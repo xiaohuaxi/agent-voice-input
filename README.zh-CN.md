@@ -25,7 +25,7 @@
 ### 1. 前置条件
 
 - **Python** `>= 3.10`
-- **ffmpeg**（Ubuntu / WSL2 执行 `sudo apt install ffmpeg`；macOS 执行 `brew install ffmpeg`）
+- **ffmpeg**（Ubuntu / WSL2 执行 `sudo apt install ffmpeg`）
 
 ### 2. 安装
 

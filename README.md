@@ -25,7 +25,7 @@ Instead of treating terminal dictation like generic chat input, `agent-voice-inp
 ### 1. Prerequisites
 
 - **Python** `>= 3.10`
-- **ffmpeg** (`sudo apt install ffmpeg` on Ubuntu/WSL2; `brew install ffmpeg` on macOS)
+- **ffmpeg** (`sudo apt install ffmpeg` on Ubuntu/WSL2)
 
 ### 2. Install
 
