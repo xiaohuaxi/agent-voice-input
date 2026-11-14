@@ -6,13 +6,13 @@
 
 不同于缺乏代码上下文的通用语音输入法，`agent-voice-input` 采用「极速语音识别 + 结合当前活跃会话上下文的轻量精修」两阶段设计，在粘贴进终端前自动修准同音代码标识符、中英混说术语与口语中途改口。
 
-> **早期版本说明（`v0.1.0`）**：当前已在 **Windows Terminal + WSL2（含远程桌面）** 与 **macOS + Ghostty** 下打通日常语音输入工作流；更多终端适配、`tmux` 深度配合以及更灵活的二阶段精修模型选择仍在持续推进中。
+> **早期版本说明（`v0.1.0`）**：当前已在 **Windows Terminal + WSL2（含 `tmux` 多分屏与远程桌面）** 与 **macOS + Ghostty（含 `tmux`）** 下打通日常语音输入工作流；更多终端适配以及更灵活的二阶段精修模型选择仍在持续推进中。
 
 ---
 
 ## 核心思路
 
-1. **活跃会话上下文抽取**：自动定位前台终端中的主 Agent 会话（支持终端标题标签、macOS Ghostty 分屏 `tty`/`cwd` 直连匹配，以及 Linux `/proc` 根会话扫描，严格排除后台 subagent），增量提取近期对话与 `git status` 文件名作为上下文参考。
+1. **活跃会话上下文抽取**：自动定位前台终端中的主 Agent 会话，原生支持 `tmux` 分屏焦点窗格识别而无需修改 `~/.tmux.conf`（支持终端/窗格标题标签、运行时会话注册表、macOS Ghostty 分屏 `tty`/`cwd` 直连匹配，以及 Linux `/proc` / macOS `ps` 根会话扫描，严格排除后台 subagent 与相邻分屏干扰），增量提取近期对话与 `git status` 文件名作为上下文参考。
 2. **一阶段语音识别（ASR）**：先在本地做 `-50 dBFS` 静音门控与 `-20 dBFS` 响度归一化，再调用云端语音识别（默认阿里百炼 `qwen3-asr-flash`，亦支持火山豆包、Gemini 或 OpenAI 兼容接口）。
 3. **二阶段轻量语境精修**：结合抽取出的会话上下文修正同音标识符并理顺口语改口。目前暂时默认通过本地 Codex CLI 调用轻量模型（`codex-luna`）完成整理，也可在配置中切换为 OpenAI 兼容接口或直接关闭（`off`）。
 4. **焦点安全粘贴**：Windows 与 macOS 均提供不抢焦点的顶部胶囊提示（录音、识别、精修阶段，默认随桌面 UI 语言自动切换中英文提示）；开始录音时锁定原终端窗口/分屏，上屏仅粘贴不自动按回车，中途切走焦点则仅写入剪贴板防串窗。
@@ -91,9 +91,9 @@ agent-voice-input stop
   - **自动化权限（Automation → Ghostty）**：首次向 Ghostty 读取分屏或上屏时弹窗确认一次即可。
   - **辅助功能（Accessibility）与输入监控（Input Monitoring）**：默认 `RControl` + Ghostty 组合**不需要开启**；仅在向非 Ghostty 应用回退模拟 `Cmd+V` 粘贴（需辅助功能）或改用非修饰键热键 / 运行 `agent-voice-input key-test`（需输入监控 / 辅助功能）时按需授权。
 
-### 可选：多窗口会话标题钩子
+### 可选：多窗口与 `tmux` 会话标题钩子
 
-在 WSL2、`tmux` 内或不支持暴露分屏 `tty`/`cwd` 的终端中并行打开多个同目录窗口时，可按 [`integrations/`](integrations/README.zh-CN.md) 为 Codex、Claude Code 或 Antigravity CLI 接入轻量终端标题标签。
+`tmux` 分屏下的焦点窗格识别开箱即用，无需改动 `~/.tmux.conf`。若常在同一项目目录下并行打开多个 Agent 终端窗口或分屏（如 WSL2、`tmux` 内或不支持暴露分屏 `tty`/`cwd` 的终端），可按 [`integrations/`](integrations/README.zh-CN.md) 为 Codex、Claude Code 或 Antigravity CLI 接入轻量终端/窗格标题标签。
 
 ---
 

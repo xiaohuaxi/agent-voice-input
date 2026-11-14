@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 from typing import Any, Callable, Mapping
 
+from . import _tmux
 from . import session_ctx as _sctx
 from .config import get_runtime_dir
 
@@ -47,12 +49,28 @@ def _proc_info(pid_dir: Path) -> tuple[str, int, int, int, list[str]] | None:
         return None
 
 
-def _has_proc_tty(pdir: Path, tty_nr: int) -> bool:
+def _is_test_runner_proc(comm: str, args: list[str]) -> bool:
+    if comm in ("pytest", "py.test"):
+        return True
+    for i, a in enumerate(args[:6]):
+        base = os.path.basename(a)
+        if base in ("pytest", "py.test") or (base.startswith("test_") and base.endswith(".py")):
+            return True
+        if a == "-m" and i + 1 < len(args) and args[i + 1].split(".")[0] in ("unittest", "pytest"):
+            return True
+    return False
+
+
+def _has_proc_tty(pdir: Path, tty_nr: int, *, allow_fixture_tty: bool = False) -> bool:
     if tty_nr > 0:
         return True
     for fn in ("0", "2"):
         t = _sctx._readlink_clean(pdir / "fd" / fn)
+        if not t or t == "/dev/null":
+            continue
         if t.startswith("/dev/pts/") or (t.startswith("/dev/tty") and t != "/dev/tty"):
+            return True
+        if allow_fixture_tty and os.path.basename(t).lower().startswith(("pts", "tty")):
             return True
     return False
 
@@ -62,6 +80,7 @@ def _walk_ancestor(
 ) -> tuple[int, list[str]]:
     cur, seen = pid0, set()
     use_proc = proc_root.is_dir()
+    allow_fixture_tty = use_proc and proc_root != Path("/proc")
     stop_after_this = False
     for _ in range(32):
         if cur <= 1 or cur in seen:
@@ -74,7 +93,7 @@ def _walk_ancestor(
                 break
             comm, ppid, psid, tty_nr, argv = info
             is_sl = cur == psid
-            has_tty = _has_proc_tty(pdir, tty_nr)
+            has_tty = _has_proc_tty(pdir, tty_nr, allow_fixture_tty=allow_fixture_tty)
         else:
             pinfo = _sctx.ps_proc_info(cur)
             if pinfo is None:
@@ -83,7 +102,7 @@ def _walk_ancestor(
             has_tty = bool(tty_path)
         if pred(comm, argv):
             return cur, argv
-        if stop_after_this or ppid <= 1:
+        if _is_test_runner_proc(comm, argv) or stop_after_this or ppid <= 1:
             break
         if is_sl:
             if has_tty:
@@ -124,6 +143,7 @@ def _find_tty(start_pid: int, proc_root: Path) -> str:
                 break
             cur = ppid
         return ""
+    allow_fixture_tty = proc_root != Path("/proc")
     info0 = _proc_info(proc_root / str(start_pid))
     if info0 is None:
         return ""
@@ -144,9 +164,15 @@ def _find_tty(start_pid: int, proc_root: Path) -> str:
                 return pts
         for fn in ("0", "2"):
             t = _sctx._readlink_clean(pdir / "fd" / fn)
-            if (
-                t.startswith("/dev/pts/") or (t.startswith("/dev/tty") and t != "/dev/tty")
-            ) and os.path.exists(t):
+            if not t or t == "/dev/null":
+                continue
+            is_dev_tty = t.startswith("/dev/pts/") or (
+                t.startswith("/dev/tty") and t != "/dev/tty"
+            )
+            is_fixture = allow_fixture_tty and os.path.basename(t).lower().startswith(
+                ("pts", "tty")
+            )
+            if (is_dev_tty or is_fixture) and os.path.exists(t):
                 return t
         if cur == psid or ppid <= 1:
             break
@@ -166,6 +192,92 @@ def write_osc2(tty_path: str, title: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def _escape_tmux_title_arg(title: str) -> str:
+    """Escape ``#`` for tmux format expansion and trailing ``;`` for tmux argv parsing."""
+    s = _CTRL_RE.sub("", title).replace("#", "##")
+    if s.endswith(";"):
+        s = s[:-1] + r"\;"
+    return s
+
+
+def parse_tmux_env(env: Mapping[str, str]) -> tuple[str, str]:
+    """Return ``(tmux_socket, tmux_pane)`` when ``TMUX_PANE`` is a valid ``%<id>`` pane token."""
+    pane = _CTRL_RE.sub("", (env.get("TMUX_PANE") or "").strip())
+    if not _tmux._TMUX_PANE_ID_RE.match(pane):
+        return "", ""
+    sock = _tmux.parse_tmux_socket_from_env(env.get("TMUX") or "")
+    return sock, pane
+
+
+def _resolve_and_sync_tmux_pane(
+    env: Mapping[str, str],
+    *,
+    tty_path: str,
+    title: str,
+    proc_root: Path,
+    explicit_env: bool,
+) -> tuple[str, str]:
+    """Verify ``TMUX_PANE`` matches ``tty_path`` on live servers and sync ``#{pane_title}``."""
+    if not tty_path:
+        return "", ""
+    if not explicit_env and proc_root != Path("/proc"):
+        return "", ""
+    sock, pane = parse_tmux_env(env)
+    if not pane:
+        return "", ""
+
+    is_live_sock = bool(sock and _tmux._is_live_owned_socket(sock))
+    if not is_live_sock:
+        if explicit_env and proc_root != Path("/proc"):
+            return sock, pane
+        return "", ""
+
+    tmux_bin = _tmux.resolve_tmux_bin(env)
+    if not tmux_bin:
+        return "", ""
+
+    sock_arg = _tmux.preferred_tmux_socket_arg(sock)
+    child_env = {k: v for k, v in env.items() if k not in ("TMUX", "TMUX_PANE")}
+    try:
+        probe = subprocess.run(
+            [tmux_bin, "-S", sock_arg, "display-message", "-p", "-t", pane, "#{pane_tty}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=child_env,
+            timeout=0.4,
+            check=False,
+        )
+        if probe.returncode != 0:
+            return "", ""
+        pane_tty = probe.stdout.decode("utf-8", errors="ignore").strip()
+        if not pane_tty or not _sctx._norm_same_path(pane_tty, tty_path):
+            return "", ""
+        # Verified in tmux 3.2a: `select-pane -t <pane> -T <title>` updates #{pane_title} only
+        # and never changes pane_active or pane_last focus state.
+        subprocess.run(
+            [
+                tmux_bin,
+                "-S",
+                sock_arg,
+                "select-pane",
+                "-t",
+                pane,
+                "-T",
+                _escape_tmux_title_arg(title),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=child_env,
+            timeout=0.4,
+            check=False,
+        )
+        return sock_arg, pane
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
 
 
 def _payload_cwd(payload: Mapping[str, Any]) -> str:
@@ -220,10 +332,14 @@ def update_agy_session(
     if os.path.isfile(tp_str) and _sctx._is_agy_transcript_subagent(tp_str):
         return False
     cwd, pid0 = _payload_cwd(payload), (os.getpid() if start_pid is None else start_pid)
-    reg_pid = 0
+    agent_pid = 0
     if proc_root.is_dir():
+        tty0 = _find_tty(pid0, proc_root)
         agy_pid, eff_args = _find_ancestor_cli(pid0, proc_root, "agy")
         if not agy_pid or _sctx._is_headless_cli_invocation("agy", eff_args):
+            return False
+        anc_tty = _find_tty(agy_pid, proc_root)
+        if tty0 and anc_tty and not _sctx._norm_same_path(tty0, anc_tty):
             return False
         agy_dir, lock_real, sfx = (
             proc_root / str(agy_pid),
@@ -248,23 +364,43 @@ def update_agy_session(
         ):
             return False
         cwd = cwd or _sctx._readlink_clean(agy_dir / "cwd")
-        tty_path = _find_tty(agy_pid, proc_root)
-        reg_pid = agy_pid
+        tty_path = anc_tty or tty0
+        agent_pid = agy_pid
     else:
         if not _sctx.is_agy_presence_lock_held_nonproc(lock_file):
             return False
+        tty0 = _find_tty(pid0, proc_root)
         agy_pid, eff_args = _find_ancestor_cli(pid0, proc_root, "agy")
+        tty_path = tty0
         if agy_pid:
-            if _sctx._is_headless_cli_invocation("agy", eff_args):
-                return False
-            cwd = cwd or _sctx._query_pid_cwd_nonproc(agy_pid)
-            reg_pid = agy_pid
-        tty_path = _find_tty(agy_pid or pid0, proc_root)
+            anc_tty = _find_tty(agy_pid, proc_root)
+            if not (tty0 and anc_tty and not _sctx._norm_same_path(tty0, anc_tty)):
+                if _sctx._is_headless_cli_invocation("agy", eff_args):
+                    return False
+                cwd = cwd or _sctx._query_pid_cwd_nonproc(agy_pid)
+                agent_pid = agy_pid
+                tty_path = anc_tty or tty0
+    title = f"agy · {_short_cwd(cwd, str(eff_home))} [#{cid[:8]}]"
+    tmux_sock, tmux_pane = _resolve_and_sync_tmux_pane(
+        eff_env,
+        tty_path=tty_path,
+        title=title,
+        proc_root=proc_root,
+        explicit_env=(env is not None),
+    )
     rt = runtime_dir if runtime_dir is not None else get_runtime_dir(eff_env, create=False)
     _sctx.write_session_registry_entry(
-        rt, cli="agy", session_id=cid, jsonl_path=tp_str, cwd=cwd, tty=tty_path, pid=reg_pid
+        rt,
+        cli="agy",
+        session_id=cid,
+        jsonl_path=tp_str,
+        cwd=cwd,
+        tmux_pane=tmux_pane,
+        tmux_socket=tmux_sock,
+        tty=tty_path,
+        agent_pid=agent_pid,
     )
-    write_osc2(tty_path, f"agy · {_short_cwd(cwd, str(eff_home))} [#{cid[:8]}]")
+    write_osc2(tty_path, title)
     return True
 
 
@@ -297,28 +433,53 @@ def update_claude_session(
     ):
         return False
     pid0 = os.getpid() if start_pid is None else start_pid
-    target_pid = pid0
+    agent_pid = 0
+    tty0 = _find_tty(pid0, proc_root)
+    tty_path = tty0
     cl_pid, eff_args = _find_ancestor_cli(pid0, proc_root, "claude")
     if cl_pid:
-        if _sctx._is_headless_cli_invocation("claude", eff_args):
-            return False
-        target_pid = cl_pid
-        if not cwd:
-            cwd = (
-                _sctx._readlink_clean(proc_root / str(cl_pid) / "cwd")
-                if proc_root.is_dir()
-                else _sctx._query_pid_cwd_nonproc(cl_pid)
-            )
-            if not tp and cwd:
-                encs = _sctx.encode_claude_project_dir(cwd)
-                tp = str(eff_home / ".claude" / "projects" / encs[0] / f"{sid}.jsonl") if encs else ""
-    tty_path = _find_tty(target_pid, proc_root)
+        anc_tty = _find_tty(cl_pid, proc_root)
+        # Ignore ancestor across a setsid + fresh PTY boundary (e.g. isolated PTY unit tests)
+        if not (tty0 and anc_tty and not _sctx._norm_same_path(tty0, anc_tty)):
+            if _sctx._is_headless_cli_invocation("claude", eff_args):
+                return False
+            agent_pid = cl_pid
+            tty_path = anc_tty or tty0
+            if not cwd:
+                cwd = (
+                    _sctx._readlink_clean(proc_root / str(cl_pid) / "cwd")
+                    if proc_root.is_dir()
+                    else _sctx._query_pid_cwd_nonproc(cl_pid)
+                )
+                if not tp and cwd:
+                    encs = _sctx.encode_claude_project_dir(cwd)
+                    tp = (
+                        str(eff_home / ".claude" / "projects" / encs[0] / f"{sid}.jsonl")
+                        if encs
+                        else ""
+                    )
+    title = f"claude · {_short_cwd(cwd, str(eff_home))} [#{sid[:8]}]"
+    tmux_sock, tmux_pane = _resolve_and_sync_tmux_pane(
+        eff_env,
+        tty_path=tty_path,
+        title=title,
+        proc_root=proc_root,
+        explicit_env=(env is not None),
+    )
     if tp:
         rt = runtime_dir if runtime_dir is not None else get_runtime_dir(eff_env, create=False)
         _sctx.write_session_registry_entry(
-            rt, cli="claude", session_id=sid, jsonl_path=tp, cwd=cwd, tty=tty_path, pid=cl_pid
+            rt,
+            cli="claude",
+            session_id=sid,
+            jsonl_path=tp,
+            cwd=cwd,
+            tmux_pane=tmux_pane,
+            tmux_socket=tmux_sock,
+            tty=tty_path,
+            agent_pid=agent_pid,
         )
-    write_osc2(tty_path, f"claude · {_short_cwd(cwd, str(eff_home))} [#{sid[:8]}]")
+    write_osc2(tty_path, title)
     return True
 
 

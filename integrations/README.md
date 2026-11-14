@@ -5,7 +5,8 @@
 `agent-voice-input` can bind to the active foreground coding agent session in **O(1) time** across multiple concurrent terminal tabs/windows, extracting clean recent dialogue and `git status` file hotwords for speech recognition and Stage 2 refinement while strictly ignoring background subagents and non-interactive child processes.
 
 All integrations below are **optional enhancements**:
-- On **macOS + Ghostty**, `agent-voice-input` already reads the focused split's `tty` and `cwd` to match each split's active `codex`, `claude`, or `agy` session without hooks (though hooks still work on macOS via `ps` parent-chain `/dev/ttys*` discovery, e.g. inside `tmux` or other terminals).
+- **Inside `tmux`**, active-pane tracking works out of the box on both Linux/WSL2 and macOS without modifying `~/.tmux.conf` (matching the focused attached client's active pane while isolating sibling panes).
+- On **macOS + Ghostty**, `agent-voice-input` already reads the focused split's `tty` and `cwd` to match each split's active `codex`, `claude`, or `agy` session without hooks (including when Ghostty attaches to `tmux`).
 - On **Linux / WSL2**, without hooks it automatically falls back to `/proc` foreground interactive root-session scanning and window-title / directory disambiguation.
 
 ---
@@ -56,8 +57,8 @@ Ensure `agent-voice-input` is on your `PATH` (or use its full path; see [`claude
 
 What the hook does:
 1. Automatically ignores background subagents carrying `agent_id` or `isSidechain` as well as headless `claude -p` / `--print` invocations (via `/proc` on Linux or `ps` parent-chain inspection on macOS);
-2. Atomically writes root session metadata (including normalized controlling `tty` and root `pid`) to `<runtime_dir>/sessions/claude-<id8>.json` (`0600` permissions);
-3. Walks the parent process chain to locate the controlling TTY character device (`/dev/pts/*` or `/dev/ttys*`) and writes an OSC 2 title (`claude · <short_cwd> [#<id8>]`) while keeping `stdout` empty so Claude's prompt context is never polluted.
+2. Atomically writes root session metadata (including `agent_pid`/`pid`, normalized controlling `tty`, and `tmux_pane` / `tmux_socket` when inside `tmux`) to `<runtime_dir>/sessions/claude-<id8>.json` (`0600` permissions);
+3. Walks the parent process chain to locate the controlling TTY character device (`/dev/pts/*` or `/dev/ttys*`) and writes an OSC 2 title (`claude · <short_cwd> [#<id8>]`)—and syncs the target pane's `#{pane_title}` inside `tmux` without switching pane focus—while keeping `stdout` empty so Claude's prompt context is never polluted.
 
 ---
 
@@ -86,4 +87,15 @@ Following [`gemini/hooks.json`](gemini/hooks.json), add `voice-session-title` to
 }
 ```
 
-The hook checks `presence/<cid>.lock` file locks, the opening JSONL record, and the parent process chain (`/proc` on Linux or `ps` on macOS) to filter out background subagents and headless `agy -p` invocations—recording the normalized `tty` in `<runtime_dir>/sessions/agy-<cid8>.json`, updating the controlling TTY title (`agy · <short_cwd> [#<cid8>]`) only for foreground interactive sessions, and returning a clean `{}` JSON response.
+The hook checks `presence/<cid>.lock` file locks, the opening JSONL record, and the parent process chain (`/proc` on Linux or `ps` on macOS) to filter out background subagents and headless `agy -p` invocations—recording the normalized `tty` (and `tmux_pane` metadata when inside `tmux`) in `<runtime_dir>/sessions/agy-<cid8>.json`, updating the controlling TTY / pane title (`agy · <short_cwd> [#<cid8>]`) without changing pane focus only for foreground interactive sessions, and returning a clean `{}` JSON response.
+
+---
+
+## 4. `tmux` Split Panes (Zero `~/.tmux.conf` Changes Needed)
+
+`agent-voice-input` tracks `tmux` multi-pane workflows out of the box without enabling `set-titles on` or modifying `~/.tmux.conf`:
+
+- **Active-Pane Locking**: Even when the outer terminal window title stays `tmux` or a shell default, the daemon queries the active attached `tmux` client's current active pane (matching the outer `window_tty`/`window_pid` directly on macOS + Ghostty) and resolves sessions strictly within that pane:
+  1. **With Hooks / Codex Title UUID**: Matches `[#tag]` / UUID in `#{pane_title}` or `tmux_pane` in the runtime session registry, verifying the recorded `agent_pid` and pane process tree are still alive so exited sessions never leave stale matches.
+  2. **Without Hooks**: Scopes interactive root-session discovery strictly to the active pane (`/proc` descendant process tree on Linux/WSL2, or `ps`/`lsof` controlling-TTY inspection on macOS), keeping background teammate panes and empty shell panes isolated.
+- **Multi-Tab / Split Coexistence**: If `tmux` stays attached in one terminal tab/split while you switch to a regular non-`tmux` tab/split running another agent, outer `window_tty` matching (Ghostty), `[#tag]` hints, CLI/spinner/directory titles, and client activity comparison keep the foreground non-`tmux` session from being hijacked by the background `tmux` session.

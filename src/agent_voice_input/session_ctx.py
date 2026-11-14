@@ -2,9 +2,10 @@
 
 Supports ``codex``, ``claude`` (Claude Code), and ``agy`` (Antigravity CLI) across:
 1. O(1) window title session tag / UUID lookup (runtime registry + direct path / prefix);
-2. Linux ``/proc`` foreground root-session discovery (strictly excluding background subagents
-   and stale ``agy`` presence locks) with 4-level disambiguation fallback, plus macOS fallback;
-3. Streaming byte-offset incremental JSONL reading (safe against concurrent half-line writes,
+2. ``tmux`` multi-pane active-pane focus convergence and split TTY/CWD resolution (Ghostty / macOS);
+3. Linux ``/proc`` foreground root-session discovery (strictly excluding background subagents
+   and stale ``agy`` presence locks) with disambiguation fallback, plus macOS ``ps``/``lsof`` fallback;
+4. Streaming byte-offset incremental JSONL reading (safe against concurrent half-line writes,
    ``\\r``/``\\x0c`` control bytes, atomic replacement, and equal/longer in-place rewrites)
    with strict per-CLI whitelist filtering and ``git status`` hotword extraction.
 """
@@ -23,10 +24,27 @@ import stat
 import subprocess
 import threading
 import time
-from typing import Any, BinaryIO, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
 import urllib.parse
 import uuid
 
+from ._tmux import (
+    _MAX_TMUX_SOCKET_TARGETS,
+    _TMUX_PANE_ID_RE,
+    TmuxClientInfo,
+    TmuxPaneInfo,
+    TmuxServerSnapshot,
+    _is_live_owned_socket,
+    _norm_same_path,
+    _same_tmux_server,
+    parse_tmux_clients_output,
+    parse_tmux_panes_output,
+    parse_tmux_probe_output,
+    parse_tmux_socket_from_env,
+    preferred_tmux_socket_arg,
+    probe_tmux_snapshot,
+    resolve_tmux_bin,
+)
 from .asr_providers import AsrContext
 from .config import ensure_secure_dir, get_runtime_dir
 
@@ -56,7 +74,50 @@ _WORD_CLI_RE = re.compile(
     r"(?:^|[\s\[\(\{·|:])(agy|antigravity|claude|codex)(?=$|[\s\]\)\}·|:])",
     re.IGNORECASE,
 )
+_WORD_TMUX_RE = re.compile(
+    r"(?:^|[\s\[\(\{·|:])tmux(?=$|[\s\]\)\}·|:*])",
+    re.IGNORECASE,
+)
+_TUI_SPINNER_RE = re.compile(r"[\u2733\u2800-\u28ff]")
+_CTRL_STRIP_RE = re.compile(r"[\x00-\x1f\x7f]")
 _CLAUDE_VER_COMM_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
+
+
+def _build_generic_pane_titles() -> frozenset[str]:
+    names = {
+        "bash",
+        "zsh",
+        "fish",
+        "sh",
+        "dash",
+        "ksh",
+        "tcsh",
+        "csh",
+        "nu",
+        "pwsh",
+        "powershell",
+        "tmux",
+        "ubuntu",
+        "debian",
+        "linux",
+        "localhost",
+    }
+    if hasattr(os, "uname"):
+        try:
+            node = os.uname().nodename.strip().lower()
+            if node:
+                names.add(node)
+                names.add(node.split(".", 1)[0])
+        except OSError:
+            pass
+    return frozenset(names)
+
+
+_GENERIC_SHELL_TITLES = _build_generic_pane_titles()
+
+
+def _is_meaningful_pane_title(ptitle_low: str) -> bool:
+    return len(ptitle_low) >= 4 and ptitle_low not in _GENERIC_SHELL_TITLES
 
 
 @dataclass(frozen=True)
@@ -73,7 +134,7 @@ class SessionMatch:
     session_id: str
     jsonl_path: str
     cwd: str = ""
-    matched_by: str = ""  # "registry" | "title_uuid" | "title_prefix" | "tty_registry" | "tty_ps" | "proc_scan" | "recent_root"
+    matched_by: str = ""  # "registry" | "title_uuid" | "title_prefix" | "tmux_registry" | "tmux_pane_title" | "tmux_proc_scan" | "tty_registry" | "tty_ps" | "proc_scan" | "recent_root"
     pts_mtime: float = 0.0
     jsonl_mtime: float = 0.0
     thread_name: str = ""
@@ -173,8 +234,84 @@ def parse_window_title_hint(window_title: str) -> TitleHint | None:
 
 
 # ---------------------------------------------------------------------------
-# Root-session predicates & filesystem helpers
+# Root-session predicates, TTY/CWD normalization & process helpers
 # ---------------------------------------------------------------------------
+
+_AGY_WS_CWD_RE = re.compile(
+    r"(?:Command Working Directory:\s*|Active Workspaces:\s*\r?\n-\s*)(/[^\r\n<]+)"
+)
+
+
+def normalize_tty_path(raw_tty: str) -> str:
+    """Normalize a TTY name or path (e.g. ``ttys019`` -> ``/dev/ttys019``), excluding ``?``/``??``."""
+    s = (raw_tty or "").strip()
+    if not s or s in ("?", "??", "-", "/dev/tty", "/dev/null"):
+        return ""
+    if s.startswith("/dev/"):
+        norm = "/" + "/".join(part for part in s.split("/") if part)
+        if norm.startswith("/dev/pts/") and len(norm) > len("/dev/pts/"):
+            return norm
+        if norm.startswith("/dev/tty") and norm != "/dev/tty":
+            return norm
+        return ""
+    if s.startswith("pts/") and len(s) > 4:
+        return f"/dev/{s}"
+    if s.startswith("tty") and len(s) > 3:
+        return f"/dev/{s}"
+    if re.fullmatch(r"s\d+", s):
+        return f"/dev/{s}" if os.path.exists(f"/dev/{s}") else f"/dev/tty{s}"
+    for cand in (f"/dev/{s}", f"/dev/tty{s}"):
+        if os.path.exists(cand):
+            return cand
+    return ""
+
+
+def _normalize_cwd(raw_cwd: str) -> str:
+    s = (raw_cwd or "").strip()
+    if not s:
+        return ""
+    if s.startswith("file://"):
+        parsed = urllib.parse.urlparse(s)
+        s = urllib.parse.unquote(parsed.path or "")
+    if len(s) > 1:
+        s = s.rstrip("/")
+    return s
+
+
+def _cwd_variants(cwd: str) -> set[str]:
+    norm = _normalize_cwd(cwd)
+    if not norm:
+        return set()
+    out = {norm}
+    try:
+        real = os.path.realpath(norm)
+        if len(real) > 1:
+            real = real.rstrip("/")
+        if real:
+            out.add(real)
+    except OSError:
+        pass
+    return out
+
+
+def _cwd_match_rank(target_cwd: str, cand_cwd: str, home: Path | None = None) -> int:
+    """Return 2 on exact directory match, 1 on bounded subdirectory match, 0 otherwise."""
+    t_vars = _cwd_variants(target_cwd)
+    c_vars = _cwd_variants(cand_cwd)
+    if not t_vars or not c_vars:
+        return 0
+    if t_vars & c_vars:
+        return 2
+    broad = {"/", "/tmp", "/private/tmp", "/var", "/private/var", "/Users", "/home"}
+    if home is not None:
+        broad |= _cwd_variants(str(home))
+    for tv in t_vars:
+        for cv in c_vars:
+            if (cv not in broad and tv.startswith(cv + "/")) or (
+                tv not in broad and cv.startswith(tv + "/")
+            ):
+                return 1
+    return 0
 
 
 def encode_claude_project_dir(cwd: str) -> list[str]:
@@ -234,7 +371,7 @@ def _read_codex_root_meta(jsonl_path: str | Path) -> tuple[bool, str, str]:
         return False, "", ""
     is_cli = payload.get("source") == "cli"
     sid = str(payload.get("id") or payload.get("session_id") or "").strip().lower()
-    cwd = str(payload.get("cwd") or "").strip()
+    cwd = _normalize_cwd(str(payload.get("cwd") or ""))
     return is_cli, sid, cwd
 
 
@@ -285,7 +422,7 @@ def _read_claude_root_meta(
                 if isinstance(obj.get("sessionId"), str) and obj["sessionId"].strip():
                     last_sid = obj["sessionId"].strip().lower()
                 if isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
-                    last_cwd = obj["cwd"].strip()
+                    last_cwd = _normalize_cwd(obj["cwd"])
                 if "isSidechain" in obj or obj.get("type") in ("user", "assistant"):
                     if bool(obj.get("isSidechain")):
                         return False, "", ""
@@ -383,81 +520,33 @@ def _is_agy_transcript_subagent(jsonl_path: str | Path) -> bool:
     return False
 
 
-_AGY_WS_CWD_RE = re.compile(
-    r"(?:Command Working Directory:\s*|Active Workspaces:\s*\r?\n-\s*)(/[^\r\n<]+)"
-)
-
-
-def normalize_tty_path(raw_tty: str) -> str:
-    """Normalize a TTY name or path (e.g. ``ttys019`` -> ``/dev/ttys019``), excluding ``?``/``??``."""
-    s = (raw_tty or "").strip()
-    if not s or s in ("?", "??", "-", "/dev/tty", "/dev/null"):
-        return ""
-    if s.startswith("/dev/"):
-        norm = "/" + "/".join(part for part in s.split("/") if part)
-        if norm.startswith("/dev/pts/") and len(norm) > len("/dev/pts/"):
-            return norm
-        if norm.startswith("/dev/tty") and norm != "/dev/tty":
-            return norm
-        return ""
-    if s.startswith("pts/") and len(s) > 4:
-        return f"/dev/{s}"
-    if s.startswith("tty") and len(s) > 3:
-        return f"/dev/{s}"
-    if re.fullmatch(r"s\d+", s):
-        return f"/dev/{s}" if os.path.exists(f"/dev/{s}") else f"/dev/tty{s}"
-    for cand in (f"/dev/{s}", f"/dev/tty{s}"):
-        if os.path.exists(cand):
-            return cand
-    return ""
-
-
-def _normalize_cwd(raw_cwd: str) -> str:
-    s = (raw_cwd or "").strip()
-    if not s:
-        return ""
-    if s.startswith("file://"):
-        parsed = urllib.parse.urlparse(s)
-        s = urllib.parse.unquote(parsed.path or "")
-    if len(s) > 1:
-        s = s.rstrip("/")
-    return s
-
-
-def _cwd_variants(cwd: str) -> set[str]:
-    norm = _normalize_cwd(cwd)
-    if not norm:
-        return set()
-    out = {norm}
+def _extract_agy_transcript_cwd(jsonl_path: str | Path) -> str:
     try:
-        real = os.path.realpath(norm)
-        if len(real) > 1:
-            real = real.rstrip("/")
-        if real:
-            out.add(real)
+        with open(jsonl_path, "rb") as f:
+            for _ in range(8):
+                raw, exceeded = _read_bounded_line(f)
+                if not raw:
+                    break
+                if exceeded or not raw.strip():
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
+                    return _normalize_cwd(obj["cwd"])
+                content = obj.get("content")
+                if isinstance(content, str) and (
+                    "Working Directory:" in content or "Active Workspaces:" in content
+                ):
+                    m = _AGY_WS_CWD_RE.search(content)
+                    if m:
+                        return _normalize_cwd(m.group(1))
     except OSError:
         pass
-    return out
-
-
-def _cwd_match_rank(target_cwd: str, cand_cwd: str, home: Path | None = None) -> int:
-    """Return 2 on exact directory match, 1 on bounded subdirectory match, 0 otherwise."""
-    t_vars = _cwd_variants(target_cwd)
-    c_vars = _cwd_variants(cand_cwd)
-    if not t_vars or not c_vars:
-        return 0
-    if t_vars & c_vars:
-        return 2
-    broad = {"/", "/tmp", "/private/tmp", "/var", "/private/var", "/Users", "/home"}
-    if home is not None:
-        broad |= _cwd_variants(str(home))
-    for tv in t_vars:
-        for cv in c_vars:
-            if (cv not in broad and tv.startswith(cv + "/")) or (
-                tv not in broad and cv.startswith(tv + "/")
-            ):
-                return 1
-    return 0
+    return ""
 
 
 def _split_cmdline(raw_args: str) -> list[str]:
@@ -607,42 +696,17 @@ def _query_pid_agy_lock_cids(pid: int, proc_root: Path | None = None) -> list[st
             return []
         if r.returncode != 0:
             return []
-        targets = [ln[1:] for ln in r.stdout.decode("utf-8", errors="replace").splitlines() if ln.startswith("n")]
+        targets = [
+            ln[1:]
+            for ln in r.stdout.decode("utf-8", errors="replace").splitlines()
+            if ln.startswith("n")
+        ]
     for t in targets:
         if t.endswith(".lock") and "/presence/" in t.replace("\\", "/"):
             cid = Path(t).stem.lower()
             if cid and cid not in out:
                 out.append(cid)
     return out
-
-
-def _extract_agy_transcript_cwd(jsonl_path: str | Path) -> str:
-    try:
-        with open(jsonl_path, "rb") as f:
-            for _ in range(8):
-                raw, exceeded = _read_bounded_line(f)
-                if not raw:
-                    break
-                if exceeded or not raw.strip():
-                    continue
-                try:
-                    obj = json.loads(raw.decode("utf-8", errors="replace"))
-                except ValueError:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                if isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
-                    return _normalize_cwd(obj["cwd"])
-                content = obj.get("content")
-                if isinstance(content, str) and (
-                    "Working Directory:" in content or "Active Workspaces:" in content
-                ):
-                    m = _AGY_WS_CWD_RE.search(content)
-                    if m:
-                        return _normalize_cwd(m.group(1))
-    except OSError:
-        pass
-    return ""
 
 
 def _read_proc_cmdline_args(proc_pid_dir: Path) -> list[str]:
@@ -668,7 +732,6 @@ def _is_headless_cli_invocation(cli_kind: str, args: Sequence[str]) -> bool:
                 return True
         return False
     if cli_kind == "codex":
-        # Find first positional subcommand (skip flags and common flag values)
         skip_next = False
         value_flags = {
             "-m", "--model", "-c", "--config", "-C", "--cd", "-p", "--profile",
@@ -691,6 +754,26 @@ def _is_headless_cli_invocation(cli_kind: str, args: Sequence[str]) -> bool:
                 return True
             break
     return False
+
+
+def _classify_interactive_cli(comm: str, argv: Sequence[str]) -> str | None:
+    cli_kind, eff_args = _match_cli_process(comm, argv)
+    if cli_kind is None or _is_headless_cli_invocation(cli_kind, eff_args):
+        return None
+    return cli_kind
+
+
+def _classify_proc_cli(proc_pid_dir: Path) -> str | None:
+    return _classify_interactive_cli(
+        _read_proc_comm(proc_pid_dir), _read_proc_cmdline_args(proc_pid_dir)
+    )
+
+
+def _ps_pid_matches_cli(pid: int, expected_cli: str) -> bool:
+    pinfo = ps_proc_info(pid)
+    if pinfo is None:
+        return False
+    return _classify_interactive_cli(pinfo[0], pinfo[3]) == expected_cli
 
 
 def _collect_open_agy_presence_cids(
@@ -806,7 +889,7 @@ def is_agy_root_session_valid(
 
 
 # ---------------------------------------------------------------------------
-# Linux /proc helpers
+# Linux /proc & storage discovery helpers
 # ---------------------------------------------------------------------------
 
 
@@ -829,19 +912,6 @@ def _read_proc_comm(proc_pid_dir: Path) -> str:
         return ""
 
 
-def _classify_interactive_cli(comm: str, argv: Sequence[str]) -> str | None:
-    cli_kind, eff_args = _match_cli_process(comm, argv)
-    if cli_kind is None or _is_headless_cli_invocation(cli_kind, eff_args):
-        return None
-    return cli_kind
-
-
-def _classify_proc_cli(proc_pid_dir: Path) -> str | None:
-    return _classify_interactive_cli(
-        _read_proc_comm(proc_pid_dir), _read_proc_cmdline_args(proc_pid_dir)
-    )
-
-
 def _readlink_clean(path: Path) -> str:
     try:
         target = os.readlink(path)
@@ -853,10 +923,10 @@ def _readlink_clean(path: Path) -> str:
 
 
 def _read_proc_cwd(proc_pid_dir: Path) -> str:
-    return _readlink_clean(proc_pid_dir / "cwd")
+    return _normalize_cwd(_readlink_clean(proc_pid_dir / "cwd"))
 
 
-def _read_proc_pts_mtime(proc_pid_dir: Path) -> float:
+def _read_proc_tty_path(proc_pid_dir: Path) -> str:
     # 1. Primary: /proc/<pid>/stat tty_nr -> /dev/pts/<minor>
     try:
         stat_txt = (proc_pid_dir / "stat").read_text(encoding="utf-8", errors="replace")
@@ -869,29 +939,33 @@ def _read_proc_pts_mtime(proc_pid_dir: Path) -> float:
                     major = (tty_nr >> 8) & 0xFFF
                     minor = (tty_nr & 0xFF) | ((tty_nr >> 12) & 0xFFF00)
                     if 136 <= major <= 143:
-                        pts_idx = (major - 136) * 256 + minor
-                        mt = _safe_mtime(f"/dev/pts/{pts_idx}")
-                        if mt > 0:
-                            return mt
+                        pts_path = f"/dev/pts/{(major - 136) * 256 + minor}"
+                        if os.path.exists(pts_path):
+                            return pts_path
     except (OSError, ValueError):
         pass
 
     # 2. Fallback: fd/0 when pointing to a real tty/pts device (or test pts_* fixture), never /dev/null
     fd0 = _readlink_clean(proc_pid_dir / "fd" / "0")
     if not fd0 or fd0 == "/dev/null":
-        return 0.0
+        return ""
     try:
         st = os.stat(fd0)
     except OSError:
-        return 0.0
+        return ""
     base = os.path.basename(fd0).lower()
     if (
         stat.S_ISCHR(st.st_mode)
         or fd0.startswith(("/dev/pts/", "/dev/tty"))
         or base.startswith(("pts", "tty"))
     ):
-        return st.st_mtime
-    return 0.0
+        return fd0
+    return ""
+
+
+def _read_proc_pts_mtime(proc_pid_dir: Path) -> float:
+    tty_path = _read_proc_tty_path(proc_pid_dir)
+    return _safe_mtime(tty_path) if tty_path else 0.0
 
 
 def _load_codex_thread_names(home: Path) -> dict[str, str]:
@@ -919,6 +993,119 @@ def _load_codex_thread_names(home: Path) -> dict[str, str]:
     return mapping
 
 
+def _read_proc_ppid(proc_pid_dir: Path) -> int:
+    try:
+        stat_txt = (proc_pid_dir / "stat").read_text(encoding="utf-8", errors="replace")
+        rpar = stat_txt.rfind(")")
+        if rpar != -1:
+            fields_after = stat_txt[rpar + 2 :].split()
+            if len(fields_after) >= 2:
+                return int(fields_after[1])
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _collect_descendant_pids(proc_root: Path, root_pids: Sequence[int]) -> set[int]:
+    seeds = {p for p in root_pids if p > 1}
+    if not seeds or not proc_root.is_dir():
+        return set()
+    children_by_ppid: dict[int, list[int]] = {}
+    existing: set[int] = set()
+    for pdir in _iter_numeric_proc_dirs(proc_root):
+        pid = int(pdir.name)
+        existing.add(pid)
+        ppid = _read_proc_ppid(pdir)
+        if ppid > 1:
+            children_by_ppid.setdefault(ppid, []).append(pid)
+    visited: set[int] = set()
+    stack = [p for p in seeds if p in existing]
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        for ch in children_by_ppid.get(cur, ()):
+            if ch not in visited:
+                stack.append(ch)
+    return visited
+
+
+def _collect_pane_pids(proc_root: Path, pane_pid: int, pane_tty: str = "") -> set[int]:
+    if not proc_root.is_dir():
+        return set()
+    if pane_pid > 1:
+        return _collect_descendant_pids(proc_root, (pane_pid,))
+    if not pane_tty:
+        return set()
+    norm_tty = os.path.realpath(pane_tty) if os.path.exists(pane_tty) else pane_tty
+    matched: set[int] = set()
+    for pdir in _iter_numeric_proc_dirs(proc_root):
+        ptty = _read_proc_tty_path(pdir)
+        if not ptty:
+            continue
+        norm_p = os.path.realpath(ptty) if os.path.exists(ptty) else ptty
+        if norm_p == norm_tty:
+            matched.add(int(pdir.name))
+    return matched
+
+
+def _collect_live_cli_pids(proc_root: Path, allowed_pids: set[int]) -> dict[str, set[int]]:
+    out: dict[str, set[int]] = {}
+    if not allowed_pids or not proc_root.is_dir():
+        return out
+    for pid in allowed_pids:
+        pdir = proc_root / str(pid)
+        cli = _classify_proc_cli(pdir)
+        if cli is not None:
+            out.setdefault(cli, set()).add(pid)
+    return out
+
+
+def _extract_claude_cmdline_sid(proc_pid_dir: Path) -> str:
+    args = _read_proc_cmdline_args(proc_pid_dir)
+    return _extract_claude_sid_from_argv(args)
+
+
+def _extract_claude_sid_from_argv(args: Sequence[str]) -> str:
+    for i, a in enumerate(args):
+        if a == "--":
+            break
+        if a in ("--session-id", "--resume", "-r") and i + 1 < len(args):
+            cand = args[i + 1].strip().lower()
+            if _STRICT_UUID_RE.match(cand):
+                return cand
+        for pfx in ("--session-id=", "--resume="):
+            if a.startswith(pfx):
+                cand = a[len(pfx) :].strip().lower()
+                if _STRICT_UUID_RE.match(cand):
+                    return cand
+    return ""
+
+
+def _is_path_under_dir(target_path: str | Path, root_dir: Path) -> bool:
+    try:
+        real_target = os.path.realpath(target_path)
+        real_root = os.path.realpath(root_dir)
+    except OSError:
+        return False
+    return real_target == real_root or real_target.startswith(real_root.rstrip(os.sep) + os.sep)
+
+
+def _dir_basename_in_title(window_title: str, dir_path: str) -> bool:
+    if not window_title or not dir_path:
+        return False
+    base = os.path.basename(dir_path.rstrip("/\\"))
+    if not base:
+        return False
+    tail = r"(?:[/\\]+)?(?=$|[\s:·\]\)\}\"'])"
+    if len(base) == 1:
+        pat = rf"[/\\]{re.escape(base)}{tail}"
+    else:
+        pat = rf"(?:^|[\s/\\:·\[\(\{{\"']){re.escape(base)}{tail}"
+    return bool(re.search(pat, window_title, re.IGNORECASE))
+
+
 def _agy_transcript_and_mtime(
     home: Path, cid: str, fallback_path: str | Path | None = None
 ) -> tuple[str, float]:
@@ -926,7 +1113,9 @@ def _agy_transcript_and_mtime(
     if tp is not None:
         return str(tp), _safe_mtime(tp)
     tp_str = str(_default_agy_expected_transcript_path(home, cid))
-    return tp_str, (_safe_mtime(fallback_path) if fallback_path is not None else _safe_mtime(tp_str))
+    return tp_str, (
+        _safe_mtime(fallback_path) if fallback_path is not None else _safe_mtime(tp_str)
+    )
 
 
 def _build_agy_match(
@@ -955,9 +1144,15 @@ def _build_agy_match(
 
 
 def _collect_codex_storage_matches(
-    home: Path, *, matched_by: str, file_glob: str = "rollout-*.jsonl",
-    sid_prefix: str = "", fallback_sid: str = "", eff_cwd: str = "",
-    limit: int = 0, codex_names: Mapping[str, str] | None = None,
+    home: Path,
+    *,
+    matched_by: str,
+    file_glob: str = "rollout-*.jsonl",
+    sid_prefix: str = "",
+    fallback_sid: str = "",
+    eff_cwd: str = "",
+    limit: int = 0,
+    codex_names: Mapping[str, str] | None = None,
 ) -> list[SessionMatch]:
     pattern = str(home / ".codex" / "sessions" / "*" / "*" / "*" / file_glob)
     files = sorted(glob.glob(pattern), key=_safe_mtime, reverse=True)
@@ -974,18 +1169,35 @@ def _collect_codex_storage_matches(
             continue
         if eff_cwd and _cwd_match_rank(eff_cwd, meta_cwd, home) == 0:
             continue
-        out.append(SessionMatch(
-            cli="codex", session_id=eff_sid, jsonl_path=cf, cwd=meta_cwd or eff_cwd,
-            matched_by=matched_by, jsonl_mtime=_safe_mtime(cf), thread_name=names.get(eff_sid, ""),
-        ))
+        out.append(
+            SessionMatch(
+                cli="codex",
+                session_id=eff_sid,
+                jsonl_path=cf,
+                cwd=meta_cwd or eff_cwd,
+                matched_by=matched_by,
+                jsonl_mtime=_safe_mtime(cf),
+                thread_name=names.get(eff_sid, ""),
+            )
+        )
     return out
 
 
 def _collect_claude_storage_matches(
-    home: Path, *, matched_by: str, file_glob: str = "*.jsonl",
-    sid_prefix: str = "", fallback_sid: str = "", eff_cwd: str = "",
-    filter_cwd: bool = False, include_global: bool = True,
-    allow_empty_global: bool = False, pts_mtime: float = 0.0, limit: int = 0,
+    home: Path,
+    *,
+    matched_by: str,
+    file_glob: str = "*.jsonl",
+    sid_prefix: str = "",
+    fallback_sid: str = "",
+    eff_cwd: str = "",
+    filter_cwd: bool = False,
+    include_global: bool = True,
+    allow_empty_global: bool = False,
+    pts_mtime: float = 0.0,
+    limit: int = 0,
+    claimed_claude_sids: Mapping[str, int] | None = None,
+    owner_pid: int = 0,
 ) -> list[SessionMatch]:
     cands: list[SessionMatch] = []
     seen_paths: set[str] = set()
@@ -999,53 +1211,95 @@ def _collect_claude_storage_matches(
                     continue
                 jf_str = str(jf)
                 seen_paths.add(jf_str)
-                is_root, sid, meta_cwd = _read_claude_root_meta(jf, allow_empty_or_meta_only=True)
+                is_root, sid, meta_cwd = _read_claude_root_meta(
+                    jf, allow_empty_or_meta_only=True
+                )
                 eff_sid = sid or fallback_sid
                 if not is_root or not eff_sid or (sid_prefix and not eff_sid.startswith(sid_prefix)):
                     continue
-                cands.append(SessionMatch(
-                    cli="claude", session_id=eff_sid, jsonl_path=jf_str, cwd=meta_cwd or eff_cwd,
-                    matched_by=matched_by, pts_mtime=pts_mtime, jsonl_mtime=_safe_mtime(jf),
-                ))
+                if claimed_claude_sids:
+                    claimed_owner = claimed_claude_sids.get(eff_sid, 0)
+                    if claimed_owner not in (0, owner_pid):
+                        continue
+                cands.append(
+                    SessionMatch(
+                        cli="claude",
+                        session_id=eff_sid,
+                        jsonl_path=jf_str,
+                        cwd=meta_cwd or eff_cwd,
+                        matched_by=matched_by,
+                        pts_mtime=pts_mtime,
+                        jsonl_mtime=_safe_mtime(jf),
+                    )
+                )
     if include_global and (not filter_cwd or not cands):
-        claude_files = sorted(glob.glob(str(home / ".claude" / "projects" / "*" / file_glob)), key=_safe_mtime, reverse=True)
+        claude_files = sorted(
+            glob.glob(str(home / ".claude" / "projects" / "*" / file_glob)),
+            key=_safe_mtime,
+            reverse=True,
+        )
         if limit > 0:
             claude_files = claude_files[:limit]
         for clf in claude_files:
             if clf in seen_paths or not os.path.isfile(clf):
                 continue
-            is_root, sid, meta_cwd = _read_claude_root_meta(clf, allow_empty_or_meta_only=allow_empty_global)
+            is_root, sid, meta_cwd = _read_claude_root_meta(
+                clf, allow_empty_or_meta_only=allow_empty_global
+            )
             eff_sid = sid or fallback_sid
             if not is_root or not eff_sid or (sid_prefix and not eff_sid.startswith(sid_prefix)):
                 continue
+            if claimed_claude_sids:
+                claimed_owner = claimed_claude_sids.get(eff_sid, 0)
+                if claimed_owner not in (0, owner_pid):
+                    continue
             if filter_cwd and eff_cwd and _cwd_match_rank(eff_cwd, meta_cwd, home) == 0:
                 continue
-            cands.append(SessionMatch(
-                cli="claude", session_id=eff_sid, jsonl_path=clf,
-                cwd=meta_cwd or (eff_cwd if filter_cwd else ""),
-                matched_by=matched_by, pts_mtime=pts_mtime, jsonl_mtime=_safe_mtime(clf),
-            ))
+            cands.append(
+                SessionMatch(
+                    cli="claude",
+                    session_id=eff_sid,
+                    jsonl_path=clf,
+                    cwd=meta_cwd or (eff_cwd if filter_cwd else ""),
+                    matched_by=matched_by,
+                    pts_mtime=pts_mtime,
+                    jsonl_mtime=_safe_mtime(clf),
+                )
+            )
     return cands
-
-
-def _upsert_newer_match(by_key: dict[str, SessionMatch], cand: SessionMatch) -> None:
-    prev = by_key.get(cand.session_key)
-    if prev is None or (cand.pts_mtime, cand.jsonl_mtime) > (prev.pts_mtime, prev.jsonl_mtime):
-        by_key[cand.session_key] = cand
 
 
 def scan_proc_root_sessions(
     home: Path,
     proc_root: Path = Path("/proc"),
+    *,
+    allowed_pids: set[int] | None = None,
+    excluded_pids: set[int] | None = None,
+    claimed_claude_sids: Mapping[str, int] | None = None,
 ) -> list[SessionMatch]:
     """Discover active foreground root sessions for ``codex``, ``agy``, and ``claude``."""
     if not proc_root.is_dir():
         return []
+    if allowed_pids is not None:
+        if not allowed_pids:
+            return []
+        proc_dirs = [
+            proc_root / str(pid)
+            for pid in sorted(allowed_pids)
+            if pid > 0 and (proc_root / str(pid)).is_dir()
+        ]
+    else:
+        proc_dirs = _iter_numeric_proc_dirs(proc_root)
 
+    codex_root_dir = home / ".codex"
+    agy_root_dir = home / ".gemini"
     codex_names = _load_codex_thread_names(home)
     by_key: dict[str, SessionMatch] = {}
 
-    for proc_dir in _iter_numeric_proc_dirs(proc_root):
+    for proc_dir in proc_dirs:
+        pid = int(proc_dir.name)
+        if excluded_pids is not None and pid in excluded_pids:
+            continue
         cli_kind = _classify_proc_cli(proc_dir)
         if cli_kind is None:
             continue
@@ -1053,71 +1307,122 @@ def scan_proc_root_sessions(
         proc_cwd = _read_proc_cwd(proc_dir)
         fd_dir = proc_dir / "fd"
 
-        if cli_kind in ("codex", "agy"):
+        if cli_kind == "codex":
             try:
                 fd_names = os.listdir(fd_dir)
             except OSError:
                 continue
             for fd_name in fd_names:
                 target = _readlink_clean(fd_dir / fd_name)
-                if not target:
+                if not target or not target.endswith(".jsonl"):
                     continue
-                if cli_kind == "codex":
-                    if (
-                        not target.endswith(".jsonl")
-                        or not os.path.basename(target).startswith("rollout-")
-                        or not os.path.isfile(target)
-                    ):
-                        continue
-                    is_cli, sid, meta_cwd = _read_codex_root_meta(target)
-                    if not is_cli or not sid:
-                        continue
-                    _upsert_newer_match(
-                        by_key,
-                        SessionMatch(
-                            cli="codex",
-                            session_id=sid,
-                            jsonl_path=target,
-                            cwd=meta_cwd or proc_cwd,
-                            matched_by="proc_scan",
-                            pts_mtime=pts_mtime,
-                            jsonl_mtime=_safe_mtime(target),
-                            thread_name=codex_names.get(sid, ""),
-                        ),
-                    )
-                else:
-                    if not target.endswith(".lock") or "/presence/" not in target.replace("\\", "/"):
-                        continue
-                    cid = Path(target).stem.lower()
-                    if not cid or not os.path.isfile(target):
-                        continue
-                    tp = _resolve_agy_transcript_path(home, cid)
-                    if tp is not None and _is_agy_transcript_subagent(tp):
-                        continue
-                    tp_str, j_mtime = _agy_transcript_and_mtime(home, cid, target)
-                    _upsert_newer_match(
-                        by_key,
-                        SessionMatch(
-                            cli="agy",
-                            session_id=cid,
-                            jsonl_path=tp_str,
-                            cwd=proc_cwd,
-                            matched_by="proc_scan",
-                            pts_mtime=pts_mtime,
-                            jsonl_mtime=j_mtime,
-                        ),
-                    )
+                base = os.path.basename(target)
+                if (
+                    not base.startswith("rollout-")
+                    or not _is_path_under_dir(target, codex_root_dir)
+                    or not os.path.isfile(target)
+                ):
+                    continue
+                is_cli, sid, meta_cwd = _read_codex_root_meta(target)
+                if not is_cli or not sid:
+                    continue
+                j_mtime = _safe_mtime(target)
+                cand = SessionMatch(
+                    cli="codex",
+                    session_id=sid,
+                    jsonl_path=target,
+                    cwd=meta_cwd or proc_cwd,
+                    matched_by="proc_scan",
+                    pts_mtime=pts_mtime,
+                    jsonl_mtime=j_mtime,
+                    thread_name=codex_names.get(sid, ""),
+                )
+                prev = by_key.get(cand.session_key)
+                if prev is None or (cand.pts_mtime, cand.jsonl_mtime) > (
+                    prev.pts_mtime,
+                    prev.jsonl_mtime,
+                ):
+                    by_key[cand.session_key] = cand
 
-        elif cli_kind == "claude" and proc_cwd:
-            cl_cands = _collect_claude_storage_matches(
-                home,
-                matched_by="proc_scan",
-                eff_cwd=proc_cwd,
-                include_global=False,
-                pts_mtime=pts_mtime,
-            )
-            if cl_cands:
-                _upsert_newer_match(by_key, max(cl_cands, key=lambda c: c.jsonl_mtime))
+        elif cli_kind == "agy":
+            try:
+                fd_names = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for fd_name in fd_names:
+                target = _readlink_clean(fd_dir / fd_name)
+                if not target or not target.endswith(".lock"):
+                    continue
+                if "/presence/" not in target.replace("\\", "/") or not _is_path_under_dir(
+                    target, agy_root_dir
+                ):
+                    continue
+                cid = Path(target).stem.lower()
+                if not cid or not os.path.isfile(target):
+                    continue
+                tp = _resolve_agy_transcript_path(home, cid)
+                if tp is not None and _is_agy_transcript_subagent(tp):
+                    continue
+                tp_str, j_mtime = _agy_transcript_and_mtime(home, cid, target)
+                cand = SessionMatch(
+                    cli="agy",
+                    session_id=cid,
+                    jsonl_path=tp_str,
+                    cwd=proc_cwd,
+                    matched_by="proc_scan",
+                    pts_mtime=pts_mtime,
+                    jsonl_mtime=j_mtime,
+                )
+                prev = by_key.get(cand.session_key)
+                if prev is None or (cand.pts_mtime, cand.jsonl_mtime) > (
+                    prev.pts_mtime,
+                    prev.jsonl_mtime,
+                ):
+                    by_key[cand.session_key] = cand
+
+        elif cli_kind == "claude":
+            if not proc_cwd:
+                continue
+            pinned_sid = _extract_claude_cmdline_sid(proc_dir)
+            best_pinned: SessionMatch | None = None
+            best_unclaimed: SessionMatch | None = None
+            for enc in encode_claude_project_dir(proc_cwd):
+                proj_dir = home / ".claude" / "projects" / enc
+                if not proj_dir.is_dir():
+                    continue
+                for jf in proj_dir.glob("*.jsonl"):
+                    if not jf.is_file():
+                        continue
+                    is_root, sid, meta_cwd = _read_claude_root_meta(
+                        jf, allow_empty_or_meta_only=True
+                    )
+                    if not is_root or not sid:
+                        continue
+                    j_mtime = _safe_mtime(jf)
+                    cand = SessionMatch(
+                        cli="claude",
+                        session_id=sid,
+                        jsonl_path=str(jf),
+                        cwd=meta_cwd or proc_cwd,
+                        matched_by="proc_scan",
+                        pts_mtime=pts_mtime,
+                        jsonl_mtime=j_mtime,
+                    )
+                    if pinned_sid and sid == pinned_sid:
+                        if best_pinned is None or cand.jsonl_mtime > best_pinned.jsonl_mtime:
+                            best_pinned = cand
+                    owner_pid = (claimed_claude_sids or {}).get(sid, 0)
+                    if owner_pid in (0, pid):
+                        if best_unclaimed is None or cand.jsonl_mtime > best_unclaimed.jsonl_mtime:
+                            best_unclaimed = cand
+            chosen = best_pinned or best_unclaimed
+            if chosen is not None:
+                prev = by_key.get(chosen.session_key)
+                if prev is None or (chosen.pts_mtime, chosen.jsonl_mtime) > (
+                    prev.pts_mtime,
+                    prev.jsonl_mtime,
+                ):
+                    by_key[chosen.session_key] = chosen
 
     return list(by_key.values())
 
@@ -1194,6 +1499,14 @@ def _disambiguate_candidates(
 # ---------------------------------------------------------------------------
 
 
+def _clean_pos_int(val: Any) -> int:
+    return int(val) if isinstance(val, int) and not isinstance(val, bool) and val > 0 else 0
+
+
+def _extract_record_pid(rec: Mapping[str, Any]) -> int:
+    return _clean_pos_int(rec.get("agent_pid")) or _clean_pos_int(rec.get("pid"))
+
+
 def _is_trusted_runtime_dir(rt_dir: Path) -> bool:
     try:
         st = os.lstat(rt_dir)
@@ -1259,7 +1572,10 @@ def write_session_registry_entry(
     session_id: str,
     jsonl_path: str,
     cwd: str = "",
+    tmux_pane: str = "",
+    tmux_socket: str = "",
     tty: str = "",
+    agent_pid: int = 0,
     pid: int = 0,
 ) -> Path:
     """Atomically write ``${runtime_dir}/sessions/<cli>-<sid[:8]>.json`` (0700 dirs, 0600 file)."""
@@ -1277,17 +1593,27 @@ def write_session_registry_entry(
     target = sessions_dir / f"{cli_low}-{prefix8}.json"
     nonce = uuid.uuid4().hex[:12]
     tmp = sessions_dir / f".{cli_low}-{prefix8}.{os.getpid()}.{nonce}.tmp"
+    tty_clean = _CTRL_STRIP_RE.sub("", (tty or "").strip())
+    eff_tty = normalize_tty_path(tty_clean) or tty_clean
+    eff_pid = _clean_pos_int(agent_pid) or _clean_pos_int(pid)
     payload: dict[str, Any] = {
         "cli": cli_low,
         "session_id": sid_low,
         "cwd": _normalize_cwd(cwd),
-        "tty": normalize_tty_path(tty),
+        "tty": eff_tty,
         "jsonl_path": jsonl_path,
         "transcript_path": jsonl_path,
         "updated_at": time.time(),
     }
-    if pid > 0:
-        payload["pid"] = int(pid)
+    pane_clean = _CTRL_STRIP_RE.sub("", (tmux_pane or "").strip())
+    if _TMUX_PANE_ID_RE.match(pane_clean):
+        payload["tmux_pane"] = pane_clean
+        sock_clean = _CTRL_STRIP_RE.sub("", (tmux_socket or "").strip())
+        if sock_clean:
+            payload["tmux_socket"] = sock_clean
+    if eff_pid > 0:
+        payload["agent_pid"] = eff_pid
+        payload["pid"] = eff_pid
     open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(str(tmp), open_flags, 0o600)
     try:
@@ -1324,24 +1650,46 @@ def _ordered_clis(preferred: str | None) -> tuple[str, ...]:
     return all_clis
 
 
+def _iter_trusted_registry_records(
+    runtime_dirs: Sequence[Path],
+    pattern: str = "*.json",
+) -> Iterator[tuple[int, Path, dict[str, Any]]]:
+    for dir_idx, sdir in _iter_trusted_sessions_dirs(runtime_dirs):
+        for reg_file in sdir.glob(pattern):
+            rec = _read_trusted_registry_json(reg_file)
+            if rec is not None:
+                yield dir_idx, reg_file, rec
+
+
 def _validate_registry_record(
     rec: Mapping[str, Any],
+    *,
+    expected_cli: str,
     home: Path,
     proc_root: Path | None,
-) -> tuple[str, str, str, str, float] | None:
-    """Validate a parsed ``sessions/*.json`` record and return ``(cli, sid, jsonl_path, cwd, updated_at)``."""
-    cli = str(rec.get("cli") or "").strip().lower()
+    matched_by: str = "registry",
+    fallback_cwd: str = "",
+    codex_names: Mapping[str, str] | None = None,
+) -> tuple[SessionMatch, float, int] | None:
     sid = str(rec.get("session_id") or "").strip().lower()
+    if not sid:
+        return None
+    agent_pid = _extract_record_pid(rec)
+    if agent_pid > 0 and proc_root is not None:
+        if proc_root.is_dir():
+            if _classify_proc_cli(proc_root / str(agent_pid)) != expected_cli:
+                return None
+        elif not _is_pid_alive(agent_pid):
+            return None
+
     raw_path = str(rec.get("jsonl_path") or rec.get("transcript_path") or "").strip()
     reg_cwd = _normalize_cwd(str(rec.get("cwd") or ""))
-    if cli not in ("codex", "claude", "agy") or not sid:
-        return None
     try:
         updated_at = float(rec.get("updated_at") or 0.0)
     except (TypeError, ValueError):
         updated_at = 0.0
 
-    if cli == "agy":
+    if expected_cli == "agy":
         valid_agy, live_cwd, _ = _resolve_valid_agy_root_meta(sid, home, proc_root)
         if not valid_agy:
             return None
@@ -1352,8 +1700,10 @@ def _validate_registry_record(
             raw_path = _upgrade_agy_transcript_path(raw_path)
         else:
             raw_path = str(_default_agy_expected_transcript_path(home, sid))
-        reg_cwd = reg_cwd or live_cwd
-    elif cli == "codex":
+        if not reg_cwd and live_cwd:
+            reg_cwd = live_cwd
+
+    elif expected_cli == "codex":
         if not raw_path:
             return None
         if os.path.isfile(raw_path) and os.path.getsize(raw_path) > 0:
@@ -1361,8 +1711,10 @@ def _validate_registry_record(
             if not is_cli:
                 return None
             sid = sid or meta_sid
-            reg_cwd = reg_cwd or meta_cwd
-    elif cli == "claude":
+            if not reg_cwd and meta_cwd:
+                reg_cwd = meta_cwd
+
+    elif expected_cli == "claude":
         if not raw_path:
             return None
         if os.path.isfile(raw_path) and os.path.getsize(raw_path) > 0:
@@ -1372,65 +1724,153 @@ def _validate_registry_record(
             if not is_root:
                 return None
             sid = sid or meta_sid
-            reg_cwd = reg_cwd or meta_cwd
-    return cli, sid, raw_path, reg_cwd, updated_at
-
-
-def _registry_record_to_match(
-    rec: dict[str, Any],
-    *,
-    home: Path,
-    proc_root: Path | None,
-    matched_by: str,
-    fallback_cwd: str = "",
-    codex_names: dict[str, str] | None = None,
-) -> SessionMatch | None:
-    validated = _validate_registry_record(rec, home, proc_root)
-    if validated is None:
+            if not reg_cwd and meta_cwd:
+                reg_cwd = meta_cwd
+    else:
         return None
-    cli, sid, raw_path, reg_cwd, updated_at = validated
-    return SessionMatch(
-        cli=cli,
-        session_id=sid,
-        jsonl_path=raw_path,
-        cwd=reg_cwd or fallback_cwd,
-        matched_by=matched_by,
-        pts_mtime=updated_at,
-        jsonl_mtime=_safe_mtime(raw_path),
-        thread_name=(codex_names.get(sid, "") if (codex_names and cli == "codex") else ""),
+
+    return (
+        SessionMatch(
+            cli=expected_cli,
+            session_id=sid,
+            jsonl_path=raw_path,
+            cwd=reg_cwd or _normalize_cwd(fallback_cwd),
+            matched_by=matched_by,
+            pts_mtime=updated_at,
+            jsonl_mtime=_safe_mtime(raw_path),
+            thread_name=(
+                codex_names.get(sid, "") if (expected_cli == "codex" and codex_names) else ""
+            ),
+        ),
+        updated_at,
+        agent_pid,
     )
 
 
-def _lookup_in_registry(
+@dataclass(frozen=True)
+class _RegistryHit:
+    match: SessionMatch
+    agent_pid: int = 0
+    tmux_pane: str = ""
+    tmux_socket: str = ""
+
+
+def _lookup_in_registry_detailed(
     hint: TitleHint,
     runtime_dirs: Sequence[Path],
     home: Path,
     proc_root: Path | None,
-) -> SessionMatch | None:
+    *,
+    matched_by: str = "registry",
+) -> tuple[_RegistryHit | None, bool]:
+    """Return ``(best_registry_hit, saw_stale_exited)``."""
     prefix8 = hint.session_token[:8].lower()
     clis = (hint.cli,) if (hint.explicit_cli and hint.cli) else _ordered_clis(hint.cli)
-    hits: list[tuple[int, int, float, SessionMatch]] = []
+    hits: list[tuple[int, int, float, _RegistryHit]] = []
+    saw_stale_exited = False
+    has_proc = proc_root is not None and proc_root.is_dir()
 
     for dir_idx, sdir in _iter_trusted_sessions_dirs(runtime_dirs):
         for cli_rank, cli in enumerate(clis):
             if not cli:
                 continue
-            rec = _read_trusted_registry_json(sdir / f"{cli}-{prefix8}.json")
+            reg_file = sdir / f"{cli}-{prefix8}.json"
+            rec = _read_trusted_registry_json(reg_file)
             if rec is None:
                 continue
-            sid_raw = str(rec.get("session_id") or "").strip().lower()
-            if not sid_raw or not sid_raw.startswith(hint.session_token):
+            sid = str(rec.get("session_id") or "").strip().lower()
+            if not sid or not sid.startswith(hint.session_token):
                 continue
-            cand = _registry_record_to_match(
-                {**rec, "cli": cli}, home=home, proc_root=proc_root, matched_by="registry"
+            rec_pid = _extract_record_pid(rec)
+            if rec_pid > 0 and proc_root is not None:
+                if has_proc:
+                    if _classify_proc_cli(proc_root / str(rec_pid)) != cli:
+                        saw_stale_exited = True
+                        continue
+                elif not _is_pid_alive(rec_pid):
+                    saw_stale_exited = True
+                    continue
+            validated = _validate_registry_record(
+                rec,
+                expected_cli=cli,
+                home=home,
+                proc_root=proc_root,
+                matched_by=matched_by,
             )
-            if cand is not None:
-                hits.append((-dir_idx, -cli_rank, cand.pts_mtime, cand))
+            if validated is None:
+                continue
+            cand, updated_at, agent_pid = validated
+            rec_pane = str(rec.get("tmux_pane") or "").strip()
+            rec_sock = str(rec.get("tmux_socket") or "").strip()
+            hits.append(
+                (
+                    -dir_idx,
+                    -cli_rank,
+                    updated_at,
+                    _RegistryHit(
+                        match=cand,
+                        agent_pid=agent_pid,
+                        tmux_pane=rec_pane if _TMUX_PANE_ID_RE.match(rec_pane) else "",
+                        tmux_socket=rec_sock,
+                    ),
+                )
+            )
 
     if not hits:
-        return None
+        return None, saw_stale_exited
     hits.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-    return hits[0][3]
+    return hits[0][3], False
+
+
+def _collect_live_claimed_claude_sids(
+    runtime_dirs: Sequence[Path],
+    proc_root: Path | None,
+) -> dict[str, int]:
+    """Return ``{session_id: agent_pid}`` for Claude sessions actively owned by a live PID."""
+    claimed: dict[str, int] = {}
+    if proc_root is None:
+        return claimed
+    has_proc = proc_root.is_dir()
+    for _, _, rec in _iter_trusted_registry_records(runtime_dirs, "claude-*.json"):
+        sid = str(rec.get("session_id") or "").strip().lower()
+        agent_pid = _extract_record_pid(rec)
+        if sid and agent_pid > 0 and sid not in claimed:
+            is_live = (
+                (_classify_proc_cli(proc_root / str(agent_pid)) == "claude")
+                if has_proc
+                else _is_pid_alive(agent_pid)
+            )
+            if is_live:
+                claimed[sid] = agent_pid
+    return claimed
+
+
+def _collect_registry_tmux_sockets(runtime_dirs: Sequence[Path]) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for _, _, rec in _iter_trusted_registry_records(runtime_dirs):
+        raw_sock = str(rec.get("tmux_socket") or "").strip()
+        if not raw_sock or not _is_live_owned_socket(raw_sock):
+            continue
+        real_sock = os.path.realpath(raw_sock)
+        if real_sock not in seen:
+            seen.add(real_sock)
+            found.append(preferred_tmux_socket_arg(raw_sock))
+            if len(found) >= _MAX_TMUX_SOCKET_TARGETS:
+                break
+    return found
+
+
+def _collect_tmux_bound_session_keys(runtime_dirs: Sequence[Path]) -> set[str]:
+    bound: set[str] = set()
+    for _, _, rec in _iter_trusted_registry_records(runtime_dirs):
+        if not str(rec.get("tmux_pane") or "").strip():
+            continue
+        cli = str(rec.get("cli") or "").strip().lower()
+        sid = str(rec.get("session_id") or "").strip().lower()
+        if cli in ("codex", "claude", "agy") and sid:
+            bound.add(f"{cli}:{sid}")
+    return bound
 
 
 def _lookup_by_full_uuid(
@@ -1453,7 +1893,9 @@ def _lookup_by_full_uuid(
             if hits:
                 return hits[0]
         elif cli == "agy":
-            agy_hit = _build_agy_match(uid, home=home, proc_root=proc_root, matched_by="title_uuid")
+            agy_hit = _build_agy_match(
+                uid, home=home, proc_root=proc_root, matched_by="title_uuid"
+            )
             if agy_hit is not None:
                 return agy_hit
         elif cli == "claude":
@@ -1609,38 +2051,36 @@ def _lookup_tty_in_registry(
 ) -> SessionMatch | None:
     codex_names = _load_codex_thread_names(home)
     hits: list[tuple[int, int, float, SessionMatch]] = []
-    for dir_idx, sdir in _iter_trusted_sessions_dirs(runtime_dirs):
-        for reg_file in sdir.glob("*.json"):
-            rec = _read_trusted_registry_json(reg_file)
-            if rec is None:
-                continue
-            reg_tty = normalize_tty_path(str(rec.get("tty") or ""))
-            try:
-                reg_pid = int(rec.get("pid") or 0)
-            except (TypeError, ValueError):
-                reg_pid = 0
+    for dir_idx, _, rec in _iter_trusted_registry_records(runtime_dirs):
+        reg_tty = normalize_tty_path(str(rec.get("tty") or ""))
+        reg_pid = _extract_record_pid(rec)
+        cli = str(rec.get("cli") or "").strip().lower()
+        if cli not in ("codex", "claude", "agy"):
+            continue
 
-            if reg_pid > 0 and reg_pid in live_pids:
-                pid_rank = 2
-            elif reg_tty == norm_tty:
-                if reg_pid > 0 and not _is_pid_alive(reg_pid):
-                    continue
-                if live_pids and str(rec.get("cli") or "").strip().lower() not in active_cli_set:
-                    continue
-                pid_rank = 1
-            else:
+        if reg_pid > 0 and reg_pid in live_pids:
+            pid_rank = 2
+        elif reg_tty == norm_tty:
+            if reg_pid > 0 and not _is_pid_alive(reg_pid):
                 continue
+            if live_pids and cli not in active_cli_set:
+                continue
+            pid_rank = 1
+        else:
+            continue
 
-            cand = _registry_record_to_match(
-                rec,
-                home=home,
-                proc_root=proc_root,
-                matched_by="tty_registry",
-                fallback_cwd=fallback_cwd,
-                codex_names=codex_names,
-            )
-            if cand is not None:
-                hits.append((pid_rank, -dir_idx, cand.pts_mtime, cand))
+        validated = _validate_registry_record(
+            rec,
+            expected_cli=cli,
+            home=home,
+            proc_root=proc_root,
+            matched_by="tty_registry",
+            fallback_cwd=fallback_cwd,
+            codex_names=codex_names,
+        )
+        if validated is not None:
+            cand, updated_at, _ = validated
+            hits.append((pid_rank, -dir_idx, updated_at, cand))
     if not hits:
         return None
     hits.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
@@ -1655,21 +2095,25 @@ def _find_storage_session_for_cli(
     eff_cwd: str,
     window_title: str,
     agent_pid: int = 0,
+    matched_by: str = "tty_ps",
+    claimed_claude_sids: Mapping[str, int] | None = None,
 ) -> SessionMatch | None:
     if cli_kind == "codex":
         cands = _collect_codex_storage_matches(
-            home, matched_by="tty_ps", eff_cwd=eff_cwd, limit=48
+            home, matched_by=matched_by, eff_cwd=eff_cwd, limit=48
         )
         return _disambiguate_candidates(cands, window_title, eff_cwd, home)
 
     if cli_kind == "claude":
         cands = _collect_claude_storage_matches(
             home,
-            matched_by="tty_ps",
+            matched_by=matched_by,
             eff_cwd=eff_cwd,
             filter_cwd=True,
             allow_empty_global=not bool(eff_cwd),
             limit=48,
+            claimed_claude_sids=claimed_claude_sids,
+            owner_pid=agent_pid,
         )
         return _disambiguate_candidates(cands, window_title, eff_cwd, home)
 
@@ -1683,7 +2127,11 @@ def _find_storage_session_for_cli(
                 for cid in _query_pid_agy_lock_cids(agent_pid, proc_root)
                 if (
                     cand := _build_agy_match(
-                        cid, home=home, proc_root=proc_root, matched_by="tty_ps", fallback_cwd=eff_cwd
+                        cid,
+                        home=home,
+                        proc_root=proc_root,
+                        matched_by=matched_by,
+                        fallback_cwd=eff_cwd,
                     )
                 )
                 is not None
@@ -1694,7 +2142,7 @@ def _find_storage_session_for_cli(
         unknown_cwd_cands: list[SessionMatch] = []
         for lf in presence_dir.glob("*.lock"):
             cand = _build_agy_match(
-                lf.stem, home=home, proc_root=proc_root, matched_by="tty_ps"
+                lf.stem, home=home, proc_root=proc_root, matched_by=matched_by
             )
             if cand is None:
                 continue
@@ -1724,6 +2172,7 @@ def _resolve_by_window_tty(
     runtime_dirs: Sequence[Path],
     home: Path,
     proc_root: Path | None,
+    claimed_claude_sids: Mapping[str, int] | None = None,
 ) -> tuple[SessionMatch | None, bool]:
     """Resolve active session bound to ``norm_tty``; return ``(match, stop_fallback)``."""
     live_pids, interactive_agents, has_mux = _list_tty_processes(
@@ -1732,7 +2181,13 @@ def _resolve_by_window_tty(
     active_cli_set = {cli_k for _pid, cli_k in interactive_agents}
 
     reg_hit = _lookup_tty_in_registry(
-        norm_tty, live_pids, active_cli_set, runtime_dirs, home, proc_root, fallback_cwd=norm_cwd
+        norm_tty,
+        live_pids,
+        active_cli_set,
+        runtime_dirs,
+        home,
+        proc_root,
+        fallback_cwd=norm_cwd,
     )
     if reg_hit is not None:
         return reg_hit, True
@@ -1750,6 +2205,8 @@ def _resolve_by_window_tty(
             eff_cwd=eff_cwd,
             window_title=window_title,
             agent_pid=agent_pid,
+            matched_by="tty_ps",
+            claimed_claude_sids=claimed_claude_sids,
         )
         if hit is not None:
             return hit, True
@@ -1763,33 +2220,35 @@ def _scan_nonproc_fallback_sessions(
     home: Path,
     runtime_dirs: Sequence[Path],
     window_cwd: str = "",
+    *,
+    check_pid_alive: bool = True,
 ) -> list[SessionMatch]:
     """Fallback for macOS (no ``/proc``): active runtime registry + recent root transcripts."""
     codex_names = _load_codex_thread_names(home)
     by_key: dict[str, SessionMatch] = {}
     key_tier: dict[str, int] = {}
+    eff_proc_for_reg: Path | None = Path("/__nonproc__") if check_pid_alive else None
 
-    for dir_idx, sdir in _iter_trusted_sessions_dirs(runtime_dirs):
-        for reg_file in sdir.glob("*.json"):
-            rec = _read_trusted_registry_json(reg_file)
-            if rec is None:
-                continue
-            try:
-                reg_pid = int(rec.get("pid") or 0)
-            except (TypeError, ValueError):
-                reg_pid = 0
-            if reg_pid > 0 and not _is_pid_alive(reg_pid):
-                continue
-            cand = _registry_record_to_match(
-                rec, home=home, proc_root=None, matched_by="recent_root", codex_names=codex_names
-            )
-            if cand is None:
-                continue
-            prev = by_key.get(cand.session_key)
-            prev_tier = key_tier.get(cand.session_key, 999999)
-            if prev is None or (-dir_idx, cand.pts_mtime) >= (-prev_tier, prev.pts_mtime):
-                by_key[cand.session_key] = cand
-                key_tier[cand.session_key] = dir_idx
+    for dir_idx, _, rec in _iter_trusted_registry_records(runtime_dirs):
+        cli = str(rec.get("cli") or "").strip().lower()
+        if cli not in ("codex", "claude", "agy"):
+            continue
+        validated = _validate_registry_record(
+            rec,
+            expected_cli=cli,
+            home=home,
+            proc_root=eff_proc_for_reg,
+            matched_by="recent_root",
+            codex_names=codex_names,
+        )
+        if validated is None:
+            continue
+        cand, updated_at, _ = validated
+        prev = by_key.get(cand.session_key)
+        prev_tier = key_tier.get(cand.session_key, 999999)
+        if prev is None or (-dir_idx, updated_at) >= (-prev_tier, prev.pts_mtime):
+            by_key[cand.session_key] = cand
+            key_tier[cand.session_key] = dir_idx
 
     for cand in _collect_codex_storage_matches(
         home, matched_by="recent_root", limit=24, codex_names=codex_names
@@ -2001,7 +2460,7 @@ def _extract_codex_response_item(payload: Mapping[str, Any]) -> tuple[str, str] 
 # ---------------------------------------------------------------------------
 
 _TECH_IDENT_RE = re.compile(
-    r"\b(?:[A-Za-z0-9_-]+\.(?:py|sh|ps1|toml|json|md|ts|tsx|js|rs|go|yaml|yml)|[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+|[a-z]+(?:[A-Z][a-z0-9]+)+)\b"
+    r"\b(?:[A-Za-z0-9_-]+\.(?:py|sh|ps1|swift|toml|json|md|ts|tsx|js|rs|go|yaml|yml)|[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+|[a-z]+(?:[A-Z][a-z0-9]+)+)\b"
 )
 
 
@@ -2115,6 +2574,14 @@ def _hash_file_prefix(f: BinaryIO, length: int) -> tuple[int, bytes]:
     return read_total, h.digest()
 
 
+def _tty_matches(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    na = normalize_tty_path(a) or a.strip()
+    nb = normalize_tty_path(b) or b.strip()
+    return na == nb or _norm_same_path(na, nb)
+
+
 class SessionTracker:
     """Thread-safe stateful session resolver and incremental JSONL clean-turn extractor."""
 
@@ -2126,6 +2593,9 @@ class SessionTracker:
         proc_root: str | Path | None = "/proc",
         env: Mapping[str, str] | None = None,
         git_cache_ttl_sec: float = 2.0,
+        tmux_socket: str | Path | None = None,
+        tmux_socket_name: str | None = None,
+        tmux_probe_fn: Callable[[], TmuxServerSnapshot] | None = None,
     ) -> None:
         self.env = os.environ if env is None else env
         self.home = (
@@ -2141,9 +2611,430 @@ class SessionTracker:
         )
         self.proc_root = Path(proc_root) if proc_root is not None else None
         self.git_cache_ttl_sec = git_cache_ttl_sec
+        self._tmux_socket = str(tmux_socket).strip() if tmux_socket is not None else ""
+        self._tmux_socket_name = (tmux_socket_name or "").strip()
+        self._tmux_probe_fn = tmux_probe_fn
         self._lock = threading.RLock()
         self._states: dict[str, SessionState] = {}
         self._git_cache: dict[str, tuple[float, str, list[str]]] = {}
+
+    def _has_explicit_tmux_override(self) -> bool:
+        return bool(
+            self._tmux_probe_fn is not None
+            or self._tmux_socket
+            or self._tmux_socket_name
+        )
+
+    def _probe_tmux(self, rt_dirs: Sequence[Path] = ()) -> TmuxServerSnapshot:
+        if self._tmux_probe_fn is not None:
+            try:
+                return self._tmux_probe_fn()
+            except Exception:
+                return TmuxServerSnapshot()
+        # Synthetic fake-/proc or proc_root=None tests without an explicit tmux override must never touch host tmux
+        if self.proc_root != Path("/proc") and not self._has_explicit_tmux_override():
+            return TmuxServerSnapshot()
+        extra_socks = _collect_registry_tmux_sockets(rt_dirs) if rt_dirs else ()
+        return probe_tmux_snapshot(
+            env=self.env,
+            tmux_socket=self._tmux_socket or None,
+            tmux_socket_name=self._tmux_socket_name or None,
+            extra_sockets=extra_socks,
+        )
+
+    @staticmethod
+    def _select_active_tmux_target(
+        snap: TmuxServerSnapshot,
+        window_title: str = "",
+        *,
+        window_tty: str = "",
+        window_pid: int = 0,
+    ) -> tuple[TmuxClientInfo, TmuxPaneInfo] | None:
+        if not snap.clients or not snap.panes:
+            return None
+        resolved_pairs: list[tuple[TmuxClientInfo, TmuxPaneInfo]] = []
+        for client in snap.clients:
+            chosen_pane: TmuxPaneInfo | None = None
+            if client.pane_id:
+                for p in snap.panes:
+                    if (
+                        p.pane_id == client.pane_id
+                        and _same_tmux_server(client.socket_path, p.socket_path)
+                        and (not client.session_id or p.session_id == client.session_id)
+                        and (not client.window_id or p.window_id == client.window_id)
+                    ):
+                        chosen_pane = p
+                        break
+            if chosen_pane is None:
+                for p in snap.panes:
+                    if (
+                        p.session_id == client.session_id
+                        and (
+                            p.window_id == client.window_id
+                            if client.window_id
+                            else p.window_active
+                        )
+                        and p.pane_active
+                        and _same_tmux_server(client.socket_path, p.socket_path)
+                    ):
+                        chosen_pane = p
+                        break
+            if chosen_pane is not None:
+                resolved_pairs.append((client, chosen_pane))
+
+        if not resolved_pairs:
+            return None
+        if len(resolved_pairs) == 1:
+            return resolved_pairs[0]
+
+        if window_tty:
+            tty_hits = [
+                pair
+                for pair in resolved_pairs
+                if pair[0].client_tty and _tty_matches(pair[0].client_tty, window_tty)
+            ]
+            if len(tty_hits) == 1:
+                return tty_hits[0]
+            if tty_hits:
+                resolved_pairs = tty_hits
+
+        if window_pid > 1:
+            pid_hits = [pair for pair in resolved_pairs if pair[0].client_pid == window_pid]
+            if len(pid_hits) == 1:
+                return pid_hits[0]
+            if pid_hits:
+                resolved_pairs = pid_hits
+
+        wtitle = (window_title or "").strip()
+        title_low = wtitle.lower()
+        if title_low:
+            title_hits: list[tuple[TmuxClientInfo, TmuxPaneInfo]] = []
+            for client, pane in resolved_pairs:
+                pt = (pane.pane_title or "").strip().lower()
+                if (_is_meaningful_pane_title(pt) and pt in title_low) or _dir_basename_in_title(
+                    wtitle, pane.current_path
+                ):
+                    title_hits.append((client, pane))
+            if len(title_hits) == 1:
+                return title_hits[0]
+
+        resolved_pairs.sort(
+            key=lambda pair: (pair[0].activity, 1 if pair[0].focused else 0),
+            reverse=True,
+        )
+        return resolved_pairs[0]
+
+    @staticmethod
+    def _outer_hint_belongs_to_tmux(
+        window_title: str,
+        hint: TitleHint,
+        active_pane: TmuxPaneInfo,
+    ) -> bool:
+        del window_title
+        ptitle = (active_pane.pane_title or "").strip()
+        if not ptitle:
+            return False
+        pane_hint = parse_window_title_hint(ptitle)
+        return pane_hint is not None and pane_hint.session_token == hint.session_token
+
+    def _should_prefer_non_tmux(
+        self,
+        window_title: str,
+        active_client: TmuxClientInfo,
+        active_pane: TmuxPaneInfo,
+        non_tmux_cands: Sequence[SessionMatch],
+    ) -> bool:
+        """Distinguish foreground non-tmux terminal tabs from an attached ``tmux`` tab."""
+        if not non_tmux_cands:
+            return False
+
+        wtitle = (window_title or "").strip()
+        title_low = wtitle.lower()
+        ptitle = (active_pane.pane_title or "").strip()
+        ptitle_low = ptitle.lower()
+
+        if wtitle:
+            # 1. Quoted tmux set-titles '"<pane_title>"' -> foreground tab IS tmux
+            if len(ptitle_low) >= 4 and f'"{ptitle_low}"' in title_low:
+                return False
+
+            has_ptitle_in_outer = _is_meaningful_pane_title(ptitle_low) and (
+                ptitle_low in title_low
+            )
+
+            non_tmux_cwd = any(
+                c.cwd and _dir_basename_in_title(wtitle, c.cwd) for c in non_tmux_cands
+            )
+            tmux_paths: list[str] = []
+            if active_pane.current_path:
+                tmux_paths.append(active_pane.current_path)
+            elif (
+                active_client.client_pid > 1
+                and self.proc_root is not None
+                and self.proc_root.is_dir()
+            ):
+                tmux_paths.append(
+                    _read_proc_cwd(self.proc_root / str(active_client.client_pid))
+                )
+            tmux_cwd = any(p and _dir_basename_in_title(wtitle, p) for p in tmux_paths)
+
+            cli_word = _infer_cli_word_from_title(wtitle)
+            pane_cli_word = _infer_cli_word_from_title(ptitle) if has_ptitle_in_outer else None
+            non_tmux_exclusive_cli = bool(
+                cli_word
+                and any(c.cli == cli_word for c in non_tmux_cands)
+                and cli_word != pane_cli_word
+            )
+            non_tmux_exclusive_topic = any(
+                c.thread_name
+                and len(c.thread_name) >= 2
+                and c.thread_name.lower() in title_low
+                and (not has_ptitle_in_outer or c.thread_name.lower() not in ptitle_low)
+                for c in non_tmux_cands
+            )
+
+            # 2. Unquoted tmux set-titles ('#T' / 'tmux: #T'): active pane_title forwarded to outer window
+            if has_ptitle_in_outer:
+                if (
+                    (non_tmux_cwd and not tmux_cwd)
+                    or non_tmux_exclusive_cli
+                    or non_tmux_exclusive_topic
+                ):
+                    return True
+                return False
+
+            has_spinner = bool(_TUI_SPINNER_RE.search(wtitle))
+
+            # 3. Explicit word 'tmux' (unless outer title is a non-tmux spinner or thread_name topic)
+            if (
+                _WORD_TMUX_RE.search(wtitle)
+                and not has_spinner
+                and not non_tmux_exclusive_topic
+            ):
+                return False
+
+            # 4. Explicit CLI name, TUI spinner ('✳' / Braille), or Codex thread_name on outer window
+            if non_tmux_exclusive_cli:
+                return True
+            if has_spinner:
+                return True
+            if non_tmux_exclusive_topic:
+                return True
+
+            # 5. Directory basename in outer shell title (e.g. 'user@host: ~/repos/proj')
+            if non_tmux_cwd and not tmux_cwd:
+                return True
+            if tmux_cwd and not non_tmux_cwd:
+                return False
+
+        # 5. Generic/empty title tie-breaker: compare non-tmux TTY/JSONL activity vs tmux client_activity
+        # (tmux client_activity has 1-second integer precision and ignores background pane stdout)
+        if active_client.activity <= 0:
+            return False
+        best_non_tmux_ts = max(max(c.pts_mtime, c.jsonl_mtime) for c in non_tmux_cands)
+        return best_non_tmux_ts >= (active_client.activity + 1.0)
+
+    def _resolve_tmux_active_pane_detailed(
+        self,
+        active_pane: TmuxPaneInfo,
+        rt_dirs: Sequence[Path],
+        *,
+        window_title: str = "",
+        claimed_claude: Mapping[str, int] | None = None,
+    ) -> tuple[SessionMatch | None, bool]:
+        """Two-stage resolution scoped strictly to ``active_pane``; returns ``(match, authoritative_empty)``."""
+        has_proc = self.proc_root is not None and self.proc_root.is_dir()
+        use_ps = self.proc_root is not None and not has_proc
+        pane_pids: set[int] = set()
+        live_pane_clis: dict[str, set[int]] = {}
+        pane_proc_cands: list[SessionMatch] = []
+        darwin_live_pids: set[int] = set()
+        darwin_agents: list[tuple[int, str]] = []
+
+        eff_claimed = (
+            claimed_claude
+            if claimed_claude is not None
+            else _collect_live_claimed_claude_sids(rt_dirs, self.proc_root)
+        )
+
+        if has_proc and self.proc_root is not None:
+            pane_pids = _collect_pane_pids(
+                self.proc_root, active_pane.pane_pid, active_pane.pane_tty
+            )
+            live_pane_clis = _collect_live_cli_pids(self.proc_root, pane_pids)
+            pane_proc_cands = scan_proc_root_sessions(
+                self.home,
+                self.proc_root,
+                allowed_pids=pane_pids,
+                claimed_claude_sids=eff_claimed,
+            )
+        elif use_ps:
+            norm_pane_tty = normalize_tty_path(active_pane.pane_tty)
+            if norm_pane_tty:
+                darwin_live_pids, darwin_agents, _ = _list_tty_processes(
+                    norm_pane_tty, None, window_pid=active_pane.pane_pid
+                )
+
+        darwin_active_clis = {cli_k for _pid, cli_k in darwin_agents}
+
+        def _is_live_in_pane(cand: SessionMatch, rec_agent_pid: int = 0) -> bool:
+            if not has_proc:
+                if not use_ps:
+                    return True
+                if rec_agent_pid > 0 and not _is_pid_alive(rec_agent_pid):
+                    return False
+                if darwin_live_pids and cand.cli not in darwin_active_clis:
+                    if not (rec_agent_pid > 0 and _ps_pid_matches_cli(rec_agent_pid, cand.cli)):
+                        return False
+                return True
+            cli_pids = live_pane_clis.get(cand.cli)
+            if not cli_pids:
+                return False
+            if rec_agent_pid > 0:
+                if rec_agent_pid not in cli_pids:
+                    return False
+                if cand.cli == "agy":
+                    return any(c.session_key == cand.session_key for c in pane_proc_cands)
+                if cand.cli == "codex":
+                    live_codex = [c for c in pane_proc_cands if c.cli == "codex"]
+                    if live_codex:
+                        return any(c.session_key == cand.session_key for c in live_codex)
+                return True
+            return any(c.session_key == cand.session_key for c in pane_proc_cands)
+
+        def _enrich_from_pane(cand: SessionMatch, matched_by: str) -> SessionMatch:
+            proc_hit = next(
+                (c for c in pane_proc_cands if c.session_key == cand.session_key), None
+            )
+            eff_cwd = _normalize_cwd(
+                cand.cwd
+                or (proc_hit.cwd if proc_hit else "")
+                or active_pane.current_path
+            )
+            eff_pts = cand.pts_mtime or (proc_hit.pts_mtime if proc_hit else 0.0)
+            eff_tname = cand.thread_name or (proc_hit.thread_name if proc_hit else "")
+            return SessionMatch(
+                cli=cand.cli,
+                session_id=cand.session_id,
+                jsonl_path=cand.jsonl_path,
+                cwd=eff_cwd,
+                matched_by=matched_by,
+                pts_mtime=eff_pts,
+                jsonl_mtime=cand.jsonl_mtime,
+                thread_name=eff_tname,
+            )
+
+        # Stage 1a: Active pane's #{pane_title} [#tag] or full UUID
+        pane_hint = parse_window_title_hint(active_pane.pane_title)
+        if pane_hint is not None:
+            reg_hit, saw_stale_exited = _lookup_in_registry_detailed(
+                pane_hint,
+                rt_dirs,
+                self.home,
+                self.proc_root,
+                matched_by="tmux_registry",
+            )
+            if reg_hit is not None:
+                if _is_live_in_pane(reg_hit.match, reg_hit.agent_pid):
+                    return _enrich_from_pane(reg_hit.match, "tmux_registry"), False
+                saw_stale_exited = True
+            if not saw_stale_exited:
+                if pane_hint.is_full_uuid:
+                    uuid_hit = _lookup_by_full_uuid(pane_hint, self.home, self.proc_root)
+                    if uuid_hit is not None and _is_live_in_pane(uuid_hit):
+                        return _enrich_from_pane(uuid_hit, "tmux_pane_title"), False
+                else:
+                    pfx_hit = _lookup_by_short_prefix(
+                        pane_hint, self.home, self.proc_root, pane_proc_cands
+                    )
+                    if pfx_hit is not None and _is_live_in_pane(pfx_hit):
+                        return _enrich_from_pane(pfx_hit, "tmux_pane_title"), False
+
+        # Stage 1b: Runtime session registry entries bound to active_pane.pane_id
+        pane_reg_hits: list[tuple[int, float, SessionMatch]] = []
+        for dir_idx, _, rec in _iter_trusted_registry_records(rt_dirs):
+            if str(rec.get("tmux_pane") or "").strip() != active_pane.pane_id:
+                continue
+            rec_sock = str(rec.get("tmux_socket") or "").strip()
+            if (
+                rec_sock
+                and active_pane.socket_path
+                and not _norm_same_path(rec_sock, active_pane.socket_path)
+            ):
+                continue
+            rec_tty = str(rec.get("tty") or "").strip()
+            if (
+                rec_tty
+                and active_pane.pane_tty
+                and not _tty_matches(rec_tty, active_pane.pane_tty)
+            ):
+                continue
+            cli = str(rec.get("cli") or "").strip().lower()
+            validated = _validate_registry_record(
+                rec,
+                expected_cli=cli,
+                home=self.home,
+                proc_root=self.proc_root,
+                matched_by="tmux_registry",
+            )
+            if validated is None:
+                continue
+            cand, updated_at, agent_pid = validated
+            if not _is_live_in_pane(cand, agent_pid):
+                continue
+            pane_reg_hits.append((-dir_idx, updated_at, cand))
+
+        if pane_reg_hits:
+            pane_reg_hits.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return _enrich_from_pane(pane_reg_hits[0][2], "tmux_registry"), False
+
+        # Stage 2a: Scoped /proc root-session discovery inside active_pane's process tree ONLY
+        if pane_proc_cands:
+            best = _disambiguate_candidates(
+                pane_proc_cands,
+                active_pane.pane_title or window_title,
+                active_pane.current_path,
+                self.home,
+            )
+            if best is not None:
+                return _enrich_from_pane(best, "tmux_proc_scan"), False
+
+        # Stage 2b: Scoped Darwin (non-/proc) active-pane process + storage discovery via ps/lsof
+        if use_ps and darwin_agents:
+            pane_cwd = _normalize_cwd(active_pane.current_path)
+            for agent_pid, cli_kind in darwin_agents:
+                eff_cwd = pane_cwd or _query_pid_cwd_nonproc(agent_pid)
+                hit = _find_storage_session_for_cli(
+                    cli_kind,
+                    home=self.home,
+                    proc_root=self.proc_root,
+                    eff_cwd=eff_cwd,
+                    window_title=active_pane.pane_title or window_title,
+                    agent_pid=agent_pid,
+                    matched_by="tmux_proc_scan",
+                    claimed_claude_sids=eff_claimed,
+                )
+                if hit is not None:
+                    return _enrich_from_pane(hit, "tmux_proc_scan"), False
+            return None, True
+
+        return None, bool(has_proc or (use_ps and darwin_live_pids))
+
+    def _resolve_tmux_active_pane(
+        self,
+        active_pane: TmuxPaneInfo,
+        rt_dirs: Sequence[Path],
+        *,
+        window_title: str = "",
+        claimed_claude: Mapping[str, int] | None = None,
+    ) -> SessionMatch | None:
+        hit, _ = self._resolve_tmux_active_pane_detailed(
+            active_pane,
+            rt_dirs,
+            window_title=window_title,
+            claimed_claude=claimed_claude,
+        )
+        return hit
 
     def _candidate_runtime_dirs(self) -> list[Path]:
         dirs: list[Path] = [self.runtime_dir]
@@ -2188,69 +3079,242 @@ class SessionTracker:
         window_cwd: str = "",
         window_pid: int = 0,
     ) -> SessionMatch | None:
-        """Resolve foreground main CLI session via title O(1) lookup, split TTY/CWD, or ``/proc`` fallback."""
+        """Resolve foreground main CLI session via title O(1) lookup, tmux active pane, split TTY/CWD, or fallback."""
         with self._lock:
             rt_dirs = self._candidate_runtime_dirs()
             norm_tty = normalize_tty_path(window_tty)
             norm_cwd = _normalize_cwd(window_cwd)
             hint = parse_window_title_hint(window_title)
+            tmux_snap = self._probe_tmux(rt_dirs=rt_dirs)
+            active_target = self._select_active_tmux_target(
+                tmux_snap, window_title, window_tty=norm_tty, window_pid=window_pid
+            )
+            has_proc = self.proc_root is not None and self.proc_root.is_dir()
+            is_real_proc = has_proc and self.proc_root == Path("/proc")
+            claimed_claude = (
+                _collect_live_claimed_claude_sids(rt_dirs, self.proc_root)
+                if self.proc_root is not None
+                else {}
+            )
 
-            if hint is not None:
-                def _with_cwd(hit: SessionMatch | None) -> SessionMatch | None:
-                    return (
-                        replace(hit, cwd=norm_cwd)
-                        if (hit is not None and norm_cwd and not hit.cwd)
-                        else hit
-                    )
-
-                reg_hit = _lookup_in_registry(hint, rt_dirs, self.home, self.proc_root)
-                if reg_hit is not None:
-                    return _with_cwd(reg_hit)
-                if hint.is_full_uuid:
-                    return _with_cwd(_lookup_by_full_uuid(hint, self.home, self.proc_root))
-
-                proc_cands = (
-                    scan_proc_root_sessions(self.home, self.proc_root)
-                    if (self.proc_root is not None and self.proc_root.is_dir())
-                    else []
-                )
-                # Explicit session tag in title that matches no valid root session MUST return None
-                # rather than silently guessing an unrelated window's conversation!
-                return _with_cwd(
-                    _lookup_by_short_prefix(hint, self.home, self.proc_root, proc_cands)
+            def _with_cwd(hit: SessionMatch | None) -> SessionMatch | None:
+                return (
+                    replace(hit, cwd=norm_cwd)
+                    if (hit is not None and norm_cwd and not hit.cwd)
+                    else hit
                 )
 
-            if not norm_tty and window_pid > 0 and not (
-                self.proc_root is not None and self.proc_root.is_dir()
+            outer_hint_owned_by_tmux = bool(
+                hint is not None
+                and active_target is not None
+                and self._outer_hint_belongs_to_tmux(window_title, hint, active_target[1])
+            )
+            stale_hint_fallthrough = False
+            neutralize_outer_title = False
+
+            if (
+                hint is not None
+                and active_target is not None
+                and not outer_hint_owned_by_tmux
+                and any(
+                    p.pane_id != active_target[1].pane_id
+                    and _same_tmux_server(p.socket_path, active_target[1].socket_path)
+                    and self._outer_hint_belongs_to_tmux(window_title, hint, p)
+                    for p in tmux_snap.panes
+                )
             ):
+                outer_hint_owned_by_tmux = True
+                neutralize_outer_title = True
+
+            if hint is not None and not outer_hint_owned_by_tmux:
+                reg_hit, saw_stale_exited = _lookup_in_registry_detailed(
+                    hint, rt_dirs, self.home, self.proc_root
+                )
+                if reg_hit is not None:
+                    if (
+                        active_target is not None
+                        and reg_hit.tmux_pane
+                        and _same_tmux_server(reg_hit.tmux_socket, active_target[1].socket_path)
+                    ):
+                        outer_hint_owned_by_tmux = True
+                        if reg_hit.tmux_pane != active_target[1].pane_id:
+                            neutralize_outer_title = True
+                    else:
+                        return _with_cwd(reg_hit.match)
+                elif saw_stale_exited:
+                    stale_hint_fallthrough = True
+                else:
+                    all_proc_cands = (
+                        scan_proc_root_sessions(
+                            self.home,
+                            self.proc_root,
+                            claimed_claude_sids=claimed_claude,
+                        )
+                        if (has_proc and self.proc_root is not None)
+                        else []
+                    )
+                    if hint.is_full_uuid:
+                        disk_hit = _lookup_by_full_uuid(hint, self.home, self.proc_root)
+                    else:
+                        disk_hit = _lookup_by_short_prefix(
+                            hint, self.home, self.proc_root, all_proc_cands
+                        )
+                    if disk_hit is None:
+                        # Explicit session tag in title that matches no valid root session MUST return None
+                        # rather than silently guessing an unrelated window's conversation!
+                        return None
+                    if is_real_proc and not any(
+                        c.session_key == disk_hit.session_key for c in all_proc_cands
+                    ):
+                        stale_hint_fallthrough = True
+                    else:
+                        return _with_cwd(disk_hit)
+
+            eff_title = (
+                ""
+                if (stale_hint_fallthrough or neutralize_outer_title)
+                else (window_title or "")
+            )
+
+            if not norm_tty and window_pid > 0 and not has_proc and self.proc_root is not None:
                 pinfo = ps_proc_info(window_pid)
-                if pinfo is not None and pinfo[2] and _classify_interactive_cli(pinfo[0], pinfo[3]):
+                if pinfo is not None and pinfo[2] and (
+                    _classify_interactive_cli(pinfo[0], pinfo[3])
+                    or pinfo[0].lower() in ("tmux", "screen", "zellij")
+                ):
                     norm_tty = pinfo[2]
 
-            if norm_tty:
+            if stale_hint_fallthrough or norm_tty:
+                active_target = self._select_active_tmux_target(
+                    tmux_snap, eff_title, window_tty=norm_tty, window_pid=window_pid
+                )
+
+            tty_matches_tmux_client = bool(
+                norm_tty
+                and any(
+                    c.client_tty and _tty_matches(c.client_tty, norm_tty)
+                    for c in tmux_snap.clients
+                )
+            )
+            if norm_tty and not tty_matches_tmux_client:
                 tty_hit, stop_fallback = _resolve_by_window_tty(
                     norm_tty,
                     norm_cwd=norm_cwd,
                     window_pid=window_pid,
-                    window_title=window_title,
+                    window_title=eff_title,
                     runtime_dirs=rt_dirs,
                     home=self.home,
                     proc_root=self.proc_root,
+                    claimed_claude_sids=claimed_claude,
                 )
                 if tty_hit is not None or stop_fallback:
                     return tty_hit
 
-            if self.proc_root is not None and self.proc_root.is_dir():
-                proc_cands = scan_proc_root_sessions(self.home, self.proc_root)
-                if proc_cands:
-                    return _disambiguate_candidates(
-                        proc_cands, window_title, norm_cwd, self.home
+            all_tmux_pids: set[int] = set()
+            if has_proc and self.proc_root is not None and (tmux_snap.panes or tmux_snap.clients):
+                roots = [p.pane_pid for p in tmux_snap.panes if p.pane_pid > 1] + [
+                    c.client_pid for c in tmux_snap.clients if c.client_pid > 1
+                ]
+                all_tmux_pids = _collect_descendant_pids(self.proc_root, roots)
+                for p in tmux_snap.panes:
+                    if p.pane_pid <= 1 and p.pane_tty:
+                        all_tmux_pids.update(
+                            _collect_pane_pids(self.proc_root, 0, p.pane_tty)
+                        )
+
+            if active_target is not None:
+                active_client, active_pane = active_target
+                if has_proc and self.proc_root is not None:
+                    if not outer_hint_owned_by_tmux and not tty_matches_tmux_client:
+                        non_tmux_cands = scan_proc_root_sessions(
+                            self.home,
+                            self.proc_root,
+                            excluded_pids=all_tmux_pids,
+                            claimed_claude_sids=claimed_claude,
+                        )
+                        if non_tmux_cands and self._should_prefer_non_tmux(
+                            eff_title, active_client, active_pane, non_tmux_cands
+                        ):
+                            return _disambiguate_candidates(
+                                non_tmux_cands, eff_title, norm_cwd, self.home
+                            )
+                    return self._resolve_tmux_active_pane(
+                        active_pane,
+                        rt_dirs,
+                        window_title=eff_title,
+                        claimed_claude=claimed_claude,
                     )
 
+                pane_hit, pane_authoritative_empty = self._resolve_tmux_active_pane_detailed(
+                    active_pane,
+                    rt_dirs,
+                    window_title=eff_title,
+                    claimed_claude=claimed_claude,
+                )
+                if outer_hint_owned_by_tmux or tty_matches_tmux_client:
+                    return pane_hit
+                tmux_bound_keys = _collect_tmux_bound_session_keys(rt_dirs)
+                if pane_hit is not None:
+                    tmux_bound_keys.add(pane_hit.session_key)
+                tmux_pane_uuids = {
+                    ph.session_token
+                    for p in tmux_snap.panes
+                    for ph in (parse_window_title_hint(p.pane_title),)
+                    if ph is not None and ph.is_full_uuid
+                }
+                all_fallback = _scan_nonproc_fallback_sessions(
+                    self.home,
+                    rt_dirs,
+                    window_cwd=norm_cwd,
+                    check_pid_alive=(self.proc_root is not None),
+                )
+                non_tmux_cands = [
+                    c
+                    for c in all_fallback
+                    if c.session_key not in tmux_bound_keys
+                    and c.session_id not in tmux_pane_uuids
+                ]
+                if non_tmux_cands and self._should_prefer_non_tmux(
+                    eff_title, active_client, active_pane, non_tmux_cands
+                ):
+                    return _disambiguate_candidates(
+                        non_tmux_cands, eff_title, norm_cwd, self.home
+                    )
+                if (
+                    pane_hit is not None
+                    or pane_authoritative_empty
+                    or (
+                        _WORD_TMUX_RE.search(eff_title)
+                        and not _TUI_SPINNER_RE.search(eff_title)
+                    )
+                ):
+                    return pane_hit
+                return _disambiguate_candidates(
+                    non_tmux_cands or all_fallback, eff_title, norm_cwd, self.home
+                )
+
+            if has_proc and self.proc_root is not None:
+                proc_cands = scan_proc_root_sessions(
+                    self.home,
+                    self.proc_root,
+                    excluded_pids=all_tmux_pids or None,
+                    claimed_claude_sids=claimed_claude,
+                )
+                if proc_cands:
+                    return _disambiguate_candidates(proc_cands, eff_title, norm_cwd, self.home)
+                if stale_hint_fallthrough or is_real_proc:
+                    return None
+
+            if stale_hint_fallthrough and self.proc_root is not None:
+                return None
+
             fallback_cands = _scan_nonproc_fallback_sessions(
-                self.home, rt_dirs, window_cwd=norm_cwd
+                self.home,
+                rt_dirs,
+                window_cwd=norm_cwd,
+                check_pid_alive=(self.proc_root is not None),
             )
-            return _disambiguate_candidates(fallback_cands, window_title, norm_cwd, self.home)
+            return _disambiguate_candidates(fallback_cands, eff_title, norm_cwd, self.home)
 
     def _reset_state(self, state: SessionState, new_path: str) -> None:
         state.jsonl_path = new_path
@@ -2267,7 +3331,7 @@ class SessionTracker:
 
     def _consume_parsed_record(self, state: SessionState, obj: Mapping[str, Any]) -> None:
         if not state.cwd and isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
-            state.cwd = obj["cwd"].strip()
+            state.cwd = _normalize_cwd(obj["cwd"])
 
         if state.cli == "agy":
             turn = _clean_agy_record(obj)
@@ -2284,7 +3348,7 @@ class SessionTracker:
             payload = obj.get("payload")
             if typ == "session_meta" and isinstance(payload, dict) and not state.cwd:
                 if isinstance(payload.get("cwd"), str):
-                    state.cwd = payload["cwd"].strip()
+                    state.cwd = _normalize_cwd(payload["cwd"])
             elif typ == "event_msg" and isinstance(payload, dict):
                 if payload.get("type") == "item_completed":
                     turn = _extract_codex_item_completed(payload)

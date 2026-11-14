@@ -6,13 +6,13 @@ Context-aware voice input for CLI coding agents (such as **Codex**, **Claude Cod
 
 Instead of treating terminal dictation like generic chat input, `agent-voice-input` pairs fast speech recognition with lightweight refinement grounded in your active coding session—fixing homophone identifiers, mixed Chinese–English technical terms, and spoken self-corrections before pasting safely into the terminal.
 
-> **Early Release (`v0.1.0`)**: Verified on **Windows Terminal + WSL2 (including Remote Desktop)** and **macOS + Ghostty**. Broader terminal support, deeper `tmux` integration, and more flexible Stage 2 model choices are actively in progress.
+> **Early Release (`v0.1.0`)**: Verified on **Windows Terminal + WSL2 (including `tmux` split panes and Remote Desktop)** and **macOS + Ghostty (including `tmux`)**. Broader terminal support and more flexible Stage 2 model choices are actively in progress.
 
 ---
 
 ## How It Works
 
-1. **Active Session Context**: Locates the foreground agent session (via optional terminal title tags, Ghostty split `tty`/`cwd` matching on macOS, or `/proc` root-session scanning on Linux while ignoring background subagents) and extracts recent dialogue plus `git status` filenames as context.
+1. **Active Session Context**: Locates the foreground agent session—including the active pane inside `tmux` without editing `~/.tmux.conf` (via optional terminal/pane title tags, runtime session registry, Ghostty split `tty`/`cwd` matching on macOS, or `/proc` / `ps` root-session scanning while ignoring background subagents and sibling panes)—and extracts recent dialogue plus `git status` filenames as context.
 2. **Stage 1 — Speech Recognition**: Applies a local silence gate (`-50 dBFS`) and RMS loudness normalization (`-20 dBFS`), then transcribes audio via cloud ASR (defaults to Alibaba Bailian `qwen3-asr-flash`; also supports Volcengine Doubao, Gemini, or OpenAI-compatible endpoints).
 3. **Stage 2 — Lightweight Context Refinement**: Cleans up technical terms and explicit spoken self-corrections against the extracted session context. For now, Stage 2 defaults to invoking a lightweight model through local Codex CLI (`codex-luna`), and can also be pointed to an OpenAI-compatible API or turned off (`off`).
 4. **Focus-Safe Paste**: Shows recording/recognition/refinement stages in a non-activating top HUD pill (Windows & macOS, automatically matching Chinese or English desktop UI language), locks onto the origin terminal window/split when recording begins, never auto-presses Enter, and falls back to clipboard-only if focus drifted elsewhere.
@@ -91,9 +91,9 @@ On macOS with **Ghostty**, `agent-voice-input` works out of the box without term
   - **Automation (Ghostty)**: Prompted once on first split query / text injection into Ghostty.
   - **Accessibility & Input Monitoring**: **Not required** for the default `RControl` + Ghostty setup. Only needed when pasting into non-Ghostty apps via simulated `Cmd+V` (Accessibility) or when binding non-modifier hotkeys / running `agent-voice-input key-test` (Input Monitoring / Accessibility).
 
-### Optional: Multi-Window Session Title Hooks
+### Optional: Multi-Window & `tmux` Session Title Hooks
 
-If you run multiple agent windows side by side on WSL2, inside `tmux`, or in terminals that do not expose per-split `tty`/`cwd`, see [`integrations/`](integrations/README.md) for optional terminal title hooks for Codex, Claude Code, and Antigravity CLI.
+`tmux` active-pane detection works out of the box without modifying `~/.tmux.conf`. If you run multiple agent windows or panes side by side in the same directory on WSL2, inside `tmux`, or in terminals that do not expose per-split `tty`/`cwd`, see [`integrations/`](integrations/README.md) for optional terminal/pane title hooks for Codex, Claude Code, and Antigravity CLI.
 
 ---
 
