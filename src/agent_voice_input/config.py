@@ -30,30 +30,102 @@ VALID_TRIGGER_MODES = frozenset({"tap_toggle", "ptt"})
 VALID_UI_LANGUAGES = frozenset({"auto", "zh", "en"})
 VALID_WSL_SOURCES = frozenset({"auto", "pulse", "winmm", "wasapi"})
 VALID_ASR_PROVIDERS = frozenset(
-    {"auto", "ali", "qwen", "doubao", "gemini", "gemini-flash-audio", "openai-compatible"}
+    {
+        "auto",
+        "dashscope",
+        "doubao",
+        "openrouter",
+        "gemini",
+        "openai",
+        "groq",
+        "siliconflow",
+        "openai-compatible",
+    }
 )
+VALID_ASR_APIS = frozenset({"auto", "audio-transcriptions", "chat-completions"})
 VALID_DOUBAO_MODES = frozenset({"auto", "flash", "submit"})
-VALID_REFINER_PROVIDERS = frozenset({"codex-luna", "openai-compatible", "off"})
-VALID_REFINER_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+VALID_REFINER_PROVIDERS = frozenset(
+    {
+        "codex",
+        "dashscope",
+        "volcengine",
+        "openrouter",
+        "gemini",
+        "openai",
+        "groq",
+        "siliconflow",
+        "openai-compatible",
+        "off",
+    }
+)
+VALID_EFFORTS = frozenset(
+    {"auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+VALID_REFINER_EFFORTS = VALID_EFFORTS
+
+ASR_AUTO_PRIORITY: tuple[str, ...] = (
+    "dashscope",
+    "doubao",
+    "openrouter",
+    "gemini",
+    "openai",
+    "groq",
+    "siliconflow",
+)
 
 DEFAULT_ASR_MODELS: dict[str, str] = {
-    "ali": "qwen3-asr-flash",
-    "qwen": "qwen3-asr-flash",
+    "dashscope": "qwen3-asr-flash",
     "doubao": "bigmodel",
+    "openrouter": "qwen/qwen3-asr-1.7b",
     "gemini": "gemini-2.5-flash",
-    "gemini-flash-audio": "gemini-2.5-flash",
-    "openai-compatible": "gpt-4o-transcribe",
+    "openai": "gpt-4o-mini-transcribe",
+    "groq": "whisper-large-v3-turbo",
+    "siliconflow": "FunAudioLLM/SenseVoiceSmall",
+    "openai-compatible": "gpt-4o-mini-transcribe",
 }
 
-# Strict credential lookup priority (suffix style first, prefix style second).
+DEFAULT_REFINER_MODELS: dict[str, str] = {
+    "codex": "gpt-6-luna",
+    "dashscope": "qwen-turbo-latest",
+    "volcengine": "doubao-seed-1-6-flash",
+    "openrouter": "google/gemini-2.5-flash-lite",
+    "gemini": "gemini-2.5-flash-lite",
+    "openai": "gpt-4o-mini",
+    "groq": "llama-3.3-70b-versatile",
+    "siliconflow": "Qwen/Qwen2.5-7B-Instruct",
+}
+
+DEFAULT_ASR_BASE_URLS: dict[str, str] = {
+    "doubao": "https://openspeech.bytedance.com/api/v3/auc/bigmodel",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta",
+    "openai": "https://api.openai.com/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "siliconflow": "https://api.siliconflow.cn/v1",
+}
+
+DEFAULT_REFINER_BASE_URLS: dict[str, str] = {
+    "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "volcengine": "https://ark.cn-beijing.volces.com/api/v3",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta",
+    "openai": "https://api.openai.com/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "siliconflow": "https://api.siliconflow.cn/v1",
+}
+
+# Strict credential lookup priority (canonical vendor env var first, legacy aliases second).
 # REDLINE: DOUBAO_ASR_API_ID / API_ID_DOUBAO_ASR typos MUST NEVER be added here.
 CREDENTIAL_ENV_ORDER: dict[str, tuple[str, ...]] = {
-    "ali": ("ALI_API_KEY", "API_KEY_ALI", "DASHSCOPE_API_KEY"),
-    "huoshan": ("HUOSHAN_API_KEY", "API_KEY_HUOSHAN", "ARK_API_KEY"),
+    "dashscope": ("DASHSCOPE_API_KEY", "ALI_API_KEY", "API_KEY_ALI"),
     "doubao_app_id": ("DOUBAO_ASR_APP_ID", "APP_ID_DOUBAO_ASR"),
     "doubao_key": ("DOUBAO_ASR_API_KEY", "API_KEY_DOUBAO_ASR"),
+    "volcengine": ("ARK_API_KEY", "VOLCENGINE_API_KEY", "HUOSHAN_API_KEY", "API_KEY_HUOSHAN"),
+    "openrouter": ("OPENROUTER_API_KEY", "API_KEY_OPENROUTER"),
     "gemini": ("GEMINI_API_KEY", "API_KEY_GEMINI"),
     "openai": ("OPENAI_API_KEY", "API_KEY_OPENAI"),
+    "groq": ("GROQ_API_KEY", "API_KEY_GROQ"),
+    "siliconflow": ("SILICONFLOW_API_KEY", "API_KEY_SILICONFLOW"),
 }
 
 _SENSITIVE_ENV_NAME_RE = re.compile(
@@ -64,10 +136,12 @@ _NON_SECRET_ENV_NAMES = frozenset(
     {
         "AGENT_VOICE_INPUT_HOTKEY",
         "AGENT_VOICE_INPUT_UI_LANGUAGE",
+        "AGENT_VOICE_INPUT_ASR_API",
         "AGENT_VOICE_INPUT_ASR_API_KEY_ENV",
         "AGENT_VOICE_INPUT_REFINER_API_KEY_ENV",
         "VOICE_INPUT_HOTKEY",
         "VOICE_INPUT_UI_LANGUAGE",
+        "VOICE_INPUT_ASR_API",
         "VOICE_INPUT_ASR_API_KEY_ENV",
         "VOICE_INPUT_REFINER_API_KEY_ENV",
         "SSH_AUTH_SOCK",
@@ -129,6 +203,8 @@ class AudioConfig:
 class AsrConfig:
     provider: str = "auto"
     model: str = ""
+    api: str = "auto"
+    effort: str = "auto"
     resource_id: str = "auto"
     doubao_mode: str = "auto"
     base_url: str = ""
@@ -137,30 +213,50 @@ class AsrConfig:
     timeout_sec: float = 15.0
 
     def canonical_provider(self) -> str:
-        p = self.provider.strip().lower()
-        if p == "qwen":
-            return "ali"
-        if p == "gemini-flash-audio":
-            return "gemini"
-        return p
+        return self.provider.strip().lower()
 
     def effective_model(self, resolved_provider: str | None = None) -> str:
         if self.model and self.model.strip():
             return self.model.strip()
         prov = (resolved_provider or self.provider).strip().lower()
-        return DEFAULT_ASR_MODELS.get(prov, DEFAULT_ASR_MODELS["ali"])
+        return DEFAULT_ASR_MODELS.get(prov, DEFAULT_ASR_MODELS["dashscope"])
+
+    def effective_base_url(self, resolved_provider: str | None = None) -> str:
+        if self.base_url and self.base_url.strip():
+            return self.base_url.strip()
+        prov = (resolved_provider or self.provider).strip().lower()
+        return DEFAULT_ASR_BASE_URLS.get(prov, "")
 
 
 @dataclass
 class RefinerConfig:
-    provider: str = "codex-luna"
-    model: str = "gpt-6-luna"
+    provider: str = "codex"
+    model: str = ""
     effort: str = "low"
     base_url: str = ""
     api_key_env: str = ""
     max_turns_per_thread: int = 20
     timeout_sec: float = 12.0
     force_on_single_hop: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.model or not self.model.strip():
+            prov = self.provider.strip().lower()
+            if prov in ("none", "false", "0", "disabled"):
+                prov = "off"
+            self.model = DEFAULT_REFINER_MODELS.get(prov, "")
+
+    def effective_model(self, resolved_provider: str | None = None) -> str:
+        if self.model and self.model.strip():
+            return self.model.strip()
+        prov = (resolved_provider or self.provider).strip().lower()
+        return DEFAULT_REFINER_MODELS.get(prov, "")
+
+    def effective_base_url(self, resolved_provider: str | None = None) -> str:
+        if self.base_url and self.base_url.strip():
+            return self.base_url.strip()
+        prov = (resolved_provider or self.provider).strip().lower()
+        return DEFAULT_REFINER_BASE_URLS.get(prov, "")
 
 
 @dataclass
@@ -193,14 +289,32 @@ class CredentialItem:
 
 @dataclass(frozen=True)
 class ProviderCredentials:
-    ali: CredentialItem | None = None
-    huoshan: CredentialItem | None = None
+    dashscope: CredentialItem | None = None
+    volcengine: CredentialItem | None = None
     doubao_app_id: CredentialItem | None = None
     doubao_key: CredentialItem | None = None
+    openrouter: CredentialItem | None = None
     gemini: CredentialItem | None = None
     openai: CredentialItem | None = None
+    groq: CredentialItem | None = None
+    siliconflow: CredentialItem | None = None
     asr_custom: CredentialItem | None = None
     refiner_custom: CredentialItem | None = None
+
+    def for_provider(self, provider: str) -> CredentialItem | None:
+        prov = provider.strip().lower()
+        mapping: dict[str, CredentialItem | None] = {
+            "dashscope": self.dashscope,
+            "volcengine": self.volcengine,
+            "doubao": self.doubao_key,
+            "openrouter": self.openrouter,
+            "gemini": self.gemini,
+            "openai": self.openai,
+            "groq": self.groq,
+            "siliconflow": self.siliconflow,
+            "openai-compatible": self.openai,
+        }
+        return mapping.get(prov)
 
     def all_secret_values(self) -> list[str]:
         vals: list[str] = []
@@ -964,6 +1078,20 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
     if asr is not None:
         if not isinstance(asr, Mapping):
             raise ConfigError("[asr] must be a table/object")
+        prev_asr_provider = cfg.asr.provider
+        has_explicit_asr_provider = asr.get("provider") is not None
+        has_explicit_asr_model = (
+            asr.get("model") is not None and str(asr.get("model")).strip() != ""
+        )
+        has_explicit_asr_api = (
+            asr.get("api") is not None and str(asr.get("api")).strip() != ""
+        )
+        has_explicit_asr_base_url = (
+            asr.get("base_url") is not None and str(asr.get("base_url")).strip() != ""
+        )
+        has_explicit_asr_key_env = (
+            asr.get("api_key_env") is not None and str(asr.get("api_key_env")).strip() != ""
+        )
         for k, v in asr.items():
             if v is None:
                 continue
@@ -971,6 +1099,10 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.asr.provider = _as_str(v, "asr.provider").strip().lower()
             elif k == "model":
                 cfg.asr.model = _as_str(v, "asr.model").strip()
+            elif k == "api":
+                cfg.asr.api = _as_str(v, "asr.api").strip().lower()
+            elif k == "effort":
+                cfg.asr.effort = _as_str(v, "asr.effort").strip().lower()
             elif k == "resource_id":
                 cfg.asr.resource_id = _as_str(v, "asr.resource_id").strip()
             elif k == "doubao_mode":
@@ -985,11 +1117,31 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.asr.timeout_sec = _as_float(v, "asr.timeout_sec")
             else:
                 raise ConfigError(f"unknown asr option {k!r}")
+        if has_explicit_asr_provider and cfg.asr.provider != prev_asr_provider:
+            if not has_explicit_asr_model:
+                cfg.asr.model = ""
+            if not has_explicit_asr_api:
+                cfg.asr.api = "auto"
+            if not has_explicit_asr_base_url:
+                cfg.asr.base_url = ""
+            if not has_explicit_asr_key_env:
+                cfg.asr.api_key_env = ""
 
     ref = data.get("refiner")
     if ref is not None:
         if not isinstance(ref, Mapping):
             raise ConfigError("[refiner] must be a table/object")
+        prev_ref_provider = cfg.refiner.provider
+        has_explicit_ref_provider = ref.get("provider") is not None
+        has_explicit_ref_model = (
+            ref.get("model") is not None and str(ref.get("model")).strip() != ""
+        )
+        has_explicit_ref_base_url = (
+            ref.get("base_url") is not None and str(ref.get("base_url")).strip() != ""
+        )
+        has_explicit_ref_key_env = (
+            ref.get("api_key_env") is not None and str(ref.get("api_key_env")).strip() != ""
+        )
         for k, v in ref.items():
             if v is None:
                 continue
@@ -1011,6 +1163,13 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.refiner.force_on_single_hop = _as_bool(v, "refiner.force_on_single_hop")
             else:
                 raise ConfigError(f"unknown refiner option {k!r}")
+        if has_explicit_ref_provider and cfg.refiner.provider != prev_ref_provider:
+            if not has_explicit_ref_model:
+                cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
+            if not has_explicit_ref_base_url:
+                cfg.refiner.base_url = ""
+            if not has_explicit_ref_key_env:
+                cfg.refiner.api_key_env = ""
 
 
 def _apply_env_overrides(cfg: Config, env: Mapping[str, str]) -> None:
@@ -1054,33 +1213,64 @@ def _apply_env_overrides(cfg: Config, env: Mapping[str, str]) -> None:
     if (kv := _get("TAIL_DRAIN_SEC", "AUDIO_TAIL_DRAIN_SEC")) is not None:
         cfg.audio.tail_drain_sec = _as_float(kv[1], kv[0])
 
-    if (kv := _get("ASR_PROVIDER")) is not None:
-        cfg.asr.provider = kv[1].lower()
-    if (kv := _get("ASR_MODEL")) is not None:
-        cfg.asr.model = kv[1]
+    prev_asr_provider = cfg.asr.provider
+    asr_prov_kv = _get("ASR_PROVIDER")
+    asr_model_kv = _get("ASR_MODEL")
+    asr_api_kv = _get("ASR_API")
+    asr_url_kv = _get("ASR_BASE_URL")
+    asr_key_kv = _get("ASR_API_KEY_ENV")
+    if asr_prov_kv is not None:
+        cfg.asr.provider = asr_prov_kv[1].lower()
+        if cfg.asr.provider != prev_asr_provider:
+            if asr_model_kv is None:
+                cfg.asr.model = ""
+            if asr_api_kv is None:
+                cfg.asr.api = "auto"
+            if asr_url_kv is None:
+                cfg.asr.base_url = ""
+            if asr_key_kv is None:
+                cfg.asr.api_key_env = ""
+    if asr_model_kv is not None:
+        cfg.asr.model = asr_model_kv[1]
+    if asr_api_kv is not None:
+        cfg.asr.api = asr_api_kv[1].lower()
+    if (kv := _get("ASR_EFFORT")) is not None:
+        cfg.asr.effort = kv[1].lower()
     if (kv := _get("ASR_RESOURCE_ID")) is not None:
         cfg.asr.resource_id = kv[1]
     if (kv := _get("ASR_DOUBAO_MODE")) is not None:
         cfg.asr.doubao_mode = kv[1].lower()
-    if (kv := _get("ASR_BASE_URL")) is not None:
-        cfg.asr.base_url = kv[1]
-    if (kv := _get("ASR_API_KEY_ENV")) is not None:
-        cfg.asr.api_key_env = kv[1]
+    if asr_url_kv is not None:
+        cfg.asr.base_url = asr_url_kv[1]
+    if asr_key_kv is not None:
+        cfg.asr.api_key_env = asr_key_kv[1]
     if (kv := _get("HOTWORDS_FILE")) is not None:
         cfg.asr.hotwords_file = kv[1]
     if (kv := _get("ASR_TIMEOUT_SEC")) is not None:
         cfg.asr.timeout_sec = _as_float(kv[1], kv[0])
 
-    if (kv := _get("REFINER")) is not None:
-        cfg.refiner.provider = _normalize_refiner_provider(kv[1])
-    if (kv := _get("REFINER_MODEL")) is not None:
-        cfg.refiner.model = kv[1]
+    prev_ref_provider = cfg.refiner.provider
+    ref_prov_kv = _get("REFINER_PROVIDER", "REFINER")
+    ref_model_kv = _get("REFINER_MODEL")
+    ref_url_kv = _get("REFINER_BASE_URL")
+    ref_key_kv = _get("REFINER_API_KEY_ENV")
+    if ref_prov_kv is not None:
+        cfg.refiner.provider = _normalize_refiner_provider(ref_prov_kv[1])
+        if cfg.refiner.provider != prev_ref_provider:
+            if ref_model_kv is None:
+                cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
+            if ref_url_kv is None:
+                cfg.refiner.base_url = ""
+            if ref_key_kv is None:
+                cfg.refiner.api_key_env = ""
+    if ref_model_kv is not None:
+        cfg.refiner.model = ref_model_kv[1]
     if (kv := _get("REFINER_EFFORT")) is not None:
         cfg.refiner.effort = kv[1].lower()
-    if (kv := _get("REFINER_BASE_URL")) is not None:
-        cfg.refiner.base_url = kv[1]
-    if (kv := _get("REFINER_API_KEY_ENV")) is not None:
-        cfg.refiner.api_key_env = kv[1]
+    if ref_url_kv is not None:
+        cfg.refiner.base_url = ref_url_kv[1]
+    if ref_key_kv is not None:
+        cfg.refiner.api_key_env = ref_key_kv[1]
     if (kv := _get("REFINER_MAX_TURNS")) is not None:
         cfg.refiner.max_turns_per_thread = _as_int(kv[1], kv[0])
     if (kv := _get("REFINER_TIMEOUT_SEC")) is not None:
@@ -1107,7 +1297,153 @@ def _expand_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, dict[st
     return nested
 
 
-def _validate_config(cfg: Config) -> None:
+def _host_matches_domain(url: str, *domains: str) -> bool:
+    try:
+        host = (urllib.parse.urlsplit(url.strip()).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return any(host == d or host.endswith(f".{d}") for d in domains)
+
+
+def is_gemini_native_url(base_url: str) -> bool:
+    """Return True when ``base_url`` targets Google's native ``:generateContent`` endpoint."""
+    b = base_url.strip().rstrip("/")
+    if not b:
+        return True
+    if _host_matches_domain(b, "googleapis.com"):
+        parsed = urllib.parse.urlsplit(b)
+        return "/openai" not in (parsed.path or "").lower()
+    return False
+
+
+def is_dashscope_native_multimodal_model(model: str, base_url: str = "") -> bool:
+    """Return True when DashScope model/URL uses the native multimodal-generation route."""
+    b = base_url.strip().lower().rstrip("/")
+    if b.endswith("/generation") or "/multimodal-generation" in b:
+        return True
+    m = model.strip().lower()
+    return (
+        m.startswith("qwen-audio-")
+        or m.startswith("fun-asr")
+        or m.startswith("paraformer")
+        or m.startswith("sensevoice")
+    )
+
+
+def classify_asr_model_api(model: str) -> str | None:
+    """Classify known dedicated STT vs multimodal chat-audio models (case-insensitive).
+
+    Returns ``'audio-transcriptions'``, ``'chat-completions'``, or ``None`` if unknown.
+    """
+    m = model.strip().lower()
+    if not m:
+        return None
+    slug = m.split("/", 1)[-1]
+    base_slug = slug.split(":", 1)[0]
+
+    # 1. Dedicated STT signatures (transcribe BEFORE gemini-, -stt/voxtral-mini-3b-2507 BEFORE voxtral-small*)
+    if (
+        m.startswith(("deepgram/", "assemblyai/", "elevenlabs/", "fish-audio/"))
+        or "whisper" in m
+        or "transcribe" in m
+        or "-stt" in m
+        or "_stt" in m
+        or base_slug.startswith("stt")
+        or base_slug.endswith("stt")
+        or "-asr" in m
+        or "_asr" in m
+        or base_slug.startswith("asr")
+        or base_slug.endswith("asr")
+        or "parakeet" in m
+        or "chirp-" in m
+        or "scribe-" in m
+        or "sensevoice" in m
+        or "telespeech" in m
+        or "voxtral-mini-3b-2507" in m
+    ):
+        return "audio-transcriptions"
+
+    # 2. Multimodal audio-understanding chat models
+    if (
+        base_slug.startswith("gpt-audio")
+        or "-gpt-audio" in m
+        or ("gpt-4o" in base_slug and "audio" in base_slug)
+        or "-omni" in m
+        or "_omni" in m
+        or base_slug.endswith("omni")
+        or base_slug.startswith("gemini-")
+        or base_slug.startswith("muse-")
+        or base_slug.startswith("mimo-")
+        or base_slug.startswith("voxtral-small")
+    ):
+        return "chat-completions"
+
+    return None
+
+
+def resolve_asr_api(
+    provider: str,
+    model: str,
+    api: str = "auto",
+    base_url: str = "",
+) -> str:
+    """Resolve effective Stage 1 ASR wire protocol and reject incompatible combinations."""
+    prov = provider.strip().lower()
+    req_api = (api or "auto").strip().lower()
+    if req_api not in VALID_ASR_APIS:
+        raise ConfigError(
+            f"asr.api must be one of {sorted(VALID_ASR_APIS)}, got {api!r}"
+        )
+    eff_model = model.strip() or DEFAULT_ASR_MODELS.get(prov, "")
+
+    if prov == "doubao":
+        if req_api != "auto":
+            raise ConfigError(
+                f"asr.api={req_api!r} is incompatible with provider 'doubao' "
+                "(uses native Doubao ASR protocol; keep asr.api='auto')"
+            )
+        return "doubao-native"
+
+    if prov == "gemini" and is_gemini_native_url(base_url):
+        if req_api != "auto":
+            raise ConfigError(
+                f"asr.api={req_api!r} is incompatible with native 'gemini' :generateContent "
+                "(keep asr.api='auto', or use provider='openrouter' / an OpenAI-compatible base_url)"
+            )
+        return "gemini-native"
+
+    if prov == "dashscope":
+        if is_dashscope_native_multimodal_model(eff_model, base_url):
+            if req_api != "auto":
+                raise ConfigError(
+                    f"asr.api={req_api!r} is incompatible with DashScope native multimodal model "
+                    f"{eff_model!r} (keep asr.api='auto')"
+                )
+            return "dashscope-native"
+        if req_api == "audio-transcriptions":
+            raise ConfigError(
+                "asr.api='audio-transcriptions' is not supported by provider 'dashscope'"
+            )
+        return "chat-completions"
+
+    if req_api != "auto":
+        return req_api
+
+    classified = classify_asr_model_api(eff_model)
+    if classified is not None:
+        return classified
+
+    if prov == "openrouter":
+        raise ConfigError(
+            f"cannot infer asr.api for unknown OpenRouter model {eff_model!r} with asr.api='auto'; "
+            "please explicitly set asr.api = 'audio-transcriptions' or 'chat-completions'"
+        )
+    return "audio-transcriptions"
+
+
+def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> None:
     if not cfg.hotkey.key:
         raise ConfigError("hotkey.key must not be empty")
     if cfg.hotkey.trigger_mode not in VALID_TRIGGER_MODES:
@@ -1144,6 +1480,14 @@ def _validate_config(cfg: Config) -> None:
         raise ConfigError(
             f"asr.provider must be one of {sorted(VALID_ASR_PROVIDERS)}, got {cfg.asr.provider!r}"
         )
+    if cfg.asr.api not in VALID_ASR_APIS:
+        raise ConfigError(
+            f"asr.api must be one of {sorted(VALID_ASR_APIS)}, got {cfg.asr.api!r}"
+        )
+    if cfg.asr.effort not in VALID_EFFORTS:
+        raise ConfigError(
+            f"asr.effort must be one of {sorted(VALID_EFFORTS)}, got {cfg.asr.effort!r}"
+        )
     if cfg.asr.doubao_mode not in VALID_DOUBAO_MODES:
         raise ConfigError(
             f"asr.doubao_mode must be one of {sorted(VALID_DOUBAO_MODES)}, "
@@ -1151,17 +1495,69 @@ def _validate_config(cfg: Config) -> None:
         )
     if cfg.asr.timeout_sec <= 0:
         raise ConfigError("asr.timeout_sec must be > 0")
+    if cfg.asr.provider == "openai-compatible" and not cfg.asr.base_url.strip():
+        raise ConfigError(
+            "asr.base_url must be explicitly set when asr.provider is 'openai-compatible' "
+            "(use asr.provider='openai' for the official OpenAI API)"
+        )
+
+    if cfg.asr.provider != "auto":
+        resolve_asr_api(
+            cfg.asr.provider,
+            cfg.asr.effective_model(cfg.asr.provider),
+            cfg.asr.api,
+            cfg.asr.base_url,
+        )
+    else:
+        auto_prov = _infer_provider_from_explicit_asr_hints(cfg.asr)
+        if auto_prov is None and env is not None:
+            creds = resolve_credentials(cfg, env)
+            if any(
+                getattr(creds, k) is not None
+                for k in (
+                    "asr_custom",
+                    "dashscope",
+                    "doubao_key",
+                    "openrouter",
+                    "gemini",
+                    "openai",
+                    "groq",
+                    "siliconflow",
+                )
+            ) or cfg.asr.base_url.strip():
+                auto_prov = select_asr_provider(cfg, creds)
+        if auto_prov is not None:
+            if auto_prov == "openai-compatible" and not cfg.asr.base_url.strip():
+                raise ConfigError(
+                    "asr.base_url must be explicitly set when asr.provider resolves to "
+                    "'openai-compatible' (set asr.base_url or choose a built-in asr.provider)"
+                )
+            resolve_asr_api(
+                auto_prov,
+                cfg.asr.effective_model(auto_prov),
+                cfg.asr.api,
+                cfg.asr.base_url,
+            )
 
     if cfg.refiner.provider not in VALID_REFINER_PROVIDERS:
         raise ConfigError(
             f"refiner.provider must be one of {sorted(VALID_REFINER_PROVIDERS)}, "
             f"got {cfg.refiner.provider!r}"
         )
-    if cfg.refiner.provider == "codex-luna" and cfg.refiner.effort not in VALID_REFINER_EFFORTS:
+    if cfg.refiner.provider != "off" and cfg.refiner.effort not in VALID_EFFORTS:
         raise ConfigError(
-            f"refiner.effort for codex-luna must be one of {sorted(VALID_REFINER_EFFORTS)}, "
+            f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, "
             f"got {cfg.refiner.effort!r}"
         )
+    if cfg.refiner.provider == "openai-compatible":
+        if not cfg.refiner.base_url.strip():
+            raise ConfigError(
+                "refiner.base_url must be explicitly set when refiner.provider is 'openai-compatible'"
+            )
+        if not cfg.refiner.model.strip():
+            raise ConfigError(
+                "refiner.model must be explicitly set when refiner.provider is 'openai-compatible'"
+            )
     if cfg.refiner.max_turns_per_thread <= 0:
         raise ConfigError("refiner.max_turns_per_thread must be > 0")
     if cfg.refiner.timeout_sec <= 0:
@@ -1244,7 +1640,10 @@ def load_config(
     if cli_overrides:
         _apply_section_dict(cfg, _expand_cli_overrides(cli_overrides))
 
-    _validate_config(cfg)
+    if not cfg.refiner.model.strip():
+        cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
+
+    _validate_config(cfg, env=effective_env)
     return cfg, effective_env
 
 
@@ -1266,7 +1665,7 @@ def _first_present_credential(
 def resolve_credentials(
     cfg: Config | None, env: Mapping[str, str] | None = None
 ) -> ProviderCredentials:
-    """Resolve provider credentials strictly honoring suffix-first priority."""
+    """Resolve provider credentials strictly honoring canonical vendor env priority."""
     src_env = os.environ if env is None else env
     asr_custom: CredentialItem | None = None
     refiner_custom: CredentialItem | None = None
@@ -1277,74 +1676,54 @@ def resolve_credentials(
             refiner_custom = _first_present_credential(src_env, (cfg.refiner.api_key_env.strip(),))
 
     return ProviderCredentials(
-        ali=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["ali"]),
-        huoshan=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["huoshan"]),
+        dashscope=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["dashscope"]),
+        volcengine=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["volcengine"]),
         doubao_app_id=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["doubao_app_id"]),
         doubao_key=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["doubao_key"]),
+        openrouter=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["openrouter"]),
         gemini=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["gemini"]),
         openai=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["openai"]),
+        groq=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["groq"]),
+        siliconflow=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["siliconflow"]),
         asr_custom=asr_custom,
         refiner_custom=refiner_custom,
     )
 
 
-def is_volces_host(url: str) -> bool:
-    """Strictly check whether ``url``'s hostname belongs to ``volces.com``."""
-    try:
-        host = (urllib.parse.urlsplit(url.strip()).hostname or "").lower().rstrip(".")
-    except ValueError:
-        return False
-    return host == "volces.com" or host.endswith(".volces.com")
-
-
-def _host_matches_domain(url: str, *domains: str) -> bool:
-    try:
-        host = (urllib.parse.urlsplit(url.strip()).hostname or "").lower().rstrip(".")
-    except ValueError:
-        return False
-    if not host:
-        return False
-    return any(host == d or host.endswith(f".{d}") for d in domains)
-
-
 def _infer_provider_from_explicit_asr_hints(asr_cfg: AsrConfig) -> str | None:
-    """Infer target ASR provider when ``provider='auto'`` has explicit url/model/api_key_env."""
+    """Infer target ASR provider when ``provider='auto'`` has explicit base_url, Doubao slot, or api_key_env."""
     url = asr_cfg.base_url.strip()
-    model = asr_cfg.model.strip().lower()
-    key_env = asr_cfg.api_key_env.strip().upper()
     rid = asr_cfg.resource_id.strip().lower()
     dmode = asr_cfg.doubao_mode.strip().lower()
+    key_env = asr_cfg.api_key_env.strip().upper()
 
     if url:
         if _host_matches_domain(url, "aliyuncs.com", "dashscope.aliyuncs.com"):
-            return "ali"
+            return "dashscope"
         if _host_matches_domain(url, "bytedance.com"):
             return "doubao"
+        if _host_matches_domain(url, "openrouter.ai"):
+            return "openrouter"
         if _host_matches_domain(url, "googleapis.com"):
             return "gemini"
+        if _host_matches_domain(url, "openai.com"):
+            return "openai"
+        if _host_matches_domain(url, "groq.com"):
+            return "groq"
+        if _host_matches_domain(url, "siliconflow.cn"):
+            return "siliconflow"
         return "openai-compatible"
-
-    if model:
-        if model.startswith(("qwen", "fun-asr", "paraformer", "sensevoice")):
-            return "ali"
-        if model == "bigmodel" or "seedasr" in model or "bigasr" in model:
-            return "doubao"
-        if model.startswith("gemini"):
-            return "gemini"
-        if "whisper" in model or "transcribe" in model:
-            return "openai-compatible"
 
     if (rid and rid != "auto") or (dmode and dmode != "auto"):
         return "doubao"
 
     if key_env:
-        if any(tok in key_env for tok in ("ALI", "DASHSCOPE", "QWEN")):
-            return "ali"
-        if "DOUBAO" in key_env:
-            return "doubao"
-        if "GEMINI" in key_env or "GOOGLE" in key_env:
-            return "gemini"
-        # Third-party custom key env (e.g. GROQ_API_KEY / OPENAI_* / HUOSHAN_*) -> openai-compatible
+        for group_key, names in CREDENTIAL_ENV_ORDER.items():
+            if key_env in names:
+                if group_key in ("doubao_app_id", "doubao_key"):
+                    return "doubao"
+                if group_key in VALID_ASR_PROVIDERS:
+                    return group_key
         return "openai-compatible"
 
     return None
@@ -1353,6 +1732,10 @@ def _infer_provider_from_explicit_asr_hints(asr_cfg: AsrConfig) -> str | None:
 def select_asr_provider(cfg: Config, creds: ProviderCredentials) -> str:
     """Resolve effective canonical ASR provider name without cross-vendor key leakage."""
     prov = cfg.asr.canonical_provider()
+    if prov not in VALID_ASR_PROVIDERS:
+        raise ConfigError(
+            f"asr.provider must be one of {sorted(VALID_ASR_PROVIDERS)}, got {cfg.asr.provider!r}"
+        )
     if prov != "auto":
         return prov
 
@@ -1360,15 +1743,10 @@ def select_asr_provider(cfg: Config, creds: ProviderCredentials) -> str:
     if inferred is not None:
         return inferred
 
-    if creds.ali is not None:
-        return "ali"
-    if creds.doubao_key is not None:
-        return "doubao"
-    if creds.gemini is not None:
-        return "gemini"
-    if creds.openai is not None:
-        return "openai-compatible"
-    return "ali"
+    for candidate in ASR_AUTO_PRIORITY:
+        if creds.for_provider(candidate) is not None:
+            return candidate
+    return "dashscope"
 
 
 # ---------------------------------------------------------------------------
@@ -1377,6 +1755,7 @@ def select_asr_provider(cfg: Config, creds: ProviderCredentials) -> str:
 
 _BEARER_RE = re.compile(r"(\bBearer\s+)[A-Za-z0-9._~+/=-]{4,}", re.IGNORECASE)
 _SK_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}")
+_GSK_TOKEN_RE = re.compile(r"\bgsk_[A-Za-z0-9_-]{12,}")
 _AIZA_TOKEN_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{12,}")
 _URL_USERINFO_SECRET_RE = re.compile(r"(https?://[^/\s:@]+:)[^/\s@]+(@)", re.IGNORECASE)
 _QUOTED_KEYVAL_SECRET_RE = re.compile(
@@ -1493,5 +1872,6 @@ def redact_secrets(
     out = _BEARER_RE.sub(r"\1[REDACTED]", out)
     out = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", out)
     out = _SK_TOKEN_RE.sub("[REDACTED]", out)
+    out = _GSK_TOKEN_RE.sub("[REDACTED]", out)
     out = _AIZA_TOKEN_RE.sub("[REDACTED]", out)
     return out

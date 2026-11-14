@@ -28,17 +28,28 @@ from agent_voice_input.audio_proc import (  # noqa: E402
     process_wav,
 )
 from agent_voice_input.config import (  # noqa: E402
+    ASR_AUTO_PRIORITY,
+    CREDENTIAL_ENV_ORDER,
     Config,
     ConfigError,
+    DEFAULT_ASR_BASE_URLS,
+    DEFAULT_ASR_MODELS,
+    DEFAULT_REFINER_BASE_URLS,
+    DEFAULT_REFINER_MODELS,
+    VALID_ASR_APIS,
+    VALID_ASR_PROVIDERS,
+    VALID_EFFORTS,
+    VALID_REFINER_PROVIDERS,
     _parse_simple_toml,
+    classify_asr_model_api,
     ensure_secure_dir,
     get_runtime_dir,
-    is_volces_host,
     load_config,
     load_env_files,
     parse_env_text,
     parse_toml,
     redact_secrets,
+    resolve_asr_api,
     resolve_credentials,
     select_asr_provider,
 )
@@ -130,7 +141,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 tap_max_ms = 900
 
                 [asr]
-                provider = "qwen"
+                provider = "dashscope"
                 timeout_sec = 20.0
 
                 [refiner]
@@ -227,7 +238,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg.hotkey.key, "F9")
             self.assertEqual(cfg.hotkey.trigger_mode, "ptt")
 
-    def test_rejects_float_for_int_nonfinite_float_and_invalid_luna_effort(self) -> None:
+    def test_rejects_float_for_int_nonfinite_float_and_invalid_effort_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             with self.assertRaises(ConfigError):
@@ -242,14 +253,26 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                     home_dir=home,
                     cli_overrides={"audio.floor_dbfs": float("nan")},
                 )
+            # All 9 canonical effort levels are accepted on both stages; bogus values raise ConfigError
+            for valid_eff in ("auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"):
+                ok_cfg, _ = load_config(
+                    env={
+                        "HOME": str(home),
+                        "AGENT_VOICE_INPUT_ASR_EFFORT": valid_eff,
+                        "AGENT_VOICE_INPUT_REFINER_EFFORT": valid_eff,
+                    },
+                    home_dir=home,
+                )
+                self.assertEqual(ok_cfg.asr.effort, valid_eff)
+                self.assertEqual(ok_cfg.refiner.effort, valid_eff)
             with self.assertRaises(ConfigError):
                 load_config(
-                    env={"HOME": str(home), "VOICE_INPUT_REFINER_EFFORT": "none"},
+                    env={"HOME": str(home), "VOICE_INPUT_REFINER_EFFORT": "ultra"},
                     home_dir=home,
                 )
             with self.assertRaises(ConfigError):
                 load_config(
-                    env={"HOME": str(home), "VOICE_INPUT_REFINER_EFFORT": "ultra"},
+                    env={"HOME": str(home), "AGENT_VOICE_INPUT_ASR_EFFORT": "turbo"},
                     home_dir=home,
                 )
             with self.assertRaises(ConfigError):
@@ -300,29 +323,43 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             {
                 "ALI_API_KEY": "ali_suffix_v",
                 "API_KEY_ALI": "ali_prefix_v",
-                "DASHSCOPE_API_KEY": "ali_dash_v",
+                "DASHSCOPE_API_KEY": "dash_canonical_v",
                 "HUOSHAN_API_KEY": "hs_suffix_v",
                 "API_KEY_HUOSHAN": "hs_prefix_v",
-                "ARK_API_KEY": "hs_ark_v",
+                "VOLCENGINE_API_KEY": "volc_suffix_v",
+                "ARK_API_KEY": "ark_canonical_v",
                 "DOUBAO_ASR_APP_ID": "db_appid_suffix",
                 "APP_ID_DOUBAO_ASR": "db_appid_prefix",
                 "DOUBAO_ASR_API_KEY": "db_key_suffix",
                 "API_KEY_DOUBAO_ASR": "db_key_prefix",
+                "OPENROUTER_API_KEY": "or_suffix_v",
+                "API_KEY_OPENROUTER": "or_prefix_v",
                 "GEMINI_API_KEY": "gem_suffix_v",
                 "API_KEY_GEMINI": "gem_prefix_v",
                 "OPENAI_API_KEY": "oai_suffix_v",
                 "API_KEY_OPENAI": "oai_prefix_v",
+                "GROQ_API_KEY": "groq_suffix_v",
+                "API_KEY_GROQ": "groq_prefix_v",
+                "SILICONFLOW_API_KEY": "sf_suffix_v",
+                "API_KEY_SILICONFLOW": "sf_prefix_v",
             },
         )
-        assert creds.ali is not None
-        assert creds.huoshan is not None
+        assert creds.dashscope is not None
+        assert creds.volcengine is not None
         assert creds.doubao_app_id is not None
         assert creds.doubao_key is not None
+        assert creds.openrouter is not None
         assert creds.gemini is not None
         assert creds.openai is not None
-        self.assertEqual((creds.ali.value, creds.ali.source_env), ("ali_suffix_v", "ALI_API_KEY"))
+        assert creds.groq is not None
+        assert creds.siliconflow is not None
         self.assertEqual(
-            (creds.huoshan.value, creds.huoshan.source_env), ("hs_suffix_v", "HUOSHAN_API_KEY")
+            (creds.dashscope.value, creds.dashscope.source_env),
+            ("dash_canonical_v", "DASHSCOPE_API_KEY"),
+        )
+        self.assertEqual(
+            (creds.volcengine.value, creds.volcengine.source_env),
+            ("ark_canonical_v", "ARK_API_KEY"),
         )
         self.assertEqual(
             (creds.doubao_app_id.value, creds.doubao_app_id.source_env),
@@ -333,17 +370,57 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             ("db_key_suffix", "DOUBAO_ASR_API_KEY"),
         )
         self.assertEqual(
+            (creds.openrouter.value, creds.openrouter.source_env),
+            ("or_suffix_v", "OPENROUTER_API_KEY"),
+        )
+        self.assertEqual(
             (creds.gemini.value, creds.gemini.source_env), ("gem_suffix_v", "GEMINI_API_KEY")
         )
         self.assertEqual(
             (creds.openai.value, creds.openai.source_env), ("oai_suffix_v", "OPENAI_API_KEY")
         )
+        self.assertEqual(
+            (creds.groq.value, creds.groq.source_env), ("groq_suffix_v", "GROQ_API_KEY")
+        )
+        self.assertEqual(
+            (creds.siliconflow.value, creds.siliconflow.source_env),
+            ("sf_suffix_v", "SILICONFLOW_API_KEY"),
+        )
 
-        self.assertNotIn("ali_suffix_v", repr(creds))
-        self.assertNotIn("ali_suffix_v", str(creds.ali))
-        self.assertIn("ALI_API_KEY", str(creds.ali))
+        # Fallback aliases work cleanly when canonical key is absent
+        creds_alias = resolve_credentials(
+            cfg,
+            {
+                "ALI_API_KEY": "ali_alias_v",
+                "VOLCENGINE_API_KEY": "volc_alias_v",
+                "API_KEY_OPENROUTER": "or_alias_v",
+                "API_KEY_GROQ": "groq_alias_v",
+                "API_KEY_SILICONFLOW": "sf_alias_v",
+            },
+        )
+        assert creds_alias.dashscope is not None
+        assert creds_alias.volcengine is not None
+        assert creds_alias.openrouter is not None
+        assert creds_alias.groq is not None
+        assert creds_alias.siliconflow is not None
+        self.assertEqual(creds_alias.dashscope.source_env, "ALI_API_KEY")
+        self.assertEqual(creds_alias.volcengine.source_env, "VOLCENGINE_API_KEY")
+        self.assertEqual(creds_alias.openrouter.source_env, "API_KEY_OPENROUTER")
+        self.assertEqual(creds_alias.groq.source_env, "API_KEY_GROQ")
+        self.assertEqual(creds_alias.siliconflow.source_env, "API_KEY_SILICONFLOW")
+
+        creds_hs = resolve_credentials(cfg, {"HUOSHAN_API_KEY": "hs_alias_v"})
+        assert creds_hs.volcengine is not None
+        self.assertEqual(creds_hs.volcengine.source_env, "HUOSHAN_API_KEY")
+
+        self.assertNotIn("dash_canonical_v", repr(creds))
+        self.assertNotIn("dash_canonical_v", str(creds.dashscope))
+        self.assertIn("DASHSCOPE_API_KEY", str(creds.dashscope))
 
         # REDLINE REGRESSION: typo API_ID_DOUBAO_ASR / DOUBAO_ASR_API_ID MUST return None!
+        for group_names in CREDENTIAL_ENV_ORDER.values():
+            for name in group_names:
+                self.assertNotIn("API_ID", name)
         creds_typo = resolve_credentials(
             cfg,
             {
@@ -358,27 +435,39 @@ class ConfigAndCredentialsTests(unittest.TestCase):
     def test_auto_provider_selection_and_custom_api_key_env_isolation(self) -> None:
         cfg = Config()
         self.assertEqual(
-            select_asr_provider(cfg, resolve_credentials(cfg, {"API_KEY_DOUBAO_ASR": "k"})),
-            "doubao",
+            ASR_AUTO_PRIORITY,
+            ("dashscope", "doubao", "openrouter", "gemini", "openai", "groq", "siliconflow"),
         )
-        self.assertEqual(
-            select_asr_provider(
-                cfg,
-                resolve_credentials(cfg, {"API_KEY_ALI": "a", "API_KEY_DOUBAO_ASR": "k"}),
-            ),
-            "ali",
-        )
-        self.assertEqual(
-            select_asr_provider(cfg, resolve_credentials(cfg, {"API_KEY_GEMINI": "g"})),
-            "gemini",
-        )
-        self.assertEqual(
-            select_asr_provider(cfg, resolve_credentials(cfg, {"API_KEY_OPENAI": "o"})),
-            "openai-compatible",
-        )
-        self.assertEqual(select_asr_provider(cfg, resolve_credentials(cfg, {})), "ali")
+        # Full ordered priority chain check
+        full_env = {
+            "DASHSCOPE_API_KEY": "k_dash",
+            "DOUBAO_ASR_API_KEY": "k_db",
+            "OPENROUTER_API_KEY": "k_or",
+            "GEMINI_API_KEY": "k_gem",
+            "OPENAI_API_KEY": "k_oai",
+            "GROQ_API_KEY": "k_groq",
+            "SILICONFLOW_API_KEY": "k_sf",
+        }
+        expected_chain = [
+            ("DASHSCOPE_API_KEY", "dashscope"),
+            ("DOUBAO_ASR_API_KEY", "doubao"),
+            ("OPENROUTER_API_KEY", "openrouter"),
+            ("GEMINI_API_KEY", "gemini"),
+            ("OPENAI_API_KEY", "openai"),
+            ("GROQ_API_KEY", "groq"),
+            ("SILICONFLOW_API_KEY", "siliconflow"),
+        ]
+        cur_env = dict(full_env)
+        for env_key, expected_prov in expected_chain:
+            self.assertEqual(
+                select_asr_provider(cfg, resolve_credentials(cfg, cur_env)),
+                expected_prov,
+            )
+            cur_env.pop(env_key)
+        # Empty env defaults to dashscope
+        self.assertEqual(select_asr_provider(cfg, resolve_credentials(cfg, {})), "dashscope")
 
-        # Custom third-party api_key_env / base_url with provider='auto' MUST NOT jump to doubao!
+        # Custom third-party api_key_env with provider='auto' MUST NOT jump to doubao!
         cfg_groq = Config()
         cfg_groq.asr.api_key_env = "GROQ_CUSTOM_KEY"
         env_mixed = {"GROQ_CUSTOM_KEY": "groq_val_123", "DOUBAO_ASR_API_KEY": "db_val_456"}
@@ -387,20 +476,16 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             "openai-compatible",
         )
 
-        # Explicit Doubao resource_id under provider='auto' MUST route to doubao even if ALI key exists
+        # Explicit Doubao resource_id under provider='auto' MUST route to doubao even if DashScope key exists
         cfg_db_rid = Config()
         cfg_db_rid.asr.resource_id = "volc.seedasr.auc"
         self.assertEqual(
             select_asr_provider(
                 cfg_db_rid,
-                resolve_credentials(cfg_db_rid, {"ALI_API_KEY": "a", "DOUBAO_ASR_API_KEY": "d"}),
+                resolve_credentials(cfg_db_rid, {"DASHSCOPE_API_KEY": "a", "DOUBAO_ASR_API_KEY": "d"}),
             ),
             "doubao",
         )
-
-        # Strict hostname check for volces.com (prevent substring spoofing)
-        self.assertTrue(is_volces_host("https://ark.cn-beijing.volces.com/api/v3"))
-        self.assertFalse(is_volces_host("https://evil-notvolces.com/v1"))
 
     def test_redact_secrets_dict_repr_custom_env_and_no_false_positive_on_tokens_count(self) -> None:
         dyn_sk = "sk-" + ("z" * 20)
@@ -528,6 +613,314 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             os.symlink(Path(tmp) / "missing_target", dangling)
             with self.assertRaises(ConfigError):
                 ensure_secure_dir(dangling)
+
+    def test_v020_legacy_provider_rejection_and_stage_validation_matrix(self) -> None:
+        self.assertEqual(
+            VALID_ASR_PROVIDERS,
+            frozenset({"auto", "dashscope", "doubao", "openrouter", "gemini", "openai", "groq", "siliconflow", "openai-compatible"}),
+        )
+        self.assertEqual(
+            VALID_REFINER_PROVIDERS,
+            frozenset({"codex", "dashscope", "volcengine", "openrouter", "gemini", "openai", "groq", "siliconflow", "openai-compatible", "off"}),
+        )
+        self.assertEqual(VALID_ASR_APIS, frozenset({"auto", "audio-transcriptions", "chat-completions"}))
+        self.assertEqual(
+            VALID_EFFORTS,
+            frozenset({"auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"}),
+        )
+
+        # Default Config uses canonical v0.2.0 values
+        dcfg = Config()
+        self.assertEqual(dcfg.asr.provider, "auto")
+        self.assertEqual(dcfg.asr.api, "auto")
+        self.assertEqual(dcfg.asr.effort, "auto")
+        self.assertEqual(dcfg.refiner.provider, "codex")
+        self.assertEqual(dcfg.refiner.model, "gpt-6-luna")
+        self.assertEqual(dcfg.refiner.effort, "low")
+
+        # Built-in default models & base_urls strictly match v0.2.0 table
+        self.assertEqual(DEFAULT_ASR_MODELS["dashscope"], "qwen3-asr-flash")
+        self.assertEqual(DEFAULT_ASR_MODELS["doubao"], "bigmodel")
+        self.assertEqual(DEFAULT_ASR_MODELS["openrouter"], "qwen/qwen3-asr-1.7b")
+        self.assertEqual(DEFAULT_ASR_MODELS["gemini"], "gemini-2.5-flash")
+        self.assertEqual(DEFAULT_ASR_MODELS["openai"], "gpt-4o-mini-transcribe")
+        self.assertEqual(DEFAULT_ASR_MODELS["groq"], "whisper-large-v3-turbo")
+        self.assertEqual(DEFAULT_ASR_MODELS["siliconflow"], "FunAudioLLM/SenseVoiceSmall")
+        self.assertEqual(DEFAULT_ASR_MODELS["openai-compatible"], "gpt-4o-mini-transcribe")
+
+        self.assertEqual(DEFAULT_REFINER_MODELS["codex"], "gpt-6-luna")
+        self.assertEqual(DEFAULT_REFINER_MODELS["dashscope"], "qwen-turbo-latest")
+        self.assertEqual(DEFAULT_REFINER_MODELS["volcengine"], "doubao-seed-1-6-flash")
+        self.assertEqual(DEFAULT_REFINER_MODELS["openrouter"], "google/gemini-2.5-flash-lite")
+        self.assertEqual(DEFAULT_REFINER_MODELS["gemini"], "gemini-2.5-flash-lite")
+        self.assertEqual(DEFAULT_REFINER_MODELS["openai"], "gpt-4o-mini")
+        self.assertEqual(DEFAULT_REFINER_MODELS["groq"], "llama-3.3-70b-versatile")
+        self.assertEqual(DEFAULT_REFINER_MODELS["siliconflow"], "Qwen/Qwen2.5-7B-Instruct")
+
+        self.assertEqual(DEFAULT_ASR_BASE_URLS["openrouter"], "https://openrouter.ai/api/v1")
+        self.assertEqual(DEFAULT_ASR_BASE_URLS["groq"], "https://api.groq.com/openai/v1")
+        self.assertEqual(DEFAULT_ASR_BASE_URLS["siliconflow"], "https://api.siliconflow.cn/v1")
+        self.assertEqual(DEFAULT_REFINER_BASE_URLS["volcengine"], "https://ark.cn-beijing.volces.com/api/v3")
+        self.assertEqual(DEFAULT_REFINER_BASE_URLS["dashscope"], "https://dashscope.aliyuncs.com/compatible-mode/v1")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            # Legacy v0.1.0 aliases and stage-mismatched providers MUST raise ConfigError
+            for bad_asr in ("ali", "qwen", "gemini-flash-audio", "codex-luna", "volcengine", "codex", "off"):
+                with self.subTest(bad_asr=bad_asr):
+                    with self.assertRaises(ConfigError):
+                        load_config(env={"HOME": str(home)}, home_dir=home, cli_overrides={"asr.provider": bad_asr})
+            for bad_refiner in ("codex-luna", "ali", "qwen", "gemini-flash-audio", "doubao", "auto"):
+                with self.subTest(bad_refiner=bad_refiner):
+                    with self.assertRaises(ConfigError):
+                        load_config(env={"HOME": str(home)}, home_dir=home, cli_overrides={"refiner.provider": bad_refiner})
+
+            # openai-compatible requires explicit base_url (and explicit model on Refiner)
+            with self.assertRaises(ConfigError):
+                load_config(env={"HOME": str(home)}, home_dir=home, cli_overrides={"asr.provider": "openai-compatible"})
+            ok_oai_asr, _ = load_config(
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={"asr.provider": "openai-compatible", "asr.base_url": "http://127.0.0.1:8000/v1"},
+            )
+            self.assertEqual(ok_oai_asr.asr.effective_model(), "gpt-4o-mini-transcribe")
+
+            with self.assertRaises(ConfigError):
+                load_config(
+                    env={"HOME": str(home)},
+                    home_dir=home,
+                    cli_overrides={"refiner.provider": "openai-compatible", "refiner.base_url": "http://127.0.0.1:8000/v1"},
+                )
+            with self.assertRaises(ConfigError):
+                load_config(
+                    env={"HOME": str(home)},
+                    home_dir=home,
+                    cli_overrides={"refiner.provider": "openai-compatible", "refiner.model": "local-qwen"},
+                )
+            ok_oai_ref, _ = load_config(
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={
+                    "refiner.provider": "openai-compatible",
+                    "refiner.base_url": "http://127.0.0.1:8000/v1",
+                    "refiner.model": "local-qwen",
+                },
+            )
+            self.assertEqual(ok_oai_ref.refiner.model, "local-qwen")
+
+    def test_cross_layer_provider_override_resets_inherited_model_and_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.toml").write_text(
+                """
+                [asr]
+                provider = "dashscope"
+                model = "fun-asr-realtime"
+                api = "auto"
+
+                [refiner]
+                provider = "codex"
+                model = "gpt-6-luna"
+                """,
+                encoding="utf-8",
+            )
+            # 1. Env overrides provider without model -> resets inherited model to new provider default!
+            cfg_env, _ = load_config(
+                env={
+                    "HOME": str(home),
+                    "AGENT_VOICE_INPUT_ASR_PROVIDER": "openrouter",
+                    "AGENT_VOICE_INPUT_REFINER_PROVIDER": "openrouter",
+                },
+                home_dir=home,
+            )
+            self.assertEqual(cfg_env.asr.provider, "openrouter")
+            self.assertEqual(cfg_env.asr.model, "")
+            self.assertEqual(cfg_env.asr.effective_model(), "qwen/qwen3-asr-1.7b")
+            self.assertEqual(cfg_env.refiner.provider, "openrouter")
+            self.assertEqual(cfg_env.refiner.model, "google/gemini-2.5-flash-lite")
+
+            # 2. CLI overrides provider without model -> resets env/TOML model to new provider default!
+            cfg_cli, _ = load_config(
+                env={
+                    "HOME": str(home),
+                    "AGENT_VOICE_INPUT_ASR_PROVIDER": "openrouter",
+                    "AGENT_VOICE_INPUT_ASR_MODEL": "google/gemini-2.5-flash",
+                    "AGENT_VOICE_INPUT_ASR_API": "chat-completions",
+                },
+                home_dir=home,
+                cli_overrides={
+                    "asr.provider": "groq",
+                    "refiner.provider": "volcengine",
+                },
+            )
+            self.assertEqual(cfg_cli.asr.provider, "groq")
+            self.assertEqual(cfg_cli.asr.model, "")
+            self.assertEqual(cfg_cli.asr.api, "auto")
+            self.assertEqual(cfg_cli.asr.effective_model(), "whisper-large-v3-turbo")
+            self.assertEqual(cfg_cli.refiner.provider, "volcengine")
+            self.assertEqual(cfg_cli.refiner.model, "doubao-seed-1-6-flash")
+
+            # 3. Same-layer provider + explicit model preserves explicit model
+            cfg_both, _ = load_config(
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={
+                    "asr.provider": "openrouter",
+                    "asr.model": "qwen/qwen3.8-omni-flash",
+                    "refiner.provider": "openrouter",
+                    "refiner.model": "anthropic/claude-haiku-4.5",
+                },
+            )
+            self.assertEqual(cfg_both.asr.model, "qwen/qwen3.8-omni-flash")
+            self.assertEqual(cfg_both.refiner.model, "anthropic/claude-haiku-4.5")
+
+            # 4. Switching away from openai-compatible in CLI clears inherited local base_url / api_key_env
+            (cfg_dir / "config.toml").write_text(
+                """
+                [asr]
+                provider = "openai-compatible"
+                base_url = "http://127.0.0.1:8000/v1"
+                model = "faster-whisper"
+                api_key_env = "LOCAL_ASR_KEY"
+
+                [refiner]
+                provider = "openai-compatible"
+                base_url = "http://127.0.0.1:8001/v1"
+                model = "local-qwen"
+                api_key_env = "LOCAL_REF_KEY"
+                """,
+                encoding="utf-8",
+            )
+            cfg_sw, _ = load_config(
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={"asr.provider": "openrouter", "refiner.provider": "openrouter"},
+            )
+            self.assertEqual(cfg_sw.asr.effective_base_url(), "https://openrouter.ai/api/v1")
+            self.assertEqual(cfg_sw.asr.effective_model(), "qwen/qwen3-asr-1.7b")
+            self.assertEqual(cfg_sw.asr.api_key_env, "")
+            self.assertEqual(cfg_sw.refiner.effective_base_url(), "https://openrouter.ai/api/v1")
+            self.assertEqual(cfg_sw.refiner.model, "google/gemini-2.5-flash-lite")
+            self.assertEqual(cfg_sw.refiner.api_key_env, "")
+
+    def test_asr_api_auto_classification_and_native_incompatibility_checks(self) -> None:
+        # Dedicated STT models -> audio-transcriptions (including gemini-*-transcribe & voxtral-mini-3b-2507 / -stt)
+        for stt_model in (
+            "qwen/qwen3-asr-1.7b",
+            "openai/whisper-large-v3-turbo",
+            "openai/gpt-4o-mini-transcribe",
+            "google/gemini-3.5-transcribe",
+            "deepgram/nova-3",
+            "assemblyai/universal-3-6-pro",
+            "elevenlabs/scribe-v1",
+            "fish-audio/fish-speech-1.5",
+            "nvidia/parakeet-tdt-0.6b-v2",
+            "google/chirp-2",
+            "FunAudioLLM/SenseVoiceSmall",
+            "TeleAI/TeleSpeechASR",
+            "mistralai/voxtral-mini-3b-2507",
+            "mistralai/voxtral-small-24b-2507-stt",
+        ):
+            with self.subTest(stt_model=stt_model):
+                self.assertEqual(classify_asr_model_api(stt_model), "audio-transcriptions")
+                self.assertEqual(resolve_asr_api("openrouter", stt_model, "auto"), "audio-transcriptions")
+
+        # Multimodal audio chat models -> chat-completions
+        for chat_model in (
+            "google/gemini-2.5-flash",
+            "google/gemini-3-flash-preview",
+            "openai/gpt-audio-mini",
+            "openai/gpt-4o-audio-preview",
+            "qwen/qwen3.8-omni-flash",
+            "mistralai/voxtral-small-24b-2507",
+            "xiaomi/mimo-audio-7b",
+            "muse-audio-1",
+        ):
+            with self.subTest(chat_model=chat_model):
+                self.assertEqual(classify_asr_model_api(chat_model), "chat-completions")
+                self.assertEqual(resolve_asr_api("openrouter", chat_model, "auto"), "chat-completions")
+
+        # Unknown model: OpenRouter + api="auto" raises ConfigError; explicit api succeeds; other 4 default to audio-transcriptions
+        self.assertIsNone(classify_asr_model_api("acme/custom-voice-v1"))
+        with self.assertRaises(ConfigError):
+            resolve_asr_api("openrouter", "acme/custom-voice-v1", "auto")
+        self.assertEqual(
+            resolve_asr_api("openrouter", "acme/custom-voice-v1", "audio-transcriptions"),
+            "audio-transcriptions",
+        )
+        self.assertEqual(
+            resolve_asr_api("openrouter", "acme/custom-voice-v1", "chat-completions"),
+            "chat-completions",
+        )
+        for other_prov in ("openai", "groq", "siliconflow", "openai-compatible"):
+            self.assertEqual(
+                resolve_asr_api(other_prov, "acme/custom-voice-v1", "auto"),
+                "audio-transcriptions",
+            )
+
+        # Native/dedicated providers reject incompatible explicit asr.api at config validation time
+        with self.assertRaises(ConfigError):
+            resolve_asr_api("doubao", "bigmodel", "audio-transcriptions")
+        with self.assertRaises(ConfigError):
+            resolve_asr_api("doubao", "bigmodel", "chat-completions")
+        with self.assertRaises(ConfigError):
+            resolve_asr_api("dashscope", "qwen3-asr-flash", "audio-transcriptions")
+        with self.assertRaises(ConfigError):
+            resolve_asr_api("dashscope", "fun-asr-realtime", "chat-completions")
+        with self.assertRaises(ConfigError):
+            resolve_asr_api("gemini", "gemini-2.5-flash", "audio-transcriptions")
+        self.assertEqual(resolve_asr_api("dashscope", "qwen3-asr-flash", "auto"), "chat-completions")
+        self.assertEqual(resolve_asr_api("dashscope", "fun-asr-realtime", "auto"), "dashscope-native")
+        self.assertEqual(resolve_asr_api("gemini", "gemini-2.5-flash", "auto"), "gemini-native")
+
+        # Regression: asr.provider="auto" with explicit hints validates openai-compatible base_url
+        # AND OpenRouter unknown-model api="auto" immediately in load_config (even without env vars set!)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir.mkdir(parents=True)
+
+            # 1) Custom api_key_env inferring openai-compatible without base_url -> ConfigError
+            (cfg_dir / "config.toml").write_text(
+                '[asr]\nprovider = "auto"\napi_key_env = "CUSTOM_THIRD_PARTY_STT_KEY"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ConfigError):
+                load_config(env={"HOME": str(home)}, home_dir=home)
+
+            # Adding base_url makes it valid
+            (cfg_dir / "config.toml").write_text(
+                '[asr]\nprovider = "auto"\napi_key_env = "CUSTOM_THIRD_PARTY_STT_KEY"\nbase_url = "http://127.0.0.1:8000/v1"\n',
+                encoding="utf-8",
+            )
+            ok_hint_cfg, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(ok_hint_cfg.asr.base_url, "http://127.0.0.1:8000/v1")
+
+            # 2) api_key_env = "OPENROUTER_API_KEY" + unknown model + api="auto" -> ConfigError even with empty env
+            (cfg_dir / "config.toml").write_text(
+                '[asr]\nprovider = "auto"\napi_key_env = "OPENROUTER_API_KEY"\nmodel = "acme/unknown-voice-model"\napi = "auto"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ConfigError):
+                load_config(env={"HOME": str(home)}, home_dir=home)
+
+    def test_redact_secrets_covers_gsk_openrouter_and_all_v020_credential_envs(self) -> None:
+        gsk_tok = "gsk_" + ("q" * 20)
+        or_tok = "sk-or-v1-" + ("r" * 20)
+        env = {
+            "DASHSCOPE_API_KEY": "dash_" + ("a" * 12),
+            "ARK_API_KEY": "ark_" + ("b" * 12),
+            "VOLCENGINE_API_KEY": "volc_" + ("c" * 12),
+            "OPENROUTER_API_KEY": "or_" + ("d" * 12),
+            "GROQ_API_KEY": "groq_" + ("e" * 12),
+            "SILICONFLOW_API_KEY": "sf_" + ("f" * 12),
+        }
+        raw = " ".join([*env.values(), gsk_tok, or_tok])
+        redacted = redact_secrets(raw, env)
+        for secret in (*env.values(), gsk_tok, or_tok):
+            self.assertNotIn(secret, redacted)
 
 
 class AudioProcTests(unittest.TestCase):

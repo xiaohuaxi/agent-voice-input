@@ -1,6 +1,7 @@
 # agent-voice-input example configuration
 # Default location: ~/.config/agent-voice-input/config.toml (also falls back to ~/.config/voice-input/config.toml)
-# Or specify explicitly via --config / AGENT_VOICE_INPUT_CONFIG
+# Priority: CLI flags > AGENT_VOICE_INPUT_* env vars > config.toml > built-in defaults
+# Specify a custom config file via --config / AGENT_VOICE_INPUT_CONFIG
 
 [hotkey]
 # Global hotkey:
@@ -37,33 +38,78 @@ beep = false
 # tail_drain_sec = 0.65
 
 [asr]
-# Stage 1 speech-to-text provider: "auto" | "ali" | "doubao" | "gemini" | "openai-compatible"
+# Stage 1 speech-to-text provider:
+# "auto" | "dashscope" | "doubao" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible"
+# When "auto", selects the first configured credential in priority order:
+#   dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow
 provider = "auto"
-# Leave empty to select each provider's default model automatically:
-# - ali -> "qwen3-asr-flash" (also supports "fun-asr-realtime" / "qwen-audio-3.0")
-# - doubao -> "bigmodel"
-# - gemini -> "gemini-2.5-flash" (single-hop audio + context refinement; skips Stage 2 by default)
-# - openai-compatible -> "gpt-4o-transcribe" (or a local faster-whisper-server model name)
+# Upstream model ID (kept verbatim; leave empty "" to use the provider's built-in default):
+# - dashscope         -> "qwen3-asr-flash" (also supports "fun-asr-realtime" / "qwen-audio-turbo-latest")
+# - doubao            -> "bigmodel"
+# - openrouter        -> "qwen/qwen3-asr-1.7b" (dedicated STT) or e.g. "google/gemini-2.5-flash" / "openai/gpt-audio-mini" (single-hop chat audio)
+# - gemini            -> "gemini-2.5-flash" (native :generateContent single-hop audio + context refinement; skips Stage 2 by default)
+# - openai            -> "gpt-4o-mini-transcribe"
+# - groq              -> "whisper-large-v3-turbo"
+# - siliconflow       -> "FunAudioLLM/SenseVoiceSmall"
+# - openai-compatible -> "gpt-4o-mini-transcribe" (requires explicit base_url, e.g. local faster-whisper-server)
 model = ""
-# Doubao resource slot: "auto" (auto-probes and caches available slot) or explicit e.g. "volc.seedasr.auc"
+# Wire protocol for OpenRouter / OpenAI-compatible channels:
+# "auto" | "audio-transcriptions" (dedicated STT -> Stage 2) | "chat-completions" (multimodal single-hop audio + context; skips Stage 2 by default)
+# Note: "auto" classifies known STT vs multimodal audio models automatically; for uncataloged models on "openrouter", set api explicitly.
+api = "auto"
+# Stage 1 thinking/reasoning budget:
+# "auto" (suppresses default thinking latency on supported multimodal models) | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+effort = "auto"
+# Doubao resource slot & mode: "auto" (auto-probes and caches available slot) or explicit e.g. "volc.seedasr.auc"
 resource_id = "auto"
+doubao_mode = "auto"
+# Required when provider = "openai-compatible"; built-in providers resolve base_url automatically
 base_url = ""
+# Optional custom environment variable name holding the Stage 1 API key
 api_key_env = ""
 hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 timeout_sec = 15.0
 
 [refiner]
-# Stage 2 context-aware refinement engine:
-# - "codex-luna" (default: resident codex app-server in-memory thread paired with a lightweight fast model)
-# - "openai-compatible"
-# - "off"
-provider = "codex-luna"
+# Stage 2 context-aware refinement provider:
+# "codex" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
+# Built-in default models (used when model = "" or when provider is overridden via CLI/env without a new model):
+# - codex             -> "gpt-6-luna" (resident codex app-server in-memory thread; never enables Fast mode)
+# - dashscope         -> "qwen-turbo-latest"
+# - volcengine        -> "doubao-seed-1-6-flash"
+# - openrouter        -> "google/gemini-2.5-flash-lite"
+# - gemini            -> "gemini-2.5-flash-lite"
+# - openai            -> "gpt-4o-mini"
+# - groq              -> "llama-3.3-70b-versatile"
+# - siliconflow       -> "Qwen/Qwen2.5-7B-Instruct"
+# - openai-compatible -> requires explicit base_url and model (loopback URLs require no API key)
+# - off               -> disable Stage 2 refinement
+provider = "codex"
 model = "gpt-6-luna"
+# Stage 2 thinking/reasoning budget:
+# "auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 effort = "low"
-# When provider = "openai-compatible", point base_url to Volcengine Ark / OpenAI / a local server:
-# base_url = "https://ark.cn-beijing.volces.com/api/v3"
+# Required when provider = "openai-compatible" (e.g. "http://127.0.0.1:8000/v1"); built-in providers resolve base_url automatically
 base_url = ""
 api_key_env = ""
 max_turns_per_thread = 20
 timeout_sec = 12.0
+# Set true to run Stage 2 refinement even when Stage 1 already performed single-hop multimodal refinement
 force_on_single_hop = false
+
+# -----------------------------------------------------------------------------
+# Quick Recipes (replace the [asr] / [refiner] values above as needed)
+# -----------------------------------------------------------------------------
+# Recipe 1 — OpenRouter single key (two-stage dedicated STT + fast refiner):
+#   [asr]
+#   provider = "openrouter"
+#   model = "qwen/qwen3-asr-1.7b"
+#   [refiner]
+#   provider = "openrouter"
+#   model = "google/gemini-2.5-flash-lite"
+#
+# Recipe 2 — OpenRouter single key (single-hop multimodal audio + context):
+#   [asr]
+#   provider = "openrouter"
+#   model = "google/gemini-2.5-flash"
+#   effort = "auto"

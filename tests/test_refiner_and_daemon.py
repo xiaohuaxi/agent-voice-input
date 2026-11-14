@@ -17,10 +17,10 @@ if str(_SRC_ROOT) not in sys.path:
 
 from agent_voice_input.asr_providers import AsrContext, AsrResult, BaseAsrProvider, HttpRequest, HttpResponse  # noqa: E402
 from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
-from agent_voice_input.config import Config, RefinerConfig, load_config, load_env_files, parse_toml, resolve_credentials  # noqa: E402
+from agent_voice_input.config import Config, ConfigError, RefinerConfig, _parse_simple_toml, load_config, load_env_files, parse_toml, resolve_credentials  # noqa: E402
 from agent_voice_input.daemon import VoiceInputDaemon, run_pipeline_once, send_control_command  # noqa: E402
 from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome, SHIM_SCRIPT  # noqa: E402
-from agent_voice_input.refiner import CodexLunaRefiner, OpenAICompatibleRefiner, RefinerResult, create_refiner  # noqa: E402
+from agent_voice_input.refiner import CodexRefiner, GeminiRefiner, OpenAICompatibleRefiner, RefinerResult, create_refiner  # noqa: E402
 from agent_voice_input.session_ctx import SessionTracker, write_session_registry_entry  # noqa: E402
 
 _MOCK_APP_SERVER_CODE = r"""
@@ -69,7 +69,7 @@ def _zero_wav(seconds: float = 1.0) -> bytes:
 
 
 class _FakeAsr(BaseAsrProvider):
-    provider_name = "ali"
+    provider_name = "dashscope"
 
     def __init__(self, text: str = "把 refiner 点 py 改一下", gate_evt: threading.Event | None = None) -> None:
         self.text = text
@@ -80,7 +80,7 @@ class _FakeAsr(BaseAsrProvider):
         self.calls += 1
         if self.gate_evt is not None:
             self.gate_evt.wait(timeout=3.0)
-        return AsrResult(text=self.text, provider="ali", model="qwen3-asr-flash", latency_ms=12)
+        return AsrResult(text=self.text, provider="dashscope", model="qwen3-asr-flash", latency_ms=12)
 
 
 class _FakePlatform:
@@ -133,20 +133,39 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
     def test_example_configs_parse_cleanly_without_secrets_or_typos(self) -> None:
         toml_path = _REPO_ROOT / "config.example.toml"
         env_path = _REPO_ROOT / "config.example.env"
-        parsed = parse_toml(toml_path.read_text(encoding="utf-8"))
+        toml_raw = toml_path.read_text(encoding="utf-8")
+        parsed = parse_toml(toml_raw)
+        parsed_simple = _parse_simple_toml(toml_raw)
+        self.assertEqual(parsed, parsed_simple)
         self.assertEqual(parsed["hotkey"]["key"], "RControl")
         self.assertEqual(parsed["ui"]["language"], "auto")
-        self.assertEqual(parsed["refiner"]["provider"], "codex-luna")
+        self.assertEqual(parsed["audio"]["macos_device"], "default")
+        self.assertEqual(parsed["asr"]["provider"], "auto")
+        self.assertEqual(parsed["asr"]["api"], "auto")
+        self.assertEqual(parsed["asr"]["effort"], "auto")
+        self.assertEqual(parsed["refiner"]["provider"], "codex")
         cfg, _ = load_config(config_path=toml_path, env={"HOME": "/tmp/nonexistent-home"})
         self.assertEqual(cfg.ui.language, "auto")
+        self.assertEqual(cfg.audio.macos_device, "default")
+        self.assertEqual(cfg.refiner.provider, "codex")
         self.assertEqual(cfg.refiner.model, "gpt-6-luna")
         self.assertIs(cfg.audio.beep, False)
 
         env_raw = env_path.read_text(encoding="utf-8")
         self.assertNotIn("API_ID", env_raw)
         loaded = load_env_files({}, env_paths=[env_path])
-        self.assertIn("ALI_API_KEY", loaded)
-        self.assertIn("DOUBAO_ASR_APP_ID", loaded)
+        for expected_key in (
+            "DASHSCOPE_API_KEY",
+            "DOUBAO_ASR_APP_ID",
+            "DOUBAO_ASR_API_KEY",
+            "ARK_API_KEY",
+            "OPENROUTER_API_KEY",
+            "GEMINI_API_KEY",
+            "OPENAI_API_KEY",
+            "GROQ_API_KEY",
+            "SILICONFLOW_API_KEY",
+        ):
+            self.assertIn(expected_key, loaded)
 
     def test_pyproject_and_package_data_integrity(self) -> None:
         pyproject_path = _REPO_ROOT / "pyproject.toml"
@@ -169,6 +188,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertIn("win_shim.ps1", pkg_data)
         self.assertIn("mac_shim.swift", pkg_data)
         manifest_raw = (_REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+        self.assertIn("win_shim.ps1", manifest_raw)
         self.assertIn("mac_shim.swift", manifest_raw)
         self.assertTrue(SHIM_SCRIPT.is_file())
         self.assertEqual(
@@ -178,13 +198,14 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertTrue((_REPO_ROOT / "LICENSE").is_file())
         self.assertTrue((_REPO_ROOT / "bin" / "agent-voice-input").is_file())
 
-    def test_codex_command_isolation_and_no_fast_mode(self) -> None:
+    def test_codex_command_isolation_effort_mapping_and_no_fast_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            fake_codex = Path(td) / "codex"
+            tmp = Path(td)
+            fake_codex = tmp / "codex"
             fake_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fake_codex.chmod(0o755)
-            ref = CodexLunaRefiner(Config(), env={"CODEX_BIN": str(fake_codex)}, runtime_dir=Path(td))
-            cmd = ref._build_cmd(Path(td))
+            ref = CodexRefiner(Config(), env={"CODEX_BIN": str(fake_codex)}, runtime_dir=tmp)
+            cmd = ref._build_cmd(tmp)
             joined = " ".join(cmd)
             self.assertIn("mcp_servers={}", cmd)
             self.assertIn("project_doc_max_bytes=0", cmd)
@@ -192,6 +213,39 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
             self.assertIn("multi_agent", cmd)
             self.assertNotIn("fast", joined.lower())
             self.assertNotIn("service_tier", joined.lower())
+
+            # Verify JSON-RPC thread/start & turn/start effort mapping across auto / explicit / max / default
+            for eff, expected_rpc_eff in (
+                ("low", "low"),
+                ("auto", "low"),
+                ("none", "none"),
+                ("max", "xhigh"),
+                ("default", None),
+            ):
+                rpc_log = tmp / f"rpc_{eff}.jsonl"
+                cfg_eff = Config(refiner=RefinerConfig(provider="codex", effort=eff, timeout_sec=3.0))
+                r_eff = CodexRefiner(
+                    cfg_eff,
+                    env={},
+                    runtime_dir=tmp,
+                    app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "ok"],
+                )
+                try:
+                    out = r_eff.refine("测试档位")
+                    self.assertEqual(out.text, "CLEAN[thr-1#1]:测试档位")
+                finally:
+                    r_eff.close()
+                recs = [json.loads(ln) for ln in rpc_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                t_start = next(r for r in recs if r.get("method") == "thread/start")
+                turn_start = next(r for r in recs if r.get("method") == "turn/start")
+                raw_rpc = rpc_log.read_text(encoding="utf-8").lower()
+                self.assertNotIn("service_tier", raw_rpc)
+                if expected_rpc_eff is None:
+                    self.assertNotIn("config", t_start["params"])
+                    self.assertNotIn("effort", turn_start["params"])
+                else:
+                    self.assertEqual(t_start["params"]["config"], {"model_reasoning_effort": expected_rpc_eff})
+                    self.assertEqual(turn_start["params"]["effort"], expected_rpc_eff)
 
     def test_win_shim_static_safety_invariants(self) -> None:
         shim = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
@@ -245,8 +299,8 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             self.assertIsNotNone(snap)
             assert snap is not None
 
-            cfg = Config(refiner=RefinerConfig(provider="codex-luna", model="gpt-6-luna", effort="low", max_turns_per_thread=2, timeout_sec=5.0))
-            ref = CodexLunaRefiner(
+            cfg = Config(refiner=RefinerConfig(provider="codex", model="gpt-6-luna", effort="low", max_turns_per_thread=2, timeout_sec=5.0))
+            ref = CodexRefiner(
                 cfg,
                 env={},
                 runtime_dir=tmp,
@@ -294,15 +348,15 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             self.assertIn("daemon.py", turn_inputs[2])
             self.assertIn("全新上下文", turn_inputs[3])
 
-    def test_codex_luna_fallbacks_to_exec_then_asr_draft_and_redacts(self) -> None:
+    def test_codex_fallbacks_to_exec_then_asr_draft_and_redacts(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             rpc_log = tmp / "rpc_fail.jsonl"
-            env = {"ALI_API_KEY": "MOCK_SECRET_9999"}
-            cfg = Config(refiner=RefinerConfig(provider="codex-luna", timeout_sec=3.0))
+            env = {"DASHSCOPE_API_KEY": "MOCK_SECRET_9999"}
+            cfg = Config(refiner=RefinerConfig(provider="codex", timeout_sec=3.0))
 
             # Fallback 1: app-server fails -> codex exec succeeds
-            ref_exec = CodexLunaRefiner(
+            ref_exec = CodexRefiner(
                 cfg,
                 env=env,
                 runtime_dir=tmp,
@@ -311,6 +365,7 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             )
             res1 = ref_exec.refine("原始语音草稿")
             self.assertEqual(res1.text, "EXEC_REFINED_TEXT")
+            self.assertEqual(res1.provider, "codex")
             self.assertEqual(res1.used_fallback, "codex-exec")
             self.assertNotIn("MOCK_SECRET_9999", res1.warning)
             self.assertIn("[REDACTED]", res1.warning)
@@ -320,7 +375,7 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             def broken_exec(_envlp: str, _cwd: Path) -> str:
                 raise RuntimeError("exec failed key=MOCK_SECRET_9999")
 
-            ref_draft = CodexLunaRefiner(
+            ref_draft = CodexRefiner(
                 cfg,
                 env=env,
                 runtime_dir=tmp,
@@ -339,32 +394,184 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             self.assertEqual(res3.text, "Gemini单跳已精修")
             self.assertEqual(res3.used_fallback, "single_hop_passthrough")
 
-    def test_openai_compatible_refiner_volces_and_error_redaction(self) -> None:
+    def test_built_in_and_openai_compatible_refiners_effort_and_error_redaction(self) -> None:
         seen: list[HttpRequest] = []
         fake_val = "dummy-volc-" + ("0" * 12)
-        env = {"HUOSHAN_API_KEY": fake_val}
-        cfg = Config(refiner=RefinerConfig(provider="openai-compatible", model="doubao-lite", base_url="https://ark.cn-beijing.volces.com/api/v3"))
-        creds = resolve_credentials(cfg, env)
+        gem_fake = "dummy-gem-" + ("9" * 12)
+        env = {
+            "HUOSHAN_API_KEY": fake_val,
+            "OPENROUTER_API_KEY": "sk-or-v1-" + ("1" * 16),
+            "DASHSCOPE_API_KEY": "dummy-dash-" + ("2" * 12),
+            "GROQ_API_KEY": "gsk_" + ("3" * 16),
+            "SILICONFLOW_API_KEY": "sk-sf-" + ("4" * 14),
+            "OPENAI_API_KEY": "sk-oai-" + ("5" * 14),
+            "GEMINI_API_KEY": gem_fake,
+        }
 
         def ok_transport(req: HttpRequest) -> HttpResponse:
             seen.append(req)
-            return HttpResponse(200, {}, json.dumps({"choices": [{"message": {"content": "整理后的火山输出"}}]}).encode("utf-8"))
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": "整理后的云端输出"}}]}).encode("utf-8"),
+            )
 
-        ref = create_refiner(cfg, creds, env=env, transport=ok_transport)
+        # 1. Volcengine Ark built-in provider resolves default URL, default model & HUOSHAN_API_KEY/ARK_API_KEY
+        cfg_volc = Config(refiner=RefinerConfig(provider="volcengine"))
+        creds = resolve_credentials(cfg_volc, env)
+        ref = create_refiner(cfg_volc, creds, env=env, transport=ok_transport)
         self.assertIsInstance(ref, OpenAICompatibleRefiner)
         out = ref.refine("火山初稿", fallback_context="user: hi")
-        self.assertEqual(out.text, "整理后的火山输出")
+        self.assertEqual(out.text, "整理后的火山输出" if False else "整理后的云端输出")
+        self.assertEqual(out.provider, "volcengine")
+        self.assertEqual(out.model, "doubao-seed-1-6-flash")
         self.assertEqual(seen[0].url, "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
         self.assertEqual(seen[0].headers.get("Authorization"), f"Bearer {fake_val}")
 
         def err_transport(_req: HttpRequest) -> HttpResponse:
             return HttpResponse(500, {}, f"upstream leaked {fake_val}".encode("utf-8"))
 
-        ref_err = OpenAICompatibleRefiner(cfg, creds, env=env, transport=err_transport)
+        ref_err = OpenAICompatibleRefiner(cfg_volc, creds, env=env, transport=err_transport)
         fb = ref_err.refine("保留原稿")
         self.assertEqual(fb.text, "保留原稿")
         self.assertEqual(fb.used_fallback, "asr_draft")
         self.assertNotIn(fake_val, fb.warning)
+
+        # 2. OpenRouter, DashScope, Groq, SiliconFlow, OpenAI, and keyless loopback openai-compatible
+        matrix = [
+            ("openrouter", "", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "low"}}),
+            ("openrouter", "", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "none"}}),
+            ("openrouter", "", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {}),
+            ("dashscope", "", "", "low", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen-turbo-latest", {}),
+            ("groq", "", "", "low", "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile", {}),
+            ("siliconflow", "", "", "low", "https://api.siliconflow.cn/v1/chat/completions", "Qwen/Qwen2.5-7B-Instruct", {}),
+            # gpt-4o-mini omits reasoning_effort so default [refiner] provider="openai" never 400s
+            ("openai", "", "", "low", "https://api.openai.com/v1/chat/completions", "gpt-4o-mini", {}),
+            # OpenAI reasoning models omit incompatible custom temperature (both with reasoning_effort and effort="default"/"auto")
+            ("openai", "o4-mini", "", "medium", "https://api.openai.com/v1/chat/completions", "o4-mini", {"reasoning_effort": "medium"}),
+            ("openai", "gpt-5-mini", "", "default", "https://api.openai.com/v1/chat/completions", "gpt-5-mini", {}),
+            ("openai", "gpt-6-luna", "", "auto", "https://api.openai.com/v1/chat/completions", "gpt-6-luna", {}),
+            ("openrouter", "openai/o3-mini", "", "low", "https://openrouter.ai/api/v1/chat/completions", "openai/o3-mini", {"reasoning": {"effort": "low"}}),
+            ("openai-compatible", "local-qwen", "http://127.0.0.1:8000/v1", "low", "http://127.0.0.1:8000/v1/chat/completions", "local-qwen", {}),
+        ]
+        no_temp_models = {"o4-mini", "gpt-5-mini", "gpt-6-luna", "openai/o3-mini"}
+        for prov, m_override, b_url, eff, exp_url, exp_model, exp_extra in matrix:
+            with self.subTest(prov=prov, model=m_override, effort=eff):
+                seen.clear()
+                sub_env = {} if prov == "openai-compatible" else env
+                c = Config(refiner=RefinerConfig(provider=prov, model=m_override, base_url=b_url, effort=eff))
+                r_inst = create_refiner(c, resolve_credentials(c, sub_env), env=sub_env, transport=ok_transport)
+                res_m = r_inst.refine("测试初稿")
+                self.assertEqual(res_m.provider, prov)
+                self.assertEqual(res_m.model, exp_model)
+                self.assertEqual(seen[0].url, exp_url)
+                p_json = json.loads(seen[0].body.decode("utf-8"))
+                self.assertEqual(p_json["model"], exp_model)
+                for k, v in exp_extra.items():
+                    self.assertEqual(p_json.get(k), v)
+                if exp_model in no_temp_models:
+                    self.assertNotIn("temperature", p_json)
+                else:
+                    self.assertEqual(p_json.get("temperature"), 0.1)
+                if "reasoning" not in exp_extra:
+                    self.assertNotIn("reasoning", p_json)
+                if "reasoning_effort" not in exp_extra:
+                    self.assertNotIn("reasoning_effort", p_json)
+
+        # 3. Native Gemini Stage 2 refiner (:generateContent + thinkingConfig + thought filtering + fallback redaction)
+        gem_seen: list[HttpRequest] = []
+
+        def gem_ok_tx(req: HttpRequest) -> HttpResponse:
+            gem_seen.append(req)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "parts": [
+                                        {"thought": True, "text": "internal thought"},
+                                        {"text": "Gemini 精修定稿"},
+                                    ]
+                                }
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
+
+        cfg_gem = Config(refiner=RefinerConfig(provider="gemini", effort="low"))
+        gem_ref = create_refiner(cfg_gem, resolve_credentials(cfg_gem, env), env=env, transport=gem_ok_tx)
+        self.assertIsInstance(gem_ref, GeminiRefiner)
+        gem_out = gem_ref.refine("Gemini 初稿", fallback_context="上下文")
+        self.assertEqual(gem_out.text, "Gemini 精修定稿")
+        self.assertEqual(gem_out.provider, "gemini")
+        self.assertEqual(gem_out.model, "gemini-2.5-flash-lite")
+        self.assertIn("models/gemini-2.5-flash-lite:generateContent", gem_seen[0].url)
+        gem_body = json.loads(gem_seen[0].body.decode("utf-8"))
+        self.assertEqual(gem_body["generationConfig"]["thinkingConfig"], {"thinkingBudget": 1024})
+
+        gem_err_ref = GeminiRefiner(
+            cfg_gem,
+            resolve_credentials(cfg_gem, env),
+            env=env,
+            transport=lambda _r: HttpResponse(500, {}, f"bad key {gem_fake}".encode("utf-8")),
+        )
+        gem_fb = gem_err_ref.refine("Gemini 保底原稿")
+        self.assertEqual(gem_fb.text, "Gemini 保底原稿")
+        self.assertEqual(gem_fb.used_fallback, "asr_draft")
+        self.assertNotIn(gem_fake, gem_fb.warning)
+
+        # Legacy / invalid refiner provider raises ConfigError
+        with self.assertRaises(ConfigError):
+            create_refiner(Config(refiner=RefinerConfig(provider="codex-luna")))
+        with self.assertRaises(ConfigError):
+            create_refiner(Config(refiner=RefinerConfig(provider="doubao")))
+
+    def test_http_refiners_redact_secret_spanning_180_char_truncation_boundary(self) -> None:
+        volc_secret = "volcprefix-" + ("0" * 16)
+        gem_secret = "geminiprefix-" + ("9" * 16)
+        env = {
+            "HUOSHAN_API_KEY": volc_secret,
+            "GEMINI_API_KEY": gem_secret,
+        }
+        pad = ("x" * 168) + " "  # len=169 -> secret spans indices 169..196/198, crossing char 180
+
+        volc_body = f"{pad}{volc_secret} trailing_tail"
+        self.assertLess(len(pad), 180)
+        self.assertGreater(len(pad) + len(volc_secret), 180)
+        cfg_volc = Config(refiner=RefinerConfig(provider="volcengine"))
+        volc_ref = OpenAICompatibleRefiner(
+            cfg_volc,
+            resolve_credentials(cfg_volc, env),
+            env=env,
+            transport=lambda _r: HttpResponse(502, {}, volc_body.encode("utf-8")),
+        )
+        volc_fb = volc_ref.refine("边界脱敏原稿")
+        self.assertEqual(volc_fb.text, "边界脱敏原稿")
+        self.assertEqual(volc_fb.used_fallback, "asr_draft")
+        self.assertIn("[REDACTED]", volc_fb.warning)
+        self.assertNotIn(volc_secret, volc_fb.warning)
+        self.assertNotIn("volcprefix", volc_fb.warning)
+
+        gem_body = f"{pad}{gem_secret} trailing_tail"
+        self.assertGreater(len(pad) + len(gem_secret), 180)
+        cfg_gem = Config(refiner=RefinerConfig(provider="gemini"))
+        gem_ref = GeminiRefiner(
+            cfg_gem,
+            resolve_credentials(cfg_gem, env),
+            env=env,
+            transport=lambda _r: HttpResponse(502, {}, gem_body.encode("utf-8")),
+        )
+        gem_fb = gem_ref.refine("Gemini 边界脱敏原稿")
+        self.assertEqual(gem_fb.text, "Gemini 边界脱敏原稿")
+        self.assertEqual(gem_fb.used_fallback, "asr_draft")
+        self.assertIn("[REDACTED]", gem_fb.warning)
+        self.assertNotIn(gem_secret, gem_fb.warning)
+        self.assertNotIn("geminipref", gem_fb.warning)
 
 
 def _isolated_tracker(base: Path) -> SessionTracker:
@@ -639,24 +846,192 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(daemon.state, "idle")
             daemon.close()
 
-    def test_cli_common_flags_work_both_before_and_after_subcommand(self) -> None:
+    def test_cli_common_flags_and_doctor_redacted_diagnostics(self) -> None:
+        import io
+        from unittest import mock
         from agent_voice_input import cli as cli_mod
 
         parser = cli_mod._build_parser()
 
-        before = parser.parse_args(["--config", "/tmp/a.toml", "--asr", "doubao", "--effort", "medium", "doctor"])
-        after = parser.parse_args(["doctor", "--config", "/tmp/a.toml", "--asr", "doubao", "--effort", "medium"])
+        before = parser.parse_args(
+            [
+                "--config",
+                "/tmp/a.toml",
+                "--asr-provider",
+                "openrouter",
+                "--asr-model",
+                "google/gemini-2.5-flash",
+                "--asr-api",
+                "chat-completions",
+                "--asr-effort",
+                "none",
+                "--refiner-provider",
+                "openrouter",
+                "--refiner-effort",
+                "medium",
+                "doctor",
+            ]
+        )
+        after = parser.parse_args(
+            [
+                "doctor",
+                "--config",
+                "/tmp/a.toml",
+                "--asr",
+                "openrouter",
+                "--asr-model",
+                "google/gemini-2.5-flash",
+                "--asr-api",
+                "chat-completions",
+                "--asr-effort",
+                "none",
+                "--refiner",
+                "openrouter",
+                "--effort",
+                "medium",
+            ]
+        )
         status_before = parser.parse_args(["--config", "/tmp/b.toml", "status"])
         status_after = parser.parse_args(["status", "--config", "/tmp/b.toml"])
         hook_parsed = parser.parse_args(["session-hook", "--cli", "agy"])
         for parsed in (before, after):
             self.assertEqual(parsed.config, "/tmp/a.toml")
-            self.assertEqual(parsed.asr, "doubao")
+            self.assertEqual(parsed.asr, "openrouter")
+            self.assertEqual(parsed.asr_model, "google/gemini-2.5-flash")
+            self.assertEqual(parsed.asr_api, "chat-completions")
+            self.assertEqual(parsed.asr_effort, "none")
+            self.assertEqual(parsed.refiner, "openrouter")
             self.assertEqual(parsed.effort, "medium")
         self.assertEqual(status_before.config, "/tmp/b.toml")
         self.assertEqual(status_after.config, "/tmp/b.toml")
         self.assertEqual(hook_parsed.subcmd, "session-hook")
         self.assertEqual(hook_parsed.cli, "agy")
+
+        # Offline _cmd_doctor verification: displays resolved provider/model/api/effort and NEVER leaks raw secrets
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            secret_or = "sk-or-v1-" + ("8" * 20)
+            env = {
+                "HOME": td,
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "OPENROUTER_API_KEY": secret_or,
+            }
+            cfg, merged_env = load_config(
+                env=env,
+                home_dir=td,
+                cli_overrides={
+                    "asr.provider": "auto",
+                    "refiner.provider": "openrouter",
+                    "refiner.effort": "low",
+                },
+            )
+            buf = io.StringIO()
+            with (
+                mock.patch.object(cli_mod, "is_wsl", return_value=False),
+                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.platform", "linux"),
+                mock.patch("sys.stdout", buf),
+            ):
+                rc = cli_mod._cmd_doctor(cfg, merged_env)
+            out = buf.getvalue()
+            self.assertEqual(rc, 0, out)
+            self.assertIn("selected=openrouter (model=qwen/qwen3-asr-1.7b, api=audio-transcriptions, effort=auto) -> OK", out)
+            self.assertIn("openrouter=OK (via OPENROUTER_API_KEY)", out)
+            self.assertIn("[refiner]   OK openrouter (model=google/gemini-2.5-flash-lite, effort=low)", out)
+            self.assertNotIn(secret_or, out)
+
+            # Loopback keyless vs explicit api_key_env parity in _cmd_doctor:
+            # 1) No api_key_env -> loopback openai-compatible is OK without credentials.
+            # 2) Explicit api_key_env unset -> MUST report MISSING KEY (rc=1) for both ASR and Refiner even on loopback!
+            loop_env = {"HOME": td, "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
+            cfg_loop_ok = Config()
+            cfg_loop_ok.asr.provider = "openai-compatible"
+            cfg_loop_ok.asr.base_url = "http://127.0.0.1:8000/v1"
+            cfg_loop_ok.refiner = RefinerConfig(
+                provider="openai-compatible",
+                model="local-qwen",
+                base_url="http://127.0.0.1:8001/v1",
+            )
+            buf_loop_ok = io.StringIO()
+            with (
+                mock.patch.object(cli_mod, "is_wsl", return_value=False),
+                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.platform", "linux"),
+                mock.patch("sys.stdout", buf_loop_ok),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(cfg_loop_ok, loop_env), 0, buf_loop_ok.getvalue())
+
+            cfg_loop_asr_miss = Config()
+            cfg_loop_asr_miss.asr.provider = "openai-compatible"
+            cfg_loop_asr_miss.asr.base_url = "http://127.0.0.1:8000/v1"
+            cfg_loop_asr_miss.asr.api_key_env = "MISSING_LOCAL_ASR_KEY"
+            cfg_loop_asr_miss.refiner = RefinerConfig(provider="off")
+            buf_asr_miss = io.StringIO()
+            with (
+                mock.patch.object(cli_mod, "is_wsl", return_value=False),
+                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.platform", "linux"),
+                mock.patch("sys.stdout", buf_asr_miss),
+            ):
+                rc_asr_miss = cli_mod._cmd_doctor(cfg_loop_asr_miss, loop_env)
+            self.assertEqual(rc_asr_miss, 1, buf_asr_miss.getvalue())
+            self.assertIn("MISSING KEY", buf_asr_miss.getvalue())
+            self.assertIn("asr_custom=not set", buf_asr_miss.getvalue())
+
+            cfg_loop_ref_miss = Config()
+            cfg_loop_ref_miss.asr.provider = "openai-compatible"
+            cfg_loop_ref_miss.asr.base_url = "http://127.0.0.1:8000/v1"
+            cfg_loop_ref_miss.refiner = RefinerConfig(
+                provider="openai-compatible",
+                model="local-qwen",
+                base_url="http://127.0.0.1:8001/v1",
+                api_key_env="MISSING_LOCAL_REF_KEY",
+            )
+            buf_ref_miss = io.StringIO()
+            with (
+                mock.patch.object(cli_mod, "is_wsl", return_value=False),
+                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.platform", "linux"),
+                mock.patch("sys.stdout", buf_ref_miss),
+            ):
+                rc_ref_miss = cli_mod._cmd_doctor(cfg_loop_ref_miss, loop_env)
+            self.assertEqual(rc_ref_miss, 1, buf_ref_miss.getvalue())
+            self.assertIn("[refiner]   MISSING KEY openai-compatible", buf_ref_miss.getvalue())
+
+            # Top-level cli.main() exception redaction: non-prefix UUID-like secret stored ONLY in .env
+            # under a custom api_key_env pointer MUST still be redacted on uncaught Exception & ConfigError!
+            cfg_dir = Path(td) / ".config" / "agent-voice-input"
+            cfg_dir.mkdir(parents=True)
+            custom_uuid_secret = "11111111-" + ("2222-" * 3) + ("3" * 12)
+            (cfg_dir / "config.toml").write_text(
+                '[asr]\nprovider = "openai-compatible"\nbase_url = "http://127.0.0.1:8000/v1"\napi_key_env = "CUSTOM_PLAIN_CRED"\n',
+                encoding="utf-8",
+            )
+            (cfg_dir / "agent-voice-input.env").write_text(
+                f'CUSTOM_PLAIN_CRED="{custom_uuid_secret}"\n',
+                encoding="utf-8",
+            )
+            err_buf = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"HOME": td, "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}, clear=True),
+                mock.patch.object(cli_mod, "_cmd_doctor", side_effect=RuntimeError(f"boom {custom_uuid_secret}")),
+                mock.patch("sys.stderr", err_buf),
+            ):
+                rc_err = cli_mod.main(["doctor"])
+            self.assertEqual(rc_err, 1)
+            self.assertNotIn(custom_uuid_secret, err_buf.getvalue())
+            self.assertIn("[REDACTED]", err_buf.getvalue())
+
+            err_cfg_buf = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"HOME": td, "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}, clear=True),
+                mock.patch.object(cli_mod, "_cmd_doctor", side_effect=ConfigError(f"bad cfg {custom_uuid_secret}")),
+                mock.patch("sys.stderr", err_cfg_buf),
+            ):
+                rc_cfg_err = cli_mod.main(["doctor"])
+            self.assertEqual(rc_cfg_err, 2)
+            self.assertNotIn(custom_uuid_secret, err_cfg_buf.getvalue())
+            self.assertIn("[REDACTED]", err_cfg_buf.getvalue())
 
     def test_lenticular_artifact_cleanup_and_refiner_anti_truncation_guards(self) -> None:
         from agent_voice_input.asr_providers import strip_lenticular_artifacts, transcribe
@@ -686,14 +1061,14 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         self.assertIn("严禁概括、压缩或删减", REFINER_SYSTEM_PROMPT)
         self.assertIn("严禁把 <context_delta> 中的括号", REFINER_SYSTEM_PROMPT)
 
-        # Ali multi-part list content joins all segments and strips trailing '】【' artifact
+        # DashScope multi-part list content joins all segments and strips trailing '】【' artifact
         cfg = Config()
-        cfg.asr.provider = "ali"
+        cfg.asr.provider = "dashscope"
         cfg.asr.hotwords_file = ""
         asr_out = transcribe(
             _voiced_wav(),
             cfg,
-            env={"ALI_API_KEY": "dummy_ali_key_val"},
+            env={"DASHSCOPE_API_KEY": "dummy_ali_key_val"},
             context=AsrContext(dialog_text="上次转录为 start】【。"),
             transport=lambda _req: HttpResponse(
                 200,
@@ -740,9 +1115,9 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 ops.append("stop_rec")
                 return self.wav_bytes, self.source
 
-        class _MockRefiner(CodexLunaRefiner):
+        class _MockRefiner(CodexRefiner):
             def refine(self, asr_input, *, session_key: str = "", tracker=None, fallback_context: str = ""):
-                return RefinerResult("精修后完整句子不丢字。", "codex-luna", "gpt-6-luna", 37)
+                return RefinerResult("精修后完整句子不丢字。", "codex", "gpt-6-luna", 37)
 
             def close(self) -> None:
                 return None
@@ -874,7 +1249,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         release_refiner = threading.Event()
 
         class _BlockingAsr(BaseAsrProvider):
-            provider_name = "ali"
+            provider_name = "dashscope"
 
             def __init__(self, single_hop: bool = False) -> None:
                 self.single_hop = single_hop
@@ -884,17 +1259,17 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 release_asr.wait(timeout=2.0)
                 return AsrResult(
                     text="双阶段语音识别初稿",
-                    provider="gemini" if self.single_hop else "ali",
-                    model="qwen3-asr-flash",
+                    provider="openrouter" if self.single_hop else "dashscope",
+                    model="google/gemini-2.5-flash" if self.single_hop else "qwen3-asr-flash",
                     latency_ms=15,
                     is_single_hop_refined=self.single_hop,
                 )
 
-        class _BlockingRefiner(CodexLunaRefiner):
+        class _BlockingRefiner(CodexRefiner):
             def refine(self, asr_input, *, session_key: str = "", tracker=None, fallback_context: str = ""):
                 in_refiner.set()
                 release_refiner.wait(timeout=2.0)
-                return RefinerResult("双阶段整理精修定稿。", "codex-luna", "gpt-6-luna", 28)
+                return RefinerResult("双阶段整理精修定稿。", "codex", "gpt-6-luna", 28)
 
             def close(self) -> None:
                 return None
@@ -902,7 +1277,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         # 1. Stage 1 ('recognizing') -> Stage 2 ('refining') -> 'done' -> daemon 'idle'
         with tempfile.TemporaryDirectory() as td:
             plat = _FakePlatform()
-            cfg = Config(refiner=RefinerConfig(provider="codex-luna"))
+            cfg = Config(refiner=RefinerConfig(provider="codex"))
             daemon = VoiceInputDaemon(
                 cfg,
                 env={},
@@ -937,13 +1312,13 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             finally:
                 daemon.close()
 
-        # 2. Single-hop ASR (e.g. Gemini without force_on_single_hop) skips 'refining' HUD cleanly
+        # 2. Single-hop ASR (e.g. OpenRouter ChatAudioAsrProvider / Gemini without force_on_single_hop) skips 'refining' HUD cleanly
         in_asr.clear()
         release_asr.set()
         with tempfile.TemporaryDirectory() as td_sh:
             plat_sh = _FakePlatform()
-            cfg_sh = Config(refiner=RefinerConfig(provider="codex-luna", force_on_single_hop=False))
-            ref_sh = CodexLunaRefiner(cfg_sh, env={}, runtime_dir=Path(td_sh))
+            cfg_sh = Config(refiner=RefinerConfig(provider="codex", force_on_single_hop=False))
+            ref_sh = CodexRefiner(cfg_sh, env={}, runtime_dir=Path(td_sh))
             daemon_sh = VoiceInputDaemon(
                 cfg_sh,
                 env={},
@@ -970,7 +1345,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         sup_asr_rel = threading.Event()
 
         class _EmptySlowAsr(BaseAsrProvider):
-            provider_name = "ali"
+            provider_name = "dashscope"
 
             def __init__(self) -> None:
                 pass
@@ -978,11 +1353,11 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
                 sup_asr_in.set()
                 sup_asr_rel.wait(timeout=2.0)
-                return AsrResult(text="", provider="ali", model="qwen3-asr-flash", latency_ms=10)
+                return AsrResult(text="", provider="dashscope", model="qwen3-asr-flash", latency_ms=10)
 
         with tempfile.TemporaryDirectory() as td_sup:
             plat_sup = _FakePlatform()
-            cfg_sup = Config(refiner=RefinerConfig(provider="codex-luna"))
+            cfg_sup = Config(refiner=RefinerConfig(provider="codex"))
             cfg_sup.audio.beep = True
             daemon_sup = VoiceInputDaemon(
                 cfg_sup,
@@ -1022,7 +1397,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             cfg = Config(refiner=RefinerConfig(provider="off"))
             daemon = VoiceInputDaemon(
                 cfg,
-                env={"ALI_API_KEY": "SECRET_VAL_7788"},
+                env={"DASHSCOPE_API_KEY": "SECRET_VAL_7788"},
                 runtime_dir=tmp,
                 platform=plat,
                 asr_provider=_FakeAsr("免打扰实测第一句。第二句完整保留。"),
@@ -1084,6 +1459,92 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         self.assertTrue(wplat._use_winmm)
         self.assertFalse(wplat.switch_to_fallback_audio())
         self.assertFalse(wplat._use_winmm)
+
+    def test_end_to_end_pipeline_openrouter_single_hop_vs_dashscope_two_stage(self) -> None:
+        from agent_voice_input.asr_providers import create_asr_provider
+
+        asr_calls: list[str] = []
+        ref_calls: list[str] = []
+        env = {
+            "OPENROUTER_API_KEY": "sk-or-v1-" + ("7" * 16),
+            "DASHSCOPE_API_KEY": "dummy-dash-" + ("6" * 12),
+        }
+
+        def or_chat_tx(req: HttpRequest) -> HttpResponse:
+            asr_calls.append(req.url)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": "OpenRouter 单跳直出文本"}}]}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        def dash_asr_tx(req: HttpRequest) -> HttpResponse:
+            asr_calls.append(req.url)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": "百炼一阶段初稿"}}]}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        def or_refiner_tx(req: HttpRequest) -> HttpResponse:
+            ref_calls.append(req.url)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": "二阶段精修后文本"}}]}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            tracker = SessionTracker(home_dir=Path(td), env={}, runtime_dir=Path(td), proc_root=Path(td) / "no_proc")
+
+            # Case A: OpenRouter multimodal single-hop skips Stage 2 HTTP call by default
+            cfg_sh = Config()
+            cfg_sh.asr.provider = "openrouter"
+            cfg_sh.asr.model = "google/gemini-2.5-flash"
+            cfg_sh.asr.hotwords_file = ""
+            cfg_sh.refiner.provider = "openrouter"
+            creds_sh = resolve_credentials(cfg_sh, env)
+            res_sh = run_pipeline_once(
+                _voiced_wav(),
+                cfg=cfg_sh,
+                creds=creds_sh,
+                tracker=tracker,
+                asr_provider=create_asr_provider(cfg_sh, creds_sh, env=env, transport=or_chat_tx),
+                refiner=create_refiner(cfg_sh, creds_sh, env=env, transport=or_refiner_tx),
+                dry_run=True,
+                env=env,
+            )
+            self.assertTrue(res_sh.ok)
+            self.assertEqual(res_sh.final_text, "OpenRouter 单跳直出文本")
+            self.assertEqual(len(asr_calls), 1)
+            self.assertEqual(len(ref_calls), 0)
+            assert res_sh.refined is not None
+            self.assertEqual(res_sh.refined.used_fallback, "single_hop_passthrough")
+
+            # Case B: DashScope qwen3-asr-flash (even though it hits compatible-mode/v1/chat/completions)
+            # has is_single_hop_refined=False, so Stage 2 refiner MUST run!
+            asr_calls.clear()
+            ref_calls.clear()
+            cfg_ds = Config()
+            cfg_ds.asr.provider = "dashscope"
+            cfg_ds.asr.model = "qwen3-asr-flash"
+            cfg_ds.asr.hotwords_file = ""
+            cfg_ds.refiner.provider = "openrouter"
+            creds_ds = resolve_credentials(cfg_ds, env)
+            res_ds = run_pipeline_once(
+                _voiced_wav(),
+                cfg=cfg_ds,
+                creds=creds_ds,
+                tracker=tracker,
+                asr_provider=create_asr_provider(cfg_ds, creds_ds, env=env, transport=dash_asr_tx),
+                refiner=create_refiner(cfg_ds, creds_ds, env=env, transport=or_refiner_tx),
+                dry_run=True,
+                env=env,
+            )
+            self.assertTrue(res_ds.ok)
+            self.assertEqual(res_ds.final_text, "二阶段精修后文本")
+            self.assertEqual(len(asr_calls), 1)
+            self.assertEqual(len(ref_calls), 1)
 
 
 if __name__ == "__main__":

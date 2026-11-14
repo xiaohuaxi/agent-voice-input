@@ -6,8 +6,33 @@ import json, os, queue, shutil, signal, subprocess, tempfile, threading, time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .asr_providers import AsrResult, HttpRequest, HttpTransport, strip_lenticular_artifacts, urllib_http_transport
-from .config import Config, ProviderCredentials, ensure_secure_dir, expand_user_path, get_runtime_dir, is_volces_host, redact_secrets, resolve_credentials
+from .asr_providers import (
+    AsrResult,
+    GEMINI_DEFAULT_BASE_URL,
+    HttpRequest,
+    HttpTransport,
+    _is_loopback_url,
+    _is_openai_reasoning_model,
+    _missing_key_hint,
+    apply_chat_effort_params,
+    build_gemini_generation_config,
+    extract_chat_message_text,
+    strip_lenticular_artifacts,
+    urllib_http_transport,
+)
+from .config import (
+    Config,
+    ConfigError,
+    ProviderCredentials,
+    VALID_EFFORTS,
+    VALID_REFINER_PROVIDERS,
+    ensure_secure_dir,
+    expand_user_path,
+    get_runtime_dir,
+    is_gemini_native_url,
+    redact_secrets,
+    resolve_credentials,
+)
 from .session_ctx import SessionTracker
 
 REFINER_SYSTEM_PROMPT = (
@@ -56,6 +81,21 @@ def _clean_out(text: str, fallback: str = "") -> str:
 
 def _clean_env(env: Mapping[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if k not in ("BASH_ENV", "ENV", "PROMPT_COMMAND", "PYTHONSTARTUP")}
+
+
+def _normalize_codex_effort(effort: str) -> str | None:
+    """Map unified ``effort`` values to Codex CLI ``model_reasoning_effort`` (or ``None`` to omit)."""
+    eff = (effort or "low").strip().lower()
+    if eff not in VALID_EFFORTS:
+        raise ConfigError(f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, got {effort!r}")
+    if eff == "default":
+        return None
+    if eff == "auto":
+        return "low"
+    if eff == "max":
+        return "xhigh"
+    return eff
+
 
 class BaseRefiner:
     provider_name: str = "off"
@@ -123,10 +163,16 @@ class _AppServerClient:
                     raise RuntimeError(f"{method} error: {msg['error']}")
                 return msg["result"] if isinstance(msg.get("result"), dict) else {}
 
-    def run_turn(self, thread_id: str, effort: str, text: str, timeout_sec: float) -> str:
+    def run_turn(self, thread_id: str, effort: str | None, text: str, timeout_sec: float) -> str:
         rid, self._next_id = self._next_id, self._next_id + 1
         deadline = time.monotonic() + max(0.05, float(timeout_sec))
-        self._send({"jsonrpc": "2.0", "id": rid, "method": "turn/start", "params": {"threadId": thread_id, "effort": effort, "input": [{"type": "text", "text": text, "text_elements": []}]}})
+        turn_params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": text, "text_elements": []}],
+        }
+        if effort is not None:
+            turn_params["effort"] = effort
+        self._send({"jsonrpc": "2.0", "id": rid, "method": "turn/start", "params": turn_params})
         chunks, last_err = [], ""
         while True:
             msg = self._next_msg(deadline)
@@ -164,8 +210,10 @@ class _AppServerClient:
                 except Exception: pass
 
 
-class CodexLunaRefiner(BaseRefiner):
-    provider_name = "codex-luna"
+class CodexRefiner(BaseRefiner):
+    """Resident tool-free Codex refiner (REDLINE: Fast mode is strictly forbidden)."""
+
+    provider_name = "codex"
 
     def __init__(self, cfg: Config, *, env: Mapping[str, str] | None = None, runtime_dir: Path | None = None, app_server_cmd: list[str] | None = None, exec_runner: Callable[[str, Path], str] | None = None) -> None:
         self.cfg, self.env = cfg, dict(os.environ if env is None else env)
@@ -186,7 +234,7 @@ class CodexLunaRefiner(BaseRefiner):
             self._client = None
         self._slots.clear()
 
-    def _exec_fallback(self, full_envelope: str, empty_cwd: Path) -> str:
+    def _exec_fallback(self, full_envelope: str, empty_cwd: Path, model: str, codex_effort: str | None) -> str:
         if self._exec_runner is not None:
             return self._exec_runner(full_envelope, empty_cwd).strip()
         if not (cbin := find_codex_bin(self.env)):
@@ -194,15 +242,19 @@ class CodexLunaRefiner(BaseRefiner):
         with tempfile.NamedTemporaryFile(prefix="luna-exec-", suffix=".txt", dir=str(self.runtime_dir), delete=False) as tf:
             out_path = tf.name
         try:
-            cmd = [cbin, "exec", "--ephemeral", "--skip-git-repo-check", "-c", "mcp_servers={}", "-c", "hooks={}", "-c", "project_doc_max_bytes=0", "-c", f"model_reasoning_effort={json.dumps(self.cfg.refiner.effort)}", "--disable", "shell_tool", "--disable", "plugins", "--enable", "skip_host_skill_discovery", "-s", "read-only", "-C", str(empty_cwd), "-m", self.cfg.refiner.model, "-o", out_path, "-"]
+            effort_args = ["-c", f"model_reasoning_effort={json.dumps(codex_effort)}"] if codex_effort is not None else []
+            cmd = [cbin, "exec", "--ephemeral", "--skip-git-repo-check", "-c", "mcp_servers={}", "-c", "hooks={}", "-c", "project_doc_max_bytes=0", *effort_args, "--disable", "shell_tool", "--disable", "plugins", "--enable", "skip_host_skill_discovery", "-s", "read-only", "-C", str(empty_cwd), "-m", model, "-o", out_path, "-"]
             p = subprocess.run(cmd, input=f"{REFINER_SYSTEM_PROMPT}\n\n{full_envelope}", stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, cwd=str(empty_cwd), env=_clean_env(self.env), timeout=self.cfg.refiner.timeout_sec, check=False)
             if p.returncode != 0:
-                raise RuntimeError(f"codex exec rc={p.returncode}: {p.stderr.strip()[:160]}")
+                excerpt = redact_secrets(p.stderr.strip(), self.env, cfg=self.cfg)[:160]
+                raise RuntimeError(f"codex exec rc={p.returncode}: {excerpt}")
             return Path(out_path).read_text(encoding="utf-8", errors="replace").strip()
         finally:
             Path(out_path).unlink(missing_ok=True)
 
     def refine(self, asr_input: AsrResult | str, *, session_key: str = "", tracker: SessionTracker | None = None, fallback_context: str = "") -> RefinerResult:
+        codex_effort = _normalize_codex_effort(self.cfg.refiner.effort)
+        model = self.cfg.refiner.effective_model("codex")
         clean_draft, single_hop = _unpack(asr_input)
         if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
             return NoopRefiner().refine(asr_input)
@@ -216,68 +268,178 @@ class CodexLunaRefiner(BaseRefiner):
                 need_new = slot is None or slot.turn_count >= self.cfg.refiner.max_turns_per_thread or slot.generation != probe_gen
                 delta_txt, new_idx, gen = tracker.get_luna_delta(session_key, full=need_new) if (tracker and session_key) else (fallback_context, 0, 0)
                 if need_new:
-                    res = self._client.request("thread/start", {"model": self.cfg.refiner.model, "ephemeral": True, "cwd": str(empty_cwd), "approvalPolicy": "never", "sandbox": "read-only", "developerInstructions": REFINER_SYSTEM_PROMPT, "config": {"model_reasoning_effort": self.cfg.refiner.effort}}, tsec)
+                    tstart_params: dict[str, Any] = {
+                        "model": model,
+                        "ephemeral": True,
+                        "cwd": str(empty_cwd),
+                        "approvalPolicy": "never",
+                        "sandbox": "read-only",
+                        "developerInstructions": REFINER_SYSTEM_PROMPT,
+                    }
+                    if codex_effort is not None:
+                        tstart_params["config"] = {"model_reasoning_effort": codex_effort}
+                    res = self._client.request("thread/start", tstart_params, tsec)
                     if not (tid := str((res.get("thread") or {}).get("id") or "").strip()):
                         raise RuntimeError("empty thread id")
                     slot = _ThreadSlot(tid, 0, gen)
                     if session_key:
                         self._slots[session_key] = slot
                 assert slot is not None
-                if not (out_txt := self._client.run_turn(slot.thread_id, self.cfg.refiner.effort, build_refiner_envelope(delta_txt, clean_draft), tsec)):
+                if not (out_txt := self._client.run_turn(slot.thread_id, codex_effort, build_refiner_envelope(delta_txt, clean_draft), tsec)):
                     raise RuntimeError("empty agentMessage")
                 slot.turn_count += 1
                 if tracker and session_key:
                     tracker.mark_luna_synced(session_key, new_idx, gen)
-                return RefinerResult(_clean_out(out_txt, clean_draft), self.provider_name, self.cfg.refiner.model, _ms(t0))
+                return RefinerResult(_clean_out(out_txt, clean_draft), self.provider_name, model, _ms(t0))
             except Exception as app_exc:
                 self._reset()
                 app_warn = redact_secrets(str(app_exc), self.env, cfg=self.cfg)
             try:
                 full_ctx = tracker.get_luna_delta(session_key, full=True)[0] if (tracker and session_key) else fallback_context
-                if exec_txt := self._exec_fallback(build_refiner_envelope(full_ctx, clean_draft), empty_cwd):
-                    return RefinerResult(_clean_out(exec_txt, clean_draft), self.provider_name, self.cfg.refiner.model, _ms(t0), "codex-exec", app_warn)
+                if exec_txt := self._exec_fallback(build_refiner_envelope(full_ctx, clean_draft), empty_cwd, model, codex_effort):
+                    return RefinerResult(_clean_out(exec_txt, clean_draft), self.provider_name, model, _ms(t0), "codex-exec", app_warn)
                 exec_warn = "empty exec output"
             except Exception as exec_exc:
                 exec_warn = redact_secrets(str(exec_exc), self.env, cfg=self.cfg)
-            return RefinerResult(_clean_out(clean_draft), self.provider_name, self.cfg.refiner.model, _ms(t0), "asr_draft", f"app-server: {app_warn}; exec: {exec_warn}")
+            return RefinerResult(_clean_out(clean_draft), self.provider_name, model, _ms(t0), "asr_draft", f"app-server: {app_warn}; exec: {exec_warn}")
 
     def close(self) -> None:
         with self._lock:
             self._reset()
 
 
-class OpenAICompatibleRefiner(BaseRefiner):
-    provider_name = "openai-compatible"
+CodexLunaRefiner = CodexRefiner
+
+
+class GeminiRefiner(BaseRefiner):
+    """Stage 2 text refiner backed by Google Gemini native ``:generateContent``."""
+
+    provider_name = "gemini"
 
     def __init__(self, cfg: Config, creds: ProviderCredentials | None = None, *, env: Mapping[str, str] | None = None, transport: HttpTransport | None = None) -> None:
         self.cfg, self.env = cfg, (os.environ if env is None else env)
         self.creds = creds or resolve_credentials(cfg, self.env)
         self.transport = transport or urllib_http_transport
 
+    def _resolve_key(self) -> str:
+        explicit_env = self.cfg.refiner.api_key_env.strip()
+        if explicit_env:
+            if self.creds.refiner_custom is None or not self.creds.refiner_custom.value:
+                raise RuntimeError(f"configured refiner.api_key_env {explicit_env!r} is not set or empty")
+            return self.creds.refiner_custom.value
+        if self.creds.gemini is not None and self.creds.gemini.value:
+            return self.creds.gemini.value
+        raise RuntimeError(_missing_key_hint("gemini", stage="refiner"))
+
     def refine(self, asr_input: AsrResult | str, *, session_key: str = "", tracker: SessionTracker | None = None, fallback_context: str = "") -> RefinerResult:
+        model = self.cfg.refiner.effective_model("gemini")
+        gen_cfg = build_gemini_generation_config(model, self.cfg.refiner.effort, temperature=0.1)
         clean_draft, single_hop = _unpack(asr_input)
         if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
             return NoopRefiner().refine(asr_input)
         t0 = time.monotonic()
-        base = (self.cfg.refiner.base_url.strip() or "https://api.openai.com/v1").rstrip("/")
-        url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
-        it = self.creds.refiner_custom if self.cfg.refiner.api_key_env.strip() else ((self.creds.huoshan or self.creds.openai) if is_volces_host(url) else (self.creds.openai or self.creds.huoshan))
-        key = it.value if it else ""
-        secrets = (*self.creds.all_secret_values(), *((key,) if key else ()))
+        secrets: tuple[str, ...] = tuple(self.creds.all_secret_values())
         try:
+            key = self._resolve_key()
+            secrets = (*secrets, key)
+            base = (self.cfg.refiner.effective_base_url("gemini").strip() or GEMINI_DEFAULT_BASE_URL).rstrip("/")
+            model_path = model if model.startswith("models/") else f"models/{model}"
+            url = f"{base}/{model_path}:generateContent"
             full_ctx = tracker.get_luna_delta(session_key, full=True)[0] if (tracker and session_key) else fallback_context
-            headers = {"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})}
-            payload = {"model": self.cfg.refiner.model, "temperature": 0.1, "stream": False, "messages": [{"role": "system", "content": REFINER_SYSTEM_PROMPT}, {"role": "user", "content": build_refiner_envelope(full_ctx, clean_draft)}]}
+            payload = {
+                "systemInstruction": {"parts": [{"text": REFINER_SYSTEM_PROMPT}]},
+                "contents": [{"role": "user", "parts": [{"text": build_refiner_envelope(full_ctx, clean_draft)}]}],
+                "generationConfig": gen_cfg,
+            }
+            headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
             resp = self.transport(HttpRequest(url, "POST", headers, json.dumps(payload, ensure_ascii=False).encode("utf-8"), self.cfg.refiner.timeout_sec))
             if resp.status != 200:
-                raise RuntimeError(f"HTTP {resp.status}: {resp.text()[:180]}")
-            choices = resp.json().get("choices") or []
-            content = ((choices[0].get("message") or {}).get("content")) if choices and isinstance(choices[0], dict) else ""
-            if not (out_txt := (str(content).strip() if isinstance(content, str) else "")):
-                raise RuntimeError("empty choices[0].message.content")
-            return RefinerResult(_clean_out(out_txt, clean_draft), self.provider_name, self.cfg.refiner.model, _ms(t0))
+                excerpt = redact_secrets(resp.text(), self.env, cfg=self.cfg, extra_secrets=secrets)[:180]
+                raise RuntimeError(f"HTTP {resp.status}: {excerpt}")
+            data = resp.json()
+            cands = data.get("candidates")
+            parts = ((cands[0].get("content") or {}).get("parts") or []) if isinstance(cands, list) and cands and isinstance(cands[0], dict) else []
+            out_txt = "".join(
+                p["text"] for p in parts if isinstance(p, dict) and not p.get("thought") and isinstance(p.get("text"), str)
+            ).strip()
+            if not out_txt:
+                raise RuntimeError("empty Gemini generateContent text")
+            return RefinerResult(_clean_out(out_txt, clean_draft), self.provider_name, model, _ms(t0))
         except Exception as exc:
-            return RefinerResult(_clean_out(clean_draft), self.provider_name, self.cfg.refiner.model, _ms(t0), "asr_draft", redact_secrets(str(exc), self.env, cfg=self.cfg, extra_secrets=secrets))
+            return RefinerResult(_clean_out(clean_draft), self.provider_name, model, _ms(t0), "asr_draft", redact_secrets(str(exc), self.env, cfg=self.cfg, extra_secrets=secrets))
+
+
+class OpenAICompatibleRefiner(BaseRefiner):
+    provider_name = "openai-compatible"
+
+    def __init__(self, cfg: Config, creds: ProviderCredentials | None = None, *, provider_name: str | None = None, env: Mapping[str, str] | None = None, transport: HttpTransport | None = None) -> None:
+        self.cfg, self.env = cfg, (os.environ if env is None else env)
+        self.creds = creds or resolve_credentials(cfg, self.env)
+        self.transport = transport or urllib_http_transport
+        resolved_prov = (provider_name or cfg.refiner.provider or "openai-compatible").strip().lower()
+        self.provider_name = resolved_prov
+        if resolved_prov == "openai-compatible":
+            if not cfg.refiner.base_url.strip():
+                raise ConfigError("refiner.base_url must be explicitly set when refiner.provider is 'openai-compatible'")
+            if not cfg.refiner.model.strip():
+                raise ConfigError("refiner.model must be explicitly set when refiner.provider is 'openai-compatible'")
+
+    def _resolve_key(self, url: str) -> str:
+        explicit_env = self.cfg.refiner.api_key_env.strip()
+        if explicit_env:
+            if self.creds.refiner_custom is None or not self.creds.refiner_custom.value:
+                raise RuntimeError(f"configured refiner.api_key_env {explicit_env!r} is not set or empty")
+            return self.creds.refiner_custom.value
+        item = self.creds.for_provider(self.provider_name)
+        if item is not None and item.value:
+            return item.value
+        if self.provider_name == "openai-compatible" and _is_loopback_url(url):
+            return ""
+        raise RuntimeError(_missing_key_hint(self.provider_name, stage="refiner"))
+
+    def refine(self, asr_input: AsrResult | str, *, session_key: str = "", tracker: SessionTracker | None = None, fallback_context: str = "") -> RefinerResult:
+        model = self.cfg.refiner.effective_model(self.provider_name)
+        if self.cfg.refiner.effort.strip().lower() not in VALID_EFFORTS:
+            raise ConfigError(f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, got {self.cfg.refiner.effort!r}")
+        clean_draft, single_hop = _unpack(asr_input)
+        if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
+            return NoopRefiner().refine(asr_input)
+        t0 = time.monotonic()
+        base = (self.cfg.refiner.effective_base_url(self.provider_name).strip() or "https://api.openai.com/v1").rstrip("/")
+        url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+        secrets: tuple[str, ...] = tuple(self.creds.all_secret_values())
+        try:
+            key = self._resolve_key(url)
+            if key:
+                secrets = (*secrets, key)
+            full_ctx = tracker.get_luna_delta(session_key, full=True)[0] if (tracker and session_key) else fallback_context
+            headers = {"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})}
+            payload: dict[str, Any] = {
+                "model": model,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": REFINER_SYSTEM_PROMPT},
+                    {"role": "user", "content": build_refiner_envelope(full_ctx, clean_draft)},
+                ],
+            }
+            if not _is_openai_reasoning_model(model):
+                payload["temperature"] = 0.1
+            apply_chat_effort_params(
+                payload,
+                provider=self.provider_name,
+                model=model,
+                effort=self.cfg.refiner.effort,
+            )
+            resp = self.transport(HttpRequest(url, "POST", headers, json.dumps(payload, ensure_ascii=False).encode("utf-8"), self.cfg.refiner.timeout_sec))
+            if resp.status != 200:
+                excerpt = redact_secrets(resp.text(), self.env, cfg=self.cfg, extra_secrets=secrets)[:180]
+                raise RuntimeError(f"HTTP {resp.status}: {excerpt}")
+            out_txt = extract_chat_message_text(resp.json())
+            if not out_txt:
+                raise RuntimeError("empty choices[0].message.content")
+            return RefinerResult(_clean_out(out_txt, clean_draft), self.provider_name, model, _ms(t0))
+        except Exception as exc:
+            return RefinerResult(_clean_out(clean_draft), self.provider_name, model, _ms(t0), "asr_draft", redact_secrets(str(exc), self.env, cfg=self.cfg, extra_secrets=secrets))
 
 
 OpenAICompatRefiner = OpenAICompatibleRefiner
@@ -285,8 +447,20 @@ OpenAICompatRefiner = OpenAICompatibleRefiner
 
 def create_refiner(cfg: Config, creds: ProviderCredentials | None = None, *, env: Mapping[str, str] | None = None, runtime_dir: Path | None = None, transport: HttpTransport | None = None) -> BaseRefiner:
     prov = cfg.refiner.provider.strip().lower()
-    if prov == "codex-luna":
-        return CodexLunaRefiner(cfg, env=env, runtime_dir=runtime_dir)
-    if prov == "openai-compatible":
-        return OpenAICompatibleRefiner(cfg, creds, env=env, transport=transport)
-    return NoopRefiner()
+    if prov in ("none", "false", "0", "disabled"):
+        prov = "off"
+    if prov not in VALID_REFINER_PROVIDERS:
+        raise ConfigError(
+            f"refiner.provider must be one of {sorted(VALID_REFINER_PROVIDERS)}, got {cfg.refiner.provider!r}"
+        )
+    if prov != "off" and cfg.refiner.effort.strip().lower() not in VALID_EFFORTS:
+        raise ConfigError(
+            f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, got {cfg.refiner.effort!r}"
+        )
+    if prov == "off":
+        return NoopRefiner()
+    if prov == "codex":
+        return CodexRefiner(cfg, env=env, runtime_dir=runtime_dir)
+    if prov == "gemini" and is_gemini_native_url(cfg.refiner.base_url):
+        return GeminiRefiner(cfg, creds, env=env, transport=transport)
+    return OpenAICompatibleRefiner(cfg, creds, provider_name=prov, env=env, transport=transport)

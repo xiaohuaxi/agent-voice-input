@@ -5,6 +5,7 @@ import argparse, json, os, signal, subprocess, sys, time
 from pathlib import Path
 from typing import Any
 
+from .asr_providers import _is_loopback_url
 from .audio_proc import resolve_ffmpeg_bin
 from .config import (
     Config,
@@ -12,7 +13,9 @@ from .config import (
     expand_user_path,
     get_runtime_dir,
     load_config,
+    load_env_files,
     redact_secrets,
+    resolve_asr_api,
     resolve_credentials,
     select_asr_provider,
 )
@@ -27,11 +30,41 @@ from .session_title import run_session_hook
 def _add_common_flags(p: argparse.ArgumentParser, *, is_sub: bool = False) -> None:
     kw: dict[str, Any] = {"default": argparse.SUPPRESS} if is_sub else {}
     p.add_argument("--config", help="Path to config.toml or config.json", **kw)
-    p.add_argument("--asr", help="Override Stage 1 ASR provider (ali|doubao|gemini|openai-compatible)", **kw)
-    p.add_argument("--asr-model", help="Override Stage 1 ASR model", **kw)
-    p.add_argument("--refiner", help="Override Stage 2 refiner (codex-luna|openai-compatible|off)", **kw)
-    p.add_argument("--refiner-model", help="Override Stage 2 refiner model", **kw)
-    p.add_argument("--effort", help="Override Stage 2 reasoning effort (low|medium|high)", **kw)
+    p.add_argument(
+        "--asr",
+        "--asr-provider",
+        dest="asr",
+        help="Override Stage 1 ASR provider (auto|dashscope|doubao|openrouter|gemini|openai|groq|siliconflow|openai-compatible)",
+        **kw,
+    )
+    p.add_argument("--asr-model", dest="asr_model", help="Override Stage 1 ASR model", **kw)
+    p.add_argument(
+        "--asr-api",
+        dest="asr_api",
+        help="Override Stage 1 ASR API protocol (auto|audio-transcriptions|chat-completions)",
+        **kw,
+    )
+    p.add_argument(
+        "--asr-effort",
+        dest="asr_effort",
+        help="Override Stage 1 reasoning/thinking effort (auto|default|none|minimal|low|medium|high|xhigh|max)",
+        **kw,
+    )
+    p.add_argument(
+        "--refiner",
+        "--refiner-provider",
+        dest="refiner",
+        help="Override Stage 2 refiner provider (codex|dashscope|volcengine|openrouter|gemini|openai|groq|siliconflow|openai-compatible|off)",
+        **kw,
+    )
+    p.add_argument("--refiner-model", dest="refiner_model", help="Override Stage 2 refiner model", **kw)
+    p.add_argument(
+        "--refiner-effort",
+        "--effort",
+        dest="effort",
+        help="Override Stage 2 reasoning/thinking effort (auto|default|none|minimal|low|medium|high|xhigh|max)",
+        **kw,
+    )
 
 
 def _cred_label(item: Any) -> str:
@@ -99,16 +132,27 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
         print(f"[win-shim]  PowerShell={'OK (' + str(w.get('ps_version')) + ')' if ps_ok else 'FAIL'} fg={w.get('fg_process')!r}{ui_info}")
         ok_all = ok_all and ps_ok and (pulse_ok or winmm_n > 0)
     eff_asr = select_asr_provider(cfg, creds)
-    asr_ready = {
-        "ali": bool(creds.ali or creds.asr_custom),
-        "doubao": bool(creds.doubao_key or creds.asr_custom),
-        "gemini": bool(creds.gemini or creds.asr_custom),
-        "openai-compatible": True,
-    }.get(eff_asr, False)
+    eff_asr_model = cfg.asr.effective_model(eff_asr)
+    eff_asr_url = cfg.asr.effective_base_url(eff_asr)
+    eff_asr_api = resolve_asr_api(eff_asr, eff_asr_model, cfg.asr.api, cfg.asr.base_url)
+    if cfg.asr.api_key_env.strip():
+        asr_ready = bool(creds.asr_custom and creds.asr_custom.value)
+    elif eff_asr == "openai-compatible":
+        asr_ready = bool(creds.openai or _is_loopback_url(eff_asr_url))
+    else:
+        asr_ready = bool(creds.for_provider(eff_asr))
+    asr_creds_tail = f", asr_custom={_cred_label(creds.asr_custom)}" if cfg.asr.api_key_env.strip() else ""
     print(
-        f"[asr]       selected={eff_asr} ({cfg.asr.effective_model(eff_asr)}) -> {'OK' if asr_ready else 'MISSING KEY'} | "
-        f"ali={_cred_label(creds.ali)}, doubao={_cred_label(creds.doubao_key)} (app_id={_cred_label(creds.doubao_app_id)}), "
-        f"huoshan={_cred_label(creds.huoshan)}, gemini={_cred_label(creds.gemini)}, openai={_cred_label(creds.openai)}"
+        f"[asr]       selected={eff_asr} (model={eff_asr_model}, api={eff_asr_api}, effort={cfg.asr.effort}) -> "
+        f"{'OK' if asr_ready else 'MISSING KEY'} | "
+        f"dashscope={_cred_label(creds.dashscope)}, "
+        f"doubao={_cred_label(creds.doubao_key)} (app_id={_cred_label(creds.doubao_app_id)}), "
+        f"volcengine={_cred_label(creds.volcengine)}, "
+        f"openrouter={_cred_label(creds.openrouter)}, "
+        f"gemini={_cred_label(creds.gemini)}, "
+        f"openai={_cred_label(creds.openai)}, "
+        f"groq={_cred_label(creds.groq)}, "
+        f"siliconflow={_cred_label(creds.siliconflow)}{asr_creds_tail}"
     )
     ok_all = ok_all and asr_ready
     match = SessionTracker(env=env, runtime_dir=rt_dir).resolve_session(
@@ -118,14 +162,33 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
         window_pid=fg_pid,
     )
     print(f"[session]   {match.session_key + ' (' + match.matched_by + ')' if match else 'none matched (will use empty context)'}")
-    if cfg.refiner.provider == "codex-luna":
+    ref_prov = cfg.refiner.provider.strip().lower()
+    if ref_prov in ("", "off", "none", "false", "0", "disabled"):
+        print("[refiner]   off")
+    elif ref_prov == "codex":
+        eff_ref_model = cfg.refiner.effective_model("codex")
         if cbin := find_codex_bin(env):
-            print(f"[refiner]   OK codex-luna ({cbin}, model={cfg.refiner.model} [{_check_codex_model(cfg.refiner.model, env)}], effort={cfg.refiner.effort})")
+            print(
+                f"[refiner]   OK codex ({cbin}, model={eff_ref_model} "
+                f"[{_check_codex_model(eff_ref_model, env)}], effort={cfg.refiner.effort})"
+            )
         else:
             print("[refiner]   FAIL codex binary not found")
             ok_all = False
     else:
-        print(f"[refiner]   provider={cfg.refiner.provider} model={cfg.refiner.model}")
+        eff_ref_model = cfg.refiner.effective_model(ref_prov)
+        eff_ref_url = cfg.refiner.effective_base_url(ref_prov)
+        if cfg.refiner.api_key_env.strip():
+            ref_ready = bool(creds.refiner_custom and creds.refiner_custom.value)
+        elif ref_prov == "openai-compatible":
+            ref_ready = bool(creds.openai or _is_loopback_url(eff_ref_url))
+        else:
+            ref_ready = bool(creds.for_provider(ref_prov))
+        print(
+            f"[refiner]   {'OK' if ref_ready else 'MISSING KEY'} {ref_prov} "
+            f"(model={eff_ref_model}, effort={cfg.refiner.effort})"
+        )
+        ok_all = ok_all and ref_ready
     return 0 if ok_all else 1
 
 
@@ -187,11 +250,13 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str]) -> int:
             x
             for f, v in (
                 ("--config", getattr(args, "config", None)),
-                ("--asr", getattr(args, "asr", None)),
+                ("--asr-provider", getattr(args, "asr", None)),
                 ("--asr-model", getattr(args, "asr_model", None)),
-                ("--refiner", getattr(args, "refiner", None)),
+                ("--asr-api", getattr(args, "asr_api", None)),
+                ("--asr-effort", getattr(args, "asr_effort", None)),
+                ("--refiner-provider", getattr(args, "refiner", None)),
                 ("--refiner-model", getattr(args, "refiner_model", None)),
-                ("--effort", getattr(args, "effort", None)),
+                ("--refiner-effort", getattr(args, "effort", None)),
             )
             if v
             for x in (f, v)
@@ -280,12 +345,16 @@ def main(argv: list[str] | None = None) -> int:
         for a, k in (
             ("asr", "asr.provider"),
             ("asr_model", "asr.model"),
+            ("asr_api", "asr.api"),
+            ("asr_effort", "asr.effort"),
             ("refiner", "refiner.provider"),
             ("refiner_model", "refiner.model"),
             ("effort", "refiner.effort"),
         )
         if getattr(args, a, None)
     }
+    cfg: Config | None = None
+    env: dict[str, str] | None = None
     try:
         cfg, env = load_config(config_path=getattr(args, "config", None), cli_overrides=ov)
         if args.subcmd == "daemon":
@@ -315,10 +384,12 @@ def main(argv: list[str] | None = None) -> int:
                 return run_macos_key_test(cfg, seconds=args.seconds, env=env)
             return run_key_test(cfg, seconds=args.seconds)
     except ConfigError as exc:
-        print(f"config error: {exc}", file=sys.stderr)
+        eff_env = env if env is not None else load_env_files()
+        print(f"config error: {redact_secrets(str(exc), eff_env, cfg=cfg)}", file=sys.stderr)
         return 2
     except Exception as exc:
-        print(f"error: {redact_secrets(str(exc))}", file=sys.stderr)
+        eff_env = env if env is not None else load_env_files()
+        print(f"error: {redact_secrets(str(exc), eff_env, cfg=cfg)}", file=sys.stderr)
         return 1
     return 0
 

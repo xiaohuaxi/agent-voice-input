@@ -47,7 +47,7 @@ def _voiced_wav() -> bytes:
 
 
 class _StubAsr(BaseAsrProvider):
-    provider_name = "ali"
+    provider_name = "dashscope"
 
     def __init__(self, text: str) -> None:
         self.text = text
@@ -55,7 +55,7 @@ class _StubAsr(BaseAsrProvider):
 
     def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
         self.seen_contexts.append(context)
-        return AsrResult(text=self.text, provider="ali", model="qwen3-asr-flash", latency_ms=10)
+        return AsrResult(text=self.text, provider="dashscope", model="qwen3-asr-flash", latency_ms=10)
 
 
 class MacOSPlatformAndGhosttyTests(unittest.TestCase):
@@ -596,7 +596,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             env = {
                 "HOME": str(tmp),
                 "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt_dir),
-                "ALI_API_KEY": "dummy_ali_key_doctor",
+                "DASHSCOPE_API_KEY": "dummy_dashscope_key_doctor",
             }
             cfg = Config(refiner=RefinerConfig(provider="off"))
             out_buf = io.StringIO()
@@ -628,9 +628,9 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
     def test_privacy_redaction_ghostty_fallback_early_exit_and_once_title_override(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            secret_token = "sk-very-secret-ali-token-987654"
+            secret_token = "sk-very-secret-dashscope-token-987654"
             sensitive_speech = "这是绝对不能落入状态快照的用户私密语音原文"
-            env = {"HOME": str(tmp), "ALI_API_KEY": secret_token, "AGENT_VOICE_INPUT_SWIFTC": "none"}
+            env = {"HOME": str(tmp), "DASHSCOPE_API_KEY": secret_token, "AGENT_VOICE_INPUT_SWIFTC": "none"}
 
             # 1. Privacy redline: osascript stderr echoing pasteText & secret NEVER leaks into PasteOutcome.reason or daemon status
             def fake_osa_leak(cmd, *, stdin=None, input=None, capture_output=False, text=False, env=None, timeout=None, check=False, **kw):
@@ -874,7 +874,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             env = {
                 "HOME": str(home),
                 "XDG_RUNTIME_DIR": str(tmp / "xdg"),
-                "ALI_API_KEY": "sk-test-dummy-key-value",
+                "DASHSCOPE_API_KEY": "sk-test-dummy-key-value",
             }
 
             def fake_subproc(cmd, *, stdin=None, input=None, capture_output=False, text=False, env=None, timeout=None, check=False, **kw):
