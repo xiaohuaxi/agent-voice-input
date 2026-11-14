@@ -76,9 +76,10 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
             if m.get("mac_shim_ok")
             else f"WARN ({m.get('mac_shim_error') or 'unavailable'})"
         )
+        mac_ui_info = f" ui_lang={m.get('ui_lang')}" if m.get("ui_lang") else ""
         print(
             f"[mac-shim]  swiftc={'OK (' + str(m.get('swiftc_bin')) + ')' if m.get('swiftc_ok') else 'WARN (not found)'} "
-            f"shim={shim_desc}"
+            f"shim={shim_desc}{mac_ui_info}"
         )
         if m.get("fg_surface_id"):
             print(
@@ -93,8 +94,9 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
         w = probe_wsl_host(cfg, env)
         fg_title = str(w.get("fg_title") or "")
         ps_ok, pulse_ok, winmm_n = bool(w.get("powershell_ok")), bool(w.get("pulse_rdp_ok")), int(w.get("winmm_devs") or 0)
+        ui_info = f" ui_lang={w.get('ui_lang')}" if w.get("ui_lang") else ""
         print(f"[wsl-audio] PulseAudio RDPSource={'OK' if pulse_ok else 'WARN'}, winmm waveIn devs={winmm_n}")
-        print(f"[win-shim]  PowerShell={'OK (' + str(w.get('ps_version')) + ')' if ps_ok else 'FAIL'} fg={w.get('fg_process')!r}")
+        print(f"[win-shim]  PowerShell={'OK (' + str(w.get('ps_version')) + ')' if ps_ok else 'FAIL'} fg={w.get('fg_process')!r}{ui_info}")
         ok_all = ok_all and ps_ok and (pulse_ok or winmm_n > 0)
     eff_asr = select_asr_provider(cfg, creds)
     asr_ready = {

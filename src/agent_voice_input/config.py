@@ -27,6 +27,7 @@ class ConfigError(ValueError):
 
 
 VALID_TRIGGER_MODES = frozenset({"tap_toggle", "ptt"})
+VALID_UI_LANGUAGES = frozenset({"auto", "zh", "en"})
 VALID_WSL_SOURCES = frozenset({"auto", "pulse", "winmm", "wasapi"})
 VALID_ASR_PROVIDERS = frozenset(
     {"auto", "ali", "qwen", "doubao", "gemini", "gemini-flash-audio", "openai-compatible"}
@@ -62,9 +63,11 @@ _SENSITIVE_ENV_NAME_RE = re.compile(
 _NON_SECRET_ENV_NAMES = frozenset(
     {
         "AGENT_VOICE_INPUT_HOTKEY",
+        "AGENT_VOICE_INPUT_UI_LANGUAGE",
         "AGENT_VOICE_INPUT_ASR_API_KEY_ENV",
         "AGENT_VOICE_INPUT_REFINER_API_KEY_ENV",
         "VOICE_INPUT_HOTKEY",
+        "VOICE_INPUT_UI_LANGUAGE",
         "VOICE_INPUT_ASR_API_KEY_ENV",
         "VOICE_INPUT_REFINER_API_KEY_ENV",
         "SSH_AUTH_SOCK",
@@ -93,6 +96,11 @@ class HotkeyConfig:
     trigger_mode: str = "tap_toggle"
     tap_max_ms: int = 1200
     debounce_ms: int = 180
+
+
+@dataclass
+class UiConfig:
+    language: str = "auto"
 
 
 DEFAULT_WSL_TAIL_DRAIN_SEC = 0.65
@@ -158,6 +166,7 @@ class RefinerConfig:
 @dataclass
 class Config:
     hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
+    ui: UiConfig = field(default_factory=UiConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     refiner: RefinerConfig = field(default_factory=RefinerConfig)
@@ -855,6 +864,29 @@ def _as_str(val: Any, name: str) -> str:
     raise ConfigError(f"{name}: expected string, got {type(val).__name__}")
 
 
+_ZH_EXPLICIT_RE = re.compile(r"^zh(?:[-_][a-z0-9]+)*$", re.IGNORECASE)
+_EN_EXPLICIT_RE = re.compile(r"^en(?:[-_][a-z0-9]+)*$", re.IGNORECASE)
+
+
+def normalize_ui_language(raw: Any, name: str = "ui.language") -> str:
+    s = _as_str(raw, name).strip()
+    if not s:
+        raise ConfigError(
+            f"{name} must be one of {sorted(VALID_UI_LANGUAGES)}, got {raw!r}"
+        )
+    low = s.lower()
+    if low == "auto":
+        return "auto"
+    core = low.split("@", 1)[0].split(".", 1)[0]
+    if _ZH_EXPLICIT_RE.match(core):
+        return "zh"
+    if _EN_EXPLICIT_RE.match(core):
+        return "en"
+    raise ConfigError(
+        f"{name} must be one of {sorted(VALID_UI_LANGUAGES)}, got {raw!r}"
+    )
+
+
 def _normalize_refiner_provider(raw: Any) -> str:
     if raw is False:
         return "off"
@@ -865,7 +897,7 @@ def _normalize_refiner_provider(raw: Any) -> str:
 
 
 def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
-    allowed_top = {"hotkey", "audio", "asr", "refiner"}
+    allowed_top = {"hotkey", "ui", "audio", "asr", "refiner"}
     for k in data:
         if k not in allowed_top:
             raise ConfigError(f"unknown top-level config section {k!r}")
@@ -887,6 +919,18 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.hotkey.debounce_ms = _as_int(v, "hotkey.debounce_ms")
             else:
                 raise ConfigError(f"unknown hotkey option {k!r}")
+
+    ui = data.get("ui")
+    if ui is not None:
+        if not isinstance(ui, Mapping):
+            raise ConfigError("[ui] must be a table/object")
+        for k, v in ui.items():
+            if v is None:
+                continue
+            if k == "language":
+                cfg.ui.language = normalize_ui_language(v, "ui.language")
+            else:
+                raise ConfigError(f"unknown ui option {k!r}")
 
     au = data.get("audio")
     if au is not None:
@@ -988,6 +1032,9 @@ def _apply_env_overrides(cfg: Config, env: Mapping[str, str]) -> None:
     if (kv := _get("DEBOUNCE_MS")) is not None:
         cfg.hotkey.debounce_ms = _as_int(kv[1], kv[0])
 
+    if (kv := _get("UI_LANGUAGE")) is not None:
+        cfg.ui.language = normalize_ui_language(kv[1], kv[0])
+
     if (kv := _get("AUDIO_FLOOR_DBFS")) is not None:
         cfg.audio.floor_dbfs = _as_float(kv[1], kv[0])
     if (kv := _get("AUDIO_TARGET_DBFS")) is not None:
@@ -1072,6 +1119,8 @@ def _validate_config(cfg: Config) -> None:
         raise ConfigError("hotkey.tap_max_ms must be > 0")
     if cfg.hotkey.debounce_ms < 0:
         raise ConfigError("hotkey.debounce_ms must be >= 0")
+
+    cfg.ui.language = normalize_ui_language(cfg.ui.language, "ui.language")
 
     if cfg.audio.wsl_source not in VALID_WSL_SOURCES:
         raise ConfigError(

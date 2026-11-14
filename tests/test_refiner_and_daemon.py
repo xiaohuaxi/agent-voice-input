@@ -135,8 +135,10 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         env_path = _REPO_ROOT / "config.example.env"
         parsed = parse_toml(toml_path.read_text(encoding="utf-8"))
         self.assertEqual(parsed["hotkey"]["key"], "RControl")
+        self.assertEqual(parsed["ui"]["language"], "auto")
         self.assertEqual(parsed["refiner"]["provider"], "codex-luna")
         cfg, _ = load_config(config_path=toml_path, env={"HOME": "/tmp/nonexistent-home"})
+        self.assertEqual(cfg.ui.language, "auto")
         self.assertEqual(cfg.refiner.model, "gpt-6-luna")
         self.assertIs(cfg.audio.beep, False)
 

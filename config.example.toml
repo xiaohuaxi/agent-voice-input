@@ -14,6 +14,11 @@ trigger_mode = "tap_toggle"
 tap_max_ms = 1200
 debounce_ms = 180
 
+[ui]
+# Desktop HUD pill language: "auto" (follows Windows UI language on WSL2 or desktop/POSIX locale on macOS/Linux; falls back to "en") | "zh" | "en"
+# Can also be overridden via AGENT_VOICE_INPUT_UI_LANGUAGE (or VOICE_INPUT_UI_LANGUAGE)
+language = "auto"
+
 [audio]
 # Silence gate & RMS loudness normalization (pure stdlib; blocks accidental empty triggers before hitting cloud APIs)
 floor_dbfs = -50.0

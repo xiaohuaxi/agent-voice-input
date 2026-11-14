@@ -11,6 +11,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Media;
 using System.Runtime.InteropServices;
@@ -63,12 +64,30 @@ internal sealed class HudPillForm : Form {
     [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("gdi32.dll")] private static extern IntPtr CreateRoundRectRgn(int x1, int y1, int x2, int y2, int cx, int cy);
     [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr hObject);
-    private readonly Font _font = new Font("Microsoft YaHei UI", 10.5f, FontStyle.Bold);
+    private const TextFormatFlags MeasureFlags = TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+    private const TextFormatFlags DrawFlags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis;
+    private Font _font;
+    private bool _ownsFont, _cjkFont;
     private readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer();
     private string _text = "";
     private Color _fg = Color.White, _border = Color.Gray;
 
+    private static bool HasCjk(string s) {
+        if (string.IsNullOrEmpty(s)) return false;
+        for (int i = 0; i < s.Length; i++) { if (s[i] >= 0x2E80 && s[i] <= 0x9FFF) return true; }
+        return false;
+    }
+    private static Font CreateHudFont(bool preferCjk, out bool owns) {
+        string[] fams = preferCjk ? new string[] { "Microsoft YaHei UI", "Segoe UI" } : new string[] { "Segoe UI", "Microsoft YaHei UI" };
+        foreach (string n in fams) {
+            try { using (FontFamily ff = new FontFamily(n)) { owns = true; return new Font(ff, 10.5f, ff.IsStyleAvailable(FontStyle.Bold) ? FontStyle.Bold : FontStyle.Regular); } } catch { }
+        }
+        try { owns = true; return new Font(FontFamily.GenericSansSerif, 10.5f, FontStyle.Bold); } catch { owns = false; return SystemFonts.DefaultFont; }
+    }
+
     public HudPillForm() {
+        _cjkFont = VoiceWinShim.GetHostUiCulture().StartsWith("zh", StringComparison.OrdinalIgnoreCase);
+        _font = CreateHudFont(_cjkFont, out _ownsFont);
         FormBorderStyle = FormBorderStyle.None; StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false; DoubleBuffered = true; BackColor = Color.FromArgb(24, 26, 32);
         _timer.Tick += (s, e) => { _timer.Stop(); HideNoActivate(); };
@@ -83,12 +102,14 @@ internal sealed class HudPillForm : Form {
     }
     public void HideNoActivate() { if (IsHandleCreated) ShowWindow(Handle, 0); }
     public void ShowStatus(string text, Color fg, Color border, int autoHideMs, IntPtr fgHwnd) {
-        _timer.Stop(); _text = text; _fg = fg; _border = border;
-        Size sz = TextRenderer.MeasureText(_text, _font);
-        int w = Math.Max(156, sz.Width + 36), h = Math.Max(36, sz.Height + 16);
+        _timer.Stop(); _text = text ?? ""; _fg = fg; _border = border;
+        bool wantCjk = HasCjk(_text);
+        if (wantCjk != _cjkFont) { if (_ownsFont && _font != null) _font.Dispose(); _cjkFont = wantCjk; _font = CreateHudFont(_cjkFont, out _ownsFont); }
         Screen scr = (fgHwnd != IntPtr.Zero) ? Screen.FromHandle(fgHwnd) : Screen.PrimaryScreen;
         if (scr == null) scr = Screen.PrimaryScreen;
-        Rectangle wa = scr.WorkingArea;
+        Rectangle wa = (scr != null) ? scr.WorkingArea : new Rectangle(0, 0, 1920, 1080);
+        Size sz = TextRenderer.MeasureText(_text, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
+        int w = Math.Min(Math.Max(156, wa.Width - 24), Math.Max(156, sz.Width + 36)), h = Math.Max(36, sz.Height + 16);
         int x = wa.Left + (wa.Width - w) / 2, y = wa.Top + 36;
         IntPtr rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 18, 18);
         Region old = Region; Region = Region.FromHrgn(rgn); DeleteObject(rgn);
@@ -101,10 +122,11 @@ internal sealed class HudPillForm : Form {
     protected override void OnPaint(PaintEventArgs e) {
         base.OnPaint(e);
         using (Pen p = new Pen(_border, 1.5f)) { e.Graphics.DrawRectangle(p, 1, 1, Width - 3, Height - 3); }
-        TextRenderer.DrawText(e.Graphics, _text, _font, ClientRectangle, _fg, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+        Rectangle rc = new Rectangle(10, 0, Math.Max(1, Width - 20), Height);
+        TextRenderer.DrawText(e.Graphics, _text, _font, rc, _fg, DrawFlags);
     }
     protected override void Dispose(bool disposing) {
-        if (disposing) { _timer.Dispose(); _font.Dispose(); }
+        if (disposing) { _timer.Dispose(); if (_ownsFont && _font != null) _font.Dispose(); }
         base.Dispose(disposing);
     }
 }
@@ -158,6 +180,13 @@ public static class VoiceWinShim {
         {"lalt",0xA4},{"lmenu",0xA4},{"rshift",0xA1},{"lshift",0xA0},{"capslock",0x14},{"scrolllock",0x91},
         {"pause",0x13},{"insert",0x2D},{"space",0x20}
     };
+
+    public static string GetHostUiCulture() {
+        string n = "";
+        try { if (CultureInfo.CurrentUICulture != null) n = CultureInfo.CurrentUICulture.Name ?? ""; } catch { }
+        if (string.IsNullOrWhiteSpace(n)) { try { if (CultureInfo.InstalledUICulture != null) n = CultureInfo.InstalledUICulture.Name ?? ""; } catch { } }
+        return n.Trim();
+    }
 
     public static uint ResolveKeyName(string raw) {
         string k = (raw ?? "RControl").Trim();
@@ -215,14 +244,15 @@ public static class VoiceWinShim {
             string st = (state ?? "").Trim().ToLowerInvariant();
             if (st == "" || st == "idle" || st == "hide") { if (_hud != null) _hud.HideNoActivate(); return; }
             if (_hud == null || _hud.IsDisposed) _hud = new HudPillForm();
+            bool zh = GetHostUiCulture().StartsWith("zh", StringComparison.OrdinalIgnoreCase);
             string txt; Color fg, bd; int ms = 0;
-            if (st == "recording") { txt = "\u25CF \u6B63\u5728\u5F55\u97F3\u2026 (\u518D\u6309" + _hotkeyLabel + " \u5B8C\u6210)"; fg = Color.FromArgb(255, 102, 102); bd = Color.FromArgb(190, 62, 62); }
-            else if (st == "recognizing" || st == "processing") { txt = "\u25D0 \u6B63\u5728\u8BED\u97F3\u8BC6\u522B\u2026"; fg = Color.FromArgb(34, 211, 238); bd = Color.FromArgb(20, 148, 175); }
-            else if (st == "refining") { txt = "\u25C8 \u6B63\u5728\u6574\u7406\u7CBE\u4FEE\u2026"; fg = Color.FromArgb(251, 191, 36); bd = Color.FromArgb(185, 132, 28); }
-            else if (st == "done") { txt = "\u2713 \u5DF2\u586B\u5165"; fg = Color.FromArgb(74, 222, 128); bd = Color.FromArgb(46, 150, 88); ms = 900; }
-            else if (st == "copied") { txt = "\u2713 \u5DF2\u590D\u5236(\u7A97\u53E3\u5DF2\u5207\u6362)"; fg = Color.FromArgb(129, 140, 248); bd = Color.FromArgb(99, 102, 241); ms = 900; }
-            else if (st == "empty") { txt = "\u25CB \u672A\u68C0\u6D4B\u5230\u8BED\u97F3"; fg = Color.FromArgb(203, 213, 225); bd = Color.FromArgb(100, 116, 139); ms = 900; }
-            else { txt = "\u2715 \u8BC6\u522B\u5931\u8D25"; fg = Color.FromArgb(248, 113, 113); bd = Color.FromArgb(185, 65, 65); ms = 900; }
+            if (st == "recording") { txt = zh ? ("\u25CF \u6B63\u5728\u5F55\u97F3\u2026 (\u518D\u6309" + _hotkeyLabel + " \u5B8C\u6210)") : "\u25CF Listening\u2026"; fg = Color.FromArgb(255, 102, 102); bd = Color.FromArgb(190, 62, 62); }
+            else if (st == "recognizing" || st == "processing") { txt = zh ? "\u25D0 \u6B63\u5728\u8BED\u97F3\u8BC6\u522B\u2026" : "\u25D0 Transcribing\u2026"; fg = Color.FromArgb(34, 211, 238); bd = Color.FromArgb(20, 148, 175); }
+            else if (st == "refining") { txt = zh ? "\u25C8 \u6B63\u5728\u6574\u7406\u7CBE\u4FEE\u2026" : "\u25C8 Refining\u2026"; fg = Color.FromArgb(251, 191, 36); bd = Color.FromArgb(185, 132, 28); }
+            else if (st == "done") { txt = zh ? "\u2713 \u5DF2\u586B\u5165" : "\u2713 Inserted"; fg = Color.FromArgb(74, 222, 128); bd = Color.FromArgb(46, 150, 88); ms = 900; }
+            else if (st == "copied") { txt = zh ? "\u2713 \u5DF2\u590D\u5236(\u7A97\u53E3\u5DF2\u5207\u6362)" : "\u2713 Copied (window switched)"; fg = Color.FromArgb(129, 140, 248); bd = Color.FromArgb(99, 102, 241); ms = 900; }
+            else if (st == "empty") { txt = zh ? "\u25CB \u672A\u68C0\u6D4B\u5230\u8BED\u97F3" : "\u25CB No speech detected"; fg = Color.FromArgb(203, 213, 225); bd = Color.FromArgb(100, 116, 139); ms = 900; }
+            else { txt = zh ? "\u2715 \u8BC6\u522B\u5931\u8D25" : "\u2715 Transcription failed"; fg = Color.FromArgb(248, 113, 113); bd = Color.FromArgb(185, 65, 65); ms = 900; }
             if (!string.IsNullOrEmpty(customText)) txt = customText;
             if (durationMs > 0) ms = durationMs;
             _hud.ShowStatus(txt, fg, bd, ms, GetForegroundWindow());
@@ -452,7 +482,7 @@ function Invoke-Tone([string]$kind) { [VoiceWinShim]::PlayTone($kind, [bool]$Bee
 
 if ($Mode -eq "probe") {
     $hwnd = 0L; $proc = ""; $title = ""; [VoiceWinShim]::QueryForeground([ref]$hwnd, [ref]$proc, [ref]$title)
-    Write-JsonLine @{ ok = $true; ps_version = $PSVersionTable.PSVersion.ToString(); wave_in_devs = [VoiceWinShim]::waveInGetNumDevs(); hwnd = $hwnd; process = $proc; title = $title }
+    Write-JsonLine @{ ok = $true; ps_version = $PSVersionTable.PSVersion.ToString(); wave_in_devs = [VoiceWinShim]::waveInGetNumDevs(); hwnd = $hwnd; process = $proc; title = $title; ui_culture = [VoiceWinShim]::GetHostUiCulture() }
     exit 0
 }
 
@@ -474,7 +504,7 @@ try {
     }
     [VoiceWinShim]::StartHook($targetVk, $isPtt, $TapMaxMs, $DebounceMs, $false, 0)
     [VoiceWinShim]::StartStdinReader()
-    Write-JsonLine @{ event = "ready"; target_vk = ("0x{0:X2}" -f $targetVk); mode = $TriggerMode; wave_in_devs = [VoiceWinShim]::waveInGetNumDevs() }
+    Write-JsonLine @{ event = "ready"; target_vk = ("0x{0:X2}" -f $targetVk); mode = $TriggerMode; wave_in_devs = [VoiceWinShim]::waveInGetNumDevs(); ui_culture = [VoiceWinShim]::GetHostUiCulture() }
     :bridgeLoop while ([VoiceWinShim]::PumpOnce()) {
         try {
             $ev = New-Object ShimEvent

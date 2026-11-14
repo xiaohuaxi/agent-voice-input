@@ -24,6 +24,7 @@ enum RawEventKind { case flagsChanged, keyDown, keyUp }
 struct TargetKeySpec {
     let name: String
     let hudLabel: String
+    let hudLabelEn: String
     let primaryKeyCode: UInt16
     let altKeyCodes: Set<UInt16>
     let isModifier: Bool
@@ -48,20 +49,20 @@ private let FUNCTION_KEY_CODES: [Int: UInt16] = [
 ]
 
 private let MODIFIER_TABLE: [([String], TargetKeySpec)] = [
-    (["rcontrol", "rctrl", "rightcontrol", "rightctrl"], TargetKeySpec(name: "RControl", hudLabel: "右 Ctrl", primaryKeyCode: 0x3E, altKeyCodes: [], isModifier: true, highFlag: FLAG_CONTROL, deviceMask: NX_DEVICERCTLKEYMASK, oppositeDeviceMask: NX_DEVICELCTLKEYMASK)),
-    (["lcontrol", "lctrl", "leftcontrol", "leftctrl"], TargetKeySpec(name: "LControl", hudLabel: "左 Ctrl", primaryKeyCode: 0x3B, altKeyCodes: [], isModifier: true, highFlag: FLAG_CONTROL, deviceMask: NX_DEVICELCTLKEYMASK, oppositeDeviceMask: NX_DEVICERCTLKEYMASK)),
-    (["control", "ctrl"], TargetKeySpec(name: "LControl", hudLabel: " Ctrl", primaryKeyCode: 0x3B, altKeyCodes: [], isModifier: true, highFlag: FLAG_CONTROL, deviceMask: NX_DEVICELCTLKEYMASK, oppositeDeviceMask: NX_DEVICERCTLKEYMASK)),
-    (["ralt", "roption", "rightalt", "rightoption", "rmenu"], TargetKeySpec(name: "ROption", hudLabel: "右 Option", primaryKeyCode: 0x3D, altKeyCodes: [], isModifier: true, highFlag: FLAG_OPTION, deviceMask: NX_DEVICERALTKEYMASK, oppositeDeviceMask: NX_DEVICELALTKEYMASK)),
-    (["lalt", "loption", "leftalt", "leftoption", "lmenu"], TargetKeySpec(name: "LOption", hudLabel: "左 Option", primaryKeyCode: 0x3A, altKeyCodes: [], isModifier: true, highFlag: FLAG_OPTION, deviceMask: NX_DEVICELALTKEYMASK, oppositeDeviceMask: NX_DEVICERALTKEYMASK)),
-    (["alt", "option"], TargetKeySpec(name: "LOption", hudLabel: " Option", primaryKeyCode: 0x3A, altKeyCodes: [], isModifier: true, highFlag: FLAG_OPTION, deviceMask: NX_DEVICELALTKEYMASK, oppositeDeviceMask: NX_DEVICERALTKEYMASK)),
-    (["rcommand", "rcmd", "rightcommand", "rightcmd"], TargetKeySpec(name: "RCommand", hudLabel: "右 Cmd", primaryKeyCode: 0x36, altKeyCodes: [], isModifier: true, highFlag: FLAG_COMMAND, deviceMask: NX_DEVICERCMDKEYMASK, oppositeDeviceMask: NX_DEVICELCMDKEYMASK)),
-    (["lcommand", "lcmd", "leftcommand", "leftcmd"], TargetKeySpec(name: "LCommand", hudLabel: "左 Cmd", primaryKeyCode: 0x37, altKeyCodes: [], isModifier: true, highFlag: FLAG_COMMAND, deviceMask: NX_DEVICELCMDKEYMASK, oppositeDeviceMask: NX_DEVICERCMDKEYMASK)),
-    (["command", "cmd"], TargetKeySpec(name: "LCommand", hudLabel: " Cmd", primaryKeyCode: 0x37, altKeyCodes: [], isModifier: true, highFlag: FLAG_COMMAND, deviceMask: NX_DEVICELCMDKEYMASK, oppositeDeviceMask: NX_DEVICERCMDKEYMASK)),
-    (["rshift", "rightshift"], TargetKeySpec(name: "RShift", hudLabel: "右 Shift", primaryKeyCode: 0x3C, altKeyCodes: [], isModifier: true, highFlag: FLAG_SHIFT, deviceMask: NX_DEVICERSHIFTKEYMASK, oppositeDeviceMask: NX_DEVICELSHIFTKEYMASK)),
-    (["lshift", "leftshift"], TargetKeySpec(name: "LShift", hudLabel: "左 Shift", primaryKeyCode: 0x38, altKeyCodes: [], isModifier: true, highFlag: FLAG_SHIFT, deviceMask: NX_DEVICELSHIFTKEYMASK, oppositeDeviceMask: NX_DEVICERSHIFTKEYMASK)),
-    (["shift"], TargetKeySpec(name: "LShift", hudLabel: " Shift", primaryKeyCode: 0x38, altKeyCodes: [], isModifier: true, highFlag: FLAG_SHIFT, deviceMask: NX_DEVICELSHIFTKEYMASK, oppositeDeviceMask: NX_DEVICERSHIFTKEYMASK)),
-    (["fn", "function", "globe"], TargetKeySpec(name: "Fn", hudLabel: " Fn", primaryKeyCode: 0x3F, altKeyCodes: [0xB3], isModifier: true, highFlag: FLAG_FUNCTION, deviceMask: 0, oppositeDeviceMask: 0)),
-    (["capslock"], TargetKeySpec(name: "CapsLock", hudLabel: " CapsLock", primaryKeyCode: 0x39, altKeyCodes: [], isModifier: true, highFlag: FLAG_CAPSLOCK, deviceMask: 0, oppositeDeviceMask: 0)),
+    (["rcontrol", "rctrl", "rightcontrol", "rightctrl"], TargetKeySpec(name: "RControl", hudLabel: "右 Ctrl", hudLabelEn: "Right Ctrl", primaryKeyCode: 0x3E, altKeyCodes: [], isModifier: true, highFlag: FLAG_CONTROL, deviceMask: NX_DEVICERCTLKEYMASK, oppositeDeviceMask: NX_DEVICELCTLKEYMASK)),
+    (["lcontrol", "lctrl", "leftcontrol", "leftctrl"], TargetKeySpec(name: "LControl", hudLabel: "左 Ctrl", hudLabelEn: "Left Ctrl", primaryKeyCode: 0x3B, altKeyCodes: [], isModifier: true, highFlag: FLAG_CONTROL, deviceMask: NX_DEVICELCTLKEYMASK, oppositeDeviceMask: NX_DEVICERCTLKEYMASK)),
+    (["control", "ctrl"], TargetKeySpec(name: "LControl", hudLabel: " Ctrl", hudLabelEn: "Ctrl", primaryKeyCode: 0x3B, altKeyCodes: [], isModifier: true, highFlag: FLAG_CONTROL, deviceMask: NX_DEVICELCTLKEYMASK, oppositeDeviceMask: NX_DEVICERCTLKEYMASK)),
+    (["ralt", "roption", "rightalt", "rightoption", "rmenu"], TargetKeySpec(name: "ROption", hudLabel: "右 Option", hudLabelEn: "Right Option", primaryKeyCode: 0x3D, altKeyCodes: [], isModifier: true, highFlag: FLAG_OPTION, deviceMask: NX_DEVICERALTKEYMASK, oppositeDeviceMask: NX_DEVICELALTKEYMASK)),
+    (["lalt", "loption", "leftalt", "leftoption", "lmenu"], TargetKeySpec(name: "LOption", hudLabel: "左 Option", hudLabelEn: "Left Option", primaryKeyCode: 0x3A, altKeyCodes: [], isModifier: true, highFlag: FLAG_OPTION, deviceMask: NX_DEVICELALTKEYMASK, oppositeDeviceMask: NX_DEVICERALTKEYMASK)),
+    (["alt", "option"], TargetKeySpec(name: "LOption", hudLabel: " Option", hudLabelEn: "Option", primaryKeyCode: 0x3A, altKeyCodes: [], isModifier: true, highFlag: FLAG_OPTION, deviceMask: NX_DEVICELALTKEYMASK, oppositeDeviceMask: NX_DEVICERALTKEYMASK)),
+    (["rcommand", "rcmd", "rightcommand", "rightcmd"], TargetKeySpec(name: "RCommand", hudLabel: "右 Cmd", hudLabelEn: "Right Cmd", primaryKeyCode: 0x36, altKeyCodes: [], isModifier: true, highFlag: FLAG_COMMAND, deviceMask: NX_DEVICERCMDKEYMASK, oppositeDeviceMask: NX_DEVICELCMDKEYMASK)),
+    (["lcommand", "lcmd", "leftcommand", "leftcmd"], TargetKeySpec(name: "LCommand", hudLabel: "左 Cmd", hudLabelEn: "Left Cmd", primaryKeyCode: 0x37, altKeyCodes: [], isModifier: true, highFlag: FLAG_COMMAND, deviceMask: NX_DEVICELCMDKEYMASK, oppositeDeviceMask: NX_DEVICERCMDKEYMASK)),
+    (["command", "cmd"], TargetKeySpec(name: "LCommand", hudLabel: " Cmd", hudLabelEn: "Cmd", primaryKeyCode: 0x37, altKeyCodes: [], isModifier: true, highFlag: FLAG_COMMAND, deviceMask: NX_DEVICELCMDKEYMASK, oppositeDeviceMask: NX_DEVICERCMDKEYMASK)),
+    (["rshift", "rightshift"], TargetKeySpec(name: "RShift", hudLabel: "右 Shift", hudLabelEn: "Right Shift", primaryKeyCode: 0x3C, altKeyCodes: [], isModifier: true, highFlag: FLAG_SHIFT, deviceMask: NX_DEVICERSHIFTKEYMASK, oppositeDeviceMask: NX_DEVICELSHIFTKEYMASK)),
+    (["lshift", "leftshift"], TargetKeySpec(name: "LShift", hudLabel: "左 Shift", hudLabelEn: "Left Shift", primaryKeyCode: 0x38, altKeyCodes: [], isModifier: true, highFlag: FLAG_SHIFT, deviceMask: NX_DEVICELSHIFTKEYMASK, oppositeDeviceMask: NX_DEVICERSHIFTKEYMASK)),
+    (["shift"], TargetKeySpec(name: "LShift", hudLabel: " Shift", hudLabelEn: "Shift", primaryKeyCode: 0x38, altKeyCodes: [], isModifier: true, highFlag: FLAG_SHIFT, deviceMask: NX_DEVICELSHIFTKEYMASK, oppositeDeviceMask: NX_DEVICERSHIFTKEYMASK)),
+    (["fn", "function", "globe"], TargetKeySpec(name: "Fn", hudLabel: " Fn", hudLabelEn: "Fn", primaryKeyCode: 0x3F, altKeyCodes: [0xB3], isModifier: true, highFlag: FLAG_FUNCTION, deviceMask: 0, oppositeDeviceMask: 0)),
+    (["capslock"], TargetKeySpec(name: "CapsLock", hudLabel: " CapsLock", hudLabelEn: "CapsLock", primaryKeyCode: 0x39, altKeyCodes: [], isModifier: true, highFlag: FLAG_CAPSLOCK, deviceMask: 0, oppositeDeviceMask: 0)),
 ]
 
 private let KEY_CODE_NAMES: [UInt16: String] = {
@@ -79,15 +80,15 @@ func resolveTargetKey(_ raw: String) throws -> TargetKeySpec {
     let k = (trimmed.isEmpty ? "RControl" : trimmed).lowercased()
     for (aliases, spec) in MODIFIER_TABLE where aliases.contains(k) { return spec }
     if k == "space" {
-        return TargetKeySpec(name: "Space", hudLabel: " Space", primaryKeyCode: 0x31, altKeyCodes: [], isModifier: false, highFlag: 0, deviceMask: 0, oppositeDeviceMask: 0)
+        return TargetKeySpec(name: "Space", hudLabel: " Space", hudLabelEn: "Space", primaryKeyCode: 0x31, altKeyCodes: [], isModifier: false, highFlag: 0, deviceMask: 0, oppositeDeviceMask: 0)
     }
     if k.hasPrefix("f"), let fn = Int(k.dropFirst()), let kc = FUNCTION_KEY_CODES[fn] {
-        return TargetKeySpec(name: "F\(fn)", hudLabel: " F\(fn)", primaryKeyCode: kc, altKeyCodes: [], isModifier: false, highFlag: 0, deviceMask: 0, oppositeDeviceMask: 0)
+        return TargetKeySpec(name: "F\(fn)", hudLabel: " F\(fn)", hudLabelEn: "F\(fn)", primaryKeyCode: kc, altKeyCodes: [], isModifier: false, highFlag: 0, deviceMask: 0, oppositeDeviceMask: 0)
     }
     if k.hasPrefix("0x"), let parsed = UInt16(k.dropFirst(2), radix: 16) {
         for (_, spec) in MODIFIER_TABLE where spec.primaryKeyCode == parsed { return spec }
         let hex = String(format: "0x%02X", parsed)
-        return TargetKeySpec(name: hex, hudLabel: " \(hex)", primaryKeyCode: parsed, altKeyCodes: [], isModifier: false, highFlag: 0, deviceMask: 0, oppositeDeviceMask: 0)
+        return TargetKeySpec(name: hex, hudLabel: " \(hex)", hudLabelEn: hex, primaryKeyCode: parsed, altKeyCodes: [], isModifier: false, highFlag: 0, deviceMask: 0, oppositeDeviceMask: 0)
     }
     throw NSError(domain: "MacShim", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unsupported macOS hotkey name: \(raw)"])
 }
@@ -227,16 +228,31 @@ private func rgba(_ r: Int, _ g: Int, _ b: Int, _ a: CGFloat = 1.0) -> NSColor {
     NSColor(srgbRed: CGFloat(r) / 255.0, green: CGFloat(g) / 255.0, blue: CGFloat(b) / 255.0, alpha: a)
 }
 
+private func hostUiCulture() -> String {
+    for raw in Locale.preferredLanguages {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !s.isEmpty { return s }
+    }
+    return Locale.current.identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func isZhUiCulture(_ tag: String) -> Bool {
+    let low = tag.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return low == "zh" || low.hasPrefix("zh-") || low.hasPrefix("zh_") || low.hasPrefix("zh.") || low.hasPrefix("zh@")
+}
+
 final class HudPillController {
     private var panel: NSPanel?
     private var bgView: NSView?
     private var label: NSTextField?
     private var hideWorkItem: DispatchWorkItem?
     private let hotkeyLabel: String
+    private let hotkeyLabelEn: String
     private let isPtt: Bool
 
-    init(hotkeyLabel: String, isPtt: Bool) {
+    init(hotkeyLabel: String, hotkeyLabelEn: String, isPtt: Bool) {
         self.hotkeyLabel = hotkeyLabel
+        self.hotkeyLabelEn = hotkeyLabelEn
         self.isPtt = isPtt
     }
 
@@ -278,22 +294,25 @@ final class HudPillController {
         ensurePanel()
         guard let panel = panel, let bgView = bgView, let label = label else { return }
 
+        let zh = isZhUiCulture(hostUiCulture())
         var (txt, fg, bd, autoHideMs): (String, NSColor, NSColor, Int)
         if st == "recording" {
-            txt = "● 正在录音… (\(isPtt ? "松开" : "再按")\(hotkeyLabel) 完成)"
+            txt = zh
+                ? "● 正在录音… (\(isPtt ? "松开" : "再按")\(hotkeyLabel) 完成)"
+                : "● Listening… (\(isPtt ? "release" : "press") \(hotkeyLabelEn) to finish)"
             (fg, bd, autoHideMs) = (rgba(255, 102, 102), rgba(190, 62, 62, 0.95), 0)
         } else if st == "recognizing" || st == "processing" {
-            (txt, fg, bd, autoHideMs) = ("◐ 正在语音识别…", rgba(34, 211, 238), rgba(20, 148, 175, 0.95), 0)
+            (txt, fg, bd, autoHideMs) = (zh ? "◐ 正在语音识别…" : "◐ Transcribing…", rgba(34, 211, 238), rgba(20, 148, 175, 0.95), 0)
         } else if st == "refining" {
-            (txt, fg, bd, autoHideMs) = ("◈ 正在整理精修…", rgba(251, 191, 36), rgba(185, 132, 28, 0.95), 0)
+            (txt, fg, bd, autoHideMs) = (zh ? "◈ 正在整理精修…" : "◈ Refining…", rgba(251, 191, 36), rgba(185, 132, 28, 0.95), 0)
         } else if st == "done" {
-            (txt, fg, bd, autoHideMs) = ("✓ 已填入", rgba(74, 222, 128), rgba(46, 150, 88, 0.95), 900)
+            (txt, fg, bd, autoHideMs) = (zh ? "✓ 已填入" : "✓ Inserted", rgba(74, 222, 128), rgba(46, 150, 88, 0.95), 900)
         } else if st == "copied" {
-            (txt, fg, bd, autoHideMs) = ("✓ 已复制(窗口已切换)", rgba(129, 140, 248), rgba(99, 102, 241, 0.95), 900)
+            (txt, fg, bd, autoHideMs) = (zh ? "✓ 已复制(窗口已切换)" : "✓ Copied (window switched)", rgba(129, 140, 248), rgba(99, 102, 241, 0.95), 900)
         } else if st == "empty" {
-            (txt, fg, bd, autoHideMs) = ("○ 未检测到语音", rgba(203, 213, 225), rgba(100, 116, 139, 0.95), 900)
+            (txt, fg, bd, autoHideMs) = (zh ? "○ 未检测到语音" : "○ No speech detected", rgba(203, 213, 225), rgba(100, 116, 139, 0.95), 900)
         } else {
-            (txt, fg, bd, autoHideMs) = ("✕ 识别失败", rgba(248, 113, 113), rgba(185, 65, 65, 0.95), 900)
+            (txt, fg, bd, autoHideMs) = (zh ? "✕ 识别失败" : "✕ Transcription failed", rgba(248, 113, 113), rgba(185, 65, 65, 0.95), 900)
         }
         if !customText.isEmpty { txt = customText }
         if durationMs > 0 { autoHideMs = durationMs }
@@ -391,6 +410,8 @@ private func runSelfCheck() -> Int32 {
         let recov = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 5600, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
         try check(recov.count == 1 && recov[0].kind == "toggle", "recovered toggle after swallowed keyUp")
 
+        try check(isZhUiCulture("zh-Hans-CN") && isZhUiCulture("zh_TW.UTF-8") && !isZhUiCulture("en-US"), "ui_culture zh detection")
+
         #if arch(arm64)
         let archName = "arm64"
         #elseif arch(x86_64)
@@ -398,7 +419,7 @@ private func runSelfCheck() -> Int32 {
         #else
         let archName = "unknown"
         #endif
-        writeJsonLine(["ok": true, "mode": "self-check", "arch": archName, "rcontrol_vk": String(format: "0x%02X", rctrl.primaryKeyCode), "rcontrol_mask": String(format: "0x%04X", rctrl.deviceMask)])
+        writeJsonLine(["ok": true, "mode": "self-check", "arch": archName, "rcontrol_vk": String(format: "0x%02X", rctrl.primaryKeyCode), "rcontrol_mask": String(format: "0x%04X", rctrl.deviceMask), "ui_culture": hostUiCulture()])
         return 0
     } catch {
         fputs("self-check error: \(error.localizedDescription)\n", stderr)
@@ -439,7 +460,7 @@ struct MacShimMain {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
-        let hud = HudPillController(hotkeyLabel: spec.hudLabel, isPtt: isPtt)
+        let hud = HudPillController(hotkeyLabel: spec.hudLabel, hotkeyLabelEn: spec.hudLabelEn, isPtt: isPtt)
         var engine = HotkeyEngine(spec: spec, isPtt: isPtt, tapMaxMs: tapMaxMs, debounceMs: debounceMs, keyTest: isKeyTest)
         var globalMonitor: Any?
 
@@ -528,7 +549,7 @@ struct MacShimMain {
         stdinThread.name = "mac-shim-stdin"
         stdinThread.start()
 
-        writeJsonLine(["event": "ready", "target_vk": String(format: "0x%02X", spec.primaryKeyCode), "mode": triggerMode, "listen_access": hasListenAccess])
+        writeJsonLine(["event": "ready", "target_vk": String(format: "0x%02X", spec.primaryKeyCode), "mode": triggerMode, "listen_access": hasListenAccess, "ui_culture": hostUiCulture()])
         app.run(); cleanupAndExit(0)
     }
 }

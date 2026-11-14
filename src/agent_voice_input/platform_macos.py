@@ -1,12 +1,13 @@
 """macOS native bridge: AVFoundation capture, Ghostty split-aware input, and mac_shim.swift hotkey/HUD."""
 from __future__ import annotations
 
-import hashlib, os, platform as py_platform, re, shutil, subprocess, threading, time
+import hashlib, json, os, platform as py_platform, re, shutil, subprocess, threading, time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .audio_proc import resolve_ffmpeg_bin
 from .config import Config, ensure_secure_dir, expand_user_path, redact_secrets
+from .hud import resolve_ui_language
 from .platform_wsl import FfmpegWavRecorder, ForegroundWindow, JsonlShimMixin, PasteOutcome, stream_key_test_proc
 
 GHOSTTY_BUNDLE_ID = "com.mitchellh.ghostty"
@@ -286,6 +287,7 @@ def probe_macos_host(cfg: Config, env: Mapping[str, str] | None = None, *, cache
     if swiftc := resolve_swiftc_bin(eff_env):
         info["swiftc_ok"], info["swiftc_bin"] = True, swiftc
     shim_bin, shim_err = compile_mac_shim(env=eff_env, cache_dir=cache_dir, swiftc_bin=swiftc, cfg=cfg)
+    ui_cult = ""
     if shim_bin is not None:
         info["mac_shim_bin"] = str(shim_bin)
         try:
@@ -294,13 +296,22 @@ def probe_macos_host(cfg: Config, env: Mapping[str, str] | None = None, *, cache
                 capture_output=True, text=True, env=eff_env, timeout=5, check=False,
             )
             info["mac_shim_ok"] = sc.returncode == 0
-            if sc.returncode != 0:
+            if sc.returncode == 0 and sc.stdout.strip():
+                try:
+                    sc_json = json.loads(sc.stdout.strip().splitlines()[-1])
+                    if isinstance(sc_json, dict):
+                        ui_cult = str(sc_json.get("ui_culture") or "").strip()
+                except ValueError:
+                    pass
+            elif sc.returncode != 0:
                 raw_err = (sc.stderr or sc.stdout or f"self-check rc={sc.returncode}").strip()
                 info["mac_shim_error"] = redact_secrets(raw_err, eff_env, cfg=cfg)
         except Exception as exc:
             info["mac_shim_error"] = redact_secrets(str(exc), eff_env, cfg=cfg)
     else:
         info["mac_shim_error"] = shim_err
+    info["ui_culture"] = ui_cult
+    info["ui_lang"] = resolve_ui_language(cfg.ui.language, env=eff_env, win_ui_culture=ui_cult or None)
 
     try:
         fg = MacOSPlatform(cfg, env=eff_env, cache_dir=cache_dir).get_foreground_window()

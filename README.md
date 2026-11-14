@@ -15,7 +15,7 @@ Instead of treating terminal dictation like generic chat input, `agent-voice-inp
 1. **Active Session Context**: Locates the foreground agent session (via optional terminal title tags, Ghostty split `tty`/`cwd` matching on macOS, or `/proc` root-session scanning on Linux while ignoring background subagents) and extracts recent dialogue plus `git status` filenames as context.
 2. **Stage 1 — Speech Recognition**: Applies a local silence gate (`-50 dBFS`) and RMS loudness normalization (`-20 dBFS`), then transcribes audio via cloud ASR (defaults to Alibaba Bailian `qwen3-asr-flash`; also supports Volcengine Doubao, Gemini, or OpenAI-compatible endpoints).
 3. **Stage 2 — Lightweight Context Refinement**: Cleans up technical terms and explicit spoken self-corrections against the extracted session context. For now, Stage 2 defaults to invoking a lightweight model through local Codex CLI (`codex-luna`), and can also be pointed to an OpenAI-compatible API or turned off (`off`).
-4. **Focus-Safe Paste**: Shows recording/recognition/refinement stages in a non-activating top HUD pill (Windows & macOS), locks onto the origin terminal window/split when recording begins, never auto-presses Enter, and falls back to clipboard-only if focus drifted elsewhere.
+4. **Focus-Safe Paste**: Shows recording/recognition/refinement stages in a non-activating top HUD pill (Windows & macOS, automatically matching Chinese or English desktop UI language), locks onto the origin terminal window/split when recording begins, never auto-presses Enter, and falls back to clipboard-only if focus drifted elsewhere.
 5. **Lightweight Setup**: Relies only on the Python 3.10+ standard library plus host `ffmpeg` (built-in `powershell.exe` on WSL2; cached native `mac_shim.swift` helper via `/usr/bin/swiftc` on macOS), requiring no extra Python packages.
 
 ---
@@ -58,7 +58,7 @@ EOF
 chmod 600 ~/.config/agent-voice-input/agent-voice-input.env
 ```
 
-Other supported credentials include `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` (Doubao), `GEMINI_API_KEY`, and `OPENAI_API_KEY`. To customize hotkeys (`trigger_mode = "tap_toggle"` or `"ptt"`), macOS audio input (`[audio] macos_device = "default"` or `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`), ASR models, or Stage 2 refinement (such as `refiner.provider = "openai-compatible"` or `"off"`), copy [`config.example.toml`](config.example.toml) to `~/.config/agent-voice-input/config.toml` (also see [`config.example.env`](config.example.env)).
+Other supported credentials include `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` (Doubao), `GEMINI_API_KEY`, and `OPENAI_API_KEY`. To customize hotkeys (`trigger_mode = "tap_toggle"` or `"ptt"`), HUD language (`[ui] language = "auto" | "zh" | "en"`, or `AGENT_VOICE_INPUT_UI_LANGUAGE`), macOS audio input (`[audio] macos_device = "default"` or `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`), ASR models, or Stage 2 refinement (such as `refiner.provider = "openai-compatible"` or `"off"`), copy [`config.example.toml`](config.example.toml) to `~/.config/agent-voice-input/config.toml` (also see [`config.example.env`](config.example.env)).
 
 ### 4. Verify & Run
 

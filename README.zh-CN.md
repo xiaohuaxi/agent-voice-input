@@ -15,7 +15,7 @@
 1. **活跃会话上下文抽取**：自动定位前台终端中的主 Agent 会话（支持终端标题标签、macOS Ghostty 分屏 `tty`/`cwd` 直连匹配，以及 Linux `/proc` 根会话扫描，严格排除后台 subagent），增量提取近期对话与 `git status` 文件名作为上下文参考。
 2. **一阶段语音识别（ASR）**：先在本地做 `-50 dBFS` 静音门控与 `-20 dBFS` 响度归一化，再调用云端语音识别（默认阿里百炼 `qwen3-asr-flash`，亦支持火山豆包、Gemini 或 OpenAI 兼容接口）。
 3. **二阶段轻量语境精修**：结合抽取出的会话上下文修正同音标识符并理顺口语改口。目前暂时默认通过本地 Codex CLI 调用轻量模型（`codex-luna`）完成整理，也可在配置中切换为 OpenAI 兼容接口或直接关闭（`off`）。
-4. **焦点安全粘贴**：Windows 与 macOS 均提供不抢焦点的顶部胶囊提示（录音、识别、精修阶段）；开始录音时锁定原终端窗口/分屏，上屏仅粘贴不自动按回车，中途切走焦点则仅写入剪贴板防串窗。
+4. **焦点安全粘贴**：Windows 与 macOS 均提供不抢焦点的顶部胶囊提示（录音、识别、精修阶段，默认随桌面 UI 语言自动切换中英文提示）；开始录音时锁定原终端窗口/分屏，上屏仅粘贴不自动按回车，中途切走焦点则仅写入剪贴板防串窗。
 5. **依赖精简**：仅使用 Python 3.10+ 标准库与宿主机 `ffmpeg`（WSL2 复用系统自带 `powershell.exe`，macOS 首次启动使用 `/usr/bin/swiftc` 幂等编译缓存原生辅助程序 `mac_shim.swift`），无需额外安装第三方 Python 包。
 
 ---
@@ -58,7 +58,7 @@ EOF
 chmod 600 ~/.config/agent-voice-input/agent-voice-input.env
 ```
 
-除 `ALI_API_KEY`（百炼）外，也支持 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`（豆包）、`GEMINI_API_KEY` 或 `OPENAI_API_KEY`（详见 [`config.example.env`](config.example.env)）。如需自定义快捷键（单点切换 `tap_toggle` 或按住说话 `ptt`）、macOS 录音设备（`[audio] macos_device = "default"` 或环境变量 `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`）、模型或将二阶段精修改为 `openai-compatible` / 关闭（`off`），可将 [`config.example.toml`](config.example.toml) 保存为 `~/.config/agent-voice-input/config.toml` 按需修改。
+除 `ALI_API_KEY`（百炼）外，也支持 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`（豆包）、`GEMINI_API_KEY` 或 `OPENAI_API_KEY`（详见 [`config.example.env`](config.example.env)）。如需自定义快捷键（单点切换 `tap_toggle` 或按住说话 `ptt`）、胶囊提示语言（`[ui] language = "auto" | "zh" | "en"`，或环境变量 `AGENT_VOICE_INPUT_UI_LANGUAGE`）、macOS 录音设备（`[audio] macos_device = "default"` 或环境变量 `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`）、模型或将二阶段精修改为 `openai-compatible` / 关闭（`off`），可将 [`config.example.toml`](config.example.toml) 保存为 `~/.config/agent-voice-input/config.toml` 按需修改。
 
 ### 4. 自检与运行
 

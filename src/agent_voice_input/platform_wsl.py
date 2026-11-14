@@ -8,6 +8,7 @@ from typing import Any, Callable, Mapping
 
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, redact_secrets
+from .hud import format_hud_text, resolve_ui_language
 
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 WSLG_PULSE_SOCK = "/mnt/wslg/PulseServer"
@@ -149,7 +150,8 @@ def to_windows_path(path: str | Path) -> str:
 
 
 def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    eff_env = _pulse_env(os.environ if env is None else env)
+    raw_env = os.environ if env is None else env
+    eff_env = _pulse_env(raw_env)
     info: dict[str, Any] = {"powershell_ok": False, "pulse_rdp_ok": False, "winmm_devs": 0, "fg_process": "", "fg_title": ""}
     try:
         p = subprocess.run([resolve_ffmpeg_bin(), "-nostdin", "-hide_banner", "-sources", "pulse"], stdin=subprocess.DEVNULL, capture_output=True, text=True, env=eff_env, timeout=5, check=False)
@@ -160,7 +162,8 @@ def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[st
             p = subprocess.run([POWERSHELL_EXE, "-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "probe"], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8, check=False)
             if p.returncode == 0 and p.stdout.strip():
                 d = json.loads(p.stdout.strip().splitlines()[-1])
-                info.update(powershell_ok=bool(d.get("ok")), ps_version=str(d.get("ps_version") or ""), winmm_devs=int(d.get("wave_in_devs") or 0), fg_process=str(d.get("process") or ""), fg_title=str(d.get("title") or ""), fg_hwnd=int(d.get("hwnd") or 0))
+                ui_cult = str(d.get("ui_culture") or "").strip()
+                info.update(powershell_ok=bool(d.get("ok")), ps_version=str(d.get("ps_version") or ""), winmm_devs=int(d.get("wave_in_devs") or 0), fg_process=str(d.get("process") or ""), fg_title=str(d.get("title") or ""), fg_hwnd=int(d.get("hwnd") or 0), ui_culture=ui_cult, ui_lang=resolve_ui_language(cfg.ui.language, env=raw_env, win_ui_culture=ui_cult))
         except Exception as exc: info["ps_error"] = str(exc)
     return info
 
@@ -220,7 +223,12 @@ class JsonlShimMixin:
         self._event_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._event_worker: threading.Thread | None = None
         self._on_event: Callable[[dict[str, Any]], None] | None = None
+        self._win_ui_culture = ""
         self.last_shim_error = ""
+
+    def _host_ui_culture(self) -> str | None:
+        # Non-WSL platforms fall back to POSIX locale vars when the shim omits ui_culture.
+        return self._win_ui_culture or None
 
     def _disable_shim_once(self, reason: str) -> None:
         self.last_shim_error = redact_secrets(reason, self.env, cfg=self.cfg)
@@ -318,6 +326,7 @@ class JsonlShimMixin:
                     continue
                 if msg.get("event") == "ready":
                     got_ready = True
+                    self._win_ui_culture = str(msg.get("ui_culture") or "").strip()
                     self._ready.set()
                 elif "event" in msg and self._on_event is not None:
                     self._ensure_event_worker()
@@ -396,12 +405,35 @@ class JsonlShimMixin:
         self._ensure_shim()
 
     def hud(self, state: str, text: str = "", duration_ms: int = 0) -> None:
-        if self._has_managed_shim():
+        if not self._has_managed_shim():
+            return
+        st = (state or "").strip().lower()
+        try:
+            if not self._ensure_shim():
+                return
+            if not self._ready.is_set():
+                self._ready.wait(timeout=self._shim_ready_timeout)
             req: dict[str, Any] = {"cmd": "hud", "state": state}
-            if text: req["text"] = text
-            if duration_ms > 0: req["duration_ms"] = duration_ms
-            try: self._shim_rpc(req, timeout_sec=1.5)
-            except Exception: pass
+            eff_text = text
+            if not eff_text and st not in ("", "idle", "hide"):
+                lang = resolve_ui_language(
+                    self.cfg.ui.language,
+                    env=self.env,
+                    win_ui_culture=self._host_ui_culture(),
+                )
+                eff_text = format_hud_text(
+                    st,
+                    lang,
+                    hotkey=self.cfg.hotkey.key,
+                    trigger_mode=self.cfg.hotkey.trigger_mode,
+                )
+            if eff_text:
+                req["text"] = eff_text
+            if duration_ms > 0:
+                req["duration_ms"] = duration_ms
+            self._shim_rpc(req, timeout_sec=1.5)
+        except Exception:
+            pass
 
     def close(self) -> None:
         self._closed = True
@@ -429,6 +461,10 @@ class WslPlatform(JsonlShimMixin):
     _shim_graceful = False
     _shim_ready_timeout = 8.0
     _shim_label = "win_shim"
+
+    def _host_ui_culture(self) -> str | None:
+        # Intentional on WSL2: always pass a string ("" when omitted) so HUD language never falls back to WSL Linux LANG.
+        return self._win_ui_culture
 
     def __init__(self, cfg: Config, *, env: Mapping[str, str] | None = None, pulse_source: str = "RDPSource", shim_cmd_factory: Callable[[], list[str]] | None = None) -> None:
         raw_env = os.environ if env is None else env
