@@ -6,7 +6,7 @@ Context-aware voice input for CLI coding agents (such as **Codex**, **Claude Cod
 
 Instead of treating terminal dictation like generic chat input, `agent-voice-input` pairs fast speech recognition with lightweight refinement grounded in your active coding session—fixing homophone identifiers, mixed Chinese–English technical terms, and spoken self-corrections before pasting safely into the terminal.
 
-> **Early Release (`v0.2.0`)**: Verified on **Windows Terminal + WSL2 (including `tmux` split panes and Remote Desktop)** and **macOS + Ghostty (including `tmux`)**. Broader terminal coverage is actively in progress.
+> **Early Release (`v0.2.1`)**: Verified on **Windows Terminal + WSL2 (including `tmux` split panes and Remote Desktop)** and **macOS + Ghostty (including `tmux`)**. Broader terminal coverage is actively in progress.
 
 ---
 

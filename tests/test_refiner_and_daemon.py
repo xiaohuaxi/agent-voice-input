@@ -181,7 +181,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
 
         proj = data["project"]
         self.assertEqual(proj["name"], "agent-voice-input")
-        self.assertEqual(proj["version"], "0.2.0")
+        self.assertEqual(proj["version"], "0.2.1")
         self.assertEqual(proj["requires-python"], ">=3.10")
         self.assertEqual(proj["license"], "Apache-2.0")
         self.assertEqual(
