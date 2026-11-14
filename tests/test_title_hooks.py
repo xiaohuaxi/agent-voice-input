@@ -463,6 +463,7 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
                             proc.stdin.close()
                         except BrokenPipeError:
                             pass
+                        proc.stdin = None
 
                     deadline = time.monotonic() + timeout_sec
                     pty_eof = False
