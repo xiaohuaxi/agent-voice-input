@@ -6,6 +6,7 @@ import json, os, queue, shutil, signal, subprocess, tempfile, threading, time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from . import __version__
 from .asr_providers import (
     AsrResult,
     GEMINI_DEFAULT_BASE_URL,
@@ -117,7 +118,7 @@ class _AppServerClient:
         self._q: queue.Queue[str | None] = queue.Queue()
         self._next_id = 1
         threading.Thread(target=self._reader, daemon=True).start()
-        self.request("initialize", {"clientInfo": {"name": "agent-voice-input", "version": "0.1.0"}, "capabilities": {"experimentalApi": False, "optOutNotificationMethods": _OPT_OUT}}, timeout_sec)
+        self.request("initialize", {"clientInfo": {"name": "agent-voice-input", "version": __version__}, "capabilities": {"experimentalApi": False, "optOutNotificationMethods": _OPT_OUT}}, timeout_sec)
         self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
     def _reader(self) -> None:
