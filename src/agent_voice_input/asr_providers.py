@@ -12,13 +12,16 @@ Implements verified contracts for:
 """
 from __future__ import annotations
 
+import atexit
 import base64
 from dataclasses import dataclass, field
 import hashlib
+import http.client
 import json
 import os
 import re
 import socket
+import ssl
 import string
 import threading
 import time
@@ -386,32 +389,363 @@ class _SameOriginSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 _SAFE_OPENER = urllib.request.build_opener(_SameOriginSafeRedirectHandler())
+_DEFAULT_SAFE_OPENER = _SAFE_OPENER
+_INITIAL_PROXIES = urllib.request.getproxies()
+
+_OriginKey = tuple[str, str, int]
+_MAX_REDIRECTS = 5
+_STALE_CONN_ERRORS = (
+    http.client.RemoteDisconnected,
+    http.client.CannotSendRequest,
+    http.client.BadStatusLine,
+    ConnectionError,
+    ssl.SSLEOFError,
+)
+
+
+class _KeepAlivePool:
+    """Thread-safe same-origin HTTP/1.1 Keep-Alive connection pool."""
+
+    def __init__(self, *, max_per_origin: int = 2, idle_timeout_sec: float = 45.0) -> None:
+        self.max_per_origin = max_per_origin
+        self.idle_timeout_sec = idle_timeout_sec
+        self._lock = threading.Lock()
+        self._idle: dict[_OriginKey, list[tuple[http.client.HTTPConnection, float]]] = {}
+        self._ssl_ctx: ssl.SSLContext | None = None
+
+    def _get_ssl_context(self) -> ssl.SSLContext:
+        with self._lock:
+            if self._ssl_ctx is None:
+                self._ssl_ctx = ssl.create_default_context()
+            return self._ssl_ctx
+
+    def _new_connection(
+        self, scheme: str, host: str, port: int, timeout_sec: float
+    ) -> http.client.HTTPConnection:
+        if scheme == "https":
+            return http.client.HTTPSConnection(
+                host, port, timeout=timeout_sec, context=self._get_ssl_context()
+            )
+        return http.client.HTTPConnection(host, port, timeout=timeout_sec)
+
+    def acquire(
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        timeout_sec: float,
+        *,
+        allow_reuse: bool = True,
+    ) -> tuple[http.client.HTTPConnection, bool]:
+        now = time.monotonic()
+        to_close: list[http.client.HTTPConnection] = []
+        reused_conn: http.client.HTTPConnection | None = None
+        key: _OriginKey = (scheme, host, port)
+        with self._lock:
+            for k in list(self._idle.keys()):
+                bucket = self._idle[k]
+                kept: list[tuple[http.client.HTTPConnection, float]] = []
+                for c, ts in bucket:
+                    if (now - ts) > self.idle_timeout_sec or getattr(c, "sock", None) is None:
+                        to_close.append(c)
+                    else:
+                        kept.append((c, ts))
+                if kept:
+                    self._idle[k] = kept
+                else:
+                    del self._idle[k]
+            if allow_reuse and key in self._idle:
+                bucket = self._idle[key]
+                reused_conn, _ = bucket.pop()
+                if not bucket:
+                    del self._idle[key]
+        for c in to_close:
+            _close_quietly(c)
+        if reused_conn is not None:
+            try:
+                reused_conn.timeout = timeout_sec
+                sock = getattr(reused_conn, "sock", None)
+                if sock is None:
+                    _close_quietly(reused_conn)
+                else:
+                    sock.settimeout(timeout_sec)
+                    return reused_conn, True
+            except Exception:
+                _close_quietly(reused_conn)
+        return self._new_connection(scheme, host, port, timeout_sec), False
+
+    def release(
+        self, scheme: str, host: str, port: int, conn: http.client.HTTPConnection
+    ) -> None:
+        if getattr(conn, "sock", None) is None or self.max_per_origin <= 0:
+            _close_quietly(conn)
+            return
+        now = time.monotonic()
+        key: _OriginKey = (scheme, host, port)
+        to_close: list[http.client.HTTPConnection] = []
+        with self._lock:
+            bucket = self._idle.get(key, [])
+            kept: list[tuple[http.client.HTTPConnection, float]] = []
+            for c, ts in bucket:
+                if (now - ts) > self.idle_timeout_sec or getattr(c, "sock", None) is None:
+                    to_close.append(c)
+                else:
+                    kept.append((c, ts))
+            while len(kept) >= self.max_per_origin:
+                old_c, _ = kept.pop(0)
+                to_close.append(old_c)
+            kept.append((conn, now))
+            self._idle[key] = kept
+        for c in to_close:
+            _close_quietly(c)
+
+    def close_all(self) -> None:
+        to_close: list[http.client.HTTPConnection] = []
+        with self._lock:
+            for bucket in self._idle.values():
+                for c, _ in bucket:
+                    to_close.append(c)
+            self._idle.clear()
+        for c in to_close:
+            _close_quietly(c)
+
+
+_KEEPALIVE_POOL = _KeepAlivePool()
+atexit.register(_KEEPALIVE_POOL.close_all)
+
+
+def _validate_request_url(
+    url: str,
+) -> tuple[urllib.parse.SplitResult, tuple[str, str, int | None, str | None, str | None]]:
+    parsed = urllib.parse.urlsplit(url)
+    origin = _origin_tuple(parsed)
+    scheme, host, port, _, _ = origin
+    if scheme not in ("https", "http") or not host or port is None or port <= 0:
+        raise urllib.error.URLError(f"invalid or unsupported URL: {url}")
+    if scheme != "https" and not _is_loopback_url(url):
+        raise urllib.error.URLError(
+            f"refusing non-HTTPS request to {parsed.scheme}://{parsed.netloc}"
+        )
+    return parsed, origin
+
+
+def _should_use_system_proxy(scheme: str, host: str, port: int | None = None) -> bool:
+    proxies = urllib.request.getproxies()
+    if not proxies:
+        return False
+    proxy_url = (proxies.get(scheme.lower()) or proxies.get("all") or "").strip()
+    if not proxy_url:
+        return False
+    try:
+        if urllib.request.proxy_bypass(host):
+            return False
+        if port is not None and ":" not in host and urllib.request.proxy_bypass(f"{host}:{port}"):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _execute_keepalive(
+    req: HttpRequest,
+    *,
+    wall_deadline: float,
+    hdrs_init: dict[str, str],
+) -> HttpResponse:
+    cur_url = req.url
+    cur_method = req.method.upper()
+    cur_body = req.body
+    cur_headers = dict(hdrs_init)
+    if not any(k.lower() == "connection" for k in cur_headers):
+        cur_headers["Connection"] = "keep-alive"
+
+    redirects = 0
+    visited: dict[str, int] = {}
+
+    while True:
+        parsed, origin = _validate_request_url(cur_url)
+        scheme, host, port, _, _ = origin
+        assert port is not None
+
+        rem = wall_deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError(
+                "HTTP redirect exceeded total request deadline"
+                if redirects > 0
+                else f"HTTP request exceeded deadline before send for {req.url}"
+            )
+        eff_timeout = max(0.005, min(float(req.timeout_sec), rem))
+        path = parsed.path or "/"
+        target_path = f"{path}?{parsed.query}" if parsed.query else path
+        wire_body: bytes | None = (
+            cur_body
+            if (cur_body or cur_method not in ("GET", "HEAD", "DELETE", "OPTIONS"))
+            else None
+        )
+
+        conn: http.client.HTTPConnection | None = None
+        resp: http.client.HTTPResponse | None = None
+        for attempt in range(2):
+            conn, reused = _KEEPALIVE_POOL.acquire(
+                scheme, host, port, eff_timeout, allow_reuse=(attempt == 0)
+            )
+            try:
+                conn.request(cur_method, target_path, body=wire_body, headers=cur_headers)
+                rem_resp = wall_deadline - time.monotonic()
+                if rem_resp <= 0:
+                    raise TimeoutError("HTTP response header wait exceeded total request deadline")
+                sock = getattr(conn, "sock", None)
+                if sock is not None:
+                    sock.settimeout(max(0.005, min(float(req.timeout_sec), rem_resp)))
+                resp = conn.getresponse()
+                break
+            except _STALE_CONN_ERRORS:
+                _close_quietly(conn)
+                conn = None
+                if reused and attempt == 0:
+                    rem_retry = wall_deadline - time.monotonic()
+                    if rem_retry <= 0:
+                        raise TimeoutError("HTTP retry exceeded total request deadline") from None
+                    eff_timeout = max(0.005, min(float(req.timeout_sec), rem_retry))
+                    continue
+                raise
+            except BaseException:
+                _close_quietly(conn)
+                conn = None
+                raise
+
+        assert conn is not None and resp is not None
+        status = int(getattr(resp, "status", None) or resp.getcode() or 200)
+        resp_hdrs = {k.lower(): v for k, v in resp.headers.items()}
+        raw_loc = resp.headers.get("Location") or resp.headers.get("URI")
+        is_redirect = (
+            status in (301, 302, 303, 307, 308)
+            and raw_loc is not None
+            and (
+                status in (307, 308)
+                or (status in (301, 302, 303) and cur_method in ("GET", "HEAD", "POST"))
+            )
+        )
+
+        can_reuse = False
+        try:
+            if is_redirect:
+                body = _read_stream_with_deadline(
+                    resp, wall_deadline, max_bytes=_STREAM_CHUNK_BYTES
+                )
+            else:
+                body = _read_stream_with_deadline(resp, wall_deadline)
+
+            conn_hdr = resp_hdrs.get("connection", "")
+            close_tokens = {tok.strip().lower() for tok in conn_hdr.split(",") if tok.strip()}
+            body_fully_drained = (
+                cur_method == "HEAD"
+                or status in (204, 304)
+                or (bool(getattr(resp, "chunked", False)) and resp.isclosed())
+                or (not getattr(resp, "chunked", False) and getattr(resp, "length", None) == 0)
+            )
+            can_reuse = (
+                body_fully_drained
+                and not bool(getattr(resp, "will_close", True))
+                and "close" not in close_tokens
+                and getattr(conn, "sock", None) is not None
+            )
+        finally:
+            _close_quietly(resp)
+            if can_reuse:
+                _KEEPALIVE_POOL.release(scheme, host, port, conn)
+            else:
+                _close_quietly(conn)
+
+        if not is_redirect:
+            return HttpResponse(status=status, headers=resp_hdrs, body=body)
+
+        assert raw_loc is not None
+        if (wall_deadline - time.monotonic()) <= 0:
+            raise TimeoutError("HTTP redirect exceeded total request deadline")
+
+        loc_parts = urllib.parse.urlparse(raw_loc)
+        if loc_parts.scheme.lower() not in ("http", "https", ""):
+            raise urllib.error.URLError(f"Redirection to url '{raw_loc}' is not allowed")
+        if not loc_parts.path and loc_parts.netloc:
+            parts_list = list(loc_parts)
+            parts_list[2] = "/"
+            norm_loc = urllib.parse.urlunparse(parts_list)
+        else:
+            norm_loc = urllib.parse.urlunparse(loc_parts)
+        norm_loc = urllib.parse.quote(norm_loc, encoding="iso-8859-1", safe=string.punctuation)
+        resolved_url = urllib.parse.urljoin(cur_url, norm_loc).replace(" ", "%20")
+
+        target = urllib.parse.urlsplit(resolved_url)
+        new_origin = _origin_tuple(target)
+        if origin != new_origin or origin[2] == -1:
+            raise urllib.error.URLError(
+                f"refusing cross-origin redirect from {parsed.scheme}://{parsed.netloc} "
+                f"to {target.scheme}://{target.netloc}"
+            )
+        if new_origin[0] != "https" and not _is_loopback_url(resolved_url):
+            raise urllib.error.URLError(
+                f"refusing non-HTTPS redirect to {target.scheme}://{target.netloc}"
+            )
+
+        redirects += 1
+        visited[resolved_url] = visited.get(resolved_url, 0) + 1
+        if redirects > _MAX_REDIRECTS or visited[resolved_url] > 4:
+            raise urllib.error.URLError(f"redirect limit ({_MAX_REDIRECTS}) exceeded")
+
+        if status in (307, 308):
+            cur_headers = {k: v for k, v in cur_headers.items() if k.lower() != "host"}
+        else:
+            if cur_method == "POST" or (status == 303 and cur_method != "HEAD"):
+                cur_method = "GET"
+            cur_body = b""
+            cur_headers = {
+                k: v
+                for k, v in cur_headers.items()
+                if k.lower() not in ("host", "content-length", "content-type", "transfer-encoding")
+            }
+        cur_url = resolved_url
 
 
 def urllib_http_transport(req: HttpRequest) -> HttpResponse:
-    """Default pure-stdlib HTTP transport with safe redirect policy, deadline, and User-Agent."""
+    """Default pure-stdlib HTTP transport with Keep-Alive pooling, proxy compat, and safe redirects."""
     wall_deadline = (
         req.deadline if req.deadline is not None else (time.monotonic() + float(req.timeout_sec))
     )
-    rem = wall_deadline - time.monotonic()
-    if rem <= 0:
-        raise TimeoutError(f"HTTP request exceeded deadline before send for {req.url}")
-    eff_timeout = min(float(req.timeout_sec), rem)
-
     hdrs_out = dict(req.headers)
     if not any(k.lower() == "user-agent" for k in hdrs_out):
         hdrs_out["User-Agent"] = DEFAULT_USER_AGENT
 
-    ureq = urllib.request.Request(
-        req.url,
-        data=req.body,
-        headers=hdrs_out,
-        method=req.method,
-    )
-    setattr(ureq, "_voice_deadline", wall_deadline)
-    setattr(ureq, "_voice_req_timeout", float(req.timeout_sec))
     try:
-        with _SAFE_OPENER.open(ureq, timeout=eff_timeout) as resp:
+        rem = wall_deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError(f"HTTP request exceeded deadline before send for {req.url}")
+        eff_timeout = min(float(req.timeout_sec), rem)
+
+        _, origin = _validate_request_url(req.url)
+        scheme, host, port, _, _ = origin
+
+        if not _should_use_system_proxy(scheme, host, port):
+            return _execute_keepalive(req, wall_deadline=wall_deadline, hdrs_init=hdrs_out)
+
+        ureq = urllib.request.Request(
+            req.url,
+            data=req.body,
+            headers=hdrs_out,
+            method=req.method,
+        )
+        setattr(ureq, "_voice_deadline", wall_deadline)
+        setattr(ureq, "_voice_req_timeout", float(req.timeout_sec))
+        cur_proxies = urllib.request.getproxies()
+        opener = (
+            _SAFE_OPENER
+            if (_SAFE_OPENER is not _DEFAULT_SAFE_OPENER or cur_proxies == _INITIAL_PROXIES)
+            else urllib.request.build_opener(
+                urllib.request.ProxyHandler(cur_proxies),
+                _SameOriginSafeRedirectHandler(),
+            )
+        )
+        with opener.open(ureq, timeout=eff_timeout) as resp:
             status = getattr(resp, "status", None) or resp.getcode() or 200
             hdrs = {k.lower(): v for k, v in resp.headers.items()}
             body = _read_stream_with_deadline(resp, wall_deadline)
@@ -428,7 +762,7 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
             return HttpResponse(status=int(exc.code), headers=hdrs, body=body)
         finally:
             _close_quietly(exc)
-    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
+    except (urllib.error.URLError, TimeoutError, socket.timeout, http.client.HTTPException, OSError) as exc:
         raise RuntimeError(f"HTTP transport error for {req.url}: {exc}") from None
 
 
@@ -799,6 +1133,13 @@ class BaseAsrProvider:
             raise self._fail(missing_hint)
         return vendor_item
 
+    def _effective_asr_timeout_sec(self, wav_bytes: bytes | bytearray = b"") -> float:
+        base = float(self.cfg.asr.timeout_sec)
+        audio_sec = max(0.0, (len(wav_bytes) - 44) / 32000.0)
+        if base >= 10.0 and audio_sec > 20.0:
+            return max(base, min(180.0, base + (audio_sec - 20.0) * 0.25))
+        return base
+
     def _send(
         self,
         req: HttpRequest,
@@ -807,10 +1148,11 @@ class BaseAsrProvider:
         deadline: float | None = None,
     ) -> HttpResponse:
         now = self.clock_fn()
+        budget_sec = max(float(self.cfg.asr.timeout_sec), float(req.timeout_sec))
         logical_deadline = deadline if deadline is not None else (now + float(req.timeout_sec))
         if now > logical_deadline:
             raise self._fail(
-                f"ASR HTTP request timed out before send (budget={self.cfg.asr.timeout_sec:.2f}s)",
+                f"ASR HTTP request timed out before send (budget={budget_sec:.2f}s)",
                 extra_secrets=extra_secrets,
             )
         eff_req = req
@@ -832,7 +1174,7 @@ class BaseAsrProvider:
 
         if self.clock_fn() > logical_deadline + 1e-9:
             raise self._fail(
-                f"ASR HTTP response exceeded timeout budget ({self.cfg.asr.timeout_sec:.2f}s)",
+                f"ASR HTTP response exceeded timeout budget ({budget_sec:.2f}s)",
                 extra_secrets=extra_secrets,
             )
         return resp
@@ -916,11 +1258,16 @@ class DashScopeAsrProvider(BaseAsrProvider):
             "Content-Type": "application/json",
         }
 
+        eff_timeout = self._effective_asr_timeout_sec(wav_bytes)
         t0 = self.clock_fn()
         if use_native:
-            text = self._call_native_route(url, headers, model, data_uri, ctx_text, cred.value)
+            text = self._call_native_route(
+                url, headers, model, data_uri, ctx_text, cred.value, timeout_sec=eff_timeout
+            )
         else:
-            text = self._call_compat_route(url, headers, model, data_uri, ctx_text, cred.value)
+            text = self._call_compat_route(
+                url, headers, model, data_uri, ctx_text, cred.value, timeout_sec=eff_timeout
+            )
         text = strip_lenticular_artifacts(text).strip()
         latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
         return AsrResult(
@@ -939,6 +1286,8 @@ class DashScopeAsrProvider(BaseAsrProvider):
         data_uri: str,
         ctx_text: str,
         secret: str,
+        *,
+        timeout_sec: float | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = []
         if ctx_text:
@@ -971,7 +1320,7 @@ class DashScopeAsrProvider(BaseAsrProvider):
                 method="POST",
                 headers=headers,
                 body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                timeout_sec=self.cfg.asr.timeout_sec,
+                timeout_sec=self.cfg.asr.timeout_sec if timeout_sec is None else timeout_sec,
             ),
             extra_secrets=(secret,),
         )
@@ -1009,6 +1358,8 @@ class DashScopeAsrProvider(BaseAsrProvider):
         data_uri: str,
         ctx_text: str,
         secret: str,
+        *,
+        timeout_sec: float | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = []
         if ctx_text:
@@ -1029,7 +1380,7 @@ class DashScopeAsrProvider(BaseAsrProvider):
                 method="POST",
                 headers=headers,
                 body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                timeout_sec=self.cfg.asr.timeout_sec,
+                timeout_sec=self.cfg.asr.timeout_sec if timeout_sec is None else timeout_sec,
             ),
             extra_secrets=(secret,),
         )
@@ -1193,12 +1544,19 @@ class DoubaoAsrProvider(BaseAsrProvider):
         return False, slots
 
     def _remaining_timeout(
-        self, deadline: float, rid: str, stage: str, secrets: Sequence[str]
+        self,
+        deadline: float,
+        rid: str,
+        stage: str,
+        secrets: Sequence[str],
+        *,
+        budget_sec: float | None = None,
     ) -> float:
         rem = deadline - self.clock_fn()
         if rem <= 0:
+            eff_budget = float(self.cfg.asr.timeout_sec) if budget_sec is None else budget_sec
             raise self._fail(
-                f"Doubao {stage} ({rid}) timed out (budget={self.cfg.asr.timeout_sec:.2f}s)",
+                f"Doubao {stage} ({rid}) timed out (budget={eff_budget:.2f}s)",
                 extra_secrets=secrets,
             )
         return rem
@@ -1244,19 +1602,20 @@ class DoubaoAsrProvider(BaseAsrProvider):
         body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         auth_hdrs = self._auth_headers(app_id, api_key)
 
+        eff_timeout = self._effective_asr_timeout_sec(wav_bytes)
         t0 = self.clock_fn()
-        deadline = t0 + float(self.cfg.asr.timeout_sec)
+        deadline = t0 + eff_timeout
         slot_errors: list[str] = []
 
         for mode, rid in candidates:
             try:
                 if mode == "flash":
                     text = self._run_flash(
-                        base_url, auth_hdrs, rid, body_bytes, deadline, secrets
+                        base_url, auth_hdrs, rid, body_bytes, deadline, secrets, budget_sec=eff_timeout
                     )
                 else:
                     text = self._run_submit_and_query(
-                        base_url, auth_hdrs, rid, body_bytes, t0, deadline, secrets
+                        base_url, auth_hdrs, rid, body_bytes, t0, deadline, secrets, budget_sec=eff_timeout
                     )
                 if is_auto_slot:
                     with _DOUBAO_SLOT_LOCK:
@@ -1323,8 +1682,10 @@ class DoubaoAsrProvider(BaseAsrProvider):
         body_bytes: bytes,
         deadline: float,
         secrets: Sequence[str],
+        *,
+        budget_sec: float | None = None,
     ) -> str:
-        rem = self._remaining_timeout(deadline, rid, "flash", secrets)
+        rem = self._remaining_timeout(deadline, rid, "flash", secrets, budget_sec=budget_sec)
         req_id = str(uuid.uuid4())
         headers = {
             **auth_hdrs,
@@ -1370,8 +1731,10 @@ class DoubaoAsrProvider(BaseAsrProvider):
         t0: float,
         deadline: float,
         secrets: Sequence[str],
+        *,
+        budget_sec: float | None = None,
     ) -> str:
-        rem = self._remaining_timeout(deadline, rid, "submit", secrets)
+        rem = self._remaining_timeout(deadline, rid, "submit", secrets, budget_sec=budget_sec)
         req_id = str(uuid.uuid4())
         common_headers = {
             **auth_hdrs,
@@ -1412,9 +1775,13 @@ class DoubaoAsrProvider(BaseAsrProvider):
         poll_t0 = self.clock_fn()
 
         while True:
-            rem_before_sleep = self._remaining_timeout(deadline, rid, "query", secrets)
+            rem_before_sleep = self._remaining_timeout(
+                deadline, rid, "query", secrets, budget_sec=budget_sec
+            )
             self.sleep_fn(min(wait_sec, rem_before_sleep))
-            rem_for_query = self._remaining_timeout(deadline, rid, "query", secrets)
+            rem_for_query = self._remaining_timeout(
+                deadline, rid, "query", secrets, budget_sec=budget_sec
+            )
 
             q_resp = self._send(
                 HttpRequest(
@@ -1524,6 +1891,7 @@ class GeminiAudioProvider(BaseAsrProvider):
             "Content-Type": "application/json",
         }
 
+        eff_timeout = self._effective_asr_timeout_sec(wav_bytes)
         t0 = self.clock_fn()
         resp = self._send(
             HttpRequest(
@@ -1531,7 +1899,7 @@ class GeminiAudioProvider(BaseAsrProvider):
                 method="POST",
                 headers=headers,
                 body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                timeout_sec=self.cfg.asr.timeout_sec,
+                timeout_sec=eff_timeout,
             ),
             extra_secrets=(cred.value,),
         )
@@ -1730,6 +2098,7 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
             )
             headers["Content-Type"] = content_type
 
+        eff_timeout = self._effective_asr_timeout_sec(wav_bytes)
         t0 = self.clock_fn()
         resp = self._send(
             HttpRequest(
@@ -1737,7 +2106,7 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
                 method="POST",
                 headers=headers,
                 body=body,
-                timeout_sec=self.cfg.asr.timeout_sec,
+                timeout_sec=eff_timeout,
             ),
             extra_secrets=secrets,
         )
@@ -1876,6 +2245,7 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
+        eff_timeout = self._effective_asr_timeout_sec(wav_bytes)
         t0 = self.clock_fn()
         resp = self._send(
             HttpRequest(
@@ -1883,7 +2253,7 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                 method="POST",
                 headers=headers,
                 body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                timeout_sec=self.cfg.asr.timeout_sec,
+                timeout_sec=eff_timeout,
             ),
             extra_secrets=secrets,
         )

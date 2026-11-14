@@ -28,10 +28,13 @@ from agent_voice_input.asr_providers import (  # noqa: E402
     ChatAudioAsrProvider,
     HttpRequest,
     HttpResponse,
+    _KEEPALIVE_POOL,
+    _KeepAlivePool,
     _SameOriginSafeRedirectHandler,
     create_asr_provider,
     reset_doubao_slot_cache,
     transcribe,
+    urllib_http_transport,
 )
 from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
 from agent_voice_input.config import Config, ConfigError, resolve_credentials  # noqa: E402
@@ -54,6 +57,7 @@ class AsrProvidersTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         reset_doubao_slot_cache()
+        _KEEPALIVE_POOL.close_all()
 
     def test_ali_qwen3_compatible_mode_exact_contract(self) -> None:
         captured: list[HttpRequest] = []
@@ -878,6 +882,295 @@ class AsrProvidersTests(unittest.TestCase):
         bad_cfg.asr.provider = "ali"
         with self.assertRaises(ConfigError):
             create_asr_provider(bad_cfg, resolve_credentials(Config(), env), env=env)
+
+    def test_urllib_http_transport_keepalive_pool_reconnect_redirect_proxy_and_warnings(self) -> None:
+        import gc
+        import http.server
+
+        accept_count = [0]
+        drop_once_armed = [False]
+        always_drop = [False]
+        seen_requests: list[tuple[str, str, bytes]] = []
+
+        class _KeepAliveHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: object) -> None:
+                return None
+
+            def _read_body(self) -> bytes:
+                cl = int(self.headers.get("Content-Length") or "0")
+                return self.rfile.read(cl) if cl > 0 else b""
+
+            def _send_json(
+                self,
+                status: int,
+                payload: dict[str, object],
+                *,
+                extra_headers: dict[str, str] | None = None,
+            ) -> None:
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                if extra_headers:
+                    for k, v in extra_headers.items():
+                        self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def _handle_all(self) -> None:
+                body = self._read_body()
+                if always_drop[0]:
+                    self.close_connection = True
+                    return
+                if drop_once_armed[0]:
+                    drop_once_armed[0] = False
+                    self.close_connection = True
+                    return
+                seen_requests.append((self.command, self.path, body))
+                if self.path == "/submit":
+                    self._send_json(200, {"ok": True}, extra_headers={"x-api-status-code": "20000000"})
+                elif self.path == "/query":
+                    q_n = sum(1 for _, p, _ in seen_requests if p == "/query")
+                    code = "20000001" if q_n == 1 else "20000000"
+                    self._send_json(
+                        200,
+                        {"result": {"text": "轮询复用连接成功"}},
+                        extra_headers={"x-api-status-code": code},
+                    )
+                elif self.path == "/err400":
+                    self._send_json(400, {"error": "bad_param"})
+                elif self.path == "/close":
+                    self._send_json(200, {"bye": True}, extra_headers={"Connection": "close"})
+                elif self.path == "/redir307":
+                    self._send_json(307, {"redir": 307}, extra_headers={"Location": "/echo"})
+                elif self.path == "/redir302":
+                    self._send_json(302, {"redir": 302}, extra_headers={"Location": "/echo"})
+                elif self.path == "/redir_cross":
+                    self._send_json(
+                        302,
+                        {"redir": "evil"},
+                        extra_headers={"Location": "https://evil.example.com/steal"},
+                    )
+                elif self.path == "/redir_loop":
+                    self._send_json(302, {"loop": True}, extra_headers={"Location": "/redir_loop"})
+                elif self.path == "/slow":
+                    time.sleep(0.25)
+                    self._send_json(200, {"slow": True})
+                else:
+                    self._send_json(200, {"method": self.command, "path": self.path, "body": body.decode("utf-8")})
+
+            do_GET = _handle_all
+            do_POST = _handle_all
+
+        class _CountingServer(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+
+            def get_request(self):  # type: ignore[override]
+                sock, addr = super().get_request()
+                accept_count[0] += 1
+                return sock, addr
+
+        no_proxy_env = {
+            "HTTP_PROXY": "",
+            "HTTPS_PROXY": "",
+            "ALL_PROXY": "",
+            "NO_PROXY": "",
+            "http_proxy": "",
+            "https_proxy": "",
+            "all_proxy": "",
+            "no_proxy": "",
+        }
+
+        _KEEPALIVE_POOL.close_all()
+        srv = _CountingServer(("127.0.0.1", 0), _KeepAliveHandler)
+        port = srv.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        srv_thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        srv_thread.start()
+        try:
+            with mock.patch.dict(os.environ, no_proxy_env, clear=False):
+                # 1. Consecutive requests (including Doubao-style submit + query polling) reuse ONE TCP connection!
+                r_sub = urllib_http_transport(HttpRequest(f"{base}/submit", "POST", {}, b'{"a":1}', 3.0))
+                r_q1 = urllib_http_transport(HttpRequest(f"{base}/query", "POST", {}, b"{}", 3.0))
+                r_q2 = urllib_http_transport(HttpRequest(f"{base}/query", "POST", {}, b"{}", 3.0))
+                r_err = urllib_http_transport(HttpRequest(f"{base}/err400", "POST", {}, b"bad", 3.0))
+                self.assertEqual(r_sub.status, 200)
+                self.assertEqual(r_q1.headers["x-api-status-code"], "20000001")
+                self.assertEqual(r_q2.json()["result"]["text"], "轮询复用连接成功")
+                # 4xx returns HttpResponse (never raises) and still preserves keep-alive!
+                self.assertEqual((r_err.status, r_err.json()), (400, {"error": "bad_param"}))
+                self.assertEqual(accept_count[0], 1)
+
+                # 2. Server abruptly drops idle/reused connection (RemoteDisconnected) -> transparent 1x reconnect!
+                drop_once_armed[0] = True
+                r_reconn = urllib_http_transport(HttpRequest(f"{base}/echo", "POST", {}, b"hello", 3.0))
+                self.assertEqual(r_reconn.status, 200)
+                self.assertEqual(r_reconn.json(), {"method": "POST", "path": "/echo", "body": "hello"})
+                self.assertEqual(accept_count[0], 2)
+
+                # Fresh connection failure does NOT loop infinitely; raises RuntimeError per contract
+                always_drop[0] = True
+                try:
+                    with self.assertRaises(RuntimeError) as drop_ctx:
+                        urllib_http_transport(HttpRequest(f"{base}/echo", "POST", {}, b"fail", 3.0))
+                    self.assertIn("HTTP transport error", str(drop_ctx.exception))
+                finally:
+                    always_drop[0] = False
+
+                # 3. `Connection: close` from server is not returned to pool -> next request opens a fresh socket
+                r_cls = urllib_http_transport(HttpRequest(f"{base}/close", "GET", {}, b"", 3.0))
+                self.assertEqual(r_cls.status, 200)
+                accept_before_next = accept_count[0]
+                r_after_cls = urllib_http_transport(HttpRequest(f"{base}/echo", "GET", {}, b"", 3.0))
+                self.assertEqual(r_after_cls.status, 200)
+                self.assertEqual(accept_count[0], accept_before_next + 1)
+
+                # 4. Same-origin 307 preserves POST+body (reusing the same socket!); 302 downgrades POST->GET
+                accept_before_redir = accept_count[0]
+                r_307 = urllib_http_transport(HttpRequest(f"{base}/redir307", "POST", {}, b"keep_body", 3.0))
+                self.assertEqual(r_307.json(), {"method": "POST", "path": "/echo", "body": "keep_body"})
+                r_302 = urllib_http_transport(HttpRequest(f"{base}/redir302", "POST", {}, b"drop_body", 3.0))
+                self.assertEqual(r_302.json(), {"method": "GET", "path": "/echo", "body": ""})
+                self.assertEqual(accept_count[0], accept_before_redir)
+
+                # Cross-origin redirect, non-HTTPS non-loopback URL, and redirect loops raise RuntimeError
+                with self.assertRaises(RuntimeError) as cross_ctx:
+                    urllib_http_transport(HttpRequest(f"{base}/redir_cross", "POST", {}, b"{}", 3.0))
+                self.assertIn("HTTP transport error", str(cross_ctx.exception))
+                self.assertIn("refusing cross-origin redirect", str(cross_ctx.exception))
+
+                with self.assertRaises(RuntimeError) as non_https_ctx:
+                    urllib_http_transport(HttpRequest("http://example.com/v1/audio", "POST", {}, b"{}", 3.0))
+                self.assertIn("HTTP transport error", str(non_https_ctx.exception))
+
+                with self.assertRaises(RuntimeError) as loop_ctx:
+                    urllib_http_transport(HttpRequest(f"{base}/redir_loop", "GET", {}, b"", 3.0))
+                self.assertIn("HTTP transport error", str(loop_ctx.exception))
+
+                # 5. Pre-expired and mid-read wall_deadline raise RuntimeError cleanly
+                with self.assertRaises(RuntimeError):
+                    urllib_http_transport(
+                        HttpRequest(f"{base}/echo", "GET", {}, b"", 3.0, deadline=time.monotonic() - 0.1)
+                    )
+                with self.assertRaises(RuntimeError):
+                    urllib_http_transport(
+                        HttpRequest(f"{base}/slow", "GET", {}, b"", 3.0, deadline=time.monotonic() + 0.05)
+                    )
+
+            # 6. Proxy env compatibility: HTTP_PROXY routes through _SAFE_OPENER; NO_PROXY bypasses back to pool!
+            import io
+
+            proxy_called = [0]
+
+            class _FakeOpenerResp(io.BytesIO):
+                status = 200
+                headers = {"Content-Type": "application/json"}
+
+                def __init__(self) -> None:
+                    super().__init__(b'{"via":"proxy"}')
+
+            class _FakeOpener:
+                def open(self, ureq: object, timeout: float | None = None) -> _FakeOpenerResp:
+                    proxy_called[0] += 1
+                    return _FakeOpenerResp()
+
+            base_clean_env = {
+                k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")
+            }
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {**base_clean_env, "HTTP_PROXY": "http://127.0.0.1:9999"},
+                    clear=True,
+                ),
+                mock.patch("agent_voice_input.asr_providers._SAFE_OPENER", _FakeOpener()),
+            ):
+                r_prox = urllib_http_transport(HttpRequest(f"{base}/echo", "GET", {}, b"", 3.0))
+                self.assertEqual(r_prox.json(), {"via": "proxy"})
+                self.assertEqual(proxy_called[0], 1)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {**base_clean_env, "HTTP_PROXY": "http://127.0.0.1:9999", "NO_PROXY": "127.0.0.1"},
+                    clear=True,
+                ),
+                mock.patch("agent_voice_input.asr_providers._SAFE_OPENER", _FakeOpener()),
+            ):
+                r_bypass = urllib_http_transport(HttpRequest(f"{base}/echo", "GET", {}, b"", 3.0))
+                self.assertEqual(r_bypass.json()["path"], "/echo")
+                self.assertEqual(proxy_called[0], 1)
+
+            # 7. Pool capacity eviction (max_per_origin=2) & idle expiry close evicted sockets without leaks
+            mini_pool = _KeepAlivePool(max_per_origin=2, idle_timeout_sec=0.05)
+            conns = [mini_pool._new_connection("http", "127.0.0.1", port, 2.0) for _ in range(3)]
+            try:
+                for c in conns:
+                    c.connect()
+                for c in conns:
+                    mini_pool.release("http", "127.0.0.1", port, c)
+                # Oldest connection c[0] was evicted & closed immediately
+                self.assertIsNone(conns[0].sock)
+                time.sleep(0.08)
+                fresh_c, was_reused = mini_pool.acquire("http", "127.0.0.1", port, 2.0)
+                self.assertFalse(was_reused)
+                fresh_c.close()
+                self.assertIsNone(conns[1].sock)
+                self.assertIsNone(conns[2].sock)
+            finally:
+                for c in conns:
+                    c.close()
+                mini_pool.close_all()
+        finally:
+            _KEEPALIVE_POOL.close_all()
+            srv.shutdown()
+            srv.server_close()
+            srv_thread.join(timeout=2.0)
+            gc.collect()
+
+    def test_long_audio_asr_timeout_adaptive_relaxation(self) -> None:
+        seen_timeouts: list[float] = []
+
+        def fake_tx(req: HttpRequest) -> HttpResponse:
+            seen_timeouts.append(req.timeout_sec)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"text": "长语音转写成功"}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        env = {"OPENAI_API_KEY": "sk-oai-" + ("a" * 16)}
+        short_wav = b"RIFF" + (b"\x00" * (40 + 10 * 32000))   # 10s (<= 20s)
+        long_10m_wav = b"RIFF" + (b"\x00" * (40 + 600 * 32000))  # 600s (10 minutes)
+        huge_wav = b"RIFF" + (b"\x00" * (40 + 900 * 32000))   # 900s (15 minutes -> capped at 180s)
+
+        # 1. Small unit-test timeout (< 10.0s) is NEVER relaxed even on 10-minute audio
+        cfg_small = Config()
+        cfg_small.asr.provider = "openai"
+        cfg_small.asr.timeout_sec = 3.0
+        cfg_small.asr.hotwords_file = ""
+        prov_small = create_asr_provider(cfg_small, resolve_credentials(cfg_small, env), env=env, transport=fake_tx)
+        self.assertEqual(prov_small._effective_asr_timeout_sec(long_10m_wav), 3.0)
+        prov_small.transcribe(long_10m_wav)
+        self.assertEqual(seen_timeouts[-1], 3.0)
+
+        # 2. Normal timeout (15.0s) keeps exact 15.0s for <= 20s short audio, relaxes to 160.0s for 10m audio, caps at 180.0s
+        cfg_norm = Config()
+        cfg_norm.asr.provider = "openai"
+        cfg_norm.asr.timeout_sec = 15.0
+        cfg_norm.asr.hotwords_file = ""
+        prov_norm = create_asr_provider(cfg_norm, resolve_credentials(cfg_norm, env), env=env, transport=fake_tx)
+        self.assertEqual(prov_norm._effective_asr_timeout_sec(short_wav), 15.0)
+        self.assertAlmostEqual(prov_norm._effective_asr_timeout_sec(long_10m_wav), 160.0)
+        self.assertEqual(prov_norm._effective_asr_timeout_sec(huge_wav), 180.0)
+
+        seen_timeouts.clear()
+        prov_norm.transcribe(short_wav)
+        prov_norm.transcribe(long_10m_wav)
+        self.assertEqual(seen_timeouts[0], 15.0)
+        self.assertAlmostEqual(seen_timeouts[1], 160.0)
 
 
 class SessionCtxTests(unittest.TestCase):
