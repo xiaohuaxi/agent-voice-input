@@ -11,6 +11,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
 using System.Media;
@@ -101,7 +102,7 @@ internal sealed class HudPillForm : Form {
         base.WndProc(ref m);
     }
     public void HideNoActivate() { if (IsHandleCreated) ShowWindow(Handle, 0); }
-    public void ShowStatus(string text, Color fg, Color border, int autoHideMs, IntPtr fgHwnd) {
+    public void ShowStatus(string text, Color fg, Color border, int autoHideMs, IntPtr fgHwnd, string position) {
         _timer.Stop(); _text = text ?? ""; _fg = fg; _border = border;
         bool wantCjk = HasCjk(_text);
         if (wantCjk != _cjkFont) { if (_ownsFont && _font != null) _font.Dispose(); _cjkFont = wantCjk; _font = CreateHudFont(_cjkFont, out _ownsFont); }
@@ -110,8 +111,10 @@ internal sealed class HudPillForm : Form {
         Rectangle wa = (scr != null) ? scr.WorkingArea : new Rectangle(0, 0, 1920, 1080);
         Size sz = TextRenderer.MeasureText(_text, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
         int w = Math.Min(Math.Max(156, wa.Width - 24), Math.Max(156, sz.Width + 36)), h = Math.Max(36, sz.Height + 16);
-        int x = wa.Left + (wa.Width - w) / 2, y = wa.Top + 36;
-        IntPtr rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 18, 18);
+        bool isTop = string.Equals((position ?? "").Trim(), "top", StringComparison.OrdinalIgnoreCase);
+        int x = wa.Left + (wa.Width - w) / 2;
+        int y = isTop ? (wa.Top + 36) : Math.Max(wa.Top + 8, wa.Bottom - h - 14);
+        IntPtr rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, h, h);
         Region old = Region; Region = Region.FromHrgn(rgn); DeleteObject(rgn);
         if (old != null) old.Dispose();
         IntPtr hdl = Handle;
@@ -121,7 +124,19 @@ internal sealed class HudPillForm : Form {
     }
     protected override void OnPaint(PaintEventArgs e) {
         base.OnPaint(e);
-        using (Pen p = new Pen(_border, 1.5f)) { e.Graphics.DrawRectangle(p, 1, 1, Width - 3, Height - 3); }
+        SmoothingMode prevSmooth = e.Graphics.SmoothingMode;
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        float inset = 1.25f;
+        float d = Math.Max(4f, Height - inset * 2f - 1f);
+        float wArc = Math.Max(d, Width - inset * 2f - 1f);
+        using (GraphicsPath path = new GraphicsPath())
+        using (Pen p = new Pen(_border, 1.5f)) {
+            path.AddArc(inset, inset, d, d, 90f, 180f);
+            path.AddArc(inset + wArc - d, inset, d, d, 270f, 180f);
+            path.CloseFigure();
+            e.Graphics.DrawPath(p, path);
+        }
+        e.Graphics.SmoothingMode = prevSmooth;
         Rectangle rc = new Rectangle(10, 0, Math.Max(1, Width - 20), Height);
         TextRenderer.DrawText(e.Graphics, _text, _font, rc, _fg, DrawFlags);
     }
@@ -239,7 +254,7 @@ public static class VoiceWinShim {
         } catch { try { SystemSounds.Asterisk.Play(); } catch { } }
     }
 
-    public static void UpdateHud(string state, string customText, int durationMs) {
+    public static void UpdateHud(string state, string customText, int durationMs, string position = "bottom") {
         try {
             string st = (state ?? "").Trim().ToLowerInvariant();
             if (st == "" || st == "idle" || st == "hide") { if (_hud != null) _hud.HideNoActivate(); return; }
@@ -255,7 +270,7 @@ public static class VoiceWinShim {
             else { txt = zh ? "\u2715 \u8BC6\u522B\u5931\u8D25" : "\u2715 Transcription failed"; fg = Color.FromArgb(248, 113, 113); bd = Color.FromArgb(185, 65, 65); ms = 900; }
             if (!string.IsNullOrEmpty(customText)) txt = customText;
             if (durationMs > 0) ms = durationMs;
-            _hud.ShowStatus(txt, fg, bd, ms, GetForegroundWindow());
+            _hud.ShowStatus(txt, fg, bd, ms, GetForegroundWindow(), position);
         } catch { }
     }
 
@@ -488,7 +503,7 @@ if ($Mode -eq "probe") {
 
 $targetVk = [VoiceWinShim]::ResolveKeyName($Hotkey)
 $isPtt = ($TriggerMode -eq "ptt" -or $TriggerMode -eq "push_to_talk")
-$AllowedTerminals = @("windowsterminal", "openconsole", "mintty", "wezterm-gui", "alacritty", "ghostty", "conhost", "putty", "tabby", "hyper")
+$AllowedTerminals = @("windowsterminal", "openconsole", "mintty", "wezterm", "wezterm-gui", "alacritty", "ghostty", "conhost", "putty", "tabby", "hyper", "kitty", "rio")
 try {
     if ($Mode -eq "key-test") {
         [VoiceWinShim]::StartHook($targetVk, $isPtt, $TapMaxMs, $DebounceMs, $true, ($Seconds * 1000))
@@ -521,7 +536,7 @@ try {
                 elseif ($op -eq "beep") { Invoke-Tone ([string]$cmdObj.kind); Write-JsonLine @{ type = "reply"; reply = "beep"; seq_id = $seq; ok = $true } }
                 elseif ($op -eq "hud") {
                     $dms = if ($null -ne $cmdObj.duration_ms) { [int]$cmdObj.duration_ms } else { 0 }
-                    [VoiceWinShim]::UpdateHud([string]$cmdObj.state, [string]$cmdObj.text, $dms)
+                    [VoiceWinShim]::UpdateHud([string]$cmdObj.state, [string]$cmdObj.text, $dms, [string]$cmdObj.position)
                     Write-JsonLine @{ type = "reply"; reply = "hud"; seq_id = $seq; ok = $true }
                 } elseif ($op -eq "paste") {
                     $txt = [string]$cmdObj.text; $clipOk = $false

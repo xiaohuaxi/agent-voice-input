@@ -9,8 +9,8 @@ from typing import Any, Callable, Mapping
 from .asr_providers import AsrResult, BaseAsrProvider, create_asr_provider
 from .audio_proc import AudioGateResult, process_wav
 from .config import Config, ProviderCredentials, ensure_secure_dir, get_runtime_dir, redact_secrets, resolve_credentials, select_asr_provider
-from .platform_macos import MacOSPlatform
-from .platform_wsl import ForegroundWindow, PasteOutcome, WslPlatform
+from .platform_macos import MacOSPlatform, is_macos_terminal_window
+from .platform_wsl import ForegroundWindow, PasteOutcome, WslPlatform, is_windows_terminal_process
 from .refiner import BaseRefiner, RefinerResult, create_refiner
 from .session_ctx import SessionSnapshot, SessionTracker
 
@@ -181,16 +181,30 @@ class VoiceInputDaemon:
             summary["audio_error"] = self._redact_str(audio_err)
         return summary
 
-    def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False) -> dict[str, Any]:
+    def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False, from_hotkey: bool = False) -> dict[str, Any]:
         arrival_ts = self.clock_fn()
         with self._trigger_lock:
             with self._lock:
                 if self._stop_evt.is_set():
                     return {"ok": False, "ignored": "stopping", "state": self.state, "seq_id": self.seq_id}
+                eff_no_paste, eff_silent = bool(no_paste), bool(silent_hud)
+                if (
+                    action in ("toggle", "ptt_start")
+                    and self.state != "recording"
+                    and self.cfg.hotkey.only_in_terminals
+                    and not eff_no_paste
+                    and (from_hotkey or window is not None)
+                ):
+                    cand_win = window if window is not None else ForegroundWindow()
+                    if (checker := getattr(self.platform, "is_allowed_terminal", None)) is not None:
+                        allowed = bool(checker(cand_win))
+                    else:
+                        allowed = is_windows_terminal_process(cand_win.process) or is_macos_terminal_window(cand_win.process, cand_win.bundle_id)
+                    if not allowed:
+                        return {"ok": False, "ignored": "non_terminal", "state": self.state, "seq_id": self.seq_id}
                 if action in ("toggle", "ptt_start") and (arrival_ts - self._last_trigger_ts) * 1000.0 < self.cfg.hotkey.debounce_ms:
                     return {"ok": False, "ignored": "debounced", "state": self.state, "seq_id": self.seq_id}
                 now = self.clock_fn()
-                eff_no_paste, eff_silent = bool(no_paste), bool(silent_hud)
                 if action == "ptt_cancel":
                     if self.state != "recording":
                         return {"ok": True, "state": self.state, "seq_id": self.seq_id}
@@ -332,7 +346,7 @@ class VoiceInputDaemon:
         prev_term = signal.signal(signal.SIGTERM, lambda *_: self._stop_evt.set()) if is_main else None
         try:
             self.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8"); os.chmod(self.pid_path, 0o600)
-            self.platform.start_event_listener(lambda m: self.handle_trigger(str(m.get("event")), _window_from_mapping(m)) if m.get("event") in ("toggle", "ptt_start", "ptt_stop", "ptt_cancel") else None)
+            self.platform.start_event_listener(lambda m: self.handle_trigger(str(m.get("event")), _window_from_mapping(m), from_hotkey=True) if m.get("event") in ("toggle", "ptt_start", "ptt_stop", "ptt_cancel") else None)
             srv.bind(str(self.sock_path)); os.chmod(self.sock_path, 0o600); srv.listen(8); srv.settimeout(0.3)
             while not self._stop_evt.is_set():
                 try: conn, _ = srv.accept()

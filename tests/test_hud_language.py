@@ -20,8 +20,11 @@ from agent_voice_input.config import (  # noqa: E402
     ConfigError,
     HotkeyConfig,
     UiConfig,
+    VALID_UI_POSITIONS,
     load_config,
     normalize_ui_language,
+    normalize_ui_position,
+    redact_secrets,
 )
 from agent_voice_input.hud import (  # noqa: E402
     format_hotkey_label,
@@ -36,6 +39,7 @@ from agent_voice_input.platform_macos import (  # noqa: E402
 from agent_voice_input.platform_wsl import (  # noqa: E402
     ForegroundWindow,
     POWERSHELL_EXE,
+    WINDOWS_TERMINALS,
     WslPlatform,
     probe_wsl_host,
 )
@@ -115,6 +119,75 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             (cfg_dir / "config.toml").write_text('[ui]\nunknown_opt = "en"\n', encoding="utf-8")
             with self.assertRaises(ConfigError):
                 load_config(env={"HOME": str(home)}, home_dir=home)
+
+    def test_config_and_env_ui_position_and_non_secret_redaction(self) -> None:
+        self.assertEqual(VALID_UI_POSITIONS, frozenset({"bottom", "top"}))
+        self.assertEqual(Config().ui.position, "bottom")
+        self.assertEqual(normalize_ui_position(), "bottom")
+        self.assertEqual(normalize_ui_position("bottom"), "bottom")
+        self.assertEqual(normalize_ui_position(" BOTTOM "), "bottom")
+        self.assertEqual(normalize_ui_position("top"), "top")
+        self.assertEqual(normalize_ui_position(" Top "), "top")
+
+        for bad_pos in ("", "   ", "center", "middle", "left", "right", "auto", True, 123):
+            with self.subTest(bad_pos=bad_pos):
+                with self.assertRaises(ValueError):
+                    normalize_ui_position(bad_pos)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir.mkdir(parents=True)
+
+            # Default without config file is 'bottom'
+            cfg_def, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(cfg_def.ui.position, "bottom")
+
+            # TOML sets 'top'
+            (cfg_dir / "config.toml").write_text('[ui]\nposition = "TOP"\n', encoding="utf-8")
+            cfg_top, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(cfg_top.ui.position, "top")
+
+            # Env overrides TOML; AGENT_VOICE_INPUT_UI_POSITION beats VOICE_INPUT_UI_POSITION
+            cfg_legacy, _ = load_config(
+                env={"HOME": str(home), "VOICE_INPUT_UI_POSITION": "bottom"},
+                home_dir=home,
+            )
+            self.assertEqual(cfg_legacy.ui.position, "bottom")
+
+            cfg_pref, _ = load_config(
+                env={
+                    "HOME": str(home),
+                    "AGENT_VOICE_INPUT_UI_POSITION": "top",
+                    "VOICE_INPUT_UI_POSITION": "bottom",
+                },
+                home_dir=home,
+            )
+            self.assertEqual(cfg_pref.ui.position, "top")
+
+            # CLI override beats env and TOML
+            cfg_cli, _ = load_config(
+                env={"HOME": str(home), "AGENT_VOICE_INPUT_UI_POSITION": "top"},
+                home_dir=home,
+                cli_overrides={"ui.position": "bottom"},
+            )
+            self.assertEqual(cfg_cli.ui.position, "bottom")
+
+            with self.assertRaises(ConfigError):
+                load_config(
+                    env={"HOME": str(home), "AGENT_VOICE_INPUT_UI_POSITION": "middle"},
+                    home_dir=home,
+                )
+
+        # Ensure non-secret env vars never cause redact_secrets to mask 'bottom'/'top'/'true'/'false'
+        non_sec_env = {
+            "AGENT_VOICE_INPUT_UI_POSITION": "bottom",
+            "VOICE_INPUT_UI_POSITION": "top",
+            "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS": "true",
+            "VOICE_INPUT_ONLY_IN_TERMINALS": "false",
+        }
+        sample = "hud position=bottom or top, only_in_terminals=true or false"
+        self.assertEqual(redact_secrets(sample, non_sec_env), sample)
 
     def test_wsl2_windows_ui_culture_not_misled_by_posix_lang(self) -> None:
         # Core trap: WSL2 Ubuntu often has LANG=C.UTF-8 or en_US.UTF-8 even on Chinese Windows desktop!
@@ -269,6 +342,10 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(zh_cmds[3].get("duration_ms"), 900)
+            self.assertEqual(
+                [c.get("position") for c in zh_cmds],
+                ["bottom", "bottom", "bottom", "bottom", "bottom", "bottom", "bottom", None, "bottom"],
+            )
 
             # 2. English Windows desktop (ready ui_culture='en-US') + distracting Linux LANG=zh_CN.UTF-8 + PTT RAlt
             en_cmds = _run_hud_scenario(
@@ -317,12 +394,14 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(override_en_cmds[0].get("text"), "● Listening… (press Right Ctrl to finish)")
 
             override_zh_cmds = _run_hud_scenario(
-                cfg=Config(),
+                cfg=Config(ui=UiConfig(position="top")),
                 env={"LANG": "C.UTF-8", "AGENT_VOICE_INPUT_UI_LANGUAGE": "zh-TW"},
                 ready_ui_culture="en-US",
-                calls=[("recording", "", 0)],
+                calls=[("recording", "", 0), ("hide", "", 0)],
             )
             self.assertEqual(override_zh_cmds[0].get("text"), "● 正在录音… (再按右 Ctrl 完成)")
+            self.assertEqual(override_zh_cmds[0].get("position"), "top")
+            self.assertIsNone(override_zh_cmds[1].get("position"))
 
         # 5. probe_wsl_host resolves ui_lang from probe JSON ui_culture without launching real PowerShell
         def _fake_isfile(p: str | os.PathLike[str]) -> bool:
@@ -412,6 +491,10 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(mac_zh[2].get("duration_ms"), 900)
+            self.assertEqual(
+                [c.get("position") for c in mac_zh],
+                ["bottom", "bottom", "bottom", None],
+            )
 
             # 2. English macOS desktop (ui_culture='en-US') with RCommand PTT despite LANG=zh_CN.UTF-8
             mac_en = _run_mac_hud_scenario(
@@ -438,14 +521,16 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             )
             self.assertEqual(mac_posix_zh[0].get("text"), "● 正在录音… (再按 Fn 完成)")
 
-            # 4. Explicit config override wins over mac_shim ui_culture
+            # 4. Explicit config override wins over mac_shim ui_culture and forwards position='top'
             mac_override = _run_mac_hud_scenario(
-                cfg=Config(hotkey=HotkeyConfig(key="ROption"), ui=UiConfig(language="en")),
+                cfg=Config(hotkey=HotkeyConfig(key="ROption"), ui=UiConfig(language="en", position="top")),
                 env={"LANG": "zh_CN.UTF-8"},
                 ready_ui_culture="zh-Hans-CN",
-                calls=[("recording", "", 0)],
+                calls=[("recording", "", 0), ("hide", "", 0)],
             )
             self.assertEqual(mac_override[0].get("text"), "● Listening… (press Right Option to finish)")
+            self.assertEqual(mac_override[0].get("position"), "top")
+            self.assertIsNone(mac_override[1].get("position"))
 
             # 5. probe_macos_host parses self-check ui_culture and resolves ui_lang
             fake_bin = tmp_dir / "fake_mac_shim"
@@ -576,6 +661,8 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(format_hud_text(state, "en"), en_txt)
 
     def test_win_shim_ascii_ui_culture_and_layout_contract(self) -> None:
+        import re
+
         shim = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
         self.assertTrue(shim.isascii(), "win_shim.ps1 must stay pure 7-bit ASCII using C# \\uXXXX escapes")
         self.assertNotIn("$UiLanguage", shim)
@@ -589,6 +676,23 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertIn("TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix", shim)
         self.assertIn("TextFormatFlags.EndEllipsis", shim)
         self.assertIn("wa.Width - 24", shim)
+        # Bottom capsule positioning + 100% pill corner radius + anti-aliased GraphicsPath border
+        self.assertIn("using System.Drawing.Drawing2D;", shim)
+        self.assertIn("wa.Bottom - h - 14", shim)
+        self.assertIn("wa.Top + 36", shim)
+        self.assertIn("CreateRoundRectRgn(0, 0, w + 1, h + 1, h, h)", shim)
+        self.assertIn("SmoothingMode.AntiAlias", shim)
+        self.assertIn("new GraphicsPath()", shim)
+        self.assertIn("path.AddArc(", shim)
+        self.assertNotIn("DrawRectangle(", shim)
+        self.assertIn("[string]$cmdObj.position", shim)
+
+        # Single source of truth parity between platform_wsl.WINDOWS_TERMINALS and win_shim.ps1 $AllowedTerminals
+        m = re.search(r"\$AllowedTerminals\s*=\s*@\(([^)]+)\)", shim)
+        self.assertIsNotNone(m)
+        assert m is not None
+        shim_terms = {item.strip().strip('"').strip("'") for item in m.group(1).split(",") if item.strip()}
+        self.assertEqual(shim_terms, set(WINDOWS_TERMINALS))
 
 
 if __name__ == "__main__":

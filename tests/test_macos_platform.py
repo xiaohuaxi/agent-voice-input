@@ -22,16 +22,19 @@ if str(_SRC_ROOT) not in sys.path:
 from agent_voice_input import cli as cli_mod  # noqa: E402
 from agent_voice_input.asr_providers import AsrContext, AsrResult, BaseAsrProvider  # noqa: E402
 from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
-from agent_voice_input.config import AudioConfig, Config, ConfigError, RefinerConfig, load_config  # noqa: E402
+from agent_voice_input.config import AudioConfig, Config, ConfigError, HotkeyConfig, RefinerConfig, load_config  # noqa: E402
 from agent_voice_input.daemon import VoiceInputDaemon, run_pipeline_once  # noqa: E402
 from agent_voice_input.platform_macos import (  # noqa: E402
     GHOSTTY_BUNDLE_ID,
+    MACOS_TERMINALS,
+    MACOS_TERMINAL_BUNDLE_IDS,
     MAC_SHIM_SCRIPT,
     MacOSPlatform,
     _APPLE_SEP,
     _GHOSTTY_INPUT_SCRIPT,
     compile_mac_shim,
     get_macos_cache_dir,
+    is_macos_terminal_window,
     parse_avfoundation_audio_devices,
     probe_macos_host,
     resolve_macos_audio_device,
@@ -981,6 +984,198 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertIn(f"[session]   codex:{sid_a} (tty_ps)", doctor_out)
             self.assertIn("tty=/dev/ttys021", doctor_out)
 
+    def test_macos_terminal_whitelist_chinese_terminal_paste_and_hotkey_gate(self) -> None:
+        expected_procs = {
+            "terminal",
+            "终端",
+            "iterm2",
+            "iterm",
+            "wezterm",
+            "wezterm-gui",
+            "alacritty",
+            "ghostty",
+            "kitty",
+            "warp",
+            "hyper",
+            "rio",
+            "tabby",
+        }
+        expected_bundles = {
+            GHOSTTY_BUNDLE_ID,
+            "com.apple.terminal",
+            "com.googlecode.iterm2",
+            "com.github.wez.wezterm",
+            "org.alacritty",
+            "io.alacritty",
+            "net.kovidgoyal.kitty",
+            "dev.warp.warp-stable",
+            "dev.warp.warp",
+            "co.zeit.hyper",
+            "com.raphaelamorim.rio",
+            "org.tabby",
+        }
+        self.assertEqual(MACOS_TERMINALS, expected_procs)
+        self.assertEqual(MACOS_TERMINAL_BUNDLE_IDS, expected_bundles)
+
+        self.assertTrue(is_macos_terminal_window("Ghostty", GHOSTTY_BUNDLE_ID))
+        self.assertTrue(is_macos_terminal_window("终端", "com.apple.Terminal"))
+        self.assertTrue(is_macos_terminal_window("终端.app", ""))
+        self.assertTrue(is_macos_terminal_window("LocalizedTerm", "com.apple.Terminal"))
+        self.assertTrue(is_macos_terminal_window("Terminal.app", ""))
+        self.assertTrue(is_macos_terminal_window("Warp.app", "dev.warp.warp-stable"))
+        self.assertFalse(is_macos_terminal_window("Windows App", "com.microsoft.rdc.macos"))
+        self.assertFalse(is_macos_terminal_window("Safari", "com.apple.Safari"))
+        self.assertFalse(is_macos_terminal_window("", ""))
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            osa_calls: list[list[str]] = []
+            hud_calls: list[str] = []
+            beep_calls: list[str] = []
+            rec_starts: list[bool] = []
+            cancel_calls: list[int] = []
+            cur_app = ["终端", "com.apple.Terminal", "601", "codex — zsh"]
+
+            def fake_run(cmd, *, stdin=None, input=None, capture_output=False, text=False, env=None, timeout=None, check=False, **kw):
+                exe = Path(cmd[0]).name
+                if exe == "pbcopy":
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                if exe == "osascript":
+                    osa_calls.append(list(cmd))
+                    script = cmd[2] if len(cmd) > 2 else ""
+                    if 'keystroke "v"' in script:
+                        return subprocess.CompletedProcess(cmd, 0, "", "")
+                    if "focused terminal of selected tab of front window" in script and "on run argv" not in script:
+                        out = _APPLE_SEP.join(["surf-g1", "codex", "/dev/ttys011", str(tmp), "701"])
+                        return subprocess.CompletedProcess(cmd, 0, out + "\n", "")
+                    if "on run argv" in script:
+                        return subprocess.CompletedProcess(cmd, 0, "ok\n", "")
+                    return subprocess.CompletedProcess(cmd, 0, _APPLE_SEP.join(cur_app) + "\n", "")
+                if exe in ("git", "tmux", "ps"):
+                    empty = "" if text else b""
+                    return subprocess.CompletedProcess(cmd, 1, empty, empty)
+                raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+            with mock.patch("agent_voice_input.platform_macos.shutil.which", return_value="/usr/bin/mock"), mock.patch(
+                "agent_voice_input.platform_macos.subprocess.run", side_effect=fake_run
+            ):
+                plat = MacOSPlatform(
+                    Config(audio=AudioConfig(beep=True), refiner=RefinerConfig(provider="off")),
+                    env={"HOME": str(tmp), "AGENT_VOICE_INPUT_SWIFTC": "none"},
+                    cache_dir=tmp / "cache",
+                )
+                plat.hud = lambda state, text="", *, duration_ms=0: hud_calls.append(state)  # type: ignore[method-assign]
+                plat.beep = lambda kind: beep_calls.append(kind)  # type: ignore[method-assign]
+                plat.start_recording = lambda _rt, *, loopback=False: rec_starts.append(loopback)  # type: ignore[method-assign]
+                plat.stop_recording = lambda *, drain=True: (_voiced_wav(), "avfoundation")  # type: ignore[method-assign]
+                plat.cancel_recording = lambda: cancel_calls.append(1)  # type: ignore[method-assign]
+
+                # 1. Chinese macOS built-in Terminal (`终端` / `com.apple.Terminal`) is allowed and pastes via Cmd+V
+                zh_term_win = ForegroundWindow(0, "终端", "codex — zsh", bundle_id="com.apple.Terminal", pid=601)
+                self.assertTrue(plat.is_allowed_terminal(zh_term_win))
+                paste_zh = plat.deliver_text("中文系统终端粘贴", seq_id=1, origin_window=zh_term_win)
+                self.assertTrue(paste_zh.pasted)
+                self.assertEqual(paste_zh.reason, "ok")
+
+                osa_calls.clear()
+                hud_calls.clear()
+                beep_calls.clear()
+                rec_starts.clear()
+
+                daemon = VoiceInputDaemon(
+                    Config(audio=AudioConfig(beep=True), refiner=RefinerConfig(provider="off")),
+                    env={"HOME": str(tmp)},
+                    runtime_dir=tmp / "rt",
+                    platform=plat,
+                    asr_provider=_StubAsr("终端语音输入"),
+                    refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                    tracker=SessionTracker(home_dir=tmp, env={"HOME": str(tmp)}, runtime_dir=tmp / "rt", proc_root=tmp / "noproc"),
+                )
+                try:
+                    # 2. Frontmost Windows App (RDP) or Safari or empty window -> ignored="non_terminal" with zero side effects
+                    for non_term in (
+                        ForegroundWindow(0, "Windows App", "", bundle_id="com.microsoft.rdc.macos", pid=810),
+                        ForegroundWindow(0, "Safari", "", bundle_id="com.apple.Safari", pid=811),
+                        ForegroundWindow(),
+                    ):
+                        prev_ts = daemon._last_trigger_ts
+                        res_ig = daemon.handle_trigger("toggle", non_term, from_hotkey=True)
+                        self.assertEqual(
+                            res_ig,
+                            {"ok": False, "ignored": "non_terminal", "state": "idle", "seq_id": 0},
+                        )
+                        self.assertEqual(daemon.state, "idle")
+                        self.assertEqual(daemon.seq_id, 0)
+                        self.assertEqual(daemon._last_trigger_ts, prev_ts)
+                        self.assertEqual(osa_calls, [])
+                        self.assertEqual(hud_calls, [])
+                        self.assertEqual(beep_calls, [])
+                        self.assertEqual(rec_starts, [])
+
+                    # 3. Immediately switching to Chinese `终端` (`com.apple.Terminal`) starts recording without debounce block
+                    r_zh_start = daemon.handle_trigger(
+                        "toggle",
+                        ForegroundWindow(0, "终端", "", bundle_id="com.apple.Terminal", pid=601),
+                        from_hotkey=True,
+                    )
+                    self.assertTrue(r_zh_start["ok"])
+                    self.assertEqual(daemon.state, "recording")
+                    self.assertEqual(rec_starts, [False])
+                    self.assertEqual(hud_calls, ["recording"])
+                    self.assertEqual(beep_calls, ["start"])
+
+                    # 4. Active recording started in terminal, then focus switched to Windows App -> toggle stop & ptt_cancel NEVER blocked!
+                    cur_app[:] = ["Windows App", "com.microsoft.rdc.macos", "810", "Win11 Remote"]
+                    win_app_fg = ForegroundWindow(0, "Windows App", "Win11 Remote", bundle_id="com.microsoft.rdc.macos", pid=810)
+                    daemon._last_trigger_ts = -1e9
+                    r_stop = daemon.handle_trigger("toggle", win_app_fg, from_hotkey=True)
+                    self.assertTrue(r_stop["ok"])
+                    self.assertEqual(r_stop["state"], "recognizing")
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_stop["seq_id"]:
+                        time.sleep(0.02)
+                    self.assertTrue(daemon.last_result["ok"])
+                    self.assertFalse(daemon.last_result["pasted"])
+                    self.assertEqual(daemon.last_result["paste_reason"], "focus_changed")
+
+                    # Start in Ghostty via ptt_start, switch to Windows App, ptt_cancel cleanly cancels
+                    daemon._last_trigger_ts = -1e9
+                    r_ptt = daemon.handle_trigger(
+                        "ptt_start",
+                        ForegroundWindow(0, "Ghostty", "", bundle_id=GHOSTTY_BUNDLE_ID, pid=700),
+                        from_hotkey=True,
+                    )
+                    self.assertTrue(r_ptt["ok"])
+                    self.assertEqual(daemon.state, "recording")
+                    r_cancel = daemon.handle_trigger("ptt_cancel", win_app_fg, from_hotkey=True)
+                    self.assertEqual(r_cancel, {"ok": True, "state": "idle", "seq_id": r_ptt["seq_id"] + 1})
+                    self.assertEqual(cancel_calls, [1])
+                    self.assertEqual(daemon.state, "idle")
+                finally:
+                    daemon.close()
+
+                # 5. only_in_terminals = False allows starting recording even in Windows App
+                daemon_all = VoiceInputDaemon(
+                    Config(hotkey=HotkeyConfig(only_in_terminals=False), refiner=RefinerConfig(provider="off")),
+                    env={"HOME": str(tmp)},
+                    runtime_dir=tmp / "rt_all",
+                    platform=plat,
+                    asr_provider=_StubAsr("允许任意窗口"),
+                    refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                    tracker=SessionTracker(home_dir=tmp, env={"HOME": str(tmp)}, runtime_dir=tmp / "rt_all", proc_root=tmp / "noproc"),
+                )
+                try:
+                    cur_app[:] = ["Windows App", "com.microsoft.rdc.macos", "810", "Win11 Remote"]
+                    r_any = daemon_all.handle_trigger(
+                        "toggle",
+                        ForegroundWindow(0, "Windows App", "", bundle_id="com.microsoft.rdc.macos", pid=810),
+                        from_hotkey=True,
+                    )
+                    self.assertTrue(r_any["ok"])
+                    self.assertEqual(daemon_all.state, "recording")
+                finally:
+                    daemon_all.close()
+
     def test_mac_shim_static_invariants(self) -> None:
         self.assertTrue(MAC_SHIM_SCRIPT.is_file())
         src = MAC_SHIM_SCRIPT.read_text(encoding="utf-8")
@@ -999,12 +1194,16 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn("hidesOnDeactivate = false", src)
         self.assertIn("orderFrontRegardless()", src)
         self.assertNotIn("makeKeyAndOrderFront", src)
-        # Chord tainting & two-stage HUD states
+        # Chord tainting, HUD bottom/top positioning, & two-stage HUD states
         self.assertIn("chordTainted", src)
         self.assertIn("ptt_cancel", src)
         self.assertIn("counterForEventType", src)
         self.assertIn('st == "recognizing" || st == "processing"', src)
         self.assertIn('st == "refining"', src)
+        self.assertIn("func computeHudPillY(", src)
+        self.assertIn("round(visibleMinY + 14.0)", src)
+        self.assertIn("round(visibleMaxY - pillH - 14.0)", src)
+        self.assertIn('obj["position"] as? String', src)
 
     @unittest.skipUnless(
         sys.platform == "darwin" and bool(resolve_swiftc := (os.path.isfile("/usr/bin/swiftc") or shutil.which("swiftc"))),

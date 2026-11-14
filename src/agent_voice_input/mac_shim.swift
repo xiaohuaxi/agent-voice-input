@@ -241,6 +241,14 @@ private func isZhUiCulture(_ tag: String) -> Bool {
     return low == "zh" || low.hasPrefix("zh-") || low.hasPrefix("zh_") || low.hasPrefix("zh.") || low.hasPrefix("zh@")
 }
 
+func computeHudPillY(visibleMinY: CGFloat, visibleMaxY: CGFloat, pillH: CGFloat, position: String) -> CGFloat {
+    let pos = position.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if pos == "top" {
+        return round(visibleMaxY - pillH - 14.0)
+    }
+    return round(visibleMinY + 14.0)
+}
+
 final class HudPillController {
     private var panel: NSPanel?
     private var bgView: NSView?
@@ -286,7 +294,7 @@ final class HudPillController {
         panel?.orderOut(nil)
     }
 
-    func update(state: String, customText: String, durationMs: Int) {
+    func update(state: String, customText: String, durationMs: Int, position: String = "bottom") {
         hideWorkItem?.cancel(); hideWorkItem = nil
         let st = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if st.isEmpty || st == "idle" || st == "hide" { panel?.orderOut(nil); return }
@@ -326,7 +334,8 @@ final class HudPillController {
         let activeScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) ?? NSScreen.main ?? NSScreen.screens.first
         let vf = activeScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
 
-        panel.setFrame(NSRect(x: round(vf.midX - pillW / 2.0), y: round(vf.maxY - pillH - 14.0), width: pillW, height: pillH), display: false)
+        let pillY = computeHudPillY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, pillH: pillH, position: position)
+        panel.setFrame(NSRect(x: round(vf.midX - pillW / 2.0), y: pillY, width: pillW, height: pillH), display: false)
         bgView.frame = NSRect(x: 0, y: 0, width: pillW, height: pillH)
         bgView.layer?.cornerRadius = pillH / 2.0
         bgView.layer?.borderColor = bd.cgColor
@@ -411,6 +420,9 @@ private func runSelfCheck() -> Int32 {
         try check(recov.count == 1 && recov[0].kind == "toggle", "recovered toggle after swallowed keyUp")
 
         try check(isZhUiCulture("zh-Hans-CN") && isZhUiCulture("zh_TW.UTF-8") && !isZhUiCulture("en-US"), "ui_culture zh detection")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 64.0, "HUD bottom pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 64.0, "HUD default pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: " TOP ") == 850.0, "HUD top pillY")
 
         #if arch(arm64)
         let archName = "arm64"
@@ -534,7 +546,8 @@ struct MacShimMain {
                         writeJsonLine(["type": "reply", "reply": "fg_window", "seq_id": seqId, "ok": true, "hwnd": 0, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": ""])
                     case "hud":
                         let dms = (obj["duration_ms"] as? Int) ?? ((obj["duration_ms"] as? NSNumber)?.intValue ?? 0)
-                        hud.update(state: (obj["state"] as? String) ?? "", customText: (obj["text"] as? String) ?? "", durationMs: dms)
+                        let pos = (obj["position"] as? String) ?? "bottom"
+                        hud.update(state: (obj["state"] as? String) ?? "", customText: (obj["text"] as? String) ?? "", durationMs: dms, position: pos)
                         writeJsonLine(["type": "reply", "reply": "hud", "seq_id": seqId, "ok": true])
                     case "quit":
                         cleanupAndExit(0)

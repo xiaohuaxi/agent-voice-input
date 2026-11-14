@@ -7,12 +7,36 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
-from .config import Config, redact_secrets
+from .config import Config, normalize_ui_position, redact_secrets
 from .hud import format_hud_text, resolve_ui_language
 
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 WSLG_PULSE_SOCK = "/mnt/wslg/PulseServer"
 SHIM_SCRIPT = Path(__file__).resolve().with_name("win_shim.ps1")
+WINDOWS_TERMINALS = frozenset(
+    {
+        "windowsterminal",
+        "openconsole",
+        "mintty",
+        "wezterm",
+        "wezterm-gui",
+        "alacritty",
+        "ghostty",
+        "conhost",
+        "putty",
+        "tabby",
+        "hyper",
+        "kitty",
+        "rio",
+    }
+)
+
+
+def is_windows_terminal_process(process: str) -> bool:
+    p = (process or "").strip().lower()
+    if p.endswith(".exe"):
+        p = p[:-4]
+    return bool(p) and p in WINDOWS_TERMINALS
 
 
 @dataclass(frozen=True)
@@ -415,18 +439,20 @@ class JsonlShimMixin:
                 self._ready.wait(timeout=self._shim_ready_timeout)
             req: dict[str, Any] = {"cmd": "hud", "state": state}
             eff_text = text
-            if not eff_text and st not in ("", "idle", "hide"):
-                lang = resolve_ui_language(
-                    self.cfg.ui.language,
-                    env=self.env,
-                    win_ui_culture=self._host_ui_culture(),
-                )
-                eff_text = format_hud_text(
-                    st,
-                    lang,
-                    hotkey=self.cfg.hotkey.key,
-                    trigger_mode=self.cfg.hotkey.trigger_mode,
-                )
+            if st not in ("", "idle", "hide"):
+                req["position"] = normalize_ui_position(self.cfg.ui.position)
+                if not eff_text:
+                    lang = resolve_ui_language(
+                        self.cfg.ui.language,
+                        env=self.env,
+                        win_ui_culture=self._host_ui_culture(),
+                    )
+                    eff_text = format_hud_text(
+                        st,
+                        lang,
+                        hotkey=self.cfg.hotkey.key,
+                        trigger_mode=self.cfg.hotkey.trigger_mode,
+                    )
             if eff_text:
                 req["text"] = eff_text
             if duration_ms > 0:
@@ -490,6 +516,9 @@ class WslPlatform(JsonlShimMixin):
         if not os.path.isfile(POWERSHELL_EXE):
             raise RuntimeError(f"PowerShell not found at {POWERSHELL_EXE}")
         return [POWERSHELL_EXE, "-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "bridge", "-Hotkey", self.cfg.hotkey.key, "-TriggerMode", self.cfg.hotkey.trigger_mode, "-TapMaxMs", str(self.cfg.hotkey.tap_max_ms), "-DebounceMs", str(self.cfg.hotkey.debounce_ms), "-Beep", "1" if self.cfg.audio.beep else "0"]
+
+    def is_allowed_terminal(self, window: ForegroundWindow) -> bool:
+        return is_windows_terminal_process(window.process)
 
     def get_foreground_window(self) -> ForegroundWindow:
         if self._has_managed_shim():

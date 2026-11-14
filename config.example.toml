@@ -14,11 +14,18 @@ key = "RControl"
 trigger_mode = "tap_toggle"
 tap_max_ms = 1200
 debounce_ms = 180
+# Start new hotkey recordings only when an allowed terminal window is focused (set false to allow triggering in any app;
+# stopping or canceling an active recording is never blocked even if focus moved away)
+# Can also be overridden via AGENT_VOICE_INPUT_ONLY_IN_TERMINALS (or VOICE_INPUT_ONLY_IN_TERMINALS)
+only_in_terminals = true
 
 [ui]
 # Desktop HUD pill language: "auto" (follows Windows UI language on WSL2 or desktop/POSIX locale on macOS/Linux; falls back to "en") | "zh" | "en"
 # Can also be overridden via AGENT_VOICE_INPUT_UI_LANGUAGE (or VOICE_INPUT_UI_LANGUAGE)
 language = "auto"
+# Desktop HUD pill vertical position: "bottom" (default, above Dock/taskbar) | "top"
+# Can also be overridden via AGENT_VOICE_INPUT_UI_POSITION (or VOICE_INPUT_UI_POSITION)
+position = "bottom"
 
 [audio]
 # Silence gate & RMS loudness normalization (pure stdlib; blocks accidental empty triggers before hitting cloud APIs)

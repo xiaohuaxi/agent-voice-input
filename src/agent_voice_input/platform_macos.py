@@ -12,7 +12,39 @@ from .platform_wsl import FfmpegWavRecorder, ForegroundWindow, JsonlShimMixin, P
 
 GHOSTTY_BUNDLE_ID = "com.mitchellh.ghostty"
 MAC_SHIM_SCRIPT = Path(__file__).resolve().with_name("mac_shim.swift")
-MACOS_TERMINALS = frozenset({"terminal", "iterm2", "iterm", "wezterm", "wezterm-gui", "alacritty", "ghostty", "kitty", "warp"})
+MACOS_TERMINALS = frozenset(
+    {
+        "terminal",
+        "终端",
+        "iterm2",
+        "iterm",
+        "wezterm",
+        "wezterm-gui",
+        "alacritty",
+        "ghostty",
+        "kitty",
+        "warp",
+        "hyper",
+        "rio",
+        "tabby",
+    }
+)
+MACOS_TERMINAL_BUNDLE_IDS = frozenset(
+    {
+        GHOSTTY_BUNDLE_ID,
+        "com.apple.terminal",
+        "com.googlecode.iterm2",
+        "com.github.wez.wezterm",
+        "org.alacritty",
+        "io.alacritty",
+        "net.kovidgoyal.kitty",
+        "dev.warp.warp-stable",
+        "dev.warp.warp",
+        "co.zeit.hyper",
+        "com.raphaelamorim.rio",
+        "org.tabby",
+    }
+)
 SOUND_MAP = {"start": "Tink.aiff", "stop": "Pop.aiff", "focus": "Glass.aiff", "error": "Basso.aiff"}
 
 _APPLE_SEP = "\x1f"
@@ -106,6 +138,16 @@ MACOS_PERMISSIONS_HINT = (
 
 def is_ghostty_app(app_name: str, bundle_id: str = "") -> bool:
     return bundle_id.strip().lower() == GHOSTTY_BUNDLE_ID or app_name.strip().lower() == "ghostty"
+
+
+def is_macos_terminal_window(process: str, bundle_id: str = "") -> bool:
+    bid = (bundle_id or "").strip().lower()
+    if bid and bid in MACOS_TERMINAL_BUNDLE_IDS:
+        return True
+    proc = (process or "").strip().lower()
+    if proc.endswith(".app"):
+        proc = proc[:-4]
+    return bool(proc) and proc in MACOS_TERMINALS
 
 
 def resolve_macos_audio_device(cfg: Config, env: Mapping[str, str] | None = None) -> str:
@@ -429,8 +471,10 @@ class MacOSPlatform(JsonlShimMixin):
             t_pid,
         )
 
-    def _append_tmux_pane_title(self, win_title: str, app_name: str) -> str:
-        if self.env.get("TMUX") and self._which("tmux") and (not app_name or app_name.lower() in MACOS_TERMINALS):
+    def _append_tmux_pane_title(self, win_title: str, app_name: str, bundle_id: str = "") -> str:
+        if self.env.get("TMUX") and self._which("tmux") and (
+            not (app_name or bundle_id) or is_macos_terminal_window(app_name, bundle_id)
+        ):
             tmux_env = {k: v for k, v in self.env.items() if k != "TMUX_PANE"}
             try:
                 tp = subprocess.run(
@@ -442,6 +486,9 @@ class MacOSPlatform(JsonlShimMixin):
             except (OSError, subprocess.SubprocessError):
                 pass
         return win_title
+
+    def is_allowed_terminal(self, window: ForegroundWindow) -> bool:
+        return is_macos_terminal_window(window.process, window.bundle_id)
 
     def get_foreground_window(self, *, hint: ForegroundWindow | None = None) -> ForegroundWindow:
         if hint is not None and (hint.process or hint.bundle_id):
@@ -458,9 +505,13 @@ class MacOSPlatform(JsonlShimMixin):
                 return ForegroundWindow(0, eff_name, g_title, eff_bundle, surface_id, tty, cwd, t_pid)
             if not win_title:
                 win_title = self._query_ax_title()
-            return ForegroundWindow(0, eff_name, self._append_tmux_pane_title(win_title, eff_name), eff_bundle, pid=app_pid)
+            return ForegroundWindow(
+                0, eff_name, self._append_tmux_pane_title(win_title, eff_name, eff_bundle), eff_bundle, pid=app_pid
+            )
 
-        return ForegroundWindow(0, app_name, self._append_tmux_pane_title(win_title, app_name), bundle_id, pid=app_pid)
+        return ForegroundWindow(
+            0, app_name, self._append_tmux_pane_title(win_title, app_name, bundle_id), bundle_id, pid=app_pid
+        )
 
     def resolve_foreground_window(self, window: ForegroundWindow | None = None) -> ForegroundWindow:
         if window is None:
@@ -556,7 +607,7 @@ class MacOSPlatform(JsonlShimMixin):
         fg = self.get_foreground_window()
         if origin_window is None and fg.surface_id and is_ghostty_app(fg.process, fg.bundle_id):
             return self._deliver_to_ghostty_surface(text, fg.surface_id, clip_ok)
-        if self._is_focus_drifted(origin_window, fg) or (fg.process and fg.process.lower() not in MACOS_TERMINALS):
+        if self._is_focus_drifted(origin_window, fg) or ((fg.process or fg.bundle_id) and not self.is_allowed_terminal(fg)):
             if clip_ok:
                 self.beep("focus")
             return PasteOutcome(False, clip_ok, "focus_changed" if clip_ok else "clipboard_failed", fg.process)

@@ -28,6 +28,7 @@ class ConfigError(ValueError):
 
 VALID_TRIGGER_MODES = frozenset({"tap_toggle", "ptt"})
 VALID_UI_LANGUAGES = frozenset({"auto", "zh", "en"})
+VALID_UI_POSITIONS = frozenset({"bottom", "top"})
 VALID_WSL_SOURCES = frozenset({"auto", "pulse", "winmm", "wasapi"})
 VALID_ASR_PROVIDERS = frozenset(
     {
@@ -135,12 +136,17 @@ _SENSITIVE_ENV_NAME_RE = re.compile(
 _NON_SECRET_ENV_NAMES = frozenset(
     {
         "AGENT_VOICE_INPUT_HOTKEY",
+        "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS",
+        "AGENT_VOICE_INPUT_TMUX_HINT",
         "AGENT_VOICE_INPUT_UI_LANGUAGE",
+        "AGENT_VOICE_INPUT_UI_POSITION",
         "AGENT_VOICE_INPUT_ASR_API",
         "AGENT_VOICE_INPUT_ASR_API_KEY_ENV",
         "AGENT_VOICE_INPUT_REFINER_API_KEY_ENV",
         "VOICE_INPUT_HOTKEY",
+        "VOICE_INPUT_ONLY_IN_TERMINALS",
         "VOICE_INPUT_UI_LANGUAGE",
+        "VOICE_INPUT_UI_POSITION",
         "VOICE_INPUT_ASR_API",
         "VOICE_INPUT_ASR_API_KEY_ENV",
         "VOICE_INPUT_REFINER_API_KEY_ENV",
@@ -170,11 +176,13 @@ class HotkeyConfig:
     trigger_mode: str = "tap_toggle"
     tap_max_ms: int = 1200
     debounce_ms: int = 180
+    only_in_terminals: bool = True
 
 
 @dataclass
 class UiConfig:
     language: str = "auto"
+    position: str = "bottom"
 
 
 DEFAULT_WSL_TAIL_DRAIN_SEC = 0.65
@@ -1001,6 +1009,15 @@ def normalize_ui_language(raw: Any, name: str = "ui.language") -> str:
     )
 
 
+def normalize_ui_position(raw: Any = "bottom", field_name: str = "ui.position") -> str:
+    s = _as_str(raw, field_name).strip().lower()
+    if s in VALID_UI_POSITIONS:
+        return s
+    raise ConfigError(
+        f"{field_name} must be one of {sorted(VALID_UI_POSITIONS)}, got {raw!r}"
+    )
+
+
 def _normalize_refiner_provider(raw: Any) -> str:
     if raw is False:
         return "off"
@@ -1031,6 +1048,8 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.hotkey.tap_max_ms = _as_int(v, "hotkey.tap_max_ms")
             elif k == "debounce_ms":
                 cfg.hotkey.debounce_ms = _as_int(v, "hotkey.debounce_ms")
+            elif k == "only_in_terminals":
+                cfg.hotkey.only_in_terminals = _as_bool(v, "hotkey.only_in_terminals")
             else:
                 raise ConfigError(f"unknown hotkey option {k!r}")
 
@@ -1043,6 +1062,8 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 continue
             if k == "language":
                 cfg.ui.language = normalize_ui_language(v, "ui.language")
+            elif k == "position":
+                cfg.ui.position = normalize_ui_position(v, "ui.position")
             else:
                 raise ConfigError(f"unknown ui option {k!r}")
 
@@ -1190,9 +1211,13 @@ def _apply_env_overrides(cfg: Config, env: Mapping[str, str]) -> None:
         cfg.hotkey.tap_max_ms = _as_int(kv[1], kv[0])
     if (kv := _get("DEBOUNCE_MS")) is not None:
         cfg.hotkey.debounce_ms = _as_int(kv[1], kv[0])
+    if (kv := _get("ONLY_IN_TERMINALS")) is not None:
+        cfg.hotkey.only_in_terminals = _as_bool(kv[1], kv[0])
 
     if (kv := _get("UI_LANGUAGE")) is not None:
         cfg.ui.language = normalize_ui_language(kv[1], kv[0])
+    if (kv := _get("UI_POSITION")) is not None:
+        cfg.ui.position = normalize_ui_position(kv[1], kv[0])
 
     if (kv := _get("AUDIO_FLOOR_DBFS")) is not None:
         cfg.audio.floor_dbfs = _as_float(kv[1], kv[0])
@@ -1455,8 +1480,13 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
         raise ConfigError("hotkey.tap_max_ms must be > 0")
     if cfg.hotkey.debounce_ms < 0:
         raise ConfigError("hotkey.debounce_ms must be >= 0")
+    if not isinstance(cfg.hotkey.only_in_terminals, bool):
+        raise ConfigError(
+            f"hotkey.only_in_terminals: invalid boolean value {cfg.hotkey.only_in_terminals!r}"
+        )
 
     cfg.ui.language = normalize_ui_language(cfg.ui.language, "ui.language")
+    cfg.ui.position = normalize_ui_position(cfg.ui.position, "ui.position")
 
     if cfg.audio.wsl_source not in VALID_WSL_SOURCES:
         raise ConfigError(

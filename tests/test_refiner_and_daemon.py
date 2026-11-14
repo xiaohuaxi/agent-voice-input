@@ -17,9 +17,9 @@ if str(_SRC_ROOT) not in sys.path:
 
 from agent_voice_input.asr_providers import AsrContext, AsrResult, BaseAsrProvider, HttpRequest, HttpResponse  # noqa: E402
 from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
-from agent_voice_input.config import Config, ConfigError, RefinerConfig, _parse_simple_toml, load_config, load_env_files, parse_toml, resolve_credentials  # noqa: E402
+from agent_voice_input.config import Config, ConfigError, HotkeyConfig, RefinerConfig, _parse_simple_toml, load_config, load_env_files, parse_toml, resolve_credentials  # noqa: E402
 from agent_voice_input.daemon import VoiceInputDaemon, run_pipeline_once, send_control_command  # noqa: E402
-from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome, SHIM_SCRIPT  # noqa: E402
+from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome, SHIM_SCRIPT, WslPlatform, is_windows_terminal_process  # noqa: E402
 from agent_voice_input.refiner import CodexRefiner, GeminiRefiner, OpenAICompatibleRefiner, RefinerResult, create_refiner  # noqa: E402
 from agent_voice_input.session_ctx import SessionTracker, write_session_registry_entry  # noqa: E402
 
@@ -138,14 +138,18 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         parsed_simple = _parse_simple_toml(toml_raw)
         self.assertEqual(parsed, parsed_simple)
         self.assertEqual(parsed["hotkey"]["key"], "RControl")
+        self.assertIs(parsed["hotkey"]["only_in_terminals"], True)
         self.assertEqual(parsed["ui"]["language"], "auto")
+        self.assertEqual(parsed["ui"]["position"], "bottom")
         self.assertEqual(parsed["audio"]["macos_device"], "default")
         self.assertEqual(parsed["asr"]["provider"], "auto")
         self.assertEqual(parsed["asr"]["api"], "auto")
         self.assertEqual(parsed["asr"]["effort"], "auto")
         self.assertEqual(parsed["refiner"]["provider"], "codex")
         cfg, _ = load_config(config_path=toml_path, env={"HOME": "/tmp/nonexistent-home"})
+        self.assertIs(cfg.hotkey.only_in_terminals, True)
         self.assertEqual(cfg.ui.language, "auto")
+        self.assertEqual(cfg.ui.position, "bottom")
         self.assertEqual(cfg.audio.macos_device, "default")
         self.assertEqual(cfg.refiner.provider, "codex")
         self.assertEqual(cfg.refiner.model, "gpt-6-luna")
@@ -1545,6 +1549,237 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(res_ds.final_text, "二阶段精修后文本")
             self.assertEqual(len(asr_calls), 1)
             self.assertEqual(len(ref_calls), 1)
+
+    def test_only_in_terminals_config_windows_whitelist_and_daemon_gate_invariants(self) -> None:
+        # 1. Config & env overrides for [hotkey] only_in_terminals
+        self.assertIs(Config().hotkey.only_in_terminals, True)
+        with tempfile.TemporaryDirectory() as td_cfg:
+            home = Path(td_cfg)
+            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.toml").write_text("[hotkey]\nonly_in_terminals = false\n", encoding="utf-8")
+            c_false, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertIs(c_false.hotkey.only_in_terminals, False)
+
+            for truthy in ("1", "true", "TRUE", "yes", "on"):
+                c_t, _ = load_config(
+                    env={"HOME": str(home), "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS": truthy},
+                    home_dir=home,
+                )
+                self.assertIs(c_t.hotkey.only_in_terminals, True)
+
+            (cfg_dir / "config.toml").write_text("[hotkey]\nonly_in_terminals = true\n", encoding="utf-8")
+            for falsy in ("0", "false", "FALSE", "no", "off"):
+                c_f, _ = load_config(
+                    env={"HOME": str(home), "VOICE_INPUT_ONLY_IN_TERMINALS": falsy},
+                    home_dir=home,
+                )
+                self.assertIs(c_f.hotkey.only_in_terminals, False)
+
+            # AGENT_VOICE_INPUT_ONLY_IN_TERMINALS beats VOICE_INPUT_ONLY_IN_TERMINALS
+            c_pref, _ = load_config(
+                env={
+                    "HOME": str(home),
+                    "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS": "true",
+                    "VOICE_INPUT_ONLY_IN_TERMINALS": "false",
+                },
+                home_dir=home,
+            )
+            self.assertIs(c_pref.hotkey.only_in_terminals, True)
+
+            with self.assertRaises(ConfigError):
+                load_config(
+                    env={"HOME": str(home), "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS": "maybe"},
+                    home_dir=home,
+                )
+            (cfg_dir / "config.toml").write_text("[hotkey]\nonly_in_terminals = 123\n", encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_config(env={"HOME": str(home)}, home_dir=home)
+
+        # 2. Windows terminal whitelist single source of truth
+        wplat = WslPlatform(Config(), env={"VOICE_INPUT_PULSE_SOURCE": "custom_src"})
+        for ok_proc in (
+            "WindowsTerminal",
+            "WindowsTerminal.exe",
+            "OpenConsole.exe",
+            "mintty",
+            "wezterm",
+            "wezterm-gui.exe",
+            "alacritty",
+            "ghostty.exe",
+            "conhost",
+            "putty",
+            "tabby",
+            "hyper",
+            "kitty",
+            "rio.exe",
+        ):
+            self.assertTrue(is_windows_terminal_process(ok_proc), msg=ok_proc)
+            self.assertTrue(wplat.is_allowed_terminal(ForegroundWindow(1, ok_proc, "t")), msg=ok_proc)
+
+        for bad_proc in ("mstsc.exe", "mstsc", "chrome.exe", "msedge.exe", "Code.exe", "explorer", ""):
+            self.assertFalse(is_windows_terminal_process(bad_proc), msg=bad_proc)
+            self.assertFalse(wplat.is_allowed_terminal(ForegroundWindow(1, bad_proc, "t")), msg=bad_proc)
+
+        # 3. Daemon gate: non-terminal start blocked cleanly; active recording NEVER stuck on window switch!
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            now = [100.0]
+            start_calls = [0]
+
+            class _CountingFakePlatform(_FakePlatform):
+                def start_recording(self, runtime_dir: Path) -> None:
+                    start_calls[0] += 1
+
+            plat = _CountingFakePlatform(paste_outcome=PasteOutcome(False, True, "focus_changed", "mstsc"))
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            cfg.audio.beep = True
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("切窗停止不卡死"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+                clock_fn=lambda: now[0],
+            )
+            try:
+                non_terms = [
+                    ForegroundWindow(10, "mstsc.exe", "Remote Desktop"),
+                    ForegroundWindow(11, "chrome.exe", "Google"),
+                    ForegroundWindow(0, "", ""),
+                    ForegroundWindow(0, "Windows App", "Win11", bundle_id="com.microsoft.rdc.macos"),
+                    ForegroundWindow(0, "Safari", "Apple", bundle_id="com.apple.Safari"),
+                ]
+                for w_bad in non_terms:
+                    for act in ("toggle", "ptt_start"):
+                        resp = daemon.handle_trigger(act, w_bad, from_hotkey=True)
+                        self.assertEqual(
+                            resp,
+                            {"ok": False, "ignored": "non_terminal", "state": "idle", "seq_id": 0},
+                        )
+                # None window with from_hotkey=True also blocked
+                self.assertEqual(
+                    daemon.handle_trigger("toggle", None, from_hotkey=True),
+                    {"ok": False, "ignored": "non_terminal", "state": "idle", "seq_id": 0},
+                )
+                self.assertEqual(start_calls[0], 0)
+                self.assertEqual(plat.huds, [])
+                self.assertEqual(plat.beeps, [])
+                self.assertEqual(daemon._last_trigger_ts, -1e9)
+
+                # Immediately (+10ms < 180ms debounce_ms!) pressing hotkey in WindowsTerminal.exe MUST start recording
+                # because blocked non_terminal triggers never polluted _last_trigger_ts!
+                now[0] += 0.01
+                wt_win = ForegroundWindow(200, "WindowsTerminal.exe", "codex [#abcd1234]")
+                r_start = daemon.handle_trigger("toggle", wt_win, from_hotkey=True)
+                self.assertTrue(r_start["ok"])
+                self.assertEqual(r_start["state"], "recording")
+                self.assertEqual(r_start["seq_id"], 1)
+                self.assertEqual(start_calls[0], 1)
+                self.assertEqual(plat.huds, ["recording"])
+                self.assertEqual(plat.beeps, ["start"])
+
+                # Mid-recording user switches focus to Windows App / mstsc.exe and presses hotkey to stop (toggle):
+                # MUST NOT be blocked by only_in_terminals!
+                now[0] += 0.5
+                rdp_win = ForegroundWindow(0, "Windows App", "Win11", bundle_id="com.microsoft.rdc.macos")
+                r_stop = daemon.handle_trigger("toggle", rdp_win, from_hotkey=True)
+                self.assertTrue(r_stop["ok"])
+                self.assertEqual(r_stop["state"], "recognizing")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.state != "idle":
+                    time.sleep(0.02)
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(plat.huds[-1], "copied")
+
+                # PTT start in Ghostty -> switch to Windows App -> ptt_stop works cleanly
+                now[0] += 0.5
+                ghostty_win = ForegroundWindow(0, "Ghostty", "zsh", bundle_id="com.mitchellh.ghostty")
+                self.assertEqual(
+                    daemon.handle_trigger("ptt_start", ghostty_win, from_hotkey=True)["state"],
+                    "recording",
+                )
+                now[0] += 0.5
+                r_ptt_stop = daemon.handle_trigger("ptt_stop", rdp_win, from_hotkey=True)
+                self.assertTrue(r_ptt_stop["ok"])
+                self.assertEqual(r_ptt_stop["state"], "recognizing")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.state != "idle":
+                    time.sleep(0.02)
+
+                # PTT start in Chinese macOS 终端 -> switch to Windows App -> ptt_cancel works cleanly
+                now[0] += 0.5
+                zh_term = ForegroundWindow(0, "终端", "zsh", bundle_id="com.apple.Terminal")
+                self.assertEqual(
+                    daemon.handle_trigger("ptt_start", zh_term, from_hotkey=True)["state"],
+                    "recording",
+                )
+                now[0] += 0.3
+                r_cancel = daemon.handle_trigger("ptt_cancel", rdp_win, from_hotkey=True)
+                self.assertTrue(r_cancel["ok"])
+                self.assertEqual(r_cancel["state"], "idle")
+                self.assertEqual(plat.canceled, 1)
+
+                # Explicit CLI control toggle (from_hotkey=False, window=None) is NOT blocked even if plat.fg is chrome
+                plat.fg = ForegroundWindow(300, "chrome.exe", "Browser")
+                now[0] += 0.5
+                r_cli = daemon.handle_control({"cmd": "toggle"})
+                self.assertTrue(r_cli["ok"])
+                self.assertEqual(r_cli["state"], "recording")
+                now[0] += 0.3
+                daemon.handle_trigger("ptt_cancel")
+
+                # only_in_terminals = False allows starting hotkey recording in non-terminal windows
+                daemon.cfg.hotkey.only_in_terminals = False
+                now[0] += 0.5
+                r_any = daemon.handle_trigger("toggle", rdp_win, from_hotkey=True)
+                self.assertTrue(r_any["ok"])
+                self.assertEqual(r_any["state"], "recording")
+                now[0] += 0.3
+                daemon.handle_trigger("ptt_cancel")
+            finally:
+                daemon.close()
+
+        # 4. serve_forever registers hotkey listener with from_hotkey=True
+        with tempfile.TemporaryDirectory() as td_srv:
+            rt_srv = Path(td_srv)
+            plat_srv = _FakePlatform()
+            daemon_srv = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="off")),
+                env={},
+                runtime_dir=rt_srv,
+                platform=plat_srv,
+                asr_provider=_FakeAsr("监听回调门禁"),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(rt_srv),
+            )
+            t_srv = threading.Thread(target=daemon_srv.serve_forever, daemon=True)
+            t_srv.start()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not daemon_srv.sock_path.exists():
+                time.sleep(0.02)
+            assert plat_srv.listener is not None
+            try:
+                # Non-terminal event from shim listener is ignored
+                plat_srv.listener({"event": "toggle", "hwnd": 55, "process": "mstsc", "title": "RDP"})
+                self.assertEqual(daemon_srv.state, "idle")
+                self.assertEqual(daemon_srv.seq_id, 0)
+                self.assertEqual(plat_srv.huds, [])
+
+                # Terminal event from shim listener starts recording; non-terminal toggle stops it
+                plat_srv.listener({"event": "toggle", "hwnd": 77, "process": "WindowsTerminal", "title": "codex"})
+                self.assertEqual(daemon_srv.state, "recording")
+                daemon_srv._last_trigger_ts = -1e9
+                plat_srv.listener({"event": "toggle", "hwnd": 55, "process": "mstsc", "title": "RDP"})
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon_srv.state != "idle":
+                    time.sleep(0.02)
+                self.assertEqual(daemon_srv.state, "idle")
+            finally:
+                send_control_command(rt_srv, {"cmd": "shutdown"})
+                t_srv.join(timeout=3.0)
 
 
 if __name__ == "__main__":

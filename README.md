@@ -15,7 +15,7 @@ Instead of treating terminal dictation like generic chat input, `agent-voice-inp
 1. **Active Session Context**: Locates the foreground agent session—including the active pane inside `tmux` without editing `~/.tmux.conf` (via optional terminal/pane title tags, runtime session registry, Ghostty split `tty`/`cwd` matching on macOS, or `/proc` / `ps` root-session scanning while ignoring background subagents and sibling panes)—and incrementally extracts recent dialogue plus `git status` filenames as context.
 2. **Stage 1 — Speech Recognition**: Applies a local silence gate (`-50 dBFS`) and RMS loudness normalization (`-20 dBFS`), then transcribes audio via built-in cloud or local-compatible providers (`dashscope`, `doubao`, `openrouter` dual-protocol STT & multimodal audio, `gemini`, `openai`, `groq`, `siliconflow`, or `openai-compatible`).
 3. **Stage 2 — Lightweight Context Refinement**: Cleans up technical terms, identifier casing, and explicit spoken self-corrections against the extracted session context. Defaults to local Codex CLI (`codex` with `gpt-6-luna`), and also supports `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, or `off` (automatically skipped when Stage 1 already performed single-hop multimodal refinement).
-4. **Focus-Safe Paste**: Shows recording/recognition/refinement stages in a non-activating top HUD pill (Windows & macOS, automatically matching Chinese or English desktop UI language), locks onto the origin terminal window/split when recording begins, never auto-presses Enter, and falls back to clipboard-only if focus drifted elsewhere.
+4. **Focus-Safe Paste**: Shows recording/recognition/refinement stages in a non-activating bottom HUD pill (configurable to `"top"`; Windows & macOS, automatically matching Chinese or English desktop UI language), starts hotkey recordings only in terminal windows by default, locks onto the origin terminal window/split when recording begins, never auto-presses Enter, and falls back to clipboard-only if focus drifted elsewhere.
 5. **Zero Extra Python Dependencies**: Uses only the Python 3.10+ standard library plus host `ffmpeg` (built-in `powershell.exe` on WSL2; cached native `mac_shim.swift` helper via `/usr/bin/swiftc` on macOS).
 
 ---
@@ -58,7 +58,7 @@ EOF
 chmod 600 ~/.config/agent-voice-input/agent-voice-input.env
 ```
 
-To customize hotkeys (`trigger_mode = "tap_toggle"` or `"ptt"`), HUD language (`[ui] language = "auto" | "zh" | "en"`, or `AGENT_VOICE_INPUT_UI_LANGUAGE`), macOS audio input (`[audio] macos_device = "default"` or `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`), providers, models, or Stage 2 refinement, copy [`config.example.toml`](config.example.toml) to `~/.config/agent-voice-input/config.toml` (see [`config.example.env`](config.example.env) for all credential variables).
+To customize hotkeys (`trigger_mode = "tap_toggle"` or `"ptt"`, `only_in_terminals = true | false`), HUD language & position (`[ui] language = "auto" | "zh" | "en"` and `position = "bottom" | "top"`, or `AGENT_VOICE_INPUT_UI_LANGUAGE` / `AGENT_VOICE_INPUT_UI_POSITION`), macOS audio input (`[audio] macos_device = "default"` or `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`), providers, models, or Stage 2 refinement, copy [`config.example.toml`](config.example.toml) to `~/.config/agent-voice-input/config.toml` (see [`config.example.env`](config.example.env) for all credential variables).
 
 ### 4. Verify & Run
 
@@ -82,7 +82,7 @@ agent-voice-input stop
 
 On macOS with **Ghostty**, `agent-voice-input` works out of the box without terminal hooks or invasive input permissions:
 
-- **Hotkey & Top Capsule HUD**: Tap Right Ctrl (`RControl`) to toggle recording—or set `trigger_mode = "ptt"` to hold-to-speak—with a non-activating top HUD pill showing recording, recognition, and refinement progress in Chinese or English matching your desktop locale.
+- **Terminal-Scoped Hotkey & Bottom Capsule HUD**: Tap Right Ctrl (`RControl`) to toggle recording—or set `trigger_mode = "ptt"` to hold-to-speak (enabled only in terminal windows by default via `[hotkey] only_in_terminals = true`, while stopping/canceling an active recording works from any app)—with a non-activating bottom HUD pill (or `[ui] position = "top"`) showing recording, recognition, and refinement progress in Chinese or English matching your desktop locale.
 - **Native Split Targeting & Anti-Drift Guard**: Locks onto the exact focused Ghostty split surface when recording starts and injects bracketed-paste text directly into that split without Accessibility synthetic keystrokes; if you switch splits or apps mid-transcription, it safely copies to the clipboard instead of pasting into the wrong target.
 - **Zero-Hook Split & `tmux` Session Binding**: Uses the focused Ghostty split's `tty` and `cwd` (and the attached client's active pane when inside `tmux`) to match the active `codex`, `claude`, or `agy` session in that pane, keeping multiple side-by-side splits isolated even without title hooks.
 - **Audio Input Selection**: Defaults to `[audio] macos_device = "default"` (system default microphone); override via `macos_device` in `config.toml` or `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE` (device index or name, inspectable via `agent-voice-input doctor`).
@@ -211,7 +211,7 @@ Common runtime flags accepted across `daemon`, `start`, `doctor`, `once`, `statu
 | `--refiner-model` | `AGENT_VOICE_INPUT_REFINER_MODEL` | Stage 2 upstream model ID |
 | `--refiner-effort`, `--effort` | `AGENT_VOICE_INPUT_REFINER_EFFORT` | Stage 2 thinking budget (`auto`, `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) |
 
-*(Shorter `VOICE_INPUT_*` environment variable aliases are also accepted, alongside `AGENT_VOICE_INPUT_HOTKEY`, `AGENT_VOICE_INPUT_TRIGGER_MODE`, `AGENT_VOICE_INPUT_UI_LANGUAGE`, `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`, `AGENT_VOICE_INPUT_ASR_BASE_URL`, `AGENT_VOICE_INPUT_REFINER_BASE_URL`, and `AGENT_VOICE_INPUT_FORCE_REFINE`.)*
+*(Shorter `VOICE_INPUT_*` environment variable aliases are also accepted, alongside `AGENT_VOICE_INPUT_HOTKEY`, `AGENT_VOICE_INPUT_TRIGGER_MODE`, `AGENT_VOICE_INPUT_ONLY_IN_TERMINALS`, `AGENT_VOICE_INPUT_UI_LANGUAGE`, `AGENT_VOICE_INPUT_UI_POSITION`, `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`, `AGENT_VOICE_INPUT_ASR_BASE_URL`, `AGENT_VOICE_INPUT_REFINER_BASE_URL`, and `AGENT_VOICE_INPUT_FORCE_REFINE`.)*
 
 ### Optional: Multi-Window & `tmux` Session Title Hooks
 

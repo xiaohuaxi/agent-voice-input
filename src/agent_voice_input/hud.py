@@ -4,7 +4,12 @@ from __future__ import annotations
 import os
 from typing import Mapping
 
-from .config import VALID_UI_LANGUAGES, normalize_ui_language
+from .config import (
+    VALID_UI_LANGUAGES,
+    VALID_UI_POSITIONS,
+    normalize_ui_language,
+    normalize_ui_position,
+)
 
 POSIX_LOCALE_VARS: tuple[str, ...] = ("LC_ALL", "LC_MESSAGES", "LANG")
 
@@ -145,9 +150,11 @@ def format_hud_text(
 __all__ = [
     "POSIX_LOCALE_VARS",
     "VALID_UI_LANGUAGES",
+    "VALID_UI_POSITIONS",
     "format_hotkey_label",
     "format_hud_text",
     "is_zh_locale",
     "normalize_ui_language",
+    "normalize_ui_position",
     "resolve_ui_language",
 ]

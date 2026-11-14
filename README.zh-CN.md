@@ -15,7 +15,7 @@
 1. **活跃会话上下文抽取**：自动定位前台终端中的主 Agent 会话，原生支持 `tmux` 分屏焦点窗格识别而无需修改 `~/.tmux.conf`（支持终端/窗格标题标签、运行时会话注册表、macOS Ghostty 分屏 `tty`/`cwd` 直连匹配，以及 Linux `/proc` / macOS `ps` 根会话扫描，严格排除后台 subagent 与相邻分屏干扰），增量提取近期对话与 `git status` 文件名作为上下文参考。
 2. **一阶段语音识别（ASR）**：先在本地做 `-50 dBFS` 静音门控与 `-20 dBFS` 响度归一化，再调用内置云端或本地兼容渠道（支持 `dashscope`、`doubao`、`openrouter` 双协议 STT 与多模态音频、`gemini`、`openai`、`groq`、`siliconflow` 或 `openai-compatible`）。
 3. **二阶段轻量语境精修**：结合抽取出的会话上下文修正同音标识符、大小写与明确口语改口。默认通过本地 Codex CLI（`codex` + `gpt-6-luna`）完成整理，也支持直接切换为 `dashscope`、`volcengine`、`openrouter`、`gemini`、`openai`、`groq`、`siliconflow`、`openai-compatible` 或关闭（`off`；当一阶段已完成多模态单跳整理时默认自动跳过二阶段）。
-4. **焦点安全粘贴**：Windows 与 macOS 均提供不抢焦点的顶部胶囊提示（录音、识别、精修阶段，默认随桌面 UI 语言自动切换中英文提示）；开始录音时锁定原终端窗口/分屏，上屏仅粘贴不自动按回车，中途切走焦点则仅写入剪贴板防串窗。
+4. **焦点安全粘贴**：Windows 与 macOS 均提供不抢焦点的底部悬浮胶囊提示（可配 `"top"` 置顶；录音、识别、精修阶段，默认随桌面 UI 语言自动切换中英文提示）；默认仅在允许的终端窗口前台时响应新热键录音，开始录音时锁定原终端窗口/分屏，上屏仅粘贴不自动按回车，中途切走焦点则仅写入剪贴板防串窗。
 5. **零额外 Python 依赖**：仅使用 Python 3.10+ 标准库与宿主机 `ffmpeg`（WSL2 复用系统自带 `powershell.exe`，macOS 首次启动使用 `/usr/bin/swiftc` 幂等编译缓存原生辅助程序 `mac_shim.swift`），无需额外安装第三方 Python 包。
 
 ---
@@ -58,7 +58,7 @@ EOF
 chmod 600 ~/.config/agent-voice-input/agent-voice-input.env
 ```
 
-如需自定义快捷键（单点切换 `tap_toggle` 或按住说话 `ptt`）、胶囊提示语言（`[ui] language = "auto" | "zh" | "en"`，或环境变量 `AGENT_VOICE_INPUT_UI_LANGUAGE`）、macOS 录音设备（`[audio] macos_device = "default"` 或环境变量 `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`）、渠道、模型或二阶段精修方式，可将 [`config.example.toml`](config.example.toml) 复制为 `~/.config/agent-voice-input/config.toml` 按需修改（全部凭据变量见 [`config.example.env`](config.example.env)）。
+如需自定义快捷键（单点切换 `tap_toggle`、按住说话 `ptt` 或 `only_in_terminals = true | false`）、胶囊提示语言与位置（`[ui] language = "auto" | "zh" | "en"`、`position = "bottom" | "top"`，或环境变量 `AGENT_VOICE_INPUT_UI_LANGUAGE` / `AGENT_VOICE_INPUT_UI_POSITION`）、macOS 录音设备（`[audio] macos_device = "default"` 或环境变量 `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`）、渠道、模型或二阶段精修方式，可将 [`config.example.toml`](config.example.toml) 复制为 `~/.config/agent-voice-input/config.toml` 按需修改（全部凭据变量见 [`config.example.env`](config.example.env)）。
 
 ### 4. 自检与运行
 
@@ -82,7 +82,7 @@ agent-voice-input stop
 
 在 **macOS + Ghostty** 下无需配置终端钩子或高侵入全局权限即可开箱使用：
 
-- **热键与顶部胶囊提示**：默认单点右 Ctrl（`RControl`）开始/结束录音，亦可在配置中设为 `trigger_mode = "ptt"` 按住说话；录音、识别、精修各阶段由顶部不抢焦点的悬浮胶囊按桌面语言自动显示中英文提示。
+- **终端限定热键与底部胶囊提示**：默认单点右 Ctrl（`RControl`）开始/结束录音，亦可在配置中设为 `trigger_mode = "ptt"` 按住说话（默认 `[hotkey] only_in_terminals = true` 仅在前台为终端窗口时启动新录音，录音中途切到其他应用仍可正常停止或取消）；录音、识别、精修各阶段由底部不抢焦点的悬浮胶囊（可配 `[ui] position = "top"`）按桌面语言自动显示中英文提示。
 - **Ghostty 原生分屏直投与防焦点漂移**：按下录音时记录当前聚焦的 Ghostty 分屏 surface，识别完成后通过原生脚本接口直接向该分屏注入 bracketed paste 文本（免辅助功能按键模拟）；若等待期间切到了别的分屏或窗口，仅写入剪贴板不误投。
 - **分屏 TTY 与 `tmux` 免钩子会话自动关联**：自动采集聚焦 Ghostty 分屏的 `tty` 与 `cwd`（连接 `tmux` 时进一步锁定对应客户端的焦点窗格），直接匹配该分屏内正在运行的 `codex`、`claude` 或 `agy` 活跃会话，多分屏并行开发互不串台。
 - **录音设备指定**：默认 `[audio] macos_device = "default"` 跟随系统默认麦克风；也可在 `config.toml` 或环境变量 `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE` 中指定设备序号或名称（可用 `agent-voice-input doctor` 查看可用输入设备）。
@@ -211,7 +211,7 @@ model = "llama-3.3-70b-versatile"
 | `--refiner-model` | `AGENT_VOICE_INPUT_REFINER_MODEL` | 二阶段上游模型 ID |
 | `--refiner-effort`, `--effort` | `AGENT_VOICE_INPUT_REFINER_EFFORT` | 二阶段思考档位（`auto`, `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`） |
 
-*（环境变量同时兼容 `VOICE_INPUT_*` 短前缀，以及 `AGENT_VOICE_INPUT_HOTKEY`、`AGENT_VOICE_INPUT_TRIGGER_MODE`、`AGENT_VOICE_INPUT_UI_LANGUAGE`、`AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`、`AGENT_VOICE_INPUT_ASR_BASE_URL`、`AGENT_VOICE_INPUT_REFINER_BASE_URL`、`AGENT_VOICE_INPUT_FORCE_REFINE` 等覆盖项。）*
+*（环境变量同时兼容 `VOICE_INPUT_*` 短前缀，以及 `AGENT_VOICE_INPUT_HOTKEY`、`AGENT_VOICE_INPUT_TRIGGER_MODE`、`AGENT_VOICE_INPUT_ONLY_IN_TERMINALS`、`AGENT_VOICE_INPUT_UI_LANGUAGE`、`AGENT_VOICE_INPUT_UI_POSITION`、`AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`、`AGENT_VOICE_INPUT_ASR_BASE_URL`、`AGENT_VOICE_INPUT_REFINER_BASE_URL`、`AGENT_VOICE_INPUT_FORCE_REFINE` 等覆盖项。）*
 
 ### 可选：多窗口与 `tmux` 会话标题钩子
 
