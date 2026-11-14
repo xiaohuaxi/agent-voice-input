@@ -33,8 +33,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install tmux for integration tests (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: command -v tmux >/dev/null 2>&1 || brew install tmux
+
       - name: Run offline unit tests
-        run: PYTHONPATH=src python -m unittest discover -s tests -v
+        run: PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests -v
 
   package-check:
     name: Build and verify sdist & wheel

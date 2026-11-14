@@ -72,12 +72,13 @@ def _same_tmux_server(sock_a: str, sock_b: str) -> bool:
     return _norm_same_path(sock_a, sock_b)
 
 
-def _is_live_owned_socket(sock_path: str | Path) -> bool:
+def _is_live_owned_socket(sock_path: str | Path, *, uid: int | None = None) -> bool:
+    eff_uid = os.getuid() if uid is None else uid
     try:
         st = os.stat(sock_path)
     except OSError:
         return False
-    return stat.S_ISSOCK(st.st_mode) and st.st_uid == os.getuid()
+    return stat.S_ISSOCK(st.st_mode) and st.st_uid == eff_uid
 
 
 def preferred_tmux_socket_arg(sock_path: str | Path) -> str:
@@ -99,7 +100,7 @@ def preferred_tmux_socket_arg(sock_path: str | Path) -> str:
 
 
 def _candidate_default_tmux_sockets(env: Mapping[str, str]) -> list[Path]:
-    """Return up to 2-3 candidate default ``tmux-<uid>/default`` socket paths without directory scans."""
+    """Return live owned ``tmux-<uid>/*`` server socket paths (``default`` first, bounded)."""
     uid = os.getuid()
     tmux_tmpdir = (env.get("TMUX_TMPDIR") or "").strip()
     if tmux_tmpdir:
@@ -110,12 +111,36 @@ def _candidate_default_tmux_sockets(env: Mapping[str, str]) -> list[Path]:
 
     out: list[Path] = []
     seen: set[str] = set()
-    for base in base_dirs:
-        cand = Path(base) / f"tmux-{uid}" / "default"
+
+    def _add(cand: Path) -> None:
+        if len(out) >= _MAX_TMUX_SOCKET_TARGETS:
+            return
+        if not _is_live_owned_socket(cand, uid=uid):
+            return
         key = os.path.normpath(str(cand))
         if key not in seen:
             seen.add(key)
             out.append(cand)
+
+    for base in base_dirs:
+        if len(out) >= _MAX_TMUX_SOCKET_TARGETS:
+            break
+        uid_dir = Path(base) / f"tmux-{uid}"
+        _add(uid_dir / "default")
+        try:
+            st = os.stat(uid_dir)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+                continue
+            with os.scandir(uid_dir) as it:
+                extra_names = sorted(
+                    entry.name for entry in it if entry.name != "default"
+                )
+        except OSError:
+            continue
+        for name in extra_names:
+            if len(out) >= _MAX_TMUX_SOCKET_TARGETS:
+                break
+            _add(uid_dir / name)
     return out
 
 
@@ -299,9 +324,10 @@ def probe_tmux_snapshot(
         for def_sock in _candidate_default_tmux_sockets(eff_env):
             if _is_live_owned_socket(def_sock):
                 cand_socks.append(str(def_sock))
-        env_sock = parse_tmux_socket_from_env(eff_env.get("TMUX") or "")
-        if env_sock and _is_live_owned_socket(env_sock):
-            cand_socks.append(env_sock)
+        for env_key in ("TMUX", "AGENT_VOICE_INPUT_TMUX_HINT"):
+            env_sock = parse_tmux_socket_from_env(eff_env.get(env_key) or "")
+            if env_sock and _is_live_owned_socket(env_sock):
+                cand_socks.append(env_sock)
         for es in extra_sockets:
             es_str = str(es or "").strip()
             if es_str and _is_live_owned_socket(es_str):

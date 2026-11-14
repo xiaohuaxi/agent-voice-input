@@ -1267,17 +1267,81 @@ class TmuxRealIsolatedIntegrationTests(unittest.TestCase):
         os.chmod(self.tmux_tmpdir, 0o700)
         self.sock_name = f"t{os.getpid()}_{uuid.uuid4().hex[:6]}"
 
+        self.cache_dir = self.base / "cache"
+        self.cache_dir.mkdir(parents=True)
         self.base_env = {
             **os.environ,
             "HOME": str(self.home),
             "XDG_RUNTIME_DIR": str(self.xdg),
+            "XDG_CACHE_HOME": str(self.cache_dir),
             "TMUX_TMPDIR": str(self.tmux_tmpdir),
             "TERM": "xterm-256color",
             "PYTHONPATH": str(SRC_ROOT),
         }
-        self.base_env.pop("TMUX", None)
-        self.base_env.pop("TMUX_PANE", None)
-        self.base_env.pop("AGENT_VOICE_INPUT_DISABLE_TMUX", None)
+        for _pop_key in (
+            "TMUX",
+            "TMUX_PANE",
+            "AGENT_VOICE_INPUT_DISABLE_TMUX",
+            "AGENT_VOICE_INPUT_TMUX_HINT",
+            "AGENT_VOICE_INPUT_RUNTIME_DIR",
+            "VOICE_INPUT_RUNTIME_DIR",
+        ):
+            self.base_env.pop(_pop_key, None)
+
+        self._pre_host_pids: set[int] = set()
+        if sys.platform == "darwin":
+            _ps_pre = subprocess.run(
+                ["ps", "-u", str(os.getuid()), "-o", "pid="],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            self._pre_host_pids = {
+                int(tok) for tok in _ps_pre.stdout.split() if tok.isdigit()
+            }
+
+        self._host_lsof_violations: list[int] = []
+        _orig_sc_run = subprocess.run
+
+        def _spy_sc_run(cmd, *args, **kwargs):
+            if cmd and os.path.basename(str(cmd[0])) == "lsof" and "-p" in cmd:
+                p_arg = str(cmd[cmd.index("-p") + 1])
+                for tok in p_arg.split(","):
+                    if tok.isdigit() and int(tok) in self._pre_host_pids:
+                        self._host_lsof_violations.append(int(tok))
+            return _orig_sc_run(cmd, *args, **kwargs)
+
+        _spy_patcher = mock.patch("agent_voice_input.session_ctx.subprocess.run", side_effect=_spy_sc_run)
+        _spy_patcher.start()
+        self.addCleanup(_spy_patcher.stop)
+        self.addCleanup(lambda: self.assertEqual(self._host_lsof_violations, [], "lsof queried host external PIDs"))
+
+        _scan_patcher = mock.patch.object(
+            SessionTracker, "_scan_darwin_live_non_tmux_sessions", return_value=[]
+        )
+        _scan_patcher.start()
+        self.addCleanup(_scan_patcher.stop)
+
+        _orig_list_rows = SessionTracker._list_darwin_user_ps_rows
+        _iso_markers = (str(self.base), str(self.tmux_tmpdir))
+
+        def _isolated_darwin_ps_rows(tracker_self: SessionTracker):
+            rows = _orig_list_rows(tracker_self)
+            if rows is None:
+                return None
+            return [
+                row
+                for row in rows
+                if any(m in " ".join(row[4]) for m in _iso_markers)
+            ]
+
+        _rows_patcher = mock.patch.object(
+            SessionTracker, "_list_darwin_user_ps_rows", _isolated_darwin_ps_rows
+        )
+        _rows_patcher.start()
+        self.addCleanup(_rows_patcher.stop)
 
         self._client_proc: subprocess.Popen[bytes] | None = None
         self._master_fd: int | None = None
@@ -1563,14 +1627,13 @@ class TmuxRealIsolatedIntegrationTests(unittest.TestCase):
         after = self._tmux("list-sessions", check=False)
         self.assertNotEqual(after.returncode, 0)
 
-    @unittest.skipUnless(Path("/proc").is_dir(), "Linux /proc required")
     def test_real_tmux_linux_proc_scoping_reopen_stale_uuid_and_empty_pane(self) -> None:
         proj_dir = self.base / "repo"
         proj_dir.mkdir()
         fake_bin = self.base / "fake_bin"
         fake_bin.mkdir()
 
-        # Direct #!{sys.executable} shebang ensures Linux kernel sets /proc/<pid>/comm to 'codex'/'claude'
+        # #!{sys.executable} exercises both Linux /proc comm='codex' and macOS ps 'Python .../fake_bin/codex'
         codex_shim = fake_bin / "codex"
         codex_shim.write_text(
             f"#!{sys.executable}\n"
@@ -1639,6 +1702,34 @@ class TmuxRealIsolatedIntegrationTests(unittest.TestCase):
         assert snap_sw is not None
         self.assertEqual(snap_sw.match.session_id, cx_bg)
 
+        # 1b. Zero-hook custom `tmux -L` server auto-discovery (no $TMUX, no registry, no constructor socket arg!)
+        daemon_env = {k: v for k, v in self.base_env.items() if k not in ("TMUX", "TMUX_PANE")}
+        zero_hook_daemon_tracker = SessionTracker(
+            home_dir=self.home,
+            runtime_dir=self.rt,
+            env=daemon_env,
+        )
+        m_auto_cx = zero_hook_daemon_tracker.resolve_session("Ubuntu")
+        assert m_auto_cx is not None
+        self.assertEqual((m_auto_cx.cli, m_auto_cx.session_id, m_auto_cx.matched_by), ("codex", cx_bg, "tmux_proc_scan"))
+
+        # 1c. Ghostty ForegroundWindow (window_tty=client_tty) with stale pre-tmux outer UUID falls through to active pane!
+        client_tty, client_pid_s = (
+            self._tmux("list-clients", "-F", "#{client_tty}\t#{client_pid}")
+            .stdout.splitlines()[0]
+            .split("\t")
+        )
+        stale_pre_tmux_cx = "0196cafe-cafe-7000-8000-00000000cafe"
+        _write_codex_rollout(self.home, stale_pre_tmux_cx, str(proj_dir), "进tmux前残留外层标题", mtime=time.time() + 300)
+        m_ghostty_tmux = zero_hook_daemon_tracker.resolve_session(
+            f"codex · {stale_pre_tmux_cx}",
+            window_tty=client_tty,
+            window_cwd=str(self.home),
+            window_pid=int(client_pid_s),
+        )
+        assert m_ghostty_tmux is not None
+        self.assertEqual((m_ghostty_tmux.cli, m_ghostty_tmux.session_id), ("codex", cx_bg))
+
         # 2. Hooked Claude exits in %0, then hookless Claude reopens over sticky [#aaaa1111] #{pane_title}
         cl_0 = "aaaa1111-0000-4000-8000-000000000010"
         f_cl_0 = _write_claude_jsonl(self.home, cl_0, str(proj_dir), "左窗格旧Claude对话", mtime=time.time() + 120)
@@ -1684,12 +1775,156 @@ class TmuxRealIsolatedIntegrationTests(unittest.TestCase):
         assert m_reopen is not None
         self.assertEqual((m_reopen.cli, m_reopen.session_id, m_reopen.matched_by), ("claude", cl_reopen, "tmux_proc_scan"))
 
-        # 3. Real /proc stale outer Codex UUID (no live codex process holding fd) falls through to active pane
+        # 3. Stale outer Codex UUID (no live codex process holding fd) falls through to active pane on Linux & macOS
+        #    First terminate %1's codex_shim so only %0's claude is running on this server, while testing dead_cx_real.
         dead_cx_real = "0196dead-dead-7000-8000-deadbeef9999"
         _write_codex_rollout(self.home, dead_cx_real, str(proj_dir), "已退出无进程Codex", mtime=time.time() + 500)
         m_stale_uuid = tracker.resolve_session(f"⠋ repo · Old dead codex · {dead_cx_real}")
         assert m_stale_uuid is not None
         self.assertEqual((m_stale_uuid.cli, m_stale_uuid.session_id), ("claude", cl_reopen))
+
+        # 3b. Hookless Antigravity (agy) holding presence/<cid>.lock in %1 resolves via tmux_proc_scan
+        agy_cid = "3333eeee-4444-4000-8000-000000000077"
+        presence_dir = self.home / ".gemini" / "antigravity-cli" / "presence"
+        presence_dir.mkdir(parents=True, exist_ok=True)
+        agy_lock = presence_dir / f"{agy_cid}.lock"
+        agy_lock.write_text("", encoding="utf-8")
+        agy_logs = self.home / ".gemini" / "antigravity-cli" / "brain" / agy_cid / ".system_generated" / "logs"
+        agy_logs.mkdir(parents=True, exist_ok=True)
+        (agy_logs / "transcript.jsonl").write_text(
+            json.dumps(
+                {
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "content": f"<user_information>\nCommand Working Directory: {proj_dir}\n</user_information>\n<USER_REQUEST>排查WSL与macOS的tmux分屏</USER_REQUEST>",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        agy_shim = fake_bin / "agy"
+        agy_shim.write_text(
+            f"#!{sys.executable}\n"
+            "import fcntl, os, signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+            "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "open(sys.argv[2], 'w').write(str(os.getpid()))\n"
+            "while True:\n"
+            "    time.sleep(0.2)\n",
+            encoding="utf-8",
+        )
+        os.chmod(agy_shim, 0o755)
+        rdy_agy = self.base / "rdy_agy"
+        self._tmux(
+            "respawn-pane",
+            "-k",
+            "-t",
+            "%1",
+            f"{shlex.quote(str(agy_shim))} {shlex.quote(str(agy_lock))} {shlex.quote(str(rdy_agy))}",
+        )
+        self._tmux("select-pane", "-t", "%1")
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline and not rdy_agy.is_file():
+            time.sleep(0.05)
+        self.assertTrue(rdy_agy.is_file())
+        snap_agy = zero_hook_daemon_tracker.sync_session(window_title="Ubuntu")
+        assert snap_agy is not None
+        self.assertEqual((snap_agy.match.cli, snap_agy.match.session_id, snap_agy.match.matched_by), ("agy", agy_cid, "tmux_proc_scan"))
+        self.assertEqual(list(snap_agy.clean_turns), [("user", "排查WSL与macOS的tmux分屏")])
+
+        # 3c. End-to-end WSL2 WslPlatform (hwnd=98765, process="WindowsTerminal", title="Ubuntu", tty="", cwd="", pid=0)
+        #     driving VoiceInputDaemon against the real attached tmux server!
+        from agent_voice_input.asr_providers import AsrContext, AsrResult, BaseAsrProvider
+        from agent_voice_input.config import Config, RefinerConfig
+        from agent_voice_input.daemon import VoiceInputDaemon
+        from agent_voice_input.platform_wsl import WslPlatform
+        from agent_voice_input.refiner import create_refiner
+        import base64
+        import io
+        import wave
+
+        buf_wav = io.BytesIO()
+        with wave.open(buf_wav, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x10\x20" * 6400)
+        wav_b64 = base64.b64encode(buf_wav.getvalue()).decode("ascii")
+
+        mock_win_shim = (
+            "import json, sys\n"
+            f"WAV_B64 = {wav_b64!r}\n"
+            "sys.stdout.write(json.dumps({'event': 'ready', 'ui_culture': 'zh-CN'}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "for raw in sys.stdin:\n"
+            "    req = json.loads(raw)\n"
+            "    cmd = req.get('cmd')\n"
+            "    sid = req.get('seq_id', 0)\n"
+            "    if cmd == 'quit':\n"
+            "        break\n"
+            "    if cmd == 'fg_window':\n"
+            "        rep = {'reply': 'fg_window', 'seq_id': sid, 'hwnd': 98765, 'process': 'WindowsTerminal', 'title': 'Ubuntu'}\n"
+            "    elif cmd == 'rec_start':\n"
+            "        rep = {'reply': 'rec_start', 'seq_id': sid, 'ok': True}\n"
+            "    elif cmd == 'rec_stop':\n"
+            "        rep = {'reply': 'rec_stop', 'seq_id': sid, 'ok': True, 'wav_b64': WAV_B64}\n"
+            "    elif cmd == 'paste':\n"
+            "        rep = {'reply': 'paste', 'seq_id': sid, 'pasted': req.get('target_hwnd') == 98765, 'clipboard': True, 'reason': 'ok', 'fg_process': 'WindowsTerminal'}\n"
+            "    else:\n"
+            "        rep = {'reply': cmd, 'seq_id': sid, 'ok': True}\n"
+            "    sys.stdout.write(json.dumps(rep) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+        )
+
+        class _CaptureAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.contexts: list[AsrContext | None] = []
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                self.contexts.append(context)
+                return AsrResult(text="WSL端tmux全链路验证通过。", provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
+
+        wsl_cfg = Config(refiner=RefinerConfig(provider="off"))
+        wsl_cfg.audio.wsl_source = "winmm"
+        wsl_cfg.audio.tail_drain_sec = 0.0
+        wsl_plat = WslPlatform(
+            wsl_cfg,
+            env=daemon_env,
+            shim_cmd_factory=lambda: [sys.executable, "-u", "-c", mock_win_shim],
+        )
+        cap_asr = _CaptureAsr()
+        wsl_daemon = VoiceInputDaemon(
+            wsl_cfg,
+            env=daemon_env,
+            runtime_dir=self.rt / "wsl_daemon",
+            platform=wsl_plat,
+            asr_provider=cap_asr,
+            refiner=create_refiner(wsl_cfg),
+            tracker=SessionTracker(home_dir=self.home, runtime_dir=self.rt, env=daemon_env),
+        )
+        try:
+            wsl_plat.start_event_listener(lambda _e: None)
+            r_on = wsl_daemon.handle_trigger("toggle")
+            self.assertTrue(r_on["ok"])
+            self.assertEqual(wsl_daemon._origin_win.hwnd, 98765)
+            self.assertEqual(wsl_daemon._origin_win.tty, "")
+            self.assertEqual(wsl_daemon._origin_win.pid, 0)
+            wsl_daemon._last_trigger_ts = -1e9
+            r_off = wsl_daemon.handle_trigger("toggle")
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline and wsl_daemon.last_result.get("seq_id") != r_off["seq_id"]:
+                time.sleep(0.03)
+            self.assertTrue(wsl_daemon.last_result["ok"], wsl_daemon.last_result)
+            self.assertEqual(wsl_daemon.last_result["session_key"], f"agy:{agy_cid}")
+            self.assertTrue(wsl_daemon.last_result["pasted"])
+            assert cap_asr.contexts and cap_asr.contexts[0] is not None
+            self.assertIn("排查WSL与macOS的tmux分屏", cap_asr.contexts[0].dialog_text)
+        finally:
+            wsl_daemon.close()
 
         # 4. Empty shell pane %2 while unbound disk sessions & neighbor pane agents exist -> MUST return None
         self._tmux("split-window", "-v", "-t", "s0", "bash --norc --noprofile")
@@ -1898,6 +2133,493 @@ class DarwinTmuxGhosttyUnitTests(unittest.TestCase):
                         window_pid=4000,
                     )
                 )
+
+    def test_interpreter_unwrapping_anti_self_match_wsl_same_cwd_clients_and_daemon_tmux_env(self) -> None:
+        from agent_voice_input import cli as cli_mod
+        from agent_voice_input.config import Config
+        from agent_voice_input.platform_macos import MacOSPlatform, _normalize_title_for_drift
+        from agent_voice_input.platform_wsl import ForegroundWindow
+        from agent_voice_input.session_ctx import _match_cli_process
+
+        # 1. Interpreter unwrapping (Python/Node/Bun) vs strict anti-self-match on session-hook child args
+        self.assertEqual(
+            _match_cli_process("Python", ["/opt/homebrew/Resources/Python.app/Contents/MacOS/Python", "/tmp/fake_bin/claude", "--resume"]),
+            ("claude", ["/tmp/fake_bin/claude", "--resume"]),
+        )
+        self.assertEqual(
+            _match_cli_process("python3.12", ["python3.12", "-u", "/usr/local/bin/codex"]),
+            ("codex", ["/usr/local/bin/codex"]),
+        )
+        self.assertEqual(
+            _match_cli_process("node", ["node", "--no-warnings", "-r", "dotenv/config", "/opt/@openai/codex/bin/codex.js"]),
+            ("codex", ["/opt/@openai/codex/bin/codex.js"]),
+        )
+        for non_cli_argv in (
+            ["python3", "/usr/local/bin/agent-voice-input", "session-hook", "--cli", "claude"],
+            ["Python", "-m", "agent_voice_input.cli", "session-hook", "--cli", "claude"],
+            ["python3", "-c", "import sys; print('claude')", "claude"],
+            ["node", "/srv/other-tool.js", "--cli", "claude", "codex", "agy"],
+        ):
+            self.assertEqual(
+                _match_cli_process(os.path.basename(non_cli_argv[0]), non_cli_argv)[0],
+                None,
+                f"must not misclassify {non_cli_argv!r} as an interactive agent CLI",
+            )
+
+        # 2. WSL2 multi-client tmux selection in SAME repo (window_tty='', window_pid=0):
+        #    Shared _dir_basename_in_title ('shared-app') MUST NOT drown out exact [#tag] or pane_title on Client 1!
+        shared_cwd = "/home/xhx/repos/shared-app"
+        wsl_multi_snap = TmuxServerSnapshot(
+            clients=(
+                TmuxClientInfo(
+                    session_id="$0",
+                    window_id="@0",
+                    pane_id="%0",
+                    activity=1000,
+                    client_tty="/dev/pts/1",
+                    client_pid=301,
+                    focused=False,
+                    socket_path="/tmp/tmux-1000/default",
+                ),
+                TmuxClientInfo(
+                    session_id="$1",
+                    window_id="@1",
+                    pane_id="%1",
+                    activity=2000,
+                    client_tty="/dev/pts/2",
+                    client_pid=302,
+                    focused=True,
+                    socket_path="/tmp/tmux-1000/default",
+                ),
+            ),
+            panes=(
+                TmuxPaneInfo(
+                    session_id="$0",
+                    window_id="@0",
+                    window_active=True,
+                    pane_id="%0",
+                    pane_active=True,
+                    pane_pid=401,
+                    pane_tty="/dev/pts/3",
+                    socket_path="/tmp/tmux-1000/default",
+                    current_path=shared_cwd,
+                    pane_title="claude · ~/repos/shared-app [#aaaa1111]",
+                ),
+                TmuxPaneInfo(
+                    session_id="$1",
+                    window_id="@1",
+                    window_active=True,
+                    pane_id="%1",
+                    pane_active=True,
+                    pane_pid=402,
+                    pane_tty="/dev/pts/4",
+                    socket_path="/tmp/tmux-1000/default",
+                    current_path=shared_cwd,
+                    pane_title="claude · ~/repos/shared-app [#bbbb2222]",
+                ),
+            ),
+        )
+        # Even when truncated outer title only carries [#aaaa1111] + shared repo name, Client 1 (%0) wins over higher-activity Client 2!
+        picked_tok = SessionTracker._select_active_tmux_target(
+            wsl_multi_snap, "0:claude* shared-app [#aaaa1111]", window_tty="", window_pid=0
+        )
+        assert picked_tok is not None
+        self.assertEqual(picked_tok[1].pane_id, "%0")
+
+        # Full pane_title substring in set-titles window title also picks Client 1 (%0) despite shared_cwd on Client 2
+        picked_pt = SessionTracker._select_active_tmux_target(
+            wsl_multi_snap, '0:0.0 "claude · ~/repos/shared-app [#aaaa1111]"', window_tty="", window_pid=0
+        )
+        assert picked_pt is not None
+        self.assertEqual(picked_pt[1].pane_id, "%0")
+
+        # 3. macOS inline spinner rotation inside tmux set-titles ('0:0.0 claude "⠋ ..."') does NOT trigger focus_changed
+        self.assertEqual(
+            _normalize_title_for_drift('0:0.0 claude "⠋ shared-app · Fix bug"'),
+            _normalize_title_for_drift('0:0.0 claude "⠸ shared-app · Fix bug"'),
+        )
+        self.assertEqual(
+            _normalize_title_for_drift('0:0.0 claude "⠋ shared-app · Fix bug"'),
+            _normalize_title_for_drift('0:0.0 claude "shared-app · Fix bug"'),
+        )
+        self.assertNotEqual(
+            _normalize_title_for_drift('0:0.0 claude "⠋ repo-a"'),
+            _normalize_title_for_drift('0:0.1 claude "⠋ repo-b"'),
+        )
+
+        # 4. cli._cmd_start strips TMUX_PANE and moves TMUX -> AGENT_VOICE_INPUT_TMUX_HINT;
+        #    probe_tmux_snapshot still discovers custom -S socket via AGENT_VOICE_INPUT_TMUX_HINT,
+        #    while MacOSPlatform in once-mode strips TMUX_PANE before invoking tmux!
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rt = root / "rt"
+            rt.mkdir()
+            captured_popen_env: dict[str, str] = {}
+
+            class _DummyDaemonProc:
+                def poll(self) -> None:
+                    return None
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "HOME": str(root),
+                        "XDG_RUNTIME_DIR": str(root / "xdg"),
+                        "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                        "TMUX": "/custom/sock/s1,999,0",
+                        "TMUX_PANE": "%7",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    cli_mod,
+                    "send_control_command",
+                    side_effect=[{"ok": False}, {"ok": True, "pid": 4321}],
+                ),
+                mock.patch.object(
+                    cli_mod.subprocess,
+                    "Popen",
+                    side_effect=lambda *a, **kw: (captured_popen_env.update(kw.get("env") or {}) or _DummyDaemonProc()),
+                ),
+                mock.patch("sys.stdout"),
+            ):
+                ns = cli_mod._build_parser().parse_args(["start"])
+                rc_start = cli_mod._cmd_start(ns, dict(os.environ))
+            self.assertEqual(rc_start, 0)
+            self.assertNotIn("TMUX", captured_popen_env)
+            self.assertNotIn("TMUX_PANE", captured_popen_env)
+            self.assertEqual(captured_popen_env.get("AGENT_VOICE_INPUT_TMUX_HINT"), "/custom/sock/s1,999,0")
+
+            import socket as sock_mod
+
+            short_dir = Path(tempfile.mkdtemp(prefix="avi_h_", dir="/tmp"))
+            srv_sock = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+            try:
+                custom_sock = short_dir / "ext.sock"
+                srv_sock.bind(str(custom_sock))
+                probed_cmds: list[list[str]] = []
+
+                def fake_tmux_probe(cmd, **kw):
+                    probed_cmds.append(list(cmd))
+                    return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+                with (
+                    mock.patch("agent_voice_input._tmux.resolve_tmux_bin", return_value="/usr/bin/tmux"),
+                    mock.patch("subprocess.run", side_effect=fake_tmux_probe),
+                ):
+                    probe_tmux_snapshot(
+                        env={
+                            "TMUX_TMPDIR": str(root / "empty_t"),
+                            "AGENT_VOICE_INPUT_TMUX_HINT": f"{custom_sock},999,0",
+                        }
+                    )
+                self.assertEqual(len(probed_cmds), 1)
+                self.assertEqual(probed_cmds[0][:3], ["/usr/bin/tmux", "-S", preferred_tmux_socket_arg(custom_sock)])
+            finally:
+                srv_sock.close()
+                shutil.rmtree(short_dir, ignore_errors=True)
+
+            # Verify MacOSPlatform once-mode strips TMUX_PANE when running display-message / paste-buffer
+            seen_tmux_envs: list[dict[str, str]] = []
+            cur_osa_title = ['0:0.0 "⠋ repo"']
+
+            def fake_mac_run(cmd, *, env=None, **kw):
+                exe = Path(cmd[0]).name
+                if exe == "pbcopy":
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                if exe == "tmux":
+                    seen_tmux_envs.append(dict(env or {}))
+                    return subprocess.CompletedProcess(cmd, 0, "pane-ok\n" if "display-message" in cmd else "", "")
+                if exe == "osascript":
+                    return subprocess.CompletedProcess(
+                        cmd, 0, f"iTerm2\x1fcom.googlecode.iterm2\x1f500\x1f{cur_osa_title[0]}\n", ""
+                    )
+                raise AssertionError(f"unexpected {cmd}")
+
+            with (
+                mock.patch("agent_voice_input.platform_macos.shutil.which", return_value="/usr/bin/mock"),
+                mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=fake_mac_run),
+            ):
+                mplat = MacOSPlatform(
+                    Config(),
+                    env={"HOME": str(root), "TMUX": "/tmp/tmux-501/default,10,0", "TMUX_PANE": "%9"},
+                    cache_dir=root / "cache",
+                )
+                origin_w = mplat.get_foreground_window()
+                cur_osa_title[0] = '0:0.0 "⠸ repo"'
+                p_out = mplat.deliver_text("测试", seq_id=1, origin_window=origin_w)
+            self.assertTrue(p_out.pasted)
+            self.assertEqual(p_out.reason, "tmux")
+            self.assertTrue(seen_tmux_envs)
+            for t_env in seen_tmux_envs:
+                self.assertNotIn("TMUX_PANE", t_env)
+
+            # Foreground `agent-voice-input daemon` also sanitizes TMUX / TMUX_PANE via _sanitize_daemon_tmux_env
+            captured_fg_daemon_env: dict[str, str] = {}
+
+            class _DummyVoiceDaemon:
+                def __init__(self, _cfg: object, *, env: dict[str, str]) -> None:
+                    captured_fg_daemon_env.update(env)
+
+                def serve_forever(self) -> None:
+                    return None
+
+            cfg_toml = root / "d.toml"
+            cfg_toml.write_text('[refiner]\nprovider = "off"\n', encoding="utf-8")
+            with (
+                mock.patch.object(
+                    cli_mod,
+                    "load_config",
+                    return_value=(
+                        Config(),
+                        {
+                            "HOME": str(root),
+                            "TMUX": "/custom/sock/fg,888,0",
+                            "TMUX_PANE": "%4",
+                        },
+                    ),
+                ),
+                mock.patch.object(cli_mod, "VoiceInputDaemon", _DummyVoiceDaemon),
+            ):
+                rc_fg = cli_mod.main(["daemon", "--config", str(cfg_toml)])
+            self.assertEqual(rc_fg, 0)
+            self.assertNotIn("TMUX", captured_fg_daemon_env)
+            self.assertNotIn("TMUX_PANE", captured_fg_daemon_env)
+            self.assertEqual(
+                captured_fg_daemon_env.get("AGENT_VOICE_INPUT_TMUX_HINT"),
+                "/custom/sock/fg,888,0",
+            )
+
+    def test_darwin_lsof_unification_headless_filters_stale_claude_fallthrough_and_socket_quota(self) -> None:
+        import socket as sock_mod
+        from agent_voice_input._tmux import _candidate_default_tmux_sockets
+        from agent_voice_input.session_ctx import (
+            _classify_interactive_cli,
+            _find_storage_session_for_cli,
+            _is_headless_cli_invocation,
+            _query_pids_open_files_and_cwds,
+        )
+
+        # 1. [P1-4] Desktop background headless CLI invocations MUST be filtered out
+        for cli_k, hl_argv in (
+            ("codex", ["codex", "-c", 'forced_login_method="chatgpt"', "exec-server", "--concurrent-requests", "32"]),
+            ("agy", ["agy", "acp", "--agent", "llm-chat-session"]),
+            ("agy", ["agy", "--agent", "llm-chat-session", "acp"]),
+            ("claude", ["claude", "mcp", "serve"]),
+            ("claude", ["claude", "--settings", "/tmp/s.json", "mcp", "serve"]),
+        ):
+            self.assertTrue(_is_headless_cli_invocation(cli_k, hl_argv), f"expected headless for {hl_argv!r}")
+            self.assertIsNone(_classify_interactive_cli(hl_argv[0], hl_argv))
+
+        # Interactive sessions (including --agent mcp / -c / -i) MUST remain interactive
+        for cli_k, ok_argv in (
+            ("codex", ["codex", "-c", 'model="gpt-5"']),
+            ("agy", ["agy", "--agent", "mcp"]),
+            ("agy", ["agy", "-i", "explain"]),
+            ("claude", ["claude", "--agent", "mcp"]),
+            ("claude", ["claude", "-c"]),
+        ):
+            self.assertFalse(_is_headless_cli_invocation(cli_k, ok_argv), f"expected interactive for {ok_argv!r}")
+            self.assertEqual(_classify_interactive_cli(ok_argv[0], ok_argv), cli_k)
+
+        # 2. [P2-1] _candidate_default_tmux_sockets skips missing default & non-socket dummy files before quota (8)
+        short_base = Path(tempfile.mkdtemp(prefix="avi_q_", dir="/tmp"))
+        srv_sock = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+        try:
+            uid_dir = short_base / f"tmux-{os.getuid()}"
+            uid_dir.mkdir(mode=0o700)
+            for idx in range(10):
+                (uid_dir / f"a_dummy_{idx:02d}").write_text("stale", encoding="utf-8")
+            live_sock = uid_dir / "z_live_named"
+            srv_sock.bind(str(live_sock))
+            found_socks = _candidate_default_tmux_sockets({"TMUX_TMPDIR": str(short_base)})
+            self.assertEqual(found_socks, [live_sock])
+        finally:
+            srv_sock.close()
+            shutil.rmtree(short_base, ignore_errors=True)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            proj_tmux = home / "repos" / "tmux-svc"
+            proj_outer_dead = home / "repos" / "outer-dead"
+            proj_other_live = home / "repos" / "other-live"
+            proj_cd_target = home / "repos" / "cd-target"
+            for d in (rt, proj_tmux, proj_outer_dead, proj_other_live, proj_cd_target):
+                d.mkdir(parents=True)
+
+            now = time.time()
+            cl_tmux_sid = "1111aaaa-2222-4333-8444-555555550001"
+            cl_dead_sid = "2222bbbb-3333-4444-8555-666666660002"
+            cl_other_sid = "3333cccc-4444-4555-8666-777777770003"
+            _write_claude_jsonl(home, cl_tmux_sid, str(proj_tmux), "tmux pane active claude", now - 5)
+            _write_claude_jsonl(home, cl_dead_sid, str(proj_outer_dead), "dead outer claude", now)
+            _write_claude_jsonl(home, cl_other_sid, str(proj_other_live), "other live non-tmux claude", now - 60)
+
+            cx_cd_sid = "4444dddd-5555-4666-8777-888888880004"
+            cx_cd_jf = _write_codex_rollout(home, cx_cd_sid, str(proj_cd_target), "codex -C cd-target", now - 30)
+
+            agy_cid = "5555eeee-6666-4777-8888-999999990005"
+            lock_dir = home / ".gemini" / "antigravity-cli" / "presence"
+            lock_dir.mkdir(parents=True)
+            agy_lock = lock_dir / f"{agy_cid}.lock"
+            agy_lock.write_text("", encoding="utf-8")
+            os.utime(agy_lock, (now - 45, now - 45))
+
+            snap = TmuxServerSnapshot(
+                clients=(
+                    TmuxClientInfo(
+                        session_id="$0",
+                        window_id="@0",
+                        pane_id="%0",
+                        activity=int(now),
+                        client_tty="/dev/ttys002",
+                        client_pid=4100,
+                        focused=True,
+                        socket_path="/private/tmp/tmux-501/default",
+                    ),
+                ),
+                panes=(
+                    TmuxPaneInfo(
+                        session_id="$0",
+                        window_id="@0",
+                        window_active=True,
+                        pane_id="%0",
+                        pane_active=True,
+                        pane_pid=5100,
+                        pane_tty="/dev/ttys020",
+                        socket_path="/private/tmp/tmux-501/default",
+                        current_path=str(proj_tmux),
+                        pane_title="zsh",
+                    ),
+                ),
+            )
+
+            # 3. [P1-3a + P2-3] Unified lsof flags (-b -w -d cwd,0-999) + codex -C /other_repo FD priority when cands==0
+            seen_lsof_cmds: list[list[str]] = []
+
+            def fake_lsof_and_ps(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[bytes]:
+                exe = os.path.basename(cmd[0])
+                if exe == "lsof":
+                    seen_lsof_cmds.append(list(cmd))
+                    pid_arg = cmd[cmd.index("-p") + 1] if "-p" in cmd else ""
+                    if pid_arg == "7777":
+                        out = f"p7777\nfcwd\nn{proj_tmux}\nf15\nn{cx_cd_jf}\n"
+                        return subprocess.CompletedProcess(cmd, 0, out.encode("utf-8"), b"")
+                    if pid_arg == "5150":
+                        return subprocess.CompletedProcess(cmd, 0, f"p5150\nfcwd\nn{proj_tmux}\n".encode("utf-8"), b"")
+                    if "8101" in pid_arg:
+                        out = (
+                            f"p8101\nfcwd\nn{proj_other_live}\n"
+                            f"p8102\nfcwd\nn{proj_cd_target}\nf12\nn{cx_cd_jf}\n"
+                            f"p8103\nfcwd\nn{proj_other_live}\nf9\nn{agy_lock}\n"
+                        )
+                        return subprocess.CompletedProcess(cmd, 0, out.encode("utf-8"), b"")
+                    return subprocess.CompletedProcess(cmd, 1, b"", b"")
+                if exe == "ps" and "-t" in cmd:
+                    t_arg = cmd[cmd.index("-t") + 1]
+                    if t_arg == "ttys020":
+                        return subprocess.CompletedProcess(
+                            cmd, 0, b"5100 4099 Ss ttys020 -zsh\n5150 5100 S+ ttys020 claude\n", b""
+                        )
+                    return subprocess.CompletedProcess(cmd, 1, b"", b"")
+                if exe == "ps" and "-u" in cmd:
+                    ps_u = (
+                        "5150 5100 S+ ttys020 claude\n"
+                        "8099 1 Ss ?? claude\n"
+                        "8100 1 S ttys099 codex -c forced_login_method=\"chatgpt\" exec-server\n"
+                        "8101 8000 S+ ttys030 claude\n"
+                        "8102 8001 S+ ttys031 codex\n"
+                        "8103 8002 S+ ttys032 agy\n"
+                        "8104 8003 S+ ttys033 agy acp --agent llm-chat-session\n"
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, ps_u.encode("utf-8"), b"")
+                return subprocess.CompletedProcess(cmd, 1, b"", b"")
+
+            with mock.patch("agent_voice_input.session_ctx.subprocess.run", side_effect=fake_lsof_and_ps):
+                files_map, cwd_map = _query_pids_open_files_and_cwds([7777], None)
+                self.assertEqual(
+                    seen_lsof_cmds[-1][:8],
+                    ["lsof", "-b", "-n", "-P", "-a", "-w", "-d", "cwd,0-999"],
+                )
+                self.assertEqual(cwd_map.get(7777), str(proj_tmux))
+                self.assertIn(str(cx_cd_jf), files_map.get(7777, []))
+
+                # Codex -C /cd-target running in shell CWD proj_tmux (where _collect_codex_storage_matches == [])
+                hit_cd = _find_storage_session_for_cli(
+                    "codex",
+                    home=home,
+                    proc_root=None,
+                    eff_cwd=str(proj_tmux),
+                    window_title="",
+                    agent_pid=7777,
+                    matched_by="tmux_proc_scan",
+                )
+                assert hit_cd is not None
+                self.assertEqual(hit_cd.session_id, cx_cd_sid)
+
+                # Offline mock test of _scan_darwin_live_non_tmux_sessions: excludes tmux ttys020 & headless workers
+                orig_is_dir = Path.is_dir
+                with mock.patch.object(
+                    Path,
+                    "is_dir",
+                    autospec=True,
+                    side_effect=lambda p: False if p == Path("/proc") else orig_is_dir(p),
+                ):
+                    darwin_tracker = SessionTracker(
+                        runtime_dir=rt,
+                        home_dir=home,
+                        proc_root=Path("/proc"),
+                        tmux_probe_fn=lambda: snap,
+                    )
+                    non_tmux_hits = {
+                        m.session_key: m
+                        for m in darwin_tracker._scan_darwin_live_non_tmux_sessions(snap)
+                    }
+                    self.assertEqual(
+                        set(non_tmux_hits.keys()),
+                        {f"claude:{cl_other_sid}", f"codex:{cx_cd_sid}", f"agy:{agy_cid}"},
+                    )
+
+                    # 4. [P1-2] Stale outer dead claude UUID (proj_outer_dead) with window_tty="":
+                    #    Even though claude runs inside tmux (ttys020 -> proj_tmux) AND outside tmux
+                    #    in a DIFFERENT repo (ttys030 -> proj_other_live), neither matches proj_outer_dead,
+                    #    so resolve_session MUST NOT resurrect cl_dead_sid — it falls through to active tmux pane!
+                    m_fallthrough = darwin_tracker.resolve_session(
+                        f"claude · outer-dead · {cl_dead_sid}",
+                        window_tty="",
+                        window_pid=0,
+                    )
+                    assert m_fallthrough is not None
+                    self.assertEqual(
+                        (m_fallthrough.cli, m_fallthrough.session_id, m_fallthrough.matched_by),
+                        ("claude", cl_tmux_sid, "tmux_proc_scan"),
+                    )
+
+            # 5. [P1-3b] When batched lsof fails/times out on 12 live processes, NO 12x serial lsof cascade occurs!
+            timeout_lsof_calls: list[list[str]] = []
+
+            def fake_lsof_timeout(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[bytes]:
+                exe = os.path.basename(cmd[0])
+                if exe == "ps" and "-u" in cmd:
+                    rows_12 = "".join(f"{9100 + i} 9000 S+ ttys0{40 + i} claude\n" for i in range(12))
+                    return subprocess.CompletedProcess(cmd, 0, rows_12.encode("utf-8"), b"")
+                if exe == "lsof":
+                    timeout_lsof_calls.append(list(cmd))
+                    raise subprocess.TimeoutExpired(cmd, 1.5)
+                return subprocess.CompletedProcess(cmd, 1, b"", b"")
+
+            with mock.patch("agent_voice_input.session_ctx.subprocess.run", side_effect=fake_lsof_timeout):
+                t_cascade = SessionTracker(
+                    runtime_dir=rt,
+                    home_dir=home,
+                    proc_root=root / "noproc",
+                    tmux_probe_fn=lambda: snap,
+                )
+                self.assertEqual(t_cascade._scan_darwin_live_non_tmux_sessions(snap), [])
+            self.assertEqual(len(timeout_lsof_calls), 1, "batched lsof timeout must not cascade into per-PID lsof")
 
 
 if __name__ == "__main__":

@@ -902,6 +902,14 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                             cmd, 0, b"4200 600 Ss ttys022 -zsh\n4202 4200 S+ ttys022 /Users/dev/.local/bin/codex\n", b""
                         )
                     return subprocess.CompletedProcess(cmd, 1, b"", b"")
+                if exe == "lsof" and "-p" in cmd:
+                    self.assertIs(stdin, subprocess.DEVNULL)
+                    pid_arg = cmd[cmd.index("-p") + 1]
+                    if pid_arg == "4101":
+                        return subprocess.CompletedProcess(
+                            cmd, 0, f"p4101\nfcwd\nn{proj_a}\nf12\nn{f_a}\n".encode("utf-8"), b""
+                        )
+                    return subprocess.CompletedProcess(cmd, 1, b"", b"")
                 if exe == "git":
                     return subprocess.CompletedProcess(cmd, 1, b"", b"")
                 raise AssertionError(f"unexpected cmd: {cmd}")

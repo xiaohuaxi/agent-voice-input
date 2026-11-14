@@ -17,6 +17,8 @@ SOUND_MAP = {"start": "Tink.aiff", "stop": "Pop.aiff", "focus": "Glass.aiff", "e
 
 _APPLE_SEP = "\x1f"
 _SPINNER_PREFIX_RE = re.compile(r"^[\u2800-\u28ff✳✢✶✻✽·•\s]+")
+_SPINNER_INLINE_RE = re.compile(r"[\u2800-\u28ff✳✢✶✻✽]+\s*")
+_MULTI_WS_RE = re.compile(r"\s+")
 _AVF_AUDIO_DEV_RE = re.compile(r"\[(\d+)\]\s+(.+?)\s*$")
 _OSA_CODE_RE = re.compile(r"\((-?\d+)\)")
 
@@ -247,7 +249,9 @@ def run_macos_key_test(
 
 
 def _normalize_title_for_drift(title: str) -> str:
-    return _SPINNER_PREFIX_RE.sub("", title.strip())
+    cleaned = _SPINNER_PREFIX_RE.sub("", title.strip())
+    cleaned = _SPINNER_INLINE_RE.sub("", cleaned)
+    return _MULTI_WS_RE.sub(" ", cleaned).strip()
 
 
 def _summarize_osascript_error(stderr: str, *, kind: str) -> str:
@@ -427,10 +431,11 @@ class MacOSPlatform(JsonlShimMixin):
 
     def _append_tmux_pane_title(self, win_title: str, app_name: str) -> str:
         if self.env.get("TMUX") and self._which("tmux") and (not app_name or app_name.lower() in MACOS_TERMINALS):
+            tmux_env = {k: v for k, v in self.env.items() if k != "TMUX_PANE"}
             try:
                 tp = subprocess.run(
                     ["tmux", "display-message", "-p", "#{pane_title}"],
-                    stdin=subprocess.DEVNULL, capture_output=True, text=True, env=self.env, timeout=1.5, check=False,
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, env=tmux_env, timeout=1.5, check=False,
                 )
                 if tp.returncode == 0 and tp.stdout.strip():
                     return f"{win_title} {tp.stdout.strip()}".strip()
@@ -556,13 +561,14 @@ class MacOSPlatform(JsonlShimMixin):
                 self.beep("focus")
             return PasteOutcome(False, clip_ok, "focus_changed" if clip_ok else "clipboard_failed", fg.process)
         if self._which("tmux") and self.env.get("TMUX"):
+            tmux_env = {k: v for k, v in self.env.items() if k != "TMUX_PANE"}
             try:
                 lb = subprocess.run(
-                    ["tmux", "load-buffer", "-"], input=text, text=True, env=self.env,
+                    ["tmux", "load-buffer", "-"], input=text, text=True, env=tmux_env,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, check=False,
                 )
                 pb = subprocess.run(
-                    ["tmux", "paste-buffer", "-p"], stdin=subprocess.DEVNULL, env=self.env,
+                    ["tmux", "paste-buffer", "-p"], stdin=subprocess.DEVNULL, env=tmux_env,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, check=False,
                 )
                 if lb.returncode == 0 and pb.returncode == 0:

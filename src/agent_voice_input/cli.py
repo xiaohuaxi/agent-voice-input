@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse, json, os, signal, subprocess, sys, time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -228,6 +229,15 @@ def _cmd_once(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> int
             plat.close()
 
 
+def _sanitize_daemon_tmux_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Strip ``TMUX`` / ``TMUX_PANE`` from global daemon env while keeping socket discovery hint."""
+    out = dict(env)
+    out.pop("TMUX_PANE", None)
+    if raw_tmux := out.pop("TMUX", "").strip():
+        out.setdefault("AGENT_VOICE_INPUT_TMUX_HINT", raw_tmux)
+    return out
+
+
 def _cmd_start(args: argparse.Namespace, env: dict[str, str]) -> int:
     rt_dir = get_runtime_dir(env, create=True)
     try:
@@ -237,7 +247,7 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str]) -> int:
     except Exception:
         pass
     src_root = Path(__file__).resolve().parents[1]
-    child_env = dict(os.environ)
+    child_env = _sanitize_daemon_tmux_env(os.environ)
     if (src_root / "agent_voice_input").is_dir():
         prev_pp = child_env.get("PYTHONPATH", "")
         child_env["PYTHONPATH"] = f"{src_root}{os.pathsep}{prev_pp}" if prev_pp else str(src_root)
@@ -358,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cfg, env = load_config(config_path=getattr(args, "config", None), cli_overrides=ov)
         if args.subcmd == "daemon":
-            VoiceInputDaemon(cfg, env=env).serve_forever()
+            VoiceInputDaemon(cfg, env=_sanitize_daemon_tmux_env(env)).serve_forever()
             return 0
         if args.subcmd == "start":
             return _cmd_start(args, env)
