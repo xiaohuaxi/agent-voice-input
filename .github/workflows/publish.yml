@@ -13,6 +13,7 @@ jobs:
   test-and-build:
     name: Run unit tests and build distributions
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -75,6 +76,7 @@ jobs:
     name: Publish to PyPI via Trusted Publisher OIDC
     needs: test-and-build
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     environment:
       name: pypi
       url: https://pypi.org/p/agent-voice-input

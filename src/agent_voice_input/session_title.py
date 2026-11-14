@@ -78,11 +78,12 @@ def _find_tty(start_pid: int, proc_root: Path) -> str:
                 check=False,
             )
             tty = r.stdout.decode("utf-8", errors="ignore").strip()
-            return (
-                (tty if tty.startswith("/dev/") else f"/dev/{tty}")
-                if tty and tty not in ("?", "??")
-                else ""
-            )
+            if not tty or tty in ("?", "??", "-"):
+                return ""
+            for cand in ((tty,) if tty.startswith("/dev/") else (f"/dev/{tty}", f"/dev/tty{tty}")):
+                if os.path.exists(cand):
+                    return cand
+            return ""
         except (OSError, subprocess.SubprocessError):
             return ""
     info0 = _proc_info(proc_root / str(start_pid))

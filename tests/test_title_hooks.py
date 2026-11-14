@@ -25,6 +25,7 @@ from agent_voice_input.session_ctx import SessionTracker  # noqa: E402
 
 
 def _drain_pty_master(master_fd: int) -> bytes:
+    os.set_blocking(master_fd, False)
     chunks: list[bytes] = []
     while True:
         r, _, _ = select.select([master_fd], [], [], 0.05)
@@ -397,20 +398,20 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
             hook_sh = str(REPO_ROOT / "integrations" / "claude" / "voice-title.sh")
             bin_cli = str(REPO_ROOT / "bin" / "agent-voice-input")
 
-            # 1. Run integrations/claude/voice-title.sh in an isolated session attached to a dedicated pty
-            master_fd, slave_fd = pty.openpty()
-            try:
+            def _run_with_fresh_pty(cmd: list[str], raw_payload: bytes) -> tuple[subprocess.CompletedProcess[bytes], bytes]:
+                master_fd, slave_fd = pty.openpty()
+                os.set_blocking(master_fd, False)
+                r_pipe, w_pipe = os.pipe()
+                os.write(w_pipe, raw_payload)
+                os.close(w_pipe)
+
                 def _attach_ctty() -> None:
                     os.setsid()
                     fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
 
-                payload = json.dumps({"session_id": sid, "cwd": str(proj)}).encode("utf-8")
-                r_pipe, w_pipe = os.pipe()
-                os.write(w_pipe, payload)
-                os.close(w_pipe)
                 try:
                     proc = subprocess.run(
-                        ["bash", hook_sh],
+                        cmd,
                         stdin=r_pipe,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
@@ -422,64 +423,36 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
                     )
                 finally:
                     os.close(r_pipe)
-
-                self.assertEqual(proc.returncode, 0)
-                self.assertEqual(proc.stdout, b"")
-                pty_bytes = _drain_pty_master(master_fd)
-                self.assertEqual(pty_bytes.decode("utf-8"), "\033]2;claude · ~/work/my-svc [#a1b2c3d4]\007")
-
-                # 2. Subagent payload (agent_id set) MUST NOT emit OSC 2 or create registry
-                sub_payload = json.dumps(
-                    {"session_id": sub_sid, "agent_id": "agent-xyz", "cwd": str(proj)}
-                ).encode("utf-8")
-                r_pipe2, w_pipe2 = os.pipe()
-                os.write(w_pipe2, sub_payload)
-                os.close(w_pipe2)
+                    os.close(slave_fd)
                 try:
-                    proc_sub = subprocess.run(
-                        ["bash", hook_sh],
-                        stdin=r_pipe2,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        env=env,
-                        preexec_fn=_attach_ctty,
-                        pass_fds=(slave_fd,),
-                        timeout=5,
-                        check=False,
-                    )
+                    return proc, _drain_pty_master(master_fd)
                 finally:
-                    os.close(r_pipe2)
-                self.assertEqual(proc_sub.returncode, 0)
-                self.assertEqual(_drain_pty_master(master_fd), b"")
+                    os.close(master_fd)
 
-                # 3. `agent-voice-input session-hook --cli auto` detects session_id and updates pty cleanly
-                auto_in = json.dumps({"session_id": sid, "cwd": str(proj)}).encode("utf-8")
-                r_pipe3, w_pipe3 = os.pipe()
-                os.write(w_pipe3, auto_in)
-                os.close(w_pipe3)
-                try:
-                    proc_auto = subprocess.run(
-                        [bin_cli, "session-hook", "--cli", "auto"],
-                        stdin=r_pipe3,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        env=env,
-                        preexec_fn=_attach_ctty,
-                        pass_fds=(slave_fd,),
-                        timeout=5,
-                        check=False,
-                    )
-                finally:
-                    os.close(r_pipe3)
-                self.assertEqual(proc_auto.returncode, 0)
-                self.assertEqual(proc_auto.stdout, b"")
-                self.assertEqual(
-                    _drain_pty_master(master_fd).decode("utf-8"),
-                    "\033]2;claude · ~/work/my-svc [#a1b2c3d4]\007",
-                )
-            finally:
-                os.close(master_fd)
-                os.close(slave_fd)
+            # 1. Run integrations/claude/voice-title.sh in an isolated session attached to a dedicated pty
+            payload = json.dumps({"session_id": sid, "cwd": str(proj)}).encode("utf-8")
+            proc, pty_bytes = _run_with_fresh_pty(["bash", hook_sh], payload)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, b"")
+            self.assertEqual(pty_bytes.decode("utf-8"), "\033]2;claude · ~/work/my-svc [#a1b2c3d4]\007")
+
+            # 2. Subagent payload (agent_id set) MUST NOT emit OSC 2 or create registry
+            sub_payload = json.dumps(
+                {"session_id": sub_sid, "agent_id": "agent-xyz", "cwd": str(proj)}
+            ).encode("utf-8")
+            proc_sub, sub_pty_bytes = _run_with_fresh_pty(["bash", hook_sh], sub_payload)
+            self.assertEqual(proc_sub.returncode, 0, proc_sub.stderr)
+            self.assertEqual(sub_pty_bytes, b"")
+
+            # 3. `agent-voice-input session-hook --cli auto` detects session_id and updates pty cleanly
+            auto_in = json.dumps({"session_id": sid, "cwd": str(proj)}).encode("utf-8")
+            proc_auto, auto_pty_bytes = _run_with_fresh_pty([bin_cli, "session-hook", "--cli", "auto"], auto_in)
+            self.assertEqual(proc_auto.returncode, 0, proc_auto.stderr)
+            self.assertEqual(proc_auto.stdout, b"")
+            self.assertEqual(
+                auto_pty_bytes.decode("utf-8"),
+                "\033]2;claude · ~/work/my-svc [#a1b2c3d4]\007",
+            )
 
             # 4. Resolve the registered 0-message Claude session via SessionTracker
             rt_dir = xdg / "agent-voice-input"
