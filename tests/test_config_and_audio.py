@@ -309,6 +309,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         default_cfg = Config()
         self.assertIs(default_cfg.audio.beep, False)
         self.assertIsNone(default_cfg.audio.tail_drain_sec)
+        self.assertEqual(default_cfg.audio.max_duration_sec, 600.0)
         self.assertAlmostEqual(default_cfg.audio.effective_tail_drain_sec(macos=False), 0.65)
         self.assertAlmostEqual(default_cfg.audio.effective_tail_drain_sec(macos=True), 0.20)
 
@@ -321,6 +322,55 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg_zero.audio.tail_drain_sec, 0.0)
             self.assertEqual(cfg_zero.audio.effective_tail_drain_sec(macos=False), 0.0)
             self.assertEqual(cfg_zero.audio.effective_tail_drain_sec(macos=True), 0.0)
+
+    def test_max_duration_sec_config_env_precedence_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.toml").write_text(
+                "[audio]\nmax_duration_sec = 300\n",
+                encoding="utf-8",
+            )
+            cfg_toml, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(cfg_toml.audio.max_duration_sec, 300.0)
+
+            # 0 disables max duration limit; legacy VOICE_INPUT_MAX_DURATION_SEC works and AGENT_VOICE_INPUT_MAX_DURATION_SEC wins
+            cfg_legacy, _ = load_config(
+                env={"HOME": str(home), "VOICE_INPUT_MAX_DURATION_SEC": "0"},
+                home_dir=home,
+            )
+            self.assertEqual(cfg_legacy.audio.max_duration_sec, 0.0)
+
+            cfg_canon, _ = load_config(
+                env={
+                    "HOME": str(home),
+                    "AGENT_VOICE_INPUT_MAX_DURATION_SEC": "480.5",
+                    "VOICE_INPUT_MAX_DURATION_SEC": "120",
+                },
+                home_dir=home,
+            )
+            self.assertEqual(cfg_canon.audio.max_duration_sec, 480.5)
+
+            for bad_override in (-0.1, -60, float("nan"), float("inf"), float("-inf")):
+                with self.subTest(bad_override=bad_override):
+                    with self.assertRaises(ConfigError) as ctx:
+                        load_config(
+                            env={"HOME": str(home)},
+                            home_dir=home,
+                            cli_overrides={"audio.max_duration_sec": bad_override},
+                        )
+                    self.assertIn("audio.max_duration_sec must be >= 0", str(ctx.exception))
+
+            for bad_env in ("-1", "-0.01", "nan", "inf", "-inf", "abc"):
+                with self.subTest(bad_env=bad_env):
+                    with self.assertRaises(ConfigError) as ctx_env:
+                        load_config(
+                            env={"HOME": str(home), "AGENT_VOICE_INPUT_MAX_DURATION_SEC": bad_env},
+                            home_dir=home,
+                        )
+                    if bad_env != "abc":
+                        self.assertIn("audio.max_duration_sec must be >= 0", str(ctx_env.exception))
 
     def test_credential_suffix_first_priority_and_strict_no_api_id_typo(self) -> None:
         cfg = Config()

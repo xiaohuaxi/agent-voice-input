@@ -27,9 +27,16 @@ from agent_voice_input.config import (  # noqa: E402
     redact_secrets,
 )
 from agent_voice_input.hud import (  # noqa: E402
+    DEFAULT_ERROR_HUD_DURATION_MS,
+    HUD_STATE_DURATIONS_MS,
+    default_hud_duration_ms,
+    format_countdown_hint,
     format_hotkey_label,
     format_hud_text,
+    format_recording_duration,
     is_zh_locale,
+    pcm16le_rms_level,
+    recording_countdown_warn_sec,
     resolve_ui_language,
 )
 from agent_voice_input.platform_macos import (  # noqa: E402
@@ -37,6 +44,7 @@ from agent_voice_input.platform_macos import (  # noqa: E402
     probe_macos_host,
 )
 from agent_voice_input.platform_wsl import (  # noqa: E402
+    FfmpegWavRecorder,
     ForegroundWindow,
     POWERSHELL_EXE,
     WINDOWS_TERMINALS,
@@ -55,8 +63,9 @@ _MOCK_HUD_SHIM = (
     "    if req.get('cmd') == 'quit': break\n"
     "    with log_path.open('a', encoding='utf-8') as f:\n"
     "        f.write(json.dumps(req, ensure_ascii=False) + '\\n')\n"
-    "    sys.stdout.write(json.dumps({'type': 'reply', 'reply': req['cmd'], 'seq_id': req['seq_id'], 'ok': True}) + '\\n')\n"
-    "    sys.stdout.flush()\n"
+    "    if int(req.get('seq_id') or 0) > 0:\n"
+    "        sys.stdout.write(json.dumps({'type': 'reply', 'reply': req['cmd'], 'seq_id': req['seq_id'], 'ok': True}) + '\\n')\n"
+    "        sys.stdout.flush()\n"
 )
 
 
@@ -272,6 +281,21 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertEqual(resolve_ui_language("auto", env={"LANG": "en_US.UTF-8"}), "en")
         self.assertEqual(resolve_ui_language("auto", env={}), "en")
 
+    def test_default_hud_duration_ms_contract(self) -> None:
+        for persistent in ("", "   ", "idle", " IDLE ", "hide", " HIDE ", "recording", "recognizing", "processing", "refining"):
+            self.assertEqual(default_hud_duration_ms(persistent), 0, msg=persistent)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["done"], 900)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["copied"], 2000)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["empty"], 2200)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["error"], 2600)
+        self.assertEqual(DEFAULT_ERROR_HUD_DURATION_MS, 2600)
+        self.assertEqual(default_hud_duration_ms("done"), 900)
+        self.assertEqual(default_hud_duration_ms(" DONE "), 900)
+        self.assertEqual(default_hud_duration_ms("copied"), 2000)
+        self.assertEqual(default_hud_duration_ms("empty"), 2200)
+        self.assertEqual(default_hud_duration_ms("error"), 2600)
+        self.assertEqual(default_hud_duration_ms("asr_timeout"), 2600)
+
     def test_wsl_platform_hud_production_rpc_and_probe_never_launch_real_powershell(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
@@ -319,12 +343,13 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                     ("recording", "", 0),
                     ("recognizing", "", 0),
                     ("refining", "", 0),
-                    ("done", "", 900),
+                    ("done", "", 0),
                     ("copied", "", 0),
                     ("empty", "", 0),
                     ("error", "", 0),
                     ("hide", "", 0),
                     ("recording", "Custom HUD", 0),
+                    ("copied", "", 1500),
                 ],
             )
             self.assertEqual(
@@ -339,12 +364,16 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                     ("error", "✕ 识别失败"),
                     ("hide", None),
                     ("recording", "Custom HUD"),
+                    ("copied", "✓ 已复制(窗口已切换)"),
                 ],
             )
-            self.assertEqual(zh_cmds[3].get("duration_ms"), 900)
+            self.assertEqual(
+                [c.get("duration_ms") for c in zh_cmds],
+                [None, None, None, 900, 2000, 2200, 2600, None, None, 1500],
+            )
             self.assertEqual(
                 [c.get("position") for c in zh_cmds],
-                ["bottom", "bottom", "bottom", "bottom", "bottom", "bottom", "bottom", None, "bottom"],
+                ["bottom", "bottom", "bottom", "bottom", "bottom", "bottom", "bottom", None, "bottom", "bottom"],
             )
 
             # 2. English Windows desktop (ready ui_culture='en-US') + distracting Linux LANG=zh_CN.UTF-8 + PTT RAlt
@@ -373,6 +402,10 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                     ("empty", "○ No speech detected"),
                     ("error", "✕ Transcription failed"),
                 ],
+            )
+            self.assertEqual(
+                [c.get("duration_ms") for c in en_cmds],
+                [None, None, None, 900, 2000, 2200, 2600],
             )
 
             # 3. Omitted ui_culture in ready event still passes empty string (never falls back to WSL Linux LANG=zh_CN.UTF-8)
@@ -479,21 +512,39 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 cfg=Config(hotkey=HotkeyConfig(key="ROption", trigger_mode="tap_toggle")),
                 env={"LANG": "C.UTF-8"},
                 ready_ui_culture="zh-Hans-CN",
-                calls=[("recording", "", 0), ("recognizing", "", 0), ("done", "", 900), ("hide", "", 0)],
+                calls=[
+                    ("recording", "", 0),
+                    ("recognizing", "", 0),
+                    ("refining", "", 0),
+                    ("done", "", 0),
+                    ("copied", "", 0),
+                    ("empty", "", 0),
+                    ("error", "", 0),
+                    ("error", "", 1500),
+                    ("hide", "", 0),
+                ],
             )
             self.assertEqual(
                 [(c["state"], c.get("text")) for c in mac_zh],
                 [
                     ("recording", "● 正在录音… (再按右 Option 完成)"),
                     ("recognizing", "◐ 正在语音识别…"),
+                    ("refining", "◈ 正在整理精修…"),
                     ("done", "✓ 已填入"),
+                    ("copied", "✓ 已复制(窗口已切换)"),
+                    ("empty", "○ 未检测到语音"),
+                    ("error", "✕ 识别失败"),
+                    ("error", "✕ 识别失败"),
                     ("hide", None),
                 ],
             )
-            self.assertEqual(mac_zh[2].get("duration_ms"), 900)
+            self.assertEqual(
+                [c.get("duration_ms") for c in mac_zh],
+                [None, None, None, 900, 2000, 2200, 2600, 1500, None],
+            )
             self.assertEqual(
                 [c.get("position") for c in mac_zh],
-                ["bottom", "bottom", "bottom", None],
+                ["bottom", "bottom", "bottom", "bottom", "bottom", "bottom", "bottom", "bottom", None],
             )
 
             # 2. English macOS desktop (ui_culture='en-US') with RCommand PTT despite LANG=zh_CN.UTF-8
@@ -511,6 +562,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                     ("copied", "✓ Copied (window switched)"),
                 ],
             )
+            self.assertEqual([c.get("duration_ms") for c in mac_en], [None, None, 2000])
 
             # 3. Omitted ui_culture on MacOSPlatform falls back to POSIX LANG (win_ui_culture=None)
             mac_posix_zh = _run_mac_hud_scenario(
@@ -670,22 +722,46 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertIn("CultureInfo.CurrentUICulture", shim)
         self.assertIn("CultureInfo.InstalledUICulture", shim)
         self.assertGreaterEqual(shim.count("ui_culture = [VoiceWinShim]::GetHostUiCulture()"), 2)
+        self.assertIn("[VoiceWinShim]::EnableDpiAwareness()", shim)
+        self.assertIn("SetProcessDpiAwarenessContext", shim)
+        self.assertIn("GetDpiForMonitor", shim)
+        self.assertIn("GetTargetDpi", shim)
         self.assertIn('"Segoe UI"', shim)
         self.assertIn('"Microsoft YaHei UI"', shim)
         self.assertIn("_ownsFont", shim)
+        self.assertIn("GraphicsUnit.Pixel", shim)
+        self.assertIn("FontStyle.Regular", shim)
         self.assertIn("TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix", shim)
         self.assertIn("TextFormatFlags.EndEllipsis", shim)
-        self.assertIn("wa.Width - 24", shim)
-        # Bottom capsule positioning + 100% pill corner radius + anti-aliased GraphicsPath border
+        self.assertIn("SplitHudSegments", shim)
+        # Per-Monitor DPI V2 layered anti-aliased capsule + compact 4pt bottom positioning
         self.assertIn("using System.Drawing.Drawing2D;", shim)
-        self.assertIn("wa.Bottom - h - 14", shim)
-        self.assertIn("wa.Top + 36", shim)
-        self.assertIn("CreateRoundRectRgn(0, 0, w + 1, h + 1, h, h)", shim)
+        self.assertIn("using System.Drawing.Imaging;", shim)
+        self.assertIn("UpdateLayeredWindow(", shim)
+        self.assertIn("PixelFormat.Format32bppPArgb", shim)
+        self.assertIn("0x00080000", shim)
+        self.assertNotIn("CreateRoundRectRgn(", shim)
+        self.assertIn("wa.Width - ScalePx(24)", shim)
+        self.assertIn("wa.Bottom - h - ScalePx(4)", shim)
+        self.assertIn("wa.Top + ScalePx(36)", shim)
+        self.assertIn("ScalePx(31)", shim)
+        self.assertIn("ScalePx(12)", shim)
+        self.assertIn("ScalePx(13)", shim)
+        self.assertIn("ScalePx(14)", shim)
+        self.assertIn("ScalePx(11)", shim)
+        self.assertIn("ScalePx(7)", shim)
+        self.assertIn("ScalePx(6)", shim)
+        self.assertIn("DrawStatusIcon(", shim)
+        self.assertIn("RecordingCountdownWarnSec(", shim)
+        self.assertIn("FormatCountdownHint(", shim)
         self.assertIn("SmoothingMode.AntiAlias", shim)
+        self.assertIn("PixelOffsetMode.HighQuality", shim)
         self.assertIn("new GraphicsPath()", shim)
         self.assertIn("path.AddArc(", shim)
         self.assertNotIn("DrawRectangle(", shim)
         self.assertIn("[string]$cmdObj.position", shim)
+        for dur_decl in ("ms = 900;", "ms = 2000;", "ms = 2200;", "ms = 2600;"):
+            self.assertIn(dur_decl, shim)
 
         # Single source of truth parity between platform_wsl.WINDOWS_TERMINALS and win_shim.ps1 $AllowedTerminals
         m = re.search(r"\$AllowedTerminals\s*=\s*@\(([^)]+)\)", shim)
@@ -693,6 +769,310 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         assert m is not None
         shim_terms = {item.strip().strip('"').strip("'") for item in m.group(1).split(",") if item.strip()}
         self.assertEqual(shim_terms, set(WINDOWS_TERMINALS))
+
+        # Dynamic waveform & recording duration contract across win_shim.ps1 and mac_shim.swift
+        for sym in (
+            "FormatRecordingDuration(",
+            "DurationSlotTemplate(",
+            "ComputePcm16RmsLevel(",
+            "GetLiveAudioLevel(",
+            "SetExternalAudioLevel(",
+            "BuildVerticalBarPath(",
+            "_animTimer",
+            '"hud_level"',
+        ):
+            self.assertIn(sym, shim)
+
+        mac_shim = (_REPO_ROOT / "src" / "agent_voice_input" / "mac_shim.swift").read_text(encoding="utf-8")
+        for sym in (
+            "func formatRecordingDuration(",
+            "func durationSlotTemplate(",
+            "func recordingCountdownWarnSec(",
+            "func formatCountdownHint(",
+            "final class WaveBarsView: NSView",
+            "final class StatusIconView: NSView",
+            "monospacedDigitSystemFont",
+            "updateAudioLevel(",
+            'case "hud_level":',
+        ):
+            self.assertIn(sym, mac_shim)
+
+    def test_countdown_warn_threshold_hint_copy_and_hud_rpc_fields(self) -> None:
+        from agent_voice_input.config import AudioConfig
+
+        self.assertEqual(recording_countdown_warn_sec(0), 0)
+        self.assertEqual(recording_countdown_warn_sec(-10), 0)
+        self.assertEqual(recording_countdown_warn_sec(1), 1)
+        self.assertEqual(recording_countdown_warn_sec(2), 1)
+        self.assertEqual(recording_countdown_warn_sec(9), 3)
+        self.assertEqual(recording_countdown_warn_sec(20), 6)
+        self.assertEqual(recording_countdown_warn_sec(36), 10)
+        self.assertEqual(recording_countdown_warn_sec(44.9), 10)
+        self.assertEqual(recording_countdown_warn_sec(45), 15)
+        self.assertEqual(recording_countdown_warn_sec(600), 15)
+
+        self.assertEqual(format_countdown_hint(12, "zh"), "(12s 后自动完成)")
+        self.assertEqual(format_countdown_hint(12, "en"), "(auto-finish in 12s)")
+        self.assertEqual(format_countdown_hint(-5, "zh"), "(0s 后自动完成)")
+        self.assertEqual(format_countdown_hint(-5, "en"), "(auto-finish in 0s)")
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            rpc_log = tmp / "countdown-rpc.jsonl"
+            shim_echo = (
+                "import json, pathlib, sys\n"
+                "lp = pathlib.Path(sys.argv[1])\n"
+                "sys.stdout.write(json.dumps({'event': 'ready', 'ui_culture': 'zh-CN'}) + '\\n'); sys.stdout.flush()\n"
+                "for ln in sys.stdin:\n"
+                "    req = json.loads(ln)\n"
+                "    with lp.open('a', encoding='utf-8') as f: f.write(json.dumps(req, ensure_ascii=False) + '\\n')\n"
+                "    if req.get('cmd') == 'quit': break\n"
+                "    if 'seq_id' in req:\n"
+                "        sys.stdout.write(json.dumps({'type': 'reply', 'reply': req['cmd'], 'seq_id': req['seq_id'], 'ok': True}) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+            )
+            wplat = WslPlatform(
+                Config(audio=AudioConfig(max_duration_sec=600.0)),
+                env={"LANG": "zh_CN.UTF-8"},
+                shim_cmd_factory=lambda: [sys.executable, "-u", "-c", shim_echo, str(rpc_log)],
+            )
+            try:
+                wplat.start_event_listener(lambda _e: None)
+                wplat.hud("recording")
+                wplat.hud("recognizing")
+            finally:
+                wplat.close()
+
+            wplat_unlim = WslPlatform(
+                Config(audio=AudioConfig(max_duration_sec=0.0)),
+                env={"LANG": "zh_CN.UTF-8"},
+                shim_cmd_factory=lambda: [sys.executable, "-u", "-c", shim_echo, str(rpc_log)],
+            )
+            try:
+                wplat_unlim.start_event_listener(lambda _e: None)
+                wplat_unlim.hud("recording")
+            finally:
+                wplat_unlim.close()
+
+            hud_reqs = [
+                json.loads(ln)
+                for ln in rpc_log.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and json.loads(ln).get("cmd") == "hud"
+            ]
+            self.assertEqual(len(hud_reqs), 3)
+            self.assertEqual(hud_reqs[0]["state"], "recording")
+            self.assertEqual(hud_reqs[0]["max_duration_sec"], 600)
+            self.assertEqual(hud_reqs[0]["warn_remain_sec"], 15)
+            # Non-recording HUD requests and unlimited max_duration_sec=0 omit countdown fields
+            self.assertNotIn("max_duration_sec", hud_reqs[1])
+            self.assertNotIn("warn_remain_sec", hud_reqs[1])
+            self.assertNotIn("max_duration_sec", hud_reqs[2])
+            self.assertNotIn("warn_remain_sec", hud_reqs[2])
+
+    def test_format_recording_duration_and_pcm16le_rms_level_boundaries(self) -> None:
+        import array
+        import struct
+
+        self.assertEqual(format_recording_duration(-3.8), "0s")
+        self.assertEqual(format_recording_duration(0), "0s")
+        self.assertEqual(format_recording_duration(9), "9s")
+        self.assertEqual(format_recording_duration(12.9), "12s")
+        self.assertEqual(format_recording_duration(59), "59s")
+        self.assertEqual(format_recording_duration(59.99), "59s")
+        self.assertEqual(format_recording_duration(60), "1m 00s")
+        self.assertEqual(format_recording_duration(65), "1m 05s")
+        self.assertEqual(format_recording_duration(605), "10m 05s")
+        self.assertEqual(format_recording_duration(3661), "61m 01s")
+
+        # Empty / single odd byte / silence / low noise floor (-52 dBFS < -48 dBFS) -> 0.0
+        self.assertEqual(pcm16le_rms_level(b""), 0.0)
+        self.assertEqual(pcm16le_rms_level(b"\x7f"), 0.0)
+        self.assertEqual(pcm16le_rms_level(b"\x00\x00" * 320), 0.0)
+        quiet_amp = int(32768 * (10.0 ** (-52.0 / 20.0)))  # ~82
+        quiet_pcm = struct.pack("<" + "h" * 64, *([quiet_amp, -quiet_amp] * 32))
+        self.assertEqual(pcm16le_rms_level(quiet_pcm), 0.0)
+
+        # Mid speech (-31 dBFS -> exact midpoint 0.5 of [-48, -14] dBFS), plus trailing odd byte & memoryview/bytearray
+        mid_amp = int(round(32768 * (10.0 ** (-31.0 / 20.0))))  # ~923
+        mid_pcm = struct.pack("<" + "h" * 100, *([mid_amp, -mid_amp] * 50))
+        lvl_bytes = pcm16le_rms_level(mid_pcm + b"\xff")
+        self.assertAlmostEqual(lvl_bytes, 0.5, delta=0.02)
+        self.assertEqual(pcm16le_rms_level(bytearray(mid_pcm)), lvl_bytes)
+        self.assertEqual(pcm16le_rms_level(memoryview(mid_pcm)), lvl_bytes)
+
+        # Loud speech / full-scale peak (-6 dBFS and 0 dBFS >= -14 dBFS) -> clamped to 1.0
+        loud_pcm = struct.pack("<" + "h" * 64, *([16000, -16000] * 32))
+        peak_pcm = struct.pack("<" + "h" * 64, *([-32768, 32767] * 32))
+        self.assertEqual(pcm16le_rms_level(loud_pcm), 1.0)
+        self.assertEqual(pcm16le_rms_level(peak_pcm), 1.0)
+
+        # Ensure big-endian host branch & Python 3.13+ (no audioop) compatibility
+        import ast
+
+        be_arr = array.array("h", [mid_amp, -mid_amp] * 20)
+        be_arr.byteswap()
+        with mock.patch("agent_voice_input.hud.sys.byteorder", "big"), mock.patch.dict(sys.modules, {"audioop": None}):
+            self.assertAlmostEqual(pcm16le_rms_level(be_arr.tobytes()), 0.5, delta=0.02)
+        for py_file in (_REPO_ROOT / "src" / "agent_voice_input").glob("*.py"):
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    self.assertTrue(all(alias.name != "audioop" for alias in node.names), msg=str(py_file))
+                elif isinstance(node, ast.ImportFrom):
+                    self.assertNotEqual(node.module, "audioop", msg=str(py_file))
+
+    def test_ffmpeg_recorder_live_level_and_one_way_hud_level_rpc_safety(self) -> None:
+        import struct
+        import threading
+        import time
+        from agent_voice_input.config import AudioConfig
+
+        # 1. FfmpegWavRecorder updates current_level in real time, expires stale chunks (>0.25s), and resets on stop()
+        speech_chunk = struct.pack("<" + "h" * 1024, *([2800, -2800] * 512))  # 2048 bytes (~ -21.4 dBFS -> ~0.78)
+        stream_src = (
+            "import os, struct, time\n"
+            f"os.write(1, {speech_chunk!r})\n"
+            "time.sleep(0.45)\n"
+        )
+        rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", stream_src])
+        self.assertEqual(rec.current_level, 0.0)
+        with tempfile.TemporaryDirectory() as td:
+            rec.start("pulse", "RDPSource", Path(td), {})
+            deadline = time.monotonic() + 1.5
+            live = 0.0
+            while time.monotonic() < deadline:
+                live = rec.current_level
+                if live > 0.0:
+                    break
+                time.sleep(0.01)
+            self.assertGreater(live, 0.65)
+            self.assertLessEqual(live, 1.0)
+
+            # Wait >0.25s with no new audio chunks -> current_level automatically decays to 0.0
+            time.sleep(0.28)
+            self.assertEqual(rec.current_level, 0.0)
+
+            # Inject fresh timestamp then stop() -> immediately resets to 0.0
+            rec._live_level = 0.8
+            rec._live_level_ts = time.monotonic()
+            self.assertGreater(rec.current_level, 0.7)
+            wav = rec.stop(drain_sec=0.0)
+            self.assertGreater(len(wav), 44)
+            self.assertEqual(rec.current_level, 0.0)
+
+        # 2. JsonlShimMixin.hud_level one-way JSONL + concurrent _shim_rpc interleaving + level streamer lifecycle
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            log_path = tmp_dir / "hud-level-rpc.jsonl"
+            plat = MacOSPlatform(
+                Config(audio=AudioConfig(tail_drain_sec=0.0)),
+                env={"HOME": str(tmp_dir), "LANG": "zh_CN.UTF-8"},
+                cache_dir=tmp_dir / "cache",
+                shim_cmd_factory=lambda: [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    _MOCK_HUD_SHIM,
+                    "zh-Hans-CN",
+                    str(log_path),
+                ],
+            )
+            plat._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [
+                    sys.executable,
+                    "-c",
+                    f"import os, time\nfor _ in range(6):\n os.write(1, {speech_chunk!r})\n time.sleep(0.05)\n",
+                ]
+            )
+            try:
+                plat.start_event_listener(lambda _e: None)
+                plat.hud("recording")
+                # Direct one-way hud_level clamping & concurrent RPC safety
+                plat.hud_level(-0.5)
+                plat.hud_level(0.654321)
+                plat.hud_level(1.8)
+
+                rpc_errors: list[Exception] = []
+
+                def _hammer_rpc() -> None:
+                    for _ in range(8):
+                        try:
+                            r = plat._shim_rpc({"cmd": "fg_window"}, timeout_sec=2.0)
+                            if not r or not r.get("ok"):
+                                rpc_errors.append(RuntimeError(f"bad reply: {r}"))
+                        except Exception as exc:  # pragma: no cover
+                            rpc_errors.append(exc)
+
+                t_rpc = threading.Thread(target=_hammer_rpc)
+                t_rpc.start()
+                plat.start_recording(tmp_dir)
+                time.sleep(0.20)
+                t_rpc.join(timeout=3.0)
+                self.assertEqual(rpc_errors, [])
+                wav_mac, src_mac = plat.stop_recording(drain=False)
+                self.assertEqual(src_mac, "avfoundation")
+                self.assertGreater(len(wav_mac), 44)
+                # Streamer thread must be stopped immediately upon stop_recording()
+                self.assertIsNone(plat._level_thread)
+                plat.hud("recognizing")
+            finally:
+                plat.close()
+
+            logged = [json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            lvl_msgs = [m for m in logged if m.get("cmd") == "hud_level"]
+            self.assertGreaterEqual(len(lvl_msgs), 5)
+            for m in lvl_msgs:
+                self.assertNotIn("seq_id", m)
+                self.assertGreaterEqual(m["level"], 0.0)
+                self.assertLessEqual(m["level"], 1.0)
+            # First three explicit calls were clamped to 0.0, 0.654, 1.0, and streamer pushed >0.65 live speech levels
+            self.assertEqual([m["level"] for m in lvl_msgs[:3]], [0.0, 0.654, 1.0])
+            self.assertTrue(any(0.65 < m["level"] < 0.95 for m in lvl_msgs[3:]))
+
+            # 3. BytesIO pipe compatibility in FfmpegWavRecorder._read_pipe & WslPlatform pulse streamer
+            import io
+
+            bio = io.BytesIO(speech_chunk)
+            sink = bytearray()
+            rec_bio = FfmpegWavRecorder()
+            rec_bio._buf = sink
+            rec_bio._proc = mock.Mock()  # type: ignore[assignment]
+            rec_bio._read_pipe(bio, sink, 0)
+            self.assertEqual(bytes(sink), speech_chunk)
+            self.assertGreater(rec_bio.current_level, 0.65)
+            rec_bio._proc = None
+
+            wsl_log = tmp_dir / "wsl-pulse-level.jsonl"
+            wplat = WslPlatform(
+                Config(audio=AudioConfig(wsl_source="pulse", tail_drain_sec=0.0)),
+                env={"LANG": "C.UTF-8"},
+                shim_cmd_factory=lambda: [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    _MOCK_HUD_SHIM,
+                    "zh-CN",
+                    str(wsl_log),
+                ],
+            )
+            wplat._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [
+                    sys.executable,
+                    "-c",
+                    f"import os, time\nfor _ in range(5):\n os.write(1, {speech_chunk!r})\n time.sleep(0.05)\n",
+                ]
+            )
+            try:
+                wplat.start_event_listener(lambda _e: None)
+                wplat.hud("recording")
+                wplat.start_recording(tmp_dir)
+                time.sleep(0.18)
+                wplat.stop_recording(drain=False)
+                self.assertIsNone(wplat._level_thread)
+            finally:
+                wplat.close()
+            wsl_msgs = [json.loads(ln) for ln in wsl_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.assertTrue(any(m.get("cmd") == "hud_level" and m.get("level", 0.0) > 0.65 for m in wsl_msgs))
 
 
 if __name__ == "__main__":

@@ -58,7 +58,7 @@ EOF
 chmod 600 ~/.config/agent-voice-input/agent-voice-input.env
 ```
 
-如需自定义快捷键（单点切换 `tap_toggle`、按住说话 `ptt` 或 `only_in_terminals = true | false`）、胶囊提示语言与位置（`[ui] language = "auto" | "zh" | "en"`、`position = "bottom" | "top"`，或环境变量 `AGENT_VOICE_INPUT_UI_LANGUAGE` / `AGENT_VOICE_INPUT_UI_POSITION`）、macOS 录音设备（`[audio] macos_device = "default"` 或环境变量 `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`）、渠道、模型或二阶段精修方式，可将 [`config.example.toml`](config.example.toml) 复制为 `~/.config/agent-voice-input/config.toml` 按需修改（全部凭据变量见 [`config.example.env`](config.example.env)）。
+如需自定义快捷键（单点切换 `tap_toggle`、按住说话 `ptt` 或 `only_in_terminals = true | false`）、胶囊提示语言与位置（`[ui] language = "auto" | "zh" | "en"`、`position = "bottom" | "top"`，或环境变量 `AGENT_VOICE_INPUT_UI_LANGUAGE` / `AGENT_VOICE_INPUT_UI_POSITION`）、单次最长录音时长（`[audio] max_duration_sec = 600.0`，默认 10 分钟，最后 15 秒胶囊倒计时预警并到点自动完成转写；设 `0` 不限制）、macOS 录音设备（`[audio] macos_device = "default"` 或环境变量 `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`）、渠道、模型或二阶段精修方式，可将 [`config.example.toml`](config.example.toml) 复制为 `~/.config/agent-voice-input/config.toml` 按需修改（全部凭据变量见 [`config.example.env`](config.example.env)）。
 
 ### 4. 自检与运行
 
@@ -71,6 +71,7 @@ agent-voice-input start
 
 # 其它常用子命令
 agent-voice-input status
+agent-voice-input restart
 agent-voice-input toggle
 agent-voice-input once --duration 4 --dry-run
 agent-voice-input retry --list
@@ -199,7 +200,7 @@ model = "llama-3.3-70b-versatile"
 
 ## 命令行参数与环境变量覆盖
 
-`daemon`、`start`、`doctor`、`once`、`retry`、`status`、`toggle`、`stop`、`key-test` 均支持以下覆盖参数：
+`daemon`、`start`、`restart`、`doctor`、`once`、`retry`、`status`、`toggle`、`stop`、`key-test` 均支持以下覆盖参数：
 
 | CLI 参数 | 环境变量覆盖（`AGENT_VOICE_INPUT_*`） | 说明 |
 | :--- | :--- | :--- |
@@ -212,7 +213,7 @@ model = "llama-3.3-70b-versatile"
 | `--refiner-model` | `AGENT_VOICE_INPUT_REFINER_MODEL` | 二阶段上游模型 ID |
 | `--refiner-effort`, `--effort` | `AGENT_VOICE_INPUT_REFINER_EFFORT` | 二阶段思考档位（`auto`, `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`） |
 
-*（环境变量同时兼容 `VOICE_INPUT_*` 短前缀，以及 `AGENT_VOICE_INPUT_HOTKEY`、`AGENT_VOICE_INPUT_TRIGGER_MODE`、`AGENT_VOICE_INPUT_ONLY_IN_TERMINALS`、`AGENT_VOICE_INPUT_UI_LANGUAGE`、`AGENT_VOICE_INPUT_UI_POSITION`、`AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`、`AGENT_VOICE_INPUT_ASR_BASE_URL`、`AGENT_VOICE_INPUT_REFINER_BASE_URL`、`AGENT_VOICE_INPUT_FORCE_REFINE` 等覆盖项。）*
+*（环境变量同时兼容 `VOICE_INPUT_*` 短前缀，以及 `AGENT_VOICE_INPUT_HOTKEY`、`AGENT_VOICE_INPUT_TRIGGER_MODE`、`AGENT_VOICE_INPUT_ONLY_IN_TERMINALS`、`AGENT_VOICE_INPUT_UI_LANGUAGE`、`AGENT_VOICE_INPUT_UI_POSITION`、`AGENT_VOICE_INPUT_MAX_DURATION_SEC`、`AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`、`AGENT_VOICE_INPUT_ASR_BASE_URL`、`AGENT_VOICE_INPUT_REFINER_BASE_URL`、`AGENT_VOICE_INPUT_FORCE_REFINE` 等覆盖项。）*
 
 ### 可选：多窗口与 `tmux` 会话标题钩子
 

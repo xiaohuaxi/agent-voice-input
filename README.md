@@ -58,7 +58,7 @@ EOF
 chmod 600 ~/.config/agent-voice-input/agent-voice-input.env
 ```
 
-To customize hotkeys (`trigger_mode = "tap_toggle"` or `"ptt"`, `only_in_terminals = true | false`), HUD language & position (`[ui] language = "auto" | "zh" | "en"` and `position = "bottom" | "top"`, or `AGENT_VOICE_INPUT_UI_LANGUAGE` / `AGENT_VOICE_INPUT_UI_POSITION`), macOS audio input (`[audio] macos_device = "default"` or `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`), providers, models, or Stage 2 refinement, copy [`config.example.toml`](config.example.toml) to `~/.config/agent-voice-input/config.toml` (see [`config.example.env`](config.example.env) for all credential variables).
+To customize hotkeys (`trigger_mode = "tap_toggle"` or `"ptt"`, `only_in_terminals = true | false`), HUD language & position (`[ui] language = "auto" | "zh" | "en"` and `position = "bottom" | "top"`, or `AGENT_VOICE_INPUT_UI_LANGUAGE` / `AGENT_VOICE_INPUT_UI_POSITION`), recording duration cap (`[audio] max_duration_sec = 600.0`, default 10 min with a 15s HUD countdown and normal auto-finish; `0` disables), macOS audio input (`[audio] macos_device = "default"` or `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`), providers, models, or Stage 2 refinement, copy [`config.example.toml`](config.example.toml) to `~/.config/agent-voice-input/config.toml` (see [`config.example.env`](config.example.env) for all credential variables).
 
 ### 4. Verify & Run
 
@@ -71,6 +71,7 @@ agent-voice-input start
 
 # Other common commands
 agent-voice-input status
+agent-voice-input restart
 agent-voice-input toggle
 agent-voice-input once --duration 4 --dry-run
 agent-voice-input retry --list
@@ -199,7 +200,7 @@ model = "llama-3.3-70b-versatile"
 
 ## CLI Flags & Environment Overrides
 
-Common runtime flags accepted across `daemon`, `start`, `doctor`, `once`, `retry`, `status`, `toggle`, `stop`, and `key-test`:
+Common runtime flags accepted across `daemon`, `start`, `restart`, `doctor`, `once`, `retry`, `status`, `toggle`, `stop`, and `key-test`:
 
 | CLI Flag | Env Override (`AGENT_VOICE_INPUT_*`) | Description |
 | :--- | :--- | :--- |
@@ -212,7 +213,7 @@ Common runtime flags accepted across `daemon`, `start`, `doctor`, `once`, `retry
 | `--refiner-model` | `AGENT_VOICE_INPUT_REFINER_MODEL` | Stage 2 upstream model ID |
 | `--refiner-effort`, `--effort` | `AGENT_VOICE_INPUT_REFINER_EFFORT` | Stage 2 thinking budget (`auto`, `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) |
 
-*(Shorter `VOICE_INPUT_*` environment variable aliases are also accepted, alongside `AGENT_VOICE_INPUT_HOTKEY`, `AGENT_VOICE_INPUT_TRIGGER_MODE`, `AGENT_VOICE_INPUT_ONLY_IN_TERMINALS`, `AGENT_VOICE_INPUT_UI_LANGUAGE`, `AGENT_VOICE_INPUT_UI_POSITION`, `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`, `AGENT_VOICE_INPUT_ASR_BASE_URL`, `AGENT_VOICE_INPUT_REFINER_BASE_URL`, and `AGENT_VOICE_INPUT_FORCE_REFINE`.)*
+*(Shorter `VOICE_INPUT_*` environment variable aliases are also accepted, alongside `AGENT_VOICE_INPUT_HOTKEY`, `AGENT_VOICE_INPUT_TRIGGER_MODE`, `AGENT_VOICE_INPUT_ONLY_IN_TERMINALS`, `AGENT_VOICE_INPUT_UI_LANGUAGE`, `AGENT_VOICE_INPUT_UI_POSITION`, `AGENT_VOICE_INPUT_MAX_DURATION_SEC`, `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`, `AGENT_VOICE_INPUT_ASR_BASE_URL`, `AGENT_VOICE_INPUT_REFINER_BASE_URL`, and `AGENT_VOICE_INPUT_FORCE_REFINE`.)*
 
 ### Optional: Multi-Window & `tmux` Session Title Hooks
 

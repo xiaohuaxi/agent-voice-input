@@ -8,7 +8,13 @@ from typing import Any, Callable, Mapping
 
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, normalize_ui_position, redact_secrets
-from .hud import format_hud_text, resolve_ui_language
+from .hud import (
+    default_hud_duration_ms,
+    format_hud_text,
+    pcm16le_rms_level,
+    recording_countdown_warn_sec,
+    resolve_ui_language,
+)
 
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 WSLG_PULSE_SOCK = "/mnt/wslg/PulseServer"
@@ -75,8 +81,17 @@ class FfmpegWavRecorder:
         self._err_buf = bytearray()
         self._stdout_eof = False
         self._unexpected_exit_cb: Callable[[], None] | None = None
+        self._level_cb: Callable[[float], None] | None = None
+        self._live_level: float = 0.0
+        self._live_level_ts: float = 0.0
         self.last_stderr: str = ""
         self.last_returncode: int | None = None
+
+    @property
+    def current_level(self) -> float:
+        if self._proc is None or (time.monotonic() - self._live_level_ts) > 0.25:
+            return 0.0
+        return self._live_level
 
     def _build_cmd(self, fmt: str, source: str) -> list[str]:
         if self._cmd_factory is not None:
@@ -84,13 +99,18 @@ class FfmpegWavRecorder:
         in_opts = ["-sample_rate", "16000", "-channels", "1", "-fragment_size", "640"] if fmt == "pulse" else []
         return [resolve_ffmpeg_bin(), "-nostdin", "-hide_banner", "-loglevel", "error", "-probesize", "32", "-analyzeduration", "0", "-fflags", "nobuffer", "-flags", "low_delay", *in_opts, "-f", fmt, "-i", source, "-ac", "1", "-ar", "16000", "-f", "s16le", "-acodec", "pcm_s16le", "-flush_packets", "1", "pipe:1"]
 
-    @staticmethod
-    def _read_pipe(pipe: Any, sink: bytearray, limit: int = 0) -> None:
+    def _read_pipe(self, pipe: Any, sink: bytearray, limit: int = 0) -> None:
+        read_fn = (getattr(pipe, "read1", None) or pipe.read) if not limit else pipe.read
+        chunk_sz = 2048 if not limit else 4096
         try:
-            while chunk := pipe.read(4096 if limit else 8192):
+            while chunk := read_fn(chunk_sz):
                 sink.extend(chunk)
-                if limit and len(sink) > limit:
-                    del sink[:-limit]
+                if limit:
+                    if len(sink) > limit:
+                        del sink[:-limit]
+                elif self._buf is sink:
+                    self._live_level = pcm16le_rms_level(chunk)
+                    self._live_level_ts = time.monotonic()
         except Exception:
             pass
         finally:
@@ -106,11 +126,20 @@ class FfmpegWavRecorder:
         err_reader: threading.Thread,
         err_buf: bytearray,
     ) -> None:
+        read_fn = getattr(pipe, "read1", None) or pipe.read
         try:
-            while chunk := pipe.read(8192):
+            while chunk := read_fn(1600):
                 sink.extend(chunk)
                 if len(sink) >= 2 and not startup_evt.is_set():
                     startup_evt.set()
+                lvl = pcm16le_rms_level(chunk)
+                self._live_level = lvl
+                self._live_level_ts = time.monotonic()
+                if (lvl_cb := self._level_cb) is not None:
+                    try:
+                        lvl_cb(lvl)
+                    except Exception:
+                        pass
         except Exception:
             pass
         finally:
@@ -147,6 +176,7 @@ class FfmpegWavRecorder:
         verify_startup: bool = False,
         startup_timeout_sec: float = 0.35,
         on_unexpected_exit: Callable[[], None] | None = None,
+        on_level: Callable[[float], None] | None = None,
     ) -> None:
         self.stop(drain_sec=0.0)
         buf, err_buf = bytearray(), bytearray()
@@ -160,12 +190,18 @@ class FfmpegWavRecorder:
             self._proc, self._reader, self._err_reader, self._buf, self._err_buf = proc, reader, err_reader, buf, err_buf
             self._stdout_eof = False
             self._unexpected_exit_cb = None
+            self._level_cb = on_level
+            self._live_level, self._live_level_ts = 0.0, 0.0
         try:
             err_reader.start(); reader.start()
         except Exception:
             with self._lock:
-                self._proc, self._reader, self._err_reader, self._buf, self._err_buf = None, None, None, bytearray(), bytearray()
-                self._stdout_eof = False
+                if self._proc is proc:
+                    self._proc, self._reader, self._err_reader, self._buf, self._err_buf = None, None, None, bytearray(), bytearray()
+                    self._stdout_eof = False
+                    self._unexpected_exit_cb = None
+                    self._level_cb = None
+                    self._live_level, self._live_level_ts = 0.0, 0.0
             try: proc.kill(); proc.wait(timeout=0.5)
             except Exception: pass
             for pipe in (proc.stdout, proc.stderr):
@@ -219,6 +255,8 @@ class FfmpegWavRecorder:
             self._proc, self._reader, self._err_reader, self._buf, self._err_buf = None, None, None, bytearray(), bytearray()
             self._stdout_eof = False
             self._unexpected_exit_cb = None
+            self._level_cb = None
+            self._live_level, self._live_level_ts = 0.0, 0.0
         if proc is None:
             return b""
         if drain_sec > 0.0 and proc.poll() is None:
@@ -237,6 +275,7 @@ class FfmpegWavRecorder:
             reader.join(timeout=1.0)
         if err_reader is not None and err_reader is not threading.current_thread():
             err_reader.join(timeout=1.0)
+        self._live_level, self._live_level_ts = 0.0, 0.0
         self.last_returncode = proc.returncode
         self.last_stderr = bytes(err_buf).decode("utf-8", errors="replace").strip()
         raw = bytes(buf)
@@ -347,10 +386,14 @@ class JsonlShimMixin:
         self._shim: subprocess.Popen[str] | None = None
         self._shim_disabled = False
         self._shim_lock = threading.Lock()
+        self._stdin_lock = threading.Lock()
         self._rpc_seq, self._pending, self._ready = 100, {}, threading.Event()
         self._event_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._event_worker: threading.Thread | None = None
         self._on_event: Callable[[dict[str, Any]], None] | None = None
+        self._level_stop_evt: threading.Event | None = None
+        self._level_thread: threading.Thread | None = None
+        self._last_level_push_ts: float = 0.0
         self._win_ui_culture = ""
         self.last_shim_error = ""
 
@@ -500,8 +543,9 @@ class JsonlShimMixin:
                     self._rpc_seq += 1
                     sid = self._rpc_seq
                     self._pending[sid] = q
-                    proc.stdin.write(json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n")
-                    proc.stdin.flush()
+                    with self._stdin_lock:
+                        proc.stdin.write(json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n")
+                        proc.stdin.flush()
                 res = q.get(timeout=timeout_sec)
                 if res.get("error") == "shim_eof" and attempt == 0 and not self._closed and not self._shim_disabled:
                     continue
@@ -543,8 +587,14 @@ class JsonlShimMixin:
                 self._ready.wait(timeout=self._shim_ready_timeout)
             req: dict[str, Any] = {"cmd": "hud", "state": state}
             eff_text = text
+            eff_duration_ms = duration_ms if duration_ms > 0 else 0
             if st not in ("", "idle", "hide"):
                 req["position"] = normalize_ui_position(self.cfg.ui.position)
+                if st == "recording" and self.cfg.audio.max_duration_sec > 0:
+                    req["max_duration_sec"] = max(1, int(round(self.cfg.audio.max_duration_sec)))
+                    req["warn_remain_sec"] = recording_countdown_warn_sec(
+                        self.cfg.audio.max_duration_sec
+                    )
                 if not eff_text:
                     lang = resolve_ui_language(
                         self.cfg.ui.language,
@@ -557,16 +607,76 @@ class JsonlShimMixin:
                         hotkey=self.cfg.hotkey.key,
                         trigger_mode=self.cfg.hotkey.trigger_mode,
                     )
+                if eff_duration_ms <= 0:
+                    eff_duration_ms = default_hud_duration_ms(st)
             if eff_text:
                 req["text"] = eff_text
-            if duration_ms > 0:
-                req["duration_ms"] = duration_ms
+            if eff_duration_ms > 0:
+                req["duration_ms"] = eff_duration_ms
             self._shim_rpc(req, timeout_sec=1.5)
         except Exception:
             pass
 
+    def hud_level(self, level: float) -> None:
+        if not self._has_managed_shim() or not self._ready.is_set():
+            return
+        proc = self._shim
+        if proc is None or proc.stdin is None or proc.poll() is not None:
+            return
+        clamped = round(max(0.0, min(1.0, float(level))), 3)
+        line = json.dumps({"cmd": "hud_level", "level": clamped}) + "\n"
+        try:
+            with self._stdin_lock:
+                if proc.poll() is None and proc.stdin is not None and not proc.stdin.closed:
+                    proc.stdin.write(line)
+                    proc.stdin.flush()
+        except Exception:
+            pass
+
+    def _on_recorder_level(self, level: float) -> None:
+        if self._closed or not self._has_managed_shim():
+            return
+        now = time.monotonic()
+        if (now - self._last_level_push_ts) < 0.045:
+            return
+        self._last_level_push_ts = now
+        self.hud_level(level)
+
+    def _start_level_streamer(self, source_fn: Callable[[], float]) -> None:
+        self._stop_level_streamer()
+        if not self._has_managed_shim():
+            return
+        stop_evt = threading.Event()
+
+        def _stream_loop() -> None:
+            while not stop_evt.wait(0.075):
+                if self._closed or not self._has_managed_shim():
+                    break
+                if (time.monotonic() - self._last_level_push_ts) < 0.07:
+                    continue
+                try:
+                    lvl = float(source_fn())
+                except Exception:
+                    lvl = 0.0
+                self.hud_level(lvl)
+
+        worker = threading.Thread(target=_stream_loop, daemon=True)
+        self._level_stop_evt = stop_evt
+        self._level_thread = worker
+        worker.start()
+
+    def _stop_level_streamer(self) -> None:
+        evt, worker = self._level_stop_evt, self._level_thread
+        self._level_stop_evt, self._level_thread = None, None
+        self._last_level_push_ts = 0.0
+        if evt is not None:
+            evt.set()
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=0.5)
+
     def close(self) -> None:
         self._closed = True
+        self._stop_level_streamer()
         self._on_event = None
         self._event_q.put(None)
         if self._event_worker is not None and self._event_worker.is_alive() and self._event_worker is not threading.current_thread():
@@ -577,10 +687,11 @@ class JsonlShimMixin:
             proc, self._shim = self._shim, None
         if proc is not None and proc.poll() is None:
             try:
-                if proc.stdin:
-                    proc.stdin.write('{"cmd":"quit"}\n')
-                    proc.stdin.flush()
-                    proc.stdin.close()
+                with self._stdin_lock:
+                    if proc.stdin and not proc.stdin.closed:
+                        proc.stdin.write('{"cmd":"quit"}\n')
+                        proc.stdin.flush()
+                        proc.stdin.close()
                 proc.wait(timeout=2.0)
             except Exception:
                 pass
@@ -644,6 +755,7 @@ class WslPlatform(JsonlShimMixin):
             except Exception: pass
 
     def start_recording(self, runtime_dir: Path, *, loopback: bool = False) -> None:
+        self._stop_level_streamer()
         self.last_audio_error = ""
         eff_loopback = bool(loopback or self.env.get("AGENT_VOICE_INPUT_WASAPI_LOOPBACK") == "1" or self.env.get("VOICE_INPUT_WASAPI_LOOPBACK") == "1")
         if self._use_winmm:
@@ -668,11 +780,13 @@ class WslPlatform(JsonlShimMixin):
                         self.env,
                         verify_startup=True,
                         on_unexpected_exit=self._recorder_lost_cb,
+                        on_level=self._on_recorder_level,
                     )
                 except Exception:
                     self._rec_mode = ""
                     self.last_audio_error = self._ff_rec.diagnostic_summary() or err
                     raise
+                self._start_level_streamer(lambda: self._ff_rec.current_level)
                 return
             raise NoMicrophoneError(f"no microphone input device available ({err})") if "wasapi_" in err.lower() else RuntimeError(err)
         self._rec_mode = "pulse"
@@ -685,13 +799,16 @@ class WslPlatform(JsonlShimMixin):
                 self.env,
                 verify_startup=True,
                 on_unexpected_exit=self._recorder_lost_cb,
+                on_level=self._on_recorder_level,
             )
         except Exception:
             self._rec_mode = ""
             self.last_audio_error = self._ff_rec.diagnostic_summary()
             raise
+        self._start_level_streamer(lambda: self._ff_rec.current_level)
 
     def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
+        self._stop_level_streamer()
         mode, self._rec_mode = self._rec_mode, ""
         drain_sec = self.cfg.audio.effective_tail_drain_sec(macos=False) if (drain and mode) else 0.0
         if mode == "winmm":
@@ -707,6 +824,7 @@ class WslPlatform(JsonlShimMixin):
         return wav, "pulse"
 
     def cancel_recording(self) -> None:
+        self._stop_level_streamer()
         try: self.stop_recording(drain=False)
         except Exception: pass
 

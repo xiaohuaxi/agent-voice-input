@@ -1,7 +1,10 @@
 """Environment-aware HUD language resolution and bilingual status copy (single source of truth)."""
 from __future__ import annotations
 
+import array
+import math
 import os
+import sys
 from typing import Mapping
 
 from .config import (
@@ -71,6 +74,27 @@ _STATIC_HUD_COPY: dict[str, tuple[str, str]] = {
     "no_mic": ("✕ 无可用麦克风", "✕ No microphone found"),
     "mic_disconnected": ("✕ 麦克风已断开", "✕ Microphone disconnected"),
 }
+
+_PERSISTENT_HUD_STATES: frozenset[str] = frozenset(
+    {"", "idle", "hide", "recording", "recognizing", "processing", "refining"}
+)
+
+HUD_STATE_DURATIONS_MS: dict[str, int] = {
+    "done": 900,
+    "copied": 2000,
+    "empty": 2200,
+    "error": 2600,
+}
+
+DEFAULT_ERROR_HUD_DURATION_MS: int = 2600
+
+
+def default_hud_duration_ms(state: str) -> int:
+    """Return default auto-hide duration in ms for ``state`` (0 = stay visible until next state)."""
+    st = (state or "").strip().lower()
+    if st in _PERSISTENT_HUD_STATES:
+        return 0
+    return HUD_STATE_DURATIONS_MS.get(st, DEFAULT_ERROR_HUD_DURATION_MS)
 
 
 def is_zh_locale(tag: str | None) -> bool:
@@ -149,14 +173,67 @@ def format_hud_text(
     return pair[0] if zh else pair[1]
 
 
+def format_recording_duration(elapsed_sec: int | float) -> str:
+    """Format recording elapsed seconds as '0s'..'59s' (< 60s) or '1m 00s' (>= 60s)."""
+    sec = max(0, int(elapsed_sec))
+    if sec < 60:
+        return f"{sec}s"
+    m, s = divmod(sec, 60)
+    return f"{m}m {s:02d}s"
+
+
+def recording_countdown_warn_sec(max_duration_sec: float) -> int:
+    """Return countdown warning threshold in seconds before ``max_duration_sec`` (`0` when disabled)."""
+    if not math.isfinite(max_duration_sec) or max_duration_sec <= 0:
+        return 0
+    if max_duration_sec >= 45:
+        return 15
+    return max(1, min(10, int(max_duration_sec // 3) or 1))
+
+
+def format_countdown_hint(remain_sec: int, lang: str = "en") -> str:
+    """Format countdown bracket hint near maximum recording duration."""
+    r = max(0, int(remain_sec))
+    if (lang or "en").strip().lower() == "zh":
+        return f"({r}s 后自动完成)"
+    return f"(auto-finish in {r}s)"
+
+
+def pcm16le_rms_level(pcm_bytes: bytes | bytearray | memoryview) -> float:
+    """Compute normalized visual audio level in [0.0, 1.0] from 16-bit signed LE PCM bytes."""
+    even_n = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    if even_n < 2:
+        return 0.0
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes[:even_n])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    rms = math.sqrt(sum(x * x for x in samples) / len(samples)) / 32768.0
+    if rms <= 1e-5:
+        return 0.0
+    db = 20.0 * math.log10(rms)
+    if db <= -48.0:
+        return 0.0
+    if db >= -14.0:
+        return 1.0
+    return (db + 48.0) / 34.0
+
+
 __all__ = [
+    "DEFAULT_ERROR_HUD_DURATION_MS",
+    "HUD_STATE_DURATIONS_MS",
     "POSIX_LOCALE_VARS",
     "VALID_UI_LANGUAGES",
     "VALID_UI_POSITIONS",
+    "default_hud_duration_ms",
+    "format_countdown_hint",
     "format_hotkey_label",
     "format_hud_text",
+    "format_recording_duration",
     "is_zh_locale",
     "normalize_ui_language",
     "normalize_ui_position",
+    "pcm16le_rms_level",
+    "recording_countdown_warn_sec",
     "resolve_ui_language",
 ]

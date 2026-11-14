@@ -196,6 +196,7 @@ class AudioConfig:
     max_gain_db: float = 40.0
     min_duration_sec: float = 0.3
     min_voiced_sec: float = 0.1
+    max_duration_sec: float = 600.0
     wsl_source: str = "auto"
     macos_device: str = "default"
     beep: bool = False
@@ -980,6 +981,18 @@ def _as_float(val: Any, name: str) -> float:
     return fval
 
 
+def _parse_max_duration_sec(val: Any, name: str = "audio.max_duration_sec") -> float:
+    if isinstance(val, bool):
+        raise ConfigError(f"{name}: expected number, got boolean")
+    try:
+        fval = float(val)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name}: invalid float value {val!r}") from None
+    if not math.isfinite(fval) or fval < 0.0:
+        raise ConfigError("audio.max_duration_sec must be >= 0")
+    return fval
+
+
 def _as_str(val: Any, name: str) -> str:
     if isinstance(val, str):
         return val
@@ -1084,6 +1097,8 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.audio.min_duration_sec = _as_float(v, "audio.min_duration_sec")
             elif k == "min_voiced_sec":
                 cfg.audio.min_voiced_sec = _as_float(v, "audio.min_voiced_sec")
+            elif k == "max_duration_sec":
+                cfg.audio.max_duration_sec = _parse_max_duration_sec(v, "audio.max_duration_sec")
             elif k == "wsl_source":
                 cfg.audio.wsl_source = _as_str(v, "audio.wsl_source").strip().lower()
             elif k == "macos_device":
@@ -1229,6 +1244,8 @@ def _apply_env_overrides(cfg: Config, env: Mapping[str, str]) -> None:
         cfg.audio.min_duration_sec = _as_float(kv[1], kv[0])
     if (kv := _get("AUDIO_MIN_VOICED_SEC")) is not None:
         cfg.audio.min_voiced_sec = _as_float(kv[1], kv[0])
+    if (kv := _get("MAX_DURATION_SEC", "AUDIO_MAX_DURATION_SEC")) is not None:
+        cfg.audio.max_duration_sec = _parse_max_duration_sec(kv[1], kv[0])
     if (kv := _get("WSL_SOURCE")) is not None:
         cfg.audio.wsl_source = kv[1].lower()
     if (kv := _get("MACOS_AUDIO_DEVICE", "MACOS_DEVICE")) is not None:
@@ -1497,6 +1514,13 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
         raise ConfigError("audio.macos_device must not be empty")
     if cfg.audio.min_duration_sec < 0 or cfg.audio.min_voiced_sec < 0:
         raise ConfigError("audio min_duration_sec and min_voiced_sec must be >= 0")
+    if (
+        isinstance(cfg.audio.max_duration_sec, bool)
+        or not isinstance(cfg.audio.max_duration_sec, (int, float))
+        or not math.isfinite(cfg.audio.max_duration_sec)
+        or cfg.audio.max_duration_sec < 0.0
+    ):
+        raise ConfigError("audio.max_duration_sec must be >= 0")
     if not (-120.0 <= cfg.audio.floor_dbfs < cfg.audio.target_dbfs <= 0.0):
         raise ConfigError(
             "audio dBFS bounds must satisfy -120.0 <= floor_dbfs < target_dbfs <= 0.0"

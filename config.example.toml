@@ -34,6 +34,9 @@ target_dbfs = -20.0
 max_gain_db = 40.0
 min_duration_sec = 0.3
 min_voiced_sec = 0.1
+# Maximum single recording duration in seconds (default 600s = 10 minutes; HUD shows countdown in the final 15s and auto-finishes transcription; set 0 to disable)
+# Can also be overridden via AGENT_VOICE_INPUT_MAX_DURATION_SEC (or VOICE_INPUT_MAX_DURATION_SEC)
+max_duration_sec = 600.0
 # WSL2 capture source: "auto" (defaults to resident win_shim Windows WASAPI 16 kHz capture, avoiding WSLg RDPSource zero-packet deadlocks) | "wasapi" | "winmm" | "pulse"
 wsl_source = "auto"
 # macOS AVFoundation audio input device: "default" (system default mic) | device index e.g. "0" | device name

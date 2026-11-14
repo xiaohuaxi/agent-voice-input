@@ -538,6 +538,7 @@ class MacOSPlatform(JsonlShimMixin):
                 pass
 
     def start_recording(self, runtime_dir: Path, *, loopback: bool = False) -> None:
+        self._stop_level_streamer()
         self.last_audio_error = ""
         try:
             self._ff_rec.start(
@@ -547,14 +548,17 @@ class MacOSPlatform(JsonlShimMixin):
                 self.env,
                 verify_startup=True,
                 on_unexpected_exit=self._recorder_lost_cb,
+                on_level=self._on_recorder_level,
             )
         except Exception:
             self._recording = False
             self.last_audio_error = self._ff_rec.diagnostic_summary()
             raise
         self._recording = True
+        self._start_level_streamer(lambda: self._ff_rec.current_level)
 
     def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
+        self._stop_level_streamer()
         was_rec, self._recording = self._recording, False
         drain_sec = self.cfg.audio.effective_tail_drain_sec(macos=True) if (drain and was_rec) else 0.0
         wav = self._ff_rec.stop(drain_sec=drain_sec)
@@ -562,6 +566,7 @@ class MacOSPlatform(JsonlShimMixin):
         return wav, "avfoundation"
 
     def cancel_recording(self) -> None:
+        self._stop_level_streamer()
         self._recording = False
         self._ff_rec.stop(drain_sec=0.0)
 

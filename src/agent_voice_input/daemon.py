@@ -255,6 +255,7 @@ class VoiceInputDaemon:
         self._origin_win, self.last_result, self._srv_sock = ForegroundWindow(), {}, None
         self._cur_no_paste, self._cur_silent_hud = False, False
         self._recorder_lost_seq, self._recorder_lost_ts, self._recorder_lost_stop_absorbed = -1, -1e9, False
+        self._max_dur_timer: threading.Timer | None = None
         if (setter := getattr(self.platform, "set_recorder_lost_callback", None)) is not None:
             setter(self._on_recorder_lost)
 
@@ -266,6 +267,37 @@ class VoiceInputDaemon:
     def is_current_seq(self, seq_id: int) -> bool:
         with self._lock:
             return not self._stop_evt.is_set() and self.seq_id == seq_id
+
+    def _cancel_max_duration_timer(self) -> None:
+        with self._lock:
+            t, self._max_dur_timer = self._max_dur_timer, None
+        if t is not None:
+            t.cancel()
+
+    def _arm_max_duration_timer(self, seq_id: int) -> None:
+        max_sec = float(self.cfg.audio.max_duration_sec)
+        if max_sec <= 0.0:
+            return
+        t = threading.Timer(max_sec, self._on_max_duration_timeout, args=(seq_id,))
+        t.daemon = True
+        start_it = False
+        with self._lock:
+            old, self._max_dur_timer = self._max_dur_timer, None
+            if not self._stop_evt.is_set() and self.seq_id == seq_id and self.state == "recording":
+                self._max_dur_timer = t
+                start_it = True
+        if old is not None:
+            old.cancel()
+        if start_it:
+            t.start()
+
+    def _on_max_duration_timeout(self, seq_id: int) -> None:
+        if self._stop_evt.is_set() or not self.is_current_seq(seq_id):
+            return
+        with self._lock:
+            if self._stop_evt.is_set() or self.seq_id != seq_id or self.state != "recording":
+                return
+        self.handle_trigger("toggle", expected_seq_id=seq_id)
 
     def _redact_str(self, text: str) -> str:
         return redact_secrets(text, self.env, cfg=self.cfg, extra_secrets=self.creds.all_secret_values())
@@ -297,6 +329,7 @@ class VoiceInputDaemon:
                 self._cur_no_paste, self._cur_silent_hud = False, False
                 win_snap = self._origin_win
                 self.state = "recognizing"
+            self._cancel_max_duration_timer()
             try:
                 try:
                     raw_wav, src_used = self.platform.stop_recording(drain=False)
@@ -372,12 +405,14 @@ class VoiceInputDaemon:
             summary["audio_error"] = self._redact_str(audio_err)
         return summary
 
-    def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False, from_hotkey: bool = False) -> dict[str, Any]:
+    def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False, from_hotkey: bool = False, expected_seq_id: int | None = None) -> dict[str, Any]:
         arrival_ts = self.clock_fn()
         with self._trigger_lock:
             with self._lock:
                 if self._stop_evt.is_set():
                     return {"ok": False, "ignored": "stopping", "state": self.state, "seq_id": self.seq_id}
+                if expected_seq_id is not None and (self.seq_id != expected_seq_id or self.state != "recording"):
+                    return {"ok": False, "ignored": "stale_seq", "state": self.state, "seq_id": self.seq_id}
                 eff_no_paste, eff_silent = bool(no_paste), bool(silent_hud)
                 if (
                     action in ("toggle", "ptt_start")
@@ -393,7 +428,7 @@ class VoiceInputDaemon:
                         allowed = is_windows_terminal_process(cand_win.process) or is_macos_terminal_window(cand_win.process, cand_win.bundle_id)
                     if not allowed:
                         return {"ok": False, "ignored": "non_terminal", "state": self.state, "seq_id": self.seq_id}
-                if action in ("toggle", "ptt_start") and (arrival_ts - self._last_trigger_ts) * 1000.0 < self.cfg.hotkey.debounce_ms:
+                if expected_seq_id is None and action in ("toggle", "ptt_start") and (arrival_ts - self._last_trigger_ts) * 1000.0 < self.cfg.hotkey.debounce_ms:
                     return {"ok": False, "ignored": "debounced", "state": self.state, "seq_id": self.seq_id}
                 if (
                     action == "toggle"
@@ -417,6 +452,7 @@ class VoiceInputDaemon:
                 elif action in ("toggle", "ptt_start") and self.state != "recording":
                     self._cur_no_paste, self._cur_silent_hud = bool(no_paste), bool(silent_hud)
                     self._recorder_lost_seq, self._recorder_lost_ts, self._recorder_lost_stop_absorbed = -1, -1e9, False
+                    self._origin_win = window if window is not None else ForegroundWindow()
                     self.seq_id += 1; self.state, self._last_trigger_ts, cur_seq, mode = "recording", now, self.seq_id, "start"
                 elif action in ("toggle", "ptt_stop") and self.state == "recording":
                     # Stage 1 ('recognizing') starts immediately on the very first line of stopping recording
@@ -429,25 +465,42 @@ class VoiceInputDaemon:
                     return {"ok": True, "state": self.state, "seq_id": self.seq_id}
 
             if mode == "cancel":
+                self._cancel_max_duration_timer()
                 if not eff_silent: self._hud("hide")
                 self.platform.cancel_recording()
                 if not eff_silent: self.platform.beep("error")
                 return {"ok": True, "state": "idle", "seq_id": cur_seq}
             if mode == "start":
+                self._cancel_max_duration_timer()
                 if not eff_silent: self._hud("recording")
+                rec_started = False
                 try:
+                    eff_loopback = bool(
+                        loopback
+                        or self.env.get("AGENT_VOICE_INPUT_WASAPI_LOOPBACK") == "1"
+                        or self.env.get("VOICE_INPUT_WASAPI_LOOPBACK") == "1"
+                    )
+                    if loopback:
+                        self.platform.start_recording(self.runtime_dir, loopback=True)
+                    else:
+                        self.platform.start_recording(self.runtime_dir)
+                    rec_started = True
+                    if not eff_silent and not eff_loopback:
+                        self.platform.beep("start")
                     if (resolver := getattr(self.platform, "resolve_foreground_window", None)) is not None:
                         win_now = resolver(window)
                     else:
                         win_now = window if (window and (window.title or window.process or window.hwnd)) else self.platform.get_foreground_window()
                     with self._lock: self._origin_win = win_now
-                    if loopback:
-                        self.platform.start_recording(self.runtime_dir, loopback=True)
-                    else:
-                        self.platform.start_recording(self.runtime_dir)
-                    if not eff_silent: self.platform.beep("start")
+                    self._arm_max_duration_timer(cur_seq)
                     return {"ok": True, "state": "recording", "seq_id": cur_seq}
                 except Exception as exc:
+                    self._cancel_max_duration_timer()
+                    if rec_started:
+                        try:
+                            self.platform.cancel_recording()
+                        except Exception:
+                            pass
                     err = self._redact(exc)
                     is_no_mic = isinstance(exc, NoMicrophoneError)
                     with self._lock:
@@ -467,6 +520,7 @@ class VoiceInputDaemon:
                         out_err["skipped_reason"] = "no_mic"
                     return out_err
 
+            self._cancel_max_duration_timer()
             if not eff_silent: self._hud("recognizing")
             try:
                 raw_wav, src_used = self.platform.stop_recording()
@@ -560,7 +614,7 @@ class VoiceInputDaemon:
                 self.last_result = summary
             return {"ok": res.ok, "seq_id": cur_seq, "skipped_reason": res.skipped_reason, "asr_text": res.asr.text if res.asr else "", "final_text": res.final_text, "summary": summary}
         if cmd == "shutdown":
-            self._stop_evt.set(); return {"ok": True, "stopping": True}
+            self._stop_evt.set(); self._cancel_max_duration_timer(); return {"ok": True, "stopping": True}
         return {"ok": False, "error": f"unknown cmd: {cmd}"}
 
     def serve_forever(self) -> None:
@@ -594,6 +648,7 @@ class VoiceInputDaemon:
 
     def close(self) -> None:
         self._stop_evt.set()
+        self._cancel_max_duration_timer()
         if self._srv_sock is not None:
             try: self._srv_sock.close()
             except OSError: pass

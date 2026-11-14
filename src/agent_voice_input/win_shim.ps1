@@ -12,6 +12,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Media;
@@ -60,88 +61,531 @@ internal interface IAudioCaptureClient {
     int GetNextPacketSize(out uint pNumFramesInNextPacket);
 }
 
-internal sealed class HudPillForm : Form {
+public sealed class HudPillForm : Form {
+    [StructLayout(LayoutKind.Sequential)] private struct WinPoint { public int x, y; public WinPoint(int x, int y) { this.x = x; this.y = y; } }
+    [StructLayout(LayoutKind.Sequential)] private struct WinSize { public int cx, cy; public WinSize(int cx, int cy) { this.cx = cx; this.cy = cy; } }
+    [StructLayout(LayoutKind.Sequential, Pack = 1)] private struct BlendFunc { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-    [DllImport("gdi32.dll")] private static extern IntPtr CreateRoundRectRgn(int x1, int y1, int x2, int y2, int cx, int cy);
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref WinPoint pptDst, ref WinSize psize, IntPtr hdcSrc, ref WinPoint pptSrc, int crKey, ref BlendFunc pblend, int dwFlags);
+    [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    [DllImport("gdi32.dll")] private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr hdc);
+    [DllImport("gdi32.dll")] private static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
     [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr hObject);
-    private const TextFormatFlags MeasureFlags = TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
-    private const TextFormatFlags DrawFlags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis;
+    private const TextFormatFlags MeasureFlags = TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+    private const TextFormatFlags SegDrawFlags = TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+    private const TextFormatFlags DurDrawFlags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+    private const TextFormatFlags TruncDrawFlags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis;
+    private static readonly Color DefaultBgColor = Color.FromArgb(64, 18, 26);
+    private static readonly Color RecBgColor = Color.FromArgb(64, 18, 26);
+    private static readonly Color RecBorderColor = Color.FromArgb(196, 66, 80);
+    private static readonly Color RecWaveActiveColor = Color.FromArgb(255, 255, 104, 112);
+    private static readonly Color RecWaveQuietColor = Color.FromArgb(255, 232, 92, 102);
+    private static readonly Color RecMainColor = Color.FromArgb(248, 250, 252);
+    private static readonly Color RecHintColor = Color.FromArgb(214, 188, 194);
+    private static readonly Color WarnBgColor = Color.FromArgb(72, 38, 12);
+    private static readonly Color WarnBorderColor = Color.FromArgb(224, 138, 28);
+    private static readonly Color WarnWaveActiveColor = Color.FromArgb(255, 251, 191, 36);
+    private static readonly Color WarnWaveQuietColor = Color.FromArgb(220, 251, 191, 36);
+    private static readonly Color WarnMainColor = Color.FromArgb(254, 252, 232);
+    private static readonly Color WarnHintColor = Color.FromArgb(253, 224, 71);
+    private static readonly float[] BellWeight = new float[] { 1.00f, 0.92f, 0.78f, 0.58f, 0.40f };
     private Font _font;
     private bool _ownsFont, _cjkFont;
+    private int _dpi = 96;
     private readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer();
-    private string _text = "";
-    private Color _fg = Color.White, _border = Color.Gray;
+    private readonly System.Windows.Forms.Timer _animTimer = new System.Windows.Forms.Timer();
+    private readonly float[] _waveHist = new float[5];
+    private readonly float[] _barNorms = new float[9];
+    private float _smoothLevel = 0f;
+    private int _frameIdx = 0;
+    private long _recStartTick = 0L, _elapsedOverrideSec = -1L;
+    private int _maxDurationSec = 0, _warnRemainSec = 0;
+    private bool _isWaveRecording = false, _shown = false;
+    private string _text = "", _position = "bottom", _iconKind = "";
+    private Color _bgColor = DefaultBgColor, _iconColor = Color.White, _mainColor = Color.White, _hintColor = RecHintColor, _borderColor = Color.Gray;
+    private IntPtr _fgHwnd = IntPtr.Zero;
+    private int _lastX = int.MinValue, _lastY = int.MinValue, _lastW = 0, _lastH = 0;
+
+    public bool IsWaveAnimating { get { return _isWaveRecording && _animTimer.Enabled; } }
+    public int LastWidth { get { return _lastW; } }
+    public int LastHeight { get { return _lastH; } }
+    public bool IsCountdownWarning {
+        get {
+            if (!_isWaveRecording || _maxDurationSec <= 0 || _warnRemainSec <= 0) return false;
+            long rem = Math.Max(0L, (long)_maxDurationSec - GetEffectiveElapsedSec());
+            return rem <= (long)_warnRemainSec;
+        }
+    }
+    public float[] CurrentBarNorms { get { float[] c = new float[9]; Array.Copy(_barNorms, c, 9); return c; } }
+    public string CurrentDurationText { get { return VoiceWinShim.FormatRecordingDuration(GetEffectiveElapsedSec()); } }
+
+    private int ScalePx(int px) { return (int)Math.Round(px * _dpi / 96.0); }
+
+    private long GetEffectiveElapsedSec() {
+        if (_elapsedOverrideSec >= 0L) return _elapsedOverrideSec;
+        long diffMs = (long)VoiceWinShim.GetTickCount64() - _recStartTick;
+        return (diffMs > 0L) ? (diffMs / 1000L) : 0L;
+    }
+
+    private void ResetWaveEnvelope() {
+        _smoothLevel = 0f; _frameIdx = 0; _elapsedOverrideSec = -1L;
+        Array.Clear(_waveHist, 0, _waveHist.Length);
+        Array.Clear(_barNorms, 0, _barNorms.Length);
+    }
+
+    private void StepWaveEnvelope(float rawLvl) {
+        float r = (rawLvl < 0f) ? 0f : ((rawLvl > 1f) ? 1f : rawLvl);
+        _smoothLevel = (r > _smoothLevel) ? (_smoothLevel * 0.35f + r * 0.65f) : (_smoothLevel * 0.70f + r * 0.30f);
+        for (int k = _waveHist.Length - 1; k > 0; k--) _waveHist[k] = _waveHist[k - 1];
+        _waveHist[0] = _smoothLevel;
+        _frameIdx++;
+        for (int i = 0; i < 9; i++) {
+            int dist = Math.Abs(i - 4);
+            float v = _waveHist[dist] * BellWeight[dist];
+            if (v > 0.03f) v *= (float)(0.86 + 0.14 * Math.Sin(_frameIdx * 0.75 + i * 1.15));
+            else v = 0f;
+            _barNorms[i] = (v < 0f) ? 0f : ((v > 1f) ? 1f : v);
+        }
+    }
+
+    public void StepTestRecordingFrame(float rawLevel, long elapsedSec) {
+        _elapsedOverrideSec = elapsedSec;
+        StepWaveEnvelope(rawLevel);
+        RenderPill(false);
+    }
 
     private static bool HasCjk(string s) {
         if (string.IsNullOrEmpty(s)) return false;
         for (int i = 0; i < s.Length; i++) { if (s[i] >= 0x2E80 && s[i] <= 0x9FFF) return true; }
         return false;
     }
-    private static Font CreateHudFont(bool preferCjk, out bool owns) {
+
+    private static Font CreateHudFont(bool preferCjk, int dpi, out bool owns) {
+        float pxSize = Math.Max(12f, (float)Math.Round(13.0f * dpi / 96.0f));
         string[] fams = preferCjk ? new string[] { "Microsoft YaHei UI", "Segoe UI" } : new string[] { "Segoe UI", "Microsoft YaHei UI" };
         foreach (string n in fams) {
-            try { using (FontFamily ff = new FontFamily(n)) { owns = true; return new Font(ff, 10.5f, ff.IsStyleAvailable(FontStyle.Bold) ? FontStyle.Bold : FontStyle.Regular); } } catch { }
+            try {
+                using (FontFamily ff = new FontFamily(n)) {
+                    FontStyle st = ff.IsStyleAvailable(FontStyle.Regular) ? FontStyle.Regular : FontStyle.Bold;
+                    owns = true;
+                    return new Font(ff, pxSize, st, GraphicsUnit.Pixel);
+                }
+            } catch { }
         }
-        try { owns = true; return new Font(FontFamily.GenericSansSerif, 10.5f, FontStyle.Bold); } catch { owns = false; return SystemFonts.DefaultFont; }
+        try { owns = true; return new Font(FontFamily.GenericSansSerif, pxSize, FontStyle.Regular, GraphicsUnit.Pixel); }
+        catch { owns = false; return SystemFonts.DefaultFont; }
+    }
+
+    private static GraphicsPath BuildCapsulePath(float x, float y, float rw, float rh) {
+        GraphicsPath path = new GraphicsPath();
+        float d = Math.Max(2f, Math.Min(rw, rh));
+        path.AddArc(x, y, d, d, 90f, 180f);
+        path.AddArc(x + rw - d, y, d, d, 270f, 180f);
+        path.CloseFigure();
+        return path;
+    }
+
+    private static GraphicsPath BuildVerticalBarPath(float x, float y, float bw, float bh) {
+        GraphicsPath p = new GraphicsPath();
+        if (bh <= bw + 0.05f) {
+            p.AddEllipse(x, y, bw, bw);
+        } else {
+            p.AddArc(x, y, bw, bw, 180f, 180f);
+            p.AddArc(x, y + bh - bw, bw, bw, 0f, 180f);
+            p.CloseFigure();
+        }
+        return p;
+    }
+
+    private static string ResolveIconKind(string iconKind, string iconSeg) {
+        if (!string.IsNullOrEmpty(iconKind)) return iconKind;
+        if (iconSeg == "\u25D0") return "recognizing";
+        if (iconSeg == "\u25C8") return "refining";
+        if (iconSeg == "\u2713") return "done";
+        if (iconSeg == "\u25CB") return "empty";
+        return "error";
+    }
+
+    private static void AddQuadCurve(GraphicsPath gp, PointF p0, PointF ctrl, PointF p1) {
+        PointF c1 = new PointF(p0.X + (ctrl.X - p0.X) * (2.0f / 3.0f), p0.Y + (ctrl.Y - p0.Y) * (2.0f / 3.0f));
+        PointF c2 = new PointF(p1.X + (ctrl.X - p1.X) * (2.0f / 3.0f), p1.Y + (ctrl.Y - p1.Y) * (2.0f / 3.0f));
+        gp.AddBezier(p0, c1, c2, p1);
+    }
+
+    private static void DrawStatusIcon(Graphics g, string kind, Color color, float x, float y, float box, float dpiScale) {
+        SmoothingMode prevSm = g.SmoothingMode;
+        PixelOffsetMode prevPo = g.PixelOffsetMode;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        try {
+            if (kind == "recognizing") {
+                float ins = 1.0f * dpiScale;
+                float d = Math.Max(2.0f, box - ins * 2.0f);
+                using (Pen p = new Pen(color, 1.6f * dpiScale)) {
+                    g.DrawEllipse(p, x + ins, y + ins, d, d);
+                }
+                using (GraphicsPath semi = new GraphicsPath())
+                using (SolidBrush b = new SolidBrush(color)) {
+                    semi.AddArc(x + ins, y + ins, d, d, 90f, 180f);
+                    semi.CloseFigure();
+                    g.FillPath(b, semi);
+                }
+            } else if (kind == "refining") {
+                float cx = x + box * 0.5f, cy = y + box * 0.5f;
+                PointF top = new PointF(cx, y + box * 0.04f);
+                PointF right = new PointF(x + box * 0.96f, cy);
+                PointF bottom = new PointF(cx, y + box * 0.96f);
+                PointF left = new PointF(x + box * 0.04f, cy);
+                float pull = box * 0.085f;
+                using (GraphicsPath sp = new GraphicsPath())
+                using (SolidBrush b = new SolidBrush(color)) {
+                    AddQuadCurve(sp, top, new PointF(cx + pull, cy - pull), right);
+                    AddQuadCurve(sp, right, new PointF(cx + pull, cy + pull), bottom);
+                    AddQuadCurve(sp, bottom, new PointF(cx - pull, cy + pull), left);
+                    AddQuadCurve(sp, left, new PointF(cx - pull, cy - pull), top);
+                    sp.CloseFigure();
+                    g.FillPath(b, sp);
+                }
+            } else if (kind == "done") {
+                using (Pen p = new Pen(color, 1.8f * dpiScale)) {
+                    p.StartCap = LineCap.Round;
+                    p.EndCap = LineCap.Round;
+                    p.LineJoin = LineJoin.Round;
+                    g.DrawLines(p, new PointF[] {
+                        new PointF(x + box * 0.14f, y + box * 0.54f),
+                        new PointF(x + box * 0.40f, y + box * 0.80f),
+                        new PointF(x + box * 0.88f, y + box * 0.24f)
+                    });
+                }
+            } else if (kind == "empty") {
+                float ins = 1.0f * dpiScale;
+                float d = Math.Max(2.0f, box - ins * 2.0f);
+                using (Pen p = new Pen(color, 1.6f * dpiScale)) {
+                    g.DrawEllipse(p, x + ins, y + ins, d, d);
+                }
+            } else {
+                float ins = 1.8f * dpiScale;
+                using (Pen p = new Pen(color, 1.8f * dpiScale)) {
+                    p.StartCap = LineCap.Round;
+                    p.EndCap = LineCap.Round;
+                    g.DrawLine(p, x + ins, y + ins, x + box - ins, y + box - ins);
+                    g.DrawLine(p, x + box - ins, y + ins, x + ins, y + box - ins);
+                }
+            }
+        } finally {
+            g.SmoothingMode = prevSm;
+            g.PixelOffsetMode = prevPo;
+        }
     }
 
     public HudPillForm() {
         _cjkFont = VoiceWinShim.GetHostUiCulture().StartsWith("zh", StringComparison.OrdinalIgnoreCase);
-        _font = CreateHudFont(_cjkFont, out _ownsFont);
+        _dpi = VoiceWinShim.GetTargetDpi(IntPtr.Zero);
+        _font = CreateHudFont(_cjkFont, _dpi, out _ownsFont);
+        AutoScaleMode = AutoScaleMode.None;
         FormBorderStyle = FormBorderStyle.None; StartPosition = FormStartPosition.Manual;
-        ShowInTaskbar = false; DoubleBuffered = true; BackColor = Color.FromArgb(24, 26, 32);
+        ShowInTaskbar = false; BackColor = DefaultBgColor;
         _timer.Tick += (s, e) => { _timer.Stop(); HideNoActivate(); };
+        _animTimer.Interval = 60;
+        _animTimer.Tick += (s, e) => {
+            if (!_isWaveRecording || IsDisposed) { _animTimer.Stop(); return; }
+            StepWaveEnvelope(VoiceWinShim.GetLiveAudioLevel());
+            RenderPill(false);
+        };
     }
     protected override bool ShowWithoutActivation { get { return true; } }
     protected override CreateParams CreateParams {
-        get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x08000000 | 0x00000080 | 0x00000008; return cp; }
+        get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x00080000 | 0x00000020 | 0x08000000 | 0x00000080 | 0x00000008; return cp; }
     }
     protected override void WndProc(ref Message m) {
         if (m.Msg == 0x0021) { m.Result = new IntPtr(3); return; }
         base.WndProc(ref m);
     }
-    public void HideNoActivate() { if (IsHandleCreated) ShowWindow(Handle, 0); }
-    public void ShowStatus(string text, Color fg, Color border, int autoHideMs, IntPtr fgHwnd, string position) {
-        _timer.Stop(); _text = text ?? ""; _fg = fg; _border = border;
+    public void HideNoActivate() {
+        _timer.Stop(); _animTimer.Stop(); _isWaveRecording = false; _shown = false;
+        _maxDurationSec = 0; _warnRemainSec = 0;
+        if (IsHandleCreated) ShowWindow(Handle, 0);
+    }
+    public void ShowStatus(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int autoHideMs, IntPtr fgHwnd, string position, bool waveMode = false, string iconKind = "", int maxDurationSec = 0, int warnRemainSec = 0) {
+        _timer.Stop();
+        _text = text ?? ""; _bgColor = bgColor; _iconColor = iconColor; _mainColor = mainColor; _hintColor = hintColor; _borderColor = border;
+        _iconKind = iconKind ?? ""; _fgHwnd = fgHwnd; _position = position ?? "bottom";
+        int dpi = VoiceWinShim.GetTargetDpi(fgHwnd);
         bool wantCjk = HasCjk(_text);
-        if (wantCjk != _cjkFont) { if (_ownsFont && _font != null) _font.Dispose(); _cjkFont = wantCjk; _font = CreateHudFont(_cjkFont, out _ownsFont); }
-        Screen scr = (fgHwnd != IntPtr.Zero) ? Screen.FromHandle(fgHwnd) : Screen.PrimaryScreen;
-        if (scr == null) scr = Screen.PrimaryScreen;
-        Rectangle wa = (scr != null) ? scr.WorkingArea : new Rectangle(0, 0, 1920, 1080);
-        Size sz = TextRenderer.MeasureText(_text, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
-        int w = Math.Min(Math.Max(156, wa.Width - 24), Math.Max(156, sz.Width + 36)), h = Math.Max(36, sz.Height + 16);
-        bool isTop = string.Equals((position ?? "").Trim(), "top", StringComparison.OrdinalIgnoreCase);
-        int x = wa.Left + (wa.Width - w) / 2;
-        int y = isTop ? (wa.Top + 36) : Math.Max(wa.Top + 8, wa.Bottom - h - 14);
-        IntPtr rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, h, h);
-        Region old = Region; Region = Region.FromHrgn(rgn); DeleteObject(rgn);
-        if (old != null) old.Dispose();
-        IntPtr hdl = Handle;
-        SetWindowPos(hdl, new IntPtr(-1), x, y, w, h, 0x0010 | 0x0040);
-        Invalidate(); Update();
+        if (_font == null || wantCjk != _cjkFont || dpi != _dpi) {
+            if (_ownsFont && _font != null) _font.Dispose();
+            _cjkFont = wantCjk; _dpi = dpi;
+            _font = CreateHudFont(_cjkFont, _dpi, out _ownsFont);
+        }
+        if (waveMode) {
+            _maxDurationSec = (maxDurationSec > 0) ? maxDurationSec : 0;
+            _warnRemainSec = (_maxDurationSec > 0) ? ((warnRemainSec > 0) ? warnRemainSec : VoiceWinShim.RecordingCountdownWarnSec(_maxDurationSec)) : 0;
+            if (!_isWaveRecording) {
+                _isWaveRecording = true;
+                _recStartTick = (long)VoiceWinShim.GetTickCount64();
+                ResetWaveEnvelope();
+                float initLvl = VoiceWinShim.GetLiveAudioLevel();
+                if (initLvl > 0f) StepWaveEnvelope(initLvl);
+            }
+            RenderPill(true);
+            if (!_animTimer.Enabled) _animTimer.Start();
+        } else {
+            _animTimer.Stop();
+            _isWaveRecording = false;
+            _maxDurationSec = 0; _warnRemainSec = 0;
+            RenderPill(true);
+        }
         if (autoHideMs > 0) { _timer.Interval = autoHideMs; _timer.Start(); }
     }
-    protected override void OnPaint(PaintEventArgs e) {
-        base.OnPaint(e);
-        SmoothingMode prevSmooth = e.Graphics.SmoothingMode;
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        float inset = 1.25f;
-        float d = Math.Max(4f, Height - inset * 2f - 1f);
-        float wArc = Math.Max(d, Width - inset * 2f - 1f);
-        using (GraphicsPath path = new GraphicsPath())
-        using (Pen p = new Pen(_border, 1.5f)) {
-            path.AddArc(inset, inset, d, d, 90f, 180f);
-            path.AddArc(inset + wArc - d, inset, d, d, 270f, 180f);
-            path.CloseFigure();
-            e.Graphics.DrawPath(p, path);
+
+    public Bitmap RenderOffscreenBitmap(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int dpi, Rectangle workArea, bool waveMode, string iconKind, float[] barNormsOverride, long elapsedSec, int maxDurationSec, int warnRemainSec) {
+        _text = text ?? ""; _bgColor = bgColor; _iconColor = iconColor; _mainColor = mainColor; _hintColor = hintColor; _borderColor = border;
+        _iconKind = iconKind ?? ""; _position = "bottom"; _isWaveRecording = waveMode;
+        _maxDurationSec = (waveMode && maxDurationSec > 0) ? maxDurationSec : 0;
+        _warnRemainSec = (_maxDurationSec > 0) ? ((warnRemainSec > 0) ? warnRemainSec : VoiceWinShim.RecordingCountdownWarnSec(_maxDurationSec)) : 0;
+        _elapsedOverrideSec = elapsedSec;
+        Array.Clear(_barNorms, 0, _barNorms.Length);
+        if (barNormsOverride != null) {
+            int n = Math.Min(9, barNormsOverride.Length);
+            for (int i = 0; i < n; i++) _barNorms[i] = barNormsOverride[i];
         }
-        e.Graphics.SmoothingMode = prevSmooth;
-        Rectangle rc = new Rectangle(10, 0, Math.Max(1, Width - 20), Height);
-        TextRenderer.DrawText(e.Graphics, _text, _font, rc, _fg, DrawFlags);
+        int clampedDpi = (dpi < 96) ? 96 : ((dpi > 480) ? 480 : dpi);
+        bool wantCjk = HasCjk(_text);
+        if (_font == null || wantCjk != _cjkFont || clampedDpi != _dpi) {
+            if (_ownsFont && _font != null) _font.Dispose();
+            _cjkFont = wantCjk; _dpi = clampedDpi;
+            _font = CreateHudFont(_cjkFont, _dpi, out _ownsFont);
+        }
+        int dummyX, dummyY;
+        return BuildPillPArgbBitmap(workArea, out dummyX, out dummyY);
+    }
+
+    private Bitmap BuildPillPArgbBitmap(Rectangle wa, out int x, out int y) {
+        string iconSeg, mainSeg, hintSeg; bool spBeforeHint;
+        VoiceWinShim.SplitHudSegments(_text, out iconSeg, out mainSeg, out hintSeg, out spBeforeHint);
+        int padL = ScalePx(13), padR = ScalePx(14), minW = ScalePx(64);
+        int maxW = Math.Max(minW, wa.Width - ScalePx(24));
+
+        float dpiScale = _dpi / 96.0f;
+        float barW = 2.4f * dpiScale, barGap = 2.2f * dpiScale;
+        int waveBoxW = (int)Math.Ceiling(9.0f * barW + 8.0f * barGap);
+        string durStr = "", effHint = hintSeg;
+        int slotW = 0, hintSlotW = 0, iconBox = 0, gap1 = 0, gap2 = 0, iconGap = 0, hintGap = 0, totalTextW = 0, textH = 0;
+        Size mainSz = Size.Empty, hintSz = Size.Empty;
+        Color effBg = _bgColor, effBorder = _borderColor, effMain = _mainColor, effHintCol = _hintColor;
+        Color effWaveActive = RecWaveActiveColor, effWaveQuiet = RecWaveQuietColor;
+
+        if (_isWaveRecording) {
+            long elapsedSec = GetEffectiveElapsedSec();
+            bool isWarn = false;
+            long remainSec = 0L;
+            if (_maxDurationSec > 0 && _warnRemainSec > 0) {
+                remainSec = Math.Max(0L, (long)_maxDurationSec - elapsedSec);
+                isWarn = (remainSec <= (long)_warnRemainSec);
+            }
+            bool zhHint = (_text.Length > 0) ? HasCjk(_text) : _cjkFont;
+            if (isWarn) {
+                effBg = WarnBgColor;
+                effBorder = WarnBorderColor;
+                effWaveActive = WarnWaveActiveColor;
+                effWaveQuiet = WarnWaveQuietColor;
+                effMain = WarnMainColor;
+                effHintCol = WarnHintColor;
+                effHint = VoiceWinShim.FormatCountdownHint((int)remainSec, zhHint);
+            } else {
+                effBg = RecBgColor;
+                effBorder = RecBorderColor;
+                effWaveActive = RecWaveActiveColor;
+                effWaveQuiet = RecWaveQuietColor;
+                effMain = RecMainColor;
+                effHintCol = RecHintColor;
+            }
+            durStr = VoiceWinShim.FormatRecordingDuration(elapsedSec);
+            string slotTpl = VoiceWinShim.DurationSlotTemplate(elapsedSec);
+            Size actDurSz = TextRenderer.MeasureText(durStr, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
+            Size tplDurSz = TextRenderer.MeasureText(slotTpl, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
+            slotW = Math.Max(actDurSz.Width, tplDurSz.Width);
+            if (effHint.Length > 0) {
+                hintSz = TextRenderer.MeasureText(effHint, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
+                if (isWarn) {
+                    string hintTpl = VoiceWinShim.CountdownHintSlotTemplate((int)remainSec, zhHint);
+                    Size tplHintSz = TextRenderer.MeasureText(hintTpl, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
+                    hintSlotW = Math.Max(hintSz.Width, tplHintSz.Width);
+                } else {
+                    hintSlotW = hintSz.Width;
+                }
+            }
+            gap1 = ScalePx(7);
+            gap2 = (effHint.Length > 0) ? ScalePx(6) : 0;
+            totalTextW = waveBoxW + gap1 + slotW + gap2 + hintSlotW;
+            textH = Math.Max(actDurSz.Height, hintSz.Height);
+        } else {
+            iconBox = (iconSeg.Length > 0) ? ScalePx(11) : 0;
+            mainSz = (mainSeg.Length > 0) ? TextRenderer.MeasureText(mainSeg, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags) : Size.Empty;
+            hintSz = (hintSeg.Length > 0) ? TextRenderer.MeasureText(hintSeg, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags) : Size.Empty;
+            iconGap = (iconBox > 0 && (mainSeg.Length > 0 || hintSeg.Length > 0)) ? ScalePx(6) : 0;
+            hintGap = (hintSeg.Length > 0 && mainSeg.Length > 0) ? ScalePx(spBeforeHint ? 4 : 2) : 0;
+            totalTextW = iconBox + iconGap + mainSz.Width + hintGap + hintSz.Width;
+            textH = Math.Max(iconBox, Math.Max(mainSz.Height, hintSz.Height));
+        }
+        if (textH <= 0) textH = TextRenderer.MeasureText("Ag", _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags).Height;
+
+        int rawW = Math.Max(minW, totalTextW + padL + padR);
+        bool truncated = rawW > maxW;
+        int w = Math.Min(maxW, rawW);
+        int h = Math.Max(ScalePx(31), textH + ScalePx(12));
+        bool isTop = string.Equals((_position ?? "").Trim(), "top", StringComparison.OrdinalIgnoreCase);
+        x = wa.Left + (wa.Width - w) / 2;
+        y = isTop ? (wa.Top + ScalePx(36)) : Math.Max(wa.Top + ScalePx(4), wa.Bottom - h - ScalePx(4));
+
+        Bitmap outBmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+        using (Bitmap rgbBmp = new Bitmap(w, h, PixelFormat.Format32bppRgb))
+        using (Bitmap maskBmp = new Bitmap(w, h, PixelFormat.Format32bppArgb)) {
+            using (Graphics g = Graphics.FromImage(rgbBmp)) {
+                g.Clear(effBg);
+                int availW = Math.Max(1, w - padL - padR);
+                int bleed = ScalePx(2);
+                if (_isWaveRecording) {
+                    int curX = padL + (truncated ? 0 : Math.Max(0, (availW - totalTextW) / 2));
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    float maxBarH = Math.Min(h - 8.0f * dpiScale, 15.0f * dpiScale);
+                    if (maxBarH < barW) maxBarH = barW;
+                    using (SolidBrush quietBrush = new SolidBrush(effWaveQuiet))
+                    using (SolidBrush activeBrush = new SolidBrush(effWaveActive)) {
+                        for (int i = 0; i < 9; i++) {
+                            float norm = _barNorms[i];
+                            float bh = barW + norm * (maxBarH - barW);
+                            float bx = curX + i * (barW + barGap);
+                            float by = (h - bh) * 0.5f;
+                            using (GraphicsPath bp = BuildVerticalBarPath(bx, by, barW, bh)) {
+                                g.FillPath((norm > 0.01f) ? activeBrush : quietBrush, bp);
+                            }
+                        }
+                    }
+                    curX += waveBoxW + gap1;
+                    TextRenderer.DrawText(g, durStr, _font, new Rectangle(curX - bleed, 0, slotW + bleed * 2, h), effMain, DurDrawFlags);
+                    curX += slotW + gap2;
+                    if (effHint.Length > 0) {
+                        int remW = w - padR - curX;
+                        if (remW > 0) {
+                            if (truncated) {
+                                TextRenderer.DrawText(g, effHint, _font, new Rectangle(curX, 0, remW, h), effHintCol, SegDrawFlags | TextFormatFlags.EndEllipsis);
+                            } else {
+                                TextRenderer.DrawText(g, effHint, _font, new Rectangle(curX, 0, hintSlotW + bleed, h), effHintCol, SegDrawFlags);
+                            }
+                        }
+                    }
+                } else if (truncated) {
+                    if (iconBox > 0) {
+                        DrawStatusIcon(g, ResolveIconKind(_iconKind, iconSeg), _iconColor, (float)padL, (h - iconBox) * 0.5f, (float)iconBox, dpiScale);
+                        int tx = padL + iconBox + iconGap;
+                        string restTxt = mainSeg + ((hintSeg.Length > 0) ? ((spBeforeHint ? " " : "") + hintSeg) : "");
+                        if (w - padR - tx > 0 && restTxt.Length > 0) {
+                            TextRenderer.DrawText(g, restTxt, _font, new Rectangle(tx, 0, w - padR - tx, h), effMain, SegDrawFlags | TextFormatFlags.EndEllipsis);
+                        }
+                    } else {
+                        TextRenderer.DrawText(g, _text, _font, new Rectangle(padL, 0, availW, h), effMain, TruncDrawFlags);
+                    }
+                } else {
+                    int curX = padL + Math.Max(0, (availW - totalTextW) / 2);
+                    if (iconBox > 0) {
+                        DrawStatusIcon(g, ResolveIconKind(_iconKind, iconSeg), _iconColor, (float)curX, (h - iconBox) * 0.5f, (float)iconBox, dpiScale);
+                        curX += iconBox + iconGap;
+                    }
+                    if (mainSeg.Length > 0) {
+                        TextRenderer.DrawText(g, mainSeg, _font, new Rectangle(curX, 0, mainSz.Width + bleed, h), effMain, SegDrawFlags);
+                        curX += mainSz.Width + hintGap;
+                    }
+                    if (hintSeg.Length > 0) {
+                        TextRenderer.DrawText(g, hintSeg, _font, new Rectangle(curX, 0, hintSz.Width + bleed, h), effHintCol, SegDrawFlags);
+                    }
+                }
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                float penW = Math.Max(1.0f, 1.1f * (_dpi / 96.0f));
+                float inset = penW * 0.5f + 0.5f;
+                using (GraphicsPath borderPath = BuildCapsulePath(inset, inset, Math.Max(4f, w - inset * 2.0f), Math.Max(4f, h - inset * 2.0f)))
+                using (Pen borderPen = new Pen(effBorder, penW)) {
+                    g.DrawPath(borderPen, borderPath);
+                }
+            }
+            using (Graphics gm = Graphics.FromImage(maskBmp)) {
+                gm.Clear(Color.FromArgb(0, 0, 0, 0));
+                gm.SmoothingMode = SmoothingMode.AntiAlias;
+                gm.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                using (GraphicsPath maskPath = BuildCapsulePath(0.5f, 0.5f, Math.Max(4f, w - 1.0f), Math.Max(4f, h - 1.0f)))
+                using (SolidBrush maskBrush = new SolidBrush(Color.FromArgb(242, 255, 255, 255))) {
+                    gm.FillPath(maskBrush, maskPath);
+                }
+            }
+            Rectangle fullRc = new Rectangle(0, 0, w, h);
+            BitmapData rgbData = null, maskData = null, outData = null;
+            try {
+                rgbData = rgbBmp.LockBits(fullRc, ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);
+                maskData = maskBmp.LockBits(fullRc, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                outData = outBmp.LockBits(fullRc, ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
+                int byteLen = outData.Stride * h;
+                byte[] rgbBytes = new byte[byteLen];
+                byte[] maskBytes = new byte[byteLen];
+                byte[] outBytes = new byte[byteLen];
+                Marshal.Copy(rgbData.Scan0, rgbBytes, 0, byteLen);
+                Marshal.Copy(maskData.Scan0, maskBytes, 0, byteLen);
+                for (int idx = 0; idx < byteLen; idx += 4) {
+                    int a = maskBytes[idx + 3];
+                    if (a != 0) {
+                        outBytes[idx]     = (byte)((rgbBytes[idx]     * a + 127) / 255);
+                        outBytes[idx + 1] = (byte)((rgbBytes[idx + 1] * a + 127) / 255);
+                        outBytes[idx + 2] = (byte)((rgbBytes[idx + 2] * a + 127) / 255);
+                        outBytes[idx + 3] = (byte)a;
+                    }
+                }
+                Marshal.Copy(outBytes, 0, outData.Scan0, byteLen);
+            } finally {
+                if (outData != null) outBmp.UnlockBits(outData);
+                if (maskData != null) maskBmp.UnlockBits(maskData);
+                if (rgbData != null) rgbBmp.UnlockBits(rgbData);
+            }
+        }
+        _lastX = x; _lastY = y; _lastW = w; _lastH = h;
+        return outBmp;
+    }
+
+    private void RenderPill(bool forceTopMost) {
+        Rectangle wa = VoiceWinShim.GetTargetWorkArea(_fgHwnd);
+        int prevX = _lastX, prevY = _lastY, prevW = _lastW, prevH = _lastH;
+        int x, y;
+        IntPtr hdl = Handle;
+        using (Bitmap outBmp = BuildPillPArgbBitmap(wa, out x, out y)) {
+            int w = outBmp.Width, h = outBmp.Height;
+            IntPtr screenDc = IntPtr.Zero, memDc = IntPtr.Zero, hBmp = IntPtr.Zero, oldBmp = IntPtr.Zero;
+            try {
+                screenDc = GetDC(IntPtr.Zero);
+                memDc = CreateCompatibleDC(screenDc);
+                hBmp = outBmp.GetHbitmap(Color.FromArgb(0, 0, 0, 0));
+                oldBmp = SelectObject(memDc, hBmp);
+                WinPoint ptDst = new WinPoint(x, y);
+                WinSize szWnd = new WinSize(w, h);
+                WinPoint ptSrc = new WinPoint(0, 0);
+                BlendFunc blend = new BlendFunc { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = 1 };
+                UpdateLayeredWindow(hdl, screenDc, ref ptDst, ref szWnd, memDc, ref ptSrc, 0, ref blend, 2);
+            } finally {
+                if (memDc != IntPtr.Zero && oldBmp != IntPtr.Zero) SelectObject(memDc, oldBmp);
+                if (hBmp != IntPtr.Zero) DeleteObject(hBmp);
+                if (memDc != IntPtr.Zero) DeleteDC(memDc);
+                if (screenDc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screenDc);
+            }
+            if (forceTopMost || !_shown || x != prevX || y != prevY || w != prevW || h != prevH) {
+                SetWindowPos(hdl, new IntPtr(-1), x, y, w, h, 0x0010 | 0x0040);
+                _shown = true;
+            }
+        }
     }
     protected override void Dispose(bool disposing) {
-        if (disposing) { _timer.Dispose(); if (_ownsFont && _font != null) _font.Dispose(); }
+        if (disposing) { _timer.Dispose(); _animTimer.Dispose(); if (_ownsFont && _font != null) _font.Dispose(); }
         base.Dispose(disposing);
     }
 }
@@ -158,6 +602,17 @@ public static class VoiceWinShim {
     [StructLayout(LayoutKind.Explicit)] private struct INPUT_UNION { [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] private long _p0; [FieldOffset(8)] private long _p1; [FieldOffset(16)] private long _p2; [FieldOffset(24)] private long _p3; }
     [StructLayout(LayoutKind.Sequential)] private struct INPUT { public uint type; public INPUT_UNION u; }
 
+    [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)] private struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+
+    [DllImport("user32.dll")] private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+    [DllImport("shcore.dll")] private static extern int SetProcessDpiAwareness(int awareness);
+    [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+    [DllImport("shcore.dll")] private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+    [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern uint GetDpiForSystem();
     [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
     [DllImport("user32.dll", SetLastError = true)] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
     [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
@@ -195,6 +650,81 @@ public static class VoiceWinShim {
         {"lalt",0xA4},{"lmenu",0xA4},{"rshift",0xA1},{"lshift",0xA0},{"capslock",0x14},{"scrolllock",0x91},
         {"pause",0x13},{"insert",0x2D},{"space",0x20}
     };
+
+    public static void EnableDpiAwareness() {
+        try { if (SetProcessDpiAwarenessContext(new IntPtr(-4))) return; } catch { }
+        try { if (SetProcessDpiAwareness(2) == 0) return; } catch { }
+        try { SetProcessDPIAware(); } catch { }
+    }
+
+    private static int ClampDpi(int dpi) { return (dpi < 96) ? 96 : ((dpi > 480) ? 480 : dpi); }
+
+    public static int GetTargetDpi(IntPtr fgHwnd) {
+        IntPtr target = (fgHwnd != IntPtr.Zero) ? fgHwnd : GetForegroundWindow();
+        try {
+            IntPtr hMon = MonitorFromWindow(target, 2u);
+            if (hMon != IntPtr.Zero) {
+                uint dpiX, dpiY;
+                if (GetDpiForMonitor(hMon, 0, out dpiX, out dpiY) == 0 && dpiX > 0) return ClampDpi((int)dpiX);
+            }
+        } catch { }
+        if (target != IntPtr.Zero) {
+            try { uint wDpi = GetDpiForWindow(target); if (wDpi > 0) return ClampDpi((int)wDpi); } catch { }
+        }
+        try { uint sDpi = GetDpiForSystem(); if (sDpi > 0) return ClampDpi((int)sDpi); } catch { }
+        return 96;
+    }
+
+    public static Rectangle GetTargetWorkArea(IntPtr fgHwnd) {
+        IntPtr target = (fgHwnd != IntPtr.Zero) ? fgHwnd : GetForegroundWindow();
+        try {
+            IntPtr hMon = MonitorFromWindow(target, 2u);
+            if (hMon != IntPtr.Zero) {
+                MONITORINFO mi = new MONITORINFO();
+                mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+                if (GetMonitorInfo(hMon, ref mi) && mi.rcWork.Right > mi.rcWork.Left && mi.rcWork.Bottom > mi.rcWork.Top) {
+                    return Rectangle.FromLTRB(mi.rcWork.Left, mi.rcWork.Top, mi.rcWork.Right, mi.rcWork.Bottom);
+                }
+            }
+        } catch { }
+        Screen scr = (target != IntPtr.Zero) ? Screen.FromHandle(target) : Screen.PrimaryScreen;
+        if (scr == null) scr = Screen.PrimaryScreen;
+        return (scr != null) ? scr.WorkingArea : new Rectangle(0, 0, 1920, 1080);
+    }
+
+    public static void SplitHudSegments(string raw, out string icon, out string main, out string hint, out bool spaceBeforeHint) {
+        icon = ""; main = ""; hint = ""; spaceBeforeHint = false;
+        string s = (raw ?? "").Trim();
+        if (s.Length == 0) return;
+        string rest = s;
+        int spIdx = s.IndexOf(' ');
+        if (spIdx >= 1 && spIdx <= 3 && spIdx + 1 < s.Length) {
+            bool hasAlphaNum = false;
+            for (int i = 0; i < spIdx; i++) {
+                if (char.IsLetterOrDigit(s[i])) { hasAlphaNum = true; break; }
+            }
+            if (!hasAlphaNum) {
+                icon = s.Substring(0, spIdx);
+                int afterIdx = spIdx + 1;
+                while (afterIdx < s.Length && s[afterIdx] == ' ') afterIdx++;
+                rest = s.Substring(afterIdx);
+            }
+        }
+        if (rest.EndsWith(")")) {
+            int openIdx = rest.LastIndexOf('(');
+            if (openIdx > 0) {
+                int trimEnd = openIdx;
+                while (trimEnd > 0 && rest[trimEnd - 1] == ' ') trimEnd--;
+                if (trimEnd > 0) {
+                    main = rest.Substring(0, trimEnd);
+                    spaceBeforeHint = (trimEnd < openIdx);
+                    hint = rest.Substring(openIdx);
+                    return;
+                }
+            }
+        }
+        main = rest;
+    }
 
     public static string GetHostUiCulture() {
         string n = "";
@@ -254,23 +784,118 @@ public static class VoiceWinShim {
         } catch { try { SystemSounds.Asterisk.Play(); } catch { } }
     }
 
-    public static void UpdateHud(string state, string customText, int durationMs, string position = "bottom") {
+    public static string FormatRecordingDuration(long elapsedSec) {
+        long sec = (elapsedSec < 0L) ? 0L : elapsedSec;
+        if (sec < 60L) return sec.ToString(CultureInfo.InvariantCulture) + "s";
+        long m = sec / 60L, s = sec % 60L;
+        return m.ToString(CultureInfo.InvariantCulture) + "m " + s.ToString("00", CultureInfo.InvariantCulture) + "s";
+    }
+
+    public static string DurationSlotTemplate(long elapsedSec) {
+        if (elapsedSec < 10L) return "8s";
+        if (elapsedSec < 60L) return "88s";
+        if (elapsedSec < 600L) return "8m 88s";
+        return "88m 88s";
+    }
+
+    public static int RecordingCountdownWarnSec(int maxDurationSec) {
+        if (maxDurationSec <= 0) return 0;
+        if (maxDurationSec >= 45) return 15;
+        int third = maxDurationSec / 3;
+        return Math.Max(1, Math.Min(10, (third > 0) ? third : 1));
+    }
+
+    public static string FormatCountdownHint(int remainSec, bool zh) {
+        int r = (remainSec < 0) ? 0 : remainSec;
+        string rs = r.ToString(CultureInfo.InvariantCulture);
+        return zh ? ("(" + rs + "s \u540E\u81EA\u52A8\u5B8C\u6210)") : ("(auto-finish in " + rs + "s)");
+    }
+
+    public static string CountdownHintSlotTemplate(int remainSec, bool zh) {
+        string tpl = (remainSec >= 10) ? "88" : "8";
+        return zh ? ("(" + tpl + "s \u540E\u81EA\u52A8\u5B8C\u6210)") : ("(auto-finish in " + tpl + "s)");
+    }
+
+    public static float ComputePcm16RmsLevel(byte[] pcm, int byteCount) {
+        if (pcm == null || byteCount < 2) return 0f;
+        int nSamples = byteCount / 2;
+        double sumSq = 0.0;
+        for (int i = 0; i < nSamples * 2; i += 2) {
+            short s = (short)(pcm[i] | (pcm[i + 1] << 8));
+            double d = (double)s;
+            sumSq += d * d;
+        }
+        double rms = Math.Sqrt(sumSq / nSamples) / 32768.0;
+        if (rms <= 1e-5) return 0f;
+        double db = 20.0 * Math.Log10(rms);
+        if (db <= -48.0) return 0f;
+        if (db >= -14.0) return 1f;
+        return (float)((db + 48.0) / 34.0);
+    }
+
+    public static void SetExternalAudioLevel(float level) {
+        float clamped = (level < 0f) ? 0f : ((level > 1f) ? 1f : level);
+        _extLevel = clamped;
+        Interlocked.Exchange(ref _extLevelTick, (long)GetTickCount64());
+    }
+
+    public static float GetLiveAudioLevel() {
+        if (_wasapiActive) return _wasapiLevel;
+        if ((long)GetTickCount64() - Interlocked.Read(ref _extLevelTick) <= 260L) return _extLevel;
+        return 0f;
+    }
+
+    private static void ResolveHudVisualStyle(string st, bool zh, string customText, out string txt, out Color bg, out Color ic, out Color mc, out Color hc, out Color bd, out int ms, out bool waveMode, out string iconKind) {
+        ms = 0; waveMode = false; iconKind = "";
+        if (st == "recording") {
+            string hkEn = (_hotkeyLabel == "\u53F3 Ctrl") ? "Right Ctrl" : _hotkeyLabel.Trim();
+            txt = zh
+                ? ("\u25CF \u6B63\u5728\u5F55\u97F3\u2026 (" + (_isPtt ? "\u677E\u5F00" : "\u518D\u6309") + _hotkeyLabel + " \u5B8C\u6210)")
+                : ("\u25CF Listening\u2026 (" + (_isPtt ? "release " : "press ") + hkEn + " to finish)");
+            bg = Color.FromArgb(64, 18, 26); ic = Color.FromArgb(255, 104, 112); mc = Color.FromArgb(248, 250, 252); hc = Color.FromArgb(214, 188, 194); bd = Color.FromArgb(196, 66, 80);
+            string trimmedCustom = (customText ?? "").TrimStart();
+            waveMode = string.IsNullOrEmpty(trimmedCustom) || trimmedCustom.StartsWith("\u25CF ", StringComparison.Ordinal);
+        } else if (st == "recognizing" || st == "processing") {
+            txt = zh ? "\u25D0 \u6B63\u5728\u8BED\u97F3\u8BC6\u522B\u2026" : "\u25D0 Transcribing\u2026";
+            bg = Color.FromArgb(16, 40, 72); ic = Color.FromArgb(56, 189, 248); mc = Color.FromArgb(244, 248, 252); hc = Color.FromArgb(176, 198, 222); bd = Color.FromArgb(52, 148, 212); iconKind = "recognizing";
+        } else if (st == "refining") {
+            txt = zh ? "\u25C8 \u6B63\u5728\u6574\u7406\u7CBE\u4FEE\u2026" : "\u25C8 Refining\u2026";
+            bg = Color.FromArgb(46, 22, 76); ic = Color.FromArgb(208, 156, 255); mc = Color.FromArgb(248, 245, 255); hc = Color.FromArgb(198, 182, 226); bd = Color.FromArgb(156, 88, 224); iconKind = "refining";
+        } else if (st == "done") {
+            txt = zh ? "\u2713 \u5DF2\u586B\u5165" : "\u2713 Inserted";
+            bg = Color.FromArgb(14, 54, 36); ic = Color.FromArgb(74, 222, 128); mc = Color.FromArgb(242, 253, 246); hc = Color.FromArgb(174, 218, 192); bd = Color.FromArgb(48, 168, 102); ms = 900; iconKind = "done";
+        } else if (st == "copied") {
+            txt = zh ? "\u2713 \u5DF2\u590D\u5236(\u7A97\u53E3\u5DF2\u5207\u6362)" : "\u2713 Copied (window switched)";
+            bg = Color.FromArgb(28, 32, 82); ic = Color.FromArgb(144, 156, 255); mc = Color.FromArgb(240, 244, 255); hc = Color.FromArgb(186, 196, 238); bd = Color.FromArgb(108, 116, 242); ms = 2000; iconKind = "done";
+        } else if (st == "empty") {
+            txt = zh ? "\u25CB \u672A\u68C0\u6D4B\u5230\u8BED\u97F3" : "\u25CB No speech detected";
+            bg = Color.FromArgb(66, 44, 12); ic = Color.FromArgb(251, 191, 36); mc = Color.FromArgb(254, 243, 199); hc = Color.FromArgb(226, 202, 148); bd = Color.FromArgb(212, 148, 20); ms = 2200; iconKind = "empty";
+        } else {
+            txt = zh ? "\u2715 \u8BC6\u522B\u5931\u8D25" : "\u2715 Transcription failed";
+            bg = Color.FromArgb(84, 18, 24); ic = Color.FromArgb(252, 129, 129); mc = Color.FromArgb(254, 226, 226); hc = Color.FromArgb(238, 178, 182); bd = Color.FromArgb(239, 68, 68); ms = 2600; iconKind = "error";
+        }
+        if (!string.IsNullOrEmpty(customText)) txt = customText;
+    }
+
+    public static Bitmap RenderHudSnapshotBitmap(string state, string customText, int dpi = 192, int workWidth = 1920, int workHeight = 1080, float[] barNorms = null, long elapsedSec = 0L, int maxDurationSec = 0, int warnRemainSec = 0, bool zh = true) {
+        string st = (state ?? "error").Trim().ToLowerInvariant();
+        string txt, iconKind; Color bg, ic, mc, hc, bd; int ms; bool waveMode;
+        ResolveHudVisualStyle(st, zh, customText, out txt, out bg, out ic, out mc, out hc, out bd, out ms, out waveMode, out iconKind);
+        using (HudPillForm f = new HudPillForm()) {
+            return f.RenderOffscreenBitmap(txt, bg, ic, mc, hc, bd, dpi, new Rectangle(0, 0, workWidth, workHeight), waveMode, iconKind, barNorms, elapsedSec, maxDurationSec, warnRemainSec);
+        }
+    }
+
+    public static void UpdateHud(string state, string customText, int durationMs, string position = "bottom", int maxDurationSec = 0, int warnRemainSec = 0) {
         try {
             string st = (state ?? "").Trim().ToLowerInvariant();
             if (st == "" || st == "idle" || st == "hide") { if (_hud != null) _hud.HideNoActivate(); return; }
             if (_hud == null || _hud.IsDisposed) _hud = new HudPillForm();
             bool zh = GetHostUiCulture().StartsWith("zh", StringComparison.OrdinalIgnoreCase);
-            string txt; Color fg, bd; int ms = 0;
-            if (st == "recording") { txt = zh ? ("\u25CF \u6B63\u5728\u5F55\u97F3\u2026 (\u518D\u6309" + _hotkeyLabel + " \u5B8C\u6210)") : "\u25CF Listening\u2026"; fg = Color.FromArgb(255, 102, 102); bd = Color.FromArgb(190, 62, 62); }
-            else if (st == "recognizing" || st == "processing") { txt = zh ? "\u25D0 \u6B63\u5728\u8BED\u97F3\u8BC6\u522B\u2026" : "\u25D0 Transcribing\u2026"; fg = Color.FromArgb(34, 211, 238); bd = Color.FromArgb(20, 148, 175); }
-            else if (st == "refining") { txt = zh ? "\u25C8 \u6B63\u5728\u6574\u7406\u7CBE\u4FEE\u2026" : "\u25C8 Refining\u2026"; fg = Color.FromArgb(251, 191, 36); bd = Color.FromArgb(185, 132, 28); }
-            else if (st == "done") { txt = zh ? "\u2713 \u5DF2\u586B\u5165" : "\u2713 Inserted"; fg = Color.FromArgb(74, 222, 128); bd = Color.FromArgb(46, 150, 88); ms = 900; }
-            else if (st == "copied") { txt = zh ? "\u2713 \u5DF2\u590D\u5236(\u7A97\u53E3\u5DF2\u5207\u6362)" : "\u2713 Copied (window switched)"; fg = Color.FromArgb(129, 140, 248); bd = Color.FromArgb(99, 102, 241); ms = 900; }
-            else if (st == "empty") { txt = zh ? "\u25CB \u672A\u68C0\u6D4B\u5230\u8BED\u97F3" : "\u25CB No speech detected"; fg = Color.FromArgb(203, 213, 225); bd = Color.FromArgb(100, 116, 139); ms = 900; }
-            else { txt = zh ? "\u2715 \u8BC6\u522B\u5931\u8D25" : "\u2715 Transcription failed"; fg = Color.FromArgb(248, 113, 113); bd = Color.FromArgb(185, 65, 65); ms = 900; }
-            if (!string.IsNullOrEmpty(customText)) txt = customText;
+            string txt, iconKind; Color bg, ic, mc, hc, bd; int ms; bool waveMode;
+            ResolveHudVisualStyle(st, zh, customText, out txt, out bg, out ic, out mc, out hc, out bd, out ms, out waveMode, out iconKind);
             if (durationMs > 0) ms = durationMs;
-            _hud.ShowStatus(txt, fg, bd, ms, GetForegroundWindow(), position);
+            _hud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, GetForegroundWindow(), position, waveMode, iconKind, maxDurationSec, warnRemainSec);
         } catch { }
     }
 
@@ -355,6 +980,9 @@ public static class VoiceWinShim {
     private static MemoryStream _recPcm = null;
     private static volatile string _recErr = "";
     private static volatile bool _recInitOk = false;
+    private static volatile float _wasapiLevel = 0f, _extLevel = 0f;
+    private static long _extLevelTick = 0L;
+    private static volatile bool _wasapiActive = false;
 
     private static byte[] BuildPcm16MonoWav(byte[] pcm, int pcmLen, int sr) {
         byte[] buf = new byte[44 + pcmLen];
@@ -377,12 +1005,14 @@ public static class VoiceWinShim {
             int nBytes = (int)(frames * 2);
             if (nBytes > 0) {
                 if ((flags & 2u) != 0 || pData == IntPtr.Zero) {
+                    _wasapiLevel = 0f;
                     int rem = nBytes;
                     while (rem > 0) { int chunk = Math.Min(rem, zeros.Length); dst.Write(zeros, 0, chunk); rem -= chunk; }
                 } else {
                     if (scratch == null || scratch.Length < nBytes) scratch = new byte[Math.Max(nBytes, 8192)];
                     Marshal.Copy(pData, scratch, 0, nBytes);
                     dst.Write(scratch, 0, nBytes);
+                    _wasapiLevel = ComputePcm16RmsLevel(scratch, nBytes);
                 }
             }
             cap.ReleaseBuffer(frames);
@@ -393,6 +1023,7 @@ public static class VoiceWinShim {
     public static bool StartRecording(bool loopback, out string error) {
         int dummyBytes; string dummyErr;
         StopRecording(out dummyBytes, out dummyErr);
+        _wasapiLevel = 0f; _wasapiActive = true;
         ManualResetEvent initEvt = new ManualResetEvent(false);
         ManualResetEvent stopEvt = new ManualResetEvent(false);
         MemoryStream pcm = new MemoryStream(64000);
@@ -435,11 +1066,13 @@ public static class VoiceWinShim {
         });
         t.IsBackground = true; t.SetApartmentState(ApartmentState.MTA); t.Start();
         if (!initEvt.WaitOne(3000)) {
+            _wasapiActive = false; _wasapiLevel = 0f;
             try { stopEvt.Set(); t.Join(300); } catch { }
             try { initEvt.Dispose(); stopEvt.Dispose(); pcm.Dispose(); } catch { }
             error = "wasapi_init_timeout"; return false;
         }
         if (!_recInitOk) {
+            _wasapiActive = false; _wasapiLevel = 0f;
             try { stopEvt.Set(); t.Join(500); } catch { }
             try { initEvt.Dispose(); stopEvt.Dispose(); pcm.Dispose(); } catch { }
             error = string.IsNullOrEmpty(_recErr) ? "wasapi_init_failed" : _recErr; return false;
@@ -455,8 +1088,9 @@ public static class VoiceWinShim {
             _recThread = null; _recInitEvt = null; _recStopEvt = null; _recPcm = null;
         }
         pcmBytes = 0; error = "";
-        if (t == null) { error = "not_recording"; return new byte[0]; }
+        if (t == null) { _wasapiActive = false; _wasapiLevel = 0f; error = "not_recording"; return new byte[0]; }
         try { if (stopEvt != null) stopEvt.Set(); t.Join(2500); } catch { }
+        _wasapiActive = false; _wasapiLevel = 0f;
         if (initEvt != null) { try { initEvt.Dispose(); } catch { } }
         if (stopEvt != null) { try { stopEvt.Dispose(); } catch { } }
         byte[] raw = new byte[0];
@@ -495,9 +1129,11 @@ public static class VoiceWinShim {
 function Write-JsonLine($obj) { try { [Console]::Out.WriteLine(($obj | ConvertTo-Json -Compress -Depth 5)); [Console]::Out.Flush() } catch { } }
 function Invoke-Tone([string]$kind) { [VoiceWinShim]::PlayTone($kind, [bool]$Beep) }
 
+[VoiceWinShim]::EnableDpiAwareness()
+
 if ($Mode -eq "probe") {
     $hwnd = 0L; $proc = ""; $title = ""; [VoiceWinShim]::QueryForeground([ref]$hwnd, [ref]$proc, [ref]$title)
-    Write-JsonLine @{ ok = $true; ps_version = $PSVersionTable.PSVersion.ToString(); wave_in_devs = [VoiceWinShim]::waveInGetNumDevs(); hwnd = $hwnd; process = $proc; title = $title; ui_culture = [VoiceWinShim]::GetHostUiCulture() }
+    Write-JsonLine @{ ok = $true; ps_version = $PSVersionTable.PSVersion.ToString(); wave_in_devs = [VoiceWinShim]::waveInGetNumDevs(); hwnd = $hwnd; process = $proc; title = $title; ui_culture = [VoiceWinShim]::GetHostUiCulture(); dpi = [VoiceWinShim]::GetTargetDpi([IntPtr]$hwnd) }
     exit 0
 }
 
@@ -536,8 +1172,14 @@ try {
                 elseif ($op -eq "beep") { Invoke-Tone ([string]$cmdObj.kind); Write-JsonLine @{ type = "reply"; reply = "beep"; seq_id = $seq; ok = $true } }
                 elseif ($op -eq "hud") {
                     $dms = if ($null -ne $cmdObj.duration_ms) { [int]$cmdObj.duration_ms } else { 0 }
-                    [VoiceWinShim]::UpdateHud([string]$cmdObj.state, [string]$cmdObj.text, $dms, [string]$cmdObj.position)
+                    $maxDur = if ($null -ne $cmdObj.max_duration_sec) { [int]$cmdObj.max_duration_sec } else { 0 }
+                    $warnRem = if ($null -ne $cmdObj.warn_remain_sec) { [int]$cmdObj.warn_remain_sec } else { 0 }
+                    [VoiceWinShim]::UpdateHud([string]$cmdObj.state, [string]$cmdObj.text, $dms, [string]$cmdObj.position, $maxDur, $warnRem)
                     Write-JsonLine @{ type = "reply"; reply = "hud"; seq_id = $seq; ok = $true }
+                } elseif ($op -eq "hud_level") {
+                    $lvl = if ($null -ne $cmdObj.level) { [float]$cmdObj.level } else { 0.0 }
+                    [VoiceWinShim]::SetExternalAudioLevel($lvl)
+                    if ($seq -gt 0) { Write-JsonLine @{ type = "reply"; reply = "hud_level"; seq_id = $seq; ok = $true } }
                 } elseif ($op -eq "paste") {
                     $txt = [string]$cmdObj.text; $clipOk = $false
                     for ($i = 0; $i -lt 3; $i++) { try { [System.Windows.Forms.Clipboard]::SetText($txt); $clipOk = $true; break } catch { Start-Sleep -Milliseconds 15 } }
@@ -563,7 +1205,7 @@ try {
                 } elseif ($op -eq "quit") { break bridgeLoop }
                 else { Write-JsonLine @{ type = "reply"; reply = $op; seq_id = $seq; ok = $false; error = "unknown_cmd:$op" } }
             } catch {
-                Write-JsonLine @{ type = "reply"; reply = $op; seq_id = $seq; ok = $false; error = [string]$_.Exception.Message }
+                if ($seq -gt 0 -or $op -ne "hud_level") { Write-JsonLine @{ type = "reply"; reply = $op; seq_id = $seq; ok = $false; error = [string]$_.Exception.Message } }
             }
         }
     }

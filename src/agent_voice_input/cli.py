@@ -1,7 +1,7 @@
-"""CLI entrypoint for agent-voice-input (daemon, start, stop, status, toggle, once, retry, doctor, key-test, session-hook)."""
+"""CLI entrypoint for agent-voice-input (daemon, start, restart, stop, status, toggle, once, retry, doctor, key-test, session-hook)."""
 from __future__ import annotations
 
-import argparse, json, os, signal, subprocess, sys, time
+import argparse, json, os, signal, stat, subprocess, sys, time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -302,11 +302,78 @@ def _sanitize_daemon_tmux_env(env: Mapping[str, str]) -> dict[str, str]:
     return out
 
 
+_CLI_OVERRIDE_FLAGS: tuple[tuple[str, str], ...] = (
+    ("--config", "config"),
+    ("--asr-provider", "asr"),
+    ("--asr-model", "asr_model"),
+    ("--asr-api", "asr_api"),
+    ("--asr-effort", "asr_effort"),
+    ("--refiner-provider", "refiner"),
+    ("--refiner-model", "refiner_model"),
+    ("--refiner-effort", "effort"),
+)
+
+
+def _trim_log_file_if_needed(
+    log_path: Path, max_bytes: int = 1_048_576, keep_bytes: int = 262_144
+) -> None:
+    """Atomically retain only the tail of a regular log file once it exceeds ``max_bytes``."""
+    try:
+        st = os.lstat(log_path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= max_bytes:
+            return
+        keep = max(0, int(keep_bytes))
+        if keep <= 0:
+            tail = b""
+        else:
+            with open(log_path, "rb") as f:
+                if st.st_size > keep:
+                    f.seek(st.st_size - keep)
+                tail = f.read()
+            if st.st_size > keep:
+                nl = tail.find(b"\n")
+                if 0 <= nl < len(tail) - 1:
+                    tail = tail[nl + 1 :]
+        tmp_path = log_path.parent / f".{log_path.name}.trim.{os.getpid()}.{time.monotonic_ns()}.tmp"
+        fd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        closed_by_file = False
+        try:
+            os.fchmod(fd, 0o600)
+            fobj = os.fdopen(fd, "wb")
+            closed_by_file = True
+            with fobj as tf:
+                tf.write(tail)
+                tf.flush()
+            os.replace(tmp_path, log_path)
+        except Exception:
+            if not closed_by_file:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def _cmd_start(args: argparse.Namespace, env: dict[str, str]) -> int:
     rt_dir = get_runtime_dir(env, create=True)
+    has_overrides = any(getattr(args, attr, None) for _, attr in _CLI_OVERRIDE_FLAGS)
     try:
         if (st := send_control_command(rt_dir, {"cmd": "status"}, timeout_sec=1.0)).get("ok"):
-            print(f"already running (pid={st.get('pid')}, state={st.get('state')})")
+            if has_overrides:
+                print(
+                    f"already running (pid={st.get('pid')}, state={st.get('state')}); "
+                    "run 'agent-voice-input restart' to apply new flags/config"
+                )
+            else:
+                print(
+                    f"already running (pid={st.get('pid')}, state={st.get('state')}) "
+                    "(use 'restart' to reload config)"
+                )
             return 0
     except Exception:
         pass
@@ -322,21 +389,13 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str]) -> int:
         "daemon",
         *(
             x
-            for f, v in (
-                ("--config", getattr(args, "config", None)),
-                ("--asr-provider", getattr(args, "asr", None)),
-                ("--asr-model", getattr(args, "asr_model", None)),
-                ("--asr-api", getattr(args, "asr_api", None)),
-                ("--asr-effort", getattr(args, "asr_effort", None)),
-                ("--refiner-provider", getattr(args, "refiner", None)),
-                ("--refiner-model", getattr(args, "refiner_model", None)),
-                ("--refiner-effort", getattr(args, "effort", None)),
-            )
-            if v
+            for f, attr in _CLI_OVERRIDE_FLAGS
+            if (v := getattr(args, attr, None))
             for x in (f, v)
         ),
     ]
     log_path = rt_dir / "daemon.log"
+    _trim_log_file_if_needed(log_path)
     fd = os.open(str(log_path), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as log_f:
@@ -366,7 +425,10 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str]) -> int:
 def _cmd_stop(env: dict[str, str]) -> int:
     rt_dir = get_runtime_dir(env, create=False)
     pid_file = rt_dir / "daemon.pid"
-    pid = int(pid_file.read_text(encoding="utf-8").strip()) if pid_file.is_file() else 0
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip()) if pid_file.is_file() else 0
+    except ValueError:
+        pid = 0
     try:
         send_control_command(rt_dir, {"cmd": "shutdown"}, timeout_sec=1.5)
     except Exception:
@@ -375,13 +437,29 @@ def _cmd_stop(env: dict[str, str]) -> int:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
-    for _ in range(20):
-        try:
-            if pid > 0:
+    if pid > 0:
+        for _ in range(20):
+            try:
                 os.kill(pid, 0)
                 time.sleep(0.1)
+            except OSError:
+                break
+    dead = pid <= 0
+    if not dead:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            dead = True
+        except PermissionError:
+            dead = False
         except OSError:
-            break
+            dead = True
+    if dead:
+        for stale in (pid_file, rt_dir / "control.sock"):
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
     print("stopped")
     return 0
 
@@ -394,7 +472,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     _add_common_flags(parser)
     sub = parser.add_subparsers(dest="subcmd", required=True)
-    for name in ("daemon", "start", "doctor", "stop", "status", "toggle"):
+    for name in ("daemon", "start", "restart", "doctor", "stop", "status", "toggle"):
         _add_common_flags(sub.add_parser(name), is_sub=True)
     p_once = sub.add_parser("once")
     _add_common_flags(p_once, is_sub=True)
@@ -442,6 +520,9 @@ def main(argv: list[str] | None = None) -> int:
             VoiceInputDaemon(cfg, env=_sanitize_daemon_tmux_env(env)).serve_forever()
             return 0
         if args.subcmd == "start":
+            return _cmd_start(args, env)
+        if args.subcmd == "restart":
+            _cmd_stop(env)
             return _cmd_start(args, env)
         if args.subcmd == "stop":
             return _cmd_stop(env)

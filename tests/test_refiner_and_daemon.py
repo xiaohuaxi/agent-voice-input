@@ -279,10 +279,14 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         # Two-stage HUD copy & colors + backward-compatible 'processing' alias
         self.assertIn('st == "recognizing" || st == "processing"', shim)
         self.assertIn(r"\u25D0 \u6B63\u5728\u8BED\u97F3\u8BC6\u522B\u2026", shim)
-        self.assertIn("Color.FromArgb(34, 211, 238)", shim)
+        self.assertIn("Color.FromArgb(56, 189, 248)", shim)
         self.assertIn('st == "refining"', shim)
         self.assertIn(r"\u25C8 \u6B63\u5728\u6574\u7406\u7CBE\u4FEE\u2026", shim)
+        self.assertIn("Color.FromArgb(208, 156, 255)", shim)
         self.assertIn("Color.FromArgb(251, 191, 36)", shim)
+        self.assertIn("Color.FromArgb(64, 18, 26)", shim)
+        self.assertIn("Color.FromArgb(72, 38, 12)", shim)
+        self.assertIn("Color.FromArgb(242, 255, 255, 255)", shim)
         self.assertNotIn("save vrec", shim)
         self.assertNotIn("[Console]::Beep", shim)
         self.assertNotIn("QueueUserWorkItem", shim)
@@ -585,6 +589,32 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         self.assertNotIn(gem_secret, gem_fb.warning)
         self.assertNotIn("geminipref", gem_fb.warning)
 
+    def test_long_text_refiner_timeout_adaptive_relaxation(self) -> None:
+        # Small unit-test timeout (< 10.0s) and short text (<= 600 chars) keep exact base timeout
+        self.assertEqual(effective_refiner_timeout_sec(5.0, 1500), 5.0)
+        self.assertEqual(effective_refiner_timeout_sec(12.0, 600), 12.0)
+        # Long text (> 600 chars) with base >= 10.0s scales at +0.04s/char up to 240.0s cap
+        self.assertAlmostEqual(effective_refiner_timeout_sec(12.0, 1600), 52.0)
+        self.assertEqual(effective_refiner_timeout_sec(12.0, 10000), 240.0)
+
+        seen_timeouts: list[float] = []
+
+        def fake_tx(req: HttpRequest) -> HttpResponse:
+            seen_timeouts.append(req.timeout_sec)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": "精修长文"}}]}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        env = {"OPENAI_API_KEY": "sk-oai-" + ("7" * 16)}
+        cfg = Config(refiner=RefinerConfig(provider="openai", timeout_sec=12.0))
+        ref = OpenAICompatibleRefiner(cfg, resolve_credentials(cfg, env), env=env, transport=fake_tx)
+        ref.refine("短文")
+        ref.refine("字" * 1600)
+        self.assertEqual(seen_timeouts[0], 12.0)
+        self.assertAlmostEqual(seen_timeouts[1], 52.0)
+
 
 def _isolated_tracker(base: Path) -> SessionTracker:
     return SessionTracker(home_dir=base / "home", env={}, runtime_dir=base, proc_root=base / "noproc")
@@ -675,6 +705,101 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             # Superseded seq 1 must NOT emit a stale HUD state overwriting seq 2's 'recording'
             self.assertEqual(plat.huds, ["recording", "recognizing", "recording", "hide", "recording", "recognizing", "copied"])
             daemon.close()
+
+    def test_max_duration_sec_auto_stop_early_cancel_and_expected_seq_guard(self) -> None:
+        from agent_voice_input.config import AudioConfig
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            plat = _FakePlatform()
+            daemon = VoiceInputDaemon(
+                Config(
+                    audio=AudioConfig(max_duration_sec=0.06),
+                    refiner=RefinerConfig(provider="off"),
+                ),
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("十分钟自动结束并正常转写"),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                # 1. Reaching max_duration_sec automatically stops recording (bypassing hotkey debounce) & completes ASR/paste
+                r_start = daemon.handle_trigger("toggle")
+                self.assertTrue(r_start["ok"])
+                self.assertEqual(daemon.state, "recording")
+                seq_auto = r_start["seq_id"]
+                self.assertIsNotNone(daemon._max_dur_timer)
+
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != seq_auto:
+                    time.sleep(0.01)
+                self.assertEqual(daemon.state, "idle")
+                self.assertIsNone(daemon._max_dur_timer)
+                self.assertTrue(daemon.last_result.get("ok"))
+                self.assertEqual(plat.deliveries[-1][0], "十分钟自动结束并正常转写")
+                self.assertEqual(plat.huds, ["recording", "recognizing", "done"])
+
+                # 2. Stale expected_seq_id when idle (same seq_id!) MUST NOT toggle a new recording
+                stale_idle = daemon.handle_trigger("toggle", expected_seq_id=seq_auto)
+                self.assertEqual(stale_idle.get("ignored"), "stale_seq")
+                self.assertEqual(daemon.state, "idle")
+
+                # 3. Manual early stop & cancel cancel _max_dur_timer immediately; stale expected_seq_id cannot stop newer round
+                daemon.cfg.audio.max_duration_sec = 30.0
+                daemon._last_trigger_ts = -1e9
+                r_s2 = daemon.handle_trigger("toggle")
+                seq2 = r_s2["seq_id"]
+                t_obj2 = daemon._max_dur_timer
+                self.assertIsNotNone(t_obj2)
+                assert t_obj2 is not None
+                self.assertTrue(t_obj2.is_alive())
+
+                # Stale seq_auto while seq2 is recording -> ignored="stale_seq", seq2 stays recording
+                stale_cross = daemon.handle_trigger("toggle", expected_seq_id=seq_auto)
+                self.assertEqual(stale_cross.get("ignored"), "stale_seq")
+                self.assertEqual(daemon.state, "recording")
+                self.assertEqual(daemon.seq_id, seq2)
+
+                # Manual stop cancels timer immediately
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                self.assertIsNone(daemon._max_dur_timer)
+                t_obj2.join(timeout=0.5)
+                self.assertFalse(t_obj2.is_alive())
+
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != seq2:
+                    time.sleep(0.01)
+
+                # Manual ptt_cancel also cancels timer immediately
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("ptt_start")
+                t_obj3 = daemon._max_dur_timer
+                self.assertIsNotNone(t_obj3)
+                assert t_obj3 is not None
+                daemon.handle_trigger("ptt_cancel")
+                self.assertIsNone(daemon._max_dur_timer)
+                t_obj3.join(timeout=0.5)
+                self.assertFalse(t_obj3.is_alive())
+
+                # Silent audio reaching max_duration_sec stops cleanly into silence gate ('empty' HUD)
+                plat.wav_bytes = _zero_wav(0.5)
+                daemon.cfg.audio.max_duration_sec = 0.05
+                daemon._last_trigger_ts = -1e9
+                r_sil = daemon.handle_trigger("toggle")
+                seq_sil = r_sil["seq_id"]
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != seq_sil:
+                    time.sleep(0.01)
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(daemon.last_result.get("skipped_reason"), "silence")
+                self.assertEqual(plat.huds[-1], "empty")
+                self.assertIsNone(daemon._max_dur_timer)
+            finally:
+                daemon.close()
+                self.assertIsNone(daemon._max_dur_timer)
 
     def test_unix_control_socket_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -846,6 +971,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             r_start = daemon.handle_trigger("toggle")
             self.assertFalse(r_start["ok"])
             self.assertEqual(daemon.state, "idle")
+            self.assertEqual(bad_plat.canceled, 1)
 
             bad_plat.get_foreground_window = lambda: ForegroundWindow(1, "WindowsTerminal", "t")  # type: ignore[method-assign]
             bad_plat.stop_recording = lambda: (_ for _ in ()).throw(RuntimeError("stop boom"))  # type: ignore[method-assign]
@@ -1154,7 +1280,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             try:
                 self.assertTrue(daemon.handle_trigger("toggle")["ok"])
-                self.assertEqual(ops, ["hud:recording", "fg_window", "start_rec", "beep:start"])
+                self.assertEqual(ops, ["hud:recording", "beep:start", "start_rec", "fg_window"])
                 ops.clear()
                 daemon._last_trigger_ts = -1e9
                 r_stop = daemon.handle_trigger("toggle")
@@ -2170,6 +2296,270 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 info = probe_macos_host(Config(), env={"HOME": td}, cache_dir=Path(td) / "c3")
             self.assertEqual(info["audio_devices"], [])
             self.assertFalse(info["avfoundation_ok"])
+
+    def test_daemon_start_recording_precedes_slow_resolver_and_cancels_on_error(self) -> None:
+        in_resolver = threading.Event()
+        release_resolver = threading.Event()
+        events: list[str] = []
+        rec_active = [False]
+        rec_active_during_resolve = [False]
+        fail_resolve = [False]
+        fail_cancel = [False]
+
+        class _SlowResolvePlatform(_FakePlatform):
+            def hud(self, state: str, text: str = "", duration_ms: int = 0) -> None:
+                events.append(f"hud:{state}")
+                super().hud(state, text, duration_ms)
+
+            def beep(self, kind: str) -> None:
+                events.append(f"beep:{kind}")
+                super().beep(kind)
+
+            def start_recording(self, runtime_dir: Path, *, loopback: bool = False) -> None:
+                events.append(f"start_rec:loopback={loopback}")
+                rec_active[0] = True
+
+            def cancel_recording(self) -> None:
+                events.append("cancel_rec")
+                rec_active[0] = False
+                super().cancel_recording()
+                if fail_cancel[0]:
+                    raise RuntimeError("cancel failed too")
+
+            def resolve_foreground_window(self, window: ForegroundWindow | None = None) -> ForegroundWindow:
+                events.append("resolve_enter")
+                rec_active_during_resolve[0] = rec_active[0]
+                in_resolver.set()
+                release_resolver.wait(timeout=2.0)
+                if fail_resolve[0]:
+                    raise RuntimeError("osascript timed out")
+                events.append("resolve_exit")
+                return ForegroundWindow(42, "Ghostty", "codex [#12345678]", bundle_id="com.mitchellh.ghostty")
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            plat = _SlowResolvePlatform()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            cfg.audio.beep = True
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("不吞首字"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                # 1. Slow resolve_foreground_window runs AFTER start_recording() has already opened the mic!
+                res_box: list[dict[str, object]] = []
+                t = threading.Thread(
+                    target=lambda: res_box.append(
+                        daemon.handle_trigger(
+                            "toggle",
+                            ForegroundWindow(0, "Ghostty", "", bundle_id="com.mitchellh.ghostty"),
+                            from_hotkey=True,
+                        )
+                    ),
+                    daemon=True,
+                )
+                t.start()
+                self.assertTrue(in_resolver.wait(timeout=2.0))
+                # While resolver is still blocked, mic capture is ALREADY running and start beep already played!
+                self.assertTrue(rec_active[0])
+                self.assertTrue(rec_active_during_resolve[0])
+                self.assertEqual(
+                    events,
+                    ["hud:recording", "start_rec:loopback=False", "beep:start", "resolve_enter"],
+                )
+                release_resolver.set()
+                t.join(timeout=2.0)
+                self.assertTrue(res_box[0]["ok"])
+                self.assertEqual(daemon.state, "recording")
+                self.assertEqual(daemon._origin_win.title, "codex [#12345678]")
+
+                # Cancel clean before next subcase
+                daemon.handle_trigger("ptt_cancel")
+                self.assertFalse(rec_active[0])
+
+                # 2. Loopback mode suppresses start beep so prompt tone is never captured into system loopback
+                events.clear()
+                in_resolver.clear()
+                release_resolver.set()
+                daemon._last_trigger_ts = -1e9
+                r_loop = daemon.handle_trigger("ptt_start", loopback=True)
+                self.assertTrue(r_loop["ok"])
+                self.assertEqual(
+                    events,
+                    ["hud:recording", "start_rec:loopback=True", "resolve_enter", "resolve_exit"],
+                )
+                daemon.handle_trigger("ptt_cancel")
+
+                # 3. Resolver raises after start_recording -> cancel_recording() cleans up orphan recorder & rolls back
+                events.clear()
+                fail_resolve[0] = True
+                fail_cancel[0] = True  # Even if cancel_recording raises, rollback completes cleanly
+                daemon._last_trigger_ts = -1e9
+                r_err = daemon.handle_trigger("toggle")
+                self.assertFalse(r_err["ok"])
+                self.assertIn("osascript timed out", str(r_err["error"]))
+                self.assertEqual(daemon.state, "idle")
+                self.assertFalse(rec_active[0])
+                self.assertEqual(
+                    events,
+                    [
+                        "hud:recording",
+                        "start_rec:loopback=False",
+                        "beep:start",
+                        "resolve_enter",
+                        "cancel_rec",
+                        "hud:error",
+                        "beep:error",
+                    ],
+                )
+            finally:
+                daemon.close()
+
+    def test_cli_restart_running_hints_stale_stop_cleanup_and_log_trim(self) -> None:
+        import io
+        from unittest import mock
+        from agent_voice_input import cli as cli_mod
+
+        parser = cli_mod._build_parser()
+        r_pre = parser.parse_args(["--config", "/tmp/c.toml", "--asr", "groq", "restart"])
+        r_post = parser.parse_args(["restart", "--config", "/tmp/c.toml", "--refiner", "openrouter", "--effort", "low"])
+        self.assertEqual((r_pre.subcmd, r_pre.config, r_pre.asr), ("restart", "/tmp/c.toml", "groq"))
+        self.assertEqual(
+            (r_post.subcmd, r_post.config, r_post.refiner, r_post.effort),
+            ("restart", "/tmp/c.toml", "openrouter", "low"),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rt = root / "rt"
+            rt.mkdir()
+            env = {"HOME": str(root), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
+
+            # 1. `start` when already running: prints reload hint with or without CLI overrides
+            buf_plain = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_mod, "send_control_command", return_value={"ok": True, "pid": 1234, "state": "idle"}
+                ),
+                mock.patch("sys.stdout", buf_plain),
+            ):
+                rc1 = cli_mod._cmd_start(parser.parse_args(["start"]), env)
+            self.assertEqual(rc1, 0)
+            self.assertEqual(
+                buf_plain.getvalue().strip(),
+                "already running (pid=1234, state=idle) (use 'restart' to reload config)",
+            )
+
+            buf_ov = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_mod, "send_control_command", return_value={"ok": True, "pid": 1234, "state": "idle"}
+                ),
+                mock.patch("sys.stdout", buf_ov),
+            ):
+                rc2 = cli_mod._cmd_start(parser.parse_args(["start", "--asr", "groq"]), env)
+            self.assertEqual(rc2, 0)
+            self.assertEqual(
+                buf_ov.getvalue().strip(),
+                "already running (pid=1234, state=idle); run 'agent-voice-input restart' to apply new flags/config",
+            )
+
+            # 2. `restart` in main(): stops then starts cleanly; bad config fails BEFORE stopping live daemon
+            call_seq: list[str] = []
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(cli_mod, "_cmd_stop", side_effect=lambda _e: (call_seq.append("stop") or 0)),
+                mock.patch.object(
+                    cli_mod,
+                    "_cmd_start",
+                    side_effect=lambda a, _e: (call_seq.append(f"start:{getattr(a, 'asr', None)}") or 0),
+                ),
+            ):
+                rc_restart = cli_mod.main(["restart", "--asr", "dashscope"])
+            self.assertEqual(rc_restart, 0)
+            self.assertEqual(call_seq, ["stop", "start:dashscope"])
+
+            call_seq.clear()
+            err_buf = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(cli_mod, "_cmd_stop", side_effect=lambda _e: (call_seq.append("stop") or 0)),
+                mock.patch("sys.stderr", err_buf),
+            ):
+                rc_bad = cli_mod.main(["restart", "--config", str(root / "missing.toml")])
+            self.assertEqual(rc_bad, 2)
+            self.assertEqual(call_seq, [])
+
+            # 3. `stop` cleans stale daemon.pid and control.sock when process is gone, preserves if PermissionError
+            pid_file = rt / "daemon.pid"
+            sock_file = rt / "control.sock"
+            pid_file.write_text("999991\n", encoding="utf-8")
+            sock_file.write_text("stale", encoding="utf-8")
+
+            def fake_kill_dead(pid: int, sig: int) -> None:
+                raise ProcessLookupError(3, "No such process")
+
+            with (
+                mock.patch.object(cli_mod, "send_control_command", side_effect=ConnectionRefusedError("dead")),
+                mock.patch.object(cli_mod.os, "kill", side_effect=fake_kill_dead),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                self.assertEqual(cli_mod._cmd_stop(env), 0)
+            self.assertFalse(pid_file.exists())
+            self.assertFalse(sock_file.exists())
+
+            # Alive process (PermissionError on kill(pid, 0)) does NOT unlink active files
+            pid_file.write_text("999992\n", encoding="utf-8")
+            sock_file.write_text("alive", encoding="utf-8")
+
+            def fake_kill_perm(pid: int, sig: int) -> None:
+                raise PermissionError(1, "Operation not permitted")
+
+            with (
+                mock.patch.object(cli_mod, "send_control_command", return_value={"ok": True}),
+                mock.patch.object(cli_mod.os, "kill", side_effect=fake_kill_perm),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                self.assertEqual(cli_mod._cmd_stop(env), 0)
+            self.assertTrue(pid_file.exists())
+            self.assertTrue(sock_file.exists())
+
+            # 4. `_trim_log_file_if_needed`: <=1 MiB untouched; >1 MiB keeps ~256 KiB line-aligned 0600; symlink ignored
+            log_path = rt / "daemon.log"
+            small_payload = b"small line\n" * 100
+            log_path.write_bytes(small_payload)
+            cli_mod._trim_log_file_if_needed(log_path)
+            self.assertEqual(log_path.read_bytes(), small_payload)
+
+            lines = [f"line-{i:06d} 中文日志内容校验不截半个UTF8字符\n".encode("utf-8") for i in range(25000)]
+            big_payload = b"".join(lines)
+            self.assertGreater(len(big_payload), 1_048_576)
+            log_path.write_bytes(big_payload)
+            os.chmod(log_path, 0o644)
+            cli_mod._trim_log_file_if_needed(log_path)
+
+            trimmed = log_path.read_bytes()
+            self.assertLessEqual(len(trimmed), 262_144)
+            self.assertGreater(len(trimmed), 250_000)
+            decoded = trimmed.decode("utf-8")  # Must be valid UTF-8 starting cleanly on a line boundary!
+            self.assertTrue(decoded.startswith("line-"))
+            self.assertTrue(decoded.endswith("line-024999 中文日志内容校验不截半个UTF8字符\n"))
+            self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
+            self.assertEqual([p.name for p in rt.iterdir() if ".trim." in p.name], [])
+
+            # Symlink guard: target file > 1 MiB MUST NOT be truncated or replaced via symlink
+            target_big = root / "external_target.log"
+            target_big.write_bytes(big_payload)
+            sym_log = rt / "sym_daemon.log"
+            sym_log.symlink_to(target_big)
+            cli_mod._trim_log_file_if_needed(sym_log)
+            self.assertTrue(sym_log.is_symlink())
+            self.assertEqual(target_big.stat().st_size, len(big_payload))
 
 
 if __name__ == "__main__":
