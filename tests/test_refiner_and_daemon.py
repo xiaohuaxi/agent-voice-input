@@ -910,6 +910,11 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         self.assertEqual(status_after.config, "/tmp/b.toml")
         self.assertEqual(hook_parsed.subcmd, "session-hook")
         self.assertEqual(hook_parsed.cli, "agy")
+        ver_buf = io.StringIO()
+        with mock.patch("sys.stdout", ver_buf), self.assertRaises(SystemExit) as ver_exit:
+            parser.parse_args(["--version"])
+        self.assertEqual(ver_exit.exception.code, 0)
+        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.2.1")
 
         # Offline _cmd_doctor verification: displays resolved provider/model/api/effort and NEVER leaks raw secrets
         with tempfile.TemporaryDirectory() as td:

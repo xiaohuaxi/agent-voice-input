@@ -6,6 +6,7 @@ import inspect, json, os, signal, socket, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from . import __version__
 from .asr_providers import AsrResult, BaseAsrProvider, create_asr_provider
 from .audio_proc import AudioGateResult, process_wav
 from .config import Config, ProviderCredentials, ensure_secure_dir, get_runtime_dir, redact_secrets, resolve_credentials, select_asr_provider
@@ -316,7 +317,7 @@ class VoiceInputDaemon:
         cmd = str(req.get("cmd") or "status")
         if cmd == "status":
             with self._lock:
-                return {"ok": True, "pid": os.getpid(), "state": self.state, "seq_id": self.seq_id, "asr_provider": select_asr_provider(self.cfg, self.creds), "refiner_provider": self.cfg.refiner.provider, "last_result": dict(self.last_result)}
+                return {"ok": True, "version": __version__, "pid": os.getpid(), "state": self.state, "seq_id": self.seq_id, "asr_provider": select_asr_provider(self.cfg, self.creds), "refiner_provider": self.cfg.refiner.provider, "last_result": dict(self.last_result)}
         if cmd in ("toggle", "rec_start", "rec_stop"):
             win = _window_from_mapping(req) if any(req.get(k) for k in ("hwnd", "process", "title", "bundle_id", "surface_id", "tty", "cwd", "pid")) else None
             return self.handle_trigger({"toggle": "toggle", "rec_start": "ptt_start", "rec_stop": "ptt_stop"}[cmd], win, no_paste=bool(req.get("no_paste")), silent_hud=bool(req.get("silent_hud")), loopback=bool(req.get("loopback")))

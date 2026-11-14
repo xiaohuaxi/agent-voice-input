@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .asr_providers import _is_loopback_url
 from .audio_proc import resolve_ffmpeg_bin
 from .config import (
@@ -327,6 +328,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="agent-voice-input",
         description="Two-stage context-aware voice input for CLI coding agents.",
     )
+    parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     _add_common_flags(parser)
     sub = parser.add_subparsers(dest="subcmd", required=True)
     for name in ("daemon", "start", "doctor", "stop", "status", "toggle"):
