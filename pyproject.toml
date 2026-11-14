@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-voice-input"
+version = "0.1.0"
+description = "Two-stage context-aware voice input for CLI coding agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+keywords = [
+    "voice-input",
+    "asr",
+    "speech-to-text",
+    "cli-agent",
+    "codex",
+    "claude-code",
+    "wsl2",
+    "macos",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: User Interfaces",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+[project.urls]
+Homepage = "https://github.com/xiaohuaxi/agent-voice-input"
+Repository = "https://github.com/xiaohuaxi/agent-voice-input"
+Issues = "https://github.com/xiaohuaxi/agent-voice-input/issues"
+
+[project.scripts]
+agent-voice-input = "agent_voice_input.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agent_voice_input*"]
+
+[tool.setuptools.package-data]
+agent_voice_input = ["win_shim.ps1"]

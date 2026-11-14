@@ -1,0 +1,18 @@
+{
+  "voice-session-title": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "agent-voice-input session-hook --cli agy",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "agent-voice-input session-hook --cli agy",
+        "timeout": 5
+      }
+    ]
+  }
+}

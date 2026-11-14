@@ -1,0 +1,92 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    name: Run unit tests and build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run unit tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Verify packaged wheel and sdist contents
+        run: |
+          python - <<'PY'
+          import glob, tarfile, zipfile
+          whls = glob.glob("dist/*.whl")
+          assert len(whls) == 1, f"expected 1 wheel, got {whls}"
+          with zipfile.ZipFile(whls[0]) as zf:
+              names = set(zf.namelist())
+              for req in (
+                  "agent_voice_input/__init__.py",
+                  "agent_voice_input/cli.py",
+                  "agent_voice_input/daemon.py",
+                  "agent_voice_input/win_shim.ps1",
+              ):
+                  assert req in names, f"missing {req} in wheel"
+              assert any("LICENSE" in n for n in names), f"missing LICENSE in wheel: {sorted(names)}"
+              eps = [n for n in names if n.endswith("entry_points.txt")]
+              assert eps and "agent-voice-input = agent_voice_input.cli:main" in zf.read(eps[0]).decode("utf-8")
+
+          sdists = glob.glob("dist/*.tar.gz")
+          assert len(sdists) == 1, f"expected 1 sdist, got {sdists}"
+          with tarfile.open(sdists[0], "r:gz") as tf:
+              snames = set(tf.getnames())
+              for suffix in (
+                  "/LICENSE",
+                  "/README.md",
+                  "/README.zh-CN.md",
+                  "/config.example.toml",
+                  "/config.example.env",
+                  "/src/agent_voice_input/win_shim.ps1",
+              ):
+                  assert any(n.endswith(suffix) for n in snames), f"missing {suffix} in sdist"
+          PY
+
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI via Trusted Publisher OIDC
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/agent-voice-input
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distribution to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

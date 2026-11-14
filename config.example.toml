@@ -1,0 +1,59 @@
+# agent-voice-input example configuration
+# Default location: ~/.config/agent-voice-input/config.toml (also falls back to ~/.config/voice-input/config.toml)
+# Or specify explicitly via --config / AGENT_VOICE_INPUT_CONFIG
+
+[hotkey]
+# Windows global hotkey: RControl (default Right Ctrl, 0xA3) | RAlt | RShift | CapsLock | F1..F24 | 0xNN
+key = "RControl"
+# Trigger mode:
+# - "tap_toggle": isolated tap toggles recording start/stop (chords such as RControl+C pass through untouched)
+# - "ptt": push-to-talk (hold to speak, release to transcribe; pressing another key cancels)
+trigger_mode = "tap_toggle"
+tap_max_ms = 1200
+debounce_ms = 180
+
+[audio]
+# Silence gate & RMS loudness normalization (pure stdlib; blocks accidental empty triggers before hitting cloud APIs)
+floor_dbfs = -50.0
+target_dbfs = -20.0
+max_gain_db = 40.0
+min_duration_sec = 0.3
+min_voiced_sec = 0.1
+# WSL2 capture source: "auto" (defaults to resident win_shim Windows WASAPI 16 kHz capture, avoiding WSLg RDPSource zero-packet deadlocks) | "wasapi" | "winmm" | "pulse"
+wsl_source = "auto"
+# Start/stop audio cue is disabled by default to avoid 1-2s RDP audio wake-up lag; enable locally if desired
+beep = false
+# Tail drain seconds after stopping recording (auto-adapts by platform when unset: 0.65s on WSL2/RDP, 0.20s on macOS)
+# tail_drain_sec = 0.65
+
+[asr]
+# Stage 1 speech-to-text provider: "auto" | "ali" | "doubao" | "gemini" | "openai-compatible"
+provider = "auto"
+# Leave empty to select each provider's default model automatically:
+# - ali -> "qwen3-asr-flash" (also supports "fun-asr-realtime" / "qwen-audio-3.0")
+# - doubao -> "bigmodel"
+# - gemini -> "gemini-2.5-flash" (single-hop audio + context refinement; skips Stage 2 by default)
+# - openai-compatible -> "gpt-4o-transcribe" (or a local faster-whisper-server model name)
+model = ""
+# Doubao resource slot: "auto" (auto-probes and caches available slot) or explicit e.g. "volc.seedasr.auc"
+resource_id = "auto"
+base_url = ""
+api_key_env = ""
+hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
+timeout_sec = 15.0
+
+[refiner]
+# Stage 2 context-aware refinement engine:
+# - "codex-luna" (default: resident codex app-server in-memory thread paired with a lightweight fast model)
+# - "openai-compatible"
+# - "off"
+provider = "codex-luna"
+model = "gpt-6-luna"
+effort = "low"
+# When provider = "openai-compatible", point base_url to Volcengine Ark / OpenAI / a local server:
+# base_url = "https://ark.cn-beijing.volces.com/api/v3"
+base_url = ""
+api_key_env = ""
+max_turns_per_thread = 20
+timeout_sec = 12.0
+force_on_single_hop = false

@@ -1,0 +1,25 @@
+# Byte-compiled / cache / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets & OS metadata
+.env
+*.env
+!config.example.env
+.DS_Store
+
+# Agent harness runtime paths
+.agents/worktrees/
+.agents/tmp-*
+.agents/settings.local.json
+.agents/scheduled_tasks.lock
