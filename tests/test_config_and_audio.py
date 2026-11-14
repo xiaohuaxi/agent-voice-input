@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import time
@@ -602,8 +603,8 @@ class AudioProcTests(unittest.TestCase):
         self.assertAlmostEqual(out_dbfs, -20.0, delta=0.05)
 
     def test_ffmpeg_converts_48k_stereo_wav_to_16k_mono(self) -> None:
-        if not Path("/usr/bin/ffmpeg").is_file():
-            self.skipTest("/usr/bin/ffmpeg not installed")
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg not installed")
         sr_in = 48000
         n_frames = int(0.5 * sr_in)
         stereo = array.array("h")
@@ -655,14 +656,28 @@ class AudioProcTests(unittest.TestCase):
         self.assertEqual((ch, sw, sr, len(arr)), (1, 2, 16000, 9001))
         self.assertTrue(all(v == 0x1234 for v in arr))
 
-        # 2. Real /usr/bin/ffmpeg streaming s16le pipe with low-latency flags + tail_drain_sec
-        if not Path("/usr/bin/ffmpeg").is_file():
-            self.skipTest("/usr/bin/ffmpeg not installed")
+        # 2. Real ffmpeg streaming s16le pipe with low-latency flags + tail_drain_sec
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg not installed")
         rec_live = FfmpegWavRecorder()
         with tempfile.TemporaryDirectory() as td:
-            rec_live.start("lavfi", "sine=frequency=440:sample_rate=16000", Path(td), os.environ)
-            time.sleep(0.22)
-            live_wav = rec_live.stop(drain_sec=0.15)
+            try:
+                rec_live.start(
+                    "lavfi",
+                    "sine=frequency=440:sample_rate=16000:samples_per_frame=320:duration=5,arealtime",
+                    Path(td),
+                    os.environ,
+                )
+                deadline = time.monotonic() + 2.0
+                while not rec_live._buf and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                time.sleep(0.22)
+                self.assertIsNotNone(rec_live._proc)
+                assert rec_live._proc is not None
+                self.assertIsNone(rec_live._proc.poll())
+                live_wav = rec_live.stop(drain_sec=0.15)
+            finally:
+                rec_live.stop(drain_sec=0.0)
             self.assertEqual(list(Path(td).iterdir()), [])
         gate = process_wav(live_wav)
         self.assertTrue(gate.passed)

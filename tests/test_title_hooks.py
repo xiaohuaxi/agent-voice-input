@@ -1,17 +1,20 @@
 """Unit tests for window title hooks (codex/claude/agy), integrations, and SessionTracker O(1) linkage."""
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
 from pathlib import Path
 import pty
 import select
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import termios
+import time
 import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,20 +27,31 @@ from agent_voice_input.config import parse_toml  # noqa: E402
 from agent_voice_input.session_ctx import SessionTracker  # noqa: E402
 
 
+def _read_pty_nonblocking(master_fd: int, sink: list[bytes]) -> bool:
+    """Drain currently buffered PTY bytes into ``sink``; return True on slave EOF/hangup."""
+    while True:
+        try:
+            data = os.read(master_fd, 4096)
+        except BlockingIOError:
+            return False
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            if exc.errno in (errno.EIO, errno.ENXIO):
+                return True
+            raise
+        if not data:
+            return True
+        sink.append(data)
+
+
 def _drain_pty_master(master_fd: int) -> bytes:
     os.set_blocking(master_fd, False)
     chunks: list[bytes] = []
     while True:
         r, _, _ = select.select([master_fd], [], [], 0.05)
-        if not r:
+        if not r or _read_pty_nonblocking(master_fd, chunks):
             break
-        try:
-            data = os.read(master_fd, 4096)
-        except OSError:
-            break
-        if not data:
-            break
-        chunks.append(data)
     return b"".join(chunks)
 
 
@@ -398,36 +412,97 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
             hook_sh = str(REPO_ROOT / "integrations" / "claude" / "voice-title.sh")
             bin_cli = str(REPO_ROOT / "bin" / "agent-voice-input")
 
-            def _run_with_fresh_pty(cmd: list[str], raw_payload: bytes) -> tuple[subprocess.CompletedProcess[bytes], bytes]:
-                master_fd, slave_fd = pty.openpty()
-                os.set_blocking(master_fd, False)
-                r_pipe, w_pipe = os.pipe()
-                os.write(w_pipe, raw_payload)
-                os.close(w_pipe)
+            def _run_with_fresh_pty(
+                cmd: list[str], raw_payload: bytes, timeout_sec: float = 5.0
+            ) -> tuple[subprocess.CompletedProcess[bytes], bytes]:
+                fds = list(pty.openpty())  # [master_fd, slave_fd]
+                proc: subprocess.Popen[bytes] | None = None
+                pty_chunks: list[bytes] = []
 
-                def _attach_ctty() -> None:
-                    os.setsid()
-                    fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+                def _close_pty(idx: int) -> None:
+                    if fds[idx] >= 0:
+                        fd, fds[idx] = fds[idx], -1
+                        os.close(fd)
+
+                def _kill_and_reap() -> tuple[bytes, bytes]:
+                    # Close master_fd first to unblock Darwin XNU ttywait() before SIGKILL.
+                    _close_pty(0)
+                    assert proc is not None
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    proc.kill()
+                    return proc.communicate()
 
                 try:
-                    proc = subprocess.run(
+                    os.set_blocking(fds[0], False)
+                    child_slave_fd = fds[1]
+
+                    def _attach_ctty() -> None:
+                        os.setsid()
+                        fcntl.ioctl(child_slave_fd, termios.TIOCSCTTY, 0)
+
+                    proc = subprocess.Popen(
                         cmd,
-                        stdin=r_pipe,
+                        stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         env=env,
                         preexec_fn=_attach_ctty,
-                        pass_fds=(slave_fd,),
-                        timeout=5,
-                        check=False,
+                        pass_fds=(child_slave_fd,),
+                    )
+                    _close_pty(1)
+                    assert proc.stdin is not None
+                    try:
+                        proc.stdin.write(raw_payload)
+                    except BrokenPipeError:
+                        pass
+                    finally:
+                        try:
+                            proc.stdin.close()
+                        except BrokenPipeError:
+                            pass
+
+                    deadline = time.monotonic() + timeout_sec
+                    pty_eof = False
+                    while proc.poll() is None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            out_b, err_b = _kill_and_reap()
+                            raise subprocess.TimeoutExpired(
+                                cmd, timeout_sec, output=out_b, stderr=err_b
+                            )
+                        if not pty_eof:
+                            ready, _, _ = select.select([fds[0]], [], [], min(0.05, remaining))
+                            if ready:
+                                pty_eof = _read_pty_nonblocking(fds[0], pty_chunks)
+                        else:
+                            time.sleep(min(0.005, remaining))
+
+                    while not pty_eof and fds[0] >= 0:
+                        ready, _, _ = select.select([fds[0]], [], [], 0.05)
+                        if not ready:
+                            break
+                        pty_eof = _read_pty_nonblocking(fds[0], pty_chunks)
+
+                    out_b, err_b = proc.communicate(timeout=2)
+                    return (
+                        subprocess.CompletedProcess(cmd, proc.returncode, out_b, err_b),
+                        b"".join(pty_chunks),
                     )
                 finally:
-                    os.close(r_pipe)
-                    os.close(slave_fd)
-                try:
-                    return proc, _drain_pty_master(master_fd)
-                finally:
-                    os.close(master_fd)
+                    _close_pty(1)
+                    if proc is not None:
+                        if proc.poll() is None:
+                            _kill_and_reap()
+                        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                            if pipe is not None and not pipe.closed:
+                                try:
+                                    pipe.close()
+                                except BrokenPipeError:
+                                    pass
+                    _close_pty(0)
 
             # 1. Run integrations/claude/voice-title.sh in an isolated session attached to a dedicated pty
             payload = json.dumps({"session_id": sid, "cwd": str(proj)}).encode("utf-8")
