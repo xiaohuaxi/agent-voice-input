@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import re
 import stat
-import subprocess
 import sys
 from typing import Any, Callable, Mapping
 
@@ -15,7 +14,6 @@ from .config import get_runtime_dir
 
 _SID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{0,56}$")
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_VER_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
 
 
 def _short_cwd(cwd: str, home: str) -> str:
@@ -49,43 +47,83 @@ def _proc_info(pid_dir: Path) -> tuple[str, int, int, int, list[str]] | None:
         return None
 
 
+def _has_proc_tty(pdir: Path, tty_nr: int) -> bool:
+    if tty_nr > 0:
+        return True
+    for fn in ("0", "2"):
+        t = _sctx._readlink_clean(pdir / "fd" / fn)
+        if t.startswith("/dev/pts/") or (t.startswith("/dev/tty") and t != "/dev/tty"):
+            return True
+    return False
+
+
 def _walk_ancestor(
     pid0: int, proc_root: Path, pred: Callable[[str, list[str]], bool]
 ) -> tuple[int, list[str]]:
     cur, seen = pid0, set()
+    use_proc = proc_root.is_dir()
+    stop_after_this = False
     for _ in range(32):
         if cur <= 1 or cur in seen:
             break
         seen.add(cur)
-        info = _proc_info(proc_root / str(cur))
-        if info is None:
+        if use_proc:
+            pdir = proc_root / str(cur)
+            info = _proc_info(pdir)
+            if info is None:
+                break
+            comm, ppid, psid, tty_nr, argv = info
+            is_sl = cur == psid
+            has_tty = _has_proc_tty(pdir, tty_nr)
+        else:
+            pinfo = _sctx.ps_proc_info(cur)
+            if pinfo is None:
+                break
+            comm, ppid, tty_path, argv, is_sl = pinfo
+            has_tty = bool(tty_path)
+        if pred(comm, argv):
+            return cur, argv
+        if stop_after_this or ppid <= 1:
             break
-        if pred(info[0], info[4]):
-            return cur, info[4]
-        cur = info[1]
+        if is_sl:
+            if has_tty:
+                break
+            stop_after_this = True
+        cur = ppid
     return 0, []
+
+
+def _find_ancestor_cli(pid0: int, proc_root: Path, target_cli: str) -> tuple[int, list[str]]:
+    eff_box: list[str] = []
+
+    def _pred(comm: str, argv: list[str]) -> bool:
+        cli_k, eff = _sctx._match_cli_process(comm, argv)
+        if cli_k == target_cli:
+            eff_box[:] = eff
+            return True
+        return False
+
+    pid, raw_args = _walk_ancestor(pid0, proc_root, _pred)
+    return pid, (eff_box if pid else raw_args)
 
 
 def _find_tty(start_pid: int, proc_root: Path) -> str:
     if not proc_root.is_dir():
-        try:
-            r = subprocess.run(
-                ["ps", "-o", "tty=", "-p", str(start_pid)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=1.0,
-                check=False,
-            )
-            tty = r.stdout.decode("utf-8", errors="ignore").strip()
-            if not tty or tty in ("?", "??", "-"):
-                return ""
-            for cand in ((tty,) if tty.startswith("/dev/") else (f"/dev/{tty}", f"/dev/tty{tty}")):
-                if os.path.exists(cand):
-                    return cand
-            return ""
-        except (OSError, subprocess.SubprocessError):
-            return ""
+        cur, seen = start_pid, set()
+        for _ in range(32):
+            if cur <= 1 or cur in seen:
+                break
+            seen.add(cur)
+            pinfo = _sctx.ps_proc_info(cur)
+            if pinfo is None:
+                break
+            _comm, ppid, tty_path, _argv, is_sess_leader = pinfo
+            if tty_path:
+                return tty_path
+            if is_sess_leader or ppid <= 1:
+                break
+            cur = ppid
+        return ""
     info0 = _proc_info(proc_root / str(start_pid))
     if info0 is None:
         return ""
@@ -182,13 +220,10 @@ def update_agy_session(
     if os.path.isfile(tp_str) and _sctx._is_agy_transcript_subagent(tp_str):
         return False
     cwd, pid0 = _payload_cwd(payload), (os.getpid() if start_pid is None else start_pid)
+    reg_pid = 0
     if proc_root.is_dir():
-        agy_pid, args = _walk_ancestor(
-            pid0,
-            proc_root,
-            lambda c, a: c == "agy" or bool(a and os.path.basename(a[0]) == "agy"),
-        )
-        if not agy_pid or _sctx._is_headless_cli_invocation("agy", args):
+        agy_pid, eff_args = _find_ancestor_cli(pid0, proc_root, "agy")
+        if not agy_pid or _sctx._is_headless_cli_invocation("agy", eff_args):
             return False
         agy_dir, lock_real, sfx = (
             proc_root / str(agy_pid),
@@ -214,13 +249,20 @@ def update_agy_session(
             return False
         cwd = cwd or _sctx._readlink_clean(agy_dir / "cwd")
         tty_path = _find_tty(agy_pid, proc_root)
+        reg_pid = agy_pid
     else:
         if not _sctx.is_agy_presence_lock_held_nonproc(lock_file):
             return False
-        tty_path = _find_tty(pid0, proc_root)
+        agy_pid, eff_args = _find_ancestor_cli(pid0, proc_root, "agy")
+        if agy_pid:
+            if _sctx._is_headless_cli_invocation("agy", eff_args):
+                return False
+            cwd = cwd or _sctx._query_pid_cwd_nonproc(agy_pid)
+            reg_pid = agy_pid
+        tty_path = _find_tty(agy_pid or pid0, proc_root)
     rt = runtime_dir if runtime_dir is not None else get_runtime_dir(eff_env, create=False)
     _sctx.write_session_registry_entry(
-        rt, cli="agy", session_id=cid, jsonl_path=tp_str, cwd=cwd
+        rt, cli="agy", session_id=cid, jsonl_path=tp_str, cwd=cwd, tty=tty_path, pid=reg_pid
     )
     write_osc2(tty_path, f"agy · {_short_cwd(cwd, str(eff_home))} [#{cid[:8]}]")
     return True
@@ -256,27 +298,27 @@ def update_claude_session(
         return False
     pid0 = os.getpid() if start_pid is None else start_pid
     target_pid = pid0
-    if proc_root.is_dir():
-        cl_pid, args = _walk_ancestor(
-            pid0,
-            proc_root,
-            lambda c, a: c == "claude"
-            or (
-                (c == "node" or bool(_VER_RE.match(c)))
-                and any(os.path.basename(x) == "claude" or "/claude/versions/" in x for x in a[:8])
-            ),
-        )
-        if cl_pid:
-            if _sctx._is_headless_cli_invocation("claude", args):
-                return False
-            target_pid = cl_pid
-            cwd = cwd or _sctx._readlink_clean(proc_root / str(cl_pid) / "cwd")
+    cl_pid, eff_args = _find_ancestor_cli(pid0, proc_root, "claude")
+    if cl_pid:
+        if _sctx._is_headless_cli_invocation("claude", eff_args):
+            return False
+        target_pid = cl_pid
+        if not cwd:
+            cwd = (
+                _sctx._readlink_clean(proc_root / str(cl_pid) / "cwd")
+                if proc_root.is_dir()
+                else _sctx._query_pid_cwd_nonproc(cl_pid)
+            )
+            if not tp and cwd:
+                encs = _sctx.encode_claude_project_dir(cwd)
+                tp = str(eff_home / ".claude" / "projects" / encs[0] / f"{sid}.jsonl") if encs else ""
+    tty_path = _find_tty(target_pid, proc_root)
     if tp:
         rt = runtime_dir if runtime_dir is not None else get_runtime_dir(eff_env, create=False)
         _sctx.write_session_registry_entry(
-            rt, cli="claude", session_id=sid, jsonl_path=tp, cwd=cwd
+            rt, cli="claude", session_id=sid, jsonl_path=tp, cwd=cwd, tty=tty_path, pid=cl_pid
         )
-    write_osc2(_find_tty(target_pid, proc_root), f"claude · {_short_cwd(cwd, str(eff_home))} [#{sid[:8]}]")
+    write_osc2(tty_path, f"claude · {_short_cwd(cwd, str(eff_home))} [#{sid[:8]}]")
     return True
 
 

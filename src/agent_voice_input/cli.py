@@ -17,7 +17,7 @@ from .config import (
     select_asr_provider,
 )
 from .daemon import VoiceInputDaemon, create_platform, run_pipeline_once, send_control_command
-from .platform_macos import probe_macos_host
+from .platform_macos import probe_macos_host, run_macos_key_test
 from .platform_wsl import ForegroundWindow, is_wsl, probe_wsl_host, run_key_test
 from .refiner import find_codex_bin
 from .session_ctx import SessionTracker
@@ -50,7 +50,8 @@ def _check_codex_model(model: str, env: dict[str, str]) -> str:
 
 
 def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
-    creds, rt_dir, ok_all, fg_title = resolve_credentials(cfg, env), get_runtime_dir(env, create=True), True, ""
+    creds, rt_dir, ok_all = resolve_credentials(cfg, env), get_runtime_dir(env, create=True), True
+    fg_title, fg_tty, fg_cwd, fg_pid = "", "", "", 0
     print(f"[python]    OK ({sys.version.split()[0]}, runtime={rt_dir})")
     try:
         print(f"[ffmpeg]    OK ({resolve_ffmpeg_bin()})")
@@ -59,7 +60,34 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
         ok_all = False
     if sys.platform == "darwin":
         m = probe_macos_host(cfg, env)
-        print(f"[macos]     avfoundation={'OK' if m.get('avfoundation_ok') else 'WARN'} pbcopy={'OK' if m.get('pbcopy_ok') else 'FAIL'} tmux={m.get('tmux_active')}")
+        fg_title = str(m.get("fg_title") or "")
+        fg_tty = str(m.get("fg_tty") or "")
+        fg_cwd = str(m.get("fg_cwd") or "")
+        fg_pid = int(m.get("fg_pid") or 0)
+        devs = m.get("audio_devices") or []
+        devs_str = ", ".join(devs) if devs else "none listed (check mic device or grant Microphone permission)"
+        print(
+            f"[macos-aud] avfoundation={'OK' if m.get('avfoundation_ok') else 'WARN'} "
+            f"device={m.get('configured_audio_device')} inputs={devs_str} | "
+            f"pbcopy={'OK' if m.get('pbcopy_ok') else 'FAIL'} tmux={m.get('tmux_active')}"
+        )
+        shim_desc = (
+            f"OK ({m.get('mac_shim_bin')})"
+            if m.get("mac_shim_ok")
+            else f"WARN ({m.get('mac_shim_error') or 'unavailable'})"
+        )
+        print(
+            f"[mac-shim]  swiftc={'OK (' + str(m.get('swiftc_bin')) + ')' if m.get('swiftc_ok') else 'WARN (not found)'} "
+            f"shim={shim_desc}"
+        )
+        if m.get("fg_surface_id"):
+            print(
+                f"[macos-fg]  app={m.get('fg_process')!r} surface={m.get('fg_surface_id')} "
+                f"tty={m.get('fg_tty') or '-'} cwd={m.get('fg_cwd') or '-'} title={fg_title!r}"
+            )
+        else:
+            print(f"[macos-fg]  app={m.get('fg_process')!r} title={fg_title!r}")
+        print(f"[macos-tcc] {m.get('permissions_hint')}")
         ok_all = ok_all and bool(m.get("pbcopy_ok"))
     elif is_wsl(env):
         w = probe_wsl_host(cfg, env)
@@ -81,7 +109,12 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
         f"huoshan={_cred_label(creds.huoshan)}, gemini={_cred_label(creds.gemini)}, openai={_cred_label(creds.openai)}"
     )
     ok_all = ok_all and asr_ready
-    match = SessionTracker(env=env, runtime_dir=rt_dir).resolve_session(fg_title)
+    match = SessionTracker(env=env, runtime_dir=rt_dir).resolve_session(
+        fg_title,
+        window_tty=fg_tty,
+        window_cwd=fg_cwd,
+        window_pid=fg_pid,
+    )
     print(f"[session]   {match.session_key + ' (' + match.matched_by + ')' if match else 'none matched (will use empty context)'}")
     if cfg.refiner.provider == "codex-luna":
         if cbin := find_codex_bin(env):
@@ -98,7 +131,7 @@ def _cmd_once(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> int
     rt_dir = get_runtime_dir(env, create=True)
     plat = None if (args.wav_file and args.dry_run and args.title is not None) else create_platform(cfg, env=env)
     try:
-        win = ForegroundWindow(0, "", args.title) if args.title is not None else (plat.get_foreground_window() if plat else ForegroundWindow())
+        win = ForegroundWindow(0, "", args.title or "") if plat is None else plat.get_foreground_window()
         if args.wav_file:
             raw_wav, src = args.wav_file, "file"
         else:
@@ -107,7 +140,10 @@ def _cmd_once(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> int
             plat.start_recording(rt_dir)
             time.sleep(max(0.2, float(args.duration)))
             raw_wav, src = plat.stop_recording()
-        res = run_pipeline_once(raw_wav, cfg=cfg, platform=plat, origin_window=win, audio_source=src, dry_run=args.dry_run, env=env)
+        res = run_pipeline_once(
+            raw_wav, cfg=cfg, platform=plat, origin_window=win, window_title_override=args.title,
+            audio_source=src, dry_run=args.dry_run, env=env,
+        )
         if not res.ok:
             print(f"[agent-voice-input] skipped: {res.skipped_reason}", file=sys.stderr)
             return 1
@@ -273,6 +309,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcmd == "doctor":
             return _cmd_doctor(cfg, env)
         if args.subcmd == "key-test":
+            if sys.platform == "darwin":
+                return run_macos_key_test(cfg, seconds=args.seconds, env=env)
             return run_key_test(cfg, seconds=args.seconds)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)

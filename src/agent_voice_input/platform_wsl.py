@@ -1,13 +1,13 @@
 """WSL2 host bridge: WASAPI 16kHz capture via win_shim.ps1 stdio JSONL + PulseAudio RDPSource fallback."""
 from __future__ import annotations
 
-import base64, json, os, queue, signal, subprocess, threading, time
+import base64, json, os, queue, signal, subprocess, sys, threading, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
-from .config import Config
+from .config import Config, redact_secrets
 
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 WSLG_PULSE_SOCK = "/mnt/wslg/PulseServer"
@@ -16,7 +16,18 @@ SHIM_SCRIPT = Path(__file__).resolve().with_name("win_shim.ps1")
 
 @dataclass(frozen=True)
 class ForegroundWindow:
-    hwnd: int = 0; process: str = ""; title: str = ""
+    hwnd: int = 0
+    process: str = ""
+    title: str = ""
+    bundle_id: str = ""
+    surface_id: str = ""
+    tty: str = ""
+    cwd: str = ""
+    pid: int = 0
+
+    @property
+    def app_name(self) -> str:
+        return self.process
 
 
 @dataclass(frozen=True)
@@ -154,18 +165,28 @@ def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[st
     return info
 
 
+def stream_key_test_proc(cmd: list[str], *, env: Mapping[str, str] | None = None) -> int:
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+        env=None if env is None else dict(env),
+    )
+    try:
+        assert proc.stdout is not None
+        for ln in iter(proc.stdout.readline, ""):
+            if ln.strip():
+                print(ln.strip(), flush=True)
+        return proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+
+
 def run_key_test(cfg: Config, seconds: int = 10) -> int:
     if not os.path.isfile(POWERSHELL_EXE):
         raise RuntimeError(f"PowerShell not found at {POWERSHELL_EXE}")
     cmd = [POWERSHELL_EXE, "-NoProfile", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "key-test", "-Hotkey", cfg.hotkey.key, "-TriggerMode", cfg.hotkey.trigger_mode, "-TapMaxMs", str(cfg.hotkey.tap_max_ms), "-DebounceMs", str(cfg.hotkey.debounce_ms), "-Seconds", str(max(1, seconds))]
-    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
-    try:
-        assert proc.stdout is not None
-        for ln in iter(proc.stdout.readline, ""):
-            if ln.strip(): print(ln.strip(), flush=True)
-        return proc.wait(timeout=5)
-    finally:
-        if proc.poll() is None: proc.terminate()
+    return stream_key_test_proc(cmd)
 
 
 def _reap_shim_proc(proc: subprocess.Popen[str] | None) -> None:
@@ -183,30 +204,41 @@ def _reap_shim_proc(proc: subprocess.Popen[str] | None) -> None:
         pass
 
 
-class WslPlatform:
-    def __init__(self, cfg: Config, *, env: Mapping[str, str] | None = None, pulse_source: str = "RDPSource", shim_cmd_factory: Callable[[], list[str]] | None = None) -> None:
-        raw_env = os.environ if env is None else env
-        self.cfg, self.env = cfg, _pulse_env(raw_env)
-        explicit_pulse = (raw_env.get("AGENT_VOICE_INPUT_PULSE_SOURCE") or raw_env.get("VOICE_INPUT_PULSE_SOURCE") or "").strip()
-        self.pulse_source = explicit_pulse or pulse_source.strip() or "RDPSource"
-        self._shim_cmd_factory = shim_cmd_factory
-        if cfg.audio.wsl_source in ("winmm", "wasapi"):
-            self._primary_winmm = True
-        elif cfg.audio.wsl_source == "pulse":
-            self._primary_winmm = False
-        else:
-            has_custom_pulse = bool(explicit_pulse or pulse_source.strip() not in ("", "RDPSource"))
-            self._primary_winmm = bool(not has_custom_pulse and shim_cmd_factory is None and os.path.isfile(POWERSHELL_EXE))
-        self._use_winmm, self._shim, self._shim_lock = self._primary_winmm, None, threading.Lock()
-        self.last_audio_error = ""
+class JsonlShimMixin:
+    _shim_graceful: bool = False
+    _shim_ready_timeout: float = 8.0
+    _shim_label: str = "shim"
+    cfg: Config
+    env: dict[str, str]
+
+    def _init_shim_bridge(self) -> None:
         self._closed = False
+        self._shim: subprocess.Popen[str] | None = None
+        self._shim_disabled = False
+        self._shim_lock = threading.Lock()
         self._rpc_seq, self._pending, self._ready = 100, {}, threading.Event()
         self._event_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._event_worker: threading.Thread | None = None
-        self._on_event, self._ff_rec, self._rec_mode = None, FfmpegWavRecorder(), ""
+        self._on_event: Callable[[dict[str, Any]], None] | None = None
+        self.last_shim_error = ""
+
+    def _disable_shim_once(self, reason: str) -> None:
+        self.last_shim_error = redact_secrets(reason, self.env, cfg=self.cfg)
+        if not self._shim_disabled:
+            self._shim_disabled = True
+            if self.last_shim_error:
+                print(
+                    f"[agent-voice-input] {self._shim_label} unavailable ({self.last_shim_error}); "
+                    "global hotkey & HUD disabled, 'toggle'/'once' remain available.",
+                    file=sys.stderr, flush=True,
+                )
 
     def _has_managed_shim(self) -> bool:
-        return not self._closed and (self._shim is not None or self._on_event is not None)
+        if self._closed or self._shim_disabled:
+            return False
+        if self._shim_graceful:
+            return self._shim is not None and self._shim.poll() is None
+        return self._shim is not None or self._on_event is not None
 
     def _ensure_event_worker(self) -> None:
         with self._shim_lock:
@@ -220,55 +252,92 @@ class WslPlatform:
                 try: cb(msg)
                 except Exception: pass
 
-    def _build_shim_cmd(self) -> list[str]:
-        if self._shim_cmd_factory is not None:
-            return self._shim_cmd_factory()
-        if not os.path.isfile(POWERSHELL_EXE):
-            raise RuntimeError(f"PowerShell not found at {POWERSHELL_EXE}")
-        return [POWERSHELL_EXE, "-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "bridge", "-Hotkey", self.cfg.hotkey.key, "-TriggerMode", self.cfg.hotkey.trigger_mode, "-TapMaxMs", str(self.cfg.hotkey.tap_max_ms), "-DebounceMs", str(self.cfg.hotkey.debounce_ms), "-Beep", "1" if self.cfg.audio.beep else "0"]
+    def _build_shim_cmd(self) -> list[str] | None:
+        raise NotImplementedError
 
-    def _ensure_shim(self) -> None:
+    def _ensure_shim(self) -> bool:
         if self._closed:
-            raise RuntimeError("WslPlatform is closed")
+            if self._shim_graceful:
+                return False
+            raise RuntimeError(f"{type(self).__name__} is closed")
+        if self._shim_disabled:
+            return False
         dead: subprocess.Popen[str] | None = None
         with self._shim_lock:
             if self._shim is not None and self._shim.poll() is None:
-                return
+                return True
             dead, self._shim = self._shim, None
             cmd = self._build_shim_cmd()
+            if not cmd:
+                if self._shim_graceful:
+                    self._disable_shim_once(self.last_shim_error or f"{self._shim_label} unavailable")
+                    return False
+                raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
             self._ready.clear()
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1)
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, encoding="utf-8", errors="replace", bufsize=1,
+                    env=self.env if self._shim_graceful else None,
+                )
+            except OSError as exc:
+                if self._shim_graceful:
+                    self._disable_shim_once(f"failed to spawn {self._shim_label}: {exc}")
+                    return False
+                raise
             self._shim = proc
             threading.Thread(target=self._shim_reader, args=(proc,), daemon=True).start()
         _reap_shim_proc(dead)
-        self._ready.wait(timeout=8.0)
+        self._ready.wait(timeout=self._shim_ready_timeout)
+        if self._shim_disabled:
+            return False
+        if self._shim_graceful:
+            with self._shim_lock:
+                alive = self._shim is not None and self._shim.poll() is None
+            if not alive:
+                self._disable_shim_once(self.last_shim_error or f"{self._shim_label} exited before ready")
+                return False
+        return True
 
     def _respawn_shim_bg(self) -> None:
         time.sleep(0.2)
-        if not self._closed and self._on_event is not None:
+        if not self._closed and not self._shim_disabled and self._on_event is not None:
             try: self._ensure_shim()
             except Exception: pass
 
     def _shim_reader(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stdout is not None
+        got_ready = False
         try:
             for raw in iter(proc.stdout.readline, ""):
-                if not raw.strip(): continue
+                if not raw.strip():
+                    continue
                 try: msg = json.loads(raw)
                 except ValueError: continue
-                if isinstance(msg, dict):
-                    if msg.get("event") == "ready": self._ready.set()
-                    elif "event" in msg and self._on_event is not None:
-                        self._ensure_event_worker(); self._event_q.put(msg)
-                    elif ("reply" in msg or msg.get("type") == "reply") and (q := self._pending.get(int(msg.get("seq_id") or 0))) is not None:
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("event") == "ready":
+                    got_ready = True
+                    self._ready.set()
+                elif "event" in msg and self._on_event is not None:
+                    self._ensure_event_worker()
+                    self._event_q.put(msg)
+                elif "reply" in msg or msg.get("type") == "reply":
+                    if (q := self._pending.get(int(msg.get("seq_id") or 0))) is not None:
                         try: q.put_nowait(msg)
                         except queue.Full: pass
+                elif self._shim_graceful and not got_ready and msg.get("ok") is False:
+                    self._disable_shim_once(str(msg.get("error") or f"{self._shim_label} startup failed"))
+                    self._ready.set()
         finally:
             need_respawn = False
             with self._shim_lock:
                 if self._shim is proc:
                     self._shim = None
-                    need_respawn = not self._closed and self._on_event is not None
+                    self._ready.set()
+                    if not got_ready and self._shim_graceful and not self._closed:
+                        self._disable_shim_once(self.last_shim_error or f"{self._shim_label} exited before ready")
+                    need_respawn = got_ready and not self._closed and not self._shim_disabled and self._on_event is not None
             _reap_shim_proc(proc)
             for q in list(self._pending.values()):
                 try: q.put_nowait({"error": "shim_eof"})
@@ -276,9 +345,12 @@ class WslPlatform:
             if need_respawn:
                 threading.Thread(target=self._respawn_shim_bg, daemon=True).start()
 
-    def _shim_rpc(self, payload: dict[str, Any], timeout_sec: float = 5.0) -> dict[str, Any]:
+    def _shim_rpc(self, payload: dict[str, Any], timeout_sec: float = 5.0) -> dict[str, Any] | None:
         for attempt in range(2):
-            self._ensure_shim()
+            if not self._ensure_shim():
+                if self._shim_graceful:
+                    return None
+                raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
             sid = 0
             q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
             broken: subprocess.Popen[str] | None = None
@@ -294,30 +366,99 @@ class WslPlatform:
                     proc.stdin.write(json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n")
                     proc.stdin.flush()
                 res = q.get(timeout=timeout_sec)
-                if res.get("error") == "shim_eof" and attempt == 0 and not self._closed:
+                if res.get("error") == "shim_eof" and attempt == 0 and not self._closed and not self._shim_disabled:
                     continue
                 if "error" in res:
+                    if self._shim_graceful:
+                        return None
                     raise RuntimeError(str(res["error"]))
                 return res
-            except (BrokenPipeError, OSError):
+            except (BrokenPipeError, OSError, queue.Empty):
                 if broken is not None:
                     _reap_shim_proc(broken)
-                if attempt == 0 and not self._closed:
+                if attempt == 0 and not self._closed and not self._shim_disabled:
                     continue
+                if self._shim_graceful:
+                    return None
                 raise
             finally:
                 if sid:
                     self._pending.pop(sid, None)
+        if self._shim_graceful:
+            return None
         raise RuntimeError("shim_rpc exhausted retries")
 
     def start_event_listener(self, on_hotkey_event: Callable[[dict[str, Any]], None]) -> None:
         self._closed = False
-        self._on_event = on_hotkey_event; self._ensure_event_worker(); self._ensure_shim()
+        self._shim_disabled = False
+        self._on_event = on_hotkey_event
+        self._ensure_event_worker()
+        self._ensure_shim()
+
+    def hud(self, state: str, text: str = "", duration_ms: int = 0) -> None:
+        if self._has_managed_shim():
+            req: dict[str, Any] = {"cmd": "hud", "state": state}
+            if text: req["text"] = text
+            if duration_ms > 0: req["duration_ms"] = duration_ms
+            try: self._shim_rpc(req, timeout_sec=1.5)
+            except Exception: pass
+
+    def close(self) -> None:
+        self._closed = True
+        self._on_event = None
+        self._event_q.put(None)
+        if self._event_worker is not None and self._event_worker.is_alive() and self._event_worker is not threading.current_thread():
+            self._event_worker.join(timeout=1.0)
+        if (cancel := getattr(self, "cancel_recording", None)) is not None:
+            cancel()
+        with self._shim_lock:
+            proc, self._shim = self._shim, None
+        if proc is not None and proc.poll() is None:
+            try:
+                if proc.stdin:
+                    proc.stdin.write('{"cmd":"quit"}\n')
+                    proc.stdin.flush()
+                    proc.stdin.close()
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+        _reap_shim_proc(proc)
+
+
+class WslPlatform(JsonlShimMixin):
+    _shim_graceful = False
+    _shim_ready_timeout = 8.0
+    _shim_label = "win_shim"
+
+    def __init__(self, cfg: Config, *, env: Mapping[str, str] | None = None, pulse_source: str = "RDPSource", shim_cmd_factory: Callable[[], list[str]] | None = None) -> None:
+        raw_env = os.environ if env is None else env
+        self.cfg, self.env = cfg, _pulse_env(raw_env)
+        explicit_pulse = (raw_env.get("AGENT_VOICE_INPUT_PULSE_SOURCE") or raw_env.get("VOICE_INPUT_PULSE_SOURCE") or "").strip()
+        self.pulse_source = explicit_pulse or pulse_source.strip() or "RDPSource"
+        self._shim_cmd_factory = shim_cmd_factory
+        if cfg.audio.wsl_source in ("winmm", "wasapi"):
+            self._primary_winmm = True
+        elif cfg.audio.wsl_source == "pulse":
+            self._primary_winmm = False
+        else:
+            has_custom_pulse = bool(explicit_pulse or pulse_source.strip() not in ("", "RDPSource"))
+            self._primary_winmm = bool(not has_custom_pulse and shim_cmd_factory is None and os.path.isfile(POWERSHELL_EXE))
+        self._use_winmm = self._primary_winmm
+        self.last_audio_error = ""
+        self._ff_rec, self._rec_mode = FfmpegWavRecorder(), ""
+        self._init_shim_bridge()
+
+    def _build_shim_cmd(self) -> list[str]:
+        if self._shim_cmd_factory is not None:
+            return self._shim_cmd_factory()
+        if not os.path.isfile(POWERSHELL_EXE):
+            raise RuntimeError(f"PowerShell not found at {POWERSHELL_EXE}")
+        return [POWERSHELL_EXE, "-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "bridge", "-Hotkey", self.cfg.hotkey.key, "-TriggerMode", self.cfg.hotkey.trigger_mode, "-TapMaxMs", str(self.cfg.hotkey.tap_max_ms), "-DebounceMs", str(self.cfg.hotkey.debounce_ms), "-Beep", "1" if self.cfg.audio.beep else "0"]
 
     def get_foreground_window(self) -> ForegroundWindow:
         if self._has_managed_shim():
             try:
-                r = self._shim_rpc({"cmd": "fg_window"}, timeout_sec=3.0)
+                r = self._shim_rpc({"cmd": "fg_window"}, timeout_sec=3.0) or {}
                 return ForegroundWindow(int(r.get("hwnd") or 0), str(r.get("process") or ""), str(r.get("title") or ""))
             except Exception:
                 pass
@@ -329,14 +470,6 @@ class WslPlatform:
             try: self._shim_rpc({"cmd": "beep", "kind": kind}, timeout_sec=1.5)
             except Exception: pass
 
-    def hud(self, state: str, text: str = "", duration_ms: int = 0) -> None:
-        if self._has_managed_shim():
-            req: dict[str, Any] = {"cmd": "hud", "state": state}
-            if text: req["text"] = text
-            if duration_ms > 0: req["duration_ms"] = duration_ms
-            try: self._shim_rpc(req, timeout_sec=1.5)
-            except Exception: pass
-
     def start_recording(self, runtime_dir: Path, *, loopback: bool = False) -> None:
         self.last_audio_error = ""
         eff_loopback = bool(loopback or self.env.get("AGENT_VOICE_INPUT_WASAPI_LOOPBACK") == "1" or self.env.get("VOICE_INPUT_WASAPI_LOOPBACK") == "1")
@@ -344,7 +477,7 @@ class WslPlatform:
             req: dict[str, Any] = {"cmd": "rec_start"}
             if eff_loopback:
                 req["loopback"] = True
-            res = self._shim_rpc(req, timeout_sec=4.0)
+            res = self._shim_rpc(req, timeout_sec=4.0) or {}
             if res.get("ok"):
                 self._rec_mode = "winmm"
                 return
@@ -365,7 +498,7 @@ class WslPlatform:
         if mode == "winmm":
             if drain_sec > 0.0:
                 time.sleep(drain_sec)
-            res = self._shim_rpc({"cmd": "rec_stop"}, timeout_sec=5.0)
+            res = self._shim_rpc({"cmd": "rec_stop"}, timeout_sec=5.0) or {}
             b64 = str(res.get("wav_b64") or "")
             wav = base64.b64decode(b64) if b64 else b""
             self.last_audio_error = "" if wav else str(res.get("rec_error") or "wasapi_empty_audio")
@@ -388,20 +521,7 @@ class WslPlatform:
             self._use_winmm = False
         return False
 
-    def deliver_text(self, text: str, seq_id: int, target_hwnd: int = 0) -> PasteOutcome:
-        res = self._shim_rpc({"cmd": "paste", "seq_id": seq_id, "text": text, "target_hwnd": target_hwnd, "expect_terminal": True}, timeout_sec=5.0)
+    def deliver_text(self, text: str, seq_id: int, target_hwnd: int = 0, *, origin_window: ForegroundWindow | None = None) -> PasteOutcome:
+        eff_hwnd = target_hwnd or (origin_window.hwnd if origin_window is not None else 0)
+        res = self._shim_rpc({"cmd": "paste", "seq_id": seq_id, "text": text, "target_hwnd": eff_hwnd, "expect_terminal": True}, timeout_sec=5.0) or {}
         return PasteOutcome(bool(res.get("pasted")), bool(res.get("clipboard")), str(res.get("reason") or "ok"), str(res.get("fg_process") or ""))
-
-    def close(self) -> None:
-        self._closed = True
-        self._on_event = None; self._event_q.put(None)
-        if self._event_worker is not None and self._event_worker.is_alive() and self._event_worker is not threading.current_thread():
-            self._event_worker.join(timeout=1.0)
-        self.cancel_recording()
-        with self._shim_lock: proc, self._shim = self._shim, None
-        if proc is not None and proc.poll() is None:
-            try:
-                if proc.stdin: proc.stdin.write('{"cmd":"quit"}\n'); proc.stdin.flush(); proc.stdin.close()
-                proc.wait(timeout=2.0)
-            except Exception: pass
-        _reap_shim_proc(proc)

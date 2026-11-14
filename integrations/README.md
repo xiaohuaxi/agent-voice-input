@@ -4,7 +4,9 @@
 
 `agent-voice-input` can bind to the active foreground coding agent session in **O(1) time** across multiple concurrent terminal tabs/windows, extracting clean recent dialogue and `git status` file hotwords for speech recognition and Stage 2 refinement while strictly ignoring background subagents and non-interactive child processes.
 
-All integrations below are **optional enhancements**—without them, `agent-voice-input` automatically falls back to `/proc` foreground interactive root-session scanning and window-title directory disambiguation.
+All integrations below are **optional enhancements**:
+- On **macOS + Ghostty**, `agent-voice-input` already reads the focused split's `tty` and `cwd` to match each split's active `codex`, `claude`, or `agy` session without hooks (though hooks still work on macOS via `ps` parent-chain `/dev/ttys*` discovery, e.g. inside `tmux` or other terminals).
+- On **Linux / WSL2**, without hooks it automatically falls back to `/proc` foreground interactive root-session scanning and window-title / directory disambiguation.
 
 ---
 
@@ -53,9 +55,9 @@ Ensure `agent-voice-input` is on your `PATH` (or use its full path; see [`claude
 ```
 
 What the hook does:
-1. Automatically ignores background subagents carrying `agent_id` or `isSidechain`;
-2. Atomically writes root session metadata to `$XDG_RUNTIME_DIR/agent-voice-input/sessions/claude-<id8>.json` (`0600` permissions);
-3. Writes an OSC 2 title (`claude · <short_cwd> [#<id8>]`) directly to the controlling TTY character device while keeping `stdout` empty so Claude's prompt context is never polluted.
+1. Automatically ignores background subagents carrying `agent_id` or `isSidechain` as well as headless `claude -p` / `--print` invocations (via `/proc` on Linux or `ps` parent-chain inspection on macOS);
+2. Atomically writes root session metadata (including normalized controlling `tty` and root `pid`) to `<runtime_dir>/sessions/claude-<id8>.json` (`0600` permissions);
+3. Walks the parent process chain to locate the controlling TTY character device (`/dev/pts/*` or `/dev/ttys*`) and writes an OSC 2 title (`claude · <short_cwd> [#<id8>]`) while keeping `stdout` empty so Claude's prompt context is never polluted.
 
 ---
 
@@ -84,4 +86,4 @@ Following [`gemini/hooks.json`](gemini/hooks.json), add `voice-session-title` to
 }
 ```
 
-The hook checks `presence/<cid>.lock` file locks and the opening JSONL record to filter out background subagents and headless `agy -p` invocations, updating the controlling TTY title (`agy · <short_cwd> [#<cid8>]`) only for foreground interactive sessions and returning a clean `{}` JSON response.
+The hook checks `presence/<cid>.lock` file locks, the opening JSONL record, and the parent process chain (`/proc` on Linux or `ps` on macOS) to filter out background subagents and headless `agy -p` invocations—recording the normalized `tty` in `<runtime_dir>/sessions/agy-<cid8>.json`, updating the controlling TTY title (`agy · <short_cwd> [#<cid8>]`) only for foreground interactive sessions, and returning a clean `{}` JSON response.

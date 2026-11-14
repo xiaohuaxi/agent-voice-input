@@ -4,7 +4,9 @@
 
 `agent-voice-input` 支持在多个并行终端窗口中 **O(1) 精确锁定当前前台 Agent 会话**，抽取干净的最近对话与 `git status` 热词供语音识别和二阶段精修纠错，同时严格排除后台 subagent 或非交互子进程。
 
-以下接入均为**可选增强**（未配置时仍会自动回退到 `/proc` 前台根会话扫描与目录名消歧）。
+以下接入均为**可选增强**：
+- 在 **macOS + Ghostty** 下，`agent-voice-input` 已可直接读取当前聚焦分屏的 `tty` 与 `cwd` 自动关联对应分屏内的 `codex`、`claude` 或 `agy` 会话，零钩子也不会串分屏（若在 `tmux` 或其他终端内使用，钩子在 macOS 下同样可通过 `ps` 祖先进程链找到 `/dev/ttys*` 正常工作）；
+- 在 **Linux / WSL2** 下，未配置钩子时会自动回退到 `/proc` 前台根会话扫描与窗口标题 / 目录名消歧。
 
 ---
 
@@ -53,9 +55,9 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
 ```
 
 钩子会：
-1. 自动忽略带有 `agent_id` 或 `isSidechain` 的后台 subagent；
-2. 将主会话元数据原子写入 `$XDG_RUNTIME_DIR/agent-voice-input/sessions/claude-<id8>.json`（权限 `0600`）；
-3. 直接向控制终端字符设备写入 OSC 2 标题 `claude · <short_cwd> [#<id8>]`，保持标准输出为空，绝不污染 Claude 上下文。
+1. 自动忽略带有 `agent_id` 或 `isSidechain` 的后台 subagent，并通过 `/proc`（Linux）或 `ps` 祖先链（macOS）拦截无头 `claude -p` / `--print` 调用；
+2. 将主会话元数据（含规范化后的控制终端 `tty` 与根进程 `pid`）原子写入 `<runtime_dir>/sessions/claude-<id8>.json`（权限 `0600`）；
+3. 沿父进程链定位控制终端字符设备（`/dev/pts/*` 或 `/dev/ttys*`）写入 OSC 2 标题 `claude · <short_cwd> [#<id8>]`，保持标准输出为空，绝不污染 Claude 上下文。
 
 ---
 
@@ -84,4 +86,4 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
 }
 ```
 
-钩子会通过 `presence/<cid>.lock` 锁句柄与首行 JSONL 校验严格拦截后台 subagent / 无头 `agy -p` 进程，仅在前台主会话中更新控制终端标题 `agy · <short_cwd> [#<cid8>]` 并返回标准空 JSON `{}`。
+钩子会结合 `presence/<cid>.lock` 文件锁、首行 JSONL 校验以及 `/proc`（Linux）或 `ps` 祖先进程链（macOS）严格拦截后台 subagent 与无头 `agy -p` 进程，将规范化 `tty` 记入 `<runtime_dir>/sessions/agy-<cid8>.json`，仅在前台交互式主会话中更新控制终端标题 `agy · <short_cwd> [#<cid8>]` 并返回标准空 JSON `{}`。

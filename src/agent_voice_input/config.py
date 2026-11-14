@@ -107,6 +107,7 @@ class AudioConfig:
     min_duration_sec: float = 0.3
     min_voiced_sec: float = 0.1
     wsl_source: str = "auto"
+    macos_device: str = "default"
     beep: bool = False
     tail_drain_sec: float | None = None
 
@@ -906,6 +907,8 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.audio.min_voiced_sec = _as_float(v, "audio.min_voiced_sec")
             elif k == "wsl_source":
                 cfg.audio.wsl_source = _as_str(v, "audio.wsl_source").strip().lower()
+            elif k == "macos_device":
+                cfg.audio.macos_device = _as_str(v, "audio.macos_device").strip()
             elif k == "beep":
                 cfg.audio.beep = _as_bool(v, "audio.beep")
             elif k == "tail_drain_sec":
@@ -997,6 +1000,8 @@ def _apply_env_overrides(cfg: Config, env: Mapping[str, str]) -> None:
         cfg.audio.min_voiced_sec = _as_float(kv[1], kv[0])
     if (kv := _get("WSL_SOURCE")) is not None:
         cfg.audio.wsl_source = kv[1].lower()
+    if (kv := _get("MACOS_AUDIO_DEVICE", "MACOS_DEVICE")) is not None:
+        cfg.audio.macos_device = kv[1]
     if (kv := _get("BEEP")) is not None:
         cfg.audio.beep = _as_bool(kv[1], kv[0])
     if (kv := _get("TAIL_DRAIN_SEC", "AUDIO_TAIL_DRAIN_SEC")) is not None:
@@ -1073,6 +1078,8 @@ def _validate_config(cfg: Config) -> None:
             f"audio.wsl_source must be one of {sorted(VALID_WSL_SOURCES)}, "
             f"got {cfg.audio.wsl_source!r}"
         )
+    if not cfg.audio.macos_device or not cfg.audio.macos_device.strip():
+        raise ConfigError("audio.macos_device must not be empty")
     if cfg.audio.min_duration_sec < 0 or cfg.audio.min_voiced_sec < 0:
         raise ConfigError("audio min_duration_sec and min_voiced_sec must be >= 0")
     if not (-120.0 <= cfg.audio.floor_dbfs < cfg.audio.target_dbfs <= 0.0):

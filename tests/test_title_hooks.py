@@ -16,6 +16,7 @@ import tempfile
 import termios
 import time
 import unittest
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
@@ -335,6 +336,7 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
                     home=home,
                     proc_root=no_proc,
                     runtime_dir=rt,
+                    start_pid=1,
                 )
             )
 
@@ -348,6 +350,7 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
                         home=home,
                         proc_root=no_proc,
                         runtime_dir=rt,
+                        start_pid=1,
                     )
                 )
                 self.assertTrue((rt / "sessions" / "agy-11223344.json").is_file())
@@ -566,6 +569,199 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
                     os.close(r_p)
                 self.assertEqual(rc, 0)
                 self.assertNotIn(b"\x1b]2;", out_file.read_bytes())
+
+    def test_nonproc_ps_parent_chain_tty_discovery_and_headless_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            home = base / "home"
+            rt = base / "rt"
+            no_proc = base / "nonexistent_proc"
+            proj = home / "repos" / "voice-app"
+            presence_dir = home / ".gemini" / "antigravity-cli" / "presence"
+            proj.mkdir(parents=True)
+            presence_dir.mkdir(parents=True)
+
+            # 1. Real PTY OSC 2 emission across a multi-hop detached ps ancestor chain (non-/proc)
+            master_fd, slave_fd = pty.openpty()
+            try:
+                os.set_blocking(master_fd, False)
+                slave_name = os.ttyname(slave_fd)
+                slave_short = slave_name[5:] if slave_name.startswith("/dev/") else slave_name
+
+                ps_rows_pty: dict[int, str] = {
+                    9010: f"9010 676 Ss {slave_short} login -fp dev\n",
+                    9011: f"9011 9010 S {slave_short} -zsh\n",
+                    9050: "9050 9011 S+ ?? node /opt/claude/versions/2.1.12 --resume\n",
+                    9080: "9080 9050 Ss ?? /bin/sh -c agent-voice-input session-hook --cli claude\n",
+                    9081: "9081 9080 S ?? python3 agent-voice-input session-hook --cli claude\n",
+                }
+
+                def fake_subproc_pty(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                    self.assertIs(kwargs.get("stdin"), subprocess.DEVNULL)
+                    exe = os.path.basename(cmd[0])
+                    if exe == "ps" and "-p" in cmd:
+                        pid_q = int(cmd[cmd.index("-p") + 1])
+                        out = ps_rows_pty.get(pid_q, "")
+                        return subprocess.CompletedProcess(cmd, 0 if out else 1, out.encode("utf-8"), b"")
+                    if exe == "lsof":
+                        return subprocess.CompletedProcess(cmd, 0, f"p9050\nn{proj}\n".encode("utf-8"), b"")
+                    raise AssertionError(f"unexpected subprocess cmd: {cmd}")
+
+                cl_sid = "12345678-aaaa-4bbb-8ccc-ddddeeeeffff"
+                with mock.patch("agent_voice_input.session_ctx.subprocess.run", side_effect=fake_subproc_pty):
+                    ok_cl = VST.update_claude_session(
+                        {"session_id": cl_sid},
+                        home=home,
+                        proc_root=no_proc,
+                        runtime_dir=rt,
+                        start_pid=9081,
+                    )
+                self.assertTrue(ok_cl)
+                pty_buf: list[bytes] = []
+                _read_pty_nonblocking(master_fd, pty_buf)
+                self.assertEqual(
+                    b"".join(pty_buf).decode("utf-8"),
+                    "\033]2;claude · ~/repos/voice-app [#12345678]\007",
+                )
+                cl_reg = json.loads((rt / "sessions" / "claude-12345678.json").read_text(encoding="utf-8"))
+                self.assertEqual(cl_reg["tty"], slave_name)
+                self.assertEqual(cl_reg["pid"], 9050)
+                self.assertEqual(cl_reg["cwd"], str(proj))
+            finally:
+                os.close(master_fd)
+                os.close(slave_fd)
+
+            # 2. Deterministic /dev/ttys019 normalization + agy multi-hop walk + headless -p / --print blocking
+            cid_ok = "abcdef12-3333-4444-8555-666677778888"
+            cid_hl = "fedcba98-3333-4444-8555-666677778888"
+            lock_ok = presence_dir / f"{cid_ok}.lock"
+            lock_hl = presence_dir / f"{cid_hl}.lock"
+            lock_ok.write_text("", encoding="utf-8")
+            lock_hl.write_text("", encoding="utf-8")
+
+            ps_rows_ttys: dict[int, str] = {
+                7001: "7001 600 Ss ttys019 -zsh\n",
+                # Interactive agy spawning hook in detached child chain without direct tty
+                7100: "7100 7001 S+ ?? /Users/dev/.local/bin/agy\n",
+                7101: "7101 7100 Ss ?? /bin/sh -c agent-voice-input session-hook --cli agy\n",
+                7102: "7102 7101 S ?? python3 agent-voice-input session-hook --cli agy\n",
+                # Headless agy -p invocation on same shell
+                7200: "7200 7001 S+ ttys019 /Users/dev/.local/bin/agy -p summarize diff\n",
+                7201: "7201 7200 S ?? python3 agent-voice-input session-hook --cli agy\n",
+                # Headless claude -p and --print invocations (native & node wrapper)
+                7300: "7300 7001 S+ ttys019 claude -p review changes\n",
+                7301: "7301 7300 S ?? python3 agent-voice-input session-hook --cli claude\n",
+                7400: "7400 7001 S+ ttys019 node /opt/claude/versions/2.1.9 --print check\n",
+                7401: "7401 7400 S ?? python3 agent-voice-input session-hook --cli claude\n",
+                # Detached non-agent session leader without tty (must stop at session boundary!)
+                7500: "7500 7001 Ss ?? /bin/bash -c hook\n",
+                7501: "7501 7500 S ?? python3 agent-voice-input\n",
+                # Session-leader boundary guards against climbing into an outer host claude terminal:
+                7600: "7600 600 S+ ttys019 claude\n",
+                # (a) New interactive login/pty session leader WITH tty (Ss ttys025) stops immediately
+                7601: "7601 7600 Ss ttys025 -zsh\n",
+                7602: "7602 7601 S ttys025 python3 -m unittest\n",
+                # (b) setsid() test runner WITHOUT tty (Ss ??) allows only 1 hop (7610), never reaching 7600
+                7610: "7610 7600 S ?? python3 -m unittest\n",
+                7611: "7611 7610 Ss ?? python3 hook_child\n",
+            }
+            osc2_calls: list[tuple[str, str]] = []
+
+            def fake_subproc_ttys(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                self.assertIs(kwargs.get("stdin"), subprocess.DEVNULL)
+                exe = os.path.basename(cmd[0])
+                if exe == "ps" and "-p" in cmd:
+                    pid_q = int(cmd[cmd.index("-p") + 1])
+                    out = ps_rows_ttys.get(pid_q, "")
+                    return subprocess.CompletedProcess(cmd, 0 if out else 1, out.encode("utf-8"), b"")
+                if exe == "lsof":
+                    return subprocess.CompletedProcess(cmd, 0, f"p7100\nn{proj}\n".encode("utf-8"), b"")
+                raise AssertionError(f"unexpected subprocess cmd: {cmd}")
+
+            fd_ok = os.open(str(lock_ok), os.O_RDWR)
+            fd_hl = os.open(str(lock_hl), os.O_RDWR)
+            try:
+                fcntl.flock(fd_ok, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd_hl, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with mock.patch(
+                    "agent_voice_input.session_ctx.subprocess.run", side_effect=fake_subproc_ttys
+                ), mock.patch(
+                    "agent_voice_input.session_title.write_osc2",
+                    side_effect=lambda t, s: osc2_calls.append((t, s)) or bool(t),
+                ):
+                    # Interactive agy succeeds, normalizes ttys019 -> /dev/ttys019
+                    self.assertTrue(
+                        VST.update_agy_session(
+                            {"conversationId": cid_ok},
+                            home=home,
+                            proc_root=no_proc,
+                            runtime_dir=rt,
+                            start_pid=7102,
+                        )
+                    )
+                    agy_reg = json.loads((rt / "sessions" / "agy-abcdef12.json").read_text(encoding="utf-8"))
+                    self.assertEqual(agy_reg["tty"], "/dev/ttys019")
+                    self.assertEqual(agy_reg["pid"], 7100)
+                    self.assertEqual(agy_reg["cwd"], str(proj))
+                    self.assertEqual(osc2_calls[-1], ("/dev/ttys019", "agy · ~/repos/voice-app [#abcdef12]"))
+
+                    # Headless agy -p blocked even when presence lock is held!
+                    before_n = len(osc2_calls)
+                    self.assertFalse(
+                        VST.update_agy_session(
+                            {"conversationId": cid_hl, "cwd": str(proj)},
+                            home=home,
+                            proc_root=no_proc,
+                            runtime_dir=rt,
+                            start_pid=7201,
+                        )
+                    )
+                    self.assertFalse((rt / "sessions" / "agy-fedcba98.json").exists())
+                    self.assertEqual(len(osc2_calls), before_n)
+
+                    # Headless claude -p & node claude --print blocked!
+                    for bad_sid, bad_pid in (
+                        ("88880001-1111-4222-8333-444455556666", 7301),
+                        ("88880002-1111-4222-8333-444455556666", 7401),
+                    ):
+                        self.assertFalse(
+                            VST.update_claude_session(
+                                {"session_id": bad_sid, "cwd": str(proj)},
+                                home=home,
+                                proc_root=no_proc,
+                                runtime_dir=rt,
+                                start_pid=bad_pid,
+                            )
+                        )
+                        self.assertFalse((rt / "sessions" / f"claude-{bad_sid[:8]}.json").exists())
+                    self.assertEqual(len(osc2_calls), before_n)
+
+                    # Detached session leader (7500 Ss ??) does not leak across session boundary to 7001 ttys019
+                    self.assertEqual(VST._find_tty(7501, no_proc), "")
+
+                    # Session-leader boundary in _walk_ancestor (non-/proc):
+                    # (a) Ss ttys025 stops immediately; (b) Ss ?? stops after 1 hop without hitting outer claude (7600)
+                    for child_pid in (7602, 7611):
+                        self.assertEqual(VST._find_ancestor_cli(child_pid, no_proc, "claude"), (0, []))
+
+            finally:
+                os.close(fd_ok)
+                os.close(fd_hl)
+
+            # 3. Mock /proc _walk_ancestor session-leader boundary check (has_tty stops immediately; no_tty stops after 1 hop)
+            proc_sl = base / "proc_sl"
+            _write_fake_proc(proc_sl, 8000, ppid=1, psid=8000, tty_nr=34816, comm="claude", cmdline=["claude"])
+            # (a) New session leader WITH tty (8010 == psid 8010, tty_nr > 0) -> stops at 8010
+            _write_fake_proc(proc_sl, 8010, ppid=8000, psid=8010, tty_nr=34817, comm="zsh", cmdline=["-zsh"])
+            _write_fake_proc(proc_sl, 8011, ppid=8010, psid=8010, tty_nr=34817, comm="python3", cmdline=["python3", "-m", "unittest"])
+            # (b) setsid() session leader WITHOUT tty (8021 == psid 8021, tty_nr == 0) -> 1 hop checks 8020, stops before 8000
+            _write_fake_proc(proc_sl, 8020, ppid=8000, psid=8000, tty_nr=0, comm="python3", cmdline=["python3", "-m", "unittest"])
+            _write_fake_proc(proc_sl, 8021, ppid=8020, psid=8021, tty_nr=0, comm="python3", cmdline=["python3", "hook"])
+            # (c) Direct setsid() hook spawned by claude (8030 == psid 8030, tty_nr == 0, ppid == 8000) -> 1 hop hits 8000!
+            _write_fake_proc(proc_sl, 8030, ppid=8000, psid=8030, tty_nr=0, comm="sh", cmdline=["/bin/sh", "-c", "hook"])
+            self.assertEqual(VST._find_ancestor_cli(8011, proc_sl, "claude"), (0, []))
+            self.assertEqual(VST._find_ancestor_cli(8021, proc_sl, "claude"), (0, []))
+            self.assertEqual(VST._find_ancestor_cli(8030, proc_sl, "claude")[0], 8000)
 
 
 if __name__ == "__main__":

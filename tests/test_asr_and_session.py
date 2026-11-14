@@ -1,6 +1,7 @@
 """Unit tests for ``agent_voice_input.asr_providers`` and ``agent_voice_input.session_ctx``."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -8,8 +9,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -31,6 +34,7 @@ from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
 from agent_voice_input.config import Config, resolve_credentials  # noqa: E402
 from agent_voice_input.session_ctx import (  # noqa: E402
     SessionTracker,
+    encode_claude_project_dir,
     is_agy_presence_lock_held_nonproc,
     parse_window_title_hint,
     write_session_registry_entry,
@@ -1349,6 +1353,304 @@ class SessionCtxTests(unittest.TestCase):
             assert m_shared is not None
             self.assertEqual(m_shared.session_id, sid_shared_new)
             self.assertEqual(m_shared.cwd, "/tmp/new-shared")
+
+    def test_ghostty_multi_split_tty_zero_hook_isolation_and_cwd_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            rt = root / "rt"
+            no_proc = root / "no_proc"
+            proj_alpha = home / "repos" / "proj-alpha"
+            proj_beta = home / "repos" / "proj-beta"
+            proj_alpha.mkdir(parents=True)
+            proj_beta.mkdir(parents=True)
+            rt.mkdir(parents=True)
+
+            # Set up 2 concurrent sessions per CLI (proj_beta deliberately given newer mtime everywhere!)
+            now = time.time()
+
+            # Codex sessions
+            cx_dir = home / ".codex" / "sessions" / "2026" / "11" / "14"
+            cx_dir.mkdir(parents=True)
+            cx_alpha = "aaaa1111-0000-4000-8000-000000000001"
+            cx_beta = "bbbb2222-0000-4000-8000-000000000002"
+            f_cx_alpha = cx_dir / f"rollout-2026-11-14-{cx_alpha}.jsonl"
+            f_cx_beta = cx_dir / f"rollout-2026-11-14-{cx_beta}.jsonl"
+            f_cx_alpha.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": cx_alpha, "source": "cli", "cwd": str(proj_alpha)}}) + "\n",
+                encoding="utf-8",
+            )
+            f_cx_beta.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": cx_beta, "source": "cli", "cwd": str(proj_beta)}}) + "\n",
+                encoding="utf-8",
+            )
+            os.utime(f_cx_alpha, (now - 120, now - 120))
+            os.utime(f_cx_beta, (now - 5, now - 5))
+
+            # Claude sessions
+            enc_alpha = encode_claude_project_dir(str(proj_alpha))[0]
+            enc_beta = encode_claude_project_dir(str(proj_beta))[0]
+            cl_dir_a = home / ".claude" / "projects" / enc_alpha
+            cl_dir_b = home / ".claude" / "projects" / enc_beta
+            cl_dir_a.mkdir(parents=True)
+            cl_dir_b.mkdir(parents=True)
+            cl_alpha = "1111aaaa-0000-4000-8000-000000000001"
+            cl_beta = "2222bbbb-0000-4000-8000-000000000002"
+            f_cl_alpha = cl_dir_a / f"{cl_alpha}.jsonl"
+            f_cl_beta = cl_dir_b / f"{cl_beta}.jsonl"
+            f_cl_alpha.write_text(
+                json.dumps({"type": "user", "isSidechain": False, "sessionId": cl_alpha, "cwd": str(proj_alpha), "message": {"role": "user", "content": "alpha turn"}}) + "\n",
+                encoding="utf-8",
+            )
+            f_cl_beta.write_text(
+                json.dumps({"type": "user", "isSidechain": False, "sessionId": cl_beta, "cwd": str(proj_beta), "message": {"role": "user", "content": "beta turn"}}) + "\n",
+                encoding="utf-8",
+            )
+            os.utime(f_cl_alpha, (now - 120, now - 120))
+            os.utime(f_cl_beta, (now - 5, now - 5))
+
+            # Antigravity (agy) sessions with active flock + transcript Working Directory
+            presence_dir = home / ".gemini" / "antigravity-cli" / "presence"
+            presence_dir.mkdir(parents=True)
+            agy_alpha = "3333cccc-0000-4000-8000-000000000001"
+            agy_beta = "4444dddd-0000-4000-8000-000000000002"
+            for cid, pdir, age in ((agy_alpha, proj_alpha, 120), (agy_beta, proj_beta, 5)):
+                lf = presence_dir / f"{cid}.lock"
+                lf.write_text("", encoding="utf-8")
+                logs_dir = home / ".gemini" / "antigravity-cli" / "brain" / cid / ".system_generated" / "logs"
+                logs_dir.mkdir(parents=True)
+                tf = logs_dir / "transcript.jsonl"
+                tf.write_text(
+                    json.dumps(
+                        {
+                            "source": "USER_EXPLICIT",
+                            "type": "USER_INPUT",
+                            "content": f"<user_information>\nCommand Working Directory: {pdir}\n</user_information>\n<USER_REQUEST>fix {pdir.name}</USER_REQUEST>",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.utime(tf, (now - age, now - age))
+
+            fd_agy_a = os.open(str(presence_dir / f"{agy_alpha}.lock"), os.O_RDWR)
+            fd_agy_b = os.open(str(presence_dir / f"{agy_beta}.lock"), os.O_RDWR)
+            try:
+                fcntl.flock(fd_agy_a, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd_agy_b, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                tracker = SessionTracker(
+                    home_dir=home,
+                    env={"HOME": str(home)},
+                    runtime_dir=rt,
+                    proc_root=no_proc,
+                )
+
+                tty_tables: dict[str, str] = {}
+                pid_rows: dict[int, str] = {}
+                lsof_rows: dict[int, str] = {}
+
+                def fake_subproc(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                    self.assertIs(kwargs.get("stdin"), subprocess.DEVNULL)
+                    exe = os.path.basename(cmd[0])
+                    if exe == "ps" and "-t" in cmd:
+                        t_short = cmd[cmd.index("-t") + 1]
+                        out = tty_tables.get(t_short, "")
+                        return subprocess.CompletedProcess(cmd, 0 if out else 1, out.encode("utf-8"), b"")
+                    if exe == "ps" and "-p" in cmd:
+                        pid_q = int(cmd[cmd.index("-p") + 1])
+                        out = pid_rows.get(pid_q, "")
+                        return subprocess.CompletedProcess(cmd, 0 if out else 1, out.encode("utf-8"), b"")
+                    if exe == "lsof" and "-p" in cmd:
+                        pid_q = int(cmd[cmd.index("-p") + 1])
+                        out = lsof_rows.get(pid_q, "")
+                        return subprocess.CompletedProcess(cmd, 0 if out else 1, out.encode("utf-8"), b"")
+                    if exe == "git":
+                        return subprocess.CompletedProcess(cmd, 1, b"", b"")
+                    raise AssertionError(f"unexpected cmd: {cmd}")
+
+                with mock.patch("agent_voice_input.session_ctx.subprocess.run", side_effect=fake_subproc):
+                    # 1. Two Codex splits (plus a headless `codex exec` worker on ttys011 that must be ignored)
+                    tty_tables["ttys011"] = (
+                        "5001 600 Ss ttys011 -zsh\n"
+                        "5010 5001 S+ ttys011 /Users/dev/.local/bin/codex\n"
+                        "5015 5010 S ttys011 /Users/dev/.local/bin/codex exec check\n"
+                    )
+                    tty_tables["ttys012"] = (
+                        "6001 600 Ss ttys012 -zsh\n"
+                        "6010 6001 S+ ttys012 /Users/dev/.local/bin/codex\n"
+                    )
+                    m_cx_1 = tracker.resolve_session(
+                        "Ghostty", window_tty="/dev/ttys011", window_cwd=f"file://localhost{proj_alpha}/"
+                    )
+                    m_cx_2 = tracker.resolve_session(
+                        "Ghostty", window_tty="/dev/ttys012", window_cwd=str(proj_beta)
+                    )
+                    assert m_cx_1 is not None and m_cx_2 is not None
+                    self.assertEqual((m_cx_1.cli, m_cx_1.session_id, m_cx_1.matched_by), ("codex", cx_alpha, "tty_ps"))
+                    self.assertEqual((m_cx_2.cli, m_cx_2.session_id, m_cx_2.matched_by), ("codex", cx_beta, "tty_ps"))
+
+                    # 2. Two Claude splits (node wrapper + native binary; headless `claude -p` ignored)
+                    tty_tables["ttys011"] = (
+                        "5001 600 Ss ttys011 -zsh\n"
+                        "5020 5001 S+ ttys011 node /opt/claude/versions/2.1.12\n"
+                        "5025 5020 S ttys011 claude -p subcheck\n"
+                    )
+                    tty_tables["ttys012"] = (
+                        "6001 600 Ss ttys012 -zsh\n"
+                        "6020 6001 S+ ttys012 claude\n"
+                    )
+                    m_cl_1 = tracker.resolve_session(
+                        "zsh", window_tty="/dev/ttys011", window_cwd=str(proj_alpha)
+                    )
+                    m_cl_2 = tracker.resolve_session(
+                        "zsh", window_tty="/dev/ttys012", window_cwd=str(proj_beta)
+                    )
+                    assert m_cl_1 is not None and m_cl_2 is not None
+                    self.assertEqual((m_cl_1.cli, m_cl_1.session_id, m_cl_1.matched_by), ("claude", cl_alpha, "tty_ps"))
+                    self.assertEqual((m_cl_2.cli, m_cl_2.session_id, m_cl_2.matched_by), ("claude", cl_beta, "tty_ps"))
+
+                    # 3. Two Antigravity (agy) splits (headless `agy -p` ignored)
+                    tty_tables["ttys011"] = (
+                        "5001 600 Ss ttys011 -zsh\n"
+                        "5030 5001 S+ ttys011 /Users/dev/.local/bin/agy\n"
+                        "5035 5030 S ttys011 /Users/dev/.local/bin/agy -p quick\n"
+                    )
+                    tty_tables["ttys012"] = (
+                        "6001 600 Ss ttys012 -zsh\n"
+                        "6030 6001 S+ ttys012 antigravity\n"
+                    )
+                    m_ag_1 = tracker.resolve_session(
+                        "Ghostty", window_tty="/dev/ttys011", window_cwd=str(proj_alpha)
+                    )
+                    m_ag_2 = tracker.resolve_session(
+                        "Ghostty", window_tty="/dev/ttys012", window_cwd=str(proj_beta)
+                    )
+                    assert m_ag_1 is not None and m_ag_2 is not None
+                    self.assertEqual((m_ag_1.cli, m_ag_1.session_id, m_ag_1.matched_by), ("agy", agy_alpha, "tty_ps"))
+                    self.assertEqual((m_ag_2.cli, m_ag_2.session_id, m_ag_2.matched_by), ("agy", agy_beta, "tty_ps"))
+
+                    # 3b. Real macOS agy transcripts omit cwd in JSONL: lsof PID -> presence/<cid>.lock disambiguates even in SAME cwd!
+                    lsof_rows[5030] = f"p5030\nn{presence_dir / (agy_beta + '.lock')}\n"
+                    m_ag_lsof = tracker.resolve_session(
+                        "Ghostty", window_tty="/dev/ttys011", window_cwd=str(proj_alpha)
+                    )
+                    assert m_ag_lsof is not None
+                    self.assertEqual((m_ag_lsof.cli, m_ag_lsof.session_id, m_ag_lsof.matched_by), ("agy", agy_beta, "tty_ps"))
+                    lsof_rows.clear()
+
+                    # 4. Idle shell split (no agent on ttys013) MUST NOT steal neighbor split's session!
+                    tty_tables["ttys013"] = "7001 600 Ss ttys013 -zsh\n"
+                    self.assertIsNone(
+                        tracker.resolve_session(
+                            "zsh", window_tty="/dev/ttys013", window_cwd=str(proj_alpha)
+                        )
+                    )
+
+                    # 4b. Unquoted ps args with paired apostrophes around headless `-p` / `exec` MUST NOT be swallowed!
+                    tty_tables["ttys014"] = (
+                        "7101 600 Ss ttys014 -zsh\n"
+                        "7110 7101 S+ ttys014 claude --append-system-prompt don't -p can't\n"
+                        "7111 7101 S ttys014 codex -c note=don't exec can't\n"
+                        "7112 7101 S ttys014 agy --note don't -p can't\n"
+                    )
+                    self.assertIsNone(
+                        tracker.resolve_session(
+                            "zsh", window_tty="/dev/ttys014", window_cwd=str(proj_alpha)
+                        )
+                    )
+
+                    # 4c. TTY-less GUI window_pid (e.g. Ghostty app_pid) MUST NOT pollute live_pids on empty tty
+                    tty_tables["ttys015"] = ""
+                    pid_rows[9999] = "9999 1 S ?? /Applications/Ghostty.app/Contents/MacOS/ghostty\n"
+                    with mock.patch("agent_voice_input.session_ctx._is_pid_alive", side_effect=lambda p: p == 5020):
+                        # 5. Priority 1: Explicit #tag in window title still takes top precedence over window_tty
+                        m_explicit = tracker.resolve_session(
+                            f"claude · [#{cl_beta[:8]}]",
+                            window_tty="/dev/ttys011",
+                            window_cwd=str(proj_alpha),
+                        )
+                        assert m_explicit is not None
+                        self.assertEqual(m_explicit.session_id, cl_beta)
+                        self.assertEqual(m_explicit.matched_by, "title_prefix")
+
+                        # 6. Priority 2a: Registry tty_registry hit vs stale dead PID rejection + normalized cwd
+                        tty_tables["ttys011"] = (
+                            "5001 600 Ss ttys011 -zsh\n"
+                            "5020 5001 S+ ttys011 claude\n"
+                        )
+                        reg_path = write_session_registry_entry(
+                            rt,
+                            cli="claude",
+                            session_id=cl_alpha,
+                            jsonl_path=str(f_cl_alpha),
+                            cwd=f"file://localhost{proj_alpha}/",
+                            tty="ttys011",
+                            pid=5020,
+                        )
+                        assert reg_path is not None
+                        self.assertEqual(json.loads(reg_path.read_text(encoding="utf-8"))["cwd"], str(proj_alpha))
+                        self.assertEqual(encode_claude_project_dir(f"{proj_alpha}/"), encode_claude_project_dir(str(proj_alpha)))
+                        self.assertEqual(
+                            encode_claude_project_dir(f"file://localhost{proj_alpha}/"),
+                            encode_claude_project_dir(str(proj_alpha)),
+                        )
+
+                        m_reg = tracker.resolve_session(
+                            "zsh", window_tty="/dev/ttys011", window_cwd=str(proj_alpha)
+                        )
+                        assert m_reg is not None
+                        self.assertEqual((m_reg.session_id, m_reg.matched_by), (cl_alpha, "tty_registry"))
+
+                        # Stale registry entry with dead PID (888888) on idle shell ttys013 is ignored
+                        write_session_registry_entry(
+                            rt,
+                            cli="claude",
+                            session_id=cl_beta,
+                            jsonl_path=str(f_cl_beta),
+                            cwd=str(proj_beta),
+                            tty="/dev/ttys013",
+                            pid=888888,
+                        )
+                        self.assertIsNone(
+                            tracker.resolve_session(
+                                "zsh", window_tty="/dev/ttys013", window_cwd=str(proj_beta)
+                            )
+                        )
+
+                        # Empty ps -t table (e.g. inside multiplexer) + TTY-less GUI window_pid=9999 falls through
+                        # cleanly to Priority 3 non-/proc fallback instead of treating GUI PID 9999 as a live shell PID!
+                        m_mux_fb = tracker.resolve_session(
+                            "claude", window_tty="/dev/ttys015", window_cwd=str(proj_alpha), window_pid=9999
+                        )
+                        assert m_mux_fb is not None
+                        self.assertEqual(m_mux_fb.session_id, cl_alpha)
+
+                        # 7. Priority 3: No window_tty, but window_cwd provided -> disambiguates to proj_alpha
+                        #    (including a freshly opened 0-message Claude session in a third project!)
+                        m_cwd_only = tracker.resolve_session(
+                            "claude", window_tty="", window_cwd=str(proj_alpha)
+                        )
+                        assert m_cwd_only is not None
+                        self.assertEqual(m_cwd_only.cli, "claude")
+                        self.assertEqual(m_cwd_only.session_id, cl_alpha)
+
+                        proj_gamma = home / "repos" / "gamma-empty"
+                        proj_gamma.mkdir(parents=True)
+                        cl_gamma = "66660003-cccc-4ddd-8eee-ffff00003333"
+                        cl_dir_g = home / ".claude" / "projects" / encode_claude_project_dir(str(proj_gamma))[0]
+                        cl_dir_g.mkdir(parents=True, exist_ok=True)
+                        f_cl_gamma = cl_dir_g / f"{cl_gamma}.jsonl"
+                        f_cl_gamma.write_bytes(b"")
+                        os.utime(f_cl_gamma, (now, now))
+                        m_cwd_zero = tracker.resolve_session(
+                            "claude", window_tty="", window_cwd=str(proj_gamma)
+                        )
+                        assert m_cwd_zero is not None
+                        self.assertEqual((m_cwd_zero.cli, m_cwd_zero.session_id), ("claude", cl_gamma))
+            finally:
+                os.close(fd_agy_a)
+                os.close(fd_agy_b)
 
 
 if __name__ == "__main__":

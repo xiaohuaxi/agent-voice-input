@@ -165,6 +165,9 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         )
         pkg_data = data["tool"]["setuptools"]["package-data"]["agent_voice_input"]
         self.assertIn("win_shim.ps1", pkg_data)
+        self.assertIn("mac_shim.swift", pkg_data)
+        manifest_raw = (_REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+        self.assertIn("mac_shim.swift", manifest_raw)
         self.assertTrue(SHIM_SCRIPT.is_file())
         self.assertEqual(
             SHIM_SCRIPT.resolve(),
@@ -362,10 +365,24 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         self.assertNotIn(fake_val, fb.warning)
 
 
+def _isolated_tracker(base: Path) -> SessionTracker:
+    return SessionTracker(home_dir=base / "home", env={}, runtime_dir=base, proc_root=base / "noproc")
+
+
 class DaemonStateMachineAndSocketTests(unittest.TestCase):
     def test_zero_wav_auto_switches_pulse_to_winmm(self) -> None:
-        plat = _FakePlatform(wav_bytes=_zero_wav(1.0), source="pulse")
-        res = run_pipeline_once(_zero_wav(1.0), cfg=Config(), platform=plat, audio_source="pulse", asr_provider=_FakeAsr(), refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))), env={})
+        with tempfile.TemporaryDirectory() as td:
+            plat = _FakePlatform(wav_bytes=_zero_wav(1.0), source="pulse")
+            res = run_pipeline_once(
+                _zero_wav(1.0),
+                cfg=Config(),
+                platform=plat,
+                audio_source="pulse",
+                asr_provider=_FakeAsr(),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(Path(td)),
+                env={},
+            )
         self.assertFalse(res.ok)
         self.assertEqual(res.skipped_reason, "silence")
         self.assertTrue(res.switched_fallback)
@@ -383,6 +400,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 platform=plat,
                 asr_provider=_FakeAsr("旧轮次语音", gate_evt=gate_evt),
                 refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(Path(td)),
                 clock_fn=lambda: now[0],
             )
             # Start recording seq 1
@@ -448,6 +466,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 platform=plat,
                 asr_provider=_FakeAsr("通过控制套接字上屏"),
                 refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(rt),
             )
             t = threading.Thread(target=daemon.serve_forever, daemon=True)
             t.start()
@@ -593,7 +612,15 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         # Also verify daemon rolls back state="idle" if get_foreground_window() or stop_recording() raises
         with tempfile.TemporaryDirectory() as td:
             bad_plat = _FakePlatform()
-            daemon = VoiceInputDaemon(Config(refiner=RefinerConfig(provider="off")), env={}, runtime_dir=Path(td), platform=bad_plat, asr_provider=_FakeAsr(), refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))))
+            daemon = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="off")),
+                env={},
+                runtime_dir=Path(td),
+                platform=bad_plat,
+                asr_provider=_FakeAsr(),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(Path(td)),
+            )
             bad_plat.get_foreground_window = lambda: (_ for _ in ()).throw(RuntimeError("fg boom"))  # type: ignore[method-assign]
             r_start = daemon.handle_trigger("toggle")
             self.assertFalse(r_start["ok"])
@@ -729,6 +756,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 platform=plat,
                 asr_provider=_FakeAsr("精修前原始初稿句子"),
                 refiner=_MockRefiner(cfg, env={}, runtime_dir=Path(td)),
+                tracker=_isolated_tracker(Path(td)),
             )
             try:
                 self.assertTrue(daemon.handle_trigger("toggle")["ok"])
@@ -797,6 +825,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 platform=_DrainPlatform(),
                 asr_provider=_FakeAsr("并发排空测试"),
                 refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(Path(td2)),
                 clock_fn=controlled_clock,
             )
             try:
@@ -879,6 +908,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 platform=plat,
                 asr_provider=_BlockingAsr(),
                 refiner=_BlockingRefiner(cfg, env={}, runtime_dir=Path(td)),
+                tracker=_isolated_tracker(Path(td)),
             )
             try:
                 self.assertEqual(daemon.handle_trigger("toggle")["state"], "recording")
@@ -919,6 +949,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 platform=plat_sh,
                 asr_provider=_BlockingAsr(single_hop=True),
                 refiner=ref_sh,
+                tracker=_isolated_tracker(Path(td_sh)),
             )
             try:
                 daemon_sh.handle_trigger("toggle")
@@ -958,6 +989,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 platform=plat_sup,
                 asr_provider=_EmptySlowAsr(),
                 refiner=_BlockingRefiner(cfg_sup, env={}, runtime_dir=Path(td_sup)),
+                tracker=_isolated_tracker(Path(td_sup)),
             )
             try:
                 daemon_sup.handle_trigger("toggle")
@@ -993,6 +1025,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 platform=plat,
                 asr_provider=_FakeAsr("免打扰实测第一句。第二句完整保留。"),
                 refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(tmp),
             )
             try:
                 # 1. no_paste + silent_hud control cycle: full ASR/refiner, zero paste, zero HUD/beep

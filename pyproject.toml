@@ -17,10 +17,12 @@ keywords = [
     "codex",
     "claude-code",
     "wsl2",
+    "macos",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
+    "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -44,4 +46,4 @@ where = ["src"]
 include = ["agent_voice_input*"]
 
 [tool.setuptools.package-data]
-agent_voice_input = ["win_shim.ps1"]
+agent_voice_input = ["win_shim.ps1", "mac_shim.swift"]

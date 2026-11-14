@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json, os, signal, socket, sys, threading, time
+import inspect, json, os, signal, socket, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -26,6 +26,29 @@ def create_platform(cfg: Config, *, env: Mapping[str, str] | None = None) -> Wsl
     return MacOSPlatform(cfg, env=env) if sys.platform == "darwin" else WslPlatform(cfg, env=env)
 
 
+def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
+    return ForegroundWindow(
+        hwnd=int(m.get("hwnd") or 0),
+        process=str(m.get("process") or ""),
+        title=str(m.get("title") or ""),
+        bundle_id=str(m.get("bundle_id") or ""),
+        surface_id=str(m.get("surface_id") or ""),
+        tty=str(m.get("tty") or ""),
+        cwd=str(m.get("cwd") or ""),
+        pid=int(m.get("pid") or 0),
+    )
+
+
+def _deliver_with_origin(platform: Any, text: str, *, seq_id: int, origin_window: ForegroundWindow) -> PasteOutcome:
+    try:
+        params = inspect.signature(platform.deliver_text).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "origin_window" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return platform.deliver_text(text, seq_id=seq_id, target_hwnd=origin_window.hwnd, origin_window=origin_window)
+    return platform.deliver_text(text, seq_id=seq_id, target_hwnd=origin_window.hwnd)
+
+
 def _will_run_stage2_refiner(cfg: Config, refiner: BaseRefiner, asr_res: AsrResult) -> bool:
     prov = cfg.refiner.provider.strip().lower()
     if prov in ("", "off", "none", "false", "0", "disabled"):
@@ -41,6 +64,7 @@ def run_pipeline_once(
     raw_wav: bytes | str | Path, *, cfg: Config, creds: ProviderCredentials | None = None,
     tracker: SessionTracker | None = None, asr_provider: BaseAsrProvider | None = None,
     refiner: BaseRefiner | None = None, platform: Any = None, origin_window: ForegroundWindow | None = None,
+    window_title_override: str | None = None,
     audio_source: str = "file", seq_id: int = 1, dry_run: bool = False,
     is_current_seq: Callable[[int], bool] | None = None,
     on_stage: Callable[[str], None] | None = None,
@@ -61,7 +85,16 @@ def run_pipeline_once(
             sw = bool(gate.all_zero and gate.reason == "silence" and audio_source == "pulse" and platform and platform.switch_to_fallback_audio())
             return PipelineResult(False, seq_id, skipped_reason=gate.reason, audio_source=audio_source, switched_fallback=sw, gate=gate)
         win = origin_window or (platform.get_foreground_window() if platform else ForegroundWindow())
-        snap = eff_tracker.sync_session(window_title=win.title)
+        snap = (
+            eff_tracker.sync_session(
+                window_title=win.title,
+                window_tty=win.tty,
+                window_cwd=win.cwd,
+                window_pid=win.pid,
+            )
+            if window_title_override is None
+            else eff_tracker.sync_session(window_title=window_title_override)
+        )
         asr_ctx = eff_tracker.build_asr_context(snap)
         asr_res = eff_asr.transcribe(gate.wav_bytes, context=asr_ctx)
         if not asr_res.text.strip():
@@ -74,7 +107,7 @@ def run_pipeline_once(
         final_text = ref_res.text.strip() or asr_res.text.strip()
         if is_current_seq is not None and not is_current_seq(seq_id):
             return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res)
-        paste_out = None if (dry_run or platform is None) else platform.deliver_text(final_text, seq_id=seq_id, target_hwnd=win.hwnd)
+        paste_out = None if (dry_run or platform is None) else _deliver_with_origin(platform, final_text, seq_id=seq_id, origin_window=win)
         return PipelineResult(True, seq_id, final_text=final_text, audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, paste=paste_out)
     finally:
         if owns_refiner:
@@ -185,7 +218,10 @@ class VoiceInputDaemon:
             if mode == "start":
                 if not eff_silent: self._hud("recording")
                 try:
-                    win_now = window if (window and (window.title or window.process or window.hwnd)) else self.platform.get_foreground_window()
+                    if (resolver := getattr(self.platform, "resolve_foreground_window", None)) is not None:
+                        win_now = resolver(window)
+                    else:
+                        win_now = window if (window and (window.title or window.process or window.hwnd)) else self.platform.get_foreground_window()
                     with self._lock: self._origin_win = win_now
                     if loopback:
                         self.platform.start_recording(self.runtime_dir, loopback=True)
@@ -268,7 +304,7 @@ class VoiceInputDaemon:
             with self._lock:
                 return {"ok": True, "pid": os.getpid(), "state": self.state, "seq_id": self.seq_id, "asr_provider": select_asr_provider(self.cfg, self.creds), "refiner_provider": self.cfg.refiner.provider, "last_result": dict(self.last_result)}
         if cmd in ("toggle", "rec_start", "rec_stop"):
-            win = ForegroundWindow(int(req.get("hwnd") or 0), str(req.get("process") or ""), str(req.get("title") or "")) if any(req.get(k) for k in ("hwnd", "process", "title")) else None
+            win = _window_from_mapping(req) if any(req.get(k) for k in ("hwnd", "process", "title", "bundle_id", "surface_id", "tty", "cwd", "pid")) else None
             return self.handle_trigger({"toggle": "toggle", "rec_start": "ptt_start", "rec_stop": "ptt_stop"}[cmd], win, no_paste=bool(req.get("no_paste")), silent_hud=bool(req.get("silent_hud")), loopback=bool(req.get("loopback")))
         if cmd == "selftest_wav":
             wav_path = Path(str(req.get("wav_path") or "")).expanduser()
@@ -277,7 +313,7 @@ class VoiceInputDaemon:
             with self._lock:
                 self.seq_id += 1
                 cur_seq = self.seq_id
-            win = ForegroundWindow(0, "", str(req.get("title") or ""))
+            win = _window_from_mapping(req)
             res = run_pipeline_once(wav_path, cfg=self.cfg, creds=self.creds, tracker=self.tracker, asr_provider=self.asr_provider, refiner=self.refiner, platform=self.platform, origin_window=win, audio_source="selftest_wav", seq_id=cur_seq, dry_run=True, env=self.env)
             summary = self._build_summary(cur_seq, res, dry_run=True)
             with self._lock:
@@ -296,7 +332,7 @@ class VoiceInputDaemon:
         prev_term = signal.signal(signal.SIGTERM, lambda *_: self._stop_evt.set()) if is_main else None
         try:
             self.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8"); os.chmod(self.pid_path, 0o600)
-            self.platform.start_event_listener(lambda m: self.handle_trigger(str(m.get("event")), ForegroundWindow(int(m.get("hwnd") or 0), str(m.get("process") or ""), str(m.get("title") or ""))) if m.get("event") in ("toggle", "ptt_start", "ptt_stop", "ptt_cancel") else None)
+            self.platform.start_event_listener(lambda m: self.handle_trigger(str(m.get("event")), _window_from_mapping(m)) if m.get("event") in ("toggle", "ptt_start", "ptt_stop", "ptt_cancel") else None)
             srv.bind(str(self.sock_path)); os.chmod(self.sock_path, 0o600); srv.listen(8); srv.settimeout(0.3)
             while not self._stop_evt.is_set():
                 try: conn, _ = srv.accept()

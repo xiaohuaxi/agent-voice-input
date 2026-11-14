@@ -3,7 +3,9 @@
 # Or specify explicitly via --config / AGENT_VOICE_INPUT_CONFIG
 
 [hotkey]
-# Windows global hotkey: RControl (default Right Ctrl, 0xA3) | RAlt | RShift | CapsLock | F1..F24 | 0xNN
+# Global hotkey:
+# - Windows/WSL2: RControl (default Right Ctrl, 0xA3) | RAlt | RShift | CapsLock | F1..F24 | 0xNN
+# - macOS: RControl (default Right Ctrl, 0x3E / NX_DEVICERCTLKEYMASK) | LControl | ROption/RAlt | RCommand | Fn | F1..F20 | 0xNN
 key = "RControl"
 # Trigger mode:
 # - "tap_toggle": isolated tap toggles recording start/stop (chords such as RControl+C pass through untouched)
@@ -21,6 +23,9 @@ min_duration_sec = 0.3
 min_voiced_sec = 0.1
 # WSL2 capture source: "auto" (defaults to resident win_shim Windows WASAPI 16 kHz capture, avoiding WSLg RDPSource zero-packet deadlocks) | "wasapi" | "winmm" | "pulse"
 wsl_source = "auto"
+# macOS AVFoundation audio input device: "default" (system default mic) | device index e.g. "0" | device name
+# (can also be overridden via AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE)
+macos_device = "default"
 # Start/stop audio cue is disabled by default to avoid 1-2s RDP audio wake-up lag; enable locally if desired
 beep = false
 # Tail drain seconds after stopping recording (auto-adapts by platform when unset: 0.65s on WSL2/RDP, 0.20s on macOS)
