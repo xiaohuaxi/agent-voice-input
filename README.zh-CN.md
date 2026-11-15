@@ -23,7 +23,7 @@
    帮我看一下 platform_wsl.py 里面 max_duration_sec 的默认值，改成 10 分钟，顺便跑一下单测，别接管道 head。
 ```
 
-> 当前支持 **Windows Terminal + WSL2（含远程桌面与 `tmux`）** 与 **macOS + Ghostty（含 `tmux`）**，更多终端适配持续推进中。
+> 已验证支持 **Windows Terminal + WSL2（含远程桌面与 `tmux`）** 与 **macOS（`Ghostty`、系统自带 `Terminal.app` /「终端」及 `tmux`）**；其他常用 macOS 终端（`iTerm2`、`WezTerm`、`Alacritty`、`Kitty`、`Warp` 等）已内置窗口级防串窗、子进程 PTY 会话发现与 `Cmd+V` / `tmux` 粘贴基线支持，欢迎在对应环境实测并提交 PR。
 
 ---
 
@@ -94,11 +94,11 @@ agent-voice-input start
 - **原生 WASAPI 采集，告别 WSLg 与远程桌面卡顿**：默认通过常驻 `win_shim` 直接调用 Windows 原生 WASAPI 16 kHz 采集音频，彻底避开 WSLg `RDPSource` 休眠零包死锁；默认关闭起止提示音以避免远程桌面（RDP）1–2 秒音频通道唤醒延迟。
 - **`tmux` 分屏开箱即用**：无需改动 `~/.tmux.conf`，自动追踪当前 attached 客户端的焦点窗格并隔离相邻后台分屏。
 
-### macOS + Ghostty（含 `tmux`）
+### macOS（`Ghostty`、系统自带 `Terminal.app` 与 `tmux`）
 
-- **原生胶囊与 Ghostty 分屏直投**：通过缓存的原生 `mac_shim` 监听右 Ctrl（或 `ptt` 按住说话）并渲染 Retina 悬浮波形胶囊；按下录音时锁定当前聚焦的 Ghostty 分屏 surface，完成后直接向该分屏注入 bracketed paste 文本，等待期间切走分屏或应用会自动退回剪贴板。
-- **零钩子分屏与 `tmux` 会话关联**：直接读取聚焦 Ghostty 分屏的 `tty` 与 `cwd`（连接 `tmux` 时进一步定位对应焦点窗格），精准匹配该窗格内的 `codex`、`claude` 或 `agy` 活跃会话；录音设备默认跟随系统麦克风（可通过 `[audio] macos_device` 指定）。
-- **轻量系统权限（TCC）**：仅需**麦克风权限**（供 `ffmpeg` 录音）与首次向 Ghostty 注入文本时的**自动化（Automation → Ghostty）**确认；默认 `RControl` + Ghostty 组合**不需要**开启「辅助功能（Accessibility）」或「输入监控（Input Monitoring）」（仅在向非 Ghostty 应用模拟 `Cmd+V` 或绑定非修饰键热键时按需授权）。
+- **原生胶囊与终端感知安全投递**：通过缓存的原生 `mac_shim` 监听右 Ctrl（或 `ptt` 按住说话）并渲染 Retina 悬浮波形胶囊。在 **Ghostty** 中锁定聚焦分屏 surface 直接注入文本；在**系统自带「终端」（`Terminal.app`）**及其他终端中锁定窗口 ID 与当前标签页 `tty`，连接 `tmux` 时直投对应焦点窗格，常规 shell 下经剪贴板 + `Cmd+V` 粘贴，中途切换窗口或标签页均自动退回剪贴板防误投。
+- **零钩子标签页/分屏与 `tmux` 会话关联**：直接读取 Ghostty 分屏 `tty`/`cwd`、`Terminal.app` 当前选中标签页 `tty` 或终端窗口子进程 PTY 树（连接 `tmux` 时进一步定位对应焦点窗格），精准匹配当前标签页内的 `codex`、`claude` 或 `agy` 活跃会话并严格隔离其他终端窗口；录音设备默认跟随系统麦克风（可通过 `[audio] macos_device` 指定）。
+- **轻量系统权限（TCC）**：需授予**麦克风权限**（供 `ffmpeg` 录音），以及按所用终端授予一次**自动化（Automation → Ghostty 或 Terminal）**确认；默认 `RControl` 修饰键热键**不需要**开启「输入监控（Input Monitoring）」，且在 Ghostty 或 `tmux` 会话内上屏**不需要**「辅助功能（Accessibility）」（仅在非 Ghostty 终端的普通非 `tmux` 标签页模拟 `Cmd+V` 时按需授权）。
 
 ---
 

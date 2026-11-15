@@ -37,6 +37,7 @@ def create_platform(cfg: Config, *, env: Mapping[str, str] | None = None) -> Wsl
 
 
 def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
+    raw_ax = m.get("ax_trusted")
     return ForegroundWindow(
         hwnd=int(m.get("hwnd") or 0),
         process=str(m.get("process") or ""),
@@ -46,6 +47,7 @@ def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
         tty=str(m.get("tty") or ""),
         cwd=str(m.get("cwd") or ""),
         pid=int(m.get("pid") or 0),
+        ax_trusted=raw_ax if isinstance(raw_ax, bool) else None,
     )
 
 

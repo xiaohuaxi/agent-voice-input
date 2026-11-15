@@ -25,6 +25,7 @@ from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
 from agent_voice_input.config import AudioConfig, Config, ConfigError, HotkeyConfig, RefinerConfig, load_config  # noqa: E402
 from agent_voice_input.daemon import VoiceInputDaemon, run_pipeline_once  # noqa: E402
 from agent_voice_input.platform_macos import (  # noqa: E402
+    APPLE_TERMINAL_BUNDLE_ID,
     GHOSTTY_BUNDLE_ID,
     MACOS_TERMINALS,
     MACOS_TERMINAL_BUNDLE_IDS,
@@ -33,14 +34,24 @@ from agent_voice_input.platform_macos import (  # noqa: E402
     SHIM_SCHEMA_VERSION,
     _APPLE_SEP,
     _GHOSTTY_INPUT_SCRIPT,
+    _TERMINAL_QUERY_SCRIPT,
+    _summarize_osascript_error,
     check_macos_clt_ready,
     compile_mac_shim,
     get_macos_cache_dir,
+    is_apple_terminal_app,
     is_macos_terminal_window,
     parse_avfoundation_audio_devices,
     probe_macos_host,
     resolve_macos_audio_device,
     run_macos_key_test,
+)
+from agent_voice_input._tmux import (  # noqa: E402
+    TmuxClientInfo,
+    TmuxPaneInfo,
+    TmuxServerSnapshot,
+    probe_tmux_snapshot,
+    resolve_tmux_bin,
 )
 from agent_voice_input.platform_wsl import (  # noqa: E402
     FfmpegWavRecorder,
@@ -1263,6 +1274,9 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn("kAudioHardwarePropertyDefaultInputDevice", src)
         self.assertIn("kAudioDevicePropertyDeviceIsAlive", src)
         self.assertIn('"audio_devices_changed"', src)
+        self.assertIn("func queryFrontWindowMetadata(", src)
+        self.assertIn("CGWindowListCopyWindowInfo", src)
+        self.assertIn("AXUIElementSetMessagingTimeout", src)
 
     def test_macos_coreaudio_fast_fail_busy_disconnect_and_seamless_respawn(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1874,6 +1888,687 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertEqual(payload.get("mode"), "self-check")
             self.assertEqual(payload.get("rcontrol_vk"), "0x3E")
             self.assertEqual(payload.get("rcontrol_mask"), "0x2000")
+
+    def test_apple_terminal_tab_tty_shim_hwnd_focus_drift_and_daemon_tmux_paste(self) -> None:
+        # 1. is_apple_terminal_app & Terminal Automation error summary
+        self.assertEqual(APPLE_TERMINAL_BUNDLE_ID, "com.apple.terminal")
+        self.assertTrue(is_apple_terminal_app("Terminal", "com.apple.Terminal"))
+        self.assertTrue(is_apple_terminal_app("终端", "com.apple.Terminal"))
+        self.assertTrue(is_apple_terminal_app("Terminal.app", ""))
+        self.assertTrue(is_apple_terminal_app("终端", ""))
+        self.assertFalse(is_apple_terminal_app("Terminal", "com.googlecode.iterm2"))
+        self.assertFalse(is_apple_terminal_app("Ghostty", GHOSTTY_BUNDLE_ID))
+        self.assertEqual(
+            _summarize_osascript_error("Not authorized to send Apple events to Terminal. (-1743)", kind="terminal"),
+            "automation_denied (grant Automation permission for Terminal)",
+        )
+        self.assertNotIn("do script", _TERMINAL_QUERY_SCRIPT)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = {"HOME": str(tmp), "AGENT_VOICE_INPUT_SWIFTC": "none"}
+            term_state = {
+                "wid": "42",
+                "tty": "/dev/ttys004",
+                "wname": "xhx — claude ∙ git — 80×24",
+                "tcustom": "claude · ~/proj [#abcd1234]",
+                "denied": False,
+            }
+            cmd_v_rc = [0]
+            cmd_v_err = [""]
+            osa_scripts: list[str] = []
+            tmux_cmds: list[list[str]] = []
+            seen_encodings: list[str | None] = []
+            paste_buf_rc = [0]
+            paste_buf_timeout = [False]
+
+            def fake_term_run(cmd, *, stdin=None, input=None, capture_output=False, text=False, encoding=None, env=None, timeout=None, check=False, **kw):
+                exe = Path(cmd[0]).name
+                if exe == "pbcopy":
+                    seen_encodings.append(encoding)
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                if exe == "osascript":
+                    script = cmd[2] if len(cmd) > 2 else ""
+                    osa_scripts.append(script)
+                    if script == _TERMINAL_QUERY_SCRIPT:
+                        if term_state["denied"]:
+                            return subprocess.CompletedProcess(cmd, 1, "", "Not authorized (-1743)")
+                        out = _APPLE_SEP.join(
+                            ["at1", str(term_state["wid"]), str(term_state["tty"]), str(term_state["wname"]), str(term_state["tcustom"])]
+                        )
+                        return subprocess.CompletedProcess(cmd, 0, out + "\n", "")
+                    if 'keystroke "v"' in script:
+                        return subprocess.CompletedProcess(cmd, cmd_v_rc[0], "", cmd_v_err[0])
+                    if 'attribute "AXTitle"' in script and "character id 31" not in script:
+                        return subprocess.CompletedProcess(cmd, 0, "AX Fallback Title\n", "")
+                    return subprocess.CompletedProcess(
+                        cmd, 0, _APPLE_SEP.join(["Terminal", "com.apple.Terminal", "601", str(term_state["wname"])]) + "\n", ""
+                    )
+                if exe == "tmux":
+                    tmux_cmds.append(list(cmd))
+                    if "load-buffer" in cmd:
+                        seen_encodings.append(encoding)
+                    if "paste-buffer" in cmd:
+                        if paste_buf_timeout[0]:
+                            raise subprocess.TimeoutExpired(cmd, timeout or 2.0)
+                        return subprocess.CompletedProcess(cmd, paste_buf_rc[0], "", "")
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+            with (
+                mock.patch("agent_voice_input.platform_macos.shutil.which", return_value="/usr/bin/mock"),
+                mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=fake_term_run),
+            ):
+                plat = MacOSPlatform(Config(), env=env, cache_dir=tmp / "cache")
+
+                # 2. resolve_foreground_window enriches Terminal.app shim_hint (even with hwnd > 0 & title) with active tab TTY + custom title
+                shim_hint = ForegroundWindow(
+                    hwnd=999,
+                    process="终端",
+                    title="xhx — claude ∙ git — 80×24",
+                    bundle_id="com.apple.Terminal",
+                    pid=601,
+                )
+                origin_term = plat.resolve_foreground_window(shim_hint)
+                self.assertEqual(origin_term.hwnd, 42)
+                self.assertEqual(origin_term.tty, "/dev/ttys004")
+                self.assertIn("[#abcd1234]", origin_term.title)
+                self.assertIn("80×24", origin_term.title)
+
+                # 3. Same Terminal window + same tab TTY with dynamic foreground process/dimensions title update -> pasted=True!
+                term_state["wname"] = "xhx — zsh — 120×40"
+                out_same_tab = plat.deliver_text("同标签页动态标题不误判漂移", seq_id=1, origin_window=origin_term)
+                self.assertTrue(out_same_tab.pasted)
+                self.assertEqual(out_same_tab.reason, "ok")
+
+                # 4. Switching tabs inside the SAME Terminal window (ttys004 -> ttys005, even with identical title) -> focus_changed!
+                term_state["tty"] = "/dev/ttys005"
+                out_tab_drift = plat.deliver_text("切标签页拦截", seq_id=2, origin_window=origin_term)
+                self.assertFalse(out_tab_drift.pasted)
+                self.assertEqual(out_tab_drift.reason, "focus_changed")
+
+                # 5. Conflicting explicit [#tag] on the SAME tab TTY -> focus_changed!
+                term_state["tty"] = "/dev/ttys004"
+                term_state["tcustom"] = "claude · ~/other [#ffff9999]"
+                out_tag_drift = plat.deliver_text("同TTY切会话标签拦截", seq_id=3, origin_window=origin_term)
+                self.assertFalse(out_tag_drift.pasted)
+                self.assertEqual(out_tag_drift.reason, "focus_changed")
+
+                # 6. Automation denied (-1743) on Terminal.app degrades gracefully to shim/AX title without failing
+                term_state["denied"] = True
+                deg_win = plat.resolve_foreground_window(shim_hint)
+                self.assertEqual(deg_win.hwnd, 999)
+                self.assertEqual(deg_win.tty, "")
+                self.assertEqual(deg_win.title, "xhx — claude ∙ git — 80×24")
+
+                # 7. mac_shim fg_window hwnd + in-process title skips System Events osascript AND catches same-title window drift!
+                osa_scripts.clear()
+                shim_fg_box = [
+                    {
+                        "ok": True,
+                        "reply": "fg_window",
+                        "hwnd": 101,
+                        "process": "Alacritty",
+                        "bundle_id": "org.alacritty",
+                        "pid": 9000,
+                        "title": "zsh",
+                    }
+                ]
+                plat_shim = MacOSPlatform(Config(), env=env, cache_dir=tmp / "cache2")
+                plat_shim._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat_shim._shim_rpc = lambda payload, timeout_sec=1.5, **kw: (  # type: ignore[method-assign]
+                    dict(shim_fg_box[0]) if payload.get("cmd") == "fg_window" else {"ok": True}
+                )
+                alac_origin = plat_shim.get_foreground_window()
+                self.assertEqual((alac_origin.hwnd, alac_origin.process, alac_origin.title), (101, "Alacritty", "zsh"))
+                self.assertEqual(osa_scripts, [], "mac_shim supplying non-empty title must spawn zero osascript calls")
+
+                shim_fg_box[0]["hwnd"] = 202  # Second Alacritty window with identical 'zsh' title!
+                out_hwnd_drift = plat_shim.deliver_text("同名窗口切换拦截", seq_id=4, origin_window=alac_origin)
+                self.assertFalse(out_hwnd_drift.pasted)
+                self.assertEqual(out_hwnd_drift.reason, "focus_changed")
+
+                # 8. Daemon-mode ($TMUX absent) attached tmux paste via eff_tty (zero Cmd+V needed) + delete-buffer cleanup on failure
+                term_state["denied"] = False
+                term_state["tty"] = "/dev/ttys004"
+                term_state["tcustom"] = "claude · ~/proj [#abcd1234]"
+                tmux_snap = TmuxServerSnapshot(
+                    clients=(
+                        TmuxClientInfo(
+                            session_id="$0",
+                            window_id="@0",
+                            pane_id="%3",
+                            activity=1000.0,
+                            client_tty="/dev/ttys004",
+                            client_pid=710,
+                            focused=True,
+                            socket_path="/tmp/avi_mock.sock",
+                        ),
+                    ),
+                    panes=(
+                        TmuxPaneInfo(
+                            pane_id="%3",
+                            session_id="$0",
+                            window_id="@0",
+                            window_active=True,
+                            pane_active=True,
+                            pane_pid=720,
+                            pane_tty="/dev/ttys020",
+                            socket_path="/tmp/avi_mock.sock",
+                            current_path=str(tmp),
+                            pane_title="claude [#abcd1234]",
+                        ),
+                    ),
+                )
+                plat_dtmux = MacOSPlatform(
+                    Config(), env=env, cache_dir=tmp / "cache3", tmux_probe_fn=lambda: tmux_snap
+                )
+                origin_dtmux = plat_dtmux.get_foreground_window()
+                osa_scripts.clear()
+                tmux_cmds.clear()
+                cmd_v_rc[0] = 1
+                cmd_v_err[0] = "not allowed to send keystrokes (1002)"
+                out_dtmux = plat_dtmux.deliver_text("守护进程直投tmux窗格", seq_id=5, origin_window=origin_dtmux)
+                self.assertTrue(out_dtmux.pasted)
+                self.assertEqual(out_dtmux.reason, "tmux")
+                self.assertFalse(any('keystroke "v"' in s for s in osa_scripts), "attached tmux must bypass Cmd+V")
+                self.assertEqual(len(tmux_cmds), 2)
+                self.assertIn("load-buffer", tmux_cmds[0])
+                self.assertIn("paste-buffer", tmux_cmds[1])
+                self.assertEqual(tmux_cmds[1][-2:], ["-t", "%3"])
+
+                # If paste-buffer fails or times out, named buffer is cleaned up via delete-buffer before falling back
+                tmux_cmds.clear()
+                paste_buf_rc[0] = 1
+                out_pb_fail = plat_dtmux.deliver_text("粘贴缓冲失败回退", seq_id=6, origin_window=origin_dtmux)
+                self.assertFalse(out_pb_fail.pasted)
+                self.assertIn("accessibility_denied", out_pb_fail.reason)
+                self.assertEqual([c[c.index("-S") + 2] for c in tmux_cmds], ["load-buffer", "paste-buffer", "delete-buffer"])
+
+                tmux_cmds.clear()
+                paste_buf_rc[0] = 0
+                paste_buf_timeout[0] = True
+                out_pb_to = plat_dtmux.deliver_text("粘贴缓冲超时清理", seq_id=61, origin_window=origin_dtmux)
+                paste_buf_timeout[0] = False
+                self.assertFalse(out_pb_to.pasted)
+                self.assertEqual([c[c.index("-S") + 2] for c in tmux_cmds], ["load-buffer", "paste-buffer", "delete-buffer"])
+                self.assertTrue(all(enc == "utf-8" for enc in seen_encodings), f"expected utf-8 encodings, got {seen_encodings}")
+
+                # Cmd+W closed window (hwnd=0, title='', ax_trusted=True) & Cmd+, Settings panel ('通用', hwnd=500 != wid=42) -> focus_changed!
+                osa_scripts.clear()
+                shim_fg_box[0] = {
+                    "ok": True,
+                    "reply": "fg_window",
+                    "hwnd": 0,
+                    "process": "终端",
+                    "bundle_id": "com.apple.Terminal",
+                    "pid": 601,
+                    "title": "",
+                    "ax_trusted": True,
+                }
+                plat_term_shim = MacOSPlatform(Config(), env=env, cache_dir=tmp / "cache_tshim")
+                plat_term_shim._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat_term_shim._shim_rpc = plat_shim._shim_rpc  # type: ignore[method-assign]
+                out_cmd_w = plat_term_shim.deliver_text("关窗后拦截", seq_id=62, origin_window=origin_term)
+                self.assertFalse(out_cmd_w.pasted)
+                self.assertEqual(out_cmd_w.reason, "focus_changed")
+                self.assertEqual(osa_scripts, [], "Cmd+W hwnd=0 from mac_shim must skip Terminal/System Events osascript")
+
+                shim_fg_box[0] = {
+                    "ok": True,
+                    "reply": "fg_window",
+                    "hwnd": 500,
+                    "process": "终端",
+                    "bundle_id": "com.apple.Terminal",
+                    "pid": 601,
+                    "title": "通用",
+                    "ax_trusted": True,
+                }
+                fg_settings = plat_term_shim.get_foreground_window()
+                self.assertEqual((fg_settings.hwnd, fg_settings.tty, fg_settings.title), (500, "", "通用"))
+                out_settings = plat_term_shim.deliver_text("打开设置面板拦截", seq_id=63, origin_window=origin_term)
+                self.assertFalse(out_settings.pasted)
+                self.assertEqual(out_settings.reason, "focus_changed")
+
+                # Single-PTY third-party terminal (Alacritty pid=9000, eff_tty='', ax_trusted=False, title='')
+                # resolves hotkey hint AND pastes directly via attached tmux with ZERO osascript / System Events calls!
+                osa_scripts.clear()
+                paste_buf_rc[0] = 0
+                shim_fg_box[0] = {
+                    "ok": True,
+                    "reply": "fg_window",
+                    "hwnd": 101,
+                    "process": "Alacritty",
+                    "bundle_id": "org.alacritty",
+                    "pid": 9000,
+                    "title": "",
+                    "ax_trusted": False,
+                }
+                alac_tmux_snap = TmuxServerSnapshot(
+                    clients=(
+                        TmuxClientInfo(
+                            session_id="$0",
+                            window_id="@0",
+                            pane_id="%7",
+                            activity=1000.0,
+                            client_tty="/dev/ttys010",
+                            client_pid=9002,
+                            focused=True,
+                            socket_path="/tmp/avi_alac.sock",
+                        ),
+                    ),
+                    panes=(
+                        TmuxPaneInfo(
+                            pane_id="%7",
+                            session_id="$0",
+                            window_id="@0",
+                            window_active=True,
+                            pane_active=True,
+                            pane_pid=9100,
+                            pane_tty="/dev/ttys025",
+                            socket_path="/tmp/avi_alac.sock",
+                            current_path=str(tmp),
+                            pane_title="codex",
+                        ),
+                    ),
+                )
+                plat_alac_rescue = MacOSPlatform(
+                    Config(), env=env, cache_dir=tmp / "cache4", tmux_probe_fn=lambda: alac_tmux_snap
+                )
+                plat_alac_rescue._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat_alac_rescue._shim_rpc = plat_shim._shim_rpc  # type: ignore[method-assign]
+                alac_untrusted_hint = ForegroundWindow(
+                    hwnd=101,
+                    process="Alacritty",
+                    title="",
+                    bundle_id="org.alacritty",
+                    pid=9000,
+                    ax_trusted=False,
+                )
+                alac_resolved = plat_alac_rescue.resolve_foreground_window(alac_untrusted_hint)
+                self.assertEqual(osa_scripts, [], "ax_trusted=False shim hint must never trigger System Events TCC popup")
+                with mock.patch.object(
+                    SessionTracker,
+                    "_list_darwin_user_ps_rows",
+                    return_value=[
+                        (9000, 1, "Ss", "", ["alacritty"]),
+                        (9001, 9000, "Ss", "/dev/ttys010", ["-zsh"]),
+                        (9002, 9001, "S+", "/dev/ttys010", ["tmux", "attach"]),
+                    ],
+                ):
+                    out_rescue = plat_alac_rescue.deliver_text(
+                        "Alacritty免辅助功能tmux直投", seq_id=7, origin_window=alac_resolved
+                    )
+                self.assertTrue(out_rescue.pasted)
+                self.assertEqual(out_rescue.reason, "tmux")
+                self.assertEqual(osa_scripts, [], "attached tmux on single-PTY Alacritty must bypass Cmd+V osascript completely")
+
+            # 9. _cmd_doctor [macos-fg] displays tty=... when fg_tty is present without fg_surface_id (Terminal.app)
+            fake_term_probe = {
+                "avfoundation_ok": True,
+                "audio_devices": ["[0] Built-in Mic"],
+                "configured_audio_device": ":default",
+                "pbcopy_ok": True,
+                "tmux_active": False,
+                "clt_ok": True,
+                "clt_error": "",
+                "swiftc_ok": True,
+                "swiftc_bin": "/usr/bin/swiftc",
+                "mac_shim_ok": True,
+                "mac_shim_bin": "/tmp/mac_shim",
+                "mac_shim_error": "",
+                "fg_process": "Terminal",
+                "fg_surface_id": "",
+                "fg_tty": "/dev/ttys004",
+                "fg_cwd": "",
+                "fg_pid": 601,
+                "fg_title": "zsh — 80×24",
+                "permissions_hint": "Microphone -> terminal",
+            }
+            doc_out = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(cli_mod, "probe_macos_host", return_value=fake_term_probe),
+                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch.object(cli_mod.SessionTracker, "resolve_session", return_value=None),
+                mock.patch("sys.stdout", doc_out),
+            ):
+                rc_doc = cli_mod._cmd_doctor(
+                    Config(refiner=RefinerConfig(provider="off")),
+                    {"HOME": str(tmp), "DASHSCOPE_API_KEY": "sk-doc"},
+                )
+            self.assertEqual(rc_doc, 0)
+            self.assertIn("[macos-fg]  app='Terminal' tty=/dev/ttys004 cwd=- title='zsh — 80×24'", doc_out.getvalue())
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and bool(resolve_tmux_bin()),
+        "macOS + tmux required for unattended real Darwin PTY + tmux integration test",
+    )
+    def test_real_darwin_pty_and_tmux_unattended_daemon_session_and_paste_e2e(self) -> None:
+        tmux_bin = resolve_tmux_bin()
+        assert tmux_bin
+        short_dir = Path(tempfile.mkdtemp(prefix="avi_m_", dir="/tmp"))
+        sock_path = short_dir / "t.sock"
+        gui_proc: subprocess.Popen[str] | None = None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                home = tmp / "home"
+                rt = tmp / "rt"
+                proj = home / "repos" / "darwin-tmux-live"
+                fake_bin = tmp / "bin"
+                for d in (home, rt, proj, fake_bin):
+                    d.mkdir(parents=True)
+
+                sid = "01967777-8888-7999-8aaa-bbbbccccdddd"
+                cx_dir = home / ".codex" / "sessions" / "2026" / "11" / "16"
+                cx_dir.mkdir(parents=True)
+                rollout_f = cx_dir / f"rollout-2026-11-16T02-00-00-{sid}.jsonl"
+                rollout_f.write_text(
+                    json.dumps({"type": "session_meta", "payload": {"id": sid, "source": "cli", "cwd": str(proj)}})
+                    + "\n"
+                    + json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "item_completed",
+                                "item": {
+                                    "type": "UserMessage",
+                                    "content": [{"type": "text", "text": "请核对 darwin_pty_bridge.py 的会话路由"}],
+                                },
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                ready_f = tmp / "agent_ready"
+                captured_f = tmp / "pane_captured.bin"
+                codex_stub = fake_bin / "codex"
+                codex_stub.write_text(
+                    "import os, pathlib, select, sys, tty\n"
+                    f"os.chdir({str(proj)!r})\n"
+                    "tty.setcbreak(0)\n"
+                    f"rf = open({str(rollout_f)!r}, 'r', encoding='utf-8')\n"
+                    f"pathlib.Path({str(ready_f)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+                    f"cap = pathlib.Path({str(captured_f)!r})\n"
+                    "while True:\n"
+                    "    r, _, _ = select.select([0], [], [], 0.5)\n"
+                    "    if 0 in r:\n"
+                    "        try:\n"
+                    "            data = os.read(0, 4096)\n"
+                    "        except OSError:\n"
+                    "            break\n"
+                    "        if not data:\n"
+                    "            break\n"
+                    "        with cap.open('ab') as out:\n"
+                    "            out.write(data)\n",
+                    encoding="utf-8",
+                )
+
+                clean_env = {
+                    k: v
+                    for k, v in os.environ.items()
+                    if k not in ("TMUX", "TMUX_PANE", "AGENT_VOICE_INPUT_DISABLE_TMUX")
+                }
+                clean_env.update(
+                    {
+                        "HOME": str(home),
+                        "TERM": "xterm-256color",
+                        "TMUX_TMPDIR": str(short_dir),
+                        "AGENT_VOICE_INPUT_TMUX_HINT": f"{sock_path},1,0",
+                        "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                        "AGENT_VOICE_INPUT_SWIFTC": "none",
+                    }
+                )
+
+                ns = subprocess.run(
+                    [
+                        tmux_bin,
+                        "-S",
+                        str(sock_path),
+                        "-f",
+                        "/dev/null",
+                        "new-session",
+                        "-d",
+                        "-s",
+                        "main",
+                        "-x",
+                        "80",
+                        "-y",
+                        "24",
+                        "-c",
+                        str(proj),
+                        sys.executable,
+                        "-u",
+                        str(codex_stub),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    env=clean_env,
+                    timeout=5.0,
+                    check=False,
+                )
+                self.assertEqual(ns.returncode, 0, f"tmux new-session failed: {ns.stderr!r}")
+
+                gui_holder = tmp / "gui_holder.py"
+                gui_holder.write_text(
+                    "import fcntl, json, os, pty, select, signal, struct, subprocess, sys, termios, time\n"
+                    "mfd, sfd = pty.openpty()\n"
+                    "fcntl.ioctl(mfd, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))\n"
+                    "stty = os.ttyname(sfd)\n"
+                    "def _ctty():\n"
+                    "    os.setsid()\n"
+                    "    fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n"
+                    f"proc = subprocess.Popen([{tmux_bin!r}, '-S', {str(sock_path)!r}, 'attach', '-t', 'main'], "
+                    "stdin=sfd, stdout=sfd, stderr=sfd, preexec_fn=_ctty, close_fds=True)\n"
+                    "os.close(sfd)\n"
+                    "sys.stdout.write(json.dumps({'gui_pid': os.getpid(), 'client_pid': proc.pid, 'client_tty': stty}) + '\\n')\n"
+                    "sys.stdout.flush()\n"
+                    "stop = [False]\n"
+                    "signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__(0, True))\n"
+                    "try:\n"
+                    "    while not stop[0] and proc.poll() is None:\n"
+                    "        r, _, _ = select.select([mfd], [], [], 0.2)\n"
+                    "        if mfd in r:\n"
+                    "            try:\n"
+                    "                if not os.read(mfd, 4096): break\n"
+                    "            except OSError:\n"
+                    "                break\n"
+                    "finally:\n"
+                    "    if proc.poll() is None:\n"
+                    "        proc.terminate()\n"
+                    "        try: proc.wait(timeout=2.0)\n"
+                    "        except Exception: proc.kill()\n"
+                    "    try: os.close(mfd)\n"
+                    "    except OSError: pass\n",
+                    encoding="utf-8",
+                )
+                gui_proc = subprocess.Popen(
+                    [sys.executable, "-u", str(gui_holder)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=clean_env,
+                    start_new_session=True,
+                )
+                assert gui_proc.stdout is not None
+                meta_line = gui_proc.stdout.readline().strip()
+                self.assertTrue(meta_line, "gui_holder failed to report PTY metadata")
+                meta = json.loads(meta_line)
+                gui_pid = int(meta["gui_pid"])
+                client_tty = str(meta["client_tty"])
+                self.assertTrue(client_tty.startswith("/dev/tty"), client_tty)
+
+                deadline = time.monotonic() + 5.0
+                live_snap = TmuxServerSnapshot()
+                while time.monotonic() < deadline:
+                    live_snap = probe_tmux_snapshot(env=clean_env)
+                    if ready_f.is_file() and len(live_snap.clients) == 1 and len(live_snap.panes) == 1:
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(ready_f.is_file(), "codex stub inside tmux pane did not become ready")
+                self.assertEqual(len(live_snap.clients), 1)
+                codex_pid = int(ready_f.read_text(encoding="utf-8").strip())
+                pane_pid = live_snap.panes[0].pane_pid
+
+                # Filter real `ps` rows to ONLY our isolated test processes so lsof never touches unrelated host PIDs
+                orig_list_ps = SessionTracker._list_darwin_user_ps_rows
+                allowed_roots = {gui_pid, int(meta["client_pid"]), pane_pid, codex_pid}
+
+                def _scoped_real_ps_rows(tracker_self: SessionTracker):
+                    rows = orig_list_ps(tracker_self)
+                    if not rows:
+                        return rows
+                    keep = set(allowed_roots)
+                    changed = True
+                    while changed:
+                        changed = False
+                        for r_pid, r_ppid, _st, _tty, _argv in rows:
+                            if r_ppid in keep and r_pid not in keep:
+                                keep.add(r_pid)
+                                changed = True
+                    return [row for row in rows if row[0] in keep]
+
+                # 1. Terminal.app unattended e2e: real PTY + real tmux + real ps/lsof session lookup + zero-osascript tmux paste!
+                term_win = ForegroundWindow(
+                    hwnd=77,
+                    process="Terminal",
+                    title="xhx — tmux — 80×24",
+                    bundle_id="com.apple.Terminal",
+                    tty=client_tty,
+                    pid=gui_pid,
+                )
+                plat = MacOSPlatform(
+                    Config(refiner=RefinerConfig(provider="off")),
+                    env=clean_env,
+                    cache_dir=tmp / "cache",
+                )
+                plat._copy_to_clipboard = lambda _txt: True  # type: ignore[method-assign]
+                plat.get_foreground_window = lambda hint=None: term_win  # type: ignore[method-assign]
+                plat._run_osascript = lambda *a, **kw: (_ for _ in ()).throw(  # type: ignore[method-assign]
+                    AssertionError("unattended Terminal.app + tmux paste must spawn zero osascript calls")
+                )
+                plat.start_recording = lambda _rt, *, loopback=False, **kw: None  # type: ignore[method-assign]
+                plat.stop_recording = lambda *, drain=True: (_voiced_wav(), "avfoundation")  # type: ignore[method-assign]
+
+                asr = _StubAsr("实测 darwin_pty_bridge.py 无弹窗直投")
+                tracker = SessionTracker(home_dir=home, runtime_dir=rt, env=clean_env)
+                with mock.patch.object(SessionTracker, "_list_darwin_user_ps_rows", _scoped_real_ps_rows):
+                    daemon = VoiceInputDaemon(
+                        Config(refiner=RefinerConfig(provider="off")),
+                        env=clean_env,
+                        runtime_dir=rt,
+                        platform=plat,
+                        asr_provider=asr,
+                        refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                        tracker=tracker,
+                    )
+                    try:
+                        r_on = daemon.handle_trigger("toggle", term_win)
+                        self.assertTrue(r_on["ok"])
+                        daemon._last_trigger_ts = -1e9
+                        r_off = daemon.handle_trigger("toggle", term_win)
+                        wait_until = time.monotonic() + 4.0
+                        while time.monotonic() < wait_until and daemon.last_result.get("seq_id") != r_off["seq_id"]:
+                            time.sleep(0.03)
+                    finally:
+                        daemon.close()
+
+                self.assertTrue(daemon.last_result.get("ok"), daemon.last_result)
+                self.assertEqual(daemon.last_result.get("session_key"), f"codex:{sid}")
+                self.assertTrue(daemon.last_result.get("pasted"))
+                self.assertEqual(daemon.last_result.get("paste_reason"), "tmux")
+                assert asr.seen_contexts and asr.seen_contexts[0] is not None
+                self.assertIn("darwin_pty_bridge.py", asr.seen_contexts[0].dialog_text)
+
+                cap_deadline = time.monotonic() + 3.0
+                received_text = ""
+                while time.monotonic() < cap_deadline:
+                    if captured_f.is_file():
+                        received_text = captured_f.read_bytes().decode("utf-8", errors="replace")
+                        if "实测 darwin_pty_bridge.py 无弹窗直投" in received_text:
+                            break
+                    time.sleep(0.03)
+                self.assertIn("实测 darwin_pty_bridge.py 无弹窗直投", received_text)
+                self.assertFalse(received_text.endswith(("\n", "\r")), f"paste must not append Enter: {received_text!r}")
+
+                buf_check = subprocess.run(
+                    [tmux_bin, "-S", str(sock_path), "list-buffers", "-F", "#{buffer_name}"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    env=clean_env,
+                    timeout=2.0,
+                    check=False,
+                )
+                avi_bufs = [ln for ln in (buf_check.stdout or "").splitlines() if ln.startswith("avi-")]
+                self.assertEqual(avi_bufs, [], "named avi-* tmux paste buffer must be auto-deleted by -d")
+
+                # 2. Single-tab GUI terminal (Alacritty: tty='', pid=gui_pid, ax_trusted=False) resolves session
+                #    via real PTY tree AND pastes directly via attached tmux with zero osascript calls!
+                captured_f.unlink(missing_ok=True)
+                alac_osa_calls: list[list[str]] = []
+                alac_win = ForegroundWindow(
+                    hwnd=88,
+                    process="Alacritty",
+                    title="",
+                    bundle_id="org.alacritty",
+                    tty="",
+                    pid=gui_pid,
+                    ax_trusted=False,
+                )
+                with mock.patch.object(SessionTracker, "_list_darwin_user_ps_rows", _scoped_real_ps_rows):
+                    m_gui = tracker.resolve_session("Alacritty", window_tty="", window_pid=gui_pid)
+                    assert m_gui is not None
+                    self.assertEqual((m_gui.cli, m_gui.session_id, m_gui.matched_by), ("codex", sid, "tmux_proc_scan"))
+
+                    plat.get_foreground_window = lambda hint=None: alac_win  # type: ignore[method-assign]
+                    plat._run_osascript = lambda args, **kw: (  # type: ignore[method-assign]
+                        alac_osa_calls.append(list(args))
+                        or subprocess.CompletedProcess(["osascript", *args], 1, "", "not allowed to send keystrokes (1002)")
+                    )
+                    self.assertEqual(plat.resolve_foreground_window(alac_win), alac_win)
+                    out_alac = plat.deliver_text("第三方单标签终端实测直投", seq_id=2, origin_window=alac_win)
+                self.assertTrue(out_alac.pasted)
+                self.assertEqual(out_alac.reason, "tmux")
+                self.assertEqual(alac_osa_calls, [], "single-tab GUI terminal attached to tmux must spawn zero osascript calls")
+
+                cap_deadline2 = time.monotonic() + 3.0
+                received_alac = ""
+                while time.monotonic() < cap_deadline2:
+                    if captured_f.is_file():
+                        received_alac = captured_f.read_bytes().decode("utf-8", errors="replace")
+                        if "第三方单标签终端实测直投" in received_alac:
+                            break
+                    time.sleep(0.03)
+                self.assertIn("第三方单标签终端实测直投", received_alac)
+        finally:
+            subprocess.run(
+                [tmux_bin, "-S", str(sock_path), "kill-server"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3.0,
+                check=False,
+            )
+            if gui_proc is not None:
+                if gui_proc.poll() is None:
+                    gui_proc.terminate()
+                    try:
+                        gui_proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        gui_proc.kill()
+                        gui_proc.wait(timeout=2.0)
+                if gui_proc.stdout is not None:
+                    gui_proc.stdout.close()
+                if gui_proc.stderr is not None:
+                    gui_proc.stderr.close()
+            shutil.rmtree(short_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

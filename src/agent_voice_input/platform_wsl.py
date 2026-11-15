@@ -56,6 +56,7 @@ class ForegroundWindow:
     tty: str = ""
     cwd: str = ""
     pid: int = 0
+    ax_trusted: bool | None = None
 
     @property
     def app_name(self) -> str:

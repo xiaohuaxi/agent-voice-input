@@ -124,6 +124,11 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
                 f"[macos-fg]  app={m.get('fg_process')!r} surface={m.get('fg_surface_id')} "
                 f"tty={m.get('fg_tty') or '-'} cwd={m.get('fg_cwd') or '-'} title={fg_title!r}"
             )
+        elif m.get("fg_tty") or m.get("fg_cwd"):
+            print(
+                f"[macos-fg]  app={m.get('fg_process')!r} "
+                f"tty={m.get('fg_tty') or '-'} cwd={m.get('fg_cwd') or '-'} title={fg_title!r}"
+            )
         else:
             print(f"[macos-fg]  app={m.get('fg_process')!r} title={fg_title!r}")
         print(f"[macos-tcc] {m.get('permissions_hint')}")

@@ -24,7 +24,7 @@ Generic OS dictation has no idea what files, symbols, or CLI flags exist in your
    Check the default of max_duration_sec in platform_wsl.py, change it to 10 minutes, and run the unit tests without piping to head.
 ```
 
-> Verified on **Windows Terminal + WSL2 (including Remote Desktop and `tmux`)** and **macOS + Ghostty (including `tmux`)**, with broader terminal coverage actively in progress.
+> Verified on **Windows Terminal + WSL2 (including Remote Desktop and `tmux`)** and **macOS (`Ghostty`, built-in `Terminal.app`, and `tmux`)**; common third-party macOS terminals (`iTerm2`, `WezTerm`, `Alacritty`, `Kitty`, `Warp`, etc.) share baseline window-scoping, child-PTY session discovery, and `Cmd+V` / `tmux` paste support (community verification PRs welcome).
 
 ---
 
@@ -95,11 +95,11 @@ agent-voice-input start
 - **Native WASAPI Capture (Zero WSLg / RDP Glitches)**: Captures 16 kHz audio directly via Windows WASAPI in a resident `win_shim`, bypassing WSLg `RDPSource` zero-packet deadlocks; start/stop audio cues default to off to avoid 1–2s Remote Desktop audio wake-up lag.
 - **Zero-Config `tmux` Pane Resolution**: Automatically tracks the active pane of the attached `tmux` client without modifying `~/.tmux.conf`.
 
-### macOS + Ghostty (Including `tmux`)
+### macOS (`Ghostty`, Built-in `Terminal.app` & `tmux`)
 
-- **Native Retina HUD & Direct Split Injection**: Uses a cached native `mac_shim` for Right Ctrl tap/PTT and Retina capsule rendering; locks onto the exact focused Ghostty split surface when recording begins and injects bracketed-paste text directly without synthetic keystrokes (falling back to clipboard if focus moved).
-- **Zero-Hook Split & `tmux` Session Binding**: Reads the focused Ghostty split's `tty` and `cwd` (and active pane inside `tmux`) to bind directly to the `codex`, `claude`, or `agy` session running in that split; audio input defaults to system mic (`[audio] macos_device = "default"`).
-- **Minimal macOS Permissions (TCC)**: Requires only **Microphone** (for `ffmpeg`) and a one-time **Automation (Ghostty)** prompt; **Accessibility** and **Input Monitoring** are **not required** for the default `RControl` + Ghostty setup (only needed for fallback `Cmd+V` paste into non-Ghostty apps or non-modifier hotkeys).
+- **Native Retina HUD & Terminal-Aware Delivery**: Uses a cached native `mac_shim` for Right Ctrl tap/PTT and Retina capsule rendering. In **Ghostty**, locks onto the exact focused split surface and injects bracketed-paste text directly; in **built-in `Terminal.app`** (and other macOS terminals), locks onto the window ID / active tab `tty` and delivers via `tmux` buffer paste (when attached to `tmux`) or `Cmd+V` (falling back to clipboard if focus or tab moved).
+- **Zero-Hook Tab/Split & `tmux` Session Binding**: Reads Ghostty's split `tty`/`cwd`, `Terminal.app`'s selected tab `tty`, or the terminal window's child PTY tree (plus active pane inside `tmux`) to bind directly to the `codex`, `claude`, or `agy` session running in that tab while isolating sibling terminals; audio input defaults to system mic (`[audio] macos_device = "default"`).
+- **Minimal macOS Permissions (TCC)**: Requires **Microphone** (for `ffmpeg`) plus **Automation → Ghostty** (for Ghostty) or **Automation → Terminal** (for multi-tab `Terminal.app` active-tab lookup). **Input Monitoring** is **not required** for default modifier hotkeys (`RControl`), and **Accessibility** is only needed for `Cmd+V` paste into non-Ghostty terminals when not running inside `tmux`.
 
 ---
 

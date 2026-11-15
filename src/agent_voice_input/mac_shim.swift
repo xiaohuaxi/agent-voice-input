@@ -1450,10 +1450,49 @@ private func monotonicMs() -> UInt64 {
     ProcessInfo.processInfo.systemUptime.isFinite ? UInt64(ProcessInfo.processInfo.systemUptime * 1000.0) : 0
 }
 
-private func queryFrontmostApp() -> (name: String, bundleId: String, pid: Int) {
-    guard let app = NSWorkspace.shared.frontmostApplication else { return ("", "", 0) }
+private func queryFrontWindowMetadata(pid: Int, bundleId: String) -> (hwnd: Int, title: String, axTrusted: Bool) {
+    let trusted = AXIsProcessTrusted()
+    guard pid > 0 else { return (0, "", trusted) }
+    var winNum = 0
+    if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+        for entry in list {
+            let ownerPid = (entry[kCGWindowOwnerPID as String] as? Int) ?? ((entry[kCGWindowOwnerPID as String] as? NSNumber)?.intValue ?? 0)
+            let layer = (entry[kCGWindowLayer as String] as? Int) ?? ((entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1)
+            if ownerPid == pid && layer == 0 {
+                winNum = (entry[kCGWindowNumber as String] as? Int) ?? ((entry[kCGWindowNumber as String] as? NSNumber)?.intValue ?? 0)
+                break
+            }
+        }
+    }
+    var axTitle = ""
+    if bundleId.lowercased() != "com.mitchellh.ghostty" && trusted {
+        let axApp = AXUIElementCreateApplication(pid_t(pid))
+        _ = AXUIElementSetMessagingTimeout(axApp, 0.25)
+        var winRef: CFTypeRef?
+        var st = AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &winRef)
+        if (st != .success || winRef == nil) && st != .cannotComplete {
+            st = AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &winRef)
+        }
+        if st == .success, let w = winRef, CFGetTypeID(w) == AXUIElementGetTypeID() {
+            let axWin = unsafeBitCast(w, to: AXUIElement.self)
+            _ = AXUIElementSetMessagingTimeout(axWin, 0.25)
+            var titleRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(axWin, kAXTitleAttribute as CFString, &titleRef) == .success,
+               let s = titleRef as? String {
+                axTitle = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+    }
+    return (winNum, axTitle, trusted)
+}
+
+private func queryFrontmostApp() -> (name: String, bundleId: String, pid: Int, hwnd: Int, title: String, axTrusted: Bool) {
+    guard let app = NSWorkspace.shared.frontmostApplication else { return ("", "", 0, 0, "", AXIsProcessTrusted()) }
     let name = app.localizedName ?? app.bundleURL?.deletingPathExtension().lastPathComponent ?? ""
-    return (name, app.bundleIdentifier ?? "", Int(app.processIdentifier))
+    let bundleId = app.bundleIdentifier ?? ""
+    let pid = Int(app.processIdentifier)
+    let meta = queryFrontWindowMetadata(pid: pid, bundleId: bundleId)
+    return (name, bundleId, pid, meta.hwnd, meta.title, meta.axTrusted)
 }
 
 private func parseOptionalBool(_ raw: Any?) -> Bool? {
@@ -1922,7 +1961,7 @@ struct MacShimMain {
                     writeJsonLine(["event": item.kind, "vk": String(format: "0x%02X", item.vk), "key_name": kname, "flags": String(format: "0x%X", item.flags), "is_down": item.isDown, "tainted": item.tainted])
                 } else {
                     let fg = queryFrontmostApp()
-                    writeJsonLine(["event": item.kind, "hwnd": 0, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": "", "ts_ms": now])
+                    writeJsonLine(["event": item.kind, "hwnd": fg.hwnd, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": fg.title, "ax_trusted": fg.axTrusted, "ts_ms": now])
                 }
             }
         }
@@ -1947,7 +1986,7 @@ struct MacShimMain {
                     switch op {
                     case "fg_window":
                         let fg = queryFrontmostApp()
-                        writeJsonLine(["type": "reply", "reply": "fg_window", "seq_id": seqId, "ok": true, "hwnd": 0, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": ""])
+                        writeJsonLine(["type": "reply", "reply": "fg_window", "seq_id": seqId, "ok": true, "hwnd": fg.hwnd, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": fg.title, "ax_trusted": fg.axTrusted])
                     case "audio_status":
                         writeJsonLine(["type": "reply", "reply": true, "seq_id": seqId, "ok": true, "audio_status": queryAudioInputStatus()])
                     case "hud":

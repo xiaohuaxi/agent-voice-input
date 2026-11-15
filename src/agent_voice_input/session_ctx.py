@@ -24,7 +24,7 @@ import stat
 import subprocess
 import threading
 import time
-from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Collection, Iterator, Mapping, Sequence
 import urllib.parse
 import uuid
 
@@ -1866,6 +1866,7 @@ def _validate_registry_record(
 class _RegistryHit:
     match: SessionMatch
     agent_pid: int = 0
+    tty: str = ""
     tmux_pane: str = ""
     tmux_socket: str = ""
 
@@ -1915,6 +1916,7 @@ def _lookup_in_registry_detailed(
             if validated is None:
                 continue
             cand, updated_at, agent_pid = validated
+            rec_tty = normalize_tty_path(str(rec.get("tty") or ""))
             rec_pane = str(rec.get("tmux_pane") or "").strip()
             rec_sock = str(rec.get("tmux_socket") or "").strip()
             hits.append(
@@ -1925,6 +1927,7 @@ def _lookup_in_registry_detailed(
                     _RegistryHit(
                         match=cand,
                         agent_pid=agent_pid,
+                        tty=rec_tty,
                         tmux_pane=rec_pane if _TMUX_PANE_ID_RE.match(rec_pane) else "",
                         tmux_socket=rec_sock,
                     ),
@@ -2718,6 +2721,49 @@ def _tty_matches(a: str, b: str) -> bool:
     return na == nb or _norm_same_path(na, nb)
 
 
+def collect_darwin_window_pty_tree(
+    rows: Sequence[tuple[int, int, str, str, list[str]]],
+    root_pid: int,
+) -> tuple[set[str], set[int]]:
+    """Collect ``(tab_ttys, descendant_pids)`` beneath a Darwin GUI terminal ``root_pid``.
+
+    ``tab_ttys`` stops descending along a branch once it enters its first
+    controlling TTY so nested tool sub-PTYs (e.g. ``agy`` / ``codex`` PTY
+    runners) are not mistaken for separate terminal tabs, while
+    ``descendant_pids`` captures the full process subtree under ``root_pid``.
+    """
+    if root_pid <= 1 or not rows:
+        return set(), set()
+    tty_by_pid: dict[int, str] = {}
+    children: dict[int, list[int]] = {}
+    for pid, ppid, _stat, row_tty, _argv in rows:
+        tty_by_pid[pid] = row_tty
+        if ppid > 0 and pid != ppid:
+            children.setdefault(ppid, []).append(pid)
+
+    descendant_pids: set[int] = set()
+    tab_ttys: set[str] = set()
+    root_tty = tty_by_pid.get(root_pid, "")
+    if root_tty:
+        tab_ttys.add(root_tty)
+
+    queue: list[tuple[int, bool]] = [(root_pid, bool(root_tty))]
+    seen: set[int] = {root_pid}
+    while queue:
+        cur, has_tab_tty = queue.pop(0)
+        for ch in children.get(cur, ()):
+            if ch in seen:
+                continue
+            seen.add(ch)
+            descendant_pids.add(ch)
+            ch_tty = tty_by_pid.get(ch, "")
+            next_has_tty = has_tab_tty or bool(ch_tty)
+            if not has_tab_tty and ch_tty:
+                tab_ttys.add(ch_tty)
+            queue.append((ch, next_has_tty))
+    return tab_ttys, descendant_pids
+
+
 class SessionTracker:
     """Thread-safe stateful session resolver and incremental JSONL clean-turn extractor."""
 
@@ -2785,6 +2831,8 @@ class SessionTracker:
         *,
         window_tty: str = "",
         window_pid: int = 0,
+        allowed_client_ttys: Collection[str] | None = None,
+        allowed_client_pids: Collection[int] | None = None,
     ) -> tuple[TmuxClientInfo, TmuxPaneInfo] | None:
         if not snap.clients or not snap.panes:
             return None
@@ -2817,6 +2865,19 @@ class SessionTracker:
                         break
             if chosen_pane is not None:
                 resolved_pairs.append((client, chosen_pane))
+
+        if allowed_client_ttys is not None or allowed_client_pids is not None:
+            pid_set = set(allowed_client_pids) if allowed_client_pids else set()
+            tty_list = [t for t in (allowed_client_ttys or ()) if t]
+            resolved_pairs = [
+                pair
+                for pair in resolved_pairs
+                if (pair[0].client_pid > 1 and pair[0].client_pid in pid_set)
+                or (
+                    pair[0].client_tty
+                    and any(_tty_matches(pair[0].client_tty, t) for t in tty_list)
+                )
+            ]
 
         if not resolved_pairs:
             return None
@@ -3267,16 +3328,21 @@ class SessionTracker:
         tmux_snap: TmuxServerSnapshot,
         *,
         claimed_claude: Mapping[str, int] | None = None,
+        allowed_pids: Collection[int] | None = None,
+        rows: Sequence[tuple[int, int, str, str, list[str]]] | None = None,
     ) -> list[SessionMatch]:
         """Discover live interactive non-``tmux`` root sessions on Darwin via ``ps`` + ``lsof``."""
-        rows = self._list_darwin_user_ps_rows()
-        if not rows:
+        eff_rows = self._list_darwin_user_ps_rows() if rows is None else rows
+        if not eff_rows:
             return []
         excluded_ttys = self._collect_tmux_ttys(tmux_snap)
+        allowed_pid_set = set(allowed_pids) if allowed_pids is not None else None
 
         live_rows: list[tuple[int, str, str]] = []
-        for pid, _ppid, _stat, row_tty, argv in rows:
+        for pid, _ppid, _stat, row_tty, argv in eff_rows:
             if not row_tty or row_tty in excluded_ttys:
+                continue
+            if allowed_pid_set is not None and pid not in allowed_pid_set:
                 continue
             a0 = os.path.basename(argv[0].replace("\\", "/")).lstrip("-").lower() if argv else ""
             cli_k = _classify_interactive_cli(a0, argv)
@@ -3373,6 +3439,8 @@ class SessionTracker:
         *,
         norm_tty: str = "",
         window_pid: int = 0,
+        allowed_pids: Collection[int] | None = None,
+        rows: Sequence[tuple[int, int, str, str, list[str]]] | None = None,
     ) -> bool:
         if norm_tty:
             live_pids, tty_agents, _ = _list_tty_processes(
@@ -3389,17 +3457,36 @@ class SessionTracker:
                     )
                     if open_rollouts and os.path.realpath(cand.jsonl_path) not in open_rollouts:
                         return False
+                elif cand.cli == "agy" and cand.session_id:
+                    agy_root = self.home / ".gemini"
+                    open_by_pid, _ = _query_pids_open_files_and_cwds(
+                        [pid for pid, cli_k in tty_agents if cli_k == "agy"],
+                        None,
+                    )
+                    open_stems = {
+                        Path(target).stem.lower()
+                        for files in open_by_pid.values()
+                        for target in files
+                        if target.endswith(".lock")
+                        and "/presence/" in target.replace("\\", "/")
+                        and _is_path_under_dir(target, agy_root)
+                    }
+                    if open_stems and cand.session_id.lower() not in open_stems:
+                        return False
             return True
 
-        if cand.cli not in ("codex", "claude"):
+        if cand.cli not in ("codex", "claude", "agy"):
             return True
-        rows = self._list_darwin_user_ps_rows()
-        if rows is None:
+        eff_rows = self._list_darwin_user_ps_rows() if rows is None else rows
+        if eff_rows is None:
             return True
         excluded_ttys = self._collect_tmux_ttys(tmux_snap)
+        allowed_pid_set = set(allowed_pids) if allowed_pids is not None else None
         matching_pids: list[int] = []
-        for pid, _ppid, _stat, rtty, argv in rows:
+        for pid, _ppid, _stat, rtty, argv in eff_rows:
             if not rtty or rtty in excluded_ttys:
+                continue
+            if allowed_pid_set is not None and pid not in allowed_pid_set:
                 continue
             a0 = os.path.basename(argv[0].replace("\\", "/")).lstrip("-").lower() if argv else ""
             if _classify_interactive_cli(a0, argv) == cand.cli:
@@ -3409,6 +3496,18 @@ class SessionTracker:
         if cand.cli == "codex" and cand.jsonl_path:
             open_rollouts = _query_pids_codex_rollout_paths(matching_pids, self.home, None)
             return os.path.realpath(cand.jsonl_path) in open_rollouts
+        if cand.cli == "agy" and cand.session_id:
+            agy_root = self.home / ".gemini"
+            open_by_pid, _ = _query_pids_open_files_and_cwds(matching_pids, None)
+            want_stem = cand.session_id.lower()
+            return any(
+                target.endswith(".lock")
+                and "/presence/" in target.replace("\\", "/")
+                and _is_path_under_dir(target, agy_root)
+                and Path(target).stem.lower() == want_stem
+                for files in open_by_pid.values()
+                for target in files
+            )
         if cand.cli == "claude" and cand.cwd:
             _, cwd_by_pid = _query_pids_open_files_and_cwds(matching_pids, None)
             return any(
@@ -3432,12 +3531,49 @@ class SessionTracker:
             norm_cwd = _normalize_cwd(window_cwd)
             hint = parse_window_title_hint(window_title)
             tmux_snap = self._probe_tmux(rt_dirs=rt_dirs)
-            active_target = self._select_active_tmux_target(
-                tmux_snap, window_title, window_tty=norm_tty, window_pid=window_pid
-            )
             has_proc = self.proc_root is not None and self.proc_root.is_dir()
             is_real_proc = has_proc and self.proc_root == Path("/proc")
             is_real_darwin = not has_proc and self.proc_root == Path("/proc")
+
+            darwin_ptys_probed = False
+            darwin_ps_rows: list[tuple[int, int, str, str, list[str]]] | None = None
+            darwin_win_tab_ttys: set[str] = set()
+            darwin_win_desc_pids: set[int] = set()
+
+            def _ensure_darwin_window_ptys() -> None:
+                nonlocal norm_tty, darwin_ptys_probed, darwin_ps_rows, darwin_win_tab_ttys, darwin_win_desc_pids
+                if darwin_ptys_probed:
+                    return
+                darwin_ptys_probed = True
+                if norm_tty or window_pid <= 0 or has_proc or self.proc_root is None:
+                    return
+                pinfo = ps_proc_info(window_pid)
+                if pinfo is not None and pinfo[2] and (
+                    _classify_interactive_cli(pinfo[0], pinfo[3])
+                    or pinfo[0].lower() in ("tmux", "screen", "zellij")
+                ):
+                    norm_tty = pinfo[2]
+                    return
+                if is_real_darwin and window_pid > 1:
+                    darwin_ps_rows = self._list_darwin_user_ps_rows()
+                    if darwin_ps_rows:
+                        darwin_win_tab_ttys, darwin_win_desc_pids = collect_darwin_window_pty_tree(
+                            darwin_ps_rows, window_pid
+                        )
+                        if len(darwin_win_tab_ttys) == 1:
+                            norm_tty = next(iter(darwin_win_tab_ttys))
+
+            if not norm_tty and window_pid > 0 and (hint is None or bool(tmux_snap.clients)):
+                _ensure_darwin_window_ptys()
+
+            active_target = self._select_active_tmux_target(
+                tmux_snap,
+                window_title,
+                window_tty=norm_tty,
+                window_pid=window_pid,
+                allowed_client_ttys=(darwin_win_tab_ttys if len(darwin_win_tab_ttys) > 1 else None),
+                allowed_client_pids=(darwin_win_desc_pids if len(darwin_win_tab_ttys) > 1 else None),
+            )
             claimed_claude = (
                 _collect_live_claimed_claude_sids(rt_dirs, self.proc_root)
                 if self.proc_root is not None
@@ -3486,6 +3622,22 @@ class SessionTracker:
                         outer_hint_owned_by_tmux = True
                         if reg_hit.tmux_pane != active_target[1].pane_id:
                             neutralize_outer_title = True
+                    elif not reg_hit.tmux_pane and (
+                        (
+                            norm_tty
+                            and any(
+                                c.client_tty and _tty_matches(c.client_tty, norm_tty)
+                                for c in tmux_snap.clients
+                            )
+                        )
+                        or (norm_tty and reg_hit.tty and not _tty_matches(norm_tty, reg_hit.tty))
+                        or (
+                            darwin_win_desc_pids
+                            and reg_hit.agent_pid > 0
+                            and reg_hit.agent_pid not in darwin_win_desc_pids
+                        )
+                    ):
+                        stale_hint_fallthrough = True
                     else:
                         return _with_cwd(reg_hit.match)
                 elif saw_stale_exited:
@@ -3510,6 +3662,7 @@ class SessionTracker:
                         # Explicit session tag in title that matches no valid root session MUST return None
                         # rather than silently guessing an unrelated window's conversation!
                         return None
+                    _ensure_darwin_window_ptys()
                     hint_tty_is_tmux_client = bool(
                         norm_tty
                         and any(
@@ -3525,12 +3678,18 @@ class SessionTracker:
                         stale_hint_fallthrough = True
                     elif (
                         is_real_darwin
-                        and (active_target is not None or bool(norm_tty))
+                        and (
+                            active_target is not None
+                            or bool(norm_tty)
+                            or bool(darwin_win_tab_ttys)
+                        )
                         and not self._darwin_is_unhooked_session_live(
                             disk_hit,
                             tmux_snap,
                             norm_tty=norm_tty,
                             window_pid=window_pid,
+                            allowed_pids=(darwin_win_desc_pids if darwin_win_desc_pids else None),
+                            rows=darwin_ps_rows,
                         )
                     ):
                         stale_hint_fallthrough = True
@@ -3543,17 +3702,20 @@ class SessionTracker:
                 else (window_title or "")
             )
 
-            if not norm_tty and window_pid > 0 and not has_proc and self.proc_root is not None:
-                pinfo = ps_proc_info(window_pid)
-                if pinfo is not None and pinfo[2] and (
-                    _classify_interactive_cli(pinfo[0], pinfo[3])
-                    or pinfo[0].lower() in ("tmux", "screen", "zellij")
-                ):
-                    norm_tty = pinfo[2]
+            _ensure_darwin_window_ptys()
 
-            if stale_hint_fallthrough or norm_tty:
+            if stale_hint_fallthrough or norm_tty or len(darwin_win_tab_ttys) > 1:
                 active_target = self._select_active_tmux_target(
-                    tmux_snap, eff_title, window_tty=norm_tty, window_pid=window_pid
+                    tmux_snap,
+                    eff_title,
+                    window_tty=norm_tty,
+                    window_pid=window_pid,
+                    allowed_client_ttys=(
+                        darwin_win_tab_ttys if len(darwin_win_tab_ttys) > 1 else None
+                    ),
+                    allowed_client_pids=(
+                        darwin_win_desc_pids if len(darwin_win_tab_ttys) > 1 else None
+                    ),
                 )
 
             tty_matches_tmux_client = bool(
@@ -3589,6 +3751,41 @@ class SessionTracker:
                             _collect_pane_pids(self.proc_root, 0, p.pane_tty)
                         )
 
+            def _collect_darwin_scoped_non_tmux_cands() -> list[SessionMatch]:
+                scoped_cands: dict[str, SessionMatch] = {}
+                for cand in self._scan_darwin_live_non_tmux_sessions(
+                    tmux_snap,
+                    claimed_claude=claimed_claude,
+                    allowed_pids=(darwin_win_desc_pids if darwin_win_desc_pids else None),
+                    rows=darwin_ps_rows,
+                ):
+                    scoped_cands[cand.session_key] = cand
+                if darwin_win_tab_ttys and darwin_ps_rows:
+                    excluded_ttys = self._collect_tmux_ttys(tmux_snap)
+                    pids_by_tty: dict[str, set[int]] = {}
+                    clis_by_tty: dict[str, set[str]] = {}
+                    for r_pid, _ppid, _stat, r_tty, r_argv in darwin_ps_rows:
+                        if r_pid in darwin_win_desc_pids and r_tty and r_tty not in excluded_ttys:
+                            pids_by_tty.setdefault(r_tty, set()).add(r_pid)
+                            a0 = os.path.basename(r_argv[0].replace("\\", "/")).lstrip("-").lower() if r_argv else ""
+                            if cli_k := _classify_interactive_cli(a0, r_argv):
+                                clis_by_tty.setdefault(r_tty, set()).add(cli_k)
+                    for tab_tty in sorted(darwin_win_tab_ttys):
+                        if tab_tty in excluded_ttys:
+                            continue
+                        reg_cand = _lookup_tty_in_registry(
+                            tab_tty,
+                            pids_by_tty.get(tab_tty, set()),
+                            clis_by_tty.get(tab_tty, set()),
+                            rt_dirs,
+                            self.home,
+                            self.proc_root,
+                            fallback_cwd=norm_cwd,
+                        )
+                        if reg_cand is not None:
+                            scoped_cands[reg_cand.session_key] = reg_cand
+                return list(scoped_cands.values())
+
             if active_target is not None:
                 active_client, active_pane = active_target
                 if has_proc and self.proc_root is not None:
@@ -3621,10 +3818,7 @@ class SessionTracker:
                 if outer_hint_owned_by_tmux or tty_matches_tmux_client:
                     return pane_hit
                 if is_real_darwin:
-                    non_tmux_cands = self._scan_darwin_live_non_tmux_sessions(
-                        tmux_snap,
-                        claimed_claude=claimed_claude,
-                    )
+                    non_tmux_cands = _collect_darwin_scoped_non_tmux_cands()
                     if non_tmux_cands and self._should_prefer_non_tmux(
                         eff_title, active_client, active_pane, non_tmux_cands
                     ):
@@ -3683,6 +3877,12 @@ class SessionTracker:
                     return _disambiguate_candidates(proc_cands, eff_title, norm_cwd, self.home)
                 if stale_hint_fallthrough or is_real_proc:
                     return None
+
+            if is_real_darwin and len(darwin_win_tab_ttys) > 1:
+                scoped_list = _collect_darwin_scoped_non_tmux_cands()
+                if scoped_list:
+                    return _disambiguate_candidates(scoped_list, eff_title, norm_cwd, self.home)
+                return None
 
             if stale_hint_fallthrough and self.proc_root is not None:
                 return None

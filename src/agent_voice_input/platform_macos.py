@@ -5,8 +5,14 @@ import hashlib, json, os, platform as py_platform, re, shutil, subprocess, sys, 
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from ._tmux import (
+    TmuxServerSnapshot,
+    preferred_tmux_socket_arg,
+    probe_tmux_snapshot,
+    resolve_tmux_bin,
+)
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
-from .config import Config, ensure_secure_dir, expand_user_path, redact_secrets
+from .config import Config, ensure_secure_dir, expand_user_path, get_runtime_dir, redact_secrets
 from .hud import resolve_ui_language
 from .platform_wsl import (
     FfmpegWavRecorder,
@@ -19,8 +25,17 @@ from .platform_wsl import (
     invoke_recorder_recovered_callback,
     stream_key_test_proc,
 )
+from .session_ctx import (
+    SessionTracker,
+    _collect_registry_tmux_sockets,
+    _tty_matches,
+    collect_darwin_window_pty_tree,
+    normalize_tty_path,
+    parse_window_title_hint,
+)
 
 GHOSTTY_BUNDLE_ID = "com.mitchellh.ghostty"
+APPLE_TERMINAL_BUNDLE_ID = "com.apple.terminal"
 MAC_SHIM_SCRIPT = Path(__file__).resolve().with_name("mac_shim.swift")
 SHIM_SCHEMA_VERSION = 2
 MACOS_TERMINALS = frozenset(
@@ -137,18 +152,56 @@ on run argv
     end tell
 end run"""
 
+_TERMINAL_QUERY_SCRIPT = """\
+tell application id "com.apple.Terminal"
+    if not running or (count of windows) is 0 then return ""
+    set w to front window
+    try
+        if (miniaturized of w) or not (visible of w) then return ""
+    end try
+    set wid to 0
+    set {wname, ttty, tcustom} to {"", "", ""}
+    try
+        set wid to id of w
+    end try
+    try
+        set wname to name of w
+    end try
+    try
+        set t to selected tab of w
+        try
+            set ttty to tty of t
+        end try
+        try
+            set tcustom to custom title of t
+        end try
+    end try
+    set sep to character id 31
+    return "at1" & sep & (wid as text) & sep & ttty & sep & wname & sep & tcustom
+end tell"""
+
 _CMD_V_SCRIPT = 'tell application "System Events" to keystroke "v" using command down'
 
 MACOS_PERMISSIONS_HINT = (
     "Microphone -> terminal/daemon host (ffmpeg capture); "
-    "Automation -> Ghostty (split lookup & direct input without Accessibility); "
+    "Automation -> Ghostty (split lookup & direct input) or Terminal.app (active tab TTY lookup); "
     "Input Monitoring -> global non-modifier hotkeys / key-test; "
-    "Accessibility -> only needed for non-Ghostty System Events window title / Cmd+V fallback"
+    "Accessibility -> Cmd+V paste for non-Ghostty terminals outside tmux"
 )
 
 
 def is_ghostty_app(app_name: str, bundle_id: str = "") -> bool:
     return bundle_id.strip().lower() == GHOSTTY_BUNDLE_ID or app_name.strip().lower() == "ghostty"
+
+
+def is_apple_terminal_app(app_name: str, bundle_id: str = "") -> bool:
+    bid = (bundle_id or "").strip().lower()
+    if bid:
+        return bid == APPLE_TERMINAL_BUNDLE_ID
+    proc = (app_name or "").strip().lower()
+    if proc.endswith(".app"):
+        proc = proc[:-4]
+    return proc in ("terminal", "终端")
 
 
 def is_macos_terminal_window(process: str, bundle_id: str = "") -> bool:
@@ -378,7 +431,7 @@ def _summarize_osascript_error(stderr: str, *, kind: str) -> str:
     if any(tok in low for tok in ("not allowed assistive access", "not allowed to send keystrokes", "-1719", "-25211", "(1002)")):
         return "accessibility_denied (grant Accessibility permission for System Events Cmd+V, or use Ghostty)"
     if "-1743" in low or "not authorized to send apple events" in low:
-        target = "Ghostty" if kind == "ghostty" else "System Events"
+        target = {"ghostty": "Ghostty", "terminal": "Terminal"}.get(kind, "System Events")
         return f"automation_denied (grant Automation permission for {target})"
     m = _OSA_CODE_RE.search(stderr)
     return f"{kind}_osascript_error({m.group(1)})" if m else f"{kind}_osascript_failed"
@@ -399,7 +452,7 @@ def probe_macos_host(
         "tmux_active": bool(eff_env.get("TMUX")),
         "clt_ok": True, "clt_error": "",
         "swiftc_ok": False, "swiftc_bin": "", "mac_shim_ok": False, "mac_shim_bin": "", "mac_shim_error": "",
-        "fg_process": "", "fg_bundle_id": "", "fg_title": "", "fg_surface_id": "", "fg_tty": "", "fg_cwd": "", "fg_pid": 0,
+        "fg_hwnd": 0, "fg_process": "", "fg_bundle_id": "", "fg_title": "", "fg_surface_id": "", "fg_tty": "", "fg_cwd": "", "fg_pid": 0,
         "permissions_hint": MACOS_PERMISSIONS_HINT,
     }
     try:
@@ -457,7 +510,7 @@ def probe_macos_host(
     try:
         fg = MacOSPlatform(cfg, env=eff_env, cache_dir=cache_dir).get_foreground_window()
         info.update(
-            fg_process=fg.process, fg_bundle_id=fg.bundle_id, fg_title=fg.title,
+            fg_hwnd=fg.hwnd, fg_process=fg.process, fg_bundle_id=fg.bundle_id, fg_title=fg.title,
             fg_surface_id=fg.surface_id, fg_tty=fg.tty, fg_cwd=fg.cwd, fg_pid=fg.pid,
         )
     except Exception as exc:
@@ -535,12 +588,15 @@ class MacOSPlatform(JsonlShimMixin):
         env: Mapping[str, str] | None = None,
         cache_dir: Path | None = None,
         shim_cmd_factory: Callable[[], list[str] | None] | None = None,
+        tmux_probe_fn: Callable[[], TmuxServerSnapshot] | None = None,
     ) -> None:
         self.cfg = cfg
         self.env = dict(os.environ if env is None else env)
         self.audio_dev = resolve_macos_audio_device(self.cfg, self.env)
         self._cache_dir = cache_dir
         self._shim_cmd_factory = shim_cmd_factory
+        self._tmux_probe_fn = tmux_probe_fn
+        self._fg_tls = threading.local()
         self._ff_rec = FfmpegWavRecorder()
         self._recording = False
         self._recorder_lost_cb: Callable[..., Any] | None = None
@@ -689,6 +745,11 @@ class MacOSPlatform(JsonlShimMixin):
     def _which(self, name: str) -> str | None:
         return shutil.which(name, path=self.env.get("PATH")) if "PATH" in self.env else shutil.which(name)
 
+    def _resolve_tmux_exe(self) -> str:
+        if found := self._which("tmux"):
+            return found if os.path.sep in found and Path(found).name == "tmux" else "tmux"
+        return resolve_tmux_bin(self.env) if "PATH" in self.env else ""
+
     def _run_osascript(self, args: list[str], *, timeout: float = 2.5) -> subprocess.CompletedProcess[str] | None:
         if not self._which("osascript"):
             return None
@@ -719,15 +780,25 @@ class MacOSPlatform(JsonlShimMixin):
         return ax.stdout.strip() if (ax is not None and ax.returncode == 0) else ""
 
     def _query_frontmost_process_and_title(self) -> tuple[str, str, str, int]:
+        self._fg_tls.hwnd = 0
+        self._fg_tls.from_shim = False
+        self._fg_tls.ax_trusted = None
         if self._has_managed_shim():
             r = self._shim_rpc({"cmd": "fg_window"}, timeout_sec=1.5)
             if r is not None:
                 app_name = str(r.get("process") or "").strip()
                 bundle_id = str(r.get("bundle_id") or "").strip()
                 app_pid = int(r.get("pid") or 0)
+                self._fg_tls.hwnd = int(r.get("hwnd") or 0)
+                self._fg_tls.from_shim = True
+                raw_ax = r.get("ax_trusted")
+                self._fg_tls.ax_trusted = raw_ax if isinstance(raw_ax, bool) else None
+                shim_title = str(r.get("title") or "").strip()
                 if is_ghostty_app(app_name, bundle_id):
-                    return app_name or "Ghostty", bundle_id or GHOSTTY_BUNDLE_ID, "", app_pid
-                return app_name, bundle_id, self._query_ax_title(), app_pid
+                    return app_name or "Ghostty", bundle_id or GHOSTTY_BUNDLE_ID, shim_title, app_pid
+                if is_apple_terminal_app(app_name, bundle_id):
+                    return app_name or "Terminal", bundle_id or APPLE_TERMINAL_BUNDLE_ID, shim_title, app_pid
+                return app_name, bundle_id, shim_title, app_pid
 
         p = self._run_osascript(["-e", _FRONTMOST_APP_SCRIPT], timeout=2.5)
         if p is None or p.returncode != 0 or _APPLE_SEP not in p.stdout:
@@ -743,6 +814,25 @@ class MacOSPlatform(JsonlShimMixin):
             parts[3].strip() if len(parts) > 3 else "",
             app_pid,
         )
+
+    def _query_apple_terminal(self) -> tuple[int, str, str, str] | None:
+        p = self._run_osascript(["-e", _TERMINAL_QUERY_SCRIPT], timeout=2.5)
+        if p is None or p.returncode != 0 or not p.stdout.strip():
+            return None
+        parts = p.stdout.rstrip("\r\n").split(_APPLE_SEP)
+        if len(parts) < 4 or parts[0] != "at1":
+            return None
+        try:
+            win_id = max(0, int(parts[1].strip())) if parts[1].strip() else 0
+        except ValueError:
+            win_id = 0
+        tab_tty = normalize_tty_path(parts[2].strip())
+        if not tab_tty and win_id <= 0:
+            return None
+        wname = parts[3].strip()
+        tcustom = parts[4].strip() if len(parts) > 4 else ""
+        eff_title = f"{wname} {tcustom}".strip() if (tcustom and tcustom not in wname) else (wname or tcustom)
+        return win_id, eff_title, tab_tty, wname
 
     def _query_ghostty_terminal(self) -> tuple[str, str, str, str, int] | None:
         p = self._run_osascript(["-e", _GHOSTTY_QUERY_SCRIPT], timeout=2.5)
@@ -765,13 +855,14 @@ class MacOSPlatform(JsonlShimMixin):
         )
 
     def _append_tmux_pane_title(self, win_title: str, app_name: str, bundle_id: str = "") -> str:
-        if self.env.get("TMUX") and self._which("tmux") and (
+        tmux_exe = self._resolve_tmux_exe() if self.env.get("TMUX") else ""
+        if tmux_exe and (
             not (app_name or bundle_id) or is_macos_terminal_window(app_name, bundle_id)
         ):
             tmux_env = {k: v for k, v in self.env.items() if k != "TMUX_PANE"}
             try:
                 tp = subprocess.run(
-                    ["tmux", "display-message", "-p", "#{pane_title}"],
+                    [tmux_exe, "display-message", "-p", "#{pane_title}"],
                     stdin=subprocess.DEVNULL, capture_output=True, text=True, env=tmux_env, timeout=1.5, check=False,
                 )
                 if tp.returncode == 0 and tp.stdout.strip():
@@ -785,33 +876,112 @@ class MacOSPlatform(JsonlShimMixin):
 
     def get_foreground_window(self, *, hint: ForegroundWindow | None = None) -> ForegroundWindow:
         if hint is not None and (hint.process or hint.bundle_id):
-            app_name, bundle_id, win_title, app_pid = hint.process, hint.bundle_id, hint.title, hint.pid
-            if not is_ghostty_app(app_name, bundle_id) and not win_title:
+            app_name, bundle_id, win_title, app_pid, app_hwnd = (
+                hint.process,
+                hint.bundle_id,
+                hint.title,
+                hint.pid,
+                hint.hwnd,
+            )
+            from_shim = hint.ax_trusted is not None
+            ax_trusted = hint.ax_trusted
+            if (
+                not is_ghostty_app(app_name, bundle_id)
+                and not is_apple_terminal_app(app_name, bundle_id)
+                and not win_title
+                and not from_shim
+                and ax_trusted is not False
+            ):
                 win_title = self._query_ax_title()
         else:
+            self._fg_tls.hwnd = 0
+            self._fg_tls.from_shim = False
+            self._fg_tls.ax_trusted = None
             app_name, bundle_id, win_title, app_pid = self._query_frontmost_process_and_title()
+            app_hwnd = int(getattr(self._fg_tls, "hwnd", 0) or 0)
+            from_shim = bool(getattr(self._fg_tls, "from_shim", False))
+            ax_trusted = getattr(self._fg_tls, "ax_trusted", None)
 
         if is_ghostty_app(app_name, bundle_id):
             eff_name, eff_bundle = app_name or "Ghostty", bundle_id or GHOSTTY_BUNDLE_ID
-            if (g_info := self._query_ghostty_terminal()) is not None:
-                surface_id, g_title, tty, cwd, t_pid = g_info
-                return ForegroundWindow(0, eff_name, g_title, eff_bundle, surface_id, tty, cwd, t_pid)
-            if not win_title:
+            if not (from_shim and app_hwnd <= 0):
+                if (g_info := self._query_ghostty_terminal()) is not None:
+                    surface_id, g_title, tty, cwd, t_pid = g_info
+                    return ForegroundWindow(
+                        app_hwnd, eff_name, g_title, eff_bundle, surface_id, tty, cwd, t_pid, ax_trusted=ax_trusted
+                    )
+            if not win_title and not from_shim and ax_trusted is not False:
                 win_title = self._query_ax_title()
             return ForegroundWindow(
-                0, eff_name, self._append_tmux_pane_title(win_title, eff_name, eff_bundle), eff_bundle, pid=app_pid
+                app_hwnd,
+                eff_name,
+                self._append_tmux_pane_title(win_title, eff_name, eff_bundle),
+                eff_bundle,
+                pid=app_pid,
+                ax_trusted=ax_trusted,
+            )
+
+        if is_apple_terminal_app(app_name, bundle_id):
+            eff_name = app_name or "Terminal"
+            eff_bundle = bundle_id or APPLE_TERMINAL_BUNDLE_ID
+            if not (from_shim and app_hwnd <= 0):
+                if (t_info := self._query_apple_terminal()) is not None:
+                    t_wid, t_title, t_tty, t_wname = t_info
+                    is_other_panel = bool(
+                        win_title
+                        and t_wname
+                        and _normalize_title_for_drift(win_title) != _normalize_title_for_drift(t_wname)
+                        and (app_hwnd <= 0 or t_wid <= 0 or app_hwnd != t_wid)
+                    )
+                    if not is_other_panel:
+                        eff_hwnd = t_wid if t_wid > 0 else app_hwnd
+                        merged_title = t_title or win_title
+                        return ForegroundWindow(
+                            eff_hwnd,
+                            eff_name,
+                            self._append_tmux_pane_title(merged_title, eff_name, eff_bundle),
+                            eff_bundle,
+                            tty=t_tty,
+                            pid=app_pid,
+                            ax_trusted=ax_trusted,
+                        )
+            if not win_title and not from_shim and ax_trusted is not False:
+                win_title = self._query_ax_title()
+            return ForegroundWindow(
+                app_hwnd,
+                eff_name,
+                self._append_tmux_pane_title(win_title, eff_name, eff_bundle),
+                eff_bundle,
+                pid=app_pid,
+                ax_trusted=ax_trusted,
             )
 
         return ForegroundWindow(
-            0, app_name, self._append_tmux_pane_title(win_title, app_name, bundle_id), bundle_id, pid=app_pid
+            app_hwnd,
+            app_name,
+            self._append_tmux_pane_title(win_title, app_name, bundle_id),
+            bundle_id,
+            pid=app_pid,
+            ax_trusted=ax_trusted,
         )
 
     def resolve_foreground_window(self, window: ForegroundWindow | None = None) -> ForegroundWindow:
         if window is None:
             return self.get_foreground_window()
-        if window.surface_id or window.hwnd or (window.title and not is_ghostty_app(window.process, window.bundle_id)):
-            return window
-        if window.title and is_ghostty_app(window.process, window.bundle_id) and not self._which("osascript"):
+        if is_ghostty_app(window.process, window.bundle_id):
+            if window.surface_id or (window.title and not self._which("osascript")):
+                return window
+            return self.get_foreground_window(hint=window)
+        if is_apple_terminal_app(window.process, window.bundle_id):
+            if window.tty or (window.title and not self._which("osascript")):
+                return window
+            return self.get_foreground_window(hint=window)
+        if (
+            window.surface_id
+            or window.title
+            or (window.ax_trusted is not None and not self.env.get("TMUX"))
+            or (window.hwnd and not self._which("osascript"))
+        ):
             return window
         if window.title and not window.process and not window.bundle_id:
             return window
@@ -1201,7 +1371,7 @@ class MacOSPlatform(JsonlShimMixin):
             return False
         try:
             p = subprocess.run(
-                ["pbcopy"], input=text, text=True, env=self.env,
+                ["pbcopy"], input=text, text=True, encoding="utf-8", env=self.env,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, check=False,
             )
             return p.returncode == 0
@@ -1211,18 +1381,170 @@ class MacOSPlatform(JsonlShimMixin):
     def _is_focus_drifted(self, origin: ForegroundWindow | None, current: ForegroundWindow) -> bool:
         if origin is None:
             return False
-        if origin.bundle_id and current.bundle_id and origin.bundle_id.lower() != current.bundle_id.lower():
-            return True
-        if origin.process and current.process and origin.process.lower() != current.process.lower():
+        if origin.bundle_id and current.bundle_id:
+            if origin.bundle_id.lower() != current.bundle_id.lower():
+                return True
+        elif origin.process and current.process and origin.process.lower() != current.process.lower():
             return True
         if (origin.process or origin.bundle_id) and not (current.process or current.bundle_id):
             return True
         if origin.hwnd > 0 and current.hwnd > 0 and origin.hwnd != current.hwnd:
             return True
+        orig_tty = normalize_tty_path(origin.tty)
+        cur_tty = normalize_tty_path(current.tty)
+        if orig_tty and not cur_tty:
+            return True
+        if origin.hwnd > 0 and current.hwnd <= 0 and not cur_tty and (not current.title or current.ax_trusted is not None):
+            return True
+        if orig_tty and cur_tty:
+            if orig_tty != cur_tty:
+                return True
+            o_hint = parse_window_title_hint(origin.title)
+            c_hint = parse_window_title_hint(current.title)
+            if o_hint is not None and c_hint is not None and o_hint.session_token != c_hint.session_token:
+                return True
+            return False
+        if (origin.process or origin.bundle_id) and origin.title and not current.title and current.hwnd <= 0 and not cur_tty:
+            return True
         if (origin.process or origin.bundle_id) and origin.title and current.title:
             if _normalize_title_for_drift(origin.title) != _normalize_title_for_drift(current.title):
                 return True
         return False
+
+    def _deliver_via_tmux_buffer(
+        self,
+        tmux_cmd_prefix: list[str],
+        text: str,
+        *,
+        seq_id: int,
+        target_pane: str = "",
+        tmux_env: Mapping[str, str],
+    ) -> bool:
+        buf_name = f"avi-{os.getpid()}-{seq_id}-{time.monotonic_ns() & 0xFFFF:04x}"
+        env_dict = dict(tmux_env)
+        loaded = False
+        pasted = False
+        try:
+            lb = subprocess.run(
+                [*tmux_cmd_prefix, "load-buffer", "-b", buf_name, "-"],
+                input=text,
+                text=True,
+                encoding="utf-8",
+                env=env_dict,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+                check=False,
+            )
+            if lb.returncode != 0:
+                return False
+            loaded = True
+            pb_cmd = [*tmux_cmd_prefix, "paste-buffer", "-d", "-p", "-b", buf_name]
+            if target_pane:
+                pb_cmd.extend(["-t", target_pane])
+            pb = subprocess.run(
+                pb_cmd,
+                stdin=subprocess.DEVNULL,
+                env=env_dict,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+                check=False,
+            )
+            if pb.returncode == 0:
+                pasted = True
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            if loaded and not pasted:
+                try:
+                    subprocess.run(
+                        [*tmux_cmd_prefix, "delete-buffer", "-b", buf_name],
+                        stdin=subprocess.DEVNULL,
+                        env=env_dict,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=1.0,
+                        check=False,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        return False
+
+    def _probe_tmux_for_paste(self) -> TmuxServerSnapshot:
+        if self._tmux_probe_fn is not None:
+            try:
+                return self._tmux_probe_fn()
+            except Exception:
+                return TmuxServerSnapshot()
+        try:
+            rt_dir = get_runtime_dir(self.env, create=False)
+            extra_socks = _collect_registry_tmux_sockets([rt_dir])
+        except Exception:
+            extra_socks = []
+        if (
+            self._cache_dir is not None
+            and not extra_socks
+            and not any(self.env.get(k) for k in ("TMUX", "AGENT_VOICE_INPUT_TMUX_HINT", "TMUX_TMPDIR"))
+        ):
+            return TmuxServerSnapshot()
+        return probe_tmux_snapshot(env=self.env, extra_sockets=extra_socks)
+
+    def _try_deliver_attached_tmux(
+        self,
+        text: str,
+        *,
+        seq_id: int,
+        eff_tty: str,
+        fg: ForegroundWindow,
+        allow_pid_single_tty: bool = False,
+    ) -> bool:
+        tmux_bin = self._resolve_tmux_exe()
+        if not tmux_bin:
+            return False
+        snap = self._probe_tmux_for_paste()
+        if not snap.clients or not snap.panes:
+            return False
+        target_tty = normalize_tty_path(eff_tty)
+        if not target_tty and allow_pid_single_tty and fg.pid > 1:
+            rows = SessionTracker(env=self.env)._list_darwin_user_ps_rows()
+            if rows:
+                tab_ttys, desc_pids = collect_darwin_window_pty_tree(rows, fg.pid)
+                if len(tab_ttys) == 1:
+                    target_tty = next(iter(tab_ttys))
+                elif not tab_ttys and desc_pids:
+                    desc_clients = [
+                        c for c in snap.clients if c.client_pid > 1 and c.client_pid in desc_pids and c.client_tty
+                    ]
+                    if len(desc_clients) == 1:
+                        target_tty = normalize_tty_path(desc_clients[0].client_tty)
+        if not target_tty:
+            return False
+        selected = SessionTracker._select_active_tmux_target(
+            snap,
+            fg.title,
+            window_tty=target_tty,
+            window_pid=fg.pid,
+            allowed_client_ttys=(target_tty,),
+        )
+        if selected is None:
+            return False
+        client, pane = selected
+        if not _tty_matches(client.client_tty, target_tty) or not pane.pane_id:
+            return False
+        sock_path = pane.socket_path or client.socket_path
+        cmd_prefix = [tmux_bin]
+        if sock_path:
+            cmd_prefix.extend(["-S", preferred_tmux_socket_arg(sock_path)])
+        tmux_env = {k: v for k, v in self.env.items() if k not in ("TMUX", "TMUX_PANE")}
+        return self._deliver_via_tmux_buffer(
+            cmd_prefix,
+            text,
+            seq_id=seq_id,
+            target_pane=pane.pane_id,
+            tmux_env=tmux_env,
+        )
 
     def _deliver_to_ghostty_surface(self, text: str, surface_id: str, clip_ok: bool) -> PasteOutcome:
         p = self._run_osascript(["-e", _GHOSTTY_INPUT_SCRIPT, "--", surface_id, text], timeout=2.5)
@@ -1256,21 +1578,15 @@ class MacOSPlatform(JsonlShimMixin):
             if clip_ok:
                 self.beep("focus")
             return PasteOutcome(False, clip_ok, "focus_changed" if clip_ok else "clipboard_failed", fg.process)
-        if self._which("tmux") and self.env.get("TMUX"):
+        if self.env.get("TMUX") and (tmux_exe := self._resolve_tmux_exe()):
             tmux_env = {k: v for k, v in self.env.items() if k != "TMUX_PANE"}
-            try:
-                lb = subprocess.run(
-                    ["tmux", "load-buffer", "-"], input=text, text=True, env=tmux_env,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, check=False,
-                )
-                pb = subprocess.run(
-                    ["tmux", "paste-buffer", "-p"], stdin=subprocess.DEVNULL, env=tmux_env,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, check=False,
-                )
-                if lb.returncode == 0 and pb.returncode == 0:
-                    return PasteOutcome(True, True, "tmux", fg.process)
-            except (OSError, subprocess.SubprocessError):
-                pass
+            if self._deliver_via_tmux_buffer([tmux_exe], text, seq_id=seq_id, tmux_env=tmux_env):
+                return PasteOutcome(True, clip_ok, "tmux", fg.process)
+        eff_tty = normalize_tty_path(fg.tty)
+        if (eff_tty or fg.pid > 1) and self._try_deliver_attached_tmux(
+            text, seq_id=seq_id, eff_tty=eff_tty, fg=fg, allow_pid_single_tty=not bool(eff_tty)
+        ):
+            return PasteOutcome(True, clip_ok, "tmux", fg.process)
         if not clip_ok:
             return PasteOutcome(False, False, "clipboard_failed", fg.process)
         p = self._run_osascript(["-e", _CMD_V_SCRIPT], timeout=2.5)

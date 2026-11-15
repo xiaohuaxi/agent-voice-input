@@ -35,6 +35,7 @@ from agent_voice_input.session_ctx import (  # noqa: E402
     TmuxClientInfo,
     TmuxPaneInfo,
     TmuxServerSnapshot,
+    collect_darwin_window_pty_tree,
     parse_tmux_probe_output,
     parse_tmux_socket_from_env,
     probe_tmux_snapshot,
@@ -2620,6 +2621,239 @@ class DarwinTmuxGhosttyUnitTests(unittest.TestCase):
                 )
                 self.assertEqual(t_cascade._scan_darwin_live_non_tmux_sessions(snap), [])
             self.assertEqual(len(timeout_lsof_calls), 1, "batched lsof timeout must not cascade into per-PID lsof")
+
+    def test_darwin_window_pty_tree_single_and_multi_tab_gui_terminal_scoping(self) -> None:
+        # 1. collect_darwin_window_pty_tree stops tab-TTY discovery at first controlling TTY per branch
+        #    (ignoring nested agent tool sub-PTYs) while still traversing intermediate non-TTY helpers.
+        sample_rows = [
+            # Alacritty (9000, no tty) -> login (9001, ttys010) -> -zsh (9002, ttys010)
+            # -> agy (9003, ttys010) -> nested PTY tool runner (9004, ttys099!)
+            (9000, 1, "Ss", "", ["/Applications/Alacritty.app/Contents/MacOS/alacritty"]),
+            (9001, 9000, "Ss", "/dev/ttys010", ["/usr/bin/login", "-fp", "xhx"]),
+            (9002, 9001, "S", "/dev/ttys010", ["-zsh"]),
+            (9003, 9002, "S+", "/dev/ttys010", ["agy"]),
+            (9004, 9003, "Ss+", "/dev/ttys099", ["/bin/zsh", "-c", "pytest"]),
+            # iTerm2 (8000, no tty) -> iTermServer (8001, no tty) -> 2 tabs (ttys004, ttys005)
+            (8000, 1, "Ss", "", ["/Applications/iTerm.app/Contents/MacOS/iTerm2"]),
+            (8001, 8000, "S", "", ["iTermServer-3.5"]),
+            (8010, 8001, "Ss", "/dev/ttys004", ["-zsh"]),
+            (8011, 8010, "S+", "/dev/ttys004", ["claude"]),
+            (8020, 8001, "Ss+", "/dev/ttys005", ["-zsh"]),
+        ]
+        alac_ttys, alac_desc = collect_darwin_window_pty_tree(sample_rows, 9000)
+        self.assertEqual(alac_ttys, {"/dev/ttys010"})
+        self.assertEqual(alac_desc, {9001, 9002, 9003, 9004})
+
+        iterm_ttys, iterm_desc = collect_darwin_window_pty_tree(sample_rows, 8000)
+        self.assertEqual(iterm_ttys, {"/dev/ttys004", "/dev/ttys005"})
+        self.assertEqual(iterm_desc, {8001, 8010, 8011, 8020})
+        self.assertEqual(collect_darwin_window_pty_tree(sample_rows, 1), (set(), set()))
+
+        # 2. SessionTracker.resolve_session on real Darwin (Path('/proc').is_dir() == False)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            proj_ghostty_tmux = home / "repos" / "ghostty-tmux"
+            proj_ghostty_plain = home / "repos" / "ghostty-plain"
+            proj_alac = home / "repos" / "alac-app"
+            proj_iterm = home / "repos" / "iterm-svc"
+            for d in (rt, proj_ghostty_tmux, proj_ghostty_plain, proj_alac, proj_iterm):
+                d.mkdir(parents=True)
+
+            now = time.time()
+            sid_g_tmux = "11110000-1111-4111-8111-000000000001"
+            sid_g_plain = "22220000-2222-4222-8222-000000000002"
+            sid_alac = "33330000-3333-4333-8333-000000000003"
+            sid_iterm = "44440000-4444-4444-8444-000000000004"
+            sid_agy = "55550000-5555-4555-8555-000000000005"
+            _write_claude_jsonl(home, sid_g_tmux, str(proj_ghostty_tmux), "Ghostty tmux 会话", now)
+            f_g_plain = _write_codex_rollout(home, sid_g_plain, str(proj_ghostty_plain), "Ghostty 普通会话", now)
+            f_alac = _write_codex_rollout(home, sid_alac, str(proj_alac), "Alacritty 单标签会话", now - 30)
+            f_iterm = _write_claude_jsonl(home, sid_iterm, str(proj_iterm), "iTerm2 多标签会话", now - 60)
+            agy_lock = home / ".gemini" / "antigravity-cli" / "presence" / f"{sid_agy}.lock"
+            agy_tx = home / ".gemini" / "antigravity-cli" / "brain" / sid_agy / ".system_generated" / "logs" / "transcript.jsonl"
+            agy_lock.parent.mkdir(parents=True, exist_ok=True)
+            agy_tx.parent.mkdir(parents=True, exist_ok=True)
+            agy_lock.write_text("", encoding="utf-8")
+            agy_tx.write_text('{"type":"USER_INPUT","content":"Ghostty agy 会话"}\n', encoding="utf-8")
+
+            snap_box = [
+                TmuxServerSnapshot(
+                    clients=(
+                        TmuxClientInfo(
+                            session_id="$0",
+                            window_id="@0",
+                            pane_id="%0",
+                            activity=now,
+                            client_tty="/dev/ttys002",
+                            client_pid=6101,
+                            focused=True,
+                            socket_path="/private/tmp/tmux-501/default",
+                        ),
+                    ),
+                    panes=(
+                        TmuxPaneInfo(
+                            session_id="$0",
+                            window_id="@0",
+                            window_active=True,
+                            pane_id="%0",
+                            pane_active=True,
+                            pane_pid=6200,
+                            pane_tty="/dev/ttys020",
+                            socket_path="/private/tmp/tmux-501/default",
+                            current_path=str(proj_ghostty_tmux),
+                            pane_title="zsh",
+                        ),
+                    ),
+                )
+            ]
+
+            iterm_has_claude = [True]
+            ps_calls = [0]
+
+            def fake_darwin_subproc(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[bytes]:
+                exe = os.path.basename(cmd[0])
+                if exe == "ps":
+                    ps_calls[0] += 1
+                    if "-p" in cmd:
+                        pid_s = cmd[cmd.index("-p") + 1]
+                        p_map = {
+                            "9000": "9000 1 Ss ?? /Applications/Alacritty.app/Contents/MacOS/alacritty\n",
+                            "8000": "8000 1 Ss ?? /Applications/iTerm.app/Contents/MacOS/iTerm2\n",
+                        }
+                        out = p_map.get(pid_s, "")
+                        return subprocess.CompletedProcess(cmd, 0 if out else 1, out.encode("utf-8"), b"")
+                    if "-t" in cmd:
+                        t_arg = cmd[cmd.index("-t") + 1]
+                        if t_arg == "ttys010":
+                            out = (
+                                "9001 9000 Ss ttys010 /usr/bin/login\n"
+                                "9002 9001 S ttys010 -zsh\n"
+                                "9003 9002 S+ ttys010 /opt/homebrew/bin/codex\n"
+                            )
+                            return subprocess.CompletedProcess(cmd, 0, out.encode("utf-8"), b"")
+                        if t_arg == "ttys020":
+                            out = "6200 6199 Ss ttys020 -zsh\n6201 6200 S+ ttys020 claude\n"
+                            return subprocess.CompletedProcess(cmd, 0, out.encode("utf-8"), b"")
+                        return subprocess.CompletedProcess(cmd, 1, b"", b"")
+                    if "-u" in cmd:
+                        lines = [
+                            # Ghostty (676) with tmux client (ttys002) + newer plain codex (ttys003)
+                            "676 1 Ss ?? /Applications/Ghostty.app/Contents/MacOS/ghostty",
+                            "6100 676 Ss ttys002 -zsh",
+                            "6101 6100 S+ ttys002 tmux attach",
+                            "6200 6199 Ss ttys020 -zsh",
+                            "6201 6200 S+ ttys020 claude",
+                            "6300 676 Ss ttys003 -zsh",
+                            "6301 6300 S+ ttys003 /opt/homebrew/bin/codex",
+                            "6400 676 Ss ttys006 -zsh",
+                            "6401 6400 S+ ttys006 /opt/homebrew/bin/agy",
+                            # Alacritty (9000) single tab ttys010 + nested tool sub-PTY ttys099
+                            "9000 1 Ss ?? /Applications/Alacritty.app/Contents/MacOS/alacritty",
+                            "9001 9000 Ss ttys010 /usr/bin/login",
+                            "9002 9001 S ttys010 -zsh",
+                            "9003 9002 S+ ttys010 /opt/homebrew/bin/codex",
+                            "9004 9003 Ss+ ttys099 /bin/zsh -c pytest",
+                            # iTerm2 (8000) two tabs ttys004 & ttys005
+                            "8000 1 Ss ?? /Applications/iTerm.app/Contents/MacOS/iTerm2",
+                            "8001 8000 S ?? iTermServer",
+                            "8010 8001 Ss ttys004 -zsh",
+                            "8020 8001 Ss+ ttys005 -zsh",
+                        ]
+                        if iterm_has_claude[0]:
+                            lines.append("8011 8010 S+ ttys004 claude")
+                        return subprocess.CompletedProcess(cmd, 0, ("\n".join(lines) + "\n").encode("utf-8"), b"")
+                if exe == "lsof":
+                    pid_csv = cmd[cmd.index("-p") + 1] if "-p" in cmd else ""
+                    pids = {int(x) for x in pid_csv.split(",") if x.isdigit()}
+                    chunks: list[str] = []
+                    if 9003 in pids:
+                        chunks.append(f"p9003\nfcwd\nn{proj_alac}\nf12\nn{f_alac}\n")
+                    if 6301 in pids:
+                        chunks.append(f"p6301\nfcwd\nn{proj_ghostty_plain}\nf12\nn{f_g_plain}\n")
+                    if 6401 in pids:
+                        chunks.append(f"p6401\nfcwd\nn{proj_ghostty_plain}\nf15\nn{agy_lock}\n")
+                    if 6201 in pids:
+                        chunks.append(f"p6201\nfcwd\nn{proj_ghostty_tmux}\n")
+                    if 8011 in pids:
+                        chunks.append(f"p8011\nfcwd\nn{proj_iterm}\n")
+                    out_s = "".join(chunks)
+                    return subprocess.CompletedProcess(cmd, 0 if out_s else 1, out_s.encode("utf-8"), b"")
+                return subprocess.CompletedProcess(cmd, 1, b"", b"")
+
+            orig_is_dir = Path.is_dir
+            with (
+                mock.patch("agent_voice_input.session_ctx.subprocess.run", side_effect=fake_darwin_subproc),
+                mock.patch.object(
+                    Path,
+                    "is_dir",
+                    autospec=True,
+                    side_effect=lambda p: False if p == Path("/proc") else orig_is_dir(p),
+                ),
+            ):
+                tracker = SessionTracker(
+                    runtime_dir=rt,
+                    home_dir=home,
+                    proc_root=Path("/proc"),
+                    tmux_probe_fn=lambda: snap_box[0],
+                )
+
+                # A. Single-tab Alacritty (window_pid=9000, window_tty='') resolves exact sid_alac via tty_ps
+                #    despite nested tool PTY ttys099 and Ghostty's newer tmux/codex sessions!
+                m_alac = tracker.resolve_session("Alacritty", window_tty="", window_pid=9000)
+                assert m_alac is not None
+                self.assertEqual((m_alac.cli, m_alac.session_id, m_alac.matched_by), ("codex", sid_alac, "tty_ps"))
+
+                # B. Multi-tab iTerm2 (window_pid=8000, 2 tabs) scopes strictly to iTerm2's subtree,
+                #    excluding Ghostty's tmux client & Ghostty's codex, resolving iTerm2's claude!
+                m_iterm = tracker.resolve_session("zsh", window_tty="", window_pid=8000)
+                assert m_iterm is not None
+                self.assertEqual((m_iterm.cli, m_iterm.session_id, m_iterm.matched_by), ("claude", sid_iterm, "tty_ps"))
+
+                # C. Multi-tab iTerm2 when BOTH tabs are empty shells -> returns None (no Ghostty or disk leak!)
+                iterm_has_claude[0] = False
+                self.assertIsNone(tracker.resolve_session("zsh", window_tty="", window_pid=8000))
+                _ = f_iterm
+
+                # D. Zero-subprocess O(1) registry fast path preserved when [#tag] is present & no tmux client exists
+                orig_tmux_snap = snap_box[0]
+                write_session_registry_entry(
+                    rt,
+                    cli="codex",
+                    session_id=sid_alac,
+                    jsonl_path=str(f_alac),
+                    cwd=str(proj_alac),
+                    tty="/dev/ttys010",
+                )
+                snap_box[0] = TmuxServerSnapshot()
+                ps_calls[0] = 0
+                m_fast = tracker.resolve_session(
+                    f"codex [#{sid_alac[:8]}]", window_tty="", window_pid=9000
+                )
+                assert m_fast is not None
+                self.assertEqual((m_fast.session_id, m_fast.matched_by), (sid_alac, "registry"))
+                self.assertEqual(ps_calls[0], 0, "O(1) registry hit without tmux clients must spawn zero ps calls")
+
+                # E. Stale hooked non-tmux [#tag] falls through when window_tty is an attached tmux client!
+                snap_box[0] = orig_tmux_snap
+                m_stale_reg = tracker.resolve_session(
+                    f"codex [#{sid_alac[:8]}]", window_tty="/dev/ttys002", window_pid=676
+                )
+                assert m_stale_reg is not None
+                self.assertEqual((m_stale_reg.cli, m_stale_reg.session_id), ("claude", sid_g_tmux))
+
+                # F. Unhooked agy [#tag] in title scopes strictly to window_pid's open presence/<cid>.lock!
+                import fcntl
+
+                with agy_lock.open("r+", encoding="utf-8") as lock_f:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertIsNone(
+                        tracker.resolve_session(f"agy [#{sid_agy[:8]}]", window_tty="", window_pid=8000)
+                    )
+                    m_agy_g = tracker.resolve_session(f"agy [#{sid_agy[:8]}]", window_tty="", window_pid=676)
+                    assert m_agy_g is not None
+                    self.assertEqual((m_agy_g.cli, m_agy_g.session_id), ("agy", sid_agy))
 
 
 if __name__ == "__main__":
