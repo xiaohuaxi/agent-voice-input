@@ -246,7 +246,7 @@ func computeHudPillY(visibleMinY: CGFloat, visibleMaxY: CGFloat, pillH: CGFloat,
     if pos == "top" {
         return round(visibleMaxY - pillH - 14.0)
     }
-    return round(visibleMinY + 28.0)
+    return round(visibleMinY + 12.0)
 }
 
 func stripOuterParens(_ raw: String) -> String {
@@ -788,7 +788,7 @@ final class HudPillController {
         var waveMode = false
         if st == "recording" {
             txt = zh
-                ? "● 录音中… (\(isPtt ? "松开" : "再按")\(hotkeyLabel) 完成)"
+                ? "● 录音中… (\(isPtt ? "松开" : "按")\(hotkeyLabel) 完成)"
                 : "● Listening… (\(isPtt ? "release" : "press") \(hotkeyLabelEn) to finish)"
             (bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
                 Self.recBg, Self.recWaveActive, Self.recMainText, Self.recHintTextCol, Self.recBorder, 0, ""
@@ -1005,11 +1005,11 @@ private func runSelfCheck() -> Int32 {
         try check(recov.count == 1 && recov[0].kind == "toggle", "recovered toggle after swallowed keyUp")
 
         try check(isZhUiCulture("zh-Hans-CN") && isZhUiCulture("zh_TW.UTF-8") && !isZhUiCulture("en-US"), "ui_culture zh detection")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 78.0, "HUD bottom pillY")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 78.0, "HUD default pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 62.0, "HUD bottom pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 62.0, "HUD default pillY")
         try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: " TOP ") == 850.0, "HUD top pillY")
-        try check(splitHudSegments("● 录音中… (再按右 Ctrl 完成)") == HudSegments(icon: "●", main: "录音中…", hint: "(再按右 Ctrl 完成)", hasSpaceBeforeHint: true), "HUD split recording zh")
-        try check(stripOuterParens("(再按右 Ctrl 完成)") == "再按右 Ctrl 完成" && stripOuterParens("12s 后自动完成") == "12s 后自动完成" && stripOuterParens("") == "", "HUD strip outer parens")
+        try check(splitHudSegments("● 录音中… (按右 Ctrl 完成)") == HudSegments(icon: "●", main: "录音中…", hint: "(按右 Ctrl 完成)", hasSpaceBeforeHint: true), "HUD split recording zh")
+        try check(stripOuterParens("(按右 Ctrl 完成)") == "按右 Ctrl 完成" && stripOuterParens("12s 后自动完成") == "12s 后自动完成" && stripOuterParens("") == "", "HUD strip outer parens")
         try check(splitHudSegments("✓ 已复制(窗口已切换)") == HudSegments(icon: "✓", main: "已复制", hint: "(窗口已切换)", hasSpaceBeforeHint: false), "HUD split copied zh")
         try check(splitHudSegments("Custom HUD") == HudSegments(icon: "", main: "Custom HUD", hint: "", hasSpaceBeforeHint: false), "HUD split custom")
         try check(formatRecordingDuration(-5) == "0s" && formatRecordingDuration(0) == "0s" && formatRecordingDuration(9) == "9s" && formatRecordingDuration(59) == "59s", "HUD duration seconds")

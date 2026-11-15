@@ -1202,7 +1202,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn('st == "recognizing" || st == "processing"', src)
         self.assertIn('st == "refining"', src)
         self.assertIn("func computeHudPillY(", src)
-        self.assertIn("round(visibleMinY + 28.0)", src)
+        self.assertIn("round(visibleMinY + 12.0)", src)
         self.assertIn("round(visibleMaxY - pillH - 14.0)", src)
         self.assertIn("func splitHudSegments(", src)
         self.assertIn("func stripOuterParens(", src)

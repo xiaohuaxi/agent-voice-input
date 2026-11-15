@@ -355,7 +355,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(
                 [(c["state"], c.get("text")) for c in zh_cmds],
                 [
-                    ("recording", "● 录音中… (再按右 Ctrl 完成)"),
+                    ("recording", "● 录音中… (按右 Ctrl 完成)"),
                     ("recognizing", "◐ 语音识别…"),
                     ("refining", "◈ 整理精修…"),
                     ("done", "✓ 已填入"),
@@ -432,7 +432,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 ready_ui_culture="en-US",
                 calls=[("recording", "", 0), ("hide", "", 0)],
             )
-            self.assertEqual(override_zh_cmds[0].get("text"), "● 录音中… (再按右 Ctrl 完成)")
+            self.assertEqual(override_zh_cmds[0].get("text"), "● 录音中… (按右 Ctrl 完成)")
             self.assertEqual(override_zh_cmds[0].get("position"), "top")
             self.assertIsNone(override_zh_cmds[1].get("position"))
 
@@ -527,7 +527,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(
                 [(c["state"], c.get("text")) for c in mac_zh],
                 [
-                    ("recording", "● 录音中… (再按右 Option 完成)"),
+                    ("recording", "● 录音中… (按右 Option 完成)"),
                     ("recognizing", "◐ 语音识别…"),
                     ("refining", "◈ 整理精修…"),
                     ("done", "✓ 已填入"),
@@ -571,7 +571,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 ready_ui_culture="__OMIT__",
                 calls=[("recording", "", 0)],
             )
-            self.assertEqual(mac_posix_zh[0].get("text"), "● 录音中… (再按 Fn 完成)")
+            self.assertEqual(mac_posix_zh[0].get("text"), "● 录音中… (按 Fn 完成)")
 
             # 4. Explicit config override wins over mac_shim ui_culture and forwards position='top'
             mac_override = _run_mac_hud_scenario(
@@ -652,7 +652,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
 
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="RControl", trigger_mode="tap_toggle"),
-            "● 录音中… (再按右 Ctrl 完成)",
+            "● 录音中… (按右 Ctrl 完成)",
         )
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="RControl", trigger_mode="ptt"),
@@ -660,7 +660,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         )
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="ROption", trigger_mode="tap_toggle"),
-            "● 录音中… (再按右 Option 完成)",
+            "● 录音中… (按右 Option 完成)",
         )
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="RCommand", trigger_mode="ptt"),
@@ -668,7 +668,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         )
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="CapsLock", trigger_mode="tap_toggle"),
-            "● 录音中… (再按 CapsLock 完成)",
+            "● 录音中… (按 CapsLock 完成)",
         )
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="F8", trigger_mode="ptt"),
@@ -742,7 +742,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertIn("0x00080000", shim)
         self.assertNotIn("CreateRoundRectRgn(", shim)
         self.assertIn("wa.Width - ScalePx(24)", shim)
-        self.assertIn("wa.Bottom - h - ScalePx(28)", shim)
+        self.assertIn("wa.Bottom - h - ScalePx(12)", shim)
         self.assertIn("wa.Top + ScalePx(36)", shim)
         self.assertIn("ScalePx(34)", shim)
         self.assertIn("ScalePx(14)", shim)

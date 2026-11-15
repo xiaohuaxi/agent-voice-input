@@ -441,7 +441,7 @@ public sealed class HudPillForm : Form {
         int h = Math.Max(ScalePx(34), textH + ScalePx(14));
         bool isTop = string.Equals((_position ?? "").Trim(), "top", StringComparison.OrdinalIgnoreCase);
         x = wa.Left + (wa.Width - w) / 2;
-        y = isTop ? (wa.Top + ScalePx(36)) : Math.Max(wa.Top + ScalePx(4), wa.Bottom - h - ScalePx(28));
+        y = isTop ? (wa.Top + ScalePx(36)) : Math.Max(wa.Top + ScalePx(4), wa.Bottom - h - ScalePx(12));
 
         Bitmap outBmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
         using (Bitmap rgbBmp = new Bitmap(w, h, PixelFormat.Format32bppRgb))
@@ -861,7 +861,7 @@ public static class VoiceWinShim {
         if (st == "recording") {
             string hkEn = (_hotkeyLabel == "\u53F3 Ctrl") ? "Right Ctrl" : _hotkeyLabel.Trim();
             txt = zh
-                ? ("\u25CF \u5F55\u97F3\u4E2D\u2026 (" + (_isPtt ? "\u677E\u5F00" : "\u518D\u6309") + _hotkeyLabel + " \u5B8C\u6210)")
+                ? ("\u25CF \u5F55\u97F3\u4E2D\u2026 (" + (_isPtt ? "\u677E\u5F00" : "\u6309") + _hotkeyLabel + " \u5B8C\u6210)")
                 : ("\u25CF Listening\u2026 (" + (_isPtt ? "release " : "press ") + hkEn + " to finish)");
             bg = Color.FromArgb(64, 18, 26); ic = Color.FromArgb(255, 104, 112); mc = Color.FromArgb(248, 250, 252); hc = Color.FromArgb(230, 188, 178, 192); bd = Color.FromArgb(196, 66, 80);
             string trimmedCustom = (customText ?? "").TrimStart();
