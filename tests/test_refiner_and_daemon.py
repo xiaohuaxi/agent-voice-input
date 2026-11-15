@@ -752,6 +752,13 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 self.assertEqual(stale_idle.get("ignored"), "stale_seq")
                 self.assertEqual(daemon.state, "idle")
 
+                # 2b. Single late reflex user toggle within 1.5s of auto-stop is absorbed once ("already_stopped")
+                daemon._last_trigger_ts = -1e9
+                reflex_tap = daemon.handle_trigger("toggle")
+                self.assertEqual(reflex_tap.get("ignored"), "already_stopped")
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(daemon.seq_id, seq_auto)
+
                 # 3. Manual early stop & cancel cancel _max_dur_timer immediately; stale expected_seq_id cannot stop newer round
                 daemon.cfg.audio.max_duration_sec = 30.0
                 daemon._last_trigger_ts = -1e9

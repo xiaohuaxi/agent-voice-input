@@ -258,6 +258,7 @@ class VoiceInputDaemon:
         self._origin_win, self.last_result, self._srv_sock = ForegroundWindow(), {}, None
         self._cur_no_paste, self._cur_silent_hud = False, False
         self._recorder_lost_seq, self._recorder_lost_ts, self._recorder_lost_stop_absorbed = -1, -1e9, False
+        self._auto_stop_seq, self._auto_stop_ts, self._auto_stop_absorbed = -1, -1e9, False
         self._max_dur_timer: threading.Timer | None = None
         if (setter := getattr(self.platform, "set_recorder_lost_callback", None)) is not None:
             setter(self._on_recorder_lost)
@@ -445,6 +446,16 @@ class VoiceInputDaemon:
                 ):
                     self._recorder_lost_stop_absorbed = True
                     return {"ok": True, "ignored": "already_stopped", "state": self.state, "seq_id": self.seq_id}
+                if (
+                    expected_seq_id is None
+                    and action == "toggle"
+                    and self.state != "recording"
+                    and self.seq_id == self._auto_stop_seq
+                    and not self._auto_stop_absorbed
+                    and 0.0 <= (arrival_ts - self._auto_stop_ts) < 1.5
+                ):
+                    self._auto_stop_absorbed = True
+                    return {"ok": True, "ignored": "already_stopped", "state": self.state, "seq_id": self.seq_id}
                 now = self.clock_fn()
                 if action == "ptt_cancel":
                     if self.state != "recording":
@@ -455,6 +466,7 @@ class VoiceInputDaemon:
                 elif action in ("toggle", "ptt_start") and self.state != "recording":
                     self._cur_no_paste, self._cur_silent_hud = bool(no_paste), bool(silent_hud)
                     self._recorder_lost_seq, self._recorder_lost_ts, self._recorder_lost_stop_absorbed = -1, -1e9, False
+                    self._auto_stop_seq, self._auto_stop_ts, self._auto_stop_absorbed = -1, -1e9, False
                     self._origin_win = window if window is not None else ForegroundWindow()
                     self.seq_id += 1; self.state, self._last_trigger_ts, cur_seq, mode = "recording", now, self.seq_id, "start"
                 elif action in ("toggle", "ptt_stop") and self.state == "recording":
@@ -463,7 +475,9 @@ class VoiceInputDaemon:
                     eff_no_paste = bool(no_paste or self._cur_no_paste)
                     eff_silent = bool(silent_hud or self._cur_silent_hud)
                     self._cur_no_paste, self._cur_silent_hud = False, False
-                    self._last_trigger_ts, cur_seq, win_snap, mode = now, self.seq_id, self._origin_win, "stop"
+                    if expected_seq_id is None:
+                        self._last_trigger_ts = now
+                    cur_seq, win_snap, mode = self.seq_id, self._origin_win, "stop"
                 else:
                     return {"ok": True, "state": self.state, "seq_id": self.seq_id}
 
@@ -527,6 +541,13 @@ class VoiceInputDaemon:
             if not eff_silent: self._hud("recognizing")
             try:
                 raw_wav, src_used = self.platform.stop_recording()
+                if expected_seq_id is not None:
+                    done_ts = self.clock_fn()
+                    with self._lock:
+                        if self.seq_id == cur_seq:
+                            self._auto_stop_seq = cur_seq
+                            self._auto_stop_ts = done_ts
+                            self._auto_stop_absorbed = False
                 if not eff_silent: self.platform.beep("stop")
             except Exception as exc:
                 err = self._redact(exc)

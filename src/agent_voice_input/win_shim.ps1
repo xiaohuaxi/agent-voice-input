@@ -851,7 +851,7 @@ public static class VoiceWinShim {
     }
 
     public static float GetLiveAudioLevel() {
-        if (_wasapiActive) return _wasapiLevel;
+        if (_wasapiActive) return ((long)GetTickCount64() - Interlocked.Read(ref _wasapiLevelTick) <= 260L) ? _wasapiLevel : 0f;
         if ((long)GetTickCount64() - Interlocked.Read(ref _extLevelTick) <= 260L) return _extLevel;
         return 0f;
     }
@@ -998,7 +998,7 @@ public static class VoiceWinShim {
     private static volatile string _recErr = "";
     private static volatile bool _recInitOk = false;
     private static volatile float _wasapiLevel = 0f, _extLevel = 0f;
-    private static long _extLevelTick = 0L;
+    private static long _wasapiLevelTick = 0L, _extLevelTick = 0L;
     private static volatile bool _wasapiActive = false;
 
     private static byte[] BuildPcm16MonoWav(byte[] pcm, int pcmLen, int sr) {
@@ -1015,14 +1015,15 @@ public static class VoiceWinShim {
 
     private static void DrainWasapiPackets(IAudioCaptureClient cap, MemoryStream dst, byte[] zeros, ref byte[] scratch) {
         uint next = 0;
-        if (cap.GetNextPacketSize(out next) != 0) return;
+        if (cap.GetNextPacketSize(out next) != 0) { _wasapiLevel = 0f; return; }
         while (next > 0) {
             IntPtr pData; uint frames, flags; ulong dpos, qpos;
-            if (cap.GetBuffer(out pData, out frames, out flags, out dpos, out qpos) != 0) break;
+            if (cap.GetBuffer(out pData, out frames, out flags, out dpos, out qpos) != 0) { _wasapiLevel = 0f; break; }
             int nBytes = (int)(frames * 2);
             if (nBytes > 0) {
                 if ((flags & 2u) != 0 || pData == IntPtr.Zero) {
                     _wasapiLevel = 0f;
+                    Interlocked.Exchange(ref _wasapiLevelTick, (long)GetTickCount64());
                     int rem = nBytes;
                     while (rem > 0) { int chunk = Math.Min(rem, zeros.Length); dst.Write(zeros, 0, chunk); rem -= chunk; }
                 } else {
@@ -1030,17 +1031,18 @@ public static class VoiceWinShim {
                     Marshal.Copy(pData, scratch, 0, nBytes);
                     dst.Write(scratch, 0, nBytes);
                     _wasapiLevel = ComputePcm16RmsLevel(scratch, nBytes);
+                    Interlocked.Exchange(ref _wasapiLevelTick, (long)GetTickCount64());
                 }
             }
             cap.ReleaseBuffer(frames);
-            if (cap.GetNextPacketSize(out next) != 0) break;
+            if (cap.GetNextPacketSize(out next) != 0) { _wasapiLevel = 0f; break; }
         }
     }
 
     public static bool StartRecording(bool loopback, out string error) {
         int dummyBytes; string dummyErr;
         StopRecording(out dummyBytes, out dummyErr);
-        _wasapiLevel = 0f; _wasapiActive = true;
+        _wasapiLevel = 0f; Interlocked.Exchange(ref _wasapiLevelTick, 0L); _wasapiActive = true;
         ManualResetEvent initEvt = new ManualResetEvent(false);
         ManualResetEvent stopEvt = new ManualResetEvent(false);
         MemoryStream pcm = new MemoryStream(64000);
@@ -1074,6 +1076,7 @@ public static class VoiceWinShim {
                 _recErr = "wasapi_exc:" + ex.GetType().Name + ":" + ex.Message;
                 try { initEvt.Set(); } catch { }
             } finally {
+                _wasapiLevel = 0f;
                 if (started && client != null) { try { client.Stop(); } catch { } }
                 if (cap != null) { try { Marshal.ReleaseComObject(cap); } catch { } }
                 if (client != null) { try { Marshal.ReleaseComObject(client); } catch { } }
