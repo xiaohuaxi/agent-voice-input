@@ -95,7 +95,8 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 # - openai-compatible -> requires explicit base_url and model (loopback URLs require no API key)
 # - off               -> disable Stage 2 refinement
 provider = "codex"
-model = "gpt-6-luna"
+# Leave empty "" to use the selected provider's built-in default model above
+model = ""
 # Stage 2 thinking/reasoning budget:
 # "auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 effort = "low"
@@ -110,15 +111,13 @@ force_on_single_hop = false
 # -----------------------------------------------------------------------------
 # Quick Recipes (replace the [asr] / [refiner] values above as needed)
 # -----------------------------------------------------------------------------
-# Recipe 1 — OpenRouter single key (two-stage dedicated STT + fast refiner):
+# Recipe 1 — OpenRouter single key (two-stage dedicated STT + fast refiner, using built-in defaults):
 #   [asr]
 #   provider = "openrouter"
-#   model = "qwen/qwen3-asr-1.7b"
 #   [refiner]
 #   provider = "openrouter"
-#   model = "google/gemini-2.5-flash-lite"
 #
-# Recipe 2 — OpenRouter single key (single-hop multimodal audio + context):
+# Recipe 2 — OpenRouter single key (single-hop multimodal audio + context; skips Stage 2):
 #   [asr]
 #   provider = "openrouter"
 #   model = "google/gemini-2.5-flash"

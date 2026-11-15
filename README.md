@@ -1,206 +1,188 @@
-[English](README.md) | [简体中文](README.zh-CN.md)
+**English** | [简体中文](https://github.com/xiaohuaxi/agent-voice-input/blob/main/README.zh-CN.md)
 
 # agent-voice-input
 
-Context-aware voice input for CLI coding agents (such as **Codex**, **Claude Code**, and **Antigravity CLI / `agy`**).
+[![PyPI version](https://img.shields.io/pypi/v/agent-voice-input.svg)](https://pypi.org/project/agent-voice-input/)
+[![Python 3.10+](https://img.shields.io/pypi/pyversions/agent-voice-input.svg)](https://pypi.org/project/agent-voice-input/)
+[![CI](https://github.com/xiaohuaxi/agent-voice-input/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaohuaxi/agent-voice-input/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/xiaohuaxi/agent-voice-input/blob/main/LICENSE)
 
-Instead of treating terminal dictation like generic chat input, `agent-voice-input` pairs fast speech recognition with lightweight refinement grounded in your active coding session—fixing homophone identifiers, mixed Chinese–English technical terms, and spoken self-corrections before pasting safely into the terminal.
+**Context-aware voice input built specifically for CLI coding agents** (**Codex**, **Claude Code**, and **Antigravity CLI / `agy`**).
 
-> **Early Release (`v0.3.0`)**: Verified on **Windows Terminal + WSL2 (including `tmux` split panes and Remote Desktop)** and **macOS + Ghostty (including `tmux`)**. Broader terminal coverage is actively in progress.
+Generic OS dictation has no idea what files, symbols, or CLI flags exist in your repository. `agent-voice-input` automatically locates the active coding agent session in your focused terminal window or pane, pairs fast speech recognition with lightweight refinement grounded in your live dialogue + `git status` filenames, and fixes homophone identifiers, mixed-language technical terms, and mid-sentence self-corrections before pasting safely into your terminal:
+
+```text
+🎙️ What you say casually to your terminal:
+   "Check the default max duration seconds in platform w s l dot py, change it from
+    three minutes to five minutes—actually wait, make it ten minutes—and run unit tests
+    without piping to head"
+
+❌ Generic OS dictation:
+   Check the default max duration seconds in platform WSL dot pie, change it from 3 minutes to 5 minutes actually wait make it 10 minutes and run unit tests without piping to head
+
+✅ agent-voice-input (refined against your active Agent session & repo context, pasted without pressing Enter):
+   Check the default of max_duration_sec in platform_wsl.py, change it to 10 minutes, and run the unit tests without piping to head.
+```
+
+> Verified on **Windows Terminal + WSL2 (including Remote Desktop and `tmux`)** and **macOS + Ghostty (including `tmux`)**, with broader terminal coverage actively in progress.
 
 ---
 
-## How It Works
+## Why It Works Better for Coding Agents
 
-1. **Active Session Context**: Locates the foreground agent session—including the active pane inside `tmux` without editing `~/.tmux.conf` (via optional terminal/pane title tags, runtime session registry, Ghostty split `tty`/`cwd` matching on macOS, or `/proc` / `ps` root-session scanning while ignoring background subagents and sibling panes)—and incrementally extracts recent dialogue plus `git status` filenames as context.
-2. **Stage 1 — Speech Recognition**: Applies a local silence gate (`-50 dBFS`) and RMS loudness normalization (`-20 dBFS`), automatically splits recordings longer than 3 minutes (`180s`) at natural silent pauses for concurrent transcription, stashes failed recordings under `failed/` for `retry` recovery, and transcribes audio via built-in cloud or local-compatible providers (`dashscope`, `doubao`, `openrouter` dual-protocol STT & multimodal audio, `gemini`, `openai`, `groq`, `siliconflow`, or `openai-compatible`).
-3. **Stage 2 — Lightweight Context Refinement**: Cleans up technical terms, identifier casing, and explicit spoken self-corrections against the extracted session context. Defaults to local Codex CLI (`codex` with `gpt-6-luna`), and also supports `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, or `off` (automatically skipped when Stage 1 already performed single-hop multimodal refinement).
-4. **Focus-Safe Paste**: Shows recording/recognition/refinement stages in a non-activating bottom HUD pill (configurable to `"top"`; Windows & macOS, automatically matching Chinese or English desktop UI language), starts hotkey recordings only in terminal windows by default, locks onto the origin terminal window/split when recording begins, never auto-presses Enter, and falls back to clipboard-only if focus drifted elsewhere.
-5. **Zero Extra Python Dependencies**: Uses only the Python 3.10+ standard library plus host `ffmpeg` (built-in `powershell.exe` on WSL2; cached native `mac_shim.swift` helper via `/usr/bin/swiftc` on macOS).
+- **Grounded in Your Active Agent Session**: Automatically resolves the foreground agent session inside your active terminal window, Ghostty split, or `tmux` pane (zero `~/.tmux.conf` changes needed), incrementally extracting recent dialogue and `git status` paths as context while strictly ignoring background subagents and sibling splits.
+- **Provider-Driven Speech + Context Pipeline**: Pairs fast dedicated speech-to-text with a resident tool-free `codex` refiner by default, switches cleanly to any built-in cloud/local API provider, or runs single-hop multimodal audio + context refinement (Gemini / OpenRouter)—just pick a `provider` and its built-in default model applies automatically.
+- **Built for Long Developer Dictation**: Local silence gating and loudness normalization block empty triggers; supports up to 10-minute recordings by default (with a 15s HUD countdown), splits recordings over 3 minutes (`180s`) at natural pauses for concurrent transcription, alerts immediately if a mic is missing or unplugged, and stashes failed audio for `agent-voice-input retry` so long thoughts are never lost.
+- **Native HiDPI Waveform HUD & Focus-Safe Paste**: Non-activating floating capsule on both Windows (Per-Monitor V2 HiDPI) and macOS (Retina AppKit) displays live timer, waveform bars, and stage progress in English or Chinese matching your desktop locale. Locks onto the origin terminal window/split on record start, never auto-presses Enter, and falls back to clipboard if focus moved elsewhere.
+- **Zero Extra Python Dependencies**: Pure Python `>= 3.10` standard library plus host `ffmpeg` (uses built-in `powershell.exe` on WSL2; compiles and caches a native `mac_shim` helper via `/usr/bin/swiftc` on macOS).
 
 ---
 
 ## Quick Start
 
-### 1. Prerequisites
+### Option 1: Let Your Coding Agent Set It Up (Recommended)
+
+Copy and paste this prompt directly into **Codex**, **Claude Code**, or **AGY**:
+
+```text
+Please install and configure agent-voice-input (https://github.com/xiaohuaxi/agent-voice-input) for me:
+1. Check python3 (>=3.10) and ffmpeg (plus Xcode Command Line Tools `/usr/bin/swiftc` on macOS), then install via `uv tool install agent-voice-input` (or `pipx` if `uv` is unavailable).
+2. Check if an API key is already set in my environment (e.g. DASHSCOPE_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, GROQ_API_KEY); if not, ask which provider I want to use and write it to `~/.config/agent-voice-input/agent-voice-input.env` with chmod 600.
+3. If the `codex` CLI is not installed or logged in on this machine, set `[refiner] provider` in `~/.config/agent-voice-input/config.toml` to match my configured API provider (leave `model` unset so built-in defaults apply).
+4. Run `agent-voice-input doctor` to verify all checks pass, then start the background daemon with `agent-voice-input start`.
+```
+
+### Option 2: Manual Setup in 3 Steps
+
+**1. Prerequisites**
 
 - **Python** `>= 3.10`
-- **ffmpeg**:
-  - Ubuntu / WSL2: `sudo apt install ffmpeg`
-  - macOS: `brew install ffmpeg`
-- **macOS native hotkey & HUD helper** (recommended on macOS): Xcode Command Line Tools (`xcode-select --install`) providing `/usr/bin/swiftc`. `mac_shim.swift` is compiled idempotently and cached on first start; if `swiftc` is absent, `agent-voice-input` automatically falls back to CLI `toggle` / `once` commands.
+- **ffmpeg**: `sudo apt install ffmpeg` (Ubuntu / WSL2) or `brew install ffmpeg` (macOS)
+- **Xcode Command Line Tools** (recommended on macOS): `xcode-select --install` for `/usr/bin/swiftc` to compile and cache the native hotkey & HUD helper on first start (falls back to CLI `toggle` / `once` if absent).
 
-### 2. Install
+**2. Install**
 
 ```bash
 uv tool install agent-voice-input
-# Or with pipx / pip:
-# pipx install agent-voice-input
+# Or with pipx: pipx install agent-voice-input
 ```
 
-For local development from source:
+**3. Configure One Credential & Start**
 
-```bash
-git clone https://github.com/xiaohuaxi/agent-voice-input.git ~/repos/agent-voice-input
-mkdir -p ~/.local/bin
-ln -s ~/repos/agent-voice-input/bin/agent-voice-input ~/.local/bin/agent-voice-input
-```
-
-### 3. Configure Credentials
-
-Create `~/.config/agent-voice-input/agent-voice-input.env` (or export variables in your shell) with at least one provider key—for example, Alibaba Bailian (`DASHSCOPE_API_KEY`) or a single `OPENROUTER_API_KEY` covering both stages:
+Add at least one provider key to `~/.config/agent-voice-input/agent-voice-input.env` (for example `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `DASHSCOPE_API_KEY`):
 
 ```bash
 mkdir -p ~/.config/agent-voice-input && chmod 700 ~/.config/agent-voice-input
 cat > ~/.config/agent-voice-input/agent-voice-input.env <<'EOF'
-DASHSCOPE_API_KEY="<your-dashscope-api-key>"
+OPENROUTER_API_KEY="<your-openrouter-api-key>"
 EOF
 chmod 600 ~/.config/agent-voice-input/agent-voice-input.env
-```
 
-To customize hotkeys (`trigger_mode = "tap_toggle"` or `"ptt"`, `only_in_terminals = true | false`), HUD language & position (`[ui] language = "auto" | "zh" | "en"` and `position = "bottom" | "top"`, or `AGENT_VOICE_INPUT_UI_LANGUAGE` / `AGENT_VOICE_INPUT_UI_POSITION`), recording duration cap (`[audio] max_duration_sec = 600.0`, default 10 min with a 15s HUD countdown and normal auto-finish; `0` disables), macOS audio input (`[audio] macos_device = "default"` or `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`), providers, models, or Stage 2 refinement, copy [`config.example.toml`](config.example.toml) to `~/.config/agent-voice-input/config.toml` (see [`config.example.env`](config.example.env) for all credential variables).
-
-### 4. Verify & Run
-
-```bash
-# Check audio bridge, mac_shim/win_shim status, resolved providers/models, credentials, and session detection
+# Verify audio bridge, native shim, resolved providers/models, and session binding, then start daemon
 agent-voice-input doctor
-
-# Start background daemon (defaults to isolated Right Ctrl tap on WSL2 & macOS)
 agent-voice-input start
-
-# Other common commands
-agent-voice-input status
-agent-voice-input restart
-agent-voice-input toggle
-agent-voice-input once --duration 4 --dry-run
-agent-voice-input retry --list
-agent-voice-input stop
 ```
 
----
-
-## macOS + Ghostty Experience & Permissions
-
-On macOS with **Ghostty**, `agent-voice-input` works out of the box without terminal hooks or invasive input permissions:
-
-- **Terminal-Scoped Hotkey & Bottom Capsule HUD**: Tap Right Ctrl (`RControl`) to toggle recording—or set `trigger_mode = "ptt"` to hold-to-speak (enabled only in terminal windows by default via `[hotkey] only_in_terminals = true`, while stopping/canceling an active recording works from any app)—with a non-activating bottom HUD pill (or `[ui] position = "top"`) showing recording, recognition, and refinement progress in Chinese or English matching your desktop locale.
-- **Native Split Targeting & Anti-Drift Guard**: Locks onto the exact focused Ghostty split surface when recording starts and injects bracketed-paste text directly into that split without Accessibility synthetic keystrokes; if you switch splits or apps mid-transcription, it safely copies to the clipboard instead of pasting into the wrong target.
-- **Zero-Hook Split & `tmux` Session Binding**: Uses the focused Ghostty split's `tty` and `cwd` (and the attached client's active pane when inside `tmux`) to match the active `codex`, `claude`, or `agy` session in that pane, keeping multiple side-by-side splits isolated even without title hooks.
-- **Audio Input Selection**: Defaults to `[audio] macos_device = "default"` (system default microphone); override via `macos_device` in `config.toml` or `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE` (device index or name, inspectable via `agent-voice-input doctor`).
-- **macOS Permissions (TCC)**:
-  - **Microphone**: Required for your terminal / background Python environment so `ffmpeg` (`avfoundation`) can record audio.
-  - **Automation (Ghostty)**: Prompted once on first split query / text injection into Ghostty.
-  - **Accessibility & Input Monitoring**: **Not required** for the default `RControl` + Ghostty setup. Only needed when pasting into non-Ghostty apps via simulated `Cmd+V` (Accessibility) or when binding non-modifier hotkeys / running `agent-voice-input key-test` (Input Monitoring / Accessibility).
+> Tap **Right Ctrl** (`RControl`) inside your terminal to start and finish recording. To customize hotkeys (`trigger_mode = "ptt"`), HUD position (`bottom` / `top`), duration limits, or providers, copy [`config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml) to `~/.config/agent-voice-input/config.toml` (see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env) for all credential variables).
 
 ---
 
-## Configuration & Providers
+## Platform Experience
 
-Configuration uses a clean two-file layout (`CLI flags > AGENT_VOICE_INPUT_* env vars > config.toml > defaults`):
+### Windows Terminal + WSL2 (Including Remote Desktop & `tmux`)
 
-- **`~/.config/agent-voice-input/config.toml`**: Structured `[hotkey]`, `[ui]`, `[audio]`, `[asr]`, and `[refiner]` settings (`provider`, `model`, `api`, `effort`, `base_url`, `api_key_env`, etc.).
-- **`~/.config/agent-voice-input/agent-voice-input.env`**: API keys (and optional `AGENT_VOICE_INPUT_*` overrides).
+- **Terminal-Scoped Hotkey & HiDPI Capsule**: Isolated Right Ctrl tap toggles recording (chords like `RControl+C` pass through untouched; starts only when a terminal is focused, while stopping/canceling works from any app) with an anti-aliased Per-Monitor V2 HiDPI capsule above the taskbar.
+- **Native WASAPI Capture (Zero WSLg / RDP Glitches)**: Captures 16 kHz audio directly via Windows WASAPI in a resident `win_shim`, bypassing WSLg `RDPSource` zero-packet deadlocks; start/stop audio cues default to off to avoid 1–2s Remote Desktop audio wake-up lag.
+- **Zero-Config `tmux` Pane Resolution**: Automatically tracks the active pane of the attached `tmux` client without modifying `~/.tmux.conf`.
 
-### Structured `[asr]` & `[refiner]` Fields
+### macOS + Ghostty (Including `tmux`)
 
-- **`provider` & `model`**: `model` always keeps the upstream model ID verbatim (e.g. `"qwen/qwen3-asr-1.7b"` or `"google/gemini-2.5-flash"`). Leave `model = ""` to use the provider's built-in default. When `provider` is overridden at a higher-priority layer (env or CLI) without specifying `model`, any lower-layer `model` is cleared so the new provider's default model applies cleanly.
-- **`asr.api` (`"auto" | "audio-transcriptions" | "chat-completions"`)**:
-  - `"auto"` (default) uses native adapters for `dashscope`, `doubao`, and native `gemini`. On `openrouter`, `openai`, `groq`, `siliconflow`, and `openai-compatible`, it classifies known dedicated STT models (`qwen3-asr`, `whisper`, `*-transcribe`, `sensevoice`, `deepgram/*`, `assemblyai/*`, `elevenlabs/*`, etc.) to `"audio-transcriptions"` + Stage 2 refinement, and known multimodal audio models (`gemini-*`, `gpt-audio*`, `gpt-4o*audio*`, `*-omni*`, `mimo-*`, `voxtral-small*`, etc.) to `"chat-completions"` for single-hop transcription + context refinement (skipping Stage 2 by default unless `refiner.force_on_single_hop = true`). Note that `dashscope` `qwen3-asr-flash` uses a chat-compatible endpoint for pure STT and still runs Stage 2.
-  - When testing a newly released, uncataloged model on `openrouter`, set `asr.api = "audio-transcriptions"` or `"chat-completions"` explicitly.
-- **`asr.effort` & `refiner.effort`**: Unified reasoning/thinking control (`"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`). `asr.effort` defaults to `"auto"` (suppressing default thinking latency on supported multimodal models such as Gemini 2.5 while omitting reasoning fields on pure STT/non-reasoning audio models); `refiner.effort` defaults to `"low"`; `"default"` omits reasoning parameters completely.
+- **Native Retina HUD & Direct Split Injection**: Uses a cached native `mac_shim` for Right Ctrl tap/PTT and Retina capsule rendering; locks onto the exact focused Ghostty split surface when recording begins and injects bracketed-paste text directly without synthetic keystrokes (falling back to clipboard if focus moved).
+- **Zero-Hook Split & `tmux` Session Binding**: Reads the focused Ghostty split's `tty` and `cwd` (and active pane inside `tmux`) to bind directly to the `codex`, `claude`, or `agy` session running in that split; audio input defaults to system mic (`[audio] macos_device = "default"`).
+- **Minimal macOS Permissions (TCC)**: Requires only **Microphone** (for `ffmpeg`) and a one-time **Automation (Ghostty)** prompt; **Accessibility** and **Input Monitoring** are **not required** for the default `RControl` + Ghostty setup (only needed for fallback `Cmd+V` paste into non-Ghostty apps or non-modifier hotkeys).
+
+---
+
+## Configuration & Providers Reference
+
+Configuration uses two clean files (`CLI flags > AGENT_VOICE_INPUT_* env vars > config.toml > built-in defaults`):
+
+- **`~/.config/agent-voice-input/config.toml`**: Structured `[hotkey]`, `[ui]`, `[audio]`, `[asr]`, and `[refiner]` settings.
+- **`~/.config/agent-voice-input/agent-voice-input.env`**: API credentials (prefix-style aliases also supported; see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)).
+
+### How `provider`, `model`, and `asr.api` Work
+
+- **Provider-first defaults (`model` is optional)**: Leave `model = ""` (or omit it) in `[asr]` and `[refiner]` to automatically use the selected `provider`'s built-in default model. Overriding `provider` via env or CLI without specifying `model` cleanly resets any lower-layer `model` to the new provider's default. When explicitly set, `model` passes the upstream model ID verbatim.
+- **Two-stage STT vs. single-hop multimodal (`asr.api`)**:
+  - `asr.api = "auto"` (default) routes `dashscope`, `doubao`, and dedicated STT models (`qwen/qwen3-asr-1.7b`, `whisper-*`, `*-transcribe`, `SenseVoiceSmall`, etc.) through Stage 1 transcription + Stage 2 context refinement;
+  - Native `gemini` and multimodal chat-audio models on OpenRouter / OpenAI-compatible channels (`gemini-2.5-flash`, `google/gemini-2.5-flash`, `gpt-audio*`, etc.) perform transcription + context refinement in a single hop and skip Stage 2 automatically (unless `refiner.force_on_single_hop = true`). For newly released uncataloged models on `openrouter`, set `asr.api = "audio-transcriptions"` or `"chat-completions"` explicitly.
+- **Reasoning budget (`effort`)**: Accepts `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`. `asr.effort` defaults to `"auto"` (suppressing thinking latency on supported multimodal models); `refiner.effort` defaults to `"low"`.
 
 ### Built-in Providers
 
-| `provider` | Stages | Default `asr.model` | Default `refiner.model` | Recommended Credential Env |
+| `provider` | Stages | Built-in Default `asr.model` | Built-in Default `refiner.model` | Credential Source / Env |
 | :--- | :--- | :--- | :--- | :--- |
+| **`codex`** | `refiner` | — | `gpt-6-luna` | Local `codex` CLI login *(resident read-only tool-free session; never enables Fast mode)* |
 | **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` | `qwen-turbo-latest` | `DASHSCOPE_API_KEY` *(compat: `ALI_API_KEY`)* |
-| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` |
+| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` *(auto-probes granted slot)* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-1-6-flash` | `ARK_API_KEY` *(compat: `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
 | **`openrouter`** | `asr`, `refiner` | `qwen/qwen3-asr-1.7b` | `google/gemini-2.5-flash-lite` | `OPENROUTER_API_KEY` |
-| **`gemini`** | `asr`, `refiner` | `gemini-2.5-flash` | `gemini-2.5-flash-lite` | `GEMINI_API_KEY` |
+| **`gemini`** | `asr`, `refiner` | `gemini-2.5-flash` *(single-hop)* | `gemini-2.5-flash-lite` | `GEMINI_API_KEY` |
 | **`openai`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` | `gpt-4o-mini` | `OPENAI_API_KEY` |
 | **`groq`** | `asr`, `refiner` | `whisper-large-v3-turbo` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
 | **`siliconflow`** | `asr`, `refiner` | `FunAudioLLM/SenseVoiceSmall` | `Qwen/Qwen2.5-7B-Instruct` | `SILICONFLOW_API_KEY` |
-| **`codex`** | `refiner` | — | `gpt-6-luna` | Local `codex` CLI login *(never enables Fast mode)* |
-| **`openai-compatible`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` *(needs `base_url`)* | *(needs `base_url` + `model`)* | `api_key_env` or `OPENAI_API_KEY` *(loopback URLs need no key)* |
+| **`openai-compatible`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` *(needs `base_url`)* | *(needs explicit `base_url` + `model`)* | `api_key_env` or `OPENAI_API_KEY` *(loopback URLs need no key)* |
 
-- **Special values**:
-  - `asr.provider = "auto"` (default): selects the first configured credential in order `dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow`.
-  - `refiner.provider = "off"`: disables Stage 2 refinement.
-- Prefix-style credential aliases (`API_KEY_OPENROUTER`, `API_KEY_GEMINI`, `APP_ID_DOUBAO_ASR` + `API_KEY_DOUBAO_ASR`, etc.) are also supported; see [`config.example.env`](config.example.env).
+- `asr.provider = "auto"` (default): selects the first configured credential in order `dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow`.
+- `refiner.provider = "off"`: disables Stage 2 refinement.
 
----
-
-## Common Configuration Recipes (`config.toml`)
-
-### Recipe A — Low-Latency Mainland China Setup (`dashscope` + `codex` / `volcengine` / `dashscope`)
+### Common `config.toml` Recipes
 
 ```toml
+# Recipe 1: OpenRouter single key — two-stage dedicated STT + fast refiner (uses built-in defaults)
+[asr]
+provider = "openrouter"
+
+[refiner]
+provider = "openrouter"
+```
+
+```toml
+# Recipe 2: Single-hop multimodal audio + context refinement (OpenRouter or native Gemini; skips Stage 2)
+[asr]
+provider = "openrouter"          # Or set provider = "gemini" (with GEMINI_API_KEY, no model needed)
+model = "google/gemini-2.5-flash"
+effort = "auto"
+```
+
+```toml
+# Recipe 3: Low-latency Mainland China setup (DashScope STT + resident local Codex or API refiner)
 [asr]
 provider = "dashscope"
-model = "qwen3-asr-flash"
 
 [refiner]
-# Resident local Codex app-server (or switch provider to "volcengine" / "dashscope" for pure API refinement)
-provider = "codex"
-model = "gpt-6-luna"
-effort = "low"
-```
-
-### Recipe B — OpenRouter Single Key (Two-Stage Dedicated STT + Refiner)
-
-Uses `OPENROUTER_API_KEY` for both fast dedicated speech-to-text (`/audio/transcriptions`) and session-aware Stage 2 cleanup:
-
-```toml
-[asr]
-provider = "openrouter"
-model = "qwen/qwen3-asr-1.7b"
-
-[refiner]
-provider = "openrouter"
-model = "google/gemini-2.5-flash-lite"
-effort = "low"
-```
-
-### Recipe C — OpenRouter Single Key (Multimodal Single-Hop)
-
-Routes audio + session context in a single `/chat/completions` hop with anti-instruction-hijacking guards and automatically skips Stage 2:
-
-```toml
-[asr]
-provider = "openrouter"
-model = "google/gemini-2.5-flash"
-api = "auto"
-effort = "auto"
-```
-
-### Recipe D — Native Gemini Single-Hop or Ultra-Fast Groq Whisper
-
-```toml
-# Option 1: Native Google Gemini (:generateContent single-hop audio + context; skips Stage 2)
-[asr]
-provider = "gemini"
-model = "gemini-2.5-flash"
-effort = "auto"
-```
-
-```toml
-# Option 2: Groq Whisper STT + Groq Stage 2 Refiner
-[asr]
-provider = "groq"
-model = "whisper-large-v3-turbo"
-
-[refiner]
-provider = "groq"
-model = "llama-3.3-70b-versatile"
+provider = "codex"               # Or "dashscope" / "volcengine" if Codex CLI is not installed
 ```
 
 ---
 
-## CLI Flags & Environment Overrides
+## CLI Commands & Overrides
 
-Common runtime flags accepted across `daemon`, `start`, `restart`, `doctor`, `once`, `retry`, `status`, `toggle`, `stop`, and `key-test`:
+### Common Subcommands
+
+```bash
+agent-voice-input start                  # Start background daemon
+agent-voice-input restart                # Restart daemon after config changes
+agent-voice-input status                 # Inspect daemon state, last latency, and redacted errors
+agent-voice-input doctor                 # Check audio bridge, native shim, credentials, and session binding
+agent-voice-input retry --list           # List stashed failed recordings (`agent-voice-input retry` re-runs latest)
+agent-voice-input once --duration 4 --dry-run  # Record once and print result without pasting
+agent-voice-input toggle                 # Toggle recording start/stop from CLI
+agent-voice-input stop                   # Stop background daemon
+agent-voice-input key-test               # Inspect raw key scancodes / modifier events
+```
+
+### Runtime Flags & Environment Variables
 
 | CLI Flag | Env Override (`AGENT_VOICE_INPUT_*`) | Description |
 | :--- | :--- | :--- |
@@ -208,29 +190,31 @@ Common runtime flags accepted across `daemon`, `start`, `restart`, `doctor`, `on
 | `--asr`, `--asr-provider` | `AGENT_VOICE_INPUT_ASR_PROVIDER` | Stage 1 provider (`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`) |
 | `--asr-model` | `AGENT_VOICE_INPUT_ASR_MODEL` | Stage 1 upstream model ID |
 | `--asr-api` | `AGENT_VOICE_INPUT_ASR_API` | Stage 1 protocol (`auto`, `audio-transcriptions`, `chat-completions`) |
-| `--asr-effort` | `AGENT_VOICE_INPUT_ASR_EFFORT` | Stage 1 thinking budget (`auto`, `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) |
+| `--asr-effort` | `AGENT_VOICE_INPUT_ASR_EFFORT` | Stage 1 thinking budget |
 | `--refiner`, `--refiner-provider` | `AGENT_VOICE_INPUT_REFINER_PROVIDER` | Stage 2 provider (`codex`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`) |
 | `--refiner-model` | `AGENT_VOICE_INPUT_REFINER_MODEL` | Stage 2 upstream model ID |
-| `--refiner-effort`, `--effort` | `AGENT_VOICE_INPUT_REFINER_EFFORT` | Stage 2 thinking budget (`auto`, `default`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) |
+| `--refiner-effort`, `--effort` | `AGENT_VOICE_INPUT_REFINER_EFFORT` | Stage 2 thinking budget |
 
-*(Shorter `VOICE_INPUT_*` environment variable aliases are also accepted, alongside `AGENT_VOICE_INPUT_HOTKEY`, `AGENT_VOICE_INPUT_TRIGGER_MODE`, `AGENT_VOICE_INPUT_ONLY_IN_TERMINALS`, `AGENT_VOICE_INPUT_UI_LANGUAGE`, `AGENT_VOICE_INPUT_UI_POSITION`, `AGENT_VOICE_INPUT_MAX_DURATION_SEC`, `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`, `AGENT_VOICE_INPUT_ASR_BASE_URL`, `AGENT_VOICE_INPUT_REFINER_BASE_URL`, and `AGENT_VOICE_INPUT_FORCE_REFINE`.)*
+*(Also supports `AGENT_VOICE_INPUT_HOTKEY`, `AGENT_VOICE_INPUT_TRIGGER_MODE`, `AGENT_VOICE_INPUT_ONLY_IN_TERMINALS`, `AGENT_VOICE_INPUT_UI_LANGUAGE`, `AGENT_VOICE_INPUT_UI_POSITION`, `AGENT_VOICE_INPUT_MAX_DURATION_SEC`, `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`, and `VOICE_INPUT_*` short aliases.)*
 
-### Optional: Multi-Window & `tmux` Session Title Hooks
+### Optional: Multi-Window Session Title Hooks
 
-`tmux` active-pane detection works out of the box without modifying `~/.tmux.conf`. If you run multiple agent windows or panes side by side in the same directory on WSL2, inside `tmux`, or in terminals that do not expose per-split `tty`/`cwd`, see [`integrations/`](integrations/README.md) for optional terminal/pane title hooks (`agent-voice-input session-hook`) for Codex, Claude Code, and Antigravity CLI.
+Single-window setups, macOS + Ghostty splits, and `tmux` panes work out of the box with zero hooks. If you run multiple standalone terminal windows side by side in the **same project directory** on WSL2 or in terminals without per-split `tty`/`cwd` introspection, see [`integrations/`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.md) for optional lightweight session title hooks (`agent-voice-input session-hook`) for Codex, Claude Code, and Antigravity CLI.
 
 ---
 
 ## Development
 
 ```bash
+git clone https://github.com/xiaohuaxi/agent-voice-input.git ~/repos/agent-voice-input
+ln -sf ~/repos/agent-voice-input/bin/agent-voice-input ~/.local/bin/agent-voice-input
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 ## Acknowledgments
 
-Early exploration for this project was inspired by [`Einstellung/voice-asr`](https://github.com/Einstellung/voice-asr), particularly around pairing `Qwen3-ASR` with technical terminology context biasing for mixed Chinese–English speech, as well as pre-transcription silence gating and loudness normalization.
+Early exploration for this project was inspired by [`Einstellung/voice-asr`](https://github.com/Einstellung/voice-asr), particularly around pairing `Qwen3-ASR` with technical terminology context for mixed Chinese–English speech, as well as pre-transcription silence gating and loudness normalization.
 
 ## License
 
-[Apache-2.0 License](LICENSE)
+[Apache-2.0 License](https://github.com/xiaohuaxi/agent-voice-input/blob/main/LICENSE)
