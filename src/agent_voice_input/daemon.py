@@ -595,8 +595,24 @@ class VoiceInputDaemon:
     def handle_control(self, req: Mapping[str, Any]) -> dict[str, Any]:
         cmd = str(req.get("cmd") or "status")
         if cmd == "status":
+            shim_ok = not bool(getattr(self.platform, "_shim_disabled", False))
+            raw_shim_err = str(getattr(self.platform, "last_shim_error", "") or "")
+            shim_err = self._redact_str(raw_shim_err) if raw_shim_err else ""
             with self._lock:
-                return {"ok": True, "version": __version__, "pid": os.getpid(), "state": self.state, "seq_id": self.seq_id, "asr_provider": select_asr_provider(self.cfg, self.creds), "refiner_provider": self.cfg.refiner.provider, "last_result": dict(self.last_result)}
+                resp: dict[str, Any] = {
+                    "ok": True,
+                    "version": __version__,
+                    "pid": os.getpid(),
+                    "state": self.state,
+                    "seq_id": self.seq_id,
+                    "asr_provider": select_asr_provider(self.cfg, self.creds),
+                    "refiner_provider": self.cfg.refiner.provider,
+                    "shim_ok": shim_ok,
+                    "last_result": dict(self.last_result),
+                }
+                if shim_err:
+                    resp["shim_error"] = shim_err
+                return resp
         if cmd in ("toggle", "rec_start", "rec_stop"):
             win = _window_from_mapping(req) if any(req.get(k) for k in ("hwnd", "process", "title", "bundle_id", "surface_id", "tty", "cwd", "pid")) else None
             return self.handle_trigger({"toggle": "toggle", "rec_start": "ptt_start", "rec_stop": "ptt_stop"}[cmd], win, no_paste=bool(req.get("no_paste")), silent_hud=bool(req.get("silent_hud")), loopback=bool(req.get("loopback")))

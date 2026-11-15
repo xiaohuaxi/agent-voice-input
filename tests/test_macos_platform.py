@@ -32,6 +32,7 @@ from agent_voice_input.platform_macos import (  # noqa: E402
     MacOSPlatform,
     _APPLE_SEP,
     _GHOSTTY_INPUT_SCRIPT,
+    check_macos_clt_ready,
     compile_mac_shim,
     get_macos_cache_dir,
     is_macos_terminal_window,
@@ -1220,9 +1221,140 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn("contentsScale = scale", src)
         self.assertIn('obj["position"] as? String', src)
 
+    def test_macos_clt_check_first_run_progress_and_xcode_license_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cache_dir = tmp / "clt_cache"
+
+            # 1. DEVELOPER_DIR validation without invoking xcode-select
+            dev_dir = tmp / "FakeXcode.app" / "Contents" / "Developer"
+            dev_dir.mkdir(parents=True)
+            self.assertEqual(check_macos_clt_ready({"DEVELOPER_DIR": str(dev_dir)}), (True, ""))
+            ok_bad_dev, err_bad_dev = check_macos_clt_ready({"DEVELOPER_DIR": str(tmp / "missing_dev")})
+            self.assertFalse(ok_bad_dev)
+            self.assertIn("xcode-select --install", err_bad_dev)
+
+            # 2. Missing CLT when using /usr/bin/swiftc stub: NEVER invokes /usr/bin/swiftc (no GUI modal!)
+            fake_xs = tmp / "xcode-select"
+            fake_xs.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(2)\n", encoding="utf-8")
+            fake_xs.chmod(0o755)
+            subproc_calls: list[list[str]] = []
+
+            def spy_run(cmd, *a, **kw):
+                subproc_calls.append(list(cmd))
+                if Path(cmd[0]).name == "xcode-select":
+                    return subprocess.CompletedProcess(cmd, 2, "", "xcode-select: error: unable to get active developer directory\n")
+                raise AssertionError(f"/usr/bin/swiftc stub MUST NOT be invoked when CLT is missing: {cmd}")
+
+            err_buf = io.StringIO()
+            with (
+                mock.patch("agent_voice_input.platform_macos.os.path.isfile", side_effect=lambda p: p == str(fake_xs) or Path(p).is_file()),
+                mock.patch("agent_voice_input.platform_macos.os.access", return_value=True),
+                mock.patch("agent_voice_input.platform_macos.shutil.which", side_effect=lambda n, path=None: str(fake_xs) if n == "xcode-select" else None),
+                mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=spy_run),
+                mock.patch("sys.stderr", err_buf),
+            ):
+                b_clt, e_clt = compile_mac_shim(
+                    env={"HOME": str(tmp), "PATH": str(tmp)},
+                    cache_dir=cache_dir,
+                    swiftc_bin="/usr/bin/swiftc",
+                    announce=True,
+                )
+            self.assertIsNone(b_clt)
+            self.assertIn("xcode-select --install", e_clt)
+            self.assertIn("agent-voice-input restart", e_clt)
+            self.assertEqual(len(subproc_calls), 1)
+            self.assertEqual(Path(subproc_calls[0][0]).name, "xcode-select")
+            # No misleading "Compiling..." progress when CLT is missing
+            self.assertEqual(err_buf.getvalue(), "")
+
+            # 3. Cold compile with announce=True emits clear stderr progress once; warm cache hit stays silent
+            fake_swift = tmp / "prog_shim.swift"
+            fake_swift.write_text("// cold-compile-test\n", encoding="utf-8")
+            fake_swiftc = tmp / "prog_swiftc"
+            fake_swiftc.write_text(
+                f"#!{sys.executable}\n"
+                "import os, pathlib, sys\n"
+                "if 'UNACCEPTED_LICENSE' in os.environ:\n"
+                "    sys.stderr.write('Agreeing to the Xcode/iOS license requires admin privileges, please run \"sudo xcodebuild -license\"\\n')\n"
+                "    sys.exit(69)\n"
+                "out = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])\n"
+                "out.write_text('#!/bin/sh\\necho ok\\n', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fake_swiftc.chmod(0o755)
+
+            # Unaccepted Xcode license appends non-interactive `sudo xcodebuild -license accept` hint
+            b_lic, e_lic = compile_mac_shim(
+                env={"HOME": str(tmp), "UNACCEPTED_LICENSE": "1"},
+                cache_dir=cache_dir,
+                swift_source=fake_swift,
+                swiftc_bin=str(fake_swiftc),
+            )
+            self.assertIsNone(b_lic)
+            self.assertIn("sudo xcodebuild -license accept", e_lic)
+
+            cold_out, cold_err = io.StringIO(), io.StringIO()
+            with mock.patch("sys.stdout", cold_out), mock.patch("sys.stderr", cold_err):
+                b_cold, e_cold = compile_mac_shim(
+                    env={"HOME": str(tmp)},
+                    cache_dir=cache_dir,
+                    swift_source=fake_swift,
+                    swiftc_bin=str(fake_swiftc),
+                    announce=True,
+                )
+            self.assertIsNotNone(b_cold)
+            self.assertEqual(e_cold, "")
+            self.assertEqual(cold_out.getvalue(), "")
+            self.assertIn("Compiling native macOS helper (first run, may take 5-15s)", cold_err.getvalue())
+            self.assertIn("Native macOS helper ready", cold_err.getvalue())
+
+            warm_err = io.StringIO()
+            with mock.patch("sys.stderr", warm_err):
+                b_warm, e_warm = compile_mac_shim(
+                    env={"HOME": str(tmp)},
+                    cache_dir=cache_dir,
+                    swift_source=fake_swift,
+                    swiftc_bin=str(fake_swiftc),
+                    announce=True,
+                )
+            self.assertEqual(b_warm, b_cold)
+            self.assertEqual(e_warm, "")
+            self.assertEqual(warm_err.getvalue(), "")
+
+            # 4. _cmd_doctor clearly reports MISSING CLT when clt_ok is False
+            fake_probe_noclts = {
+                "avfoundation_ok": True,
+                "audio_devices": ["[0] Built-in Mic"],
+                "configured_audio_device": ":default",
+                "pbcopy_ok": True,
+                "tmux_active": False,
+                "clt_ok": False,
+                "clt_error": "Xcode Command Line Tools not installed",
+                "swiftc_ok": False,
+                "swiftc_bin": "/usr/bin/swiftc",
+                "mac_shim_ok": False,
+                "mac_shim_bin": "",
+                "mac_shim_error": "Xcode Command Line Tools not installed; run 'xcode-select --install'",
+                "fg_process": "Ghostty",
+                "fg_title": "zsh",
+                "permissions_hint": "Microphone -> terminal",
+            }
+            doc_buf = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(cli_mod, "probe_macos_host", return_value=fake_probe_noclts),
+                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("sys.stdout", doc_buf),
+            ):
+                cli_mod._cmd_doctor(Config(refiner=RefinerConfig(provider="off")), {"HOME": str(tmp), "DASHSCOPE_API_KEY": "sk-doc"})
+            self.assertIn("MISSING CLT (run 'xcode-select --install')", doc_buf.getvalue())
+
     @unittest.skipUnless(
-        sys.platform == "darwin" and bool(resolve_swiftc := (os.path.isfile("/usr/bin/swiftc") or shutil.which("swiftc"))),
-        "macOS swiftc required for native shim compile check",
+        sys.platform == "darwin"
+        and bool(os.path.isfile("/usr/bin/swiftc") or shutil.which("swiftc"))
+        and check_macos_clt_ready()[0],
+        "macOS swiftc + Xcode Command Line Tools required for native shim compile check",
     )
     def test_real_swiftc_compiles_mac_shim_and_passes_self_check(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -22,7 +22,7 @@ from .config import (
     select_asr_provider,
 )
 from .daemon import VoiceInputDaemon, create_platform, run_pipeline_once, send_control_command
-from .platform_macos import probe_macos_host, run_macos_key_test
+from .platform_macos import compile_mac_shim, probe_macos_host, run_macos_key_test
 from .platform_wsl import ForegroundWindow, is_wsl, probe_wsl_host, run_key_test
 from .refiner import find_codex_bin
 from .session_ctx import SessionTracker
@@ -94,7 +94,7 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
         print(f"[ffmpeg]    FAIL ({exc})")
         ok_all = False
     if sys.platform == "darwin":
-        m = probe_macos_host(cfg, env)
+        m = probe_macos_host(cfg, env, announce_compile=True)
         fg_title = str(m.get("fg_title") or "")
         fg_tty = str(m.get("fg_tty") or "")
         fg_cwd = str(m.get("fg_cwd") or "")
@@ -111,11 +111,14 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
             if m.get("mac_shim_ok")
             else f"WARN ({m.get('mac_shim_error') or 'unavailable'})"
         )
+        if m.get("swiftc_ok"):
+            swiftc_desc = f"OK ({m.get('swiftc_bin')})"
+        elif m.get("clt_ok") is False:
+            swiftc_desc = "MISSING CLT (run 'xcode-select --install')"
+        else:
+            swiftc_desc = "WARN (not found)"
         mac_ui_info = f" ui_lang={m.get('ui_lang')}" if m.get("ui_lang") else ""
-        print(
-            f"[mac-shim]  swiftc={'OK (' + str(m.get('swiftc_bin')) + ')' if m.get('swiftc_ok') else 'WARN (not found)'} "
-            f"shim={shim_desc}{mac_ui_info}"
-        )
+        print(f"[mac-shim]  swiftc={swiftc_desc} shim={shim_desc}{mac_ui_info}")
         if m.get("fg_surface_id"):
             print(
                 f"[macos-fg]  app={m.get('fg_process')!r} surface={m.get('fg_surface_id')} "
@@ -359,11 +362,52 @@ def _trim_log_file_if_needed(
         pass
 
 
-def _cmd_start(args: argparse.Namespace, env: dict[str, str]) -> int:
+def _read_redacted_log_tail(
+    log_path: Path,
+    start_offset: int,
+    env: Mapping[str, str],
+    *,
+    cfg: Config | None = None,
+    max_bytes: int = 2048,
+    max_lines: int = 12,
+) -> str:
+    """Read newly appended regular-file log lines since ``start_offset`` with secret redaction."""
+    try:
+        st = os.lstat(log_path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+            return ""
+        base = start_offset if 0 <= start_offset < st.st_size else max(0, st.st_size - max_bytes)
+        seek_pos = max(base, st.st_size - max(256, int(max_bytes)))
+        with open(log_path, "rb") as f:
+            if seek_pos > 0:
+                f.seek(seek_pos)
+            raw = f.read()
+        lines = [ln.rstrip() for ln in raw.decode("utf-8", errors="replace").splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        creds = resolve_credentials(cfg, env) if cfg is not None else None
+        extra = creds.all_secret_values() if creds is not None else ()
+        return redact_secrets("\n".join(lines[-max_lines:]), env, cfg=cfg, extra_secrets=extra)
+    except Exception:
+        return ""
+
+
+def _warn_degraded_shim(st: Mapping[str, Any]) -> None:
+    if st.get("shim_ok") is False and (se := str(st.get("shim_error") or "").strip()):
+        print(
+            f"[agent-voice-input] WARN: native hotkey/HUD helper unavailable ({se}); "
+            "CLI 'toggle'/'once' remain available.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | None = None) -> int:
     rt_dir = get_runtime_dir(env, create=True)
     has_overrides = any(getattr(args, attr, None) for _, attr in _CLI_OVERRIDE_FLAGS)
     try:
         if (st := send_control_command(rt_dir, {"cmd": "status"}, timeout_sec=1.0)).get("ok"):
+            _warn_degraded_shim(st)
             if has_overrides:
                 print(
                     f"already running (pid={st.get('pid')}, state={st.get('state')}); "
@@ -377,6 +421,17 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str]) -> int:
             return 0
     except Exception:
         pass
+    warned_shim = False
+    if sys.platform == "darwin":
+        shim_bin, pre_err = compile_mac_shim(env=env, cfg=cfg, announce=True)
+        if shim_bin is None and pre_err:
+            warned_shim = True
+            print(
+                f"[agent-voice-input] WARN: native hotkey/HUD helper unavailable ({pre_err}); "
+                "daemon will start in CLI-only mode ('toggle'/'once').",
+                file=sys.stderr,
+                flush=True,
+            )
     src_root = Path(__file__).resolve().parents[1]
     child_env = _sanitize_daemon_tmux_env(os.environ)
     if (src_root / "agent_voice_input").is_dir():
@@ -396,6 +451,11 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str]) -> int:
     ]
     log_path = rt_dir / "daemon.log"
     _trim_log_file_if_needed(log_path)
+    try:
+        st_before = os.lstat(log_path)
+        start_offset = st_before.st_size if stat.S_ISREG(st_before.st_mode) else 0
+    except OSError:
+        start_offset = 0
     fd = os.open(str(log_path), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as log_f:
@@ -411,9 +471,13 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str]) -> int:
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             print(f"daemon exited early (rc={proc.returncode}); check {log_path}", file=sys.stderr)
+            if diag := _read_redacted_log_tail(log_path, start_offset, env, cfg=cfg):
+                print(diag, file=sys.stderr)
             return 1
         try:
             if (st := send_control_command(rt_dir, {"cmd": "status"}, timeout_sec=0.5)).get("ok"):
+                if not warned_shim:
+                    _warn_degraded_shim(st)
                 print(f"started (pid={st.get('pid')})")
                 return 0
         except Exception:
@@ -520,10 +584,10 @@ def main(argv: list[str] | None = None) -> int:
             VoiceInputDaemon(cfg, env=_sanitize_daemon_tmux_env(env)).serve_forever()
             return 0
         if args.subcmd == "start":
-            return _cmd_start(args, env)
+            return _cmd_start(args, env, cfg=cfg)
         if args.subcmd == "restart":
             _cmd_stop(env)
-            return _cmd_start(args, env)
+            return _cmd_start(args, env, cfg=cfg)
         if args.subcmd == "stop":
             return _cmd_stop(env)
         if args.subcmd in ("status", "toggle"):

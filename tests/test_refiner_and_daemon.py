@@ -2477,7 +2477,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 mock.patch.object(
                     cli_mod,
                     "_cmd_start",
-                    side_effect=lambda a, _e: (call_seq.append(f"start:{getattr(a, 'asr', None)}") or 0),
+                    side_effect=lambda a, _e, **_kw: (call_seq.append(f"start:{getattr(a, 'asr', None)}") or 0),
                 ),
             ):
                 rc_restart = cli_mod.main(["restart", "--asr", "dashscope"])
@@ -2560,6 +2560,92 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             cli_mod._trim_log_file_if_needed(sym_log)
             self.assertTrue(sym_log.is_symlink())
             self.assertEqual(target_big.stat().st_size, len(big_payload))
+
+            # 5. Daemon `status` reports shim_ok & redacted shim_error; `_cmd_start` surfaces degraded shim & early-exit log tail
+            sec = "sk-super-secret-start-diag-token"
+            env_sec = {**env, "DASHSCOPE_API_KEY": sec}
+            plat_deg = _FakePlatform()
+            daemon_deg = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="off")),
+                env=env_sec,
+                runtime_dir=rt / "rt_status",
+                platform=plat_deg,
+                asr_provider=_FakeAsr(),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                st_ok = daemon_deg.handle_control({"cmd": "status"})
+                self.assertTrue(st_ok["shim_ok"])
+                self.assertNotIn("shim_error", st_ok)
+
+                plat_deg._shim_disabled = True  # type: ignore[attr-defined]
+                plat_deg.last_shim_error = f"Xcode CLT missing token={sec}"  # type: ignore[attr-defined]
+                st_deg = daemon_deg.handle_control({"cmd": "status"})
+                self.assertFalse(st_deg["shim_ok"])
+                self.assertIn("Xcode CLT missing", st_deg["shim_error"])
+                self.assertNotIn(sec, st_deg["shim_error"])
+            finally:
+                daemon_deg.close()
+
+            # `_cmd_start` when already running in degraded shim mode prints WARN to stderr
+            warn_out, warn_err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_mod,
+                    "send_control_command",
+                    return_value={
+                        "ok": True,
+                        "pid": 2468,
+                        "state": "idle",
+                        "shim_ok": False,
+                        "shim_error": "Xcode Command Line Tools not installed; run 'xcode-select --install'",
+                    },
+                ),
+                mock.patch("sys.stdout", warn_out),
+                mock.patch("sys.stderr", warn_err),
+            ):
+                self.assertEqual(cli_mod._cmd_start(parser.parse_args(["start"]), env_sec), 0)
+            self.assertIn("already running (pid=2468", warn_out.getvalue())
+            self.assertIn("xcode-select --install", warn_err.getvalue())
+
+            # `_cmd_start` on early exit prints ONLY newly appended daemon.log lines and redacts secrets
+            rt_early = root / "rt_early"
+            rt_early.mkdir()
+            early_log = rt_early / "daemon.log"
+            early_log.write_text("OLD_YESTERDAY_ERROR_MUST_NOT_SHOW\n", encoding="utf-8")
+
+            class _DeadProc:
+                pid = 77777
+                returncode = 1
+
+                def poll(self) -> int:
+                    return 1
+
+            def fake_early_popen(_cmd, *, stdout=None, stderr=None, **_kw):
+                assert stdout is not None
+                stdout.write(f"RuntimeError: Add-Type C# compile failed with key={sec}\n")
+                stdout.flush()
+                return _DeadProc()
+
+            early_err = io.StringIO()
+            with (
+                mock.patch.object(cli_mod, "send_control_command", side_effect=ConnectionRefusedError("down")),
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch.object(cli_mod.subprocess, "Popen", side_effect=fake_early_popen),
+                mock.patch("sys.stderr", early_err),
+            ):
+                rc_early = cli_mod._cmd_start(
+                    parser.parse_args(["start"]),
+                    {**env_sec, "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt_early)},
+                    cfg=Config(refiner=RefinerConfig(provider="off")),
+                )
+            self.assertEqual(rc_early, 1)
+            err_txt = early_err.getvalue()
+            self.assertIn("daemon exited early (rc=1)", err_txt)
+            self.assertIn("Add-Type C# compile failed", err_txt)
+            self.assertNotIn("OLD_YESTERDAY_ERROR_MUST_NOT_SHOW", err_txt)
+            self.assertNotIn(sec, err_txt)
 
 
 if __name__ == "__main__":

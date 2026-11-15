@@ -1,7 +1,7 @@
 """macOS native bridge: AVFoundation capture, Ghostty split-aware input, and mac_shim.swift hotkey/HUD."""
 from __future__ import annotations
 
-import hashlib, json, os, platform as py_platform, re, shutil, subprocess, threading, time
+import hashlib, json, os, platform as py_platform, re, shutil, subprocess, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -208,6 +208,45 @@ def resolve_swiftc_bin(env: Mapping[str, str] | None = None) -> str | None:
     return shutil.which("swiftc", path=src_env.get("PATH"))
 
 
+def check_macos_clt_ready(env: Mapping[str, str] | None = None) -> tuple[bool, str]:
+    """Verify Xcode Command Line Tools are installed without triggering Apple's GUI stub modal."""
+    src_env = os.environ if env is None else env
+    if dev_dir := (src_env.get("DEVELOPER_DIR") or "").strip():
+        if os.path.isdir(dev_dir):
+            return True, ""
+        return (
+            False,
+            f"DEVELOPER_DIR={dev_dir!r} does not exist (unset DEVELOPER_DIR or run 'xcode-select --install')",
+        )
+    xs_bin = (
+        "/usr/bin/xcode-select"
+        if (os.path.isfile("/usr/bin/xcode-select") and os.access("/usr/bin/xcode-select", os.X_OK))
+        else shutil.which("xcode-select", path=src_env.get("PATH"))
+    )
+    if not xs_bin:
+        return True, ""
+    try:
+        proc = subprocess.run(
+            [xs_bin, "-p"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=dict(src_env),
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"xcode-select check failed ({exc}); install Xcode Command Line Tools via 'xcode-select --install'"
+    dev_path = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not dev_path or not os.path.isdir(dev_path):
+        return (
+            False,
+            "Xcode Command Line Tools not installed; run 'xcode-select --install', complete the macOS installer, "
+            "then run 'agent-voice-input restart'",
+        )
+    return True, ""
+
+
 def compile_mac_shim(
     *,
     env: Mapping[str, str] | None = None,
@@ -215,6 +254,7 @@ def compile_mac_shim(
     swift_source: Path = MAC_SHIM_SCRIPT,
     swiftc_bin: str | None = None,
     cfg: Config | None = None,
+    announce: bool = False,
 ) -> tuple[Path | None, str]:
     src_env = os.environ if env is None else env
     if not swift_source.is_file():
@@ -240,12 +280,25 @@ def compile_mac_shim(
     if not eff_swiftc:
         return None, "swiftc not found (install Xcode Command Line Tools: xcode-select --install)"
 
+    # On bare macOS, /usr/bin/swiftc is an xcrun stub that pops up a GUI install modal if CLT is missing.
+    if eff_swiftc == "/usr/bin/swiftc":
+        clt_ok, clt_err = check_macos_clt_ready(src_env)
+        if not clt_ok:
+            return None, redact_secrets(clt_err, src_env, cfg=cfg)
+
     tmp_path = target_dir / f".{bin_name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
     mod_cache = ensure_secure_dir(target_dir / "swift-modcache")
     cmd = [
         eff_swiftc, "-O", "-parse-as-library", "-module-cache-path", str(mod_cache), str(swift_source),
         "-framework", "AppKit", "-framework", "ApplicationServices", "-o", str(tmp_path),
     ]
+    t0 = time.monotonic()
+    if announce:
+        print(
+            "[agent-voice-input] Compiling native macOS helper (first run, may take 5-15s)...",
+            file=sys.stderr,
+            flush=True,
+        )
     try:
         proc = subprocess.run(
             cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=dict(src_env), timeout=60, check=False
@@ -256,8 +309,19 @@ def compile_mac_shim(
 
     if proc.returncode != 0 or not tmp_path.is_file():
         tmp_path.unlink(missing_ok=True)
-        err_lines = " ".join((proc.stderr or proc.stdout or "").strip().splitlines())[-280:]
-        return None, redact_secrets(f"swiftc compile failed (rc={proc.returncode}): {err_lines or 'no output'}", src_env, cfg=cfg)
+        raw_out = (proc.stderr or proc.stdout or "").strip()
+        err_lines = " ".join(raw_out.splitlines())[-280:]
+        low = raw_out.lower()
+        hint = ""
+        if "license" in low and ("xcodebuild" in low or "agree" in low):
+            hint = " — run 'sudo xcodebuild -license accept'"
+        elif "xcode-select" in low or "no developer tools" in low or "unable to find utility" in low:
+            hint = " — run 'xcode-select --install'"
+        return None, redact_secrets(
+            f"swiftc compile failed (rc={proc.returncode}): {err_lines or 'no output'}{hint}",
+            src_env,
+            cfg=cfg,
+        )
 
     try:
         os.chmod(tmp_path, 0o700)
@@ -273,13 +337,19 @@ def compile_mac_shim(
                 item.unlink()
             except OSError:
                 pass
+    if announce:
+        print(
+            f"[agent-voice-input] Native macOS helper ready ({time.monotonic() - t0:.1f}s).",
+            file=sys.stderr,
+            flush=True,
+        )
     return bin_path, ""
 
 
 def run_macos_key_test(
     cfg: Config, seconds: int = 10, *, env: Mapping[str, str] | None = None, cache_dir: Path | None = None
 ) -> int:
-    bin_path, err = compile_mac_shim(env=env, cache_dir=cache_dir, cfg=cfg)
+    bin_path, err = compile_mac_shim(env=env, cache_dir=cache_dir, cfg=cfg, announce=True)
     if bin_path is None:
         raise RuntimeError(f"macOS key-test unavailable: {err}")
     cmd = [
@@ -308,13 +378,20 @@ def _summarize_osascript_error(stderr: str, *, kind: str) -> str:
     return f"{kind}_osascript_error({m.group(1)})" if m else f"{kind}_osascript_failed"
 
 
-def probe_macos_host(cfg: Config, env: Mapping[str, str] | None = None, *, cache_dir: Path | None = None) -> dict[str, Any]:
+def probe_macos_host(
+    cfg: Config,
+    env: Mapping[str, str] | None = None,
+    *,
+    cache_dir: Path | None = None,
+    announce_compile: bool = False,
+) -> dict[str, Any]:
     eff_env = dict(os.environ if env is None else env)
     audio_dev = resolve_macos_audio_device(cfg, eff_env)
     info: dict[str, Any] = {
         "avfoundation_ok": False, "audio_devices": [], "configured_audio_device": f":{audio_dev}",
         "pbcopy_ok": bool(shutil.which("pbcopy", path=eff_env.get("PATH"))),
         "tmux_active": bool(eff_env.get("TMUX")),
+        "clt_ok": True, "clt_error": "",
         "swiftc_ok": False, "swiftc_bin": "", "mac_shim_ok": False, "mac_shim_bin": "", "mac_shim_error": "",
         "fg_process": "", "fg_bundle_id": "", "fg_title": "", "fg_surface_id": "", "fg_tty": "", "fg_cwd": "", "fg_pid": 0,
         "permissions_hint": MACOS_PERMISSIONS_HINT,
@@ -331,9 +408,20 @@ def probe_macos_host(cfg: Config, env: Mapping[str, str] | None = None, *, cache
     except Exception as exc:
         info["av_error"] = redact_secrets(str(exc), eff_env, cfg=cfg)
 
-    if swiftc := resolve_swiftc_bin(eff_env):
-        info["swiftc_ok"], info["swiftc_bin"] = True, swiftc
-    shim_bin, shim_err = compile_mac_shim(env=eff_env, cache_dir=cache_dir, swiftc_bin=swiftc, cfg=cfg)
+    swiftc = resolve_swiftc_bin(eff_env)
+    if swiftc == "/usr/bin/swiftc":
+        clt_ok, clt_err = check_macos_clt_ready(eff_env)
+        info["clt_ok"] = clt_ok
+        if clt_err:
+            info["clt_error"] = redact_secrets(clt_err, eff_env, cfg=cfg)
+    else:
+        clt_ok = True
+    if swiftc:
+        info["swiftc_bin"] = swiftc
+        info["swiftc_ok"] = bool(clt_ok)
+    shim_bin, shim_err = compile_mac_shim(
+        env=eff_env, cache_dir=cache_dir, swiftc_bin=swiftc, cfg=cfg, announce=announce_compile
+    )
     ui_cult = ""
     if shim_bin is not None:
         info["mac_shim_bin"] = str(shim_bin)
@@ -415,7 +503,7 @@ class MacOSPlatform(JsonlShimMixin):
     def _build_shim_cmd(self) -> list[str] | None:
         if self._shim_cmd_factory is not None:
             return self._shim_cmd_factory()
-        bin_path, err = compile_mac_shim(env=self.env, cache_dir=self._cache_dir, cfg=self.cfg)
+        bin_path, err = compile_mac_shim(env=self.env, cache_dir=self._cache_dir, cfg=self.cfg, announce=True)
         if bin_path is None:
             self.last_shim_error = redact_secrets(err, self.env, cfg=self.cfg)
             return None
