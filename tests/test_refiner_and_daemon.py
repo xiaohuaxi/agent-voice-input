@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SRC_ROOT = _REPO_ROOT / "src"
@@ -1994,6 +1995,181 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(rc_r, 0)
             self.assertEqual(out_run.getvalue().strip(), "找回的 post-studio 长语音内容")
             self.assertEqual(list_failed_audios(rt), before_files)  # retry Neither deletes nor duplicates stashed WAVs!
+
+    def test_no_microphone_fail_fast_and_mid_recording_disconnect_recovery(self) -> None:
+        import subprocess
+        from agent_voice_input.hud import format_hud_text
+        from agent_voice_input.platform_macos import MacOSPlatform, probe_macos_host
+        from agent_voice_input.platform_wsl import FfmpegWavRecorder, NoMicrophoneError, WslPlatform
+
+        self.assertEqual(format_hud_text("no_mic", "zh"), "✕ 无可用麦克风")
+        self.assertEqual(format_hud_text("no_mic", "en"), "✕ No microphone found")
+        self.assertEqual(format_hud_text("mic_disconnected", "zh"), "✕ 麦克风已断开")
+        self.assertEqual(format_hud_text("mic_disconnected", "en"), "✕ Microphone disconnected")
+
+        # 1. MacOSPlatform + Daemon fail-fast on rc=251 ("Audio device not found"): immediate no_mic HUD + error beep!
+        no_dev_src = (
+            "import sys\n"
+            "sys.stderr.write('[AVFoundation indev] Audio device not found\\n')\n"
+            "sys.stderr.flush()\n"
+            "sys.exit(251)\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            hud_events: list[tuple[str, int]] = []
+            beeps: list[str] = []
+            mplat = MacOSPlatform(Config(), env={"HOME": td}, cache_dir=Path(td) / "cache", shim_cmd_factory=lambda: None)
+            mplat._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", no_dev_src])
+            mplat.hud = lambda st, text="", duration_ms=0: hud_events.append((st, duration_ms))  # type: ignore[method-assign]
+            mplat.beep = lambda kind: beeps.append(kind)  # type: ignore[method-assign]
+            mplat.resolve_foreground_window = lambda win=None: ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty")  # type: ignore[method-assign]
+
+            cfg_off = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg_off,
+                env={"HOME": td},
+                runtime_dir=rt,
+                platform=mplat,
+                asr_provider=_FakeAsr("unused"),
+                refiner=create_refiner(cfg_off),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                resp = daemon.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))
+                self.assertFalse(resp["ok"])
+                self.assertEqual(resp["state"], "idle")
+                self.assertEqual(resp.get("skipped_reason"), "no_mic")
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(daemon.last_result.get("skipped_reason"), "no_mic")
+                self.assertIn("Audio device not found", daemon.last_result.get("error", ""))
+                self.assertEqual(hud_events[-1], ("no_mic", 2200))
+                self.assertEqual(beeps, ["error"])  # never played 'start'!
+            finally:
+                daemon.close()
+
+            # 2. WSL2 WASAPI E_NOTFOUND (0x80070490) fails fast with NoMicrophoneError without dead pulse fallback
+            wplat = WslPlatform(Config(), env={})
+            wplat._use_winmm = True
+            wplat._shim_rpc = lambda req, timeout_sec=4.0: {"ok": False, "rec_error": "wasapi_endpoint_hr_0x80070490"}  # type: ignore[method-assign]
+            with self.assertRaises(NoMicrophoneError):
+                wplat.start_recording(rt)
+
+            # 3a. Mid-recording disconnect after 0.6s of pure silence (>= min_duration_sec, unvoiced):
+            # reports mic_disconnected HUD (2200ms) + single error beep (NOT 'empty' / double beep)!
+            short_drop_src = (
+                "import os, sys, time\n"
+                "os.write(1, (b'\\x00\\x00' * 9600))\n"  # 0.6s @ 16kHz pure silence before disconnect
+                "sys.stdout.flush()\n"
+                "time.sleep(0.06)\n"
+                "sys.stderr.write('Device unplugged\\n')\n"
+                "sys.exit(251)\n"
+            )
+            hud_short: list[tuple[str, int]] = []
+            beep_short: list[str] = []
+            mplat_short = MacOSPlatform(Config(), env={"HOME": td}, cache_dir=Path(td) / "cache_short", shim_cmd_factory=lambda: None)
+            mplat_short._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", short_drop_src])
+            mplat_short.hud = lambda st, text="", duration_ms=0: hud_short.append((st, duration_ms))  # type: ignore[method-assign]
+            mplat_short.beep = lambda kind: beep_short.append(kind)  # type: ignore[method-assign]
+            mplat_short.resolve_foreground_window = lambda win=None: ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty")  # type: ignore[method-assign]
+            daemon_short = VoiceInputDaemon(
+                cfg_off,
+                env={"HOME": td},
+                runtime_dir=rt,
+                platform=mplat_short,
+                asr_provider=_FakeAsr("unused"),
+                refiner=create_refiner(cfg_off),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                self.assertTrue(daemon_short.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))["ok"])
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon_short.state != "idle":
+                    time.sleep(0.02)
+                self.assertEqual(daemon_short.state, "idle")
+                self.assertEqual(daemon_short.last_result.get("skipped_reason"), "mic_disconnected")
+                self.assertEqual(hud_short[-1], ("mic_disconnected", 2200))
+                self.assertEqual(beep_short.count("error"), 1)
+                # User's instinctive 'stop' tap right after disconnect is absorbed once without wiping mic_disconnected HUD
+                daemon_short._last_trigger_ts = -1e9
+                r_abs = daemon_short.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))
+                self.assertEqual(r_abs.get("ignored"), "already_stopped")
+                self.assertEqual(hud_short[-1], ("mic_disconnected", 2200))
+            finally:
+                daemon_short.close()
+
+            # 3b. Mid-recording Bluetooth disconnect AFTER capturing 0.8s of speech:
+            # alerts user, absorbs user's instinctive 'stop' toggle while ASR is in-flight, AND pastes rescued speech!
+            mid_drop_src = (
+                "import os, sys, time\n"
+                "os.write(1, (b'\\xe8\\x0e\\x18\\xf1' * 6400))\n"  # 0.8s @ 16kHz s16le voiced audio
+                "sys.stdout.flush()\n"
+                "time.sleep(0.08)\n"
+                "sys.stderr.write('Input/output error\\n')\n"
+                "sys.exit(251)\n"
+            )
+            asr_entered = threading.Event()
+            release_asr = threading.Event()
+
+            class _SlowRescueAsr(_FakeAsr):
+                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                    asr_entered.set()
+                    release_asr.wait(timeout=2.0)
+                    return AsrResult("断麦前已说的前半段内容", "fake", "m", 15)
+
+            hud_mid: list[str] = []
+            beep_mid: list[str] = []
+            pasted_mid: list[str] = []
+            mplat2 = MacOSPlatform(Config(), env={"HOME": td}, cache_dir=Path(td) / "cache2", shim_cmd_factory=lambda: None)
+            mplat2._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", mid_drop_src])
+            mplat2.hud = lambda st, text="", duration_ms=0: hud_mid.append(st)  # type: ignore[method-assign]
+            mplat2.beep = lambda kind: beep_mid.append(kind)  # type: ignore[method-assign]
+            mplat2.resolve_foreground_window = lambda win=None: ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty")  # type: ignore[method-assign]
+            mplat2.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None: (pasted_mid.append(txt) or PasteOutcome(True, True, "ok", "Ghostty"))  # type: ignore[method-assign]
+
+            daemon2 = VoiceInputDaemon(
+                cfg_off,
+                env={"HOME": td},
+                runtime_dir=rt,
+                platform=mplat2,
+                asr_provider=_SlowRescueAsr(),
+                refiner=create_refiner(cfg_off),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                r_start = daemon2.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))
+                self.assertTrue(r_start["ok"])
+                self.assertTrue(asr_entered.wait(timeout=2.0))
+                # User presses toggle to "finish speaking" while rescue ASR is in-flight: must NOT supersede rescue!
+                daemon2._last_trigger_ts = -1e9
+                r_stop_tap = daemon2.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))
+                self.assertTrue(r_stop_tap["ok"])
+                self.assertEqual(r_stop_tap.get("ignored"), "already_stopped")
+                self.assertEqual(r_stop_tap["seq_id"], r_start["seq_id"])
+                release_asr.set()
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline and not pasted_mid:
+                    time.sleep(0.02)
+                self.assertEqual(pasted_mid, ["断麦前已说的前半段内容"])
+                self.assertEqual(daemon2.state, "idle")
+                self.assertEqual(beep_mid.count("error"), 1)
+                self.assertEqual(hud_mid[-1], "done")
+            finally:
+                release_asr.set()
+                daemon2.close()
+
+            # 4. probe_macos_host sets avfoundation_ok=False when zero audio input devices exist
+            empty_avf_out = "[AVFoundation indev @ 0x1] AVFoundation audio devices:\n[in#0] Error opening input\n"
+            with (
+                unittest.mock.patch("agent_voice_input.platform_macos.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                unittest.mock.patch(
+                    "agent_voice_input.platform_macos.subprocess.run",
+                    return_value=subprocess.CompletedProcess(["ffmpeg"], 1, "", empty_avf_out),
+                ),
+                unittest.mock.patch("agent_voice_input.platform_macos.compile_mac_shim", return_value=(None, "skip")),
+            ):
+                info = probe_macos_host(Config(), env={"HOME": td}, cache_dir=Path(td) / "c3")
+            self.assertEqual(info["audio_devices"], [])
+            self.assertFalse(info["avfoundation_ok"])
 
 
 if __name__ == "__main__":

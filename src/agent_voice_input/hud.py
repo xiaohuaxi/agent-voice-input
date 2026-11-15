@@ -68,6 +68,8 @@ _STATIC_HUD_COPY: dict[str, tuple[str, str]] = {
     "done": ("✓ 已填入", "✓ Inserted"),
     "copied": ("✓ 已复制(窗口已切换)", "✓ Copied (window switched)"),
     "empty": ("○ 未检测到语音", "○ No speech detected"),
+    "no_mic": ("✕ 无可用麦克风", "✕ No microphone found"),
+    "mic_disconnected": ("✕ 麦克风已断开", "✕ Microphone disconnected"),
 }
 
 

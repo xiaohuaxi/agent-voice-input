@@ -60,6 +60,10 @@ class PasteOutcome:
     pasted: bool; clipboard: bool; reason: str = "ok"; fg_process: str = ""
 
 
+class NoMicrophoneError(RuntimeError):
+    """Raised when no usable microphone / audio input device can be opened."""
+
+
 class FfmpegWavRecorder:
     def __init__(self, cmd_factory: Callable[[str, str], list[str]] | None = None) -> None:
         self._cmd_factory = cmd_factory
@@ -69,6 +73,8 @@ class FfmpegWavRecorder:
         self._err_reader: threading.Thread | None = None
         self._buf = bytearray()
         self._err_buf = bytearray()
+        self._stdout_eof = False
+        self._unexpected_exit_cb: Callable[[], None] | None = None
         self.last_stderr: str = ""
         self.last_returncode: int | None = None
 
@@ -91,30 +97,128 @@ class FfmpegWavRecorder:
             try: pipe.close()
             except Exception: pass
 
-    def start(self, fmt: str, source: str, runtime_dir: Path | None = None, env: Mapping[str, str] | None = None) -> None:
+    def _read_stdout(
+        self,
+        pipe: Any,
+        sink: bytearray,
+        startup_evt: threading.Event,
+        proc: subprocess.Popen[bytes],
+        err_reader: threading.Thread,
+        err_buf: bytearray,
+    ) -> None:
+        try:
+            while chunk := pipe.read(8192):
+                sink.extend(chunk)
+                if len(sink) >= 2 and not startup_evt.is_set():
+                    startup_evt.set()
+        except Exception:
+            pass
+        finally:
+            try: pipe.close()
+            except Exception: pass
+            startup_evt.set()
+            cb: Callable[[], None] | None = None
+            with self._lock:
+                if self._proc is proc:
+                    self._stdout_eof = True
+                still_active = self._proc is proc and self._unexpected_exit_cb is not None
+            if still_active:
+                try:
+                    rc = proc.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    rc = proc.poll()
+                err_reader.join(timeout=0.15)
+                with self._lock:
+                    if self._proc is proc and rc not in (None, 0):
+                        self.last_returncode = rc
+                        self.last_stderr = bytes(err_buf).decode("utf-8", errors="replace").strip()
+                        cb = self._unexpected_exit_cb
+                        self._unexpected_exit_cb = None
+            if cb is not None:
+                threading.Thread(target=cb, daemon=True).start()
+
+    def start(
+        self,
+        fmt: str,
+        source: str,
+        runtime_dir: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        *,
+        verify_startup: bool = False,
+        startup_timeout_sec: float = 0.35,
+        on_unexpected_exit: Callable[[], None] | None = None,
+    ) -> None:
         self.stop(drain_sec=0.0)
         buf, err_buf = bytearray(), bytearray()
+        startup_evt = threading.Event()
         self.last_stderr, self.last_returncode = "", None
         proc = subprocess.Popen(self._build_cmd(fmt, source), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True, env=dict(os.environ if env is None else env))
         assert proc.stdout is not None and proc.stderr is not None
-        reader = threading.Thread(target=self._read_pipe, args=(proc.stdout, buf, 0), daemon=True)
         err_reader = threading.Thread(target=self._read_pipe, args=(proc.stderr, err_buf, 512), daemon=True)
+        reader = threading.Thread(target=self._read_stdout, args=(proc.stdout, buf, startup_evt, proc, err_reader, err_buf), daemon=True)
+        with self._lock:
+            self._proc, self._reader, self._err_reader, self._buf, self._err_buf = proc, reader, err_reader, buf, err_buf
+            self._stdout_eof = False
+            self._unexpected_exit_cb = None
         try:
-            reader.start(); err_reader.start()
+            err_reader.start(); reader.start()
         except Exception:
+            with self._lock:
+                self._proc, self._reader, self._err_reader, self._buf, self._err_buf = None, None, None, bytearray(), bytearray()
+                self._stdout_eof = False
             try: proc.kill(); proc.wait(timeout=0.5)
             except Exception: pass
             for pipe in (proc.stdout, proc.stderr):
                 try: pipe.close()
                 except Exception: pass
             raise
-        with self._lock:
-            self._proc, self._reader, self._err_reader, self._buf, self._err_buf = proc, reader, err_reader, buf, err_buf
+
+        if verify_startup:
+            startup_evt.wait(timeout=max(0.02, float(startup_timeout_sec)))
+            with self._lock:
+                saw_eof = self._stdout_eof
+            if len(buf) < 2 and (saw_eof or proc.poll() is not None):
+                try:
+                    rc = proc.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    rc = proc.poll()
+                err_reader.join(timeout=0.15)
+                err_txt = bytes(err_buf).decode("utf-8", errors="replace").strip()
+                if rc not in (None, 0):
+                    self.stop(drain_sec=0.0)
+                    self.last_returncode = rc
+                    self.last_stderr = err_txt
+                    raise NoMicrophoneError(f"no microphone input device available ({self.diagnostic_summary()})")
+
+        if on_unexpected_exit is not None:
+            early_eof = False
+            with self._lock:
+                if self._proc is proc:
+                    if self._stdout_eof or proc.poll() is not None:
+                        early_eof = True
+                    else:
+                        self._unexpected_exit_cb = on_unexpected_exit
+            if early_eof:
+                try:
+                    rc = proc.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    rc = proc.poll()
+                err_reader.join(timeout=0.15)
+                should_fire = False
+                with self._lock:
+                    if self._proc is proc and rc not in (None, 0):
+                        self.last_returncode = rc
+                        self.last_stderr = bytes(err_buf).decode("utf-8", errors="replace").strip()
+                        should_fire = True
+                if should_fire:
+                    threading.Thread(target=on_unexpected_exit, daemon=True).start()
 
     def stop(self, *, drain_sec: float = 0.0) -> bytes:
         with self._lock:
             proc, reader, err_reader, buf, err_buf = self._proc, self._reader, self._err_reader, self._buf, self._err_buf
             self._proc, self._reader, self._err_reader, self._buf, self._err_buf = None, None, None, bytearray(), bytearray()
+            self._stdout_eof = False
+            self._unexpected_exit_cb = None
         if proc is None:
             return b""
         if drain_sec > 0.0 and proc.poll() is None:
@@ -129,9 +233,9 @@ class FfmpegWavRecorder:
                 except ProcessLookupError: pass
             try: proc.wait(timeout=wait_s); break
             except subprocess.TimeoutExpired: continue
-        if reader is not None:
+        if reader is not None and reader is not threading.current_thread():
             reader.join(timeout=1.0)
-        if err_reader is not None:
+        if err_reader is not None and err_reader is not threading.current_thread():
             err_reader.join(timeout=1.0)
         self.last_returncode = proc.returncode
         self.last_stderr = bytes(err_buf).decode("utf-8", errors="replace").strip()
@@ -508,7 +612,11 @@ class WslPlatform(JsonlShimMixin):
         self._use_winmm = self._primary_winmm
         self.last_audio_error = ""
         self._ff_rec, self._rec_mode = FfmpegWavRecorder(), ""
+        self._recorder_lost_cb: Callable[[], None] | None = None
         self._init_shim_bridge()
+
+    def set_recorder_lost_callback(self, cb: Callable[[], None] | None) -> None:
+        self._recorder_lost_cb = cb
 
     def _build_shim_cmd(self) -> list[str]:
         if self._shim_cmd_factory is not None:
@@ -548,14 +656,40 @@ class WslPlatform(JsonlShimMixin):
                 return
             err = str(res.get("rec_error") or "winmm rec_start failed")
             self.last_audio_error = err
+            if any(code in err.lower() for code in ("0x80070490", "0x80070005")):
+                raise NoMicrophoneError(f"no microphone input device available ({err})")
             if self.cfg.audio.wsl_source == "auto" and not eff_loopback:
                 self._rec_mode = "pulse"
-                self._ff_rec.start("pulse", self.pulse_source, runtime_dir, self.env)
+                try:
+                    self._ff_rec.start(
+                        "pulse",
+                        self.pulse_source,
+                        runtime_dir,
+                        self.env,
+                        verify_startup=True,
+                        on_unexpected_exit=self._recorder_lost_cb,
+                    )
+                except Exception:
+                    self._rec_mode = ""
+                    self.last_audio_error = self._ff_rec.diagnostic_summary() or err
+                    raise
                 return
-            raise RuntimeError(err)
+            raise NoMicrophoneError(f"no microphone input device available ({err})") if "wasapi_" in err.lower() else RuntimeError(err)
         self._rec_mode = "pulse"
         src = "RDPSink.monitor" if (eff_loopback and self.pulse_source == "RDPSource") else self.pulse_source
-        self._ff_rec.start("pulse", src, runtime_dir, self.env)
+        try:
+            self._ff_rec.start(
+                "pulse",
+                src,
+                runtime_dir,
+                self.env,
+                verify_startup=True,
+                on_unexpected_exit=self._recorder_lost_cb,
+            )
+        except Exception:
+            self._rec_mode = ""
+            self.last_audio_error = self._ff_rec.diagnostic_summary()
+            raise
 
     def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
         mode, self._rec_mode = self._rec_mode, ""

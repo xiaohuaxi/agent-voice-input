@@ -213,8 +213,8 @@ def _run_wav_or_live(
             src = audio_source
         else:
             assert plat is not None
-            print(f"Recording {duration:.1f}s ...", file=sys.stderr, flush=True)
             plat.start_recording(rt_dir)
+            print(f"Recording {duration:.1f}s ...", file=sys.stderr, flush=True)
             time.sleep(max(0.2, float(duration)))
             raw_wav, src = plat.stop_recording()
         try:

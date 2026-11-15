@@ -8,7 +8,7 @@ from typing import Any, Callable, Mapping
 from .audio_proc import resolve_ffmpeg_bin
 from .config import Config, ensure_secure_dir, expand_user_path, redact_secrets
 from .hud import resolve_ui_language
-from .platform_wsl import FfmpegWavRecorder, ForegroundWindow, JsonlShimMixin, PasteOutcome, stream_key_test_proc
+from .platform_wsl import FfmpegWavRecorder, ForegroundWindow, JsonlShimMixin, NoMicrophoneError, PasteOutcome, stream_key_test_proc
 
 GHOSTTY_BUNDLE_ID = "com.mitchellh.ghostty"
 MAC_SHIM_SCRIPT = Path(__file__).resolve().with_name("mac_shim.swift")
@@ -325,8 +325,9 @@ def probe_macos_host(cfg: Config, env: Mapping[str, str] | None = None, *, cache
             stdin=subprocess.DEVNULL, capture_output=True, text=True, env=eff_env, timeout=4, check=False,
         )
         combined = f"{p.stdout or ''}\n{p.stderr or ''}"
-        info["avfoundation_ok"] = "AVFoundation audio devices" in combined
-        info["audio_devices"] = parse_avfoundation_audio_devices(combined)
+        devs = parse_avfoundation_audio_devices(combined)
+        info["audio_devices"] = devs
+        info["avfoundation_ok"] = ("AVFoundation audio devices" in combined) and bool(devs)
     except Exception as exc:
         info["av_error"] = redact_secrets(str(exc), eff_env, cfg=cfg)
 
@@ -390,8 +391,12 @@ class MacOSPlatform(JsonlShimMixin):
         self._shim_cmd_factory = shim_cmd_factory
         self._ff_rec = FfmpegWavRecorder()
         self._recording = False
+        self._recorder_lost_cb: Callable[[], None] | None = None
         self.last_audio_error = ""
         self._init_shim_bridge()
+
+    def set_recorder_lost_callback(self, cb: Callable[[], None] | None) -> None:
+        self._recorder_lost_cb = cb
 
     def _which(self, name: str) -> str | None:
         return shutil.which(name, path=self.env.get("PATH")) if "PATH" in self.env else shutil.which(name)
@@ -534,7 +539,19 @@ class MacOSPlatform(JsonlShimMixin):
 
     def start_recording(self, runtime_dir: Path, *, loopback: bool = False) -> None:
         self.last_audio_error = ""
-        self._ff_rec.start("avfoundation", f":{self.audio_dev}", runtime_dir, self.env)
+        try:
+            self._ff_rec.start(
+                "avfoundation",
+                f":{self.audio_dev}",
+                runtime_dir,
+                self.env,
+                verify_startup=True,
+                on_unexpected_exit=self._recorder_lost_cb,
+            )
+        except Exception:
+            self._recording = False
+            self.last_audio_error = self._ff_rec.diagnostic_summary()
+            raise
         self._recording = True
 
     def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
