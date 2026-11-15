@@ -1,6 +1,6 @@
 # agent-voice-input example configuration
 # Default location: ~/.config/agent-voice-input/config.toml (also falls back to ~/.config/voice-input/config.toml)
-# Priority: CLI flags > AGENT_VOICE_INPUT_* env vars > config.toml > built-in defaults
+# Priority: CLI flags > config.toml > built-in defaults
 # Specify a custom config file via --config / AGENT_VOICE_INPUT_CONFIG
 
 [hotkey]
@@ -16,15 +16,12 @@ trigger_mode = "tap_toggle"
 # debounce_ms = 180
 # Start new hotkey recordings only when an allowed terminal window is focused (set false to allow triggering in any app;
 # stopping or canceling an active recording is never blocked even if focus moved away)
-# Can also be overridden via AGENT_VOICE_INPUT_ONLY_IN_TERMINALS (or VOICE_INPUT_ONLY_IN_TERMINALS)
 only_in_terminals = true
 
 [ui]
 # Desktop HUD pill language: "auto" (follows Windows UI language on WSL2 or desktop/POSIX locale on macOS/Linux; falls back to "en") | "zh" | "en"
-# Can also be overridden via AGENT_VOICE_INPUT_UI_LANGUAGE (or VOICE_INPUT_UI_LANGUAGE)
 language = "auto"
 # Desktop HUD pill vertical position: "bottom" (default, above Dock/taskbar) | "top"
-# Can also be overridden via AGENT_VOICE_INPUT_UI_POSITION (or VOICE_INPUT_UI_POSITION)
 position = "bottom"
 
 [audio]
@@ -35,12 +32,10 @@ position = "bottom"
 # min_duration_sec = 0.3
 # min_voiced_sec = 0.1
 # Maximum single recording duration in seconds (default 600s = 10 minutes; HUD shows countdown in the final 15s and auto-finishes transcription; set 0 to disable)
-# Can also be overridden via AGENT_VOICE_INPUT_MAX_DURATION_SEC (or VOICE_INPUT_MAX_DURATION_SEC)
 # max_duration_sec = 600.0
 # WSL2 capture source: "auto" (defaults to resident win_shim Windows WASAPI 16 kHz capture, avoiding WSLg RDPSource zero-packet deadlocks) | "wasapi" | "winmm" | "pulse"
 wsl_source = "auto"
 # macOS AVFoundation audio input device: "default" (system default mic) | device index e.g. "0" | device name
-# (can also be overridden via AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE)
 macos_device = "default"
 # Start/stop audio cue is disabled by default to avoid 1-2s RDP audio wake-up lag; enable locally if desired
 beep = false
@@ -83,7 +78,7 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 [refiner]
 # Stage 2 context-aware refinement provider:
 # "codex" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
-# Built-in default models (used when model = "" or when provider is overridden via CLI/env without a new model):
+# Built-in default models (used when model = "" or when provider is overridden via CLI without a new model):
 # - codex             -> "gpt-6-luna" (resident codex app-server in-memory thread; never enables Fast mode)
 # - dashscope         -> "qwen-turbo-latest"
 # - volcengine        -> "doubao-seed-1-6-flash"

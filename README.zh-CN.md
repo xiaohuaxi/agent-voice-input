@@ -104,14 +104,14 @@ agent-voice-input start
 
 ## 配置与渠道参考
 
-配置由两个文件组成，覆盖优先级为 `CLI 参数 > AGENT_VOICE_INPUT_* 环境变量 > config.toml > 内置默认值`：
+配置由两个文件组成，覆盖优先级为 `CLI 参数 > config.toml > 内置默认值`：
 
 - **`~/.config/agent-voice-input/config.toml`**：结构化配置 `[hotkey]`、`[ui]`、`[audio]`、`[asr]` 与 `[refiner]`。
 - **`~/.config/agent-voice-input/agent-voice-input.env`**：存放 API Key（兼容前缀别名，见 [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)）。
 
 ### `provider`、`model` 与工作模式约定
 
-- **按 Agent / `provider` 选择即可，`model` 默认留空自动匹配**：`[asr]` 与 `[refiner]` 中的 `model` 留空（`""` 或不填）时，自动采用所选 `provider` 的内置默认模型；通过环境变量或 CLI 切换 `provider` 且未显式指定 `model` 时，也会自动切回新渠道的默认模型，不会把旧渠道的模型名串过去。如需指定具体模型，原样填写该渠道的上游模型 ID 即可。
+- **按 Agent / `provider` 选择即可，`model` 默认留空自动匹配**：`[asr]` 与 `[refiner]` 中的 `model` 留空（`""` 或不填）时，自动采用所选 `provider` 的内置默认模型；通过 CLI 切换 `provider` 且未显式指定 `model` 时，也会自动切回新渠道的默认模型，不会把旧渠道的模型名串过去。如需指定具体模型，原样填写该渠道的上游模型 ID 即可。
 - **两阶段模式 vs 多模态单跳模式（`asr.api`）**：
   - 默认 `asr.api = "auto"` 会自动按渠道与模型选择协议：`dashscope`、`doubao` 与专用 STT 模型（如 `qwen/qwen3-asr-1.7b`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）走一阶段纯转写 + 二阶段语境精修；
   - 原生 `gemini` 以及 OpenRouter / OpenAI 兼容渠道下的多模态音频理解模型（如 `gemini-2.5-flash`、`google/gemini-2.5-flash`、`gpt-audio*`）自动将音频与会话上下文合并为单次请求一步完成转写与精修，并默认跳过二阶段（除非设置 `refiner.force_on_single_hop = true`）。在 `openrouter` 下使用未内置收录的新模型时，请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
@@ -181,20 +181,20 @@ agent-voice-input stop                   # 停止后台守护进程
 agent-voice-input key-test               # 测试按键扫描码与修饰键捕获
 ```
 
-### 核心 CLI 参数与环境变量
+### 核心 CLI 参数
 
-| CLI 参数 | 环境变量（`AGENT_VOICE_INPUT_*`） | 说明 |
-| :--- | :--- | :--- |
-| `--config PATH` | `AGENT_VOICE_INPUT_CONFIG` | 指定 `config.toml` 或 `config.json` 路径 |
-| `--asr`, `--asr-provider` | `AGENT_VOICE_INPUT_ASR_PROVIDER` | 一阶段渠道（`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`） |
-| `--asr-model` | `AGENT_VOICE_INPUT_ASR_MODEL` | 一阶段上游模型 ID |
-| `--asr-api` | `AGENT_VOICE_INPUT_ASR_API` | 一阶段协议（`auto`, `audio-transcriptions`, `chat-completions`） |
-| `--asr-effort` | `AGENT_VOICE_INPUT_ASR_EFFORT` | 一阶段思考档位 |
-| `--refiner`, `--refiner-provider` | `AGENT_VOICE_INPUT_REFINER_PROVIDER` | 二阶段渠道（`codex`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`） |
-| `--refiner-model` | `AGENT_VOICE_INPUT_REFINER_MODEL` | 二阶段上游模型 ID |
-| `--refiner-effort`, `--effort` | `AGENT_VOICE_INPUT_REFINER_EFFORT` | 二阶段思考档位 |
+| CLI 参数 | 说明 |
+| :--- | :--- |
+| `--config PATH` | 指定 `config.toml` 或 `config.json` 路径（亦可通过 `AGENT_VOICE_INPUT_CONFIG` 指定） |
+| `--asr`, `--asr-provider` | 一阶段渠道（`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`） |
+| `--asr-model` | 一阶段上游模型 ID |
+| `--asr-api` | 一阶段协议（`auto`, `audio-transcriptions`, `chat-completions`） |
+| `--asr-effort` | 一阶段思考档位 |
+| `--refiner`, `--refiner-provider` | 二阶段渠道（`codex`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`） |
+| `--refiner-model` | 二阶段上游模型 ID |
+| `--refiner-effort`, `--effort` | 二阶段思考档位 |
 
-*（同时支持 `AGENT_VOICE_INPUT_HOTKEY`、`AGENT_VOICE_INPUT_TRIGGER_MODE`、`AGENT_VOICE_INPUT_ONLY_IN_TERMINALS`、`AGENT_VOICE_INPUT_UI_LANGUAGE`、`AGENT_VOICE_INPUT_UI_POSITION`、`AGENT_VOICE_INPUT_MAX_DURATION_SEC`、`AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE` 等环境变量及 `VOICE_INPUT_*` 短前缀别名。）*
+*（环境变量用于存放各厂商凭据、引导路径 `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR` 及底层运行期诊断项；常规参数统一在 `config.toml` 中配置。）*
 
 ### 可选：多窗口并发会话标题钩子
 

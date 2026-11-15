@@ -134,7 +134,7 @@ class SimpleTomlParserTests(unittest.TestCase):
 
 
 class ConfigAndCredentialsTests(unittest.TestCase):
-    def test_config_precedence_cli_over_env_over_file_over_default(self) -> None:
+    def test_config_precedence_cli_over_file_over_default_and_ignores_ordinary_env_knobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             cfg_dir = home / ".config" / "voice-input"
@@ -161,8 +161,10 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            # Ordinary config env vars are ignored; config.toml and CLI overrides govern
             env = {
                 "HOME": str(home),
+                "AGENT_VOICE_INPUT_HOTKEY": "RAlt",
                 "VOICE_INPUT_HOTKEY": "RAlt",
                 "VOICE_INPUT_ASR_PROVIDER": "doubao",
             }
@@ -171,7 +173,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 home_dir=home,
                 cli_overrides={"asr.provider": "gemini", "hotkey.debounce_ms": None},
             )
-            self.assertEqual(cfg.hotkey.key, "RAlt")
+            self.assertEqual(cfg.hotkey.key, "F8")
             self.assertEqual(cfg.hotkey.trigger_mode, "ptt")
             self.assertEqual(cfg.hotkey.tap_max_ms, 900)
             self.assertEqual(cfg.hotkey.debounce_ms, 180)
@@ -179,6 +181,15 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg.asr.effective_model(), "gemini-2.5-flash")
             self.assertEqual(cfg.refiner.provider, "off")
             self.assertEqual(cfg.refiner.effort, "medium")
+
+            # AGENT_VOICE_INPUT_CONFIG path bootstrap env var still selects config file
+            alt_cfg = home / "custom.toml"
+            alt_cfg.write_text('[hotkey]\nkey = "F10"\n', encoding="utf-8")
+            cfg_alt, _ = load_config(
+                env={"HOME": str(home), "AGENT_VOICE_INPUT_CONFIG": str(alt_cfg)},
+                home_dir=home,
+            )
+            self.assertEqual(cfg_alt.hotkey.key, "F10")
 
     def test_falls_back_to_utf8_bom_json_and_parses_empty_env_inline_comments(self) -> None:
         env_parsed = parse_env_text(
@@ -228,7 +239,6 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 "HOME": str(home),
                 "DOUBAO_ASR_API_KEY": "caller_wins_val",
                 "AGENT_VOICE_INPUT_HOTKEY": "F9",
-                "VOICE_INPUT_HOTKEY": "F8",
                 "VOICE_INPUT_TRIGGER_MODE": "ptt",
             }
             merged = load_env_files(caller_env, home_dir=home)
@@ -240,9 +250,9 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             cfg, _ = load_config(env=caller_env, home_dir=home)
             self.assertEqual(cfg.audio.wsl_source, "wasapi")
             self.assertIs(cfg.audio.beep, True)
-            # AGENT_VOICE_INPUT_* takes precedence over VOICE_INPUT_*, while VOICE_INPUT_* still works as fallback
-            self.assertEqual(cfg.hotkey.key, "F9")
-            self.assertEqual(cfg.hotkey.trigger_mode, "ptt")
+            # Ordinary config env vars do not override defaults/config.toml
+            self.assertEqual(cfg.hotkey.key, "RControl")
+            self.assertEqual(cfg.hotkey.trigger_mode, "tap_toggle")
 
     def test_rejects_float_for_int_nonfinite_float_and_invalid_effort_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -262,24 +272,23 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             # All 9 canonical effort levels are accepted on both stages; bogus values raise ConfigError
             for valid_eff in ("auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"):
                 ok_cfg, _ = load_config(
-                    env={
-                        "HOME": str(home),
-                        "AGENT_VOICE_INPUT_ASR_EFFORT": valid_eff,
-                        "AGENT_VOICE_INPUT_REFINER_EFFORT": valid_eff,
-                    },
+                    env={"HOME": str(home)},
                     home_dir=home,
+                    cli_overrides={"asr.effort": valid_eff, "refiner.effort": valid_eff},
                 )
                 self.assertEqual(ok_cfg.asr.effort, valid_eff)
                 self.assertEqual(ok_cfg.refiner.effort, valid_eff)
             with self.assertRaises(ConfigError):
                 load_config(
-                    env={"HOME": str(home), "VOICE_INPUT_REFINER_EFFORT": "ultra"},
+                    env={"HOME": str(home)},
                     home_dir=home,
+                    cli_overrides={"refiner.effort": "ultra"},
                 )
             with self.assertRaises(ConfigError):
                 load_config(
-                    env={"HOME": str(home), "AGENT_VOICE_INPUT_ASR_EFFORT": "turbo"},
+                    env={"HOME": str(home)},
                     home_dir=home,
+                    cli_overrides={"asr.effort": "turbo"},
                 )
             with self.assertRaises(ConfigError):
                 load_config(
@@ -301,8 +310,9 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 )
             with self.assertRaises(ConfigError):
                 load_config(
-                    env={"HOME": str(home), "VOICE_INPUT_TAIL_DRAIN_SEC": "650"},
+                    env={"HOME": str(home)},
                     home_dir=home,
+                    cli_overrides={"audio.tail_drain_sec": 650.0},
                 )
 
     def test_beep_default_false_and_platform_adaptive_tail_drain_sec(self) -> None:
@@ -315,15 +325,18 @@ class ConfigAndCredentialsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
+            cfg_path = home / "config.toml"
+            cfg_path.write_text("[audio]\ntail_drain_sec = 0.0\n", encoding="utf-8")
             cfg_zero, _ = load_config(
-                env={"HOME": str(home), "VOICE_INPUT_TAIL_DRAIN_SEC": "0.0"},
+                config_path=cfg_path,
+                env={"HOME": str(home)},
                 home_dir=home,
             )
             self.assertEqual(cfg_zero.audio.tail_drain_sec, 0.0)
             self.assertEqual(cfg_zero.audio.effective_tail_drain_sec(macos=False), 0.0)
             self.assertEqual(cfg_zero.audio.effective_tail_drain_sec(macos=True), 0.0)
 
-    def test_max_duration_sec_config_env_precedence_and_validation(self) -> None:
+    def test_max_duration_sec_config_and_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             cfg_dir = home / ".config" / "agent-voice-input"
@@ -335,22 +348,20 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             cfg_toml, _ = load_config(env={"HOME": str(home)}, home_dir=home)
             self.assertEqual(cfg_toml.audio.max_duration_sec, 300.0)
 
-            # 0 disables max duration limit; legacy VOICE_INPUT_MAX_DURATION_SEC works and AGENT_VOICE_INPUT_MAX_DURATION_SEC wins
-            cfg_legacy, _ = load_config(
-                env={"HOME": str(home), "VOICE_INPUT_MAX_DURATION_SEC": "0"},
-                home_dir=home,
+            # 0 disables max duration limit via config.toml or cli_overrides
+            (cfg_dir / "config.toml").write_text(
+                "[audio]\nmax_duration_sec = 0\n",
+                encoding="utf-8",
             )
-            self.assertEqual(cfg_legacy.audio.max_duration_sec, 0.0)
+            cfg_zero, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(cfg_zero.audio.max_duration_sec, 0.0)
 
-            cfg_canon, _ = load_config(
-                env={
-                    "HOME": str(home),
-                    "AGENT_VOICE_INPUT_MAX_DURATION_SEC": "480.5",
-                    "VOICE_INPUT_MAX_DURATION_SEC": "120",
-                },
+            cfg_cli, _ = load_config(
+                env={"HOME": str(home), "AGENT_VOICE_INPUT_MAX_DURATION_SEC": "120"},
                 home_dir=home,
+                cli_overrides={"audio.max_duration_sec": 480.5},
             )
-            self.assertEqual(cfg_canon.audio.max_duration_sec, 480.5)
+            self.assertEqual(cfg_cli.audio.max_duration_sec, 480.5)
 
             for bad_override in (-0.1, -60, float("nan"), float("inf"), float("-inf")):
                 with self.subTest(bad_override=bad_override):
@@ -362,15 +373,14 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                         )
                     self.assertIn("audio.max_duration_sec must be >= 0", str(ctx.exception))
 
-            for bad_env in ("-1", "-0.01", "nan", "inf", "-inf", "abc"):
-                with self.subTest(bad_env=bad_env):
-                    with self.assertRaises(ConfigError) as ctx_env:
-                        load_config(
-                            env={"HOME": str(home), "AGENT_VOICE_INPUT_MAX_DURATION_SEC": bad_env},
-                            home_dir=home,
-                        )
-                    if bad_env != "abc":
-                        self.assertIn("audio.max_duration_sec must be >= 0", str(ctx_env.exception))
+            for bad_toml in ("-1", "-0.01", '"abc"', "true"):
+                with self.subTest(bad_toml=bad_toml):
+                    (cfg_dir / "config.toml").write_text(
+                        f"[audio]\nmax_duration_sec = {bad_toml}\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ConfigError):
+                        load_config(env={"HOME": str(home)}, home_dir=home)
 
     def test_credential_suffix_first_priority_and_strict_no_api_id_typo(self) -> None:
         cfg = Config()
@@ -782,29 +792,22 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 """,
                 encoding="utf-8",
             )
-            # 1. Env overrides provider without model -> resets inherited model to new provider default!
-            cfg_env, _ = load_config(
-                env={
-                    "HOME": str(home),
-                    "AGENT_VOICE_INPUT_ASR_PROVIDER": "openrouter",
-                    "AGENT_VOICE_INPUT_REFINER_PROVIDER": "openrouter",
-                },
-                home_dir=home,
-            )
-            self.assertEqual(cfg_env.asr.provider, "openrouter")
-            self.assertEqual(cfg_env.asr.model, "")
-            self.assertEqual(cfg_env.asr.effective_model(), "qwen/qwen3-asr-1.7b")
-            self.assertEqual(cfg_env.refiner.provider, "openrouter")
-            self.assertEqual(cfg_env.refiner.model, "google/gemini-2.5-flash-lite")
+            # 1. CLI overrides provider without model -> resets config.toml model/api to new provider default!
+            (cfg_dir / "config.toml").write_text(
+                """
+                [asr]
+                provider = "openrouter"
+                model = "google/gemini-2.5-flash"
+                api = "chat-completions"
 
-            # 2. CLI overrides provider without model -> resets env/TOML model to new provider default!
+                [refiner]
+                provider = "codex"
+                model = "gpt-6-luna"
+                """,
+                encoding="utf-8",
+            )
             cfg_cli, _ = load_config(
-                env={
-                    "HOME": str(home),
-                    "AGENT_VOICE_INPUT_ASR_PROVIDER": "openrouter",
-                    "AGENT_VOICE_INPUT_ASR_MODEL": "google/gemini-2.5-flash",
-                    "AGENT_VOICE_INPUT_ASR_API": "chat-completions",
-                },
+                env={"HOME": str(home)},
                 home_dir=home,
                 cli_overrides={
                     "asr.provider": "groq",
@@ -818,7 +821,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg_cli.refiner.provider, "volcengine")
             self.assertEqual(cfg_cli.refiner.model, "doubao-seed-1-6-flash")
 
-            # 3. Same-layer provider + explicit model preserves explicit model
+            # 2. Same-layer provider + explicit model preserves explicit model
             cfg_both, _ = load_config(
                 env={"HOME": str(home)},
                 home_dir=home,

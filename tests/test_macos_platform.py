@@ -77,13 +77,13 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertEqual(loaded_cfg.audio.macos_device, "1")
             self.assertEqual(resolve_macos_audio_device(loaded_cfg, {}), "1")
 
-            # AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE has highest priority over config.audio.macos_device
+            # Leading colon is stripped cleanly; ordinary *_MACOS_AUDIO_DEVICE env vars do not override config
             self.assertEqual(
                 resolve_macos_audio_device(loaded_cfg, {"AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE": "2"}),
-                "2",
+                "1",
             )
             self.assertEqual(
-                resolve_macos_audio_device(loaded_cfg, {"VOICE_INPUT_MACOS_AUDIO_DEVICE": ":MacBook Pro Mic"}),
+                resolve_macos_audio_device(Config(audio=AudioConfig(macos_device=":MacBook Pro Mic")), {}),
                 "MacBook Pro Mic",
             )
 
@@ -93,7 +93,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_config(config_path=bad_cfg, env={"HOME": str(home)}, home_dir=home)
 
-            # Verify MacOSPlatform.start_recording passes ':default' / ':<override>' to FfmpegWavRecorder
+            # Verify MacOSPlatform.start_recording passes ':default' / ':<configured>' to FfmpegWavRecorder
             seen_fmt_src: list[tuple[str, str]] = []
             plat_default = MacOSPlatform(Config(), env={"HOME": str(home)}, cache_dir=home / "cache")
             plat_default._ff_rec = FfmpegWavRecorder(
@@ -102,16 +102,16 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             plat_default.start_recording(home)
             plat_default.cancel_recording()
 
-            plat_env = MacOSPlatform(
-                Config(audio=AudioConfig(macos_device="1")),
-                env={"HOME": str(home), "AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE": "3"},
+            plat_cfg = MacOSPlatform(
+                Config(audio=AudioConfig(macos_device="3")),
+                env={"HOME": str(home)},
                 cache_dir=home / "cache",
             )
-            plat_env._ff_rec = FfmpegWavRecorder(
+            plat_cfg._ff_rec = FfmpegWavRecorder(
                 cmd_factory=lambda fmt, src: (seen_fmt_src.append((fmt, src)) or [sys.executable, "-c", "pass"])
             )
-            plat_env.start_recording(home)
-            plat_env.cancel_recording()
+            plat_cfg.start_recording(home)
+            plat_cfg.cancel_recording()
 
             self.assertEqual(seen_fmt_src, [("avfoundation", ":default"), ("avfoundation", ":3")])
 

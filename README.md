@@ -105,14 +105,14 @@ agent-voice-input start
 
 ## Configuration & Providers Reference
 
-Configuration uses two clean files (`CLI flags > AGENT_VOICE_INPUT_* env vars > config.toml > built-in defaults`):
+Configuration uses two clean files (`CLI flags > config.toml > built-in defaults`):
 
 - **`~/.config/agent-voice-input/config.toml`**: Structured `[hotkey]`, `[ui]`, `[audio]`, `[asr]`, and `[refiner]` settings.
 - **`~/.config/agent-voice-input/agent-voice-input.env`**: API credentials (prefix-style aliases also supported; see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)).
 
 ### How `provider`, `model`, and `asr.api` Work
 
-- **Provider-first defaults (`model` is optional)**: Leave `model = ""` (or omit it) in `[asr]` and `[refiner]` to automatically use the selected `provider`'s built-in default model. Overriding `provider` via env or CLI without specifying `model` cleanly resets any lower-layer `model` to the new provider's default. When explicitly set, `model` passes the upstream model ID verbatim.
+- **Provider-first defaults (`model` is optional)**: Leave `model = ""` (or omit it) in `[asr]` and `[refiner]` to automatically use the selected `provider`'s built-in default model. Overriding `provider` via CLI without specifying `model` cleanly resets any config-file `model` to the new provider's default. When explicitly set, `model` passes the upstream model ID verbatim.
 - **Two-stage STT vs. single-hop multimodal (`asr.api`)**:
   - `asr.api = "auto"` (default) routes `dashscope`, `doubao`, and dedicated STT models (`qwen/qwen3-asr-1.7b`, `whisper-*`, `*-transcribe`, `SenseVoiceSmall`, etc.) through Stage 1 transcription + Stage 2 context refinement;
   - Native `gemini` and multimodal chat-audio models on OpenRouter / OpenAI-compatible channels (`gemini-2.5-flash`, `google/gemini-2.5-flash`, `gpt-audio*`, etc.) perform transcription + context refinement in a single hop and skip Stage 2 automatically (unless `refiner.force_on_single_hop = true`). For newly released uncataloged models on `openrouter`, set `asr.api = "audio-transcriptions"` or `"chat-completions"` explicitly.
@@ -182,20 +182,20 @@ agent-voice-input stop                   # Stop background daemon
 agent-voice-input key-test               # Inspect raw key scancodes / modifier events
 ```
 
-### Runtime Flags & Environment Variables
+### Runtime CLI Flags
 
-| CLI Flag | Env Override (`AGENT_VOICE_INPUT_*`) | Description |
-| :--- | :--- | :--- |
-| `--config PATH` | `AGENT_VOICE_INPUT_CONFIG` | Path to `config.toml` or `config.json` |
-| `--asr`, `--asr-provider` | `AGENT_VOICE_INPUT_ASR_PROVIDER` | Stage 1 provider (`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`) |
-| `--asr-model` | `AGENT_VOICE_INPUT_ASR_MODEL` | Stage 1 upstream model ID |
-| `--asr-api` | `AGENT_VOICE_INPUT_ASR_API` | Stage 1 protocol (`auto`, `audio-transcriptions`, `chat-completions`) |
-| `--asr-effort` | `AGENT_VOICE_INPUT_ASR_EFFORT` | Stage 1 thinking budget |
-| `--refiner`, `--refiner-provider` | `AGENT_VOICE_INPUT_REFINER_PROVIDER` | Stage 2 provider (`codex`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`) |
-| `--refiner-model` | `AGENT_VOICE_INPUT_REFINER_MODEL` | Stage 2 upstream model ID |
-| `--refiner-effort`, `--effort` | `AGENT_VOICE_INPUT_REFINER_EFFORT` | Stage 2 thinking budget |
+| CLI Flag | Description |
+| :--- | :--- |
+| `--config PATH` | Path to `config.toml` or `config.json` (also supports `AGENT_VOICE_INPUT_CONFIG`) |
+| `--asr`, `--asr-provider` | Stage 1 provider (`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`) |
+| `--asr-model` | Stage 1 upstream model ID |
+| `--asr-api` | Stage 1 protocol (`auto`, `audio-transcriptions`, `chat-completions`) |
+| `--asr-effort` | Stage 1 thinking budget |
+| `--refiner`, `--refiner-provider` | Stage 2 provider (`codex`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`) |
+| `--refiner-model` | Stage 2 upstream model ID |
+| `--refiner-effort`, `--effort` | Stage 2 thinking budget |
 
-*(Also supports `AGENT_VOICE_INPUT_HOTKEY`, `AGENT_VOICE_INPUT_TRIGGER_MODE`, `AGENT_VOICE_INPUT_ONLY_IN_TERMINALS`, `AGENT_VOICE_INPUT_UI_LANGUAGE`, `AGENT_VOICE_INPUT_UI_POSITION`, `AGENT_VOICE_INPUT_MAX_DURATION_SEC`, `AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE`, and `VOICE_INPUT_*` short aliases.)*
+*(Environment variables are reserved for API credentials, bootstrap paths `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR`, and low-level runtime/diagnostic hooks; ordinary options live in `config.toml`.)*
 
 ### Optional: Multi-Window Session Title Hooks
 

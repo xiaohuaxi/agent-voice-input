@@ -24,7 +24,7 @@
 
 - `src/agent_voice_input/`：核心包实现及随包分发的 `win_shim.ps1`（运行时通过 `Path(__file__).resolve().with_name("win_shim.ps1")` 定位，改动打包配置时保持 `[tool.setuptools.package-data]` 与 `MANIFEST.in` 收录该文件）。
 - `bin/agent-voice-input`：源码直跑入口（便于本地软链开发）。当前运行时仅使用 Python 3.10+ 标准库与宿主机 `ffmpeg`（WSL2 下调用系统自带 `powershell.exe`）；非必要不引入第三方运行时包，确需新增时交维护者拍板并同步评估该直跑入口。
-- `config.example.toml`、`config.example.env`：公开配置与凭据模板。改动配置字段或凭据环境变量解析前先看 `src/agent_voice_input/config.py`（`CREDENTIAL_ENV_ORDER` 后缀风格优先、兼容前缀别名），并同步更新模板与 `README.md`、`README.zh-CN.md`。
+- `config.example.toml`、`config.example.env`：公开配置与凭据模板。常规参数收归 `config.toml`（及必要的 CLI 参数），不逐一镜像 `AGENT_VOICE_INPUT_*` 环境变量覆盖；环境变量只留给厂商凭据（`CREDENTIAL_ENV_ORDER` 后缀风格优先、兼容前缀别名）、引导路径（`AGENT_VOICE_INPUT_CONFIG`、`AGENT_VOICE_INPUT_RUNTIME_DIR`）及底层进程协作与诊断开关。改动配置字段或凭据解析前先看 `src/agent_voice_input/config.py`，并同步更新模板与 `README.md`、`README.zh-CN.md`。
 - `integrations/`：各 CLI Agent 的终端标题及会话注册接入示例；改动钩子或会话定位契约时，同步核对 `src/agent_voice_input/session_title.py` 与 `integrations/README.md`、`integrations/README.zh-CN.md`。
 - `tests/`：离线单元测试套件。
 - 后续平台适配细则、协议调研与阶段性设计文档统一放 `docs/` 按需查阅，不在本文件堆叠实现细节。

@@ -1715,37 +1715,20 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             c_false, _ = load_config(env={"HOME": str(home)}, home_dir=home)
             self.assertIs(c_false.hotkey.only_in_terminals, False)
 
-            for truthy in ("1", "true", "TRUE", "yes", "on"):
-                c_t, _ = load_config(
-                    env={"HOME": str(home), "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS": truthy},
-                    home_dir=home,
-                )
-                self.assertIs(c_t.hotkey.only_in_terminals, True)
-
-            (cfg_dir / "config.toml").write_text("[hotkey]\nonly_in_terminals = true\n", encoding="utf-8")
-            for falsy in ("0", "false", "FALSE", "no", "off"):
-                c_f, _ = load_config(
-                    env={"HOME": str(home), "VOICE_INPUT_ONLY_IN_TERMINALS": falsy},
-                    home_dir=home,
-                )
-                self.assertIs(c_f.hotkey.only_in_terminals, False)
-
-            # AGENT_VOICE_INPUT_ONLY_IN_TERMINALS beats VOICE_INPUT_ONLY_IN_TERMINALS
-            c_pref, _ = load_config(
-                env={
-                    "HOME": str(home),
-                    "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS": "true",
-                    "VOICE_INPUT_ONLY_IN_TERMINALS": "false",
-                },
+            # Ordinary *_ONLY_IN_TERMINALS env vars do not override config.toml; cli_overrides do
+            c_env_ignored, _ = load_config(
+                env={"HOME": str(home), "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS": "true"},
                 home_dir=home,
             )
-            self.assertIs(c_pref.hotkey.only_in_terminals, True)
+            self.assertIs(c_env_ignored.hotkey.only_in_terminals, False)
 
-            with self.assertRaises(ConfigError):
-                load_config(
-                    env={"HOME": str(home), "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS": "maybe"},
-                    home_dir=home,
-                )
+            c_cli_true, _ = load_config(
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={"hotkey.only_in_terminals": True},
+            )
+            self.assertIs(c_cli_true.hotkey.only_in_terminals, True)
+
             (cfg_dir / "config.toml").write_text("[hotkey]\nonly_in_terminals = 123\n", encoding="utf-8")
             with self.assertRaises(ConfigError):
                 load_config(env={"HOME": str(home)}, home_dir=home)

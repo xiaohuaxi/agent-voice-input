@@ -135,21 +135,7 @@ _SENSITIVE_ENV_NAME_RE = re.compile(
 )
 _NON_SECRET_ENV_NAMES = frozenset(
     {
-        "AGENT_VOICE_INPUT_HOTKEY",
-        "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS",
         "AGENT_VOICE_INPUT_TMUX_HINT",
-        "AGENT_VOICE_INPUT_UI_LANGUAGE",
-        "AGENT_VOICE_INPUT_UI_POSITION",
-        "AGENT_VOICE_INPUT_ASR_API",
-        "AGENT_VOICE_INPUT_ASR_API_KEY_ENV",
-        "AGENT_VOICE_INPUT_REFINER_API_KEY_ENV",
-        "VOICE_INPUT_HOTKEY",
-        "VOICE_INPUT_ONLY_IN_TERMINALS",
-        "VOICE_INPUT_UI_LANGUAGE",
-        "VOICE_INPUT_UI_POSITION",
-        "VOICE_INPUT_ASR_API",
-        "VOICE_INPUT_ASR_API_KEY_ENV",
-        "VOICE_INPUT_REFINER_API_KEY_ENV",
         "SSH_AUTH_SOCK",
     }
 )
@@ -1208,119 +1194,6 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.refiner.api_key_env = ""
 
 
-def _apply_env_overrides(cfg: Config, env: Mapping[str, str]) -> None:
-    def _get(*suffixes: str) -> tuple[str, str] | None:
-        for prefix in ("AGENT_VOICE_INPUT_", "VOICE_INPUT_"):
-            for sfx in suffixes:
-                name = f"{prefix}{sfx}"
-                val = env.get(name)
-                if val is not None and val.strip() != "":
-                    return name, val.strip()
-        return None
-
-    if (kv := _get("HOTKEY")) is not None:
-        cfg.hotkey.key = kv[1]
-    if (kv := _get("TRIGGER_MODE")) is not None:
-        cfg.hotkey.trigger_mode = kv[1].lower()
-    if (kv := _get("TAP_MAX_MS")) is not None:
-        cfg.hotkey.tap_max_ms = _as_int(kv[1], kv[0])
-    if (kv := _get("DEBOUNCE_MS")) is not None:
-        cfg.hotkey.debounce_ms = _as_int(kv[1], kv[0])
-    if (kv := _get("ONLY_IN_TERMINALS")) is not None:
-        cfg.hotkey.only_in_terminals = _as_bool(kv[1], kv[0])
-
-    if (kv := _get("UI_LANGUAGE")) is not None:
-        cfg.ui.language = normalize_ui_language(kv[1], kv[0])
-    if (kv := _get("UI_POSITION")) is not None:
-        cfg.ui.position = normalize_ui_position(kv[1], kv[0])
-
-    if (kv := _get("AUDIO_FLOOR_DBFS")) is not None:
-        cfg.audio.floor_dbfs = _as_float(kv[1], kv[0])
-    if (kv := _get("AUDIO_TARGET_DBFS")) is not None:
-        cfg.audio.target_dbfs = _as_float(kv[1], kv[0])
-    if (kv := _get("AUDIO_MAX_GAIN_DB")) is not None:
-        cfg.audio.max_gain_db = _as_float(kv[1], kv[0])
-    if (kv := _get("AUDIO_MIN_DURATION_SEC")) is not None:
-        cfg.audio.min_duration_sec = _as_float(kv[1], kv[0])
-    if (kv := _get("AUDIO_MIN_VOICED_SEC")) is not None:
-        cfg.audio.min_voiced_sec = _as_float(kv[1], kv[0])
-    if (kv := _get("MAX_DURATION_SEC", "AUDIO_MAX_DURATION_SEC")) is not None:
-        cfg.audio.max_duration_sec = _parse_max_duration_sec(kv[1], kv[0])
-    if (kv := _get("WSL_SOURCE")) is not None:
-        cfg.audio.wsl_source = kv[1].lower()
-    if (kv := _get("MACOS_AUDIO_DEVICE", "MACOS_DEVICE")) is not None:
-        cfg.audio.macos_device = kv[1]
-    if (kv := _get("BEEP")) is not None:
-        cfg.audio.beep = _as_bool(kv[1], kv[0])
-    if (kv := _get("TAIL_DRAIN_SEC", "AUDIO_TAIL_DRAIN_SEC")) is not None:
-        cfg.audio.tail_drain_sec = _as_float(kv[1], kv[0])
-
-    prev_asr_provider = cfg.asr.provider
-    asr_prov_kv = _get("ASR_PROVIDER")
-    asr_model_kv = _get("ASR_MODEL")
-    asr_api_kv = _get("ASR_API")
-    asr_url_kv = _get("ASR_BASE_URL")
-    asr_key_kv = _get("ASR_API_KEY_ENV")
-    if asr_prov_kv is not None:
-        cfg.asr.provider = asr_prov_kv[1].lower()
-        if cfg.asr.provider != prev_asr_provider:
-            if asr_model_kv is None:
-                cfg.asr.model = ""
-            if asr_api_kv is None:
-                cfg.asr.api = "auto"
-            if asr_url_kv is None:
-                cfg.asr.base_url = ""
-            if asr_key_kv is None:
-                cfg.asr.api_key_env = ""
-    if asr_model_kv is not None:
-        cfg.asr.model = asr_model_kv[1]
-    if asr_api_kv is not None:
-        cfg.asr.api = asr_api_kv[1].lower()
-    if (kv := _get("ASR_EFFORT")) is not None:
-        cfg.asr.effort = kv[1].lower()
-    if (kv := _get("ASR_RESOURCE_ID")) is not None:
-        cfg.asr.resource_id = kv[1]
-    if (kv := _get("ASR_DOUBAO_MODE")) is not None:
-        cfg.asr.doubao_mode = kv[1].lower()
-    if asr_url_kv is not None:
-        cfg.asr.base_url = asr_url_kv[1]
-    if asr_key_kv is not None:
-        cfg.asr.api_key_env = asr_key_kv[1]
-    if (kv := _get("HOTWORDS_FILE")) is not None:
-        cfg.asr.hotwords_file = kv[1]
-    if (kv := _get("ASR_TIMEOUT_SEC")) is not None:
-        cfg.asr.timeout_sec = _as_float(kv[1], kv[0])
-
-    prev_ref_provider = cfg.refiner.provider
-    ref_prov_kv = _get("REFINER_PROVIDER", "REFINER")
-    ref_model_kv = _get("REFINER_MODEL")
-    ref_url_kv = _get("REFINER_BASE_URL")
-    ref_key_kv = _get("REFINER_API_KEY_ENV")
-    if ref_prov_kv is not None:
-        cfg.refiner.provider = _normalize_refiner_provider(ref_prov_kv[1])
-        if cfg.refiner.provider != prev_ref_provider:
-            if ref_model_kv is None:
-                cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
-            if ref_url_kv is None:
-                cfg.refiner.base_url = ""
-            if ref_key_kv is None:
-                cfg.refiner.api_key_env = ""
-    if ref_model_kv is not None:
-        cfg.refiner.model = ref_model_kv[1]
-    if (kv := _get("REFINER_EFFORT")) is not None:
-        cfg.refiner.effort = kv[1].lower()
-    if ref_url_kv is not None:
-        cfg.refiner.base_url = ref_url_kv[1]
-    if ref_key_kv is not None:
-        cfg.refiner.api_key_env = ref_key_kv[1]
-    if (kv := _get("REFINER_MAX_TURNS")) is not None:
-        cfg.refiner.max_turns_per_thread = _as_int(kv[1], kv[0])
-    if (kv := _get("REFINER_TIMEOUT_SEC")) is not None:
-        cfg.refiner.timeout_sec = _as_float(kv[1], kv[0])
-    if (kv := _get("FORCE_REFINE")) is not None:
-        cfg.refiner.force_on_single_hop = _as_bool(kv[1], kv[0])
-
-
 def _expand_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     nested: dict[str, dict[str, Any]] = {}
     for k, v in cli_overrides.items():
@@ -1643,7 +1516,7 @@ def load_config(
     home_dir: str | Path | None = None,
     load_default_env_files: bool = True,
 ) -> tuple[Config, dict[str, str]]:
-    """Load merged ``(Config, merged_env)`` following CLI > AGENT_VOICE_INPUT_* > VOICE_INPUT_* > file > defaults."""
+    """Load merged ``(Config, merged_env)`` following CLI > config file > defaults."""
     effective_env = (
         load_env_files(env, env_paths=env_paths, home_dir=home_dir)
         if load_default_env_files
@@ -1688,8 +1561,6 @@ def load_config(
         file_data = _load_config_file(chosen_path)
         _apply_section_dict(cfg, file_data)
         cfg.config_path = str(chosen_path)
-
-    _apply_env_overrides(cfg, effective_env)
 
     if cli_overrides:
         _apply_section_dict(cfg, _expand_cli_overrides(cli_overrides))
@@ -1869,13 +1740,8 @@ def redact_secrets(
             if val and len(val.strip()) >= 4:
                 raw_secrets.add(val.strip())
 
-    # Follow configured custom API key env var pointers from env and Config
-    ptr_names: list[str] = [
-        (src_env.get("AGENT_VOICE_INPUT_ASR_API_KEY_ENV") or "").strip(),
-        (src_env.get("VOICE_INPUT_ASR_API_KEY_ENV") or "").strip(),
-        (src_env.get("AGENT_VOICE_INPUT_REFINER_API_KEY_ENV") or "").strip(),
-        (src_env.get("VOICE_INPUT_REFINER_API_KEY_ENV") or "").strip(),
-    ]
+    # Follow configured custom API key env var pointers from Config
+    ptr_names: list[str] = []
     if cfg is not None:
         ptr_names.append(cfg.asr.api_key_env.strip())
         ptr_names.append(cfg.refiner.api_key_env.strip())

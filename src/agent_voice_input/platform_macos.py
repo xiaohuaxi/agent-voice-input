@@ -151,13 +151,8 @@ def is_macos_terminal_window(process: str, bundle_id: str = "") -> bool:
 
 
 def resolve_macos_audio_device(cfg: Config, env: Mapping[str, str] | None = None) -> str:
-    src_env = os.environ if env is None else env
-    raw = (
-        src_env.get("AGENT_VOICE_INPUT_MACOS_AUDIO_DEVICE")
-        or src_env.get("VOICE_INPUT_MACOS_AUDIO_DEVICE")
-        or cfg.audio.macos_device
-        or "default"
-    ).strip()
+    del env
+    raw = (cfg.audio.macos_device or "default").strip()
     if raw.startswith(":"):
         raw = raw[1:].strip()
     return raw or "default"

@@ -90,41 +90,25 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             cfg_dir.mkdir(parents=True)
             (cfg_dir / "config.toml").write_text('[ui]\nlanguage = "zh-CN"\n', encoding="utf-8")
 
-            # File sets zh-CN -> normalized to 'zh'
-            cfg_file, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            # File sets zh-CN -> normalized to 'zh'; ordinary env vars do not override file
+            cfg_file, _ = load_config(
+                env={"HOME": str(home), "AGENT_VOICE_INPUT_UI_LANGUAGE": "en_US"},
+                home_dir=home,
+            )
             self.assertEqual(cfg_file.ui.language, "zh")
 
-            # VOICE_INPUT_UI_LANGUAGE overrides file; AGENT_VOICE_INPUT_UI_LANGUAGE overrides legacy prefix
-            cfg_legacy_env, _ = load_config(
-                env={"HOME": str(home), "VOICE_INPUT_UI_LANGUAGE": "en_US"},
-                home_dir=home,
-            )
-            self.assertEqual(cfg_legacy_env.ui.language, "en")
-
-            cfg_pref_env, _ = load_config(
-                env={
-                    "HOME": str(home),
-                    "AGENT_VOICE_INPUT_UI_LANGUAGE": "zh_TW",
-                    "VOICE_INPUT_UI_LANGUAGE": "en_US",
-                },
-                home_dir=home,
-            )
-            self.assertEqual(cfg_pref_env.ui.language, "zh")
-
-            # CLI override wins over env and file
+            # CLI override wins over file
             cfg_cli, _ = load_config(
-                env={"HOME": str(home), "AGENT_VOICE_INPUT_UI_LANGUAGE": "zh"},
+                env={"HOME": str(home)},
                 home_dir=home,
                 cli_overrides={"ui.language": "en-GB"},
             )
             self.assertEqual(cfg_cli.ui.language, "en")
 
-            # Invalid env or unknown [ui] key raises ConfigError
+            # Invalid language in config.toml or unknown [ui] key raises ConfigError
+            (cfg_dir / "config.toml").write_text('[ui]\nlanguage = "fr-FR"\n', encoding="utf-8")
             with self.assertRaises(ConfigError):
-                load_config(
-                    env={"HOME": str(home), "AGENT_VOICE_INPUT_UI_LANGUAGE": "fr-FR"},
-                    home_dir=home,
-                )
+                load_config(env={"HOME": str(home)}, home_dir=home)
             (cfg_dir / "config.toml").write_text('[ui]\nunknown_opt = "en"\n', encoding="utf-8")
             with self.assertRaises(ConfigError):
                 load_config(env={"HOME": str(home)}, home_dir=home)
@@ -152,48 +136,30 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             cfg_def, _ = load_config(env={"HOME": str(home)}, home_dir=home)
             self.assertEqual(cfg_def.ui.position, "bottom")
 
-            # TOML sets 'top'
+            # TOML sets 'top'; ordinary env vars are ignored
             (cfg_dir / "config.toml").write_text('[ui]\nposition = "TOP"\n', encoding="utf-8")
-            cfg_top, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            cfg_top, _ = load_config(
+                env={"HOME": str(home), "AGENT_VOICE_INPUT_UI_POSITION": "bottom"},
+                home_dir=home,
+            )
             self.assertEqual(cfg_top.ui.position, "top")
 
-            # Env overrides TOML; AGENT_VOICE_INPUT_UI_POSITION beats VOICE_INPUT_UI_POSITION
-            cfg_legacy, _ = load_config(
-                env={"HOME": str(home), "VOICE_INPUT_UI_POSITION": "bottom"},
-                home_dir=home,
-            )
-            self.assertEqual(cfg_legacy.ui.position, "bottom")
-
-            cfg_pref, _ = load_config(
-                env={
-                    "HOME": str(home),
-                    "AGENT_VOICE_INPUT_UI_POSITION": "top",
-                    "VOICE_INPUT_UI_POSITION": "bottom",
-                },
-                home_dir=home,
-            )
-            self.assertEqual(cfg_pref.ui.position, "top")
-
-            # CLI override beats env and TOML
+            # CLI override beats TOML
             cfg_cli, _ = load_config(
-                env={"HOME": str(home), "AGENT_VOICE_INPUT_UI_POSITION": "top"},
+                env={"HOME": str(home)},
                 home_dir=home,
                 cli_overrides={"ui.position": "bottom"},
             )
             self.assertEqual(cfg_cli.ui.position, "bottom")
 
+            (cfg_dir / "config.toml").write_text('[ui]\nposition = "middle"\n', encoding="utf-8")
             with self.assertRaises(ConfigError):
-                load_config(
-                    env={"HOME": str(home), "AGENT_VOICE_INPUT_UI_POSITION": "middle"},
-                    home_dir=home,
-                )
+                load_config(env={"HOME": str(home)}, home_dir=home)
 
         # Ensure non-secret env vars never cause redact_secrets to mask 'bottom'/'top'/'true'/'false'
         non_sec_env = {
-            "AGENT_VOICE_INPUT_UI_POSITION": "bottom",
-            "VOICE_INPUT_UI_POSITION": "top",
-            "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS": "true",
-            "VOICE_INPUT_ONLY_IN_TERMINALS": "false",
+            "AGENT_VOICE_INPUT_TMUX_HINT": "/tmp/tmux-1000/default,123,0",
+            "AGENT_VOICE_INPUT_RUNTIME_DIR": "/tmp/rt",
         }
         sample = "hud position=bottom or top, only_in_terminals=true or false"
         self.assertEqual(redact_secrets(sample, non_sec_env), sample)
@@ -213,33 +179,13 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertEqual(resolve_ui_language("auto", env=wsl_zh_env, win_ui_culture="ja-JP"), "en")
         self.assertEqual(resolve_ui_language("auto", env=wsl_zh_env, win_ui_culture=""), "en")
 
-        # Explicit config or *_UI_LANGUAGE env always wins over Windows UI culture
+        # Explicit config always wins over Windows UI culture; ordinary *_UI_LANGUAGE env is ignored
         self.assertEqual(resolve_ui_language("en", env=wsl_c_env, win_ui_culture="zh-CN"), "en")
         self.assertEqual(resolve_ui_language("zh-CN", env=wsl_en_env, win_ui_culture="en-US"), "zh")
         self.assertEqual(
             resolve_ui_language(
                 "auto",
                 env={"LANG": "C.UTF-8", "AGENT_VOICE_INPUT_UI_LANGUAGE": "en_US"},
-                win_ui_culture="zh-CN",
-            ),
-            "en",
-        )
-        self.assertEqual(
-            resolve_ui_language(
-                "auto",
-                env={"LANG": "en_US.UTF-8", "VOICE_INPUT_UI_LANGUAGE": "zh_CN"},
-                win_ui_culture="en-US",
-            ),
-            "zh",
-        )
-        # AGENT_VOICE_INPUT_UI_LANGUAGE=auto takes precedence over legacy VOICE_INPUT_UI_LANGUAGE=en
-        self.assertEqual(
-            resolve_ui_language(
-                "auto",
-                env={
-                    "AGENT_VOICE_INPUT_UI_LANGUAGE": "auto",
-                    "VOICE_INPUT_UI_LANGUAGE": "en",
-                },
                 win_ui_culture="zh-CN",
             ),
             "zh",
@@ -431,8 +377,8 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(override_en_cmds[0].get("text"), "● Listening… (press Right Ctrl to finish)")
 
             override_zh_cmds = _run_hud_scenario(
-                cfg=Config(ui=UiConfig(position="top")),
-                env={"LANG": "C.UTF-8", "AGENT_VOICE_INPUT_UI_LANGUAGE": "zh-TW"},
+                cfg=Config(ui=UiConfig(language="zh", position="top")),
+                env={"LANG": "C.UTF-8"},
                 ready_ui_culture="en-US",
                 calls=[("recording", "", 0), ("hide", "", 0)],
             )

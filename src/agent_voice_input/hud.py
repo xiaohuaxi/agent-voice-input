@@ -119,14 +119,6 @@ def resolve_ui_language(
         norm = normalize_ui_language(configured, "ui.language")
         if norm != "auto":
             return norm
-    for prefix in ("AGENT_VOICE_INPUT_", "VOICE_INPUT_"):
-        var_name = f"{prefix}UI_LANGUAGE"
-        val = src_env.get(var_name)
-        if val is not None and val.strip() != "":
-            norm_env = normalize_ui_language(val, var_name)
-            if norm_env != "auto":
-                return norm_env
-            break
 
     if win_ui_culture is not None:
         return "zh" if is_zh_locale(win_ui_culture) else "en"
