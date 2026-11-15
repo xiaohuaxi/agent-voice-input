@@ -21,17 +21,23 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
-public struct ShimEvent { public string Kind, Process, Title; public uint Vk, Scan; public bool Extended, IsDown, Tainted; public long Hwnd; public ulong TsMs; }
+public struct ShimEvent { public string Kind, Process, Title, Reason; public uint Vk, Scan; public bool Extended, IsDown, Tainted; public long Hwnd, RecGen; public ulong TsMs; public int GapMs; }
 
 [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] internal class MMDeviceEnumeratorComObject { }
 [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 internal interface IMMDeviceEnumerator {
-    int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IntPtr ppDevices);
-    int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
+    [PreserveSig] int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IntPtr ppDevices);
+    [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
+    [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string pwstrId, out IMMDevice ppDevice);
+    [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr pClient);
+    [PreserveSig] int UnregisterEndpointNotificationCallback(IntPtr pClient);
 }
 [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 internal interface IMMDevice {
-    int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+    [PreserveSig] int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+    [PreserveSig] int OpenPropertyStore(int stgmAccess, out IntPtr ppProperties);
+    [PreserveSig] int GetId(out IntPtr ppstrId);
+    [PreserveSig] int GetState(out int pdwState);
 }
 [StructLayout(LayoutKind.Sequential)]
 internal struct WAVEFORMATEX {
@@ -41,24 +47,24 @@ internal struct WAVEFORMATEX {
 }
 [ComImport, Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 internal interface IAudioClient {
-    int Initialize(int ShareMode, uint StreamFlags, long hnsBufferDuration, long hnsPeriodicity, ref WAVEFORMATEX pFormat, IntPtr AudioSessionGuid);
-    int GetBufferSize(out uint pNumBufferFrames);
-    int GetStreamLatency(out long phnsLatency);
-    int GetCurrentPadding(out uint pNumPaddingFrames);
-    int IsFormatSupported(int ShareMode, IntPtr pFormat, out IntPtr ppClosestMatch);
-    int GetMixFormat(out IntPtr ppDeviceFormat);
-    int GetDevicePeriod(out long phnsDefaultDevicePeriod, out long phnsMinimumDevicePeriod);
-    int Start();
-    int Stop();
-    int Reset();
-    int SetEventHandle(IntPtr eventHandle);
-    int GetService(ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
+    [PreserveSig] int Initialize(int ShareMode, uint StreamFlags, long hnsBufferDuration, long hnsPeriodicity, ref WAVEFORMATEX pFormat, IntPtr AudioSessionGuid);
+    [PreserveSig] int GetBufferSize(out uint pNumBufferFrames);
+    [PreserveSig] int GetStreamLatency(out long phnsLatency);
+    [PreserveSig] int GetCurrentPadding(out uint pNumPaddingFrames);
+    [PreserveSig] int IsFormatSupported(int ShareMode, IntPtr pFormat, out IntPtr ppClosestMatch);
+    [PreserveSig] int GetMixFormat(out IntPtr ppDeviceFormat);
+    [PreserveSig] int GetDevicePeriod(out long phnsDefaultDevicePeriod, out long phnsMinimumDevicePeriod);
+    [PreserveSig] int Start();
+    [PreserveSig] int Stop();
+    [PreserveSig] int Reset();
+    [PreserveSig] int SetEventHandle(IntPtr eventHandle);
+    [PreserveSig] int GetService(ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
 }
 [ComImport, Guid("C8ADBD64-E71E-48a0-A4DE-185C395CD317"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 internal interface IAudioCaptureClient {
-    int GetBuffer(out IntPtr ppData, out uint pNumFramesToRead, out uint pdwFlags, out ulong pu64DevicePosition, out ulong pu64QPCPosition);
-    int ReleaseBuffer(uint NumFramesRead);
-    int GetNextPacketSize(out uint pNumFramesInNextPacket);
+    [PreserveSig] int GetBuffer(out IntPtr ppData, out uint pNumFramesToRead, out uint pdwFlags, out ulong pu64DevicePosition, out ulong pu64QPCPosition);
+    [PreserveSig] int ReleaseBuffer(uint NumFramesRead);
+    [PreserveSig] int GetNextPacketSize(out uint pNumFramesInNextPacket);
 }
 
 public sealed class HudPillForm : Form {
@@ -92,10 +98,11 @@ public sealed class HudPillForm : Form {
     private static readonly Color WarnMainColor = Color.FromArgb(254, 252, 232);
     private static readonly Color WarnHintColor = Color.FromArgb(255, 251, 191, 36);
     private static readonly float[] BellWeight = new float[] { 1.00f, 0.92f, 0.78f, 0.58f, 0.40f };
+    private readonly bool _isToast;
     private Font _font;
     private bool _ownsFont, _cjkFont;
     private int _dpi = 96;
-    private readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer();
+    private readonly System.Windows.Forms.Timer _hideTimer = new System.Windows.Forms.Timer();
     private readonly System.Windows.Forms.Timer _animTimer = new System.Windows.Forms.Timer();
     private readonly float[] _waveHist = new float[5];
     private readonly float[] _barNorms = new float[9];
@@ -107,9 +114,16 @@ public sealed class HudPillForm : Form {
     private string _text = "", _position = "bottom", _iconKind = "";
     private Color _bgColor = DefaultBgColor, _iconColor = Color.White, _mainColor = Color.White, _hintColor = RecHintColor, _borderColor = Color.Gray;
     private IntPtr _fgHwnd = IntPtr.Zero;
+    private Rectangle _anchoredWorkArea = Rectangle.Empty;
     private int _lastX = int.MinValue, _lastY = int.MinValue, _lastW = 0, _lastH = 0;
 
+    public bool IsToast { get { return _isToast; } }
+    public bool IsShown { get { return _shown; } }
+    public Rectangle AnchoredWorkArea { get { return _anchoredWorkArea; } }
+    public int AnchoredDpi { get { return _dpi; } }
     public bool IsWaveAnimating { get { return _isWaveRecording && _animTimer.Enabled; } }
+    public int LastX { get { return _lastX; } }
+    public int LastY { get { return _lastY; } }
     public int LastWidth { get { return _lastW; } }
     public int LastHeight { get { return _lastH; } }
     public bool IsCountdownWarning {
@@ -163,9 +177,13 @@ public sealed class HudPillForm : Form {
         return false;
     }
 
-    private static Font CreateHudFont(bool preferCjk, int dpi, out bool owns) {
-        float pxSize = Math.Max(12f, (float)Math.Round(13.0f * dpi / 96.0f));
-        string[] fams = preferCjk ? new string[] { "Microsoft YaHei UI", "Segoe UI" } : new string[] { "Segoe UI", "Microsoft YaHei UI" };
+    private static Font CreateHudFont(bool preferCjk, int dpi, bool isToast, out bool owns) {
+        float pxSize = isToast
+            ? Math.Max(11f, (float)Math.Round(12.25f * dpi / 96.0f))
+            : Math.Max(12f, (float)Math.Round(13.0f * dpi / 96.0f));
+        string[] fams = (isToast || preferCjk)
+            ? new string[] { "Microsoft YaHei UI", "Segoe UI" }
+            : new string[] { "Segoe UI", "Microsoft YaHei UI" };
         foreach (string n in fams) {
             try {
                 using (FontFamily ff = new FontFamily(n)) {
@@ -205,8 +223,9 @@ public sealed class HudPillForm : Form {
         if (iconSeg == "\u25D0") return "recognizing";
         if (iconSeg == "\u25C8") return "refining";
         if (iconSeg == "\u2713") return "done";
-        if (iconSeg == "\u25CB") return "empty";
-        return "error";
+        if (iconSeg == "\u25CB") return "empty_ring";
+        if (iconSeg == "!" || iconSeg == "\uFF01" || (!string.IsNullOrEmpty(iconSeg) && iconSeg[0] == '\u26A0')) return "warning";
+        return "cross";
     }
 
     private static void AddQuadCurve(GraphicsPath gp, PointF p0, PointF ctrl, PointF p1) {
@@ -260,11 +279,23 @@ public sealed class HudPillForm : Form {
                         new PointF(x + box * 0.88f, y + box * 0.24f)
                     });
                 }
-            } else if (kind == "empty") {
+            } else if (kind == "empty" || kind == "empty_ring") {
                 float ins = 1.0f * dpiScale;
                 float d = Math.Max(2.0f, box - ins * 2.0f);
                 using (Pen p = new Pen(color, 1.6f * dpiScale)) {
                     g.DrawEllipse(p, x + ins, y + ins, d, d);
+                }
+            } else if (kind == "warning") {
+                float cx = x + box * 0.5f;
+                float strokeW = Math.Max(1.5f, 1.8f * dpiScale);
+                using (Pen p = new Pen(color, strokeW)) {
+                    p.StartCap = LineCap.Round;
+                    p.EndCap = LineCap.Round;
+                    g.DrawLine(p, cx, y + box * 0.15f, cx, y + box * 0.52f);
+                }
+                float dotD = Math.Max(2.0f, 2.1f * dpiScale);
+                using (SolidBrush b = new SolidBrush(color)) {
+                    g.FillEllipse(b, cx - dotD * 0.5f, y + box * 0.80f - dotD * 0.5f, dotD, dotD);
                 }
             } else {
                 float ins = 1.8f * dpiScale;
@@ -281,14 +312,15 @@ public sealed class HudPillForm : Form {
         }
     }
 
-    public HudPillForm() {
+    public HudPillForm(bool isToast = false) {
+        _isToast = isToast;
         _cjkFont = VoiceWinShim.GetHostUiCulture().StartsWith("zh", StringComparison.OrdinalIgnoreCase);
         _dpi = VoiceWinShim.GetTargetDpi(IntPtr.Zero);
-        _font = CreateHudFont(_cjkFont, _dpi, out _ownsFont);
+        _font = CreateHudFont(_cjkFont, _dpi, _isToast, out _ownsFont);
         AutoScaleMode = AutoScaleMode.None;
         FormBorderStyle = FormBorderStyle.None; StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false; BackColor = DefaultBgColor;
-        _timer.Tick += (s, e) => { _timer.Stop(); HideNoActivate(); };
+        _hideTimer.Tick += (s, e) => { _hideTimer.Stop(); HideNoActivate(); };
         _animTimer.Interval = 60;
         _animTimer.Tick += (s, e) => {
             if (!_isWaveRecording || IsDisposed) { _animTimer.Stop(); return; }
@@ -305,22 +337,25 @@ public sealed class HudPillForm : Form {
         base.WndProc(ref m);
     }
     public void HideNoActivate() {
-        _timer.Stop(); _animTimer.Stop(); _isWaveRecording = false; _shown = false;
+        _hideTimer.Stop(); _animTimer.Stop(); _isWaveRecording = false; _shown = false;
         _maxDurationSec = 0; _warnRemainSec = 0;
         if (IsHandleCreated) ShowWindow(Handle, 0);
     }
-    public void ShowStatus(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int autoHideMs, IntPtr fgHwnd, string position, bool waveMode = false, string iconKind = "", int maxDurationSec = 0, int warnRemainSec = 0) {
-        _timer.Stop();
+    public void ShowStatus(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int autoHideMs, IntPtr fgHwnd, string position, bool waveMode = false, string iconKind = "", int maxDurationSec = 0, int warnRemainSec = 0, Rectangle? workAreaOverride = null, int dpiOverride = 0) {
+        _hideTimer.Stop();
         _text = text ?? ""; _bgColor = bgColor; _iconColor = iconColor; _mainColor = mainColor; _hintColor = hintColor; _borderColor = border;
         _iconKind = iconKind ?? ""; _fgHwnd = fgHwnd; _position = position ?? "bottom";
-        int dpi = VoiceWinShim.GetTargetDpi(fgHwnd);
+        int dpi = (dpiOverride > 0) ? dpiOverride : VoiceWinShim.GetTargetDpi(fgHwnd);
+        _anchoredWorkArea = (workAreaOverride.HasValue && workAreaOverride.Value.Width > 0 && workAreaOverride.Value.Height > 0)
+            ? workAreaOverride.Value
+            : VoiceWinShim.GetTargetWorkArea(fgHwnd);
         bool wantCjk = HasCjk(_text);
         if (_font == null || wantCjk != _cjkFont || dpi != _dpi) {
             if (_ownsFont && _font != null) _font.Dispose();
             _cjkFont = wantCjk; _dpi = dpi;
-            _font = CreateHudFont(_cjkFont, _dpi, out _ownsFont);
+            _font = CreateHudFont(_cjkFont, _dpi, _isToast, out _ownsFont);
         }
-        if (waveMode) {
+        if (waveMode && !_isToast) {
             _maxDurationSec = (maxDurationSec > 0) ? maxDurationSec : 0;
             _warnRemainSec = (_maxDurationSec > 0) ? ((warnRemainSec > 0) ? warnRemainSec : VoiceWinShim.RecordingCountdownWarnSec(_maxDurationSec)) : 0;
             if (!_isWaveRecording) {
@@ -338,13 +373,25 @@ public sealed class HudPillForm : Form {
             _maxDurationSec = 0; _warnRemainSec = 0;
             RenderPill(true);
         }
-        if (autoHideMs > 0) { _timer.Interval = autoHideMs; _timer.Start(); }
+        if (autoHideMs > 0) { _hideTimer.Interval = autoHideMs; _hideTimer.Start(); }
     }
 
-    public Bitmap RenderOffscreenBitmap(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int dpi, Rectangle workArea, bool waveMode, string iconKind, float[] barNormsOverride, long elapsedSec, int maxDurationSec, int warnRemainSec) {
+    public void SyncAnchor(Rectangle workArea, int dpi, string position) {
+        if (!_shown || IsDisposed || workArea.Width <= 0 || workArea.Height <= 0) return;
+        _anchoredWorkArea = workArea;
+        if (!string.IsNullOrEmpty(position)) _position = position;
+        if (dpi > 0 && dpi != _dpi) {
+            if (_ownsFont && _font != null) _font.Dispose();
+            _dpi = dpi;
+            _font = CreateHudFont(_cjkFont, _dpi, _isToast, out _ownsFont);
+        }
+        RenderPill(false);
+    }
+
+    public Bitmap RenderOffscreenBitmap(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int dpi, Rectangle workArea, bool waveMode, string iconKind, float[] barNormsOverride, long elapsedSec, int maxDurationSec, int warnRemainSec, string position = "bottom") {
         _text = text ?? ""; _bgColor = bgColor; _iconColor = iconColor; _mainColor = mainColor; _hintColor = hintColor; _borderColor = border;
-        _iconKind = iconKind ?? ""; _position = "bottom"; _isWaveRecording = waveMode;
-        _maxDurationSec = (waveMode && maxDurationSec > 0) ? maxDurationSec : 0;
+        _iconKind = iconKind ?? ""; _position = position ?? "bottom"; _isWaveRecording = waveMode && !_isToast;
+        _maxDurationSec = (_isWaveRecording && maxDurationSec > 0) ? maxDurationSec : 0;
         _warnRemainSec = (_maxDurationSec > 0) ? ((warnRemainSec > 0) ? warnRemainSec : VoiceWinShim.RecordingCountdownWarnSec(_maxDurationSec)) : 0;
         _elapsedOverrideSec = elapsedSec;
         Array.Clear(_barNorms, 0, _barNorms.Length);
@@ -357,7 +404,7 @@ public sealed class HudPillForm : Form {
         if (_font == null || wantCjk != _cjkFont || clampedDpi != _dpi) {
             if (_ownsFont && _font != null) _font.Dispose();
             _cjkFont = wantCjk; _dpi = clampedDpi;
-            _font = CreateHudFont(_cjkFont, _dpi, out _ownsFont);
+            _font = CreateHudFont(_cjkFont, _dpi, _isToast, out _ownsFont);
         }
         int dummyX, dummyY;
         return BuildPillPArgbBitmap(workArea, out dummyX, out dummyY);
@@ -366,7 +413,9 @@ public sealed class HudPillForm : Form {
     private Bitmap BuildPillPArgbBitmap(Rectangle wa, out int x, out int y) {
         string iconSeg, mainSeg, hintSeg; bool spBeforeHint;
         VoiceWinShim.SplitHudSegments(_text, out iconSeg, out mainSeg, out hintSeg, out spBeforeHint);
-        int padL = ScalePx(15), padR = ScalePx(15), minW = ScalePx(64);
+        int padL = _isToast ? ScalePx(12) : ScalePx(15);
+        int padR = _isToast ? ScalePx(12) : ScalePx(15);
+        int minW = _isToast ? ScalePx(56) : ScalePx(64);
         int maxW = Math.Max(minW, wa.Width - ScalePx(24));
 
         float dpiScale = _dpi / 96.0f;
@@ -425,7 +474,7 @@ public sealed class HudPillForm : Form {
             totalTextW = slotW + gap1 + waveBoxW + gap2 + hintSlotW;
             textH = Math.Max(actDurSz.Height, hintSz.Height);
         } else {
-            iconBox = (iconSeg.Length > 0) ? ScalePx(11) : 0;
+            iconBox = (iconSeg.Length > 0 || (_isToast && !string.IsNullOrEmpty(_iconKind))) ? ScalePx(11) : 0;
             mainSz = (mainSeg.Length > 0) ? TextRenderer.MeasureText(mainSeg, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags) : Size.Empty;
             hintSz = (hintSeg.Length > 0) ? TextRenderer.MeasureText(hintSeg, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags) : Size.Empty;
             iconGap = (iconBox > 0 && (mainSeg.Length > 0 || hintSeg.Length > 0)) ? ScalePx(6) : 0;
@@ -438,10 +487,17 @@ public sealed class HudPillForm : Form {
         int rawW = Math.Max(minW, totalTextW + padL + padR);
         bool truncated = rawW > maxW;
         int w = Math.Min(maxW, rawW);
-        int h = Math.Max(ScalePx(34), textH + ScalePx(14));
+        int h = _isToast ? Math.Max(ScalePx(30), textH + ScalePx(10)) : Math.Max(ScalePx(34), textH + ScalePx(14));
         bool isTop = string.Equals((_position ?? "").Trim(), "top", StringComparison.OrdinalIgnoreCase);
         x = wa.Left + (wa.Width - w) / 2;
-        y = isTop ? (wa.Top + ScalePx(36)) : Math.Max(wa.Top + ScalePx(4), wa.Bottom - h - ScalePx(8));
+        if (_isToast) {
+            int mainSlotH = VoiceWinShim.GetMainSlotHeight(ScalePx(34));
+            y = isTop
+                ? (wa.Top + ScalePx(36) + mainSlotH + ScalePx(8))
+                : Math.Max(wa.Top + ScalePx(4), wa.Bottom - ScalePx(8) - mainSlotH - ScalePx(8) - h);
+        } else {
+            y = isTop ? (wa.Top + ScalePx(36)) : Math.Max(wa.Top + ScalePx(4), wa.Bottom - h - ScalePx(8));
+        }
 
         Bitmap outBmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
         using (Bitmap rgbBmp = new Bitmap(w, h, PixelFormat.Format32bppRgb))
@@ -508,7 +564,7 @@ public sealed class HudPillForm : Form {
                 }
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                float penW = Math.Max(1.0f, 1.1f * (_dpi / 96.0f));
+                float penW = _isToast ? Math.Max(1.0f, _dpi / 96.0f) : Math.Max(1.0f, 1.1f * (_dpi / 96.0f));
                 float inset = penW * 0.5f + 0.5f;
                 using (GraphicsPath borderPath = BuildCapsulePath(inset, inset, Math.Max(4f, w - inset * 2.0f), Math.Max(4f, h - inset * 2.0f)))
                 using (Pen borderPen = new Pen(effBorder, penW)) {
@@ -557,7 +613,9 @@ public sealed class HudPillForm : Form {
     }
 
     private void RenderPill(bool forceTopMost) {
-        Rectangle wa = VoiceWinShim.GetTargetWorkArea(_fgHwnd);
+        Rectangle wa = (_anchoredWorkArea.Width > 0 && _anchoredWorkArea.Height > 0)
+            ? _anchoredWorkArea
+            : VoiceWinShim.GetTargetWorkArea(_fgHwnd);
         int prevX = _lastX, prevY = _lastY, prevW = _lastW, prevH = _lastH;
         int x, y;
         IntPtr hdl = Handle;
@@ -587,7 +645,7 @@ public sealed class HudPillForm : Form {
         }
     }
     protected override void Dispose(bool disposing) {
-        if (disposing) { _timer.Dispose(); _animTimer.Dispose(); if (_ownsFont && _font != null) _font.Dispose(); }
+        if (disposing) { _hideTimer.Dispose(); _animTimer.Dispose(); if (_ownsFont && _font != null) _font.Dispose(); }
         base.Dispose(disposing);
     }
 }
@@ -641,6 +699,7 @@ public static class VoiceWinShim {
     private static IntPtr _hook = IntPtr.Zero;
     private static LowLevelKeyboardProc _procRef;
     private static HudPillForm _hud;
+    private static HudPillForm _toastHud;
     private static string _hotkeyLabel = "\u53F3 Ctrl";
     private static readonly Dictionary<string, SoundPlayer> _tones = new Dictionary<string, SoundPlayer>(StringComparer.OrdinalIgnoreCase);
     private static uint _mainTid = 0, _targetVk = 0xA3, _ignoredCompanionVk = 0x11;
@@ -694,11 +753,37 @@ public static class VoiceWinShim {
         return (scr != null) ? scr.WorkingArea : new Rectangle(0, 0, 1920, 1080);
     }
 
-    public static void SplitHudSegments(string raw, out string icon, out string main, out string hint, out bool spaceBeforeHint) {
-        icon = ""; main = ""; hint = ""; spaceBeforeHint = false;
+    public static int GetMainSlotHeight(int fallbackPx) {
+        if (_hud != null && !_hud.IsDisposed && _hud.IsShown && _hud.Visible) {
+            int hh = (_hud.LastHeight > 0) ? _hud.LastHeight : _hud.Height;
+            if (hh > 0) return hh;
+        }
+        return fallbackPx;
+    }
+
+    public static string StripLeadingStatusSymbol(string raw, out string symbol) {
+        symbol = "";
         string s = (raw ?? "").Trim();
-        if (s.Length == 0) return;
-        string rest = s;
+        if (s.Length == 0) return "";
+        char c0 = s[0];
+        bool isKnownSym = (
+            c0 == '\u25CF' || c0 == '\u25D0' || c0 == '\u25C8' || c0 == '\u2713' ||
+            c0 == '\u25CB' || c0 == '\u2715' || c0 == '\u2716' || c0 == '!' ||
+            c0 == '\uFF01' || c0 == '\u26A0'
+        );
+        if (isKnownSym) {
+            int idx = 1;
+            if (idx < s.Length && s[idx] == '\uFE0F') idx++;
+            if (idx < s.Length && char.IsWhiteSpace(s[idx])) {
+                symbol = s.Substring(0, idx);
+                while (idx < s.Length && char.IsWhiteSpace(s[idx])) idx++;
+                return s.Substring(idx);
+            }
+            if (c0 == '!' || c0 == '\uFF01' || c0 == '\u26A0') {
+                symbol = s.Substring(0, idx);
+                return s.Substring(idx).TrimStart();
+            }
+        }
         int spIdx = s.IndexOf(' ');
         if (spIdx >= 1 && spIdx <= 3 && spIdx + 1 < s.Length) {
             bool hasAlphaNum = false;
@@ -706,12 +791,20 @@ public static class VoiceWinShim {
                 if (char.IsLetterOrDigit(s[i])) { hasAlphaNum = true; break; }
             }
             if (!hasAlphaNum) {
-                icon = s.Substring(0, spIdx);
+                symbol = s.Substring(0, spIdx);
                 int afterIdx = spIdx + 1;
                 while (afterIdx < s.Length && s[afterIdx] == ' ') afterIdx++;
-                rest = s.Substring(afterIdx);
+                return s.Substring(afterIdx);
             }
         }
+        return s;
+    }
+
+    public static void SplitHudSegments(string raw, out string icon, out string main, out string hint, out bool spaceBeforeHint) {
+        icon = ""; main = ""; hint = ""; spaceBeforeHint = false;
+        string s = (raw ?? "").Trim();
+        if (s.Length == 0) return;
+        string rest = StripLeadingStatusSymbol(s, out icon);
         if (rest.EndsWith(")")) {
             int openIdx = rest.LastIndexOf('(');
             if (openIdx > 0) {
@@ -856,8 +949,21 @@ public static class VoiceWinShim {
         return 0f;
     }
 
-    private static void ResolveHudVisualStyle(string st, bool zh, string customText, out string txt, out Color bg, out Color ic, out Color mc, out Color hc, out Color bd, out int ms, out bool waveMode, out string iconKind) {
+    public static string ResolveHudLayer(string st, string explicitLayer) {
+        if (st == "" || st == "idle" || st == "hide" || st == "hide_toast" || st == "hide_all") return "control";
+        string lyr = (explicitLayer ?? "").Trim().ToLowerInvariant();
+        if (lyr == "main" || lyr == "toast") return lyr;
+        if (st == "recording" || st == "recognizing" || st == "processing" || st == "refining" || st == "done" || st == "copied") return "main";
+        return "toast";
+    }
+
+    private static void ResolveHudVisualStyle(string st, bool zh, string customText, bool isToast, out string txt, out Color bg, out Color ic, out Color mc, out Color hc, out Color bd, out int ms, out bool waveMode, out string iconKind) {
         ms = 0; waveMode = false; iconKind = "";
+        Color toastBg = Color.FromArgb(30, 31, 36);
+        Color toastMain = Color.FromArgb(244, 245, 248);
+        Color toastHint = Color.FromArgb(190, 195, 208);
+        Color toastAmber = Color.FromArgb(251, 191, 36);
+        Color toastCoral = Color.FromArgb(248, 113, 113);
         if (st == "recording") {
             string hkEn = (_hotkeyLabel == "\u53F3 Ctrl") ? "Right Ctrl" : _hotkeyLabel.Trim();
             txt = zh
@@ -865,7 +971,7 @@ public static class VoiceWinShim {
                 : ("\u25CF Listening\u2026 (" + (_isPtt ? "release " : "press ") + hkEn + " to finish)");
             bg = Color.FromArgb(64, 18, 26); ic = Color.FromArgb(255, 104, 112); mc = Color.FromArgb(248, 250, 252); hc = Color.FromArgb(230, 188, 178, 192); bd = Color.FromArgb(196, 66, 80);
             string trimmedCustom = (customText ?? "").TrimStart();
-            waveMode = string.IsNullOrEmpty(trimmedCustom) || trimmedCustom.StartsWith("\u25CF ", StringComparison.Ordinal);
+            waveMode = !isToast && (string.IsNullOrEmpty(trimmedCustom) || trimmedCustom.StartsWith("\u25CF ", StringComparison.Ordinal));
         } else if (st == "recognizing" || st == "processing") {
             txt = zh ? "\u25D0 \u8BED\u97F3\u8BC6\u522B\u2026" : "\u25D0 Transcribing\u2026";
             bg = Color.FromArgb(16, 40, 72); ic = Color.FromArgb(56, 189, 248); mc = Color.FromArgb(244, 248, 252); hc = Color.FromArgb(176, 198, 222); bd = Color.FromArgb(52, 148, 212); iconKind = "recognizing";
@@ -880,39 +986,113 @@ public static class VoiceWinShim {
             bg = Color.FromArgb(28, 32, 82); ic = Color.FromArgb(144, 156, 255); mc = Color.FromArgb(240, 244, 255); hc = Color.FromArgb(186, 196, 238); bd = Color.FromArgb(108, 116, 242); ms = 2000; iconKind = "done";
         } else if (st == "empty") {
             txt = zh ? "\u25CB \u672A\u68C0\u6D4B\u5230\u8BED\u97F3" : "\u25CB No speech detected";
-            bg = Color.FromArgb(66, 44, 12); ic = Color.FromArgb(251, 191, 36); mc = Color.FromArgb(254, 243, 199); hc = Color.FromArgb(226, 202, 148); bd = Color.FromArgb(212, 148, 20); ms = 2200; iconKind = "empty";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2200; iconKind = "empty_ring";
+        } else if (st == "mic_unavailable") {
+            txt = zh ? "! \u9EA6\u514B\u98CE\u6682\u5FD9\uFF0C\u8BF7\u518D\u8BD5\u4E00\u6B21" : "! Microphone busy, try again";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2600; iconKind = "warning";
+        } else if (st == "audio_recovered") {
+            txt = zh ? "! \u9EA6\u514B\u98CE\u77ED\u6682\u4E2D\u65AD\uFF0C\u5DF2\u81EA\u52A8\u6062\u590D" : "! Mic briefly interrupted, resumed";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2400; iconKind = "warning";
         } else if (st == "no_mic") {
             txt = zh ? "\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE" : "\u2715 No microphone found";
-            bg = Color.FromArgb(84, 18, 24); ic = Color.FromArgb(252, 129, 129); mc = Color.FromArgb(254, 226, 226); hc = Color.FromArgb(238, 178, 182); bd = Color.FromArgb(239, 68, 68); ms = 2200; iconKind = "error";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2200; iconKind = "cross";
+        } else if (st == "mic_permission") {
+            txt = zh ? "\u2715 \u9EA6\u514B\u98CE\u6743\u9650\u672A\u5F00\u542F" : "\u2715 Microphone access denied";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 3200; iconKind = "cross";
         } else if (st == "mic_disconnected") {
             txt = zh ? "\u2715 \u9EA6\u514B\u98CE\u5DF2\u65AD\u5F00" : "\u2715 Microphone disconnected";
-            bg = Color.FromArgb(84, 18, 24); ic = Color.FromArgb(252, 129, 129); mc = Color.FromArgb(254, 226, 226); hc = Color.FromArgb(238, 178, 182); bd = Color.FromArgb(239, 68, 68); ms = 2200; iconKind = "error";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2200; iconKind = "cross";
+        } else if (st == "paste_failed") {
+            txt = zh ? "\u2715 \u586B\u5165\u5931\u8D25" : "\u2715 Failed to insert text";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2600; iconKind = "cross";
         } else {
             txt = zh ? "\u2715 \u8BC6\u522B\u5931\u8D25" : "\u2715 Transcription failed";
-            bg = Color.FromArgb(84, 18, 24); ic = Color.FromArgb(252, 129, 129); mc = Color.FromArgb(254, 226, 226); hc = Color.FromArgb(238, 178, 182); bd = Color.FromArgb(239, 68, 68); ms = 2600; iconKind = "error";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2600; iconKind = "cross";
+        }
+        if (isToast && bg != toastBg) {
+            bg = toastBg; mc = toastMain; hc = toastHint;
         }
         if (!string.IsNullOrEmpty(customText)) txt = customText;
     }
 
-    public static Bitmap RenderHudSnapshotBitmap(string state, string customText, int dpi = 192, int workWidth = 1920, int workHeight = 1080, float[] barNorms = null, long elapsedSec = 0L, int maxDurationSec = 0, int warnRemainSec = 0, bool zh = true) {
+    public static Bitmap RenderHudSnapshotBitmap(string state, string customText) {
+        return RenderHudSnapshotBitmap(state, customText, 192, 1920, 1080);
+    }
+
+    public static Bitmap RenderHudSnapshotBitmap(string state, string customText, int dpi, int workWidth, int workHeight) {
+        string st = (state ?? "error").Trim().ToLowerInvariant();
+        bool autoToast = (ResolveHudLayer(st, "") == "toast");
+        return RenderHudSnapshotBitmap(state, customText, dpi, workWidth, workHeight, autoToast);
+    }
+
+    public static Bitmap RenderHudSnapshotBitmap(string state, string customText, int dpi, int workWidth, int workHeight, bool isToast) {
+        return RenderHudSnapshotBitmap(state, customText, dpi, workWidth, workHeight, null, 0L, 0, 0, true, isToast);
+    }
+
+    public static Bitmap RenderHudSnapshotBitmap(string state, string customText, int dpi, int workWidth, int workHeight, float[] barNorms, long elapsedSec = 0L, int maxDurationSec = 0, int warnRemainSec = 0, bool zh = true, bool isToast = false) {
         string st = (state ?? "error").Trim().ToLowerInvariant();
         string txt, iconKind; Color bg, ic, mc, hc, bd; int ms; bool waveMode;
-        ResolveHudVisualStyle(st, zh, customText, out txt, out bg, out ic, out mc, out hc, out bd, out ms, out waveMode, out iconKind);
-        using (HudPillForm f = new HudPillForm()) {
+        ResolveHudVisualStyle(st, zh, customText, isToast, out txt, out bg, out ic, out mc, out hc, out bd, out ms, out waveMode, out iconKind);
+        using (HudPillForm f = new HudPillForm(isToast)) {
             return f.RenderOffscreenBitmap(txt, bg, ic, mc, hc, bd, dpi, new Rectangle(0, 0, workWidth, workHeight), waveMode, iconKind, barNorms, elapsedSec, maxDurationSec, warnRemainSec);
         }
     }
 
-    public static void UpdateHud(string state, string customText, int durationMs, string position = "bottom", int maxDurationSec = 0, int warnRemainSec = 0) {
+    public static void UpdateHud(string state, string customText, int durationMs, string position = "bottom", int maxDurationSec = 0, int warnRemainSec = 0, string layer = "", bool? clearMain = null, bool? clearToast = null) {
         try {
             string st = (state ?? "").Trim().ToLowerInvariant();
-            if (st == "" || st == "idle" || st == "hide") { if (_hud != null) _hud.HideNoActivate(); return; }
-            if (_hud == null || _hud.IsDisposed) _hud = new HudPillForm();
+            if (st == "" || st == "idle" || st == "hide") {
+                if (_hud != null) _hud.HideNoActivate();
+                if (clearToast == true && _toastHud != null) _toastHud.HideNoActivate();
+                return;
+            }
+            if (st == "hide_toast") {
+                if (_toastHud != null) _toastHud.HideNoActivate();
+                return;
+            }
+            if (st == "hide_all") {
+                if (_hud != null) _hud.HideNoActivate();
+                if (_toastHud != null) _toastHud.HideNoActivate();
+                return;
+            }
+            string effLayer = ResolveHudLayer(st, layer);
+            bool isToast = (effLayer == "toast");
             bool zh = GetHostUiCulture().StartsWith("zh", StringComparison.OrdinalIgnoreCase);
             string txt, iconKind; Color bg, ic, mc, hc, bd; int ms; bool waveMode;
-            ResolveHudVisualStyle(st, zh, customText, out txt, out bg, out ic, out mc, out hc, out bd, out ms, out waveMode, out iconKind);
+            ResolveHudVisualStyle(st, zh, customText, isToast, out txt, out bg, out ic, out mc, out hc, out bd, out ms, out waveMode, out iconKind);
             if (durationMs > 0) ms = durationMs;
-            _hud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, GetForegroundWindow(), position, waveMode, iconKind, maxDurationSec, warnRemainSec);
+            IntPtr fg = GetForegroundWindow();
+            if (!isToast) {
+                bool shouldClearToast = clearToast.HasValue ? clearToast.Value : (st == "recording");
+                if (shouldClearToast && _toastHud != null) _toastHud.HideNoActivate();
+                if (_hud == null || _hud.IsDisposed) _hud = new HudPillForm(false);
+                Rectangle? inheritWa = null;
+                int inheritDpi = 0;
+                if (st != "recording" && _hud.IsShown && _hud.AnchoredWorkArea.Width > 0) {
+                    inheritWa = _hud.AnchoredWorkArea;
+                    inheritDpi = _hud.AnchoredDpi;
+                } else if (!shouldClearToast && _toastHud != null && !_toastHud.IsDisposed && _toastHud.IsShown && _toastHud.AnchoredWorkArea.Width > 0) {
+                    inheritWa = _toastHud.AnchoredWorkArea;
+                    inheritDpi = _toastHud.AnchoredDpi;
+                }
+                _hud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, fg, position, waveMode, iconKind, maxDurationSec, warnRemainSec, inheritWa, inheritDpi);
+                if (!shouldClearToast && _toastHud != null && !_toastHud.IsDisposed && _toastHud.IsShown) {
+                    _toastHud.SyncAnchor(_hud.AnchoredWorkArea, _hud.AnchoredDpi, position);
+                }
+            } else {
+                Rectangle? anchorWa = null;
+                int anchorDpi = 0;
+                if (_hud != null && !_hud.IsDisposed && _hud.IsShown && _hud.AnchoredWorkArea.Width > 0) {
+                    anchorWa = _hud.AnchoredWorkArea;
+                    anchorDpi = _hud.AnchoredDpi;
+                } else if (_toastHud != null && !_toastHud.IsDisposed && _toastHud.IsShown && _toastHud.AnchoredWorkArea.Width > 0) {
+                    anchorWa = _toastHud.AnchoredWorkArea;
+                    anchorDpi = _toastHud.AnchoredDpi;
+                }
+                if (clearMain == true && _hud != null) _hud.HideNoActivate();
+                if (_toastHud == null || _toastHud.IsDisposed) _toastHud = new HudPillForm(true);
+                _toastHud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, fg, position, false, iconKind, 0, 0, anchorWa, anchorDpi);
+            }
         } catch { }
     }
 
@@ -991,10 +1171,14 @@ public static class VoiceWinShim {
         return !StdinClosed || !CmdQueue.IsEmpty || !EvtQueue.IsEmpty;
     }
 
+    private const int AUDCLNT_S_BUFFER_EMPTY = 0x08890001;
+    private sealed class RecSession { public volatile bool Run = true; public long RecGen = 0L; }
     private static readonly object _recSync = new object();
     private static Thread _recThread = null;
     private static ManualResetEvent _recInitEvt = null, _recStopEvt = null;
     private static MemoryStream _recPcm = null;
+    private static RecSession _recSess = null;
+    private static volatile bool _recRun = false;
     private static volatile string _recErr = "";
     private static volatile bool _recInitOk = false;
     private static volatile float _wasapiLevel = 0f, _extLevel = 0f;
@@ -1013,12 +1197,93 @@ public static class VoiceWinShim {
         return buf;
     }
 
-    private static void DrainWasapiPackets(IAudioCaptureClient cap, MemoryStream dst, byte[] zeros, ref byte[] scratch) {
-        uint next = 0;
-        if (cap.GetNextPacketSize(out next) != 0) { _wasapiLevel = 0f; return; }
-        while (next > 0) {
+    private static long ElapsedStopwatchMs(long startTick, long endTick) {
+        if (endTick <= startTick) return 0L;
+        return (long)((endTick - startTick) * 1000.0 / Stopwatch.Frequency);
+    }
+
+    private static void EnqueueAudioEvent(string kind, string reason, int gapMs, long recGen) {
+        EvtQueue.Enqueue(new ShimEvent { Kind = kind, Reason = reason ?? "", GapMs = gapMs, RecGen = recGen, TsMs = GetTickCount64() });
+        if (_mainTid != 0) PostThreadMessage(_mainTid, WM_APP_WAKE, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    public static string ClassifyWasapiStartHr(int hr) {
+        if (hr == unchecked((int)0x80070490)) return "no_mic:0x80070490";
+        if (hr == unchecked((int)0x80070005)) return "mic_permission:0x80070005";
+        return string.Format(CultureInfo.InvariantCulture, "mic_busy:0x{0:X8}", (uint)hr);
+    }
+
+    private static void ReleaseWasapiStream(ref IAudioCaptureClient cap, ref IAudioClient client, bool started) {
+        if (started && client != null) { try { client.Stop(); } catch { } }
+        if (cap != null) { try { Marshal.ReleaseComObject(cap); } catch { } cap = null; }
+        if (client != null) { try { Marshal.ReleaseComObject(client); } catch { } client = null; }
+    }
+
+    private static string OpenWasapiStreamOnDevice(IMMDevice dev, bool loopback, out IAudioClient client, out IAudioCaptureClient cap, out int failHr) {
+        client = null; cap = null; failHr = 0;
+        Guid iidCli = new Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2");
+        object oCli = null;
+        int hr = dev.Activate(ref iidCli, 23, IntPtr.Zero, out oCli);
+        if (hr < 0 || oCli == null) {
+            failHr = (hr < 0) ? hr : unchecked((int)0x80004005);
+            return ClassifyWasapiStartHr(failHr);
+        }
+        client = (IAudioClient)oCli;
+        WAVEFORMATEX wf = new WAVEFORMATEX { wFormatTag = 1, nChannels = 1, nSamplesPerSec = 16000, wBitsPerSample = 16, nBlockAlign = 2, nAvgBytesPerSec = 32000, cbSize = 0 };
+        uint sflags = 0x88000000u | (loopback ? 0x00020000u : 0u);
+        hr = client.Initialize(0, sflags, 10000000L, 0L, ref wf, IntPtr.Zero);
+        if (hr < 0) {
+            failHr = hr;
+            ReleaseWasapiStream(ref cap, ref client, false);
+            return ClassifyWasapiStartHr(hr);
+        }
+        Guid iidCap = new Guid("C8ADBD64-E71E-48a0-A4DE-185C395CD317");
+        object oCap = null;
+        hr = client.GetService(ref iidCap, out oCap);
+        if (hr < 0 || oCap == null) {
+            failHr = (hr < 0) ? hr : unchecked((int)0x80004005);
+            ReleaseWasapiStream(ref cap, ref client, false);
+            return ClassifyWasapiStartHr(failHr);
+        }
+        cap = (IAudioCaptureClient)oCap;
+        hr = client.Start();
+        if (hr < 0) {
+            failHr = hr;
+            ReleaseWasapiStream(ref cap, ref client, false);
+            return ClassifyWasapiStartHr(hr);
+        }
+        return "";
+    }
+
+    private static bool IsEndpointStillActive(IMMDeviceEnumerator enumObj, string deviceId) {
+        if (enumObj == null || string.IsNullOrEmpty(deviceId)) return true;
+        IMMDevice curDev = null;
+        try {
+            int hr = enumObj.GetDevice(deviceId, out curDev);
+            if (hr < 0 || curDev == null) return false;
+            int state = 0;
+            hr = curDev.GetState(out state);
+            return (hr >= 0) && ((state & 1) != 0);
+        } catch {
+            return false;
+        } finally {
+            if (curDev != null) { try { Marshal.ReleaseComObject(curDev); } catch { } }
+        }
+    }
+
+    private static int DrainWasapiPackets(IAudioCaptureClient cap, MemoryStream dst, byte[] zeros, ref byte[] scratch, out bool gotFrames) {
+        gotFrames = false;
+        uint pkt = 0;
+        int hr = cap.GetNextPacketSize(out pkt);
+        if (hr < 0) { _wasapiLevel = 0f; return hr; }
+        while (pkt > 0) {
             IntPtr pData; uint frames, flags; ulong dpos, qpos;
-            if (cap.GetBuffer(out pData, out frames, out flags, out dpos, out qpos) != 0) { _wasapiLevel = 0f; break; }
+            hr = cap.GetBuffer(out pData, out frames, out flags, out dpos, out qpos);
+            if (hr < 0) { _wasapiLevel = 0f; return hr; }
+            if (hr == AUDCLNT_S_BUFFER_EMPTY || frames == 0) {
+                cap.ReleaseBuffer(0);
+                break;
+            }
             int nBytes = (int)(frames * 2);
             if (nBytes > 0) {
                 if ((flags & 2u) != 0 || pData == IntPtr.Zero) {
@@ -1033,79 +1298,192 @@ public static class VoiceWinShim {
                     _wasapiLevel = ComputePcm16RmsLevel(scratch, nBytes);
                     Interlocked.Exchange(ref _wasapiLevelTick, (long)GetTickCount64());
                 }
+                gotFrames = true;
             }
-            cap.ReleaseBuffer(frames);
-            if (cap.GetNextPacketSize(out next) != 0) { _wasapiLevel = 0f; break; }
+            hr = cap.ReleaseBuffer(frames);
+            if (hr < 0) { _wasapiLevel = 0f; return hr; }
+            hr = cap.GetNextPacketSize(out pkt);
+            if (hr < 0) { _wasapiLevel = 0f; return hr; }
         }
+        return 0;
+    }
+
+    public static string StartRecording(bool loopback = false) {
+        string err;
+        return StartRecording(loopback, 0L, out err) ? "" : err;
     }
 
     public static bool StartRecording(bool loopback, out string error) {
+        return StartRecording(loopback, 0L, out error);
+    }
+
+    public static bool StartRecording(bool loopback, long recGen, out string error) {
         int dummyBytes; string dummyErr;
         StopRecording(out dummyBytes, out dummyErr);
         _wasapiLevel = 0f; Interlocked.Exchange(ref _wasapiLevelTick, 0L); _wasapiActive = true;
         ManualResetEvent initEvt = new ManualResetEvent(false);
         ManualResetEvent stopEvt = new ManualResetEvent(false);
         MemoryStream pcm = new MemoryStream(64000);
-        _recErr = ""; _recInitOk = false;
+        RecSession sess = new RecSession { RecGen = recGen };
+        _recErr = ""; _recInitOk = false; _recRun = true;
         Thread t = new Thread(() => {
             IMMDeviceEnumerator en = null; IMMDevice dev = null; IAudioClient client = null; IAudioCaptureClient cap = null;
             bool started = false;
             try {
                 en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
                 int hr = en.GetDefaultAudioEndpoint(loopback ? 0 : 1, 0, out dev);
-                if (hr != 0 || dev == null) { _recErr = "wasapi_endpoint_hr_0x" + hr.ToString("X8"); initEvt.Set(); return; }
-                Guid iidCli = new Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2");
-                object oCli; hr = dev.Activate(ref iidCli, 23, IntPtr.Zero, out oCli);
-                if (hr != 0 || oCli == null) { _recErr = "wasapi_activate_hr_0x" + hr.ToString("X8"); initEvt.Set(); return; }
-                client = (IAudioClient)oCli;
-                WAVEFORMATEX wf = new WAVEFORMATEX { wFormatTag = 1, nChannels = 1, nSamplesPerSec = 16000, wBitsPerSample = 16, nBlockAlign = 2, nAvgBytesPerSec = 32000, cbSize = 0 };
-                uint sflags = 0x88000000u | (loopback ? 0x00020000u : 0u);
-                hr = client.Initialize(0, sflags, 10000000L, 0L, ref wf, IntPtr.Zero);
-                if (hr != 0) { _recErr = "wasapi_init_hr_0x" + hr.ToString("X8"); initEvt.Set(); return; }
-                Guid iidCap = new Guid("C8ADBD64-E71E-48a0-A4DE-185C395CD317");
-                object oCap; hr = client.GetService(ref iidCap, out oCap);
-                if (hr != 0 || oCap == null) { _recErr = "wasapi_service_hr_0x" + hr.ToString("X8"); initEvt.Set(); return; }
-                cap = (IAudioCaptureClient)oCap;
-                hr = client.Start();
-                if (hr != 0) { _recErr = "wasapi_start_hr_0x" + hr.ToString("X8"); initEvt.Set(); return; }
+                if (hr < 0 || dev == null) {
+                    _recErr = ClassifyWasapiStartHr((hr < 0) ? hr : unchecked((int)0x80070490));
+                    initEvt.Set();
+                    return;
+                }
+                string initialDeviceId = "";
+                IntPtr idPtr = IntPtr.Zero;
+                int idHr = dev.GetId(out idPtr);
+                if (idHr >= 0 && idPtr != IntPtr.Zero) {
+                    try { initialDeviceId = Marshal.PtrToStringUni(idPtr) ?? ""; }
+                    finally { Marshal.FreeCoTaskMem(idPtr); }
+                }
+                int openHr;
+                string openErr = OpenWasapiStreamOnDevice(dev, loopback, out client, out cap, out openHr);
+                if (!string.IsNullOrEmpty(openErr)) {
+                    _recErr = openErr;
+                    initEvt.Set();
+                    return;
+                }
                 started = true; _recInitOk = true; initEvt.Set();
                 byte[] zeros = new byte[8192]; byte[] scratch = null;
-                while (!stopEvt.WaitOne(10)) { DrainWasapiPackets(cap, pcm, zeros, ref scratch); }
-                DrainWasapiPackets(cap, pcm, zeros, ref scratch);
+                long lastPacketTick = Stopwatch.GetTimestamp();
+                long lastDeviceCheckTick = lastPacketTick;
+                int reopenCount = 0;
+                while (sess.Run && _recRun && !stopEvt.WaitOne(10)) {
+                    bool gotFrames;
+                    int drainHr = DrainWasapiPackets(cap, pcm, zeros, ref scratch, out gotFrames);
+                    long nowTick = Stopwatch.GetTimestamp();
+                    if (gotFrames && drainHr >= 0) {
+                        lastPacketTick = nowTick;
+                    }
+                    if (drainHr >= 0 && ElapsedStopwatchMs(lastDeviceCheckTick, nowTick) >= 200L) {
+                        lastDeviceCheckTick = nowTick;
+                        if (!string.IsNullOrEmpty(initialDeviceId) && !IsEndpointStillActive(en, initialDeviceId)) {
+                            _recErr = "wasapi_device_unplugged";
+                            if (sess.Run && _recRun) EnqueueAudioEvent("rec_lost", _recErr, 0, sess.RecGen);
+                            break;
+                        }
+                    }
+                    bool stalled = (!loopback) && (drainHr >= 0) && (ElapsedStopwatchMs(lastPacketTick, nowTick) > 900L);
+                    if (drainHr < 0 || stalled) {
+                        int failStreamHr = drainHr;
+                        if (!string.IsNullOrEmpty(initialDeviceId) && !IsEndpointStillActive(en, initialDeviceId)) {
+                            _recErr = "wasapi_device_unplugged";
+                            if (sess.Run && _recRun) EnqueueAudioEvent("rec_lost", _recErr, 0, sess.RecGen);
+                            break;
+                        }
+                        bool reopened = false;
+                        if (!string.IsNullOrEmpty(initialDeviceId) && reopenCount < 3 && sess.Run && _recRun) {
+                            reopenCount++;
+                            ReleaseWasapiStream(ref cap, ref client, started);
+                            started = false;
+                            if (dev != null) { try { Marshal.ReleaseComObject(dev); } catch { } dev = null; }
+                            int[] retryDelaysMs = new int[] { 0, 150, 300 };
+                            for (int attempt = 0; attempt < retryDelaysMs.Length && sess.Run && _recRun; attempt++) {
+                                if (retryDelaysMs[attempt] > 0) {
+                                    if (stopEvt.WaitOne(retryDelaysMs[attempt]) || !sess.Run || !_recRun) break;
+                                }
+                                if (!IsEndpointStillActive(en, initialDeviceId)) {
+                                    _recErr = "wasapi_device_unplugged";
+                                    break;
+                                }
+                                IMMDevice reDev = null;
+                                int ghr = en.GetDevice(initialDeviceId, out reDev);
+                                if (ghr >= 0 && reDev != null) {
+                                    IAudioClient reCli; IAudioCaptureClient reCap; int reOpenHr;
+                                    string reErr = OpenWasapiStreamOnDevice(reDev, loopback, out reCli, out reCap, out reOpenHr);
+                                    if (string.IsNullOrEmpty(reErr) && reCli != null && reCap != null) {
+                                        dev = reDev; client = reCli; cap = reCap; started = true;
+                                        reopened = true;
+                                        break;
+                                    }
+                                    try { Marshal.ReleaseComObject(reDev); } catch { }
+                                    if (reOpenHr < 0 && failStreamHr >= 0) failStreamHr = reOpenHr;
+                                } else {
+                                    if (reDev != null) { try { Marshal.ReleaseComObject(reDev); } catch { } }
+                                    if (ghr < 0 && failStreamHr >= 0) failStreamHr = ghr;
+                                }
+                            }
+                        }
+                        if (!sess.Run || !_recRun) break;
+                        if (reopened) {
+                            long resumeTick = Stopwatch.GetTimestamp();
+                            long rawGapMs = ElapsedStopwatchMs(lastPacketTick, resumeTick);
+                            int gapMs = (rawGapMs < 0L) ? 0 : ((rawGapMs > 30000L) ? 30000 : (int)rawGapMs);
+                            int padBytes = (gapMs * 32) & ~1;
+                            int rem = padBytes;
+                            while (rem > 0) { int chunk = Math.Min(rem, zeros.Length); pcm.Write(zeros, 0, chunk); rem -= chunk; }
+                            _wasapiLevel = 0f;
+                            Interlocked.Exchange(ref _wasapiLevelTick, (long)GetTickCount64());
+                            lastPacketTick = resumeTick;
+                            lastDeviceCheckTick = resumeTick;
+                            EnqueueAudioEvent("rec_recovered", "", gapMs, sess.RecGen);
+                            continue;
+                        }
+                        if (string.IsNullOrEmpty(_recErr)) {
+                            _recErr = (failStreamHr < 0)
+                                ? string.Format(CultureInfo.InvariantCulture, "wasapi_stream_lost:0x{0:X8}", (uint)failStreamHr)
+                                : "wasapi_stream_stalled";
+                        }
+                        if (sess.Run && _recRun) EnqueueAudioEvent("rec_lost", _recErr, 0, sess.RecGen);
+                        break;
+                    }
+                }
+                if (started && cap != null && string.IsNullOrEmpty(_recErr)) {
+                    bool tailFrames;
+                    DrainWasapiPackets(cap, pcm, zeros, ref scratch, out tailFrames);
+                }
             } catch (Exception ex) {
-                _recErr = "wasapi_exc:" + ex.GetType().Name + ":" + ex.Message;
-                try { initEvt.Set(); } catch { }
+                if (!_recInitOk) {
+                    _recErr = "mic_busy:exc:" + ex.GetType().Name + ":" + ex.Message;
+                    try { initEvt.Set(); } catch { }
+                } else {
+                    _recErr = "wasapi_stream_lost:" + ex.GetType().Name + ":" + ex.Message;
+                    if (sess.Run && _recRun) EnqueueAudioEvent("rec_lost", _recErr, 0, sess.RecGen);
+                }
             } finally {
                 _wasapiLevel = 0f;
-                if (started && client != null) { try { client.Stop(); } catch { } }
-                if (cap != null) { try { Marshal.ReleaseComObject(cap); } catch { } }
-                if (client != null) { try { Marshal.ReleaseComObject(client); } catch { } }
+                ReleaseWasapiStream(ref cap, ref client, started);
                 if (dev != null) { try { Marshal.ReleaseComObject(dev); } catch { } }
                 if (en != null) { try { Marshal.ReleaseComObject(en); } catch { } }
             }
         });
         t.IsBackground = true; t.SetApartmentState(ApartmentState.MTA); t.Start();
         if (!initEvt.WaitOne(3000)) {
-            _wasapiActive = false; _wasapiLevel = 0f;
+            sess.Run = false; _recRun = false; _wasapiActive = false; _wasapiLevel = 0f;
             try { stopEvt.Set(); t.Join(300); } catch { }
             try { initEvt.Dispose(); stopEvt.Dispose(); pcm.Dispose(); } catch { }
-            error = "wasapi_init_timeout"; return false;
+            error = "mic_busy:wasapi_init_timeout"; return false;
         }
         if (!_recInitOk) {
-            _wasapiActive = false; _wasapiLevel = 0f;
+            sess.Run = false; _recRun = false; _wasapiActive = false; _wasapiLevel = 0f;
             try { stopEvt.Set(); t.Join(500); } catch { }
             try { initEvt.Dispose(); stopEvt.Dispose(); pcm.Dispose(); } catch { }
-            error = string.IsNullOrEmpty(_recErr) ? "wasapi_init_failed" : _recErr; return false;
+            error = string.IsNullOrEmpty(_recErr) ? "mic_busy:wasapi_init_failed" : _recErr; return false;
         }
-        lock (_recSync) { _recThread = t; _recInitEvt = initEvt; _recStopEvt = stopEvt; _recPcm = pcm; }
+        lock (_recSync) { _recThread = t; _recInitEvt = initEvt; _recStopEvt = stopEvt; _recPcm = pcm; _recSess = sess; }
         error = ""; return true;
     }
 
+    public static byte[] StopRecording(out string error) {
+        int dummyBytes;
+        return StopRecording(out dummyBytes, out error);
+    }
+
     public static byte[] StopRecording(out int pcmBytes, out string error) {
-        Thread t; ManualResetEvent initEvt, stopEvt; MemoryStream pcm;
+        Thread t; ManualResetEvent initEvt, stopEvt; MemoryStream pcm; RecSession sess;
         lock (_recSync) {
-            t = _recThread; initEvt = _recInitEvt; stopEvt = _recStopEvt; pcm = _recPcm;
-            _recThread = null; _recInitEvt = null; _recStopEvt = null; _recPcm = null;
+            t = _recThread; initEvt = _recInitEvt; stopEvt = _recStopEvt; pcm = _recPcm; sess = _recSess;
+            _recThread = null; _recInitEvt = null; _recStopEvt = null; _recPcm = null; _recSess = null;
+            _recRun = false;
+            if (sess != null) sess.Run = false;
         }
         pcmBytes = 0; error = "";
         if (t == null) { _wasapiActive = false; _wasapiLevel = 0f; error = "not_recording"; return new byte[0]; }
@@ -1121,6 +1499,7 @@ public static class VoiceWinShim {
             error = string.IsNullOrEmpty(_recErr) ? "wasapi_zero_packets" : _recErr;
             return new byte[0];
         }
+        error = _recErr ?? "";
         return BuildPcm16MonoWav(raw, evenLen, 16000);
     }
 
@@ -1128,6 +1507,7 @@ public static class VoiceWinShim {
         int dummyBytes; string dummyErr; StopRecording(out dummyBytes, out dummyErr);
         if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
         if (_hud != null) { try { _hud.Dispose(); } catch { } _hud = null; }
+        if (_toastHud != null) { try { _toastHud.Dispose(); } catch { } _toastHud = null; }
     }
 
     public static bool SendCtrlV() {
@@ -1179,7 +1559,15 @@ try {
     :bridgeLoop while ([VoiceWinShim]::PumpOnce()) {
         try {
             $ev = New-Object ShimEvent
-            while ([VoiceWinShim]::EvtQueue.TryDequeue([ref]$ev)) { Write-JsonLine @{ event = $ev.Kind; hwnd = $ev.Hwnd; process = $ev.Process; title = $ev.Title; ts_ms = $ev.TsMs } }
+            while ([VoiceWinShim]::EvtQueue.TryDequeue([ref]$ev)) {
+                if ($ev.Kind -eq "rec_lost") {
+                    Write-JsonLine @{ event = "rec_lost"; reason = [string]$ev.Reason; rec_gen = [long]$ev.RecGen }
+                } elseif ($ev.Kind -eq "rec_recovered") {
+                    Write-JsonLine @{ event = "rec_recovered"; gap_ms = [int]$ev.GapMs; rec_gen = [long]$ev.RecGen }
+                } else {
+                    Write-JsonLine @{ event = $ev.Kind; hwnd = $ev.Hwnd; process = $ev.Process; title = $ev.Title; ts_ms = $ev.TsMs }
+                }
+            }
         } catch { }
         $rawCmd = $null
         while ([VoiceWinShim]::CmdQueue.TryDequeue([ref]$rawCmd)) {
@@ -1194,7 +1582,10 @@ try {
                     $dms = if ($null -ne $cmdObj.duration_ms) { [int]$cmdObj.duration_ms } else { 0 }
                     $maxDur = if ($null -ne $cmdObj.max_duration_sec) { [int]$cmdObj.max_duration_sec } else { 0 }
                     $warnRem = if ($null -ne $cmdObj.warn_remain_sec) { [int]$cmdObj.warn_remain_sec } else { 0 }
-                    [VoiceWinShim]::UpdateHud([string]$cmdObj.state, [string]$cmdObj.text, $dms, [string]$cmdObj.position, $maxDur, $warnRem)
+                    $lyr = if ($null -ne $cmdObj.layer) { [string]$cmdObj.layer } else { "" }
+                    $clrMain = if ($null -ne $cmdObj.clear_main) { [bool]$cmdObj.clear_main } else { $null }
+                    $clrToast = if ($null -ne $cmdObj.clear_toast) { [bool]$cmdObj.clear_toast } else { $null }
+                    [VoiceWinShim]::UpdateHud([string]$cmdObj.state, [string]$cmdObj.text, $dms, [string]$cmdObj.position, $maxDur, $warnRem, $lyr, $clrMain, $clrToast)
                     Write-JsonLine @{ type = "reply"; reply = "hud"; seq_id = $seq; ok = $true }
                 } elseif ($op -eq "hud_level") {
                     $lvl = if ($null -ne $cmdObj.level) { [float]$cmdObj.level } else { 0.0 }
@@ -1216,7 +1607,8 @@ try {
                     }
                 } elseif ($op -eq "rec_start") {
                     $loopback = if ($null -ne $cmdObj.loopback) { [bool]$cmdObj.loopback } else { $false }
-                    $recErr = ""; $okStart = [VoiceWinShim]::StartRecording($loopback, [ref]$recErr)
+                    $recGen = if ($null -ne $cmdObj.rec_gen) { [long]$cmdObj.rec_gen } else { 0L }
+                    $recErr = ""; $okStart = [VoiceWinShim]::StartRecording($loopback, $recGen, [ref]$recErr)
                     Write-JsonLine @{ type = "reply"; reply = "rec_start"; seq_id = $seq; ok = [bool]$okStart; rec_error = [string]$recErr }
                 } elseif ($op -eq "rec_stop") {
                     $pcmBytes = 0; $recErr = ""; $wavBytes = [VoiceWinShim]::StopRecording([ref]$pcmBytes, [ref]$recErr)

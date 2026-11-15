@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import CoreAudio
 import Foundation
 
 // Device-dependent modifier masks from IOKit/hidsystem/IOLLEvent.h
@@ -224,6 +225,21 @@ struct HotkeyEngine {
     }
 }
 
+struct HudRgba: Equatable {
+    let r: CGFloat
+    let g: CGFloat
+    let b: CGFloat
+    let a: CGFloat
+
+    var nsColor: NSColor {
+        NSColor(srgbRed: r, green: g, blue: b, alpha: a)
+    }
+}
+
+private func hudRgba(_ r: Int, _ g: Int, _ b: Int, _ a: CGFloat = 1.0) -> HudRgba {
+    HudRgba(r: CGFloat(r) / 255.0, g: CGFloat(g) / 255.0, b: CGFloat(b) / 255.0, a: a)
+}
+
 private func rgba(_ r: Int, _ g: Int, _ b: Int, _ a: CGFloat = 1.0) -> NSColor {
     NSColor(srgbRed: CGFloat(r) / 255.0, green: CGFloat(g) / 255.0, blue: CGFloat(b) / 255.0, alpha: a)
 }
@@ -241,12 +257,24 @@ private func isZhUiCulture(_ tag: String) -> Bool {
     return low == "zh" || low.hasPrefix("zh-") || low.hasPrefix("zh_") || low.hasPrefix("zh.") || low.hasPrefix("zh@")
 }
 
-func computeHudPillY(visibleMinY: CGFloat, visibleMaxY: CGFloat, pillH: CGFloat, position: String) -> CGFloat {
+func normalizeHudPosition(_ position: String) -> String {
     let pos = position.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    if pos == "top" {
+    return pos == "top" ? "top" : "bottom"
+}
+
+func computeHudPillY(visibleMinY: CGFloat, visibleMaxY: CGFloat, pillH: CGFloat, position: String) -> CGFloat {
+    if normalizeHudPosition(position) == "top" {
         return round(visibleMaxY - pillH - 14.0)
     }
     return round(visibleMinY + 8.0)
+}
+
+func computeHudToastY(visibleMinY: CGFloat, visibleMaxY: CGFloat, mainH: CGFloat, toastH: CGFloat, position: String) -> CGFloat {
+    let effMainH = max(42.0, mainH)
+    if normalizeHudPosition(position) == "top" {
+        return round(visibleMaxY - 14.0 - effMainH - 8.0 - toastH)
+    }
+    return round(visibleMinY + 8.0 + effMainH + 8.0)
 }
 
 func stripOuterParens(_ raw: String) -> String {
@@ -256,6 +284,28 @@ func stripOuterParens(_ raw: String) -> String {
         return String(inner).trimmingCharacters(in: .whitespacesAndNewlines)
     }
     return t
+}
+
+private let LEADING_HUD_SYMBOLS: Set<String> = ["●", "◐", "◈", "✓", "○", "✕", "✖", "✗", "!", "⚠", "⚠️"]
+
+func stripLeadingHudSymbol(_ raw: String) -> String {
+    let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if s.isEmpty { return "" }
+    let chars = Array(s)
+    if let first = chars.first {
+        let firstStr = String(first)
+        if LEADING_HUD_SYMBOLS.contains(firstStr) {
+            var idx = 1
+            while idx < chars.count && chars[idx].isWhitespace { idx += 1 }
+            return String(chars[idx...])
+        }
+    }
+    let seg = splitHudSegments(s)
+    if !seg.icon.isEmpty {
+        if seg.hint.isEmpty { return seg.main }
+        return seg.main + (seg.hasSpaceBeforeHint ? " " : "") + seg.hint
+    }
+    return s
 }
 
 struct HudSegments: Equatable {
@@ -273,7 +323,12 @@ func splitHudSegments(_ raw: String) -> HudSegments {
     let chars = Array(s)
     var iconPart = ""
     var rest = s
-    if let spIdx = chars.firstIndex(of: " "), spIdx >= 1, spIdx <= 3, spIdx + 1 < chars.count {
+    if let first = chars.first, LEADING_HUD_SYMBOLS.contains(String(first)) {
+        iconPart = String(first)
+        var afterIdx = 1
+        while afterIdx < chars.count && chars[afterIdx] == " " { afterIdx += 1 }
+        rest = (afterIdx < chars.count) ? String(chars[afterIdx...]) : ""
+    } else if let spIdx = chars.firstIndex(of: " "), spIdx >= 1, spIdx <= 3, spIdx + 1 < chars.count {
         let prefix = chars[0..<spIdx]
         if !prefix.contains(where: { $0.isLetter || $0.isNumber }) {
             iconPart = String(prefix)
@@ -295,6 +350,221 @@ func splitHudSegments(_ raw: String) -> HudSegments {
         }
     }
     return HudSegments(icon: iconPart, main: rest, hint: "", hasSpaceBeforeHint: false)
+}
+
+struct HudVisualStyle: Equatable {
+    let layer: String
+    let defaultText: String
+    let bg: HudRgba
+    let border: HudRgba
+    let borderWidth: CGFloat
+    let icon: HudRgba
+    let mainText: HudRgba
+    let hintText: HudRgba
+    let autoHideMs: Int
+    let iconKind: String
+}
+
+func resolveHudLayer(state: String, explicitLayer: String = "") -> String {
+    let st = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if st.isEmpty || st == "idle" || st == "hide" || st == "hide_toast" || st == "hide_all" {
+        return "control"
+    }
+    let exp = explicitLayer.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if exp == "main" || exp == "toast" {
+        return exp
+    }
+    switch st {
+    case "recording", "recognizing", "processing", "refining", "done", "copied":
+        return "main"
+    default:
+        return "toast"
+    }
+}
+
+func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool = false) -> HudVisualStyle {
+    let st = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let layer = resolveHudLayer(state: st, explicitLayer: explicitLayer)
+
+    let toastBg = HudRgba(r: 30.0 / 255.0, g: 31.0 / 255.0, b: 36.0 / 255.0, a: 0.96)
+    let toastMainText = HudRgba(r: 244.0 / 255.0, g: 245.0 / 255.0, b: 248.0 / 255.0, a: 1.0)
+    let toastHintText = HudRgba(r: 182.0 / 255.0, g: 186.0 / 255.0, b: 196.0 / 255.0, a: 0.92)
+    let amberBorder = HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 0.78)
+    let amberIcon = HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 1.0)
+    let coralBorder = HudRgba(r: 248.0 / 255.0, g: 113.0 / 255.0, b: 113.0 / 255.0, a: 0.78)
+    let coralIcon = HudRgba(r: 248.0 / 255.0, g: 113.0 / 255.0, b: 113.0 / 255.0, a: 1.0)
+
+    switch st {
+    case "recording":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "● 录音中…" : "● Listening…",
+            bg: hudRgba(64, 18, 26, 0.95),
+            border: hudRgba(232, 88, 102, 0.68),
+            borderWidth: 1.0,
+            icon: hudRgba(255, 104, 112, 1.0),
+            mainText: hudRgba(248, 250, 252, 1.0),
+            hintText: hudRgba(188, 178, 192, 0.90),
+            autoHideMs: 0,
+            iconKind: ""
+        )
+    case "recognizing", "processing":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "◐ 语音识别…" : "◐ Transcribing…",
+            bg: hudRgba(16, 40, 72, 0.95),
+            border: hudRgba(56, 189, 248, 0.65),
+            borderWidth: 1.0,
+            icon: hudRgba(56, 189, 248, 1.0),
+            mainText: hudRgba(244, 248, 252, 1.0),
+            hintText: hudRgba(176, 198, 222, 1.0),
+            autoHideMs: 0,
+            iconKind: "recognizing"
+        )
+    case "refining":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "◈ 整理精修…" : "◈ Refining…",
+            bg: hudRgba(46, 22, 76, 0.95),
+            border: hudRgba(192, 132, 252, 0.65),
+            borderWidth: 1.0,
+            icon: hudRgba(208, 156, 255, 1.0),
+            mainText: hudRgba(248, 245, 255, 1.0),
+            hintText: hudRgba(198, 182, 226, 1.0),
+            autoHideMs: 0,
+            iconKind: "refining"
+        )
+    case "done":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "✓ 已填入" : "✓ Inserted",
+            bg: hudRgba(14, 54, 36, 0.95),
+            border: hudRgba(74, 222, 128, 0.62),
+            borderWidth: 1.0,
+            icon: hudRgba(74, 222, 128, 1.0),
+            mainText: hudRgba(242, 253, 246, 1.0),
+            hintText: hudRgba(174, 218, 192, 1.0),
+            autoHideMs: 900,
+            iconKind: "done"
+        )
+    case "copied":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "✓ 已复制(窗口已切换)" : "✓ Copied (window switched)",
+            bg: hudRgba(28, 32, 82, 0.95),
+            border: hudRgba(129, 140, 248, 0.68),
+            borderWidth: 1.0,
+            icon: hudRgba(144, 156, 255, 1.0),
+            mainText: hudRgba(240, 244, 255, 1.0),
+            hintText: hudRgba(186, 196, 238, 1.0),
+            autoHideMs: 2000,
+            iconKind: "done"
+        )
+    case "empty":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "○ 未检测到语音" : "○ No speech detected",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 2200,
+            iconKind: "empty_ring"
+        )
+    case "mic_unavailable":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "! 麦克风暂忙，请再试一次" : "! Microphone busy, try again",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 2600,
+            iconKind: "warning"
+        )
+    case "audio_recovered":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "! 麦克风短暂中断，已自动恢复" : "! Mic briefly interrupted, resumed",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 2400,
+            iconKind: "warning"
+        )
+    case "no_mic":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "✕ 无可用麦克风" : "✕ No microphone found",
+            bg: toastBg,
+            border: coralBorder,
+            borderWidth: 1.0,
+            icon: coralIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 2200,
+            iconKind: "cross"
+        )
+    case "mic_permission":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "✕ 麦克风权限未开启" : "✕ Microphone access denied",
+            bg: toastBg,
+            border: coralBorder,
+            borderWidth: 1.0,
+            icon: coralIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 3200,
+            iconKind: "cross"
+        )
+    case "mic_disconnected":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "✕ 麦克风已断开" : "✕ Microphone disconnected",
+            bg: toastBg,
+            border: coralBorder,
+            borderWidth: 1.0,
+            icon: coralIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 2200,
+            iconKind: "cross"
+        )
+    case "paste_failed":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "✕ 填入失败" : "✕ Failed to insert text",
+            bg: toastBg,
+            border: coralBorder,
+            borderWidth: 1.0,
+            icon: coralIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 2600,
+            iconKind: "cross"
+        )
+    default:
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "✕ 识别失败" : "✕ Transcription failed",
+            bg: toastBg,
+            border: coralBorder,
+            borderWidth: 1.0,
+            icon: coralIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 2600,
+            iconKind: "cross"
+        )
+    }
 }
 
 private func snapToPixel(_ value: CGFloat, scale: CGFloat) -> CGFloat {
@@ -339,10 +609,15 @@ private func containsCjkScalar(_ s: String) -> Bool {
 }
 
 final class StatusIconView: NSView {
-    static let boxSize: CGFloat = 11.0
+    static let mainBoxSize: CGFloat = 14.0
+    static let toastBoxSize: CGFloat = 13.0
+    static let boxSize: CGFloat = mainBoxSize
 
     override var isFlipped: Bool { true }
 
+    var configuredSize: CGFloat = mainBoxSize {
+        didSet { needsDisplay = true }
+    }
     var iconKind: String = "recognizing" {
         didSet { needsDisplay = true }
     }
@@ -358,18 +633,18 @@ final class StatusIconView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        let box = min(bounds.width, bounds.height)
+        let box = min(configuredSize, min(bounds.width, bounds.height))
         if box <= 2.0 { return }
         let ox = (bounds.width - box) * 0.5
         let oy = (bounds.height - box) * 0.5
 
         switch iconKind {
         case "recognizing":
-            let ins: CGFloat = 1.0
+            let ins: CGFloat = 1.1
             let d = max(2.0, box - ins * 2.0)
             let ovalRect = NSRect(x: ox + ins, y: oy + ins, width: d, height: d)
             let ring = NSBezierPath(ovalIn: ovalRect)
-            ring.lineWidth = 1.6
+            ring.lineWidth = 1.8
             iconColor.setStroke()
             ring.stroke()
             NSGraphicsContext.saveGraphicsState()
@@ -396,7 +671,7 @@ final class StatusIconView: NSView {
             sp.fill()
         case "done":
             let p = NSBezierPath()
-            p.lineWidth = 1.8
+            p.lineWidth = 2.0
             p.lineCapStyle = .round
             p.lineJoinStyle = .round
             p.move(to: NSPoint(x: ox + box * 0.14, y: oy + box * 0.54))
@@ -404,17 +679,30 @@ final class StatusIconView: NSView {
             p.line(to: NSPoint(x: ox + box * 0.88, y: oy + box * 0.24))
             iconColor.setStroke()
             p.stroke()
-        case "empty":
-            let ins: CGFloat = 1.0
+        case "empty", "empty_ring":
+            let ins: CGFloat = 1.1
             let d = max(2.0, box - ins * 2.0)
             let ring = NSBezierPath(ovalIn: NSRect(x: ox + ins, y: oy + ins, width: d, height: d))
-            ring.lineWidth = 1.6
+            ring.lineWidth = 1.8
             iconColor.setStroke()
             ring.stroke()
+        case "warning":
+            let cx = ox + box * 0.5
+            let stem = NSBezierPath()
+            stem.lineWidth = 2.0
+            stem.lineCapStyle = .round
+            stem.move(to: NSPoint(x: cx, y: oy + box * 0.15))
+            stem.line(to: NSPoint(x: cx, y: oy + box * 0.56))
+            iconColor.setStroke()
+            stem.stroke()
+            let dotD = max(2.2, box * 0.17)
+            let dotRect = NSRect(x: cx - dotD * 0.5, y: oy + box * 0.82 - dotD * 0.5, width: dotD, height: dotD)
+            iconColor.setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
         default:
-            let ins: CGFloat = 1.8
+            let ins = max(1.8, box * 0.16)
             let p = NSBezierPath()
-            p.lineWidth = 1.8
+            p.lineWidth = 2.0
             p.lineCapStyle = .round
             p.move(to: NSPoint(x: ox + ins, y: oy + ins))
             p.line(to: NSPoint(x: ox + box - ins, y: oy + box - ins))
@@ -427,10 +715,10 @@ final class StatusIconView: NSView {
 }
 
 final class WaveBarsView: NSView {
-    static let barWidth: CGFloat = 2.5
-    static let barGap: CGFloat = 2.5
-    static let maxBarHeight: CGFloat = 15.0
-    static let totalWidth: CGFloat = 9.0 * 2.5 + 8.0 * 2.5
+    static let barWidth: CGFloat = 3.0
+    static let barGap: CGFloat = 3.0
+    static let maxBarHeight: CGFloat = 18.0
+    static let totalWidth: CGFloat = 51.0
 
     var barNorms: [CGFloat] = Array(repeating: 0.0, count: 9) {
         didSet { needsDisplay = true }
@@ -474,8 +762,9 @@ final class HudPillController {
     private static let warnMainText = rgba(254, 252, 232)
     private static let warnHintTextCol = rgba(251, 191, 36, 1.0)
 
-    private static let hudFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
-    private static let monoDurFont = NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .medium)
+    private static let hudFont = NSFont.systemFont(ofSize: 15.0, weight: .medium)
+    private static let monoDurFont = NSFont.monospacedDigitSystemFont(ofSize: 15.0, weight: .medium)
+    private static let toastFont = NSFont.systemFont(ofSize: 14.0, weight: .medium)
     private static let bellWeight: [CGFloat] = [1.00, 0.92, 0.78, 0.58, 0.40]
 
     private var panel: NSPanel?
@@ -488,6 +777,19 @@ final class HudPillController {
     private var hideWorkItem: DispatchWorkItem?
     private var animTimer: DispatchSourceTimer?
 
+    private var toastPanel: NSPanel?
+    private var toastBgView: NSView?
+    private var toastIconView: StatusIconView?
+    private var toastLabel: NSTextField?
+    private var toastHideWorkItem: DispatchWorkItem?
+
+    private var currentMainPillH: CGFloat = 42.0
+    private var isMainVisible = false
+    private var isToastVisible = false
+    private var anchoredScale: CGFloat = 2.0
+    private var anchoredVisibleFrame: NSRect = .zero
+    private var lastToastPosition: String = "bottom"
+    private var currentToastSize: NSSize = NSSize(width: 120.0, height: 36.0)
     private var isWaveRecording = false
     private var recStartMs: UInt64 = 0
     private var liveLevel: CGFloat = 0.0
@@ -517,20 +819,21 @@ final class HudPillController {
 
     private func ensurePanel() {
         if panel != nil { return }
-        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 34), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 240, height: 42), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.level = .statusBar
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
         p.ignoresMouseEvents = true; p.hidesOnDeactivate = false; p.isReleasedWhenClosed = false
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 34))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 42))
         container.wantsLayer = true
         container.layer?.backgroundColor = Self.recBg.cgColor
-        container.layer?.cornerRadius = 17.0
+        container.layer?.cornerRadius = 21.0
         container.layer?.borderWidth = 1.0
         container.layer?.masksToBounds = true
 
-        let iv = StatusIconView(frame: NSRect(x: 0, y: 0, width: StatusIconView.boxSize, height: StatusIconView.boxSize))
+        let iv = StatusIconView(frame: NSRect(x: 0, y: 0, width: StatusIconView.mainBoxSize, height: StatusIconView.mainBoxSize))
+        iv.configuredSize = StatusIconView.mainBoxSize
         iv.isHidden = true
         container.addSubview(iv)
 
@@ -541,7 +844,7 @@ final class HudPillController {
         tf.maximumNumberOfLines = 1
         container.addSubview(tf)
 
-        let wv = WaveBarsView(frame: NSRect(x: 0, y: 0, width: WaveBarsView.totalWidth, height: 34))
+        let wv = WaveBarsView(frame: NSRect(x: 0, y: 0, width: WaveBarsView.totalWidth, height: 42))
         wv.isHidden = true
         container.addSubview(wv)
 
@@ -565,6 +868,66 @@ final class HudPillController {
 
         p.contentView = container
         panel = p; bgView = container; iconView = iv; label = tf; waveView = wv; durLabel = dl; hintLabel = hl
+    }
+
+    private func ensureToastPanel() {
+        if toastPanel != nil { return }
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 220, height: 36), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.level = .statusBar
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
+        p.ignoresMouseEvents = true; p.hidesOnDeactivate = false; p.isReleasedWhenClosed = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 36))
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 18.0
+        container.layer?.borderWidth = 1.0
+        container.layer?.masksToBounds = true
+
+        let iv = StatusIconView(frame: NSRect(x: 0, y: 0, width: StatusIconView.toastBoxSize, height: StatusIconView.toastBoxSize))
+        iv.configuredSize = StatusIconView.toastBoxSize
+        iv.isHidden = true
+        container.addSubview(iv)
+
+        let tf = NSTextField(labelWithString: "")
+        tf.font = Self.toastFont
+        tf.alignment = .left
+        tf.lineBreakMode = .byTruncatingTail
+        tf.maximumNumberOfLines = 1
+        container.addSubview(tf)
+
+        p.contentView = container
+        toastPanel = p; toastBgView = container; toastIconView = iv; toastLabel = tf
+    }
+
+    private func activeScreenMetrics() -> (scale: CGFloat, visibleFrame: NSRect) {
+        let mouseLoc = NSEvent.mouseLocation
+        let activeScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) ?? NSScreen.main ?? NSScreen.screens.first
+        let scale = activeScreen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        let vf = activeScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        return (scale, vf)
+    }
+
+    private func resolveAnchoredScreenMetrics(refresh: Bool) -> (scale: CGFloat, visibleFrame: NSRect) {
+        if refresh || anchoredVisibleFrame.width <= 0.0 || (!isMainVisible && !isToastVisible) {
+            let (s, vf) = activeScreenMetrics()
+            anchoredScale = s
+            anchoredVisibleFrame = vf
+        }
+        return (anchoredScale, anchoredVisibleFrame)
+    }
+
+    private func syncToastToAnchor(position: String? = nil) {
+        guard isToastVisible, let toastPanel = toastPanel, anchoredVisibleFrame.width > 0.0 else { return }
+        if let pos = position, !pos.isEmpty { lastToastPosition = pos }
+        let vf = anchoredVisibleFrame
+        let scale = anchoredScale
+        let toastW = currentToastSize.width
+        let toastH = currentToastSize.height
+        let toastX = snapToPixel(vf.midX - toastW / 2.0, scale: scale)
+        let mainSlotH: CGFloat = isMainVisible ? max(42.0, currentMainPillH) : 42.0
+        let toastY = computeHudToastY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, mainH: mainSlotH, toastH: toastH, position: lastToastPosition)
+        toastPanel.setFrame(NSRect(x: toastX, y: toastY, width: toastW, height: toastH), display: false)
     }
 
     private func stopWaveTimer() {
@@ -707,30 +1070,29 @@ final class HudPillController {
             hintLabel.isHidden = true
         }
 
-        let padL: CGFloat = 15.0, padR: CGFloat = 15.0
+        let padL: CGFloat = 18.0, padR: CGFloat = 18.0
         let waveW: CGFloat = WaveBarsView.totalWidth
-        let gap1: CGFloat = 9.0
-        let gap2: CGFloat = effHint.isEmpty ? 0.0 : 9.0
+        let gap1: CGFloat = 11.0
+        let gap2: CGFloat = effHint.isEmpty ? 0.0 : 11.0
         let totalContentW = slotW + gap1 + waveW + gap2 + hintW
         let textH = max(max(tplH, actH), hintH)
 
-        let mouseLoc = NSEvent.mouseLocation
-        let activeScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) ?? NSScreen.main ?? NSScreen.screens.first
-        let scale = activeScreen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-        let vf = activeScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-
-        let maxW = max(64.0, min(640.0, vf.width - 24.0))
-        let pillH: CGFloat = max(34.0, textH + 14.0)
+        let (scale, vf) = resolveAnchoredScreenMetrics(refresh: false)
+        let maxW = max(64.0, min(680.0, vf.width - 24.0))
+        let pillH: CGFloat = max(42.0, ceil(textH) + 18.0)
         let pillW: CGFloat = min(maxW, max(64.0, snapToPixel(totalContentW + padL + padR, scale: scale)))
         let pillX = snapToPixel(vf.midX - pillW / 2.0, scale: scale)
         let pillY = computeHudPillY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, pillH: pillH, position: recPosition)
+        currentMainPillH = pillH
 
         panel.setFrame(NSRect(x: pillX, y: pillY, width: pillW, height: pillH), display: true)
+        syncToastToAnchor(position: recPosition)
         bgView.frame = NSRect(x: 0, y: 0, width: pillW, height: pillH)
         bgView.layer?.contentsScale = scale
         bgView.layer?.cornerRadius = pillH / 2.0
         bgView.layer?.backgroundColor = effBg.cgColor
         bgView.layer?.borderColor = effBorder.cgColor
+        bgView.layer?.borderWidth = 1.0
 
         let availW = max(1.0, pillW - padL - padR)
         var curX = padL + ((totalContentW <= availW) ? snapToPixel((availW - totalContentW) * 0.5, scale: scale) : 0.0)
@@ -752,11 +1114,23 @@ final class HudPillController {
         }
     }
 
-    func hide() {
+    func hideMain() {
         hideWorkItem?.cancel(); hideWorkItem = nil
         stopWaveTimer()
         maxDurationSec = 0; warnRemainSec = 0
+        isMainVisible = false
+        currentMainPillH = 42.0
         panel?.orderOut(nil)
+    }
+
+    func hideToast() {
+        toastHideWorkItem?.cancel(); toastHideWorkItem = nil
+        isToastVisible = false
+        toastPanel?.orderOut(nil)
+    }
+
+    func hide() {
+        hideMain()
     }
 
     private static func resolveIconKind(stateKind: String, iconSeg: String) -> String {
@@ -765,79 +1139,37 @@ final class HudPillController {
         case "◐": return "recognizing"
         case "◈": return "refining"
         case "✓": return "done"
-        case "○": return "empty"
-        default: return "error"
+        case "○": return "empty_ring"
+        case "!", "⚠", "⚠️": return "warning"
+        default: return "cross"
         }
     }
 
-    func update(state: String, customText: String, durationMs: Int, position: String = "bottom", maxDurationSec: Int = 0, warnRemainSec: Int = 0) {
+    private func updateMain(
+        state st: String,
+        style: HudVisualStyle,
+        customText: String,
+        durationMs: Int,
+        position: String,
+        maxDurationSec: Int,
+        warnRemainSec: Int,
+        zh: Bool
+    ) {
         hideWorkItem?.cancel(); hideWorkItem = nil
-        let st = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if st.isEmpty || st == "idle" || st == "hide" {
-            stopWaveTimer()
-            self.maxDurationSec = 0; self.warnRemainSec = 0
-            panel?.orderOut(nil)
-            return
-        }
-
         ensurePanel()
         guard let panel = panel, let bgView = bgView, let iconView = iconView, let label = label else { return }
 
-        let zh = isZhUiCulture(hostUiCulture())
-        var (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind): (String, NSColor, NSColor, NSColor, NSColor, NSColor, Int, String)
+        var txt = style.defaultText
         var waveMode = false
         if st == "recording" {
             txt = zh
                 ? "● 录音中… (\(isPtt ? "松开" : "按")\(hotkeyLabel) 完成)"
                 : "● Listening… (\(isPtt ? "release" : "press") \(hotkeyLabelEn) to finish)"
-            (bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                Self.recBg, Self.recWaveActive, Self.recMainText, Self.recHintTextCol, Self.recBorder, 0, ""
-            )
             let trimmedCustom = customText.trimmingCharacters(in: .whitespacesAndNewlines)
             waveMode = trimmedCustom.isEmpty || trimmedCustom.hasPrefix("● ")
-        } else if st == "recognizing" || st == "processing" {
-            (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                zh ? "◐ 语音识别…" : "◐ Transcribing…",
-                rgba(16, 40, 72, 0.95), rgba(56, 189, 248), rgba(244, 248, 252), rgba(176, 198, 222), rgba(56, 189, 248, 0.65), 0, "recognizing"
-            )
-        } else if st == "refining" {
-            (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                zh ? "◈ 整理精修…" : "◈ Refining…",
-                rgba(46, 22, 76, 0.95), rgba(208, 156, 255), rgba(248, 245, 255), rgba(198, 182, 226), rgba(192, 132, 252, 0.65), 0, "refining"
-            )
-        } else if st == "done" {
-            (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                zh ? "✓ 已填入" : "✓ Inserted",
-                rgba(14, 54, 36, 0.95), rgba(74, 222, 128), rgba(242, 253, 246), rgba(174, 218, 192), rgba(74, 222, 128, 0.62), 900, "done"
-            )
-        } else if st == "copied" {
-            (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                zh ? "✓ 已复制(窗口已切换)" : "✓ Copied (window switched)",
-                rgba(28, 32, 82, 0.95), rgba(144, 156, 255), rgba(240, 244, 255), rgba(186, 196, 238), rgba(129, 140, 248, 0.68), 2000, "done"
-            )
-        } else if st == "empty" {
-            (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                zh ? "○ 未检测到语音" : "○ No speech detected",
-                rgba(66, 44, 12, 0.95), rgba(251, 191, 36), rgba(254, 243, 199), rgba(226, 202, 148), rgba(251, 191, 36, 0.68), 2200, "empty"
-            )
-        } else if st == "no_mic" {
-            (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                zh ? "✕ 无可用麦克风" : "✕ No microphone found",
-                rgba(84, 18, 24, 0.95), rgba(252, 129, 129), rgba(254, 226, 226), rgba(238, 178, 182), rgba(248, 113, 113, 0.78), 2200, "error"
-            )
-        } else if st == "mic_disconnected" {
-            (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                zh ? "✕ 麦克风已断开" : "✕ Microphone disconnected",
-                rgba(84, 18, 24, 0.95), rgba(252, 129, 129), rgba(254, 226, 226), rgba(238, 178, 182), rgba(248, 113, 113, 0.78), 2200, "error"
-            )
-        } else {
-            (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                zh ? "✕ 识别失败" : "✕ Transcription failed",
-                rgba(84, 18, 24, 0.95), rgba(252, 129, 129), rgba(254, 226, 226), rgba(238, 178, 182), rgba(248, 113, 113, 0.78), 2600, "error"
-            )
         }
         if !customText.isEmpty { txt = customText }
-        if durationMs > 0 { autoHideMs = durationMs }
+        let autoHideMs = (durationMs > 0) ? durationMs : style.autoHideMs
 
         let seg = splitHudSegments(txt)
         if waveMode {
@@ -847,6 +1179,7 @@ final class HudPillController {
             self.maxDurationSec = max(0, maxDurationSec)
             self.warnRemainSec = (self.maxDurationSec > 0) ? (warnRemainSec > 0 ? warnRemainSec : recordingCountdownWarnSec(self.maxDurationSec)) : 0
             if !isWaveRecording {
+                _ = resolveAnchoredScreenMetrics(refresh: !isToastVisible)
                 isWaveRecording = true
                 recStartMs = monotonicMs()
                 smoothLevel = 0.0
@@ -860,6 +1193,7 @@ final class HudPillController {
                 waveView?.barNorms = (initLvl > 0.0) ? stepWaveEnvelope(initLvl) : Array(repeating: 0.0, count: 9)
             }
             layoutWavePill(forceFrame: true)
+            isMainVisible = true
             panel.orderFrontRegardless()
             startWaveTimerIfNeeded()
         } else {
@@ -869,7 +1203,13 @@ final class HudPillController {
             durLabel?.isHidden = true
             hintLabel?.isHidden = true
 
-            let hasIcon = !seg.icon.isEmpty
+            let mainColor = style.mainText.nsColor
+            let hintColor = style.hintText.nsColor
+            let iconColor = style.icon.nsColor
+            let bgCol = style.bg.nsColor
+            let bd = style.border.nsColor
+
+            let hasIcon = !seg.icon.isEmpty || !style.iconKind.isEmpty
             let hasBody = !seg.main.isEmpty || !seg.hint.isEmpty
             let para = NSMutableParagraphStyle()
             para.alignment = hasIcon ? .left : .center
@@ -893,32 +1233,35 @@ final class HudPillController {
             label.sizeToFit()
             label.isHidden = !hasBody
 
-            let textSize = hasBody ? label.frame.size : NSSize(width: 0, height: 15)
-            let iconBox: CGFloat = hasIcon ? StatusIconView.boxSize : 0.0
-            let iconGap: CGFloat = (hasIcon && hasBody) ? 6.0 : 0.0
-            let padL: CGFloat = 15.0, padR: CGFloat = 15.0
+            let textSize = hasBody ? label.frame.size : NSSize(width: 0, height: 18)
+            let textH = ceil(textSize.height)
+            let iconBox: CGFloat = hasIcon ? StatusIconView.mainBoxSize : 0.0
+            let iconGap: CGFloat = (hasIcon && hasBody) ? 8.0 : 0.0
+            let padL: CGFloat = 18.0, padR: CGFloat = 18.0
             let contentW = iconBox + iconGap + ceil(textSize.width)
-            let pillH: CGFloat = max(34.0, ceil(textSize.height) + 14.0)
-            let pillW: CGFloat = min(640.0, max(64.0, contentW + padL + padR))
+            let pillH: CGFloat = max(42.0, ceil(textH) + 18.0)
 
-            let mouseLoc = NSEvent.mouseLocation
-            let activeScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) ?? NSScreen.main ?? NSScreen.screens.first
-            let scale = activeScreen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-            let vf = activeScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-
+            let (scale, vf) = resolveAnchoredScreenMetrics(refresh: false)
+            let maxW = max(64.0, min(680.0, vf.width - 24.0))
+            let pillW: CGFloat = min(maxW, max(64.0, snapToPixel(contentW + padL + padR, scale: scale)))
             let pillX = snapToPixel(vf.midX - pillW / 2.0, scale: scale)
             let pillY = computeHudPillY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, pillH: pillH, position: position)
+            currentMainPillH = pillH
+
             panel.setFrame(NSRect(x: pillX, y: pillY, width: pillW, height: pillH), display: false)
+            syncToastToAnchor(position: position)
             bgView.frame = NSRect(x: 0, y: 0, width: pillW, height: pillH)
             bgView.layer?.contentsScale = scale
             bgView.layer?.cornerRadius = pillH / 2.0
             bgView.layer?.backgroundColor = bgCol.cgColor
             bgView.layer?.borderColor = bd.cgColor
+            bgView.layer?.borderWidth = style.borderWidth
 
             let availW = max(1.0, pillW - padL - padR)
             var curX = padL + ((contentW <= availW) ? snapToPixel((availW - contentW) * 0.5, scale: scale) : 0.0)
             if hasIcon {
-                iconView.iconKind = Self.resolveIconKind(stateKind: iconKind, iconSeg: seg.icon)
+                iconView.configuredSize = StatusIconView.mainBoxSize
+                iconView.iconKind = Self.resolveIconKind(stateKind: style.iconKind, iconSeg: seg.icon)
                 iconView.iconColor = iconColor
                 let iconY = snapToPixel((pillH - iconBox) / 2.0, scale: scale)
                 iconView.frame = NSRect(x: curX, y: iconY, width: iconBox, height: iconBox)
@@ -929,23 +1272,166 @@ final class HudPillController {
                 iconView.isHidden = true
             }
             if hasBody {
-                let labelH = ceil(textSize.height)
-                let labelY = snapToPixel((pillH - labelH) / 2.0, scale: scale)
+                let labelY = snapToPixel((pillH - textH) / 2.0, scale: scale)
                 let remW = max(0.0, pillW - padR - curX)
-                label.frame = NSRect(x: curX, y: labelY, width: min(ceil(textSize.width), remW), height: labelH)
+                label.frame = NSRect(x: curX, y: labelY, width: min(ceil(textSize.width), remW), height: textH)
             }
+            isMainVisible = true
             panel.orderFrontRegardless()
         }
 
         if autoHideMs > 0 {
-            let work = DispatchWorkItem { [weak self] in self?.hide() }
+            let work = DispatchWorkItem { [weak self] in self?.hideMain() }
             hideWorkItem = work
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(autoHideMs), execute: work)
         }
     }
 
+    private func updateToast(
+        style: HudVisualStyle,
+        customText: String,
+        durationMs: Int,
+        position: String
+    ) {
+        toastHideWorkItem?.cancel(); toastHideWorkItem = nil
+        ensureToastPanel()
+        guard let toastPanel = toastPanel, let toastBgView = toastBgView,
+              let toastIconView = toastIconView, let toastLabel = toastLabel else { return }
+
+        let rawTxt = customText.isEmpty ? style.defaultText : customText
+        let bodyTxt = stripLeadingHudSymbol(rawTxt)
+        let seg = splitHudSegments(rawTxt)
+        let effIconKind = Self.resolveIconKind(stateKind: style.iconKind, iconSeg: seg.icon)
+        let hasIcon = !effIconKind.isEmpty
+        let hasBody = !bodyTxt.isEmpty
+
+        let para = NSMutableParagraphStyle()
+        para.alignment = hasIcon ? .left : .center
+        para.lineBreakMode = .byTruncatingTail
+        toastLabel.attributedStringValue = NSAttributedString(string: bodyTxt, attributes: [
+            .font: Self.toastFont,
+            .foregroundColor: style.mainText.nsColor,
+            .paragraphStyle: para,
+        ])
+        toastLabel.sizeToFit()
+        toastLabel.isHidden = !hasBody
+
+        let textSize = hasBody ? toastLabel.frame.size : NSSize(width: 0, height: 17)
+        let textH = ceil(textSize.height)
+        let iconBox: CGFloat = hasIcon ? StatusIconView.toastBoxSize : 0.0
+        let iconGap: CGFloat = (hasIcon && hasBody) ? 7.0 : 0.0
+        let padL: CGFloat = 15.0, padR: CGFloat = 15.0
+        let contentW = iconBox + iconGap + ceil(textSize.width)
+        let toastH: CGFloat = max(36.0, ceil(textH) + 14.0)
+
+        let (scale, vf) = resolveAnchoredScreenMetrics(refresh: !(isMainVisible || isToastVisible))
+        let maxW = max(64.0, min(680.0, vf.width - 24.0))
+        let toastW: CGFloat = min(maxW, max(64.0, snapToPixel(contentW + padL + padR, scale: scale)))
+        let toastX = snapToPixel(vf.midX - toastW / 2.0, scale: scale)
+        let mainSlotH: CGFloat = isMainVisible ? max(42.0, currentMainPillH) : 42.0
+        let toastY = computeHudToastY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, mainH: mainSlotH, toastH: toastH, position: position)
+        lastToastPosition = position
+        currentToastSize = NSSize(width: toastW, height: toastH)
+
+        toastPanel.setFrame(NSRect(x: toastX, y: toastY, width: toastW, height: toastH), display: false)
+        toastBgView.frame = NSRect(x: 0, y: 0, width: toastW, height: toastH)
+        toastBgView.layer?.contentsScale = scale
+        toastBgView.layer?.cornerRadius = toastH / 2.0
+        toastBgView.layer?.backgroundColor = style.bg.nsColor.cgColor
+        toastBgView.layer?.borderColor = style.border.nsColor.cgColor
+        toastBgView.layer?.borderWidth = style.borderWidth
+
+        let availW = max(1.0, toastW - padL - padR)
+        var curX = padL + ((contentW <= availW) ? snapToPixel((availW - contentW) * 0.5, scale: scale) : 0.0)
+        if hasIcon {
+            toastIconView.configuredSize = StatusIconView.toastBoxSize
+            toastIconView.iconKind = effIconKind
+            toastIconView.iconColor = style.icon.nsColor
+            let iconY = snapToPixel((toastH - iconBox) / 2.0, scale: scale)
+            toastIconView.frame = NSRect(x: curX, y: iconY, width: iconBox, height: iconBox)
+            toastIconView.layer?.contentsScale = scale
+            toastIconView.isHidden = false
+            curX += iconBox + iconGap
+        } else {
+            toastIconView.isHidden = true
+        }
+        if hasBody {
+            let labelY = snapToPixel((toastH - textH) / 2.0, scale: scale)
+            let remW = max(0.0, toastW - padR - curX)
+            toastLabel.frame = NSRect(x: curX, y: labelY, width: min(ceil(textSize.width), remW), height: textH)
+        }
+        isToastVisible = true
+        toastPanel.orderFrontRegardless()
+
+        let autoHideMs = (durationMs > 0) ? durationMs : style.autoHideMs
+        if autoHideMs > 0 {
+            let work = DispatchWorkItem { [weak self] in self?.hideToast() }
+            toastHideWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(autoHideMs), execute: work)
+        }
+    }
+
+    func update(
+        state: String,
+        customText: String,
+        durationMs: Int,
+        position: String = "bottom",
+        maxDurationSec: Int = 0,
+        warnRemainSec: Int = 0,
+        layer: String = "",
+        clearMain: Bool? = nil,
+        clearToast: Bool? = nil
+    ) {
+        let st = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if st.isEmpty || st == "idle" || st == "hide" {
+            hideMain()
+            if clearToast == true { hideToast() }
+            return
+        }
+        if st == "hide_toast" {
+            hideToast()
+            return
+        }
+        if st == "hide_all" {
+            hideMain()
+            hideToast()
+            return
+        }
+
+        let zh = isZhUiCulture(hostUiCulture())
+        let style = resolveHudVisualStyle(state: st, explicitLayer: layer, zh: zh)
+        if style.layer == "main" {
+            if clearToast == true || (st == "recording" && clearToast == nil) {
+                hideToast()
+            }
+            updateMain(
+                state: st,
+                style: style,
+                customText: customText,
+                durationMs: durationMs,
+                position: position,
+                maxDurationSec: maxDurationSec,
+                warnRemainSec: warnRemainSec,
+                zh: zh
+            )
+        } else {
+            updateToast(
+                style: style,
+                customText: customText,
+                durationMs: durationMs,
+                position: position
+            )
+            if clearMain == true {
+                hideMain()
+            }
+        }
+    }
+
     func close() {
-        hide(); panel?.close(); panel = nil
+        hideMain()
+        hideToast()
+        panel?.close(); panel = nil
+        toastPanel?.close(); toastPanel = nil
     }
 }
 
@@ -968,6 +1454,280 @@ private func queryFrontmostApp() -> (name: String, bundleId: String, pid: Int) {
     guard let app = NSWorkspace.shared.frontmostApplication else { return ("", "", 0) }
     let name = app.localizedName ?? app.bundleURL?.deletingPathExtension().lastPathComponent ?? ""
     return (name, app.bundleIdentifier ?? "", Int(app.processIdentifier))
+}
+
+private func parseOptionalBool(_ raw: Any?) -> Bool? {
+    if let b = raw as? Bool { return b }
+    if let n = raw as? NSNumber { return n.boolValue }
+    return nil
+}
+
+private func audioDeviceInputChannelCount(_ devId: AudioDeviceID) -> Int {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    if !AudioObjectHasProperty(devId, &addr) { return 0 }
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(devId, &addr, 0, nil, &size) == noErr,
+          size >= UInt32(MemoryLayout<AudioBufferList>.size) else {
+        return 0
+    }
+    let rawPtr = UnsafeMutableRawPointer.allocate(
+        byteCount: Int(size),
+        alignment: MemoryLayout<AudioBufferList>.alignment
+    )
+    defer { rawPtr.deallocate() }
+    guard AudioObjectGetPropertyData(devId, &addr, 0, nil, &size, rawPtr) == noErr else {
+        return 0
+    }
+    let ablPtr = rawPtr.assumingMemoryBound(to: AudioBufferList.self)
+    let buffers = UnsafeMutableAudioBufferListPointer(ablPtr)
+    var totalChannels = 0
+    for buf in buffers {
+        totalChannels += Int(buf.mNumberChannels)
+    }
+    return totalChannels
+}
+
+private func isAudioDeviceAlive(_ devId: AudioDeviceID) -> Bool {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceIsAlive,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    if !AudioObjectHasProperty(devId, &addr) {
+        return true
+    }
+    var alive: UInt32 = 1
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    let status = AudioObjectGetPropertyData(devId, &addr, 0, nil, &size, &alive)
+    if status != noErr {
+        return true
+    }
+    return alive != 0
+}
+
+private func readAudioStringProperty(_ devId: AudioObjectID, selector: AudioObjectPropertySelector) -> String {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    if !AudioObjectHasProperty(devId, &addr) {
+        return ""
+    }
+    var unmanagedStr: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    let status = withUnsafeMutablePointer(to: &unmanagedStr) { ptr in
+        AudioObjectGetPropertyData(devId, &addr, 0, nil, &size, ptr)
+    }
+    guard status == noErr, let cfStr = unmanagedStr?.takeRetainedValue() else {
+        return ""
+    }
+    return (cfStr as String).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func queryDefaultInputDeviceID() -> AudioDeviceID {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var devId = AudioDeviceID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &devId)
+    return (status == noErr) ? devId : AudioDeviceID(kAudioObjectUnknown)
+}
+
+func queryAudioInputStatus() -> [String: Any] {
+    let sysObj = AudioObjectID(kAudioObjectSystemObject)
+    var devicesAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var dataSize: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(sysObj, &devicesAddr, 0, nil, &dataSize) == noErr,
+          dataSize >= UInt32(MemoryLayout<AudioDeviceID>.size) else {
+        return ["has_input": false, "input_count": 0, "default_uid": "", "default_name": "", "default_name_unique": false, "alive_uids": [String](), "uid_names": [String: String]()]
+    }
+    let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+    var deviceIds = [AudioDeviceID](repeating: 0, count: count)
+    var actualSize = dataSize
+    guard AudioObjectGetPropertyData(sysObj, &devicesAddr, 0, nil, &actualSize, &deviceIds) == noErr else {
+        return ["has_input": false, "input_count": 0, "default_uid": "", "default_name": "", "default_name_unique": false, "alive_uids": [String](), "uid_names": [String: String]()]
+    }
+    let actualCount = min(count, Int(actualSize) / MemoryLayout<AudioDeviceID>.size)
+
+    var aliveUids: [String] = []
+    var uidNames: [String: String] = [:]
+    var aliveById: [AudioDeviceID: (uid: String, name: String)] = [:]
+    for idx in 0..<actualCount {
+        let devId = deviceIds[idx]
+        if devId == AudioDeviceID(kAudioObjectUnknown) { continue }
+        if audioDeviceInputChannelCount(devId) <= 0 { continue }
+        if !isAudioDeviceAlive(devId) { continue }
+        let rawUid = readAudioStringProperty(devId, selector: kAudioDevicePropertyDeviceUID)
+        let uid = rawUid.isEmpty ? "dev-\(devId)" : rawUid
+        let name = readAudioStringProperty(devId, selector: kAudioObjectPropertyName)
+        if !aliveUids.contains(uid) {
+            aliveUids.append(uid)
+        }
+        uidNames[uid] = name
+        aliveById[devId] = (uid: uid, name: name)
+    }
+
+    let defId = queryDefaultInputDeviceID()
+    var defaultUid = ""
+    var defaultName = ""
+    if let entry = aliveById[defId] {
+        defaultUid = entry.uid
+        defaultName = entry.name
+    }
+    var defaultNameUnique = !defaultUid.isEmpty && !defaultName.isEmpty && !defaultName.contains(":")
+    if defaultNameUnique {
+        for (otherUid, otherName) in uidNames where otherUid != defaultUid {
+            if otherName.isEmpty || otherName == defaultName || otherName.hasPrefix(defaultName) || defaultName.hasPrefix(otherName) {
+                defaultNameUnique = false
+                break
+            }
+        }
+    }
+    return [
+        "has_input": !aliveUids.isEmpty,
+        "input_count": aliveUids.count,
+        "default_uid": defaultUid,
+        "default_name": defaultName,
+        "default_name_unique": defaultNameUnique,
+        "alive_uids": aliveUids,
+        "uid_names": uidNames,
+    ]
+}
+
+private func audioStatusSnapshotKey(_ st: [String: Any]) -> String {
+    let hasIn = (st["has_input"] as? Bool) ?? false
+    let cnt = (st["input_count"] as? Int) ?? 0
+    let defUid = (st["default_uid"] as? String) ?? ""
+    let defName = (st["default_name"] as? String) ?? ""
+    let defUniq = (st["default_name_unique"] as? Bool) ?? false
+    let uids = (st["alive_uids"] as? [String]) ?? []
+    let uidNames = (st["uid_names"] as? [String: String]) ?? [:]
+    let pairs = uids.map { "\($0)=\(uidNames[$0] ?? "")" }.joined(separator: ",")
+    return "\(hasIn)|\(cnt)|\(defUid)|\(defName)|\(defUniq)|\(pairs)"
+}
+
+final class CoreAudioInputMonitor {
+    private let queue = DispatchQueue(label: "agent_voice_input.coreaudio")
+    private var sysDevicesBlock: AudioObjectPropertyListenerBlock?
+    private var sysDefaultBlock: AudioObjectPropertyListenerBlock?
+    private var devAliveBlock: AudioObjectPropertyListenerBlock?
+    private var watchedDefaultDevId: AudioDeviceID = AudioDeviceID(kAudioObjectUnknown)
+    private var lastSnapshotKey: String = ""
+    private var started = false
+
+    private func rebindDefaultDeviceAliveListenerOnQueue() {
+        let newDevId = queryDefaultInputDeviceID()
+        if newDevId == watchedDefaultDevId { return }
+        var aliveAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        if watchedDefaultDevId != AudioDeviceID(kAudioObjectUnknown), let oldBlock = devAliveBlock {
+            _ = AudioObjectRemovePropertyListenerBlock(watchedDefaultDevId, &aliveAddr, queue, oldBlock)
+            watchedDefaultDevId = AudioDeviceID(kAudioObjectUnknown)
+        }
+        if newDevId != AudioDeviceID(kAudioObjectUnknown), let block = devAliveBlock, AudioObjectHasProperty(newDevId, &aliveAddr) {
+            if AudioObjectAddPropertyListenerBlock(newDevId, &aliveAddr, queue, block) == noErr {
+                watchedDefaultDevId = newDevId
+            }
+        }
+    }
+
+    private func emitIfChangedOnQueue() {
+        if !started { return }
+        rebindDefaultDeviceAliveListenerOnQueue()
+        let st = queryAudioInputStatus()
+        let key = audioStatusSnapshotKey(st)
+        if key != lastSnapshotKey {
+            lastSnapshotKey = key
+            var ev = st
+            ev["event"] = "audio_devices_changed"
+            writeJsonLine(ev)
+        }
+    }
+
+    func start() -> [String: Any] {
+        return queue.sync {
+            let initial = queryAudioInputStatus()
+            if started { return initial }
+            started = true
+            lastSnapshotKey = audioStatusSnapshotKey(initial)
+
+            let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                self?.emitIfChangedOnQueue()
+            }
+            sysDevicesBlock = listener
+            sysDefaultBlock = listener
+            devAliveBlock = listener
+
+            let sysObj = AudioObjectID(kAudioObjectSystemObject)
+            var devsAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDevices,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            _ = AudioObjectAddPropertyListenerBlock(sysObj, &devsAddr, queue, listener)
+
+            var defAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            _ = AudioObjectAddPropertyListenerBlock(sysObj, &defAddr, queue, listener)
+
+            rebindDefaultDeviceAliveListenerOnQueue()
+            return initial
+        }
+    }
+
+    func stop() {
+        queue.sync {
+            if !started { return }
+            started = false
+            let sysObj = AudioObjectID(kAudioObjectSystemObject)
+            if let b1 = sysDevicesBlock {
+                var devsAddr = AudioObjectPropertyAddress(
+                    mSelector: kAudioHardwarePropertyDevices,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+                _ = AudioObjectRemovePropertyListenerBlock(sysObj, &devsAddr, queue, b1)
+            }
+            if let b2 = sysDefaultBlock {
+                var defAddr = AudioObjectPropertyAddress(
+                    mSelector: kAudioHardwarePropertyDefaultInputDevice,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+                _ = AudioObjectRemovePropertyListenerBlock(sysObj, &defAddr, queue, b2)
+            }
+            if watchedDefaultDevId != AudioDeviceID(kAudioObjectUnknown), let b3 = devAliveBlock {
+                var aliveAddr = AudioObjectPropertyAddress(
+                    mSelector: kAudioDevicePropertyDeviceIsAlive,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain
+                )
+                _ = AudioObjectRemovePropertyListenerBlock(watchedDefaultDevId, &aliveAddr, queue, b3)
+                watchedDefaultDevId = AudioDeviceID(kAudioObjectUnknown)
+            }
+            sysDevicesBlock = nil
+            sysDefaultBlock = nil
+            devAliveBlock = nil
+        }
+    }
 }
 
 private func runSelfCheck() -> Int32 {
@@ -1015,9 +1775,33 @@ private func runSelfCheck() -> Int32 {
         try check(recov.count == 1 && recov[0].kind == "toggle", "recovered toggle after swallowed keyUp")
 
         try check(isZhUiCulture("zh-Hans-CN") && isZhUiCulture("zh_TW.UTF-8") && !isZhUiCulture("en-US"), "ui_culture zh detection")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 58.0, "HUD bottom pillY")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 58.0, "HUD default pillY")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: " TOP ") == 850.0, "HUD top pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 42.0, position: "bottom") == 58.0, "HUD bottom pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 42.0, position: "") == 58.0, "HUD default pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 42.0, position: " TOP ") == 844.0, "HUD top pillY")
+        try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 42.0, toastH: 36.0, position: "bottom") == 108.0, "HUD bottom toastY")
+        try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 0.0, toastH: 36.0, position: "") == 108.0, "HUD bottom toastY min mainH")
+        try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 42.0, toastH: 36.0, position: " TOP ") == 800.0, "HUD top toastY")
+
+        try check(stripLeadingHudSymbol("! 麦克风暂忙") == "麦克风暂忙", "stripLeadingHudSymbol bang")
+        try check(stripLeadingHudSymbol("⚠ 麦克风暂忙") == "麦克风暂忙", "stripLeadingHudSymbol warn")
+        try check(stripLeadingHudSymbol("⚠️ 麦克风暂忙") == "麦克风暂忙", "stripLeadingHudSymbol warn vs16")
+        try check(stripLeadingHudSymbol("✕ 无可用麦克风") == "无可用麦克风", "stripLeadingHudSymbol cross")
+
+        let stBusy = resolveHudVisualStyle(state: "mic_unavailable", zh: true)
+        let stRecov = resolveHudVisualStyle(state: "audio_recovered", zh: true)
+        let stEmpty = resolveHudVisualStyle(state: "empty", zh: true)
+        let stNoMic = resolveHudVisualStyle(state: "no_mic", zh: true)
+        let stPerm = resolveHudVisualStyle(state: "mic_permission", zh: true)
+        let stPaste = resolveHudVisualStyle(state: "paste_failed", zh: true)
+        let stRecog = resolveHudVisualStyle(state: "recognizing", zh: true)
+        try check(stBusy.layer == "toast" && stBusy.iconKind == "warning" && stBusy.borderWidth == 1.0, "style mic_unavailable")
+        try check(stRecov.layer == "toast" && stRecov.iconKind == "warning" && stRecov.bg == stBusy.bg && stRecov.border == stBusy.border, "style audio_recovered")
+        try check(stEmpty.layer == "toast" && stEmpty.iconKind == "empty_ring" && stEmpty.border == stBusy.border, "style empty")
+        try check(stNoMic.layer == "toast" && stNoMic.iconKind == "cross" && stNoMic.bg == stBusy.bg && stNoMic.border != stBusy.border, "style no_mic")
+        try check(stPerm.layer == "toast" && stPerm.iconKind == "cross" && stPerm.autoHideMs == 3200, "style mic_permission")
+        try check(stPaste.layer == "toast" && stPaste.iconKind == "cross" && stPaste.border == stNoMic.border, "style paste_failed")
+        try check(stRecog.layer == "main" && stRecog.iconKind == "recognizing", "style recognizing")
+
         try check(splitHudSegments("● 录音中… (按右 Ctrl 完成)") == HudSegments(icon: "●", main: "录音中…", hint: "(按右 Ctrl 完成)", hasSpaceBeforeHint: true), "HUD split recording zh")
         try check(stripOuterParens("(按右 Ctrl 完成)") == "按右 Ctrl 完成" && stripOuterParens("12s 后自动完成") == "12s 后自动完成" && stripOuterParens("") == "", "HUD strip outer parens")
         try check(splitHudSegments("✓ 已复制(窗口已切换)") == HudSegments(icon: "✓", main: "已复制", hint: "(窗口已切换)", hasSpaceBeforeHint: false), "HUD split copied zh")
@@ -1029,6 +1813,17 @@ private func runSelfCheck() -> Int32 {
         try check(formatCountdownHint(12, zh: true) == "(12s 后自动完成)" && formatCountdownHint(5, zh: false) == "(auto-finish in 5s)", "HUD countdown hint")
         try check(countdownHintSlotTemplate(12, zh: true) == "(88s 后自动完成)" && countdownHintSlotTemplate(9, zh: false) == "(auto-finish in 8s)", "HUD countdown slot template")
 
+        let audioSt = queryAudioInputStatus()
+        guard let hasInput = audioSt["has_input"] as? Bool,
+              let inputCount = audioSt["input_count"] as? Int,
+              let defaultUid = audioSt["default_uid"] as? String,
+              let _ = audioSt["default_name"] as? String,
+              let aliveUids = audioSt["alive_uids"] as? [String] else {
+            throw NSError(domain: "SelfCheck", code: 2, userInfo: [NSLocalizedDescriptionKey: "invalid queryAudioInputStatus structure"])
+        }
+        try check(aliveUids.count == inputCount && (inputCount > 0) == hasInput, "audio_status count invariant")
+        try check(defaultUid.isEmpty || aliveUids.contains(defaultUid), "audio_status default_uid invariant")
+
         #if arch(arm64)
         let archName = "arm64"
         #elseif arch(x86_64)
@@ -1036,7 +1831,7 @@ private func runSelfCheck() -> Int32 {
         #else
         let archName = "unknown"
         #endif
-        writeJsonLine(["ok": true, "mode": "self-check", "arch": archName, "rcontrol_vk": String(format: "0x%02X", rctrl.primaryKeyCode), "rcontrol_mask": String(format: "0x%04X", rctrl.deviceMask), "ui_culture": hostUiCulture()])
+        writeJsonLine(["ok": true, "mode": "self-check", "arch": archName, "rcontrol_vk": String(format: "0x%02X", rctrl.primaryKeyCode), "rcontrol_mask": String(format: "0x%04X", rctrl.deviceMask), "ui_culture": hostUiCulture(), "audio_status": audioSt])
         return 0
     } catch {
         fputs("self-check error: \(error.localizedDescription)\n", stderr)
@@ -1078,11 +1873,13 @@ struct MacShimMain {
         app.setActivationPolicy(.accessory)
 
         let hud = HudPillController(hotkeyLabel: spec.hudLabel, hotkeyLabelEn: spec.hudLabelEn, isPtt: isPtt)
+        let audioMonitor = CoreAudioInputMonitor()
         var engine = HotkeyEngine(spec: spec, isPtt: isPtt, tapMaxMs: tapMaxMs, debounceMs: debounceMs, keyTest: isKeyTest)
         var globalMonitor: Any?
 
         let cleanupAndExit: (Int32) -> Never = { code in
             if let gm = globalMonitor { NSEvent.removeMonitor(gm); globalMonitor = nil }
+            audioMonitor.stop()
             hud.close()
             Foundation.exit(code)
         }
@@ -1136,6 +1933,8 @@ struct MacShimMain {
             app.run(); cleanupAndExit(0)
         }
 
+        let initialAudioStatus = audioMonitor.start()
+
         let stdinThread = Thread {
             while let rawLine = readLine(strippingNewline: true) {
                 let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1149,12 +1948,27 @@ struct MacShimMain {
                     case "fg_window":
                         let fg = queryFrontmostApp()
                         writeJsonLine(["type": "reply", "reply": "fg_window", "seq_id": seqId, "ok": true, "hwnd": 0, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": ""])
+                    case "audio_status":
+                        writeJsonLine(["type": "reply", "reply": true, "seq_id": seqId, "ok": true, "audio_status": queryAudioInputStatus()])
                     case "hud":
                         let dms = (obj["duration_ms"] as? Int) ?? ((obj["duration_ms"] as? NSNumber)?.intValue ?? 0)
                         let maxDur = (obj["max_duration_sec"] as? Int) ?? ((obj["max_duration_sec"] as? NSNumber)?.intValue ?? 0)
                         let warnRem = (obj["warn_remain_sec"] as? Int) ?? ((obj["warn_remain_sec"] as? NSNumber)?.intValue ?? 0)
                         let pos = (obj["position"] as? String) ?? "bottom"
-                        hud.update(state: (obj["state"] as? String) ?? "", customText: (obj["text"] as? String) ?? "", durationMs: dms, position: pos, maxDurationSec: maxDur, warnRemainSec: warnRem)
+                        let layer = (obj["layer"] as? String) ?? ""
+                        let clearMain = parseOptionalBool(obj["clear_main"])
+                        let clearToast = parseOptionalBool(obj["clear_toast"])
+                        hud.update(
+                            state: (obj["state"] as? String) ?? "",
+                            customText: (obj["text"] as? String) ?? "",
+                            durationMs: dms,
+                            position: pos,
+                            maxDurationSec: maxDur,
+                            warnRemainSec: warnRem,
+                            layer: layer,
+                            clearMain: clearMain,
+                            clearToast: clearToast
+                        )
                         writeJsonLine(["type": "reply", "reply": "hud", "seq_id": seqId, "ok": true])
                     case "hud_level":
                         let lvl = (obj["level"] as? Double) ?? ((obj["level"] as? NSNumber)?.doubleValue ?? 0.0)
@@ -1175,7 +1989,7 @@ struct MacShimMain {
         stdinThread.name = "mac-shim-stdin"
         stdinThread.start()
 
-        writeJsonLine(["event": "ready", "target_vk": String(format: "0x%02X", spec.primaryKeyCode), "mode": triggerMode, "listen_access": hasListenAccess, "ui_culture": hostUiCulture()])
+        writeJsonLine(["event": "ready", "target_vk": String(format: "0x%02X", spec.primaryKeyCode), "mode": triggerMode, "listen_access": hasListenAccess, "ui_culture": hostUiCulture(), "audio_status": initialAudioStatus])
         app.run(); cleanupAndExit(0)
     }
 }

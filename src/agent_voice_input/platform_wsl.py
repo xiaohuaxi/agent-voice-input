@@ -1,7 +1,7 @@
 """WSL2 host bridge: WASAPI 16kHz capture via win_shim.ps1 stdio JSONL + PulseAudio RDPSource fallback."""
 from __future__ import annotations
 
-import base64, json, os, queue, signal, subprocess, sys, threading, time
+import base64, inspect, json, os, queue, signal, subprocess, sys, threading, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -11,6 +11,7 @@ from .config import Config, normalize_ui_position, redact_secrets
 from .hud import (
     default_hud_duration_ms,
     format_hud_text,
+    hud_layer_for_state,
     pcm16le_rms_level,
     recording_countdown_warn_sec,
     resolve_ui_language,
@@ -69,6 +70,104 @@ class PasteOutcome:
 class NoMicrophoneError(RuntimeError):
     """Raised when no usable microphone / audio input device can be opened."""
 
+    reason_code: str = "no_mic"
+    hud_state: str = "no_mic"
+
+
+class MicrophoneUnavailableError(RuntimeError):
+    """Raised when a microphone exists but cannot be opened (busy, switching, or permission denied)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "mic_unavailable",
+        hud_state: str = "mic_unavailable",
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.hud_state = hud_state
+
+
+def _callable_accepts_kwarg(cb: Callable[..., Any], kw: str) -> bool:
+    try:
+        sig = inspect.signature(cb)
+    except (TypeError, ValueError):
+        return False
+    return kw in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+
+def invoke_recorder_lost_callback(cb: Callable[..., Any] | None, seq_id: int | None = None) -> None:
+    if cb is None:
+        return
+    if seq_id is not None and _callable_accepts_kwarg(cb, "seq_id"):
+        cb(seq_id=seq_id)
+        return
+    cb()
+
+
+def invoke_recorder_recovered_callback(cb: Callable[..., Any] | None, gap_ms: int, seq_id: int | None = None) -> None:
+    if cb is None:
+        return
+    if seq_id is not None and _callable_accepts_kwarg(cb, "seq_id"):
+        cb(gap_ms, seq_id=seq_id)
+        return
+    cb(gap_ms)
+
+
+def classify_ffmpeg_startup_error(
+    stderr: str,
+    rc: int | None,
+    *,
+    diagnostic: str,
+    has_known_input: bool | None = None,
+) -> NoMicrophoneError | MicrophoneUnavailableError:
+    low = (stderr or "").lower()
+    if any(
+        tok in low
+        for tok in (
+            "permission denied",
+            "not authorized",
+            "access denied",
+            "operation not permitted",
+            "authorization",
+        )
+    ):
+        return MicrophoneUnavailableError(
+            f"microphone access denied ({diagnostic})",
+            reason_code="mic_permission",
+            hud_state="mic_permission",
+        )
+    if any(
+        tok in low
+        for tok in (
+            "device or resource busy",
+            "resource busy",
+            "device in use",
+            "is busy",
+            "startup_timeout_no_frames",
+        )
+    ):
+        return MicrophoneUnavailableError(
+            f"microphone busy ({diagnostic})",
+            reason_code="mic_unavailable",
+            hud_state="mic_unavailable",
+        )
+    if any(
+        tok in low
+        for tok in ("device not found", "no such device", "cannot find audio device", "unknown input")
+    ):
+        return NoMicrophoneError(f"no microphone input device available ({diagnostic})")
+    if has_known_input is True:
+        return MicrophoneUnavailableError(
+            f"microphone temporarily unavailable ({diagnostic})",
+            reason_code="mic_unavailable",
+            hud_state="mic_unavailable",
+        )
+    return NoMicrophoneError(f"no microphone input device available ({diagnostic})")
+
 
 class FfmpegWavRecorder:
     def __init__(self, cmd_factory: Callable[[str, str], list[str]] | None = None) -> None:
@@ -77,15 +176,32 @@ class FfmpegWavRecorder:
         self._proc: subprocess.Popen[bytes] | None = None
         self._reader: threading.Thread | None = None
         self._err_reader: threading.Thread | None = None
+        self._wd_stop_evt: threading.Event | None = None
+        self._wd_thread: threading.Thread | None = None
         self._buf = bytearray()
         self._err_buf = bytearray()
         self._stdout_eof = False
+        self._stopping = False
+        self._stall_triggered = False
+        self._last_chunk_ts: float = 0.0
         self._unexpected_exit_cb: Callable[[], None] | None = None
         self._level_cb: Callable[[float], None] | None = None
         self._live_level: float = 0.0
         self._live_level_ts: float = 0.0
+        self.first_chunk_ts: float = 0.0
+        self.last_chunk_ts: float = 0.0
         self.last_stderr: str = ""
         self.last_returncode: int | None = None
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return (
+                self._proc is not None
+                and not self._stopping
+                and not self._stdout_eof
+                and self._proc.poll() is None
+            )
 
     @property
     def current_level(self) -> float:
@@ -129,12 +245,16 @@ class FfmpegWavRecorder:
         read_fn = getattr(pipe, "read1", None) or pipe.read
         try:
             while chunk := read_fn(1600):
+                now_ts = time.monotonic()
                 sink.extend(chunk)
+                self._last_chunk_ts = now_ts
+                self.last_chunk_ts = now_ts
                 if len(sink) >= 2 and not startup_evt.is_set():
+                    self.first_chunk_ts = now_ts
                     startup_evt.set()
                 lvl = pcm16le_rms_level(chunk)
                 self._live_level = lvl
-                self._live_level_ts = time.monotonic()
+                self._live_level_ts = now_ts
                 if (lvl_cb := self._level_cb) is not None:
                     try:
                         lvl_cb(lvl)
@@ -150,7 +270,11 @@ class FfmpegWavRecorder:
             with self._lock:
                 if self._proc is proc:
                     self._stdout_eof = True
-                still_active = self._proc is proc and self._unexpected_exit_cb is not None
+                still_active = (
+                    self._proc is proc
+                    and not self._stopping
+                    and self._unexpected_exit_cb is not None
+                )
             if still_active:
                 try:
                     rc = proc.wait(timeout=0.25)
@@ -158,13 +282,58 @@ class FfmpegWavRecorder:
                     rc = proc.poll()
                 err_reader.join(timeout=0.15)
                 with self._lock:
-                    if self._proc is proc and rc not in (None, 0):
+                    if self._proc is proc and not self._stopping:
                         self.last_returncode = rc
-                        self.last_stderr = bytes(err_buf).decode("utf-8", errors="replace").strip()
+                        raw_err = bytes(err_buf).decode("utf-8", errors="replace").strip()
+                        if self._stall_triggered:
+                            raw_err = f"{raw_err} [stream_stalled]".strip()
+                        elif rc == 0 and not raw_err:
+                            raw_err = "unexpected_eof_rc0"
+                        self.last_stderr = raw_err
                         cb = self._unexpected_exit_cb
                         self._unexpected_exit_cb = None
+                        if (wd_evt := self._wd_stop_evt) is not None:
+                            wd_evt.set()
             if cb is not None:
                 threading.Thread(target=cb, daemon=True).start()
+
+    def _watch_stall(
+        self,
+        proc: subprocess.Popen[bytes],
+        sink: bytearray,
+        wd_stop_evt: threading.Event,
+        start_ts: float,
+        stall_timeout_sec: float,
+    ) -> None:
+        initial_grace_sec = max(1.6, stall_timeout_sec * 1.5)
+        poll_sec = max(0.04, min(0.12, stall_timeout_sec / 4.0))
+        while not wd_stop_evt.wait(poll_sec):
+            with self._lock:
+                if self._proc is not proc or self._stopping or self._stdout_eof:
+                    return
+                last_ts = self._last_chunk_ts
+                got_audio = len(sink) >= 2
+            now = time.monotonic()
+            stalled = (
+                (now - last_ts) >= stall_timeout_sec
+                if (got_audio and last_ts > 0.0)
+                else (now - start_ts) >= initial_grace_sec
+            )
+            if stalled:
+                with self._lock:
+                    if self._proc is not proc or self._stopping:
+                        return
+                    self._stall_triggered = True
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                return
 
     def start(
         self,
@@ -174,21 +343,28 @@ class FfmpegWavRecorder:
         env: Mapping[str, str] | None = None,
         *,
         verify_startup: bool = False,
-        startup_timeout_sec: float = 0.35,
+        startup_timeout_sec: float = 0.65,
+        stall_timeout_sec: float = 1.2,
+        has_known_input: bool | None = None,
         on_unexpected_exit: Callable[[], None] | None = None,
         on_level: Callable[[float], None] | None = None,
     ) -> None:
         self.stop(drain_sec=0.0)
         buf, err_buf = bytearray(), bytearray()
         startup_evt = threading.Event()
-        self.last_stderr, self.last_returncode = "", None
+        start_ts = time.monotonic()
+        self.last_stderr, self.last_returncode, self.first_chunk_ts, self.last_chunk_ts = "", None, 0.0, 0.0
         proc = subprocess.Popen(self._build_cmd(fmt, source), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True, env=dict(os.environ if env is None else env))
         assert proc.stdout is not None and proc.stderr is not None
         err_reader = threading.Thread(target=self._read_pipe, args=(proc.stderr, err_buf, 512), daemon=True)
         reader = threading.Thread(target=self._read_stdout, args=(proc.stdout, buf, startup_evt, proc, err_reader, err_buf), daemon=True)
         with self._lock:
             self._proc, self._reader, self._err_reader, self._buf, self._err_buf = proc, reader, err_reader, buf, err_buf
+            self._wd_stop_evt, self._wd_thread = None, None
             self._stdout_eof = False
+            self._stopping = False
+            self._stall_triggered = False
+            self._last_chunk_ts = 0.0
             self._unexpected_exit_cb = None
             self._level_cb = on_level
             self._live_level, self._live_level_ts = 0.0, 0.0
@@ -199,6 +375,9 @@ class FfmpegWavRecorder:
                 if self._proc is proc:
                     self._proc, self._reader, self._err_reader, self._buf, self._err_buf = None, None, None, bytearray(), bytearray()
                     self._stdout_eof = False
+                    self._stopping = False
+                    self._stall_triggered = False
+                    self._last_chunk_ts = 0.0
                     self._unexpected_exit_cb = None
                     self._level_cb = None
                     self._live_level, self._live_level_ts = 0.0, 0.0
@@ -213,27 +392,52 @@ class FfmpegWavRecorder:
             startup_evt.wait(timeout=max(0.02, float(startup_timeout_sec)))
             with self._lock:
                 saw_eof = self._stdout_eof
-            if len(buf) < 2 and (saw_eof or proc.poll() is not None):
-                try:
-                    rc = proc.wait(timeout=0.25)
-                except subprocess.TimeoutExpired:
-                    rc = proc.poll()
-                err_reader.join(timeout=0.15)
+            if len(buf) < 2:
+                exited = saw_eof or proc.poll() is not None
+                if exited:
+                    try:
+                        rc = proc.wait(timeout=0.25)
+                    except subprocess.TimeoutExpired:
+                        rc = proc.poll()
+                    err_reader.join(timeout=0.15)
+                else:
+                    rc = None
                 err_txt = bytes(err_buf).decode("utf-8", errors="replace").strip()
-                if rc not in (None, 0):
-                    self.stop(drain_sec=0.0)
+                self.stop(drain_sec=0.0)
+                if exited:
                     self.last_returncode = rc
-                    self.last_stderr = err_txt
-                    raise NoMicrophoneError(f"no microphone input device available ({self.diagnostic_summary()})")
+                    self.last_stderr = err_txt or ("startup_eof_rc0" if rc == 0 else "")
+                else:
+                    self.last_returncode = None
+                    self.last_stderr = err_txt or "startup_timeout_no_frames"
+                raise classify_ffmpeg_startup_error(
+                    self.last_stderr,
+                    rc,
+                    diagnostic=self.diagnostic_summary(),
+                    has_known_input=has_known_input,
+                )
 
         if on_unexpected_exit is not None:
             early_eof = False
+            wd_evt: threading.Event | None = None
+            wd_thr: threading.Thread | None = None
             with self._lock:
-                if self._proc is proc:
+                if self._proc is proc and not self._stopping:
                     if self._stdout_eof or proc.poll() is not None:
                         early_eof = True
                     else:
                         self._unexpected_exit_cb = on_unexpected_exit
+                        if stall_timeout_sec > 0.0:
+                            wd_evt = threading.Event()
+                            wd_thr = threading.Thread(
+                                target=self._watch_stall,
+                                args=(proc, buf, wd_evt, start_ts, float(stall_timeout_sec)),
+                                daemon=True,
+                            )
+                            self._wd_stop_evt = wd_evt
+                            self._wd_thread = wd_thr
+            if wd_thr is not None:
+                wd_thr.start()
             if early_eof:
                 try:
                     rc = proc.wait(timeout=0.25)
@@ -242,9 +446,10 @@ class FfmpegWavRecorder:
                 err_reader.join(timeout=0.15)
                 should_fire = False
                 with self._lock:
-                    if self._proc is proc and rc not in (None, 0):
+                    if self._proc is proc and not self._stopping:
                         self.last_returncode = rc
-                        self.last_stderr = bytes(err_buf).decode("utf-8", errors="replace").strip()
+                        raw_err = bytes(err_buf).decode("utf-8", errors="replace").strip()
+                        self.last_stderr = raw_err or ("unexpected_eof_rc0" if rc == 0 else "")
                         should_fire = True
                 if should_fire:
                     threading.Thread(target=on_unexpected_exit, daemon=True).start()
@@ -252,11 +457,18 @@ class FfmpegWavRecorder:
     def stop(self, *, drain_sec: float = 0.0) -> bytes:
         with self._lock:
             proc, reader, err_reader, buf, err_buf = self._proc, self._reader, self._err_reader, self._buf, self._err_buf
+            wd_evt, wd_thr = self._wd_stop_evt, self._wd_thread
             self._proc, self._reader, self._err_reader, self._buf, self._err_buf = None, None, None, bytearray(), bytearray()
+            self._wd_stop_evt, self._wd_thread = None, None
+            self._stopping = True
             self._stdout_eof = False
             self._unexpected_exit_cb = None
             self._level_cb = None
             self._live_level, self._live_level_ts = 0.0, 0.0
+        if wd_evt is not None:
+            wd_evt.set()
+        if wd_thr is not None and wd_thr.is_alive() and wd_thr is not threading.current_thread():
+            wd_thr.join(timeout=0.5)
         if proc is None:
             return b""
         if drain_sec > 0.0 and proc.poll() is None:
@@ -412,12 +624,19 @@ class JsonlShimMixin:
                     file=sys.stderr, flush=True,
                 )
 
+    _INTERNAL_SHIM_EVENTS: frozenset[str] = frozenset(
+        {"rec_lost", "rec_recovered", "audio_devices_changed"}
+    )
+
     def _has_managed_shim(self) -> bool:
         if self._closed or self._shim_disabled:
             return False
         if self._shim_graceful:
-            return self._shim is not None and self._shim.poll() is None
+            return (self._shim is not None and self._shim.poll() is None) or self._on_event is not None
         return self._shim is not None or self._on_event is not None
+
+    def _on_shim_internal_event(self, msg: dict[str, Any]) -> None:
+        pass
 
     def _ensure_event_worker(self) -> None:
         with self._shim_lock:
@@ -427,6 +646,12 @@ class JsonlShimMixin:
 
     def _event_loop(self) -> None:
         while (msg := self._event_q.get()) is not None:
+            if str(msg.get("event") or "") in self._INTERNAL_SHIM_EVENTS:
+                try:
+                    self._on_shim_internal_event(msg)
+                except Exception:
+                    pass
+                continue
             if (cb := self._on_event) is not None:
                 try: cb(msg)
                 except Exception: pass
@@ -498,8 +723,16 @@ class JsonlShimMixin:
                 if msg.get("event") == "ready":
                     got_ready = True
                     self._win_ui_culture = str(msg.get("ui_culture") or "").strip()
+                    if "audio_status" in msg and isinstance(msg.get("audio_status"), dict):
+                        try:
+                            self._on_shim_internal_event({"event": "audio_devices_changed", **msg["audio_status"]})
+                        except Exception:
+                            pass
                     self._ready.set()
-                elif "event" in msg and self._on_event is not None:
+                elif "event" in msg and (
+                    self._on_event is not None
+                    or str(msg.get("event") or "") in self._INTERNAL_SHIM_EVENTS
+                ):
                     self._ensure_event_worker()
                     self._event_q.put(msg)
                 elif "reply" in msg or msg.get("type") == "reply":
@@ -525,8 +758,15 @@ class JsonlShimMixin:
             if need_respawn:
                 threading.Thread(target=self._respawn_shim_bg, daemon=True).start()
 
-    def _shim_rpc(self, payload: dict[str, Any], timeout_sec: float = 5.0) -> dict[str, Any] | None:
-        for attempt in range(2):
+    def _shim_rpc(
+        self,
+        payload: dict[str, Any],
+        timeout_sec: float = 5.0,
+        *,
+        allow_retry: bool = True,
+    ) -> dict[str, Any] | None:
+        max_attempts = 2 if allow_retry else 1
+        for attempt in range(max_attempts):
             if not self._ensure_shim():
                 if self._shim_graceful:
                     return None
@@ -547,7 +787,7 @@ class JsonlShimMixin:
                         proc.stdin.write(json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n")
                         proc.stdin.flush()
                 res = q.get(timeout=timeout_sec)
-                if res.get("error") == "shim_eof" and attempt == 0 and not self._closed and not self._shim_disabled:
+                if res.get("error") == "shim_eof" and (attempt + 1) < max_attempts and not self._closed and not self._shim_disabled:
                     continue
                 if "error" in res:
                     if self._shim_graceful:
@@ -557,7 +797,7 @@ class JsonlShimMixin:
             except (BrokenPipeError, OSError, queue.Empty):
                 if broken is not None:
                     _reap_shim_proc(broken)
-                if attempt == 0 and not self._closed and not self._shim_disabled:
+                if (attempt + 1) < max_attempts and not self._closed and not self._shim_disabled:
                     continue
                 if self._shim_graceful:
                     return None
@@ -576,7 +816,15 @@ class JsonlShimMixin:
         self._ensure_event_worker()
         self._ensure_shim()
 
-    def hud(self, state: str, text: str = "", duration_ms: int = 0) -> None:
+    def hud(
+        self,
+        state: str,
+        text: str = "",
+        duration_ms: int = 0,
+        *,
+        clear_main: bool | None = None,
+        clear_toast: bool | None = None,
+    ) -> None:
         if not self._has_managed_shim():
             return
         st = (state or "").strip().lower()
@@ -588,7 +836,9 @@ class JsonlShimMixin:
             req: dict[str, Any] = {"cmd": "hud", "state": state}
             eff_text = text
             eff_duration_ms = duration_ms if duration_ms > 0 else 0
-            if st not in ("", "idle", "hide"):
+            layer = hud_layer_for_state(st)
+            if layer != "control":
+                req["layer"] = layer
                 req["position"] = normalize_ui_position(self.cfg.ui.position)
                 if st == "recording" and self.cfg.audio.max_duration_sec > 0:
                     req["max_duration_sec"] = max(1, int(round(self.cfg.audio.max_duration_sec)))
@@ -609,6 +859,12 @@ class JsonlShimMixin:
                     )
                 if eff_duration_ms <= 0:
                     eff_duration_ms = default_hud_duration_ms(st)
+                if clear_toast is None and st == "recording":
+                    clear_toast = True
+            if clear_main is not None:
+                req["clear_main"] = bool(clear_main)
+            if clear_toast is not None:
+                req["clear_toast"] = bool(clear_toast)
             if eff_text:
                 req["text"] = eff_text
             if eff_duration_ms > 0:
@@ -723,11 +979,73 @@ class WslPlatform(JsonlShimMixin):
         self._use_winmm = self._primary_winmm
         self.last_audio_error = ""
         self._ff_rec, self._rec_mode = FfmpegWavRecorder(), ""
-        self._recorder_lost_cb: Callable[[], None] | None = None
+        self._winmm_state_lock = threading.Lock()
+        self._winmm_gen = 0
+        self._active_seq_id: int | None = None
+        self._winmm_starting = False
+        self._pending_winmm_lost_reason = ""
+        self._pending_winmm_recovered_gaps: list[int] = []
+        self._recorder_lost_cb: Callable[..., Any] | None = None
+        self._recorder_recovered_cb: Callable[..., Any] | None = None
         self._init_shim_bridge()
 
-    def set_recorder_lost_callback(self, cb: Callable[[], None] | None) -> None:
+    def set_recorder_lost_callback(self, cb: Callable[..., Any] | None) -> None:
         self._recorder_lost_cb = cb
+
+    def set_recorder_recovered_callback(self, cb: Callable[..., Any] | None) -> None:
+        self._recorder_recovered_cb = cb
+
+    @staticmethod
+    def _parse_event_rec_gen(msg: Mapping[str, Any]) -> int:
+        raw = msg.get("rec_gen")
+        if raw is None or isinstance(raw, bool):
+            return 0
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return 0
+        return val if val > 0 else 0
+
+    def _on_shim_internal_event(self, msg: dict[str, Any]) -> None:
+        ev = str(msg.get("event") or "")
+        if ev == "rec_lost":
+            ev_gen = self._parse_event_rec_gen(msg)
+            if ev_gen <= 0:
+                return
+            reason = str(msg.get("reason") or "wasapi_device_lost").strip() or "wasapi_device_lost"
+            should_fire = False
+            ev_seq: int | None = None
+            with self._winmm_state_lock:
+                if ev_gen != self._winmm_gen:
+                    return
+                if self._rec_mode == "winmm":
+                    self.last_audio_error = reason
+                    should_fire = True
+                    ev_seq = self._active_seq_id
+                elif self._winmm_starting:
+                    self._pending_winmm_lost_reason = reason
+            if should_fire:
+                invoke_recorder_lost_callback(self._recorder_lost_cb, ev_seq)
+        elif ev == "rec_recovered":
+            ev_gen = self._parse_event_rec_gen(msg)
+            if ev_gen <= 0:
+                return
+            try:
+                gap_ms = int(msg.get("gap_ms") or 0)
+            except (TypeError, ValueError):
+                gap_ms = 0
+            should_fire_rec = False
+            rec_seq: int | None = None
+            with self._winmm_state_lock:
+                if ev_gen != self._winmm_gen:
+                    return
+                if self._rec_mode == "winmm":
+                    should_fire_rec = True
+                    rec_seq = self._active_seq_id
+                elif self._winmm_starting:
+                    self._pending_winmm_recovered_gaps.append(gap_ms)
+            if should_fire_rec:
+                invoke_recorder_recovered_callback(self._recorder_recovered_cb, gap_ms, rec_seq)
 
     def _build_shim_cmd(self) -> list[str]:
         if self._shim_cmd_factory is not None:
@@ -754,42 +1072,125 @@ class WslPlatform(JsonlShimMixin):
             try: self._shim_rpc({"cmd": "beep", "kind": kind}, timeout_sec=1.5)
             except Exception: pass
 
-    def start_recording(self, runtime_dir: Path, *, loopback: bool = False) -> None:
+    @staticmethod
+    def _classify_wasapi_start_error(err: str) -> NoMicrophoneError | MicrophoneUnavailableError:
+        low = (err or "").strip().lower()
+        if low.startswith("mic_permission") or "0x80070005" in low or "access_denied" in low:
+            return MicrophoneUnavailableError(
+                f"microphone access denied ({err})",
+                reason_code="mic_permission",
+                hud_state="mic_permission",
+            )
+        if low.startswith("no_mic") or "0x80070490" in low:
+            return NoMicrophoneError(f"no microphone input device available ({err})")
+        return MicrophoneUnavailableError(
+            f"microphone temporarily unavailable ({err})",
+            reason_code="mic_unavailable",
+            hud_state="mic_unavailable",
+        )
+
+    def _fire_pulse_lost(self, expected_gen: int, expected_seq: int | None) -> None:
+        with self._winmm_state_lock:
+            if self._winmm_gen != expected_gen or self._rec_mode != "pulse":
+                return
+        invoke_recorder_lost_callback(self._recorder_lost_cb, expected_seq)
+
+    def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
         self._stop_level_streamer()
         self.last_audio_error = ""
         eff_loopback = bool(loopback or self.env.get("AGENT_VOICE_INPUT_WASAPI_LOOPBACK") == "1" or self.env.get("VOICE_INPUT_WASAPI_LOOPBACK") == "1")
         if self._use_winmm:
-            req: dict[str, Any] = {"cmd": "rec_start"}
+            with self._winmm_state_lock:
+                self._winmm_gen += 1
+                my_gen = self._winmm_gen
+                self._active_seq_id = seq_id
+                self._rec_mode = ""
+                self._winmm_starting = True
+                self._pending_winmm_lost_reason = ""
+                self._pending_winmm_recovered_gaps.clear()
+            req: dict[str, Any] = {"cmd": "rec_start", "rec_gen": my_gen}
             if eff_loopback:
                 req["loopback"] = True
-            res = self._shim_rpc(req, timeout_sec=4.0) or {}
+            try:
+                res = (
+                    self._shim_rpc(req, timeout_sec=4.0, allow_retry=False)
+                    if "allow_retry" in getattr(getattr(self._shim_rpc, "__code__", None), "co_varnames", ())
+                    else self._shim_rpc(req, timeout_sec=4.0)
+                ) or {}
+            except Exception as shim_exc:
+                with self._winmm_state_lock:
+                    if self._winmm_gen == my_gen:
+                        self._winmm_starting = False
+                        self._pending_winmm_lost_reason = ""
+                        self._pending_winmm_recovered_gaps.clear()
+                self.last_audio_error = str(shim_exc)
+                if self.cfg.audio.wsl_source == "auto" and not eff_loopback:
+                    with self._winmm_state_lock:
+                        self._winmm_gen += 1
+                        fb_gen = self._winmm_gen
+                        self._active_seq_id = seq_id
+                        self._rec_mode = "pulse"
+                    try:
+                        self._ff_rec.start(
+                            "pulse",
+                            self.pulse_source,
+                            runtime_dir,
+                            self.env,
+                            verify_startup=True,
+                            on_unexpected_exit=lambda g=fb_gen, s=seq_id: self._fire_pulse_lost(g, s),
+                            on_level=self._on_recorder_level,
+                        )
+                    except Exception:
+                        with self._winmm_state_lock:
+                            if self._winmm_gen == fb_gen:
+                                self._rec_mode = ""
+                                self._active_seq_id = None
+                        self.last_audio_error = self._ff_rec.diagnostic_summary() or str(shim_exc)
+                        raise
+                    self._start_level_streamer(lambda: self._ff_rec.current_level)
+                    return
+                raise
             if res.get("ok"):
-                self._rec_mode = "winmm"
+                early_lost = ""
+                early_gaps: list[int] = []
+                with self._winmm_state_lock:
+                    if self._winmm_gen == my_gen:
+                        self._winmm_starting = False
+                        self._rec_mode = "winmm"
+                        early_lost = self._pending_winmm_lost_reason
+                        self._pending_winmm_lost_reason = ""
+                        early_gaps = list(self._pending_winmm_recovered_gaps)
+                        self._pending_winmm_recovered_gaps.clear()
+                if early_gaps:
+                    for g in early_gaps:
+                        invoke_recorder_recovered_callback(self._recorder_recovered_cb, g, seq_id)
+                if early_lost:
+                    self.last_audio_error = early_lost
+                    if self._recorder_lost_cb is not None:
+                        def _deliver_early_lost(expected_gen: int = my_gen, expected_seq: int | None = seq_id) -> None:
+                            with self._winmm_state_lock:
+                                if self._winmm_gen != expected_gen or self._rec_mode != "winmm":
+                                    return
+                            invoke_recorder_lost_callback(self._recorder_lost_cb, expected_seq)
+
+                        threading.Thread(target=_deliver_early_lost, daemon=True).start()
                 return
+            with self._winmm_state_lock:
+                if self._winmm_gen == my_gen:
+                    self._winmm_starting = False
+                    self._active_seq_id = None
+                    self._pending_winmm_lost_reason = ""
+                    self._pending_winmm_recovered_gaps.clear()
             err = str(res.get("rec_error") or "winmm rec_start failed")
             self.last_audio_error = err
-            if any(code in err.lower() for code in ("0x80070490", "0x80070005")):
-                raise NoMicrophoneError(f"no microphone input device available ({err})")
-            if self.cfg.audio.wsl_source == "auto" and not eff_loopback:
-                self._rec_mode = "pulse"
-                try:
-                    self._ff_rec.start(
-                        "pulse",
-                        self.pulse_source,
-                        runtime_dir,
-                        self.env,
-                        verify_startup=True,
-                        on_unexpected_exit=self._recorder_lost_cb,
-                        on_level=self._on_recorder_level,
-                    )
-                except Exception:
-                    self._rec_mode = ""
-                    self.last_audio_error = self._ff_rec.diagnostic_summary() or err
-                    raise
-                self._start_level_streamer(lambda: self._ff_rec.current_level)
-                return
-            raise NoMicrophoneError(f"no microphone input device available ({err})") if "wasapi_" in err.lower() else RuntimeError(err)
-        self._rec_mode = "pulse"
+            # Never fall back to WSLg's dummy RDPSource (which streams silent zeros) when Windows
+            # itself confirmed the microphone is missing, denied, or temporarily busy.
+            raise self._classify_wasapi_start_error(err)
+        with self._winmm_state_lock:
+            self._winmm_gen += 1
+            p_gen = self._winmm_gen
+            self._active_seq_id = seq_id
+            self._rec_mode = "pulse"
         src = "RDPSink.monitor" if (eff_loopback and self.pulse_source == "RDPSource") else self.pulse_source
         try:
             self._ff_rec.start(
@@ -798,18 +1199,27 @@ class WslPlatform(JsonlShimMixin):
                 runtime_dir,
                 self.env,
                 verify_startup=True,
-                on_unexpected_exit=self._recorder_lost_cb,
+                on_unexpected_exit=lambda g=p_gen, s=seq_id: self._fire_pulse_lost(g, s),
                 on_level=self._on_recorder_level,
             )
         except Exception:
-            self._rec_mode = ""
+            with self._winmm_state_lock:
+                if self._winmm_gen == p_gen:
+                    self._rec_mode = ""
+                    self._active_seq_id = None
             self.last_audio_error = self._ff_rec.diagnostic_summary()
             raise
         self._start_level_streamer(lambda: self._ff_rec.current_level)
 
     def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
         self._stop_level_streamer()
-        mode, self._rec_mode = self._rec_mode, ""
+        with self._winmm_state_lock:
+            self._winmm_gen += 1
+            self._active_seq_id = None
+            self._winmm_starting = False
+            self._pending_winmm_lost_reason = ""
+            self._pending_winmm_recovered_gaps.clear()
+            mode, self._rec_mode = self._rec_mode, ""
         drain_sec = self.cfg.audio.effective_tail_drain_sec(macos=False) if (drain and mode) else 0.0
         if mode == "winmm":
             if drain_sec > 0.0:
@@ -817,7 +1227,8 @@ class WslPlatform(JsonlShimMixin):
             res = self._shim_rpc({"cmd": "rec_stop"}, timeout_sec=5.0) or {}
             b64 = str(res.get("wav_b64") or "")
             wav = base64.b64decode(b64) if b64 else b""
-            self.last_audio_error = "" if wav else str(res.get("rec_error") or "wasapi_empty_audio")
+            rec_err = str(res.get("rec_error") or "").strip()
+            self.last_audio_error = rec_err if rec_err else ("" if wav else "wasapi_empty_audio")
             return wav, "winmm"
         wav = self._ff_rec.stop(drain_sec=drain_sec)
         self.last_audio_error = "" if wav else self._ff_rec.diagnostic_summary()

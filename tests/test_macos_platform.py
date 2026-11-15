@@ -30,6 +30,7 @@ from agent_voice_input.platform_macos import (  # noqa: E402
     MACOS_TERMINAL_BUNDLE_IDS,
     MAC_SHIM_SCRIPT,
     MacOSPlatform,
+    SHIM_SCHEMA_VERSION,
     _APPLE_SEP,
     _GHOSTTY_INPUT_SCRIPT,
     check_macos_clt_ready,
@@ -41,7 +42,12 @@ from agent_voice_input.platform_macos import (  # noqa: E402
     resolve_macos_audio_device,
     run_macos_key_test,
 )
-from agent_voice_input.platform_wsl import FfmpegWavRecorder, ForegroundWindow  # noqa: E402
+from agent_voice_input.platform_wsl import (  # noqa: E402
+    FfmpegWavRecorder,
+    ForegroundWindow,
+    MicrophoneUnavailableError,
+    NoMicrophoneError,
+)
 from agent_voice_input.refiner import create_refiner  # noqa: E402
 from agent_voice_input.session_ctx import SessionTracker, write_session_registry_entry  # noqa: E402
 
@@ -95,9 +101,14 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
 
             # Verify MacOSPlatform.start_recording passes ':default' / ':<configured>' to FfmpegWavRecorder
             seen_fmt_src: list[tuple[str, str]] = []
+            ok_pcm_cmd = [
+                sys.executable,
+                "-c",
+                "import os, time; os.write(1, b'\\x00\\x00' * 160); time.sleep(0.5)",
+            ]
             plat_default = MacOSPlatform(Config(), env={"HOME": str(home)}, cache_dir=home / "cache")
             plat_default._ff_rec = FfmpegWavRecorder(
-                cmd_factory=lambda fmt, src: (seen_fmt_src.append((fmt, src)) or [sys.executable, "-c", "pass"])
+                cmd_factory=lambda fmt, src: (seen_fmt_src.append((fmt, src)) or list(ok_pcm_cmd))
             )
             plat_default.start_recording(home)
             plat_default.cancel_recording()
@@ -108,7 +119,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 cache_dir=home / "cache",
             )
             plat_cfg._ff_rec = FfmpegWavRecorder(
-                cmd_factory=lambda fmt, src: (seen_fmt_src.append((fmt, src)) or [sys.executable, "-c", "pass"])
+                cmd_factory=lambda fmt, src: (seen_fmt_src.append((fmt, src)) or list(ok_pcm_cmd))
             )
             plat_cfg.start_recording(home)
             plat_cfg.cancel_recording()
@@ -1178,9 +1189,11 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     daemon_all.close()
 
     def test_mac_shim_static_invariants(self) -> None:
+        self.assertEqual(SHIM_SCHEMA_VERSION, 2)
         self.assertTrue(MAC_SHIM_SCRIPT.is_file())
         src = MAC_SHIM_SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn("import Carbon", src)
+        self.assertIn("import CoreAudio", src)
         # Right Control dual compatibility: keyCode 0x3E (62) + NX_DEVICERCTLKEYMASK (0x00002000)
         self.assertIn("0x00002000", src)
         self.assertIn("0x3E", src)
@@ -1188,43 +1201,509 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn("CGPreflightListenEventAccess() || AXIsProcessTrusted()", src)
         self.assertIn(": [.flagsChanged]", src)
         self.assertIn("CGEventSource.keyState", src)
-        # Non-activating capsule HUD invariants
+        # Non-activating capsule HUD + independent Doubao-style upper toast panel invariants
         self.assertIn(".accessory", src)
         self.assertIn(".nonactivatingPanel", src)
+        self.assertIn("private var toastPanel: NSPanel?", src)
+        self.assertIn("private var toastHideWorkItem: DispatchWorkItem?", src)
         self.assertIn("ignoresMouseEvents = true", src)
         self.assertIn("hidesOnDeactivate = false", src)
         self.assertIn("orderFrontRegardless()", src)
         self.assertNotIn("makeKeyAndOrderFront", src)
-        # Chord tainting, HUD bottom/top positioning, & two-stage HUD states
+        # Chord tainting, HUD bottom/top positioning, & two-layer HUD states
         self.assertIn("chordTainted", src)
         self.assertIn("ptt_cancel", src)
         self.assertIn("counterForEventType", src)
-        self.assertIn('st == "recognizing" || st == "processing"', src)
-        self.assertIn('st == "refining"', src)
-        self.assertIn('st == "no_mic"', src)
-        self.assertIn('st == "mic_disconnected"', src)
+        self.assertIn('case "recognizing", "processing":', src)
+        self.assertIn('case "refining":', src)
+        self.assertIn('case "no_mic":', src)
+        self.assertIn('case "mic_unavailable":', src)
+        self.assertIn('case "mic_permission":', src)
+        self.assertIn('case "mic_disconnected":', src)
+        self.assertIn('case "audio_recovered":', src)
+        self.assertIn('case "paste_failed":', src)
         self.assertIn("✕ 无可用麦克风", src)
+        self.assertIn("! 麦克风暂忙，请再试一次", src)
+        self.assertIn("! 麦克风短暂中断，已自动恢复", src)
         self.assertIn("✕ 麦克风已断开", src)
         self.assertIn("func computeHudPillY(", src)
+        self.assertIn("func computeHudToastY(", src)
         self.assertIn("round(visibleMinY + 8.0)", src)
         self.assertIn("round(visibleMaxY - pillH - 14.0)", src)
+        self.assertIn("round(visibleMinY + 8.0 + effMainH + 8.0)", src)
+        self.assertIn("round(visibleMaxY - 14.0 - effMainH - 8.0 - toastH)", src)
         self.assertIn("func splitHudSegments(", src)
         self.assertIn("func stripOuterParens(", src)
+        self.assertIn("func stripLeadingHudSymbol(", src)
+        self.assertIn("func resolveHudVisualStyle(", src)
         self.assertIn("rgba(64, 18, 26, 0.95)", src)
         self.assertIn("rgba(72, 38, 12, 0.95)", src)
-        self.assertIn("rgba(16, 40, 72, 0.95)", src)
-        self.assertIn("rgba(46, 22, 76, 0.95)", src)
-        self.assertIn("rgba(14, 54, 36, 0.95)", src)
-        self.assertIn("rgba(28, 32, 82, 0.95)", src)
-        self.assertIn("rgba(66, 44, 12, 0.95)", src)
-        self.assertIn("rgba(84, 18, 24, 0.95)", src)
+        self.assertIn("hudRgba(16, 40, 72, 0.95)", src)
+        self.assertIn("hudRgba(46, 22, 76, 0.95)", src)
+        self.assertIn("hudRgba(14, 54, 36, 0.95)", src)
+        self.assertIn("hudRgba(28, 32, 82, 0.95)", src)
+        self.assertIn("HudRgba(r: 30.0 / 255.0, g: 31.0 / 255.0, b: 36.0 / 255.0, a: 0.96)", src)
+        self.assertIn("HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 0.78)", src)
+        self.assertIn("HudRgba(r: 248.0 / 255.0, g: 113.0 / 255.0, b: 113.0 / 255.0, a: 0.78)", src)
         self.assertIn("final class StatusIconView: NSView", src)
         self.assertIn("func recordingCountdownWarnSec(", src)
         self.assertIn("func formatCountdownHint(", src)
-        self.assertIn("max(34.0, ceil(textSize.height) + 14.0)", src)
-        self.assertIn("ofSize: 12.5, weight: .medium", src)
+        # 42pt Retina-scaled main capsule & 36pt toast capsule + CoreAudio live monitor
+        self.assertIn("max(42.0, ceil(textH) + 18.0)", src)
+        self.assertIn("max(36.0, ceil(textH) + 14.0)", src)
+        self.assertIn("ofSize: 15.0, weight: .medium", src)
+        self.assertIn("ofSize: 14.0, weight: .medium", src)
+        self.assertIn("barWidth: CGFloat = 3.0", src)
+        self.assertIn("barGap: CGFloat = 3.0", src)
+        self.assertIn("totalWidth: CGFloat = 51.0", src)
         self.assertIn("contentsScale = scale", src)
         self.assertIn('obj["position"] as? String', src)
+        self.assertIn("func queryAudioInputStatus()", src)
+        self.assertIn("kAudioHardwarePropertyDevices", src)
+        self.assertIn("kAudioHardwarePropertyDefaultInputDevice", src)
+        self.assertIn("kAudioDevicePropertyDeviceIsAlive", src)
+        self.assertIn('"audio_devices_changed"', src)
+
+    def test_macos_coreaudio_fast_fail_busy_disconnect_and_seamless_respawn(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            rt = tmp / "rt"
+            rt.mkdir()
+            env = {"HOME": str(tmp), "AGENT_VOICE_INPUT_SWIFTC": "none"}
+
+            # 1. audio_status.has_input == False -> zero ffmpeg subprocesses spawned, fast-fails with NoMicrophoneError
+            ff_spawns_1: list[tuple[str, str]] = []
+            plat_no_in = MacOSPlatform(Config(), env=env, cache_dir=tmp / "c1")
+            plat_no_in._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda fmt, src: (ff_spawns_1.append((fmt, src)) or [sys.executable, "-c", "pass"])
+            )
+            plat_no_in._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            plat_no_in._shim_rpc = lambda payload, timeout_sec=0.8, **kw: (  # type: ignore[method-assign]
+                {
+                    "ok": True,
+                    "reply": True,
+                    "audio_status": {
+                        "has_input": False,
+                        "input_count": 0,
+                        "default_uid": "",
+                        "default_name": "",
+                        "alive_uids": [],
+                    },
+                }
+                if payload.get("cmd") == "audio_status"
+                else {"ok": True}
+            )
+            with self.assertRaises(NoMicrophoneError):
+                plat_no_in.start_recording(rt)
+            self.assertEqual(ff_spawns_1, [])
+            self.assertEqual(plat_no_in.last_audio_error, "coreaudio_no_input_device")
+
+            # 2. has_input == True + ffmpeg fails with Input/output error (e.g. BT A2DP->HFP switch)
+            # -> raises MicrophoneUnavailableError(reason_code="mic_unavailable", hud_state="mic_unavailable")
+            io_err_src = "import sys; sys.stderr.write('[in#0] Error opening input: Input/output error\\n'); sys.exit(251)"
+            plat_busy = MacOSPlatform(Config(), env=env, cache_dir=tmp / "c2")
+            plat_busy._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", io_err_src])
+            plat_busy._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            plat_busy._shim_rpc = lambda payload, timeout_sec=0.8, **kw: (  # type: ignore[method-assign]
+                {
+                    "ok": True,
+                    "reply": True,
+                    "audio_status": {
+                        "has_input": True,
+                        "input_count": 1,
+                        "default_uid": "bt-earbuds:input",
+                        "default_name": "FreeClip",
+                        "alive_uids": ["bt-earbuds:input"],
+                    },
+                }
+                if payload.get("cmd") == "audio_status"
+                else {"ok": True}
+            )
+            with self.assertRaises(MicrophoneUnavailableError) as busy_ctx:
+                plat_busy.start_recording(rt)
+            self.assertEqual(busy_ctx.exception.reason_code, "mic_unavailable")
+            self.assertEqual(busy_ctx.exception.hud_state, "mic_unavailable")
+
+            # 3. Mid-recording audio_devices_changed (active_uid disappears) -> immediately aborts recording,
+            # preserves first-half PCM, sets last_audio_error="coreaudio_device_disconnected", fires _recorder_lost_cb
+            hold_src = (
+                "import os, sys, time\n"
+                "os.write(1, (b'\\xe8\\x0e\\x18\\xf1' * 4000))\n"  # 0.5s @ 16kHz voiced audio
+                "sys.stdout.flush()\n"
+                "time.sleep(10.0)\n"
+            )
+            lost_evt = threading.Event()
+            rescued_box: list[tuple[bytes, str]] = []
+            plat_drop = MacOSPlatform(Config(), env=env, cache_dir=tmp / "c3")
+            plat_drop._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", hold_src])
+            plat_drop._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            plat_drop._shim_rpc = lambda payload, timeout_sec=0.8, **kw: (  # type: ignore[method-assign]
+                {
+                    "ok": True,
+                    "reply": True,
+                    "audio_status": {
+                        "has_input": True,
+                        "input_count": 1,
+                        "default_uid": "bt-earbuds:input",
+                        "default_name": "FreeClip",
+                        "alive_uids": ["bt-earbuds:input"],
+                    },
+                }
+                if payload.get("cmd") == "audio_status"
+                else {"ok": True}
+            )
+
+            def _on_lost_drop() -> None:
+                rescued_box.append(plat_drop.stop_recording(drain=False))
+                lost_evt.set()
+
+            plat_drop.set_recorder_lost_callback(_on_lost_drop)
+            plat_drop.start_recording(rt)
+            self.assertEqual(plat_drop._active_recording_uid, "bt-earbuds:input")
+            t_drop = time.monotonic()
+            plat_drop._on_shim_internal_event(
+                {
+                    "event": "audio_devices_changed",
+                    "has_input": False,
+                    "input_count": 0,
+                    "default_uid": "",
+                    "default_name": "",
+                    "alive_uids": [],
+                }
+            )
+            self.assertTrue(lost_evt.wait(timeout=1.0))
+            self.assertLess(time.monotonic() - t_drop, 0.5)
+            self.assertEqual(plat_drop.last_audio_error, "coreaudio_device_disconnected")
+            self.assertEqual(len(rescued_box), 1)
+            rescued_wav, rescued_backend = rescued_box[0]
+            self.assertEqual(rescued_backend, "avfoundation")
+            self.assertEqual(len(rescued_wav), 44 + 16000)
+            self.assertEqual(rescued_wav[44:52], b"\xe8\x0e\x18\xf1" * 2)
+
+            # 4. Mid-recording transient ffmpeg exit while active_uid remains in alive_uids ->
+            # seamlessly respawns ffmpeg once, concatenates both PCM segments + silence padding, fires _recorder_recovered_cb
+            gen_counter = [0]
+            seg1_src = (
+                "import os, sys, time\n"
+                "os.write(1, b'\\x11\\x22' * 3200)\n"  # 6400 bytes PCM (0.2s)
+                "sys.stdout.flush()\n"
+                "time.sleep(0.05)\n"
+                "sys.stderr.write('transient HFP glitch\\n')\n"
+                "sys.exit(251)\n"
+            )
+            seg2_src = (
+                "import os, sys, time\n"
+                "os.write(1, b'\\x33\\x44' * 4800)\n"  # 9600 bytes PCM (0.3s)
+                "sys.stdout.flush()\n"
+                "time.sleep(5.0)\n"
+            )
+
+            seen_respawn_srcs: list[str] = []
+
+            def _respawn_cmd_factory(_fmt: str, src: str) -> list[str]:
+                seen_respawn_srcs.append(src)
+                gen_counter[0] += 1
+                return [sys.executable, "-c", seg1_src if gen_counter[0] == 1 else seg2_src]
+
+            recovered_gaps: list[int] = []
+            rec_evt = threading.Event()
+            bogus_lost: list[int] = []
+            plat_rec = MacOSPlatform(
+                Config(audio=AudioConfig(tail_drain_sec=0.0)),
+                env=env,
+                cache_dir=tmp / "c4",
+            )
+            plat_rec._ff_rec = FfmpegWavRecorder(cmd_factory=_respawn_cmd_factory)
+            plat_rec._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            plat_rec._shim_rpc = lambda payload, timeout_sec=0.8, **kw: (  # type: ignore[method-assign]
+                {
+                    "ok": True,
+                    "reply": True,
+                    "audio_status": {
+                        "has_input": True,
+                        "input_count": 1,
+                        "default_uid": "bt-earbuds:input",
+                        "default_name": "FreeClip",
+                        "alive_uids": ["bt-earbuds:input"],
+                    },
+                }
+                if payload.get("cmd") == "audio_status"
+                else {"ok": True}
+            )
+            plat_rec.set_recorder_lost_callback(lambda: bogus_lost.append(1))
+            plat_rec.set_recorder_recovered_callback(lambda gap: (recovered_gaps.append(gap), rec_evt.set()))
+
+            plat_rec.start_recording(rt)
+            self.assertTrue(rec_evt.wait(timeout=2.0))
+            self.assertEqual(gen_counter[0], 2)
+            self.assertEqual(seen_respawn_srcs, [":default", ":FreeClip"])
+            self.assertEqual(bogus_lost, [])
+            self.assertEqual(len(recovered_gaps), 1)
+            self.assertGreaterEqual(recovered_gaps[0], 0)
+
+            merged_wav, merged_backend = plat_rec.stop_recording(drain=False)
+            self.assertEqual(merged_backend, "avfoundation")
+            self.assertEqual(plat_rec.last_audio_error, "")
+            expected_pad = (min(30000, recovered_gaps[0]) * 32) & ~1
+            merged_pcm = merged_wav[44:]
+            self.assertEqual(len(merged_pcm), 6400 + expected_pad + 9600)
+            self.assertEqual(merged_pcm[:6400], b"\x11\x22" * 3200)
+            if expected_pad > 0:
+                self.assertEqual(merged_pcm[6400 : 6400 + expected_pad], b"\x00" * expected_pad)
+            self.assertEqual(merged_pcm[-9600:], b"\x33\x44" * 4800)
+
+            # 5. No silent drift to another mic B when default_uid changed mid-recording, AND immediate-EOF on
+            # respawned child reports lost instead of false recovered!
+            drift_gen = [0]
+            plat_drift = MacOSPlatform(Config(audio=AudioConfig(tail_drain_sec=0.0)), env=env, cache_dir=tmp / "c5")
+            plat_drift._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: (
+                    drift_gen.__setitem__(0, drift_gen[0] + 1)
+                    or [sys.executable, "-c", seg1_src if drift_gen[0] == 1 else seg2_src]
+                )
+            )
+            plat_drift._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            cur_def = ["mic-a:input"]
+            plat_drift._shim_rpc = lambda payload, timeout_sec=0.8, **kw: (  # type: ignore[method-assign]
+                {
+                    "ok": True,
+                    "reply": True,
+                    "audio_status": {
+                        "has_input": True,
+                        "input_count": 2,
+                        "default_uid": cur_def[0],
+                        "default_name": "Mic",
+                        "alive_uids": ["mic-a:input", "mic-b:input"],
+                    },
+                }
+                if payload.get("cmd") == "audio_status"
+                else {"ok": True}
+            )
+            drift_lost = threading.Event()
+            plat_drift.set_recorder_lost_callback(drift_lost.set)
+            plat_drift.start_recording(rt)
+            cur_def[0] = "mic-b:input"  # Default switched to B while A is still in alive_uids
+            self.assertTrue(drift_lost.wait(timeout=2.0))
+            self.assertEqual(drift_gen[0], 1)  # Must NOT respawn onto mic-b!
+            wav_drift, _ = plat_drift.stop_recording(drain=False)
+            self.assertEqual(wav_drift[44:], b"\x11\x22" * 3200)
+
+            imm_eof_gen = [0]
+            imm_eof_seg2 = (
+                "import os, sys\n"
+                "os.write(1, b'\\x55\\x66' * 100)\n"
+                "sys.stdout.flush()\n"
+                "sys.exit(1)\n"
+            )
+            plat_imm = MacOSPlatform(Config(audio=AudioConfig(tail_drain_sec=0.0)), env=env, cache_dir=tmp / "c6")
+            plat_imm._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: (
+                    imm_eof_gen.__setitem__(0, imm_eof_gen[0] + 1)
+                    or [sys.executable, "-c", seg1_src if imm_eof_gen[0] == 1 else imm_eof_seg2]
+                )
+            )
+            plat_imm._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            plat_imm._shim_rpc = plat_rec._shim_rpc  # type: ignore[method-assign]
+            imm_lost = threading.Event()
+            imm_false_rec: list[int] = []
+            plat_imm.set_recorder_lost_callback(imm_lost.set)
+            plat_imm.set_recorder_recovered_callback(imm_false_rec.append)
+            plat_imm.start_recording(rt)
+            self.assertTrue(imm_lost.wait(timeout=2.0))
+            self.assertEqual(imm_false_rec, [])
+            wav_imm, _ = plat_imm.stop_recording(drain=False)
+            self.assertGreaterEqual(len(wav_imm), 44 + 6400)
+
+            # 6. Post-start live CoreAudio verification catches default switch during start() even before
+            # audio_devices_changed event is consumed, AND late EOF during post_st RPC is never swallowed.
+            switch_rpc_calls = [0]
+            plat_post_sw = MacOSPlatform(Config(audio=AudioConfig(tail_drain_sec=0.0)), env=env, cache_dir=tmp / "c7")
+            plat_post_sw._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [
+                    sys.executable,
+                    "-c",
+                    seg1_src if switch_rpc_calls[0] <= 1 else seg2_src,
+                ]
+            )
+            plat_post_sw._has_managed_shim = lambda: True  # type: ignore[method-assign]
+
+            def _post_switch_rpc(payload: dict[str, object], timeout_sec: float = 0.8, **kw: object) -> dict[str, object]:
+                if payload.get("cmd") != "audio_status":
+                    return {"ok": True}
+                switch_rpc_calls[0] += 1
+                # Call 1 (start_recording) & Call 2 (pre-respawn): mic-a ("MicA"); Call 3 (post-respawn): switched to mic-b!
+                is_after_respawn = switch_rpc_calls[0] >= 3
+                return {
+                    "ok": True,
+                    "reply": True,
+                    "audio_status": {
+                        "has_input": True,
+                        "input_count": 2,
+                        "default_uid": "mic-b:input" if is_after_respawn else "mic-a:input",
+                        "default_name": "MicB" if is_after_respawn else "MicA",
+                        "default_name_unique": True,
+                        "alive_uids": ["mic-a:input", "mic-b:input"],
+                        "uid_names": {"mic-a:input": "MicA", "mic-b:input": "MicB"},
+                    },
+                }
+
+            plat_post_sw._shim_rpc = _post_switch_rpc  # type: ignore[method-assign]
+            post_sw_lost = threading.Event()
+            post_sw_false_rec: list[int] = []
+            plat_post_sw.set_recorder_lost_callback(post_sw_lost.set)
+            plat_post_sw.set_recorder_recovered_callback(post_sw_false_rec.append)
+            plat_post_sw.start_recording(rt)
+            self.assertTrue(post_sw_lost.wait(timeout=2.5))
+            self.assertEqual(post_sw_false_rec, [])
+            self.assertEqual(plat_post_sw.last_audio_error, "coreaudio_default_input_switched")
+            wav_post_sw, _ = plat_post_sw.stop_recording(drain=False)
+            self.assertEqual(wav_post_sw[44:], b"\x11\x22" * 3200)
+
+            # Late EOF arriving AFTER 0.08s wait while post_st RPC is in flight must not be swallowed
+            late_eof_seg2 = (
+                "import os, sys, time\n"
+                "os.write(1, b'\\x77\\x88' * 200)\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(0.11)\n"
+                "sys.exit(1)\n"
+            )
+            late_gen = [0]
+            late_rpc_calls = [0]
+            plat_late = MacOSPlatform(Config(audio=AudioConfig(tail_drain_sec=0.0)), env=env, cache_dir=tmp / "c8")
+            plat_late._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: (
+                    late_gen.__setitem__(0, late_gen[0] + 1)
+                    or [sys.executable, "-c", seg1_src if late_gen[0] == 1 else late_eof_seg2]
+                )
+            )
+            plat_late._has_managed_shim = lambda: True  # type: ignore[method-assign]
+
+            def _slow_post_rpc(payload: dict[str, object], timeout_sec: float = 0.8, **kw: object) -> dict[str, object]:
+                if payload.get("cmd") == "audio_status":
+                    late_rpc_calls[0] += 1
+                    if late_rpc_calls[0] >= 3:
+                        time.sleep(0.12)
+                return plat_rec._shim_rpc(payload, timeout_sec=timeout_sec)
+
+            plat_late._shim_rpc = _slow_post_rpc  # type: ignore[method-assign]
+            late_lost = threading.Event()
+            late_false_rec: list[int] = []
+            plat_late.set_recorder_lost_callback(late_lost.set)
+            plat_late.set_recorder_recovered_callback(late_false_rec.append)
+            plat_late.start_recording(rt)
+            self.assertTrue(late_lost.wait(timeout=2.5))
+            self.assertEqual(late_false_rec, [])
+            _, _ = plat_late.stop_recording(drain=False)
+
+            # 7. >1.5s recovery gap pads full actual silence without 1500ms truncation, AND busy timeout isolates sessions
+            long_gap_gen = [0]
+            plat_lgap = MacOSPlatform(Config(audio=AudioConfig(tail_drain_sec=0.0)), env=env, cache_dir=tmp / "c9")
+            plat_lgap._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: (
+                    long_gap_gen.__setitem__(0, long_gap_gen[0] + 1)
+                    or [sys.executable, "-c", seg1_src if long_gap_gen[0] == 1 else seg2_src]
+                )
+            )
+            plat_lgap._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            lgap_calls = [0]
+
+            def _delayed_pre_rpc(payload: dict[str, object], timeout_sec: float = 0.8, **kw: object) -> dict[str, object]:
+                if payload.get("cmd") == "audio_status":
+                    lgap_calls[0] += 1
+                    if lgap_calls[0] == 2:
+                        time.sleep(1.55)
+                return plat_rec._shim_rpc(payload, timeout_sec=timeout_sec)
+
+            plat_lgap._shim_rpc = _delayed_pre_rpc  # type: ignore[method-assign]
+            lgap_vals: list[int] = []
+            lgap_evt = threading.Event()
+            plat_lgap.set_recorder_recovered_callback(lambda g: (lgap_vals.append(g), lgap_evt.set()))
+            plat_lgap.start_recording(rt)
+            self.assertTrue(lgap_evt.wait(timeout=4.0))
+            self.assertGreater(lgap_vals[0], 1520)
+            wav_lgap, _ = plat_lgap.stop_recording(drain=False)
+            self.assertEqual(len(wav_lgap[44:]), 6400 + ((lgap_vals[0] * 32) & ~1) + 9600)
+
+            # Session isolation under busy timeout: stuck old recovery cannot leak PCM or stop a newly started session
+            block_enter = threading.Event()
+            block_release = threading.Event()
+            iso_gen = [0]
+            plat_iso = MacOSPlatform(Config(audio=AudioConfig(tail_drain_sec=0.0)), env=env, cache_dir=tmp / "c10")
+            plat_iso._busy_wait_timeout_sec = 0.08
+            plat_iso._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: (
+                    iso_gen.__setitem__(0, iso_gen[0] + 1)
+                    or [sys.executable, "-c", seg1_src if iso_gen[0] == 1 else seg2_src]
+                )
+            )
+            plat_iso._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            iso_rpc_calls = [0]
+
+            def _blocking_rpc(payload: dict[str, object], timeout_sec: float = 0.8, **kw: object) -> dict[str, object]:
+                if payload.get("cmd") == "audio_status":
+                    iso_rpc_calls[0] += 1
+                    if iso_rpc_calls[0] == 2:
+                        block_enter.set()
+                        block_release.wait(timeout=2.0)
+                return plat_rec._shim_rpc(payload, timeout_sec=timeout_sec)
+
+            plat_iso._shim_rpc = _blocking_rpc  # type: ignore[method-assign]
+            plat_iso.start_recording(rt)
+            self.assertTrue(block_enter.wait(timeout=1.5))
+            # stop_recording times out explicitly instead of touching busy recorder or leaving orphaned cache
+            wav_to, _ = plat_iso.stop_recording(drain=False)
+            self.assertEqual(wav_to, b"")
+            self.assertEqual(plat_iso.last_audio_error, "recorder_busy_timeout")
+            self.assertIsNone(plat_iso._cur_session)
+            # Starting a new session while old session is still blocked allocates an isolated recorder
+            plat_iso.start_recording(rt)
+            new_sess = plat_iso._cur_session
+            self.assertIsNotNone(new_sess)
+            assert new_sess is not None
+            self.assertTrue(new_sess.rec.is_running)
+            block_release.set()
+            time.sleep(0.12)
+            # Unblocked old task must NOT have stopped new_sess.rec!
+            self.assertTrue(new_sess.rec.is_running)
+            wav_new, _ = plat_iso.stop_recording(drain=False)
+            self.assertEqual(wav_new[44:], b"\x33\x44" * 4800)
+
+            # 8. Slow post-respawn RPC while seg2 keeps streaming uses first_chunk_ts (no double-counted gap)
+            streaming_seg2 = (
+                "import os, sys, time\n"
+                "for _ in range(12):\n"
+                "    os.write(1, b'\\x55\\x66' * 400)\n"
+                "    sys.stdout.flush()\n"
+                "    time.sleep(0.03)\n"
+                "time.sleep(2.0)\n"
+            )
+            fc_gen = [0]
+            fc_rpc = [0]
+            plat_fc = MacOSPlatform(Config(audio=AudioConfig(tail_drain_sec=0.0)), env=env, cache_dir=tmp / "c11")
+            plat_fc._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: (
+                    fc_gen.__setitem__(0, fc_gen[0] + 1)
+                    or [sys.executable, "-c", seg1_src if fc_gen[0] == 1 else streaming_seg2]
+                )
+            )
+            plat_fc._has_managed_shim = lambda: True  # type: ignore[method-assign]
+
+            def _slow_post_for_fc(payload: dict[str, object], timeout_sec: float = 0.8, **kw: object) -> dict[str, object]:
+                if payload.get("cmd") == "audio_status":
+                    fc_rpc[0] += 1
+                    if fc_rpc[0] >= 3:
+                        time.sleep(0.32)
+                return plat_rec._shim_rpc(payload, timeout_sec=timeout_sec)
+
+            plat_fc._shim_rpc = _slow_post_for_fc  # type: ignore[method-assign]
+            fc_gaps: list[int] = []
+            fc_evt = threading.Event()
+            plat_fc.set_recorder_recovered_callback(lambda g: (fc_gaps.append(g), fc_evt.set()))
+            plat_fc.start_recording(rt)
+            self.assertTrue(fc_evt.wait(timeout=2.5))
+            # True startup gap is <240ms; must NOT inflate by the 320ms post_st RPC!
+            self.assertLess(fc_gaps[0], 245)
+            _, _ = plat_fc.stop_recording(drain=False)
 
     def test_macos_clt_check_first_run_progress_and_xcode_license_hint(self) -> None:
         with tempfile.TemporaryDirectory() as td:

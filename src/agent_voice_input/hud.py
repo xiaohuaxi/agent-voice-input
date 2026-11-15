@@ -72,11 +72,23 @@ _STATIC_HUD_COPY: dict[str, tuple[str, str]] = {
     "copied": ("✓ 已复制(窗口已切换)", "✓ Copied (window switched)"),
     "empty": ("○ 未检测到语音", "○ No speech detected"),
     "no_mic": ("✕ 无可用麦克风", "✕ No microphone found"),
+    "mic_unavailable": ("! 麦克风暂忙，请再试一次", "! Microphone busy, try again"),
+    "mic_permission": ("✕ 麦克风权限未开启", "✕ Microphone access denied"),
     "mic_disconnected": ("✕ 麦克风已断开", "✕ Microphone disconnected"),
+    "audio_recovered": ("! 麦克风短暂中断，已自动恢复", "! Mic briefly interrupted, resumed"),
+    "paste_failed": ("✕ 填入失败", "✕ Failed to insert text"),
 }
 
+_CONTROL_HUD_STATES: frozenset[str] = frozenset(
+    {"", "idle", "hide", "hide_toast", "hide_all"}
+)
+
+_MAIN_HUD_STATES: frozenset[str] = frozenset(
+    {"recording", "recognizing", "processing", "refining", "done", "copied"}
+)
+
 _PERSISTENT_HUD_STATES: frozenset[str] = frozenset(
-    {"", "idle", "hide", "recording", "recognizing", "processing", "refining"}
+    {*_CONTROL_HUD_STATES, "recording", "recognizing", "processing", "refining"}
 )
 
 HUD_STATE_DURATIONS_MS: dict[str, int] = {
@@ -84,11 +96,30 @@ HUD_STATE_DURATIONS_MS: dict[str, int] = {
     "copied": 2000,
     "empty": 2200,
     "no_mic": 2200,
+    "mic_unavailable": 2600,
+    "mic_permission": 3200,
     "mic_disconnected": 2200,
+    "audio_recovered": 2400,
+    "paste_failed": 2600,
     "error": 2600,
 }
 
 DEFAULT_ERROR_HUD_DURATION_MS: int = 2600
+
+
+def hud_layer_for_state(state: str) -> str:
+    """Return HUD layer routing ('control' | 'main' | 'toast') for ``state``."""
+    st = (state or "").strip().lower()
+    if st in _CONTROL_HUD_STATES:
+        return "control"
+    if st in _MAIN_HUD_STATES:
+        return "main"
+    return "toast"
+
+
+def is_toast_hud_state(state: str) -> bool:
+    """Return True when ``state`` renders in the upper toast capsule above the main HUD slot."""
+    return hud_layer_for_state(state) == "toast"
 
 
 def default_hud_duration_ms(state: str) -> int:
@@ -153,7 +184,7 @@ def format_hud_text(
 ) -> str:
     """Format HUD status pill copy in Chinese ('zh') or English ('en')."""
     st = (state or "").strip().lower()
-    if st in ("", "idle", "hide"):
+    if st in _CONTROL_HUD_STATES:
         return ""
     zh = (lang or "en").strip().lower() == "zh"
     if st == "recording":
@@ -224,6 +255,8 @@ __all__ = [
     "format_hotkey_label",
     "format_hud_text",
     "format_recording_duration",
+    "hud_layer_for_state",
+    "is_toast_hud_state",
     "is_zh_locale",
     "normalize_ui_language",
     "normalize_ui_position",

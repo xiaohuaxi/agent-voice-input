@@ -34,6 +34,8 @@ from agent_voice_input.hud import (  # noqa: E402
     format_hotkey_label,
     format_hud_text,
     format_recording_duration,
+    hud_layer_for_state,
+    is_toast_hud_state,
     is_zh_locale,
     pcm16le_rms_level,
     recording_countdown_warn_sec,
@@ -228,13 +230,32 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertEqual(resolve_ui_language("auto", env={}), "en")
 
     def test_default_hud_duration_ms_contract(self) -> None:
-        for persistent in ("", "   ", "idle", " IDLE ", "hide", " HIDE ", "recording", "recognizing", "processing", "refining"):
+        for persistent in (
+            "",
+            "   ",
+            "idle",
+            " IDLE ",
+            "hide",
+            " HIDE ",
+            "hide_toast",
+            " HIDE_TOAST ",
+            "hide_all",
+            " HIDE_ALL ",
+            "recording",
+            "recognizing",
+            "processing",
+            "refining",
+        ):
             self.assertEqual(default_hud_duration_ms(persistent), 0, msg=persistent)
         self.assertEqual(HUD_STATE_DURATIONS_MS["done"], 900)
         self.assertEqual(HUD_STATE_DURATIONS_MS["copied"], 2000)
         self.assertEqual(HUD_STATE_DURATIONS_MS["empty"], 2200)
         self.assertEqual(HUD_STATE_DURATIONS_MS["no_mic"], 2200)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["mic_unavailable"], 2600)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["mic_permission"], 3200)
         self.assertEqual(HUD_STATE_DURATIONS_MS["mic_disconnected"], 2200)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["audio_recovered"], 2400)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["paste_failed"], 2600)
         self.assertEqual(HUD_STATE_DURATIONS_MS["error"], 2600)
         self.assertEqual(DEFAULT_ERROR_HUD_DURATION_MS, 2600)
         self.assertEqual(default_hud_duration_ms("done"), 900)
@@ -242,7 +263,11 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertEqual(default_hud_duration_ms("copied"), 2000)
         self.assertEqual(default_hud_duration_ms("empty"), 2200)
         self.assertEqual(default_hud_duration_ms("no_mic"), 2200)
+        self.assertEqual(default_hud_duration_ms("mic_unavailable"), 2600)
+        self.assertEqual(default_hud_duration_ms("mic_permission"), 3200)
         self.assertEqual(default_hud_duration_ms("mic_disconnected"), 2200)
+        self.assertEqual(default_hud_duration_ms("audio_recovered"), 2400)
+        self.assertEqual(default_hud_duration_ms("paste_failed"), 2600)
         self.assertEqual(default_hud_duration_ms("error"), 2600)
         self.assertEqual(default_hud_duration_ms("asr_timeout"), 2600)
 
@@ -596,7 +621,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(format_hotkey_label(raw, "zh"), zh_lbl)
             self.assertEqual(format_hotkey_label(raw, "en"), en_lbl)
 
-        for st in ("", "idle", "hide"):
+        for st in ("", "idle", "hide", "hide_toast", "hide_all", " HIDE_TOAST ", " HIDE_ALL "):
             self.assertEqual(format_hud_text(st, "zh"), "")
             self.assertEqual(format_hud_text(st, "en"), "")
 
@@ -656,11 +681,162 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             ("done", "✓ 已填入", "✓ Inserted"),
             ("copied", "✓ 已复制(窗口已切换)", "✓ Copied (window switched)"),
             ("empty", "○ 未检测到语音", "○ No speech detected"),
+            ("no_mic", "✕ 无可用麦克风", "✕ No microphone found"),
+            ("mic_unavailable", "! 麦克风暂忙，请再试一次", "! Microphone busy, try again"),
+            ("mic_permission", "✕ 麦克风权限未开启", "✕ Microphone access denied"),
+            ("mic_disconnected", "✕ 麦克风已断开", "✕ Microphone disconnected"),
+            ("audio_recovered", "! 麦克风短暂中断，已自动恢复", "! Mic briefly interrupted, resumed"),
+            ("paste_failed", "✕ 填入失败", "✕ Failed to insert text"),
             ("error", "✕ 识别失败", "✕ Transcription failed"),
         ]
         for state, zh_txt, en_txt in pairs:
             self.assertEqual(format_hud_text(state, "zh"), zh_txt)
             self.assertEqual(format_hud_text(state, "en"), en_txt)
+
+    def test_hud_layer_routing_and_dual_capsule_rpc_contract(self) -> None:
+        for ctrl_st in ("", "   ", "idle", "hide", "hide_toast", "hide_all", " HIDE_TOAST ", " HIDE_ALL "):
+            self.assertEqual(hud_layer_for_state(ctrl_st), "control", msg=ctrl_st)
+            self.assertFalse(is_toast_hud_state(ctrl_st), msg=ctrl_st)
+        for main_st in ("recording", " RECORDING ", "recognizing", "processing", "refining", "done", "copied"):
+            self.assertEqual(hud_layer_for_state(main_st), "main", msg=main_st)
+            self.assertFalse(is_toast_hud_state(main_st), msg=main_st)
+        for toast_st in (
+            "empty",
+            "no_mic",
+            "mic_unavailable",
+            "mic_permission",
+            "mic_disconnected",
+            "audio_recovered",
+            "paste_failed",
+            "error",
+            "asr_timeout",
+        ):
+            self.assertEqual(hud_layer_for_state(toast_st), "toast", msg=toast_st)
+            self.assertTrue(is_toast_hud_state(toast_st), msg=toast_st)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            wsl_log = tmp_dir / "wsl-dual-hud.jsonl"
+            mac_log = tmp_dir / "mac-dual-hud.jsonl"
+
+            wplat = WslPlatform(
+                Config(),
+                env={"LANG": "C.UTF-8"},
+                shim_cmd_factory=lambda: [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    _MOCK_HUD_SHIM,
+                    "zh-CN",
+                    str(wsl_log),
+                ],
+            )
+            mplat = MacOSPlatform(
+                Config(),
+                env={"HOME": str(tmp_dir), "LANG": "C.UTF-8"},
+                cache_dir=tmp_dir / "cache",
+                shim_cmd_factory=lambda: [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    _MOCK_HUD_SHIM,
+                    "en-US",
+                    str(mac_log),
+                ],
+            )
+            try:
+                wplat.start_event_listener(lambda _e: None)
+                mplat.start_event_listener(lambda _e: None)
+                for plat in (wplat, mplat):
+                    plat.hud("recording")
+                    plat.hud("recording", clear_toast=False)
+                    plat.hud("audio_recovered", clear_main=False)
+                    plat.hud("recognizing")
+                    plat.hud("mic_disconnected", duration_ms=3200, clear_main=False)
+                    plat.hud("refining", clear_toast=True)
+                    plat.hud("mic_unavailable", clear_main=True)
+                    plat.hud("mic_permission", clear_main=True)
+                    plat.hud("paste_failed", clear_main=True)
+                    plat.hud("hide_toast")
+                    plat.hud("hide", clear_toast=True)
+                    plat.hud("hide_all")
+            finally:
+                wplat.close()
+                mplat.close()
+
+            wsl_reqs = [json.loads(ln) for ln in wsl_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            mac_reqs = [json.loads(ln) for ln in mac_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.assertEqual(len(wsl_reqs), 12)
+            self.assertEqual(len(mac_reqs), 12)
+
+            for reqs, is_zh in ((wsl_reqs, True), (mac_reqs, False)):
+                # 0: recording defaults to layer='main' and clear_toast=True
+                self.assertEqual(reqs[0]["layer"], "main")
+                self.assertIs(reqs[0]["clear_toast"], True)
+                self.assertNotIn("clear_main", reqs[0])
+
+                # 1: recording with explicit clear_toast=False preserves False
+                self.assertEqual(reqs[1]["layer"], "main")
+                self.assertIs(reqs[1]["clear_toast"], False)
+
+                # 2: audio_recovered routes to layer='toast' with clear_main=False & duration_ms=2400
+                self.assertEqual(reqs[2]["layer"], "toast")
+                self.assertIs(reqs[2]["clear_main"], False)
+                self.assertEqual(reqs[2]["duration_ms"], 2400)
+                self.assertEqual(
+                    reqs[2]["text"],
+                    "! 麦克风短暂中断，已自动恢复" if is_zh else "! Mic briefly interrupted, resumed",
+                )
+
+                # 3: recognizing routes to layer='main' without touching toast
+                self.assertEqual(reqs[3]["layer"], "main")
+                self.assertNotIn("clear_toast", reqs[3])
+                self.assertNotIn("clear_main", reqs[3])
+
+                # 4: mic_disconnected during salvage keeps main capsule (clear_main=False)
+                self.assertEqual(reqs[4]["layer"], "toast")
+                self.assertIs(reqs[4]["clear_main"], False)
+                self.assertEqual(reqs[4]["duration_ms"], 3200)
+
+                # 5: refining with explicit clear_toast=True
+                self.assertEqual(reqs[5]["layer"], "main")
+                self.assertIs(reqs[5]["clear_toast"], True)
+
+                # 6, 7, 8: mic_unavailable / mic_permission / paste_failed toast states with clear_main=True
+                self.assertEqual(reqs[6]["layer"], "toast")
+                self.assertIs(reqs[6]["clear_main"], True)
+                self.assertEqual(reqs[6]["duration_ms"], 2600)
+                self.assertEqual(
+                    reqs[6]["text"],
+                    "! 麦克风暂忙，请再试一次" if is_zh else "! Microphone busy, try again",
+                )
+
+                self.assertEqual(reqs[7]["layer"], "toast")
+                self.assertIs(reqs[7]["clear_main"], True)
+                self.assertEqual(reqs[7]["duration_ms"], 3200)
+                self.assertEqual(
+                    reqs[7]["text"],
+                    "✕ 麦克风权限未开启" if is_zh else "✕ Microphone access denied",
+                )
+
+                self.assertEqual(reqs[8]["layer"], "toast")
+                self.assertIs(reqs[8]["clear_main"], True)
+                self.assertEqual(reqs[8]["duration_ms"], 2600)
+                self.assertEqual(
+                    reqs[8]["text"],
+                    "✕ 填入失败" if is_zh else "✕ Failed to insert text",
+                )
+
+                # 9, 10, 11: control states omit layer/position/text/duration_ms and forward clear_toast when set
+                for idx, expected_st in ((9, "hide_toast"), (10, "hide"), (11, "hide_all")):
+                    self.assertEqual(reqs[idx]["state"], expected_st)
+                    self.assertNotIn("layer", reqs[idx])
+                    self.assertNotIn("position", reqs[idx])
+                    self.assertNotIn("text", reqs[idx])
+                    self.assertNotIn("duration_ms", reqs[idx])
+                self.assertNotIn("clear_toast", reqs[9])
+                self.assertIs(reqs[10]["clear_toast"], True)
+                self.assertNotIn("clear_toast", reqs[11])
 
     def test_win_shim_ascii_ui_culture_and_layout_contract(self) -> None:
         import re
@@ -712,19 +888,83 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertNotIn("DrawRectangle(", shim)
         self.assertIn("[string]$cmdObj.position", shim)
         self.assertIn('st == "no_mic"', shim)
+        self.assertIn('st == "mic_unavailable"', shim)
+        self.assertIn('st == "mic_permission"', shim)
         self.assertIn('st == "mic_disconnected"', shim)
-        self.assertIn(r"\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE", shim)
-        self.assertIn(r"\u2715 \u9EA6\u514B\u98CE\u5DF2\u65AD\u5F00", shim)
-        self.assertEqual(
-            bytes(r"\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE", "ascii").decode("unicode_escape"),
-            format_hud_text("no_mic", "zh"),
-        )
-        self.assertEqual(
-            bytes(r"\u2715 \u9EA6\u514B\u98CE\u5DF2\u65AD\u5F00", "ascii").decode("unicode_escape"),
-            format_hud_text("mic_disconnected", "zh"),
-        )
-        for dur_decl in ("ms = 900;", "ms = 2000;", "ms = 2200;", "ms = 2600;"):
+        self.assertIn('st == "audio_recovered"', shim)
+        self.assertIn('st == "paste_failed"', shim)
+        for esc_lit, state_key in (
+            (r"\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE", "no_mic"),
+            (r"! \u9EA6\u514B\u98CE\u6682\u5FD9\uFF0C\u8BF7\u518D\u8BD5\u4E00\u6B21", "mic_unavailable"),
+            (r"\u2715 \u9EA6\u514B\u98CE\u6743\u9650\u672A\u5F00\u542F", "mic_permission"),
+            (r"\u2715 \u9EA6\u514B\u98CE\u5DF2\u65AD\u5F00", "mic_disconnected"),
+            (r"! \u9EA6\u514B\u98CE\u77ED\u6682\u4E2D\u65AD\uFF0C\u5DF2\u81EA\u52A8\u6062\u590D", "audio_recovered"),
+            (r"\u2715 \u586B\u5165\u5931\u8D25", "paste_failed"),
+        ):
+            self.assertIn(esc_lit, shim)
+            self.assertEqual(
+                bytes(esc_lit, "ascii").decode("unicode_escape"),
+                format_hud_text(state_key, "zh"),
+            )
+        for dur_decl in ("ms = 900;", "ms = 2000;", "ms = 2200;", "ms = 2400;", "ms = 2600;", "ms = 3200;"):
             self.assertIn(dur_decl, shim)
+
+        # COM [PreserveSig] vtable integrity + WASAPI disconnect & seamless recovery contracts
+        expected_com_Counts = {
+            "IMMDeviceEnumerator": 5,
+            "IMMDevice": 4,
+            "IAudioClient": 12,
+            "IAudioCaptureClient": 3,
+        }
+        for iface_name, expected_n in expected_com_Counts.items():
+            im = re.search(rf"internal interface {iface_name}\s*\{{([^}}]+)\}}", shim, re.S)
+            self.assertIsNotNone(im, msg=iface_name)
+            assert im is not None
+            method_lines = [ln.strip() for ln in im.group(1).splitlines() if ln.strip()]
+            self.assertEqual(len(method_lines), expected_n, msg=iface_name)
+            for ml in method_lines:
+                self.assertTrue(ml.startswith("[PreserveSig]"), msg=f"{iface_name}: {ml}")
+
+        for wasapi_sym in (
+            "AUDCLNT_S_BUFFER_EMPTY = 0x08890001",
+            "no_mic:0x80070490",
+            "mic_permission:0x80070005",
+            "mic_busy:0x{0:X8}",
+            "IsEndpointStillActive(",
+            "wasapi_device_unplugged",
+            "wasapi_stream_lost:0x{0:X8}",
+            "wasapi_stream_stalled",
+            '"rec_lost"',
+            '"rec_recovered"',
+            "gap_ms =",
+            "13.0f * dpi / 96.0f",
+            "2.5f * dpiScale",
+        ):
+            self.assertIn(wasapi_sym, shim)
+
+        # Upper toast capsule (_toastHud) layout, styling & independent lifecycle contracts
+        for toast_sym in (
+            "_toastHud",
+            "_hideTimer",
+            "HudPillForm(bool isToast = false)",
+            "Color.FromArgb(30, 31, 36)",
+            "Color.FromArgb(251, 191, 36)",
+            "Color.FromArgb(248, 113, 113)",
+            "StripLeadingStatusSymbol(",
+            'kind == "warning"',
+            "ScalePx(30)",
+            "ScalePx(12)",
+            "12.25f * dpi / 96.0f",
+            "wa.Bottom - ScalePx(8) - mainSlotH - ScalePx(8) - h",
+            "wa.Top + ScalePx(36) + mainSlotH + ScalePx(8)",
+            '"hide_toast"',
+            '"hide_all"',
+            "cmdObj.layer",
+            "cmdObj.clear_main",
+            "cmdObj.clear_toast",
+            "bool isToast",
+        ):
+            self.assertIn(toast_sym, shim)
 
         # Single source of truth parity between platform_wsl.WINDOWS_TERMINALS and win_shim.ps1 $AllowedTerminals
         m = re.search(r"\$AllowedTerminals\s*=\s*@\(([^)]+)\)", shim)

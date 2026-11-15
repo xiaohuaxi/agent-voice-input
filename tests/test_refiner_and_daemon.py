@@ -34,7 +34,16 @@ from agent_voice_input.daemon import (  # noqa: E402
     run_pipeline_once,
     send_control_command,
 )
-from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome, SHIM_SCRIPT, WslPlatform, is_windows_terminal_process  # noqa: E402
+from agent_voice_input.platform_wsl import (  # noqa: E402
+    FfmpegWavRecorder,
+    ForegroundWindow,
+    MicrophoneUnavailableError,
+    NoMicrophoneError,
+    PasteOutcome,
+    SHIM_SCRIPT,
+    WslPlatform,
+    is_windows_terminal_process,
+)
 from agent_voice_input.refiner import (  # noqa: E402
     CodexRefiner,
     GeminiRefiner,
@@ -1505,7 +1514,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             try:
                 self.assertTrue(daemon.handle_trigger("toggle")["ok"])
-                self.assertEqual(ops, ["hud:recording", "start_rec", "beep:start", "fg_window"])
+                self.assertEqual(ops, ["start_rec", "hud:recording", "beep:start", "fg_window"])
                 ops.clear()
                 daemon._last_trigger_ts = -1e9
                 r_stop = daemon.handle_trigger("toggle")
@@ -2654,7 +2663,10 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 self.assertEqual(pasted_mid, ["断麦前已说的前半段内容"])
                 self.assertEqual(daemon2.state, "idle")
                 self.assertEqual(beep_mid.count("error"), 1)
+                self.assertIn("recognizing", hud_mid)
+                self.assertIn("mic_disconnected", hud_mid)
                 self.assertEqual(hud_mid[-1], "done")
+                self.assertIs(daemon2.last_result.get("capture_interrupted"), True)
             finally:
                 release_asr.set()
                 daemon2.close()
@@ -2736,9 +2748,10 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         rec_active_during_resolve = [False]
         fail_resolve = [False]
         fail_cancel = [False]
+        start_exc: list[Exception | None] = [None]
 
         class _SlowResolvePlatform(_FakePlatform):
-            def hud(self, state: str, text: str = "", duration_ms: int = 0) -> None:
+            def hud(self, state: str, text: str = "", duration_ms: int = 0, **_kw: object) -> None:
                 events.append(f"hud:{state}")
                 super().hud(state, text, duration_ms)
 
@@ -2748,6 +2761,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
 
             def start_recording(self, runtime_dir: Path, *, loopback: bool = False) -> None:
                 events.append(f"start_rec:loopback={loopback}")
+                if start_exc[0] is not None:
+                    raise start_exc[0]
                 rec_active[0] = True
 
             def cancel_recording(self) -> None:
@@ -2801,7 +2816,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 self.assertTrue(rec_active_during_resolve[0])
                 self.assertEqual(
                     events,
-                    ["hud:recording", "start_rec:loopback=False", "beep:start", "resolve_enter"],
+                    ["start_rec:loopback=False", "hud:recording", "beep:start", "resolve_enter"],
                 )
                 release_resolver.set()
                 t.join(timeout=2.0)
@@ -2822,7 +2837,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 self.assertTrue(r_loop["ok"])
                 self.assertEqual(
                     events,
-                    ["hud:recording", "start_rec:loopback=True", "resolve_enter", "resolve_exit"],
+                    ["start_rec:loopback=True", "hud:recording", "resolve_enter", "resolve_exit"],
                 )
                 daemon.handle_trigger("ptt_cancel")
 
@@ -2839,8 +2854,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 self.assertEqual(
                     events,
                     [
-                        "hud:recording",
                         "start_rec:loopback=False",
+                        "hud:recording",
                         "beep:start",
                         "resolve_enter",
                         "cancel_rec",
@@ -2848,8 +2863,260 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                         "beep:error",
                     ],
                 )
+
+                # 4. start_recording raising NoMicrophoneError / MicrophoneUnavailableError NEVER flashes hud:recording!
+                fail_resolve[0] = False
+                fail_cancel[0] = False
+                for mic_err, exp_hud, exp_reason in (
+                    (NoMicrophoneError("no input device"), "hud:no_mic", "no_mic"),
+                    (
+                        MicrophoneUnavailableError(
+                            "bt switching",
+                            reason_code="mic_unavailable",
+                            hud_state="mic_unavailable",
+                        ),
+                        "hud:mic_unavailable",
+                        "mic_unavailable",
+                    ),
+                ):
+                    events.clear()
+                    start_exc[0] = mic_err
+                    daemon._last_trigger_ts = -1e9
+                    r_mic = daemon.handle_trigger("toggle")
+                    self.assertFalse(r_mic["ok"])
+                    self.assertEqual(r_mic.get("skipped_reason"), exp_reason)
+                    self.assertEqual(daemon.last_result.get("skipped_reason"), exp_reason)
+                    self.assertEqual(daemon.state, "idle")
+                    self.assertNotIn("hud:recording", events)
+                    self.assertNotIn("cancel_rec", events)
+                    self.assertEqual(events, ["start_rec:loopback=False", exp_hud, "beep:error"])
+                start_exc[0] = None
             finally:
                 daemon.close()
+
+    def test_daemon_recorder_recovered_and_ffmpeg_eof_stall_watchdog(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            hud_calls: list[tuple[str, dict[str, object]]] = []
+
+            class _RecoverablePlatform(_FakePlatform):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.rec_cb = None
+
+                def set_recorder_recovered_callback(self, cb) -> None:
+                    self.rec_cb = cb
+
+                def hud(self, state: str, text: str = "", duration_ms: int = 0, **kw: object) -> None:
+                    hud_calls.append((state, dict(kw)))
+                    super().hud(state, text, duration_ms)
+
+            plat = _RecoverablePlatform()
+            plat.wav_to_return = pack_pcm16_mono_wav([3200, -3200] * 4800)
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("自动恢复后的完整语音"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                self.assertIsNotNone(plat.rec_cb)
+                r_start = daemon.handle_trigger("toggle", ForegroundWindow(42, "Ghostty", "codex"))
+                self.assertTrue(r_start["ok"])
+                hud_calls.clear()
+
+                # < 250ms recovery: silently recorded without toast HUD
+                assert plat.rec_cb is not None
+                plat.rec_cb(120)
+                self.assertEqual(hud_calls, [])
+
+                # >= 250ms recovery: emits audio_recovered toast with clear_main=False
+                plat.rec_cb(320)
+                self.assertEqual(hud_calls, [("audio_recovered", {"clear_main": False})])
+
+                daemon._last_trigger_ts = -1e9
+                r_stop = daemon.handle_trigger("toggle")
+                self.assertTrue(r_stop["ok"])
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_stop["seq_id"]:
+                    time.sleep(0.02)
+                self.assertTrue(daemon.last_result["ok"])
+                self.assertEqual(daemon.last_result.get("recovery_count"), 2)
+                self.assertEqual(daemon.last_result.get("recovery_gap_ms"), 440)
+            finally:
+                daemon.close()
+
+            # FfmpegWavRecorder: rc == 0 unexpected EOF after initial audio fires on_unexpected_exit & records unexpected_eof_rc0
+            eof_evt = threading.Event()
+            eof_src = (
+                "import os, sys, time\n"
+                "os.write(1, b'\\x10\\x00' * 1600)\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(0.05)\n"
+                "sys.exit(0)\n"
+            )
+            rec_eof = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", eof_src])
+            rec_eof.start(
+                "avfoundation",
+                ":default",
+                rt,
+                {"HOME": td},
+                verify_startup=True,
+                startup_timeout_sec=0.35,
+                stall_timeout_sec=1.2,
+                on_unexpected_exit=eof_evt.set,
+            )
+            try:
+                self.assertTrue(eof_evt.wait(timeout=1.5))
+                self.assertEqual(rec_eof.last_returncode, 0)
+                self.assertIn("unexpected_eof_rc0", rec_eof.last_stderr)
+            finally:
+                rec_eof.stop(drain_sec=0.0)
+
+            # FfmpegWavRecorder: stall_timeout_sec=0.12 frame stall watchdog kills frozen stream & tags [stream_stalled]
+            stall_evt = threading.Event()
+            stall_src = (
+                "import os, sys, time\n"
+                "os.write(1, b'\\x10\\x00' * 1600)\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(10.0)\n"
+            )
+            rec_stall = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", stall_src])
+            t_stall = time.monotonic()
+            rec_stall.start(
+                "avfoundation",
+                ":default",
+                rt,
+                {"HOME": td},
+                verify_startup=True,
+                startup_timeout_sec=0.35,
+                stall_timeout_sec=0.12,
+                on_unexpected_exit=stall_evt.set,
+            )
+            try:
+                self.assertTrue(stall_evt.wait(timeout=1.5))
+                self.assertLess(time.monotonic() - t_stall, 1.2)
+                self.assertIn("[stream_stalled]", rec_stall.last_stderr)
+            finally:
+                rec_stall.stop(drain_sec=0.0)
+
+            # FfmpegWavRecorder: 0-frame hang during verify_startup fails fast with MicrophoneUnavailableError
+            zero_hang = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", "import time; time.sleep(5)"])
+            with self.assertRaises(MicrophoneUnavailableError) as zh_ctx:
+                zero_hang.start("avfoundation", ":default", rt, {"HOME": td}, verify_startup=True, startup_timeout_sec=0.08)
+            self.assertEqual(zh_ctx.exception.hud_state, "mic_unavailable")
+            self.assertIn("startup_timeout_no_frames", zero_hang.last_stderr)
+            self.assertFalse(zero_hang.is_running)
+
+            # WslPlatform: rec_lost arriving during rec_start RPC before _rec_mode='winmm' is delivered cleanly
+            from agent_voice_input.config import AudioConfig
+            from agent_voice_input.platform_wsl import WslPlatform
+
+            wplat_race = WslPlatform(Config(audio=AudioConfig(wsl_source="winmm")), env={"HOME": td})
+            early_lost_evt = threading.Event()
+            wplat_race.set_recorder_lost_callback(early_lost_evt.set)
+
+            seen_rec_gens: list[int] = []
+
+            def _racing_rpc(payload: dict[str, object], timeout_sec: float = 4.0, **kw: object) -> dict[str, object]:
+                if payload.get("cmd") == "rec_start":
+                    rg = int(payload.get("rec_gen") or 0)
+                    seen_rec_gens.append(rg)
+                    if len(seen_rec_gens) == 1:
+                        wplat_race._on_shim_internal_event(
+                            {"event": "rec_lost", "reason": "wasapi_device_unplugged", "rec_gen": rg}
+                        )
+                    return {"ok": True}
+                return {"ok": True}
+
+            wplat_race._shim_rpc = _racing_rpc  # type: ignore[method-assign]
+            wplat_race.start_recording(rt, seq_id=1)
+            self.assertEqual(seen_rec_gens, [1])
+            self.assertTrue(early_lost_evt.wait(timeout=1.0))
+            self.assertEqual(wplat_race.last_audio_error, "wasapi_device_unplugged")
+            wplat_race.cancel_recording()
+
+            # Stale queued Windows rec_lost / rec_recovered from rec_gen=1 must NEVER stop a newly started session!
+            wplat_stale = WslPlatform(Config(audio=AudioConfig(wsl_source="winmm")), env={"HOME": td})
+            stale_gens: list[int] = []
+            wplat_stale._shim_rpc = lambda payload, timeout_sec=4.0, **kw: (  # type: ignore[method-assign]
+                (stale_gens.append(int(payload.get("rec_gen") or 0)) or {"ok": True})
+                if payload.get("cmd") == "rec_start"
+                else {"ok": True}
+            )
+            wplat_stale.is_allowed_terminal = lambda _w: True  # type: ignore[method-assign]
+            wplat_stale.get_foreground_window = lambda: ForegroundWindow(1, "WindowsTerminal", "codex")  # type: ignore[method-assign]
+            wplat_stale.hud = lambda *a, **k: None  # type: ignore[method-assign]
+            wplat_stale.beep = lambda *a, **k: None  # type: ignore[method-assign]
+            daemon_w = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td},
+                runtime_dir=rt,
+                platform=wplat_stale,
+                asr_provider=_FakeAsr("ok"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                self.assertTrue(daemon_w.handle_trigger("ptt_start")["ok"])
+                gen1 = stale_gens[-1]
+                daemon_w._last_trigger_ts = -1e9
+                self.assertTrue(daemon_w.handle_trigger("ptt_cancel")["ok"])
+                daemon_w._last_trigger_ts = -1e9
+                self.assertTrue(daemon_w.handle_trigger("ptt_start")["ok"])
+                self.assertEqual((daemon_w.state, daemon_w.seq_id), ("recording", 3))
+                # Replay queued old events from gen1 AND unnumbered legacy events — neither may touch seq=3
+                wplat_stale._on_shim_internal_event({"event": "rec_recovered", "gap_ms": 400, "rec_gen": gen1})
+                wplat_stale._on_shim_internal_event({"event": "rec_lost", "reason": "wasapi_device_unplugged", "rec_gen": gen1})
+                wplat_stale._on_shim_internal_event({"event": "rec_lost", "reason": "wasapi_device_unplugged"})
+                self.assertEqual((daemon_w.state, daemon_w.seq_id), ("recording", 3))
+                self.assertEqual(daemon_w._rec_recovery_count, 0)
+                self.assertEqual(wplat_stale.last_audio_error, "")
+            finally:
+                daemon_w.close()
+
+            # VoiceInputDaemon: _on_recorder_recovered arriving inside start_recording flushes AFTER recording(clear_toast=True)
+            hud_seq_order: list[tuple[str, object]] = []
+
+            class _EarlyRecoverPlatform(_FakePlatform):
+                def hud(self, state: str, text: str = "", duration_ms: int = 0, **kw: object) -> None:
+                    hud_seq_order.append((state, kw.get("clear_toast")))
+                    super().hud(state, text, duration_ms)
+
+                def start_recording(self, runtime_dir: Path, *, loopback: bool = False) -> None:
+                    daemon_er._on_recorder_recovered(350)
+
+            plat_er = _EarlyRecoverPlatform()
+            daemon_er = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td},
+                runtime_dir=rt,
+                platform=plat_er,
+                asr_provider=_FakeAsr("ok"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                self.assertTrue(daemon_er.handle_trigger("toggle")["ok"])
+                self.assertEqual(hud_seq_order, [("recording", True), ("audio_recovered", None)])
+                # Cancel seq=1 and start a fresh recording seq=3; stale callbacks from seq=1 must be ignored
+                daemon_er._last_trigger_ts = -1e9
+                self.assertTrue(daemon_er.handle_trigger("ptt_cancel")["ok"])
+                daemon_er._last_trigger_ts = -1e9
+                r_s3 = daemon_er.handle_trigger("ptt_start")
+                self.assertTrue(r_s3["ok"])
+                self.assertEqual((daemon_er.state, daemon_er.seq_id), ("recording", 3))
+                self.assertEqual((daemon_er._rec_recovery_count, daemon_er._rec_recovery_gap_ms), (1, 350))
+                daemon_er._on_recorder_recovered(500, seq_id=1)
+                daemon_er._on_recorder_lost(seq_id=1)
+                self.assertEqual((daemon_er.state, daemon_er.seq_id), ("recording", 3))
+                self.assertEqual((daemon_er._rec_recovery_count, daemon_er._rec_recovery_gap_ms), (1, 350))
+            finally:
+                daemon_er.close()
 
     def test_cli_restart_running_hints_stale_stop_cleanup_and_log_trim(self) -> None:
         import io
