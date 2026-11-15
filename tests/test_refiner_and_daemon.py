@@ -1286,7 +1286,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             try:
                 self.assertTrue(daemon.handle_trigger("toggle")["ok"])
-                self.assertEqual(ops, ["hud:recording", "beep:start", "start_rec", "fg_window"])
+                self.assertEqual(ops, ["hud:recording", "start_rec", "beep:start", "fg_window"])
                 ops.clear()
                 daemon._last_trigger_ts = -1e9
                 r_stop = daemon.handle_trigger("toggle")
@@ -2211,6 +2211,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
 
     def test_no_microphone_fail_fast_and_mid_recording_disconnect_recovery(self) -> None:
         import subprocess
+        from agent_voice_input.config import AudioConfig
         from agent_voice_input.hud import format_hud_text
         from agent_voice_input.platform_macos import MacOSPlatform, probe_macos_host
         from agent_voice_input.platform_wsl import FfmpegWavRecorder, NoMicrophoneError, WslPlatform
@@ -2294,14 +2295,20 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 tracker=_isolated_tracker(rt),
             )
             try:
-                self.assertTrue(daemon_short.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))["ok"])
+                r_short_start = daemon_short.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))
+                self.assertTrue(r_short_start["ok"])
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline and daemon_short.state != "idle":
                     time.sleep(0.02)
                 self.assertEqual(daemon_short.state, "idle")
+                self.assertIsNone(daemon_short._max_dur_timer)
                 self.assertEqual(daemon_short.last_result.get("skipped_reason"), "mic_disconnected")
                 self.assertEqual(hud_short[-1], ("mic_disconnected", 2200))
                 self.assertEqual(beep_short.count("error"), 1)
+                # Racing max-duration watchdog callback for the disconnected seq_id must exit cleanly without
+                # emitting stale HUD updates OR consuming _recorder_lost_stop_absorbed!
+                daemon_short._on_max_duration_timeout(int(r_short_start["seq_id"]))
+                self.assertEqual(hud_short[-1], ("mic_disconnected", 2200))
                 # User's instinctive 'stop' tap right after disconnect is absorbed once without wiping mic_disconnected HUD
                 daemon_short._last_trigger_ts = -1e9
                 r_abs = daemon_short.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))
@@ -2383,6 +2390,61 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 info = probe_macos_host(Config(), env={"HOME": td}, cache_dir=Path(td) / "c3")
             self.assertEqual(info["audio_devices"], [])
             self.assertFalse(info["avfoundation_ok"])
+
+            # 5. Cross-feature seam: max_duration_sec auto-stop on a live FfmpegWavRecorder subprocess streams
+            # live RMS levels (~20 Hz 1600-byte chunks) AND stops ffmpeg cleanly without firing a bogus
+            # _on_recorder_lost / mic_disconnected callback!
+            live_stream_src = (
+                "import os, sys, time\n"
+                "chunk = b'\\xe8\\x0e\\x18\\xf1' * 400\n"  # 1600 bytes (50ms @ 16kHz s16le voiced audio)
+                "while True:\n"
+                "    try:\n"
+                "        os.write(1, chunk)\n"
+                "    except OSError:\n"
+                "        break\n"
+                "    time.sleep(0.015)\n"
+            )
+            cfg_max = Config(
+                audio=AudioConfig(max_duration_sec=0.14, min_duration_sec=0.05, min_voiced_sec=0.03, tail_drain_sec=0.0),
+                refiner=RefinerConfig(provider="off"),
+            )
+            hud_max: list[str] = []
+            beep_max: list[str] = []
+            pasted_max: list[str] = []
+            levels_seen: list[float] = []
+            mplat_max = MacOSPlatform(cfg_max, env={"HOME": td}, cache_dir=Path(td) / "cache_max", shim_cmd_factory=lambda: None)
+            mplat_max._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", live_stream_src])
+            mplat_max._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            mplat_max.hud_level = lambda lvl: levels_seen.append(lvl)  # type: ignore[method-assign]
+            mplat_max.hud = lambda st, text="", duration_ms=0: hud_max.append(st)  # type: ignore[method-assign]
+            mplat_max.beep = lambda kind: beep_max.append(kind)  # type: ignore[method-assign]
+            mplat_max.resolve_foreground_window = lambda win=None: ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty")  # type: ignore[method-assign]
+            mplat_max.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None: (pasted_max.append(txt) or PasteOutcome(True, True, "ok", "Ghostty"))  # type: ignore[method-assign]
+
+            daemon_max = VoiceInputDaemon(
+                cfg_max,
+                env={"HOME": td},
+                runtime_dir=rt,
+                platform=mplat_max,
+                asr_provider=_FakeAsr("最长录音自动完成不误报断麦"),
+                refiner=create_refiner(cfg_max),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                r_max = daemon_max.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))
+                self.assertTrue(r_max["ok"])
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline and not pasted_max:
+                    time.sleep(0.02)
+                self.assertEqual(pasted_max, ["最长录音自动完成不误报断麦"])
+                self.assertEqual(daemon_max.state, "idle")
+                self.assertNotIn("mic_disconnected", hud_max)
+                self.assertEqual(hud_max[-1], "done")
+                self.assertEqual(beep_max, ["start", "stop"])
+                self.assertGreaterEqual(len(levels_seen), 2)
+                self.assertTrue(any(v > 0.1 for v in levels_seen))
+            finally:
+                daemon_max.close()
 
     def test_daemon_start_recording_precedes_slow_resolver_and_cancels_on_error(self) -> None:
         in_resolver = threading.Event()

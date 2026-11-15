@@ -441,7 +441,7 @@ public sealed class HudPillForm : Form {
         int h = Math.Max(ScalePx(34), textH + ScalePx(14));
         bool isTop = string.Equals((_position ?? "").Trim(), "top", StringComparison.OrdinalIgnoreCase);
         x = wa.Left + (wa.Width - w) / 2;
-        y = isTop ? (wa.Top + ScalePx(36)) : Math.Max(wa.Top + ScalePx(4), wa.Bottom - h - ScalePx(12));
+        y = isTop ? (wa.Top + ScalePx(36)) : Math.Max(wa.Top + ScalePx(4), wa.Bottom - h - ScalePx(8));
 
         Bitmap outBmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
         using (Bitmap rgbBmp = new Bitmap(w, h, PixelFormat.Format32bppRgb))
@@ -881,6 +881,12 @@ public static class VoiceWinShim {
         } else if (st == "empty") {
             txt = zh ? "\u25CB \u672A\u68C0\u6D4B\u5230\u8BED\u97F3" : "\u25CB No speech detected";
             bg = Color.FromArgb(66, 44, 12); ic = Color.FromArgb(251, 191, 36); mc = Color.FromArgb(254, 243, 199); hc = Color.FromArgb(226, 202, 148); bd = Color.FromArgb(212, 148, 20); ms = 2200; iconKind = "empty";
+        } else if (st == "no_mic") {
+            txt = zh ? "\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE" : "\u2715 No microphone found";
+            bg = Color.FromArgb(84, 18, 24); ic = Color.FromArgb(252, 129, 129); mc = Color.FromArgb(254, 226, 226); hc = Color.FromArgb(238, 178, 182); bd = Color.FromArgb(239, 68, 68); ms = 2200; iconKind = "error";
+        } else if (st == "mic_disconnected") {
+            txt = zh ? "\u2715 \u9EA6\u514B\u98CE\u5DF2\u65AD\u5F00" : "\u2715 Microphone disconnected";
+            bg = Color.FromArgb(84, 18, 24); ic = Color.FromArgb(252, 129, 129); mc = Color.FromArgb(254, 226, 226); hc = Color.FromArgb(238, 178, 182); bd = Color.FromArgb(239, 68, 68); ms = 2200; iconKind = "error";
         } else {
             txt = zh ? "\u2715 \u8BC6\u522B\u5931\u8D25" : "\u2715 Transcription failed";
             bg = Color.FromArgb(84, 18, 24); ic = Color.FromArgb(252, 129, 129); mc = Color.FromArgb(254, 226, 226); hc = Color.FromArgb(238, 178, 182); bd = Color.FromArgb(239, 68, 68); ms = 2600; iconKind = "error";

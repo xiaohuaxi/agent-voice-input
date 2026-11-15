@@ -246,7 +246,7 @@ func computeHudPillY(visibleMinY: CGFloat, visibleMaxY: CGFloat, pillH: CGFloat,
     if pos == "top" {
         return round(visibleMaxY - pillH - 14.0)
     }
-    return round(visibleMinY + 12.0)
+    return round(visibleMinY + 8.0)
 }
 
 func stripOuterParens(_ raw: String) -> String {
@@ -820,6 +820,16 @@ final class HudPillController {
                 zh ? "○ 未检测到语音" : "○ No speech detected",
                 rgba(66, 44, 12, 0.95), rgba(251, 191, 36), rgba(254, 243, 199), rgba(226, 202, 148), rgba(251, 191, 36, 0.68), 2200, "empty"
             )
+        } else if st == "no_mic" {
+            (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
+                zh ? "✕ 无可用麦克风" : "✕ No microphone found",
+                rgba(84, 18, 24, 0.95), rgba(252, 129, 129), rgba(254, 226, 226), rgba(238, 178, 182), rgba(248, 113, 113, 0.78), 2200, "error"
+            )
+        } else if st == "mic_disconnected" {
+            (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
+                zh ? "✕ 麦克风已断开" : "✕ Microphone disconnected",
+                rgba(84, 18, 24, 0.95), rgba(252, 129, 129), rgba(254, 226, 226), rgba(238, 178, 182), rgba(248, 113, 113, 0.78), 2200, "error"
+            )
         } else {
             (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
                 zh ? "✕ 识别失败" : "✕ Transcription failed",
@@ -1005,8 +1015,8 @@ private func runSelfCheck() -> Int32 {
         try check(recov.count == 1 && recov[0].kind == "toggle", "recovered toggle after swallowed keyUp")
 
         try check(isZhUiCulture("zh-Hans-CN") && isZhUiCulture("zh_TW.UTF-8") && !isZhUiCulture("en-US"), "ui_culture zh detection")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 62.0, "HUD bottom pillY")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 62.0, "HUD default pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 58.0, "HUD bottom pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 58.0, "HUD default pillY")
         try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: " TOP ") == 850.0, "HUD top pillY")
         try check(splitHudSegments("● 录音中… (按右 Ctrl 完成)") == HudSegments(icon: "●", main: "录音中…", hint: "(按右 Ctrl 完成)", hasSpaceBeforeHint: true), "HUD split recording zh")
         try check(stripOuterParens("(按右 Ctrl 完成)") == "按右 Ctrl 完成" && stripOuterParens("12s 后自动完成") == "12s 后自动完成" && stripOuterParens("") == "", "HUD strip outer parens")

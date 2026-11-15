@@ -83,6 +83,8 @@ HUD_STATE_DURATIONS_MS: dict[str, int] = {
     "done": 900,
     "copied": 2000,
     "empty": 2200,
+    "no_mic": 2200,
+    "mic_disconnected": 2200,
     "error": 2600,
 }
 

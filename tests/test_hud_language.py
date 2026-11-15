@@ -287,12 +287,16 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertEqual(HUD_STATE_DURATIONS_MS["done"], 900)
         self.assertEqual(HUD_STATE_DURATIONS_MS["copied"], 2000)
         self.assertEqual(HUD_STATE_DURATIONS_MS["empty"], 2200)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["no_mic"], 2200)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["mic_disconnected"], 2200)
         self.assertEqual(HUD_STATE_DURATIONS_MS["error"], 2600)
         self.assertEqual(DEFAULT_ERROR_HUD_DURATION_MS, 2600)
         self.assertEqual(default_hud_duration_ms("done"), 900)
         self.assertEqual(default_hud_duration_ms(" DONE "), 900)
         self.assertEqual(default_hud_duration_ms("copied"), 2000)
         self.assertEqual(default_hud_duration_ms("empty"), 2200)
+        self.assertEqual(default_hud_duration_ms("no_mic"), 2200)
+        self.assertEqual(default_hud_duration_ms("mic_disconnected"), 2200)
         self.assertEqual(default_hud_duration_ms("error"), 2600)
         self.assertEqual(default_hud_duration_ms("asr_timeout"), 2600)
 
@@ -742,7 +746,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertIn("0x00080000", shim)
         self.assertNotIn("CreateRoundRectRgn(", shim)
         self.assertIn("wa.Width - ScalePx(24)", shim)
-        self.assertIn("wa.Bottom - h - ScalePx(12)", shim)
+        self.assertIn("wa.Bottom - h - ScalePx(8)", shim)
         self.assertIn("wa.Top + ScalePx(36)", shim)
         self.assertIn("ScalePx(34)", shim)
         self.assertIn("ScalePx(14)", shim)
@@ -761,6 +765,18 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertIn("path.AddArc(", shim)
         self.assertNotIn("DrawRectangle(", shim)
         self.assertIn("[string]$cmdObj.position", shim)
+        self.assertIn('st == "no_mic"', shim)
+        self.assertIn('st == "mic_disconnected"', shim)
+        self.assertIn(r"\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE", shim)
+        self.assertIn(r"\u2715 \u9EA6\u514B\u98CE\u5DF2\u65AD\u5F00", shim)
+        self.assertEqual(
+            bytes(r"\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE", "ascii").decode("unicode_escape"),
+            format_hud_text("no_mic", "zh"),
+        )
+        self.assertEqual(
+            bytes(r"\u2715 \u9EA6\u514B\u98CE\u5DF2\u65AD\u5F00", "ascii").decode("unicode_escape"),
+            format_hud_text("mic_disconnected", "zh"),
+        )
         for dur_decl in ("ms = 900;", "ms = 2000;", "ms = 2200;", "ms = 2600;"):
             self.assertIn(dur_decl, shim)
 
