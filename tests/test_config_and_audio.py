@@ -680,6 +680,56 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 ensure_secure_dir(dangling)
 
+    def test_max_retries_defaults_overrides_validation_and_redaction(self) -> None:
+        dcfg = Config()
+        self.assertEqual(dcfg.asr.max_retries, 2)
+        self.assertEqual(dcfg.refiner.max_retries, 2)
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            cfg_path = home / "config.toml"
+            cfg_path.write_text(
+                "[asr]\nmax_retries = 0\n\n[refiner]\nmax_retries = 4\n",
+                encoding="utf-8",
+            )
+            c_toml, _ = load_config(config_path=cfg_path, env={"HOME": td}, home_dir=home)
+            self.assertEqual(c_toml.asr.max_retries, 0)
+            self.assertEqual(c_toml.refiner.max_retries, 4)
+
+            # *_MAX_RETRIES env vars are ignored (ordinary config lives in config.toml / cli_overrides)
+            env_ov = {
+                "HOME": td,
+                "AGENT_VOICE_INPUT_ASR_MAX_RETRIES": "5",
+                "VOICE_INPUT_REFINER_MAX_RETRIES": "1",
+            }
+            c_env, _ = load_config(config_path=cfg_path, env=env_ov, home_dir=home)
+            self.assertEqual(c_env.asr.max_retries, 0)
+            self.assertEqual(c_env.refiner.max_retries, 4)
+
+            c_cli, _ = load_config(
+                config_path=cfg_path,
+                env=env_ov,
+                home_dir=home,
+                cli_overrides={"asr.max_retries": 5, "refiner.max_retries": 1},
+            )
+            self.assertEqual(c_cli.asr.max_retries, 5)
+            self.assertEqual(c_cli.refiner.max_retries, 1)
+
+            msg = redact_secrets("HTTP 502 after 5 attempts (code=1)", env_ov, cfg=c_cli)
+            self.assertEqual(msg, "HTTP 502 after 5 attempts (code=1)")
+
+            for bad_toml in (
+                "[asr]\nmax_retries = -1\n",
+                "[asr]\nmax_retries = 11\n",
+                "[asr]\nmax_retries = true\n",
+                '[asr]\nmax_retries = "abc"\n',
+                "[refiner]\nmax_retries = 1.5\n",
+                "[refiner]\nmax_retries = -2\n",
+            ):
+                cfg_path.write_text(bad_toml, encoding="utf-8")
+                with self.assertRaises(ConfigError):
+                    load_config(config_path=cfg_path, env={"HOME": td}, home_dir=home)
+
     def test_v020_legacy_provider_rejection_and_stage_validation_matrix(self) -> None:
         self.assertEqual(
             VALID_ASR_PROVIDERS,

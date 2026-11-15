@@ -26,13 +26,18 @@ from agent_voice_input.asr_providers import (  # noqa: E402
     AsrError,
     CHAT_AUDIO_TASK_REMINDER,
     ChatAudioAsrProvider,
+    DEFAULT_CONNECT_TIMEOUT_SEC,
     HttpRequest,
     HttpResponse,
+    HttpTransportError,
     _KEEPALIVE_POOL,
     _KeepAlivePool,
     _SameOriginSafeRedirectHandler,
+    classify_transport_error,
     create_asr_provider,
+    parse_retry_after,
     reset_doubao_slot_cache,
+    reset_rate_limit_pacers,
     transcribe,
     urllib_http_transport,
 )
@@ -54,9 +59,11 @@ def _sample_wav() -> bytes:
 class AsrProvidersTests(unittest.TestCase):
     def setUp(self) -> None:
         reset_doubao_slot_cache()
+        reset_rate_limit_pacers()
 
     def tearDown(self) -> None:
         reset_doubao_slot_cache()
+        reset_rate_limit_pacers()
         _KEEPALIVE_POOL.close_all()
 
     def test_ali_qwen3_compatible_mode_exact_contract(self) -> None:
@@ -1162,6 +1169,704 @@ class AsrProvidersTests(unittest.TestCase):
         prov_small = create_asr_provider(cfg_small, resolve_credentials(cfg_small, env), env=env, transport=fake_tx)
         prov_small.transcribe(chunk_wav)
         self.assertEqual(seen_timeouts[-1], 3.0)
+
+    def test_split_connect_and_tls_handshake_timeout_vs_read_timeout(self) -> None:
+        import http.server
+        import socket as _sock
+        import ssl as _ssl
+
+        self.assertEqual(DEFAULT_CONNECT_TIMEOUT_SEC, 9.0)
+        self.assertEqual(
+            HttpRequest(url="http://127.0.0.1:9/ok", method="GET", headers={}, body=b"", timeout_sec=5.0).connect_timeout_sec,
+            9.0,
+        )
+
+        # 1. Stalled TLS handshake on BOTH direct Keep-Alive path and system proxy path fails within
+        #    connect_timeout_sec (~0.15s) even when request timeout_sec is 4.0s!
+        held_socks: list[_sock.socket] = []
+        stop_evt = threading.Event()
+        srv = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        srv.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        srv.settimeout(0.05)
+        stalled_port = srv.getsockname()[1]
+
+        def _accept_and_stall_loop() -> None:
+            while not stop_evt.is_set():
+                try:
+                    c, _ = srv.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                held_socks.append(c)
+
+        t_stall = threading.Thread(target=_accept_and_stall_loop, daemon=True)
+        t_stall.start()
+        try:
+            # 1a. Direct Keep-Alive HTTPS path: TCP accepted immediately, ServerHello never arrives
+            t0 = time.monotonic()
+            with mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=False):
+                with self.assertRaises(HttpTransportError) as cm_direct:
+                    urllib_http_transport(
+                        HttpRequest(
+                            url=f"https://127.0.0.1:{stalled_port}/v1/audio",
+                            method="POST",
+                            headers={},
+                            body=b"{}",
+                            timeout_sec=4.0,
+                            connect_timeout_sec=0.14,
+                        )
+                    )
+            dt_direct = time.monotonic() - t0
+            self.assertLess(dt_direct, 0.9)
+            self.assertEqual(cm_direct.exception.retry_kind, "transient")
+
+            # 1b. Stalled HTTP proxy CONNECT tunnel: proxy accepts TCP, never answers CONNECT line
+            #     (mock proxy_bypass=False so host NO_PROXY=* can NEVER bypass loopback proxy!)
+            before_proxy_accepts = len(held_socks)
+            proxy_url = f"http://127.0.0.1:{stalled_port}"
+            t1 = time.monotonic()
+            with (
+                mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=True),
+                mock.patch("urllib.request.getproxies", return_value={"https": proxy_url}),
+                mock.patch("urllib.request.proxy_bypass", return_value=False),
+            ):
+                with self.assertRaises(HttpTransportError) as cm_proxy:
+                    urllib_http_transport(
+                        HttpRequest(
+                            url="https://proxy-only.invalid/v1/audio",
+                            method="POST",
+                            headers={},
+                            body=b"{}",
+                            timeout_sec=4.0,
+                            connect_timeout_sec=0.14,
+                        )
+                    )
+            dt_proxy = time.monotonic() - t1
+            self.assertLess(dt_proxy, 0.9)
+            self.assertGreater(len(held_socks), before_proxy_accepts)
+            self.assertEqual(cm_proxy.exception.retry_kind, "transient")
+        finally:
+            stop_evt.set()
+            srv.close()
+            t_stall.join(timeout=1.0)
+            for s_open in held_socks:
+                try:
+                    s_open.close()
+                except OSError:
+                    pass
+
+        # 1c. Slow-drip byte-by-byte trickle during proxy CONNECT and response headers CANNOT exceed hard deadline!
+        drip_stop = threading.Event()
+        drip_srv = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        drip_srv.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        drip_srv.bind(("127.0.0.1", 0))
+        drip_srv.listen(8)
+        drip_srv.settimeout(0.05)
+        drip_port = drip_srv.getsockname()[1]
+
+        def _drip_loop() -> None:
+            while not drip_stop.is_set():
+                try:
+                    c, _ = drip_srv.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                try:
+                    c.settimeout(0.1)
+                    try:
+                        c.recv(512)
+                    except OSError:
+                        pass
+                    for b_ch in b"HTTP/1.1 200 OK\r\nX-Slow: ":
+                        if drip_stop.is_set():
+                            break
+                        c.sendall(bytes([b_ch]))
+                        time.sleep(0.03)
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
+
+        t_drip = threading.Thread(target=_drip_loop, daemon=True)
+        t_drip.start()
+        try:
+            # Slow-drip CONNECT headers bounded by connect_timeout_sec=0.12s (even with timeout_sec=3.0s)
+            t_dc = time.monotonic()
+            with (
+                mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=True),
+                mock.patch("urllib.request.getproxies", return_value={"https": f"http://127.0.0.1:{drip_port}"}),
+                mock.patch("urllib.request.proxy_bypass", return_value=False),
+            ):
+                with self.assertRaises(HttpTransportError):
+                    urllib_http_transport(
+                        HttpRequest(
+                            url="https://proxy-only.invalid/v1/audio",
+                            method="POST",
+                            headers={},
+                            body=b"{}",
+                            timeout_sec=3.0,
+                            connect_timeout_sec=0.12,
+                        )
+                    )
+            self.assertLess(time.monotonic() - t_dc, 0.35)
+
+            # Slow-drip HTTP response headers bounded by timeout_sec=0.12s
+            t_dh = time.monotonic()
+            with mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=False):
+                with self.assertRaises(HttpTransportError):
+                    urllib_http_transport(
+                        HttpRequest(
+                            url=f"http://127.0.0.1:{drip_port}/v1/audio",
+                            method="POST",
+                            headers={},
+                            body=b"{}",
+                            timeout_sec=0.12,
+                            connect_timeout_sec=1.0,
+                        )
+                    )
+            self.assertLess(time.monotonic() - t_dh, 0.35)
+        finally:
+            drip_stop.set()
+            drip_srv.close()
+            t_drip.join(timeout=1.0)
+
+        # 2. Fast connect + slow response body (0.24s > connect_timeout_sec=0.10s, < timeout_sec=2.0s)
+        #    MUST succeed cleanly because post-connect I/O switches back to timeout_sec!
+        class _SlowBodyHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: object) -> None:
+                return None
+
+            def do_POST(self) -> None:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    self.rfile.read(n)
+                time.sleep(0.24)
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SlowBodyHandler)
+        t_http = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        t_http.start()
+        try:
+            slow_url = f"http://127.0.0.1:{httpd.server_port}/slow"
+            with mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=False):
+                r1 = urllib_http_transport(
+                    HttpRequest(
+                        url=slow_url,
+                        method="POST",
+                        headers={},
+                        body=b"ping",
+                        timeout_sec=2.0,
+                        connect_timeout_sec=0.10,
+                    )
+                )
+                # Second call reuses pooled Keep-Alive connection and also preserves slow body read timeout
+                r2 = urllib_http_transport(
+                    HttpRequest(
+                        url=slow_url,
+                        method="POST",
+                        headers={},
+                        body=b"ping2",
+                        timeout_sec=2.0,
+                        connect_timeout_sec=0.10,
+                    )
+                )
+            self.assertEqual(r1.status, 200)
+            self.assertEqual(r2.status, 200)
+            self.assertEqual(r2.json(), {"ok": True})
+
+            # Also verify HTTPS path (_SplitTimeoutHTTPSConnection): fast handshake under connect_timeout_sec=0.10s
+            # immediately switches socket timeout back to timeout_sec=2.0s so 0.24s response body succeeds!
+            handshake_timeouts: list[float | None] = []
+            outer_test = self
+
+            class _FakeTlsCtx:
+                def wrap_socket(self, sock: _sock.socket, *, server_hostname: str | None = None, do_handshake_on_connect: bool = True) -> Any:
+                    outer_test.assertFalse(do_handshake_on_connect)
+
+                    class _Wrapped:
+                        def __getattr__(self, name: str) -> Any:
+                            return getattr(sock, name)
+
+                        def do_handshake(self) -> None:
+                            handshake_timeouts.append(sock.gettimeout())
+
+                        def makefile(self, *a: Any, **kw: Any) -> Any:
+                            return sock.makefile(*a, **kw)
+
+                    return _Wrapped()
+
+            _KEEPALIVE_POOL.close_all()
+            with (
+                mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=False),
+                mock.patch.object(_KEEPALIVE_POOL, "_get_ssl_context", return_value=_FakeTlsCtx()),
+            ):
+                r_https = urllib_http_transport(
+                    HttpRequest(
+                        url=f"https://127.0.0.1:{httpd.server_port}/slow",
+                        method="POST",
+                        headers={},
+                        body=b"https-ping",
+                        timeout_sec=2.0,
+                        connect_timeout_sec=0.10,
+                    )
+                )
+            self.assertEqual(r_https.status, 200)
+            self.assertEqual(len(handshake_timeouts), 1)
+            self.assertLessEqual(handshake_timeouts[0] or 99.0, 0.12)
+        finally:
+            _KEEPALIVE_POOL.close_all()
+            httpd.shutdown()
+            httpd.server_close()
+            t_http.join(timeout=1.0)
+
+        # 2b. Cooperative cancellation wakes threads waiting on _RATE_PACER concurrency inflight_lock within <0.25s!
+        from agent_voice_input.asr_providers import _RATE_PACER
+
+        reset_rate_limit_pacers()
+        pkey = "test-conc|host|fp"
+        _RATE_PACER.note_rate_limit(pkey, now=time.monotonic(), is_concurrency=True, min_interval_sec=0.01)
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+
+        def _hold_pacer() -> None:
+            with _RATE_PACER.guard(pkey, deadline=time.monotonic() + 5.0, clock_fn=time.monotonic, sleep_fn=time.sleep):
+                holder_entered.set()
+                release_holder.wait(timeout=2.0)
+
+        th_hold = threading.Thread(target=_hold_pacer, daemon=True)
+        th_hold.start()
+        self.assertTrue(holder_entered.wait(timeout=1.0))
+        cancel_flag = [False]
+        threading.Timer(0.06, lambda: cancel_flag.__setitem__(0, True)).start()
+        t_wait0 = time.monotonic()
+        with _RATE_PACER.guard(
+            pkey,
+            deadline=time.monotonic() + 5.0,
+            clock_fn=time.monotonic,
+            sleep_fn=time.sleep,
+            is_cancelled=lambda: cancel_flag[0],
+        ) as waited_flag:
+            self.assertFalse(waited_flag)
+        self.assertLess(time.monotonic() - t_wait0, 0.35)
+        release_holder.set()
+        th_hold.join(timeout=1.0)
+        reset_rate_limit_pacers()
+
+        # 3. Low-level transport exception classification distinguishes permanent TLS/DNS errors from transient ones
+        cert_err = _ssl.SSLCertVerificationError(1, "certificate verify failed: self-signed certificate")
+        self.assertEqual(classify_transport_error(cert_err), "never")
+        self.assertEqual(classify_transport_error(urllib.error.URLError(cert_err)), "never")
+        self.assertEqual(
+            classify_transport_error(_ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number")),
+            "never",
+        )
+        self.assertEqual(
+            classify_transport_error(_ssl.SSLEOFError(8, "EOF occurred in violation of protocol")),
+            "transient",
+        )
+        eai_noname = getattr(_sock, "EAI_NONAME", 8)
+        eai_again = getattr(_sock, "EAI_AGAIN", 2)
+        self.assertEqual(
+            classify_transport_error(_sock.gaierror(eai_noname, "nodename nor servname provided")),
+            "never",
+        )
+        self.assertEqual(
+            classify_transport_error(_sock.gaierror(eai_again, "Temporary failure in name resolution")),
+            "transient",
+        )
+        self.assertEqual(parse_retry_after({"Retry-After": "1.75"}), 1.75)
+        self.assertEqual(parse_retry_after({"Retry-After-Ms": "650"}), 0.65)
+        self.assertAlmostEqual(
+            parse_retry_after(
+                {"Retry-After": "Wed, 21 Oct 2015 07:28:03 GMT"},
+                now_epoch=1445412480.0,
+            )
+            or 0.0,
+            3.0,
+            places=2,
+        )
+
+    def test_asr_two_bucket_retries_doubao_two_phase_pacing_and_fail_fast(self) -> None:
+        from agent_voice_input.daemon import _transcribe_wav_chunks
+
+        wav = _sample_wav()
+        env = {
+            "OPENAI_API_KEY": "sk-oai-" + ("r" * 16),
+            "OPENROUTER_API_KEY": "sk-or-" + ("r" * 16),
+            "GEMINI_API_KEY": "gem_" + ("r" * 16),
+            "DASHSCOPE_API_KEY": "ali_" + ("r" * 16),
+            "DOUBAO_ASR_APP_ID": "app_r_123",
+            "DOUBAO_ASR_API_KEY": "acc_r_" + ("x" * 16),
+        }
+
+        # 1. Rate-limit HTTP 429 honors Retry-After; Retry-After >= remaining timeout aborts immediately!
+        now_rl = [100.0]
+        sleeps_rl: list[float] = []
+        calls_rl = [0]
+
+        def fake_sleep_rl(sec: float) -> None:
+            sleeps_rl.append(round(sec, 3))
+            now_rl[0] += sec
+
+        def tx_rl(req: HttpRequest) -> HttpResponse:
+            calls_rl[0] += 1
+            if calls_rl[0] == 1:
+                return HttpResponse(
+                    429,
+                    {"content-type": "application/json", "Retry-After": "2.25"},
+                    b'{"error":{"message":"Rate limit reached for requests","type":"requests"}}',
+                )
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"text": "限流重试成功"}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        cfg_oai = Config()
+        cfg_oai.asr.provider = "openai"
+        cfg_oai.asr.hotwords_file = ""
+        prov_rl = create_asr_provider(
+            cfg_oai,
+            resolve_credentials(cfg_oai, env),
+            env=env,
+            transport=tx_rl,
+            clock_fn=lambda: now_rl[0],
+            sleep_fn=fake_sleep_rl,
+            rand_fn=lambda: 0.0,
+        )
+        res_rl = prov_rl.transcribe(wav)
+        self.assertEqual(res_rl.text, "限流重试成功")
+        self.assertEqual(res_rl.retries, 1)
+        self.assertEqual(calls_rl[0], 2)
+        self.assertEqual(sleeps_rl, [2.25])
+
+        # Retry-After (120s) > remaining timeout_sec (10s) -> fails fast without sleeping!
+        reset_rate_limit_pacers()
+        sleeps_big: list[float] = []
+        calls_big = [0]
+
+        def tx_big_ra(_req: HttpRequest) -> HttpResponse:
+            calls_big[0] += 1
+            return HttpResponse(429, {"Retry-After": "120"}, b'{"error":{"message":"slow down"}}')
+
+        cfg_short = Config()
+        cfg_short.asr.provider = "openai"
+        cfg_short.asr.timeout_sec = 10.0
+        cfg_short.asr.hotwords_file = ""
+        prov_big = create_asr_provider(
+            cfg_short,
+            resolve_credentials(cfg_short, env),
+            env=env,
+            transport=tx_big_ra,
+            clock_fn=lambda: 50.0,
+            sleep_fn=sleeps_big.append,
+        )
+        with self.assertRaises(AsrError) as cm_big:
+            prov_big.transcribe(wav)
+        self.assertEqual(cm_big.exception.retry_kind, "rate_limit")
+        self.assertEqual(calls_big[0], 1)
+        self.assertEqual(sleeps_big, [])
+
+        # 2. Doubao cached flash slot hitting QPS quota exceeded retries on flash WITHOUT evicting slot cache!
+        reset_doubao_slot_cache()
+        reset_rate_limit_pacers()
+        now_db = [10.0]
+        sleeps_db: list[float] = []
+        db_urls: list[tuple[str, str]] = []
+
+        def tx_db_qps(req: HttpRequest) -> HttpResponse:
+            rid = req.headers.get("X-Api-Resource-Id", "")
+            db_urls.append((req.url, rid))
+            # Call 1 warms slot cache; Call 2 (transcribe #2 attempt 1) hits QPS limit; Call 3 succeeds on flash!
+            if len(db_urls) == 2:
+                return HttpResponse(
+                    403,
+                    {
+                        "x-api-status-code": "45000292",
+                        "x-api-message": "quota exceeded for types: qps",
+                    },
+                    b"{}",
+                )
+            return HttpResponse(
+                200,
+                {"x-api-status-code": "20000000", "x-api-message": "OK"},
+                json.dumps({"result": {"text": "豆包极速版限流恢复"}}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        cfg_db = Config()
+        cfg_db.asr.provider = "doubao"
+        cfg_db.asr.hotwords_file = ""
+        prov_db = create_asr_provider(
+            cfg_db,
+            resolve_credentials(cfg_db, env),
+            env=env,
+            transport=tx_db_qps,
+            clock_fn=lambda: now_db[0],
+            sleep_fn=lambda s: (sleeps_db.append(round(s, 3)), now_db.__setitem__(0, now_db[0] + s))[0],  # type: ignore[func-returns-value]
+            rand_fn=lambda: 0.0,
+        )
+        self.assertEqual(prov_db.transcribe(wav).retries, 0)
+        res_db2 = prov_db.transcribe(wav)
+        self.assertEqual(res_db2.text, "豆包极速版限流恢复")
+        self.assertEqual(res_db2.retries, 1)
+        # Never fell back to /submit! All 3 calls stayed on flash slot volc.bigasr.auc_turbo
+        self.assertTrue(all(u.endswith("/recognize/flash") and r == "volc.bigasr.auc_turbo" for u, r in db_urls))
+
+        # 3. Doubao two-phase /submit -> /query: transient 502 / 55000031 during /query retries /query ONLY
+        #    reusing the exact same X-Api-Request-Id without re-submitting audio!
+        reset_doubao_slot_cache()
+        reset_rate_limit_pacers()
+        now_sq = [20.0]
+        sq_calls: list[tuple[str, str]] = []
+        q_attempt = [0]
+
+        def tx_db_sq(req: HttpRequest) -> HttpResponse:
+            req_id = req.headers.get("X-Api-Request-Id", "")
+            sq_calls.append((req.url.rsplit("/", 1)[-1], req_id))
+            if req.url.endswith("/recognize/flash"):
+                return HttpResponse(403, {"x-api-status-code": "45000030", "x-api-message": "resource not granted"}, b"{}")
+            if req.url.endswith("/submit"):
+                return HttpResponse(200, {"x-api-status-code": "20000000", "x-api-message": "OK"}, b"{}")
+            q_attempt[0] += 1
+            if q_attempt[0] == 1:
+                return HttpResponse(200, {"x-api-status-code": "20000001", "x-api-message": "processing"}, b"{}")
+            if q_attempt[0] == 2:
+                return HttpResponse(502, {"x-api-status-code": "55000031", "x-api-message": "server busy"}, b"bad gateway")
+            return HttpResponse(
+                200,
+                {"x-api-status-code": "20000000", "x-api-message": "OK"},
+                json.dumps({"result": {"text": "两阶段查询重试恢复"}}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        prov_sq = create_asr_provider(
+            cfg_db,
+            resolve_credentials(cfg_db, env),
+            env=env,
+            transport=tx_db_sq,
+            clock_fn=lambda: now_sq[0],
+            sleep_fn=lambda s: now_sq.__setitem__(0, now_sq[0] + s),
+            rand_fn=lambda: 0.0,
+        )
+        res_sq = prov_sq.transcribe(wav)
+        self.assertEqual(res_sq.text, "两阶段查询重试恢复")
+        self.assertEqual(res_sq.retries, 1)
+        submit_ids = [req_id for ep, req_id in sq_calls if ep == "submit"]
+        query_ids = [req_id for ep, req_id in sq_calls if ep == "query"]
+        self.assertEqual(len(submit_ids), 1)
+        self.assertEqual(len(query_ids), 3)
+        self.assertEqual(set(query_ids), {submit_ids[0]})
+
+        # 4. 5-chunk concurrent Doubao 2-QPS burst simulation: server rejects if >2 requests arrive within 0.50s;
+        #    adaptive _RATE_PACER activates on first 429 and all 5 chunks succeed cleanly!
+        reset_doubao_slot_cache()
+        reset_rate_limit_pacers()
+        qps_lock = threading.Lock()
+        req_times: list[float] = []
+        throttled_count = [0]
+
+        def tx_qps_burst(req: HttpRequest) -> HttpResponse:
+            now_t = time.monotonic()
+            with qps_lock:
+                recent = [t for t in req_times if (now_t - t) < 0.50]
+                if len(recent) >= 2:
+                    throttled_count[0] += 1
+                    return HttpResponse(
+                        429,
+                        {"x-api-status-code": "45000292", "x-api-message": "quota exceeded for types: qps"},
+                        b"{}",
+                    )
+                req_times.append(now_t)
+                idx = len(req_times)
+            return HttpResponse(
+                200,
+                {"x-api-status-code": "20000000", "x-api-message": "OK"},
+                json.dumps({"result": {"text": f"分段{idx}"}}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        prov_burst = create_asr_provider(
+            cfg_db,
+            resolve_credentials(cfg_db, env),
+            env=env,
+            transport=tx_qps_burst,
+            rand_fn=lambda: 0.0,
+        )
+        seg = [3500, -3500] * 12000  # 1.5s speech
+        pause = [0] * 6400           # 0.4s pause
+        five_chunk_wav = pack_pcm16_mono_wav((seg + pause) * 4 + seg)
+        merged_res, n_chunks, _ = _transcribe_wav_chunks(
+            five_chunk_wav,
+            eff_asr=prov_burst,
+            asr_ctx=None,
+            floor_dbfs=-50.0,
+            max_chunk_sec=2.1,
+        )
+        self.assertEqual(n_chunks, 5)
+        self.assertGreaterEqual(throttled_count[0], 1)
+        self.assertGreaterEqual(merged_res.retries, 1)
+        for idx_expected in range(1, 6):
+            self.assertIn(f"分段{idx_expected}", merged_res.text)
+
+        # 5. OpenRouter HTTP 200 mid-stream error (finish_reason == "error") retries instead of returning partial text!
+        reset_rate_limit_pacers()
+        or_calls = [0]
+
+        def tx_or_mid(_req: HttpRequest) -> HttpResponse:
+            or_calls[0] += 1
+            if or_calls[0] == 1:
+                return HttpResponse(
+                    200,
+                    {"content-type": "application/json"},
+                    json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "finish_reason": "error",
+                                    "message": {"role": "assistant", "content": "半截"},
+                                }
+                            ]
+                        }
+                    ).encode("utf-8"),
+                )
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"role": "assistant", "content": "完整的多模态转写结果"},
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
+
+        cfg_or = Config()
+        cfg_or.asr.provider = "openrouter"
+        cfg_or.asr.model = "google/gemini-2.5-flash"
+        cfg_or.asr.hotwords_file = ""
+        res_or = create_asr_provider(
+            cfg_or,
+            resolve_credentials(cfg_or, env),
+            env=env,
+            transport=tx_or_mid,
+            sleep_fn=lambda _s: None,
+            rand_fn=lambda: 0.0,
+        ).transcribe(wav)
+        self.assertEqual(res_or.text, "完整的多模态转写结果")
+        self.assertEqual(res_or.retries, 1)
+        self.assertEqual(or_calls[0], 2)
+
+        # 6. Non-retryable permanent errors, legal silence codes, max_retries=0, and full-budget timeout
+        #    MUST make strictly 1 attempt (never multiplying user wait by 3x!)
+        for bad_status, bad_body in (
+            (401, b'{"error":{"message":"Invalid API key","type":"invalid_request_error"}}'),
+            (400, b'{"error":{"message":"Unsupported audio format","type":"invalid_request_error"}}'),
+            (429, b'{"error":{"message":"You exceeded your current quota","code":"insufficient_quota"}}'),
+        ):
+            cnt = [0]
+
+            def tx_perm(_r: HttpRequest, s: int = bad_status, b: bytes = bad_body) -> HttpResponse:
+                cnt[0] += 1
+                return HttpResponse(s, {"content-type": "application/json"}, b)
+
+            p_perm = create_asr_provider(
+                cfg_oai, resolve_credentials(cfg_oai, env), env=env, transport=tx_perm, sleep_fn=lambda _s: None
+            )
+            with self.assertRaises(AsrError):
+                p_perm.transcribe(wav)
+            self.assertEqual(cnt[0], 1)
+
+        # Gemini safety block -> 1 call only
+        gem_cnt = [0]
+
+        def tx_gem_block(_r: HttpRequest) -> HttpResponse:
+            gem_cnt[0] += 1
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                b'{"promptFeedback":{"blockReason":"SAFETY"}}',
+            )
+
+        cfg_gem = Config()
+        cfg_gem.asr.provider = "gemini"
+        cfg_gem.asr.hotwords_file = ""
+        with self.assertRaises(AsrError):
+            create_asr_provider(
+                cfg_gem, resolve_credentials(cfg_gem, env), env=env, transport=tx_gem_block, sleep_fn=lambda _s: None
+            ).transcribe(wav)
+        self.assertEqual(gem_cnt[0], 1)
+
+        # DashScope legal silence ASR_RESPONSE_HAVE_NO_WORDS -> returns "" on attempt 1 without retry
+        ali_cnt = [0]
+
+        def tx_ali_sil(_r: HttpRequest) -> HttpResponse:
+            ali_cnt[0] += 1
+            return HttpResponse(
+                400,
+                {"content-type": "application/json"},
+                b'{"error":{"code":"ASR_RESPONSE_HAVE_NO_WORDS","message":"no words"}}',
+            )
+
+        cfg_ali = Config()
+        cfg_ali.asr.provider = "dashscope"
+        cfg_ali.asr.hotwords_file = ""
+        res_ali_sil = create_asr_provider(
+            cfg_ali, resolve_credentials(cfg_ali, env), env=env, transport=tx_ali_sil, sleep_fn=lambda _s: None
+        ).transcribe(wav)
+        self.assertEqual((res_ali_sil.text, res_ali_sil.retries, ali_cnt[0]), ("", 0, 1))
+
+        # max_retries = 0 -> strictly 1 attempt even on HTTP 503
+        zero_cnt = [0]
+        cfg_zero = Config()
+        cfg_zero.asr.provider = "openai"
+        cfg_zero.asr.max_retries = 0
+        cfg_zero.asr.hotwords_file = ""
+        with self.assertRaises(AsrError):
+            create_asr_provider(
+                cfg_zero,
+                resolve_credentials(cfg_zero, env),
+                env=env,
+                transport=lambda _r: (zero_cnt.__setitem__(0, zero_cnt[0] + 1), HttpResponse(503, {}, b"busy"))[1],
+                sleep_fn=lambda _s: None,
+            ).transcribe(wav)
+        self.assertEqual(zero_cnt[0], 1)
+
+        # Full-budget read timeout consumed on attempt 1 -> strictly 1 attempt (never 60s * 3 = 180s!)
+        now_to = [0.0]
+        to_cnt = [0]
+
+        def tx_full_to(_r: HttpRequest) -> HttpResponse:
+            to_cnt[0] += 1
+            now_to[0] += 60.5
+            raise HttpTransportError("read timed out", retry_kind="transient")
+
+        with self.assertRaises(AsrError):
+            create_asr_provider(
+                cfg_oai,
+                resolve_credentials(cfg_oai, env),
+                env=env,
+                transport=tx_full_to,
+                clock_fn=lambda: now_to[0],
+                sleep_fn=lambda _s: None,
+            ).transcribe(wav)
+        self.assertEqual(to_cnt[0], 1)
 
 
 class SessionCtxTests(unittest.TestCase):

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from . import __version__
-from .asr_providers import AsrResult, BaseAsrProvider, create_asr_provider
+from .asr_providers import AsrError, AsrResult, BaseAsrProvider, create_asr_provider
 from .audio_proc import AudioGateResult, DEFAULT_MAX_CHUNK_SEC, inspect_wav_chunks, process_wav, save_failed_audio
 from .config import Config, ProviderCredentials, ensure_secure_dir, get_runtime_dir, redact_secrets, resolve_credentials, select_asr_provider
 from .platform_macos import MacOSPlatform, is_macos_terminal_window
@@ -95,6 +95,53 @@ def _derive_failed_label(snap: SessionSnapshot | None, win: ForegroundWindow) ->
 MAX_ASR_CHUNK_CONCURRENCY: int = 5
 
 
+def _call_asr_transcribe(
+    eff_asr: BaseAsrProvider,
+    wav_bytes: bytes,
+    *,
+    context: Any,
+    is_cancelled: Callable[[], bool] | None,
+) -> AsrResult:
+    if is_cancelled is not None:
+        try:
+            params = inspect.signature(eff_asr.transcribe).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "is_cancelled" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return eff_asr.transcribe(wav_bytes, context=context, is_cancelled=is_cancelled)
+    return eff_asr.transcribe(wav_bytes, context=context)
+
+
+def _call_refiner_refine(
+    eff_refiner: BaseRefiner,
+    asr_res: AsrResult,
+    *,
+    session_key: str,
+    tracker: SessionTracker,
+    fallback_context: str,
+    is_cancelled: Callable[[], bool] | None,
+) -> RefinerResult:
+    if is_cancelled is not None:
+        try:
+            params = inspect.signature(eff_refiner.refine).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "is_cancelled" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return eff_refiner.refine(
+                asr_res,
+                session_key=session_key,
+                tracker=tracker,
+                fallback_context=fallback_context,
+                is_cancelled=is_cancelled,
+            )
+    return eff_refiner.refine(
+        asr_res,
+        session_key=session_key,
+        tracker=tracker,
+        fallback_context=fallback_context,
+    )
+
+
 def _transcribe_wav_chunks(
     wav_bytes: bytes,
     *,
@@ -105,18 +152,40 @@ def _transcribe_wav_chunks(
     seq_id: int = 1,
     is_current_seq: Callable[[int], bool] | None = None,
 ) -> tuple[AsrResult, int, tuple[float, ...]]:
+    cancel_check: Callable[[], bool] | None = (
+        (lambda: not is_current_seq(seq_id)) if is_current_seq is not None else None
+    )
     infos = inspect_wav_chunks(wav_bytes, max_chunk_sec=max_chunk_sec, floor_dbfs=floor_dbfs)
     if len(infos) <= 1:
-        return eff_asr.transcribe(wav_bytes, context=asr_ctx), 1, ()
+        if cancel_check is not None and cancel_check():
+            return AsrResult(text="", provider=getattr(eff_asr, "provider_name", ""), model="", latency_ms=0), 1, ()
+        return _call_asr_transcribe(eff_asr, wav_bytes, context=asr_ctx, is_cancelled=cancel_check), 1, ()
 
     chunk_secs = tuple(round(c.duration_sec, 2) for c in infos)
     t0 = time.monotonic()
     results: list[AsrResult | None] = [None] * len(infos)
+    abort_evt = threading.Event()
+    first_exc_lock = threading.Lock()
+    first_exc: list[Exception] = []
+
+    def _chunk_cancelled() -> bool:
+        return abort_evt.is_set() or (cancel_check is not None and cancel_check())
 
     def _work(chunk_wav: bytes) -> AsrResult | None:
-        if is_current_seq is not None and not is_current_seq(seq_id):
+        if cancel_check is not None and cancel_check():
             return None
-        return eff_asr.transcribe(chunk_wav, context=asr_ctx)
+        if abort_evt.is_set():
+            return None
+        try:
+            return _call_asr_transcribe(eff_asr, chunk_wav, context=asr_ctx, is_cancelled=_chunk_cancelled)
+        except Exception as exc:
+            if cancel_check is not None and cancel_check() and isinstance(exc, AsrError) and "cancelled" in str(exc).lower():
+                return None
+            with first_exc_lock:
+                if not abort_evt.is_set():
+                    first_exc.append(exc)
+                    abort_evt.set()
+            raise
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_ASR_CHUNK_CONCURRENCY, len(infos))) as pool:
         futs = [pool.submit(_work, c.wav_bytes) for c in infos]
@@ -124,8 +193,11 @@ def _transcribe_wav_chunks(
             for idx, fut in enumerate(futs):
                 results[idx] = fut.result()
         except Exception:
+            abort_evt.set()
             for f in futs:
                 f.cancel()
+            if first_exc:
+                raise first_exc[0]
             raise
 
     non_null = [r for r in results if r is not None]
@@ -135,7 +207,19 @@ def _transcribe_wav_chunks(
     prov = first.provider if first else getattr(eff_asr, "provider_name", "")
     model = first.model if first else ""
     single_hop = bool(non_null) and all(r.is_single_hop_refined for r in non_null)
-    return AsrResult(text=merged_text, provider=prov, model=model, latency_ms=elapsed_ms, is_single_hop_refined=single_hop), len(infos), chunk_secs
+    total_retries = sum(r.retries for r in non_null)
+    return (
+        AsrResult(
+            text=merged_text,
+            provider=prov,
+            model=model,
+            latency_ms=elapsed_ms,
+            is_single_hop_refined=single_hop,
+            retries=total_retries,
+        ),
+        len(infos),
+        chunk_secs,
+    )
 
 
 def run_pipeline_once(
@@ -191,15 +275,32 @@ def run_pipeline_once(
                 else eff_tracker.sync_session(window_title=window_title_override)
             )
             asr_ctx = eff_tracker.build_asr_context(snap)
-            asr_res, chunk_count, chunk_secs = _transcribe_wav_chunks(
-                gate.wav_bytes,
-                eff_asr=eff_asr,
-                asr_ctx=asr_ctx,
-                floor_dbfs=cfg.audio.floor_dbfs,
-                max_chunk_sec=max_chunk_sec,
-                seq_id=seq_id,
-                is_current_seq=is_current_seq,
+            cancel_check: Callable[[], bool] | None = (
+                (lambda: not is_current_seq(seq_id)) if is_current_seq is not None else None
             )
+            try:
+                asr_res, chunk_count, chunk_secs = _transcribe_wav_chunks(
+                    gate.wav_bytes,
+                    eff_asr=eff_asr,
+                    asr_ctx=asr_ctx,
+                    floor_dbfs=cfg.audio.floor_dbfs,
+                    max_chunk_sec=max_chunk_sec,
+                    seq_id=seq_id,
+                    is_current_seq=is_current_seq,
+                )
+            except AsrError as asr_exc:
+                if cancel_check is not None and cancel_check() and "cancelled" in str(asr_exc).lower():
+                    saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
+                    return PipelineResult(
+                        False,
+                        seq_id,
+                        skipped_reason="superseded",
+                        audio_source=audio_source,
+                        gate=gate,
+                        session=snap,
+                        saved_audio=saved_p,
+                    )
+                raise
             if not asr_res.text.strip():
                 if is_current_seq is not None and not is_current_seq(seq_id):
                     saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
@@ -211,7 +312,14 @@ def run_pipeline_once(
                 return PipelineResult(False, seq_id, final_text=asr_res.text.strip(), skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
             if _will_run_stage2_refiner(cfg, eff_refiner, asr_res) and on_stage is not None:
                 on_stage("refining")
-            ref_res = eff_refiner.refine(asr_res, session_key=snap.session_key if snap else "", tracker=eff_tracker, fallback_context=asr_ctx.dialog_text)
+            ref_res = _call_refiner_refine(
+                eff_refiner,
+                asr_res,
+                session_key=snap.session_key if snap else "",
+                tracker=eff_tracker,
+                fallback_context=asr_ctx.dialog_text,
+                is_cancelled=cancel_check,
+            )
             final_text = ref_res.text.strip() or asr_res.text.strip()
             if is_current_seq is not None and not is_current_seq(seq_id):
                 saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
@@ -397,6 +505,12 @@ class VoiceInputDaemon:
 
     def _build_summary(self, seq_id: int, res: PipelineResult, *, dry_run: bool = False) -> dict[str, Any]:
         summary: dict[str, Any] = {"seq_id": seq_id, "ok": res.ok, "skipped_reason": res.skipped_reason, "audio_source": res.audio_source, "switched_fallback": res.switched_fallback, "session_key": res.session.session_key if res.session else "", "asr_provider": res.asr.provider if res.asr else "", "refiner_fallback": res.refined.used_fallback if res.refined else "", "pasted": res.paste.pasted if res.paste else False, "paste_reason": res.paste.reason if res.paste else ("dry_run" if dry_run and res.ok else ""), "raw_audio_sec": round(res.gate.duration_sec, 3) if res.gate else 0.0, "voiced_audio_sec": round(res.gate.voiced_sec, 3) if res.gate else 0.0, "asr_ms": res.asr.latency_ms if res.asr else 0, "refine_ms": res.refined.latency_ms if res.refined else 0, "asr_chars": len(res.asr.text.strip()) if res.asr else 0, "final_chars": len(res.final_text)}
+        if res.asr and res.asr.retries > 0:
+            summary["asr_retries"] = res.asr.retries
+        if res.refined and res.refined.retries > 0:
+            summary["refiner_retries"] = res.refined.retries
+        if res.refined and res.refined.warning:
+            summary["refiner_warning"] = self._redact_str(res.refined.warning)
         if res.asr_chunks > 1:
             summary["asr_chunks"] = res.asr_chunks
             if res.asr_chunk_secs:

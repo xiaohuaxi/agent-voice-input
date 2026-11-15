@@ -16,7 +16,15 @@ _SRC_ROOT = _REPO_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
-from agent_voice_input.asr_providers import AsrContext, AsrResult, BaseAsrProvider, HttpRequest, HttpResponse  # noqa: E402
+from agent_voice_input.asr_providers import (  # noqa: E402
+    AsrContext,
+    AsrError,
+    AsrResult,
+    BaseAsrProvider,
+    HttpRequest,
+    HttpResponse,
+    reset_rate_limit_pacers,
+)
 from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
 from agent_voice_input.config import Config, ConfigError, HotkeyConfig, RefinerConfig, _parse_simple_toml, load_config, load_env_files, parse_toml, resolve_credentials  # noqa: E402
 from agent_voice_input.daemon import (  # noqa: E402
@@ -622,6 +630,208 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         ref.refine("字" * 1600)
         self.assertEqual(seen_timeouts[0], 12.0)
         self.assertAlmostEqual(seen_timeouts[1], 52.0)
+
+    def test_refiner_http_and_codex_retries_two_buckets_and_unified_deadline(self) -> None:
+        reset_rate_limit_pacers()
+        env = {
+            "OPENAI_API_KEY": "sk-oai-" + ("9" * 16),
+            "GEMINI_API_KEY": "gem_" + ("9" * 16),
+        }
+
+        # 1. OpenAICompatibleRefiner retries 429 (honoring Retry-After) + transient empty output glitch
+        now_oai = [10.0]
+        sleeps_oai: list[float] = []
+        oai_calls = [0]
+
+        def tx_oai(req: HttpRequest) -> HttpResponse:
+            oai_calls[0] += 1
+            if oai_calls[0] == 1:
+                return HttpResponse(429, {"Retry-After": "1.5"}, b'{"error":{"message":"Too many requests"}}')
+            if oai_calls[0] == 2:
+                return HttpResponse(200, {"content-type": "application/json"}, b'{"choices":[{"message":{"content":"   "}}]}')
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": "精修重试后成功输出。"}}]}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        cfg_oai = Config(refiner=RefinerConfig(provider="openai", max_retries=2, timeout_sec=30.0))
+        ref_oai = OpenAICompatibleRefiner(
+            cfg_oai,
+            resolve_credentials(cfg_oai, env),
+            env=env,
+            transport=tx_oai,
+            clock_fn=lambda: now_oai[0],
+            sleep_fn=lambda s: (sleeps_oai.append(round(s, 3)), now_oai.__setitem__(0, now_oai[0] + s))[0],  # type: ignore[func-returns-value]
+            rand_fn=lambda: 0.0,
+        )
+        r_ok = ref_oai.refine("原始草稿")
+        self.assertEqual((r_ok.text, r_ok.used_fallback, r_ok.retries, oai_calls[0]), ("精修重试后成功输出。", "", 2, 3))
+        self.assertEqual(sleeps_oai[0], 1.5)
+
+        # 2. Content filter / HTTP 401 on OpenAICompatibleRefiner & SAFETY block on GeminiRefiner
+        #    MUST fall back to asr_draft on attempt 1 WITHOUT retrying!
+        for perm_resp in (
+            HttpResponse(401, {"content-type": "application/json"}, b'{"error":{"message":"bad key"}}'),
+            HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                b'{"choices":[{"finish_reason":"content_filter","message":{"content":""}}]}',
+            ),
+        ):
+            c_perm = [0]
+            ref_perm = OpenAICompatibleRefiner(
+                cfg_oai,
+                resolve_credentials(cfg_oai, env),
+                env=env,
+                transport=lambda _r, resp=perm_resp: (c_perm.__setitem__(0, c_perm[0] + 1), resp)[1],
+                sleep_fn=lambda _s: None,
+            )
+            res_p = ref_perm.refine("保留语音原文")
+            self.assertEqual((res_p.text, res_p.used_fallback, res_p.retries, c_perm[0]), ("保留语音原文", "asr_draft", 0, 1))
+
+        gem_calls = [0]
+
+        def tx_gem(req: HttpRequest) -> HttpResponse:
+            gem_calls[0] += 1
+            if gem_calls[0] == 1:
+                return HttpResponse(503, {"content-type": "application/json"}, b'{"error":{"status":"UNAVAILABLE","message":"overloaded"}}')
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"candidates": [{"content": {"parts": [{"text": "Gemini 精修恢复。"}]}}]}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        cfg_gem = Config(refiner=RefinerConfig(provider="gemini", max_retries=2))
+        res_gem = GeminiRefiner(
+            cfg_gem,
+            resolve_credentials(cfg_gem, env),
+            env=env,
+            transport=tx_gem,
+            sleep_fn=lambda _s: None,
+            rand_fn=lambda: 0.0,
+        ).refine("Gemini 草稿")
+        self.assertEqual((res_gem.text, res_gem.used_fallback, res_gem.retries, gem_calls[0]), ("Gemini 精修恢复。", "", 1, 2))
+
+        gem_safe_calls = [0]
+        res_gem_safe = GeminiRefiner(
+            cfg_gem,
+            resolve_credentials(cfg_gem, env),
+            env=env,
+            transport=lambda _r: (
+                gem_safe_calls.__setitem__(0, gem_safe_calls[0] + 1),
+                HttpResponse(200, {"content-type": "application/json"}, b'{"candidates":[{"finishReason":"SAFETY"}]}'),
+            )[1],
+            sleep_fn=lambda _s: None,
+        ).refine("安全拦截回退初稿")
+        self.assertEqual((res_gem_safe.text, res_gem_safe.used_fallback, res_gem_safe.retries, gem_safe_calls[0]), ("安全拦截回退初稿", "asr_draft", 0, 1))
+
+        # 3. CodexRefiner: max_retries=0 skips codex exec fallback; max_retries=2 recovers fresh app-server
+        #    on transient crash and enforces unified deadline across app-server + exec!
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            log_file = rt / "rpc.jsonl"
+            state_file = rt / "attempt_count.txt"
+            exec_calls = [0]
+
+            flaky_script = (
+                "import pathlib, subprocess, sys\n"
+                "st = pathlib.Path(sys.argv[2])\n"
+                "n = int(st.read_text() if st.exists() else '0') + 1\n"
+                "st.write_text(str(n))\n"
+                "mode = 'fail_app' if n == 1 else 'ok'\n"
+                f"code = {json.dumps(_MOCK_APP_SERVER_CODE)}\n"
+                "raise SystemExit(subprocess.call([sys.executable, '-c', code, sys.argv[1], mode]))\n"
+            )
+
+            def count_exec_runner(_env_txt: str, _cwd: Path) -> str:
+                exec_calls[0] += 1
+                return "EXEC_FALLBACK_OUT"
+
+            # 3a. max_retries = 0 -> strictly 1 attempt (no second app-server spawn, no codex exec)
+            cfg_c0 = Config(refiner=RefinerConfig(provider="codex", max_retries=0))
+            ref_c0 = CodexRefiner(
+                cfg_c0,
+                env={},
+                runtime_dir=rt,
+                app_server_cmd=[sys.executable, "-c", _MOCK_APP_SERVER_CODE, str(log_file), "fail_app"],
+                exec_runner=count_exec_runner,
+            )
+            try:
+                r_c0 = ref_c0.refine("不重试直接回退")
+                self.assertEqual((r_c0.text, r_c0.used_fallback, r_c0.retries, exec_calls[0]), ("不重试直接回退", "asr_draft", 0, 0))
+            finally:
+                ref_c0.close()
+
+            # 3b. max_retries = 2 -> attempt 1 app-server crashes transiently, retry 1 spawns fresh app-server & succeeds!
+            cfg_c2 = Config(refiner=RefinerConfig(provider="codex", max_retries=2))
+            ref_c2 = CodexRefiner(
+                cfg_c2,
+                env={},
+                runtime_dir=rt,
+                app_server_cmd=[sys.executable, "-c", flaky_script, str(log_file), str(state_file)],
+                exec_runner=count_exec_runner,
+            )
+            try:
+                r_c2 = ref_c2.refine("常驻恢复成功")
+                spawns_n = int(state_file.read_text(encoding="utf-8"))
+                self.assertEqual((r_c2.text, r_c2.used_fallback, r_c2.retries, spawns_n, exec_calls[0]), ("CLEAN[thr-1#1]:常驻恢复成功", "", 1, 2, 0))
+            finally:
+                ref_c2.close()
+
+            # 3c. CodexRefiner permanent errors (invalid model, certificate verify failed, content_filter)
+            #     MUST fail fast on attempt 1 with 0 retries and 0 codex exec calls!
+            for perm_msg in ("invalid model gpt-999", "SSL: CERTIFICATE_VERIFY_FAILED", "blocked by content_filter"):
+                perm_state = rt / f"perm_{ abs(hash(perm_msg)) }.txt"
+                perm_exec = [0]
+                perm_app_code = (
+                    "import json, pathlib, sys\n"
+                    "p = pathlib.Path(sys.argv[1])\n"
+                    "p.write_text(str(int(p.read_text() if p.exists() else '0') + 1))\n"
+                    "for raw in sys.stdin:\n"
+                    "    m = json.loads(raw)\n"
+                    "    if m.get('method') == 'initialize':\n"
+                    "        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{}}) + '\\n'); sys.stdout.flush()\n"
+                    "    elif m.get('method') == 'thread/start':\n"
+                    f"        sys.stdout.write(json.dumps({{'jsonrpc':'2.0','id':m['id'],'error':{{'code':-32000,'message':{json.dumps(perm_msg)}}}}}) + '\\n'); sys.stdout.flush()\n"
+                )
+                ref_cp = CodexRefiner(
+                    cfg_c2,
+                    env={},
+                    runtime_dir=rt,
+                    app_server_cmd=[sys.executable, "-c", perm_app_code, str(perm_state)],
+                    exec_runner=lambda _e, _c, b=perm_exec: (b.__setitem__(0, b[0] + 1), "NO")[1],
+                )
+                try:
+                    r_cp = ref_cp.refine("永久错误保留初稿")
+                    self.assertEqual(
+                        (r_cp.text, r_cp.used_fallback, r_cp.retries, int(perm_state.read_text()), perm_exec[0]),
+                        ("永久错误保留初稿", "asr_draft", 0, 1, 0),
+                    )
+                finally:
+                    ref_cp.close()
+
+        # 4. Refiner hitting _RATE_PACER queue timeout from a prior 429 Retry-After MUST gracefully
+        #    fall back to asr_draft instead of raising an unhandled TimeoutError!
+        from agent_voice_input.asr_providers import _RATE_PACER, make_rate_pacer_key
+
+        reset_rate_limit_pacers()
+        oai_key = env["OPENAI_API_KEY"]
+        pkey_ref = make_rate_pacer_key("openai", "https://api.openai.com/v1/chat/completions", oai_key)
+        _RATE_PACER.note_rate_limit(pkey_ref, now=100.0, retry_after_sec=50.0)
+        cfg_pacer_to = Config(refiner=RefinerConfig(provider="openai", max_retries=2, timeout_sec=5.0))
+        ref_pto = OpenAICompatibleRefiner(
+            cfg_pacer_to,
+            resolve_credentials(cfg_pacer_to, env),
+            env=env,
+            transport=lambda _r: HttpResponse(200, {}, b"{}"),
+            clock_fn=lambda: 100.0,
+            sleep_fn=lambda _s: None,
+        )
+        res_pto = ref_pto.refine("节流超时回退原稿")
+        self.assertEqual((res_pto.text, res_pto.used_fallback, res_pto.retries), ("节流超时回退原稿", "asr_draft", 0))
+        self.assertIn("rate-limit pacing exceeded", res_pto.warning)
+        reset_rate_limit_pacers()
 
 
 def _isolated_tracker(base: Path) -> SessionTracker:
@@ -1497,6 +1707,86 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 self.assertNotIn("refining", plat_sh.huds)
             finally:
                 daemon_sh.close()
+
+        # 2b. Summary telemetry records asr_retries, refiner_retries & redacted refiner_warning;
+        #     multi-chunk sibling failure aborts sibling backoff promptly with real root-cause AsrError!
+        with tempfile.TemporaryDirectory() as td_sum:
+            secret_tok = "sk-summary-secret-token-7788"
+
+            class _RetryAsr(BaseAsrProvider):
+                provider_name = "openai"
+
+                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                    return AsrResult("初稿文本", "openai", "gpt-4o-mini-transcribe", 25, retries=2)
+
+            class _RetryWarnRefiner(OpenAICompatibleRefiner):
+                def refine(self, asr_draft, **kwargs):  # type: ignore[override]
+                    return RefinerResult(
+                        "初稿文本",
+                        "openai",
+                        "gpt-4o-mini",
+                        40,
+                        used_fallback="asr_draft",
+                        warning=f"upstream 503 with key={secret_tok}",
+                        retries=2,
+                    )
+
+            env_sum = {"OPENAI_API_KEY": secret_tok}
+            cfg_sum = Config(refiner=RefinerConfig(provider="openai"))
+            d_sum = VoiceInputDaemon(
+                cfg_sum,
+                env=env_sum,
+                runtime_dir=Path(td_sum),
+                platform=_FakePlatform(),
+                asr_provider=_RetryAsr(cfg_sum, resolve_credentials(cfg_sum, env_sum), env=env_sum),
+                refiner=_RetryWarnRefiner(cfg_sum, resolve_credentials(cfg_sum, env_sum), env=env_sum),
+                tracker=_isolated_tracker(Path(td_sum)),
+            )
+            try:
+                d_sum.handle_trigger("toggle")
+                d_sum._last_trigger_ts = -1e9
+                r_s = d_sum.handle_trigger("toggle")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and d_sum.last_result.get("seq_id") != r_s["seq_id"]:
+                    time.sleep(0.01)
+                self.assertEqual(d_sum.last_result.get("asr_retries"), 2)
+                self.assertEqual(d_sum.last_result.get("refiner_retries"), 2)
+                self.assertIn("upstream 503", d_sum.last_result.get("refiner_warning", ""))
+                self.assertNotIn(secret_tok, json.dumps(d_sum.last_result, ensure_ascii=False))
+            finally:
+                d_sum.close()
+
+        # Multi-chunk sibling abort: chunk 0 enters 4.0s backoff, chunk 1 fails with HTTP 401 ->
+        # chunk 0 aborts backoff within <0.4s and _transcribe_wav_chunks raises chunk 1's 401 error!
+        from agent_voice_input.asr_providers import create_asr_provider
+
+        reset_rate_limit_pacers()
+        chunk_idx = [0]
+        idx_lock = threading.Lock()
+        both_in = threading.Barrier(2, timeout=1.0)
+
+        def tx_sibling_abort(_req: HttpRequest) -> HttpResponse:
+            both_in.wait()
+            with idx_lock:
+                chunk_idx[0] += 1
+                n = chunk_idx[0]
+            if n == 1:
+                return HttpResponse(429, {"Retry-After": "4.0"}, b'{"error":{"message":"slow"}}')
+            time.sleep(0.04)
+            return HttpResponse(401, {"content-type": "application/json"}, b'{"error":{"message":"Invalid API key"}}')
+
+        env_ab = {"OPENAI_API_KEY": "sk-oai-" + ("z" * 16)}
+        cfg_ab = Config()
+        cfg_ab.asr.provider = "openai"
+        cfg_ab.asr.hotwords_file = ""
+        prov_ab = create_asr_provider(cfg_ab, resolve_credentials(cfg_ab, env_ab), env=env_ab, transport=tx_sibling_abort)
+        two_chunk_wav = pack_pcm16_mono_wav([3500, -3500] * 12000 + [0] * 6400 + [3500, -3500] * 12000)
+        t_ab0 = time.monotonic()
+        with self.assertRaises(AsrError) as cm_ab:
+            _transcribe_wav_chunks(two_chunk_wav, eff_asr=prov_ab, asr_ctx=None, floor_dbfs=-50.0, max_chunk_sec=2.1)
+        self.assertLess(time.monotonic() - t_ab0, 0.8)
+        self.assertIn("Invalid API key", str(cm_ab.exception))
+        reset_rate_limit_pacers()
 
         # 3. Superseded empty/error Stage 1 must NOT emit stale 'refining'/'empty' HUD or error beep during seq 2 recording
         sup_asr_in = threading.Event()

@@ -117,6 +117,7 @@ Configuration uses two clean files (`CLI flags > config.toml > built-in defaults
   - `asr.api = "auto"` (default) routes `dashscope`, `doubao`, and dedicated STT models (`qwen/qwen3-asr-1.7b`, `whisper-*`, `*-transcribe`, `SenseVoiceSmall`, etc.) through Stage 1 transcription + Stage 2 context refinement;
   - Native `gemini` and multimodal chat-audio models on OpenRouter / OpenAI-compatible channels (`gemini-2.5-flash`, `google/gemini-2.5-flash`, `gpt-audio*`, etc.) perform transcription + context refinement in a single hop and skip Stage 2 automatically (unless `refiner.force_on_single_hop = true`). For newly released uncataloged models on `openrouter`, set `asr.api = "audio-transcriptions"` or `"chat-completions"` explicitly.
 - **Reasoning budget (`effort`)**: Accepts `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`. `asr.effort` defaults to `"auto"` (suppressing thinking latency on supported multimodal models); `refiner.effort` defaults to `"low"`.
+- **Same-provider retries & handshake timeout (`max_retries`)**: `[asr] max_retries` and `[refiner] max_retries` default to `2` (`0..10`, extra retries beyond the initial request; `0` disables retries), separating rate-limit throttling (`HTTP 429`, `Retry-After`, vendor QPS codes) from transient network/5xx errors under the stage `timeout_sec` budget with a 9s connect/TLS handshake cap.
 
 ### Built-in Providers
 

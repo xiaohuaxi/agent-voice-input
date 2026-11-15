@@ -206,6 +206,7 @@ class AsrConfig:
     api_key_env: str = ""
     hotwords_file: str = "~/.config/agent-voice-input/hotwords.txt"
     timeout_sec: float = 60.0
+    max_retries: int = 2
 
     def canonical_provider(self) -> str:
         return self.provider.strip().lower()
@@ -232,6 +233,7 @@ class RefinerConfig:
     api_key_env: str = ""
     max_turns_per_thread: int = 20
     timeout_sec: float = 90.0
+    max_retries: int = 2
     force_on_single_hop: bool = False
 
     def __post_init__(self) -> None:
@@ -1137,6 +1139,8 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.asr.hotwords_file = _as_str(v, "asr.hotwords_file").strip()
             elif k == "timeout_sec":
                 cfg.asr.timeout_sec = _as_float(v, "asr.timeout_sec")
+            elif k == "max_retries":
+                cfg.asr.max_retries = _as_int(v, "asr.max_retries")
             else:
                 raise ConfigError(f"unknown asr option {k!r}")
         if has_explicit_asr_provider and cfg.asr.provider != prev_asr_provider:
@@ -1181,6 +1185,8 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.refiner.max_turns_per_thread = _as_int(v, "refiner.max_turns_per_thread")
             elif k == "timeout_sec":
                 cfg.refiner.timeout_sec = _as_float(v, "refiner.timeout_sec")
+            elif k == "max_retries":
+                cfg.refiner.max_retries = _as_int(v, "refiner.max_retries")
             elif k == "force_on_single_hop":
                 cfg.refiner.force_on_single_hop = _as_bool(v, "refiner.force_on_single_hop")
             else:
@@ -1422,6 +1428,12 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
         )
     if cfg.asr.timeout_sec <= 0:
         raise ConfigError("asr.timeout_sec must be > 0")
+    if (
+        isinstance(cfg.asr.max_retries, bool)
+        or not isinstance(cfg.asr.max_retries, int)
+        or not (0 <= cfg.asr.max_retries <= 10)
+    ):
+        raise ConfigError("asr.max_retries must satisfy 0 <= max_retries <= 10")
     if cfg.asr.provider == "openai-compatible" and not cfg.asr.base_url.strip():
         raise ConfigError(
             "asr.base_url must be explicitly set when asr.provider is 'openai-compatible' "
@@ -1489,6 +1501,12 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
         raise ConfigError("refiner.max_turns_per_thread must be > 0")
     if cfg.refiner.timeout_sec <= 0:
         raise ConfigError("refiner.timeout_sec must be > 0")
+    if (
+        isinstance(cfg.refiner.max_retries, bool)
+        or not isinstance(cfg.refiner.max_retries, int)
+        or not (0 <= cfg.refiner.max_retries <= 10)
+    ):
+        raise ConfigError("refiner.max_retries must satisfy 0 <= max_retries <= 10")
 
 
 def _load_config_file(path: Path) -> dict[str, Any]:

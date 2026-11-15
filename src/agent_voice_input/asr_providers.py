@@ -14,18 +14,27 @@ from __future__ import annotations
 
 import atexit
 import base64
-from dataclasses import dataclass, field
+import contextlib
+from dataclasses import dataclass, field, replace
+import datetime
+import email.utils
+import errno
 import hashlib
 import http.client
+import io
 import json
+import math
 import os
+import random
 import re
+import selectors
 import socket
 import ssl
 import string
+import sys
 import threading
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -48,6 +57,7 @@ from .config import (
 )
 
 DEFAULT_USER_AGENT = "agent-voice-input/0.1"
+DEFAULT_CONNECT_TIMEOUT_SEC: float = 9.0
 _STREAM_CHUNK_BYTES = 65536
 
 
@@ -61,12 +71,26 @@ class AsrError(RuntimeError):
         env: Mapping[str, str] | None = None,
         cfg: Config | None = None,
         extra_secrets: Sequence[str] = (),
+        retry_kind: str = "never",
+        retry_after_sec: float | None = None,
+        is_concurrency_limit: bool = False,
     ) -> None:
         safe = redact_secrets(message, env, cfg=cfg, extra_secrets=extra_secrets)
         super().__init__(safe)
+        self.retry_kind = retry_kind
+        self.retry_after_sec = retry_after_sec
+        self.is_concurrency_limit = is_concurrency_limit
         self.__cause__ = None
         self.__context__ = None
         self.__suppress_context__ = True
+
+
+class HttpTransportError(RuntimeError):
+    """Structured HTTP transport failure carrying pre-stringification retry classification."""
+
+    def __init__(self, message: str, *, retry_kind: str = "never") -> None:
+        super().__init__(message)
+        self.retry_kind = retry_kind
 
 
 @dataclass(frozen=True)
@@ -76,6 +100,7 @@ class AsrResult:
     model: str
     latency_ms: int
     is_single_hop_refined: bool = False
+    retries: int = 0
 
 
 @dataclass
@@ -93,6 +118,7 @@ class HttpRequest:
     body: bytes
     timeout_sec: float
     deadline: float | None = None
+    connect_timeout_sec: float = DEFAULT_CONNECT_TIMEOUT_SEC
 
 
 @dataclass(frozen=True)
@@ -385,10 +411,352 @@ class _SameOriginSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
                 setattr(new_req, "_voice_deadline", getattr(req, "_voice_deadline"))
             if hasattr(req, "_voice_req_timeout"):
                 setattr(new_req, "_voice_req_timeout", getattr(req, "_voice_req_timeout"))
+            if hasattr(req, "_voice_connect_timeout"):
+                setattr(new_req, "_voice_connect_timeout", getattr(req, "_voice_connect_timeout"))
         return new_req
 
 
-_SAFE_OPENER = urllib.request.build_opener(_SameOriginSafeRedirectHandler())
+def _create_connection_with_deadline(
+    address: tuple[str, int],
+    conn_deadline: float | None,
+    source_address: tuple[str, int] | None = None,
+    fallback_timeout: float | None = None,
+) -> socket.socket:
+    host, port = address
+    last_err: OSError | None = None
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if not infos:
+        raise OSError("getaddrinfo returns an empty list")
+    for af, socktype, proto, _, sa in infos:
+        if conn_deadline is not None:
+            rem = conn_deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError(f"HTTP TCP connect timed out for {host}:{port}")
+            step_timeout: float | None = max(0.005, rem)
+        else:
+            step_timeout = fallback_timeout
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            if step_timeout is not None:
+                sock.settimeout(step_timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+            return sock
+        except OSError as exc:
+            last_err = exc
+            if sock is not None:
+                _close_quietly(sock)
+            if conn_deadline is not None and time.monotonic() >= conn_deadline:
+                raise TimeoutError(f"HTTP TCP connect timed out for {host}:{port}") from None
+    assert last_err is not None
+    raise last_err
+
+
+class _DeadlineSocketIO(socket.SocketIO):
+    """SocketIO tightening per-recv socket timeout against a hard monotonic deadline."""
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        mode: str,
+        deadline_getter: Callable[[], float | None],
+    ) -> None:
+        super().__init__(sock, mode)  # type: ignore[arg-type]
+        self._deadline_getter = deadline_getter
+
+    def readinto(self, b: Any) -> int | None:
+        dl = self._deadline_getter()
+        if dl is not None:
+            rem = dl - time.monotonic()
+            if rem <= 0:
+                self._timeout_occurred = True  # type: ignore[attr-defined]
+                raise TimeoutError("HTTP socket read exceeded deadline")
+            cur_to = self._sock.gettimeout()  # type: ignore[attr-defined]
+            if cur_to is None or rem < cur_to:
+                self._sock.settimeout(max(0.001, rem))  # type: ignore[attr-defined]
+        return super().readinto(b)
+
+
+def _make_deadline_response_class(
+    deadline_getter: Callable[[], float | None],
+) -> type[http.client.HTTPResponse]:
+    class _BoundDeadlineHTTPResponse(http.client.HTTPResponse):
+        def __init__(
+            self,
+            sock: Any,
+            debuglevel: int = 0,
+            method: str | None = None,
+            url: str | None = None,
+        ) -> None:
+            super().__init__(sock, debuglevel=debuglevel, method=method, url=url)
+            if isinstance(sock, socket.socket):
+                old_fp = self.fp
+                sock._io_refs += 1  # type: ignore[attr-defined]
+                try:
+                    self.fp = io.BufferedReader(_DeadlineSocketIO(sock, "r", deadline_getter))
+                except BaseException:
+                    sock._io_refs -= 1  # type: ignore[attr-defined]
+                    raise
+                finally:
+                    _close_quietly(old_fp)
+
+    return _BoundDeadlineHTTPResponse
+
+
+def _handshake_tls_with_deadline(tls_sock: Any, conn_deadline: float | None) -> None:
+    """Complete TLS handshake strictly within ``conn_deadline`` even under slow-drip flights."""
+    if conn_deadline is None:
+        tls_sock.do_handshake()
+        return
+    if not isinstance(tls_sock, ssl.SSLSocket):
+        rem = conn_deadline - time.monotonic()
+        if rem <= 0:
+            raise TimeoutError("TLS handshake timed out")
+        tls_sock.settimeout(max(0.005, rem))
+        tls_sock.do_handshake()
+        if time.monotonic() > conn_deadline:
+            raise TimeoutError("TLS handshake exceeded connect timeout")
+        return
+
+    tls_sock.setblocking(False)
+    with selectors.DefaultSelector() as sel:
+        while True:
+            rem = conn_deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError("TLS handshake timed out")
+            try:
+                tls_sock.do_handshake()
+                return
+            except ssl.SSLWantReadError:
+                sel.register(tls_sock, selectors.EVENT_READ)
+                try:
+                    ready = sel.select(rem)
+                finally:
+                    sel.unregister(tls_sock)
+                if not ready:
+                    raise TimeoutError("TLS handshake timed out") from None
+            except ssl.SSLWantWriteError:
+                sel.register(tls_sock, selectors.EVENT_WRITE)
+                try:
+                    ready = sel.select(rem)
+                finally:
+                    sel.unregister(tls_sock)
+                if not ready:
+                    raise TimeoutError("TLS handshake timed out") from None
+
+
+def _connect_tcp_and_tunnel(
+    conn: http.client.HTTPConnection, conn_deadline: float | None
+) -> None:
+    sys.audit("http.client.connect", conn, conn.host, conn.port)
+    fb_t = float(conn.timeout) if isinstance(conn.timeout, (int, float)) else None
+    conn.sock = _create_connection_with_deadline(
+        (conn.host, conn.port),
+        conn_deadline,
+        conn.source_address,
+        fallback_timeout=fb_t,
+    )
+    try:
+        try:
+            conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as exc:
+            if exc.errno != errno.ENOPROTOOPT:
+                raise
+        if getattr(conn, "_tunnel_host", None):
+            if conn_deadline is not None:
+                rem = conn_deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError("HTTP proxy CONNECT timed out")
+                conn.sock.settimeout(max(0.005, rem))
+            if hasattr(conn, "_phase_deadline"):
+                setattr(conn, "_phase_deadline", conn_deadline)
+            try:
+                conn._tunnel()  # type: ignore[attr-defined]
+            finally:
+                if hasattr(conn, "_phase_deadline"):
+                    setattr(conn, "_phase_deadline", None)
+            if conn_deadline is not None and time.monotonic() > conn_deadline:
+                raise TimeoutError("HTTP proxy CONNECT exceeded connect timeout")
+    except BaseException:
+        _close_quietly(conn.sock)
+        conn.sock = None
+        raise
+
+
+class _SplitTimeoutHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection separating cumulative connect/tunnel budget from request I/O timeout."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        connect_timeout: float | None = DEFAULT_CONNECT_TIMEOUT_SEC,
+        io_deadline: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(host, port, **kwargs)
+        self._connect_timeout = connect_timeout
+        self._io_deadline = io_deadline
+        self._phase_deadline: float | None = None
+        self.response_class = _make_deadline_response_class(self._current_read_deadline)
+
+    def _current_read_deadline(self) -> float | None:
+        if self._phase_deadline is not None and self._io_deadline is not None:
+            return min(self._phase_deadline, self._io_deadline)
+        return self._phase_deadline if self._phase_deadline is not None else self._io_deadline
+
+    def _compute_connect_deadline(self) -> float | None:
+        now = time.monotonic()
+        if self._io_deadline is not None and now >= self._io_deadline:
+            raise TimeoutError("HTTP request exceeded deadline before connect")
+        conn_dl = (
+            now + max(0.005, float(self._connect_timeout))
+            if isinstance(self._connect_timeout, (int, float)) and self._connect_timeout > 0
+            else None
+        )
+        if self._io_deadline is not None:
+            conn_dl = self._io_deadline if conn_dl is None else min(conn_dl, self._io_deadline)
+        return conn_dl
+
+    def _apply_post_connect_timeout(self) -> None:
+        io_t = float(self.timeout) if isinstance(self.timeout, (int, float)) else None
+        if self._io_deadline is not None:
+            rem_io = self._io_deadline - time.monotonic()
+            if rem_io <= 0:
+                raise TimeoutError("HTTP request exceeded total deadline after connect")
+            io_t = rem_io if io_t is None else min(io_t, rem_io)
+        if self.sock is not None:
+            if io_t is not None:
+                self.sock.settimeout(max(0.005, io_t))
+            else:
+                self.sock.setblocking(True)
+
+    def _arm_response_deadline(self) -> None:
+        now = time.monotonic()
+        req_dl = (
+            now + max(0.005, float(self.timeout))
+            if isinstance(self.timeout, (int, float)) and self.timeout > 0
+            else None
+        )
+        if self._io_deadline is not None:
+            rem = self._io_deadline - now
+            if rem <= 0:
+                raise TimeoutError("HTTP response header wait exceeded total request deadline")
+            eff_dl = self._io_deadline if req_dl is None else min(self._io_deadline, req_dl)
+        else:
+            eff_dl = req_dl
+        self._phase_deadline = eff_dl
+        if eff_dl is not None and self.sock is not None:
+            self.sock.settimeout(max(0.005, eff_dl - now))
+
+    def connect(self) -> None:
+        conn_dl = self._compute_connect_deadline()
+        _connect_tcp_and_tunnel(self, conn_dl)
+        try:
+            self._apply_post_connect_timeout()
+        except BaseException:
+            _close_quietly(self.sock)
+            self.sock = None
+            raise
+
+    def getresponse(self) -> http.client.HTTPResponse:
+        self._arm_response_deadline()
+        resp = super().getresponse()
+        if self._io_deadline is not None:
+            _install_deadline_proxy(resp, self._io_deadline)
+        return resp
+
+
+class _SplitTimeoutHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection bounding TCP + proxy CONNECT + TLS handshake under connect_timeout."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        connect_timeout: float | None = DEFAULT_CONNECT_TIMEOUT_SEC,
+        io_deadline: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(host, port, **kwargs)
+        self._connect_timeout = connect_timeout
+        self._io_deadline = io_deadline
+        self._phase_deadline: float | None = None
+        self.response_class = _make_deadline_response_class(self._current_read_deadline)
+
+    def _current_read_deadline(self) -> float | None:
+        return _SplitTimeoutHTTPConnection._current_read_deadline(self)  # type: ignore[arg-type]
+
+    def _compute_connect_deadline(self) -> float | None:
+        return _SplitTimeoutHTTPConnection._compute_connect_deadline(self)  # type: ignore[arg-type]
+
+    def _apply_post_connect_timeout(self) -> None:
+        _SplitTimeoutHTTPConnection._apply_post_connect_timeout(self)  # type: ignore[arg-type]
+
+    def _arm_response_deadline(self) -> None:
+        _SplitTimeoutHTTPConnection._arm_response_deadline(self)  # type: ignore[arg-type]
+
+    def connect(self) -> None:
+        conn_dl = self._compute_connect_deadline()
+        _connect_tcp_and_tunnel(self, conn_dl)
+        try:
+            server_hostname = self._tunnel_host if self._tunnel_host else self.host  # type: ignore[attr-defined]
+            if conn_dl is not None and (conn_dl - time.monotonic()) <= 0:
+                raise TimeoutError("TLS handshake timed out")
+            self.sock = self._context.wrap_socket(  # type: ignore[attr-defined]
+                self.sock,
+                server_hostname=server_hostname,
+                do_handshake_on_connect=False,
+            )
+            _handshake_tls_with_deadline(self.sock, conn_dl)
+            self._apply_post_connect_timeout()
+        except BaseException:
+            _close_quietly(self.sock)
+            self.sock = None
+            raise
+
+    def getresponse(self) -> http.client.HTTPResponse:
+        self._arm_response_deadline()
+        resp = super().getresponse()
+        if self._io_deadline is not None:
+            _install_deadline_proxy(resp, self._io_deadline)
+        return resp
+
+
+class _SplitTimeoutHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        conn_t = getattr(req, "_voice_connect_timeout", DEFAULT_CONNECT_TIMEOUT_SEC)
+        io_dl = getattr(req, "_voice_deadline", None)
+        return self.do_open(
+            lambda host, **kw: _SplitTimeoutHTTPConnection(
+                host, connect_timeout=conn_t, io_deadline=io_dl, **kw
+            ),
+            req,
+        )
+
+
+class _SplitTimeoutHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        conn_t = getattr(req, "_voice_connect_timeout", DEFAULT_CONNECT_TIMEOUT_SEC)
+        io_dl = getattr(req, "_voice_deadline", None)
+        return self.do_open(
+            lambda host, **kw: _SplitTimeoutHTTPSConnection(
+                host, connect_timeout=conn_t, io_deadline=io_dl, **kw
+            ),
+            req,
+            context=self._context,
+        )
+
+
+_SAFE_OPENER = urllib.request.build_opener(
+    _SplitTimeoutHTTPHandler(),
+    _SplitTimeoutHTTPSHandler(),
+    _SameOriginSafeRedirectHandler(),
+)
 _DEFAULT_SAFE_OPENER = _SAFE_OPENER
 _INITIAL_PROXIES = urllib.request.getproxies()
 
@@ -424,13 +792,31 @@ class _KeepAlivePool:
             return self._ssl_ctx
 
     def _new_connection(
-        self, scheme: str, host: str, port: int, timeout_sec: float
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        timeout_sec: float,
+        *,
+        connect_timeout_sec: float = DEFAULT_CONNECT_TIMEOUT_SEC,
+        io_deadline: float | None = None,
     ) -> http.client.HTTPConnection:
         if scheme == "https":
-            return http.client.HTTPSConnection(
-                host, port, timeout=timeout_sec, context=self._get_ssl_context()
+            return _SplitTimeoutHTTPSConnection(
+                host,
+                port,
+                timeout=timeout_sec,
+                context=self._get_ssl_context(),
+                connect_timeout=connect_timeout_sec,
+                io_deadline=io_deadline,
             )
-        return http.client.HTTPConnection(host, port, timeout=timeout_sec)
+        return _SplitTimeoutHTTPConnection(
+            host,
+            port,
+            timeout=timeout_sec,
+            connect_timeout=connect_timeout_sec,
+            io_deadline=io_deadline,
+        )
 
     def acquire(
         self,
@@ -440,6 +826,8 @@ class _KeepAlivePool:
         timeout_sec: float,
         *,
         allow_reuse: bool = True,
+        connect_timeout_sec: float = DEFAULT_CONNECT_TIMEOUT_SEC,
+        io_deadline: float | None = None,
     ) -> tuple[http.client.HTTPConnection, bool]:
         now = time.monotonic()
         to_close: list[http.client.HTTPConnection] = []
@@ -468,6 +856,12 @@ class _KeepAlivePool:
         if reused_conn is not None:
             try:
                 reused_conn.timeout = timeout_sec
+                if hasattr(reused_conn, "_connect_timeout"):
+                    setattr(reused_conn, "_connect_timeout", connect_timeout_sec)
+                if hasattr(reused_conn, "_io_deadline"):
+                    setattr(reused_conn, "_io_deadline", io_deadline)
+                if hasattr(reused_conn, "_phase_deadline"):
+                    setattr(reused_conn, "_phase_deadline", None)
                 sock = getattr(reused_conn, "sock", None)
                 if sock is None:
                     _close_quietly(reused_conn)
@@ -476,11 +870,25 @@ class _KeepAlivePool:
                     return reused_conn, True
             except Exception:
                 _close_quietly(reused_conn)
-        return self._new_connection(scheme, host, port, timeout_sec), False
+        return (
+            self._new_connection(
+                scheme,
+                host,
+                port,
+                timeout_sec,
+                connect_timeout_sec=connect_timeout_sec,
+                io_deadline=io_deadline,
+            ),
+            False,
+        )
 
     def release(
         self, scheme: str, host: str, port: int, conn: http.client.HTTPConnection
     ) -> None:
+        if hasattr(conn, "_io_deadline"):
+            setattr(conn, "_io_deadline", None)
+        if hasattr(conn, "_phase_deadline"):
+            setattr(conn, "_phase_deadline", None)
         if getattr(conn, "sock", None) is None or self.max_per_origin <= 0:
             _close_quietly(conn)
             return
@@ -562,6 +970,7 @@ def _execute_keepalive(
     cur_headers = dict(hdrs_init)
     if not any(k.lower() == "connection" for k in cur_headers):
         cur_headers["Connection"] = "keep-alive"
+    conn_timeout = max(0.005, float(req.connect_timeout_sec))
 
     redirects = 0
     visited: dict[str, int] = {}
@@ -591,9 +1000,17 @@ def _execute_keepalive(
         resp: http.client.HTTPResponse | None = None
         for attempt in range(2):
             conn, reused = _KEEPALIVE_POOL.acquire(
-                scheme, host, port, eff_timeout, allow_reuse=(attempt == 0)
+                scheme,
+                host,
+                port,
+                eff_timeout,
+                allow_reuse=(attempt == 0),
+                connect_timeout_sec=conn_timeout,
+                io_deadline=wall_deadline,
             )
             try:
+                if not reused:
+                    conn.connect()
                 conn.request(cur_method, target_path, body=wire_body, headers=cur_headers)
                 rem_resp = wall_deadline - time.monotonic()
                 if rem_resp <= 0:
@@ -711,11 +1128,547 @@ def _execute_keepalive(
         cur_url = resolved_url
 
 
+_TRANSIENT_OS_ERRNOS = frozenset(
+    e
+    for e in (
+        getattr(errno, "ETIMEDOUT", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ECONNREFUSED", None),
+        getattr(errno, "EPIPE", None),
+        getattr(errno, "ENETUNREACH", None),
+        getattr(errno, "EHOSTUNREACH", None),
+        getattr(errno, "ENETDOWN", None),
+        getattr(errno, "EHOSTDOWN", None),
+    )
+    if e is not None
+)
+
+
+def classify_transport_error(exc: BaseException) -> str:
+    """Classify low-level socket/TLS/HTTP transport exceptions BEFORE stringification."""
+    if isinstance(exc, HttpTransportError):
+        return exc.retry_kind
+    if isinstance(exc, AsrError):
+        return exc.retry_kind
+
+    outer_msg = str(exc).lower()
+    if any(
+        frag in outer_msg
+        for frag in (
+            "refusing cross-origin redirect",
+            "refusing non-https",
+            "is not allowed",
+            "invalid or unsupported url",
+            "redirect limit",
+            "no host given",
+            "rate-limit pacing exceeded",
+            "rate-limit concurrency queue exceeded",
+        )
+    ):
+        return "never"
+
+    inner: BaseException = exc
+    if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, BaseException):
+        inner = exc.reason
+
+    if isinstance(inner, ssl.SSLCertVerificationError) or isinstance(
+        exc, ssl.SSLCertVerificationError
+    ):
+        return "never"
+
+    if isinstance(inner, ssl.SSLEOFError):
+        return "transient"
+
+    if isinstance(inner, ssl.SSLError):
+        reason_up = f"{getattr(inner, 'reason', '') or ''} {inner}".upper()
+        if any(
+            tok in reason_up
+            for tok in (
+                "CERTIFICATE_VERIFY_FAILED",
+                "CERT_",
+                "WRONG_VERSION_NUMBER",
+                "UNSUPPORTED_PROTOCOL",
+                "PROTOCOL_VERSION",
+                "NO_CIPHERS",
+                "HOSTNAME_MISMATCH",
+            )
+        ):
+            return "never"
+        if any(
+            tok in reason_up
+            for tok in ("TIMED OUT", "TIMEOUT", "EOF", "RESET", "BROKEN PIPE", "SYSCALL")
+        ):
+            return "transient"
+        return "never"
+
+    if isinstance(inner, socket.gaierror):
+        eai_again = getattr(socket, "EAI_AGAIN", None)
+        msg_low = str(inner).lower()
+        if (
+            (eai_again is not None and getattr(inner, "errno", None) == eai_again)
+            or "temporary failure" in msg_low
+            or "try again" in msg_low
+        ):
+            return "transient"
+        return "never"
+
+    if isinstance(inner, (TimeoutError, socket.timeout, ConnectionError)):
+        return "transient"
+
+    if isinstance(
+        inner,
+        (
+            http.client.RemoteDisconnected,
+            http.client.IncompleteRead,
+            http.client.BadStatusLine,
+            http.client.CannotSendRequest,
+            http.client.ResponseNotReady,
+        ),
+    ):
+        return "transient"
+
+    if isinstance(inner, (http.client.InvalidURL, http.client.LineTooLong)):
+        return "never"
+
+    if isinstance(inner, http.client.HTTPException):
+        return "transient"
+
+    if isinstance(inner, OSError):
+        if getattr(inner, "errno", None) in _TRANSIENT_OS_ERRNOS:
+            return "transient"
+        if "timed out" in str(inner).lower():
+            return "transient"
+
+    return "never"
+
+
+def _header_ci(headers: Mapping[str, str], name: str) -> str:
+    target = name.lower()
+    if target in headers:
+        return str(headers[target] or "").strip()
+    for k, v in headers.items():
+        if k.lower() == target:
+            return str(v or "").strip()
+    return ""
+
+
+def parse_retry_after(
+    headers: Mapping[str, str], *, now_epoch: float | None = None
+) -> float | None:
+    """Parse standard ``Retry-After`` (seconds or HTTP-date) or ``Retry-After-Ms`` header."""
+    raw_ms = _header_ci(headers, "retry-after-ms")
+    if raw_ms:
+        try:
+            ms_val = float(raw_ms)
+            if math.isfinite(ms_val) and ms_val >= 0:
+                return ms_val / 1000.0
+        except ValueError:
+            pass
+
+    raw = _header_ci(headers, "retry-after")
+    if not raw:
+        return None
+    try:
+        sec_val = float(raw)
+        if math.isfinite(sec_val) and sec_val >= 0:
+            return sec_val
+    except ValueError:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        ref = time.time() if now_epoch is None else now_epoch
+        return max(0.0, dt.timestamp() - ref)
+    except Exception:
+        return None
+
+
+_NON_RETRYABLE_HTTP_STATUSES = frozenset({400, 401, 402, 403, 404, 405, 410, 413, 415, 422})
+
+
+def _is_transient_http_status(status: int) -> bool:
+    return status in (408, 425, 500, 502, 503, 504) or (520 <= status <= 529)
+
+
+def _is_doubao_rate_limit(status: int, api_code: str, api_msg: str) -> tuple[bool, bool]:
+    """Return ``(is_rate_limit, is_concurrency_limit)`` for Doubao AUC responses."""
+    if api_code in ("45000131", "45000030"):
+        return False, False
+    low = api_msg.lower()
+    if any(
+        perm in low
+        for perm in (
+            "lifetime",
+            "package exhausted",
+            "trial quota exhausted",
+            "arrearage",
+            "overdue",
+        )
+    ):
+        return False, False
+    is_conc = "concurrency" in low or "concurrent" in low
+    if status == 429:
+        return True, is_conc
+    if any(
+        pat in low
+        for pat in (
+            "quota exceeded for types: qps",
+            "quota exceeded for types: concurrency",
+            "qps limit",
+            "exceeded qps",
+            "qps exceeded",
+            "concurrency limit",
+            "concurrent limit",
+            "too many requests",
+            "rate limit",
+            "ratelimit",
+            "request too frequent",
+            "too frequent",
+        )
+    ):
+        return True, is_conc
+    return False, False
+
+
+def classify_http_failure(
+    provider: str,
+    status: int,
+    headers: Mapping[str, str],
+    data: Mapping[str, Any] | None = None,
+    *,
+    non_json: bool = False,
+    api_code: str = "",
+    api_msg: str = "",
+) -> tuple[str, float | None, bool]:
+    """Classify an HTTP/vendor failure into ``('rate_limit' | 'transient' | 'never', retry_after, is_conc)``."""
+    prov = provider.strip().lower()
+    retry_after = parse_retry_after(headers)
+
+    if non_json:
+        if status == 429:
+            return "rate_limit", retry_after, False
+        if status in _NON_RETRYABLE_HTTP_STATUSES:
+            return "never", None, False
+        if status == 200 or _is_transient_http_status(status):
+            return "transient", retry_after, False
+        return "never", None, False
+
+    payload = data if isinstance(data, Mapping) else {}
+
+    if prov == "doubao":
+        is_rl, is_conc = _is_doubao_rate_limit(status, api_code, api_msg)
+        if is_rl:
+            return "rate_limit", retry_after, is_conc
+        if api_code == "45000131":
+            return "never", None, False
+        if api_code == "55000031" or api_code.startswith("550"):
+            return "transient", retry_after, False
+        if _is_transient_http_status(status):
+            return "transient", retry_after, False
+        return "never", None, False
+
+    if prov == "dashscope":
+        raw_err = payload.get("error")
+        err_dict = raw_err if isinstance(raw_err, Mapping) else {}
+        code_str = str(
+            api_code or payload.get("code") or err_dict.get("code") or err_dict.get("type") or ""
+        ).strip()
+        msg_str = str(
+            api_msg or payload.get("message") or err_dict.get("message") or ""
+        ).lower()
+        code_low = code_str.lower()
+        if any(
+            perm in code_low or perm in msg_str
+            for perm in ("arrearage", "allocationquota", "freetieronly", "invalidapikey")
+        ):
+            return "never", None, False
+        is_conc = "concurrency" in code_low or "concurrency" in msg_str
+        if (
+            status == 429
+            or code_low.startswith("throttling")
+            or "rate_limit" in code_low
+            or "ratelimit" in code_low
+            or "requests rate limit" in msg_str
+        ):
+            return "rate_limit", retry_after, is_conc
+        if (
+            _is_transient_http_status(status)
+            or code_low.startswith(("internalerror", "serviceunavailable", "modelunavailable"))
+            or "system error" in msg_str
+        ):
+            return "transient", retry_after, False
+        return "never", None, False
+
+    if prov == "gemini":
+        pf = payload.get("promptFeedback")
+        if isinstance(pf, Mapping) and pf.get("blockReason"):
+            return "never", None, False
+        raw_err = payload.get("error")
+        err_dict = raw_err if isinstance(raw_err, Mapping) else {}
+        g_status = str(err_dict.get("status") or "").strip().upper()
+        g_code = err_dict.get("code")
+        g_msg = str(err_dict.get("message") or "").lower()
+        if g_status in (
+            "INVALID_ARGUMENT",
+            "PERMISSION_DENIED",
+            "UNAUTHENTICATED",
+            "NOT_FOUND",
+            "FAILED_PRECONDITION",
+        ):
+            return "never", None, False
+        if "billing" in g_msg or "limit: 0" in g_msg:
+            return "never", None, False
+        if status == 429 or g_code == 429 or g_status == "RESOURCE_EXHAUSTED":
+            return "rate_limit", retry_after, ("concurrent" in g_msg)
+        if (
+            _is_transient_http_status(status)
+            or g_code in (500, 502, 503, 504)
+            or g_status in ("UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED")
+        ):
+            return "transient", retry_after, False
+        return "never", None, False
+
+    # OpenRouter / OpenAI / Groq / SiliconFlow / Volcengine Ark / OpenAI-compatible
+    raw_err = payload.get("error")
+    choices = payload.get("choices")
+    choice0 = (
+        choices[0]
+        if isinstance(choices, list) and choices and isinstance(choices[0], Mapping)
+        else {}
+    )
+    if not raw_err and isinstance(choice0.get("error"), Mapping):
+        raw_err = choice0.get("error")
+    err_dict = raw_err if isinstance(raw_err, Mapping) else {}
+    err_code = err_dict.get("code")
+    err_type = str(err_dict.get("type") or "").strip().lower()
+    err_msg = str(err_dict.get("message") or raw_err or "").lower()
+    meta = err_dict.get("metadata")
+    meta_type = str(meta.get("error_type") or "").strip().lower() if isinstance(meta, Mapping) else ""
+    finish_reason = str(choice0.get("finish_reason") or "").strip().lower()
+
+    if status == 402 or err_code == 402:
+        return "never", None, False
+    if (
+        str(err_code).lower() == "insufficient_quota"
+        or err_type == "insufficient_quota"
+        or "check your plan and billing" in err_msg
+    ):
+        return "never", None, False
+    if err_code in _NON_RETRYABLE_HTTP_STATUSES or err_type in (
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+    ):
+        return "never", None, False
+
+    is_conc = "concurrency" in err_msg or "concurrent" in err_msg
+    if (
+        status == 429
+        or err_code == 429
+        or "rate_limit" in err_type
+        or "rate_limit" in meta_type
+        or "throttl" in err_type
+        or str(err_code).lower() in ("rate_limit_exceeded", "server_overloaded")
+    ):
+        return "rate_limit", retry_after, is_conc
+
+    if (
+        _is_transient_http_status(status)
+        or (isinstance(err_code, int) and _is_transient_http_status(err_code))
+        or meta_type in ("provider_overloaded", "provider_unavailable", "server", "timeout")
+        or err_type in ("server_error", "internal_error", "service_unavailable", "timeout")
+        or (finish_reason == "error" and status == 200)
+    ):
+        return "transient", retry_after, False
+
+    return "never", None, False
+
+
+def compute_retry_delay(
+    retry_kind: str,
+    retry_index: int,
+    *,
+    retry_after_sec: float | None = None,
+    rand_fn: Callable[[], float] = random.random,
+) -> float:
+    """Compute equal-jitter backoff delay for 1-based ``retry_index`` honoring ``Retry-After``."""
+    idx = max(1, int(retry_index))
+    u = max(0.0, min(1.0, float(rand_fn())))
+    if retry_kind == "rate_limit":
+        cap = min(8.0, float(2**idx))
+    else:
+        cap = min(2.0, 0.25 * float(2 ** (idx - 1)))
+    jittered = cap * (0.5 + 0.5 * u)
+    if retry_after_sec is not None and retry_after_sec > 0:
+        return max(jittered, float(retry_after_sec))
+    return jittered
+
+
+@dataclass
+class _PacerBucket:
+    next_allowed_at: float = 0.0
+    cooldown_until: float = 0.0
+    serialize_until: float = 0.0
+    min_interval_sec: float = 0.55
+    inflight_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+class _ProviderRatePacer:
+    """Lightweight per-credential request pacer activated ONLY after a real rate-limit event."""
+
+    DEFAULT_MIN_INTERVAL_SEC = 0.55
+    DEFAULT_COOLDOWN_SEC = 60.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buckets: dict[str, _PacerBucket] = {}
+
+    def reset(self) -> None:
+        with self._lock:
+            self._buckets.clear()
+
+    def note_rate_limit(
+        self,
+        key: str,
+        *,
+        now: float,
+        retry_after_sec: float | None = None,
+        is_concurrency: bool = False,
+        min_interval_sec: float = DEFAULT_MIN_INTERVAL_SEC,
+        cooldown_sec: float = DEFAULT_COOLDOWN_SEC,
+    ) -> None:
+        if not key:
+            return
+        with self._lock:
+            b = self._buckets.get(key)
+            if b is None:
+                b = _PacerBucket()
+                self._buckets[key] = b
+            b.min_interval_sec = max(b.min_interval_sec, float(min_interval_sec))
+            b.cooldown_until = max(b.cooldown_until, now + float(cooldown_sec))
+            if is_concurrency:
+                b.serialize_until = max(b.serialize_until, now + float(cooldown_sec))
+            floor_wait = float(retry_after_sec) if (retry_after_sec and retry_after_sec > 0) else b.min_interval_sec
+            b.next_allowed_at = max(b.next_allowed_at, now + floor_wait)
+
+    @contextlib.contextmanager
+    def guard(
+        self,
+        key: str,
+        *,
+        deadline: float | None,
+        clock_fn: Callable[[], float],
+        sleep_fn: Callable[[float], None],
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[bool]:
+        if not key:
+            yield False
+            return
+        now = clock_fn()
+        with self._lock:
+            b = self._buckets.get(key)
+            if b is None or (now >= b.cooldown_until and now >= b.serialize_until):
+                b = None
+            else:
+                need_serial = now < b.serialize_until
+                inflight_lock = b.inflight_lock
+        if b is None:
+            yield False
+            return
+
+        acquired_serial = False
+        waited = False
+        if need_serial:
+            t_lock = clock_fn()
+            if is_cancelled is not None or (deadline is not None and clock_fn is time.monotonic):
+                while True:
+                    if is_cancelled is not None and is_cancelled():
+                        yield False
+                        return
+                    if deadline is not None and clock_fn is time.monotonic:
+                        rem_lock = deadline - clock_fn()
+                        if rem_lock <= 0:
+                            raise TimeoutError("rate-limit concurrency queue exceeded timeout budget")
+                        step_to = min(0.05, rem_lock) if is_cancelled is not None else max(0.005, rem_lock)
+                    else:
+                        step_to = 0.05
+                    if inflight_lock.acquire(timeout=max(0.002, step_to)):
+                        acquired_serial = True
+                        break
+                    if deadline is not None and clock_fn is time.monotonic and (deadline - clock_fn()) <= 0:
+                        raise TimeoutError("rate-limit concurrency queue exceeded timeout budget")
+            else:
+                inflight_lock.acquire()
+                acquired_serial = True
+            waited = (clock_fn() - t_lock) > 0.001
+
+        try:
+            with self._lock:
+                now2 = clock_fn()
+                if now2 < b.cooldown_until:
+                    slot_at = max(now2, b.next_allowed_at)
+                    if deadline is not None and slot_at >= deadline:
+                        raise TimeoutError("rate-limit pacing exceeded remaining timeout budget")
+                    b.next_allowed_at = slot_at + b.min_interval_sec
+                    wait_sec = max(0.0, slot_at - now2)
+                else:
+                    wait_sec = 0.0
+            if wait_sec > 0:
+                waited = True
+                _sleep_cooperative(wait_sec, sleep_fn=sleep_fn, is_cancelled=is_cancelled)
+            yield waited
+        finally:
+            if acquired_serial:
+                inflight_lock.release()
+
+
+def _sleep_cooperative(
+    seconds: float,
+    *,
+    sleep_fn: Callable[[float], None],
+    is_cancelled: Callable[[], bool] | None = None,
+) -> None:
+    if seconds <= 0:
+        return
+    if is_cancelled is not None and is_cancelled():
+        return
+    if sleep_fn is not time.sleep or is_cancelled is None or seconds <= 0.1:
+        sleep_fn(seconds)
+        return
+    end = time.monotonic() + seconds
+    while True:
+        if is_cancelled():
+            return
+        rem = end - time.monotonic()
+        if rem <= 0:
+            return
+        sleep_fn(min(0.05, rem))
+
+
+def make_rate_pacer_key(provider_name: str, base_url: str, secret: str = "") -> str:
+    parsed = urllib.parse.urlsplit(base_url.strip())
+    host = (parsed.netloc or base_url.strip()).lower()
+    fp = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:12] if secret else "anon"
+    return f"{provider_name.strip().lower()}|{host}|{fp}"
+
+
+_RATE_PACER = _ProviderRatePacer()
+
+
+def reset_rate_limit_pacers() -> None:
+    """Clear process-local adaptive rate-limit pacer state (used in unit tests)."""
+    _RATE_PACER.reset()
+
+
 def urllib_http_transport(req: HttpRequest) -> HttpResponse:
     """Default pure-stdlib HTTP transport with Keep-Alive pooling, proxy compat, and safe redirects."""
     wall_deadline = (
         req.deadline if req.deadline is not None else (time.monotonic() + float(req.timeout_sec))
     )
+    conn_timeout = max(0.005, float(req.connect_timeout_sec))
     hdrs_out = dict(req.headers)
     if not any(k.lower() == "user-agent" for k in hdrs_out):
         hdrs_out["User-Agent"] = DEFAULT_USER_AGENT
@@ -740,12 +1693,15 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
         )
         setattr(ureq, "_voice_deadline", wall_deadline)
         setattr(ureq, "_voice_req_timeout", float(req.timeout_sec))
+        setattr(ureq, "_voice_connect_timeout", conn_timeout)
         cur_proxies = urllib.request.getproxies()
         opener = (
             _SAFE_OPENER
             if (_SAFE_OPENER is not _DEFAULT_SAFE_OPENER or cur_proxies == _INITIAL_PROXIES)
             else urllib.request.build_opener(
                 urllib.request.ProxyHandler(cur_proxies),
+                _SplitTimeoutHTTPHandler(),
+                _SplitTimeoutHTTPSHandler(),
                 _SameOriginSafeRedirectHandler(),
             )
         )
@@ -767,7 +1723,10 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
         finally:
             _close_quietly(exc)
     except (urllib.error.URLError, TimeoutError, socket.timeout, http.client.HTTPException, OSError) as exc:
-        raise RuntimeError(f"HTTP transport error for {req.url}: {exc}") from None
+        rkind = classify_transport_error(exc)
+        raise HttpTransportError(
+            f"HTTP transport error for {req.url}: {exc}", retry_kind=rkind
+        ) from None
 
 
 def load_hotwords_file(
@@ -1081,6 +2040,32 @@ def extract_chat_message_text(data: Mapping[str, Any]) -> str:
     return ""
 
 
+def extract_openai_compat_error(data: Mapping[str, Any]) -> tuple[Any, str] | None:
+    """Detect top-level or choice-level upstream errors (including HTTP 200 mid-stream failures)."""
+    raw_err = data.get("error")
+    if raw_err:
+        msg = (
+            str(raw_err.get("message") or raw_err)
+            if isinstance(raw_err, Mapping)
+            else str(raw_err)
+        )
+        return raw_err, msg
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
+        c0 = choices[0]
+        c_err = c0.get("error")
+        if c_err:
+            msg = (
+                str(c_err.get("message") or c_err)
+                if isinstance(c_err, Mapping)
+                else str(c_err)
+            )
+            return c_err, msg
+        if str(c0.get("finish_reason") or "").strip().lower() == "error":
+            return {"type": "server_error"}, "upstream generation aborted with finish_reason=error"
+    return None
+
+
 def _missing_key_hint(provider_name: str, *, stage: str = "asr") -> str:
     prov = provider_name.strip().lower()
     envs = CREDENTIAL_ENV_ORDER.get(prov)
@@ -1103,6 +2088,7 @@ class BaseAsrProvider:
         transport: HttpTransport | None = None,
         clock_fn: Callable[[], float] = time.monotonic,
         sleep_fn: Callable[[float], None] = time.sleep,
+        rand_fn: Callable[[], float] = random.random,
     ) -> None:
         self.cfg = cfg
         self.creds = creds
@@ -1110,10 +2096,56 @@ class BaseAsrProvider:
         self.transport = transport or urllib_http_transport
         self.clock_fn = clock_fn
         self.sleep_fn = sleep_fn
+        self.rand_fn = rand_fn
 
-    def _fail(self, msg: str, extra_secrets: Sequence[str] = ()) -> AsrError:
+    def _fail(
+        self,
+        msg: str,
+        extra_secrets: Sequence[str] = (),
+        *,
+        retry_kind: str = "never",
+        retry_after_sec: float | None = None,
+        is_concurrency_limit: bool = False,
+    ) -> AsrError:
         secrets = [*self.creds.all_secret_values(), *extra_secrets]
-        return AsrError(msg, env=self.env, cfg=self.cfg, extra_secrets=secrets)
+        return AsrError(
+            msg,
+            env=self.env,
+            cfg=self.cfg,
+            extra_secrets=secrets,
+            retry_kind=retry_kind,
+            retry_after_sec=retry_after_sec,
+            is_concurrency_limit=is_concurrency_limit,
+        )
+
+    def _fail_http(
+        self,
+        msg: str,
+        resp: HttpResponse,
+        data: Mapping[str, Any] | None = None,
+        extra_secrets: Sequence[str] = (),
+        *,
+        provider: str | None = None,
+        non_json: bool = False,
+        api_code: str = "",
+        api_msg: str = "",
+    ) -> AsrError:
+        rkind, rafter, is_conc = classify_http_failure(
+            provider or self.provider_name,
+            resp.status,
+            resp.headers,
+            data,
+            non_json=non_json,
+            api_code=api_code,
+            api_msg=api_msg,
+        )
+        return self._fail(
+            msg,
+            extra_secrets=extra_secrets,
+            retry_kind=rkind,
+            retry_after_sec=rafter,
+            is_concurrency_limit=is_conc,
+        )
 
     def _safe_excerpt(
         self, raw_text: str, extra_secrets: Sequence[str] = (), *, limit: int = 240
@@ -1143,6 +2175,8 @@ class BaseAsrProvider:
         extra_secrets: Sequence[str] = (),
         *,
         deadline: float | None = None,
+        pacer_key: str = "",
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> HttpResponse:
         now = self.clock_fn()
         budget_sec = max(float(self.cfg.asr.timeout_sec), float(req.timeout_sec))
@@ -1151,35 +2185,145 @@ class BaseAsrProvider:
             raise self._fail(
                 f"ASR HTTP request timed out before send (budget={budget_sec:.2f}s)",
                 extra_secrets=extra_secrets,
-            )
-        eff_req = req
-        if self.clock_fn is time.monotonic and req.deadline is None:
-            eff_req = HttpRequest(
-                url=req.url,
-                method=req.method,
-                headers=req.headers,
-                body=req.body,
-                timeout_sec=min(float(req.timeout_sec), max(0.005, logical_deadline - now)),
-                deadline=logical_deadline,
+                retry_kind="transient",
             )
         try:
-            resp = self.transport(eff_req)
+            with _RATE_PACER.guard(
+                pacer_key,
+                deadline=logical_deadline,
+                clock_fn=self.clock_fn,
+                sleep_fn=self.sleep_fn,
+                is_cancelled=is_cancelled,
+            ) as pacer_waited:
+                if is_cancelled is not None and is_cancelled():
+                    raise self._fail(
+                        "ASR request cancelled",
+                        extra_secrets=extra_secrets,
+                        retry_kind="never",
+                    )
+                now_send = self.clock_fn()
+                if now_send > logical_deadline:
+                    raise self._fail(
+                        f"ASR HTTP request timed out before send (budget={budget_sec:.2f}s)",
+                        extra_secrets=extra_secrets,
+                        retry_kind="transient",
+                    )
+                eff_req = req
+                rem_send = max(0.005, logical_deadline - now_send)
+                if pacer_waited or rem_send < float(req.timeout_sec) - 0.02:
+                    eff_req = replace(
+                        eff_req,
+                        timeout_sec=min(float(req.timeout_sec), rem_send),
+                    )
+                if self.clock_fn is time.monotonic and eff_req.deadline is None:
+                    eff_req = replace(eff_req, deadline=logical_deadline)
+                resp = self.transport(eff_req)
         except AsrError:
             raise
         except Exception as exc:
-            raise self._fail(str(exc), extra_secrets=extra_secrets) from None
+            rkind = classify_transport_error(exc)
+            raise self._fail(
+                str(exc), extra_secrets=extra_secrets, retry_kind=rkind
+            ) from None
 
         if self.clock_fn() > logical_deadline + 1e-9:
             raise self._fail(
                 f"ASR HTTP response exceeded timeout budget ({budget_sec:.2f}s)",
                 extra_secrets=extra_secrets,
+                retry_kind="transient",
             )
         return resp
+
+    def _maybe_backoff_before_retry(
+        self,
+        err: AsrError,
+        *,
+        retries_used: int,
+        max_retries: int,
+        deadline: float,
+        pacer_key: str,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> bool:
+        if err.retry_kind not in ("rate_limit", "transient"):
+            return False
+        now = self.clock_fn()
+        if err.retry_kind == "rate_limit":
+            _RATE_PACER.note_rate_limit(
+                pacer_key,
+                now=now,
+                retry_after_sec=err.retry_after_sec,
+                is_concurrency=err.is_concurrency_limit,
+            )
+        if retries_used >= max_retries:
+            return False
+        if is_cancelled is not None and is_cancelled():
+            return False
+        rem = deadline - now
+        if rem <= 0.02:
+            return False
+        if err.retry_after_sec is not None and err.retry_after_sec >= rem:
+            return False
+        delay = compute_retry_delay(
+            err.retry_kind,
+            retries_used + 1,
+            retry_after_sec=err.retry_after_sec,
+            rand_fn=self.rand_fn,
+        )
+        if delay >= rem - 0.01:
+            return False
+        _sleep_cooperative(delay, sleep_fn=self.sleep_fn, is_cancelled=is_cancelled)
+        if is_cancelled is not None and is_cancelled():
+            return False
+        if (deadline - self.clock_fn()) <= 0:
+            return False
+        return True
+
+    def _execute_with_retry(
+        self,
+        *,
+        deadline: float,
+        pacer_key: str,
+        is_cancelled: Callable[[], bool] | None,
+        attempt_fn: Callable[[float], str],
+    ) -> tuple[str, int, bool]:
+        """Run ``attempt_fn(rem_sec)`` with bounded retries; returns ``(text, retries_used, cancelled)``."""
+        max_retries = max(0, int(self.cfg.asr.max_retries))
+        eff_budget = float(self.cfg.asr.timeout_sec)
+        retries_used = 0
+        while True:
+            if is_cancelled is not None and is_cancelled():
+                return "", retries_used, True
+            raw_rem = deadline - self.clock_fn()
+            rem = (
+                eff_budget
+                if (retries_used == 0 and raw_rem >= eff_budget - 0.02)
+                else max(0.005, raw_rem)
+            )
+            try:
+                out = attempt_fn(rem)
+                return out, retries_used, False
+            except AsrError as err:
+                if is_cancelled is not None and is_cancelled():
+                    return "", retries_used, True
+                if not self._maybe_backoff_before_retry(
+                    err,
+                    retries_used=retries_used,
+                    max_retries=max_retries,
+                    deadline=deadline,
+                    pacer_key=pacer_key,
+                    is_cancelled=is_cancelled,
+                ):
+                    if is_cancelled is not None and is_cancelled():
+                        return "", retries_used, True
+                    raise
+                retries_used += 1
 
     def transcribe(
         self,
         wav_bytes: bytes,
         context: AsrContext | Mapping[str, Any] | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> AsrResult:
         raise NotImplementedError
 
@@ -1232,6 +2376,8 @@ class DashScopeAsrProvider(BaseAsrProvider):
         self,
         wav_bytes: bytes,
         context: AsrContext | Mapping[str, Any] | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> AsrResult:
         model = self.cfg.asr.effective_model("dashscope")
         if not wav_bytes:
@@ -1254,18 +2400,48 @@ class DashScopeAsrProvider(BaseAsrProvider):
             "Authorization": f"Bearer {cred.value}",
             "Content-Type": "application/json",
         }
+        pacer_key = make_rate_pacer_key(self.provider_name, url, cred.value)
 
         eff_timeout = float(self.cfg.asr.timeout_sec)
         t0 = self.clock_fn()
+        deadline = t0 + eff_timeout
         if use_native:
-            text = self._call_native_route(
-                url, headers, model, data_uri, ctx_text, cred.value, timeout_sec=eff_timeout
+            raw_text, retries_used, _ = self._execute_with_retry(
+                deadline=deadline,
+                pacer_key=pacer_key,
+                is_cancelled=is_cancelled,
+                attempt_fn=lambda rem: self._call_native_route(
+                    url,
+                    headers,
+                    model,
+                    data_uri,
+                    ctx_text,
+                    cred.value,
+                    timeout_sec=rem,
+                    deadline=deadline,
+                    pacer_key=pacer_key,
+                    is_cancelled=is_cancelled,
+                ),
             )
         else:
-            text = self._call_compat_route(
-                url, headers, model, data_uri, ctx_text, cred.value, timeout_sec=eff_timeout
+            raw_text, retries_used, _ = self._execute_with_retry(
+                deadline=deadline,
+                pacer_key=pacer_key,
+                is_cancelled=is_cancelled,
+                attempt_fn=lambda rem: self._call_compat_route(
+                    url,
+                    headers,
+                    model,
+                    data_uri,
+                    ctx_text,
+                    cred.value,
+                    timeout_sec=rem,
+                    deadline=deadline,
+                    pacer_key=pacer_key,
+                    is_cancelled=is_cancelled,
+                ),
             )
-        text = strip_lenticular_artifacts(text).strip()
+        text = strip_lenticular_artifacts(raw_text).strip()
         latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
         return AsrResult(
             text=text,
@@ -1273,6 +2449,7 @@ class DashScopeAsrProvider(BaseAsrProvider):
             model=model,
             latency_ms=latency_ms,
             is_single_hop_refined=False,
+            retries=retries_used,
         )
 
     def _call_compat_route(
@@ -1285,6 +2462,9 @@ class DashScopeAsrProvider(BaseAsrProvider):
         secret: str,
         *,
         timeout_sec: float | None = None,
+        deadline: float | None = None,
+        pacer_key: str = "",
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = []
         if ctx_text:
@@ -1320,29 +2500,48 @@ class DashScopeAsrProvider(BaseAsrProvider):
                 timeout_sec=self.cfg.asr.timeout_sec if timeout_sec is None else timeout_sec,
             ),
             extra_secrets=(secret,),
+            deadline=deadline,
+            pacer_key=pacer_key,
+            is_cancelled=is_cancelled,
         )
         try:
             data = resp.json()
         except ValueError:
             excerpt = self._safe_excerpt(resp.text(), (secret,))
-            raise self._fail(
+            raise self._fail_http(
                 f"DashScope compatible-mode returned non-JSON (HTTP {resp.status}): {excerpt}",
+                resp,
                 extra_secrets=(secret,),
+                non_json=True,
             ) from None
 
-        if resp.status != 200 or (data.get("error") and not data.get("choices")):
-            raw_err = data.get("error")
+        compat_err = extract_openai_compat_error(data)
+        if resp.status != 200 or compat_err is not None:
+            raw_err = compat_err[0] if compat_err is not None else data.get("error")
             err_msg = (
-                str(raw_err.get("message") or data)
-                if isinstance(raw_err, dict)
-                else str(raw_err or data)
+                compat_err[1]
+                if compat_err is not None
+                else (
+                    str(raw_err.get("message") or data)
+                    if isinstance(raw_err, dict)
+                    else str(raw_err or data)
+                )
             )
-            if "ASR_RESPONSE_HAVE_NO_WORDS" in err_msg:
+            err_code = (
+                str(raw_err.get("code") or "")
+                if isinstance(raw_err, Mapping)
+                else str(data.get("code") or "")
+            )
+            if err_code == "ASR_RESPONSE_HAVE_NO_WORDS" or "ASR_RESPONSE_HAVE_NO_WORDS" in err_msg:
                 return ""
             excerpt = self._safe_excerpt(err_msg, (secret,))
-            raise self._fail(
+            raise self._fail_http(
                 f"DashScope compatible-mode HTTP {resp.status}: {excerpt}",
+                resp,
+                data,
                 extra_secrets=(secret,),
+                api_code=err_code,
+                api_msg=err_msg,
             )
 
         return extract_chat_message_text(data)
@@ -1357,6 +2556,9 @@ class DashScopeAsrProvider(BaseAsrProvider):
         secret: str,
         *,
         timeout_sec: float | None = None,
+        deadline: float | None = None,
+        pacer_key: str = "",
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = []
         if ctx_text:
@@ -1380,14 +2582,19 @@ class DashScopeAsrProvider(BaseAsrProvider):
                 timeout_sec=self.cfg.asr.timeout_sec if timeout_sec is None else timeout_sec,
             ),
             extra_secrets=(secret,),
+            deadline=deadline,
+            pacer_key=pacer_key,
+            is_cancelled=is_cancelled,
         )
         try:
             data = resp.json()
         except ValueError:
             excerpt = self._safe_excerpt(resp.text(), (secret,))
-            raise self._fail(
+            raise self._fail_http(
                 f"DashScope multimodal-generation returned non-JSON (HTTP {resp.status}): {excerpt}",
+                resp,
                 extra_secrets=(secret,),
+                non_json=True,
             ) from None
 
         code = str(data.get("code") or "")
@@ -1397,9 +2604,13 @@ class DashScopeAsrProvider(BaseAsrProvider):
 
         if resp.status != 200 or (code and not data.get("output")):
             excerpt = self._safe_excerpt(message or str(data), (secret,))
-            raise self._fail(
+            raise self._fail_http(
                 f"DashScope multimodal-generation HTTP {resp.status} ({code}): {excerpt}",
+                resp,
+                data,
                 extra_secrets=(secret,),
+                api_code=code,
+                api_msg=message,
             )
 
         output = data.get("output")
@@ -1555,6 +2766,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
             raise self._fail(
                 f"Doubao {stage} ({rid}) timed out (budget={eff_budget:.2f}s)",
                 extra_secrets=secrets,
+                retry_kind="transient",
             )
         return rem
 
@@ -1562,6 +2774,8 @@ class DoubaoAsrProvider(BaseAsrProvider):
         self,
         wav_bytes: bytes,
         context: AsrContext | Mapping[str, Any] | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> AsrResult:
         model = self.cfg.asr.effective_model("doubao")
         if not wav_bytes:
@@ -1570,6 +2784,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
         app_id, api_key, secrets = self._resolve_auth()
         base_url = _resolve_doubao_base_url(self.cfg.asr.base_url)
         cache_key = self._make_cache_key(base_url, app_id, api_key)
+        pacer_key = make_rate_pacer_key(self.provider_name, base_url, f"{app_id or ''}|{api_key}")
         is_auto_slot, candidates = self._build_candidate_slots(cache_key)
 
         ctx = _coerce_context(context, self.cfg.asr.hotwords_file, env=self.env)
@@ -1603,27 +2818,56 @@ class DoubaoAsrProvider(BaseAsrProvider):
         t0 = self.clock_fn()
         deadline = t0 + eff_timeout
         slot_errors: list[str] = []
+        retries_box = [0]
 
         for mode, rid in candidates:
+            if is_cancelled is not None and is_cancelled():
+                return AsrResult(
+                    text="",
+                    provider=self.provider_name,
+                    model=model,
+                    latency_ms=max(0, int(round((self.clock_fn() - t0) * 1000))),
+                    retries=retries_box[0],
+                )
             try:
                 if mode == "flash":
-                    text = self._run_flash(
-                        base_url, auth_hdrs, rid, body_bytes, deadline, secrets, budget_sec=eff_timeout
+                    text, cancelled = self._run_flash(
+                        base_url,
+                        auth_hdrs,
+                        rid,
+                        body_bytes,
+                        deadline,
+                        secrets,
+                        budget_sec=eff_timeout,
+                        pacer_key=pacer_key,
+                        retries_box=retries_box,
+                        is_cancelled=is_cancelled,
                     )
                 else:
-                    text = self._run_submit_and_query(
-                        base_url, auth_hdrs, rid, body_bytes, t0, deadline, secrets, budget_sec=eff_timeout
+                    text, cancelled = self._run_submit_and_query(
+                        base_url,
+                        auth_hdrs,
+                        rid,
+                        body_bytes,
+                        t0,
+                        deadline,
+                        secrets,
+                        budget_sec=eff_timeout,
+                        pacer_key=pacer_key,
+                        retries_box=retries_box,
+                        is_cancelled=is_cancelled,
                     )
-                if is_auto_slot:
+                if not cancelled and is_auto_slot:
                     with _DOUBAO_SLOT_LOCK:
                         _DOUBAO_SLOT_CACHE[cache_key] = (mode, rid)
                 latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
                 return AsrResult(
-                    text=strip_lenticular_artifacts(text).strip(),
+                    text="" if cancelled else strip_lenticular_artifacts(text).strip(),
                     provider=self.provider_name,
                     model=model,
                     latency_ms=latency_ms,
                     is_single_hop_refined=False,
+                    retries=retries_box[0],
                 )
             except _DoubaoSlotUnavailableError as slot_exc:
                 with _DOUBAO_SLOT_LOCK:
@@ -1640,8 +2884,8 @@ class DoubaoAsrProvider(BaseAsrProvider):
     def _extract_doubao_status(
         self, resp: HttpResponse, data: Mapping[str, Any], secrets: Sequence[str]
     ) -> tuple[str, str]:
-        api_code = str(resp.headers.get("x-api-status-code") or "").strip()
-        api_msg = str(resp.headers.get("x-api-message") or "").strip()
+        api_code = _header_ci(resp.headers, "x-api-status-code")
+        api_msg = _header_ci(resp.headers, "x-api-message")
         header_obj = data.get("header") if isinstance(data.get("header"), dict) else {}
         if not api_code:
             api_code = str(header_obj.get("code") or data.get("code") or "").strip()
@@ -1681,43 +2925,84 @@ class DoubaoAsrProvider(BaseAsrProvider):
         secrets: Sequence[str],
         *,
         budget_sec: float | None = None,
-    ) -> str:
-        rem = self._remaining_timeout(deadline, rid, "flash", secrets, budget_sec=budget_sec)
-        req_id = str(uuid.uuid4())
-        headers = {
-            **auth_hdrs,
-            "Content-Type": "application/json",
-            "X-Api-Resource-Id": rid,
-            "X-Api-Request-Id": req_id,
-            "X-Api-Sequence": "-1",
-        }
-        resp = self._send(
-            HttpRequest(
-                url=f"{base_url}/recognize/flash",
-                method="POST",
-                headers=headers,
-                body=body_bytes,
-                timeout_sec=rem,
-            ),
-            extra_secrets=secrets,
-            deadline=deadline,
-        )
-        try:
-            data = resp.json()
-        except ValueError:
-            data = {}
-        api_code, api_msg = self._extract_doubao_status(resp, data, secrets)
-        if self._is_recoverable_slot_error(resp.status, api_code, api_msg):
-            raise _DoubaoSlotUnavailableError(api_code or str(resp.status), api_msg)
-        if api_code == "20000003":
-            return ""
-        if resp.status == 200 and (api_code == "20000000" or (not api_code and "result" in data)):
-            res = data.get("result")
-            return str(res.get("text") or "").strip() if isinstance(res, dict) else ""
-        raise self._fail(
-            f"Doubao flash ({rid}) failed HTTP {resp.status} code={api_code}: {api_msg}",
-            extra_secrets=secrets,
-        )
+        pacer_key: str = "",
+        retries_box: list[int] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[str, bool]:
+        max_retries = max(0, int(self.cfg.asr.max_retries))
+        rbox = retries_box if retries_box is not None else [0]
+        while True:
+            if is_cancelled is not None and is_cancelled():
+                return "", True
+            try:
+                rem = self._remaining_timeout(deadline, rid, "flash", secrets, budget_sec=budget_sec)
+                req_id = str(uuid.uuid4())
+                headers = {
+                    **auth_hdrs,
+                    "Content-Type": "application/json",
+                    "X-Api-Resource-Id": rid,
+                    "X-Api-Request-Id": req_id,
+                    "X-Api-Sequence": "-1",
+                }
+                resp = self._send(
+                    HttpRequest(
+                        url=f"{base_url}/recognize/flash",
+                        method="POST",
+                        headers=headers,
+                        body=body_bytes,
+                        timeout_sec=rem,
+                    ),
+                    extra_secrets=secrets,
+                    deadline=deadline,
+                    pacer_key=pacer_key,
+                    is_cancelled=is_cancelled,
+                )
+                non_json = False
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
+                    non_json = bool(resp.body.strip())
+                api_code, api_msg = self._extract_doubao_status(resp, data, secrets)
+                if api_code == "20000003":
+                    return "", False
+                if (
+                    resp.status == 200
+                    and not non_json
+                    and (api_code == "20000000" or (not api_code and "result" in data))
+                ):
+                    res = data.get("result")
+                    return (
+                        str(res.get("text") or "").strip() if isinstance(res, dict) else ""
+                    ), False
+                is_rl, _ = _is_doubao_rate_limit(resp.status, api_code, api_msg)
+                if not is_rl and self._is_recoverable_slot_error(resp.status, api_code, api_msg):
+                    raise _DoubaoSlotUnavailableError(api_code or str(resp.status), api_msg)
+                raise self._fail_http(
+                    f"Doubao flash ({rid}) failed HTTP {resp.status} code={api_code}: {api_msg}",
+                    resp,
+                    data,
+                    extra_secrets=secrets,
+                    provider="doubao",
+                    non_json=non_json and not api_code,
+                    api_code=api_code,
+                    api_msg=api_msg,
+                )
+            except AsrError as err:
+                if is_cancelled is not None and is_cancelled():
+                    return "", True
+                if not self._maybe_backoff_before_retry(
+                    err,
+                    retries_used=rbox[0],
+                    max_retries=max_retries,
+                    deadline=deadline,
+                    pacer_key=pacer_key,
+                    is_cancelled=is_cancelled,
+                ):
+                    if is_cancelled is not None and is_cancelled():
+                        return "", True
+                    raise
+                rbox[0] += 1
 
     def _run_submit_and_query(
         self,
@@ -1730,91 +3015,173 @@ class DoubaoAsrProvider(BaseAsrProvider):
         secrets: Sequence[str],
         *,
         budget_sec: float | None = None,
-    ) -> str:
-        rem = self._remaining_timeout(deadline, rid, "submit", secrets, budget_sec=budget_sec)
-        req_id = str(uuid.uuid4())
-        common_headers = {
-            **auth_hdrs,
-            "Content-Type": "application/json",
-            "X-Api-Resource-Id": rid,
-            "X-Api-Request-Id": req_id,
-            "X-Api-Sequence": "-1",
-        }
-        submit_resp = self._send(
-            HttpRequest(
-                url=f"{base_url}/submit",
-                method="POST",
-                headers=common_headers,
-                body=body_bytes,
-                timeout_sec=rem,
-            ),
-            extra_secrets=secrets,
-            deadline=deadline,
-        )
-        try:
-            submit_data = submit_resp.json()
-        except ValueError:
-            submit_data = {}
-        sub_code, sub_msg = self._extract_doubao_status(submit_resp, submit_data, secrets)
-        if self._is_recoverable_slot_error(submit_resp.status, sub_code, sub_msg):
-            raise _DoubaoSlotUnavailableError(sub_code or str(submit_resp.status), sub_msg)
-        if sub_code == "20000003":
-            return ""
-        if submit_resp.status != 200 or sub_code != "20000000":
-            raise self._fail(
-                f"Doubao submit ({rid}) failed HTTP {submit_resp.status} code={sub_code}: {sub_msg}",
-                extra_secrets=secrets,
-            )
+        pacer_key: str = "",
+        retries_box: list[int] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[str, bool]:
+        max_retries = max(0, int(self.cfg.asr.max_retries))
+        rbox = retries_box if retries_box is not None else [0]
+        common_headers: dict[str, str] = {}
 
-        # Poll /query reusing the exact same X-Api-Request-Id under unified deadline
+        # Phase 1: submit task (retries on rate_limit / transient errors)
+        while True:
+            if is_cancelled is not None and is_cancelled():
+                return "", True
+            try:
+                rem = self._remaining_timeout(deadline, rid, "submit", secrets, budget_sec=budget_sec)
+                req_id = str(uuid.uuid4())
+                common_headers = {
+                    **auth_hdrs,
+                    "Content-Type": "application/json",
+                    "X-Api-Resource-Id": rid,
+                    "X-Api-Request-Id": req_id,
+                    "X-Api-Sequence": "-1",
+                }
+                submit_resp = self._send(
+                    HttpRequest(
+                        url=f"{base_url}/submit",
+                        method="POST",
+                        headers=common_headers,
+                        body=body_bytes,
+                        timeout_sec=rem,
+                    ),
+                    extra_secrets=secrets,
+                    deadline=deadline,
+                    pacer_key=pacer_key,
+                    is_cancelled=is_cancelled,
+                )
+                sub_non_json = False
+                try:
+                    submit_data = submit_resp.json()
+                except ValueError:
+                    submit_data = {}
+                    sub_non_json = bool(submit_resp.body.strip())
+                sub_code, sub_msg = self._extract_doubao_status(submit_resp, submit_data, secrets)
+                if sub_code == "20000003":
+                    return "", False
+                if submit_resp.status == 200 and sub_code == "20000000":
+                    break
+                is_rl, _ = _is_doubao_rate_limit(submit_resp.status, sub_code, sub_msg)
+                if not is_rl and self._is_recoverable_slot_error(
+                    submit_resp.status, sub_code, sub_msg
+                ):
+                    raise _DoubaoSlotUnavailableError(sub_code or str(submit_resp.status), sub_msg)
+                raise self._fail_http(
+                    f"Doubao submit ({rid}) failed HTTP {submit_resp.status} code={sub_code}: {sub_msg}",
+                    submit_resp,
+                    submit_data,
+                    extra_secrets=secrets,
+                    provider="doubao",
+                    non_json=sub_non_json and not sub_code,
+                    api_code=sub_code,
+                    api_msg=sub_msg,
+                )
+            except AsrError as err:
+                if is_cancelled is not None and is_cancelled():
+                    return "", True
+                if not self._maybe_backoff_before_retry(
+                    err,
+                    retries_used=rbox[0],
+                    max_retries=max_retries,
+                    deadline=deadline,
+                    pacer_key=pacer_key,
+                    is_cancelled=is_cancelled,
+                ):
+                    if is_cancelled is not None and is_cancelled():
+                        return "", True
+                    raise
+                rbox[0] += 1
+
+        # Phase 2: poll /query reusing the exact same X-Api-Request-Id under unified deadline
         query_body = b"{}"
         wait_sec = 0.15
         poll_t0 = self.clock_fn()
+        need_poll_sleep = True
 
         while True:
-            rem_before_sleep = self._remaining_timeout(
-                deadline, rid, "query", secrets, budget_sec=budget_sec
-            )
-            self.sleep_fn(min(wait_sec, rem_before_sleep))
-            rem_for_query = self._remaining_timeout(
-                deadline, rid, "query", secrets, budget_sec=budget_sec
-            )
-
-            q_resp = self._send(
-                HttpRequest(
-                    url=f"{base_url}/query",
-                    method="POST",
-                    headers=common_headers,
-                    body=query_body,
-                    timeout_sec=rem_for_query,
-                ),
-                extra_secrets=secrets,
-                deadline=deadline,
-            )
+            if is_cancelled is not None and is_cancelled():
+                return "", True
             try:
-                q_data = q_resp.json()
-            except ValueError:
-                q_data = {}
-            q_code, q_msg = self._extract_doubao_status(q_resp, q_data, secrets)
-            if q_code == "20000000" and q_resp.status == 200:
-                res = q_data.get("result")
-                return str(res.get("text") or "").strip() if isinstance(res, dict) else ""
-            if q_code == "20000003":
-                return ""
-            if q_code in ("20000001", "20000002"):
-                total_elapsed = self.clock_fn() - t0
-                poll_elapsed = self.clock_fn() - poll_t0
-                if self.clock_fn() >= deadline:
-                    raise self._fail(
-                        f"Doubao query ({rid}) timed out after {total_elapsed:.2f}s (last code={q_code})",
-                        extra_secrets=secrets,
+                if need_poll_sleep:
+                    rem_before_sleep = self._remaining_timeout(
+                        deadline, rid, "query", secrets, budget_sec=budget_sec
                     )
-                wait_sec = 0.30 if poll_elapsed > 2.0 else 0.15
-                continue
-            raise self._fail(
-                f"Doubao query ({rid}) failed HTTP {q_resp.status} code={q_code}: {q_msg}",
-                extra_secrets=secrets,
-            )
+                    _sleep_cooperative(
+                        min(wait_sec, rem_before_sleep),
+                        sleep_fn=self.sleep_fn,
+                        is_cancelled=is_cancelled,
+                    )
+                    if is_cancelled is not None and is_cancelled():
+                        return "", True
+                need_poll_sleep = True
+                rem_for_query = self._remaining_timeout(
+                    deadline, rid, "query", secrets, budget_sec=budget_sec
+                )
+
+                q_resp = self._send(
+                    HttpRequest(
+                        url=f"{base_url}/query",
+                        method="POST",
+                        headers=common_headers,
+                        body=query_body,
+                        timeout_sec=rem_for_query,
+                    ),
+                    extra_secrets=secrets,
+                    deadline=deadline,
+                    pacer_key=pacer_key,
+                    is_cancelled=is_cancelled,
+                )
+                q_non_json = False
+                try:
+                    q_data = q_resp.json()
+                except ValueError:
+                    q_data = {}
+                    q_non_json = bool(q_resp.body.strip())
+                q_code, q_msg = self._extract_doubao_status(q_resp, q_data, secrets)
+                if q_code == "20000000" and q_resp.status == 200 and not q_non_json:
+                    res = q_data.get("result")
+                    return (
+                        str(res.get("text") or "").strip() if isinstance(res, dict) else ""
+                    ), False
+                if q_code == "20000003":
+                    return "", False
+                if q_code in ("20000001", "20000002"):
+                    total_elapsed = self.clock_fn() - t0
+                    poll_elapsed = self.clock_fn() - poll_t0
+                    if self.clock_fn() >= deadline:
+                        raise self._fail(
+                            f"Doubao query ({rid}) timed out after {total_elapsed:.2f}s (last code={q_code})",
+                            extra_secrets=secrets,
+                            retry_kind="transient",
+                        )
+                    wait_sec = 0.60 if poll_elapsed > 8.0 else (0.30 if poll_elapsed > 2.0 else 0.15)
+                    continue
+                raise self._fail_http(
+                    f"Doubao query ({rid}) failed HTTP {q_resp.status} code={q_code}: {q_msg}",
+                    q_resp,
+                    q_data,
+                    extra_secrets=secrets,
+                    provider="doubao",
+                    non_json=q_non_json and not q_code,
+                    api_code=q_code,
+                    api_msg=q_msg,
+                )
+            except AsrError as err:
+                if is_cancelled is not None and is_cancelled():
+                    return "", True
+                if not self._maybe_backoff_before_retry(
+                    err,
+                    retries_used=rbox[0],
+                    max_retries=max_retries,
+                    deadline=deadline,
+                    pacer_key=pacer_key,
+                    is_cancelled=is_cancelled,
+                ):
+                    if is_cancelled is not None and is_cancelled():
+                        return "", True
+                    raise
+                rbox[0] += 1
+                need_poll_sleep = False
 
 
 # ---------------------------------------------------------------------------
@@ -1832,6 +3199,10 @@ GEMINI_AUDIO_SYSTEM_PROMPT = (
     "仅输出整理后的最终纯文本。若录音中无人声词句，输出空字符串。"
 )
 
+_GEMINI_BLOCKED_FINISH_REASONS = frozenset(
+    {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"}
+)
+
 
 class GeminiAudioProvider(BaseAsrProvider):
     provider_name = "gemini"
@@ -1846,6 +3217,8 @@ class GeminiAudioProvider(BaseAsrProvider):
         self,
         wav_bytes: bytes,
         context: AsrContext | Mapping[str, Any] | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> AsrResult:
         model = self.cfg.asr.effective_model("gemini")
         gen_cfg = build_gemini_generation_config(model, self.cfg.asr.effort, temperature=0.1)
@@ -1887,74 +3260,97 @@ class GeminiAudioProvider(BaseAsrProvider):
             "x-goog-api-key": cred.value,
             "Content-Type": "application/json",
         }
+        body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        pacer_key = make_rate_pacer_key(self.provider_name, url, cred.value)
 
         eff_timeout = float(self.cfg.asr.timeout_sec)
         t0 = self.clock_fn()
-        resp = self._send(
-            HttpRequest(
-                url=url,
-                method="POST",
-                headers=headers,
-                body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                timeout_sec=eff_timeout,
-            ),
-            extra_secrets=(cred.value,),
-        )
-        latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
+        deadline = t0 + eff_timeout
 
-        try:
-            data = resp.json()
-        except ValueError:
-            excerpt = self._safe_excerpt(resp.text(), (cred.value,))
-            raise self._fail(
-                f"Gemini generateContent returned non-JSON (HTTP {resp.status}): {excerpt}",
+        def _attempt(rem: float) -> str:
+            resp = self._send(
+                HttpRequest(
+                    url=url,
+                    method="POST",
+                    headers=headers,
+                    body=body_bytes,
+                    timeout_sec=rem,
+                ),
                 extra_secrets=(cred.value,),
-            ) from None
-
-        if resp.status != 200 or (data.get("error") and not data.get("candidates")):
-            raw_err = data.get("error")
-            err_msg = (
-                str(raw_err.get("message") or data)
-                if isinstance(raw_err, dict)
-                else str(raw_err or data)
+                deadline=deadline,
+                pacer_key=pacer_key,
+                is_cancelled=is_cancelled,
             )
-            excerpt = self._safe_excerpt(err_msg, (cred.value,))
-            raise self._fail(
-                f"Gemini generateContent HTTP {resp.status}: {excerpt}",
-                extra_secrets=(cred.value,),
-            )
+            try:
+                data = resp.json()
+            except ValueError:
+                excerpt = self._safe_excerpt(resp.text(), (cred.value,))
+                raise self._fail_http(
+                    f"Gemini generateContent returned non-JSON (HTTP {resp.status}): {excerpt}",
+                    resp,
+                    extra_secrets=(cred.value,),
+                    non_json=True,
+                ) from None
 
-        candidates = data.get("candidates")
-        if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
-            pf = data.get("promptFeedback")
-            if isinstance(pf, dict) and pf.get("blockReason"):
-                excerpt = self._safe_excerpt(str(pf), (cred.value,))
-                raise self._fail(
-                    f"Gemini generateContent blocked ({pf.get('blockReason')}): {excerpt}",
+            if resp.status != 200 or (data.get("error") and not data.get("candidates")):
+                raw_err = data.get("error")
+                err_msg = (
+                    str(raw_err.get("message") or data)
+                    if isinstance(raw_err, dict)
+                    else str(raw_err or data)
+                )
+                excerpt = self._safe_excerpt(err_msg, (cred.value,))
+                raise self._fail_http(
+                    f"Gemini generateContent HTTP {resp.status}: {excerpt}",
+                    resp,
+                    data,
                     extra_secrets=(cred.value,),
                 )
-            return AsrResult(
-                text="",
-                provider=self.provider_name,
-                model=model,
-                latency_ms=latency_ms,
-                is_single_hop_refined=True,
-            )
 
-        cand_content = candidates[0].get("content")
-        resp_parts = cand_content.get("parts") if isinstance(cand_content, dict) else None
-        if not isinstance(resp_parts, list):
-            resp_parts = []
-        out_chunks: list[str] = []
-        for p in resp_parts:
-            if isinstance(p, dict) and not p.get("thought") and isinstance(p.get("text"), str):
-                out_chunks.append(p["text"])
+            candidates = data.get("candidates")
+            if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+                pf = data.get("promptFeedback")
+                if isinstance(pf, dict) and pf.get("blockReason"):
+                    excerpt = self._safe_excerpt(str(pf), (cred.value,))
+                    raise self._fail(
+                        f"Gemini generateContent blocked ({pf.get('blockReason')}): {excerpt}",
+                        extra_secrets=(cred.value,),
+                        retry_kind="never",
+                    )
+                return ""
+
+            finish_reason = str(candidates[0].get("finishReason") or "").strip().upper()
+            if finish_reason in _GEMINI_BLOCKED_FINISH_REASONS:
+                raise self._fail(
+                    f"Gemini generateContent blocked ({finish_reason})",
+                    extra_secrets=(cred.value,),
+                    retry_kind="never",
+                )
+
+            cand_content = candidates[0].get("content")
+            resp_parts = cand_content.get("parts") if isinstance(cand_content, dict) else None
+            if not isinstance(resp_parts, list):
+                resp_parts = []
+            out_chunks: list[str] = []
+            for p in resp_parts:
+                if isinstance(p, dict) and not p.get("thought") and isinstance(p.get("text"), str):
+                    out_chunks.append(p["text"])
+            return "".join(out_chunks)
+
+        raw_out, retries_used, cancelled = self._execute_with_retry(
+            deadline=deadline,
+            pacer_key=pacer_key,
+            is_cancelled=is_cancelled,
+            attempt_fn=_attempt,
+        )
+        latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
         return AsrResult(
-            text=strip_lenticular_artifacts("".join(out_chunks)).strip(),
+            text="" if cancelled else strip_lenticular_artifacts(raw_out).strip(),
             provider=self.provider_name,
             model=model,
             latency_ms=latency_ms,
             is_single_hop_refined=True,
+            retries=retries_used,
         )
 
 
@@ -2045,6 +3441,8 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
         self,
         wav_bytes: bytes,
         context: AsrContext | Mapping[str, Any] | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> AsrResult:
         model = self.cfg.asr.effective_model(self.provider_name)
         base = self._resolve_base_url()
@@ -2060,6 +3458,7 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
         url = base if base.endswith("/audio/transcriptions") else f"{base}/audio/transcriptions"
         api_key = self._resolve_bearer_key(url)
         secrets: tuple[str, ...] = (api_key,) if api_key else ()
+        pacer_key = make_rate_pacer_key(self.provider_name, url, api_key or "")
         ctx = _coerce_context(context, self.cfg.asr.hotwords_file, env=self.env)
 
         headers: dict[str, str] = {}
@@ -2097,49 +3496,76 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
 
         eff_timeout = float(self.cfg.asr.timeout_sec)
         t0 = self.clock_fn()
-        resp = self._send(
-            HttpRequest(
-                url=url,
-                method="POST",
-                headers=headers,
-                body=body,
-                timeout_sec=eff_timeout,
-            ),
-            extra_secrets=secrets,
+        deadline = t0 + eff_timeout
+
+        def _attempt(rem: float) -> str:
+            resp = self._send(
+                HttpRequest(
+                    url=url,
+                    method="POST",
+                    headers=headers,
+                    body=body,
+                    timeout_sec=rem,
+                ),
+                extra_secrets=secrets,
+                deadline=deadline,
+                pacer_key=pacer_key,
+                is_cancelled=is_cancelled,
+            )
+
+            if resp.status != 200:
+                try:
+                    err_data = resp.json()
+                    non_json = False
+                except ValueError:
+                    err_data = {}
+                    non_json = True
+                excerpt = self._safe_excerpt(resp.text(), secrets)
+                raise self._fail_http(
+                    f"{self.provider_name} audio/transcriptions HTTP {resp.status}: {excerpt}",
+                    resp,
+                    err_data,
+                    extra_secrets=secrets,
+                    non_json=non_json,
+                )
+
+            try:
+                data = resp.json()
+            except ValueError:
+                excerpt = self._safe_excerpt(resp.text(), secrets)
+                raise self._fail_http(
+                    f"{self.provider_name} audio/transcriptions returned non-JSON (HTTP {resp.status}): {excerpt}",
+                    resp,
+                    extra_secrets=secrets,
+                    non_json=True,
+                ) from None
+
+            if data.get("error"):
+                raw_err = data.get("error")
+                err_msg = (
+                    str(raw_err.get("message") or data)
+                    if isinstance(raw_err, dict)
+                    else str(raw_err or data)
+                )
+                excerpt = self._safe_excerpt(err_msg, secrets)
+                raise self._fail_http(
+                    f"{self.provider_name} audio/transcriptions error: {excerpt}",
+                    resp,
+                    data,
+                    extra_secrets=secrets,
+                )
+
+            raw_text = data.get("text")
+            return str(raw_text) if isinstance(raw_text, str) else ""
+
+        raw_out, retries_used, cancelled = self._execute_with_retry(
+            deadline=deadline,
+            pacer_key=pacer_key,
+            is_cancelled=is_cancelled,
+            attempt_fn=_attempt,
         )
         latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
-
-        if resp.status != 200:
-            excerpt = self._safe_excerpt(resp.text(), secrets)
-            raise self._fail(
-                f"{self.provider_name} audio/transcriptions HTTP {resp.status}: {excerpt}",
-                extra_secrets=secrets,
-            )
-
-        try:
-            data = resp.json()
-        except ValueError:
-            excerpt = self._safe_excerpt(resp.text(), secrets)
-            raise self._fail(
-                f"{self.provider_name} audio/transcriptions returned non-JSON (HTTP {resp.status}): {excerpt}",
-                extra_secrets=secrets,
-            ) from None
-
-        if data.get("error") and not isinstance(data.get("text"), str):
-            raw_err = data.get("error")
-            err_msg = (
-                str(raw_err.get("message") or data)
-                if isinstance(raw_err, dict)
-                else str(raw_err or data)
-            )
-            excerpt = self._safe_excerpt(err_msg, secrets)
-            raise self._fail(
-                f"{self.provider_name} audio/transcriptions error: {excerpt}",
-                extra_secrets=secrets,
-            )
-
-        raw_text = data.get("text")
-        text = strip_lenticular_artifacts(str(raw_text)).strip() if isinstance(raw_text, str) else ""
+        text = "" if cancelled else strip_lenticular_artifacts(raw_out).strip()
 
         return AsrResult(
             text=text,
@@ -2147,6 +3573,7 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
             model=model,
             latency_ms=latency_ms,
             is_single_hop_refined=False,
+            retries=retries_used,
         )
 
 
@@ -2185,6 +3612,8 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
         self,
         wav_bytes: bytes,
         context: AsrContext | Mapping[str, Any] | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> AsrResult:
         model = self.cfg.asr.effective_model(self.provider_name)
         base = self._resolve_base_url()
@@ -2200,6 +3629,7 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
         url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
         api_key = self._resolve_bearer_key(url)
         secrets: tuple[str, ...] = (api_key,) if api_key else ()
+        pacer_key = make_rate_pacer_key(self.provider_name, url, api_key or "")
 
         ctx = _coerce_context(context, self.cfg.asr.hotwords_file, env=self.env)
         ctx_body = _compose_context_text(ctx, max_chars=16000)
@@ -2241,50 +3671,69 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         eff_timeout = float(self.cfg.asr.timeout_sec)
         t0 = self.clock_fn()
-        resp = self._send(
-            HttpRequest(
-                url=url,
-                method="POST",
-                headers=headers,
-                body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                timeout_sec=eff_timeout,
-            ),
-            extra_secrets=secrets,
+        deadline = t0 + eff_timeout
+
+        def _attempt(rem: float) -> str:
+            resp = self._send(
+                HttpRequest(
+                    url=url,
+                    method="POST",
+                    headers=headers,
+                    body=body_bytes,
+                    timeout_sec=rem,
+                ),
+                extra_secrets=secrets,
+                deadline=deadline,
+                pacer_key=pacer_key,
+                is_cancelled=is_cancelled,
+            )
+            try:
+                data = resp.json()
+            except ValueError:
+                excerpt = self._safe_excerpt(resp.text(), secrets)
+                raise self._fail_http(
+                    f"{self.provider_name} chat/completions returned non-JSON (HTTP {resp.status}): {excerpt}",
+                    resp,
+                    extra_secrets=secrets,
+                    non_json=True,
+                ) from None
+
+            compat_err = extract_openai_compat_error(data)
+            if resp.status != 200 or compat_err is not None:
+                err_msg = (
+                    compat_err[1]
+                    if compat_err is not None
+                    else str(data.get("error") or data)
+                )
+                excerpt = self._safe_excerpt(err_msg, secrets)
+                raise self._fail_http(
+                    f"{self.provider_name} chat/completions HTTP {resp.status}: {excerpt}",
+                    resp,
+                    data,
+                    extra_secrets=secrets,
+                )
+
+            return extract_chat_message_text(data)
+
+        raw_out, retries_used, cancelled = self._execute_with_retry(
+            deadline=deadline,
+            pacer_key=pacer_key,
+            is_cancelled=is_cancelled,
+            attempt_fn=_attempt,
         )
         latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
-
-        try:
-            data = resp.json()
-        except ValueError:
-            excerpt = self._safe_excerpt(resp.text(), secrets)
-            raise self._fail(
-                f"{self.provider_name} chat/completions returned non-JSON (HTTP {resp.status}): {excerpt}",
-                extra_secrets=secrets,
-            ) from None
-
-        if resp.status != 200 or (data.get("error") and not data.get("choices")):
-            raw_err = data.get("error")
-            err_msg = (
-                str(raw_err.get("message") or data)
-                if isinstance(raw_err, dict)
-                else str(raw_err or data)
-            )
-            excerpt = self._safe_excerpt(err_msg, secrets)
-            raise self._fail(
-                f"{self.provider_name} chat/completions HTTP {resp.status}: {excerpt}",
-                extra_secrets=secrets,
-            )
-
-        out_text = strip_lenticular_artifacts(extract_chat_message_text(data)).strip()
+        out_text = "" if cancelled else strip_lenticular_artifacts(raw_out).strip()
         return AsrResult(
             text=out_text,
             provider=self.provider_name,
             model=model,
             latency_ms=latency_ms,
             is_single_hop_refined=True,
+            retries=retries_used,
         )
 
 
@@ -2301,6 +3750,7 @@ def create_asr_provider(
     transport: HttpTransport | None = None,
     clock_fn: Callable[[], float] = time.monotonic,
     sleep_fn: Callable[[float], None] = time.sleep,
+    rand_fn: Callable[[], float] = random.random,
 ) -> BaseAsrProvider:
     eff_env = os.environ if env is None else env
     if cfg.asr.effort.strip().lower() not in VALID_EFFORTS:
@@ -2328,6 +3778,7 @@ def create_asr_provider(
         "transport": transport,
         "clock_fn": clock_fn,
         "sleep_fn": sleep_fn,
+        "rand_fn": rand_fn,
     }
     if provider_name == "dashscope":
         return DashScopeAsrProvider(cfg, eff_creds, **kwargs)
@@ -2354,6 +3805,8 @@ def transcribe(
     transport: HttpTransport | None = None,
     clock_fn: Callable[[], float] = time.monotonic,
     sleep_fn: Callable[[float], None] = time.sleep,
+    rand_fn: Callable[[], float] = random.random,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> AsrResult:
     """Top-level transcribe entry point fixed across Chunk 1 and Chunk 2."""
     provider = create_asr_provider(
@@ -2363,5 +3816,6 @@ def transcribe(
         transport=transport,
         clock_fn=clock_fn,
         sleep_fn=sleep_fn,
+        rand_fn=rand_fn,
     )
-    return provider.transcribe(wav_bytes, context=context)
+    return provider.transcribe(wav_bytes, context=context, is_cancelled=is_cancelled)

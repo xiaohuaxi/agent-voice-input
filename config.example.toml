@@ -74,6 +74,8 @@ base_url = ""
 api_key_env = ""
 hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 # timeout_sec = 60.0
+# Extra retry attempts within the same provider on rate-limit / transient network errors (0 disables retry)
+# max_retries = 2
 
 [refiner]
 # Stage 2 context-aware refinement provider:
@@ -100,6 +102,8 @@ base_url = ""
 api_key_env = ""
 # max_turns_per_thread = 20
 # timeout_sec = 90.0
+# Extra retry attempts within the same provider on rate-limit / transient network errors (0 disables retry)
+# max_retries = 2
 # Set true to run Stage 2 refinement even when Stage 1 already performed single-hop multimodal refinement
 force_on_single_hop = false
 
