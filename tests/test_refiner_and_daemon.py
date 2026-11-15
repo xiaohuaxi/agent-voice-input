@@ -284,10 +284,10 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertIn("wasapi_zero_packets", shim)
         # Two-stage HUD copy & colors + backward-compatible 'processing' alias
         self.assertIn('st == "recognizing" || st == "processing"', shim)
-        self.assertIn(r"\u25D0 \u6B63\u5728\u8BED\u97F3\u8BC6\u522B\u2026", shim)
+        self.assertIn(r"\u25D0 \u8BED\u97F3\u8BC6\u522B\u2026", shim)
         self.assertIn("Color.FromArgb(56, 189, 248)", shim)
         self.assertIn('st == "refining"', shim)
-        self.assertIn(r"\u25C8 \u6B63\u5728\u6574\u7406\u7CBE\u4FEE\u2026", shim)
+        self.assertIn(r"\u25C8 \u6574\u7406\u7CBE\u4FEE\u2026", shim)
         self.assertIn("Color.FromArgb(208, 156, 255)", shim)
         self.assertIn("Color.FromArgb(251, 191, 36)", shim)
         self.assertIn("Color.FromArgb(64, 18, 26)", shim)

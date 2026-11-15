@@ -246,7 +246,16 @@ func computeHudPillY(visibleMinY: CGFloat, visibleMaxY: CGFloat, pillH: CGFloat,
     if pos == "top" {
         return round(visibleMaxY - pillH - 14.0)
     }
-    return round(visibleMinY + 4.0)
+    return round(visibleMinY + 28.0)
+}
+
+func stripOuterParens(_ raw: String) -> String {
+    let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if t.count >= 2 && t.first == "(" && t.last == ")" {
+        let inner = t.dropFirst().dropLast()
+        return String(inner).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    return t
 }
 
 struct HudSegments: Equatable {
@@ -418,10 +427,10 @@ final class StatusIconView: NSView {
 }
 
 final class WaveBarsView: NSView {
-    static let barWidth: CGFloat = 2.4
-    static let barGap: CGFloat = 2.2
+    static let barWidth: CGFloat = 2.5
+    static let barGap: CGFloat = 2.5
     static let maxBarHeight: CGFloat = 15.0
-    static let totalWidth: CGFloat = 9.0 * 2.4 + 8.0 * 2.2
+    static let totalWidth: CGFloat = 9.0 * 2.5 + 8.0 * 2.5
 
     var barNorms: [CGFloat] = Array(repeating: 0.0, count: 9) {
         didSet { needsDisplay = true }
@@ -456,14 +465,14 @@ final class HudPillController {
     private static let recWaveActive = rgba(255, 104, 112, 1.0)
     private static let recWaveQuiet = rgba(232, 92, 102, 1.0)
     private static let recMainText = rgba(248, 250, 252)
-    private static let recHintTextCol = rgba(214, 188, 194)
+    private static let recHintTextCol = rgba(188, 178, 192, 0.90)
 
     private static let warnBg = rgba(72, 38, 12, 0.95)
     private static let warnBorder = rgba(245, 158, 11, 0.72)
     private static let warnWaveActive = rgba(251, 191, 36, 1.0)
     private static let warnWaveQuiet = rgba(251, 191, 36, 0.86)
     private static let warnMainText = rgba(254, 252, 232)
-    private static let warnHintTextCol = rgba(253, 224, 71)
+    private static let warnHintTextCol = rgba(251, 191, 36, 1.0)
 
     private static let hudFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
     private static let monoDurFont = NSFont.monospacedDigitSystemFont(ofSize: 12.5, weight: .medium)
@@ -508,16 +517,16 @@ final class HudPillController {
 
     private func ensurePanel() {
         if panel != nil { return }
-        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 31), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 34), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.level = .statusBar
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
         p.ignoresMouseEvents = true; p.hidesOnDeactivate = false; p.isReleasedWhenClosed = false
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 31))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 34))
         container.wantsLayer = true
         container.layer?.backgroundColor = Self.recBg.cgColor
-        container.layer?.cornerRadius = 15.5
+        container.layer?.cornerRadius = 17.0
         container.layer?.borderWidth = 1.0
         container.layer?.masksToBounds = true
 
@@ -532,7 +541,7 @@ final class HudPillController {
         tf.maximumNumberOfLines = 1
         container.addSubview(tf)
 
-        let wv = WaveBarsView(frame: NSRect(x: 0, y: 0, width: ceil(WaveBarsView.totalWidth), height: 31))
+        let wv = WaveBarsView(frame: NSRect(x: 0, y: 0, width: WaveBarsView.totalWidth, height: 34))
         wv.isHidden = true
         container.addSubview(wv)
 
@@ -634,8 +643,9 @@ final class HudPillController {
             remainSec = max(0, maxDurationSec - elapsedSec)
             isWarn = (remainSec <= warnRemainSec)
         }
-        let effHint = isWarn ? formatCountdownHint(remainSec, zh: recZhHint) : recHintText
-        let hintSlotTpl = isWarn ? countdownHintSlotTemplate(remainSec, zh: recZhHint) : effHint
+        let rawEffHint = isWarn ? formatCountdownHint(remainSec, zh: recZhHint) : recHintText
+        let effHint = stripOuterParens(rawEffHint)
+        let hintSlotTpl = isWarn ? stripOuterParens(countdownHintSlotTemplate(remainSec, zh: recZhHint)) : effHint
         let durStr = formatRecordingDuration(elapsedSec)
         let slotTpl = durationSlotTemplate(elapsedSec)
 
@@ -697,11 +707,11 @@ final class HudPillController {
             hintLabel.isHidden = true
         }
 
-        let padL: CGFloat = 13.0, padR: CGFloat = 14.0
-        let waveW: CGFloat = ceil(WaveBarsView.totalWidth)
-        let gap1: CGFloat = 7.0
-        let gap2: CGFloat = effHint.isEmpty ? 0.0 : 6.0
-        let totalContentW = waveW + gap1 + slotW + gap2 + hintW
+        let padL: CGFloat = 15.0, padR: CGFloat = 15.0
+        let waveW: CGFloat = WaveBarsView.totalWidth
+        let gap1: CGFloat = 9.0
+        let gap2: CGFloat = effHint.isEmpty ? 0.0 : 9.0
+        let totalContentW = slotW + gap1 + waveW + gap2 + hintW
         let textH = max(max(tplH, actH), hintH)
 
         let mouseLoc = NSEvent.mouseLocation
@@ -710,8 +720,8 @@ final class HudPillController {
         let vf = activeScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
 
         let maxW = max(64.0, min(640.0, vf.width - 24.0))
-        let pillH: CGFloat = max(31.0, textH + 12.0)
-        let pillW: CGFloat = min(maxW, max(64.0, totalContentW + padL + padR))
+        let pillH: CGFloat = max(34.0, textH + 14.0)
+        let pillW: CGFloat = min(maxW, max(64.0, snapToPixel(totalContentW + padL + padR, scale: scale)))
         let pillX = snapToPixel(vf.midX - pillW / 2.0, scale: scale)
         let pillY = computeHudPillY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, pillH: pillH, position: recPosition)
 
@@ -724,19 +734,21 @@ final class HudPillController {
 
         let availW = max(1.0, pillW - padL - padR)
         var curX = padL + ((totalContentW <= availW) ? snapToPixel((availW - totalContentW) * 0.5, scale: scale) : 0.0)
-        waveView.frame = NSRect(x: curX, y: 0, width: waveW, height: pillH)
-        waveView.layer?.contentsScale = scale
-        curX += waveW + gap1
 
         let durH = max(tplH, actH)
         let durY = snapToPixel((pillH - durH) / 2.0, scale: scale)
         durLabel.frame = NSRect(x: curX, y: durY, width: slotW, height: durH)
-        curX += slotW + gap2
+        curX += slotW + gap1
+
+        waveView.frame = NSRect(x: snapToPixel(curX, scale: scale), y: 0, width: waveW, height: pillH)
+        waveView.layer?.contentsScale = scale
+        curX += waveW + gap2
 
         if !effHint.isEmpty {
-            let remW = max(0.0, pillW - padR - curX)
+            let curXSnap = snapToPixel(curX, scale: scale)
+            let remW = max(0.0, pillW - padR - curXSnap)
             let hintY = snapToPixel((pillH - hintH) / 2.0, scale: scale)
-            hintLabel.frame = NSRect(x: curX, y: hintY, width: min(hintW, remW), height: hintH)
+            hintLabel.frame = NSRect(x: curXSnap, y: hintY, width: min(hintW, remW), height: hintH)
         }
     }
 
@@ -776,7 +788,7 @@ final class HudPillController {
         var waveMode = false
         if st == "recording" {
             txt = zh
-                ? "● 正在录音… (\(isPtt ? "松开" : "再按")\(hotkeyLabel) 完成)"
+                ? "● 录音中… (\(isPtt ? "松开" : "再按")\(hotkeyLabel) 完成)"
                 : "● Listening… (\(isPtt ? "release" : "press") \(hotkeyLabelEn) to finish)"
             (bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
                 Self.recBg, Self.recWaveActive, Self.recMainText, Self.recHintTextCol, Self.recBorder, 0, ""
@@ -785,12 +797,12 @@ final class HudPillController {
             waveMode = trimmedCustom.isEmpty || trimmedCustom.hasPrefix("● ")
         } else if st == "recognizing" || st == "processing" {
             (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                zh ? "◐ 正在语音识别…" : "◐ Transcribing…",
+                zh ? "◐ 语音识别…" : "◐ Transcribing…",
                 rgba(16, 40, 72, 0.95), rgba(56, 189, 248), rgba(244, 248, 252), rgba(176, 198, 222), rgba(56, 189, 248, 0.65), 0, "recognizing"
             )
         } else if st == "refining" {
             (txt, bgCol, iconColor, mainColor, hintColor, bd, autoHideMs, iconKind) = (
-                zh ? "◈ 正在整理精修…" : "◈ Refining…",
+                zh ? "◈ 整理精修…" : "◈ Refining…",
                 rgba(46, 22, 76, 0.95), rgba(208, 156, 255), rgba(248, 245, 255), rgba(198, 182, 226), rgba(192, 132, 252, 0.65), 0, "refining"
             )
         } else if st == "done" {
@@ -874,9 +886,9 @@ final class HudPillController {
             let textSize = hasBody ? label.frame.size : NSSize(width: 0, height: 15)
             let iconBox: CGFloat = hasIcon ? StatusIconView.boxSize : 0.0
             let iconGap: CGFloat = (hasIcon && hasBody) ? 6.0 : 0.0
-            let padL: CGFloat = 13.0, padR: CGFloat = 14.0
+            let padL: CGFloat = 15.0, padR: CGFloat = 15.0
             let contentW = iconBox + iconGap + ceil(textSize.width)
-            let pillH: CGFloat = max(31.0, ceil(textSize.height) + 12.0)
+            let pillH: CGFloat = max(34.0, ceil(textSize.height) + 14.0)
             let pillW: CGFloat = min(640.0, max(64.0, contentW + padL + padR))
 
             let mouseLoc = NSEvent.mouseLocation
@@ -993,10 +1005,11 @@ private func runSelfCheck() -> Int32 {
         try check(recov.count == 1 && recov[0].kind == "toggle", "recovered toggle after swallowed keyUp")
 
         try check(isZhUiCulture("zh-Hans-CN") && isZhUiCulture("zh_TW.UTF-8") && !isZhUiCulture("en-US"), "ui_culture zh detection")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 54.0, "HUD bottom pillY")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 54.0, "HUD default pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 78.0, "HUD bottom pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 78.0, "HUD default pillY")
         try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: " TOP ") == 850.0, "HUD top pillY")
-        try check(splitHudSegments("● 正在录音… (再按右 Ctrl 完成)") == HudSegments(icon: "●", main: "正在录音…", hint: "(再按右 Ctrl 完成)", hasSpaceBeforeHint: true), "HUD split recording zh")
+        try check(splitHudSegments("● 录音中… (再按右 Ctrl 完成)") == HudSegments(icon: "●", main: "录音中…", hint: "(再按右 Ctrl 完成)", hasSpaceBeforeHint: true), "HUD split recording zh")
+        try check(stripOuterParens("(再按右 Ctrl 完成)") == "再按右 Ctrl 完成" && stripOuterParens("12s 后自动完成") == "12s 后自动完成" && stripOuterParens("") == "", "HUD strip outer parens")
         try check(splitHudSegments("✓ 已复制(窗口已切换)") == HudSegments(icon: "✓", main: "已复制", hint: "(窗口已切换)", hasSpaceBeforeHint: false), "HUD split copied zh")
         try check(splitHudSegments("Custom HUD") == HudSegments(icon: "", main: "Custom HUD", hint: "", hasSpaceBeforeHint: false), "HUD split custom")
         try check(formatRecordingDuration(-5) == "0s" && formatRecordingDuration(0) == "0s" && formatRecordingDuration(9) == "9s" && formatRecordingDuration(59) == "59s", "HUD duration seconds")

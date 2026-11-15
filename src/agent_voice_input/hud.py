@@ -65,9 +65,9 @@ _HOTKEY_LABELS: dict[str, tuple[str, str]] = {
 }
 
 _STATIC_HUD_COPY: dict[str, tuple[str, str]] = {
-    "recognizing": ("◐ 正在语音识别…", "◐ Transcribing…"),
-    "processing": ("◐ 正在语音识别…", "◐ Transcribing…"),
-    "refining": ("◈ 正在整理精修…", "◈ Refining…"),
+    "recognizing": ("◐ 语音识别…", "◐ Transcribing…"),
+    "processing": ("◐ 语音识别…", "◐ Transcribing…"),
+    "refining": ("◈ 整理精修…", "◈ Refining…"),
     "done": ("✓ 已填入", "✓ Inserted"),
     "copied": ("✓ 已复制(窗口已切换)", "✓ Copied (window switched)"),
     "empty": ("○ 未检测到语音", "○ No speech detected"),
@@ -167,7 +167,7 @@ def format_hud_text(
         hk = format_hotkey_label(hotkey, "zh" if zh else "en")
         if zh:
             sep = " " if (hk and ord(hk[0]) <= 0x7F) else ""
-            return f"● 正在录音… ({'松开' if is_ptt else '再按'}{sep}{hk} 完成)"
+            return f"● 录音中… ({'松开' if is_ptt else '再按'}{sep}{hk} 完成)"
         return f"● Listening… ({'release' if is_ptt else 'press'} {hk} to finish)"
     pair = _STATIC_HUD_COPY.get(st, ("✕ 识别失败", "✕ Transcription failed"))
     return pair[0] if zh else pair[1]

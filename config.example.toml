@@ -12,8 +12,8 @@ key = "RControl"
 # - "tap_toggle": isolated tap toggles recording start/stop (chords such as RControl+C pass through untouched)
 # - "ptt": push-to-talk (hold to speak, release to transcribe; pressing another key cancels)
 trigger_mode = "tap_toggle"
-tap_max_ms = 1200
-debounce_ms = 180
+# tap_max_ms = 1200
+# debounce_ms = 180
 # Start new hotkey recordings only when an allowed terminal window is focused (set false to allow triggering in any app;
 # stopping or canceling an active recording is never blocked even if focus moved away)
 # Can also be overridden via AGENT_VOICE_INPUT_ONLY_IN_TERMINALS (or VOICE_INPUT_ONLY_IN_TERMINALS)
@@ -29,14 +29,14 @@ position = "bottom"
 
 [audio]
 # Silence gate & RMS loudness normalization (pure stdlib; blocks accidental empty triggers before hitting cloud APIs)
-floor_dbfs = -50.0
-target_dbfs = -20.0
-max_gain_db = 40.0
-min_duration_sec = 0.3
-min_voiced_sec = 0.1
+# floor_dbfs = -50.0
+# target_dbfs = -20.0
+# max_gain_db = 40.0
+# min_duration_sec = 0.3
+# min_voiced_sec = 0.1
 # Maximum single recording duration in seconds (default 600s = 10 minutes; HUD shows countdown in the final 15s and auto-finishes transcription; set 0 to disable)
 # Can also be overridden via AGENT_VOICE_INPUT_MAX_DURATION_SEC (or VOICE_INPUT_MAX_DURATION_SEC)
-max_duration_sec = 600.0
+# max_duration_sec = 600.0
 # WSL2 capture source: "auto" (defaults to resident win_shim Windows WASAPI 16 kHz capture, avoiding WSLg RDPSource zero-packet deadlocks) | "wasapi" | "winmm" | "pulse"
 wsl_source = "auto"
 # macOS AVFoundation audio input device: "default" (system default mic) | device index e.g. "0" | device name
@@ -102,7 +102,7 @@ effort = "low"
 # Required when provider = "openai-compatible" (e.g. "http://127.0.0.1:8000/v1"); built-in providers resolve base_url automatically
 base_url = ""
 api_key_env = ""
-max_turns_per_thread = 20
+# max_turns_per_thread = 20
 # timeout_sec = 90.0
 # Set true to run Stage 2 refinement even when Stage 1 already performed single-hop multimodal refinement
 force_on_single_hop = false

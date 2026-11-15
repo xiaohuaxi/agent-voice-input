@@ -84,13 +84,13 @@ public sealed class HudPillForm : Form {
     private static readonly Color RecWaveActiveColor = Color.FromArgb(255, 255, 104, 112);
     private static readonly Color RecWaveQuietColor = Color.FromArgb(255, 232, 92, 102);
     private static readonly Color RecMainColor = Color.FromArgb(248, 250, 252);
-    private static readonly Color RecHintColor = Color.FromArgb(214, 188, 194);
+    private static readonly Color RecHintColor = Color.FromArgb(230, 188, 178, 192);
     private static readonly Color WarnBgColor = Color.FromArgb(72, 38, 12);
     private static readonly Color WarnBorderColor = Color.FromArgb(224, 138, 28);
     private static readonly Color WarnWaveActiveColor = Color.FromArgb(255, 251, 191, 36);
     private static readonly Color WarnWaveQuietColor = Color.FromArgb(220, 251, 191, 36);
     private static readonly Color WarnMainColor = Color.FromArgb(254, 252, 232);
-    private static readonly Color WarnHintColor = Color.FromArgb(253, 224, 71);
+    private static readonly Color WarnHintColor = Color.FromArgb(255, 251, 191, 36);
     private static readonly float[] BellWeight = new float[] { 1.00f, 0.92f, 0.78f, 0.58f, 0.40f };
     private Font _font;
     private bool _ownsFont, _cjkFont;
@@ -366,11 +366,12 @@ public sealed class HudPillForm : Form {
     private Bitmap BuildPillPArgbBitmap(Rectangle wa, out int x, out int y) {
         string iconSeg, mainSeg, hintSeg; bool spBeforeHint;
         VoiceWinShim.SplitHudSegments(_text, out iconSeg, out mainSeg, out hintSeg, out spBeforeHint);
-        int padL = ScalePx(13), padR = ScalePx(14), minW = ScalePx(64);
+        int padL = ScalePx(15), padR = ScalePx(15), minW = ScalePx(64);
         int maxW = Math.Max(minW, wa.Width - ScalePx(24));
 
         float dpiScale = _dpi / 96.0f;
-        float barW = 2.4f * dpiScale, barGap = 2.2f * dpiScale;
+        int textDy = _cjkFont ? -Math.Max(1, (int)Math.Round(0.5f * dpiScale)) : -ScalePx(1);
+        float barW = 2.5f * dpiScale, barGap = 2.5f * dpiScale;
         int waveBoxW = (int)Math.Ceiling(9.0f * barW + 8.0f * barGap);
         string durStr = "", effHint = hintSeg;
         int slotW = 0, hintSlotW = 0, iconBox = 0, gap1 = 0, gap2 = 0, iconGap = 0, hintGap = 0, totalTextW = 0, textH = 0;
@@ -403,6 +404,7 @@ public sealed class HudPillForm : Form {
                 effMain = RecMainColor;
                 effHintCol = RecHintColor;
             }
+            effHint = VoiceWinShim.StripOuterParens(effHint);
             durStr = VoiceWinShim.FormatRecordingDuration(elapsedSec);
             string slotTpl = VoiceWinShim.DurationSlotTemplate(elapsedSec);
             Size actDurSz = TextRenderer.MeasureText(durStr, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
@@ -411,16 +413,16 @@ public sealed class HudPillForm : Form {
             if (effHint.Length > 0) {
                 hintSz = TextRenderer.MeasureText(effHint, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
                 if (isWarn) {
-                    string hintTpl = VoiceWinShim.CountdownHintSlotTemplate((int)remainSec, zhHint);
+                    string hintTpl = VoiceWinShim.StripOuterParens(VoiceWinShim.CountdownHintSlotTemplate((int)remainSec, zhHint));
                     Size tplHintSz = TextRenderer.MeasureText(hintTpl, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
                     hintSlotW = Math.Max(hintSz.Width, tplHintSz.Width);
                 } else {
                     hintSlotW = hintSz.Width;
                 }
             }
-            gap1 = ScalePx(7);
-            gap2 = (effHint.Length > 0) ? ScalePx(6) : 0;
-            totalTextW = waveBoxW + gap1 + slotW + gap2 + hintSlotW;
+            gap1 = ScalePx(9);
+            gap2 = (effHint.Length > 0) ? ScalePx(9) : 0;
+            totalTextW = slotW + gap1 + waveBoxW + gap2 + hintSlotW;
             textH = Math.Max(actDurSz.Height, hintSz.Height);
         } else {
             iconBox = (iconSeg.Length > 0) ? ScalePx(11) : 0;
@@ -436,10 +438,10 @@ public sealed class HudPillForm : Form {
         int rawW = Math.Max(minW, totalTextW + padL + padR);
         bool truncated = rawW > maxW;
         int w = Math.Min(maxW, rawW);
-        int h = Math.Max(ScalePx(31), textH + ScalePx(12));
+        int h = Math.Max(ScalePx(34), textH + ScalePx(14));
         bool isTop = string.Equals((_position ?? "").Trim(), "top", StringComparison.OrdinalIgnoreCase);
         x = wa.Left + (wa.Width - w) / 2;
-        y = isTop ? (wa.Top + ScalePx(36)) : Math.Max(wa.Top + ScalePx(4), wa.Bottom - h - ScalePx(4));
+        y = isTop ? (wa.Top + ScalePx(36)) : Math.Max(wa.Top + ScalePx(4), wa.Bottom - h - ScalePx(28));
 
         Bitmap outBmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
         using (Bitmap rgbBmp = new Bitmap(w, h, PixelFormat.Format32bppRgb))
@@ -450,6 +452,8 @@ public sealed class HudPillForm : Form {
                 int bleed = ScalePx(2);
                 if (_isWaveRecording) {
                     int curX = padL + (truncated ? 0 : Math.Max(0, (availW - totalTextW) / 2));
+                    TextRenderer.DrawText(g, durStr, _font, new Rectangle(curX - bleed, textDy, slotW + bleed * 2, h), effMain, DurDrawFlags);
+                    curX += slotW + gap1;
                     g.SmoothingMode = SmoothingMode.AntiAlias;
                     g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                     float maxBarH = Math.Min(h - 8.0f * dpiScale, 15.0f * dpiScale);
@@ -466,16 +470,14 @@ public sealed class HudPillForm : Form {
                             }
                         }
                     }
-                    curX += waveBoxW + gap1;
-                    TextRenderer.DrawText(g, durStr, _font, new Rectangle(curX - bleed, 0, slotW + bleed * 2, h), effMain, DurDrawFlags);
-                    curX += slotW + gap2;
+                    curX += waveBoxW + gap2;
                     if (effHint.Length > 0) {
                         int remW = w - padR - curX;
                         if (remW > 0) {
                             if (truncated) {
-                                TextRenderer.DrawText(g, effHint, _font, new Rectangle(curX, 0, remW, h), effHintCol, SegDrawFlags | TextFormatFlags.EndEllipsis);
+                                TextRenderer.DrawText(g, effHint, _font, new Rectangle(curX, textDy, remW, h), effHintCol, SegDrawFlags | TextFormatFlags.EndEllipsis);
                             } else {
-                                TextRenderer.DrawText(g, effHint, _font, new Rectangle(curX, 0, hintSlotW + bleed, h), effHintCol, SegDrawFlags);
+                                TextRenderer.DrawText(g, effHint, _font, new Rectangle(curX, textDy, hintSlotW + bleed, h), effHintCol, SegDrawFlags);
                             }
                         }
                     }
@@ -485,10 +487,10 @@ public sealed class HudPillForm : Form {
                         int tx = padL + iconBox + iconGap;
                         string restTxt = mainSeg + ((hintSeg.Length > 0) ? ((spBeforeHint ? " " : "") + hintSeg) : "");
                         if (w - padR - tx > 0 && restTxt.Length > 0) {
-                            TextRenderer.DrawText(g, restTxt, _font, new Rectangle(tx, 0, w - padR - tx, h), effMain, SegDrawFlags | TextFormatFlags.EndEllipsis);
+                            TextRenderer.DrawText(g, restTxt, _font, new Rectangle(tx, textDy, w - padR - tx, h), effMain, SegDrawFlags | TextFormatFlags.EndEllipsis);
                         }
                     } else {
-                        TextRenderer.DrawText(g, _text, _font, new Rectangle(padL, 0, availW, h), effMain, TruncDrawFlags);
+                        TextRenderer.DrawText(g, _text, _font, new Rectangle(padL, textDy, availW, h), effMain, TruncDrawFlags);
                     }
                 } else {
                     int curX = padL + Math.Max(0, (availW - totalTextW) / 2);
@@ -497,11 +499,11 @@ public sealed class HudPillForm : Form {
                         curX += iconBox + iconGap;
                     }
                     if (mainSeg.Length > 0) {
-                        TextRenderer.DrawText(g, mainSeg, _font, new Rectangle(curX, 0, mainSz.Width + bleed, h), effMain, SegDrawFlags);
+                        TextRenderer.DrawText(g, mainSeg, _font, new Rectangle(curX, textDy, mainSz.Width + bleed, h), effMain, SegDrawFlags);
                         curX += mainSz.Width + hintGap;
                     }
                     if (hintSeg.Length > 0) {
-                        TextRenderer.DrawText(g, hintSeg, _font, new Rectangle(curX, 0, hintSz.Width + bleed, h), effHintCol, SegDrawFlags);
+                        TextRenderer.DrawText(g, hintSeg, _font, new Rectangle(curX, textDy, hintSz.Width + bleed, h), effHintCol, SegDrawFlags);
                     }
                 }
                 g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -805,6 +807,15 @@ public static class VoiceWinShim {
         return Math.Max(1, Math.Min(10, (third > 0) ? third : 1));
     }
 
+    public static string StripOuterParens(string s) {
+        if (string.IsNullOrEmpty(s)) return "";
+        string t = s.Trim();
+        if (t.Length >= 2 && t[0] == '(' && t[t.Length - 1] == ')') {
+            return t.Substring(1, t.Length - 2).Trim();
+        }
+        return t;
+    }
+
     public static string FormatCountdownHint(int remainSec, bool zh) {
         int r = (remainSec < 0) ? 0 : remainSec;
         string rs = r.ToString(CultureInfo.InvariantCulture);
@@ -850,16 +861,16 @@ public static class VoiceWinShim {
         if (st == "recording") {
             string hkEn = (_hotkeyLabel == "\u53F3 Ctrl") ? "Right Ctrl" : _hotkeyLabel.Trim();
             txt = zh
-                ? ("\u25CF \u6B63\u5728\u5F55\u97F3\u2026 (" + (_isPtt ? "\u677E\u5F00" : "\u518D\u6309") + _hotkeyLabel + " \u5B8C\u6210)")
+                ? ("\u25CF \u5F55\u97F3\u4E2D\u2026 (" + (_isPtt ? "\u677E\u5F00" : "\u518D\u6309") + _hotkeyLabel + " \u5B8C\u6210)")
                 : ("\u25CF Listening\u2026 (" + (_isPtt ? "release " : "press ") + hkEn + " to finish)");
-            bg = Color.FromArgb(64, 18, 26); ic = Color.FromArgb(255, 104, 112); mc = Color.FromArgb(248, 250, 252); hc = Color.FromArgb(214, 188, 194); bd = Color.FromArgb(196, 66, 80);
+            bg = Color.FromArgb(64, 18, 26); ic = Color.FromArgb(255, 104, 112); mc = Color.FromArgb(248, 250, 252); hc = Color.FromArgb(230, 188, 178, 192); bd = Color.FromArgb(196, 66, 80);
             string trimmedCustom = (customText ?? "").TrimStart();
             waveMode = string.IsNullOrEmpty(trimmedCustom) || trimmedCustom.StartsWith("\u25CF ", StringComparison.Ordinal);
         } else if (st == "recognizing" || st == "processing") {
-            txt = zh ? "\u25D0 \u6B63\u5728\u8BED\u97F3\u8BC6\u522B\u2026" : "\u25D0 Transcribing\u2026";
+            txt = zh ? "\u25D0 \u8BED\u97F3\u8BC6\u522B\u2026" : "\u25D0 Transcribing\u2026";
             bg = Color.FromArgb(16, 40, 72); ic = Color.FromArgb(56, 189, 248); mc = Color.FromArgb(244, 248, 252); hc = Color.FromArgb(176, 198, 222); bd = Color.FromArgb(52, 148, 212); iconKind = "recognizing";
         } else if (st == "refining") {
-            txt = zh ? "\u25C8 \u6B63\u5728\u6574\u7406\u7CBE\u4FEE\u2026" : "\u25C8 Refining\u2026";
+            txt = zh ? "\u25C8 \u6574\u7406\u7CBE\u4FEE\u2026" : "\u25C8 Refining\u2026";
             bg = Color.FromArgb(46, 22, 76); ic = Color.FromArgb(208, 156, 255); mc = Color.FromArgb(248, 245, 255); hc = Color.FromArgb(198, 182, 226); bd = Color.FromArgb(156, 88, 224); iconKind = "refining";
         } else if (st == "done") {
             txt = zh ? "\u2713 \u5DF2\u586B\u5165" : "\u2713 Inserted";
