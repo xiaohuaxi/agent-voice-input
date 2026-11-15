@@ -92,6 +92,9 @@ def _derive_failed_label(snap: SessionSnapshot | None, win: ForegroundWindow) ->
     return ""
 
 
+MAX_ASR_CHUNK_CONCURRENCY: int = 5
+
+
 def _transcribe_wav_chunks(
     wav_bytes: bytes,
     *,
@@ -115,7 +118,7 @@ def _transcribe_wav_chunks(
             return None
         return eff_asr.transcribe(chunk_wav, context=asr_ctx)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(infos))) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_ASR_CHUNK_CONCURRENCY, len(infos))) as pool:
         futs = [pool.submit(_work, c.wav_bytes) for c in infos]
         try:
             for idx, fut in enumerate(futs):

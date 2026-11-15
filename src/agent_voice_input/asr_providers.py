@@ -406,7 +406,11 @@ _STALE_CONN_ERRORS = (
 class _KeepAlivePool:
     """Thread-safe same-origin HTTP/1.1 Keep-Alive connection pool."""
 
-    def __init__(self, *, max_per_origin: int = 2, idle_timeout_sec: float = 45.0) -> None:
+    _MAX_IDLE_PER_ORIGIN = 5
+
+    def __init__(
+        self, *, max_per_origin: int = _MAX_IDLE_PER_ORIGIN, idle_timeout_sec: float = 45.0
+    ) -> None:
         self.max_per_origin = max_per_origin
         self.idle_timeout_sec = idle_timeout_sec
         self._lock = threading.Lock()
@@ -1133,13 +1137,6 @@ class BaseAsrProvider:
             raise self._fail(missing_hint)
         return vendor_item
 
-    def _effective_asr_timeout_sec(self, wav_bytes: bytes | bytearray = b"") -> float:
-        base = float(self.cfg.asr.timeout_sec)
-        audio_sec = max(0.0, (len(wav_bytes) - 44) / 32000.0)
-        if base >= 10.0 and audio_sec > 20.0:
-            return max(base, min(180.0, base + (audio_sec - 20.0) * 0.25))
-        return base
-
     def _send(
         self,
         req: HttpRequest,
@@ -1258,7 +1255,7 @@ class DashScopeAsrProvider(BaseAsrProvider):
             "Content-Type": "application/json",
         }
 
-        eff_timeout = self._effective_asr_timeout_sec(wav_bytes)
+        eff_timeout = float(self.cfg.asr.timeout_sec)
         t0 = self.clock_fn()
         if use_native:
             text = self._call_native_route(
@@ -1602,7 +1599,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
         body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         auth_hdrs = self._auth_headers(app_id, api_key)
 
-        eff_timeout = self._effective_asr_timeout_sec(wav_bytes)
+        eff_timeout = float(self.cfg.asr.timeout_sec)
         t0 = self.clock_fn()
         deadline = t0 + eff_timeout
         slot_errors: list[str] = []
@@ -1891,7 +1888,7 @@ class GeminiAudioProvider(BaseAsrProvider):
             "Content-Type": "application/json",
         }
 
-        eff_timeout = self._effective_asr_timeout_sec(wav_bytes)
+        eff_timeout = float(self.cfg.asr.timeout_sec)
         t0 = self.clock_fn()
         resp = self._send(
             HttpRequest(
@@ -2098,7 +2095,7 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
             )
             headers["Content-Type"] = content_type
 
-        eff_timeout = self._effective_asr_timeout_sec(wav_bytes)
+        eff_timeout = float(self.cfg.asr.timeout_sec)
         t0 = self.clock_fn()
         resp = self._send(
             HttpRequest(
@@ -2245,7 +2242,7 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        eff_timeout = self._effective_asr_timeout_sec(wav_bytes)
+        eff_timeout = float(self.cfg.asr.timeout_sec)
         t0 = self.clock_fn()
         resp = self._send(
             HttpRequest(

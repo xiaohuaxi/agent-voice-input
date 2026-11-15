@@ -19,7 +19,13 @@ if str(_SRC_ROOT) not in sys.path:
 from agent_voice_input.asr_providers import AsrContext, AsrResult, BaseAsrProvider, HttpRequest, HttpResponse  # noqa: E402
 from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
 from agent_voice_input.config import Config, ConfigError, HotkeyConfig, RefinerConfig, _parse_simple_toml, load_config, load_env_files, parse_toml, resolve_credentials  # noqa: E402
-from agent_voice_input.daemon import VoiceInputDaemon, run_pipeline_once, send_control_command  # noqa: E402
+from agent_voice_input.daemon import (  # noqa: E402
+    MAX_ASR_CHUNK_CONCURRENCY,
+    VoiceInputDaemon,
+    _transcribe_wav_chunks,
+    run_pipeline_once,
+    send_control_command,
+)
 from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome, SHIM_SCRIPT, WslPlatform, is_windows_terminal_process  # noqa: E402
 from agent_voice_input.refiner import (  # noqa: E402
     CodexRefiner,
@@ -2017,6 +2023,87 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertIn("，", echo_ref.seen_drafts[0])
             self.assertTrue(res_multi.final_text.startswith("整篇精修："))
             self.assertEqual(list_failed_audios(rt), [])  # successful run never writes to failed/
+
+            # 2b. 5-way parallel chunk transcription: 5 chunks run in a single simultaneous wave; >5 chunks cap at 5 while preserving order
+            import array as _array
+            import wave as _wave
+
+            self.assertEqual(MAX_ASR_CHUNK_CONCURRENCY, 5)
+
+            def _build_distinct_chunks_wav(num_chunks: int) -> bytes:
+                segs: list[int] = []
+                for k in range(num_chunks):
+                    amp = 2000 + k * 600
+                    segs.extend([amp, -amp] * int(1.0 * sr))  # 2.0s voiced segment
+                    if k + 1 < num_chunks:
+                        segs.extend([0] * int(0.5 * sr))  # 0.5s silent pause
+                return pack_pcm16_mono_wav(segs)
+
+            def _chunk_id_from_wav(chunk_bytes: bytes) -> int:
+                with _wave.open(io.BytesIO(chunk_bytes), "rb") as wf:
+                    raw = wf.readframes(wf.getnframes())
+                samples = _array.array("h")
+                samples.frombytes(raw)
+                if sys.byteorder != "little":
+                    samples.byteswap()
+                peak = max((abs(int(x)) for x in samples), default=0)
+                return max(0, int(round((peak - 2000) / 600.0)))
+
+            barrier_5 = threading.Barrier(5, timeout=2.0)
+
+            class _FiveWaveAsr(BaseAsrProvider):
+                provider_name = "dashscope"
+
+                def __init__(self) -> None:
+                    pass
+
+                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                    cid = _chunk_id_from_wav(wav_bytes)
+                    barrier_5.wait()
+                    return AsrResult(f"第{cid + 1}段", "dashscope", "qwen3-asr-flash", 10, False)
+
+            five_res, five_cnt, _ = _transcribe_wav_chunks(
+                _build_distinct_chunks_wav(5),
+                eff_asr=_FiveWaveAsr(),
+                asr_ctx=AsrContext("", "", ""),
+                floor_dbfs=-50.0,
+                max_chunk_sec=3.0,
+            )
+            self.assertEqual(five_cnt, 5)
+            self.assertEqual(five_res.text, "第1段，第2段，第3段，第4段，第5段")
+
+            class _CapFiveAsr(BaseAsrProvider):
+                provider_name = "dashscope"
+
+                def __init__(self) -> None:
+                    self._lk = threading.Lock()
+                    self.active = 0
+                    self.peak_active = 0
+
+                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                    cid = _chunk_id_from_wav(wav_bytes)
+                    with self._lk:
+                        self.active += 1
+                        if self.active > self.peak_active:
+                            self.peak_active = self.active
+                    try:
+                        time.sleep(0.06 if cid < 2 else 0.02)
+                        return AsrResult(f"第{cid + 1}段", "dashscope", "qwen3-asr-flash", 12, False)
+                    finally:
+                        with self._lk:
+                            self.active -= 1
+
+            cap_asr = _CapFiveAsr()
+            seven_res, seven_cnt, _ = _transcribe_wav_chunks(
+                _build_distinct_chunks_wav(7),
+                eff_asr=cap_asr,
+                asr_ctx=AsrContext("", "", ""),
+                floor_dbfs=-50.0,
+                max_chunk_sec=3.0,
+            )
+            self.assertEqual(seven_cnt, 7)
+            self.assertEqual(cap_asr.peak_active, 5)
+            self.assertEqual(seven_res.text, "第1段，第2段，第3段，第4段，第5段，第6段，第7段")
 
             # 3. Daemon ASR failure stashes WAV labeled with cwd basename; subsequent successful recording NEVER deletes it!
             class _BoomThenOkAsr(BaseAsrProvider):

@@ -1103,7 +1103,9 @@ class AsrProvidersTests(unittest.TestCase):
                 self.assertEqual(r_bypass.json()["path"], "/echo")
                 self.assertEqual(proxy_called[0], 1)
 
-            # 7. Pool capacity eviction (max_per_origin=2) & idle expiry close evicted sockets without leaks
+            # 7. Default pool keeps 5 idle warm connections per origin; custom capacity eviction & idle expiry close sockets cleanly
+            self.assertEqual(_KeepAlivePool._MAX_IDLE_PER_ORIGIN, 5)
+            self.assertEqual(_KEEPALIVE_POOL.max_per_origin, 5)
             mini_pool = _KeepAlivePool(max_per_origin=2, idle_timeout_sec=0.05)
             conns = [mini_pool._new_connection("http", "127.0.0.1", port, 2.0) for _ in range(3)]
             try:
@@ -1130,7 +1132,7 @@ class AsrProvidersTests(unittest.TestCase):
             srv_thread.join(timeout=2.0)
             gc.collect()
 
-    def test_long_audio_asr_timeout_adaptive_relaxation(self) -> None:
+    def test_asr_timeout_sec_forwarding_to_http_transport(self) -> None:
         seen_timeouts: list[float] = []
 
         def fake_tx(req: HttpRequest) -> HttpResponse:
@@ -1138,39 +1140,28 @@ class AsrProvidersTests(unittest.TestCase):
             return HttpResponse(
                 200,
                 {"content-type": "application/json"},
-                json.dumps({"text": "长语音转写成功"}, ensure_ascii=False).encode("utf-8"),
+                json.dumps({"text": "语音转写成功"}, ensure_ascii=False).encode("utf-8"),
             )
 
         env = {"OPENAI_API_KEY": "sk-oai-" + ("a" * 16)}
-        short_wav = b"RIFF" + (b"\x00" * (40 + 10 * 32000))   # 10s (<= 20s)
-        long_10m_wav = b"RIFF" + (b"\x00" * (40 + 600 * 32000))  # 600s (10 minutes)
-        huge_wav = b"RIFF" + (b"\x00" * (40 + 900 * 32000))   # 900s (15 minutes -> capped at 180s)
+        chunk_wav = b"RIFF" + (b"\x00" * (40 + 180 * 32000))  # 180s chunk
 
-        # 1. Small unit-test timeout (< 10.0s) is NEVER relaxed even on 10-minute audio
+        # Default AsrConfig.timeout_sec (60.0s) and explicit overrides forward directly to transport
+        cfg_def = Config()
+        cfg_def.asr.provider = "openai"
+        cfg_def.asr.hotwords_file = ""
+        self.assertEqual(cfg_def.asr.timeout_sec, 60.0)
+        prov_def = create_asr_provider(cfg_def, resolve_credentials(cfg_def, env), env=env, transport=fake_tx)
+        prov_def.transcribe(chunk_wav)
+        self.assertEqual(seen_timeouts[-1], 60.0)
+
         cfg_small = Config()
         cfg_small.asr.provider = "openai"
         cfg_small.asr.timeout_sec = 3.0
         cfg_small.asr.hotwords_file = ""
         prov_small = create_asr_provider(cfg_small, resolve_credentials(cfg_small, env), env=env, transport=fake_tx)
-        self.assertEqual(prov_small._effective_asr_timeout_sec(long_10m_wav), 3.0)
-        prov_small.transcribe(long_10m_wav)
+        prov_small.transcribe(chunk_wav)
         self.assertEqual(seen_timeouts[-1], 3.0)
-
-        # 2. Normal timeout (15.0s) keeps exact 15.0s for <= 20s short audio, relaxes to 160.0s for 10m audio, caps at 180.0s
-        cfg_norm = Config()
-        cfg_norm.asr.provider = "openai"
-        cfg_norm.asr.timeout_sec = 15.0
-        cfg_norm.asr.hotwords_file = ""
-        prov_norm = create_asr_provider(cfg_norm, resolve_credentials(cfg_norm, env), env=env, transport=fake_tx)
-        self.assertEqual(prov_norm._effective_asr_timeout_sec(short_wav), 15.0)
-        self.assertAlmostEqual(prov_norm._effective_asr_timeout_sec(long_10m_wav), 160.0)
-        self.assertEqual(prov_norm._effective_asr_timeout_sec(huge_wav), 180.0)
-
-        seen_timeouts.clear()
-        prov_norm.transcribe(short_wav)
-        prov_norm.transcribe(long_10m_wav)
-        self.assertEqual(seen_timeouts[0], 15.0)
-        self.assertAlmostEqual(seen_timeouts[1], 160.0)
 
 
 class SessionCtxTests(unittest.TestCase):
