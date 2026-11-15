@@ -403,12 +403,18 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
             xdg.mkdir(parents=True)
             bin_dir = str(REPO_ROOT / "bin")
             env = {
-                **os.environ,
-                "HOME": str(home),
-                "XDG_RUNTIME_DIR": str(xdg),
-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-                "PYTHONPATH": str(SRC_ROOT),
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("AGENT_VOICE_INPUT_RUNTIME_DIR", "VOICE_INPUT_RUNTIME_DIR")
             }
+            env.update(
+                {
+                    "HOME": str(home),
+                    "XDG_RUNTIME_DIR": str(xdg),
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "PYTHONPATH": str(SRC_ROOT),
+                }
+            )
 
             sid = "a1b2c3d4-5678-4abc-9def-0123456789ab"
             sub_sid = "f0e1d2c3-5678-4abc-9def-0123456789ab"

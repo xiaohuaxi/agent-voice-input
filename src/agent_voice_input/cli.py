@@ -422,7 +422,7 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
     except Exception:
         pass
     warned_shim = False
-    if sys.platform == "darwin":
+    if sys.platform == "darwin" and cfg is not None:
         shim_bin, pre_err = compile_mac_shim(env=env, cfg=cfg, announce=True)
         if shim_bin is None and pre_err:
             warned_shim = True

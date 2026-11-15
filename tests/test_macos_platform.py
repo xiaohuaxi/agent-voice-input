@@ -1247,8 +1247,12 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 raise AssertionError(f"/usr/bin/swiftc stub MUST NOT be invoked when CLT is missing: {cmd}")
 
             err_buf = io.StringIO()
+            orig_isfile = os.path.isfile
             with (
-                mock.patch("agent_voice_input.platform_macos.os.path.isfile", side_effect=lambda p: p == str(fake_xs) or Path(p).is_file()),
+                mock.patch(
+                    "agent_voice_input.platform_macos.os.path.isfile",
+                    side_effect=lambda p: str(p) == str(fake_xs) or (str(p) != "/usr/bin/xcode-select" and orig_isfile(p)),
+                ),
                 mock.patch("agent_voice_input.platform_macos.os.access", return_value=True),
                 mock.patch("agent_voice_input.platform_macos.shutil.which", side_effect=lambda n, path=None: str(fake_xs) if n == "xcode-select" else None),
                 mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=spy_run),

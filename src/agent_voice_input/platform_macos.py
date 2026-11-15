@@ -235,7 +235,7 @@ def check_macos_clt_ready(env: Mapping[str, str] | None = None) -> tuple[bool, s
             timeout=3,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except Exception as exc:
         return False, f"xcode-select check failed ({exc}); install Xcode Command Line Tools via 'xcode-select --install'"
     dev_path = (proc.stdout or "").strip()
     if proc.returncode != 0 or not dev_path or not os.path.isdir(dev_path):
