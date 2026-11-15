@@ -13,7 +13,7 @@ Instead of treating terminal dictation like generic chat input, `agent-voice-inp
 ## How It Works
 
 1. **Active Session Context**: Locates the foreground agent session—including the active pane inside `tmux` without editing `~/.tmux.conf` (via optional terminal/pane title tags, runtime session registry, Ghostty split `tty`/`cwd` matching on macOS, or `/proc` / `ps` root-session scanning while ignoring background subagents and sibling panes)—and incrementally extracts recent dialogue plus `git status` filenames as context.
-2. **Stage 1 — Speech Recognition**: Applies a local silence gate (`-50 dBFS`) and RMS loudness normalization (`-20 dBFS`), then transcribes audio via built-in cloud or local-compatible providers (`dashscope`, `doubao`, `openrouter` dual-protocol STT & multimodal audio, `gemini`, `openai`, `groq`, `siliconflow`, or `openai-compatible`).
+2. **Stage 1 — Speech Recognition**: Applies a local silence gate (`-50 dBFS`) and RMS loudness normalization (`-20 dBFS`), automatically splits recordings longer than 3 minutes (`180s`) at natural silent pauses for concurrent transcription, stashes failed recordings under `failed/` for `retry` recovery, and transcribes audio via built-in cloud or local-compatible providers (`dashscope`, `doubao`, `openrouter` dual-protocol STT & multimodal audio, `gemini`, `openai`, `groq`, `siliconflow`, or `openai-compatible`).
 3. **Stage 2 — Lightweight Context Refinement**: Cleans up technical terms, identifier casing, and explicit spoken self-corrections against the extracted session context. Defaults to local Codex CLI (`codex` with `gpt-6-luna`), and also supports `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, or `off` (automatically skipped when Stage 1 already performed single-hop multimodal refinement).
 4. **Focus-Safe Paste**: Shows recording/recognition/refinement stages in a non-activating bottom HUD pill (configurable to `"top"`; Windows & macOS, automatically matching Chinese or English desktop UI language), starts hotkey recordings only in terminal windows by default, locks onto the origin terminal window/split when recording begins, never auto-presses Enter, and falls back to clipboard-only if focus drifted elsewhere.
 5. **Zero Extra Python Dependencies**: Uses only the Python 3.10+ standard library plus host `ffmpeg` (built-in `powershell.exe` on WSL2; cached native `mac_shim.swift` helper via `/usr/bin/swiftc` on macOS).
@@ -73,6 +73,7 @@ agent-voice-input start
 agent-voice-input status
 agent-voice-input toggle
 agent-voice-input once --duration 4 --dry-run
+agent-voice-input retry --list
 agent-voice-input stop
 ```
 
@@ -198,7 +199,7 @@ model = "llama-3.3-70b-versatile"
 
 ## CLI Flags & Environment Overrides
 
-Common runtime flags accepted across `daemon`, `start`, `doctor`, `once`, `status`, `toggle`, `stop`, and `key-test`:
+Common runtime flags accepted across `daemon`, `start`, `doctor`, `once`, `retry`, `status`, `toggle`, `stop`, and `key-test`:
 
 | CLI Flag | Env Override (`AGENT_VOICE_INPUT_*`) | Description |
 | :--- | :--- | :--- |

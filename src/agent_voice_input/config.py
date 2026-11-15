@@ -218,7 +218,7 @@ class AsrConfig:
     base_url: str = ""
     api_key_env: str = ""
     hotwords_file: str = "~/.config/agent-voice-input/hotwords.txt"
-    timeout_sec: float = 15.0
+    timeout_sec: float = 60.0
 
     def canonical_provider(self) -> str:
         return self.provider.strip().lower()
@@ -244,7 +244,7 @@ class RefinerConfig:
     base_url: str = ""
     api_key_env: str = ""
     max_turns_per_thread: int = 20
-    timeout_sec: float = 12.0
+    timeout_sec: float = 90.0
     force_on_single_hop: bool = False
 
     def __post_init__(self) -> None:

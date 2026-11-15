@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import inspect, json, os, signal, socket, sys, threading, time
+import concurrent.futures, inspect, json, os, signal, socket, sys, threading, time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from . import __version__
 from .asr_providers import AsrResult, BaseAsrProvider, create_asr_provider
-from .audio_proc import AudioGateResult, process_wav
+from .audio_proc import AudioGateResult, DEFAULT_MAX_CHUNK_SEC, inspect_wav_chunks, process_wav, save_failed_audio
 from .config import Config, ProviderCredentials, ensure_secure_dir, get_runtime_dir, redact_secrets, resolve_credentials, select_asr_provider
 from .platform_macos import MacOSPlatform, is_macos_terminal_window
 from .platform_wsl import ForegroundWindow, PasteOutcome, WslPlatform, is_windows_terminal_process
@@ -21,6 +21,7 @@ class PipelineResult:
     ok: bool; seq_id: int; final_text: str = ""; skipped_reason: str = ""; audio_source: str = ""
     switched_fallback: bool = False; gate: AudioGateResult | None = None; session: SessionSnapshot | None = None
     asr: AsrResult | None = None; refined: RefinerResult | None = None; paste: PasteOutcome | None = None; error: str = ""
+    asr_chunks: int = 1; asr_chunk_secs: tuple[float, ...] = (); saved_audio: str = ""
 
 
 def create_platform(cfg: Config, *, env: Mapping[str, str] | None = None) -> WslPlatform | MacOSPlatform:
@@ -61,6 +62,79 @@ def _will_run_stage2_refiner(cfg: Config, refiner: BaseRefiner, asr_res: AsrResu
     return True
 
 
+def _join_chunk_texts(parts: Sequence[str]) -> str:
+    out: list[str] = []
+    for raw in parts:
+        s = raw.strip()
+        if not s:
+            continue
+        if not out:
+            out.append(s)
+            continue
+        prev = out[-1]
+        if prev[-1].isascii() and prev[-1].isalnum() and s[0].isascii() and s[0].isalnum():
+            out.append(" " + s)
+        elif prev[-1] in "，。！？；：,.!?;:\n":
+            out.append(s)
+        else:
+            out.append("，" + s if not prev[-1].isascii() else " " + s)
+    return "".join(out).strip()
+
+
+def _derive_failed_label(snap: SessionSnapshot | None, win: ForegroundWindow) -> str:
+    for cwd_cand in ((snap.match.cwd if snap else ""), win.cwd):
+        if cwd_cand and cwd_cand.strip():
+            name = Path(cwd_cand.strip().rstrip("/\\")).name
+            if name:
+                return name
+    if snap and snap.match.cli and snap.match.session_id:
+        return f"{snap.match.cli}-{snap.match.session_id[:8]}"
+    return ""
+
+
+def _transcribe_wav_chunks(
+    wav_bytes: bytes,
+    *,
+    eff_asr: BaseAsrProvider,
+    asr_ctx: Any,
+    floor_dbfs: float,
+    max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
+    seq_id: int = 1,
+    is_current_seq: Callable[[int], bool] | None = None,
+) -> tuple[AsrResult, int, tuple[float, ...]]:
+    infos = inspect_wav_chunks(wav_bytes, max_chunk_sec=max_chunk_sec, floor_dbfs=floor_dbfs)
+    if len(infos) <= 1:
+        return eff_asr.transcribe(wav_bytes, context=asr_ctx), 1, ()
+
+    chunk_secs = tuple(round(c.duration_sec, 2) for c in infos)
+    t0 = time.monotonic()
+    results: list[AsrResult | None] = [None] * len(infos)
+
+    def _work(chunk_wav: bytes) -> AsrResult | None:
+        if is_current_seq is not None and not is_current_seq(seq_id):
+            return None
+        return eff_asr.transcribe(chunk_wav, context=asr_ctx)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(infos))) as pool:
+        futs = [pool.submit(_work, c.wav_bytes) for c in infos]
+        try:
+            for idx, fut in enumerate(futs):
+                results[idx] = fut.result()
+        except Exception:
+            for f in futs:
+                f.cancel()
+            raise
+
+    non_null = [r for r in results if r is not None]
+    merged_text = _join_chunk_texts([r.text for r in non_null if r.text.strip()])
+    elapsed_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+    first = non_null[0] if non_null else None
+    prov = first.provider if first else getattr(eff_asr, "provider_name", "")
+    model = first.model if first else ""
+    single_hop = bool(non_null) and all(r.is_single_hop_refined for r in non_null)
+    return AsrResult(text=merged_text, provider=prov, model=model, latency_ms=elapsed_ms, is_single_hop_refined=single_hop), len(infos), chunk_secs
+
+
 def run_pipeline_once(
     raw_wav: bytes | str | Path, *, cfg: Config, creds: ProviderCredentials | None = None,
     tracker: SessionTracker | None = None, asr_provider: BaseAsrProvider | None = None,
@@ -69,6 +143,8 @@ def run_pipeline_once(
     audio_source: str = "file", seq_id: int = 1, dry_run: bool = False,
     is_current_seq: Callable[[int], bool] | None = None,
     on_stage: Callable[[str], None] | None = None,
+    runtime_dir: Path | None = None,
+    max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
     env: Mapping[str, str] | None = None,
 ) -> PipelineResult:
     eff_env = os.environ if env is None else env
@@ -77,6 +153,19 @@ def run_pipeline_once(
     eff_asr = asr_provider or create_asr_provider(cfg, eff_creds, env=eff_env)
     owns_refiner = refiner is None
     eff_refiner = refiner or create_refiner(cfg, eff_creds, env=eff_env)
+    can_save_failed = runtime_dir is not None and audio_source not in ("file", "selftest_wav", "retry")
+
+    def _stash_failed(gate_res: AudioGateResult, snap_res: SessionSnapshot | None, win_res: ForegroundWindow) -> str:
+        if not can_save_failed or runtime_dir is None or not gate_res.wav_bytes:
+            return ""
+        saved = save_failed_audio(
+            gate_res.wav_bytes,
+            runtime_dir,
+            duration_sec=gate_res.duration_sec,
+            label=_derive_failed_label(snap_res, win_res),
+        )
+        return str(saved) if saved is not None else ""
+
     try:
         if isinstance(raw_wav, (bytes, bytearray)) and len(raw_wav) == 0:
             sw = bool(platform and platform.switch_to_fallback_audio()) if audio_source in ("pulse", "winmm") else False
@@ -86,30 +175,54 @@ def run_pipeline_once(
             sw = bool(gate.all_zero and gate.reason == "silence" and audio_source == "pulse" and platform and platform.switch_to_fallback_audio())
             return PipelineResult(False, seq_id, skipped_reason=gate.reason, audio_source=audio_source, switched_fallback=sw, gate=gate)
         win = origin_window or (platform.get_foreground_window() if platform else ForegroundWindow())
-        snap = (
-            eff_tracker.sync_session(
-                window_title=win.title,
-                window_tty=win.tty,
-                window_cwd=win.cwd,
-                window_pid=win.pid,
+        snap: SessionSnapshot | None = None
+        try:
+            snap = (
+                eff_tracker.sync_session(
+                    window_title=win.title,
+                    window_tty=win.tty,
+                    window_cwd=win.cwd,
+                    window_pid=win.pid,
+                )
+                if window_title_override is None
+                else eff_tracker.sync_session(window_title=window_title_override)
             )
-            if window_title_override is None
-            else eff_tracker.sync_session(window_title=window_title_override)
-        )
-        asr_ctx = eff_tracker.build_asr_context(snap)
-        asr_res = eff_asr.transcribe(gate.wav_bytes, context=asr_ctx)
-        if not asr_res.text.strip():
-            return PipelineResult(False, seq_id, skipped_reason="empty_asr", audio_source=audio_source, gate=gate, session=snap, asr=asr_res)
-        if is_current_seq is not None and not is_current_seq(seq_id):
-            return PipelineResult(False, seq_id, final_text=asr_res.text.strip(), skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res)
-        if _will_run_stage2_refiner(cfg, eff_refiner, asr_res) and on_stage is not None:
-            on_stage("refining")
-        ref_res = eff_refiner.refine(asr_res, session_key=snap.session_key if snap else "", tracker=eff_tracker, fallback_context=asr_ctx.dialog_text)
-        final_text = ref_res.text.strip() or asr_res.text.strip()
-        if is_current_seq is not None and not is_current_seq(seq_id):
-            return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res)
-        paste_out = None if (dry_run or platform is None) else _deliver_with_origin(platform, final_text, seq_id=seq_id, origin_window=win)
-        return PipelineResult(True, seq_id, final_text=final_text, audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, paste=paste_out)
+            asr_ctx = eff_tracker.build_asr_context(snap)
+            asr_res, chunk_count, chunk_secs = _transcribe_wav_chunks(
+                gate.wav_bytes,
+                eff_asr=eff_asr,
+                asr_ctx=asr_ctx,
+                floor_dbfs=cfg.audio.floor_dbfs,
+                max_chunk_sec=max_chunk_sec,
+                seq_id=seq_id,
+                is_current_seq=is_current_seq,
+            )
+            if not asr_res.text.strip():
+                if is_current_seq is not None and not is_current_seq(seq_id):
+                    saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
+                    return PipelineResult(False, seq_id, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+                saved_p = _stash_failed(gate, snap, win)
+                return PipelineResult(False, seq_id, skipped_reason="empty_asr", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+            if is_current_seq is not None and not is_current_seq(seq_id):
+                saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
+                return PipelineResult(False, seq_id, final_text=asr_res.text.strip(), skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+            if _will_run_stage2_refiner(cfg, eff_refiner, asr_res) and on_stage is not None:
+                on_stage("refining")
+            ref_res = eff_refiner.refine(asr_res, session_key=snap.session_key if snap else "", tracker=eff_tracker, fallback_context=asr_ctx.dialog_text)
+            final_text = ref_res.text.strip() or asr_res.text.strip()
+            if is_current_seq is not None and not is_current_seq(seq_id):
+                saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
+                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+            paste_out = None if (dry_run or platform is None) else _deliver_with_origin(platform, final_text, seq_id=seq_id, origin_window=win)
+            saved_p = _stash_failed(gate, snap, win) if (paste_out is not None and not paste_out.pasted and not paste_out.clipboard) else ""
+            return PipelineResult(True, seq_id, final_text=final_text, audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, paste=paste_out, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+        except Exception as exc:
+            if saved_p := _stash_failed(gate, snap, win):
+                try:
+                    setattr(exc, "_saved_audio_path", saved_p)
+                except Exception:
+                    pass
+            raise
     finally:
         if owns_refiner:
             eff_refiner.close()
@@ -176,6 +289,12 @@ class VoiceInputDaemon:
 
     def _build_summary(self, seq_id: int, res: PipelineResult, *, dry_run: bool = False) -> dict[str, Any]:
         summary: dict[str, Any] = {"seq_id": seq_id, "ok": res.ok, "skipped_reason": res.skipped_reason, "audio_source": res.audio_source, "switched_fallback": res.switched_fallback, "session_key": res.session.session_key if res.session else "", "asr_provider": res.asr.provider if res.asr else "", "refiner_fallback": res.refined.used_fallback if res.refined else "", "pasted": res.paste.pasted if res.paste else False, "paste_reason": res.paste.reason if res.paste else ("dry_run" if dry_run and res.ok else ""), "raw_audio_sec": round(res.gate.duration_sec, 3) if res.gate else 0.0, "voiced_audio_sec": round(res.gate.voiced_sec, 3) if res.gate else 0.0, "asr_ms": res.asr.latency_ms if res.asr else 0, "refine_ms": res.refined.latency_ms if res.refined else 0, "asr_chars": len(res.asr.text.strip()) if res.asr else 0, "final_chars": len(res.final_text)}
+        if res.asr_chunks > 1:
+            summary["asr_chunks"] = res.asr_chunks
+            if res.asr_chunk_secs:
+                summary["asr_chunk_secs"] = list(res.asr_chunk_secs)
+        if res.saved_audio:
+            summary["saved_audio"] = res.saved_audio
         if dry_run:
             summary["dry_run"] = True
         if not res.ok and (audio_err := str(getattr(self.platform, "last_audio_error", "") or "")):
@@ -281,10 +400,16 @@ class VoiceInputDaemon:
                 origin_window=origin_win, audio_source=src_used, seq_id=seq_id, dry_run=no_paste,
                 is_current_seq=self.is_current_seq,
                 on_stage=lambda st: self._on_pipeline_stage(seq_id, st, silent_hud),
+                runtime_dir=self.runtime_dir,
                 env=self.env,
             )
             if res.ok:
-                hud_st = "copied" if (res.paste and not res.paste.pasted and res.paste.clipboard) else "done"
+                if res.paste and not res.paste.pasted and not res.paste.clipboard:
+                    hud_st, beep_k = "error", "error"
+                elif res.paste and not res.paste.pasted and res.paste.clipboard:
+                    hud_st = "copied"
+                else:
+                    hud_st = "done"
             elif res.skipped_reason in ("too_short", "silence", "empty_audio", "empty_asr"):
                 hud_st, beep_k = "empty", "error"
             elif res.skipped_reason != "superseded":
@@ -293,6 +418,8 @@ class VoiceInputDaemon:
         except Exception as exc:
             hud_st, beep_k = "error", "error"
             summary = {"seq_id": seq_id, "ok": False, "error": self._redact(exc)}
+            if saved_p := str(getattr(exc, "_saved_audio_path", "") or ""):
+                summary["saved_audio"] = saved_p
         if not self.is_current_seq(seq_id):
             with self._lock:
                 if seq_id >= int(self.last_result.get("seq_id") or 0):

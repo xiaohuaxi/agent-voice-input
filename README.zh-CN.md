@@ -13,7 +13,7 @@
 ## 核心思路
 
 1. **活跃会话上下文抽取**：自动定位前台终端中的主 Agent 会话，原生支持 `tmux` 分屏焦点窗格识别而无需修改 `~/.tmux.conf`（支持终端/窗格标题标签、运行时会话注册表、macOS Ghostty 分屏 `tty`/`cwd` 直连匹配，以及 Linux `/proc` / macOS `ps` 根会话扫描，严格排除后台 subagent 与相邻分屏干扰），增量提取近期对话与 `git status` 文件名作为上下文参考。
-2. **一阶段语音识别（ASR）**：先在本地做 `-50 dBFS` 静音门控与 `-20 dBFS` 响度归一化，再调用内置云端或本地兼容渠道（支持 `dashscope`、`doubao`、`openrouter` 双协议 STT 与多模态音频、`gemini`、`openai`、`groq`、`siliconflow` 或 `openai-compatible`）。
+2. **一阶段语音识别（ASR）**：先在本地做 `-50 dBFS` 静音门控与 `-20 dBFS` 响度归一化（180s 以内整段直发，超过 3 分钟的长语音自动挑自然停顿处切分后小并发转写；若识别或上屏失败，自动将音频暂存于运行目录 `failed/` 供 `retry` 恢复），再调用内置云端或本地兼容渠道（支持 `dashscope`、`doubao`、`openrouter` 双协议 STT 与多模态音频、`gemini`、`openai`、`groq`、`siliconflow` 或 `openai-compatible`）。
 3. **二阶段轻量语境精修**：结合抽取出的会话上下文修正同音标识符、大小写与明确口语改口。默认通过本地 Codex CLI（`codex` + `gpt-6-luna`）完成整理，也支持直接切换为 `dashscope`、`volcengine`、`openrouter`、`gemini`、`openai`、`groq`、`siliconflow`、`openai-compatible` 或关闭（`off`；当一阶段已完成多模态单跳整理时默认自动跳过二阶段）。
 4. **焦点安全粘贴**：Windows 与 macOS 均提供不抢焦点的底部悬浮胶囊提示（可配 `"top"` 置顶；录音、识别、精修阶段，默认随桌面 UI 语言自动切换中英文提示）；默认仅在允许的终端窗口前台时响应新热键录音，开始录音时锁定原终端窗口/分屏，上屏仅粘贴不自动按回车，中途切走焦点则仅写入剪贴板防串窗。
 5. **零额外 Python 依赖**：仅使用 Python 3.10+ 标准库与宿主机 `ffmpeg`（WSL2 复用系统自带 `powershell.exe`，macOS 首次启动使用 `/usr/bin/swiftc` 幂等编译缓存原生辅助程序 `mac_shim.swift`），无需额外安装第三方 Python 包。
@@ -73,6 +73,7 @@ agent-voice-input start
 agent-voice-input status
 agent-voice-input toggle
 agent-voice-input once --duration 4 --dry-run
+agent-voice-input retry --list
 agent-voice-input stop
 ```
 
@@ -198,7 +199,7 @@ model = "llama-3.3-70b-versatile"
 
 ## 命令行参数与环境变量覆盖
 
-`daemon`、`start`、`doctor`、`once`、`status`、`toggle`、`stop`、`key-test` 均支持以下覆盖参数：
+`daemon`、`start`、`doctor`、`once`、`retry`、`status`、`toggle`、`stop`、`key-test` 均支持以下覆盖参数：
 
 | CLI 参数 | 环境变量覆盖（`AGENT_VOICE_INPUT_*`） | 说明 |
 | :--- | :--- | :--- |

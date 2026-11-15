@@ -10,19 +10,30 @@ import io
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from typing import Sequence
 import wave
 
-from .config import AudioConfig
+from .config import AudioConfig, ensure_secure_dir
 
 TARGET_SAMPLE_RATE = 16000
 TARGET_CHANNELS = 1
 TARGET_SAMPLE_WIDTH = 2  # 16-bit signed little-endian PCM
 PEAK_LIMIT_RATIO = 0.99
 PEAK_LIMIT_INT16 = int(round(PEAK_LIMIT_RATIO * 32767))  # 32440
+
+DEFAULT_MAX_CHUNK_SEC = 180.0
+DEFAULT_SEARCH_WINDOW_SEC = 45.0
+_SPLIT_FRAME_SAMPLES = 320  # 20 ms @ 16 kHz (50 fps)
+
+FAILED_AUDIO_MAX_FILES = 10
+FAILED_AUDIO_MAX_AGE_SEC = 24 * 3600.0
+_FAILED_LABEL_CLEAN_RE = re.compile(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+")
 
 
 class AudioError(RuntimeError):
@@ -128,7 +139,7 @@ def _decode_pcm16_via_ffmpeg(
     raw_bytes: bytes | None,
     *,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
-    timeout_sec: float = 15.0,
+    timeout_sec: float = 30.0,
 ) -> bytes:
     exe = resolve_ffmpeg_bin(ffmpeg_bin)
     input_spec = str(source_path.resolve()) if source_path is not None else "pipe:0"
@@ -179,7 +190,7 @@ def decode_to_16k_mono_pcm(
     wav_input: bytes | bytearray | memoryview | str | Path,
     *,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
-    timeout_sec: float = 15.0,
+    timeout_sec: float = 30.0,
 ) -> bytes:
     """Decode WAV bytes or an audio file path into raw 16 kHz mono s16le PCM bytes."""
     source_path: Path | None = None
@@ -213,7 +224,7 @@ def ensure_16k_mono_s16_wav(
     wav_input: bytes | bytearray | memoryview | str | Path,
     *,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
-    timeout_sec: float = 15.0,
+    timeout_sec: float = 30.0,
 ) -> bytes:
     """Return canonical 16 kHz 16-bit mono PCM WAV bytes without level scaling."""
     pcm = decode_to_16k_mono_pcm(wav_input, ffmpeg_bin=ffmpeg_bin, timeout_sec=timeout_sec)
@@ -230,7 +241,7 @@ def process_wav(
     min_duration_sec: float | None = None,
     min_voiced_sec: float | None = None,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
-    timeout_sec: float = 15.0,
+    timeout_sec: float = 30.0,
 ) -> AudioGateResult:
     """Gate silence/short clips and normalize voiced RMS to ``target_dbfs`` (-20 dBFS)."""
     cfg = audio_cfg or AudioConfig()
@@ -311,3 +322,343 @@ def process_wav(
         gain_db=gain_db,
         all_zero=False,
     )
+
+
+@dataclass(frozen=True)
+class WavChunkInfo:
+    index: int
+    start_sec: float
+    end_sec: float
+    duration_sec: float
+    cut_reason: str  # "single" | "pause_300ms" | "pause_100ms" | "valley" | "tail"
+    cut_dbfs: float
+    silence_dbfs: float
+    wav_bytes: bytes
+
+
+def _pick_cut_frame(
+    frame_db: Sequence[float],
+    win_start: int,
+    win_end: int,
+    silence_db: float,
+) -> tuple[int, str, float]:
+    """Pick the cleanest pause frame inside ``[win_start, win_end)`` (300ms -> 100ms -> energy valley)."""
+    silent_runs: list[tuple[int, int]] = []
+    run_s = -1
+    for i in range(win_start, win_end):
+        if frame_db[i] <= silence_db:
+            if run_s < 0:
+                run_s = i
+        elif run_s >= 0:
+            silent_runs.append((run_s, i))
+            run_s = -1
+    if run_s >= 0:
+        silent_runs.append((run_s, win_end))
+
+    for min_run, reason in ((15, "pause_300ms"), (5, "pause_100ms")):
+        cands = [seg for seg in silent_runs if (seg[1] - seg[0]) >= min_run]
+        if cands:
+            # Once a pause is >=700ms (35 frames, >=350ms silence on each side), prefer later sentence stops near win_end
+            best_s, best_e = max(cands, key=lambda seg: (min(seg[1] - seg[0], 35), seg[1]))
+            mid = max(win_start, min(win_end, (best_s + best_e) // 2))
+            avg_db = sum(frame_db[best_s:best_e]) / max(1, best_e - best_s)
+            return mid, reason, avg_db
+
+    # Continuous rapid speech fallback: 160 ms (8-frame) minimum-energy valley across the full search window
+    span = win_end - win_start
+    if span <= 0:
+        return win_end, "valley", frame_db[min(win_end, len(frame_db) - 1)]
+    w = min(8, span)
+    cur_sum = sum(frame_db[win_start : win_start + w])
+    best_sum, best_idx = cur_sum, win_start
+    for idx in range(win_start + 1, win_end - w + 1):
+        cur_sum += frame_db[idx + w - 1] - frame_db[idx - 1]
+        if cur_sum <= best_sum:
+            best_sum, best_idx = cur_sum, idx
+    mid = max(win_start, min(win_end, best_idx + w // 2))
+    return mid, "valley", best_sum / float(w)
+
+
+def inspect_wav_chunks(
+    wav_input: bytes | bytearray | memoryview | str | Path,
+    *,
+    max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
+    search_window_sec: float = DEFAULT_SEARCH_WINDOW_SEC,
+    floor_dbfs: float = -50.0,
+) -> list[WavChunkInfo]:
+    """Split long 16 kHz mono WAV audio at natural pauses and return full diagnostic metadata + WAV bytes."""
+    raw_bytes = bytes(wav_input) if isinstance(wav_input, (bytes, bytearray, memoryview)) else None
+    fast_pcm = _try_extract_fast_16k_mono_pcm(raw_bytes) if raw_bytes is not None else None
+    pcm_bytes = fast_pcm if fast_pcm is not None else decode_to_16k_mono_pcm(wav_input)
+    if not pcm_bytes:
+        return []
+
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes)
+    if sys.byteorder != "little":
+        samples.byteswap()
+
+    total_samples = len(samples)
+    total_sec = total_samples / float(TARGET_SAMPLE_RATE)
+    max_samples = max(_SPLIT_FRAME_SAMPLES * 5, int(round(max_chunk_sec * TARGET_SAMPLE_RATE)))
+    if total_samples <= max_samples:
+        single_wav = (
+            raw_bytes
+            if (raw_bytes is not None and fast_pcm is not None)
+            else pack_pcm16_mono_wav(samples, sample_rate=TARGET_SAMPLE_RATE)
+        )
+        return [
+            WavChunkInfo(
+                index=0,
+                start_sec=0.0,
+                end_sec=total_sec,
+                duration_sec=total_sec,
+                cut_reason="single",
+                cut_dbfs=floor_dbfs,
+                silence_dbfs=floor_dbfs,
+                wav_bytes=single_wav,
+            )
+        ]
+
+    fs = _SPLIT_FRAME_SAMPLES
+    full_scale_sq = 32768.0 * 32768.0
+    frame_db: list[float] = []
+    for off in range(0, total_samples, fs):
+        blk = samples[off : off + fs]
+        if not blk:
+            break
+        msq = sum(s * s for s in blk) / (len(blk) * full_scale_sq)
+        frame_db.append(10.0 * math.log10(msq) if msq > 1e-12 else -120.0)
+
+    n_frames = len(frame_db)
+    sorted_db = sorted(frame_db)
+    p08_db = sorted_db[int(0.08 * (n_frames - 1))]
+    p85_db = sorted_db[int(0.85 * (n_frames - 1))]
+    upper_cap = min(-26.0, max(floor_dbfs, p85_db - 8.0))
+    silence_db = min(upper_cap, max(floor_dbfs, p08_db + 6.0))
+
+    max_frames = max(5, max_samples // fs)
+    lookback_frames = min(max(1, int(round(search_window_sec * 50.0))), max(1, int(max_frames * 0.35)))
+    min_tail_frames = min(250, max(5, max_frames // 6))
+
+    ranges: list[tuple[int, int, str, float]] = []
+    cur = 0
+    while cur < n_frames:
+        rem = n_frames - cur
+        if rem <= max_frames:
+            tail_db = frame_db[-1] if frame_db else silence_db
+            ranges.append((cur, n_frames, "tail", tail_db))
+            break
+        eff_min_tail = min(min_tail_frames, rem // 2)
+        win_end = min(cur + max_frames, n_frames - eff_min_tail)
+        win_start = max(cur + 1, win_end - lookback_frames)
+        cut, reason, cut_db = _pick_cut_frame(frame_db, win_start, win_end, silence_db)
+        if cut <= cur:
+            cut = win_end
+        ranges.append((cur, cut, reason, cut_db))
+        cur = cut
+
+    out_infos: list[WavChunkInfo] = []
+    for idx, (f_start, f_end, reason, cut_db) in enumerate(ranges):
+        s_idx = f_start * fs
+        e_idx = total_samples if idx == len(ranges) - 1 else min(total_samples, f_end * fs)
+        if e_idx > s_idx:
+            s_sec = s_idx / float(TARGET_SAMPLE_RATE)
+            e_sec = e_idx / float(TARGET_SAMPLE_RATE)
+            out_infos.append(
+                WavChunkInfo(
+                    index=len(out_infos),
+                    start_sec=s_sec,
+                    end_sec=e_sec,
+                    duration_sec=e_sec - s_sec,
+                    cut_reason=reason,
+                    cut_dbfs=cut_db,
+                    silence_dbfs=silence_db,
+                    wav_bytes=pack_pcm16_mono_wav(samples[s_idx:e_idx], sample_rate=TARGET_SAMPLE_RATE),
+                )
+            )
+    return out_infos
+
+
+def split_wav_chunks(
+    wav_input: bytes | bytearray | memoryview | str | Path,
+    *,
+    max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
+    search_window_sec: float = DEFAULT_SEARCH_WINDOW_SEC,
+    floor_dbfs: float = -50.0,
+) -> list[bytes]:
+    """Split long 16 kHz mono WAV audio at natural silent pauses so every chunk is <= ``max_chunk_sec``."""
+    return [
+        c.wav_bytes
+        for c in inspect_wav_chunks(
+            wav_input,
+            max_chunk_sec=max_chunk_sec,
+            search_window_sec=search_window_sec,
+            floor_dbfs=floor_dbfs,
+        )
+    ]
+
+
+def get_failed_audio_dir(runtime_dir: Path, *, create: bool = False) -> Path:
+    if create:
+        base = ensure_secure_dir(Path(runtime_dir))
+        return ensure_secure_dir(base / "failed")
+    return Path(runtime_dir) / "failed"
+
+
+def _sanitize_failed_label(raw: str) -> str:
+    cleaned = _FAILED_LABEL_CLEAN_RE.sub("-", (raw or "").strip()).strip("-_")
+    return cleaned[:32]
+
+
+def prune_failed_audio_dir(
+    failed_dir: Path,
+    *,
+    now_ts: float | None = None,
+    max_files: int = FAILED_AUDIO_MAX_FILES,
+    max_age_sec: float = FAILED_AUDIO_MAX_AGE_SEC,
+) -> None:
+    if not failed_dir.is_dir() or failed_dir.is_symlink():
+        return
+    now = time.time() if now_ts is None else now_ts
+    alive: list[tuple[float, str, Path]] = []
+    try:
+        entries = list(failed_dir.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                continue
+            st = entry.stat()
+        except OSError:
+            continue
+        if entry.name.startswith("."):
+            if entry.name.endswith(".tmp") and (now - st.st_mtime) > 600.0:
+                try:
+                    entry.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            continue
+        if not entry.name.lower().endswith(".wav"):
+            continue
+        if max_age_sec > 0 and (now - st.st_mtime) > max_age_sec:
+            try:
+                entry.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        alive.append((st.st_mtime, entry.name, entry))
+
+    if max_files >= 0 and len(alive) > max_files:
+        alive.sort(key=lambda item: (item[0], item[1]))
+        for _, _, old_path in alive[: len(alive) - max_files]:
+            try:
+                old_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def save_failed_audio(
+    wav_bytes: bytes,
+    runtime_dir: Path,
+    *,
+    duration_sec: float = 0.0,
+    label: str = "",
+    now_ts: float | None = None,
+    max_files: int = FAILED_AUDIO_MAX_FILES,
+    max_age_sec: float = FAILED_AUDIO_MAX_AGE_SEC,
+) -> Path | None:
+    """Atomically persist a failed normalized WAV under ``<runtime_dir>/failed/`` (0600, ring-pruned)."""
+    if not wav_bytes:
+        return None
+    try:
+        fdir = get_failed_audio_dir(runtime_dir, create=True)
+        ts = time.time() if now_ts is None else now_ts
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(ts))
+        dur_tag = f"{max(1, int(round(duration_sec)))}s" if duration_sec > 0 else "wav"
+        clean_lbl = _sanitize_failed_label(label)
+        stem = f"{stamp}_{dur_tag}_{clean_lbl}" if clean_lbl else f"{stamp}_{dur_tag}"
+        tmp = fdir / f".{stem}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(wav_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            if now_ts is not None:
+                os.utime(tmp, (ts, ts))
+            target: Path | None = None
+            for suffix_idx in range(1, 100):
+                cand = fdir / (f"{stem}.wav" if suffix_idx == 1 else f"{stem}_{suffix_idx}.wav")
+                try:
+                    os.link(tmp, cand)
+                    target = cand
+                    break
+                except FileExistsError:
+                    continue
+                except OSError:
+                    if not cand.exists():
+                        os.replace(tmp, cand)
+                        target = cand
+                        break
+            if target is None:
+                return None
+        finally:
+            tmp.unlink(missing_ok=True)
+        prune_failed_audio_dir(fdir, now_ts=ts, max_files=max_files, max_age_sec=max_age_sec)
+        return target
+    except Exception:
+        return None
+
+
+def list_failed_audios(runtime_dir: Path) -> list[Path]:
+    """Return saved failed WAV paths ordered newest-first (read-only; does not mutate disk)."""
+    fdir = get_failed_audio_dir(runtime_dir, create=False)
+    if not fdir.is_dir() or fdir.is_symlink():
+        return []
+    items: list[tuple[float, str, Path]] = []
+    try:
+        for entry in fdir.iterdir():
+            if entry.name.startswith(".") or not entry.name.lower().endswith(".wav") or entry.is_symlink():
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            if st.st_size > 0:
+                items.append((st.st_mtime, entry.name, entry))
+    except OSError:
+        return []
+    items.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [p for _, _, p in items]
+
+
+def resolve_failed_audio(runtime_dir: Path, selector: str | None = None) -> Path:
+    """Resolve a failed audio file by path, 1-based index (1=newest), filename, or unique substring."""
+    sel = (selector or "").strip()
+    if sel and (os.sep in sel or (os.altsep and os.altsep in sel) or sel.startswith("~") or sel.lower().endswith(".wav")):
+        cand = Path(sel).expanduser()
+        if cand.is_file():
+            return cand
+    items = list_failed_audios(runtime_dir)
+    if not items:
+        raise FileNotFoundError(f"no saved failed audio found in {get_failed_audio_dir(runtime_dir)}")
+    if not sel:
+        return items[0]
+    if sel.isascii() and sel.isdigit():
+        idx = int(sel)
+        if idx < 1 or idx > len(items):
+            raise FileNotFoundError(f"failed audio index {idx} out of range (available: 1..{len(items)})")
+        return items[idx - 1]
+    exact = [p for p in items if p.name == sel or p.stem == sel]
+    if len(exact) == 1:
+        return exact[0]
+    substr = [p for p in items if sel.lower() in p.name.lower()]
+    if len(substr) == 1:
+        return substr[0]
+    if len(substr) > 1:
+        names = ", ".join(p.name for p in substr[:5])
+        raise FileNotFoundError(f"ambiguous failed audio selector {sel!r} matched {len(substr)} files: {names}")
+    raise FileNotFoundError(f"no failed audio matching {sel!r} (run 'agent-voice-input retry --list')")

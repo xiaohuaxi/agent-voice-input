@@ -1,4 +1,4 @@
-"""CLI entrypoint for agent-voice-input (daemon, start, stop, status, toggle, once, doctor, key-test, session-hook)."""
+"""CLI entrypoint for agent-voice-input (daemon, start, stop, status, toggle, once, retry, doctor, key-test, session-hook)."""
 from __future__ import annotations
 
 import argparse, json, os, signal, subprocess, sys, time
@@ -8,7 +8,7 @@ from typing import Any
 
 from . import __version__
 from .asr_providers import _is_loopback_url
-from .audio_proc import resolve_ffmpeg_bin
+from .audio_proc import get_failed_audio_dir, list_failed_audios, resolve_failed_audio, resolve_ffmpeg_bin
 from .config import (
     Config,
     ConfigError,
@@ -194,32 +194,54 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
     return 0 if ok_all else 1
 
 
-def _cmd_once(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> int:
+def _run_wav_or_live(
+    *,
+    wav_file: str | Path | None,
+    audio_source: str,
+    duration: float,
+    dry_run: bool,
+    title: str | None,
+    cfg: Config,
+    env: dict[str, str],
+) -> int:
     rt_dir = get_runtime_dir(env, create=True)
-    plat = None if (args.wav_file and args.dry_run and args.title is not None) else create_platform(cfg, env=env)
+    plat = None if (wav_file and dry_run and title is not None) else create_platform(cfg, env=env)
     try:
-        win = ForegroundWindow(0, "", args.title or "") if plat is None else plat.get_foreground_window()
-        if args.wav_file:
-            raw_wav, src = args.wav_file, "file"
+        win = ForegroundWindow(0, "", title or "") if plat is None else plat.get_foreground_window()
+        if wav_file:
+            raw_wav: bytes | str | Path = wav_file
+            src = audio_source
         else:
             assert plat is not None
-            print(f"Recording {args.duration:.1f}s ...", file=sys.stderr, flush=True)
+            print(f"Recording {duration:.1f}s ...", file=sys.stderr, flush=True)
             plat.start_recording(rt_dir)
-            time.sleep(max(0.2, float(args.duration)))
+            time.sleep(max(0.2, float(duration)))
             raw_wav, src = plat.stop_recording()
-        res = run_pipeline_once(
-            raw_wav, cfg=cfg, platform=plat, origin_window=win, window_title_override=args.title,
-            audio_source=src, dry_run=args.dry_run, env=env,
-        )
+        try:
+            res = run_pipeline_once(
+                raw_wav, cfg=cfg, platform=plat, origin_window=win, window_title_override=title,
+                audio_source=src, dry_run=dry_run, runtime_dir=rt_dir, env=env,
+            )
+        except Exception as exc:
+            if saved_p := str(getattr(exc, "_saved_audio_path", "") or ""):
+                print(
+                    f"[agent-voice-input] saved failed audio: {saved_p} (recover via 'agent-voice-input retry')",
+                    file=sys.stderr,
+                )
+            raise
         if not res.ok:
-            print(f"[agent-voice-input] skipped: {res.skipped_reason}", file=sys.stderr)
+            msg = f"[agent-voice-input] skipped: {res.skipped_reason}"
+            if res.saved_audio:
+                msg += f" (saved: {res.saved_audio}; recover via 'agent-voice-input retry')"
+            print(msg, file=sys.stderr)
             return 1
-        if args.dry_run and res.asr:
+        if dry_run and res.asr:
             fb = f" fallback={res.refined.used_fallback}" if (res.refined and res.refined.used_fallback) else ""
             r_tag = f"{res.refined.provider}/{res.refined.model} {res.refined.latency_ms}ms{fb}" if res.refined else "off"
+            ch_tag = f" chunks={res.asr_chunks}" if res.asr_chunks > 1 else ""
             print(
                 f"[session] {res.session.session_key if res.session else 'none'}\n"
-                f"[stage1]  ({res.asr.provider}/{res.asr.model} {res.asr.latency_ms}ms): {res.asr.text}\n"
+                f"[stage1]  ({res.asr.provider}/{res.asr.model} {res.asr.latency_ms}ms{ch_tag}): {res.asr.text}\n"
                 f"[stage2]  ({r_tag}): {res.final_text}",
                 file=sys.stderr,
             )
@@ -228,6 +250,47 @@ def _cmd_once(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> int
     finally:
         if plat is not None:
             plat.close()
+
+
+def _cmd_once(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> int:
+    return _run_wav_or_live(
+        wav_file=args.wav_file,
+        audio_source="file",
+        duration=args.duration,
+        dry_run=args.dry_run,
+        title=args.title,
+        cfg=cfg,
+        env=env,
+    )
+
+
+def _cmd_retry(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> int:
+    rt_dir = get_runtime_dir(env, create=False)
+    if args.list_only:
+        items = list_failed_audios(rt_dir)
+        if not items:
+            print(f"no saved failed recordings in {get_failed_audio_dir(rt_dir)}")
+            return 0
+        for idx, p in enumerate(items, 1):
+            try:
+                st = p.stat()
+                ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+                kb = max(1, int(round(st.st_size / 1024.0)))
+            except OSError:
+                ts_str, kb = "-", 0
+            print(f"{idx}. [{ts_str}] {p.name} ({kb} KB) -> {p}")
+        return 0
+    wav_path = resolve_failed_audio(rt_dir, args.target)
+    print(f"[agent-voice-input] retrying failed audio: {wav_path}", file=sys.stderr, flush=True)
+    return _run_wav_or_live(
+        wav_file=wav_path,
+        audio_source="retry",
+        duration=0.0,
+        dry_run=args.dry_run,
+        title=args.title,
+        cfg=cfg,
+        env=env,
+    )
 
 
 def _sanitize_daemon_tmux_env(env: Mapping[str, str]) -> dict[str, str]:
@@ -339,6 +402,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_once.add_argument("--duration", type=float, default=4.0, help="Live capture seconds when --file is omitted")
     p_once.add_argument("--dry-run", action="store_true", help="Print Stage 1 & Stage 2 output without clipboard/paste")
     p_once.add_argument("--title", help="Optional window title override for session matching")
+    p_retry = sub.add_parser("retry", help="List or re-run saved failed voice recordings")
+    _add_common_flags(p_retry, is_sub=True)
+    p_retry.add_argument("target", nargs="?", default="", help="Optional 1-based index (1=newest), filename, substring, or path")
+    p_retry.add_argument("-l", "--list", action="store_true", dest="list_only", help="List saved failed recordings without running")
+    p_retry.add_argument("--dry-run", action="store_true", help="Print Stage 1 & Stage 2 output without clipboard/paste")
+    p_retry.add_argument("--title", help="Optional window title override for session matching")
     p_kt = sub.add_parser("key-test")
     _add_common_flags(p_kt, is_sub=True)
     p_kt.add_argument("--seconds", type=int, default=10, help="Probe duration in seconds (Esc exits early)")
@@ -389,6 +458,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         if args.subcmd == "once":
             return _cmd_once(args, cfg, env)
+        if args.subcmd == "retry":
+            return _cmd_retry(args, cfg, env)
         if args.subcmd == "doctor":
             return _cmd_doctor(cfg, env)
         if args.subcmd == "key-test":

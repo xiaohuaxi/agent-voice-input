@@ -98,6 +98,15 @@ def _normalize_codex_effort(effort: str) -> str | None:
     return eff
 
 
+def effective_refiner_timeout_sec(configured_sec: float, draft_chars: int) -> float:
+    """Scale Stage 2 timeout for long transcripts (>600 chars) while preserving explicit short timeouts."""
+    base = max(0.05, float(configured_sec))
+    if draft_chars <= 600 or base < 10.0:
+        return base
+    extra = (draft_chars - 600) * 0.04
+    return min(max(base, 240.0), base + extra)
+
+
 class BaseRefiner:
     provider_name: str = "off"
     def refine(self, asr_input: AsrResult | str, *, session_key: str = "", tracker: SessionTracker | None = None, fallback_context: str = "") -> RefinerResult:
@@ -235,17 +244,18 @@ class CodexRefiner(BaseRefiner):
             self._client = None
         self._slots.clear()
 
-    def _exec_fallback(self, full_envelope: str, empty_cwd: Path, model: str, codex_effort: str | None) -> str:
+    def _exec_fallback(self, full_envelope: str, empty_cwd: Path, model: str, codex_effort: str | None, timeout_sec: float | None = None) -> str:
         if self._exec_runner is not None:
             return self._exec_runner(full_envelope, empty_cwd).strip()
         if not (cbin := find_codex_bin(self.env)):
             raise RuntimeError("codex binary not found")
+        eff_tsec = self.cfg.refiner.timeout_sec if timeout_sec is None else timeout_sec
         with tempfile.NamedTemporaryFile(prefix="luna-exec-", suffix=".txt", dir=str(self.runtime_dir), delete=False) as tf:
             out_path = tf.name
         try:
             effort_args = ["-c", f"model_reasoning_effort={json.dumps(codex_effort)}"] if codex_effort is not None else []
             cmd = [cbin, "exec", "--ephemeral", "--skip-git-repo-check", "-c", "mcp_servers={}", "-c", "hooks={}", "-c", "project_doc_max_bytes=0", *effort_args, "--disable", "shell_tool", "--disable", "plugins", "--enable", "skip_host_skill_discovery", "-s", "read-only", "-C", str(empty_cwd), "-m", model, "-o", out_path, "-"]
-            p = subprocess.run(cmd, input=f"{REFINER_SYSTEM_PROMPT}\n\n{full_envelope}", stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, cwd=str(empty_cwd), env=_clean_env(self.env), timeout=self.cfg.refiner.timeout_sec, check=False)
+            p = subprocess.run(cmd, input=f"{REFINER_SYSTEM_PROMPT}\n\n{full_envelope}", stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, cwd=str(empty_cwd), env=_clean_env(self.env), timeout=eff_tsec, check=False)
             if p.returncode != 0:
                 excerpt = redact_secrets(p.stderr.strip(), self.env, cfg=self.cfg)[:160]
                 raise RuntimeError(f"codex exec rc={p.returncode}: {excerpt}")
@@ -259,7 +269,9 @@ class CodexRefiner(BaseRefiner):
         clean_draft, single_hop = _unpack(asr_input)
         if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
             return NoopRefiner().refine(asr_input)
-        t0, tsec, empty_cwd = time.monotonic(), self.cfg.refiner.timeout_sec, ensure_secure_dir(self.runtime_dir / "luna-empty-cwd")
+        t0 = time.monotonic()
+        tsec = effective_refiner_timeout_sec(self.cfg.refiner.timeout_sec, len(clean_draft))
+        empty_cwd = ensure_secure_dir(self.runtime_dir / "luna-empty-cwd")
         with self._lock:
             try:
                 if self._client is None:
@@ -297,7 +309,7 @@ class CodexRefiner(BaseRefiner):
                 app_warn = redact_secrets(str(app_exc), self.env, cfg=self.cfg)
             try:
                 full_ctx = tracker.get_luna_delta(session_key, full=True)[0] if (tracker and session_key) else fallback_context
-                if exec_txt := self._exec_fallback(build_refiner_envelope(full_ctx, clean_draft), empty_cwd, model, codex_effort):
+                if exec_txt := self._exec_fallback(build_refiner_envelope(full_ctx, clean_draft), empty_cwd, model, codex_effort, timeout_sec=tsec):
                     return RefinerResult(_clean_out(exec_txt, clean_draft), self.provider_name, model, _ms(t0), "codex-exec", app_warn)
                 exec_warn = "empty exec output"
             except Exception as exec_exc:
@@ -353,7 +365,8 @@ class GeminiRefiner(BaseRefiner):
                 "generationConfig": gen_cfg,
             }
             headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
-            resp = self.transport(HttpRequest(url, "POST", headers, json.dumps(payload, ensure_ascii=False).encode("utf-8"), self.cfg.refiner.timeout_sec))
+            tsec = effective_refiner_timeout_sec(self.cfg.refiner.timeout_sec, len(clean_draft))
+            resp = self.transport(HttpRequest(url, "POST", headers, json.dumps(payload, ensure_ascii=False).encode("utf-8"), tsec))
             if resp.status != 200:
                 excerpt = redact_secrets(resp.text(), self.env, cfg=self.cfg, extra_secrets=secrets)[:180]
                 raise RuntimeError(f"HTTP {resp.status}: {excerpt}")
@@ -431,7 +444,8 @@ class OpenAICompatibleRefiner(BaseRefiner):
                 model=model,
                 effort=self.cfg.refiner.effort,
             )
-            resp = self.transport(HttpRequest(url, "POST", headers, json.dumps(payload, ensure_ascii=False).encode("utf-8"), self.cfg.refiner.timeout_sec))
+            tsec = effective_refiner_timeout_sec(self.cfg.refiner.timeout_sec, len(clean_draft))
+            resp = self.transport(HttpRequest(url, "POST", headers, json.dumps(payload, ensure_ascii=False).encode("utf-8"), tsec))
             if resp.status != 200:
                 excerpt = redact_secrets(resp.text(), self.env, cfg=self.cfg, extra_secrets=secrets)[:180]
                 raise RuntimeError(f"HTTP {resp.status}: {excerpt}")

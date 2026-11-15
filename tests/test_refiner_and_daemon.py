@@ -20,7 +20,14 @@ from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
 from agent_voice_input.config import Config, ConfigError, HotkeyConfig, RefinerConfig, _parse_simple_toml, load_config, load_env_files, parse_toml, resolve_credentials  # noqa: E402
 from agent_voice_input.daemon import VoiceInputDaemon, run_pipeline_once, send_control_command  # noqa: E402
 from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome, SHIM_SCRIPT, WslPlatform, is_windows_terminal_process  # noqa: E402
-from agent_voice_input.refiner import CodexRefiner, GeminiRefiner, OpenAICompatibleRefiner, RefinerResult, create_refiner  # noqa: E402
+from agent_voice_input.refiner import (  # noqa: E402
+    CodexRefiner,
+    GeminiRefiner,
+    OpenAICompatibleRefiner,
+    RefinerResult,
+    create_refiner,
+    effective_refiner_timeout_sec,
+)
 from agent_voice_input.session_ctx import SessionTracker, write_session_registry_entry  # noqa: E402
 
 _MOCK_APP_SERVER_CODE = r"""
@@ -1785,6 +1792,208 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             finally:
                 send_control_command(rt_srv, {"cmd": "shutdown"})
                 t_srv.join(timeout=3.0)
+
+    def test_long_audio_chunk_pipeline_refiner_timeout_scaling_and_failed_retry_cli(self) -> None:
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from agent_voice_input import cli as cli_mod
+        from agent_voice_input.audio_proc import list_failed_audios
+
+        # 1. Refiner timeout scaling preserves short explicit budgets and expands for long transcripts
+        self.assertEqual(effective_refiner_timeout_sec(3.0, 120), 3.0)
+        self.assertEqual(effective_refiner_timeout_sec(3.0, 2000), 3.0)
+        self.assertEqual(effective_refiner_timeout_sec(90.0, 600), 90.0)
+        self.assertAlmostEqual(effective_refiner_timeout_sec(90.0, 2100), 150.0, places=2)
+        self.assertEqual(effective_refiner_timeout_sec(90.0, 10000), 240.0)
+
+        seen_timeouts: list[float] = []
+
+        def _capture_tx(req: HttpRequest) -> HttpResponse:
+            seen_timeouts.append(req.timeout_sec)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": "精修长文输出"}}]}, ensure_ascii=False).encode("utf-8"),
+            )
+
+        cfg_slow = Config(refiner=RefinerConfig(provider="siliconflow", timeout_sec=90.0))
+        env_sf = {"SILICONFLOW_API_KEY": "sf_fake_key_123456"}
+        ref_slow = OpenAICompatibleRefiner(
+            cfg_slow,
+            resolve_credentials(cfg_slow, env_sf),
+            provider_name="siliconflow",
+            env=env_sf,
+            transport=_capture_tx,
+        )
+        ref_slow.refine("长" * 1600)
+        self.assertAlmostEqual(seen_timeouts[0], 130.0, places=2)
+
+        # 2. Multi-chunk concurrent Stage 1 transcription -> ordered merge -> single Stage 2 refinement pass
+        sr = 16000
+        long_samples = (
+            [3800, -3800] * int(1.6 * sr)  # 3.2s
+            + [0] * int(0.5 * sr)          # 0.5s pause
+            + [3800, -3800] * int(1.6 * sr)  # 3.2s -> total 6.9s (> max_chunk_sec=4.5s)
+        )
+        long_wav = pack_pcm16_mono_wav(long_samples)
+
+        class _ChunkRecordingAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self._lk = threading.Lock()
+                self.n = 0
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                with self._lk:
+                    self.n += 1
+                    idx = self.n
+                return AsrResult(f"第{idx}段内容", "dashscope", "qwen3-asr-flash", 25, False)
+
+        class _EchoRefiner(OpenAICompatibleRefiner):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.seen_drafts: list[str] = []
+
+            def refine(self, asr_input, *, session_key="", tracker=None, fallback_context=""):  # type: ignore[override]
+                txt = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                self.seen_drafts.append(txt)
+                return RefinerResult(f"整篇精修：{txt}", "dashscope", "qwen-turbo-latest", 18)
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            chunk_asr = _ChunkRecordingAsr()
+            echo_ref = _EchoRefiner()
+            plat_ok = _FakePlatform(wav_bytes=long_wav)
+            res_multi = run_pipeline_once(
+                long_wav,
+                cfg=Config(refiner=RefinerConfig(provider="dashscope")),
+                tracker=_isolated_tracker(rt),
+                asr_provider=chunk_asr,
+                refiner=echo_ref,
+                platform=plat_ok,
+                audio_source="avfoundation",
+                runtime_dir=rt,
+                max_chunk_sec=4.5,
+                env={},
+            )
+            self.assertTrue(res_multi.ok)
+            self.assertEqual(res_multi.asr_chunks, 2)
+            self.assertEqual(len(res_multi.asr_chunk_secs), 2)
+            self.assertAlmostEqual(sum(res_multi.asr_chunk_secs), 6.9, delta=0.1)
+            self.assertEqual(chunk_asr.n, 2)
+            self.assertEqual(len(echo_ref.seen_drafts), 1)
+            self.assertIn("，", echo_ref.seen_drafts[0])
+            self.assertTrue(res_multi.final_text.startswith("整篇精修："))
+            self.assertEqual(list_failed_audios(rt), [])  # successful run never writes to failed/
+
+            # 3. Daemon ASR failure stashes WAV labeled with cwd basename; subsequent successful recording NEVER deletes it!
+            class _BoomThenOkAsr(BaseAsrProvider):
+                provider_name = "dashscope"
+
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                    self.calls += 1
+                    if self.calls == 1:
+                        raise RuntimeError("DashScope HTTP 400: The audio is too long")
+                    return AsrResult("恢复成功后的完整文本", "dashscope", "qwen3-asr-flash", 15, False)
+
+            boom_asr = _BoomThenOkAsr()
+            plat_d = _FakePlatform(wav_bytes=long_wav)
+            plat_d.fg = ForegroundWindow(
+                0, "Ghostty", "agy", bundle_id="com.mitchellh.ghostty", cwd="/Users/demo/repos/post-studio"
+            )
+            daemon = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="off")),
+                env={},
+                runtime_dir=rt,
+                platform=plat_d,
+                asr_provider=boom_asr,
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                daemon.handle_trigger("toggle", plat_d.fg)
+                daemon._last_trigger_ts = -1e9
+                r_stop1 = daemon.handle_trigger("toggle", plat_d.fg)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_stop1["seq_id"]:
+                    time.sleep(0.02)
+                self.assertFalse(daemon.last_result["ok"])
+                saved_path_str = daemon.last_result.get("saved_audio") or ""
+                self.assertTrue(saved_path_str.endswith(".wav"))
+                self.assertIn("post-studio", Path(saved_path_str).name)
+                self.assertTrue(Path(saved_path_str).is_file())
+
+                # Second recording succeeds -> first failed recording MUST remain intact on disk!
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle", plat_d.fg)
+                daemon._last_trigger_ts = -1e9
+                r_stop2 = daemon.handle_trigger("toggle", plat_d.fg)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_stop2["seq_id"]:
+                    time.sleep(0.02)
+                self.assertTrue(daemon.last_result["ok"])
+                self.assertTrue(Path(saved_path_str).is_file())
+            finally:
+                daemon.close()
+
+            # 4. Paste + clipboard double failure emits 'error' HUD and also stashes failed WAV
+            plat_clip_fail = _FakePlatform(
+                wav_bytes=_voiced_wav(),
+                paste_outcome=PasteOutcome(False, False, "clipboard_failed", "Ghostty"),
+            )
+            plat_clip_fail.fg = ForegroundWindow(0, "Ghostty", "zsh", bundle_id="com.mitchellh.ghostty", cwd="/tmp/other-proj")
+            daemon2 = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="off")),
+                env={},
+                runtime_dir=rt,
+                platform=plat_clip_fail,
+                asr_provider=_FakeAsr("剪贴板挂了"),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                daemon2.handle_trigger("toggle", plat_clip_fail.fg)
+                daemon2._last_trigger_ts = -1e9
+                r_cf = daemon2.handle_trigger("toggle", plat_clip_fail.fg)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon2.last_result.get("seq_id") != r_cf["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(plat_clip_fail.huds[-1], "error")
+                self.assertIn("other-proj", Path(daemon2.last_result["saved_audio"]).name)
+            finally:
+                daemon2.close()
+
+            # 5. CLI 'retry --list' & 'retry post-studio --dry-run' recover the exact target recording cleanly
+            iso_home = Path(td) / "home"
+            iso_home.mkdir(parents=True)
+            cli_env = {"HOME": str(iso_home), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
+            out_list = io.StringIO()
+            with unittest.mock.patch.dict(os.environ, cli_env, clear=True), redirect_stdout(out_list):
+                rc_l = cli_mod.main(["retry", "--list"])
+            self.assertEqual(rc_l, 0)
+            self.assertIn("post-studio", out_list.getvalue())
+            self.assertIn("other-proj", out_list.getvalue())
+
+            before_files = list_failed_audios(rt)
+            out_run, err_run = io.StringIO(), io.StringIO()
+            with (
+                unittest.mock.patch.dict(os.environ, cli_env, clear=True),
+                unittest.mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_FakeAsr("找回的 post-studio 长语音内容")),
+                redirect_stdout(out_run),
+                redirect_stderr(err_run),
+            ):
+                rc_r = cli_mod.main(["retry", "post-studio", "--refiner", "off", "--dry-run", "--title", "agy"])
+            self.assertEqual(rc_r, 0)
+            self.assertEqual(out_run.getvalue().strip(), "找回的 post-studio 长语音内容")
+            self.assertEqual(list_failed_audios(rt), before_files)  # retry Neither deletes nor duplicates stashed WAVs!
 
 
 if __name__ == "__main__":

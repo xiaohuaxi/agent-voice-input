@@ -22,10 +22,16 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from agent_voice_input.audio_proc import (  # noqa: E402
+    DEFAULT_MAX_CHUNK_SEC,
     PEAK_LIMIT_INT16,
     decode_to_16k_mono_pcm,
+    inspect_wav_chunks,
+    list_failed_audios,
     pack_pcm16_mono_wav,
     process_wav,
+    resolve_failed_audio,
+    save_failed_audio,
+    split_wav_chunks,
 )
 from agent_voice_input.config import (  # noqa: E402
     ASR_AUTO_PRIORITY,
@@ -1128,6 +1134,137 @@ class AudioProcTests(unittest.TestCase):
             with mock.patch("agent_voice_input.platform_wsl.WSLG_PULSE_SOCK", str(Path(td) / "no_wslg_sock")):
                 derived = _pulse_env({"XDG_RUNTIME_DIR": td})
             self.assertEqual(derived["PULSE_SERVER"], f"unix:{pdir / 'native'}")
+
+    def test_default_timeouts_pause_splitting_and_failed_audio_ring_buffer(self) -> None:
+        default_cfg = Config()
+        self.assertEqual(default_cfg.asr.timeout_sec, 60.0)
+        self.assertEqual(default_cfg.refiner.timeout_sec, 90.0)
+        self.assertEqual(DEFAULT_MAX_CHUNK_SEC, 180.0)
+
+        # 1. Exact <= 180.0s (including exact 180.0s boundary) returns single original WAV without splitting
+        short_wav = pack_pcm16_mono_wav([3500, -3500] * 8000)  # 1.0s
+        single_chunks = split_wav_chunks(short_wav, max_chunk_sec=5.0)
+        self.assertEqual(len(single_chunks), 1)
+        self.assertEqual(single_chunks[0], short_wav)
+        exact_180_wav = pack_pcm16_mono_wav(b"\x10\x0e" * (180 * 16000))  # exact 180.000s (2,880,000 samples)
+        self.assertEqual(split_wav_chunks(exact_180_wav), [exact_180_wav])
+
+        # 2. Long audio with elevated ambient floor (-38 dBFS > -50 dBFS) splits cleanly at natural pauses
+        sr = 16000
+        speech_amp = 4200
+        ambient_amp = int(round((10.0 ** (-38.0 / 20.0)) * 32768.0))  # ~412 (> -50 dBFS floor!)
+
+        def _seg(amp: int, sec: float) -> list[int]:
+            half = int(round(sec * sr / 2.0))
+            return [amp, -amp] * half
+
+        long_samples = (
+            _seg(speech_amp, 3.5)
+            + _seg(ambient_amp, 0.5)  # pause 1 centered at ~3.75s
+            + _seg(speech_amp, 3.5)
+            + _seg(ambient_amp, 0.4)  # pause 2 centered at ~7.70s
+            + _seg(speech_amp, 2.6)
+        )
+        long_wav = pack_pcm16_mono_wav(long_samples)
+        chunks = split_wav_chunks(long_wav, max_chunk_sec=5.0, search_window_sec=2.0)
+        self.assertEqual(len(chunks), 3)
+        reconstructed: list[int] = []
+        chunk_secs: list[float] = []
+        for ch_bytes in chunks:
+            _, _, out_sr, arr = _unpack_wav_samples(ch_bytes)
+            self.assertEqual(out_sr, sr)
+            dur = len(arr) / float(sr)
+            self.assertLessEqual(dur, 5.0 + 1e-6)
+            chunk_secs.append(dur)
+            reconstructed.extend(arr)
+        self.assertGreaterEqual(chunk_secs[0], 3.55)
+        self.assertLessEqual(chunk_secs[0], 3.95)
+        self.assertEqual(reconstructed, long_samples)  # strictly lossless sample preservation!
+
+        # 3. Continuous speech without any silent frames falls back to minimum-energy valley
+        cont_samples = _seg(6000, 4.0) + _seg(1500, 0.2) + _seg(6000, 1.0)
+        cont_chunks = split_wav_chunks(pack_pcm16_mono_wav(cont_samples), max_chunk_sec=4.5, search_window_sec=1.5)
+        self.assertEqual(len(cont_chunks), 2)
+        _, _, _, c0_arr = _unpack_wav_samples(cont_chunks[0])
+        _, _, _, c1_arr = _unpack_wav_samples(cont_chunks[1])
+        self.assertAlmostEqual(len(c0_arr) / float(sr), 4.1, delta=0.12)
+        self.assertEqual(list(c0_arr) + list(c1_arr), cont_samples)
+
+        # 3b. Barely-over-threshold audio with trailing silence never emits a <0.5s micro-sliver chunk
+        barely_over = [4000, -4000] * 39000 + [0] * 2002  # 80,002 samples (5.000125s)
+        bo_chunks = split_wav_chunks(pack_pcm16_mono_wav(barely_over), max_chunk_sec=5.0, search_window_sec=2.0)
+        self.assertEqual(len(bo_chunks), 2)
+        bo_recon: list[int] = []
+        for bo_b in bo_chunks:
+            _, _, _, bo_arr = _unpack_wav_samples(bo_b)
+            self.assertGreaterEqual(len(bo_arr) / float(sr), 0.8)
+            self.assertLessEqual(len(bo_arr) / float(sr), 5.0 + 1e-6)
+            bo_recon.extend(bo_arr)
+        self.assertEqual(bo_recon, barely_over)
+
+        # 3c. Soft speaker + room fan noise boosted by process_wav (+18 dB -> pauses at -30 dBFS) & rapid talker (<9% pauses)
+        soft_speech = 460   # ~ -37 dBFS raw speech -> boosted by +17 dB to -20 dBFS
+        fan_noise = 130     # ~ -48 dBFS raw fan noise -> boosted to ~ -31 dBFS (above -32 dBFS!)
+        boosted_raw = (
+            _seg(soft_speech, 3.2)
+            + _seg(fan_noise, 0.85)  # earlier stop at 3.2..4.05s
+            + _seg(soft_speech, 0.5)
+            + _seg(fan_noise, 0.75)  # later full sentence stop at 4.55..5.30s -> midpoint ~4.92s!
+            + _seg(soft_speech, 3.4)
+        )
+        gate_boosted = process_wav(pack_pcm16_mono_wav(boosted_raw))
+        self.assertTrue(gate_boosted.passed)
+        self.assertGreater(gate_boosted.gain_db, 14.0)
+        b_infos = inspect_wav_chunks(gate_boosted.wav_bytes, max_chunk_sec=5.5, search_window_sec=2.5)
+        self.assertEqual(len(b_infos), 2)
+        self.assertEqual(b_infos[0].cut_reason, "pause_300ms")
+        # Prefers the later >=700ms sentence stop (~4.92s) over the earlier one (~3.62s) to minimize total chunks!
+        self.assertGreaterEqual(b_infos[0].end_sec, 4.70)
+        self.assertLessEqual(b_infos[0].end_sec, 5.15)
+
+        # 4. Failed audio ring buffer: 0700 dir, 0600 files, collision suffix, 24h TTL + max 10 retention, selector lookup
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "uncreated_rt"
+            base_ts = 1_760_000_000.0
+            expired = save_failed_audio(short_wav, rt, duration_sec=248.4, label="old-repo", now_ts=base_ts - 90_000.0)
+            self.assertIsNotNone(expired)
+            assert expired is not None
+            self.assertTrue(expired.is_file())
+            self.assertEqual(expired.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(expired.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(rt.stat().st_mode & 0o777, 0o700)
+
+            s1 = save_failed_audio(short_wav, rt, duration_sec=210.0, label="post-studio", now_ts=base_ts)
+            s1_dup = save_failed_audio(short_wav, rt, duration_sec=210.0, label="post-studio", now_ts=base_ts)
+            s2 = save_failed_audio(short_wav, rt, duration_sec=5.0, label="post-studio", now_ts=base_ts)
+            assert s1 is not None and s1_dup is not None and s2 is not None
+            self.assertNotEqual(s1, s1_dup)
+            self.assertTrue(s1_dup.name.endswith("_2.wav"))
+            self.assertNotEqual(s1, s2)
+            self.assertIn("210s_post-studio", s1.name)
+            self.assertFalse(expired.exists())  # >24h entry pruned on write!
+
+            for idx in range(11):
+                save_failed_audio(
+                    short_wav,
+                    rt,
+                    duration_sec=10 + idx,
+                    label=f"proj-{idx}",
+                    now_ts=base_ts + 10 + idx,
+                )
+            kept = list_failed_audios(rt)
+            self.assertEqual(len(kept), 10)
+            self.assertIn("proj-10", kept[0].name)
+            self.assertIn("proj-1", kept[-1].name)
+
+            self.assertEqual(resolve_failed_audio(rt), kept[0])
+            self.assertEqual(resolve_failed_audio(rt, "1"), kept[0])
+            self.assertEqual(resolve_failed_audio(rt, "10"), kept[-1])
+            self.assertEqual(resolve_failed_audio(rt, "proj-7"), [p for p in kept if "proj-7" in p.name][0])
+            with self.assertRaises(FileNotFoundError):
+                resolve_failed_audio(rt, "proj-")
+            with self.assertRaises(FileNotFoundError):
+                resolve_failed_audio(rt, "99")
 
 
 if __name__ == "__main__":
