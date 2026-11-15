@@ -1393,7 +1393,12 @@ class AsrProvidersTests(unittest.TestCase):
             handshake_timeouts: list[float | None] = []
             outer_test = self
 
+            import ssl as _ssl
+
             class _FakeTlsCtx:
+                verify_mode = _ssl.CERT_NONE
+                check_hostname = False
+
                 def wrap_socket(self, sock: _sock.socket, *, server_hostname: str | None = None, do_handshake_on_connect: bool = True) -> Any:
                     outer_test.assertFalse(do_handshake_on_connect)
 
