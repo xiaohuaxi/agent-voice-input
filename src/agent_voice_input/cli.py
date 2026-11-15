@@ -1,7 +1,7 @@
 """CLI entrypoint for agent-voice-input (daemon, start, restart, stop, status, toggle, once, retry, doctor, key-test, session-hook)."""
 from __future__ import annotations
 
-import argparse, json, os, signal, stat, subprocess, sys, time
+import argparse, json, os, signal, socket, stat, subprocess, sys, time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -22,7 +22,13 @@ from .config import (
     select_asr_provider,
 )
 from .daemon import VoiceInputDaemon, create_platform, run_pipeline_once, send_control_command
-from .platform_macos import compile_mac_shim, probe_macos_host, run_macos_key_test
+from .platform_macos import (
+    classify_macos_mic_permission,
+    compile_mac_shim,
+    probe_macos_host,
+    run_mac_shim_self_check,
+    run_macos_key_test,
+)
 from .platform_wsl import ForegroundWindow, is_wsl, probe_wsl_host, run_key_test
 from .refiner import find_codex_bin
 from .session_ctx import SessionTracker
@@ -131,7 +137,14 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
             )
         else:
             print(f"[macos-fg]  app={m.get('fg_process')!r} title={fg_title!r}")
-        print(f"[macos-tcc] {m.get('permissions_hint')}")
+        caller_mic = str(m.get("caller_mic_auth") or "").strip()
+        tcc_prefix = f"caller_mic_auth={caller_mic} | " if caller_mic else ""
+        print(f"[macos-tcc] {tcc_prefix}{m.get('permissions_hint')}")
+        if caller_warn := str(m.get("caller_mic_warning") or "").strip():
+            print(
+                f"[macos-tcc] WARN (current shell context: {caller_warn}; "
+                "note: reflects this shell, not an already-running GUI daemon)"
+            )
         ok_all = ok_all and bool(m.get("pbcopy_ok"))
     elif is_wsl(env):
         w = probe_wsl_host(cfg, env)
@@ -426,22 +439,48 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
             return 0
     except Exception:
         pass
-    warned_shim = False
-    if sys.platform == "darwin" and cfg is not None:
-        shim_bin, pre_err = compile_mac_shim(env=env, cfg=cfg, announce=True)
-        if shim_bin is None and pre_err:
-            warned_shim = True
-            print(
-                f"[agent-voice-input] WARN: native hotkey/HUD helper unavailable ({pre_err}); "
-                "daemon will start in CLI-only mode ('toggle'/'once').",
-                file=sys.stderr,
-                flush=True,
-            )
     src_root = Path(__file__).resolve().parents[1]
     child_env = _sanitize_daemon_tmux_env(os.environ)
     if (src_root / "agent_voice_input").is_dir():
         prev_pp = child_env.get("PYTHONPATH", "")
         child_env["PYTHONPATH"] = f"{src_root}{os.pathsep}{prev_pp}" if prev_pp else str(src_root)
+    warned_shim = False
+    if sys.platform == "darwin" and cfg is not None:
+        shim_bin, pre_err = compile_mac_shim(env=env, cfg=cfg, announce=True)
+        if shim_bin is None:
+            if pre_err:
+                warned_shim = True
+                print(
+                    f"[agent-voice-input] WARN: native hotkey/HUD helper unavailable ({pre_err}); "
+                    "daemon will start in CLI-only mode ('toggle'/'once').",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            ssh_env = (
+                {**child_env, **{k: env[k] for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY") if k in env}}
+            )
+            if (ssh_warn := classify_macos_mic_permission({"mic_auth": "not_determined"}, ssh_env)) is not None:
+                print(
+                    f"[agent-voice-input] WARN: {redact_secrets(str(ssh_warn), env, cfg=cfg)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            sc_ok, sc_json, _sc_err = run_mac_shim_self_check(shim_bin, child_env, cfg=cfg)
+            if sc_ok:
+                aud_st = sc_json.get("audio_status")
+                perm_env = (
+                    {**child_env, **{k: env[k] for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY") if k in env}}
+                )
+                if (
+                    isinstance(aud_st, Mapping)
+                    and (perm_err := classify_macos_mic_permission(aud_st, perm_env)) is not None
+                ):
+                    print(
+                        f"[agent-voice-input] WARN: {redact_secrets(str(perm_err), env, cfg=cfg)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
     cmd = [
         sys.executable,
         "-m",
@@ -596,10 +635,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcmd == "stop":
             return _cmd_stop(env)
         if args.subcmd in ("status", "toggle"):
+            ctrl_timeout = 20.0 if args.subcmd == "toggle" else 8.0
             try:
-                resp = send_control_command(get_runtime_dir(env, create=False), {"cmd": args.subcmd})
+                resp = send_control_command(
+                    get_runtime_dir(env, create=False),
+                    {"cmd": args.subcmd},
+                    timeout_sec=ctrl_timeout,
+                )
                 print(json.dumps(resp, ensure_ascii=False))
                 return 0 if resp.get("ok") else 1
+            except (TimeoutError, socket.timeout):
+                if args.subcmd == "status":
+                    print(json.dumps({"ok": False, "state": "stopped"}))
+                    return 1
+                print("agent-voice-input daemon control request timed out", file=sys.stderr)
+                return 1
             except Exception:
                 if args.subcmd == "status":
                     print(json.dumps({"ok": False, "state": "stopped"}))

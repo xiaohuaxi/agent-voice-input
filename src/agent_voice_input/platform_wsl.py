@@ -57,6 +57,8 @@ class ForegroundWindow:
     cwd: str = ""
     pid: int = 0
     ax_trusted: bool | None = None
+    tmux_socket: str = ""
+    tmux_pane: str = ""
 
     @property
     def app_name(self) -> str:

@@ -1,12 +1,15 @@
 """macOS native bridge: AVFoundation capture, Ghostty split-aware input, and mac_shim.swift hotkey/HUD."""
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib, json, os, platform as py_platform, re, shutil, subprocess, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from ._tmux import (
     TmuxServerSnapshot,
+    _same_tmux_server,
+    parse_tmux_socket_from_env,
     preferred_tmux_socket_arg,
     probe_tmux_snapshot,
     resolve_tmux_bin,
@@ -37,7 +40,7 @@ from .session_ctx import (
 GHOSTTY_BUNDLE_ID = "com.mitchellh.ghostty"
 APPLE_TERMINAL_BUNDLE_ID = "com.apple.terminal"
 MAC_SHIM_SCRIPT = Path(__file__).resolve().with_name("mac_shim.swift")
-SHIM_SCHEMA_VERSION = 2
+SHIM_SCHEMA_VERSION = 3
 MACOS_TERMINALS = frozenset(
     {
         "terminal",
@@ -76,6 +79,7 @@ SOUND_MAP = {"start": "Tink.aiff", "stop": "Pop.aiff", "focus": "Glass.aiff", "e
 _APPLE_SEP = "\x1f"
 _SPINNER_PREFIX_RE = re.compile(r"^[\u2800-\u28ff✳✢✶✻✽·•\s]+")
 _SPINNER_INLINE_RE = re.compile(r"[\u2800-\u28ff✳✢✶✻✽]+\s*")
+_TERM_DIM_RE = re.compile(r"\s*(?:[—–-]|\s)\s*\d+\s*[×x]\s*\d+(?=\s|$)")
 _MULTI_WS_RE = re.compile(r"\s+")
 _AVF_AUDIO_DEV_RE = re.compile(r"\[(\d+)\]\s+(.+?)\s*$")
 _OSA_CODE_RE = re.compile(r"\((-?\d+)\)")
@@ -349,7 +353,9 @@ def compile_mac_shim(
     mod_cache = ensure_secure_dir(target_dir / "swift-modcache")
     cmd = [
         eff_swiftc, "-O", "-parse-as-library", "-module-cache-path", str(mod_cache), str(swift_source),
-        "-framework", "AppKit", "-framework", "ApplicationServices", "-framework", "CoreAudio", "-o", str(tmp_path),
+        "-framework", "AppKit", "-framework", "ApplicationServices", "-framework", "CoreAudio",
+        "-framework", "AVFoundation", "-framework", "Security",
+        "-o", str(tmp_path),
     ]
     t0 = time.monotonic()
     if announce:
@@ -425,6 +431,10 @@ def _normalize_title_for_drift(title: str) -> str:
     return _MULTI_WS_RE.sub(" ", cleaned).strip()
 
 
+def _normalize_tmux_title_for_drift(title: str) -> str:
+    return _normalize_title_for_drift(_TERM_DIM_RE.sub("", title))
+
+
 def _summarize_osascript_error(stderr: str, *, kind: str) -> str:
     # Redline: NEVER echo raw stderr text (AppleScript errors can echo pasteText user speech!)
     low = stderr.lower()
@@ -435,6 +445,83 @@ def _summarize_osascript_error(stderr: str, *, kind: str) -> str:
         return f"automation_denied (grant Automation permission for {target})"
     m = _OSA_CODE_RE.search(stderr)
     return f"{kind}_osascript_error({m.group(1)})" if m else f"{kind}_osascript_failed"
+
+
+def classify_macos_mic_permission(
+    st: Mapping[str, Any] | None,
+    env: Mapping[str, str] | None = None,
+) -> MicrophoneUnavailableError | None:
+    mic_auth = str((st or {}).get("mic_auth") or "").strip().lower()
+    if mic_auth == "authorized":
+        return None
+    if mic_auth == "denied":
+        return MicrophoneUnavailableError(
+            "macOS Microphone access is denied; enable your terminal app in System Settings -> Privacy & Security -> Microphone",
+            reason_code="mic_permission",
+            hud_state="mic_permission",
+        )
+    if mic_auth == "restricted":
+        return MicrophoneUnavailableError(
+            "macOS Microphone access is restricted by system or management policy",
+            reason_code="mic_permission",
+            hud_state="mic_permission",
+        )
+    if mic_auth == "not_determined":
+        non_gui_msg = (
+            "macOS daemon is running in a non-GUI/SSH session without Microphone TCC access; "
+            "run 'agent-voice-input restart' inside a local macOS terminal (outside any SSH-started tmux server)"
+        )
+        has_graphic = (st or {}).get("has_graphic_session")
+        if isinstance(has_graphic, bool):
+            if has_graphic is False:
+                return MicrophoneUnavailableError(
+                    non_gui_msg,
+                    reason_code="mic_permission",
+                    hud_state="mic_permission",
+                )
+            return None
+        eff_env = env if env is not None else {}
+        if any(str(eff_env.get(k) or "").strip() for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
+            return MicrophoneUnavailableError(
+                non_gui_msg,
+                reason_code="mic_permission",
+                hud_state="mic_permission",
+            )
+        return None
+    return None
+
+
+def run_mac_shim_self_check(
+    shim_bin: Path,
+    env: Mapping[str, str],
+    *,
+    cfg: Config | None = None,
+    timeout: float = 5.0,
+) -> tuple[bool, dict[str, Any], str]:
+    try:
+        sc = subprocess.run(
+            [str(shim_bin), "--self-check"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=dict(env),
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        return False, {}, redact_secrets(str(exc), env, cfg=cfg)
+    if sc.returncode != 0:
+        raw_err = (sc.stderr or sc.stdout or f"self-check rc={sc.returncode}").strip()
+        return False, {}, redact_secrets(raw_err, env, cfg=cfg)
+    sc_json: dict[str, Any] = {}
+    if out := (sc.stdout or "").strip():
+        try:
+            parsed = json.loads(out.splitlines()[-1])
+            if isinstance(parsed, dict):
+                sc_json = parsed
+        except ValueError:
+            pass
+    return True, sc_json, ""
 
 
 def probe_macos_host(
@@ -452,6 +539,7 @@ def probe_macos_host(
         "tmux_active": bool(eff_env.get("TMUX")),
         "clt_ok": True, "clt_error": "",
         "swiftc_ok": False, "swiftc_bin": "", "mac_shim_ok": False, "mac_shim_bin": "", "mac_shim_error": "",
+        "caller_mic_auth": "", "caller_has_graphic_session": None, "caller_is_remote_session": None, "caller_mic_warning": "",
         "fg_hwnd": 0, "fg_process": "", "fg_bundle_id": "", "fg_title": "", "fg_surface_id": "", "fg_tty": "", "fg_cwd": "", "fg_pid": 0,
         "permissions_hint": MACOS_PERMISSIONS_HINT,
     }
@@ -484,24 +572,21 @@ def probe_macos_host(
     ui_cult = ""
     if shim_bin is not None:
         info["mac_shim_bin"] = str(shim_bin)
-        try:
-            sc = subprocess.run(
-                [str(shim_bin), "--self-check"], stdin=subprocess.DEVNULL,
-                capture_output=True, text=True, env=eff_env, timeout=5, check=False,
-            )
-            info["mac_shim_ok"] = sc.returncode == 0
-            if sc.returncode == 0 and sc.stdout.strip():
-                try:
-                    sc_json = json.loads(sc.stdout.strip().splitlines()[-1])
-                    if isinstance(sc_json, dict):
-                        ui_cult = str(sc_json.get("ui_culture") or "").strip()
-                except ValueError:
-                    pass
-            elif sc.returncode != 0:
-                raw_err = (sc.stderr or sc.stdout or f"self-check rc={sc.returncode}").strip()
-                info["mac_shim_error"] = redact_secrets(raw_err, eff_env, cfg=cfg)
-        except Exception as exc:
-            info["mac_shim_error"] = redact_secrets(str(exc), eff_env, cfg=cfg)
+        sc_ok, sc_json, sc_err = run_mac_shim_self_check(shim_bin, eff_env, cfg=cfg, timeout=5.0)
+        info["mac_shim_ok"] = sc_ok
+        if sc_ok:
+            ui_cult = str(sc_json.get("ui_culture") or "").strip()
+            aud_st = sc_json.get("audio_status")
+            if isinstance(aud_st, Mapping):
+                info["caller_mic_auth"] = str(aud_st.get("mic_auth") or "").strip().lower()
+                if isinstance(aud_st.get("has_graphic_session"), bool):
+                    info["caller_has_graphic_session"] = aud_st["has_graphic_session"]
+                if isinstance(aud_st.get("is_remote_session"), bool):
+                    info["caller_is_remote_session"] = aud_st["is_remote_session"]
+                if (perm_err := classify_macos_mic_permission(aud_st, eff_env)) is not None:
+                    info["caller_mic_warning"] = redact_secrets(str(perm_err), eff_env, cfg=cfg)
+        elif sc_err:
+            info["mac_shim_error"] = sc_err
     else:
         info["mac_shim_error"] = shim_err
     info["ui_culture"] = ui_cult
@@ -529,6 +614,7 @@ class _MacRecSession:
         active_name: str = "",
         active_name_unique: bool = False,
         daemon_seq_id: int | None = None,
+        initial_mic_auth: str = "",
     ) -> None:
         self.gen = gen
         self.rec = rec
@@ -537,6 +623,7 @@ class _MacRecSession:
         self.active_name = active_name
         self.active_name_unique = active_name_unique
         self.daemon_seq_id = daemon_seq_id
+        self.initial_mic_auth = initial_mic_auth
         self.pcm = bytearray()
         self.active: bool = True
         self.aborted: bool = False
@@ -589,6 +676,7 @@ class MacOSPlatform(JsonlShimMixin):
         cache_dir: Path | None = None,
         shim_cmd_factory: Callable[[], list[str] | None] | None = None,
         tmux_probe_fn: Callable[[], TmuxServerSnapshot] | None = None,
+        self_check_fn: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> None:
         self.cfg = cfg
         self.env = dict(os.environ if env is None else env)
@@ -596,6 +684,7 @@ class MacOSPlatform(JsonlShimMixin):
         self._cache_dir = cache_dir
         self._shim_cmd_factory = shim_cmd_factory
         self._tmux_probe_fn = tmux_probe_fn
+        self._self_check_fn = self_check_fn
         self._fg_tls = threading.local()
         self._ff_rec = FfmpegWavRecorder()
         self._recording = False
@@ -603,11 +692,15 @@ class MacOSPlatform(JsonlShimMixin):
         self._recorder_recovered_cb: Callable[..., Any] | None = None
         self._audio_cache_lock = threading.Lock()
         self._audio_status_known: bool = False
+        self._hal_ok: bool = True
         self._has_audio_input: bool = True
         self._default_input_uid: str = ""
         self._default_input_name: str = ""
         self._default_input_name_unique: bool = False
         self._alive_input_uids: set[str] = set()
+        self._mic_auth: str = ""
+        self._has_graphic_session: bool | None = None
+        self._is_remote_session: bool | None = None
         self._rec_cond = threading.Condition()
         self._rec_active: bool = False
         self._rec_gen: int = 0
@@ -645,22 +738,92 @@ class MacOSPlatform(JsonlShimMixin):
             if isinstance(raw_alive, (list, tuple, set, frozenset))
             else set()
         )
+        hal_ok = bool(st["hal_ok"]) if ("hal_ok" in st and st["hal_ok"] is not None) else True
         has_input = bool(st["has_input"]) if "has_input" in st else bool(alive_uids)
         default_uid = str(st.get("default_uid") or "").strip()
         default_name = str(st.get("default_name") or "").strip()
         default_unique = _is_unique_audio_device_name(st, default_uid, default_name)
+        has_perm_fields = any(k in st for k in ("mic_auth", "has_graphic_session", "is_remote_session"))
+        mic_auth = str(st.get("mic_auth") or "").strip().lower()
+        raw_graphic = st.get("has_graphic_session")
+        has_graphic = raw_graphic if isinstance(raw_graphic, bool) else None
+        raw_remote = st.get("is_remote_session")
+        is_remote = raw_remote if isinstance(raw_remote, bool) else None
         with self._audio_cache_lock:
             self._audio_status_known = True
+            self._hal_ok = hal_ok
             self._has_audio_input = has_input
             self._default_input_uid = default_uid
             self._default_input_name = default_name
             self._default_input_name_unique = default_unique
             self._alive_input_uids = alive_uids
+            if has_perm_fields:
+                self._mic_auth = mic_auth
+                self._has_graphic_session = has_graphic
+                self._is_remote_session = is_remote
         return has_input, default_uid, alive_uids
+
+    def _normalize_and_cache_audio_status(self, st: Mapping[str, Any]) -> dict[str, Any]:
+        has_input, default_uid, alive_uids = self._update_audio_status_cache(st)
+        default_name = str(st.get("default_name") or "").strip()
+        hal_ok = bool(st["hal_ok"]) if ("hal_ok" in st and st["hal_ok"] is not None) else True
+        mic_auth = str(st.get("mic_auth") or "").strip().lower()
+        raw_graphic = st.get("has_graphic_session")
+        has_graphic = raw_graphic if isinstance(raw_graphic, bool) else None
+        raw_remote = st.get("is_remote_session")
+        is_remote = raw_remote if isinstance(raw_remote, bool) else None
+        return {
+            **st,
+            "hal_ok": hal_ok,
+            "has_input": has_input,
+            "default_uid": default_uid,
+            "default_name": default_name,
+            "default_name_unique": _is_unique_audio_device_name(st, default_uid, default_name),
+            "alive_uids": sorted(alive_uids),
+            "mic_auth": mic_auth,
+            "has_graphic_session": has_graphic,
+            "is_remote_session": is_remote,
+        }
+
+    def _probe_unmanaged_audio_status(self, timeout_sec: float = 1.5) -> dict[str, Any] | None:
+        if self._closed or self._shim_disabled:
+            return None
+        raw_st: Any = None
+        if self._self_check_fn is not None:
+            try:
+                raw_st = self._self_check_fn()
+            except Exception:
+                return None
+            if (
+                isinstance(raw_st, Mapping)
+                and isinstance(raw_st.get("audio_status"), Mapping)
+                and "has_input" not in raw_st
+                and "mic_auth" not in raw_st
+            ):
+                raw_st = raw_st["audio_status"]
+        elif (
+            sys.platform == "darwin"
+            and self._shim_cmd_factory is None
+            and getattr(self._ff_rec, "_cmd_factory", None) is None
+        ):
+            bin_path, _err = compile_mac_shim(
+                env=self.env, cache_dir=self._cache_dir, cfg=self.cfg, announce=False
+            )
+            if bin_path is None:
+                return None
+            sc_ok, sc_json, _sc_err = run_mac_shim_self_check(
+                bin_path, self.env, cfg=self.cfg, timeout=max(1.5, timeout_sec)
+            )
+            if not sc_ok:
+                return None
+            raw_st = sc_json.get("audio_status")
+        if not isinstance(raw_st, Mapping):
+            return None
+        return self._normalize_and_cache_audio_status(raw_st)
 
     def _query_live_audio_status(self, timeout_sec: float = 0.8) -> dict[str, Any] | None:
         if not self._has_managed_shim():
-            return None
+            return self._probe_unmanaged_audio_status(timeout_sec=timeout_sec)
         try:
             res = self._shim_rpc({"cmd": "audio_status"}, timeout_sec=timeout_sec, allow_retry=False)
         except TypeError:
@@ -672,20 +835,11 @@ class MacOSPlatform(JsonlShimMixin):
         st = (
             res.get("audio_status")
             if isinstance(res.get("audio_status"), dict)
-            else (res if ("has_input" in res or "alive_uids" in res) else None)
+            else (res if ("has_input" in res or "alive_uids" in res or "mic_auth" in res) else None)
         )
         if not isinstance(st, dict):
             return None
-        has_input, default_uid, alive_uids = self._update_audio_status_cache(st)
-        default_name = str(st.get("default_name") or "").strip()
-        return {
-            **st,
-            "has_input": has_input,
-            "default_uid": default_uid,
-            "default_name": default_name,
-            "default_name_unique": _is_unique_audio_device_name(st, default_uid, default_name),
-            "alive_uids": sorted(alive_uids),
-        }
+        return self._normalize_and_cache_audio_status(st)
 
     def _on_shim_internal_event(self, msg: dict[str, Any]) -> None:
         if str(msg.get("event") or "") != "audio_devices_changed":
@@ -912,7 +1066,7 @@ class MacOSPlatform(JsonlShimMixin):
                     )
             if not win_title and not from_shim and ax_trusted is not False:
                 win_title = self._query_ax_title()
-            return ForegroundWindow(
+            g_win = ForegroundWindow(
                 app_hwnd,
                 eff_name,
                 self._append_tmux_pane_title(win_title, eff_name, eff_bundle),
@@ -920,34 +1074,48 @@ class MacOSPlatform(JsonlShimMixin):
                 pid=app_pid,
                 ax_trusted=ax_trusted,
             )
+            return self._enrich_window_tmux_target(g_win) if not (from_shim and app_hwnd <= 0) else g_win
 
         if is_apple_terminal_app(app_name, bundle_id):
             eff_name = app_name or "Terminal"
             eff_bundle = bundle_id or APPLE_TERMINAL_BUNDLE_ID
+            saw_other_panel = False
             if not (from_shim and app_hwnd <= 0):
                 if (t_info := self._query_apple_terminal()) is not None:
                     t_wid, t_title, t_tty, t_wname = t_info
                     is_other_panel = bool(
-                        win_title
-                        and t_wname
-                        and _normalize_title_for_drift(win_title) != _normalize_title_for_drift(t_wname)
-                        and (app_hwnd <= 0 or t_wid <= 0 or app_hwnd != t_wid)
+                        (
+                            win_title
+                            and t_wname
+                            and _normalize_title_for_drift(win_title) != _normalize_title_for_drift(t_wname)
+                            and (app_hwnd <= 0 or t_wid <= 0 or app_hwnd != t_wid)
+                        )
+                        or (
+                            not win_title
+                            and ax_trusted is False
+                            and app_hwnd > 0
+                            and t_wid > 0
+                            and app_hwnd != t_wid
+                        )
                     )
                     if not is_other_panel:
                         eff_hwnd = t_wid if t_wid > 0 else app_hwnd
                         merged_title = t_title or win_title
-                        return ForegroundWindow(
-                            eff_hwnd,
-                            eff_name,
-                            self._append_tmux_pane_title(merged_title, eff_name, eff_bundle),
-                            eff_bundle,
-                            tty=t_tty,
-                            pid=app_pid,
-                            ax_trusted=ax_trusted,
+                        return self._enrich_window_tmux_target(
+                            ForegroundWindow(
+                                eff_hwnd,
+                                eff_name,
+                                self._append_tmux_pane_title(merged_title, eff_name, eff_bundle),
+                                eff_bundle,
+                                tty=t_tty,
+                                pid=app_pid,
+                                ax_trusted=ax_trusted,
+                            )
                         )
+                    saw_other_panel = True
             if not win_title and not from_shim and ax_trusted is not False:
                 win_title = self._query_ax_title()
-            return ForegroundWindow(
+            term_win = ForegroundWindow(
                 app_hwnd,
                 eff_name,
                 self._append_tmux_pane_title(win_title, eff_name, eff_bundle),
@@ -955,8 +1123,11 @@ class MacOSPlatform(JsonlShimMixin):
                 pid=app_pid,
                 ax_trusted=ax_trusted,
             )
+            if not (from_shim and app_hwnd <= 0) and not saw_other_panel:
+                return self._enrich_window_tmux_target(term_win)
+            return term_win
 
-        return ForegroundWindow(
+        other_win = ForegroundWindow(
             app_hwnd,
             app_name,
             self._append_tmux_pane_title(win_title, app_name, bundle_id),
@@ -964,17 +1135,18 @@ class MacOSPlatform(JsonlShimMixin):
             pid=app_pid,
             ax_trusted=ax_trusted,
         )
+        return self._enrich_window_tmux_target(other_win) if not (from_shim and app_hwnd <= 0) else other_win
 
     def resolve_foreground_window(self, window: ForegroundWindow | None = None) -> ForegroundWindow:
         if window is None:
             return self.get_foreground_window()
         if is_ghostty_app(window.process, window.bundle_id):
             if window.surface_id or (window.title and not self._which("osascript")):
-                return window
+                return self._enrich_window_tmux_target(window)
             return self.get_foreground_window(hint=window)
         if is_apple_terminal_app(window.process, window.bundle_id):
             if window.tty or (window.title and not self._which("osascript")):
-                return window
+                return self._enrich_window_tmux_target(window)
             return self.get_foreground_window(hint=window)
         if (
             window.surface_id
@@ -982,9 +1154,9 @@ class MacOSPlatform(JsonlShimMixin):
             or (window.ax_trusted is not None and not self.env.get("TMUX"))
             or (window.hwnd and not self._which("osascript"))
         ):
-            return window
+            return self._enrich_window_tmux_target(window)
         if window.title and not window.process and not window.bundle_id:
-            return window
+            return self._enrich_window_tmux_target(window)
         return self.get_foreground_window(hint=window)
 
     def beep(self, kind: str) -> None:
@@ -1026,13 +1198,14 @@ class MacOSPlatform(JsonlShimMixin):
         locked_uid = ""
         locked_name = ""
         locked_name_unique = False
+        initial_mic_auth = ""
         is_default_dev = self.audio_dev.lstrip(":").strip().lower() in ("", "default")
-        if self._has_managed_shim() or (
-            self._audio_status_known and not self._shim_disabled and not self._closed
-        ):
+        if not self._shim_disabled and not self._closed:
             live_st = self._query_live_audio_status(timeout_sec=0.8)
             if live_st is not None:
+                eff_st: dict[str, Any] = live_st
                 known = True
+                hal_ok = bool(live_st.get("hal_ok", True))
                 has_in = bool(live_st.get("has_input", True))
                 def_uid = str(live_st.get("default_uid") or "").strip()
                 def_name = str(live_st.get("default_name") or "").strip()
@@ -1040,15 +1213,34 @@ class MacOSPlatform(JsonlShimMixin):
             else:
                 with self._audio_cache_lock:
                     known = self._audio_status_known
+                    hal_ok = self._hal_ok
                     has_in = self._has_audio_input
                     def_uid = self._default_input_uid
                     def_name = self._default_input_name
                     def_uniq = self._default_input_name_unique
+                    eff_st = (
+                        {
+                            "hal_ok": hal_ok,
+                            "has_input": has_in,
+                            "mic_auth": self._mic_auth,
+                            "has_graphic_session": self._has_graphic_session,
+                            "is_remote_session": self._is_remote_session,
+                        }
+                        if known
+                        else {}
+                    )
+            if known and hal_ok and not has_in:
+                self.last_audio_error = "coreaudio_no_input_device"
+                raise NoMicrophoneError("no microphone input device available on macOS")
+            if (perm_err := classify_macos_mic_permission(eff_st, self.env)) is not None:
+                self.last_audio_error = "macos_mic_permission"
+                raise perm_err
+            if known and not has_in:
+                self.last_audio_error = "coreaudio_no_input_device"
+                raise NoMicrophoneError("no microphone input device available on macOS")
             if known:
-                if not has_in:
-                    self.last_audio_error = "coreaudio_no_input_device"
-                    raise NoMicrophoneError("no microphone input device available on macOS")
                 has_known_input = True
+                initial_mic_auth = str(eff_st.get("mic_auth") or "").strip().lower()
                 if is_default_dev:
                     locked_uid = def_uid
                     locked_name = def_name
@@ -1064,11 +1256,13 @@ class MacOSPlatform(JsonlShimMixin):
                 active_name=locked_name,
                 active_name_unique=locked_name_unique,
                 daemon_seq_id=seq_id,
+                initial_mic_auth=initial_mic_auth,
             )
             self._cur_session = session
             self._rec_active = True
             self._recording = True
 
+        startup_timeout = 15.0 if initial_mic_auth == "not_determined" else 0.85
         try:
             session.rec.start(
                 "avfoundation",
@@ -1076,7 +1270,7 @@ class MacOSPlatform(JsonlShimMixin):
                 runtime_dir,
                 self.env,
                 verify_startup=True,
-                startup_timeout_sec=0.85,
+                startup_timeout_sec=startup_timeout,
                 stall_timeout_sec=1.2,
                 has_known_input=has_known_input,
                 on_unexpected_exit=lambda s=session: self._on_ffmpeg_unexpected_exit(s),
@@ -1090,6 +1284,11 @@ class MacOSPlatform(JsonlShimMixin):
                     self._cur_session = None
                     self._rec_active = False
                     self._recording = False
+            if session.initial_mic_auth == "not_determined":
+                post_st = self._query_live_audio_status(timeout_sec=0.6)
+                if (perm_err := classify_macos_mic_permission(post_st, self.env)) is not None:
+                    self.last_audio_error = "macos_mic_permission"
+                    raise perm_err from None
             self.last_audio_error = session.rec.diagnostic_summary()
             raise
 
@@ -1163,7 +1362,8 @@ class MacOSPlatform(JsonlShimMixin):
                         alive_set = {str(u).strip() for u in raw_alive if str(u).strip()}
                         cur_def_uid = str(live_st.get("default_uid") or "").strip()
                         if (
-                            bool(live_st.get("has_input", bool(alive_set)))
+                            classify_macos_mic_permission(live_st, self.env) is None
+                            and bool(live_st.get("has_input", bool(alive_set)))
                             and session.active_uid in alive_set
                             and cur_def_uid == session.active_uid
                             and _is_unique_audio_device_name(live_st, session.active_uid, session.active_name)
@@ -1337,6 +1537,21 @@ class MacOSPlatform(JsonlShimMixin):
             wav = pack_pcm16_mono_wav(bytes(pcm)) if pcm else b""
         else:
             wav = seg_wav
+        if (
+            session.initial_mic_auth == "not_determined"
+            and self.last_audio_error != "coreaudio_device_disconnected"
+        ):
+            post_st = self._query_live_audio_status(timeout_sec=0.6)
+            hw_gone = (
+                isinstance(post_st, Mapping)
+                and bool(post_st.get("hal_ok", True))
+                and not bool(post_st.get("has_input", True))
+            )
+            if not hw_gone and (perm_err := classify_macos_mic_permission(post_st, self.env)) is not None:
+                self.last_audio_error = "macos_mic_permission"
+                perm_err._raw_wav = wav  # type: ignore[attr-defined]
+                perm_err._audio_source = "avfoundation"  # type: ignore[attr-defined]
+                raise perm_err
         if not self.last_audio_error:
             self.last_audio_error = "" if wav else session.rec.diagnostic_summary()
         return wav, "avfoundation"
@@ -1390,6 +1605,15 @@ class MacOSPlatform(JsonlShimMixin):
             return True
         if origin.hwnd > 0 and current.hwnd > 0 and origin.hwnd != current.hwnd:
             return True
+        if origin.tmux_pane:
+            if not current.tmux_pane or origin.tmux_pane != current.tmux_pane:
+                return True
+            if (
+                origin.tmux_socket
+                and current.tmux_socket
+                and not _same_tmux_server(origin.tmux_socket, current.tmux_socket)
+            ):
+                return True
         orig_tty = normalize_tty_path(origin.tty)
         cur_tty = normalize_tty_path(current.tty)
         if orig_tty and not cur_tty:
@@ -1403,6 +1627,9 @@ class MacOSPlatform(JsonlShimMixin):
             c_hint = parse_window_title_hint(current.title)
             if o_hint is not None and c_hint is not None and o_hint.session_token != c_hint.session_token:
                 return True
+            if not origin.tmux_pane and current.tmux_pane and origin.title and current.title:
+                if _normalize_tmux_title_for_drift(origin.title) != _normalize_tmux_title_for_drift(current.title):
+                    return True
             return False
         if (origin.process or origin.bundle_id) and origin.title and not current.title and current.hwnd <= 0 and not cur_tty:
             return True
@@ -1489,7 +1716,88 @@ class MacOSPlatform(JsonlShimMixin):
             and not any(self.env.get(k) for k in ("TMUX", "AGENT_VOICE_INPUT_TMUX_HINT", "TMUX_TMPDIR"))
         ):
             return TmuxServerSnapshot()
-        return probe_tmux_snapshot(env=self.env, extra_sockets=extra_socks)
+        probe_env = (
+            {**self.env, "TMUX_TMPDIR": str(self._cache_dir)}
+            if (self._cache_dir is not None and "TMUX_TMPDIR" not in self.env)
+            else self.env
+        )
+        return probe_tmux_snapshot(env=probe_env, extra_sockets=extra_socks)
+
+    def _resolve_window_tmux_target(
+        self,
+        win: ForegroundWindow,
+        *,
+        allow_pid_single_tty: bool = True,
+        strict_tty: bool = False,
+    ) -> tuple[str, str]:
+        if win.surface_id:
+            return "", ""
+        if (win.process or win.bundle_id) and not is_macos_terminal_window(win.process, win.bundle_id):
+            return "", ""
+        if self._tmux_probe_fn is None and not self._resolve_tmux_exe():
+            return "", ""
+        snap = self._probe_tmux_for_paste()
+        if not snap.clients or not snap.panes:
+            return "", ""
+        target_tty = normalize_tty_path(win.tty)
+        if not target_tty and allow_pid_single_tty and win.pid > 1:
+            try:
+                rows = SessionTracker(env=self.env)._list_darwin_user_ps_rows()
+            except Exception:
+                rows = None
+            if rows:
+                tab_ttys, desc_pids = collect_darwin_window_pty_tree(rows, win.pid)
+                if len(tab_ttys) == 1:
+                    target_tty = next(iter(tab_ttys))
+                elif not tab_ttys and desc_pids:
+                    desc_clients = [
+                        c for c in snap.clients if c.client_pid > 1 and c.client_pid in desc_pids and c.client_tty
+                    ]
+                    if len(desc_clients) == 1:
+                        target_tty = normalize_tty_path(desc_clients[0].client_tty)
+        if target_tty:
+            selected = SessionTracker._select_active_tmux_target(
+                snap,
+                win.title,
+                window_tty=target_tty,
+                window_pid=win.pid,
+                allowed_client_ttys=(target_tty,),
+            )
+            if selected is not None:
+                client, pane = selected
+                if _tty_matches(client.client_tty, target_tty) and pane.pane_id:
+                    return (pane.socket_path or client.socket_path), pane.pane_id
+            return "", ""
+        if not strict_tty and (raw_tmux := (self.env.get("TMUX") or "").strip()):
+            env_sock = parse_tmux_socket_from_env(raw_tmux)
+            scoped_snap = snap
+            if env_sock:
+                c_filt = tuple(
+                    c for c in snap.clients if not c.socket_path or _same_tmux_server(c.socket_path, env_sock)
+                )
+                p_filt = tuple(
+                    p for p in snap.panes if not p.socket_path or _same_tmux_server(p.socket_path, env_sock)
+                )
+                scoped_snap = TmuxServerSnapshot(clients=c_filt, panes=p_filt)
+            selected = SessionTracker._select_active_tmux_target(
+                scoped_snap,
+                win.title,
+                window_tty=target_tty,
+                window_pid=win.pid,
+            )
+            if selected is not None:
+                client, pane = selected
+                if pane.pane_id:
+                    return (pane.socket_path or client.socket_path or env_sock), pane.pane_id
+        return "", ""
+
+    def _enrich_window_tmux_target(self, win: ForegroundWindow) -> ForegroundWindow:
+        if win.tmux_pane or (win.ax_trusted is not None and win.hwnd <= 0 and not win.tty):
+            return win
+        sock_path, pane_id = self._resolve_window_tmux_target(win)
+        if not pane_id:
+            return win
+        return replace(win, tmux_socket=sock_path, tmux_pane=pane_id)
 
     def _try_deliver_attached_tmux(
         self,
@@ -1499,52 +1807,40 @@ class MacOSPlatform(JsonlShimMixin):
         eff_tty: str,
         fg: ForegroundWindow,
         allow_pid_single_tty: bool = False,
-    ) -> bool:
+        origin_window: ForegroundWindow | None = None,
+    ) -> str:
+        orig_pane = (origin_window.tmux_pane or "").strip() if origin_window is not None else ""
+        orig_sock = (origin_window.tmux_socket or "").strip() if origin_window is not None else ""
         tmux_bin = self._resolve_tmux_exe()
         if not tmux_bin:
-            return False
-        snap = self._probe_tmux_for_paste()
-        if not snap.clients or not snap.panes:
-            return False
-        target_tty = normalize_tty_path(eff_tty)
-        if not target_tty and allow_pid_single_tty and fg.pid > 1:
-            rows = SessionTracker(env=self.env)._list_darwin_user_ps_rows()
-            if rows:
-                tab_ttys, desc_pids = collect_darwin_window_pty_tree(rows, fg.pid)
-                if len(tab_ttys) == 1:
-                    target_tty = next(iter(tab_ttys))
-                elif not tab_ttys and desc_pids:
-                    desc_clients = [
-                        c for c in snap.clients if c.client_pid > 1 and c.client_pid in desc_pids and c.client_tty
-                    ]
-                    if len(desc_clients) == 1:
-                        target_tty = normalize_tty_path(desc_clients[0].client_tty)
-        if not target_tty:
-            return False
-        selected = SessionTracker._select_active_tmux_target(
-            snap,
-            fg.title,
-            window_tty=target_tty,
-            window_pid=fg.pid,
-            allowed_client_ttys=(target_tty,),
+            return "focus_changed" if orig_pane else ""
+        probe_win = replace(fg, tty=eff_tty) if eff_tty != fg.tty else fg
+        sock_path, pane_id = self._resolve_window_tmux_target(
+            probe_win,
+            allow_pid_single_tty=allow_pid_single_tty,
+            strict_tty=True,
         )
-        if selected is None:
-            return False
-        client, pane = selected
-        if not _tty_matches(client.client_tty, target_tty) or not pane.pane_id:
-            return False
-        sock_path = pane.socket_path or client.socket_path
+        if not pane_id:
+            return "focus_changed" if orig_pane else ""
+        if orig_pane:
+            if pane_id != orig_pane or (
+                orig_sock and sock_path and not _same_tmux_server(orig_sock, sock_path)
+            ):
+                return "focus_changed"
         cmd_prefix = [tmux_bin]
         if sock_path:
             cmd_prefix.extend(["-S", preferred_tmux_socket_arg(sock_path)])
         tmux_env = {k: v for k, v in self.env.items() if k not in ("TMUX", "TMUX_PANE")}
-        return self._deliver_via_tmux_buffer(
+        pasted = self._deliver_via_tmux_buffer(
             cmd_prefix,
             text,
             seq_id=seq_id,
-            target_pane=pane.pane_id,
+            target_pane=pane_id,
             tmux_env=tmux_env,
         )
+        if pasted:
+            return "tmux"
+        return "tmux_paste_failed" if orig_pane else ""
 
     def _deliver_to_ghostty_surface(self, text: str, surface_id: str, clip_ok: bool) -> PasteOutcome:
         p = self._run_osascript(["-e", _GHOSTTY_INPUT_SCRIPT, "--", surface_id, text], timeout=2.5)
@@ -1572,6 +1868,11 @@ class MacOSPlatform(JsonlShimMixin):
         if origin_window is not None and origin_window.surface_id:
             return self._deliver_to_ghostty_surface(text, origin_window.surface_id, clip_ok)
         fg = self.get_foreground_window()
+        if (
+            "get_foreground_window" in self.__dict__
+            or type(self).get_foreground_window is not MacOSPlatform.get_foreground_window
+        ) and not fg.tmux_pane:
+            fg = self._enrich_window_tmux_target(fg)
         if origin_window is None and fg.surface_id and is_ghostty_app(fg.process, fg.bundle_id):
             return self._deliver_to_ghostty_surface(text, fg.surface_id, clip_ok)
         if self._is_focus_drifted(origin_window, fg) or ((fg.process or fg.bundle_id) and not self.is_allowed_terminal(fg)):
@@ -1579,14 +1880,54 @@ class MacOSPlatform(JsonlShimMixin):
                 self.beep("focus")
             return PasteOutcome(False, clip_ok, "focus_changed" if clip_ok else "clipboard_failed", fg.process)
         if self.env.get("TMUX") and (tmux_exe := self._resolve_tmux_exe()):
-            tmux_env = {k: v for k, v in self.env.items() if k != "TMUX_PANE"}
-            if self._deliver_via_tmux_buffer([tmux_exe], text, seq_id=seq_id, tmux_env=tmux_env):
+            eff_sock = ""
+            target_p = ""
+            if origin_window is not None and origin_window.tmux_pane:
+                cur_sock, cur_pane = self._resolve_window_tmux_target(fg)
+                if (
+                    not cur_pane
+                    or cur_pane != origin_window.tmux_pane
+                    or (
+                        origin_window.tmux_socket
+                        and cur_sock
+                        and not _same_tmux_server(origin_window.tmux_socket, cur_sock)
+                    )
+                ):
+                    if clip_ok:
+                        self.beep("focus")
+                    return PasteOutcome(False, clip_ok, "focus_changed" if clip_ok else "clipboard_failed", fg.process)
+                eff_sock = cur_sock or origin_window.tmux_socket
+                target_p = origin_window.tmux_pane
+            cmd_prefix = [tmux_exe]
+            if eff_sock:
+                cmd_prefix.extend(["-S", preferred_tmux_socket_arg(eff_sock)])
+            tmux_env = (
+                {k: v for k, v in self.env.items() if k not in ("TMUX", "TMUX_PANE")}
+                if eff_sock
+                else {k: v for k, v in self.env.items() if k != "TMUX_PANE"}
+            )
+            if self._deliver_via_tmux_buffer(cmd_prefix, text, seq_id=seq_id, target_pane=target_p, tmux_env=tmux_env):
                 return PasteOutcome(True, clip_ok, "tmux", fg.process)
+            if target_p:
+                if clip_ok:
+                    self.beep("focus")
+                return PasteOutcome(False, clip_ok, "tmux_paste_failed" if clip_ok else "clipboard_failed", fg.process)
         eff_tty = normalize_tty_path(fg.tty)
-        if (eff_tty or fg.pid > 1) and self._try_deliver_attached_tmux(
-            text, seq_id=seq_id, eff_tty=eff_tty, fg=fg, allow_pid_single_tty=not bool(eff_tty)
-        ):
-            return PasteOutcome(True, clip_ok, "tmux", fg.process)
+        if eff_tty or fg.pid > 1 or (origin_window is not None and origin_window.tmux_pane):
+            tmux_out = self._try_deliver_attached_tmux(
+                text,
+                seq_id=seq_id,
+                eff_tty=eff_tty,
+                fg=fg,
+                allow_pid_single_tty=not bool(eff_tty),
+                origin_window=origin_window,
+            )
+            if tmux_out == "tmux":
+                return PasteOutcome(True, clip_ok, "tmux", fg.process)
+            if tmux_out in ("focus_changed", "tmux_paste_failed"):
+                if clip_ok:
+                    self.beep("focus")
+                return PasteOutcome(False, clip_ok, tmux_out if clip_ok else "clipboard_failed", fg.process)
         if not clip_ok:
             return PasteOutcome(False, False, "clipboard_failed", fg.process)
         p = self._run_osascript(["-e", _CMD_V_SCRIPT], timeout=2.5)

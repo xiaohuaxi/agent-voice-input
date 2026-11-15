@@ -2658,7 +2658,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 self.assertEqual(r_stop_tap["seq_id"], r_start["seq_id"])
                 release_asr.set()
                 deadline = time.monotonic() + 2.5
-                while time.monotonic() < deadline and not pasted_mid:
+                while time.monotonic() < deadline and (not pasted_mid or daemon2.state != "idle" or "done" not in hud_mid):
                     time.sleep(0.02)
                 self.assertEqual(pasted_mid, ["断麦前已说的前半段内容"])
                 self.assertEqual(daemon2.state, "idle")
@@ -2728,7 +2728,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 r_max = daemon_max.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))
                 self.assertTrue(r_max["ok"])
                 deadline = time.monotonic() + 2.5
-                while time.monotonic() < deadline and not pasted_max:
+                while time.monotonic() < deadline and (not pasted_max or daemon_max.state != "idle" or "done" not in hud_max):
                     time.sleep(0.02)
                 self.assertEqual(pasted_max, ["最长录音自动完成不误报断麦"])
                 self.assertEqual(daemon_max.state, "idle")
@@ -2749,10 +2749,13 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         fail_resolve = [False]
         fail_cancel = [False]
         start_exc: list[Exception | None] = [None]
+        stop_exc: list[Exception | None] = [None]
+        hud_records: list[tuple[str, int, dict[str, object]]] = []
 
         class _SlowResolvePlatform(_FakePlatform):
             def hud(self, state: str, text: str = "", duration_ms: int = 0, **_kw: object) -> None:
                 events.append(f"hud:{state}")
+                hud_records.append((state, duration_ms, dict(_kw)))
                 super().hud(state, text, duration_ms)
 
             def beep(self, kind: str) -> None:
@@ -2764,6 +2767,12 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 if start_exc[0] is not None:
                     raise start_exc[0]
                 rec_active[0] = True
+
+            def stop_recording(self) -> tuple[bytes, str]:
+                rec_active[0] = False
+                if stop_exc[0] is not None:
+                    raise stop_exc[0]
+                return super().stop_recording()
 
             def cancel_recording(self) -> None:
                 events.append("cancel_rec")
@@ -2891,6 +2900,38 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                     self.assertNotIn("cancel_rec", events)
                     self.assertEqual(events, ["start_rec:loopback=False", exp_hud, "beep:error"])
                 start_exc[0] = None
+
+                # 5. stop_recording raising NoMicrophoneError / MicrophoneUnavailableError (e.g. first TCC dialog denied)
+                for stop_err, exp_state, exp_reason, exp_dur in (
+                    (
+                        MicrophoneUnavailableError(
+                            "macOS Microphone access is denied",
+                            reason_code="mic_permission",
+                            hud_state="mic_permission",
+                        ),
+                        "mic_permission",
+                        "mic_permission",
+                        0,
+                    ),
+                    (NoMicrophoneError("mic unplugged on stop"), "no_mic", "no_mic", 2200),
+                ):
+                    daemon._last_trigger_ts = -1e9
+                    self.assertTrue(daemon.handle_trigger("toggle")["ok"])
+                    self.assertEqual(daemon.state, "recording")
+                    events.clear()
+                    hud_records.clear()
+                    stop_exc[0] = stop_err
+                    daemon._last_trigger_ts = -1e9
+                    r_stop = daemon.handle_trigger("toggle")
+                    self.assertFalse(r_stop["ok"])
+                    self.assertEqual(r_stop.get("skipped_reason"), exp_reason)
+                    self.assertEqual(daemon.last_result.get("skipped_reason"), exp_reason)
+                    self.assertEqual(daemon.state, "idle")
+                    self.assertEqual(events, ["hud:recognizing", f"hud:{exp_state}", "beep:error"])
+                    self.assertEqual(hud_records[-1][0], exp_state)
+                    self.assertEqual(hud_records[-1][1], exp_dur)
+                    self.assertTrue(hud_records[-1][2].get("clear_main"))
+                stop_exc[0] = None
             finally:
                 daemon.close()
 
@@ -3344,6 +3385,73 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertIn("Add-Type C# compile failed", err_txt)
             self.assertNotIn("OLD_YESTERDAY_ERROR_MUST_NOT_SHOW", err_txt)
             self.assertNotIn(sec, err_txt)
+
+            # 6. CLI `toggle` uses timeout_sec >= 20.0 (covering 15s first-time TCC prompt) and distinguishes
+            #    TimeoutError / socket.timeout from "daemon is not running"; `_window_from_mapping` parses tmux fields
+            import socket as sock_mod
+            from agent_voice_input.daemon import _window_from_mapping
+
+            mapped_win = _window_from_mapping(
+                {
+                    "hwnd": 42,
+                    "process": "Terminal",
+                    "tty": "/dev/ttys004",
+                    "tmux_socket": "/tmp/avi.sock",
+                    "tmux_pane": "%3",
+                }
+            )
+            self.assertEqual((mapped_win.tmux_socket, mapped_win.tmux_pane), ("/tmp/avi.sock", "%3"))
+
+            seen_toggle_timeouts: list[float] = []
+
+            def fake_toggle_ok(_rt_dir: Path, payload: dict[str, object], timeout_sec: float = 8.0) -> dict[str, object]:
+                self.assertEqual(payload.get("cmd"), "toggle")
+                seen_toggle_timeouts.append(timeout_sec)
+                return {"ok": True, "state": "recording", "seq_id": 1}
+
+            toggle_out = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(cli_mod, "send_control_command", side_effect=fake_toggle_ok),
+                mock.patch("sys.stdout", toggle_out),
+            ):
+                rc_tog_ok = cli_mod.main(["toggle"])
+            self.assertEqual(rc_tog_ok, 0)
+            self.assertEqual(len(seen_toggle_timeouts), 1)
+            self.assertGreaterEqual(seen_toggle_timeouts[0], 20.0)
+            self.assertIn('"recording"', toggle_out.getvalue())
+
+            for timeout_exc in (TimeoutError("timed out"), sock_mod.timeout("socket timed out")):
+                tog_to_err = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch.object(cli_mod, "send_control_command", side_effect=timeout_exc),
+                    mock.patch("sys.stderr", tog_to_err),
+                ):
+                    rc_tog_to = cli_mod.main(["toggle"])
+                self.assertEqual(rc_tog_to, 1)
+                self.assertIn("timed out", tog_to_err.getvalue().lower())
+                self.assertNotIn("daemon is not running", tog_to_err.getvalue())
+
+            tog_down_err = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(cli_mod, "send_control_command", side_effect=ConnectionRefusedError("refused")),
+                mock.patch("sys.stderr", tog_down_err),
+            ):
+                rc_tog_down = cli_mod.main(["toggle"])
+            self.assertEqual(rc_tog_down, 1)
+            self.assertIn("agent-voice-input daemon is not running", tog_down_err.getvalue())
+
+            st_to_out = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(cli_mod, "send_control_command", side_effect=TimeoutError("status timeout")),
+                mock.patch("sys.stdout", st_to_out),
+            ):
+                rc_st_to = cli_mod.main(["status"])
+            self.assertEqual(rc_st_to, 1)
+            self.assertEqual(json.loads(st_to_out.getvalue()), {"ok": False, "state": "stopped"})
 
 
 if __name__ == "__main__":

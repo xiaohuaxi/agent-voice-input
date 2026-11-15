@@ -1,7 +1,9 @@
 import AppKit
 import ApplicationServices
+import AVFoundation
 import CoreAudio
 import Foundation
+import Security
 
 // Device-dependent modifier masks from IOKit/hidsystem/IOLLEvent.h
 private let NX_DEVICELCTLKEYMASK: UInt   = 0x00000001
@@ -270,7 +272,7 @@ func computeHudPillY(visibleMinY: CGFloat, visibleMaxY: CGFloat, pillH: CGFloat,
 }
 
 func computeHudToastY(visibleMinY: CGFloat, visibleMaxY: CGFloat, mainH: CGFloat, toastH: CGFloat, position: String) -> CGFloat {
-    let effMainH = max(42.0, mainH)
+    let effMainH = max(36.0, mainH)
     if normalizeHudPosition(position) == "top" {
         return round(visibleMaxY - 14.0 - effMainH - 8.0 - toastH)
     }
@@ -386,9 +388,9 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
     let st = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     let layer = resolveHudLayer(state: st, explicitLayer: explicitLayer)
 
-    let toastBg = HudRgba(r: 30.0 / 255.0, g: 31.0 / 255.0, b: 36.0 / 255.0, a: 0.96)
+    let toastBg = HudRgba(r: 30.0 / 255.0, g: 31.0 / 255.0, b: 36.0 / 255.0, a: 0.98)
     let toastMainText = HudRgba(r: 244.0 / 255.0, g: 245.0 / 255.0, b: 248.0 / 255.0, a: 1.0)
-    let toastHintText = HudRgba(r: 182.0 / 255.0, g: 186.0 / 255.0, b: 196.0 / 255.0, a: 0.92)
+    let toastHintText = HudRgba(r: 204.0 / 255.0, g: 208.0 / 255.0, b: 218.0 / 255.0, a: 1.0)
     let amberBorder = HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 0.78)
     let amberIcon = HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 1.0)
     let coralBorder = HudRgba(r: 248.0 / 255.0, g: 113.0 / 255.0, b: 113.0 / 255.0, a: 0.78)
@@ -399,12 +401,12 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
         return HudVisualStyle(
             layer: layer,
             defaultText: zh ? "● 录音中…" : "● Listening…",
-            bg: hudRgba(64, 18, 26, 0.95),
+            bg: hudRgba(64, 18, 26, 0.98),
             border: hudRgba(232, 88, 102, 0.68),
             borderWidth: 1.0,
             icon: hudRgba(255, 104, 112, 1.0),
             mainText: hudRgba(248, 250, 252, 1.0),
-            hintText: hudRgba(188, 178, 192, 0.90),
+            hintText: hudRgba(210, 200, 216, 1.0),
             autoHideMs: 0,
             iconKind: ""
         )
@@ -412,7 +414,7 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
         return HudVisualStyle(
             layer: layer,
             defaultText: zh ? "◐ 语音识别…" : "◐ Transcribing…",
-            bg: hudRgba(16, 40, 72, 0.95),
+            bg: hudRgba(16, 40, 72, 0.98),
             border: hudRgba(56, 189, 248, 0.65),
             borderWidth: 1.0,
             icon: hudRgba(56, 189, 248, 1.0),
@@ -425,7 +427,7 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
         return HudVisualStyle(
             layer: layer,
             defaultText: zh ? "◈ 整理精修…" : "◈ Refining…",
-            bg: hudRgba(46, 22, 76, 0.95),
+            bg: hudRgba(46, 22, 76, 0.98),
             border: hudRgba(192, 132, 252, 0.65),
             borderWidth: 1.0,
             icon: hudRgba(208, 156, 255, 1.0),
@@ -438,7 +440,7 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
         return HudVisualStyle(
             layer: layer,
             defaultText: zh ? "✓ 已填入" : "✓ Inserted",
-            bg: hudRgba(14, 54, 36, 0.95),
+            bg: hudRgba(14, 54, 36, 0.98),
             border: hudRgba(74, 222, 128, 0.62),
             borderWidth: 1.0,
             icon: hudRgba(74, 222, 128, 1.0),
@@ -451,7 +453,7 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
         return HudVisualStyle(
             layer: layer,
             defaultText: zh ? "✓ 已复制(窗口已切换)" : "✓ Copied (window switched)",
-            bg: hudRgba(28, 32, 82, 0.95),
+            bg: hudRgba(28, 32, 82, 0.98),
             border: hudRgba(129, 140, 248, 0.68),
             borderWidth: 1.0,
             icon: hudRgba(144, 156, 255, 1.0),
@@ -609,8 +611,8 @@ private func containsCjkScalar(_ s: String) -> Bool {
 }
 
 final class StatusIconView: NSView {
-    static let mainBoxSize: CGFloat = 14.0
-    static let toastBoxSize: CGFloat = 13.0
+    static let mainBoxSize: CGFloat = 13.0
+    static let toastBoxSize: CGFloat = 12.0
     static let boxSize: CGFloat = mainBoxSize
 
     override var isFlipped: Bool { true }
@@ -715,10 +717,10 @@ final class StatusIconView: NSView {
 }
 
 final class WaveBarsView: NSView {
-    static let barWidth: CGFloat = 3.0
-    static let barGap: CGFloat = 3.0
-    static let maxBarHeight: CGFloat = 18.0
-    static let totalWidth: CGFloat = 51.0
+    static let barWidth: CGFloat = 2.5
+    static let barGap: CGFloat = 2.5
+    static let maxBarHeight: CGFloat = 15.0
+    static let totalWidth: CGFloat = 42.5
 
     var barNorms: [CGFloat] = Array(repeating: 0.0, count: 9) {
         didSet { needsDisplay = true }
@@ -748,23 +750,23 @@ final class WaveBarsView: NSView {
 }
 
 final class HudPillController {
-    private static let recBg = rgba(64, 18, 26, 0.95)
+    private static let recBg = rgba(64, 18, 26, 0.98)
     private static let recBorder = rgba(232, 88, 102, 0.68)
     private static let recWaveActive = rgba(255, 104, 112, 1.0)
     private static let recWaveQuiet = rgba(232, 92, 102, 1.0)
     private static let recMainText = rgba(248, 250, 252)
-    private static let recHintTextCol = rgba(188, 178, 192, 0.90)
+    private static let recHintTextCol = rgba(210, 200, 216, 1.0)
 
-    private static let warnBg = rgba(72, 38, 12, 0.95)
+    private static let warnBg = rgba(72, 38, 12, 0.98)
     private static let warnBorder = rgba(245, 158, 11, 0.72)
     private static let warnWaveActive = rgba(251, 191, 36, 1.0)
     private static let warnWaveQuiet = rgba(251, 191, 36, 0.86)
     private static let warnMainText = rgba(254, 252, 232)
     private static let warnHintTextCol = rgba(251, 191, 36, 1.0)
 
-    private static let hudFont = NSFont.systemFont(ofSize: 15.0, weight: .medium)
-    private static let monoDurFont = NSFont.monospacedDigitSystemFont(ofSize: 15.0, weight: .medium)
-    private static let toastFont = NSFont.systemFont(ofSize: 14.0, weight: .medium)
+    private static let hudFont = NSFont.systemFont(ofSize: 14.0, weight: .medium)
+    private static let monoDurFont = NSFont.monospacedDigitSystemFont(ofSize: 14.0, weight: .medium)
+    private static let toastFont = NSFont.systemFont(ofSize: 13.0, weight: .medium)
     private static let bellWeight: [CGFloat] = [1.00, 0.92, 0.78, 0.58, 0.40]
 
     private var panel: NSPanel?
@@ -783,13 +785,13 @@ final class HudPillController {
     private var toastLabel: NSTextField?
     private var toastHideWorkItem: DispatchWorkItem?
 
-    private var currentMainPillH: CGFloat = 42.0
+    private var currentMainPillH: CGFloat = 36.0
     private var isMainVisible = false
     private var isToastVisible = false
     private var anchoredScale: CGFloat = 2.0
     private var anchoredVisibleFrame: NSRect = .zero
     private var lastToastPosition: String = "bottom"
-    private var currentToastSize: NSSize = NSSize(width: 120.0, height: 36.0)
+    private var currentToastSize: NSSize = NSSize(width: 120.0, height: 32.0)
     private var isWaveRecording = false
     private var recStartMs: UInt64 = 0
     private var liveLevel: CGFloat = 0.0
@@ -817,18 +819,31 @@ final class HudPillController {
         self.isPtt = isPtt
     }
 
+    private func alignSubviewRect(_ rect: NSRect, in container: NSView, scale: CGFloat) -> NSRect {
+        if container.window != nil {
+            return container.backingAlignedRect(rect, options: .alignAllEdgesNearest)
+        }
+        return NSRect(
+            x: snapToPixel(rect.origin.x, scale: scale),
+            y: snapToPixel(rect.origin.y, scale: scale),
+            width: snapToPixel(rect.size.width, scale: scale),
+            height: snapToPixel(rect.size.height, scale: scale)
+        )
+    }
+
     private func ensurePanel() {
         if panel != nil { return }
-        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 240, height: 42), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 240, height: 36), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.appearance = NSAppearance(named: .darkAqua)
         p.level = .statusBar
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
         p.ignoresMouseEvents = true; p.hidesOnDeactivate = false; p.isReleasedWhenClosed = false
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 42))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 36))
         container.wantsLayer = true
         container.layer?.backgroundColor = Self.recBg.cgColor
-        container.layer?.cornerRadius = 21.0
+        container.layer?.cornerRadius = 18.0
         container.layer?.borderWidth = 1.0
         container.layer?.masksToBounds = true
 
@@ -844,7 +859,7 @@ final class HudPillController {
         tf.maximumNumberOfLines = 1
         container.addSubview(tf)
 
-        let wv = WaveBarsView(frame: NSRect(x: 0, y: 0, width: WaveBarsView.totalWidth, height: 42))
+        let wv = WaveBarsView(frame: NSRect(x: 0, y: 0, width: WaveBarsView.totalWidth, height: 36))
         wv.isHidden = true
         container.addSubview(wv)
 
@@ -872,15 +887,16 @@ final class HudPillController {
 
     private func ensureToastPanel() {
         if toastPanel != nil { return }
-        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 220, height: 36), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 220, height: 32), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.appearance = NSAppearance(named: .darkAqua)
         p.level = .statusBar
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
         p.ignoresMouseEvents = true; p.hidesOnDeactivate = false; p.isReleasedWhenClosed = false
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 36))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 32))
         container.wantsLayer = true
-        container.layer?.cornerRadius = 18.0
+        container.layer?.cornerRadius = 16.0
         container.layer?.borderWidth = 1.0
         container.layer?.masksToBounds = true
 
@@ -925,7 +941,7 @@ final class HudPillController {
         let toastW = currentToastSize.width
         let toastH = currentToastSize.height
         let toastX = snapToPixel(vf.midX - toastW / 2.0, scale: scale)
-        let mainSlotH: CGFloat = isMainVisible ? max(42.0, currentMainPillH) : 42.0
+        let mainSlotH: CGFloat = isMainVisible ? max(36.0, currentMainPillH) : 36.0
         let toastY = computeHudToastY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, mainH: mainSlotH, toastH: toastH, position: lastToastPosition)
         toastPanel.setFrame(NSRect(x: toastX, y: toastY, width: toastW, height: toastH), display: false)
     }
@@ -1070,16 +1086,16 @@ final class HudPillController {
             hintLabel.isHidden = true
         }
 
-        let padL: CGFloat = 18.0, padR: CGFloat = 18.0
+        let padL: CGFloat = 16.0, padR: CGFloat = 16.0
         let waveW: CGFloat = WaveBarsView.totalWidth
-        let gap1: CGFloat = 11.0
-        let gap2: CGFloat = effHint.isEmpty ? 0.0 : 11.0
+        let gap1: CGFloat = 10.0
+        let gap2: CGFloat = effHint.isEmpty ? 0.0 : 10.0
         let totalContentW = slotW + gap1 + waveW + gap2 + hintW
         let textH = max(max(tplH, actH), hintH)
 
         let (scale, vf) = resolveAnchoredScreenMetrics(refresh: false)
         let maxW = max(64.0, min(680.0, vf.width - 24.0))
-        let pillH: CGFloat = max(42.0, ceil(textH) + 18.0)
+        let pillH: CGFloat = max(36.0, ceil(textH) + 12.0)
         let pillW: CGFloat = min(maxW, max(64.0, snapToPixel(totalContentW + padL + padR, scale: scale)))
         let pillX = snapToPixel(vf.midX - pillW / 2.0, scale: scale)
         let pillY = computeHudPillY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, pillH: pillH, position: recPosition)
@@ -1099,10 +1115,10 @@ final class HudPillController {
 
         let durH = max(tplH, actH)
         let durY = snapToPixel((pillH - durH) / 2.0, scale: scale)
-        durLabel.frame = NSRect(x: curX, y: durY, width: slotW, height: durH)
+        durLabel.frame = alignSubviewRect(NSRect(x: curX, y: durY, width: slotW, height: durH), in: bgView, scale: scale)
         curX += slotW + gap1
 
-        waveView.frame = NSRect(x: snapToPixel(curX, scale: scale), y: 0, width: waveW, height: pillH)
+        waveView.frame = alignSubviewRect(NSRect(x: snapToPixel(curX, scale: scale), y: 0, width: waveW, height: pillH), in: bgView, scale: scale)
         waveView.layer?.contentsScale = scale
         curX += waveW + gap2
 
@@ -1110,7 +1126,7 @@ final class HudPillController {
             let curXSnap = snapToPixel(curX, scale: scale)
             let remW = max(0.0, pillW - padR - curXSnap)
             let hintY = snapToPixel((pillH - hintH) / 2.0, scale: scale)
-            hintLabel.frame = NSRect(x: curXSnap, y: hintY, width: min(hintW, remW), height: hintH)
+            hintLabel.frame = alignSubviewRect(NSRect(x: curXSnap, y: hintY, width: min(hintW, remW), height: hintH), in: bgView, scale: scale)
         }
     }
 
@@ -1119,7 +1135,7 @@ final class HudPillController {
         stopWaveTimer()
         maxDurationSec = 0; warnRemainSec = 0
         isMainVisible = false
-        currentMainPillH = 42.0
+        currentMainPillH = 36.0
         panel?.orderOut(nil)
     }
 
@@ -1236,10 +1252,10 @@ final class HudPillController {
             let textSize = hasBody ? label.frame.size : NSSize(width: 0, height: 18)
             let textH = ceil(textSize.height)
             let iconBox: CGFloat = hasIcon ? StatusIconView.mainBoxSize : 0.0
-            let iconGap: CGFloat = (hasIcon && hasBody) ? 8.0 : 0.0
-            let padL: CGFloat = 18.0, padR: CGFloat = 18.0
+            let iconGap: CGFloat = (hasIcon && hasBody) ? 7.0 : 0.0
+            let padL: CGFloat = 16.0, padR: CGFloat = 16.0
             let contentW = iconBox + iconGap + ceil(textSize.width)
-            let pillH: CGFloat = max(42.0, ceil(textH) + 18.0)
+            let pillH: CGFloat = max(36.0, ceil(textH) + 12.0)
 
             let (scale, vf) = resolveAnchoredScreenMetrics(refresh: false)
             let maxW = max(64.0, min(680.0, vf.width - 24.0))
@@ -1264,7 +1280,7 @@ final class HudPillController {
                 iconView.iconKind = Self.resolveIconKind(stateKind: style.iconKind, iconSeg: seg.icon)
                 iconView.iconColor = iconColor
                 let iconY = snapToPixel((pillH - iconBox) / 2.0, scale: scale)
-                iconView.frame = NSRect(x: curX, y: iconY, width: iconBox, height: iconBox)
+                iconView.frame = alignSubviewRect(NSRect(x: curX, y: iconY, width: iconBox, height: iconBox), in: bgView, scale: scale)
                 iconView.layer?.contentsScale = scale
                 iconView.isHidden = false
                 curX += iconBox + iconGap
@@ -1274,7 +1290,7 @@ final class HudPillController {
             if hasBody {
                 let labelY = snapToPixel((pillH - textH) / 2.0, scale: scale)
                 let remW = max(0.0, pillW - padR - curX)
-                label.frame = NSRect(x: curX, y: labelY, width: min(ceil(textSize.width), remW), height: textH)
+                label.frame = alignSubviewRect(NSRect(x: curX, y: labelY, width: min(ceil(textSize.width), remW), height: textH), in: bgView, scale: scale)
             }
             isMainVisible = true
             panel.orderFrontRegardless()
@@ -1319,16 +1335,16 @@ final class HudPillController {
         let textSize = hasBody ? toastLabel.frame.size : NSSize(width: 0, height: 17)
         let textH = ceil(textSize.height)
         let iconBox: CGFloat = hasIcon ? StatusIconView.toastBoxSize : 0.0
-        let iconGap: CGFloat = (hasIcon && hasBody) ? 7.0 : 0.0
-        let padL: CGFloat = 15.0, padR: CGFloat = 15.0
+        let iconGap: CGFloat = (hasIcon && hasBody) ? 6.5 : 0.0
+        let padL: CGFloat = 14.0, padR: CGFloat = 14.0
         let contentW = iconBox + iconGap + ceil(textSize.width)
-        let toastH: CGFloat = max(36.0, ceil(textH) + 14.0)
+        let toastH: CGFloat = max(32.0, ceil(textH) + 10.0)
 
         let (scale, vf) = resolveAnchoredScreenMetrics(refresh: !(isMainVisible || isToastVisible))
         let maxW = max(64.0, min(680.0, vf.width - 24.0))
         let toastW: CGFloat = min(maxW, max(64.0, snapToPixel(contentW + padL + padR, scale: scale)))
         let toastX = snapToPixel(vf.midX - toastW / 2.0, scale: scale)
-        let mainSlotH: CGFloat = isMainVisible ? max(42.0, currentMainPillH) : 42.0
+        let mainSlotH: CGFloat = isMainVisible ? max(36.0, currentMainPillH) : 36.0
         let toastY = computeHudToastY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, mainH: mainSlotH, toastH: toastH, position: position)
         lastToastPosition = position
         currentToastSize = NSSize(width: toastW, height: toastH)
@@ -1348,7 +1364,7 @@ final class HudPillController {
             toastIconView.iconKind = effIconKind
             toastIconView.iconColor = style.icon.nsColor
             let iconY = snapToPixel((toastH - iconBox) / 2.0, scale: scale)
-            toastIconView.frame = NSRect(x: curX, y: iconY, width: iconBox, height: iconBox)
+            toastIconView.frame = alignSubviewRect(NSRect(x: curX, y: iconY, width: iconBox, height: iconBox), in: toastBgView, scale: scale)
             toastIconView.layer?.contentsScale = scale
             toastIconView.isHidden = false
             curX += iconBox + iconGap
@@ -1358,7 +1374,7 @@ final class HudPillController {
         if hasBody {
             let labelY = snapToPixel((toastH - textH) / 2.0, scale: scale)
             let remW = max(0.0, toastW - padR - curX)
-            toastLabel.frame = NSRect(x: curX, y: labelY, width: min(ceil(textSize.width), remW), height: textH)
+            toastLabel.frame = alignSubviewRect(NSRect(x: curX, y: labelY, width: min(ceil(textSize.width), remW), height: textH), in: toastBgView, scale: scale)
         }
         isToastVisible = true
         toastPanel.orderFrontRegardless()
@@ -1580,7 +1596,46 @@ private func queryDefaultInputDeviceID() -> AudioDeviceID {
     return (status == noErr) ? devId : AudioDeviceID(kAudioObjectUnknown)
 }
 
+func queryMicrophonePermissionInfo() -> [String: Any] {
+    let micAuth: String
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:
+        micAuth = "authorized"
+    case .denied:
+        micAuth = "denied"
+    case .restricted:
+        micAuth = "restricted"
+    case .notDetermined:
+        micAuth = "not_determined"
+    @unknown default:
+        micAuth = "unknown"
+    }
+    var info: [String: Any] = ["mic_auth": micAuth]
+    var sid = SecuritySessionId(0)
+    var attrs = SessionAttributeBits(rawValue: 0)
+    if SessionGetInfo(callerSecuritySession, &sid, &attrs) == errSessionSuccess {
+        info["has_graphic_session"] = attrs.contains(.sessionHasGraphicAccess)
+        info["is_remote_session"] = attrs.contains(.sessionIsRemote)
+    }
+    return info
+}
+
 func queryAudioInputStatus() -> [String: Any] {
+    let permInfo = queryMicrophonePermissionInfo()
+    func failedHalStatus() -> [String: Any] {
+        var out: [String: Any] = [
+            "hal_ok": false,
+            "has_input": false,
+            "input_count": 0,
+            "default_uid": "",
+            "default_name": "",
+            "default_name_unique": false,
+            "alive_uids": [String](),
+            "uid_names": [String: String](),
+        ]
+        for (k, v) in permInfo { out[k] = v }
+        return out
+    }
     let sysObj = AudioObjectID(kAudioObjectSystemObject)
     var devicesAddr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDevices,
@@ -1588,17 +1643,19 @@ func queryAudioInputStatus() -> [String: Any] {
         mElement: kAudioObjectPropertyElementMain
     )
     var dataSize: UInt32 = 0
-    guard AudioObjectGetPropertyDataSize(sysObj, &devicesAddr, 0, nil, &dataSize) == noErr,
-          dataSize >= UInt32(MemoryLayout<AudioDeviceID>.size) else {
-        return ["has_input": false, "input_count": 0, "default_uid": "", "default_name": "", "default_name_unique": false, "alive_uids": [String](), "uid_names": [String: String]()]
+    guard AudioObjectGetPropertyDataSize(sysObj, &devicesAddr, 0, nil, &dataSize) == noErr else {
+        return failedHalStatus()
     }
     let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
     var deviceIds = [AudioDeviceID](repeating: 0, count: count)
-    var actualSize = dataSize
-    guard AudioObjectGetPropertyData(sysObj, &devicesAddr, 0, nil, &actualSize, &deviceIds) == noErr else {
-        return ["has_input": false, "input_count": 0, "default_uid": "", "default_name": "", "default_name_unique": false, "alive_uids": [String](), "uid_names": [String: String]()]
+    var actualCount = 0
+    if count > 0 {
+        var actualSize = dataSize
+        guard AudioObjectGetPropertyData(sysObj, &devicesAddr, 0, nil, &actualSize, &deviceIds) == noErr else {
+            return failedHalStatus()
+        }
+        actualCount = min(count, Int(actualSize) / MemoryLayout<AudioDeviceID>.size)
     }
-    let actualCount = min(count, Int(actualSize) / MemoryLayout<AudioDeviceID>.size)
 
     var aliveUids: [String] = []
     var uidNames: [String: String] = [:]
@@ -1634,7 +1691,8 @@ func queryAudioInputStatus() -> [String: Any] {
             }
         }
     }
-    return [
+    var result: [String: Any] = [
+        "hal_ok": true,
         "has_input": !aliveUids.isEmpty,
         "input_count": aliveUids.count,
         "default_uid": defaultUid,
@@ -1643,6 +1701,8 @@ func queryAudioInputStatus() -> [String: Any] {
         "alive_uids": aliveUids,
         "uid_names": uidNames,
     ]
+    for (k, v) in permInfo { result[k] = v }
+    return result
 }
 
 private func audioStatusSnapshotKey(_ st: [String: Any]) -> String {
@@ -1814,12 +1874,12 @@ private func runSelfCheck() -> Int32 {
         try check(recov.count == 1 && recov[0].kind == "toggle", "recovered toggle after swallowed keyUp")
 
         try check(isZhUiCulture("zh-Hans-CN") && isZhUiCulture("zh_TW.UTF-8") && !isZhUiCulture("en-US"), "ui_culture zh detection")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 42.0, position: "bottom") == 58.0, "HUD bottom pillY")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 42.0, position: "") == 58.0, "HUD default pillY")
-        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 42.0, position: " TOP ") == 844.0, "HUD top pillY")
-        try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 42.0, toastH: 36.0, position: "bottom") == 108.0, "HUD bottom toastY")
-        try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 0.0, toastH: 36.0, position: "") == 108.0, "HUD bottom toastY min mainH")
-        try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 42.0, toastH: 36.0, position: " TOP ") == 800.0, "HUD top toastY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 58.0, "HUD bottom pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 58.0, "HUD default pillY")
+        try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: " TOP ") == 850.0, "HUD top pillY")
+        try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 36.0, toastH: 32.0, position: "bottom") == 102.0, "HUD bottom toastY")
+        try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 0.0, toastH: 32.0, position: "") == 102.0, "HUD bottom toastY min mainH")
+        try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 36.0, toastH: 32.0, position: " TOP ") == 810.0, "HUD top toastY")
 
         try check(stripLeadingHudSymbol("! 麦克风暂忙") == "麦克风暂忙", "stripLeadingHudSymbol bang")
         try check(stripLeadingHudSymbol("⚠ 麦克风暂忙") == "麦克风暂忙", "stripLeadingHudSymbol warn")
@@ -1853,13 +1913,19 @@ private func runSelfCheck() -> Int32 {
         try check(countdownHintSlotTemplate(12, zh: true) == "(88s 后自动完成)" && countdownHintSlotTemplate(9, zh: false) == "(auto-finish in 8s)", "HUD countdown slot template")
 
         let audioSt = queryAudioInputStatus()
-        guard let hasInput = audioSt["has_input"] as? Bool,
+        let validMicAuths: Set<String> = ["authorized", "denied", "restricted", "not_determined", "unknown"]
+        guard let halOk = audioSt["hal_ok"] as? Bool,
+              let micAuth = audioSt["mic_auth"] as? String,
+              !micAuth.isEmpty,
+              validMicAuths.contains(micAuth),
+              let hasInput = audioSt["has_input"] as? Bool,
               let inputCount = audioSt["input_count"] as? Int,
               let defaultUid = audioSt["default_uid"] as? String,
               let _ = audioSt["default_name"] as? String,
               let aliveUids = audioSt["alive_uids"] as? [String] else {
             throw NSError(domain: "SelfCheck", code: 2, userInfo: [NSLocalizedDescriptionKey: "invalid queryAudioInputStatus structure"])
         }
+        _ = halOk
         try check(aliveUids.count == inputCount && (inputCount > 0) == hasInput, "audio_status count invariant")
         try check(defaultUid.isEmpty || aliveUids.contains(defaultUid), "audio_status default_uid invariant")
 

@@ -37,6 +37,7 @@ from agent_voice_input.platform_macos import (  # noqa: E402
     _TERMINAL_QUERY_SCRIPT,
     _summarize_osascript_error,
     check_macos_clt_ready,
+    classify_macos_mic_permission,
     compile_mac_shim,
     get_macos_cache_dir,
     is_apple_terminal_app,
@@ -44,6 +45,7 @@ from agent_voice_input.platform_macos import (  # noqa: E402
     parse_avfoundation_audio_devices,
     probe_macos_host,
     resolve_macos_audio_device,
+    run_mac_shim_self_check,
     run_macos_key_test,
 )
 from agent_voice_input._tmux import (  # noqa: E402
@@ -1200,11 +1202,14 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     daemon_all.close()
 
     def test_mac_shim_static_invariants(self) -> None:
-        self.assertEqual(SHIM_SCHEMA_VERSION, 2)
+        self.assertEqual(SHIM_SCHEMA_VERSION, 3)
         self.assertTrue(MAC_SHIM_SCRIPT.is_file())
         src = MAC_SHIM_SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn("import Carbon", src)
+        self.assertIn("import AVFoundation", src)
         self.assertIn("import CoreAudio", src)
+        self.assertIn("import Security", src)
+        self.assertNotIn("requestAccess", src)
         # Right Control dual compatibility: keyCode 0x3E (62) + NX_DEVICERCTLKEYMASK (0x00002000)
         self.assertIn("0x00002000", src)
         self.assertIn("0x3E", src)
@@ -1215,6 +1220,10 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         # Non-activating capsule HUD + independent Doubao-style upper toast panel invariants
         self.assertIn(".accessory", src)
         self.assertIn(".nonactivatingPanel", src)
+        self.assertIn("p.appearance = NSAppearance(named: .darkAqua)", src)
+        self.assertEqual(src.count("p.appearance = NSAppearance(named: .darkAqua)"), 2)
+        self.assertIn("backingAlignedRect(rect, options: .alignAllEdgesNearest)", src)
+        self.assertIn("private func alignSubviewRect(", src)
         self.assertIn("private var toastPanel: NSPanel?", src)
         self.assertIn("private var toastHideWorkItem: DispatchWorkItem?", src)
         self.assertIn("ignoresMouseEvents = true", src)
@@ -1239,6 +1248,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn("✕ 麦克风已断开", src)
         self.assertIn("func computeHudPillY(", src)
         self.assertIn("func computeHudToastY(", src)
+        self.assertIn("let effMainH = max(36.0, mainH)", src)
         self.assertIn("round(visibleMinY + 8.0)", src)
         self.assertIn("round(visibleMaxY - pillH - 14.0)", src)
         self.assertIn("round(visibleMinY + 8.0 + effMainH + 8.0)", src)
@@ -1247,28 +1257,41 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn("func stripOuterParens(", src)
         self.assertIn("func stripLeadingHudSymbol(", src)
         self.assertIn("func resolveHudVisualStyle(", src)
-        self.assertIn("rgba(64, 18, 26, 0.95)", src)
-        self.assertIn("rgba(72, 38, 12, 0.95)", src)
-        self.assertIn("hudRgba(16, 40, 72, 0.95)", src)
-        self.assertIn("hudRgba(46, 22, 76, 0.95)", src)
-        self.assertIn("hudRgba(14, 54, 36, 0.95)", src)
-        self.assertIn("hudRgba(28, 32, 82, 0.95)", src)
-        self.assertIn("HudRgba(r: 30.0 / 255.0, g: 31.0 / 255.0, b: 36.0 / 255.0, a: 0.96)", src)
+        self.assertIn("rgba(64, 18, 26, 0.98)", src)
+        self.assertIn("rgba(72, 38, 12, 0.98)", src)
+        self.assertIn("hudRgba(64, 18, 26, 0.98)", src)
+        self.assertIn("hudRgba(16, 40, 72, 0.98)", src)
+        self.assertIn("hudRgba(46, 22, 76, 0.98)", src)
+        self.assertIn("hudRgba(14, 54, 36, 0.98)", src)
+        self.assertIn("hudRgba(28, 32, 82, 0.98)", src)
+        self.assertIn("HudRgba(r: 30.0 / 255.0, g: 31.0 / 255.0, b: 36.0 / 255.0, a: 0.98)", src)
+        self.assertIn("hudRgba(210, 200, 216, 1.0)", src)
+        self.assertIn("rgba(210, 200, 216, 1.0)", src)
+        self.assertIn("HudRgba(r: 204.0 / 255.0, g: 208.0 / 255.0, b: 218.0 / 255.0, a: 1.0)", src)
         self.assertIn("HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 0.78)", src)
         self.assertIn("HudRgba(r: 248.0 / 255.0, g: 113.0 / 255.0, b: 113.0 / 255.0, a: 0.78)", src)
         self.assertIn("final class StatusIconView: NSView", src)
+        self.assertIn("static let mainBoxSize: CGFloat = 13.0", src)
+        self.assertIn("static let toastBoxSize: CGFloat = 12.0", src)
         self.assertIn("func recordingCountdownWarnSec(", src)
         self.assertIn("func formatCountdownHint(", src)
-        # 42pt Retina-scaled main capsule & 36pt toast capsule + CoreAudio live monitor
-        self.assertIn("max(42.0, ceil(textH) + 18.0)", src)
-        self.assertIn("max(36.0, ceil(textH) + 14.0)", src)
-        self.assertIn("ofSize: 15.0, weight: .medium", src)
+        # 36pt Retina-scaled main capsule & 32pt toast capsule + CoreAudio & TCC read-only query
+        self.assertIn("max(36.0, ceil(textH) + 12.0)", src)
+        self.assertIn("max(32.0, ceil(textH) + 10.0)", src)
+        self.assertNotIn("42.0", src)
         self.assertIn("ofSize: 14.0, weight: .medium", src)
-        self.assertIn("barWidth: CGFloat = 3.0", src)
-        self.assertIn("barGap: CGFloat = 3.0", src)
-        self.assertIn("totalWidth: CGFloat = 51.0", src)
+        self.assertIn("ofSize: 13.0, weight: .medium", src)
+        self.assertIn("barWidth: CGFloat = 2.5", src)
+        self.assertIn("barGap: CGFloat = 2.5", src)
+        self.assertIn("maxBarHeight: CGFloat = 15.0", src)
+        self.assertIn("totalWidth: CGFloat = 42.5", src)
         self.assertIn("contentsScale = scale", src)
         self.assertIn('obj["position"] as? String', src)
+        self.assertIn("func queryMicrophonePermissionInfo() -> [String: Any]", src)
+        self.assertIn("AVCaptureDevice.authorizationStatus(for: .audio)", src)
+        self.assertIn("SessionGetInfo(callerSecuritySession, &sid, &attrs) == errSessionSuccess", src)
+        self.assertIn('"hal_ok": false', src)
+        self.assertIn('"hal_ok": true', src)
         self.assertIn("func queryAudioInputStatus()", src)
         self.assertIn("kAudioHardwarePropertyDevices", src)
         self.assertIn("kAudioHardwarePropertyDefaultInputDevice", src)
@@ -1852,6 +1875,659 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 cli_mod._cmd_doctor(Config(refiner=RefinerConfig(provider="off")), {"HOME": str(tmp), "DASHSCOPE_API_KEY": "sk-doc"})
             self.assertIn("MISSING CLT (run 'xcode-select --install')", doc_buf.getvalue())
 
+    def test_macos_mic_permission_classification_precheck_and_first_prompt_loop(self) -> None:
+        # 1. Full matrix of classify_macos_mic_permission
+        ssh_env = {"SSH_CONNECTION": "10.0.0.2 51234 10.0.0.1 22", "SSH_TTY": "/dev/ttys004"}
+        self.assertIsNone(
+            classify_macos_mic_permission(
+                {"mic_auth": "authorized", "has_graphic_session": False, "is_remote_session": True},
+                ssh_env,
+            )
+        )
+        err_denied = classify_macos_mic_permission({"mic_auth": "denied", "has_graphic_session": True}, {})
+        assert err_denied is not None
+        self.assertEqual((err_denied.reason_code, err_denied.hud_state), ("mic_permission", "mic_permission"))
+        self.assertIn("System Settings -> Privacy & Security -> Microphone", str(err_denied))
+
+        err_restr = classify_macos_mic_permission({"mic_auth": "restricted"}, {})
+        assert err_restr is not None
+        self.assertEqual((err_restr.reason_code, err_restr.hud_state), ("mic_permission", "mic_permission"))
+        self.assertIn("restricted", str(err_restr))
+
+        err_non_gui = classify_macos_mic_permission(
+            {"mic_auth": "not_determined", "has_graphic_session": False, "is_remote_session": True},
+            {},
+        )
+        assert err_non_gui is not None
+        self.assertEqual((err_non_gui.reason_code, err_non_gui.hud_state), ("mic_permission", "mic_permission"))
+        self.assertIn("agent-voice-input restart", str(err_non_gui))
+
+        # Local GUI session (e.g. Ghostty-started tmux later attached from SSH) with has_graphic_session=True is ALLOWED
+        self.assertIsNone(
+            classify_macos_mic_permission(
+                {"mic_auth": "not_determined", "has_graphic_session": True, "is_remote_session": True},
+                ssh_env,
+            )
+        )
+
+        # Fallback when has_graphic_session is missing or non-bool: SSH env vars block, clean env allows
+        for ssh_k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
+            err_fb = classify_macos_mic_permission({"mic_auth": "not_determined"}, {ssh_k: "non-empty"})
+            assert err_fb is not None
+            self.assertEqual(err_fb.reason_code, "mic_permission")
+        err_non_bool = classify_macos_mic_permission(
+            {"mic_auth": "not_determined", "has_graphic_session": "true"},
+            {"SSH_CLIENT": "10.0.0.2 51234 22"},
+        )
+        assert err_non_bool is not None
+        self.assertEqual(err_non_bool.reason_code, "mic_permission")
+        self.assertIsNone(classify_macos_mic_permission({"mic_auth": "not_determined"}, {}))
+        self.assertIsNone(classify_macos_mic_permission({"mic_auth": "unknown"}, ssh_env))
+        self.assertIsNone(classify_macos_mic_permission(None, ssh_env))
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            rt = tmp / "rt"
+            rt.mkdir()
+            env = {"HOME": str(tmp), "AGENT_VOICE_INPUT_SWIFTC": "none"}
+
+            # Verify compile_mac_shim links AVFoundation and Security frameworks
+            seen_swiftc_argv: list[list[str]] = []
+            fake_swift = tmp / "fw_shim.swift"
+            fake_swift.write_text("// fw-check\n", encoding="utf-8")
+
+            def _spy_swiftc_run(cmd, **_kw):
+                seen_swiftc_argv.append(list(cmd))
+                out = Path(cmd[cmd.index("-o") + 1])
+                out.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=_spy_swiftc_run):
+                b_fw, e_fw = compile_mac_shim(
+                    env={"HOME": str(tmp)},
+                    cache_dir=tmp / "fw_cache",
+                    swift_source=fake_swift,
+                    swiftc_bin="/opt/custom/swiftc",
+                )
+            self.assertIsNotNone(b_fw)
+            self.assertEqual(e_fw, "")
+            self.assertEqual(len(seen_swiftc_argv), 1)
+            self.assertIn("AVFoundation", seen_swiftc_argv[0])
+            self.assertIn("Security", seen_swiftc_argv[0])
+
+            # 2. MacOSPlatform.start_recording precheck priority & live status refresh
+            ff_spawns: list[tuple[str, str]] = []
+            ok_pcm_src = "import os, time; os.write(1, b'\\x00\\x00' * 320); time.sleep(1.0)"
+            cur_audio_st: dict[str, object] = {
+                "hal_ok": True,
+                "has_input": False,
+                "input_count": 0,
+                "default_uid": "",
+                "default_name": "",
+                "alive_uids": [],
+                "mic_auth": "denied",
+                "has_graphic_session": True,
+            }
+            plat_pre = MacOSPlatform(Config(), env=env, cache_dir=tmp / "c_pre")
+            plat_pre._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda fmt, src: (ff_spawns.append((fmt, src)) or [sys.executable, "-c", ok_pcm_src])
+            )
+            plat_pre._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            plat_pre._shim_rpc = lambda payload, timeout_sec=0.8, **_kw: (  # type: ignore[method-assign]
+                {"ok": True, "reply": True, "audio_status": dict(cur_audio_st)}
+                if payload.get("cmd") == "audio_status"
+                else {"ok": True}
+            )
+
+            # 2a. hal_ok=True, has_input=False, mic_auth="denied" -> no_mic wins (hardware enumerated, zero mics)
+            with self.assertRaises(NoMicrophoneError):
+                plat_pre.start_recording(rt)
+            self.assertEqual(ff_spawns, [])
+            self.assertEqual(plat_pre.last_audio_error, "coreaudio_no_input_device")
+
+            # 2b. hal_ok=False, has_input=False, mic_auth="denied" -> mic_permission wins over HAL failure
+            cur_audio_st.update(hal_ok=False, has_input=False, mic_auth="denied")
+            with self.assertRaises(MicrophoneUnavailableError) as cm_perm:
+                plat_pre.start_recording(rt)
+            self.assertEqual(cm_perm.exception.reason_code, "mic_permission")
+            self.assertEqual(cm_perm.exception.hud_state, "mic_permission")
+            self.assertEqual(ff_spawns, [])
+            self.assertEqual(plat_pre.last_audio_error, "macos_mic_permission")
+
+            # 2c. hal_ok=False, has_input=False, mic_auth="authorized" -> falls through to NoMicrophoneError
+            cur_audio_st.update(hal_ok=False, has_input=False, mic_auth="authorized")
+            with self.assertRaises(NoMicrophoneError):
+                plat_pre.start_recording(rt)
+            self.assertEqual(ff_spawns, [])
+
+            # 2d. First denied, then user enables permission in System Settings -> live query refreshes and starts!
+            cur_audio_st.update(
+                hal_ok=True,
+                has_input=True,
+                input_count=1,
+                default_uid="built-in:mic",
+                default_name="MacBook Pro Microphone",
+                alive_uids=["built-in:mic"],
+                mic_auth="denied",
+            )
+            with self.assertRaises(MicrophoneUnavailableError):
+                plat_pre.start_recording(rt)
+            self.assertEqual(ff_spawns, [])
+
+            cur_audio_st["mic_auth"] = "authorized"
+            seen_timeouts: list[float] = []
+            orig_rec_start = plat_pre._ff_rec.start
+
+            def _spy_start(*a, **kw):
+                seen_timeouts.append(float(kw.get("startup_timeout_sec", 0.0)))
+                return orig_rec_start(*a, **kw)
+
+            with mock.patch.object(plat_pre._ff_rec, "start", side_effect=_spy_start):
+                plat_pre.start_recording(rt)
+            self.assertEqual(len(ff_spawns), 1)
+            self.assertEqual(seen_timeouts, [0.85])
+            plat_pre.cancel_recording()
+
+            # 3. First-prompt closed loop: not_determined + has_graphic_session=True -> startup_timeout_sec=15.0;
+            #    if user clicks "Don't Allow" -> stop_recording sees denied -> Daemon reports mic_permission & clears main HUD!
+            prompt_st: dict[str, object] = {
+                "hal_ok": True,
+                "has_input": True,
+                "input_count": 1,
+                "default_uid": "built-in:mic",
+                "default_name": "MacBook Pro Microphone",
+                "alive_uids": ["built-in:mic"],
+                "mic_auth": "not_determined",
+                "has_graphic_session": True,
+                "is_remote_session": False,
+            }
+            prompt_timeouts: list[float] = []
+            hud_calls: list[tuple[str, int, dict[str, object]]] = []
+            beep_calls: list[str] = []
+            silent_capture_src = (
+                "import os, sys, time\n"
+                "os.write(1, b'\\x00\\x00' * 16000)\n"  # 1.0s silent PCM while TCC prompt is up
+                "sys.stdout.flush()\n"
+                "time.sleep(5.0)\n"
+            )
+            plat_prompt = MacOSPlatform(
+                Config(audio=AudioConfig(tail_drain_sec=0.0), refiner=RefinerConfig(provider="off")),
+                env=env,
+                cache_dir=tmp / "c_prompt",
+            )
+            plat_prompt._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", silent_capture_src])
+            plat_prompt._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            plat_prompt._shim_rpc = lambda payload, timeout_sec=0.8, **_kw: (  # type: ignore[method-assign]
+                {"ok": True, "reply": True, "audio_status": dict(prompt_st)}
+                if payload.get("cmd") == "audio_status"
+                else {"ok": True}
+            )
+            plat_prompt.hud = lambda st, text="", duration_ms=0, **kw: hud_calls.append((st, duration_ms, dict(kw)))  # type: ignore[method-assign]
+            plat_prompt.beep = lambda kind: beep_calls.append(kind)  # type: ignore[method-assign]
+            plat_prompt.resolve_foreground_window = lambda win=None: ForegroundWindow(  # type: ignore[method-assign]
+                0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID
+            )
+
+            orig_prompt_rec_start = plat_prompt._ff_rec.start
+
+            def _spy_prompt_start(*a, **kw):
+                prompt_timeouts.append(float(kw.get("startup_timeout_sec", 0.0)))
+                return orig_prompt_rec_start(*a, **kw)
+
+            daemon_prompt = VoiceInputDaemon(
+                Config(audio=AudioConfig(tail_drain_sec=0.0), refiner=RefinerConfig(provider="off")),
+                env=env,
+                runtime_dir=rt,
+                platform=plat_prompt,
+                asr_provider=_StubAsr("unused"),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=SessionTracker(home_dir=tmp, env=env, runtime_dir=rt, proc_root=tmp / "noproc"),
+            )
+            try:
+                with mock.patch.object(plat_prompt._ff_rec, "start", side_effect=_spy_prompt_start):
+                    r_pstart = daemon_prompt.handle_trigger(
+                        "toggle", ForegroundWindow(0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID)
+                    )
+                self.assertTrue(r_pstart["ok"])
+                self.assertEqual(daemon_prompt.state, "recording")
+                self.assertEqual(prompt_timeouts, [15.0])
+
+                # User clicks "Don't Allow" in macOS TCC dialog, then presses hotkey to stop
+                prompt_st["mic_auth"] = "denied"
+                hud_calls.clear()
+                beep_calls.clear()
+                daemon_prompt._last_trigger_ts = -1e9
+                r_pstop = daemon_prompt.handle_trigger(
+                    "toggle", ForegroundWindow(0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID)
+                )
+                self.assertFalse(r_pstop["ok"])
+                self.assertEqual(r_pstop["state"], "idle")
+                self.assertEqual(r_pstop.get("skipped_reason"), "mic_permission")
+                self.assertEqual(daemon_prompt.state, "idle")
+                self.assertEqual(daemon_prompt.last_result.get("skipped_reason"), "mic_permission")
+                self.assertEqual(plat_prompt.last_audio_error, "macos_mic_permission")
+                self.assertEqual(
+                    hud_calls,
+                    [
+                        ("recognizing", 0, {}),
+                        ("mic_permission", 0, {"clear_main": True}),
+                    ],
+                )
+                self.assertEqual(beep_calls, ["error"])
+            finally:
+                daemon_prompt.close()
+
+            # 4. CLI _cmd_start & _cmd_doctor on darwin: non-GUI not_determined warns to stderr and still returns 0;
+            #    already-running fast path does NOT run self-check or emit extra TCC warnings!
+            fake_shim_bin = tmp / "mac_shim-arm64-test"
+            fake_shim_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            fake_shim_bin.chmod(0o700)
+
+            sc_payload = {
+                "ok": True,
+                "mode": "self-check",
+                "ui_culture": "zh-Hans-CN",
+                "audio_status": {
+                    "hal_ok": True,
+                    "has_input": True,
+                    "input_count": 1,
+                    "default_uid": "built-in:mic",
+                    "default_name": "MacBook Pro Microphone",
+                    "alive_uids": ["built-in:mic"],
+                    "mic_auth": "not_determined",
+                    "has_graphic_session": False,
+                    "is_remote_session": True,
+                },
+            }
+            fake_sc_script = tmp / "selfcheck_shim"
+            fake_sc_script.write_text(
+                f"#!{sys.executable}\nimport json\nprint(json.dumps({sc_payload!r}))\n",
+                encoding="utf-8",
+            )
+            fake_sc_script.chmod(0o755)
+            sc_ok, sc_parsed, sc_err = run_mac_shim_self_check(fake_sc_script, {"HOME": str(tmp)})
+            self.assertTrue(sc_ok)
+            self.assertEqual(sc_err, "")
+            self.assertEqual(sc_parsed["audio_status"]["mic_auth"], "not_determined")
+
+            parser = cli_mod._build_parser()
+            rt_cli = tmp / "rt_cli"
+            rt_cli.mkdir()
+            cli_env = {"HOME": str(tmp), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt_cli)}
+
+            # 4a. Already-running branch: returns 0 without calling compile_mac_shim or run_mac_shim_self_check
+            out_running, err_running = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(
+                    cli_mod, "send_control_command", return_value={"ok": True, "pid": 4321, "state": "idle", "shim_ok": True}
+                ),
+                mock.patch.object(cli_mod, "compile_mac_shim") as mock_comp_run,
+                mock.patch.object(cli_mod, "run_mac_shim_self_check") as mock_sc_run,
+                mock.patch("sys.stdout", out_running),
+                mock.patch("sys.stderr", err_running),
+            ):
+                rc_already = cli_mod._cmd_start(
+                    parser.parse_args(["start"]), cli_env, cfg=Config(refiner=RefinerConfig(provider="off"))
+                )
+            self.assertEqual(rc_already, 0)
+            self.assertIn("already running (pid=4321", out_running.getvalue())
+            self.assertEqual(err_running.getvalue(), "")
+            mock_comp_run.assert_not_called()
+            mock_sc_run.assert_not_called()
+
+            # 4b. Fresh start on darwin in non-GUI session (not_determined + has_graphic_session=False):
+            #     prints WARN to stderr, spawns daemon, and returns 0!
+            class _LiveProc:
+                pid = 88888
+                returncode = None
+
+                def poll(self) -> None:
+                    return None
+
+            ctrl_calls = [0]
+
+            def _ctrl_down_then_up(_rt, _req, timeout_sec=1.0):
+                ctrl_calls[0] += 1
+                if ctrl_calls[0] == 1:
+                    raise ConnectionRefusedError("not running yet")
+                return {"ok": True, "pid": 88888, "state": "idle", "shim_ok": True}
+
+            out_fresh, err_fresh = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(cli_mod, "send_control_command", side_effect=_ctrl_down_then_up),
+                mock.patch.object(cli_mod, "compile_mac_shim", return_value=(fake_shim_bin, "")),
+                mock.patch.object(cli_mod, "run_mac_shim_self_check", return_value=(True, sc_payload, "")) as mock_sc_fresh,
+                mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
+                mock.patch("sys.stdout", out_fresh),
+                mock.patch("sys.stderr", err_fresh),
+            ):
+                rc_fresh = cli_mod._cmd_start(
+                    parser.parse_args(["start"]), cli_env, cfg=Config(refiner=RefinerConfig(provider="off"))
+                )
+            self.assertEqual(rc_fresh, 0)
+            mock_sc_fresh.assert_called_once()
+            self.assertIn("started (pid=88888)", out_fresh.getvalue())
+            self.assertIn("[agent-voice-input] WARN:", err_fresh.getvalue())
+            self.assertIn("non-GUI/SSH session", err_fresh.getvalue())
+
+            # 4c. _cmd_doctor displays caller_mic_auth and non-fatal current-shell context WARN while keeping rc=0
+            fake_probe_ssh = {
+                "avfoundation_ok": True,
+                "audio_devices": ["[0] MacBook Pro Microphone"],
+                "configured_audio_device": ":default",
+                "pbcopy_ok": True,
+                "tmux_active": True,
+                "clt_ok": True,
+                "swiftc_ok": True,
+                "swiftc_bin": "/usr/bin/swiftc",
+                "mac_shim_ok": True,
+                "mac_shim_bin": str(fake_shim_bin),
+                "mac_shim_error": "",
+                "caller_mic_auth": "not_determined",
+                "caller_has_graphic_session": False,
+                "caller_is_remote_session": True,
+                "caller_mic_warning": str(err_non_gui),
+                "fg_process": "Ghostty",
+                "fg_title": "zsh",
+                "permissions_hint": "Microphone -> terminal",
+            }
+            doc_ssh_buf = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(cli_mod, "probe_macos_host", return_value=fake_probe_ssh),
+                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("sys.stdout", doc_ssh_buf),
+            ):
+                rc_doc_ssh = cli_mod._cmd_doctor(
+                    Config(refiner=RefinerConfig(provider="off")),
+                    {**cli_env, "DASHSCOPE_API_KEY": "sk-doc-ssh"},
+                )
+            self.assertEqual(rc_doc_ssh, 0)
+            doc_ssh_txt = doc_ssh_buf.getvalue()
+            self.assertIn("caller_mic_auth=not_determined", doc_ssh_txt)
+            self.assertIn("not an already-running GUI daemon", doc_ssh_txt)
+
+            # 5. Unmanaged MacOSPlatform (`agent-voice-input once` without bridge shim) enforces TCC precheck,
+            #    grants 15s first-prompt startup window, and isolates mock-recorder unit tests on darwin!
+            once_st: dict[str, object] = {
+                "hal_ok": True,
+                "has_input": True,
+                "input_count": 1,
+                "default_uid": "built-in:mic",
+                "default_name": "MacBook Pro Microphone",
+                "alive_uids": ["built-in:mic"],
+                "mic_auth": "denied",
+                "has_graphic_session": True,
+                "is_remote_session": False,
+            }
+            once_ff_spawns: list[tuple[str, str]] = []
+            once_timeouts: list[float] = []
+
+            def _make_once_plat() -> MacOSPlatform:
+                p = MacOSPlatform(
+                    Config(audio=AudioConfig(tail_drain_sec=0.0), refiner=RefinerConfig(provider="off")),
+                    env=cli_env,
+                    cache_dir=tmp / "c_once_unmanaged",
+                    self_check_fn=lambda: dict(once_st),
+                )
+                p._ff_rec = FfmpegWavRecorder(
+                    cmd_factory=lambda fmt, src: (once_ff_spawns.append((fmt, src)) or [sys.executable, "-c", silent_capture_src])
+                )
+                p.get_foreground_window = lambda **kw: ForegroundWindow(0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID)  # type: ignore[method-assign]
+                return p
+
+            for bad_mode in ("denied", "non_gui_not_determined"):
+                if bad_mode == "denied":
+                    once_st["mic_auth"] = "denied"
+                    once_st["has_graphic_session"] = True
+                else:
+                    once_st["mic_auth"] = "not_determined"
+                    once_st["has_graphic_session"] = False
+                once_ff_spawns.clear()
+                with mock.patch.object(cli_mod, "create_platform", side_effect=lambda *_a, **_kw: _make_once_plat()):
+                    with self.assertRaises(MicrophoneUnavailableError) as once_err_ctx:
+                        cli_mod._run_wav_or_live(
+                            wav_file=None,
+                            audio_source="live",
+                            duration=0.2,
+                            dry_run=True,
+                            title="codex",
+                            cfg=Config(refiner=RefinerConfig(provider="off")),
+                            env=dict(cli_env),
+                        )
+                self.assertEqual(once_err_ctx.exception.reason_code, "mic_permission")
+                self.assertEqual(once_ff_spawns, [])
+
+            # Unmanaged local GUI not_determined gets 15.0s startup_timeout_sec and rechecks on stop_recording()
+            once_st["mic_auth"] = "not_determined"
+            once_st["has_graphic_session"] = True
+            plat_once_gui = _make_once_plat()
+            self.assertFalse(plat_once_gui._has_managed_shim())
+            orig_once_rec_start = plat_once_gui._ff_rec.start
+
+            def _spy_once_start(*a, **kw):
+                once_timeouts.append(float(kw.get("startup_timeout_sec", 0.0)))
+                return orig_once_rec_start(*a, **kw)
+
+            with mock.patch.object(plat_once_gui._ff_rec, "start", side_effect=_spy_once_start):
+                plat_once_gui.start_recording(rt_cli)
+            self.assertEqual(once_timeouts, [15.0])
+            once_st["mic_auth"] = "denied"
+            with self.assertRaises(MicrophoneUnavailableError) as once_stop_err:
+                plat_once_gui.stop_recording(drain=False)
+            self.assertEqual(once_stop_err.exception.reason_code, "mic_permission")
+            plat_once_gui.close()
+
+            # Darwin host fallback isolation: fake _ff_rec (unit test) skips host compile_mac_shim,
+            # while real default FfmpegWavRecorder (_cmd_factory is None) queries run_mac_shim_self_check.
+            plat_mock_iso = MacOSPlatform(Config(), env=cli_env, cache_dir=tmp / "c_iso_mock")
+            plat_mock_iso._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", "pass"])
+            with (
+                mock.patch("agent_voice_input.platform_macos.sys.platform", "darwin"),
+                mock.patch("agent_voice_input.platform_macos.compile_mac_shim") as mock_iso_comp,
+            ):
+                self.assertIsNone(plat_mock_iso._probe_unmanaged_audio_status())
+            mock_iso_comp.assert_not_called()
+
+            plat_prod_once = MacOSPlatform(Config(), env=cli_env, cache_dir=tmp / "c_iso_prod")
+            with (
+                mock.patch("agent_voice_input.platform_macos.sys.platform", "darwin"),
+                mock.patch("agent_voice_input.platform_macos.compile_mac_shim", return_value=(fake_shim_bin, "")) as mock_prod_comp,
+                mock.patch(
+                    "agent_voice_input.platform_macos.run_mac_shim_self_check",
+                    return_value=(True, sc_payload, ""),
+                ) as mock_prod_sc,
+            ):
+                with self.assertRaises(MicrophoneUnavailableError) as prod_once_err:
+                    plat_prod_once.start_recording(rt_cli)
+            self.assertEqual(prod_once_err.exception.reason_code, "mic_permission")
+            mock_prod_comp.assert_called_once()
+            mock_prod_sc.assert_called_once()
+
+            # 6. First-prompt TCC dialog denied AND ffmpeg exits early (_on_recorder_lost):
+            #    reports mic_permission (NOT mic_disconnected!), absorbs follow-up toggle,
+            #    while real hardware unplug still preserves mic_disconnected!
+            early_exit_after_chunk_src = (
+                "import os, sys, time\n"
+                "os.write(1, b'\\x00\\x00' * 800)\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(0.08)\n"
+                "sys.exit(1)\n"
+            )
+            lost_perm_st: dict[str, object] = {
+                "hal_ok": True,
+                "has_input": True,
+                "input_count": 1,
+                "default_uid": "built-in:mic",
+                "default_name": "MacBook Pro Microphone",
+                "default_name_unique": True,
+                "alive_uids": ["built-in:mic"],
+                "uid_names": {"built-in:mic": "MacBook Pro Microphone"},
+                "mic_auth": "not_determined",
+                "has_graphic_session": True,
+                "is_remote_session": False,
+            }
+            lost_perm_huds: list[tuple[str, int, dict[str, object]]] = []
+            lost_perm_beeps: list[str] = []
+            lost_perm_spawns = [0]
+            plat_lost_perm = MacOSPlatform(
+                Config(audio=AudioConfig(tail_drain_sec=0.0), refiner=RefinerConfig(provider="off")),
+                env=env,
+                cache_dir=tmp / "c_lost_perm",
+            )
+            plat_lost_perm._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: (
+                    lost_perm_spawns.__setitem__(0, lost_perm_spawns[0] + 1)
+                    or [sys.executable, "-c", early_exit_after_chunk_src]
+                )
+            )
+            plat_lost_perm._has_managed_shim = lambda: True  # type: ignore[method-assign]
+
+            def _lost_perm_rpc(payload: dict[str, object], timeout_sec: float = 0.8, **kw: object) -> dict[str, object]:
+                if payload.get("cmd") == "audio_status":
+                    return {"ok": True, "reply": True, "audio_status": dict(lost_perm_st)}
+                return {"ok": True}
+
+            plat_lost_perm._shim_rpc = _lost_perm_rpc  # type: ignore[method-assign]
+            plat_lost_perm.hud = lambda st, text="", duration_ms=0, **kw: lost_perm_huds.append((st, duration_ms, dict(kw)))  # type: ignore[method-assign]
+            plat_lost_perm.beep = lambda kind: lost_perm_beeps.append(kind)  # type: ignore[method-assign]
+            plat_lost_perm.resolve_foreground_window = lambda win=None: ForegroundWindow(  # type: ignore[method-assign]
+                0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID
+            )
+            daemon_lost_perm = VoiceInputDaemon(
+                Config(audio=AudioConfig(tail_drain_sec=0.0), refiner=RefinerConfig(provider="off")),
+                env=env,
+                runtime_dir=rt,
+                platform=plat_lost_perm,
+                asr_provider=_StubAsr("unused"),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=SessionTracker(home_dir=tmp, env=env, runtime_dir=rt, proc_root=tmp / "noproc"),
+            )
+            try:
+                # 6a. Dialog denied + ffmpeg exits -> mic_permission (no respawn, no mic_disconnected)
+                r_lp_start = daemon_lost_perm.handle_trigger(
+                    "toggle", ForegroundWindow(0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID)
+                )
+                self.assertTrue(r_lp_start["ok"])
+                lost_perm_st["mic_auth"] = "denied"
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline and (
+                    daemon_lost_perm.state != "idle" or not any(h[0] == "mic_permission" for h in lost_perm_huds)
+                ):
+                    time.sleep(0.02)
+                self.assertEqual(daemon_lost_perm.state, "idle")
+                self.assertEqual(lost_perm_spawns[0], 1)
+                self.assertEqual(daemon_lost_perm.last_result.get("skipped_reason"), "mic_permission")
+                self.assertNotIn("mic_disconnected", [h[0] for h in lost_perm_huds])
+                self.assertEqual(lost_perm_huds[-1], ("mic_permission", 0, {"clear_main": True}))
+                # Immediate follow-up toggle within absorption window (past debounce) is absorbed cleanly
+                daemon_lost_perm._last_trigger_ts = -1e9
+                r_absorb = daemon_lost_perm.handle_trigger(
+                    "toggle", ForegroundWindow(0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID)
+                )
+                self.assertEqual(r_absorb.get("ignored"), "already_stopped")
+                self.assertEqual(daemon_lost_perm.state, "idle")
+
+                # 6b. Real hardware unplug during not_determined (has_input=False) preserves mic_disconnected!
+                lost_perm_st["mic_auth"] = "not_determined"
+                lost_perm_st["has_input"] = True
+                lost_perm_st["alive_uids"] = ["built-in:mic"]
+                lost_perm_huds.clear()
+                daemon_lost_perm._last_trigger_ts = -1e9
+                daemon_lost_perm._recorder_lost_ts = -1e9
+                r_hw_start = daemon_lost_perm.handle_trigger(
+                    "toggle", ForegroundWindow(0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID)
+                )
+                self.assertTrue(r_hw_start["ok"])
+                # Unplug mic (hal_ok=True, has_input=False) even if mic_auth simultaneously reads denied
+                lost_perm_st["has_input"] = False
+                lost_perm_st["alive_uids"] = []
+                lost_perm_st["mic_auth"] = "denied"
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline and (
+                    daemon_lost_perm.state != "idle" or not any(h[0] == "mic_disconnected" for h in lost_perm_huds)
+                ):
+                    time.sleep(0.02)
+                self.assertEqual(daemon_lost_perm.state, "idle")
+                self.assertEqual(daemon_lost_perm.last_result.get("skipped_reason"), "mic_disconnected")
+                self.assertEqual(lost_perm_huds[-1], ("mic_disconnected", 2200, {"clear_main": True}))
+
+                # 6c. CoreAudio audio_devices_changed event setting coreaudio_device_disconnected also preserves mic_disconnected!
+                lost_perm_st["mic_auth"] = "not_determined"
+                lost_perm_st["has_input"] = True
+                lost_perm_st["alive_uids"] = ["built-in:mic"]
+                plat_lost_perm._ff_rec = FfmpegWavRecorder(
+                    cmd_factory=lambda _f, _s: [sys.executable, "-c", silent_capture_src]
+                )
+                lost_perm_huds.clear()
+                daemon_lost_perm._last_trigger_ts = -1e9
+                daemon_lost_perm._recorder_lost_ts = -1e9
+                self.assertTrue(
+                    daemon_lost_perm.handle_trigger(
+                        "toggle", ForegroundWindow(0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID)
+                    )["ok"]
+                )
+                lost_perm_st["mic_auth"] = "denied"
+                plat_lost_perm._on_shim_internal_event(
+                    {
+                        "event": "audio_devices_changed",
+                        "hal_ok": True,
+                        "has_input": False,
+                        "input_count": 0,
+                        "default_uid": "",
+                        "default_name": "",
+                        "alive_uids": [],
+                    }
+                )
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and (
+                    daemon_lost_perm.state != "idle" or not any(h[0] == "mic_disconnected" for h in lost_perm_huds)
+                ):
+                    time.sleep(0.02)
+                self.assertEqual(daemon_lost_perm.state, "idle")
+                self.assertEqual(daemon_lost_perm.last_result.get("skipped_reason"), "mic_disconnected")
+                self.assertEqual(lost_perm_huds[-1], ("mic_disconnected", 2200, {"clear_main": True}))
+
+                # 6d. If valid voiced speech (gate.passed) was already captured before denied + exit, rescue still delivers!
+                voiced_exit_src = (
+                    "import os, sys, time\n"
+                    "os.write(1, b'\\xe8\\x0e\\x18\\xf1' * 4800)\n"
+                    "sys.stdout.flush()\n"
+                    "time.sleep(0.08)\n"
+                    "sys.exit(1)\n"
+                )
+                rescued_texts: list[str] = []
+                plat_lost_perm.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None: (  # type: ignore[method-assign]
+                    rescued_texts.append(txt) or PasteOutcome(True, True, "ok", "Ghostty")
+                )
+                daemon_lost_perm.asr_provider = _StubAsr("保留已有语音不丢字")
+                lost_perm_st["mic_auth"] = "not_determined"
+                lost_perm_st["has_input"] = True
+                lost_perm_st["alive_uids"] = ["built-in:mic"]
+                plat_lost_perm._ff_rec = FfmpegWavRecorder(
+                    cmd_factory=lambda _f, _s: [sys.executable, "-c", voiced_exit_src]
+                )
+                lost_perm_huds.clear()
+                daemon_lost_perm._last_trigger_ts = -1e9
+                daemon_lost_perm._recorder_lost_ts = -1e9
+                self.assertTrue(
+                    daemon_lost_perm.handle_trigger(
+                        "toggle", ForegroundWindow(0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID)
+                    )["ok"]
+                )
+                lost_perm_st["mic_auth"] = "denied"
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline and (
+                    not rescued_texts or daemon_lost_perm.state != "idle" or not any(h[0] == "done" for h in lost_perm_huds)
+                ):
+                    time.sleep(0.02)
+                self.assertEqual(rescued_texts, ["保留已有语音不丢字"])
+                self.assertEqual(daemon_lost_perm.state, "idle")
+            finally:
+                daemon_lost_perm.close()
+
     @unittest.skipUnless(
         sys.platform == "darwin"
         and bool(os.path.isfile("/usr/bin/swiftc") or shutil.which("swiftc"))
@@ -1888,6 +2564,13 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertEqual(payload.get("mode"), "self-check")
             self.assertEqual(payload.get("rcontrol_vk"), "0x3E")
             self.assertEqual(payload.get("rcontrol_mask"), "0x2000")
+            aud_st = payload.get("audio_status")
+            self.assertIsInstance(aud_st, dict)
+            self.assertIsInstance(aud_st.get("hal_ok"), bool)
+            self.assertIn(
+                aud_st.get("mic_auth"),
+                {"authorized", "denied", "restricted", "not_determined", "unknown"},
+            )
 
     def test_apple_terminal_tab_tty_shim_hwnd_focus_drift_and_daemon_tmux_paste(self) -> None:
         # 1. is_apple_terminal_app & Terminal Automation error summary
@@ -2077,12 +2760,23 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertIn("paste-buffer", tmux_cmds[1])
                 self.assertEqual(tmux_cmds[1][-2:], ["-t", "%3"])
 
-                # If paste-buffer fails or times out, named buffer is cleaned up via delete-buffer before falling back
+                # If paste-buffer fails or times out:
+                # - with locked origin tmux_pane: cleans up delete-buffer and stops on clipboard (tmux_paste_failed, zero Cmd+V)
+                # - without origin_window: cleans up delete-buffer before falling back to Cmd+V
+                osa_scripts.clear()
                 tmux_cmds.clear()
                 paste_buf_rc[0] = 1
-                out_pb_fail = plat_dtmux.deliver_text("粘贴缓冲失败回退", seq_id=6, origin_window=origin_dtmux)
+                out_pb_fail = plat_dtmux.deliver_text("粘贴缓冲失败终止", seq_id=6, origin_window=origin_dtmux)
                 self.assertFalse(out_pb_fail.pasted)
-                self.assertIn("accessibility_denied", out_pb_fail.reason)
+                self.assertTrue(out_pb_fail.clipboard)
+                self.assertEqual(out_pb_fail.reason, "tmux_paste_failed")
+                self.assertFalse(any('keystroke "v"' in s for s in osa_scripts), "locked tmux pane failure must not fall back to Cmd+V")
+                self.assertEqual([c[c.index("-S") + 2] for c in tmux_cmds], ["load-buffer", "paste-buffer", "delete-buffer"])
+
+                tmux_cmds.clear()
+                out_pb_no_orig = plat_dtmux.deliver_text("无origin粘贴缓冲失败回退", seq_id=60, origin_window=None)
+                self.assertFalse(out_pb_no_orig.pasted)
+                self.assertIn("accessibility_denied", out_pb_no_orig.reason)
                 self.assertEqual([c[c.index("-S") + 2] for c in tmux_cmds], ["load-buffer", "paste-buffer", "delete-buffer"])
 
                 tmux_cmds.clear()
@@ -2091,6 +2785,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 out_pb_to = plat_dtmux.deliver_text("粘贴缓冲超时清理", seq_id=61, origin_window=origin_dtmux)
                 paste_buf_timeout[0] = False
                 self.assertFalse(out_pb_to.pasted)
+                self.assertEqual(out_pb_to.reason, "tmux_paste_failed")
                 self.assertEqual([c[c.index("-S") + 2] for c in tmux_cmds], ["load-buffer", "paste-buffer", "delete-buffer"])
                 self.assertTrue(all(enc == "utf-8" for enc in seen_encodings), f"expected utf-8 encodings, got {seen_encodings}")
 
@@ -2202,6 +2897,386 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertTrue(out_rescue.pasted)
                 self.assertEqual(out_rescue.reason, "tmux")
                 self.assertEqual(osa_scripts, [], "attached tmux on single-PTY Alacritty must bypass Cmd+V osascript completely")
+
+                # 8b. P2-1: ax_trusted=False, title='' on Terminal.app:
+                #     - Normal terminal window (hwnd=42 == t_wid=42) enriches tty & pastes via tmux without System Events;
+                #     - Settings/Inspector panel (hwnd=500 != t_wid=42) sets is_other_panel=True (tty='') -> focus_changed!
+                osa_scripts.clear()
+                tmux_cmds.clear()
+                term_state["denied"] = False
+                term_state["wid"] = 42
+                term_state["tty"] = "/dev/ttys004"
+                term_state["wname"] = "xhx — tmux — 80×24"
+                term_state["tcustom"] = ""
+                cur_tmux_box = [tmux_snap]
+                plat_term_untrusted = MacOSPlatform(
+                    Config(), env=env, cache_dir=tmp / "cache_t_untrusted", tmux_probe_fn=lambda: cur_tmux_box[0]
+                )
+                plat_term_untrusted._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat_term_untrusted._shim_rpc = plat_shim._shim_rpc  # type: ignore[method-assign]
+                shim_fg_box[0] = {
+                    "ok": True,
+                    "reply": "fg_window",
+                    "hwnd": 42,
+                    "process": "终端",
+                    "bundle_id": "com.apple.Terminal",
+                    "pid": 601,
+                    "title": "",
+                    "ax_trusted": False,
+                }
+                untrusted_term_hint = ForegroundWindow(
+                    hwnd=42,
+                    process="终端",
+                    title="",
+                    bundle_id="com.apple.Terminal",
+                    pid=601,
+                    ax_trusted=False,
+                )
+                origin_untrusted_term = plat_term_untrusted.resolve_foreground_window(untrusted_term_hint)
+                self.assertEqual(origin_untrusted_term.hwnd, 42)
+                self.assertEqual(origin_untrusted_term.tty, "/dev/ttys004")
+                self.assertEqual(origin_untrusted_term.tmux_pane, "%3")
+                self.assertFalse(any('attribute "AXTitle"' in s for s in osa_scripts))
+
+                osa_scripts.clear()
+                out_untrusted_ok = plat_term_untrusted.deliver_text(
+                    "无辅助功能正常窗口直投", seq_id=71, origin_window=origin_untrusted_term
+                )
+                self.assertTrue(out_untrusted_ok.pasted)
+                self.assertEqual(out_untrusted_ok.reason, "tmux")
+                self.assertFalse(any('keystroke "v"' in s for s in osa_scripts))
+
+                # Terminal.app opens Settings/Inspector panel while ax_trusted=False (hwnd=500 != t_wid=42, title='')
+                osa_scripts.clear()
+                tmux_cmds.clear()
+                shim_fg_box[0] = {
+                    "ok": True,
+                    "reply": "fg_window",
+                    "hwnd": 500,
+                    "process": "终端",
+                    "bundle_id": "com.apple.Terminal",
+                    "pid": 601,
+                    "title": "",
+                    "ax_trusted": False,
+                }
+                fg_untrusted_panel = plat_term_untrusted.get_foreground_window()
+                self.assertEqual(
+                    (fg_untrusted_panel.hwnd, fg_untrusted_panel.tty, fg_untrusted_panel.title, fg_untrusted_panel.tmux_pane),
+                    (500, "", "", ""),
+                )
+                out_untrusted_panel = plat_term_untrusted.deliver_text(
+                    "无辅助功能设置面板拦截", seq_id=72, origin_window=origin_untrusted_term
+                )
+                self.assertFalse(out_untrusted_panel.pasted)
+                self.assertEqual(out_untrusted_panel.reason, "focus_changed")
+                self.assertEqual(tmux_cmds, [])
+                self.assertFalse(any('keystroke "v"' in s for s in osa_scripts))
+
+                # 8c. P2-2: Switching tmux active pane (%3 -> %4) on the SAME TTY (/dev/ttys004) blocks paste
+                #     with focus_changed (both unchanged & changed title, plus TOCTOU & manual-origin fallback),
+                #     while same-pane (%3) window resize still pastes cleanly!
+                shim_fg_box[0] = {
+                    "ok": True,
+                    "reply": "fg_window",
+                    "hwnd": 42,
+                    "process": "终端",
+                    "bundle_id": "com.apple.Terminal",
+                    "pid": 601,
+                    "title": "xhx — tmux — 80×24",
+                    "ax_trusted": True,
+                }
+                tmux_snap_pane4 = TmuxServerSnapshot(
+                    clients=(
+                        TmuxClientInfo(
+                            session_id="$0",
+                            window_id="@0",
+                            pane_id="%4",
+                            activity=1001.0,
+                            client_tty="/dev/ttys004",
+                            client_pid=710,
+                            focused=True,
+                            socket_path="/tmp/avi_mock.sock",
+                        ),
+                    ),
+                    panes=(
+                        TmuxPaneInfo(
+                            pane_id="%3",
+                            session_id="$0",
+                            window_id="@0",
+                            window_active=True,
+                            pane_active=False,
+                            pane_pid=720,
+                            pane_tty="/dev/ttys020",
+                            socket_path="/tmp/avi_mock.sock",
+                            current_path=str(tmp),
+                            pane_title="claude [#abcd1234]",
+                        ),
+                        TmuxPaneInfo(
+                            pane_id="%4",
+                            session_id="$0",
+                            window_id="@0",
+                            window_active=True,
+                            pane_active=True,
+                            pane_pid=721,
+                            pane_tty="/dev/ttys021",
+                            socket_path="/tmp/avi_mock.sock",
+                            current_path=str(tmp),
+                            pane_title="vim",
+                        ),
+                    ),
+                )
+                cur_tmux_box[0] = tmux_snap
+                origin_p3 = plat_term_untrusted.get_foreground_window()
+                self.assertEqual((origin_p3.tmux_socket, origin_p3.tmux_pane), ("/tmp/avi_mock.sock", "%3"))
+
+                # Same pane %3 + Terminal window resize (80×24 -> 120×40) -> pasted=True via tmux!
+                term_state["wname"] = "xhx — tmux — 120×40"
+                shim_fg_box[0]["title"] = "xhx — tmux — 120×40"
+                osa_scripts.clear()
+                tmux_cmds.clear()
+                out_p3_resize = plat_term_untrusted.deliver_text("同窗格缩放直投", seq_id=73, origin_window=origin_p3)
+                self.assertTrue(out_p3_resize.pasted)
+                self.assertEqual(out_p3_resize.reason, "tmux")
+                self.assertEqual(tmux_cmds[1][-2:], ["-t", "%3"])
+
+                # Switch active pane %3 -> %4 on same /dev/ttys004 WITH UNCHANGED outer title -> focus_changed, zero Cmd+V!
+                cur_tmux_box[0] = tmux_snap_pane4
+                osa_scripts.clear()
+                tmux_cmds.clear()
+                out_p4_same_title = plat_term_untrusted.deliver_text(
+                    "同TTY无标题变化切窗格拦截", seq_id=74, origin_window=origin_p3
+                )
+                self.assertFalse(out_p4_same_title.pasted)
+                self.assertEqual(out_p4_same_title.reason, "focus_changed")
+                self.assertEqual(tmux_cmds, [])
+                self.assertFalse(any('keystroke "v"' in s for s in osa_scripts))
+
+                # Switch active pane %3 -> %4 WITH CHANGED outer title -> focus_changed, zero Cmd+V!
+                term_state["wname"] = "xhx — tmux:1:vim — 120×40"
+                shim_fg_box[0]["title"] = "xhx — tmux:1:vim — 120×40"
+                osa_scripts.clear()
+                tmux_cmds.clear()
+                out_p4_diff_title = plat_term_untrusted.deliver_text(
+                    "同TTY变标题切窗格拦截", seq_id=75, origin_window=origin_p3
+                )
+                self.assertFalse(out_p4_diff_title.pasted)
+                self.assertEqual(out_p4_diff_title.reason, "focus_changed")
+                self.assertEqual(tmux_cmds, [])
+                self.assertFalse(any('keystroke "v"' in s for s in osa_scripts))
+
+                # TOCTOU race guard: get_foreground_window sees %3, then tmux switches to %4 before _try_deliver_attached_tmux
+                probe_seq = iter([tmux_snap, tmux_snap_pane4])
+                plat_toctou = MacOSPlatform(
+                    Config(), env=env, cache_dir=tmp / "cache_toctou", tmux_probe_fn=lambda: next(probe_seq, tmux_snap_pane4)
+                )
+                plat_toctou._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat_toctou._shim_rpc = plat_shim._shim_rpc  # type: ignore[method-assign]
+                osa_scripts.clear()
+                tmux_cmds.clear()
+                cmd_v_rc[0] = 0
+                out_toctou = plat_toctou.deliver_text("TOCTOU切窗格不回退CmdV", seq_id=76, origin_window=origin_p3)
+                self.assertFalse(out_toctou.pasted)
+                self.assertEqual(out_toctou.reason, "focus_changed")
+                self.assertEqual(tmux_cmds, [])
+                self.assertFalse(any('keystroke "v"' in s for s in osa_scripts), "TOCTOU pane drift must never fall back to Cmd+V")
+
+                # Manual origin (tmux_pane=='') attached to tmux: title change blocks, dimension-only change passes!
+                manual_origin = ForegroundWindow(
+                    hwnd=42,
+                    process="终端",
+                    title="xhx — tmux:0:codex — 80×24",
+                    bundle_id="com.apple.Terminal",
+                    tty="/dev/ttys004",
+                    pid=601,
+                )
+                osa_scripts.clear()
+                tmux_cmds.clear()
+                out_manual_drift = plat_term_untrusted.deliver_text(
+                    "手工origin标题变化拦截", seq_id=77, origin_window=manual_origin
+                )
+                self.assertFalse(out_manual_drift.pasted)
+                self.assertEqual(out_manual_drift.reason, "focus_changed")
+                self.assertEqual(tmux_cmds, [])
+                self.assertFalse(any('keystroke "v"' in s for s in osa_scripts))
+
+                term_state["wname"] = "xhx — tmux:0:codex — 120×40"
+                shim_fg_box[0]["title"] = "xhx — tmux:0:codex — 120×40"
+                out_manual_resize = plat_term_untrusted.deliver_text(
+                    "手工origin仅尺寸变化放行", seq_id=78, origin_window=manual_origin
+                )
+                self.assertTrue(out_manual_resize.pasted)
+                self.assertEqual(out_manual_resize.reason, "tmux")
+
+                # Single-PTY Alacritty (ax_trusted=False, title='') switching tmux pane %7 -> %8 -> focus_changed!
+                alac_snap_box = [alac_tmux_snap]
+                plat_alac_drift = MacOSPlatform(
+                    Config(), env=env, cache_dir=tmp / "cache_alac_drift", tmux_probe_fn=lambda: alac_snap_box[0]
+                )
+                plat_alac_drift._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat_alac_drift._shim_rpc = plat_shim._shim_rpc  # type: ignore[method-assign]
+                shim_fg_box[0] = {
+                    "ok": True,
+                    "reply": "fg_window",
+                    "hwnd": 101,
+                    "process": "Alacritty",
+                    "bundle_id": "org.alacritty",
+                    "pid": 9000,
+                    "title": "",
+                    "ax_trusted": False,
+                }
+                with mock.patch.object(
+                    SessionTracker,
+                    "_list_darwin_user_ps_rows",
+                    return_value=[
+                        (9000, 1, "Ss", "", ["alacritty"]),
+                        (9001, 9000, "Ss", "/dev/ttys010", ["-zsh"]),
+                        (9002, 9001, "S+", "/dev/ttys010", ["tmux", "attach"]),
+                    ],
+                ):
+                    alac_orig_p7 = plat_alac_drift.resolve_foreground_window(alac_untrusted_hint)
+                    self.assertEqual(alac_orig_p7.tmux_pane, "%7")
+                    alac_snap_box[0] = TmuxServerSnapshot(
+                        clients=(
+                            TmuxClientInfo(
+                                session_id="$0",
+                                window_id="@0",
+                                pane_id="%8",
+                                activity=1002.0,
+                                client_tty="/dev/ttys010",
+                                client_pid=9002,
+                                focused=True,
+                                socket_path="/tmp/avi_alac.sock",
+                            ),
+                        ),
+                        panes=(
+                            TmuxPaneInfo(
+                                pane_id="%8",
+                                session_id="$0",
+                                window_id="@0",
+                                window_active=True,
+                                pane_active=True,
+                                pane_pid=9101,
+                                pane_tty="/dev/ttys026",
+                                socket_path="/tmp/avi_alac.sock",
+                                current_path=str(tmp),
+                                pane_title="zsh",
+                            ),
+                        ),
+                    )
+                    osa_scripts.clear()
+                    tmux_cmds.clear()
+                    out_alac_p8 = plat_alac_drift.deliver_text(
+                        "Alacritty无标题切窗格拦截", seq_id=79, origin_window=alac_orig_p7
+                    )
+                self.assertFalse(out_alac_p8.pasted)
+                self.assertEqual(out_alac_p8.reason, "focus_changed")
+                self.assertEqual(tmux_cmds, [])
+                self.assertEqual(osa_scripts, [])
+
+                # $TMUX env set (e.g. 'once' path):
+                # 1) Server B on foreground TTY (/dev/ttys004) must pass '-S server_b.sock' instead of defaulting to $TMUX server A;
+                # 2) If foreground TTY detaches while another client (/dev/ttys099) stays on %3, must NOT borrow other client!
+                env_with_tmux = {**env, "TMUX": "/tmp/server_a.sock,500,0"}
+                multi_srv_snap_box = [
+                    TmuxServerSnapshot(
+                        clients=(
+                            TmuxClientInfo(
+                                session_id="$0",
+                                window_id="@0",
+                                pane_id="%3",
+                                activity=1000.0,
+                                client_tty="/dev/ttys099",
+                                client_pid=801,
+                                focused=True,
+                                socket_path="/tmp/server_a.sock",
+                            ),
+                            TmuxClientInfo(
+                                session_id="$0",
+                                window_id="@0",
+                                pane_id="%3",
+                                activity=1005.0,
+                                client_tty="/dev/ttys004",
+                                client_pid=802,
+                                focused=True,
+                                socket_path="/tmp/server_b.sock",
+                            ),
+                        ),
+                        panes=(
+                            TmuxPaneInfo(
+                                pane_id="%3",
+                                session_id="$0",
+                                window_id="@0",
+                                window_active=True,
+                                pane_active=True,
+                                pane_pid=811,
+                                pane_tty="/dev/ttys031",
+                                socket_path="/tmp/server_a.sock",
+                                current_path=str(tmp),
+                                pane_title="other",
+                            ),
+                            TmuxPaneInfo(
+                                pane_id="%3",
+                                session_id="$0",
+                                window_id="@0",
+                                window_active=True,
+                                pane_active=True,
+                                pane_pid=812,
+                                pane_tty="/dev/ttys032",
+                                socket_path="/tmp/server_b.sock",
+                                current_path=str(tmp),
+                                pane_title="target",
+                            ),
+                        ),
+                    )
+                ]
+                shim_fg_box[0] = {
+                    "ok": True,
+                    "reply": "fg_window",
+                    "hwnd": 42,
+                    "process": "终端",
+                    "bundle_id": "com.apple.Terminal",
+                    "pid": 601,
+                    "title": "",
+                    "ax_trusted": False,
+                }
+                term_state["tty"] = "/dev/ttys004"
+                plat_once_tmux = MacOSPlatform(
+                    Config(),
+                    env=env_with_tmux,
+                    cache_dir=tmp / "cache_once_tmux",
+                    tmux_probe_fn=lambda: multi_srv_snap_box[0],
+                )
+                plat_once_tmux._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat_once_tmux._shim_rpc = plat_shim._shim_rpc  # type: ignore[method-assign]
+                orig_srv_b = plat_once_tmux.get_foreground_window()
+                self.assertEqual((orig_srv_b.tmux_socket, orig_srv_b.tmux_pane), ("/tmp/server_b.sock", "%3"))
+                tmux_cmds.clear()
+                paste_buf_rc[0] = 0
+                out_srv_b = plat_once_tmux.deliver_text("跨server精确socket直投", seq_id=80, origin_window=orig_srv_b)
+                self.assertTrue(out_srv_b.pasted)
+                self.assertEqual(out_srv_b.reason, "tmux")
+                buf_cmds = [c for c in tmux_cmds if "load-buffer" in c or "paste-buffer" in c]
+                self.assertEqual(len(buf_cmds), 2)
+                self.assertIn("-S", buf_cmds[0])
+                exp_srv_b = os.path.realpath("/tmp/server_b.sock")
+                self.assertEqual(os.path.realpath(buf_cmds[0][buf_cmds[0].index("-S") + 1]), exp_srv_b)
+                self.assertEqual(os.path.realpath(buf_cmds[1][buf_cmds[1].index("-S") + 1]), exp_srv_b)
+                self.assertEqual(buf_cmds[1][-2:], ["-t", "%3"])
+
+                # Detach /dev/ttys004 while /dev/ttys099 remains attached to server_a %3 -> must NOT borrow /dev/ttys099!
+                multi_srv_snap_box[0] = TmuxServerSnapshot(
+                    clients=(multi_srv_snap_box[0].clients[0],),
+                    panes=multi_srv_snap_box[0].panes,
+                )
+                osa_scripts.clear()
+                tmux_cmds.clear()
+                out_detached_tty = plat_once_tmux.deliver_text(
+                    "前台TTY已detach不借用其他客户端", seq_id=81, origin_window=orig_srv_b
+                )
+                self.assertFalse(out_detached_tty.pasted)
+                self.assertEqual(out_detached_tty.reason, "focus_changed")
+                self.assertEqual([c for c in tmux_cmds if "load-buffer" in c or "paste-buffer" in c], [])
+                self.assertFalse(any('keystroke "v"' in s for s in osa_scripts))
 
             # 9. _cmd_doctor [macos-fg] displays tty=... when fg_tty is present without fg_surface_id (Terminal.app)
             fake_term_probe = {
@@ -2532,8 +3607,13 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                         alac_osa_calls.append(list(args))
                         or subprocess.CompletedProcess(["osascript", *args], 1, "", "not allowed to send keystrokes (1002)")
                     )
-                    self.assertEqual(plat.resolve_foreground_window(alac_win), alac_win)
-                    out_alac = plat.deliver_text("第三方单标签终端实测直投", seq_id=2, origin_window=alac_win)
+                    resolved_alac = plat.resolve_foreground_window(alac_win)
+                    self.assertEqual(
+                        (resolved_alac.hwnd, resolved_alac.process, resolved_alac.tty, resolved_alac.ax_trusted),
+                        (alac_win.hwnd, alac_win.process, alac_win.tty, alac_win.ax_trusted),
+                    )
+                    self.assertEqual(resolved_alac.tmux_pane, live_snap.panes[0].pane_id)
+                    out_alac = plat.deliver_text("第三方单标签终端实测直投", seq_id=2, origin_window=resolved_alac)
                 self.assertTrue(out_alac.pasted)
                 self.assertEqual(out_alac.reason, "tmux")
                 self.assertEqual(alac_osa_calls, [], "single-tab GUI terminal attached to tmux must spawn zero osascript calls")

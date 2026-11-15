@@ -48,6 +48,8 @@ def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
         cwd=str(m.get("cwd") or ""),
         pid=int(m.get("pid") or 0),
         ax_trusted=raw_ax if isinstance(raw_ax, bool) else None,
+        tmux_socket=str(m.get("tmux_socket") or ""),
+        tmux_pane=str(m.get("tmux_pane") or ""),
     )
 
 
@@ -503,11 +505,17 @@ class VoiceInputDaemon:
                 win_snap = self._origin_win
                 self.state = "recognizing"
             self._cancel_max_duration_timer()
+            stop_perm_exc: MicrophoneUnavailableError | None = None
             try:
                 try:
                     raw_wav, src_used = self.platform.stop_recording(drain=False)
                 except TypeError:
                     raw_wav, src_used = self.platform.stop_recording()
+            except MicrophoneUnavailableError as exc:
+                raw_wav = bytes(getattr(exc, "_raw_wav", b"") or b"")
+                src_used = str(getattr(exc, "_audio_source", "") or "")
+                if str(getattr(exc, "reason_code", "")) == "mic_permission":
+                    stop_perm_exc = exc
             except Exception:
                 raw_wav, src_used = b"", ""
             gate = None
@@ -518,6 +526,28 @@ class VoiceInputDaemon:
                     gate = None
             lost_ts = self.clock_fn()
             if gate is None or not gate.passed:
+                if stop_perm_exc is not None:
+                    perm_hud = str(getattr(stop_perm_exc, "hud_state", "mic_permission") or "mic_permission")
+                    perm_err = self._redact(stop_perm_exc)
+                    with self._lock:
+                        still_cur = self.seq_id == cur_seq
+                        if still_cur:
+                            self.state = "idle"
+                            self._recorder_lost_seq = cur_seq
+                            self._recorder_lost_ts = lost_ts
+                            self._recorder_lost_stop_absorbed = False
+                        self.last_result = {
+                            "seq_id": cur_seq,
+                            "ok": False,
+                            "skipped_reason": "mic_permission",
+                            "audio_source": src_used,
+                            "error": perm_err,
+                        }
+                    if still_cur and not eff_silent:
+                        self._hud(perm_hud, duration_ms=0, clear_main=True)
+                    if not eff_silent:
+                        self.platform.beep("error")
+                    return
                 audio_err = self._redact_str(str(getattr(self.platform, "last_audio_error", "") or "mic_disconnected"))
                 with self._lock:
                     still_cur = self.seq_id == cur_seq
@@ -778,13 +808,24 @@ class VoiceInputDaemon:
                 if not eff_silent: self.platform.beep("stop")
             except Exception as exc:
                 err = self._redact(exc)
+                is_mic_err = isinstance(exc, (NoMicrophoneError, MicrophoneUnavailableError))
+                err_reason = str(getattr(exc, "reason_code", "no_mic")) if is_mic_err else ""
+                err_hud_state = str(getattr(exc, "hud_state", "no_mic")) if is_mic_err else "error"
+                err_hud_dur = 2200 if err_hud_state == "no_mic" else 0
                 with self._lock:
                     still_cur = self.seq_id == cur_seq
                     if still_cur: self.state = "idle"
-                    self.last_result = {"seq_id": cur_seq, "ok": False, "error": err}
-                if still_cur and not eff_silent: self._hud("error", clear_main=True)
+                    lr_stop: dict[str, Any] = {"seq_id": cur_seq, "ok": False, "error": err}
+                    if err_reason:
+                        lr_stop["skipped_reason"] = err_reason
+                    self.last_result = lr_stop
+                if still_cur and not eff_silent:
+                    self._hud(err_hud_state, duration_ms=err_hud_dur, clear_main=True)
                 if not eff_silent: self.platform.beep("error")
-                return {"ok": False, "error": err, "state": "idle", "seq_id": cur_seq}
+                out_stop_err: dict[str, Any] = {"ok": False, "error": err, "state": "idle", "seq_id": cur_seq}
+                if err_reason:
+                    out_stop_err["skipped_reason"] = err_reason
+                return out_stop_err
             threading.Thread(
                 target=self._run_bg_pipeline,
                 args=(cur_seq, raw_wav, src_used, win_snap, eff_no_paste, eff_silent, False, rec_cnt, rec_gap),
@@ -896,7 +937,25 @@ class VoiceInputDaemon:
                     resp["shim_error"] = shim_err
                 return resp
         if cmd in ("toggle", "rec_start", "rec_stop"):
-            win = _window_from_mapping(req) if any(req.get(k) for k in ("hwnd", "process", "title", "bundle_id", "surface_id", "tty", "cwd", "pid")) else None
+            win = (
+                _window_from_mapping(req)
+                if any(
+                    req.get(k)
+                    for k in (
+                        "hwnd",
+                        "process",
+                        "title",
+                        "bundle_id",
+                        "surface_id",
+                        "tty",
+                        "cwd",
+                        "pid",
+                        "tmux_socket",
+                        "tmux_pane",
+                    )
+                )
+                else None
+            )
             return self.handle_trigger({"toggle": "toggle", "rec_start": "ptt_start", "rec_stop": "ptt_stop"}[cmd], win, no_paste=bool(req.get("no_paste")), silent_hud=bool(req.get("silent_hud")), loopback=bool(req.get("loopback")))
         if cmd == "selftest_wav":
             wav_path = Path(str(req.get("wav_path") or "")).expanduser()
