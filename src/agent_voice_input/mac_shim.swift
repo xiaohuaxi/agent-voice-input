@@ -390,7 +390,7 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
 
     let toastBg = HudRgba(r: 30.0 / 255.0, g: 31.0 / 255.0, b: 36.0 / 255.0, a: 0.98)
     let toastMainText = HudRgba(r: 244.0 / 255.0, g: 245.0 / 255.0, b: 248.0 / 255.0, a: 1.0)
-    let toastHintText = HudRgba(r: 204.0 / 255.0, g: 208.0 / 255.0, b: 218.0 / 255.0, a: 1.0)
+    let toastHintText = HudRgba(r: 190.0 / 255.0, g: 195.0 / 255.0, b: 208.0 / 255.0, a: 1.0)
     let amberBorder = HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 0.78)
     let amberIcon = HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 1.0)
     let coralBorder = HudRgba(r: 248.0 / 255.0, g: 113.0 / 255.0, b: 113.0 / 255.0, a: 0.78)
@@ -406,7 +406,7 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
             borderWidth: 1.0,
             icon: hudRgba(255, 104, 112, 1.0),
             mainText: hudRgba(248, 250, 252, 1.0),
-            hintText: hudRgba(210, 200, 216, 1.0),
+            hintText: hudRgba(188, 178, 192, 1.0),
             autoHideMs: 0,
             iconKind: ""
         )
@@ -755,7 +755,7 @@ final class HudPillController {
     private static let recWaveActive = rgba(255, 104, 112, 1.0)
     private static let recWaveQuiet = rgba(232, 92, 102, 1.0)
     private static let recMainText = rgba(248, 250, 252)
-    private static let recHintTextCol = rgba(210, 200, 216, 1.0)
+    private static let recHintTextCol = rgba(188, 178, 192, 1.0)
 
     private static let warnBg = rgba(72, 38, 12, 0.98)
     private static let warnBorder = rgba(245, 158, 11, 0.72)
@@ -764,9 +764,9 @@ final class HudPillController {
     private static let warnMainText = rgba(254, 252, 232)
     private static let warnHintTextCol = rgba(251, 191, 36, 1.0)
 
-    private static let hudFont = NSFont.systemFont(ofSize: 14.0, weight: .medium)
-    private static let monoDurFont = NSFont.monospacedDigitSystemFont(ofSize: 14.0, weight: .medium)
-    private static let toastFont = NSFont.systemFont(ofSize: 13.0, weight: .medium)
+    private static let hudFont = NSFont.systemFont(ofSize: 13.5, weight: .regular)
+    private static let monoDurFont = NSFont.monospacedDigitSystemFont(ofSize: 13.5, weight: .regular)
+    private static let toastFont = NSFont.systemFont(ofSize: 12.5, weight: .regular)
     private static let bellWeight: [CGFloat] = [1.00, 0.92, 0.78, 0.58, 0.40]
 
     private var panel: NSPanel?
