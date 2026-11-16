@@ -111,6 +111,45 @@ class SimpleTomlParserTests(unittest.TestCase):
         parsed_entry = parse_toml(toml_doc)
         self.assertEqual(parsed_entry["hotkey"]["key"], "RControl")
 
+    def test_parses_multiline_basic_and_literal_toml_strings_identically_across_runtimes(self) -> None:
+        toml_doc = (
+            "[refiner]\n"
+            "prompt = '''\n"
+            "# Heading inside literal multiline (not a comment!)\n"
+            "Line 2 with raw backslash C:\\temp\\file and 'single' ''two'' quotes.\n"
+            "\n"
+            "  Indented line 4 after blank line''''\n"
+            "alt_basic = \"\"\"\n"
+            "# Basic multiline with escape \\u4e2d\\u6587 and folded \\\n"
+            "   \t  continuation plus \"one\" \"\"two\"\" quotes\"\"\"\"\"\n"
+            "inline_ml = '''kept first line\nsecond line''' # trailing comment\n"
+            "arr_ml = [\n"
+            "  # comment inside multiline array\n"
+            "  '''first\nitem''',\n"
+            "  \"\"\"second\\nitem\"\"\",\n"
+            "]\n"
+        )
+        parsed_simple = _parse_simple_toml(toml_doc)
+        parsed_entry = parse_toml(toml_doc)
+        self.assertEqual(parsed_simple, parsed_entry)
+        self.assertEqual(
+            parsed_simple["refiner"]["prompt"],
+            "# Heading inside literal multiline (not a comment!)\n"
+            "Line 2 with raw backslash C:\\temp\\file and 'single' ''two'' quotes.\n"
+            "\n"
+            "  Indented line 4 after blank line'",
+        )
+        self.assertEqual(
+            parsed_simple["refiner"]["alt_basic"],
+            '# Basic multiline with escape 中文 and folded continuation plus "one" ""two"" quotes""',
+        )
+        self.assertEqual(parsed_simple["refiner"]["inline_ml"], "kept first line\nsecond line")
+        self.assertEqual(parsed_simple["refiner"]["arr_ml"], ["first\nitem", "second\nitem"])
+        # CRLF leading newline trimming and normalization inside multiline strings
+        crlf_doc = "[refiner]\r\nprompt = '''\r\nfirst\r\nsecond'''\r\n"
+        self.assertEqual(_parse_simple_toml(crlf_doc)["refiner"]["prompt"], "first\nsecond")
+        self.assertEqual(parse_toml(crlf_doc)["refiner"]["prompt"], "first\nsecond")
+
     def test_rejects_invalid_toml_syntax_surrogates_and_control_chars_with_line_number(self) -> None:
         bad_cases = [
             ('[hotkey\nkey = "F8"', "line 1"),
@@ -125,6 +164,12 @@ class SimpleTomlParserTests(unittest.TestCase):
             ('[hotkey]\nmax_overflow = "\\UFFFFFFFF"', "line 2"),
             ('[hotkey]\nraw_nul = "abc\x00def"', "line 2"),
             ('[hotkey]\narr = [\n  "unclosed_across_newline,\n  b"\n]', "line 3"),
+            ("[refiner]\nprompt = '''\nunterminated multiline", "line 2"),
+            ('[refiner]\nprompt = """\nunterminated basic', "line 2"),
+            ("[refiner]\nprompt = '''too many ''''''", "line 2"),
+            ('[refiner]\nprompt = """too many """"""', "line 2"),
+            ("[refiner]\nprompt = '''\nline3\nbad\x00ctrl'''", "line 4"),
+            ('["""badkey"""]\nx = 1', "line 1"),
         ]
         for doc, expected_line in bad_cases:
             with self.subTest(doc=repr(doc)):

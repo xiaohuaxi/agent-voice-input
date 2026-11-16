@@ -116,6 +116,7 @@ agent-voice-input start
   - 默认 `asr.api = "auto"` 会自动按渠道与模型选择协议：`dashscope`、`doubao` 与专用 STT 模型（如 `qwen/qwen3-asr-1.7b`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）走一阶段纯转写 + 二阶段语境精修；
   - 原生 `gemini` 以及 OpenRouter / OpenAI 兼容渠道下的多模态音频理解模型（如 `gemini-2.5-flash`、`google/gemini-2.5-flash`、`gpt-audio*`）自动将音频与会话上下文合并为单次请求一步完成转写与精修，并默认跳过二阶段（除非设置 `refiner.force_on_single_hop = true`）。在 `openrouter` 下使用未内置收录的新模型时，请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
 - **思考档位控制（`effort`）**：支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`。`asr.effort` 默认 `"auto"`（自动压低多模态模型的默认思考延迟），`refiner.effort` 默认 `"low"`。
+- **精修提示词与前缀缓存组织（`refiner.prompt`、`include_git_status`、`context_max_chars`）**：`prompt` 默认留空 `""` 时使用内置英文语音听写编辑提示词（结合只读 `<session_reference_log>` 上下文分块与 `<workspace_git_status>` 修正同音错字与代码术语、顺通口语停顿并保持原句结构与说话语言、严禁把口述提问当成对话回答），亦可在 `[refiner]` 中用 TOML 三引号多行文本 `prompt = '''...'''` 定制。终端历史对话（默认上限 `context_max_chars = 200000` 字符，满窗按四分之一即 `50K` 整块滑出）按固定前缀顺序置于单条 `user` 消息前部，易变的当轮语音草稿与 `git status` 文件列表统一放在该消息最末尾（`include_git_status = true`，可设为 `false` 关闭）以命中自动前缀缓存（`codex` 渠道按会话复用 `thread/revert` 清空的固定线程壳以保持 `prompt_cache_key` 命中且不残留历史草稿）。
 - **同渠道重试与建连超时（`max_retries`）**：`[asr] max_retries` 与 `[refiner] max_retries` 默认 `2`（`0..10`，指首次请求之外的额外重试次数，`0` 关闭重试），在阶段 `timeout_sec` 总预算与独立的 9 秒建连/TLS 握手超时上限内，区分频率限流（`HTTP 429`、`Retry-After`、厂商 QPS 码）与瞬态通信/5xx 错误分别退避重试。
 
 ### 内置渠道一览

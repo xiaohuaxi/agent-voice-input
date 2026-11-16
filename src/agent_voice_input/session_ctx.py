@@ -2673,6 +2673,10 @@ def extract_turn_hotwords(
     return found
 
 
+DEFAULT_REFINER_CONTEXT_MAX_CHARS = 200000
+DEFAULT_REFINER_CHUNK_CHARS = DEFAULT_REFINER_CONTEXT_MAX_CHARS // 4
+
+
 def format_turns_text(turns: Sequence[tuple[str, str]], max_chars: int = 16000) -> str:
     if not turns or max_chars <= 0:
         return ""
@@ -2690,6 +2694,65 @@ def format_turns_text(turns: Sequence[tuple[str, str]], max_chars: int = 16000) 
         total += len(entry) + 2
     blocks.reverse()
     return "\n\n".join(blocks)
+
+
+def chunk_turns_for_refiner(
+    turns: Sequence[tuple[str, str]],
+    *,
+    max_chars: int = DEFAULT_REFINER_CONTEXT_MAX_CHARS,
+    chunk_chars: int | None = None,
+) -> list[str]:
+    """Pack turns into deterministic fixed-boundary text chunks with ~1/4-window eviction.
+
+    Chunks are anchored from ``turns[0]`` forward (~1/4 of ``max_chars`` by default, e.g. 50K
+    for 200K) and evicted in whole-chunk steps once ``max_chars`` is exceeded, keeping the
+    remaining ~3/4 prefix byte-identical across subsequent turns.
+    Uses third-party transcript labels (``[Speaker]`` / ``[CLI Agent]``) rather than
+    ``[Assistant]`` so Stage 2 refiners do not mistake downstream agent turns for their own.
+    """
+    if not turns or max_chars <= 0:
+        return []
+    default_chunk = (
+        DEFAULT_REFINER_CHUNK_CHARS
+        if max_chars == DEFAULT_REFINER_CONTEXT_MAX_CHARS
+        else max_chars // 4
+    )
+    target_chunk = max(256, default_chunk) if chunk_chars is None else int(chunk_chars)
+    eff_chunk = max(256, min(target_chunk, max(256, max_chars // 2)))
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for role, text in turns:
+        tag = "Speaker" if role == "user" else "CLI Agent"
+        prefix = f"[{tag}]\n"
+        entry = f"{prefix}{text}"
+        if len(entry) > max_chars:
+            rem = max(0, max_chars - len(prefix))
+            entry = f"{prefix}{text[-rem:]}" if rem > 0 else prefix.rstrip()
+        sep = 2 if cur else 0
+        if cur and cur_len + sep + len(entry) > eff_chunk:
+            chunks.append("\n\n".join(cur))
+            cur = [entry]
+            cur_len = len(entry)
+        else:
+            cur.append(entry)
+            cur_len += sep + len(entry)
+    if cur:
+        chunks.append("\n\n".join(cur))
+
+    kept: list[str] = []
+    total = 0
+    for ch in reversed(chunks):
+        sep = 2 if kept else 0
+        if kept and total + sep + len(ch) > max_chars:
+            break
+        if not kept and len(ch) > max_chars:
+            kept.append(ch[-max_chars:])
+            break
+        kept.append(ch)
+        total += sep + len(ch)
+    kept.reverse()
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -4144,12 +4207,44 @@ class SessionTracker:
                 byte_offset=state.byte_offset,
             )
 
+    def get_refiner_context(
+        self,
+        session_key: str,
+        *,
+        max_chars: int = DEFAULT_REFINER_CONTEXT_MAX_CHARS,
+        include_git_status: bool = True,
+        chunk_chars: int | None = None,
+    ) -> tuple[list[str], str]:
+        """Return ``(dialog_chunks, git_context_text)`` separated for message-boundary prefix caching."""
+        with self._lock:
+            state = self._states.get(session_key)
+            if state is None:
+                return [], ""
+            turns_copy = list(state.clean_turns)
+            cwd = state.cwd
+            git_status, git_hw = (
+                self._get_git_info(cwd) if include_git_status else ("", [])
+            )
+
+        dialog_chunks = chunk_turns_for_refiner(
+            turns_copy, max_chars=max_chars, chunk_chars=chunk_chars
+        )
+        git_sections: list[str] = []
+        if include_git_status:
+            if cwd:
+                git_sections.append(f"cwd: {cwd}")
+            if git_status:
+                git_sections.append(f"git_status:\n{git_status}")
+            if git_hw:
+                git_sections.append("changed_files: " + ", ".join(git_hw[:30]))
+        return dialog_chunks, "\n\n".join(git_sections)
+
     def get_luna_delta(
         self,
         session_key: str,
         *,
         full: bool = False,
-        max_chars: int = 12000,
+        max_chars: int = DEFAULT_REFINER_CONTEXT_MAX_CHARS,
     ) -> tuple[str, int, int]:
         """Return ``(context_delta_text, new_synced_idx, generation)`` for Stage 2 Luna thread."""
         with self._lock:

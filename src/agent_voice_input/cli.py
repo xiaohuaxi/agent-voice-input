@@ -186,6 +186,7 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
     )
     print(f"[session]   {match.session_key + ' (' + match.matched_by + ')' if match else 'none matched (will use empty context)'}")
     ref_prov = cfg.refiner.provider.strip().lower()
+    prompt_tag = ", prompt=custom" if cfg.refiner.prompt.strip() else ""
     if ref_prov in ("", "off", "none", "false", "0", "disabled"):
         print("[refiner]   off")
     elif ref_prov == "codex":
@@ -193,7 +194,7 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
         if cbin := find_codex_bin(env):
             print(
                 f"[refiner]   OK codex ({cbin}, model={eff_ref_model} "
-                f"[{_check_codex_model(eff_ref_model, env)}], effort={cfg.refiner.effort})"
+                f"[{_check_codex_model(eff_ref_model, env)}], effort={cfg.refiner.effort}{prompt_tag})"
             )
         else:
             print("[refiner]   FAIL codex binary not found")
@@ -209,7 +210,7 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
             ref_ready = bool(creds.for_provider(ref_prov))
         print(
             f"[refiner]   {'OK' if ref_ready else 'MISSING KEY'} {ref_prov} "
-            f"(model={eff_ref_model}, effort={cfg.refiner.effort})"
+            f"(model={eff_ref_model}, effort={cfg.refiner.effort}{prompt_tag})"
         )
         ok_all = ok_all and ref_ready
     return 0 if ok_all else 1

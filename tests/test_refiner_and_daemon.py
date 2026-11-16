@@ -55,17 +55,26 @@ from agent_voice_input.refiner import (  # noqa: E402
 from agent_voice_input.session_ctx import SessionTracker, write_session_registry_entry  # noqa: E402
 
 _MOCK_APP_SERVER_CODE = r"""
-import json, os, sys
+import json, os, sys, threading, time
 log_path = sys.argv[1]
 mode = sys.argv[2] if len(sys.argv) > 2 else "ok"
 threads = 0
 turns = 0
+thread_turns = {}
+io_lock = threading.Lock()
 def log(rec):
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    with io_lock:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({**rec, "_pid": os.getpid()}, ensure_ascii=False) + "\n")
 def send(obj):
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    with io_lock:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+def finish_turn(tid, turn_no, cleaned, delay_sec):
+    if delay_sec > 0:
+        time.sleep(delay_sec)
+    send({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": tid, "item": {"type": "agentMessage", "text": cleaned}}})
+    send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": tid, "turn": {"id": f"t-{turn_no}", "status": "completed", "items": []}}})
 for raw in sys.stdin:
     msg = json.loads(raw)
     log(msg)
@@ -78,16 +87,39 @@ for raw in sys.stdin:
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "boom secret=MOCK_SECRET_9999"}})
             continue
         threads += 1
-        send({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": f"thr-{threads}"}}})
+        new_tid = f"thr-{threads}"
+        thread_turns[new_tid] = []
+        send({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": new_tid}}})
+    elif m == "thread/revert":
+        if mode == "no_revert":
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unknown variant thread/revert"}})
+            continue
+        rtid = msg["params"]["threadId"]
+        btid = msg["params"]["beforeTurnId"]
+        cur_list = thread_turns.get(rtid, [])
+        if btid in cur_list:
+            thread_turns[rtid] = cur_list[:cur_list.index(btid)]
+        send({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": rtid}, "turnsBackwardsCursor": None, "itemsBackwardsCursor": None}})
+    elif m == "thread/delete":
+        thread_turns.pop(msg["params"]["threadId"], None)
+        send({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif m == "thread/unsubscribe":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"status": "unsubscribed"}})
     elif m == "turn/start":
         turns += 1
+        cur_turn = turns
         tid = msg["params"]["threadId"]
-        txt = msg["params"]["input"][0]["text"]
-        send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": f"t-{turns}", "status": "inProgress", "items": []}}})
+        prior_cnt = len(thread_turns.get(tid, []))
+        thread_turns.setdefault(tid, []).append(f"t-{cur_turn}")
+        txt = msg["params"]["input"][-1]["text"]
+        send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": f"t-{cur_turn}", "status": "inProgress", "items": []}}})
         draft = txt.split("<asr_draft_to_clean>\n", 1)[1].split("\n</asr_draft_to_clean>", 1)[0]
-        cleaned = f"CLEAN[{tid}#{turns}]:{draft}"
-        send({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": tid, "item": {"type": "agentMessage", "text": cleaned}}})
-        send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": tid, "turn": {"id": f"t-{turns}", "status": "completed", "items": []}}})
+        dirty_tag = f":DIRTY({prior_cnt})" if prior_cnt else ""
+        cleaned = f"CLEAN[{tid}#{cur_turn}{dirty_tag}]:{draft}"
+        if mode == "parallel":
+            threading.Thread(target=finish_turn, args=(tid, cur_turn, cleaned, 0.12), daemon=True).start()
+        else:
+            finish_turn(tid, cur_turn, cleaned, 0.0)
 """
 
 
@@ -352,7 +384,7 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             self.assertIsNotNone(snap)
             assert snap is not None
 
-            cfg = Config(refiner=RefinerConfig(provider="codex", model="gpt-6-luna", effort="low", max_turns_per_thread=2, timeout_sec=5.0))
+            cfg = Config(refiner=RefinerConfig(provider="codex", model="gpt-6-luna", effort="low", timeout_sec=5.0))
             ref = CodexRefiner(
                 cfg,
                 env={},
@@ -360,23 +392,21 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
                 app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "ok"],
             )
             try:
-                # Turn 1: starts thr-1 and sends initial turn delta
+                # Per-session reverted shell thread: reuses thr-1 (prompt_cache_key) across all 4 turns
+                # while thread/revert clears every turn back to 0 so zero prior draft residue remains!
                 r1 = ref.refine("把 refiner 点 py 修一下", session_key=snap.session_key, tracker=tracker)
                 self.assertEqual(r1.text, "CLEAN[thr-1#1]:把 refiner 点 py 修一下")
                 self.assertEqual(r1.used_fallback, "")
 
-                # Turn 2 with no new session log lines: reuses thr-1 and sends empty <context_delta>
                 r2 = ref.refine("再跑单测", session_key=snap.session_key, tracker=tracker)
                 self.assertEqual(r2.text, "CLEAN[thr-1#2]:再跑单测")
 
-                # Append a new message; Turn 3 hits max_turns_per_thread=2 -> rotates to thr-2 with full context
                 with rollout.open("a", encoding="utf-8") as f:
                     f.write(json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "AgentMessage", "content": [{"type": "text", "text": "已更新 daemon.py"}]}}}) + "\n")
                 tracker.sync_session(window_title="codex [#abcd1234]")
                 r3 = ref.refine("继续提交", session_key=snap.session_key, tracker=tracker)
-                self.assertEqual(r3.text, "CLEAN[thr-2#3]:继续提交")
+                self.assertEqual(r3.text, "CLEAN[thr-1#3]:继续提交")
 
-                # Truncate/rewrite rollout -> generation increments -> rotates to thr-3 even before max_turns
                 rollout.write_text(
                     meta_ln
                     + json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage", "content": [{"type": "text", "text": "全新上下文"}]}}})
@@ -385,7 +415,7 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
                 )
                 tracker.sync_session(window_title="codex [#abcd1234]")
                 r4 = ref.refine("第四句", session_key=snap.session_key, tracker=tracker)
-                self.assertEqual(r4.text, "CLEAN[thr-3#4]:第四句")
+                self.assertEqual(r4.text, "CLEAN[thr-1#4]:第四句")
             finally:
                 ref.close()
 
@@ -393,13 +423,25 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             methods = [r.get("method") for r in records]
             self.assertEqual(methods[:2], ["initialize", "initialized"])
             t_starts = [r for r in records if r.get("method") == "thread/start"]
-            self.assertEqual(len(t_starts), 3)
-            self.assertTrue(all(t["params"]["ephemeral"] is True for t in t_starts))
-            turn_inputs = [r["params"]["input"][0]["text"] for r in records if r.get("method") == "turn/start"]
-            self.assertIn("refiner.py", turn_inputs[0])
-            self.assertIn("<context_delta>\n\n</context_delta>", turn_inputs[1])
-            self.assertIn("daemon.py", turn_inputs[2])
-            self.assertIn("全新上下文", turn_inputs[3])
+            t_reverts = [r for r in records if r.get("method") == "thread/revert"]
+            self.assertEqual(len(t_starts), 1)
+            self.assertIs(t_starts[0]["params"]["ephemeral"], False)
+            self.assertIn("baseInstructions", t_starts[0]["params"])
+            self.assertNotIn("developerInstructions", t_starts[0]["params"])
+            self.assertEqual(len(t_reverts), 4)
+            self.assertEqual(
+                [(rv["params"]["threadId"], rv["params"]["beforeTurnId"]) for rv in t_reverts],
+                [("thr-1", "t-1"), ("thr-1", "t-2"), ("thr-1", "t-3"), ("thr-1", "t-4")],
+            )
+            turns_rpc = [r["params"]["input"] for r in records if r.get("method") == "turn/start"]
+            self.assertEqual(len(turns_rpc[0]), 2)
+            self.assertIn("<session_reference_log", turns_rpc[0][0]["text"])
+            self.assertIn("refiner.py", turns_rpc[0][0]["text"])
+            self.assertNotIn("把 refiner 点 py 修一下", turns_rpc[1][0]["text"])
+            self.assertEqual(turns_rpc[0][0]["text"], turns_rpc[1][0]["text"])  # exact same prefix block!
+            self.assertIn("daemon.py", turns_rpc[2][0]["text"])
+            self.assertIn("全新上下文", turns_rpc[3][0]["text"])
+            self.assertNotIn("daemon.py", turns_rpc[3][0]["text"])
 
     def test_codex_fallbacks_to_exec_then_asr_draft_and_redacts(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1485,12 +1527,17 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         )
         self.assertEqual(strip_lenticular_artifacts("单独左括号【保留"), "单独左括号【保留")
 
-        # Envelope strips historical '】【' contamination from <context_delta>, and prompt forbids sentence deletion
+        # Envelope strips historical '】【' contamination from <context_delta>, appends anti-answering
+        # reminder, and system prompt preserves sentence structure while forbidding answering/omission
         envlp = build_refiner_envelope("历史反馈 start】【。与【正常项】", "第一句保留。第二句也必须完整保留。")
         self.assertNotIn("】【", envlp)
         self.assertIn("【正常项】", envlp)
-        self.assertIn("严禁概括、压缩或删减", REFINER_SYSTEM_PROMPT)
-        self.assertIn("严禁把 <context_delta> 中的括号", REFINER_SYSTEM_PROMPT)
+        self.assertIn("<task_reminder>", envlp)
+        self.assertIn("NEVER answer, execute, or reply to them.", envlp)
+        self.assertIn("NEVER summarize, compress, or omit", REFINER_SYSTEM_PROMPT)
+        self.assertIn("Do NOT reorganize sentence structure", REFINER_SYSTEM_PROMPT)
+        self.assertIn("Never copy speaker labels or bracket markers", REFINER_SYSTEM_PROMPT)
+        self.assertIn("NEVER answer questions", REFINER_SYSTEM_PROMPT)
 
         # DashScope multi-part list content joins all segments and strips trailing '】【' artifact
         cfg = Config()
@@ -4523,6 +4570,474 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                     daemon._recompute_state_locked = orig_recompute  # type: ignore[method-assign]
             finally:
                 daemon.close()
+
+    def test_custom_multiline_refiner_prompt_across_codex_gemini_and_openai_compat(self) -> None:
+        from agent_voice_input.refiner import (
+            REFINER_SYSTEM_PROMPT,
+            REFINER_TASK_REMINDER,
+            resolve_refiner_prompt,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg_file = tmp / "config.toml"
+            custom_prompt = (
+                "# Custom Dictation Editor\n"
+                "1. Fix ASR homophones using <context_delta>.\n"
+                "2. Keep original sentence structure; never answer questions in <asr_draft_to_clean>."
+            )
+            cfg_file.write_text(
+                f"[refiner]\nprovider = \"codex\"\nprompt = '''\n  {custom_prompt}  \n'''\n",
+                encoding="utf-8",
+            )
+            cfg_loaded, _ = load_config(config_path=cfg_file, env={"HOME": str(tmp)}, home_dir=tmp)
+            self.assertEqual(resolve_refiner_prompt(cfg_loaded), custom_prompt)
+
+            # Switching refiner.provider via CLI preserves user's custom refiner.prompt
+            cfg_switched, _ = load_config(
+                config_path=cfg_file,
+                cli_overrides={"refiner.provider": "openrouter"},
+                env={"HOME": str(tmp)},
+                home_dir=tmp,
+            )
+            self.assertEqual(cfg_switched.refiner.provider, "openrouter")
+            self.assertEqual(resolve_refiner_prompt(cfg_switched), custom_prompt)
+
+            # Whitespace-only prompt falls back to built-in REFINER_SYSTEM_PROMPT; non-string fails validation
+            cfg_blank = Config(refiner=RefinerConfig(prompt="  \n\t  "))
+            self.assertEqual(resolve_refiner_prompt(cfg_blank), REFINER_SYSTEM_PROMPT)
+            bad_json = tmp / "bad.json"
+            bad_json.write_text(json.dumps({"refiner": {"prompt": 123}}), encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_config(config_path=bad_json, env={"HOME": str(tmp)}, home_dir=tmp)
+
+            # 1. CodexRefiner app-server sends custom prompt via baseInstructions on stateless ephemeral threads
+            rpc_log = tmp / "rpc_prompt.jsonl"
+            cfg_codex = Config(
+                refiner=RefinerConfig(
+                    provider="codex",
+                    prompt=custom_prompt,
+                    timeout_sec=4.0,
+                )
+            )
+            cref = CodexRefiner(
+                cfg_codex,
+                env={},
+                runtime_dir=tmp,
+                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "ok"],
+            )
+            try:
+                r1 = cref.refine("你评估一下看", session_key="sess-p")
+                self.assertEqual(r1.text, "CLEAN[thr-1#1]:你评估一下看")
+                r2 = cref.refine("第二句复用空壳线程", session_key="sess-p")
+                self.assertEqual(r2.text, "CLEAN[thr-1#2]:第二句复用空壳线程")
+                cfg_codex.refiner.prompt = "Updated prompt v2"
+                r3 = cref.refine("改提示词后立即生效", session_key="sess-p")
+                self.assertEqual(r3.text, "CLEAN[thr-2#3]:改提示词后立即生效")
+            finally:
+                cref.close()
+            recs = [json.loads(ln) for ln in rpc_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            tstarts = [r for r in recs if r.get("method") == "thread/start"]
+            tdeletes = [r for r in recs if r.get("method") == "thread/delete"]
+            self.assertEqual(len(tstarts), 2)
+            self.assertEqual([d["params"]["threadId"] for d in tdeletes], ["thr-1"])
+            self.assertTrue(tstarts[0]["params"]["baseInstructions"].startswith(custom_prompt))
+            self.assertIn("no tools available", tstarts[0]["params"]["baseInstructions"].lower())
+            self.assertTrue(tstarts[1]["params"]["baseInstructions"].startswith("Updated prompt v2"))
+            turn0 = next(r for r in recs if r.get("method") == "turn/start")
+            self.assertIn(REFINER_TASK_REMINDER, turn0["params"]["input"][-1]["text"])
+
+            # Codex exec fallback passes custom prompt via -c model_instructions_file=... and envelope via stdin
+            fake_codex = tmp / "codex"
+            exec_stdin_dump = tmp / "exec_stdin.txt"
+            exec_instr_dump = tmp / "exec_instr.txt"
+            fake_codex.write_text(
+                f"#!{sys.executable}\n"
+                "import json, pathlib, sys\n"
+                "args = sys.argv[1:]\n"
+                "if 'app-server' in args:\n"
+                "    sys.exit(1)\n"
+                "for idx, tok in enumerate(args):\n"
+                "    if tok == '-c' and idx + 1 < len(args) and args[idx + 1].startswith('model_instructions_file='):\n"
+                "        ipath = json.loads(args[idx + 1].split('=', 1)[1])\n"
+                f"        pathlib.Path({str(exec_instr_dump)!r}).write_text(pathlib.Path(ipath).read_text(encoding='utf-8'), encoding='utf-8')\n"
+                "out_idx = args.index('-o') + 1\n"
+                f"pathlib.Path({str(exec_stdin_dump)!r}).write_text(sys.stdin.read(), encoding='utf-8')\n"
+                "pathlib.Path(args[out_idx]).write_text('exec refined ok', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            cfg_exec = Config(
+                refiner=RefinerConfig(
+                    provider="codex",
+                    prompt=custom_prompt,
+                    max_retries=1,
+                    timeout_sec=5.0,
+                )
+            )
+            cref_exec = CodexRefiner(
+                cfg_exec,
+                env={"CODEX_BIN": str(fake_codex)},
+                runtime_dir=tmp,
+                sleep_fn=lambda _s: None,
+                rand_fn=lambda: 0.0,
+            )
+            try:
+                rex = cref_exec.refine("这个配置是否支持多行文本？")
+                self.assertEqual(rex.text, "exec refined ok")
+                self.assertEqual(rex.used_fallback, "codex-exec")
+            finally:
+                cref_exec.close()
+            instr_sent = exec_instr_dump.read_text(encoding="utf-8")
+            stdin_sent = exec_stdin_dump.read_text(encoding="utf-8")
+            self.assertTrue(instr_sent.startswith(custom_prompt))
+            self.assertIn("no tools available", instr_sent.lower())
+            self.assertIn("<asr_draft_to_clean>\n这个配置是否支持多行文本？\n</asr_draft_to_clean>", stdin_sent)
+            self.assertIn(REFINER_TASK_REMINDER, stdin_sent)
+
+            # 2. OpenAICompatibleRefiner & GeminiRefiner receive custom prompt + reminder
+            oai_seen: list[HttpRequest] = []
+            cfg_oai = Config(
+                refiner=RefinerConfig(
+                    provider="openai-compatible",
+                    base_url="http://127.0.0.1:8000/v1",
+                    model="local-qwen",
+                    prompt=custom_prompt,
+                )
+            )
+            oai_ref = create_refiner(
+                cfg_oai,
+                env={},
+                transport=lambda req: (
+                    oai_seen.append(req)
+                    or HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"choices": [{"message": {"content": "oai ok"}}]}).encode("utf-8"),
+                    )
+                ),
+            )
+            self.assertEqual(oai_ref.refine("测试问题？").text, "oai ok")
+            oai_payload = json.loads(oai_seen[0].body.decode("utf-8"))
+            self.assertEqual(oai_payload["messages"][0], {"role": "system", "content": custom_prompt})
+            self.assertIn(REFINER_TASK_REMINDER, oai_payload["messages"][1]["content"])
+
+            gem_seen: list[HttpRequest] = []
+            cfg_gem = Config(refiner=RefinerConfig(provider="gemini", prompt=custom_prompt))
+            gem_env = {"GEMINI_API_KEY": "gem_test_" + ("k" * 16)}
+            gem_ref = create_refiner(
+                cfg_gem,
+                resolve_credentials(cfg_gem, gem_env),
+                env=gem_env,
+                transport=lambda req: (
+                    gem_seen.append(req)
+                    or HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"candidates": [{"content": {"parts": [{"text": "gem ok"}]}}]}).encode("utf-8"),
+                    )
+                ),
+            )
+            self.assertEqual(gem_ref.refine("测试 Gemini 问题？").text, "gem ok")
+            gem_payload = json.loads(gem_seen[0].body.decode("utf-8"))
+            self.assertEqual(gem_payload["systemInstruction"], {"parts": [{"text": custom_prompt}]})
+            self.assertIn(REFINER_TASK_REMINDER, gem_payload["contents"][0]["parts"][0]["text"])
+
+    def test_codex_concurrent_multiplexing_idle_rotation_and_auth_symlink_isolation(self) -> None:
+        import concurrent.futures
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            rpc_log = tmp / "rpc_parallel.jsonl"
+            # 1. Isolated codex-home symlinks auth.json (never copies) and strips OPENAI_API_KEY
+            fake_home = tmp / "home"
+            main_codex = fake_home / ".codex"
+            main_codex.mkdir(parents=True)
+            auth_file = main_codex / "auth.json"
+            auth_file.write_text('{"tokens":{"access_token":"dummy"}}', encoding="utf-8")
+            auth_file.chmod(0o600)
+            (main_codex / "AGENTS.md").write_text("HEAVY_USER_AGENTS_MD_SHOULD_NOT_BE_VISIBLE", encoding="utf-8")
+
+            rt_dir = tmp / "rt"
+            cfg = Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0))
+            ref = CodexRefiner(
+                cfg,
+                env={
+                    "HOME": str(fake_home),
+                    "OPENAI_API_KEY": "sk-asr-only-key",
+                    "OPENAI_BASE_URL": "https://asr-only.example/v1",
+                },
+                runtime_dir=rt_dir,
+                max_threads_per_process=2,
+                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "parallel"],
+            )
+            try:
+                codex_home, has_auth = ref._prepare_codex_home()
+                self.assertTrue(has_auth)
+                link_auth = codex_home / "auth.json"
+                self.assertTrue(link_auth.is_symlink())
+                self.assertEqual(os.readlink(link_auth), str(auth_file))
+                self.assertFalse((codex_home / "AGENTS.md").exists())
+                proc_env = ref._build_codex_env(codex_home, has_auth=has_auth)
+                self.assertEqual(proc_env["CODEX_HOME"], str(codex_home))
+                self.assertNotIn("OPENAI_API_KEY", proc_env)
+                self.assertNotIn("OPENAI_BASE_URL", proc_env)
+
+                # Concurrent requests 1 & 2 run in parallel on app-server PID #1;
+                # request 3 overlaps and seamlessly rotates to app-server PID #2 without dropping 1 or 2!
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                    futs = [
+                        pool.submit(ref.refine, "并发草稿一"),
+                        pool.submit(ref.refine, "并发草稿二"),
+                        pool.submit(ref.refine, "并发草稿三"),
+                    ]
+                    outs = [f.result(timeout=5.0) for f in futs]
+
+                self.assertTrue(outs[0].text.endswith(":并发草稿一"))
+                self.assertTrue(outs[1].text.endswith(":并发草稿二"))
+                self.assertTrue(outs[2].text.endswith(":并发草稿三"))
+                self.assertTrue(all(o.used_fallback == "" for o in outs))
+            finally:
+                ref.close()
+
+            recs = [json.loads(ln) for ln in rpc_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            init_pids = [r["_pid"] for r in recs if r.get("method") == "initialize"]
+            self.assertEqual(len(init_pids), 2)
+            self.assertNotEqual(init_pids[0], init_pids[1])
+            unsubs = [r for r in recs if r.get("method") == "thread/unsubscribe"]
+            self.assertEqual(len(unsubs), 3)
+
+            # Non-symlink regular auth.json in codex-home must be rejected (falls back to draft safely)
+            bad_rt = tmp / "bad_rt"
+            bad_ch = bad_rt / "codex-home"
+            bad_ch.mkdir(parents=True)
+            bad_ch.chmod(0o700)
+            (bad_ch / "auth.json").write_text("copied!", encoding="utf-8")
+            ref_bad = CodexRefiner(
+                Config(refiner=RefinerConfig(provider="codex", max_retries=0, timeout_sec=2.0)),
+                env={"HOME": str(fake_home)},
+                runtime_dir=bad_rt,
+                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "ok"],
+            )
+            try:
+                fb_res = ref_bad.refine("凭证异常兜底原稿")
+                self.assertEqual(fb_res.text, "凭证异常兜底原稿")
+                self.assertEqual(fb_res.used_fallback, "asr_draft")
+                self.assertIn("non-symlink", fb_res.warning)
+            finally:
+                ref_bad.close()
+
+    def test_message_boundary_chunking_git_status_toggle_and_anti_chat_wire_format(self) -> None:
+        import concurrent.futures
+        import subprocess
+        from agent_voice_input.session_ctx import (
+            DEFAULT_REFINER_CHUNK_CHARS,
+            DEFAULT_REFINER_CONTEXT_MAX_CHARS,
+            chunk_turns_for_refiner,
+        )
+
+        self.assertEqual(RefinerConfig().context_max_chars, 200000)
+        self.assertEqual(DEFAULT_REFINER_CONTEXT_MAX_CHARS, 200000)
+        self.assertEqual(DEFAULT_REFINER_CHUNK_CHARS, 50000)
+
+        # 1. Deterministic immutable chunk boundaries: adding a new turn freezes earlier sealed chunks
+        turns_base = [
+            ("user", "U1-" + ("a" * 9000)),
+            ("assistant", "A1-" + ("b" * 9000)),
+            ("user", "U2-" + ("c" * 8000)),
+        ]
+        c_before = chunk_turns_for_refiner(turns_base, max_chars=200000, chunk_chars=16000)
+        self.assertEqual(len(c_before), 3)
+        self.assertIn("[Speaker]", c_before[0])
+        self.assertIn("[CLI Agent]", c_before[1])
+        self.assertNotIn("[Assistant]", "\n".join(c_before))
+
+        turns_grown = [*turns_base, ("assistant", "A2-new-reply")]
+        c_after = chunk_turns_for_refiner(turns_grown, max_chars=200000, chunk_chars=16000)
+        self.assertEqual(c_before[0], c_after[0])
+        self.assertEqual(c_before[1], c_after[1])
+        self.assertIn("A2-new-reply", c_after[-1])
+
+        # Whole-chunk 1/4-window eviction when total exceeds max_chars keeps surviving chunks byte-identical
+        c_evicted = chunk_turns_for_refiner(turns_grown, max_chars=20000, chunk_chars=10000)
+        self.assertEqual(len(c_evicted), 2)
+        self.assertEqual(c_evicted[0], c_after[1])
+        self.assertEqual(c_evicted[1], c_after[2])
+
+        # 2. End-to-end wire payload verification: single user message + git status tail + zero assistant messages
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            subprocess.run(["git", "init", "-q"], cwd=str(tmp), check=True)
+            (tmp / "feature_alpha.py").write_text("x = 1\n", encoding="utf-8")
+
+            sid = "ef012345-0000-0000-0000-000000000099"
+            sdir = tmp / ".codex" / "sessions" / "2026" / "11" / "16"
+            sdir.mkdir(parents=True)
+            rollout = sdir / f"rollout-2026-{sid}.jsonl"
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": sid, "source": "cli", "cwd": str(tmp)}})
+                + "\n"
+                + json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage", "content": [{"type": "text", "text": "先看下旧逻辑" + ("x" * 30000)}]}}})
+                + "\n"
+                + json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "AgentMessage", "content": [{"type": "text", "text": "旧逻辑已读完" + ("y" * 30000)}]}}})
+                + "\n",
+                encoding="utf-8",
+            )
+            write_session_registry_entry(tmp, cli="codex", session_id=sid, jsonl_path=str(rollout), cwd=str(tmp))
+            tracker = SessionTracker(home_dir=tmp, env={}, runtime_dir=tmp, proc_root=tmp / "empty_proc")
+            snap = tracker.sync_session(window_title="codex [#ef012345]")
+            assert snap is not None
+
+            # Verify config parsing & validation for include_git_status and context_max_chars
+            cfg_toml = tmp / "ctx.toml"
+            cfg_toml.write_text(
+                "[refiner]\n"
+                'provider = "openai-compatible"\n'
+                'base_url = "http://127.0.0.1:8080/v1"\n'
+                'model = "qwen-local"\n'
+                "include_git_status = true\n"
+                "context_max_chars = 200000\n",
+                encoding="utf-8",
+            )
+            cfg_on, _ = load_config(config_path=cfg_toml, env={"HOME": str(tmp)}, home_dir=tmp)
+            self.assertIs(cfg_on.refiner.include_git_status, True)
+            self.assertEqual(cfg_on.refiner.context_max_chars, 200000)
+
+            bad_ctx = tmp / "bad_ctx.toml"
+            bad_ctx.write_text("[refiner]\ncontext_max_chars = -1\n", encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_config(config_path=bad_ctx, env={"HOME": str(tmp)}, home_dir=tmp)
+
+            # OpenAI-compatible wire payload: strictly 1 system + 1 user message (zero consecutive user / assistant msgs)
+            oai_reqs: list[HttpRequest] = []
+            oai_ref = create_refiner(
+                cfg_on,
+                env={},
+                transport=lambda req: (
+                    oai_reqs.append(req)
+                    or HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"choices": [{"message": {"content": "修好的结果"}}]}).encode("utf-8"),
+                    )
+                ),
+            )
+            oai_ref.refine("feature alpha 点 py 怎么样了？", session_key=snap.session_key, tracker=tracker)
+            body_on = json.loads(oai_reqs[-1].body.decode("utf-8"))
+            msgs_on = body_on["messages"]
+            self.assertEqual([m["role"] for m in msgs_on], ["system", "user"])
+            user_on = msgs_on[1]["content"]
+            self.assertEqual(user_on.count('<session_reference_log read_only="true">'), 2)
+            draft_pos_on = user_on.index("<asr_draft_to_clean>")
+            prefix_on = user_on[:draft_pos_on]
+            # git_status is ONLY at the tail after <asr_draft_to_clean>, never in the leading prefix!
+            self.assertNotIn("feature_alpha.py", prefix_on)
+            self.assertIn("<workspace_git_status", user_on[draft_pos_on:])
+            self.assertIn("feature_alpha.py", user_on[draft_pos_on:])
+            self.assertLess(
+                user_on.index("</asr_draft_to_clean>"),
+                user_on.index("<workspace_git_status"),
+            )
+            self.assertLess(
+                user_on.index("</workspace_git_status>"),
+                user_on.index("<task_reminder>"),
+            )
+
+            # Flip include_git_status=False -> leading prefix stays 100% byte-identical, git block omitted!
+            cfg_off = Config(
+                refiner=RefinerConfig(
+                    provider="openai-compatible",
+                    base_url="http://127.0.0.1:8080/v1",
+                    model="qwen-local",
+                    include_git_status=False,
+                    context_max_chars=200000,
+                )
+            )
+            oai_ref_off = create_refiner(
+                cfg_off,
+                env={},
+                transport=lambda req: (
+                    oai_reqs.append(req)
+                    or HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"choices": [{"message": {"content": "无 git 状态结果"}}]}).encode("utf-8"),
+                    )
+                ),
+            )
+            oai_ref_off.refine("第二句提问？", session_key=snap.session_key, tracker=tracker)
+            msgs_off = json.loads(oai_reqs[-1].body.decode("utf-8"))["messages"]
+            self.assertEqual([m["role"] for m in msgs_off], ["system", "user"])
+            user_off = msgs_off[1]["content"]
+            self.assertEqual(prefix_on, user_off[: user_off.index("<asr_draft_to_clean>")])
+            self.assertNotIn("<workspace_git_status", user_off)
+            self.assertNotIn("feature_alpha.py", user_off)
+
+            # Gemini native wire payload keeps a single "role": "user" turn with multi-part boundaries
+            gem_reqs: list[HttpRequest] = []
+            gem_env = {"GEMINI_API_KEY": "gem_boundary_" + ("z" * 16)}
+            cfg_gem = Config(refiner=RefinerConfig(provider="gemini", include_git_status=True))
+            gem_ref = create_refiner(
+                cfg_gem,
+                resolve_credentials(cfg_gem, gem_env),
+                env=gem_env,
+                transport=lambda req: (
+                    gem_reqs.append(req)
+                    or HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"candidates": [{"content": {"parts": [{"text": "gem boundary ok"}]}}]}).encode("utf-8"),
+                    )
+                ),
+            )
+            gem_ref.refine("检查一下 feature alpha", session_key=snap.session_key, tracker=tracker)
+            gem_body = json.loads(gem_reqs[-1].body.decode("utf-8"))
+            self.assertEqual(len(gem_body["contents"]), 1)
+            self.assertEqual(gem_body["contents"][0]["role"], "user")
+            gem_parts = gem_body["contents"][0]["parts"]
+            self.assertEqual(len(gem_parts), 3)
+            self.assertIn('<session_reference_log read_only="true">', gem_parts[0]["text"])
+            self.assertIn("<workspace_git_status", gem_parts[-1]["text"])
+
+            # 3. CodexRefiner graceful fallback when thread/revert is unsupported + same-session overlap fallback
+            nr_log = tmp / "no_revert.jsonl"
+            ref_nr = CodexRefiner(
+                Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0)),
+                env={},
+                runtime_dir=tmp / "rt_nr",
+                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(nr_log), "no_revert"],
+            )
+            try:
+                nr1 = ref_nr.refine("无撤回接口第一句", session_key="sess-nr")
+                nr2 = ref_nr.refine("无撤回接口第二句", session_key="sess-nr")
+                self.assertEqual(nr1.text, "CLEAN[thr-1#1]:无撤回接口第一句")
+                self.assertEqual(nr2.text, "CLEAN[thr-2#2]:无撤回接口第二句")
+            finally:
+                ref_nr.close()
+            nr_recs = [json.loads(ln) for ln in nr_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            nr_tstarts = [r for r in nr_recs if r.get("method") == "thread/start"]
+            self.assertEqual([t["params"]["ephemeral"] for t in nr_tstarts], [False, True])
+            self.assertEqual([r["params"]["threadId"] for r in nr_recs if r.get("method") == "thread/delete"], ["thr-1"])
+
+            # Same-session concurrent overlap: 1st takes persistent shell thr-1, 2nd runs ephemeral thr-2 without blocking
+            ov_log = tmp / "overlap.jsonl"
+            ref_ov = CodexRefiner(
+                Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0)),
+                env={},
+                runtime_dir=tmp / "rt_ov",
+                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(ov_log), "parallel"],
+            )
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    fa = pool.submit(ref_ov.refine, "同会话并发A", session_key="sess-same")
+                    fb = pool.submit(ref_ov.refine, "同会话并发B", session_key="sess-same")
+                    ra, rb = fa.result(timeout=5.0), fb.result(timeout=5.0)
+                self.assertTrue(ra.text.endswith(":同会话并发A") and "DIRTY" not in ra.text)
+                self.assertTrue(rb.text.endswith(":同会话并发B") and "DIRTY" not in rb.text)
+                rc = ref_ov.refine("同会话后续复用C", session_key="sess-same")
+                self.assertEqual(rc.text, "CLEAN[thr-1#3]:同会话后续复用C")
+            finally:
+                ref_ov.close()
 
 
 if __name__ == "__main__":

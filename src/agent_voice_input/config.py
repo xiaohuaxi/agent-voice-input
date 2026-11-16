@@ -229,6 +229,9 @@ class RefinerConfig:
     provider: str = "codex"
     model: str = ""
     effort: str = "low"
+    prompt: str = ""
+    include_git_status: bool = True
+    context_max_chars: int = 200000
     base_url: str = ""
     api_key_env: str = ""
     max_turns_per_thread: int = 20
@@ -524,6 +527,10 @@ _FLOAT_RE = re.compile(
 )
 
 
+def _toml_lineno(src: str, pos: int) -> int:
+    return src.count("\n", 0, max(0, min(pos, len(src)))) + 1
+
+
 def _is_disallowed_toml_ctrl(ch: str) -> bool:
     code = ord(ch)
     return (code < 0x20 and ch != "\t") or code == 0x7F
@@ -538,83 +545,225 @@ def _decode_unicode_scalar(hex_part: str, expected_len: int, lineno: int) -> str
     return chr(cp)
 
 
-def _strip_toml_comment(line: str) -> str:
-    """Strip unquoted `# ...` comment from a single TOML line."""
-    in_single = False
-    in_double = False
-    escaped = False
-    for idx, ch in enumerate(line):
-        if in_double:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_double = False
-        elif in_single:
-            if ch == "'":
-                in_single = False
-        else:
-            if ch == '"':
-                in_double = True
-            elif ch == "'":
-                in_single = True
-            elif ch == "#":
-                return line[:idx]
-    return line
+_TOML_BASIC_ESCAPES: dict[str, str] = {
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "f": "\f",
+    "r": "\r",
+    '"': '"',
+    "\\": "\\",
+}
 
 
 def _parse_toml_basic_string(src: str, pos: int, lineno: int) -> tuple[str, int]:
-    """Parse double-quoted string starting at `pos` (pointing to opening `"`)."""
+    """Parse single-line double-quoted string starting at ``pos`` (pointing to opening ``"``)."""
     i = pos + 1
     out: list[str] = []
-    escapes = {
-        "b": "\b",
-        "t": "\t",
-        "n": "\n",
-        "f": "\f",
-        "r": "\r",
-        '"': '"',
-        "\\": "\\",
-    }
     while i < len(src):
         ch = src[i]
         if ch == '"':
             return "".join(out), i + 1
+        if ch in "\r\n":
+            raise ConfigError(f"line {lineno}: unterminated string literal")
         if ch == "\\":
+            esc_lineno = _toml_lineno(src, i)
             i += 1
-            if i >= len(src):
-                raise ConfigError(f"line {lineno}: unterminated escape sequence")
+            if i >= len(src) or src[i] in "\r\n":
+                raise ConfigError(f"line {esc_lineno}: unterminated escape sequence")
             esc = src[i]
-            if esc in escapes:
-                out.append(escapes[esc])
+            if esc in _TOML_BASIC_ESCAPES:
+                out.append(_TOML_BASIC_ESCAPES[esc])
                 i += 1
             elif esc == "u":
-                out.append(_decode_unicode_scalar(src[i + 1 : i + 5], 4, lineno))
+                out.append(_decode_unicode_scalar(src[i + 1 : i + 5], 4, esc_lineno))
                 i += 5
             elif esc == "U":
-                out.append(_decode_unicode_scalar(src[i + 1 : i + 9], 8, lineno))
+                out.append(_decode_unicode_scalar(src[i + 1 : i + 9], 8, esc_lineno))
                 i += 9
             else:
-                raise ConfigError(f"line {lineno}: unsupported escape \\{esc}")
+                raise ConfigError(f"line {esc_lineno}: unsupported escape \\{esc}")
             continue
         if _is_disallowed_toml_ctrl(ch):
-            raise ConfigError(f"line {lineno}: unescaped control character in string")
+            raise ConfigError(f"line {_toml_lineno(src, i)}: unescaped control character in string")
         out.append(ch)
         i += 1
     raise ConfigError(f"line {lineno}: unterminated double-quoted string")
 
 
-def _parse_toml_literal_string(src: str, pos: int, lineno: int) -> tuple[str, int]:
-    """Parse single-quoted literal string starting at `pos` (pointing to `'`)."""
-    end = src.find("'", pos + 1)
-    if end == -1:
-        raise ConfigError(f"line {lineno}: unterminated single-quoted string")
-    val = src[pos + 1 : end]
-    for ch in val:
+def _parse_toml_multiline_basic_string(src: str, pos: int, lineno: int) -> tuple[str, int]:
+    """Parse TOML v1.0 multiline basic string ``\"\"\"...\"\"\"`` starting at ``pos``."""
+    i = pos + 3
+    n = len(src)
+    if src.startswith("\r\n", i):
+        i += 2
+    elif i < n and src[i] == "\n":
+        i += 1
+    out: list[str] = []
+    while i < n:
+        if src.startswith('"""', i):
+            qcount = 3
+            while i + qcount < n and src[i + qcount] == '"':
+                qcount += 1
+            if qcount >= 6:
+                raise ConfigError(
+                    f"line {_toml_lineno(src, i)}: too many consecutive quotes in multiline string"
+                )
+            out.append('"' * (qcount - 3))
+            return "".join(out), i + qcount
+        ch = src[i]
+        if ch == "\\":
+            # TOML line-ending backslash trims trailing whitespace + newline(s)
+            j = i + 1
+            while j < n and src[j] in " \t":
+                j += 1
+            if j < n and (src[j] == "\n" or src.startswith("\r\n", j)):
+                i = j
+                while i < n:
+                    if src.startswith("\r\n", i):
+                        i += 2
+                    elif src[i] in " \t\n":
+                        i += 1
+                    else:
+                        break
+                continue
+            esc_lineno = _toml_lineno(src, i)
+            i += 1
+            if i >= n:
+                raise ConfigError(f"line {esc_lineno}: unterminated escape sequence")
+            esc = src[i]
+            if esc in _TOML_BASIC_ESCAPES:
+                out.append(_TOML_BASIC_ESCAPES[esc])
+                i += 1
+            elif esc == "u":
+                out.append(_decode_unicode_scalar(src[i + 1 : i + 5], 4, esc_lineno))
+                i += 5
+            elif esc == "U":
+                out.append(_decode_unicode_scalar(src[i + 1 : i + 9], 8, esc_lineno))
+                i += 9
+            else:
+                raise ConfigError(f"line {esc_lineno}: unsupported escape \\{esc}")
+            continue
+        if src.startswith("\r\n", i):
+            out.append("\n")
+            i += 2
+            continue
+        if ch == "\n":
+            out.append("\n")
+            i += 1
+            continue
         if _is_disallowed_toml_ctrl(ch):
-            raise ConfigError(f"line {lineno}: control character in literal string")
-    return val, end + 1
+            raise ConfigError(f"line {_toml_lineno(src, i)}: unescaped control character in string")
+        out.append(ch)
+        i += 1
+    raise ConfigError(f"line {lineno}: unterminated multiline double-quoted string")
+
+
+def _parse_toml_literal_string(src: str, pos: int, lineno: int) -> tuple[str, int]:
+    """Parse single-line literal string ``'...'`` starting at ``pos``."""
+    i = pos + 1
+    while i < len(src):
+        ch = src[i]
+        if ch == "'":
+            return src[pos + 1 : i], i + 1
+        if ch in "\r\n":
+            raise ConfigError(f"line {lineno}: unterminated single-quoted string")
+        if _is_disallowed_toml_ctrl(ch):
+            raise ConfigError(f"line {_toml_lineno(src, i)}: control character in literal string")
+        i += 1
+    raise ConfigError(f"line {lineno}: unterminated single-quoted string")
+
+
+def _parse_toml_multiline_literal_string(src: str, pos: int, lineno: int) -> tuple[str, int]:
+    """Parse TOML v1.0 multiline literal string ``'''...'''`` starting at ``pos``."""
+    i = pos + 3
+    n = len(src)
+    if src.startswith("\r\n", i):
+        i += 2
+    elif i < n and src[i] == "\n":
+        i += 1
+    out: list[str] = []
+    while i < n:
+        if src.startswith("'''", i):
+            qcount = 3
+            while i + qcount < n and src[i + qcount] == "'":
+                qcount += 1
+            if qcount >= 6:
+                raise ConfigError(
+                    f"line {_toml_lineno(src, i)}: too many consecutive quotes in multiline literal string"
+                )
+            out.append("'" * (qcount - 3))
+            return "".join(out), i + qcount
+        ch = src[i]
+        if src.startswith("\r\n", i):
+            out.append("\n")
+            i += 2
+            continue
+        if ch == "\n":
+            out.append("\n")
+            i += 1
+            continue
+        if _is_disallowed_toml_ctrl(ch):
+            raise ConfigError(f"line {_toml_lineno(src, i)}: control character in literal string")
+        out.append(ch)
+        i += 1
+    raise ConfigError(f"line {lineno}: unterminated multiline single-quoted string")
+
+
+def _skip_toml_inline_ws_and_comment(src: str, pos: int) -> int:
+    n = len(src)
+    while pos < n and src[pos] in " \t":
+        pos += 1
+    if pos < n and src[pos] == "#":
+        pos += 1
+        while pos < n:
+            if src.startswith("\r\n", pos) or src[pos] == "\n":
+                break
+            if _is_disallowed_toml_ctrl(src[pos]):
+                raise ConfigError(f"line {_toml_lineno(src, pos)}: disallowed control character")
+            pos += 1
+    return pos
+
+
+def _skip_toml_ws_and_comments(src: str, pos: int) -> int:
+    n = len(src)
+    while pos < n:
+        ch = src[pos]
+        if ch in " \t\n":
+            pos += 1
+            continue
+        if ch == "\r":
+            if src.startswith("\r\n", pos):
+                pos += 2
+                continue
+            raise ConfigError(f"line {_toml_lineno(src, pos)}: disallowed control character")
+        if ch == "#":
+            pos = _skip_toml_inline_ws_and_comment(src, pos)
+            continue
+        break
+    return pos
+
+
+def _expect_toml_eol_or_eof(src: str, pos: int) -> int:
+    pos = _skip_toml_inline_ws_and_comment(src, pos)
+    n = len(src)
+    if pos >= n:
+        return pos
+    if src.startswith("\r\n", pos):
+        return pos + 2
+    if src[pos] == "\n":
+        return pos + 1
+    line_end = src.find("\n", pos)
+    if line_end == -1:
+        raw_rem = src[pos:]
+    elif line_end > pos and src[line_end - 1] == "\r":
+        raw_rem = src[pos : line_end - 1]
+    else:
+        raw_rem = src[pos:line_end]
+    if any(_is_disallowed_toml_ctrl(c) for c in raw_rem):
+        raise ConfigError(f"line {_toml_lineno(src, pos)}: disallowed control character")
+    rem = raw_rem.strip()
+    raise ConfigError(f"line {_toml_lineno(src, pos)}: unexpected trailing tokens {rem!r}")
 
 
 def _parse_toml_key_path(raw_key: str, lineno: int) -> list[str]:
@@ -630,9 +779,13 @@ def _parse_toml_key_path(raw_key: str, lineno: int) -> list[str]:
         if i >= n:
             raise ConfigError(f"line {lineno}: trailing dot in key {raw_key!r}")
         if s[i] == '"':
+            if s.startswith('"""', i):
+                raise ConfigError(f"line {lineno}: multiline string not allowed in key")
             seg, i = _parse_toml_basic_string(s, i, lineno)
             parts.append(seg)
         elif s[i] == "'":
+            if s.startswith("'''", i):
+                raise ConfigError(f"line {lineno}: multiline string not allowed in key")
             seg, i = _parse_toml_literal_string(s, i, lineno)
             parts.append(seg)
         else:
@@ -668,53 +821,55 @@ def _toml_type_tag(val: Any) -> str:
     return type(val).__name__
 
 
-def _parse_toml_value(src: str, pos: int, lineno: int) -> tuple[Any, int]:
+def _parse_toml_value(src: str, pos: int) -> tuple[Any, int]:
+    pos = _skip_toml_ws_and_comments(src, pos)
     n = len(src)
-    while pos < n and src[pos] in " \t\r\n":
-        pos += 1
+    lineno = _toml_lineno(src, pos)
     if pos >= n:
         raise ConfigError(f"line {lineno}: missing value")
     ch = src[pos]
     if ch == '"':
-        if src[pos : pos + 3] == '"""':
-            raise ConfigError(f"line {lineno}: multi-line strings are not supported in simple TOML")
+        if src.startswith('"""', pos):
+            return _parse_toml_multiline_basic_string(src, pos, lineno)
         return _parse_toml_basic_string(src, pos, lineno)
     if ch == "'":
-        if src[pos : pos + 3] == "'''":
-            raise ConfigError(f"line {lineno}: multi-line strings are not supported in simple TOML")
+        if src.startswith("'''", pos):
+            return _parse_toml_multiline_literal_string(src, pos, lineno)
         return _parse_toml_literal_string(src, pos, lineno)
     if ch == "[":
+        arr_lineno = lineno
         i = pos + 1
         items: list[Any] = []
         elem_tag: str | None = None
         while True:
-            while i < n and src[i] in " \t\r\n":
-                i += 1
+            i = _skip_toml_ws_and_comments(src, i)
             if i >= n:
-                raise ConfigError(f"line {lineno}: unterminated array")
+                raise ConfigError(f"line {arr_lineno}: unterminated array")
             if src[i] == "]":
                 return items, i + 1
-            val, i = _parse_toml_value(src, i, lineno)
+            elem_lineno = _toml_lineno(src, i)
+            val, i = _parse_toml_value(src, i)
             vtag = _toml_type_tag(val)
             if elem_tag is None:
                 elem_tag = vtag
             elif elem_tag != vtag:
                 raise ConfigError(
-                    f"line {lineno}: heterogeneous array types ({elem_tag} vs {vtag})"
+                    f"line {elem_lineno}: heterogeneous array types ({elem_tag} vs {vtag})"
                 )
             items.append(val)
-            while i < n and src[i] in " \t\r\n":
-                i += 1
+            i = _skip_toml_ws_and_comments(src, i)
             if i >= n:
-                raise ConfigError(f"line {lineno}: unterminated array")
+                raise ConfigError(f"line {arr_lineno}: unterminated array")
             if src[i] == ",":
                 i += 1
                 continue
             if src[i] == "]":
                 return items, i + 1
-            raise ConfigError(f"line {lineno}: expected ',' or ']' in array")
+            raise ConfigError(f"line {_toml_lineno(src, i)}: expected ',' or ']' in array")
     start = pos
-    while pos < n and src[pos] not in " \t\r\n,]":
+    while pos < n and src[pos] not in " \t\r\n,]#":
+        if _is_disallowed_toml_ctrl(src[pos]):
+            raise ConfigError(f"line {_toml_lineno(src, pos)}: disallowed control character")
         pos += 1
     tok = src[start:pos]
     if tok == "true":
@@ -733,11 +888,19 @@ def _parse_toml_value(src: str, pos: int, lineno: int) -> tuple[Any, int]:
     raise ConfigError(f"line {lineno}: invalid TOML value {tok!r}")
 
 
-def _find_unquoted_equals(line: str) -> int:
+def _scan_toml_single_line_delim(src: str, pos: int, target: str) -> int:
+    """Find unquoted single-line ``target`` char before EOL/comment, validating control chars."""
+    n = len(src)
     in_single = False
     in_double = False
     escaped = False
-    for idx, ch in enumerate(line):
+    i = pos
+    while i < n:
+        ch = src[i]
+        if ch == "\n" or src.startswith("\r\n", i):
+            return -1
+        if _is_disallowed_toml_ctrl(ch):
+            raise ConfigError(f"line {_toml_lineno(src, i)}: disallowed control character")
         if in_double:
             if escaped:
                 escaped = False
@@ -749,97 +912,45 @@ def _find_unquoted_equals(line: str) -> int:
             if ch == "'":
                 in_single = False
         else:
+            if ch == "#":
+                return -1
+            if ch == target:
+                return i
             if ch == '"':
                 in_double = True
             elif ch == "'":
                 in_single = True
-            elif ch == "=":
-                return idx
+        i += 1
     return -1
 
 
-def _has_unclosed_single_line_quote(text: str) -> bool:
-    if '"""' in text or "'''" in text:
-        return False
-    in_single = False
-    in_double = False
-    escaped = False
-    for ch in text:
-        if in_double:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_double = False
-        elif in_single:
-            if ch == "'":
-                in_single = False
-        else:
-            if ch == '"':
-                in_double = True
-            elif ch == "'":
-                in_single = True
-    return in_single or in_double
-
-
-def _bracket_balance(text: str) -> int:
-    depth = 0
-    in_single = False
-    in_double = False
-    escaped = False
-    for ch in text:
-        if in_double:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_double = False
-        elif in_single:
-            if ch == "'":
-                in_single = False
-        else:
-            if ch == '"':
-                in_double = True
-            elif ch == "'":
-                in_single = True
-            elif ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-    return depth
-
-
 def _parse_simple_toml(text: str) -> dict[str, Any]:
-    """Pure-stdlib lightweight TOML parser for Python 3.10 fallback."""
+    """Pure-stdlib TOML parser for Python 3.10 fallback (supports multiline strings & arrays)."""
     if text.startswith("\ufeff"):
         text = text[1:]
     root: dict[str, Any] = {}
     current_table: dict[str, Any] = root
     explicit_tables: set[tuple[str, ...]] = set()
 
-    raw_lines = text.splitlines()
-    idx = 0
-    total = len(raw_lines)
-    while idx < total:
-        lineno = idx + 1
-        raw_ln = raw_lines[idx]
-        for ch in _strip_toml_comment(raw_ln):
-            if _is_disallowed_toml_ctrl(ch):
-                raise ConfigError(f"line {lineno}: disallowed control character")
-        cleaned = _strip_toml_comment(raw_ln).strip()
-        idx += 1
-        if not cleaned:
-            continue
+    pos = 0
+    n = len(text)
+    while True:
+        pos = _skip_toml_ws_and_comments(text, pos)
+        if pos >= n:
+            break
+        lineno = _toml_lineno(text, pos)
 
-        if cleaned.startswith("["):
-            if cleaned.startswith("[["):
+        if text[pos] == "[":
+            if text.startswith("[[", pos):
                 raise ConfigError(f"line {lineno}: array of tables [[...]] is not supported")
-            if not cleaned.endswith("]"):
-                raise ConfigError(f"line {lineno}: invalid table header {cleaned!r}")
-            header_body = cleaned[1:-1].strip()
+            close_idx = _scan_toml_single_line_delim(text, pos + 1, "]")
+            if close_idx == -1:
+                line_end = text.find("\n", pos)
+                snippet = (text[pos:] if line_end == -1 else text[pos:line_end]).rstrip("\r").strip()
+                raise ConfigError(f"line {lineno}: invalid table header {snippet!r}")
+            header_body = text[pos + 1 : close_idx].strip()
             path_parts = _parse_toml_key_path(header_body, lineno)
+            pos = _expect_toml_eol_or_eof(text, close_idx + 1)
             path_tuple = tuple(path_parts)
             if path_tuple in explicit_tables:
                 raise ConfigError(f"line {lineno}: duplicate table [{header_body}]")
@@ -860,37 +971,34 @@ def _parse_simple_toml(text: str) -> dict[str, Any]:
             current_table = node
             continue
 
-        eq_pos = _find_unquoted_equals(cleaned)
+        eq_pos = _scan_toml_single_line_delim(text, pos, "=")
         if eq_pos == -1:
+            # Ensure control chars on the rest of the malformed line are still caught
+            line_end = text.find("\n", pos)
+            rest = text[pos:] if line_end == -1 else text[pos:line_end]
+            if rest.endswith("\r"):
+                rest = rest[:-1]
+            for off, ch in enumerate(rest):
+                if ch == "#":
+                    _skip_toml_inline_ws_and_comment(text, pos + off)
+                    break
+                if _is_disallowed_toml_ctrl(ch):
+                    raise ConfigError(f"line {_toml_lineno(text, pos + off)}: disallowed control character")
             raise ConfigError(f"line {lineno}: expected 'key = value'")
-        key_part = cleaned[:eq_pos]
-        val_part = cleaned[eq_pos + 1 :].strip()
-        if not val_part:
+
+        key_parts = _parse_toml_key_path(text[pos:eq_pos], lineno)
+        vpos = eq_pos + 1
+        while vpos < n and text[vpos] in " \t":
+            vpos += 1
+        if vpos >= n or text[vpos] in "\r\n#":
+            if vpos < n and text[vpos] == "#":
+                _skip_toml_inline_ws_and_comment(text, vpos)
+            elif vpos < n and text[vpos] == "\r" and not text.startswith("\r\n", vpos):
+                raise ConfigError(f"line {lineno}: disallowed control character")
             raise ConfigError(f"line {lineno}: missing value after '='")
 
-        if _has_unclosed_single_line_quote(val_part):
-            raise ConfigError(f"line {lineno}: unterminated string literal")
-
-        while _bracket_balance(val_part) > 0:
-            if idx >= total:
-                raise ConfigError(f"line {lineno}: unterminated array")
-            cont_raw = raw_lines[idx]
-            cont_lineno = idx + 1
-            for ch in _strip_toml_comment(cont_raw):
-                if _is_disallowed_toml_ctrl(ch):
-                    raise ConfigError(f"line {cont_lineno}: disallowed control character")
-            cont = _strip_toml_comment(cont_raw).strip()
-            if _has_unclosed_single_line_quote(cont):
-                raise ConfigError(f"line {cont_lineno}: unterminated string literal")
-            idx += 1
-            if cont:
-                val_part = f"{val_part}\n{cont}"
-
-        key_parts = _parse_toml_key_path(key_part, lineno)
-        val, end_pos = _parse_toml_value(val_part, 0, lineno)
-        rem = val_part[end_pos:].strip()
-        if rem:
-            raise ConfigError(f"line {lineno}: unexpected trailing tokens {rem!r}")
+        val, end_pos = _parse_toml_value(text, vpos)
+        pos = _expect_toml_eol_or_eof(text, end_pos)
 
         target = current_table
         for part in key_parts[:-1]:
@@ -1177,6 +1285,12 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.refiner.model = _as_str(v, "refiner.model").strip()
             elif k == "effort":
                 cfg.refiner.effort = _as_str(v, "refiner.effort").strip().lower()
+            elif k == "prompt":
+                cfg.refiner.prompt = _as_str(v, "refiner.prompt")
+            elif k == "include_git_status":
+                cfg.refiner.include_git_status = _as_bool(v, "refiner.include_git_status")
+            elif k == "context_max_chars":
+                cfg.refiner.context_max_chars = _as_int(v, "refiner.context_max_chars")
             elif k == "base_url":
                 cfg.refiner.base_url = _as_str(v, "refiner.base_url").strip()
             elif k == "api_key_env":
@@ -1488,6 +1602,20 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
             f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, "
             f"got {cfg.refiner.effort!r}"
         )
+    if not isinstance(cfg.refiner.prompt, str):
+        raise ConfigError(
+            f"refiner.prompt: expected string, got {type(cfg.refiner.prompt).__name__}"
+        )
+    if not isinstance(cfg.refiner.include_git_status, bool):
+        raise ConfigError(
+            f"refiner.include_git_status: invalid boolean value {cfg.refiner.include_git_status!r}"
+        )
+    if (
+        isinstance(cfg.refiner.context_max_chars, bool)
+        or not isinstance(cfg.refiner.context_max_chars, int)
+        or cfg.refiner.context_max_chars < 0
+    ):
+        raise ConfigError("refiner.context_max_chars must be an integer >= 0")
     if cfg.refiner.provider == "openai-compatible":
         if not cfg.refiner.base_url.strip():
             raise ConfigError(
