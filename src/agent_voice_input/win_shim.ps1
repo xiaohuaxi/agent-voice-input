@@ -1510,12 +1510,16 @@ public static class VoiceWinShim {
         if (_toastHud != null) { try { _toastHud.Dispose(); } catch { } _toastHud = null; }
     }
 
-    public static bool SendCtrlV() {
-        int[] mods = new int[] { 0x12, 0xA4, 0xA5, 0x10, 0xA0, 0xA1, 0x5B, 0x5C, 0xA3 };
-        for (int i = 0; i < 15; i++) {
-            bool anyDown = false; foreach (int vk in mods) { if ((GetAsyncKeyState(vk) & 0x8000) != 0) { anyDown = true; break; } }
-            if (!anyDown) break; Thread.Sleep(10);
+    public static bool IsAnyPasteBlockingKeyDown() {
+        if (_targetDown) return true;
+        int[] vks = new int[] { 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x10, 0xA0, 0xA1, 0x5B, 0x5C, (int)_targetVk };
+        foreach (int vk in vks) {
+            if (vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0) return true;
         }
+        return false;
+    }
+
+    public static bool SendCtrlV() {
         INPUT[] ins = new INPUT[4];
         ins[0].type = INPUT_KEYBOARD; ins[0].u.ki.wVk = VK_LCONTROL;
         ins[1].type = INPUT_KEYBOARD; ins[1].u.ki.wVk = VK_V;
@@ -1528,6 +1532,18 @@ public static class VoiceWinShim {
 
 function Write-JsonLine($obj) { try { [Console]::Out.WriteLine(($obj | ConvertTo-Json -Compress -Depth 5)); [Console]::Out.Flush() } catch { } }
 function Invoke-Tone([string]$kind) { [VoiceWinShim]::PlayTone($kind, [bool]$Beep) }
+function Set-ClipboardSafe([string]$val) {
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            if ([string]::IsNullOrEmpty($val)) { [System.Windows.Forms.Clipboard]::Clear() }
+            else { [System.Windows.Forms.Clipboard]::SetText($val) }
+            return $true
+        } catch {
+            if ($i -lt 2) { Start-Sleep -Milliseconds 10 }
+        }
+    }
+    return $false
+}
 
 [VoiceWinShim]::EnableDpiAwareness()
 
@@ -1592,17 +1608,45 @@ try {
                     [VoiceWinShim]::SetExternalAudioLevel($lvl)
                     if ($seq -gt 0) { Write-JsonLine @{ type = "reply"; reply = "hud_level"; seq_id = $seq; ok = $true } }
                 } elseif ($op -eq "paste") {
-                    $txt = [string]$cmdObj.text; $clipOk = $false
-                    for ($i = 0; $i -lt 3; $i++) { try { [System.Windows.Forms.Clipboard]::SetText($txt); $clipOk = $true; break } catch { Start-Sleep -Milliseconds 15 } }
-                    $h = 0L; $p = ""; $t = ""; [VoiceWinShim]::QueryForeground([ref]$h, [ref]$p, [ref]$t)
-                    $pNorm = ($p -replace '\.exe$','').ToLowerInvariant()
+                    $txt = [string]$cmdObj.text
+                    $fbTxt = if ($null -ne $cmdObj.fallback_text -and ([string]$cmdObj.fallback_text).Length -gt 0) { [string]$cmdObj.fallback_text } else { $txt }
+                    $forceClipOnly = if ($null -ne $cmdObj.force_clipboard_only) { [bool]$cmdObj.force_clipboard_only } else { $false }
+                    $suppressBeep = if ($null -ne $cmdObj.suppress_beep) { [bool]$cmdObj.suppress_beep } else { $false }
                     $expectTerm = if ($null -ne $cmdObj.expect_terminal) { [bool]$cmdObj.expect_terminal } else { $true }
                     $thwnd = if ($null -ne $cmdObj.target_hwnd) { [long]$cmdObj.target_hwnd } else { 0L }
-                    if ($clipOk -and (($thwnd -le 0) -or ($h -eq $thwnd)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $pNorm))) {
-                        $sent = [VoiceWinShim]::SendCtrlV()
-                        Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = [bool]$sent; clipboard = $clipOk; reason = $(if ($sent) { "ok" } else { "send_input_failed" }); fg_process = $p }
+                    $h = 0L; $p = ""; $t = ""; [VoiceWinShim]::QueryForeground([ref]$h, [ref]$p, [ref]$t)
+                    $pNorm = ($p -replace '\.exe$','').ToLowerInvariant()
+                    $winMatch = (($thwnd -le 0) -or ($h -eq $thwnd)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $pNorm))
+                    if ($winMatch -and (-not $forceClipOnly)) {
+                        if ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
+                            Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "hotkey_held"; fg_process = $p }
+                        } else {
+                            $clipOk = Set-ClipboardSafe $txt
+                            if (-not $clipOk) {
+                                Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "clipboard_failed"; fg_process = $p }
+                            } else {
+                                $h2 = 0L; $p2 = ""; $t2 = ""; [VoiceWinShim]::QueryForeground([ref]$h2, [ref]$p2, [ref]$t2)
+                                $p2Norm = ($p2 -replace '\.exe$','').ToLowerInvariant()
+                                $winMatch2 = (($thwnd -le 0) -or ($h2 -eq $thwnd)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $p2Norm))
+                                if (-not $winMatch2) {
+                                    if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }
+                                    if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
+                                    Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "focus_changed" } else { "clipboard_failed" }); fg_process = $p2 }
+                                } else {
+                                    $sent = [VoiceWinShim]::SendCtrlV()
+                                    if ($sent) {
+                                        Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $true; clipboard = $true; reason = "ok"; fg_process = $p2 }
+                                    } else {
+                                        if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }
+                                        if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
+                                        Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "send_input_failed" } else { "clipboard_failed" }); fg_process = $p2 }
+                                    }
+                                }
+                            }
+                        }
                     } else {
-                        if ($clipOk) { Invoke-Tone "focus" }
+                        $clipOk = Set-ClipboardSafe $fbTxt
+                        if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
                         Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "focus_changed" } else { "clipboard_failed" }); fg_process = $p }
                     }
                 } elseif ($op -eq "rec_start") {

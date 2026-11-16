@@ -266,11 +266,17 @@ class NoopRefiner(BaseRefiner):
 
 
 class _AppServerClient:
-    def __init__(self, cmd: list[str], cwd: Path, env: dict[str, str], timeout_sec: float) -> None:
+    def __init__(self, cmd: list[str], cwd: Path, env: dict[str, str], timeout_sec: float | None = None) -> None:
         self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1, cwd=str(cwd), env=env, start_new_session=True)
         self._q: queue.Queue[str | None] = queue.Queue()
         self._next_id = 1
+        self._close_lock = threading.Lock()
+        self._closed_flag = False
         threading.Thread(target=self._reader, daemon=True).start()
+        if timeout_sec is not None:
+            self.initialize(timeout_sec)
+
+    def initialize(self, timeout_sec: float) -> None:
         try:
             init_tsec = min(float(timeout_sec), DEFAULT_CONNECT_TIMEOUT_SEC)
             self.request("initialize", {"clientInfo": {"name": "agent-voice-input", "version": __version__}, "capabilities": {"experimentalApi": False, "optOutNotificationMethods": _OPT_OUT}}, init_tsec)
@@ -364,17 +370,31 @@ class _AppServerClient:
                 return "\n".join(chunks).strip()
 
     def close(self) -> None:
+        with self._close_lock:
+            if self._closed_flag:
+                return
+            self._closed_flag = True
         for sig in (signal.SIGTERM, signal.SIGKILL):
             if self._proc.poll() is not None:
                 break
-            try: os.killpg(os.getpgid(self._proc.pid), sig)
-            except OSError: self._proc.kill()
-            try: self._proc.wait(timeout=0.5); break
-            except subprocess.TimeoutExpired: continue
+            try:
+                os.killpg(os.getpgid(self._proc.pid), sig)
+            except OSError:
+                try:
+                    self._proc.kill()
+                except OSError:
+                    pass
+            try:
+                self._proc.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
         for pipe in (self._proc.stdin, self._proc.stdout):
             if pipe is not None:
-                try: pipe.close()
-                except Exception: pass
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
 
 
 class CodexRefiner(BaseRefiner):
@@ -399,6 +419,9 @@ class CodexRefiner(BaseRefiner):
         self._app_server_cmd, self._exec_runner = app_server_cmd, exec_runner
         self.clock_fn, self.sleep_fn, self.rand_fn = clock_fn, sleep_fn, rand_fn
         self._lock, self._client, self._slots = threading.Lock(), None, {}
+        self._client_lock = threading.Lock()
+        self._closed = False
+        self._exec_proc: subprocess.Popen[str] | None = None
 
     def _build_cmd(self, empty_cwd: Path) -> list[str]:
         if self._app_server_cmd is not None:
@@ -407,11 +430,63 @@ class CodexRefiner(BaseRefiner):
             raise RuntimeError("codex binary not found")
         return [cbin, "-c", "mcp_servers={}", "-c", "hooks={}", "-c", "project_doc_max_bytes=0", "-c", "allow_login_shell=false", *(x for f in _DISABLE for x in ("--disable", f)), "--enable", "skip_host_skill_discovery", "--sandbox", "read-only", "-a", "never", "--cd", str(empty_cwd), "app-server", "--stdio"]
 
+    @staticmethod
+    def _terminate_proc(proc: subprocess.Popen[str] | None) -> None:
+        if proc is None:
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if proc.poll() is not None:
+                break
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except OSError:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            try:
+                proc.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
     def _reset(self) -> None:
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        with self._client_lock:
+            cli, self._client = self._client, None
+        if cli is not None:
+            cli.close()
         self._slots.clear()
+
+    def _ensure_client(self, empty_cwd: Path, init_budget_sec: float) -> _AppServerClient:
+        with self._client_lock:
+            if self._closed:
+                raise RuntimeError("codex refiner closed")
+            if self._client is not None:
+                return self._client
+        cli = _AppServerClient(self._build_cmd(empty_cwd), empty_cwd, _clean_env(self.env))
+        abort_now = False
+        with self._client_lock:
+            if self._closed:
+                abort_now = True
+            else:
+                self._client = cli
+        if abort_now:
+            cli.close()
+            raise RuntimeError("codex refiner closed")
+        try:
+            cli.initialize(init_budget_sec)
+            return cli
+        except BaseException:
+            with self._client_lock:
+                if self._client is cli:
+                    self._client = None
+            raise
 
     def _exec_fallback(self, full_envelope: str, empty_cwd: Path, model: str, codex_effort: str | None, timeout_sec: float | None = None) -> str:
         if self._exec_runner is not None:
@@ -421,15 +496,35 @@ class CodexRefiner(BaseRefiner):
         eff_tsec = self.cfg.refiner.timeout_sec if timeout_sec is None else timeout_sec
         with tempfile.NamedTemporaryFile(prefix="luna-exec-", suffix=".txt", dir=str(self.runtime_dir), delete=False) as tf:
             out_path = tf.name
+        proc: subprocess.Popen[str] | None = None
         try:
             effort_args = ["-c", f"model_reasoning_effort={json.dumps(codex_effort)}"] if codex_effort is not None else []
             cmd = [cbin, "exec", "--ephemeral", "--skip-git-repo-check", "-c", "mcp_servers={}", "-c", "hooks={}", "-c", "project_doc_max_bytes=0", *effort_args, "--disable", "shell_tool", "--disable", "plugins", "--enable", "skip_host_skill_discovery", "-s", "read-only", "-C", str(empty_cwd), "-m", model, "-o", out_path, "-"]
-            p = subprocess.run(cmd, input=f"{REFINER_SYSTEM_PROMPT}\n\n{full_envelope}", stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, cwd=str(empty_cwd), env=_clean_env(self.env), timeout=eff_tsec, check=False)
-            if p.returncode != 0:
-                excerpt = redact_secrets(p.stderr.strip(), self.env, cfg=self.cfg)[:160]
-                raise RuntimeError(f"codex exec rc={p.returncode}: {excerpt}")
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, cwd=str(empty_cwd), env=_clean_env(self.env), start_new_session=True)
+            abort_exec = False
+            with self._client_lock:
+                if self._closed:
+                    abort_exec = True
+                else:
+                    self._exec_proc = proc
+            if abort_exec:
+                self._terminate_proc(proc)
+                raise RuntimeError("codex refiner closed")
+            try:
+                _, stderr_txt = proc.communicate(input=f"{REFINER_SYSTEM_PROMPT}\n\n{full_envelope}", timeout=eff_tsec)
+            except subprocess.TimeoutExpired:
+                self._terminate_proc(proc)
+                raise
+            if proc.returncode != 0:
+                excerpt = redact_secrets((stderr_txt or "").strip(), self.env, cfg=self.cfg)[:160]
+                raise RuntimeError(f"codex exec rc={proc.returncode}: {excerpt}")
             return Path(out_path).read_text(encoding="utf-8", errors="replace").strip()
         finally:
+            if proc is not None:
+                with self._client_lock:
+                    if self._exec_proc is proc:
+                        self._exec_proc = None
+                self._terminate_proc(proc)
             Path(out_path).unlink(missing_ok=True)
 
     def _run_app_server_turn(
@@ -447,10 +542,7 @@ class CodexRefiner(BaseRefiner):
         rem_init = deadline - self.clock_fn()
         if rem_init <= 0:
             raise TimeoutError("codex refiner exceeded timeout budget")
-        if self._client is None:
-            self._client = _AppServerClient(
-                self._build_cmd(empty_cwd), empty_cwd, _clean_env(self.env), rem_init
-            )
+        client = self._ensure_client(empty_cwd, rem_init)
         slot = self._slots.get(session_key) if session_key else None
         probe_gen = (
             tracker.get_luna_delta(session_key, full=False)[2]
@@ -481,7 +573,7 @@ class CodexRefiner(BaseRefiner):
             }
             if codex_effort is not None:
                 tstart_params["config"] = {"model_reasoning_effort": codex_effort}
-            res = self._client.request("thread/start", tstart_params, rem_tstart)
+            res = client.request("thread/start", tstart_params, rem_tstart)
             if not (tid := str((res.get("thread") or {}).get("id") or "").strip()):
                 raise RuntimeError("empty thread id")
             slot = _ThreadSlot(tid, 0, gen)
@@ -492,7 +584,7 @@ class CodexRefiner(BaseRefiner):
         if rem_turn <= 0:
             raise TimeoutError("codex refiner exceeded timeout budget before turn/start")
         if not (
-            out_txt := self._client.run_turn(
+            out_txt := client.run_turn(
                 slot.thread_id,
                 codex_effort,
                 build_refiner_envelope(delta_txt, clean_draft),
@@ -520,12 +612,33 @@ class CodexRefiner(BaseRefiner):
         if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
             return NoopRefiner().refine(asr_input)
         t0 = self.clock_fn()
+        eff_cancelled = lambda: self._closed or bool(is_cancelled is not None and is_cancelled())
+        if eff_cancelled():
+            return RefinerResult(
+                _clean_out(clean_draft),
+                self.provider_name,
+                model,
+                _ms(t0, self.clock_fn),
+                "superseded",
+                "",
+                retries=0,
+            )
         tsec = effective_refiner_timeout_sec(self.cfg.refiner.timeout_sec, len(clean_draft))
         deadline = t0 + tsec
         max_retries = max(0, int(self.cfg.refiner.max_retries))
         empty_cwd = ensure_secure_dir(self.runtime_dir / "luna-empty-cwd")
 
         with self._lock:
+            if eff_cancelled():
+                return RefinerResult(
+                    _clean_out(clean_draft),
+                    self.provider_name,
+                    model,
+                    _ms(t0, self.clock_fn),
+                    "superseded",
+                    "",
+                    retries=0,
+                )
             try:
                 out_txt = self._run_app_server_turn(
                     clean_draft=clean_draft,
@@ -550,6 +663,17 @@ class CodexRefiner(BaseRefiner):
                 app_warn = redact_secrets(raw_err_str, self.env, cfg=self.cfg)
                 rkind = _classify_codex_error(app_exc)
 
+            if eff_cancelled():
+                return RefinerResult(
+                    _clean_out(clean_draft),
+                    self.provider_name,
+                    model,
+                    _ms(t0, self.clock_fn),
+                    "superseded",
+                    f"app-server: {app_warn}",
+                    retries=0,
+                )
+
             if rkind == "never" or max_retries <= 0:
                 return RefinerResult(
                     _clean_out(clean_draft),
@@ -564,7 +688,7 @@ class CodexRefiner(BaseRefiner):
             retries_used = 0
             exec_warn = ""
             for r_idx in range(1, max_retries + 1):
-                if is_cancelled is not None and is_cancelled():
+                if eff_cancelled():
                     return RefinerResult(
                         _clean_out(clean_draft),
                         self.provider_name,
@@ -580,8 +704,8 @@ class CodexRefiner(BaseRefiner):
                 delay = compute_retry_delay(rkind, r_idx, rand_fn=self.rand_fn)
                 if delay >= rem - 0.05:
                     break
-                _sleep_cooperative(delay, sleep_fn=self.sleep_fn, is_cancelled=is_cancelled)
-                if is_cancelled is not None and is_cancelled():
+                _sleep_cooperative(delay, sleep_fn=self.sleep_fn, is_cancelled=eff_cancelled)
+                if eff_cancelled():
                     return RefinerResult(
                         _clean_out(clean_draft),
                         self.provider_name,
@@ -666,6 +790,14 @@ class CodexRefiner(BaseRefiner):
             )
 
     def close(self) -> None:
+        with self._client_lock:
+            self._closed = True
+            cli, self._client = self._client, None
+            ep, self._exec_proc = self._exec_proc, None
+        if cli is not None:
+            cli.close()
+        if ep is not None:
+            self._terminate_proc(ep)
         with self._lock:
             self._reset()
 

@@ -450,15 +450,16 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
             iconKind: "done"
         )
     case "copied":
+        let isToast = (layer == "toast")
         return HudVisualStyle(
             layer: layer,
             defaultText: zh ? "✓ 已复制(窗口已切换)" : "✓ Copied (window switched)",
-            bg: hudRgba(28, 32, 82, 0.98),
+            bg: isToast ? toastBg : hudRgba(28, 32, 82, 0.98),
             border: hudRgba(129, 140, 248, 0.68),
             borderWidth: 1.0,
             icon: hudRgba(144, 156, 255, 1.0),
-            mainText: hudRgba(240, 244, 255, 1.0),
-            hintText: hudRgba(186, 196, 238, 1.0),
+            mainText: isToast ? toastMainText : hudRgba(240, 244, 255, 1.0),
+            hintText: isToast ? toastHintText : hudRgba(186, 196, 238, 1.0),
             autoHideMs: 2000,
             iconKind: "done"
         )
@@ -1324,11 +1325,32 @@ final class HudPillController {
         let para = NSMutableParagraphStyle()
         para.alignment = hasIcon ? .left : .center
         para.lineBreakMode = .byTruncatingTail
-        toastLabel.attributedStringValue = NSAttributedString(string: bodyTxt, attributes: [
-            .font: Self.toastFont,
-            .foregroundColor: style.mainText.nsColor,
-            .paragraphStyle: para,
-        ])
+        if !seg.hint.isEmpty {
+            let attr = NSMutableAttributedString()
+            if !seg.main.isEmpty {
+                attr.append(NSAttributedString(string: seg.main, attributes: [
+                    .font: Self.toastFont,
+                    .foregroundColor: style.mainText.nsColor,
+                    .paragraphStyle: para,
+                ]))
+            }
+            if !seg.hasSpaceBeforeHint && attr.length > 0 {
+                attr.addAttribute(.kern, value: 1.5, range: NSRange(location: attr.length - 1, length: 1))
+            }
+            let prefixSpace = (seg.hasSpaceBeforeHint && attr.length > 0) ? " " : ""
+            attr.append(NSAttributedString(string: prefixSpace + seg.hint, attributes: [
+                .font: Self.toastFont,
+                .foregroundColor: style.hintText.nsColor,
+                .paragraphStyle: para,
+            ]))
+            toastLabel.attributedStringValue = attr
+        } else {
+            toastLabel.attributedStringValue = NSAttributedString(string: bodyTxt, attributes: [
+                .font: Self.toastFont,
+                .foregroundColor: style.mainText.nsColor,
+                .paragraphStyle: para,
+            ])
+        }
         toastLabel.sizeToFit()
         toastLabel.isHidden = !hasBody
 
@@ -1893,6 +1915,8 @@ private func runSelfCheck() -> Int32 {
         let stPerm = resolveHudVisualStyle(state: "mic_permission", zh: true)
         let stPaste = resolveHudVisualStyle(state: "paste_failed", zh: true)
         let stRecog = resolveHudVisualStyle(state: "recognizing", zh: true)
+        let stCopiedMain = resolveHudVisualStyle(state: "copied", zh: true)
+        let stCopiedToast = resolveHudVisualStyle(state: "copied", explicitLayer: "toast", zh: true)
         try check(stBusy.layer == "toast" && stBusy.iconKind == "warning" && stBusy.borderWidth == 1.0, "style mic_unavailable")
         try check(stRecov.layer == "toast" && stRecov.iconKind == "warning" && stRecov.bg == stBusy.bg && stRecov.border == stBusy.border, "style audio_recovered")
         try check(stEmpty.layer == "toast" && stEmpty.iconKind == "empty_ring" && stEmpty.border == stBusy.border, "style empty")
@@ -1900,6 +1924,17 @@ private func runSelfCheck() -> Int32 {
         try check(stPerm.layer == "toast" && stPerm.iconKind == "cross" && stPerm.autoHideMs == 3200, "style mic_permission")
         try check(stPaste.layer == "toast" && stPaste.iconKind == "cross" && stPaste.border == stNoMic.border, "style paste_failed")
         try check(stRecog.layer == "main" && stRecog.iconKind == "recognizing", "style recognizing")
+        try check(stCopiedMain.layer == "main" && stCopiedMain.iconKind == "done" && stCopiedMain.bg != stBusy.bg, "style copied main")
+        try check(
+            stCopiedToast.layer == "toast"
+                && stCopiedToast.iconKind == "done"
+                && stCopiedToast.bg == stBusy.bg
+                && stCopiedToast.mainText == stBusy.mainText
+                && stCopiedToast.hintText == stBusy.hintText
+                && stCopiedToast.border == stCopiedMain.border
+                && stCopiedToast.icon == stCopiedMain.icon,
+            "style copied toast"
+        )
 
         try check(splitHudSegments("● 录音中… (按右 Ctrl 完成)") == HudSegments(icon: "●", main: "录音中…", hint: "(按右 Ctrl 完成)", hasSpaceBeforeHint: true), "HUD split recording zh")
         try check(stripOuterParens("(按右 Ctrl 完成)") == "按右 Ctrl 完成" && stripOuterParens("12s 后自动完成") == "12s 后自动完成" && stripOuterParens("") == "", "HUD strip outer parens")
@@ -2055,6 +2090,16 @@ struct MacShimMain {
                         writeJsonLine(["type": "reply", "reply": "fg_window", "seq_id": seqId, "ok": true, "hwnd": fg.hwnd, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": fg.title, "ax_trusted": fg.axTrusted])
                     case "audio_status":
                         writeJsonLine(["type": "reply", "reply": true, "seq_id": seqId, "ok": true, "audio_status": queryAudioInputStatus()])
+                    case "key_state":
+                        let modFlags = CGEventSource.flagsState(.combinedSessionState)
+                        let blockingMods: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
+                        let fnHeld = (spec.highFlag == FLAG_FUNCTION) && modFlags.contains(.maskSecondaryFn)
+                        let nonModHeld = !spec.isModifier && (
+                            CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(spec.primaryKeyCode))
+                            || spec.altKeyCodes.contains(where: { CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0)) })
+                        )
+                        let held = engine.targetDown || !modFlags.intersection(blockingMods).isEmpty || fnHeld || nonModHeld
+                        writeJsonLine(["type": "reply", "reply": "key_state", "seq_id": seqId, "ok": true, "hotkey_held": held])
                     case "hud":
                         let dms = (obj["duration_ms"] as? Int) ?? ((obj["duration_ms"] as? NSNumber)?.intValue ?? 0)
                         let maxDur = (obj["max_duration_sec"] as? Int) ?? ((obj["max_duration_sec"] as? NSNumber)?.intValue ?? 0)

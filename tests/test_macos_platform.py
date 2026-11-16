@@ -1300,6 +1300,12 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn("func queryFrontWindowMetadata(", src)
         self.assertIn("CGWindowListCopyWindowInfo", src)
         self.assertIn("AXUIElementSetMessagingTimeout", src)
+        self.assertIn('case "key_state":', src)
+        self.assertIn("stCopiedMain", src)
+        self.assertIn("stCopiedToast", src)
+        self.assertNotIn("pbpaste", src)
+        py_macos_src = (_REPO_ROOT / "src" / "agent_voice_input" / "platform_macos.py").read_text(encoding="utf-8")
+        self.assertNotIn("pbpaste", py_macos_src)
 
     def test_macos_coreaudio_fast_fail_busy_disconnect_and_seamless_respawn(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -3649,6 +3655,466 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 if gui_proc.stderr is not None:
                     gui_proc.stderr.close()
             shutil.rmtree(short_dir, ignore_errors=True)
+
+    def test_macos_serial_batch_ghostty_and_tmux_preserve_unpasted_clipboard_fallback(self) -> None:
+        pbcopy_payloads: list[str] = []
+        ghostty_injected: list[tuple[str, str]] = []
+        tmux_injected: list[str] = []
+        cur_surface = ["surface-split-A"]
+        cur_front_app = ["Ghostty", GHOSTTY_BUNDLE_ID, "901", ""]
+        ghostty_verdict = ["ok"]
+        s1_gate = threading.Event()
+        asr_items = iter(["分屏A未贴第一段", "分屏B直投第二段"])
+
+        class _BatchAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                pass
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                txt = next(asr_items)
+                if txt == "分屏A未贴第一段":
+                    s1_gate.wait(timeout=2.0)
+                return AsrResult(text=txt, provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
+
+        def fake_run(cmd, *, stdin=None, input=None, capture_output=False, text=False, env=None, timeout=None, check=False, **kw):
+            exe = Path(cmd[0]).name
+            empty = "" if (text or kw.get("encoding")) else b""
+            if exe == "pbcopy":
+                raw = input.decode("utf-8") if isinstance(input, (bytes, bytearray)) else str(input or "")
+                pbcopy_payloads.append(raw)
+                return subprocess.CompletedProcess(cmd, 0, empty, empty)
+            if exe == "tmux":
+                if "load-buffer" in cmd:
+                    raw = input.decode("utf-8") if isinstance(input, (bytes, bytearray)) else str(input or "")
+                    tmux_injected.append(raw)
+                return subprocess.CompletedProcess(cmd, 0, empty, empty)
+            if exe == "osascript":
+                script = cmd[2] if len(cmd) > 2 else ""
+                if "on run argv" in script:
+                    target_sid, payload = cmd[4], cmd[5]
+                    if ghostty_verdict[0] == "ok":
+                        ghostty_injected.append((target_sid, payload))
+                    return subprocess.CompletedProcess(cmd, 0, ghostty_verdict[0] + "\n", "")
+                if "focused terminal of selected tab of front window" in script:
+                    out = _APPLE_SEP.join([cur_surface[0], "codex", "/dev/ttys011", "/tmp/proj", "950"])
+                    return subprocess.CompletedProcess(cmd, 0, out + "\n", "")
+                if 'tell application "System Events"' in script:
+                    return subprocess.CompletedProcess(cmd, 0, _APPLE_SEP.join(cur_front_app) + "\n", "")
+            if exe in ("git", "ps", "lsof", "pgrep"):
+                return subprocess.CompletedProcess(cmd, 1, empty, empty)
+            raise AssertionError(f"unexpected cmd: {cmd}")
+
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "agent_voice_input.platform_macos.shutil.which", return_value="/usr/bin/mock"
+        ), mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=fake_run):
+            tmp = Path(td)
+            env = {"HOME": str(tmp), "AGENT_VOICE_INPUT_SWIFTC": "none"}
+            plat = MacOSPlatform(Config(refiner=RefinerConfig(provider="off")), env=env, cache_dir=tmp / "cache")
+            plat.start_recording = lambda _rt, *, loopback=False: None  # type: ignore[method-assign]
+            plat.stop_recording = lambda *, drain=True: (_voiced_wav(), "avfoundation")  # type: ignore[method-assign]
+
+            daemon = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="off")),
+                env=env,
+                runtime_dir=tmp / "rt",
+                platform=plat,
+                asr_provider=_BatchAsr(),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=SessionTracker(home_dir=tmp, env=env, runtime_dir=tmp / "rt", proc_root=tmp / "noproc"),
+                paste_settle_sec=0.0,
+            )
+            try:
+                # 1. Start & stop segment 1 on Ghostty split A (blocked in ASR)
+                cur_surface[0] = "surface-split-A"
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                r_s1 = daemon.handle_trigger("toggle")
+
+                # 2. Switch to Ghostty split B and start recording segment 2 while segment 1 is still in ASR
+                cur_surface[0] = "surface-split-B"
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                self.assertEqual(daemon._origin_win.surface_id, "surface-split-B")
+
+                # Segment 1 finishes while focused on split B -> Ghostty script reports focus_changed -> pbcopy gets "分屏A未贴第一段"
+                ghostty_verdict[0] = "focus_changed"
+                s1_gate.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_s1["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(pbcopy_payloads, ["分屏A未贴第一段"])
+                self.assertEqual(daemon._batch_unpasted_clips, ["分屏A未贴第一段"])
+
+                # 3. Finish segment 2 on split B -> Ghostty 'input text' succeeds with preserve_clipboard=True:
+                #    split B receives "分屏B直投第二段", and pbcopy is NOT called again!
+                ghostty_verdict[0] = "ok"
+                daemon._last_trigger_ts = -1e9
+                r_s2 = daemon.handle_trigger("toggle")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_s2["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(ghostty_injected, [("surface-split-B", "分屏B直投第二段")])
+                self.assertEqual(pbcopy_payloads, ["分屏A未贴第一段"], "Ghostty direct paste must not overwrite unpasted clipboard fallback")
+                self.assertTrue(daemon.last_result["pasted"])
+
+                # 4. Direct tmux paste-buffer also honors preserve_clipboard=True vs False
+                plat.env["TMUX"] = "/tmp/tmux-mock/default,123,0"
+                cur_front_app[:] = ["iTerm2", "com.googlecode.iterm2", "512", "tmux"]
+                tmux_win = plat.get_foreground_window()
+                out_tmux_preserve = plat.deliver_text(
+                    "tmux直投不覆写剪贴板",
+                    seq_id=20,
+                    origin_window=tmux_win,
+                    preserve_clipboard=True,
+                )
+                self.assertTrue(out_tmux_preserve.pasted)
+                self.assertFalse(out_tmux_preserve.clipboard)
+                self.assertFalse(out_tmux_preserve.used_clipboard_paste)
+                self.assertEqual(tmux_injected, ["tmux直投不覆写剪贴板"])
+                self.assertEqual(pbcopy_payloads, ["分屏A未贴第一段"])
+
+                out_tmux_normal = plat.deliver_text(
+                    "常规单段tmux同步剪贴板",
+                    seq_id=21,
+                    origin_window=tmux_win,
+                    preserve_clipboard=False,
+                )
+                self.assertTrue(out_tmux_normal.pasted)
+                self.assertTrue(out_tmux_normal.clipboard)
+                self.assertEqual(pbcopy_payloads[-1], "常规单段tmux同步剪贴板")
+            finally:
+                daemon.close()
+
+            # 5. Reusing MacOSPlatform for direct tmux delivery AFTER daemon.close() / plat.close() still succeeds!
+            self.assertTrue(plat._closed)
+            out_after_close = plat.deliver_text(
+                "close后仍可tmux直投",
+                seq_id=22,
+                origin_window=tmux_win,
+            )
+            self.assertTrue(out_after_close.pasted)
+            self.assertEqual(out_after_close.reason, "tmux")
+            self.assertEqual(tmux_injected[-1], "close后仍可tmux直投")
+
+    def test_macos_cmd_v_waits_for_key_state_release_and_rechecks_focus_while_direct_channels_do_not_wait(self) -> None:
+        pbcopy_payloads: list[str] = []
+        pbcopy_rcs: list[int] = []
+        cmd_v_count = [0]
+        cmd_v_rc = [0]
+        beeps: list[str] = []
+        cur_app = ["iTerm2", "com.googlecode.iterm2", "512", "claude [#abcd1234]"]
+
+        def fake_run(cmd, *, stdin=None, input=None, capture_output=False, text=False, env=None, timeout=None, check=False, **kw):
+            exe = Path(cmd[0]).name
+            empty = "" if (text or kw.get("encoding")) else b""
+            if exe == "pbcopy":
+                rc = pbcopy_rcs.pop(0) if pbcopy_rcs else 0
+                if rc == 0:
+                    raw = input.decode("utf-8") if isinstance(input, (bytes, bytearray)) else str(input or "")
+                    pbcopy_payloads.append(raw)
+                return subprocess.CompletedProcess(cmd, rc, empty, empty)
+            if exe == "tmux":
+                return subprocess.CompletedProcess(cmd, 0, empty, empty)
+            if exe == "osascript":
+                script = cmd[2] if len(cmd) > 2 else ""
+                if "on run argv" in script:
+                    return subprocess.CompletedProcess(cmd, 0, "ok\n", "")
+                if 'keystroke "v"' in script:
+                    cmd_v_count[0] += 1
+                    err = "System Events got an error: not allowed (1002)" if cmd_v_rc[0] != 0 else ""
+                    return subprocess.CompletedProcess(cmd, cmd_v_rc[0], "", err)
+                return subprocess.CompletedProcess(cmd, 0, _APPLE_SEP.join(cur_app) + "\n", "")
+            if exe in ("git", "ps", "lsof", "pgrep"):
+                return subprocess.CompletedProcess(cmd, 1, empty, empty)
+            raise AssertionError(f"unexpected cmd: {cmd}")
+
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "agent_voice_input.platform_macos.shutil.which", return_value="/usr/bin/mock"
+        ), mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=fake_run):
+            plat = MacOSPlatform(
+                Config(),
+                env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"},
+                cache_dir=Path(td) / "cache",
+            )
+            plat._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            key_rpc_calls: list[tuple[dict[str, object], bool]] = []
+            held_handler: list[Any] = [lambda: {"ok": True, "hotkey_held": True}]
+
+            def dispatch_shim_rpc(payload: dict[str, object], timeout_sec: float = 0.8, *, allow_retry: bool = True) -> dict[str, object]:
+                if payload.get("cmd") == "fg_window":
+                    return {
+                        "ok": True,
+                        "hwnd": 100,
+                        "process": cur_app[0],
+                        "bundle_id": cur_app[1],
+                        "pid": int(cur_app[2]),
+                        "title": cur_app[3],
+                        "ax_trusted": True,
+                    }
+                if payload.get("cmd") == "key_state":
+                    key_rpc_calls.append((dict(payload), allow_retry))
+                    return held_handler[0]()
+                return {"ok": True}
+
+            plat._shim_rpc = dispatch_shim_rpc  # type: ignore[method-assign]
+
+            # 1. Ghostty 'input text' and 'tmux paste-buffer' NEVER wait on key_state even when hotkey is held
+            cur_app[:] = ["Ghostty", GHOSTTY_BUNDLE_ID, "901", ""]
+            out_g = plat.deliver_text(
+                "Ghostty按住热键直投",
+                seq_id=1,
+                origin_window=ForegroundWindow(0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID, surface_id="surf-1"),
+            )
+            self.assertTrue(out_g.pasted)
+            self.assertEqual(key_rpc_calls, [])
+
+            cur_app[:] = ["iTerm2", "com.googlecode.iterm2", "512", "tmux"]
+            plat.env["TMUX"] = "/tmp/s,123,0"
+            tmux_origin = plat.get_foreground_window()
+            out_t = plat.deliver_text(
+                "tmux按住热键直投",
+                seq_id=2,
+                origin_window=tmux_origin,
+            )
+            self.assertTrue(out_t.pasted)
+            self.assertEqual(out_t.reason, "tmux")
+            self.assertEqual(key_rpc_calls, [])
+            plat.env.pop("TMUX", None)
+
+            # 2. System Events Cmd+V polls key_state (allow_retry=False) until released, re-verifies focus, then pastes
+            pbcopy_payloads.clear()
+            origin_iterm = ForegroundWindow(100, "iTerm2", "claude [#abcd1234]", "com.googlecode.iterm2")
+            cur_app[:] = ["iTerm2", "com.googlecode.iterm2", "512", "claude [#abcd1234]"]
+            held_seq = iter(
+                [
+                    {"ok": True, "hotkey_held": True},
+                    {"ok": True, "hotkey_held": True},
+                    {"ok": True, "hotkey_held": False},
+                ]
+            )
+            held_handler[0] = lambda: next(held_seq)
+            settle_called = [0]
+            out_cv = plat.deliver_text(
+                "松键后CmdV粘贴",
+                seq_id=3,
+                origin_window=origin_iterm,
+                fallback_clipboard_text="回退\n\n松键后CmdV粘贴",
+                before_clipboard_write=lambda: settle_called.__setitem__(0, settle_called[0] + 1),
+            )
+            self.assertTrue(out_cv.pasted)
+            self.assertTrue(out_cv.clipboard)
+            self.assertTrue(out_cv.used_clipboard_paste)
+            self.assertEqual(cmd_v_count[0], 1)
+            self.assertEqual(settle_called[0], 1)
+            self.assertEqual(pbcopy_payloads, ["松键后CmdV粘贴"])
+            self.assertEqual(len(key_rpc_calls), 3)
+            for req, allow_retry in key_rpc_calls:
+                self.assertEqual(req.get("cmd"), "key_state")
+                self.assertFalse(allow_retry)
+
+            # 3. Focus switches to Safari while hotkey is held -> post-release recheck skips Cmd+V & writes fallback_clipboard_text
+            pbcopy_payloads.clear()
+            key_rpc_calls.clear()
+            cmd_v_count[0] = 0
+            drift_step = [0]
+
+            def on_key_drift() -> dict[str, object]:
+                drift_step[0] += 1
+                if drift_step[0] == 1:
+                    return {"ok": True, "hotkey_held": True}
+                cur_app[:] = ["Safari", "com.apple.Safari", "777", "Docs"]
+                return {"ok": True, "hotkey_held": False}
+
+            held_handler[0] = on_key_drift
+            cur_app[:] = ["iTerm2", "com.googlecode.iterm2", "512", "claude [#abcd1234]"]
+            out_cv_drift = plat.deliver_text(
+                "松键前切到了浏览器",
+                seq_id=4,
+                origin_window=origin_iterm,
+                fallback_clipboard_text="前序未贴\n\n松键前切到了浏览器",
+            )
+            self.assertFalse(out_cv_drift.pasted)
+            self.assertTrue(out_cv_drift.clipboard)
+            self.assertFalse(out_cv_drift.used_clipboard_paste)
+            self.assertEqual(out_cv_drift.reason, "focus_changed")
+            self.assertEqual(cmd_v_count[0], 0)
+            self.assertEqual(pbcopy_payloads, ["前序未贴\n\n松键前切到了浏览器"])
+
+            # 4. Hold timeout safety net -> writes fallback_clipboard_text without sending Cmd+V
+            pbcopy_payloads.clear()
+            plat._paste_hold_timeout_sec = 0.08
+            cur_app[:] = ["iTerm2", "com.googlecode.iterm2", "512", "claude [#abcd1234]"]
+            held_handler[0] = lambda: {"ok": True, "hotkey_held": True}
+            out_cv_to = plat.deliver_text(
+                "长按超时回退",
+                seq_id=5,
+                origin_window=origin_iterm,
+                fallback_clipboard_text="历史段\n\n长按超时回退",
+            )
+            self.assertFalse(out_cv_to.pasted)
+            self.assertTrue(out_cv_to.clipboard)
+            self.assertEqual(out_cv_to.reason, "focus_changed")
+            self.assertEqual(cmd_v_count[0], 0)
+            self.assertEqual(pbcopy_payloads, ["历史段\n\n长按超时回退"])
+
+            # 5. Settle wait BEFORE key_state & focus check: focus drifting during before_clipboard_write
+            #    skips Cmd+V, writes fallback_clipboard_text once, and does NOT call before_clipboard_write twice!
+            pbcopy_payloads.clear()
+            key_rpc_calls.clear()
+            cmd_v_count[0] = 0
+            plat._paste_hold_timeout_sec = 1.0
+            cur_app[:] = ["iTerm2", "com.googlecode.iterm2", "512", "claude [#abcd1234]"]
+            held_handler[0] = lambda: {"ok": True, "hotkey_held": False}
+            settle_invocations = [0]
+
+            def settle_switches_focus() -> bool:
+                settle_invocations[0] += 1
+                self.assertEqual(key_rpc_calls, [], "before_clipboard_write must execute BEFORE key_state polling")
+                cur_app[:] = ["Safari", "com.apple.Safari", "777", "Docs"]
+                return True
+
+            out_settle_drift = plat.deliver_text(
+                "冷却等待期间切走窗口",
+                seq_id=6,
+                origin_window=origin_iterm,
+                fallback_clipboard_text="前段\n\n冷却等待期间切走窗口",
+                before_clipboard_write=settle_switches_focus,
+            )
+            self.assertFalse(out_settle_drift.pasted)
+            self.assertTrue(out_settle_drift.clipboard)
+            self.assertEqual(out_settle_drift.reason, "focus_changed")
+            self.assertEqual(cmd_v_count[0], 0)
+            self.assertEqual(settle_invocations[0], 1)
+            self.assertEqual(pbcopy_payloads, ["前段\n\n冷却等待期间切走窗口"])
+
+            # 6. Transient key_state failures (None / ok:False / exception) NEVER prematurely release Cmd+V
+            pbcopy_payloads.clear()
+            key_rpc_calls.clear()
+            cmd_v_count[0] = 0
+            cur_app[:] = ["iTerm2", "com.googlecode.iterm2", "512", "claude [#abcd1234]"]
+            flaky_step = [0]
+
+            def flaky_key_state() -> Any:
+                flaky_step[0] += 1
+                if flaky_step[0] == 1:
+                    return None
+                if flaky_step[0] == 2:
+                    return {"ok": False, "error": "busy"}
+                if flaky_step[0] == 3:
+                    raise RuntimeError("transient_rpc_timeout")
+                if flaky_step[0] == 4:
+                    return {"ok": True, "hotkey_held": True}
+                return {"ok": True, "hotkey_held": False}
+
+            held_handler[0] = flaky_key_state
+            out_flaky_ok = plat.deliver_text("瞬时RPC抖动后松键粘贴", seq_id=7, origin_window=origin_iterm)
+            self.assertTrue(out_flaky_ok.pasted)
+            self.assertEqual(flaky_step[0], 5)
+            self.assertEqual(cmd_v_count[0], 1)
+
+            pbcopy_payloads.clear()
+            cmd_v_count[0] = 0
+            plat._paste_hold_timeout_sec = 0.08
+            held_handler[0] = lambda: None
+            out_none_timeout = plat.deliver_text(
+                "key_state持续None超时回退",
+                seq_id=8,
+                origin_window=origin_iterm,
+                fallback_clipboard_text="前段\n\nkey_state持续None超时回退",
+            )
+            self.assertFalse(out_none_timeout.pasted)
+            self.assertTrue(out_none_timeout.clipboard)
+            self.assertEqual(out_none_timeout.reason, "focus_changed")
+            self.assertEqual(cmd_v_count[0], 0)
+            self.assertEqual(pbcopy_payloads, ["前段\n\nkey_state持续None超时回退"])
+
+            # 7. First pbcopy succeeds, Cmd+V fails, AND fallback_clipboard_text restore pbcopy fails:
+            #    must report clipboard=False, reason="clipboard_failed" (never false 'copied'), and daemon saves failed audio!
+            plat.beep = lambda kind: beeps.append(kind)  # type: ignore[method-assign]
+            pbcopy_payloads.clear()
+            beeps.clear()
+            cmd_v_count[0] = 0
+            cmd_v_rc[0] = 1
+            pbcopy_rcs[:] = [0, 1]
+            plat._paste_hold_timeout_sec = 1.0
+            held_handler[0] = lambda: {"ok": True, "hotkey_held": False}
+            out_restore_fail = plat.deliver_text(
+                "单段首写成功",
+                seq_id=9,
+                origin_window=origin_iterm,
+                fallback_clipboard_text="前序回退\n\n单段首写成功",
+            )
+            self.assertFalse(out_restore_fail.pasted)
+            self.assertFalse(out_restore_fail.clipboard)
+            self.assertEqual(out_restore_fail.reason, "clipboard_failed")
+            self.assertEqual(beeps, [], "must not play focus beep when fallback clipboard restore failed")
+
+            # Verify end-to-end with VoiceInputDaemon: emits 'error' (never 'copied') and stashes failed WAV!
+            hud_seen: list[str] = []
+            plat.hud = lambda st, **_kw: hud_seen.append(st)  # type: ignore[method-assign]
+            plat.start_recording = lambda _rt, *, loopback=False: None  # type: ignore[method-assign]
+            plat.stop_recording = lambda *, drain=True: (_voiced_wav(), "avfoundation")  # type: ignore[method-assign]
+            rt_fail = Path(td) / "rt_restore_fail"
+            daemon_rf = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="off")),
+                env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"},
+                runtime_dir=rt_fail,
+                platform=plat,
+                asr_provider=_StubAsr("需回写组合但失败的本段"),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=SessionTracker(home_dir=Path(td), env={"HOME": td}, runtime_dir=rt_fail, proc_root=Path(td) / "noproc"),
+                paste_settle_sec=0.0,
+            )
+            try:
+                daemon_rf._batch_unpasted_clips.append("前序未贴段")
+                pbcopy_rcs[:] = [0, 1]
+                daemon_rf.handle_trigger("toggle", origin_iterm)
+                daemon_rf._last_trigger_ts = -1e9
+                r_rf = daemon_rf.handle_trigger("toggle")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon_rf.last_result.get("seq_id") != r_rf["seq_id"]:
+                    time.sleep(0.02)
+                self.assertFalse(daemon_rf.last_result["pasted"])
+                self.assertEqual(daemon_rf.last_result["paste_reason"], "clipboard_failed")
+                self.assertNotIn("copied", hud_seen)
+                self.assertIn("error", hud_seen)
+                saved_wav = str(daemon_rf.last_result.get("saved_audio") or "")
+                self.assertTrue(saved_wav and Path(saved_wav).is_file())
+            finally:
+                daemon_rf.close()
+
+            # 8. Managed shim dies & disables itself mid-key_state wait: MUST fall back to clipboard (never fire Cmd+V!)
+            plat.__dict__.pop("_has_managed_shim", None)
+            plat._closed = False
+            plat._shim_disabled = False
+            plat._on_event = lambda _m: None
+            pbcopy_rcs.clear()
+            pbcopy_payloads.clear()
+            cmd_v_count[0] = 0
+            cmd_v_rc[0] = 0
+            plat._paste_hold_timeout_sec = 5.0
+
+            def shim_dies_and_disables() -> Any:
+                plat._shim_disabled = True
+                return None
+
+            held_handler[0] = shim_dies_and_disables
+            t_disable0 = time.monotonic()
+            out_shim_died = plat.deliver_text(
+                "shim失效回退段",
+                seq_id=11,
+                origin_window=origin_iterm,
+                fallback_clipboard_text="前段\n\nshim失效回退段",
+            )
+            elapsed_disable = time.monotonic() - t_disable0
+            self.assertFalse(out_shim_died.pasted)
+            self.assertTrue(out_shim_died.clipboard)
+            self.assertEqual(out_shim_died.reason, "focus_changed")
+            self.assertEqual(cmd_v_count[0], 0, "must NEVER fire Cmd+V when managed shim disappears before confirming key release")
+            self.assertLess(elapsed_disable, 1.0, "must fail over to clipboard immediately when shim becomes disabled")
+            self.assertEqual(pbcopy_payloads, ["前段\n\nshim失效回退段"])
 
 
 if __name__ == "__main__":

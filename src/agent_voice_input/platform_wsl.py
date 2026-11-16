@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .asr_providers import _sleep_cooperative
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, normalize_ui_position, redact_secrets
 from .hud import (
@@ -67,7 +68,7 @@ class ForegroundWindow:
 
 @dataclass(frozen=True)
 class PasteOutcome:
-    pasted: bool; clipboard: bool; reason: str = "ok"; fg_process: str = ""
+    pasted: bool; clipboard: bool; reason: str = "ok"; fg_process: str = ""; used_clipboard_paste: bool = False
 
 
 class NoMicrophoneError(RuntimeError):
@@ -671,6 +672,12 @@ class JsonlShimMixin:
             return False
         dead: subprocess.Popen[str] | None = None
         with self._shim_lock:
+            if self._closed:
+                if self._shim_graceful:
+                    return False
+                raise RuntimeError(f"{type(self).__name__} is closed")
+            if self._shim_disabled:
+                return False
             if self._shim is not None and self._shim.poll() is None:
                 return True
             dead, self._shim = self._shim, None
@@ -696,6 +703,10 @@ class JsonlShimMixin:
             threading.Thread(target=self._shim_reader, args=(proc,), daemon=True).start()
         _reap_shim_proc(dead)
         self._ready.wait(timeout=self._shim_ready_timeout)
+        if self._closed:
+            if self._shim_graceful:
+                return False
+            raise RuntimeError(f"{type(self).__name__} is closed")
         if self._shim_disabled:
             return False
         if self._shim_graceful:
@@ -739,15 +750,25 @@ class JsonlShimMixin:
                     self._ensure_event_worker()
                     self._event_q.put(msg)
                 elif "reply" in msg or msg.get("type") == "reply":
-                    if (q := self._pending.get(int(msg.get("seq_id") or 0))) is not None:
-                        try: q.put_nowait(msg)
-                        except queue.Full: pass
+                    with self._shim_lock:
+                        entry = self._pending.get(int(msg.get("seq_id") or 0))
+                    if entry is not None:
+                        owner_proc, wait_q = entry if isinstance(entry, tuple) else (proc, entry)
+                        if owner_proc is proc:
+                            try: wait_q.put_nowait(msg)
+                            except queue.Full: pass
                 elif self._shim_graceful and not got_ready and msg.get("ok") is False:
                     self._disable_shim_once(str(msg.get("error") or f"{self._shim_label} startup failed"))
                     self._ready.set()
         finally:
             need_respawn = False
+            stale_queues: list[queue.Queue[dict[str, Any]]] = []
             with self._shim_lock:
+                for k_sid, val in list(self._pending.items()):
+                    owner_proc, wait_q = val if isinstance(val, tuple) else (proc, val)
+                    if owner_proc is proc:
+                        stale_queues.append(wait_q)
+                        self._pending.pop(k_sid, None)
                 if self._shim is proc:
                     self._shim = None
                     self._ready.set()
@@ -755,7 +776,7 @@ class JsonlShimMixin:
                         self._disable_shim_once(self.last_shim_error or f"{self._shim_label} exited before ready")
                     need_respawn = got_ready and not self._closed and not self._shim_disabled and self._on_event is not None
             _reap_shim_proc(proc)
-            for q in list(self._pending.values()):
+            for q in stale_queues:
                 try: q.put_nowait({"error": "shim_eof"})
                 except queue.Full: pass
             if need_respawn:
@@ -776,6 +797,7 @@ class JsonlShimMixin:
                 raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
             sid = 0
             q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+            sent_proc: subprocess.Popen[str] | None = None
             broken: subprocess.Popen[str] | None = None
             try:
                 with self._shim_lock:
@@ -783,9 +805,10 @@ class JsonlShimMixin:
                     if proc is None or proc.stdin is None or proc.poll() is not None:
                         broken, self._shim = proc, None
                         raise BrokenPipeError("shim_not_running")
+                    sent_proc = proc
                     self._rpc_seq += 1
                     sid = self._rpc_seq
-                    self._pending[sid] = q
+                    self._pending[sid] = (proc, q)
                     with self._stdin_lock:
                         proc.stdin.write(json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n")
                         proc.stdin.flush()
@@ -807,7 +830,12 @@ class JsonlShimMixin:
                 raise
             finally:
                 if sid:
-                    self._pending.pop(sid, None)
+                    with self._shim_lock:
+                        cur_entry = self._pending.get(sid)
+                        if cur_entry is not None:
+                            owner_p = cur_entry[0] if isinstance(cur_entry, tuple) else sent_proc
+                            if owner_p is sent_proc:
+                                self._pending.pop(sid, None)
         if self._shim_graceful:
             return None
         raise RuntimeError("shim_rpc exhausted retries")
@@ -825,6 +853,7 @@ class JsonlShimMixin:
         text: str = "",
         duration_ms: int = 0,
         *,
+        layer: str | None = None,
         clear_main: bool | None = None,
         clear_toast: bool | None = None,
     ) -> None:
@@ -839,9 +868,11 @@ class JsonlShimMixin:
             req: dict[str, Any] = {"cmd": "hud", "state": state}
             eff_text = text
             eff_duration_ms = duration_ms if duration_ms > 0 else 0
-            layer = hud_layer_for_state(st)
-            if layer != "control":
-                req["layer"] = layer
+            base_layer = hud_layer_for_state(st)
+            if base_layer != "control":
+                exp_layer = (layer or "").strip().lower()
+                eff_layer = exp_layer if exp_layer in ("main", "toast") else base_layer
+                req["layer"] = eff_layer
                 req["position"] = normalize_ui_position(self.cfg.ui.position)
                 if st == "recording" and self.cfg.audio.max_duration_sec > 0:
                     req["max_duration_sec"] = max(1, int(round(self.cfg.audio.max_duration_sec)))
@@ -862,7 +893,7 @@ class JsonlShimMixin:
                     )
                 if eff_duration_ms <= 0:
                     eff_duration_ms = default_hud_duration_ms(st)
-                if clear_toast is None and st == "recording":
+                if clear_toast is None and st == "recording" and eff_layer == "main":
                     clear_toast = True
             if clear_main is not None:
                 req["clear_main"] = bool(clear_main)
@@ -990,6 +1021,7 @@ class WslPlatform(JsonlShimMixin):
         self._pending_winmm_recovered_gaps: list[int] = []
         self._recorder_lost_cb: Callable[..., Any] | None = None
         self._recorder_recovered_cb: Callable[..., Any] | None = None
+        self._paste_hold_timeout_sec: float | None = None
         self._init_shim_bridge()
 
     def set_recorder_lost_callback(self, cb: Callable[..., Any] | None) -> None:
@@ -1252,7 +1284,90 @@ class WslPlatform(JsonlShimMixin):
             self._use_winmm = False
         return False
 
-    def deliver_text(self, text: str, seq_id: int, target_hwnd: int = 0, *, origin_window: ForegroundWindow | None = None) -> PasteOutcome:
+    def _effective_paste_hold_timeout_sec(self) -> float:
+        if self._paste_hold_timeout_sec is not None:
+            return max(0.0, float(self._paste_hold_timeout_sec))
+        return max(15.0, float(self.cfg.audio.max_duration_sec) + 2.0)
+
+    def _dispatch_paste_rpc(self, req: dict[str, Any], timeout_sec: float = 5.0) -> dict[str, Any]:
+        if _callable_accepts_kwarg(self._shim_rpc, "allow_retry"):
+            return self._shim_rpc(req, timeout_sec=timeout_sec, allow_retry=False) or {}
+        return self._shim_rpc(req, timeout_sec=timeout_sec) or {}
+
+    def deliver_text(
+        self,
+        text: str,
+        seq_id: int,
+        target_hwnd: int = 0,
+        *,
+        origin_window: ForegroundWindow | None = None,
+        fallback_clipboard_text: str | None = None,
+        preserve_clipboard: bool = False,
+        suppress_beep: bool | Callable[[], bool] = False,
+        is_cancelled: Callable[[], bool] | None = None,
+        before_clipboard_write: Callable[[], None] | None = None,
+    ) -> PasteOutcome:
+        del preserve_clipboard
         eff_hwnd = target_hwnd or (origin_window.hwnd if origin_window is not None else 0)
-        res = self._shim_rpc({"cmd": "paste", "seq_id": seq_id, "text": text, "target_hwnd": eff_hwnd, "expect_terminal": True}, timeout_sec=5.0) or {}
-        return PasteOutcome(bool(res.get("pasted")), bool(res.get("clipboard")), str(res.get("reason") or "ok"), str(res.get("fg_process") or ""))
+        cancelled_fn = lambda: bool(is_cancelled is not None and is_cancelled())
+        if cancelled_fn():
+            return PasteOutcome(False, False, "cancelled", "")
+        if before_clipboard_write is not None:
+            before_clipboard_write()
+        hold_deadline = time.monotonic() + self._effective_paste_hold_timeout_sec()
+        while True:
+            if cancelled_fn():
+                return PasteOutcome(False, False, "cancelled", "")
+            req: dict[str, Any] = {
+                "cmd": "paste",
+                "seq_id": seq_id,
+                "text": text,
+                "target_hwnd": eff_hwnd,
+                "expect_terminal": True,
+            }
+            if fallback_clipboard_text is not None and fallback_clipboard_text != text:
+                req["fallback_text"] = fallback_clipboard_text
+            if bool(suppress_beep() if callable(suppress_beep) else suppress_beep):
+                req["suppress_beep"] = True
+            res = self._dispatch_paste_rpc(req, timeout_sec=5.0)
+            reason = str(res.get("reason") or "ok")
+            fg_proc = str(res.get("fg_process") or "")
+            if reason != "hotkey_held":
+                pasted = bool(res.get("pasted"))
+                clip_ok = bool(res.get("clipboard"))
+                return PasteOutcome(
+                    pasted,
+                    clip_ok,
+                    reason,
+                    fg_proc,
+                    used_clipboard_paste=bool(pasted and clip_ok),
+                )
+            rem = hold_deadline - time.monotonic()
+            if rem <= 0.0:
+                break
+            _sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
+
+        if cancelled_fn():
+            return PasteOutcome(False, False, "cancelled", "")
+        fb_req: dict[str, Any] = {
+            "cmd": "paste",
+            "seq_id": seq_id,
+            "text": text,
+            "target_hwnd": eff_hwnd,
+            "expect_terminal": True,
+            "force_clipboard_only": True,
+        }
+        if fallback_clipboard_text is not None:
+            fb_req["fallback_text"] = fallback_clipboard_text
+        if bool(suppress_beep() if callable(suppress_beep) else suppress_beep):
+            fb_req["suppress_beep"] = True
+        res_fb = self._dispatch_paste_rpc(fb_req, timeout_sec=5.0)
+        clip_ok = bool(res_fb.get("clipboard"))
+        fg_proc = str(res_fb.get("fg_process") or "")
+        return PasteOutcome(
+            False,
+            clip_ok,
+            "focus_changed" if clip_ok else str(res_fb.get("reason") or "clipboard_failed"),
+            fg_proc,
+            used_clipboard_paste=False,
+        )

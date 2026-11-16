@@ -1,13 +1,14 @@
-"""Core anti-reentrant two-stage state machine daemon and single-shot pipeline for agent-voice-input."""
+"""Core serial-pipelined two-stage state machine daemon and single-shot pipeline for agent-voice-input."""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import concurrent.futures, inspect, json, os, signal, socket, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from . import __version__
-from .asr_providers import AsrError, AsrResult, BaseAsrProvider, create_asr_provider
+from .asr_providers import AsrError, AsrResult, BaseAsrProvider, _sleep_cooperative, create_asr_provider
 from .audio_proc import AudioGateResult, DEFAULT_MAX_CHUNK_SEC, inspect_wav_chunks, process_wav, save_failed_audio
 from .config import Config, ProviderCredentials, ensure_secure_dir, get_runtime_dir, redact_secrets, resolve_credentials, select_asr_provider
 from .hud import is_toast_hud_state
@@ -53,14 +54,44 @@ def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
     )
 
 
-def _deliver_with_origin(platform: Any, text: str, *, seq_id: int, origin_window: ForegroundWindow) -> PasteOutcome:
+def _deliver_with_origin(
+    platform: Any,
+    text: str,
+    *,
+    seq_id: int,
+    origin_window: ForegroundWindow,
+    fallback_clipboard_text: str | None = None,
+    preserve_clipboard: bool = False,
+    suppress_beep: bool | Callable[[], bool] = False,
+    is_cancelled: Callable[[], bool] | None = None,
+    before_clipboard_write: Callable[[], None] | None = None,
+) -> PasteOutcome:
     try:
         params = inspect.signature(platform.deliver_text).parameters
     except (TypeError, ValueError):
         params = {}
-    if "origin_window" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return platform.deliver_text(text, seq_id=seq_id, target_hwnd=origin_window.hwnd, origin_window=origin_window)
-    return platform.deliver_text(text, seq_id=seq_id, target_hwnd=origin_window.hwnd)
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+    def _accepts(name: str) -> bool:
+        return name in params or has_var_kw
+
+    if before_clipboard_write is not None and not _accepts("before_clipboard_write"):
+        before_clipboard_write()
+
+    kw: dict[str, Any] = {"seq_id": seq_id, "target_hwnd": origin_window.hwnd}
+    if _accepts("origin_window"):
+        kw["origin_window"] = origin_window
+    if fallback_clipboard_text is not None and _accepts("fallback_clipboard_text"):
+        kw["fallback_clipboard_text"] = fallback_clipboard_text
+    if preserve_clipboard and _accepts("preserve_clipboard"):
+        kw["preserve_clipboard"] = True
+    if suppress_beep and _accepts("suppress_beep"):
+        kw["suppress_beep"] = suppress_beep
+    if is_cancelled is not None and _accepts("is_cancelled"):
+        kw["is_cancelled"] = is_cancelled
+    if before_clipboard_write is not None and _accepts("before_clipboard_write"):
+        kw["before_clipboard_write"] = before_clipboard_write
+    return platform.deliver_text(text, **kw)
 
 
 def _will_run_stage2_refiner(cfg: Config, refiner: BaseRefiner, asr_res: AsrResult) -> bool:
@@ -105,6 +136,26 @@ def _derive_failed_label(snap: SessionSnapshot | None, win: ForegroundWindow) ->
 
 
 MAX_ASR_CHUNK_CONCURRENCY: int = 5
+MAX_PENDING_UTTERANCES: int = 8
+DEFAULT_PASTE_SETTLE_SEC: float = 0.15
+
+
+def _make_cancel_check(
+    seq_id: int,
+    is_current_seq: Callable[[int], bool] | None,
+    is_cancelled: Callable[[], bool] | None,
+) -> Callable[[], bool] | None:
+    if is_current_seq is None and is_cancelled is None:
+        return None
+
+    def _check() -> bool:
+        if is_cancelled is not None and is_cancelled():
+            return True
+        if is_current_seq is not None and not is_current_seq(seq_id):
+            return True
+        return False
+
+    return _check
 
 
 def _call_asr_transcribe(
@@ -163,10 +214,9 @@ def _transcribe_wav_chunks(
     max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
     seq_id: int = 1,
     is_current_seq: Callable[[int], bool] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[AsrResult, int, tuple[float, ...]]:
-    cancel_check: Callable[[], bool] | None = (
-        (lambda: not is_current_seq(seq_id)) if is_current_seq is not None else None
-    )
+    cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled)
     infos = inspect_wav_chunks(wav_bytes, max_chunk_sec=max_chunk_sec, floor_dbfs=floor_dbfs)
     if len(infos) <= 1:
         if cancel_check is not None and cancel_check():
@@ -241,6 +291,8 @@ def run_pipeline_once(
     window_title_override: str | None = None,
     audio_source: str = "file", seq_id: int = 1, dry_run: bool = False,
     is_current_seq: Callable[[int], bool] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+    deliver_fn: Callable[[str, ForegroundWindow], PasteOutcome] | None = None,
     on_stage: Callable[[str], None] | None = None,
     runtime_dir: Path | None = None,
     max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
@@ -287,9 +339,7 @@ def run_pipeline_once(
                 else eff_tracker.sync_session(window_title=window_title_override)
             )
             asr_ctx = eff_tracker.build_asr_context(snap)
-            cancel_check: Callable[[], bool] | None = (
-                (lambda: not is_current_seq(seq_id)) if is_current_seq is not None else None
-            )
+            cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled)
             try:
                 asr_res, chunk_count, chunk_secs = _transcribe_wav_chunks(
                     gate.wav_bytes,
@@ -299,6 +349,7 @@ def run_pipeline_once(
                     max_chunk_sec=max_chunk_sec,
                     seq_id=seq_id,
                     is_current_seq=is_current_seq,
+                    is_cancelled=is_cancelled,
                 )
             except AsrError as asr_exc:
                 if cancel_check is not None and cancel_check() and "cancelled" in str(asr_exc).lower():
@@ -314,12 +365,12 @@ def run_pipeline_once(
                     )
                 raise
             if not asr_res.text.strip():
-                if is_current_seq is not None and not is_current_seq(seq_id):
+                if cancel_check is not None and cancel_check():
                     saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
                     return PipelineResult(False, seq_id, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
                 saved_p = _stash_failed(gate, snap, win)
                 return PipelineResult(False, seq_id, skipped_reason="empty_asr", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
-            if is_current_seq is not None and not is_current_seq(seq_id):
+            if cancel_check is not None and cancel_check():
                 saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
                 return PipelineResult(False, seq_id, final_text=asr_res.text.strip(), skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
             if _will_run_stage2_refiner(cfg, eff_refiner, asr_res) and on_stage is not None:
@@ -333,10 +384,24 @@ def run_pipeline_once(
                 is_cancelled=cancel_check,
             )
             final_text = ref_res.text.strip() or asr_res.text.strip()
-            if is_current_seq is not None and not is_current_seq(seq_id):
+            if cancel_check is not None and cancel_check():
                 saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
                 return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
-            paste_out = None if (dry_run or platform is None) else _deliver_with_origin(platform, final_text, seq_id=seq_id, origin_window=win)
+            if dry_run or (platform is None and deliver_fn is None):
+                paste_out = None
+            elif deliver_fn is not None:
+                paste_out = deliver_fn(final_text, win)
+            else:
+                paste_out = _deliver_with_origin(
+                    platform,
+                    final_text,
+                    seq_id=seq_id,
+                    origin_window=win,
+                    is_cancelled=cancel_check,
+                )
+            if paste_out is not None and paste_out.reason == "cancelled" and cancel_check is not None and cancel_check():
+                saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
+                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
             saved_p = _stash_failed(gate, snap, win) if (paste_out is not None and not paste_out.pasted and not paste_out.clipboard) else ""
             return PipelineResult(True, seq_id, final_text=final_text, audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, paste=paste_out, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
         except Exception as exc:
@@ -364,8 +429,37 @@ def send_control_command(runtime_dir: Path, payload: Mapping[str, Any], timeout_
     return json.loads(buf.decode("utf-8", errors="replace").strip() or "{}")
 
 
+@dataclass(frozen=True)
+class _QueuedUtterance:
+    seq_id: int
+    raw_wav: bytes
+    audio_source: str
+    origin_win: ForegroundWindow
+    no_paste: bool = False
+    silent_hud: bool = False
+    recorder_lost: bool = False
+    recovery_count: int = 0
+    recovery_gap_ms: int = 0
+    audio_error: str = ""
+
+
 class VoiceInputDaemon:
-    def __init__(self, cfg: Config, *, env: Mapping[str, str] | None = None, runtime_dir: Path | None = None, platform: Any = None, asr_provider: BaseAsrProvider | None = None, refiner: BaseRefiner | None = None, tracker: SessionTracker | None = None, clock_fn: Callable[[], float] = time.monotonic) -> None:
+    MAX_PENDING_UTTERANCES: int = MAX_PENDING_UTTERANCES
+
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        env: Mapping[str, str] | None = None,
+        runtime_dir: Path | None = None,
+        platform: Any = None,
+        asr_provider: BaseAsrProvider | None = None,
+        refiner: BaseRefiner | None = None,
+        tracker: SessionTracker | None = None,
+        clock_fn: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        paste_settle_sec: float = DEFAULT_PASTE_SETTLE_SEC,
+    ) -> None:
         self.cfg, self.env = cfg, dict(os.environ if env is None else env)
         self.creds = resolve_credentials(cfg, self.env)
         self.runtime_dir = ensure_secure_dir(runtime_dir or get_runtime_dir(self.env, create=True))
@@ -373,8 +467,22 @@ class VoiceInputDaemon:
         self.tracker = tracker or SessionTracker(env=self.env, runtime_dir=self.runtime_dir)
         self.asr_provider = asr_provider or create_asr_provider(cfg, self.creds, env=self.env)
         self.refiner = refiner or create_refiner(cfg, self.creds, env=self.env, runtime_dir=self.runtime_dir)
-        self.clock_fn, self._trigger_lock, self._lock, self._stop_evt = clock_fn, threading.Lock(), threading.Lock(), threading.Event()
+        self.clock_fn, self.sleep_fn = clock_fn, sleep_fn
+        self._paste_settle_sec = max(0.0, float(paste_settle_sec))
+        self._trigger_lock, self._lock, self._stop_evt = threading.Lock(), threading.Lock(), threading.Event()
+        self._queue_cv = threading.Condition(self._lock)
         self.state, self.seq_id, self._last_trigger_ts = "idle", 0, -1e9
+        self._recording_active: bool = False
+        self._recording_seq_id: int = -1
+        self._stopping_capture: bool = False
+        self._utterance_queue: deque[_QueuedUtterance] = deque()
+        self._active_task: _QueuedUtterance | None = None
+        self._active_bg_stage: str = ""
+        self._worker_thread: threading.Thread | None = None
+        self._batch_unpasted_clips: list[str] = []
+        self._clipboard_busy_until: float = -1e9
+        self._main_hud_state: str = ""
+        self._main_hud_visible: bool = False
         self._origin_win, self.last_result, self._srv_sock = ForegroundWindow(), {}, None
         self._cur_no_paste, self._cur_silent_hud = False, False
         self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
@@ -396,6 +504,51 @@ class VoiceInputDaemon:
         with self._lock:
             return not self._stop_evt.is_set() and self.seq_id == seq_id
 
+    def _inflight_or_queued_count_locked(self) -> int:
+        return (1 if self._active_task is not None else 0) + len(self._utterance_queue)
+
+    def _is_seq_inflight_locked(self, seq_id: int) -> bool:
+        if self._active_task is not None and self._active_task.seq_id == seq_id:
+            return True
+        return any(t.seq_id == seq_id for t in self._utterance_queue)
+
+    def _derive_bg_stage_locked(self) -> str:
+        if self._active_task is not None:
+            return self._active_bg_stage or "recognizing"
+        if self._utterance_queue:
+            return "recognizing"
+        return ""
+
+    def _recompute_state_locked(self) -> str:
+        if self._recording_active:
+            st = "recording"
+        elif bg := self._derive_bg_stage_locked():
+            st = bg
+        elif self._stopping_capture:
+            st = "recognizing"
+        else:
+            st = "idle"
+        self.state = st
+        if st == "idle":
+            self._batch_unpasted_clips.clear()
+        return st
+
+    def _is_recording_or_stopping(self) -> bool:
+        with self._lock:
+            return self._recording_active or self._stopping_capture
+
+    def _enqueue_utterance_locked(self, task: _QueuedUtterance) -> None:
+        self._utterance_queue.append(task)
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            w = threading.Thread(
+                target=self._utterance_worker_loop,
+                name="avi-utterance-worker",
+                daemon=True,
+            )
+            self._worker_thread = w
+            w.start()
+        self._queue_cv.notify()
+
     def _cancel_max_duration_timer(self) -> None:
         with self._lock:
             t, self._max_dur_timer = self._max_dur_timer, None
@@ -411,7 +564,7 @@ class VoiceInputDaemon:
         start_it = False
         with self._lock:
             old, self._max_dur_timer = self._max_dur_timer, None
-            if not self._stop_evt.is_set() and self.seq_id == seq_id and self.state == "recording":
+            if not self._stop_evt.is_set() and self._recording_active and self._recording_seq_id == seq_id:
                 self._max_dur_timer = t
                 start_it = True
         if old is not None:
@@ -420,10 +573,10 @@ class VoiceInputDaemon:
             t.start()
 
     def _on_max_duration_timeout(self, seq_id: int) -> None:
-        if self._stop_evt.is_set() or not self.is_current_seq(seq_id):
+        if self._stop_evt.is_set():
             return
         with self._lock:
-            if self._stop_evt.is_set() or self.seq_id != seq_id or self.state != "recording":
+            if self._stop_evt.is_set() or not self._recording_active or self._recording_seq_id != seq_id:
                 return
         self.handle_trigger("toggle", expected_seq_id=seq_id)
 
@@ -433,19 +586,48 @@ class VoiceInputDaemon:
     def _redact(self, exc: Exception) -> str:
         return self._redact_str(str(exc))
 
+    def _update_main_hud_visibility_locked(
+        self,
+        state: str,
+        *,
+        layer: str | None = None,
+        clear_main: bool | None = None,
+    ) -> None:
+        st = state.strip().lower()
+        lyr = (layer or "").strip().lower()
+        if lyr == "toast":
+            if clear_main is True:
+                self._main_hud_state = ""
+                self._main_hud_visible = False
+            return
+        if st in ("recording", "recognizing", "processing", "refining"):
+            self._main_hud_state = st
+            self._main_hud_visible = True
+        elif st in ("hide", "hide_all", "idle", "done", "copied"):
+            self._main_hud_state = ""
+            self._main_hud_visible = False
+        elif clear_main is True:
+            self._main_hud_state = ""
+            self._main_hud_visible = False
+
     def _hud(
         self,
         state: str,
         *,
         duration_ms: int = 0,
+        layer: str | None = None,
         clear_main: bool | None = None,
         clear_toast: bool | None = None,
     ) -> None:
+        with self._lock:
+            self._update_main_hud_visibility_locked(state, layer=layer, clear_main=clear_main)
         if (fn := getattr(self.platform, "hud", None)) is None:
             return
         kw: dict[str, Any] = {}
         if duration_ms > 0:
             kw["duration_ms"] = duration_ms
+        if layer is not None:
+            kw["layer"] = layer
         if clear_main is not None:
             kw["clear_main"] = clear_main
         if clear_toast is not None:
@@ -474,28 +656,32 @@ class VoiceInputDaemon:
         norm_gap = max(0, int(gap_ms or 0))
         emit_toast = False
         with self._lock:
-            if self._stop_evt.is_set() or self.state != "recording":
+            if self._stop_evt.is_set() or not self._recording_active:
                 return
-            if seq_id is not None and self.seq_id != seq_id:
+            if seq_id is not None and self._recording_seq_id != seq_id:
                 return
+            rec_seq = self._recording_seq_id
             self._rec_recovery_count += 1
             self._rec_recovery_gap_ms += norm_gap
             if not self._cur_silent_hud and norm_gap >= 250:
-                if self._rec_hud_ready_seq == self.seq_id:
+                if self._rec_hud_ready_seq == rec_seq:
                     emit_toast = True
                 else:
-                    self._pending_recovery_toast_seq = self.seq_id
+                    self._pending_recovery_toast_seq = rec_seq
         if emit_toast:
             self._hud("audio_recovered", clear_main=False)
 
     def _on_recorder_lost(self, *, seq_id: int | None = None) -> None:
         with self._trigger_lock:
             with self._lock:
-                if self._stop_evt.is_set() or self.state != "recording":
+                if self._stop_evt.is_set() or not self._recording_active:
                     return
-                if seq_id is not None and self.seq_id != seq_id:
+                if seq_id is not None and self._recording_seq_id != seq_id:
                     return
-                cur_seq = self.seq_id
+                cur_seq = self._recording_seq_id
+                self._recording_active = False
+                self._recording_seq_id = -1
+                self._stopping_capture = True
                 eff_no_paste = self._cur_no_paste
                 eff_silent = self._cur_silent_hud
                 rec_cnt, rec_gap = self._rec_recovery_count, self._rec_recovery_gap_ms
@@ -503,7 +689,7 @@ class VoiceInputDaemon:
                 self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
                 self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
                 win_snap = self._origin_win
-                self.state = "recognizing"
+                self._recompute_state_locked()
             self._cancel_max_duration_timer()
             stop_perm_exc: MicrophoneUnavailableError | None = None
             try:
@@ -518,6 +704,7 @@ class VoiceInputDaemon:
                     stop_perm_exc = exc
             except Exception:
                 raw_wav, src_used = b"", ""
+            snap_audio_err = str(getattr(self.platform, "last_audio_error", "") or "")
             gate = None
             if len(raw_wav) > 44:
                 try:
@@ -530,9 +717,10 @@ class VoiceInputDaemon:
                     perm_hud = str(getattr(stop_perm_exc, "hud_state", "mic_permission") or "mic_permission")
                     perm_err = self._redact(stop_perm_exc)
                     with self._lock:
-                        still_cur = self.seq_id == cur_seq
+                        self._stopping_capture = False
+                        resume_state = self._recompute_state_locked()
+                        still_cur = not self._recording_active and self.seq_id == cur_seq
                         if still_cur:
-                            self.state = "idle"
                             self._recorder_lost_seq = cur_seq
                             self._recorder_lost_ts = lost_ts
                             self._recorder_lost_stop_absorbed = False
@@ -543,16 +731,21 @@ class VoiceInputDaemon:
                             "audio_source": src_used,
                             "error": perm_err,
                         }
-                    if still_cur and not eff_silent:
-                        self._hud(perm_hud, duration_ms=0, clear_main=True)
+                    if not eff_silent:
+                        if resume_state != "idle":
+                            self._hud(resume_state)
+                            self._hud(perm_hud, duration_ms=0, clear_main=False)
+                        elif still_cur:
+                            self._hud(perm_hud, duration_ms=0, clear_main=True)
                     if not eff_silent:
                         self.platform.beep("error")
                     return
-                audio_err = self._redact_str(str(getattr(self.platform, "last_audio_error", "") or "mic_disconnected"))
+                audio_err = self._redact_str(snap_audio_err or "mic_disconnected")
                 with self._lock:
-                    still_cur = self.seq_id == cur_seq
+                    self._stopping_capture = False
+                    resume_state = self._recompute_state_locked()
+                    still_cur = not self._recording_active and self.seq_id == cur_seq
                     if still_cur:
-                        self.state = "idle"
                         self._recorder_lost_seq = cur_seq
                         self._recorder_lost_ts = lost_ts
                         self._recorder_lost_stop_absorbed = False
@@ -568,35 +761,54 @@ class VoiceInputDaemon:
                         lr_lost["recovery_count"] = rec_cnt
                         lr_lost["recovery_gap_ms"] = rec_gap
                     self.last_result = lr_lost
-                if still_cur and not eff_silent:
-                    self._hud("mic_disconnected", duration_ms=2200, clear_main=True)
+                if not eff_silent:
+                    if resume_state != "idle":
+                        self._hud(resume_state)
+                        self._hud("mic_disconnected", duration_ms=2200, clear_main=False)
+                    elif still_cur:
+                        self._hud("mic_disconnected", duration_ms=2200, clear_main=True)
                 if not eff_silent:
                     self.platform.beep("error")
                 return
-            with self._lock:
+            task = _QueuedUtterance(
+                seq_id=cur_seq,
+                raw_wav=raw_wav,
+                audio_source=src_used,
+                origin_win=win_snap,
+                no_paste=eff_no_paste,
+                silent_hud=eff_silent,
+                recorder_lost=True,
+                recovery_count=rec_cnt,
+                recovery_gap_ms=rec_gap,
+                audio_error=snap_audio_err,
+            )
+            with self._queue_cv:
+                self._stopping_capture = False
                 if self.seq_id == cur_seq:
                     self._recorder_lost_seq = cur_seq
                     self._recorder_lost_ts = lost_ts
                     self._recorder_lost_stop_absorbed = False
+                self._enqueue_utterance_locked(task)
+                main_stage = self._recompute_state_locked()
             if not eff_silent:
-                self._hud("recognizing")
+                self._hud(main_stage)
                 self._hud("mic_disconnected", duration_ms=3200, clear_main=False)
                 self.platform.beep("error")
-            threading.Thread(
-                target=self._run_bg_pipeline,
-                args=(cur_seq, raw_wav, src_used, win_snap, eff_no_paste, eff_silent, True, rec_cnt, rec_gap),
-                daemon=True,
-            ).start()
 
     def _on_pipeline_stage(self, seq_id: int, stage: str, silent_hud: bool = False) -> None:
-        if not self.is_current_seq(seq_id):
+        if self._stop_evt.is_set():
             return
         with self._trigger_lock:
             emit = False
             with self._lock:
-                if not self._stop_evt.is_set() and self.seq_id == seq_id and self.state in ("recognizing", "processing"):
-                    self.state = stage
-                    emit = not silent_hud
+                if self._stop_evt.is_set() or self._active_task is None or self._active_task.seq_id != seq_id:
+                    return
+                self._active_bg_stage = stage
+                if not self._recording_active and not self._stopping_capture:
+                    new_st = self._recompute_state_locked()
+                    emit = not silent_hud and new_st == stage and self._main_hud_state != stage
+                    if emit:
+                        self._update_main_hud_visibility_locked(stage)
             if emit:
                 self._hud(stage)
 
@@ -609,6 +821,7 @@ class VoiceInputDaemon:
         recorder_lost: bool = False,
         recovery_count: int = 0,
         recovery_gap_ms: int = 0,
+        audio_error: str | None = None,
     ) -> dict[str, Any]:
         summary: dict[str, Any] = {"seq_id": seq_id, "ok": res.ok, "skipped_reason": res.skipped_reason, "audio_source": res.audio_source, "switched_fallback": res.switched_fallback, "session_key": res.session.session_key if res.session else "", "asr_provider": res.asr.provider if res.asr else "", "refiner_fallback": res.refined.used_fallback if res.refined else "", "pasted": res.paste.pasted if res.paste else False, "paste_reason": res.paste.reason if res.paste else ("dry_run" if dry_run and res.ok else ""), "raw_audio_sec": round(res.gate.duration_sec, 3) if res.gate else 0.0, "voiced_audio_sec": round(res.gate.voiced_sec, 3) if res.gate else 0.0, "asr_ms": res.asr.latency_ms if res.asr else 0, "refine_ms": res.refined.latency_ms if res.refined else 0, "asr_chars": len(res.asr.text.strip()) if res.asr else 0, "final_chars": len(res.final_text)}
         if res.asr and res.asr.retries > 0:
@@ -630,22 +843,24 @@ class VoiceInputDaemon:
         if recovery_count > 0:
             summary["recovery_count"] = recovery_count
             summary["recovery_gap_ms"] = recovery_gap_ms
-        if (not res.ok or recorder_lost) and (audio_err := str(getattr(self.platform, "last_audio_error", "") or "")):
-            summary["audio_error"] = self._redact_str(audio_err)
+        eff_audio_err = str(getattr(self.platform, "last_audio_error", "") or "") if audio_error is None else audio_error
+        if (not res.ok or recorder_lost) and eff_audio_err:
+            summary["audio_error"] = self._redact_str(eff_audio_err)
         return summary
 
     def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False, from_hotkey: bool = False, expected_seq_id: int | None = None) -> dict[str, Any]:
         arrival_ts = self.clock_fn()
         with self._trigger_lock:
+            queue_full_toast = False
             with self._lock:
                 if self._stop_evt.is_set():
                     return {"ok": False, "ignored": "stopping", "state": self.state, "seq_id": self.seq_id}
-                if expected_seq_id is not None and (self.seq_id != expected_seq_id or self.state != "recording"):
+                if expected_seq_id is not None and (not self._recording_active or self._recording_seq_id != expected_seq_id):
                     return {"ok": False, "ignored": "stale_seq", "state": self.state, "seq_id": self.seq_id}
                 eff_no_paste, eff_silent = bool(no_paste), bool(silent_hud)
                 if (
                     action in ("toggle", "ptt_start")
-                    and self.state != "recording"
+                    and not self._recording_active
                     and self.cfg.hotkey.only_in_terminals
                     and not eff_no_paste
                     and (from_hotkey or window is not None)
@@ -661,11 +876,11 @@ class VoiceInputDaemon:
                     return {"ok": False, "ignored": "debounced", "state": self.state, "seq_id": self.seq_id}
                 if (
                     action == "toggle"
-                    and self.state != "recording"
+                    and not self._recording_active
                     and self.seq_id == self._recorder_lost_seq
                     and not self._recorder_lost_stop_absorbed
                     and (
-                        self.state in ("recognizing", "refining", "processing")
+                        self._is_seq_inflight_locked(self._recorder_lost_seq)
                         or 0.0 <= (arrival_ts - self._recorder_lost_ts) < 1.5
                     )
                 ):
@@ -674,7 +889,7 @@ class VoiceInputDaemon:
                 if (
                     expected_seq_id is None
                     and action == "toggle"
-                    and self.state != "recording"
+                    and not self._recording_active
                     and self.seq_id == self._auto_stop_seq
                     and not self._auto_stop_absorbed
                     and 0.0 <= (arrival_ts - self._auto_stop_ts) < 1.5
@@ -682,25 +897,46 @@ class VoiceInputDaemon:
                     self._auto_stop_absorbed = True
                     return {"ok": True, "ignored": "already_stopped", "state": self.state, "seq_id": self.seq_id}
                 now = self.clock_fn()
+                resume_state = "idle"
+                stop_hud_stage = "recognizing"
                 if action == "ptt_cancel":
-                    if self.state != "recording":
+                    if not self._recording_active:
                         return {"ok": True, "state": self.state, "seq_id": self.seq_id}
                     eff_silent = bool(silent_hud or self._cur_silent_hud)
+                    self._recording_active = False
+                    self._recording_seq_id = -1
                     self._cur_no_paste, self._cur_silent_hud = False, False
                     self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
                     self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
-                    self.seq_id += 1; self.state, self._last_trigger_ts, cur_seq, mode = "idle", now, self.seq_id, "cancel"
-                elif action in ("toggle", "ptt_start") and self.state != "recording":
-                    self._cur_no_paste, self._cur_silent_hud = bool(no_paste), bool(silent_hud)
-                    self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
-                    self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
-                    self._recorder_lost_seq, self._recorder_lost_ts, self._recorder_lost_stop_absorbed = -1, -1e9, False
-                    self._auto_stop_seq, self._auto_stop_ts, self._auto_stop_absorbed = -1, -1e9, False
-                    self._origin_win = window if window is not None else ForegroundWindow()
-                    self.seq_id += 1; self.state, self._last_trigger_ts, cur_seq, mode = "recording", now, self.seq_id, "start"
-                elif action in ("toggle", "ptt_stop") and self.state == "recording":
-                    # Stage 1 ('recognizing') starts immediately on the very first line of stopping recording
-                    self.state = "recognizing"
+                    self.seq_id += 1
+                    cur_seq = self.seq_id
+                    self._last_trigger_ts = now
+                    resume_state = self._recompute_state_locked()
+                    mode = "cancel"
+                elif action in ("toggle", "ptt_start") and not self._recording_active:
+                    if self._inflight_or_queued_count_locked() >= MAX_PENDING_UTTERANCES:
+                        cur_state, cur_seq = self.state, self.seq_id
+                        queue_full_toast = not eff_silent
+                        mode = "queue_full"
+                    else:
+                        self._cur_no_paste, self._cur_silent_hud = bool(no_paste), bool(silent_hud)
+                        self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
+                        self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
+                        self._recorder_lost_seq, self._recorder_lost_ts, self._recorder_lost_stop_absorbed = -1, -1e9, False
+                        self._auto_stop_seq, self._auto_stop_ts, self._auto_stop_absorbed = -1, -1e9, False
+                        self._origin_win = window if window is not None else ForegroundWindow()
+                        self.seq_id += 1
+                        cur_seq = self.seq_id
+                        self._recording_active = True
+                        self._recording_seq_id = cur_seq
+                        self._last_trigger_ts = now
+                        self._recompute_state_locked()
+                        mode = "start"
+                elif action in ("toggle", "ptt_stop") and self._recording_active:
+                    cur_seq = self._recording_seq_id
+                    self._recording_active = False
+                    self._recording_seq_id = -1
+                    self._stopping_capture = True
                     eff_no_paste = bool(no_paste or self._cur_no_paste)
                     eff_silent = bool(silent_hud or self._cur_silent_hud)
                     rec_cnt, rec_gap = self._rec_recovery_count, self._rec_recovery_gap_ms
@@ -709,16 +945,29 @@ class VoiceInputDaemon:
                     self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
                     if expected_seq_id is None:
                         self._last_trigger_ts = now
-                    cur_seq, win_snap, mode = self.seq_id, self._origin_win, "stop"
+                    win_snap = self._origin_win
+                    stop_hud_stage = self._recompute_state_locked()
+                    mode = "stop"
                 else:
                     return {"ok": True, "state": self.state, "seq_id": self.seq_id}
 
+            if mode == "queue_full":
+                if queue_full_toast:
+                    self._hud("mic_unavailable", clear_main=False)
+                return {"ok": False, "ignored": "queue_full", "state": cur_state, "seq_id": cur_seq}
+
             if mode == "cancel":
                 self._cancel_max_duration_timer()
-                if not eff_silent: self._hud("hide", clear_toast=True)
+                if not eff_silent:
+                    if resume_state == "idle":
+                        self._hud("hide", clear_toast=True)
+                    else:
+                        self._hud(resume_state, clear_toast=True)
                 self.platform.cancel_recording()
-                if not eff_silent: self.platform.beep("error")
-                return {"ok": True, "state": "idle", "seq_id": cur_seq}
+                if not eff_silent:
+                    self.platform.beep("error")
+                return {"ok": True, "state": resume_state, "seq_id": cur_seq}
+
             if mode == "start":
                 self._cancel_max_duration_timer()
                 rec_started = False
@@ -746,7 +995,7 @@ class VoiceInputDaemon:
                         self._hud("recording", clear_toast=True)
                     flush_rec_toast = False
                     with self._lock:
-                        if self.seq_id == cur_seq and self.state == "recording":
+                        if self._recording_active and self._recording_seq_id == cur_seq:
                             self._rec_hud_ready_seq = cur_seq
                             flush_rec_toast = (
                                 self._pending_recovery_toast_seq == cur_seq and not eff_silent
@@ -760,7 +1009,9 @@ class VoiceInputDaemon:
                         win_now = resolver(window)
                     else:
                         win_now = window if (window and (window.title or window.process or window.hwnd)) else self.platform.get_foreground_window()
-                    with self._lock: self._origin_win = win_now
+                    with self._lock:
+                        if self._recording_active and self._recording_seq_id == cur_seq:
+                            self._origin_win = win_now
                     self._arm_max_duration_timer(cur_seq)
                     return {"ok": True, "state": "recording", "seq_id": cur_seq}
                 except Exception as exc:
@@ -776,28 +1027,38 @@ class VoiceInputDaemon:
                     err_hud_state = str(getattr(exc, "hud_state", "no_mic")) if is_mic_err else "error"
                     err_hud_dur = 2200 if err_hud_state == "no_mic" else 0
                     with self._lock:
-                        still_cur = self.seq_id == cur_seq
+                        still_cur = self._recording_active and self._recording_seq_id == cur_seq
                         if still_cur:
-                            self.state = "idle"
+                            self._recording_active = False
+                            self._recording_seq_id = -1
                             self._cur_no_paste, self._cur_silent_hud = False, False
                             self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
                             self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
+                        err_state = self._recompute_state_locked()
                         lr: dict[str, Any] = {"seq_id": cur_seq, "ok": False, "error": err}
                         if err_reason:
                             lr["skipped_reason"] = err_reason
                         self.last_result = lr
                     if still_cur and not eff_silent:
-                        self._hud(err_hud_state, duration_ms=err_hud_dur, clear_main=True)
-                    if not eff_silent: self.platform.beep("error")
-                    out_err: dict[str, Any] = {"ok": False, "error": err, "state": "idle", "seq_id": cur_seq}
+                        if err_state == "idle":
+                            self._hud(err_hud_state, duration_ms=err_hud_dur, clear_main=True)
+                        else:
+                            if rec_started:
+                                self._hud(err_state)
+                            self._hud(err_hud_state, duration_ms=err_hud_dur, clear_main=False)
+                    if not eff_silent:
+                        self.platform.beep("error")
+                    out_err: dict[str, Any] = {"ok": False, "error": err, "state": err_state, "seq_id": cur_seq}
                     if err_reason:
                         out_err["skipped_reason"] = err_reason
                     return out_err
 
             self._cancel_max_duration_timer()
-            if not eff_silent: self._hud("recognizing")
+            if not eff_silent:
+                self._hud(stop_hud_stage)
             try:
                 raw_wav, src_used = self.platform.stop_recording()
+                snap_audio_err = str(getattr(self.platform, "last_audio_error", "") or "")
                 if expected_seq_id is not None:
                     done_ts = self.clock_fn()
                     with self._lock:
@@ -805,7 +1066,8 @@ class VoiceInputDaemon:
                             self._auto_stop_seq = cur_seq
                             self._auto_stop_ts = done_ts
                             self._auto_stop_absorbed = False
-                if not eff_silent: self.platform.beep("stop")
+                if not eff_silent:
+                    self.platform.beep("stop")
             except Exception as exc:
                 err = self._redact(exc)
                 is_mic_err = isinstance(exc, (NoMicrophoneError, MicrophoneUnavailableError))
@@ -813,56 +1075,153 @@ class VoiceInputDaemon:
                 err_hud_state = str(getattr(exc, "hud_state", "no_mic")) if is_mic_err else "error"
                 err_hud_dur = 2200 if err_hud_state == "no_mic" else 0
                 with self._lock:
-                    still_cur = self.seq_id == cur_seq
-                    if still_cur: self.state = "idle"
+                    self._stopping_capture = False
+                    err_stop_state = self._recompute_state_locked()
+                    still_cur = not self._recording_active and self.seq_id == cur_seq
                     lr_stop: dict[str, Any] = {"seq_id": cur_seq, "ok": False, "error": err}
                     if err_reason:
                         lr_stop["skipped_reason"] = err_reason
                     self.last_result = lr_stop
-                if still_cur and not eff_silent:
-                    self._hud(err_hud_state, duration_ms=err_hud_dur, clear_main=True)
-                if not eff_silent: self.platform.beep("error")
-                out_stop_err: dict[str, Any] = {"ok": False, "error": err, "state": "idle", "seq_id": cur_seq}
+                if not eff_silent:
+                    if err_stop_state == "idle":
+                        if still_cur:
+                            self._hud(err_hud_state, duration_ms=err_hud_dur, clear_main=True)
+                    else:
+                        if err_stop_state != stop_hud_stage:
+                            self._hud(err_stop_state)
+                        self._hud(err_hud_state, duration_ms=err_hud_dur, clear_main=False)
+                if not eff_silent:
+                    self.platform.beep("error")
+                out_stop_err: dict[str, Any] = {"ok": False, "error": err, "state": err_stop_state, "seq_id": cur_seq}
                 if err_reason:
                     out_stop_err["skipped_reason"] = err_reason
                 return out_stop_err
-            threading.Thread(
-                target=self._run_bg_pipeline,
-                args=(cur_seq, raw_wav, src_used, win_snap, eff_no_paste, eff_silent, False, rec_cnt, rec_gap),
-                daemon=True,
-            ).start()
-            return {"ok": True, "state": "recognizing", "seq_id": cur_seq}
 
-    def _run_bg_pipeline(
+            task = _QueuedUtterance(
+                seq_id=cur_seq,
+                raw_wav=raw_wav,
+                audio_source=src_used,
+                origin_win=win_snap,
+                no_paste=eff_no_paste,
+                silent_hud=eff_silent,
+                recorder_lost=False,
+                recovery_count=rec_cnt,
+                recovery_gap_ms=rec_gap,
+                audio_error=snap_audio_err,
+            )
+            with self._queue_cv:
+                self._stopping_capture = False
+                self._enqueue_utterance_locked(task)
+                out_state = self._recompute_state_locked()
+            return {"ok": True, "state": out_state, "seq_id": cur_seq}
+
+    def _wait_clipboard_settle(self) -> bool:
+        with self._lock:
+            busy_until = self._clipboard_busy_until
+        rem = busy_until - self.clock_fn()
+        if rem > 0.0:
+            _sleep_cooperative(rem, sleep_fn=self.sleep_fn, is_cancelled=self._stop_evt.is_set)
+            return True
+        return False
+
+    def _deliver_for_utterance(
         self,
-        seq_id: int,
-        raw_wav: bytes,
-        src_used: str,
+        task: _QueuedUtterance,
+        final_text: str,
         origin_win: ForegroundWindow,
-        no_paste: bool = False,
-        silent_hud: bool = False,
-        recorder_lost: bool = False,
-        recovery_count: int = 0,
-        recovery_gap_ms: int = 0,
-    ) -> None:
+    ) -> PasteOutcome:
+        with self._lock:
+            unpasted_snapshot = list(self._batch_unpasted_clips)
+        fallback_txt = "\n\n".join([*unpasted_snapshot, final_text]) if unpasted_snapshot else None
+        preserve_clip = bool(unpasted_snapshot)
+        paste_out = _deliver_with_origin(
+            self.platform,
+            final_text,
+            seq_id=task.seq_id,
+            origin_window=origin_win,
+            fallback_clipboard_text=fallback_txt,
+            preserve_clipboard=preserve_clip,
+            suppress_beep=lambda: self._is_recording_or_stopping() or task.silent_hud,
+            is_cancelled=self._stop_evt.is_set,
+            before_clipboard_write=self._wait_clipboard_settle,
+        )
+        now_done = self.clock_fn()
+        with self._lock:
+            if paste_out.used_clipboard_paste:
+                self._clipboard_busy_until = now_done + self._paste_settle_sec
+            if paste_out.pasted:
+                if paste_out.used_clipboard_paste or paste_out.clipboard:
+                    self._batch_unpasted_clips.clear()
+            elif paste_out.clipboard:
+                self._batch_unpasted_clips.append(final_text)
+        return paste_out
+
+    def _utterance_worker_loop(self) -> None:
+        while True:
+            with self._queue_cv:
+                while not self._stop_evt.is_set() and not self._utterance_queue:
+                    self._queue_cv.wait()
+                if self._stop_evt.is_set():
+                    self._utterance_queue.clear()
+                    self._active_task = None
+                    self._active_bg_stage = ""
+                    self._recompute_state_locked()
+                    return
+                task = self._utterance_queue.popleft()
+                self._active_task = task
+                self._active_bg_stage = "recognizing"
+                self._recompute_state_locked()
+            if not task.silent_hud and not self._stop_evt.is_set():
+                with self._trigger_lock:
+                    emit_recog = False
+                    with self._lock:
+                        if (
+                            not self._stop_evt.is_set()
+                            and self._active_task is task
+                            and not self._recording_active
+                            and not self._stopping_capture
+                            and self.state == "recognizing"
+                            and self._main_hud_state != "recognizing"
+                        ):
+                            emit_recog = True
+                            self._update_main_hud_visibility_locked("recognizing")
+                    if emit_recog:
+                        self._hud("recognizing")
+            self._execute_queued_utterance(task)
+
+    def _execute_queued_utterance(self, task: _QueuedUtterance) -> None:
         hud_st, hud_dur_ms, beep_k = "", 0, ""
         try:
             res = run_pipeline_once(
-                raw_wav, cfg=self.cfg, creds=self.creds, tracker=self.tracker,
-                asr_provider=self.asr_provider, refiner=self.refiner, platform=self.platform,
-                origin_window=origin_win, audio_source=src_used, seq_id=seq_id, dry_run=no_paste,
-                is_current_seq=self.is_current_seq,
-                on_stage=lambda st: self._on_pipeline_stage(seq_id, st, silent_hud),
+                task.raw_wav,
+                cfg=self.cfg,
+                creds=self.creds,
+                tracker=self.tracker,
+                asr_provider=self.asr_provider,
+                refiner=self.refiner,
+                platform=self.platform,
+                origin_window=task.origin_win,
+                audio_source=task.audio_source,
+                seq_id=task.seq_id,
+                dry_run=task.no_paste,
+                is_cancelled=self._stop_evt.is_set,
+                deliver_fn=(
+                    None
+                    if (task.no_paste or self.platform is None)
+                    else (lambda txt, w: self._deliver_for_utterance(task, txt, w))
+                ),
+                on_stage=lambda st: self._on_pipeline_stage(task.seq_id, st, task.silent_hud),
                 runtime_dir=self.runtime_dir,
                 env=self.env,
             )
             summary = self._build_summary(
-                seq_id,
+                task.seq_id,
                 res,
-                dry_run=no_paste,
-                recorder_lost=recorder_lost,
-                recovery_count=recovery_count,
-                recovery_gap_ms=recovery_gap_ms,
+                dry_run=task.no_paste,
+                recorder_lost=task.recorder_lost,
+                recovery_count=task.recovery_count,
+                recovery_gap_ms=task.recovery_gap_ms,
+                audio_error=task.audio_error,
             )
             if res.ok:
                 if res.paste and not res.paste.pasted and not res.paste.clipboard:
@@ -872,7 +1231,7 @@ class VoiceInputDaemon:
                 else:
                     hud_st = "done"
             elif res.skipped_reason in ("too_short", "silence", "empty_audio", "empty_asr"):
-                if recorder_lost:
+                if task.recorder_lost:
                     hud_st, hud_dur_ms, beep_k = "mic_disconnected", 2200, ""
                     summary["skipped_reason"] = "mic_disconnected"
                 else:
@@ -881,39 +1240,81 @@ class VoiceInputDaemon:
                 hud_st, beep_k = "error", "error"
         except Exception as exc:
             hud_st, beep_k = "error", "error"
-            summary = {"seq_id": seq_id, "ok": False, "error": self._redact(exc)}
-            if recorder_lost:
+            summary = {"seq_id": task.seq_id, "ok": False, "error": self._redact(exc)}
+            if task.recorder_lost:
                 summary["capture_interrupted"] = True
-            if recovery_count > 0:
-                summary["recovery_count"] = recovery_count
-                summary["recovery_gap_ms"] = recovery_gap_ms
+            if task.recovery_count > 0:
+                summary["recovery_count"] = task.recovery_count
+                summary["recovery_gap_ms"] = task.recovery_gap_ms
+            if task.audio_error:
+                summary["audio_error"] = self._redact_str(task.audio_error)
             if saved_p := str(getattr(exc, "_saved_audio_path", "") or ""):
                 summary["saved_audio"] = saved_p
-        if recorder_lost and beep_k == "error":
+
+        if task.recorder_lost and beep_k == "error":
             beep_k = ""
-        if not self.is_current_seq(seq_id):
+
+        if self._stop_evt.is_set():
             with self._lock:
-                if seq_id >= int(self.last_result.get("seq_id") or 0):
-                    self.last_result = summary
+                if self._active_task is task:
+                    self._active_task = None
+                    self._active_bg_stage = ""
+                self._recompute_state_locked()
             return
+
         with self._trigger_lock:
-            emit = False
+            hud_calls: list[tuple[str, int, str | None, bool | None]] = []
+            play_beep = ""
             with self._lock:
-                if seq_id >= int(self.last_result.get("seq_id") or 0):
-                    self.last_result = summary
-                if not self._stop_evt.is_set() and self.seq_id == seq_id:
-                    if self.state in ("recognizing", "refining", "processing"):
-                        self.state = "idle"
-                    emit = not silent_hud
-            if emit:
-                if hud_st:
-                    self._hud(
-                        hud_st,
-                        duration_ms=hud_dur_ms,
-                        clear_main=True if is_toast_hud_state(hud_st) else None,
-                    )
-                if beep_k:
-                    self.platform.beep(beep_k)
+                self.last_result = summary
+                prev_state = self.state
+                if self._active_task is task:
+                    self._active_task = None
+                    self._active_bg_stage = ""
+                has_more = bool(self._utterance_queue)
+                rec_active = self._recording_active or self._stopping_capture
+                new_state = self._recompute_state_locked()
+                if not self._stop_evt.is_set():
+                    if task.silent_hud:
+                        if not rec_active and not has_more and self._main_hud_visible:
+                            hud_calls.append(("hide", 0, None, None))
+                    elif rec_active:
+                        if hud_st == "copied":
+                            hud_calls.append(("copied", hud_dur_ms, "toast", False))
+                        elif hud_st and is_toast_hud_state(hud_st):
+                            hud_calls.append((hud_st, hud_dur_ms, None, False))
+                    elif has_more and not self._utterance_queue[0].silent_hud:
+                        if new_state == "recognizing" and self._main_hud_state != "recognizing":
+                            hud_calls.append(("recognizing", 0, None, None))
+                        if hud_st == "copied":
+                            hud_calls.append(("copied", hud_dur_ms, "toast", False))
+                        elif hud_st and is_toast_hud_state(hud_st):
+                            hud_calls.append((hud_st, hud_dur_ms, None, False))
+                        play_beep = beep_k
+                    else:
+                        if hud_st:
+                            hud_calls.append(
+                                (
+                                    hud_st,
+                                    hud_dur_ms,
+                                    None,
+                                    True if is_toast_hud_state(hud_st) else None,
+                                )
+                            )
+                        elif self._main_hud_visible:
+                            hud_calls.append(("hide", 0, None, None))
+                        play_beep = beep_k
+                    for st_n, _, lyr_n, clr_m_n in hud_calls:
+                        self._update_main_hud_visibility_locked(st_n, layer=lyr_n, clear_main=clr_m_n)
+            for st_name, dur_val, lyr_val, clr_main_val in hud_calls:
+                self._hud(
+                    st_name,
+                    duration_ms=dur_val,
+                    layer=lyr_val,
+                    clear_main=clr_main_val,
+                )
+            if play_beep:
+                self.platform.beep(play_beep)
 
     def handle_control(self, req: Mapping[str, Any]) -> dict[str, Any]:
         cmd = str(req.get("cmd") or "status")
@@ -928,6 +1329,7 @@ class VoiceInputDaemon:
                     "pid": os.getpid(),
                     "state": self.state,
                     "seq_id": self.seq_id,
+                    "pending_count": self._inflight_or_queued_count_locked(),
                     "asr_provider": select_asr_provider(self.cfg, self.creds),
                     "refiner_provider": self.cfg.refiner.provider,
                     "shim_ok": shim_ok,
@@ -965,13 +1367,32 @@ class VoiceInputDaemon:
                 self.seq_id += 1
                 cur_seq = self.seq_id
             win = _window_from_mapping(req)
-            res = run_pipeline_once(wav_path, cfg=self.cfg, creds=self.creds, tracker=self.tracker, asr_provider=self.asr_provider, refiner=self.refiner, platform=self.platform, origin_window=win, audio_source="selftest_wav", seq_id=cur_seq, dry_run=True, env=self.env)
-            summary = self._build_summary(cur_seq, res, dry_run=True)
+            res = run_pipeline_once(
+                wav_path,
+                cfg=self.cfg,
+                creds=self.creds,
+                tracker=self.tracker,
+                asr_provider=self.asr_provider,
+                refiner=self.refiner,
+                platform=self.platform,
+                origin_window=win,
+                audio_source="selftest_wav",
+                seq_id=cur_seq,
+                dry_run=True,
+                runtime_dir=self.runtime_dir,
+                env=self.env,
+            )
+            summary = self._build_summary(cur_seq, res, dry_run=True, audio_error="")
             with self._lock:
                 self.last_result = summary
             return {"ok": res.ok, "seq_id": cur_seq, "skipped_reason": res.skipped_reason, "asr_text": res.asr.text if res.asr else "", "final_text": res.final_text, "summary": summary}
         if cmd == "shutdown":
-            self._stop_evt.set(); self._cancel_max_duration_timer(); return {"ok": True, "stopping": True}
+            self._stop_evt.set()
+            self._cancel_max_duration_timer()
+            with self._queue_cv:
+                self._utterance_queue.clear()
+                self._queue_cv.notify_all()
+            return {"ok": True, "stopping": True}
         return {"ok": False, "error": f"unknown cmd: {cmd}"}
 
     def serve_forever(self) -> None:
@@ -1006,9 +1427,18 @@ class VoiceInputDaemon:
     def close(self) -> None:
         self._stop_evt.set()
         self._cancel_max_duration_timer()
+        worker: threading.Thread | None = None
+        with self._queue_cv:
+            self._utterance_queue.clear()
+            self._batch_unpasted_clips.clear()
+            worker = self._worker_thread
+            self._queue_cv.notify_all()
         if self._srv_sock is not None:
             try: self._srv_sock.close()
             except OSError: pass
             self._srv_sock = None
         self.sock_path.unlink(missing_ok=True); self.pid_path.unlink(missing_ok=True)
-        self.platform.close(); self.refiner.close()
+        self.refiner.close()
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=1.5)
+        self.platform.close()

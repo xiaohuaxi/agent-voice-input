@@ -14,6 +14,7 @@ from ._tmux import (
     probe_tmux_snapshot,
     resolve_tmux_bin,
 )
+from .asr_providers import _sleep_cooperative
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, ensure_secure_dir, expand_user_path, get_runtime_dir, redact_secrets
 from .hud import resolve_ui_language
@@ -24,6 +25,7 @@ from .platform_wsl import (
     MicrophoneUnavailableError,
     NoMicrophoneError,
     PasteOutcome,
+    _callable_accepts_kwarg,
     invoke_recorder_lost_callback,
     invoke_recorder_recovered_callback,
     stream_key_test_proc,
@@ -706,6 +708,7 @@ class MacOSPlatform(JsonlShimMixin):
         self._rec_gen: int = 0
         self._cur_session: _MacRecSession | None = None
         self._busy_wait_timeout_sec: float = 4.0
+        self._paste_hold_timeout_sec: float | None = None
         self.last_audio_error = ""
         self._init_shim_bridge()
 
@@ -1842,43 +1845,116 @@ class MacOSPlatform(JsonlShimMixin):
             return "tmux"
         return "tmux_paste_failed" if orig_pane else ""
 
-    def _deliver_to_ghostty_surface(self, text: str, surface_id: str, clip_ok: bool) -> PasteOutcome:
-        p = self._run_osascript(["-e", _GHOSTTY_INPUT_SCRIPT, "--", surface_id, text], timeout=2.5)
-        if p is None:
-            if clip_ok:
-                self.beep("focus")
-            return PasteOutcome(False, clip_ok, "osascript_unavailable" if clip_ok else "clipboard_failed", "Ghostty")
-        if p.returncode != 0:
-            if clip_ok:
-                self.beep("focus")
-            reason = _summarize_osascript_error(p.stderr or "", kind="ghostty") if clip_ok else "clipboard_failed"
-            return PasteOutcome(False, clip_ok, reason, "Ghostty")
-        verdict = p.stdout.strip()
-        if verdict == "ok":
-            return PasteOutcome(True, clip_ok, "ok", "Ghostty")
-        cur_proc = self._query_frontmost_process_and_title()[0] if verdict == "not_frontmost" else "Ghostty"
-        if clip_ok:
-            self.beep("focus")
-        return PasteOutcome(False, clip_ok, "focus_changed" if clip_ok else "clipboard_failed", cur_proc)
+    def _effective_paste_hold_timeout_sec(self) -> float:
+        if self._paste_hold_timeout_sec is not None:
+            return max(0.0, float(self._paste_hold_timeout_sec))
+        return max(15.0, float(self.cfg.audio.max_duration_sec) + 2.0)
 
-    def deliver_text(
-        self, text: str, seq_id: int, target_hwnd: int = 0, *, origin_window: ForegroundWindow | None = None
-    ) -> PasteOutcome:
-        clip_ok = self._copy_to_clipboard(text)
-        if origin_window is not None and origin_window.surface_id:
-            return self._deliver_to_ghostty_surface(text, origin_window.surface_id, clip_ok)
+    def _query_shim_key_state(self) -> bool | None:
+        if not self._has_managed_shim():
+            return None
+        try:
+            if _callable_accepts_kwarg(self._shim_rpc, "allow_retry"):
+                res = self._shim_rpc({"cmd": "key_state"}, timeout_sec=0.8, allow_retry=False)
+            else:
+                res = self._shim_rpc({"cmd": "key_state"}, timeout_sec=0.8)
+        except Exception:
+            return None
+        if not isinstance(res, dict) or res.get("ok") is not True:
+            return None
+        return bool(res.get("hotkey_held"))
+
+    def _query_paste_foreground_window(self) -> ForegroundWindow:
         fg = self.get_foreground_window()
         if (
             "get_foreground_window" in self.__dict__
             or type(self).get_foreground_window is not MacOSPlatform.get_foreground_window
         ) and not fg.tmux_pane:
             fg = self._enrich_window_tmux_target(fg)
-        if origin_window is None and fg.surface_id and is_ghostty_app(fg.process, fg.bundle_id):
-            return self._deliver_to_ghostty_surface(text, fg.surface_id, clip_ok)
-        if self._is_focus_drifted(origin_window, fg) or ((fg.process or fg.bundle_id) and not self.is_allowed_terminal(fg)):
-            if clip_ok:
+        return fg
+
+    def _deliver_to_ghostty_surface(
+        self,
+        text: str,
+        surface_id: str,
+        *,
+        on_direct_success: Callable[[str, str], PasteOutcome],
+        on_fallback: Callable[[str, str], PasteOutcome],
+    ) -> PasteOutcome:
+        p = self._run_osascript(["-e", _GHOSTTY_INPUT_SCRIPT, "--", surface_id, text], timeout=2.5)
+        if p is None:
+            return on_fallback("osascript_unavailable", "Ghostty")
+        if p.returncode != 0:
+            err_reason = _summarize_osascript_error(p.stderr or "", kind="ghostty")
+            return on_fallback(err_reason, "Ghostty")
+        verdict = p.stdout.strip()
+        if verdict == "ok":
+            return on_direct_success("ok", "Ghostty")
+        cur_proc = self._query_frontmost_process_and_title()[0] if verdict == "not_frontmost" else "Ghostty"
+        return on_fallback("focus_changed", cur_proc)
+
+    def deliver_text(
+        self,
+        text: str,
+        seq_id: int,
+        target_hwnd: int = 0,
+        *,
+        origin_window: ForegroundWindow | None = None,
+        fallback_clipboard_text: str | None = None,
+        preserve_clipboard: bool = False,
+        suppress_beep: bool | Callable[[], bool] = False,
+        is_cancelled: Callable[[], bool] | None = None,
+        before_clipboard_write: Callable[[], None] | None = None,
+    ) -> PasteOutcome:
+        del target_hwnd
+        cancelled_fn = lambda: bool(is_cancelled is not None and is_cancelled())
+        if cancelled_fn():
+            return PasteOutcome(False, False, "cancelled", "")
+
+        def _is_beep_suppressed() -> bool:
+            return bool(suppress_beep() if callable(suppress_beep) else suppress_beep)
+
+        def _write_clip(payload_txt: str, *, skip_settle: bool = False) -> bool:
+            if before_clipboard_write is not None and not skip_settle:
+                before_clipboard_write()
+            return self._copy_to_clipboard(payload_txt)
+
+        def _fallback_to_clipboard(reason_if_ok: str, fg_proc: str, *, skip_settle: bool = False) -> PasteOutcome:
+            fb_txt = fallback_clipboard_text if fallback_clipboard_text is not None else text
+            clip_ok = _write_clip(fb_txt, skip_settle=skip_settle)
+            if clip_ok and not _is_beep_suppressed():
                 self.beep("focus")
-            return PasteOutcome(False, clip_ok, "focus_changed" if clip_ok else "clipboard_failed", fg.process)
+            return PasteOutcome(
+                False,
+                clip_ok,
+                reason_if_ok if clip_ok else "clipboard_failed",
+                fg_proc,
+                used_clipboard_paste=False,
+            )
+
+        def _direct_success(reason_ok: str, fg_proc: str) -> PasteOutcome:
+            if preserve_clipboard:
+                return PasteOutcome(True, False, reason_ok, fg_proc, used_clipboard_paste=False)
+            clip_ok = _write_clip(text)
+            return PasteOutcome(True, clip_ok, reason_ok, fg_proc, used_clipboard_paste=False)
+
+        if origin_window is not None and origin_window.surface_id:
+            return self._deliver_to_ghostty_surface(
+                text,
+                origin_window.surface_id,
+                on_direct_success=_direct_success,
+                on_fallback=_fallback_to_clipboard,
+            )
+        fg = self._query_paste_foreground_window()
+        if origin_window is None and fg.surface_id and is_ghostty_app(fg.process, fg.bundle_id):
+            return self._deliver_to_ghostty_surface(
+                text,
+                fg.surface_id,
+                on_direct_success=_direct_success,
+                on_fallback=_fallback_to_clipboard,
+            )
+        if self._is_focus_drifted(origin_window, fg) or ((fg.process or fg.bundle_id) and not self.is_allowed_terminal(fg)):
+            return _fallback_to_clipboard("focus_changed", fg.process)
         if self.env.get("TMUX") and (tmux_exe := self._resolve_tmux_exe()):
             eff_sock = ""
             target_p = ""
@@ -1893,9 +1969,7 @@ class MacOSPlatform(JsonlShimMixin):
                         and not _same_tmux_server(origin_window.tmux_socket, cur_sock)
                     )
                 ):
-                    if clip_ok:
-                        self.beep("focus")
-                    return PasteOutcome(False, clip_ok, "focus_changed" if clip_ok else "clipboard_failed", fg.process)
+                    return _fallback_to_clipboard("focus_changed", fg.process)
                 eff_sock = cur_sock or origin_window.tmux_socket
                 target_p = origin_window.tmux_pane
             cmd_prefix = [tmux_exe]
@@ -1907,11 +1981,9 @@ class MacOSPlatform(JsonlShimMixin):
                 else {k: v for k, v in self.env.items() if k != "TMUX_PANE"}
             )
             if self._deliver_via_tmux_buffer(cmd_prefix, text, seq_id=seq_id, target_pane=target_p, tmux_env=tmux_env):
-                return PasteOutcome(True, clip_ok, "tmux", fg.process)
+                return _direct_success("tmux", fg.process)
             if target_p:
-                if clip_ok:
-                    self.beep("focus")
-                return PasteOutcome(False, clip_ok, "tmux_paste_failed" if clip_ok else "clipboard_failed", fg.process)
+                return _fallback_to_clipboard("tmux_paste_failed", fg.process)
         eff_tty = normalize_tty_path(fg.tty)
         if eff_tty or fg.pid > 1 or (origin_window is not None and origin_window.tmux_pane):
             tmux_out = self._try_deliver_attached_tmux(
@@ -1923,16 +1995,57 @@ class MacOSPlatform(JsonlShimMixin):
                 origin_window=origin_window,
             )
             if tmux_out == "tmux":
-                return PasteOutcome(True, clip_ok, "tmux", fg.process)
+                return _direct_success("tmux", fg.process)
             if tmux_out in ("focus_changed", "tmux_paste_failed"):
-                if clip_ok:
-                    self.beep("focus")
-                return PasteOutcome(False, clip_ok, tmux_out if clip_ok else "clipboard_failed", fg.process)
+                return _fallback_to_clipboard(tmux_out, fg.process)
+
+        waited_for_settle = False
+        if before_clipboard_write is not None:
+            t_settle0 = time.monotonic()
+            settle_ret = before_clipboard_write()
+            waited_for_settle = bool(settle_ret) or (time.monotonic() - t_settle0) >= 0.001
+        if cancelled_fn():
+            return PasteOutcome(False, False, "cancelled", fg.process)
+
+        waited_for_key = False
+        if self._has_managed_shim():
+            hold_deadline = time.monotonic() + self._effective_paste_hold_timeout_sec()
+            while True:
+                if cancelled_fn():
+                    return PasteOutcome(False, False, "cancelled", fg.process)
+                if not self._has_managed_shim():
+                    return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                key_state = self._query_shim_key_state()
+                if cancelled_fn():
+                    return PasteOutcome(False, False, "cancelled", fg.process)
+                if key_state is False:
+                    break
+                if not self._has_managed_shim():
+                    return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                rem = hold_deadline - time.monotonic()
+                if rem <= 0.0:
+                    return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                waited_for_key = True
+                _sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
+
+        if cancelled_fn():
+            return PasteOutcome(False, False, "cancelled", fg.process)
+        if waited_for_settle or waited_for_key:
+            fg = self._query_paste_foreground_window()
+            if self._is_focus_drifted(origin_window, fg) or ((fg.process or fg.bundle_id) and not self.is_allowed_terminal(fg)):
+                return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+
+        clip_ok = self._copy_to_clipboard(text)
         if not clip_ok:
             return PasteOutcome(False, False, "clipboard_failed", fg.process)
         p = self._run_osascript(["-e", _CMD_V_SCRIPT], timeout=2.5)
         if p is not None and p.returncode == 0:
-            return PasteOutcome(True, True, "ok", fg.process)
-        self.beep("focus")
+            return PasteOutcome(True, True, "ok", fg.process, used_clipboard_paste=True)
+        if fallback_clipboard_text is not None and fallback_clipboard_text != text:
+            clip_ok = self._copy_to_clipboard(fallback_clipboard_text)
+        if not clip_ok:
+            return PasteOutcome(False, False, "clipboard_failed", fg.process, used_clipboard_paste=False)
+        if not _is_beep_suppressed():
+            self.beep("focus")
         reason = "osascript_unavailable" if p is None else _summarize_osascript_error(p.stderr or "", kind="system_events")
-        return PasteOutcome(False, True, reason, fg.process)
+        return PasteOutcome(False, True, reason, fg.process, used_clipboard_paste=False)

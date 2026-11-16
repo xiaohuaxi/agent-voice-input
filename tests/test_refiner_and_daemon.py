@@ -122,6 +122,7 @@ class _FakePlatform:
         self.fg = ForegroundWindow(hwnd=101, process="WindowsTerminal", title="codex [#abcd1234]")
         self.beeps: list[str] = []
         self.huds: list[str] = []
+        self.hud_events: list[dict[str, object]] = []
         self.deliveries: list[tuple[str, int, int]] = []
         self.canceled = 0
         self.switched = 0
@@ -136,8 +137,9 @@ class _FakePlatform:
     def beep(self, kind: str) -> None:
         self.beeps.append(kind)
 
-    def hud(self, state: str, text: str = "", duration_ms: int = 0) -> None:
+    def hud(self, state: str, text: str = "", duration_ms: int = 0, **kw: object) -> None:
         self.huds.append(state)
+        self.hud_events.append({"state": state, "duration_ms": duration_ms, **kw})
 
     def start_recording(self, runtime_dir: Path) -> None:
         return None
@@ -316,6 +318,16 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertNotIn("[Console]::Beep", shim)
         self.assertNotIn("QueueUserWorkItem", shim)
         self.assertNotIn("GetText", shim)  # never saves/restores old clipboard
+        self.assertIn("IsAnyPasteBlockingKeyDown", shim)
+        self.assertIn("hotkey_held", shim)
+        self.assertIn("force_clipboard_only", shim)
+        self.assertIn("Set-ClipboardSafe", shim)
+        self.assertIn("if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }", shim)
+        self.assertIn('if ($clipOk) { "send_input_failed" } else { "clipboard_failed" }', shim)
+        self.assertNotIn("$fbOk", shim)
+        send_ctrl_v_block = shim.split("public static bool SendCtrlV()", 1)[1].split("private static void InitWaveTable()", 1)[0]
+        self.assertNotIn("Thread.Sleep", send_ctrl_v_block)
+        self.assertNotIn("Start-Sleep", shim.split('elseif ($op -eq "paste")', 1)[1])
 
 
 class RefinerProtocolAndFallbackTests(unittest.TestCase):
@@ -868,16 +880,48 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
 
     def test_debounce_ptt_cancel_superseded_seq_and_focus_changed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
+            # Explicit run_pipeline_once cancellation hooks (is_current_seq / is_cancelled) remain honored
+            plat_direct = _FakePlatform()
+            res_sup_seq = run_pipeline_once(
+                _voiced_wav(),
+                cfg=Config(refiner=RefinerConfig(provider="off")),
+                platform=plat_direct,
+                asr_provider=_FakeAsr("外部淘汰"),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(Path(td)),
+                seq_id=7,
+                is_current_seq=lambda _s: False,
+                env={},
+            )
+            self.assertFalse(res_sup_seq.ok)
+            self.assertEqual(res_sup_seq.skipped_reason, "superseded")
+            res_sup_cancel = run_pipeline_once(
+                _voiced_wav(),
+                cfg=Config(refiner=RefinerConfig(provider="off")),
+                platform=plat_direct,
+                asr_provider=_FakeAsr("显式取消"),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(Path(td)),
+                seq_id=8,
+                is_cancelled=lambda: True,
+                env={},
+            )
+            self.assertFalse(res_sup_cancel.ok)
+            self.assertEqual(res_sup_cancel.skipped_reason, "superseded")
+            self.assertEqual(plat_direct.deliveries, [])
+
             now = [10.0]
             gate_evt = threading.Event()
             plat = _FakePlatform(paste_outcome=PasteOutcome(False, True, "focus_changed", "chrome"))
+            cfg_d = Config(refiner=RefinerConfig(provider="off"))
+            cfg_d.audio.beep = True
             daemon = VoiceInputDaemon(
-                Config(refiner=RefinerConfig(provider="off")),
+                cfg_d,
                 env={},
                 runtime_dir=Path(td),
                 platform=plat,
-                asr_provider=_FakeAsr("旧轮次语音", gate_evt=gate_evt),
-                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                asr_provider=_FakeAsr("前序口述不淘汰", gate_evt=gate_evt),
+                refiner=create_refiner(cfg_d),
                 tracker=_isolated_tracker(Path(td)),
                 clock_fn=lambda: now[0],
             )
@@ -896,28 +940,36 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             r2 = daemon.handle_trigger("toggle")
             self.assertEqual(r2["state"], "recognizing")
             seq1 = r2["seq_id"]
+            self.assertEqual(daemon.handle_control({"cmd": "status"})["pending_count"], 1)
 
-            # User starts a new recording while seq 1 is still in flight -> increments seq_id to 2, superseding seq 1!
+            # User starts a new recording while seq 1 is still in flight -> seq 1 is NOT superseded!
             now[0] += 0.5
             r3 = daemon.handle_trigger("ptt_start")
             self.assertEqual(r3["state"], "recording")
             self.assertGreater(r3["seq_id"], seq1)
 
-            # Release seq 1 ASR; it must NOT call deliver_text because seq_id has advanced
+            # Release seq 1 ASR while seq 2 is recording: seq 1 delivers (focus_changed -> copied on toast layer)
             gate_evt.set()
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline and daemon.last_result.get("seq_id") != seq1:
                 time.sleep(0.02)
-            self.assertEqual(daemon.last_result.get("skipped_reason"), "superseded")
-            self.assertEqual(len(plat.deliveries), 0)
+            self.assertTrue(daemon.last_result["ok"])
+            self.assertEqual(daemon.last_result.get("skipped_reason"), "")
+            self.assertEqual(len(plat.deliveries), 1)
+            self.assertEqual(plat.deliveries[0][0], "前序口述不淘汰")
+            self.assertEqual(daemon.state, "recording")
+            copied_during_rec = [e for e in plat.hud_events if e["state"] == "copied"]
+            self.assertEqual(len(copied_during_rec), 1)
+            self.assertEqual(copied_during_rec[0].get("layer"), "toast")
+            self.assertIs(copied_during_rec[0].get("clear_main"), False)
 
-            # Cancel current PTT recording via chord taint
+            # Cancel current PTT recording via chord taint -> only cancels seq 2, drains back to idle
             now[0] += 0.3
             rc = daemon.handle_trigger("ptt_cancel")
             self.assertEqual(rc["state"], "idle")
             self.assertEqual(plat.canceled, 1)
 
-            # Normal cycle with focus_changed (browser active): clipboard=True, pasted=False
+            # Normal cycle with focus_changed when idle: main capsule 'copied'
             now[0] += 0.5
             daemon.handle_trigger("toggle")
             now[0] += 0.5
@@ -929,8 +981,10 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertTrue(daemon.last_result["ok"])
             self.assertFalse(daemon.last_result["pasted"])
             self.assertEqual(daemon.last_result["paste_reason"], "focus_changed")
-            # Superseded seq 1 must NOT emit a stale HUD state overwriting seq 2's 'recording'
-            self.assertEqual(plat.huds, ["recording", "recognizing", "recording", "hide", "recording", "recognizing", "copied"])
+            self.assertEqual(
+                plat.huds,
+                ["recording", "recognizing", "recording", "copied", "hide", "recording", "recognizing", "copied"],
+            )
             daemon.close()
 
     def test_max_duration_sec_auto_stop_early_cancel_and_expected_seq_guard(self) -> None:
@@ -1797,7 +1851,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         self.assertIn("Invalid API key", str(cm_ab.exception))
         reset_rate_limit_pacers()
 
-        # 3. Superseded empty/error Stage 1 must NOT emit stale 'refining'/'empty' HUD or error beep during seq 2 recording
+        # 3. Empty Stage 1 finishing during seq 2 recording keeps main HUD on 'recording' (clear_main=False) & suppresses error beep
         sup_asr_in = threading.Event()
         sup_asr_rel = threading.Event()
 
@@ -1839,9 +1893,13 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline and daemon_sup.last_result.get("seq_id") != r_s1["seq_id"]:
                     time.sleep(0.02)
+                self.assertEqual(daemon_sup.last_result.get("skipped_reason"), "empty_asr")
                 self.assertEqual(daemon_sup.state, "recording")
-                self.assertEqual(plat_sup.huds, huds_before)
+                self.assertEqual(plat_sup.huds, [*huds_before, "empty"])
+                self.assertIs(plat_sup.hud_events[-1].get("clear_main"), False)
                 self.assertEqual(plat_sup.beeps, beeps_before)
+                daemon_sup._last_trigger_ts = -1e9
+                daemon_sup.handle_trigger("ptt_cancel")
             finally:
                 daemon_sup.close()
 
@@ -3452,6 +3510,1019 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 rc_st_to = cli_mod.main(["status"])
             self.assertEqual(rc_st_to, 1)
             self.assertEqual(json.loads(st_to_out.getvalue()), {"ok": False, "state": "stopped"})
+
+
+class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
+    def test_serial_multi_utterance_fifo_no_separator_and_ptt_cancel_resumes_bg_stage(self) -> None:
+        from agent_voice_input.refiner import BaseRefiner
+
+        order_lock = threading.Lock()
+        events: list[str] = []
+        inflight = [0]
+        max_inflight = [0]
+        seg1_asr_entered = threading.Event()
+        seg1_asr_release = threading.Event()
+        seg4_refine_entered = threading.Event()
+        seg4_refine_release = threading.Event()
+
+        class _OrderedAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self._idx = 0
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                with order_lock:
+                    self._idx += 1
+                    idx = self._idx
+                    inflight[0] += 1
+                    max_inflight[0] = max(max_inflight[0], inflight[0])
+                    events.append(f"asr_start:{idx}")
+                try:
+                    if idx == 1:
+                        seg1_asr_entered.set()
+                        seg1_asr_release.wait(timeout=3.0)
+                    txt = f"第{idx}段原话"
+                    with order_lock:
+                        events.append(f"asr_end:{idx}")
+                    return AsrResult(text=txt, provider="dashscope", model="qwen3-asr-flash", latency_ms=8)
+                finally:
+                    with order_lock:
+                        inflight[0] -= 1
+
+        class _OrderedRefiner(BaseRefiner):
+            provider_name = "codex"
+
+            def __init__(self) -> None:
+                self._idx = 0
+
+            def refine(self, asr_input: object, **_kw: object) -> RefinerResult:
+                raw = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                with order_lock:
+                    self._idx += 1
+                    idx = self._idx
+                    inflight[0] += 1
+                    max_inflight[0] = max(max_inflight[0], inflight[0])
+                    events.append(f"refine_start:{idx}")
+                try:
+                    if idx == 4:
+                        seg4_refine_entered.set()
+                        seg4_refine_release.wait(timeout=3.0)
+                    out = f"精修:{raw}"
+                    with order_lock:
+                        events.append(f"refine_end:{idx}")
+                    return RefinerResult(text=out, provider="codex", model="gpt-6-luna", latency_ms=10)
+                finally:
+                    with order_lock:
+                        inflight[0] -= 1
+
+        class _SerialPlat(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.pasted_texts: list[str] = []
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                origin_window: ForegroundWindow | None = None,
+                fallback_clipboard_text: str | None = None,
+                preserve_clipboard: bool = False,
+                suppress_beep: object = False,
+                is_cancelled: object = None,
+                before_clipboard_write: object = None,
+            ) -> PasteOutcome:
+                if callable(before_clipboard_write):
+                    before_clipboard_write()
+                with order_lock:
+                    events.append(f"deliver:{text}")
+                self.pasted_texts.append(text)
+                self.deliveries.append((text, seq_id, target_hwnd))
+                return PasteOutcome(True, True, "ok", "WindowsTerminal", used_clipboard_paste=True)
+
+        with tempfile.TemporaryDirectory() as td:
+            plat = _SerialPlat()
+            cfg = Config(refiner=RefinerConfig(provider="codex"))
+            cfg.audio.beep = True
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=Path(td),
+                platform=plat,
+                asr_provider=_OrderedAsr(),
+                refiner=_OrderedRefiner(),
+                tracker=_isolated_tracker(Path(td)),
+                paste_settle_sec=0.0,
+            )
+            try:
+                # Start & stop segment 1 -> enters ASR and blocks
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                s1 = daemon.handle_trigger("toggle")
+                self.assertTrue(seg1_asr_entered.wait(timeout=2.0))
+                self.assertEqual(daemon.handle_control({"cmd": "status"})["pending_count"], 1)
+
+                # While segment 1 is still in ASR, record & finish segment 2 and segment 3
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                self.assertEqual(daemon.state, "recording")
+                daemon._last_trigger_ts = -1e9
+                s2 = daemon.handle_trigger("toggle")
+                self.assertEqual(s2["state"], "recognizing")
+                self.assertEqual(daemon.handle_control({"cmd": "status"})["pending_count"], 2)
+
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                s3 = daemon.handle_trigger("toggle")
+                st_snap = daemon.handle_control({"cmd": "status"})
+                self.assertEqual(st_snap["pending_count"], 3)
+                self.assertNotIn("第1段", json.dumps(st_snap, ensure_ascii=False))
+
+                # Release segment 1 -> worker drains 1 -> 2 -> 3 strictly serially with zero concurrency
+                seg1_asr_release.set()
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != s3["seq_id"]:
+                    time.sleep(0.02)
+
+                self.assertEqual(max_inflight[0], 1)
+                self.assertEqual(
+                    events,
+                    [
+                        "asr_start:1",
+                        "asr_end:1",
+                        "refine_start:1",
+                        "refine_end:1",
+                        "deliver:精修:第1段原话",
+                        "asr_start:2",
+                        "asr_end:2",
+                        "refine_start:2",
+                        "refine_end:2",
+                        "deliver:精修:第2段原话",
+                        "asr_start:3",
+                        "asr_end:3",
+                        "refine_start:3",
+                        "refine_end:3",
+                        "deliver:精修:第3段原话",
+                    ],
+                )
+                # Exact text without any extra newlines or separators injected
+                self.assertEqual(
+                    plat.pasted_texts,
+                    ["精修:第1段原话", "精修:第2段原话", "精修:第3段原话"],
+                )
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(daemon.handle_control({"cmd": "status"})["pending_count"], 0)
+
+                # Segment 4 blocks in refining; starting & cancelling segment 5 via ptt_cancel
+                # restores main HUD to 'refining' (not 'idle'/'hide') and never drops segment 4!
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("ptt_start")
+                daemon._last_trigger_ts = -1e9
+                s4 = daemon.handle_trigger("ptt_stop")
+                self.assertTrue(seg4_refine_entered.wait(timeout=2.0))
+                self.assertEqual(daemon.state, "refining")
+
+                daemon._last_trigger_ts = -1e9
+                r_s5 = daemon.handle_trigger("ptt_start")
+                self.assertEqual(r_s5["state"], "recording")
+                daemon._last_trigger_ts = -1e9
+                r_cancel = daemon.handle_trigger("ptt_cancel")
+                self.assertEqual(r_cancel["state"], "refining")
+                self.assertEqual(daemon.state, "refining")
+                self.assertEqual(plat.hud_events[-1]["state"], "refining")
+                self.assertIs(plat.hud_events[-1].get("clear_toast"), True)
+
+                seg4_refine_release.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != s4["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(plat.pasted_texts[-1], "精修:第4段原话")
+                self.assertEqual(daemon.state, "idle")
+            finally:
+                daemon.close()
+
+    def test_clipboard_settle_pacing_sleeps_only_before_clipboard_write(self) -> None:
+        from agent_voice_input.refiner import BaseRefiner
+
+        now = [100.0]
+        timeline: list[tuple[str, float]] = []
+
+        def fake_sleep(sec: float) -> None:
+            timeline.append(("sleep", round(sec, 4)))
+            now[0] += sec
+
+        class _TimedAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.n = 0
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                self.n += 1
+                timeline.append((f"asr:{self.n}", round(now[0], 4)))
+                if self.n == 2:
+                    now[0] += 0.03
+                return AsrResult(text=f"段{self.n}", provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
+
+        class _TimedRefiner(BaseRefiner):
+            provider_name = "codex"
+
+            def __init__(self) -> None:
+                self.n = 0
+
+            def refine(self, asr_input: object, **_kw: object) -> RefinerResult:
+                self.n += 1
+                raw = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                timeline.append((f"refine:{self.n}", round(now[0], 4)))
+                if self.n == 2:
+                    now[0] += 0.02
+                return RefinerResult(text=raw, provider="codex", model="gpt-6-luna", latency_ms=5)
+
+        class _SettlePlat(_FakePlatform):
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                before_clipboard_write: object = None,
+                **_kw: object,
+            ) -> PasteOutcome:
+                timeline.append((f"enter_deliver:{text}", round(now[0], 4)))
+                if callable(before_clipboard_write):
+                    before_clipboard_write()
+                timeline.append((f"write_clipboard:{text}", round(now[0], 4)))
+                return PasteOutcome(True, True, "ok", "WindowsTerminal", used_clipboard_paste=True)
+
+        with tempfile.TemporaryDirectory() as td:
+            plat = _SettlePlat()
+            daemon = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="codex")),
+                env={},
+                runtime_dir=Path(td),
+                platform=plat,
+                asr_provider=_TimedAsr(),
+                refiner=_TimedRefiner(),
+                tracker=_isolated_tracker(Path(td)),
+                clock_fn=lambda: now[0],
+                sleep_fn=fake_sleep,
+                paste_settle_sec=0.15,
+            )
+            try:
+                # Enqueue segment 1 and segment 2 back-to-back at t=100.0
+                daemon.handle_trigger("toggle")
+                now[0] += 0.25
+                daemon.handle_trigger("toggle")
+                now[0] += 0.25
+                daemon.handle_trigger("toggle")
+                now[0] += 0.25
+                s2 = daemon.handle_trigger("toggle")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != s2["seq_id"]:
+                    time.sleep(0.01)
+
+                names = [ev for ev, _ in timeline]
+                # Zero sleep before asr:2 or refine:2; sleep happens strictly inside deliver_text before write_clipboard:段2!
+                idx_asr2 = names.index("asr:2")
+                idx_ref2 = names.index("refine:2")
+                idx_ent2 = names.index("enter_deliver:段2")
+                idx_w2 = names.index("write_clipboard:段2")
+                self.assertNotIn("sleep", names[:idx_ent2 + 1])
+                sleeps_between = [val for ev, val in timeline[idx_ent2:idx_w2] if ev == "sleep"]
+                self.assertGreater(len(sleeps_between), 0)
+                # Total settle sleep equals remaining delta 0.15 - (0.03 + 0.02) = 0.10s
+                self.assertAlmostEqual(sum(sleeps_between), 0.10, places=3)
+                t_w1 = dict(timeline)["write_clipboard:段1"]
+                t_w2 = dict(timeline)["write_clipboard:段2"]
+                self.assertAlmostEqual(t_w2 - t_w1, 0.15, places=3)
+                self.assertLess(idx_asr2, idx_ref2)
+            finally:
+                daemon.close()
+
+    def test_focus_drift_clipboard_double_newline_concat_no_transient_overwrite_and_idle_reset(self) -> None:
+        asr_texts = iter(["第一段", "免贴不污染", "第二段", "第三段自动贴", "甲段", "乙段", "新一轮独立口述"])
+        seg1_gate = threading.Event()
+
+        class _SeqAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                pass
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                txt = next(asr_texts)
+                if txt == "第一段":
+                    seg1_gate.wait(timeout=2.0)
+                return AsrResult(text=txt, provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
+
+        class _ClipPlat(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.clipboard_history: list[str] = []
+                self.mode = "focus_changed"
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                fallback_clipboard_text: str | None = None,
+                suppress_beep: object = False,
+                before_clipboard_write: object = None,
+                **_kw: object,
+            ) -> PasteOutcome:
+                if callable(before_clipboard_write):
+                    before_clipboard_write()
+                muted = bool(suppress_beep() if callable(suppress_beep) else suppress_beep)
+                if self.mode == "focus_changed":
+                    clip_payload = fallback_clipboard_text if fallback_clipboard_text is not None else text
+                    self.clipboard_history.append(clip_payload)
+                    if not muted:
+                        self.beeps.append("focus")
+                    return PasteOutcome(False, True, "focus_changed", "Safari")
+                self.clipboard_history.append(text)
+                return PasteOutcome(True, True, "ok", "WindowsTerminal", used_clipboard_paste=True)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            sample_wav = tmp / "sample.wav"
+            sample_wav.write_bytes(_voiced_wav())
+            plat = _ClipPlat()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            cfg.audio.beep = True
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=tmp,
+                platform=plat,
+                asr_provider=_SeqAsr(),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(tmp),
+                paste_settle_sec=0.0,
+            )
+            try:
+                # Batch 1: start & stop segment 1 (blocked on seg1_gate), then start recording segment 2
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                r_s1 = daemon.handle_trigger("toggle")
+
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                self.assertEqual(daemon.state, "recording")
+                beeps_on_s2_start = list(plat.beeps)
+
+                # Segment 1 finishes with focus_changed DURING segment 2 recording:
+                # copied -> layer="toast", clear_main=False, and ZERO 'focus' beep!
+                seg1_gate.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_s1["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(plat.clipboard_history, ["第一段"])
+                self.assertEqual(plat.beeps, beeps_on_s2_start)
+                self.assertEqual(plat.hud_events[-1]["state"], "copied")
+                self.assertEqual(plat.hud_events[-1].get("layer"), "toast")
+                self.assertIs(plat.hud_events[-1].get("clear_main"), False)
+
+                # Stop segment 2 -> wait no: first test no_paste utterance & selftest_wav in the same active batch!
+                # Wait: finish segment 2 as no_paste=True via control rec_stop, while starting segment 3 before idle!
+                r_nopaste = daemon.handle_control({"cmd": "rec_stop", "no_paste": True})
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")  # keep batch alive (recording segment 3 -> "第二段")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_nopaste["seq_id"]:
+                    time.sleep(0.02)
+                # selftest_wav also must not touch _batch_unpasted_clips
+                st_wav = daemon.handle_control({"cmd": "selftest_wav", "wav_path": str(sample_wav)})
+                self.assertTrue(st_wav["ok"])
+                self.assertEqual(st_wav["final_text"], "第二段")
+                # Now finish real segment ("第三段" in seq? No, selftest consumed "第二段", so re-check: let's feed exact text)
+                # Wait: selftest_wav consumed "第二段" from asr_texts! Let's verify _batch_unpasted_clips still == ["第一段"]!
+                self.assertEqual(daemon._batch_unpasted_clips, ["第一段"])
+            finally:
+                daemon.close()
+
+        # Clean deterministic check of S1 focus_changed + S2 focus_changed -> S3 simulated paste -> Batch 2 idle reset
+        batch_texts = iter(["第一段", "第二段", "本段直接粘贴", "甲段", "乙段", "新一轮独立口述"])
+
+        class _DetAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                pass
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                return AsrResult(text=next(batch_texts), provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
+
+        with tempfile.TemporaryDirectory() as td2:
+            plat2 = _ClipPlat()
+            cfg2 = Config(refiner=RefinerConfig(provider="off"))
+            daemon2 = VoiceInputDaemon(
+                cfg2,
+                env={},
+                runtime_dir=Path(td2),
+                platform=plat2,
+                asr_provider=_DetAsr(),
+                refiner=create_refiner(cfg2),
+                tracker=_isolated_tracker(Path(td2)),
+                paste_settle_sec=0.0,
+            )
+            try:
+                # Hold worker on S1 by pausing _utterance_queue? Even simpler: record S2 while S1 is running!
+                # Or hold _trigger_lock? Let's enqueue S1 & S2 while S1 is gated!
+                s1_hold = threading.Event()
+                orig_deliver = plat2.deliver_text
+                deliver_idx = [0]
+
+                def gated_deliver(text: str, seq_id: int, target_hwnd: int = 0, **kw: object) -> PasteOutcome:
+                    deliver_idx[0] += 1
+                    if deliver_idx[0] == 1:
+                        res = orig_deliver(text, seq_id, target_hwnd, **kw)
+                        s1_hold.wait(timeout=2.0)
+                        return res
+                    return orig_deliver(text, seq_id, target_hwnd, **kw)
+
+                plat2.deliver_text = gated_deliver  # type: ignore[method-assign]
+
+                daemon2.handle_trigger("toggle")
+                daemon2._last_trigger_ts = -1e9
+                daemon2.handle_trigger("toggle")  # S1 ("第一段")
+                daemon2._last_trigger_ts = -1e9
+                daemon2.handle_trigger("toggle")
+                daemon2._last_trigger_ts = -1e9
+                r_b1_s2 = daemon2.handle_trigger("toggle")  # S2 ("第二段") queued in same batch
+                daemon2._last_trigger_ts = -1e9
+                daemon2.handle_trigger("toggle")  # start S3 recording so batch stays active after S2!
+                s1_hold.set()
+
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon2.last_result.get("seq_id") != r_b1_s2["seq_id"]:
+                    time.sleep(0.02)
+                # S2 wrote "第一段\n\n第二段" directly in one shot — NEVER transiently "第二段"!
+                self.assertEqual(plat2.clipboard_history, ["第一段", "第一段\n\n第二段"])
+
+                # S3 pastes via simulated Ctrl+V (used_clipboard_paste=True): clipboard gets ONLY "本段直接粘贴" & clears batch!
+                plat2.mode = "paste_ok"
+                daemon2._last_trigger_ts = -1e9
+                r_b1_s3 = daemon2.handle_trigger("toggle")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon2.last_result.get("seq_id") != r_b1_s3["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(plat2.clipboard_history[-1], "本段直接粘贴")
+                self.assertEqual(daemon2._batch_unpasted_clips, [])
+                self.assertEqual(daemon2.state, "idle")
+
+                # Batch 2: S4 ("甲段") + S5 ("乙段") focus_changed -> drains to idle -> Batch 3 ("新一轮独立口述")
+                plat2.mode = "focus_changed"
+                plat2.clipboard_history.clear()
+                s4_hold = threading.Event()
+                b2_idx = [0]
+
+                def gated_deliver_b2(text: str, seq_id: int, target_hwnd: int = 0, **kw: object) -> PasteOutcome:
+                    b2_idx[0] += 1
+                    res = orig_deliver(text, seq_id, target_hwnd, **kw)
+                    if b2_idx[0] == 1:
+                        s4_hold.wait(timeout=2.0)
+                    return res
+
+                plat2.deliver_text = gated_deliver_b2  # type: ignore[method-assign]
+                daemon2._last_trigger_ts = -1e9
+                daemon2.handle_trigger("toggle")
+                daemon2._last_trigger_ts = -1e9
+                daemon2.handle_trigger("toggle")  # "甲段"
+                daemon2._last_trigger_ts = -1e9
+                daemon2.handle_trigger("toggle")
+                daemon2._last_trigger_ts = -1e9
+                r_b2_s5 = daemon2.handle_trigger("toggle")  # "乙段"
+                s4_hold.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon2.last_result.get("seq_id") != r_b2_s5["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(plat2.clipboard_history, ["甲段", "甲段\n\n乙段"])
+                self.assertEqual(daemon2.state, "idle")
+                self.assertEqual(daemon2._batch_unpasted_clips, [])
+
+                # New independent round after idle MUST NOT include "甲段" or "乙段"!
+                daemon2._last_trigger_ts = -1e9
+                daemon2.handle_trigger("toggle")
+                daemon2._last_trigger_ts = -1e9
+                r_b3 = daemon2.handle_trigger("toggle")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon2.last_result.get("seq_id") != r_b3["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(plat2.clipboard_history[-1], "新一轮独立口述")
+            finally:
+                daemon2.close()
+
+    def test_wsl_deliver_text_hotkey_held_deferral_no_blind_retry_and_hold_timeout_fallback(self) -> None:
+        plat = WslPlatform(Config(), env={})
+        rpc_calls: list[tuple[dict[str, object], bool]] = []
+        replies = iter(
+            [
+                {"ok": True, "pasted": False, "clipboard": False, "reason": "hotkey_held", "fg_process": "WindowsTerminal"},
+                {"ok": True, "pasted": False, "clipboard": False, "reason": "hotkey_held", "fg_process": "WindowsTerminal"},
+                {"ok": True, "pasted": True, "clipboard": True, "reason": "ok", "fg_process": "WindowsTerminal"},
+            ]
+        )
+
+        def fake_rpc(payload: dict[str, object], timeout_sec: float = 3.0, *, allow_retry: bool = True) -> dict[str, object]:
+            rpc_calls.append((dict(payload), allow_retry))
+            return next(replies)
+
+        plat._shim_rpc = fake_rpc  # type: ignore[method-assign]
+        before_clip_cnt = [0]
+        origin = ForegroundWindow(hwnd=321, process="WindowsTerminal", title="codex")
+        out = plat.deliver_text(
+            "按住右Ctrl松开后上屏",
+            seq_id=10,
+            target_hwnd=321,
+            origin_window=origin,
+            fallback_clipboard_text="回退段\n\n按住右Ctrl松开后上屏",
+            before_clipboard_write=lambda: before_clip_cnt.__setitem__(0, before_clip_cnt[0] + 1),
+        )
+        self.assertTrue(out.pasted)
+        self.assertTrue(out.clipboard)
+        self.assertTrue(out.used_clipboard_paste)
+        self.assertEqual(out.reason, "ok")
+        self.assertEqual(before_clip_cnt[0], 1)
+        self.assertEqual(len(rpc_calls), 3)
+        for payload, allow_retry in rpc_calls:
+            self.assertFalse(allow_retry, "non-idempotent paste RPC must never set allow_retry=True")
+            self.assertEqual(payload["fallback_text"], "回退段\n\n按住右Ctrl松开后上屏")
+
+        # 2. Focus switched while hotkey was held -> upon key release shim returns focus_changed with clipboard=True
+        replies_drift = iter(
+            [
+                {"ok": True, "pasted": False, "clipboard": False, "reason": "hotkey_held", "fg_process": "WindowsTerminal"},
+                {"ok": True, "pasted": False, "clipboard": True, "reason": "focus_changed", "fg_process": "chrome"},
+            ]
+        )
+        plat._shim_rpc = lambda payload, timeout_sec=3.0, *, allow_retry=True: next(replies_drift)  # type: ignore[method-assign]
+        out_drift = plat.deliver_text(
+            "松键时已切窗",
+            seq_id=11,
+            target_hwnd=321,
+            origin_window=origin,
+            fallback_clipboard_text="旧段\n\n松键时已切窗",
+        )
+        self.assertFalse(out_drift.pasted)
+        self.assertTrue(out_drift.clipboard)
+        self.assertFalse(out_drift.used_clipboard_paste)
+        self.assertEqual(out_drift.reason, "focus_changed")
+
+        # 3. Hold timeout safety net -> sends force_clipboard_only=True so text safely lands in clipboard
+        plat._paste_hold_timeout_sec = 0.08
+        timeout_rpcs: list[dict[str, object]] = []
+
+        def fake_held_forever(payload: dict[str, object], timeout_sec: float = 3.0, *, allow_retry: bool = True) -> dict[str, object]:
+            timeout_rpcs.append(dict(payload))
+            if payload.get("force_clipboard_only"):
+                return {"ok": True, "pasted": False, "clipboard": True, "reason": "focus_changed", "fg_process": "WindowsTerminal"}
+            return {"ok": True, "pasted": False, "clipboard": False, "reason": "hotkey_held", "fg_process": "WindowsTerminal"}
+
+        plat._shim_rpc = fake_held_forever  # type: ignore[method-assign]
+        out_to = plat.deliver_text(
+            "超时兜底写剪贴板",
+            seq_id=12,
+            target_hwnd=321,
+            origin_window=origin,
+            fallback_clipboard_text="前段\n\n超时兜底写剪贴板",
+        )
+        self.assertFalse(out_to.pasted)
+        self.assertTrue(out_to.clipboard)
+        self.assertEqual(out_to.reason, "focus_changed")
+        self.assertTrue(timeout_rpcs[-1].get("force_clipboard_only"))
+        self.assertEqual(timeout_rpcs[-1].get("fallback_text"), "前段\n\n超时兜底写剪贴板")
+
+    def test_audio_error_snapshot_queue_full_recorder_lost_absorption_and_fast_close(self) -> None:
+        from agent_voice_input.daemon import MAX_PENDING_UTTERANCES
+
+        # 1. Audio error snapshot isolation + exact _recorder_lost_seq absorption
+        s1_in_asr = threading.Event()
+        s1_rel_asr = threading.Event()
+
+        class _GateFirstAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.n = 0
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                self.n += 1
+                if self.n == 1:
+                    s1_in_asr.set()
+                    s1_rel_asr.wait(timeout=3.0)
+                return AsrResult(text=f"抢救语音{self.n}", provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
+
+        class _LostPlat(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.last_audio_error = ""
+                self._lost_cb = None
+
+            def set_recorder_lost_callback(self, cb):
+                self._lost_cb = cb
+
+            def start_recording(self, runtime_dir: Path) -> None:
+                # Starting a new recording resets platform.last_audio_error, just like real WslPlatform/MacOSPlatform
+                self.last_audio_error = ""
+
+        with tempfile.TemporaryDirectory() as td:
+            now = [50.0]
+            plat = _LostPlat()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=Path(td),
+                platform=plat,
+                asr_provider=_GateFirstAsr(),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(Path(td)),
+                clock_fn=lambda: now[0],
+            )
+            try:
+                daemon.handle_trigger("toggle")
+                plat.last_audio_error = "usb_mic_yanked_seq1"
+                assert plat._lost_cb is not None
+                plat._lost_cb(seq_id=daemon.seq_id)
+                self.assertTrue(s1_in_asr.wait(timeout=2.0))
+
+                # Even after 2.0s (> 1.5s), while seq 1 salvage is STILL inflight, first toggle stop is absorbed once!
+                now[0] += 2.0
+                r_abs = daemon.handle_trigger("toggle")
+                self.assertEqual(r_abs.get("ignored"), "already_stopped")
+
+                # Next toggle starts seq 2 recording -> resets plat.last_audio_error = ""!
+                now[0] += 0.3
+                r_s2 = daemon.handle_trigger("toggle")
+                self.assertEqual(r_s2["state"], "recording")
+                self.assertEqual(plat.last_audio_error, "")
+
+                # Release seq 1 ASR: summary MUST still preserve snapped audio_error="usb_mic_yanked_seq1"!
+                s1_rel_asr.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != 1:
+                    time.sleep(0.02)
+                self.assertTrue(daemon.last_result["ok"])
+                self.assertTrue(daemon.last_result.get("capture_interrupted"))
+                self.assertEqual(daemon.last_result.get("audio_error"), "usb_mic_yanked_seq1")
+
+                # Finish seq 2 -> clean summary must NOT inherit seq 1's audio_error
+                now[0] += 0.3
+                r_s2_stop = daemon.handle_trigger("toggle")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_s2_stop["seq_id"]:
+                    time.sleep(0.02)
+                self.assertNotIn("audio_error", daemon.last_result)
+
+                # Non-inflight recorder_lost (zero wav -> skipped immediately) does NOT absorb after 1.6s (> 1.5s)
+                plat.wav_bytes = _zero_wav(0.5)
+                now[0] += 0.5
+                daemon.handle_trigger("toggle")
+                plat.last_audio_error = "silent_unplug"
+                plat._lost_cb(seq_id=daemon.seq_id)
+                now[0] += 1.6
+                plat.wav_bytes = _voiced_wav()
+                r_after_window = daemon.handle_trigger("toggle")
+                self.assertEqual(r_after_window["state"], "recording")
+                now[0] += 0.3
+                daemon.handle_trigger("ptt_cancel")
+            finally:
+                daemon.close()
+
+        # 2. Bounded queue MAX_PENDING_UTTERANCES = 8 -> 9th start returns ignored="queue_full" without starting mic
+        hold_q = threading.Event()
+        q_in_asr = threading.Event()
+
+        class _HoldAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                pass
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                q_in_asr.set()
+                hold_q.wait(timeout=3.0)
+                return AsrResult(text="队列项", provider="dashscope", model="qwen3-asr-flash", latency_ms=2)
+
+        with tempfile.TemporaryDirectory() as td_q:
+            plat_q = _FakePlatform()
+            start_calls = [0]
+            plat_q.start_recording = lambda _rt: start_calls.__setitem__(0, start_calls[0] + 1)  # type: ignore[method-assign]
+            daemon_q = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="off")),
+                env={},
+                runtime_dir=Path(td_q),
+                platform=plat_q,
+                asr_provider=_HoldAsr(),
+                refiner=create_refiner(Config(refiner=RefinerConfig(provider="off"))),
+                tracker=_isolated_tracker(Path(td_q)),
+                paste_settle_sec=0.0,
+            )
+            try:
+                for _ in range(MAX_PENDING_UTTERANCES):
+                    daemon_q._last_trigger_ts = -1e9
+                    r_on = daemon_q.handle_trigger("toggle")
+                    self.assertTrue(r_on["ok"])
+                    daemon_q._last_trigger_ts = -1e9
+                    daemon_q.handle_trigger("toggle")
+                self.assertTrue(q_in_asr.wait(timeout=2.0))
+                self.assertEqual(start_calls[0], MAX_PENDING_UTTERANCES)
+                self.assertEqual(daemon_q.handle_control({"cmd": "status"})["pending_count"], MAX_PENDING_UTTERANCES)
+
+                daemon_q._last_trigger_ts = -1e9
+                r_full = daemon_q.handle_trigger("toggle")
+                self.assertFalse(r_full["ok"])
+                self.assertEqual(r_full.get("ignored"), "queue_full")
+                self.assertEqual(start_calls[0], MAX_PENDING_UTTERANCES)
+                self.assertEqual(plat_q.hud_events[-1]["state"], "mic_unavailable")
+                self.assertIs(plat_q.hud_events[-1].get("clear_main"), False)
+            finally:
+                hold_q.set()
+                daemon_q.close()
+
+        # 3. Fast daemon.close() (< 1.0s) when CodexRefiner is blocked in a slow app-server turn
+        #    AND JsonlShimMixin _closed respawn guard + per-proc _pending isolation
+        slow_app_server = (
+            "import json, sys, time\n"
+            "flag = sys.argv[1]\n"
+            "for raw in sys.stdin:\n"
+            "    msg = json.loads(raw)\n"
+            "    m = msg.get('method'); rid = msg.get('id')\n"
+            "    if m == 'initialize':\n"
+            "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': {'userAgent': 'mock'}}) + '\\n'); sys.stdout.flush()\n"
+            "    elif m == 'thread/start':\n"
+            "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': {'thread': {'id': 'thr-slow'}}}) + '\\n'); sys.stdout.flush()\n"
+            "    elif m == 'turn/start':\n"
+            "        with open(flag, 'w', encoding='utf-8') as f: f.write('in_turn')\n"
+            "        time.sleep(10.0)\n"
+        )
+        with tempfile.TemporaryDirectory() as td_slow:
+            tmp_s = Path(td_slow)
+            turn_flag = tmp_s / "in_turn.flag"
+            cfg_s = Config(refiner=RefinerConfig(provider="codex", timeout_sec=15.0))
+            ref_s = CodexRefiner(
+                cfg_s,
+                env={},
+                runtime_dir=tmp_s,
+                app_server_cmd=[sys.executable, "-u", "-c", slow_app_server, str(turn_flag)],
+            )
+            daemon_s = VoiceInputDaemon(
+                cfg_s,
+                env={},
+                runtime_dir=tmp_s,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("慢精修关停测试"),
+                refiner=ref_s,
+                tracker=_isolated_tracker(tmp_s),
+            )
+            daemon_s.handle_trigger("toggle")
+            daemon_s._last_trigger_ts = -1e9
+            daemon_s.handle_trigger("toggle")
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not turn_flag.is_file():
+                time.sleep(0.02)
+            self.assertTrue(turn_flag.is_file())
+
+            t_close0 = time.monotonic()
+            daemon_s.close()
+            close_elapsed = time.monotonic() - t_close0
+            self.assertLess(close_elapsed, 1.0, f"daemon.close() hung for {close_elapsed:.2f}s on slow CodexRefiner")
+
+            # JsonlShimMixin: _closed prevents _ensure_shim resurrection, and real _shim_reader(proc_old)
+            # flushes ONLY proc_old's _pending entries with 'shim_eof' without touching proc_new's RPCs!
+            import io
+            import queue as q_mod
+
+            w_closed = WslPlatform(Config(), env={})
+            w_closed.close()
+            with self.assertRaises(RuntimeError):
+                w_closed._ensure_shim()
+
+            class _MockShimProc:
+                def __init__(self, stdout_data: str = "", returncode: int | None = 0) -> None:
+                    self.stdin = io.StringIO()
+                    self.stdout = io.StringIO(stdout_data)
+                    self._rc = returncode
+
+                def poll(self) -> int | None:
+                    return self._rc
+
+                def kill(self) -> None:
+                    self._rc = -9
+
+                def wait(self, timeout: float | None = None) -> int:
+                    return 0 if self._rc is None else self._rc
+
+            w_iso = WslPlatform(Config(), env={})
+            proc_old = _MockShimProc(
+                json.dumps({"type": "reply", "reply": "ping", "seq_id": 2, "ok": True}) + "\n",
+                returncode=0,
+            )
+            proc_new = _MockShimProc("", returncode=None)
+            q_old: q_mod.Queue[dict[str, object]] = q_mod.Queue()
+            q_new: q_mod.Queue[dict[str, object]] = q_mod.Queue()
+            w_iso._shim = proc_new  # type: ignore[assignment]
+            w_iso._pending[1] = (proc_old, q_old)  # type: ignore[assignment]
+            w_iso._pending[2] = (proc_new, q_new)  # type: ignore[assignment]
+            w_iso._shim_reader(proc_old)  # type: ignore[arg-type]
+            self.assertEqual(q_old.get_nowait(), {"error": "shim_eof"})
+            self.assertTrue(q_new.empty())
+            self.assertNotIn(1, w_iso._pending)
+            self.assertIs(w_iso._pending[2][0], proc_new)
+            self.assertIs(w_iso._shim, proc_new)
+            proc_new.stdin.close()
+            proc_new.stdout.close()
+
+    def test_normal_followed_by_silent_hud_task_drains_cleanly_without_stranded_main_capsule(self) -> None:
+        gate_t1 = threading.Event()
+        in_t1 = threading.Event()
+
+        class _StagedAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.n = 0
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                self.n += 1
+                if self.n in (1, 4):
+                    in_t1.set()
+                    gate_t1.wait(timeout=2.0)
+                return AsrResult(text=f"口述{self.n}", provider="dashscope", model="qwen3-asr-flash", latency_ms=4)
+
+        with tempfile.TemporaryDirectory() as td:
+            plat = _FakePlatform()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=Path(td),
+                platform=plat,
+                asr_provider=_StagedAsr(),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(Path(td)),
+                paste_settle_sec=0.0,
+            )
+            try:
+                # Case A: Normal task #1 blocked in ASR; task #2 (silent_hud=True, no_paste=True) already queued behind #1
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                self.assertTrue(in_t1.wait(timeout=2.0))
+                self.assertTrue(daemon._main_hud_visible)
+
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_control({"cmd": "rec_start", "no_paste": True, "silent_hud": True})
+                daemon._last_trigger_ts = -1e9
+                r_silent2 = daemon.handle_control({"cmd": "rec_stop"})
+                self.assertEqual(daemon.handle_control({"cmd": "status"})["pending_count"], 2)
+
+                gate_t1.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_silent2["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(daemon.state, "idle")
+                self.assertFalse(daemon._main_hud_visible)
+                # Task #1 emitted its own 'done' instead of lighting up 'recognizing' for silent task #2!
+                self.assertEqual(plat.huds, ["recording", "recognizing", "done"])
+
+                # Subsequent normal task #3 still lights up 'recognizing' -> 'done' cleanly
+                plat.huds.clear()
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                r_norm3 = daemon.handle_trigger("toggle")
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_norm3["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(plat.huds, ["recording", "recognizing", "done"])
+                self.assertFalse(daemon._main_hud_visible)
+
+                # Case B: Normal task #4 finishes WHILE silent task #5 is actively recording -> when #5 finishes, 'hide' clears stale main HUD!
+                plat.huds.clear()
+                in_t1.clear()
+                gate_t1.clear()
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                r_norm4 = daemon.handle_trigger("toggle")
+                self.assertTrue(in_t1.wait(timeout=2.0))
+                self.assertTrue(daemon._main_hud_visible)
+
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_control({"cmd": "rec_start", "no_paste": True, "silent_hud": True})
+                gate_t1.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_norm4["seq_id"]:
+                    time.sleep(0.02)
+                # Now stop silent task #5 -> drains to idle and explicitly hides stranded main HUD!
+                daemon._last_trigger_ts = -1e9
+                r_silent5 = daemon.handle_control({"cmd": "rec_stop"})
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_silent5["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(daemon.state, "idle")
+                self.assertFalse(daemon._main_hud_visible)
+                self.assertEqual(plat.huds[-1], "hide")
+
+                # Case C: Normal #6 -> Silent #7 -> Normal #8 queued; worker pops #8 right as foreground starts recording #9.
+                # Background worker MUST re-check under _trigger_lock and NEVER overwrite #9's 'recording' main capsule!
+                plat.huds.clear()
+                in_t1.clear()
+                gate_t1.clear()
+                popped_t8 = threading.Event()
+                allow_worker_trigger_lock = threading.Event()
+                target_seq8 = [-1]
+
+                orig_recompute = daemon._recompute_state_locked
+
+                def hooked_recompute() -> str:
+                    st = orig_recompute()
+                    if (
+                        target_seq8[0] > 0
+                        and daemon._active_task is not None
+                        and daemon._active_task.seq_id == target_seq8[0]
+                        and threading.current_thread().name == "avi-utterance-worker"
+                        and not popped_t8.is_set()
+                    ):
+                        popped_t8.set()
+                    return st
+
+                daemon._recompute_state_locked = hooked_recompute  # type: ignore[method-assign]
+
+                orig_tlock = daemon._trigger_lock
+
+                class _GateWorkerTriggerLock:
+                    def __enter__(self_lock) -> Any:
+                        if popped_t8.is_set() and threading.current_thread().name == "avi-utterance-worker":
+                            allow_worker_trigger_lock.wait(timeout=2.0)
+                        return orig_tlock.__enter__()
+
+                    def __exit__(self_lock, exc_type: Any, exc: Any, tb: Any) -> Any:
+                        return orig_tlock.__exit__(exc_type, exc, tb)
+
+                daemon._trigger_lock = _GateWorkerTriggerLock()  # type: ignore[assignment]
+                try:
+                    # Block task #6 in ASR while we enqueue silent #7 and normal #8
+                    in_s6 = threading.Event()
+                    gate_s6 = threading.Event()
+                    orig_transcribe = daemon.asr_provider.transcribe
+
+                    def gated_transcribe(wav_b: bytes, context: AsrContext | None = None) -> AsrResult:
+                        res_asr = orig_transcribe(wav_b, context)
+                        if res_asr.text == "口述6":
+                            in_s6.set()
+                            gate_s6.wait(timeout=2.0)
+                        return res_asr
+
+                    daemon.asr_provider.transcribe = gated_transcribe  # type: ignore[method-assign]
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_trigger("toggle")
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_trigger("toggle")
+                    self.assertTrue(in_s6.wait(timeout=2.0))
+
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_control({"cmd": "rec_start", "no_paste": True, "silent_hud": True})
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_control({"cmd": "rec_stop"})
+
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_trigger("toggle")
+                    daemon._last_trigger_ts = -1e9
+                    r_norm8 = daemon.handle_trigger("toggle")
+                    target_seq8[0] = r_norm8["seq_id"]
+
+                    gate_s6.set()
+                    self.assertTrue(popped_t8.wait(timeout=2.0))
+                    # Worker just popped #8 (after silent #7 left _main_hud_visible=False) and is paused before _trigger_lock;
+                    # foreground starts recording #9 now!
+                    daemon._last_trigger_ts = -1e9
+                    r_rec9 = daemon.handle_trigger("ptt_start")
+                    self.assertEqual(r_rec9["state"], "recording")
+                    self.assertEqual(plat.huds[-1], "recording")
+
+                    allow_worker_trigger_lock.set()
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_norm8["seq_id"]:
+                        time.sleep(0.02)
+                    self.assertEqual(daemon.state, "recording")
+                    self.assertEqual(daemon._main_hud_state, "recording")
+                    self.assertEqual(plat.huds[-1], "recording")
+
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_trigger("ptt_cancel")
+                finally:
+                    allow_worker_trigger_lock.set()
+                    daemon._trigger_lock = orig_tlock  # type: ignore[assignment]
+                    daemon._recompute_state_locked = orig_recompute  # type: ignore[method-assign]
+            finally:
+                daemon.close()
 
 
 if __name__ == "__main__":
