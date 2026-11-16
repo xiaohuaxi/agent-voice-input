@@ -248,7 +248,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
 
         proj = data["project"]
         self.assertEqual(proj["name"], "agent-voice-input")
-        self.assertEqual(proj["version"], "0.5.0")
+        self.assertEqual(proj["version"], "0.6.0")
         self.assertEqual(proj["requires-python"], ">=3.10")
         self.assertEqual(proj["license"], "Apache-2.0")
         self.assertEqual(
@@ -1378,7 +1378,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         with mock.patch("sys.stdout", ver_buf), self.assertRaises(SystemExit) as ver_exit:
             parser.parse_args(["--version"])
         self.assertEqual(ver_exit.exception.code, 0)
-        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.5.0")
+        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.6.0")
 
         # Offline _cmd_doctor verification: displays resolved provider/model/api/effort and NEVER leaks raw secrets
         with tempfile.TemporaryDirectory() as td:
