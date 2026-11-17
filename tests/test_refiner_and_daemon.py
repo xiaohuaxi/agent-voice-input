@@ -94,6 +94,8 @@ for raw in sys.stdin:
         if mode == "no_revert":
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unknown variant thread/revert"}})
             continue
+        if mode == "slow_revert":
+            time.sleep(0.35)
         rtid = msg["params"]["threadId"]
         btid = msg["params"]["beforeTurnId"]
         cur_list = thread_turns.get(rtid, [])
@@ -1594,6 +1596,9 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 return self.wav_bytes, self.source
 
         class _MockRefiner(CodexRefiner):
+            def prepare_session(self, session_key: str = "") -> None:
+                return None
+
             def refine(self, asr_input, *, session_key: str = "", tracker=None, fallback_context: str = ""):
                 return RefinerResult("精修后完整句子不丢字。", "codex", "gpt-6-luna", 37)
 
@@ -1744,6 +1749,9 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 )
 
         class _BlockingRefiner(CodexRefiner):
+            def prepare_session(self, session_key: str = "") -> None:
+                return None
+
             def refine(self, asr_input, *, session_key: str = "", tracker=None, fallback_context: str = ""):
                 in_refiner.set()
                 release_refiner.wait(timeout=2.0)
@@ -5038,6 +5046,119 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 self.assertEqual(rc.text, "CLEAN[thr-1#3]:同会话后续复用C")
             finally:
                 ref_ov.close()
+
+    def test_codex_async_revert_shell_snapshot_disable_and_parallel_asr_prewarm(self) -> None:
+        from agent_voice_input.refiner import _DISABLE, find_codex_bin
+
+        self.assertIn("shell_snapshot", _DISABLE)
+        # Hermetic empty env={} MUST NEVER leak into host os.environ["PATH"] or ~!
+        self.assertIsNone(find_codex_bin({}))
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            # 1. Async thread/revert: refine() returns immediately without blocking on 350ms revert RPC,
+            #    and the next turn still reuses thr-1 cleanly after background revert finishes!
+            slow_log = tmp / "slow_revert.jsonl"
+            ref_slow = CodexRefiner(
+                Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0)),
+                env={},
+                runtime_dir=tmp / "rt_slow",
+                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(slow_log), "slow_revert"],
+            )
+            try:
+                # Warm thread first on turn 1, wait 0.45s so thr-1 is ready, then time turn 2!
+                r1 = ref_slow.refine("预热第一句", session_key="agy:async-rev")
+                self.assertEqual(r1.text, "CLEAN[thr-1#1]:预热第一句")
+                time.sleep(0.45)
+
+                t_start = time.monotonic()
+                r2 = ref_slow.refine("异步撤回不阻塞上屏", session_key="agy:async-rev")
+                elapsed_turn2 = time.monotonic() - t_start
+                self.assertEqual(r2.text, "CLEAN[thr-1#2]:异步撤回不阻塞上屏")
+                # Turn 2 returns well before the 350ms slow_revert finishes!
+                self.assertLess(elapsed_turn2, 0.25)
+
+                # Calling turn 3 immediately waits seamlessly for the in-flight revert and still reuses thr-1!
+                r3 = ref_slow.refine("紧接第三句仍复用", session_key="agy:async-rev")
+                self.assertEqual(r3.text, "CLEAN[thr-1#3]:紧接第三句仍复用")
+            finally:
+                ref_slow.close()
+
+            slow_recs = [json.loads(ln) for ln in slow_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.assertEqual(len([r for r in slow_recs if r.get("method") == "thread/start"]), 1)
+            self.assertEqual(len([r for r in slow_recs if r.get("method") == "thread/revert"]), 3)
+
+            # 2. Stage 1 ASR parallel prewarm: initialize + thread/start run concurrently BEFORE ASR returns!
+            import fcntl
+
+            pre_log = tmp / "prewarm.jsonl"
+            agy_cid = "fedcba98-0000-4000-8000-000000000001"
+            agy_pres = tmp / "home" / ".gemini" / "antigravity-cli" / "presence"
+            agy_pres.mkdir(parents=True)
+            agy_lock_fd = os.open(str(agy_pres / f"{agy_cid}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(agy_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            agy_logs = tmp / "home" / ".gemini" / "antigravity-cli" / "brain" / agy_cid / ".system_generated" / "logs"
+            agy_logs.mkdir(parents=True)
+            agy_file = agy_logs / "transcript_full.jsonl"
+            agy_file.write_text(
+                json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>\n预热会话\n</USER_REQUEST>"}) + "\n",
+                encoding="utf-8",
+            )
+            rt_pre = tmp / "rt_pre"
+            rt_pre.mkdir(mode=0o700)
+            write_session_registry_entry(rt_pre, cli="agy", session_id=agy_cid, jsonl_path=str(agy_file), cwd=str(tmp))
+            tracker = SessionTracker(home_dir=tmp / "home", runtime_dir=rt_pre, proc_root=None)
+
+            ref_pre = CodexRefiner(
+                Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0)),
+                env={},
+                runtime_dir=rt_pre,
+                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(pre_log), "ok"],
+            )
+            saw_prewarm_during_asr = [False]
+
+            class _SlowInspectAsr(BaseAsrProvider):
+                provider_name = "dashscope"
+
+                def __init__(self) -> None:
+                    pass
+
+                def transcribe(self, wav_bytes: bytes, context: Any = None, *, is_cancelled: Any = None) -> AsrResult:
+                    deadline_w = time.monotonic() + 1.5
+                    while time.monotonic() < deadline_w:
+                        if pre_log.is_file():
+                            methods_now = [
+                                json.loads(ln).get("method")
+                                for ln in pre_log.read_text(encoding="utf-8").splitlines()
+                                if ln.strip()
+                            ]
+                            if "thread/start" in methods_now:
+                                saw_prewarm_during_asr[0] = True
+                                break
+                        time.sleep(0.02)
+                    return AsrResult(text="并行预热语音草稿", provider="dashscope", model="qwen3-asr-flash", latency_ms=80)
+
+            try:
+                pipe_res = run_pipeline_once(
+                    _voiced_wav(),
+                    cfg=Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0)),
+                    tracker=tracker,
+                    asr_provider=_SlowInspectAsr(),
+                    refiner=ref_pre,
+                    window_title_override="[agy:#fedcba98]",
+                    dry_run=True,
+                    env={},
+                )
+                self.assertTrue(pipe_res.ok)
+                self.assertTrue(saw_prewarm_during_asr[0])
+                self.assertEqual(pipe_res.final_text, "CLEAN[thr-1#1]:并行预热语音草稿")
+            finally:
+                ref_pre.close()
+                os.close(agy_lock_fd)
+
+            pre_recs = [json.loads(ln) for ln in pre_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.assertEqual(len([r for r in pre_recs if r.get("method") == "thread/start"]), 1)
+            self.assertEqual(len([r for r in pre_recs if r.get("method") == "turn/start"]), 1)
 
 
 if __name__ == "__main__":

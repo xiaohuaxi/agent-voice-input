@@ -104,6 +104,7 @@ _PURE_CHAT_CONFIG_OVERRIDES = (
 _DISABLE = (
     "code_mode_host",
     "shell_tool",
+    "shell_snapshot",
     "unified_exec",
     "multi_agent",
     "multi_agent_v2",
@@ -149,13 +150,24 @@ def _unpack(asr_input: AsrResult | str) -> tuple[str, bool]:
     return (asr_input.text.strip(), asr_input.is_single_hop_refined) if isinstance(asr_input, AsrResult) else (str(asr_input).strip(), False)
 
 def find_codex_bin(env: Mapping[str, str] | None = None) -> str | None:
+    explicit = env is not None and env is not os.environ
     src = os.environ if env is None else env
     if (c := (src.get("CODEX_BIN") or "").strip()) and os.path.isfile(c) and os.access(c, os.X_OK):
         return c
-    if found := shutil.which("codex", path=src.get("PATH")):
-        return found
+    raw_path = src.get("PATH")
+    if raw_path:
+        if found := shutil.which("codex", path=raw_path):
+            return found
+    elif not explicit:
+        if found := shutil.which("codex"):
+            return found
+    if explicit and not (src.get("HOME") or "").strip():
+        return None
     home = expand_user_path("~", env=src)
-    return next((str(p) for p in (home / ".local/bin/codex", Path("/usr/local/bin/codex"), Path("/opt/homebrew/bin/codex")) if p.is_file() and os.access(str(p), os.X_OK)), None)
+    cands = [home / ".local/bin/codex"]
+    if not explicit or bool((src.get("PATH") or "").strip()):
+        cands.extend([Path("/usr/local/bin/codex"), Path("/opt/homebrew/bin/codex")])
+    return next((str(p) for p in cands if p.is_file() and os.access(str(p), os.X_OK)), None)
 
 def resolve_refiner_prompt(cfg: Config | None = None) -> str:
     if cfg is not None and cfg.refiner.prompt.strip():
@@ -379,6 +391,8 @@ class BaseRefiner:
         is_cancelled: Callable[[], bool] | None = None,
     ) -> RefinerResult:
         raise NotImplementedError
+    def prepare_session(self, session_key: str = "") -> None:
+        pass
     def close(self) -> None:
         pass
 
@@ -677,7 +691,11 @@ class _SessionThreadSlot:
     client: _AppServerClient
     config_sig: tuple[str, str | None, str]
     thread_id: str = ""
-    in_use: bool = True
+    state: str = "in_turn"  # "preparing" | "ready" | "in_turn" | "reverting"
+
+    @property
+    def is_busy(self) -> bool:
+        return self.state != "ready"
 
 
 class CodexRefiner(BaseRefiner):
@@ -706,10 +724,14 @@ class CodexRefiner(BaseRefiner):
         self.clock_fn, self.sleep_fn, self.rand_fn = clock_fn, sleep_fn, rand_fn
         self._init_lock = threading.Lock()
         self._client_lock = threading.Lock()
+        self._slot_cv = threading.Condition(self._client_lock)
         self._client: _AppServerClient | None = None
         self._all_clients: set[_AppServerClient] = set()
         self._exec_procs: set[subprocess.Popen[str]] = set()
         self._session_threads: OrderedDict[str, _SessionThreadSlot] = OrderedDict()
+        self._preparing_keys: set[str] = set()
+        self._active_bg_ops = 0
+        self._closing = False
         self._closed = False
 
     def _resolve_main_codex_home(self) -> Path | None:
@@ -990,6 +1012,24 @@ class CodexRefiner(BaseRefiner):
             Path(out_path).unlink(missing_ok=True)
             Path(instr_path).unlink(missing_ok=True)
 
+    def _wait_slot_transition_locked(
+        self,
+        skey: str,
+        mono_deadline: float,
+    ) -> None:
+        while not self._closed:
+            existing = self._session_threads.get(skey)
+            if (
+                existing is None
+                or existing.state not in ("preparing", "reverting")
+                or existing.client.is_dead
+            ):
+                break
+            rem = mono_deadline - time.monotonic()
+            if rem <= 0:
+                break
+            self._slot_cv.wait(timeout=rem)
+
     def _acquire_session_turn(
         self,
         *,
@@ -998,14 +1038,18 @@ class CodexRefiner(BaseRefiner):
         skey: str,
         config_sig: tuple[str, str | None, str],
     ) -> tuple[_AppServerClient, _SessionThreadSlot | None, str, list[str]]:
+        wait_deadline = time.monotonic() + min(1.5, max(0.05, float(init_budget_sec)))
         if skey:
             with self._client_lock:
+                if self._closed:
+                    raise RuntimeError("codex refiner closed")
+                self._wait_slot_transition_locked(skey, wait_deadline)
                 if self._closed:
                     raise RuntimeError("codex refiner closed")
                 existing = self._session_threads.get(skey)
                 if (
                     existing is not None
-                    and not existing.in_use
+                    and not existing.is_busy
                     and existing.thread_id
                     and existing.client is self._client
                     and self._client is not None
@@ -1013,7 +1057,7 @@ class CodexRefiner(BaseRefiner):
                     and existing.config_sig == config_sig
                     and self._client.try_acquire_existing_thread_turn()
                 ):
-                    existing.in_use = True
+                    existing.state = "in_turn"
                     self._session_threads.move_to_end(skey)
                     return self._client, existing, existing.thread_id, []
 
@@ -1025,9 +1069,12 @@ class CodexRefiner(BaseRefiner):
         with self._client_lock:
             if self._closed:
                 return client, None, "", stale_tids
+            self._wait_slot_transition_locked(skey, wait_deadline)
+            if self._closed or not client.revert_supported:
+                return client, None, "", stale_tids
             existing = self._session_threads.get(skey)
             if existing is not None:
-                if existing.in_use:
+                if existing.is_busy:
                     return client, None, "", stale_tids
                 if (
                     existing.client is client
@@ -1035,7 +1082,7 @@ class CodexRefiner(BaseRefiner):
                     and existing.config_sig == config_sig
                     and existing.thread_id
                 ):
-                    existing.in_use = True
+                    existing.state = "in_turn"
                     self._session_threads.move_to_end(skey)
                     return client, existing, existing.thread_id, stale_tids
                 self._session_threads.pop(skey, None)
@@ -1044,7 +1091,7 @@ class CodexRefiner(BaseRefiner):
 
             while len(self._session_threads) >= MAX_CACHED_SESSION_THREADS:
                 idle_key = next(
-                    (k for k, v in self._session_threads.items() if not v.in_use),
+                    (k for k, v in self._session_threads.items() if not v.is_busy),
                     None,
                 )
                 if idle_key is None:
@@ -1053,9 +1100,219 @@ class CodexRefiner(BaseRefiner):
                 if evicted.client is client and evicted.thread_id:
                     stale_tids.append(evicted.thread_id)
 
-            slot = _SessionThreadSlot(client=client, config_sig=config_sig, thread_id="", in_use=True)
+            slot = _SessionThreadSlot(client=client, config_sig=config_sig, thread_id="", state="in_turn")
             self._session_threads[skey] = slot
             return client, slot, "", stale_tids
+
+    def _finish_slot_revert(
+        self,
+        client: _AppServerClient,
+        slot: _SessionThreadSlot,
+        skey: str,
+        tid: str,
+        turn_id: str,
+        rev_budget: float,
+    ) -> None:
+        reverted_ok = False
+        failed = False
+        force_kill = False
+        try:
+            if turn_id and not self._closed and not client.is_dead:
+                try:
+                    client.request(
+                        "thread/revert",
+                        {"threadId": tid, "beforeTurnId": turn_id},
+                        rev_budget,
+                    )
+                    reverted_ok = True
+                except _CodexRpcError as rev_rpc_err:
+                    err_low = str(rev_rpc_err).lower()
+                    if rev_rpc_err.rpc_code == -32601 or (
+                        rev_rpc_err.rpc_code == -32600
+                        and any(
+                            k in err_low
+                            for k in ("unknown variant", "experimentalapi", "not supported", "only supports")
+                        )
+                    ):
+                        client.mark_revert_unsupported()
+                except (TimeoutError, BrokenPipeError, ConnectionError, EOFError):
+                    failed = True
+                    force_kill = client.is_dead
+                except Exception:
+                    pass
+            if not reverted_ok and not failed and tid and not client.is_dead and not self._closed:
+                try:
+                    client.request("thread/delete", {"threadId": tid}, 0.3)
+                except (TimeoutError, BrokenPipeError, ConnectionError, EOFError):
+                    failed = True
+                    force_kill = client.is_dead
+                except Exception:
+                    pass
+        finally:
+            with self._client_lock:
+                if (
+                    reverted_ok
+                    and not failed
+                    and not self._closed
+                    and not client.is_dead
+                    and self._session_threads.get(skey) is slot
+                ):
+                    slot.state = "ready"
+                elif self._session_threads.get(skey) is slot:
+                    self._session_threads.pop(skey, None)
+                if self._active_bg_ops > 0:
+                    self._active_bg_ops -= 1
+                self._slot_cv.notify_all()
+            self._release_client(client, failed=failed, force_kill=force_kill)
+
+    def prepare_session(self, session_key: str = "") -> None:
+        """Warm resident app-server and session shell thread in parallel with Stage 1 ASR."""
+        if self._app_server_cmd is None and not find_codex_bin(self.env):
+            return
+        try:
+            codex_effort = _normalize_codex_effort(self.cfg.refiner.effort)
+            model = self.cfg.refiner.effective_model("codex")
+            composed_instr = _compose_codex_instructions(resolve_refiner_prompt(self.cfg))
+        except Exception:
+            return
+        skey = session_key.strip()
+        config_sig = (model, codex_effort, composed_instr)
+        with self._client_lock:
+            if self._closed or self._closing or skey in self._preparing_keys:
+                return
+            cur = self._client
+            if cur is not None and not cur.is_dead:
+                if not skey or not cur.revert_supported:
+                    return
+                existing = self._session_threads.get(skey)
+                if (
+                    existing is not None
+                    and existing.client is cur
+                    and existing.config_sig == config_sig
+                ):
+                    return
+            self._preparing_keys.add(skey)
+            self._active_bg_ops += 1
+        try:
+            threading.Thread(
+                target=self._run_prepare_session,
+                args=(skey, model, codex_effort, composed_instr, config_sig),
+                name="avi-codex-prewarm",
+                daemon=True,
+            ).start()
+        except Exception:
+            with self._client_lock:
+                self._preparing_keys.discard(skey)
+                if self._active_bg_ops > 0:
+                    self._active_bg_ops -= 1
+                self._slot_cv.notify_all()
+
+    def _run_prepare_session(
+        self,
+        skey: str,
+        model: str,
+        codex_effort: str | None,
+        composed_instr: str,
+        config_sig: tuple[str, str | None, str],
+    ) -> None:
+        cli: _AppServerClient | None = None
+        slot: _SessionThreadSlot | None = None
+        tid = ""
+        failed = False
+        force_kill = False
+        try:
+            empty_cwd = ensure_secure_dir(self.runtime_dir / "luna-empty-cwd")
+            init_budget = max(0.2, min(float(self.cfg.refiner.timeout_sec), DEFAULT_CONNECT_TIMEOUT_SEC))
+            cli = self._acquire_client(empty_cwd, init_budget)
+            if not skey or not cli.revert_supported:
+                return
+            stale_tids: list[str] = []
+            with self._client_lock:
+                if self._closed or self._closing or not cli.revert_supported:
+                    return
+                existing = self._session_threads.get(skey)
+                if existing is not None:
+                    if existing.is_busy or (
+                        existing.client is cli
+                        and not cli.is_dead
+                        and existing.config_sig == config_sig
+                        and existing.thread_id
+                    ):
+                        return
+                    self._session_threads.pop(skey, None)
+                    if existing.client is cli and existing.thread_id:
+                        stale_tids.append(existing.thread_id)
+                while len(self._session_threads) >= MAX_CACHED_SESSION_THREADS:
+                    idle_key = next(
+                        (k for k, v in self._session_threads.items() if not v.is_busy),
+                        None,
+                    )
+                    if idle_key is None:
+                        break
+                    evicted = self._session_threads.pop(idle_key)
+                    if evicted.client is cli and evicted.thread_id:
+                        stale_tids.append(evicted.thread_id)
+                slot = _SessionThreadSlot(client=cli, config_sig=config_sig, thread_id="", state="preparing")
+                self._session_threads[skey] = slot
+
+            for old_tid in stale_tids:
+                if not cli.is_dead:
+                    try:
+                        cli.request("thread/delete", {"threadId": old_tid}, 0.3)
+                    except Exception:
+                        pass
+            tstart_params: dict[str, Any] = {
+                "model": model,
+                "ephemeral": False,
+                "cwd": str(empty_cwd),
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "baseInstructions": composed_instr,
+            }
+            if codex_effort is not None:
+                tstart_params["config"] = {"model_reasoning_effort": codex_effort}
+            res = cli.request("thread/start", tstart_params, init_budget)
+            tid = str((res.get("thread") or {}).get("id") or "").strip()
+            if not tid:
+                raise RuntimeError("empty thread id")
+            kept = False
+            with self._client_lock:
+                if not self._closed and not self._closing and not cli.is_dead and self._session_threads.get(skey) is slot:
+                    slot.thread_id = tid
+                    slot.state = "ready"
+                    kept = True
+                elif self._session_threads.get(skey) is slot:
+                    self._session_threads.pop(skey, None)
+                self._slot_cv.notify_all()
+            if not kept and tid and not cli.is_dead and not self._closed:
+                try:
+                    cli.request("thread/delete", {"threadId": tid}, 0.3)
+                except Exception:
+                    pass
+        except Exception as exc:
+            failed = True
+            if cli is not None:
+                force_kill = cli.is_dead or isinstance(
+                    exc, (BrokenPipeError, ConnectionError, EOFError)
+                )
+            if slot is not None:
+                with self._client_lock:
+                    if self._session_threads.get(skey) is slot:
+                        self._session_threads.pop(skey, None)
+                    self._slot_cv.notify_all()
+                if tid and cli is not None and not cli.is_dead and not force_kill and not self._closed:
+                    try:
+                        cli.request("thread/delete", {"threadId": tid}, 0.3)
+                    except Exception:
+                        pass
+        finally:
+            if cli is not None:
+                self._release_client(cli, failed=failed, force_kill=force_kill)
+            with self._client_lock:
+                self._preparing_keys.discard(skey)
+                if self._active_bg_ops > 0:
+                    self._active_bg_ops -= 1
+                self._slot_cv.notify_all()
 
     def _run_app_server_turn(
         self,
@@ -1082,7 +1339,7 @@ class CodexRefiner(BaseRefiner):
         )
         failed = False
         force_kill = False
-        slot_released = False
+        handed_off_bg = False
         try:
             for old_tid in stale_tids:
                 if not client.is_dead:
@@ -1117,51 +1374,27 @@ class CodexRefiner(BaseRefiner):
             if not out_txt:
                 raise RuntimeError("empty agentMessage")
             if slot is not None:
-                reverted_ok = False
-                if turn_id and not self._closed and not client.is_dead:
-                    rev_budget = max(0.4, min(2.5, deadline - self.clock_fn()))
-                    try:
-                        client.request(
-                            "thread/revert",
-                            {"threadId": tid, "beforeTurnId": turn_id},
-                            rev_budget,
-                        )
-                        reverted_ok = True
-                    except _CodexRpcError as rev_rpc_err:
-                        err_low = str(rev_rpc_err).lower()
-                        if rev_rpc_err.rpc_code == -32601 or (
-                            rev_rpc_err.rpc_code == -32600
-                            and any(
-                                k in err_low
-                                for k in ("unknown variant", "experimentalapi", "not supported", "only supports")
-                            )
-                        ):
-                            client.mark_revert_unsupported()
-                    except (TimeoutError, BrokenPipeError, ConnectionError, EOFError):
-                        failed = True
-                        force_kill = client.is_dead
-                    except Exception:
-                        pass
+                rev_budget = max(0.5, min(2.5, deadline - self.clock_fn()))
                 with self._client_lock:
                     if (
-                        reverted_ok
-                        and not failed
+                        turn_id
                         and not self._closed
                         and not client.is_dead
                         and self._session_threads.get(skey) is slot
                     ):
-                        slot.in_use = False
-                    elif self._session_threads.get(skey) is slot:
-                        self._session_threads.pop(skey, None)
-                slot_released = True
-                if not reverted_ok and not failed and tid and not client.is_dead and not self._closed:
+                        slot.state = "reverting"
+                        self._active_bg_ops += 1
+                        handed_off_bg = True
+                if handed_off_bg:
                     try:
-                        client.request("thread/delete", {"threadId": tid}, 0.3)
-                    except (TimeoutError, BrokenPipeError, ConnectionError, EOFError):
-                        failed = True
-                        force_kill = client.is_dead
+                        threading.Thread(
+                            target=self._finish_slot_revert,
+                            args=(client, slot, skey, tid, turn_id, rev_budget),
+                            name="avi-codex-revert",
+                            daemon=True,
+                        ).start()
                     except Exception:
-                        pass
+                        self._finish_slot_revert(client, slot, skey, tid, turn_id, rev_budget)
             return out_txt
         except Exception as exc:
             failed = True
@@ -1170,24 +1403,25 @@ class CodexRefiner(BaseRefiner):
             )
             raise
         finally:
-            if slot is not None:
-                if not slot_released:
+            if not handed_off_bg:
+                if slot is not None:
                     with self._client_lock:
                         if self._session_threads.get(skey) is slot:
                             self._session_threads.pop(skey, None)
+                        self._slot_cv.notify_all()
                     if tid and not client.is_dead and not force_kill and not self._closed:
                         try:
                             client.request("thread/delete", {"threadId": tid}, 0.3)
                         except Exception:
                             pass
-            else:
-                rem_unsub = deadline - self.clock_fn()
-                if tid and not failed and not client.is_dead and not force_kill and rem_unsub > 0:
-                    try:
-                        client.request("thread/unsubscribe", {"threadId": tid}, min(0.5, rem_unsub))
-                    except Exception:
-                        pass
-            self._release_client(client, failed=failed, force_kill=force_kill)
+                else:
+                    rem_unsub = deadline - self.clock_fn()
+                    if tid and not failed and not client.is_dead and not force_kill and rem_unsub > 0:
+                        try:
+                            client.request("thread/unsubscribe", {"threadId": tid}, min(0.5, rem_unsub))
+                        except Exception:
+                            pass
+                self._release_client(client, failed=failed, force_kill=force_kill)
 
     def refine(
         self,
@@ -1368,9 +1602,18 @@ class CodexRefiner(BaseRefiner):
         )
 
     def close(self) -> None:
+        grace_deadline = time.monotonic() + 0.25
         with self._client_lock:
+            self._closing = True
+            while self._active_bg_ops > 0:
+                rem = grace_deadline - time.monotonic()
+                if rem <= 0:
+                    break
+                self._slot_cv.wait(timeout=rem)
             self._closed = True
             self._session_threads.clear()
+            self._preparing_keys.clear()
+            self._slot_cv.notify_all()
             cur, self._client = self._client, None
             clients = list(self._all_clients)
             self._all_clients.clear()

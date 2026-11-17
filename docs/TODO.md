@@ -22,18 +22,12 @@
 - **投递前互斥门禁**：在最终粘贴/写剪贴板前设短临界区门禁，消除“刚检查完未取消、紧接着触发取消却仍上屏”的竞态。
 - **有效录音留存防白说**：`recording` 阶段取消直接丢弃；进入 `recognizing` / `refining` 后主动取消的，将已通过门控的有效 WAV 复用 `save_failed_audio()`（`0600` 原子写、保留 24 小时内最近 10 条）暂存至 `failed/` 供 `retry` 恢复（若来源本身已是 `retry` 则保留原文件不重复落盘），实施时同步更新 `AGENTS.md` 状态隐私说明。
 
-## 会话压缩节点（`/compact`）后的精修上下文截取
-
-当前 `session_ctx.py` 从会话 JSONL 文件头按字节偏移增量提取全部历史用户消息与 Agent 回复（受 `refiner.context_max_chars = 200000` 上限约束）。当长会话执行过多次上下文压缩（如 `/compact`）且底层仍追加在同一个 JSONL 文件中时，把压缩节点之前的陈旧对话一并塞进精修上下文既冗余又易冲掉前缀缓存。后续按各 CLI 实际落盘契约分别适配：
-
-- **`agy`（Antigravity CLI）**：同一会话的压缩前后记录均保存在同一个 `transcript_full.jsonl` / `transcript.jsonl` 内，每次 `/compact` 会写入一条 `{"source": "SYSTEM", "type": "CHECKPOINT", ...}` 记录（`content` 含 `<CONTEXT_SUMMARY>`）。增量解析遇到新的 `CHECKPOINT` 节点时，可丢弃此前累积的 `clean_turns`，改为以最新压缩摘要（或自该节点起的新对话）作为精修上下文起点。
-- **`codex` 与 `claude`（Claude Code）**：两者的会话压缩记录格式与单文件/切文件行为与 `agy` 不同（实施前先在本地实测核对 Codex rollout 中的 `compacted` / 摘要事件及 Claude Code JSONL 中的 `compact_boundary` / summary 记录结构，不凭猜测硬编码），按各自确认后的压缩边界统一收敛截取逻辑。
-
 ## 本地真实渠道系统测试与精修缓存命中率可观测性
 
-1. **本地真实凭据系统测试模块（不进 CI）**：
-   - 在现有 100% 离线单测套件（`tests/`）之外，单独提供按需手动触发的端到端系统测试入口（绝不接入 GitHub Actions CI）。
-   - 直接复用本机已配置的 API Key（如百炼、OpenRouter、Gemini 等）与本机 `codex` 订阅登录态，覆盖真实一阶段转写、二阶段语境精修保真度（错词纠正、句式保留、不误答提问）以及多轮连续请求的延迟与缓存命中率实测。
+1. **本地真实凭据与真实会话数据回归验证（不进 CI）**：
+   - 在现有 100% 离线单测套件（`tests/`）之外，单独提供按需触发的端到端系统测试入口（绝不接入 GitHub Actions CI）。
+   - **必须使用真实长度与结构的会话数据实测**：改动精修提示词、上下文组织、线程复用或性能链路后，不能仅靠合成短文本探针或 Mock 单测下结论，须加载本机真实长会话转录样本（含压缩节点、中英混合代码讨论与真实 `git status`）跑多轮连续请求，逐轮核验真实耗时分解、`cached_input_tokens` 命中数值及精修保真度（错词纠正、句式保留、不误答提问）。
+   - 直接复用本机已配置的 API Key（如百炼、OpenRouter、Gemini 等）与本机 `codex` 订阅登录态完成实测。
 2. **精修前缀缓存命中采集与用户侧提示**：
    - 采集各精修渠道返回的 token 与缓存命中指标（OpenAI 兼容接口的 `usage.prompt_tokens_details.cached_tokens`、DeepSeek 的 `usage.prompt_cache_hit_tokens`、Gemini 原生接口的 `usageMetadata.cachedContentTokenCount`、Codex `app-server` 的 `thread/tokenUsage/updated` 中 `cachedInputTokens`）。
    - 将本轮精修是否命中缓存及命中比例纳入 `status` 运行快照与可选诊断/状态提示，方便直观确认缓存是否生效。

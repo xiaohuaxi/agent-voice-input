@@ -2946,6 +2946,202 @@ class SessionCtxTests(unittest.TestCase):
                 os.close(fd_agy_a)
                 os.close(fd_agy_b)
 
+    def test_compaction_boundary_truncation_for_agy_claude_and_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            rt = root / "rt"
+            empty_proc = root / "empty_proc"
+            home.mkdir()
+            rt.mkdir(mode=0o700)
+            empty_proc.mkdir()
+
+            # 1. agy: SYSTEM/CHECKPOINT drops pre-compaction turns and strips # Subagents / # Conversation Logs tail
+            agy_cid = "aabbccdd-1111-4222-8333-444455556677"
+            agy_pres = home / ".gemini" / "antigravity-cli" / "presence"
+            agy_pres.mkdir(parents=True)
+            agy_lock = agy_pres / f"{agy_cid}.lock"
+            agy_lock_fd = os.open(str(agy_lock), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(agy_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            agy_logs = home / ".gemini" / "antigravity-cli" / "brain" / agy_cid / ".system_generated" / "logs"
+            agy_logs.mkdir(parents=True)
+            agy_jsonl = agy_logs / "transcript_full.jsonl"
+            agy_jsonl.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>\n第1轮远古历史提问 OLD_AGY_TURN_1\n</USER_REQUEST>"}),
+                        json.dumps({"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "第1轮远古回复 OLD_AGY_REPLY_1"}),
+                        json.dumps(
+                            {
+                                "source": "SYSTEM",
+                                "type": "CHECKPOINT",
+                                "content": (
+                                    "# Resuming from a compaction\n\n"
+                                    "You are continuing work on the task described above, and need to resume work efficiently using the progress summary below:\n\n"
+                                    "# User Requests\n1. 先发版再做延迟优化\n\n"
+                                    "# Previous Session Summary:\n<summary>\n已完成 v0.6.0 发版，接下来做 thread/revert 异步化。\n</summary>\n\n"
+                                    "# Subagents (12 total)\n{\"noise\": \"SUBAGENT_JSON_NOISE\"}\n\n"
+                                    "# Conversation Logs\n- transcript.jsonl"
+                                ),
+                            }
+                        ),
+                        json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>\n压缩后的最新提问 NEW_AGY_TURN\n</USER_REQUEST>"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            write_session_registry_entry(rt, cli="agy", session_id=agy_cid, jsonl_path=str(agy_jsonl), cwd=str(root))
+
+            # 2. claude: system/compact_boundary + user/isCompactSummary drops pre-compaction turns
+            cl_sid = "11223344-5555-4666-8777-888899990000"
+            cl_dir = home / ".claude" / "projects" / encode_claude_project_dir(str(root))[0]
+            cl_dir.mkdir(parents=True, exist_ok=True)
+            cl_jsonl = cl_dir / f"{cl_sid}.jsonl"
+            cl_jsonl.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"isSidechain": False, "type": "user", "sessionId": cl_sid, "cwd": str(root), "message": {"role": "user", "content": "OLD_CLAUDE_TURN_1"}}),
+                        json.dumps({"isSidechain": False, "type": "assistant", "sessionId": cl_sid, "message": {"role": "assistant", "content": [{"type": "text", "text": "OLD_CLAUDE_REPLY_1"}]}}),
+                        json.dumps({"isSidechain": False, "type": "system", "subtype": "compact_boundary", "content": "Conversation compacted"}),
+                        json.dumps({"isSidechain": False, "type": "user", "isCompactSummary": True, "message": {"role": "user", "content": "Claude compact summary: keep refiner.py clean"}}),
+                        json.dumps({"isSidechain": False, "type": "user", "message": {"role": "user", "content": "NEW_CLAUDE_TURN"}}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            write_session_registry_entry(rt, cli="claude", session_id=cl_sid, jsonl_path=str(cl_jsonl), cwd=str(root))
+
+            # 3. codex: type="compacted" drops pre-compaction turns and keeps retained_context.user_messages + post-compact turns
+            cx_sid = "99887766-1111-4222-8333-444455550000"
+            cx_dir = home / ".codex" / "sessions" / "2026" / "11" / "17"
+            cx_dir.mkdir(parents=True)
+            cx_jsonl = cx_dir / f"rollout-2026-{cx_sid}.jsonl"
+            cx_jsonl.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "session_meta", "payload": {"id": cx_sid, "source": "cli", "cwd": str(root)}}),
+                        json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage", "content": [{"type": "text", "text": "OLD_CODEX_TURN_1"}]}}}),
+                        json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "AgentMessage", "content": [{"type": "text", "text": "OLD_CODEX_REPLY_1"}]}}}),
+                        json.dumps(
+                            {
+                                "type": "compacted",
+                                "payload": {
+                                    "message": "",
+                                    "retained_context": {
+                                        "user_messages": [
+                                            {"order": 10, "text": "RETAINED_CODEX_USER_MSG"},
+                                        ],
+                                        "assistant_messages": [
+                                            {"order": 11, "text": "RETAINED_CODEX_ASSISTANT_MSG"},
+                                        ],
+                                    },
+                                    "replacement_history": [
+                                        {
+                                            "type": "message",
+                                            "role": "user",
+                                            "content": [{"type": "input_text", "text": "SUFFIX_REPLACEMENT_USER_MSG"}],
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "ContextCompaction", "id": "cc-1"}}}),
+                        json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "AgentMessage", "content": [{"type": "text", "text": "NEW_CODEX_REPLY"}]}}}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            write_session_registry_entry(rt, cli="codex", session_id=cx_sid, jsonl_path=str(cx_jsonl), cwd=str(root))
+
+            tracker = SessionTracker(home_dir=home, runtime_dir=rt, proc_root=None)
+
+            snap_agy = tracker.sync_session(window_title="[agy:#aabbccdd]")
+            assert snap_agy is not None
+            agy_chunks, _ = tracker.get_refiner_context(snap_agy.session_key, include_git_status=False)
+            agy_joined = "\n".join(agy_chunks)
+            self.assertNotIn("OLD_AGY_TURN_1", agy_joined)
+            self.assertNotIn("OLD_AGY_REPLY_1", agy_joined)
+            self.assertNotIn("SUBAGENT_JSON_NOISE", agy_joined)
+            self.assertNotIn("Resuming from a compaction", agy_joined)
+            self.assertIn("已完成 v0.6.0 发版", agy_joined)
+            self.assertIn("NEW_AGY_TURN", agy_joined)
+
+            # Incremental second compaction on agy drops the previous compaction too!
+            with agy_jsonl.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "source": "SYSTEM",
+                            "type": "CHECKPOINT",
+                            "content": "# Resuming from a compaction\nprogress summary below:\n\n<summary>第二次压缩摘要 SECOND_CP</summary>",
+                        }
+                    )
+                    + "\n"
+                )
+            gen_before = snap_agy.generation
+            snap_agy2 = tracker.sync_session(window_title="[agy:#aabbccdd]")
+            assert snap_agy2 is not None
+            self.assertGreater(snap_agy2.generation, gen_before)
+            agy_chunks2, _ = tracker.get_refiner_context(snap_agy2.session_key, include_git_status=False)
+            agy_joined2 = "\n".join(agy_chunks2)
+            self.assertNotIn("NEW_AGY_TURN", agy_joined2)
+            self.assertIn("SECOND_CP", agy_joined2)
+
+            snap_cl = tracker.sync_session(window_title="[claude:#11223344]")
+            assert snap_cl is not None
+            cl_chunks, _ = tracker.get_refiner_context(snap_cl.session_key, include_git_status=False)
+            cl_joined = "\n".join(cl_chunks)
+            self.assertNotIn("OLD_CLAUDE_TURN_1", cl_joined)
+            self.assertNotIn("OLD_CLAUDE_REPLY_1", cl_joined)
+            self.assertIn("[CLI Agent]\nClaude compact summary: keep refiner.py clean", cl_joined)
+            self.assertIn("[Speaker]\nNEW_CLAUDE_TURN", cl_joined)
+
+            snap_cx = tracker.sync_session(window_title="[codex:#99887766]")
+            assert snap_cx is not None
+            cx_chunks, _ = tracker.get_refiner_context(snap_cx.session_key, include_git_status=False)
+            cx_joined = "\n".join(cx_chunks)
+            self.assertNotIn("OLD_CODEX_TURN_1", cx_joined)
+            self.assertNotIn("OLD_CODEX_REPLY_1", cx_joined)
+            self.assertIn("RETAINED_CODEX_USER_MSG", cx_joined)
+            self.assertIn("RETAINED_CODEX_ASSISTANT_MSG", cx_joined)
+            self.assertIn("SUFFIX_REPLACEMENT_USER_MSG", cx_joined)
+            self.assertLess(cx_joined.index("RETAINED_CODEX_USER_MSG"), cx_joined.index("RETAINED_CODEX_ASSISTANT_MSG"))
+            self.assertIn("NEW_CODEX_REPLY", cx_joined)
+
+            # Second Codex compaction followed by legacy response_item-only turns still ingests cleanly
+            with cx_jsonl.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "type": "compacted",
+                            "payload": {"message": "LOCAL_COMPACT_SUMMARY", "replacement_history": []},
+                        }
+                    )
+                    + "\n"
+                    + json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "LEGACY_POST_COMPACT_TURN"}],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            snap_cx2 = tracker.sync_session(window_title="[codex:#99887766]")
+            assert snap_cx2 is not None
+            cx_chunks2, _ = tracker.get_refiner_context(snap_cx2.session_key, include_git_status=False)
+            cx_joined2 = "\n".join(cx_chunks2)
+            self.assertNotIn("NEW_CODEX_REPLY", cx_joined2)
+            self.assertIn("LOCAL_COMPACT_SUMMARY", cx_joined2)
+            self.assertIn("LEGACY_POST_COMPACT_TURN", cx_joined2)
+            os.close(agy_lock_fd)
+
 
 if __name__ == "__main__":
     unittest.main()

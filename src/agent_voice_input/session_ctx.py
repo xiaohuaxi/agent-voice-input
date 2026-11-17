@@ -165,6 +165,7 @@ class SessionState:
     codex_saw_item_completed: bool = False
     codex_item_turns: list[tuple[str, str]] = field(default_factory=list)
     codex_resp_turns: list[tuple[str, str]] = field(default_factory=list)
+    claude_just_compacted: bool = False
 
 
 @dataclass(frozen=True)
@@ -2460,6 +2461,29 @@ _CODEX_ENV_CTX_RE = re.compile(
 _CODEX_PERM_CTX_RE = re.compile(
     r"<permissions instructions>.*?</permissions instructions>", re.DOTALL | re.IGNORECASE
 )
+_CODEX_REC_PLUGINS_RE = re.compile(
+    r"<recommended_plugins>.*?</recommended_plugins>", re.DOTALL | re.IGNORECASE
+)
+_AGY_CHECKPOINT_PREAMBLE_RE = re.compile(
+    r"^\s*#\s*Resuming from a compaction\b.*?progress summary below:\s*",
+    re.DOTALL | re.IGNORECASE,
+)
+_AGY_CHECKPOINT_TAIL_RE = re.compile(
+    r"\n#\s*(?:Subagents|Conversation Logs)\b.*",
+    re.DOTALL,
+)
+
+
+def _extract_agy_compaction_summary(obj: Mapping[str, Any]) -> str | None:
+    """Return cleaned summary string when ``obj`` is an ``agy`` compaction ``CHECKPOINT`` record."""
+    if obj.get("source") != "SYSTEM" or obj.get("type") != "CHECKPOINT":
+        return None
+    raw = obj.get("content")
+    if not isinstance(raw, str):
+        return ""
+    cleaned = _AGY_CHECKPOINT_PREAMBLE_RE.sub("", raw)
+    cleaned = _AGY_CHECKPOINT_TAIL_RE.sub("", cleaned).strip()
+    return cleaned
 
 
 def _clean_agy_record(obj: Mapping[str, Any]) -> tuple[str, str] | None:
@@ -2501,22 +2525,18 @@ def _clean_claude_text(raw: str, *, role: str) -> str:
     return s.strip()
 
 
-def _clean_claude_record(obj: Mapping[str, Any]) -> tuple[str, str] | None:
-    if (
-        bool(obj.get("isSidechain"))
-        or bool(obj.get("isMeta"))
-        or bool(obj.get("isApiErrorMessage"))
-        or bool(obj.get("agentId"))
-        or bool(obj.get("agent_id"))
+def _is_claude_sidechain_or_subagent(obj: Mapping[str, Any]) -> bool:
+    return bool(
+        obj.get("isSidechain")
+        or obj.get("agentId")
+        or obj.get("agent_id")
         or obj.get("entrypoint") == "sdk-cli"
-    ):
-        return None
-    typ = obj.get("type")
-    if typ not in ("user", "assistant"):
-        return None
-    msg = obj.get("message")
-    if not isinstance(msg, dict):
-        return None
+    )
+
+
+def _extract_claude_message_text(msg: Any, *, role: str) -> str:
+    if not isinstance(msg, Mapping):
+        return ""
     content = msg.get("content")
     raw_parts: list[str] = []
     if isinstance(content, str):
@@ -2529,8 +2549,21 @@ def _clean_claude_record(obj: Mapping[str, Any]) -> tuple[str, str] | None:
                 if isinstance(txt, str) and txt:
                     raw_parts.append(txt)
     if not raw_parts:
+        return ""
+    return _clean_claude_text("\n".join(raw_parts), role=role)
+
+
+def _clean_claude_record(obj: Mapping[str, Any]) -> tuple[str, str] | None:
+    if (
+        _is_claude_sidechain_or_subagent(obj)
+        or bool(obj.get("isMeta"))
+        or bool(obj.get("isApiErrorMessage"))
+    ):
         return None
-    cleaned = _clean_claude_text("\n".join(raw_parts), role=typ)
+    typ = obj.get("type")
+    if typ not in ("user", "assistant"):
+        return None
+    cleaned = _extract_claude_message_text(obj.get("message"), role=typ)
     if not cleaned:
         return None
     return (typ, cleaned)
@@ -2586,12 +2619,60 @@ def _extract_codex_response_item(payload: Mapping[str, Any]) -> tuple[str, str] 
         if s.startswith("# AGENTS.md instructions"):
             continue
         s = _CODEX_ENV_CTX_RE.sub("", s)
-        s = _CODEX_PERM_CTX_RE.sub("", s).strip()
-        if not s or s.startswith("# AGENTS.md instructions"):
+        s = _CODEX_PERM_CTX_RE.sub("", s)
+        s = _CODEX_REC_PLUGINS_RE.sub("", s).strip()
+        if not s or s.startswith(("# AGENTS.md instructions", "<recommended_plugins>")):
             continue
         chunks.append(s)
     joined = "\n".join(chunks).strip()
     return (role, joined) if joined else None
+
+
+def _extract_codex_compacted_turns(payload: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Extract post-compaction summary / retained turns & uncompacted suffix from a Codex ``compacted`` record."""
+    retained_turns: list[tuple[str, str]] = []
+    rc = payload.get("retained_context")
+    if isinstance(rc, Mapping):
+        ordered: list[tuple[int, int, str, str]] = []
+        seq = 0
+        for key, role in (("user_messages", "user"), ("assistant_messages", "assistant")):
+            items = rc.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                txt = item.get("text")
+                if not isinstance(txt, str) or not txt.strip():
+                    continue
+                raw_ord = item.get("order")
+                ord_val = int(raw_ord) if isinstance(raw_ord, int) and not isinstance(raw_ord, bool) else (1_000_000 + seq)
+                ordered.append((ord_val, seq, role, txt.strip()))
+                seq += 1
+        ordered.sort(key=lambda t: (t[0], t[1]))
+        retained_turns = [(r, txt) for _, _, r, txt in ordered]
+
+    rh_turns: list[tuple[str, str]] = []
+    rh = payload.get("replacement_history")
+    if isinstance(rh, list):
+        for item in rh:
+            if isinstance(item, Mapping):
+                turn = _extract_codex_response_item(item)
+                if turn is not None:
+                    rh_turns.append(turn)
+
+    out: list[tuple[str, str]] = []
+    raw_msg = payload.get("message")
+    summary_txt = raw_msg.strip() if isinstance(raw_msg, str) else ""
+    if summary_txt and (not rh_turns or rh_turns[-1][1] != summary_txt):
+        out.append(("assistant", summary_txt))
+
+    out.extend(retained_turns)
+    seen_retained = set(retained_turns)
+    for turn in rh_turns:
+        if turn not in seen_retained:
+            out.append(turn)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3969,6 +4050,7 @@ class SessionTracker:
         state.codex_saw_item_completed = False
         state.codex_item_turns.clear()
         state.codex_resp_turns.clear()
+        state.claude_just_compacted = False
         state.generation += 1
 
     def _consume_parsed_record(self, state: SessionState, obj: Mapping[str, Any]) -> None:
@@ -3976,13 +4058,39 @@ class SessionTracker:
             state.cwd = _normalize_cwd(obj["cwd"])
 
         if state.cli == "agy":
+            cp_summary = _extract_agy_compaction_summary(obj)
+            if cp_summary is not None:
+                state.clean_turns.clear()
+                if cp_summary:
+                    state.clean_turns.append(("assistant", cp_summary))
+                state.luna_synced_idx = 0
+                state.generation += 1
+                return
             turn = _clean_agy_record(obj)
             if turn is not None:
                 state.clean_turns.append(turn)
 
         elif state.cli == "claude":
+            if not _is_claude_sidechain_or_subagent(obj):
+                if obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
+                    state.clean_turns.clear()
+                    state.luna_synced_idx = 0
+                    state.generation += 1
+                    state.claude_just_compacted = True
+                    return
+                if obj.get("type") == "user" and bool(obj.get("isCompactSummary")):
+                    state.clean_turns.clear()
+                    state.luna_synced_idx = 0
+                    if not state.claude_just_compacted:
+                        state.generation += 1
+                    state.claude_just_compacted = False
+                    summary_txt = _extract_claude_message_text(obj.get("message"), role="user")
+                    if summary_txt:
+                        state.clean_turns.append(("assistant", summary_txt))
+                    return
             turn = _clean_claude_record(obj)
             if turn is not None:
+                state.claude_just_compacted = False
                 state.clean_turns.append(turn)
 
         elif state.cli == "codex":
@@ -3991,6 +4099,14 @@ class SessionTracker:
             if typ == "session_meta" and isinstance(payload, dict) and not state.cwd:
                 if isinstance(payload.get("cwd"), str):
                     state.cwd = _normalize_cwd(payload["cwd"])
+            elif typ == "compacted" and isinstance(payload, dict):
+                seed_turns = _extract_codex_compacted_turns(payload)
+                state.codex_saw_item_completed = False
+                state.codex_item_turns.clear()
+                state.codex_resp_turns = list(seed_turns)
+                state.clean_turns.clear()
+                state.luna_synced_idx = 0
+                state.generation += 1
             elif typ == "event_msg" and isinstance(payload, dict):
                 if payload.get("type") == "item_completed":
                     turn = _extract_codex_item_completed(payload)

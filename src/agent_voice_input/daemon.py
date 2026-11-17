@@ -8,7 +8,15 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from . import __version__
-from .asr_providers import AsrError, AsrResult, BaseAsrProvider, _sleep_cooperative, create_asr_provider
+from .asr_providers import (
+    AsrError,
+    AsrResult,
+    BaseAsrProvider,
+    ChatAudioAsrProvider,
+    GeminiAudioProvider,
+    _sleep_cooperative,
+    create_asr_provider,
+)
 from .audio_proc import AudioGateResult, DEFAULT_MAX_CHUNK_SEC, inspect_wav_chunks, process_wav, save_failed_audio
 from .config import Config, ProviderCredentials, ensure_secure_dir, get_runtime_dir, redact_secrets, resolve_credentials, select_asr_provider
 from .hud import is_toast_hud_state
@@ -92,6 +100,22 @@ def _deliver_with_origin(
     if before_clipboard_write is not None and _accepts("before_clipboard_write"):
         kw["before_clipboard_write"] = before_clipboard_write
     return platform.deliver_text(text, **kw)
+
+
+def _may_run_stage2_refiner(
+    cfg: Config, refiner: BaseRefiner, asr_provider: BaseAsrProvider
+) -> bool:
+    prov = cfg.refiner.provider.strip().lower()
+    if prov in ("", "off", "none", "false", "0", "disabled"):
+        return False
+    if getattr(refiner, "provider_name", "off") in ("", "off", "none"):
+        return False
+    if not cfg.refiner.force_on_single_hop and (
+        isinstance(asr_provider, (GeminiAudioProvider, ChatAudioAsrProvider))
+        or bool(getattr(asr_provider, "single_hop", False))
+    ):
+        return False
+    return True
 
 
 def _will_run_stage2_refiner(cfg: Config, refiner: BaseRefiner, asr_res: AsrResult) -> bool:
@@ -303,7 +327,9 @@ def run_pipeline_once(
     eff_tracker = tracker or SessionTracker(env=eff_env)
     eff_asr = asr_provider or create_asr_provider(cfg, eff_creds, env=eff_env)
     owns_refiner = refiner is None
-    eff_refiner = refiner or create_refiner(cfg, eff_creds, env=eff_env)
+    eff_refiner = refiner or create_refiner(
+        cfg, eff_creds, env=eff_env, runtime_dir=runtime_dir
+    )
     can_save_failed = runtime_dir is not None and audio_source not in ("file", "selftest_wav", "retry")
 
     def _stash_failed(gate_res: AudioGateResult, snap_res: SessionSnapshot | None, win_res: ForegroundWindow) -> str:
@@ -340,6 +366,15 @@ def run_pipeline_once(
             )
             asr_ctx = eff_tracker.build_asr_context(snap)
             cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled)
+            if (
+                not (cancel_check is not None and cancel_check())
+                and _may_run_stage2_refiner(cfg, eff_refiner, eff_asr)
+                and (prep_fn := getattr(eff_refiner, "prepare_session", None)) is not None
+            ):
+                try:
+                    prep_fn(snap.session_key if snap else "")
+                except Exception:
+                    pass
             try:
                 asr_res, chunk_count, chunk_secs = _transcribe_wav_chunks(
                     gate.wav_bytes,
