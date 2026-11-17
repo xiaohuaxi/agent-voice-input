@@ -30,7 +30,7 @@
 ## 核心亮点
 
 - **精准绑定当前活跃 Agent 上下文**：自动识别前台终端窗口、Ghostty 分屏或 `tmux` 焦点窗格（无需修改 `~/.tmux.conf`）中的主 Agent 会话，增量抽取最近对话与 `git status` 变更文件名供精修纠偏，严格隔离后台 subagent 与相邻分屏。
-- **按渠道即插即用的「识别 + 精修」双引擎**：默认采用「极速语音转写 + 本地常驻 `codex` 会话轻量精修」，也支持切换任意内置云端/本地 API 渠道，或使用 Gemini / OpenRouter 多模态单跳直出；日常只需指定 `provider`，自动匹配对应渠道的默认模型。
+- **按渠道即插即用的「识别 + 精修」双引擎**：默认采用「极速语音转写 + 复用本机 `codex` 登录态的无状态 Keep-Alive 精修」，也支持切换任意内置云端/本地 API 渠道，或使用 Gemini / OpenRouter 多模态单跳直出；日常只需指定 `provider`，自动匹配对应渠道的默认模型。
 - **面向长口述与连续口述的可靠录音链**：支持在上一句转写/精修期间直接开始下一段录音并按序串行上屏（切走窗口回退剪贴板的多段结果自动空行拼接、不覆盖前文）；内置静音门控与响度归一化拦截空触；单次默认最长 10 分钟（最后 15 秒胶囊倒计时提示），超过 3 分钟的长语音自动挑自然停顿处切分并并发转写；无麦克风或中途掉麦即时提醒；转写或上屏失败自动暂存音频，随时用 `agent-voice-input retry` 恢复，绝不丢话。
 - **原生高分屏波形胶囊与防串窗安全粘贴**：Windows（Per-Monitor V2 HiDPI）与 macOS（Retina 原生面板）均提供不抢焦点的悬浮胶囊（计时、实时声波与阶段进度自动跟随系统中英文）；开始录音即锁定目标终端窗口/分屏，只粘贴不自动回车，中途切走焦点则自动退回剪贴板防误投。
 - **零第三方 Python 依赖**：仅使用 Python `>= 3.10` 标准库与宿主机 `ffmpeg`（WSL2 复用系统内置 `powershell.exe`，macOS 首次启动自动编译缓存原生 `mac_shim`）。
@@ -115,15 +115,17 @@ agent-voice-input start
 - **两阶段模式 vs 多模态单跳模式（`asr.api`）**：
   - 默认 `asr.api = "auto"` 会自动按渠道与模型选择协议：`dashscope`、`doubao` 与专用 STT 模型（如 `qwen/qwen3-asr-1.7b`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）走一阶段纯转写 + 二阶段语境精修；
   - 原生 `gemini` 以及 OpenRouter / OpenAI 兼容渠道下的多模态音频理解模型（如 `gemini-2.5-flash`、`google/gemini-2.5-flash`、`gpt-audio*`）自动将音频与会话上下文合并为单次请求一步完成转写与精修，并默认跳过二阶段（除非设置 `refiner.force_on_single_hop = true`）。在 `openrouter` 下使用未内置收录的新模型时，请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
+- **二阶段协议选择（`refiner.api`）**：支持 `"auto" | "chat-completions" | "responses"`。默认 `"auto"` 将 `codex` 路由至纯无状态 HTTP `/responses`（`store=false`、`stream=true`），将 `gemini` 路由至原生 `:generateContent`，其余兼容渠道保持 `/chat/completions`；在 `openai`、`openrouter` 或 `openai-compatible` 下亦可显式设 `refiner.api = "responses"` 启用无状态 `/responses` 引擎。
 - **思考档位控制（`effort`）**：支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`。`asr.effort` 默认 `"auto"`（自动压低多模态模型的默认思考延迟），`refiner.effort` 默认 `"low"`。
-- **精修提示词与前缀缓存组织（`refiner.prompt`、`include_git_status`、`context_max_chars`）**：`prompt` 默认留空 `""` 时使用内置英文语音听写编辑提示词（结合只读 `<session_reference_log>` 上下文分块与 `<workspace_git_status>` 修正同音错字与代码术语、顺通口语停顿并保持原句结构与说话语言、严禁把口述提问当成对话回答），亦可在 `[refiner]` 中用 TOML 三引号多行文本 `prompt = '''...'''` 定制。终端历史对话（默认上限 `context_max_chars = 200000` 字符，满窗按四分之一即 `50K` 整块滑出）按固定前缀顺序置于单条 `user` 消息前部，易变的当轮语音草稿与 `git status` 文件列表统一放在该消息最末尾（`include_git_status = true`，可设为 `false` 关闭）以命中自动前缀缓存（`codex` 渠道按会话复用 `thread/revert` 清空的固定线程壳以保持 `prompt_cache_key` 命中且不残留历史草稿）。
+- **精修提示词与前缀缓存组织（`refiner.prompt`、`include_git_status`、`context_max_chars`）**：`prompt` 默认留空 `""` 时使用内置英文语音听写编辑提示词（结合只读 `<session_reference_log>` 上下文分块与 `<workspace_git_status>` 修正同音错字与代码术语、顺通口语停顿并保持原句结构与说话语言、严禁把口述提问当成对话回答），亦可在 `[refiner]` 中用 TOML 三引号多行文本 `prompt = '''...'''` 定制。终端历史对话（默认上限 `context_max_chars = 200000` 字符，满窗按四分之一即 `50K` 整块滑出）按固定分块置于前部（`/responses` 下作 `developer` 消息块，`/chat/completions` 下置于单条 `user` 消息前部），易变的当轮语音草稿与 `git status` 文件列表统一放在末尾（`include_git_status = true`，可设为 `false` 关闭）以稳定命中前缀缓存（`codex` 配合确定性会话 `prompt_cache_key` 与负载均衡亲和性 Cookie 实现 95%+ 缓存命中且零历史草稿残留）。
 - **同渠道重试与建连超时（`max_retries`）**：`[asr] max_retries` 与 `[refiner] max_retries` 默认 `2`（`0..10`，指首次请求之外的额外重试次数，`0` 关闭重试），在阶段 `timeout_sec` 总预算与独立的 9 秒建连/TLS 握手超时上限内，区分频率限流（`HTTP 429`、`Retry-After`、厂商 QPS 码）与瞬态通信/5xx 错误分别退避重试。
+- **可选本地 MP3 录音环形归档（`audio.save_recordings`）**：默认关闭（`false`）。显式设为 `true` 时，后台异步通过 `ffmpeg` 将有效非静音录音压缩为 `16 kHz` 单声道 `32 kbps` MP3 以 `0600` 权限保存至 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`，并按修改时间保留最新 `save_recordings_max_count`（默认 `50`，范围 `1..5000`）条，不阻塞实时识别与上屏耗时。
 
 ### 内置渠道一览
 
 | `provider` | 可用阶段 | 内置默认 `asr.model` | 内置默认 `refiner.model` | 凭据来源 / 环境变量 |
 | :--- | :--- | :--- | :--- | :--- |
-| **`codex`** | `refiner` | — | `gpt-6-luna` | 复用本机 `codex` CLI 登录态 *(只读无工具常驻会话，绝不开启 Fast 模式)* |
+| **`codex`** | `refiner` | — | `gpt-6-luna` | 复用本机 `codex` CLI 登录态 *(无状态 HTTP `/responses` 直连 + 30 分钟提前安全刷新，绝不开启 Fast 模式)* |
 | **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` | `qwen-turbo-latest` | `DASHSCOPE_API_KEY` *(兼容 `ALI_API_KEY`)* |
 | **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` *(自动探测可用槽位)* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-1-6-flash` | `ARK_API_KEY` *(兼容 `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
@@ -140,7 +142,7 @@ agent-voice-input start
 ### 常见 `config.toml` 配方
 
 ```toml
-# 配方 1：国内低延迟主力（百炼 ASR + 本机常驻 Codex 精修；未装 Codex 可将 refiner.provider 改为 "dashscope" 或 "volcengine"）
+# 配方 1：国内低延迟主力（百炼 ASR + 本机无状态 Codex 精修；未装 Codex 可将 refiner.provider 改为 "dashscope" 或 "volcengine"）
 [asr]
 provider = "dashscope"
 
@@ -194,6 +196,7 @@ agent-voice-input key-test               # 测试按键扫描码与修饰键捕�
 | `--asr-effort` | 一阶段思考档位 |
 | `--refiner`, `--refiner-provider` | 二阶段渠道（`codex`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`） |
 | `--refiner-model` | 二阶段上游模型 ID |
+| `--refiner-api` | 二阶段协议（`auto`, `chat-completions`, `responses`） |
 | `--refiner-effort`, `--effort` | 二阶段思考档位 |
 
 *（环境变量用于存放各厂商凭据、引导路径 `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR` 及底层运行期诊断项；常规参数统一在 `config.toml` 中配置。）*

@@ -32,10 +32,11 @@
 ## 运行边界与验证
 
 - 测试隔离：`tests/` 保持离线可重入，不访问外网，不读写宿主机真实配置与运行期目录（`~/.config`、`$XDG_RUNTIME_DIR` 等）。
-- 脱敏与状态隐私：异常摘要、日志与 `status` 快照输出经 `redact_secrets` 脱敏，不在运行状态文件中落盘用户语音原文（仅在识别或投递失败时允许以 `0600` 权限将当次 WAV 原子暂存于运行目录 `failed/` 供 `retry` 恢复，保留 24 小时内最近 10 条）。
+- 脱敏与状态隐私：异常摘要、日志与 `status` 快照输出经 `redact_secrets` 脱敏，不在运行状态文件中落盘用户语音原文；录音仅在识别/投递失败时以 `0600` 权限原子暂存于运行目录 `failed/`（保留 24 小时内最近 10 条 WAV 供 `retry` 恢复），或用户显式开启 `audio.save_recordings = true` 时以 `0600` 权限环形归档于本地缓存目录 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`（绝不进状态文件或版本库）。
 - WSL2 宿主机交互：改动 WSL2 桥接前先读 `src/agent_voice_input/platform_wsl.py`；宿主机可能关闭 `appendWindowsPath`（`powershell.exe` 不在 `PATH`），统一复用既有路径解析入口，单次非交互调用关闭标准输入防管道阻塞挂起。
 - macOS 宿主机交互：改动 macOS 桥接前先读 `src/agent_voice_input/platform_macos.py` 与 `src/agent_voice_input/mac_shim.swift`；macOS 麦克风 TCC 权限归属责任进程，经 SSH 仅作单测、编译与自检，实机录音用的守护进程在本机已获麦克风授权的图形终端（如 Ghostty）内启动或重启（经 `sshd` 拉起会被系统静默喂全 0 静音帧）。
-- 红线：`src/agent_voice_input/refiner.py` 拉起后台 `codex` 子进程仅作无工具纯文本精修，不得开启 Fast 模式。
+- 红线：`src/agent_voice_input/refiner.py` 的精修请求及凭据刷新拉起的 `codex` 子进程仅作无工具纯文本精修与认证状态读取，严禁开启 Fast 模式（不得传 `service_tier="fast"` 或任何 Fast 配置）。
 - 单元测试：`PYTHONPATH=src python3 -m unittest discover -s tests -v`
+- 真实系统自检、精修基准与线上诊断：后续新增功能或性能优化触及 ASR、精修器、会话上下文、守护进程或终端投递时，除离线单测外，须通过 `.agents/skills/voice-eval/`（`e2e_system.py` / `bench_refiner.py`）在本机隔离运行目录完成真实系统自检；排查实机口述变慢与缓存未命中时用 `diagnose_live.py` 只读核验（严禁把真实会话、录音或运行流水入库）。
 - 提交前密钥扫描：`gitleaks protect --staged -v` 与 `gitleaks detect --source . -v`
 - 推送与远端工作流闭环：仓库启用了 GitHub Actions（`.github/workflows/ci.yml` 覆盖 Python 3.10+ 多版本与双平台矩阵，推 `v*` tag 另触发 `.github/workflows/publish.yml`）；执行 `git push`（含推分支或推 tag）后不直接结束任务，继续通过 `gh run list` / `gh run watch` 跟进当次触发的远端工作流直至全绿，遇失败当场定位修复。

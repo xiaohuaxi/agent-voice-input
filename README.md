@@ -31,7 +31,7 @@ Generic OS dictation has no idea what files, symbols, or CLI flags exist in your
 ## Why It Works Better for Coding Agents
 
 - **Grounded in Your Active Agent Session**: Automatically resolves the foreground agent session inside your active terminal window, Ghostty split, or `tmux` pane (zero `~/.tmux.conf` changes needed), incrementally extracting recent dialogue and `git status` paths as context while strictly ignoring background subagents and sibling splits.
-- **Provider-Driven Speech + Context Pipeline**: Pairs fast dedicated speech-to-text with a resident tool-free `codex` refiner by default, switches cleanly to any built-in cloud/local API provider, or runs single-hop multimodal audio + context refinement (Gemini / OpenRouter)—just pick a `provider` and its built-in default model applies automatically.
+- **Provider-Driven Speech + Context Pipeline**: Pairs fast dedicated speech-to-text with a stateless Keep-Alive `codex` refiner by default, switches cleanly to any built-in cloud/local API provider, or runs single-hop multimodal audio + context refinement (Gemini / OpenRouter)—just pick a `provider` and its built-in default model applies automatically.
 - **Built for Long & Back-to-Back Dictation**: Start a new recording immediately while earlier utterances are still transcribing or refining—utterances queue and paste in FIFO order (joining consecutive focus-drifted clipboard fallbacks with a blank line instead of overwriting); local silence gating and loudness normalization block empty triggers; supports up to 10-minute recordings by default (with a 15s HUD countdown), splits recordings over 3 minutes (`180s`) at natural pauses for concurrent transcription, alerts immediately if a mic is missing or unplugged, and stashes failed audio for `agent-voice-input retry` so long thoughts are never lost.
 - **Native HiDPI Waveform HUD & Focus-Safe Paste**: Non-activating floating capsule on both Windows (Per-Monitor V2 HiDPI) and macOS (Retina AppKit) displays live timer, waveform bars, and stage progress in English or Chinese matching your desktop locale. Locks onto the origin terminal window/split on record start, never auto-presses Enter, and falls back to clipboard if focus moved elsewhere.
 - **Zero Extra Python Dependencies**: Pure Python `>= 3.10` standard library plus host `ffmpeg` (uses built-in `powershell.exe` on WSL2; compiles and caches a native `mac_shim` helper via `/usr/bin/swiftc` on macOS).
@@ -110,21 +110,23 @@ Configuration uses two clean files (`CLI flags > config.toml > built-in defaults
 - **`~/.config/agent-voice-input/config.toml`**: Structured `[hotkey]`, `[ui]`, `[audio]`, `[asr]`, and `[refiner]` settings.
 - **`~/.config/agent-voice-input/agent-voice-input.env`**: API credentials (prefix-style aliases also supported; see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)).
 
-### How `provider`, `model`, and `asr.api` Work
+### How `provider`, `model`, `asr.api`, and `refiner.api` Work
 
 - **Provider-first defaults (`model` is optional)**: Leave `model = ""` (or omit it) in `[asr]` and `[refiner]` to automatically use the selected `provider`'s built-in default model. Overriding `provider` via CLI without specifying `model` cleanly resets any config-file `model` to the new provider's default. When explicitly set, `model` passes the upstream model ID verbatim.
 - **Two-stage STT vs. single-hop multimodal (`asr.api`)**:
   - `asr.api = "auto"` (default) routes `dashscope`, `doubao`, and dedicated STT models (`qwen/qwen3-asr-1.7b`, `whisper-*`, `*-transcribe`, `SenseVoiceSmall`, etc.) through Stage 1 transcription + Stage 2 context refinement;
   - Native `gemini` and multimodal chat-audio models on OpenRouter / OpenAI-compatible channels (`gemini-2.5-flash`, `google/gemini-2.5-flash`, `gpt-audio*`, etc.) perform transcription + context refinement in a single hop and skip Stage 2 automatically (unless `refiner.force_on_single_hop = true`). For newly released uncataloged models on `openrouter`, set `asr.api = "audio-transcriptions"` or `"chat-completions"` explicitly.
+- **Stage 2 wire protocol (`refiner.api`)**: Accepts `"auto" | "chat-completions" | "responses"`. `"auto"` (default) routes `codex` to stateless HTTP `/responses` (`store=false`, `stream=true`), `gemini` to native `:generateContent`, and all other providers to `/chat/completions`; set `refiner.api = "responses"` on `openai`, `openrouter`, or `openai-compatible` to opt into the stateless `/responses` engine.
 - **Reasoning budget (`effort`)**: Accepts `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`. `asr.effort` defaults to `"auto"` (suppressing thinking latency on supported multimodal models); `refiner.effort` defaults to `"low"`.
-- **Stage 2 prompt & context caching (`refiner.prompt`, `include_git_status`, `context_max_chars`)**: Leave `prompt = ""` (default) to use the built-in English voice-dictation editor prompt (repairs ASR typos/identifiers from read-only `<session_reference_log>` blocks and `<workspace_git_status>`, smooths spoken disfluencies while preserving original sentence structure and language, and strictly forbids answering dictated questions), or customize it with TOML multiline strings `prompt = '''...'''`. Recent dialogue (up to `context_max_chars = 200000`, evicted in ~1/4-window `50K` blocks) is placed at the start of a single `user` message ahead of the current draft and trailing `git status` paths (`include_git_status = true` by default) for automatic prefix caching (`codex` reuses a reverted per-session shell thread to preserve `prompt_cache_key` without retaining prior drafts).
+- **Stage 2 prompt & context caching (`refiner.prompt`, `include_git_status`, `context_max_chars`)**: Leave `prompt = ""` (default) to use the built-in English voice-dictation editor prompt (repairs ASR typos/identifiers from read-only `<session_reference_log>` blocks and `<workspace_git_status>`, smooths spoken disfluencies while preserving original sentence structure and language, and strictly forbids answering dictated questions), or customize it with TOML multiline strings `prompt = '''...'''`. Recent dialogue (up to `context_max_chars = 200000`, evicted in ~1/4-window `50K` blocks) is segmented into immutable `<session_reference_log>` prefix blocks (`developer` messages on `/responses`, or leading blocks in a single `user` message on `/chat/completions`) ahead of the current draft and trailing `git status` paths (`include_git_status = true` by default) for high-hit prefix caching (`codex` pairs deterministic per-session `prompt_cache_key` with Keep-Alive edge-affinity cookies).
 - **Same-provider retries & handshake timeout (`max_retries`)**: `[asr] max_retries` and `[refiner] max_retries` default to `2` (`0..10`, extra retries beyond the initial request; `0` disables retries), separating rate-limit throttling (`HTTP 429`, `Retry-After`, vendor QPS codes) from transient network/5xx errors under the stage `timeout_sec` budget with a 9s connect/TLS handshake cap.
+- **Optional local MP3 recording archive (`audio.save_recordings`)**: Disabled by default (`false`). When enabled, valid non-silent recordings are compressed asynchronously via `ffmpeg` (`16 kHz` mono `32 kbps` MP3) into `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/` with `0600` permissions and ring-pruned to the newest `save_recordings_max_count` (`50` by default, `1..5000`) files without adding latency to live dictation.
 
 ### Built-in Providers
 
 | `provider` | Stages | Built-in Default `asr.model` | Built-in Default `refiner.model` | Credential Source / Env |
 | :--- | :--- | :--- | :--- | :--- |
-| **`codex`** | `refiner` | — | `gpt-6-luna` | Local `codex` CLI login *(resident read-only tool-free session; never enables Fast mode)* |
+| **`codex`** | `refiner` | — | `gpt-6-luna` | Local `codex` CLI login *(stateless HTTP `/responses` + 30m safe refresh; never enables Fast mode)* |
 | **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` | `qwen-turbo-latest` | `DASHSCOPE_API_KEY` *(compat: `ALI_API_KEY`)* |
 | **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` *(auto-probes granted slot)* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-1-6-flash` | `ARK_API_KEY` *(compat: `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
@@ -158,7 +160,7 @@ effort = "auto"
 ```
 
 ```toml
-# Recipe 3: Low-latency Mainland China setup (DashScope STT + resident local Codex or API refiner)
+# Recipe 3: Low-latency Mainland China setup (DashScope STT + stateless local Codex or API refiner)
 [asr]
 provider = "dashscope"
 
@@ -195,6 +197,7 @@ agent-voice-input key-test               # Inspect raw key scancodes / modifier 
 | `--asr-effort` | Stage 1 thinking budget |
 | `--refiner`, `--refiner-provider` | Stage 2 provider (`codex`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`) |
 | `--refiner-model` | Stage 2 upstream model ID |
+| `--refiner-api` | Stage 2 protocol (`auto`, `chat-completions`, `responses`) |
 | `--refiner-effort`, `--effort` | Stage 2 thinking budget |
 
 *(Environment variables are reserved for API credentials, bootstrap paths `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR`, and low-level runtime/diagnostic hooks; ordinary options live in `config.toml`.)*

@@ -59,6 +59,7 @@ VALID_REFINER_PROVIDERS = frozenset(
         "off",
     }
 )
+VALID_REFINER_APIS = frozenset({"auto", "chat-completions", "responses"})
 VALID_EFFORTS = frozenset(
     {"auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
@@ -187,6 +188,8 @@ class AudioConfig:
     macos_device: str = "default"
     beep: bool = False
     tail_drain_sec: float | None = None
+    save_recordings: bool = False
+    save_recordings_max_count: int = 50
 
     def effective_tail_drain_sec(self, *, macos: bool = False) -> float:
         if self.tail_drain_sec is not None:
@@ -228,6 +231,7 @@ class AsrConfig:
 class RefinerConfig:
     provider: str = "codex"
     model: str = ""
+    api: str = "auto"
     effort: str = "low"
     prompt: str = ""
     include_git_status: bool = True
@@ -257,6 +261,37 @@ class RefinerConfig:
             return self.base_url.strip()
         prov = (resolved_provider or self.provider).strip().lower()
         return DEFAULT_REFINER_BASE_URLS.get(prov, "")
+
+    def effective_api(self, resolved_provider: str | None = None) -> str:
+        if not isinstance(self.api, str):
+            raise ConfigError(f"refiner.api: expected string, got {type(self.api).__name__}")
+        req_api = (self.api or "auto").strip().lower()
+        if req_api not in VALID_REFINER_APIS:
+            raise ConfigError(
+                f"refiner.api must be one of {sorted(VALID_REFINER_APIS)}, got {self.api!r}"
+            )
+        prov = (resolved_provider or self.provider).strip().lower()
+        if prov in ("", "none", "false", "0", "disabled"):
+            prov = "off"
+        if prov == "off":
+            return "off"
+        if prov == "gemini":
+            if req_api != "auto":
+                raise ConfigError(
+                    f"refiner.api={req_api!r} is incompatible with provider 'gemini' "
+                    "(uses native Gemini :generateContent; keep refiner.api='auto')"
+                )
+            return "gemini" if is_gemini_native_url(self.base_url) else "chat-completions"
+        if prov == "codex":
+            if req_api == "chat-completions":
+                raise ConfigError(
+                    "refiner.api='chat-completions' is incompatible with provider 'codex' "
+                    "(uses stateless 'responses' API; keep refiner.api='auto' or 'responses')"
+                )
+            return "responses"
+        if req_api == "auto":
+            return "chat-completions"
+        return req_api
 
 
 @dataclass
@@ -414,6 +449,26 @@ def get_runtime_dir(
     if create:
         ensure_secure_dir(rt_dir, expected_uid=uid)
     return rt_dir
+
+
+def resolve_saved_recordings_dir(
+    env: Mapping[str, str] | None = None,
+    *,
+    uid: int | None = None,
+    create: bool = False,
+) -> Path:
+    """Return ``${XDG_CACHE_HOME}/agent-voice-input/recordings`` (or ``~/.cache/agent-voice-input/recordings``)."""
+    src_env = os.environ if env is None else env
+    cache_home = (src_env.get("XDG_CACHE_HOME") or "").strip()
+    if cache_home:
+        rec_dir = expand_user_path(cache_home, env=src_env) / "agent-voice-input" / "recordings"
+    else:
+        raw_home = (src_env.get("HOME") or "").strip()
+        base_home = expand_user_path(raw_home, env=src_env) if raw_home else Path.home()
+        rec_dir = base_home / ".cache" / "agent-voice-input" / "recordings"
+    if create:
+        ensure_secure_dir(rec_dir, expected_uid=uid)
+    return rec_dir
 
 
 # ---------------------------------------------------------------------------
@@ -1203,6 +1258,10 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.audio.beep = _as_bool(v, "audio.beep")
             elif k == "tail_drain_sec":
                 cfg.audio.tail_drain_sec = _as_float(v, "audio.tail_drain_sec")
+            elif k == "save_recordings":
+                cfg.audio.save_recordings = _as_bool(v, "audio.save_recordings")
+            elif k == "save_recordings_max_count":
+                cfg.audio.save_recordings_max_count = _as_int(v, "audio.save_recordings_max_count")
             else:
                 raise ConfigError(f"unknown audio option {k!r}")
 
@@ -1270,6 +1329,9 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
         has_explicit_ref_model = (
             ref.get("model") is not None and str(ref.get("model")).strip() != ""
         )
+        has_explicit_ref_api = (
+            ref.get("api") is not None and str(ref.get("api")).strip() != ""
+        )
         has_explicit_ref_base_url = (
             ref.get("base_url") is not None and str(ref.get("base_url")).strip() != ""
         )
@@ -1283,6 +1345,8 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.refiner.provider = _normalize_refiner_provider(v)
             elif k == "model":
                 cfg.refiner.model = _as_str(v, "refiner.model").strip()
+            elif k == "api":
+                cfg.refiner.api = _as_str(v, "refiner.api").strip().lower()
             elif k == "effort":
                 cfg.refiner.effort = _as_str(v, "refiner.effort").strip().lower()
             elif k == "prompt":
@@ -1308,6 +1372,8 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
         if has_explicit_ref_provider and cfg.refiner.provider != prev_ref_provider:
             if not has_explicit_ref_model:
                 cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
+            if not has_explicit_ref_api:
+                cfg.refiner.api = "auto"
             if not has_explicit_ref_base_url:
                 cfg.refiner.base_url = ""
             if not has_explicit_ref_key_env:
@@ -1522,6 +1588,18 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
         raise ConfigError("audio.max_gain_db must satisfy 0.0 <= max_gain_db <= 120.0")
     if cfg.audio.tail_drain_sec is not None and not (0.0 <= cfg.audio.tail_drain_sec <= 5.0):
         raise ConfigError("audio.tail_drain_sec must satisfy 0.0 <= tail_drain_sec <= 5.0")
+    if not isinstance(cfg.audio.save_recordings, bool):
+        raise ConfigError(
+            f"audio.save_recordings: invalid boolean value {cfg.audio.save_recordings!r}"
+        )
+    if (
+        isinstance(cfg.audio.save_recordings_max_count, bool)
+        or not isinstance(cfg.audio.save_recordings_max_count, int)
+        or not (1 <= cfg.audio.save_recordings_max_count <= 5000)
+    ):
+        raise ConfigError(
+            "audio.save_recordings_max_count must satisfy 1 <= save_recordings_max_count <= 5000"
+        )
 
     if cfg.asr.provider not in VALID_ASR_PROVIDERS:
         raise ConfigError(
@@ -1597,6 +1675,7 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
             f"refiner.provider must be one of {sorted(VALID_REFINER_PROVIDERS)}, "
             f"got {cfg.refiner.provider!r}"
         )
+    cfg.refiner.effective_api(cfg.refiner.provider)
     if cfg.refiner.provider != "off" and cfg.refiner.effort not in VALID_EFFORTS:
         raise ConfigError(
             f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, "
@@ -1828,16 +1907,19 @@ _BEARER_RE = re.compile(r"(\bBearer\s+)[A-Za-z0-9._~+/=-]{4,}", re.IGNORECASE)
 _SK_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}")
 _GSK_TOKEN_RE = re.compile(r"\bgsk_[A-Za-z0-9_-]{12,}")
 _AIZA_TOKEN_RE = re.compile(r"\bAIza[0-9A-Za-z_-]{12,}")
+_JWT_TOKEN_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}\b")
 _URL_USERINFO_SECRET_RE = re.compile(r"(https?://[^/\s:@]+:)[^/\s@]+(@)", re.IGNORECASE)
+_SECRET_KEY_ALT = (
+    r"x-api-key|x-api-access-key|x-api-app-key|x-goog-api-key|chatgpt[-_]account[-_]id|authorization|"
+    r"api_?key|access_?key|access_?token|refresh_?token|id_?token|auth_?token|account_?id|"
+    r"app_?id|api_?id|app_?key|secret|token|password"
+)
 _QUOTED_KEYVAL_SECRET_RE = re.compile(
-    r"""((['"])(?:x-api-key|x-api-access-key|x-api-app-key|x-goog-api-key|authorization|"""
-    r"""api_?key|access_?key|app_?id|api_?id|app_?key|secret|token|password)\2\s*:\s*)(['"])"""
-    r"""(?:\\.|(?!\3)[^\\])*?\3""",
+    rf"""((['"])(?:{_SECRET_KEY_ALT})\2\s*:\s*)(['"])(?:\\.|(?!\3)[^\\])*?\3""",
     re.IGNORECASE | re.DOTALL,
 )
 _ESCAPED_QUOTED_KEYVAL_SECRET_RE = re.compile(
-    r"""(\\(['"])(?:x-api-key|x-api-access-key|x-api-app-key|x-goog-api-key|authorization|"""
-    r"""api_?key|access_?key|app_?id|api_?id|app_?key|secret|token|password)\\\2\s*:\s*)(\\(['"]))"""
+    rf"""(\\(['"])(?:{_SECRET_KEY_ALT})\\\2\s*:\s*)(\\(['"]))"""
     r"""(?:(?!\4)[^\\]|\\\\\\\\|\\\\\\\4|\\\\\\(?!\\|\4)[^\\]|\\\\(?!\\|\4)[^\\]|\\(?!\\|\4)[^\\])*(\\\4)""",
     re.IGNORECASE | re.DOTALL,
 )
@@ -1847,12 +1929,13 @@ _AUTH_HEADER_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 _UNQUOTED_HEADER_SECRET_RE = re.compile(
-    r"((?:x-api-key|x-api-access-key|x-api-app-key|x-goog-api-key)\s*[:=]\s*)"
+    r"(\b(?:x-api-key|x-api-access-key|x-api-app-key|x-goog-api-key|chatgpt[-_]account[-_]id|"
+    r"access_?token|refresh_?token|id_?token|auth_?token|account_?id)\s*[:=]\s*)"
     r"(?:(['\"])(?:\\[^\r\n]|(?!\2)[^\\\r\n])*\2|[^\s\"',;}\]\r\n]+)",
     re.IGNORECASE,
 )
 _QUERY_SECRET_RE = re.compile(
-    r"([?&](?:key|api_key|access_key|access_token|token)=)[^&\s\"']+",
+    r"([?&](?:key|api_key|access_key|access_token|refresh_token|id_token|auth_token|account_id|token)=)[^&\s\"']+",
     re.IGNORECASE,
 )
 
@@ -1940,4 +2023,5 @@ def redact_secrets(
     out = _SK_TOKEN_RE.sub("[REDACTED]", out)
     out = _GSK_TOKEN_RE.sub("[REDACTED]", out)
     out = _AIZA_TOKEN_RE.sub("[REDACTED]", out)
+    out = _JWT_TOKEN_RE.sub("[REDACTED]", out)
     return out

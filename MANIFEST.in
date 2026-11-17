@@ -3,4 +3,6 @@ include bin/agent-voice-input
 include src/agent_voice_input/win_shim.ps1 src/agent_voice_input/mac_shim.swift
 recursive-include integrations *
 recursive-include tests *.py
+prune .agents
+prune .claude
 global-exclude __pycache__ *.py[cod]

@@ -41,6 +41,9 @@ macos_device = "default"
 beep = false
 # Tail drain seconds after stopping recording (auto-adapts by platform when unset: 0.65s on WSL2/RDP, 0.20s on macOS)
 # tail_drain_sec = 0.65
+# Optional local MP3 ring archive of valid voiced recordings under ~/.cache/agent-voice-input/recordings/ (0600 mode, off by default)
+# save_recordings = false
+# save_recordings_max_count = 50
 
 [asr]
 # Stage 1 speech-to-text provider:
@@ -81,7 +84,7 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 # Stage 2 context-aware refinement provider:
 # "codex" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
 # Built-in default models (used when model = "" or when provider is overridden via CLI without a new model):
-# - codex             -> "gpt-6-luna" (resident codex app-server per-session reverted shell thread; never enables Fast mode)
+# - codex             -> "gpt-6-luna" (stateless Keep-Alive HTTP /responses reusing local codex login; never enables Fast mode)
 # - dashscope         -> "qwen-turbo-latest"
 # - volcengine        -> "doubao-seed-1-6-flash"
 # - openrouter        -> "google/gemini-2.5-flash-lite"
@@ -94,13 +97,16 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 provider = "codex"
 # Leave empty "" to use the selected provider's built-in default model above
 model = ""
+# Stage 2 wire protocol:
+# "auto" ("responses" for codex, "gemini" for gemini, "chat-completions" for other providers) | "chat-completions" | "responses"
+api = "auto"
 # Stage 2 thinking/reasoning budget:
 # "auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 effort = "low"
 # Custom Stage 2 system prompt (leave empty "" to use the built-in English voice-dictation editor prompt).
 # Supports TOML multiline literal strings '''...''' (no backslash escaping needed) or """...""";
-# requests supply read-only <session_reference_log> context blocks followed by <asr_draft_to_clean>
-# (and optional <workspace_git_status>) at the end of a single user message:
+# requests supply read-only <session_reference_log> context blocks (as developer messages on /responses,
+# or leading user blocks on /chat/completions) followed by <asr_draft_to_clean> and optional <workspace_git_status>:
 # prompt = '''
 # You are a stateless, non-conversational voice-dictation text editor, NOT a chat or coding assistant.
 # Fix ASR homophones/typos using <session_reference_log> and <workspace_git_status>, smooth spoken disfluencies,

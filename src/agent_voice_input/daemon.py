@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-import concurrent.futures, inspect, json, os, signal, socket, sys, threading, time
+import concurrent.futures, fcntl, inspect, json, os, signal, socket, stat, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -17,8 +17,25 @@ from .asr_providers import (
     _sleep_cooperative,
     create_asr_provider,
 )
-from .audio_proc import AudioGateResult, DEFAULT_MAX_CHUNK_SEC, inspect_wav_chunks, process_wav, save_failed_audio
-from .config import Config, ProviderCredentials, ensure_secure_dir, get_runtime_dir, redact_secrets, resolve_credentials, select_asr_provider
+from .audio_proc import (
+    AudioGateResult,
+    DEFAULT_MAX_CHUNK_SEC,
+    inspect_wav_chunks,
+    process_wav,
+    save_failed_audio,
+    spawn_recording_archive,
+    wait_recording_archives,
+)
+from .config import (
+    Config,
+    ProviderCredentials,
+    ensure_secure_dir,
+    get_runtime_dir,
+    redact_secrets,
+    resolve_credentials,
+    resolve_saved_recordings_dir,
+    select_asr_provider,
+)
 from .hud import is_toast_hud_state
 from .platform_macos import MacOSPlatform, is_macos_terminal_window
 from .platform_wsl import (
@@ -33,12 +50,264 @@ from .refiner import BaseRefiner, RefinerResult, create_refiner
 from .session_ctx import SessionSnapshot, SessionTracker
 
 
+TELEMETRY_FILENAME: str = "telemetry.jsonl"
+TELEMETRY_MAX_BYTES: int = 256 * 1024
+RECENT_RESULTS_MAXLEN: int = 20
+
+
+def _elapsed_ms(t0: float, clock_fn: Callable[[], float] = time.monotonic) -> int:
+    return max(0, int(round((clock_fn() - t0) * 1000)))
+
+
 @dataclass(frozen=True)
 class PipelineResult:
-    ok: bool; seq_id: int; final_text: str = ""; skipped_reason: str = ""; audio_source: str = ""
-    switched_fallback: bool = False; gate: AudioGateResult | None = None; session: SessionSnapshot | None = None
-    asr: AsrResult | None = None; refined: RefinerResult | None = None; paste: PasteOutcome | None = None; error: str = ""
-    asr_chunks: int = 1; asr_chunk_secs: tuple[float, ...] = (); saved_audio: str = ""
+    ok: bool
+    seq_id: int
+    final_text: str = ""
+    skipped_reason: str = ""
+    audio_source: str = ""
+    switched_fallback: bool = False
+    gate: AudioGateResult | None = None
+    session: SessionSnapshot | None = None
+    asr: AsrResult | None = None
+    refined: RefinerResult | None = None
+    paste: PasteOutcome | None = None
+    error: str = ""
+    asr_chunks: int = 1
+    asr_chunk_secs: tuple[float, ...] = ()
+    saved_audio: str = ""
+    gate_ms: int = 0
+    sync_ms: int = 0
+    refine_init_ms: int = 0
+    deliver_ms: int = 0
+    total_ms: int = 0
+    ctx_chars: int = 0
+    ctx_chunks: int = 0
+
+
+def build_pipeline_summary(
+    seq_id: int,
+    res: PipelineResult,
+    *,
+    dry_run: bool = False,
+    recorder_lost: bool = False,
+    recovery_count: int = 0,
+    recovery_gap_ms: int = 0,
+    audio_error: str = "",
+    redact_fn: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
+    """Build a strictly text-free, secret-redacted numeric summary for status & telemetry.jsonl."""
+    clean_str = redact_fn if redact_fn is not None else (lambda s: redact_secrets(s))
+    in_tok = res.refined.input_tokens if res.refined else None
+    cached_tok = res.refined.cached_input_tokens if res.refined else None
+    out_tok = res.refined.output_tokens if res.refined else None
+    rsn_tok = res.refined.reasoning_tokens if res.refined else None
+    summary: dict[str, Any] = {
+        "ts": round(time.time(), 6),
+        "seq_id": seq_id,
+        "ok": res.ok,
+        "skipped_reason": res.skipped_reason,
+        "audio_source": res.audio_source,
+        "switched_fallback": res.switched_fallback,
+        "session_key": res.session.session_key if res.session else "",
+        "asr_provider": res.asr.provider if res.asr else "",
+        "asr_model": res.asr.model if res.asr else "",
+        "refiner_provider": res.refined.provider if res.refined else "",
+        "refiner_model": res.refined.model if res.refined else "",
+        "refiner_fallback": res.refined.used_fallback if res.refined else "",
+        "pasted": res.paste.pasted if res.paste else False,
+        "paste_reason": res.paste.reason if res.paste else ("dry_run" if dry_run and res.ok else ""),
+        "raw_audio_sec": round(res.gate.duration_sec, 3) if res.gate else 0.0,
+        "voiced_audio_sec": round(res.gate.voiced_sec, 3) if res.gate else 0.0,
+        "gate_ms": res.gate_ms,
+        "sync_ms": res.sync_ms,
+        "asr_ms": res.asr.latency_ms if res.asr else 0,
+        "refine_init_ms": res.refine_init_ms,
+        "refine_ms": res.refined.latency_ms if res.refined else 0,
+        "deliver_ms": res.deliver_ms,
+        "total_ms": res.total_ms,
+        "asr_chars": len(res.asr.text.strip()) if res.asr else 0,
+        "final_chars": len(res.final_text),
+        "ctx_chars": res.ctx_chars,
+        "ctx_chunks": res.ctx_chunks,
+        "input_tokens": in_tok,
+        "cached_input_tokens": cached_tok,
+        "output_tokens": out_tok,
+        "reasoning_tokens": rsn_tok,
+    }
+    if in_tok is not None and in_tok > 0 and cached_tok is not None:
+        summary["cache_hit_pct"] = round(100.0 * cached_tok / in_tok, 1)
+    if res.asr and res.asr.retries > 0:
+        summary["asr_retries"] = res.asr.retries
+    if res.refined and res.refined.retries > 0:
+        summary["refiner_retries"] = res.refined.retries
+    if res.refined and res.refined.warning:
+        summary["refiner_warning"] = clean_str(res.refined.warning)
+    if res.error:
+        summary["error"] = clean_str(res.error)
+    if res.asr_chunks > 1:
+        summary["asr_chunks"] = res.asr_chunks
+        if res.asr_chunk_secs:
+            summary["asr_chunk_secs"] = list(res.asr_chunk_secs)
+    if res.saved_audio:
+        summary["saved_audio"] = res.saved_audio
+    if dry_run:
+        summary["dry_run"] = True
+    if recorder_lost:
+        summary["capture_interrupted"] = True
+    if recovery_count > 0:
+        summary["recovery_count"] = recovery_count
+        summary["recovery_gap_ms"] = recovery_gap_ms
+    if (not res.ok or recorder_lost) and audio_error:
+        summary["audio_error"] = clean_str(audio_error)
+    return summary
+
+
+def append_telemetry_record(
+    runtime_dir: Path,
+    record: Mapping[str, Any],
+    *,
+    max_bytes: int = TELEMETRY_MAX_BYTES,
+) -> None:
+    """Append one pure-numeric JSON record to ``0600`` ``telemetry.jsonl`` with atomic >256KB tail truncation."""
+    try:
+        rt = ensure_secure_dir(runtime_dir)
+        telemetry_path = rt / TELEMETRY_FILENAME
+        lock_path = rt / ".telemetry.lock"
+        line_bytes = (json.dumps(dict(record), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        lfd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | nofollow, 0o600)
+        os.fchmod(lfd, 0o600)
+        with os.fdopen(lfd, "r+", encoding="utf-8") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                try:
+                    st_pre = os.lstat(telemetry_path)
+                    if not stat.S_ISREG(st_pre.st_mode):
+                        return
+                except FileNotFoundError:
+                    pass
+                afd = os.open(
+                    str(telemetry_path),
+                    os.O_CREAT | os.O_WRONLY | os.O_APPEND | nofollow,
+                    0o600,
+                )
+                os.fchmod(afd, 0o600)
+                with os.fdopen(afd, "wb") as af:
+                    af.write(line_bytes)
+                    af.flush()
+                st = os.lstat(telemetry_path)
+                if not stat.S_ISREG(st.st_mode) or st.st_size <= max_bytes:
+                    return
+                keep_target = max(1, max_bytes // 2)
+                seek_pos = max(0, st.st_size - keep_target)
+                with open(telemetry_path, "rb") as rf:
+                    if seek_pos > 0:
+                        rf.seek(seek_pos)
+                    raw_tail = rf.read()
+                if seek_pos > 0:
+                    nl = raw_tail.find(b"\n")
+                    if 0 <= nl < len(raw_tail) - 1:
+                        tail = raw_tail[nl + 1 :]
+                    else:
+                        tail = line_bytes if len(line_bytes) <= max_bytes else b""
+                else:
+                    tail = raw_tail
+                tmp_path = rt / f".{TELEMETRY_FILENAME}.trim.{os.getpid()}.{time.monotonic_ns()}.tmp"
+                tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY | nofollow, 0o600)
+                closed_tfd = False
+                try:
+                    os.fchmod(tfd, 0o600)
+                    tf_obj = os.fdopen(tfd, "wb")
+                    closed_tfd = True
+                    with tf_obj as tf:
+                        tf.write(tail)
+                        tf.flush()
+                    os.replace(tmp_path, telemetry_path)
+                except Exception:
+                    if not closed_tfd:
+                        try:
+                            os.close(tfd)
+                        except OSError:
+                            pass
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+
+
+def read_telemetry_history(
+    runtime_dir: Path,
+    limit: int = 10,
+    *,
+    max_scan_bytes: int = TELEMETRY_MAX_BYTES + 65536,
+) -> list[dict[str, Any]]:
+    """Read up to ``limit`` most recent JSONL telemetry records from ``runtime_dir / telemetry.jsonl``."""
+    eff_limit = max(0, int(limit))
+    if eff_limit <= 0:
+        return []
+    telemetry_path = runtime_dir / TELEMETRY_FILENAME
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(telemetry_path), os.O_RDONLY | nofollow)
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+                return []
+            seek_pos = max(0, st.st_size - max(4096, int(max_scan_bytes)))
+            if seek_pos > 0:
+                f.seek(seek_pos)
+            raw = f.read()
+        if seek_pos > 0:
+            nl = raw.find(b"\n")
+            if 0 <= nl < len(raw) - 1:
+                raw = raw[nl + 1 :]
+        out: list[dict[str, Any]] = []
+        for raw_ln in raw.splitlines():
+            ln = raw_ln.strip()
+            if not ln:
+                continue
+            try:
+                obj = json.loads(ln.decode("utf-8", errors="replace"))
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
+        return out[-eff_limit:]
+    except Exception:
+        return []
+
+
+def merge_recent_results(
+    mem_items: Sequence[Mapping[str, Any]],
+    disk_items: Sequence[Mapping[str, Any]],
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Merge persisted telemetry records with live in-memory ``recent_results`` without duplicates."""
+    eff_limit = max(0, int(limit))
+    if eff_limit <= 0:
+        return []
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any]] = set()
+    for rec in disk_items:
+        d = dict(rec)
+        key = (d.get("ts"), d.get("seq_id"))
+        if d.get("ts") is not None:
+            seen.add(key)
+        merged.append(d)
+    for rec in mem_items:
+        d = dict(rec)
+        key = (d.get("ts"), d.get("seq_id"))
+        if d.get("ts") is not None and key in seen:
+            continue
+        if d.get("ts") is not None:
+            seen.add(key)
+        merged.append(d)
+    return merged[-eff_limit:]
 
 
 def create_platform(cfg: Config, *, env: Mapping[str, str] | None = None) -> WslPlatform | MacOSPlatform:
@@ -321,6 +590,7 @@ def run_pipeline_once(
     runtime_dir: Path | None = None,
     max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
     env: Mapping[str, str] | None = None,
+    archive_sink: Callable[[threading.Thread], None] | None = None,
 ) -> PipelineResult:
     eff_env = os.environ if env is None else env
     eff_creds = creds or resolve_credentials(cfg, eff_env)
@@ -331,6 +601,7 @@ def run_pipeline_once(
         cfg, eff_creds, env=eff_env, runtime_dir=runtime_dir
     )
     can_save_failed = runtime_dir is not None and audio_source not in ("file", "selftest_wav", "retry")
+    local_archive_threads: list[threading.Thread] = []
 
     def _stash_failed(gate_res: AudioGateResult, snap_res: SessionSnapshot | None, win_res: ForegroundWindow) -> str:
         if not can_save_failed or runtime_dir is None or not gate_res.wav_bytes:
@@ -343,14 +614,36 @@ def run_pipeline_once(
         )
         return str(saved) if saved is not None else ""
 
+    t_total0 = time.monotonic()
     try:
         if isinstance(raw_wav, (bytes, bytearray)) and len(raw_wav) == 0:
             sw = bool(platform and platform.switch_to_fallback_audio()) if audio_source in ("pulse", "winmm") else False
-            return PipelineResult(False, seq_id, skipped_reason="empty_audio", audio_source=audio_source, switched_fallback=sw)
+            return PipelineResult(False, seq_id, skipped_reason="empty_audio", audio_source=audio_source, switched_fallback=sw, total_ms=_elapsed_ms(t_total0))
+        t_gate0 = time.monotonic()
         gate = process_wav(raw_wav, cfg.audio)
+        gate_ms = _elapsed_ms(t_gate0)
         if not gate.passed:
             sw = bool(gate.all_zero and gate.reason == "silence" and audio_source == "pulse" and platform and platform.switch_to_fallback_audio())
-            return PipelineResult(False, seq_id, skipped_reason=gate.reason, audio_source=audio_source, switched_fallback=sw, gate=gate)
+            return PipelineResult(False, seq_id, skipped_reason=gate.reason, audio_source=audio_source, switched_fallback=sw, gate=gate, gate_ms=gate_ms, total_ms=_elapsed_ms(t_total0))
+        if cfg.audio.save_recordings and audio_source not in ("retry", "selftest_wav"):
+            try:
+                if isinstance(raw_wav, (bytes, bytearray, memoryview)):
+                    arch_bytes = bytes(raw_wav)
+                else:
+                    arch_bytes = Path(raw_wav).read_bytes() or gate.wav_bytes
+                arch_th = spawn_recording_archive(
+                    arch_bytes,
+                    resolve_saved_recordings_dir(eff_env),
+                    max_count=cfg.audio.save_recordings_max_count,
+                )
+                if arch_th is not None:
+                    if archive_sink is not None:
+                        archive_sink(arch_th)
+                    else:
+                        local_archive_threads.append(arch_th)
+            except Exception:
+                pass
+        t_sync0 = time.monotonic()
         win = origin_window or (platform.get_foreground_window() if platform else ForegroundWindow())
         snap: SessionSnapshot | None = None
         try:
@@ -365,16 +658,20 @@ def run_pipeline_once(
                 else eff_tracker.sync_session(window_title=window_title_override)
             )
             asr_ctx = eff_tracker.build_asr_context(snap)
+            sync_ms = _elapsed_ms(t_sync0)
             cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled)
+            prep_ms = 0
             if (
                 not (cancel_check is not None and cancel_check())
                 and _may_run_stage2_refiner(cfg, eff_refiner, eff_asr)
                 and (prep_fn := getattr(eff_refiner, "prepare_session", None)) is not None
             ):
+                t_prep0 = time.monotonic()
                 try:
                     prep_fn(snap.session_key if snap else "")
                 except Exception:
                     pass
+                prep_ms = _elapsed_ms(t_prep0)
             try:
                 asr_res, chunk_count, chunk_secs = _transcribe_wav_chunks(
                     gate.wav_bytes,
@@ -397,17 +694,21 @@ def run_pipeline_once(
                         gate=gate,
                         session=snap,
                         saved_audio=saved_p,
+                        gate_ms=gate_ms,
+                        sync_ms=sync_ms,
+                        refine_init_ms=prep_ms,
+                        total_ms=_elapsed_ms(t_total0),
                     )
                 raise
             if not asr_res.text.strip():
                 if cancel_check is not None and cancel_check():
                     saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                    return PipelineResult(False, seq_id, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+                    return PipelineResult(False, seq_id, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0))
                 saved_p = _stash_failed(gate, snap, win)
-                return PipelineResult(False, seq_id, skipped_reason="empty_asr", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+                return PipelineResult(False, seq_id, skipped_reason="empty_asr", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0))
             if cancel_check is not None and cancel_check():
                 saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                return PipelineResult(False, seq_id, final_text=asr_res.text.strip(), skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+                return PipelineResult(False, seq_id, final_text=asr_res.text.strip(), skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0))
             if _will_run_stage2_refiner(cfg, eff_refiner, asr_res) and on_stage is not None:
                 on_stage("refining")
             ref_res = _call_refiner_refine(
@@ -418,15 +719,22 @@ def run_pipeline_once(
                 fallback_context=asr_ctx.dialog_text,
                 is_cancelled=cancel_check,
             )
+            refine_init_ms = prep_ms + (ref_res.init_ms if ref_res else 0)
+            ctx_chars = ref_res.context_chars if ref_res else 0
+            ctx_chunks = ref_res.context_chunks if ref_res else 0
             final_text = ref_res.text.strip() or asr_res.text.strip()
             if cancel_check is not None and cancel_check():
                 saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks)
+            deliver_ms = 0
             if dry_run or (platform is None and deliver_fn is None):
                 paste_out = None
             elif deliver_fn is not None:
+                t_deliv0 = time.monotonic()
                 paste_out = deliver_fn(final_text, win)
+                deliver_ms = _elapsed_ms(t_deliv0)
             else:
+                t_deliv0 = time.monotonic()
                 paste_out = _deliver_with_origin(
                     platform,
                     final_text,
@@ -434,11 +742,12 @@ def run_pipeline_once(
                     origin_window=win,
                     is_cancelled=cancel_check,
                 )
+                deliver_ms = _elapsed_ms(t_deliv0)
             if paste_out is not None and paste_out.reason == "cancelled" and cancel_check is not None and cancel_check():
                 saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, deliver_ms=deliver_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks)
             saved_p = _stash_failed(gate, snap, win) if (paste_out is not None and not paste_out.pasted and not paste_out.clipboard) else ""
-            return PipelineResult(True, seq_id, final_text=final_text, audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, paste=paste_out, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p)
+            return PipelineResult(True, seq_id, final_text=final_text, audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, paste=paste_out, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, deliver_ms=deliver_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks)
         except Exception as exc:
             if saved_p := _stash_failed(gate, snap, win):
                 try:
@@ -449,6 +758,8 @@ def run_pipeline_once(
     finally:
         if owns_refiner:
             eff_refiner.close()
+        if local_archive_threads:
+            wait_recording_archives(local_archive_threads, timeout_sec=2.0)
 
 
 def send_control_command(runtime_dir: Path, payload: Mapping[str, Any], timeout_sec: float = 8.0) -> dict[str, Any]:
@@ -519,12 +830,14 @@ class VoiceInputDaemon:
         self._main_hud_state: str = ""
         self._main_hud_visible: bool = False
         self._origin_win, self.last_result, self._srv_sock = ForegroundWindow(), {}, None
+        self.recent_results: deque[dict[str, Any]] = deque(maxlen=RECENT_RESULTS_MAXLEN)
         self._cur_no_paste, self._cur_silent_hud = False, False
         self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
         self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
         self._recorder_lost_seq, self._recorder_lost_ts, self._recorder_lost_stop_absorbed = -1, -1e9, False
         self._auto_stop_seq, self._auto_stop_ts, self._auto_stop_absorbed = -1, -1e9, False
         self._max_dur_timer: threading.Timer | None = None
+        self._archive_threads: set[threading.Thread] = set()
         if (setter := getattr(self.platform, "set_recorder_lost_callback", None)) is not None:
             setter(self._on_recorder_lost)
         if (rec_setter := getattr(self.platform, "set_recorder_recovered_callback", None)) is not None:
@@ -534,6 +847,18 @@ class VoiceInputDaemon:
     def pid_path(self) -> Path: return self.runtime_dir / "daemon.pid"
     @property
     def sock_path(self) -> Path: return self.runtime_dir / "control.sock"
+    @property
+    def telemetry_path(self) -> Path: return self.runtime_dir / TELEMETRY_FILENAME
+
+    def _record_result_locked(self, summary: dict[str, Any]) -> dict[str, Any]:
+        summary.setdefault("ts", round(time.time(), 6))
+        self.last_result = summary
+        snap = dict(summary)
+        self.recent_results.append(snap)
+        return snap
+
+    def _append_telemetry(self, summary: Mapping[str, Any]) -> None:
+        append_telemetry_record(self.runtime_dir, summary)
 
     def is_current_seq(self, seq_id: int) -> bool:
         with self._lock:
@@ -759,13 +1084,16 @@ class VoiceInputDaemon:
                             self._recorder_lost_seq = cur_seq
                             self._recorder_lost_ts = lost_ts
                             self._recorder_lost_stop_absorbed = False
-                        self.last_result = {
-                            "seq_id": cur_seq,
-                            "ok": False,
-                            "skipped_reason": "mic_permission",
-                            "audio_source": src_used,
-                            "error": perm_err,
-                        }
+                        perm_snap = self._record_result_locked(
+                            {
+                                "seq_id": cur_seq,
+                                "ok": False,
+                                "skipped_reason": "mic_permission",
+                                "audio_source": src_used,
+                                "error": perm_err,
+                            }
+                        )
+                    self._append_telemetry(perm_snap)
                     if not eff_silent:
                         if resume_state != "idle":
                             self._hud(resume_state)
@@ -795,7 +1123,8 @@ class VoiceInputDaemon:
                     if rec_cnt > 0:
                         lr_lost["recovery_count"] = rec_cnt
                         lr_lost["recovery_gap_ms"] = rec_gap
-                    self.last_result = lr_lost
+                    lost_snap = self._record_result_locked(lr_lost)
+                self._append_telemetry(lost_snap)
                 if not eff_silent:
                     if resume_state != "idle":
                         self._hud(resume_state)
@@ -858,30 +1187,17 @@ class VoiceInputDaemon:
         recovery_gap_ms: int = 0,
         audio_error: str | None = None,
     ) -> dict[str, Any]:
-        summary: dict[str, Any] = {"seq_id": seq_id, "ok": res.ok, "skipped_reason": res.skipped_reason, "audio_source": res.audio_source, "switched_fallback": res.switched_fallback, "session_key": res.session.session_key if res.session else "", "asr_provider": res.asr.provider if res.asr else "", "refiner_fallback": res.refined.used_fallback if res.refined else "", "pasted": res.paste.pasted if res.paste else False, "paste_reason": res.paste.reason if res.paste else ("dry_run" if dry_run and res.ok else ""), "raw_audio_sec": round(res.gate.duration_sec, 3) if res.gate else 0.0, "voiced_audio_sec": round(res.gate.voiced_sec, 3) if res.gate else 0.0, "asr_ms": res.asr.latency_ms if res.asr else 0, "refine_ms": res.refined.latency_ms if res.refined else 0, "asr_chars": len(res.asr.text.strip()) if res.asr else 0, "final_chars": len(res.final_text)}
-        if res.asr and res.asr.retries > 0:
-            summary["asr_retries"] = res.asr.retries
-        if res.refined and res.refined.retries > 0:
-            summary["refiner_retries"] = res.refined.retries
-        if res.refined and res.refined.warning:
-            summary["refiner_warning"] = self._redact_str(res.refined.warning)
-        if res.asr_chunks > 1:
-            summary["asr_chunks"] = res.asr_chunks
-            if res.asr_chunk_secs:
-                summary["asr_chunk_secs"] = list(res.asr_chunk_secs)
-        if res.saved_audio:
-            summary["saved_audio"] = res.saved_audio
-        if dry_run:
-            summary["dry_run"] = True
-        if recorder_lost:
-            summary["capture_interrupted"] = True
-        if recovery_count > 0:
-            summary["recovery_count"] = recovery_count
-            summary["recovery_gap_ms"] = recovery_gap_ms
         eff_audio_err = str(getattr(self.platform, "last_audio_error", "") or "") if audio_error is None else audio_error
-        if (not res.ok or recorder_lost) and eff_audio_err:
-            summary["audio_error"] = self._redact_str(eff_audio_err)
-        return summary
+        return build_pipeline_summary(
+            seq_id,
+            res,
+            dry_run=dry_run,
+            recorder_lost=recorder_lost,
+            recovery_count=recovery_count,
+            recovery_gap_ms=recovery_gap_ms,
+            audio_error=eff_audio_err,
+            redact_fn=self._redact_str,
+        )
 
     def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False, from_hotkey: bool = False, expected_seq_id: int | None = None) -> dict[str, Any]:
         arrival_ts = self.clock_fn()
@@ -1073,7 +1389,8 @@ class VoiceInputDaemon:
                         lr: dict[str, Any] = {"seq_id": cur_seq, "ok": False, "error": err}
                         if err_reason:
                             lr["skipped_reason"] = err_reason
-                        self.last_result = lr
+                        lr_snap = self._record_result_locked(lr)
+                    self._append_telemetry(lr_snap)
                     if still_cur and not eff_silent:
                         if err_state == "idle":
                             self._hud(err_hud_state, duration_ms=err_hud_dur, clear_main=True)
@@ -1116,7 +1433,8 @@ class VoiceInputDaemon:
                     lr_stop: dict[str, Any] = {"seq_id": cur_seq, "ok": False, "error": err}
                     if err_reason:
                         lr_stop["skipped_reason"] = err_reason
-                    self.last_result = lr_stop
+                    lr_stop_snap = self._record_result_locked(lr_stop)
+                self._append_telemetry(lr_stop_snap)
                 if not eff_silent:
                     if err_stop_state == "idle":
                         if still_cur:
@@ -1248,6 +1566,7 @@ class VoiceInputDaemon:
                 on_stage=lambda st: self._on_pipeline_stage(task.seq_id, st, task.silent_hud),
                 runtime_dir=self.runtime_dir,
                 env=self.env,
+                archive_sink=self._register_archive_thread,
             )
             summary = self._build_summary(
                 task.seq_id,
@@ -1275,7 +1594,14 @@ class VoiceInputDaemon:
                 hud_st, beep_k = "error", "error"
         except Exception as exc:
             hud_st, beep_k = "error", "error"
-            summary = {"seq_id": task.seq_id, "ok": False, "error": self._redact(exc)}
+            summary = {
+                "seq_id": task.seq_id,
+                "ok": False,
+                "audio_source": task.audio_source,
+                "asr_provider": getattr(self.asr_provider, "provider_name", ""),
+                "refiner_provider": getattr(self.refiner, "provider_name", ""),
+                "error": self._redact(exc),
+            }
             if task.recorder_lost:
                 summary["capture_interrupted"] = True
             if task.recovery_count > 0:
@@ -1297,11 +1623,14 @@ class VoiceInputDaemon:
                 self._recompute_state_locked()
             return
 
+        summary.setdefault("ts", round(time.time(), 6))
+        self._append_telemetry(summary)
+
         with self._trigger_lock:
             hud_calls: list[tuple[str, int, str | None, bool | None]] = []
             play_beep = ""
             with self._lock:
-                self.last_result = summary
+                self._record_result_locked(summary)
                 prev_state = self.state
                 if self._active_task is task:
                     self._active_task = None
@@ -1357,6 +1686,9 @@ class VoiceInputDaemon:
             shim_ok = not bool(getattr(self.platform, "_shim_disabled", False))
             raw_shim_err = str(getattr(self.platform, "last_shim_error", "") or "")
             shim_err = self._redact_str(raw_shim_err) if raw_shim_err else ""
+            raw_hist = req.get("history")
+            want_hist = raw_hist is not None and not isinstance(raw_hist, bool)
+            hist_limit = max(0, min(500, int(raw_hist))) if want_hist else 0
             with self._lock:
                 resp: dict[str, Any] = {
                     "ok": True,
@@ -1372,7 +1704,16 @@ class VoiceInputDaemon:
                 }
                 if shim_err:
                     resp["shim_error"] = shim_err
-                return resp
+                mem_snap = [dict(r) for r in self.recent_results] if want_hist else []
+            if want_hist:
+                disk_items = read_telemetry_history(
+                    self.runtime_dir, limit=max(hist_limit, RECENT_RESULTS_MAXLEN)
+                )
+                merged = merge_recent_results(mem_snap, disk_items, limit=hist_limit)
+                resp["recent_results"] = merged
+                if not resp["last_result"] and merged:
+                    resp["last_result"] = dict(merged[-1])
+            return resp
         if cmd in ("toggle", "rec_start", "rec_stop"):
             win = (
                 _window_from_mapping(req)
@@ -1419,7 +1760,8 @@ class VoiceInputDaemon:
             )
             summary = self._build_summary(cur_seq, res, dry_run=True, audio_error="")
             with self._lock:
-                self.last_result = summary
+                st_snap = self._record_result_locked(summary)
+            self._append_telemetry(st_snap)
             return {"ok": res.ok, "seq_id": cur_seq, "skipped_reason": res.skipped_reason, "asr_text": res.asr.text if res.asr else "", "final_text": res.final_text, "summary": summary}
         if cmd == "shutdown":
             self._stop_evt.set()
@@ -1459,6 +1801,19 @@ class VoiceInputDaemon:
             if is_main and prev_term is not None: signal.signal(signal.SIGTERM, prev_term)
             self.close()
 
+    def _register_archive_thread(self, th: threading.Thread) -> None:
+        with self._lock:
+            self._archive_threads = {t for t in self._archive_threads if t.is_alive()}
+            self._archive_threads.add(th)
+
+    def wait_pending_archives(self, timeout_sec: float = 2.0) -> None:
+        with self._lock:
+            pending = [t for t in self._archive_threads if t.is_alive()]
+        if pending:
+            wait_recording_archives(pending, timeout_sec=timeout_sec)
+        with self._lock:
+            self._archive_threads = {t for t in self._archive_threads if t.is_alive()}
+
     def close(self) -> None:
         self._stop_evt.set()
         self._cancel_max_duration_timer()
@@ -1476,4 +1831,7 @@ class VoiceInputDaemon:
         self.refiner.close()
         if worker is not None and worker.is_alive() and worker is not threading.current_thread():
             worker.join(timeout=1.5)
+        self.wait_pending_archives(timeout_sec=2.0)
         self.platform.close()
+
+    stop = close

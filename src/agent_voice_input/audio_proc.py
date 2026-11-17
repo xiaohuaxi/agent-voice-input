@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Sequence
+from typing import Iterable, Sequence
 import wave
 
 from .config import AudioConfig, ensure_secure_dir
@@ -534,7 +534,7 @@ def prune_failed_audio_dir(
         except OSError:
             continue
         if entry.name.startswith("."):
-            if entry.name.endswith(".tmp") and (now - st.st_mtime) > 600.0:
+            if (entry.name.endswith(".tmp") or entry.name.startswith(".rec-")) and (now - st.st_mtime) > 600.0:
                 try:
                     entry.unlink(missing_ok=True)
                 except OSError:
@@ -662,3 +662,240 @@ def resolve_failed_audio(runtime_dir: Path, selector: str | None = None) -> Path
         names = ", ".join(p.name for p in substr[:5])
         raise FileNotFoundError(f"ambiguous failed audio selector {sel!r} matched {len(substr)} files: {names}")
     raise FileNotFoundError(f"no failed audio matching {sel!r} (run 'agent-voice-input retry --list')")
+
+
+SAVED_RECORDING_EXTS: tuple[str, ...] = (".mp3", ".m4a", ".wav")
+
+
+def _is_saved_recording_entry(entry: Path) -> bool:
+    name = entry.name
+    return (
+        name.startswith("rec-")
+        and not name.startswith(".")
+        and name.lower().endswith(SAVED_RECORDING_EXTS)
+    )
+
+
+def prune_saved_recordings_dir(
+    recordings_dir: Path,
+    *,
+    max_count: int = 50,
+    now_ts: float | None = None,
+) -> None:
+    """Retain at most ``max_count`` newest ``rec-*`` files ordered by mtime, pruning older entries."""
+    if not recordings_dir.is_dir() or recordings_dir.is_symlink():
+        return
+    now = time.time() if now_ts is None else now_ts
+    eff_max = max(1, int(max_count))
+    alive: list[tuple[int, str, Path]] = []
+    try:
+        entries = list(recordings_dir.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                continue
+            st = entry.stat()
+        except OSError:
+            continue
+        if entry.name.startswith("."):
+            if (entry.name.endswith(".tmp") or entry.name.startswith(".rec-")) and (now - st.st_mtime) > 600.0:
+                try:
+                    entry.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            continue
+        if _is_saved_recording_entry(entry):
+            alive.append((st.st_mtime_ns, entry.name, entry))
+
+    if len(alive) > eff_max:
+        alive.sort(key=lambda item: (item[0], item[1]))
+        for _, _, old_path in alive[: len(alive) - eff_max]:
+            try:
+                old_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def list_saved_recordings(recordings_dir: Path) -> list[Path]:
+    """Return archived ``rec-*`` files ordered newest-first (read-only; never mutates disk)."""
+    if not recordings_dir.is_dir() or recordings_dir.is_symlink():
+        return []
+    items: list[tuple[int, str, Path]] = []
+    try:
+        for entry in recordings_dir.iterdir():
+            if not _is_saved_recording_entry(entry) or entry.is_symlink():
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            if st.st_size > 0:
+                items.append((st.st_mtime_ns, entry.name, entry))
+    except OSError:
+        return []
+    items.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [p for _, _, p in items]
+
+
+def _write_temp_0600(path: Path, data: bytes) -> None:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+    closed = False
+    try:
+        os.fchmod(fd, 0o600)
+        fobj = os.fdopen(fd, "wb")
+        closed = True
+        with fobj as f:
+            f.write(data)
+            f.flush()
+    except Exception:
+        if not closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+
+
+def archive_recording_audio(
+    raw_wav_bytes: bytes,
+    recordings_dir: Path,
+    *,
+    max_count: int = 50,
+    ffmpeg_bin: str = "/usr/bin/ffmpeg",
+    now_ts: float | None = None,
+    timeout_sec: float = 15.0,
+) -> Path | None:
+    """Compress voiced WAV to 16 kHz mono 32 kbps MP3 (fallback AAC .m4a / .wav) with 0600 mode & ring pruning."""
+    if not raw_wav_bytes:
+        return None
+    tmp_in: Path | None = None
+    tmp_candidates: list[Path] = []
+    try:
+        rec_dir = ensure_secure_dir(recordings_dir)
+        ts = time.time() if now_ts is None else now_ts
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(ts))
+        rand_hex = os.urandom(3).hex()
+        uniq = f"{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}"
+        tmp_in = rec_dir / f".rec-in-{uniq}.wav.tmp"
+        _write_temp_0600(tmp_in, raw_wav_bytes)
+
+        chosen_tmp: Path | None = None
+        chosen_ext = ".wav"
+        exe: str | None = None
+        try:
+            exe = resolve_ffmpeg_bin(ffmpeg_bin)
+        except Exception:
+            exe = None
+
+        if exe is not None:
+            for ext, fmt_args in (
+                (".mp3", ("-f", "mp3", "-c:a", "libmp3lame", "-b:a", "32k")),
+                (".m4a", ("-f", "ipod", "-c:a", "aac", "-b:a", "32k")),
+            ):
+                tmp_out = rec_dir / f".rec-out-{uniq}{ext}"
+                tmp_candidates.append(tmp_out)
+                # Pre-create 0600 target before ffmpeg writes into it so encoded bytes are never world-readable
+                _write_temp_0600(tmp_out, b"")
+                proc = subprocess.run(
+                    [
+                        exe,
+                        "-nostdin",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-i",
+                        str(tmp_in),
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        *fmt_args,
+                        str(tmp_out),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout_sec,
+                    check=False,
+                )
+                if proc.returncode == 0 and tmp_out.is_file() and tmp_out.stat().st_size > 0:
+                    chosen_tmp = tmp_out
+                    chosen_ext = ext
+                    break
+
+        if chosen_tmp is None:
+            tmp_wav = rec_dir / f".rec-out-{uniq}.wav.tmp"
+            tmp_candidates.append(tmp_wav)
+            _write_temp_0600(tmp_wav, raw_wav_bytes)
+            chosen_tmp = tmp_wav
+            chosen_ext = ".wav"
+
+        os.chmod(chosen_tmp, 0o600)
+        if now_ts is not None:
+            os.utime(chosen_tmp, (ts, ts))
+        final_path = rec_dir / f"rec-{stamp}-{rand_hex}{chosen_ext}"
+        os.replace(chosen_tmp, final_path)
+        prune_saved_recordings_dir(rec_dir, max_count=max_count, now_ts=ts)
+        return final_path
+    except Exception:
+        return None
+    finally:
+        if tmp_in is not None:
+            try:
+                tmp_in.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for cand in tmp_candidates:
+            try:
+                cand.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def spawn_recording_archive(
+    raw_wav_bytes: bytes,
+    recordings_dir: Path,
+    *,
+    max_count: int = 50,
+    ffmpeg_bin: str = "/usr/bin/ffmpeg",
+    now_ts: float | None = None,
+) -> threading.Thread | None:
+    """Spawn a non-blocking daemon thread to archive ``raw_wav_bytes``."""
+    if not raw_wav_bytes:
+        return None
+    try:
+        th = threading.Thread(
+            target=archive_recording_audio,
+            args=(raw_wav_bytes, recordings_dir),
+            kwargs={"max_count": max_count, "ffmpeg_bin": ffmpeg_bin, "now_ts": now_ts},
+            name="avi-rec-archive",
+            daemon=True,
+        )
+        th.start()
+        return th
+    except Exception:
+        return None
+
+
+def wait_recording_archives(
+    threads: Iterable[threading.Thread],
+    *,
+    timeout_sec: float = 2.0,
+) -> None:
+    """Best-effort wait up to ``timeout_sec`` total for pending background archive threads."""
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    for th in list(threads):
+        if th is threading.current_thread() or not th.is_alive():
+            continue
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            break
+        try:
+            th.join(timeout=rem)
+        except Exception:
+            pass

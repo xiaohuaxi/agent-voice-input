@@ -18,7 +18,7 @@
 
 - **取消令牌贯穿**：每轮任务持独立 `CancelToken`（区分用户主动取消、新轮覆盖、进程退出），贯穿分片调度、退避等待、豆包轮询与二阶段精修；用户取消须穿透 Refiner 原稿兜底，绝不退回初稿继续粘贴。
 - **在途 Socket 快速唤醒**：HTTP 传输层登记当前活动 socket（含 TLS 握手前后的 `SSLSocket` 切换，以及归还 Keep-Alive 连接池前先注销），取消时调用 `shutdown(SHUT_RDWR)` 立即唤醒阻塞读写。
-- **Codex 精修取消与进程隔离**：`CodexRefiner` 已改为无全局串行锁的多路复用单轮纯 Chat 架构；接入主动取消时仅终止受影响在途轮次或对应 `codex exec` 子进程组，避免误伤同客户端上并行的其他精修请求。
+- **Codex 精修取消与连接收敛**：`CodexRefiner` 已切换为纯无状态 `http.client` Keep-Alive `/responses` 直连（仅在凭据距过期不足 30 分钟或 Keyring 无文件模式下短调一次 `codex app-server` `getAuthStatus`）；接入主动取消时直接关闭当前在途 HTTP socket（若正处于凭据刷新则终止对应短生命周期子进程），不影响后续请求。
 - **投递前互斥门禁**：在最终粘贴/写剪贴板前设短临界区门禁，消除“刚检查完未取消、紧接着触发取消却仍上屏”的竞态。
 - **有效录音留存防白说**：`recording` 阶段取消直接丢弃；进入 `recognizing` / `refining` 后主动取消的，将已通过门控的有效 WAV 复用 `save_failed_audio()`（`0600` 原子写、保留 24 小时内最近 10 条）暂存至 `failed/` 供 `retry` 恢复（若来源本身已是 `retry` 则保留原文件不重复落盘），实施时同步更新 `AGENTS.md` 状态隐私说明。
 
@@ -29,5 +29,5 @@
    - **必须使用真实长度与结构的会话数据实测**：改动精修提示词、上下文组织、线程复用或性能链路后，不能仅靠合成短文本探针或 Mock 单测下结论，须加载本机真实长会话转录样本（含压缩节点、中英混合代码讨论与真实 `git status`）跑多轮连续请求，逐轮核验真实耗时分解、`cached_input_tokens` 命中数值及精修保真度（错词纠正、句式保留、不误答提问）。
    - 直接复用本机已配置的 API Key（如百炼、OpenRouter、Gemini 等）与本机 `codex` 订阅登录态完成实测。
 2. **精修前缀缓存命中采集与用户侧提示**：
-   - 采集各精修渠道返回的 token 与缓存命中指标（OpenAI 兼容接口的 `usage.prompt_tokens_details.cached_tokens`、DeepSeek 的 `usage.prompt_cache_hit_tokens`、Gemini 原生接口的 `usageMetadata.cachedContentTokenCount`、Codex `app-server` 的 `thread/tokenUsage/updated` 中 `cachedInputTokens`）。
+   - 采集各精修渠道返回的 token 与缓存命中指标（OpenAI 兼容接口的 `usage.prompt_tokens_details.cached_tokens`、DeepSeek 的 `usage.prompt_cache_hit_tokens`、Gemini 原生接口的 `usageMetadata.cachedContentTokenCount`、Responses SSE `response.completed` 的 `usage.input_tokens_details.cached_tokens`）。
    - 将本轮精修是否命中缓存及命中比例纳入 `status` 运行快照与可选诊断/状态提示，方便直观确认缓存是否生效。

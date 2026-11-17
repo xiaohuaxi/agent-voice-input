@@ -1,0 +1,7 @@
+interface:
+  display_name: "语音链路实测与诊断"
+  short_description: "运行真实长会话精修基准、零打扰全链路真机自检，或只读诊断守护进程口述异常"
+  default_prompt: "使用 $voice-eval 运行真实长会话精修基准、全链路系统自检或只读诊断本机语音输入守护进程延迟与缓存命中情况。"
+
+policy:
+  allow_implicit_invocation: true

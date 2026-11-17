@@ -21,7 +21,15 @@ from .config import (
     resolve_credentials,
     select_asr_provider,
 )
-from .daemon import VoiceInputDaemon, create_platform, run_pipeline_once, send_control_command
+from .daemon import (
+    VoiceInputDaemon,
+    append_telemetry_record,
+    build_pipeline_summary,
+    create_platform,
+    read_telemetry_history,
+    run_pipeline_once,
+    send_control_command,
+)
 from .platform_macos import (
     classify_macos_mic_permission,
     compile_mac_shim,
@@ -30,7 +38,7 @@ from .platform_macos import (
     run_macos_key_test,
 )
 from .platform_wsl import ForegroundWindow, is_wsl, probe_wsl_host, run_key_test
-from .refiner import find_codex_bin
+from .refiner import find_codex_bin, inspect_codex_auth_status
 from .session_ctx import SessionTracker
 from .session_title import run_session_hook
 
@@ -67,6 +75,12 @@ def _add_common_flags(p: argparse.ArgumentParser, *, is_sub: bool = False) -> No
     )
     p.add_argument("--refiner-model", dest="refiner_model", help="Override Stage 2 refiner model", **kw)
     p.add_argument(
+        "--refiner-api",
+        dest="refiner_api",
+        help="Override Stage 2 refiner API protocol (auto|chat-completions|responses)",
+        **kw,
+    )
+    p.add_argument(
         "--refiner-effort",
         "--effort",
         dest="effort",
@@ -80,6 +94,8 @@ def _cred_label(item: Any) -> str:
 
 
 def _check_codex_model(model: str, env: dict[str, str]) -> str:
+    if env is not os.environ and not (env.get("CODEX_HOME") or "").strip() and not (env.get("HOME") or "").strip():
+        return "models_cache.json not found"
     cache = Path(env.get("CODEX_HOME") or (expand_user_path("~", env=env) / ".codex")) / "models_cache.json"
     if not cache.is_file():
         return "models_cache.json not found"
@@ -186,18 +202,26 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
     )
     print(f"[session]   {match.session_key + ' (' + match.matched_by + ')' if match else 'none matched (will use empty context)'}")
     ref_prov = cfg.refiner.provider.strip().lower()
+    eff_ref_api = cfg.refiner.effective_api(ref_prov)
     prompt_tag = ", prompt=custom" if cfg.refiner.prompt.strip() else ""
-    if ref_prov in ("", "off", "none", "false", "0", "disabled"):
+    if eff_ref_api == "off":
         print("[refiner]   off")
     elif ref_prov == "codex":
         eff_ref_model = cfg.refiner.effective_model("codex")
-        if cbin := find_codex_bin(env):
+        auth_ok, auth_note = inspect_codex_auth_status(cfg, env)
+        if auth_ok:
+            cbin = find_codex_bin(env)
+            bin_tag = f", refresh_bin={cbin}" if cbin else ""
             print(
-                f"[refiner]   OK codex ({cbin}, model={eff_ref_model} "
-                f"[{_check_codex_model(eff_ref_model, env)}], effort={cfg.refiner.effort}{prompt_tag})"
+                f"[refiner]   OK codex (model={eff_ref_model} "
+                f"[{_check_codex_model(eff_ref_model, env)}], api={eff_ref_api}, "
+                f"effort={cfg.refiner.effort}, {auth_note}{bin_tag}{prompt_tag})"
             )
         else:
-            print("[refiner]   FAIL codex binary not found")
+            print(
+                f"[refiner]   FAIL codex (model={eff_ref_model}, api={eff_ref_api}, "
+                f"effort={cfg.refiner.effort}{prompt_tag}) -> {auth_note}"
+            )
             ok_all = False
     else:
         eff_ref_model = cfg.refiner.effective_model(ref_prov)
@@ -210,7 +234,7 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
             ref_ready = bool(creds.for_provider(ref_prov))
         print(
             f"[refiner]   {'OK' if ref_ready else 'MISSING KEY'} {ref_prov} "
-            f"(model={eff_ref_model}, effort={cfg.refiner.effort}{prompt_tag})"
+            f"(model={eff_ref_model}, api={eff_ref_api}, effort={cfg.refiner.effort}{prompt_tag})"
         )
         ok_all = ok_all and ref_ready
     return 0 if ok_all else 1
@@ -245,12 +269,30 @@ def _run_wav_or_live(
                 audio_source=src, dry_run=dry_run, runtime_dir=rt_dir, env=env,
             )
         except Exception as exc:
+            creds_err = resolve_credentials(cfg, env)
+            err_rec: dict[str, Any] = {
+                "ts": round(time.time(), 6),
+                "seq_id": 1,
+                "ok": False,
+                "audio_source": src,
+                "error": redact_secrets(str(exc), env, cfg=cfg, extra_secrets=creds_err.all_secret_values()),
+            }
             if saved_p := str(getattr(exc, "_saved_audio_path", "") or ""):
+                err_rec["saved_audio"] = saved_p
                 print(
                     f"[agent-voice-input] saved failed audio: {saved_p} (recover via 'agent-voice-input retry')",
                     file=sys.stderr,
                 )
+            append_telemetry_record(rt_dir, err_rec)
             raise
+        creds_ok = resolve_credentials(cfg, env)
+        summary = build_pipeline_summary(
+            res.seq_id,
+            res,
+            dry_run=dry_run,
+            redact_fn=lambda s: redact_secrets(s, env, cfg=cfg, extra_secrets=creds_ok.all_secret_values()),
+        )
+        append_telemetry_record(rt_dir, summary)
         if not res.ok:
             msg = f"[agent-voice-input] skipped: {res.skipped_reason}"
             if res.saved_audio:
@@ -259,7 +301,15 @@ def _run_wav_or_live(
             return 1
         if dry_run and res.asr:
             fb = f" fallback={res.refined.used_fallback}" if (res.refined and res.refined.used_fallback) else ""
-            r_tag = f"{res.refined.provider}/{res.refined.model} {res.refined.latency_ms}ms{fb}" if res.refined else "off"
+            tok_tag = ""
+            if res.refined and res.refined.input_tokens is not None:
+                c_tok = res.refined.cached_input_tokens
+                if c_tok is not None and res.refined.input_tokens > 0:
+                    pct = 100.0 * c_tok / res.refined.input_tokens
+                    tok_tag = f" tokens={res.refined.input_tokens}(cached={c_tok},{pct:.0f}%)"
+                else:
+                    tok_tag = f" tokens={res.refined.input_tokens}"
+            r_tag = f"{res.refined.provider}/{res.refined.model} {res.refined.latency_ms}ms{fb}{tok_tag}" if res.refined else "off"
             ch_tag = f" chunks={res.asr_chunks}" if res.asr_chunks > 1 else ""
             print(
                 f"[session] {res.session.session_key if res.session else 'none'}\n"
@@ -332,6 +382,7 @@ _CLI_OVERRIDE_FLAGS: tuple[tuple[str, str], ...] = (
     ("--asr-effort", "asr_effort"),
     ("--refiner-provider", "refiner"),
     ("--refiner-model", "refiner_model"),
+    ("--refiner-api", "refiner_api"),
     ("--refiner-effort", "effort"),
 )
 
@@ -581,8 +632,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     _add_common_flags(parser)
     sub = parser.add_subparsers(dest="subcmd", required=True)
-    for name in ("daemon", "start", "restart", "doctor", "stop", "status", "toggle"):
+    for name in ("daemon", "start", "restart", "doctor", "stop", "toggle"):
         _add_common_flags(sub.add_parser(name), is_sub=True)
+    p_status = sub.add_parser("status")
+    _add_common_flags(p_status, is_sub=True)
+    p_status.add_argument(
+        "--history",
+        nargs="?",
+        const=10,
+        type=int,
+        default=None,
+        help="Include last N redacted numeric records (default: 10)",
+    )
     p_once = sub.add_parser("once")
     _add_common_flags(p_once, is_sub=True)
     p_once.add_argument("--file", "--wav", dest="wav_file", help="Input audio/WAV file instead of live mic")
@@ -617,6 +678,7 @@ def main(argv: list[str] | None = None) -> int:
             ("asr_effort", "asr.effort"),
             ("refiner", "refiner.provider"),
             ("refiner_model", "refiner.model"),
+            ("refiner_api", "refiner.api"),
             ("effort", "refiner.effort"),
         )
         if getattr(args, a, None)
@@ -637,25 +699,35 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_stop(env)
         if args.subcmd in ("status", "toggle"):
             ctrl_timeout = 20.0 if args.subcmd == "toggle" else 8.0
+            rt_dir_st = get_runtime_dir(env, create=False)
+            raw_hist = getattr(args, "history", None) if args.subcmd == "status" else None
+            hist_limit = max(0, min(500, int(raw_hist))) if raw_hist is not None else None
+            ctrl_req: dict[str, Any] = {"cmd": args.subcmd}
+            if hist_limit is not None:
+                ctrl_req["history"] = hist_limit
             try:
                 resp = send_control_command(
-                    get_runtime_dir(env, create=False),
-                    {"cmd": args.subcmd},
+                    rt_dir_st,
+                    ctrl_req,
                     timeout_sec=ctrl_timeout,
                 )
                 print(json.dumps(resp, ensure_ascii=False))
                 return 0 if resp.get("ok") else 1
-            except (TimeoutError, socket.timeout):
+            except Exception as exc:
                 if args.subcmd == "status":
-                    print(json.dumps({"ok": False, "state": "stopped"}))
+                    out_st: dict[str, Any] = {"ok": False, "state": "stopped"}
+                    if hist_limit is not None:
+                        disk_hist = read_telemetry_history(rt_dir_st, limit=hist_limit)
+                        out_st["last_result"] = dict(disk_hist[-1]) if disk_hist else {}
+                        out_st["recent_results"] = disk_hist
+                    print(json.dumps(out_st, ensure_ascii=False))
                     return 1
-                print("agent-voice-input daemon control request timed out", file=sys.stderr)
-                return 1
-            except Exception:
-                if args.subcmd == "status":
-                    print(json.dumps({"ok": False, "state": "stopped"}))
-                    return 1
-                print("agent-voice-input daemon is not running (run 'agent-voice-input start' first)", file=sys.stderr)
+                msg = (
+                    "agent-voice-input daemon control request timed out"
+                    if isinstance(exc, (TimeoutError, socket.timeout))
+                    else "agent-voice-input daemon is not running (run 'agent-voice-input start' first)"
+                )
+                print(msg, file=sys.stderr)
                 return 1
         if args.subcmd == "once":
             return _cmd_once(args, cfg, env)

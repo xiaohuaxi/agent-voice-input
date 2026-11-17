@@ -48,80 +48,267 @@ from agent_voice_input.refiner import (  # noqa: E402
     CodexRefiner,
     GeminiRefiner,
     OpenAICompatibleRefiner,
+    OpenAIResponsesRefiner,
     RefinerResult,
     create_refiner,
     effective_refiner_timeout_sec,
 )
 from agent_voice_input.session_ctx import SessionTracker, write_session_registry_entry  # noqa: E402
 
-_MOCK_APP_SERVER_CODE = r"""
-import json, os, sys, threading, time
-log_path = sys.argv[1]
-mode = sys.argv[2] if len(sys.argv) > 2 else "ok"
-threads = 0
-turns = 0
-thread_turns = {}
-io_lock = threading.Lock()
-def log(rec):
-    with io_lock:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({**rec, "_pid": os.getpid()}, ensure_ascii=False) + "\n")
-def send(obj):
-    with io_lock:
-        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
-def finish_turn(tid, turn_no, cleaned, delay_sec):
-    if delay_sec > 0:
-        time.sleep(delay_sec)
-    send({"jsonrpc": "2.0", "method": "item/completed", "params": {"threadId": tid, "item": {"type": "agentMessage", "text": cleaned}}})
-    send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": tid, "turn": {"id": f"t-{turn_no}", "status": "completed", "items": []}}})
+import base64
+import http.server
+
+
+def _make_fake_jwt(
+    *,
+    exp: int | None = 4102444800,
+    account_id: str = "acct-unit-test-0001",
+    is_fedramp: bool = False,
+) -> str:
+    hdr = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').decode("ascii").rstrip("=")
+    payload: dict[str, object] = {"iss": "https://auth.openai.com"}
+    if exp is not None:
+        payload["exp"] = exp
+    if account_id or is_fedramp:
+        auth_ns: dict[str, object] = {}
+        if account_id:
+            auth_ns["chatgpt_account_id"] = account_id
+        if is_fedramp:
+            auth_ns["chatgpt_account_is_fedramp"] = True
+        payload["https://api.openai.com/auth"] = auth_ns
+    body = (
+        base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        .decode("ascii")
+        .rstrip("=")
+    )
+    return f"{hdr}.{body}.fakesig"
+
+
+def _write_codex_auth_json(
+    home_dir: Path,
+    *,
+    access_token: str | None = None,
+    account_id: str = "acct-unit-test-0001",
+    auth_mode: str = "chatgpt",
+    openai_api_key: str | None = None,
+    exp: int | None = 4102444800,
+) -> Path:
+    cdir = home_dir / ".codex"
+    cdir.mkdir(parents=True, exist_ok=True)
+    auth_file = cdir / "auth.json"
+    tok = access_token if access_token is not None else _make_fake_jwt(exp=exp, account_id=account_id)
+    obj: dict[str, object] = {
+        "auth_mode": auth_mode,
+        "OPENAI_API_KEY": openai_api_key,
+    }
+    if auth_mode == "api_key":
+        obj["tokens"] = None
+    else:
+        tokens_dict: dict[str, object] = {
+            "access_token": tok,
+            "refresh_token": "rt.fake_unit_test_refresh",
+        }
+        if account_id:
+            tokens_dict["account_id"] = account_id
+        obj["tokens"] = tokens_dict
+    auth_file.write_text(json.dumps(obj), encoding="utf-8")
+    auth_file.chmod(0o600)
+    return auth_file
+
+
+def _sse_completed_frames(
+    deltas: list[str],
+    *,
+    usage: dict[str, object] | None = None,
+    output_only: str = "",
+) -> list[str]:
+    frames = [
+        f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': d}, ensure_ascii=False)}\n\n"
+        for d in deltas
+    ]
+    resp_obj: dict[str, object] = {"id": "resp_mock_1"}
+    if usage is not None:
+        resp_obj["usage"] = usage
+    if output_only:
+        resp_obj["output"] = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": output_only}],
+            }
+        ]
+    frames.append(
+        f"data: {json.dumps({'type': 'response.completed', 'response': resp_obj}, ensure_ascii=False)}\n\n"
+    )
+    return frames
+
+
+class _LocalResponsesServer:
+    """Offline localhost HTTP/1.1 Keep-Alive SSE server (deliberately omits Content-Type on 200)."""
+
+    def __init__(self, responder=None, *, accept_delay_sec: float = 0.0) -> None:
+        outer = self
+        self.responder = responder
+        self.accept_delay_sec = accept_delay_sec
+        self.requests: list[dict[str, object]] = []
+        self.accepted_conns = 0
+        self._lock = threading.Lock()
+        self._client_socks: set[object] = set()
+
+        class _Server(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+            def get_request(self):
+                sock, addr = super().get_request()
+                if outer.accept_delay_sec > 0:
+                    time.sleep(outer.accept_delay_sec)
+                with outer._lock:
+                    outer.accepted_conns += 1
+                    outer._client_socks.add(sock)
+                return sock, addr
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                clen = int(self.headers.get("Content-Length") or 0)
+                raw_body = self.rfile.read(clen) if clen > 0 else b""
+                try:
+                    parsed_body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+                except ValueError:
+                    parsed_body = {}
+                with outer._lock:
+                    seq_no = len(outer.requests) + 1
+                    rec = {
+                        "seq": seq_no,
+                        "path": self.path,
+                        "headers": {k.lower(): v for k, v in self.headers.items()},
+                        "raw_headers": dict(self.headers.items()),
+                        "body": parsed_body,
+                        "client_port": self.client_address[1],
+                    }
+                    outer.requests.append(rec)
+                if outer.responder is not None:
+                    outer.responder(self, rec)
+                    return
+                inp = parsed_body.get("input") or []
+                last_txt = inp[-1]["content"][0]["text"] if inp else ""
+                draft = (
+                    last_txt.split("<asr_draft_to_clean>\n", 1)[1].split("\n</asr_draft_to_clean>", 1)[0]
+                    if "<asr_draft_to_clean>\n" in last_txt
+                    else last_txt
+                )
+                outer.send_sse_200(self, _sse_completed_frames([f"CLEAN#{seq_no}:", draft]))
+
+        self._httpd = _Server(("127.0.0.1", 0), _Handler)
+        self.port = self._httpd.server_address[1]
+        self.base_url = f"http://127.0.0.1:{self.port}/backend-api/codex"
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def send_sse_200(
+        handler: http.server.BaseHTTPRequestHandler,
+        frames: list[str],
+        *,
+        set_cookies: list[str] = (),
+        close_after: bool = False,
+    ) -> None:
+        handler.send_response(200)
+        # Intentionally NO Content-Type header to match real Codex backend HTTP 200 behavior!
+        for sc in set_cookies:
+            handler.send_header("Set-Cookie", sc)
+        handler.send_header("Transfer-Encoding", "chunked")
+        handler.send_header("Connection", "close" if close_after else "keep-alive")
+        handler.end_headers()
+        for fr in frames:
+            b = fr.encode("utf-8")
+            handler.wfile.write(f"{len(b):x}\r\n".encode("ascii") + b + b"\r\n")
+            handler.wfile.flush()
+        handler.wfile.write(b"0\r\n\r\n")
+        handler.wfile.flush()
+        if close_after:
+            handler.close_connection = True
+
+    @staticmethod
+    def send_json(
+        handler: http.server.BaseHTTPRequestHandler,
+        status: int,
+        payload: object,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        raw = (
+            payload.encode("utf-8")
+            if isinstance(payload, str)
+            else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(raw)))
+        if headers:
+            for k, v in headers.items():
+                handler.send_header(k, v)
+        handler.end_headers()
+        handler.wfile.write(raw)
+        handler.wfile.flush()
+
+    def close(self) -> None:
+        self._httpd.shutdown()
+        with self._lock:
+            socks = list(self._client_socks)
+            self._client_socks.clear()
+        for s in socks:
+            try:
+                s.shutdown(2)
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+        self._httpd.server_close()
+        self._thread.join(timeout=1.0)
+
+
+_MOCK_AUTH_APP_SERVER_CODE = r"""
+import json, os, pathlib, sys
+log_path = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+token_out = sys.argv[3] if len(sys.argv) > 3 else ""
+auth_json_out = sys.argv[4] if len(sys.argv) > 4 else ""
 for raw in sys.stdin:
     msg = json.loads(raw)
-    log(msg)
+    with log_path.open("a", encoding="utf-8") as lf:
+        lf.write(json.dumps({**msg, "_env_has_oai": "OPENAI_API_KEY" in os.environ}, ensure_ascii=False) + "\n")
     m = msg.get("method")
     rid = msg.get("id")
     if m == "initialize":
-        send({"jsonrpc": "2.0", "id": rid, "result": {"userAgent": "mock"}})
-    elif m == "thread/start":
-        if mode == "fail_app":
-            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "boom secret=MOCK_SECRET_9999"}})
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"userAgent": "mock"}}) + "\n")
+        sys.stdout.flush()
+    elif m == "getAuthStatus":
+        if mode == "fail":
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "refresh network error"}}) + "\n")
+            sys.stdout.flush()
             continue
-        threads += 1
-        new_tid = f"thr-{threads}"
-        thread_turns[new_tid] = []
-        send({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": new_tid}}})
-    elif m == "thread/revert":
-        if mode == "no_revert":
-            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unknown variant thread/revert"}})
-            continue
-        if mode == "slow_revert":
-            time.sleep(0.35)
-        rtid = msg["params"]["threadId"]
-        btid = msg["params"]["beforeTurnId"]
-        cur_list = thread_turns.get(rtid, [])
-        if btid in cur_list:
-            thread_turns[rtid] = cur_list[:cur_list.index(btid)]
-        send({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": rtid}, "turnsBackwardsCursor": None, "itemsBackwardsCursor": None}})
-    elif m == "thread/delete":
-        thread_turns.pop(msg["params"]["threadId"], None)
-        send({"jsonrpc": "2.0", "id": rid, "result": {}})
-    elif m == "thread/unsubscribe":
-        send({"jsonrpc": "2.0", "id": rid, "result": {"status": "unsubscribed"}})
-    elif m == "turn/start":
-        turns += 1
-        cur_turn = turns
-        tid = msg["params"]["threadId"]
-        prior_cnt = len(thread_turns.get(tid, []))
-        thread_turns.setdefault(tid, []).append(f"t-{cur_turn}")
-        txt = msg["params"]["input"][-1]["text"]
-        send({"jsonrpc": "2.0", "id": rid, "result": {"turn": {"id": f"t-{cur_turn}", "status": "inProgress", "items": []}}})
-        draft = txt.split("<asr_draft_to_clean>\n", 1)[1].split("\n</asr_draft_to_clean>", 1)[0]
-        dirty_tag = f":DIRTY({prior_cnt})" if prior_cnt else ""
-        cleaned = f"CLEAN[{tid}#{cur_turn}{dirty_tag}]:{draft}"
-        if mode == "parallel":
-            threading.Thread(target=finish_turn, args=(tid, cur_turn, cleaned, 0.12), daemon=True).start()
-        else:
-            finish_turn(tid, cur_turn, cleaned, 0.0)
+        if auth_json_out:
+            p = pathlib.Path(auth_json_out)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": token_out, "account_id": "acct-refreshed-disk", "refresh_token": "rt.2"}
+            }), encoding="utf-8")
+        auth_method = "apikey" if mode == "apikey" else "chatgpt"
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0",
+            "id": rid,
+            "result": {"authMethod": auth_method, "authToken": token_out, "requiresOpenaiAuth": True}
+        }) + "\n")
+        sys.stdout.flush()
 """
 
 
@@ -215,6 +402,10 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertEqual(parsed["asr"]["effort"], "auto")
         self.assertEqual(parsed["refiner"]["provider"], "codex")
         self.assertEqual(parsed["refiner"]["model"], "")
+        self.assertEqual(parsed["refiner"]["api"], "auto")
+        self.assertNotIn("max_turns_per_thread", toml_raw)
+        self.assertNotIn("max_turns_per_thread", (_REPO_ROOT / "README.md").read_text(encoding="utf-8"))
+        self.assertNotIn("max_turns_per_thread", (_REPO_ROOT / "README.zh-CN.md").read_text(encoding="utf-8"))
         cfg, _ = load_config(config_path=toml_path, env={"HOME": "/tmp/nonexistent-home"})
         self.assertIs(cfg.hotkey.only_in_terminals, True)
         self.assertEqual(cfg.ui.language, "auto")
@@ -222,6 +413,8 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertEqual(cfg.audio.macos_device, "default")
         self.assertEqual(cfg.refiner.provider, "codex")
         self.assertEqual(cfg.refiner.model, "gpt-6-luna")
+        self.assertEqual(cfg.refiner.api, "auto")
+        self.assertEqual(cfg.refiner.effective_api(), "responses")
         self.assertIs(cfg.audio.beep, False)
 
         env_raw = env_path.read_text(encoding="utf-8")
@@ -263,6 +456,8 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         manifest_raw = (_REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
         self.assertIn("win_shim.ps1", manifest_raw)
         self.assertIn("mac_shim.swift", manifest_raw)
+        self.assertIn("prune .agents", manifest_raw)
+        self.assertIn("prune .claude", manifest_raw)
         self.assertTrue(SHIM_SCRIPT.is_file())
         self.assertEqual(
             SHIM_SCRIPT.resolve(),
@@ -277,8 +472,9 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
             fake_codex = tmp / "codex"
             fake_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fake_codex.chmod(0o755)
-            ref = CodexRefiner(Config(), env={"CODEX_BIN": str(fake_codex)}, runtime_dir=tmp)
-            cmd = ref._build_cmd(tmp)
+            _write_codex_auth_json(tmp)
+            ref = CodexRefiner(Config(), env={"HOME": str(tmp), "CODEX_BIN": str(fake_codex)}, runtime_dir=tmp)
+            cmd = ref._build_auth_refresh_cmd()
             joined = " ".join(cmd)
             self.assertIn("mcp_servers={}", cmd)
             self.assertIn("project_doc_max_bytes=0", cmd)
@@ -286,39 +482,52 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
             self.assertIn("multi_agent", cmd)
             self.assertNotIn("fast", joined.lower())
             self.assertNotIn("service_tier", joined.lower())
+            ref.close()
 
-            # Verify JSON-RPC thread/start & turn/start effort mapping across auto / explicit / max / default
-            for eff, expected_rpc_eff in (
-                ("low", "low"),
-                ("auto", "low"),
-                ("none", "none"),
-                ("max", "xhigh"),
-                ("default", None),
-            ):
-                rpc_log = tmp / f"rpc_{eff}.jsonl"
-                cfg_eff = Config(refiner=RefinerConfig(provider="codex", effort=eff, timeout_sec=3.0))
-                r_eff = CodexRefiner(
-                    cfg_eff,
-                    env={},
-                    runtime_dir=tmp,
-                    app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "ok"],
-                )
-                try:
-                    out = r_eff.refine("测试档位")
-                    self.assertEqual(out.text, "CLEAN[thr-1#1]:测试档位")
-                finally:
-                    r_eff.close()
-                recs = [json.loads(ln) for ln in rpc_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
-                t_start = next(r for r in recs if r.get("method") == "thread/start")
-                turn_start = next(r for r in recs if r.get("method") == "turn/start")
-                raw_rpc = rpc_log.read_text(encoding="utf-8").lower()
-                self.assertNotIn("service_tier", raw_rpc)
-                if expected_rpc_eff is None:
-                    self.assertNotIn("config", t_start["params"])
-                    self.assertNotIn("effort", turn_start["params"])
-                else:
-                    self.assertEqual(t_start["params"]["config"], {"model_reasoning_effort": expected_rpc_eff})
-                    self.assertEqual(turn_start["params"]["effort"], expected_rpc_eff)
+            # Verify stateless /responses reasoning effort mapping across concrete / auto / default & strict no-Fast
+            srv = _LocalResponsesServer()
+            try:
+                for eff, expected_wire_eff in (
+                    ("none", "none"),
+                    ("minimal", "minimal"),
+                    ("low", "low"),
+                    ("medium", "medium"),
+                    ("high", "high"),
+                    ("xhigh", "xhigh"),
+                    ("max", "max"),
+                    ("auto", None),
+                    ("default", None),
+                ):
+                    cfg_eff = Config(
+                        refiner=RefinerConfig(
+                            provider="codex",
+                            base_url=srv.base_url,
+                            effort=eff,
+                            timeout_sec=3.0,
+                        )
+                    )
+                    r_eff = CodexRefiner(cfg_eff, env={"HOME": str(tmp)}, runtime_dir=tmp)
+                    try:
+                        out = r_eff.refine("测试档位")
+                        self.assertTrue(out.text.endswith(":测试档位"))
+                    finally:
+                        r_eff.close()
+                    sent_body = srv.requests[-1]["body"]
+                    assert isinstance(sent_body, dict)
+                    raw_json = json.dumps(sent_body).lower()
+                    self.assertNotIn("service_tier", raw_json)
+                    self.assertNotIn("previous_response_id", sent_body)
+                    self.assertIs(sent_body["store"], False)
+                    self.assertIs(sent_body["stream"], True)
+                    self.assertEqual(sent_body["tools"], [])
+                    self.assertEqual(sent_body["tool_choice"], "none")
+                    self.assertIs(sent_body["parallel_tool_calls"], False)
+                    if expected_wire_eff is None:
+                        self.assertNotIn("reasoning", sent_body)
+                    else:
+                        self.assertEqual(sent_body["reasoning"], {"effort": expected_wire_eff})
+            finally:
+                srv.close()
 
     def test_win_shim_static_safety_invariants(self) -> None:
         shim = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
@@ -368,7 +577,7 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
     def test_codex_luna_incremental_delta_rotation_and_generation_reset(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            rpc_log = tmp / "rpc.jsonl"
+            _write_codex_auth_json(tmp, account_id="acct-stateless-01")
             sid = "abcd1234-0000-0000-0000-000000000001"
             sdir = tmp / ".codex" / "sessions" / "2026" / "11" / "13"
             sdir.mkdir(parents=True)
@@ -386,28 +595,30 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             self.assertIsNotNone(snap)
             assert snap is not None
 
-            cfg = Config(refiner=RefinerConfig(provider="codex", model="gpt-6-luna", effort="low", timeout_sec=5.0))
-            ref = CodexRefiner(
-                cfg,
-                env={},
-                runtime_dir=tmp,
-                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "ok"],
+            srv = _LocalResponsesServer()
+            cfg = Config(
+                refiner=RefinerConfig(
+                    provider="codex",
+                    model="gpt-6-luna",
+                    base_url=srv.base_url,
+                    effort="low",
+                    timeout_sec=5.0,
+                )
             )
+            ref = CodexRefiner(cfg, env={"HOME": str(tmp)}, runtime_dir=tmp)
             try:
-                # Per-session reverted shell thread: reuses thr-1 (prompt_cache_key) across all 4 turns
-                # while thread/revert clears every turn back to 0 so zero prior draft residue remains!
                 r1 = ref.refine("把 refiner 点 py 修一下", session_key=snap.session_key, tracker=tracker)
-                self.assertEqual(r1.text, "CLEAN[thr-1#1]:把 refiner 点 py 修一下")
+                self.assertEqual(r1.text, "CLEAN#1:把 refiner 点 py 修一下")
                 self.assertEqual(r1.used_fallback, "")
 
                 r2 = ref.refine("再跑单测", session_key=snap.session_key, tracker=tracker)
-                self.assertEqual(r2.text, "CLEAN[thr-1#2]:再跑单测")
+                self.assertEqual(r2.text, "CLEAN#2:再跑单测")
 
                 with rollout.open("a", encoding="utf-8") as f:
                     f.write(json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "AgentMessage", "content": [{"type": "text", "text": "已更新 daemon.py"}]}}}) + "\n")
                 tracker.sync_session(window_title="codex [#abcd1234]")
                 r3 = ref.refine("继续提交", session_key=snap.session_key, tracker=tracker)
-                self.assertEqual(r3.text, "CLEAN[thr-1#3]:继续提交")
+                self.assertEqual(r3.text, "CLEAN#3:继续提交")
 
                 rollout.write_text(
                     meta_ln
@@ -417,79 +628,113 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
                 )
                 tracker.sync_session(window_title="codex [#abcd1234]")
                 r4 = ref.refine("第四句", session_key=snap.session_key, tracker=tracker)
-                self.assertEqual(r4.text, "CLEAN[thr-1#4]:第四句")
+                self.assertEqual(r4.text, "CLEAN#4:第四句")
             finally:
                 ref.close()
+                srv.close()
 
-            records = [json.loads(ln) for ln in rpc_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            methods = [r.get("method") for r in records]
-            self.assertEqual(methods[:2], ["initialize", "initialized"])
-            t_starts = [r for r in records if r.get("method") == "thread/start"]
-            t_reverts = [r for r in records if r.get("method") == "thread/revert"]
-            self.assertEqual(len(t_starts), 1)
-            self.assertIs(t_starts[0]["params"]["ephemeral"], False)
-            self.assertIn("baseInstructions", t_starts[0]["params"])
-            self.assertNotIn("developerInstructions", t_starts[0]["params"])
-            self.assertEqual(len(t_reverts), 4)
-            self.assertEqual(
-                [(rv["params"]["threadId"], rv["params"]["beforeTurnId"]) for rv in t_reverts],
-                [("thr-1", "t-1"), ("thr-1", "t-2"), ("thr-1", "t-3"), ("thr-1", "t-4")],
-            )
-            turns_rpc = [r["params"]["input"] for r in records if r.get("method") == "turn/start"]
-            self.assertEqual(len(turns_rpc[0]), 2)
-            self.assertIn("<session_reference_log", turns_rpc[0][0]["text"])
-            self.assertIn("refiner.py", turns_rpc[0][0]["text"])
-            self.assertNotIn("把 refiner 点 py 修一下", turns_rpc[1][0]["text"])
-            self.assertEqual(turns_rpc[0][0]["text"], turns_rpc[1][0]["text"])  # exact same prefix block!
-            self.assertIn("daemon.py", turns_rpc[2][0]["text"])
-            self.assertIn("全新上下文", turns_rpc[3][0]["text"])
-            self.assertNotIn("daemon.py", turns_rpc[3][0]["text"])
+            self.assertEqual(len(srv.requests), 4)
+            # Keep-Alive socket reused across all 4 sequential requests!
+            ports = [r["client_port"] for r in srv.requests]
+            self.assertEqual(len(set(ports)), 1)
 
-    def test_codex_fallbacks_to_exec_then_asr_draft_and_redacts(self) -> None:
+            b0 = srv.requests[0]["body"]
+            b1 = srv.requests[1]["body"]
+            b2 = srv.requests[2]["body"]
+            b3 = srv.requests[3]["body"]
+            assert isinstance(b0, dict) and isinstance(b1, dict) and isinstance(b2, dict) and isinstance(b3, dict)
+            # Deterministic prompt_cache_key & session-id / thread-id per session_key
+            pck = b0["prompt_cache_key"]
+            self.assertTrue(all(b["prompt_cache_key"] == pck for b in (b0, b1, b2, b3)))
+            h0 = srv.requests[0]["headers"]
+            assert isinstance(h0, dict)
+            self.assertEqual(h0.get("session-id"), pck)
+            self.assertEqual(h0.get("thread-id"), pck)
+            self.assertEqual(h0.get("chatgpt-account-id"), "acct-stateless-01")
+            self.assertEqual(h0.get("originator"), "codex_cli_rs")
+            self.assertEqual(h0.get("x-codex-routing-hint"), "model=gpt-6-luna")
+
+            # Developer context chunk + final user draft layout with zero prior draft residue!
+            self.assertEqual([it["role"] for it in b0["input"]], ["developer", "user"])
+            self.assertIn("<session_reference_log", b0["input"][0]["content"][0]["text"])
+            self.assertIn("refiner.py", b0["input"][0]["content"][0]["text"])
+            self.assertNotIn("把 refiner 点 py 修一下", json.dumps(b1["input"], ensure_ascii=False))
+            self.assertEqual(b0["input"][0]["content"][0]["text"], b1["input"][0]["content"][0]["text"])
+            self.assertIn("daemon.py", b2["input"][0]["content"][0]["text"])
+            self.assertIn("全新上下文", b3["input"][0]["content"][0]["text"])
+            self.assertNotIn("daemon.py", b3["input"][0]["content"][0]["text"])
+
+    def test_codex_fallbacks_to_asr_draft_and_redacts_detail_and_sse_errors(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            rpc_log = tmp / "rpc_fail.jsonl"
-            env = {"DASHSCOPE_API_KEY": "MOCK_SECRET_9999"}
-            cfg = Config(refiner=RefinerConfig(provider="codex", timeout_sec=3.0))
+            secret_acct = "acct-" + ("9" * 16)
+            secret_tok = _make_fake_jwt(account_id=secret_acct)
+            _write_codex_auth_json(tmp, access_token=secret_tok, account_id=secret_acct)
+            env = {"HOME": str(tmp), "DASHSCOPE_API_KEY": "MOCK_SECRET_9999"}
 
-            # Fallback 1: app-server fails -> codex exec succeeds
-            ref_exec = CodexRefiner(
-                cfg,
-                env=env,
-                runtime_dir=tmp,
-                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "fail_app"],
-                exec_runner=lambda envlp, cwd: "EXEC_REFINED_TEXT",
-            )
-            res1 = ref_exec.refine("原始语音草稿")
-            self.assertEqual(res1.text, "EXEC_REFINED_TEXT")
-            self.assertEqual(res1.provider, "codex")
-            self.assertEqual(res1.used_fallback, "codex-exec")
-            self.assertNotIn("MOCK_SECRET_9999", res1.warning)
-            self.assertIn("[REDACTED]", res1.warning)
-            ref_exec.close()
+            mode_box = ["fastapi_detail"]
 
-            # Fallback 2: both app-server and codex exec fail -> returns original draft without losing text
-            def broken_exec(_envlp: str, _cwd: Path) -> str:
-                raise RuntimeError("exec failed key=MOCK_SECRET_9999")
+            def err_responder(handler, _rec) -> None:
+                m = mode_box[0]
+                if m == "fastapi_detail":
+                    _LocalResponsesServer.send_json(
+                        handler,
+                        400,
+                        {"detail": f"Store must be false for {secret_acct} key=MOCK_SECRET_9999 tok={secret_tok}"},
+                    )
+                else:
+                    _LocalResponsesServer.send_sse_200(
+                        handler,
+                        [
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "type": "response.failed",
+                                    "response": {
+                                        "error": {
+                                            "code": "invalid_prompt",
+                                            "message": f"blocked {secret_acct} MOCK_SECRET_9999",
+                                        }
+                                    },
+                                }
+                            )
+                            + "\n\n"
+                        ],
+                    )
 
-            ref_draft = CodexRefiner(
-                cfg,
-                env=env,
-                runtime_dir=tmp,
-                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "fail_app"],
-                exec_runner=broken_exec,
-            )
-            res2 = ref_draft.refine("绝不丢失的用户原话")
-            self.assertEqual(res2.text, "绝不丢失的用户原话")
-            self.assertEqual(res2.used_fallback, "asr_draft")
-            self.assertNotIn("MOCK_SECRET_9999", res2.warning)
-            ref_draft.close()
+            srv = _LocalResponsesServer(responder=err_responder)
+            cfg = Config(refiner=RefinerConfig(provider="codex", base_url=srv.base_url, timeout_sec=3.0))
+            ref = CodexRefiner(cfg, env=env, runtime_dir=tmp)
+            try:
+                res1 = ref.refine("绝不丢失的用户原话")
+                self.assertEqual(res1.text, "绝不丢失的用户原话")
+                self.assertEqual(res1.provider, "codex")
+                self.assertEqual(res1.used_fallback, "asr_draft")
+                self.assertIn("[REDACTED]", res1.warning)
+                for forbidden in ("MOCK_SECRET_9999", secret_acct, secret_tok):
+                    self.assertNotIn(forbidden, res1.warning)
 
-            # Single-hop ASR result bypasses Stage 2 automatically
-            single = AsrResult(text="Gemini单跳已精修", provider="gemini", model="gemini-2.5-flash", latency_ms=50, is_single_hop_refined=True)
-            res3 = ref_draft.refine(single)
-            self.assertEqual(res3.text, "Gemini单跳已精修")
-            self.assertEqual(res3.used_fallback, "single_hop_passthrough")
+                mode_box[0] = "sse_failed"
+                res2 = ref.refine("流内错误回退原话")
+                self.assertEqual(res2.text, "流内错误回退原话")
+                self.assertEqual(res2.used_fallback, "asr_draft")
+                for forbidden in ("MOCK_SECRET_9999", secret_acct, secret_tok):
+                    self.assertNotIn(forbidden, res2.warning)
+
+                # Single-hop ASR result bypasses Stage 2 automatically
+                single = AsrResult(
+                    text="Gemini单跳已精修",
+                    provider="gemini",
+                    model="gemini-2.5-flash",
+                    latency_ms=50,
+                    is_single_hop_refined=True,
+                )
+                res3 = ref.refine(single)
+                self.assertEqual(res3.text, "Gemini单跳已精修")
+                self.assertEqual(res3.used_fallback, "single_hop_passthrough")
+            finally:
+                ref.close()
+                srv.close()
 
     def test_built_in_and_openai_compatible_refiners_effort_and_error_redaction(self) -> None:
         seen: list[HttpRequest] = []
@@ -791,90 +1036,79 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         ).refine("安全拦截回退初稿")
         self.assertEqual((res_gem_safe.text, res_gem_safe.used_fallback, res_gem_safe.retries, gem_safe_calls[0]), ("安全拦截回退初稿", "asr_draft", 0, 1))
 
-        # 3. CodexRefiner: max_retries=0 skips codex exec fallback; max_retries=2 recovers fresh app-server
-        #    on transient crash and enforces unified deadline across app-server + exec!
+        # 3. CodexRefiner / OpenAIResponsesRefiner: max_retries=0 skips retry; max_retries=2 recovers
+        #    on transient 503 / SSE server_error, while permanent errors fail fast on attempt 1!
         with tempfile.TemporaryDirectory() as td:
             rt = Path(td)
-            log_file = rt / "rpc.jsonl"
-            state_file = rt / "attempt_count.txt"
-            exec_calls = [0]
+            _write_codex_auth_json(rt)
+            mode_c = ["503"]
 
-            flaky_script = (
-                "import pathlib, subprocess, sys\n"
-                "st = pathlib.Path(sys.argv[2])\n"
-                "n = int(st.read_text() if st.exists() else '0') + 1\n"
-                "st.write_text(str(n))\n"
-                "mode = 'fail_app' if n == 1 else 'ok'\n"
-                f"code = {json.dumps(_MOCK_APP_SERVER_CODE)}\n"
-                "raise SystemExit(subprocess.call([sys.executable, '-c', code, sys.argv[1], mode]))\n"
-            )
+            def flaky_responder(handler, rec) -> None:
+                m = mode_c[0]
+                if m == "503":
+                    _LocalResponsesServer.send_json(handler, 503, {"detail": "backend overloaded"})
+                elif m == "flaky_once" and int(rec["seq"]) == 1:
+                    _LocalResponsesServer.send_sse_200(
+                        handler,
+                        [
+                            'data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"transient glitch"}}}\n\n'
+                        ],
+                    )
+                elif m.startswith("perm:"):
+                    _LocalResponsesServer.send_json(handler, 400, {"detail": m[5:]})
+                else:
+                    _LocalResponsesServer.send_sse_200(
+                        handler, _sse_completed_frames(["恢复成功"])
+                    )
 
-            def count_exec_runner(_env_txt: str, _cwd: Path) -> str:
-                exec_calls[0] += 1
-                return "EXEC_FALLBACK_OUT"
-
-            # 3a. max_retries = 0 -> strictly 1 attempt (no second app-server spawn, no codex exec)
-            cfg_c0 = Config(refiner=RefinerConfig(provider="codex", max_retries=0))
-            ref_c0 = CodexRefiner(
-                cfg_c0,
-                env={},
-                runtime_dir=rt,
-                app_server_cmd=[sys.executable, "-c", _MOCK_APP_SERVER_CODE, str(log_file), "fail_app"],
-                exec_runner=count_exec_runner,
-            )
+            srv_r = _LocalResponsesServer(responder=flaky_responder)
             try:
-                r_c0 = ref_c0.refine("不重试直接回退")
-                self.assertEqual((r_c0.text, r_c0.used_fallback, r_c0.retries, exec_calls[0]), ("不重试直接回退", "asr_draft", 0, 0))
-            finally:
-                ref_c0.close()
+                # 3a. max_retries = 0 -> strictly 1 attempt
+                cfg_c0 = Config(refiner=RefinerConfig(provider="codex", base_url=srv_r.base_url, max_retries=0))
+                ref_c0 = CodexRefiner(cfg_c0, env={"HOME": str(rt)}, runtime_dir=rt, sleep_fn=lambda _s: None)
+                try:
+                    r_c0 = ref_c0.refine("不重试直接回退")
+                    self.assertEqual((r_c0.text, r_c0.used_fallback, r_c0.retries, len(srv_r.requests)), ("不重试直接回退", "asr_draft", 0, 1))
+                finally:
+                    ref_c0.close()
 
-            # 3b. max_retries = 2 -> attempt 1 app-server crashes transiently, retry 1 spawns fresh app-server & succeeds!
-            cfg_c2 = Config(refiner=RefinerConfig(provider="codex", max_retries=2))
-            ref_c2 = CodexRefiner(
-                cfg_c2,
-                env={},
-                runtime_dir=rt,
-                app_server_cmd=[sys.executable, "-c", flaky_script, str(log_file), str(state_file)],
-                exec_runner=count_exec_runner,
-            )
-            try:
-                r_c2 = ref_c2.refine("常驻恢复成功")
-                spawns_n = int(state_file.read_text(encoding="utf-8"))
-                self.assertEqual((r_c2.text, r_c2.used_fallback, r_c2.retries, spawns_n, exec_calls[0]), ("CLEAN[thr-1#1]:常驻恢复成功", "", 1, 2, 0))
-            finally:
-                ref_c2.close()
-
-            # 3c. CodexRefiner permanent errors (invalid model, certificate verify failed, content_filter)
-            #     MUST fail fast on attempt 1 with 0 retries and 0 codex exec calls!
-            for perm_msg in ("invalid model gpt-999", "SSL: CERTIFICATE_VERIFY_FAILED", "blocked by content_filter"):
-                perm_state = rt / f"perm_{ abs(hash(perm_msg)) }.txt"
-                perm_exec = [0]
-                perm_app_code = (
-                    "import json, pathlib, sys\n"
-                    "p = pathlib.Path(sys.argv[1])\n"
-                    "p.write_text(str(int(p.read_text() if p.exists() else '0') + 1))\n"
-                    "for raw in sys.stdin:\n"
-                    "    m = json.loads(raw)\n"
-                    "    if m.get('method') == 'initialize':\n"
-                    "        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{}}) + '\\n'); sys.stdout.flush()\n"
-                    "    elif m.get('method') == 'thread/start':\n"
-                    f"        sys.stdout.write(json.dumps({{'jsonrpc':'2.0','id':m['id'],'error':{{'code':-32000,'message':{json.dumps(perm_msg)}}}}}) + '\\n'); sys.stdout.flush()\n"
-                )
-                ref_cp = CodexRefiner(
+                # 3b. max_retries = 2 -> attempt 1 SSE server_error, retry 1 succeeds!
+                srv_r.requests.clear()
+                mode_c[0] = "flaky_once"
+                cfg_c2 = Config(refiner=RefinerConfig(provider="codex", base_url=srv_r.base_url, max_retries=2))
+                ref_c2 = CodexRefiner(
                     cfg_c2,
-                    env={},
+                    env={"HOME": str(rt)},
                     runtime_dir=rt,
-                    app_server_cmd=[sys.executable, "-c", perm_app_code, str(perm_state)],
-                    exec_runner=lambda _e, _c, b=perm_exec: (b.__setitem__(0, b[0] + 1), "NO")[1],
+                    sleep_fn=lambda _s: None,
+                    rand_fn=lambda: 0.0,
                 )
                 try:
-                    r_cp = ref_cp.refine("永久错误保留初稿")
-                    self.assertEqual(
-                        (r_cp.text, r_cp.used_fallback, r_cp.retries, int(perm_state.read_text()), perm_exec[0]),
-                        ("永久错误保留初稿", "asr_draft", 0, 1, 0),
-                    )
+                    r_c2 = ref_c2.refine("常驻恢复成功")
+                    self.assertEqual((r_c2.text, r_c2.used_fallback, r_c2.retries, len(srv_r.requests)), ("恢复成功", "", 1, 2))
                 finally:
-                    ref_cp.close()
+                    ref_c2.close()
+
+                # 3c. Permanent errors (invalid model, content_filter, quota) MUST fail fast on attempt 1 with 0 retries!
+                for perm_msg in ("invalid model gpt-999", "blocked by content_filter", "insufficient_quota"):
+                    srv_r.requests.clear()
+                    mode_c[0] = f"perm:{perm_msg}"
+                    ref_cp = CodexRefiner(
+                        cfg_c2,
+                        env={"HOME": str(rt)},
+                        runtime_dir=rt,
+                        sleep_fn=lambda _s: None,
+                    )
+                    try:
+                        r_cp = ref_cp.refine("永久错误保留初稿")
+                        self.assertEqual(
+                            (r_cp.text, r_cp.used_fallback, r_cp.retries, len(srv_r.requests)),
+                            ("永久错误保留初稿", "asr_draft", 0, 1),
+                        )
+                    finally:
+                        ref_cp.close()
+            finally:
+                srv_r.close()
 
         # 4. Refiner hitting _RATE_PACER queue timeout from a prior 429 Retry-After MUST gracefully
         #    fall back to asr_draft instead of raising an unhandled TimeoutError!
@@ -1412,8 +1646,33 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn("selected=openrouter (model=qwen/qwen3-asr-1.7b, api=audio-transcriptions, effort=auto) -> OK", out)
             self.assertIn("openrouter=OK (via OPENROUTER_API_KEY)", out)
-            self.assertIn("[refiner]   OK openrouter (model=google/gemini-2.5-flash-lite, effort=low)", out)
+            self.assertIn("[refiner]   OK openrouter (model=google/gemini-2.5-flash-lite, api=chat-completions, effort=low)", out)
             self.assertNotIn(secret_or, out)
+
+            # Doctor with codex auth.json (verifying api=responses and zero leakage of access_token / account_id)
+            doc_acct_secret = "acct-doctor-secret-7744"
+            doc_jwt_secret = _make_fake_jwt(account_id=doc_acct_secret)
+            _write_codex_auth_json(Path(td), access_token=doc_jwt_secret, account_id=doc_acct_secret)
+            cfg_doc_codex, env_doc_codex = load_config(
+                env=env,
+                home_dir=td,
+                cli_overrides={"asr.provider": "openrouter", "refiner.provider": "codex"},
+            )
+            buf_doc_codex = io.StringIO()
+            with (
+                mock.patch.object(cli_mod, "is_wsl", return_value=False),
+                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.platform", "linux"),
+                mock.patch("sys.stdout", buf_doc_codex),
+            ):
+                rc_doc_codex = cli_mod._cmd_doctor(cfg_doc_codex, env_doc_codex)
+            out_doc_codex = buf_doc_codex.getvalue()
+            self.assertEqual(rc_doc_codex, 0, out_doc_codex)
+            self.assertIn("OK codex", out_doc_codex)
+            self.assertIn("api=responses", out_doc_codex)
+            self.assertIn("auth=chatgpt (auth.json)", out_doc_codex)
+            self.assertNotIn(doc_acct_secret, out_doc_codex)
+            self.assertNotIn(doc_jwt_secret, out_doc_codex)
 
             # Loopback keyless vs explicit api_key_env parity in _cmd_doctor:
             # 1) No api_key_env -> loopback openai-compatible is OK without credentials.
@@ -4300,53 +4559,48 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 hold_q.set()
                 daemon_q.close()
 
-        # 3. Fast daemon.close() (< 1.0s) when CodexRefiner is blocked in a slow app-server turn
+        # 3. Fast daemon.close() (< 1.0s) when CodexRefiner is blocked mid-SSE stream
         #    AND JsonlShimMixin _closed respawn guard + per-proc _pending isolation
-        slow_app_server = (
-            "import json, sys, time\n"
-            "flag = sys.argv[1]\n"
-            "for raw in sys.stdin:\n"
-            "    msg = json.loads(raw)\n"
-            "    m = msg.get('method'); rid = msg.get('id')\n"
-            "    if m == 'initialize':\n"
-            "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': {'userAgent': 'mock'}}) + '\\n'); sys.stdout.flush()\n"
-            "    elif m == 'thread/start':\n"
-            "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': {'thread': {'id': 'thr-slow'}}}) + '\\n'); sys.stdout.flush()\n"
-            "    elif m == 'turn/start':\n"
-            "        with open(flag, 'w', encoding='utf-8') as f: f.write('in_turn')\n"
-            "        time.sleep(10.0)\n"
-        )
         with tempfile.TemporaryDirectory() as td_slow:
             tmp_s = Path(td_slow)
-            turn_flag = tmp_s / "in_turn.flag"
-            cfg_s = Config(refiner=RefinerConfig(provider="codex", timeout_sec=15.0))
-            ref_s = CodexRefiner(
-                cfg_s,
-                env={},
-                runtime_dir=tmp_s,
-                app_server_cmd=[sys.executable, "-u", "-c", slow_app_server, str(turn_flag)],
-            )
-            daemon_s = VoiceInputDaemon(
-                cfg_s,
-                env={},
-                runtime_dir=tmp_s,
-                platform=_FakePlatform(),
-                asr_provider=_FakeAsr("慢精修关停测试"),
-                refiner=ref_s,
-                tracker=_isolated_tracker(tmp_s),
-            )
-            daemon_s.handle_trigger("toggle")
-            daemon_s._last_trigger_ts = -1e9
-            daemon_s.handle_trigger("toggle")
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline and not turn_flag.is_file():
-                time.sleep(0.02)
-            self.assertTrue(turn_flag.is_file())
+            _write_codex_auth_json(tmp_s)
+            in_stream_evt = threading.Event()
 
-            t_close0 = time.monotonic()
-            daemon_s.close()
-            close_elapsed = time.monotonic() - t_close0
-            self.assertLess(close_elapsed, 1.0, f"daemon.close() hung for {close_elapsed:.2f}s on slow CodexRefiner")
+            def slow_sse_responder(handler, _rec) -> None:
+                handler.send_response(200)
+                handler.send_header("Transfer-Encoding", "chunked")
+                handler.send_header("Connection", "keep-alive")
+                handler.end_headers()
+                fr = b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+                handler.wfile.write(f"{len(fr):x}\r\n".encode("ascii") + fr + b"\r\n")
+                handler.wfile.flush()
+                in_stream_evt.set()
+                time.sleep(10.0)
+
+            srv_slow = _LocalResponsesServer(responder=slow_sse_responder)
+            try:
+                cfg_s = Config(refiner=RefinerConfig(provider="codex", base_url=srv_slow.base_url, timeout_sec=15.0))
+                ref_s = CodexRefiner(cfg_s, env={"HOME": str(tmp_s)}, runtime_dir=tmp_s)
+                daemon_s = VoiceInputDaemon(
+                    cfg_s,
+                    env={"HOME": str(tmp_s)},
+                    runtime_dir=tmp_s,
+                    platform=_FakePlatform(),
+                    asr_provider=_FakeAsr("慢精修关停测试"),
+                    refiner=ref_s,
+                    tracker=_isolated_tracker(tmp_s),
+                )
+                daemon_s.handle_trigger("toggle")
+                daemon_s._last_trigger_ts = -1e9
+                daemon_s.handle_trigger("toggle")
+                self.assertTrue(in_stream_evt.wait(timeout=3.0))
+
+                t_close0 = time.monotonic()
+                daemon_s.close()
+                close_elapsed = time.monotonic() - t_close0
+                self.assertLess(close_elapsed, 1.0, f"daemon.close() hung for {close_elapsed:.2f}s on slow CodexRefiner")
+            finally:
+                srv_slow.close()
 
             # JsonlShimMixin: _closed prevents _ensure_shim resurrection, and real _shim_reader(proc_old)
             # flushes ONLY proc_old's _pending entries with 'shim_eof' without touching proc_new's RPCs!
@@ -4619,89 +4873,37 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_config(config_path=bad_json, env={"HOME": str(tmp)}, home_dir=tmp)
 
-            # 1. CodexRefiner app-server sends custom prompt via baseInstructions on stateless ephemeral threads
-            rpc_log = tmp / "rpc_prompt.jsonl"
+            # 1. CodexRefiner stateless /responses sends custom prompt via instructions (with no-tools constraint)
+            _write_codex_auth_json(tmp)
+            srv_prompt = _LocalResponsesServer()
             cfg_codex = Config(
                 refiner=RefinerConfig(
                     provider="codex",
+                    base_url=srv_prompt.base_url,
                     prompt=custom_prompt,
                     timeout_sec=4.0,
                 )
             )
-            cref = CodexRefiner(
-                cfg_codex,
-                env={},
-                runtime_dir=tmp,
-                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "ok"],
-            )
+            cref = CodexRefiner(cfg_codex, env={"HOME": str(tmp)}, runtime_dir=tmp)
             try:
                 r1 = cref.refine("你评估一下看", session_key="sess-p")
-                self.assertEqual(r1.text, "CLEAN[thr-1#1]:你评估一下看")
-                r2 = cref.refine("第二句复用空壳线程", session_key="sess-p")
-                self.assertEqual(r2.text, "CLEAN[thr-1#2]:第二句复用空壳线程")
+                self.assertEqual(r1.text, "CLEAN#1:你评估一下看")
+                r2 = cref.refine("第二句无状态复用", session_key="sess-p")
+                self.assertEqual(r2.text, "CLEAN#2:第二句无状态复用")
                 cfg_codex.refiner.prompt = "Updated prompt v2"
                 r3 = cref.refine("改提示词后立即生效", session_key="sess-p")
-                self.assertEqual(r3.text, "CLEAN[thr-2#3]:改提示词后立即生效")
+                self.assertEqual(r3.text, "CLEAN#3:改提示词后立即生效")
             finally:
                 cref.close()
-            recs = [json.loads(ln) for ln in rpc_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            tstarts = [r for r in recs if r.get("method") == "thread/start"]
-            tdeletes = [r for r in recs if r.get("method") == "thread/delete"]
-            self.assertEqual(len(tstarts), 2)
-            self.assertEqual([d["params"]["threadId"] for d in tdeletes], ["thr-1"])
-            self.assertTrue(tstarts[0]["params"]["baseInstructions"].startswith(custom_prompt))
-            self.assertIn("no tools available", tstarts[0]["params"]["baseInstructions"].lower())
-            self.assertTrue(tstarts[1]["params"]["baseInstructions"].startswith("Updated prompt v2"))
-            turn0 = next(r for r in recs if r.get("method") == "turn/start")
-            self.assertIn(REFINER_TASK_REMINDER, turn0["params"]["input"][-1]["text"])
-
-            # Codex exec fallback passes custom prompt via -c model_instructions_file=... and envelope via stdin
-            fake_codex = tmp / "codex"
-            exec_stdin_dump = tmp / "exec_stdin.txt"
-            exec_instr_dump = tmp / "exec_instr.txt"
-            fake_codex.write_text(
-                f"#!{sys.executable}\n"
-                "import json, pathlib, sys\n"
-                "args = sys.argv[1:]\n"
-                "if 'app-server' in args:\n"
-                "    sys.exit(1)\n"
-                "for idx, tok in enumerate(args):\n"
-                "    if tok == '-c' and idx + 1 < len(args) and args[idx + 1].startswith('model_instructions_file='):\n"
-                "        ipath = json.loads(args[idx + 1].split('=', 1)[1])\n"
-                f"        pathlib.Path({str(exec_instr_dump)!r}).write_text(pathlib.Path(ipath).read_text(encoding='utf-8'), encoding='utf-8')\n"
-                "out_idx = args.index('-o') + 1\n"
-                f"pathlib.Path({str(exec_stdin_dump)!r}).write_text(sys.stdin.read(), encoding='utf-8')\n"
-                "pathlib.Path(args[out_idx]).write_text('exec refined ok', encoding='utf-8')\n",
-                encoding="utf-8",
-            )
-            fake_codex.chmod(0o755)
-            cfg_exec = Config(
-                refiner=RefinerConfig(
-                    provider="codex",
-                    prompt=custom_prompt,
-                    max_retries=1,
-                    timeout_sec=5.0,
-                )
-            )
-            cref_exec = CodexRefiner(
-                cfg_exec,
-                env={"CODEX_BIN": str(fake_codex)},
-                runtime_dir=tmp,
-                sleep_fn=lambda _s: None,
-                rand_fn=lambda: 0.0,
-            )
-            try:
-                rex = cref_exec.refine("这个配置是否支持多行文本？")
-                self.assertEqual(rex.text, "exec refined ok")
-                self.assertEqual(rex.used_fallback, "codex-exec")
-            finally:
-                cref_exec.close()
-            instr_sent = exec_instr_dump.read_text(encoding="utf-8")
-            stdin_sent = exec_stdin_dump.read_text(encoding="utf-8")
-            self.assertTrue(instr_sent.startswith(custom_prompt))
-            self.assertIn("no tools available", instr_sent.lower())
-            self.assertIn("<asr_draft_to_clean>\n这个配置是否支持多行文本？\n</asr_draft_to_clean>", stdin_sent)
-            self.assertIn(REFINER_TASK_REMINDER, stdin_sent)
+                srv_prompt.close()
+            self.assertEqual(len(srv_prompt.requests), 3)
+            p_b0 = srv_prompt.requests[0]["body"]
+            p_b2 = srv_prompt.requests[2]["body"]
+            assert isinstance(p_b0, dict) and isinstance(p_b2, dict)
+            self.assertTrue(p_b0["instructions"].startswith(custom_prompt))
+            self.assertIn("no tools available", p_b0["instructions"].lower())
+            self.assertTrue(p_b2["instructions"].startswith("Updated prompt v2"))
+            self.assertIn(REFINER_TASK_REMINDER, p_b0["input"][-1]["content"][0]["text"])
 
             # 2. OpenAICompatibleRefiner & GeminiRefiner receive custom prompt + reminder
             oai_seen: list[HttpRequest] = []
@@ -4751,89 +4953,349 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             self.assertEqual(gem_payload["systemInstruction"], {"parts": [{"text": custom_prompt}]})
             self.assertIn(REFINER_TASK_REMINDER, gem_payload["contents"][0]["parts"][0]["text"])
 
-    def test_codex_concurrent_multiplexing_idle_rotation_and_auth_symlink_isolation(self) -> None:
-        import concurrent.futures
+    def test_stateless_responses_cookies_idle_reconnect_api_routing_and_codex_30m_refresh(self) -> None:
+        # 1. Config effective_api(), explicit api="responses" routing, gemini incompatibility & legacy max_turns_per_thread
+        self.assertEqual(RefinerConfig(provider="codex").effective_api(), "responses")
+        self.assertEqual(RefinerConfig(provider="gemini").effective_api(), "gemini")
+        self.assertEqual(RefinerConfig(provider="off").effective_api(), "off")
+        for compat_prov in ("openai", "openrouter", "dashscope", "volcengine", "groq", "siliconflow"):
+            self.assertEqual(RefinerConfig(provider=compat_prov).effective_api(), "chat-completions")
+            self.assertEqual(RefinerConfig(provider=compat_prov, api="responses").effective_api(), "responses")
 
+        with tempfile.TemporaryDirectory() as td_cfg:
+            p_compat = Path(td_cfg) / "legacy.toml"
+            p_compat.write_text('[refiner]\nprovider = "openai"\napi = "responses"\nmax_turns_per_thread = 42\n', encoding="utf-8")
+            loaded_c, _ = load_config(config_path=p_compat, env={"HOME": td_cfg}, home_dir=Path(td_cfg))
+            self.assertEqual(loaded_c.refiner.effective_api(), "responses")
+            self.assertEqual(loaded_c.refiner.max_turns_per_thread, 42)
+            ref_oai_resp = create_refiner(loaded_c, env={"HOME": td_cfg, "OPENAI_API_KEY": "sk-oai-" + ("6" * 14)})
+            self.assertIsInstance(ref_oai_resp, OpenAIResponsesRefiner)
+            self.assertNotIsInstance(ref_oai_resp, CodexRefiner)
+            ref_oai_resp.close()
+
+            for bad_toml in (
+                '[refiner]\nprovider = "gemini"\napi = "responses"\n',
+                '[refiner]\nprovider = "gemini"\napi = "chat-completions"\n',
+                '[refiner]\nprovider = "codex"\napi = "chat-completions"\n',
+                '[refiner]\nprovider = "openai"\napi = "invalid-proto"\n',
+            ):
+                bad_p = Path(td_cfg) / "bad_api.toml"
+                bad_p.write_text(bad_toml, encoding="utf-8")
+                with self.assertRaises(ConfigError):
+                    load_config(config_path=bad_p, env={"HOME": td_cfg}, home_dir=Path(td_cfg))
+
+        # 2. OpenAIResponsesRefiner: HTTP 200 without Content-Type, LB Cookie allowlist, account-switch reset,
+        #    and transparent 1x Keep-Alive idle-disconnect reconnect (zero max_retries consumed!)
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            rpc_log = tmp / "rpc_parallel.jsonl"
-            # 1. Isolated codex-home symlinks auth.json (never copies) and strips OPENAI_API_KEY
-            fake_home = tmp / "home"
-            main_codex = fake_home / ".codex"
-            main_codex.mkdir(parents=True)
-            auth_file = main_codex / "auth.json"
-            auth_file.write_text('{"tokens":{"access_token":"dummy"}}', encoding="utf-8")
-            auth_file.chmod(0o600)
-            (main_codex / "AGENTS.md").write_text("HEAVY_USER_AGENTS_MD_SHOULD_NOT_BE_VISIBLE", encoding="utf-8")
+            drop_second_socket = [True]
 
-            rt_dir = tmp / "rt"
-            cfg = Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0))
-            ref = CodexRefiner(
-                cfg,
-                env={
-                    "HOME": str(fake_home),
-                    "OPENAI_API_KEY": "sk-asr-only-key",
-                    "OPENAI_BASE_URL": "https://asr-only.example/v1",
-                },
-                runtime_dir=rt_dir,
-                max_threads_per_process=2,
-                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "parallel"],
-            )
+            def cookie_and_drop_responder(handler, rec) -> None:
+                seq = int(rec["seq"])
+                if seq == 1:
+                    _LocalResponsesServer.send_sse_200(
+                        handler,
+                        _sse_completed_frames(
+                            ["R1-OK"],
+                            usage={"input_tokens": 5000, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 12},
+                        ),
+                        set_cookies=[
+                            "__cf_bm=bm_v1; Path=/; HttpOnly; Secure",
+                            "__cflb=lb_node_a; Path=/; HttpOnly",
+                            "__oailb=oai_shard_7; Path=/; Secure",
+                            "chatgpt_user_secret=MUST_NEVER_BE_STORED; Path=/",
+                        ],
+                    )
+                    return
+                if seq == 2 and drop_second_socket[0]:
+                    drop_second_socket[0] = False
+                    # Simulate Cloudflare closing an idle Keep-Alive TCP connection before sending status line!
+                    handler.close_connection = True
+                    try:
+                        handler.connection.shutdown(2)
+                    except Exception:
+                        pass
+                    handler.connection.close()
+                    return
+                _LocalResponsesServer.send_sse_200(
+                    handler,
+                    _sse_completed_frames(
+                        [f"R{seq}-OK"],
+                        usage={"input_tokens": 5010, "input_tokens_details": {"cached_tokens": 4864}, "output_tokens": 14, "output_tokens_details": {"reasoning_tokens": 4}},
+                    ),
+                )
+
+            srv = _LocalResponsesServer(responder=cookie_and_drop_responder)
             try:
-                codex_home, has_auth = ref._prepare_codex_home()
-                self.assertTrue(has_auth)
-                link_auth = codex_home / "auth.json"
-                self.assertTrue(link_auth.is_symlink())
-                self.assertEqual(os.readlink(link_auth), str(auth_file))
-                self.assertFalse((codex_home / "AGENTS.md").exists())
-                proc_env = ref._build_codex_env(codex_home, has_auth=has_auth)
-                self.assertEqual(proc_env["CODEX_HOME"], str(codex_home))
-                self.assertNotIn("OPENAI_API_KEY", proc_env)
-                self.assertNotIn("OPENAI_BASE_URL", proc_env)
+                _write_codex_auth_json(tmp, account_id="acct-alpha")
+                # max_retries = 0 proves idle-disconnect reconnect does NOT consume max_retries budget!
+                cfg = Config(refiner=RefinerConfig(provider="codex", base_url=srv.base_url, max_retries=0, timeout_sec=5.0))
+                ref = CodexRefiner(cfg, env={"HOME": str(tmp)}, runtime_dir=tmp)
+                try:
+                    res1 = ref.refine("第一轮拿 Cookie", session_key="codex:s1", fallback_context="ctx_body")
+                    self.assertEqual(res1.text, "R1-OK")
+                    self.assertEqual((res1.input_tokens, res1.cached_input_tokens, res1.output_tokens, res1.reasoning_tokens), (5000, 0, 12, 0))
 
-                # Concurrent requests 1 & 2 run in parallel on app-server PID #1;
-                # request 3 overlaps and seamlessly rotates to app-server PID #2 without dropping 1 or 2!
-                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-                    futs = [
-                        pool.submit(ref.refine, "并发草稿一"),
-                        pool.submit(ref.refine, "并发草稿二"),
-                        pool.submit(ref.refine, "并发草稿三"),
-                    ]
-                    outs = [f.result(timeout=5.0) for f in futs]
+                    # Req 2 hits simulated idle Keep-Alive disconnect on reused socket, reconnects 1x transparently & echoes LB cookies!
+                    res2 = ref.refine("第二轮断连重发", session_key="codex:s1", fallback_context="ctx_body")
+                    self.assertEqual((res2.text, res2.used_fallback, res2.retries), ("R3-OK", "", 0))
+                    self.assertEqual((res2.input_tokens, res2.cached_input_tokens, res2.output_tokens, res2.reasoning_tokens), (5010, 4864, 14, 4))
 
-                self.assertTrue(outs[0].text.endswith(":并发草稿一"))
-                self.assertTrue(outs[1].text.endswith(":并发草稿二"))
-                self.assertTrue(outs[2].text.endswith(":并发草稿三"))
-                self.assertTrue(all(o.used_fallback == "" for o in outs))
+                    hdr_reconnected = srv.requests[-1]["headers"]
+                    assert isinstance(hdr_reconnected, dict)
+                    cookie_sent = hdr_reconnected.get("cookie", "")
+                    self.assertIn("__cf_bm=bm_v1", cookie_sent)
+                    self.assertIn("__cflb=lb_node_a", cookie_sent)
+                    self.assertIn("__oailb=oai_shard_7", cookie_sent)
+                    self.assertNotIn("chatgpt_user_secret", cookie_sent)
+                    port_acct_alpha = srv.requests[-1]["client_port"]
+
+                    # Switch account_id in auth.json (bumping mtime_ns) -> clears LB cookies AND closes old Keep-Alive socket!
+                    auth_p = _write_codex_auth_json(tmp, account_id="acct-beta")
+                    st_prev = auth_p.stat()
+                    os.utime(auth_p, ns=(st_prev.st_atime_ns, st_prev.st_mtime_ns + 5_000_000))
+                    res3 = ref.refine("切换账号后清空 Cookie", session_key="codex:s1")
+                    self.assertEqual(res3.used_fallback, "")
+                    hdr_beta = srv.requests[-1]["headers"]
+                    assert isinstance(hdr_beta, dict)
+                    self.assertEqual(hdr_beta.get("chatgpt-account-id"), "acct-beta")
+                    self.assertNotIn("cookie", hdr_beta)
+                    self.assertNotEqual(srv.requests[-1]["client_port"], port_acct_alpha)
+                finally:
+                    ref.close()
+
+                # Also verify provider="openai" + api="responses" wire format via OpenAIResponsesRefiner
+                srv.requests.clear()
+                cfg_oai_r = Config(
+                    refiner=RefinerConfig(
+                        provider="openai",
+                        api="responses",
+                        model="gpt-5-mini",
+                        base_url=f"http://127.0.0.1:{srv.port}/v1",
+                        effort="low",
+                    )
+                )
+                env_oai = {"HOME": str(tmp), "OPENAI_API_KEY": "sk-oai-direct-responses-999"}
+                ref_oai = create_refiner(cfg_oai_r, resolve_credentials(cfg_oai_r, env_oai), env=env_oai)
+                self.assertIsInstance(ref_oai, OpenAIResponsesRefiner)
+                try:
+                    out_oai = ref_oai.refine("标准平台 Responses 测试", session_key="claude:s9", fallback_context="log_1")
+                    self.assertEqual(out_oai.provider, "openai")
+                    self.assertEqual(out_oai.used_fallback, "")
+                    req_oai = srv.requests[-1]
+                    self.assertEqual(req_oai["path"], "/v1/responses")
+                    h_oai = req_oai["headers"]
+                    assert isinstance(h_oai, dict)
+                    self.assertEqual(h_oai.get("authorization"), "Bearer sk-oai-direct-responses-999")
+                    self.assertNotIn("chatgpt-account-id", h_oai)
+                    self.assertNotIn("originator", h_oai)
+                finally:
+                    ref_oai.close()
             finally:
-                ref.close()
+                srv.close()
 
-            recs = [json.loads(ln) for ln in rpc_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            init_pids = [r["_pid"] for r in recs if r.get("method") == "initialize"]
-            self.assertEqual(len(init_pids), 2)
-            self.assertNotEqual(init_pids[0], init_pids[1])
-            unsubs = [r for r in recs if r.get("method") == "thread/unsubscribe"]
-            self.assertEqual(len(unsubs), 3)
-
-            # Non-symlink regular auth.json in codex-home must be rejected (falls back to draft safely)
-            bad_rt = tmp / "bad_rt"
-            bad_ch = bad_rt / "codex-home"
-            bad_ch.mkdir(parents=True)
-            bad_ch.chmod(0o700)
-            (bad_ch / "auth.json").write_text("copied!", encoding="utf-8")
-            ref_bad = CodexRefiner(
-                Config(refiner=RefinerConfig(provider="codex", max_retries=0, timeout_sec=2.0)),
-                env={"HOME": str(fake_home)},
-                runtime_dir=bad_rt,
-                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(rpc_log), "ok"],
-            )
+        # 3. CodexRefiner: api_key mode routing, JWT account_id fallback, 30-min (1800s) proactive refresh,
+        #    300s failure cooldown while token still valid (>60s), HTTP 401 refresh+retry, Keyring mode,
+        #    and strict env={"HOME": td} hermetic isolation!
+        with tempfile.TemporaryDirectory() as td_auth:
+            tmp_a = Path(td_auth)
+            srv_a = _LocalResponsesServer()
+            srv_oai_mode = _LocalResponsesServer()
             try:
-                fb_res = ref_bad.refine("凭证异常兜底原稿")
-                self.assertEqual(fb_res.text, "凭证异常兜底原稿")
-                self.assertEqual(fb_res.used_fallback, "asr_draft")
-                self.assertIn("non-symlink", fb_res.warning)
+                # 3a. auth_mode="api_key" routes to api.openai.com/v1 (or base_url) without subscription headers
+                home_ak = tmp_a / "home_apikey"
+                _write_codex_auth_json(home_ak, auth_mode="api_key", openai_api_key="sk-from-auth-json-111")
+                ref_ak = CodexRefiner(
+                    Config(refiner=RefinerConfig(provider="codex", base_url=f"http://127.0.0.1:{srv_oai_mode.port}/v1")),
+                    env={"HOME": str(home_ak)},
+                )
+                try:
+                    r_ak = ref_ak.refine("API Key 登录态路由")
+                    self.assertEqual(r_ak.used_fallback, "")
+                    self.assertEqual(srv_oai_mode.requests[-1]["path"], "/v1/responses")
+                    h_ak = srv_oai_mode.requests[-1]["headers"]
+                    assert isinstance(h_ak, dict)
+                    self.assertEqual(h_ak.get("authorization"), "Bearer sk-from-auth-json-111")
+                    self.assertNotIn("chatgpt-account-id", h_ak)
+                finally:
+                    ref_ak.close()
+
+                # 3b. 30-minute (1800s) refresh window + JWT chatgpt_account_id claim fallback + Stage 1 OPENAI_API_KEY stripped
+                home_30m = tmp_a / "home_30m"
+                now_epoch = [1_750_000_000.0]
+                now_mono = [100.0]
+                tok_initial = _make_fake_jwt(exp=int(now_epoch[0]) + 2000, account_id="acct-from-jwt-claim")
+                tok_refreshed = _make_fake_jwt(exp=int(now_epoch[0]) + 86400 * 10, account_id="acct-refreshed-disk")
+                # Write auth.json WITHOUT top-level tokens.account_id to exercise JWT claim extraction!
+                _write_codex_auth_json(home_30m, access_token=tok_initial, account_id="")
+                rpc_log_30m = tmp_a / "rpc_30m.jsonl"
+                auth_file_30m = home_30m / ".codex" / "auth.json"
+
+                ref_30m = CodexRefiner(
+                    Config(refiner=RefinerConfig(provider="codex", base_url=srv_a.base_url)),
+                    env={"HOME": str(home_30m), "OPENAI_API_KEY": "sk-stage1-asr-key-must-not-leak"},
+                    app_server_cmd=[
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        _MOCK_AUTH_APP_SERVER_CODE,
+                        str(rpc_log_30m),
+                        "ok",
+                        tok_refreshed,
+                        str(auth_file_30m),
+                    ],
+                    time_fn=lambda: now_epoch[0],
+                    clock_fn=lambda: now_mono[0],
+                )
+                try:
+                    # At T+0 (exp - now = 2000s >= 1800s): uses auth.json directly, 0 getAuthStatus spawns!
+                    srv_a.requests.clear()
+                    r_pre = ref_30m.refine("未进三十分钟窗口")
+                    self.assertEqual(r_pre.used_fallback, "")
+                    self.assertFalse(rpc_log_30m.exists())
+                    h_pre = srv_a.requests[-1]["headers"]
+                    assert isinstance(h_pre, dict)
+                    self.assertEqual(h_pre.get("chatgpt-account-id"), "acct-from-jwt-claim")
+                    self.assertEqual(h_pre.get("authorization"), f"Bearer {tok_initial}")
+
+                    # Advance clock by 210s -> exp - now = 1790s (< 1800s): triggers getAuthStatus(includeToken=True, refreshToken=True)!
+                    now_epoch[0] += 210.0
+                    now_mono[0] += 210.0
+                    r_post = ref_30m.refine("进入三十分钟提前刷新窗口")
+                    self.assertEqual(r_post.used_fallback, "")
+                    self.assertTrue(rpc_log_30m.is_file())
+                    rpc_lines = [json.loads(ln) for ln in rpc_log_30m.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                    get_auth_req = next(r for r in rpc_lines if r.get("method") == "getAuthStatus")
+                    self.assertEqual(get_auth_req["params"], {"includeToken": True, "refreshToken": True})
+                    self.assertFalse(get_auth_req["_env_has_oai"])
+                    h_post = srv_a.requests[-1]["headers"]
+                    assert isinstance(h_post, dict)
+                    self.assertEqual(h_post.get("authorization"), f"Bearer {tok_refreshed}")
+                    self.assertEqual(h_post.get("chatgpt-account-id"), "acct-refreshed-disk")
+                finally:
+                    ref_30m.close()
+
+                # 3c. Transient refresh failure when 60 < exp - now < 1800 -> passes through with valid token + 300s cooldown;
+                #     when exp - now <= 60 (hard expired) -> fails cleanly to asr_draft!
+                home_cd = tmp_a / "home_cooldown"
+                t_epoch_cd = [1_750_010_000.0]
+                t_mono_cd = [500.0]
+                tok_900s = _make_fake_jwt(exp=int(t_epoch_cd[0]) + 900, account_id="acct-cd")
+                _write_codex_auth_json(home_cd, access_token=tok_900s, account_id="acct-cd")
+                rpc_log_cd = tmp_a / "rpc_cd.jsonl"
+                ref_cd = CodexRefiner(
+                    Config(refiner=RefinerConfig(provider="codex", base_url=srv_a.base_url, max_retries=0)),
+                    env={"HOME": str(home_cd)},
+                    app_server_cmd=[sys.executable, "-u", "-c", _MOCK_AUTH_APP_SERVER_CODE, str(rpc_log_cd), "fail"],
+                    time_fn=lambda: t_epoch_cd[0],
+                    clock_fn=lambda: t_mono_cd[0],
+                )
+                try:
+                    # Call 1 (rem=900s): refresh fails, falls back to still-valid tok_900s & sets 300s cooldown!
+                    rcd1 = ref_cd.refine("刷新失败但旧票据仍有效")
+                    self.assertEqual((rcd1.text, rcd1.used_fallback), ("CLEAN#" + str(len(srv_a.requests)) + ":刷新失败但旧票据仍有效", ""))
+                    calls_after_1 = len([json.loads(ln) for ln in rpc_log_cd.read_text(encoding="utf-8").splitlines() if "getAuthStatus" in ln])
+                    self.assertEqual(calls_after_1, 1)
+
+                    # Call 2 (+120s < 300s cooldown): does NOT spawn getAuthStatus again!
+                    t_epoch_cd[0] += 120.0
+                    t_mono_cd[0] += 120.0
+                    rcd2 = ref_cd.refine("冷却期内零子进程")
+                    self.assertEqual(rcd2.used_fallback, "")
+                    calls_after_2 = len([json.loads(ln) for ln in rpc_log_cd.read_text(encoding="utf-8").splitlines() if "getAuthStatus" in ln])
+                    self.assertEqual(calls_after_2, 1)
+
+                    # Call 3: advance past hard expiry (rem=30s <= 60s) -> fails cleanly to asr_draft!
+                    t_epoch_cd[0] += 750.0
+                    t_mono_cd[0] += 750.0
+                    rcd3 = ref_cd.refine("真过期降级原稿")
+                    self.assertEqual((rcd3.text, rcd3.used_fallback), ("真过期降级原稿", "asr_draft"))
+                finally:
+                    ref_cd.close()
+
+                # 3d. HTTP 401 triggers refresh + 1 immediate retry; Keyring (no auth.json) exports token;
+                #     and hermetic env={"HOME": empty_dir} never touches host ~/.codex or host PATH!
+                tok_stale = _make_fake_jwt(exp=4102444800, account_id="acct-401")
+                tok_fresh_401 = _make_fake_jwt(exp=4102488888, account_id="acct-401")
+
+                def responder_401(handler, rec) -> None:
+                    hdrs = rec["headers"]
+                    assert isinstance(hdrs, dict)
+                    if hdrs.get("authorization") != f"Bearer {tok_fresh_401}":
+                        _LocalResponsesServer.send_json(handler, 401, {"detail": "Token revoked"})
+                        return
+                    _LocalResponsesServer.send_sse_200(handler, _sse_completed_frames(["401刷新恢复成功"]))
+
+                srv_401 = _LocalResponsesServer(responder=responder_401)
+                try:
+                    # Keyring mode (NO auth.json on disk at all!)
+                    home_kr = tmp_a / "home_keyring"
+                    home_kr.mkdir(parents=True)
+                    rpc_log_kr = tmp_a / "rpc_kr.jsonl"
+                    tok_kr = _make_fake_jwt(exp=4102444800, account_id="acct-keyring-jwt")
+                    srv_a.requests.clear()
+                    ref_kr = CodexRefiner(
+                        Config(refiner=RefinerConfig(provider="codex", base_url=srv_a.base_url)),
+                        env={"HOME": str(home_kr)},
+                        app_server_cmd=[sys.executable, "-u", "-c", _MOCK_AUTH_APP_SERVER_CODE, str(rpc_log_kr), "ok", tok_kr],
+                    )
+                    try:
+                        r_kr1 = ref_kr.refine("钥匙串第一轮")
+                        r_kr2 = ref_kr.refine("钥匙串第二轮内存复用")
+                        self.assertEqual((r_kr1.used_fallback, r_kr2.used_fallback), ("", ""))
+                        self.assertFalse((home_kr / ".codex" / "auth.json").exists())
+                        kr_calls = [json.loads(ln) for ln in rpc_log_kr.read_text(encoding="utf-8").splitlines() if "getAuthStatus" in ln]
+                        self.assertEqual(len(kr_calls), 1)
+                        h_kr = srv_a.requests[-1]["headers"]
+                        assert isinstance(h_kr, dict)
+                        self.assertEqual(h_kr.get("chatgpt-account-id"), "acct-keyring-jwt")
+                    finally:
+                        ref_kr.close()
+
+                    # HTTP 401 refresh & retry
+                    home_401 = tmp_a / "home_401"
+                    auth_401_path = _write_codex_auth_json(home_401, access_token=tok_stale, account_id="acct-401")
+                    rpc_log_401 = tmp_a / "rpc_401.jsonl"
+                    ref_401 = CodexRefiner(
+                        Config(refiner=RefinerConfig(provider="codex", base_url=srv_401.base_url, max_retries=0)),
+                        env={"HOME": str(home_401)},
+                        app_server_cmd=[
+                            sys.executable,
+                            "-u",
+                            "-c",
+                            _MOCK_AUTH_APP_SERVER_CODE,
+                            str(rpc_log_401),
+                            "ok",
+                            tok_fresh_401,
+                            str(auth_401_path),
+                        ],
+                    )
+                    try:
+                        r_401 = ref_401.refine("遇401自动刷新重试")
+                        self.assertEqual((r_401.text, r_401.used_fallback, len(srv_401.requests)), ("401刷新恢复成功", "", 2))
+                    finally:
+                        ref_401.close()
+
+                    # Strict hermetic isolation: env={"HOME": empty_hermetic} with NO auth.json and NO PATH/CODEX_BIN
+                    # MUST NEVER read host ~/.codex/auth.json or invoke host `codex` binary!
+                    home_hermetic = tmp_a / "home_hermetic_empty"
+                    home_hermetic.mkdir(parents=True)
+                    srv_a.requests.clear()
+                    ref_herm = CodexRefiner(
+                        Config(refiner=RefinerConfig(provider="codex", base_url=srv_a.base_url, max_retries=0)),
+                        env={"HOME": str(home_hermetic)},
+                    )
+                    try:
+                        r_herm = ref_herm.refine("严格隔离不碰宿主机")
+                        self.assertEqual((r_herm.text, r_herm.used_fallback), ("严格隔离不碰宿主机", "asr_draft"))
+                        self.assertEqual(len(srv_a.requests), 0)
+                    finally:
+                        ref_herm.close()
+                finally:
+                    srv_401.close()
             finally:
-                ref_bad.close()
+                srv_a.close()
+                srv_oai_mode.close()
 
     def test_message_boundary_chunking_git_status_toggle_and_anti_chat_wire_format(self) -> None:
         import concurrent.futures
@@ -5007,97 +5469,57 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             self.assertIn('<session_reference_log read_only="true">', gem_parts[0]["text"])
             self.assertIn("<workspace_git_status", gem_parts[-1]["text"])
 
-            # 3. CodexRefiner graceful fallback when thread/revert is unsupported + same-session overlap fallback
-            nr_log = tmp / "no_revert.jsonl"
-            ref_nr = CodexRefiner(
-                Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0)),
-                env={},
-                runtime_dir=tmp / "rt_nr",
-                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(nr_log), "no_revert"],
-            )
-            try:
-                nr1 = ref_nr.refine("无撤回接口第一句", session_key="sess-nr")
-                nr2 = ref_nr.refine("无撤回接口第二句", session_key="sess-nr")
-                self.assertEqual(nr1.text, "CLEAN[thr-1#1]:无撤回接口第一句")
-                self.assertEqual(nr2.text, "CLEAN[thr-2#2]:无撤回接口第二句")
-            finally:
-                ref_nr.close()
-            nr_recs = [json.loads(ln) for ln in nr_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            nr_tstarts = [r for r in nr_recs if r.get("method") == "thread/start"]
-            self.assertEqual([t["params"]["ephemeral"] for t in nr_tstarts], [False, True])
-            self.assertEqual([r["params"]["threadId"] for r in nr_recs if r.get("method") == "thread/delete"], ["thr-1"])
-
-            # Same-session concurrent overlap: 1st takes persistent shell thr-1, 2nd runs ephemeral thr-2 without blocking
-            ov_log = tmp / "overlap.jsonl"
+            # 3. Stateless Responses wire layout: N developer <session_reference_log> items + 1 trailing user draft+git item,
+            #    plus safe concurrent same-session execution!
+            _write_codex_auth_json(tmp)
+            srv_ov = _LocalResponsesServer()
             ref_ov = CodexRefiner(
-                Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0)),
-                env={},
+                Config(refiner=RefinerConfig(provider="codex", base_url=srv_ov.base_url, include_git_status=True, timeout_sec=5.0)),
+                env={"HOME": str(tmp)},
                 runtime_dir=tmp / "rt_ov",
-                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(ov_log), "parallel"],
             )
             try:
+                r_wire = ref_ov.refine("检查多块 developer 布局", session_key=snap.session_key, tracker=tracker)
+                self.assertEqual(r_wire.used_fallback, "")
+                w_body = srv_ov.requests[-1]["body"]
+                assert isinstance(w_body, dict)
+                w_in = w_body["input"]
+                self.assertEqual([it["role"] for it in w_in], ["developer", "developer", "user"])
+                self.assertNotIn("feature_alpha.py", w_in[0]["content"][0]["text"])
+                self.assertNotIn("feature_alpha.py", w_in[1]["content"][0]["text"])
+                self.assertIn("<workspace_git_status", w_in[2]["content"][0]["text"])
+                self.assertIn("feature_alpha.py", w_in[2]["content"][0]["text"])
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     fa = pool.submit(ref_ov.refine, "同会话并发A", session_key="sess-same")
                     fb = pool.submit(ref_ov.refine, "同会话并发B", session_key="sess-same")
                     ra, rb = fa.result(timeout=5.0), fb.result(timeout=5.0)
-                self.assertTrue(ra.text.endswith(":同会话并发A") and "DIRTY" not in ra.text)
-                self.assertTrue(rb.text.endswith(":同会话并发B") and "DIRTY" not in rb.text)
-                rc = ref_ov.refine("同会话后续复用C", session_key="sess-same")
-                self.assertEqual(rc.text, "CLEAN[thr-1#3]:同会话后续复用C")
+                self.assertTrue(ra.text.endswith(":同会话并发A"))
+                self.assertTrue(rb.text.endswith(":同会话并发B"))
             finally:
                 ref_ov.close()
+                srv_ov.close()
 
-    def test_codex_async_revert_shell_snapshot_disable_and_parallel_asr_prewarm(self) -> None:
+    def test_codex_parallel_asr_socket_prewarm_and_hermetic_find_codex_bin(self) -> None:
         from agent_voice_input.refiner import _DISABLE, find_codex_bin
+        import fcntl
 
         self.assertIn("shell_snapshot", _DISABLE)
-        # Hermetic empty env={} MUST NEVER leak into host os.environ["PATH"] or ~!
+        # Hermetic empty env={} and explicit PATH without codex MUST NEVER leak into host os.environ or /opt/homebrew!
         self.assertIsNone(find_codex_bin({}))
+        with tempfile.TemporaryDirectory() as td_bin:
+            self.assertIsNone(find_codex_bin({"HOME": td_bin, "PATH": td_bin}))
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            # 1. Async thread/revert: refine() returns immediately without blocking on 350ms revert RPC,
-            #    and the next turn still reuses thr-1 cleanly after background revert finishes!
-            slow_log = tmp / "slow_revert.jsonl"
-            ref_slow = CodexRefiner(
-                Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0)),
-                env={},
-                runtime_dir=tmp / "rt_slow",
-                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(slow_log), "slow_revert"],
-            )
-            try:
-                # Warm thread first on turn 1, wait 0.45s so thr-1 is ready, then time turn 2!
-                r1 = ref_slow.refine("预热第一句", session_key="agy:async-rev")
-                self.assertEqual(r1.text, "CLEAN[thr-1#1]:预热第一句")
-                time.sleep(0.45)
-
-                t_start = time.monotonic()
-                r2 = ref_slow.refine("异步撤回不阻塞上屏", session_key="agy:async-rev")
-                elapsed_turn2 = time.monotonic() - t_start
-                self.assertEqual(r2.text, "CLEAN[thr-1#2]:异步撤回不阻塞上屏")
-                # Turn 2 returns well before the 350ms slow_revert finishes!
-                self.assertLess(elapsed_turn2, 0.25)
-
-                # Calling turn 3 immediately waits seamlessly for the in-flight revert and still reuses thr-1!
-                r3 = ref_slow.refine("紧接第三句仍复用", session_key="agy:async-rev")
-                self.assertEqual(r3.text, "CLEAN[thr-1#3]:紧接第三句仍复用")
-            finally:
-                ref_slow.close()
-
-            slow_recs = [json.loads(ln) for ln in slow_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            self.assertEqual(len([r for r in slow_recs if r.get("method") == "thread/start"]), 1)
-            self.assertEqual(len([r for r in slow_recs if r.get("method") == "thread/revert"]), 3)
-
-            # 2. Stage 1 ASR parallel prewarm: initialize + thread/start run concurrently BEFORE ASR returns!
-            import fcntl
-
-            pre_log = tmp / "prewarm.jsonl"
+            home_p = tmp / "home"
+            _write_codex_auth_json(home_p)
             agy_cid = "fedcba98-0000-4000-8000-000000000001"
-            agy_pres = tmp / "home" / ".gemini" / "antigravity-cli" / "presence"
+            agy_pres = home_p / ".gemini" / "antigravity-cli" / "presence"
             agy_pres.mkdir(parents=True)
             agy_lock_fd = os.open(str(agy_pres / f"{agy_cid}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(agy_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            agy_logs = tmp / "home" / ".gemini" / "antigravity-cli" / "brain" / agy_cid / ".system_generated" / "logs"
+            agy_logs = home_p / ".gemini" / "antigravity-cli" / "brain" / agy_cid / ".system_generated" / "logs"
             agy_logs.mkdir(parents=True)
             agy_file = agy_logs / "transcript_full.jsonl"
             agy_file.write_text(
@@ -5107,15 +5529,12 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             rt_pre = tmp / "rt_pre"
             rt_pre.mkdir(mode=0o700)
             write_session_registry_entry(rt_pre, cli="agy", session_id=agy_cid, jsonl_path=str(agy_file), cwd=str(tmp))
-            tracker = SessionTracker(home_dir=tmp / "home", runtime_dir=rt_pre, proc_root=None)
+            tracker = SessionTracker(home_dir=home_p, runtime_dir=rt_pre, proc_root=None)
 
-            ref_pre = CodexRefiner(
-                Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0)),
-                env={},
-                runtime_dir=rt_pre,
-                app_server_cmd=[sys.executable, "-u", "-c", _MOCK_APP_SERVER_CODE, str(pre_log), "ok"],
-            )
-            saw_prewarm_during_asr = [False]
+            srv_pre = _LocalResponsesServer()
+            cfg_pre = Config(refiner=RefinerConfig(provider="codex", base_url=srv_pre.base_url, timeout_sec=5.0))
+            ref_pre = CodexRefiner(cfg_pre, env={"HOME": str(home_p)}, runtime_dir=rt_pre)
+            saw_tcp_prewarm_during_asr = [False]
 
             class _SlowInspectAsr(BaseAsrProvider):
                 provider_name = "dashscope"
@@ -5123,42 +5542,939 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 def __init__(self) -> None:
                     pass
 
-                def transcribe(self, wav_bytes: bytes, context: Any = None, *, is_cancelled: Any = None) -> AsrResult:
+                def transcribe(self, wav_bytes: bytes, context: object = None, *, is_cancelled: object = None) -> AsrResult:
                     deadline_w = time.monotonic() + 1.5
                     while time.monotonic() < deadline_w:
-                        if pre_log.is_file():
-                            methods_now = [
-                                json.loads(ln).get("method")
-                                for ln in pre_log.read_text(encoding="utf-8").splitlines()
-                                if ln.strip()
-                            ]
-                            if "thread/start" in methods_now:
-                                saw_prewarm_during_asr[0] = True
-                                break
-                        time.sleep(0.02)
+                        # Verify prepare_session() connected TCP socket BEFORE any HTTP request is sent!
+                        if srv_pre.accepted_conns >= 1 and len(srv_pre.requests) == 0:
+                            saw_tcp_prewarm_during_asr[0] = True
+                            break
+                        time.sleep(0.01)
                     return AsrResult(text="并行预热语音草稿", provider="dashscope", model="qwen3-asr-flash", latency_ms=80)
 
             try:
                 pipe_res = run_pipeline_once(
                     _voiced_wav(),
-                    cfg=Config(refiner=RefinerConfig(provider="codex", timeout_sec=5.0)),
+                    cfg=cfg_pre,
                     tracker=tracker,
                     asr_provider=_SlowInspectAsr(),
                     refiner=ref_pre,
                     window_title_override="[agy:#fedcba98]",
                     dry_run=True,
-                    env={},
+                    env={"HOME": str(home_p)},
                 )
                 self.assertTrue(pipe_res.ok)
-                self.assertTrue(saw_prewarm_during_asr[0])
-                self.assertEqual(pipe_res.final_text, "CLEAN[thr-1#1]:并行预热语音草稿")
+                self.assertTrue(saw_tcp_prewarm_during_asr[0])
+                self.assertEqual(pipe_res.final_text, "CLEAN#1:并行预热语音草稿")
+                # Only 1 TCP connection total (reused from prepare_session prewarm)!
+                self.assertEqual(srv_pre.accepted_conns, 1)
+                self.assertLessEqual(pipe_res.refined.init_ms if pipe_res.refined else 999, 15)
             finally:
                 ref_pre.close()
+                srv_pre.close()
                 os.close(agy_lock_fd)
 
-            pre_recs = [json.loads(ln) for ln in pre_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            self.assertEqual(len([r for r in pre_recs if r.get("method") == "thread/start"]), 1)
-            self.assertEqual(len([r for r in pre_recs if r.get("method") == "turn/start"]), 1)
+
+class ObservabilityAndTelemetryTests(unittest.TestCase):
+    def test_refiner_token_usage_extraction_and_none_vs_zero_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            _write_codex_auth_json(tmp)
+
+            def usage_responder(handler, rec) -> None:
+                n = int(rec["seq"])
+                if n == 1:
+                    # Omitted input_tokens_details / output_tokens_details -> normalized to 0 when input/output present
+                    _LocalResponsesServer.send_sse_200(
+                        handler,
+                        _sse_completed_frames(["OUT-1"], usage={"input_tokens": 4200, "output_tokens": 28}),
+                    )
+                elif n == 2:
+                    _LocalResponsesServer.send_sse_200(
+                        handler,
+                        _sse_completed_frames(
+                            [],
+                            output_only="OUT-2",
+                            usage={
+                                "input_tokens": 4210,
+                                "input_tokens_details": {"cached_tokens": 4096},
+                                "output_tokens": 31,
+                                "output_tokens_details": {"reasoning_tokens": 12},
+                            },
+                        ),
+                    )
+                else:
+                    _LocalResponsesServer.send_sse_200(handler, _sse_completed_frames(["OUT-3"], usage=None))
+
+            srv_u = _LocalResponsesServer(responder=usage_responder)
+            cfg_codex = Config(refiner=RefinerConfig(provider="codex", base_url=srv_u.base_url, timeout_sec=5.0))
+            ref_codex = CodexRefiner(cfg_codex, env={"HOME": str(tmp)}, runtime_dir=tmp / "rt_codex")
+            try:
+                c1 = ref_codex.refine("第一轮冷启动", session_key="agy:u1", fallback_context="ctx_alpha")
+                self.assertEqual(c1.text, "OUT-1")
+                self.assertEqual((c1.input_tokens, c1.cached_input_tokens, c1.output_tokens, c1.reasoning_tokens), (4200, 0, 28, 0))
+                self.assertIsNotNone(c1.cached_input_tokens)
+                self.assertGreaterEqual(c1.init_ms, 0)
+                self.assertEqual(c1.context_chunks, 1)
+                self.assertGreater(c1.context_chars, 0)
+
+                c2 = ref_codex.refine("第二轮热命中", session_key="agy:u1", fallback_context="ctx_alpha")
+                self.assertEqual(c2.text, "OUT-2")
+                self.assertEqual((c2.input_tokens, c2.cached_input_tokens, c2.output_tokens, c2.reasoning_tokens), (4210, 4096, 31, 12))
+
+                c3 = ref_codex.refine("第三轮无通知上报", session_key="agy:u1", fallback_context="ctx_alpha")
+                self.assertEqual(c3.text, "OUT-3")
+                self.assertEqual((c3.input_tokens, c3.cached_input_tokens, c3.output_tokens, c3.reasoning_tokens), (None, None, None, None))
+            finally:
+                ref_codex.close()
+                srv_u.close()
+
+            # OpenAICompatibleRefiner: OpenAI details (0 vs hit), DeepSeek cache hit, and omitted details -> None
+            oai_payloads = [
+                {
+                    "choices": [{"message": {"content": "oai-miss"}}],
+                    "usage": {
+                        "prompt_tokens": 2048,
+                        "completion_tokens": 19,
+                        "prompt_tokens_details": {"cached_tokens": 0},
+                        "completion_tokens_details": {"reasoning_tokens": 0},
+                    },
+                },
+                {
+                    "choices": [{"message": {"content": "deepseek-hit"}}],
+                    "usage": {
+                        "prompt_cache_hit_tokens": 1920,
+                        "prompt_cache_miss_tokens": 140,
+                        "completion_tokens": 22,
+                        "completion_tokens_details": {"reasoning_tokens": 64},
+                    },
+                },
+                {
+                    "choices": [{"message": {"content": "bare-gateway"}}],
+                    "usage": {"prompt_tokens": 500, "completion_tokens": 15},
+                },
+            ]
+            oai_idx = [0]
+
+            def oai_tx(_req: HttpRequest) -> HttpResponse:
+                body = oai_payloads[oai_idx[0]]
+                oai_idx[0] += 1
+                return HttpResponse(200, {"content-type": "application/json"}, json.dumps(body).encode("utf-8"))
+
+            cfg_oai = Config(
+                refiner=RefinerConfig(
+                    provider="openai-compatible",
+                    base_url="http://127.0.0.1:8000/v1",
+                    model="local-ds",
+                )
+            )
+            ref_oai = OpenAICompatibleRefiner(cfg_oai, env={}, transport=oai_tx)
+            o1 = ref_oai.refine("测试一", fallback_context="ctx_block")
+            self.assertEqual((o1.input_tokens, o1.cached_input_tokens, o1.output_tokens, o1.reasoning_tokens), (2048, 0, 19, 0))
+            o2 = ref_oai.refine("测试二", fallback_context="ctx_block")
+            self.assertEqual((o2.input_tokens, o2.cached_input_tokens, o2.output_tokens, o2.reasoning_tokens), (2060, 1920, 22, 64))
+            o3 = ref_oai.refine("测试三")
+            self.assertEqual((o3.input_tokens, o3.cached_input_tokens, o3.output_tokens, o3.reasoning_tokens), (500, None, 15, None))
+            self.assertEqual((o3.context_chunks, o3.context_chars), (0, 0))
+
+            # GeminiRefiner: omitted cachedContentTokenCount -> 0 when promptTokenCount exists; absent usageMetadata -> None
+            gem_payloads = [
+                {
+                    "candidates": [{"content": {"parts": [{"text": "gem-0"}]}}],
+                    "usageMetadata": {"promptTokenCount": 3100, "candidatesTokenCount": 25},
+                },
+                {
+                    "candidates": [{"content": {"parts": [{"text": "gem-hit"}]}}],
+                    "usageMetadata": {
+                        "promptTokenCount": 3120,
+                        "cachedContentTokenCount": 2980,
+                        "candidatesTokenCount": 27,
+                        "thoughtsTokenCount": 48,
+                    },
+                },
+                {"candidates": [{"content": {"parts": [{"text": "gem-none"}]}}]},
+            ]
+            gem_idx = [0]
+            gem_env = {"GEMINI_API_KEY": "gem_usage_" + ("a" * 16)}
+            cfg_gem = Config(refiner=RefinerConfig(provider="gemini"))
+            ref_gem = GeminiRefiner(
+                cfg_gem,
+                resolve_credentials(cfg_gem, gem_env),
+                env=gem_env,
+                transport=lambda _r: (
+                    gem_idx.__setitem__(0, gem_idx[0] + 1),
+                    HttpResponse(200, {"content-type": "application/json"}, json.dumps(gem_payloads[gem_idx[0] - 1]).encode("utf-8")),
+                )[1],
+            )
+            g1 = ref_gem.refine("g1")
+            self.assertEqual((g1.input_tokens, g1.cached_input_tokens, g1.output_tokens, g1.reasoning_tokens), (3100, 0, 25, None))
+            g2 = ref_gem.refine("g2")
+            self.assertEqual((g2.input_tokens, g2.cached_input_tokens, g2.output_tokens, g2.reasoning_tokens), (3120, 2980, 27, 48))
+            g3 = ref_gem.refine("g3")
+            self.assertEqual((g3.input_tokens, g3.cached_input_tokens, g3.output_tokens, g3.reasoning_tokens), (None, None, None, None))
+
+    def test_daemon_telemetry_jsonl_permissions_256kb_atomic_trim_and_zero_plaintext(self) -> None:
+        import stat
+        from agent_voice_input.daemon import TELEMETRY_MAX_BYTES, append_telemetry_record, read_telemetry_history
+        from agent_voice_input.refiner import BaseRefiner
+
+        secret_speech = "PRIVATE_USER_SPEECH_UTTERANCE_8821"
+        secret_refined = "PRIVATE_REFINED_RESULT_TEXT_7732"
+        secret_dialog = "PRIVATE_SESSION_CONTEXT_BODY_6643"
+        secret_api_key = "sk-private-secret-" + ("z" * 18)
+
+        class _InstrumentedRefiner(BaseRefiner):
+            provider_name = "codex"
+
+            def refine(self, asr_input, *, session_key="", tracker=None, fallback_context="", is_cancelled=None):
+                return RefinerResult(
+                    text=secret_refined,
+                    provider="codex",
+                    model="gpt-6-luna",
+                    latency_ms=85,
+                    warning=f"minor warn key={secret_api_key}",
+                    input_tokens=8192,
+                    cached_input_tokens=7680,
+                    output_tokens=36,
+                    reasoning_tokens=0,
+                    init_ms=4,
+                    context_chars=12345,
+                    context_chunks=2,
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            rt = tmp / "rt"
+            sid = "99887766-0000-4000-8000-000000000099"
+            sdir = tmp / "home" / ".codex" / "sessions" / "2026" / "11" / "17"
+            sdir.mkdir(parents=True)
+            rollout = sdir / f"rollout-2026-{sid}.jsonl"
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": sid, "source": "cli", "cwd": ""}})
+                + "\n"
+                + json.dumps({"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "UserMessage", "content": [{"type": "text", "text": secret_dialog}]}}})
+                + "\n",
+                encoding="utf-8",
+            )
+            rt.mkdir(parents=True, mode=0o700)
+            write_session_registry_entry(rt, cli="codex", session_id=sid, jsonl_path=str(rollout), cwd="")
+            env = {"OPENAI_API_KEY": secret_api_key, "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
+            cfg = Config(refiner=RefinerConfig(provider="codex"))
+            plat = _FakePlatform()
+            plat.fg = ForegroundWindow(hwnd=101, process="WindowsTerminal", title=f"codex [#{sid[:8]}]")
+            tracker = SessionTracker(home_dir=tmp / "home", env=env, runtime_dir=rt, proc_root=tmp / "no_proc")
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr(secret_speech),
+                refiner=_InstrumentedRefiner(),
+                tracker=tracker,
+                paste_settle_sec=0.0,
+            )
+            try:
+                for i in range(25):
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_trigger("toggle")
+                    daemon._last_trigger_ts = -1e9
+                    r_stop = daemon.handle_trigger("toggle")
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r_stop["seq_id"]:
+                        time.sleep(0.01)
+
+                self.assertEqual(len(daemon.recent_results), 20)
+                self.assertEqual(daemon.recent_results[0]["seq_id"], 6)
+                self.assertEqual(daemon.recent_results[-1]["seq_id"], 25)
+
+                lr = daemon.last_result
+                for required_num_key in (
+                    "asr_ms",
+                    "refine_init_ms",
+                    "refine_ms",
+                    "deliver_ms",
+                    "total_ms",
+                    "ctx_chars",
+                    "ctx_chunks",
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                ):
+                    self.assertIsInstance(lr[required_num_key], int, required_num_key)
+                self.assertEqual(lr["asr_provider"], "dashscope")
+                self.assertEqual(lr["refiner_provider"], "codex")
+                self.assertEqual((lr["ctx_chars"], lr["ctx_chunks"]), (12345, 2))
+                self.assertEqual((lr["input_tokens"], lr["cached_input_tokens"], lr["output_tokens"], lr["reasoning_tokens"]), (8192, 7680, 36, 0))
+
+                tpath = rt / "telemetry.jsonl"
+                self.assertTrue(tpath.is_file())
+                self.assertEqual(stat.S_IMODE(tpath.stat().st_mode), 0o600)
+                raw_telemetry = tpath.read_text(encoding="utf-8")
+                combined_dump = json.dumps(
+                    {"last": lr, "recent": list(daemon.recent_results)},
+                    ensure_ascii=False,
+                ) + "\n" + raw_telemetry
+                for forbidden in (secret_speech, secret_refined, secret_dialog, secret_api_key):
+                    self.assertNotIn(forbidden, combined_dump)
+                self.assertIn("[REDACTED]", combined_dump)
+            finally:
+                daemon.close()
+
+            # Push telemetry.jsonl well past 256 KB and verify atomic 0600 tail truncation on whole lines
+            rt_trim = tmp / "rt_trim"
+            rt_trim.mkdir(mode=0o700)
+            for seq in range(1, 900):
+                append_telemetry_record(
+                    rt_trim,
+                    {
+                        "ts": 1700000000.0 + seq * 0.01,
+                        "seq_id": seq,
+                        "ok": True,
+                        "asr_provider": "dashscope",
+                        "refiner_provider": "codex",
+                        "asr_ms": 300,
+                        "refine_init_ms": 0,
+                        "refine_ms": 400,
+                        "deliver_ms": 20,
+                        "total_ms": 720,
+                        "ctx_chars": 150000,
+                        "ctx_chunks": 3,
+                        "input_tokens": 42000,
+                        "cached_input_tokens": 41500,
+                        "output_tokens": 40,
+                        "reasoning_tokens": 0,
+                        "pad": "x" * 180,
+                    },
+                )
+            trim_file = rt_trim / "telemetry.jsonl"
+            st_trim = trim_file.stat()
+            self.assertLessEqual(st_trim.st_size, TELEMETRY_MAX_BYTES)
+            self.assertGreater(st_trim.st_size, 90 * 1024)
+            self.assertEqual(stat.S_IMODE(st_trim.st_mode), 0o600)
+            self.assertEqual([p.name for p in rt_trim.iterdir() if ".tmp" in p.name], [])
+
+            raw_lines = trim_file.read_bytes().splitlines()
+            self.assertGreater(len(raw_lines), 100)
+            parsed_trimmed = [json.loads(ln.decode("utf-8")) for ln in raw_lines]
+            self.assertEqual(parsed_trimmed[-1]["seq_id"], 899)
+            self.assertGreater(parsed_trimmed[0]["seq_id"], 1)
+            self.assertEqual(
+                [r["seq_id"] for r in read_telemetry_history(rt_trim, limit=3)],
+                [897, 898, 899],
+            )
+
+    def test_cli_status_history_backward_compat_online_merge_and_offline_fallback(self) -> None:
+        import io
+        from agent_voice_input import cli as cli_mod
+        from agent_voice_input.daemon import append_telemetry_record
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            rt = tmp / "rt_cli"
+            rt.mkdir(mode=0o700)
+            cfg_file = tmp / "cfg.toml"
+            cfg_file.write_text('[refiner]\nprovider = "off"\n', encoding="utf-8")
+
+            # Seed 2 historical records from a previous daemon lifecycle in telemetry.jsonl
+            for old_seq in (101, 102):
+                append_telemetry_record(
+                    rt,
+                    {"ts": 1700000100.0 + old_seq, "seq_id": old_seq, "ok": True, "total_ms": 500 + old_seq},
+                )
+
+            env_patch = {
+                "HOME": str(tmp),
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "AGENT_VOICE_INPUT_CONFIG": str(cfg_file),
+            }
+            plat = _FakePlatform()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=env_patch,
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("新守护进程口述"),
+                paste_settle_sec=0.0,
+            )
+            srv_thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_thread.start()
+            try:
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not (rt / "control.sock").exists():
+                    time.sleep(0.02)
+
+                # Run 2 live utterances on the current daemon (seq 1, 2)
+                for _ in range(2):
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_trigger("toggle")
+                    daemon._last_trigger_ts = -1e9
+                    rs = daemon.handle_trigger("toggle")
+                    w_dl = time.monotonic() + 2.0
+                    while time.monotonic() < w_dl and daemon.last_result.get("seq_id") != rs["seq_id"]:
+                        time.sleep(0.01)
+
+                with unittest.mock.patch.dict(os.environ, env_patch, clear=True):
+                    # 1. Default `status` without --history omits recent_results (strictly backward-compatible)
+                    buf_plain = io.StringIO()
+                    with unittest.mock.patch("sys.stdout", buf_plain):
+                        rc_plain = cli_mod.main(["--config", str(cfg_file), "status"])
+                    self.assertEqual(rc_plain, 0)
+                    obj_plain = json.loads(buf_plain.getvalue())
+                    self.assertTrue(obj_plain["ok"])
+                    self.assertEqual(obj_plain["last_result"]["seq_id"], 2)
+                    self.assertNotIn("recent_results", obj_plain)
+
+                    # 2. `status --history` (default const=10) merges prior telemetry.jsonl (101, 102) + live (1, 2) without duplicates
+                    buf_hist = io.StringIO()
+                    with unittest.mock.patch("sys.stdout", buf_hist):
+                        rc_hist = cli_mod.main(["--config", str(cfg_file), "status", "--history"])
+                    self.assertEqual(rc_hist, 0)
+                    obj_hist = json.loads(buf_hist.getvalue())
+                    self.assertEqual([r["seq_id"] for r in obj_hist["recent_results"]], [101, 102, 1, 2])
+
+                    # 3. `status --history 3` caps at last 3
+                    buf_h3 = io.StringIO()
+                    with unittest.mock.patch("sys.stdout", buf_h3):
+                        rc_h3 = cli_mod.main(["--config", str(cfg_file), "status", "--history", "3"])
+                    self.assertEqual(rc_h3, 0)
+                    obj_h3 = json.loads(buf_h3.getvalue())
+                    self.assertEqual([r["seq_id"] for r in obj_h3["recent_results"]], [102, 1, 2])
+            finally:
+                daemon.close()
+                srv_thread.join(timeout=2.0)
+
+            # 4. Offline daemon fallback: plain `status` stays compact; `status --history 2` reads telemetry.jsonl
+            with unittest.mock.patch.dict(os.environ, env_patch, clear=True):
+                buf_off_plain = io.StringIO()
+                with unittest.mock.patch("sys.stdout", buf_off_plain):
+                    rc_off_plain = cli_mod.main(["--config", str(cfg_file), "status"])
+                self.assertEqual(rc_off_plain, 1)
+                self.assertEqual(json.loads(buf_off_plain.getvalue()), {"ok": False, "state": "stopped"})
+
+                buf_off_hist = io.StringIO()
+                with unittest.mock.patch("sys.stdout", buf_off_hist):
+                    rc_off_hist = cli_mod.main(["--config", str(cfg_file), "status", "--history", "2"])
+                self.assertEqual(rc_off_hist, 1)
+                obj_off_hist = json.loads(buf_off_hist.getvalue())
+                self.assertFalse(obj_off_hist["ok"])
+                self.assertEqual(obj_off_hist["state"], "stopped")
+                self.assertEqual([r["seq_id"] for r in obj_off_hist["recent_results"]], [1, 2])
+                self.assertEqual(obj_off_hist["last_result"]["seq_id"], 2)
+
+    def test_diagnose_live_works_without_logs_sqlite(self) -> None:
+        import importlib.util
+        import io
+        from agent_voice_input.daemon import append_telemetry_record
+
+        diag_script = _REPO_ROOT / ".agents" / "skills" / "voice-eval" / "scripts" / "diagnose_live.py"
+        self.assertTrue(diag_script.is_file())
+        spec = importlib.util.spec_from_file_location("avi_diagnose_live_test", diag_script)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            rt = tmp / "rt_no_sqlite"
+            rt.mkdir(mode=0o700)
+            cfg_file = tmp / "cfg.toml"
+            cfg_file.write_text('[refiner]\nprovider = "codex"\n', encoding="utf-8")
+            append_telemetry_record(
+                rt,
+                {
+                    "ts": 1700000500.0,
+                    "seq_id": 7,
+                    "ok": True,
+                    "session_key": "agy:secret-session-uuid",
+                    "asr_provider": "dashscope",
+                    "refiner_provider": "codex",
+                    "asr_ms": 320,
+                    "refine_init_ms": 0,
+                    "refine_ms": 410,
+                    "deliver_ms": 25,
+                    "total_ms": 755,
+                    "ctx_chars": 98000,
+                    "ctx_chunks": 2,
+                    "input_tokens": 28000,
+                    "cached_input_tokens": 27500,
+                    "output_tokens": 30,
+                    "reasoning_tokens": 0,
+                },
+            )
+            self.assertFalse((rt / "codex-home" / "logs_2.sqlite").exists())
+            buf = io.StringIO()
+            with (
+                unittest.mock.patch.dict(os.environ, {"HOME": str(tmp), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}, clear=True),
+                unittest.mock.patch("sys.stdout", buf),
+            ):
+                rc = mod.main(["--config", str(cfg_file), "--runtime-dir", str(rt), "--last", "5", "--json"])
+            self.assertEqual(rc, 0)
+            out_json = json.loads(buf.getvalue())
+            self.assertIsNone(out_json["storage"]["legacy_codex_sqlite"])
+            self.assertEqual(len(out_json["recent_results"]), 1)
+            self.assertNotIn("secret-session-uuid", buf.getvalue())
+            self.assertTrue(out_json["recent_results"][0]["session_tag"].startswith("agy#"))
+
+
+class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
+    def test_p1_codex_unchanged_proactive_cooldown_and_401_same_token_no_resend(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            srv = _LocalResponsesServer()
+            try:
+                # 1. Proactive refresh (<1800s) where codex app-server returns the SAME unrotated token
+                #    (even touching auth.json) MUST arm 300s cooldown so prepare_session() + refine()
+                #    do NOT spawn 2 app-servers per utterance!
+                home_unrot = tmp / "home_unrot"
+                t_epoch = [1_750_020_000.0]
+                t_mono = [1000.0]
+                tok_1500s = _make_fake_jwt(exp=int(t_epoch[0]) + 1500, account_id="acct-unrot")
+                auth_unrot = _write_codex_auth_json(home_unrot, access_token=tok_1500s, account_id="acct-unrot")
+                rpc_log = tmp / "rpc_unrot.jsonl"
+
+                ref = CodexRefiner(
+                    Config(refiner=RefinerConfig(provider="codex", base_url=srv.base_url, timeout_sec=5.0)),
+                    env={"HOME": str(home_unrot)},
+                    app_server_cmd=[
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        _MOCK_AUTH_APP_SERVER_CODE,
+                        str(rpc_log),
+                        "ok",
+                        tok_1500s,
+                        str(auth_unrot),
+                    ],
+                    time_fn=lambda: t_epoch[0],
+                    clock_fn=lambda: t_mono[0],
+                )
+                try:
+                    ref.prepare_session("codex:s1")
+                    deadline_pw = time.monotonic() + 2.0
+                    while time.monotonic() < deadline_pw and not rpc_log.is_file():
+                        time.sleep(0.01)
+                    # Wait for prewarm thread to settle
+                    time.sleep(0.05)
+                    r1 = ref.refine("第一句口述")
+                    self.assertEqual(r1.used_fallback, "")
+                    t_epoch[0] += 60.0
+                    t_mono[0] += 60.0
+                    r2 = ref.refine("冷却期内第二句口述")
+                    self.assertEqual(r2.used_fallback, "")
+                    rpc_calls = [
+                        json.loads(ln)
+                        for ln in rpc_log.read_text(encoding="utf-8").splitlines()
+                        if "getAuthStatus" in ln
+                    ]
+                    self.assertEqual(len(rpc_calls), 1)
+                finally:
+                    ref.close()
+
+                # 2. HTTP 401 where refresh returns the SAME dead token MUST fail fast to asr_draft
+                #    after 1 HTTP request without resending the same dead token!
+                srv_401 = _LocalResponsesServer(
+                    responder=lambda h, _r: _LocalResponsesServer.send_json(h, 401, {"detail": "revoked"})
+                )
+                try:
+                    home_dead = tmp / "home_dead"
+                    tok_dead = _make_fake_jwt(exp=4102444800, account_id="acct-dead")
+                    auth_dead = _write_codex_auth_json(home_dead, access_token=tok_dead, account_id="acct-dead")
+                    rpc_dead = tmp / "rpc_dead.jsonl"
+                    ref_dead = CodexRefiner(
+                        Config(refiner=RefinerConfig(provider="codex", base_url=srv_401.base_url, max_retries=2)),
+                        env={"HOME": str(home_dead)},
+                        app_server_cmd=[
+                            sys.executable,
+                            "-u",
+                            "-c",
+                            _MOCK_AUTH_APP_SERVER_CODE,
+                            str(rpc_dead),
+                            "ok",
+                            tok_dead,
+                            str(auth_dead),
+                        ],
+                    )
+                    try:
+                        r_dead = ref_dead.refine("死票不重发")
+                        self.assertEqual((r_dead.text, r_dead.used_fallback), ("死票不重发", "asr_draft"))
+                        self.assertEqual(len(srv_401.requests), 1)
+                    finally:
+                        ref_dead.close()
+                finally:
+                    srv_401.close()
+            finally:
+                srv.close()
+
+    def test_p1_responses_non_codex_reasoning_effort_model_gating(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            srv = _LocalResponsesServer()
+            try:
+                env_oai = {"HOME": str(tmp), "OPENAI_API_KEY": "sk-oai-" + ("8" * 16)}
+                # 1. Non-reasoning OpenAI models on api="responses" omit `reasoning` field completely
+                for non_rsn_model in ("gpt-4o-mini", "gpt-4o", "gpt-4.1"):
+                    srv.requests.clear()
+                    cfg_nr = Config(
+                        refiner=RefinerConfig(
+                            provider="openai",
+                            api="responses",
+                            model=non_rsn_model,
+                            effort="low",
+                            base_url=f"http://127.0.0.1:{srv.port}/v1",
+                        )
+                    )
+                    ref_nr = create_refiner(cfg_nr, resolve_credentials(cfg_nr, env_oai), env=env_oai)
+                    try:
+                        res_nr = ref_nr.refine("非推理模型省略 reasoning")
+                        self.assertEqual(res_nr.used_fallback, "")
+                        sent_body = srv.requests[-1]["body"]
+                        assert isinstance(sent_body, dict)
+                        self.assertNotIn("reasoning", sent_body, non_rsn_model)
+                    finally:
+                        ref_nr.close()
+
+                # 2. Reasoning OpenAI model maps effort="max" -> "xhigh"
+                srv.requests.clear()
+                cfg_rsn = Config(
+                    refiner=RefinerConfig(
+                        provider="openai",
+                        api="responses",
+                        model="gpt-5-mini",
+                        effort="max",
+                        base_url=f"http://127.0.0.1:{srv.port}/v1",
+                    )
+                )
+                ref_rsn = create_refiner(cfg_rsn, resolve_credentials(cfg_rsn, env_oai), env=env_oai)
+                try:
+                    ref_rsn.refine("推理模型 max 映射 xhigh")
+                    body_rsn = srv.requests[-1]["body"]
+                    assert isinstance(body_rsn, dict)
+                    self.assertEqual(body_rsn.get("reasoning"), {"effort": "xhigh"})
+                finally:
+                    ref_rsn.close()
+
+                # 3. CodexRefiner in api_key mode: omits reasoning on gpt-4o-mini, maps max->xhigh on gpt-6-luna
+                home_ak = tmp / "home_ak"
+                _write_codex_auth_json(home_ak, auth_mode="api_key", openai_api_key="sk-ak-codex-777777")
+                for c_model, c_eff, expected_rsn in (
+                    ("gpt-4o-mini", "low", None),
+                    ("gpt-6-luna", "max", {"effort": "xhigh"}),
+                ):
+                    srv.requests.clear()
+                    ref_cak = CodexRefiner(
+                        Config(
+                            refiner=RefinerConfig(
+                                provider="codex",
+                                model=c_model,
+                                effort=c_eff,
+                                base_url=f"http://127.0.0.1:{srv.port}/v1",
+                            )
+                        ),
+                        env={"HOME": str(home_ak)},
+                    )
+                    try:
+                        ref_cak.refine("Codex API Key 模式门控")
+                        b_cak = srv.requests[-1]["body"]
+                        assert isinstance(b_cak, dict)
+                        self.assertEqual(b_cak.get("reasoning"), expected_rsn)
+                    finally:
+                        ref_cak.close()
+            finally:
+                srv.close()
+
+    def test_p2_truncated_chunked_sse_retries_and_atomic_conn_release_on_close_or_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            _write_codex_auth_json(tmp, account_id="acct-sse-1")
+
+            # 1. Truncated chunked stream after response.output_text.done WITHOUT response.completed
+            #    MUST NOT accept partial text—must retry and recover on full response.completed!
+            def truncated_then_ok(handler, rec) -> None:
+                if int(rec["seq"]) == 1:
+                    handler.send_response(200)
+                    handler.send_header("Transfer-Encoding", "chunked")
+                    handler.send_header("Connection", "keep-alive")
+                    handler.end_headers()
+                    premature_frames = [
+                        'data: {"type":"response.output_text.delta","delta":"半截错误残片"}\n\n',
+                        'data: {"type":"response.output_text.done","text":"半截错误残片"}\n\n',
+                    ]
+                    for fr in premature_frames:
+                        b = fr.encode("utf-8")
+                        handler.wfile.write(f"{len(b):x}\r\n".encode("ascii") + b + b"\r\n")
+                    handler.wfile.flush()
+                    # Drop TCP socket mid-chunked WITHOUT sending 0\r\n\r\n or response.completed!
+                    handler.close_connection = True
+                    try:
+                        handler.connection.shutdown(2)
+                    except Exception:
+                        pass
+                    handler.connection.close()
+                    return
+                _LocalResponsesServer.send_sse_200(handler, _sse_completed_frames(["完整精修结果"]))
+
+            srv_trunc = _LocalResponsesServer(responder=truncated_then_ok)
+            try:
+                ref_t = CodexRefiner(
+                    Config(refiner=RefinerConfig(provider="codex", base_url=srv_trunc.base_url, max_retries=2)),
+                    env={"HOME": str(tmp)},
+                    sleep_fn=lambda _s: None,
+                    rand_fn=lambda: 0.0,
+                )
+                try:
+                    res_t = ref_t.refine("测试半截断流")
+                    self.assertEqual((res_t.text, res_t.used_fallback, res_t.retries), ("完整精修结果", "", 1))
+                finally:
+                    ref_t.close()
+
+                # Also verify compatible gateway `data: [DONE]` marker works cleanly
+                from agent_voice_input.refiner import _parse_responses_sse_lines
+
+                done_lines = iter(
+                    [
+                        'data: {"type":"response.output_text.delta","delta":"兼容网关OK"}\n'.encode("utf-8"),
+                        b"\n",
+                        b"data: [DONE]\n",
+                        b"\n",
+                    ]
+                )
+                txt_d, _, _ = _parse_responses_sse_lines(
+                    lambda: next(done_lines, b""),
+                    provider_name="openai-compatible",
+                    resp_headers={},
+                )
+                self.assertEqual(txt_d, "兼容网关OK")
+            finally:
+                srv_trunc.close()
+
+            # 2. Atomic _finish_conn guard: switching account or closing mid-flight never leaks conn back into pool
+            in_flight_evt = threading.Event()
+            proceed_evt = threading.Event()
+
+            def slow_responder(handler, _rec) -> None:
+                in_flight_evt.set()
+                proceed_evt.wait(timeout=2.0)
+                _LocalResponsesServer.send_sse_200(handler, _sse_completed_frames(["并发切号完成"]))
+
+            srv_race = _LocalResponsesServer(responder=slow_responder)
+            try:
+                ref_race = CodexRefiner(
+                    Config(refiner=RefinerConfig(provider="codex", base_url=srv_race.base_url, timeout_sec=5.0)),
+                    env={"HOME": str(tmp)},
+                )
+                try:
+                    out_holder: list[RefinerResult] = []
+                    th = threading.Thread(target=lambda: out_holder.append(ref_race.refine("并发请求")))
+                    th.start()
+                    self.assertTrue(in_flight_evt.wait(timeout=2.0))
+                    # Simulate concurrent account identity switch while connection is active
+                    from agent_voice_input.refiner import _ResponsesAuthTarget
+
+                    ref_race._sync_auth_identity(
+                        _ResponsesAuthTarget(
+                            url=f"{srv_race.base_url}/responses",
+                            bearer_token="tok-new",
+                            identity_key="http://127.0.0.1|acct:switched-mid-flight",
+                            is_codex_subscription=True,
+                        )
+                    )
+                    proceed_evt.set()
+                    th.join(timeout=2.0)
+                    self.assertEqual(len(out_holder), 1)
+                    with ref_race._pool._lock:
+                        total_idle = sum(len(v) for v in ref_race._pool._idle.values())
+                    self.assertEqual(total_idle, 0)
+                finally:
+                    ref_race.close()
+            finally:
+                srv_race.close()
+
+    def test_p3_redact_secrets_oauth_jwt_and_find_codex_bin_dict_env(self) -> None:
+        from agent_voice_input.config import redact_secrets
+        from agent_voice_input.refiner import find_codex_bin
+
+        fake_jwt = _make_fake_jwt(exp=4102444800, account_id="acct-secret-9988")
+        rt_val = "rt_" + ("1" * 12)
+        id_val = "id_" + ("2" * 12)
+        at_c_val = "at_" + ("3" * 12)
+        at_s_val = "at_" + ("4" * 12)
+        acct_val = "acct_" + ("5" * 10)
+        rt_q_val = "rt_" + ("6" * 10)
+        acct_q_val = "acct_" + ("7" * 10)
+        kv_val = "kv_" + ("8" * 10)
+        sample = (
+            f'json={{"access_token": "{fake_jwt}", "refresh_token": "{rt_val}", '
+            f'"id_token": "{id_val}", "authToken": "{at_c_val}", "auth_token": "{at_s_val}", '
+            f'"account_id": "{acct_val}"}} '
+            f"bare_jwt={fake_jwt} query=https://example.com/cb?refresh_token={rt_q_val}&account_id={acct_q_val} "
+            f"kv_line=authToken={kv_val}"
+        )
+        redacted = redact_secrets(sample, env={})
+        for secret_piece in (
+            fake_jwt,
+            rt_val,
+            id_val,
+            at_c_val,
+            at_s_val,
+            acct_val,
+            rt_q_val,
+            acct_q_val,
+            kv_val,
+        ):
+            self.assertNotIn(secret_piece, redacted)
+        self.assertNotIn("eyJ", redacted)
+
+        # find_codex_bin: dict(os.environ) with matching HOME checks ~/.local/bin/codex and system fallbacks,
+        # whereas isolated HOME or missing PATH strictly stays hermetic!
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            fake_home = tmp / "fake_home"
+            local_bin = fake_home / ".local" / "bin"
+            local_bin.mkdir(parents=True)
+            fake_codex = local_bin / "codex"
+            fake_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_codex.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {"HOME": str(fake_home), "PATH": "/nonexistent-dir"}, clear=True):
+                copied_prod_env = dict(os.environ)
+                self.assertEqual(find_codex_bin(copied_prod_env), str(fake_codex))
+                other_home = tmp / "other_isolated_home"
+                other_home.mkdir()
+                self.assertIsNone(find_codex_bin({"HOME": str(other_home), "PATH": "/nonexistent-dir"}))
+
+    def test_save_recordings_mp3_archive_permissions_ring_prune_and_ffmpeg_restore(self) -> None:
+        import math
+        import stat
+        from agent_voice_input.audio_proc import (
+            archive_recording_audio,
+            ensure_16k_mono_s16_wav,
+            list_saved_recordings,
+            process_wav,
+        )
+        from agent_voice_input.config import AudioConfig, resolve_saved_recordings_dir
+
+        speech_band_wav = pack_pcm16_mono_wav(
+            [int(5000 * math.sin(2.0 * math.pi * 440.0 * i / 16000.0)) for i in range(9600)]
+        )
+
+        # 1. Defaults & validation
+        self.assertIs(AudioConfig().save_recordings, False)
+        self.assertEqual(AudioConfig().save_recordings_max_count, 50)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            # Hermetic path resolution under HOME and XDG_CACHE_HOME
+            self.assertEqual(
+                resolve_saved_recordings_dir({"HOME": str(tmp)}),
+                tmp / ".cache" / "agent-voice-input" / "recordings",
+            )
+            self.assertEqual(
+                resolve_saved_recordings_dir({"HOME": str(tmp), "XDG_CACHE_HOME": str(tmp / "xdg_c")}),
+                tmp / "xdg_c" / "agent-voice-input" / "recordings",
+            )
+
+            for bad_toml in (
+                "[audio]\nsave_recordings_max_count = 0\n",
+                "[audio]\nsave_recordings_max_count = 5001\n",
+                '[audio]\nsave_recordings = "not_a_bool"\n',
+            ):
+                bad_f = tmp / "bad_audio.toml"
+                bad_f.write_text(bad_toml, encoding="utf-8")
+                with self.assertRaises(ConfigError):
+                    load_config(config_path=bad_f, env={"HOME": str(tmp)}, home_dir=tmp)
+
+            ok_f = tmp / "ok_audio.toml"
+            ok_f.write_text("[audio]\nsave_recordings = true\nsave_recordings_max_count = 3\n", encoding="utf-8")
+            cfg_rec, env_rec = load_config(config_path=ok_f, env={"HOME": str(tmp)}, home_dir=tmp)
+            self.assertIs(cfg_rec.audio.save_recordings, True)
+            self.assertEqual(cfg_rec.audio.save_recordings_max_count, 3)
+
+            # 2. Archive 5 recordings with deterministic timestamps & max_count=3 -> retains newest 3 as 0600 MP3
+            rec_dir = resolve_saved_recordings_dir(env_rec)
+            created_names: list[str] = []
+            for i in range(5):
+                out_p = archive_recording_audio(
+                    speech_band_wav,
+                    rec_dir,
+                    max_count=3,
+                    now_ts=1_750_100_000.0 + i * 10.0,
+                )
+                assert out_p is not None
+                self.assertTrue(out_p.name.startswith("rec-"))
+                self.assertEqual(out_p.suffix, ".mp3")
+                created_names.append(out_p.name)
+
+            self.assertEqual(stat.S_IMODE(rec_dir.stat().st_mode), 0o700)
+            kept = list_saved_recordings(rec_dir)
+            self.assertEqual([p.name for p in kept], list(reversed(created_names[-3:])))
+            for p in kept:
+                self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
+
+            # 3. Restore archived MP3 -> 16kHz mono PCM WAV via ffmpeg & verify gate passes!
+            restored_wav = ensure_16k_mono_s16_wav(kept[0])
+            gate_restored = process_wav(restored_wav, cfg_rec.audio)
+            self.assertTrue(gate_restored.passed)
+            self.assertGreater(gate_restored.duration_sec, 0.4)
+
+            # 4. End-to-end VoiceInputDaemon integration with isolated HOME + graceful stop() wait,
+            #    while silence and retry sources do NOT archive!
+            home_d = tmp / "daemon_home"
+            rt_d = tmp / "daemon_rt"
+            home_d.mkdir()
+            rt_d.mkdir(mode=0o700)
+            env_d = {"HOME": str(home_d), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt_d)}
+            cfg_d = Config(
+                audio=AudioConfig(save_recordings=True, save_recordings_max_count=2),
+                refiner=RefinerConfig(provider="off"),
+            )
+            # Silence input must NOT produce an archived recording
+            res_sil = run_pipeline_once(
+                _zero_wav(0.6),
+                cfg=cfg_d,
+                asr_provider=_FakeAsr("不会触发"),
+                dry_run=True,
+                env=env_d,
+            )
+            self.assertFalse(res_sil.ok)
+            self.assertEqual(list_saved_recordings(resolve_saved_recordings_dir(env_d)), [])
+
+            # retry audio_source must NOT duplicate archive
+            run_pipeline_once(
+                _voiced_wav(),
+                cfg=cfg_d,
+                asr_provider=_FakeAsr("retry不重复归档"),
+                audio_source="retry",
+                dry_run=True,
+                env=env_d,
+            )
+            self.assertEqual(list_saved_recordings(resolve_saved_recordings_dir(env_d)), [])
+
+            # Live daemon utterances archive asynchronously without blocking & flush cleanly on daemon.stop()
+            plat_d = _FakePlatform()
+            daemon_d = VoiceInputDaemon(
+                cfg_d,
+                env=env_d,
+                runtime_dir=rt_d,
+                platform=plat_d,
+                asr_provider=_FakeAsr("守护进程异步归档测试"),
+                paste_settle_sec=0.0,
+            )
+            try:
+                for _ in range(3):
+                    daemon_d._last_trigger_ts = -1e9
+                    daemon_d.handle_trigger("toggle")
+                    daemon_d._last_trigger_ts = -1e9
+                    rs = daemon_d.handle_trigger("toggle")
+                    dl = time.monotonic() + 2.0
+                    while time.monotonic() < dl and daemon_d.last_result.get("seq_id") != rs["seq_id"]:
+                        time.sleep(0.01)
+            finally:
+                daemon_d.stop()
+
+            d_saved = list_saved_recordings(resolve_saved_recordings_dir(env_d))
+            self.assertEqual(len(d_saved), 2)
+            self.assertTrue(all(p.suffix == ".mp3" and stat.S_IMODE(p.stat().st_mode) == 0o600 for p in d_saved))
 
 
 if __name__ == "__main__":
