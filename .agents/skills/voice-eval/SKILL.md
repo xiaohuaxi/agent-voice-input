@@ -9,6 +9,7 @@ description: 在本机真实长会话或合成样本上实测语音输入精修�
 1. 真实长会话精修基准（`scripts/bench_refiner.py`）：改动 Stage 2 精修器、提示词、`<session_reference_log>` 分块或前缀缓存机制后，用本机真实长会话与真实凭据跑连续多轮冷/热基准。
 2. 零打扰全链路系统自检（`scripts/e2e_system.py`）：功能新增或重构后，在不触碰桌面热键、HUD、剪贴板与主守护进程的前提下，自动跑通「真实人声 WAV → 真 ASR → 真多块上下文 → 真无状态精修 → 真 `VoiceInputDaemon` 串行队列 → 隔离 `tmux` 粘贴读回 → 遥测与故障恢复」全链路。
 3. 本机运行期只读诊断（`scripts/diagnose_live.py`）：用户反馈近期口述变慢、缓存未命中、专有名词未修对或偶发降级时，秒级只读定位根因。
+4. 存量真实录音按时间点 A/B 回放评测（`scripts/eval_recordings.py`）：将已归档录音对齐当时的历史会话快照（`--manifest-from` 锁定同批样本、`--asr-from` 冻结 Stage 1 初稿纯测 Stage 2、`--compare` 生成配对对照），结果与脱敏逐条 diff 以 `0600` 写入 `~/.cache/agent-voice-input/eval-runs/`。
 
 ## 安全与隐私红线
 

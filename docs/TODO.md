@@ -10,10 +10,10 @@
 
 ### `v0.8.0`：核心日常体验跃升
 - [x] **`v0.8-1` WSL 蓝牙耳机充电盒双 HUD 胶囊竞态修复**：`win_shim.ps1` 补齐非 `loopback` 启动期 `850ms` 首帧门禁（`PeekMessage` 保活低级钩子）与中段重开有帧恢复确认。
-- [ ] **`v0.8-2` 精修评测回放、提示词/载荷重构与热词补齐**：
-  - [ ] 扩展 `voice-eval` 支持存量录音按会话时间点（Point-in-Time）回放评测（产出限定仓外缓存目录）；
-  - [ ] 重构 `REFINER_SYSTEM_PROMPT`（解开 Rule 2/Rule 3 折返与车轱辘话清理死锁、放开跨会话通用技术术语谐音纠偏、前置 `<workspace_git_status>`、优化 `/responses` 历史块角色权重、自适应 `agent` / `general` 双子规则）；
-  - [ ] 补齐 Stage 1 热词提取（扩展 `_TECH_IDENT_RE` 覆盖 `PascalCase` / `kebab-case` / `.jsonl`、干净工作树 `git ls-files` 核心文件名兜底、内置低优通用 AI/CLI 词表并严守豆包等窄配额）。
+- [x] **`v0.8-2` 精修评测回放、提示词/载荷重构与热词补齐**：
+  - [x] 扩展 `voice-eval` 支持存量录音按会话时间点（Point-in-Time）回放评测（产出限定仓外缓存目录）；
+  - [x] 重构 `REFINER_SYSTEM_PROMPT`（解开 Rule 2/Rule 3 折返与车轱辘话清理死锁、放开跨会话通用技术术语谐音纠偏、前置 `<workspace_git_status>`、锁定 `/responses` 历史块 `developer` 前缀缓存角色、自适应 `agent` / `general` 双子规则）；
+  - [x] 补齐 Stage 1 热词提取（扩展 `_TECH_IDENT_RE` 覆盖 `PascalCase` / `kebab-case` / `.jsonl`、干净工作树 `git log` / `ls-files` 核心文件名兜底、内置低优通用 AI/CLI 词表并严守豆包等窄配额）。
 - [ ] **`v0.8-3` 全局通用语音输入、远程桌面让行与双端安全投递**：
   - [ ] 新增 `hotkey.scope = "all" | "coding" | "terminals"`（默认 `"all"`，兼容 `only_in_terminals`）及 `hotkey.yield_remote_desktop = true` + `ignore_apps`（排除裸 `msrdc.exe` 防误伤 Win11 WSLg）；
   - [ ] 普通非 Agent 窗口硬隔离 `SessionTracker.sync_session` 防跨场景上下文串台，全场景保持不自动回车；

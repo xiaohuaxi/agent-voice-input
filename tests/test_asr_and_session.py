@@ -3142,6 +3142,228 @@ class SessionCtxTests(unittest.TestCase):
             self.assertIn("LEGACY_POST_COMPACT_TURN", cx_joined2)
             os.close(agy_lock_fd)
 
+    def test_tech_ident_re_cjk_pascal_kebab_and_negative_guards(self) -> None:
+        from agent_voice_input.session_ctx import extract_turn_hotwords
+
+        turns = [
+            (
+                "user",
+                "看下SessionTracker的实现，把refiner.py和transcript_full.jsonl改下，"
+                "对齐_TECH_IDENT_RE、_build_payload、__init__、__main__、RControl、HTTPRequest、"
+                "buildRefinerBlocks、gpt-6-luna、qwen3-asr-flash、app-server、openai-compatible、--no-paste。",
+            ),
+            (
+                "assistant",
+                "The Windows setup is up-to-date and read-only; check step-by-step trade-offs in UTF-8 "
+                "on v0.8 and v0.8-1 for 395438e5-0000-4000-8000-000000000001 at 1.py.",
+            ),
+        ]
+        hw = extract_turn_hotwords(turns, max_words=40)
+        expected_present = (
+            "SessionTracker",
+            "refiner.py",
+            "transcript_full.jsonl",
+            "_TECH_IDENT_RE",
+            "_build_payload",
+            "RControl",
+            "HTTPRequest",
+            "buildRefinerBlocks",
+            "gpt-6-luna",
+            "qwen3-asr-flash",
+            "app-server",
+            "openai-compatible",
+            "--no-paste",
+        )
+        for tok in expected_present:
+            self.assertIn(tok, hw)
+
+        expected_absent = (
+            "__init__",
+            "__main__",
+            "The",
+            "Windows",
+            "up-to-date",
+            "read-only",
+            "step-by-step",
+            "trade-offs",
+            "UTF-8",
+            "v0.8",
+            "v0.8-1",
+            "395438e5-0000-4000-8000-000000000001",
+            "1.py",
+        )
+        for bad in expected_absent:
+            self.assertNotIn(bad, hw)
+
+        # Pathological camelCase / mixed-case strings with trailing underscore must complete in <0.1s (no ReDoS)
+        t_redos0 = time.monotonic()
+        pathological = [("user", "a" + ("A" * 2500) + "_ " + ("aA" * 1200) + "_")]
+        self.assertEqual(extract_turn_hotwords(pathological), [])
+        self.assertLess(time.monotonic() - t_redos0, 0.25)
+
+    def test_clean_worktree_repo_core_files_and_stage2_spelling_hint(self) -> None:
+        from agent_voice_input.session_ctx import SessionMatch, read_repo_core_files
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "clean-repo"
+            (repo / "src" / "pkg").mkdir(parents=True)
+            (repo / "tests").mkdir(parents=True)
+            (repo / "docs").mkdir(parents=True)
+            (repo / "src" / "pkg" / "core_router.py").write_text("x = 1\n", encoding="utf-8")
+            (repo / "src" / "pkg" / "voice_bridge.swift").write_text("let y = 2\n", encoding="utf-8")
+            (repo / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+            (repo / "tests" / "test_core_router.py").write_text("pass\n", encoding="utf-8")
+            (repo / "docs" / "guide.toml").write_text("a = 1\n", encoding="utf-8")
+
+            git_env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@example.com",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@example.com",
+            }
+            subprocess.run(["git", "init", "-q"], cwd=str(repo), env=git_env, check=True)
+            subprocess.run(["git", "add", "."], cwd=str(repo), env=git_env, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(repo), env=git_env, check=True)
+
+            core_files = read_repo_core_files(str(repo))
+            self.assertIn("core_router.py", core_files)
+            self.assertIn("voice_bridge.swift", core_files)
+            self.assertNotIn("__init__.py", core_files)
+            self.assertNotIn("test_core_router.py", core_files)
+            self.assertNotIn("guide.toml", core_files)
+
+            # Deleted historical file in git log must NOT be returned as a live tracked repo file
+            (repo / "src" / "pkg" / "obsolete_deleted.py").write_text("d = 0\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=str(repo), env=git_env, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "add temp"], cwd=str(repo), env=git_env, check=True)
+            subprocess.run(["git", "rm", "-q", "src/pkg/obsolete_deleted.py"], cwd=str(repo), env=git_env, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "rm temp"], cwd=str(repo), env=git_env, check=True)
+            self.assertNotIn("obsolete_deleted.py", read_repo_core_files(str(repo)))
+
+            # Timeout fallback returns [] cleanly without raising
+            with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="git", timeout=0.05)):
+                self.assertEqual(read_repo_core_files(str(repo), timeout_sec=0.05), [])
+
+            jpath = root / "rollout-clean.jsonl"
+            jpath.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "session_meta", "payload": {"id": "cln-1", "source": "cli", "cwd": str(repo)}}),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "item_completed",
+                                    "item": {"type": "UserMessage", "content": [{"type": "text", "text": "开始检查"}]},
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            tracker = SessionTracker(
+                home_dir=root,
+                runtime_dir=root / "rt",
+                proc_root=root / "no_proc",
+                git_cache_ttl_sec=0.0,
+                repo_files_cache_ttl_sec=300.0,
+            )
+            with mock.patch(
+                "agent_voice_input.session_ctx.read_repo_core_files",
+                wraps=read_repo_core_files,
+            ) as spy_repo:
+                snap_clean = tracker.sync_session(
+                    match=SessionMatch(cli="codex", session_id="cln-1", jsonl_path=str(jpath), cwd=str(repo), matched_by="test")
+                )
+                assert snap_clean is not None
+                self.assertEqual(snap_clean.git_status, "")
+                self.assertIn("core_router", snap_clean.hotwords)
+                self.assertIn("voice_bridge", snap_clean.hotwords)
+
+                _, git_ctx_clean = tracker.get_refiner_context(snap_clean.session_key, include_git_status=True)
+                self.assertIn("repo_files (tracked, unchanged; spelling reference only):", git_ctx_clean)
+                self.assertIn("core_router.py", git_ctx_clean)
+                # Cached by cwd (300s TTL): get_refiner_context reuses cached repo_files without re-spawning git!
+                self.assertEqual(spy_repo.call_count, 1)
+
+            # Dirty file added -> switches immediately back to git status priority
+            (repo / "dirty_new_feature.py").write_text("z = 3\n", encoding="utf-8")
+            snap_dirty = tracker.sync_session(
+                match=SessionMatch(cli="codex", session_id="cln-1", jsonl_path=str(jpath), cwd=str(repo), matched_by="test")
+            )
+            assert snap_dirty is not None
+            self.assertIn("dirty_new_feature.py", snap_dirty.hotwords)
+            self.assertNotIn("core_router", snap_dirty.hotwords)
+            _, git_ctx_dirty = tracker.get_refiner_context(snap_dirty.session_key, include_git_status=True)
+            self.assertIn("changed_files:", git_ctx_dirty)
+            self.assertNotIn("repo_files (tracked, unchanged;", git_ctx_dirty)
+
+    def test_builtin_hotwords_mode_isolation_and_doubao_whisper_quotas(self) -> None:
+        from agent_voice_input.asr_providers import _build_doubao_corpus_context, _compose_stt_prompt_text
+
+        ctx_agent = SessionTracker.build_asr_context(None, extra_hotwords=["UserPriorityTerm"], mode="agent")
+        self.assertEqual(ctx_agent.hotwords[0], "UserPriorityTerm")
+        self.assertIn("Codex", ctx_agent.hotwords)
+        self.assertIn("Luna", ctx_agent.hotwords)
+
+        ctx_gen = SessionTracker.build_asr_context(None, extra_hotwords=["UserPriorityTerm"], mode="general")
+        self.assertEqual(ctx_gen.hotwords, ["UserPriorityTerm"])
+        from agent_voice_input.session_ctx import SessionMatch, SessionSnapshot
+        non_null_snap = SessionSnapshot(
+            match=SessionMatch(cli="codex", session_id="s1", jsonl_path="/tmp/x.jsonl", cwd="/tmp"),
+            clean_turns=(("user", "讨论 SessionTracker"),),
+            luna_synced_idx=0,
+            generation=0,
+            git_status="M refiner.py",
+            hotwords=("SessionTracker", "refiner.py"),
+            byte_offset=10,
+        )
+        ctx_gen_snap = SessionTracker.build_asr_context(non_null_snap, extra_hotwords=["UserPriorityTerm"], mode="general")
+        self.assertEqual(ctx_gen_snap.hotwords, ["UserPriorityTerm"])
+        self.assertEqual(ctx_gen_snap.git_status, "")
+        self.assertEqual(ctx_gen_snap.dialog_text, "")
+
+        # Doubao: skips x.ext when stem x is also present, and continues past oversized entry to fit trailing short words
+        db_words = [
+            "refiner.py",
+            "refiner",
+            "session_ctx.py",
+            "session_ctx",
+            "a" * 58,
+            "b" * 58,
+            "c" * 58,  # 7+11+58+58 = 134; +58 = 192 > 180 -> skipped via continue!
+            "Codex",
+            "Luna",
+        ]
+        raw_corpus = _build_doubao_corpus_context(AsrContext(hotwords=db_words))
+        assert raw_corpus is not None
+        parsed_db = json.loads(raw_corpus)
+        picked_db = [item["word"] for item in parsed_db["hotwords"]]
+        self.assertLessEqual(len(picked_db), 30)
+        self.assertLessEqual(sum(len(w) for w in picked_db), 180)
+        self.assertIn("refiner", picked_db)
+        self.assertNotIn("refiner.py", picked_db)
+        self.assertIn("session_ctx", picked_db)
+        self.assertNotIn("session_ctx.py", picked_db)
+        self.assertNotIn("c" * 58, picked_db)
+        self.assertIn("Codex", picked_db)
+        self.assertIn("Luna", picked_db)
+
+        # Whisper: <=35 words / <=360 chars and reversed so #1 highest-priority hotword sits at the very right end
+        many_hw = ["HighestPriorityAlpha", "SecondBeta", *[f"filler_hotword_{i:02d}" for i in range(80)]]
+        stt_prompt = _compose_stt_prompt_text(
+            AsrContext(hotwords=many_hw, dialog_text="历史对话内容_" * 150),
+            max_chars=2000,
+        )
+        hw_line = stt_prompt.splitlines()[-1]
+        self.assertTrue(hw_line.startswith("常用技术术语："))
+        self.assertLessEqual(len(hw_line), 360)
+        self.assertTrue(stt_prompt.endswith("、SecondBeta、HighestPriorityAlpha"))
+
 
 if __name__ == "__main__":
     unittest.main()

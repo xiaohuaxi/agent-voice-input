@@ -2679,9 +2679,159 @@ def _extract_codex_compacted_turns(payload: Mapping[str, Any]) -> list[tuple[str
 # Git status & technical identifier hotword extraction
 # ---------------------------------------------------------------------------
 
-_TECH_IDENT_RE = re.compile(
-    r"\b(?:[A-Za-z0-9_-]+\.(?:py|sh|ps1|swift|toml|json|md|ts|tsx|js|rs|go|yaml|yml)|[A-Za-z_][A-Za-z0-9_]*_[A-Za-z0-9_]+|[a-z]+(?:[A-Z][a-z0-9]+)+)\b"
+_TECH_EXT = (
+    r"(?:jsonl|json|pyi|py|sh|ps1|swift|toml|md|tsx|ts|jsx|mjs|js|vue|svelte|scss|css|html|sql|rs|go"
+    r"|cpp|cc|c|hpp|h|java|kt|rb|php|yaml|yml|lock|ini|cfg|zsh|bash|env)"
 )
+_TECH_IDENT_RE = re.compile(
+    rf"(?<![A-Za-z0-9_.\-])(?P<file>[A-Za-z0-9_][A-Za-z0-9_.\-]*\.{_TECH_EXT})(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_.\-])(?P<flag>--[a-z][a-z0-9]*(?:-[a-z0-9]+)*)(?![A-Za-z0-9_\-])"
+    r"|(?<![A-Za-z0-9_])(?P<snake>_*[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])(?P<camel>[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+)(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])(?P<pascal>[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+|[A-Z]{2,}[a-z0-9]{2,}(?:[A-Z][a-z0-9]*)*)(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_.\-])(?P<kebab>[A-Za-z][A-Za-z0-9]*(?:\.[0-9]+)*(?:-[A-Za-z0-9]+(?:\.[0-9]+)*)+)(?![A-Za-z0-9_\-])"
+)
+
+_KEBAB_STOP_SEGS = frozenset(
+    "a an and as at by for from in into is it non of off on one or out over per re self step the to up well with".split()
+)
+_KEBAB_STOP_WORDS = frozenset({
+    "read-only", "real-time", "short-term", "long-term", "high-level", "low-level",
+    "trade-off", "trade-offs", "code-switching", "false-positive", "false-positives",
+    "open-source", "full-text", "plain-text", "single-hop", "two-stage", "multi-turn",
+    "utf-8", "utf-16", "sha-256", "covid-19",
+})
+_KEBAB_NUM_PREFIX_STOP = frozenset({
+    "top", "utf", "sha", "iso", "rfc", "http", "line", "step", "part", "item", "page", "phase", "wave", "rule",
+})
+_IDENT_STOP = frozenset({"__init__", "__main__"})
+_VER_ONLY_RE = re.compile(r"^[vV]?[0-9]+(?:\.[0-9]+)*(?:-[A-Za-z0-9.]+)?$")
+_HASH_HEX_RE = re.compile(r"^[0-9a-fA-F]{7,}(?:-[0-9a-fA-F]{4,})+$")
+
+BUILTIN_AGENT_HOTWORDS: tuple[str, ...] = (
+    "Codex", "Claude Code", "Gemini", "Flash-Lite", "Luna", "Astra", "Sol",
+    "Opus", "Sonnet", "Haiku", "Antigravity", "agy", "Ghostty", "tmux", "WSL2", "CLI",
+    "Qwen", "DeepSeek", "豆包", "Kimi", "Whisper", "Groq", "OpenRouter", "DashScope",
+    "subagent", "worktree", "rebase", "JSONL", "TOML", "竞态",
+)
+
+REPO_FILES_CACHE_TTL_SEC: float = 300.0
+_REPO_SKIP_DIRS = frozenset({
+    "node_modules", "vendor", "dist", "build", "out", "target", "third_party",
+    "docs", "doc", "examples", "fixtures", "testdata", "test", "tests",
+    "__tests__", "spec", "__pycache__", ".github", "migrations",
+})
+_REPO_SKIP_BASES = frozenset({
+    "__init__.py", "__main__.py", "conftest.py", "setup.py",
+    "index.ts", "index.js", "index.tsx", "mod.rs", "main.go", "package-lock.json",
+})
+_REPO_CORE_EXTS = frozenset(
+    ".py .ts .tsx .js .vue .svelte .go .rs .swift .sh .ps1 .kt .java .rb .c .cpp .h .toml .sql".split()
+)
+_REPO_TEST_FILE_RE = re.compile(r"^test_|(?:_test|\.test|\.spec)\.", re.IGNORECASE)
+_REPO_PRIORITY_ROOTS = frozenset({"src", "lib", "app", "pkg", "cmd", "internal"})
+
+
+def _dedupe_hotwords_ci(words: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen_low: set[str] = set()
+    for raw in words:
+        w = raw.strip()
+        if w and (low := w.lower()) not in seen_low:
+            seen_low.add(low)
+            out.append(w)
+    return out
+
+
+def _keep_tech_token(m: re.Match[str]) -> str | None:
+    tok = m.group(0)
+    if not (4 <= len(tok) <= 48) or tok in _IDENT_STOP:
+        return None
+    if m.group("file"):
+        stem = tok.rsplit(".", 1)[0]
+        return tok if len(stem) >= 2 and any(c.isalpha() for c in stem) else None
+    if m.group("kebab"):
+        low = tok.lower()
+        if len(tok) < 5 or low in _KEBAB_STOP_WORDS or _VER_ONLY_RE.match(tok) or _HASH_HEX_RE.match(tok):
+            return None
+        segs = low.split("-")
+        if _KEBAB_STOP_SEGS.intersection(segs):
+            return None
+        if len(segs) == 2 and segs[1].isdigit() and segs[0] in _KEBAB_NUM_PREFIX_STOP:
+            return None
+    return tok
+
+
+def read_repo_core_files(
+    cwd: str, *, timeout_sec: float = 0.8, max_files: int = 20
+) -> list[str]:
+    """Return up to ``max_files`` core tracked basenames when ``git status`` is clean."""
+    if not cwd or not os.path.isdir(cwd):
+        return []
+    base = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", cwd]
+    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1"}
+
+    def _run_nul(args: list[str]) -> list[str]:
+        try:
+            proc = subprocess.run(
+                [*base, *args],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_sec,
+                check=False,
+                env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        if proc.returncode != 0:
+            return []
+        return [seg.decode("utf-8", errors="replace") for seg in proc.stdout[:262144].split(b"\0") if seg]
+
+    def _is_core_source(rel_path: str) -> bool:
+        if "\n" in rel_path or "\r" in rel_path:
+            return False
+        parts = rel_path.strip().split("/")
+        base_name = parts[-1] if parts else ""
+        if not base_name or base_name in _REPO_SKIP_BASES:
+            return False
+        _, ext = os.path.splitext(base_name)
+        if ext.lower() not in _REPO_CORE_EXTS or _REPO_TEST_FILE_RE.search(base_name):
+            return False
+        return not _REPO_SKIP_DIRS.intersection(parts[:-1])
+
+    tracked = [
+        p.strip()
+        for p in _run_nul(["ls-files", "-z", "--", ":(glob)*", ":(glob)*/*", ":(glob)*/*/*", ":(glob)*/*/*/*"])
+        if p.strip() and _is_core_source(p)
+    ]
+    if not tracked:
+        return []
+    live_set = set(tracked)
+
+    out: list[str] = []
+    seen_low: set[str] = set()
+    for p in _run_nul(["log", "-z", "-n", "12", "--no-merges", "--no-renames", "--name-only", "--format="]):
+        p_clean = p.strip()
+        if p_clean in live_set:
+            b = os.path.basename(p_clean)
+            if b.lower() not in seen_low:
+                seen_low.add(b.lower())
+                out.append(b)
+                if len(out) >= max_files:
+                    return out
+
+    tracked.sort(
+        key=lambda p: p.count("/") - (1 if p.split("/", 1)[0] in _REPO_PRIORITY_ROOTS else 0)
+    )
+    for p in tracked:
+        b = os.path.basename(p)
+        if b.lower() not in seen_low:
+            seen_low.add(b.lower())
+            out.append(b)
+            if len(out) >= max_files:
+                break
+    return out
 
 
 def read_git_status_summary(
@@ -2738,16 +2888,16 @@ def read_git_status_summary(
 
 
 def extract_turn_hotwords(
-    turns: Sequence[tuple[str, str]], *, max_words: int = 40
+    turns: Sequence[tuple[str, str]], *, max_words: int = 24
 ) -> list[str]:
-    """Extract recent snake_case / camelCase / filename tokens from recent clean turns."""
+    """Extract recent technical identifiers, flags, model slugs, and filenames from clean turns."""
     found: list[str] = []
-    seen: set[str] = set()
+    seen_low: set[str] = set()
     for _, text in reversed(turns[-12:]):
         for m in _TECH_IDENT_RE.finditer(text):
-            tok = m.group(0)
-            if 3 <= len(tok) <= 48 and tok not in seen:
-                seen.add(tok)
+            tok = _keep_tech_token(m)
+            if tok and (low := tok.lower()) not in seen_low:
+                seen_low.add(low)
                 found.append(tok)
                 if len(found) >= max_words:
                     return found
@@ -2919,6 +3069,7 @@ class SessionTracker:
         proc_root: str | Path | None = "/proc",
         env: Mapping[str, str] | None = None,
         git_cache_ttl_sec: float = 2.0,
+        repo_files_cache_ttl_sec: float = REPO_FILES_CACHE_TTL_SEC,
         tmux_socket: str | Path | None = None,
         tmux_socket_name: str | None = None,
         tmux_probe_fn: Callable[[], TmuxServerSnapshot] | None = None,
@@ -2937,12 +3088,14 @@ class SessionTracker:
         )
         self.proc_root = Path(proc_root) if proc_root is not None else None
         self.git_cache_ttl_sec = git_cache_ttl_sec
+        self.repo_files_cache_ttl_sec = repo_files_cache_ttl_sec
         self._tmux_socket = str(tmux_socket).strip() if tmux_socket is not None else ""
         self._tmux_socket_name = (tmux_socket_name or "").strip()
         self._tmux_probe_fn = tmux_probe_fn
         self._lock = threading.RLock()
         self._states: dict[str, SessionState] = {}
         self._git_cache: dict[str, tuple[float, str, list[str]]] = {}
+        self._repo_cache: dict[str, tuple[float, list[str]]] = {}
 
     def _has_explicit_tmux_override(self) -> bool:
         return bool(
@@ -4245,12 +4398,27 @@ class SessionTracker:
         if not cwd:
             return "", []
         now = time.monotonic()
-        cached = self._git_cache.get(cwd)
-        if cached is not None and (now - cached[0]) < self.git_cache_ttl_sec:
-            return cached[1], list(cached[2])
+        with self._lock:
+            cached = self._git_cache.get(cwd)
+            if cached is not None and (now - cached[0]) < self.git_cache_ttl_sec:
+                return cached[1], list(cached[2])
         status_txt, hw = read_git_status_summary(cwd)
-        self._git_cache[cwd] = (now, status_txt, hw)
+        with self._lock:
+            self._git_cache[cwd] = (time.monotonic(), status_txt, hw)
         return status_txt, list(hw)
+
+    def _get_repo_files(self, cwd: str) -> list[str]:
+        if not cwd:
+            return []
+        now = time.monotonic()
+        with self._lock:
+            cached = self._repo_cache.get(cwd)
+            if cached is not None and (now - cached[0]) < self.repo_files_cache_ttl_sec:
+                return list(cached[1])
+        files = read_repo_core_files(cwd)
+        with self._lock:
+            self._repo_cache[cwd] = (time.monotonic(), files)
+        return list(files)
 
     def sync_session(
         self,
@@ -4260,6 +4428,7 @@ class SessionTracker:
         window_tty: str = "",
         window_cwd: str = "",
         window_pid: int = 0,
+        include_git_info: bool = True,
     ) -> SessionSnapshot | None:
         """Resolve (if needed) and incrementally ingest new JSONL lines for the active session."""
         with self._lock:
@@ -4308,20 +4477,30 @@ class SessionTracker:
                     cwd=eff_cwd,
                     jsonl_mtime=_safe_mtime(state.jsonl_path) or eff_match.jsonl_mtime,
                 )
+            turns_tuple = tuple(state.clean_turns)
+            luna_idx = state.luna_synced_idx
+            gen = state.generation
+            boff = state.byte_offset
 
-            git_status, git_hw = self._get_git_info(eff_cwd)
-            turn_hw = extract_turn_hotwords(state.clean_turns)
-            merged_hw = tuple(dict.fromkeys([*git_hw, *turn_hw]))
+        git_status, git_hw = self._get_git_info(eff_cwd) if include_git_info else ("", [])
+        repo_stems: list[str] = []
+        if include_git_info and eff_cwd and not git_hw:
+            for fname in self._get_repo_files(eff_cwd)[:12]:
+                stem = os.path.splitext(fname)[0]
+                if len(stem) >= 3:
+                    repo_stems.append(stem)
+        turn_hw = extract_turn_hotwords(turns_tuple)
+        merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems]))
 
-            return SessionSnapshot(
-                match=eff_match,
-                clean_turns=tuple(state.clean_turns),
-                luna_synced_idx=state.luna_synced_idx,
-                generation=state.generation,
-                git_status=git_status,
-                hotwords=merged_hw,
-                byte_offset=state.byte_offset,
-            )
+        return SessionSnapshot(
+            match=eff_match,
+            clean_turns=turns_tuple,
+            luna_synced_idx=luna_idx,
+            generation=gen,
+            git_status=git_status,
+            hotwords=merged_hw,
+            byte_offset=boff,
+        )
 
     def get_refiner_context(
         self,
@@ -4338,10 +4517,15 @@ class SessionTracker:
                 return [], ""
             turns_copy = list(state.clean_turns)
             cwd = state.cwd
-            git_status, git_hw = (
-                self._get_git_info(cwd) if include_git_status else ("", [])
-            )
 
+        git_status, git_hw = (
+            self._get_git_info(cwd) if include_git_status else ("", [])
+        )
+        repo_files = (
+            self._get_repo_files(cwd)
+            if (include_git_status and cwd and not git_hw)
+            else []
+        )
         dialog_chunks = chunk_turns_for_refiner(
             turns_copy, max_chars=max_chars, chunk_chars=chunk_chars
         )
@@ -4353,6 +4537,11 @@ class SessionTracker:
                 git_sections.append(f"git_status:\n{git_status}")
             if git_hw:
                 git_sections.append("changed_files: " + ", ".join(git_hw[:30]))
+            elif repo_files:
+                git_sections.append(
+                    "repo_files (tracked, unchanged; spelling reference only): "
+                    + ", ".join(repo_files[:20])
+                )
         return dialog_chunks, "\n\n".join(git_sections)
 
     def get_luna_delta(
@@ -4399,10 +4588,12 @@ class SessionTracker:
         *,
         extra_hotwords: Sequence[str] = (),
         max_dialog_chars: int = 16000,
+        mode: str = "agent",
     ) -> AsrContext:
-        if snapshot is None:
-            return AsrContext(hotwords=list(dict.fromkeys(extra_hotwords)))
-        merged_hw = list(dict.fromkeys([*extra_hotwords, *snapshot.hotwords]))
+        builtin_tail = () if mode == "general" else BUILTIN_AGENT_HOTWORDS
+        if mode == "general" or snapshot is None:
+            return AsrContext(hotwords=_dedupe_hotwords_ci([*extra_hotwords, *builtin_tail]))
+        merged_hw = _dedupe_hotwords_ci([*extra_hotwords, *snapshot.hotwords, *builtin_tail])
         return AsrContext(
             hotwords=merged_hw,
             git_status=snapshot.git_status,

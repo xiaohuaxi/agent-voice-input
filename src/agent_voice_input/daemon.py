@@ -476,26 +476,23 @@ def _call_refiner_refine(
     tracker: SessionTracker,
     fallback_context: str,
     is_cancelled: Callable[[], bool] | None,
+    mode: str = "agent",
 ) -> RefinerResult:
-    if is_cancelled is not None:
-        try:
-            params = inspect.signature(eff_refiner.refine).parameters
-        except (TypeError, ValueError):
-            params = {}
-        if "is_cancelled" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-            return eff_refiner.refine(
-                asr_res,
-                session_key=session_key,
-                tracker=tracker,
-                fallback_context=fallback_context,
-                is_cancelled=is_cancelled,
-            )
-    return eff_refiner.refine(
-        asr_res,
-        session_key=session_key,
-        tracker=tracker,
-        fallback_context=fallback_context,
-    )
+    try:
+        params = inspect.signature(eff_refiner.refine).parameters
+    except (TypeError, ValueError):
+        params = {}
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    kw: dict[str, Any] = {
+        "session_key": session_key,
+        "tracker": tracker,
+        "fallback_context": fallback_context,
+    }
+    if is_cancelled is not None and ("is_cancelled" in params or has_var_kw):
+        kw["is_cancelled"] = is_cancelled
+    if "mode" in params or (has_var_kw and mode != "agent"):
+        kw["mode"] = mode
+    return eff_refiner.refine(asr_res, **kw)
 
 
 def _transcribe_wav_chunks(
@@ -591,7 +588,9 @@ def run_pipeline_once(
     max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
     env: Mapping[str, str] | None = None,
     archive_sink: Callable[[threading.Thread], None] | None = None,
+    mode: str = "agent",
 ) -> PipelineResult:
+    eff_mode = "general" if mode == "general" else "agent"
     eff_env = os.environ if env is None else env
     eff_creds = creds or resolve_credentials(cfg, eff_env)
     eff_tracker = tracker or SessionTracker(env=eff_env)
@@ -647,17 +646,18 @@ def run_pipeline_once(
         win = origin_window or (platform.get_foreground_window() if platform else ForegroundWindow())
         snap: SessionSnapshot | None = None
         try:
-            snap = (
-                eff_tracker.sync_session(
-                    window_title=win.title,
-                    window_tty=win.tty,
-                    window_cwd=win.cwd,
-                    window_pid=win.pid,
+            if eff_mode != "general":
+                snap = (
+                    eff_tracker.sync_session(
+                        window_title=win.title,
+                        window_tty=win.tty,
+                        window_cwd=win.cwd,
+                        window_pid=win.pid,
+                    )
+                    if window_title_override is None
+                    else eff_tracker.sync_session(window_title=window_title_override)
                 )
-                if window_title_override is None
-                else eff_tracker.sync_session(window_title=window_title_override)
-            )
-            asr_ctx = eff_tracker.build_asr_context(snap)
+            asr_ctx = eff_tracker.build_asr_context(snap, mode=eff_mode)
             sync_ms = _elapsed_ms(t_sync0)
             cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled)
             prep_ms = 0
@@ -718,6 +718,7 @@ def run_pipeline_once(
                 tracker=eff_tracker,
                 fallback_context=asr_ctx.dialog_text,
                 is_cancelled=cancel_check,
+                mode=eff_mode,
             )
             refine_init_ms = prep_ms + (ref_res.init_ms if ref_res else 0)
             ctx_chars = ref_res.context_chars if ref_res else 0

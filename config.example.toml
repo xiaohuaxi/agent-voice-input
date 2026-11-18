@@ -75,6 +75,7 @@ doubao_mode = "auto"
 base_url = ""
 # Optional custom environment variable name holding the Stage 1 API key
 api_key_env = ""
+# Custom universal user hotwords (highest priority; in coding-agent mode, active git/session identifiers and built-in AI/CLI terms are appended automatically)
 hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 # timeout_sec = 60.0
 # Extra retry attempts within the same provider on rate-limit / transient network errors (0 disables retry)
@@ -103,17 +104,18 @@ api = "auto"
 # Stage 2 thinking/reasoning budget:
 # "auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 effort = "low"
-# Custom Stage 2 system prompt (leave empty "" to use the built-in English voice-dictation editor prompt).
+# Custom Stage 2 system prompt (leave empty "" to use the built-in adaptive agent/general voice-dictation editor prompts;
+# setting a non-empty prompt overrides both modes).
 # Supports TOML multiline literal strings '''...''' (no backslash escaping needed) or """...""";
-# requests supply read-only <session_reference_log> context blocks (as developer messages on /responses,
-# or leading user blocks on /chat/completions) followed by <asr_draft_to_clean> and optional <workspace_git_status>:
+# in agent mode, requests supply read-only <session_reference_log> context blocks (as developer messages on /responses,
+# or leading user blocks on /chat/completions) followed by optional <workspace_git_status>, <asr_draft_to_clean>, and <task_reminder>:
 # prompt = '''
 # You are a stateless, non-conversational voice-dictation text editor, NOT a chat or coding assistant.
-# Fix ASR homophones/typos using <session_reference_log> and <workspace_git_status>, smooth spoken disfluencies,
-# preserve the speaker's original sentence structure and language(s), and output ONLY the cleaned <asr_draft_to_clean>.
+# Fix ASR homophones/typos using <session_reference_log> and <workspace_git_status>, resolve self-corrections,
+# preserve every substantive point and language(s), and output ONLY the cleaned <asr_draft_to_clean>.
 # '''
 prompt = ""
-# Append workspace git status / modified filenames at the very end of the user message (keeps prefix cache intact)
+# Include workspace git status / modified filenames (or clean-worktree core repo filenames) in the final user block (keeps 50K prefix cache intact)
 include_git_status = true
 # Maximum recent session dialogue characters extracted for Stage 2 context (0 disables dialogue history; ~1/4-window eviction)
 context_max_chars = 200000

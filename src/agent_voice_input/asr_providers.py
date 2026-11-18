@@ -1757,6 +1757,17 @@ def load_hotwords_file(
     return words
 
 
+def _dedupe_words_ci(words: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen_low: set[str] = set()
+    for raw in words:
+        w = raw.strip()
+        if w and (low := w.lower()) not in seen_low:
+            seen_low.add(low)
+            out.append(w)
+    return out
+
+
 def _coerce_context(
     ctx: AsrContext | Mapping[str, Any] | None,
     hotwords_file: str = "",
@@ -1767,7 +1778,7 @@ def _coerce_context(
     if ctx is None:
         return AsrContext(hotwords=file_words)
     if isinstance(ctx, AsrContext):
-        merged_words = list(dict.fromkeys([*file_words, *ctx.hotwords]))
+        merged_words = _dedupe_words_ci([*file_words, *ctx.hotwords])
         return AsrContext(
             hotwords=merged_words,
             git_status=ctx.git_status or "",
@@ -1776,7 +1787,7 @@ def _coerce_context(
     if isinstance(ctx, Mapping):
         raw_hw = ctx.get("hotwords") or []
         hw_list = [str(w).strip() for w in raw_hw if str(w).strip()]
-        merged_words = list(dict.fromkeys([*file_words, *hw_list]))
+        merged_words = _dedupe_words_ci([*file_words, *hw_list])
         return AsrContext(
             hotwords=merged_words,
             git_status=str(ctx.get("git_status") or ""),
@@ -1834,9 +1845,10 @@ def _compose_context_text(ctx: AsrContext, max_chars: int) -> str:
     used = 0
 
     if ctx.hotwords:
-        hw_str = "常用技术术语：" + "、".join(ctx.hotwords[:80])
-        if len(hw_str) > max_chars // 2:
-            hw_str = hw_str[: max(64, max_chars // 2)]
+        hw_str = "常用技术术语：" + "、".join(ctx.hotwords[:45])
+        hw_cap = max(64, min(420, max_chars // 2))
+        if len(hw_str) > hw_cap:
+            hw_str = hw_str[:hw_cap]
         sections.append(hw_str)
         used += len(hw_str) + 1
 
@@ -1872,10 +1884,24 @@ def _compose_stt_prompt_text(ctx: AsrContext, max_chars: int = 2000) -> str:
         return ""
     hw_str = ""
     if ctx.hotwords:
-        hw_str = "常用技术术语：" + "、".join(ctx.hotwords[:80])
-        hw_cap = max(64, max_chars // 2)
-        if len(hw_str) > hw_cap:
-            hw_str = hw_str[:hw_cap]
+        picked_hw: list[str] = []
+        hw_prefix = "常用技术术语："
+        hw_cap = max(16, min(360, max(64, max_chars // 2)) - len(hw_prefix))
+        used_hw = 0
+        for raw_w in ctx.hotwords[:35]:
+            w = raw_w.strip()
+            if not w:
+                continue
+            add_len = len(w) + (1 if picked_hw else 0)
+            if picked_hw and used_hw + add_len > hw_cap:
+                continue
+            if not picked_hw and len(w) > hw_cap:
+                w = w[:hw_cap]
+                add_len = len(w)
+            picked_hw.append(w)
+            used_hw += add_len
+        if picked_hw:
+            hw_str = hw_prefix + "、".join(reversed(picked_hw))
 
     reserved = (len(hw_str) + 1) if hw_str else 0
     bg_budget = max(0, max_chars - reserved)
@@ -2668,16 +2694,29 @@ def _resolve_doubao_base_url(raw_base: str) -> str:
 
 def _build_doubao_corpus_context(ctx: AsrContext) -> str | None:
     """Build serialized Doubao corpus.context strictly within 30 words/180 chars + 600 dialog chars."""
+    cleaned_words = [w for raw in ctx.hotwords if (w := raw.strip())]
+    canonical_by_low: dict[str, str] = {}
+    for w in cleaned_words:
+        canonical_by_low.setdefault(w.lower(), w)
+
     hw_objs: list[dict[str, str]] = []
     hw_chars = 0
-    for raw_word in ctx.hotwords:
-        w = raw_word.strip()
-        if not w:
-            continue
+    added_low: set[str] = set()
+    for w in cleaned_words:
+        if "." in w:
+            stem, ext = w.rsplit(".", 1)
+            if len(stem) >= 3 and ext.isalnum() and stem.lower() in canonical_by_low:
+                w = canonical_by_low[stem.lower()]
         if len(w) > 60:
             w = w[:60]
-        if len(hw_objs) >= 30 or hw_chars + len(w) > 180:
+        w_low = w.lower()
+        if w_low in added_low:
+            continue
+        if len(hw_objs) >= 30 or hw_chars >= 180:
             break
+        if hw_chars + len(w) > 180:
+            continue
+        added_low.add(w_low)
         hw_objs.append({"word": w})
         hw_chars += len(w)
 
