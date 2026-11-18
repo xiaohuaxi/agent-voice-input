@@ -679,7 +679,7 @@ def _is_saved_recording_entry(entry: Path) -> bool:
 def prune_saved_recordings_dir(
     recordings_dir: Path,
     *,
-    max_count: int = 50,
+    max_count: int = 100,
     now_ts: float | None = None,
 ) -> None:
     """Retain at most ``max_count`` newest ``rec-*`` files ordered by mtime, pruning older entries."""
@@ -763,7 +763,7 @@ def archive_recording_audio(
     raw_wav_bytes: bytes,
     recordings_dir: Path,
     *,
-    max_count: int = 50,
+    max_count: int = 100,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
     now_ts: float | None = None,
     timeout_sec: float = 15.0,
@@ -861,7 +861,7 @@ def spawn_recording_archive(
     raw_wav_bytes: bytes,
     recordings_dir: Path,
     *,
-    max_count: int = 50,
+    max_count: int = 100,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
     now_ts: float | None = None,
 ) -> threading.Thread | None:

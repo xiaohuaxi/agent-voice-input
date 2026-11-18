@@ -6360,7 +6360,7 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
 
         # 1. Defaults & validation
         self.assertIs(AudioConfig().save_recordings, False)
-        self.assertEqual(AudioConfig().save_recordings_max_count, 50)
+        self.assertEqual(AudioConfig().save_recordings_max_count, 100)
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

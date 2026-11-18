@@ -43,7 +43,7 @@ beep = false
 # tail_drain_sec = 0.65
 # Optional local MP3 ring archive of valid voiced recordings under ~/.cache/agent-voice-input/recordings/ (0600 mode, off by default)
 # save_recordings = false
-# save_recordings_max_count = 50
+# save_recordings_max_count = 100
 
 [asr]
 # Stage 1 speech-to-text provider:
