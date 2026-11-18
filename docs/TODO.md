@@ -22,12 +22,10 @@
 - **投递前互斥门禁**：在最终粘贴/写剪贴板前设短临界区门禁，消除“刚检查完未取消、紧接着触发取消却仍上屏”的竞态。
 - **有效录音留存防白说**：`recording` 阶段取消直接丢弃；进入 `recognizing` / `refining` 后主动取消的，将已通过门控的有效 WAV 复用 `save_failed_audio()`（`0600` 原子写、保留 24 小时内最近 10 条）暂存至 `failed/` 供 `retry` 恢复（若来源本身已是 `retry` 则保留原文件不重复落盘），实施时同步更新 `AGENTS.md` 状态隐私说明。
 
-## 本地真实渠道系统测试与精修缓存命中率可观测性
+## 连发口述优化：ASR 保持串行 + 无状态精修并发重叠（保序落字）
 
-1. **本地真实凭据与真实会话数据回归验证（不进 CI）**：
-   - 在现有 100% 离线单测套件（`tests/`）之外，单独提供按需触发的端到端系统测试入口（绝不接入 GitHub Actions CI）。
-   - **必须使用真实长度与结构的会话数据实测**：改动精修提示词、上下文组织、线程复用或性能链路后，不能仅靠合成短文本探针或 Mock 单测下结论，须加载本机真实长会话转录样本（含压缩节点、中英混合代码讨论与真实 `git status`）跑多轮连续请求，逐轮核验真实耗时分解、`cached_input_tokens` 命中数值及精修保真度（错词纠正、句式保留、不误答提问）。
-   - 直接复用本机已配置的 API Key（如百炼、OpenRouter、Gemini 等）与本机 `codex` 订阅登录态完成实测。
-2. **精修前缀缓存命中采集与用户侧提示**：
-   - 采集各精修渠道返回的 token 与缓存命中指标（OpenAI 兼容接口的 `usage.prompt_tokens_details.cached_tokens`、DeepSeek 的 `usage.prompt_cache_hit_tokens`、Gemini 原生接口的 `usageMetadata.cachedContentTokenCount`、Responses SSE `response.completed` 的 `usage.input_tokens_details.cached_tokens`）。
-   - 将本轮精修是否命中缓存及命中比例纳入 `status` 运行快照与可选诊断/状态提示，方便直观确认缓存是否生效。
+连续快速录入多条语音时，当前单线程 `ASR -> Refine -> Deliver` 全串行队列会产生队头阻塞（后一条需等前一条精修与粘贴全部完成才开始识别）。后续优化边界如下：
+
+- **Stage 1 ASR 保持串行**：部分语音识别渠道（如豆包试用期 QPS / 并发限制较严）在突发并发下易触发限流报错，且 ASR 本身热态耗时较短（通常 `<1s`），因此第一阶段继续单路串行消费录音队列。
+- **Stage 2 精修并发重叠 + 严格保序投递**：`OpenAIResponsesRefiner` / `CodexRefiner` 及各 HTTP 精修器现均为纯无状态请求，上游对并发承受度充裕且占用了主要耗时（`1.5s～3.5s`）。下一条语音跑完串行 ASR 后无须等待上一条精修结束即可并发发起精修请求，最终在终端粘贴投递环节严格按 `seq_id` 顺序提交上屏。
+- **补充排队可观测性与去锁争用**：在 `_QueuedUtterance` 与 `telemetry.jsonl` 中补记 `queue_wait_ms`（区分队列等待与实际处理耗时），并避免后台管线阶段回调在录音启停期间争抢 `_trigger_lock`。

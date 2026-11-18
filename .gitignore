@@ -23,3 +23,13 @@ venv/
 .agents/tmp-*
 .agents/settings.local.json
 .agents/scheduled_tasks.lock
+
+# Local voice recordings & runtime telemetry (never commit)
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.opus
+*.flac
+recordings/
+telemetry.jsonl
