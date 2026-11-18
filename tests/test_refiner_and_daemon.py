@@ -443,7 +443,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
 
         proj = data["project"]
         self.assertEqual(proj["name"], "agent-voice-input")
-        self.assertEqual(proj["version"], "0.6.1")
+        self.assertEqual(proj["version"], "0.7.0")
         self.assertEqual(proj["requires-python"], ">=3.10")
         self.assertEqual(proj["license"], "Apache-2.0")
         self.assertEqual(
@@ -1614,7 +1614,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         with mock.patch("sys.stdout", ver_buf), self.assertRaises(SystemExit) as ver_exit:
             parser.parse_args(["--version"])
         self.assertEqual(ver_exit.exception.code, 0)
-        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.6.1")
+        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.7.0")
 
         # Offline _cmd_doctor verification: displays resolved provider/model/api/effort and NEVER leaks raw secrets
         with tempfile.TemporaryDirectory() as td:
@@ -6344,6 +6344,7 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
                 self.assertIsNone(find_codex_bin({"HOME": str(other_home), "PATH": "/nonexistent-dir"}))
 
     def test_save_recordings_mp3_archive_permissions_ring_prune_and_ffmpeg_restore(self) -> None:
+        import inspect
         import math
         import stat
         from agent_voice_input.audio_proc import (
@@ -6351,6 +6352,8 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             ensure_16k_mono_s16_wav,
             list_saved_recordings,
             process_wav,
+            prune_saved_recordings_dir,
+            spawn_recording_archive,
         )
         from agent_voice_input.config import AudioConfig, resolve_saved_recordings_dir
 
@@ -6360,7 +6363,9 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
 
         # 1. Defaults & validation
         self.assertIs(AudioConfig().save_recordings, False)
-        self.assertEqual(AudioConfig().save_recordings_max_count, 100)
+        self.assertEqual(AudioConfig().save_recordings_max_count, 300)
+        for fn in (prune_saved_recordings_dir, archive_recording_audio, spawn_recording_archive):
+            self.assertEqual(inspect.signature(fn).parameters["max_count"].default, 300)
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -6410,6 +6415,8 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             self.assertEqual([p.name for p in kept], list(reversed(created_names[-3:])))
             for p in kept:
                 self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
+                # 0.6s @ 64 kbps CBR MP3 (~8 KB/s) yields ~4.8 KB (> 4000 B vs ~2.4 KB at 32 kbps)
+                self.assertGreater(p.stat().st_size, 4000)
 
             # 3. Restore archived MP3 -> 16kHz mono PCM WAV via ffmpeg & verify gate passes!
             restored_wav = ensure_16k_mono_s16_wav(kept[0])
