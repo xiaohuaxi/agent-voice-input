@@ -443,7 +443,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
 
         proj = data["project"]
         self.assertEqual(proj["name"], "agent-voice-input")
-        self.assertEqual(proj["version"], "0.7.0")
+        self.assertEqual(proj["version"], "0.7.1")
         self.assertEqual(proj["requires-python"], ">=3.10")
         self.assertEqual(proj["license"], "Apache-2.0")
         self.assertEqual(
@@ -1614,7 +1614,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         with mock.patch("sys.stdout", ver_buf), self.assertRaises(SystemExit) as ver_exit:
             parser.parse_args(["--version"])
         self.assertEqual(ver_exit.exception.code, 0)
-        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.7.0")
+        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.7.1")
 
         # Offline _cmd_doctor verification: displays resolved provider/model/api/effort and NEVER leaks raw secrets
         with tempfile.TemporaryDirectory() as td:
@@ -6346,8 +6346,11 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
     def test_save_recordings_mp3_archive_permissions_ring_prune_and_ffmpeg_restore(self) -> None:
         import inspect
         import math
+        import shutil
         import stat
+        import subprocess
         from agent_voice_input.audio_proc import (
+            AudioError,
             archive_recording_audio,
             ensure_16k_mono_s16_wav,
             list_saved_recordings,
@@ -6360,6 +6363,20 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
         speech_band_wav = pack_pcm16_mono_wav(
             [int(5000 * math.sin(2.0 * math.pi * 440.0 * i / 16000.0)) for i in range(9600)]
         )
+        has_ffmpeg = bool(os.path.isfile("/usr/bin/ffmpeg") or shutil.which("ffmpeg"))
+        has_mp3_encoder = False
+        if has_ffmpeg:
+            ffmpeg_exe = "/usr/bin/ffmpeg" if os.path.isfile("/usr/bin/ffmpeg") else shutil.which("ffmpeg")
+            assert ffmpeg_exe is not None
+            enc_proc = subprocess.run(
+                [ffmpeg_exe, "-nostdin", "-hide_banner", "-encoders"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+                check=False,
+            )
+            has_mp3_encoder = "libmp3lame" in enc_proc.stdout
 
         # 1. Defaults & validation
         self.assertIs(AudioConfig().save_recordings, False)
@@ -6395,7 +6412,7 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             self.assertIs(cfg_rec.audio.save_recordings, True)
             self.assertEqual(cfg_rec.audio.save_recordings_max_count, 3)
 
-            # 2. Archive 5 recordings with deterministic timestamps & max_count=3 -> retains newest 3 as 0600 MP3
+            # 2. Archive 5 recordings with deterministic timestamps & max_count=3 -> retains newest 3 as 0600
             rec_dir = resolve_saved_recordings_dir(env_rec)
             created_names: list[str] = []
             for i in range(5):
@@ -6407,7 +6424,13 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
                 )
                 assert out_p is not None
                 self.assertTrue(out_p.name.startswith("rec-"))
-                self.assertEqual(out_p.suffix, ".mp3")
+                if has_ffmpeg:
+                    if has_mp3_encoder:
+                        self.assertEqual(out_p.suffix, ".mp3")
+                    else:
+                        self.assertIn(out_p.suffix, (".mp3", ".m4a"))
+                else:
+                    self.assertEqual(out_p.suffix, ".wav")
                 created_names.append(out_p.name)
 
             self.assertEqual(stat.S_IMODE(rec_dir.stat().st_mode), 0o700)
@@ -6415,14 +6438,44 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             self.assertEqual([p.name for p in kept], list(reversed(created_names[-3:])))
             for p in kept:
                 self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
-                # 0.6s @ 64 kbps CBR MP3 (~8 KB/s) yields ~4.8 KB (> 4000 B vs ~2.4 KB at 32 kbps)
-                self.assertGreater(p.stat().st_size, 4000)
+                if has_ffmpeg:
+                    if has_mp3_encoder:
+                        # 0.6s @ 64 kbps CBR MP3 (~8 KB/s) yields ~4.8 KB (> 4000 B vs ~2.4 KB at 32 kbps)
+                        self.assertEqual(p.suffix, ".mp3")
+                        self.assertGreater(p.stat().st_size, 4000)
+                    else:
+                        self.assertIn(p.suffix, (".mp3", ".m4a"))
+                        self.assertGreater(p.stat().st_size, 0)
+                else:
+                    self.assertEqual(p.suffix, ".wav")
+                    self.assertEqual(p.read_bytes(), speech_band_wav)
 
-            # 3. Restore archived MP3 -> 16kHz mono PCM WAV via ffmpeg & verify gate passes!
-            restored_wav = ensure_16k_mono_s16_wav(kept[0])
-            gate_restored = process_wav(restored_wav, cfg_rec.audio)
-            self.assertTrue(gate_restored.passed)
-            self.assertGreater(gate_restored.duration_sec, 0.4)
+            # 3. Restore archived recording -> 16kHz mono PCM WAV & verify gate passes (+ no-ffmpeg fallback check)
+            if has_ffmpeg:
+                restored_wav = ensure_16k_mono_s16_wav(kept[0])
+                gate_restored = process_wav(restored_wav, cfg_rec.audio)
+                self.assertTrue(gate_restored.passed)
+                self.assertGreater(gate_restored.duration_sec, 0.4)
+
+                fb_dir = tmp / "fallback_wav_dir"
+                with unittest.mock.patch(
+                    "agent_voice_input.audio_proc.resolve_ffmpeg_bin",
+                    side_effect=AudioError("no ffmpeg"),
+                ):
+                    fb_out = archive_recording_audio(
+                        speech_band_wav,
+                        fb_dir,
+                        max_count=3,
+                        now_ts=1_750_100_100.0,
+                    )
+                assert fb_out is not None
+                self.assertEqual(fb_out.suffix, ".wav")
+                self.assertEqual(stat.S_IMODE(fb_out.stat().st_mode), 0o600)
+                self.assertEqual(fb_out.read_bytes(), speech_band_wav)
+            else:
+                gate_restored = process_wav(kept[0].read_bytes(), cfg_rec.audio)
+                self.assertTrue(gate_restored.passed)
+                self.assertGreater(gate_restored.duration_sec, 0.4)
 
             # 4. End-to-end VoiceInputDaemon integration with isolated HOME + graceful stop() wait,
             #    while silence and retry sources do NOT archive!
@@ -6481,7 +6534,13 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
 
             d_saved = list_saved_recordings(resolve_saved_recordings_dir(env_d))
             self.assertEqual(len(d_saved), 2)
-            self.assertTrue(all(p.suffix == ".mp3" and stat.S_IMODE(p.stat().st_mode) == 0o600 for p in d_saved))
+            if has_ffmpeg:
+                expected_exts = (".mp3",) if has_mp3_encoder else (".mp3", ".m4a")
+                self.assertTrue(
+                    all(p.suffix in expected_exts and stat.S_IMODE(p.stat().st_mode) == 0o600 for p in d_saved)
+                )
+            else:
+                self.assertTrue(all(p.suffix == ".wav" and stat.S_IMODE(p.stat().st_mode) == 0o600 for p in d_saved))
 
 
 if __name__ == "__main__":
