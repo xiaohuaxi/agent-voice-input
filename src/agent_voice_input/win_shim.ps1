@@ -944,7 +944,8 @@ public static class VoiceWinShim {
     }
 
     public static float GetLiveAudioLevel() {
-        if (_wasapiActive) return ((long)GetTickCount64() - Interlocked.Read(ref _wasapiLevelTick) <= 260L) ? _wasapiLevel : 0f;
+        RecSession s = _recSess;
+        if (s != null && s.Run) return ((long)GetTickCount64() - Interlocked.Read(ref s.LevelTick) <= 260L) ? s.Level : 0f;
         if ((long)GetTickCount64() - Interlocked.Read(ref _extLevelTick) <= 260L) return _extLevel;
         return 0f;
     }
@@ -1172,18 +1173,38 @@ public static class VoiceWinShim {
     }
 
     private const int AUDCLNT_S_BUFFER_EMPTY = 0x08890001;
-    private sealed class RecSession { public volatile bool Run = true; public long RecGen = 0L; }
+    private const long WasapiStartupFirstFrameTimeoutMs = 850L;
+    private const long WasapiStallTimeoutMs = 900L;
+    private const long WasapiReopenVerifyTimeoutMs = 500L;
+
+    private sealed class RecSession {
+        public volatile bool Run = true;
+        public volatile bool InitOk = false;
+        public volatile string Err = "";
+        public volatile float Level = 0f;
+        public long LevelTick = 0L;
+        public long RecGen = 0L;
+        public bool WorkerDone = false;
+        public bool Abandoned = false;
+        public Thread Worker;
+        public ManualResetEvent InitEvt;
+        public ManualResetEvent StopEvt;
+        public MemoryStream Pcm;
+        public void DisposeResources() {
+            if (InitEvt != null) { try { InitEvt.Dispose(); } catch { } InitEvt = null; }
+            if (StopEvt != null) { try { StopEvt.Dispose(); } catch { } StopEvt = null; }
+            if (Pcm != null) { try { Pcm.Dispose(); } catch { } Pcm = null; }
+        }
+    }
     private static readonly object _recSync = new object();
-    private static Thread _recThread = null;
-    private static ManualResetEvent _recInitEvt = null, _recStopEvt = null;
-    private static MemoryStream _recPcm = null;
-    private static RecSession _recSess = null;
-    private static volatile bool _recRun = false;
-    private static volatile string _recErr = "";
-    private static volatile bool _recInitOk = false;
-    private static volatile float _wasapiLevel = 0f, _extLevel = 0f;
-    private static long _wasapiLevelTick = 0L, _extLevelTick = 0L;
-    private static volatile bool _wasapiActive = false;
+    private static volatile RecSession _recSess = null;
+    private static volatile float _extLevel = 0f;
+    private static long _extLevelTick = 0L;
+
+    private static void WriteZeros(MemoryStream dst, byte[] zeros, int byteCount) {
+        int rem = byteCount;
+        while (rem > 0) { int chunk = Math.Min(rem, zeros.Length); dst.Write(zeros, 0, chunk); rem -= chunk; }
+    }
 
     private static byte[] BuildPcm16MonoWav(byte[] pcm, int pcmLen, int sr) {
         byte[] buf = new byte[44 + pcmLen];
@@ -1271,15 +1292,15 @@ public static class VoiceWinShim {
         }
     }
 
-    private static int DrainWasapiPackets(IAudioCaptureClient cap, MemoryStream dst, byte[] zeros, ref byte[] scratch, out bool gotFrames) {
+    private static int DrainWasapiPackets(RecSession sess, IAudioCaptureClient cap, MemoryStream dst, byte[] zeros, ref byte[] scratch, out bool gotFrames) {
         gotFrames = false;
         uint pkt = 0;
         int hr = cap.GetNextPacketSize(out pkt);
-        if (hr < 0) { _wasapiLevel = 0f; return hr; }
+        if (hr < 0) { sess.Level = 0f; return hr; }
         while (pkt > 0) {
             IntPtr pData; uint frames, flags; ulong dpos, qpos;
             hr = cap.GetBuffer(out pData, out frames, out flags, out dpos, out qpos);
-            if (hr < 0) { _wasapiLevel = 0f; return hr; }
+            if (hr < 0) { sess.Level = 0f; return hr; }
             if (hr == AUDCLNT_S_BUFFER_EMPTY || frames == 0) {
                 cap.ReleaseBuffer(0);
                 break;
@@ -1287,25 +1308,70 @@ public static class VoiceWinShim {
             int nBytes = (int)(frames * 2);
             if (nBytes > 0) {
                 if ((flags & 2u) != 0 || pData == IntPtr.Zero) {
-                    _wasapiLevel = 0f;
-                    Interlocked.Exchange(ref _wasapiLevelTick, (long)GetTickCount64());
-                    int rem = nBytes;
-                    while (rem > 0) { int chunk = Math.Min(rem, zeros.Length); dst.Write(zeros, 0, chunk); rem -= chunk; }
+                    sess.Level = 0f;
+                    Interlocked.Exchange(ref sess.LevelTick, (long)GetTickCount64());
+                    WriteZeros(dst, zeros, nBytes);
                 } else {
                     if (scratch == null || scratch.Length < nBytes) scratch = new byte[Math.Max(nBytes, 8192)];
                     Marshal.Copy(pData, scratch, 0, nBytes);
                     dst.Write(scratch, 0, nBytes);
-                    _wasapiLevel = ComputePcm16RmsLevel(scratch, nBytes);
-                    Interlocked.Exchange(ref _wasapiLevelTick, (long)GetTickCount64());
+                    sess.Level = ComputePcm16RmsLevel(scratch, nBytes);
+                    Interlocked.Exchange(ref sess.LevelTick, (long)GetTickCount64());
                 }
                 gotFrames = true;
             }
             hr = cap.ReleaseBuffer(frames);
-            if (hr < 0) { _wasapiLevel = 0f; return hr; }
+            if (hr < 0) { sess.Level = 0f; return hr; }
             hr = cap.GetNextPacketSize(out pkt);
-            if (hr < 0) { _wasapiLevel = 0f; return hr; }
+            if (hr < 0) { sess.Level = 0f; return hr; }
         }
         return 0;
+    }
+
+    private static bool WaitForWasapiPacket(RecSession sess, IMMDeviceEnumerator en, string deviceId, IAudioCaptureClient cap, MemoryStream dst, byte[] zeros, ref byte[] scratch, long timeoutMs, out long packetTick, out int failHr, out bool endpointInactive) {
+        long startTick = Stopwatch.GetTimestamp();
+        long devCheckTick = startTick;
+        packetTick = startTick;
+        failHr = 0;
+        endpointInactive = false;
+        while (sess.Run && !StdinClosed) {
+            bool gotFrames;
+            int hr = DrainWasapiPackets(sess, cap, dst, zeros, ref scratch, out gotFrames);
+            long nowTick = Stopwatch.GetTimestamp();
+            if (hr < 0) {
+                failHr = hr;
+                endpointInactive = !string.IsNullOrEmpty(deviceId) && !IsEndpointStillActive(en, deviceId);
+                return false;
+            }
+            if (gotFrames) {
+                packetTick = nowTick;
+                return true;
+            }
+            if (ElapsedStopwatchMs(devCheckTick, nowTick) >= 200L) {
+                devCheckTick = nowTick;
+                if (!string.IsNullOrEmpty(deviceId) && !IsEndpointStillActive(en, deviceId)) {
+                    endpointInactive = true;
+                    return false;
+                }
+            }
+            if (ElapsedStopwatchMs(startTick, nowTick) >= timeoutMs) return false;
+            if (sess.StopEvt.WaitOne(10)) break;
+        }
+        return false;
+    }
+
+    private static bool HasPendingStopOrQuitCmd() {
+        foreach (string raw in CmdQueue) {
+            if (string.IsNullOrEmpty(raw)) continue;
+            string s = raw.TrimStart();
+            if (s.StartsWith("{\"cmd\":\"rec_stop\"", StringComparison.Ordinal) ||
+                s.StartsWith("{\"cmd\": \"rec_stop\"", StringComparison.Ordinal) ||
+                s.StartsWith("{\"cmd\":\"quit\"", StringComparison.Ordinal) ||
+                s.StartsWith("{\"cmd\": \"quit\"", StringComparison.Ordinal)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static string StartRecording(bool loopback = false) {
@@ -1320,23 +1386,24 @@ public static class VoiceWinShim {
     public static bool StartRecording(bool loopback, long recGen, out string error) {
         int dummyBytes; string dummyErr;
         StopRecording(out dummyBytes, out dummyErr);
-        _wasapiLevel = 0f; Interlocked.Exchange(ref _wasapiLevelTick, 0L); _wasapiActive = true;
-        ManualResetEvent initEvt = new ManualResetEvent(false);
-        ManualResetEvent stopEvt = new ManualResetEvent(false);
-        MemoryStream pcm = new MemoryStream(64000);
-        RecSession sess = new RecSession { RecGen = recGen };
-        _recErr = ""; _recInitOk = false; _recRun = true;
+        RecSession sess = new RecSession {
+            RecGen = recGen,
+            InitEvt = new ManualResetEvent(false),
+            StopEvt = new ManualResetEvent(false),
+            Pcm = new MemoryStream(64000)
+        };
         Thread t = new Thread(() => {
             IMMDeviceEnumerator en = null; IMMDevice dev = null; IAudioClient client = null; IAudioCaptureClient cap = null;
             bool started = false;
+            bool initNotified = false;
             try {
                 en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
                 int hr = en.GetDefaultAudioEndpoint(loopback ? 0 : 1, 0, out dev);
                 if (hr < 0 || dev == null) {
-                    _recErr = ClassifyWasapiStartHr((hr < 0) ? hr : unchecked((int)0x80070490));
-                    initEvt.Set();
+                    sess.Err = ClassifyWasapiStartHr((hr < 0) ? hr : unchecked((int)0x80070490));
                     return;
                 }
+                if (!sess.Run || StdinClosed) { sess.Err = "mic_busy:wasapi_aborted"; return; }
                 string initialDeviceId = "";
                 IntPtr idPtr = IntPtr.Zero;
                 int idHr = dev.GetId(out idPtr);
@@ -1346,52 +1413,61 @@ public static class VoiceWinShim {
                 }
                 int openHr;
                 string openErr = OpenWasapiStreamOnDevice(dev, loopback, out client, out cap, out openHr);
-                if (!string.IsNullOrEmpty(openErr)) {
-                    _recErr = openErr;
-                    initEvt.Set();
-                    return;
-                }
-                started = true; _recInitOk = true; initEvt.Set();
+                if (!string.IsNullOrEmpty(openErr)) { sess.Err = openErr; return; }
+                started = true;
+                if (!sess.Run || StdinClosed) { sess.Err = "mic_busy:wasapi_aborted"; return; }
                 byte[] zeros = new byte[8192]; byte[] scratch = null;
                 long lastPacketTick = Stopwatch.GetTimestamp();
                 long lastDeviceCheckTick = lastPacketTick;
-                int reopenCount = 0;
-                while (sess.Run && _recRun && !stopEvt.WaitOne(10)) {
-                    bool gotFrames;
-                    int drainHr = DrainWasapiPackets(cap, pcm, zeros, ref scratch, out gotFrames);
-                    long nowTick = Stopwatch.GetTimestamp();
-                    if (gotFrames && drainHr >= 0) {
-                        lastPacketTick = nowTick;
+                if (!loopback) {
+                    int initHr; bool initInactive;
+                    if (!WaitForWasapiPacket(sess, en, initialDeviceId, cap, sess.Pcm, zeros, ref scratch, WasapiStartupFirstFrameTimeoutMs, out lastPacketTick, out initHr, out initInactive)) {
+                        sess.Err = initInactive ? "no_mic:wasapi_endpoint_inactive"
+                                 : (initHr < 0) ? ClassifyWasapiStartHr(initHr)
+                                 : (!sess.Run || StdinClosed || sess.StopEvt.WaitOne(0)) ? "mic_busy:wasapi_aborted"
+                                 : "mic_busy:wasapi_startup_no_frames";
+                        return;
                     }
+                    lastDeviceCheckTick = lastPacketTick;
+                }
+                sess.InitOk = true;
+                initNotified = true;
+                try { sess.InitEvt.Set(); } catch { }
+                int reopenCount = 0;
+                while (sess.Run && !sess.StopEvt.WaitOne(10)) {
+                    bool gotFrames;
+                    int drainHr = DrainWasapiPackets(sess, cap, sess.Pcm, zeros, ref scratch, out gotFrames);
+                    long nowTick = Stopwatch.GetTimestamp();
+                    if (gotFrames) lastPacketTick = nowTick;
                     if (drainHr >= 0 && ElapsedStopwatchMs(lastDeviceCheckTick, nowTick) >= 200L) {
                         lastDeviceCheckTick = nowTick;
                         if (!string.IsNullOrEmpty(initialDeviceId) && !IsEndpointStillActive(en, initialDeviceId)) {
-                            _recErr = "wasapi_device_unplugged";
-                            if (sess.Run && _recRun) EnqueueAudioEvent("rec_lost", _recErr, 0, sess.RecGen);
+                            sess.Err = "wasapi_device_unplugged";
+                            if (sess.Run) EnqueueAudioEvent("rec_lost", sess.Err, 0, sess.RecGen);
                             break;
                         }
                     }
-                    bool stalled = (!loopback) && (drainHr >= 0) && (ElapsedStopwatchMs(lastPacketTick, nowTick) > 900L);
+                    bool stalled = (!loopback) && (drainHr >= 0) && (ElapsedStopwatchMs(lastPacketTick, nowTick) > WasapiStallTimeoutMs);
                     if (drainHr < 0 || stalled) {
                         int failStreamHr = drainHr;
                         if (!string.IsNullOrEmpty(initialDeviceId) && !IsEndpointStillActive(en, initialDeviceId)) {
-                            _recErr = "wasapi_device_unplugged";
-                            if (sess.Run && _recRun) EnqueueAudioEvent("rec_lost", _recErr, 0, sess.RecGen);
+                            sess.Err = "wasapi_device_unplugged";
+                            if (sess.Run) EnqueueAudioEvent("rec_lost", sess.Err, 0, sess.RecGen);
                             break;
                         }
                         bool reopened = false;
-                        if (!string.IsNullOrEmpty(initialDeviceId) && reopenCount < 3 && sess.Run && _recRun) {
+                        if (!string.IsNullOrEmpty(initialDeviceId) && reopenCount < 3 && sess.Run && !StdinClosed) {
                             reopenCount++;
                             ReleaseWasapiStream(ref cap, ref client, started);
                             started = false;
                             if (dev != null) { try { Marshal.ReleaseComObject(dev); } catch { } dev = null; }
                             int[] retryDelaysMs = new int[] { 0, 150, 300 };
-                            for (int attempt = 0; attempt < retryDelaysMs.Length && sess.Run && _recRun; attempt++) {
+                            for (int attempt = 0; attempt < retryDelaysMs.Length && sess.Run && !StdinClosed; attempt++) {
                                 if (retryDelaysMs[attempt] > 0) {
-                                    if (stopEvt.WaitOne(retryDelaysMs[attempt]) || !sess.Run || !_recRun) break;
+                                    if (sess.StopEvt.WaitOne(retryDelaysMs[attempt]) || !sess.Run || StdinClosed) break;
                                 }
                                 if (!IsEndpointStillActive(en, initialDeviceId)) {
-                                    _recErr = "wasapi_device_unplugged";
+                                    sess.Err = "wasapi_device_unplugged";
                                     break;
                                 }
                                 IMMDevice reDev = null;
@@ -1412,64 +1488,117 @@ public static class VoiceWinShim {
                                 }
                             }
                         }
-                        if (!sess.Run || !_recRun) break;
+                        if (!sess.Run) break;
                         if (reopened) {
+                            bool verifiedRecovery = loopback;
                             long resumeTick = Stopwatch.GetTimestamp();
-                            long rawGapMs = ElapsedStopwatchMs(lastPacketTick, resumeTick);
-                            int gapMs = (rawGapMs < 0L) ? 0 : ((rawGapMs > 30000L) ? 30000 : (int)rawGapMs);
-                            int padBytes = (gapMs * 32) & ~1;
-                            int rem = padBytes;
-                            while (rem > 0) { int chunk = Math.Min(rem, zeros.Length); pcm.Write(zeros, 0, chunk); rem -= chunk; }
-                            _wasapiLevel = 0f;
-                            Interlocked.Exchange(ref _wasapiLevelTick, (long)GetTickCount64());
-                            lastPacketTick = resumeTick;
-                            lastDeviceCheckTick = resumeTick;
-                            EnqueueAudioEvent("rec_recovered", "", gapMs, sess.RecGen);
-                            continue;
+                            using (MemoryStream reopenPcm = new MemoryStream(4096)) {
+                                if (!loopback) {
+                                    int reHr; bool reInactive;
+                                    verifiedRecovery = WaitForWasapiPacket(sess, en, initialDeviceId, cap, reopenPcm, zeros, ref scratch, WasapiReopenVerifyTimeoutMs, out resumeTick, out reHr, out reInactive);
+                                    if (!verifiedRecovery) {
+                                        if (reHr < 0 && failStreamHr >= 0) failStreamHr = reHr;
+                                        if (reInactive) sess.Err = "wasapi_device_unplugged";
+                                    }
+                                }
+                                if (verifiedRecovery) {
+                                    if (sess.Run || reopenPcm.Length > 0) {
+                                        long rawGapMs = ElapsedStopwatchMs(lastPacketTick, resumeTick) - (reopenPcm.Length / 32L);
+                                        int gapMs = (rawGapMs < 0L) ? 0 : ((rawGapMs > 30000L) ? 30000 : (int)rawGapMs);
+                                        WriteZeros(sess.Pcm, zeros, gapMs * 32);
+                                        if (reopenPcm.Length > 0) {
+                                            reopenPcm.WriteTo(sess.Pcm);
+                                        } else {
+                                            sess.Level = 0f;
+                                            Interlocked.Exchange(ref sess.LevelTick, (long)GetTickCount64());
+                                        }
+                                        if (sess.Run && !StdinClosed) {
+                                            lastPacketTick = resumeTick;
+                                            lastDeviceCheckTick = resumeTick;
+                                            EnqueueAudioEvent("rec_recovered", "", gapMs, sess.RecGen);
+                                            continue;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
                         }
-                        if (string.IsNullOrEmpty(_recErr)) {
-                            _recErr = (failStreamHr < 0)
+                        if (string.IsNullOrEmpty(sess.Err)) {
+                            sess.Err = (failStreamHr < 0)
                                 ? string.Format(CultureInfo.InvariantCulture, "wasapi_stream_lost:0x{0:X8}", (uint)failStreamHr)
                                 : "wasapi_stream_stalled";
                         }
-                        if (sess.Run && _recRun) EnqueueAudioEvent("rec_lost", _recErr, 0, sess.RecGen);
+                        if (sess.Run) EnqueueAudioEvent("rec_lost", sess.Err, 0, sess.RecGen);
                         break;
                     }
                 }
-                if (started && cap != null && string.IsNullOrEmpty(_recErr)) {
+                if (started && cap != null && string.IsNullOrEmpty(sess.Err)) {
                     bool tailFrames;
-                    DrainWasapiPackets(cap, pcm, zeros, ref scratch, out tailFrames);
+                    DrainWasapiPackets(sess, cap, sess.Pcm, zeros, ref scratch, out tailFrames);
                 }
             } catch (Exception ex) {
-                if (!_recInitOk) {
-                    _recErr = "mic_busy:exc:" + ex.GetType().Name + ":" + ex.Message;
-                    try { initEvt.Set(); } catch { }
+                if (!sess.InitOk) {
+                    sess.Err = "mic_busy:exc:" + ex.GetType().Name + ":" + ex.Message;
                 } else {
-                    _recErr = "wasapi_stream_lost:" + ex.GetType().Name + ":" + ex.Message;
-                    if (sess.Run && _recRun) EnqueueAudioEvent("rec_lost", _recErr, 0, sess.RecGen);
+                    sess.Err = "wasapi_stream_lost:" + ex.GetType().Name + ":" + ex.Message;
+                    if (sess.Run) EnqueueAudioEvent("rec_lost", sess.Err, 0, sess.RecGen);
                 }
             } finally {
-                _wasapiLevel = 0f;
+                sess.Level = 0f;
                 ReleaseWasapiStream(ref cap, ref client, started);
                 if (dev != null) { try { Marshal.ReleaseComObject(dev); } catch { } }
                 if (en != null) { try { Marshal.ReleaseComObject(en); } catch { } }
+                if (!initNotified) {
+                    try { ManualResetEvent ie = sess.InitEvt; if (ie != null) ie.Set(); } catch { }
+                }
+                bool disposeSelf = false;
+                lock (_recSync) {
+                    sess.WorkerDone = true;
+                    disposeSelf = sess.Abandoned;
+                }
+                if (disposeSelf) sess.DisposeResources();
             }
         });
+        sess.Worker = t;
         t.IsBackground = true; t.SetApartmentState(ApartmentState.MTA); t.Start();
-        if (!initEvt.WaitOne(3000)) {
-            sess.Run = false; _recRun = false; _wasapiActive = false; _wasapiLevel = 0f;
-            try { stopEvt.Set(); t.Join(300); } catch { }
-            try { initEvt.Dispose(); stopEvt.Dispose(); pcm.Dispose(); } catch { }
-            error = "mic_busy:wasapi_init_timeout"; return false;
+        long waitStartTick = Stopwatch.GetTimestamp();
+        bool initSignaled = false;
+        bool waitAborted = false;
+        while (true) {
+            if (sess.InitEvt.WaitOne(15)) { initSignaled = true; break; }
+            MSG pm;
+            PeekMessage(out pm, IntPtr.Zero, 0, 0, 0);
+            if (StdinClosed || HasPendingStopOrQuitCmd()) { waitAborted = true; break; }
+            if (ElapsedStopwatchMs(waitStartTick, Stopwatch.GetTimestamp()) >= 3000L) break;
         }
-        if (!_recInitOk) {
-            sess.Run = false; _recRun = false; _wasapiActive = false; _wasapiLevel = 0f;
-            try { stopEvt.Set(); t.Join(500); } catch { }
-            try { initEvt.Dispose(); stopEvt.Dispose(); pcm.Dispose(); } catch { }
-            error = string.IsNullOrEmpty(_recErr) ? "mic_busy:wasapi_init_failed" : _recErr; return false;
+        if (initSignaled && sess.InitOk && !waitAborted && !StdinClosed && !HasPendingStopOrQuitCmd()) {
+            lock (_recSync) {
+                if (sess.InitEvt != null) { try { sess.InitEvt.Dispose(); } catch { } sess.InitEvt = null; }
+                _recSess = sess;
+            }
+            error = "";
+            return true;
         }
-        lock (_recSync) { _recThread = t; _recInitEvt = initEvt; _recStopEvt = stopEvt; _recPcm = pcm; _recSess = sess; }
-        error = ""; return true;
+        sess.Run = false;
+        try { sess.StopEvt.Set(); } catch { }
+        bool joined = false;
+        try { joined = t.Join(initSignaled ? 500 : 300); } catch { }
+        bool disposeNow = joined;
+        if (!disposeNow) {
+            lock (_recSync) {
+                if (sess.WorkerDone) disposeNow = true;
+                else sess.Abandoned = true;
+            }
+        }
+        if (disposeNow) sess.DisposeResources();
+        if (!initSignaled && !waitAborted) {
+            error = "mic_busy:wasapi_init_timeout";
+        } else if (waitAborted && string.IsNullOrEmpty(sess.Err)) {
+            error = "mic_busy:wasapi_aborted";
+        } else {
+            error = string.IsNullOrEmpty(sess.Err) ? "mic_busy:wasapi_init_failed" : sess.Err;
+        }
+        return false;
     }
 
     public static byte[] StopRecording(out string error) {
@@ -1478,28 +1607,38 @@ public static class VoiceWinShim {
     }
 
     public static byte[] StopRecording(out int pcmBytes, out string error) {
-        Thread t; ManualResetEvent initEvt, stopEvt; MemoryStream pcm; RecSession sess;
+        RecSession sess;
         lock (_recSync) {
-            t = _recThread; initEvt = _recInitEvt; stopEvt = _recStopEvt; pcm = _recPcm; sess = _recSess;
-            _recThread = null; _recInitEvt = null; _recStopEvt = null; _recPcm = null; _recSess = null;
-            _recRun = false;
-            if (sess != null) sess.Run = false;
+            sess = _recSess;
+            _recSess = null;
         }
         pcmBytes = 0; error = "";
-        if (t == null) { _wasapiActive = false; _wasapiLevel = 0f; error = "not_recording"; return new byte[0]; }
-        try { if (stopEvt != null) stopEvt.Set(); t.Join(2500); } catch { }
-        _wasapiActive = false; _wasapiLevel = 0f;
-        if (initEvt != null) { try { initEvt.Dispose(); } catch { } }
-        if (stopEvt != null) { try { stopEvt.Dispose(); } catch { } }
+        if (sess == null || sess.Worker == null) { error = "not_recording"; return new byte[0]; }
+        sess.Run = false;
+        try { if (sess.StopEvt != null) sess.StopEvt.Set(); } catch { }
+        bool joined = false;
+        try { joined = sess.Worker.Join(2500); } catch { }
+        bool workerDone = joined;
+        if (!workerDone) {
+            lock (_recSync) {
+                if (sess.WorkerDone) workerDone = true;
+                else sess.Abandoned = true;
+            }
+        }
+        if (!workerDone) {
+            error = string.IsNullOrEmpty(sess.Err) ? "wasapi_stop_timeout" : sess.Err;
+            return new byte[0];
+        }
         byte[] raw = new byte[0];
-        if (pcm != null) { try { raw = pcm.ToArray(); pcm.Dispose(); } catch { } }
+        if (sess.Pcm != null) { try { raw = sess.Pcm.ToArray(); } catch { } }
+        sess.DisposeResources();
         int evenLen = raw.Length - (raw.Length % 2);
         pcmBytes = evenLen;
         if (evenLen < 2) {
-            error = string.IsNullOrEmpty(_recErr) ? "wasapi_zero_packets" : _recErr;
+            error = string.IsNullOrEmpty(sess.Err) ? "wasapi_zero_packets" : sess.Err;
             return new byte[0];
         }
-        error = _recErr ?? "";
+        error = sess.Err ?? "";
         return BuildPcm16MonoWav(raw, evenLen, 16000);
     }
 

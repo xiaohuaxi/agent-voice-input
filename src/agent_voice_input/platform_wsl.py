@@ -788,6 +788,7 @@ class JsonlShimMixin:
         timeout_sec: float = 5.0,
         *,
         allow_retry: bool = True,
+        before_write: Callable[[], None] | None = None,
     ) -> dict[str, Any] | None:
         max_attempts = 2 if allow_retry else 1
         for attempt in range(max_attempts):
@@ -805,6 +806,8 @@ class JsonlShimMixin:
                     if proc is None or proc.stdin is None or proc.poll() is not None:
                         broken, self._shim = proc, None
                         raise BrokenPipeError("shim_not_running")
+                    if before_write is not None:
+                        before_write()
                     sent_proc = proc
                     self._rpc_seq += 1
                     sid = self._rpc_seq
@@ -1017,6 +1020,7 @@ class WslPlatform(JsonlShimMixin):
         self._winmm_gen = 0
         self._active_seq_id: int | None = None
         self._winmm_starting = False
+        self._winmm_rpc_dispatched = False
         self._pending_winmm_lost_reason = ""
         self._pending_winmm_recovered_gaps: list[int] = []
         self._recorder_lost_cb: Callable[..., Any] | None = None
@@ -1135,36 +1139,56 @@ class WslPlatform(JsonlShimMixin):
         self.last_audio_error = ""
         eff_loopback = bool(loopback or self.env.get("AGENT_VOICE_INPUT_WASAPI_LOOPBACK") == "1" or self.env.get("VOICE_INPUT_WASAPI_LOOPBACK") == "1")
         if self._use_winmm:
+            has_before_write = _callable_accepts_kwarg(self._shim_rpc, "before_write")
             with self._winmm_state_lock:
+                if self._closed:
+                    raise RuntimeError(f"{type(self).__name__} is closed")
                 self._winmm_gen += 1
                 my_gen = self._winmm_gen
                 self._active_seq_id = seq_id
                 self._rec_mode = ""
                 self._winmm_starting = True
+                self._winmm_rpc_dispatched = not has_before_write
                 self._pending_winmm_lost_reason = ""
                 self._pending_winmm_recovered_gaps.clear()
             req: dict[str, Any] = {"cmd": "rec_start", "rec_gen": my_gen}
             if eff_loopback:
                 req["loopback"] = True
+
+            def _on_before_write() -> None:
+                with self._winmm_state_lock:
+                    if self._closed or self._winmm_gen != my_gen:
+                        raise self._classify_wasapi_start_error("mic_busy:wasapi_aborted")
+                    self._winmm_rpc_dispatched = True
+
+            rpc_kw: dict[str, Any] = {}
+            if _callable_accepts_kwarg(self._shim_rpc, "allow_retry"):
+                rpc_kw["allow_retry"] = False
+            if has_before_write:
+                rpc_kw["before_write"] = _on_before_write
             try:
-                res = (
-                    self._shim_rpc(req, timeout_sec=4.0, allow_retry=False)
-                    if "allow_retry" in getattr(getattr(self._shim_rpc, "__code__", None), "co_varnames", ())
-                    else self._shim_rpc(req, timeout_sec=4.0)
-                ) or {}
+                res = self._shim_rpc(req, timeout_sec=4.0, **rpc_kw) or {}
             except Exception as shim_exc:
+                fb_gen = 0
                 with self._winmm_state_lock:
                     if self._winmm_gen == my_gen:
                         self._winmm_starting = False
+                        self._winmm_rpc_dispatched = False
+                        self._active_seq_id = None
                         self._pending_winmm_lost_reason = ""
                         self._pending_winmm_recovered_gaps.clear()
+                        if (
+                            not self._closed
+                            and not isinstance(shim_exc, (NoMicrophoneError, MicrophoneUnavailableError))
+                            and self.cfg.audio.wsl_source == "auto"
+                            and not eff_loopback
+                        ):
+                            self._winmm_gen += 1
+                            fb_gen = self._winmm_gen
+                            self._active_seq_id = seq_id
+                            self._rec_mode = "pulse"
                 self.last_audio_error = str(shim_exc)
-                if self.cfg.audio.wsl_source == "auto" and not eff_loopback:
-                    with self._winmm_state_lock:
-                        self._winmm_gen += 1
-                        fb_gen = self._winmm_gen
-                        self._active_seq_id = seq_id
-                        self._rec_mode = "pulse"
+                if fb_gen:
                     try:
                         self._ff_rec.start(
                             "pulse",
@@ -1182,20 +1206,48 @@ class WslPlatform(JsonlShimMixin):
                                 self._active_seq_id = None
                         self.last_audio_error = self._ff_rec.diagnostic_summary() or str(shim_exc)
                         raise
+                    stale_fb = False
+                    with self._winmm_state_lock:
+                        if self._closed or self._winmm_gen != fb_gen:
+                            stale_fb = True
+                            if self._winmm_gen == fb_gen:
+                                self._rec_mode = ""
+                                self._active_seq_id = None
+                    if stale_fb:
+                        self._ff_rec.stop(drain_sec=0.0)
+                        raise self._classify_wasapi_start_error("mic_busy:wasapi_aborted")
                     self._start_level_streamer(lambda: self._ff_rec.current_level)
                     return
                 raise
             if res.get("ok"):
                 early_lost = ""
                 early_gaps: list[int] = []
+                stale_ok = False
                 with self._winmm_state_lock:
-                    if self._winmm_gen == my_gen:
+                    if self._closed or self._winmm_gen != my_gen:
+                        stale_ok = True
+                        if self._winmm_gen == my_gen:
+                            self._winmm_starting = False
+                            self._winmm_rpc_dispatched = False
+                            self._active_seq_id = None
+                            self._pending_winmm_lost_reason = ""
+                            self._pending_winmm_recovered_gaps.clear()
+                    else:
                         self._winmm_starting = False
+                        self._winmm_rpc_dispatched = False
                         self._rec_mode = "winmm"
                         early_lost = self._pending_winmm_lost_reason
                         self._pending_winmm_lost_reason = ""
                         early_gaps = list(self._pending_winmm_recovered_gaps)
                         self._pending_winmm_recovered_gaps.clear()
+                if stale_ok:
+                    if not has_before_write and not self._closed:
+                        try:
+                            self._shim_rpc({"cmd": "rec_stop"}, timeout_sec=2.0)
+                        except Exception:
+                            pass
+                    self.last_audio_error = "mic_busy:wasapi_aborted"
+                    raise self._classify_wasapi_start_error("mic_busy:wasapi_aborted")
                 if early_gaps:
                     for g in early_gaps:
                         invoke_recorder_recovered_callback(self._recorder_recovered_cb, g, seq_id)
@@ -1213,6 +1265,7 @@ class WslPlatform(JsonlShimMixin):
             with self._winmm_state_lock:
                 if self._winmm_gen == my_gen:
                     self._winmm_starting = False
+                    self._winmm_rpc_dispatched = False
                     self._active_seq_id = None
                     self._pending_winmm_lost_reason = ""
                     self._pending_winmm_recovered_gaps.clear()
@@ -1222,6 +1275,8 @@ class WslPlatform(JsonlShimMixin):
             # itself confirmed the microphone is missing, denied, or temporarily busy.
             raise self._classify_wasapi_start_error(err)
         with self._winmm_state_lock:
+            if self._closed:
+                raise RuntimeError(f"{type(self).__name__} is closed")
             self._winmm_gen += 1
             p_gen = self._winmm_gen
             self._active_seq_id = seq_id
@@ -1244,6 +1299,16 @@ class WslPlatform(JsonlShimMixin):
                     self._active_seq_id = None
             self.last_audio_error = self._ff_rec.diagnostic_summary()
             raise
+        stale_pulse = False
+        with self._winmm_state_lock:
+            if self._closed or self._winmm_gen != p_gen:
+                stale_pulse = True
+                if self._winmm_gen == p_gen:
+                    self._rec_mode = ""
+                    self._active_seq_id = None
+        if stale_pulse:
+            self._ff_rec.stop(drain_sec=0.0)
+            raise self._classify_wasapi_start_error("mic_busy:wasapi_aborted")
         self._start_level_streamer(lambda: self._ff_rec.current_level)
 
     def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
@@ -1251,12 +1316,14 @@ class WslPlatform(JsonlShimMixin):
         with self._winmm_state_lock:
             self._winmm_gen += 1
             self._active_seq_id = None
+            was_dispatched = self._winmm_rpc_dispatched
             self._winmm_starting = False
+            self._winmm_rpc_dispatched = False
             self._pending_winmm_lost_reason = ""
             self._pending_winmm_recovered_gaps.clear()
             mode, self._rec_mode = self._rec_mode, ""
         drain_sec = self.cfg.audio.effective_tail_drain_sec(macos=False) if (drain and mode) else 0.0
-        if mode == "winmm":
+        if mode == "winmm" or was_dispatched:
             if drain_sec > 0.0:
                 time.sleep(drain_sec)
             res = self._shim_rpc({"cmd": "rec_stop"}, timeout_sec=5.0) or {}

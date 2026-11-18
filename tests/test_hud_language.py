@@ -927,10 +927,16 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
 
         for wasapi_sym in (
             "AUDCLNT_S_BUFFER_EMPTY = 0x08890001",
+            "WasapiStartupFirstFrameTimeoutMs = 850L",
+            "WasapiStallTimeoutMs = 900L",
+            "WasapiReopenVerifyTimeoutMs = 500L",
             "no_mic:0x80070490",
+            "no_mic:wasapi_endpoint_inactive",
             "mic_permission:0x80070005",
             "mic_busy:0x{0:X8}",
+            "mic_busy:wasapi_startup_no_frames",
             "IsEndpointStillActive(",
+            "PeekMessage(out pm, IntPtr.Zero, 0, 0, 0);",
             "wasapi_device_unplugged",
             "wasapi_stream_lost:0x{0:X8}",
             "wasapi_stream_stalled",
@@ -941,6 +947,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             "2.5f * dpiScale",
         ):
             self.assertIn(wasapi_sym, shim)
+        self.assertNotIn("initEvt.WaitOne(3000)", shim)
 
         # Upper toast capsule (_toastHud) layout, styling & independent lifecycle contracts
         for toast_sym in (

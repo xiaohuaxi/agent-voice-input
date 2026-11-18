@@ -6542,6 +6542,294 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             else:
                 self.assertTrue(all(p.suffix == ".wav" and stat.S_IMODE(p.stat().st_mode) == 0o600 for p in d_saved))
 
+    def test_wsl_wasapi_startup_no_frames_and_reopen_contracts(self) -> None:
+        from agent_voice_input.config import AudioConfig, HotkeyConfig, UiConfig
+        from agent_voice_input.daemon import _window_from_mapping
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        # 1. Error classification parity for startup 0-frame & inactive endpoint codes
+        err_busy = WslPlatform._classify_wasapi_start_error("mic_busy:wasapi_startup_no_frames")
+        self.assertIsInstance(err_busy, MicrophoneUnavailableError)
+        self.assertEqual(err_busy.reason_code, "mic_unavailable")
+        self.assertEqual(err_busy.hud_state, "mic_unavailable")
+
+        err_inact = WslPlatform._classify_wasapi_start_error("no_mic:wasapi_endpoint_inactive")
+        self.assertIsInstance(err_inact, NoMicrophoneError)
+        self.assertEqual(err_inact.reason_code, "no_mic")
+        self.assertEqual(err_inact.hud_state, "no_mic")
+
+        # 2. Core Win32/WASAPI startup & reopen gate invariants in win_shim.ps1
+        shim = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
+        start_rec_block = shim.split("public static bool StartRecording(bool loopback, long recGen, out string error)", 1)[1].split(
+            "public static byte[] StopRecording(out string error)", 1
+        )[0]
+        self.assertLess(
+            start_rec_block.index('"mic_busy:wasapi_startup_no_frames"'),
+            start_rec_block.index("sess.InitOk = true;"),
+        )
+        reopen_block = start_rec_block.split("if (reopened) {", 1)[1]
+        self.assertLess(
+            reopen_block.index("WasapiReopenVerifyTimeoutMs"),
+            reopen_block.index('EnqueueAudioEvent("rec_recovered"'),
+        )
+        self.assertIn("PeekMessage(out pm, IntPtr.Zero, 0, 0, 0);", start_rec_block)
+        self.assertIn("HasPendingStopOrQuitCmd()", start_rec_block)
+
+        # 3. End-to-end WSL stdio JSONL shim:
+        #    (a) PTT <850ms release on charging-case 0-frame startup shows ONLY single mic_unavailable toast;
+        #    (b) PTT <850ms release when first frame succeeds closes cleanly via queued ptt_stop;
+        #    (c) Direct concurrent cancel_recording() both AFTER and BEFORE rec_start stdin write preserves order & stops device.
+        mock_shim_code = (
+            "import json, sys, threading\n"
+            "lock = threading.Lock()\n"
+            "def emit(obj):\n"
+            "    with lock:\n"
+            "        sys.stdout.write(json.dumps(obj) + '\\n')\n"
+            "        sys.stdout.flush()\n"
+            "emit({'event': 'ready', 'ui_culture': 'zh-CN'})\n"
+            "cmds = []\n"
+            "rec_cmds = []\n"
+            "hold_evt = threading.Event()\n"
+            "device_recording = [False]\n"
+            "scenario = ['fail_0frames_ptt']\n"
+            "for raw in iter(sys.stdin.readline, ''):\n"
+            "    if not raw.strip():\n"
+            "        continue\n"
+            "    msg = json.loads(raw)\n"
+            "    op = msg.get('cmd')\n"
+            "    seq = int(msg.get('seq_id') or 0)\n"
+            "    with lock:\n"
+            "        cmds.append(msg)\n"
+            "        if op in ('rec_start', 'rec_stop'):\n"
+            "            rec_cmds.append(op)\n"
+            "    if op == 'set_scenario':\n"
+            "        scenario[0] = str(msg.get('mode') or '')\n"
+            "        hold_evt.clear()\n"
+            "        with lock:\n"
+            "            cmds.clear()\n"
+            "            rec_cmds.clear()\n"
+            "        emit({'type': 'reply', 'reply': 'set_scenario', 'seq_id': seq, 'ok': True})\n"
+            "    elif op == 'inject_hotkey':\n"
+            "        emit({'type': 'reply', 'reply': 'inject_hotkey', 'seq_id': seq, 'ok': True})\n"
+            "        emit({'event': msg.get('hk_event'), 'hwnd': 77, 'process': 'WindowsTerminal', 'title': 'codex'})\n"
+            "    elif op == 'rec_start':\n"
+            "        sc = scenario[0]\n"
+            "        if sc == 'fail_0frames_ptt':\n"
+            "            emit({'event': 'ptt_stop', 'hwnd': 77, 'process': 'WindowsTerminal', 'title': 'codex'})\n"
+            "            device_recording[0] = False\n"
+            "            emit({'type': 'reply', 'reply': 'rec_start', 'seq_id': seq, 'ok': False, 'rec_error': 'mic_busy:wasapi_startup_no_frames'})\n"
+            "        elif sc == 'ok_early_ptt_stop':\n"
+            "            emit({'event': 'ptt_stop', 'hwnd': 77, 'process': 'WindowsTerminal', 'title': 'codex'})\n"
+            "            device_recording[0] = True\n"
+            "            emit({'type': 'reply', 'reply': 'rec_start', 'seq_id': seq, 'ok': True, 'rec_error': ''})\n"
+            "        elif sc == 'hold_inflight':\n"
+            "            emit({'event': 'test_rec_start_received', 'seq_id': seq})\n"
+            "            def _delayed_abort(s=seq):\n"
+            "                hold_evt.wait(timeout=3.0)\n"
+            "                device_recording[0] = False\n"
+            "                emit({'type': 'reply', 'reply': 'rec_start', 'seq_id': s, 'ok': False, 'rec_error': 'mic_busy:wasapi_aborted'})\n"
+            "            threading.Thread(target=_delayed_abort, daemon=True).start()\n"
+            "        else:\n"
+            "            device_recording[0] = True\n"
+            "            emit({'type': 'reply', 'reply': 'rec_start', 'seq_id': seq, 'ok': True, 'rec_error': ''})\n"
+            "    elif op == 'rec_stop':\n"
+            "        was_rec = device_recording[0]\n"
+            "        device_recording[0] = False\n"
+            "        hold_evt.set()\n"
+            "        emit({'type': 'reply', 'reply': 'rec_stop', 'seq_id': seq, 'ok': False, 'pcm_bytes': 0, 'wav_b64': '', 'rec_error': 'wasapi_zero_packets' if was_rec else 'not_recording'})\n"
+            "    elif op == 'dump_state':\n"
+            "        with lock:\n"
+            "            snap_cmds = list(cmds)\n"
+            "            snap_rec = list(rec_cmds)\n"
+            "        emit({'type': 'reply', 'reply': 'dump_state', 'seq_id': seq, 'ok': True, 'cmds': snap_cmds, 'rec_cmds': snap_rec, 'device_recording': device_recording[0]})\n"
+            "    elif op == 'quit':\n"
+            "        device_recording[0] = False\n"
+            "        hold_evt.set()\n"
+            "        break\n"
+            "    else:\n"
+            "        emit({'type': 'reply', 'reply': op, 'seq_id': seq, 'ok': True})\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            cfg = Config(
+                hotkey=HotkeyConfig(trigger_mode="push_to_talk", debounce_ms=0),
+                audio=AudioConfig(wsl_source="auto", beep=True),
+                ui=UiConfig(language="zh"),
+            )
+            wplat = WslPlatform(
+                cfg,
+                env={"HOME": td},
+                shim_cmd_factory=lambda: [sys.executable, "-u", "-c", mock_shim_code],
+            )
+            wplat._primary_winmm = True
+            wplat._use_winmm = True
+            pulse_called = False
+
+            def _forbid_pulse(*_a: object, **_k: object) -> None:
+                nonlocal pulse_called
+                pulse_called = True
+                raise AssertionError("PulseAudio fallback must not run on WASAPI busy/cancel/shutdown")
+
+            wplat._ff_rec.start = _forbid_pulse  # type: ignore[method-assign]
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td},
+                runtime_dir=rt,
+                platform=wplat,
+                asr_provider=_FakeAsr("unused"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            rec_start_seen = threading.Event()
+            hotkey_done_count = 0
+            hotkey_cv = threading.Condition()
+
+            def _on_shim_event(m: dict[str, object]) -> None:
+                nonlocal hotkey_done_count
+                ev = str(m.get("event") or "")
+                if ev == "test_rec_start_received":
+                    rec_start_seen.set()
+                    return
+                if ev in ("toggle", "ptt_start", "ptt_stop", "ptt_cancel"):
+                    daemon.handle_trigger(ev, _window_from_mapping(m), from_hotkey=True)
+                    with hotkey_cv:
+                        hotkey_done_count += 1
+                        hotkey_cv.notify_all()
+
+            try:
+                wplat.start_event_listener(_on_shim_event)
+
+                # (a) Charging-case 0-frame failure + <850ms PTT release -> single mic_unavailable toast, idle state
+                wplat._shim_rpc({"cmd": "inject_hotkey", "hk_event": "ptt_start"}, timeout_sec=2.0)
+                with hotkey_cv:
+                    self.assertTrue(hotkey_cv.wait_for(lambda: hotkey_done_count >= 2, timeout=2.0))
+                self.assertEqual(daemon.state, "idle")
+                self.assertFalse(pulse_called)
+                self.assertEqual(daemon.last_result.get("skipped_reason"), "mic_unavailable")
+                self.assertIn("mic_busy:wasapi_startup_no_frames", daemon.last_result.get("error", ""))
+
+                st_a = wplat._shim_rpc({"cmd": "dump_state"}, timeout_sec=2.0) or {}
+                hud_a = [c for c in (st_a.get("cmds") or []) if c.get("cmd") == "hud"]
+                beep_a = [c.get("kind") for c in (st_a.get("cmds") or []) if c.get("cmd") == "beep"]
+                self.assertEqual([c.get("state") for c in hud_a], ["mic_unavailable"])
+                self.assertEqual(hud_a[0].get("layer"), "toast")
+                self.assertIs(hud_a[0].get("clear_main"), True)
+                self.assertEqual(hud_a[0].get("duration_ms"), 2600)
+                self.assertEqual(hud_a[0].get("text"), "! 麦克风暂忙，请再试一次")
+                self.assertEqual(beep_a, ["error"])
+                self.assertEqual(st_a.get("rec_cmds"), ["rec_start"])
+                self.assertIs(st_a.get("device_recording"), False)
+
+                # (b) <850ms PTT release when first frame arrives -> queued ptt_stop stops capture cleanly
+                with hotkey_cv:
+                    hotkey_done_count = 0
+                wplat._shim_rpc({"cmd": "set_scenario", "mode": "ok_early_ptt_stop"}, timeout_sec=2.0)
+                wplat._shim_rpc({"cmd": "inject_hotkey", "hk_event": "ptt_start"}, timeout_sec=2.0)
+                with hotkey_cv:
+                    self.assertTrue(hotkey_cv.wait_for(lambda: hotkey_done_count >= 2, timeout=2.0))
+                # Wait for background utterance worker to finish processing empty audio back to idle
+                with daemon._queue_cv:
+                    self.assertTrue(
+                        daemon._queue_cv.wait_for(
+                            lambda: daemon.state == "idle" and daemon._active_task is None and not daemon._utterance_queue,
+                            timeout=2.0,
+                        )
+                    )
+                st_b = wplat._shim_rpc({"cmd": "dump_state"}, timeout_sec=2.0) or {}
+                self.assertEqual(st_b.get("rec_cmds"), ["rec_start", "rec_stop"])
+                self.assertIs(st_b.get("device_recording"), False)
+                self.assertEqual(daemon.state, "idle")
+
+                # (c1) Concurrent cancel_recording() AFTER rec_start is received by shim -> ordered ['rec_start', 'rec_stop']
+                rec_start_seen.clear()
+                wplat._shim_rpc({"cmd": "set_scenario", "mode": "hold_inflight"}, timeout_sec=2.0)
+                start_err: list[BaseException] = []
+                start_done = threading.Event()
+
+                def _bg_start() -> None:
+                    try:
+                        wplat.start_recording(rt, seq_id=99)
+                    except BaseException as exc:
+                        start_err.append(exc)
+                    finally:
+                        start_done.set()
+
+                threading.Thread(target=_bg_start, daemon=True).start()
+                self.assertTrue(rec_start_seen.wait(timeout=2.0))
+                wplat.cancel_recording()
+                self.assertTrue(start_done.wait(timeout=2.0))
+                self.assertEqual(len(start_err), 1)
+                self.assertIsInstance(start_err[0], MicrophoneUnavailableError)
+                st_c1 = wplat._shim_rpc({"cmd": "dump_state"}, timeout_sec=2.0) or {}
+                self.assertEqual(st_c1.get("rec_cmds"), ["rec_start", "rec_stop"])
+                self.assertIs(st_c1.get("device_recording"), False)
+                self.assertEqual(wplat._rec_mode, "")
+
+                # (c2) Concurrent cancel_recording() BEFORE rec_start writes to stdin -> never inverted ['rec_stop', 'rec_start']
+                wplat._shim_rpc({"cmd": "set_scenario", "mode": "ok_immediate"}, timeout_sec=2.0)
+                orig_ensure = wplat._ensure_shim
+                entered_ensure = threading.Event()
+                release_ensure = threading.Event()
+
+                def _paused_ensure() -> bool:
+                    ok = orig_ensure()
+                    if not entered_ensure.is_set():
+                        entered_ensure.set()
+                        release_ensure.wait(timeout=2.0)
+                    return ok
+
+                wplat._ensure_shim = _paused_ensure  # type: ignore[method-assign]
+                pre_err: list[BaseException] = []
+                pre_done = threading.Event()
+
+                def _bg_pre_start() -> None:
+                    try:
+                        wplat.start_recording(rt, seq_id=100)
+                    except BaseException as exc:
+                        pre_err.append(exc)
+                    finally:
+                        pre_done.set()
+
+                try:
+                    threading.Thread(target=_bg_pre_start, daemon=True).start()
+                    self.assertTrue(entered_ensure.wait(timeout=2.0))
+                    wplat.cancel_recording()
+                    release_ensure.set()
+                    self.assertTrue(pre_done.wait(timeout=2.0))
+                finally:
+                    wplat._ensure_shim = orig_ensure  # type: ignore[method-assign]
+
+                self.assertEqual(len(pre_err), 1)
+                self.assertIsInstance(pre_err[0], MicrophoneUnavailableError)
+                st_c2 = wplat._shim_rpc({"cmd": "dump_state"}, timeout_sec=2.0) or {}
+                self.assertEqual(st_c2.get("rec_cmds"), [])
+                self.assertIs(st_c2.get("device_recording"), False)
+                self.assertEqual(wplat._rec_mode, "")
+                self.assertFalse(pulse_called)
+
+                # (d) Shutdown/close during in-flight rec_start with wsl_source='auto' must NEVER spawn PulseAudio fallback
+                rec_start_seen.clear()
+                wplat._shim_rpc({"cmd": "set_scenario", "mode": "hold_inflight"}, timeout_sec=2.0)
+                close_err: list[BaseException] = []
+                close_done = threading.Event()
+
+                def _bg_close_start() -> None:
+                    try:
+                        wplat.start_recording(rt, seq_id=101)
+                    except BaseException as exc:
+                        close_err.append(exc)
+                    finally:
+                        close_done.set()
+
+                threading.Thread(target=_bg_close_start, daemon=True).start()
+                self.assertTrue(rec_start_seen.wait(timeout=2.0))
+                daemon.close()
+                self.assertTrue(close_done.wait(timeout=2.0))
+                self.assertEqual(len(close_err), 1)
+                self.assertFalse(pulse_called)
+            finally:
+                daemon.close()
+
 
 if __name__ == "__main__":
     unittest.main()

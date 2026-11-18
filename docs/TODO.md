@@ -9,7 +9,7 @@
 ## 一、阶段迭代追踪清单
 
 ### `v0.8.0`：核心日常体验跃升
-- [ ] **`v0.8-1` WSL 蓝牙耳机充电盒双 HUD 胶囊竞态修复**：`win_shim.ps1` 补齐非 `loopback` 启动期 `850ms` 首帧门禁（`PeekMessage` 保活低级钩子）与 `everGotFrames` 有帧重开恢复确认。
+- [x] **`v0.8-1` WSL 蓝牙耳机充电盒双 HUD 胶囊竞态修复**：`win_shim.ps1` 补齐非 `loopback` 启动期 `850ms` 首帧门禁（`PeekMessage` 保活低级钩子）与中段重开有帧恢复确认。
 - [ ] **`v0.8-2` 精修评测回放、提示词/载荷重构与热词补齐**：
   - [ ] 扩展 `voice-eval` 支持存量录音按会话时间点（Point-in-Time）回放评测（产出限定仓外缓存目录）；
   - [ ] 重构 `REFINER_SYSTEM_PROMPT`（解开 Rule 2/Rule 3 折返与车轱辘话清理死锁、放开跨会话通用技术术语谐音纠偏、前置 `<workspace_git_status>`、优化 `/responses` 历史块角色权重、自适应 `agent` / `general` 双子规则）；
