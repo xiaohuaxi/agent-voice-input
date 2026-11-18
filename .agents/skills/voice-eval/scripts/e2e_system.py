@@ -596,6 +596,19 @@ def _fmt_cell(text: str, max_chars: int = 160) -> str:
     return s if len(s) <= max_chars else (s[:max_chars].rstrip() + " …[truncated]")
 
 
+def _pane_contains_delivered(fin_txt: str, pane_full: str) -> bool:
+    """Verify delivered text landed in tmux pane (handling multiline paragraphs & 2-col CJK wrap padding spaces)."""
+    if not fin_txt:
+        return False
+    if fin_txt in pane_full:
+        return True
+    fin_norm = "\n".join(ln.strip() for ln in fin_txt.splitlines() if ln.strip())
+    if fin_norm and fin_norm in pane_full:
+        return True
+    fin_compact = "".join(fin_txt.split())
+    return bool(fin_compact and fin_compact in "".join(pane_full.split()))
+
+
 def main(argv: list[str] | None = None) -> int:
     t_suite0 = time.monotonic()
     ap = argparse.ArgumentParser(
@@ -702,7 +715,7 @@ def main(argv: list[str] | None = None) -> int:
         tmux_sock_path = ""
         try:
             ns = subprocess.run(
-                [tmux_bin, "-L", sock_name, "-f", "/dev/null", "new-session", "-d", "-s", "e2e", "-x", "200", "-y", "50", "cat"],
+                [tmux_bin, "-L", sock_name, "-f", "/dev/null", "new-session", "-d", "-s", "e2e", "-x", "200", "-y", "50", "sh", "-c", "cat >/dev/null"],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
@@ -847,7 +860,7 @@ def main(argv: list[str] | None = None) -> int:
             # Read back real terminal text from isolated tmux pane
             time.sleep(0.08)
             cap = subprocess.run(
-                [tmux_bin, "-L", sock_name, "capture-pane", "-p", "-J", "-t", pane_id],
+                [tmux_bin, "-L", sock_name, "capture-pane", "-p", "-J", "-S", "-", "-t", pane_id],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
@@ -857,22 +870,26 @@ def main(argv: list[str] | None = None) -> int:
             )
             pane_lines = [ln.strip() for ln in cap.stdout.splitlines() if ln.strip()]
             pane_full = "\n".join(pane_lines)
+            pane_compact = "".join(pane_full.split())
 
             recs_3 = [r for r in (st_after_3.get("recent_results") or []) if int(r.get("seq_id") or 0) in (1, 2, 3)]
             recs_by_seq = {int(r["seq_id"]): r for r in recs_3}
 
             e2e_issues: list[str] = []
             warm_cache_hits: list[float] = []
-            last_pane_pos = -1
+            last_compact_pos = -1
 
             for idx, item in enumerate(utterance_items, start=1):
                 rec = recs_by_seq.get(idx, {})
                 asr_txt = asr_proxy.asr_texts[idx - 1] if (idx - 1) < len(asr_proxy.asr_texts) else ""
                 fin_txt = platform.delivered_by_seq.get(idx, "")
                 fin_norm = "\n".join(ln.strip() for ln in fin_txt.splitlines() if ln.strip())
+                fin_compact = "".join(fin_txt.split())
                 matched_pane_line = next((ln for ln in pane_lines if fin_txt and fin_txt in ln), "")
                 if not matched_pane_line and fin_norm and fin_norm in pane_full:
                     matched_pane_line = fin_norm
+                elif not matched_pane_line and fin_compact and fin_compact in pane_compact:
+                    matched_pane_line = next((ln for ln in pane_lines if fin_compact in "".join(ln.split())), fin_norm)
                 row_issues: list[str] = []
 
                 if not rec.get("ok"):
@@ -897,19 +914,14 @@ def main(argv: list[str] | None = None) -> int:
                     if idx >= 2 and hit_pct is not None:
                         warm_cache_hits.append(hit_pct)
 
-                pane_needle = (
-                    fin_txt
-                    if (fin_txt and fin_txt in pane_full)
-                    else (fin_norm if (fin_norm and fin_norm in pane_full) else "")
-                )
-                if not pane_needle:
+                if not _pane_contains_delivered(fin_txt, pane_full):
                     row_issues.append("missing_in_tmux_pane")
-                else:
-                    pos = pane_full.find(pane_needle, max(0, last_pane_pos))
-                    if pos < last_pane_pos:
+                elif fin_compact:
+                    pos = pane_compact.find(fin_compact, max(0, last_compact_pos))
+                    if pos < last_compact_pos:
                         row_issues.append("tmux_order_mismatch")
                     else:
-                        last_pane_pos = pos + len(pane_needle)
+                        last_compact_pos = pos + len(fin_compact)
 
                 if used_custom_wav:
                     for priv_s in (asr_txt, fin_txt):
@@ -1071,7 +1083,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 time.sleep(0.06)
                 cap_rep = subprocess.run(
-                    [tmux_bin, "-L", sock_name, "capture-pane", "-p", "-J", "-t", pane_id],
+                    [tmux_bin, "-L", sock_name, "capture-pane", "-p", "-J", "-S", "-", "-t", pane_id],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
@@ -1090,7 +1102,7 @@ def main(argv: list[str] | None = None) -> int:
                     if len(priv_s) >= 6:
                         private_replay_prose.append(priv_s)
 
-                tmux_hit = bool(rep_fin_txt and rep_fin_txt in rep_pane_full)
+                tmux_hit = _pane_contains_delivered(rep_fin_txt, rep_pane_full)
                 r_issues: list[str] = []
                 if not rs_start.get("ok") or not rs_stop.get("ok"):
                     r_issues.append("trigger_failed")

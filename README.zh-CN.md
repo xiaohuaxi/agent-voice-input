@@ -119,7 +119,7 @@ agent-voice-input start
 - **思考档位控制（`effort`）**：支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`。`asr.effort` 默认 `"auto"`（自动压低多模态模型的默认思考延迟），`refiner.effort` 默认 `"low"`。
 - **精修提示词与前缀缓存组织（`refiner.prompt`、`include_git_status`、`context_max_chars`）**：`prompt` 默认留空 `""` 时使用内置英文语音听写编辑提示词（结合只读 `<session_reference_log>` 上下文分块与 `<workspace_git_status>` 修正同音错字与代码术语、顺通口语停顿并保持原句结构与说话语言、严禁把口述提问当成对话回答），亦可在 `[refiner]` 中用 TOML 三引号多行文本 `prompt = '''...'''` 定制。终端历史对话（默认上限 `context_max_chars = 200000` 字符，满窗按四分之一即 `50K` 整块滑出）按固定分块置于前部（`/responses` 下作 `developer` 消息块，`/chat/completions` 下置于单条 `user` 消息前部），易变的当轮语音草稿与 `git status` 文件列表统一放在末尾（`include_git_status = true`，可设为 `false` 关闭）以稳定命中前缀缓存（`codex` 配合确定性会话 `prompt_cache_key` 与负载均衡亲和性 Cookie 实现 95%+ 缓存命中且零历史草稿残留）。
 - **同渠道重试与建连超时（`max_retries`）**：`[asr] max_retries` 与 `[refiner] max_retries` 默认 `2`（`0..10`，指首次请求之外的额外重试次数，`0` 关闭重试），在阶段 `timeout_sec` 总预算与独立的 9 秒建连/TLS 握手超时上限内，区分频率限流（`HTTP 429`、`Retry-After`、厂商 QPS 码）与瞬态通信/5xx 错误分别退避重试。
-- **可选本地 MP3 录音环形归档（`audio.save_recordings`）**：默认关闭（`false`）。显式设为 `true` 时，后台异步通过 `ffmpeg` 将有效非静音录音压缩为 `16 kHz` 单声道 `32 kbps` MP3 以 `0600` 权限保存至 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`，并按修改时间保留最新 `save_recordings_max_count`（默认 `100`，范围 `1..5000`）条，不阻塞实时识别与上屏耗时。
+- **可选本地 MP3 录音环形归档（`audio.save_recordings`）**：默认关闭（`false`）。显式设为 `true` 时，后台异步通过 `ffmpeg` 将有效非静音录音压缩为 `16 kHz` 单声道 `64 kbps` MP3 以 `0600` 权限保存至 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`，并按修改时间保留最新 `save_recordings_max_count`（默认 `300`，范围 `1..5000`）条，不阻塞实时识别与上屏耗时。
 
 ### 内置渠道一览
 

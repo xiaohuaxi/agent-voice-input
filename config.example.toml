@@ -41,9 +41,9 @@ macos_device = "default"
 beep = false
 # Tail drain seconds after stopping recording (auto-adapts by platform when unset: 0.65s on WSL2/RDP, 0.20s on macOS)
 # tail_drain_sec = 0.65
-# Optional local MP3 ring archive of valid voiced recordings under ~/.cache/agent-voice-input/recordings/ (0600 mode, off by default)
+# Optional local MP3 ring archive of valid voiced recordings under ~/.cache/agent-voice-input/recordings/ (16 kHz mono 64 kbps, 0600 mode, off by default)
 # save_recordings = false
-# save_recordings_max_count = 100
+# save_recordings_max_count = 300
 
 [asr]
 # Stage 1 speech-to-text provider:

@@ -63,7 +63,7 @@ PYTHONPATH=src python3 .agents/skills/voice-eval/scripts/e2e_system.py --wav /tm
 - `C2_serial_e2e_tmux`：在独立 `tmux -L avi-e2e-*` 服务器与无头 `PlatformBackend` 下拉起真实 `VoiceInputDaemon`，驱动 U1 冷启动及 U2+U3 背靠背连续入队（验证串行队列不丢句、保序执行、稳态轮触发 `cached_input_tokens > 0`，并通过 `tmux capture-pane` 读回真实落字核验代码标识符还原、问句保留与口语纠错）。
 - `C3_telemetry_privacy_contract`：校验 `status --history` 与 `telemetry.jsonl` 权限严格为 `0600`、分段耗时字段齐全，且全文不含任何语音口述原文（含回放真实录音原文）或明文密钥。
 - `C4_fault_recovery_redaction`：注入单次上游故障，验证当次音频以 `0600` 原子暂存至隔离 `failed/`、异常信息中敏感 token 被 `redact_secrets` 脱敏，且 `diagnose_live.py --json` 正常闭环。
-- `C5_mp3_archive_and_saved_replay`：在隔离 `XDG_CACHE_HOME` 验证 `audio.save_recordings=true` 真实产出 `0600` `rec-*.mp3` 且能经 `ffmpeg` 还原为有效 `16kHz WAV`；同时检查宿主机 `resolve_saved_recordings_dir()`，若存在真实 `.mp3`/`.m4a`/`.wav` 历史录音则挑最新 `1~2` 条（`--saved-limit`）还原后送入隔离守护进程 + 真 ASR + 真精修 + 隔离 `tmux` 落字验证（仅输出纯数值指标、零原文打印），尚无历史录音时标明 `SKIPPED (0 saved recordings yet)` 并跑通隔离 MP3 往返真链路回放。
+- `C5_mp3_archive_and_saved_replay`：在隔离 `XDG_CACHE_HOME` 验证 `audio.save_recordings=true` 真实产出 `0600` `64 kbps` `rec-*.mp3` 且能经 `ffmpeg` 还原为有效 `16kHz WAV`；同时检查宿主机 `resolve_saved_recordings_dir()`，若存在真实 `.mp3`/`.m4a`/`.wav` 历史录音则挑最新 `1~2` 条（`--saved-limit`）还原后送入隔离守护进程 + 真 ASR + 真精修 + 隔离 `tmux` 落字验证（仅输出纯数值指标、零原文打印），尚无历史录音时标明 `SKIPPED (0 saved recordings yet)` 并跑通隔离 MP3 往返真链路回放。
 
 ## 场景 3：本机运行期慢速与异常只读诊断（`scripts/diagnose_live.py`）
 

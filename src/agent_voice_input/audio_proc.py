@@ -679,7 +679,7 @@ def _is_saved_recording_entry(entry: Path) -> bool:
 def prune_saved_recordings_dir(
     recordings_dir: Path,
     *,
-    max_count: int = 100,
+    max_count: int = 300,
     now_ts: float | None = None,
 ) -> None:
     """Retain at most ``max_count`` newest ``rec-*`` files ordered by mtime, pruning older entries."""
@@ -763,12 +763,12 @@ def archive_recording_audio(
     raw_wav_bytes: bytes,
     recordings_dir: Path,
     *,
-    max_count: int = 100,
+    max_count: int = 300,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
     now_ts: float | None = None,
     timeout_sec: float = 15.0,
 ) -> Path | None:
-    """Compress voiced WAV to 16 kHz mono 32 kbps MP3 (fallback AAC .m4a / .wav) with 0600 mode & ring pruning."""
+    """Compress voiced WAV to 16 kHz mono 64 kbps MP3 (fallback AAC .m4a / .wav) with 0600 mode & ring pruning."""
     if not raw_wav_bytes:
         return None
     tmp_in: Path | None = None
@@ -792,8 +792,8 @@ def archive_recording_audio(
 
         if exe is not None:
             for ext, fmt_args in (
-                (".mp3", ("-f", "mp3", "-c:a", "libmp3lame", "-b:a", "32k")),
-                (".m4a", ("-f", "ipod", "-c:a", "aac", "-b:a", "32k")),
+                (".mp3", ("-f", "mp3", "-c:a", "libmp3lame", "-b:a", "64k")),
+                (".m4a", ("-f", "ipod", "-c:a", "aac", "-b:a", "64k")),
             ):
                 tmp_out = rec_dir / f".rec-out-{uniq}{ext}"
                 tmp_candidates.append(tmp_out)
@@ -861,7 +861,7 @@ def spawn_recording_archive(
     raw_wav_bytes: bytes,
     recordings_dir: Path,
     *,
-    max_count: int = 100,
+    max_count: int = 300,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
     now_ts: float | None = None,
 ) -> threading.Thread | None:

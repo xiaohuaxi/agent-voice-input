@@ -189,7 +189,7 @@ class AudioConfig:
     beep: bool = False
     tail_drain_sec: float | None = None
     save_recordings: bool = False
-    save_recordings_max_count: int = 100
+    save_recordings_max_count: int = 300
 
     def effective_tail_drain_sec(self, *, macos: bool = False) -> float:
         if self.tail_drain_sec is not None:
