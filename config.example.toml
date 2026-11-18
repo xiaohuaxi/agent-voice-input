@@ -14,9 +14,16 @@ key = "RControl"
 trigger_mode = "tap_toggle"
 # tap_max_ms = 1200
 # debounce_ms = 180
-# Start new hotkey recordings only when an allowed terminal window is focused (set false to allow triggering in any app;
-# stopping or canceling an active recording is never blocked even if focus moved away)
-only_in_terminals = true
+# Hotkey activation scope for starting new recordings (stopping/canceling an active recording works from any window):
+# - "all" (default): dictate anywhere (terminals bind to active CLI session; IDEs use isolated coding mode; general apps use everyday prose mode)
+# - "coding": start only in terminals and code editors / IDEs
+# - "terminals": start only in allowed terminal emulators (legacy `only_in_terminals = true/false` remains supported)
+scope = "all"
+# Yield hotkey silently when a remote desktop / streaming / VM client window is focused so the remote host can handle it
+# (Note: Windows excludes bare "msrdc" by default to protect Win11 WSLg Linux GUI apps; AVD/W365 users not using WSLg can add "msrdc" to ignore_apps)
+yield_remote_desktop = true
+# Extra process names or macOS bundle IDs (supports trailing "*" prefix match) where new hotkey recordings should be ignored:
+ignore_apps = []
 
 [ui]
 # Desktop HUD pill language: "auto" (follows Windows UI language on WSL2 or desktop/POSIX locale on macOS/Linux; falls back to "en") | "zh" | "en"

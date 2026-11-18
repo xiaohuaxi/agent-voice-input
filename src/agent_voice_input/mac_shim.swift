@@ -21,6 +21,7 @@ private let FLAG_CONTROL: UInt  = NSEvent.ModifierFlags.control.rawValue
 private let FLAG_OPTION: UInt   = NSEvent.ModifierFlags.option.rawValue
 private let FLAG_COMMAND: UInt  = NSEvent.ModifierFlags.command.rawValue
 private let FLAG_FUNCTION: UInt = NSEvent.ModifierFlags.function.rawValue
+private let AVI_INJECT_TAG: Int64 = 0x41564931
 
 enum RawEventKind { case flagsChanged, keyDown, keyUp }
 
@@ -2036,6 +2037,7 @@ struct MacShimMain {
             : [.flagsChanged]
 
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: listenMask) { ev in
+            if ev.cgEvent?.getIntegerValueField(.eventSourceUserData) == AVI_INJECT_TAG { return }
             let rawKind: RawEventKind
             switch ev.type {
             case .flagsChanged: rawKind = .flagsChanged
@@ -2074,6 +2076,7 @@ struct MacShimMain {
         }
 
         let initialAudioStatus = audioMonitor.start()
+        var postAccessPrompted = false
 
         let stdinThread = Thread {
             while let rawLine = readLine(strippingNewline: true) {
@@ -2100,6 +2103,78 @@ struct MacShimMain {
                         )
                         let held = engine.targetDown || !modFlags.intersection(blockingMods).isEmpty || fnHeld || nonModHeld
                         writeJsonLine(["type": "reply", "reply": "key_state", "seq_id": seqId, "ok": true, "hotkey_held": held])
+                    case "paste_cmd_v":
+                        guard CGPreflightPostEventAccess() else {
+                            writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": false, "reason": "accessibility_denied"])
+                            if !postAccessPrompted {
+                                postAccessPrompted = true
+                                DispatchQueue.main.async { _ = CGRequestPostEventAccess() }
+                            }
+                            break
+                        }
+                        let normProc: (String) -> String = { raw in
+                            let low = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                            return low.hasSuffix(".app") ? String(low.dropLast(4)).trimmingCharacters(in: .whitespacesAndNewlines) : low
+                        }
+                        let expBundle = ((obj["expect_bundle_id"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        let expProc = normProc((obj["expect_process"] as? String) ?? "")
+                        let expHwnd = (obj["expect_hwnd"] as? Int) ?? ((obj["expect_hwnd"] as? NSNumber)?.intValue ?? 0)
+                        if !expBundle.isEmpty || !expProc.isEmpty || expHwnd > 0 {
+                            guard let curApp = NSWorkspace.shared.frontmostApplication else {
+                                writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": false, "reason": "focus_changed", "fg_process": ""])
+                                break
+                            }
+                            let curName = curApp.localizedName ?? curApp.bundleURL?.deletingPathExtension().lastPathComponent ?? ""
+                            let curProc = normProc(curName)
+                            let curBundle = (curApp.bundleIdentifier ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                            let curPid = Int(curApp.processIdentifier)
+                            var curHwnd = 0
+                            if expHwnd > 0 && curPid > 0,
+                               let wlist = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+                                for entry in wlist {
+                                    let ownerPid = (entry[kCGWindowOwnerPID as String] as? Int) ?? ((entry[kCGWindowOwnerPID as String] as? NSNumber)?.intValue ?? 0)
+                                    let wLayer = (entry[kCGWindowLayer as String] as? Int) ?? ((entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1)
+                                    if ownerPid == curPid && wLayer == 0 {
+                                        curHwnd = (entry[kCGWindowNumber as String] as? Int) ?? ((entry[kCGWindowNumber as String] as? NSNumber)?.intValue ?? 0)
+                                        break
+                                    }
+                                }
+                            }
+                            let appMismatch = (!expBundle.isEmpty && !curBundle.isEmpty && curBundle != expBundle)
+                                || ((expBundle.isEmpty || curBundle.isEmpty) && !expProc.isEmpty && !curProc.isEmpty && curProc != expProc)
+                                || (curBundle.isEmpty && curProc.isEmpty)
+                            let hwndMismatch = (expHwnd > 0 && curHwnd != expHwnd)
+                            if appMismatch || hwndMismatch {
+                                writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": false, "reason": "focus_changed", "fg_process": curName])
+                                break
+                            }
+                        }
+                        let src = CGEventSource(stateID: .privateState)
+                        let steps: [(CGKeyCode, Bool, CGEventFlags)] = [
+                            (0x37, true, .maskCommand),
+                            (0x09, true, .maskCommand),
+                            (0x09, false, .maskCommand),
+                            (0x37, false, []),
+                        ]
+                        var events: [CGEvent] = []
+                        if src != nil {
+                            for (kc, isDown, fl) in steps {
+                                guard let ev = CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: isDown) else {
+                                    events.removeAll()
+                                    break
+                                }
+                                ev.flags = fl
+                                ev.setIntegerValueField(.eventSourceUserData, value: AVI_INJECT_TAG)
+                                events.append(ev)
+                            }
+                        }
+                        let postedOk = (events.count == steps.count)
+                        if postedOk {
+                            for ev in events {
+                                ev.post(tap: .cghidEventTap)
+                            }
+                        }
+                        writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": postedOk, "reason": postedOk ? "ok" : "cgevent_failed"])
                     case "hud":
                         let dms = (obj["duration_ms"] as? Int) ?? ((obj["duration_ms"] as? NSNumber)?.intValue ?? 0)
                         let maxDur = (obj["max_duration_sec"] as? Int) ?? ((obj["max_duration_sec"] as? NSNumber)?.intValue ?? 0)

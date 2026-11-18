@@ -392,7 +392,9 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         parsed_simple = _parse_simple_toml(toml_raw)
         self.assertEqual(parsed, parsed_simple)
         self.assertEqual(parsed["hotkey"]["key"], "RControl")
-        self.assertIs(parsed["hotkey"]["only_in_terminals"], True)
+        self.assertEqual(parsed["hotkey"]["scope"], "all")
+        self.assertIs(parsed["hotkey"]["yield_remote_desktop"], True)
+        self.assertEqual(parsed["hotkey"]["ignore_apps"], [])
         self.assertEqual(parsed["ui"]["language"], "auto")
         self.assertEqual(parsed["ui"]["position"], "bottom")
         self.assertEqual(parsed["audio"]["macos_device"], "default")
@@ -407,7 +409,10 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertNotIn("max_turns_per_thread", (_REPO_ROOT / "README.md").read_text(encoding="utf-8"))
         self.assertNotIn("max_turns_per_thread", (_REPO_ROOT / "README.zh-CN.md").read_text(encoding="utf-8"))
         cfg, _ = load_config(config_path=toml_path, env={"HOME": "/tmp/nonexistent-home"})
-        self.assertIs(cfg.hotkey.only_in_terminals, True)
+        self.assertEqual(cfg.hotkey.scope, "all")
+        self.assertIs(cfg.hotkey.yield_remote_desktop, True)
+        self.assertEqual(cfg.hotkey.ignore_apps, ())
+        self.assertIs(cfg.hotkey.only_in_terminals, False)
         self.assertEqual(cfg.ui.language, "auto")
         self.assertEqual(cfg.ui.position, "bottom")
         self.assertEqual(cfg.audio.macos_device, "default")
@@ -535,7 +540,8 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertIn("_chordTainted", shim)
         self.assertIn("ptt_cancel", shim)
         self.assertIn("CallNextHookEx", shim)
-        self.assertIn("SendCtrlV", shim)
+        self.assertIn("SendPasteChord", shim)
+        self.assertIn("KEYEVENTF_EXTENDEDKEY", shim)
         self.assertIn("focus_changed", shim)
         self.assertIn("SoundPlayer", shim)
         self.assertIn("ShowWithoutActivation", shim)
@@ -568,8 +574,8 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertIn("if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }", shim)
         self.assertIn('if ($clipOk) { "send_input_failed" } else { "clipboard_failed" }', shim)
         self.assertNotIn("$fbOk", shim)
-        send_ctrl_v_block = shim.split("public static bool SendCtrlV()", 1)[1].split("private static void InitWaveTable()", 1)[0]
-        self.assertNotIn("Thread.Sleep", send_ctrl_v_block)
+        send_paste_block = shim.split("public static bool SendPasteChord(", 1)[1].split("private static void InitWaveTable()", 1)[0]
+        self.assertNotIn("Thread.Sleep", send_paste_block)
         self.assertNotIn("Start-Sleep", shim.split('elseif ($op -eq "paste")', 1)[1])
 
 
@@ -2403,8 +2409,10 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(len(ref_calls), 1)
 
     def test_only_in_terminals_config_windows_whitelist_and_daemon_gate_invariants(self) -> None:
-        # 1. Config & env overrides for [hotkey] only_in_terminals
-        self.assertIs(Config().hotkey.only_in_terminals, True)
+        # 1. Config & env overrides for [hotkey] scope & backward-compatible only_in_terminals
+        self.assertEqual(Config().hotkey.scope, "all")
+        self.assertIs(Config().hotkey.only_in_terminals, False)
+        self.assertIs(Config().hotkey.yield_remote_desktop, True)
         with tempfile.TemporaryDirectory() as td_cfg:
             home = Path(td_cfg)
             cfg_dir = home / ".config" / "agent-voice-input"
@@ -2467,7 +2475,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                     start_calls[0] += 1
 
             plat = _CountingFakePlatform(paste_outcome=PasteOutcome(False, True, "focus_changed", "mstsc"))
-            cfg = Config(refiner=RefinerConfig(provider="off"))
+            cfg = Config(hotkey=HotkeyConfig(scope="terminals"), refiner=RefinerConfig(provider="off"))
             cfg.audio.beep = True
             daemon = VoiceInputDaemon(
                 cfg,
@@ -2481,18 +2489,18 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             try:
                 non_terms = [
-                    ForegroundWindow(10, "mstsc.exe", "Remote Desktop"),
-                    ForegroundWindow(11, "chrome.exe", "Google"),
-                    ForegroundWindow(0, "", ""),
-                    ForegroundWindow(0, "Windows App", "Win11", bundle_id="com.microsoft.rdc.macos"),
-                    ForegroundWindow(0, "Safari", "Apple", bundle_id="com.apple.Safari"),
+                    (ForegroundWindow(10, "mstsc.exe", "Remote Desktop"), "remote_client"),
+                    (ForegroundWindow(11, "chrome.exe", "Google"), "non_terminal"),
+                    (ForegroundWindow(0, "", ""), "non_terminal"),
+                    (ForegroundWindow(0, "Windows App", "Win11", bundle_id="com.microsoft.rdc.macos"), "remote_client"),
+                    (ForegroundWindow(0, "Safari", "Apple", bundle_id="com.apple.Safari"), "non_terminal"),
                 ]
-                for w_bad in non_terms:
+                for w_bad, exp_ignored in non_terms:
                     for act in ("toggle", "ptt_start"):
                         resp = daemon.handle_trigger(act, w_bad, from_hotkey=True)
                         self.assertEqual(
                             resp,
-                            {"ok": False, "ignored": "non_terminal", "state": "idle", "seq_id": 0},
+                            {"ok": False, "ignored": exp_ignored, "state": "idle", "seq_id": 0},
                         )
                 # None window with from_hotkey=True also blocked
                 self.assertEqual(
@@ -2566,8 +2574,22 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 now[0] += 0.3
                 daemon.handle_trigger("ptt_cancel")
 
-                # only_in_terminals = False allows starting hotkey recording in non-terminal windows
+                # only_in_terminals = False maps to scope="all": non-remote apps start recording,
+                # while remote desktop clients still yield silently until yield_remote_desktop=False
                 daemon.cfg.hotkey.only_in_terminals = False
+                self.assertEqual(daemon.cfg.hotkey.scope, "all")
+                now[0] += 0.5
+                r_rdp_yield = daemon.handle_trigger("toggle", rdp_win, from_hotkey=True)
+                self.assertEqual(r_rdp_yield["ignored"], "remote_client")
+                r_chrome = daemon.handle_trigger(
+                    "toggle", ForegroundWindow(301, "chrome.exe", "Docs"), from_hotkey=True
+                )
+                self.assertTrue(r_chrome["ok"])
+                self.assertEqual(r_chrome["state"], "recording")
+                now[0] += 0.3
+                daemon.handle_trigger("ptt_cancel")
+
+                daemon.cfg.hotkey.yield_remote_desktop = False
                 now[0] += 0.5
                 r_any = daemon.handle_trigger("toggle", rdp_win, from_hotkey=True)
                 self.assertTrue(r_any["ok"])

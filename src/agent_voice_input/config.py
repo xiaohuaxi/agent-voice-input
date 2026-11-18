@@ -27,6 +27,7 @@ class ConfigError(ValueError):
 
 
 VALID_TRIGGER_MODES = frozenset({"tap_toggle", "ptt"})
+VALID_HOTKEY_SCOPES = frozenset({"all", "coding", "terminals"})
 VALID_UI_LANGUAGES = frozenset({"auto", "zh", "en"})
 VALID_UI_POSITIONS = frozenset({"bottom", "top"})
 VALID_WSL_SOURCES = frozenset({"auto", "pulse", "winmm", "wasapi"})
@@ -157,13 +158,60 @@ _NON_SECRET_ENV_SUFFIXES = (
 )
 
 
+_UNSET: Any = object()
+
+
 @dataclass
 class HotkeyConfig:
     key: str = "RControl"
     trigger_mode: str = "tap_toggle"
     tap_max_ms: int = 1200
     debounce_ms: int = 180
-    only_in_terminals: bool = True
+    scope: str = "all"
+    yield_remote_desktop: bool = True
+    ignore_apps: tuple[str, ...] = ()
+
+    def __init__(
+        self,
+        key: str = "RControl",
+        trigger_mode: str = "tap_toggle",
+        tap_max_ms: int = 1200,
+        debounce_ms: int = 180,
+        only_in_terminals: Any = _UNSET,
+        *,
+        scope: Any = _UNSET,
+        yield_remote_desktop: bool = True,
+        ignore_apps: tuple[str, ...] = (),
+    ) -> None:
+        self.key = key
+        self.trigger_mode = trigger_mode
+        self.tap_max_ms = tap_max_ms
+        self.debounce_ms = debounce_ms
+        self.yield_remote_desktop = yield_remote_desktop
+        self.ignore_apps = (
+            tuple(ignore_apps) if isinstance(ignore_apps, (list, tuple)) else ignore_apps
+        )
+        if scope is not _UNSET and scope is not None:
+            self.scope = scope.strip().lower() if isinstance(scope, str) else scope
+        elif only_in_terminals is not _UNSET and only_in_terminals is not None:
+            if not isinstance(only_in_terminals, bool):
+                raise ConfigError(
+                    f"hotkey.only_in_terminals: invalid boolean value {only_in_terminals!r}"
+                )
+            self.scope = "terminals" if only_in_terminals else "all"
+        else:
+            self.scope = "all"
+
+    @property
+    def only_in_terminals(self) -> bool:
+        """Deprecated compatibility alias synced with ``scope == 'terminals'``."""
+        return self.scope == "terminals"
+
+    @only_in_terminals.setter
+    def only_in_terminals(self, val: bool) -> None:
+        if not isinstance(val, bool):
+            raise ConfigError(f"hotkey.only_in_terminals: invalid boolean value {val!r}")
+        self.scope = "terminals" if val else "all"
 
 
 @dataclass
@@ -1191,6 +1239,22 @@ def _normalize_refiner_provider(raw: Any) -> str:
     return s
 
 
+def _as_app_patterns(val: Any, name: str = "hotkey.ignore_apps") -> tuple[str, ...]:
+    if not isinstance(val, (list, tuple)):
+        raise ConfigError(f"{name}: expected array of strings, got {type(val).__name__}")
+    out: list[str] = []
+    for item in val:
+        if not isinstance(item, str):
+            raise ConfigError(f"{name}: every item must be a string, got {item!r}")
+        s = item.strip()
+        if not s:
+            continue
+        if s.rstrip("*").strip() == "":
+            raise ConfigError(f"{name}: bare wildcard {item!r} is not allowed")
+        out.append(s)
+    return tuple(dict.fromkeys(out))
+
+
 def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
     allowed_top = {"hotkey", "ui", "audio", "asr", "refiner"}
     for k in data:
@@ -1201,6 +1265,8 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
     if hk is not None:
         if not isinstance(hk, Mapping):
             raise ConfigError("[hotkey] must be a table/object")
+        has_explicit_scope = hk.get("scope") is not None
+        oit_val: bool | None = None
         for k, v in hk.items():
             if v is None:
                 continue
@@ -1212,10 +1278,18 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.hotkey.tap_max_ms = _as_int(v, "hotkey.tap_max_ms")
             elif k == "debounce_ms":
                 cfg.hotkey.debounce_ms = _as_int(v, "hotkey.debounce_ms")
+            elif k == "scope":
+                cfg.hotkey.scope = _as_str(v, "hotkey.scope").strip().lower()
+            elif k == "yield_remote_desktop":
+                cfg.hotkey.yield_remote_desktop = _as_bool(v, "hotkey.yield_remote_desktop")
+            elif k == "ignore_apps":
+                cfg.hotkey.ignore_apps = _as_app_patterns(v, "hotkey.ignore_apps")
             elif k == "only_in_terminals":
-                cfg.hotkey.only_in_terminals = _as_bool(v, "hotkey.only_in_terminals")
+                oit_val = _as_bool(v, "hotkey.only_in_terminals")
             else:
                 raise ConfigError(f"unknown hotkey option {k!r}")
+        if oit_val is not None and not has_explicit_scope:
+            cfg.hotkey.scope = "terminals" if oit_val else "all"
 
     ui = data.get("ui")
     if ui is not None:
@@ -1556,10 +1630,16 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
         raise ConfigError("hotkey.tap_max_ms must be > 0")
     if cfg.hotkey.debounce_ms < 0:
         raise ConfigError("hotkey.debounce_ms must be >= 0")
-    if not isinstance(cfg.hotkey.only_in_terminals, bool):
+    if not isinstance(cfg.hotkey.scope, str) or cfg.hotkey.scope not in VALID_HOTKEY_SCOPES:
         raise ConfigError(
-            f"hotkey.only_in_terminals: invalid boolean value {cfg.hotkey.only_in_terminals!r}"
+            f"hotkey.scope must be one of {sorted(VALID_HOTKEY_SCOPES)}, "
+            f"got {cfg.hotkey.scope!r}"
         )
+    if not isinstance(cfg.hotkey.yield_remote_desktop, bool):
+        raise ConfigError(
+            f"hotkey.yield_remote_desktop: invalid boolean value {cfg.hotkey.yield_remote_desktop!r}"
+        )
+    cfg.hotkey.ignore_apps = _as_app_patterns(cfg.hotkey.ignore_apps, "hotkey.ignore_apps")
 
     cfg.ui.language = normalize_ui_language(cfg.ui.language, "ui.language")
     cfg.ui.position = normalize_ui_position(cfg.ui.position, "ui.position")

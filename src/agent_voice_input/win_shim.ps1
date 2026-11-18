@@ -652,8 +652,8 @@ public sealed class HudPillForm : Form {
 
 public static class VoiceWinShim {
     private const int WH_KEYBOARD_LL = 13, WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105;
-    private const uint WM_QUIT = 0x0012, WM_APP_WAKE = 0x8001, WM_TIMER = 0x0113, LLKHF_EXTENDED = 0x01, LLKHF_LOWER_IL_INJECTED = 0x02, LLKHF_INJECTED = 0x10, INPUT_KEYBOARD = 1, KEYEVENTF_KEYUP = 0x0002;
-    private const ushort VK_LCONTROL = 0xA2, VK_V = 0x56;
+    private const uint WM_QUIT = 0x0012, WM_APP_WAKE = 0x8001, WM_TIMER = 0x0113, LLKHF_EXTENDED = 0x01, LLKHF_LOWER_IL_INJECTED = 0x02, LLKHF_INJECTED = 0x10, INPUT_KEYBOARD = 1, KEYEVENTF_EXTENDEDKEY = 0x0001, KEYEVENTF_KEYUP = 0x0002;
+    private const ushort VK_LCONTROL = 0xA2, VK_LSHIFT = 0xA0, VK_INSERT = 0x2D, VK_V = 0x56;
     public delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
     [StructLayout(LayoutKind.Sequential)] private struct KBDLLHOOKSTRUCT { public uint vkCode, scanCode, flags, time; public IntPtr dwExtraInfo; }
     [StructLayout(LayoutKind.Sequential)] private struct POINT { public int x, y; }
@@ -686,6 +686,7 @@ public static class VoiceWinShim {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
     [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint uCode, uint uMapType);
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
     [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("kernel32.dll")] public static extern ulong GetTickCount64();
@@ -1658,13 +1659,37 @@ public static class VoiceWinShim {
         return false;
     }
 
-    public static bool SendCtrlV() {
-        INPUT[] ins = new INPUT[4];
-        ins[0].type = INPUT_KEYBOARD; ins[0].u.ki.wVk = VK_LCONTROL;
-        ins[1].type = INPUT_KEYBOARD; ins[1].u.ki.wVk = VK_V;
-        ins[2].type = INPUT_KEYBOARD; ins[2].u.ki.wVk = VK_V; ins[2].u.ki.dwFlags = KEYEVENTF_KEYUP;
-        ins[3].type = INPUT_KEYBOARD; ins[3].u.ki.wVk = VK_LCONTROL; ins[3].u.ki.dwFlags = KEYEVENTF_KEYUP;
-        return SendInput(4, ins, Marshal.SizeOf(typeof(INPUT))) == 4;
+    private static void FillKeyInput(ref INPUT inp, ushort vk, bool keyUp, bool extended) {
+        inp.type = INPUT_KEYBOARD;
+        inp.u.ki.wVk = vk;
+        inp.u.ki.wScan = (ushort)MapVirtualKey((uint)vk, 0u);
+        inp.u.ki.dwFlags = (keyUp ? KEYEVENTF_KEYUP : 0u) | (extended ? KEYEVENTF_EXTENDEDKEY : 0u);
+    }
+
+    public static bool SendPasteChord(string chord) {
+        string mode = (chord ?? "ctrl_v").Trim().ToLowerInvariant();
+        ushort[] mods;
+        ushort mainVk;
+        bool mainExt = false;
+        if (mode == "ctrl_shift_v") {
+            mods = new ushort[] { VK_LCONTROL, VK_LSHIFT };
+            mainVk = VK_V;
+        } else if (mode == "shift_insert") {
+            mods = new ushort[] { VK_LSHIFT };
+            mainVk = VK_INSERT;
+            mainExt = true; // Dedicated Insert (E0 52) MUST set KEYEVENTF_EXTENDEDKEY on both down & up!
+        } else {
+            mods = new ushort[] { VK_LCONTROL };
+            mainVk = VK_V;
+        }
+        int total = mods.Length * 2 + 2;
+        INPUT[] ins = new INPUT[total];
+        int idx = 0;
+        for (int m = 0; m < mods.Length; m++) FillKeyInput(ref ins[idx++], mods[m], false, false);
+        FillKeyInput(ref ins[idx++], mainVk, false, mainExt);
+        FillKeyInput(ref ins[idx++], mainVk, true, mainExt);
+        for (int m = mods.Length - 1; m >= 0; m--) FillKeyInput(ref ins[idx++], mods[m], true, false);
+        return SendInput((uint)total, ins, Marshal.SizeOf(typeof(INPUT))) == (uint)total;
     }
 }
 "@
@@ -1682,6 +1707,16 @@ function Set-ClipboardSafe([string]$val) {
         }
     }
     return $false
+}
+function Get-TitleSessionToken([string]$title) {
+    if ([string]::IsNullOrWhiteSpace($title)) { return "" }
+    $m1 = [regex]::Matches($title, '(?i)\[(agy|claude|codex):#?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8,36})\]')
+    if ($m1.Count -gt 0) { return $m1[$m1.Count - 1].Groups[2].Value.ToLowerInvariant() }
+    $m2 = [regex]::Matches($title, '(?i)\[#([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8,36})\](?=$|[^0-9A-Za-z_])')
+    if ($m2.Count -gt 0) { return $m2[$m2.Count - 1].Groups[1].Value.ToLowerInvariant() }
+    $m3 = [regex]::Matches($title, '(?i)(?:^|[^0-9a-f-])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=$|[^0-9a-f-])')
+    if ($m3.Count -gt 0) { return $m3[$m3.Count - 1].Groups[1].Value.ToLowerInvariant() }
+    return ""
 }
 
 [VoiceWinShim]::EnableDpiAwareness()
@@ -1752,10 +1787,15 @@ try {
                     $forceClipOnly = if ($null -ne $cmdObj.force_clipboard_only) { [bool]$cmdObj.force_clipboard_only } else { $false }
                     $suppressBeep = if ($null -ne $cmdObj.suppress_beep) { [bool]$cmdObj.suppress_beep } else { $false }
                     $expectTerm = if ($null -ne $cmdObj.expect_terminal) { [bool]$cmdObj.expect_terminal } else { $true }
+                    $expectProc = if ($null -ne $cmdObj.expect_process) { ([string]$cmdObj.expect_process -replace '\.exe$','').Trim().ToLowerInvariant() } else { "" }
+                    $expectTok = if ($null -ne $cmdObj.expect_session_token) { ([string]$cmdObj.expect_session_token).Trim().ToLowerInvariant() } else { "" }
+                    $pasteChord = if ($null -ne $cmdObj.paste_chord -and ([string]$cmdObj.paste_chord).Length -gt 0) { [string]$cmdObj.paste_chord } else { "ctrl_v" }
                     $thwnd = if ($null -ne $cmdObj.target_hwnd) { [long]$cmdObj.target_hwnd } else { 0L }
                     $h = 0L; $p = ""; $t = ""; [VoiceWinShim]::QueryForeground([ref]$h, [ref]$p, [ref]$t)
                     $pNorm = ($p -replace '\.exe$','').ToLowerInvariant()
-                    $winMatch = (($thwnd -le 0) -or ($h -eq $thwnd)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $pNorm))
+                    $curTok = if ($expectTok -ne "") { Get-TitleSessionToken $t } else { "" }
+                    $tokConflict = ($expectTok -ne "") -and ($curTok -ne "") -and ($curTok -ne $expectTok)
+                    $winMatch = (($thwnd -le 0) -or ($h -eq $thwnd)) -and (($expectProc -eq "") -or ($pNorm -eq $expectProc)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $pNorm)) -and (-not $tokConflict)
                     if ($winMatch -and (-not $forceClipOnly)) {
                         if ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
                             Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "hotkey_held"; fg_process = $p }
@@ -1766,13 +1806,18 @@ try {
                             } else {
                                 $h2 = 0L; $p2 = ""; $t2 = ""; [VoiceWinShim]::QueryForeground([ref]$h2, [ref]$p2, [ref]$t2)
                                 $p2Norm = ($p2 -replace '\.exe$','').ToLowerInvariant()
-                                $winMatch2 = (($thwnd -le 0) -or ($h2 -eq $thwnd)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $p2Norm))
+                                $curTok2 = if ($expectTok -ne "") { Get-TitleSessionToken $t2 } else { "" }
+                                $tokConflict2 = ($expectTok -ne "") -and ($curTok2 -ne "") -and ($curTok2 -ne $expectTok)
+                                $winMatch2 = (($thwnd -le 0) -or ($h2 -eq $thwnd)) -and (($expectProc -eq "") -or ($p2Norm -eq $expectProc)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $p2Norm)) -and (-not $tokConflict2)
                                 if (-not $winMatch2) {
                                     if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }
                                     if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
                                     Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "focus_changed" } else { "clipboard_failed" }); fg_process = $p2 }
+                                } elseif ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
+                                    if ($fbTxt -ne $txt) { [void](Set-ClipboardSafe $fbTxt) }
+                                    Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "hotkey_held"; fg_process = $p2 }
                                 } else {
-                                    $sent = [VoiceWinShim]::SendCtrlV()
+                                    $sent = [VoiceWinShim]::SendPasteChord($pasteChord)
                                     if ($sent) {
                                         Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $true; clipboard = $true; reason = "ok"; fg_process = $p2 }
                                     } else {

@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from . import __version__
+from .app_scope import (
+    classify_window_category,
+    is_remote_client_window,
+    match_app_patterns,
+)
 from .asr_providers import (
     AsrError,
     AsrResult,
@@ -47,7 +52,7 @@ from .platform_wsl import (
     is_windows_terminal_process,
 )
 from .refiner import BaseRefiner, RefinerResult, create_refiner
-from .session_ctx import SessionSnapshot, SessionTracker
+from .session_ctx import SessionSnapshot, SessionTracker, parse_window_title_hint
 
 
 TELEMETRY_FILENAME: str = "telemetry.jsonl"
@@ -574,6 +579,52 @@ def _transcribe_wav_chunks(
     )
 
 
+def _resolve_pipeline_window_routing(
+    win: ForegroundWindow,
+    *,
+    platform: Any,
+    origin_window: ForegroundWindow | None,
+    window_title_override: str | None,
+    audio_source: str,
+    explicit_mode: str,
+) -> tuple[bool, str]:
+    """Return ``(should_sync_session, refiner_mode)`` for ``run_pipeline_once``."""
+    m = (explicit_mode or "auto").strip().lower()
+    if m == "general":
+        return False, "general"
+    if m == "agent":
+        return True, "agent"
+    if window_title_override is not None or bool(
+        win.tty or win.cwd or win.tmux_pane or win.surface_id
+    ):
+        return True, "agent"
+    if not (win.process or win.bundle_id):
+        if (
+            parse_window_title_hint(win.title) is not None
+            or audio_source in ("file", "selftest_wav", "retry")
+            or (platform is None and origin_window is None)
+        ):
+            return True, "agent"
+        return False, "general"
+    checker = getattr(platform, "is_allowed_terminal", None)
+    is_term = (
+        (lambda w: bool(checker(w)))
+        if checker is not None
+        else (
+            lambda w: is_windows_terminal_process(w.process)
+            or is_macos_terminal_window(w.process, w.bundle_id)
+        )
+    )
+    cat = classify_window_category(win, is_terminal=is_term)
+    if cat == "terminal":
+        return True, "agent"
+    if cat == "coding_gui":
+        # v0.8-3: MUST skip sync_session so WSL2 /proc or macOS fallback never injects an
+        # unrelated background CLI repo's 200K session into VS Code / Cursor / Antigravity IDE!
+        return False, "agent"
+    return False, "general"
+
+
 def run_pipeline_once(
     raw_wav: bytes | str | Path, *, cfg: Config, creds: ProviderCredentials | None = None,
     tracker: SessionTracker | None = None, asr_provider: BaseAsrProvider | None = None,
@@ -588,9 +639,8 @@ def run_pipeline_once(
     max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
     env: Mapping[str, str] | None = None,
     archive_sink: Callable[[threading.Thread], None] | None = None,
-    mode: str = "agent",
+    mode: str = "auto",
 ) -> PipelineResult:
-    eff_mode = "general" if mode == "general" else "agent"
     eff_env = os.environ if env is None else env
     eff_creds = creds or resolve_credentials(cfg, eff_env)
     eff_tracker = tracker or SessionTracker(env=eff_env)
@@ -644,9 +694,17 @@ def run_pipeline_once(
                 pass
         t_sync0 = time.monotonic()
         win = origin_window or (platform.get_foreground_window() if platform else ForegroundWindow())
+        should_sync, eff_mode = _resolve_pipeline_window_routing(
+            win,
+            platform=platform,
+            origin_window=origin_window,
+            window_title_override=window_title_override,
+            audio_source=audio_source,
+            explicit_mode=mode,
+        )
         snap: SessionSnapshot | None = None
         try:
-            if eff_mode != "general":
+            if should_sync:
                 snap = (
                     eff_tracker.sync_session(
                         window_title=win.title,
@@ -1200,6 +1258,27 @@ class VoiceInputDaemon:
             redact_fn=self._redact_str,
         )
 
+    def _is_terminal_window(self, win: ForegroundWindow) -> bool:
+        if (checker := getattr(self.platform, "is_allowed_terminal", None)) is not None:
+            return bool(checker(win))
+        return is_windows_terminal_process(win.process) or is_macos_terminal_window(
+            win.process, win.bundle_id
+        )
+
+    def _start_gate_reason(self, win: ForegroundWindow) -> str | None:
+        hk = self.cfg.hotkey
+        if hk.ignore_apps and match_app_patterns(win, hk.ignore_apps):
+            return "ignored_app"
+        if hk.yield_remote_desktop and is_remote_client_window(win):
+            return "remote_client"
+        scope = (hk.scope or "all").strip().lower()
+        if scope == "all":
+            return None
+        cat = classify_window_category(win, is_terminal=self._is_terminal_window)
+        if cat == "terminal" or (scope == "coding" and cat == "coding_gui"):
+            return None
+        return "non_terminal" if scope == "terminals" else "out_of_scope"
+
     def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False, from_hotkey: bool = False, expected_seq_id: int | None = None) -> dict[str, Any]:
         arrival_ts = self.clock_fn()
         with self._trigger_lock:
@@ -1210,20 +1289,6 @@ class VoiceInputDaemon:
                 if expected_seq_id is not None and (not self._recording_active or self._recording_seq_id != expected_seq_id):
                     return {"ok": False, "ignored": "stale_seq", "state": self.state, "seq_id": self.seq_id}
                 eff_no_paste, eff_silent = bool(no_paste), bool(silent_hud)
-                if (
-                    action in ("toggle", "ptt_start")
-                    and not self._recording_active
-                    and self.cfg.hotkey.only_in_terminals
-                    and not eff_no_paste
-                    and (from_hotkey or window is not None)
-                ):
-                    cand_win = window if window is not None else ForegroundWindow()
-                    if (checker := getattr(self.platform, "is_allowed_terminal", None)) is not None:
-                        allowed = bool(checker(cand_win))
-                    else:
-                        allowed = is_windows_terminal_process(cand_win.process) or is_macos_terminal_window(cand_win.process, cand_win.bundle_id)
-                    if not allowed:
-                        return {"ok": False, "ignored": "non_terminal", "state": self.state, "seq_id": self.seq_id}
                 if expected_seq_id is None and action in ("toggle", "ptt_start") and (arrival_ts - self._last_trigger_ts) * 1000.0 < self.cfg.hotkey.debounce_ms:
                     return {"ok": False, "ignored": "debounced", "state": self.state, "seq_id": self.seq_id}
                 if (
@@ -1248,6 +1313,20 @@ class VoiceInputDaemon:
                 ):
                     self._auto_stop_absorbed = True
                     return {"ok": True, "ignored": "already_stopped", "state": self.state, "seq_id": self.seq_id}
+                if (
+                    action in ("toggle", "ptt_start")
+                    and not self._recording_active
+                    and not eff_no_paste
+                    and (from_hotkey or window is not None)
+                ):
+                    cand_win = window if window is not None else ForegroundWindow()
+                    if (blocked := self._start_gate_reason(cand_win)) is not None:
+                        return {
+                            "ok": False,
+                            "ignored": blocked,
+                            "state": self.state,
+                            "seq_id": self.seq_id,
+                        }
                 now = self.clock_fn()
                 resume_state = "idle"
                 stop_hud_stage = "recognizing"

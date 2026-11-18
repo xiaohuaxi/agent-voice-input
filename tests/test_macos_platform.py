@@ -298,14 +298,14 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             plat = MacOSPlatform(cfg, env={"HOME": td}, cache_dir=Path(td) / "cache")
             plat.beep = lambda kind: beeps.append(kind)  # type: ignore[method-assign]
 
-            # Case 1: Same Ghostty surface -> direct input text succeeds via argv
+            # Case 1: Same Ghostty surface -> direct input text succeeds via argv without touching clipboard
             out_ok = plat.deliver_text(tricky_text, seq_id=1, origin_window=origin)
             self.assertTrue(out_ok.pasted)
-            self.assertTrue(out_ok.clipboard)
+            self.assertFalse(out_ok.clipboard)
             self.assertEqual(out_ok.reason, "ok")
             self.assertEqual(out_ok.fg_process, "Ghostty")
             self.assertEqual(osa_invocations[-1][5], tricky_text)
-            self.assertEqual(clipboard_writes[-1], tricky_text)
+            self.assertEqual(clipboard_writes, [])
             self.assertEqual(beeps, [])
 
             # Case 2: User switched split or tab inside Ghostty -> focus_changed, keeps clipboard, plays focus cue
@@ -1108,7 +1108,11 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 rec_starts.clear()
 
                 daemon = VoiceInputDaemon(
-                    Config(audio=AudioConfig(beep=True), refiner=RefinerConfig(provider="off")),
+                    Config(
+                        hotkey=HotkeyConfig(scope="terminals"),
+                        audio=AudioConfig(beep=True),
+                        refiner=RefinerConfig(provider="off"),
+                    ),
                     env={"HOME": str(tmp)},
                     runtime_dir=tmp / "rt",
                     platform=plat,
@@ -1117,17 +1121,17 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     tracker=SessionTracker(home_dir=tmp, env={"HOME": str(tmp)}, runtime_dir=tmp / "rt", proc_root=tmp / "noproc"),
                 )
                 try:
-                    # 2. Frontmost Windows App (RDP) or Safari or empty window -> ignored="non_terminal" with zero side effects
-                    for non_term in (
-                        ForegroundWindow(0, "Windows App", "", bundle_id="com.microsoft.rdc.macos", pid=810),
-                        ForegroundWindow(0, "Safari", "", bundle_id="com.apple.Safari", pid=811),
-                        ForegroundWindow(),
+                    # 2. Frontmost Windows App (RDP) yields as "remote_client"; Safari or empty window -> "non_terminal"
+                    for non_term, exp_reason in (
+                        (ForegroundWindow(0, "Windows App", "", bundle_id="com.microsoft.rdc.macos", pid=810), "remote_client"),
+                        (ForegroundWindow(0, "Safari", "", bundle_id="com.apple.Safari", pid=811), "non_terminal"),
+                        (ForegroundWindow(), "non_terminal"),
                     ):
                         prev_ts = daemon._last_trigger_ts
                         res_ig = daemon.handle_trigger("toggle", non_term, from_hotkey=True)
                         self.assertEqual(
                             res_ig,
-                            {"ok": False, "ignored": "non_terminal", "state": "idle", "seq_id": 0},
+                            {"ok": False, "ignored": exp_reason, "state": "idle", "seq_id": 0},
                         )
                         self.assertEqual(daemon.state, "idle")
                         self.assertEqual(daemon.seq_id, 0)
@@ -1179,7 +1183,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 finally:
                     daemon.close()
 
-                # 5. only_in_terminals = False allows starting recording even in Windows App
+                # 5. only_in_terminals = False allows Safari while yielding Windows App unless yield_remote_desktop=False
                 daemon_all = VoiceInputDaemon(
                     Config(hotkey=HotkeyConfig(only_in_terminals=False), refiner=RefinerConfig(provider="off")),
                     env={"HOME": str(tmp)},
@@ -1191,6 +1195,13 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 )
                 try:
                     cur_app[:] = ["Windows App", "com.microsoft.rdc.macos", "810", "Win11 Remote"]
+                    r_yield = daemon_all.handle_trigger(
+                        "toggle",
+                        ForegroundWindow(0, "Windows App", "", bundle_id="com.microsoft.rdc.macos", pid=810),
+                        from_hotkey=True,
+                    )
+                    self.assertEqual(r_yield["ignored"], "remote_client")
+                    daemon_all.cfg.hotkey.yield_remote_desktop = False
                     r_any = daemon_all.handle_trigger(
                         "toggle",
                         ForegroundWindow(0, "Windows App", "", bundle_id="com.microsoft.rdc.macos", pid=810),
@@ -1202,10 +1213,16 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     daemon_all.close()
 
     def test_mac_shim_static_invariants(self) -> None:
-        self.assertEqual(SHIM_SCHEMA_VERSION, 3)
+        self.assertEqual(SHIM_SCHEMA_VERSION, 4)
         self.assertTrue(MAC_SHIM_SCRIPT.is_file())
         src = MAC_SHIM_SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn("import Carbon", src)
+        self.assertIn("AVI_INJECT_TAG", src)
+        self.assertIn("paste_cmd_v", src)
+        self.assertIn("CGPreflightPostEventAccess()", src)
+        self.assertIn("expect_bundle_id", src)
+        self.assertIn("expect_hwnd", src)
+        self.assertIn("events.append(ev)", src)
         self.assertIn("import AVFoundation", src)
         self.assertIn("import CoreAudio", src)
         self.assertIn("import Security", src)
@@ -3776,14 +3793,14 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertEqual(pbcopy_payloads, ["分屏A未贴第一段"])
 
                 out_tmux_normal = plat.deliver_text(
-                    "常规单段tmux同步剪贴板",
+                    "常规单段tmux直投亦不碰剪贴板",
                     seq_id=21,
                     origin_window=tmux_win,
                     preserve_clipboard=False,
                 )
                 self.assertTrue(out_tmux_normal.pasted)
-                self.assertTrue(out_tmux_normal.clipboard)
-                self.assertEqual(pbcopy_payloads[-1], "常规单段tmux同步剪贴板")
+                self.assertFalse(out_tmux_normal.clipboard)
+                self.assertEqual(pbcopy_payloads, ["分屏A未贴第一段"])
             finally:
                 daemon.close()
 

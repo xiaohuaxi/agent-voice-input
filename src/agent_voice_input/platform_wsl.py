@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .app_scope import normalize_app_token, resolve_windows_paste_chord
 from .asr_providers import _sleep_cooperative
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, normalize_ui_position, redact_secrets
@@ -17,6 +18,7 @@ from .hud import (
     recording_countdown_warn_sec,
     resolve_ui_language,
 )
+from .session_ctx import parse_window_title_hint
 
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 WSLG_PULSE_SOCK = "/mnt/wslg/PulseServer"
@@ -1376,11 +1378,50 @@ class WslPlatform(JsonlShimMixin):
     ) -> PasteOutcome:
         del preserve_clipboard
         eff_hwnd = target_hwnd or (origin_window.hwnd if origin_window is not None else 0)
+        origin_proc = normalize_app_token(origin_window.process) if origin_window is not None else ""
+        known_origin = (eff_hwnd > 0) or bool(origin_proc)
+        expect_terminal = not known_origin
+        paste_chord = resolve_windows_paste_chord(origin_proc) if origin_proc else "ctrl_v"
         cancelled_fn = lambda: bool(is_cancelled is not None and is_cancelled())
+
+        def _fallback_clipboard_via_shim() -> PasteOutcome:
+            fb_req: dict[str, Any] = {
+                "cmd": "paste",
+                "seq_id": seq_id,
+                "text": text,
+                "target_hwnd": eff_hwnd,
+                "expect_terminal": expect_terminal,
+                "expect_process": origin_proc,
+                "paste_chord": paste_chord,
+                "force_clipboard_only": True,
+            }
+            if fallback_clipboard_text is not None:
+                fb_req["fallback_text"] = fallback_clipboard_text
+            if bool(suppress_beep() if callable(suppress_beep) else suppress_beep):
+                fb_req["suppress_beep"] = True
+            res_fb = self._dispatch_paste_rpc(fb_req, timeout_sec=5.0)
+            clip_ok = bool(res_fb.get("clipboard"))
+            fg_proc_fb = str(res_fb.get("fg_process") or "")
+            return PasteOutcome(
+                False,
+                clip_ok,
+                "focus_changed" if clip_ok else str(res_fb.get("reason") or "clipboard_failed"),
+                fg_proc_fb,
+                used_clipboard_paste=False,
+            )
+
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", "")
         if before_clipboard_write is not None:
             before_clipboard_write()
+        orig_session_tok = ""
+        if (
+            origin_window is not None
+            and is_windows_terminal_process(origin_proc)
+            and (orig_hint := parse_window_title_hint(origin_window.title)) is not None
+        ):
+            orig_session_tok = orig_hint.session_token
+
         hold_deadline = time.monotonic() + self._effective_paste_hold_timeout_sec()
         while True:
             if cancelled_fn():
@@ -1390,8 +1431,12 @@ class WslPlatform(JsonlShimMixin):
                 "seq_id": seq_id,
                 "text": text,
                 "target_hwnd": eff_hwnd,
-                "expect_terminal": True,
+                "expect_terminal": expect_terminal,
+                "expect_process": origin_proc,
+                "paste_chord": paste_chord,
             }
+            if orig_session_tok:
+                req["expect_session_token"] = orig_session_tok
             if fallback_clipboard_text is not None and fallback_clipboard_text != text:
                 req["fallback_text"] = fallback_clipboard_text
             if bool(suppress_beep() if callable(suppress_beep) else suppress_beep):
@@ -1416,25 +1461,4 @@ class WslPlatform(JsonlShimMixin):
 
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", "")
-        fb_req: dict[str, Any] = {
-            "cmd": "paste",
-            "seq_id": seq_id,
-            "text": text,
-            "target_hwnd": eff_hwnd,
-            "expect_terminal": True,
-            "force_clipboard_only": True,
-        }
-        if fallback_clipboard_text is not None:
-            fb_req["fallback_text"] = fallback_clipboard_text
-        if bool(suppress_beep() if callable(suppress_beep) else suppress_beep):
-            fb_req["suppress_beep"] = True
-        res_fb = self._dispatch_paste_rpc(fb_req, timeout_sec=5.0)
-        clip_ok = bool(res_fb.get("clipboard"))
-        fg_proc = str(res_fb.get("fg_process") or "")
-        return PasteOutcome(
-            False,
-            clip_ok,
-            "focus_changed" if clip_ok else str(res_fb.get("reason") or "clipboard_failed"),
-            fg_proc,
-            used_clipboard_paste=False,
-        )
+        return _fallback_clipboard_via_shim()

@@ -14,10 +14,10 @@
   - [x] 扩展 `voice-eval` 支持存量录音按会话时间点（Point-in-Time）回放评测（产出限定仓外缓存目录）；
   - [x] 重构 `REFINER_SYSTEM_PROMPT`（解开 Rule 2/Rule 3 折返与车轱辘话清理死锁、放开跨会话通用技术术语谐音纠偏、前置 `<workspace_git_status>`、锁定 `/responses` 历史块 `developer` 前缀缓存角色、自适应 `agent` / `general` 双子规则）；
   - [x] 补齐 Stage 1 热词提取（扩展 `_TECH_IDENT_RE` 覆盖 `PascalCase` / `kebab-case` / `.jsonl`、干净工作树 `git log` / `ls-files` 核心文件名兜底、内置低优通用 AI/CLI 词表并严守豆包等窄配额）。
-- [ ] **`v0.8-3` 全局通用语音输入、远程桌面让行与双端安全投递**：
-  - [ ] 新增 `hotkey.scope = "all" | "coding" | "terminals"`（默认 `"all"`，兼容 `only_in_terminals`）及 `hotkey.yield_remote_desktop = true` + `ignore_apps`（排除裸 `msrdc.exe` 防误伤 Win11 WSLg）；
-  - [ ] 普通非 Agent 窗口硬隔离 `SessionTracker.sync_session` 防跨场景上下文串台，全场景保持不自动回车；
-  - [ ] 修复 WSL2/macOS 非终端投递门禁死锁、WSL2 `tmux` 直投与 Windows 终端进程级粘贴键路由、macOS GUI 动态标题放宽与 `mac_shim` 原生 `CGEvent Cmd+V`、移除直投写剪贴板并补齐模拟粘贴剪贴板快照恢复。
+- [x] **`v0.8-3` 全局通用语音输入、远程桌面让行与双端安全投递**：
+  - [x] 新增 `hotkey.scope = "all" | "coding" | "terminals"`（默认 `"all"`，双向兼容 `only_in_terminals`）及 `hotkey.yield_remote_desktop = true` + `ignore_apps`（排除裸 `msrdc.exe` 防误伤 Win11 WSLg）；
+  - [x] 窗口三分类（`terminal` / `coding_gui` / `general_gui`）：非终端窗口硬跳过 `SessionTracker.sync_session` 防后台 CLI 会话串台（`coding_gui` 走无历史 `agent` 模式、`general_gui` 走 `general` 模式），全场景保持不自动回车；
+  - [x] 修复 WSL2/macOS 非终端投递门禁死锁与 `$TMUX` 跨窗误投、Windows 终端进程级粘贴键路由（`Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert` 含 `VK_INSERT` 扩展键标志）与 `[#id8]` 会话标记冲突检测、macOS GUI 动态标题放宽与 `mac_shim` 零 `Carbon` 原生 `CGEvent Cmd+V`、移除 Ghostty/`tmux` 直投写剪贴板（放弃存在后台 Tab 盲贴风险的 WSL2 `tmux` 直投；模拟粘贴剪贴板多格式备份恢复归入 `v0.9-2` 单进程状态机专项）。
 
 ### `v0.9.0`：2026 模型换代、原生音频单跳落定、操控流畅度与桌面感知
 - [ ] **`v0.9-1` 单跳原生音频缓存对齐、2026 模型换代与双轨实测横评**：

@@ -29,10 +29,10 @@
 
 ## 核心亮点
 
-- **精准绑定当前活跃 Agent 上下文**：自动识别前台终端窗口、Ghostty 分屏或 `tmux` 焦点窗格（无需修改 `~/.tmux.conf`）中的主 Agent 会话，增量抽取最近对话与 `git status` 变更文件名供精修纠偏，严格隔离后台 subagent 与相邻分屏。
+- **精准绑定活跃 Agent 上下文，同时开箱通用全桌面**：在终端内自动识别前台窗口、Ghostty 分屏或 `tmux` 焦点窗格（无需修改 `~/.tmux.conf`）中的主 Agent 会话，增量抽取最近对话与 `git status` 变更文件名纠偏，严格隔离后台 subagent 与相邻分屏；同时默认支持任意桌面窗口语音输入（`hotkey.scope = "all"`，亦可设为 `"coding"` 或 `"terminals"`）：IDE / 代码编辑器使用隔离后台会话历史的编程模式精修，日常聊天/浏览器/文档自动切换无代码偏置的通用顺句模式，聚焦远程桌面/虚拟机客户端时自动静默让行热键（`yield_remote_desktop = true`）。
 - **按渠道即插即用的「识别 + 精修」双引擎**：默认采用「极速语音转写 + 复用本机 `codex` 登录态的无状态 Keep-Alive 精修」，也支持切换任意内置云端/本地 API 渠道，或使用 Gemini / OpenRouter 多模态单跳直出；日常只需指定 `provider`，自动匹配对应渠道的默认模型。
 - **面向长口述与连续口述的可靠录音链**：支持在上一句转写/精修期间直接开始下一段录音并按序串行上屏（切走窗口回退剪贴板的多段结果自动空行拼接、不覆盖前文）；内置静音门控与响度归一化拦截空触；单次默认最长 10 分钟（最后 15 秒胶囊倒计时提示），超过 3 分钟的长语音自动挑自然停顿处切分并并发转写；无麦克风或中途掉麦即时提醒；转写或上屏失败自动暂存音频，随时用 `agent-voice-input retry` 恢复，绝不丢话。
-- **原生高分屏波形胶囊与防串窗安全粘贴**：Windows（Per-Monitor V2 HiDPI）与 macOS（Retina 原生面板）均提供不抢焦点的悬浮胶囊（计时、实时声波与阶段进度自动跟随系统中英文）；开始录音即锁定目标终端窗口/分屏，只粘贴不自动回车，中途切走焦点则自动退回剪贴板防误投。
+- **原生高分屏波形胶囊与防串窗安全粘贴**：Windows（Per-Monitor V2 HiDPI）与 macOS（Retina 原生面板）均提供不抢焦点的悬浮胶囊（计时、实时声波与阶段进度自动跟随系统中英文）；开始录音即锁定目标窗口/分屏，按进程自动路由粘贴快捷键（Windows 区分 `Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert`；macOS 在 Ghostty 与 `tmux` 内零触碰系统剪贴板直投，其余窗口走原生 `CGEvent` `Cmd+V`），只粘贴不自动回车，中途切走焦点则自动退回剪贴板防误投。
 - **零第三方 Python 依赖**：仅使用 Python `>= 3.10` 标准库与宿主机 `ffmpeg`（WSL2 复用系统内置 `powershell.exe`，macOS 首次启动自动编译缓存原生 `mac_shim`）。
 
 ---
@@ -90,15 +90,15 @@ agent-voice-input start
 
 ### Windows Terminal + WSL2（含远程桌面与 `tmux`）
 
-- **默认终端内热键与高分屏胶囊**：默认单击右 Ctrl（`RControl`）开始/完成录音（组合键如 `RControl+C` 原样放行；仅在前台为终端窗口时启动新录音，录音中途切到别的应用仍可正常结束），屏幕底部（或顶部）显示原生 Per-Monitor V2 高分屏抗锯齿波形胶囊。
+- **全局热键作用域、远程桌面让行与高分屏胶囊**：默认单击右 Ctrl（`RControl`）即可在终端、IDE 与日常桌面应用中开始/完成录音（`hotkey.scope = "all"`，可选 `"coding"` / `"terminals"`；组合键如 `RControl+C` 原样放行，录音中途切到别的应用仍可正常结束），屏幕底部（或顶部）显示原生 Per-Monitor V2 高分屏抗锯齿波形胶囊。聚焦远程桌面/虚拟机客户端（`mstsc`、`vmconnect`、Parsec、RustDesk 等）时自动静默让行新热键触发（`yield_remote_desktop = true`；默认不拦截裸 `msrdc` 以保护 Win11 本地 WSLg 应用，不使用 WSLg 的 Azure Virtual Desktop / Windows 365 用户可在配置中添加 `ignore_apps = ["msrdc"]`），并按终端进程自动路由 `Ctrl+V`、`Ctrl+Shift+V`（`WezTerm`、`Alacritty`、`Tabby`、`Hyper` 等）与 `Shift+Insert`（`mintty`、`PuTTY`、`KiTTY`）。
 - **原生 WASAPI 采集，告别 WSLg 与远程桌面卡顿**：默认通过常驻 `win_shim` 直接调用 Windows 原生 WASAPI 16 kHz 采集音频，彻底避开 WSLg `RDPSource` 休眠零包死锁；默认关闭起止提示音以避免远程桌面（RDP）1–2 秒音频通道唤醒延迟。
 - **`tmux` 分屏开箱即用**：无需改动 `~/.tmux.conf`，自动追踪当前 attached 客户端的焦点窗格并隔离相邻后台分屏。
 
 ### macOS（`Ghostty`、系统自带 `Terminal.app` 与 `tmux`）
 
-- **原生胶囊与终端感知安全投递**：通过缓存的原生 `mac_shim` 监听右 Ctrl（或 `ptt` 按住说话）并渲染 Retina 悬浮波形胶囊。在 **Ghostty** 中锁定聚焦分屏 surface 直接注入文本；在**系统自带「终端」（`Terminal.app`）**及其他终端中锁定窗口 ID 与当前标签页 `tty`，连接 `tmux` 时直投对应焦点窗格，常规 shell 下经剪贴板 + `Cmd+V` 粘贴，中途切换窗口或标签页均自动退回剪贴板防误投。
-- **零钩子标签页/分屏与 `tmux` 会话关联**：直接读取 Ghostty 分屏 `tty`/`cwd`、`Terminal.app` 当前选中标签页 `tty` 或终端窗口子进程 PTY 树（连接 `tmux` 时进一步定位对应焦点窗格），精准匹配当前标签页内的 `codex`、`claude` 或 `agy` 活跃会话并严格隔离其他终端窗口；录音设备默认跟随系统麦克风（可通过 `[audio] macos_device` 指定）。
-- **轻量系统权限（TCC）**：需授予**麦克风权限**（供 `ffmpeg` 录音），以及按所用终端授予一次**自动化（Automation → Ghostty 或 Terminal）**确认；默认 `RControl` 修饰键热键**不需要**开启「输入监控（Input Monitoring）」，且在 Ghostty 或 `tmux` 会话内上屏**不需要**「辅助功能（Accessibility）」（仅在非 Ghostty 终端的普通非 `tmux` 标签页模拟 `Cmd+V` 时按需授权）。
+- **原生胶囊与跨场景安全投递**：通过缓存的原生 `mac_shim` 监听右 Ctrl（或 `ptt` 按住说话）、在远程桌面/虚拟机窗口（`Windows App`、`屏幕共享`、Parsec、VMware/Parallels 等）静默让行热键并渲染 Retina 悬浮波形胶囊。在 **Ghostty** 与 **`tmux`** 中直接注入文本且零触碰系统剪贴板；在其他终端、IDE 及桌面 GUI 应用中锁定起点窗口 ID 并通过原生 `CGEvent` `Cmd+V` 粘贴，中途切换窗口或标签页均自动退回剪贴板防误投。
+- **零钩子标签页/分屏与 `tmux` 会话关联**：直接读取 Ghostty 分屏 `tty`/`cwd`、`Terminal.app` 当前选中标签页 `tty` 或终端窗口子进程 PTY 树（连接 `tmux` 时进一步定位对应焦点窗格），精准匹配当前标签页内的 `codex`、`claude` 或 `agy` 活跃会话，并在非终端 GUI 窗口中硬隔离后台 CLI 会话防跨仓串台；录音设备默认跟随系统麦克风（可通过 `[audio] macos_device` 指定）。
+- **轻量系统权限（TCC）**：需授予**麦克风权限**（供 `ffmpeg` 录音），以及按所用终端授予一次**自动化（Automation → Ghostty 或 Terminal）**确认；默认 `RControl` 修饰键热键**不需要**开启「输入监控（Input Monitoring）」，向桌面 GUI 应用及非 `tmux` 下的非 Ghostty 终端发送原生 `Cmd+V` 粘贴时需为宿主终端开启「辅助功能（Accessibility）」（仅在 Ghostty 或 `tmux` 内直投时无需该权限）。
 
 ---
 

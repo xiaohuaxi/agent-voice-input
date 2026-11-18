@@ -82,15 +82,15 @@
   1. **全局作用域配置与远程桌面静默让行**（[`src/agent_voice_input/config.py`](../src/agent_voice_input/config.py)、[`src/agent_voice_input/daemon.py`](../src/agent_voice_input/daemon.py)）：
      - 新增 `hotkey.scope = "all" | "coding" | "terminals"`（默认 `"all"`，向后兼容旧字段 `only_in_terminals`）；
      - 新增 `hotkey.yield_remote_desktop = true`（默认开启）与 `hotkey.ignore_apps` 自定义扩展列表：当聚焦双端远程桌面/串流/虚拟机客户端（如 macOS `Windows App`、`Screen Sharing`、`Parsec`、`RustDesk`、`VMware`、`Parallels`；Windows `mstsc`、`vmconnect` 等，**刻意排除裸 `msrdc.exe` 以免误伤 Win11 本地 WSLg Linux GUI 窗口**）且本地未处于录音态时，热键启动入口 100% 静默让行给远端响应；若本地已在录音中切入远程窗口，仍允许正常按键停止收尾。
-  2. **非终端/非 Agent 窗口上下文硬隔离**：当前台窗口属于普通非 Agent 应用（`general` 模式）时，强制跳过 `SessionTracker.sync_session`，彻底杜绝 WSL2 `/proc` 全局扫描、后台挂接 `tmux` 或 macOS 磁盘历史会话回退把无关代码仓 200K 上下文串台注入日常聊天/写作请求，并严格保持不自动回车。
-  3. **修复双端非终端投递死锁、粘贴键路由与剪贴板免污染保护**（[`src/agent_voice_input/platform_wsl.py`](../src/agent_voice_input/platform_wsl.py)、[`src/agent_voice_input/platform_macos.py`](../src/agent_voice_input/platform_macos.py)）：
-     - 解除 WSL2 `deliver_text` 硬编码 `"expect_terminal": True` 与 macOS `deliver_text` 硬编码 `not self.is_allowed_terminal(fg)` 导致的非终端永不粘贴 Bug，改为锁定录音起点窗口句柄与进程/Bundle ID；
-     - WSL2 新增活跃 `tmux` 窗格 `paste-buffer -d -p` 免剪贴板直投；`win_shim.ps1` 建立进程级粘贴组合键路由（GUI / IDE / Windows Terminal 走 `Ctrl+V`；`alacritty` / `wezterm` / `kitty` / `rio` / `ghostty` 走 `Ctrl+Shift+V`；`mintty` / `putty` 走 `Shift+Insert`）及同窗口切 Tab 标题漂移核对；
-     - macOS 对同 `hwnd` + 同 `bundle_id` 的非终端 GUI 窗口放宽动态标题漂移判定（防流式对话标题或编辑器未保存标记中断粘贴），并将慢速 `osascript` `Cmd+V` 下沉至 `mac_shim.swift` 原生 `CGEvent` 虚拟键注入；
-     - 移除 macOS Ghostty / `tmux` 直投成功路径多余的写剪贴板调用，并为模拟按键粘贴路径增加纯文本剪贴板快照备份与延迟恢复（仅焦点切走退回剪贴板保底时保留识别文本）。
+  2. **非终端窗口上下文硬隔离与三分类路由**：将目标窗口划分为 `terminal`、`coding_gui` 与 `general_gui`，非终端窗口强制跳过 `SessionTracker.sync_session`，彻底杜绝 WSL2 `/proc` 全局扫描、后台挂接 `tmux` 或 macOS 磁盘历史会话回退把无关代码仓 200K 上下文串台注入桌面 IDE 或日常聊天/写作请求（`coding_gui` 走保留代码符号纠偏与内置技术热词的无历史 `agent` 模式，`general_gui` 走纯日常顺句 `general` 模式），并严格保持不自动回车。
+  3. **修复双端非终端投递死锁、粘贴键路由与直投剪贴板免污染保护**（[`src/agent_voice_input/platform_wsl.py`](../src/agent_voice_input/platform_wsl.py)、[`src/agent_voice_input/platform_macos.py`](../src/agent_voice_input/platform_macos.py)）：
+     - 解除 WSL2 `deliver_text` 硬编码 `"expect_terminal": True` 与 macOS `deliver_text` 硬编码 `not self.is_allowed_terminal(fg)` 导致的非终端永不粘贴 Bug（并为 macOS 两处 `tmux` 分支补齐前台终端门禁防 `$TMUX` 后台串窗），改为锁定录音起点窗口句柄与进程/Bundle ID；
+     - `win_shim.ps1` 建立进程级粘贴组合键路由（GUI / IDE / Windows Terminal 走 `Ctrl+V`；`alacritty` / `wezterm` / `rio` / `ghostty` / `tabby` / `hyper` 走 `Ctrl+Shift+V`；`mintty` / `putty` / Windows `kitty` 走带 `KEYEVENTF_EXTENDEDKEY` 的 `Shift+Insert`）及同窗口 `[#id8]` 会话标记冲突核对（明确不做无法感知当前激活 Tab 的 WSL2 `tmux` 隔空直投，防误贴后台 Tab）；
+     - macOS 对同 `hwnd (>0)` + 同 `bundle_id` 的非终端 GUI 窗口放宽动态标题漂移判定（防流式对话标题或编辑器未保存标记中断粘贴），并将慢速 `osascript` `Cmd+V` 下沉至 `mac_shim.swift` 零 `Carbon` 原生 `CGEvent` 虚拟键注入（无 shim 时兼容回退 `osascript`）；
+     - 移除 macOS Ghostty / `tmux` 直投成功路径多余的写剪贴板调用，实现直投路径 100% 零触碰系统剪贴板（模拟按键粘贴路径的剪贴板多格式备份恢复留归 `v0.9-2` 单进程状态机专项）。
 - **验证方式**：
-  - **自动闭环**：`PYTHONPATH=src python3 -m unittest discover -s tests -v`（覆盖 `scope` 门禁、远程客户端静默让行与 WSLg `msrdc` 豁免、非终端 `sync_session` 硬隔离、进程粘贴键路由纯函数、直投零剪贴板触碰与快照恢复单测）+ `mac_shim --self-check` + `e2e_system.py`（同步更新 `config.example.toml`、`README.md` 与 `README.zh-CN.md`）。
-  - **真机薄验收**：① Mac 全屏 `Windows App` 连远端 Windows/WSL2 按热键验证本地零弹窗零抢麦、远端正常触发；② 双端在浏览器、聊天应用、IDE 与跨平台终端（WezTerm / Mintty）验证原地落字及原剪贴板内容恢复；③ macOS 非 Ghostty GUI 首次粘贴验证辅助功能（Accessibility）提示与剪贴板回退兜底。
+  - **自动闭环**：`PYTHONPATH=src python3 -m unittest discover -s tests -v`（覆盖 `scope` 门禁、远程客户端静默让行与 WSLg `msrdc` 豁免、非终端 `sync_session` 硬隔离、进程粘贴键路由纯函数、`$TMUX` 隔离与直投零剪贴板触碰单测）+ `win_shim.ps1` `.NET` 编译校验 + `e2e_system.py`（同步更新 `config.example.toml`、`README.md` 与 `README.zh-CN.md`）。
+  - **真机薄验收**：① Mac 全屏 `Windows App` 连远端 Windows/WSL2 按热键验证本地零弹窗零抢麦、远端正常触发；② 双端在浏览器、聊天应用、IDE 与跨平台终端（WezTerm / Mintty）验证原地落字及 Ghostty/`tmux` 直投原剪贴板内容保留；③ macOS 非 Ghostty GUI 首次粘贴验证辅助功能（Accessibility）提示与剪贴板回退兜底。
 
 ---
 
