@@ -14,6 +14,7 @@ from .config import (
     ConfigError,
     expand_user_path,
     get_runtime_dir,
+    is_dashscope_omni_chat_model,
     load_config,
     load_env_files,
     redact_secrets,
@@ -204,8 +205,16 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
     ref_prov = cfg.refiner.provider.strip().lower()
     eff_ref_api = cfg.refiner.effective_api(ref_prov)
     prompt_tag = ", prompt=custom" if cfg.refiner.prompt.strip() else ""
+    asr_is_single_hop = eff_asr_api == "gemini-native" or (
+        eff_asr_api == "chat-completions"
+        and (eff_asr != "dashscope" or is_dashscope_omni_chat_model(eff_asr_model, cfg.asr.base_url))
+    )
     if eff_ref_api == "off":
         print("[refiner]   off")
+    elif asr_is_single_hop and not cfg.refiner.force_on_single_hop:
+        print(
+            f"[refiner]   bypassed (single-hop ASR passthrough; set refiner.force_on_single_hop=true to run {ref_prov})"
+        )
     elif ref_prov == "codex":
         eff_ref_model = cfg.refiner.effective_model("codex")
         auth_ok, auth_note = inspect_codex_auth_status(cfg, env)

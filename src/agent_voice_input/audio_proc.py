@@ -28,6 +28,8 @@ PEAK_LIMIT_RATIO = 0.99
 PEAK_LIMIT_INT16 = int(round(PEAK_LIMIT_RATIO * 32767))  # 32440
 
 DEFAULT_MAX_CHUNK_SEC = 180.0
+SINGLE_HOP_MAX_CHUNK_SEC = 610.0
+SINGLE_HOP_MP3_MIN_WAV_BYTES = 96_000
 DEFAULT_SEARCH_WINDOW_SEC = 45.0
 _SPLIT_FRAME_SAMPLES = 320  # 20 ms @ 16 kHz (50 fps)
 
@@ -229,6 +231,55 @@ def ensure_16k_mono_s16_wav(
     """Return canonical 16 kHz 16-bit mono PCM WAV bytes without level scaling."""
     pcm = decode_to_16k_mono_pcm(wav_input, ffmpeg_bin=ffmpeg_bin, timeout_sec=timeout_sec)
     return pack_pcm16_mono_wav(pcm, sample_rate=TARGET_SAMPLE_RATE)
+
+
+def encode_wav_to_mp3_bytes(
+    wav_bytes: bytes,
+    *,
+    ffmpeg_bin: str = "/usr/bin/ffmpeg",
+    timeout_sec: float = 15.0,
+) -> bytes | None:
+    """Compress PCM WAV bytes in-memory to 16 kHz mono 64 kbps MP3; returns None on failure or non-shrink."""
+    if not wav_bytes:
+        return None
+    try:
+        exe = resolve_ffmpeg_bin(ffmpeg_bin)
+        proc = subprocess.run(
+            [
+                exe,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "wav",
+                "-i",
+                "pipe:0",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                str(TARGET_SAMPLE_RATE),
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "64k",
+                "-f",
+                "mp3",
+                "pipe:1",
+            ],
+            input=wav_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except Exception:
+        return None
+    out = proc.stdout or b""
+    if proc.returncode != 0 or not out or len(out) >= len(wav_bytes):
+        return None
+    return out
 
 
 def process_wav(

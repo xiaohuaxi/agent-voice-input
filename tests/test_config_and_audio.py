@@ -24,7 +24,10 @@ if str(_SRC_ROOT) not in sys.path:
 from agent_voice_input.audio_proc import (  # noqa: E402
     DEFAULT_MAX_CHUNK_SEC,
     PEAK_LIMIT_INT16,
+    SINGLE_HOP_MAX_CHUNK_SEC,
+    SINGLE_HOP_MP3_MIN_WAV_BYTES,
     decode_to_16k_mono_pcm,
+    encode_wav_to_mp3_bytes,
     inspect_wav_chunks,
     list_failed_audios,
     pack_pcm16_mono_wav,
@@ -41,7 +44,9 @@ from agent_voice_input.config import (  # noqa: E402
     DEFAULT_ASR_BASE_URLS,
     DEFAULT_ASR_MODELS,
     DEFAULT_REFINER_BASE_URLS,
+    DEFAULT_REFINER_EFFORTS,
     DEFAULT_REFINER_MODELS,
+    RefinerConfig,
     VALID_ASR_APIS,
     VALID_ASR_PROVIDERS,
     VALID_EFFORTS,
@@ -50,6 +55,7 @@ from agent_voice_input.config import (  # noqa: E402
     classify_asr_model_api,
     ensure_secure_dir,
     get_runtime_dir,
+    is_dashscope_omni_chat_model,
     load_config,
     load_env_files,
     parse_env_text,
@@ -223,7 +229,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg.hotkey.tap_max_ms, 900)
             self.assertEqual(cfg.hotkey.debounce_ms, 180)
             self.assertEqual(cfg.asr.provider, "gemini")
-            self.assertEqual(cfg.asr.effective_model(), "gemini-2.5-flash")
+            self.assertEqual(cfg.asr.effective_model(), "gemini-3.5-flash-lite")
             self.assertEqual(cfg.refiner.provider, "off")
             self.assertEqual(cfg.refiner.effort, "medium")
 
@@ -799,24 +805,30 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(dcfg.refiner.model, "gpt-6-luna")
         self.assertEqual(dcfg.refiner.effort, "low")
 
-        # Built-in default models & base_urls strictly match v0.2.0 table
+        # Built-in default models, efforts & base_urls strictly match v0.9-1 table
         self.assertEqual(DEFAULT_ASR_MODELS["dashscope"], "qwen3-asr-flash")
         self.assertEqual(DEFAULT_ASR_MODELS["doubao"], "bigmodel")
         self.assertEqual(DEFAULT_ASR_MODELS["openrouter"], "qwen/qwen3-asr-1.7b")
-        self.assertEqual(DEFAULT_ASR_MODELS["gemini"], "gemini-2.5-flash")
+        self.assertEqual(DEFAULT_ASR_MODELS["gemini"], "gemini-3.5-flash-lite")
         self.assertEqual(DEFAULT_ASR_MODELS["openai"], "gpt-4o-mini-transcribe")
         self.assertEqual(DEFAULT_ASR_MODELS["groq"], "whisper-large-v3-turbo")
         self.assertEqual(DEFAULT_ASR_MODELS["siliconflow"], "FunAudioLLM/SenseVoiceSmall")
         self.assertEqual(DEFAULT_ASR_MODELS["openai-compatible"], "gpt-4o-mini-transcribe")
 
         self.assertEqual(DEFAULT_REFINER_MODELS["codex"], "gpt-6-luna")
-        self.assertEqual(DEFAULT_REFINER_MODELS["dashscope"], "qwen-turbo-latest")
-        self.assertEqual(DEFAULT_REFINER_MODELS["volcengine"], "doubao-seed-1-6-flash")
-        self.assertEqual(DEFAULT_REFINER_MODELS["openrouter"], "google/gemini-2.5-flash-lite")
-        self.assertEqual(DEFAULT_REFINER_MODELS["gemini"], "gemini-2.5-flash-lite")
+        self.assertEqual(DEFAULT_REFINER_MODELS["dashscope"], "qwen3.8-flash")
+        self.assertEqual(DEFAULT_REFINER_MODELS["volcengine"], "doubao-seed-2-0-mini-260428")
+        self.assertEqual(DEFAULT_REFINER_MODELS["openrouter"], "google/gemini-3.5-flash-lite")
+        self.assertEqual(DEFAULT_REFINER_MODELS["gemini"], "gemini-3.5-flash-lite")
         self.assertEqual(DEFAULT_REFINER_MODELS["openai"], "gpt-4o-mini")
         self.assertEqual(DEFAULT_REFINER_MODELS["groq"], "llama-3.3-70b-versatile")
         self.assertEqual(DEFAULT_REFINER_MODELS["siliconflow"], "Qwen/Qwen2.5-7B-Instruct")
+
+        self.assertEqual(DEFAULT_REFINER_EFFORTS, {"codex": "low", "openai": "low"})
+        self.assertEqual(RefinerConfig(provider="codex").effort, "low")
+        self.assertEqual(RefinerConfig(provider="openai").effort, "low")
+        for non_codex in ("openrouter", "dashscope", "volcengine", "gemini", "openai-compatible"):
+            self.assertEqual(RefinerConfig(provider=non_codex).effort, "auto")
 
         self.assertEqual(DEFAULT_ASR_BASE_URLS["openrouter"], "https://openrouter.ai/api/v1")
         self.assertEqual(DEFAULT_ASR_BASE_URLS["groq"], "https://api.groq.com/openai/v1")
@@ -914,7 +926,8 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg_cli.asr.api, "auto")
             self.assertEqual(cfg_cli.asr.effective_model(), "whisper-large-v3-turbo")
             self.assertEqual(cfg_cli.refiner.provider, "volcengine")
-            self.assertEqual(cfg_cli.refiner.model, "doubao-seed-1-6-flash")
+            self.assertEqual(cfg_cli.refiner.model, "doubao-seed-2-0-mini-260428")
+            self.assertEqual(cfg_cli.refiner.effort, "auto")
 
             # 2. Same-layer provider + explicit model preserves explicit model
             cfg_both, _ = load_config(
@@ -956,8 +969,49 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg_sw.asr.effective_model(), "qwen/qwen3-asr-1.7b")
             self.assertEqual(cfg_sw.asr.api_key_env, "")
             self.assertEqual(cfg_sw.refiner.effective_base_url(), "https://openrouter.ai/api/v1")
-            self.assertEqual(cfg_sw.refiner.model, "google/gemini-2.5-flash-lite")
+            self.assertEqual(cfg_sw.refiner.model, "google/gemini-3.5-flash-lite")
+            self.assertEqual(cfg_sw.refiner.effort, "auto")
             self.assertEqual(cfg_sw.refiner.api_key_env, "")
+
+            # 5. Switching provider resets inherited effort unless same-layer effort is explicitly given;
+            #    config.example.toml loads cleanly with codex -> effort='low'
+            cfg_ex, _ = load_config(
+                config_path=_REPO_ROOT / "config.example.toml",
+                env={"HOME": str(home)},
+                home_dir=home,
+                load_default_env_files=False,
+            )
+            self.assertEqual(cfg_ex.refiner.provider, "codex")
+            self.assertEqual(cfg_ex.refiner.effort, "low")
+            cfg_ex_or, _ = load_config(
+                config_path=_REPO_ROOT / "config.example.toml",
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={"refiner.provider": "dashscope"},
+                load_default_env_files=False,
+            )
+            self.assertEqual(cfg_ex_or.refiner.effort, "auto")
+            cfg_ex_keep, _ = load_config(
+                config_path=_REPO_ROOT / "config.example.toml",
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={"refiner.provider": "dashscope", "refiner.effort": "medium"},
+                load_default_env_files=False,
+            )
+            self.assertEqual(cfg_ex_keep.refiner.effort, "medium")
+
+            # 6. DashScope Qwen-Omni multimodal chat model detection (rejects stream-only legacy/realtime Omni)
+            self.assertTrue(is_dashscope_omni_chat_model("qwen3.8-omni-flash"))
+            self.assertTrue(is_dashscope_omni_chat_model("qwen3-omni-flash"))
+            self.assertFalse(is_dashscope_omni_chat_model("qwen3.5-omni-plus"))
+            self.assertFalse(is_dashscope_omni_chat_model("qwen-omni-turbo"))
+            self.assertFalse(is_dashscope_omni_chat_model("qwen3-omni-flash-realtime"))
+            self.assertFalse(is_dashscope_omni_chat_model("qwen3-asr-flash"))
+            self.assertFalse(is_dashscope_omni_chat_model("qwen-audio-turbo-latest"))
+            with self.assertRaises(ConfigError):
+                resolve_asr_api("dashscope", "qwen3.5-omni-plus", "auto")
+            with self.assertRaises(ConfigError):
+                resolve_asr_api("dashscope", "qwen3-omni-flash-realtime", "auto")
 
     def test_asr_api_auto_classification_and_native_incompatibility_checks(self) -> None:
         # Dedicated STT models -> audio-transcriptions (including gemini-*-transcribe & voxtral-mini-3b-2507 / -stt)
@@ -1413,6 +1467,45 @@ class AudioProcTests(unittest.TestCase):
                 resolve_failed_audio(rt, "proj-")
             with self.assertRaises(FileNotFoundError):
                 resolve_failed_audio(rt, "99")
+
+    def test_in_memory_mp3_encoding_and_single_hop_constants(self) -> None:
+        import subprocess
+        self.assertEqual(SINGLE_HOP_MAX_CHUNK_SEC, 610.0)
+        self.assertEqual(SINGLE_HOP_MP3_MIN_WAV_BYTES, 96_000)
+        self.assertIsNone(encode_wav_to_mp3_bytes(b""))
+        self.assertIsNone(encode_wav_to_mp3_bytes(b"not-a-valid-wav"))
+        valid_1s_wav = pack_pcm16_mono_wav([1000] * 16000)
+        with mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", side_effect=FileNotFoundError("no ffmpeg")):
+            self.assertIsNone(encode_wav_to_mp3_bytes(valid_1s_wav, ffmpeg_bin="/nonexistent/ffmpeg"))
+        with mock.patch(
+            "agent_voice_input.audio_proc.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=0.01),
+        ):
+            self.assertIsNone(encode_wav_to_mp3_bytes(valid_1s_wav, ffmpeg_bin="/usr/bin/ffmpeg", timeout_sec=0.01))
+        ff_bin = shutil.which("ffmpeg")
+        if ff_bin is not None:
+            enc_probe = subprocess.run(
+                [ff_bin, "-hide_banner", "-encoders"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=5.0,
+                check=False,
+            )
+            has_lame = b"libmp3lame" in enc_probe.stdout
+            samples_4s = array.array(
+                "h",
+                (int(5000 * math.sin(2.0 * math.pi * 220.0 * i / 16000.0)) for i in range(64000)),
+            )
+            wav_4s = pack_pcm16_mono_wav(samples_4s)
+            self.assertGreater(len(wav_4s), SINGLE_HOP_MP3_MIN_WAV_BYTES)
+            mp3_bytes = encode_wav_to_mp3_bytes(wav_4s, ffmpeg_bin=ff_bin)
+            if has_lame:
+                self.assertIsNotNone(mp3_bytes)
+            if mp3_bytes is not None:
+                self.assertLess(len(mp3_bytes), len(wav_4s) // 2)
+                pcm_back = decode_to_16k_mono_pcm(mp3_bytes)
+                self.assertGreater(len(pcm_back), 60000 * 2)
 
 
 if __name__ == "__main__":

@@ -80,7 +80,7 @@ DEFAULT_ASR_MODELS: dict[str, str] = {
     "dashscope": "qwen3-asr-flash",
     "doubao": "bigmodel",
     "openrouter": "qwen/qwen3-asr-1.7b",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.5-flash-lite",
     "openai": "gpt-4o-mini-transcribe",
     "groq": "whisper-large-v3-turbo",
     "siliconflow": "FunAudioLLM/SenseVoiceSmall",
@@ -89,13 +89,18 @@ DEFAULT_ASR_MODELS: dict[str, str] = {
 
 DEFAULT_REFINER_MODELS: dict[str, str] = {
     "codex": "gpt-6-luna",
-    "dashscope": "qwen-turbo-latest",
-    "volcengine": "doubao-seed-1-6-flash",
-    "openrouter": "google/gemini-2.5-flash-lite",
-    "gemini": "gemini-2.5-flash-lite",
+    "dashscope": "qwen3.8-flash",
+    "volcengine": "doubao-seed-2-0-mini-260428",
+    "openrouter": "google/gemini-3.5-flash-lite",
+    "gemini": "gemini-3.5-flash-lite",
     "openai": "gpt-4o-mini",
     "groq": "llama-3.3-70b-versatile",
     "siliconflow": "Qwen/Qwen2.5-7B-Instruct",
+}
+
+DEFAULT_REFINER_EFFORTS: dict[str, str] = {
+    "codex": "low",
+    "openai": "low",
 }
 
 DEFAULT_ASR_BASE_URLS: dict[str, str] = {
@@ -280,7 +285,7 @@ class RefinerConfig:
     provider: str = "codex"
     model: str = ""
     api: str = "auto"
-    effort: str = "low"
+    effort: str = ""
     prompt: str = ""
     include_git_status: bool = True
     context_max_chars: int = 200000
@@ -292,17 +297,25 @@ class RefinerConfig:
     force_on_single_hop: bool = False
 
     def __post_init__(self) -> None:
+        prov = self.provider.strip().lower()
+        if prov in ("none", "false", "0", "disabled"):
+            prov = "off"
         if not self.model or not self.model.strip():
-            prov = self.provider.strip().lower()
-            if prov in ("none", "false", "0", "disabled"):
-                prov = "off"
             self.model = DEFAULT_REFINER_MODELS.get(prov, "")
+        if not self.effort or not self.effort.strip():
+            self.effort = DEFAULT_REFINER_EFFORTS.get(prov, "auto")
 
     def effective_model(self, resolved_provider: str | None = None) -> str:
         if self.model and self.model.strip():
             return self.model.strip()
         prov = (resolved_provider or self.provider).strip().lower()
         return DEFAULT_REFINER_MODELS.get(prov, "")
+
+    def effective_effort(self, resolved_provider: str | None = None) -> str:
+        if self.effort and self.effort.strip():
+            return self.effort.strip().lower()
+        prov = (resolved_provider or self.provider).strip().lower()
+        return DEFAULT_REFINER_EFFORTS.get(prov, "auto")
 
     def effective_base_url(self, resolved_provider: str | None = None) -> str:
         if self.base_url and self.base_url.strip():
@@ -1406,6 +1419,9 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
         has_explicit_ref_api = (
             ref.get("api") is not None and str(ref.get("api")).strip() != ""
         )
+        has_explicit_ref_effort = (
+            ref.get("effort") is not None and str(ref.get("effort")).strip() != ""
+        )
         has_explicit_ref_base_url = (
             ref.get("base_url") is not None and str(ref.get("base_url")).strip() != ""
         )
@@ -1448,6 +1464,8 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
             if not has_explicit_ref_api:
                 cfg.refiner.api = "auto"
+            if not has_explicit_ref_effort:
+                cfg.refiner.effort = DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
             if not has_explicit_ref_base_url:
                 cfg.refiner.base_url = ""
             if not has_explicit_ref_key_env:
@@ -1505,6 +1523,23 @@ def is_dashscope_native_multimodal_model(model: str, base_url: str = "") -> bool
         or m.startswith("paraformer")
         or m.startswith("sensevoice")
     )
+
+
+def _is_dashscope_stream_only_omni_model(model: str) -> bool:
+    m = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
+    if not (m.startswith("qwen") and "omni" in m):
+        return False
+    return "realtime" in m or m.startswith(
+        ("qwen-omni", "qwen2-omni", "qwen2.5-omni", "qwen3.5-omni")
+    )
+
+
+def is_dashscope_omni_chat_model(model: str, base_url: str = "") -> bool:
+    """Return True when DashScope model supports non-streaming Qwen-Omni chat/completions."""
+    if is_dashscope_native_multimodal_model(model, base_url) or _is_dashscope_stream_only_omni_model(model):
+        return False
+    m = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
+    return m.startswith("qwen") and "omni" in m
 
 
 def classify_asr_model_api(model: str) -> str | None:
@@ -1600,6 +1635,11 @@ def resolve_asr_api(
         if req_api == "audio-transcriptions":
             raise ConfigError(
                 "asr.api='audio-transcriptions' is not supported by provider 'dashscope'"
+            )
+        if _is_dashscope_stream_only_omni_model(eff_model):
+            raise ConfigError(
+                f"DashScope model {eff_model!r} requires streaming/realtime protocol; "
+                "use 'qwen3.8-omni-flash' or 'qwen3-omni-flash' for single-hop DashScope ASR"
             )
         return "chat-completions"
 
@@ -1872,6 +1912,8 @@ def load_config(
 
     if not cfg.refiner.model.strip():
         cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
+    if not cfg.refiner.effort.strip():
+        cfg.refiner.effort = DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
 
     _validate_config(cfg, env=effective_env)
     return cfg, effective_env

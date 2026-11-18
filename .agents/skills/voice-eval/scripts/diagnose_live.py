@@ -60,11 +60,20 @@ def _diagnose_record_flags(rec: dict[str, Any], *, is_first_for_session: bool) -
         reason = str(rec.get("skipped_reason") or "error")
         flags.append(f"SKIP({reason})")
         return flags
-    if fb := str(rec.get("refiner_fallback") or "").strip():
+    fb = str(rec.get("refiner_fallback") or "").strip()
+    is_passthrough_sh = fb == "single_hop_passthrough" and int(rec.get("refine_ms") or 0) == 0
+    is_single_hop_asr = bool(rec.get("is_single_hop_refined")) or is_passthrough_sh
+    rec_mode = str(rec.get("mode") or "agent").strip().lower()
+    if fb and fb != "single_hop_passthrough":
         flags.append(f"FALLBACK({fb})")
-    if not str(rec.get("session_key") or "").strip() and str(rec.get("refiner_provider") or "") not in ("", "off"):
+    if (
+        rec_mode != "general"
+        and not str(rec.get("session_key") or "").strip()
+        and (is_single_hop_asr or str(rec.get("refiner_provider") or "") not in ("", "off"))
+    ):
         flags.append("NO_SESSION_CTX")
-    if int(rec.get("asr_ms") or 0) >= 1800:
+    asr_slow_thr = 3300 if is_single_hop_asr else 1800
+    if int(rec.get("asr_ms") or 0) >= asr_slow_thr:
         flags.append("ASR_SLOW")
     if int(rec.get("refine_init_ms") or 0) >= 250:
         flags.append("COLD_INIT")

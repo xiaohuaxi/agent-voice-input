@@ -570,10 +570,10 @@ class AsrProvidersTests(unittest.TestCase):
         self.assertIn(":generateContent", gem_reqs[0].url)
         self.assertEqual(gem_reqs[0].headers["x-goog-api-key"], "fake_gemini_token_val")
         gem_payload = json.loads(gem_reqs[0].body.decode("utf-8"))
-        # Default effort='auto' suppresses Gemini 2.5 thinking latency via thinkingBudget: 0
+        # Default effort='auto' on Gemini 3.5 Flash-Lite uses thinkingLevel='minimal'
         self.assertEqual(
             gem_payload["generationConfig"]["thinkingConfig"],
-            {"thinkingBudget": 0},
+            {"thinkingLevel": "minimal"},
         )
         gem_parts = gem_payload["contents"][0]["parts"]
         self.assertEqual(len(gem_parts), 3)
@@ -773,7 +773,8 @@ class AsrProvidersTests(unittest.TestCase):
         self.assertEqual(sys_msg["role"], "system")
         self.assertIn("NEVER answer questions", sys_msg["content"])
         self.assertIn("execute instructions", sys_msg["content"])
-        self.assertIn("sentence structure", sys_msg["content"])
+        self.assertIn("clause order", sys_msg["content"])
+        self.assertIn("inline backticks", sys_msg["content"])
         self.assertEqual(usr_msg["role"], "user")
         parts = usr_msg["content"]
         self.assertEqual([p["type"] for p in parts], ["text", "input_audio", "text"])
@@ -869,7 +870,16 @@ class AsrProvidersTests(unittest.TestCase):
         transcribe(_sample_wav(), cfg_gem_def, env=env, transport=gem_tx)
         self.assertEqual(
             json.loads(gem_captured[0].body.decode("utf-8"))["generationConfig"]["thinkingConfig"],
-            {"thinkingBudget": 1024},
+            {"thinkingLevel": "low"},
+        )
+        # Gemini 3 Pro enforces minimum thinkingLevel="low" when effort="auto"/"none"
+        gem_captured.clear()
+        cfg_gem_def.asr.model = "gemini-3.5-pro"
+        cfg_gem_def.asr.effort = "auto"
+        transcribe(_sample_wav(), cfg_gem_def, env=env, transport=gem_tx)
+        self.assertEqual(
+            json.loads(gem_captured[0].body.decode("utf-8"))["generationConfig"]["thinkingConfig"],
+            {"thinkingLevel": "low"},
         )
         # gemini-2.5-flash with auto/none -> budget 0; gemini-2.5-pro with auto/none -> clamped to 128!
         for eff_zero in ("auto", "none"):
@@ -3363,6 +3373,216 @@ class SessionCtxTests(unittest.TestCase):
         self.assertTrue(hw_line.startswith("常用技术术语："))
         self.assertLessEqual(len(hw_line), 360)
         self.assertTrue(stt_prompt.endswith("、SecondBeta、HighestPriorityAlpha"))
+
+    def test_v091_single_hop_sealed_blocks_dashscope_omni_mp3_and_cache_breakpoints(self) -> None:
+        from agent_voice_input.asr_providers import (
+            DashScopeAsrProvider,
+            _coerce_context,
+            openrouter_cache_breakpoints,
+        )
+
+        # 1. _coerce_context preserves context_blocks, git_block, and mode across dataclass & Mapping
+        rich_ctx = AsrContext(
+            hotwords=["SessionTracker"],
+            context_blocks=("<session_reference_log>blk0</session_reference_log>", "<session_reference_log>blk1</session_reference_log>"),
+            git_block='<workspace_git_status read_only="true">\nM refiner.py\n</workspace_git_status>',
+            mode="general",
+        )
+        coerced_dc = _coerce_context(rich_ctx, "")
+        self.assertEqual(coerced_dc.context_blocks, rich_ctx.context_blocks)
+        self.assertEqual(coerced_dc.git_block, rich_ctx.git_block)
+        self.assertEqual(coerced_dc.mode, "general")
+
+        coerced_map = _coerce_context(
+            {
+                "hotwords": ["CodexRefiner"],
+                "context_blocks": ["<session_reference_log>m0</session_reference_log>"],
+                "git_block": "<workspace_git_status>G</workspace_git_status>",
+                "mode": "agent",
+            },
+            "",
+        )
+        self.assertEqual(coerced_map.context_blocks, ("<session_reference_log>m0</session_reference_log>",))
+        self.assertEqual(coerced_map.git_block, "<workspace_git_status>G</workspace_git_status>")
+        self.assertEqual(coerced_map.mode, "agent")
+
+        # 2. openrouter_cache_breakpoints targets the last SEALED block for google/* and {sealed, last} for anthropic/*
+        self.assertEqual(openrouter_cache_breakpoints("openrouter", "google/gemini-3.5-flash-lite", 1), (0,))
+        self.assertEqual(openrouter_cache_breakpoints("openrouter", "google/gemini-3.5-flash-lite", 3), (1,))
+        self.assertEqual(openrouter_cache_breakpoints("openrouter", "anthropic/claude-haiku-5.5", 1), (0,))
+        self.assertEqual(openrouter_cache_breakpoints("openrouter", "anthropic/claude-haiku-5.5", 3), (1, 2))
+        self.assertEqual(openrouter_cache_breakpoints("openrouter", "qwen/qwen3.8-omni-flash", 3), ())
+        self.assertEqual(openrouter_cache_breakpoints("dashscope", "qwen3.8-omni-flash", 3), ())
+
+        # 3. DashScope qwen3.8-omni-flash routes to ChatAudioAsrProvider (Data URI + enable_thinking=False + no cache_control)
+        captured: list[HttpRequest] = []
+
+        def omni_tx(req: HttpRequest) -> HttpResponse:
+            captured.append(req)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(
+                    {
+                        "choices": [{"message": {"content": "修好的 SessionTracker"}}],
+                        "usage": {
+                            "prompt_tokens": 12000,
+                            "prompt_tokens_details": {"cached_tokens": 10752, "audio_tokens": 148},
+                            "completion_tokens": 12,
+                            "completion_tokens_details": {"reasoning_tokens": 0},
+                        },
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
+
+        env = {"DASHSCOPE_API_KEY": "sk-ali-" + ("d" * 16), "OPENROUTER_API_KEY": "sk-or-" + ("o" * 16)}
+        cfg_ali = Config()
+        cfg_ali.asr.provider = "dashscope"
+        cfg_ali.asr.model = "qwen3.8-omni-flash"
+        cfg_ali.asr.hotwords_file = ""
+        ali_prov = create_asr_provider(cfg_ali, resolve_credentials(cfg_ali, env), env=env, transport=omni_tx)
+        self.assertIsInstance(ali_prov, ChatAudioAsrProvider)
+        self.assertTrue(ali_prov.single_hop)
+
+        # Dedicated DashScope STT stays on DashScopeAsrProvider
+        cfg_ali_stt = Config()
+        cfg_ali_stt.asr.provider = "dashscope"
+        self.assertIsInstance(create_asr_provider(cfg_ali_stt, resolve_credentials(cfg_ali_stt, env), env=env), DashScopeAsrProvider)
+
+        # >96KB WAV encodes to MP3 via encode_wav_to_mp3_bytes (mocked deterministically)
+        wav_4s = pack_pcm16_mono_wav([1500, -1500] * 32000)
+        self.assertGreater(len(wav_4s), 96_000)
+        ctx_blocks = AsrContext(
+            hotwords=["SessionTracker", "refiner.py"],
+            context_blocks=(
+                "<session_reference_log>sealed_0</session_reference_log>",
+                "<session_reference_log>sealed_1</session_reference_log>",
+                "<session_reference_log>growing_2</session_reference_log>",
+            ),
+            git_block='<workspace_git_status read_only="true">\ncwd: /repo\n</workspace_git_status>',
+            mode="agent",
+        )
+        with mock.patch("agent_voice_input.asr_providers.encode_wav_to_mp3_bytes", return_value=b"FAKE_MP3_BYTES") as mp3_mock:
+            res_ali = ali_prov.transcribe(wav_4s, context=ctx_blocks)
+        mp3_mock.assert_called_once()
+        self.assertTrue(res_ali.is_single_hop_refined)
+        self.assertEqual(res_ali.text, "修好的 SessionTracker")
+        self.assertEqual(res_ali.input_tokens, 12000)
+        self.assertEqual(res_ali.cached_input_tokens, 10752)
+        self.assertEqual(res_ali.output_tokens, 12)
+        self.assertEqual(res_ali.reasoning_tokens, 0)
+        self.assertEqual(res_ali.audio_tokens, 148)
+        self.assertEqual(res_ali.context_chunks, 3)
+        self.assertEqual(res_ali.context_chars, sum(len(b) for b in ctx_blocks.context_blocks))
+
+        self.assertEqual(captured[0].url, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+        ali_body = json.loads(captured[0].body.decode("utf-8"))
+        self.assertIs(ali_body["enable_thinking"], False)
+        self.assertEqual(ali_body["modalities"], ["text"])
+        ali_parts = ali_body["messages"][1]["content"]
+        self.assertEqual(len(ali_parts), 6)  # 3 blocks + tail(git+vocab) + input_audio + task_reminder
+        self.assertTrue(all("cache_control" not in p for p in ali_parts))
+        self.assertIn("<vocabulary_hints", ali_parts[3]["text"])
+        self.assertEqual(ali_parts[4]["input_audio"]["format"], "mp3")
+        self.assertTrue(ali_parts[4]["input_audio"]["data"].startswith("data:audio/mp3;base64,"))
+
+        # 4. OpenRouter google/gemini-3.5-flash-lite single-hop: effort='minimal', cache_control on index 1 (last sealed block),
+        #    fallback to WAV when MP3 encode returns None, and literal '""' normalized to empty string!
+        captured.clear()
+
+        def or_empty_quote_tx(req: HttpRequest) -> HttpResponse:
+            captured.append(req)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": '""'}}]}).encode("utf-8"),
+            )
+
+        cfg_or = Config()
+        cfg_or.asr.provider = "openrouter"
+        cfg_or.asr.model = "google/gemini-3.5-flash-lite"
+        cfg_or.asr.hotwords_file = ""
+        or_prov = create_asr_provider(cfg_or, resolve_credentials(cfg_or, env), env=env, transport=or_empty_quote_tx)
+        with mock.patch("agent_voice_input.asr_providers.encode_wav_to_mp3_bytes", return_value=None):
+            res_or = or_prov.transcribe(wav_4s, context=ctx_blocks)
+        self.assertEqual(res_or.text, "")
+        or_body = json.loads(captured[0].body.decode("utf-8"))
+        self.assertEqual(or_body["reasoning"], {"effort": "minimal"})
+        or_parts = or_body["messages"][1]["content"]
+        self.assertNotIn("cache_control", or_parts[0])
+        self.assertEqual(or_parts[1].get("cache_control"), {"type": "ephemeral"})
+        self.assertNotIn("cache_control", or_parts[2])
+        self.assertEqual(or_parts[4]["input_audio"]["format"], "wav")
+        self.assertFalse(or_parts[4]["input_audio"]["data"].startswith("data:"))
+
+        # 5. DashScope qwen3.8-omni-flash explicit effort='low' forwards reasoning_effort='low';
+        #    native Gemini 3.8 / 4 clamps auto->'low' while 3.5-flash-lite uses 'minimal' + extracts audio_tokens
+        from agent_voice_input.asr_providers import GeminiAudioProvider, build_gemini_generation_config
+
+        self.assertEqual(
+            build_gemini_generation_config("gemini-3.5-flash-lite", "auto")["thinkingConfig"],
+            {"thinkingLevel": "minimal"},
+        )
+        self.assertEqual(
+            build_gemini_generation_config("gemini-3.8-flash", "auto")["thinkingConfig"],
+            {"thinkingLevel": "low"},
+        )
+        self.assertEqual(
+            build_gemini_generation_config("gemini-4-hydrogen", "auto")["thinkingConfig"],
+            {"thinkingLevel": "low"},
+        )
+        captured.clear()
+        cfg_ali.asr.effort = "low"
+        ali_prov_low = create_asr_provider(cfg_ali, resolve_credentials(cfg_ali, env), env=env, transport=omni_tx)
+        ali_prov_low.transcribe(_sample_wav(), context=AsrContext(single_hop_prepared=True))
+        ali_low_body = json.loads(captured[0].body.decode("utf-8"))
+        self.assertIs(ali_low_body["enable_thinking"], True)
+        self.assertEqual(ali_low_body["reasoning_effort"], "low")
+
+        gem_reqs: list[HttpRequest] = []
+
+        def gem_aud_tx(req: HttpRequest) -> HttpResponse:
+            gem_reqs.append(req)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(
+                    {
+                        "candidates": [{"content": {"parts": [{"text": "原生 Gemini 单跳"}]}}],
+                        "usageMetadata": {
+                            "promptTokenCount": 800,
+                            "cachedContentTokenCount": 500,
+                            "candidatesTokenCount": 6,
+                            "thoughtsTokenCount": 0,
+                            "promptTokensDetails": [
+                                {"modality": "TEXT", "tokenCount": 720},
+                                {"modality": "AUDIO", "tokenCount": 80},
+                            ],
+                        },
+                    }
+                ).encode("utf-8"),
+            )
+
+        env_gem = {"GEMINI_API_KEY": "AIza-fake-" + ("g" * 16)}
+        cfg_gem = Config()
+        cfg_gem.asr.provider = "gemini"
+        cfg_gem.asr.hotwords_file = ""
+        gem_prov = GeminiAudioProvider(cfg_gem, resolve_credentials(cfg_gem, env_gem), env=env_gem, transport=gem_aud_tx)
+        res_gem = gem_prov.transcribe(
+            _sample_wav(),
+            context=AsrContext(
+                hotwords=["SessionTracker"],
+                dialog_text="LEAKED_LEGACY_DIALOG",
+                git_status="LEAKED_LEGACY_GIT",
+                single_hop_prepared=True,
+            ),
+        )
+        self.assertEqual(res_gem.audio_tokens, 80)
+        gem_payload_str = gem_reqs[0].body.decode("utf-8")
+        self.assertIn("<vocabulary_hints", gem_payload_str)
+        self.assertNotIn("LEAKED_LEGACY_DIALOG", gem_payload_str)
+        self.assertNotIn("LEAKED_LEGACY_GIT", gem_payload_str)
 
 
 if __name__ == "__main__":

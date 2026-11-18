@@ -420,6 +420,225 @@ class MetricsAndReplayTests(unittest.TestCase):
                 self.assertTrue(fpath.is_file(), fname)
                 self.assertEqual(stat.S_IMODE(fpath.stat().st_mode), 0o600)
 
+    def test_v091_single_hop_replay_bypasses_asr_cache_tracks_e2e_backticks_and_paired_retention(self) -> None:
+        diag_path = REPO_ROOT / ".agents" / "skills" / "voice-eval" / "scripts" / "diagnose_live.py"
+        diag_spec = importlib.util.spec_from_file_location("diagnose_live_mod", diag_path)
+        assert diag_spec is not None and diag_spec.loader is not None
+        diag_mod = importlib.util.module_from_spec(diag_spec)
+        diag_spec.loader.exec_module(diag_mod)
+
+        # 1. diagnose_live: single_hop_passthrough is NOT flagged as FALLBACK and uses 3300ms threshold
+        flags_fast = diag_mod._diagnose_record_flags(
+            {
+                "ok": True,
+                "session_key": "agy:1",
+                "refiner_provider": "off",
+                "refiner_fallback": "single_hop_passthrough",
+                "asr_ms": 2200,
+                "refine_ms": 0,
+                "input_tokens": 12000,
+                "cached_input_tokens": 10000,
+                "ctx_chars": 45000,
+            },
+            is_first_for_session=False,
+        )
+        self.assertEqual(flags_fast, [])
+        flags_slow = diag_mod._diagnose_record_flags(
+            {
+                "ok": True,
+                "session_key": "",
+                "refiner_provider": "off",
+                "refiner_fallback": "single_hop_passthrough",
+                "asr_ms": 3400,
+                "refine_ms": 0,
+            },
+            is_first_for_session=True,
+        )
+        self.assertIn("NO_SESSION_CTX", flags_slow)
+        self.assertIn("ASR_SLOW", flags_slow)
+        self.assertTrue(all(not f.startswith("FALLBACK") for f in flags_slow))
+        # general mode does NOT warn NO_SESSION_CTX; force_on_single_hop keeps 3300ms ASR threshold via is_single_hop_refined
+        flags_gen_sh = diag_mod._diagnose_record_flags(
+            {
+                "ok": True,
+                "mode": "general",
+                "session_key": "",
+                "is_single_hop_refined": True,
+                "refiner_provider": "openrouter",
+                "refiner_fallback": "",
+                "asr_ms": 2500,
+                "refine_ms": 600,
+            },
+            is_first_for_session=True,
+        )
+        self.assertEqual(flags_gen_sh, [])
+
+        # 2. Single-hop replay attaches context_blocks, skips asr_cache.json, records e2e_ms/backtick_hits,
+        #    and computes paired char_retention against a two-stage baseline
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home, rec_dir, eval_dir, host_rt = root / "home", root / "rec", root / "eval", root / "rt"
+            rec_dir.mkdir(parents=True)
+            host_rt.mkdir(parents=True)
+            sid = "395438e5-0000-4000-8000-000000000009"
+            brain_logs = home / ".gemini" / "antigravity-cli" / "brain" / sid / ".system_generated" / "logs"
+            brain_logs.mkdir(parents=True)
+            cfg_file = home / ".config" / "agent-voice-input" / "config.toml"
+            cfg_file.parent.mkdir(parents=True)
+            cfg_file.write_text('[asr]\nprovider = "dashscope"\n[refiner]\nprovider = "off"\n', encoding="utf-8")
+
+            t0 = 1794967200.0
+            (brain_logs / "transcript_full.jsonl").write_text(
+                "\n".join(
+                    json.dumps(r, ensure_ascii=False)
+                    for r in [
+                        {"source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": t0 - 60, "content": "看 refiner.py"},
+                        {"source": "MODEL", "type": "PLANNER_RESPONSE", "created_at": t0 - 50, "content": "已打开 refiner.py"},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            r1 = rec_dir / "rec-20261118-100010-111111.wav"
+            r2 = rec_dir / "rec-20261118-100040-222222.wav"
+            r1.write_bytes(_make_voiced_wav(4.0))
+            r2.write_bytes(_make_voiced_wav(12.0))
+            os.utime(r1, (t0 + 10.0, t0 + 10.0))
+            os.utime(r2, (t0 + 40.0, t0 + 40.0))
+            (host_rt / "telemetry.jsonl").write_text(
+                "\n".join(
+                    json.dumps(r)
+                    for r in [
+                        {"ts": t0 + 11.0, "ok": True, "session_key": f"agy:{sid}", "raw_audio_sec": 4.0, "total_ms": 900},
+                        {"ts": t0 + 41.0, "ok": True, "session_key": f"agy:{sid}", "raw_audio_sec": 12.0, "total_ms": 950},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            sh_calls: list[Any] = []
+
+            class FakeSingleHopAsr:
+                provider_name = "dashscope"
+                single_hop = True
+
+                def transcribe(self, wav_bytes: bytes, context=None, **kw) -> AsrResult:
+                    sh_calls.append(context)
+                    n = len(sh_calls)
+                    return AsrResult(
+                        text="把 `refiner.py` 改好" if n == 1 else "直接把 refiner.py 改好就行",
+                        provider="dashscope",
+                        model="qwen3.8-omni-flash",
+                        latency_ms=920 if n == 1 else 860,
+                        is_single_hop_refined=True,
+                        input_tokens=5000,
+                        cached_input_tokens=0 if n == 1 else 4500,
+                        output_tokens=10,
+                        reasoning_tokens=0,
+                        context_chars=sum(len(b) for b in (context.context_blocks if context else ())),
+                        context_chunks=len(context.context_blocks if context else ()),
+                    )
+
+            common = [
+                "--config", str(cfg_file),
+                "--home-dir", str(home),
+                "--recordings-dir", str(rec_dir),
+                "--eval-dir", str(eval_dir),
+                "--host-runtime-dir", str(host_rt),
+                "--no-git-status",
+            ]
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home), "API_KEY_ALI": "sk-fake-ali-key"}, clear=False),
+                mock.patch.object(EVAL, "create_asr_provider", side_effect=lambda *a, **kw: FakeSingleHopAsr()),
+                mock.patch("sys.stderr", io.StringIO()),
+            ):
+                with mock.patch("sys.stdout", io.StringIO()):
+                    EVAL.main([*common, "--asr-model", "qwen3.8-omni-flash", "--tag", "sh_run1"])
+                    EVAL.main([*common, "--asr-model", "qwen3.8-omni-flash", "--tag", "sh_run2"])
+                # Single-hop MUST NOT reuse asr_cache.json across runs (4 real calls across 2 runs)
+                self.assertEqual(len(sh_calls), 4)
+                self.assertTrue(all(len(c.context_blocks) >= 1 for c in sh_calls))
+                self.assertFalse((eval_dir / "asr_cache.json").exists())
+
+                sh_doc = json.loads((eval_dir / "sh_run1.json").read_text(encoding="utf-8"))
+                self.assertIsNone(sh_doc["aggregate"]["char_retention_p50"])
+                self.assertEqual(sh_doc["aggregate"]["e2e_ms_p50"], 890.0)
+                self.assertEqual(sh_doc["aggregate"]["warm_cache_hit_pct_p50"], 90.0)
+                self.assertEqual(sh_doc["aggregate"]["backtick_hits"], 2)
+                self.assertEqual(sh_doc["aggregate"]["backtick_samples"], 1)
+
+                # Write synthetic two-stage base with real asr_draft and verify paired retention calculation
+                base_two_stage = {
+                    "tag": "two_stage_base",
+                    "meta": {"asr_provider": "dashscope"},
+                    "samples": [
+                        {
+                            **sh_doc["samples"][0],
+                            "used_fallback": "",
+                            "asr_ms": 1200,
+                            "refine_ms": 1500,
+                            "e2e_ms": 2700,
+                            "asr_draft": "呃那个把 refiner 点 py 改好一下吧",
+                            "asr_chars": 23,
+                            "char_retention": 0.6,
+                        },
+                        {
+                            **sh_doc["samples"][1],
+                            "used_fallback": "",
+                            "asr_ms": 1400,
+                            "refine_ms": 1600,
+                            "e2e_ms": 3000,
+                            "asr_draft": "嗯直接把那个 refiner 点 py 改好就行了",
+                            "asr_chars": 25,
+                            "char_retention": 0.7,
+                        },
+                    ],
+                }
+                cmp_md = EVAL.compare_runs(base_two_stage, sh_doc)
+                self.assertIn("Single-hop `char_retention` is computed relative to the paired Stage 1 `asr_draft`", cmp_md)
+                self.assertNotIn("| Char retention `final/asr` p50 (all / `>=10s`) | `56.5% / 68.0%` | `- / -` |", cmp_md)
+
+                # Legacy single-hop JSON (where asr_draft duplicated refined_text) still uses paired two-stage draft
+                legacy_sh_doc = {
+                    **sh_doc,
+                    "samples": [{**s, "asr_draft": s["refined_text"], "asr_chars": len(s["refined_text"]), "char_retention": 1.0} for s in sh_doc["samples"]],
+                }
+                cmp_legacy_md = EVAL.compare_runs(base_two_stage, legacy_sh_doc)
+                self.assertNotIn("100.0% / 100.0%", cmp_legacy_md)
+
+                # --asr-from on a single-hop JSON recovers refined_text instead of treating empty asr_draft as empty_asr
+                with mock.patch("sys.stdout", io.StringIO()):
+                    EVAL.main([*common, "--asr-from", "sh_run1", "--tag", "sh_from_frozen"])
+                sh_frozen_doc = json.loads((eval_dir / "sh_from_frozen.json").read_text(encoding="utf-8"))
+                self.assertEqual(sh_frozen_doc["aggregate"]["valid_samples"], 2)
+                self.assertTrue(all(s["ok"] and s["refined_text"] for s in sh_frozen_doc["samples"]))
+
+                # mode='general' telemetry record MUST NOT fallback-match nearby CLI session history
+                r3 = rec_dir / "rec-20261118-100050-333333.wav"
+                r3.write_bytes(_make_voiced_wav(4.0))
+                os.utime(r3, (t0 + 50.0, t0 + 50.0))
+                (host_rt / "telemetry.jsonl").write_text(
+                    "\n".join(
+                        json.dumps(r)
+                        for r in [
+                            {"ts": t0 + 11.0, "ok": True, "session_key": f"agy:{sid}", "raw_audio_sec": 4.0, "total_ms": 900},
+                            {"ts": t0 + 41.0, "ok": True, "session_key": f"agy:{sid}", "raw_audio_sec": 12.0, "total_ms": 950},
+                            {"ts": t0 + 51.0, "ok": True, "mode": "general", "session_key": "", "raw_audio_sec": 4.0, "total_ms": 800},
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                sh_calls.clear()
+                with mock.patch("sys.stdout", io.StringIO()):
+                    EVAL.main([*common, "--asr-model", "qwen3.8-omni-flash", "--tag", "sh_with_gen"])
+                gen_doc = json.loads((eval_dir / "sh_with_gen.json").read_text(encoding="utf-8"))
+                gen_sample = [s for s in gen_doc["samples"] if s["recording_name"] == r3.name][0]
+                self.assertEqual(gen_sample["mode"], "general")
+                self.assertEqual(gen_sample["session_tag"], "none")
+                self.assertEqual(gen_sample["ctx_chunks"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,10 +20,10 @@
   - [x] 修复 WSL2/macOS 非终端投递门禁死锁与 `$TMUX` 跨窗误投、Windows 终端进程级粘贴键路由（`Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert` 含 `VK_INSERT` 扩展键标志）与 `[#id8]` 会话标记冲突检测、macOS GUI 动态标题放宽与 `mac_shim` 零 `Carbon` 原生 `CGEvent Cmd+V`、移除 Ghostty/`tmux` 直投写剪贴板（放弃存在后台 Tab 盲贴风险的 WSL2 `tmux` 直投；模拟粘贴剪贴板多格式备份恢复归入 `v0.9-2` 单进程状态机专项）。
 
 ### `v0.9.0`：2026 模型换代、原生音频单跳落定、操控流畅度与桌面感知
-- [ ] **`v0.9-1` 单跳原生音频缓存对齐、2026 模型换代与双轨实测横评**：
-  - [ ] 修复 `GeminiAudioProvider` / `ChatAudioAsrProvider` 滑动截尾零缓存问题（复用 50K 定界封口分块）、补齐单跳 Token/缓存指标与长音频整段/压缩上传策略；
-  - [ ] 各渠道默认模型升级至 2026 下半年最新轻量长上下文代际，补齐混合推理模型显式关思考参数与连接预热；
-  - [ ] 完成「双阶段文本精修 vs 原生音频一步到位」全量实测横评。
+- [x] **`v0.9-1` 单跳原生音频缓存对齐、2026 模型换代与双轨实测横评**（已完成）：
+  - [x] 抽离零依赖 `prompts.py` 共享编辑规则，修复 `GeminiAudioProvider` / `ChatAudioAsrProvider` 滑动截尾零缓存问题（复用 50K 定界封口分块与 OpenRouter 封口块 `cache_control`，严防空块/通用模式回退泄露），补齐 `audio_tokens` 等单跳全套用量遥测、`610s` 免切块阈值与 `>=3s` 内存 `64kbps MP3` 压缩上传；
+  - [x] 各渠道默认模型升级至 2026 下半年主力代际（`gemini-3.5-flash-lite`、`qwen3.8-flash`、`doubao-seed-2-0-mini-260428`），打通百炼 `qwen3.8-omni-flash` 单跳路由与 `doctor` 单跳透传跳过判定，补齐按渠道默认 `effort` 与显式关思考参数；
+  - [x] 完成「双阶段文本精修 vs 原生音频一步到位」全矩阵回放与跨家族双盲评测：验证确立双阶段默认稳健主路线（抗微弱气声幻觉、长文精修稳健，如 `codex/gpt-6-luna`、`deepseek-flash`）与原生音频单跳可选高阶路线（原声高密度术语直听与低延迟，如 `gemini-3.8-flash`、`gemini-3.5-flash-lite`、`qwen3.8-omni-flash`）双轨并存就绪。
 - [ ] **`v0.9-2` 单进程在途取消、连发口述 Stage 2 并发保序落字与 `win_shim` 编译缓存自愈**（实现细则见下方第二节）。
 - [ ] **`v0.9-3` 桌面端 GUI 高性价比场景感知**：桌面版 Antigravity IDE 同构 `transcript_full.jsonl` 上下文复用、VS Code / Cursor / Zed 窗口标题与 `AXDocument` 工作区热词注入（跳过 WSL `/mnt/` 9P 路径）、桌面版 ChatGPT / 聊天应用末尾轻量场景提示。
 

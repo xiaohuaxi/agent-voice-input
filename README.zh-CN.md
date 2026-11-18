@@ -30,7 +30,7 @@
 ## 核心亮点
 
 - **精准绑定活跃 Agent 上下文，同时开箱通用全桌面**：在终端内自动识别前台窗口、Ghostty 分屏或 `tmux` 焦点窗格（无需修改 `~/.tmux.conf`）中的主 Agent 会话，增量抽取最近对话与 `git status` 变更文件名纠偏，严格隔离后台 subagent 与相邻分屏；同时默认支持任意桌面窗口语音输入（`hotkey.scope = "all"`，亦可设为 `"coding"` 或 `"terminals"`）：IDE / 代码编辑器使用隔离后台会话历史的编程模式精修，日常聊天/浏览器/文档自动切换无代码偏置的通用顺句模式，聚焦远程桌面/虚拟机客户端时自动静默让行热键（`yield_remote_desktop = true`）。
-- **按渠道即插即用的「识别 + 精修」双引擎**：默认采用「极速语音转写 + 复用本机 `codex` 登录态的无状态 Keep-Alive 精修」，也支持切换任意内置云端/本地 API 渠道，或使用 Gemini / OpenRouter 多模态单跳直出；日常只需指定 `provider`，自动匹配对应渠道的默认模型。
+- **按渠道即插即用的「识别 + 精修」双引擎**：默认采用「极速语音转写 + 复用本机 `codex` 登录态的无状态 Keep-Alive 精修」，也支持切换任意内置云端/本地 API 渠道，或使用百炼 `qwen3.8-omni-flash` / Gemini / OpenRouter 多模态单跳共享 50K 缓存直出；日常只需指定 `provider`，自动匹配对应渠道的默认模型。
 - **面向长口述与连续口述的可靠录音链**：支持在上一句转写/精修期间直接开始下一段录音并按序串行上屏（切走窗口回退剪贴板的多段结果自动空行拼接、不覆盖前文）；内置静音门控与响度归一化拦截空触；单次默认最长 10 分钟（最后 15 秒胶囊倒计时提示），超过 3 分钟的长语音自动挑自然停顿处切分并并发转写；无麦克风或中途掉麦即时提醒；转写或上屏失败自动暂存音频，随时用 `agent-voice-input retry` 恢复，绝不丢话。
 - **原生高分屏波形胶囊与防串窗安全粘贴**：Windows（Per-Monitor V2 HiDPI）与 macOS（Retina 原生面板）均提供不抢焦点的悬浮胶囊（计时、实时声波与阶段进度自动跟随系统中英文）；开始录音即锁定目标窗口/分屏，按进程自动路由粘贴快捷键（Windows 区分 `Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert`；macOS 在 Ghostty 与 `tmux` 内零触碰系统剪贴板直投，其余窗口走原生 `CGEvent` `Cmd+V`），只粘贴不自动回车，中途切走焦点则自动退回剪贴板防误投。
 - **零第三方 Python 依赖**：仅使用 Python `>= 3.10` 标准库与宿主机 `ffmpeg`（WSL2 复用系统内置 `powershell.exe`，macOS 首次启动自动编译缓存原生 `mac_shim`）。
@@ -113,10 +113,10 @@ agent-voice-input start
 
 - **按 Agent / `provider` 选择即可，`model` 默认留空自动匹配**：`[asr]` 与 `[refiner]` 中的 `model` 留空（`""` 或不填）时，自动采用所选 `provider` 的内置默认模型；通过 CLI 切换 `provider` 且未显式指定 `model` 时，也会自动切回新渠道的默认模型，不会把旧渠道的模型名串过去。如需指定具体模型，原样填写该渠道的上游模型 ID 即可。
 - **两阶段模式 vs 多模态单跳模式（`asr.api`）**：
-  - 默认 `asr.api = "auto"` 会自动按渠道与模型选择协议：`dashscope`、`doubao` 与专用 STT 模型（如 `qwen/qwen3-asr-1.7b`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）走一阶段纯转写 + 二阶段语境精修；
-  - 原生 `gemini` 以及 OpenRouter / OpenAI 兼容渠道下的多模态音频理解模型（如 `gemini-2.5-flash`、`google/gemini-2.5-flash`、`gpt-audio*`）自动将音频与会话上下文合并为单次请求一步完成转写与精修，并默认跳过二阶段（除非设置 `refiner.force_on_single_hop = true`）。在 `openrouter` 下使用未内置收录的新模型时，请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
+  - 默认 `asr.api = "auto"` 会自动按渠道与模型选择协议：`dashscope`（默认 `qwen3-asr-flash`）、`doubao` 与专用 STT 模型（如 `qwen/qwen3-asr-1.7b`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）走一阶段纯转写 + 二阶段语境精修；
+  - 原生 `gemini`、百炼 `qwen*-omni*`（如 `qwen3.8-omni-flash`）以及 OpenRouter / OpenAI 兼容渠道下的多模态音频理解模型（如 `gemini-3.5-flash-lite`、`google/gemini-3.5-flash-lite`、`qwen/qwen3.8-omni-flash`、`gpt-audio*`）自动共享同一套 50K 封口 `<session_reference_log>` 前缀缓存块（`agent` 模式下会将最多 `refiner.context_max_chars` 会话历史发往所选多模态 ASR 渠道）、对 `>= 3s` 语音内存压缩为 `64 kbps` MP3、以 `610s` 为整段上限一步完成转写与精修，并默认跳过二阶段（除非设置 `refiner.force_on_single_hop = true`）。在 `openrouter` 下使用未内置收录的新模型时，请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
 - **二阶段协议选择（`refiner.api`）**：支持 `"auto" | "chat-completions" | "responses"`。默认 `"auto"` 将 `codex` 路由至纯无状态 HTTP `/responses`（`store=false`、`stream=true`），将 `gemini` 路由至原生 `:generateContent`，其余兼容渠道保持 `/chat/completions`；在 `openai`、`openrouter` 或 `openai-compatible` 下亦可显式设 `refiner.api = "responses"` 启用无状态 `/responses` 引擎。
-- **思考档位控制（`effort`）**：支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`。`asr.effort` 默认 `"auto"`（自动压低多模态模型的默认思考延迟），`refiner.effort` 默认 `"low"`。
+- **思考档位控制（`effort`）**：支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`。`asr.effort` 默认 `"auto"`；`refiner.effort` 按渠道自动默认（`codex` / `openai` 默认 `"low"`，其余渠道默认 `"auto"` 自动映射对应渠道的零思考极速参数，如 Gemini 3+ `minimal`、百炼 `enable_thinking=false`、火山方舟/官方 DeepSeek `thinking.type="disabled"`）。
 - **精修提示词与前缀缓存组织（`refiner.prompt`、`include_git_status`、`context_max_chars`）**：`prompt` 默认留空 `""` 时使用内置自适应英文语音听写编辑提示词（`agent` 模式结合只读 `<session_reference_log>`、`<workspace_git_status>` 与常见研发/AI 术语修准同音错词并消解口语中途改口，`general` 模式面向日常口述自然润色且不掺入代码语境；显式配置非空 `prompt = '''...'''` 则覆盖两模式默认提示词）。终端历史对话（默认上限 `context_max_chars = 200000` 字符，满窗按四分之一即 `50K` 整块滑出）按固定只读分块置于前部（`/responses` 下作 `developer` 消息块，`/chat/completions` 下置于单条 `user` 消息前部），末尾 `user` 块依次拼装 `<workspace_git_status>`（`include_git_status = true`，工作树干净时自动补充仓库核心追踪文件名作拼写参考）、`<asr_draft_to_clean>` 与 `<task_reminder>`，稳定命中前缀缓存（`codex` 配合确定性会话 `prompt_cache_key` 与负载均衡亲和性 Cookie 实现高缓存命中且零历史草稿残留；一阶段在 `agent` 模式下亦会在用户 `hotwords.txt` 与实时变更/对话标识符之后自动追加低优 AI/CLI 兜底热词）。
 - **同渠道重试与建连超时（`max_retries`）**：`[asr] max_retries` 与 `[refiner] max_retries` 默认 `2`（`0..10`，指首次请求之外的额外重试次数，`0` 关闭重试），在阶段 `timeout_sec` 总预算与独立的 9 秒建连/TLS 握手超时上限内，区分频率限流（`HTTP 429`、`Retry-After`、厂商 QPS 码）与瞬态通信/5xx 错误分别退避重试。
 - **可选本地 MP3 录音环形归档（`audio.save_recordings`）**：默认关闭（`false`）。显式设为 `true` 时，后台异步通过 `ffmpeg` 将有效非静音录音压缩为 `16 kHz` 单声道 `64 kbps` MP3 以 `0600` 权限保存至 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`，并按修改时间保留最新 `save_recordings_max_count`（默认 `300`，范围 `1..5000`）条，不阻塞实时识别与上屏耗时。
@@ -126,15 +126,15 @@ agent-voice-input start
 | `provider` | 可用阶段 | 内置默认 `asr.model` | 内置默认 `refiner.model` | 凭据来源 / 环境变量 |
 | :--- | :--- | :--- | :--- | :--- |
 | **`codex`** | `refiner` | — | `gpt-6-luna` | 复用本机 `codex` CLI 登录态 *(无状态 HTTP `/responses` 直连 + 30 分钟提前安全刷新，绝不开启 Fast 模式)* |
-| **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` | `qwen-turbo-latest` | `DASHSCOPE_API_KEY` *(兼容 `ALI_API_KEY`)* |
+| **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` *(或单跳 `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(兼容 `ALI_API_KEY`)* |
 | **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` *(自动探测可用槽位)* |
-| **`volcengine`** | `refiner` | — | `doubao-seed-1-6-flash` | `ARK_API_KEY` *(兼容 `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
-| **`openrouter`** | `asr`, `refiner` | `qwen/qwen3-asr-1.7b` | `google/gemini-2.5-flash-lite` | `OPENROUTER_API_KEY` |
-| **`gemini`** | `asr`, `refiner` | `gemini-2.5-flash` *(单跳)* | `gemini-2.5-flash-lite` | `GEMINI_API_KEY` |
+| **`volcengine`** | `refiner` | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(兼容 `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
+| **`openrouter`** | `asr`, `refiner` | `qwen/qwen3-asr-1.7b` | `google/gemini-3.5-flash-lite` | `OPENROUTER_API_KEY` |
+| **`gemini`** | `asr`, `refiner` | `gemini-3.5-flash-lite` *(单跳)* | `gemini-3.5-flash-lite` | `GEMINI_API_KEY` |
 | **`openai`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` | `gpt-4o-mini` | `OPENAI_API_KEY` |
 | **`groq`** | `asr`, `refiner` | `whisper-large-v3-turbo` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
 | **`siliconflow`** | `asr`, `refiner` | `FunAudioLLM/SenseVoiceSmall` | `Qwen/Qwen2.5-7B-Instruct` | `SILICONFLOW_API_KEY` |
-| **`openai-compatible`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` *(需配 `base_url`)* | *(需显式配 `base_url` + `model`)* | `api_key_env` 或 `OPENAI_API_KEY` *(本机回环地址免 Key)* |
+| **`openai-compatible`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` *(需配 `base_url`)* | *(需显式配 `base_url` + `model`，如官方 DeepSeek `deepseek-flash`)* | `api_key_env` 或 `OPENAI_API_KEY` *(本机回环地址免 Key)* |
 
 - `asr.provider = "auto"`（默认）：按 `dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow` 顺序自动选用首个已配置凭据的渠道。
 - `refiner.provider = "off"`：关闭二阶段语境精修。
@@ -160,10 +160,10 @@ provider = "openrouter"
 ```
 
 ```toml
-# 配方 3：多模态单跳音频+上下文直出（OpenRouter 或原生 Gemini，自动跳过二阶段）
+# 配方 3：多模态单跳音频 + 50K 缓存上下文直出（百炼 Qwen-Omni、OpenRouter 或原生 Gemini，自动跳过二阶段）
 [asr]
-provider = "openrouter"          # 若直连 Google 官方 API 可改为 provider = "gemini"（无需填 model）
-model = "google/gemini-2.5-flash"
+provider = "dashscope"           # 亦可设为 provider = "openrouter" 搭配 model = "google/gemini-3.5-flash-lite"，或 provider = "gemini"
+model = "qwen3.8-omni-flash"
 effort = "auto"
 ```
 

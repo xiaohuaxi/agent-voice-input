@@ -98,11 +98,11 @@
 
 聚焦底层模型代际升级、单跳原生音频与双阶段路线实证统一、连续/在途操控体验升级，以及高性价比桌面 IDE 场景感知。
 
-#### `v0.9-1`：单跳原生音频前缀缓存修复、2026 模型换代与双轨实测横评
+#### `v0.9-1`：单跳原生音频前缀缓存修复、2026 模型换代与双轨实测横评（已完成）
 - **背景与方案**：
-  1. **修复单跳多模态前缀缓存归零缺陷与长音频策略**：当前 `GeminiAudioProvider` 与 `ChatAudioAsrProvider` 使用 16K 滑动截尾 `_compose_context_text` 且前置易变 `git_status`，导致每轮前缀偏移、缓存命中率恒为 `0%`。改为统一复用 Stage 2 的 **50K 定界封口 `<session_reference_log>` 分块结构**（静态指令与固定历史块在前，音频与动态工作区状态殿后）；为 `AsrResult` 补齐 `input_tokens` / `cached_input_tokens` / `audio_tokens` / `reasoning_tokens` 遥测提取；对支持长音频的单跳模型放宽整段直传切块阈值并支持轻量 `64 kbps MP3` 编码上传以降低跨境代理带宽耗时。
-  2. **2026 下半年模型代际升级与思考开关适配**：将各渠道残留的 2024–2025 旧默认模型统一升级至 2026 下半年最新轻量长上下文（`>=250K～1M`）主力模型（如 `Codex` 保持 `Luna` 档，`Gemini` 升级至 `gemini-3.5-flash-lite`，`DashScope` 升级至 `qwen3.8-flash` 及单跳 `qwen3.8-omni-flash`，`Volcengine` 升级至 `doubao-seed-2-0-mini` / `2-0-lite` 等）；在 `apply_chat_effort_params` 与 `OpenAICompatibleRefiner` 补齐各厂商混合推理模型的显式关思考参数（如 `enable_thinking: false`、`thinking: {"type": "disabled"}`），避免隐式思维链拖慢首字延迟；补齐 `GeminiRefiner` / `OpenAICompatibleRefiner` 的 `prepare_session()` 连接预热。
-  3. **「双阶段文本精修 vs 原生音频一步到位」实测横评**：基于存量真实录音集与 6 类确定性对抗探针（反问句、列清单劫持、中途改口、生僻代码符号中英混读、首尾底噪抗幻觉、长口述），横向对比端到端延迟、缓存命中率、中英术语准确率与异常降级韧性，确立双轨并存推荐配置（双阶段高韧性默认路线 + 单跳极速可选路线）。
+  1. **修复单跳多模态前缀缓存归零缺陷与长音频策略**：原 `GeminiAudioProvider` 与 `ChatAudioAsrProvider` 使用 16K 滑动截尾 `_compose_context_text` 且前置易变 `git_status`，导致每轮前缀偏移、缓存命中率恒为 `0%`。现已统一复用 Stage 2 的 **50K 定界封口 `<session_reference_log>` 分块结构**（静态指令与已封口历史块在前，OpenRouter `google/*` 精准挂最后一个封口块、`anthropic/*` 双挂封口块与尾块，动态工作区状态、词表提示与音频殿后，且在禁用历史/Git 或 `general` 模式下严格清空旧字段防回退泄露）；为 `AsrResult` / `RefinerResult` 补齐 `input_tokens` / `cached_input_tokens` / `output_tokens` / `reasoning_tokens` / `audio_tokens` 全链路遥测提取；单跳整段直传切块阈值放宽至 `610s`，并对 `>=3s` 音频启用纯内存 `64 kbps MP3` 压缩上传（约 4 倍体积缩减、失败无感回退原 WAV）。
+  2. **2026 下半年模型代际升级与思考开关适配**：各渠道旧默认模型已升级至 2026 下半年最新轻量长上下文（`>=256K～1M`）主力模型（`Codex` 保持 `gpt-6-luna`，`OpenRouter` 与原生 `Gemini` 升级至 `gemini-3.5-flash-lite` 并切换原生 `thinkingLevel` 分代映射，百炼 `DashScope` 升级至 `qwen3.8-flash` 并打通 `qwen3.8-omni-flash` 单跳路由，火山方舟 `Volcengine` 升级至免 `ep-` 直调的 `doubao-seed-2-0-mini-260428`）；新增 `DEFAULT_REFINER_EFFORTS` 按渠道解析默认思考档位，并在 `apply_chat_effort_params` 补齐百炼 `enable_thinking: false`、火山与 DeepSeek 官方 `thinking: {"type": "disabled"}` 及 OpenRouter 强制思考家族 `effort: "minimal"`，消除隐式思维链首字延迟。
+  3. **「双阶段文本精修 vs 原生音频一步到位」实测横评结论（双轨并存就绪）**：经真实录音时间点回放矩阵与跨模型双盲质检核验，双阶段路线（如 `qwen3-asr-flash` 搭配 `codex/gpt-6-luna`、`deepseek-flash` 或 `claude-haiku-5.5`）在微弱气声/近静音边界具备专用 STT 空白帧拦截优势，且在数分钟超长口述上保持稳定编辑力度，继续作为**全局默认稳健主路线**；原生音频单跳路线（如 `google/gemini-3.8-flash`、`google/gemini-3.5-flash-lite` 与国内直连 `dashscope/qwen3.8-omni-flash`）借助原声直听 + 50K 会话上下文显著提升了中英混杂专有名词还原上限，且中长语音端到端延迟低至 `2.5s～4.5s`，作为**低延迟/高术语密度可选高阶路线**正式就绪（`doctor` 对默认单跳透传自动跳过未启用的二阶段凭据检查）。
 - **验证方式**：
   - **自动闭环**：`PYTHONPATH=src python3 -m unittest discover -s tests -v`（覆盖单跳 50K 分块字节稳定性、音频/缓存 Token 解析、各渠道关思考请求参数断言）+ `voice-eval` 多模态与双阶段横向基准脚本全自动跑分。
   - **真机薄验收**：使用更新后的默认模型与单跳极速模式各进行数轮日常长短口述，确认端到端体感延迟与环境底噪零幻觉表现。

@@ -15,7 +15,7 @@ from agent_voice_input.asr_providers import AsrResult, create_asr_provider, load
 from agent_voice_input.audio_proc import _write_temp_0600, list_saved_recordings, process_wav  # noqa: E402
 from agent_voice_input.config import ensure_secure_dir, expand_user_path, get_runtime_dir, load_config, redact_secrets, resolve_credentials, resolve_saved_recordings_dir, select_asr_provider  # noqa: E402
 from agent_voice_input.daemon import _call_refiner_refine, _may_run_stage2_refiner, _transcribe_wav_chunks, read_telemetry_history  # noqa: E402
-from agent_voice_input.refiner import create_refiner  # noqa: E402
+from agent_voice_input.refiner import attach_single_hop_context, create_refiner  # noqa: E402
 from agent_voice_input.session_ctx import SessionMatch, SessionTracker, _clean_agy_record, _clean_claude_record, _collect_claude_storage_matches, _collect_codex_storage_matches, _extract_agy_transcript_cwd, _extract_codex_item_completed, _extract_codex_response_item, _is_agy_transcript_subagent, _resolve_agy_transcript_path  # noqa: E402
 
 _REPO_ROOT = _SRC_ROOT.parent
@@ -244,32 +244,48 @@ def _contains_tech_term(text: str, term: str) -> bool:
 def evaluate_sample_metrics(asr_text: str, final_text: str, *, session_hotwords: Sequence[str] = (), used_fallback: str = "") -> dict[str, Any]:
     draft, out = asr_text.strip(), final_text.strip()
     asr_len, final_len = len(draft), len(out)
-    q_hijack = ("?" in draft or "？" in draft) and not ("?" in out or "？" in out) and final_len > int(asr_len * 1.4) + 20
+    q_hijack = bool(draft) and ("?" in draft or "？" in draft) and not ("?" in out or "？" in out) and final_len > int(asr_len * 1.4) + 20
     term_pool = dict.fromkeys([*_CANONICAL_TECH_TERMS, *(w for w in session_hotwords if len(w) >= 3)])
+    char_ret: float | None = (
+        round(final_len / asr_len, 4)
+        if asr_len > 0
+        else (None if used_fallback == "single_hop_passthrough" else 0.0)
+    )
     return {
-        "asr_chars": asr_len, "final_chars": final_len, "char_retention": round(final_len / asr_len, 4) if asr_len > 0 else 0.0,
+        "asr_chars": asr_len, "final_chars": final_len, "char_retention": char_ret,
         "has_newline": ("\n" in out), "paragraph_count": max(1, sum(1 for p in out.splitlines() if p.strip())) if out else 0,
         "filler_residue_hits": len(_TRAILING_FILLER_RE.findall(out)),
         "canonical_tech_hits": sum(1 for term in term_pool if _contains_tech_term(out, term)),
         "homophone_error_hits": len(_KNOWN_HOMOPHONE_ERROR_RE.findall(out)),
+        "backtick_hits": out.count("`"),
         "hard_gate_fail": bool(any(m in out for m in _LEAKED_MARKERS) or q_hijack),
         "is_fallback": bool(used_fallback and used_fallback != "single_hop_passthrough"),
     }
 
 
+def _sample_e2e_ms(s: Mapping[str, Any]) -> int:
+    if isinstance(s.get("e2e_ms"), (int, float)):
+        return int(s["e2e_ms"])
+    return int(s.get("asr_ms") or 0) + int(s.get("prep_ms") or 0) + int(s.get("refine_ms") or 0)
+
+
 def aggregate_run_metrics(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     valid = [s for s in samples if s.get("ok")]
     long_s = [s for s in valid if float(s.get("duration_sec") or 0.0) >= 10.0]
+    e2e_ms = [_sample_e2e_ms(s) for s in valid]
+    long_e2e_ms = [_sample_e2e_ms(s) for s in long_s]
     asr_ms = [int(s["asr_ms"]) for s in valid if isinstance(s.get("asr_ms"), (int, float))]
     ref_ms = [int(s["refine_ms"]) for s in valid if isinstance(s.get("refine_ms"), (int, float))]
     long_ref_ms = [int(s["refine_ms"]) for s in long_s if isinstance(s.get("refine_ms"), (int, float))]
     warm_hits = [float(s["cache_hit_pct"]) for s in valid if s.get("is_warm") and isinstance(s.get("cache_hit_pct"), (int, float))]
-    ret = [float(s["char_retention"]) for s in valid if int(s.get("asr_chars") or 0) > 0]
-    long_ret = [float(s["char_retention"]) for s in long_s if int(s.get("asr_chars") or 0) > 0]
+    ret = [float(s["char_retention"]) for s in valid if int(s.get("asr_chars") or 0) > 0 and isinstance(s.get("char_retention"), (int, float))]
+    long_ret = [float(s["char_retention"]) for s in long_s if int(s.get("asr_chars") or 0) > 0 and isinstance(s.get("char_retention"), (int, float))]
     r1 = lambda v: round(v, 1) if v is not None else None
     return {
         "total_recordings": len(samples), "valid_samples": len(valid), "long_samples": len(long_s),
         "skipped_samples": len(samples) - len(valid), "asr_cache_hits": sum(1 for s in samples if s.get("asr_cached")),
+        "e2e_ms_p50": r1(_percentile(e2e_ms, 50)), "e2e_ms_p90": r1(_percentile(e2e_ms, 90)),
+        "long_e2e_ms_p50": r1(_percentile(long_e2e_ms, 50)),
         "asr_ms_p50": r1(_percentile(asr_ms, 50)), "asr_ms_p90": r1(_percentile(asr_ms, 90)),
         "refine_ms_p50": r1(_percentile(ref_ms, 50)), "refine_ms_p90": r1(_percentile(ref_ms, 90)),
         "long_refine_ms_p50": r1(_percentile(long_ref_ms, 50)), "warm_cache_hit_pct_p50": r1(_percentile(warm_hits, 50)),
@@ -281,6 +297,8 @@ def aggregate_run_metrics(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any
         "filler_residue_samples": sum(1 for s in valid if int(s.get("filler_residue_hits") or 0) > 0),
         "canonical_tech_hits": sum(int(s.get("canonical_tech_hits") or 0) for s in valid),
         "homophone_error_hits": sum(int(s.get("homophone_error_hits") or 0) for s in valid),
+        "backtick_hits": sum(int(s.get("backtick_hits") or 0) for s in valid),
+        "backtick_samples": sum(1 for s in valid if int(s.get("backtick_hits") or 0) > 0),
         "fallback_count": sum(1 for s in valid if s.get("is_fallback")),
         "hard_gate_fails": sum(1 for s in valid if s.get("hard_gate_fail")),
     }
@@ -290,6 +308,7 @@ def _summary_rows(a: Mapping[str, Any]) -> list[tuple[str, str]]:
     return [
         ("Valid / Total / Long (`>=10s`)", f"{a['valid_samples']} / {a['total_recordings']} / {a['long_samples']}"),
         ("Stage 1 ASR cache hits", f"{a['asr_cache_hits']} / {a['total_recordings']}"),
+        ("End-to-end `e2e_ms` (p50 / p90 / `>=10s` p50)", f"{f(a.get('e2e_ms_p50'))} / {f(a.get('e2e_ms_p90'))} / {f(a.get('long_e2e_ms_p50'))} ms"),
         ("Stage 1 `asr_ms` (p50 / p90)", f"{f(a['asr_ms_p50'])} / {f(a['asr_ms_p90'])} ms"),
         ("Stage 2 `refine_ms` (p50 / p90 / `>=10s` p50)", f"{f(a['refine_ms_p50'])} / {f(a['refine_ms_p90'])} / {f(a['long_refine_ms_p50'])} ms"),
         ("Warm `cache_hit_rate` p50", f(a["warm_cache_hit_pct_p50"], "%")),
@@ -297,22 +316,31 @@ def _summary_rows(a: Mapping[str, Any]) -> list[tuple[str, str]]:
         ("Paragraph split rate (all / `>=10s`)", f"{f(a['multiline_rate_pct'], '%')} / {f(a['long_multiline_rate_pct'], '%')}"),
         ("Trailing filler residue (hits / samples)", f"{a['filler_residue_hits']} / {a['filler_residue_samples']}"),
         ("Canonical tech-term hits / Homophone errors", f"{a['canonical_tech_hits']} / {a['homophone_error_hits']}"),
+        ("Inline backtick violations (hits / samples)", f"{a.get('backtick_hits', 0)} / {a.get('backtick_samples', 0)}"),
         ("Fallbacks / Hard-gate fails", f"{a['fallback_count']} / {a['hard_gate_fails']}"),
     ]
 
 
-def _rescore_paired_sample(s: Mapping[str, Any], shared_hw: Sequence[str]) -> dict[str, Any]:
+def _rescore_paired_sample(s: Mapping[str, Any], shared_hw: Sequence[str], *, fallback_asr_draft: str = "") -> tuple[dict[str, Any], bool]:
     d = dict(s)
-    if d.get("ok") and "asr_draft" in d and "refined_text" in d:
-        d.update(
-            evaluate_sample_metrics(
-                str(d.get("asr_draft") or ""),
-                str(d.get("refined_text") or ""),
-                session_hotwords=shared_hw,
-                used_fallback=str(d.get("used_fallback") or ""),
+    used_paired_draft = False
+    if d.get("ok") and "refined_text" in d:
+        is_sh_pass = str(d.get("used_fallback") or "") == "single_hop_passthrough"
+        own_draft = "" if is_sh_pass else str(d.get("asr_draft") or "").strip()
+        eff_draft = own_draft
+        if not eff_draft and fallback_asr_draft.strip():
+            eff_draft = fallback_asr_draft.strip()
+            used_paired_draft = True
+        if "asr_draft" in d or is_sh_pass or used_paired_draft:
+            d.update(
+                evaluate_sample_metrics(
+                    eff_draft,
+                    str(d.get("refined_text") or ""),
+                    session_hotwords=shared_hw,
+                    used_fallback=str(d.get("used_fallback") or ""),
+                )
             )
-        )
-    return d
+    return d, used_paired_draft
 
 
 def compare_runs(
@@ -323,32 +351,44 @@ def compare_runs(
     b_map = {str(s["recording_sha1"]): s for s in base_data.get("samples", ()) if isinstance(s, Mapping) and s.get("recording_sha1")}
     c_map = {str(s["recording_sha1"]): s for s in cand_data.get("samples", ()) if isinstance(s, Mapping) and s.get("recording_sha1")}
     keys = [k for k in b_map if k in c_map]
-    do_rescore = "meta" in base_data or "meta" in cand_data
+    do_rescore = (
+        "meta" in base_data
+        or "meta" in cand_data
+        or any(s.get("used_fallback") == "single_hop_passthrough" for s in (*b_map.values(), *c_map.values()))
+    )
     b_scored, c_scored = [], []
+    used_paired_ret = False
     for k in keys:
         bs, cs = b_map[k], c_map[k]
         if do_rescore:
             hw = tuple(cs.get("session_hotwords") or bs.get("session_hotwords") or ())
-            bs, cs = _rescore_paired_sample(bs, hw), _rescore_paired_sample(cs, hw)
+            b_draft, c_draft = str(bs.get("asr_draft") or ""), str(cs.get("asr_draft") or "")
+            bs, b_used = _rescore_paired_sample(bs, hw, fallback_asr_draft=c_draft)
+            cs, c_used = _rescore_paired_sample(cs, hw, fallback_asr_draft=b_draft)
+            used_paired_ret = used_paired_ret or b_used or c_used
         b_scored.append(bs)
         c_scored.append(cs)
     b_rows, c_rows = _summary_rows(aggregate_run_metrics(b_scored)), _summary_rows(aggregate_run_metrics(c_scored))
     if diff_out_path is not None:
         md = [f"# Detailed Diff: `{b_tag}` vs `{c_tag}` (paired={len(keys)})", ""]
         for idx, k in enumerate(keys, 1):
-            bs, cs = b_map[k], c_map[k]
+            bs, cs = b_scored[idx - 1], c_scored[idx - 1]
             state = "CHANGED" if bs.get("refined_text", "") != cs.get("refined_text", "") else "IDENTICAL"
             md.extend([
                 f"## #{idx:02d} `{bs.get('recording_name')}` ({bs.get('duration_sec')}s, `{bs.get('session_tag')}`, {state})",
-                f"- Base (`{bs.get('refine_ms')}ms`, ret=`{bs.get('char_retention')}`): {redact_fn(str(bs.get('refined_text') or ''))}",
-                f"- Cand (`{cs.get('refine_ms')}ms`, ret=`{cs.get('char_retention')}`): {redact_fn(str(cs.get('refined_text') or ''))}",
+                f"- Base (`e2e={_sample_e2e_ms(bs)}ms`, `ref={bs.get('refine_ms')}ms`, ret=`{bs.get('char_retention')}`): {redact_fn(str(bs.get('refined_text') or ''))}",
+                f"- Cand (`e2e={_sample_e2e_ms(cs)}ms`, `ref={cs.get('refine_ms')}ms`, ret=`{cs.get('char_retention')}`): {redact_fn(str(cs.get('refined_text') or ''))}",
                 f"- ASR Draft: {redact_fn(str(bs.get('asr_draft') or cs.get('asr_draft') or ''))}",
                 f"- Submitted User Ref: {redact_fn(str(bs.get('submitted_user_ref') or cs.get('submitted_user_ref') or '-'))}", "",
             ])
         _atomic_write_0600(diff_out_path, "\n".join(md))
     out = [f"# Replay A/B Comparison: `{b_tag}` vs `{c_tag}` (paired=`{len(keys)}`)", ""]
     if diff_disp:
-        out.extend([f"- Detailed Diff (`0600`): `{diff_disp}`", ""])
+        out.append(f"- Detailed Diff (`0600`): `{diff_disp}`")
+    if used_paired_ret:
+        out.append("- Note: Single-hop `char_retention` is computed relative to the paired Stage 1 `asr_draft`.")
+    if diff_disp or used_paired_ret:
+        out.append("")
     out.extend([f"| Metric | `{b_tag}` | `{c_tag}` |", "| :--- | ---: | ---: |"])
     out.extend(f"| {lbl} | `{bv}` | `{cv}` |" for (lbl, bv), (_, cv) in zip(b_rows, c_rows))
     return "\n".join(out)
@@ -364,8 +404,11 @@ def main(argv: list[str] | None = None) -> int:
         ("--no-asr-cache", {"dest": "use_asr_cache", "action": "store_false"}), ("--refresh-asr", {"action": "store_true"}),
         ("--min-duration", {"type": float, "default": 0.0}), ("--limit", {"type": int, "default": 0}),
         ("--asr-provider", {"default": ""}), ("--asr-model", {"default": ""}),
+        ("--asr-api", {"default": ""}), ("--asr-effort", {"default": ""}),
         ("--refiner-provider", {"default": ""}), ("--refiner-model", {"default": ""}),
         ("--refiner-api", {"default": ""}), ("--refiner-effort", {"default": ""}),
+        ("--refiner-base-url", {"default": ""}), ("--refiner-api-key-env", {"default": ""}),
+        ("--force-single-hop-refine", {"action": "store_true"}),
         ("--max-chars", {"type": int, "default": 0}), ("--no-git-status", {"action": "store_true"}),
         ("--recordings-dir", {"default": ""}), ("--eval-dir", {"default": ""}),
         ("--host-runtime-dir", {"default": ""}), ("--home-dir", {"default": ""}),
@@ -391,23 +434,36 @@ def main(argv: list[str] | None = None) -> int:
 
     tag = _validate_tag(args.tag)
     ov: dict[str, Any] = {"audio.save_recordings": False}
-    if args.asr_provider.strip():
-        ov.update({"asr.provider": args.asr_provider.strip().lower(), "asr.model": args.asr_model.strip()})
-    elif args.asr_model.strip():
-        ov["asr.model"] = args.asr_model.strip()
+    if ap_val := args.asr_provider.strip().lower():
+        ov["asr.provider"] = ap_val
+        if ap_val != base_cfg.asr.provider:
+            ov.update({"asr.model": "", "asr.api": "auto", "asr.base_url": "", "asr.api_key_env": ""})
+    for attr, key in (("asr_model", "asr.model"), ("asr_api", "asr.api"), ("asr_effort", "asr.effort")):
+        if val := getattr(args, attr).strip():
+            ov[key] = val
     if rp := args.refiner_provider.strip().lower():
         ov["refiner.provider"] = rp
         if rp != base_cfg.refiner.provider:
-            ov.update({"refiner.model": "", "refiner.api": "auto", "refiner.base_url": "", "refiner.api_key_env": ""})
-    for attr, key in (("refiner_model", "refiner.model"), ("refiner_api", "refiner.api"), ("refiner_effort", "refiner.effort")):
+            ov.update({"refiner.model": "", "refiner.api": "auto", "refiner.effort": "", "refiner.base_url": "", "refiner.api_key_env": ""})
+    for attr, key in (
+        ("refiner_model", "refiner.model"),
+        ("refiner_api", "refiner.api"),
+        ("refiner_effort", "refiner.effort"),
+        ("refiner_base_url", "refiner.base_url"),
+        ("refiner_api_key_env", "refiner.api_key_env"),
+    ):
         if val := getattr(args, attr).strip():
             ov[key] = val
+    if args.force_single_hop_refine:
+        ov["refiner.force_on_single_hop"] = True
     if args.max_chars > 0:
         ov["refiner.context_max_chars"] = args.max_chars
     if args.no_git_status:
         ov["refiner.include_git_status"] = False
     cfg, _ = load_config(config_path=args.config or None, cli_overrides=ov, env=env, home_dir=home, load_default_env_files=False)
     creds = resolve_credentials(cfg, env)
+    secrets = list(dict.fromkeys([*secrets, *creds.all_secret_values()]))
+    redact_fn = lambda s: redact_secrets(str(s), env, cfg=cfg, extra_secrets=secrets)
 
     rec_dir = expand_user_path(args.recordings_dir, env=env) if args.recordings_dir else resolve_saved_recordings_dir(env)
     raw_recs = sorted(list_saved_recordings(rec_dir), key=lambda p: (p.stat().st_mtime, p.name))
@@ -472,8 +528,9 @@ def main(argv: list[str] | None = None) -> int:
             for idx_n, (p, rec_sha1, mtime, gate) in enumerate(prepared, 1):
                 stop_ts = _estimate_rec_stop_ts(p, mtime)
                 cutoff_ts, tel = stop_ts - gate.duration_sec, tel_map.get(p.name, {})
-                skey = str(tel.get("session_key") or "").strip()
-                if not skey or skey not in session_idx:
+                rec_mode = "general" if str(tel.get("mode") or "").strip().lower() == "general" else "agent"
+                skey = "" if rec_mode == "general" else str(tel.get("session_key") or "").strip()
+                if rec_mode != "general" and (not skey or skey not in session_idx):
                     skey = _find_fallback_session_by_ts(session_idx, cutoff_ts, stop_ts)
                 snap, submitted_ref = None, ""
                 if skey and skey in session_idx:
@@ -485,14 +542,51 @@ def main(argv: list[str] | None = None) -> int:
                         include_git_info=cfg.refiner.include_git_status,
                     )
                 eff_skey = snap.session_key if snap else ""
-                asr_ctx = tracker.build_asr_context(snap, extra_hotwords=file_hotwords)
+                asr_ctx = tracker.build_asr_context(snap, extra_hotwords=file_hotwords, mode=rec_mode)
+                is_single_hop_asr = bool(getattr(eff_asr, "single_hop", False))
+                if is_single_hop_asr and asr_from_map is None:
+                    asr_ctx = attach_single_hop_context(
+                        cfg,
+                        asr_ctx,
+                        tracker=tracker if snap is not None else None,
+                        session_key=eff_skey,
+                        mode=rec_mode,
+                    )
                 if asr_from_map is not None:
                     src_s = asr_from_map.get(rec_sha1)
                     if src_s is None:
                         raise SystemExit(f"recording {p.name} ({rec_sha1}) missing in --asr-from {args.asr_from!r}")
-                    src_txt = "" if (not src_s.get("ok", True) and src_s.get("skipped_reason") == "empty_asr") else str(src_s.get("asr_draft") or src_s.get("asr_text") or "")
-                    asr_res = AsrResult(src_txt, asr_prov, asr_mod, int(src_s.get("asr_ms") or 0), bool(src_s.get("is_single_hop_refined", False)))
+                    is_empty_skip = not src_s.get("ok", True) and src_s.get("skipped_reason") == "empty_asr"
+                    src_is_sh_pass = str(src_s.get("used_fallback") or "") == "single_hop_passthrough"
+                    if is_empty_skip:
+                        src_txt = ""
+                    else:
+                        src_txt = str(src_s.get("asr_draft") or src_s.get("asr_text") or "")
+                        if not src_txt and src_is_sh_pass:
+                            src_txt = str(src_s.get("refined_text") or "")
+                    src_in_tok = src_s.get("asr_input_tokens") if "asr_input_tokens" in src_s else (src_s.get("input_tokens") if src_is_sh_pass else None)
+                    src_c_tok = src_s.get("asr_cached_input_tokens") if "asr_cached_input_tokens" in src_s else (src_s.get("cached_input_tokens") if src_is_sh_pass else None)
+                    src_o_tok = src_s.get("asr_output_tokens") if "asr_output_tokens" in src_s else (src_s.get("output_tokens") if src_is_sh_pass else None)
+                    src_r_tok = src_s.get("asr_reasoning_tokens") if "asr_reasoning_tokens" in src_s else (src_s.get("reasoning_tokens") if src_is_sh_pass else None)
+                    src_aud_tok = src_s.get("asr_audio_tokens") if "asr_audio_tokens" in src_s else src_s.get("audio_tokens")
+                    asr_res = AsrResult(
+                        src_txt,
+                        asr_prov,
+                        asr_mod,
+                        int(src_s.get("asr_ms") or 0),
+                        bool(src_s.get("is_single_hop_refined", False) or src_is_sh_pass),
+                        input_tokens=src_in_tok if isinstance(src_in_tok, int) else None,
+                        cached_input_tokens=src_c_tok if isinstance(src_c_tok, int) else None,
+                        output_tokens=src_o_tok if isinstance(src_o_tok, int) else None,
+                        reasoning_tokens=src_r_tok if isinstance(src_r_tok, int) else None,
+                        context_chars=int(src_s.get("ctx_chars") or 0) if src_is_sh_pass else 0,
+                        context_chunks=int(src_s.get("ctx_chunks") or 0) if src_is_sh_pass else 0,
+                        audio_tokens=src_aud_tok if isinstance(src_aud_tok, int) else None,
+                    )
                     asr_cached = True
+                elif is_single_hop_asr:
+                    asr_res, _, _ = _transcribe_wav_chunks(gate.wav_bytes, eff_asr=eff_asr, asr_ctx=asr_ctx, floor_dbfs=cfg.audio.floor_dbfs)
+                    asr_cached = False
                 else:
                     ckey, hw_sha1 = make_asr_cache_key(
                         rec_sha1, asr_prov, asr_mod, asr_ctx.hotwords, git_status=asr_ctx.git_status, dialog_text=asr_ctx.dialog_text
@@ -506,31 +600,70 @@ def main(argv: list[str] | None = None) -> int:
                         asr_entries[ckey] = {"recording_sha1": rec_sha1, "asr_provider": asr_prov, "asr_model": asr_mod, "hotwords_sha1": hw_sha1, "hotword_count": len(asr_ctx.hotwords), "text": redact_fn(asr_res.text), "latency_ms": asr_res.latency_ms, "is_single_hop_refined": asr_res.is_single_hop_refined, "chunks": chunks_n, "cached_at": int(time.time())}
                         _atomic_write_0600(asr_cache_path, json.dumps({"version": 1, "entries": asr_entries}, ensure_ascii=False, indent=2) + "\n")
                 if not asr_res.text.strip():
-                    samples_out.append({"recording_name": p.name, "recording_sha1": rec_sha1, "ok": False, "skipped_reason": "empty_asr", "duration_sec": round(gate.duration_sec, 2), "session_tag": _mask_session_key(eff_skey), "asr_cached": asr_cached, "asr_ms": asr_res.latency_ms})
+                    if is_single_hop_asr and eff_skey and asr_res.context_chunks > 0:
+                        seen_warm.add(eff_skey)
+                    skip_rec: dict[str, Any] = {
+                        "recording_name": p.name, "recording_sha1": rec_sha1, "ok": False, "skipped_reason": "empty_asr",
+                        "duration_sec": round(gate.duration_sec, 2), "mode": rec_mode, "session_tag": _mask_session_key(eff_skey),
+                        "asr_cached": asr_cached, "is_single_hop_refined": asr_res.is_single_hop_refined,
+                        "asr_ms": asr_res.latency_ms, "e2e_ms": asr_res.latency_ms, "refined_text": "",
+                    }
+                    if asr_res.input_tokens is not None:
+                        skip_rec.update({
+                            "input_tokens": asr_res.input_tokens, "cached_input_tokens": asr_res.cached_input_tokens,
+                            "output_tokens": asr_res.output_tokens, "reasoning_tokens": asr_res.reasoning_tokens,
+                        })
+                    if asr_res.audio_tokens is not None:
+                        skip_rec["audio_tokens"] = asr_res.audio_tokens
+                    samples_out.append(skip_rec)
                     sys.stderr.write(f"[{idx_n:02d}/{total_n:02d}] dur={gate.duration_sec:5.1f}s SKIP(empty_asr) cached={asr_cached}\n")
                     continue
                 is_warm = bool(eff_skey and eff_skey in seen_warm)
+                prep_ms = 0
                 if eff_skey and not is_warm and _may_run_stage2_refiner(cfg, eff_ref, eff_asr) and callable(getattr(eff_ref, "prepare_session", None)):
+                    t_prep0 = time.monotonic()
                     eff_ref.prepare_session(eff_skey)
-                ref_res = _call_refiner_refine(eff_ref, asr_res, session_key=eff_skey, tracker=tracker, fallback_context=asr_ctx.dialog_text, is_cancelled=None)
+                    prep_ms = max(0, int(round((time.monotonic() - t_prep0) * 1000)))
+                ref_res = _call_refiner_refine(eff_ref, asr_res, session_key=eff_skey, tracker=tracker, fallback_context=asr_ctx.dialog_text, is_cancelled=None, mode=rec_mode)
                 if eff_skey:
                     seen_warm.add(eff_skey)
                 final_txt = ref_res.text.strip() or asr_res.text.strip()
+                is_passthrough = ref_res.used_fallback == "single_hop_passthrough"
+                metric_draft = "" if is_passthrough else asr_res.text.strip()
+                e2e_val = int(asr_res.latency_ms) + int(prep_ms) + int(ref_res.latency_ms)
+                refine_init_total = int(prep_ms) + int(ref_res.init_ms)
                 in_t, c_t = ref_res.input_tokens, ref_res.cached_input_tokens
-                hit_pct = round(100.0 * c_t / in_t, 1) if (in_t and c_t is not None and in_t > 0) else None
-                sys.stderr.write(f"[{idx_n:02d}/{total_n:02d}] dur={gate.duration_sec:5.1f}s asr={asr_res.latency_ms}ms(cached={asr_cached}) ref={ref_res.latency_ms}ms hit={hit_pct if hit_pct is not None else '-'}%\n")
-                samples_out.append({
+                aud_t = ref_res.audio_tokens if ref_res.audio_tokens is not None else asr_res.audio_tokens
+                if not is_passthrough and asr_res.input_tokens is not None and in_t is not None:
+                    tot_in = asr_res.input_tokens + in_t
+                    tot_cached = (asr_res.cached_input_tokens or 0) + (c_t or 0)
+                    hit_pct = round(100.0 * tot_cached / tot_in, 1) if tot_in > 0 else None
+                elif not is_passthrough and in_t is None and asr_res.input_tokens is not None:
+                    hit_pct = round(100.0 * asr_res.cached_input_tokens / asr_res.input_tokens, 1) if (asr_res.cached_input_tokens is not None and asr_res.input_tokens > 0) else None
+                else:
+                    hit_pct = round(100.0 * c_t / in_t, 1) if (in_t and c_t is not None and in_t > 0) else None
+                sys.stderr.write(f"[{idx_n:02d}/{total_n:02d}] dur={gate.duration_sec:5.1f}s e2e={e2e_val}ms asr={asr_res.latency_ms}ms(cached={asr_cached}) ref={ref_res.latency_ms}ms hit={hit_pct if hit_pct is not None else '-'}%\n")
+                rec_out: dict[str, Any] = {
                     "recording_name": p.name, "recording_sha1": rec_sha1, "ok": True, "duration_sec": round(gate.duration_sec, 2),
-                    "session_tag": _mask_session_key(eff_skey), "ctx_chunks": ref_res.context_chunks, "ctx_chars": ref_res.context_chars,
+                    "mode": rec_mode, "session_tag": _mask_session_key(eff_skey), "ctx_chunks": ref_res.context_chunks, "ctx_chars": ref_res.context_chars,
                     "telemetry_ctx_chars": tel.get("ctx_chars"), "hotword_count": len(asr_ctx.hotwords), "asr_cached": asr_cached,
                     "is_single_hop_refined": asr_res.is_single_hop_refined,
-                    "asr_ms": asr_res.latency_ms, "refine_init_ms": ref_res.init_ms, "refine_ms": ref_res.latency_ms, "is_warm": is_warm,
+                    "e2e_ms": e2e_val, "asr_ms": asr_res.latency_ms, "prep_ms": prep_ms, "refine_init_ms": refine_init_total, "refine_ms": ref_res.latency_ms, "is_warm": is_warm,
                     "input_tokens": in_t, "cached_input_tokens": c_t, "output_tokens": ref_res.output_tokens, "reasoning_tokens": ref_res.reasoning_tokens,
+                    "audio_tokens": aud_t,
                     "cache_hit_pct": hit_pct, "used_fallback": redact_fn(ref_res.used_fallback),
                     "session_hotwords": [redact_fn(w) for w in (snap.hotwords[:40] if snap else ())],
-                    **evaluate_sample_metrics(asr_res.text, final_txt, session_hotwords=snap.hotwords if snap else (), used_fallback=ref_res.used_fallback),
-                    "asr_draft": redact_fn(asr_res.text.strip()), "refined_text": redact_fn(final_txt), "submitted_user_ref": redact_fn(submitted_ref),
-                })
+                    **evaluate_sample_metrics(metric_draft, final_txt, session_hotwords=snap.hotwords if snap else (), used_fallback=ref_res.used_fallback),
+                    "asr_draft": redact_fn(metric_draft), "refined_text": redact_fn(final_txt), "submitted_user_ref": redact_fn(submitted_ref),
+                }
+                if not is_passthrough and asr_res.input_tokens is not None:
+                    rec_out.update({
+                        "asr_input_tokens": asr_res.input_tokens,
+                        "asr_cached_input_tokens": asr_res.cached_input_tokens,
+                        "asr_output_tokens": asr_res.output_tokens,
+                        "asr_reasoning_tokens": asr_res.reasoning_tokens,
+                    })
+                samples_out.append(rec_out)
         finally:
             eff_ref.close()
 

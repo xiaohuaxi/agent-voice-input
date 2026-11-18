@@ -25,6 +25,7 @@ from .asr_providers import (
 from .audio_proc import (
     AudioGateResult,
     DEFAULT_MAX_CHUNK_SEC,
+    SINGLE_HOP_MAX_CHUNK_SEC,
     inspect_wav_chunks,
     process_wav,
     save_failed_audio,
@@ -51,7 +52,7 @@ from .platform_wsl import (
     WslPlatform,
     is_windows_terminal_process,
 )
-from .refiner import BaseRefiner, RefinerResult, create_refiner
+from .refiner import BaseRefiner, RefinerResult, attach_single_hop_context, create_refiner
 from .session_ctx import SessionSnapshot, SessionTracker, parse_window_title_hint
 
 
@@ -88,6 +89,7 @@ class PipelineResult:
     total_ms: int = 0
     ctx_chars: int = 0
     ctx_chunks: int = 0
+    mode: str = "agent"
 
 
 def build_pipeline_summary(
@@ -113,6 +115,7 @@ def build_pipeline_summary(
         "ok": res.ok,
         "skipped_reason": res.skipped_reason,
         "audio_source": res.audio_source,
+        "mode": res.mode,
         "switched_fallback": res.switched_fallback,
         "session_key": res.session.session_key if res.session else "",
         "asr_provider": res.asr.provider if res.asr else "",
@@ -142,6 +145,22 @@ def build_pipeline_summary(
     }
     if in_tok is not None and in_tok > 0 and cached_tok is not None:
         summary["cache_hit_pct"] = round(100.0 * cached_tok / in_tok, 1)
+    if res.asr and res.asr.is_single_hop_refined:
+        summary["is_single_hop_refined"] = True
+    if res.refined and res.refined.audio_tokens is not None:
+        summary["audio_tokens"] = res.refined.audio_tokens
+    if (
+        res.asr
+        and (res.asr.input_tokens is not None or res.asr.audio_tokens is not None)
+        and (res.refined is None or res.refined.used_fallback != "single_hop_passthrough")
+    ):
+        if res.asr.input_tokens is not None:
+            summary["asr_input_tokens"] = res.asr.input_tokens
+            summary["asr_cached_input_tokens"] = res.asr.cached_input_tokens
+            summary["asr_output_tokens"] = res.asr.output_tokens
+            summary["asr_reasoning_tokens"] = res.asr.reasoning_tokens
+        if res.asr.audio_tokens is not None:
+            summary["asr_audio_tokens"] = res.asr.audio_tokens
     if res.asr and res.asr.retries > 0:
         summary["asr_retries"] = res.asr.retries
     if res.refined and res.refined.retries > 0:
@@ -500,19 +519,31 @@ def _call_refiner_refine(
     return eff_refiner.refine(asr_res, **kw)
 
 
+def _is_single_hop_asr_provider(eff_asr: BaseAsrProvider) -> bool:
+    return bool(
+        isinstance(eff_asr, (GeminiAudioProvider, ChatAudioAsrProvider))
+        or getattr(eff_asr, "single_hop", False)
+    )
+
+
 def _transcribe_wav_chunks(
     wav_bytes: bytes,
     *,
     eff_asr: BaseAsrProvider,
     asr_ctx: Any,
     floor_dbfs: float,
-    max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
+    max_chunk_sec: float | None = None,
     seq_id: int = 1,
     is_current_seq: Callable[[int], bool] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[AsrResult, int, tuple[float, ...]]:
     cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled)
-    infos = inspect_wav_chunks(wav_bytes, max_chunk_sec=max_chunk_sec, floor_dbfs=floor_dbfs)
+    eff_max_chunk_sec = (
+        (SINGLE_HOP_MAX_CHUNK_SEC if _is_single_hop_asr_provider(eff_asr) else DEFAULT_MAX_CHUNK_SEC)
+        if max_chunk_sec is None
+        else float(max_chunk_sec)
+    )
+    infos = inspect_wav_chunks(wav_bytes, max_chunk_sec=eff_max_chunk_sec, floor_dbfs=floor_dbfs)
     if len(infos) <= 1:
         if cancel_check is not None and cancel_check():
             return AsrResult(text="", provider=getattr(eff_asr, "provider_name", ""), model="", latency_ms=0), 1, ()
@@ -557,6 +588,10 @@ def _transcribe_wav_chunks(
                 raise first_exc[0]
             raise
 
+    def _sum_opt(vals: Sequence[int | None]) -> int | None:
+        present = [v for v in vals if v is not None]
+        return sum(present) if present else None
+
     non_null = [r for r in results if r is not None]
     merged_text = _join_chunk_texts([r.text for r in non_null if r.text.strip()])
     elapsed_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
@@ -573,6 +608,13 @@ def _transcribe_wav_chunks(
             latency_ms=elapsed_ms,
             is_single_hop_refined=single_hop,
             retries=total_retries,
+            input_tokens=_sum_opt([r.input_tokens for r in non_null]),
+            cached_input_tokens=_sum_opt([r.cached_input_tokens for r in non_null]),
+            output_tokens=_sum_opt([r.output_tokens for r in non_null]),
+            reasoning_tokens=_sum_opt([r.reasoning_tokens for r in non_null]),
+            context_chars=max((r.context_chars for r in non_null), default=0),
+            context_chunks=max((r.context_chunks for r in non_null), default=0),
+            audio_tokens=_sum_opt([r.audio_tokens for r in non_null]),
         ),
         len(infos),
         chunk_secs,
@@ -636,7 +678,7 @@ def run_pipeline_once(
     deliver_fn: Callable[[str, ForegroundWindow], PasteOutcome] | None = None,
     on_stage: Callable[[str], None] | None = None,
     runtime_dir: Path | None = None,
-    max_chunk_sec: float = DEFAULT_MAX_CHUNK_SEC,
+    max_chunk_sec: float | None = None,
     env: Mapping[str, str] | None = None,
     archive_sink: Callable[[threading.Thread], None] | None = None,
     mode: str = "auto",
@@ -716,6 +758,14 @@ def run_pipeline_once(
                     else eff_tracker.sync_session(window_title=window_title_override)
                 )
             asr_ctx = eff_tracker.build_asr_context(snap, mode=eff_mode)
+            if _is_single_hop_asr_provider(eff_asr):
+                asr_ctx = attach_single_hop_context(
+                    cfg,
+                    asr_ctx,
+                    tracker=eff_tracker if snap is not None else None,
+                    session_key=snap.session_key if snap else "",
+                    mode=eff_mode,
+                )
             sync_ms = _elapsed_ms(t_sync0)
             cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled)
             prep_ms = 0
@@ -756,17 +806,18 @@ def run_pipeline_once(
                         sync_ms=sync_ms,
                         refine_init_ms=prep_ms,
                         total_ms=_elapsed_ms(t_total0),
+                        mode=eff_mode,
                     )
                 raise
             if not asr_res.text.strip():
                 if cancel_check is not None and cancel_check():
                     saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                    return PipelineResult(False, seq_id, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0))
+                    return PipelineResult(False, seq_id, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0), mode=eff_mode)
                 saved_p = _stash_failed(gate, snap, win)
-                return PipelineResult(False, seq_id, skipped_reason="empty_asr", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0))
+                return PipelineResult(False, seq_id, skipped_reason="empty_asr", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0), mode=eff_mode)
             if cancel_check is not None and cancel_check():
                 saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                return PipelineResult(False, seq_id, final_text=asr_res.text.strip(), skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0))
+                return PipelineResult(False, seq_id, final_text=asr_res.text.strip(), skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0), mode=eff_mode)
             if _will_run_stage2_refiner(cfg, eff_refiner, asr_res) and on_stage is not None:
                 on_stage("refining")
             ref_res = _call_refiner_refine(
@@ -784,7 +835,7 @@ def run_pipeline_once(
             final_text = ref_res.text.strip() or asr_res.text.strip()
             if cancel_check is not None and cancel_check():
                 saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks)
+                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks, mode=eff_mode)
             deliver_ms = 0
             if dry_run or (platform is None and deliver_fn is None):
                 paste_out = None
@@ -804,9 +855,9 @@ def run_pipeline_once(
                 deliver_ms = _elapsed_ms(t_deliv0)
             if paste_out is not None and paste_out.reason == "cancelled" and cancel_check is not None and cancel_check():
                 saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, deliver_ms=deliver_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks)
+                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, deliver_ms=deliver_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks, mode=eff_mode)
             saved_p = _stash_failed(gate, snap, win) if (paste_out is not None and not paste_out.pasted and not paste_out.clipboard) else ""
-            return PipelineResult(True, seq_id, final_text=final_text, audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, paste=paste_out, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, deliver_ms=deliver_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks)
+            return PipelineResult(True, seq_id, final_text=final_text, audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, paste=paste_out, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, deliver_ms=deliver_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks, mode=eff_mode)
         except Exception as exc:
             if saved_p := _stash_failed(gate, snap, win):
                 try:

@@ -772,9 +772,11 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         out = ref.refine("火山初稿", fallback_context="user: hi")
         self.assertEqual(out.text, "整理后的火山输出" if False else "整理后的云端输出")
         self.assertEqual(out.provider, "volcengine")
-        self.assertEqual(out.model, "doubao-seed-1-6-flash")
+        self.assertEqual(out.model, "doubao-seed-2-0-mini-260428")
         self.assertEqual(seen[0].url, "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
         self.assertEqual(seen[0].headers.get("Authorization"), f"Bearer {fake_val}")
+        volc_payload = json.loads(seen[0].body.decode("utf-8"))
+        self.assertEqual(volc_payload.get("thinking"), {"type": "disabled"})
 
         def err_transport(_req: HttpRequest) -> HttpResponse:
             return HttpResponse(500, {}, f"upstream leaked {fake_val}".encode("utf-8"))
@@ -785,12 +787,19 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         self.assertEqual(fb.used_fallback, "asr_draft")
         self.assertNotIn(fake_val, fb.warning)
 
-        # 2. OpenRouter, DashScope, Groq, SiliconFlow, OpenAI, and keyless loopback openai-compatible
+        # 2. OpenRouter, DashScope, Volcengine, DeepSeek, Groq, SiliconFlow, OpenAI, and keyless loopback openai-compatible
         matrix = [
-            ("openrouter", "", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "low"}}),
-            ("openrouter", "", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "none"}}),
-            ("openrouter", "", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {}),
-            ("dashscope", "", "", "low", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen-turbo-latest", {}),
+            ("openrouter", "", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.5-flash-lite", {"reasoning": {"effort": "minimal"}}),
+            ("openrouter", "", "", "none", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.5-flash-lite", {"reasoning": {"effort": "minimal"}}),
+            ("openrouter", "", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.5-flash-lite", {"reasoning": {"effort": "low"}}),
+            ("openrouter", "", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.5-flash-lite", {}),
+            ("openrouter", "google/gemini-2.5-flash-lite", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "low"}}),
+            ("openrouter", "google/gemini-2.5-flash-lite", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "none"}}),
+            ("openrouter", "google/gemini-2.5-flash-lite", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {}),
+            ("openrouter", "minimax/minimax-m3.1-flash", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "minimax/minimax-m3.1-flash", {"reasoning": {"effort": "minimal"}}),
+            ("openrouter", "anthropic/claude-haiku-5.5", "", "none", "https://openrouter.ai/api/v1/chat/completions", "anthropic/claude-haiku-5.5", {"reasoning": {"effort": "none"}}),
+            ("dashscope", "", "", "auto", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.8-flash", {"enable_thinking": False}),
+            ("dashscope", "", "", "low", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.8-flash", {"enable_thinking": True}),
             ("groq", "", "", "low", "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile", {}),
             ("siliconflow", "", "", "low", "https://api.siliconflow.cn/v1/chat/completions", "Qwen/Qwen2.5-7B-Instruct", {}),
             # gpt-4o-mini omits reasoning_effort so default [refiner] provider="openai" never 400s
@@ -800,13 +809,14 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             ("openai", "gpt-5-mini", "", "default", "https://api.openai.com/v1/chat/completions", "gpt-5-mini", {}),
             ("openai", "gpt-6-luna", "", "auto", "https://api.openai.com/v1/chat/completions", "gpt-6-luna", {}),
             ("openrouter", "openai/o3-mini", "", "low", "https://openrouter.ai/api/v1/chat/completions", "openai/o3-mini", {"reasoning": {"effort": "low"}}),
-            ("openai-compatible", "local-qwen", "http://127.0.0.1:8000/v1", "low", "http://127.0.0.1:8000/v1/chat/completions", "local-qwen", {}),
+            ("openai-compatible", "deepseek-flash", "https://api.deepseek.com/v1", "auto", "https://api.deepseek.com/v1/chat/completions", "deepseek-flash", {"thinking": {"type": "disabled"}}),
+            ("openai-compatible", "local-qwen", "http://127.0.0.1:8000/v1", "auto", "http://127.0.0.1:8000/v1/chat/completions", "local-qwen", {}),
         ]
         no_temp_models = {"o4-mini", "gpt-5-mini", "gpt-6-luna", "openai/o3-mini"}
         for prov, m_override, b_url, eff, exp_url, exp_model, exp_extra in matrix:
             with self.subTest(prov=prov, model=m_override, effort=eff):
                 seen.clear()
-                sub_env = {} if prov == "openai-compatible" else env
+                sub_env = {} if (prov == "openai-compatible" and "127.0.0.1" in b_url) else env
                 c = Config(refiner=RefinerConfig(provider=prov, model=m_override, base_url=b_url, effort=eff))
                 r_inst = create_refiner(c, resolve_credentials(c, sub_env), env=sub_env, transport=ok_transport)
                 res_m = r_inst.refine("测试初稿")
@@ -825,6 +835,10 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
                     self.assertNotIn("reasoning", p_json)
                 if "reasoning_effort" not in exp_extra:
                     self.assertNotIn("reasoning_effort", p_json)
+                if "thinking" not in exp_extra:
+                    self.assertNotIn("thinking", p_json)
+                if "enable_thinking" not in exp_extra:
+                    self.assertNotIn("enable_thinking", p_json)
 
         # 3. Native Gemini Stage 2 refiner (:generateContent + thinkingConfig + thought filtering + fallback redaction)
         gem_seen: list[HttpRequest] = []
@@ -857,10 +871,20 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         gem_out = gem_ref.refine("Gemini 初稿", fallback_context="上下文")
         self.assertEqual(gem_out.text, "Gemini 精修定稿")
         self.assertEqual(gem_out.provider, "gemini")
-        self.assertEqual(gem_out.model, "gemini-2.5-flash-lite")
-        self.assertIn("models/gemini-2.5-flash-lite:generateContent", gem_seen[0].url)
+        self.assertEqual(gem_out.model, "gemini-3.5-flash-lite")
+        self.assertIn("models/gemini-3.5-flash-lite:generateContent", gem_seen[0].url)
         gem_body = json.loads(gem_seen[0].body.decode("utf-8"))
-        self.assertEqual(gem_body["generationConfig"]["thinkingConfig"], {"thinkingBudget": 1024})
+        self.assertEqual(gem_body["generationConfig"]["thinkingConfig"], {"thinkingLevel": "low"})
+
+        # Legacy Gemini 2.5 keeps thinkingBudget
+        gem_seen.clear()
+        cfg_gem25 = Config(refiner=RefinerConfig(provider="gemini", model="gemini-2.5-flash-lite", effort="low"))
+        gem_ref25 = create_refiner(cfg_gem25, resolve_credentials(cfg_gem25, env), env=env, transport=gem_ok_tx)
+        gem_ref25.refine("Gemini 2.5 初稿")
+        self.assertEqual(
+            json.loads(gem_seen[0].body.decode("utf-8"))["generationConfig"]["thinkingConfig"],
+            {"thinkingBudget": 1024},
+        )
 
         gem_err_ref = GeminiRefiner(
             cfg_gem,
@@ -1676,7 +1700,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn("selected=openrouter (model=qwen/qwen3-asr-1.7b, api=audio-transcriptions, effort=auto) -> OK", out)
             self.assertIn("openrouter=OK (via OPENROUTER_API_KEY)", out)
-            self.assertIn("[refiner]   OK openrouter (model=google/gemini-2.5-flash-lite, api=chat-completions, effort=low)", out)
+            self.assertIn("[refiner]   OK openrouter (model=google/gemini-3.5-flash-lite, api=chat-completions, effort=low)", out)
             self.assertNotIn(secret_or, out)
 
             # Doctor with codex auth.json (verifying api=responses and zero leakage of access_token / account_id)
@@ -7032,6 +7056,220 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
                 self.assertFalse(pulse_called)
             finally:
                 daemon.close()
+
+    def test_v091_noop_passthrough_telemetry_openrouter_refiner_cache_and_pipeline_single_hop(self) -> None:
+        from unittest import mock
+        from agent_voice_input import prompts
+        from agent_voice_input.daemon import build_pipeline_summary, run_pipeline_once
+        from agent_voice_input.refiner import NoopRefiner, REFINER_SYSTEM_PROMPT, attach_single_hop_context
+        from agent_voice_input.session_ctx import SessionMatch
+
+        # 1. prompts.py shared constants match refiner exports and enforce backtick/silence rules on single-hop
+        self.assertEqual(prompts.REFINER_SYSTEM_PROMPT, REFINER_SYSTEM_PROMPT)
+        self.assertIn("never `refiner.py`", prompts.SINGLE_HOP_SYSTEM_PROMPT)
+        self.assertIn("output nothing at all", prompts.SINGLE_HOP_SYSTEM_PROMPT)
+
+        # 2. NoopRefiner forwards single-hop AsrResult token & context telemetry cleanly
+        sh_asr_res = AsrResult(
+            text="一步到位结果",
+            provider="dashscope",
+            model="qwen3.8-omni-flash",
+            latency_ms=890,
+            is_single_hop_refined=True,
+            input_tokens=12321,
+            cached_input_tokens=10752,
+            output_tokens=15,
+            reasoning_tokens=0,
+            context_chars=65432,
+            context_chunks=2,
+            audio_tokens=210,
+        )
+        noop_res = NoopRefiner().refine(sh_asr_res)
+        self.assertEqual(noop_res.used_fallback, "single_hop_passthrough")
+        self.assertEqual(noop_res.input_tokens, 12321)
+        self.assertEqual(noop_res.cached_input_tokens, 10752)
+        self.assertEqual(noop_res.output_tokens, 15)
+        self.assertEqual(noop_res.reasoning_tokens, 0)
+        self.assertEqual(noop_res.audio_tokens, 210)
+        self.assertEqual(noop_res.context_chars, 65432)
+        self.assertEqual(noop_res.context_chunks, 2)
+
+        # 3. OpenRouter Stage 2 refiner attaches cache_control on last sealed block for google/*,
+        #    while DashScope keeps user.content as a single plain string
+        seen_reqs: list[HttpRequest] = []
+
+        def tx(req: HttpRequest) -> HttpResponse:
+            seen_reqs.append(req)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": "精修文本"}}]}).encode("utf-8"),
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            jpath = root / "sess.jsonl"
+            jpath.write_text(
+                "\n".join(
+                    json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": ("长历史块内容_" * 5000) + f"#{i}"})
+                    for i in range(4)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            tracker = SessionTracker(home_dir=root, runtime_dir=root / "rt", proc_root=root / "no_proc", env={})
+            snap = tracker.sync_session(
+                match=SessionMatch(cli="agy", session_id="s-cache", jsonl_path=str(jpath), cwd="", matched_by="test"),
+                include_git_info=False,
+            )
+            assert snap is not None
+
+            env = {"OPENROUTER_API_KEY": "sk-or-" + ("x" * 16), "DASHSCOPE_API_KEY": "sk-ali-" + ("y" * 16)}
+            cfg_or = Config(refiner=RefinerConfig(provider="openrouter"))
+            or_ref = create_refiner(cfg_or, resolve_credentials(cfg_or, env), env=env, transport=tx)
+            or_out = or_ref.refine("初稿", session_key=snap.session_key, tracker=tracker)
+            self.assertGreaterEqual(or_out.context_chunks, 2)
+            or_msg_content = json.loads(seen_reqs[0].body.decode("utf-8"))["messages"][1]["content"]
+            self.assertIsInstance(or_msg_content, list)
+            sealed_idx = or_out.context_chunks - 2
+            self.assertEqual(or_msg_content[sealed_idx].get("cache_control"), {"type": "ephemeral"})
+            self.assertNotIn("cache_control", or_msg_content[or_out.context_chunks - 1])
+
+            seen_reqs.clear()
+            cfg_ali = Config(refiner=RefinerConfig(provider="dashscope"))
+            ali_ref = create_refiner(cfg_ali, resolve_credentials(cfg_ali, env), env=env, transport=tx)
+            ali_ref.refine("初稿", session_key=snap.session_key, tracker=tracker)
+            ali_msg_content = json.loads(seen_reqs[0].body.decode("utf-8"))["messages"][1]["content"]
+            self.assertIsInstance(ali_msg_content, str)
+
+            # 4. run_pipeline_once attaches 50K blocks for terminal single-hop ASR, skips sync in coding_gui,
+            #    and propagates single-hop token telemetry into build_pipeline_summary
+            seen_ctxs: list[Any] = []
+
+            class _FakeSingleHopAsr:
+                provider_name = "dashscope"
+                single_hop = True
+
+                def transcribe(self, wav_bytes: bytes, context=None, **kw) -> AsrResult:
+                    seen_ctxs.append(context)
+                    return sh_asr_res
+
+            voiced = _voiced_wav()
+            tracker_term = mock.MagicMock(wraps=tracker)
+            tracker_term.sync_session.return_value = snap
+            res_term = run_pipeline_once(
+                voiced,
+                cfg=Config(refiner=RefinerConfig(provider="codex")),
+                tracker=tracker_term,
+                asr_provider=_FakeSingleHopAsr(),  # type: ignore[arg-type]
+                origin_window=ForegroundWindow(1, "WindowsTerminal.exe", "agy [#s-cache]"),
+                dry_run=True,
+                env=env,
+            )
+            self.assertTrue(res_term.ok)
+            self.assertGreaterEqual(len(seen_ctxs[0].context_blocks), 2)
+            summary_term = build_pipeline_summary(1, res_term, dry_run=True)
+            self.assertEqual(summary_term["input_tokens"], 12321)
+            self.assertEqual(summary_term["cached_input_tokens"], 10752)
+            self.assertEqual(summary_term["cache_hit_pct"], 87.3)
+            self.assertNotIn("asr_input_tokens", summary_term)
+
+            # coding_gui MUST isolate background CLI sessions in single-hop mode too
+            seen_ctxs.clear()
+            res_ide = run_pipeline_once(
+                voiced,
+                cfg=Config(refiner=RefinerConfig(provider="codex")),
+                tracker=tracker,
+                asr_provider=_FakeSingleHopAsr(),  # type: ignore[arg-type]
+                origin_window=ForegroundWindow(2, "Code.exe", "refiner.py - Visual Studio Code"),
+                dry_run=True,
+                env=env,
+            )
+            self.assertTrue(res_ide.ok)
+            self.assertEqual(seen_ctxs[0].context_blocks, ())
+            self.assertEqual(seen_ctxs[0].mode, "agent")
+
+            # attach_single_hop_context in general mode AND context_max_chars=0/include_git_status=False
+            # clears legacy dialog_text & git_status so single-hop ASR never leaks disabled context!
+            base_with_legacy = tracker.build_asr_context(snap, mode="agent")
+            self.assertTrue(base_with_legacy.dialog_text)
+            gen_ctx = attach_single_hop_context(
+                Config(),
+                base_with_legacy,
+                tracker=tracker,
+                session_key=snap.session_key,
+                mode="general",
+            )
+            self.assertEqual(gen_ctx.mode, "general")
+            self.assertEqual(gen_ctx.context_blocks, ())
+            self.assertEqual(gen_ctx.git_block, "")
+            self.assertEqual(gen_ctx.dialog_text, "")
+            self.assertEqual(gen_ctx.git_status, "")
+            self.assertTrue(gen_ctx.single_hop_prepared)
+
+            cfg_zero_ctx = Config(refiner=RefinerConfig(context_max_chars=0, include_git_status=False))
+            zero_ctx = attach_single_hop_context(
+                cfg_zero_ctx,
+                AsrContext(hotwords=["SessionTracker"], dialog_text="SECRET_DIALOG_LEAK", git_status="SECRET_GIT_LEAK"),
+                tracker=tracker,
+                session_key=snap.session_key,
+                mode="agent",
+            )
+            self.assertEqual(zero_ctx.context_blocks, ())
+            self.assertEqual(zero_ctx.git_block, "")
+            self.assertEqual(zero_ctx.dialog_text, "")
+            self.assertEqual(zero_ctx.git_status, "")
+            self.assertTrue(zero_ctx.single_hop_prepared)
+
+            sh_reqs: list[HttpRequest] = []
+            from agent_voice_input.asr_providers import create_asr_provider
+
+            def sh_tx(r: HttpRequest) -> HttpResponse:
+                sh_reqs.append(r)
+                return HttpResponse(200, {"content-type": "application/json"}, json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8"))
+
+            cfg_sh_ali = Config()
+            cfg_sh_ali.asr.provider = "dashscope"
+            cfg_sh_ali.asr.model = "qwen3.8-omni-flash"
+            cfg_sh_ali.asr.hotwords_file = ""
+            sh_prov = create_asr_provider(cfg_sh_ali, resolve_credentials(cfg_sh_ali, env), env=env, transport=sh_tx)
+            sh_prov.transcribe(voiced, context=zero_ctx)
+            sh_user_txt = json.dumps(json.loads(sh_reqs[0].body.decode("utf-8"))["messages"][1]["content"], ensure_ascii=False)
+            self.assertNotIn("SECRET_DIALOG_LEAK", sh_user_txt)
+            self.assertNotIn("SECRET_GIT_LEAK", sh_user_txt)
+            self.assertNotIn("<session_context>", sh_user_txt)
+
+            # Direct programmatic create_refiner rejects openai-compatible missing base_url / model (never leaks to api.openai.com)
+            with self.assertRaises(ConfigError):
+                create_refiner(Config(refiner=RefinerConfig(provider="openai-compatible", model="deepseek-flash")), env=env)
+            with self.assertRaises(ConfigError):
+                create_refiner(Config(refiner=RefinerConfig(provider="openai-compatible", base_url="https://api.deepseek.com/v1")), env=env)
+
+            # _clean_out strips echoed <asr_draft_to_clean> wrapper unless literal tag existed in input draft
+            from agent_voice_input.refiner import _clean_out
+
+            self.assertEqual(_clean_out("<asr_draft_to_clean>\n精修正文", "原始初稿"), "精修正文")
+            self.assertEqual(_clean_out("<asr_draft_to_clean>\n精修正文\n</asr_draft_to_clean>", "原始初稿"), "精修正文")
+            self.assertEqual(_clean_out("<asr_draft_to_clean> 字面讨论", "<asr_draft_to_clean> 字面讨论"), "<asr_draft_to_clean> 字面讨论")
+
+            # _cmd_doctor reports single-hop passthrough bypass and succeeds (rc=0) even without Codex login
+            import io
+            from agent_voice_input import cli as cli_mod
+
+            cfg_doc_sh = Config(refiner=RefinerConfig(provider="codex"))
+            cfg_doc_sh.asr.provider = "dashscope"
+            cfg_doc_sh.asr.model = "qwen3.8-omni-flash"
+            buf_doc_sh = io.StringIO()
+            no_codex_env = {"HOME": str(root / "empty_home"), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(root / "rt_doc"), "DASHSCOPE_API_KEY": env["DASHSCOPE_API_KEY"], "PATH": ""}
+            with (
+                mock.patch.object(cli_mod, "is_wsl", return_value=False),
+                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.platform", "linux"),
+                mock.patch("sys.stdout", buf_doc_sh),
+            ):
+                rc_doc_sh = cli_mod._cmd_doctor(cfg_doc_sh, no_codex_env)
+            self.assertEqual(rc_doc_sh, 0, buf_doc_sh.getvalue())
+            self.assertIn("bypassed (single-hop ASR passthrough", buf_doc_sh.getvalue())
 
 
 if __name__ == "__main__":

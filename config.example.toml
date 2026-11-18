@@ -59,18 +59,19 @@ beep = false
 #   dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow
 provider = "auto"
 # Upstream model ID (kept verbatim; leave empty "" to use the provider's built-in default):
-# - dashscope         -> "qwen3-asr-flash" (also supports "fun-asr-realtime" / "qwen-audio-turbo-latest")
+# - dashscope         -> "qwen3-asr-flash" (dedicated STT; also supports "fun-asr-realtime", "qwen-audio-turbo-latest", or single-hop "qwen3.8-omni-flash")
 # - doubao            -> "bigmodel"
-# - openrouter        -> "qwen/qwen3-asr-1.7b" (dedicated STT) or e.g. "google/gemini-2.5-flash" / "openai/gpt-audio-mini" (single-hop chat audio)
-# - gemini            -> "gemini-2.5-flash" (native :generateContent single-hop audio + context refinement; skips Stage 2 by default)
+# - openrouter        -> "qwen/qwen3-asr-1.7b" (dedicated STT) or e.g. "google/gemini-3.5-flash-lite" / "qwen/qwen3.8-omni-flash" / "openai/gpt-audio-mini" (single-hop chat audio)
+# - gemini            -> "gemini-3.5-flash-lite" (native :generateContent single-hop audio + context refinement; skips Stage 2 by default)
 # - openai            -> "gpt-4o-mini-transcribe"
 # - groq              -> "whisper-large-v3-turbo"
 # - siliconflow       -> "FunAudioLLM/SenseVoiceSmall"
 # - openai-compatible -> "gpt-4o-mini-transcribe" (requires explicit base_url, e.g. local faster-whisper-server)
 model = ""
-# Wire protocol for OpenRouter / OpenAI-compatible channels:
-# "auto" | "audio-transcriptions" (dedicated STT -> Stage 2) | "chat-completions" (multimodal single-hop audio + context; skips Stage 2 by default)
-# Note: "auto" classifies known STT vs multimodal audio models automatically; for uncataloged models on "openrouter", set api explicitly.
+# Wire protocol for DashScope / OpenRouter / OpenAI-compatible channels:
+# "auto" | "audio-transcriptions" (dedicated STT -> Stage 2) | "chat-completions" (multimodal single-hop audio + 50K cached session context; skips Stage 2 by default)
+# Note: in coding-agent mode, single-hop audio models send up to refiner.context_max_chars of recent session dialogue to the selected ASR provider.
+# "auto" classifies known STT vs multimodal audio models automatically; for uncataloged models on "openrouter", set api explicitly.
 api = "auto"
 # Stage 1 thinking/reasoning budget:
 # "auto" (suppresses default thinking latency on supported multimodal models) | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
@@ -93,14 +94,14 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 # "codex" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
 # Built-in default models (used when model = "" or when provider is overridden via CLI without a new model):
 # - codex             -> "gpt-6-luna" (stateless Keep-Alive HTTP /responses reusing local codex login; never enables Fast mode)
-# - dashscope         -> "qwen-turbo-latest"
-# - volcengine        -> "doubao-seed-1-6-flash"
-# - openrouter        -> "google/gemini-2.5-flash-lite"
-# - gemini            -> "gemini-2.5-flash-lite"
+# - dashscope         -> "qwen3.8-flash"
+# - volcengine        -> "doubao-seed-2-0-mini-260428"
+# - openrouter        -> "google/gemini-3.5-flash-lite"
+# - gemini            -> "gemini-3.5-flash-lite"
 # - openai            -> "gpt-4o-mini"
 # - groq              -> "llama-3.3-70b-versatile"
 # - siliconflow       -> "Qwen/Qwen2.5-7B-Instruct"
-# - openai-compatible -> requires explicit base_url and model (loopback URLs require no API key)
+# - openai-compatible -> requires explicit base_url and model (e.g. DeepSeek https://api.deepseek.com/v1 + "deepseek-flash", or local loopback Ollama/vLLM without API key)
 # - off               -> disable Stage 2 refinement
 provider = "codex"
 # Leave empty "" to use the selected provider's built-in default model above
@@ -108,9 +109,9 @@ model = ""
 # Stage 2 wire protocol:
 # "auto" ("responses" for codex, "gemini" for gemini, "chat-completions" for other providers) | "chat-completions" | "responses"
 api = "auto"
-# Stage 2 thinking/reasoning budget:
+# Stage 2 thinking/reasoning budget (leave empty "" to use the provider default: "low" for codex/openai, "auto" zero-thinking fast mode for other providers):
 # "auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-effort = "low"
+effort = ""
 # Custom Stage 2 system prompt (leave empty "" to use the built-in adaptive agent/general voice-dictation editor prompts;
 # setting a non-empty prompt overrides both modes).
 # Supports TOML multiline literal strings '''...''' (no backslash escaping needed) or """...""";
@@ -144,8 +145,8 @@ force_on_single_hop = false
 #   [refiner]
 #   provider = "openrouter"
 #
-# Recipe 2 — OpenRouter single key (single-hop multimodal audio + context; skips Stage 2):
+# Recipe 2 — Single-hop multimodal audio + 50K cached session context (DashScope Qwen-Omni or OpenRouter Gemini; skips Stage 2):
 #   [asr]
-#   provider = "openrouter"
-#   model = "google/gemini-2.5-flash"
+#   provider = "dashscope"                      # Or provider = "openrouter" with model = "google/gemini-3.5-flash-lite"
+#   model = "qwen3.8-omni-flash"
 #   effort = "auto"

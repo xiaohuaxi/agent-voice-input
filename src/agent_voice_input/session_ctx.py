@@ -4590,12 +4590,17 @@ class SessionTracker:
         max_dialog_chars: int = 16000,
         mode: str = "agent",
     ) -> AsrContext:
-        builtin_tail = () if mode == "general" else BUILTIN_AGENT_HOTWORDS
-        if mode == "general" or snapshot is None:
-            return AsrContext(hotwords=_dedupe_hotwords_ci([*extra_hotwords, *builtin_tail]))
+        eff_mode = (mode or "agent").strip().lower() or "agent"
+        builtin_tail = () if eff_mode == "general" else BUILTIN_AGENT_HOTWORDS
+        if eff_mode == "general" or snapshot is None:
+            return AsrContext(
+                hotwords=_dedupe_hotwords_ci([*extra_hotwords, *builtin_tail]),
+                mode=eff_mode,
+            )
         merged_hw = _dedupe_hotwords_ci([*extra_hotwords, *snapshot.hotwords, *builtin_tail])
         return AsrContext(
             hotwords=merged_hw,
             git_status=snapshot.git_status,
             dialog_text=snapshot.format_dialog(max_chars=max_dialog_chars),
+            mode=eff_mode,
         )
