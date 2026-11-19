@@ -8,16 +8,15 @@ from typing import Any
 
 from . import __version__, _remote_probe
 from .remote_ssh import RemoteSshManager, resolve_ssh_executable
-from .asr_providers import (
-    GEMINI_DEFAULT_BASE_URL,
+from .http_transport import (
     HttpRequest,
     HttpTransport,
     _close_quietly,
     _is_loopback_url,
-    _missing_key_hint,
     _validate_request_url,
     urllib_http_transport,
 )
+from .llm_common import GEMINI_DEFAULT_BASE_URL, _missing_key_hint
 from .audio_proc import get_failed_audio_dir, list_failed_audios, resolve_failed_audio, resolve_ffmpeg_bin
 from .config import (
     Config,

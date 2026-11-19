@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .app_scope import normalize_app_token, resolve_windows_paste_chord
-from .asr_providers import _sleep_cooperative
+from .http_transport import sleep_cooperative
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, normalize_ui_position, redact_secrets
 from .hud import (
@@ -1746,7 +1746,7 @@ class WslPlatform(JsonlShimMixin):
                 if rem_ks <= 0.0:
                     return _fallback_clipboard_via_shim()
                 waited_for_key = True
-                _sleep_cooperative(min(0.05, rem_ks), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
+                sleep_cooperative(min(0.05, rem_ks), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
             if waited_for_key:
                 self._flush_shim_events()
                 if cancelled_fn():
@@ -1790,7 +1790,7 @@ class WslPlatform(JsonlShimMixin):
             rem = hold_deadline - time.monotonic()
             if rem <= 0.0:
                 break
-            _sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
+            sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
 
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", "")

@@ -14,7 +14,7 @@ from ._tmux import (
     probe_tmux_snapshot,
     resolve_tmux_bin,
 )
-from .asr_providers import _sleep_cooperative
+from .http_transport import sleep_cooperative
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, ensure_secure_dir, expand_user_path, get_runtime_dir, redact_secrets
 from .hud import resolve_ui_language
@@ -2378,7 +2378,7 @@ class MacOSPlatform(JsonlShimMixin):
                 if rem <= 0.0:
                     return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
                 waited_for_key = True
-                _sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
+                sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
 
         if waited_for_key:
             self._flush_shim_events()

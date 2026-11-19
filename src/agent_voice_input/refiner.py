@@ -26,50 +26,52 @@ import urllib.parse
 import uuid
 
 from . import __version__
-from .asr_providers import (
-    AsrContext,
-    AsrResult,
+from .http_transport import (
     CancelToken,
     DEFAULT_CONNECT_TIMEOUT_SEC,
     DEFAULT_USER_AGENT,
-    GEMINI_DEFAULT_BASE_URL,
     HttpRequest,
     HttpResponse,
     HttpTransport,
-    _EMPTY_USAGE,
-    _GEMINI_BLOCKED_FINISH_REASONS,
     _KeepAlivePool,
     _RATE_PACER,
     _SplitTimeoutHTTPConnection,
     _SplitTimeoutHTTPSConnection,
-    _TokenUsageTuple,
     _can_reuse_pooled_conn,
     _close_quietly,
     _combine_cancel_check,
+    _is_loopback_url,
+    _register_conn_abort,
+    _unregister_conn_abort,
+    _validate_request_url,
+    classify_http_failure,
+    classify_transport_error,
+    compute_retry_delay,
+    make_rate_pacer_key,
+    sleep_cooperative,
+    urllib_http_transport,
+)
+from .llm_common import (
+    AsrContext,
+    AsrResult,
+    GEMINI_DEFAULT_BASE_URL,
+    _EMPTY_USAGE,
+    _GEMINI_BLOCKED_FINISH_REASONS,
+    _TokenUsageTuple,
     _extract_gemini_usage,
     _extract_token_usage,
-    _is_loopback_url,
     _is_openai_reasoning_model,
     _is_openrouter_thinking_model,
     _missing_key_hint,
     _openrouter_reasoning_mandatory,
     _opt_int,
     _pick_opt_int,
-    _register_conn_abort,
-    _sleep_cooperative,
-    _unregister_conn_abort,
-    _validate_request_url,
     apply_chat_effort_params,
     build_gemini_generation_config,
-    classify_http_failure,
-    classify_transport_error,
-    compute_retry_delay,
     extract_chat_message_text,
     extract_openai_compat_error,
-    make_rate_pacer_key,
     openrouter_cache_breakpoints,
     strip_lenticular_artifacts,
-    urllib_http_transport,
 )
 from .config import (
     _CODEX_KEYRING_STORE_RE,
@@ -933,7 +935,7 @@ def _run_refiner_retry_loop(
                     if delay >= rem - 0.01:
                         can_retry = False
                     else:
-                        _sleep_cooperative(
+                        sleep_cooperative(
                             delay,
                             sleep_fn=sleep_fn,
                             is_cancelled=cancelled,

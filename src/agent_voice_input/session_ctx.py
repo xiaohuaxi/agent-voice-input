@@ -106,7 +106,7 @@ from ._tmux import (
     resolve_tmux_bin,
 )
 from .app_scope import is_remote_ide_window, parse_ide_window_title
-from .asr_providers import AsrContext
+from .llm_common import AsrContext
 from .config import RemoteConfig, RemoteHostConfig, ensure_secure_dir, get_runtime_dir
 from .remote_ssh import (
     RemoteForegroundInfo,
