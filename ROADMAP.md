@@ -1,10 +1,10 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前版本基线**：`v0.10.0`（完整版本变更记录见 [CHANGELOG.md](CHANGELOG.md)）
+> **当前已发布基线**：`v0.8.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
 >
-> **项目工程规范**：[AGENTS.md](AGENTS.md)
+> **工程规范与上下文路由架构**：[AGENTS.md](AGENTS.md) · [docs/context-routing.md](docs/context-routing.md)
 
-本文档定义 `agent-voice-input` 的长期架构边界（Non-goals）、自动化验证分级体系，以及面向未来的阶段性演进规划。
+本文档定义 `agent-voice-input` 的长期架构边界（Non-goals）、自动化验证分级体系，以及按能力里程碑组织的演进路线。
 
 ---
 
@@ -33,7 +33,7 @@
 ### 1.2 自动化验证分级：最大化自动闭环 + 薄人工真机卡点
 
 1. **第一级：自动闭环门禁（主力签收基线）**
-   - **离线单元测试套件**：`PYTHONPATH=src python3 -m unittest discover -s tests -v`（全程离线可重入，覆盖协议解析、并发保序、在途取消、窗口路由与剪贴板恢复状态机）。
+   - **离线单元测试套件**：`PYTHONPATH=src python3 -W error::ResourceWarning -m unittest discover -s tests -v`（全程离线可重入，覆盖协议解析、并发保序、在途取消、窗口/SSH 路由与剪贴板恢复状态机）。
    - **原生 Shim 离线自检**：macOS `mac_shim --self-check` 与 Windows `win_shim.ps1 -Mode self-check`，在无声卡、无全局钩子权限的 CI 环境中验证原生编译、按键状态机与粘贴键路由。
    - **隔离全链路自检与时间点回放基准**：通过 `.agents/skills/voice-eval/` 在独立运行目录验证真 ASR、前缀缓存、并发保序落字与 `0600` 隐私脱敏契约；回放评测产物严格限定在仓外缓存目录（`${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/`），严禁入库。
 2. **第二级：薄人工真机卡点**
@@ -41,30 +41,48 @@
 
 ---
 
-## 二、后续阶段演进规划
+## 二、能力里程碑路线（Capability Milestones）
 
-已完成版本（`v0.1.0` ～ `v0.10.0`）的演进详情已归档至根目录 [CHANGELOG.md](CHANGELOG.md)。后续路线按 **`v0.11.0` -> `v1.0.0`** 分阶段推进。
+### 已发布基线（`已发布 · v0.1.0 – v0.8.0`）
 
----
-
-### `v0.11.0`：SSH 远程 Linux Coding Agent 无状态上下文桥接
-
-面向“macOS 或 Windows + WSL2 作为本地音频与交互宿主 → SSH 连接远端无头 Linux 服务器运行 Coding Agent”的高频远程研发场景，实现**零远端常驻守护进程、零预装包**的跨机上下文感知：
-
-1. **封堵本地后台会话误串 SSH 窗口漏洞**：
-   - 引入前置远程否决闸门、无 TTY 终端标题正向亲和校验及 macOS iTerm2 焦点 TTY 查询，彻底杜绝本地后台存活 CLI 会话或后台 `tmux` 窗格把本机 200K 上下文张冠李戴注入前台 SSH 窗口。
-2. **无状态标准库探针与正向 50K 整块对齐拉取**：
-   - 经 `ssh ... python3 -` 标准输入注入自包含只读标准库探针（免远端 `pip install`、免改 `PATH`、免疫登录 Shell 引号差异），基于远端文件 ETag 未变短路与 **正向 50K 整块对齐淘汰算法**回传 `gzip` 压缩的干净对话轮次，保持与本地全量切块字节级一致以获得 93%+ 上游前缀缓存命中率，同时支持远端 Git 仓库与**非 Git 普通工作目录**热词提取。
-3. **录音期后台异步预取与全客户端覆盖**：
-   - 在按下热键开始口述瞬间即并发启动远端上下文预取（配合 OpenSSH `ControlMaster` 复用与松键后 `<= 400ms` 硬超时熔断降级），无缝覆盖 Windows 原生 `ssh.exe`、WSL2 `ssh`、PuTTY 及 macOS 主流终端（含本地/远端 `tmux` 嵌套）。
+- **双平台原生音频、热键与悬浮胶囊桥接**：Windows + WSL2 常驻 WASAPI 采集与 HiDPI 波形胶囊，macOS 原生 `mac_shim` 修饰键监听、Ghostty / `tmux` 零剪贴板直投及多终端 `Cmd+V` 安全粘贴。
+- **共享 `50K` 封口前缀缓存与双模式管线**：两阶段转写+精修与单跳原生多模态音频统一共享 `50K` `<session_reference_log>` 前缀缓存块、自适应 `agent` / `general` 精修指令及全局桌面作用域 + 远程桌面自动让行（详见 [CHANGELOG.md](CHANGELOG.md)）。
 
 ---
 
-### `v1.0.0`：正式版准入标准（Quality Gate）
+### 主干就绪里程碑（`已在 main 落地 · 待发版`）
 
-`v1.0.0` 不预设赶工时间节点，仅在以下四项准入条件全部达成并经过全场景日常高频长稳检验合格后正式打标发布：
+以下四条主题赛道已在 `main` 分支完成实现、异构审查与自动门禁闭环，随下一次正式切版统一发布：
 
-1. **外部用户零门槛开箱**：配置任意单一主流渠道 API Key 或本地 CLI 登录态，即可通过 `init` 与 `doctor --ping` 真体检并开箱完成高准确度语音输入。
-2. **全场景安全投递与零串台**：本地终端、跨机 SSH 远端终端、主流桌面 IDE、普通桌面 GUI 应用与远程桌面自动让行均可靠运作；跨场景上下文严格隔离，系统剪贴板零意外污染，全链路严守不自动发送回车。
-3. **高保真精修与操控韧性**：跨句折返消解、中英技术术语还原、超稀疏底噪抗幻觉与抗指令劫持指标稳定达标；长上下文前缀缓存高效命中；支持在途即时取消、连发并发保序落字与失败/取消录音无损 `retry`。
-4. **双平台原生桥接与三端 CI 闭环**：`mac_shim.swift` 与 `win_shim.ps1` 离线自检及打包完整性校验全面纳入 Linux / macOS / Windows CI 门禁，守护进程单实例互斥、异常自愈与 `0600` 隐私脱敏契约经连续日常长稳运行验证无回归。
+1. **低延迟操控韧性与双端桥接 / 剪贴板自愈**：
+   - 支持 `agent-voice-input cancel [--seq N]` 与 `tap_toggle` 长按热键（`1.2s–8s`）即时中断在途识别/精修（`CancelToken` + `shutdown(SHUT_RDWR)` 唤醒阻塞连接，已过门控语音自动 `0600` 暂存 `failed/` 供 `retry` 恢复）；
+   - Stage 1 保持串行防限流、Stage 2 无状态精修并发重叠，严格按 `seq_id` 先后保序上屏；
+   - `win_shim.ps1` 编译 DLL 磁盘缓存（按 SHA-256 索引）消除冷启动抖动并支持辅助进程异常自愈；Windows 与 macOS 实现单槽位防连发竞态的多格式图文剪贴板备份还原，并对密码管理器敏感项到期清空而不重发。
+2. **全桌面 GUI 场景感知与非 Git 目录支持**：
+   - 主流桌面 IDE（VS Code、Cursor、Windsurf、Antigravity IDE、Zed、JetBrains、Xcode、Sublime Text）非递归定位本地工作区（含 WSL2 `/mnt/` 零慢盘 I/O 保护），硬隔离后台终端会话；桌面版 Antigravity IDE 通过三层路径证据绑定该工作区最新活跃的 `brain/<cid>` 主会话；
+   - 跨本地 CLI、桌面 IDE 与远端目录统一支持**非 Git 普通文件夹**有界浅层文件名扫描兜底（严格排除 `~`、`/`、`/tmp` 等隐私根目录），并为桌面 AI 聊天与 IM 应用注入轻量 `<target_app_hint>` 场景微调。
+3. **零门槛开箱、运行期自愈与三平台 CI 门禁**：
+   - 默认 `refiner.provider = "auto"`（优先复用本地 `codex` 登录并支持公开轻量模型自动回退，继而按序匹配 API Key 或优雅旁路 Stage 2），新增一等公民 `deepseek`（`deepseek-flash`）渠道；
+   - 提供 `agent-voice-input init [--force]` 与升级版 `doctor [--ping] [--remote] [--json]`（含可读修复建议与 5s 连通性探活），`retry` 自动粘贴免重复输出 `stdout`（配 `--print`）；
+   - 引入持久化 `0600` `daemon.lock`（`O_CLOEXEC` `flock`）单实例互斥、过期死进程 `sessions/*.json` 节流清理、长静音稀疏叹气/敲击抗幻觉滑窗门控，以及 GitHub Actions `windows-latest` 无头 `win_shim` CI 自检。
+4. **SSH 远端 Linux 零安装跨机上下文感知**：
+   - **Phase 0 四路远程防串台硬否决**：零配置阻断本地后台会话误串入专用 SSH 客户端、远端窗口标题、前台 `ssh` 终端或 Remote-SSH IDE（含 macOS `iTerm2` 零弹窗 TCC 预检）；
+   - **白名单无状态只读探针**：配置 `[remote] hosts` 后通过 `ssh -- <target> python3 -` 注入纯标准库探针，支持 ETag 未变短路、正向 `50K` 整块对齐裁剪（与本地增量分块保持逐字节前缀一致，高效复用上游前缀缓存）、热键按下后台异步预取、默认 `400ms` 松键剩余等待预算与主机级熔断器（完整匹配机制见 [docs/context-routing.md](docs/context-routing.md)）。
+
+---
+
+### 后续演进里程碑
+
+#### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
+
+`v1.0` 不预设硬性时间表，待上述主干能力发版并在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
+
+1. **外部用户零门槛开箱**：仅配置任意单一支持语音转写的主流渠道 API Key（可自动搭配本地 CLI 登录态或独立二阶段凭据），即可通过 `init` 与 `doctor --ping` 完成体检并稳定投入日常使用。
+2. **全场景安全投递与零串台**：本地终端、跨机 SSH 远端 Linux、主流桌面 IDE、普通桌面 GUI 应用与远程桌面自动让行均长期稳定运行；跨场景上下文严格隔离，系统剪贴板零意外污染，全链路严守不自动发送回车。
+3. **高保真精修与操控韧性**：跨句中途改口消解、中英技术术语还原、长静音稀疏底噪抗幻觉与抗指令劫持稳定达标；长会话前缀缓存高效命中；支持在途即时取消、连发并发保序落字与失败/取消录音无损 `retry`。
+4. **双平台原生桥接与三端 CI 长稳无回归**：`mac_shim.swift` 与 `win_shim.ps1` 自检及打包完整性校验持续通过 Linux / macOS / Windows CI 门禁，单实例锁、异常自愈与 `0600` 隐私脱敏契约经连续日常长稳运行零回归。
+
+#### 远期可选扩展赛道（按实际需求演进）
+
+- **原生 Linux 桌面（Wayland / X11）交互桥接**：面向不使用 macOS 或 Windows+WSL2、直接在原生 Linux 图形桌面工作的开发者，评估轻量全局热键、悬浮状态提示与活动窗口识别桥接。
+- **更多生态工具上下文接入**：在保持零第三方依赖与只读明文解析边界的前提下，按需跟进新兴主流 CLI / 桌面 Agent 的会话日志结构与标题协议。

@@ -450,7 +450,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
 
         proj = data["project"]
         self.assertEqual(proj["name"], "agent-voice-input")
-        self.assertEqual(proj["version"], "0.10.0")
+        self.assertEqual(proj["version"], "0.8.0")
         self.assertEqual(proj["requires-python"], ">=3.10")
         self.assertEqual(proj["license"], "Apache-2.0")
         self.assertEqual(
@@ -1670,7 +1670,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         with mock.patch("sys.stdout", ver_buf), self.assertRaises(SystemExit) as ver_exit:
             parser.parse_args(["--version"])
         self.assertEqual(ver_exit.exception.code, 0)
-        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.10.0")
+        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.8.0")
 
         # Offline _cmd_doctor verification: displays resolved provider/model/api/effort and NEVER leaks raw secrets
         with tempfile.TemporaryDirectory() as td:
@@ -6223,6 +6223,8 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
         from agent_voice_input.daemon import append_telemetry_record
 
         diag_script = _REPO_ROOT / ".agents" / "skills" / "voice-eval" / "scripts" / "diagnose_live.py"
+        if not diag_script.is_file() and not (_REPO_ROOT / ".agents").exists():
+            self.skipTest("repo-only .agents/skills/voice-eval is pruned from sdist")
         self.assertTrue(diag_script.is_file())
         spec = importlib.util.spec_from_file_location("avi_diagnose_live_test", diag_script)
         assert spec is not None and spec.loader is not None

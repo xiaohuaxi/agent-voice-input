@@ -8,6 +8,7 @@ All integrations below are **optional enhancements**:
 - **Inside `tmux`**, active-pane tracking works out of the box on both Linux/WSL2 and macOS without modifying `~/.tmux.conf` (matching the focused attached client's active pane while isolating sibling panes).
 - On **macOS + Ghostty**, `agent-voice-input` already reads the focused split's `tty` and `cwd` to match each split's active `codex`, `claude`, or `agy` session without hooks (including when Ghostty attaches to `tmux`).
 - On **Linux / WSL2**, without hooks it automatically falls back to `/proc` foreground interactive root-session scanning and window-title / directory disambiguation.
+- For the full local, desktop IDE, and SSH remote routing matrix, see [`docs/context-routing.md`](../docs/context-routing.md).
 
 ---
 
@@ -117,6 +118,6 @@ When dictating from a local macOS or Windows+WSL2 machine into a headless remote
    set -g set-titles on
    set -g set-titles-string '#T [@#h]'
    ```
-4. **Optional O(1) Multi-Session Disambiguation**:
+4. **Optional Title-Tag Multi-Session Disambiguation**:
    - If `agent-voice-input` is already on the remote host, `agent-voice-input session-hook` automatically appends `[@<short_hostname>]` (or `$AGENT_VOICE_INPUT_HOST_TAG`) when `$SSH_CONNECTION` is present.
    - Without installing `agent-voice-input` on the remote host, you can copy the single standalone script [`remote/remote-title-hook.sh`](remote/remote-title-hook.sh) to `~/.local/bin/remote-title-hook.sh` (`chmod +x`) and wire it into Claude Code (`~/.local/bin/remote-title-hook.sh claude`) or Antigravity CLI (`~/.local/bin/remote-title-hook.sh agy`).

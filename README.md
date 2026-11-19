@@ -30,8 +30,8 @@ Generic OS dictation has no idea what files, symbols, or CLI flags exist in your
 
 ## Why It Works Better for Coding Agents
 
-- **Grounded in Your Active Agent Session — Yet Ready Anywhere**: In terminals, automatically resolves the foreground agent session inside your active window, Ghostty split, or `tmux` pane (zero `~/.tmux.conf` changes needed) to extract recent dialogue and `git status` paths (plus shallow local filenames in non-Git folders) while isolating background subagents and sibling splits. Works across desktop apps out of the box (`hotkey.scope = "all"` by default; configurable to `"coding"` or `"terminals"`): desktop IDEs (`VS Code`, `Cursor`, `Windsurf`, `Zed`, `JetBrains`, `Xcode`, etc.) resolve the open local workspace (Git repo or ordinary folder) for filename/status hotwords without leaking terminal CLI sessions—and desktop **Antigravity IDE** additionally binds its latest matching `brain/` conversation for that workspace—while AI chat / IM apps and everyday windows use clean general dictation, and remote desktop / VM clients automatically yield the hotkey (`yield_remote_desktop = true`).
-- **Provider-Driven Speech + Context Pipeline**: `asr.provider = "auto"` and `refiner.provider = "auto"` work out of the box with a single API key (or local `codex` CLI login, with automatic public mini-model fallback on standard ChatGPT accounts), switch cleanly to any built-in cloud/local API provider (`deepseek`, `dashscope`, `openrouter`, `gemini`, `volcengine`, `openai`, `groq`, `siliconflow`), or run single-hop multimodal audio + 50K cached session context refinement (DashScope Qwen-Omni / Gemini / OpenRouter)—just pick a `provider` and its built-in default model applies automatically.
+- **Grounded in Your Active Agent Session — Local, Desktop & SSH Remote**: In local terminals, automatically resolves the foreground agent session inside your active window, Ghostty split, or `tmux` pane (zero `~/.tmux.conf` changes needed) to extract recent dialogue and `git status` paths (plus shallow local filenames in non-Git folders) while isolating background subagents and sibling splits. Over SSH to headless Linux servers, foreground SSH/Remote-IDE windows automatically veto local session crosstalk out of the box, and whitelisting `[remote] hosts = ["devbox"]` prefetches remote CLI context over `ssh -- <target> python3 -` during speech with zero remote installation. Across the desktop (`hotkey.scope = "all"` by default; configurable to `"coding"` or `"terminals"`), IDEs (`VS Code`, `Cursor`, `Windsurf`, `Zed`, `JetBrains`, `Xcode`, etc.) resolve the open local workspace without leaking terminal sessions—and desktop **Antigravity IDE** binds its latest matching `brain/` conversation—while AI chat / IM apps and everyday windows use clean general dictation, and remote desktop / VM clients automatically yield the hotkey (`yield_remote_desktop = true`). See [`docs/context-routing.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/context-routing.md) for the full routing matrix.
+- **Provider-Driven Speech + Context Pipeline**: `asr.provider = "auto"` and `refiner.provider = "auto"` work out of the box with a single speech-capable API key (pairing automatically with local `codex` CLI login—with public mini-model fallback on standard ChatGPT accounts—or a dedicated Stage 2 key such as `DEEPSEEK_API_KEY`), switch cleanly to any built-in cloud/local API provider (`deepseek`, `dashscope`, `openrouter`, `gemini`, `volcengine`, `openai`, `groq`, `siliconflow`), or run single-hop multimodal audio + 50K cached session context refinement (DashScope Qwen-Omni / Gemini / OpenRouter)—just pick a `provider` and its built-in default model applies automatically.
 - **Built for Long & Back-to-Back Dictation**: Start a new recording immediately while earlier utterances are still transcribing or refining—Stage 2 refinements overlap concurrently while utterances always paste in strict `seq_id` FIFO order (joining consecutive focus-drifted clipboard fallbacks with a blank line instead of overwriting); cancel an active recording or abort in-flight recognition/refinement instantly via `agent-voice-input cancel` (or by holding & releasing the `tap_toggle` hotkey for `1.2s–8s`, i.e. above `hotkey.tap_max_ms`, while idle from recording); local silence gating and loudness normalization block empty triggers; supports up to 10-minute recordings by default (with a 15s HUD countdown), splits recordings over 3 minutes (`180s`) at natural pauses for concurrent transcription, alerts immediately if a mic is missing or unplugged, and stashes failed or actively cancelled audio (`0600`) for `agent-voice-input retry` so long thoughts are never lost.
 - **Native HiDPI Waveform HUD & Focus-Safe Paste**: Non-activating floating capsule on both Windows (Per-Monitor V2 HiDPI) and macOS (Retina AppKit) displays live timer, waveform bars, and stage progress in English or Chinese matching your desktop locale. Locks onto the origin window/split on record start, routes per-terminal paste chords (`Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert` on Windows; zero-clipboard direct injection in Ghostty and `tmux` on macOS, or native `CGEvent` `Cmd+V`), never auto-presses Enter, and falls back to clipboard if focus moved elsewhere.
 - **Zero Extra Python Dependencies**: Pure Python `>= 3.10` standard library plus host `ffmpeg` (uses built-in `powershell.exe` on WSL2; compiles and caches a native `mac_shim` helper via `/usr/bin/swiftc` on macOS).
@@ -46,10 +46,10 @@ Copy and paste this prompt directly into **Codex**, **Claude Code**, or **AGY**:
 
 ```text
 Please install and configure agent-voice-input (https://github.com/xiaohuaxi/agent-voice-input) for me:
-1. Check python3 (>=3.10) and ffmpeg (plus Xcode Command Line Tools `/usr/bin/swiftc` on macOS), then install via `uv tool install agent-voice-input` (or `pipx` if `uv` is unavailable).
-2. Run `agent-voice-input init` to create `~/.config/agent-voice-input/config.toml` and `agent-voice-input.env` (chmod 600).
-3. Check if an API key is already set in my environment (e.g. DASHSCOPE_API_KEY, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, GROQ_API_KEY); if not, ask which provider I want to use and add it to `~/.config/agent-voice-input/agent-voice-input.env`.
-4. Run `agent-voice-input doctor --ping` to verify all checks pass, then start the background daemon with `agent-voice-input start`.
+1. Check python3 (>=3.10) and ffmpeg (plus Xcode Command Line Tools `/usr/bin/swiftc` on macOS), then install via `uv tool install agent-voice-input` (or `uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git` if `init` / `doctor --ping` are not yet in the latest PyPI release; fall back to `pipx` if `uv` is unavailable).
+2. Run `agent-voice-input init` to create `~/.config/agent-voice-input/config.toml` and `agent-voice-input.env` (chmod 600; on PyPI v0.8.0 without `init`, create `~/.config/agent-voice-input/agent-voice-input.env` with chmod 600 directly, or copy `v0.8.0`'s `config.example.toml` if customizing TOML).
+3. Check if a Stage 1 speech-capable API key is already set in my environment (e.g. DASHSCOPE_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, SILICONFLOW_API_KEY, or DOUBAO_ASR_API_KEY; optional Stage 2 keys like DEEPSEEK_API_KEY / ARK_API_KEY can be added alongside it); if not, ask which provider I want to use and add it to `~/.config/agent-voice-input/agent-voice-input.env`.
+4. Run `agent-voice-input doctor --ping` (or `agent-voice-input doctor` on v0.8.0) to verify all checks pass, then start the background daemon with `agent-voice-input start`.
 ```
 
 ### Option 2: Manual Setup in 3 Steps
@@ -62,25 +62,29 @@ Please install and configure agent-voice-input (https://github.com/xiaohuaxi/age
 
 **2. Install**
 
+**Option A — Latest PyPI release (`v0.8.0`)**:
+
 ```bash
 uv tool install agent-voice-input
-# Or with pipx: pipx install agent-voice-input
+mkdir -p -m 700 ~/.config/agent-voice-input
+# Create ~/.config/agent-voice-input/agent-voice-input.env (chmod 600) with at least one Stage 1 key, then:
+agent-voice-input doctor
+agent-voice-input start
 ```
 
-**3. Initialize Config, Add One Credential & Start**
-
-Initialize `0600` config files via `agent-voice-input init` and uncomment at least one provider key in `~/.config/agent-voice-input/agent-voice-input.env` (for example `DASHSCOPE_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, or `OPENAI_API_KEY`, plus optional `DEEPSEEK_API_KEY` or local `codex login` for Stage 2):
+**Option B — Latest `main` (includes Unreleased `init`, `doctor --ping`, `deepseek`, and `[remote]`)**:
 
 ```bash
+uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git
 agent-voice-input init
-# Edit ~/.config/agent-voice-input/agent-voice-input.env and set e.g. OPENROUTER_API_KEY="sk-or-..."
-
-# Verify audio bridge, native shim, resolved providers/models, and endpoint connectivity, then start daemon
+# Edit ~/.config/agent-voice-input/agent-voice-input.env and uncomment at least one Stage 1 key, then:
 agent-voice-input doctor --ping
 agent-voice-input start
 ```
 
-> Tap **Right Ctrl** (`RControl`) inside your terminal to start and finish recording (while an utterance is transcribing or refining in `tap_toggle` mode, holding & releasing `RControl` alone for `1.2s–8s` cancels in-flight processing). To customize hotkeys (`trigger_mode = "ptt"`), HUD position (`bottom` / `top`), duration limits, or providers, copy [`config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml) to `~/.config/agent-voice-input/config.toml` (see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env) for all credential variables).
+**Stage 1 vs. Stage 2 credentials**: Set at least one Stage 1 speech-capable key in `~/.config/agent-voice-input/agent-voice-input.env` (`DASHSCOPE_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `SILICONFLOW_API_KEY`, or `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`; optional `DEEPSEEK_API_KEY`, `ARK_API_KEY`, or local `codex login` can pair with it for Stage 2; `pipx` works identically in place of `uv tool`).
+
+> Tap **Right Ctrl** (`RControl`) inside your terminal to start and finish recording (on `main` in `tap_toggle` mode, holding & releasing `RControl` alone for `1.2s–8s` cancels in-flight processing). To customize hotkeys (`trigger_mode = "ptt"`), HUD position (`bottom` / `top`), duration limits, or providers, copy [`config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml) (or [`v0.8.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.8.0/config.example.toml) when running PyPI `v0.8.0`) to `~/.config/agent-voice-input/config.toml` (see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env) for all credential variables).
 
 ---
 
@@ -104,7 +108,7 @@ agent-voice-input start
 
 Configuration uses two clean files (`CLI flags > config.toml > built-in defaults`):
 
-- **`~/.config/agent-voice-input/config.toml`**: Structured `[hotkey]`, `[ui]`, `[audio]`, `[asr]`, and `[refiner]` settings.
+- **`~/.config/agent-voice-input/config.toml`**: Structured `[hotkey]`, `[ui]`, `[audio]`, `[asr]`, `[refiner]`, and `[remote]` settings.
 - **`~/.config/agent-voice-input/agent-voice-input.env`**: API credentials (prefix-style aliases also supported; see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)).
 
 ### How `provider`, `model`, `asr.api`, and `refiner.api` Work
@@ -178,8 +182,8 @@ agent-voice-input init                   # Create 0600 config.toml and commented
 agent-voice-input start                  # Start background daemon
 agent-voice-input restart                # Restart daemon after config changes
 agent-voice-input status                 # Inspect daemon state, last latency, and redacted errors
-agent-voice-input doctor [--ping]        # Check audio bridge, native shim, credentials, session binding, and optional endpoint ping (--json supported)
-agent-voice-input retry [--list] [--print]  # List or re-run stashed failed recordings (--print forces stdout on paste)
+agent-voice-input doctor [--ping] [--remote]  # Check audio bridge, native shim, credentials, session/SSH readiness, and endpoint ping (--json supported)
+agent-voice-input retry [--list] [--print]  # List or re-run stashed failed recordings (skips duplicate stdout when auto-pasted; --print forces stdout)
 agent-voice-input once --duration 4 --dry-run  # Record once and print result without pasting
 agent-voice-input toggle                 # Toggle recording start/stop from CLI
 agent-voice-input cancel                 # Cancel active recording, or abort in-flight tasks (`--seq N` targets one)
@@ -203,9 +207,10 @@ agent-voice-input key-test               # Inspect raw key scancodes / modifier 
 
 *(Environment variables are reserved for API credentials, bootstrap paths `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR`, and low-level runtime/diagnostic hooks; ordinary options live in `config.toml`.)*
 
-### Optional: Multi-Window Session Title Hooks
+### Optional: Multi-Window Title Hooks & SSH Remote Linux Hosts
 
-Single-window setups, macOS + Ghostty splits, and `tmux` panes work out of the box with zero hooks. If you run multiple standalone terminal windows side by side in the **same project directory** on WSL2 or in terminals without per-split `tty`/`cwd` introspection, see [`integrations/`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.md) for optional lightweight session title hooks (`agent-voice-input session-hook`) for Codex, Claude Code, and Antigravity CLI.
+- **Local multi-window hooks**: Single-window setups, macOS + Ghostty splits, and `tmux` panes work out of the box with zero hooks. If you run multiple standalone terminal windows side by side in the **same project directory** on WSL2 or in terminals without per-split `tty`/`cwd` introspection, see [`integrations/`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.md) for optional lightweight session title hooks (`agent-voice-input session-hook`) for Codex, Claude Code, and Antigravity CLI.
+- **Zero-install SSH remote Linux context (`[remote]`)**: Foreground SSH clients and Remote-SSH IDEs automatically block local background sessions from leaking out of the box. To pull live remote CLI dialogue and workspace filenames from a Linux server (zero remote daemon, pip package, or API keys—only Python 3.10+ stdlib over `BatchMode` SSH, prefetched while you speak), add `hosts = ["devbox"]` under `[remote]` in `config.toml` and verify with `agent-voice-input doctor --remote` (see [`integrations/`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.md#5-ssh-remote-linux-hosts-zero-install--optional-title-hook) and [`docs/context-routing.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/context-routing.md)).
 
 ---
 

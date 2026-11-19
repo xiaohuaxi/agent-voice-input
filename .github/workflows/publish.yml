@@ -24,7 +24,7 @@ jobs:
           python-version: "3.12"
 
       - name: Run unit tests
-        run: PYTHONPATH=src python -m unittest discover -s tests -v
+        run: PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests -v
 
       - name: Build sdist and wheel
         run: |
@@ -34,43 +34,81 @@ jobs:
       - name: Verify packaged wheel and sdist contents
         run: |
           python - <<'PY'
-          import glob, tarfile, zipfile
+          import glob, pathlib, tarfile, zipfile
+
+          pkg_files = sorted(
+              p.name
+              for p in pathlib.Path("src/agent_voice_input").iterdir()
+              if p.is_file() and p.suffix in (".py", ".ps1", ".swift")
+          )
+          assert pkg_files, "no package files discovered"
+          expected_wheel = {
+              "agent_voice_input/__init__.py",
+              "agent_voice_input/cli.py",
+              "agent_voice_input/daemon.py",
+              "agent_voice_input/prompts.py",
+              "agent_voice_input/app_scope.py",
+              "agent_voice_input/_remote_probe.py",
+              "agent_voice_input/remote_ssh.py",
+              "agent_voice_input/win_shim.ps1",
+              "agent_voice_input/mac_shim.swift",
+              *(f"agent_voice_input/{name}" for name in pkg_files),
+          }
+
           whls = glob.glob("dist/*.whl")
           assert len(whls) == 1, f"expected 1 wheel, got {whls}"
           with zipfile.ZipFile(whls[0]) as zf:
               names = set(zf.namelist())
-              for req in (
-                  "agent_voice_input/__init__.py",
-                  "agent_voice_input/cli.py",
-                  "agent_voice_input/daemon.py",
-                  "agent_voice_input/prompts.py",
-                  "agent_voice_input/app_scope.py",
-                  "agent_voice_input/win_shim.ps1",
-                  "agent_voice_input/mac_shim.swift",
-              ):
+              assert not any(
+                  "/.agents/" in f"/{n}" or "/.claude/" in f"/{n}" for n in names
+              ), f"unexpected .agents/.claude in wheel: {sorted(names)}"
+              for req in sorted(expected_wheel):
                   assert req in names, f"missing {req} in wheel"
               assert any("LICENSE" in n for n in names), f"missing LICENSE in wheel: {sorted(names)}"
               eps = [n for n in names if n.endswith("entry_points.txt")]
               assert eps and "agent-voice-input = agent_voice_input.cli:main" in zf.read(eps[0]).decode("utf-8")
 
+          integ_rels = sorted(
+              "/" + p.as_posix() for p in pathlib.Path("integrations").rglob("*") if p.is_file()
+          )
+          doc_rels = sorted(
+              "/" + p.as_posix() for p in pathlib.Path("docs").rglob("*.md") if p.is_file()
+          )
+          expected_sdist_suffixes = {
+              "/LICENSE",
+              "/AGENTS.md",
+              "/CHANGELOG.md",
+              "/ROADMAP.md",
+              "/README.md",
+              "/README.zh-CN.md",
+              "/config.example.toml",
+              "/config.example.env",
+              "/docs/context-routing.md",
+              "/integrations/remote/remote-title-hook.sh",
+              "/.github/workflows/ci.yml",
+              "/.github/workflows/publish.yml",
+              "/src/agent_voice_input/prompts.py",
+              "/src/agent_voice_input/app_scope.py",
+              "/src/agent_voice_input/_remote_probe.py",
+              "/src/agent_voice_input/remote_ssh.py",
+              "/src/agent_voice_input/win_shim.ps1",
+              "/src/agent_voice_input/mac_shim.swift",
+              *(f"/src/agent_voice_input/{name}" for name in pkg_files),
+              *integ_rels,
+              *doc_rels,
+          }
+
           sdists = glob.glob("dist/*.tar.gz")
           assert len(sdists) == 1, f"expected 1 sdist, got {sdists}"
           with tarfile.open(sdists[0], "r:gz") as tf:
               snames = set(tf.getnames())
-              for suffix in (
-                  "/LICENSE",
-                  "/CHANGELOG.md",
-                  "/ROADMAP.md",
-                  "/README.md",
-                  "/README.zh-CN.md",
-                  "/config.example.toml",
-                  "/config.example.env",
-                  "/src/agent_voice_input/prompts.py",
-                  "/src/agent_voice_input/app_scope.py",
-                  "/src/agent_voice_input/win_shim.ps1",
-                  "/src/agent_voice_input/mac_shim.swift",
-              ):
-                  assert any(n.endswith(suffix) for n in snames), f"missing {suffix} in sdist"
+              rel_snames = {"/" + n.split("/", 1)[1] for n in snames if "/" in n}
+              assert not any(
+                  n == "/.agents" or n.startswith("/.agents/") or n == "/.claude" or n.startswith("/.claude/")
+                  for n in rel_snames
+              ), f"unexpected .agents/.claude in sdist: {sorted(rel_snames)}"
+              for suffix in sorted(expected_sdist_suffixes):
+                  assert suffix in rel_snames, f"missing exact path {suffix} in sdist"
           PY
 
       - name: Upload built distributions

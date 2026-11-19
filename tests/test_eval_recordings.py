@@ -27,6 +27,8 @@ from agent_voice_input.session_ctx import SessionMatch, SessionTracker  # noqa: 
 
 def _load_eval_module():
     script_path = REPO_ROOT / ".agents" / "skills" / "voice-eval" / "scripts" / "eval_recordings.py"
+    if not script_path.is_file() and not (REPO_ROOT / ".agents").exists():
+        return None
     spec = importlib.util.spec_from_file_location("eval_recordings_mod", script_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -35,6 +37,11 @@ def _load_eval_module():
 
 
 EVAL = _load_eval_module()
+
+
+def setUpModule() -> None:
+    if EVAL is None:
+        raise unittest.SkipTest("repo-only .agents/skills/voice-eval is pruned from sdist")
 
 
 def _make_voiced_wav(duration_sec: float = 3.0, freq_hz: float = 220.0) -> bytes:

@@ -8,6 +8,7 @@
 - **在 `tmux` 分屏内**，Linux/WSL2 与 macOS 下无需修改 `~/.tmux.conf` 即可开箱自动锁定当前活跃客户端的焦点窗格（隔离隔壁后台分屏干扰）；
 - 在 **macOS + Ghostty** 下，`agent-voice-input` 已可直接读取当前聚焦分屏的 `tty` 与 `cwd` 自动关联对应分屏内的 `codex`、`claude` 或 `agy` 会话，零钩子也不会串分屏（含 Ghostty 连接 `tmux` 的场景）；
 - 在 **Linux / WSL2** 下，未配置钩子时会自动回退到 `/proc` 前台根会话扫描与窗口标题 / 目录名消歧。
+- 完整的本地终端、桌面 IDE 与 SSH 远端匹配优先级及防串台边界见 [`docs/context-routing.md`](../docs/context-routing.md)。
 
 ---
 
@@ -117,6 +118,6 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
    set -g set-titles on
    set -g set-titles-string '#T [@#h]'
    ```
-4. **可选 O(1) 同机多会话精准消歧**：
+4. **可选标题指纹同机多会话精准消歧**：
    - 若远端已装有本仓库，`agent-voice-input session-hook` 在检测到 `SSH_CONNECTION` 时会自动追加 `[@<short_hostname>]`（亦可通过环境变量 `AGENT_VOICE_INPUT_HOST_TAG` 指定别名）。
    - 若远端保持零安装，只需将单文件脚本 [`remote/remote-title-hook.sh`](remote/remote-title-hook.sh) 拷至远端 `~/.local/bin/remote-title-hook.sh`（`chmod +x`），在 Claude Code（`~/.local/bin/remote-title-hook.sh claude`）或 Antigravity CLI（`~/.local/bin/remote-title-hook.sh agy`）钩子中调用即可。

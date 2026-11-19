@@ -841,7 +841,12 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
         self.assertIn("-Mode self-check", ci_txt)
         for wf_name, wf_txt in (("ci.yml", ci_txt), ("publish.yml", pub_txt)):
             self.assertIn("agent_voice_input/mac_shim.swift", wf_txt, wf_name)
+            self.assertIn("agent_voice_input/_remote_probe.py", wf_txt, wf_name)
+            self.assertIn("agent_voice_input/remote_ssh.py", wf_txt, wf_name)
             self.assertIn("/src/agent_voice_input/mac_shim.swift", wf_txt, wf_name)
+            self.assertIn("/src/agent_voice_input/_remote_probe.py", wf_txt, wf_name)
+            self.assertIn("/src/agent_voice_input/remote_ssh.py", wf_txt, wf_name)
+            self.assertIn("/docs/context-routing.md", wf_txt, wf_name)
             self.assertIn("/CHANGELOG.md", wf_txt, wf_name)
             self.assertIn("/ROADMAP.md", wf_txt, wf_name)
 

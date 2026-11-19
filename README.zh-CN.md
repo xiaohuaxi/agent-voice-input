@@ -29,8 +29,8 @@
 
 ## 核心亮点
 
-- **精准绑定活跃 Agent 上下文，同时开箱通用全桌面**：在终端内自动识别前台窗口、Ghostty 分屏或 `tmux` 焦点窗格（无需修改 `~/.tmux.conf`）中的主 Agent 会话，增量抽取最近对话与 `git status` 变更文件名（非 Git 普通项目/文稿目录自动提取浅层文件名）纠偏，严格隔离后台 subagent 与相邻分屏；同时默认支持任意桌面窗口语音输入（`hotkey.scope = "all"`，亦可设为 `"coding"` 或 `"terminals"`）：主流桌面 IDE（`VS Code`、`Cursor`、`Windsurf`、`Zed`、`JetBrains`、`Xcode` 等）自动定位当前本地工作区（兼容 Git 仓库与普通文件夹）挂载文件拼写参考且硬隔离后台终端会话，桌面版 **Antigravity IDE** 更可关联该工作区最近活跃的同构 `brain/` 主会话；AI 聊天桌面端、即时通讯与日常窗口自动切换自适应通用模式，聚焦远程桌面/虚拟机客户端时自动静默让行热键（`yield_remote_desktop = true`）。
-- **按渠道即插即用的「识别 + 精修」双引擎**：`asr.provider = "auto"` 与 `refiner.provider = "auto"` 开箱自动适配单把 API Key（或本机 `codex` CLI 登录态，普通 ChatGPT 账号自动无感回退公开轻量模型），支持切换任意内置云端/本地 API 渠道（`deepseek`、`dashscope`、`openrouter`、`gemini`、`volcengine`、`openai`、`groq`、`siliconflow`），或使用百炼 `qwen3.8-omni-flash` / Gemini / OpenRouter 多模态单跳共享 50K 缓存直出；日常只需指定 `provider`，自动匹配对应渠道的默认模型。
+- **精准绑定活跃 Agent 上下文，贯通本地、桌面与 SSH 远端**：在本地终端内自动识别前台窗口、Ghostty 分屏或 `tmux` 焦点窗格（无需修改 `~/.tmux.conf`）中的主 Agent 会话，增量抽取最近对话与 `git status` 变更文件名（非 Git 普通项目/文稿目录自动提取浅层文件名）纠偏，严格隔离后台 subagent 与相邻分屏；在 SSH 连接无头 Linux 服务器时，前台 SSH / Remote-SSH 窗口零配置自动阻断本地后台会话串台，配一行 `[remote] hosts = ["devbox"]` 即可在说话期间通过 `ssh -- <target> python3 -` 零远端安装异步预取远端会话上下文；同时默认支持任意桌面窗口语音输入（`hotkey.scope = "all"`，亦可设为 `"coding"` 或 `"terminals"`）：主流桌面 IDE（`VS Code`、`Cursor`、`Windsurf`、`Zed`、`JetBrains`、`Xcode` 等）自动定位当前本地工作区（兼容 Git 仓库与普通文件夹）挂载文件拼写参考且硬隔离后台终端会话，桌面版 **Antigravity IDE** 更可关联该工作区最近活跃的同构 `brain/` 主会话；AI 聊天桌面端、即时通讯与日常窗口自动切换自适应通用模式，聚焦远程桌面/虚拟机客户端时自动静默让行热键（`yield_remote_desktop = true`）。完整路由规则见 [`docs/context-routing.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/context-routing.md)。
+- **按渠道即插即用的「识别 + 精修」双引擎**：`asr.provider = "auto"` 与 `refiner.provider = "auto"` 只需配置一把支持语音转写的 API Key 即可开箱跑通（二阶段可自动优先复用本机 `codex` CLI 登录态并在普通 ChatGPT 账号上无感回退公开轻量模型，或搭配 `DEEPSEEK_API_KEY` 等独立精修凭据），支持切换任意内置云端/本地 API 渠道（`deepseek`、`dashscope`、`openrouter`、`gemini`、`volcengine`、`openai`、`groq`、`siliconflow`），或使用百炼 `qwen3.8-omni-flash` / Gemini / OpenRouter 多模态单跳共享 50K 缓存直出；日常只需指定 `provider`，自动匹配对应渠道的默认模型。
 - **面向长口述与连续口述的可靠录音链**：支持在上一句转写/精修期间直接开始下一段录音——二阶段无状态精修自动并发重叠、上屏严格按 `seq_id` 先后保序落字（切走窗口回退剪贴板的多段结果自动空行拼接、不覆盖前文）；支持随时用 `agent-voice-input cancel`（或在 `tap_toggle` 非录音态下单独长按热键 `1.2s–8s`、即超出 `hotkey.tap_max_ms` 后松开）即时取消当前录音或中断后台在途识别/精修；内置静音门控与响度归一化拦截空触；单次默认最长 10 分钟（最后 15 秒胶囊倒计时提示），超过 3 分钟的长语音自动挑自然停顿处切分并并发转写；无麦克风或中途掉麦即时提醒；转写/上屏失败或主动取消的有效语音均自动以 `0600` 权限暂存，随时用 `agent-voice-input retry` 恢复，绝不丢话。
 - **原生高分屏波形胶囊与防串窗安全粘贴**：Windows（Per-Monitor V2 HiDPI）与 macOS（Retina 原生面板）均提供不抢焦点的悬浮胶囊（计时、实时声波与阶段进度自动跟随系统中英文）；开始录音即锁定目标窗口/分屏，按进程自动路由粘贴快捷键（Windows 区分 `Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert`；macOS 在 Ghostty 与 `tmux` 内零触碰系统剪贴板直投，其余窗口走原生 `CGEvent` `Cmd+V`），只粘贴不自动回车，中途切走焦点则自动退回剪贴板防误投。
 - **零第三方 Python 依赖**：仅使用 Python `>= 3.10` 标准库与宿主机 `ffmpeg`（WSL2 复用系统内置 `powershell.exe`，macOS 首次启动自动编译缓存原生 `mac_shim`）。
@@ -45,10 +45,10 @@
 
 ```text
 请帮我安装并配置 agent-voice-input（https://github.com/xiaohuaxi/agent-voice-input）：
-1. 检查 python3 (>=3.10) 与 ffmpeg（macOS 下顺带确认 Xcode Command Line Tools `/usr/bin/swiftc`），用 `uv tool install agent-voice-input`（无 uv 则用 pipx）安装；
-2. 运行 `agent-voice-input init` 初始化生成权限 600 的 `~/.config/agent-voice-input/config.toml` 与 `agent-voice-input.env`；
-3. 检查我当前环境中是否已有可用凭据（如 DASHSCOPE_API_KEY、DEEPSEEK_API_KEY、OPENROUTER_API_KEY、GEMINI_API_KEY、OPENAI_API_KEY、GROQ_API_KEY 等），没有就问我用哪家，写入 `~/.config/agent-voice-input/agent-voice-input.env`；
-4. 运行 `agent-voice-input doctor --ping` 确认各项检查与连通性通过后，执行 `agent-voice-input start` 启动后台守护进程。
+1. 检查 python3 (>=3.10) 与 ffmpeg（macOS 下顺带确认 Xcode Command Line Tools `/usr/bin/swiftc`），用 `uv tool install agent-voice-input` 安装（若最新 PyPI 尚未包含 `init` / `doctor --ping`，改用 `uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git`；无 uv 则换用 pipx）；
+2. 运行 `agent-voice-input init` 初始化生成权限 600 的 `~/.config/agent-voice-input/config.toml` 与 `agent-voice-input.env`（若使用 PyPI v0.8.0 尚无 `init`，直接创建权限 600 的 `~/.config/agent-voice-input/agent-voice-input.env`，如需自定义 TOML 请参照 `v0.8.0` 标签下的 `config.example.toml`）；
+3. 检查我当前环境中是否已有至少一把支持一阶段语音识别的凭据（如 DASHSCOPE_API_KEY、OPENROUTER_API_KEY、GEMINI_API_KEY、OPENAI_API_KEY、GROQ_API_KEY、SILICONFLOW_API_KEY 或 DOUBAO_ASR_API_KEY；二阶段可选搭配 DEEPSEEK_API_KEY / ARK_API_KEY 或本机 codex 登录），没有就问我用哪家，写入 `~/.config/agent-voice-input/agent-voice-input.env`；
+4. 运行 `agent-voice-input doctor --ping`（v0.8.0 下运行 `agent-voice-input doctor`）确认各项检查通过后，执行 `agent-voice-input start` 启动后台守护进程。
 ```
 
 ### 方式二：手动三步安装
@@ -61,25 +61,29 @@
 
 **2. 安装 CLI**
 
+**路线 A — 当前 PyPI 稳定版（`v0.8.0`）**：
+
 ```bash
 uv tool install agent-voice-input
-# 或使用 pipx：pipx install agent-voice-input
+mkdir -p -m 700 ~/.config/agent-voice-input
+# 创建权限 600 的 ~/.config/agent-voice-input/agent-voice-input.env 填入至少一把一阶段语音凭据，然后：
+agent-voice-input doctor
+agent-voice-input start
 ```
 
-**3. 初始化配置、填入一把 API Key 并启动**
-
-执行 `agent-voice-input init` 生成 `0600` 配置文件，并在 `~/.config/agent-voice-input/agent-voice-input.env` 取消注释填入任一支持的凭据（例如阿里百炼 `DASHSCOPE_API_KEY`，或一把 `OPENROUTER_API_KEY` / `GEMINI_API_KEY`，二阶段亦可搭配 `DEEPSEEK_API_KEY` 或本机 `codex login`）：
+**路线 B — 最新 `main` 分支（含待发版的 `init`、`doctor --ping`、`deepseek` 与 `[remote]`）**：
 
 ```bash
+uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git
 agent-voice-input init
-# 编辑 ~/.config/agent-voice-input/agent-voice-input.env，取消注释填入如 DASHSCOPE_API_KEY="sk-..."
-
-# 自检环境、渠道解析、鉴权连通性与当前会话识别，然后后台启动（默认单击右 Ctrl 开始/完成录音；识别/精修期间单独长按右 Ctrl 1.2s–8s 松开可取消）
+# 编辑 ~/.config/agent-voice-input/agent-voice-input.env 取消注释填入至少一把一阶段语音凭据，然后：
 agent-voice-input doctor --ping
 agent-voice-input start
 ```
 
-> 如需调整快捷键（如改为按住说话 `trigger_mode = "ptt"`）、胶囊位置（`bottom` / `top`）、录音时长上限或切换渠道，将 [`config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml) 复制到 `~/.config/agent-voice-input/config.toml` 按需修改即可（完整凭据变量见 [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)）。
+**凭据搭配说明**：在 `~/.config/agent-voice-input/agent-voice-input.env` 中配置至少一把支持一阶段语音识别的凭据（如阿里百炼 `DASHSCOPE_API_KEY`、`OPENROUTER_API_KEY`、`GEMINI_API_KEY`、`OPENAI_API_KEY`、`GROQ_API_KEY`、`SILICONFLOW_API_KEY` 或豆包 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；二阶段可额外搭配 `DEEPSEEK_API_KEY`、`ARK_API_KEY` 或直接复用本机 `codex login`；无 `uv` 时可将 `uv tool` 替换为 `pipx`）。默认单击右 Ctrl 开始/完成录音（`main` 分支 `tap_toggle` 模式下，识别/精修期间单独长按右 Ctrl `1.2s–8s` 松开可取消）。
+
+> 如需调整快捷键（如改为按住说话 `trigger_mode = "ptt"`）、胶囊位置（`bottom` / `top`）、录音时长上限或切换渠道，将 [`config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)（运行 PyPI `v0.8.0` 时请参照对应标签的 [`v0.8.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.8.0/config.example.toml)）复制到 `~/.config/agent-voice-input/config.toml` 按需修改即可（完整凭据变量见 [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)）。
 
 ---
 
@@ -103,7 +107,7 @@ agent-voice-input start
 
 配置由两个文件组成，覆盖优先级为 `CLI 参数 > config.toml > 内置默认值`：
 
-- **`~/.config/agent-voice-input/config.toml`**：结构化配置 `[hotkey]`、`[ui]`、`[audio]`、`[asr]` 与 `[refiner]`。
+- **`~/.config/agent-voice-input/config.toml`**：结构化配置 `[hotkey]`、`[ui]`、`[audio]`、`[asr]`、`[refiner]` 与 `[remote]`。
 - **`~/.config/agent-voice-input/agent-voice-input.env`**：存放 API Key（兼容前缀别名，见 [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)）。
 
 ### `provider`、`model` 与工作模式约定
@@ -177,7 +181,7 @@ agent-voice-input init                   # 初始化生成 0600 权限 config.to
 agent-voice-input start                  # 后台启动守护进程
 agent-voice-input restart                # 重启守护进程（修改配置后常用）
 agent-voice-input status                 # 查看运行状态、最近一次耗时与错误摘要
-agent-voice-input doctor [--ping]        # 全面自检音频链路、原生辅助层、凭据、会话匹配及可选端点连通性探活（支持 --json）
+agent-voice-input doctor [--ping] [--remote]  # 全面自检音频链路、原生辅助层、凭据、会话/SSH 就绪度及端点探活（支持 --json）
 agent-voice-input retry [--list] [--print]  # 查看或重跑暂存的失败录音（自动粘贴时不重复打印，加 --print 强制输出 stdout）
 agent-voice-input once --duration 4 --dry-run  # 单次录音验证流水线（不粘贴上屏）
 agent-voice-input toggle                 # 命令行触发开始/结束录音
@@ -202,9 +206,10 @@ agent-voice-input key-test               # 测试按键扫描码与修饰键捕�
 
 *（环境变量用于存放各厂商凭据、引导路径 `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR` 及底层运行期诊断项；常规参数统一在 `config.toml` 中配置。）*
 
-### 可选：多窗口并发会话标题钩子
+### 可选：多窗口会话标题钩子与 SSH 远端 Linux 主机
 
-在单项目目录单窗口、macOS + Ghostty 多分屏或 `tmux` 分屏下均无需额外配置。若常在**同一项目目录**并行开启多个独立 WSL2 终端窗口或非 Ghostty 终端分屏，可参考 [`integrations/`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.zh-CN.md) 为 Codex、Claude Code 或 Antigravity CLI 接入轻量会话标题标签（`agent-voice-input session-hook`）。
+- **本地多窗口标题钩子**：在单项目目录单窗口、macOS + Ghostty 多分屏或 `tmux` 分屏下均无需额外配置。若常在**同一项目目录**并行开启多个独立 WSL2 终端窗口或非 Ghostty 终端分屏，可参考 [`integrations/`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.zh-CN.md) 为 Codex、Claude Code 或 Antigravity CLI 接入轻量会话标题标签（`agent-voice-input session-hook`）。
+- **零远端安装 SSH Linux 上下文感知（`[remote]`）**：前台 SSH 终端与 Remote-SSH IDE 默认零配置硬隔离本地后台会话防串台；若需拉取远端 Linux 服务器上的活跃 Agent 对话与工作区文件名（远端零常驻服务、零 pip 装包、零云端凭据，仅需 Python 3.10+ 标准库，按下热键说话期间后台异步预取），只需在 `config.toml` 的 `[remote]` 下添加 `hosts = ["devbox"]` 并运行 `agent-voice-input doctor --remote` 验证（详见 [`integrations/`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.zh-CN.md) 与 [`docs/context-routing.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/context-routing.md)）。
 
 ---
 
