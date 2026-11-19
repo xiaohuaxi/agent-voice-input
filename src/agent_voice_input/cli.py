@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from .config import Config, ProviderCredentials
     from .http_transport import HttpTransport
 
-_CLI_DEPS_LOADED = False
+_LAZY_CLI_CACHE: dict[str, Any] = {}
 
 _LAZY_CLI_ATTR_NAMES: frozenset[str] = frozenset(
     {
@@ -85,91 +85,99 @@ _LAZY_CLI_ATTR_NAMES: frozenset[str] = frozenset(
 
 def _ensure_cli_deps() -> None:
     """Populate CLI runtime dependencies on demand so ``session-hook`` stays sub-35ms."""
-    global _CLI_DEPS_LOADED
-    if _CLI_DEPS_LOADED:
-        return
-    from . import _remote_probe
-    from .audio_proc import (
-        get_failed_audio_dir,
-        list_failed_audios,
-        resolve_failed_audio,
-        resolve_ffmpeg_bin,
-    )
-    from .config import (
-        CODEX_SUBSCRIPTION_BASE_URL,
-        DASHSCOPE_COMPAT_BASE_URL,
-        GEMINI_DEFAULT_BASE_URL,
-        OPENAI_DEFAULT_BASE_URL,
-        OPENROUTER_DEFAULT_BASE_URL,
-        Config,
-        ConfigError,
-        ProviderCredentials,
-        _host_matches_domain,
-        default_config_file_candidates,
-        default_env_file_candidates,
-        ensure_secure_dir,
-        expand_user_path,
-        get_runtime_dir,
-        is_dashscope_omni_chat_model,
-        is_gemini_native_url,
-        load_config,
-        load_env_files,
-        redact_secrets,
-        resolve_asr_api,
-        resolve_codex_home_dir,
-        resolve_credentials,
-        resolve_target_config_paths,
-        select_asr_provider,
-        select_refiner_provider,
-    )
-    from .daemon import (
-        DaemonAlreadyRunningError,
-        VoiceInputDaemon,
-        append_telemetry_record,
-        build_pipeline_summary,
-        create_platform,
-        read_telemetry_history,
-        run_pipeline_once,
-        send_control_command,
-    )
-    from .http_transport import (
-        HttpRequest,
-        HttpTransport,
-        _close_quietly,
-        _is_loopback_url,
-        _validate_request_url,
-        urllib_http_transport,
-    )
-    from .llm_common import _missing_key_hint
-    from .platform_common import ForegroundWindow
-    from .platform_macos import (
-        classify_macos_mic_permission,
-        compile_mac_shim,
-        probe_macos_host,
-        run_mac_shim_self_check,
-        run_macos_key_test,
-    )
-    from .platform_wsl import is_wsl, probe_wsl_host, run_key_test
-    from .refiner import (
-        CodexRefiner,
-        _build_responses_url,
-        find_codex_bin,
-        inspect_codex_auth_status,
-        resolve_codex_default_model,
-    )
-    from .remote_ssh import RemoteSshManager, resolve_ssh_executable
-    from .session_ctx import SessionTracker
-    from .session_title import run_session_hook
+    if not _LAZY_CLI_CACHE:
+        from . import _remote_probe
+        from .audio_proc import (
+            get_failed_audio_dir,
+            list_failed_audios,
+            resolve_failed_audio,
+            resolve_ffmpeg_bin,
+        )
+        from .config import (
+            CODEX_SUBSCRIPTION_BASE_URL,
+            DASHSCOPE_COMPAT_BASE_URL,
+            GEMINI_DEFAULT_BASE_URL,
+            OPENAI_DEFAULT_BASE_URL,
+            OPENROUTER_DEFAULT_BASE_URL,
+            Config,
+            ConfigError,
+            ProviderCredentials,
+            _host_matches_domain,
+            default_config_file_candidates,
+            default_env_file_candidates,
+            ensure_secure_dir,
+            expand_user_path,
+            get_runtime_dir,
+            is_dashscope_omni_chat_model,
+            is_gemini_native_url,
+            load_config,
+            load_env_files,
+            redact_secrets,
+            resolve_asr_api,
+            resolve_codex_home_dir,
+            resolve_credentials,
+            resolve_target_config_paths,
+            select_asr_provider,
+            select_refiner_provider,
+        )
+        from .daemon import (
+            DaemonAlreadyRunningError,
+            VoiceInputDaemon,
+            append_telemetry_record,
+            build_pipeline_summary,
+            create_platform,
+            read_telemetry_history,
+            run_pipeline_once,
+            send_control_command,
+        )
+        from .http_transport import (
+            HttpRequest,
+            HttpTransport,
+            _close_quietly,
+            _is_loopback_url,
+            _validate_request_url,
+            urllib_http_transport,
+        )
+        from .llm_common import _missing_key_hint
+        from .platform_common import ForegroundWindow
+        from .platform_macos import (
+            classify_macos_mic_permission,
+            compile_mac_shim,
+            probe_macos_host,
+            run_mac_shim_self_check,
+            run_macos_key_test,
+        )
+        from .platform_wsl import is_wsl, probe_wsl_host, run_key_test
+        from .refiner import (
+            CodexRefiner,
+            _build_responses_url,
+            find_codex_bin,
+            inspect_codex_auth_status,
+            resolve_codex_default_model,
+        )
+        from .remote_ssh import RemoteSshManager, resolve_ssh_executable
+        from .session_ctx import SessionTracker
+        from .session_title import run_session_hook
 
+        for _k, _v in list(locals().items()):
+            _LAZY_CLI_CACHE[_k] = _v
     g = globals()
-    for _k, _v in list(locals().items()):
-        if _k != "g":
-            g.setdefault(_k, _v)
-    _CLI_DEPS_LOADED = True
+    for _k, _v in _LAZY_CLI_CACHE.items():
+        g.setdefault(_k, _v)
 
 
 def __getattr__(name: str) -> Any:
     if name in _LAZY_CLI_ATTR_NAMES:
+        if name == "run_session_hook" and not _LAZY_CLI_CACHE:
+            from .session_title import run_session_hook as _rsh
+
+            globals()["run_session_hook"] = _rsh
+            return _rsh
+        if name == "_remote_probe" and not _LAZY_CLI_CACHE:
+            from . import _remote_probe as _rp
+
+            globals()["_remote_probe"] = _rp
+            return _rp
         _ensure_cli_deps()
         return globals()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -1909,21 +1917,23 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.subcmd == "session-hook":
-        from .session_title import run_session_hook as _run_session_hook_fast
-
-        return _run_session_hook_fast(cli_mode=args.cli, quiet_stdout=args.quiet)
+        hook_fn = globals().get("run_session_hook")
+        if hook_fn is None:
+            from .session_title import run_session_hook as hook_fn
+        return hook_fn(cli_mode=args.cli, quiet_stdout=args.quiet)
     if args.subcmd == "remote-ctx":
-        from . import _remote_probe as _rp_fast
-
+        rp_mod = globals().get("_remote_probe")
+        if rp_mod is None:
+            from . import _remote_probe as rp_mod
         raw_in = sys.stdin.buffer.read(131072)
         req_obj = json.loads(raw_in.decode("utf-8")) if raw_in.strip() else {}
-        resp_obj = _rp_fast.run_probe(req_obj if isinstance(req_obj, Mapping) else {})
+        resp_obj = rp_mod.run_probe(req_obj if isinstance(req_obj, Mapping) else {})
         if args.raw_json or (isinstance(req_obj, Mapping) and req_obj.get("raw_json")):
             sys.stdout.buffer.write(
                 json.dumps(resp_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
             )
         else:
-            sys.stdout.buffer.write(_rp_fast.pack_probe_stdout(resp_obj))
+            sys.stdout.buffer.write(rp_mod.pack_probe_stdout(resp_obj))
         sys.stdout.buffer.flush()
         return 0
     _ensure_cli_deps()

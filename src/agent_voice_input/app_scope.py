@@ -219,7 +219,9 @@ MACOS_TERMINAL_BUNDLE_IDS: frozenset[str] = frozenset(
 
 
 def is_windows_terminal_process(process: str) -> bool:
-    p = normalize_app_token(process)
+    p = (process or "").strip().lower()
+    if p.endswith(".exe"):
+        p = p[:-4]
     return bool(p) and p in WINDOWS_TERMINALS
 
 

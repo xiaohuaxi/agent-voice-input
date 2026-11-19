@@ -28,6 +28,7 @@ from agent_voice_input.app_scope import (  # noqa: E402
     WINDOWS_CTRL_SHIFT_V_PROCS,
     WINDOWS_SHIFT_INSERT_PROCS,
     WINDOWS_TERMINALS,
+    is_windows_terminal_process,
     resolve_windows_paste_chord,
 )
 from agent_voice_input.asr_providers import BaseAsrProvider, create_asr_provider  # noqa: E402
@@ -393,6 +394,38 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
             check=False,
         )
         self.assertEqual(p.returncode, 0, p.stderr or p.stdout)
+
+        patch_code = "\n".join(
+            [
+                "import io, sys",
+                "from unittest.mock import patch",
+                "import agent_voice_input.cli as cli",
+                "with patch.object(cli, 'run_session_hook', return_value=37) as m_hook:",
+                "    assert cli.main(['session-hook', '--cli', 'claude', '--quiet']) == 37",
+                "    m_hook.assert_called_once_with(cli_mode='claude', quiet_stdout=True)",
+                "assert callable(cli.run_session_hook)",
+                "with patch.object(cli, 'load_config') as m_cfg:",
+                "    assert cli.load_config is m_cfg",
+                "assert callable(cli.load_config)",
+                "with patch.object(cli, '_remote_probe') as m_rp:",
+                "    m_rp.run_probe.return_value = {'ok': True}",
+                "    fake_in = io.TextIOWrapper(io.BytesIO(b'{}'))",
+                "    fake_out = io.TextIOWrapper(io.BytesIO())",
+                "    with patch.object(sys, 'stdin', fake_in), patch.object(sys, 'stdout', fake_out):",
+                "        assert cli.main(['remote-ctx', '--raw-json']) == 0",
+                "    m_rp.run_probe.assert_called_once()",
+                "assert hasattr(cli._remote_probe, 'run_probe')",
+            ]
+        )
+        p_patch = subprocess.run(
+            [sys.executable, "-c", patch_code],
+            env={"PYTHONPATH": str(SRC_DIR)},
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(p_patch.returncode, 0, p_patch.stderr or p_patch.stdout)
 
         for py_path in sorted(PKG_DIR.glob("*.py")):
             self.assertNotIn(
@@ -868,6 +901,8 @@ class TestCrossPlatformTerminalSymmetry(unittest.TestCase):
             "update both platforms or declare genuinely OS-exclusive apps in *_ONLY_TERMINALS.",
         )
         self.assertIn("warp", WINDOWS_TERMINALS)
+        self.assertTrue(is_windows_terminal_process("warp.exe"))
+        self.assertFalse(is_windows_terminal_process("mintty.app"))
         self.assertEqual(resolve_windows_paste_chord("warp.exe"), "ctrl_shift_v")
 
         # Verify win_shim.ps1 $AllowedTerminals default array stays aligned with WINDOWS_TERMINALS
