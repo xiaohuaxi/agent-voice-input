@@ -19,7 +19,7 @@ import urllib.parse
 
 try:
     import tomllib as _stdlib_tomllib  # type: ignore[import-not-found]
-except ImportError:  # Python 3.10
+except ImportError:  # pragma: no cover - py310 import fallback when stdlib tomllib is absent
     _stdlib_tomllib = None
 
 
@@ -1446,10 +1446,10 @@ def parse_toml(text: str) -> dict[str, Any]:
             data = _stdlib_tomllib.loads(text)
         except Exception as exc:
             raise ConfigError(str(exc)) from None
-        if not isinstance(data, dict):
+        if not isinstance(data, dict):  # pragma: no cover - defensive non-table root guard
             raise ConfigError("TOML root must be a table")
         return data
-    return _parse_simple_toml(text)
+    return _parse_simple_toml(text)  # pragma: no cover - py310 fallback branch (tested via _parse_simple_toml)
 
 
 # ---------------------------------------------------------------------------

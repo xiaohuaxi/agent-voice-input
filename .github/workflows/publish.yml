@@ -88,6 +88,7 @@ jobs:
               "/config.example.toml",
               "/config.example.env",
               "/docs/context-routing.md",
+              "/scripts/check_coverage.py",
               "/integrations/remote/remote-title-hook.sh",
               "/.github/workflows/ci.yml",
               "/.github/workflows/publish.yml",

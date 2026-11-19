@@ -825,7 +825,16 @@ aliases = ["gpu01", "prod-linux"]
                     timeout=5.0,
                     check=True,
                 )
-                return decode_probe_stdout(p.stdout)
+                sub_out = decode_probe_stdout(p.stdout)
+                inproc_out = decode_probe_stdout(
+                    _remote_probe.pack_probe_stdout(
+                        _remote_probe.run_probe(
+                            req, env=probe_env, home_dir=rhome, proc_root=rproc
+                        )
+                    )
+                )
+                self.assertEqual(inproc_out, sub_out)
+                return sub_out
 
             # 1. Tier 1 `[#id8]` & `[§id8]` & UUID hit (filtering out sidechain & subagent!)
             r_t1_cl = _exec_probe_subproc({"v": 1, "title": f"claude [#{cl_new_a[:8]}]"})
@@ -2412,17 +2421,16 @@ sys.exit(p.returncode)
                         f"Expected multi-chunk context for {cli_name}",
                     )
 
+                    req_diff = {
+                        "v": 1,
+                        "title": title_tag,
+                        "max_chars": max_chars,
+                        "chunk_chars": chunk_chars,
+                        "include_git": False,
+                    }
                     proc = subprocess.run(
                         [sys.executable, "-"],
-                        input=build_probe_stdin_payload(
-                            {
-                                "v": 1,
-                                "title": title_tag,
-                                "max_chars": max_chars,
-                                "chunk_chars": chunk_chars,
-                                "include_git": False,
-                            }
-                        ),
+                        input=build_probe_stdin_payload(req_diff),
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         env=probe_env,
@@ -2430,6 +2438,14 @@ sys.exit(p.returncode)
                         check=True,
                     )
                     probe_resp = decode_probe_stdout(proc.stdout)
+                    inproc_diff = decode_probe_stdout(
+                        _remote_probe.pack_probe_stdout(
+                            _remote_probe.run_probe(
+                                req_diff, env=probe_env, home_dir=home, proc_root=proc_root
+                            )
+                        )
+                    )
+                    self.assertEqual(inproc_diff, probe_resp)
                     self.assertTrue(probe_resp["ok"], f"probe failed for {cli_name}: {probe_resp}")
                     self.assertEqual(probe_resp["cli"], cli_name)
                     self.assertEqual(probe_resp["session_id"], sid)
