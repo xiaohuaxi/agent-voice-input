@@ -1,7 +1,7 @@
 """WSL2 host bridge: WASAPI 16kHz capture via win_shim.ps1 stdio JSONL + PulseAudio RDPSource fallback."""
 from __future__ import annotations
 
-import base64, inspect, json, os, queue, signal, subprocess, sys, threading, time
+import base64, inspect, io, json, os, queue, signal, subprocess, sys, threading, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -580,30 +580,43 @@ def run_key_test(cfg: Config, seconds: int = 10) -> int:
 def _reap_shim_proc(proc: subprocess.Popen[str] | None) -> None:
     if proc is None:
         return
-    for pipe in (proc.stdin, proc.stdout):
-        if pipe is not None:
-            try: pipe.close()
-            except Exception: pass
     try:
         if proc.poll() is None:
             proc.kill()
         proc.wait(timeout=1.0)
     except Exception:
         pass
+    for pipe in (proc.stdin, proc.stdout):
+        if pipe is not None:
+            try: pipe.close()
+            except Exception: pass
 
 
 class JsonlShimMixin:
     _shim_graceful: bool = False
     _shim_ready_timeout: float = 8.0
     _shim_label: str = "shim"
+    _shim_backoff_base: float = 0.5
+    _shim_backoff_cap: float = 8.0
+    _shim_respawn_delays: tuple[float, ...] = (0.3, 1.0, 2.0, 4.0, 8.0)
     cfg: Config
     env: dict[str, str]
 
     def _init_shim_bridge(self) -> None:
         self._closed = False
+        self._close_evt = threading.Event()
         self._shim: subprocess.Popen[str] | None = None
         self._shim_disabled = False
         self._shim_lock = threading.Lock()
+        self._shim_cond = threading.Condition(self._shim_lock)
+        self._spawning_shim: bool = False
+        self._spawned_shim: subprocess.Popen[str] | None = None
+        self._spawned_ready: bool = False
+        self._shim_caps: frozenset[str] = frozenset()
+        self._shim_ever_ready: bool = False
+        self._shim_fail_count: int = 0
+        self._shim_retry_after: float = 0.0
+        self._respawn_scheduled: bool = False
         self._stdin_lock = threading.Lock()
         self._rpc_seq, self._pending, self._ready = 100, {}, threading.Event()
         self._event_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -679,7 +692,21 @@ class JsonlShimMixin:
     def _build_shim_cmd(self) -> list[str] | None:
         raise NotImplementedError
 
-    def _ensure_shim(self) -> bool:
+    def _schedule_respawn_if_needed(self) -> None:
+        start_bg = False
+        with self._shim_lock:
+            if (
+                not self._closed
+                and not self._shim_disabled
+                and self._on_event is not None
+                and not self._respawn_scheduled
+            ):
+                self._respawn_scheduled = True
+                start_bg = True
+        if start_bg:
+            threading.Thread(target=self._respawn_shim_bg, daemon=True).start()
+
+    def _ensure_shim(self, *, ignore_cooldown: bool = False) -> bool:
         if self._closed:
             if self._shim_graceful:
                 return False
@@ -687,60 +714,160 @@ class JsonlShimMixin:
         if self._shim_disabled:
             return False
         dead: subprocess.Popen[str] | None = None
-        with self._shim_lock:
-            if self._closed:
-                if self._shim_graceful:
-                    return False
-                raise RuntimeError(f"{type(self).__name__} is closed")
-            if self._shim_disabled:
-                return False
-            if self._shim is not None and self._shim.poll() is None:
-                return True
-            dead, self._shim = self._shim, None
-            cmd = self._build_shim_cmd()
-            if not cmd:
-                if self._shim_graceful:
-                    self._disable_shim_once(self.last_shim_error or f"{self._shim_label} unavailable")
-                    return False
-                raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
-            self._ready.clear()
-            try:
-                proc = subprocess.Popen(
-                    cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    text=True, encoding="utf-8", errors="replace", bufsize=1,
-                    env=self.env if self._shim_graceful else None,
-                )
-            except OSError as exc:
-                if self._shim_graceful:
-                    self._disable_shim_once(f"failed to spawn {self._shim_label}: {exc}")
-                    return False
-                raise
-            self._shim = proc
-            threading.Thread(target=self._shim_reader, args=(proc,), daemon=True).start()
-        _reap_shim_proc(dead)
-        self._ready.wait(timeout=self._shim_ready_timeout)
-        if self._closed:
-            if self._shim_graceful:
-                return False
-            raise RuntimeError(f"{type(self).__name__} is closed")
-        if self._shim_disabled:
-            return False
-        if self._shim_graceful:
+        proc_ready: threading.Event | None = None
+        proc: subprocess.Popen[str] | None = None
+        spawn_started = False
+        try:
             with self._shim_lock:
-                alive = self._shim is not None and self._shim.poll() is None
-            if not alive:
-                self._disable_shim_once(self.last_shim_error or f"{self._shim_label} exited before ready")
-                return False
-        return True
+                wait_deadline = time.monotonic() + max(0.2, float(self._shim_ready_timeout) + 0.5)
+                while self._spawning_shim and not self._closed and not self._shim_disabled:
+                    rem_w = wait_deadline - time.monotonic()
+                    if rem_w <= 0.0:
+                        break
+                    self._shim_cond.wait(timeout=rem_w)
+                if self._closed:
+                    if self._shim_graceful:
+                        return False
+                    raise RuntimeError(f"{type(self).__name__} is closed")
+                if self._shim_disabled:
+                    return False
+                if self._shim is not None and self._shim.poll() is None:
+                    if self._shim is not self._spawned_shim or self._spawned_ready:
+                        return True
+                if self._spawning_shim:
+                    return False
+                if not ignore_cooldown and time.monotonic() < self._shim_retry_after:
+                    return False
+                dead, self._shim = self._shim, None
+                self._spawned_shim = None
+                self._spawned_ready = False
+                self._shim_caps = frozenset()
+                self._spawning_shim = True
+                try:
+                    cmd = self._build_shim_cmd()
+                    if not cmd:
+                        if self._shim_graceful:
+                            self._disable_shim_once(self.last_shim_error or f"{self._shim_label} unavailable")
+                        else:
+                            raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
+                    else:
+                        self._ready.clear()
+                        proc_ready = threading.Event()
+                        try:
+                            proc = subprocess.Popen(
+                                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                                env=self.env if self._shim_graceful else None,
+                            )
+                        except OSError as exc:
+                            if self._shim_graceful:
+                                self._disable_shim_once(f"failed to spawn {self._shim_label}: {exc}")
+                            else:
+                                raise
+                        else:
+                            self._shim = proc
+                            self._spawned_shim = proc
+                            threading.Thread(target=self._shim_reader, args=(proc, proc_ready), daemon=True).start()
+                            spawn_started = True
+                finally:
+                    if not spawn_started:
+                        self._spawning_shim = False
+                        self._shim_cond.notify_all()
+        finally:
+            if dead is not None:
+                _reap_shim_proc(dead)
+        if not spawn_started:
+            return False
+        assert proc is not None and proc_ready is not None
+        proc_ready.wait(timeout=self._shim_ready_timeout)
+        reap_failed: subprocess.Popen[str] | None = None
+        closed_err = False
+        with self._shim_lock:
+            self._spawning_shim = False
+            self._shim_cond.notify_all()
+            if self._closed:
+                if self._shim is proc:
+                    self._shim = None
+                    self._spawned_shim = None
+                    self._spawned_ready = False
+                    self._shim_caps = frozenset()
+                reap_failed = proc
+                closed_err = not self._shim_graceful
+            else:
+                ok = (
+                    not self._shim_disabled
+                    and self._shim is proc
+                    and proc.poll() is None
+                    and self._spawned_ready
+                )
+                if ok:
+                    self._shim_ever_ready = True
+                    self._shim_fail_count = 0
+                    self._shim_retry_after = 0.0
+                    self.last_shim_error = ""
+                    return True
+                if self._shim is proc:
+                    self._shim = None
+                    self._spawned_shim = None
+                    self._spawned_ready = False
+                    self._shim_caps = frozenset()
+                reap_failed = proc
+                self._shim_fail_count += 1
+                backoff = min(
+                    float(self._shim_backoff_cap),
+                    float(self._shim_backoff_base) * (2 ** min(self._shim_fail_count, 4)),
+                )
+                self._shim_retry_after = time.monotonic() + backoff
+                if not self.last_shim_error:
+                    self.last_shim_error = f"{self._shim_label} failed to become ready"
+                if self._shim_graceful and not self._shim_ever_ready:
+                    self._disable_shim_once(self.last_shim_error)
+        _reap_shim_proc(reap_failed)
+        if closed_err:
+            raise RuntimeError(f"{type(self).__name__} is closed")
+        if not ignore_cooldown:
+            self._schedule_respawn_if_needed()
+        return False
 
     def _respawn_shim_bg(self) -> None:
-        time.sleep(0.2)
-        if not self._closed and not self._shim_disabled and self._on_event is not None:
-            try: self._ensure_shim()
-            except Exception: pass
+        succeeded = False
+        try:
+            for delay in self._shim_respawn_delays:
+                if self._close_evt.wait(max(0.0, float(delay))):
+                    return
+                if self._closed or self._shim_disabled or self._on_event is None:
+                    return
+                try:
+                    if self._ensure_shim(ignore_cooldown=True):
+                        succeeded = True
+                        return
+                except Exception:
+                    pass
+                if self._closed or self._shim_disabled or self._on_event is None:
+                    return
+        finally:
+            restart_again = False
+            with self._shim_lock:
+                self._respawn_scheduled = False
+                if (
+                    succeeded
+                    and not self._closed
+                    and not self._shim_disabled
+                    and self._on_event is not None
+                    and (self._shim is None or self._shim.poll() is not None)
+                ):
+                    self._respawn_scheduled = True
+                    restart_again = True
+            if restart_again:
+                threading.Thread(target=self._respawn_shim_bg, daemon=True).start()
 
-    def _shim_reader(self, proc: subprocess.Popen[str]) -> None:
+    def _shim_reader(
+        self,
+        proc: subprocess.Popen[str],
+        proc_ready: threading.Event | None = None,
+    ) -> None:
         assert proc.stdout is not None
+        managed_spawn = proc_ready is not None
         got_ready = False
         try:
             for raw in iter(proc.stdout.readline, ""):
@@ -751,20 +878,45 @@ class JsonlShimMixin:
                 if not isinstance(msg, dict):
                     continue
                 if msg.get("event") == "ready":
-                    got_ready = True
-                    self._win_ui_culture = str(msg.get("ui_culture") or "").strip()
-                    if "audio_status" in msg and isinstance(msg.get("audio_status"), dict):
-                        try:
-                            self._on_shim_internal_event({"event": "audio_devices_changed", **msg["audio_status"]})
-                        except Exception:
-                            pass
-                    self._ready.set()
+                    is_current = False
+                    with self._shim_lock:
+                        if self._shim is proc or (not managed_spawn and self._shim is None):
+                            is_current = True
+                            got_ready = True
+                            if self._shim is proc:
+                                self._spawned_ready = True
+                            raw_caps = msg.get("caps")
+                            if isinstance(raw_caps, list):
+                                self._shim_caps = frozenset(
+                                    str(c).strip()
+                                    for c in raw_caps
+                                    if isinstance(c, str) and str(c).strip()
+                                )
+                            else:
+                                self._shim_caps = frozenset()
+                            self._win_ui_culture = str(msg.get("ui_culture") or "").strip()
+                    if is_current:
+                        if "audio_status" in msg and isinstance(msg.get("audio_status"), dict):
+                            try:
+                                self._on_shim_internal_event({"event": "audio_devices_changed", **msg["audio_status"]})
+                            except Exception:
+                                pass
+                        self._ready.set()
+                    if proc_ready is not None:
+                        proc_ready.set()
                 elif "event" in msg and (
                     self._on_event is not None
                     or str(msg.get("event") or "") in self._INTERNAL_SHIM_EVENTS
                 ):
-                    self._ensure_event_worker()
-                    self._event_q.put(msg)
+                    with self._shim_lock:
+                        stale_proc = (
+                            (self._shim is not proc)
+                            if managed_spawn
+                            else (self._shim is not None and self._shim is not proc)
+                        )
+                    if not stale_proc:
+                        self._ensure_event_worker()
+                        self._event_q.put(msg)
                 elif "reply" in msg or msg.get("type") == "reply":
                     with self._shim_lock:
                         entry = self._pending.get(int(msg.get("seq_id") or 0))
@@ -774,9 +926,16 @@ class JsonlShimMixin:
                             try: wait_q.put_nowait(msg)
                             except queue.Full: pass
                 elif self._shim_graceful and not got_ready and msg.get("ok") is False:
-                    self._disable_shim_once(str(msg.get("error") or f"{self._shim_label} startup failed"))
-                    self._ready.set()
+                    with self._shim_lock:
+                        is_cur_err = self._shim is proc or (not managed_spawn and self._shim is None)
+                    if is_cur_err:
+                        self._disable_shim_once(str(msg.get("error") or f"{self._shim_label} startup failed"))
+                        self._ready.set()
+                    if proc_ready is not None:
+                        proc_ready.set()
         finally:
+            if proc_ready is not None:
+                proc_ready.set()
             need_respawn = False
             stale_queues: list[queue.Queue[dict[str, Any]]] = []
             with self._shim_lock:
@@ -787,10 +946,21 @@ class JsonlShimMixin:
                         self._pending.pop(k_sid, None)
                 if self._shim is proc:
                     self._shim = None
+                    self._spawned_shim = None
+                    self._spawned_ready = False
+                    self._shim_caps = frozenset()
                     self._ready.set()
-                    if not got_ready and self._shim_graceful and not self._closed:
+                    if not got_ready and self._shim_graceful and not self._closed and not self._shim_ever_ready:
                         self._disable_shim_once(self.last_shim_error or f"{self._shim_label} exited before ready")
-                    need_respawn = got_ready and not self._closed and not self._shim_disabled and self._on_event is not None
+                    if (
+                        got_ready
+                        and not self._closed
+                        and not self._shim_disabled
+                        and self._on_event is not None
+                        and not self._respawn_scheduled
+                    ):
+                        self._respawn_scheduled = True
+                        need_respawn = True
             _reap_shim_proc(proc)
             for q in stale_queues:
                 try: q.put_nowait({"error": "shim_eof"})
@@ -821,16 +991,22 @@ class JsonlShimMixin:
                     proc = self._shim
                     if proc is None or proc.stdin is None or proc.poll() is not None:
                         broken, self._shim = proc, None
+                        self._spawned_shim = None
+                        self._spawned_ready = False
+                        self._shim_caps = frozenset()
                         raise BrokenPipeError("shim_not_running")
-                    if before_write is not None:
-                        before_write()
                     sent_proc = proc
                     self._rpc_seq += 1
                     sid = self._rpc_seq
                     self._pending[sid] = (proc, q)
-                    with self._stdin_lock:
-                        proc.stdin.write(json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n")
-                        proc.stdin.flush()
+                line = json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n"
+                with self._stdin_lock:
+                    if before_write is not None:
+                        before_write()
+                    if sent_proc.poll() is not None or sent_proc.stdin is None or sent_proc.stdin.closed:
+                        raise BrokenPipeError("shim_not_running")
+                    sent_proc.stdin.write(line)
+                    sent_proc.stdin.flush()
                 res = q.get(timeout=timeout_sec)
                 if res.get("error") == "shim_eof" and (attempt + 1) < max_attempts and not self._closed and not self._shim_disabled:
                     continue
@@ -861,10 +1037,12 @@ class JsonlShimMixin:
 
     def start_event_listener(self, on_hotkey_event: Callable[[dict[str, Any]], None]) -> None:
         self._closed = False
+        self._close_evt.clear()
         self._shim_disabled = False
         self._on_event = on_hotkey_event
         self._ensure_event_worker()
-        self._ensure_shim()
+        if not self._ensure_shim():
+            self._schedule_respawn_if_needed()
 
     def hud(
         self,
@@ -985,6 +1163,7 @@ class JsonlShimMixin:
 
     def close(self) -> None:
         self._closed = True
+        self._close_evt.set()
         self._stop_level_streamer()
         self._on_event = None
         self._event_q.put(None)
@@ -994,16 +1173,39 @@ class JsonlShimMixin:
             cancel()
         with self._shim_lock:
             proc, self._shim = self._shim, None
+            self._spawned_shim = None
+            self._spawned_ready = False
+            self._shim_caps = frozenset()
+            self._shim_cond.notify_all()
         if proc is not None and proc.poll() is None:
-            try:
-                with self._stdin_lock:
+            quit_sent = False
+            if self._stdin_lock.acquire(timeout=0.2):
+                try:
                     if proc.stdin and not proc.stdin.closed:
-                        proc.stdin.write('{"cmd":"quit"}\n')
-                        proc.stdin.flush()
-                        proc.stdin.close()
-                proc.wait(timeout=2.0)
-            except Exception:
-                pass
+                        try:
+                            fd = proc.stdin.fileno()
+                        except (AttributeError, io.UnsupportedOperation, OSError):
+                            proc.stdin.write('{"cmd":"quit"}\n')
+                            proc.stdin.flush()
+                            proc.stdin.close()
+                            quit_sent = True
+                        else:
+                            os.set_blocking(fd, False)
+                            os.write(fd, b'{"cmd":"quit"}\n')
+                            quit_sent = True
+                            try:
+                                proc.stdin.close()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                finally:
+                    self._stdin_lock.release()
+            if quit_sent:
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
         _reap_shim_proc(proc)
 
 
@@ -1361,6 +1563,8 @@ class WslPlatform(JsonlShimMixin):
             mode, self._rec_mode = self._rec_mode, ""
         drain_sec = self.cfg.audio.effective_tail_drain_sec(macos=False) if (drain and mode) else 0.0
         if mode == "winmm" or was_dispatched:
+            if self._closed:
+                return b"", "winmm"
             if drain_sec > 0.0:
                 time.sleep(drain_sec)
             res = self._shim_rpc({"cmd": "rec_stop"}, timeout_sec=5.0) or {}

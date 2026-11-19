@@ -8079,6 +8079,311 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                 asr_hold.set()
                 daemon.close()
 
+    def test_win_shim_dll_cache_and_clip_guard_static_contracts(self) -> None:
+        shim = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
+        self.assertTrue(shim.isascii())
+        for required_tok in (
+            "CSharpCodeProvider",
+            "CompileAssemblyFromSource",
+            "VoiceWinShim_",
+            ".tmp.dll",
+            "[System.IO.File]::Move",
+            "IsHungAppWindow",
+            "CreateWindowEx",
+            "new IntPtr(-3)",
+            "ExcludeClipboardContentFromMonitorProcessing",
+            "CanIncludeInClipboardHistory",
+            "CanUploadToCloudClipboard",
+            "ClipboardViewerIgnore",
+            "Clipboard Viewer Ignore",
+            "AgentVoiceInputTransient",
+            "AgentVoiceInputRestored",
+            "CancelPendingClipRestore",
+            "WriteClipTextOnce",
+            "FlushPendingClipRestore",
+            "Set-ClipboardTransient",
+            "RunClipStateSelfCheck",
+            '$Mode -eq "clip-self-check"',
+        ):
+            self.assertIn(required_tok, shim, msg=required_tok)
+        for forbidden_tok in (
+            ".CompiledAssembly",
+            "GetText",
+            "QueueUserWorkItem",
+            "$fbOk",
+        ):
+            self.assertNotIn(forbidden_tok, shim, msg=forbidden_tok)
+
+    def test_jsonl_shim_unready_hang_reap_backoff_pulse_fallback_and_self_heal(self) -> None:
+        import subprocess
+        from unittest import mock
+        from agent_voice_input.config import AudioConfig
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        # 1. Concurrent _ensure_shim() callers coalesce into 1 Popen and ALL wait until 'ready'
+        slow_ready_shim = (
+            "import json, sys, time\n"
+            "time.sleep(0.08)\n"
+            "sys.stdout.write(json.dumps({'event': 'ready', 'ui_culture': 'zh-CN'}) + '\\n'); sys.stdout.flush()\n"
+            "for ln in sys.stdin:\n"
+            "    req = json.loads(ln)\n"
+            "    if req.get('cmd') == 'quit': break\n"
+            "    sys.stdout.write(json.dumps({'type': 'reply', 'reply': req['cmd'], 'seq_id': req['seq_id'], 'ok': True}) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+        )
+        conc_spawns = [0]
+        conc_lock = threading.Lock()
+
+        def conc_factory() -> list[str]:
+            with conc_lock:
+                conc_spawns[0] += 1
+            return [sys.executable, "-u", "-c", slow_ready_shim]
+
+        plat_conc = WslPlatform(Config(), env={}, shim_cmd_factory=conc_factory)
+        try:
+            barrier = threading.Barrier(5)
+            results: list[tuple[bool, bool]] = []
+            res_lock = threading.Lock()
+
+            def _worker() -> None:
+                barrier.wait(timeout=2.0)
+                ok = plat_conc._ensure_shim()
+                with res_lock:
+                    results.append((ok, plat_conc._spawned_ready))
+
+            threads = [threading.Thread(target=_worker) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=3.0)
+            self.assertEqual(conc_spawns[0], 1)
+            self.assertEqual(results, [(True, True)] * 5)
+        finally:
+            plat_conc.close()
+
+        # 2. Hung unready process is killed & reaped, enters exponential backoff (1->2->4->8s),
+        #    cooldown fast-fails HUD & falls back wsl_source='auto' to pulse in <150ms, then self-heals!
+        hung_then_healthy = (
+            "import json, sys, time\n"
+            "mode = sys.argv[1]\n"
+            "if mode == 'hang':\n"
+            "    time.sleep(30.0)\n"
+            "    sys.exit(0)\n"
+            "sys.stdout.write(json.dumps({'event': 'ready'}) + '\\n')\n"
+            "sys.stdout.write(json.dumps({'event': 'toggle', 'hwnd': 501, 'process': 'WindowsTerminal', 'title': 'healed'}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "for ln in sys.stdin:\n"
+            "    req = json.loads(ln)\n"
+            "    if req.get('cmd') == 'quit': break\n"
+            "    sys.stdout.write(json.dumps({'type': 'reply', 'reply': req['cmd'], 'seq_id': req['seq_id'], 'ok': True}) + '\\n')\n"
+            "    sys.stdout.flush()\n"
+        )
+        shim_mode = ["hang"]
+        spawned_procs: list[subprocess.Popen[str]] = []
+        orig_popen = subprocess.Popen
+
+        def tracking_popen(*args: Any, **kwargs: Any) -> Any:
+            p = orig_popen(*args, **kwargs)
+            if args and isinstance(args[0], list) and len(args[0]) >= 4 and args[0][-1] in ("hang", "healthy"):
+                spawned_procs.append(p)
+            return p
+
+        fake_pcm = (
+            "import sys, time\n"
+            "sys.stdout.buffer.write(b'\\x10\\x00' * 800)\n"
+            "sys.stdout.buffer.flush()\n"
+            "time.sleep(5.0)\n"
+        )
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "agent_voice_input.platform_wsl.subprocess.Popen", side_effect=tracking_popen
+        ):
+            rt = Path(td)
+            plat_hang = WslPlatform(
+                Config(audio=AudioConfig(wsl_source="auto")),
+                env={},
+                shim_cmd_factory=lambda: [sys.executable, "-u", "-c", hung_then_healthy, shim_mode[0]],
+            )
+            plat_hang._primary_winmm = True
+            plat_hang._use_winmm = True
+            plat_hang._shim_ready_timeout = 0.12
+            plat_hang._ff_rec._cmd_factory = lambda _f, _s: [sys.executable, "-u", "-c", fake_pcm]
+            try:
+                ok_hang = plat_hang._ensure_shim()
+                self.assertFalse(ok_hang)
+                self.assertIsNone(plat_hang._shim)
+                self.assertEqual(plat_hang._shim_fail_count, 1)
+                self.assertEqual(len(spawned_procs), 1)
+                self.assertIsNotNone(spawned_procs[0].poll(), "hung unready shim process must be killed & reaped")
+                rem1 = plat_hang._shim_retry_after - time.monotonic()
+                self.assertGreater(rem1, 0.5)
+                self.assertLessEqual(rem1, 1.05)
+
+                # Verify exponential backoff progression 1s -> 2s -> 4s -> 8s -> 8s (via ignore_cooldown)
+                expected_backoffs = [2.0, 4.0, 8.0, 8.0]
+                for exp_b in expected_backoffs:
+                    self.assertFalse(plat_hang._ensure_shim(ignore_cooldown=True))
+                    rem_b = plat_hang._shim_retry_after - time.monotonic()
+                    self.assertGreater(rem_b, exp_b - 0.35)
+                    self.assertLessEqual(rem_b, exp_b + 0.1)
+
+                # During cooldown: _ensure_shim() and hud() return in < 30ms without spawning,
+                # and start_recording(wsl_source='auto') smoothly falls back to pulse without stalling!
+                spawns_before_cd = len(spawned_procs)
+                t_cd0 = time.monotonic()
+                self.assertFalse(plat_hang._ensure_shim())
+                plat_hang.hud("recording")
+                self.assertLess(time.monotonic() - t_cd0, 0.05)
+                self.assertEqual(len(spawned_procs), spawns_before_cd)
+
+                t_rec0 = time.monotonic()
+                plat_hang.start_recording(rt, seq_id=1)
+                self.assertLess(time.monotonic() - t_rec0, 0.4)
+                self.assertEqual(plat_hang._rec_mode, "pulse")
+                wav_fb, mode_fb = plat_hang.stop_recording(drain=False)
+                self.assertEqual(mode_fb, "pulse")
+                self.assertGreater(len(wav_fb), 44)
+
+                # Expire cooldown & switch to healthy shim -> automatic recovery of events + RPC!
+                healed_evts: list[dict[str, Any]] = []
+                healed_done = threading.Event()
+                plat_hang._on_event = lambda m: (healed_evts.append(m), healed_done.set())
+                plat_hang._ensure_event_worker()
+                shim_mode[0] = "healthy"
+                plat_hang._shim_retry_after = 0.0
+                r_ping = plat_hang._shim_rpc({"cmd": "ping"}, timeout_sec=2.0) or {}
+                self.assertTrue(r_ping.get("ok"))
+                self.assertEqual(plat_hang._shim_fail_count, 0)
+                self.assertEqual(plat_hang.last_shim_error, "")
+                self.assertTrue(healed_done.wait(timeout=2.0))
+                self.assertEqual(healed_evts[0]["hwnd"], 501)
+            finally:
+                plat_hang.close()
+
+        # 3. Bounded 5-attempt _respawn_shim_bg stops spawning after 5 consecutive failures (no infinite loop)
+        bound_spawns = [0]
+
+        def always_fail_factory() -> list[str]:
+            bound_spawns[0] += 1
+            return [sys.executable, "-u", "-c", "import sys; sys.exit(1)"]
+
+        plat_bound = WslPlatform(Config(), env={}, shim_cmd_factory=always_fail_factory)
+        plat_bound._shim_ready_timeout = 0.1
+        plat_bound._shim_respawn_delays = (0.02, 0.02, 0.02, 0.02, 0.02)
+        try:
+            plat_bound.start_event_listener(lambda _e: None)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and (bound_spawns[0] < 6 or plat_bound._respawn_scheduled):
+                time.sleep(0.02)
+            # 1 initial attempt + 5 bounded background retries = exact 6 spawns
+            self.assertEqual(bound_spawns[0], 6)
+            self.assertFalse(plat_bound._respawn_scheduled)
+            time.sleep(0.12)
+            self.assertEqual(bound_spawns[0], 6)
+        finally:
+            plat_bound.close()
+
+        # 4. Late/zombie events from an old managed shim process are strictly dropped
+        import io
+        plat_stale = WslPlatform(Config(), env={})
+        stale_evts: list[dict[str, Any]] = []
+        plat_stale._on_event = lambda m: stale_evts.append(m)
+        plat_stale._ensure_event_worker()
+        try:
+            class _ZombieShim:
+                def __init__(self, lines: str) -> None:
+                    self.stdin = io.StringIO()
+                    self.stdout = io.StringIO(lines)
+
+                def poll(self) -> int | None:
+                    return 0
+
+                def kill(self) -> None:
+                    pass
+
+                def wait(self, timeout: float | None = None) -> int:
+                    return 0
+
+            zombie = _ZombieShim(
+                json.dumps({"event": "ready", "ui_culture": "fr-FR", "caps": ["paste_clip"]}) + "\n"
+                + json.dumps({"event": "toggle", "hwnd": 999, "process": "ZombieTerm", "title": "ghost"}) + "\n"
+            )
+            # Current self._shim is None (already reaped on timeout), while managed_spawn (proc_ready != None) flushes late buffer
+            plat_stale._shim_reader(zombie, threading.Event())  # type: ignore[arg-type]
+            plat_stale._flush_shim_events()
+            self.assertEqual(stale_evts, [])
+            self.assertEqual(plat_stale._win_ui_culture, "")
+            self.assertEqual(plat_stale._shim_caps, frozenset())
+        finally:
+            plat_stale.close()
+
+        # 5. Graceful _ensure_shim early-exit (empty cmd / Popen OSError) clears _spawning_shim so restart works
+        from agent_voice_input.platform_macos import MacOSPlatform
+        graceful_mode = ["empty"]
+        graceful_calls = [0]
+
+        def graceful_factory() -> list[str] | None:
+            graceful_calls[0] += 1
+            if graceful_mode[0] == "empty":
+                return None
+            if graceful_mode[0] == "oserror":
+                return ["/nonexistent/avi_missing_shim_binary"]
+            return [sys.executable, "-u", "-c", slow_ready_shim]
+
+        plat_grace = MacOSPlatform(Config(), env={}, shim_cmd_factory=graceful_factory)
+        try:
+            plat_grace.start_event_listener(lambda _e: None)
+            self.assertFalse(plat_grace._spawning_shim)
+            self.assertTrue(plat_grace._shim_disabled)
+            plat_grace.close()
+
+            graceful_mode[0] = "oserror"
+            plat_grace.start_event_listener(lambda _e: None)
+            self.assertFalse(plat_grace._spawning_shim)
+            self.assertTrue(plat_grace._shim_disabled)
+            plat_grace.close()
+
+            graceful_mode[0] = "ok"
+            plat_grace.start_event_listener(lambda _e: None)
+            self.assertTrue(plat_grace._spawned_ready)
+            self.assertEqual(graceful_calls[0], 3)
+        finally:
+            plat_grace.close()
+
+        # 6. Ready shim freezing with full stdin pipe never deadlocks close() against concurrent _shim_rpc
+        frozen_stdin_shim = (
+            "import json, sys, time\n"
+            "sys.stdout.write(json.dumps({'event': 'ready'}) + '\\n'); sys.stdout.flush()\n"
+            "time.sleep(30.0)\n"
+        )
+        plat_frozen = WslPlatform(
+            Config(),
+            env={},
+            shim_cmd_factory=lambda: [sys.executable, "-u", "-c", frozen_stdin_shim],
+        )
+        try:
+            self.assertTrue(plat_frozen._ensure_shim())
+            big_blob = "X" * (512 * 1024)
+            rpc_finished = threading.Event()
+
+            def _flood_rpc() -> None:
+                try:
+                    for _ in range(8):
+                        plat_frozen._shim_rpc({"cmd": "hud", "text": big_blob}, timeout_sec=0.3, allow_retry=False)
+                except Exception:
+                    pass
+                finally:
+                    rpc_finished.set()
+
+            flood_t = threading.Thread(target=_flood_rpc, daemon=True)
+            flood_t.start()
+            time.sleep(0.08)
+            t_close0 = time.monotonic()
+            plat_frozen.close()
+            self.assertLess(time.monotonic() - t_close0, 1.5)
+            self.assertTrue(rpc_finished.wait(timeout=1.5))
+        finally:
+            plat_frozen.close()
+
 
 if __name__ == "__main__":
     unittest.main()

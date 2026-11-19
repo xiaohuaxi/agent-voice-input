@@ -43,7 +43,7 @@ from .session_ctx import (
 GHOSTTY_BUNDLE_ID = "com.mitchellh.ghostty"
 APPLE_TERMINAL_BUNDLE_ID = "com.apple.terminal"
 MAC_SHIM_SCRIPT = Path(__file__).resolve().with_name("mac_shim.swift")
-SHIM_SCHEMA_VERSION = 4
+SHIM_SCHEMA_VERSION = 5
 MACOS_TERMINALS = frozenset(
     {
         "terminal",
@@ -1908,6 +1908,36 @@ class MacOSPlatform(JsonlShimMixin):
         cur_proc = self._query_frontmost_process_and_title()[0] if verdict == "not_frontmost" else "Ghostty"
         return on_fallback("focus_changed", cur_proc)
 
+    def _shim_supports_paste_clip(self) -> bool:
+        return self._has_managed_shim() and ("paste_clip" in self._shim_caps)
+
+    def _populate_paste_expectations(
+        self,
+        req: dict[str, Any],
+        *,
+        origin_window: ForegroundWindow | None,
+        expected_fg: ForegroundWindow | None,
+    ) -> None:
+        exp_bundle = (
+            (origin_window.bundle_id if origin_window and origin_window.bundle_id else "")
+            or (expected_fg.bundle_id if expected_fg and expected_fg.bundle_id else "")
+        ).strip()
+        exp_proc = (
+            (origin_window.process if origin_window and origin_window.process else "")
+            or (expected_fg.process if expected_fg and expected_fg.process else "")
+        ).strip()
+        exp_hwnd = (
+            origin_window.hwnd
+            if origin_window is not None and origin_window.hwnd > 0
+            else (expected_fg.hwnd if expected_fg is not None and expected_fg.hwnd > 0 else 0)
+        )
+        if exp_bundle:
+            req["expect_bundle_id"] = exp_bundle
+        if exp_proc:
+            req["expect_process"] = exp_proc
+        if exp_hwnd > 0:
+            req["expect_hwnd"] = exp_hwnd
+
     def _post_cmd_v(
         self,
         *,
@@ -1917,25 +1947,7 @@ class MacOSPlatform(JsonlShimMixin):
         cur_proc = expected_fg.process if expected_fg is not None else ""
         if self._has_managed_shim():
             req: dict[str, Any] = {"cmd": "paste_cmd_v"}
-            exp_bundle = (
-                (origin_window.bundle_id if origin_window and origin_window.bundle_id else "")
-                or (expected_fg.bundle_id if expected_fg and expected_fg.bundle_id else "")
-            ).strip()
-            exp_proc = (
-                (origin_window.process if origin_window and origin_window.process else "")
-                or (expected_fg.process if expected_fg and expected_fg.process else "")
-            ).strip()
-            exp_hwnd = (
-                origin_window.hwnd
-                if origin_window is not None and origin_window.hwnd > 0
-                else (expected_fg.hwnd if expected_fg is not None and expected_fg.hwnd > 0 else 0)
-            )
-            if exp_bundle:
-                req["expect_bundle_id"] = exp_bundle
-            if exp_proc:
-                req["expect_process"] = exp_proc
-            if exp_hwnd > 0:
-                req["expect_hwnd"] = exp_hwnd
+            self._populate_paste_expectations(req, origin_window=origin_window, expected_fg=expected_fg)
             try:
                 if _callable_accepts_kwarg(self._shim_rpc, "allow_retry"):
                     res = self._shim_rpc(req, timeout_sec=1.0, allow_retry=False)
@@ -1969,6 +1981,69 @@ class MacOSPlatform(JsonlShimMixin):
             else _summarize_osascript_error(p.stderr or "", kind="system_events")
         )
         return False, reason, cur_proc
+
+    def _deliver_cmd_v_via_shim_clip(
+        self,
+        text: str,
+        *,
+        origin_window: ForegroundWindow | None,
+        expected_fg: ForegroundWindow,
+        fallback_clipboard_text: str | None,
+        is_beep_suppressed: Callable[[], bool],
+    ) -> PasteOutcome:
+        cur_proc = expected_fg.process
+        req: dict[str, Any] = {"cmd": "paste_cmd_v", "text": text}
+        if fallback_clipboard_text is not None and fallback_clipboard_text != text:
+            req["fallback_text"] = fallback_clipboard_text
+        self._populate_paste_expectations(req, origin_window=origin_window, expected_fg=expected_fg)
+        res: dict[str, Any] | None = None
+        try:
+            if _callable_accepts_kwarg(self._shim_rpc, "allow_retry"):
+                res = self._shim_rpc(req, timeout_sec=1.5, allow_retry=False)
+            else:
+                res = self._shim_rpc(req, timeout_sec=1.5)
+        except Exception:
+            res = None
+        if (
+            isinstance(res, dict)
+            and res.get("ok") is True
+            and "clipboard" in res
+            and res.get("reason") != "shim_paste_unconfirmed"
+        ):
+            posted_ok = bool(res.get("posted"))
+            clip_ok = bool(res.get("clipboard"))
+            eff_fg_proc = str(res.get("fg_process")) if "fg_process" in res else cur_proc
+            if posted_ok:
+                return PasteOutcome(
+                    True,
+                    clip_ok,
+                    "ok",
+                    eff_fg_proc,
+                    used_clipboard_paste=bool(posted_ok and clip_ok),
+                )
+            if not clip_ok:
+                return PasteOutcome(False, False, "clipboard_failed", eff_fg_proc, used_clipboard_paste=False)
+            raw_reason = str(res.get("reason") or "cgevent_failed")
+            post_reason = (
+                "accessibility_denied (grant Accessibility permission to your terminal app)"
+                if raw_reason == "accessibility_denied"
+                else raw_reason
+            )
+            if not is_beep_suppressed():
+                self.beep("focus")
+            return PasteOutcome(False, True, post_reason, eff_fg_proc, used_clipboard_paste=False)
+        # RPC timed out or failed: NEVER send osascript Cmd+V (avoid double paste); ensure fallback text is on clipboard.
+        fb_txt = fallback_clipboard_text if fallback_clipboard_text is not None else text
+        clip_ok = self._copy_to_clipboard(fb_txt)
+        if clip_ok and not is_beep_suppressed():
+            self.beep("focus")
+        return PasteOutcome(
+            False,
+            clip_ok,
+            "shim_paste_unconfirmed" if clip_ok else "clipboard_failed",
+            cur_proc,
+            used_clipboard_paste=False,
+        )
 
     def deliver_text(
         self,
@@ -2140,6 +2215,14 @@ class MacOSPlatform(JsonlShimMixin):
 
         if not _confirm_commit():
             return PasteOutcome(False, False, "cancelled", fg.process)
+        if self._shim_supports_paste_clip():
+            return self._deliver_cmd_v_via_shim_clip(
+                text,
+                origin_window=origin_window,
+                expected_fg=fg,
+                fallback_clipboard_text=fallback_clipboard_text,
+                is_beep_suppressed=_is_beep_suppressed,
+            )
         clip_ok = self._copy_to_clipboard(text)
         if not clip_ok:
             return PasteOutcome(False, False, "clipboard_failed", fg.process)

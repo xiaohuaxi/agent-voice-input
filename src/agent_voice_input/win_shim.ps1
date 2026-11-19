@@ -5,7 +5,7 @@ param(
 $ErrorActionPreference = "Stop"
 [Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
+$csSource = @"
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -688,6 +688,24 @@ public static class VoiceWinShim {
     [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
     [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint uCode, uint uMapType);
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool CloseClipboard();
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool EmptyClipboard();
+    [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr GetClipboardData(uint uFormat);
+    [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SetClipboardData(uint uFormat, IntPtr hMem);
+    [DllImport("user32.dll")] private static extern bool IsClipboardFormatAvailable(uint format);
+    [DllImport("user32.dll")] private static extern uint EnumClipboardFormats(uint format);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern uint RegisterClipboardFormat(string lpszFormat);
+    [DllImport("user32.dll")] private static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] private static extern IntPtr GetClipboardOwner();
+    [DllImport("user32.dll")] private static extern bool IsHungAppWindow(IntPtr hwnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern IntPtr CreateWindowEx(uint dwExStyle, string lpClassName, string lpWindowName, uint dwStyle, int x, int y, int nWidth, int nHeight, IntPtr hWndParent, IntPtr hMenu, IntPtr hInstance, IntPtr lpParam);
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool DestroyWindow(IntPtr hWnd);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr GlobalAlloc(uint uFlags, UIntPtr dwBytes);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr GlobalFree(IntPtr hMem);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr GlobalLock(IntPtr hMem);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GlobalUnlock(IntPtr hMem);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern UIntPtr GlobalSize(IntPtr hMem);
     [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("kernel32.dll")] public static extern ulong GetTickCount64();
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr GetModuleHandle(string lpModuleName);
@@ -1650,8 +1668,490 @@ public static class VoiceWinShim {
         return BuildPcm16MonoWav(raw, evenLen, 16000);
     }
 
+    private const uint CF_DIB = 8u, CF_UNICODETEXT = 13u, CF_HDROP = 15u, CF_DIBV5 = 17u, GMEM_MOVEABLE = 0x0002u, GMEM_ZEROINIT = 0x0040u;
+    private const int MaxClipSnapshotBytes = 20 * 1024 * 1024, ClipRestoreDelayMs = 250, ClipRestoreRetryDelayMs = 60, MaxClipRestoreRetries = 3;
+    private static readonly byte[] DwordZeroBytes = new byte[4];
+    private static IntPtr _clipHwnd = IntPtr.Zero;
+    private static System.Windows.Forms.Timer _clipRestoreTimer = null;
+    private static bool _clipFormatsReady = false;
+    private static uint _fmtExcludeMonitor = 0u, _fmtCanHistory = 0u, _fmtCanCloud = 0u, _fmtViewerIgnore = 0u, _fmtViewerIgnoreSpaced = 0u, _fmtAviTransient = 0u, _fmtAviRestored = 0u, _fmtPng = 0u, _fmtHtml = 0u, _fmtRtf = 0u;
+
+    private enum SnapKind { ClearOnly, Data, Unrestorable }
+    private enum ClipReadStatus { Missing, Ok, Oversize }
+
+    private sealed class ClipEntry {
+        public readonly uint Format;
+        public readonly byte[] Data;
+        public ClipEntry(uint fmt, byte[] data) { Format = fmt; Data = data; }
+    }
+
+    private sealed class ClipSnap {
+        public static readonly ClipSnap ClearOnly = new ClipSnap(SnapKind.ClearOnly, null);
+        public static readonly ClipSnap Unrestorable = new ClipSnap(SnapKind.Unrestorable, null);
+        public readonly SnapKind Kind;
+        public readonly List<ClipEntry> Entries;
+        private ClipSnap(SnapKind kind, List<ClipEntry> entries) { Kind = kind; Entries = entries; }
+        public static ClipSnap Data(List<ClipEntry> entries) { return new ClipSnap(SnapKind.Data, entries); }
+    }
+
+    private sealed class ClipGuardState {
+        public ClipSnap SavedClip = null;
+        public uint ExpectedSeq = 0u;
+        public ulong NextToken = 0UL;
+        public ulong ExpectedToken = 0UL;
+        public int RetryCount = 0;
+        public bool RestorePending = false;
+    }
+
+    private interface IClipStore {
+        uint SequenceNumber { get; }
+        uint FormatExcludeMonitor { get; }
+        uint FormatCanHistory { get; }
+        uint FormatCanCloud { get; }
+        uint FormatViewerIgnore { get; }
+        uint FormatViewerIgnoreSpaced { get; }
+        uint FormatAviTransient { get; }
+        uint FormatAviRestored { get; }
+        uint FormatPng { get; }
+        uint FormatHtml { get; }
+        uint FormatRtf { get; }
+        bool IsOwnerHung();
+        bool Open();
+        void Close();
+        bool IsEmptyWhenOpen();
+        bool HasFormatWhenOpen(uint fmt);
+        ClipReadStatus ReadFormatBytesWhenOpen(uint fmt, int maxBytes, out byte[] data);
+        bool EmptyWhenOpen();
+        bool SetFormatBytesWhenOpen(uint fmt, byte[] data);
+    }
+
+    private static void EnsureClipFormats() {
+        if (_clipFormatsReady) return;
+        _fmtExcludeMonitor = RegisterClipboardFormat("ExcludeClipboardContentFromMonitorProcessing");
+        _fmtCanHistory = RegisterClipboardFormat("CanIncludeInClipboardHistory");
+        _fmtCanCloud = RegisterClipboardFormat("CanUploadToCloudClipboard");
+        _fmtViewerIgnore = RegisterClipboardFormat("ClipboardViewerIgnore");
+        _fmtViewerIgnoreSpaced = RegisterClipboardFormat("Clipboard Viewer Ignore");
+        _fmtAviTransient = RegisterClipboardFormat("AgentVoiceInputTransient");
+        _fmtAviRestored = RegisterClipboardFormat("AgentVoiceInputRestored");
+        _fmtPng = RegisterClipboardFormat("PNG");
+        _fmtHtml = RegisterClipboardFormat("HTML Format");
+        _fmtRtf = RegisterClipboardFormat("Rich Text Format");
+        _clipFormatsReady = true;
+    }
+
+    private static IntPtr EnsureClipHwnd() {
+        if (_clipHwnd == IntPtr.Zero) {
+            try { _clipHwnd = CreateWindowEx(0u, "STATIC", "", 0u, 0, 0, 0, 0, new IntPtr(-3), IntPtr.Zero, IntPtr.Zero, IntPtr.Zero); } catch { _clipHwnd = IntPtr.Zero; }
+        }
+        return _clipHwnd;
+    }
+
+    private sealed class Win32ClipStore : IClipStore {
+        public uint SequenceNumber { get { return GetClipboardSequenceNumber(); } }
+        public uint FormatExcludeMonitor { get { EnsureClipFormats(); return _fmtExcludeMonitor; } }
+        public uint FormatCanHistory { get { EnsureClipFormats(); return _fmtCanHistory; } }
+        public uint FormatCanCloud { get { EnsureClipFormats(); return _fmtCanCloud; } }
+        public uint FormatViewerIgnore { get { EnsureClipFormats(); return _fmtViewerIgnore; } }
+        public uint FormatViewerIgnoreSpaced { get { EnsureClipFormats(); return _fmtViewerIgnoreSpaced; } }
+        public uint FormatAviTransient { get { EnsureClipFormats(); return _fmtAviTransient; } }
+        public uint FormatAviRestored { get { EnsureClipFormats(); return _fmtAviRestored; } }
+        public uint FormatPng { get { EnsureClipFormats(); return _fmtPng; } }
+        public uint FormatHtml { get { EnsureClipFormats(); return _fmtHtml; } }
+        public uint FormatRtf { get { EnsureClipFormats(); return _fmtRtf; } }
+
+        public bool IsOwnerHung() {
+            IntPtr owner = GetClipboardOwner();
+            return (owner != IntPtr.Zero) && (owner != _clipHwnd) && IsHungAppWindow(owner);
+        }
+
+        public bool Open() {
+            IntPtr hwnd = EnsureClipHwnd();
+            if (hwnd == IntPtr.Zero) return false;
+            return OpenClipboard(hwnd);
+        }
+
+        public void Close() { CloseClipboard(); }
+        public bool IsEmptyWhenOpen() { return EnumClipboardFormats(0u) == 0u; }
+        public bool HasFormatWhenOpen(uint fmt) { return (fmt != 0u) && IsClipboardFormatAvailable(fmt); }
+
+        public ClipReadStatus ReadFormatBytesWhenOpen(uint fmt, int maxBytes, out byte[] data) {
+            data = null;
+            IntPtr hMem = GetClipboardData(fmt);
+            if (hMem == IntPtr.Zero) return ClipReadStatus.Missing;
+            ulong sz = (ulong)GlobalSize(hMem);
+            if (sz == 0UL) return ClipReadStatus.Missing;
+            if (sz > (ulong)maxBytes) return ClipReadStatus.Oversize;
+            IntPtr ptr = GlobalLock(hMem);
+            if (ptr == IntPtr.Zero) return ClipReadStatus.Missing;
+            try {
+                data = new byte[(int)sz];
+                Marshal.Copy(ptr, data, 0, (int)sz);
+                return ClipReadStatus.Ok;
+            } finally {
+                GlobalUnlock(hMem);
+            }
+        }
+
+        public bool EmptyWhenOpen() { return EmptyClipboard(); }
+
+        public bool SetFormatBytesWhenOpen(uint fmt, byte[] data) {
+            if (fmt == 0u || data == null) return false;
+            int len = data.Length;
+            IntPtr hMem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, new UIntPtr((uint)Math.Max(1, len)));
+            if (hMem == IntPtr.Zero) return false;
+            bool transferred = false;
+            try {
+                IntPtr ptr = GlobalLock(hMem);
+                if (ptr == IntPtr.Zero) return false;
+                try {
+                    if (len > 0) Marshal.Copy(data, 0, ptr, len);
+                } finally {
+                    GlobalUnlock(hMem);
+                }
+                if (SetClipboardData(fmt, hMem) != IntPtr.Zero) {
+                    transferred = true;
+                    return true;
+                }
+                return false;
+            } finally {
+                if (!transferred) GlobalFree(hMem);
+            }
+        }
+    }
+
+    private static readonly ClipGuardState _clipState = new ClipGuardState();
+    private static readonly Win32ClipStore _win32ClipStore = new Win32ClipStore();
+
+    public static byte[] EncodeUnicodeClipBytes(string s) {
+        byte[] body = Encoding.Unicode.GetBytes(s ?? "");
+        byte[] raw = new byte[body.Length + 2];
+        if (body.Length > 0) Buffer.BlockCopy(body, 0, raw, 0, body.Length);
+        return raw;
+    }
+
+    public static string DecodeUnicodeClipBytes(byte[] raw) {
+        if (raw == null || raw.Length == 0) return "";
+        int evenLen = raw.Length - (raw.Length % 2);
+        int end = 0;
+        while (end + 1 < evenLen && !(raw[end] == 0 && raw[end + 1] == 0)) end += 2;
+        return (end > 0) ? Encoding.Unicode.GetString(raw, 0, end) : "";
+    }
+
+    private static bool HasMatchingTransientTokenWhenOpen(IClipStore store, ulong token) {
+        if (token == 0UL || store.FormatAviTransient == 0u || !store.HasFormatWhenOpen(store.FormatAviTransient)) return false;
+        byte[] raw;
+        ClipReadStatus st = store.ReadFormatBytesWhenOpen(store.FormatAviTransient, 64, out raw);
+        if (st != ClipReadStatus.Ok || raw == null || raw.Length < 8) return false;
+        return BitConverter.ToUInt64(raw, 0) == token;
+    }
+
+    private static ClipSnap CaptureOpenClip(IClipStore store) {
+        if (store.IsEmptyWhenOpen()) return ClipSnap.ClearOnly;
+        if (store.FormatViewerIgnore != 0u && store.HasFormatWhenOpen(store.FormatViewerIgnore)) return ClipSnap.ClearOnly;
+        if (store.FormatViewerIgnoreSpaced != 0u && store.HasFormatWhenOpen(store.FormatViewerIgnoreSpaced)) return ClipSnap.ClearOnly;
+        if (store.FormatAviTransient != 0u && store.HasFormatWhenOpen(store.FormatAviTransient)) return ClipSnap.Unrestorable;
+        bool isOwnRestored = (store.FormatAviRestored != 0u) && store.HasFormatWhenOpen(store.FormatAviRestored);
+        if (!isOwnRestored && store.FormatExcludeMonitor != 0u && store.HasFormatWhenOpen(store.FormatExcludeMonitor)) return ClipSnap.ClearOnly;
+        uint imgDibFmt = store.HasFormatWhenOpen(CF_DIBV5) ? CF_DIBV5 : CF_DIB;
+        uint[] whitelist = new uint[] { CF_UNICODETEXT, store.FormatHtml, store.FormatRtf, store.FormatPng, imgDibFmt, CF_HDROP };
+        List<ClipEntry> entries = new List<ClipEntry>(whitelist.Length);
+        long totalBytes = 0L;
+        for (int i = 0; i < whitelist.Length; i++) {
+            uint fmt = whitelist[i];
+            if (fmt == 0u || !store.HasFormatWhenOpen(fmt)) continue;
+            byte[] data;
+            ClipReadStatus st = store.ReadFormatBytesWhenOpen(fmt, MaxClipSnapshotBytes, out data);
+            if (st == ClipReadStatus.Oversize) return ClipSnap.Unrestorable;
+            if (st == ClipReadStatus.Ok && data != null && data.Length > 0) {
+                if (totalBytes + (long)data.Length > (long)MaxClipSnapshotBytes) return ClipSnap.Unrestorable;
+                totalBytes += (long)data.Length;
+                entries.Add(new ClipEntry(fmt, data));
+            }
+        }
+        return (entries.Count > 0) ? ClipSnap.Data(entries) : ClipSnap.Unrestorable;
+    }
+
+    private static void WriteExcludeMarkersWhenOpen(IClipStore store) {
+        if (store.FormatExcludeMonitor != 0u) store.SetFormatBytesWhenOpen(store.FormatExcludeMonitor, DwordZeroBytes);
+        if (store.FormatCanHistory != 0u) store.SetFormatBytesWhenOpen(store.FormatCanHistory, DwordZeroBytes);
+        if (store.FormatCanCloud != 0u) store.SetFormatBytesWhenOpen(store.FormatCanCloud, DwordZeroBytes);
+    }
+
+    private static void CancelClipRestoreCore(ClipGuardState st, Action stopTimerFn) {
+        if (stopTimerFn != null) stopTimerFn();
+        st.RestorePending = false;
+        st.ExpectedToken = 0UL;
+        st.RetryCount = 0;
+        st.SavedClip = null;
+    }
+
+    private static bool WriteClipTextCore(ClipGuardState st, IClipStore store, string text, bool transientForPaste, Action armTimerFn, Action stopTimerFn) {
+        if (!transientForPaste) {
+            CancelClipRestoreCore(st, stopTimerFn);
+            if (!store.Open()) return false;
+            try {
+                if (!store.EmptyWhenOpen()) return false;
+                if (!string.IsNullOrEmpty(text)) {
+                    if (!store.SetFormatBytesWhenOpen(CF_UNICODETEXT, EncodeUnicodeClipBytes(text))) return false;
+                }
+                return true;
+            } finally {
+                store.Close();
+            }
+        }
+        bool preHung = store.IsOwnerHung();
+        if (!store.Open()) return false;
+        ClipSnap nextSnap = null;
+        ulong myToken = 0UL;
+        bool wroteOk = false;
+        try {
+            bool reuseExisting = st.RestorePending && (store.SequenceNumber == st.ExpectedSeq) && HasMatchingTransientTokenWhenOpen(store, st.ExpectedToken);
+            bool ownerHung = (!reuseExisting) && (preHung || store.IsOwnerHung());
+            nextSnap = reuseExisting ? st.SavedClip : (ownerHung ? ClipSnap.Unrestorable : CaptureOpenClip(store));
+            myToken = ++st.NextToken;
+            if (myToken == 0UL) myToken = ++st.NextToken;
+            if (store.EmptyWhenOpen() && store.SetFormatBytesWhenOpen(CF_UNICODETEXT, EncodeUnicodeClipBytes(text ?? ""))) {
+                WriteExcludeMarkersWhenOpen(store);
+                if (store.FormatAviTransient != 0u) store.SetFormatBytesWhenOpen(store.FormatAviTransient, BitConverter.GetBytes(myToken));
+                wroteOk = true;
+            }
+        } finally {
+            store.Close();
+        }
+        if (!wroteOk) return false;
+        if (stopTimerFn != null) stopTimerFn();
+        if (nextSnap != null && nextSnap.Kind != SnapKind.Unrestorable) {
+            st.SavedClip = nextSnap;
+            st.ExpectedToken = myToken;
+            st.ExpectedSeq = store.SequenceNumber;
+            st.RetryCount = 0;
+            st.RestorePending = true;
+            if (armTimerFn != null) armTimerFn();
+        } else {
+            st.SavedClip = null;
+            st.ExpectedToken = 0UL;
+            st.RetryCount = 0;
+            st.RestorePending = false;
+        }
+        return true;
+    }
+
+    private static void FlushClipRestoreCore(ClipGuardState st, IClipStore store, Action retryTimerFn, Action stopTimerFn) {
+        if (!st.RestorePending) return;
+        ClipSnap snap = st.SavedClip;
+        uint expSeq = st.ExpectedSeq;
+        ulong expTok = st.ExpectedToken;
+        if (snap == null || snap.Kind == SnapKind.Unrestorable || store.SequenceNumber != expSeq) {
+            CancelClipRestoreCore(st, stopTimerFn);
+            return;
+        }
+        bool opened = false;
+        int syncTries = (retryTimerFn != null) ? 1 : 3;
+        for (int a = 0; a < syncTries; a++) {
+            if (store.Open()) { opened = true; break; }
+        }
+        if (!opened) {
+            if (retryTimerFn != null && st.RetryCount < MaxClipRestoreRetries) {
+                st.RetryCount++;
+                retryTimerFn();
+                return;
+            }
+            CancelClipRestoreCore(st, stopTimerFn);
+            return;
+        }
+        try {
+            CancelClipRestoreCore(st, stopTimerFn);
+            if (store.SequenceNumber != expSeq || !HasMatchingTransientTokenWhenOpen(store, expTok)) return;
+            if (!store.EmptyWhenOpen()) return;
+            if (snap.Kind == SnapKind.Data && snap.Entries != null) {
+                for (int i = 0; i < snap.Entries.Count; i++) {
+                    ClipEntry e = snap.Entries[i];
+                    store.SetFormatBytesWhenOpen(e.Format, e.Data);
+                }
+                WriteExcludeMarkersWhenOpen(store);
+                if (store.FormatAviRestored != 0u) store.SetFormatBytesWhenOpen(store.FormatAviRestored, DwordZeroBytes);
+            }
+        } finally {
+            store.Close();
+        }
+    }
+
+    private static void StopMainClipTimer() {
+        if (_clipRestoreTimer != null) { try { _clipRestoreTimer.Stop(); } catch { } }
+    }
+
+    private static void StartMainClipTimerMs(int delayMs) {
+        if (_clipRestoreTimer == null) {
+            _clipRestoreTimer = new System.Windows.Forms.Timer();
+            _clipRestoreTimer.Tick += (s, e) => {
+                StopMainClipTimer();
+                FlushClipRestoreCore(_clipState, _win32ClipStore, ArmRetryClipTimer, StopMainClipTimer);
+            };
+        }
+        _clipRestoreTimer.Stop();
+        _clipRestoreTimer.Interval = Math.Max(10, delayMs);
+        _clipRestoreTimer.Start();
+    }
+
+    private static void ArmMainClipTimer() {
+        StartMainClipTimerMs(ClipRestoreDelayMs);
+    }
+
+    private static void ArmRetryClipTimer() {
+        StartMainClipTimerMs(ClipRestoreRetryDelayMs);
+    }
+
+    public static void CancelPendingClipRestore() {
+        CancelClipRestoreCore(_clipState, StopMainClipTimer);
+    }
+
+    public static bool WriteClipTextOnce(string text, bool transientForPaste) {
+        return WriteClipTextCore(_clipState, _win32ClipStore, text, transientForPaste, ArmMainClipTimer, StopMainClipTimer);
+    }
+
+    public static void FlushPendingClipRestore() {
+        FlushClipRestoreCore(_clipState, _win32ClipStore, null, StopMainClipTimer);
+    }
+
+    private sealed class MemClipStore : IClipStore {
+        public uint Seq = 10u;
+        public bool Hung = false;
+        public int FailNextOpens = 0;
+        public int OversizeFmt = 0;
+        public readonly Dictionary<uint, byte[]> Formats = new Dictionary<uint, byte[]>();
+        public uint SequenceNumber { get { return Seq; } }
+        public uint FormatExcludeMonitor { get { return 0xC101u; } }
+        public uint FormatCanHistory { get { return 0xC102u; } }
+        public uint FormatCanCloud { get { return 0xC103u; } }
+        public uint FormatViewerIgnore { get { return 0xC104u; } }
+        public uint FormatViewerIgnoreSpaced { get { return 0xC108u; } }
+        public uint FormatAviTransient { get { return 0xC109u; } }
+        public uint FormatAviRestored { get { return 0xC10Au; } }
+        public uint FormatPng { get { return 0xC105u; } }
+        public uint FormatHtml { get { return 0xC106u; } }
+        public uint FormatRtf { get { return 0xC107u; } }
+        public bool IsOwnerHung() { return Hung; }
+        public bool Open() { if (FailNextOpens > 0) { FailNextOpens--; return false; } return true; }
+        public void Close() { }
+        public bool IsEmptyWhenOpen() { return Formats.Count == 0; }
+        public bool HasFormatWhenOpen(uint fmt) { return Formats.ContainsKey(fmt); }
+        public ClipReadStatus ReadFormatBytesWhenOpen(uint fmt, int maxBytes, out byte[] data) {
+            data = null;
+            if ((uint)OversizeFmt == fmt) return ClipReadStatus.Oversize;
+            byte[] src;
+            if (!Formats.TryGetValue(fmt, out src) || src == null) return ClipReadStatus.Missing;
+            if (src.Length > maxBytes) return ClipReadStatus.Oversize;
+            data = new byte[src.Length];
+            Buffer.BlockCopy(src, 0, data, 0, src.Length);
+            return ClipReadStatus.Ok;
+        }
+        public bool EmptyWhenOpen() { Formats.Clear(); Seq++; return true; }
+        public bool SetFormatBytesWhenOpen(uint fmt, byte[] data) {
+            byte[] cp = new byte[data.Length];
+            Buffer.BlockCopy(data, 0, cp, 0, data.Length);
+            Formats[fmt] = cp;
+            return true;
+        }
+        public void SimulateUserCopy(uint fmt, byte[] data) {
+            Formats.Clear();
+            SetFormatBytesWhenOpen(fmt, data);
+            Seq++;
+        }
+    }
+
+    public static void RunClipStateSelfCheck() {
+        MemClipStore mem = new MemClipStore();
+        ClipGuardState st = new ClipGuardState();
+        int armed = 0, retried = 0, stopped = 0;
+        Action armFn = () => { armed++; };
+        Action retryFn = () => { retried++; };
+        Action stopFn = () => { stopped++; };
+        byte[] png0 = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        mem.Formats[mem.FormatPng] = png0;
+        mem.Formats[CF_UNICODETEXT] = EncodeUnicodeClipBytes("orig_caption");
+
+        // 1. Rapid-fire #1 + #2 (and transient lock retry during flush) preserves original PNG + text
+        if (!WriteClipTextCore(st, mem, "voice_one", true, armFn, stopFn)) throw new InvalidOperationException("step1 write failed");
+        if (!st.RestorePending || !mem.Formats.ContainsKey(mem.FormatExcludeMonitor) || !mem.Formats.ContainsKey(mem.FormatCanHistory) || !mem.Formats.ContainsKey(mem.FormatAviTransient)) throw new InvalidOperationException("step1 markers missing");
+        if (BitConverter.ToInt32(mem.Formats[mem.FormatCanHistory], 0) != 0) throw new InvalidOperationException("step1 DWORD 0 invalid");
+        mem.FailNextOpens = 1;
+        if (WriteClipTextCore(st, mem, "voice_two", true, armFn, stopFn)) throw new InvalidOperationException("step2 lock simulation failed");
+        if (!WriteClipTextCore(st, mem, "voice_two", true, armFn, stopFn)) throw new InvalidOperationException("step2 retry failed");
+        if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "voice_two") throw new InvalidOperationException("step2 text mismatch");
+        mem.FailNextOpens = 2;
+        FlushClipRestoreCore(st, mem, retryFn, stopFn);
+        if (!st.RestorePending || retried != 1) throw new InvalidOperationException("step2 flush lock retry 1 failed");
+        FlushClipRestoreCore(st, mem, retryFn, stopFn);
+        if (!st.RestorePending || retried != 2) throw new InvalidOperationException("step2 flush lock retry 2 failed");
+        FlushClipRestoreCore(st, mem, retryFn, stopFn);
+        if (st.RestorePending || !mem.Formats.ContainsKey(mem.FormatPng) || mem.Formats[mem.FormatPng].Length != png0.Length) throw new InvalidOperationException("step2 PNG not restored");
+        if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "orig_caption") throw new InvalidOperationException("step2 text not restored");
+        if (!mem.Formats.ContainsKey(mem.FormatAviRestored)) throw new InvalidOperationException("step2 AviRestored marker missing");
+
+        // 1b. Subsequent dictation after a previous restore still re-snapshots restored ordinary content (not mistaken for password!)
+        if (!WriteClipTextCore(st, mem, "voice_after_restore", true, armFn, stopFn)) throw new InvalidOperationException("step2b write failed");
+        FlushClipRestoreCore(st, mem, null, stopFn);
+        if (!mem.Formats.ContainsKey(mem.FormatPng) || DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "orig_caption") throw new InvalidOperationException("step2b ordinary restored clip clobbered");
+
+        // 2. User manual Ctrl+C during 250ms window is never overwritten by timer OR subsequent #2
+        WriteClipTextCore(st, mem, "voice_three", true, armFn, stopFn);
+        mem.SimulateUserCopy(CF_UNICODETEXT, EncodeUnicodeClipBytes("user_manual_copy"));
+        FlushClipRestoreCore(st, mem, null, stopFn);
+        if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "user_manual_copy" || mem.Formats.ContainsKey(mem.FormatPng)) throw new InvalidOperationException("step3 clobbered user copy");
+
+        WriteClipTextCore(st, mem, "voice_four_a", true, armFn, stopFn);
+        mem.SimulateUserCopy(CF_UNICODETEXT, EncodeUnicodeClipBytes("user_copy_between_bursts"));
+        WriteClipTextCore(st, mem, "voice_four_b", true, armFn, stopFn);
+        FlushClipRestoreCore(st, mem, null, stopFn);
+        if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "user_copy_between_bursts") throw new InvalidOperationException("step3b burst did not re-baseline user copy");
+
+        // 3. Focus-drift persistent fallback cancels pending timer and omits exclusion markers
+        mem.SimulateUserCopy(mem.FormatPng, png0);
+        WriteClipTextCore(st, mem, "voice_five", true, armFn, stopFn);
+        WriteClipTextCore(st, mem, "fallback_keep_me", false, armFn, stopFn);
+        if (st.RestorePending || mem.Formats.ContainsKey(mem.FormatExcludeMonitor) || mem.Formats.ContainsKey(mem.FormatCanHistory) || mem.Formats.ContainsKey(mem.FormatAviTransient)) throw new InvalidOperationException("step4 fallback kept transient markers");
+        FlushClipRestoreCore(st, mem, null, stopFn);
+        if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "fallback_keep_me") throw new InvalidOperationException("step4 fallback wiped");
+
+        // 4. Password manager markers (KeePass 'Clipboard Viewer Ignore', 'ClipboardViewerIgnore', external 'ExcludeClipboardContentFromMonitorProcessing') -> ClearOnly
+        foreach (uint pwFmt in new uint[] { mem.FormatViewerIgnore, mem.FormatViewerIgnoreSpaced, mem.FormatExcludeMonitor }) {
+            mem.Formats.Clear();
+            mem.Formats[CF_UNICODETEXT] = EncodeUnicodeClipBytes("s3cr3t_pw");
+            mem.Formats[pwFmt] = DwordZeroBytes;
+            mem.Seq++;
+            WriteClipTextCore(st, mem, "voice_six", true, armFn, stopFn);
+            FlushClipRestoreCore(st, mem, null, stopFn);
+            if (mem.Formats.Count != 0) throw new InvalidOperationException("step5 password secret not cleared for fmt " + pwFmt);
+        }
+
+        // 5. Oversize (>20MB) or hung owner -> Unrestorable, and #2 burst does not snapshot #1's transient text
+        mem.Formats.Clear();
+        mem.Formats[mem.FormatPng] = png0;
+        mem.OversizeFmt = (int)mem.FormatPng;
+        mem.Seq++;
+        WriteClipTextCore(st, mem, "voice_seven", true, armFn, stopFn);
+        mem.OversizeFmt = 0;
+        if (st.RestorePending) throw new InvalidOperationException("step6 oversize armed restore");
+        WriteClipTextCore(st, mem, "voice_seven_b", true, armFn, stopFn);
+        if (st.RestorePending) throw new InvalidOperationException("step6b burst after oversize armed restore");
+        FlushClipRestoreCore(st, mem, null, stopFn);
+        if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "voice_seven_b") throw new InvalidOperationException("step6 oversize wiped clipboard");
+
+        mem.Formats.Clear();
+        mem.Formats[CF_UNICODETEXT] = EncodeUnicodeClipBytes("from_hung_app");
+        mem.Hung = true;
+        mem.Seq++;
+        WriteClipTextCore(st, mem, "voice_eight", true, armFn, stopFn);
+        mem.Hung = false;
+        if (st.RestorePending) throw new InvalidOperationException("step7 hung owner armed restore");
+    }
+
     public static void StopHook() {
         int dummyBytes; string dummyErr; StopRecording(out dummyBytes, out dummyErr);
+        FlushPendingClipRestore();
+        if (_clipRestoreTimer != null) { try { _clipRestoreTimer.Stop(); _clipRestoreTimer.Dispose(); } catch { } _clipRestoreTimer = null; }
+        if (_clipHwnd != IntPtr.Zero) { try { DestroyWindow(_clipHwnd); } catch { } _clipHwnd = IntPtr.Zero; }
         if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
         if (_hud != null) { try { _hud.Dispose(); } catch { } _hud = null; }
         if (_toastHud != null) { try { _toastHud.Dispose(); } catch { } _toastHud = null; }
@@ -1700,18 +2200,106 @@ public static class VoiceWinShim {
     }
 }
 "@
+if (-not ('VoiceWinShim' -as [type])) {
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            $hashInput = "v1|" + $PSVersionTable.PSVersion.ToString() + "|" + $PSVersionTable.CLRVersion.ToString() + "|" + [IntPtr]::Size + "|" + $csSource
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($hashInput))
+            } finally {
+                $sha.Dispose()
+            }
+            $csHash = ([System.BitConverter]::ToString($hashBytes, 0, 8) -replace '-', '').ToLowerInvariant()
+            $cacheDir = Join-Path $env:LOCALAPPDATA "agent-voice-input\cache"
+            $dllName = "VoiceWinShim_$csHash.dll"
+            $dllPath = Join-Path $cacheDir $dllName
+            if (Test-Path -LiteralPath $dllPath) {
+                try {
+                    Add-Type -Path $dllPath -ErrorAction Stop
+                } catch {
+                    if (-not ('VoiceWinShim' -as [type])) {
+                        try { [System.IO.File]::Move($dllPath, "$dllPath.bad.$PID") } catch { }
+                    }
+                }
+            }
+            if (-not ('VoiceWinShim' -as [type])) {
+                try { [void][System.IO.Directory]::CreateDirectory($cacheDir) } catch { }
+                $randHex = [Guid]::NewGuid().ToString("N").Substring(0, 8)
+                $tmpDll = "$dllPath.$PID.$randHex.tmp.dll"
+                $provider = New-Object Microsoft.CSharp.CSharpCodeProvider
+                try {
+                    $cp = New-Object System.CodeDom.Compiler.CompilerParameters
+                    $cp.GenerateInMemory = $false
+                    $cp.GenerateExecutable = $false
+                    $cp.IncludeDebugInformation = $false
+                    $cp.OutputAssembly = $tmpDll
+                    $refLocs = @(
+                        [System.Uri].Assembly.Location,
+                        [System.Linq.Enumerable].Assembly.Location,
+                        [System.Drawing.Bitmap].Assembly.Location,
+                        [System.Windows.Forms.Form].Assembly.Location
+                    )
+                    foreach ($loc in $refLocs) {
+                        if ((-not [string]::IsNullOrWhiteSpace($loc)) -and (-not $cp.ReferencedAssemblies.Contains($loc))) {
+                            [void]$cp.ReferencedAssemblies.Add($loc)
+                        }
+                    }
+                    $cr = $provider.CompileAssemblyFromSource($cp, $csSource)
+                    if ((-not $cr.Errors.HasErrors) -and (Test-Path -LiteralPath $tmpDll)) {
+                        try {
+                            [System.IO.File]::Move($tmpDll, $dllPath)
+                        } catch [System.IO.IOException] {
+                            try { [System.IO.File]::Delete($tmpDll) } catch { }
+                        }
+                        if (Test-Path -LiteralPath $dllPath) {
+                            Add-Type -Path $dllPath -ErrorAction Stop
+                        }
+                    }
+                } finally {
+                    $provider.Dispose()
+                    if (Test-Path -LiteralPath $tmpDll) {
+                        try { [System.IO.File]::Delete($tmpDll) } catch { }
+                    }
+                }
+                try {
+                    $staleCutoff = [DateTime]::UtcNow.AddMinutes(-5)
+                    foreach ($f in [System.IO.Directory]::GetFiles($cacheDir, "VoiceWinShim_*")) {
+                        $fn = [System.IO.Path]::GetFileName($f)
+                        if ($fn.Equals($dllName, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                        if ($fn.EndsWith(".tmp.dll", [StringComparison]::OrdinalIgnoreCase)) {
+                            try {
+                                if ([System.IO.File]::GetLastWriteTimeUtc($f) -gt $staleCutoff) { continue }
+                            } catch { continue }
+                        }
+                        try { [System.IO.File]::Delete($f) } catch { }
+                    }
+                } catch { }
+            }
+        }
+    } catch { }
+    if (-not ('VoiceWinShim' -as [type])) {
+        Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition $csSource
+    }
+}
 
 function Write-JsonLine($obj) { try { [Console]::Out.WriteLine(($obj | ConvertTo-Json -Compress -Depth 5)); [Console]::Out.Flush() } catch { } }
 function Invoke-Tone([string]$kind) { [VoiceWinShim]::PlayTone($kind, [bool]$Beep) }
 function Set-ClipboardSafe([string]$val) {
     for ($i = 0; $i -lt 3; $i++) {
         try {
-            if ([string]::IsNullOrEmpty($val)) { [System.Windows.Forms.Clipboard]::Clear() }
-            else { [System.Windows.Forms.Clipboard]::SetText($val) }
-            return $true
-        } catch {
-            if ($i -lt 2) { Start-Sleep -Milliseconds 10 }
-        }
+            if ([VoiceWinShim]::WriteClipTextOnce($val, $false)) { return $true }
+        } catch { }
+        if ($i -lt 2) { Start-Sleep -Milliseconds 10 }
+    }
+    return $false
+}
+function Set-ClipboardTransient([string]$val) {
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            if ([VoiceWinShim]::WriteClipTextOnce($val, $true)) { return $true }
+        } catch { }
+        if ($i -lt 2) { Start-Sleep -Milliseconds 10 }
     }
     return $false
 }
@@ -1728,6 +2316,11 @@ function Get-TitleSessionToken([string]$title) {
 
 [VoiceWinShim]::EnableDpiAwareness()
 
+if ($Mode -eq "clip-self-check") {
+    [VoiceWinShim]::RunClipStateSelfCheck()
+    Write-JsonLine @{ ok = $true; mode = "clip-self-check" }
+    exit 0
+}
 if ($Mode -eq "probe") {
     $hwnd = 0L; $proc = ""; $title = ""; [VoiceWinShim]::QueryForeground([ref]$hwnd, [ref]$proc, [ref]$title)
     Write-JsonLine @{ ok = $true; ps_version = $PSVersionTable.PSVersion.ToString(); wave_in_devs = [VoiceWinShim]::waveInGetNumDevs(); hwnd = $hwnd; process = $proc; title = $title; ui_culture = [VoiceWinShim]::GetHostUiCulture(); dpi = [VoiceWinShim]::GetTargetDpi([IntPtr]$hwnd) }
@@ -1810,7 +2403,7 @@ try {
                         if ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
                             Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "hotkey_held"; fg_process = $p }
                         } else {
-                            $clipOk = Set-ClipboardSafe $txt
+                            $clipOk = Set-ClipboardTransient $txt
                             if (-not $clipOk) {
                                 Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "clipboard_failed"; fg_process = $p }
                             } else {
@@ -1821,10 +2414,11 @@ try {
                                 $winMatch2 = (($thwnd -le 0) -or ($h2 -eq $thwnd)) -and (($expectProc -eq "") -or ($p2Norm -eq $expectProc)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $p2Norm)) -and (-not $tokConflict2)
                                 if (-not $winMatch2) {
                                     if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }
+                                    else { $clipOk = Set-ClipboardSafe $txt }
                                     if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
                                     Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "focus_changed" } else { "clipboard_failed" }); fg_process = $p2 }
                                 } elseif ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
-                                    if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }
+                                    if ($fbTxt -ne $txt) { [void](Set-ClipboardTransient $fbTxt) }
                                     Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = [bool]$clipOk; reason = "hotkey_held"; fg_process = $p2 }
                                 } else {
                                     $sent = [VoiceWinShim]::SendPasteChord($pasteChord)
@@ -1832,6 +2426,7 @@ try {
                                         Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $true; clipboard = $true; reason = "ok"; fg_process = $p2 }
                                     } else {
                                         if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }
+                                        else { $clipOk = Set-ClipboardSafe $txt }
                                         if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
                                         Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "send_input_failed" } else { "clipboard_failed" }); fg_process = $p2 }
                                     }
