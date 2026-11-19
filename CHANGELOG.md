@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-19
+
 ### Added
 - **Zero-install SSH remote Linux session context routing (`[remote]`)**: Added stateless `ssh ... -- <target> python3 -` remote context probing (`_remote_probe.py` & `remote_ssh.py`) requiring zero remote daemon or package installation across Codex CLI, Claude Code, and Antigravity CLI. Supports Tier 1 `[@host]` + `[#id8]`/`[§id6+]`/UUID lookup, Tier 2 `cwd`-scoped matching (preferring exact over bounded non-broad child/parent directories, matching title CLI hints, and selecting the latest `mtime` session within the same rank), remote `tmux` active-pane discovery, non-Git shallow workspace filename fallback, broad privacy root refusal (`~`, `/`, `/tmp`, `/home`), ETag `not_modified` JSONL short-circuiting, forward-anchored `50K` whole-chunk eviction (`trim_turns_chunk_aligned`) for byte-identical LLM prefix caching, `start_recording` async prefetching with configurable `timeout_ms` (`400ms` default) post-stop budget, per-host circuit breakers, WSL2 `ssh.exe` path resolution, `remote-ctx` CLI helper, `integrations/remote/remote-title-hook.sh`, and `docs/context-routing.md`.
 - **Desktop IDE workspace & Antigravity IDE conversation binding**: Added bounded non-recursive workspace resolution across VS Code, Cursor, Windsurf, Antigravity IDE, Zed, JetBrains IDEs, Xcode, and Sublime Text (via window title parsing and macOS `AXDocument` `file://` URLs, with zero-slow-mount-I/O WSL2 `/mnt/` guards), injecting workspace `git status` and core filenames without leaking unrelated terminal CLI sessions, plus 3-tier `brain/<cid>` evidence matching (selecting the latest matching conversation for that workspace) and incremental `50K` cached context sync for desktop Antigravity IDE.
@@ -93,7 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Initial WSL2 release**: Two-stage context-aware voice input daemon and CLI for coding agents (**Codex**, **Claude Code**, **AGY**) on Windows + WSL2, featuring native `win_shim.ps1` WASAPI capture, global hotkey & HUD bridge, active terminal session discovery, `ffmpeg` loudness normalization with local silence gating, and safe paste without auto-pressing `Enter`.
 
-[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.6.1...v0.7.0

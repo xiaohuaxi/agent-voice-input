@@ -46,10 +46,10 @@ Copy and paste this prompt directly into **Codex**, **Claude Code**, or **AGY**:
 
 ```text
 Please install and configure agent-voice-input (https://github.com/xiaohuaxi/agent-voice-input) for me:
-1. Check python3 (>=3.10) and ffmpeg (plus Xcode Command Line Tools `/usr/bin/swiftc` on macOS), then install via `uv tool install agent-voice-input` (or `uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git` if `init` / `doctor --ping` are not yet in the latest PyPI release; fall back to `pipx` if `uv` is unavailable).
-2. Run `agent-voice-input init` to create `~/.config/agent-voice-input/config.toml` and `agent-voice-input.env` (chmod 600; on PyPI v0.8.0 without `init`, create `~/.config/agent-voice-input/agent-voice-input.env` with chmod 600 directly, or copy `v0.8.0`'s `config.example.toml` if customizing TOML).
+1. Check python3 (>=3.10) and ffmpeg (plus Xcode Command Line Tools `/usr/bin/swiftc` on macOS), then install via `uv tool install agent-voice-input` (fall back to `pipx` if `uv` is unavailable).
+2. Run `agent-voice-input init` to create `~/.config/agent-voice-input/config.toml` and `agent-voice-input.env` (chmod 600).
 3. Check if a Stage 1 speech-capable API key is already set in my environment (e.g. DASHSCOPE_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, SILICONFLOW_API_KEY, or DOUBAO_ASR_API_KEY; optional Stage 2 keys like DEEPSEEK_API_KEY / ARK_API_KEY can be added alongside it); if not, ask which provider I want to use and add it to `~/.config/agent-voice-input/agent-voice-input.env`.
-4. Run `agent-voice-input doctor --ping` (or `agent-voice-input doctor` on v0.8.0) to verify all checks pass, then start the background daemon with `agent-voice-input start`.
+4. Run `agent-voice-input doctor --ping` to verify all checks pass, then start the background daemon with `agent-voice-input start`.
 ```
 
 ### Option 2: Manual Setup in 3 Steps
@@ -60,31 +60,26 @@ Please install and configure agent-voice-input (https://github.com/xiaohuaxi/age
 - **ffmpeg**: `sudo apt install ffmpeg` (Ubuntu / WSL2) or `brew install ffmpeg` (macOS)
 - **Xcode Command Line Tools** (recommended on macOS): `xcode-select --install` for `/usr/bin/swiftc` to compile and cache the native hotkey & HUD helper on first start (falls back to CLI `toggle` / `once` if absent).
 
-**2. Install**
-
-**Option A — Latest PyPI release (`v0.8.0`)**:
+**2. Install (`v0.9.0`)**
 
 ```bash
 uv tool install agent-voice-input
-mkdir -p -m 700 ~/.config/agent-voice-input
-# Create ~/.config/agent-voice-input/agent-voice-input.env (chmod 600) with at least one Stage 1 key, then:
-agent-voice-input doctor
-agent-voice-input start
+# Or with pipx: pipx install agent-voice-input
+# (To track latest main instead: uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git)
 ```
 
-**Option B — Latest `main` (includes Unreleased `init`, `doctor --ping`, `deepseek`, and `[remote]`)**:
+**3. Initialize Config, Set One Credential & Start**
 
 ```bash
-uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git
 agent-voice-input init
-# Edit ~/.config/agent-voice-input/agent-voice-input.env and uncomment at least one Stage 1 key, then:
+# Edit ~/.config/agent-voice-input/agent-voice-input.env (chmod 600) and uncomment at least one Stage 1 key, then:
 agent-voice-input doctor --ping
 agent-voice-input start
 ```
 
 **Stage 1 vs. Stage 2 credentials**: Set at least one Stage 1 speech-capable key in `~/.config/agent-voice-input/agent-voice-input.env` (`DASHSCOPE_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `SILICONFLOW_API_KEY`, or `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`; optional `DEEPSEEK_API_KEY`, `ARK_API_KEY`, or local `codex login` can pair with it for Stage 2; `pipx` works identically in place of `uv tool`).
 
-> Tap **Right Ctrl** (`RControl`) inside your terminal to start and finish recording (on `main` in `tap_toggle` mode, holding & releasing `RControl` alone for `1.2s–8s` cancels in-flight processing). To customize hotkeys (`trigger_mode = "ptt"`), HUD position (`bottom` / `top`), duration limits, or providers, copy [`config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml) (or [`v0.8.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.8.0/config.example.toml) when running PyPI `v0.8.0`) to `~/.config/agent-voice-input/config.toml` (see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env) for all credential variables).
+> Tap **Right Ctrl** (`RControl`) inside your terminal to start and finish recording (in `tap_toggle` mode, holding & releasing `RControl` alone for `1.2s–8s` cancels in-flight processing). `agent-voice-input init` writes a starter `config.toml`; to customize hotkeys (`trigger_mode = "ptt"`), HUD position (`bottom` / `top`), `[remote]`, duration limits, or providers, see [`v0.9.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.9.0/config.example.toml) (or [`main/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)) and [`v0.9.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.9.0/config.example.env).
 
 ---
 

@@ -45,10 +45,10 @@
 
 ```text
 请帮我安装并配置 agent-voice-input（https://github.com/xiaohuaxi/agent-voice-input）：
-1. 检查 python3 (>=3.10) 与 ffmpeg（macOS 下顺带确认 Xcode Command Line Tools `/usr/bin/swiftc`），用 `uv tool install agent-voice-input` 安装（若最新 PyPI 尚未包含 `init` / `doctor --ping`，改用 `uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git`；无 uv 则换用 pipx）；
-2. 运行 `agent-voice-input init` 初始化生成权限 600 的 `~/.config/agent-voice-input/config.toml` 与 `agent-voice-input.env`（若使用 PyPI v0.8.0 尚无 `init`，直接创建权限 600 的 `~/.config/agent-voice-input/agent-voice-input.env`，如需自定义 TOML 请参照 `v0.8.0` 标签下的 `config.example.toml`）；
+1. 检查 python3 (>=3.10) 与 ffmpeg（macOS 下顺带确认 Xcode Command Line Tools `/usr/bin/swiftc`），用 `uv tool install agent-voice-input` 安装（无 uv 则换用 pipx）；
+2. 运行 `agent-voice-input init` 初始化生成权限 600 的 `~/.config/agent-voice-input/config.toml` 与 `agent-voice-input.env`；
 3. 检查我当前环境中是否已有至少一把支持一阶段语音识别的凭据（如 DASHSCOPE_API_KEY、OPENROUTER_API_KEY、GEMINI_API_KEY、OPENAI_API_KEY、GROQ_API_KEY、SILICONFLOW_API_KEY 或 DOUBAO_ASR_API_KEY；二阶段可选搭配 DEEPSEEK_API_KEY / ARK_API_KEY 或本机 codex 登录），没有就问我用哪家，写入 `~/.config/agent-voice-input/agent-voice-input.env`；
-4. 运行 `agent-voice-input doctor --ping`（v0.8.0 下运行 `agent-voice-input doctor`）确认各项检查通过后，执行 `agent-voice-input start` 启动后台守护进程。
+4. 运行 `agent-voice-input doctor --ping` 确认各项检查通过后，执行 `agent-voice-input start` 启动后台守护进程。
 ```
 
 ### 方式二：手动三步安装
@@ -59,31 +59,26 @@
 - **ffmpeg**：Ubuntu / WSL2 执行 `sudo apt install ffmpeg`；macOS 执行 `brew install ffmpeg`
 - **Xcode Command Line Tools**（macOS 推荐）：执行 `xcode-select --install` 提供 `/usr/bin/swiftc`，首次启动会自动编译缓存原生热键与胶囊辅助程序（未安装时仍可用命令行 `toggle` / `once` 模式）。
 
-**2. 安装 CLI**
-
-**路线 A — 当前 PyPI 稳定版（`v0.8.0`）**：
+**2. 安装 CLI（`v0.9.0`）**
 
 ```bash
 uv tool install agent-voice-input
-mkdir -p -m 700 ~/.config/agent-voice-input
-# 创建权限 600 的 ~/.config/agent-voice-input/agent-voice-input.env 填入至少一把一阶段语音凭据，然后：
-agent-voice-input doctor
-agent-voice-input start
+# 或使用 pipx：pipx install agent-voice-input
+# （如需直接跟踪 main 分支：uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git）
 ```
 
-**路线 B — 最新 `main` 分支（含待发版的 `init`、`doctor --ping`、`deepseek` 与 `[remote]`）**：
+**3. 初始化配置、填入凭据并启动**
 
 ```bash
-uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git
 agent-voice-input init
-# 编辑 ~/.config/agent-voice-input/agent-voice-input.env 取消注释填入至少一把一阶段语音凭据，然后：
+# 编辑权限 600 的 ~/.config/agent-voice-input/agent-voice-input.env 取消注释填入至少一把一阶段语音凭据，然后：
 agent-voice-input doctor --ping
 agent-voice-input start
 ```
 
-**凭据搭配说明**：在 `~/.config/agent-voice-input/agent-voice-input.env` 中配置至少一把支持一阶段语音识别的凭据（如阿里百炼 `DASHSCOPE_API_KEY`、`OPENROUTER_API_KEY`、`GEMINI_API_KEY`、`OPENAI_API_KEY`、`GROQ_API_KEY`、`SILICONFLOW_API_KEY` 或豆包 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；二阶段可额外搭配 `DEEPSEEK_API_KEY`、`ARK_API_KEY` 或直接复用本机 `codex login`；无 `uv` 时可将 `uv tool` 替换为 `pipx`）。默认单击右 Ctrl 开始/完成录音（`main` 分支 `tap_toggle` 模式下，识别/精修期间单独长按右 Ctrl `1.2s–8s` 松开可取消）。
+**凭据搭配说明**：在 `~/.config/agent-voice-input/agent-voice-input.env` 中配置至少一把支持一阶段语音识别的凭据（如阿里百炼 `DASHSCOPE_API_KEY`、`OPENROUTER_API_KEY`、`GEMINI_API_KEY`、`OPENAI_API_KEY`、`GROQ_API_KEY`、`SILICONFLOW_API_KEY` 或豆包 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；二阶段可额外搭配 `DEEPSEEK_API_KEY`、`ARK_API_KEY` 或直接复用本机 `codex login`；无 `uv` 时可将 `uv tool` 替换为 `pipx`）。默认单击右 Ctrl 开始/完成录音（`tap_toggle` 模式下，识别/精修期间单独长按右 Ctrl `1.2s–8s` 松开可取消）。
 
-> 如需调整快捷键（如改为按住说话 `trigger_mode = "ptt"`）、胶囊位置（`bottom` / `top`）、录音时长上限或切换渠道，将 [`config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)（运行 PyPI `v0.8.0` 时请参照对应标签的 [`v0.8.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.8.0/config.example.toml)）复制到 `~/.config/agent-voice-input/config.toml` 按需修改即可（完整凭据变量见 [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)）。
+> `agent-voice-input init` 已自动生成初始 `config.toml`；如需调整快捷键（如改为按住说话 `trigger_mode = "ptt"`）、胶囊位置（`bottom` / `top`）、`[remote]` 远端主机、录音时长上限或切换渠道，可参照 [`v0.9.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.9.0/config.example.toml)（或 [`main/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)）与 [`v0.9.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.9.0/config.example.env) 按需修改。
 
 ---
 
