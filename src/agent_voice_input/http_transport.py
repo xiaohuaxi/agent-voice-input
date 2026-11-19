@@ -781,14 +781,28 @@ class _SplitTimeoutConnMixin:
         self._phase_deadline: float | None = None
         self._abort_lock = threading.Lock()
         self._aborted = False
+        self._borrow_gen = 0
         self._cur_sock: socket.socket | None = None
         self._in_getresponse = False
         self._handed_off_to_resp = False
         self._bound_token = cancel_token
-        self._bound_hook_id = cancel_token.register_abort(self.abort_inflight) if cancel_token is not None else 0
+        self._bound_hook_id = (
+            cancel_token.register_abort(self.make_abort_fn())
+            if cancel_token is not None
+            else 0
+        )
         self.response_class = _make_deadline_response_class(  # type: ignore[misc]
             self._current_read_deadline, self._on_response_fp_closing
         )
+
+    def make_abort_fn(self) -> Callable[[], None]:
+        with self._abort_lock:
+            expected_gen = self._borrow_gen
+
+        def _abort_for_gen() -> None:
+            self.abort_inflight(expected_gen=expected_gen)
+
+        return _abort_for_gen
 
     def _release_bound_hook(self) -> None:
         tok, hid = self._bound_token, self._bound_hook_id
@@ -807,8 +821,10 @@ class _SplitTimeoutConnMixin:
         if release_hook:
             self._release_bound_hook()
 
-    def abort_inflight(self) -> None:
+    def abort_inflight(self, *, expected_gen: int | None = None) -> None:
         with self._abort_lock:
+            if expected_gen is not None and expected_gen != self._borrow_gen:
+                return
             self._aborted = True
             sock = self._cur_sock
             if sock is not None:
@@ -1118,11 +1134,23 @@ class _KeepAlivePool:
                     _close_quietly(reused_conn)
                 else:
                     abort_lock = getattr(reused_conn, "_abort_lock", None)
+                    aborted_race = False
                     if abort_lock is not None:
                         with abort_lock:
-                            setattr(reused_conn, "_cur_sock", sock)
-                    sock.settimeout(timeout_sec)
-                    return reused_conn, True
+                            if getattr(reused_conn, "_aborted", False):
+                                aborted_race = True
+                            else:
+                                setattr(
+                                    reused_conn,
+                                    "_borrow_gen",
+                                    int(getattr(reused_conn, "_borrow_gen", 0)) + 1,
+                                )
+                                setattr(reused_conn, "_cur_sock", sock)
+                    if aborted_race:
+                        _close_quietly(reused_conn)
+                    else:
+                        sock.settimeout(timeout_sec)
+                        return reused_conn, True
             except Exception:
                 _close_quietly(reused_conn)
         return (
@@ -1144,7 +1172,24 @@ class _KeepAlivePool:
             setattr(conn, "_io_deadline", None)
         if hasattr(conn, "_phase_deadline"):
             setattr(conn, "_phase_deadline", None)
-        if getattr(conn, "sock", None) is None or self.max_per_origin <= 0:
+        if callable(rel_fn := getattr(conn, "_release_bound_hook", None)):
+            rel_fn()
+        abort_lock = getattr(conn, "_abort_lock", None)
+        if abort_lock is not None:
+            with abort_lock:
+                if getattr(conn, "_aborted", False):
+                    abort_aborted = True
+                else:
+                    abort_aborted = False
+                    setattr(conn, "_borrow_gen", int(getattr(conn, "_borrow_gen", 0)) + 1)
+            if abort_aborted:
+                _close_quietly(conn)
+                return
+        if (
+            getattr(conn, "sock", None) is None
+            or getattr(conn, "_aborted", False)
+            or self.max_per_origin <= 0
+        ):
             _close_quietly(conn)
             return
         now = time.monotonic()
@@ -1154,15 +1199,25 @@ class _KeepAlivePool:
             bucket = self._idle.get(key, [])
             kept: list[tuple[http.client.HTTPConnection, float]] = []
             for c, ts in bucket:
-                if (now - ts) > self.idle_timeout_sec or getattr(c, "sock", None) is None:
+                if (
+                    (now - ts) > self.idle_timeout_sec
+                    or getattr(c, "sock", None) is None
+                    or getattr(c, "_aborted", False)
+                ):
                     to_close.append(c)
                 else:
                     kept.append((c, ts))
             while len(kept) >= self.max_per_origin:
                 old_c, _ = kept.pop(0)
                 to_close.append(old_c)
-            kept.append((conn, now))
-            self._idle[key] = kept
+            if getattr(conn, "_aborted", False) or getattr(conn, "sock", None) is None:
+                to_close.append(conn)
+            else:
+                kept.append((conn, now))
+            if kept:
+                self._idle[key] = kept
+            else:
+                self._idle.pop(key, None)
         for c in to_close:
             _close_quietly(c)
 
@@ -1225,8 +1280,11 @@ def _combine_cancel_check(
 
 
 def _register_conn_abort(cancel_token: CancelToken | None, conn: Any) -> int:
-    abort_fn = getattr(conn, "abort_inflight", None)
-    return cancel_token.register_abort(abort_fn) if (cancel_token is not None and callable(abort_fn)) else 0
+    if cancel_token is None:
+        return 0
+    make_fn = getattr(conn, "make_abort_fn", None)
+    abort_fn = make_fn() if callable(make_fn) else getattr(conn, "abort_inflight", None)
+    return cancel_token.register_abort(abort_fn) if callable(abort_fn) else 0
 
 
 def _unregister_conn_abort(cancel_token: CancelToken | None, hook_id: int) -> None:

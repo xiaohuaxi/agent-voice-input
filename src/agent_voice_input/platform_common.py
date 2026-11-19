@@ -508,8 +508,85 @@ def stream_key_test_proc(cmd: list[str], *, env: Mapping[str, str] | None = None
             proc.terminate()
 
 
-def _reap_shim_proc(proc: subprocess.Popen[str] | None) -> None:
+class _StdinGate:
+    """Mutex for shim stdin writes with indivisible deferred-close handoff on release."""
+
+    def __init__(self) -> None:
+        self._io_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._writers = 0
+        self._deferred: list[Any] = []
+
+    def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
+        ok = (
+            self._io_lock.acquire(blocking=blocking)
+            if timeout < 0
+            else self._io_lock.acquire(blocking=blocking, timeout=timeout)
+        )
+        if ok:
+            with self._state_lock:
+                self._writers += 1
+        return ok
+
+    def release(self) -> None:
+        while True:
+            with self._state_lock:
+                if not self._deferred:
+                    self._writers -= 1
+                    self._io_lock.release()
+                    return
+                items = list(self._deferred)
+                self._deferred.clear()
+            for pipe in items:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
+    def __enter__(self) -> _StdinGate:
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.release()
+
+    def close_or_defer(self, pipe: Any, *, timeout: float = 0.2) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            rem = deadline - time.monotonic()
+            got = (
+                self.acquire(timeout=rem)
+                if rem > 0.0
+                else self.acquire(blocking=False)
+            )
+            if got:
+                try:
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
+                finally:
+                    self.release()
+                return True
+            with self._state_lock:
+                if pipe is None and not self._deferred:
+                    return True
+                if self._writers > 0:
+                    if pipe is not None:
+                        self._deferred.append(pipe)
+                    return False
+            time.sleep(0)
+
+
+def _reap_shim_proc(
+    proc: subprocess.Popen[str] | None,
+    *,
+    stdin_lock: _StdinGate | threading.Lock | None = None,
+) -> None:
     if proc is None:
+        if isinstance(stdin_lock, _StdinGate):
+            stdin_lock.close_or_defer(None, timeout=0.2)
         return
     try:
         if proc.poll() is None:
@@ -517,10 +594,38 @@ def _reap_shim_proc(proc: subprocess.Popen[str] | None) -> None:
         proc.wait(timeout=1.0)
     except Exception:
         pass
-    for pipe in (proc.stdin, proc.stdout):
-        if pipe is not None:
-            try: pipe.close()
-            except Exception: pass
+    if proc.stdin is not None:
+        if stdin_lock is None:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+        elif isinstance(stdin_lock, _StdinGate):
+            if not stdin_lock.close_or_defer(proc.stdin, timeout=0.2):
+                setattr(proc, "_deferred_close_stdin", True)
+        elif stdin_lock.acquire(timeout=0.2):
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            finally:
+                stdin_lock.release()
+        else:
+            setattr(proc, "_deferred_close_stdin", True)
+    reader_th = getattr(proc, "_shim_reader_th", None)
+    if isinstance(reader_th, threading.Thread):
+        if reader_th.is_alive() and reader_th is not threading.current_thread():
+            reader_th.join(timeout=0.5)
+        if not reader_th.is_alive() and proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+    elif proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
 
 
 class JsonlShimMixin:
@@ -548,7 +653,7 @@ class JsonlShimMixin:
         self._shim_fail_count: int = 0
         self._shim_retry_after: float = 0.0
         self._respawn_scheduled: bool = False
-        self._stdin_lock = threading.Lock()
+        self._stdin_lock = _StdinGate()
         self._rpc_seq, self._pending, self._ready = 100, {}, threading.Event()
         self._event_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._event_worker: threading.Thread | None = None
@@ -698,7 +803,9 @@ class JsonlShimMixin:
                         else:
                             self._shim = proc
                             self._spawned_shim = proc
-                            threading.Thread(target=self._shim_reader, args=(proc, proc_ready), daemon=True).start()
+                            reader_th = threading.Thread(target=self._shim_reader, args=(proc, proc_ready), daemon=True)
+                            setattr(proc, "_shim_reader_th", reader_th)
+                            reader_th.start()
                             spawn_started = True
                 finally:
                     if not spawn_started:
@@ -706,7 +813,7 @@ class JsonlShimMixin:
                         self._shim_cond.notify_all()
         finally:
             if dead is not None:
-                _reap_shim_proc(dead)
+                self._reap_owned_shim(dead)
         if not spawn_started:
             return False
         assert proc is not None and proc_ready is not None
@@ -753,12 +860,15 @@ class JsonlShimMixin:
                     self.last_shim_error = f"{self._shim_label} failed to become ready"
                 if self._shim_graceful and not self._shim_ever_ready:
                     self._disable_shim_once(self.last_shim_error)
-        _reap_shim_proc(reap_failed)
+        self._reap_owned_shim(reap_failed)
         if closed_err:
             raise RuntimeError(f"{type(self).__name__} is closed")
         if not ignore_cooldown:
             self._schedule_respawn_if_needed()
         return False
+
+    def _reap_owned_shim(self, proc: subprocess.Popen[str] | None) -> None:
+        _reap_shim_proc(proc, stdin_lock=self._stdin_lock)
 
     def _respawn_shim_bg(self) -> None:
         succeeded = False
@@ -864,7 +974,13 @@ class JsonlShimMixin:
                         self._ready.set()
                     if proc_ready is not None:
                         proc_ready.set()
+        except (OSError, ValueError, RuntimeError):
+            pass
         finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
             if proc_ready is not None:
                 proc_ready.set()
             need_respawn = False
@@ -892,7 +1008,7 @@ class JsonlShimMixin:
                     ):
                         self._respawn_scheduled = True
                         need_respawn = True
-            _reap_shim_proc(proc)
+            self._reap_owned_shim(proc)
             for q in stale_queues:
                 try: q.put_nowait({"error": "shim_eof"})
                 except queue.Full: pass
@@ -934,10 +1050,18 @@ class JsonlShimMixin:
                 with self._stdin_lock:
                     if before_write is not None:
                         before_write()
-                    if sent_proc.poll() is not None or sent_proc.stdin is None or sent_proc.stdin.closed:
+                    if (
+                        sent_proc.poll() is not None
+                        or getattr(sent_proc, "_deferred_close_stdin", False)
+                        or sent_proc.stdin is None
+                        or sent_proc.stdin.closed
+                    ):
                         raise BrokenPipeError("shim_not_running")
-                    sent_proc.stdin.write(line)
-                    sent_proc.stdin.flush()
+                    try:
+                        sent_proc.stdin.write(line)
+                        sent_proc.stdin.flush()
+                    except ValueError as exc:
+                        raise BrokenPipeError("shim_stdin_closed") from exc
                 res = q.get(timeout=timeout_sec)
                 if res.get("error") == "shim_eof" and (attempt + 1) < max_attempts and not self._closed and not self._shim_disabled:
                     continue
@@ -948,7 +1072,7 @@ class JsonlShimMixin:
                 return res
             except (BrokenPipeError, OSError, queue.Empty):
                 if broken is not None:
-                    _reap_shim_proc(broken)
+                    self._reap_owned_shim(broken)
                 if (attempt + 1) < max_attempts and not self._closed and not self._shim_disabled:
                     continue
                 if self._shim_graceful:
@@ -1045,7 +1169,12 @@ class JsonlShimMixin:
         line = json.dumps({"cmd": "hud_level", "level": clamped}) + "\n"
         try:
             with self._stdin_lock:
-                if proc.poll() is None and proc.stdin is not None and not proc.stdin.closed:
+                if (
+                    proc.poll() is None
+                    and not getattr(proc, "_deferred_close_stdin", False)
+                    and proc.stdin is not None
+                    and not proc.stdin.closed
+                ):
                     proc.stdin.write(line)
                     proc.stdin.flush()
         except Exception:
@@ -1137,7 +1266,7 @@ class JsonlShimMixin:
                     proc.wait(timeout=2.0)
                 except Exception:
                     pass
-        _reap_shim_proc(proc)
+        self._reap_owned_shim(proc)
 
 
 def make_once_commit_guard(

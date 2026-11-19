@@ -1581,39 +1581,35 @@ def write_session_registry_entry(
     if eff_pid > 0:
         payload["agent_pid"] = eff_pid
         payload["pid"] = eff_pid
-    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(str(tmp), open_flags, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        os.write(fd, (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-    except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    else:
-        os.close(fd)
-
     lfd = _acquire_registry_flock(sessions_dir, exclusive=False, blocking=True)
     if lfd is None:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
         raise OSError(f"cannot acquire session registry lock in {sessions_dir}")
     try:
-        os.replace(str(tmp), str(target))
-    except Exception:
+        open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(tmp), open_flags, 0o600)
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            os.fchmod(fd, 0o600)
+            os.write(fd, (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        else:
+            os.close(fd)
+        try:
+            os.replace(str(tmp), str(target))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     finally:
         _release_registry_flock(lfd)
 
