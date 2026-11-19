@@ -1167,7 +1167,7 @@ sys.exit(p.returncode)
                 env=env,
                 runtime_dir=lrt,
                 clock_fn=lambda: fake_clock[0],
-                hard_timeout_sec=0.6,
+                hard_timeout_sec=1.5,
                 enable_multiplexing=False,
             )
             tracker = SessionTracker(
@@ -1193,8 +1193,10 @@ sys.exit(p.returncode)
                 # 1. Start recording -> triggers async prefetch (120ms); spinner changes before stop -> 0ms prefetch hit!
                 r_start = daemon.handle_trigger("ptt_start", fg_win)
                 self.assertTrue(r_start["ok"])
-                pf_deadline = time.monotonic() + 2.0
-                while time.monotonic() < pf_deadline and "devbox" not in rem_mgr.breaker_snapshot():
+                pf_deadline = time.monotonic() + 2.5
+                while time.monotonic() < pf_deadline and (
+                    "devbox" not in rem_mgr.breaker_snapshot() or bool(rem_mgr._inflight)
+                ):
                     time.sleep(0.02)
                 self.assertIn("devbox", rem_mgr.breaker_snapshot(), "start_recording must trigger async prefetch!")
                 fake_clock[0] += 2.0
@@ -1234,8 +1236,12 @@ sys.exit(p.returncode)
                 self.assertIsNone(snap_timeout)  # Timed out cleanly at ~220ms without blocking!
                 self.assertLess(elapsed_cold_ms, 340.0)
 
-                # Wait ~250ms for the background prefetch worker (380ms total) to finish warming ETag cache
-                time.sleep(0.28)
+                # Wait for the background prefetch worker (380ms sleep + subprocess startup) to finish warming ETag cache
+                warm_deadline = time.monotonic() + 2.5
+                while time.monotonic() < warm_deadline and (
+                    bool(rem_mgr._inflight) or "devbox" not in rem_mgr._completed
+                ):
+                    time.sleep(0.02)
                 ctl_file.write_text(json.dumps({"sleep_sec": 0.01, "mode": "ok"}), encoding="utf-8")
                 snap_warmed = tracker.sync_session(
                     window_title=f"claude [#{other_sid[:8]}] [@devbox]"
@@ -1265,7 +1271,11 @@ sys.exit(p.returncode)
                         f"claude [#{rem_sid[:8]}] [@devbox]", seq_id=99
                     )
                 )
-                time.sleep(0.18)
+                ho_deadline = time.monotonic() + 2.5
+                while time.monotonic() < ho_deadline and (
+                    rem_mgr.breaker_snapshot()["devbox"]["tripped"] or bool(rem_mgr._inflight)
+                ):
+                    time.sleep(0.02)
                 self.assertFalse(rem_mgr.breaker_snapshot()["devbox"]["tripped"])
                 # Consume the half-open prefetched snapshot (0ms!)
                 snap_half_open = tracker.sync_session(window_title=f"claude [#{rem_sid[:8]}] [@devbox]")
