@@ -1319,6 +1319,7 @@ sys.exit(p.returncode)
                 calls_pre_doc = len(invocations_log.read_text(encoding="utf-8").splitlines())
                 doc_out_off = io.StringIO()
                 with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
                     mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                     mock.patch.object(cli_mod, "is_wsl", return_value=True),
                     mock.patch.object(
@@ -1350,6 +1351,7 @@ sys.exit(p.returncode)
 
                 doc_out_rem = io.StringIO()
                 with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
                     mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                     mock.patch.object(cli_mod, "is_wsl", return_value=True),
                     mock.patch.object(
