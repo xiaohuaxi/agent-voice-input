@@ -2277,9 +2277,8 @@ class DarwinTmuxGhosttyUnitTests(unittest.TestCase):
                     },
                     clear=False,
                 ),
-                mock.patch.object(
-                    cli_mod,
-                    "send_control_command",
+                mock.patch(
+                    "agent_voice_input.daemon.send_control_command",
                     side_effect=[{"ok": False}, {"ok": True, "pid": 4321}],
                 ),
                 mock.patch.object(
@@ -2373,9 +2372,8 @@ class DarwinTmuxGhosttyUnitTests(unittest.TestCase):
             cfg_toml = root / "d.toml"
             cfg_toml.write_text('[refiner]\nprovider = "off"\n', encoding="utf-8")
             with (
-                mock.patch.object(
-                    cli_mod,
-                    "load_config",
+                mock.patch(
+                    "agent_voice_input.config.load_config",
                     return_value=(
                         Config(),
                         {
@@ -2385,7 +2383,7 @@ class DarwinTmuxGhosttyUnitTests(unittest.TestCase):
                         },
                     ),
                 ),
-                mock.patch.object(cli_mod, "VoiceInputDaemon", _DummyVoiceDaemon),
+                mock.patch("agent_voice_input.daemon.VoiceInputDaemon", _DummyVoiceDaemon),
             ):
                 rc_fg = cli_mod.main(["daemon", "--config", str(cfg_toml)])
             self.assertEqual(rc_fg, 0)

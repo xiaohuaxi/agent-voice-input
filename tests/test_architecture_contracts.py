@@ -400,21 +400,18 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
                 "import io, sys",
                 "from unittest.mock import patch",
                 "import agent_voice_input.cli as cli",
-                "with patch.object(cli, 'run_session_hook', return_value=37) as m_hook:",
+                "assert not hasattr(cli, '_LAZY_CLI_CACHE')",
+                "assert not hasattr(cli, '_LAZY_CLI_ATTR_NAMES')",
+                "assert '__getattr__' not in cli.__dict__",
+                "with patch('agent_voice_input.session_title.run_session_hook', return_value=37) as m_hook:",
                 "    assert cli.main(['session-hook', '--cli', 'claude', '--quiet']) == 37",
                 "    m_hook.assert_called_once_with(cli_mode='claude', quiet_stdout=True)",
-                "assert callable(cli.run_session_hook)",
-                "with patch.object(cli, 'load_config') as m_cfg:",
-                "    assert cli.load_config is m_cfg",
-                "assert callable(cli.load_config)",
-                "with patch.object(cli, '_remote_probe') as m_rp:",
-                "    m_rp.run_probe.return_value = {'ok': True}",
+                "with patch('agent_voice_input._remote_probe.run_probe', return_value={'ok': True}) as m_rp:",
                 "    fake_in = io.TextIOWrapper(io.BytesIO(b'{}'))",
                 "    fake_out = io.TextIOWrapper(io.BytesIO())",
                 "    with patch.object(sys, 'stdin', fake_in), patch.object(sys, 'stdout', fake_out):",
                 "        assert cli.main(['remote-ctx', '--raw-json']) == 0",
-                "    m_rp.run_probe.assert_called_once()",
-                "assert hasattr(cli._remote_probe, 'run_probe')",
+                "    m_rp.assert_called_once()",
             ]
         )
         p_patch = subprocess.run(
@@ -428,11 +425,48 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
         self.assertEqual(p_patch.returncode, 0, p_patch.stderr or p_patch.stdout)
 
         for py_path in sorted(PKG_DIR.glob("*.py")):
+            src_txt = py_path.read_text(encoding="utf-8")
             self.assertNotIn(
                 "_callable_accepts_kwarg",
-                py_path.read_text(encoding="utf-8"),
+                src_txt,
                 f"{py_path.name} still references legacy _callable_accepts_kwarg shell",
             )
+            self.assertNotIn(
+                "_deliver_with_origin",
+                src_txt,
+                f"{py_path.name} still references legacy _deliver_with_origin reflection shim",
+            )
+
+
+def _collect_function_local_import_targets(trees: dict[str, ast.Module]) -> dict[str, set[str]]:
+    """Collect ``(target_module, symbol)`` imported at call time via function-local ``from .mod import sym``."""
+    out: dict[str, set[str]] = {m: set() for m in trees}
+
+    def _walk_stmt(node: ast.AST, *, in_fn: bool) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in node.body:
+                _walk_stmt(child, in_fn=True)
+            return
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                _walk_stmt(child, in_fn=False)
+            return
+        if in_fn and isinstance(node, ast.ImportFrom):
+            target_mod = ""
+            if node.level == 1 and node.module:
+                target_mod = node.module.split(".")[0]
+            elif node.level == 0 and node.module and node.module.startswith("agent_voice_input."):
+                target_mod = node.module.split(".", 1)[1].split(".")[0]
+            if target_mod in out:
+                for alias in node.names:
+                    out[target_mod].add(alias.name)
+        for child in ast.iter_child_nodes(node):
+            _walk_stmt(child, in_fn=in_fn)
+
+    for tree in trees.values():
+        for stmt in tree.body:
+            _walk_stmt(stmt, in_fn=False)
+    return out
 
 
 class TestMockPatchTargetGuards(unittest.TestCase):
@@ -444,6 +478,8 @@ class TestMockPatchTargetGuards(unittest.TestCase):
             )
             for p in sorted(PKG_DIR.glob("*.py"))
         }
+        for mod_stem, local_syms in _collect_function_local_import_targets(trees).items():
+            fn_loads[mod_stem][0].update(local_syms)
         loaded_mods = {
             m: importlib.import_module(f"agent_voice_input.{m}") for m in trees
         }

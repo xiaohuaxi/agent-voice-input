@@ -628,9 +628,9 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             }
             cfg = Config(refiner=RefinerConfig(provider="off"))
             out_buf = io.StringIO()
-            with mock.patch.object(cli_mod.sys, "platform", "darwin"), mock.patch.object(
-                cli_mod, "probe_macos_host", return_value=fake_probe
-            ), mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"), mock.patch(
+            with mock.patch.object(cli_mod.sys, "platform", "darwin"), mock.patch(
+                "agent_voice_input.platform_macos.probe_macos_host", return_value=fake_probe
+            ), mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"), mock.patch(
                 "sys.stdout", out_buf
             ):
                 rc = cli_mod._cmd_doctor(cfg, env)
@@ -645,8 +645,8 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             # Verify CLI key-test routes to run_macos_key_test on darwin (never PowerShell)
             cfg_toml = tmp / "k.toml"
             cfg_toml.write_text('[refiner]\nprovider = "off"\n', encoding="utf-8")
-            with mock.patch.object(cli_mod.sys, "platform", "darwin"), mock.patch.object(
-                cli_mod, "run_macos_key_test", return_value=0
+            with mock.patch.object(cli_mod.sys, "platform", "darwin"), mock.patch(
+                "agent_voice_input.platform_macos.run_macos_key_test", return_value=0
             ) as mock_mkt, mock.patch.dict(os.environ, {"HOME": str(tmp)}, clear=False):
                 rc_kt = cli_mod.main(["key-test", "--config", str(cfg_toml), "--seconds", "3"])
             self.assertEqual(rc_kt, 0)
@@ -990,15 +990,14 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 "fg_title": "zsh",
                 "permissions_hint": "Microphone=ok",
             }
-            orig_st_init = cli_mod.SessionTracker
+            orig_st_init = SessionTracker
             buf = io.StringIO()
-            with mock.patch.object(cli_mod.sys, "platform", "darwin"), mock.patch.object(
-                cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"
-            ), mock.patch.object(
-                cli_mod, "probe_macos_host", return_value=fake_probe
-            ), mock.patch.object(
-                cli_mod,
-                "SessionTracker",
+            with mock.patch.object(cli_mod.sys, "platform", "darwin"), mock.patch(
+                "agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"
+            ), mock.patch(
+                "agent_voice_input.platform_macos.probe_macos_host", return_value=fake_probe
+            ), mock.patch(
+                "agent_voice_input.session_ctx.SessionTracker",
                 side_effect=lambda **kw: orig_st_init(home_dir=home, proc_root=tmp / "noproc", **kw),
             ), mock.patch(
                 "subprocess.run", side_effect=fake_subproc
@@ -1908,8 +1907,8 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             doc_buf = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "darwin"),
-                mock.patch.object(cli_mod, "probe_macos_host", return_value=fake_probe_noclts),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=fake_probe_noclts),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
                 mock.patch("sys.stdout", doc_buf),
             ):
                 cli_mod._cmd_doctor(Config(refiner=RefinerConfig(provider="off")), {"HOME": str(tmp), "DASHSCOPE_API_KEY": "sk-doc"})
@@ -2199,11 +2198,12 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             out_running, err_running = io.StringIO(), io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "darwin"),
-                mock.patch.object(
-                    cli_mod, "send_control_command", return_value={"ok": True, "pid": 4321, "state": "idle", "shim_ok": True}
+                mock.patch(
+                    "agent_voice_input.daemon.send_control_command",
+                    return_value={"ok": True, "pid": 4321, "state": "idle", "shim_ok": True},
                 ),
-                mock.patch.object(cli_mod, "compile_mac_shim") as mock_comp_run,
-                mock.patch.object(cli_mod, "run_mac_shim_self_check") as mock_sc_run,
+                mock.patch("agent_voice_input.platform_macos.compile_mac_shim") as mock_comp_run,
+                mock.patch("agent_voice_input.platform_macos.run_mac_shim_self_check") as mock_sc_run,
                 mock.patch("sys.stdout", out_running),
                 mock.patch("sys.stderr", err_running),
             ):
@@ -2236,9 +2236,9 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             out_fresh, err_fresh = io.StringIO(), io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "darwin"),
-                mock.patch.object(cli_mod, "send_control_command", side_effect=_ctrl_down_then_up),
-                mock.patch.object(cli_mod, "compile_mac_shim", return_value=(fake_shim_bin, "")),
-                mock.patch.object(cli_mod, "run_mac_shim_self_check", return_value=(True, sc_payload, "")) as mock_sc_fresh,
+                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=_ctrl_down_then_up),
+                mock.patch("agent_voice_input.platform_macos.compile_mac_shim", return_value=(fake_shim_bin, "")),
+                mock.patch("agent_voice_input.platform_macos.run_mac_shim_self_check", return_value=(True, sc_payload, "")) as mock_sc_fresh,
                 mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
                 mock.patch("sys.stdout", out_fresh),
                 mock.patch("sys.stderr", err_fresh),
@@ -2276,8 +2276,8 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             doc_ssh_buf = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "darwin"),
-                mock.patch.object(cli_mod, "probe_macos_host", return_value=fake_probe_ssh),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=fake_probe_ssh),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
                 mock.patch("sys.stdout", doc_ssh_buf),
             ):
                 rc_doc_ssh = cli_mod._cmd_doctor(
@@ -2326,7 +2326,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     once_st["mic_auth"] = "not_determined"
                     once_st["has_graphic_session"] = False
                 once_ff_spawns.clear()
-                with mock.patch.object(cli_mod, "create_platform", side_effect=lambda *_a, **_kw: _make_once_plat()):
+                with mock.patch("agent_voice_input.daemon.create_platform", side_effect=lambda *_a, **_kw: _make_once_plat()):
                     with self.assertRaises(MicrophoneUnavailableError) as once_err_ctx:
                         cli_mod._run_wav_or_live(
                             wav_file=None,
@@ -2539,7 +2539,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     "sys.exit(1)\n"
                 )
                 rescued_texts: list[str] = []
-                plat_lost_perm.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None: (  # type: ignore[method-assign]
+                plat_lost_perm.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None, **_kw: (  # type: ignore[method-assign]
                     rescued_texts.append(txt) or PasteOutcome(True, True, "ok", "Ghostty")
                 )
                 daemon_lost_perm.asr_provider = _StubAsr("保留已有语音不丢字")
@@ -3343,9 +3343,9 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             doc_out = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "darwin"),
-                mock.patch.object(cli_mod, "probe_macos_host", return_value=fake_term_probe),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
-                mock.patch.object(cli_mod.SessionTracker, "resolve_session", return_value=None),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=fake_term_probe),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch.object(SessionTracker, "resolve_session", return_value=None),
                 mock.patch("sys.stdout", doc_out),
             ):
                 rc_doc = cli_mod._cmd_doctor(

@@ -12,180 +12,6 @@ if TYPE_CHECKING:
     from .config import Config, ProviderCredentials
     from .http_transport import HttpTransport
 
-_LAZY_CLI_CACHE: dict[str, Any] = {}
-
-_LAZY_CLI_ATTR_NAMES: frozenset[str] = frozenset(
-    {
-        "CODEX_SUBSCRIPTION_BASE_URL",
-        "CodexRefiner",
-        "Config",
-        "ConfigError",
-        "DASHSCOPE_COMPAT_BASE_URL",
-        "DaemonAlreadyRunningError",
-        "ForegroundWindow",
-        "GEMINI_DEFAULT_BASE_URL",
-        "HttpRequest",
-        "HttpTransport",
-        "OPENAI_DEFAULT_BASE_URL",
-        "OPENROUTER_DEFAULT_BASE_URL",
-        "ProviderCredentials",
-        "RemoteSshManager",
-        "SessionTracker",
-        "VoiceInputDaemon",
-        "_build_responses_url",
-        "_close_quietly",
-        "_host_matches_domain",
-        "_is_loopback_url",
-        "_missing_key_hint",
-        "_remote_probe",
-        "_validate_request_url",
-        "append_telemetry_record",
-        "build_pipeline_summary",
-        "classify_macos_mic_permission",
-        "compile_mac_shim",
-        "create_platform",
-        "default_config_file_candidates",
-        "default_env_file_candidates",
-        "ensure_secure_dir",
-        "expand_user_path",
-        "find_codex_bin",
-        "get_failed_audio_dir",
-        "get_runtime_dir",
-        "inspect_codex_auth_status",
-        "is_dashscope_omni_chat_model",
-        "is_gemini_native_url",
-        "is_wsl",
-        "list_failed_audios",
-        "load_config",
-        "load_env_files",
-        "probe_macos_host",
-        "probe_wsl_host",
-        "read_telemetry_history",
-        "redact_secrets",
-        "resolve_asr_api",
-        "resolve_codex_default_model",
-        "resolve_codex_home_dir",
-        "resolve_credentials",
-        "resolve_failed_audio",
-        "resolve_ffmpeg_bin",
-        "resolve_ssh_executable",
-        "resolve_target_config_paths",
-        "run_key_test",
-        "run_mac_shim_self_check",
-        "run_macos_key_test",
-        "run_pipeline_once",
-        "run_session_hook",
-        "select_asr_provider",
-        "select_refiner_provider",
-        "send_control_command",
-        "urllib_http_transport",
-    }
-)
-
-
-def _ensure_cli_deps() -> None:
-    """Populate CLI runtime dependencies on demand so ``session-hook`` stays sub-35ms."""
-    if not _LAZY_CLI_CACHE:
-        from . import _remote_probe
-        from .audio_proc import (
-            get_failed_audio_dir,
-            list_failed_audios,
-            resolve_failed_audio,
-            resolve_ffmpeg_bin,
-        )
-        from .config import (
-            CODEX_SUBSCRIPTION_BASE_URL,
-            DASHSCOPE_COMPAT_BASE_URL,
-            GEMINI_DEFAULT_BASE_URL,
-            OPENAI_DEFAULT_BASE_URL,
-            OPENROUTER_DEFAULT_BASE_URL,
-            Config,
-            ConfigError,
-            ProviderCredentials,
-            _host_matches_domain,
-            default_config_file_candidates,
-            default_env_file_candidates,
-            ensure_secure_dir,
-            expand_user_path,
-            get_runtime_dir,
-            is_dashscope_omni_chat_model,
-            is_gemini_native_url,
-            load_config,
-            load_env_files,
-            redact_secrets,
-            resolve_asr_api,
-            resolve_codex_home_dir,
-            resolve_credentials,
-            resolve_target_config_paths,
-            select_asr_provider,
-            select_refiner_provider,
-        )
-        from .daemon import (
-            DaemonAlreadyRunningError,
-            VoiceInputDaemon,
-            append_telemetry_record,
-            build_pipeline_summary,
-            create_platform,
-            read_telemetry_history,
-            run_pipeline_once,
-            send_control_command,
-        )
-        from .http_transport import (
-            HttpRequest,
-            HttpTransport,
-            _close_quietly,
-            _is_loopback_url,
-            _validate_request_url,
-            urllib_http_transport,
-        )
-        from .llm_common import _missing_key_hint
-        from .platform_common import ForegroundWindow
-        from .platform_macos import (
-            classify_macos_mic_permission,
-            compile_mac_shim,
-            probe_macos_host,
-            run_mac_shim_self_check,
-            run_macos_key_test,
-        )
-        from .platform_wsl import is_wsl, probe_wsl_host, run_key_test
-        from .refiner import (
-            CodexRefiner,
-            _build_responses_url,
-            find_codex_bin,
-            inspect_codex_auth_status,
-            resolve_codex_default_model,
-        )
-        from .remote_ssh import RemoteSshManager, resolve_ssh_executable
-        from .session_ctx import SessionTracker
-        from .session_title import run_session_hook
-
-        for _k, _v in list(locals().items()):
-            _LAZY_CLI_CACHE[_k] = _v
-    g = globals()
-    for _k, _v in _LAZY_CLI_CACHE.items():
-        g.setdefault(_k, _v)
-
-
-def __getattr__(name: str) -> Any:
-    if name in _LAZY_CLI_ATTR_NAMES:
-        if name == "run_session_hook" and not _LAZY_CLI_CACHE:
-            from .session_title import run_session_hook as _rsh
-
-            globals()["run_session_hook"] = _rsh
-            return _rsh
-        if name == "_remote_probe" and not _LAZY_CLI_CACHE:
-            from . import _remote_probe as _rp
-
-            globals()["_remote_probe"] = _rp
-            return _rp
-        _ensure_cli_deps()
-        return globals()[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__() -> list[str]:
-    return sorted(set(globals().keys()) | _LAZY_CLI_ATTR_NAMES)
-
 _INIT_CONFIG_TOML = """\
 # agent-voice-input configuration (chmod 600)
 # Priority: CLI flags > config.toml > built-in defaults
@@ -341,7 +167,8 @@ def _cred_label(item: Any) -> str:
 
 
 def _check_codex_model(model: str, env: dict[str, str]) -> str:
-    _ensure_cli_deps()
+    from .config import resolve_codex_home_dir
+
     codex_home = resolve_codex_home_dir(env)
     if codex_home is None:
         return "models_cache.json not found"
@@ -361,7 +188,8 @@ def _is_macos_modifier_hotkey(raw_key: str) -> bool:
 
 
 def _write_init_file_0600(cfg_dir: Path, target: Path, content: str, *, force: bool) -> str:
-    _ensure_cli_deps()
+    from .config import ConfigError
+
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
         st = os.lstat(target)
@@ -429,7 +257,8 @@ def _write_init_file_0600(cfg_dir: Path, target: Path, content: str, *, force: b
 
 
 def _lstat_or_none(path: Path) -> os.stat_result | None:
-    _ensure_cli_deps()
+    from .config import ConfigError
+
     try:
         return os.lstat(path)
     except FileNotFoundError:
@@ -439,7 +268,8 @@ def _lstat_or_none(path: Path) -> os.stat_result | None:
 
 
 def _ensure_init_parent_dir(cfg_dir: Path, *, preserve_existing_mode: bool) -> None:
-    _ensure_cli_deps()
+    from .config import ConfigError, ensure_secure_dir
+
     dir_st = _lstat_or_none(cfg_dir)
     if dir_st is not None and preserve_existing_mode:
         if stat.S_ISLNK(dir_st.st_mode) or not stat.S_ISDIR(dir_st.st_mode):
@@ -455,7 +285,12 @@ def _cmd_init(
     env: Mapping[str, str] | None = None,
     home_dir: str | Path | None = None,
 ) -> int:
-    _ensure_cli_deps()
+    from .config import (
+        ConfigError,
+        default_config_file_candidates,
+        resolve_target_config_paths,
+    )
+
     src_env = os.environ if env is None else env
     cli_cfg_str = str(config_path).strip() if config_path is not None else ""
     has_explicit_cfg = bool(
@@ -522,7 +357,15 @@ def _build_ping_http_spec(
     base_url: str,
     key: str,
 ) -> tuple[str, dict[str, str]]:
-    _ensure_cli_deps()
+    from .config import (
+        DASHSCOPE_COMPAT_BASE_URL,
+        GEMINI_DEFAULT_BASE_URL,
+        OPENAI_DEFAULT_BASE_URL,
+        OPENROUTER_DEFAULT_BASE_URL,
+        _host_matches_domain,
+        is_gemini_native_url,
+    )
+
     prov = provider.strip().lower()
     b = base_url.strip().rstrip("/")
     for sfx in ("/chat/completions", "/audio/transcriptions", "/responses"):
@@ -567,7 +410,15 @@ def _probe_stage_ping(
     transport: HttpTransport | None,
     cache: dict[tuple[str, str, str], tuple[str, int, str]],
 ) -> tuple[str, int, str]:
-    _ensure_cli_deps()
+    from .config import CODEX_SUBSCRIPTION_BASE_URL, OPENAI_DEFAULT_BASE_URL, redact_secrets
+    from .http_transport import (
+        HttpRequest,
+        _close_quietly,
+        _validate_request_url,
+        urllib_http_transport,
+    )
+    from .refiner import CodexRefiner, _build_responses_url
+
     prov = provider.strip().lower()
     if prov == "doubao":
         return (
@@ -703,7 +554,8 @@ def _probe_stage_ping(
 
 
 def _inspect_hook_summary(env: Mapping[str, str], rt_dir: Path) -> str:
-    _ensure_cli_deps()
+    from .config import expand_user_path
+
     configured: list[str] = []
     for label, rel in (
         ("claude", "~/.claude/settings.json"),
@@ -771,6 +623,8 @@ class _DoctorState:
     ping_results: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     def clean(self, text: str) -> str:
+        from .config import redact_secrets
+
         return redact_secrets(text, self.env, cfg=self.cfg, extra_secrets=self.all_secrets)
 
     def emit(self, line: str) -> None:
@@ -786,6 +640,9 @@ class _DoctorState:
 
 
 def _doctor_check_env_and_ffmpeg(st: _DoctorState) -> None:
+    from .audio_proc import resolve_ffmpeg_bin
+    from .config import default_env_file_candidates
+
     st.emit(f"[python]    OK ({sys.version.split()[0]}, runtime={st.rt_dir})")
     st.emit(f"[config]    {st.cfg.config_path or 'defaults (no config.toml)'}")
     seen_env_inodes: set[tuple[int, int]] = set()
@@ -816,6 +673,8 @@ def _doctor_check_env_and_ffmpeg(st: _DoctorState) -> None:
 
 
 def _doctor_check_macos_host(st: _DoctorState) -> None:
+    from .platform_macos import probe_macos_host
+
     st.platform_kind = "darwin"
     m = probe_macos_host(st.cfg, st.env, announce_compile=(not st.as_json))
     st.fg_title = str(m.get("fg_title") or "")
@@ -903,6 +762,8 @@ def _doctor_check_macos_host(st: _DoctorState) -> None:
 
 
 def _doctor_check_wsl_host(st: _DoctorState) -> None:
+    from .platform_wsl import probe_wsl_host
+
     st.platform_kind = "wsl2"
     w = probe_wsl_host(st.cfg, st.env)
     st.fg_title = str(w.get("fg_title") or "")
@@ -930,6 +791,8 @@ def _doctor_check_wsl_host(st: _DoctorState) -> None:
 
 
 def _doctor_check_platform(st: _DoctorState) -> None:
+    from .platform_wsl import is_wsl
+
     if sys.platform == "darwin":
         _doctor_check_macos_host(st)
     elif is_wsl(st.env):
@@ -941,6 +804,9 @@ def _doctor_check_platform(st: _DoctorState) -> None:
 
 
 def _doctor_check_asr(st: _DoctorState) -> None:
+    from .config import resolve_asr_api, select_asr_provider
+    from .http_transport import _is_loopback_url
+
     cfg, creds = st.cfg, st.creds
     st.eff_asr = select_asr_provider(cfg, creds)
     st.eff_asr_model = cfg.asr.effective_model(st.eff_asr)
@@ -975,6 +841,9 @@ def _doctor_check_asr(st: _DoctorState) -> None:
 
 
 def _doctor_check_daemon_and_session(st: _DoctorState) -> None:
+    from .daemon import send_control_command
+    from .session_ctx import SessionTracker
+
     if (st.rt_dir / "control.sock").exists():
         try:
             dst = send_control_command(st.rt_dir, {"cmd": "status"}, timeout_sec=0.5)
@@ -1005,6 +874,8 @@ def _doctor_check_daemon_and_session(st: _DoctorState) -> None:
 
 
 def _doctor_check_remote_ssh(st: _DoctorState) -> None:
+    from .remote_ssh import resolve_ssh_executable
+
     cfg = st.cfg
     if not cfg.remote.hosts:
         st.emit('[remote]    off (optional: set [remote] hosts = ["<host>"] in config.toml for SSH Linux sessions)')
@@ -1034,6 +905,15 @@ def _doctor_check_remote_ssh(st: _DoctorState) -> None:
 
 
 def _doctor_check_refiner(st: _DoctorState) -> None:
+    from .config import is_dashscope_omni_chat_model, select_refiner_provider
+    from .http_transport import _is_loopback_url
+    from .llm_common import _missing_key_hint
+    from .refiner import (
+        find_codex_bin,
+        inspect_codex_auth_status,
+        resolve_codex_default_model,
+    )
+
     cfg, creds = st.cfg, st.creds
     raw_ref_prov = cfg.refiner.provider.strip().lower()
     if raw_ref_prov in ("none", "false", "0", "disabled"):
@@ -1117,6 +997,8 @@ def _doctor_run_pings(
     remote_ping: bool,
     transport: HttpTransport | None,
 ) -> None:
+    from .remote_ssh import RemoteSshManager
+
     if ping:
         ping_cache: dict[tuple[str, str, str], tuple[str, int, str]] = {}
         if st.asr_ready:
@@ -1247,7 +1129,8 @@ def _cmd_doctor(
     as_json: bool = False,
     transport: HttpTransport | None = None,
 ) -> int:
-    _ensure_cli_deps()
+    from .config import get_runtime_dir, resolve_credentials
+
     creds = resolve_credentials(cfg, env)
     st = _DoctorState(
         cfg=cfg,
@@ -1281,7 +1164,16 @@ def _run_wav_or_live(
     suppress_stdout_on_paste: bool = False,
     force_print: bool = False,
 ) -> int:
-    _ensure_cli_deps()
+    from .config import get_runtime_dir, redact_secrets, resolve_credentials
+    from .daemon import (
+        append_telemetry_record,
+        build_pipeline_summary,
+        create_platform,
+        run_pipeline_once,
+    )
+    from .platform_common import ForegroundWindow
+    from .platform_wsl import is_wsl
+
     rt_dir = get_runtime_dir(env, create=True)
     is_native_linux = sys.platform == "linux" and not is_wsl(env)
     plat = (
@@ -1387,7 +1279,9 @@ def _cmd_once(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> int
 
 
 def _cmd_retry(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> int:
-    _ensure_cli_deps()
+    from .audio_proc import get_failed_audio_dir, list_failed_audios, resolve_failed_audio
+    from .config import get_runtime_dir
+
     rt_dir = get_runtime_dir(env, create=False)
     if args.list_only:
         items = list_failed_audios(rt_dir)
@@ -1495,7 +1389,8 @@ def _read_redacted_log_tail(
     max_lines: int = 12,
 ) -> str:
     """Read newly appended regular-file log lines since ``start_offset`` with secret redaction."""
-    _ensure_cli_deps()
+    from .config import redact_secrets, resolve_credentials
+
     try:
         st = os.lstat(log_path)
         if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
@@ -1527,7 +1422,14 @@ def _warn_degraded_shim(st: Mapping[str, Any]) -> None:
 
 
 def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | None = None) -> int:
-    _ensure_cli_deps()
+    from .config import get_runtime_dir, redact_secrets
+    from .daemon import send_control_command
+    from .platform_macos import (
+        classify_macos_mic_permission,
+        compile_mac_shim,
+        run_mac_shim_self_check,
+    )
+
     rt_dir = get_runtime_dir(env, create=True)
     has_overrides = any(getattr(args, attr, None) for _, attr in _CLI_OVERRIDE_FLAGS)
     try:
@@ -1723,7 +1625,9 @@ def _probe_pid_liveness(pid: int) -> str:
 
 
 def _cmd_stop(env: dict[str, str]) -> int:
-    _ensure_cli_deps()
+    from .config import get_runtime_dir
+    from .daemon import send_control_command
+
     rt_dir = get_runtime_dir(env, create=False)
     pid_file = rt_dir / "daemon.pid"
     pid = _read_pid_file(pid_file)
@@ -1917,26 +1821,27 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.subcmd == "session-hook":
-        hook_fn = globals().get("run_session_hook")
-        if hook_fn is None:
-            from .session_title import run_session_hook as hook_fn
-        return hook_fn(cli_mode=args.cli, quiet_stdout=args.quiet)
+        from .session_title import run_session_hook
+
+        return run_session_hook(cli_mode=args.cli, quiet_stdout=args.quiet)
     if args.subcmd == "remote-ctx":
-        rp_mod = globals().get("_remote_probe")
-        if rp_mod is None:
-            from . import _remote_probe as rp_mod
+        from ._remote_probe import pack_probe_stdout, run_probe
+
         raw_in = sys.stdin.buffer.read(131072)
         req_obj = json.loads(raw_in.decode("utf-8")) if raw_in.strip() else {}
-        resp_obj = rp_mod.run_probe(req_obj if isinstance(req_obj, Mapping) else {})
+        resp_obj = run_probe(req_obj if isinstance(req_obj, Mapping) else {})
         if args.raw_json or (isinstance(req_obj, Mapping) and req_obj.get("raw_json")):
             sys.stdout.buffer.write(
                 json.dumps(resp_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
             )
         else:
-            sys.stdout.buffer.write(rp_mod.pack_probe_stdout(resp_obj))
+            sys.stdout.buffer.write(pack_probe_stdout(resp_obj))
         sys.stdout.buffer.flush()
         return 0
-    _ensure_cli_deps()
+
+    from .config import ConfigError, get_runtime_dir, load_config, load_env_files, redact_secrets
+    from .daemon import DaemonAlreadyRunningError
+
     if args.subcmd == "init":
         try:
             return _cmd_init(config_path=getattr(args, "config", None), force=bool(args.force))
@@ -1967,6 +1872,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cfg, env = load_config(config_path=getattr(args, "config", None), cli_overrides=ov)
         if args.subcmd == "daemon":
+            from .daemon import VoiceInputDaemon
+
             VoiceInputDaemon(cfg, env=_sanitize_daemon_tmux_env(env)).serve_forever()
             return 0
         if args.subcmd == "start":
@@ -1985,6 +1892,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcmd == "stop":
             return _cmd_stop(env)
         if args.subcmd in ("status", "toggle", "cancel"):
+            from .daemon import read_telemetry_history, send_control_command
+
             ctrl_timeout = 20.0 if args.subcmd == "toggle" else 8.0
             rt_dir_st = get_runtime_dir(env, create=False)
             raw_hist = getattr(args, "history", None) if args.subcmd == "status" else None
@@ -2032,7 +1941,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.subcmd == "key-test":
             if sys.platform == "darwin":
+                from .platform_macos import run_macos_key_test
+
                 return run_macos_key_test(cfg, seconds=args.seconds, env=env)
+            from .platform_wsl import run_key_test
+
             return run_key_test(cfg, seconds=args.seconds)
     except DaemonAlreadyRunningError as exc:
         pid_tag = f" (pid={exc.pid})" if exc.pid else ""

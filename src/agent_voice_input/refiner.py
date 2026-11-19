@@ -502,14 +502,6 @@ def build_refiner_request_blocks(
     )
 
 
-def build_refiner_envelope(context_delta: str, draft_text: str) -> str:
-    return (
-        f"<context_delta>\n{strip_lenticular_artifacts(context_delta).strip()}\n</context_delta>\n"
-        f"<asr_draft_to_clean>\n{draft_text.strip()}\n</asr_draft_to_clean>\n"
-        f"{REFINER_TASK_REMINDER}"
-    )
-
-
 def effective_refiner_timeout_sec(configured_sec: float, draft_chars: int) -> float:
     """Scale Stage 2 timeout for long transcripts (>600 chars) while preserving explicit short timeouts."""
     base = max(0.05, float(configured_sec))

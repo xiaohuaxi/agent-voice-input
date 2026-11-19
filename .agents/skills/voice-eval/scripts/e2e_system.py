@@ -582,7 +582,13 @@ class HeadlessTmuxPlatform:
         del kind
 
     def deliver_text(self, text: str, seq_id: int, target_hwnd: int = 0, **kwargs: Any) -> PasteOutcome:
-        del target_hwnd, kwargs
+        del target_hwnd
+        if callable(is_canc := kwargs.get("is_cancelled")) and is_canc():
+            return PasteOutcome(False, False, "cancelled", "tmux")
+        if callable(bcw := kwargs.get("before_clipboard_write")):
+            bcw()
+        if callable(bc := kwargs.get("before_commit")) and not bc():
+            return PasteOutcome(False, False, "cancelled", "tmux")
         buf_name = f"avi-e2e-{os.getpid()}-{seq_id}"
         lb = subprocess.run(
             [self._tmux_bin, "-L", self._sock_name, "load-buffer", "-b", buf_name, "-"],

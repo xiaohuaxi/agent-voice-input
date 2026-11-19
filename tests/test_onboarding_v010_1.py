@@ -566,8 +566,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             buf = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "darwin"),
-                mock.patch.object(cli_mod, "probe_macos_host", return_value=probe_no_shim),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=probe_no_shim),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf),
             ):
                 self.assertEqual(cli_mod._cmd_doctor(cfg_mac, merged_mac), 1)
@@ -592,8 +592,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             buf_den = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "darwin"),
-                mock.patch.object(cli_mod, "probe_macos_host", return_value=probe_mic_denied),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=probe_mic_denied),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_den),
             ):
                 self.assertEqual(cli_mod._cmd_doctor(cfg_f13, merged_mac), 1)
@@ -606,8 +606,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             buf_ax_ok = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "darwin"),
-                mock.patch.object(cli_mod, "probe_macos_host", return_value=probe_ax_warn_ok),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=probe_ax_warn_ok),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_ax_ok),
             ):
                 self.assertEqual(cli_mod._cmd_doctor(cfg_f13, merged_mac), 0, buf_ax_ok.getvalue())
@@ -616,13 +616,12 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             buf_wsl_ok = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
-                mock.patch.object(cli_mod, "is_wsl", return_value=True),
-                mock.patch.object(
-                    cli_mod,
-                    "probe_wsl_host",
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.probe_wsl_host",
                     return_value={"powershell_ok": True, "ps_version": "5.1", "wasapi_ok": True, "pulse_rdp_ok": False, "winmm_devs": 0},
                 ),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_wsl_ok),
             ):
                 self.assertEqual(cli_mod._cmd_doctor(cfg_mac, merged_mac), 0, buf_wsl_ok.getvalue())
@@ -631,13 +630,12 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             buf_wsl_fail = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
-                mock.patch.object(cli_mod, "is_wsl", return_value=True),
-                mock.patch.object(
-                    cli_mod,
-                    "probe_wsl_host",
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.probe_wsl_host",
                     return_value={"powershell_ok": True, "ps_version": "5.1", "wasapi_ok": False, "pulse_rdp_ok": False, "winmm_devs": 0},
                 ),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_wsl_fail),
             ):
                 self.assertEqual(cli_mod._cmd_doctor(cfg_mac, merged_mac), 1)
@@ -654,8 +652,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             buf_db = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_db),
             ):
                 self.assertEqual(cli_mod._cmd_doctor(Config(), env_doubao, ping=True), 0, buf_db.getvalue())
@@ -675,8 +673,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             buf_json_ok = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_json_ok),
             ):
                 rc_ping_ok = cli_mod._cmd_doctor(
@@ -714,8 +712,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             buf_401 = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_401),
             ):
                 self.assertEqual(cli_mod._cmd_doctor(Config(), env_or, ping=True, transport=_ping_401_tx), 1)
@@ -824,8 +822,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                     side_effect=AssertionError("offline doctor must not spawn codex auth RPC!"),
                 ),
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_doc_kr),
             ):
                 self.assertEqual(cli_mod._cmd_doctor(Config(), env_keyring, ping=False), 0, buf_doc_kr.getvalue())
@@ -840,8 +838,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             buf_doc_cli_kr = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_doc_cli_kr),
             ):
                 self.assertEqual(cli_mod._cmd_doctor(cfg_explicit_codex, env_keyring, ping=False), 0)
@@ -890,8 +888,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             buf_json_bool = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_json_bool),
             ):
                 rc_jb = cli_mod._cmd_doctor(Config(), env_bool_sec, ping=False, as_json=True)

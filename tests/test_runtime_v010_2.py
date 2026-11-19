@@ -364,7 +364,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             (rt_indet / "control.sock").write_text("live-legacy", encoding="utf-8")
             err_indet = io.StringIO()
             with (
-                mock.patch.object(cli_mod, "send_control_command", side_effect=TimeoutError("busy")),
+                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=TimeoutError("busy")),
                 redirect_stdout(io.StringIO()),
                 redirect_stderr(err_indet),
             ):
@@ -406,7 +406,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             try:
                 err_race = io.StringIO()
                 with (
-                    mock.patch.object(cli_mod, "send_control_command", side_effect=ConnectionRefusedError("starting")),
+                    mock.patch("agent_voice_input.daemon.send_control_command", side_effect=ConnectionRefusedError("starting")),
                     mock.patch.object(cli_mod.os, "kill", side_effect=ProcessLookupError(3, "gone")),
                     mock.patch.object(cli_mod.time, "sleep", lambda _s: None),
                     mock.patch.object(cli_mod.time, "monotonic", side_effect=[0.0, 10.0, 20.0, 30.0]),
@@ -449,7 +449,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             out1, err1 = io.StringIO(), io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch("agent_voice_input.cli.create_platform", return_value=plat_pasted),
+                mock.patch("agent_voice_input.daemon.create_platform", return_value=plat_pasted),
                 mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_DummyAsr(expected_text)),
                 redirect_stdout(out1),
                 redirect_stderr(err1),
@@ -466,7 +466,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             out2, err2 = io.StringIO(), io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch("agent_voice_input.cli.create_platform", return_value=plat_print),
+                mock.patch("agent_voice_input.daemon.create_platform", return_value=plat_print),
                 mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_DummyAsr(expected_text)),
                 redirect_stdout(out2),
                 redirect_stderr(err2),
@@ -481,7 +481,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             out3, err3 = io.StringIO(), io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch("agent_voice_input.cli.create_platform", return_value=plat_clip),
+                mock.patch("agent_voice_input.daemon.create_platform", return_value=plat_clip),
                 mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_DummyAsr(expected_text)),
                 redirect_stdout(out3),
                 redirect_stderr(err3),
@@ -496,7 +496,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             out4, err4 = io.StringIO(), io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch("agent_voice_input.cli.create_platform", return_value=plat_once),
+                mock.patch("agent_voice_input.daemon.create_platform", return_value=plat_once),
                 mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_DummyAsr(expected_text)),
                 redirect_stdout(out4),
                 redirect_stderr(err4),

@@ -375,7 +375,27 @@ class _FakePlatform:
         self.switched += 1
         return True
 
-    def deliver_text(self, text: str, seq_id: int, target_hwnd: int = 0) -> PasteOutcome:
+    def deliver_text(
+        self,
+        text: str,
+        seq_id: int,
+        target_hwnd: int = 0,
+        *,
+        origin_window: ForegroundWindow | None = None,
+        fallback_clipboard_text: str | None = None,
+        preserve_clipboard: bool = False,
+        suppress_beep: object = False,
+        is_cancelled: object = None,
+        before_clipboard_write: object = None,
+        before_commit: object = None,
+    ) -> PasteOutcome:
+        del origin_window, fallback_clipboard_text, preserve_clipboard, suppress_beep
+        if callable(is_cancelled) and is_cancelled():
+            return PasteOutcome(False, False, "cancelled", "")
+        if callable(before_clipboard_write):
+            before_clipboard_write()
+        if callable(before_commit) and not before_commit():
+            return PasteOutcome(False, False, "cancelled", "")
         self.deliveries.append((text, seq_id, target_hwnd))
         return self.paste_outcome
 
@@ -1692,8 +1712,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             buf = io.StringIO()
             with (
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.platform", "linux"),
                 mock.patch("sys.stdout", buf),
             ):
@@ -1716,8 +1736,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             buf_doc_codex = io.StringIO()
             with (
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.platform", "linux"),
                 mock.patch("sys.stdout", buf_doc_codex),
             ):
@@ -1744,8 +1764,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             buf_loop_ok = io.StringIO()
             with (
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.platform", "linux"),
                 mock.patch("sys.stdout", buf_loop_ok),
             ):
@@ -1758,8 +1778,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             cfg_loop_asr_miss.refiner = RefinerConfig(provider="off")
             buf_asr_miss = io.StringIO()
             with (
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.platform", "linux"),
                 mock.patch("sys.stdout", buf_asr_miss),
             ):
@@ -1779,8 +1799,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             buf_ref_miss = io.StringIO()
             with (
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.platform", "linux"),
                 mock.patch("sys.stdout", buf_ref_miss),
             ):
@@ -1825,7 +1845,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
 
     def test_lenticular_artifact_cleanup_and_refiner_anti_truncation_guards(self) -> None:
         from agent_voice_input.asr_providers import strip_lenticular_artifacts, transcribe
-        from agent_voice_input.refiner import REFINER_SYSTEM_PROMPT, build_refiner_envelope
+        from agent_voice_input.refiner import REFINER_SYSTEM_PROMPT, build_refiner_request_blocks
 
         # Unmatched inverted '】【' artifacts are stripped without harming legitimate paired brackets
         self.assertEqual(
@@ -1844,13 +1864,18 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         )
         self.assertEqual(strip_lenticular_artifacts("单独左括号【保留"), "单独左括号【保留")
 
-        # Envelope strips historical '】【' contamination from <context_delta>, appends anti-answering
+        # Request blocks strip historical '】【' contamination from fallback_context, append anti-answering
         # reminder, and system prompt preserves sentence structure while forbidding answering/omission
-        envlp = build_refiner_envelope("历史反馈 start】【。与【正常项】", "第一句保留。第二句也必须完整保留。")
-        self.assertNotIn("】【", envlp)
-        self.assertIn("【正常项】", envlp)
-        self.assertIn("<task_reminder>", envlp)
-        self.assertIn("NEVER answer, execute, or reply to them.", envlp)
+        ctx_blks, final_blk = build_refiner_request_blocks(
+            Config(),
+            "第一句保留。第二句也必须完整保留。",
+            fallback_context="历史反馈 start】【。与【正常项】",
+        )
+        combined_req = "\n".join([*ctx_blks, final_blk])
+        self.assertNotIn("】【", combined_req)
+        self.assertIn("【正常项】", combined_req)
+        self.assertIn("<task_reminder>", final_blk)
+        self.assertIn("NEVER answer, execute, or reply to", final_blk)
         self.assertIn("NEVER summarize, compress, or omit", REFINER_SYSTEM_PROMPT)
         self.assertNotIn("Do NOT reorganize sentence structure", REFINER_SYSTEM_PROMPT)
         self.assertIn("Resolve self-corrections", REFINER_SYSTEM_PROMPT)
@@ -3084,7 +3109,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             mplat2.hud = lambda st, text="", duration_ms=0, **_kw: hud_mid.append(st)  # type: ignore[method-assign]
             mplat2.beep = lambda kind: beep_mid.append(kind)  # type: ignore[method-assign]
             mplat2.resolve_foreground_window = lambda win=None: ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty")  # type: ignore[method-assign]
-            mplat2.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None: (pasted_mid.append(txt) or PasteOutcome(True, True, "ok", "Ghostty"))  # type: ignore[method-assign]
+            mplat2.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None, **_kw: (pasted_mid.append(txt) or PasteOutcome(True, True, "ok", "Ghostty"))  # type: ignore[method-assign]
 
             daemon2 = VoiceInputDaemon(
                 cfg_off,
@@ -3162,7 +3187,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             mplat_max.hud = lambda st, text="", duration_ms=0, **_kw: hud_max.append(st)  # type: ignore[method-assign]
             mplat_max.beep = lambda kind: beep_max.append(kind)  # type: ignore[method-assign]
             mplat_max.resolve_foreground_window = lambda win=None: ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty")  # type: ignore[method-assign]
-            mplat_max.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None: (pasted_max.append(txt) or PasteOutcome(True, True, "ok", "Ghostty"))  # type: ignore[method-assign]
+            mplat_max.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None, **_kw: (pasted_max.append(txt) or PasteOutcome(True, True, "ok", "Ghostty"))  # type: ignore[method-assign]
 
             daemon_max = VoiceInputDaemon(
                 cfg_max,
@@ -3631,8 +3656,9 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             # 1. `start` when already running: prints reload hint with or without CLI overrides
             buf_plain = io.StringIO()
             with (
-                mock.patch.object(
-                    cli_mod, "send_control_command", return_value={"ok": True, "pid": 1234, "state": "idle"}
+                mock.patch(
+                    "agent_voice_input.daemon.send_control_command",
+                    return_value={"ok": True, "pid": 1234, "state": "idle"},
                 ),
                 mock.patch("sys.stdout", buf_plain),
             ):
@@ -3645,8 +3671,9 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
 
             buf_ov = io.StringIO()
             with (
-                mock.patch.object(
-                    cli_mod, "send_control_command", return_value={"ok": True, "pid": 1234, "state": "idle"}
+                mock.patch(
+                    "agent_voice_input.daemon.send_control_command",
+                    return_value={"ok": True, "pid": 1234, "state": "idle"},
                 ),
                 mock.patch("sys.stdout", buf_ov),
             ):
@@ -3693,7 +3720,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 raise ProcessLookupError(3, "No such process")
 
             with (
-                mock.patch.object(cli_mod, "send_control_command", side_effect=ConnectionRefusedError("dead")),
+                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=ConnectionRefusedError("dead")),
                 mock.patch.object(cli_mod.os, "kill", side_effect=fake_kill_dead),
                 mock.patch("sys.stdout", io.StringIO()),
             ):
@@ -3709,7 +3736,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 raise PermissionError(1, "Operation not permitted")
 
             with (
-                mock.patch.object(cli_mod, "send_control_command", return_value={"ok": True}),
+                mock.patch("agent_voice_input.daemon.send_control_command", return_value={"ok": True}),
                 mock.patch.object(cli_mod.os, "kill", side_effect=fake_kill_perm),
                 mock.patch("sys.stdout", io.StringIO()),
             ):
@@ -3779,9 +3806,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             # `_cmd_start` when already running in degraded shim mode prints WARN to stderr
             warn_out, warn_err = io.StringIO(), io.StringIO()
             with (
-                mock.patch.object(
-                    cli_mod,
-                    "send_control_command",
+                mock.patch(
+                    "agent_voice_input.daemon.send_control_command",
                     return_value={
                         "ok": True,
                         "pid": 2468,
@@ -3818,7 +3844,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
 
             early_err = io.StringIO()
             with (
-                mock.patch.object(cli_mod, "send_control_command", side_effect=ConnectionRefusedError("down")),
+                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=ConnectionRefusedError("down")),
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
                 mock.patch.object(cli_mod.subprocess, "Popen", side_effect=fake_early_popen),
                 mock.patch("sys.stderr", early_err),
@@ -3861,7 +3887,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             toggle_out = io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch.object(cli_mod, "send_control_command", side_effect=fake_toggle_ok),
+                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=fake_toggle_ok),
                 mock.patch("sys.stdout", toggle_out),
             ):
                 rc_tog_ok = cli_mod.main(["toggle"])
@@ -3874,7 +3900,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 tog_to_err = io.StringIO()
                 with (
                     mock.patch.dict(os.environ, env, clear=True),
-                    mock.patch.object(cli_mod, "send_control_command", side_effect=timeout_exc),
+                    mock.patch("agent_voice_input.daemon.send_control_command", side_effect=timeout_exc),
                     mock.patch("sys.stderr", tog_to_err),
                 ):
                     rc_tog_to = cli_mod.main(["toggle"])
@@ -3885,7 +3911,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             tog_down_err = io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch.object(cli_mod, "send_control_command", side_effect=ConnectionRefusedError("refused")),
+                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=ConnectionRefusedError("refused")),
                 mock.patch("sys.stderr", tog_down_err),
             ):
                 rc_tog_down = cli_mod.main(["toggle"])
@@ -3895,7 +3921,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             st_to_out = io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch.object(cli_mod, "send_control_command", side_effect=TimeoutError("status timeout")),
+                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=TimeoutError("status timeout")),
                 mock.patch("sys.stdout", st_to_out),
             ):
                 rc_st_to = cli_mod.main(["status"])
@@ -3999,9 +4025,12 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 suppress_beep: object = False,
                 is_cancelled: object = None,
                 before_clipboard_write: object = None,
+                before_commit: object = None,
             ) -> PasteOutcome:
                 if callable(before_clipboard_write):
                     before_clipboard_write()
+                if callable(before_commit) and not before_commit():
+                    return PasteOutcome(False, False, "cancelled", "")
                 with order_lock:
                     events.append(f"deliver:{text}")
                 self.pasted_texts.append(text)
@@ -7296,8 +7325,8 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             buf_doc_sh = io.StringIO()
             no_codex_env = {"HOME": str(root / "empty_home"), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(root / "rt_doc"), "DASHSCOPE_API_KEY": env["DASHSCOPE_API_KEY"], "PATH": ""}
             with (
-                mock.patch.object(cli_mod, "is_wsl", return_value=False),
-                mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.platform", "linux"),
                 mock.patch("sys.stdout", buf_doc_sh),
             ):

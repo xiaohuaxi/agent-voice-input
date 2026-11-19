@@ -73,11 +73,11 @@ from agent_voice_input.session_ctx import (  # noqa: E402
     _query_pid_codex_rollout_paths,
     _read_trusted_registry_json,
     _resolve_safe_local_dir,
+    _resolve_valid_agy_root_meta,
     _scan_nonproc_fallback_sessions,
     _upgrade_agy_transcript_path,
     chunk_turns_for_refiner,
     encode_claude_project_dir,
-    is_agy_root_session_valid,
     parse_window_title_hint,
     resolve_ide_workspace_cwd,
     scan_proc_root_sessions,
@@ -1339,11 +1339,10 @@ sys.exit(p.returncode)
                 doc_out_off = io.StringIO()
                 with (
                     mock.patch.object(cli_mod.sys, "platform", "linux"),
-                    mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
-                    mock.patch.object(cli_mod, "is_wsl", return_value=True),
-                    mock.patch.object(
-                        cli_mod,
-                        "probe_wsl_host",
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                    mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                    mock.patch(
+                        "agent_voice_input.platform_wsl.probe_wsl_host",
                         return_value={
                             "powershell_ok": True,
                             "ps_version": "5.1",
@@ -1371,11 +1370,10 @@ sys.exit(p.returncode)
                 doc_out_rem = io.StringIO()
                 with (
                     mock.patch.object(cli_mod.sys, "platform", "linux"),
-                    mock.patch.object(cli_mod, "resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
-                    mock.patch.object(cli_mod, "is_wsl", return_value=True),
-                    mock.patch.object(
-                        cli_mod,
-                        "probe_wsl_host",
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                    mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                    mock.patch(
+                        "agent_voice_input.platform_wsl.probe_wsl_host",
                         return_value={
                             "powershell_ok": True,
                             "ps_version": "5.1",
@@ -1941,7 +1939,7 @@ sys.exit(p.returncode)
                 agy_pres_dir = real_home / ".gemini" / "antigravity-cli" / "presence"
                 agy_pres_dir.mkdir(parents=True, exist_ok=True)
                 os.symlink("/mnt/d/bad-agy.lock", agy_pres_dir / f"{agy_cid}.lock")
-                self.assertFalse(is_agy_root_session_valid(agy_cid, real_home, None))
+                self.assertFalse(_resolve_valid_agy_root_meta(agy_cid, real_home, None)[0])
 
                 agy_cid2 = "feedface-1111-4222-8333-444455556666"
                 agy_logs2 = (

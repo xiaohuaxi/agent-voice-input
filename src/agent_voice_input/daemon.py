@@ -391,52 +391,6 @@ def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
     )
 
 
-def _deliver_with_origin(
-    platform: Any,
-    text: str,
-    *,
-    seq_id: int,
-    origin_window: ForegroundWindow,
-    fallback_clipboard_text: str | None = None,
-    preserve_clipboard: bool = False,
-    suppress_beep: bool | Callable[[], bool] = False,
-    is_cancelled: Callable[[], bool] | None = None,
-    before_clipboard_write: Callable[[], None] | None = None,
-    before_commit: Callable[[], bool] | None = None,
-) -> PasteOutcome:
-    try:
-        params = inspect.signature(platform.deliver_text).parameters
-    except (TypeError, ValueError):
-        params = {}
-    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-
-    def _accepts(name: str) -> bool:
-        return name in params or has_var_kw
-
-    if before_clipboard_write is not None and not _accepts("before_clipboard_write"):
-        before_clipboard_write()
-    if before_commit is not None and not _accepts("before_commit"):
-        if not before_commit():
-            return PasteOutcome(False, False, "cancelled", "")
-
-    kw: dict[str, Any] = {"seq_id": seq_id, "target_hwnd": origin_window.hwnd}
-    if _accepts("origin_window"):
-        kw["origin_window"] = origin_window
-    if fallback_clipboard_text is not None and _accepts("fallback_clipboard_text"):
-        kw["fallback_clipboard_text"] = fallback_clipboard_text
-    if preserve_clipboard and _accepts("preserve_clipboard"):
-        kw["preserve_clipboard"] = True
-    if suppress_beep and _accepts("suppress_beep"):
-        kw["suppress_beep"] = suppress_beep
-    if is_cancelled is not None and _accepts("is_cancelled"):
-        kw["is_cancelled"] = is_cancelled
-    if before_clipboard_write is not None and _accepts("before_clipboard_write"):
-        kw["before_clipboard_write"] = before_clipboard_write
-    if before_commit is not None and _accepts("before_commit"):
-        kw["before_commit"] = before_commit
-    return platform.deliver_text(text, **kw)
-
-
 def _may_run_stage2_refiner(
     cfg: Config, refiner: BaseRefiner, asr_provider: BaseAsrProvider
 ) -> bool:
@@ -1171,10 +1125,10 @@ def run_pipeline_once(
                 deliver_ms = _elapsed_ms(t_deliv0)
             else:
                 t_deliv0 = time.monotonic()
-                paste_out = _deliver_with_origin(
-                    platform,
+                paste_out = platform.deliver_text(
                     cand_text,
                     seq_id=seq_id,
+                    target_hwnd=st.win.hwnd,
                     origin_window=st.win,
                     is_cancelled=cancel_check,
                     before_commit=(cancel_token.try_commit if cancel_token is not None else None),
@@ -2313,10 +2267,10 @@ class VoiceInputDaemon:
             unpasted_snapshot = list(self._batch_unpasted_clips)
         fallback_txt = "\n\n".join([*unpasted_snapshot, final_text]) if unpasted_snapshot else None
         preserve_clip = bool(unpasted_snapshot)
-        paste_out = _deliver_with_origin(
-            self.platform,
+        paste_out = self.platform.deliver_text(
             final_text,
             seq_id=task.seq_id,
+            target_hwnd=origin_win.hwnd,
             origin_window=origin_win,
             fallback_clipboard_text=fallback_txt,
             preserve_clipboard=preserve_clip,

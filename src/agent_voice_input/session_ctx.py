@@ -707,16 +707,6 @@ def _resolve_valid_agy_root_meta(
     return True, agy_cwd, 0.0
 
 
-def is_agy_root_session_valid(
-    cid: str,
-    home: Path,
-    proc_root: Path | None = None,
-) -> bool:
-    """Strictly verify ``cid`` holds a live ``presence/<cid>.lock`` and is not a subagent."""
-    valid, _, _ = _resolve_valid_agy_root_meta(cid, home, proc_root)
-    return valid
-
-
 # ---------------------------------------------------------------------------
 # Linux /proc & storage discovery helpers
 # ---------------------------------------------------------------------------
