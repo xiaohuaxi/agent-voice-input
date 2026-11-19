@@ -43,6 +43,45 @@ jobs:
       - name: Run offline unit tests
         run: PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests -v
 
+  win-shim:
+    name: Windows shim self-check (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify win_shim.ps1 7-bit ASCII and headless self-check (cold + cached DLL)
+        shell: powershell
+        run: |
+          $rawBytes = [System.IO.File]::ReadAllBytes("src/agent_voice_input/win_shim.ps1")
+          foreach ($b in $rawBytes) {
+            if ($b -gt 0x7F) { throw "Non-ASCII byte $b found in win_shim.ps1" }
+          }
+          $isoAppData = Join-Path $env:RUNNER_TEMP ("avi-shim-ci-" + [Guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Force -Path $isoAppData | Out-Null
+          $prevLocalAppData = $env:LOCALAPPDATA
+          try {
+            $env:LOCALAPPDATA = $isoAppData
+            $out1 = & powershell.exe -NoProfile -NonInteractive -Sta -ExecutionPolicy Bypass -File src/agent_voice_input/win_shim.ps1 -Mode self-check
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Host "Cold run: $out1"
+            $p1 = ($out1 | Select-Object -Last 1) | ConvertFrom-Json
+            if (-not $p1.ok -or $p1.mode -ne "self-check" -or $p1.cache_hit) {
+              throw "Unexpected cold self-check output: $out1"
+            }
+            $out2 = & powershell.exe -NoProfile -NonInteractive -Sta -ExecutionPolicy Bypass -File src/agent_voice_input/win_shim.ps1 -Mode self-check
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Host "Warm run: $out2"
+            $p2 = ($out2 | Select-Object -Last 1) | ConvertFrom-Json
+            if (-not $p2.ok -or $p2.mode -ne "self-check" -or -not $p2.cache_hit) {
+              throw "Unexpected cached self-check output: $out2"
+            }
+          } finally {
+            $env:LOCALAPPDATA = $prevLocalAppData
+            Remove-Item -Recurse -Force -Path $isoAppData -ErrorAction SilentlyContinue
+          }
+
   package-check:
     name: Build and verify sdist & wheel
     runs-on: ubuntu-latest
@@ -74,7 +113,10 @@ jobs:
                   "agent_voice_input/__init__.py",
                   "agent_voice_input/cli.py",
                   "agent_voice_input/daemon.py",
+                  "agent_voice_input/prompts.py",
+                  "agent_voice_input/app_scope.py",
                   "agent_voice_input/win_shim.ps1",
+                  "agent_voice_input/mac_shim.swift",
               ):
                   assert req in names, f"missing {req} in wheel"
               assert any("LICENSE" in n for n in names), f"missing LICENSE in wheel: {sorted(names)}"
@@ -87,11 +129,16 @@ jobs:
               snames = set(tf.getnames())
               for suffix in (
                   "/LICENSE",
+                  "/CHANGELOG.md",
+                  "/ROADMAP.md",
                   "/README.md",
                   "/README.zh-CN.md",
                   "/config.example.toml",
                   "/config.example.env",
+                  "/src/agent_voice_input/prompts.py",
+                  "/src/agent_voice_input/app_scope.py",
                   "/src/agent_voice_input/win_shim.ps1",
+                  "/src/agent_voice_input/mac_shim.swift",
               ):
                   assert any(n.endswith(suffix) for n in snames), f"missing {suffix} in sdist"
           PY

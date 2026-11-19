@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-import concurrent.futures, fcntl, inspect, json, os, signal, socket, stat, sys, threading, time
+import concurrent.futures, errno, fcntl, inspect, json, os, signal, socket, stat, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -61,6 +61,7 @@ from .session_ctx import (
     SessionSnapshot,
     SessionTracker,
     parse_window_title_hint,
+    prune_stale_session_registry,
     resolve_antigravity_ide_session,
     resolve_ide_workspace_cwd,
 )
@@ -69,6 +70,15 @@ from .session_ctx import (
 TELEMETRY_FILENAME: str = "telemetry.jsonl"
 TELEMETRY_MAX_BYTES: int = 256 * 1024
 RECENT_RESULTS_MAXLEN: int = 20
+
+
+class DaemonAlreadyRunningError(RuntimeError):
+    """Raised when another daemon instance already holds ``daemon.lock``."""
+
+    def __init__(self, pid: int | None = None) -> None:
+        self.pid = pid if (pid is not None and pid > 0) else None
+        suffix = f" (pid={self.pid})" if self.pid else ""
+        super().__init__(f"agent-voice-input daemon is already running{suffix}")
 
 
 def _elapsed_ms(t0: float, clock_fn: Callable[[], float] = time.monotonic) -> int:
@@ -1266,17 +1276,118 @@ class VoiceInputDaemon:
         self._auto_stop_seq, self._auto_stop_ts, self._auto_stop_absorbed = -1, -1e9, False
         self._max_dur_timer: threading.Timer | None = None
         self._archive_threads: set[threading.Thread] = set()
+        self._lock_fd: int | None = None
+        self._owns_runtime_files: bool = False
         if (setter := getattr(self.platform, "set_recorder_lost_callback", None)) is not None:
             setter(self._on_recorder_lost)
         if (rec_setter := getattr(self.platform, "set_recorder_recovered_callback", None)) is not None:
             rec_setter(self._on_recorder_recovered)
+        try:
+            prune_stale_session_registry(self.runtime_dir, proc_root=self.tracker.proc_root)
+        except Exception:
+            pass
 
+    @property
+    def lock_path(self) -> Path: return self.runtime_dir / "daemon.lock"
     @property
     def pid_path(self) -> Path: return self.runtime_dir / "daemon.pid"
     @property
     def sock_path(self) -> Path: return self.runtime_dir / "control.sock"
     @property
     def telemetry_path(self) -> Path: return self.runtime_dir / TELEMETRY_FILENAME
+
+    def _read_pid_file_fallback(self) -> int | None:
+        try:
+            raw = self.pid_path.read_text(encoding="utf-8").strip()
+            val = int(raw)
+            return val if val > 0 else None
+        except (OSError, ValueError):
+            return None
+
+    def acquire_lock(self) -> None:
+        if self._lock_fd is not None:
+            return
+        ensure_secure_dir(self.runtime_dir)
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        fd = os.open(str(self.lock_path), flags, 0o600)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                raise RuntimeError(f"unsafe daemon lock file: {self.lock_path}")
+            os.fchmod(fd, 0o600)
+            os.set_inheritable(fd, False)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError) as exc:
+                if isinstance(exc, OSError) and exc.errno not in (
+                    errno.EACCES,
+                    errno.EAGAIN,
+                    errno.EWOULDBLOCK,
+                ):
+                    raise
+                os.lseek(fd, 0, os.SEEK_SET)
+                raw_pid = os.read(fd, 64).decode("utf-8", errors="ignore").strip()
+                holder_pid = (
+                    int(raw_pid)
+                    if (raw_pid.isdigit() and int(raw_pid) > 0)
+                    else self._read_pid_file_fallback()
+                )
+                raise DaemonAlreadyRunningError(holder_pid) from None
+            os.ftruncate(fd, 0)
+            if self.sock_path.exists():
+                legacy_pid: int | None = None
+                legacy_alive = False
+                try:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe_sock:
+                        probe_sock.settimeout(0.6)
+                        probe_sock.connect(str(self.sock_path))
+                        # A successful AF_UNIX connect proves a live listener holds control.sock!
+                        legacy_alive = True
+                        try:
+                            probe_sock.sendall(b'{"cmd":"status"}\n')
+                            buf = b""
+                            while b"\n" not in buf and len(buf) < 65536 and (chunk := probe_sock.recv(16384)):
+                                buf += chunk
+                            st_resp = json.loads(buf.decode("utf-8", errors="replace").strip() or "{}")
+                            if isinstance(st_resp, Mapping):
+                                raw_lpid = st_resp.get("pid")
+                                if isinstance(raw_lpid, int) and not isinstance(raw_lpid, bool) and raw_lpid > 0:
+                                    legacy_pid = raw_lpid
+                        except Exception:
+                            pass
+                except (TimeoutError, socket.timeout, PermissionError):
+                    legacy_alive = True
+                except OSError as sock_exc:
+                    # Only treat explicit dead/non-socket errors as offline; EAGAIN/EWOULDBLOCK means full backlog on live listener!
+                    if sock_exc.errno in (
+                        errno.ENOENT,
+                        errno.ECONNREFUSED,
+                        errno.ENOTSOCK,
+                        errno.EPROTOTYPE,
+                    ):
+                        legacy_alive = False
+                    else:
+                        legacy_alive = True
+                if legacy_alive:
+                    if legacy_pid is None:
+                        legacy_pid = self._read_pid_file_fallback()
+                    raise DaemonAlreadyRunningError(legacy_pid)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        except BaseException:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+            raise
+        self._lock_fd = fd
+        self._owns_runtime_files = True
 
     def _record_result_locked(self, summary: dict[str, Any]) -> dict[str, Any]:
         summary.setdefault("ts", round(time.time(), 6))
@@ -2794,15 +2905,25 @@ class VoiceInputDaemon:
             self.handle_cancel(seq_id=seq_val)
 
     def serve_forever(self) -> None:
-        self.sock_path.unlink(missing_ok=True)
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._srv_sock = srv
         sig_stop = threading.Event()
         is_main = threading.current_thread() is threading.main_thread()
         prev_int = signal.signal(signal.SIGINT, lambda *_: sig_stop.set()) if is_main else None
         prev_term = signal.signal(signal.SIGTERM, lambda *_: sig_stop.set()) if is_main else None
         try:
-            self.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8"); os.chmod(self.pid_path, 0o600)
+            self.acquire_lock()
+            self.sock_path.unlink(missing_ok=True)
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._srv_sock = srv
+            pid_fd = os.open(
+                str(self.pid_path),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.fchmod(pid_fd, 0o600)
+                os.write(pid_fd, f"{os.getpid()}\n".encode("ascii"))
+            finally:
+                os.close(pid_fd)
             self.platform.start_event_listener(self._on_platform_event)
             srv.bind(str(self.sock_path)); os.chmod(self.sock_path, 0o600); srv.listen(8); srv.settimeout(0.3)
             if (
@@ -2848,21 +2969,41 @@ class VoiceInputDaemon:
             self._archive_threads = {t for t in self._archive_threads if t.is_alive()}
 
     def close(self) -> None:
-        bg_threads = self._initiate_shutdown()
-        if self._srv_sock is not None:
-            try: self._srv_sock.close()
-            except OSError: pass
-            self._srv_sock = None
-        self.sock_path.unlink(missing_ok=True); self.pid_path.unlink(missing_ok=True)
-        self.refiner.close()
-        join_deadline = time.monotonic() + 3.0
-        cur_th = threading.current_thread()
-        for th in bg_threads:
-            if (rem := join_deadline - time.monotonic()) <= 0:
-                break
-            if th.is_alive() and th is not cur_th:
-                th.join(timeout=rem)
-        self.wait_pending_archives(timeout_sec=2.0)
-        self.platform.close()
+        try:
+            bg_threads = self._initiate_shutdown()
+            if self._srv_sock is not None:
+                try: self._srv_sock.close()
+                except OSError: pass
+                self._srv_sock = None
+            if self._owns_runtime_files:
+                self.sock_path.unlink(missing_ok=True)
+                self.pid_path.unlink(missing_ok=True)
+            self.refiner.close()
+            join_deadline = time.monotonic() + 3.0
+            cur_th = threading.current_thread()
+            for th in bg_threads:
+                if (rem := join_deadline - time.monotonic()) <= 0:
+                    break
+                if th.is_alive() and th is not cur_th:
+                    th.join(timeout=rem)
+            self.wait_pending_archives(timeout_sec=2.0)
+            self.platform.close()
+        finally:
+            # Never unlink daemon.lock: unlinking causes a classic inode race allowing two concurrent daemons.
+            lock_fd, self._lock_fd = self._lock_fd, None
+            self._owns_runtime_files = False
+            if lock_fd is not None:
+                try:
+                    os.ftruncate(lock_fd, 0)
+                except OSError:
+                    pass
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
 
     stop = close

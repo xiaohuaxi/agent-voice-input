@@ -178,7 +178,7 @@ agent-voice-input start                  # 后台启动守护进程
 agent-voice-input restart                # 重启守护进程（修改配置后常用）
 agent-voice-input status                 # 查看运行状态、最近一次耗时与错误摘要
 agent-voice-input doctor [--ping]        # 全面自检音频链路、原生辅助层、凭据、会话匹配及可选端点连通性探活（支持 --json）
-agent-voice-input retry --list           # 查看暂存的失败录音（用 `agent-voice-input retry` 重新转写最近一条）
+agent-voice-input retry [--list] [--print]  # 查看或重跑暂存的失败录音（自动粘贴时不重复打印，加 --print 强制输出 stdout）
 agent-voice-input once --duration 4 --dry-run  # 单次录音验证流水线（不粘贴上屏）
 agent-voice-input toggle                 # 命令行触发开始/结束录音
 agent-voice-input cancel                 # 取消当前录音，或中断后台在途识别/精修（可用 `--seq N` 指定单条）

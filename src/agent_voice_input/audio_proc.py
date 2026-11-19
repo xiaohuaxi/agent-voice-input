@@ -344,6 +344,40 @@ def process_wav(
             all_zero=all_zero,
         )
 
+    # Sparse sigh / ambient-click filter for long mostly-silent recordings (e.g. 28.8s with <3% scattered noise):
+    # Short clips (<8s) and normal/whispered speech (>=5% voiced) bypass this check with zero overhead.
+    if total_samples >= 8 * TARGET_SAMPLE_RATE and voiced_count * 20 < total_samples:
+        fr = _SPLIT_FRAME_SAMPLES  # 320 samples = 20ms @ 16kHz
+        win_frames = 75            # 1.5s sliding window
+        frame_voiced = [
+            sum(1 for s in samples[off : off + fr] if abs(s) > thr_int)
+            for off in range(0, total_samples, fr)
+        ]
+        cur_win = sum(frame_voiced[:win_frames])
+        best_win = cur_win
+        for idx in range(win_frames, len(frame_voiced)):
+            cur_win += frame_voiced[idx] - frame_voiced[idx - win_frames]
+            if cur_win > best_win:
+                best_win = cur_win
+        max_win_voiced_sec = best_win / float(TARGET_SAMPLE_RATE)
+        concentration = best_win / float(voiced_count)
+        strong_peak_thr = thr_int * (10.0 ** (10.0 / 20.0))  # floor_dbfs + 10 dB
+        has_clear_peak = (
+            (eff_floor + 10.0 >= 0.0)
+            or max(abs(max(voiced)), abs(min(voiced))) > strong_peak_thr
+        )
+        if not has_clear_peak or (max_win_voiced_sec < 0.45 and concentration < 0.65):
+            return AudioGateResult(
+                passed=False,
+                reason="silence",
+                wav_bytes=b"",
+                duration_sec=duration_sec,
+                voiced_sec=voiced_sec,
+                rms_dbfs=-200.0,
+                gain_db=0.0,
+                all_zero=False,
+            )
+
     mean_sq = sum(s * s for s in voiced) / (voiced_count * (32768.0 * 32768.0))
     rms = math.sqrt(mean_sq)
     rms_dbfs = 20.0 * math.log10(max(rms, 1e-10))

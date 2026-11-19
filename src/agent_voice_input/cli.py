@@ -1,7 +1,7 @@
 """CLI entrypoint for agent-voice-input (init, daemon, start, restart, stop, status, toggle, cancel, once, retry, doctor, key-test, session-hook)."""
 from __future__ import annotations
 
-import argparse, dataclasses, json, os, shlex, signal, socket, stat, subprocess, sys, time
+import argparse, dataclasses, errno, fcntl, json, os, shlex, signal, socket, stat, subprocess, sys, time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,7 @@ from .config import (
     select_refiner_provider,
 )
 from .daemon import (
+    DaemonAlreadyRunningError,
     VoiceInputDaemon,
     append_telemetry_record,
     build_pipeline_summary,
@@ -1000,6 +1001,8 @@ def _run_wav_or_live(
     title: str | None,
     cfg: Config,
     env: dict[str, str],
+    suppress_stdout_on_paste: bool = False,
+    force_print: bool = False,
 ) -> int:
     rt_dir = get_runtime_dir(env, create=True)
     plat = None if (wav_file and dry_run and title is not None) else create_platform(cfg, env=env)
@@ -1068,7 +1071,20 @@ def _run_wav_or_live(
                 f"[stage2]  ({r_tag}): {res.final_text}",
                 file=sys.stderr,
             )
-        print(res.final_text)
+        if res.paste is not None and res.paste.pasted:
+            if suppress_stdout_on_paste:
+                print(f"[agent-voice-input] pasted ({len(res.final_text)} chars)", file=sys.stderr)
+                if force_print:
+                    print(res.final_text)
+            else:
+                print(res.final_text)
+        else:
+            if suppress_stdout_on_paste and res.paste is not None and res.paste.clipboard:
+                print(
+                    f"[agent-voice-input] copied to clipboard ({len(res.final_text)} chars; {res.paste.reason})",
+                    file=sys.stderr,
+                )
+            print(res.final_text)
         return 0
     finally:
         if plat is not None:
@@ -1113,6 +1129,8 @@ def _cmd_retry(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> in
         title=args.title,
         cfg=cfg,
         env=env,
+        suppress_stdout_on_paste=True,
+        force_print=bool(getattr(args, "print_stdout", False)),
     )
 
 
@@ -1333,44 +1351,186 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
     return 0
 
 
+def _try_open_daemon_lock_fd(rt_dir: Path, *, create: bool = False) -> int | None:
+    lock_file = rt_dir / "daemon.lock"
+    flags = (
+        os.O_RDWR
+        | (os.O_CREAT if create else 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(str(lock_file), flags, 0o600)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            os.close(fd)
+            return None
+        if create:
+            os.fchmod(fd, 0o600)
+        os.set_inheritable(fd, False)
+        return fd
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+
+
+def _wait_daemon_lock_free(rt_dir: Path, timeout_sec: float = 6.0) -> bool:
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        if not (rt_dir / "daemon.lock").exists():
+            return True
+        fd = _try_open_daemon_lock_fd(rt_dir, create=False)
+        if fd is None:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as exc:
+            if isinstance(exc, OSError) and exc.errno not in (
+                errno.EACCES,
+                errno.EAGAIN,
+                errno.EWOULDBLOCK,
+            ):
+                return False
+        else:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            return True
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _read_pid_file(pid_file: Path) -> int:
+    try:
+        val = int(pid_file.read_text(encoding="utf-8").strip()) if pid_file.is_file() else 0
+        return val if val > 0 else 0
+    except (OSError, ValueError):
+        return 0
+
+
+def _probe_pid_liveness(pid: int) -> str:
+    """Return ``'gone'``, ``'alive'``, or ``'perm'`` via zero-signal ``os.kill(pid, 0)``."""
+    if pid <= 0:
+        return "gone"
+    try:
+        os.kill(pid, 0)
+        return "alive"
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "perm"
+    except OSError:
+        return "gone"
+
+
 def _cmd_stop(env: dict[str, str]) -> int:
     rt_dir = get_runtime_dir(env, create=False)
     pid_file = rt_dir / "daemon.pid"
-    try:
-        pid = int(pid_file.read_text(encoding="utf-8").strip()) if pid_file.is_file() else 0
-    except ValueError:
-        pid = 0
+    pid = _read_pid_file(pid_file)
+    stop_deadline = time.monotonic() + 6.0
+    shutdown_sent = False
+    socket_still_live = False
     try:
         send_control_command(rt_dir, {"cmd": "shutdown"}, timeout_sec=1.5)
+        shutdown_sent = True
+    except (TimeoutError, socket.timeout, PermissionError):
+        socket_still_live = True
+    except OSError as sock_exc:
+        if sock_exc.errno not in (
+            None,
+            errno.ENOENT,
+            errno.ECONNREFUSED,
+            errno.ENOTSOCK,
+            errno.EPROTOTYPE,
+        ):
+            socket_still_live = True
     except Exception:
-        if pid > 0:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
-    if pid > 0:
-        for _ in range(20):
+        pass
+
+    if shutdown_sent and pid > 0:
+        while time.monotonic() < stop_deadline:
             try:
                 os.kill(pid, 0)
-                time.sleep(0.1)
+                time.sleep(0.05)
             except OSError:
                 break
-    dead = pid <= 0
-    if not dead:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            dead = True
-        except PermissionError:
-            dead = False
-        except OSError:
-            dead = True
-    if dead:
-        for stale in (pid_file, rt_dir / "control.sock"):
+
+    pid_liveness = _probe_pid_liveness(pid)
+    lock_confirmed_free = not rt_dir.is_dir()
+
+    if rt_dir.is_dir():
+        lfd: int | None = None
+        while True:
+            lfd = _try_open_daemon_lock_fd(rt_dir, create=True)
+            if lfd is None:
+                break
             try:
-                stale.unlink(missing_ok=True)
-            except OSError:
-                pass
+                fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, OSError) as exc:
+                try:
+                    os.close(lfd)
+                except OSError:
+                    pass
+                lfd = None
+                if isinstance(exc, OSError) and exc.errno not in (
+                    errno.EACCES,
+                    errno.EAGAIN,
+                    errno.EWOULDBLOCK,
+                ):
+                    break
+                if time.monotonic() >= stop_deadline:
+                    break
+                time.sleep(0.05)
+        if lfd is not None:
+            lock_confirmed_free = True
+            try:
+                cur_pid = _read_pid_file(pid_file)
+                cur_liveness = _probe_pid_liveness(cur_pid)
+                # Under LOCK_EX with no live socket:
+                # - if shutdown was sent, only unlink once `pid` has actually exited (`gone`), preserving legacy live instances;
+                # - if shutdown failed with offline socket (e.g. SIGKILL remnant whose PID may even be recycled), safe to unlink unless `perm`.
+                can_unlink = (
+                    not socket_still_live
+                    and pid_liveness != "perm"
+                    and cur_liveness != "perm"
+                    and (not shutdown_sent or (pid_liveness == "gone" and cur_liveness == "gone"))
+                )
+                if can_unlink:
+                    for stale in (pid_file, rt_dir / "control.sock"):
+                        try:
+                            stale.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            finally:
+                try:
+                    fcntl.flock(lfd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    os.close(lfd)
+                except OSError:
+                    pass
+
+    if not shutdown_sent and (socket_still_live or not lock_confirmed_free or pid_liveness == "perm"):
+        print(
+            f"error: could not confirm daemon stop in {rt_dir}; check running processes",
+            file=sys.stderr,
+        )
+        return 1
     print("stopped")
     return 0
 
@@ -1443,6 +1603,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_retry.add_argument("target", nargs="?", default="", help="Optional 1-based index (1=newest), filename, substring, or path")
     p_retry.add_argument("-l", "--list", action="store_true", dest="list_only", help="List saved failed recordings without running")
     p_retry.add_argument("--dry-run", action="store_true", help="Print Stage 1 & Stage 2 output without clipboard/paste")
+    p_retry.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_stdout",
+        help="Print recovered text to stdout even when automatically pasted",
+    )
     p_retry.add_argument("--title", help="Optional window title override for session matching")
     p_kt = sub.add_parser("key-test")
     _add_common_flags(p_kt, is_sub=True)
@@ -1492,7 +1658,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcmd == "start":
             return _cmd_start(args, env, cfg=cfg)
         if args.subcmd == "restart":
-            _cmd_stop(env)
+            rc_stop = _cmd_stop(env)
+            if rc_stop != 0:
+                return rc_stop
+            if not _wait_daemon_lock_free(get_runtime_dir(env, create=False), timeout_sec=2.0):
+                print(
+                    "error: previous daemon still holds daemon.lock; run 'agent-voice-input stop' and retry",
+                    file=sys.stderr,
+                )
+                return 1
             return _cmd_start(args, env, cfg=cfg)
         if args.subcmd == "stop":
             return _cmd_stop(env)
@@ -1545,6 +1719,14 @@ def main(argv: list[str] | None = None) -> int:
             if sys.platform == "darwin":
                 return run_macos_key_test(cfg, seconds=args.seconds, env=env)
             return run_key_test(cfg, seconds=args.seconds)
+    except DaemonAlreadyRunningError as exc:
+        pid_tag = f" (pid={exc.pid})" if exc.pid else ""
+        print(
+            f"agent-voice-input daemon is already running{pid_tag}; "
+            "run 'agent-voice-input restart' or 'agent-voice-input stop'",
+            file=sys.stderr,
+        )
+        return 1
     except ConfigError as exc:
         eff_env = env if env is not None else load_env_files()
         print(f"config error: {redact_secrets(str(exc), eff_env, cfg=cfg)}", file=sys.stderr)

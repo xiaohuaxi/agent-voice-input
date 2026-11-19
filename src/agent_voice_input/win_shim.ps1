@@ -658,9 +658,9 @@ public static class VoiceWinShim {
     [StructLayout(LayoutKind.Sequential)] private struct KBDLLHOOKSTRUCT { public uint vkCode, scanCode, flags, time; public IntPtr dwExtraInfo; }
     [StructLayout(LayoutKind.Sequential)] private struct POINT { public int x, y; }
     [StructLayout(LayoutKind.Sequential)] private struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam, lParam; public uint time; public POINT pt; }
-    [StructLayout(LayoutKind.Sequential)] private struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr dwExtraInfo; }
-    [StructLayout(LayoutKind.Explicit)] private struct INPUT_UNION { [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] private long _p0; [FieldOffset(8)] private long _p1; [FieldOffset(16)] private long _p2; [FieldOffset(24)] private long _p3; }
-    [StructLayout(LayoutKind.Sequential)] private struct INPUT { public uint type; public INPUT_UNION u; }
+    [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr dwExtraInfo; }
+    [StructLayout(LayoutKind.Explicit)] public struct INPUT_UNION { [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] private long _p0; [FieldOffset(8)] private long _p1; [FieldOffset(16)] private long _p2; [FieldOffset(24)] private long _p3; }
+    [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public INPUT_UNION u; }
 
     [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] private struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
@@ -1232,7 +1232,7 @@ public static class VoiceWinShim {
         while (rem > 0) { int chunk = Math.Min(rem, zeros.Length); dst.Write(zeros, 0, chunk); rem -= chunk; }
     }
 
-    private static byte[] BuildPcm16MonoWav(byte[] pcm, int pcmLen, int sr) {
+    public static byte[] BuildPcm16MonoWav(byte[] pcm, int pcmLen, int sr) {
         byte[] buf = new byte[44 + pcmLen];
         Encoding.ASCII.GetBytes("RIFF").CopyTo(buf, 0); BitConverter.GetBytes(36 + pcmLen).CopyTo(buf, 4);
         Encoding.ASCII.GetBytes("WAVEfmt ").CopyTo(buf, 8); BitConverter.GetBytes(16).CopyTo(buf, 16);
@@ -2202,7 +2202,7 @@ public static class VoiceWinShim {
         inp.u.ki.dwFlags = (keyUp ? KEYEVENTF_KEYUP : 0u) | (extended ? KEYEVENTF_EXTENDEDKEY : 0u);
     }
 
-    public static bool SendPasteChord(string chord) {
+    public static INPUT[] BuildPasteChordInputs(string chord) {
         string mode = (chord ?? "ctrl_v").Trim().ToLowerInvariant();
         ushort[] mods;
         ushort mainVk;
@@ -2225,10 +2225,77 @@ public static class VoiceWinShim {
         FillKeyInput(ref ins[idx++], mainVk, false, mainExt);
         FillKeyInput(ref ins[idx++], mainVk, true, mainExt);
         for (int m = mods.Length - 1; m >= 0; m--) FillKeyInput(ref ins[idx++], mods[m], true, false);
-        return SendInput((uint)total, ins, Marshal.SizeOf(typeof(INPUT))) == (uint)total;
+        return ins;
+    }
+
+    public static bool SendPasteChord(string chord) {
+        INPUT[] ins = BuildPasteChordInputs(chord);
+        return SendInput((uint)ins.Length, ins, Marshal.SizeOf(typeof(INPUT))) == (uint)ins.Length;
+    }
+
+    public static void RunHeadlessSelfCheck() {
+        if (ResolveKeyName("RControl") != 0xA3u) throw new InvalidOperationException("ResolveKeyName RControl failed");
+        if (ResolveKeyName("RAlt") != 0xA5u) throw new InvalidOperationException("ResolveKeyName RAlt failed");
+        if (ResolveKeyName("F13") != 0x7Cu) throw new InvalidOperationException("ResolveKeyName F13 failed");
+        if (ResolveKeyName("0x7B") != 0x7Bu) throw new InvalidOperationException("ResolveKeyName 0x7B failed");
+
+        INPUT[] cv = BuildPasteChordInputs("ctrl_v");
+        if (cv == null || cv.Length != 4 || cv[0].u.ki.wVk != 0xA2 || cv[1].u.ki.wVk != 0x56 || cv[2].u.ki.wVk != 0x56 || cv[3].u.ki.wVk != 0xA2)
+            throw new InvalidOperationException("BuildPasteChordInputs ctrl_v vk mismatch");
+        if ((cv[0].u.ki.dwFlags & KEYEVENTF_KEYUP) != 0 || (cv[1].u.ki.dwFlags & KEYEVENTF_KEYUP) != 0 || (cv[2].u.ki.dwFlags & KEYEVENTF_KEYUP) == 0 || (cv[3].u.ki.dwFlags & KEYEVENTF_KEYUP) == 0)
+            throw new InvalidOperationException("BuildPasteChordInputs ctrl_v flags mismatch");
+
+        INPUT[] csv = BuildPasteChordInputs("ctrl_shift_v");
+        if (csv == null || csv.Length != 6 || csv[0].u.ki.wVk != 0xA2 || csv[1].u.ki.wVk != 0xA0 || csv[2].u.ki.wVk != 0x56 || csv[3].u.ki.wVk != 0x56 || csv[4].u.ki.wVk != 0xA0 || csv[5].u.ki.wVk != 0xA2)
+            throw new InvalidOperationException("BuildPasteChordInputs ctrl_shift_v mismatch");
+
+        INPUT[] si = BuildPasteChordInputs("shift_insert");
+        if (si == null || si.Length != 4 || si[0].u.ki.wVk != 0xA0 || si[1].u.ki.wVk != 0x2D || si[2].u.ki.wVk != 0x2D || si[3].u.ki.wVk != 0xA0)
+            throw new InvalidOperationException("BuildPasteChordInputs shift_insert vk mismatch");
+        if ((si[1].u.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) == 0 || (si[2].u.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) == 0 || (si[2].u.ki.dwFlags & KEYEVENTF_KEYUP) == 0)
+            throw new InvalidOperationException("BuildPasteChordInputs shift_insert extended flags mismatch");
+
+        string segIcon, segMain, segHint; bool segSp;
+        SplitHudSegments("\u25CF \u6B63\u5728\u8046\u542C 0:05 (\u70B9\u6309 \u53F3Ctrl \u5B8C\u6210)", out segIcon, out segMain, out segHint, out segSp);
+        if (segIcon != "\u25CF" || segMain != "\u6B63\u5728\u8046\u542C 0:05" || segHint != "(\u70B9\u6309 \u53F3Ctrl \u5B8C\u6210)" || !segSp)
+            throw new InvalidOperationException("SplitHudSegments mismatch");
+        if (FormatRecordingDuration(5) != "5s" || FormatRecordingDuration(65) != "1m 05s")
+            throw new InvalidOperationException("FormatRecordingDuration mismatch");
+        if (CountdownHintSlotTemplate(9, false) != "(auto-finish in 8s)" || CountdownHintSlotTemplate(12, false) != "(auto-finish in 88s)")
+            throw new InvalidOperationException("CountdownHintSlotTemplate mismatch");
+
+        byte[] zeros = new byte[640];
+        if (ComputePcm16RmsLevel(zeros, 640) != 0f)
+            throw new InvalidOperationException("ComputePcm16RmsLevel zero mismatch");
+        byte[] loud = new byte[640];
+        for (int i = 0; i < loud.Length; i += 2) {
+            short sv = (short)(((i / 2) % 2 == 0) ? 6000 : -6000);
+            loud[i] = (byte)(sv & 0xFF);
+            loud[i + 1] = (byte)((sv >> 8) & 0xFF);
+        }
+        if (ComputePcm16RmsLevel(loud, 640) <= 0.5f)
+            throw new InvalidOperationException("ComputePcm16RmsLevel loud mismatch");
+        byte[] wav = BuildPcm16MonoWav(loud, 640, 16000);
+        if (wav == null || wav.Length != 44 + 640 || Encoding.ASCII.GetString(wav, 0, 4) != "RIFF" || Encoding.ASCII.GetString(wav, 8, 4) != "WAVE")
+            throw new InvalidOperationException("BuildPcm16MonoWav header mismatch");
+
+        RunClipStateSelfCheck();
+
+        using (Bitmap bmp = RenderHudSnapshotBitmap("recording", "\u25CF \u6B63\u5728\u8046\u542C 0:03 (\u70B9\u6309 \u53F3Ctrl \u5B8C\u6210)", 96, 1920, 1080)) {
+            if (bmp == null || bmp.Width <= 120 || bmp.Height < 28)
+                throw new InvalidOperationException("RenderHudSnapshotBitmap dimensions invalid");
+            bool anyOpaque = false;
+            int cy = bmp.Height / 2;
+            for (int x = 0; x < bmp.Width; x += 4) {
+                if (bmp.GetPixel(x, cy).A > 0) { anyOpaque = true; break; }
+            }
+            if (!anyOpaque)
+                throw new InvalidOperationException("RenderHudSnapshotBitmap produced transparent bitmap");
+        }
     }
 }
 "@
+$csCacheHit = $false
 if (-not ('VoiceWinShim' -as [type])) {
     try {
         if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
@@ -2246,6 +2313,7 @@ if (-not ('VoiceWinShim' -as [type])) {
             if (Test-Path -LiteralPath $dllPath) {
                 try {
                     Add-Type -Path $dllPath -ErrorAction Stop
+                    if ('VoiceWinShim' -as [type]) { $csCacheHit = $true }
                 } catch {
                     if (-not ('VoiceWinShim' -as [type])) {
                         try { [System.IO.File]::Move($dllPath, "$dllPath.bad.$PID") } catch { }
@@ -2310,6 +2378,8 @@ if (-not ('VoiceWinShim' -as [type])) {
     if (-not ('VoiceWinShim' -as [type])) {
         Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition $csSource
     }
+} else {
+    $csCacheHit = $true
 }
 
 function Write-JsonLine($obj) { try { [Console]::Out.WriteLine(($obj | ConvertTo-Json -Compress -Depth 5)); [Console]::Out.Flush() } catch { } }
@@ -2345,6 +2415,32 @@ function Get-TitleSessionToken([string]$title) {
 
 [VoiceWinShim]::EnableDpiAwareness()
 
+if ($Mode -eq "self-check") {
+    try {
+        $parseErrors = $null
+        if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+            [void][System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$parseErrors)
+            if ($null -ne $parseErrors -and $parseErrors.Count -gt 0) {
+                throw ("AST parse errors: " + $parseErrors.Count)
+            }
+        }
+        [VoiceWinShim]::RunHeadlessSelfCheck()
+        $t1 = "agy " + ([char]0x00B7) + " ~/repo [#a1b2c3d4]"
+        if ((Get-TitleSessionToken $t1) -ne "a1b2c3d4") { throw "Get-TitleSessionToken hash tag failed" }
+        if ((Get-TitleSessionToken "claude [claude:#DEADBEEF]") -ne "deadbeef") { throw "Get-TitleSessionToken prefixed tag failed" }
+        if ((Get-TitleSessionToken "feat/codex-config") -ne "") { throw "Get-TitleSessionToken false positive" }
+        if ((Get-TitleSessionToken "old [#11112222] new [#33334444]") -ne "33334444") { throw "Get-TitleSessionToken multi-tag tail failed" }
+        $protoSample = (@{ type = "reply"; reply = "ping"; seq_id = 1; ok = $true } | ConvertTo-Json -Compress) | ConvertFrom-Json
+        if ((-not $protoSample.ok) -or ($protoSample.reply -ne "ping") -or ([int]$protoSample.seq_id -ne 1)) {
+            throw "JSON roundtrip check failed"
+        }
+        Write-JsonLine @{ ok = $true; mode = "self-check"; ps_version = $PSVersionTable.PSVersion.ToString(); clr_version = $PSVersionTable.CLRVersion.ToString(); cache_hit = [bool]$csCacheHit }
+        exit 0
+    } catch {
+        [Console]::Error.WriteLine("win_shim self-check failed: " + [string]$_.Exception.Message)
+        exit 1
+    }
+}
 if ($Mode -eq "clip-self-check") {
     [VoiceWinShim]::RunClipStateSelfCheck()
     Write-JsonLine @{ ok = $true; mode = "clip-self-check" }

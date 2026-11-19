@@ -1685,6 +1685,246 @@ def _read_trusted_registry_json(reg_file: Path) -> dict[str, Any] | None:
     return rec if isinstance(rec, dict) else None
 
 
+SESSION_REGISTRY_TTL_SEC: float = 7 * 86400.0
+SESSION_REGISTRY_PRUNE_INTERVAL_SEC: float = 3600.0
+_SESSION_REGISTRY_TMP_STALE_SEC: float = 600.0
+_SESSION_REGISTRY_PRUNE_SCAN_LIMIT: int = 512
+_REGISTRY_LOCK_FILENAME: str = ".registry.lock"
+_REGISTRY_PRUNE_STAMP_FILENAME: str = ".prune.stamp"
+
+
+def _is_same_user_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def _acquire_registry_flock(sessions_dir: Path, *, exclusive: bool, blocking: bool) -> int | None:
+    lock_path = sessions_dir / _REGISTRY_LOCK_FILENAME
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(str(lock_path), flags, 0o600)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            os.close(fd)
+            return None
+        os.fchmod(fd, 0o600)
+        os.set_inheritable(fd, False)
+        op = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if blocking else fcntl.LOCK_NB)
+        fcntl.flock(fd, op)
+        return fd
+    except (BlockingIOError, OSError):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+
+
+def _release_registry_flock(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _touch_prune_stamp_locked(sessions_dir: Path, ts: float) -> None:
+    stamp_path = sessions_dir / _REGISTRY_PRUNE_STAMP_FILENAME
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_TRUNC
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        sfd = os.open(str(stamp_path), flags, 0o600)
+    except OSError:
+        return
+    try:
+        st = os.fstat(sfd)
+        if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid():
+            os.fchmod(sfd, 0o600)
+            os.utime(sfd, (ts, ts))
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(sfd)
+        except OSError:
+            pass
+
+
+def _is_prune_throttled(sessions_dir: Path, now_wall: float) -> bool:
+    stamp_path = sessions_dir / _REGISTRY_PRUNE_STAMP_FILENAME
+    try:
+        st = os.lstat(stamp_path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        return False
+    elapsed = now_wall - st.st_mtime
+    return 0.0 <= elapsed < SESSION_REGISTRY_PRUNE_INTERVAL_SEC
+
+
+def _try_claim_prune_slot(sessions_dir: Path, now_wall: float) -> bool:
+    if _is_prune_throttled(sessions_dir, now_wall):
+        return False
+    lfd = _acquire_registry_flock(sessions_dir, exclusive=True, blocking=False)
+    if lfd is None:
+        return False
+    try:
+        locked_now = time.time()
+        if _is_prune_throttled(sessions_dir, locked_now):
+            return False
+        _touch_prune_stamp_locked(sessions_dir, locked_now)
+        return True
+    finally:
+        _release_registry_flock(lfd)
+
+
+def _is_nonproc_cli_pid_alive_or_indeterminate(pid: int, expected_cli: str) -> bool:
+    if not expected_cli or not _is_same_user_pid_alive(pid):
+        return False
+    pinfo = ps_proc_info(pid)
+    if pinfo is None:
+        # `ps` timed out or failed transiently: preserve record if the same-user PID is still alive
+        return _is_same_user_pid_alive(pid)
+    return _classify_interactive_cli(pinfo[0], pinfo[3]) == expected_cli
+
+
+def _unlink_if_same_inode(path: str, expected_id: tuple[int, int], cutoff_mtime: float) -> bool:
+    try:
+        st_cur = os.lstat(path)
+        if (
+            not stat.S_ISREG(st_cur.st_mode)
+            or (st_cur.st_dev, st_cur.st_ino) != expected_id
+            or st_cur.st_mtime > cutoff_mtime
+        ):
+            return False
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
+def prune_stale_session_registry(
+    runtime_dir: str | Path,
+    *,
+    now_ts: float | None = None,
+    max_age_sec: float = SESSION_REGISTRY_TTL_SEC,
+    proc_root: Path | None = Path("/proc"),
+    _stamp_already_touched: bool = False,
+) -> int:
+    """Prune expired (>7d) dead-PID session registry JSONs and stale (>10m) ``.tmp`` files."""
+    rt_path = Path(runtime_dir)
+    sdir = rt_path / "sessions"
+    if not _is_trusted_runtime_dir(rt_path) or not _is_trusted_runtime_dir(sdir):
+        return 0
+
+    now = float(time.time() if now_ts is None else now_ts)
+    eff_max_age = max(0.0, float(max_age_sec))
+    my_uid = os.getuid()
+    use_proc = proc_root is not None and proc_root.is_dir()
+    candidates: list[tuple[str, tuple[int, int], float]] = []
+    scanned = 0
+
+    try:
+        it = os.scandir(sdir)
+    except OSError:
+        return 0
+
+    with it:
+        for entry in it:
+            if scanned >= _SESSION_REGISTRY_PRUNE_SCAN_LIMIT:
+                break
+            scanned += 1
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_uid != my_uid:
+                continue
+            name = entry.name
+            age = now - st.st_mtime
+            inode_id = (st.st_dev, st.st_ino)
+
+            if name.startswith(".") and name.endswith(".tmp"):
+                if age > _SESSION_REGISTRY_TMP_STALE_SEC:
+                    candidates.append((entry.path, inode_id, now - _SESSION_REGISTRY_TMP_STALE_SEC))
+                continue
+
+            if name.startswith(".") or not name.endswith(".json"):
+                continue
+            if age <= eff_max_age:
+                continue
+
+            rec = _read_trusted_registry_json(Path(entry.path))
+            if rec is None:
+                candidates.append((entry.path, inode_id, now - eff_max_age))
+                continue
+
+            agent_pid = _extract_record_pid(rec)
+            cli = str(rec.get("cli") or "").strip().lower()
+            alive = False
+            if agent_pid > 0:
+                if use_proc and proc_root is not None:
+                    pdir = proc_root / str(agent_pid)
+                    try:
+                        pst = os.stat(pdir)
+                    except OSError:
+                        alive = False
+                    else:
+                        alive = (
+                            stat.S_ISDIR(pst.st_mode)
+                            and pst.st_uid == my_uid
+                            and bool(cli)
+                            and _classify_proc_cli(pdir) == cli
+                        )
+                else:
+                    alive = _is_nonproc_cli_pid_alive_or_indeterminate(agent_pid, cli)
+            if alive:
+                continue
+
+            candidates.append((entry.path, inode_id, now - eff_max_age))
+
+    if not candidates and _stamp_already_touched:
+        return 0
+
+    lfd = _acquire_registry_flock(sdir, exclusive=True, blocking=False)
+    if lfd is None:
+        return 0
+    removed = 0
+    try:
+        if not _stamp_already_touched:
+            _touch_prune_stamp_locked(sdir, now)
+        for path_str, inode_id, cutoff_mtime in candidates:
+            if _unlink_if_same_inode(path_str, inode_id, cutoff_mtime):
+                removed += 1
+    finally:
+        _release_registry_flock(lfd)
+
+    return removed
+
+
 def write_session_registry_entry(
     runtime_dir: str | Path,
     *,
@@ -1752,6 +1992,13 @@ def write_session_registry_entry(
     else:
         os.close(fd)
 
+    lfd = _acquire_registry_flock(sessions_dir, exclusive=False, blocking=True)
+    if lfd is None:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise OSError(f"cannot acquire session registry lock in {sessions_dir}")
     try:
         os.replace(str(tmp), str(target))
     except Exception:
@@ -1760,6 +2007,14 @@ def write_session_registry_entry(
         except OSError:
             pass
         raise
+    finally:
+        _release_registry_flock(lfd)
+
+    try:
+        if _try_claim_prune_slot(sessions_dir, time.time()):
+            prune_stale_session_registry(rt_path, _stamp_already_touched=True)
+    except Exception:
+        pass
     return target
 
 

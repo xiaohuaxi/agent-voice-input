@@ -179,7 +179,7 @@ agent-voice-input start                  # Start background daemon
 agent-voice-input restart                # Restart daemon after config changes
 agent-voice-input status                 # Inspect daemon state, last latency, and redacted errors
 agent-voice-input doctor [--ping]        # Check audio bridge, native shim, credentials, session binding, and optional endpoint ping (--json supported)
-agent-voice-input retry --list           # List stashed failed recordings (`agent-voice-input retry` re-runs latest)
+agent-voice-input retry [--list] [--print]  # List or re-run stashed failed recordings (--print forces stdout on paste)
 agent-voice-input once --duration 4 --dry-run  # Record once and print result without pasting
 agent-voice-input toggle                 # Toggle recording start/stop from CLI
 agent-voice-input cancel                 # Cancel active recording, or abort in-flight tasks (`--seq N` targets one)

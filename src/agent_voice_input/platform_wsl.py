@@ -535,6 +535,54 @@ def to_windows_path(path: str | Path) -> str:
     raise RuntimeError(f"wslpath failed for {path}")
 
 
+def run_win_shim_self_check(
+    mode: str = "self-check",
+    *,
+    env: Mapping[str, str] | None = None,
+    timeout: float = 15.0,
+) -> tuple[bool, dict[str, Any], str]:
+    """Run ``win_shim.ps1 -Mode self-check`` (or ``clip-self-check``) headlessly with closed stdin."""
+    if mode not in ("self-check", "clip-self-check"):
+        raise ValueError(f"unsupported win_shim self-check mode: {mode!r}")
+    if not os.path.isfile(POWERSHELL_EXE):
+        return False, {}, f"PowerShell not found at {POWERSHELL_EXE}"
+    try:
+        p = subprocess.run(
+            [
+                POWERSHELL_EXE,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Sta",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                to_windows_path(SHIM_SCRIPT),
+                "-Mode",
+                mode,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=None if env is None else dict(env),
+            timeout=timeout,
+            check=False,
+        )
+    except Exception as exc:
+        return False, {}, str(exc)
+    if p.returncode != 0 or not p.stdout.strip():
+        err_txt = (p.stderr or p.stdout or f"rc={p.returncode}").strip()
+        return False, {}, err_txt
+    try:
+        parsed = json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception as exc:
+        return False, {}, f"invalid self-check JSON: {exc}"
+    if not isinstance(parsed, dict) or not parsed.get("ok") or parsed.get("mode") != mode:
+        return False, {}, f"unexpected self-check payload: {parsed!r}"
+    return True, parsed, ""
+
+
 def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[str, Any]:
     raw_env = os.environ if env is None else env
     eff_env = _pulse_env(raw_env)
