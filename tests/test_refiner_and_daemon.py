@@ -6803,11 +6803,16 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
         from agent_voice_input.daemon import _window_from_mapping
         from agent_voice_input.platform_wsl import WslPlatform
 
-        # 1. Error classification parity for startup 0-frame & inactive endpoint codes
-        err_busy = WslPlatform._classify_wasapi_start_error("mic_busy:wasapi_startup_no_frames")
-        self.assertIsInstance(err_busy, MicrophoneUnavailableError)
-        self.assertEqual(err_busy.reason_code, "mic_unavailable")
-        self.assertEqual(err_busy.hud_state, "mic_unavailable")
+        # 1. Error classification parity: exclusive lock / busy vs. startup 0-frame stream vs. inactive endpoint
+        err_in_use = WslPlatform._classify_wasapi_start_error("mic_busy:0x8889000A")
+        self.assertIsInstance(err_in_use, MicrophoneUnavailableError)
+        self.assertEqual(err_in_use.reason_code, "mic_unavailable")
+        self.assertEqual(err_in_use.hud_state, "mic_unavailable")
+
+        err_no_stream = WslPlatform._classify_wasapi_start_error("mic_busy:wasapi_startup_no_frames")
+        self.assertIsInstance(err_no_stream, MicrophoneUnavailableError)
+        self.assertEqual(err_no_stream.reason_code, "mic_no_stream")
+        self.assertEqual(err_no_stream.hud_state, "mic_no_stream")
 
         err_inact = WslPlatform._classify_wasapi_start_error("no_mic:wasapi_endpoint_inactive")
         self.assertIsInstance(err_inact, NoMicrophoneError)
@@ -6955,23 +6960,23 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             try:
                 wplat.start_event_listener(_on_shim_event)
 
-                # (a) Charging-case 0-frame failure + <850ms PTT release -> single mic_unavailable toast, idle state
+                # (a) Charging-case 0-frame failure + <850ms PTT release -> single mic_no_stream toast, idle state
                 wplat._shim_rpc({"cmd": "inject_hotkey", "hk_event": "ptt_start"}, timeout_sec=2.0)
                 with hotkey_cv:
                     self.assertTrue(hotkey_cv.wait_for(lambda: hotkey_done_count >= 2, timeout=2.0))
                 self.assertEqual(daemon.state, "idle")
                 self.assertFalse(pulse_called)
-                self.assertEqual(daemon.last_result.get("skipped_reason"), "mic_unavailable")
+                self.assertEqual(daemon.last_result.get("skipped_reason"), "mic_no_stream")
                 self.assertIn("mic_busy:wasapi_startup_no_frames", daemon.last_result.get("error", ""))
 
                 st_a = wplat._shim_rpc({"cmd": "dump_state"}, timeout_sec=2.0) or {}
                 hud_a = [c for c in (st_a.get("cmds") or []) if c.get("cmd") == "hud"]
                 beep_a = [c.get("kind") for c in (st_a.get("cmds") or []) if c.get("cmd") == "beep"]
-                self.assertEqual([c.get("state") for c in hud_a], ["mic_unavailable"])
+                self.assertEqual([c.get("state") for c in hud_a], ["mic_no_stream"])
                 self.assertEqual(hud_a[0].get("layer"), "toast")
                 self.assertIs(hud_a[0].get("clear_main"), True)
                 self.assertEqual(hud_a[0].get("duration_ms"), 2600)
-                self.assertEqual(hud_a[0].get("text"), "! 麦克风暂忙，请再试一次")
+                self.assertEqual(hud_a[0].get("text"), "! 麦克风无音频流，请检查耳机/设备")
                 self.assertEqual(beep_a, ["error"])
                 self.assertEqual(st_a.get("rec_cmds"), ["rec_start"])
                 self.assertIs(st_a.get("device_recording"), False)
@@ -8108,6 +8113,8 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
             "Set-ClipboardTransient",
             "RunClipStateSelfCheck",
             '$Mode -eq "clip-self-check"',
+            "MaxClipSnapshotBytes = 100 * 1024 * 1024",
+            "store.HasFormatWhenOpen(CF_DIBV5) ? CF_DIBV5 : CF_DIB",
         ):
             self.assertIn(required_tok, shim, msg=required_tok)
         for forbidden_tok in (

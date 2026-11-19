@@ -889,6 +889,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertIn("[string]$cmdObj.position", shim)
         self.assertIn('st == "no_mic"', shim)
         self.assertIn('st == "mic_unavailable"', shim)
+        self.assertIn('st == "mic_no_stream"', shim)
         self.assertIn('st == "mic_permission"', shim)
         self.assertIn('st == "mic_disconnected"', shim)
         self.assertIn('st == "audio_recovered"', shim)
@@ -901,9 +902,15 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertEqual(default_hud_duration_ms("cancelled"), 1600)
         self.assertTrue(is_toast_hud_state("cancelled"))
         self.assertEqual(hud_layer_for_state("cancelled"), "toast")
+        self.assertEqual(format_hud_text("mic_no_stream", "zh"), "! 麦克风无音频流，请检查耳机/设备")
+        self.assertEqual(format_hud_text("mic_no_stream", "en"), "! No mic audio stream, check headset")
+        self.assertEqual(default_hud_duration_ms("mic_no_stream"), 2600)
+        self.assertTrue(is_toast_hud_state("mic_no_stream"))
+        self.assertEqual(hud_layer_for_state("mic_no_stream"), "toast")
         for esc_lit, state_key in (
             (r"\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE", "no_mic"),
             (r"! \u9EA6\u514B\u98CE\u6682\u5FD9\uFF0C\u8BF7\u518D\u8BD5\u4E00\u6B21", "mic_unavailable"),
+            (r"! \u9EA6\u514B\u98CE\u65E0\u97F3\u9891\u6D41\uFF0C\u8BF7\u68C0\u67E5\u8033\u673A/\u8BBE\u5907", "mic_no_stream"),
             (r"\u2715 \u9EA6\u514B\u98CE\u6743\u9650\u672A\u5F00\u542F", "mic_permission"),
             (r"\u2715 \u9EA6\u514B\u98CE\u5DF2\u65AD\u5F00", "mic_disconnected"),
             (r"! \u9EA6\u514B\u98CE\u77ED\u6682\u4E2D\u65AD\uFF0C\u5DF2\u81EA\u52A8\u6062\u590D", "audio_recovered"),

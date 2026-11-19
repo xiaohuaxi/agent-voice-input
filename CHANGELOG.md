@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **100 MiB clipboard snapshot limit**: Raised the transient clipboard backup/restore cap from `20 MiB` to `100 MiB` across Windows (`win_shim.ps1` `MaxClipSnapshotBytes`) and macOS (`mac_shim.swift` `PasteboardGuard.defaultMaxSnapshotBytes`) so uncompressed 4K/5K screenshots and multi-format clipboard payloads restore cleanly after the default `250ms` paste delay, clearing snapshot references immediately once restoration completes, is superseded, or is abandoned, and without double-counting synthesized `CF_DIB` alongside `CF_DIBV5` (or `.tiff` alongside `.png`).
+- **Clearer WASAPI zero-frame startup toast (`mic_no_stream`)**: Distinguished `wasapi_startup_no_frames` (`IAudioClient.Start()` succeeded on an active endpoint but produced zero audio packets within `850ms`, such as a Bluetooth headset resting inside its charging case) from exclusive-mode device lock (`mic_unavailable`), showing `"! 麦克风无音频流，请检查耳机/设备"` / `"! No mic audio stream, check headset"` instead of `"! 麦克风暂忙，请再试一次"`.
+
 ## [0.9.0] - 2026-11-19
 
 ### Added

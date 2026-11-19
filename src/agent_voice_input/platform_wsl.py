@@ -1414,6 +1414,12 @@ class WslPlatform(JsonlShimMixin):
             )
         if low.startswith("no_mic") or "0x80070490" in low:
             return NoMicrophoneError(f"no microphone input device available ({err})")
+        if "wasapi_startup_no_frames" in low:
+            return MicrophoneUnavailableError(
+                f"microphone produced no audio frames ({err})",
+                reason_code="mic_no_stream",
+                hud_state="mic_no_stream",
+            )
         return MicrophoneUnavailableError(
             f"microphone temporarily unavailable ({err})",
             reason_code="mic_unavailable",

@@ -1013,6 +1013,9 @@ public static class VoiceWinShim {
         } else if (st == "mic_unavailable") {
             txt = zh ? "! \u9EA6\u514B\u98CE\u6682\u5FD9\uFF0C\u8BF7\u518D\u8BD5\u4E00\u6B21" : "! Microphone busy, try again";
             bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2600; iconKind = "warning";
+        } else if (st == "mic_no_stream") {
+            txt = zh ? "! \u9EA6\u514B\u98CE\u65E0\u97F3\u9891\u6D41\uFF0C\u8BF7\u68C0\u67E5\u8033\u673A/\u8BBE\u5907" : "! No mic audio stream, check headset";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2600; iconKind = "warning";
         } else if (st == "audio_recovered") {
             txt = zh ? "! \u9EA6\u514B\u98CE\u77ED\u6682\u4E2D\u65AD\uFF0C\u5DF2\u81EA\u52A8\u6062\u590D" : "! Mic briefly interrupted, resumed";
             bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2400; iconKind = "warning";
@@ -1698,7 +1701,8 @@ public static class VoiceWinShim {
     }
 
     private const uint CF_DIB = 8u, CF_UNICODETEXT = 13u, CF_HDROP = 15u, CF_DIBV5 = 17u, GMEM_MOVEABLE = 0x0002u, GMEM_ZEROINIT = 0x0040u;
-    private const int MaxClipSnapshotBytes = 20 * 1024 * 1024, ClipRestoreDelayMs = 250, ClipRestoreRetryDelayMs = 60, MaxClipRestoreRetries = 3;
+    public const int MaxClipSnapshotBytes = 100 * 1024 * 1024;
+    private const int ClipRestoreDelayMs = 250, ClipRestoreRetryDelayMs = 60, MaxClipRestoreRetries = 3;
     private static readonly byte[] DwordZeroBytes = new byte[4];
     private static IntPtr _clipHwnd = IntPtr.Zero;
     private static System.Windows.Forms.Timer _clipRestoreTimer = null;
@@ -2090,6 +2094,7 @@ public static class VoiceWinShim {
     }
 
     public static void RunClipStateSelfCheck() {
+        if (MaxClipSnapshotBytes != 100 * 1024 * 1024) throw new InvalidOperationException("MaxClipSnapshotBytes expected 100MiB");
         MemClipStore mem = new MemClipStore();
         ClipGuardState st = new ClipGuardState();
         int armed = 0, retried = 0, stopped = 0;
@@ -2114,32 +2119,57 @@ public static class VoiceWinShim {
         FlushClipRestoreCore(st, mem, retryFn, stopFn);
         if (!st.RestorePending || retried != 2) throw new InvalidOperationException("step2 flush lock retry 2 failed");
         FlushClipRestoreCore(st, mem, retryFn, stopFn);
-        if (st.RestorePending || !mem.Formats.ContainsKey(mem.FormatPng) || mem.Formats[mem.FormatPng].Length != png0.Length) throw new InvalidOperationException("step2 PNG not restored");
+        if (st.RestorePending || st.SavedClip != null || !mem.Formats.ContainsKey(mem.FormatPng) || mem.Formats[mem.FormatPng].Length != png0.Length) throw new InvalidOperationException("step2 PNG not restored");
         if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "orig_caption") throw new InvalidOperationException("step2 text not restored");
         if (!mem.Formats.ContainsKey(mem.FormatAviRestored)) throw new InvalidOperationException("step2 AviRestored marker missing");
 
         // 1b. Subsequent dictation after a previous restore still re-snapshots restored ordinary content (not mistaken for password!)
         if (!WriteClipTextCore(st, mem, "voice_after_restore", true, armFn, stopFn)) throw new InvalidOperationException("step2b write failed");
         FlushClipRestoreCore(st, mem, null, stopFn);
-        if (!mem.Formats.ContainsKey(mem.FormatPng) || DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "orig_caption") throw new InvalidOperationException("step2b ordinary restored clip clobbered");
+        if (st.SavedClip != null || !mem.Formats.ContainsKey(mem.FormatPng) || DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "orig_caption") throw new InvalidOperationException("step2b ordinary restored clip clobbered");
+
+        // 1c. CF_DIBV5 + synthesized CF_DIB coexistence captures only CF_DIBV5 (never double-counts bitmap quota), and falls back to CF_DIB alone
+        byte[] dibV5Sample = new byte[] { 0x7C, 0x00, 0x00, 0x00, 0xAA, 0xBB };
+        byte[] dibLegacySample = new byte[] { 0x28, 0x00, 0x00, 0x00, 0xCC, 0xDD };
+        mem.Formats.Clear();
+        mem.Formats[CF_DIBV5] = dibV5Sample;
+        mem.Formats[CF_DIB] = dibLegacySample;
+        mem.Seq++;
+        if (!WriteClipTextCore(st, mem, "voice_dibv5", true, armFn, stopFn)) throw new InvalidOperationException("step2c dibv5 write failed");
+        if (st.SavedClip == null || st.SavedClip.Entries == null || st.SavedClip.Entries.Count != 1 || st.SavedClip.Entries[0].Format != CF_DIBV5)
+            throw new InvalidOperationException("step2c expected exclusive CF_DIBV5 capture without CF_DIB duplication");
+        FlushClipRestoreCore(st, mem, null, stopFn);
+        if (st.SavedClip != null || !mem.Formats.ContainsKey(CF_DIBV5) || mem.Formats.ContainsKey(CF_DIB))
+            throw new InvalidOperationException("step2c CF_DIBV5 restore state mismatch");
+        mem.Formats.Clear();
+        mem.Formats[CF_DIB] = dibLegacySample;
+        mem.Seq++;
+        if (!WriteClipTextCore(st, mem, "voice_dib_only", true, armFn, stopFn)) throw new InvalidOperationException("step2d dib fallback write failed");
+        FlushClipRestoreCore(st, mem, null, stopFn);
+        if (st.SavedClip != null || !mem.Formats.ContainsKey(CF_DIB))
+            throw new InvalidOperationException("step2d CF_DIB fallback restore failed");
+        mem.Formats.Clear();
+        mem.Formats[mem.FormatPng] = png0;
+        mem.Formats[CF_UNICODETEXT] = EncodeUnicodeClipBytes("orig_caption");
+        mem.Seq++;
 
         // 2. User manual Ctrl+C during 250ms window is never overwritten by timer OR subsequent #2
         WriteClipTextCore(st, mem, "voice_three", true, armFn, stopFn);
         mem.SimulateUserCopy(CF_UNICODETEXT, EncodeUnicodeClipBytes("user_manual_copy"));
         FlushClipRestoreCore(st, mem, null, stopFn);
-        if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "user_manual_copy" || mem.Formats.ContainsKey(mem.FormatPng)) throw new InvalidOperationException("step3 clobbered user copy");
+        if (st.SavedClip != null || DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "user_manual_copy" || mem.Formats.ContainsKey(mem.FormatPng)) throw new InvalidOperationException("step3 clobbered user copy");
 
         WriteClipTextCore(st, mem, "voice_four_a", true, armFn, stopFn);
         mem.SimulateUserCopy(CF_UNICODETEXT, EncodeUnicodeClipBytes("user_copy_between_bursts"));
         WriteClipTextCore(st, mem, "voice_four_b", true, armFn, stopFn);
         FlushClipRestoreCore(st, mem, null, stopFn);
-        if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "user_copy_between_bursts") throw new InvalidOperationException("step3b burst did not re-baseline user copy");
+        if (st.SavedClip != null || DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "user_copy_between_bursts") throw new InvalidOperationException("step3b burst did not re-baseline user copy");
 
         // 3. Focus-drift persistent fallback cancels pending timer and omits exclusion markers
         mem.SimulateUserCopy(mem.FormatPng, png0);
         WriteClipTextCore(st, mem, "voice_five", true, armFn, stopFn);
         WriteClipTextCore(st, mem, "fallback_keep_me", false, armFn, stopFn);
-        if (st.RestorePending || mem.Formats.ContainsKey(mem.FormatExcludeMonitor) || mem.Formats.ContainsKey(mem.FormatCanHistory) || mem.Formats.ContainsKey(mem.FormatAviTransient)) throw new InvalidOperationException("step4 fallback kept transient markers");
+        if (st.RestorePending || st.SavedClip != null || mem.Formats.ContainsKey(mem.FormatExcludeMonitor) || mem.Formats.ContainsKey(mem.FormatCanHistory) || mem.Formats.ContainsKey(mem.FormatAviTransient)) throw new InvalidOperationException("step4 fallback kept transient markers");
         FlushClipRestoreCore(st, mem, null, stopFn);
         if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "fallback_keep_me") throw new InvalidOperationException("step4 fallback wiped");
 
@@ -2151,19 +2181,19 @@ public static class VoiceWinShim {
             mem.Seq++;
             WriteClipTextCore(st, mem, "voice_six", true, armFn, stopFn);
             FlushClipRestoreCore(st, mem, null, stopFn);
-            if (mem.Formats.Count != 0) throw new InvalidOperationException("step5 password secret not cleared for fmt " + pwFmt);
+            if (st.SavedClip != null || mem.Formats.Count != 0) throw new InvalidOperationException("step5 password secret not cleared for fmt " + pwFmt);
         }
 
-        // 5. Oversize (>20MB) or hung owner -> Unrestorable, and #2 burst does not snapshot #1's transient text
+        // 5. Oversize (>100MiB) or hung owner -> Unrestorable, and #2 burst does not snapshot #1's transient text
         mem.Formats.Clear();
         mem.Formats[mem.FormatPng] = png0;
         mem.OversizeFmt = (int)mem.FormatPng;
         mem.Seq++;
         WriteClipTextCore(st, mem, "voice_seven", true, armFn, stopFn);
         mem.OversizeFmt = 0;
-        if (st.RestorePending) throw new InvalidOperationException("step6 oversize armed restore");
+        if (st.RestorePending || st.SavedClip != null) throw new InvalidOperationException("step6 oversize armed restore");
         WriteClipTextCore(st, mem, "voice_seven_b", true, armFn, stopFn);
-        if (st.RestorePending) throw new InvalidOperationException("step6b burst after oversize armed restore");
+        if (st.RestorePending || st.SavedClip != null) throw new InvalidOperationException("step6b burst after oversize armed restore");
         FlushClipRestoreCore(st, mem, null, stopFn);
         if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "voice_seven_b") throw new InvalidOperationException("step6 oversize wiped clipboard");
 
@@ -2173,7 +2203,7 @@ public static class VoiceWinShim {
         mem.Seq++;
         WriteClipTextCore(st, mem, "voice_eight", true, armFn, stopFn);
         mem.Hung = false;
-        if (st.RestorePending) throw new InvalidOperationException("step7 hung owner armed restore");
+        if (st.RestorePending || st.SavedClip != null) throw new InvalidOperationException("step7 hung owner armed restore");
     }
 
     public static void StopHook() {
