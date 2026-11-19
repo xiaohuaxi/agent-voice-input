@@ -31,7 +31,52 @@ from typing import Any, BinaryIO, Callable, Collection, Iterable, Iterator, Mapp
 import urllib.parse
 import uuid
 
-from ._remote_probe import trim_turns_chunk_aligned
+from ._remote_probe import (
+    DEFAULT_REFINER_CHUNK_CHARS,
+    DEFAULT_REFINER_CONTEXT_MAX_CHARS,
+    MAX_LINE_BYTES,
+    _AGY_WS_CWD_RE,
+    _BROAD_SYSTEM_DIRS_LOW,
+    _CLAUDE_VER_COMM_RE,
+    _FULL_UUID_RE,
+    _HASH_TAG_RE,
+    _REPO_CORE_EXTS,
+    _REPO_PRIORITY_ROOTS,
+    _REPO_SKIP_BASES,
+    _REPO_SKIP_DIRS,
+    _REPO_TEST_FILE_RE,
+    _SHALLOW_DOC_AND_CODE_EXTS,
+    _SHALLOW_SKIP_BASES_LOW,
+    _SHALLOW_SKIP_DIRS_LOW,
+    _STRICT_UUID_RE,
+    _clean_agy_record,
+    _clean_claude_record,
+    _extract_agy_compaction_summary,
+    _extract_agy_cwd,
+    _extract_claude_cmdline_sid,
+    _extract_claude_message_text,
+    _extract_codex_compacted_turns,
+    _extract_codex_item_completed,
+    _extract_codex_response_item,
+    _is_agy_subagent,
+    _is_claude_sidechain_or_subagent,
+    _is_flock_held,
+    _is_headless_cli,
+    _is_path_under_dir,
+    _is_script_interpreter_token,
+    _load_codex_thread_names,
+    _ordered_clis,
+    _read_bounded_line,
+    _read_claude_root_meta,
+    _read_codex_root_meta,
+    _read_proc_cmdline_args,
+    _read_proc_comm,
+    _read_proc_ppid,
+    _readlink_clean,
+    _resolve_agy_transcript_path,
+    _safe_mtime,
+    trim_turns_chunk_aligned,
+)
 from ._tmux import (
     _MAX_TMUX_SOCKET_TARGETS,
     _TMUX_PANE_ID_RE,
@@ -63,8 +108,8 @@ from .remote_ssh import (
     strip_host_tags_from_title,
 )
 
-MAX_META_LINE_BYTES = 16 * 1024 * 1024  # 16 MiB safety cap per metadata/ingest line
-MAX_INGEST_LINE_BYTES = 16 * 1024 * 1024
+MAX_META_LINE_BYTES = MAX_LINE_BYTES  # 16 MiB safety cap per metadata/ingest line
+MAX_INGEST_LINE_BYTES = MAX_LINE_BYTES
 _REG_SID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{0,56}$")
 
 # ---------------------------------------------------------------------------
@@ -74,9 +119,6 @@ _REG_SID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{0,56}$")
 _PREFIXED_TAG_RE = re.compile(
     r"\[(agy|claude|codex):#?([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{8,36})\]",
     re.IGNORECASE,
-)
-_HASH_TAG_RE = re.compile(
-    r"\[[#§]([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{6,36})\](?=$|[^0-9A-Za-z_])"
 )
 _WIN_EXPLICIT_NON_WSL_TITLE_RE = re.compile(
     r"^(?:Administrator:\s+|管理员:\s*)?(?:Command Prompt|命令提示符|PS\s+[A-Za-z]:\\|[A-Za-z]:\\)",
@@ -92,12 +134,6 @@ _GENERIC_LOCAL_TERM_TITLE_RE = re.compile(
     r"(?:\s*(?:[—–-]|\s)\s*\d+\s*[×x]\s*\d+)?\s*$",
     re.IGNORECASE,
 )
-_FULL_UUID_RE = re.compile(
-    r"(?:^|[^0-9a-fA-F-])([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?=$|[^0-9a-fA-F-])"
-)
-_STRICT_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
 # Strict word boundaries excluding '/' and '-' so paths/branches like feat/codex-config do not match
 _WORD_CLI_RE = re.compile(
     r"(?:^|[\s\[\(\{·|:])(agy|antigravity|claude|codex)(?=$|[\s\]\)\}·|:])",
@@ -109,9 +145,6 @@ _WORD_TMUX_RE = re.compile(
 )
 _TUI_SPINNER_RE = re.compile(r"[\u2733\u2800-\u28ff]")
 _CTRL_STRIP_RE = re.compile(r"[\x00-\x1f\x7f]")
-_CLAUDE_VER_COMM_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
-_PYTHON_COMM_RE = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
-_INTERP_COMMS = frozenset({"node", "nodejs", "bun", "deno"})
 
 
 def _build_generic_pane_titles() -> frozenset[str]:
@@ -291,10 +324,6 @@ def parse_window_title_hint(window_title: str) -> TitleHint | None:
 # Root-session predicates, TTY/CWD normalization & process helpers
 # ---------------------------------------------------------------------------
 
-_AGY_WS_CWD_RE = re.compile(
-    r"(?:Command Working Directory:\s*|Active Workspaces:\s*\r?\n-\s*)(/[^\r\n<]+)"
-)
-
 
 def normalize_tty_path(raw_tty: str) -> str:
     """Normalize a TTY name or path (e.g. ``ttys019`` -> ``/dev/ttys019``), excluding ``?``/``??``."""
@@ -385,112 +414,6 @@ def encode_claude_project_dir(cwd: str) -> list[str]:
     return out
 
 
-def _safe_mtime(path: str | Path) -> float:
-    try:
-        return os.stat(path).st_mtime
-    except OSError:
-        return 0.0
-
-
-def _read_bounded_line(f: BinaryIO, max_bytes: int = MAX_META_LINE_BYTES) -> tuple[bytes, bool]:
-    """Read one ``\\n``-terminated line up to ``max_bytes``; drain remainder if exceeded."""
-    line = f.readline(max_bytes + 1)
-    if not line:
-        return b"", False
-    if len(line) <= max_bytes or line.endswith(b"\n"):
-        return line, False
-    # Drain rest of oversized single line until '\n' or EOF
-    while True:
-        chunk = f.readline(65536)
-        if not chunk or chunk.endswith(b"\n"):
-            break
-    return line[:max_bytes], True
-
-
-def _read_codex_root_meta(jsonl_path: str | Path) -> tuple[bool, str, str]:
-    """Return ``(is_root_cli, session_id, cwd)`` from line 1 of a Codex rollout JSONL."""
-    try:
-        with open(jsonl_path, "rb") as f:
-            first_line, exceeded = _read_bounded_line(f)
-    except OSError:
-        return False, "", ""
-    if not first_line or exceeded:
-        return False, "", ""
-    try:
-        obj = json.loads(first_line.decode("utf-8", errors="replace"))
-    except ValueError:
-        return False, "", ""
-    if not isinstance(obj, dict) or obj.get("type") != "session_meta":
-        return False, "", ""
-    payload = obj.get("payload")
-    if not isinstance(payload, dict):
-        return False, "", ""
-    is_cli = payload.get("source") == "cli"
-    sid = str(payload.get("id") or payload.get("session_id") or "").strip().lower()
-    cwd = _normalize_cwd(str(payload.get("cwd") or ""))
-    return is_cli, sid, cwd
-
-
-_SIDECHAIN_TRUE_RE = re.compile(rb'"isSidechain"\s*:\s*true\b')
-_SIDECHAIN_FALSE_RE = re.compile(rb'"isSidechain"\s*:\s*false\b')
-_CLAUDE_SUBAGENT_HEAD_RE = re.compile(
-    rb'"(?:agentId|agent_id)"\s*:\s*"[^"]+"|"entrypoint"\s*:\s*"sdk-cli"'
-)
-
-
-def _read_claude_root_meta(
-    jsonl_path: str | Path,
-    *,
-    allow_empty_or_meta_only: bool = False,
-) -> tuple[bool, str, str]:
-    """Return ``(is_root_not_sidechain, session_id, cwd)`` for a Claude Code JSONL."""
-    p = Path(jsonl_path)
-    if p.name.lower().startswith("agent-"):
-        return False, "", ""
-    fallback_sid = p.stem.lower()
-    last_cwd = ""
-    last_sid = fallback_sid
-    try:
-        with open(p, "rb") as f:
-            checked_records = 0
-            while checked_records < 30:
-                raw, exceeded = _read_bounded_line(f)
-                if not raw:
-                    break
-                if not raw.strip():
-                    continue
-                if exceeded:
-                    # Oversized attachment/image line: inspect head bytes without burning quota
-                    if _SIDECHAIN_TRUE_RE.search(raw) or _CLAUDE_SUBAGENT_HEAD_RE.search(raw):
-                        return False, "", ""
-                    if _SIDECHAIN_FALSE_RE.search(raw):
-                        return True, last_sid, last_cwd
-                    continue
-                checked_records += 1
-                try:
-                    obj = json.loads(raw.decode("utf-8", errors="replace"))
-                except ValueError:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                if obj.get("agentId") or obj.get("agent_id") or obj.get("entrypoint") == "sdk-cli":
-                    return False, "", ""
-                if isinstance(obj.get("sessionId"), str) and obj["sessionId"].strip():
-                    last_sid = obj["sessionId"].strip().lower()
-                if isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
-                    last_cwd = _normalize_cwd(obj["cwd"])
-                if "isSidechain" in obj or obj.get("type") in ("user", "assistant"):
-                    if bool(obj.get("isSidechain")):
-                        return False, "", ""
-                    return True, last_sid, last_cwd
-    except OSError:
-        return False, "", ""
-
-    if allow_empty_or_meta_only:
-        return True, last_sid, last_cwd
-    return False, "", ""
-
-
 def _default_agy_expected_transcript_path(home: Path, cid: str) -> Path:
     return (
         home
@@ -504,17 +427,6 @@ def _default_agy_expected_transcript_path(home: Path, cid: str) -> Path:
     )
 
 
-def _resolve_agy_transcript_path(home: Path, cid: str) -> Path | None:
-    logs_dir = home / ".gemini" / "antigravity-cli" / "brain" / cid / ".system_generated" / "logs"
-    full_p = logs_dir / "transcript_full.jsonl"
-    if full_p.is_file():
-        return full_p
-    compact_p = logs_dir / "transcript.jsonl"
-    if compact_p.is_file():
-        return compact_p
-    return None
-
-
 def _upgrade_agy_transcript_path(path_str: str) -> str:
     if not path_str:
         return path_str
@@ -526,91 +438,12 @@ def _upgrade_agy_transcript_path(path_str: str) -> str:
     return str(p)
 
 
-def _is_agy_transcript_subagent(jsonl_path: str | Path) -> bool:
-    """Inspect ONLY the first JSONL record to distinguish agy subagents from main sessions.
-
-    Main sessions begin with ``USER_EXPLICIT`` (or ``SYSTEM``/``CHECKPOINT`` / ``CONVERSATION_HISTORY``).
-    Subagents begin with a ``SYSTEM``/``SYSTEM_MESSAGE`` (or ``EPHEMERAL_MESSAGE``) carrying a
-    routed ``[Message] timestamp=... sender=...`` payload or ``<subagent_reminder>``.
-    Later records are never scanned so reading code/specs mentioning subagents cannot false-fire.
-    """
-    try:
-        with open(jsonl_path, "rb") as f:
-            while True:
-                line, exceeded = _read_bounded_line(f)
-                if not line:
-                    return False
-                if line.strip():
-                    break
-    except OSError:
-        return False
-
-    if exceeded:
-        return False
-
-    try:
-        obj = json.loads(line.decode("utf-8", errors="replace"))
-    except ValueError:
-        return False
-    if not isinstance(obj, dict):
-        return False
-
-    src = obj.get("source")
-    typ = obj.get("type")
-    if src == "USER_EXPLICIT":
-        content = str(obj.get("content") or "").lstrip()
-        if content.startswith("<USER_REQUEST>"):
-            content = content[len("<USER_REQUEST>") :].lstrip()
-        # Exclude headless delegated agy-run worker sessions
-        if content.startswith("[agy-run]"):
-            return True
-        return False
-    if src == "SYSTEM" and typ in ("CHECKPOINT", "CONVERSATION_HISTORY"):
-        return False
-    if src == "SYSTEM" and typ in ("SYSTEM_MESSAGE", "EPHEMERAL_MESSAGE"):
-        content = str(obj.get("content") or "")
-        if ("[Message] timestamp=" in content and "sender=" in content) or (
-            "<subagent_reminder>" in content or "invoked by a caller agent" in content
-        ):
-            return True
-    return False
-
-
-def _extract_agy_transcript_cwd(jsonl_path: str | Path) -> str:
-    try:
-        with open(jsonl_path, "rb") as f:
-            for _ in range(8):
-                raw, exceeded = _read_bounded_line(f)
-                if not raw:
-                    break
-                if exceeded or not raw.strip():
-                    continue
-                try:
-                    obj = json.loads(raw.decode("utf-8", errors="replace"))
-                except ValueError:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                if isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
-                    return _normalize_cwd(obj["cwd"])
-                content = obj.get("content")
-                if isinstance(content, str) and (
-                    "Working Directory:" in content or "Active Workspaces:" in content
-                ):
-                    m = _AGY_WS_CWD_RE.search(content)
-                    if m:
-                        return _normalize_cwd(m.group(1))
-    except OSError:
-        pass
-    return ""
+_is_agy_transcript_subagent = _is_agy_subagent
+_extract_agy_transcript_cwd = _extract_agy_cwd
 
 
 def _split_cmdline(raw_args: str) -> list[str]:
     return (raw_args or "").split()
-
-
-def _is_script_interpreter_token(tok_low: str) -> bool:
-    return bool(tok_low and (tok_low in _INTERP_COMMS or _PYTHON_COMM_RE.match(tok_low)))
 
 
 def _match_cli_process(comm: str, argv: Sequence[str]) -> tuple[str | None, list[str]]:
@@ -852,80 +685,7 @@ def _query_pids_codex_rollout_paths(
     return out
 
 
-def _read_proc_cmdline_args(proc_pid_dir: Path) -> list[str]:
-    try:
-        raw_cmd = (proc_pid_dir / "cmdline").read_bytes()
-    except OSError:
-        return []
-    return [a.decode("utf-8", errors="ignore") for a in raw_cmd.split(b"\x00") if a]
-
-
-def _is_headless_cli_invocation(cli_kind: str, args: Sequence[str]) -> bool:
-    """Return True when ``cmdline`` belongs to a headless/delegated CLI worker (e.g. -p, exec-server, acp, mcp)."""
-    if not args:
-        return False
-    tail = args[1:]
-    if cli_kind in ("agy", "claude"):
-        value_flags = {
-            "-m", "--model", "--agent", "--agents", "--effort", "--mode",
-            "--permission-mode", "--project", "--conversation", "--session-id",
-            "--resume", "-r", "--add-dir", "--settings", "--setting-sources",
-            "--mcp-config", "--json-schema", "--log-file", "--print-timeout",
-            "-i", "--prompt-interactive", "--system-prompt", "--append-system-prompt",
-            "--fallback-model", "--max-turns", "--max-budget-usd", "--tools",
-            "--allowedTools", "--disallowedTools", "-w", "--worktree",
-        }
-        skip_next = False
-        saw_subcmd = False
-        for a in tail:
-            if a == "--":
-                break
-            if a in ("-p", "--print", "--prompt", "--input-format", "--output-format"):
-                return True
-            if a.startswith(("--prompt=", "--input-format=", "--output-format=")):
-                return True
-            if skip_next:
-                skip_next = False
-                if not a.startswith("-"):
-                    continue
-            if a in value_flags:
-                skip_next = True
-                continue
-            if a.startswith("-"):
-                continue
-            if not saw_subcmd:
-                saw_subcmd = True
-                if cli_kind == "agy" and a == "acp":
-                    return True
-                if cli_kind == "claude" and a == "mcp":
-                    return True
-        return False
-    if cli_kind == "codex":
-        skip_next = False
-        value_flags = {
-            "-m", "--model", "-c", "--config", "-C", "--cd", "-p", "--profile",
-            "-s", "--sandbox", "-a", "--ask-for-approval", "-i", "--image",
-            "--disable", "--enable", "--add-dir", "-o", "--output-last-message",
-            "--output-schema", "--color", "--local-provider", "-w", "--writable-root",
-        }
-        for a in tail:
-            if skip_next:
-                skip_next = False
-                continue
-            if a == "--":
-                break
-            if a in value_flags:
-                skip_next = True
-                continue
-            if a.startswith("-"):
-                continue
-            if a in (
-                "exec", "e", "exec-server", "app-server", "mcp-server",
-                "completion", "debug", "cloud", "apply",
-            ):
-                return True
-            break
-    return False
+_is_headless_cli_invocation = _is_headless_cli
 
 
 def _classify_interactive_cli(comm: str, argv: Sequence[str]) -> str | None:
@@ -982,40 +742,7 @@ def _collect_open_agy_presence_cids(
     return saw_agy, open_locks
 
 
-def is_agy_presence_lock_held_nonproc(lock_path: Path) -> bool:
-    """On platforms without ``/proc`` (macOS), verify ``presence/<cid>.lock`` is actively flocked.
-
-    Uses non-blocking shared lock ``LOCK_SH | LOCK_NB`` on ``O_RDONLY`` so read-only probes
-    still conflict with ``agy``'s exclusive ``LOCK_EX`` while never blocking each other or
-    contending for write ownership on stale lock files.
-    """
-    if not lock_path.is_file():
-        return False
-    fd = -1
-    try:
-        fd = os.open(str(lock_path), os.O_RDONLY)
-    except OSError:
-        return False
-
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        except OSError as exc:
-            return exc.errno in (errno.EAGAIN, errno.EACCES)
-        else:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            return False
-    finally:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+is_agy_presence_lock_held_nonproc = _is_flock_held
 
 
 def _resolve_valid_agy_root_meta(
@@ -1076,23 +803,6 @@ def _iter_numeric_proc_dirs(proc_root: Path) -> list[Path]:
     return out
 
 
-def _read_proc_comm(proc_pid_dir: Path) -> str:
-    try:
-        return (proc_pid_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
-        return ""
-
-
-def _readlink_clean(path: Path) -> str:
-    try:
-        target = os.readlink(path)
-    except OSError:
-        return ""
-    if target.endswith(" (deleted)"):
-        return ""
-    return target
-
-
 def _read_proc_cwd(proc_pid_dir: Path) -> str:
     return _normalize_cwd(_readlink_clean(proc_pid_dir / "cwd"))
 
@@ -1137,44 +847,6 @@ def _read_proc_tty_path(proc_pid_dir: Path) -> str:
 def _read_proc_pts_mtime(proc_pid_dir: Path) -> float:
     tty_path = _read_proc_tty_path(proc_pid_dir)
     return _safe_mtime(tty_path) if tty_path else 0.0
-
-
-def _load_codex_thread_names(home: Path) -> dict[str, str]:
-    idx_file = home / ".codex" / "session_index.jsonl"
-    mapping: dict[str, str] = {}
-    if not idx_file.is_file():
-        return mapping
-    try:
-        with open(idx_file, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                s = line.strip()
-                if not s:
-                    continue
-                try:
-                    obj = json.loads(s)
-                except ValueError:
-                    continue
-                if isinstance(obj, dict):
-                    sid = str(obj.get("id") or "").strip().lower()
-                    tname = str(obj.get("thread_name") or "").strip()
-                    if sid and tname:
-                        mapping[sid] = tname
-    except OSError:
-        pass
-    return mapping
-
-
-def _read_proc_ppid(proc_pid_dir: Path) -> int:
-    try:
-        stat_txt = (proc_pid_dir / "stat").read_text(encoding="utf-8", errors="replace")
-        rpar = stat_txt.rfind(")")
-        if rpar != -1:
-            fields_after = stat_txt[rpar + 2 :].split()
-            if len(fields_after) >= 2:
-                return int(fields_after[1])
-    except (OSError, ValueError):
-        pass
-    return 0
 
 
 def _read_proc_stat_state_pgrp_tpgid(proc_pid_dir: Path) -> tuple[str, int, int]:
@@ -1247,36 +919,6 @@ def _collect_live_cli_pids(proc_root: Path, allowed_pids: set[int]) -> dict[str,
         if cli is not None:
             out.setdefault(cli, set()).add(pid)
     return out
-
-
-def _extract_claude_cmdline_sid(proc_pid_dir: Path) -> str:
-    args = _read_proc_cmdline_args(proc_pid_dir)
-    return _extract_claude_sid_from_argv(args)
-
-
-def _extract_claude_sid_from_argv(args: Sequence[str]) -> str:
-    for i, a in enumerate(args):
-        if a == "--":
-            break
-        if a in ("--session-id", "--resume", "-r") and i + 1 < len(args):
-            cand = args[i + 1].strip().lower()
-            if _STRICT_UUID_RE.match(cand):
-                return cand
-        for pfx in ("--session-id=", "--resume="):
-            if a.startswith(pfx):
-                cand = a[len(pfx) :].strip().lower()
-                if _STRICT_UUID_RE.match(cand):
-                    return cand
-    return ""
-
-
-def _is_path_under_dir(target_path: str | Path, root_dir: Path) -> bool:
-    try:
-        real_target = os.path.realpath(target_path)
-        real_root = os.path.realpath(root_dir)
-    except OSError:
-        return False
-    return real_target == real_root or real_target.startswith(real_root.rstrip(os.sep) + os.sep)
 
 
 def _dir_basename_in_title(window_title: str, dir_path: str) -> bool:
@@ -2083,13 +1725,6 @@ def write_session_registry_entry(
     return target
 
 
-def _ordered_clis(preferred: str | None) -> tuple[str, ...]:
-    all_clis = ("codex", "claude", "agy")
-    if preferred in all_clis:
-        return (preferred, *[c for c in all_clis if c != preferred])
-    return all_clis
-
-
 def _iter_trusted_registry_records(
     runtime_dirs: Sequence[Path],
     pattern: str = "*.json",
@@ -2768,265 +2403,6 @@ def _scan_nonproc_fallback_sessions(
 
 
 # ---------------------------------------------------------------------------
-# Per-CLI JSONL strict whitelist cleaners
-# ---------------------------------------------------------------------------
-
-_AGY_TRAILING_META_RE = re.compile(
-    r"\n<(?:ADDITIONAL_METADATA|SKILL|USER_SETTINGS_CHANGE)\b.*",
-    re.DOTALL,
-)
-
-# Negative backtick lookarounds prevent inline-code mentions like `<system-reminder>`
-# from wiping prose between two code spans.
-_CLAUDE_SYSTEM_REMINDER_RE = re.compile(
-    r"(?<!`)<system-reminder>(?!`).*?(?<!`)</system-reminder>(?!`)",
-    re.DOTALL | re.IGNORECASE,
-)
-_CLAUDE_USER_STRIP_PATTERNS: tuple[re.Pattern[str], ...] = (
-    _CLAUDE_SYSTEM_REMINDER_RE,
-    re.compile(
-        r"(?<!`)<task-notification>(?!`).*?(?<!`)</task-notification>(?!`)",
-        re.DOTALL | re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?<!`)<(local-command-[a-zA-Z0-9_-]+)(?:\s[^>]*)?>(?!`).*?(?<!`)</\1>(?!`)",
-        re.DOTALL | re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?<!`)<(command-[a-zA-Z0-9_-]+)(?:\s[^>]*)?>(?!`).*?(?<!`)</\1>(?!`)",
-        re.DOTALL | re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?<!`)<(bash-[a-zA-Z0-9_-]+)(?:\s[^>]*)?>(?!`).*?(?<!`)</\1>(?!`)",
-        re.DOTALL | re.IGNORECASE,
-    ),
-)
-_CLAUDE_USER_ORPHAN_TAG_RE = re.compile(
-    r"(?<!`)</?(?:task-notification|system-reminder|local-command-[a-zA-Z0-9_-]+|command-[a-zA-Z0-9_-]+|bash-[a-zA-Z0-9_-]+)(?:\s[^>]*)?>(?!`)",
-    re.IGNORECASE,
-)
-
-_CODEX_ENV_CTX_RE = re.compile(
-    r"<environment_context>.*?</environment_context>", re.DOTALL | re.IGNORECASE
-)
-_CODEX_PERM_CTX_RE = re.compile(
-    r"<permissions instructions>.*?</permissions instructions>", re.DOTALL | re.IGNORECASE
-)
-_CODEX_REC_PLUGINS_RE = re.compile(
-    r"<recommended_plugins>.*?</recommended_plugins>", re.DOTALL | re.IGNORECASE
-)
-_AGY_CHECKPOINT_PREAMBLE_RE = re.compile(
-    r"^\s*#\s*Resuming from a compaction\b.*?progress summary below:\s*",
-    re.DOTALL | re.IGNORECASE,
-)
-_AGY_CHECKPOINT_TAIL_RE = re.compile(
-    r"\n#\s*(?:Subagents|Conversation Logs)\b.*",
-    re.DOTALL,
-)
-
-
-def _extract_agy_compaction_summary(obj: Mapping[str, Any]) -> str | None:
-    """Return cleaned summary string when ``obj`` is an ``agy`` compaction ``CHECKPOINT`` record."""
-    if obj.get("source") != "SYSTEM" or obj.get("type") != "CHECKPOINT":
-        return None
-    raw = obj.get("content")
-    if not isinstance(raw, str):
-        return ""
-    cleaned = _AGY_CHECKPOINT_PREAMBLE_RE.sub("", raw)
-    cleaned = _AGY_CHECKPOINT_TAIL_RE.sub("", cleaned).strip()
-    return cleaned
-
-
-def _clean_agy_record(obj: Mapping[str, Any]) -> tuple[str, str] | None:
-    src = obj.get("source")
-    typ = obj.get("type")
-    if src == "USER_EXPLICIT" and typ == "USER_INPUT":
-        raw = obj.get("content")
-        if not isinstance(raw, str) or not raw.strip():
-            return None
-        trimmed = _AGY_TRAILING_META_RE.sub("", raw).strip()
-        open_tag = "<USER_REQUEST>"
-        close_tag = "</USER_REQUEST>"
-        start = trimmed.find(open_tag)
-        end = trimmed.rfind(close_tag)
-        if 0 <= start < end:
-            text = trimmed[start + len(open_tag) : end].strip()
-        else:
-            text = trimmed
-        return ("user", text) if text else None
-
-    if src == "MODEL" and typ == "PLANNER_RESPONSE":
-        # Strictly ignore MODEL:GENERIC, VIEW_FILE, CODE_ACTION, thinking, and tool_calls.
-        raw = obj.get("content")
-        if not isinstance(raw, str) or not raw.strip():
-            return None
-        return ("assistant", raw.strip())
-
-    return None
-
-
-def _clean_claude_text(raw: str, *, role: str) -> str:
-    s = raw
-    if role == "user":
-        for pat in _CLAUDE_USER_STRIP_PATTERNS:
-            s = pat.sub("", s)
-        s = _CLAUDE_USER_ORPHAN_TAG_RE.sub("", s)
-    else:
-        s = _CLAUDE_SYSTEM_REMINDER_RE.sub("", s)
-    return s.strip()
-
-
-def _is_claude_sidechain_or_subagent(obj: Mapping[str, Any]) -> bool:
-    return bool(
-        obj.get("isSidechain")
-        or obj.get("agentId")
-        or obj.get("agent_id")
-        or obj.get("entrypoint") == "sdk-cli"
-    )
-
-
-def _extract_claude_message_text(msg: Any, *, role: str) -> str:
-    if not isinstance(msg, Mapping):
-        return ""
-    content = msg.get("content")
-    raw_parts: list[str] = []
-    if isinstance(content, str):
-        raw_parts.append(content)
-    elif isinstance(content, list):
-        for block in content:
-            # Exclude tool_use, tool_result, thinking, redacted_thinking, image, etc.
-            if isinstance(block, dict) and block.get("type") == "text":
-                txt = block.get("text")
-                if isinstance(txt, str) and txt:
-                    raw_parts.append(txt)
-    if not raw_parts:
-        return ""
-    return _clean_claude_text("\n".join(raw_parts), role=role)
-
-
-def _clean_claude_record(obj: Mapping[str, Any]) -> tuple[str, str] | None:
-    if (
-        _is_claude_sidechain_or_subagent(obj)
-        or bool(obj.get("isMeta"))
-        or bool(obj.get("isApiErrorMessage"))
-    ):
-        return None
-    typ = obj.get("type")
-    if typ not in ("user", "assistant"):
-        return None
-    cleaned = _extract_claude_message_text(obj.get("message"), role=typ)
-    if not cleaned:
-        return None
-    return (typ, cleaned)
-
-
-def _extract_codex_item_completed(payload: Mapping[str, Any]) -> tuple[str, str] | None:
-    item = payload.get("item")
-    if not isinstance(item, dict):
-        return None
-    itype = item.get("type")
-    if itype == "UserMessage":
-        role = "user"
-    elif itype == "AgentMessage":
-        role = "assistant"
-    else:
-        return None
-
-    chunks: list[str] = []
-    content = item.get("content")
-    if isinstance(content, list):
-        for c in content:
-            if isinstance(c, dict) and str(c.get("type") or "").lower() == "text":
-                t = c.get("text")
-                if isinstance(t, str) and t:
-                    chunks.append(t)
-    elif isinstance(item.get("text"), str):
-        chunks.append(item["text"])
-
-    joined = "\n".join(chunks).strip()
-    return (role, joined) if joined else None
-
-
-def _extract_codex_response_item(payload: Mapping[str, Any]) -> tuple[str, str] | None:
-    if payload.get("type") != "message":
-        return None
-    role = payload.get("role")
-    if role not in ("user", "assistant"):
-        return None
-    content = payload.get("content")
-    if not isinstance(content, list):
-        return None
-    chunks: list[str] = []
-    for c in content:
-        if not isinstance(c, dict):
-            continue
-        ctype = str(c.get("type") or "").lower()
-        if ctype not in ("input_text", "output_text", "text"):
-            continue
-        raw_txt = c.get("text")
-        if not isinstance(raw_txt, str) or not raw_txt.strip():
-            continue
-        s = raw_txt.strip()
-        if s.startswith("# AGENTS.md instructions"):
-            continue
-        s = _CODEX_ENV_CTX_RE.sub("", s)
-        s = _CODEX_PERM_CTX_RE.sub("", s)
-        s = _CODEX_REC_PLUGINS_RE.sub("", s).strip()
-        if not s or s.startswith(("# AGENTS.md instructions", "<recommended_plugins>")):
-            continue
-        chunks.append(s)
-    joined = "\n".join(chunks).strip()
-    return (role, joined) if joined else None
-
-
-def _extract_codex_compacted_turns(payload: Mapping[str, Any]) -> list[tuple[str, str]]:
-    """Extract post-compaction summary / retained turns & uncompacted suffix from a Codex ``compacted`` record."""
-    retained_turns: list[tuple[str, str]] = []
-    rc = payload.get("retained_context")
-    if isinstance(rc, Mapping):
-        ordered: list[tuple[int, int, str, str]] = []
-        seq = 0
-        for key, role in (("user_messages", "user"), ("assistant_messages", "assistant")):
-            items = rc.get(key)
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if not isinstance(item, Mapping):
-                    continue
-                txt = item.get("text")
-                if not isinstance(txt, str) or not txt.strip():
-                    continue
-                raw_ord = item.get("order")
-                ord_val = int(raw_ord) if isinstance(raw_ord, int) and not isinstance(raw_ord, bool) else (1_000_000 + seq)
-                ordered.append((ord_val, seq, role, txt.strip()))
-                seq += 1
-        ordered.sort(key=lambda t: (t[0], t[1]))
-        retained_turns = [(r, txt) for _, _, r, txt in ordered]
-
-    rh_turns: list[tuple[str, str]] = []
-    rh = payload.get("replacement_history")
-    if isinstance(rh, list):
-        for item in rh:
-            if isinstance(item, Mapping):
-                turn = _extract_codex_response_item(item)
-                if turn is not None:
-                    rh_turns.append(turn)
-
-    out: list[tuple[str, str]] = []
-    raw_msg = payload.get("message")
-    summary_txt = raw_msg.strip() if isinstance(raw_msg, str) else ""
-    if summary_txt and (not rh_turns or rh_turns[-1][1] != summary_txt):
-        out.append(("assistant", summary_txt))
-
-    out.extend(retained_turns)
-    seen_retained = set(retained_turns)
-    for turn in rh_turns:
-        if turn not in seen_retained:
-            out.append(turn)
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Git status & technical identifier hotword extraction
 # ---------------------------------------------------------------------------
 
@@ -3067,20 +2443,6 @@ BUILTIN_AGENT_HOTWORDS: tuple[str, ...] = (
 )
 
 REPO_FILES_CACHE_TTL_SEC: float = 300.0
-_REPO_SKIP_DIRS = frozenset({
-    "node_modules", "vendor", "dist", "build", "out", "target", "third_party",
-    "docs", "doc", "examples", "fixtures", "testdata", "test", "tests",
-    "__tests__", "spec", "__pycache__", ".github", "migrations",
-})
-_REPO_SKIP_BASES = frozenset({
-    "__init__.py", "__main__.py", "conftest.py", "setup.py",
-    "index.ts", "index.js", "index.tsx", "mod.rs", "main.go", "package-lock.json",
-})
-_REPO_CORE_EXTS = frozenset(
-    ".py .ts .tsx .js .vue .svelte .go .rs .swift .sh .ps1 .kt .java .rb .c .cpp .h .toml .sql".split()
-)
-_REPO_TEST_FILE_RE = re.compile(r"^test_|(?:_test|\.test|\.spec)\.", re.IGNORECASE)
-_REPO_PRIORITY_ROOTS = frozenset({"src", "lib", "app", "pkg", "cmd", "internal"})
 
 
 def _dedupe_hotwords_ci(words: Sequence[str]) -> list[str]:
@@ -3215,12 +2577,6 @@ def _resolve_safe_local_dir(path_str: str, *, wsl: bool) -> str:
         return ""
 
 
-_BROAD_SYSTEM_DIRS_LOW: frozenset[str] = frozenset({
-    "/", "/tmp", "/private", "/private/tmp", "/var", "/private/var", "/users", "/home", "/root",
-    "/private/var/root", "/etc", "/private/etc", "/usr", "/system", "/library", "/applications", "/opt", "/mnt",
-})
-
-
 def _is_broad_or_unsafe_workspace_dir(dir_path: str, home: Path | None = None, *, wsl: bool = False) -> bool:
     norm = posixpath.normpath(_normalize_cwd(dir_path)) if dir_path else ""
     if not norm or norm == "." or norm.lower() in _BROAD_SYSTEM_DIRS_LOW:
@@ -3255,26 +2611,6 @@ def _is_inside_git_worktree(dir_path: str, *, home: Path | None = None, max_dept
             return False
         cur = parent
     return False
-
-
-_SHALLOW_SKIP_DIRS_LOW: frozenset[str] = frozenset(
-    d.lower()
-    for d in (
-        _REPO_SKIP_DIRS
-        | {
-            ".git", ".hg", ".svn", ".venv", "venv", "env", ".env", ".tox", ".mypy_cache",
-            ".pytest_cache", ".ruff_cache", ".next", ".nuxt", ".turbo", ".cache",
-            "coverage", "htmlcov", "Pods", "DerivedData", "Library", "Logs", "Temp", "tmp",
-        }
-    )
-)
-_SHALLOW_DOC_AND_CODE_EXTS: frozenset[str] = _REPO_CORE_EXTS | frozenset(
-    ".md .markdown .mdx .txt .rst .adoc .org .tex .pdf .doc .docx .xls .xlsx .ppt .pptx "
-    ".csv .tsv .json .jsonl .yaml .yml .xml .html .css .scss .ipynb .proto .graphql .prisma".split()
-)
-_SHALLOW_SKIP_BASES_LOW: frozenset[str] = frozenset(
-    b.lower() for b in (_REPO_SKIP_BASES | {".ds_store", "thumbs.db", "desktop.ini"})
-)
 
 
 def _file_stems_for_hotwords(filenames: Sequence[str], *, limit: int = 12) -> list[str]:
@@ -3987,10 +3323,6 @@ def extract_turn_hotwords(
                 if len(found) >= max_words:
                     return found
     return found
-
-
-DEFAULT_REFINER_CONTEXT_MAX_CHARS = 200000
-DEFAULT_REFINER_CHUNK_CHARS = DEFAULT_REFINER_CONTEXT_MAX_CHARS // 4
 
 
 def format_turns_text(turns: Sequence[tuple[str, str]], max_chars: int = 16000) -> str:

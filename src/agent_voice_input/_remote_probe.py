@@ -379,16 +379,16 @@ def _file_etag(path: str | Path) -> str:
 
 
 def _read_bounded_line(f: BinaryIO, max_bytes: int = MAX_LINE_BYTES) -> tuple[bytes, bool]:
+    """Read one ``\\n``-terminated line up to ``max_bytes``; drain remainder if exceeded."""
     line = f.readline(max_bytes + 1)
     if not line:
         return b"", False
-    if len(line) <= max_bytes:
+    if len(line) <= max_bytes or line.endswith(b"\n"):
         return line, False
-    if not line.endswith(b"\n"):
-        while True:
-            chunk = f.readline(65536)
-            if not chunk or chunk.endswith(b"\n"):
-                break
+    while True:
+        chunk = f.readline(65536)
+        if not chunk or chunk.endswith(b"\n"):
+            break
     return line[:max_bytes], True
 
 
@@ -436,6 +436,10 @@ def _readlink_clean(path: Path) -> str:
     return "" if t.endswith(" (deleted)") else t
 
 
+def _is_script_interpreter_token(tok_low: str) -> bool:
+    return bool(tok_low and (tok_low in _INTERP_COMMS or _PYTHON_COMM_RE.match(tok_low)))
+
+
 def _match_cli_process(comm: str, argv: Sequence[str]) -> tuple[str | None, list[str]]:
     args_list = list(argv)
     c_base = os.path.basename((comm or "").replace("\\", "/")).strip()
@@ -460,9 +464,7 @@ def _match_cli_process(comm: str, argv: Sequence[str]) -> tuple[str | None, list
     if c_base and _CLAUDE_VER_COMM_RE.match(c_base) and "claude" in a0_norm_low:
         return "claude", args_list
 
-    if (c_low in _INTERP_COMMS or _PYTHON_COMM_RE.match(c_low)) or (
-        a0_low in _INTERP_COMMS or _PYTHON_COMM_RE.match(a0_low)
-    ):
+    if _is_script_interpreter_token(c_low) or _is_script_interpreter_token(a0_low):
         idx = 1
         limit = min(len(args_list), 12)
         while idx < limit:
@@ -564,16 +566,24 @@ def _is_headless_cli(cli_kind: str, args: Sequence[str]) -> bool:
     return False
 
 
-def _classify_proc_cli(pdir: Path) -> str | None:
+def _read_proc_comm(proc_pid_dir: Path) -> str:
     try:
-        comm = (pdir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+        return (proc_pid_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
-        comm = ""
+        return ""
+
+
+def _read_proc_cmdline_args(proc_pid_dir: Path) -> list[str]:
     try:
-        raw_cmd = (pdir / "cmdline").read_bytes()
-        argv = [a.decode("utf-8", errors="ignore") for a in raw_cmd.split(b"\x00") if a]
+        raw_cmd = (proc_pid_dir / "cmdline").read_bytes()
     except OSError:
-        argv = []
+        return []
+    return [a.decode("utf-8", errors="ignore") for a in raw_cmd.split(b"\x00") if a]
+
+
+def _classify_proc_cli(proc_pid_dir: Path) -> str | None:
+    comm = _read_proc_comm(proc_pid_dir)
+    argv = _read_proc_cmdline_args(proc_pid_dir)
     if not comm and not argv:
         return None
     cli_k, eff = _match_cli_process(comm, argv)
@@ -605,9 +615,9 @@ def _read_proc_tty_mtime(pdir: Path) -> float:
     return 0.0
 
 
-def _read_proc_ppid(pdir: Path) -> int:
+def _read_proc_ppid(proc_pid_dir: Path) -> int:
     try:
-        stat_txt = (pdir / "stat").read_text(encoding="utf-8", errors="replace")
+        stat_txt = (proc_pid_dir / "stat").read_text(encoding="utf-8", errors="replace")
         rpar = stat_txt.rfind(")")
         if rpar != -1:
             fields = stat_txt[rpar + 2 :].split()
@@ -633,11 +643,12 @@ def _read_codex_root_meta(jsonl_path: str | Path) -> tuple[bool, str, str]:
     if not isinstance(obj, dict) or obj.get("type") != "session_meta":
         return False, "", ""
     payload = obj.get("payload")
-    if not isinstance(payload, dict) or payload.get("source") != "cli":
+    if not isinstance(payload, dict):
         return False, "", ""
+    is_cli = payload.get("source") == "cli"
     sid = str(payload.get("id") or payload.get("session_id") or "").strip().lower()
     cwd = _normalize_cwd(str(payload.get("cwd") or ""))
-    return True, sid, cwd
+    return is_cli, sid, cwd
 
 
 def _read_claude_root_meta(
@@ -767,13 +778,21 @@ def _is_flock_held(lock_path: Path) -> bool:
     fd = -1
     try:
         fd = os.open(str(lock_path), os.O_RDONLY)
-        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
         return False
-    except BlockingIOError:
-        return True
-    except OSError as exc:
-        return exc.errno in (errno.EAGAIN, errno.EACCES)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError as exc:
+            return exc.errno in (errno.EAGAIN, errno.EACCES)
+        else:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            return False
     finally:
         if fd >= 0:
             try:
@@ -902,12 +921,7 @@ def _infer_cli_word(title: str) -> str | None:
     return "agy" if w in ("antigravity", "gemini") else w
 
 
-def _extract_claude_cmdline_sid(pdir: Path) -> str:
-    try:
-        raw_cmd = (pdir / "cmdline").read_bytes()
-        args = [a.decode("utf-8", errors="ignore") for a in raw_cmd.split(b"\x00") if a]
-    except OSError:
-        return ""
+def _extract_claude_sid_from_argv(args: Sequence[str]) -> str:
     for i, a in enumerate(args):
         if a == "--":
             break
@@ -921,6 +935,10 @@ def _extract_claude_cmdline_sid(pdir: Path) -> str:
                 if _STRICT_UUID_RE.match(cand):
                     return cand
     return ""
+
+
+def _extract_claude_cmdline_sid(proc_pid_dir: Path) -> str:
+    return _extract_claude_sid_from_argv(_read_proc_cmdline_args(proc_pid_dir))
 
 
 def _scan_proc_candidates(
@@ -1670,6 +1688,41 @@ def _resolve_remote_session(
 # ---------------------------------------------------------------------------
 
 
+def _extract_agy_compaction_summary(obj: Mapping[str, Any]) -> str | None:
+    """Return cleaned summary string when ``obj`` is an ``agy`` compaction ``CHECKPOINT`` record."""
+    if obj.get("source") != "SYSTEM" or obj.get("type") != "CHECKPOINT":
+        return None
+    raw = obj.get("content")
+    if not isinstance(raw, str):
+        return ""
+    cleaned = _AGY_CHECKPOINT_PREAMBLE_RE.sub("", raw)
+    return _AGY_CHECKPOINT_TAIL_RE.sub("", cleaned).strip()
+
+
+def _clean_agy_record(obj: Mapping[str, Any]) -> tuple[str, str] | None:
+    src = obj.get("source")
+    typ = obj.get("type")
+    if src == "USER_EXPLICIT" and typ == "USER_INPUT":
+        raw = obj.get("content")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        trimmed = _AGY_TRAILING_META_RE.sub("", raw).strip()
+        open_tag = "<USER_REQUEST>"
+        close_tag = "</USER_REQUEST>"
+        start = trimmed.find(open_tag)
+        end = trimmed.rfind(close_tag)
+        text = trimmed[start + len(open_tag) : end].strip() if 0 <= start < end else trimmed
+        return ("user", text) if text else None
+
+    if src == "MODEL" and typ == "PLANNER_RESPONSE":
+        raw = obj.get("content")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        return ("assistant", raw.strip())
+
+    return None
+
+
 def _clean_claude_text(raw: str, *, role: str) -> str:
     s = raw
     if role == "user":
@@ -1681,7 +1734,16 @@ def _clean_claude_text(raw: str, *, role: str) -> str:
     return s.strip()
 
 
-def _extract_claude_msg_text(msg: Any, *, role: str) -> str:
+def _is_claude_sidechain_or_subagent(obj: Mapping[str, Any]) -> bool:
+    return bool(
+        obj.get("isSidechain")
+        or obj.get("agentId")
+        or obj.get("agent_id")
+        or obj.get("entrypoint") == "sdk-cli"
+    )
+
+
+def _extract_claude_message_text(msg: Any, *, role: str) -> str:
     if not isinstance(msg, Mapping):
         return ""
     content = msg.get("content")
@@ -1697,7 +1759,51 @@ def _extract_claude_msg_text(msg: Any, *, role: str) -> str:
     return _clean_claude_text("\n".join(parts), role=role) if parts else ""
 
 
-def _extract_codex_resp_item(payload: Mapping[str, Any]) -> tuple[str, str] | None:
+_extract_claude_msg_text = _extract_claude_message_text
+
+
+def _clean_claude_record(obj: Mapping[str, Any]) -> tuple[str, str] | None:
+    if (
+        _is_claude_sidechain_or_subagent(obj)
+        or bool(obj.get("isMeta"))
+        or bool(obj.get("isApiErrorMessage"))
+    ):
+        return None
+    typ = obj.get("type")
+    if typ not in ("user", "assistant"):
+        return None
+    cleaned = _extract_claude_message_text(obj.get("message"), role=typ)
+    return (typ, cleaned) if cleaned else None
+
+
+def _extract_codex_item_completed(payload: Mapping[str, Any]) -> tuple[str, str] | None:
+    item = payload.get("item")
+    if not isinstance(item, dict):
+        return None
+    itype = item.get("type")
+    if itype == "UserMessage":
+        role = "user"
+    elif itype == "AgentMessage":
+        role = "assistant"
+    else:
+        return None
+
+    chunks: list[str] = []
+    content = item.get("content")
+    if isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and str(c.get("type") or "").lower() == "text":
+                t = c.get("text")
+                if isinstance(t, str) and t:
+                    chunks.append(t)
+    elif isinstance(item.get("text"), str):
+        chunks.append(item["text"])
+
+    joined = "\n".join(chunks).strip()
+    return (role, joined) if joined else None
+
+
+def _extract_codex_response_item(payload: Mapping[str, Any]) -> tuple[str, str] | None:
     if payload.get("type") != "message":
         return None
     role = payload.get("role")
@@ -1728,7 +1834,10 @@ def _extract_codex_resp_item(payload: Mapping[str, Any]) -> tuple[str, str] | No
     return (role, joined) if joined else None
 
 
-def _extract_codex_compacted(payload: Mapping[str, Any]) -> list[tuple[str, str]]:
+_extract_codex_resp_item = _extract_codex_response_item
+
+
+def _extract_codex_compacted_turns(payload: Mapping[str, Any]) -> list[tuple[str, str]]:
     retained: list[tuple[str, str]] = []
     rc = payload.get("retained_context")
     if isinstance(rc, Mapping):
@@ -1760,7 +1869,7 @@ def _extract_codex_compacted(payload: Mapping[str, Any]) -> list[tuple[str, str]
     if isinstance(rh, list):
         for item in rh:
             if isinstance(item, Mapping):
-                turn = _extract_codex_resp_item(item)
+                turn = _extract_codex_response_item(item)
                 if turn is not None:
                     rh_turns.append(turn)
 
@@ -1775,6 +1884,9 @@ def _extract_codex_compacted(payload: Mapping[str, Any]) -> list[tuple[str, str]
         if turn not in seen_ret:
             out.append(turn)
     return out
+
+
+_extract_codex_compacted = _extract_codex_compacted_turns
 
 
 def _clean_jsonl_file(
@@ -1872,45 +1984,19 @@ def _clean_jsonl_file(
                     discovered_cwd = _normalize_cwd(obj["cwd"])
 
                 if cli == "agy":
-                    if obj.get("source") == "SYSTEM" and obj.get("type") == "CHECKPOINT":
-                        raw_cp = obj.get("content")
-                        cp_txt = ""
-                        if isinstance(raw_cp, str):
-                            cp_txt = _AGY_CHECKPOINT_TAIL_RE.sub(
-                                "", _AGY_CHECKPOINT_PREAMBLE_RE.sub("", raw_cp)
-                            ).strip()
+                    cp_txt = _extract_agy_compaction_summary(obj)
+                    if cp_txt is not None:
                         turns.clear()
                         if cp_txt:
                             turns.append(("assistant", cp_txt))
                         compaction_count += 1
                         continue
-                    src, typ = obj.get("source"), obj.get("type")
-                    if src == "USER_EXPLICIT" and typ == "USER_INPUT":
-                        raw_u = obj.get("content")
-                        if isinstance(raw_u, str) and raw_u.strip():
-                            trimmed = _AGY_TRAILING_META_RE.sub("", raw_u).strip()
-                            s_idx = trimmed.find("<USER_REQUEST>")
-                            e_idx = trimmed.rfind("</USER_REQUEST>")
-                            txt_u = (
-                                trimmed[s_idx + 14 : e_idx].strip()
-                                if 0 <= s_idx < e_idx
-                                else trimmed
-                            )
-                            if txt_u:
-                                turns.append(("user", txt_u))
-                    elif src == "MODEL" and typ == "PLANNER_RESPONSE":
-                        raw_a = obj.get("content")
-                        if isinstance(raw_a, str) and raw_a.strip():
-                            turns.append(("assistant", raw_a.strip()))
+                    turn_agy = _clean_agy_record(obj)
+                    if turn_agy is not None:
+                        turns.append(turn_agy)
 
                 elif cli == "claude":
-                    is_sub = bool(
-                        obj.get("isSidechain")
-                        or obj.get("agentId")
-                        or obj.get("agent_id")
-                        or obj.get("entrypoint") == "sdk-cli"
-                    )
-                    if not is_sub:
+                    if not _is_claude_sidechain_or_subagent(obj):
                         if obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
                             turns.clear()
                             compaction_count += 1
@@ -1921,18 +2007,14 @@ def _clean_jsonl_file(
                             if not claude_just_compacted:
                                 compaction_count += 1
                             claude_just_compacted = False
-                            sum_t = _extract_claude_msg_text(obj.get("message"), role="user")
+                            sum_t = _extract_claude_message_text(obj.get("message"), role="user")
                             if sum_t:
                                 turns.append(("assistant", sum_t))
                             continue
-                    if is_sub or bool(obj.get("isMeta")) or bool(obj.get("isApiErrorMessage")):
-                        continue
-                    typ_cl = obj.get("type")
-                    if typ_cl in ("user", "assistant"):
-                        cl_txt = _extract_claude_msg_text(obj.get("message"), role=typ_cl)
-                        if cl_txt:
-                            claude_just_compacted = False
-                            turns.append((typ_cl, cl_txt))
+                    turn_cl = _clean_claude_record(obj)
+                    if turn_cl is not None:
+                        claude_just_compacted = False
+                        turns.append(turn_cl)
 
                 elif cli == "codex":
                     typ_cx = obj.get("type")
@@ -1941,45 +2023,25 @@ def _clean_jsonl_file(
                         if isinstance(pl.get("cwd"), str):
                             discovered_cwd = _normalize_cwd(pl["cwd"])
                     elif typ_cx == "compacted" and isinstance(pl, dict):
-                        seed = _extract_codex_compacted(pl)
+                        seed = _extract_codex_compacted_turns(pl)
                         codex_saw_item = False
                         codex_item_turns.clear()
                         codex_resp_turns = list(seed)
                         compaction_count += 1
                     elif typ_cx == "event_msg" and isinstance(pl, dict):
                         if pl.get("type") == "item_completed":
-                            item = pl.get("item")
-                            if isinstance(item, dict) and item.get("type") in (
-                                "UserMessage",
-                                "AgentMessage",
-                            ):
-                                role_cx = "user" if item["type"] == "UserMessage" else "assistant"
-                                chunks_cx: list[str] = []
-                                icont = item.get("content")
-                                if isinstance(icont, list):
-                                    for blk in icont:
-                                        if (
-                                            isinstance(blk, dict)
-                                            and str(blk.get("type") or "").lower() == "text"
-                                            and isinstance(blk.get("text"), str)
-                                            and blk["text"]
-                                        ):
-                                            chunks_cx.append(blk["text"])
-                                elif isinstance(item.get("text"), str):
-                                    chunks_cx.append(item["text"])
-                                joined_cx = "\n".join(chunks_cx).strip()
-                                if joined_cx:
-                                    turn_cx = (role_cx, joined_cx)
-                                    if not codex_saw_item:
-                                        hist = list(codex_resp_turns)
-                                        if hist and hist[-1] == turn_cx:
-                                            hist.pop()
-                                        codex_item_turns = hist
-                                        codex_resp_turns.clear()
-                                        codex_saw_item = True
-                                    codex_item_turns.append(turn_cx)
+                            turn_cx = _extract_codex_item_completed(pl)
+                            if turn_cx is not None:
+                                if not codex_saw_item:
+                                    hist = list(codex_resp_turns)
+                                    if hist and hist[-1] == turn_cx:
+                                        hist.pop()
+                                    codex_item_turns = hist
+                                    codex_resp_turns.clear()
+                                    codex_saw_item = True
+                                codex_item_turns.append(turn_cx)
                     elif typ_cx == "response_item" and isinstance(pl, dict) and not codex_saw_item:
-                        turn_ri = _extract_codex_resp_item(pl)
+                        turn_ri = _extract_codex_response_item(pl)
                         if turn_ri is not None:
                             codex_resp_turns.append(turn_ri)
     except OSError:
