@@ -9,7 +9,7 @@ clipboard, global hotkey, and host daemon:
   -> Real Stage 2 stateless Refiner (prewarm + prefix-cache hit verification)
   -> Real VoiceInputDaemon UNIX socket IPC & back-to-back serial utterance queue
   -> Real isolated `tmux -L avi-e2e-*` pane buffer paste & capture-pane readback
-  -> CLI `doctor`, `status --history`, `telemetry.jsonl` (0600, zero prose), `failed/` staging, and `diagnose_live.py --json`.
+  -> CLI `doctor` & `doctor --ping`, non-Git folder context & shallow files, SSH crosstalk veto, `status --history`, `telemetry.jsonl` (0600, zero prose), `failed/` staging, and `diagnose_live.py --json`.
 """
 from __future__ import annotations
 
@@ -100,6 +100,14 @@ DEFAULT_UTTERANCE_SPECS: tuple[dict[str, Any], ...] = (
         "probe_phrases": ("不对不对", "看看结果"),
     },
 )
+
+NON_GIT_UTTERANCE_SPEC: dict[str, Any] = {
+    "id": "NG1",
+    "name": "non_git_shallow_ident",
+    "tts_text": "请对照 custom widget spec 点 m d 核对一下第四季度预算方案字段",
+    "expect_substrings": ("custom_widget_spec.md",),
+    "probe_phrases": ("第四季度预算方案", "核对一下"),
+}
 
 
 def _strip_fast_env(raw_env: Mapping[str, str]) -> dict[str, str]:
@@ -246,14 +254,49 @@ def _synthesize_speech_wav_bytes(text: str, env: Mapping[str, str], audio_cfg: A
     return wav16
 
 
+def _prepare_cached_tts_item(
+    spec: Mapping[str, Any],
+    *,
+    cache_dir: Path,
+    refresh_tts: bool,
+    env: Mapping[str, str],
+    audio_cfg: AudioConfig,
+) -> dict[str, Any]:
+    tts_txt = str(spec["tts_text"])
+    digest = hashlib.sha256(f"v1:{sys.platform}:{tts_txt}".encode("utf-8")).hexdigest()[:16]
+    wav_p = cache_dir / f"tts-{str(spec['id']).lower()}-{digest}.wav"
+    reused = False
+    gate_dur = 0.0
+    if not refresh_tts and wav_p.is_file() and not wav_p.is_symlink():
+        try:
+            os.chmod(wav_p, 0o600)
+            gate = process_wav(wav_p, audio_cfg)
+            if gate.passed and not gate.all_zero and gate.duration_sec >= 0.6:
+                reused = True
+                gate_dur = gate.duration_sec
+        except Exception:
+            reused = False
+    if not reused:
+        wav_bytes = _synthesize_speech_wav_bytes(tts_txt, env, audio_cfg)
+        _atomic_write_0600(wav_p, wav_bytes)
+        gate = process_wav(wav_p, audio_cfg)
+        gate_dur = gate.duration_sec
+    return {
+        **spec,
+        "wav_path": wav_p,
+        "duration_sec": round(gate_dur, 2),
+        "cached_wav": reused,
+    }
+
+
 def _prepare_utterance_wavs(
     *,
     wav_arg: str,
     refresh_tts: bool,
     env: Mapping[str, str],
     audio_cfg: AudioConfig,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Return ``(items, used_custom_wav)`` where each item has ``spec`` + ``wav_path`` + ``duration_sec``."""
+) -> tuple[list[dict[str, Any]], dict[str, Any], bool]:
+    """Return ``(items, non_git_item, used_custom_wav)`` where each item has ``spec`` + ``wav_path`` + ``duration_sec``."""
     if wav_arg.strip():
         raw_paths = [Path(p.strip()).expanduser().resolve() for p in wav_arg.split(",") if p.strip()]
         for p in raw_paths:
@@ -279,40 +322,32 @@ def _prepare_utterance_wavs(
                     "probe_phrases": (),
                 }
             )
-        return items, True
+        ng_item = {
+            "id": "NG1",
+            "name": "custom_non_git_1",
+            "tts_text": f"<external:{items[0]['wav_path'].name}>",
+            "wav_path": items[0]["wav_path"],
+            "duration_sec": items[0]["duration_sec"],
+            "cached_wav": True,
+            "expect_substrings": (),
+            "probe_phrases": (),
+        }
+        return items, ng_item, True
 
     home = expand_user_path("~", env=env)
     cache_dir = ensure_secure_dir(home / ".cache" / "agent-voice-input" / "eval-wavs")
-    items = []
-    for spec in DEFAULT_UTTERANCE_SPECS:
-        tts_txt = str(spec["tts_text"])
-        digest = hashlib.sha256(f"v1:{sys.platform}:{tts_txt}".encode("utf-8")).hexdigest()[:16]
-        wav_p = cache_dir / f"tts-{spec['id'].lower()}-{digest}.wav"
-        reused = False
-        gate_dur = 0.0
-        if not refresh_tts and wav_p.is_file() and not wav_p.is_symlink():
-            try:
-                os.chmod(wav_p, 0o600)
-                gate = process_wav(wav_p, audio_cfg)
-                if gate.passed and not gate.all_zero and gate.duration_sec >= 0.6:
-                    reused = True
-                    gate_dur = gate.duration_sec
-            except Exception:
-                reused = False
-        if not reused:
-            wav_bytes = _synthesize_speech_wav_bytes(tts_txt, env, audio_cfg)
-            _atomic_write_0600(wav_p, wav_bytes)
-            gate = process_wav(wav_p, audio_cfg)
-            gate_dur = gate.duration_sec
-        items.append(
-            {
-                **spec,
-                "wav_path": wav_p,
-                "duration_sec": round(gate_dur, 2),
-                "cached_wav": reused,
-            }
-        )
-    return items, False
+    items = [
+        _prepare_cached_tts_item(spec, cache_dir=cache_dir, refresh_tts=refresh_tts, env=env, audio_cfg=audio_cfg)
+        for spec in DEFAULT_UTTERANCE_SPECS
+    ]
+    ng_item = _prepare_cached_tts_item(
+        NON_GIT_UTTERANCE_SPEC,
+        cache_dir=cache_dir,
+        refresh_tts=refresh_tts,
+        env=env,
+        audio_cfg=audio_cfg,
+    )
+    return items, ng_item, False
 
 
 def _create_isolated_session(
@@ -380,6 +415,82 @@ def _create_isolated_session(
     return sid, rollout
 
 
+def _append_codex_turn(rollout: Path, turn_num: int, user_text: str, agent_text: str) -> None:
+    new_lines = [
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "text", "text": f"[Turn {turn_num}] {user_text}"}],
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "AgentMessage",
+                        "content": [{"type": "text", "text": agent_text}],
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+    ]
+    with open(rollout, "a", encoding="utf-8") as f:
+        f.write("\n".join(new_lines) + "\n")
+        f.flush()
+
+
+def _create_isolated_non_git_workspace_and_session(
+    base_dir: Path,
+    rt_dir: Path,
+    *,
+    tmux_socket: str,
+    tmux_pane: str,
+    pane_tty: str,
+) -> tuple[Path, str, Path]:
+    """Create a plain folder without `.git`, populate characteristic shallow files, and register a session."""
+    ws_dir = base_dir / "non-git-workspace"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    (ws_dir / "budget_q4_plan.xlsx").write_bytes(b"PK\x03\x04e2e-placeholder-xlsx")
+    (ws_dir / "custom_widget_spec.md").write_text(
+        "# Custom Widget Specification\n\nQ4 budget layout fields.\n",
+        encoding="utf-8",
+    )
+    sid = "22222222-3333-4444-8555-666666666666"
+    rollout = rt_dir / f"rollout-nongit-{sid}.jsonl"
+    rollout.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": sid, "source": "cli", "cwd": str(ws_dir)}}) + "\n",
+        encoding="utf-8",
+    )
+    _append_codex_turn(
+        rollout,
+        1,
+        "我们先在这个普通非 Git 文件夹下整理 custom_widget_spec.md 和 budget_q4_plan.xlsx。",
+        "收到，已记录当前非 Git 目录下的 custom_widget_spec.md 与 budget_q4_plan.xlsx 结构说明。\n"
+        + ("# non-git turn-1 reference padding\n" * 40),
+    )
+    write_session_registry_entry(
+        rt_dir,
+        cli="codex",
+        session_id=sid,
+        jsonl_path=str(rollout),
+        cwd=str(ws_dir),
+        tmux_pane=tmux_pane,
+        tmux_socket=tmux_socket,
+        tty=pane_tty,
+    )
+    return ws_dir, sid, rollout
+
+
 class HeadlessTmuxPlatform:
     """Headless test PlatformBackend: zero host hotkey/HUD/clipboard touch, real isolated tmux paste."""
 
@@ -433,8 +544,13 @@ class HeadlessTmuxPlatform:
         del window
         return True
 
+    def set_foreground_window(self, win: ForegroundWindow) -> None:
+        with self._lock:
+            self._fg_win = win
+
     def get_foreground_window(self) -> ForegroundWindow:
-        return self._fg_win
+        with self._lock:
+            return self._fg_win
 
     def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
         del runtime_dir, loopback, seq_id
@@ -544,7 +660,7 @@ def _wait_daemon_idle(rt_dir: Path, expected_results: int, *, timeout_sec: float
     deadline = time.monotonic() + timeout_sec
     last_st: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last_st = send_control_command(rt_dir, {"cmd": "status", "history": 20}, timeout_sec=3.0)
+        last_st = send_control_command(rt_dir, {"cmd": "status", "history": 50}, timeout_sec=3.0)
         recs = last_st.get("recent_results") or []
         if (
             last_st.get("ok")
@@ -661,7 +777,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
 
-    utterance_items, used_custom_wav = _prepare_utterance_wavs(
+    utterance_items, non_git_item, used_custom_wav = _prepare_utterance_wavs(
         wav_arg=args.wav,
         refresh_tts=args.refresh_tts,
         env=clean_env,
@@ -680,7 +796,7 @@ def main(argv: list[str] | None = None) -> int:
         prev_pp = e2e_env.get("PYTHONPATH", "")
         e2e_env["PYTHONPATH"] = f"{_SRC_ROOT}{os.pathsep}{prev_pp}" if prev_pp else str(_SRC_ROOT)
 
-        # Subcheck 1: CLI `doctor`
+        # Subcheck 1: CLI `doctor` (offline) + `doctor --ping` (live endpoint connectivity & auth)
         t_doc0 = time.monotonic()
         doc_proc = subprocess.run(
             [sys.executable, str(_REPO_ROOT / "bin" / "agent-voice-input"), "doctor"],
@@ -691,10 +807,26 @@ def main(argv: list[str] | None = None) -> int:
             timeout=25.0,
             check=False,
         )
+        ping_proc = subprocess.run(
+            [sys.executable, str(_REPO_ROOT / "bin" / "agent-voice-input"), "doctor", "--ping"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=e2e_env,
+            timeout=30.0,
+            check=False,
+        )
         doc_ms = max(0, int(round((time.monotonic() - t_doc0) * 1000)))
-        doc_combined = (doc_proc.stdout or "") + "\n" + (doc_proc.stderr or "")
+        ping_out = (ping_proc.stdout or "") + "\n" + (ping_proc.stderr or "")
+        doc_combined = (doc_proc.stdout or "") + "\n" + (doc_proc.stderr or "") + "\n" + ping_out
         doc_leaked = any(sec in doc_combined for sec in all_secrets)
-        doc_ok = (doc_proc.returncode == 0) and (not doc_leaked)
+        ping_lines = [ln.strip() for ln in (ping_proc.stdout or "").splitlines() if ln.strip().startswith("[ping]")]
+        ping_verified = (
+            ping_proc.returncode == 0
+            and len(ping_lines) >= 1
+            and all("FAIL" not in ln for ln in ping_lines)
+        )
+        doc_ok = (doc_proc.returncode == 0) and ping_verified and (not doc_leaked)
         host_note = (
             f"host_daemon=ONLINE(shim_ok={host_daemon_info['shim_ok']})"
             if host_daemon_info["online"]
@@ -705,7 +837,11 @@ def main(argv: list[str] | None = None) -> int:
                 "id": "C1_doctor",
                 "ok": doc_ok,
                 "elapsed_ms": doc_ms,
-                "detail": f"rc={doc_proc.returncode}, zero_secret_leak={not doc_leaked}, {host_note}",
+                "detail": (
+                    f"offline_rc={doc_proc.returncode}, ping_rc={ping_proc.returncode}"
+                    f"(probes={len(ping_lines)},ok={ping_verified}), "
+                    f"zero_secret_leak={not doc_leaked}, {host_note}"
+                ),
             }
         )
 
@@ -1163,6 +1299,215 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
 
+            # Subcheck 6: Non-Git plain folder 2-turn context + SSH foreground crosstalk veto
+            t_ctx0 = time.monotonic()
+            orig_fg_win = platform.get_foreground_window()
+            ctx_iso_issues: list[str] = []
+            non_git_dir, ng_sid, ng_rollout = _create_isolated_non_git_workspace_and_session(
+                Path(td),
+                rt_dir,
+                tmux_socket=tmux_sock_path,
+                tmux_pane=pane_id,
+                pane_tty=pane_tty,
+            )
+            if (non_git_dir / ".git").exists():
+                ctx_iso_issues.append("unexpected_dot_git")
+
+            def _run_daemon_probe_utterance(wav_bytes: bytes) -> tuple[int, dict[str, Any], str, str]:
+                nonlocal expected_ok_records
+                expected_ok_records += 1
+                seq_n = expected_ok_records
+                platform.enqueue_wav(wav_bytes)
+                time.sleep(debounce_wait)
+                p_start = send_control_command(rt_dir, {"cmd": "rec_start", "silent_hud": True})
+                time.sleep(0.04)
+                p_stop = send_control_command(rt_dir, {"cmd": "rec_stop", "silent_hud": True})
+                st_done = _wait_daemon_idle(rt_dir, expected_results=seq_n)
+                daemon.wait_pending_archives(timeout_sec=2.0)
+                rec_n = next(
+                    (r for r in (st_done.get("recent_results") or []) if int(r.get("seq_id") or 0) == seq_n),
+                    {},
+                )
+                if not p_start.get("ok") or not p_stop.get("ok"):
+                    rec_n = {**rec_n, "ok": False, "error": "trigger_failed"}
+                asr_n = asr_proxy.asr_texts[seq_n - 1] if (seq_n - 1) < len(asr_proxy.asr_texts) else ""
+                fin_n = platform.delivered_by_seq.get(seq_n, "")
+                return seq_n, rec_n, asr_n, fin_n
+
+            ng1_chars = 0
+            ng2_chars = 0
+            shallow_extracted = False
+            ssh_veto_ok = False
+            try:
+                # 6a. Non-Git Turn 1 (NG1): bind plain folder session, extract shallow filenames, refine & paste
+                subprocess.run(
+                    [tmux_bin, "-L", sock_name, "select-pane", "-t", pane_id, "-T", f"codex · non-git-workspace [#{ng_sid[:8]}]"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=tmux_clean_env,
+                    timeout=2.0,
+                    check=False,
+                )
+                platform.set_foreground_window(
+                    ForegroundWindow(
+                        hwnd=5151,
+                        process="WindowsTerminal",
+                        title=f"codex · non-git-workspace [codex:#{ng_sid[:8]}]",
+                        tty=pane_tty,
+                        cwd=str(non_git_dir),
+                        tmux_socket=tmux_sock_path,
+                        tmux_pane=pane_id,
+                    )
+                )
+                ng1_wav = Path(non_git_item["wav_path"]).read_bytes()
+                _ng1_seq, rec_ng1, asr_ng1, fin_ng1 = _run_daemon_probe_utterance(ng1_wav)
+                for priv_s in (asr_ng1, fin_ng1):
+                    if len(priv_s) >= 6:
+                        private_replay_prose.append(priv_s)
+
+                # Append a second conversation turn to non-Git rollout and run Non-Git Turn 2 (NG2)
+                _append_codex_turn(
+                    ng_rollout,
+                    2,
+                    "请把 custom_widget_spec.md 里的字段跟 budget_q4_plan.xlsx 对齐。",
+                    "已完成字段映射核对，等待下一条语音指令。\n"
+                    + ("# non-git turn-2 incremental context growth line\n" * 60),
+                )
+                ng2_wav = Path(utterance_items[1]["wav_path"]).read_bytes()
+                _ng2_seq, rec_ng2, asr_ng2, fin_ng2 = _run_daemon_probe_utterance(ng2_wav)
+                for priv_s in (asr_ng2, fin_ng2):
+                    if len(priv_s) >= 6:
+                        private_replay_prose.append(priv_s)
+
+                ng_session_key = f"codex:{ng_sid}"
+                ng_chunks, ng_git_ctx = tracker.get_refiner_context(ng_session_key)
+                ng_ws_hotwords = tracker.build_workspace_hotwords(str(non_git_dir))
+                shallow_extracted = (
+                    "workspace_files (local folder; spelling reference only):" in ng_git_ctx
+                    and "budget_q4_plan.xlsx" in ng_git_ctx
+                    and "custom_widget_spec.md" in ng_git_ctx
+                    and "git_status:" not in ng_git_ctx
+                    and "repo_files" not in ng_git_ctx
+                    and "budget_q4_plan" in ng_ws_hotwords
+                    and "custom_widget_spec" in ng_ws_hotwords
+                )
+                if not rec_ng1.get("ok") or not rec_ng1.get("pasted"):
+                    ctx_iso_issues.append("NG1:failed_or_unpasted")
+                if not rec_ng2.get("ok") or not rec_ng2.get("pasted"):
+                    ctx_iso_issues.append("NG2:failed_or_unpasted")
+                if rec_ng1.get("session_key") != ng_session_key or rec_ng2.get("session_key") != ng_session_key:
+                    ctx_iso_issues.append(
+                        f"non_git_session_mismatch({rec_ng1.get('session_key')},{rec_ng2.get('session_key')})"
+                    )
+                if not shallow_extracted:
+                    ctx_iso_issues.append("non_git_shallow_files_missing")
+                ng1_chars = int(rec_ng1.get("ctx_chars") or 0)
+                ng2_chars = int(rec_ng2.get("ctx_chars") or 0)
+                if expects_stage2 and not (ng2_chars > ng1_chars > 0):
+                    ctx_iso_issues.append(f"non_git_multiturn_ctx_not_grown({ng1_chars}->{ng2_chars})")
+                elif not ng_chunks or sum(len(c) for c in ng_chunks) <= 0:
+                    ctx_iso_issues.append("non_git_chunks_empty")
+                if not used_custom_wav:
+                    for sub in non_git_item.get("expect_substrings", ()):
+                        if sub.lower() not in fin_ng1.lower():
+                            ctx_iso_issues.append(f"NG1:missing({sub})")
+
+                time.sleep(0.06)
+                cap_ng = subprocess.run(
+                    [tmux_bin, "-L", sock_name, "capture-pane", "-p", "-J", "-S", "-", "-t", pane_id],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    env=tmux_clean_env,
+                    timeout=3.0,
+                    check=True,
+                )
+                ng_pane_full = "\n".join(ln.strip() for ln in cap_ng.stdout.splitlines() if ln.strip())
+                if not _pane_contains_delivered(fin_ng1, ng_pane_full) or not _pane_contains_delivered(fin_ng2, ng_pane_full):
+                    ctx_iso_issues.append("non_git_missing_in_tmux")
+
+                # 6b. SSH foreground crosstalk veto while both local Git & non-Git sessions remain live!
+                # Case 1: Terminal SSH prompt title (`ubuntu@prod-bastion.invalid:~`)
+                subprocess.run(
+                    [tmux_bin, "-L", sock_name, "select-pane", "-t", pane_id, "-T", "ubuntu@prod-bastion.invalid:~"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=tmux_clean_env,
+                    timeout=2.0,
+                    check=False,
+                )
+                platform.set_foreground_window(
+                    ForegroundWindow(
+                        hwnd=6161,
+                        process="WindowsTerminal",
+                        title="ubuntu@prod-bastion.invalid:~",
+                        tty="",
+                        cwd="",
+                        tmux_socket=tmux_sock_path,
+                        tmux_pane=pane_id,
+                    )
+                )
+                _ssh1_seq, rec_ssh1, asr_ssh1, fin_ssh1 = _run_daemon_probe_utterance(ng2_wav)
+                for priv_s in (asr_ssh1, fin_ssh1):
+                    if len(priv_s) >= 6:
+                        private_replay_prose.append(priv_s)
+
+                # Case 2: Dedicated SSH GUI client (`putty.exe`)
+                platform.set_foreground_window(
+                    ForegroundWindow(
+                        hwnd=6262,
+                        process="putty.exe",
+                        title="ubuntu@prod-bastion.invalid - PuTTY",
+                    )
+                )
+                _ssh2_seq, rec_ssh2, asr_ssh2, fin_ssh2 = _run_daemon_probe_utterance(ng2_wav)
+                for priv_s in (asr_ssh2, fin_ssh2):
+                    if len(priv_s) >= 6:
+                        private_replay_prose.append(priv_s)
+
+                ssh_veto_ok = (
+                    bool(rec_ssh1.get("ok"))
+                    and bool(rec_ssh2.get("ok"))
+                    and rec_ssh1.get("session_key") == ""
+                    and rec_ssh2.get("session_key") == ""
+                    and int(rec_ssh1.get("ctx_chars") or 0) == 0
+                    and int(rec_ssh2.get("ctx_chars") or 0) == 0
+                    and int(rec_ssh1.get("ctx_chunks") or 0) == 0
+                    and int(rec_ssh2.get("ctx_chunks") or 0) == 0
+                )
+                if not ssh_veto_ok:
+                    ctx_iso_issues.append(
+                        f"ssh_crosstalk_leak(term={rec_ssh1.get('session_key')!r}/{rec_ssh1.get('ctx_chars')},"
+                        f"putty={rec_ssh2.get('session_key')!r}/{rec_ssh2.get('ctx_chars')})"
+                    )
+            finally:
+                platform.set_foreground_window(orig_fg_win)
+                subprocess.run(
+                    [tmux_bin, "-L", sock_name, "select-pane", "-t", pane_id, "-T", f"codex · avi [#{sid[:8]}]"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=tmux_clean_env,
+                    timeout=2.0,
+                    check=False,
+                )
+
+            ctx_iso_ms = max(0, int(round((time.monotonic() - t_ctx0) * 1000)))
+            checks.append(
+                {
+                    "id": "C6_non_git_and_ssh_isolation",
+                    "ok": not ctx_iso_issues,
+                    "elapsed_ms": ctx_iso_ms,
+                    "detail": (
+                        f"non_git_2turn=({ng1_chars}->{ng2_chars} chars, shallow_files={shallow_extracted}), "
+                        f"ssh_veto_terminal_and_putty={ssh_veto_ok}"
+                        + (f", issues={'; '.join(ctx_iso_issues)}" if ctx_iso_issues else "")
+                    ),
+                }
+            )
+
             # Subcheck 4 (run before final telemetry audit so telemetry + diagnose_live cover both normal & fault records)
             expected_total_records = expected_ok_records
             if not args.skip_fault_check:
@@ -1248,10 +1593,10 @@ def main(argv: list[str] | None = None) -> int:
                 and (tel_st.st_mode & 0o777) == 0o600
             )
             tel_raw_text = tel_path.read_text(encoding="utf-8") if tel_mode_0600 else ""
-            disk_records = read_telemetry_history(rt_dir, limit=20)
+            disk_records = read_telemetry_history(rt_dir, limit=50)
 
             st_cli_proc = subprocess.run(
-                [sys.executable, str(_REPO_ROOT / "bin" / "agent-voice-input"), "status", "--history", "10"],
+                [sys.executable, str(_REPO_ROOT / "bin" / "agent-voice-input"), "status", "--history", "50"],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
@@ -1279,7 +1624,7 @@ def main(argv: list[str] | None = None) -> int:
 
             # Verify zero spoken prose & zero secrets in telemetry.jsonl and `status --history`
             forbidden_prose: list[str] = list(private_replay_prose)
-            for item in utterance_items:
+            for item in (*utterance_items, non_git_item):
                 forbidden_prose.extend(item.get("probe_phrases", ()))
             if not used_custom_wav:
                 for u_rep in utterance_reports:
