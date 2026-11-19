@@ -89,7 +89,7 @@ from .config import (
     resolve_credentials,
     select_refiner_provider,
 )
-from .platform_wsl import _callable_accepts_kwarg
+from .platform_common import _callable_accepts_kwarg
 from .prompts import (
     CODEX_NO_TOOLS_NOTE,
     REFINER_AGENT_MODE_ADDENDUM,

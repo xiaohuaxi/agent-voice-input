@@ -18,7 +18,7 @@ from .http_transport import sleep_cooperative
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, ensure_secure_dir, expand_user_path, get_runtime_dir, redact_secrets
 from .hud import resolve_ui_language
-from .platform_wsl import (
+from .platform_common import (
     FfmpegWavRecorder,
     ForegroundWindow,
     JsonlShimMixin,

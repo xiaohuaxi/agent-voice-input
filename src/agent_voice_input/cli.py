@@ -50,6 +50,7 @@ from .daemon import (
     run_pipeline_once,
     send_control_command,
 )
+from .platform_common import ForegroundWindow
 from .platform_macos import (
     classify_macos_mic_permission,
     compile_mac_shim,
@@ -57,7 +58,7 @@ from .platform_macos import (
     run_mac_shim_self_check,
     run_macos_key_test,
 )
-from .platform_wsl import ForegroundWindow, is_wsl, probe_wsl_host, run_key_test
+from .platform_wsl import is_wsl, probe_wsl_host, run_key_test
 from .refiner import (
     CODEX_SUBSCRIPTION_BASE_URL,
     CodexRefiner,

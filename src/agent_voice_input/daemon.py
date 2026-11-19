@@ -47,12 +47,14 @@ from .config import (
     select_refiner_provider,
 )
 from .hud import is_toast_hud_state
-from .platform_macos import MacOSPlatform, is_macos_terminal_window
-from .platform_wsl import (
+from .platform_common import (
     ForegroundWindow,
     MicrophoneUnavailableError,
     NoMicrophoneError,
     PasteOutcome,
+)
+from .platform_macos import MacOSPlatform, is_macos_terminal_window
+from .platform_wsl import (
     WslPlatform,
     is_windows_terminal_process,
     is_wsl,

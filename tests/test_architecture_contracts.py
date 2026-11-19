@@ -256,6 +256,12 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
                     edges[mod_name],
                     f"{mod_name}.py must not import asr_providers; use http_transport or llm_common",
                 )
+        for mod_name in ("platform_macos", "refiner", "platform_common"):
+            self.assertNotIn(
+                "platform_wsl",
+                edges[mod_name],
+                f"{mod_name}.py must not import platform_wsl; use platform_common",
+            )
 
     def test_session_ctx_and_remote_probe_have_zero_duplicate_top_level_definitions(self) -> None:
         trees = _parse_package_asts()

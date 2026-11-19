@@ -8206,7 +8206,7 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
             "time.sleep(5.0)\n"
         )
         with tempfile.TemporaryDirectory() as td, mock.patch(
-            "agent_voice_input.platform_wsl.subprocess.Popen", side_effect=tracking_popen
+            "agent_voice_input.platform_common.subprocess.Popen", side_effect=tracking_popen
         ):
             rt = Path(td)
             plat_hang = WslPlatform(
