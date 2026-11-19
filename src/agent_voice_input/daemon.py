@@ -44,6 +44,7 @@ from .config import (
     resolve_credentials,
     resolve_saved_recordings_dir,
     select_asr_provider,
+    select_refiner_provider,
 )
 from .hud import is_toast_hud_state
 from .platform_macos import MacOSPlatform, is_macos_terminal_window
@@ -991,7 +992,7 @@ def run_pipeline_once(
     eff_tracker = tracker or SessionTracker(env=eff_env)
     eff_asr = asr_provider or create_asr_provider(cfg, eff_creds, env=eff_env)
     owns_refiner = refiner is None
-    eff_refiner = refiner or create_refiner(cfg, eff_creds, env=eff_env, runtime_dir=runtime_dir)
+    eff_refiner = refiner or create_refiner(cfg, eff_creds, env=env, runtime_dir=runtime_dir)
     can_save_failed = runtime_dir is not None and audio_source not in ("file", "selftest_wav", "retry")
     local_archive_threads: list[threading.Thread] = []
     stashed_once = False
@@ -1229,7 +1230,9 @@ class VoiceInputDaemon:
         self.platform = platform or create_platform(cfg, env=self.env)
         self.tracker = tracker or SessionTracker(env=self.env, runtime_dir=self.runtime_dir)
         self.asr_provider = asr_provider or create_asr_provider(cfg, self.creds, env=self.env)
-        self.refiner = refiner or create_refiner(cfg, self.creds, env=self.env, runtime_dir=self.runtime_dir)
+        ref_env: Mapping[str, str] | None = self.env if env is not None else None
+        self.resolved_refiner_provider = select_refiner_provider(cfg, self.creds, ref_env)
+        self.refiner = refiner or create_refiner(cfg, self.creds, env=ref_env, runtime_dir=self.runtime_dir)
         self.clock_fn, self.sleep_fn = clock_fn, sleep_fn
         self._paste_settle_sec = max(0.0, float(paste_settle_sec))
         # Strict global lock hierarchy: _trigger_lock (T) -> _hud_lock (H) -> _lock / _queue_cv (L) -> Leaf locks
@@ -2693,7 +2696,7 @@ class VoiceInputDaemon:
                     "seq_id": self.seq_id,
                     "pending_count": self._inflight_or_queued_count_locked(),
                     "asr_provider": select_asr_provider(self.cfg, self.creds),
-                    "refiner_provider": self.cfg.refiner.provider,
+                    "refiner_provider": self.resolved_refiner_provider,
                     "shim_ok": shim_ok,
                     "last_result": dict(self.last_result),
                 }
@@ -2802,6 +2805,17 @@ class VoiceInputDaemon:
             self.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8"); os.chmod(self.pid_path, 0o600)
             self.platform.start_event_listener(self._on_platform_event)
             srv.bind(str(self.sock_path)); os.chmod(self.sock_path, 0o600); srv.listen(8); srv.settimeout(0.3)
+            if (
+                self.cfg.refiner.provider.strip().lower() == "auto"
+                and self.resolved_refiner_provider == "off"
+                and not _is_single_hop_asr_provider(self.asr_provider)
+            ):
+                print(
+                    "[agent-voice-input] INFO: refiner=auto found no Stage 2 credentials; "
+                    "delivering Stage 1 ASR transcripts directly.",
+                    file=sys.stderr,
+                    flush=True,
+                )
             while not self._stop_evt.is_set() and not sig_stop.is_set():
                 try: conn, _ = srv.accept()
                 except socket.timeout: continue

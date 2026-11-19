@@ -31,7 +31,7 @@ Generic OS dictation has no idea what files, symbols, or CLI flags exist in your
 ## Why It Works Better for Coding Agents
 
 - **Grounded in Your Active Agent Session — Yet Ready Anywhere**: In terminals, automatically resolves the foreground agent session inside your active window, Ghostty split, or `tmux` pane (zero `~/.tmux.conf` changes needed) to extract recent dialogue and `git status` paths (plus shallow local filenames in non-Git folders) while isolating background subagents and sibling splits. Works across desktop apps out of the box (`hotkey.scope = "all"` by default; configurable to `"coding"` or `"terminals"`): desktop IDEs (`VS Code`, `Cursor`, `Windsurf`, `Zed`, `JetBrains`, `Xcode`, etc.) resolve the open local workspace (Git repo or ordinary folder) for filename/status hotwords without leaking terminal CLI sessions—and desktop **Antigravity IDE** additionally binds its latest matching `brain/` conversation for that workspace—while AI chat / IM apps and everyday windows use clean general dictation, and remote desktop / VM clients automatically yield the hotkey (`yield_remote_desktop = true`).
-- **Provider-Driven Speech + Context Pipeline**: Pairs fast dedicated speech-to-text with a stateless Keep-Alive `codex` refiner by default, switches cleanly to any built-in cloud/local API provider, or runs single-hop multimodal audio + 50K cached session context refinement (DashScope Qwen-Omni / Gemini / OpenRouter)—just pick a `provider` and its built-in default model applies automatically.
+- **Provider-Driven Speech + Context Pipeline**: `asr.provider = "auto"` and `refiner.provider = "auto"` work out of the box with a single API key (or local `codex` CLI login, with automatic public mini-model fallback on standard ChatGPT accounts), switch cleanly to any built-in cloud/local API provider (`deepseek`, `dashscope`, `openrouter`, `gemini`, `volcengine`, `openai`, `groq`, `siliconflow`), or run single-hop multimodal audio + 50K cached session context refinement (DashScope Qwen-Omni / Gemini / OpenRouter)—just pick a `provider` and its built-in default model applies automatically.
 - **Built for Long & Back-to-Back Dictation**: Start a new recording immediately while earlier utterances are still transcribing or refining—Stage 2 refinements overlap concurrently while utterances always paste in strict `seq_id` FIFO order (joining consecutive focus-drifted clipboard fallbacks with a blank line instead of overwriting); cancel an active recording or abort in-flight recognition/refinement instantly via `agent-voice-input cancel` (or by holding & releasing the `tap_toggle` hotkey for `1.2s–8s`, i.e. above `hotkey.tap_max_ms`, while idle from recording); local silence gating and loudness normalization block empty triggers; supports up to 10-minute recordings by default (with a 15s HUD countdown), splits recordings over 3 minutes (`180s`) at natural pauses for concurrent transcription, alerts immediately if a mic is missing or unplugged, and stashes failed or actively cancelled audio (`0600`) for `agent-voice-input retry` so long thoughts are never lost.
 - **Native HiDPI Waveform HUD & Focus-Safe Paste**: Non-activating floating capsule on both Windows (Per-Monitor V2 HiDPI) and macOS (Retina AppKit) displays live timer, waveform bars, and stage progress in English or Chinese matching your desktop locale. Locks onto the origin window/split on record start, routes per-terminal paste chords (`Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert` on Windows; zero-clipboard direct injection in Ghostty and `tmux` on macOS, or native `CGEvent` `Cmd+V`), never auto-presses Enter, and falls back to clipboard if focus moved elsewhere.
 - **Zero Extra Python Dependencies**: Pure Python `>= 3.10` standard library plus host `ffmpeg` (uses built-in `powershell.exe` on WSL2; compiles and caches a native `mac_shim` helper via `/usr/bin/swiftc` on macOS).
@@ -47,9 +47,9 @@ Copy and paste this prompt directly into **Codex**, **Claude Code**, or **AGY**:
 ```text
 Please install and configure agent-voice-input (https://github.com/xiaohuaxi/agent-voice-input) for me:
 1. Check python3 (>=3.10) and ffmpeg (plus Xcode Command Line Tools `/usr/bin/swiftc` on macOS), then install via `uv tool install agent-voice-input` (or `pipx` if `uv` is unavailable).
-2. Check if an API key is already set in my environment (e.g. DASHSCOPE_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, GROQ_API_KEY); if not, ask which provider I want to use and write it to `~/.config/agent-voice-input/agent-voice-input.env` with chmod 600.
-3. If the `codex` CLI is not installed or logged in on this machine, set `[refiner] provider` in `~/.config/agent-voice-input/config.toml` to match my configured API provider (leave `model` unset so built-in defaults apply).
-4. Run `agent-voice-input doctor` to verify all checks pass, then start the background daemon with `agent-voice-input start`.
+2. Run `agent-voice-input init` to create `~/.config/agent-voice-input/config.toml` and `agent-voice-input.env` (chmod 600).
+3. Check if an API key is already set in my environment (e.g. DASHSCOPE_API_KEY, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, GROQ_API_KEY); if not, ask which provider I want to use and add it to `~/.config/agent-voice-input/agent-voice-input.env`.
+4. Run `agent-voice-input doctor --ping` to verify all checks pass, then start the background daemon with `agent-voice-input start`.
 ```
 
 ### Option 2: Manual Setup in 3 Steps
@@ -67,19 +67,16 @@ uv tool install agent-voice-input
 # Or with pipx: pipx install agent-voice-input
 ```
 
-**3. Configure One Credential & Start**
+**3. Initialize Config, Add One Credential & Start**
 
-Add at least one provider key to `~/.config/agent-voice-input/agent-voice-input.env` (for example `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `DASHSCOPE_API_KEY`):
+Initialize `0600` config files via `agent-voice-input init` and uncomment at least one provider key in `~/.config/agent-voice-input/agent-voice-input.env` (for example `DASHSCOPE_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, or `OPENAI_API_KEY`, plus optional `DEEPSEEK_API_KEY` or local `codex login` for Stage 2):
 
 ```bash
-mkdir -p ~/.config/agent-voice-input && chmod 700 ~/.config/agent-voice-input
-cat > ~/.config/agent-voice-input/agent-voice-input.env <<'EOF'
-OPENROUTER_API_KEY="<your-openrouter-api-key>"
-EOF
-chmod 600 ~/.config/agent-voice-input/agent-voice-input.env
+agent-voice-input init
+# Edit ~/.config/agent-voice-input/agent-voice-input.env and set e.g. OPENROUTER_API_KEY="sk-or-..."
 
-# Verify audio bridge, native shim, resolved providers/models, and session binding, then start daemon
-agent-voice-input doctor
+# Verify audio bridge, native shim, resolved providers/models, and endpoint connectivity, then start daemon
+agent-voice-input doctor --ping
 agent-voice-input start
 ```
 
@@ -126,7 +123,8 @@ Configuration uses two clean files (`CLI flags > config.toml > built-in defaults
 
 | `provider` | Stages | Built-in Default `asr.model` | Built-in Default `refiner.model` | Credential Source / Env |
 | :--- | :--- | :--- | :--- | :--- |
-| **`codex`** | `refiner` | — | `gpt-6-luna` | Local `codex` CLI login *(stateless HTTP `/responses` + 30m safe refresh; never enables Fast mode)* |
+| **`codex`** | `refiner` | — | `gpt-6-luna` *(auto-falls back to public `gpt-5.4-mini` / `gpt-5-codex-mini`)* | Local `codex` CLI login *(stateless HTTP `/responses` + 30m safe refresh; never enables Fast mode)* |
+| **`deepseek`** | `refiner` | — | `deepseek-flash` | `DEEPSEEK_API_KEY` *(compat: `API_KEY_DEEPSEEK`)* |
 | **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` *(or single-hop `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(compat: `ALI_API_KEY`)* |
 | **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` *(auto-probes granted slot)* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(compat: `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
@@ -135,9 +133,10 @@ Configuration uses two clean files (`CLI flags > config.toml > built-in defaults
 | **`openai`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` | `gpt-4o-mini` | `OPENAI_API_KEY` |
 | **`groq`** | `asr`, `refiner` | `whisper-large-v3-turbo` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
 | **`siliconflow`** | `asr`, `refiner` | `FunAudioLLM/SenseVoiceSmall` | `Qwen/Qwen2.5-7B-Instruct` | `SILICONFLOW_API_KEY` |
-| **`openai-compatible`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` *(needs `base_url`)* | *(needs explicit `base_url` + `model`, e.g. DeepSeek `deepseek-flash`)* | `api_key_env` or `OPENAI_API_KEY` *(loopback URLs need no key)* |
+| **`openai-compatible`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` *(needs `base_url`)* | *(needs explicit `base_url` + `model`)* | `api_key_env` or `OPENAI_API_KEY` *(loopback URLs need no key)* |
 
 - `asr.provider = "auto"` (default): selects the first configured credential in order `dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow`.
+- `refiner.provider = "auto"` (default): prefers local `codex` CLI login when present, otherwise selects the first configured credential in order `deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow`, or degrades cleanly to `"off"` when no Stage 2 credentials exist.
 - `refiner.provider = "off"`: disables Stage 2 refinement.
 
 ### Common `config.toml` Recipes
@@ -175,10 +174,11 @@ provider = "codex"               # Or "dashscope" / "volcengine" if Codex CLI is
 ### Common Subcommands
 
 ```bash
+agent-voice-input init                   # Create 0600 config.toml and commented agent-voice-input.env (--force overwrites)
 agent-voice-input start                  # Start background daemon
 agent-voice-input restart                # Restart daemon after config changes
 agent-voice-input status                 # Inspect daemon state, last latency, and redacted errors
-agent-voice-input doctor                 # Check audio bridge, native shim, credentials, and session binding
+agent-voice-input doctor [--ping]        # Check audio bridge, native shim, credentials, session binding, and optional endpoint ping (--json supported)
 agent-voice-input retry --list           # List stashed failed recordings (`agent-voice-input retry` re-runs latest)
 agent-voice-input once --duration 4 --dry-run  # Record once and print result without pasting
 agent-voice-input toggle                 # Toggle recording start/stop from CLI
@@ -191,12 +191,12 @@ agent-voice-input key-test               # Inspect raw key scancodes / modifier 
 
 | CLI Flag | Description |
 | :--- | :--- |
-| `--config PATH` | Path to `config.toml` or `config.json` (also supports `AGENT_VOICE_INPUT_CONFIG`) |
+| `--config PATH` | Path to `config.toml` or `config.json` (also supports `AGENT_VOICE_INPUT_CONFIG` and `XDG_CONFIG_HOME`) |
 | `--asr`, `--asr-provider` | Stage 1 provider (`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`) |
 | `--asr-model` | Stage 1 upstream model ID |
 | `--asr-api` | Stage 1 protocol (`auto`, `audio-transcriptions`, `chat-completions`) |
 | `--asr-effort` | Stage 1 thinking budget |
-| `--refiner`, `--refiner-provider` | Stage 2 provider (`codex`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`) |
+| `--refiner`, `--refiner-provider` | Stage 2 provider (`auto`, `codex`, `deepseek`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`) |
 | `--refiner-model` | Stage 2 upstream model ID |
 | `--refiner-api` | Stage 2 protocol (`auto`, `chat-completions`, `responses`) |
 | `--refiner-effort`, `--effort` | Stage 2 thinking budget |

@@ -788,7 +788,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         )
         self.assertEqual(
             VALID_REFINER_PROVIDERS,
-            frozenset({"codex", "dashscope", "volcengine", "openrouter", "gemini", "openai", "groq", "siliconflow", "openai-compatible", "off"}),
+            frozenset({"auto", "codex", "deepseek", "dashscope", "volcengine", "openrouter", "gemini", "openai", "groq", "siliconflow", "openai-compatible", "off"}),
         )
         self.assertEqual(VALID_ASR_APIS, frozenset({"auto", "audio-transcriptions", "chat-completions"}))
         self.assertEqual(
@@ -796,16 +796,20 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             frozenset({"auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"}),
         )
 
-        # Default Config uses canonical v0.2.0 values
+        # Default Config uses canonical v0.10-1 auto-routing values without polluting deferred model/effort
         dcfg = Config()
         self.assertEqual(dcfg.asr.provider, "auto")
         self.assertEqual(dcfg.asr.api, "auto")
         self.assertEqual(dcfg.asr.effort, "auto")
-        self.assertEqual(dcfg.refiner.provider, "codex")
-        self.assertEqual(dcfg.refiner.model, "gpt-6-luna")
-        self.assertEqual(dcfg.refiner.effort, "low")
+        self.assertEqual(dcfg.refiner.provider, "auto")
+        self.assertEqual(dcfg.refiner.model, "")
+        self.assertEqual(dcfg.refiner.effort, "")
+        self.assertEqual(dcfg.refiner.effective_model("codex"), "gpt-6-luna")
+        self.assertEqual(dcfg.refiner.effective_effort("codex"), "low")
+        self.assertEqual(dcfg.refiner.effective_model("deepseek"), "deepseek-flash")
+        self.assertEqual(dcfg.refiner.effective_effort("deepseek"), "auto")
 
-        # Built-in default models, efforts & base_urls strictly match v0.9-1 table
+        # Built-in default models, efforts & base_urls strictly match v0.9-1 / v0.10-1 table
         self.assertEqual(DEFAULT_ASR_MODELS["dashscope"], "qwen3-asr-flash")
         self.assertEqual(DEFAULT_ASR_MODELS["doubao"], "bigmodel")
         self.assertEqual(DEFAULT_ASR_MODELS["openrouter"], "qwen/qwen3-asr-1.7b")
@@ -816,6 +820,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(DEFAULT_ASR_MODELS["openai-compatible"], "gpt-4o-mini-transcribe")
 
         self.assertEqual(DEFAULT_REFINER_MODELS["codex"], "gpt-6-luna")
+        self.assertEqual(DEFAULT_REFINER_MODELS["deepseek"], "deepseek-flash")
         self.assertEqual(DEFAULT_REFINER_MODELS["dashscope"], "qwen3.8-flash")
         self.assertEqual(DEFAULT_REFINER_MODELS["volcengine"], "doubao-seed-2-0-mini-260428")
         self.assertEqual(DEFAULT_REFINER_MODELS["openrouter"], "google/gemini-3.5-flash-lite")
@@ -827,23 +832,24 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(DEFAULT_REFINER_EFFORTS, {"codex": "low", "openai": "low"})
         self.assertEqual(RefinerConfig(provider="codex").effort, "low")
         self.assertEqual(RefinerConfig(provider="openai").effort, "low")
-        for non_codex in ("openrouter", "dashscope", "volcengine", "gemini", "openai-compatible"):
+        for non_codex in ("deepseek", "openrouter", "dashscope", "volcengine", "gemini", "openai-compatible"):
             self.assertEqual(RefinerConfig(provider=non_codex).effort, "auto")
 
         self.assertEqual(DEFAULT_ASR_BASE_URLS["openrouter"], "https://openrouter.ai/api/v1")
         self.assertEqual(DEFAULT_ASR_BASE_URLS["groq"], "https://api.groq.com/openai/v1")
         self.assertEqual(DEFAULT_ASR_BASE_URLS["siliconflow"], "https://api.siliconflow.cn/v1")
+        self.assertEqual(DEFAULT_REFINER_BASE_URLS["deepseek"], "https://api.deepseek.com/v1")
         self.assertEqual(DEFAULT_REFINER_BASE_URLS["volcengine"], "https://ark.cn-beijing.volces.com/api/v3")
         self.assertEqual(DEFAULT_REFINER_BASE_URLS["dashscope"], "https://dashscope.aliyuncs.com/compatible-mode/v1")
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             # Legacy v0.1.0 aliases and stage-mismatched providers MUST raise ConfigError
-            for bad_asr in ("ali", "qwen", "gemini-flash-audio", "codex-luna", "volcengine", "codex", "off"):
+            for bad_asr in ("ali", "qwen", "gemini-flash-audio", "codex-luna", "volcengine", "codex", "deepseek", "off"):
                 with self.subTest(bad_asr=bad_asr):
                     with self.assertRaises(ConfigError):
                         load_config(env={"HOME": str(home)}, home_dir=home, cli_overrides={"asr.provider": bad_asr})
-            for bad_refiner in ("codex-luna", "ali", "qwen", "gemini-flash-audio", "doubao", "auto"):
+            for bad_refiner in ("codex-luna", "ali", "qwen", "gemini-flash-audio", "doubao"):
                 with self.subTest(bad_refiner=bad_refiner):
                     with self.assertRaises(ConfigError):
                         load_config(env={"HOME": str(home)}, home_dir=home, cli_overrides={"refiner.provider": bad_refiner})
@@ -974,15 +980,16 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg_sw.refiner.api_key_env, "")
 
             # 5. Switching provider resets inherited effort unless same-layer effort is explicitly given;
-            #    config.example.toml loads cleanly with codex -> effort='low'
+            #    config.example.toml loads cleanly with auto -> deferred effort="" (codex -> 'low', dashscope -> 'auto')
             cfg_ex, _ = load_config(
                 config_path=_REPO_ROOT / "config.example.toml",
                 env={"HOME": str(home)},
                 home_dir=home,
                 load_default_env_files=False,
             )
-            self.assertEqual(cfg_ex.refiner.provider, "codex")
-            self.assertEqual(cfg_ex.refiner.effort, "low")
+            self.assertEqual(cfg_ex.refiner.provider, "auto")
+            self.assertEqual(cfg_ex.refiner.effort, "")
+            self.assertEqual(cfg_ex.refiner.effective_effort("codex"), "low")
             cfg_ex_or, _ = load_config(
                 config_path=_REPO_ROOT / "config.example.toml",
                 env={"HOME": str(home)},

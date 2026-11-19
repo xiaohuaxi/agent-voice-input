@@ -550,6 +550,10 @@ def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[st
                 d = json.loads(p.stdout.strip().splitlines()[-1])
                 ui_cult = str(d.get("ui_culture") or "").strip()
                 info.update(powershell_ok=bool(d.get("ok")), ps_version=str(d.get("ps_version") or ""), winmm_devs=int(d.get("wave_in_devs") or 0), fg_process=str(d.get("process") or ""), fg_title=str(d.get("title") or ""), fg_hwnd=int(d.get("hwnd") or 0), ui_culture=ui_cult, ui_lang=resolve_ui_language(cfg.ui.language, env=raw_env, win_ui_culture=ui_cult))
+                if "wasapi_ok" in d:
+                    info["wasapi_ok"] = bool(d.get("wasapi_ok"))
+                if "wasapi_state" in d:
+                    info["wasapi_state"] = str(d.get("wasapi_state") or "")
         except Exception as exc: info["ps_error"] = str(exc)
     return info
 

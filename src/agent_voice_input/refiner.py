@@ -10,12 +10,14 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import select
 import selectors
 import shutil
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import threading
 import time
@@ -70,14 +72,20 @@ from .asr_providers import (
     urllib_http_transport,
 )
 from .config import (
+    _CODEX_KEYRING_STORE_RE,
+    DEFAULT_REFINER_MODELS,
     Config,
     ConfigError,
     ProviderCredentials,
     VALID_EFFORTS,
     VALID_REFINER_PROVIDERS,
     expand_user_path,
+    find_codex_bin,
+    has_codex_local_auth,
     redact_secrets,
+    resolve_codex_home_dir,
     resolve_credentials,
+    select_refiner_provider,
 )
 from .platform_wsl import _callable_accepts_kwarg
 from .prompts import (
@@ -99,6 +107,11 @@ OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 CODEX_SUBSCRIPTION_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CODEX_ORIGINATOR = "codex_cli_rs"
 CODEX_USER_AGENT = "codex_cli_rs/0.169.0"
+CODEX_PUBLIC_FALLBACK_MODELS: tuple[str, ...] = (
+    "gpt-5.4-mini",
+    "gpt-5-codex-mini",
+    "codex-mini-latest",
+)
 
 CODEX_REFRESH_WINDOW_SEC: float = 1800.0
 CODEX_HARD_EXPIRY_SKEW_SEC: float = 60.0
@@ -188,12 +201,14 @@ class _RefinerAttemptError(RuntimeError):
         retry_after_sec: float | None = None,
         is_concurrency_limit: bool = False,
         http_status: int | None = None,
+        error_code: str = "",
     ) -> None:
         super().__init__(message)
         self.retry_kind = retry_kind
         self.retry_after_sec = retry_after_sec
         self.is_concurrency_limit = is_concurrency_limit
         self.http_status = http_status
+        self.error_code = error_code
 
 
 def _ms(t0: float, clock_fn: Callable[[], float] = time.monotonic) -> int:
@@ -271,31 +286,80 @@ def _resolve_refiner_api_key(
     raise RuntimeError(_missing_key_hint(provider_name, stage="refiner"))
 
 
-def find_codex_bin(env: Mapping[str, str] | None = None) -> str | None:
-    src = os.environ if env is None else env
-    if (c := (src.get("CODEX_BIN") or "").strip()) and os.path.isfile(c) and os.access(c, os.X_OK):
-        return c
-    host_home = (os.environ.get("HOME") or "").strip()
-    src_home = (src.get("HOME") or "").strip()
-    hermetic = env is not None and (
-        "PATH" not in src
-        or not src_home
-        or (bool(host_home) and src_home != host_home)
-    )
-    raw_path = src.get("PATH")
-    if raw_path is not None:
-        if raw_path and (found := shutil.which("codex", path=raw_path)):
-            return found
-    elif not hermetic:
-        if found := shutil.which("codex"):
-            return found
-    if hermetic and not src_home:
-        return None
-    home = expand_user_path("~", env=src)
-    cands = [home / ".local/bin/codex"]
-    if not hermetic:
-        cands.extend((Path("/usr/local/bin/codex"), Path("/opt/homebrew/bin/codex")))
-    return next((str(p) for p in cands if p.is_file() and os.access(str(p), os.X_OK)), None)
+_CODEX_MODEL_UNSUPPORTED_RE = re.compile(
+    r"(?i)(?:model_not_found|model_not_supported"
+    r"|\bmodel\b[^:;\n]{0,80}?(?:does\s+not\s+exist|is\s+not\s+found|not\s+found"
+    r"|is\s+not\s+supported|not\s+supported|is\s+unsupported|unsupported"
+    r"|is\s+unavailable|unavailable|(?:do\s+not|don't)\s+have\s+access|no\s+access)"
+    r"|(?:(?:do\s+not|don't)\s+have\s+access|no\s+access)\s+to\s+(?:the\s+)?model\b)"
+)
+_CODEX_PARAM_OR_CTX_ERR_RE = re.compile(
+    r"(?i)\b(?:unsupported|invalid|unknown)\s+(?:parameter|value|argument|field|option|header)\b"
+    r"|context_length_exceeded|maximum\s+context\s+length"
+)
+
+
+def _read_codex_models_cache_slugs(env: Mapping[str, str] | None = None) -> list[str]:
+    codex_home = resolve_codex_home_dir(env)
+    if codex_home is None:
+        return []
+    cache_path = codex_home / "models_cache.json"
+    try:
+        st = os.stat(cache_path)
+    except OSError:
+        return []
+    if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > 4_194_304:
+        return []
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, Mapping):
+        return []
+    models = data.get("models")
+    if not isinstance(models, list):
+        return []
+    slugs: list[str] = []
+    seen: set[str] = set()
+    for item in models:
+        if isinstance(item, Mapping):
+            s = str(item.get("slug") or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                slugs.append(s)
+    return slugs
+
+
+def resolve_codex_default_model(cfg: Config, env: Mapping[str, str] | None = None) -> str:
+    """Resolve effective Codex model, falling back to a public mini model when internal ``gpt-6-luna`` is absent."""
+    if cfg.refiner.has_explicit_model("codex"):
+        return cfg.refiner.effective_model("codex")
+    default_mod = DEFAULT_REFINER_MODELS["codex"]
+    ordered_slugs = _read_codex_models_cache_slugs(env)
+    if not ordered_slugs:
+        return default_mod
+    slug_set = set(ordered_slugs)
+    if default_mod in slug_set:
+        return default_mod
+    for cand in CODEX_PUBLIC_FALLBACK_MODELS:
+        if cand in slug_set:
+            return cand
+    for s in ordered_slugs:
+        low = s.lower()
+        if "mini" in low or "luna" in low:
+            return s
+    return CODEX_PUBLIC_FALLBACK_MODELS[0]
+
+
+def _is_codex_model_unsupported_error(err: _RefinerAttemptError) -> bool:
+    if err.http_status not in (400, 404, None):
+        return False
+    if err.error_code.strip().lower() in ("model_not_found", "model_not_supported"):
+        return True
+    msg = str(err)
+    if _CODEX_PARAM_OR_CTX_ERR_RE.search(msg):
+        return False
+    return bool(_CODEX_MODEL_UNSUPPORTED_RE.search(msg))
 
 
 def resolve_refiner_prompt(cfg: Config | None = None, *, mode: str = "agent") -> str:
@@ -589,6 +653,7 @@ def _classify_stream_error_event(
         retry_kind=rkind,
         retry_after_sec=rafter,
         is_concurrency_limit=conc,
+        error_code=code,
     )
 
 
@@ -723,6 +788,8 @@ def _run_refiner_retry_loop(
     secrets_fn: Callable[[], Sequence[str]],
     attempt_fn: Callable[[float, float | None, bool], tuple[str, _TokenUsageTuple, int]],
     on_401_refresh: Callable[[], None] | None = None,
+    model_fn: Callable[[], str] | None = None,
+    on_model_fallback: Callable[[_RefinerAttemptError], bool] | None = None,
     context_chars: int = 0,
     context_chunks: int = 0,
     cancel_token: CancelToken | None = None,
@@ -731,17 +798,19 @@ def _run_refiner_retry_loop(
     max_retries = max(0, int(cfg.refiner.max_retries))
     retries_used = 0
     refreshed_401 = False
+    switched_model = False
     first_attempt = True
     total_init_ms = 0
     eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
     cancelled = (lambda: False) if eff_cancelled is None else eff_cancelled
     _cancel_kind = lambda: _cancel_fallback_kind(cancel_token, is_cancelled) or "superseded"
+    _cur_model = (lambda: model) if model_fn is None else model_fn
 
     def _fb(kind: str, warn: str = "") -> RefinerResult:
         return _fallback_result(
             clean_draft,
             provider_name,
-            model,
+            _cur_model(),
             t0,
             clock_fn,
             kind,
@@ -807,7 +876,7 @@ def _run_refiner_retry_loop(
             return RefinerResult(
                 _clean_out(out_txt, clean_draft),
                 provider_name,
-                model,
+                _cur_model(),
                 _ms(t0, clock_fn),
                 retries=retries_used,
                 input_tokens=usage[0],
@@ -836,6 +905,10 @@ def _run_refiner_retry_loop(
                         extra_secrets=secrets_fn(),
                     )
                     return _fb("asr_draft", safe_401)
+
+            if on_model_fallback is not None and not switched_model and on_model_fallback(err):
+                switched_model = True
+                continue
 
             now_err = clock_fn()
             if err.retry_kind == "rate_limit":
@@ -1635,9 +1708,10 @@ class OpenAIResponsesRefiner(BaseRefiner):
             data, non_json = {}, True
 
         if non_json:
-            err_msg, classify_data = raw_text or f"status {status}", None
+            err_code, err_msg, classify_data = "", raw_text or f"status {status}", None
         else:
             err_dict, err_msg = _extract_responses_http_error(data, raw_text)
+            err_code = str(err_dict.get("code") or "").strip()
             classify_data = data if "error" in data else {"error": err_dict}
 
         excerpt = redact_secrets(err_msg, self.env, cfg=self.cfg, extra_secrets=secrets)[:180]
@@ -1650,7 +1724,15 @@ class OpenAIResponsesRefiner(BaseRefiner):
             retry_after_sec=rafter,
             is_concurrency_limit=is_conc,
             http_status=status,
+            error_code=err_code,
         )
+
+    def _select_request_model(self) -> str:
+        return self.cfg.refiner.effective_model(self.provider_name)
+
+    def _maybe_switch_fallback_model(self, err: _RefinerAttemptError, current_model: str) -> str | None:
+        _ = (err, current_model)
+        return None
 
     def refine(
         self,
@@ -1665,7 +1747,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
         workspace_cwd: str = "",
         target_hint: str = "",
     ) -> RefinerResult:
-        model = self.cfg.refiner.effective_model(self.provider_name)
+        model = self._select_request_model()
         if self.provider_name == "openai-compatible":
             if not self.cfg.refiner.base_url.strip():
                 raise ConfigError("refiner.base_url must be explicitly set when refiner.provider is 'openai-compatible'")
@@ -1736,9 +1818,11 @@ class OpenAIResponsesRefiner(BaseRefiner):
                 context_chars=ctx_chars, context_chunks=ctx_chunks,
             )
 
-        def _encode_body(target: _ResponsesAuthTarget) -> bytes:
+        model_box = [model]
+
+        def _encode_body(target: _ResponsesAuthTarget, req_model: str) -> bytes:
             payload = self._build_payload(
-                model=model,
+                model=req_model,
                 effort=eff,
                 instructions=instructions,
                 context_blocks=context_blocks,
@@ -1748,20 +1832,29 @@ class OpenAIResponsesRefiner(BaseRefiner):
             )
             return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-        body_box = [_encode_body(auth_box[0])]
+        body_box = [_encode_body(auth_box[0], model_box[0])]
 
         def _refresh_401() -> None:
             new_auth = self._resolve_endpoint_and_auth(force_refresh=True, is_cancelled=eff_cancelled)
             self._sync_auth_identity(new_auth)
             if new_auth.is_codex_subscription != auth_box[0].is_codex_subscription:
-                body_box[0] = _encode_body(new_auth)
+                body_box[0] = _encode_body(new_auth, model_box[0])
             auth_box[0] = new_auth
+
+        def _switch_model(err: _RefinerAttemptError) -> bool:
+            fb_mod = self._maybe_switch_fallback_model(err, model_box[0])
+            if not fb_mod:
+                return False
+            model_box[0] = fb_mod
+            body_box[0] = _encode_body(auth_box[0], fb_mod)
+            return True
 
         return _run_refiner_retry_loop(
             cfg=self.cfg,
             env=self.env,
             provider_name=self.provider_name,
-            model=model,
+            model=model_box[0],
+            model_fn=lambda: model_box[0],
             clean_draft=clean_draft,
             t0=t0,
             tsec=tsec,
@@ -1775,7 +1868,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
             secrets_fn=lambda: self._extra_redaction_secrets(auth_box[0]),
             attempt_fn=lambda req_timeout, wall_dl, is_first: self._execute_streaming_attempt(
                 auth_target=auth_box[0],
-                model=model,
+                model=model_box[0],
                 session_uuid=session_uuid,
                 body_bytes=body_box[0],
                 req_timeout=req_timeout,
@@ -1788,6 +1881,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
                 cancel_token=cancel_token,
             ),
             on_401_refresh=(_refresh_401 if auth_box[0].can_refresh_on_401 else None),
+            on_model_fallback=_switch_model,
             context_chars=ctx_chars,
             context_chunks=ctx_chunks,
             cancel_token=cancel_token,
@@ -1862,15 +1956,49 @@ class CodexRefiner(OpenAIResponsesRefiner):
         self._cached_mtime_ns: int | None = None
         self._refresh_cooldown_until: float = -1e9
         self._refresh_procs: set[subprocess.Popen[bytes]] = set()
+        self._runtime_fallback_model: str = ""
 
     def _resolve_codex_home(self) -> Path | None:
-        if raw_ch := (self.env.get("CODEX_HOME") or "").strip():
-            return expand_user_path(raw_ch, env=self.env)
-        if raw_home := (self.env.get("HOME") or "").strip():
-            return Path(raw_home) / ".codex"
-        if self._explicit_env:
+        return resolve_codex_home_dir(self.env if self._explicit_env else None)
+
+    def _select_request_model(self) -> str:
+        if self.cfg.refiner.has_explicit_model("codex"):
+            return self.cfg.refiner.effective_model("codex")
+        with self._state_lock:
+            if self._runtime_fallback_model:
+                return self._runtime_fallback_model
+        return resolve_codex_default_model(self.cfg, self.env if self._explicit_env else None)
+
+    def _pick_runtime_fallback_model(self, failed_model: str) -> str:
+        slugs = [
+            s
+            for s in _read_codex_models_cache_slugs(self.env if self._explicit_env else None)
+            if s != failed_model
+        ]
+        if slugs:
+            slug_set = set(slugs)
+            for cand in CODEX_PUBLIC_FALLBACK_MODELS:
+                if cand in slug_set:
+                    return cand
+            for s in slugs:
+                if "mini" in s.lower() or "luna" in s.lower():
+                    return s
+        for cand in CODEX_PUBLIC_FALLBACK_MODELS:
+            if cand != failed_model:
+                return cand
+        return CODEX_PUBLIC_FALLBACK_MODELS[0]
+
+    def _maybe_switch_fallback_model(self, err: _RefinerAttemptError, current_model: str) -> str | None:
+        if self.cfg.refiner.has_explicit_model("codex") or not _is_codex_model_unsupported_error(err):
             return None
-        return expand_user_path("~", env=os.environ) / ".codex"
+        with self._state_lock:
+            if self._runtime_fallback_model:
+                return self._runtime_fallback_model if current_model != self._runtime_fallback_model else None
+            fb = self._pick_runtime_fallback_model(current_model)
+            if not fb or fb == current_model:
+                return None
+            self._runtime_fallback_model = fb
+            return fb
 
     def _resolve_auth_json_path(self) -> Path | None:
         ch = self._resolve_codex_home()
@@ -2303,17 +2431,93 @@ class CodexRefiner(OpenAIResponsesRefiner):
             self._terminate_proc(proc)
 
 
-def inspect_codex_auth_status(cfg: Config, env: Mapping[str, str] | None = None) -> tuple[bool, str]:
-    """Check Codex credential readiness for ``doctor`` without exposing any token or account_id."""
-    ref = CodexRefiner(cfg, env=env)
+def inspect_codex_auth_status(cfg: Config, env: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """Offline, zero-subprocess check of local Codex credential state (``'OK' | 'WARN' | 'FAIL'``)."""
+    src = os.environ if env is None else env
+    codex_home = resolve_codex_home_dir(env)
+    if codex_home is None:
+        return "FAIL", "no CODEX_HOME or HOME directory configured"
+    cbin = find_codex_bin(env)
+
+    auth_path = codex_home / "auth.json"
     try:
-        creds_item = ref._resolve_codex_credentials(force_refresh=False)
-        return True, f"auth={creds_item.mode} ({creds_item.source})"
-    except Exception as exc:
-        safe = redact_secrets(str(exc), ref.env, cfg=cfg, extra_secrets=ref._extra_redaction_secrets(None))
-        return False, safe
-    finally:
-        ref.close()
+        st = os.stat(auth_path)
+    except FileNotFoundError:
+        st = None
+    except OSError as exc:
+        return "FAIL", redact_secrets(f"cannot stat auth.json: {exc}", src, cfg=cfg)
+
+    if st is not None:
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 1_048_576:
+            return "FAIL", "unsafe or oversized Codex auth.json"
+        if st.st_size > 0:
+            try:
+                data = json.loads(auth_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                return "FAIL", redact_secrets(f"invalid Codex auth.json: {exc}", src, cfg=cfg)
+            if not isinstance(data, Mapping):
+                return "FAIL", "invalid root in Codex auth.json"
+
+            auth_mode = str(data.get("auth_mode") or "").strip().lower()
+            file_api_key = str(data.get("OPENAI_API_KEY") or "").strip()
+            env_api_key = str(src.get("OPENAI_API_KEY") or "").strip()
+            tokens = data.get("tokens") if isinstance(data.get("tokens"), Mapping) else {}
+            access_token = str(tokens.get("access_token") or "").strip()
+            refresh_token = str(tokens.get("refresh_token") or "").strip()
+
+            is_api_key_mode = auth_mode in ("api_key", "apikey") or (
+                auth_mode not in ("chatgpt", "chatgptauthtokens")
+                and not access_token
+                and not refresh_token
+                and bool(file_api_key or env_api_key)
+            )
+            if is_api_key_mode:
+                if file_api_key:
+                    return "OK", "auth=api_key (auth.json)"
+                if env_api_key:
+                    return "OK", "auth=api_key (OPENAI_API_KEY)"
+                return "FAIL", "auth_mode=api_key in auth.json, but OPENAI_API_KEY is empty"
+
+            if access_token:
+                exp, _, _ = _extract_jwt_metadata(access_token)
+                if exp is None or (exp - time.time()) > CODEX_HARD_EXPIRY_SKEW_SEC:
+                    return "OK", "auth=chatgpt (auth.json)"
+                if refresh_token and cbin is not None:
+                    return (
+                        "WARN",
+                        "auth=chatgpt (auth.json expired; unverified offline, pass --ping to refresh & verify)",
+                    )
+                return "FAIL", "Codex JWT in auth.json is expired (run 'codex login')"
+
+            if refresh_token:
+                if cbin is not None:
+                    return (
+                        "WARN",
+                        "auth=chatgpt (auth.json refresh_token; unverified offline, pass --ping to verify)",
+                    )
+                return "FAIL", "auth.json has refresh_token only, and codex binary was not found"
+
+    cfg_path = codex_home / "config.toml"
+    try:
+        cst = os.stat(cfg_path)
+    except OSError:
+        cst = None
+    if cst is not None and stat.S_ISREG(cst.st_mode) and 0 < cst.st_size <= 1_048_576:
+        try:
+            cfg_txt = cfg_path.read_text(encoding="utf-8-sig")
+        except (OSError, ValueError):
+            cfg_txt = ""
+        if _CODEX_KEYRING_STORE_RE.search(cfg_txt):
+            if cbin is not None:
+                return "WARN", "auth=keyring (config.toml; unverified offline, pass --ping to verify)"
+            return "FAIL", "keyring store configured in config.toml, but codex binary was not found"
+
+    if cbin is not None:
+        return (
+            "WARN",
+            "auth=codex-cli (no auth.json; keyring login unverified offline, pass --ping to verify)",
+        )
+    return "FAIL", "no Codex credentials found in ~/.codex/auth.json (run 'codex login')"
 
 
 class GeminiRefiner(_HttpTransportRefiner):
@@ -2577,13 +2781,9 @@ def create_refiner(
     sleep_fn: Callable[[float], None] = time.sleep,
     rand_fn: Callable[[], float] = random.random,
 ) -> BaseRefiner:
-    prov = cfg.refiner.provider.strip().lower()
-    if prov in ("none", "false", "0", "disabled"):
-        prov = "off"
-    if prov not in VALID_REFINER_PROVIDERS:
-        raise ConfigError(
-            f"refiner.provider must be one of {sorted(VALID_REFINER_PROVIDERS)}, got {cfg.refiner.provider!r}"
-        )
+    eff_env = os.environ if env is None else env
+    eff_creds = creds or resolve_credentials(cfg, eff_env)
+    prov = select_refiner_provider(cfg, eff_creds, env)
     if prov == "openai-compatible":
         if not cfg.refiner.base_url.strip():
             raise ConfigError(
@@ -2608,9 +2808,9 @@ def create_refiner(
         "rand_fn": rand_fn,
     }
     if prov == "codex":
-        return CodexRefiner(cfg, creds, runtime_dir=runtime_dir, **common_kw)
+        return CodexRefiner(cfg, eff_creds, runtime_dir=runtime_dir, **common_kw)
     if eff_api == "gemini":
-        return GeminiRefiner(cfg, creds, **common_kw)
+        return GeminiRefiner(cfg, eff_creds, **common_kw)
     if eff_api == "responses":
-        return OpenAIResponsesRefiner(cfg, creds, provider_name=prov, **common_kw)
-    return OpenAICompatibleRefiner(cfg, creds, provider_name=prov, **common_kw)
+        return OpenAIResponsesRefiner(cfg, eff_creds, provider_name=prov, **common_kw)
+    return OpenAICompatibleRefiner(cfg, eff_creds, provider_name=prov, **common_kw)

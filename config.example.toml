@@ -91,9 +91,13 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 
 [refiner]
 # Stage 2 context-aware refinement provider:
-# "codex" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
+# "auto" | "codex" | "deepseek" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
+# When "auto" (default), prefers local `codex` CLI login if present, otherwise selects the first configured credential in order:
+#   deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow
+# (falls back cleanly to "off" if no Stage 2 credentials are set).
 # Built-in default models (used when model = "" or when provider is overridden via CLI without a new model):
-# - codex             -> "gpt-6-luna" (stateless Keep-Alive HTTP /responses reusing local codex login; never enables Fast mode)
+# - codex             -> "gpt-6-luna" (stateless Keep-Alive HTTP /responses reusing local codex login, with automatic public mini-model fallback when internal models are unavailable; never enables Fast mode)
+# - deepseek          -> "deepseek-flash" (official https://api.deepseek.com/v1 with thinking disabled by default)
 # - dashscope         -> "qwen3.8-flash"
 # - volcengine        -> "doubao-seed-2-0-mini-260428"
 # - openrouter        -> "google/gemini-3.5-flash-lite"
@@ -101,9 +105,9 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 # - openai            -> "gpt-4o-mini"
 # - groq              -> "llama-3.3-70b-versatile"
 # - siliconflow       -> "Qwen/Qwen2.5-7B-Instruct"
-# - openai-compatible -> requires explicit base_url and model (e.g. DeepSeek https://api.deepseek.com/v1 + "deepseek-flash", or local loopback Ollama/vLLM without API key)
+# - openai-compatible -> requires explicit base_url and model (e.g. local loopback Ollama/vLLM without API key)
 # - off               -> disable Stage 2 refinement
-provider = "codex"
+provider = "auto"
 # Leave empty "" to use the selected provider's built-in default model above
 model = ""
 # Stage 2 wire protocol:

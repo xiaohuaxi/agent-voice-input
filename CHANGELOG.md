@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Zero-friction Stage 2 `auto` routing, built-in `deepseek` provider & Codex public model fallback**: Changed default `refiner.provider` to `"auto"` (zero-subprocess check preferring local `~/.codex/auth.json` login, falling back through configured API credentials `deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow`, or cleanly bypassing Stage 2 when none are set); added first-class `deepseek` refiner provider (`DEEPSEEK_API_KEY`, default `deepseek-flash` on `https://api.deepseek.com/v1` with thinking disabled); and added static `models_cache.json` + one-shot runtime fallback to public Codex mini models (`gpt-5.4-mini` / `gpt-5-codex-mini` / `codex-mini-latest`) when default `gpt-6-luna` is unavailable on standard ChatGPT accounts.
+- **`agent-voice-input init [--force]` & upgraded `doctor [--ping] [--json]`**: Added `init` to atomically create `0700` config directories (`AGENT_VOICE_INPUT_CONFIG` / `XDG_CONFIG_HOME` / `~/.config/agent-voice-input`) with `0600` `config.toml` and fully commented `agent-voice-input.env` templates; upgraded `doctor` with strict macOS/WSL2 readiness checks (read-only `AXIsProcessTrusted` / `CGPreflightListenEventAccess` on macOS, non-activating WASAPI default capture endpoint probe on WSL2, credential file permission warnings, daemon/hook status, and actionable 1-line `Fix:` commands) plus optional 5s zero-token `--ping` endpoint verification and `--json` redacted output.
+
 ## [0.9.0] - 2026-11-19
 
 ### Added

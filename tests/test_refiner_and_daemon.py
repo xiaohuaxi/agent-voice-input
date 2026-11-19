@@ -402,7 +402,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertEqual(parsed["asr"]["model"], "")
         self.assertEqual(parsed["asr"]["api"], "auto")
         self.assertEqual(parsed["asr"]["effort"], "auto")
-        self.assertEqual(parsed["refiner"]["provider"], "codex")
+        self.assertEqual(parsed["refiner"]["provider"], "auto")
         self.assertEqual(parsed["refiner"]["model"], "")
         self.assertEqual(parsed["refiner"]["api"], "auto")
         self.assertNotIn("max_turns_per_thread", toml_raw)
@@ -416,10 +416,11 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertEqual(cfg.ui.language, "auto")
         self.assertEqual(cfg.ui.position, "bottom")
         self.assertEqual(cfg.audio.macos_device, "default")
-        self.assertEqual(cfg.refiner.provider, "codex")
-        self.assertEqual(cfg.refiner.model, "gpt-6-luna")
+        self.assertEqual(cfg.refiner.provider, "auto")
+        self.assertEqual(cfg.refiner.model, "")
         self.assertEqual(cfg.refiner.api, "auto")
-        self.assertEqual(cfg.refiner.effective_api(), "responses")
+        self.assertEqual(cfg.refiner.effective_api("codex"), "responses")
+        self.assertEqual(cfg.refiner.effective_api("deepseek"), "chat-completions")
         self.assertIs(cfg.audio.beep, False)
 
         env_raw = env_path.read_text(encoding="utf-8")
@@ -427,6 +428,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         loaded = load_env_files({}, env_paths=[env_path])
         for expected_key in (
             "DASHSCOPE_API_KEY",
+            "DEEPSEEK_API_KEY",
             "DOUBAO_ASR_APP_ID",
             "DOUBAO_ASR_API_KEY",
             "ARK_API_KEY",

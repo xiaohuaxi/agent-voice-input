@@ -1318,6 +1318,35 @@ public static class VoiceWinShim {
         }
     }
 
+    public static bool ProbeDefaultWasapiCapture(out string stateDesc) {
+        stateDesc = "";
+        IMMDeviceEnumerator en = null;
+        IMMDevice dev = null;
+        try {
+            en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+            int hr = en.GetDefaultAudioEndpoint(1, 0, out dev);
+            if (hr < 0 || dev == null) {
+                stateDesc = string.Format(CultureInfo.InvariantCulture, "no_default:0x{0:X8}", (uint)hr);
+                return false;
+            }
+            int state = 0;
+            hr = dev.GetState(out state);
+            if (hr < 0) {
+                stateDesc = string.Format(CultureInfo.InvariantCulture, "get_state_failed:0x{0:X8}", (uint)hr);
+                return false;
+            }
+            bool active = (state & 1) != 0;
+            stateDesc = active ? "active" : string.Format(CultureInfo.InvariantCulture, "inactive:{0}", state);
+            return active;
+        } catch (Exception ex) {
+            stateDesc = "exc:" + ex.GetType().Name;
+            return false;
+        } finally {
+            if (dev != null) { try { Marshal.ReleaseComObject(dev); } catch { } }
+            if (en != null) { try { Marshal.ReleaseComObject(en); } catch { } }
+        }
+    }
+
     private static int DrainWasapiPackets(RecSession sess, IAudioCaptureClient cap, MemoryStream dst, byte[] zeros, ref byte[] scratch, out bool gotFrames) {
         gotFrames = false;
         uint pkt = 0;
@@ -2323,7 +2352,8 @@ if ($Mode -eq "clip-self-check") {
 }
 if ($Mode -eq "probe") {
     $hwnd = 0L; $proc = ""; $title = ""; [VoiceWinShim]::QueryForeground([ref]$hwnd, [ref]$proc, [ref]$title)
-    Write-JsonLine @{ ok = $true; ps_version = $PSVersionTable.PSVersion.ToString(); wave_in_devs = [VoiceWinShim]::waveInGetNumDevs(); hwnd = $hwnd; process = $proc; title = $title; ui_culture = [VoiceWinShim]::GetHostUiCulture(); dpi = [VoiceWinShim]::GetTargetDpi([IntPtr]$hwnd) }
+    $wasapiState = ""; $wasapiOk = [VoiceWinShim]::ProbeDefaultWasapiCapture([ref]$wasapiState)
+    Write-JsonLine @{ ok = $true; ps_version = $PSVersionTable.PSVersion.ToString(); wasapi_ok = [bool]$wasapiOk; wasapi_state = [string]$wasapiState; wave_in_devs = [VoiceWinShim]::waveInGetNumDevs(); hwnd = $hwnd; process = $proc; title = $title; ui_culture = [VoiceWinShim]::GetHostUiCulture(); dpi = [VoiceWinShim]::GetTargetDpi([IntPtr]$hwnd) }
     exit 0
 }
 

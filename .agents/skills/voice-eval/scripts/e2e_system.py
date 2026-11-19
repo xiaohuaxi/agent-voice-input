@@ -777,7 +777,7 @@ def main(argv: list[str] | None = None) -> int:
             asr_proxy = _ObservingAsrProxy(real_asr)
             refiner = create_refiner(cfg, creds, env=e2e_env, runtime_dir=rt_dir)
             expects_stage2 = (
-                cfg.refiner.provider.strip().lower() not in ("", "off", "none", "false", "0", "disabled")
+                getattr(refiner, "provider_name", "off") not in ("", "off", "none")
                 and (not asr_proxy.single_hop or cfg.refiner.force_on_single_hop)
             )
 

@@ -1,26 +1,44 @@
-"""CLI entrypoint for agent-voice-input (daemon, start, restart, stop, status, toggle, cancel, once, retry, doctor, key-test, session-hook)."""
+"""CLI entrypoint for agent-voice-input (init, daemon, start, restart, stop, status, toggle, cancel, once, retry, doctor, key-test, session-hook)."""
 from __future__ import annotations
 
-import argparse, json, os, signal, socket, stat, subprocess, sys, time
+import argparse, dataclasses, json, os, shlex, signal, socket, stat, subprocess, sys, time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .asr_providers import _is_loopback_url
+from .asr_providers import (
+    GEMINI_DEFAULT_BASE_URL,
+    HttpRequest,
+    HttpTransport,
+    _close_quietly,
+    _is_loopback_url,
+    _missing_key_hint,
+    _validate_request_url,
+    urllib_http_transport,
+)
 from .audio_proc import get_failed_audio_dir, list_failed_audios, resolve_failed_audio, resolve_ffmpeg_bin
 from .config import (
     Config,
     ConfigError,
+    ProviderCredentials,
+    _host_matches_domain,
+    default_config_file_candidates,
+    default_env_file_candidates,
+    ensure_secure_dir,
     expand_user_path,
     get_runtime_dir,
     is_dashscope_omni_chat_model,
+    is_gemini_native_url,
     load_config,
     load_env_files,
     redact_secrets,
     resolve_asr_api,
+    resolve_codex_home_dir,
     resolve_credentials,
+    resolve_target_config_paths,
     select_asr_provider,
+    select_refiner_provider,
 )
 from .daemon import (
     VoiceInputDaemon,
@@ -39,9 +57,119 @@ from .platform_macos import (
     run_macos_key_test,
 )
 from .platform_wsl import ForegroundWindow, is_wsl, probe_wsl_host, run_key_test
-from .refiner import find_codex_bin, inspect_codex_auth_status
+from .refiner import (
+    CODEX_SUBSCRIPTION_BASE_URL,
+    CodexRefiner,
+    _build_responses_url,
+    find_codex_bin,
+    inspect_codex_auth_status,
+    resolve_codex_default_model,
+)
 from .session_ctx import SessionTracker
 from .session_title import run_session_hook
+
+_INIT_CONFIG_TOML = """\
+# agent-voice-input configuration (chmod 600)
+# Priority: CLI flags > config.toml > built-in defaults
+
+[hotkey]
+# Default Right Ctrl ("RControl"); also supports "RAlt", "Fn" (macOS), "F13".."F20", etc.
+key = "RControl"
+# "tap_toggle" (tap to start/finish) | "ptt" (hold to speak, release to transcribe)
+trigger_mode = "tap_toggle"
+
+[asr]
+# "auto" selects the first configured API key: dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow
+provider = "auto"
+
+[refiner]
+# "auto" prefers local `codex` login, then configured API keys (deepseek -> dashscope -> gemini -> openrouter -> ...), or falls back to "off"
+provider = "auto"
+"""
+
+_INIT_ENV_TEMPLATE = """\
+# agent-voice-input API credentials (chmod 600)
+# Uncomment and fill in AT LEAST ONE provider key below:
+
+# Alibaba Cloud Bailian / DashScope (Stage 1 qwen3-asr-flash + Stage 2 qwen3.8-flash, or single-hop qwen3.8-omni-flash)
+# DASHSCOPE_API_KEY="sk-..."
+
+# DeepSeek official API (fast Stage 2 refiner: deepseek-flash)
+# DEEPSEEK_API_KEY="sk-..."
+
+# OpenRouter (single key for Stage 1 ASR + Stage 2 Refiner)
+# OPENROUTER_API_KEY="sk-or-..."
+
+# Google Gemini (single-hop Stage 1 audio + context refinement, or Stage 2 Refiner)
+# GEMINI_API_KEY="AIza..."
+
+# Volcengine Doubao Speech (Stage 1 ASR) & Volcengine Ark (Stage 2 Refiner)
+# DOUBAO_ASR_APP_ID="..."
+# DOUBAO_ASR_API_KEY="..."
+# ARK_API_KEY="..."
+
+# OpenAI / Groq / SiliconFlow
+# OPENAI_API_KEY="sk-..."
+# GROQ_API_KEY="gsk_..."
+# SILICONFLOW_API_KEY="sk-..."
+"""
+
+_MACOS_MODIFIER_HOTKEYS = frozenset(
+    {
+        "rcontrol",
+        "rctrl",
+        "rightcontrol",
+        "rightctrl",
+        "lcontrol",
+        "lctrl",
+        "leftcontrol",
+        "leftctrl",
+        "control",
+        "ctrl",
+        "ralt",
+        "roption",
+        "rightalt",
+        "rightoption",
+        "rmenu",
+        "lalt",
+        "loption",
+        "leftalt",
+        "leftoption",
+        "lmenu",
+        "alt",
+        "option",
+        "rcommand",
+        "rcmd",
+        "rightcommand",
+        "rightcmd",
+        "lcommand",
+        "lcmd",
+        "leftcommand",
+        "leftcmd",
+        "command",
+        "cmd",
+        "rshift",
+        "rightshift",
+        "lshift",
+        "leftshift",
+        "shift",
+        "fn",
+        "function",
+        "globe",
+        "capslock",
+        "0x3e",
+        "0x3b",
+        "0x3d",
+        "0x3a",
+        "0x36",
+        "0x37",
+        "0x3c",
+        "0x38",
+        "0x39",
+        "0x3f",
+        "0xb3",
+    }
+)
 
 
 def _add_common_flags(p: argparse.ArgumentParser, *, is_sub: bool = False) -> None:
@@ -71,7 +199,7 @@ def _add_common_flags(p: argparse.ArgumentParser, *, is_sub: bool = False) -> No
         "--refiner",
         "--refiner-provider",
         dest="refiner",
-        help="Override Stage 2 refiner provider (codex|dashscope|volcengine|openrouter|gemini|openai|groq|siliconflow|openai-compatible|off)",
+        help="Override Stage 2 refiner provider (auto|codex|deepseek|dashscope|volcengine|openrouter|gemini|openai|groq|siliconflow|openai-compatible|off)",
         **kw,
     )
     p.add_argument("--refiner-model", dest="refiner_model", help="Override Stage 2 refiner model", **kw)
@@ -95,9 +223,10 @@ def _cred_label(item: Any) -> str:
 
 
 def _check_codex_model(model: str, env: dict[str, str]) -> str:
-    if env is not os.environ and not (env.get("CODEX_HOME") or "").strip() and not (env.get("HOME") or "").strip():
+    codex_home = resolve_codex_home_dir(env)
+    if codex_home is None:
         return "models_cache.json not found"
-    cache = Path(env.get("CODEX_HOME") or (expand_user_path("~", env=env) / ".codex")) / "models_cache.json"
+    cache = codex_home / "models_cache.json"
     if not cache.is_file():
         return "models_cache.json not found"
     try:
@@ -107,70 +236,546 @@ def _check_codex_model(model: str, env: dict[str, str]) -> str:
         return "unreadable models_cache.json"
 
 
-def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
-    creds, rt_dir, ok_all = resolve_credentials(cfg, env), get_runtime_dir(env, create=True), True
-    fg_title, fg_tty, fg_cwd, fg_pid = "", "", "", 0
-    print(f"[python]    OK ({sys.version.split()[0]}, runtime={rt_dir})")
+def _is_macos_modifier_hotkey(raw_key: str) -> bool:
+    k = (raw_key or "RControl").strip().lower() or "rcontrol"
+    return k in _MACOS_MODIFIER_HOTKEYS
+
+
+def _write_init_file_0600(cfg_dir: Path, target: Path, content: str, *, force: bool) -> str:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        print(f"[ffmpeg]    OK ({resolve_ffmpeg_bin()})")
+        st = os.lstat(target)
+    except FileNotFoundError:
+        st = None
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect {target}: {exc}") from None
+
+    if st is not None and stat.S_ISDIR(st.st_mode):
+        raise ConfigError(f"cannot overwrite directory: {target}")
+
+    if not force:
+        if st is not None:
+            return "kept"
+        try:
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+        except FileExistsError:
+            return "kept"
+        except OSError as exc:
+            raise ConfigError(f"cannot create {target}: {exc}") from None
+        closed = False
+        try:
+            os.fchmod(fd, 0o600)
+            fobj = os.fdopen(fd, "w", encoding="utf-8")
+            closed = True
+            with fobj as f:
+                f.write(content)
+                f.flush()
+        except Exception:
+            if not closed:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return "created"
+
+    tmp_path = cfg_dir / f".{target.name}.init.{os.getpid()}.{time.monotonic_ns()}.tmp"
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+    closed = False
+    try:
+        os.fchmod(fd, 0o600)
+        fobj = os.fdopen(fd, "w", encoding="utf-8")
+        closed = True
+        with fobj as f:
+            f.write(content)
+            f.flush()
+        os.replace(tmp_path, target)
+    except Exception:
+        if not closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return "overwritten" if st is not None else "created"
+
+
+def _lstat_or_none(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect {path}: {exc}") from None
+
+
+def _ensure_init_parent_dir(cfg_dir: Path, *, preserve_existing_mode: bool) -> None:
+    dir_st = _lstat_or_none(cfg_dir)
+    if dir_st is not None and preserve_existing_mode:
+        if stat.S_ISLNK(dir_st.st_mode) or not stat.S_ISDIR(dir_st.st_mode):
+            raise ConfigError(f"unsafe config parent directory (not a real directory): {cfg_dir}")
+        return
+    ensure_secure_dir(cfg_dir)
+
+
+def _cmd_init(
+    config_path: str | Path | None = None,
+    *,
+    force: bool = False,
+    env: Mapping[str, str] | None = None,
+    home_dir: str | Path | None = None,
+) -> int:
+    src_env = os.environ if env is None else env
+    cli_cfg_str = str(config_path).strip() if config_path is not None else ""
+    has_explicit_cfg = bool(
+        cli_cfg_str
+        or src_env.get("AGENT_VOICE_INPUT_CONFIG", "").strip()
+        or src_env.get("VOICE_INPUT_CONFIG", "").strip()
+    )
+    cfg_dir, toml_path, env_path = resolve_target_config_paths(
+        config_path=config_path, env=src_env, home_dir=home_dir
+    )
+    if toml_path.suffix.lower() == ".json":
+        raise ConfigError(
+            f"init generates TOML config; target path cannot end with .json: {toml_path}"
+        )
+
+    toml_st = _lstat_or_none(toml_path)
+    env_st = _lstat_or_none(env_path)
+    for p, st in ((toml_path, toml_st), (env_path, env_st)):
+        if st is not None and stat.S_ISDIR(st.st_mode):
+            raise ConfigError(f"cannot overwrite directory: {p}")
+
+    shadowed_cfg: Path | None = None
+    if not has_explicit_cfg and not force and toml_st is None:
+        for cand in default_config_file_candidates(src_env, home_dir=home_dir):
+            if cand != toml_path and cand.is_file():
+                shadowed_cfg = cand
+                break
+
+    will_write_toml = (force or toml_st is None) and shadowed_cfg is None
+    will_write_env = force or env_st is None
+    if will_write_toml or will_write_env:
+        _ensure_init_parent_dir(cfg_dir, preserve_existing_mode=has_explicit_cfg)
+
+    if shadowed_cfg is not None:
+        print(
+            f"[init] kept existing {shadowed_cfg} "
+            f"(pass --force to create {toml_path} which takes precedence)"
+        )
+    else:
+        state_toml = _write_init_file_0600(cfg_dir, toml_path, _INIT_CONFIG_TOML, force=force)
+        if state_toml == "kept":
+            print(f"[init] kept existing {toml_path} (pass --force to overwrite)")
+        else:
+            print(f"[init] {state_toml} {toml_path} (0600)")
+
+    state_env = _write_init_file_0600(cfg_dir, env_path, _INIT_ENV_TEMPLATE, force=force)
+    if state_env == "kept":
+        print(f"[init] kept existing {env_path} (pass --force to overwrite)")
+    else:
+        print(f"[init] {state_env} {env_path} (0600)")
+
+    cfg_flag = f" --config {shlex.quote(cli_cfg_str)}" if cli_cfg_str else ""
+    print(
+        "\nNext steps:\n"
+        f"  1. Add at least one API key in {env_path} (e.g. DASHSCOPE_API_KEY or GEMINI_API_KEY)\n"
+        f"  2. Verify setup:  agent-voice-input doctor{cfg_flag} --ping\n"
+        f"  3. Start daemon:  agent-voice-input start{cfg_flag}"
+    )
+    return 0
+
+
+def _build_ping_http_spec(
+    provider: str,
+    base_url: str,
+    key: str,
+) -> tuple[str, dict[str, str]]:
+    prov = provider.strip().lower()
+    b = base_url.strip().rstrip("/")
+    for sfx in ("/chat/completions", "/audio/transcriptions", "/responses"):
+        if b.endswith(sfx):
+            b = b[: -len(sfx)]
+            break
+    if prov == "gemini" and is_gemini_native_url(b):
+        root = b or GEMINI_DEFAULT_BASE_URL.rstrip("/")
+        return f"{root}/models?pageSize=1", {"x-goog-api-key": key}
+    if prov == "openrouter":
+        if not b or _host_matches_domain(b, "openrouter.ai"):
+            root = b or "https://openrouter.ai/api/v1"
+            return f"{root}/key", {"Authorization": f"Bearer {key}"}
+        return f"{b}/models", {"Authorization": f"Bearer {key}"}
+    if prov == "dashscope":
+        if not b:
+            url = "https://dashscope.aliyuncs.com/compatible-mode/v1/models"
+        elif "/compatible-mode" in b:
+            host_root = b.split("/compatible-mode", 1)[0]
+            url = f"{host_root}/compatible-mode/v1/models"
+        elif b.endswith("/api/v1") or "/multimodal-generation" in b:
+            host_root = b.split("/api/v1", 1)[0]
+            url = f"{host_root}/compatible-mode/v1/models"
+        elif b.endswith("/models"):
+            url = b
+        else:
+            url = f"{b}/models"
+        return url, {"Authorization": f"Bearer {key}"}
+    root = b or "https://api.openai.com/v1"
+    url = root if root.endswith("/models") else f"{root}/models"
+    return url, ({"Authorization": f"Bearer {key}"} if key else {})
+
+
+def _probe_stage_ping(
+    *,
+    stage: str,
+    provider: str,
+    cfg: Config,
+    creds: ProviderCredentials,
+    env: dict[str, str],
+    base_url: str,
+    transport: HttpTransport | None,
+    cache: dict[tuple[str, str, str], tuple[str, int, str]],
+) -> tuple[str, int, str]:
+    prov = provider.strip().lower()
+    if prov == "doubao":
+        return (
+            "SKIP",
+            0,
+            "SKIP (verify audio with 'agent-voice-input once --file <wav> --dry-run')",
+        )
+
+    eff_tx = transport or urllib_http_transport
+    if prov == "codex":
+        t0 = time.monotonic()
+        deadline = t0 + 5.0
+        ping_cfg = dataclasses.replace(
+            cfg,
+            refiner=dataclasses.replace(cfg.refiner, timeout_sec=min(float(cfg.refiner.timeout_sec), 5.0)),
+        )
+        ref = CodexRefiner(ping_cfg, creds, env=env, transport=transport)
+        try:
+            c_item = ref._resolve_codex_credentials(force_refresh=False)
+            extra = tuple(s for s in (*creds.all_secret_values(), c_item.token, c_item.account_id) if s)
+            rem_sec = deadline - time.monotonic()
+            if rem_sec <= 0.05:
+                ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+                return "FAIL", ms, f"FAIL ({ms}ms: Codex ping exceeded 5.0s deadline)"
+            if c_item.mode == "api_key":
+                url, hdrs = _build_ping_http_spec(
+                    "openai", cfg.refiner.base_url or "https://api.openai.com/v1", c_item.token
+                )
+                resp = eff_tx(
+                    HttpRequest(
+                        url=url,
+                        method="GET",
+                        headers=hdrs,
+                        body=b"",
+                        timeout_sec=rem_sec,
+                        connect_timeout_sec=rem_sec,
+                    )
+                )
+                ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+                if resp.status == 200:
+                    return "OK", ms, f"OK ({ms}ms)"
+                excerpt = redact_secrets(resp.text().strip(), env, cfg=cfg, extra_secrets=extra)[:140]
+                return "FAIL", ms, f"FAIL (HTTP {resp.status}, {ms}ms: {excerpt or 'unauthorized'})"
+
+            if c_item.exp is not None and (c_item.exp - ref.time_fn()) <= 0:
+                ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+                return "FAIL", ms, "FAIL (Codex JWT expired; Fix: run 'codex login')"
+            target_url = _build_responses_url(
+                cfg.refiner.base_url, default_base_url=CODEX_SUBSCRIPTION_BASE_URL
+            )
+            _, origin = _validate_request_url(target_url)
+            scheme, host, port, _, _ = origin
+            assert port is not None
+            if transport is not None:
+                resp = transport(
+                    HttpRequest(
+                        url=target_url,
+                        method="GET",
+                        headers={"Authorization": f"Bearer {c_item.token}"},
+                        body=b"",
+                        timeout_sec=rem_sec,
+                        connect_timeout_sec=rem_sec,
+                    )
+                )
+                ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+                if resp.status in (200, 405):
+                    return "OK", ms, f"OK ({ms}ms, TLS+endpoint reachable)"
+                excerpt = redact_secrets(resp.text().strip(), env, cfg=cfg, extra_secrets=extra)[:140]
+                return "FAIL", ms, f"FAIL (HTTP {resp.status}, {ms}ms: {excerpt or 'unreachable'})"
+            conn, _ = ref._pool.acquire(
+                scheme, host, port, rem_sec, allow_reuse=False, connect_timeout_sec=rem_sec
+            )
+            try:
+                conn.connect()
+            finally:
+                _close_quietly(conn)
+            ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+            return "OK", ms, f"OK ({ms}ms, TLS handshake + JWT valid)"
+        except Exception as exc:
+            ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+            safe = redact_secrets(str(exc), env, cfg=cfg, extra_secrets=ref._extra_redaction_secrets(None))[:160]
+            return "FAIL", ms, f"FAIL ({ms}ms: {safe})"
+        finally:
+            ref.close()
+
+    custom_item = creds.asr_custom if stage == "asr" else creds.refiner_custom
+    explicit_env_name = (cfg.asr.api_key_env if stage == "asr" else cfg.refiner.api_key_env).strip()
+    if explicit_env_name:
+        key_val = custom_item.value if custom_item is not None else ""
+    else:
+        v_item = creds.for_provider(prov)
+        key_val = v_item.value if v_item is not None else ""
+
+    url, hdrs = _build_ping_http_spec(prov, base_url, key_val)
+    cache_key = ("http", url, key_val)
+    if cache_key in cache:
+        prev_st, prev_ms, prev_msg = cache[cache_key]
+        if prev_st == "OK":
+            return "OK", prev_ms, f"OK ({prev_ms}ms, shared endpoint)"
+        return prev_st, prev_ms, prev_msg
+
+    extra_sec = tuple(s for s in (*creds.all_secret_values(), key_val) if s)
+    t0 = time.monotonic()
+    try:
+        resp = eff_tx(
+            HttpRequest(
+                url=url,
+                method="GET",
+                headers=hdrs,
+                body=b"",
+                timeout_sec=5.0,
+                connect_timeout_sec=5.0,
+            )
+        )
+        ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+        if resp.status == 200:
+            out = ("OK", ms, f"OK ({ms}ms)")
+        elif resp.status in (401, 403):
+            out = (
+                "FAIL",
+                ms,
+                f"FAIL (HTTP {resp.status} unauthorized, {ms}ms; check API key in agent-voice-input.env)",
+            )
+        else:
+            excerpt = redact_secrets(resp.text().strip(), env, cfg=cfg, extra_secrets=extra_sec)[:140]
+            out = ("FAIL", ms, f"FAIL (HTTP {resp.status}, {ms}ms: {excerpt or 'unexpected status'})")
     except Exception as exc:
-        print(f"[ffmpeg]    FAIL ({exc})")
+        ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+        safe = redact_secrets(str(exc), env, cfg=cfg, extra_secrets=extra_sec)[:160]
+        out = ("FAIL", ms, f"FAIL ({ms}ms: {safe})")
+    cache[cache_key] = out
+    return out
+
+
+def _inspect_hook_summary(env: Mapping[str, str], rt_dir: Path) -> str:
+    configured: list[str] = []
+    for label, rel in (
+        ("claude", "~/.claude/settings.json"),
+        ("gemini/agy", "~/.gemini/settings.json"),
+    ):
+        p = expand_user_path(rel, env=env)
+        try:
+            if p.is_file() and not p.is_symlink() and p.stat().st_size <= 524_288:
+                if "session-hook" in p.read_text(encoding="utf-8", errors="ignore"):
+                    configured.append(label)
+        except OSError:
+            continue
+    active_reg = 0
+    sdir = rt_dir / "sessions"
+    try:
+        if sdir.is_dir() and not sdir.is_symlink():
+            active_reg = sum(
+                1
+                for e in sdir.iterdir()
+                if e.name.endswith(".json") and not e.name.startswith(".")
+            )
+    except OSError:
+        active_reg = 0
+    hooks_txt = ", ".join(configured) if configured else "none configured (optional)"
+    return f"hooks={hooks_txt}, active_registry_entries={active_reg}"
+
+
+def _cmd_doctor(
+    cfg: Config,
+    env: dict[str, str],
+    *,
+    ping: bool = False,
+    as_json: bool = False,
+    transport: HttpTransport | None = None,
+) -> int:
+    creds = resolve_credentials(cfg, env)
+    rt_dir = get_runtime_dir(env, create=True)
+    ok_all = True
+    all_secrets = creds.all_secret_values()
+    lines_out: list[str] = []
+    fixes: list[str] = []
+
+    def _clean(text: str) -> str:
+        return redact_secrets(text, env, cfg=cfg, extra_secrets=all_secrets)
+
+    def _emit(line: str) -> None:
+        safe = _clean(line)
+        lines_out.append(safe)
+        if not as_json:
+            print(safe)
+
+    def _emit_fix(fix_cmd: str) -> None:
+        safe_fix = _clean(fix_cmd)
+        fixes.append(safe_fix)
+        _emit(f"            Fix: {safe_fix}")
+
+    fg_title, fg_tty, fg_cwd, fg_pid = "", "", "", 0
+    _emit(f"[python]    OK ({sys.version.split()[0]}, runtime={rt_dir})")
+    _emit(f"[config]    {cfg.config_path or 'defaults (no config.toml)'}")
+    seen_env_inodes: set[tuple[int, int]] = set()
+    for cand_env in default_env_file_candidates(env, config_path=cfg.config_path or None):
+        try:
+            st_env = os.stat(cand_env)
+        except OSError:
+            continue
+        inode_key = (st_env.st_dev, st_env.st_ino)
+        if inode_key in seen_env_inodes:
+            continue
+        seen_env_inodes.add(inode_key)
+        if stat.S_ISREG(st_env.st_mode) and (st_env.st_mode & 0o077) != 0:
+            mode_oct = oct(stat.S_IMODE(st_env.st_mode))
+            real_target = cand_env.resolve() if cand_env.is_symlink() else cand_env
+            _emit(
+                f"[env-perm]  WARN {cand_env} has open permissions ({mode_oct}; recommend: chmod 600 {real_target})"
+            )
+
+    ffmpeg_ok = False
+    try:
+        ff_bin = resolve_ffmpeg_bin()
+        ffmpeg_ok = True
+        _emit(f"[ffmpeg]    OK ({ff_bin})")
+    except Exception as exc:
+        _emit(f"[ffmpeg]    FAIL ({exc})")
+        _emit_fix("brew install ffmpeg" if sys.platform == "darwin" else "sudo apt install ffmpeg")
         ok_all = False
+
+    platform_kind = "linux"
     if sys.platform == "darwin":
-        m = probe_macos_host(cfg, env, announce_compile=True)
+        platform_kind = "darwin"
+        m = probe_macos_host(cfg, env, announce_compile=(not as_json))
         fg_title = str(m.get("fg_title") or "")
         fg_tty = str(m.get("fg_tty") or "")
         fg_cwd = str(m.get("fg_cwd") or "")
         fg_pid = int(m.get("fg_pid") or 0)
         devs = m.get("audio_devices") or []
         devs_str = ", ".join(devs) if devs else "none listed (check mic device or grant Microphone permission)"
-        print(
-            f"[macos-aud] avfoundation={'OK' if m.get('avfoundation_ok') else 'WARN'} "
+        is_ssh_env = any(str(env.get(k) or "").strip() for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"))
+        is_local_gui = (
+            m.get("caller_has_graphic_session") is not False
+            and not bool(m.get("caller_is_remote_session"))
+            and not is_ssh_env
+        )
+        avf_fail = is_local_gui and (m.get("avfoundation_ok") is False)
+        avf_label = "OK" if m.get("avfoundation_ok") else ("FAIL" if avf_fail else "WARN")
+        _emit(
+            f"[macos-aud] avfoundation={avf_label} "
             f"device={m.get('configured_audio_device')} inputs={devs_str} | "
             f"pbcopy={'OK' if m.get('pbcopy_ok') else 'FAIL'} tmux={m.get('tmux_active')}"
         )
+        shim_fail = (m.get("swiftc_ok") is False) or (m.get("mac_shim_ok") is False)
         shim_desc = (
             f"OK ({m.get('mac_shim_bin')})"
             if m.get("mac_shim_ok")
-            else f"WARN ({m.get('mac_shim_error') or 'unavailable'})"
+            else f"FAIL ({m.get('mac_shim_error') or 'unavailable'})"
         )
         if m.get("swiftc_ok"):
             swiftc_desc = f"OK ({m.get('swiftc_bin')})"
         elif m.get("clt_ok") is False:
             swiftc_desc = "MISSING CLT (run 'xcode-select --install')"
         else:
-            swiftc_desc = "WARN (not found)"
+            swiftc_desc = "FAIL (not found)" if m.get("swiftc_ok") is False else "WARN (not found)"
         mac_ui_info = f" ui_lang={m.get('ui_lang')}" if m.get("ui_lang") else ""
-        print(f"[mac-shim]  swiftc={swiftc_desc} shim={shim_desc}{mac_ui_info}")
+        _emit(f"[mac-shim]  swiftc={swiftc_desc} shim={shim_desc}{mac_ui_info}")
+        if shim_fail:
+            ok_all = False
+            _emit_fix("xcode-select --install")
         if m.get("fg_surface_id"):
-            print(
+            _emit(
                 f"[macos-fg]  app={m.get('fg_process')!r} surface={m.get('fg_surface_id')} "
                 f"tty={m.get('fg_tty') or '-'} cwd={m.get('fg_cwd') or '-'} title={fg_title!r}"
             )
         elif m.get("fg_tty") or m.get("fg_cwd"):
-            print(
+            _emit(
                 f"[macos-fg]  app={m.get('fg_process')!r} "
                 f"tty={m.get('fg_tty') or '-'} cwd={m.get('fg_cwd') or '-'} title={fg_title!r}"
             )
         else:
-            print(f"[macos-fg]  app={m.get('fg_process')!r} title={fg_title!r}")
-        caller_mic = str(m.get("caller_mic_auth") or "").strip()
+            _emit(f"[macos-fg]  app={m.get('fg_process')!r} title={fg_title!r}")
+        caller_mic = str(m.get("caller_mic_auth") or "").strip().lower()
         tcc_prefix = f"caller_mic_auth={caller_mic} | " if caller_mic else ""
-        print(f"[macos-tcc] {tcc_prefix}{m.get('permissions_hint')}")
-        if caller_warn := str(m.get("caller_mic_warning") or "").strip():
-            print(
+        _emit(f"[macos-tcc] {tcc_prefix}{m.get('permissions_hint')}")
+        if is_local_gui and caller_mic in ("denied", "restricted"):
+            ok_all = False
+            _emit(f"[macos-tcc] FAIL Microphone permission is {caller_mic}")
+            _emit_fix('open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"')
+        elif caller_warn := str(m.get("caller_mic_warning") or "").strip():
+            _emit(
                 f"[macos-tcc] WARN (current shell context: {caller_warn}; "
                 "note: reflects this shell, not an already-running GUI daemon)"
             )
-        ok_all = ok_all and bool(m.get("pbcopy_ok"))
+        if avf_fail:
+            ok_all = False
+            _emit_fix("connect/enable an input microphone in System Settings -> Sound -> Input")
+        if m.get("ax_trusted") is False:
+            _emit(
+                '[macos-ax]  WARN Accessibility not granted (Ghostty/tmux direct delivery works; '
+                'for Cmd+V in other apps: open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")'
+            )
+        if (
+            not _is_macos_modifier_hotkey(cfg.hotkey.key)
+            and m.get("listen_event_access") is False
+            and m.get("ax_trusted") is False
+        ):
+            _emit(
+                '[macos-im]  WARN Input Monitoring not granted for non-modifier hotkey '
+                '(open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")'
+            )
+        if m.get("pbcopy_ok") is False:
+            ok_all = False
     elif is_wsl(env):
+        platform_kind = "wsl2"
         w = probe_wsl_host(cfg, env)
         fg_title = str(w.get("fg_title") or "")
-        ps_ok, pulse_ok, winmm_n = bool(w.get("powershell_ok")), bool(w.get("pulse_rdp_ok")), int(w.get("winmm_devs") or 0)
+        ps_ok = bool(w.get("powershell_ok"))
+        pulse_ok = bool(w.get("pulse_rdp_ok"))
+        winmm_n = int(w.get("winmm_devs") or 0)
+        has_wasapi_key = "wasapi_ok" in w
+        wasapi_ok = bool(w.get("wasapi_ok")) if has_wasapi_key else False
+        has_wsl_audio = (wasapi_ok or pulse_ok or winmm_n > 0) if has_wasapi_key else (pulse_ok or winmm_n > 0)
         ui_info = f" ui_lang={w.get('ui_lang')}" if w.get("ui_lang") else ""
-        print(f"[wsl-audio] PulseAudio RDPSource={'OK' if pulse_ok else 'WARN'}, winmm waveIn devs={winmm_n}")
-        print(f"[win-shim]  PowerShell={'OK (' + str(w.get('ps_version')) + ')' if ps_ok else 'FAIL'} fg={w.get('fg_process')!r}{ui_info}")
-        ok_all = ok_all and ps_ok and (pulse_ok or winmm_n > 0)
+        wasapi_prefix = f"WASAPI={'OK' if wasapi_ok else 'WARN'}, " if has_wasapi_key else ""
+        _emit(
+            f"[wsl-audio] {wasapi_prefix}PulseAudio RDPSource={'OK' if pulse_ok else 'WARN'}, winmm waveIn devs={winmm_n}"
+        )
+        _emit(
+            f"[win-shim]  PowerShell={'OK (' + str(w.get('ps_version')) + ')' if ps_ok else 'FAIL'} fg={w.get('fg_process')!r}{ui_info}"
+        )
+        if not ps_ok:
+            ok_all = False
+            _emit_fix("check WSL interop or /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+        if not has_wsl_audio:
+            ok_all = False
+            _emit_fix("cmd.exe /c start ms-settings:privacy-microphone")
+    else:
+        _emit(
+            "[platform]  INFO native Linux (native global hotkey/HUD require macOS or WSL2; CLI 'once --file' ready)"
+        )
+
     eff_asr = select_asr_provider(cfg, creds)
     eff_asr_model = cfg.asr.effective_model(eff_asr)
     eff_asr_url = cfg.asr.effective_base_url(eff_asr)
@@ -182,10 +787,11 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
     else:
         asr_ready = bool(creds.for_provider(eff_asr))
     asr_creds_tail = f", asr_custom={_cred_label(creds.asr_custom)}" if cfg.asr.api_key_env.strip() else ""
-    print(
+    _emit(
         f"[asr]       selected={eff_asr} (model={eff_asr_model}, api={eff_asr_api}, effort={cfg.asr.effort}) -> "
         f"{'OK' if asr_ready else 'MISSING KEY'} | "
         f"dashscope={_cred_label(creds.dashscope)}, "
+        f"deepseek={_cred_label(creds.deepseek)}, "
         f"doubao={_cred_label(creds.doubao_key)} (app_id={_cred_label(creds.doubao_app_id)}), "
         f"volcengine={_cred_label(creds.volcengine)}, "
         f"openrouter={_cred_label(creds.openrouter)}, "
@@ -194,58 +800,194 @@ def _cmd_doctor(cfg: Config, env: dict[str, str]) -> int:
         f"groq={_cred_label(creds.groq)}, "
         f"siliconflow={_cred_label(creds.siliconflow)}{asr_creds_tail}"
     )
-    ok_all = ok_all and asr_ready
+    if not asr_ready:
+        ok_all = False
+        _emit_fix(
+            "run 'agent-voice-input init' then set DASHSCOPE_API_KEY (or OPENROUTER_API_KEY / GEMINI_API_KEY) "
+            "in ~/.config/agent-voice-input/agent-voice-input.env"
+        )
+
+    daemon_running = False
+    daemon_pid: int | None = None
+    daemon_state = "stopped"
+    if (rt_dir / "control.sock").exists():
+        try:
+            dst = send_control_command(rt_dir, {"cmd": "status"}, timeout_sec=0.5)
+            if dst.get("ok"):
+                daemon_running = True
+                daemon_pid = int(dst.get("pid") or 0) or None
+                daemon_state = str(dst.get("state") or "idle")
+        except Exception:
+            pass
+    if daemon_running:
+        _emit(f"[daemon]    running (pid={daemon_pid}, state={daemon_state})")
+    else:
+        _emit("[daemon]    stopped (start via 'agent-voice-input start')")
+
     match = SessionTracker(env=env, runtime_dir=rt_dir).resolve_session(
         fg_title,
         window_tty=fg_tty,
         window_cwd=fg_cwd,
         window_pid=fg_pid,
     )
-    print(f"[session]   {match.session_key + ' (' + match.matched_by + ')' if match else 'none matched (will use empty context)'}")
-    ref_prov = cfg.refiner.provider.strip().lower()
-    eff_ref_api = cfg.refiner.effective_api(ref_prov)
+    _emit(
+        f"[session]   {match.session_key + ' (' + match.matched_by + ')' if match else 'none matched (will use empty context)'}"
+    )
+    _emit(f"[hooks]     {_inspect_hook_summary(env, rt_dir)}")
+
+    raw_ref_prov = cfg.refiner.provider.strip().lower()
+    if raw_ref_prov in ("none", "false", "0", "disabled"):
+        raw_ref_prov = "off"
+    resolved_ref_prov = select_refiner_provider(cfg, creds, env)
     prompt_tag = ", prompt=custom" if cfg.refiner.prompt.strip() else ""
     asr_is_single_hop = eff_asr_api == "gemini-native" or (
         eff_asr_api == "chat-completions"
         and (eff_asr != "dashscope" or is_dashscope_omni_chat_model(eff_asr_model, cfg.asr.base_url))
     )
-    if eff_ref_api == "off":
-        print("[refiner]   off")
+
+    ref_ping_needed = False
+    eff_ref_model = ""
+    eff_ref_url = ""
+    if raw_ref_prov == "off":
+        _emit("[refiner]   off")
     elif asr_is_single_hop and not cfg.refiner.force_on_single_hop:
-        print(
-            f"[refiner]   bypassed (single-hop ASR passthrough; set refiner.force_on_single_hop=true to run {ref_prov})"
+        target_lbl = resolved_ref_prov if raw_ref_prov != "auto" else "Stage 2"
+        _emit(
+            f"[refiner]   bypassed (single-hop ASR passthrough; set refiner.force_on_single_hop=true to run {target_lbl})"
         )
-    elif ref_prov == "codex":
-        eff_ref_model = cfg.refiner.effective_model("codex")
-        auth_ok, auth_note = inspect_codex_auth_status(cfg, env)
-        if auth_ok:
+    elif raw_ref_prov == "auto" and resolved_ref_prov == "off":
+        _emit(
+            "[refiner]   WARN auto -> off (no Stage 2 credentials set; raw Stage 1 ASR draft will be delivered. "
+            "Optional fix: set DEEPSEEK_API_KEY / DASHSCOPE_API_KEY or run 'codex login')"
+        )
+    elif resolved_ref_prov == "codex":
+        eff_ref_api = cfg.refiner.effective_api("codex")
+        eff_ref_effort = cfg.refiner.effective_effort("codex")
+        eff_ref_model = resolve_codex_default_model(cfg, env)
+        prov_disp = "auto -> codex" if raw_ref_prov == "auto" else "codex"
+        auth_state, auth_note = inspect_codex_auth_status(cfg, env)
+        if auth_state in ("OK", "WARN"):
+            ref_ping_needed = True
             cbin = find_codex_bin(env)
             bin_tag = f", refresh_bin={cbin}" if cbin else ""
-            print(
-                f"[refiner]   OK codex (model={eff_ref_model} "
+            _emit(
+                f"[refiner]   {auth_state} {prov_disp} (model={eff_ref_model} "
                 f"[{_check_codex_model(eff_ref_model, env)}], api={eff_ref_api}, "
-                f"effort={cfg.refiner.effort}, {auth_note}{bin_tag}{prompt_tag})"
+                f"effort={eff_ref_effort}, {auth_note}{bin_tag}{prompt_tag})"
             )
         else:
-            print(
-                f"[refiner]   FAIL codex (model={eff_ref_model}, api={eff_ref_api}, "
-                f"effort={cfg.refiner.effort}{prompt_tag}) -> {auth_note}"
+            _emit(
+                f"[refiner]   FAIL {prov_disp} (model={eff_ref_model}, api={eff_ref_api}, "
+                f"effort={eff_ref_effort}{prompt_tag}) -> {auth_note}"
             )
+            _emit_fix("run 'codex login' or set DEEPSEEK_API_KEY / DASHSCOPE_API_KEY in agent-voice-input.env")
             ok_all = False
     else:
-        eff_ref_model = cfg.refiner.effective_model(ref_prov)
-        eff_ref_url = cfg.refiner.effective_base_url(ref_prov)
+        eff_ref_api = cfg.refiner.effective_api(resolved_ref_prov)
+        eff_ref_effort = cfg.refiner.effective_effort(resolved_ref_prov)
+        eff_ref_model = cfg.refiner.effective_model(resolved_ref_prov)
+        eff_ref_url = cfg.refiner.effective_base_url(resolved_ref_prov)
+        prov_disp = f"auto -> {resolved_ref_prov}" if raw_ref_prov == "auto" else resolved_ref_prov
         if cfg.refiner.api_key_env.strip():
             ref_ready = bool(creds.refiner_custom and creds.refiner_custom.value)
-        elif ref_prov == "openai-compatible":
+        elif resolved_ref_prov == "openai-compatible":
             ref_ready = bool(creds.openai or _is_loopback_url(eff_ref_url))
         else:
-            ref_ready = bool(creds.for_provider(ref_prov))
-        print(
-            f"[refiner]   {'OK' if ref_ready else 'MISSING KEY'} {ref_prov} "
-            f"(model={eff_ref_model}, api={eff_ref_api}, effort={cfg.refiner.effort}{prompt_tag})"
+            ref_ready = bool(creds.for_provider(resolved_ref_prov))
+        _emit(
+            f"[refiner]   {'OK' if ref_ready else 'MISSING KEY'} {prov_disp} "
+            f"(model={eff_ref_model}, api={eff_ref_api}, effort={eff_ref_effort}{prompt_tag})"
         )
-        ok_all = ok_all and ref_ready
+        if ref_ready:
+            ref_ping_needed = True
+        else:
+            ok_all = False
+            if cfg.refiner.api_key_env.strip():
+                _emit_fix(f"set {cfg.refiner.api_key_env.strip()} in agent-voice-input.env")
+            else:
+                _emit_fix(_missing_key_hint(resolved_ref_prov, stage="refiner"))
+
+    ping_results: dict[str, dict[str, Any]] = {}
+    if ping:
+        ping_cache: dict[tuple[str, str, str], tuple[str, int, str]] = {}
+        if asr_ready:
+            st_asr, ms_asr, msg_asr = _probe_stage_ping(
+                stage="asr",
+                provider=eff_asr,
+                cfg=cfg,
+                creds=creds,
+                env=env,
+                base_url=eff_asr_url,
+                transport=transport,
+                cache=ping_cache,
+            )
+            ping_results["asr"] = {"provider": eff_asr, "status": st_asr, "latency_ms": ms_asr, "detail": _clean(msg_asr)}
+            _emit(f"[ping]      asr({eff_asr}): {msg_asr}")
+            if st_asr == "FAIL":
+                ok_all = False
+        if ref_ping_needed:
+            st_ref, ms_ref, msg_ref = _probe_stage_ping(
+                stage="refiner",
+                provider=resolved_ref_prov,
+                cfg=cfg,
+                creds=creds,
+                env=env,
+                base_url=eff_ref_url,
+                transport=transport,
+                cache=ping_cache,
+            )
+            ping_results["refiner"] = {
+                "provider": resolved_ref_prov,
+                "status": st_ref,
+                "latency_ms": ms_ref,
+                "detail": _clean(msg_ref),
+            }
+            _emit(f"[ping]      refiner({resolved_ref_prov}): {msg_ref}")
+            if st_ref == "FAIL":
+                ok_all = False
+
+    if as_json:
+        def _redact_json_obj(val: Any) -> Any:
+            if isinstance(val, str):
+                return _clean(val)
+            if isinstance(val, dict):
+                return {str(k): _redact_json_obj(v) for k, v in val.items()}
+            if isinstance(val, (list, tuple)):
+                return [_redact_json_obj(v) for v in val]
+            return val
+
+        report: dict[str, Any] = {
+            "ok": ok_all,
+            "version": __version__,
+            "platform": platform_kind,
+            "config_path": cfg.config_path or "",
+            "ffmpeg_ok": ffmpeg_ok,
+            "daemon": {"running": daemon_running, "pid": daemon_pid, "state": daemon_state},
+            "asr": {
+                "provider": eff_asr,
+                "model": eff_asr_model,
+                "api": eff_asr_api,
+                "ready": asr_ready,
+                "single_hop": asr_is_single_hop,
+            },
+            "refiner": {
+                "configured_provider": raw_ref_prov,
+                "resolved_provider": resolved_ref_prov,
+                "model": eff_ref_model,
+                "bypassed": bool(asr_is_single_hop and not cfg.refiner.force_on_single_hop and raw_ref_prov != "off"),
+            },
+            "session": (
+                {"session_key": match.session_key, "matched_by": match.matched_by}
+                if match is not None
+                else None
+            ),
+            "fixes": fixes,
+            "lines": lines_out,
+        }
+        if ping:
+            report["ping"] = ping_results
+        print(json.dumps(_redact_json_obj(report), ensure_ascii=False, indent=2))
+
     return 0 if ok_all else 1
 
 
@@ -641,8 +1383,36 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     _add_common_flags(parser)
     sub = parser.add_subparsers(dest="subcmd", required=True)
-    for name in ("daemon", "start", "restart", "doctor", "stop", "toggle"):
+    p_init = sub.add_parser(
+        "init",
+        help="Initialize 0600 config.toml and commented agent-voice-input.env",
+    )
+    p_init.add_argument(
+        "--config",
+        default=argparse.SUPPRESS,
+        help="Target config.toml path (default: ~/.config/agent-voice-input/config.toml)",
+    )
+    p_init.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Atomically overwrite existing files",
+    )
+    for name in ("daemon", "start", "restart", "stop", "toggle"):
         _add_common_flags(sub.add_parser(name), is_sub=True)
+    p_doc = sub.add_parser("doctor", help="Check audio bridge, native shim, credentials, and session binding")
+    _add_common_flags(p_doc, is_sub=True)
+    p_doc.add_argument(
+        "--ping",
+        action="store_true",
+        help="Run lightweight 5s online connectivity & auth checks for active endpoints",
+    )
+    p_doc.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit redacted diagnostic report as JSON",
+    )
     p_cancel = sub.add_parser("cancel", help="Cancel active recording or in-flight voice tasks")
     _add_common_flags(p_cancel, is_sub=True)
     p_cancel.add_argument(
@@ -687,6 +1457,17 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.subcmd == "session-hook":
         return run_session_hook(cli_mode=args.cli, quiet_stdout=args.quiet)
+    if args.subcmd == "init":
+        try:
+            return _cmd_init(config_path=getattr(args, "config", None), force=bool(args.force))
+        except ConfigError as exc:
+            eff_env = load_env_files()
+            print(f"config error: {redact_secrets(str(exc), eff_env)}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            eff_env = load_env_files()
+            print(f"error: {redact_secrets(str(exc), eff_env)}", file=sys.stderr)
+            return 1
     ov = {
         k: getattr(args, a)
         for a, k in (
@@ -754,7 +1535,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcmd == "retry":
             return _cmd_retry(args, cfg, env)
         if args.subcmd == "doctor":
-            return _cmd_doctor(cfg, env)
+            return _cmd_doctor(
+                cfg,
+                env,
+                ping=bool(getattr(args, "ping", False)),
+                as_json=bool(getattr(args, "as_json", False)),
+            )
         if args.subcmd == "key-test":
             if sys.platform == "darwin":
                 return run_macos_key_test(cfg, seconds=args.seconds, env=env)

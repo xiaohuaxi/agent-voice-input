@@ -2669,7 +2669,7 @@ def _is_openai_reasoning_model(model: str) -> bool:
     and ``model`` defaults to ``'gpt-4o-mini'``) never fails with 400.
     """
     slug = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
-    return slug.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6")) or "reasoning" in slug
+    return slug.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6", "codex-mini")) or "reasoning" in slug
 
 
 def apply_chat_effort_params(
@@ -2728,14 +2728,15 @@ def apply_chat_effort_params(
                     payload.pop("temperature", None)
         return
 
-    if prov == "openai-compatible":
-        if base_url and _host_matches_domain(base_url, "deepseek.com"):
-            slug = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
-            if eff in ("auto", "none", "minimal"):
-                if "reasoner" not in slug:
-                    payload["thinking"] = {"type": "disabled"}
-            else:
-                payload["thinking"] = {"type": "enabled"}
+    if prov == "deepseek" or (
+        prov == "openai-compatible" and base_url and _host_matches_domain(base_url, "deepseek.com")
+    ):
+        slug = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
+        if eff in ("auto", "none", "minimal"):
+            if "reasoner" not in slug:
+                payload["thinking"] = {"type": "disabled"}
+        else:
+            payload["thinking"] = {"type": "enabled"}
         return
 
     if prov == "openai":

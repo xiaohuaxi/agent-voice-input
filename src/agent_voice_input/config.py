@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 from typing import Any, Iterable, Mapping, Sequence
 import urllib.parse
@@ -48,7 +49,9 @@ VALID_ASR_APIS = frozenset({"auto", "audio-transcriptions", "chat-completions"})
 VALID_DOUBAO_MODES = frozenset({"auto", "flash", "submit"})
 VALID_REFINER_PROVIDERS = frozenset(
     {
+        "auto",
         "codex",
+        "deepseek",
         "dashscope",
         "volcengine",
         "openrouter",
@@ -76,6 +79,17 @@ ASR_AUTO_PRIORITY: tuple[str, ...] = (
     "siliconflow",
 )
 
+REFINER_AUTO_PRIORITY: tuple[str, ...] = (
+    "deepseek",
+    "dashscope",
+    "gemini",
+    "openrouter",
+    "volcengine",
+    "openai",
+    "groq",
+    "siliconflow",
+)
+
 DEFAULT_ASR_MODELS: dict[str, str] = {
     "dashscope": "qwen3-asr-flash",
     "doubao": "bigmodel",
@@ -89,6 +103,7 @@ DEFAULT_ASR_MODELS: dict[str, str] = {
 
 DEFAULT_REFINER_MODELS: dict[str, str] = {
     "codex": "gpt-6-luna",
+    "deepseek": "deepseek-flash",
     "dashscope": "qwen3.8-flash",
     "volcengine": "doubao-seed-2-0-mini-260428",
     "openrouter": "google/gemini-3.5-flash-lite",
@@ -113,6 +128,7 @@ DEFAULT_ASR_BASE_URLS: dict[str, str] = {
 }
 
 DEFAULT_REFINER_BASE_URLS: dict[str, str] = {
+    "deepseek": "https://api.deepseek.com/v1",
     "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "volcengine": "https://ark.cn-beijing.volces.com/api/v3",
     "openrouter": "https://openrouter.ai/api/v1",
@@ -126,6 +142,7 @@ DEFAULT_REFINER_BASE_URLS: dict[str, str] = {
 # REDLINE: DOUBAO_ASR_API_ID / API_ID_DOUBAO_ASR typos MUST NEVER be added here.
 CREDENTIAL_ENV_ORDER: dict[str, tuple[str, ...]] = {
     "dashscope": ("DASHSCOPE_API_KEY", "ALI_API_KEY", "API_KEY_ALI"),
+    "deepseek": ("DEEPSEEK_API_KEY", "API_KEY_DEEPSEEK"),
     "doubao_app_id": ("DOUBAO_ASR_APP_ID", "APP_ID_DOUBAO_ASR"),
     "doubao_key": ("DOUBAO_ASR_API_KEY", "API_KEY_DOUBAO_ASR"),
     "volcengine": ("ARK_API_KEY", "VOLCENGINE_API_KEY", "HUOSHAN_API_KEY", "API_KEY_HUOSHAN"),
@@ -282,7 +299,7 @@ class AsrConfig:
 
 @dataclass
 class RefinerConfig:
-    provider: str = "codex"
+    provider: str = "auto"
     model: str = ""
     api: str = "auto"
     effort: str = ""
@@ -295,15 +312,27 @@ class RefinerConfig:
     timeout_sec: float = 90.0
     max_retries: int = 2
     force_on_single_hop: bool = False
+    _model_explicit: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         prov = self.provider.strip().lower()
         if prov in ("none", "false", "0", "disabled"):
             prov = "off"
-        if not self.model or not self.model.strip():
-            self.model = DEFAULT_REFINER_MODELS.get(prov, "")
-        if not self.effort or not self.effort.strip():
-            self.effort = DEFAULT_REFINER_EFFORTS.get(prov, "auto")
+        self._model_explicit = bool(self.model and self.model.strip())
+        if prov not in ("auto", "off"):
+            if not self.model or not self.model.strip():
+                self.model = DEFAULT_REFINER_MODELS.get(prov, "")
+            if not self.effort or not self.effort.strip():
+                self.effort = DEFAULT_REFINER_EFFORTS.get(prov, "auto")
+
+    def has_explicit_model(self, resolved_provider: str | None = None) -> bool:
+        m = (self.model or "").strip()
+        if not m:
+            return False
+        if self._model_explicit:
+            return True
+        prov = (resolved_provider or self.provider).strip().lower()
+        return m != DEFAULT_REFINER_MODELS.get(prov, "")
 
     def effective_model(self, resolved_provider: str | None = None) -> str:
         if self.model and self.model.strip():
@@ -336,6 +365,8 @@ class RefinerConfig:
             prov = "off"
         if prov == "off":
             return "off"
+        if prov == "auto":
+            return req_api
         if prov == "gemini":
             if req_api != "auto":
                 raise ConfigError(
@@ -396,11 +427,13 @@ class ProviderCredentials:
     siliconflow: CredentialItem | None = None
     asr_custom: CredentialItem | None = None
     refiner_custom: CredentialItem | None = None
+    deepseek: CredentialItem | None = None
 
     def for_provider(self, provider: str) -> CredentialItem | None:
         prov = provider.strip().lower()
         mapping: dict[str, CredentialItem | None] = {
             "dashscope": self.dashscope,
+            "deepseek": self.deepseek,
             "volcengine": self.volcengine,
             "doubao": self.doubao_key,
             "openrouter": self.openrouter,
@@ -594,28 +627,123 @@ def parse_env_text(text: str) -> dict[str, str]:
     return result
 
 
+def _resolve_config_roots(
+    env: Mapping[str, str] | None = None,
+    *,
+    home_dir: str | Path | None = None,
+) -> tuple[list[Path], Path]:
+    src = os.environ if env is None else env
+    home = (
+        Path(home_dir)
+        if home_dir is not None
+        else Path((src.get("HOME") or "").strip() or Path.home())
+    )
+    roots: list[Path] = []
+    if home_dir is None or (env is not None and env is not os.environ):
+        if xdg := (src.get("XDG_CONFIG_HOME") or "").strip():
+            roots.append(expand_user_path(xdg, env=src, home_dir=home))
+    default_root = home / ".config"
+    if default_root not in roots:
+        roots.append(default_root)
+    return roots, home
+
+
+def default_config_file_candidates(
+    env: Mapping[str, str] | None = None,
+    *,
+    home_dir: str | Path | None = None,
+) -> list[Path]:
+    """Return ordered default config file lookup candidates across XDG & ``~/.config``."""
+    roots, _ = _resolve_config_roots(env, home_dir=home_dir)
+    out: list[Path] = []
+    for root in roots:
+        for sub_rel in (
+            ("agent-voice-input", "config.toml"),
+            ("agent-voice-input", "config.json"),
+            ("voice-input", "config.toml"),
+            ("voice-input", "config.json"),
+        ):
+            cand = root.joinpath(*sub_rel)
+            if cand not in out:
+                out.append(cand)
+    return out
+
+
+def default_env_file_candidates(
+    env: Mapping[str, str] | None = None,
+    *,
+    config_path: str | Path | None = None,
+    home_dir: str | Path | None = None,
+) -> list[Path]:
+    """Return ordered default ``.env`` lookup paths honoring ``--config``, ``AGENT_VOICE_INPUT_CONFIG`` & ``XDG_CONFIG_HOME``."""
+    src = os.environ if env is None else env
+    roots, home = _resolve_config_roots(env, home_dir=home_dir)
+    out: list[Path] = []
+    if config_path is not None and str(config_path).strip():
+        cfg_parent = expand_user_path(str(config_path).strip(), env=src, home_dir=home).parent
+        cand_env = cfg_parent / "agent-voice-input.env"
+        if cand_env not in out:
+            out.append(cand_env)
+    elif home_dir is None or (env is not None and env is not os.environ):
+        explicit_cfg = (
+            src.get("AGENT_VOICE_INPUT_CONFIG") or src.get("VOICE_INPUT_CONFIG") or ""
+        ).strip()
+        if explicit_cfg:
+            cfg_parent = expand_user_path(explicit_cfg, env=src, home_dir=home).parent
+            cand_env = cfg_parent / "agent-voice-input.env"
+            if cand_env not in out:
+                out.append(cand_env)
+    for root in roots:
+        for rel in (
+            ("agent-voice-input", "agent-voice-input.env"),
+            ("agent-voice-input", ".env"),
+            ("voice-input", "voice-input.env"),
+            ("voice-input", ".env"),
+        ):
+            p = root.joinpath(*rel)
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def resolve_target_config_paths(
+    *,
+    config_path: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+    home_dir: str | Path | None = None,
+) -> tuple[Path, Path, Path]:
+    """Return ``(config_dir, config_toml_path, env_file_path)`` for ``init`` and diagnostics."""
+    src = os.environ if env is None else env
+    roots, home = _resolve_config_roots(env, home_dir=home_dir)
+    explicit = ""
+    if config_path is not None and str(config_path).strip():
+        explicit = str(config_path).strip()
+    elif src.get("AGENT_VOICE_INPUT_CONFIG", "").strip():
+        explicit = src["AGENT_VOICE_INPUT_CONFIG"].strip()
+    elif src.get("VOICE_INPUT_CONFIG", "").strip():
+        explicit = src["VOICE_INPUT_CONFIG"].strip()
+    if explicit:
+        toml_path = expand_user_path(explicit, env=src, home_dir=home)
+        cfg_dir = toml_path.parent
+        return cfg_dir, toml_path, cfg_dir / "agent-voice-input.env"
+    cfg_dir = roots[0] / "agent-voice-input"
+    return cfg_dir, cfg_dir / "config.toml", cfg_dir / "agent-voice-input.env"
+
+
 def load_env_files(
     base_env: Mapping[str, str] | None = None,
     *,
     env_paths: Sequence[str | Path] | None = None,
+    config_path: str | Path | None = None,
     home_dir: str | Path | None = None,
 ) -> dict[str, str]:
     """Merge optional .env files behind existing environment variables (never overwrites)."""
     merged: dict[str, str] = dict(os.environ if base_env is None else base_env)
-    home = (
-        Path(home_dir)
-        if home_dir is not None
-        else Path((merged.get("HOME") or "").strip() or Path.home())
-    )
+    _, home = _resolve_config_roots(base_env, home_dir=home_dir)
     candidates: Sequence[str | Path] = (
         env_paths
         if env_paths is not None
-        else (
-            home / ".config" / "agent-voice-input" / "agent-voice-input.env",
-            home / ".config" / "agent-voice-input" / ".env",
-            home / ".config" / "voice-input" / "voice-input.env",
-            home / ".config" / "voice-input" / ".env",
-        )
+        else default_env_file_candidates(base_env, config_path=config_path, home_dir=home_dir)
     )
     for p in candidates:
         path = expand_user_path(p, env=merged, home_dir=home)
@@ -1435,6 +1563,7 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.refiner.provider = _normalize_refiner_provider(v)
             elif k == "model":
                 cfg.refiner.model = _as_str(v, "refiner.model").strip()
+                cfg.refiner._model_explicit = bool(cfg.refiner.model)
             elif k == "api":
                 cfg.refiner.api = _as_str(v, "refiner.api").strip().lower()
             elif k == "effort":
@@ -1461,11 +1590,20 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 raise ConfigError(f"unknown refiner option {k!r}")
         if has_explicit_ref_provider and cfg.refiner.provider != prev_ref_provider:
             if not has_explicit_ref_model:
-                cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
+                cfg.refiner._model_explicit = False
+                cfg.refiner.model = (
+                    ""
+                    if cfg.refiner.provider in ("auto", "off")
+                    else DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
+                )
             if not has_explicit_ref_api:
                 cfg.refiner.api = "auto"
             if not has_explicit_ref_effort:
-                cfg.refiner.effort = DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
+                cfg.refiner.effort = (
+                    ""
+                    if cfg.refiner.provider in ("auto", "off")
+                    else DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
+                )
             if not has_explicit_ref_base_url:
                 cfg.refiner.base_url = ""
             if not has_explicit_ref_key_env:
@@ -1796,11 +1934,18 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
             f"got {cfg.refiner.provider!r}"
         )
     cfg.refiner.effective_api(cfg.refiner.provider)
-    if cfg.refiner.provider != "off" and cfg.refiner.effort not in VALID_EFFORTS:
-        raise ConfigError(
-            f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, "
-            f"got {cfg.refiner.effort!r}"
-        )
+    if cfg.refiner.provider not in ("auto", "off"):
+        if cfg.refiner.effort not in VALID_EFFORTS:
+            raise ConfigError(
+                f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, "
+                f"got {cfg.refiner.effort!r}"
+            )
+    elif cfg.refiner.provider == "auto" and cfg.refiner.effort.strip():
+        if cfg.refiner.effort.strip().lower() not in VALID_EFFORTS:
+            raise ConfigError(
+                f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, "
+                f"got {cfg.refiner.effort!r}"
+            )
     if not isinstance(cfg.refiner.prompt, str):
         raise ConfigError(
             f"refiner.prompt: expected string, got {type(cfg.refiner.prompt).__name__}"
@@ -1824,6 +1969,24 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
             raise ConfigError(
                 "refiner.model must be explicitly set when refiner.provider is 'openai-compatible'"
             )
+    elif cfg.refiner.provider == "auto":
+        auto_ref_prov = _infer_provider_from_explicit_refiner_hints(cfg.refiner)
+        if auto_ref_prov is not None:
+            if auto_ref_prov == "openai-compatible":
+                if not cfg.refiner.base_url.strip():
+                    raise ConfigError(
+                        "refiner.base_url must be explicitly set when refiner.provider resolves to 'openai-compatible'"
+                    )
+                if not cfg.refiner.model.strip():
+                    raise ConfigError(
+                        "refiner.model must be explicitly set when refiner.provider resolves to 'openai-compatible'"
+                    )
+            cfg.refiner.effective_api(auto_ref_prov)
+        elif env is not None and cfg.refiner.api.strip().lower() != "auto":
+            creds_ref = resolve_credentials(cfg, env)
+            resolved_ref = select_refiner_provider(cfg, creds_ref, env)
+            if resolved_ref != "off":
+                cfg.refiner.effective_api(resolved_ref)
     if cfg.refiner.max_turns_per_thread <= 0:
         raise ConfigError("refiner.max_turns_per_thread must be > 0")
     if cfg.refiner.timeout_sec <= 0:
@@ -1863,14 +2026,13 @@ def load_config(
 ) -> tuple[Config, dict[str, str]]:
     """Load merged ``(Config, merged_env)`` following CLI > config file > defaults."""
     effective_env = (
-        load_env_files(env, env_paths=env_paths, home_dir=home_dir)
+        load_env_files(env, env_paths=env_paths, config_path=config_path, home_dir=home_dir)
         if load_default_env_files
         else dict(os.environ if env is None else env)
     )
-    home = (
-        Path(home_dir)
-        if home_dir is not None
-        else Path((effective_env.get("HOME") or "").strip() or Path.home())
+    _, home = _resolve_config_roots(
+        effective_env if env is not None else None,
+        home_dir=home_dir,
     )
 
     chosen_path: Path | None = None
@@ -1891,11 +2053,9 @@ def load_config(
         if not chosen_path.is_file():
             raise ConfigError(f"VOICE_INPUT_CONFIG file does not exist: {chosen_path}")
     else:
-        for candidate in (
-            home / ".config" / "agent-voice-input" / "config.toml",
-            home / ".config" / "agent-voice-input" / "config.json",
-            home / ".config" / "voice-input" / "config.toml",
-            home / ".config" / "voice-input" / "config.json",
+        for candidate in default_config_file_candidates(
+            effective_env if env is not None else None,
+            home_dir=home_dir,
         ):
             if candidate.is_file():
                 chosen_path = candidate
@@ -1910,12 +2070,16 @@ def load_config(
     if cli_overrides:
         _apply_section_dict(cfg, _expand_cli_overrides(cli_overrides))
 
-    if not cfg.refiner.model.strip():
-        cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
-    if not cfg.refiner.effort.strip():
-        cfg.refiner.effort = DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
+    if cfg.refiner.provider not in ("auto", "off"):
+        if not cfg.refiner.model.strip():
+            cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
+        if not cfg.refiner.effort.strip():
+            cfg.refiner.effort = DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
 
-    _validate_config(cfg, env=effective_env)
+    val_env: Mapping[str, str] | None = (
+        effective_env if (env is not None or home_dir is None) else dict(effective_env, HOME=str(home))
+    )
+    _validate_config(cfg, env=val_env)
     return cfg, effective_env
 
 
@@ -1949,6 +2113,7 @@ def resolve_credentials(
 
     return ProviderCredentials(
         dashscope=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["dashscope"]),
+        deepseek=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["deepseek"]),
         volcengine=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["volcengine"]),
         doubao_app_id=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["doubao_app_id"]),
         doubao_key=_first_present_credential(src_env, CREDENTIAL_ENV_ORDER["doubao_key"]),
@@ -1960,6 +2125,172 @@ def resolve_credentials(
         asr_custom=asr_custom,
         refiner_custom=refiner_custom,
     )
+
+
+_CODEX_KEYRING_STORE_RE = re.compile(
+    r'^\s*cli_auth_credentials_store\s*=\s*["\']keyring["\']', re.MULTILINE
+)
+
+
+def _is_other_user_tilde(raw: str) -> bool:
+    return raw.startswith("~") and raw != "~" and not raw.startswith("~/") and not raw.startswith("~\\")
+
+
+def resolve_codex_home_dir(env: Mapping[str, str] | None = None) -> Path | None:
+    """Resolve ``CODEX_HOME`` or ``~/.codex`` without leaking host ``HOME``/``pwd`` into hermetic dicts."""
+    explicit = env is not None and env is not os.environ
+    src = os.environ if env is None else env
+    raw_home = (src.get("HOME") or "").strip()
+    if raw_ch := (src.get("CODEX_HOME") or "").strip():
+        if explicit and raw_ch.startswith("~") and (not raw_home or _is_other_user_tilde(raw_ch)):
+            return None
+        return expand_user_path(raw_ch, env=src)
+    if raw_home:
+        if explicit and _is_other_user_tilde(raw_home):
+            return None
+        return Path(raw_home) / ".codex"
+    if explicit:
+        return None
+    return expand_user_path("~", env=os.environ) / ".codex"
+
+
+def find_codex_bin(env: Mapping[str, str] | None = None) -> str | None:
+    explicit = env is not None and env is not os.environ
+    src = os.environ if env is None else env
+    src_home = (src.get("HOME") or "").strip()
+    if raw_cb := (src.get("CODEX_BIN") or "").strip():
+        if explicit and raw_cb.startswith("~") and (not src_home or _is_other_user_tilde(raw_cb)):
+            return None
+        cb_path = expand_user_path(raw_cb, env=src)
+        if cb_path.is_file() and os.access(str(cb_path), os.X_OK):
+            return str(cb_path)
+    host_home = (os.environ.get("HOME") or "").strip()
+    hermetic = explicit and (
+        "PATH" not in src
+        or not src_home
+        or (bool(host_home) and src_home != host_home)
+    )
+    raw_path = src.get("PATH")
+    if raw_path is not None:
+        if raw_path and (found := shutil.which("codex", path=raw_path)):
+            return found
+    elif not hermetic:
+        if found := shutil.which("codex"):
+            return found
+    if hermetic and not src_home:
+        return None
+    home = expand_user_path("~", env=src)
+    cands = [home / ".local/bin/codex"]
+    if not hermetic:
+        cands.extend((Path("/usr/local/bin/codex"), Path("/opt/homebrew/bin/codex")))
+    return next((str(p) for p in cands if p.is_file() and os.access(str(p), os.X_OK)), None)
+
+
+def has_codex_local_auth(env: Mapping[str, str] | None = None) -> bool:
+    """Zero-subprocess check for local Codex CLI login state (hermetic when ``env`` is passed)."""
+    codex_home = resolve_codex_home_dir(env)
+    if codex_home is None:
+        return False
+    src = os.environ if env is None else env
+    auth_path = codex_home / "auth.json"
+    try:
+        st = os.stat(auth_path)
+    except OSError:
+        st = None
+    if st is not None and stat.S_ISREG(st.st_mode) and 0 < st.st_size <= 1_048_576:
+        try:
+            data = json.loads(auth_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, Mapping):
+            tokens = data.get("tokens")
+            if isinstance(tokens, Mapping):
+                if str(tokens.get("access_token") or "").strip() or str(
+                    tokens.get("refresh_token") or ""
+                ).strip():
+                    return True
+            if str(data.get("OPENAI_API_KEY") or "").strip():
+                return True
+            auth_mode = str(data.get("auth_mode") or "").strip().lower()
+            if auth_mode in ("api_key", "apikey") and str(src.get("OPENAI_API_KEY") or "").strip():
+                return True
+
+    cfg_path = codex_home / "config.toml"
+    try:
+        cst = os.stat(cfg_path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(cst.st_mode) or cst.st_size <= 0 or cst.st_size > 1_048_576:
+        return False
+    try:
+        cfg_txt = cfg_path.read_text(encoding="utf-8-sig")
+    except (OSError, ValueError):
+        return False
+    if _CODEX_KEYRING_STORE_RE.search(cfg_txt) and find_codex_bin(env) is not None:
+        return True
+    return False
+
+
+def _infer_provider_from_explicit_refiner_hints(ref_cfg: RefinerConfig) -> str | None:
+    """Infer target Refiner provider when ``provider='auto'`` has explicit base_url or api_key_env."""
+    url = ref_cfg.base_url.strip()
+    key_env = ref_cfg.api_key_env.strip().upper()
+
+    if url:
+        if _host_matches_domain(url, "deepseek.com"):
+            return "deepseek"
+        if _host_matches_domain(url, "aliyuncs.com", "dashscope.aliyuncs.com"):
+            return "dashscope"
+        if _host_matches_domain(url, "volces.com"):
+            return "volcengine"
+        if _host_matches_domain(url, "openrouter.ai"):
+            return "openrouter"
+        if _host_matches_domain(url, "googleapis.com"):
+            return "gemini"
+        if _host_matches_domain(url, "openai.com"):
+            return "openai"
+        if _host_matches_domain(url, "groq.com"):
+            return "groq"
+        if _host_matches_domain(url, "siliconflow.cn"):
+            return "siliconflow"
+        if _host_matches_domain(url, "chatgpt.com"):
+            return "codex"
+        return "openai-compatible"
+
+    if key_env:
+        for group_key, names in CREDENTIAL_ENV_ORDER.items():
+            if key_env in names and group_key in VALID_REFINER_PROVIDERS:
+                return group_key
+        return "openai-compatible"
+
+    return None
+
+
+def select_refiner_provider(
+    cfg: Config,
+    creds: ProviderCredentials,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve effective canonical Refiner provider without spawning subprocesses."""
+    prov = _normalize_refiner_provider(cfg.refiner.provider)
+    if prov not in VALID_REFINER_PROVIDERS:
+        raise ConfigError(
+            f"refiner.provider must be one of {sorted(VALID_REFINER_PROVIDERS)}, got {cfg.refiner.provider!r}"
+        )
+    if prov != "auto":
+        return prov
+
+    inferred = _infer_provider_from_explicit_refiner_hints(cfg.refiner)
+    if inferred is not None:
+        return inferred
+
+    if has_codex_local_auth(env):
+        return "codex"
+
+    for candidate in REFINER_AUTO_PRIORITY:
+        if creds.for_provider(candidate) is not None:
+            return candidate
+    return "off"
 
 
 def _infer_provider_from_explicit_asr_hints(asr_cfg: AsrConfig) -> str | None:

@@ -582,6 +582,10 @@ def probe_macos_host(
         info["mac_shim_ok"] = sc_ok
         if sc_ok:
             ui_cult = str(sc_json.get("ui_culture") or "").strip()
+            if isinstance(sc_json.get("ax_trusted"), bool):
+                info["ax_trusted"] = sc_json["ax_trusted"]
+            if isinstance(sc_json.get("listen_event_access"), bool):
+                info["listen_event_access"] = sc_json["listen_event_access"]
             aud_st = sc_json.get("audio_status")
             if isinstance(aud_st, Mapping):
                 info["caller_mic_auth"] = str(aud_st.get("mic_auth") or "").strip().lower()
