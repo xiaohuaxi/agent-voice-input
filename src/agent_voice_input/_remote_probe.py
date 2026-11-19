@@ -21,6 +21,7 @@ import struct
 import subprocess
 import sys
 from typing import Any, BinaryIO, Mapping, Sequence
+import urllib.parse
 
 PROBE_FRAME_MAGIC = b"__AVI_GZ__\x00"
 MAX_LINE_BYTES = 16 * 1024 * 1024
@@ -32,7 +33,7 @@ _STRICT_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 _PREFIXED_TAG_RE = re.compile(
-    r"\[(agy|gemini|claude|codex):#?([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{8,36})\]",
+    r"\[(agy|claude|codex):#?([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{8,36})\]",
     re.IGNORECASE,
 )
 _HASH_TAG_RE = re.compile(
@@ -42,7 +43,7 @@ _FULL_UUID_RE = re.compile(
     r"(?:^|[^0-9a-fA-F-])([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?=$|[^0-9a-fA-F-])"
 )
 _WORD_CLI_RE = re.compile(
-    r"(?:^|[\s\[\(\{·|:])(agy|antigravity|gemini|claude|codex)(?=$|[\s\]\)\}·|:])",
+    r"(?:^|[\s\[\(\{·|:])(agy|antigravity|claude|codex)(?=$|[\s\]\)\}·|:])",
     re.IGNORECASE,
 )
 _CLAUDE_VER_COMM_RE = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
@@ -278,10 +279,43 @@ def trim_turns_chunk_aligned(
     return norm_turns[first_kept_idx:], evicted_chunks
 
 
-def _normalize_cwd(raw_cwd: str) -> str:
+def _is_wsl_slow_mount_str(path_str: str) -> bool:
+    """Pure-string zero-I/O check for WSL2 ``/mnt/`` DrvFS, Windows drive, and UNC paths."""
+    s = (path_str or "").strip()
+    if not s:
+        return False
+    if s.lower().startswith("file://"):
+        try:
+            parsed = urllib.parse.urlparse(s)
+        except ValueError:
+            return True
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            return True
+        s = urllib.parse.unquote(parsed.path or "")
+    if s.startswith(("\\\\", "//")) or (len(s) >= 2 and s[0].isalpha() and s[1] == ":"):
+        return True
+    if s.startswith(("/", "\\")):
+        norm = posixpath.normpath("/" + s.replace("\\", "/").lstrip("/"))
+        return norm == "/mnt" or norm.startswith("/mnt/")
+    return False
+
+
+def _normalize_cwd(raw_cwd: str, *, wsl: bool = False) -> str:
     s = (raw_cwd or "").strip()
     if not s or "\x00" in s:
         return ""
+    if wsl and _is_wsl_slow_mount_str(s):
+        return ""
+    if s.startswith("file://") or s.lower().startswith("file://"):
+        try:
+            parsed = urllib.parse.urlparse(s)
+        except ValueError:
+            return ""
+        s = urllib.parse.unquote(parsed.path or "")
+        if not s or "\x00" in s:
+            return ""
+        if wsl and _is_wsl_slow_mount_str(s):
+            return ""
     if len(s) > 1:
         s = s.rstrip("/")
     return s
@@ -298,33 +332,108 @@ def _expand_remote_path(raw_path: str, home: Path) -> str:
     return _normalize_cwd(s)
 
 
-def _cwd_variants(cwd: str) -> set[str]:
+def _safe_realpath(path_str: str, *, wsl: bool = False) -> str:
+    """Resolve symlinks without ever calling ``lstat``/``stat`` on WSL2 ``/mnt/`` slow mounts."""
+    if not path_str or "\x00" in path_str or (wsl and _is_wsl_slow_mount_str(path_str)):
+        return ""
+    if not wsl:
+        try:
+            return _normalize_cwd(os.path.realpath(path_str))
+        except OSError:
+            return ""
+    abs_p = path_str if path_str.startswith("/") else os.path.abspath(path_str)
+    if _is_wsl_slow_mount_str(abs_p):
+        return ""
+    todo = [seg for seg in abs_p.split("/") if seg and seg != "."]
+    resolved: list[str] = []
+    hops = 0
+    while todo:
+        seg = todo.pop(0)
+        if seg == "..":
+            if resolved:
+                resolved.pop()
+            continue
+        cand = "/" + "/".join([*resolved, seg])
+        if _is_wsl_slow_mount_str(cand):
+            return ""
+        try:
+            st = os.lstat(cand)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT or ".." in todo:
+                return ""
+            tail = posixpath.normpath("/" + "/".join([*resolved, seg, *todo]))
+            return "" if _is_wsl_slow_mount_str(tail) else _normalize_cwd(tail)
+        if stat.S_ISLNK(st.st_mode):
+            hops += 1
+            if hops > 40:
+                return ""
+            try:
+                target = os.readlink(cand)
+            except OSError:
+                return ""
+            if _is_wsl_slow_mount_str(target):
+                return ""
+            if target.startswith("/"):
+                resolved = []
+            todo = [x for x in target.split("/") if x and x != "."] + todo
+        else:
+            resolved.append(seg)
+    out = "/" + "/".join(resolved)
+    return "" if _is_wsl_slow_mount_str(out) else _normalize_cwd(out)
+
+
+def _cwd_variants(cwd: str, *, wsl: bool = False) -> set[str]:
+    if wsl and _is_wsl_slow_mount_str(cwd):
+        return set()
     norm = _normalize_cwd(cwd)
-    if not norm:
+    if not norm or (wsl and _is_wsl_slow_mount_str(norm)):
         return set()
     out = {norm}
-    try:
-        real = _normalize_cwd(os.path.realpath(norm))
-        if real:
-            out.add(real)
-    except OSError:
-        pass
+    real = _safe_realpath(norm, wsl=wsl)
+    if wsl and not real:
+        return set()
+    if real:
+        out.add(real)
     return out
 
 
-def _is_broad_or_unsafe_workspace_dir(dir_path: str, home: Path | None = None) -> bool:
-    norm = posixpath.normpath(_normalize_cwd(dir_path)) if dir_path else ""
-    if not norm or not norm.startswith("/"):
+def _is_broad_or_unsafe_workspace_dir(
+    dir_path: str, home: Path | None = None, *, wsl: bool = False
+) -> bool:
+    if not dir_path or (wsl and _is_wsl_slow_mount_str(dir_path)):
         return True
+    raw_norm = _normalize_cwd(dir_path)
+    if not raw_norm or (wsl and _is_wsl_slow_mount_str(raw_norm)):
+        return True
+    norm = posixpath.normpath(raw_norm)
+    if not norm or norm == "." or not norm.startswith("/"):
+        return True
+    if wsl and _is_wsl_slow_mount_str(norm):
+        return True
+
     cands = {norm}
-    try:
-        real = posixpath.normpath(_normalize_cwd(os.path.realpath(norm)))
-        if real and real.startswith("/"):
-            cands.add(real)
-    except OSError:
-        pass
-    h_vars = _cwd_variants(str(home)) if home is not None else set()
+    real = _safe_realpath(norm, wsl=wsl)
+    if wsl and not real:
+        return True
+    if real:
+        real_norm = posixpath.normpath(real)
+        if real_norm and real_norm.startswith("/"):
+            cands.add(real_norm)
+
+    h_vars: set[str] = set()
+    if home is not None:
+        h_raw = _normalize_cwd(str(home))
+        if h_raw:
+            h_norm = posixpath.normpath(h_raw)
+            if h_norm and h_norm != ".":
+                h_vars.add(h_norm)
+            h_real = _safe_realpath(h_raw, wsl=wsl)
+            if h_real:
+                h_real_norm = posixpath.normpath(h_real)
+                if h_real_norm and h_real_norm != ".":
+                    h_vars.add(h_real_norm)
     h_vars_low = {p.lower() for p in h_vars}
+
     for cand in cands:
         cand_low = cand.lower()
         if cand_low in _BROAD_SYSTEM_DIRS_LOW:
@@ -336,29 +445,51 @@ def _is_broad_or_unsafe_workspace_dir(dir_path: str, home: Path | None = None) -
     return False
 
 
-def _cwd_match_rank(target_cwd: str, cand_cwd: str, home: Path) -> int:
-    t_vars = _cwd_variants(target_cwd)
-    c_vars = _cwd_variants(cand_cwd)
+def _cwd_match_rank(
+    target_cwd: str,
+    cand_cwd: str,
+    home: Path | None = None,
+    *,
+    wsl: bool = False,
+) -> int:
+    """Return 2 on exact directory match, 1 on bounded subdirectory match, 0 otherwise."""
+    t_vars = _cwd_variants(target_cwd, wsl=wsl)
+    c_vars = _cwd_variants(cand_cwd, wsl=wsl)
     if not t_vars or not c_vars:
         return 0
     if t_vars & c_vars:
         return 2
     for tv in t_vars:
         for cv in c_vars:
-            if (not _is_broad_or_unsafe_workspace_dir(cv, home) and tv.startswith(cv + "/")) or (
-                not _is_broad_or_unsafe_workspace_dir(tv, home) and cv.startswith(tv + "/")
+            if (
+                not _is_broad_or_unsafe_workspace_dir(cv, home, wsl=wsl)
+                and tv.startswith(cv + "/")
+            ) or (
+                not _is_broad_or_unsafe_workspace_dir(tv, home, wsl=wsl)
+                and cv.startswith(tv + "/")
             ):
                 return 1
     return 0
 
 
-def _encode_claude_dirs(cwd: str) -> list[str]:
+def encode_claude_project_dir(cwd: str, *, wsl: bool = False) -> list[str]:
+    """Return deduplicated Claude project directory names for logical and real ``cwd``."""
+    if wsl and _is_wsl_slow_mount_str(cwd):
+        return []
+    norm = _normalize_cwd(cwd)
+    if not norm or (wsl and _is_wsl_slow_mount_str(norm)):
+        return []
     out: list[str] = []
-    for cand in sorted(_cwd_variants(cwd)):
-        enc = re.sub(r"[^A-Za-z0-9]", "-", cand)
+    for candidate in (norm, _safe_realpath(norm, wsl=wsl)):
+        if not candidate:
+            continue
+        enc = re.sub(r"[^A-Za-z0-9]", "-", candidate)
         if enc and enc not in out:
             out.append(enc)
     return out
+
+
+_encode_claude_dirs = encode_claude_project_dir
 
 
 def _safe_mtime(path: str | Path) -> float:
@@ -379,20 +510,29 @@ def _file_etag(path: str | Path) -> str:
 
 
 def _read_bounded_line(f: BinaryIO, max_bytes: int = MAX_LINE_BYTES) -> tuple[bytes, bool]:
-    """Read one ``\\n``-terminated line up to ``max_bytes``; drain remainder if exceeded."""
+    """Read one ``\\n``-terminated line up to ``max_bytes`` total bytes; drain remainder if exceeded."""
     line = f.readline(max_bytes + 1)
     if not line:
         return b"", False
-    if len(line) <= max_bytes or line.endswith(b"\n"):
+    if len(line) <= max_bytes:
         return line, False
-    while True:
-        chunk = f.readline(65536)
-        if not chunk or chunk.endswith(b"\n"):
-            break
+    if not line.endswith(b"\n"):
+        while True:
+            chunk = f.readline(65536)
+            if not chunk or chunk.endswith(b"\n"):
+                break
     return line[:max_bytes], True
 
 
-def _is_path_under_dir(target_path: str | Path, root_dir: Path) -> bool:
+def _is_path_under_dir(
+    target_path: str | Path, root_dir: Path, *, wsl: bool = False
+) -> bool:
+    if wsl:
+        real_t = _safe_realpath(str(target_path), wsl=True)
+        real_r = _safe_realpath(str(root_dir), wsl=True)
+        if not real_t or not real_r:
+            return False
+        return real_t == real_r or real_t.startswith(real_r.rstrip("/") + "/")
     try:
         real_t = os.path.realpath(target_path)
         real_r = os.path.realpath(root_dir)
@@ -451,7 +591,7 @@ def _match_cli_process(comm: str, argv: Sequence[str]) -> tuple[str | None, list
     for tok in (c_low, a0_low):
         if tok == "codex" or tok.startswith(("codex-aarch64-", "codex-x86_64-")):
             return "codex", args_list
-        if tok in ("agy", "antigravity", "antigravity-cli", "gemini", "gemini-cli"):
+        if tok in ("agy", "antigravity", "antigravity-cli"):
             return "agy", args_list
         if tok == "claude":
             return "claude", args_list
@@ -459,8 +599,6 @@ def _match_cli_process(comm: str, argv: Sequence[str]) -> tuple[str | None, list
         return "claude", args_list
     if "/@openai/codex/" in a0_norm_low:
         return "codex", args_list
-    if "/@google/gemini-cli/" in a0_norm_low:
-        return "agy", args_list
     if c_base and _CLAUDE_VER_COMM_RE.match(c_base) and "claude" in a0_norm_low:
         return "claude", args_list
 
@@ -581,15 +719,19 @@ def _read_proc_cmdline_args(proc_pid_dir: Path) -> list[str]:
     return [a.decode("utf-8", errors="ignore") for a in raw_cmd.split(b"\x00") if a]
 
 
+def _classify_interactive_cli(comm: str, argv: Sequence[str]) -> str | None:
+    cli_kind, eff_args = _match_cli_process(comm, argv)
+    if cli_kind is None or _is_headless_cli(cli_kind, eff_args):
+        return None
+    return cli_kind
+
+
 def _classify_proc_cli(proc_pid_dir: Path) -> str | None:
     comm = _read_proc_comm(proc_pid_dir)
     argv = _read_proc_cmdline_args(proc_pid_dir)
     if not comm and not argv:
         return None
-    cli_k, eff = _match_cli_process(comm, argv)
-    if cli_k is None or _is_headless_cli(cli_k, eff):
-        return None
-    return cli_k
+    return _classify_interactive_cli(comm, argv)
 
 
 def _read_proc_tty_mtime(pdir: Path) -> float:
@@ -628,7 +770,9 @@ def _read_proc_ppid(proc_pid_dir: Path) -> int:
     return 0
 
 
-def _read_codex_root_meta(jsonl_path: str | Path) -> tuple[bool, str, str]:
+def _read_codex_root_meta(
+    jsonl_path: str | Path, *, wsl: bool = False
+) -> tuple[bool, str, str]:
     try:
         with open(jsonl_path, "rb") as f:
             first_line, exceeded = _read_bounded_line(f)
@@ -647,12 +791,15 @@ def _read_codex_root_meta(jsonl_path: str | Path) -> tuple[bool, str, str]:
         return False, "", ""
     is_cli = payload.get("source") == "cli"
     sid = str(payload.get("id") or payload.get("session_id") or "").strip().lower()
-    cwd = _normalize_cwd(str(payload.get("cwd") or ""))
+    cwd = _normalize_cwd(str(payload.get("cwd") or ""), wsl=wsl)
     return is_cli, sid, cwd
 
 
 def _read_claude_root_meta(
-    jsonl_path: str | Path, *, allow_empty_or_meta_only: bool = False
+    jsonl_path: str | Path,
+    *,
+    allow_empty_or_meta_only: bool = False,
+    wsl: bool = False,
 ) -> tuple[bool, str, str]:
     p = Path(jsonl_path)
     if p.name.lower().startswith("agent-"):
@@ -686,7 +833,7 @@ def _read_claude_root_meta(
                 if isinstance(obj.get("sessionId"), str) and obj["sessionId"].strip():
                     last_sid = obj["sessionId"].strip().lower()
                 if isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
-                    last_cwd = _normalize_cwd(obj["cwd"])
+                    last_cwd = _normalize_cwd(obj["cwd"], wsl=wsl)
                 if "isSidechain" in obj or obj.get("type") in ("user", "assistant"):
                     if bool(obj.get("isSidechain")):
                         return False, "", ""
@@ -698,14 +845,20 @@ def _read_claude_root_meta(
     return False, "", ""
 
 
-def _resolve_agy_transcript_path(home: Path, cid: str) -> Path | None:
+def _resolve_agy_transcript_path(
+    home: Path, cid: str, *, wsl: bool = False
+) -> Path | None:
     logs = home / ".gemini" / "antigravity-cli" / "brain" / cid / ".system_generated" / "logs"
+    if wsl and not _safe_realpath(str(logs), wsl=True):
+        return None
     full_p = logs / "transcript_full.jsonl"
-    if full_p.is_file():
-        return full_p
+    if not wsl or _safe_realpath(str(full_p), wsl=True):
+        if full_p.is_file():
+            return full_p
     comp_p = logs / "transcript.jsonl"
-    if comp_p.is_file():
-        return comp_p
+    if not wsl or _safe_realpath(str(comp_p), wsl=True):
+        if comp_p.is_file():
+            return comp_p
     return None
 
 
@@ -743,7 +896,7 @@ def _is_agy_subagent(jsonl_path: str | Path) -> bool:
     return False
 
 
-def _extract_agy_cwd(jsonl_path: str | Path) -> str:
+def _extract_agy_cwd(jsonl_path: str | Path, *, wsl: bool = False) -> str:
     try:
         with open(jsonl_path, "rb") as f:
             for _ in range(8):
@@ -759,14 +912,14 @@ def _extract_agy_cwd(jsonl_path: str | Path) -> str:
                 if not isinstance(obj, dict):
                     continue
                 if isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
-                    return _normalize_cwd(obj["cwd"])
+                    return _normalize_cwd(obj["cwd"], wsl=wsl)
                 c = obj.get("content")
                 if isinstance(c, str) and (
                     "Working Directory:" in c or "Active Workspaces:" in c
                 ):
                     m = _AGY_WS_CWD_RE.search(c)
                     if m:
-                        return _normalize_cwd(m.group(1))
+                        return _normalize_cwd(m.group(1), wsl=wsl)
     except OSError:
         pass
     return ""
@@ -801,9 +954,14 @@ def _is_flock_held(lock_path: Path) -> bool:
                 pass
 
 
-def _load_codex_thread_names(home: Path) -> dict[str, str]:
-    idx = home / ".codex" / "session_index.jsonl"
+def _load_codex_thread_names(home: Path, *, wsl: bool = False) -> dict[str, str]:
     out: dict[str, str] = {}
+    idx = home / ".codex" / "session_index.jsonl"
+    if wsl:
+        safe_idx = _safe_realpath(str(idx), wsl=True)
+        if not safe_idx:
+            return out
+        idx = Path(safe_idx)
     if not idx.is_file():
         return out
     try:
@@ -847,21 +1005,25 @@ def _candidate_runtime_dirs(home: Path, env: Mapping[str, str]) -> list[Path]:
     return out
 
 
-def _read_trusted_registry_json(reg_file: Path) -> dict[str, Any] | None:
+def _is_trusted_runtime_dir(rt_dir: Path) -> bool:
     try:
-        st_dir = os.lstat(reg_file.parent)
-        st_rt = os.lstat(reg_file.parent.parent)
+        st = os.lstat(rt_dir)
     except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return False
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        return False
+    return st.st_uid == os.getuid()
+
+
+def _read_trusted_registry_json(reg_file: Path) -> dict[str, Any] | None:
+    """Verify parent ``sessions/`` & runtime dir ``0700``/owner/non-symlink, ``O_NOFOLLOW`` ``0600`` file, and loop-read up to 256 KiB."""
+    if not _is_trusted_runtime_dir(reg_file.parent) or not _is_trusted_runtime_dir(
+        reg_file.parent.parent
+    ):
         return None
     uid = os.getuid()
-    for st_d in (st_dir, st_rt):
-        if (
-            stat.S_ISLNK(st_d.st_mode)
-            or not stat.S_ISDIR(st_d.st_mode)
-            or (st_d.st_mode & 0o077) != 0
-            or st_d.st_uid != uid
-        ):
-            return None
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(str(reg_file), flags)
@@ -876,7 +1038,16 @@ def _read_trusted_registry_json(reg_file: Path) -> dict[str, Any] | None:
             or st.st_size > 262144
         ):
             return None
-        raw = os.read(fd, 262145)
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            buf = os.read(fd, 16384)
+            if not buf:
+                break
+            total += len(buf)
+            if total > 262144:
+                return None
+            chunks.append(buf)
     except OSError:
         return None
     finally:
@@ -885,7 +1056,7 @@ def _read_trusted_registry_json(reg_file: Path) -> dict[str, Any] | None:
         except OSError:
             pass
     try:
-        obj = json.loads(raw.decode("utf-8-sig"))
+        obj = json.loads(b"".join(chunks).decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError):
         return None
     return obj if isinstance(obj, dict) else None
@@ -898,8 +1069,7 @@ def _parse_title_hint(title: str) -> tuple[str, bool, str | None, bool]:
     pm = list(_PREFIXED_TAG_RE.finditer(title))
     if pm:
         m = pm[-1]
-        cli_w = m.group(1).lower()
-        cli = "agy" if cli_w == "gemini" else cli_w
+        cli = m.group(1).lower()
         tok = m.group(2).lower()
         return tok, bool(_STRICT_UUID_RE.match(tok)), cli, True
     hm = list(_HASH_TAG_RE.finditer(title))
@@ -918,7 +1088,7 @@ def _infer_cli_word(title: str) -> str | None:
     if not m:
         return None
     w = m.group(1).lower()
-    return "agy" if w in ("antigravity", "gemini") else w
+    return "agy" if w == "antigravity" else w
 
 
 def _extract_claude_sid_from_argv(args: Sequence[str]) -> str:

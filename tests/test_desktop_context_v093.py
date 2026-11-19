@@ -601,6 +601,11 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 ide_brain, "ide-repo-a-6666",
                 [
                     {
+                        "source": "SYSTEM",
+                        "type": "SYSTEM_PROMPT",
+                        "content": f"Active Workspaces:\n- {repo_a}\nCommand Working Directory: {repo_a}\n",
+                    },
+                    {
                         "source": "USER_EXPLICIT", "type": "USER_INPUT",
                         "content": f"<USER_REQUEST>{long_turn}</USER_REQUEST>\n<ADDITIONAL_METADATA>\nActive Document: {repo_a / 'alpha_engine.py'}\n</ADDITIONAL_METADATA>",
                     },

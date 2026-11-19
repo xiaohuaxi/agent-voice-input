@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import ast
+import builtins
+import dis
 import importlib
 from pathlib import Path
 import re
@@ -71,45 +73,42 @@ def _parse_package_asts() -> dict[str, ast.Module]:
     return trees
 
 
-def _collect_function_body_loads(tree: ast.Module) -> tuple[set[str], set[str]]:
-    """Return ``(loaded_names, loaded_dotted_attrs)`` strictly inside ``def`` / ``async def`` bodies.
+def _collect_compiled_runtime_loads(
+    src: str, filename: str = "<mem>"
+) -> tuple[set[str], set[str]]:
+    """Return ``(loaded_module_globals, loaded_dotted_attrs)`` from compiled function/method bytecode.
 
-    Intentionally ignores module-level imports, ``__all__``, top-level alias assignments,
-    decorators, annotations, and parameter default expressions evaluated at import time.
+    Uses CPython's own symbol-table compiler (``LOAD_GLOBAL`` + consecutive ``LOAD_ATTR``/``LOAD_METHOD``)
+    inside runtime callables/lambdas/comprehensions, while skipping module top-level and ``class`` body
+    code objects executed at import time. This handles nested ``def``, ``global``, ``nonlocal``,
+    parameter shadowing, and import-time default arguments with 100% Python language fidelity.
     """
+    top_code = compile(src, filename, "exec")
     names: set[str] = set()
     dotted: set[str] = set()
 
-    class _BodyLoadVisitor(ast.NodeVisitor):
-        def __init__(self) -> None:
-            self.fn_depth = 0
+    def _is_class_body(code_obj: types.CodeType) -> bool:
+        return "__qualname__" in code_obj.co_names and "__module__" in code_obj.co_names
 
-        def _visit_callable(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-            self.fn_depth += 1
-            for stmt in node.body:
-                self.visit(stmt)
-            self.fn_depth -= 1
+    def _walk(code_obj: types.CodeType, *, is_runtime_fn: bool) -> None:
+        if is_runtime_fn:
+            chain: list[str] = []
+            for instr in dis.get_instructions(code_obj):
+                op = instr.opname
+                if op == "LOAD_GLOBAL":
+                    sym = str(instr.argval)
+                    names.add(sym)
+                    chain = [sym]
+                elif op in ("LOAD_ATTR", "LOAD_METHOD") and chain:
+                    chain.append(str(instr.argval))
+                    dotted.add(".".join(chain))
+                elif op not in ("EXTENDED_ARG", "NOP"):
+                    chain = []
+        for const in code_obj.co_consts:
+            if isinstance(const, types.CodeType):
+                _walk(const, is_runtime_fn=not _is_class_body(const))
 
-        visit_FunctionDef = _visit_callable
-        visit_AsyncFunctionDef = _visit_callable
-
-        def visit_Name(self, node: ast.Name) -> None:
-            if self.fn_depth > 0 and isinstance(node.ctx, ast.Load):
-                names.add(node.id)
-
-        def visit_Attribute(self, node: ast.Attribute) -> None:
-            if self.fn_depth > 0 and isinstance(node.ctx, ast.Load):
-                parts = [node.attr]
-                cur: ast.AST = node.value
-                while isinstance(cur, ast.Attribute):
-                    parts.append(cur.attr)
-                    cur = cur.value
-                if isinstance(cur, ast.Name):
-                    parts.append(cur.id)
-                    dotted.add(".".join(reversed(parts)))
-            self.generic_visit(node)
-
-    _BodyLoadVisitor().visit(tree)
+    _walk(top_code, is_runtime_fn=False)
     return names, dotted
 
 
@@ -244,6 +243,72 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
             "_remote_probe.py must have zero intra-package dependencies",
         )
 
+    def test_session_ctx_and_remote_probe_have_zero_duplicate_top_level_definitions(self) -> None:
+        trees = _parse_package_asts()
+        ctx_tree = trees["session_ctx"]
+        probe_tree = trees["_remote_probe"]
+
+        ctx_Callables = {
+            n.name for n in ctx_tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        probe_callables = {
+            n.name for n in probe_tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        self.assertEqual(
+            sorted(ctx_Callables & probe_callables),
+            [],
+            "Duplicate functions/classes re-introduced between session_ctx.py and _remote_probe.py; "
+            "import shared pure helpers from ._remote_probe instead of copy-pasting.",
+        )
+
+        def _assigned_names(tree: ast.Module) -> set[str]:
+            out: set[str] = set()
+            for stmt in tree.body:
+                if isinstance(stmt, ast.Assign):
+                    for t in stmt.targets:
+                        if isinstance(t, ast.Name):
+                            out.add(t.id)
+                elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    out.add(stmt.target.id)
+            return out
+
+        self.assertEqual(
+            sorted(_assigned_names(ctx_tree) & _assigned_names(probe_tree)),
+            [],
+            "Duplicate top-level constants re-introduced between session_ctx.py and _remote_probe.py",
+        )
+
+    def test_zero_undefined_module_globals_in_compiled_bytecode(self) -> None:
+        builtin_names = set(dir(builtins))
+        missing_globals: list[str] = []
+
+        def _walk_code(code_obj: types.CodeType, mod_name: str, mod_ns: set[str]) -> None:
+            for instr in dis.get_instructions(code_obj):
+                if instr.opname == "LOAD_GLOBAL":
+                    sym = str(instr.argval)
+                    if sym not in mod_ns and sym not in builtin_names:
+                        missing_globals.append(
+                            f"{mod_name}:{code_obj.co_name}@L{code_obj.co_firstlineno} -> {sym!r}"
+                        )
+            for const in code_obj.co_consts:
+                if isinstance(const, types.CodeType):
+                    _walk_code(const, mod_name, mod_ns)
+
+        for py_path in sorted(PKG_DIR.glob("*.py")):
+            stem = py_path.stem
+            mod = importlib.import_module(
+                "agent_voice_input" if stem == "__init__" else f"agent_voice_input.{stem}"
+            )
+            compiled = compile(py_path.read_text(encoding="utf-8"), str(py_path), "exec")
+            _walk_code(compiled, stem, set(mod.__dict__.keys()))
+
+        self.assertEqual(
+            missing_globals,
+            [],
+            "Undefined global symbol references in compiled bytecode:\n  "
+            + "\n  ".join(missing_globals),
+        )
+
     def test_remote_probe_and_package_use_stdlib_only(self) -> None:
         trees = _parse_package_asts()
         probe_tree = trees["_remote_probe"]
@@ -290,7 +355,12 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
 class TestMockPatchTargetGuards(unittest.TestCase):
     def test_all_suite_mock_patches_hit_live_runtime_references(self) -> None:
         trees = _parse_package_asts()
-        fn_loads = {m: _collect_function_body_loads(t) for m, t in trees.items()}
+        fn_loads = {
+            p.stem: _collect_compiled_runtime_loads(
+                p.read_text(encoding="utf-8"), filename=str(p)
+            )
+            for p in sorted(PKG_DIR.glob("*.py"))
+        }
         loaded_mods = {
             m: importlib.import_module(f"agent_voice_input.{m}") for m in trees
         }
@@ -415,10 +485,21 @@ import os
 __all__ = ["helper"]
 legacy_alias = helper
 
+class _Holder:
+    cls_attr = helper
+
 def only_default_arg(cb=helper):
     return os.stat(".")
+
+def shadowed_local_param(helper):
+    return helper()
+
+def nested_local_def():
+    def helper():
+        return 2
+    return helper()
 """
-        names, dotted = _collect_function_body_loads(ast.parse(dangling_src))
+        names, dotted = _collect_compiled_runtime_loads(dangling_src)
         self.assertIsNotNone(
             _verify_module_patch_chain(
                 mod_obj=fake_mod,
@@ -447,10 +528,13 @@ def only_default_arg(cb=helper):
         live_src = """
 from .other import helper
 
-def active_caller():
-    return helper()
+def outer(helper):
+    def inner():
+        global helper
+        return helper()
+    return inner()
 """
-        live_names, live_dotted = _collect_function_body_loads(ast.parse(live_src))
+        live_names, live_dotted = _collect_compiled_runtime_loads(live_src)
         self.assertIsNone(
             _verify_module_patch_chain(
                 mod_obj=fake_mod,

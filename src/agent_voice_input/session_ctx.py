@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
-import errno
 import fcntl
+import fnmatch
 import glob
 import hashlib
 import json
@@ -37,9 +37,9 @@ from ._remote_probe import (
     MAX_LINE_BYTES,
     _AGY_WS_CWD_RE,
     _BROAD_SYSTEM_DIRS_LOW,
-    _CLAUDE_VER_COMM_RE,
     _FULL_UUID_RE,
     _HASH_TAG_RE,
+    _PREFIXED_TAG_RE,
     _REPO_CORE_EXTS,
     _REPO_PRIORITY_ROOTS,
     _REPO_SKIP_BASES,
@@ -49,8 +49,11 @@ from ._remote_probe import (
     _SHALLOW_SKIP_BASES_LOW,
     _SHALLOW_SKIP_DIRS_LOW,
     _STRICT_UUID_RE,
+    _classify_interactive_cli,
+    _classify_proc_cli,
     _clean_agy_record,
     _clean_claude_record,
+    _cwd_match_rank,
     _extract_agy_compaction_summary,
     _extract_agy_cwd,
     _extract_claude_cmdline_sid,
@@ -58,13 +61,18 @@ from ._remote_probe import (
     _extract_codex_compacted_turns,
     _extract_codex_item_completed,
     _extract_codex_response_item,
+    _infer_cli_word,
     _is_agy_subagent,
+    _is_broad_or_unsafe_workspace_dir,
     _is_claude_sidechain_or_subagent,
     _is_flock_held,
     _is_headless_cli,
     _is_path_under_dir,
-    _is_script_interpreter_token,
+    _is_trusted_runtime_dir,
+    _is_wsl_slow_mount_str,
     _load_codex_thread_names,
+    _match_cli_process,
+    _normalize_cwd,
     _ordered_clis,
     _read_bounded_line,
     _read_claude_root_meta,
@@ -72,9 +80,12 @@ from ._remote_probe import (
     _read_proc_cmdline_args,
     _read_proc_comm,
     _read_proc_ppid,
+    _read_trusted_registry_json,
     _readlink_clean,
     _resolve_agy_transcript_path,
     _safe_mtime,
+    _safe_realpath,
+    encode_claude_project_dir,
     trim_turns_chunk_aligned,
 )
 from ._tmux import (
@@ -116,10 +127,6 @@ _REG_SID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{0,56}$")
 # Window title hint parsing
 # ---------------------------------------------------------------------------
 
-_PREFIXED_TAG_RE = re.compile(
-    r"\[(agy|claude|codex):#?([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{8,36})\]",
-    re.IGNORECASE,
-)
 _WIN_EXPLICIT_NON_WSL_TITLE_RE = re.compile(
     r"^(?:Administrator:\s+|管理员:\s*)?(?:Command Prompt|命令提示符|PS\s+[A-Za-z]:\\|[A-Za-z]:\\)",
     re.IGNORECASE,
@@ -132,11 +139,6 @@ _GENERIC_LOCAL_TERM_TITLE_RE = re.compile(
     r"|ubuntu(?:[- ][0-9.]+)?(?:\s+lts)?|debian(?:[- ][0-9.]+)?|arch(?:\s*linux)?|fedora"
     r"|kali(?:\s*linux)?|alpine|nixos|opensuse|wsl2?|linux)"
     r"(?:\s*(?:[—–-]|\s)\s*\d+\s*[×x]\s*\d+)?\s*$",
-    re.IGNORECASE,
-)
-# Strict word boundaries excluding '/' and '-' so paths/branches like feat/codex-config do not match
-_WORD_CLI_RE = re.compile(
-    r"(?:^|[\s\[\(\{·|:])(agy|antigravity|claude|codex)(?=$|[\s\]\)\}·|:])",
     re.IGNORECASE,
 )
 _WORD_TMUX_RE = re.compile(
@@ -264,14 +266,7 @@ class SessionSnapshot:
         return format_turns_text(self.clean_turns, max_chars=max_chars)
 
 
-def _infer_cli_word_from_title(window_title: str) -> str | None:
-    m = _WORD_CLI_RE.search(window_title)
-    if not m:
-        return None
-    w = m.group(1).lower()
-    if w == "antigravity":
-        return "agy"
-    return w
+_infer_cli_word_from_title = _infer_cli_word
 
 
 def parse_window_title_hint(window_title: str) -> TitleHint | None:
@@ -351,69 +346,6 @@ def normalize_tty_path(raw_tty: str) -> str:
     return ""
 
 
-def _normalize_cwd(raw_cwd: str) -> str:
-    s = (raw_cwd or "").strip()
-    if not s:
-        return ""
-    if s.startswith("file://"):
-        parsed = urllib.parse.urlparse(s)
-        s = urllib.parse.unquote(parsed.path or "")
-    if len(s) > 1:
-        s = s.rstrip("/")
-    return s
-
-
-def _cwd_variants(cwd: str) -> set[str]:
-    norm = _normalize_cwd(cwd)
-    if not norm:
-        return set()
-    out = {norm}
-    try:
-        real = os.path.realpath(norm)
-        if len(real) > 1:
-            real = real.rstrip("/")
-        if real:
-            out.add(real)
-    except OSError:
-        pass
-    return out
-
-
-def _cwd_match_rank(target_cwd: str, cand_cwd: str, home: Path | None = None) -> int:
-    """Return 2 on exact directory match, 1 on bounded subdirectory match, 0 otherwise."""
-    t_vars = _cwd_variants(target_cwd)
-    c_vars = _cwd_variants(cand_cwd)
-    if not t_vars or not c_vars:
-        return 0
-    if t_vars & c_vars:
-        return 2
-    broad = {"/", "/tmp", "/private/tmp", "/var", "/private/var", "/Users", "/home"}
-    if home is not None:
-        broad |= _cwd_variants(str(home))
-    for tv in t_vars:
-        for cv in c_vars:
-            if (cv not in broad and tv.startswith(cv + "/")) or (
-                tv not in broad and cv.startswith(tv + "/")
-            ):
-                return 1
-    return 0
-
-
-def encode_claude_project_dir(cwd: str) -> list[str]:
-    """Return deduplicated Claude project directory names for logical and real ``cwd``."""
-    norm = _normalize_cwd(cwd)
-    if not norm:
-        return []
-    out: list[str] = []
-    for candidate in (norm, _normalize_cwd(os.path.realpath(norm))):
-        if not candidate:
-            continue
-        enc = re.sub(r"[^A-Za-z0-9]", "-", candidate)
-        if enc and enc not in out:
-            out.append(enc)
-    return out
-
-
 def _default_agy_expected_transcript_path(home: Path, cid: str) -> Path:
     return (
         home
@@ -433,7 +365,11 @@ def _upgrade_agy_transcript_path(path_str: str) -> str:
     p = Path(path_str)
     if p.name == "transcript.jsonl":
         full_p = p.with_name("transcript_full.jsonl")
-        if full_p.is_file():
+        if _effective_is_wsl():
+            safe_full = _safe_realpath(str(full_p), wsl=True)
+            if safe_full and os.path.isfile(safe_full):
+                return str(full_p)
+        elif full_p.is_file():
             return str(full_p)
     return str(p)
 
@@ -444,68 +380,6 @@ _extract_agy_transcript_cwd = _extract_agy_cwd
 
 def _split_cmdline(raw_args: str) -> list[str]:
     return (raw_args or "").split()
-
-
-def _match_cli_process(comm: str, argv: Sequence[str]) -> tuple[str | None, list[str]]:
-    """Identify ``("codex" | "claude" | "agy", effective_argv)`` before headless filtering."""
-    args_list = list(argv)
-    c_base = os.path.basename((comm or "").replace("\\", "/")).strip()
-    c_low = c_base.lower()
-    a0_norm = args_list[0].replace("\\", "/") if args_list else ""
-    a0_norm_low = a0_norm.lower()
-    a0_low = os.path.basename(a0_norm).lstrip("-").lower() if a0_norm else ""
-
-    for tok in (c_low, a0_low):
-        if tok == "codex" or tok.startswith(("codex-aarch64-", "codex-x86_64-")):
-            return "codex", args_list
-        if tok in ("agy", "antigravity", "antigravity-cli"):
-            return "agy", args_list
-        if tok == "claude":
-            return "claude", args_list
-    if "/claude/versions/" in a0_norm_low or "/@anthropic-ai/claude-code/" in a0_norm_low:
-        return "claude", args_list
-    if "/@openai/codex/" in a0_norm_low:
-        return "codex", args_list
-    if c_base and _CLAUDE_VER_COMM_RE.match(c_base) and "claude" in a0_norm_low:
-        return "claude", args_list
-
-    if _is_script_interpreter_token(c_low) or _is_script_interpreter_token(a0_low):
-        idx = 1
-        limit = min(len(args_list), 12)
-        while idx < limit:
-            arg = args_list[idx]
-            if arg in ("-c", "-m", "-e", "--eval", "-p", "--print", "--"):
-                break
-            if arg in (
-                "-r",
-                "--require",
-                "--import",
-                "--loader",
-                "--experimental-loader",
-                "-W",
-                "-X",
-            ):
-                idx += 2
-                continue
-            if arg.startswith("-"):
-                idx += 1
-                continue
-            norm_low = arg.replace("\\", "/").lower()
-            base = os.path.basename(norm_low)
-            if (
-                base in ("claude", "claude.js", "claude.mjs")
-                or "/claude/versions/" in norm_low
-                or "/@anthropic-ai/claude-code/" in norm_low
-            ):
-                return "claude", args_list[idx:]
-            if base in ("codex", "codex.js", "codex.mjs") or "/@openai/codex/" in norm_low:
-                return "codex", args_list[idx:]
-            if base in ("agy", "agy.js", "antigravity", "antigravity-cli"):
-                return "agy", args_list[idx:]
-            # Stop at the first non-option script path so arguments to other programs
-            # (e.g. `python3 agent-voice-input session-hook --cli claude`) never false-match.
-            break
-    return None, args_list
 
 
 def _parse_ps_table(output: str) -> list[tuple[int, int, str, str, list[str]]]:
@@ -621,7 +495,7 @@ def _query_pids_open_files_and_cwds(
             path_val = ln[1:]
             if cur_fd == "cwd":
                 if path_val.startswith("/"):
-                    cwd_by_pid[cur_pid] = _normalize_cwd(path_val)
+                    cwd_by_pid[cur_pid] = _normalize_cwd(path_val, wsl=_effective_is_wsl())
             elif cur_fd == "":
                 files_by_pid.setdefault(cur_pid, []).append(path_val)
                 if (
@@ -629,7 +503,7 @@ def _query_pids_open_files_and_cwds(
                     and cur_pid not in cwd_by_pid
                     and not path_val.endswith((".jsonl", ".lock"))
                 ):
-                    cwd_by_pid[cur_pid] = _normalize_cwd(path_val)
+                    cwd_by_pid[cur_pid] = _normalize_cwd(path_val, wsl=_effective_is_wsl())
             else:
                 files_by_pid.setdefault(cur_pid, []).append(path_val)
     return files_by_pid, cwd_by_pid
@@ -663,42 +537,84 @@ def _query_pid_codex_rollout_paths(
     return _query_pids_codex_rollout_paths((pid,), home, proc_root)
 
 
+def _safe_wsl_dir(dir_path: Path, *, wsl: bool) -> Path | None:
+    if not wsl:
+        return dir_path if dir_path.is_dir() else None
+    real = _resolve_safe_local_dir(str(dir_path), wsl=True)
+    return Path(real) if real else None
+
+
+def _safe_wsl_glob_files(
+    root_dir: Path, depth: int, file_glob: str, *, wsl: bool
+) -> list[str]:
+    """Match ``file_glob`` ``depth`` levels below ``root_dir`` without following WSL ``/mnt/`` symlinks."""
+    if not wsl:
+        pat = str(root_dir.joinpath(*(["*"] * (depth - 1)), file_glob))
+        return [p for p in glob.glob(pat) if os.path.isfile(p)]
+    safe_root = _safe_wsl_dir(root_dir, wsl=True)
+    if safe_root is None:
+        return []
+    dirs: list[Path] = [safe_root]
+    for _ in range(depth - 1):
+        next_dirs: list[Path] = []
+        for d in dirs:
+            try:
+                with os.scandir(d) as it:
+                    for entry in it:
+                        if entry.name.startswith("."):
+                            continue
+                        sd = _safe_wsl_dir(Path(entry.path), wsl=True)
+                        if sd is not None:
+                            next_dirs.append(sd)
+            except OSError:
+                continue
+        dirs = next_dirs
+        if not dirs:
+            return []
+    allow_hidden_file = file_glob.startswith(".")
+    matched: list[str] = []
+    for d in dirs:
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    if not allow_hidden_file and entry.name.startswith("."):
+                        continue
+                    if not fnmatch.fnmatch(entry.name, file_glob):
+                        continue
+                    safe_f = _safe_realpath(entry.path, wsl=True)
+                    if safe_f and os.path.isfile(safe_f):
+                        matched.append(entry.path)
+        except OSError:
+            continue
+    return matched
+
+
 def _query_pids_codex_rollout_paths(
     pids: Sequence[int], home: Path, proc_root: Path | None = None
 ) -> list[str]:
+    eff_wsl = _effective_is_wsl()
+    safe_codex_root = _safe_wsl_dir(home / ".codex", wsl=eff_wsl)
+    if safe_codex_root is None:
+        return []
     files_by_pid, _ = _query_pids_open_files_and_cwds(pids, proc_root)
     if not files_by_pid:
         return []
-    codex_root_dir = home / ".codex"
     out: list[str] = []
     for targets in files_by_pid.values():
         for t in targets:
             if (
-                t.endswith(".jsonl")
-                and os.path.basename(t).startswith("rollout-")
-                and _is_path_under_dir(t, codex_root_dir)
-                and os.path.isfile(t)
+                not t.endswith(".jsonl")
+                or not os.path.basename(t).startswith("rollout-")
+                or not _is_path_under_dir(t, safe_codex_root, wsl=eff_wsl)
             ):
-                real_t = os.path.realpath(t)
-                if real_t not in out:
-                    out.append(real_t)
+                continue
+            real_t = _safe_realpath(t, wsl=eff_wsl)
+            if real_t and os.path.isfile(real_t) and real_t not in out:
+                out.append(real_t)
     return out
 
 
 _is_headless_cli_invocation = _is_headless_cli
-
-
-def _classify_interactive_cli(comm: str, argv: Sequence[str]) -> str | None:
-    cli_kind, eff_args = _match_cli_process(comm, argv)
-    if cli_kind is None or _is_headless_cli_invocation(cli_kind, eff_args):
-        return None
-    return cli_kind
-
-
-def _classify_proc_cli(proc_pid_dir: Path) -> str | None:
-    return _classify_interactive_cli(
-        _read_proc_comm(proc_pid_dir), _read_proc_cmdline_args(proc_pid_dir)
-    )
 
 
 def _ps_pid_matches_cli(pid: int, expected_cli: str) -> bool:
@@ -754,11 +670,24 @@ def _resolve_valid_agy_root_meta(
     cid_low = cid.strip().lower()
     if not cid_low:
         return False, "", 0.0
-    lock_file = home / ".gemini" / "antigravity-cli" / "presence" / f"{cid_low}.lock"
-    if not lock_file.is_file():
+    eff_wsl = _effective_is_wsl()
+    safe_presence = _safe_wsl_dir(
+        home / ".gemini" / "antigravity-cli" / "presence", wsl=eff_wsl
+    )
+    if safe_presence is None:
         return False, "", 0.0
+    lock_candidate = safe_presence / f"{cid_low}.lock"
+    if eff_wsl:
+        safe_lock = _safe_realpath(str(lock_candidate), wsl=True)
+        if not safe_lock or not os.path.isfile(safe_lock):
+            return False, "", 0.0
+        lock_file = Path(safe_lock)
+    else:
+        if not lock_candidate.is_file():
+            return False, "", 0.0
+        lock_file = lock_candidate
 
-    tp = _resolve_agy_transcript_path(home, cid_low)
+    tp = _resolve_agy_transcript_path(home, cid_low, wsl=eff_wsl)
     if tp is not None and _is_agy_transcript_subagent(tp):
         return False, "", 0.0
 
@@ -772,7 +701,7 @@ def _resolve_valid_agy_root_meta(
     held = is_agy_presence_lock_held_nonproc(lock_file)
     if not held:
         return False, "", 0.0
-    agy_cwd = _extract_agy_transcript_cwd(tp) if tp is not None else ""
+    agy_cwd = _extract_agy_transcript_cwd(tp, wsl=eff_wsl) if tp is not None else ""
     return True, agy_cwd, 0.0
 
 
@@ -804,7 +733,7 @@ def _iter_numeric_proc_dirs(proc_root: Path) -> list[Path]:
 
 
 def _read_proc_cwd(proc_pid_dir: Path) -> str:
-    return _normalize_cwd(_readlink_clean(proc_pid_dir / "cwd"))
+    return _normalize_cwd(_readlink_clean(proc_pid_dir / "cwd"), wsl=_effective_is_wsl())
 
 
 def _read_proc_tty_path(proc_pid_dir: Path) -> str:
@@ -938,13 +867,15 @@ def _dir_basename_in_title(window_title: str, dir_path: str) -> bool:
 def _agy_transcript_and_mtime(
     home: Path, cid: str, fallback_path: str | Path | None = None
 ) -> tuple[str, float]:
-    tp = _resolve_agy_transcript_path(home, cid)
+    eff_wsl = _effective_is_wsl()
+    tp = _resolve_agy_transcript_path(home, cid, wsl=eff_wsl)
     if tp is not None:
         return str(tp), _safe_mtime(tp)
     tp_str = str(_default_agy_expected_transcript_path(home, cid))
-    return tp_str, (
-        _safe_mtime(fallback_path) if fallback_path is not None else _safe_mtime(tp_str)
-    )
+    fb_target = str(fallback_path) if fallback_path is not None else tp_str
+    if eff_wsl and not _safe_realpath(fb_target, wsl=True):
+        return tp_str, 0.0
+    return tp_str, _safe_mtime(fb_target)
 
 
 def _build_agy_match(
@@ -959,13 +890,14 @@ def _build_agy_match(
     valid_agy, live_cwd, live_pts = _resolve_valid_agy_root_meta(cid_low, home, proc_root)
     if not valid_agy:
         return None
+    eff_wsl = _effective_is_wsl()
     lock_file = home / ".gemini" / "antigravity-cli" / "presence" / f"{cid_low}.lock"
     tp_str, j_mtime = _agy_transcript_and_mtime(home, cid_low, lock_file)
     return SessionMatch(
         cli="agy",
         session_id=cid_low,
         jsonl_path=tp_str,
-        cwd=live_cwd or fallback_cwd,
+        cwd=live_cwd or _normalize_cwd(fallback_cwd, wsl=eff_wsl),
         matched_by=matched_by,
         pts_mtime=live_pts,
         jsonl_mtime=j_mtime,
@@ -983,20 +915,22 @@ def _collect_codex_storage_matches(
     limit: int = 0,
     codex_names: Mapping[str, str] | None = None,
 ) -> list[SessionMatch]:
-    pattern = str(home / ".codex" / "sessions" / "*" / "*" / "*" / file_glob)
-    files = sorted(glob.glob(pattern), key=_safe_mtime, reverse=True)
+    eff_wsl = _effective_is_wsl()
+    files = sorted(
+        _safe_wsl_glob_files(home / ".codex" / "sessions", 4, file_glob, wsl=eff_wsl),
+        key=_safe_mtime,
+        reverse=True,
+    )
     if limit > 0:
         files = files[:limit]
-    names = _load_codex_thread_names(home) if codex_names is None else codex_names
+    names = _load_codex_thread_names(home, wsl=eff_wsl) if codex_names is None else codex_names
     out: list[SessionMatch] = []
     for cf in files:
-        if not os.path.isfile(cf):
-            continue
-        is_cli, sid, meta_cwd = _read_codex_root_meta(cf)
+        is_cli, sid, meta_cwd = _read_codex_root_meta(cf, wsl=eff_wsl)
         eff_sid = sid or fallback_sid
         if not is_cli or not eff_sid or (sid_prefix and not eff_sid.startswith(sid_prefix)):
             continue
-        if eff_cwd and _cwd_match_rank(eff_cwd, meta_cwd, home) == 0:
+        if eff_cwd and _cwd_match_rank(eff_cwd, meta_cwd, home, wsl=eff_wsl) == 0:
             continue
         out.append(
             SessionMatch(
@@ -1028,20 +962,24 @@ def _collect_claude_storage_matches(
     claimed_claude_sids: Mapping[str, int] | None = None,
     owner_pid: int = 0,
 ) -> list[SessionMatch]:
+    eff_wsl = _effective_is_wsl()
+    safe_projects = _safe_wsl_dir(home / ".claude" / "projects", wsl=eff_wsl)
+    if safe_projects is None:
+        return []
     cands: list[SessionMatch] = []
     seen_paths: set[str] = set()
     if eff_cwd:
-        for enc in encode_claude_project_dir(eff_cwd):
-            proj_dir = home / ".claude" / "projects" / enc
-            if not proj_dir.is_dir():
-                continue
-            for jf in sorted(proj_dir.glob(file_glob), key=_safe_mtime, reverse=True):
-                if not jf.is_file():
-                    continue
-                jf_str = str(jf)
+        for enc in encode_claude_project_dir(eff_cwd, wsl=eff_wsl):
+            proj_files = sorted(
+                _safe_wsl_glob_files(safe_projects / enc, 1, file_glob, wsl=eff_wsl),
+                key=_safe_mtime,
+                reverse=True,
+            )
+            for jf_str in proj_files:
                 seen_paths.add(jf_str)
+                jf = Path(jf_str)
                 is_root, sid, meta_cwd = _read_claude_root_meta(
-                    jf, allow_empty_or_meta_only=True
+                    jf, allow_empty_or_meta_only=True, wsl=eff_wsl
                 )
                 eff_sid = sid or fallback_sid
                 if not is_root or not eff_sid or (sid_prefix and not eff_sid.startswith(sid_prefix)):
@@ -1063,17 +1001,17 @@ def _collect_claude_storage_matches(
                 )
     if include_global and (not filter_cwd or not cands):
         claude_files = sorted(
-            glob.glob(str(home / ".claude" / "projects" / "*" / file_glob)),
+            _safe_wsl_glob_files(safe_projects, 2, file_glob, wsl=eff_wsl),
             key=_safe_mtime,
             reverse=True,
         )
         if limit > 0:
             claude_files = claude_files[:limit]
         for clf in claude_files:
-            if clf in seen_paths or not os.path.isfile(clf):
+            if clf in seen_paths:
                 continue
             is_root, sid, meta_cwd = _read_claude_root_meta(
-                clf, allow_empty_or_meta_only=allow_empty_global
+                clf, allow_empty_or_meta_only=allow_empty_global, wsl=eff_wsl
             )
             eff_sid = sid or fallback_sid
             if not is_root or not eff_sid or (sid_prefix and not eff_sid.startswith(sid_prefix)):
@@ -1082,7 +1020,7 @@ def _collect_claude_storage_matches(
                 claimed_owner = claimed_claude_sids.get(eff_sid, 0)
                 if claimed_owner not in (0, owner_pid):
                     continue
-            if filter_cwd and eff_cwd and _cwd_match_rank(eff_cwd, meta_cwd, home) == 0:
+            if filter_cwd and eff_cwd and _cwd_match_rank(eff_cwd, meta_cwd, home, wsl=eff_wsl) == 0:
                 continue
             cands.append(
                 SessionMatch(
@@ -1132,12 +1070,14 @@ def scan_proc_root_sessions(
     if not live_proc_entries:
         return []
 
+    eff_wsl = _effective_is_wsl()
     files_by_pid, cwd_by_pid = _query_pids_open_files_and_cwds(
         [pid for pid, _, _, _ in live_proc_entries], proc_root
     )
-    codex_root_dir = home / ".codex"
-    agy_root_dir = home / ".gemini"
-    codex_names = _load_codex_thread_names(home)
+    codex_root_dir = _safe_wsl_dir(home / ".codex", wsl=eff_wsl)
+    agy_root_dir = _safe_wsl_dir(home / ".gemini", wsl=eff_wsl)
+    claude_projects_dir = _safe_wsl_dir(home / ".claude" / "projects", wsl=eff_wsl)
+    codex_names = _load_codex_thread_names(home, wsl=eff_wsl)
     by_key: dict[str, SessionMatch] = {}
 
     for pid, proc_dir, cli_kind, pts_mtime in live_proc_entries:
@@ -1145,24 +1085,28 @@ def scan_proc_root_sessions(
         open_files = files_by_pid.get(pid, ())
 
         if cli_kind == "codex":
+            if codex_root_dir is None:
+                continue
             for target in open_files:
                 if not target.endswith(".jsonl"):
                     continue
                 base = os.path.basename(target)
                 if (
                     not base.startswith("rollout-")
-                    or not _is_path_under_dir(target, codex_root_dir)
-                    or not os.path.isfile(target)
+                    or not _is_path_under_dir(target, codex_root_dir, wsl=eff_wsl)
                 ):
                     continue
-                is_cli, sid, meta_cwd = _read_codex_root_meta(target)
+                safe_t = _safe_realpath(target, wsl=eff_wsl)
+                if not safe_t or not os.path.isfile(safe_t):
+                    continue
+                is_cli, sid, meta_cwd = _read_codex_root_meta(safe_t, wsl=eff_wsl)
                 if not is_cli or not sid:
                     continue
-                j_mtime = _safe_mtime(target)
+                j_mtime = _safe_mtime(safe_t)
                 cand = SessionMatch(
                     cli="codex",
                     session_id=sid,
-                    jsonl_path=target,
+                    jsonl_path=safe_t,
                     cwd=meta_cwd or proc_cwd,
                     matched_by="proc_scan",
                     pts_mtime=pts_mtime,
@@ -1177,20 +1121,23 @@ def scan_proc_root_sessions(
                     by_key[cand.session_key] = cand
 
         elif cli_kind == "agy":
+            if agy_root_dir is None:
+                continue
             for target in open_files:
                 if not target.endswith(".lock"):
                     continue
                 if "/presence/" not in target.replace("\\", "/") or not _is_path_under_dir(
-                    target, agy_root_dir
+                    target, agy_root_dir, wsl=eff_wsl
                 ):
                     continue
-                cid = Path(target).stem.lower()
-                if not cid or not os.path.isfile(target):
+                safe_t = _safe_realpath(target, wsl=eff_wsl)
+                cid = Path(safe_t).stem.lower() if safe_t else ""
+                if not cid or not os.path.isfile(safe_t):
                     continue
-                tp = _resolve_agy_transcript_path(home, cid)
+                tp = _resolve_agy_transcript_path(home, cid, wsl=eff_wsl)
                 if tp is not None and _is_agy_transcript_subagent(tp):
                     continue
-                tp_str, j_mtime = _agy_transcript_and_mtime(home, cid, target)
+                tp_str, j_mtime = _agy_transcript_and_mtime(home, cid, safe_t)
                 cand = SessionMatch(
                     cli="agy",
                     session_id=cid,
@@ -1208,20 +1155,18 @@ def scan_proc_root_sessions(
                     by_key[cand.session_key] = cand
 
         elif cli_kind == "claude":
-            if not proc_cwd:
+            if not proc_cwd or claude_projects_dir is None:
                 continue
             pinned_sid = _extract_claude_cmdline_sid(proc_dir)
             best_pinned: SessionMatch | None = None
             best_unclaimed: SessionMatch | None = None
-            for enc in encode_claude_project_dir(proc_cwd):
-                proj_dir = home / ".claude" / "projects" / enc
-                if not proj_dir.is_dir():
-                    continue
-                for jf in proj_dir.glob("*.jsonl"):
-                    if not jf.is_file():
-                        continue
+            for enc in encode_claude_project_dir(proc_cwd, wsl=eff_wsl):
+                for jf_str in _safe_wsl_glob_files(
+                    claude_projects_dir / enc, 1, "*.jsonl", wsl=eff_wsl
+                ):
+                    jf = Path(jf_str)
                     is_root, sid, meta_cwd = _read_claude_root_meta(
-                        jf, allow_empty_or_meta_only=True
+                        jf, allow_empty_or_meta_only=True, wsl=eff_wsl
                     )
                     if not is_root or not sid:
                         continue
@@ -1267,9 +1212,10 @@ def _disambiguate_candidates(
         return candidates[0]
 
     pool = list(candidates)
-    norm_cwd = _normalize_cwd(window_cwd)
+    eff_wsl = _effective_is_wsl()
+    norm_cwd = "" if is_wsl_slow_mount_path(window_cwd, wsl=eff_wsl) else _normalize_cwd(window_cwd)
     if norm_cwd:
-        cwd_ranked = [(_cwd_match_rank(norm_cwd, c.cwd, home), c) for c in pool]
+        cwd_ranked = [(_cwd_match_rank(norm_cwd, c.cwd, home, wsl=eff_wsl), c) for c in pool]
         max_cwd_rank = max(r for r, _ in cwd_ranked)
         if max_cwd_rank > 0:
             pool = [c for r, c in cwd_ranked if r == max_cwd_rank]
@@ -1334,18 +1280,6 @@ def _extract_record_pid(rec: Mapping[str, Any]) -> int:
     return _clean_pos_int(rec.get("agent_pid")) or _clean_pos_int(rec.get("pid"))
 
 
-def _is_trusted_runtime_dir(rt_dir: Path) -> bool:
-    try:
-        st = os.lstat(rt_dir)
-    except OSError:
-        return False
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-        return False
-    if (st.st_mode & 0o077) != 0:
-        return False
-    return st.st_uid == os.getuid()
-
-
 def _iter_trusted_sessions_dirs(runtime_dirs: Sequence[Path]) -> list[tuple[int, Path]]:
     out: list[tuple[int, Path]] = []
     for dir_idx, rt_dir in enumerate(runtime_dirs):
@@ -1354,42 +1288,6 @@ def _iter_trusted_sessions_dirs(runtime_dirs: Sequence[Path]) -> list[tuple[int,
             if _is_trusted_runtime_dir(sdir):
                 out.append((dir_idx, sdir))
     return out
-
-
-def _read_trusted_registry_json(reg_file: Path) -> dict[str, Any] | None:
-    """Open registry file with ``O_NOFOLLOW``, verify regular file/owner/0600, and parse JSON."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(str(reg_file), flags)
-    except OSError:
-        return None
-    try:
-        st = os.fstat(fd)
-        if (
-            not stat.S_ISREG(st.st_mode)
-            or st.st_uid != os.getuid()
-            or (st.st_mode & 0o077) != 0
-            or st.st_size > 262144
-        ):
-            return None
-        chunks: list[bytes] = []
-        while True:
-            buf = os.read(fd, 16384)
-            if not buf:
-                break
-            chunks.append(buf)
-    except OSError:
-        return None
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    try:
-        rec = json.loads(b"".join(chunks).decode("utf-8-sig"))
-    except (UnicodeDecodeError, ValueError):
-        return None
-    return rec if isinstance(rec, dict) else None
 
 
 SESSION_REGISTRY_TTL_SEC: float = 7 * 86400.0
@@ -1666,7 +1564,7 @@ def write_session_registry_entry(
     payload: dict[str, Any] = {
         "cli": cli_low,
         "session_id": sid_low,
-        "cwd": _normalize_cwd(cwd),
+        "cwd": _normalize_cwd(cwd, wsl=_effective_is_wsl()),
         "tty": eff_tty,
         "jsonl_path": jsonl_path,
         "transcript_path": jsonl_path,
@@ -1757,8 +1655,14 @@ def _validate_registry_record(
         elif not _is_pid_alive(agent_pid):
             return None
 
+    eff_wsl = _effective_is_wsl()
     raw_path = str(rec.get("jsonl_path") or rec.get("transcript_path") or "").strip()
-    reg_cwd = _normalize_cwd(str(rec.get("cwd") or ""))
+    if eff_wsl and raw_path:
+        safe_raw = _safe_realpath(raw_path, wsl=True)
+        if not safe_raw:
+            return None
+        raw_path = safe_raw
+    reg_cwd = _normalize_cwd(str(rec.get("cwd") or ""), wsl=eff_wsl)
     try:
         updated_at = float(rec.get("updated_at") or 0.0)
     except (TypeError, ValueError):
@@ -1768,7 +1672,7 @@ def _validate_registry_record(
         valid_agy, live_cwd, _ = _resolve_valid_agy_root_meta(sid, home, proc_root)
         if not valid_agy:
             return None
-        tp = _resolve_agy_transcript_path(home, sid)
+        tp = _resolve_agy_transcript_path(home, sid, wsl=eff_wsl)
         if tp is not None:
             raw_path = str(tp)
         elif raw_path:
@@ -1782,7 +1686,7 @@ def _validate_registry_record(
         if not raw_path:
             return None
         if os.path.isfile(raw_path) and os.path.getsize(raw_path) > 0:
-            is_cli, meta_sid, meta_cwd = _read_codex_root_meta(raw_path)
+            is_cli, meta_sid, meta_cwd = _read_codex_root_meta(raw_path, wsl=eff_wsl)
             if not is_cli:
                 return None
             sid = sid or meta_sid
@@ -1794,7 +1698,7 @@ def _validate_registry_record(
             return None
         if os.path.isfile(raw_path) and os.path.getsize(raw_path) > 0:
             is_root, meta_sid, meta_cwd = _read_claude_root_meta(
-                raw_path, allow_empty_or_meta_only=True
+                raw_path, allow_empty_or_meta_only=True, wsl=eff_wsl
             )
             if not is_root:
                 return None
@@ -1809,7 +1713,7 @@ def _validate_registry_record(
             cli=expected_cli,
             session_id=sid,
             jsonl_path=raw_path,
-            cwd=reg_cwd or _normalize_cwd(fallback_cwd),
+            cwd=reg_cwd or _normalize_cwd(fallback_cwd, wsl=eff_wsl),
             matched_by=matched_by,
             pts_mtime=updated_at,
             jsonl_mtime=_safe_mtime(raw_path),
@@ -2054,16 +1958,20 @@ def _lookup_by_short_prefix(
                 )
             )
         elif cli == "agy":
-            presence_dir = home / ".gemini" / "antigravity-cli" / "presence"
-            if presence_dir.is_dir():
-                for lf in presence_dir.glob(f"{prefix}*.lock"):
-                    cid = lf.stem.lower()
-                    if cid.startswith(prefix):
-                        agy_hit = _build_agy_match(
-                            cid, home=home, proc_root=proc_root, matched_by="title_prefix"
-                        )
-                        if agy_hit is not None:
-                            dir_hits.append(agy_hit)
+            eff_wsl = _effective_is_wsl()
+            for lf_str in _safe_wsl_glob_files(
+                home / ".gemini" / "antigravity-cli" / "presence",
+                1,
+                f"{prefix}*.lock",
+                wsl=eff_wsl,
+            ):
+                cid = Path(lf_str).stem.lower()
+                if cid.startswith(prefix):
+                    agy_hit = _build_agy_match(
+                        cid, home=home, proc_root=proc_root, matched_by="title_prefix"
+                    )
+                    if agy_hit is not None:
+                        dir_hits.append(agy_hit)
         elif cli == "claude":
             dir_hits.extend(
                 _collect_claude_storage_matches(
@@ -2154,7 +2062,7 @@ def _lookup_tty_in_registry(
     proc_root: Path | None,
     fallback_cwd: str = "",
 ) -> SessionMatch | None:
-    codex_names = _load_codex_thread_names(home)
+    codex_names = _load_codex_thread_names(home, wsl=_effective_is_wsl())
     hits: list[tuple[int, int, float, SessionMatch]] = []
     for dir_idx, _, rec in _iter_trusted_registry_records(runtime_dirs):
         reg_tty = normalize_tty_path(str(rec.get("tty") or ""))
@@ -2203,14 +2111,15 @@ def _find_storage_session_for_cli(
     matched_by: str = "tty_ps",
     claimed_claude_sids: Mapping[str, int] | None = None,
 ) -> SessionMatch | None:
+    eff_wsl = _effective_is_wsl()
     if cli_kind == "codex":
         if agent_pid > 0:
             open_real = _query_pid_codex_rollout_paths(agent_pid, home, proc_root)
             if open_real:
-                codex_names = _load_codex_thread_names(home)
+                codex_names = _load_codex_thread_names(home, wsl=eff_wsl)
                 pid_cands: list[SessionMatch] = []
                 for rp in open_real:
-                    is_cli, sid, meta_cwd = _read_codex_root_meta(rp)
+                    is_cli, sid, meta_cwd = _read_codex_root_meta(rp, wsl=eff_wsl)
                     if is_cli and sid:
                         pid_cands.append(
                             SessionMatch(
@@ -2244,8 +2153,10 @@ def _find_storage_session_for_cli(
         return _disambiguate_candidates(cands, window_title, eff_cwd, home)
 
     if cli_kind == "agy":
-        presence_dir = home / ".gemini" / "antigravity-cli" / "presence"
-        if not presence_dir.is_dir():
+        presence_dir = _safe_wsl_dir(
+            home / ".gemini" / "antigravity-cli" / "presence", wsl=eff_wsl
+        )
+        if presence_dir is None:
             return None
         if agent_pid > 0:
             pid_cands = [
@@ -2266,16 +2177,16 @@ def _find_storage_session_for_cli(
                 return _disambiguate_candidates(pid_cands, window_title, eff_cwd, home)
         matched_cands: list[SessionMatch] = []
         unknown_cwd_cands: list[SessionMatch] = []
-        for lf in presence_dir.glob("*.lock"):
+        for lf_str in _safe_wsl_glob_files(presence_dir, 1, "*.lock", wsl=eff_wsl):
             cand = _build_agy_match(
-                lf.stem, home=home, proc_root=proc_root, matched_by=matched_by
+                Path(lf_str).stem, home=home, proc_root=proc_root, matched_by=matched_by
             )
             if cand is None:
                 continue
             if not eff_cwd:
                 matched_cands.append(cand)
             elif cand.cwd:
-                if _cwd_match_rank(eff_cwd, cand.cwd, home) > 0:
+                if _cwd_match_rank(eff_cwd, cand.cwd, home, wsl=eff_wsl) > 0:
                     matched_cands.append(cand)
             else:
                 unknown_cwd_cands.append(replace(cand, cwd=eff_cwd))
@@ -2350,7 +2261,7 @@ def _scan_nonproc_fallback_sessions(
     check_pid_alive: bool = True,
 ) -> list[SessionMatch]:
     """Fallback for macOS (no ``/proc``): active runtime registry + recent root transcripts."""
-    codex_names = _load_codex_thread_names(home)
+    codex_names = _load_codex_thread_names(home, wsl=_effective_is_wsl())
     by_key: dict[str, SessionMatch] = {}
     key_tier: dict[str, int] = {}
     eff_proc_for_reg: Path | None = Path("/__nonproc__") if check_pid_alive else None
@@ -2390,14 +2301,15 @@ def _scan_nonproc_fallback_sessions(
     ):
         by_key.setdefault(cand.session_key, cand)
 
-    presence_dir = home / ".gemini" / "antigravity-cli" / "presence"
-    if presence_dir.is_dir():
-        for lf in presence_dir.glob("*.lock"):
-            agy_cand = _build_agy_match(
-                lf.stem, home=home, proc_root=None, matched_by="recent_root"
-            )
-            if agy_cand is not None:
-                by_key.setdefault(agy_cand.session_key, agy_cand)
+    eff_wsl = _effective_is_wsl()
+    for lf_str in _safe_wsl_glob_files(
+        home / ".gemini" / "antigravity-cli" / "presence", 1, "*.lock", wsl=eff_wsl
+    ):
+        agy_cand = _build_agy_match(
+            Path(lf_str).stem, home=home, proc_root=None, matched_by="recent_root"
+        )
+        if agy_cand is not None:
+            by_key.setdefault(agy_cand.session_key, agy_cand)
 
     return list(by_key.values())
 
@@ -2502,68 +2414,7 @@ def is_wsl_slow_mount_path(
     """Pure-string zero-I/O check blocking WSL2 ``/mnt/`` DrvFS and UNC mounts."""
     if not _effective_is_wsl(wsl, env):
         return False
-    s = (path_str or "").strip()
-    if not s:
-        return False
-    if s.lower().startswith("file://"):
-        parsed = urllib.parse.urlparse(s)
-        if parsed.netloc and parsed.netloc.lower() != "localhost":
-            return True
-        s = urllib.parse.unquote(parsed.path or "")
-    if s.startswith(("\\\\", "//")) or (len(s) >= 2 and s[0].isalpha() and s[1] == ":"):
-        return True
-    if s.startswith(("/", "\\")):
-        norm = posixpath.normpath("/" + s.replace("\\", "/").lstrip("/"))
-        return norm == "/mnt" or norm.startswith("/mnt/")
-    return False
-
-
-def _safe_realpath(path_str: str, *, wsl: bool) -> str:
-    """Resolve symlinks without ever calling ``lstat``/``stat`` on WSL2 ``/mnt/`` slow mounts."""
-    if not path_str or is_wsl_slow_mount_path(path_str, wsl=wsl):
-        return ""
-    if not wsl:
-        try:
-            return _normalize_cwd(os.path.realpath(path_str))
-        except OSError:
-            return ""
-    abs_p = path_str if path_str.startswith("/") else os.path.abspath(path_str)
-    if is_wsl_slow_mount_path(abs_p, wsl=True):
-        return ""
-    todo = [seg for seg in abs_p.split("/") if seg and seg != "."]
-    resolved: list[str] = []
-    hops = 0
-    while todo:
-        seg = todo.pop(0)
-        if seg == "..":
-            if resolved:
-                resolved.pop()
-            continue
-        cand = "/" + "/".join([*resolved, seg])
-        if is_wsl_slow_mount_path(cand, wsl=True):
-            return ""
-        try:
-            st = os.lstat(cand)
-        except OSError:
-            tail = posixpath.normpath("/" + "/".join([*resolved, seg, *todo]))
-            return "" if is_wsl_slow_mount_path(tail, wsl=True) else _normalize_cwd(tail)
-        if stat.S_ISLNK(st.st_mode):
-            hops += 1
-            if hops > 40:
-                return ""
-            try:
-                target = os.readlink(cand)
-            except OSError:
-                return ""
-            if is_wsl_slow_mount_path(target, wsl=True):
-                return ""
-            if target.startswith("/"):
-                resolved = []
-            todo = [x for x in target.split("/") if x and x != "."] + todo
-        else:
-            resolved.append(seg)
-    out = "/" + "/".join(resolved)
-    return "" if is_wsl_slow_mount_path(out, wsl=True) else _normalize_cwd(out)
+    return _is_wsl_slow_mount_str(path_str)
 
 
 def _resolve_safe_local_dir(path_str: str, *, wsl: bool) -> str:
@@ -2577,21 +2428,6 @@ def _resolve_safe_local_dir(path_str: str, *, wsl: bool) -> str:
         return ""
 
 
-def _is_broad_or_unsafe_workspace_dir(dir_path: str, home: Path | None = None, *, wsl: bool = False) -> bool:
-    norm = posixpath.normpath(_normalize_cwd(dir_path)) if dir_path else ""
-    if not norm or norm == "." or norm.lower() in _BROAD_SYSTEM_DIRS_LOW:
-        return True
-    if posixpath.dirname(norm).lower() in ("/home", "/users"):
-        return True
-    if home is not None:
-        h_norm = posixpath.normpath(_normalize_cwd(str(home)))
-        h_real = _safe_realpath(h_norm, wsl=wsl)
-        h_set = {p for p in (h_norm, h_real) if p}
-        if norm in h_set or norm.lower() in {p.lower() for p in h_set}:
-            return True
-    return False
-
-
 def _has_git_marker(dir_path: str) -> bool:
     try:
         return bool(dir_path) and os.path.exists(os.path.join(dir_path, ".git"))
@@ -2599,10 +2435,12 @@ def _has_git_marker(dir_path: str) -> bool:
         return False
 
 
-def _is_inside_git_worktree(dir_path: str, *, home: Path | None = None, max_depth: int = 12) -> bool:
+def _is_inside_git_worktree(
+    dir_path: str, *, home: Path | None = None, max_depth: int = 12, wsl: bool = False
+) -> bool:
     cur = _normalize_cwd(dir_path)
     for _ in range(max_depth + 1):
-        if not cur or _is_broad_or_unsafe_workspace_dir(cur, home):
+        if not cur or _is_broad_or_unsafe_workspace_dir(cur, home, wsl=wsl):
             return False
         if _has_git_marker(cur):
             return True
@@ -2645,7 +2483,7 @@ def read_workspace_shallow_files(
     if (
         not real_cwd
         or _is_broad_or_unsafe_workspace_dir(real_cwd, eff_home, wsl=eff_wsl)
-        or _is_inside_git_worktree(real_cwd, home=eff_home)
+        or _is_inside_git_worktree(real_cwd, home=eff_home, wsl=eff_wsl)
     ):
         return []
 
@@ -3138,11 +2976,19 @@ def resolve_antigravity_ide_session(
                         continue
                     cid_dir = Path(entry.path)
                     logs_dir = cid_dir / ".system_generated" / "logs"
-                    tp = logs_dir / "transcript_full.jsonl"
-                    if not tp.is_file():
-                        tp = logs_dir / "transcript.jsonl"
-                        if not tp.is_file():
-                            continue
+                    tp: Path | None = None
+                    for cand_name in ("transcript_full.jsonl", "transcript.jsonl"):
+                        cand_tp = logs_dir / cand_name
+                        if eff_wsl:
+                            safe_tp = _safe_realpath(str(cand_tp), wsl=True)
+                            if safe_tp and os.path.isfile(safe_tp):
+                                tp = cand_tp
+                                break
+                        elif cand_tp.is_file():
+                            tp = cand_tp
+                            break
+                    if tp is None:
+                        continue
                     try:
                         st = tp.stat()
                     except OSError:
@@ -3900,6 +3746,8 @@ class SessionTracker:
                 return True
             return any(c.session_key == cand.session_key for c in pane_proc_cands)
 
+        eff_wsl = _effective_is_wsl(env=self.env)
+
         def _enrich_from_pane(cand: SessionMatch, matched_by: str) -> SessionMatch:
             proc_hit = next(
                 (c for c in pane_proc_cands if c.session_key == cand.session_key), None
@@ -3907,7 +3755,8 @@ class SessionTracker:
             eff_cwd = _normalize_cwd(
                 cand.cwd
                 or (proc_hit.cwd if proc_hit else "")
-                or active_pane.current_path
+                or active_pane.current_path,
+                wsl=eff_wsl,
             )
             eff_pts = cand.pts_mtime or (proc_hit.pts_mtime if proc_hit else 0.0)
             eff_tname = cand.thread_name or (proc_hit.thread_name if proc_hit else "")
@@ -3999,7 +3848,7 @@ class SessionTracker:
 
         # Stage 2b: Scoped Darwin (non-/proc) active-pane process + storage discovery via ps/lsof
         if use_ps and darwin_agents:
-            pane_cwd = _normalize_cwd(active_pane.current_path)
+            pane_cwd = _normalize_cwd(active_pane.current_path, wsl=eff_wsl)
             for agent_pid, cli_kind in darwin_agents:
                 eff_cwd = pane_cwd or _query_pid_cwd_nonproc(agent_pid)
                 hit = _find_storage_session_for_cli(
@@ -4126,9 +3975,10 @@ class SessionTracker:
             [p for p, _t, _c in bounded_rows], None
         )
 
-        codex_root = self.home / ".codex"
-        agy_root = self.home / ".gemini"
-        codex_names = _load_codex_thread_names(self.home)
+        eff_wsl = _effective_is_wsl(env=self.env)
+        codex_root = _safe_wsl_dir(self.home / ".codex", wsl=eff_wsl)
+        agy_root = _safe_wsl_dir(self.home / ".gemini", wsl=eff_wsl)
+        codex_names = _load_codex_thread_names(self.home, wsl=eff_wsl)
         by_key: dict[str, SessionMatch] = {}
 
         for pid, row_tty, cli_k in bounded_rows:
@@ -4137,44 +3987,51 @@ class SessionTracker:
             open_files = files_by_pid.get(pid, ())
 
             if cli_k == "codex":
+                if codex_root is None:
+                    continue
                 for target in open_files:
                     if (
                         not target.endswith(".jsonl")
                         or not os.path.basename(target).startswith("rollout-")
-                        or not _is_path_under_dir(target, codex_root)
-                        or not os.path.isfile(target)
+                        or not _is_path_under_dir(target, codex_root, wsl=eff_wsl)
                     ):
                         continue
-                    is_cli, sid, meta_cwd = _read_codex_root_meta(target)
+                    safe_t = _safe_realpath(target, wsl=eff_wsl)
+                    if not safe_t or not os.path.isfile(safe_t):
+                        continue
+                    is_cli, sid, meta_cwd = _read_codex_root_meta(safe_t, wsl=eff_wsl)
                     if not is_cli or not sid:
                         continue
                     cand = SessionMatch(
                         cli="codex",
                         session_id=sid,
-                        jsonl_path=os.path.realpath(target),
+                        jsonl_path=safe_t,
                         cwd=meta_cwd or proc_cwd,
                         matched_by="tty_ps",
                         pts_mtime=pts_mtime,
-                        jsonl_mtime=_safe_mtime(target),
+                        jsonl_mtime=_safe_mtime(safe_t),
                         thread_name=codex_names.get(sid, ""),
                     )
                     by_key[cand.session_key] = cand
 
             elif cli_k == "agy":
+                if agy_root is None:
+                    continue
                 for target in open_files:
                     if (
                         not target.endswith(".lock")
                         or "/presence/" not in target.replace("\\", "/")
-                        or not _is_path_under_dir(target, agy_root)
+                        or not _is_path_under_dir(target, agy_root, wsl=eff_wsl)
                     ):
                         continue
-                    cid = Path(target).stem.lower()
-                    if not cid or not os.path.isfile(target):
+                    safe_t = _safe_realpath(target, wsl=eff_wsl)
+                    cid = Path(safe_t).stem.lower() if safe_t else ""
+                    if not cid or not os.path.isfile(safe_t):
                         continue
-                    tp = _resolve_agy_transcript_path(self.home, cid)
+                    tp = _resolve_agy_transcript_path(self.home, cid, wsl=eff_wsl)
                     if tp is not None and _is_agy_transcript_subagent(tp):
                         continue
-                    tp_str, j_mtime = _agy_transcript_and_mtime(self.home, cid, target)
+                    tp_str, j_mtime = _agy_transcript_and_mtime(self.home, cid, safe_t)
                     cand = SessionMatch(
                         cli="agy",
                         session_id=cid,
@@ -4220,12 +4077,14 @@ class SessionTracker:
                 if cand.cli not in {cli_k for _pid, cli_k in tty_agents}:
                     return False
                 if cand.cli == "codex" and cand.jsonl_path:
+                    eff_wsl = _effective_is_wsl(env=self.env)
                     open_rollouts = _query_pids_codex_rollout_paths(
                         [pid for pid, cli_k in tty_agents if cli_k == "codex"],
                         self.home,
                         None,
                     )
-                    if open_rollouts and os.path.realpath(cand.jsonl_path) not in open_rollouts:
+                    safe_cand_p = _safe_realpath(cand.jsonl_path, wsl=eff_wsl)
+                    if open_rollouts and (not safe_cand_p or safe_cand_p not in open_rollouts):
                         return False
                 elif cand.cli == "agy" and cand.session_id:
                     agy_root = self.home / ".gemini"
@@ -4263,25 +4122,30 @@ class SessionTracker:
                 matching_pids.append(pid)
         if not matching_pids:
             return False
+        eff_wsl = _effective_is_wsl(env=self.env)
         if cand.cli == "codex" and cand.jsonl_path:
             open_rollouts = _query_pids_codex_rollout_paths(matching_pids, self.home, None)
-            return os.path.realpath(cand.jsonl_path) in open_rollouts
+            safe_cand_p = _safe_realpath(cand.jsonl_path, wsl=eff_wsl)
+            return bool(safe_cand_p and safe_cand_p in open_rollouts)
         if cand.cli == "agy" and cand.session_id:
-            agy_root = self.home / ".gemini"
+            agy_root = _safe_wsl_dir(self.home / ".gemini", wsl=eff_wsl)
+            if agy_root is None:
+                return False
             open_by_pid, _ = _query_pids_open_files_and_cwds(matching_pids, None)
             want_stem = cand.session_id.lower()
             return any(
                 target.endswith(".lock")
                 and "/presence/" in target.replace("\\", "/")
-                and _is_path_under_dir(target, agy_root)
+                and _is_path_under_dir(target, agy_root, wsl=eff_wsl)
                 and Path(target).stem.lower() == want_stem
                 for files in open_by_pid.values()
                 for target in files
             )
         if cand.cli == "claude" and cand.cwd:
+            eff_wsl = _effective_is_wsl(env=self.env)
             _, cwd_by_pid = _query_pids_open_files_and_cwds(matching_pids, None)
             return any(
-                pcwd and _cwd_match_rank(pcwd, cand.cwd, self.home) > 0
+                pcwd and _cwd_match_rank(pcwd, cand.cwd, self.home, wsl=eff_wsl) > 0
                 for pcwd in cwd_by_pid.values()
             )
         return True
@@ -4315,6 +4179,7 @@ class SessionTracker:
             if local_prompt_cwd is not None
             else ""
         )
+        eff_wsl = _effective_is_wsl(env=self.env)
         title_low = s_title.lower()
         return [
             c
@@ -4323,7 +4188,7 @@ class SessionTracker:
             or (
                 c.cwd
                 and (
-                    (expanded and _cwd_match_rank(expanded, c.cwd, self.home) > 0)
+                    (expanded and _cwd_match_rank(expanded, c.cwd, self.home, wsl=eff_wsl) > 0)
                     or (local_prompt_cwd != "~" and _dir_basename_in_title(s_title, c.cwd))
                 )
             )
@@ -4357,10 +4222,11 @@ class SessionTracker:
             return True
         local_prompt_cwd = extract_local_prompt_cwd(s_title, self._local_hostnames)
         if local_prompt_cwd is not None:
+            eff_wsl = _effective_is_wsl(env=self.env)
             expanded = _expand_home_prefix(local_prompt_cwd, self.home)
             for p_cwd in (active_pane.current_path, pane_hit.cwd if pane_hit else ""):
                 if p_cwd and (
-                    _cwd_match_rank(expanded, p_cwd, self.home) > 0
+                    _cwd_match_rank(expanded, p_cwd, self.home, wsl=eff_wsl) > 0
                     or (local_prompt_cwd != "~" and _dir_basename_in_title(s_title, p_cwd))
                 ):
                     return True
@@ -4666,8 +4532,13 @@ class SessionTracker:
                 return None
 
             rt_dirs = self._candidate_runtime_dirs()
+            eff_wsl = _effective_is_wsl(env=self.env)
             norm_tty = normalize_tty_path(window_tty)
-            norm_cwd = _normalize_cwd(window_cwd)
+            norm_cwd = (
+                ""
+                if is_wsl_slow_mount_path(window_cwd, wsl=eff_wsl)
+                else _normalize_cwd(window_cwd)
+            )
             hint = parse_window_title_hint(window_title)
             tmux_snap = self._probe_tmux(rt_dirs=rt_dirs)
             has_proc = self.proc_root is not None and self.proc_root.is_dir()
@@ -5257,8 +5128,9 @@ class SessionTracker:
         state.generation += 1
 
     def _consume_parsed_record(self, state: SessionState, obj: Mapping[str, Any]) -> None:
+        eff_wsl = False if state.is_remote else _effective_is_wsl(env=self.env)
         if not state.cwd and isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
-            state.cwd = _normalize_cwd(obj["cwd"])
+            state.cwd = _normalize_cwd(obj["cwd"], wsl=eff_wsl)
 
         if state.cli == "agy":
             cp_summary = _extract_agy_compaction_summary(obj)
@@ -5301,7 +5173,7 @@ class SessionTracker:
             payload = obj.get("payload")
             if typ == "session_meta" and isinstance(payload, dict) and not state.cwd:
                 if isinstance(payload.get("cwd"), str):
-                    state.cwd = _normalize_cwd(payload["cwd"])
+                    state.cwd = _normalize_cwd(payload["cwd"], wsl=eff_wsl)
             elif typ == "compacted" and isinstance(payload, dict):
                 seed_turns = _extract_codex_compacted_turns(payload)
                 state.codex_saw_item_completed = False
@@ -5344,6 +5216,8 @@ class SessionTracker:
             if upgraded != path:
                 self._reset_state(state, upgraded)
                 path = upgraded
+        if _effective_is_wsl() and not _safe_realpath(path, wsl=True):
+            return
 
         try:
             with open(path, "rb") as f:

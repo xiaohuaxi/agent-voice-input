@@ -57,11 +57,30 @@ from agent_voice_input.remote_ssh import (  # noqa: E402
     resolve_ssh_executable,
 )
 from agent_voice_input.session_ctx import (  # noqa: E402
+    SessionMatch,
+    SessionState,
     SessionTracker,
+    TitleHint,
+    _collect_claude_storage_matches,
+    _collect_codex_storage_matches,
+    _cwd_match_rank,
+    _disambiguate_candidates,
+    _find_storage_session_for_cli,
+    _is_broad_or_unsafe_workspace_dir,
+    _lookup_by_short_prefix,
+    _match_cli_process,
+    _normalize_cwd,
+    _query_pid_codex_rollout_paths,
+    _read_trusted_registry_json,
+    _resolve_safe_local_dir,
+    _scan_nonproc_fallback_sessions,
+    _upgrade_agy_transcript_path,
     chunk_turns_for_refiner,
     encode_claude_project_dir,
+    is_agy_root_session_valid,
     parse_window_title_hint,
     resolve_ide_workspace_cwd,
+    scan_proc_root_sessions,
     trim_turns_chunk_aligned,
     write_session_registry_entry,
 )
@@ -1689,6 +1708,767 @@ sys.exit(p.returncode)
             assert res_once.session is not None
             self.assertEqual(res_once.session.session_key, f"remote:devbox:claude:{sid_b}")
             _ = jf_b
+
+    def test_unified_five_semantic_forks_and_wsl_slow_mount_guard(self) -> None:
+        # 1. Fork #1: open-source `gemini` / `@google/gemini-cli` is NOT misclassified as `agy`,
+        # while `session-hook --cli gemini` hook mode compatibility remains intact.
+        self.assertIs(_match_cli_process, _remote_probe._match_cli_process)
+        self.assertEqual(_match_cli_process("gemini", ["gemini"])[0], None)
+        self.assertEqual(_match_cli_process("gemini-cli", ["gemini-cli"])[0], None)
+        self.assertEqual(
+            _match_cli_process(
+                "node",
+                ["node", "/usr/local/lib/node_modules/@google/gemini-cli/dist/index.js"],
+            )[0],
+            None,
+        )
+        self.assertEqual(_match_cli_process("agy", ["agy"])[0], "agy")
+        self.assertEqual(_match_cli_process("antigravity", ["antigravity"])[0], "agy")
+        self.assertIsNone(parse_window_title_hint("[gemini:01234567]"))
+        self.assertEqual(
+            _remote_probe._parse_title_hint("[gemini:01234567]"),
+            ("", False, None, False),
+        )
+        h_hash = parse_window_title_hint("Gemini [#abcdef12]")
+        assert h_hash is not None
+        self.assertIsNone(h_hash.cli)
+        self.assertEqual(
+            _remote_probe._parse_title_hint("Gemini [#abcdef12]"),
+            ("abcdef12", False, None, False),
+        )
+        buf_hook = io.StringIO()
+        with mock.patch("sys.stdout", buf_hook):
+            rc_hook = VST.run_session_hook("gemini", stdin_text="{}", env={"HOME": "/nonexistent"})
+        self.assertEqual(rc_hook, 0)
+        self.assertEqual(buf_hook.getvalue(), "{}\n")
+
+        # 2. Fork #2: `_normalize_cwd` strips `file://` URIs AND blocks raw or percent-encoded NUL bytes.
+        self.assertIs(_normalize_cwd, _remote_probe._normalize_cwd)
+        self.assertEqual(
+            _normalize_cwd("file://macbook.local/Users/xhx/my%20repo/"),
+            "/Users/xhx/my repo",
+        )
+        self.assertEqual(_normalize_cwd("file:///tmp/work/"), "/tmp/work")
+        self.assertEqual(_normalize_cwd("/tmp/bad\x00path"), "")
+        self.assertEqual(_normalize_cwd("file:///tmp/bad%00path"), "")
+        self.assertEqual(_normalize_cwd("file://[broken/path"), "")
+        self.assertEqual(
+            _remote_probe.run_probe({"v": 1, "cwd_hint": "file://[broken/path"}, env={"HOME": "/tmp"})["ok"],
+            False,
+        )
+
+        # Exact max_bytes + 1 newline boundary parity in _read_bounded_line
+        buf_exact = io.BytesIO(b"a" * 16 + b"\nnext_line\n")
+        raw_16, exc_16 = _remote_probe._read_bounded_line(buf_exact, max_bytes=16)
+        self.assertTrue(exc_16)
+        self.assertEqual(raw_16, b"a" * 16)
+        self.assertEqual(_remote_probe._read_bounded_line(buf_exact, max_bytes=16), (b"next_line\n", False))
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            real_home = root / "real_home"
+            real_home.mkdir()
+            link_home = root / "link_home"
+            os.symlink(real_home, link_home)
+            real_proj = real_home / "repos" / "alpha"
+            (real_proj / "sub").mkdir(parents=True)
+            link_to_home = root / "alias_to_home"
+            os.symlink(real_home, link_to_home)
+            win_link = real_home / "repos" / "win_mount_link"
+            os.symlink("/mnt/d/sleeping_hdd/proj", win_link)
+
+            # 3. Fork #3: `_is_broad_or_unsafe_workspace_dir` handles symlinked $HOME, relative '.', and WSL zero-lstat.
+            self.assertIs(
+                _is_broad_or_unsafe_workspace_dir,
+                _remote_probe._is_broad_or_unsafe_workspace_dir,
+            )
+            for bad_dir in (
+                "",
+                ".",
+                "relative/sub",
+                "/",
+                "/tmp",
+                "/etc",
+                "/opt",
+                "/mnt",
+                "/home/alice",
+                "/Users/alice",
+                str(real_home),
+                str(link_home),
+                str(link_to_home),
+            ):
+                self.assertTrue(
+                    _is_broad_or_unsafe_workspace_dir(bad_dir, link_home),
+                    f"Expected {bad_dir!r} to be rejected as broad/unsafe",
+                )
+            self.assertFalse(_is_broad_or_unsafe_workspace_dir(str(real_proj), link_home))
+
+            orig_stat = os.stat
+            orig_lstat = os.lstat
+            orig_realpath = os.path.realpath
+
+            def _forbid_mnt_stat(p: object, *a: object, **kw: object):
+                if isinstance(p, (str, bytes, os.PathLike)):
+                    s = os.fsdecode(p)
+                    if s == "/mnt" or s.startswith("/mnt/"):
+                        raise AssertionError(f"Forbidden stat on WSL /mnt path: {s}")
+                    if kw.get("follow_symlinks", True):
+                        try:
+                            lst = orig_lstat(s)
+                            if stat.S_ISLNK(lst.st_mode):
+                                target = os.readlink(s)
+                                if target == "/mnt" or target.startswith("/mnt/"):
+                                    raise AssertionError(
+                                        f"Forbidden stat following symlink {s} -> {target}"
+                                    )
+                        except OSError:
+                            pass
+                return orig_stat(p, *a, **kw)  # type: ignore[arg-type]
+
+            def _forbid_mnt_lstat(p: object, *a: object, **kw: object):
+                s = os.fsdecode(p)  # type: ignore[arg-type]
+                if s == "/mnt" or s.startswith("/mnt/"):
+                    raise AssertionError(f"Forbidden lstat on WSL /mnt path: {s}")
+                return orig_lstat(p, *a, **kw)  # type: ignore[arg-type]
+
+            def _forbid_mnt_realpath(p: object, *a: object, **kw: object):
+                s = os.fsdecode(p)  # type: ignore[arg-type]
+                if s == "/mnt" or s.startswith("/mnt/"):
+                    raise AssertionError(f"Forbidden realpath on WSL /mnt path: {s}")
+                return orig_realpath(p, *a, **kw)  # type: ignore[arg-type]
+
+            with mock.patch("os.stat", side_effect=_forbid_mnt_stat), mock.patch(
+                "os.lstat", side_effect=_forbid_mnt_lstat
+            ), mock.patch(
+                "os.path.realpath", side_effect=_forbid_mnt_realpath
+            ), mock.patch("agent_voice_input.session_ctx._HOST_IS_WSL", True):
+                self.assertTrue(
+                    _is_broad_or_unsafe_workspace_dir("/mnt/d/sleeping_hdd/proj", link_home, wsl=True)
+                )
+                self.assertTrue(
+                    _is_broad_or_unsafe_workspace_dir(str(win_link), link_home, wsl=True)
+                )
+                self.assertFalse(
+                    _is_broad_or_unsafe_workspace_dir(str(real_proj), link_home, wsl=True)
+                )
+                # `missing/../win_link` must NOT collapse onto unchecked `win_link` -> `/mnt/d/...`
+                tricky_rel_link = f"{real_home}/repos/missing_dir/../win_mount_link"
+                self.assertEqual(_resolve_safe_local_dir(tricky_rel_link, wsl=True), "")
+                # `file://server/share/repo` UNC must be rejected in WSL `_cwd_variants` / `_disambiguate_candidates`
+                self.assertEqual(_remote_probe._cwd_variants("file://server/share/repo", wsl=True), set())
+                c1 = SessionMatch(cli="claude", session_id="s1", jsonl_path="/tmp/a.jsonl", cwd="/share/repo", pts_mtime=10.0)
+                c2 = SessionMatch(cli="claude", session_id="s2", jsonl_path="/tmp/b.jsonl", cwd=str(real_proj), pts_mtime=20.0)
+                picked_unc = _disambiguate_candidates([c1, c2], "claude", "file://server/share/repo", link_home)
+                assert picked_unc is not None
+                self.assertEqual(picked_unc.session_id, "s2")
+                # Local candidate disambiguation and proc scan on `/mnt/d/...` must never invoke raw `realpath` on `/mnt/`
+                c_mnt = SessionMatch(cli="codex", session_id="s3", jsonl_path="/tmp/c.jsonl", cwd="/mnt/d/demo", pts_mtime=5.0)
+                picked_mnt = _disambiguate_candidates([c_mnt, c2], "claude", "/mnt/d/demo", link_home)
+                assert picked_mnt is not None
+                self.assertEqual(encode_claude_project_dir("/mnt/d/demo", wsl=True), [])
+                # Create `real_home/.codex/sessions` BEFORE `_query_pid_codex_rollout_paths` so fd scan runs!
+                (real_home / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
+                fake_proc = root / "wsl_proc"
+                _write_fake_proc(
+                    fake_proc,
+                    777,
+                    comm="codex",
+                    cwd=str(real_proj),
+                    cmdline=["codex"],
+                    fds={"4": "/mnt/d/rollout-test.jsonl"},
+                )
+                # Local HOME + slow-mount `/mnt/d/rollout-test.jsonl` open fd: zero `/mnt/` realpath or stat!
+                self.assertEqual(_query_pid_codex_rollout_paths(777, real_home, fake_proc), [])
+                self.assertEqual(scan_proc_root_sessions(real_home, fake_proc), [])
+
+                # Slow-mount HOME (direct `/mnt/c/...` AND symlink `/tmp/.../wsl_home_link -> /mnt/c/...`) + local cwd:
+                wsl_home_link = root / "wsl_home_link"
+                os.symlink("/mnt/c/Users/demo", wsl_home_link)
+                for slow_h in (Path("/mnt/c/Users/demo"), wsl_home_link):
+                    self.assertEqual(scan_proc_root_sessions(slow_h, fake_proc), [])
+                    self.assertEqual(
+                        _lookup_by_short_prefix(
+                            TitleHint("abcd1234", False, "agy", True),
+                            slow_h,
+                            fake_proc,
+                            [],
+                        ),
+                        None,
+                    )
+                    self.assertEqual(
+                        _scan_nonproc_fallback_sessions(slow_h, [], check_pid_alive=False),
+                        [],
+                    )
+                    self.assertEqual(
+                        _find_storage_session_for_cli(
+                            "agy",
+                            home=slow_h,
+                            proc_root=fake_proc,
+                            eff_cwd=str(real_proj),
+                            window_title="agy",
+                        ),
+                        None,
+                    )
+                    self.assertEqual(
+                        _collect_codex_storage_matches(
+                            slow_h, matched_by="test", eff_cwd=str(real_proj)
+                        ),
+                        [],
+                    )
+                    self.assertEqual(
+                        _collect_claude_storage_matches(
+                            slow_h, matched_by="test", eff_cwd=str(real_proj), filter_cwd=True
+                        ),
+                        [],
+                    )
+
+                # Symlinked subdir/file inside local HOME pointing to `/mnt/d/...` must NEVER trigger `/mnt/` I/O
+                os.symlink("/mnt/d/sessions_2027", real_home / ".codex" / "sessions" / "2027")
+                os.symlink("/mnt/d/idx.jsonl", real_home / ".codex" / "session_index.jsonl")
+                self.assertEqual(_remote_probe._load_codex_thread_names(real_home, wsl=True), {})
+                claude_proj_dir = real_home / ".claude" / "projects" / "-share-repo"
+                claude_proj_dir.mkdir(parents=True, exist_ok=True)
+                os.symlink("/mnt/d/bad.jsonl", claude_proj_dir / "bad-session.jsonl")
+                self.assertEqual(
+                    _collect_claude_storage_matches(
+                        real_home, matched_by="test", eff_cwd="/share/repo", filter_cwd=True
+                    ),
+                    [],
+                )
+
+                # Agy symlinked presence `<cid>.lock -> /mnt/d/...` and symlinked `transcript_full.jsonl -> /mnt/d/...`
+                agy_cid = "deadbeef-1111-4222-8333-444455556666"
+                agy_pres_dir = real_home / ".gemini" / "antigravity-cli" / "presence"
+                agy_pres_dir.mkdir(parents=True, exist_ok=True)
+                os.symlink("/mnt/d/bad-agy.lock", agy_pres_dir / f"{agy_cid}.lock")
+                self.assertFalse(is_agy_root_session_valid(agy_cid, real_home, None))
+
+                agy_cid2 = "feedface-1111-4222-8333-444455556666"
+                agy_logs2 = (
+                    real_home
+                    / ".gemini"
+                    / "antigravity-cli"
+                    / "brain"
+                    / agy_cid2
+                    / ".system_generated"
+                    / "logs"
+                )
+                agy_logs2.mkdir(parents=True, exist_ok=True)
+                comp_tp2 = agy_logs2 / "transcript.jsonl"
+                comp_tp2.write_text(
+                    json.dumps(
+                        {
+                            "source": "USER_EXPLICIT",
+                            "type": "USER_INPUT",
+                            "content": "<USER_REQUEST>hello local transcript</USER_REQUEST>",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.symlink("/mnt/d/slow_full.jsonl", agy_logs2 / "transcript_full.jsonl")
+                self.assertEqual(
+                    _remote_probe._resolve_agy_transcript_path(real_home, agy_cid2, wsl=True),
+                    comp_tp2,
+                )
+                self.assertEqual(_upgrade_agy_transcript_path(str(comp_tp2)), str(comp_tp2))
+                tracker_agy = SessionTracker(home_dir=real_home)
+                snap_agy = tracker_agy.sync_session(
+                    SessionMatch(
+                        cli="agy",
+                        session_id=agy_cid2,
+                        jsonl_path=str(comp_tp2),
+                        cwd=str(real_proj),
+                    )
+                )
+                self.assertEqual(tracker_agy._states[f"agy:{agy_cid2}"].jsonl_path, str(comp_tp2))
+                self.assertEqual(len(snap_agy.clean_turns), 1)
+
+                # Hidden subdir `.backup` under `.codex/sessions` must stay skipped in WSL just like `glob("*/*/*/...")`
+                bak_sid = "01967777-8888-7777-8666-555544443333"
+                bak_dir = real_home / ".codex" / "sessions" / ".backup" / "11" / "19"
+                bak_dir.mkdir(parents=True, exist_ok=True)
+                (bak_dir / f"rollout-2026-11-19-{bak_sid}.jsonl").write_text(
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {"id": bak_sid, "source": "cli", "cwd": str(real_proj)},
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    _collect_codex_storage_matches(
+                        real_home, matched_by="test", eff_cwd=str(real_proj)
+                    ),
+                    [],
+                )
+
+                # Candidate Codex `session_meta` carrying UNC `file://server/share/repo` must NEVER match or strip to `/share/repo` on WSL
+                unc_sid = "01969999-8888-7777-8666-555544443333"
+                unc_dir = real_home / ".codex" / "sessions" / "2026" / "11" / "19"
+                unc_dir.mkdir(parents=True, exist_ok=True)
+                unc_file = unc_dir / f"rollout-2026-11-19-{unc_sid}.jsonl"
+                unc_file.write_text(
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": unc_sid,
+                                "source": "cli",
+                                "cwd": "file://server/share/repo",
+                            },
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    _collect_codex_storage_matches(
+                        real_home, matched_by="test", eff_cwd="/share/repo"
+                    ),
+                    [],
+                )
+                fake_proc_unc = root / "wsl_proc_unc"
+                _write_fake_proc(
+                    fake_proc_unc,
+                    778,
+                    comm="codex",
+                    cwd="",
+                    cmdline=["codex"],
+                    fds={"4": str(unc_file)},
+                )
+                unc_pid_hit = _find_storage_session_for_cli(
+                    "codex",
+                    home=real_home,
+                    proc_root=fake_proc_unc,
+                    eff_cwd="",
+                    window_title="codex",
+                    agent_pid=778,
+                )
+                assert unc_pid_hit is not None
+                self.assertEqual(unc_pid_hit.cwd, "")
+
+                tracker_wsl = SessionTracker(home_dir=real_home)
+                st_wsl = SessionState(
+                    session_key=f"codex:{unc_sid}",
+                    cli="codex",
+                    session_id=unc_sid,
+                    jsonl_path=str(unc_file),
+                )
+                tracker_wsl._consume_parsed_record(
+                    st_wsl,
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": unc_sid, "cwd": "file://server/share/repo"},
+                    },
+                )
+                self.assertEqual(st_wsl.cwd, "")
+
+            # 4. Fork #4: `_cwd_match_rank` rejects broad system dirs (`/opt`, `/etc`, symlinked `$HOME`).
+            self.assertIs(_cwd_match_rank, _remote_probe._cwd_match_rank)
+            self.assertEqual(_cwd_match_rank(str(real_proj), str(real_proj), link_home), 2)
+            self.assertEqual(
+                _cwd_match_rank(str(real_proj / "sub"), str(real_proj), link_home), 1
+            )
+            self.assertEqual(_cwd_match_rank("/opt/service-a", "/opt", link_home), 0)
+            self.assertEqual(_cwd_match_rank("/etc/nginx", "/etc", link_home), 0)
+            self.assertEqual(_cwd_match_rank(str(real_proj), str(real_home), link_home), 0)
+
+            # 5. Fork #5: `_read_trusted_registry_json` enforces parent `0700`/non-symlink + loop read on short reads.
+            self.assertIs(_read_trusted_registry_json, _remote_probe._read_trusted_registry_json)
+            rt_dir = root / "rt"
+            s_dir = rt_dir / "sessions"
+            s_dir.mkdir(parents=True)
+            os.chmod(rt_dir, 0o700)
+            os.chmod(s_dir, 0o700)
+            reg_path = s_dir / "claude-12345678.json"
+            payload_obj = {
+                "cli": "claude",
+                "session_id": "12345678-1111-4222-8333-444455556666",
+                "cwd": str(real_proj),
+                "pad": "x" * 256,
+            }
+            reg_bytes = json.dumps(payload_obj).encode("utf-8")
+            fd_w = os.open(str(reg_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd_w, reg_bytes)
+            finally:
+                os.close(fd_w)
+
+            orig_os_read = os.read
+
+            def _short_chunk_read(fd: int, n: int) -> bytes:
+                return orig_os_read(fd, min(n, 7))
+
+            with mock.patch("os.read", side_effect=_short_chunk_read):
+                self.assertEqual(_read_trusted_registry_json(reg_path), payload_obj)
+
+            # Loosening parent runtime dir to 0755 or 0500 must immediately reject direct reads
+            os.chmod(rt_dir, 0o755)
+            self.assertIsNone(_read_trusted_registry_json(reg_path))
+            os.chmod(rt_dir, 0o500)
+            try:
+                self.assertIsNone(_read_trusted_registry_json(reg_path))
+            finally:
+                os.chmod(rt_dir, 0o700)
+            self.assertEqual(_read_trusted_registry_json(reg_path), payload_obj)
+
+    def test_local_session_tracker_and_subprocess_remote_probe_differential_parity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            proc_root = root / "proc"
+            rt_dir = root / "rt"
+            real_ws = root / "real_workspaces" / "voice-engine"
+            link_ws = home / "repos" / "voice-engine"
+            for d in (home, proc_root, rt_dir, real_ws, link_ws.parent):
+                d.mkdir(parents=True, exist_ok=True)
+            os.chmod(rt_dir, 0o700)
+            os.symlink(real_ws, link_ws)
+
+            # 1. Complex Claude Code transcript: pre-compaction, compact_boundary + summary,
+            # sidechain/subagent noise, <system-reminder> vs backticked `<system-reminder>`,
+            # >2KB progress line, multi-chunk eviction, and incomplete trailing half-line.
+            cl_sid = "11112222-3333-4444-8555-666677778888"
+            cl_dir = home / ".claude" / "projects" / encode_claude_project_dir(str(link_ws))[0]
+            cl_dir.mkdir(parents=True, exist_ok=True)
+            cl_file = cl_dir / f"{cl_sid}.jsonl"
+            cl_records = [
+                {
+                    "type": "user",
+                    "sessionId": cl_sid,
+                    "cwd": link_ws.as_uri(),
+                    "isSidechain": False,
+                    "message": {"role": "user", "content": "obsolete pre-compaction turn"},
+                },
+                {"type": "system", "subtype": "compact_boundary"},
+                {
+                    "type": "user",
+                    "isCompactSummary": True,
+                    "message": {
+                        "role": "user",
+                        "content": "Compacted Claude context summary\n<system-reminder>strip me</system-reminder>",
+                    },
+                },
+                {
+                    "type": "progress",
+                    "data": "P" * 2400,
+                },
+                {
+                    "type": "user",
+                    "isSidechain": True,
+                    "message": {"role": "user", "content": "SUBAGENT_SIDECHAIN_LEAK"},
+                },
+                {
+                    "type": "assistant",
+                    "agentId": "sub-99",
+                    "message": {"role": "assistant", "content": "AGENT_ID_LEAK"},
+                },
+                {
+                    "type": "user",
+                    "isSidechain": False,
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Keep literal `<system-reminder>` tag in code span "
+                                    "<system-reminder>HIDDEN_REMINDER</system-reminder> "
+                                    "<task-notification>HIDDEN_TASK</task-notification> "
+                                    + ("alpha " * 320)
+                                ),
+                            },
+                            {"type": "tool_result", "content": "TOOL_RESULT_NOISE"},
+                        ],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "isSidechain": False,
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "SECRET_THINKING_CHAIN"},
+                            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+                            {"type": "text", "text": "Refactored _remote_probe " + ("beta " * 380)},
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "isSidechain": False,
+                    "message": {"role": "user", "content": "Final turn after chunk boundary " + ("gamma " * 320)},
+                },
+                {
+                    "type": "assistant",
+                    "isSidechain": False,
+                    "message": {"role": "assistant", "content": "All 5 forks unified cleanly."},
+                },
+            ]
+            cl_bytes = b"".join((json.dumps(r) + "\n").encode("utf-8") for r in cl_records)
+            cl_bytes += b'{"type": "assistant", "message": {"role": "assistant", "content": "UNFINISHED_HALF_LINE'
+            cl_file.write_bytes(cl_bytes)
+
+            # 2. Complex Codex rollout: session_meta, response_item boilerplate stripping,
+            # compacted (out-of-order retained_context + replacement_history + summary),
+            # item_completed dedup transition, >2KB function_call_output noise, multi-chunk eviction.
+            cx_sid = "0196abcd-ef01-7234-8567-89abcdef0123"
+            cx_dir = home / ".codex" / "sessions" / "2026" / "11" / "19"
+            cx_dir.mkdir(parents=True, exist_ok=True)
+            cx_file = cx_dir / f"rollout-2026-11-19-{cx_sid}.jsonl"
+            cx_records = [
+                {
+                    "type": "session_meta",
+                    "payload": {"id": cx_sid, "source": "cli", "cwd": str(link_ws)},
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "# AGENTS.md instructions for repo\n..."}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "<environment_context>cwd</environment_context>\n"
+                                    "<permissions instructions>perm</permissions instructions>\n"
+                                    "<recommended_plugins>plug</recommended_plugins>\n"
+                                    "early turn before compaction"
+                                ),
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "compacted",
+                    "payload": {
+                        "message": "Codex compaction checkpoint summary",
+                        "retained_context": {
+                            "assistant_messages": [{"order": 2, "text": "retained assistant #2 " + ("delta " * 320)}],
+                            "user_messages": [{"order": 1, "text": "retained user #1 " + ("epsilon " * 320)}],
+                        },
+                        "replacement_history": [
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "retained user #1 " + ("epsilon " * 320)}],
+                            },
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "post-compact user prompt " + ("zeta " * 340)}],
+                            },
+                        ],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "output": "X" * 2600,
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {
+                            "type": "UserMessage",
+                            "content": [{"type": "text", "text": "post-compact user prompt " + ("zeta " * 340)}],
+                        },
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "item": {
+                            "type": "AgentMessage",
+                            "content": [{"type": "text", "text": "Codex final answer on SessionTracker parity."}],
+                        },
+                    },
+                },
+            ]
+            cx_file.write_bytes(
+                b"".join((json.dumps(r) + "\n").encode("utf-8") for r in cx_records)
+            )
+
+            # 3. Complex Antigravity (agy) transcript: USER_INPUT + metadata tail, VIEW_FILE >2KB noise,
+            # CHECKPOINT compaction with preamble/tail stripping, and multi-chunk eviction.
+            agy_cid = "fedcba98-7654-4321-89ab-cdef01234567"
+            agy_pres = home / ".gemini" / "antigravity-cli" / "presence"
+            agy_logs = home / ".gemini" / "antigravity-cli" / "brain" / agy_cid / ".system_generated" / "logs"
+            agy_pres.mkdir(parents=True, exist_ok=True)
+            agy_logs.mkdir(parents=True, exist_ok=True)
+            agy_lock = agy_pres / f"{agy_cid}.lock"
+            agy_lock.write_text("", encoding="utf-8")
+            agy_file = agy_logs / "transcript_full.jsonl"
+            agy_records = [
+                {
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_PROMPT",
+                    "content": f"Active Workspaces:\n- {link_ws}\nCommand Working Directory: {link_ws}\n",
+                },
+                {
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "content": "<USER_REQUEST>old agy request</USER_REQUEST>\n<ADDITIONAL_METADATA>meta</ADDITIONAL_METADATA>",
+                },
+                {
+                    "source": "SYSTEM",
+                    "type": "CHECKPOINT",
+                    "content": (
+                        "# Resuming from a compaction\nHere is the progress summary below:\n"
+                        "Summary of Step 1 and Step 2 governance work " + ("eta " * 480)
+                        + "\n# Subagents\nsubagent log tail\n# Conversation Logs\nraw path"
+                    ),
+                },
+                {
+                    "source": "MODEL",
+                    "type": "VIEW_FILE",
+                    "content": "V" * 2500,
+                },
+                {
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "content": (
+                        "<USER_REQUEST>Verify differential parity "
+                        + ("theta " * 460)
+                        + "</USER_REQUEST>\n<SKILL>voice-eval</SKILL>"
+                    ),
+                },
+                {
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "content": "Both local SessionTracker and subprocess _remote_probe match byte-for-byte.",
+                    "thinking": "INTERNAL_THINKING_IGNORED",
+                },
+            ]
+            agy_file.write_bytes(
+                b"".join((json.dumps(r) + "\n").encode("utf-8") for r in agy_records)
+            )
+            _write_fake_proc(
+                proc_root,
+                910,
+                comm="agy",
+                cwd=str(link_ws),
+                cmdline=["agy"],
+                fds={"8": str(agy_lock)},
+            )
+
+            probe_env = {
+                **os.environ,
+                "HOME": str(home),
+                "AVI_REMOTE_PROC_ROOT": str(proc_root),
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt_dir),
+                "AVI_DISABLE_TMUX_PROBE": "1",
+            }
+            max_chars = 4096
+            chunk_chars = 1024
+
+            local_tracker = SessionTracker(
+                home_dir=home,
+                proc_root=proc_root,
+                runtime_dir=rt_dir,
+                env=probe_env,
+            )
+            remote_tracker = SessionTracker(
+                home_dir=root / "client_home",
+                proc_root=root / "empty_proc",
+                runtime_dir=root / "client_rt",
+                env={"HOME": str(root / "client_home")},
+            )
+            host_cfg = RemoteHostConfig(name="paritybox", ssh_target="paritybox")
+            try:
+                cases = [
+                    ("claude", cl_sid, cl_file, f"[claude:{cl_sid[:8]}]"),
+                    ("codex", cx_sid, cx_file, f"[codex:{cx_sid[:8]}]"),
+                    ("agy", agy_cid, agy_file, f"[agy:{agy_cid[:8]}]"),
+                ]
+                for cli_name, sid, jf_path, title_tag in cases:
+                    _ = jf_path
+                    local_match = local_tracker.resolve_session(window_title=title_tag)
+                    assert local_match is not None, f"local resolve_session failed for {cli_name}"
+                    local_snap = local_tracker.sync_session(local_match)
+                    assert local_snap is not None, f"local sync failed for {cli_name}"
+                    local_chunks, _ = local_tracker.get_refiner_context(
+                        local_snap.session_key,
+                        max_chars=max_chars,
+                        chunk_chars=chunk_chars,
+                        include_git_status=False,
+                    )
+                    self.assertGreaterEqual(
+                        len(local_chunks),
+                        2,
+                        f"Expected multi-chunk context for {cli_name}",
+                    )
+
+                    proc = subprocess.run(
+                        [sys.executable, "-"],
+                        input=build_probe_stdin_payload(
+                            {
+                                "v": 1,
+                                "title": title_tag,
+                                "max_chars": max_chars,
+                                "chunk_chars": chunk_chars,
+                                "include_git": False,
+                            }
+                        ),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=probe_env,
+                        timeout=5.0,
+                        check=True,
+                    )
+                    probe_resp = decode_probe_stdout(proc.stdout)
+                    self.assertTrue(probe_resp["ok"], f"probe failed for {cli_name}: {probe_resp}")
+                    self.assertEqual(probe_resp["cli"], cli_name)
+                    self.assertEqual(probe_resp["session_id"], sid)
+
+                    probe_turns = [(r, t) for r, t in probe_resp["turns"]]
+                    expected_trimmed, exp_evicted = trim_turns_chunk_aligned(
+                        local_snap.clean_turns,
+                        max_chars=max_chars,
+                        chunk_chars=chunk_chars,
+                    )
+                    self.assertGreater(
+                        exp_evicted,
+                        0,
+                        f"Expected forward-anchored chunk eviction to trigger for {cli_name}",
+                    )
+                    self.assertEqual(probe_turns, expected_trimmed)
+                    self.assertEqual(probe_resp["evicted_chunks"], exp_evicted)
+                    self.assertEqual(
+                        chunk_turns_for_refiner(
+                            probe_turns, max_chars=max_chars, chunk_chars=chunk_chars
+                        ),
+                        local_chunks,
+                    )
+
+                    remote_state = remote_tracker._apply_remote_probe_response(host_cfg, probe_resp)
+                    assert remote_state is not None
+                    remote_chunks, _ = remote_tracker.get_refiner_context(
+                        remote_state.session_key,
+                        max_chars=max_chars,
+                        chunk_chars=chunk_chars,
+                        include_git_status=False,
+                    )
+                    self.assertEqual(remote_chunks, local_chunks)
+                    self.assertEqual(remote_state.cwd, local_snap.match.cwd)
+            finally:
+                local_tracker.close()
+                remote_tracker.close()
 
 
 if __name__ == "__main__":
