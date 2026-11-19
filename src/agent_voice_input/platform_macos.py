@@ -28,6 +28,7 @@ from .platform_wsl import (
     _callable_accepts_kwarg,
     invoke_recorder_lost_callback,
     invoke_recorder_recovered_callback,
+    make_once_commit_guard,
     stream_key_test_proc,
 )
 from .session_ctx import (
@@ -1822,6 +1823,7 @@ class MacOSPlatform(JsonlShimMixin):
         fg: ForegroundWindow,
         allow_pid_single_tty: bool = False,
         origin_window: ForegroundWindow | None = None,
+        before_commit: Callable[[], bool] | None = None,
     ) -> str:
         orig_pane = (origin_window.tmux_pane or "").strip() if origin_window is not None else ""
         orig_sock = (origin_window.tmux_socket or "").strip() if origin_window is not None else ""
@@ -1841,6 +1843,8 @@ class MacOSPlatform(JsonlShimMixin):
                 orig_sock and sock_path and not _same_tmux_server(orig_sock, sock_path)
             ):
                 return "focus_changed"
+        if before_commit is not None and not before_commit():
+            return "cancelled"
         cmd_prefix = [tmux_bin]
         if sock_path:
             cmd_prefix.extend(["-S", preferred_tmux_socket_arg(sock_path)])
@@ -1978,23 +1982,24 @@ class MacOSPlatform(JsonlShimMixin):
         suppress_beep: bool | Callable[[], bool] = False,
         is_cancelled: Callable[[], bool] | None = None,
         before_clipboard_write: Callable[[], None] | None = None,
+        before_commit: Callable[[], bool] | None = None,
     ) -> PasteOutcome:
         del target_hwnd, preserve_clipboard
         cancelled_fn = lambda: bool(is_cancelled is not None and is_cancelled())
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", "")
+        _confirm_commit = make_once_commit_guard(cancelled_fn, before_commit)
 
         def _is_beep_suppressed() -> bool:
             return bool(suppress_beep() if callable(suppress_beep) else suppress_beep)
 
-        def _write_clip(payload_txt: str, *, skip_settle: bool = False) -> bool:
+        def _fallback_to_clipboard(reason_if_ok: str, fg_proc: str, *, skip_settle: bool = False) -> PasteOutcome:
             if before_clipboard_write is not None and not skip_settle:
                 before_clipboard_write()
-            return self._copy_to_clipboard(payload_txt)
-
-        def _fallback_to_clipboard(reason_if_ok: str, fg_proc: str, *, skip_settle: bool = False) -> PasteOutcome:
+            if not _confirm_commit():
+                return PasteOutcome(False, False, "cancelled", fg_proc)
             fb_txt = fallback_clipboard_text if fallback_clipboard_text is not None else text
-            clip_ok = _write_clip(fb_txt, skip_settle=skip_settle)
+            clip_ok = self._copy_to_clipboard(fb_txt)
             if clip_ok and not _is_beep_suppressed():
                 self.beep("focus")
             return PasteOutcome(
@@ -2009,6 +2014,8 @@ class MacOSPlatform(JsonlShimMixin):
             return PasteOutcome(True, False, reason_ok, fg_proc, used_clipboard_paste=False)
 
         if origin_window is not None and origin_window.surface_id:
+            if not _confirm_commit():
+                return PasteOutcome(False, False, "cancelled", "Ghostty")
             return self._deliver_to_ghostty_surface(
                 text,
                 origin_window.surface_id,
@@ -2025,6 +2032,8 @@ class MacOSPlatform(JsonlShimMixin):
         )
         fg = self._query_paste_foreground_window()
         if origin_window is None and fg.surface_id and is_ghostty_app(fg.process, fg.bundle_id):
+            if not _confirm_commit():
+                return PasteOutcome(False, False, "cancelled", "Ghostty")
             return self._deliver_to_ghostty_surface(
                 text,
                 fg.surface_id,
@@ -2055,6 +2064,8 @@ class MacOSPlatform(JsonlShimMixin):
                     return _fallback_to_clipboard("focus_changed", fg.process)
                 eff_sock = cur_sock or origin_window.tmux_socket
                 target_p = origin_window.tmux_pane
+            if not _confirm_commit():
+                return PasteOutcome(False, False, "cancelled", fg.process)
             cmd_prefix = [tmux_exe]
             if eff_sock:
                 cmd_prefix.extend(["-S", preferred_tmux_socket_arg(eff_sock)])
@@ -2076,7 +2087,10 @@ class MacOSPlatform(JsonlShimMixin):
                 fg=fg,
                 allow_pid_single_tty=not bool(eff_tty),
                 origin_window=origin_window,
+                before_commit=_confirm_commit,
             )
+            if tmux_out == "cancelled":
+                return PasteOutcome(False, False, "cancelled", fg.process)
             if tmux_out == "tmux":
                 return _direct_success("tmux", fg.process)
             if tmux_out in ("focus_changed", "tmux_paste_failed"):
@@ -2111,6 +2125,8 @@ class MacOSPlatform(JsonlShimMixin):
                 waited_for_key = True
                 _sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
 
+        if waited_for_key:
+            self._flush_shim_events()
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", fg.process)
         if waited_for_settle or waited_for_key:
@@ -2122,6 +2138,8 @@ class MacOSPlatform(JsonlShimMixin):
             ):
                 return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
 
+        if not _confirm_commit():
+            return PasteOutcome(False, False, "cancelled", fg.process)
         clip_ok = self._copy_to_clipboard(text)
         if not clip_ok:
             return PasteOutcome(False, False, "clipboard_failed", fg.process)

@@ -3034,7 +3034,9 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 r_short_start = daemon_short.handle_trigger("toggle", ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty"))
                 self.assertTrue(r_short_start["ok"])
                 deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline and daemon_short.state != "idle":
+                while time.monotonic() < deadline and (
+                    daemon_short.state != "idle" or ("mic_disconnected", 2200) not in hud_short or not beep_short
+                ):
                     time.sleep(0.02)
                 self.assertEqual(daemon_short.state, "idle")
                 self.assertIsNone(daemon_short._max_dur_timer)
@@ -3905,10 +3907,15 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
 
         order_lock = threading.Lock()
         events: list[str] = []
-        inflight = [0]
-        max_inflight = [0]
+        asr_inflight = [0]
+        max_asr_inflight = [0]
+        refine_inflight = [0]
+        max_refine_inflight = [0]
+        total_inflight = [0]
+        max_total_inflight = [0]
         seg1_asr_entered = threading.Event()
         seg1_asr_release = threading.Event()
+        seg2_refine_done = threading.Event()
         seg4_refine_entered = threading.Event()
         seg4_refine_release = threading.Event()
 
@@ -3922,8 +3929,10 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 with order_lock:
                     self._idx += 1
                     idx = self._idx
-                    inflight[0] += 1
-                    max_inflight[0] = max(max_inflight[0], inflight[0])
+                    asr_inflight[0] += 1
+                    total_inflight[0] += 1
+                    max_asr_inflight[0] = max(max_asr_inflight[0], asr_inflight[0])
+                    max_total_inflight[0] = max(max_total_inflight[0], total_inflight[0])
                     events.append(f"asr_start:{idx}")
                 try:
                     if idx == 1:
@@ -3935,7 +3944,8 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                     return AsrResult(text=txt, provider="dashscope", model="qwen3-asr-flash", latency_ms=8)
                 finally:
                     with order_lock:
-                        inflight[0] -= 1
+                        asr_inflight[0] -= 1
+                        total_inflight[0] -= 1
 
         class _OrderedRefiner(BaseRefiner):
             provider_name = "codex"
@@ -3948,20 +3958,27 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 with order_lock:
                     self._idx += 1
                     idx = self._idx
-                    inflight[0] += 1
-                    max_inflight[0] = max(max_inflight[0], inflight[0])
+                    refine_inflight[0] += 1
+                    total_inflight[0] += 1
+                    max_refine_inflight[0] = max(max_refine_inflight[0], refine_inflight[0])
+                    max_total_inflight[0] = max(max_total_inflight[0], total_inflight[0])
                     events.append(f"refine_start:{idx}")
                 try:
-                    if idx == 4:
+                    if raw == "第1段原话":
+                        seg2_refine_done.wait(timeout=2.0)
+                    elif idx == 4:
                         seg4_refine_entered.set()
                         seg4_refine_release.wait(timeout=3.0)
                     out = f"精修:{raw}"
                     with order_lock:
                         events.append(f"refine_end:{idx}")
+                    if raw == "第2段原话":
+                        seg2_refine_done.set()
                     return RefinerResult(text=out, provider="codex", model="gpt-6-luna", latency_ms=10)
                 finally:
                     with order_lock:
-                        inflight[0] -= 1
+                        refine_inflight[0] -= 1
+                        total_inflight[0] -= 1
 
         class _SerialPlat(_FakePlatform):
             def __init__(self) -> None:
@@ -4028,30 +4045,35 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 self.assertEqual(st_snap["pending_count"], 3)
                 self.assertNotIn("第1段", json.dumps(st_snap, ensure_ascii=False))
 
-                # Release segment 1 -> worker drains 1 -> 2 -> 3 strictly serially with zero concurrency
+                # Release segment 1 -> Stage 1 runs strictly serially (max_asr_inflight == 1),
+                # Stage 2 overlaps (#2 finishes refining BEFORE #1), yet delivery is strictly 1 -> 2 -> 3!
                 seg1_asr_release.set()
                 deadline = time.monotonic() + 3.0
                 while time.monotonic() < deadline and daemon.last_result.get("seq_id") != s3["seq_id"]:
                     time.sleep(0.02)
 
-                self.assertEqual(max_inflight[0], 1)
+                self.assertEqual(max_asr_inflight[0], 1)
+                self.assertEqual(max_refine_inflight[0], 2)
+                self.assertLessEqual(max_total_inflight[0], 2)
+                asr_events = [e for e in events if e.startswith("asr_")]
                 self.assertEqual(
-                    events,
+                    asr_events,
                     [
                         "asr_start:1",
                         "asr_end:1",
-                        "refine_start:1",
-                        "refine_end:1",
-                        "deliver:精修:第1段原话",
                         "asr_start:2",
                         "asr_end:2",
-                        "refine_start:2",
-                        "refine_end:2",
-                        "deliver:精修:第2段原话",
                         "asr_start:3",
                         "asr_end:3",
-                        "refine_start:3",
-                        "refine_end:3",
+                    ],
+                )
+                self.assertLess(events.index("refine_end:2"), events.index("refine_end:1"))
+                deliver_events = [e for e in events if e.startswith("deliver:")]
+                self.assertEqual(
+                    deliver_events,
+                    [
+                        "deliver:精修:第1段原话",
+                        "deliver:精修:第2段原话",
                         "deliver:精修:第3段原话",
                     ],
                 )
@@ -4159,13 +4181,16 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 paste_settle_sec=0.15,
             )
             try:
-                # Enqueue segment 1 and segment 2 back-to-back at t=100.0
+                # Enqueue segment 1, start segment 2 while segment 1 commits clipboard, then finish segment 2
                 daemon.handle_trigger("toggle")
                 now[0] += 0.25
-                daemon.handle_trigger("toggle")
+                s1 = daemon.handle_trigger("toggle")
                 now[0] += 0.25
                 daemon.handle_trigger("toggle")
-                now[0] += 0.25
+                dl_s1 = time.monotonic() + 2.0
+                while time.monotonic() < dl_s1 and daemon.last_result.get("seq_id") != s1["seq_id"]:
+                    time.sleep(0.005)
+                daemon._last_trigger_ts = -1e9
                 s2 = daemon.handle_trigger("toggle")
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline and daemon.last_result.get("seq_id") != s2["seq_id"]:
@@ -7270,6 +7295,789 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
                 rc_doc_sh = cli_mod._cmd_doctor(cfg_doc_sh, no_codex_env)
             self.assertEqual(rc_doc_sh, 0, buf_doc_sh.getvalue())
             self.assertIn("bypassed (single-hop ASR passthrough", buf_doc_sh.getvalue())
+
+
+class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
+    def test_slow_sse_stream_instant_cancel_failed_stash_and_zero_pool_pollution(self) -> None:
+        from agent_voice_input.asr_providers import CancelToken, _KEEPALIVE_POOL, urllib_http_transport
+        from agent_voice_input.audio_proc import list_failed_audios
+
+        first_delta_received = threading.Event()
+        release_server_hang = threading.Event()
+
+        def responder(handler: http.server.BaseHTTPRequestHandler, rec: dict[str, object]) -> None:
+            if rec["seq"] == 1:
+                handler.send_response(200)
+                handler.send_header("Transfer-Encoding", "chunked")
+                handler.send_header("Connection", "keep-alive")
+                handler.end_headers()
+                partial = (
+                    f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': 'POISON_LEFTOVER_CHUNK'}, ensure_ascii=False)}\n\n"
+                ).encode("utf-8")
+                handler.wfile.write(f"{len(partial):x}\r\n".encode("ascii") + partial + b"\r\n")
+                handler.wfile.flush()
+                first_delta_received.set()
+                release_server_hang.wait(timeout=5.0)
+                handler.close_connection = True
+                return
+            _LocalResponsesServer.send_sse_200(
+                handler,
+                _sse_completed_frames(["第二句干净连接成功"]),
+            )
+
+        srv = _LocalResponsesServer(responder=responder)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                rt = root / "runtime"
+                rt.mkdir()
+                cfg = Config(refiner=RefinerConfig(provider="openai", api="responses", base_url=srv.base_url, timeout_sec=10.0))
+                env = {"OPENAI_API_KEY": "sk-unit-test-v092a"}
+                ref = OpenAIResponsesRefiner(cfg, env=env)
+                plat = _FakePlatform()
+                daemon = VoiceInputDaemon(
+                    cfg,
+                    env=env,
+                    runtime_dir=rt,
+                    platform=plat,
+                    asr_provider=_FakeAsr("第一句原始草稿绝不能回退上屏"),
+                    refiner=ref,
+                    tracker=_isolated_tracker(rt),
+                    paste_settle_sec=0.0,
+                )
+                try:
+                    daemon.handle_trigger("toggle")
+                    daemon._last_trigger_ts = -1e9
+                    s1 = daemon.handle_trigger("toggle")
+                    self.assertTrue(first_delta_received.wait(timeout=2.0))
+
+                    t_c0 = time.monotonic()
+                    c_resp = daemon.handle_cancel()
+                    cancel_ms = (time.monotonic() - t_c0) * 1000.0
+                    self.assertTrue(c_resp["ok"], c_resp)
+                    self.assertEqual(c_resp["cancelled_ids"], [s1["seq_id"]])
+                    self.assertLess(cancel_ms, 150.0, f"cancel took too long: {cancel_ms:.1f}ms")
+                    self.assertEqual(daemon.state, "idle")
+                    self.assertEqual(daemon.handle_control({"cmd": "status"})["pending_count"], 0)
+                    self.assertEqual(plat.deliveries, [], "cancelled request must NEVER fall back to asr_draft or paste!")
+                    self.assertEqual(daemon.last_result["skipped_reason"], "cancelled")
+                    self.assertFalse(daemon.last_result["ok"])
+                    self.assertEqual(plat.hud_events[-1]["state"], "cancelled")
+                    self.assertIs(plat.hud_events[-1].get("clear_main"), True)
+
+                    failed_wavs = list_failed_audios(rt)
+                    self.assertEqual(len(failed_wavs), 1)
+                    self.assertEqual(failed_wavs[0].stat().st_mode & 0o777, 0o600)
+
+                    # Immediately run utterance #2 on the SAME OpenAIResponsesRefiner pool -> MUST open a fresh socket
+                    daemon.asr_provider = _FakeAsr("第二句语音")
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_trigger("toggle")
+                    daemon._last_trigger_ts = -1e9
+                    s2 = daemon.handle_trigger("toggle")
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline and daemon.last_result.get("seq_id") != s2["seq_id"]:
+                        time.sleep(0.02)
+                    self.assertTrue(daemon.last_result["ok"], daemon.last_result)
+                    self.assertEqual([d[0] for d in plat.deliveries], ["第二句干净连接成功"])
+                    self.assertEqual(srv.accepted_conns, 2)
+                    self.assertNotEqual(srv.requests[0]["client_port"], srv.requests[1]["client_port"])
+                finally:
+                    release_server_hang.set()
+                    daemon.close()
+        finally:
+            release_server_hang.set()
+            srv.close()
+
+        # Also verify global _KEEPALIVE_POOL (_execute_keepalive) mid-read abort & SSLSocket.shutdown redline
+        import ssl
+
+        ssl_shutdown_called = [False]
+        orig_ssl_shutdown = ssl.SSLSocket.shutdown
+
+        def _forbid_ssl_shutdown(self_sock: ssl.SSLSocket, *a: object, **kw: object) -> object:
+            ssl_shutdown_called[0] = True
+            return orig_ssl_shutdown(self_sock, *a, **kw)
+
+        ka_hang_entered = threading.Event()
+        ka_release = threading.Event()
+
+        def ka_responder(handler: http.server.BaseHTTPRequestHandler, rec: dict[str, object]) -> None:
+            if rec["seq"] == 1:
+                handler.send_response(200)
+                handler.send_header("Content-Type", "application/json")
+                handler.send_header("Content-Length", "128")
+                handler.send_header("Connection", "keep-alive")
+                handler.end_headers()
+                handler.wfile.write(b'{"partial":')
+                handler.wfile.flush()
+                ka_hang_entered.set()
+                ka_release.wait(timeout=5.0)
+                handler.close_connection = True
+                return
+            _LocalResponsesServer.send_json(handler, 200, {"choices": [{"message": {"content": "干净响应"}}]})
+
+        srv_ka = _LocalResponsesServer(responder=ka_responder)
+        try:
+            with unittest.mock.patch.object(ssl.SSLSocket, "shutdown", _forbid_ssl_shutdown):
+                tok = CancelToken()
+                err_box: list[Exception] = []
+
+                def _bg_req() -> None:
+                    try:
+                        urllib_http_transport(
+                            HttpRequest(
+                                url=f"http://127.0.0.1:{srv_ka.port}/v1/chat/completions",
+                                method="POST",
+                                headers={"Content-Type": "application/json"},
+                                body=b"{}",
+                                timeout_sec=8.0,
+                                cancel_token=tok,
+                            )
+                        )
+                    except Exception as exc:
+                        err_box.append(exc)
+
+                th = threading.Thread(target=_bg_req, daemon=True)
+                th.start()
+                self.assertTrue(ka_hang_entered.wait(timeout=2.0))
+                t0 = time.monotonic()
+                self.assertTrue(tok.cancel("cancelled"))
+                th.join(timeout=0.5)
+                self.assertFalse(th.is_alive())
+                self.assertLess((time.monotonic() - t0) * 1000.0, 150.0)
+                self.assertEqual(len(err_box), 1)
+                self.assertFalse(ssl_shutdown_called[0])
+
+                # Next request to same origin on _KEEPALIVE_POOL gets a brand-new connection
+                r2 = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{srv_ka.port}/v1/chat/completions",
+                        method="POST",
+                        headers={"Content-Type": "application/json"},
+                        body=b"{}",
+                        timeout_sec=3.0,
+                    )
+                )
+                self.assertEqual(r2.status, 200)
+                self.assertEqual(srv_ka.accepted_conns, 2)
+        finally:
+            ka_release.set()
+            _KEEPALIVE_POOL.close_all()
+            srv_ka.close()
+
+    def test_stage1_backoff_and_doubao_query_polling_cancel_and_retry_source_no_restash(self) -> None:
+        from agent_voice_input.asr_providers import CancelToken, DashScopeAsrProvider, DoubaoAsrProvider
+        from agent_voice_input.audio_proc import list_failed_audios
+
+        reset_rate_limit_pacers()
+        voiced = _voiced_wav()
+
+        # 1. Stage 1 HTTP 503 retry backoff wakes in <100ms via CancelToken bound Event (using real time.sleep!)
+        attempt_1_done = threading.Event()
+
+        def tx_503(_req: HttpRequest) -> HttpResponse:
+            attempt_1_done.set()
+            return HttpResponse(503, {"content-type": "application/json"}, b'{"error":{"message":"overloaded"}}')
+
+        cfg_ds = Config()
+        cfg_ds.asr.provider = "dashscope"
+        cfg_ds.asr.max_retries = 2
+        cfg_ds.asr.timeout_sec = 10.0
+        env_ds = {"DASHSCOPE_API_KEY": "sk-ds-test"}
+        ds_prov = DashScopeAsrProvider(cfg_ds, resolve_credentials(cfg_ds, env_ds), env=env_ds, transport=tx_503)
+
+        tok_backoff = CancelToken()
+        res_box: list[object] = []
+
+        def _run_ds() -> None:
+            res_box.append(
+                run_pipeline_once(
+                    voiced,
+                    cfg=Config(refiner=RefinerConfig(provider="off")),
+                    asr_provider=ds_prov,
+                    cancel_token=tok_backoff,
+                    audio_source="winmm",
+                    dry_run=True,
+                    env=env_ds,
+                )
+            )
+
+        th_ds = threading.Thread(target=_run_ds, daemon=True)
+        th_ds.start()
+        self.assertTrue(attempt_1_done.wait(timeout=2.0))
+        time.sleep(0.02)
+        t_b0 = time.monotonic()
+        self.assertTrue(tok_backoff.cancel("cancelled"))
+        th_ds.join(timeout=0.5)
+        self.assertFalse(th_ds.is_alive())
+        self.assertLess((time.monotonic() - t_b0) * 1000.0, 120.0)
+        self.assertEqual(res_box[0].skipped_reason, "cancelled")  # type: ignore[union-attr]
+
+        # 2. Doubao /query polling wakes immediately on CancelToken and retry audio_source never re-stashes failed/
+        query_entered = threading.Event()
+
+        def tx_doubao(req: HttpRequest) -> HttpResponse:
+            if "/flash" in req.url:
+                return HttpResponse(
+                    200,
+                    {"x-api-status-code": "45000030", "x-api-message": "resource not granted"},
+                    b"{}",
+                )
+            if "/submit" in req.url:
+                return HttpResponse(200, {"x-api-status-code": "20000000"}, b"{}")
+            query_entered.set()
+            return HttpResponse(200, {"x-api-status-code": "20000001"}, b"{}")
+
+        cfg_db = Config(refiner=RefinerConfig(provider="off"))
+        cfg_db.asr.provider = "doubao"
+        cfg_db.asr.timeout_sec = 12.0
+        env_db = {"DOUBAO_ASR_APP_ID": "app-1", "DOUBAO_ASR_API_KEY": "tok-1"}
+        db_prov = DoubaoAsrProvider(cfg_db, resolve_credentials(cfg_db, env_db), env=env_db, transport=tx_doubao)
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            tok_db = CancelToken()
+            db_res_box: list[object] = []
+
+            def _run_db() -> None:
+                db_res_box.append(
+                    run_pipeline_once(
+                        voiced,
+                        cfg=cfg_db,
+                        asr_provider=db_prov,
+                        cancel_token=tok_db,
+                        audio_source="retry",
+                        runtime_dir=rt,
+                        dry_run=True,
+                        env=env_db,
+                    )
+                )
+
+            th_db = threading.Thread(target=_run_db, daemon=True)
+            th_db.start()
+            self.assertTrue(query_entered.wait(timeout=2.0))
+            t_q0 = time.monotonic()
+            self.assertTrue(tok_db.cancel("cancelled"))
+            th_db.join(timeout=0.5)
+            self.assertFalse(th_db.is_alive())
+            self.assertLess((time.monotonic() - t_q0) * 1000.0, 120.0)
+            out_db = db_res_box[0]
+            self.assertFalse(out_db.ok)  # type: ignore[union-attr]
+            self.assertEqual(out_db.skipped_reason, "cancelled")  # type: ignore[union-attr]
+            self.assertEqual(out_db.saved_audio, "")  # type: ignore[union-attr]
+            self.assertEqual(list_failed_audios(rt), [], "retry source must NOT re-stash WAV on cancel")
+
+            # Legacy bare is_cancelled callback keeps 'superseded' & >=15s threshold backward compatibility
+            res_legacy = run_pipeline_once(
+                voiced,
+                cfg=cfg_db,
+                asr_provider=_FakeAsr("legacy"),
+                is_cancelled=lambda: True,
+                audio_source="winmm",
+                runtime_dir=rt,
+                dry_run=True,
+                env=env_db,
+            )
+            self.assertEqual(res_legacy.skipped_reason, "superseded")
+            self.assertEqual(list_failed_audios(rt), [])
+
+            # 3. CodexRefiner auth refresh cancellation decoupling:
+            #    #1 cancels mid-getAuthStatus -> kills temp proc without poisoning cooldown; #2 refreshes cleanly!
+            home_dir = rt / "codex_home"
+            _write_codex_auth_json(home_dir, exp=int(time.time()) + 60)  # inside 30m proactive refresh window
+            fresh_jwt = _make_fake_jwt(exp=int(time.time()) + 7200, account_id="acct-fresh-v092a")
+            call_counter_file = rt / "auth_calls.txt"
+            slow_first_auth_py = (
+                "import json, pathlib, sys, time\n"
+                f"cf = pathlib.Path({str(call_counter_file)!r})\n"
+                "n = int(cf.read_text()) + 1 if cf.exists() else 1\n"
+                "cf.write_text(str(n))\n"
+                "for raw in sys.stdin:\n"
+                "    m = json.loads(raw)\n"
+                "    if m.get('method') == 'initialize':\n"
+                "        sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{}}) + '\\n'); sys.stdout.flush()\n"
+                "    elif m.get('method') == 'getAuthStatus':\n"
+                "        if n == 1: time.sleep(5.0)\n"
+                f"        sys.stdout.write(json.dumps({{'jsonrpc':'2.0','id':m['id'],'result':{{'authMethod':'chatgpt','authToken':{fresh_jwt!r}}}}}) + '\\n'); sys.stdout.flush()\n"
+            )
+            srv_codex = _LocalResponsesServer()
+            try:
+                cfg_cx = Config(refiner=RefinerConfig(provider="codex", base_url=srv_codex.base_url, timeout_sec=8.0))
+                cref = CodexRefiner(
+                    cfg_cx,
+                    env={"HOME": str(home_dir)},
+                    app_server_cmd=[sys.executable, "-u", "-c", slow_first_auth_py],
+                )
+                try:
+                    tok_cx1 = CancelToken()
+                    r_cx1: list[RefinerResult] = []
+                    r_cx2: list[RefinerResult] = []
+                    t1 = threading.Thread(
+                        target=lambda: r_cx1.append(cref.refine("请求一被取消", cancel_token=tok_cx1)),
+                        daemon=True,
+                    )
+                    t1.start()
+                    dl_cf = time.monotonic() + 2.0
+                    while time.monotonic() < dl_cf and not call_counter_file.exists():
+                        time.sleep(0.01)
+                    t2 = threading.Thread(
+                        target=lambda: r_cx2.append(cref.refine("请求二正常刷新")),
+                        daemon=True,
+                    )
+                    t2.start()
+                    time.sleep(0.03)
+                    self.assertTrue(tok_cx1.cancel("cancelled"))
+                    t1.join(timeout=1.0)
+                    t2.join(timeout=2.0)
+                    self.assertEqual(r_cx1[0].used_fallback, "cancelled")
+                    self.assertEqual(r_cx2[0].used_fallback, "")
+                    self.assertIn("请求二正常刷新", r_cx2[0].text)
+                    self.assertEqual(call_counter_file.read_text(), "2")
+                finally:
+                    cref.close()
+            finally:
+                srv_codex.close()
+
+    def test_out_of_order_stage2_strict_seq_delivery_per_utterance_origin_window_and_queue_wait_ms(self) -> None:
+        from agent_voice_input.daemon import read_telemetry_history
+        from agent_voice_input.refiner import BaseRefiner
+
+        win_a = ForegroundWindow(hwnd=101, process="WindowsTerminal", title="claude · proj-a [#1111aaaa]")
+        win_b = ForegroundWindow(hwnd=202, process="WindowsTerminal", title="codex · proj-b [#2222bbbb]")
+        refine_done_order: list[str] = []
+        s2_refined_evt = threading.Event()
+
+        class _SeqAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.n = 0
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
+                self.n += 1
+                if self.n == 1:
+                    time.sleep(0.02)
+                return AsrResult(text=f"草稿{self.n}", provider="dashscope", model="qwen3-asr-flash", latency_ms=10)
+
+        class _OutOfOrderRefiner(BaseRefiner):
+            provider_name = "codex"
+
+            def refine(self, asr_input: object, **_kw: object) -> RefinerResult:
+                raw = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                if raw == "草稿1":
+                    # Wait until utterance #2 has already completed Stage 2 plus extra margin
+                    s2_refined_evt.wait(timeout=2.0)
+                    time.sleep(0.05)
+                    refine_done_order.append("1")
+                    return RefinerResult(text="精修A", provider="codex", model="gpt-6-luna", latency_ms=120)
+                refine_done_order.append("2")
+                s2_refined_evt.set()
+                return RefinerResult(text="精修B", provider="codex", model="gpt-6-luna", latency_ms=8)
+
+        class _FocusAwarePlat(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.current_fg = win_b
+                self.delivery_log: list[tuple[int, str, int, str]] = []
+                self.clipboard_writes: list[str] = []
+
+            def resolve_foreground_window(self, hint: ForegroundWindow | None = None) -> ForegroundWindow:
+                return hint if (hint and hint.hwnd > 0) else self.current_fg
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                origin_window: ForegroundWindow | None = None,
+                fallback_clipboard_text: str | None = None,
+                before_clipboard_write: object = None,
+                before_commit: object = None,
+                **_kw: object,
+            ) -> PasteOutcome:
+                if callable(before_clipboard_write):
+                    before_clipboard_write()
+                if callable(before_commit) and not before_commit():
+                    return PasteOutcome(False, False, "cancelled", "")
+                eff_hwnd = origin_window.hwnd if origin_window is not None else target_hwnd
+                if eff_hwnd != self.current_fg.hwnd:
+                    clip = fallback_clipboard_text if fallback_clipboard_text is not None else text
+                    self.clipboard_writes.append(clip)
+                    self.delivery_log.append((seq_id, text, eff_hwnd, "focus_changed"))
+                    return PasteOutcome(False, True, "focus_changed", self.current_fg.process)
+                self.clipboard_writes.append(text)
+                self.delivery_log.append((seq_id, text, eff_hwnd, "ok"))
+                return PasteOutcome(True, True, "ok", self.current_fg.process, used_clipboard_paste=True)
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            plat = _FocusAwarePlat()
+            cfg = Config(refiner=RefinerConfig(provider="codex"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_SeqAsr(),
+                refiner=_OutOfOrderRefiner(),
+                tracker=_isolated_tracker(rt),
+                paste_settle_sec=0.0,
+            )
+            try:
+                # Utterance #1 recorded in Window A
+                daemon.handle_trigger("toggle", win_a)
+                daemon._last_trigger_ts = -1e9
+                r1 = daemon.handle_trigger("toggle", win_a)
+
+                # User switches to Window B and records Utterance #2 while #1 is in flight
+                plat.current_fg = win_b
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle", win_b)
+                daemon._last_trigger_ts = -1e9
+                r2 = daemon.handle_trigger("toggle", win_b)
+
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and daemon.last_result.get("seq_id") != r2["seq_id"]:
+                    time.sleep(0.02)
+
+                # Stage 2 completed out of order (2 before 1), yet Stage 3 committed strictly 1 -> 2
+                # with independent origin_window checks (#1 focus_changed vs Window A, #2 pasted into Window B)!
+                self.assertEqual(refine_done_order, ["2", "1"])
+                self.assertEqual(
+                    plat.delivery_log,
+                    [
+                        (r1["seq_id"], "精修A", 101, "focus_changed"),
+                        (r2["seq_id"], "精修B", 202, "ok"),
+                    ],
+                )
+                hist = read_telemetry_history(rt, limit=10)
+                self.assertEqual([h["seq_id"] for h in hist], [r1["seq_id"], r2["seq_id"]])
+                for rec in hist:
+                    self.assertIn("queue_wait_ms", rec)
+                    self.assertIsInstance(rec["queue_wait_ms"], int)
+                    self.assertGreaterEqual(rec["queue_wait_ms"], 0)
+            finally:
+                daemon.close()
+
+    def test_layered_cancel_recording_vs_inflight_seq_target_hold_cancel_try_commit_and_cli(self) -> None:
+        import io
+        from agent_voice_input import cli as cli_mod
+        from agent_voice_input.audio_proc import list_failed_audios
+        from agent_voice_input.refiner import BaseRefiner
+
+        s1_in_refine = threading.Event()
+        s1_release = threading.Event()
+        unstoppable_hang = threading.Event()
+        s2_fast_done = threading.Event()
+
+        class _FlexWavPlatform(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.wav_queue: list[bytes] = []
+                self.pasted_texts: list[str] = []
+                self.commit_hook: object = None
+
+            def stop_recording(self, drain: bool = True) -> tuple[bytes, str]:
+                _ = drain
+                if self.wav_queue:
+                    return self.wav_queue.pop(0), "winmm"
+                return _voiced_wav(), "winmm"
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                before_clipboard_write: object = None,
+                before_commit: object = None,
+                **_kw: object,
+            ) -> PasteOutcome:
+                if callable(before_clipboard_write):
+                    before_clipboard_write()
+                if callable(before_commit) and not before_commit():
+                    return PasteOutcome(False, False, "cancelled", "")
+                if callable(self.commit_hook):
+                    self.commit_hook(seq_id)
+                self.pasted_texts.append(text)
+                self.deliveries.append((text, seq_id, target_hwnd))
+                return PasteOutcome(True, True, "ok", "WindowsTerminal", used_clipboard_paste=True)
+
+        mode_box = ["scenario1"]
+
+        class _ScenarioAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.idx = 0
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, *, cancel_token: object = None, **_kw: object) -> AsrResult:
+                self.idx += 1
+                return AsrResult(text=f"句{self.idx}", provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
+
+        class _ScenarioRefiner(BaseRefiner):
+            provider_name = "codex"
+
+            def refine(self, asr_input: object, *, cancel_token: object = None, **_kw: object) -> RefinerResult:
+                raw = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                sc = mode_box[0]
+                if sc == "scenario1" and raw == "句1":
+                    s1_in_refine.set()
+                    s1_release.wait(timeout=3.0)
+                    if cancel_token is not None and getattr(cancel_token, "is_cancelled")():
+                        return RefinerResult(text=raw, provider="codex", model="gpt-6-luna", latency_ms=5, used_fallback="cancelled")
+                    return RefinerResult(text="精修句1", provider="codex", model="gpt-6-luna", latency_ms=10)
+                if sc == "scenario2":
+                    ev = threading.Event()
+                    if cancel_token is not None:
+                        getattr(cancel_token, "bind_event")(ev)
+                    s1_in_refine.set()
+                    ev.wait(timeout=3.0)
+                    return RefinerResult(text=raw, provider="codex", model="gpt-6-luna", latency_ms=5, used_fallback="cancelled")
+                if sc == "scenario3":
+                    if raw == "句11":
+                        s1_in_refine.set()
+                        # Simulates a wedged thread that ignores cancellation for 3s; slot.done_evt MUST still wake 0ms!
+                        unstoppable_hang.wait(timeout=3.0)
+                        return RefinerResult(text="慢句11", provider="codex", model="gpt-6-luna", latency_ms=50)
+                    out = f"快{raw}"
+                    s2_fast_done.set()
+                    return RefinerResult(text=out, provider="codex", model="gpt-6-luna", latency_ms=5)
+                return RefinerResult(text=f"精修{raw}", provider="codex", model="gpt-6-luna", latency_ms=5)
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir()
+            plat = _FlexWavPlatform()
+            cfg = Config(refiner=RefinerConfig(provider="codex"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_ScenarioAsr(),
+                refiner=_ScenarioRefiner(),
+                tracker=_isolated_tracker(rt),
+                paste_settle_sec=0.0,
+            )
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            deadline_sock = time.monotonic() + 2.0
+            while time.monotonic() < deadline_sock and not daemon.sock_path.exists():
+                time.sleep(0.01)
+            try:
+                # 1. Idle hold_cancel -> ignored ('not_inflight')
+                r_idle_hc = daemon.handle_cancel(only_inflight=True)
+                self.assertFalse(r_idle_hc["ok"])
+                self.assertEqual(r_idle_hc["ignored"], "not_inflight")
+
+                # 2. #1 in Stage 2 + #2 actively recording:
+                #    - hold_cancel during recording is ignored ('not_inflight') so user never loses active recording;
+                #    - explicit cancel without --seq cancels ONLY recording #2, restores 'refining' + toast, and #1 delivers!
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                r_u1 = daemon.handle_trigger("toggle")
+                self.assertTrue(s1_in_refine.wait(timeout=2.0))
+
+                daemon._last_trigger_ts = -1e9
+                r_u2_rec = daemon.handle_trigger("toggle")
+                self.assertEqual(daemon.state, "recording")
+
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 1500})
+                self.assertEqual(daemon.state, "recording", "hold_cancel must NOT cancel active recording")
+
+                c_rec = daemon.handle_cancel()
+                self.assertTrue(c_rec["ok"])
+                self.assertEqual(c_rec["cancelled_recording"], r_u2_rec["seq_id"])
+                self.assertEqual(c_rec["state"], "refining")
+                self.assertEqual(daemon._main_hud_state, "refining")
+                self.assertEqual(plat.hud_events[-1]["state"], "cancelled")
+                self.assertIs(plat.hud_events[-1].get("clear_main"), False)
+                self.assertEqual(list_failed_audios(rt), [])
+
+                s1_release.set()
+                dl = time.monotonic() + 2.0
+                while time.monotonic() < dl and daemon.last_result.get("seq_id") != r_u1["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(plat.pasted_texts, ["精修句1"])
+
+                # 3. Multi-utterance background cancel via hold_cancel:
+                #    2 voiced utterances + 1 silent utterance -> all 3 cancelled, ONLY 2 voiced WAVs stashed!
+                s1_in_refine.clear()
+                mode_box[0] = "scenario2"
+                silence_bytes = pack_pcm16_mono_wav(b"\x00\x00" * 8000, sample_rate=16000)
+                plat.wav_queue = [_voiced_wav(), _voiced_wav(), silence_bytes]
+                for _ in range(3):
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_trigger("toggle")
+                    daemon._last_trigger_ts = -1e9
+                    daemon.handle_trigger("toggle")
+                self.assertTrue(s1_in_refine.wait(timeout=2.0))
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 1600})
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(len(list_failed_audios(rt)), 2)
+
+                # 4. --seq N (via CLI 'agent-voice-input cancel --seq N') cancels stuck head #1 in 0ms
+                #    and immediately releases already-finished #2 to paste!
+                s1_in_refine.clear()
+                s2_fast_done.clear()
+                daemon.asr_provider.idx = 10  # type: ignore[attr-defined]
+                mode_box[0] = "scenario3"
+                plat.pasted_texts.clear()
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                u_slow = daemon.handle_trigger("toggle")  # "句11"
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                u_fast = daemon.handle_trigger("toggle")  # "句12"
+                self.assertTrue(s1_in_refine.wait(timeout=2.0))
+                self.assertTrue(s2_fast_done.wait(timeout=2.0))
+                self.assertEqual(plat.pasted_texts, [], "#2 must wait while #1 is head of _commit_queue")
+
+                cfg_cli = Path(td) / "cfg.toml"
+                cfg_cli.write_text('[refiner]\nprovider = "off"\n', encoding="utf-8")
+                buf_cli = io.StringIO()
+                t_seq0 = time.monotonic()
+                with (
+                    unittest.mock.patch.dict(os.environ, {"AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}, clear=False),
+                    unittest.mock.patch("sys.stdout", buf_cli),
+                ):
+                    rc_cli = cli_mod.main(["--config", str(cfg_cli), "cancel", "--seq", str(u_slow["seq_id"])])
+                self.assertEqual(rc_cli, 0, buf_cli.getvalue())
+                cli_json = json.loads(buf_cli.getvalue().strip())
+                self.assertEqual(cli_json["cancelled_ids"], [u_slow["seq_id"]])
+
+                dl_fast = time.monotonic() + 0.3
+                while time.monotonic() < dl_fast and daemon.last_result.get("seq_id") != u_fast["seq_id"]:
+                    time.sleep(0.01)
+                self.assertLess((time.monotonic() - t_seq0) * 1000.0, 200.0)
+                self.assertEqual(plat.pasted_texts, ["快句12"])
+                unstoppable_hang.set()
+
+                # 5. try_commit() CAS race: once committed inside deliver_text, concurrent cancel returns already_committed
+                mode_box[0] = "scenario4"
+                race_results: list[dict[str, object]] = []
+                plat.commit_hook = lambda seq_val: race_results.append(daemon.handle_cancel(seq_id=seq_val))
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                u_commit = daemon.handle_trigger("toggle")
+                dl_c = time.monotonic() + 2.0
+                while time.monotonic() < dl_c and daemon.last_result.get("seq_id") != u_commit["seq_id"]:
+                    time.sleep(0.01)
+                self.assertTrue(daemon.last_result["ok"])
+                self.assertEqual(len(race_results), 1)
+                self.assertFalse(race_results[0]["ok"])
+                self.assertEqual(race_results[0]["ignored"], "already_committed")
+                self.assertEqual(race_results[0]["committed_ids"], [u_commit["seq_id"]])
+            finally:
+                s1_release.set()
+                unstoppable_hang.set()
+                daemon.close()
+                srv_th.join(timeout=2.0)
+
+    def test_slow_background_hud_never_overwrites_recording_and_drain_hides_main_hud(self) -> None:
+        from agent_voice_input.refiner import BaseRefiner
+
+        bg_hud_entered = threading.Event()
+        asr_hold = threading.Event()
+
+        class _SlowHudPlat(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.main_history: list[str] = []
+
+            def hud(
+                self,
+                state: str,
+                *,
+                duration_ms: int = 0,
+                layer: str | None = None,
+                clear_main: bool | None = None,
+                clear_toast: bool | None = None,
+            ) -> None:
+                if state in ("recognizing", "refining"):
+                    bg_hud_entered.set()
+                    time.sleep(0.05)
+                super().hud(
+                    state,
+                    duration_ms=duration_ms,
+                    layer=layer,
+                    clear_main=clear_main,
+                    clear_toast=clear_toast,
+                )
+                eff_lyr = (layer or "").strip().lower()
+                if eff_lyr != "toast":
+                    if state in ("recording", "recognizing", "refining"):
+                        self.main_history.append(state)
+                    elif state in ("done", "hide", "hide_all") or clear_main is True:
+                        self.main_history.append(f"clear:{state}")
+
+        class _GateAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                pass
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
+                asr_hold.wait(timeout=2.0)
+                return AsrResult(text="防覆盖口述", provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
+
+        class _QuickRefiner(BaseRefiner):
+            provider_name = "codex"
+
+            def refine(self, asr_input: object, **_kw: object) -> RefinerResult:
+                raw = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                return RefinerResult(text=raw, provider="codex", model="gpt-6-luna", latency_ms=5)
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            plat = _SlowHudPlat()
+            daemon = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="codex")),
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_GateAsr(),
+                refiner=_QuickRefiner(),
+                tracker=_isolated_tracker(rt),
+                paste_settle_sec=0.0,
+            )
+            try:
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                s1 = daemon.handle_trigger("toggle")
+                self.assertTrue(bg_hud_entered.wait(timeout=2.0))
+
+                # Start recording #2 while #1's slow 'recognizing' HUD call is mid-flight,
+                # then let #1 finish refining & delivering WHILE #2 is still recording!
+                daemon._last_trigger_ts = -1e9
+                r_rec2 = daemon.handle_trigger("toggle")
+                self.assertEqual(r_rec2["state"], "recording")
+                idx_rec2 = len(plat.main_history) - 1
+                self.assertEqual(plat.main_history[idx_rec2], "recording")
+
+                asr_hold.set()
+                dl = time.monotonic() + 2.0
+                while time.monotonic() < dl and daemon.last_result.get("seq_id") != s1["seq_id"]:
+                    time.sleep(0.02)
+
+                # While #2 is recording, ZERO background main-capsule calls may appear after 'recording'!
+                self.assertEqual(plat.main_history[idx_rec2:], ["recording"])
+                self.assertEqual(daemon._main_hud_state, "recording")
+
+                # Cancel recording #2 -> drains completely to idle with main HUD hidden (zero dangling HUD)
+                daemon.handle_cancel()
+                self.assertEqual(daemon.state, "idle")
+                self.assertFalse(daemon._main_hud_visible)
+                self.assertEqual(daemon._main_hud_state, "")
+            finally:
+                asr_hold.set()
+                daemon.close()
 
 
 if __name__ == "__main__":

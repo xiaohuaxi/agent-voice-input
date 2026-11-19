@@ -1,4 +1,4 @@
-"""CLI entrypoint for agent-voice-input (daemon, start, restart, stop, status, toggle, once, retry, doctor, key-test, session-hook)."""
+"""CLI entrypoint for agent-voice-input (daemon, start, restart, stop, status, toggle, cancel, once, retry, doctor, key-test, session-hook)."""
 from __future__ import annotations
 
 import argparse, json, os, signal, socket, stat, subprocess, sys, time
@@ -643,6 +643,15 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="subcmd", required=True)
     for name in ("daemon", "start", "restart", "doctor", "stop", "toggle"):
         _add_common_flags(sub.add_parser(name), is_sub=True)
+    p_cancel = sub.add_parser("cancel", help="Cancel active recording or in-flight voice tasks")
+    _add_common_flags(p_cancel, is_sub=True)
+    p_cancel.add_argument(
+        "--seq",
+        dest="seq_id",
+        type=int,
+        default=None,
+        help="Cancel only the task matching seq_id",
+    )
     p_status = sub.add_parser("status")
     _add_common_flags(p_status, is_sub=True)
     p_status.add_argument(
@@ -706,7 +715,7 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_start(args, env, cfg=cfg)
         if args.subcmd == "stop":
             return _cmd_stop(env)
-        if args.subcmd in ("status", "toggle"):
+        if args.subcmd in ("status", "toggle", "cancel"):
             ctrl_timeout = 20.0 if args.subcmd == "toggle" else 8.0
             rt_dir_st = get_runtime_dir(env, create=False)
             raw_hist = getattr(args, "history", None) if args.subcmd == "status" else None
@@ -714,6 +723,8 @@ def main(argv: list[str] | None = None) -> int:
             ctrl_req: dict[str, Any] = {"cmd": args.subcmd}
             if hist_limit is not None:
                 ctrl_req["history"] = hist_limit
+            if args.subcmd == "cancel" and getattr(args, "seq_id", None) is not None:
+                ctrl_req["seq_id"] = int(args.seq_id)
             try:
                 resp = send_control_command(
                     rt_dir_st,

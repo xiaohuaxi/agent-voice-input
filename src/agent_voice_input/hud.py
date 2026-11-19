@@ -70,6 +70,7 @@ _STATIC_HUD_COPY: dict[str, tuple[str, str]] = {
     "refining": ("◈ 整理精修…", "◈ Refining…"),
     "done": ("✓ 已填入", "✓ Inserted"),
     "copied": ("✓ 已复制(窗口已切换)", "✓ Copied (window switched)"),
+    "cancelled": ("○ 已取消", "○ Cancelled"),
     "empty": ("○ 未检测到语音", "○ No speech detected"),
     "no_mic": ("✕ 无可用麦克风", "✕ No microphone found"),
     "mic_unavailable": ("! 麦克风暂忙，请再试一次", "! Microphone busy, try again"),
@@ -94,6 +95,7 @@ _PERSISTENT_HUD_STATES: frozenset[str] = frozenset(
 HUD_STATE_DURATIONS_MS: dict[str, int] = {
     "done": 900,
     "copied": 2000,
+    "cancelled": 1600,
     "empty": 2200,
     "no_mic": 2200,
     "mic_unavailable": 2600,

@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import concurrent.futures, fcntl, inspect, json, os, signal, socket, stat, sys, threading, time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from . import __version__
 from .app_scope import (
@@ -17,6 +17,7 @@ from .asr_providers import (
     AsrError,
     AsrResult,
     BaseAsrProvider,
+    CancelToken,
     ChatAudioAsrProvider,
     GeminiAudioProvider,
     _sleep_cooperative,
@@ -87,6 +88,7 @@ class PipelineResult:
     refine_init_ms: int = 0
     deliver_ms: int = 0
     total_ms: int = 0
+    queue_wait_ms: int = 0
     ctx_chars: int = 0
     ctx_chunks: int = 0
     mode: str = "agent"
@@ -101,6 +103,7 @@ def build_pipeline_summary(
     recovery_count: int = 0,
     recovery_gap_ms: int = 0,
     audio_error: str = "",
+    queue_wait_ms: int | None = None,
     redact_fn: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """Build a strictly text-free, secret-redacted numeric summary for status & telemetry.jsonl."""
@@ -109,6 +112,7 @@ def build_pipeline_summary(
     cached_tok = res.refined.cached_input_tokens if res.refined else None
     out_tok = res.refined.output_tokens if res.refined else None
     rsn_tok = res.refined.reasoning_tokens if res.refined else None
+    eff_q_wait = max(0, int(res.queue_wait_ms if queue_wait_ms is None else queue_wait_ms))
     summary: dict[str, Any] = {
         "ts": round(time.time(), 6),
         "seq_id": seq_id,
@@ -127,6 +131,7 @@ def build_pipeline_summary(
         "paste_reason": res.paste.reason if res.paste else ("dry_run" if dry_run and res.ok else ""),
         "raw_audio_sec": round(res.gate.duration_sec, 3) if res.gate else 0.0,
         "voiced_audio_sec": round(res.gate.voiced_sec, 3) if res.gate else 0.0,
+        "queue_wait_ms": eff_q_wait,
         "gate_ms": res.gate_ms,
         "sync_ms": res.sync_ms,
         "asr_ms": res.asr.latency_ms if res.asr else 0,
@@ -366,6 +371,7 @@ def _deliver_with_origin(
     suppress_beep: bool | Callable[[], bool] = False,
     is_cancelled: Callable[[], bool] | None = None,
     before_clipboard_write: Callable[[], None] | None = None,
+    before_commit: Callable[[], bool] | None = None,
 ) -> PasteOutcome:
     try:
         params = inspect.signature(platform.deliver_text).parameters
@@ -378,6 +384,9 @@ def _deliver_with_origin(
 
     if before_clipboard_write is not None and not _accepts("before_clipboard_write"):
         before_clipboard_write()
+    if before_commit is not None and not _accepts("before_commit"):
+        if not before_commit():
+            return PasteOutcome(False, False, "cancelled", "")
 
     kw: dict[str, Any] = {"seq_id": seq_id, "target_hwnd": origin_window.hwnd}
     if _accepts("origin_window"):
@@ -392,6 +401,8 @@ def _deliver_with_origin(
         kw["is_cancelled"] = is_cancelled
     if before_clipboard_write is not None and _accepts("before_clipboard_write"):
         kw["before_clipboard_write"] = before_clipboard_write
+    if before_commit is not None and _accepts("before_commit"):
+        kw["before_commit"] = before_commit
     return platform.deliver_text(text, **kw)
 
 
@@ -454,6 +465,7 @@ def _derive_failed_label(snap: SessionSnapshot | None, win: ForegroundWindow) ->
 
 MAX_ASR_CHUNK_CONCURRENCY: int = 5
 MAX_PENDING_UTTERANCES: int = 8
+MAX_STAGE2_CONCURRENCY: int = 2
 DEFAULT_PASTE_SETTLE_SEC: float = 0.15
 
 
@@ -461,11 +473,14 @@ def _make_cancel_check(
     seq_id: int,
     is_current_seq: Callable[[int], bool] | None,
     is_cancelled: Callable[[], bool] | None,
+    cancel_token: CancelToken | None = None,
 ) -> Callable[[], bool] | None:
-    if is_current_seq is None and is_cancelled is None:
+    if is_current_seq is None and is_cancelled is None and cancel_token is None:
         return None
 
     def _check() -> bool:
+        if cancel_token is not None and cancel_token.is_cancelled():
+            return True
         if is_cancelled is not None and is_cancelled():
             return True
         if is_current_seq is not None and not is_current_seq(seq_id):
@@ -481,15 +496,19 @@ def _call_asr_transcribe(
     *,
     context: Any,
     is_cancelled: Callable[[], bool] | None,
+    cancel_token: CancelToken | None = None,
 ) -> AsrResult:
-    if is_cancelled is not None:
-        try:
-            params = inspect.signature(eff_asr.transcribe).parameters
-        except (TypeError, ValueError):
-            params = {}
-        if "is_cancelled" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-            return eff_asr.transcribe(wav_bytes, context=context, is_cancelled=is_cancelled)
-    return eff_asr.transcribe(wav_bytes, context=context)
+    try:
+        params = inspect.signature(eff_asr.transcribe).parameters
+    except (TypeError, ValueError):
+        params = {}
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    kw: dict[str, Any] = {"context": context}
+    if is_cancelled is not None and ("is_cancelled" in params or has_var_kw):
+        kw["is_cancelled"] = is_cancelled
+    if cancel_token is not None and ("cancel_token" in params or has_var_kw):
+        kw["cancel_token"] = cancel_token
+    return eff_asr.transcribe(wav_bytes, **kw)
 
 
 def _call_refiner_refine(
@@ -500,6 +519,7 @@ def _call_refiner_refine(
     tracker: SessionTracker,
     fallback_context: str,
     is_cancelled: Callable[[], bool] | None,
+    cancel_token: CancelToken | None = None,
     mode: str = "agent",
 ) -> RefinerResult:
     try:
@@ -514,6 +534,8 @@ def _call_refiner_refine(
     }
     if is_cancelled is not None and ("is_cancelled" in params or has_var_kw):
         kw["is_cancelled"] = is_cancelled
+    if cancel_token is not None and ("cancel_token" in params or has_var_kw):
+        kw["cancel_token"] = cancel_token
     if "mode" in params or (has_var_kw and mode != "agent"):
         kw["mode"] = mode
     return eff_refiner.refine(asr_res, **kw)
@@ -536,8 +558,9 @@ def _transcribe_wav_chunks(
     seq_id: int = 1,
     is_current_seq: Callable[[int], bool] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    cancel_token: CancelToken | None = None,
 ) -> tuple[AsrResult, int, tuple[float, ...]]:
-    cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled)
+    cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled, cancel_token)
     eff_max_chunk_sec = (
         (SINGLE_HOP_MAX_CHUNK_SEC if _is_single_hop_asr_provider(eff_asr) else DEFAULT_MAX_CHUNK_SEC)
         if max_chunk_sec is None
@@ -547,12 +570,20 @@ def _transcribe_wav_chunks(
     if len(infos) <= 1:
         if cancel_check is not None and cancel_check():
             return AsrResult(text="", provider=getattr(eff_asr, "provider_name", ""), model="", latency_ms=0), 1, ()
-        return _call_asr_transcribe(eff_asr, wav_bytes, context=asr_ctx, is_cancelled=cancel_check), 1, ()
+        return (
+            _call_asr_transcribe(
+                eff_asr, wav_bytes, context=asr_ctx, is_cancelled=cancel_check, cancel_token=cancel_token
+            ),
+            1,
+            (),
+        )
 
     chunk_secs = tuple(round(c.duration_sec, 2) for c in infos)
     t0 = time.monotonic()
     results: list[AsrResult | None] = [None] * len(infos)
     abort_evt = threading.Event()
+    if cancel_token is not None:
+        cancel_token.bind_event(abort_evt)
     first_exc_lock = threading.Lock()
     first_exc: list[Exception] = []
 
@@ -560,14 +591,18 @@ def _transcribe_wav_chunks(
         return abort_evt.is_set() or (cancel_check is not None and cancel_check())
 
     def _work(chunk_wav: bytes) -> AsrResult | None:
-        if cancel_check is not None and cancel_check():
-            return None
-        if abort_evt.is_set():
+        if _chunk_cancelled():
             return None
         try:
-            return _call_asr_transcribe(eff_asr, chunk_wav, context=asr_ctx, is_cancelled=_chunk_cancelled)
+            return _call_asr_transcribe(
+                eff_asr,
+                chunk_wav,
+                context=asr_ctx,
+                is_cancelled=_chunk_cancelled,
+                cancel_token=cancel_token,
+            )
         except Exception as exc:
-            if cancel_check is not None and cancel_check() and isinstance(exc, AsrError) and "cancelled" in str(exc).lower():
+            if (cancel_check is not None and cancel_check()) and isinstance(exc, AsrError) and "cancelled" in str(exc).lower():
                 return None
             with first_exc_lock:
                 if not abort_evt.is_set():
@@ -575,18 +610,22 @@ def _transcribe_wav_chunks(
                     abort_evt.set()
             raise
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_ASR_CHUNK_CONCURRENCY, len(infos))) as pool:
-        futs = [pool.submit(_work, c.wav_bytes) for c in infos]
-        try:
-            for idx, fut in enumerate(futs):
-                results[idx] = fut.result()
-        except Exception:
-            abort_evt.set()
-            for f in futs:
-                f.cancel()
-            if first_exc:
-                raise first_exc[0]
-            raise
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_ASR_CHUNK_CONCURRENCY, len(infos))) as pool:
+            futs = [pool.submit(_work, c.wav_bytes) for c in infos]
+            try:
+                for idx, fut in enumerate(futs):
+                    results[idx] = fut.result()
+            except Exception:
+                abort_evt.set()
+                for f in futs:
+                    f.cancel()
+                if first_exc:
+                    raise first_exc[0]
+                raise
+    finally:
+        if cancel_token is not None:
+            cancel_token.unbind_event(abort_evt)
 
     def _sum_opt(vals: Sequence[int | None]) -> int | None:
         present = [v for v in vals if v is not None]
@@ -667,6 +706,226 @@ def _resolve_pipeline_window_routing(
     return False, "general"
 
 
+def _parse_optional_seq_id(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raise ValueError(f"seq_id must be a positive integer, got {raw!r}")
+    return raw
+
+
+@dataclass(slots=True)
+class _Stage1State:
+    t_total0: float
+    queue_wait_ms: int = 0
+    gate: AudioGateResult | None = None
+    gate_ms: int = 0
+    switched_fallback: bool = False
+    win: ForegroundWindow = field(default_factory=ForegroundWindow)
+    eff_mode: str = "agent"
+    snap: SessionSnapshot | None = None
+    asr_ctx_dialog: str = ""
+    sync_ms: int = 0
+    prep_ms: int = 0
+    asr_res: AsrResult | None = None
+    asr_chunks: int = 1
+    asr_chunk_secs: tuple[float, ...] = ()
+    skipped_reason: str = ""
+
+
+def _make_pipeline_result(
+    seq_id: int,
+    audio_source: str,
+    st: _Stage1State,
+    *,
+    ok: bool = False,
+    final_text: str = "",
+    skipped_reason: str = "",
+    refined: RefinerResult | None = None,
+    paste: PasteOutcome | None = None,
+    deliver_ms: int = 0,
+    saved_audio: str = "",
+    error: str = "",
+) -> PipelineResult:
+    return PipelineResult(
+        ok,
+        seq_id,
+        final_text=final_text,
+        skipped_reason=skipped_reason,
+        audio_source=audio_source,
+        switched_fallback=st.switched_fallback,
+        gate=st.gate,
+        session=st.snap,
+        asr=st.asr_res,
+        refined=refined,
+        paste=paste,
+        error=error,
+        asr_chunks=st.asr_chunks,
+        asr_chunk_secs=st.asr_chunk_secs,
+        saved_audio=saved_audio,
+        gate_ms=st.gate_ms,
+        sync_ms=st.sync_ms,
+        refine_init_ms=st.prep_ms + (refined.init_ms if refined else 0),
+        deliver_ms=deliver_ms,
+        total_ms=_elapsed_ms(st.t_total0),
+        queue_wait_ms=st.queue_wait_ms,
+        ctx_chars=refined.context_chars if refined else 0,
+        ctx_chunks=refined.context_chunks if refined else 0,
+        mode=st.eff_mode,
+    )
+
+
+def _execute_stage1(
+    st: _Stage1State,
+    raw_wav: bytes | str | Path,
+    *,
+    cfg: Config,
+    env: Mapping[str, str],
+    tracker: SessionTracker,
+    eff_asr: BaseAsrProvider,
+    eff_refiner: BaseRefiner,
+    platform: Any,
+    origin_window: ForegroundWindow | None,
+    window_title_override: str | None,
+    audio_source: str,
+    explicit_mode: str,
+    seq_id: int,
+    max_chunk_sec: float | None,
+    is_current_seq: Callable[[int], bool] | None,
+    is_cancelled: Callable[[], bool] | None,
+    cancel_token: CancelToken | None,
+    cancel_check: Callable[[], bool] | None,
+    cancel_reason_fn: Callable[[], str],
+    archive_sink: Callable[[threading.Thread], None] | None,
+) -> None:
+    if isinstance(raw_wav, (bytes, bytearray)) and len(raw_wav) == 0:
+        if c_rsn := cancel_reason_fn():
+            st.skipped_reason = c_rsn
+        else:
+            st.switched_fallback = (
+                bool(platform and platform.switch_to_fallback_audio())
+                if audio_source in ("pulse", "winmm")
+                else False
+            )
+            st.skipped_reason = "empty_audio"
+        return
+
+    t_gate0 = time.monotonic()
+    gate = process_wav(raw_wav, cfg.audio)
+    st.gate = gate
+    st.gate_ms = _elapsed_ms(t_gate0)
+    if not gate.passed:
+        if c_rsn := cancel_reason_fn():
+            st.skipped_reason = c_rsn
+        else:
+            st.switched_fallback = bool(
+                gate.all_zero
+                and gate.reason == "silence"
+                and audio_source == "pulse"
+                and platform
+                and platform.switch_to_fallback_audio()
+            )
+            st.skipped_reason = gate.reason
+        return
+
+    if c_rsn := cancel_reason_fn():
+        st.skipped_reason = c_rsn
+        return
+
+    if cfg.audio.save_recordings and audio_source not in ("retry", "selftest_wav") and archive_sink is not None:
+        try:
+            arch_bytes = (
+                bytes(raw_wav)
+                if isinstance(raw_wav, (bytes, bytearray, memoryview))
+                else (Path(raw_wav).read_bytes() or gate.wav_bytes)
+            )
+            if (
+                arch_th := spawn_recording_archive(
+                    arch_bytes,
+                    resolve_saved_recordings_dir(env),
+                    max_count=cfg.audio.save_recordings_max_count,
+                )
+            ) is not None:
+                archive_sink(arch_th)
+        except Exception:
+            pass
+
+    t_sync0 = time.monotonic()
+    win = origin_window or (platform.get_foreground_window() if platform else ForegroundWindow())
+    st.win = win
+    should_sync, eff_mode = _resolve_pipeline_window_routing(
+        win,
+        platform=platform,
+        origin_window=origin_window,
+        window_title_override=window_title_override,
+        audio_source=audio_source,
+        explicit_mode=explicit_mode,
+    )
+    st.eff_mode = eff_mode
+    if should_sync:
+        st.snap = (
+            tracker.sync_session(
+                window_title=win.title,
+                window_tty=win.tty,
+                window_cwd=win.cwd,
+                window_pid=win.pid,
+            )
+            if window_title_override is None
+            else tracker.sync_session(window_title=window_title_override)
+        )
+    asr_ctx = tracker.build_asr_context(st.snap, mode=eff_mode)
+    st.asr_ctx_dialog = asr_ctx.dialog_text
+    if _is_single_hop_asr_provider(eff_asr):
+        asr_ctx = attach_single_hop_context(
+            cfg,
+            asr_ctx,
+            tracker=tracker if st.snap is not None else None,
+            session_key=st.snap.session_key if st.snap else "",
+            mode=eff_mode,
+        )
+    st.sync_ms = _elapsed_ms(t_sync0)
+
+    if (
+        not (cancel_check is not None and cancel_check())
+        and _may_run_stage2_refiner(cfg, eff_refiner, eff_asr)
+        and (prep_fn := getattr(eff_refiner, "prepare_session", None)) is not None
+    ):
+        t_prep0 = time.monotonic()
+        try:
+            prep_fn(st.snap.session_key if st.snap else "")
+        except Exception:
+            pass
+        st.prep_ms = _elapsed_ms(t_prep0)
+
+    try:
+        asr_res, chunk_count, chunk_secs = _transcribe_wav_chunks(
+            gate.wav_bytes,
+            eff_asr=eff_asr,
+            asr_ctx=asr_ctx,
+            floor_dbfs=cfg.audio.floor_dbfs,
+            max_chunk_sec=max_chunk_sec,
+            seq_id=seq_id,
+            is_current_seq=is_current_seq,
+            is_cancelled=is_cancelled,
+            cancel_token=cancel_token,
+        )
+    except Exception as asr_exc:
+        if c_rsn := cancel_reason_fn():
+            if c_rsn in ("cancelled", "shutdown") or (
+                isinstance(asr_exc, AsrError) and "cancelled" in str(asr_exc).lower()
+            ):
+                st.skipped_reason = c_rsn
+                return
+        raise
+    st.asr_res = asr_res
+    st.asr_chunks = chunk_count
+    st.asr_chunk_secs = chunk_secs
+    if not asr_res.text.strip():
+        st.skipped_reason = cancel_reason_fn() or "empty_asr"
+    elif c_rsn := cancel_reason_fn():
+        st.skipped_reason = c_rsn
+
+
 def run_pipeline_once(
     raw_wav: bytes | str | Path, *, cfg: Config, creds: ProviderCredentials | None = None,
     tracker: SessionTracker | None = None, asr_provider: BaseAsrProvider | None = None,
@@ -675,6 +934,7 @@ def run_pipeline_once(
     audio_source: str = "file", seq_id: int = 1, dry_run: bool = False,
     is_current_seq: Callable[[int], bool] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    cancel_token: CancelToken | None = None,
     deliver_fn: Callable[[str, ForegroundWindow], PasteOutcome] | None = None,
     on_stage: Callable[[str], None] | None = None,
     runtime_dir: Path | None = None,
@@ -682,184 +942,171 @@ def run_pipeline_once(
     env: Mapping[str, str] | None = None,
     archive_sink: Callable[[threading.Thread], None] | None = None,
     mode: str = "auto",
+    queue_wait_ms: int = 0,
 ) -> PipelineResult:
     eff_env = os.environ if env is None else env
     eff_creds = creds or resolve_credentials(cfg, eff_env)
     eff_tracker = tracker or SessionTracker(env=eff_env)
     eff_asr = asr_provider or create_asr_provider(cfg, eff_creds, env=eff_env)
     owns_refiner = refiner is None
-    eff_refiner = refiner or create_refiner(
-        cfg, eff_creds, env=eff_env, runtime_dir=runtime_dir
-    )
+    eff_refiner = refiner or create_refiner(cfg, eff_creds, env=eff_env, runtime_dir=runtime_dir)
     can_save_failed = runtime_dir is not None and audio_source not in ("file", "selftest_wav", "retry")
     local_archive_threads: list[threading.Thread] = []
+    stashed_once = False
+    stashed_path = ""
+    cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled, cancel_token)
+    st = _Stage1State(t_total0=time.monotonic(), queue_wait_ms=queue_wait_ms, win=origin_window or ForegroundWindow())
 
-    def _stash_failed(gate_res: AudioGateResult, snap_res: SessionSnapshot | None, win_res: ForegroundWindow) -> str:
-        if not can_save_failed or runtime_dir is None or not gate_res.wav_bytes:
+    def _cancel_reason() -> str:
+        if cancel_token is not None and cancel_token.is_cancelled():
+            return cancel_token.reason or "cancelled"
+        if cancel_check is not None and cancel_check():
+            return "superseded"
+        return ""
+
+    def _stash_failed() -> str:
+        nonlocal stashed_once, stashed_path
+        if stashed_once:
+            return stashed_path
+        stashed_once = True
+        if not can_save_failed or runtime_dir is None or st.gate is None or not st.gate.passed or not st.gate.wav_bytes:
             return ""
         saved = save_failed_audio(
-            gate_res.wav_bytes,
+            st.gate.wav_bytes,
             runtime_dir,
-            duration_sec=gate_res.duration_sec,
-            label=_derive_failed_label(snap_res, win_res),
+            duration_sec=st.gate.duration_sec,
+            label=_derive_failed_label(st.snap, st.win),
         )
-        return str(saved) if saved is not None else ""
+        stashed_path = str(saved) if saved is not None else ""
+        return stashed_path
 
-    t_total0 = time.monotonic()
-    try:
-        if isinstance(raw_wav, (bytes, bytearray)) and len(raw_wav) == 0:
-            sw = bool(platform and platform.switch_to_fallback_audio()) if audio_source in ("pulse", "winmm") else False
-            return PipelineResult(False, seq_id, skipped_reason="empty_audio", audio_source=audio_source, switched_fallback=sw, total_ms=_elapsed_ms(t_total0))
-        t_gate0 = time.monotonic()
-        gate = process_wav(raw_wav, cfg.audio)
-        gate_ms = _elapsed_ms(t_gate0)
-        if not gate.passed:
-            sw = bool(gate.all_zero and gate.reason == "silence" and audio_source == "pulse" and platform and platform.switch_to_fallback_audio())
-            return PipelineResult(False, seq_id, skipped_reason=gate.reason, audio_source=audio_source, switched_fallback=sw, gate=gate, gate_ms=gate_ms, total_ms=_elapsed_ms(t_total0))
-        if cfg.audio.save_recordings and audio_source not in ("retry", "selftest_wav"):
-            try:
-                if isinstance(raw_wav, (bytes, bytearray, memoryview)):
-                    arch_bytes = bytes(raw_wav)
-                else:
-                    arch_bytes = Path(raw_wav).read_bytes() or gate.wav_bytes
-                arch_th = spawn_recording_archive(
-                    arch_bytes,
-                    resolve_saved_recordings_dir(eff_env),
-                    max_count=cfg.audio.save_recordings_max_count,
-                )
-                if arch_th is not None:
-                    if archive_sink is not None:
-                        archive_sink(arch_th)
-                    else:
-                        local_archive_threads.append(arch_th)
-            except Exception:
-                pass
-        t_sync0 = time.monotonic()
-        win = origin_window or (platform.get_foreground_window() if platform else ForegroundWindow())
-        should_sync, eff_mode = _resolve_pipeline_window_routing(
-            win,
-            platform=platform,
-            origin_window=origin_window,
-            window_title_override=window_title_override,
-            audio_source=audio_source,
-            explicit_mode=mode,
+    def _stash_for_cancel(reason: str) -> str:
+        if reason == "shutdown" or st.gate is None or not st.gate.passed:
+            return ""
+        if reason == "cancelled" or st.gate.duration_sec >= 15.0:
+            return _stash_failed()
+        return ""
+
+    def _cancel_res(
+        reason: str,
+        *,
+        draft: str = "",
+        refined: RefinerResult | None = None,
+        deliver_ms: int = 0,
+    ) -> PipelineResult:
+        out_txt = "" if reason in ("cancelled", "shutdown") else draft
+        return _make_pipeline_result(
+            seq_id,
+            audio_source,
+            st,
+            final_text=out_txt,
+            skipped_reason=reason,
+            refined=refined,
+            deliver_ms=deliver_ms,
+            saved_audio=_stash_for_cancel(reason),
         )
-        snap: SessionSnapshot | None = None
+
+    eff_sink = archive_sink if archive_sink is not None else local_archive_threads.append
+    try:
         try:
-            if should_sync:
-                snap = (
-                    eff_tracker.sync_session(
-                        window_title=win.title,
-                        window_tty=win.tty,
-                        window_cwd=win.cwd,
-                        window_pid=win.pid,
-                    )
-                    if window_title_override is None
-                    else eff_tracker.sync_session(window_title=window_title_override)
+            _execute_stage1(
+                st,
+                raw_wav,
+                cfg=cfg,
+                env=eff_env,
+                tracker=eff_tracker,
+                eff_asr=eff_asr,
+                eff_refiner=eff_refiner,
+                platform=platform,
+                origin_window=origin_window,
+                window_title_override=window_title_override,
+                audio_source=audio_source,
+                explicit_mode=mode,
+                seq_id=seq_id,
+                max_chunk_sec=max_chunk_sec,
+                is_current_seq=is_current_seq,
+                is_cancelled=is_cancelled,
+                cancel_token=cancel_token,
+                cancel_check=cancel_check,
+                cancel_reason_fn=_cancel_reason,
+                archive_sink=eff_sink,
+            )
+            if st.skipped_reason:
+                sr = st.skipped_reason
+                if sr in ("cancelled", "shutdown", "superseded"):
+                    return _cancel_res(sr, draft=(st.asr_res.text.strip() if st.asr_res else ""))
+                return _make_pipeline_result(
+                    seq_id,
+                    audio_source,
+                    st,
+                    skipped_reason=sr,
+                    saved_audio=(_stash_failed() if sr == "empty_asr" else ""),
                 )
-            asr_ctx = eff_tracker.build_asr_context(snap, mode=eff_mode)
-            if _is_single_hop_asr_provider(eff_asr):
-                asr_ctx = attach_single_hop_context(
-                    cfg,
-                    asr_ctx,
-                    tracker=eff_tracker if snap is not None else None,
-                    session_key=snap.session_key if snap else "",
-                    mode=eff_mode,
-                )
-            sync_ms = _elapsed_ms(t_sync0)
-            cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled)
-            prep_ms = 0
-            if (
-                not (cancel_check is not None and cancel_check())
-                and _may_run_stage2_refiner(cfg, eff_refiner, eff_asr)
-                and (prep_fn := getattr(eff_refiner, "prepare_session", None)) is not None
-            ):
-                t_prep0 = time.monotonic()
-                try:
-                    prep_fn(snap.session_key if snap else "")
-                except Exception:
-                    pass
-                prep_ms = _elapsed_ms(t_prep0)
-            try:
-                asr_res, chunk_count, chunk_secs = _transcribe_wav_chunks(
-                    gate.wav_bytes,
-                    eff_asr=eff_asr,
-                    asr_ctx=asr_ctx,
-                    floor_dbfs=cfg.audio.floor_dbfs,
-                    max_chunk_sec=max_chunk_sec,
-                    seq_id=seq_id,
-                    is_current_seq=is_current_seq,
-                    is_cancelled=is_cancelled,
-                )
-            except AsrError as asr_exc:
-                if cancel_check is not None and cancel_check() and "cancelled" in str(asr_exc).lower():
-                    saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                    return PipelineResult(
-                        False,
-                        seq_id,
-                        skipped_reason="superseded",
-                        audio_source=audio_source,
-                        gate=gate,
-                        session=snap,
-                        saved_audio=saved_p,
-                        gate_ms=gate_ms,
-                        sync_ms=sync_ms,
-                        refine_init_ms=prep_ms,
-                        total_ms=_elapsed_ms(t_total0),
-                        mode=eff_mode,
-                    )
-                raise
-            if not asr_res.text.strip():
-                if cancel_check is not None and cancel_check():
-                    saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                    return PipelineResult(False, seq_id, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0), mode=eff_mode)
-                saved_p = _stash_failed(gate, snap, win)
-                return PipelineResult(False, seq_id, skipped_reason="empty_asr", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0), mode=eff_mode)
-            if cancel_check is not None and cancel_check():
-                saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                return PipelineResult(False, seq_id, final_text=asr_res.text.strip(), skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=prep_ms, total_ms=_elapsed_ms(t_total0), mode=eff_mode)
-            if _will_run_stage2_refiner(cfg, eff_refiner, asr_res) and on_stage is not None:
+
+            assert st.asr_res is not None
+            if _will_run_stage2_refiner(cfg, eff_refiner, st.asr_res) and on_stage is not None:
                 on_stage("refining")
             ref_res = _call_refiner_refine(
                 eff_refiner,
-                asr_res,
-                session_key=snap.session_key if snap else "",
+                st.asr_res,
+                session_key=st.snap.session_key if st.snap else "",
                 tracker=eff_tracker,
-                fallback_context=asr_ctx.dialog_text,
+                fallback_context=st.asr_ctx_dialog,
                 is_cancelled=cancel_check,
-                mode=eff_mode,
+                cancel_token=cancel_token,
+                mode=st.eff_mode,
             )
-            refine_init_ms = prep_ms + (ref_res.init_ms if ref_res else 0)
-            ctx_chars = ref_res.context_chars if ref_res else 0
-            ctx_chunks = ref_res.context_chunks if ref_res else 0
-            final_text = ref_res.text.strip() or asr_res.text.strip()
-            if cancel_check is not None and cancel_check():
-                saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks, mode=eff_mode)
+            cand_text = (ref_res.text.strip() if ref_res else "") or st.asr_res.text.strip()
+            if (c_rsn := _cancel_reason()) or (ref_res and ref_res.used_fallback in ("cancelled", "superseded", "shutdown")):
+                return _cancel_res(
+                    c_rsn or (ref_res.used_fallback if ref_res else "cancelled"),
+                    draft=cand_text,
+                    refined=ref_res,
+                )
+
             deliver_ms = 0
             if dry_run or (platform is None and deliver_fn is None):
+                if cancel_token is not None and not cancel_token.try_commit():
+                    return _cancel_res(cancel_token.reason or "cancelled", draft=cand_text, refined=ref_res)
                 paste_out = None
             elif deliver_fn is not None:
+                if cancel_token is not None and not cancel_token.try_commit():
+                    return _cancel_res(cancel_token.reason or "cancelled", draft=cand_text, refined=ref_res)
                 t_deliv0 = time.monotonic()
-                paste_out = deliver_fn(final_text, win)
+                paste_out = deliver_fn(cand_text, st.win)
                 deliver_ms = _elapsed_ms(t_deliv0)
             else:
                 t_deliv0 = time.monotonic()
                 paste_out = _deliver_with_origin(
                     platform,
-                    final_text,
+                    cand_text,
                     seq_id=seq_id,
-                    origin_window=win,
+                    origin_window=st.win,
                     is_cancelled=cancel_check,
+                    before_commit=(cancel_token.try_commit if cancel_token is not None else None),
                 )
                 deliver_ms = _elapsed_ms(t_deliv0)
-            if paste_out is not None and paste_out.reason == "cancelled" and cancel_check is not None and cancel_check():
-                saved_p = _stash_failed(gate, snap, win) if gate.duration_sec >= 15.0 else ""
-                return PipelineResult(False, seq_id, final_text=final_text, skipped_reason="superseded", audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, deliver_ms=deliver_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks, mode=eff_mode)
-            saved_p = _stash_failed(gate, snap, win) if (paste_out is not None and not paste_out.pasted and not paste_out.clipboard) else ""
-            return PipelineResult(True, seq_id, final_text=final_text, audio_source=audio_source, gate=gate, session=snap, asr=asr_res, refined=ref_res, paste=paste_out, asr_chunks=chunk_count, asr_chunk_secs=chunk_secs, saved_audio=saved_p, gate_ms=gate_ms, sync_ms=sync_ms, refine_init_ms=refine_init_ms, deliver_ms=deliver_ms, total_ms=_elapsed_ms(t_total0), ctx_chars=ctx_chars, ctx_chunks=ctx_chunks, mode=eff_mode)
+
+            if paste_out is not None and paste_out.reason == "cancelled":
+                return _cancel_res(_cancel_reason() or "cancelled", draft=cand_text, refined=ref_res, deliver_ms=deliver_ms)
+            if cancel_token is not None:
+                cancel_token.try_commit()
+            saved_p = _stash_failed() if (paste_out is not None and not paste_out.pasted and not paste_out.clipboard) else ""
+            return _make_pipeline_result(
+                seq_id,
+                audio_source,
+                st,
+                ok=True,
+                final_text=cand_text,
+                refined=ref_res,
+                paste=paste_out,
+                deliver_ms=deliver_ms,
+                saved_audio=saved_p,
+            )
         except Exception as exc:
-            if saved_p := _stash_failed(gate, snap, win):
+            if (c_rsn := _cancel_reason()) in ("cancelled", "shutdown"):
+                return _cancel_res(c_rsn)
+            if saved_p := _stash_failed():
                 try:
                     setattr(exc, "_saved_audio_path", saved_p)
                 except Exception:
@@ -885,7 +1132,7 @@ def send_control_command(runtime_dir: Path, payload: Mapping[str, Any], timeout_
     return json.loads(buf.decode("utf-8", errors="replace").strip() or "{}")
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True)
 class _QueuedUtterance:
     seq_id: int
     raw_wav: bytes
@@ -897,10 +1144,26 @@ class _QueuedUtterance:
     recovery_count: int = 0
     recovery_gap_ms: int = 0
     audio_error: str = ""
+    enqueued_ts: float = field(default_factory=time.monotonic)
+    cancel_token: CancelToken = field(default_factory=CancelToken)
+    stash_lock: threading.Lock = field(default_factory=threading.Lock)
+    stashed_done: bool = False
+    saved_audio: str = ""
+
+
+@dataclass(slots=True, eq=False)
+class _CommitSlot:
+    task: _QueuedUtterance
+    st: _Stage1State
+    stage: str = "recognizing"
+    done_evt: threading.Event = field(default_factory=threading.Event)
+    stage2_ref_res: RefinerResult | None = None
+    exc: Exception | None = None
 
 
 class VoiceInputDaemon:
     MAX_PENDING_UTTERANCES: int = MAX_PENDING_UTTERANCES
+    MAX_STAGE2_CONCURRENCY: int = MAX_STAGE2_CONCURRENCY
 
     def __init__(
         self,
@@ -925,16 +1188,24 @@ class VoiceInputDaemon:
         self.refiner = refiner or create_refiner(cfg, self.creds, env=self.env, runtime_dir=self.runtime_dir)
         self.clock_fn, self.sleep_fn = clock_fn, sleep_fn
         self._paste_settle_sec = max(0.0, float(paste_settle_sec))
-        self._trigger_lock, self._lock, self._stop_evt = threading.Lock(), threading.Lock(), threading.Event()
+        # Strict global lock hierarchy: _trigger_lock (T) -> _hud_lock (H) -> _lock / _queue_cv (L) -> Leaf locks
+        self._trigger_lock = threading.Lock()
+        self._hud_lock = threading.Lock()
+        self._lock = threading.Lock()
+        self._stop_evt = threading.Event()
         self._queue_cv = threading.Condition(self._lock)
         self.state, self.seq_id, self._last_trigger_ts = "idle", 0, -1e9
         self._recording_active: bool = False
         self._recording_seq_id: int = -1
         self._stopping_capture: bool = False
         self._utterance_queue: deque[_QueuedUtterance] = deque()
+        self._commit_queue: deque[_CommitSlot] = deque()
         self._active_task: _QueuedUtterance | None = None
-        self._active_bg_stage: str = ""
         self._worker_thread: threading.Thread | None = None
+        self._commit_thread: threading.Thread | None = None
+        self._stage2_active_count: int = 0
+        self._stage2_slots: set[_CommitSlot] = set()
+        self._stage2_threads: set[threading.Thread] = set()
         self._batch_unpasted_clips: list[str] = []
         self._clipboard_busy_until: float = -1e9
         self._main_hud_state: str = ""
@@ -974,19 +1245,38 @@ class VoiceInputDaemon:
         with self._lock:
             return not self._stop_evt.is_set() and self.seq_id == seq_id
 
+    def _iter_pipeline_tasks_locked(self) -> Iterator[tuple[_QueuedUtterance, str]]:
+        for s in self._commit_queue:
+            yield s.task, (s.stage or "refining")
+        if self._active_task is not None:
+            yield self._active_task, "recognizing"
+        for t in self._utterance_queue:
+            yield t, "recognizing"
+
     def _inflight_or_queued_count_locked(self) -> int:
-        return (1 if self._active_task is not None else 0) + len(self._utterance_queue)
+        return sum(1 for t, _ in self._iter_pipeline_tasks_locked() if not t.cancel_token.is_cancelled())
+
+    def _raw_pending_count_locked(self) -> int:
+        return len(self._commit_queue) + (1 if self._active_task is not None else 0) + len(self._utterance_queue)
 
     def _is_seq_inflight_locked(self, seq_id: int) -> bool:
-        if self._active_task is not None and self._active_task.seq_id == seq_id:
-            return True
-        return any(t.seq_id == seq_id for t in self._utterance_queue)
+        return any(t.seq_id == seq_id and not t.cancel_token.is_cancelled() for t, _ in self._iter_pipeline_tasks_locked())
 
-    def _derive_bg_stage_locked(self) -> str:
-        if self._active_task is not None:
-            return self._active_bg_stage or "recognizing"
-        if self._utterance_queue:
-            return "recognizing"
+    def _any_seq_present_locked(self, seq_ids: set[int]) -> bool:
+        return any(t.seq_id in seq_ids for t, _ in self._iter_pipeline_tasks_locked())
+
+    def _has_uncancelled_ahead_locked(self, target_seq_ids: set[int]) -> bool:
+        for t, _ in self._iter_pipeline_tasks_locked():
+            if t.seq_id in target_seq_ids:
+                return False
+            if not t.cancel_token.is_cancelled():
+                return True
+        return False
+
+    def _derive_bg_stage_locked(self, *, visible_only: bool = False) -> str:
+        for t, stg in self._iter_pipeline_tasks_locked():
+            if not t.cancel_token.is_cancelled() and (not visible_only or not t.silent_hud):
+                return stg
         return ""
 
     def _recompute_state_locked(self) -> str:
@@ -999,7 +1289,7 @@ class VoiceInputDaemon:
         else:
             st = "idle"
         self.state = st
-        if st == "idle":
+        if st == "idle" and not self._commit_queue and self._active_task is None and not self._utterance_queue:
             self._batch_unpasted_clips.clear()
         return st
 
@@ -1017,7 +1307,20 @@ class VoiceInputDaemon:
             )
             self._worker_thread = w
             w.start()
-        self._queue_cv.notify()
+        self._queue_cv.notify_all()
+
+    def _enqueue_commit_slot_locked(self, slot: _CommitSlot) -> None:
+        self._commit_queue.append(slot)
+        if self._commit_thread is None or not self._commit_thread.is_alive():
+            c = threading.Thread(
+                target=self._commit_worker_loop,
+                name="avi-commit-worker",
+                daemon=True,
+            )
+            self._commit_thread = c
+            c.start()
+        self._recompute_state_locked()
+        self._queue_cv.notify_all()
 
     def _cancel_max_duration_timer(self) -> None:
         with self._lock:
@@ -1080,7 +1383,7 @@ class VoiceInputDaemon:
             self._main_hud_state = ""
             self._main_hud_visible = False
 
-    def _hud(
+    def _invoke_platform_hud_unlocked(
         self,
         state: str,
         *,
@@ -1089,8 +1392,6 @@ class VoiceInputDaemon:
         clear_main: bool | None = None,
         clear_toast: bool | None = None,
     ) -> None:
-        with self._lock:
-            self._update_main_hud_visibility_locked(state, layer=layer, clear_main=clear_main)
         if (fn := getattr(self.platform, "hud", None)) is None:
             return
         kw: dict[str, Any] = {}
@@ -1121,6 +1422,73 @@ class VoiceInputDaemon:
                 pass
         except Exception:
             pass
+
+    def _hud(
+        self,
+        state: str,
+        *,
+        duration_ms: int = 0,
+        layer: str | None = None,
+        clear_main: bool | None = None,
+        clear_toast: bool | None = None,
+    ) -> None:
+        with self._hud_lock:
+            with self._lock:
+                self._update_main_hud_visibility_locked(state, layer=layer, clear_main=clear_main)
+            self._invoke_platform_hud_unlocked(
+                state,
+                duration_ms=duration_ms,
+                layer=layer,
+                clear_main=clear_main,
+                clear_toast=clear_toast,
+            )
+
+    def _maybe_emit_bg_main_hud(self, desired_stage: str) -> None:
+        if self._stop_evt.is_set():
+            return
+        with self._hud_lock:
+            emit = False
+            with self._lock:
+                if (
+                    not self._stop_evt.is_set()
+                    and not self._recording_active
+                    and not self._stopping_capture
+                ):
+                    cur_st = self._recompute_state_locked()
+                    vis_st = self._derive_bg_stage_locked(visible_only=True)
+                    if cur_st == desired_stage and vis_st == desired_stage and self._main_hud_state != desired_stage:
+                        self._update_main_hud_visibility_locked(desired_stage)
+                        emit = True
+            if emit:
+                self._invoke_platform_hud_unlocked(desired_stage)
+
+    def _emit_recording_cancel_hud(self, *, show_cancelled_toast: bool) -> str:
+        with self._hud_lock:
+            calls: list[tuple[str, str | None, bool | None, bool | None]] = []
+            with self._lock:
+                cur_state = self._recompute_state_locked()
+                vis_bg = self._derive_bg_stage_locked(visible_only=True)
+                rec_busy = self._recording_active or self._stopping_capture
+                if not self._stop_evt.is_set() and not rec_busy:
+                    if show_cancelled_toast:
+                        if vis_bg and cur_state == vis_bg:
+                            if self._main_hud_state != vis_bg:
+                                calls.append((vis_bg, None, None, True))
+                            calls.append(("cancelled", None, False, None))
+                        else:
+                            calls.append(("cancelled", None, True, None))
+                    else:
+                        calls.append(((vis_bg if (vis_bg and cur_state == vis_bg) else "hide"), None, None, True))
+                    for st_n, lyr_n, clr_m_n, _ in calls:
+                        self._update_main_hud_visibility_locked(st_n, layer=lyr_n, clear_main=clr_m_n)
+            for st_n, lyr_n, clr_m_n, clr_t_n in calls:
+                self._invoke_platform_hud_unlocked(
+                    st_n,
+                    layer=lyr_n,
+                    clear_main=clr_m_n,
+                    clear_toast=clr_t_n,
+                )
+            return cur_state
 
     def _on_recorder_recovered(self, gap_ms: int = 0, *, seq_id: int | None = None) -> None:
         norm_gap = max(0, int(gap_ms or 0))
@@ -1255,6 +1623,7 @@ class VoiceInputDaemon:
                 recovery_count=rec_cnt,
                 recovery_gap_ms=rec_gap,
                 audio_error=snap_audio_err,
+                enqueued_ts=self.clock_fn(),
             )
             with self._queue_cv:
                 self._stopping_capture = False
@@ -1268,23 +1637,6 @@ class VoiceInputDaemon:
                 self._hud(main_stage)
                 self._hud("mic_disconnected", duration_ms=3200, clear_main=False)
                 self.platform.beep("error")
-
-    def _on_pipeline_stage(self, seq_id: int, stage: str, silent_hud: bool = False) -> None:
-        if self._stop_evt.is_set():
-            return
-        with self._trigger_lock:
-            emit = False
-            with self._lock:
-                if self._stop_evt.is_set() or self._active_task is None or self._active_task.seq_id != seq_id:
-                    return
-                self._active_bg_stage = stage
-                if not self._recording_active and not self._stopping_capture:
-                    new_st = self._recompute_state_locked()
-                    emit = not silent_hud and new_st == stage and self._main_hud_state != stage
-                    if emit:
-                        self._update_main_hud_visibility_locked(stage)
-            if emit:
-                self._hud(stage)
 
     def _build_summary(
         self,
@@ -1316,13 +1668,18 @@ class VoiceInputDaemon:
             win.process, win.bundle_id
         )
 
-    def _start_gate_reason(self, win: ForegroundWindow) -> str | None:
+    def _should_yield_hotkey(self, win: ForegroundWindow) -> str | None:
         hk = self.cfg.hotkey
         if hk.ignore_apps and match_app_patterns(win, hk.ignore_apps):
             return "ignored_app"
         if hk.yield_remote_desktop and is_remote_client_window(win):
             return "remote_client"
-        scope = (hk.scope or "all").strip().lower()
+        return None
+
+    def _start_gate_reason(self, win: ForegroundWindow) -> str | None:
+        if (yielded := self._should_yield_hotkey(win)) is not None:
+            return yielded
+        scope = (self.cfg.hotkey.scope or "all").strip().lower()
         if scope == "all":
             return None
         cat = classify_window_category(win, is_terminal=self._is_terminal_window)
@@ -1396,7 +1753,10 @@ class VoiceInputDaemon:
                     resume_state = self._recompute_state_locked()
                     mode = "cancel"
                 elif action in ("toggle", "ptt_start") and not self._recording_active:
-                    if self._inflight_or_queued_count_locked() >= MAX_PENDING_UTTERANCES:
+                    if (
+                        self._inflight_or_queued_count_locked() >= MAX_PENDING_UTTERANCES
+                        or self._raw_pending_count_locked() >= MAX_PENDING_UTTERANCES * 2
+                    ):
                         cur_state, cur_seq = self.state, self.seq_id
                         queue_full_toast = not eff_silent
                         mode = "queue_full"
@@ -1441,10 +1801,7 @@ class VoiceInputDaemon:
             if mode == "cancel":
                 self._cancel_max_duration_timer()
                 if not eff_silent:
-                    if resume_state == "idle":
-                        self._hud("hide", clear_toast=True)
-                    else:
-                        self._hud(resume_state, clear_toast=True)
+                    resume_state = self._emit_recording_cancel_hud(show_cancelled_toast=False)
                 self.platform.cancel_recording()
                 if not eff_silent:
                     self.platform.beep("error")
@@ -1592,6 +1949,7 @@ class VoiceInputDaemon:
                 recovery_count=rec_cnt,
                 recovery_gap_ms=rec_gap,
                 audio_error=snap_audio_err,
+                enqueued_ts=self.clock_fn(),
             )
             with self._queue_cv:
                 self._stopping_capture = False
@@ -1599,12 +1957,138 @@ class VoiceInputDaemon:
                 out_state = self._recompute_state_locked()
             return {"ok": True, "state": out_state, "seq_id": cur_seq}
 
-    def _wait_clipboard_settle(self) -> bool:
+    def handle_cancel(
+        self,
+        *,
+        seq_id: int | None = None,
+        silent_hud: bool = False,
+        only_inflight: bool = False,
+    ) -> dict[str, Any]:
+        with self._trigger_lock:
+            cancel_rec_mode = False
+            cancelled_rec_seq = -1
+            eff_rec_silent = bool(silent_hud)
+            resume_state = "idle"
+            candidates: list[_QueuedUtterance] = []
+            with self._lock:
+                if self._stop_evt.is_set():
+                    return {"ok": False, "ignored": "stopping", "state": self.state, "seq_id": self.seq_id}
+                if only_inflight and (
+                    self._recording_active
+                    or self._stopping_capture
+                    or self._inflight_or_queued_count_locked() == 0
+                ):
+                    return {
+                        "ok": False,
+                        "ignored": "not_inflight",
+                        "cancelled_ids": [],
+                        "committed_ids": [],
+                        "state": self.state,
+                        "seq_id": self.seq_id,
+                    }
+                if self._recording_active and (seq_id is None or seq_id == self._recording_seq_id):
+                    cancel_rec_mode = True
+                    cancelled_rec_seq = self._recording_seq_id
+                    eff_rec_silent = bool(silent_hud or self._cur_silent_hud)
+                    self._recording_active = False
+                    self._recording_seq_id = -1
+                    self._cur_no_paste, self._cur_silent_hud = False, False
+                    self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
+                    self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
+                    self.seq_id += 1
+                    self._last_trigger_ts = self.clock_fn()
+                    resume_state = self._recompute_state_locked()
+                else:
+                    candidates = [
+                        t
+                        for t, _ in self._iter_pipeline_tasks_locked()
+                        if not t.cancel_token.is_cancelled() and (seq_id is None or t.seq_id == seq_id)
+                    ]
+                    if not candidates:
+                        return {
+                            "ok": seq_id is None,
+                            "ignored": "not_found" if seq_id is not None else "idle",
+                            "cancelled_ids": [],
+                            "committed_ids": [],
+                            "state": self.state,
+                            "seq_id": self.seq_id,
+                        }
+
+            if cancel_rec_mode:
+                self._cancel_max_duration_timer()
+                if not eff_rec_silent:
+                    resume_state = self._emit_recording_cancel_hud(show_cancelled_toast=True)
+                self.platform.cancel_recording()
+                if not eff_rec_silent:
+                    self.platform.beep("error")
+                return {
+                    "ok": True,
+                    "cancelled_recording": cancelled_rec_seq,
+                    "cancelled_ids": [cancelled_rec_seq],
+                    "committed_ids": [],
+                    "state": resume_state,
+                    "seq_id": self.seq_id,
+                }
+
+            tok_to_task = {t.cancel_token: t for t in candidates}
+            cancelled_toks, committed_toks = CancelToken.cancel_many(
+                [t.cancel_token for t in candidates], "cancelled"
+            )
+            cancelled_ids = [tok_to_task[tok].seq_id for tok in cancelled_toks]
+            committed_ids = [tok_to_task[tok].seq_id for tok in committed_toks]
+            any_visible_cancelled = any(not tok_to_task[tok].silent_hud for tok in cancelled_toks)
+            cancelled_set = set(cancelled_ids)
+
+            with self._queue_cv:
+                resume_state = self._recompute_state_locked()
+                self._queue_cv.notify_all()
+                if cancelled_set and not self._has_uncancelled_ahead_locked(cancelled_set):
+                    self._queue_cv.wait_for(
+                        lambda: self._stop_evt.is_set() or not self._any_seq_present_locked(cancelled_set),
+                        timeout=0.25,
+                    )
+                    resume_state = self._recompute_state_locked()
+                rec_now = self._recording_active or self._stopping_capture
+                cur_seq_now = self.seq_id
+
+            if not cancelled_ids:
+                return {
+                    "ok": False,
+                    "ignored": "already_committed",
+                    "cancelled_ids": [],
+                    "committed_ids": committed_ids,
+                    "state": resume_state,
+                    "seq_id": cur_seq_now,
+                }
+
+            if not silent_hud and any_visible_cancelled:
+                if not rec_now and resume_state == "idle":
+                    self._hud("cancelled", clear_main=True)
+                else:
+                    if not rec_now and resume_state in ("recognizing", "refining"):
+                        self._maybe_emit_bg_main_hud(resume_state)
+                    self._hud("cancelled", clear_main=False)
+
+            return {
+                "ok": True,
+                "cancelled_ids": cancelled_ids,
+                "committed_ids": committed_ids,
+                "state": resume_state,
+                "seq_id": cur_seq_now,
+            }
+
+    def _wait_clipboard_settle(self, cancel_token: CancelToken | None = None) -> bool:
         with self._lock:
             busy_until = self._clipboard_busy_until
         rem = busy_until - self.clock_fn()
         if rem > 0.0:
-            _sleep_cooperative(rem, sleep_fn=self.sleep_fn, is_cancelled=self._stop_evt.is_set)
+            _sleep_cooperative(
+                rem,
+                sleep_fn=self.sleep_fn,
+                is_cancelled=lambda: self._stop_evt.is_set()
+                or (cancel_token is not None and cancel_token.is_cancelled()),
+                cancel_token=cancel_token,
+            )
             return True
         return False
 
@@ -1626,8 +2110,9 @@ class VoiceInputDaemon:
             fallback_clipboard_text=fallback_txt,
             preserve_clipboard=preserve_clip,
             suppress_beep=lambda: self._is_recording_or_stopping() or task.silent_hud,
-            is_cancelled=self._stop_evt.is_set,
-            before_clipboard_write=self._wait_clipboard_settle,
+            is_cancelled=lambda: self._stop_evt.is_set() or task.cancel_token.is_cancelled(),
+            before_clipboard_write=lambda: self._wait_clipboard_settle(task.cancel_token),
+            before_commit=task.cancel_token.try_commit,
         )
         now_done = self.clock_fn()
         with self._lock:
@@ -1640,66 +2125,227 @@ class VoiceInputDaemon:
                 self._batch_unpasted_clips.append(final_text)
         return paste_out
 
+    def _stash_task_wav_once(
+        self,
+        task: _QueuedUtterance,
+        *,
+        gate: AudioGateResult | None,
+        snap: SessionSnapshot | None,
+        win: ForegroundWindow,
+        allow_during_shutdown: bool = False,
+    ) -> str:
+        with task.stash_lock:
+            if task.stashed_done:
+                return task.saved_audio
+            task.stashed_done = True
+            if (
+                (self._stop_evt.is_set() and not allow_during_shutdown)
+                or task.cancel_token.reason == "shutdown"
+                or task.audio_source in ("file", "selftest_wav", "retry")
+            ):
+                return ""
+            eff_gate = gate
+            if eff_gate is None and len(task.raw_wav) > 44:
+                try:
+                    eff_gate = process_wav(task.raw_wav, self.cfg.audio)
+                except Exception:
+                    eff_gate = None
+            if eff_gate is None or not eff_gate.passed or not eff_gate.wav_bytes:
+                return ""
+            saved = save_failed_audio(
+                eff_gate.wav_bytes,
+                self.runtime_dir,
+                duration_sec=eff_gate.duration_sec,
+                label=_derive_failed_label(snap, win),
+            )
+            task.saved_audio = str(saved) if saved is not None else ""
+            return task.saved_audio
+
     def _utterance_worker_loop(self) -> None:
         while True:
             with self._queue_cv:
-                while not self._stop_evt.is_set() and not self._utterance_queue:
+                while not self._stop_evt.is_set() and (
+                    not self._utterance_queue
+                    or (
+                        self._stage2_active_count >= self.MAX_STAGE2_CONCURRENCY
+                        and not self._utterance_queue[0].cancel_token.is_cancelled()
+                    )
+                ):
                     self._queue_cv.wait()
                 if self._stop_evt.is_set():
-                    self._utterance_queue.clear()
                     self._active_task = None
-                    self._active_bg_stage = ""
                     self._recompute_state_locked()
+                    self._queue_cv.notify_all()
                     return
                 task = self._utterance_queue.popleft()
                 self._active_task = task
-                self._active_bg_stage = "recognizing"
                 self._recompute_state_locked()
-            if not task.silent_hud and not self._stop_evt.is_set():
-                with self._trigger_lock:
-                    emit_recog = False
-                    with self._lock:
-                        if (
-                            not self._stop_evt.is_set()
-                            and self._active_task is task
-                            and not self._recording_active
-                            and not self._stopping_capture
-                            and self.state == "recognizing"
-                            and self._main_hud_state != "recognizing"
-                        ):
-                            emit_recog = True
-                            self._update_main_hud_visibility_locked("recognizing")
-                    if emit_recog:
-                        self._hud("recognizing")
-            self._execute_queued_utterance(task)
+            if not task.silent_hud and not self._stop_evt.is_set() and not task.cancel_token.is_cancelled():
+                self._maybe_emit_bg_main_hud("recognizing")
+            self._run_stage1_for_utterance(task)
 
-    def _execute_queued_utterance(self, task: _QueuedUtterance) -> None:
-        hud_st, hud_dur_ms, beep_k = "", 0, ""
+    def _push_completed_stage1_slot(self, slot: _CommitSlot) -> None:
+        slot.done_evt.set()
+        with self._queue_cv:
+            if self._active_task is slot.task:
+                self._active_task = None
+            if self._stop_evt.is_set():
+                self._recompute_state_locked()
+                self._queue_cv.notify_all()
+                return
+            self._enqueue_commit_slot_locked(slot)
+
+    def _run_stage1_for_utterance(self, task: _QueuedUtterance) -> None:
+        q_wait_ms = max(0, int(round((self.clock_fn() - task.enqueued_ts) * 1000)))
+        st = _Stage1State(t_total0=time.monotonic(), queue_wait_ms=q_wait_ms, win=task.origin_win)
+        slot = _CommitSlot(task=task, st=st)
+        cancel_fn = lambda: self._stop_evt.is_set() or task.cancel_token.is_cancelled()
+        reason_fn = lambda: (
+            "shutdown"
+            if self._stop_evt.is_set()
+            else ((task.cancel_token.reason or "cancelled") if task.cancel_token.is_cancelled() else "")
+        )
+
+        if self._stop_evt.is_set():
+            with self._queue_cv:
+                if self._active_task is task:
+                    self._active_task = None
+                self._recompute_state_locked()
+                self._queue_cv.notify_all()
+            return
+
         try:
-            res = run_pipeline_once(
+            _execute_stage1(
+                st,
                 task.raw_wav,
                 cfg=self.cfg,
-                creds=self.creds,
+                env=self.env,
                 tracker=self.tracker,
-                asr_provider=self.asr_provider,
-                refiner=self.refiner,
+                eff_asr=self.asr_provider,
+                eff_refiner=self.refiner,
                 platform=self.platform,
                 origin_window=task.origin_win,
+                window_title_override=None,
                 audio_source=task.audio_source,
+                explicit_mode="auto",
                 seq_id=task.seq_id,
-                dry_run=task.no_paste,
-                is_cancelled=self._stop_evt.is_set,
-                deliver_fn=(
-                    None
-                    if (task.no_paste or self.platform is None)
-                    else (lambda txt, w: self._deliver_for_utterance(task, txt, w))
-                ),
-                on_stage=lambda st: self._on_pipeline_stage(task.seq_id, st, task.silent_hud),
-                runtime_dir=self.runtime_dir,
-                env=self.env,
+                max_chunk_sec=None,
+                is_current_seq=None,
+                is_cancelled=cancel_fn,
+                cancel_token=task.cancel_token,
+                cancel_check=cancel_fn,
+                cancel_reason_fn=reason_fn,
                 archive_sink=self._register_archive_thread,
             )
-            summary = self._build_summary(
+            if st.skipped_reason:
+                self._push_completed_stage1_slot(slot)
+                return
+            assert st.asr_res is not None
+            if not _will_run_stage2_refiner(self.cfg, self.refiner, st.asr_res):
+                slot.stage2_ref_res = _call_refiner_refine(
+                    self.refiner,
+                    st.asr_res,
+                    session_key=st.snap.session_key if st.snap else "",
+                    tracker=self.tracker,
+                    fallback_context=st.asr_ctx_dialog,
+                    is_cancelled=cancel_fn,
+                    cancel_token=task.cancel_token,
+                    mode=st.eff_mode,
+                )
+                self._push_completed_stage1_slot(slot)
+                return
+        except Exception as exc:
+            if rsn := reason_fn():
+                st.skipped_reason = rsn
+            else:
+                slot.exc = exc
+            self._push_completed_stage1_slot(slot)
+            return
+
+        # Hand off to bounded concurrent Stage 2 (outside Stage 1 try/except so slot is never double-enqueued)
+        th_s2 = threading.Thread(
+            target=self._run_stage2_slot,
+            args=(slot,),
+            name=f"avi-stage2-{task.seq_id}",
+            daemon=True,
+        )
+        with self._queue_cv:
+            while (
+                not self._stop_evt.is_set()
+                and not task.cancel_token.is_cancelled()
+                and self._stage2_active_count >= self.MAX_STAGE2_CONCURRENCY
+            ):
+                self._queue_cv.wait(timeout=0.05)
+            if self._active_task is task:
+                self._active_task = None
+            if self._stop_evt.is_set():
+                self._recompute_state_locked()
+                self._queue_cv.notify_all()
+                return
+            if task.cancel_token.is_cancelled():
+                st.skipped_reason = reason_fn() or "cancelled"
+                slot.done_evt.set()
+                self._enqueue_commit_slot_locked(slot)
+                return
+            slot.stage = "refining"
+            task.cancel_token.bind_event(slot.done_evt)
+            self._stage2_active_count += 1
+            self._stage2_slots.add(slot)
+            self._stage2_threads = {t for t in self._stage2_threads if t.is_alive()}
+            self._stage2_threads.add(th_s2)
+            self._enqueue_commit_slot_locked(slot)
+
+        try:
+            th_s2.start()
+        except Exception as start_exc:
+            slot.exc = start_exc
+            task.cancel_token.unbind_event(slot.done_evt)
+            slot.done_evt.set()
+            with self._queue_cv:
+                self._stage2_active_count = max(0, self._stage2_active_count - 1)
+                self._stage2_slots.discard(slot)
+                self._stage2_threads.discard(th_s2)
+                self._queue_cv.notify_all()
+            return
+
+        if not task.silent_hud and not cancel_fn():
+            self._maybe_emit_bg_main_hud("refining")
+
+    def _run_stage2_slot(self, slot: _CommitSlot) -> None:
+        task = slot.task
+        st = slot.st
+        cancel_fn = lambda: self._stop_evt.is_set() or task.cancel_token.is_cancelled()
+        try:
+            assert st.asr_res is not None
+            slot.stage2_ref_res = _call_refiner_refine(
+                self.refiner,
+                st.asr_res,
+                session_key=st.snap.session_key if st.snap else "",
+                tracker=self.tracker,
+                fallback_context=st.asr_ctx_dialog,
+                is_cancelled=cancel_fn,
+                cancel_token=task.cancel_token,
+                mode=st.eff_mode,
+            )
+        except Exception as exc:
+            if not cancel_fn():
+                slot.exc = exc
+        finally:
+            task.cancel_token.unbind_event(slot.done_evt)
+            slot.done_evt.set()
+            with self._queue_cv:
+                self._stage2_active_count = max(0, self._stage2_active_count - 1)
+                self._stage2_slots.discard(slot)
+                self._stage2_threads.discard(threading.current_thread())
+                self._queue_cv.notify_all()
+
+    def _finalize_commit_slot(self, slot: _CommitSlot) -> tuple[dict[str, Any], str, int, str] | None:
+        task = slot.task
+        st = slot.st
+        hud_st, hud_dur_ms, beep_k = "", 0, ""
+
+        def _summarize(res: PipelineResult) -> dict[str, Any]:
+            return self._build_summary(
                 task.seq_id,
                 res,
                 dry_run=task.no_paste,
@@ -1708,108 +2354,276 @@ class VoiceInputDaemon:
                 recovery_gap_ms=task.recovery_gap_ms,
                 audio_error=task.audio_error,
             )
-            if res.ok:
-                if res.paste and not res.paste.pasted and not res.paste.clipboard:
-                    hud_st, beep_k = "error", "error"
-                elif res.paste and not res.paste.pasted and res.paste.clipboard:
-                    hud_st = "copied"
-                else:
-                    hud_st = "done"
-            elif res.skipped_reason in ("too_short", "silence", "empty_audio", "empty_asr"):
+
+        def _cancelled_outcome() -> tuple[dict[str, Any], str, int, str] | None:
+            if self._stop_evt.is_set() or task.cancel_token.reason == "shutdown" or st.skipped_reason == "shutdown":
+                return None
+            saved_p = self._stash_task_wav_once(task, gate=st.gate, snap=st.snap, win=st.win)
+            res_c = _make_pipeline_result(
+                task.seq_id,
+                task.audio_source,
+                st,
+                skipped_reason="cancelled",
+                saved_audio=saved_p,
+            )
+            return _summarize(res_c), "", 0, ""
+
+        if (
+            self._stop_evt.is_set()
+            or task.cancel_token.is_cancelled()
+            or st.skipped_reason in ("cancelled", "shutdown")
+        ):
+            return _cancelled_outcome()
+
+        if slot.exc is not None:
+            if not task.cancel_token.try_commit():
+                return _cancelled_outcome()
+            saved_p = self._stash_task_wav_once(task, gate=st.gate, snap=st.snap, win=st.win)
+            res_err = _make_pipeline_result(
+                task.seq_id,
+                task.audio_source,
+                st,
+                refined=slot.stage2_ref_res,
+                saved_audio=saved_p,
+                error=self._redact(slot.exc),
+            )
+            sum_err = _summarize(res_err)
+            if not sum_err["asr_provider"]:
+                sum_err["asr_provider"] = getattr(self.asr_provider, "provider_name", "")
+            if not sum_err["refiner_provider"]:
+                sum_err["refiner_provider"] = getattr(self.refiner, "provider_name", "")
+            return sum_err, "error", 0, ("" if task.recorder_lost else "error")
+
+        if st.skipped_reason:
+            if not task.cancel_token.try_commit():
+                return _cancelled_outcome()
+            sr = st.skipped_reason
+            saved_p = (
+                self._stash_task_wav_once(task, gate=st.gate, snap=st.snap, win=st.win)
+                if sr == "empty_asr"
+                else ""
+            )
+            res_skip = _make_pipeline_result(
+                task.seq_id,
+                task.audio_source,
+                st,
+                skipped_reason=sr,
+                saved_audio=saved_p,
+            )
+            sum_skip = _summarize(res_skip)
+            if sr in ("too_short", "silence", "empty_audio", "empty_asr"):
                 if task.recorder_lost:
                     hud_st, hud_dur_ms, beep_k = "mic_disconnected", 2200, ""
-                    summary["skipped_reason"] = "mic_disconnected"
+                    sum_skip["skipped_reason"] = "mic_disconnected"
                 else:
                     hud_st, beep_k = "empty", "error"
-            elif res.skipped_reason != "superseded":
+            elif sr != "superseded":
                 hud_st, beep_k = "error", "error"
-        except Exception as exc:
-            hud_st, beep_k = "error", "error"
-            summary = {
-                "seq_id": task.seq_id,
-                "ok": False,
-                "audio_source": task.audio_source,
-                "asr_provider": getattr(self.asr_provider, "provider_name", ""),
-                "refiner_provider": getattr(self.refiner, "provider_name", ""),
-                "error": self._redact(exc),
-            }
-            if task.recorder_lost:
-                summary["capture_interrupted"] = True
-            if task.recovery_count > 0:
-                summary["recovery_count"] = task.recovery_count
-                summary["recovery_gap_ms"] = task.recovery_gap_ms
-            if task.audio_error:
-                summary["audio_error"] = self._redact_str(task.audio_error)
-            if saved_p := str(getattr(exc, "_saved_audio_path", "") or ""):
-                summary["saved_audio"] = saved_p
+            if task.recorder_lost and beep_k == "error":
+                beep_k = ""
+            return sum_skip, hud_st, hud_dur_ms, beep_k
 
-        if task.recorder_lost and beep_k == "error":
-            beep_k = ""
+        ref_res = slot.stage2_ref_res
+        if (
+            self._stop_evt.is_set()
+            or task.cancel_token.is_cancelled()
+            or (ref_res is not None and ref_res.used_fallback in ("cancelled", "shutdown"))
+        ):
+            return _cancelled_outcome()
 
-        if self._stop_evt.is_set():
-            with self._lock:
-                if self._active_task is task:
-                    self._active_task = None
-                    self._active_bg_stage = ""
-                self._recompute_state_locked()
-            return
+        assert st.asr_res is not None
+        final_text = (ref_res.text.strip() if ref_res else "") or st.asr_res.text.strip()
 
-        summary.setdefault("ts", round(time.time(), 6))
-        self._append_telemetry(summary)
+        deliver_ms = 0
+        paste_out: PasteOutcome | None = None
+        if task.no_paste or self.platform is None:
+            if not task.cancel_token.try_commit():
+                return _cancelled_outcome()
+        else:
+            try:
+                t_deliv0 = time.monotonic()
+                paste_out = self._deliver_for_utterance(task, final_text, st.win)
+                deliver_ms = _elapsed_ms(t_deliv0)
+            except Exception as deliv_exc:
+                if self._stop_evt.is_set() or task.cancel_token.is_cancelled():
+                    return _cancelled_outcome()
+                slot.exc = deliv_exc
+                return self._finalize_commit_slot(slot)
+            if paste_out.reason == "cancelled" or task.cancel_token.is_cancelled():
+                return _cancelled_outcome()
+            task.cancel_token.try_commit()
 
-        with self._trigger_lock:
-            hud_calls: list[tuple[str, int, str | None, bool | None]] = []
+        saved_p = (
+            self._stash_task_wav_once(task, gate=st.gate, snap=st.snap, win=st.win)
+            if (paste_out is not None and not paste_out.pasted and not paste_out.clipboard)
+            else ""
+        )
+        res_ok = _make_pipeline_result(
+            task.seq_id,
+            task.audio_source,
+            st,
+            ok=True,
+            final_text=final_text,
+            refined=ref_res,
+            paste=paste_out,
+            deliver_ms=deliver_ms,
+            saved_audio=saved_p,
+        )
+        if paste_out and not paste_out.pasted and not paste_out.clipboard:
+            hud_st, beep_k = "error", ("" if task.recorder_lost else "error")
+        elif paste_out and not paste_out.pasted and paste_out.clipboard:
+            hud_st = "copied"
+        else:
+            hud_st = "done"
+        return _summarize(res_ok), hud_st, hud_dur_ms, beep_k
+
+    def _commit_worker_loop(self) -> None:
+        while True:
+            with self._queue_cv:
+                while not self._stop_evt.is_set() and not self._commit_queue:
+                    self._queue_cv.wait()
+                if self._stop_evt.is_set():
+                    self._recompute_state_locked()
+                    self._queue_cv.notify_all()
+                    return
+                slot = self._commit_queue[0]
+
+            while not self._stop_evt.is_set() and not slot.done_evt.wait(timeout=0.05):
+                pass
+
+            if self._stop_evt.is_set():
+                with self._queue_cv:
+                    self._recompute_state_locked()
+                    self._queue_cv.notify_all()
+                return
+
+            outcome = self._finalize_commit_slot(slot)
+            if outcome is None or self._stop_evt.is_set():
+                with self._queue_cv:
+                    if self._commit_queue and self._commit_queue[0] is slot:
+                        self._commit_queue.popleft()
+                    self._recompute_state_locked()
+                    self._queue_cv.notify_all()
+                if self._stop_evt.is_set():
+                    return
+                continue
+
+            summary, hud_st, hud_dur_ms, beep_k = outcome
+            summary.setdefault("ts", round(time.time(), 6))
+            self._append_telemetry(summary)
+
+            task = slot.task
             play_beep = ""
-            with self._lock:
-                self._record_result_locked(summary)
-                prev_state = self.state
-                if self._active_task is task:
-                    self._active_task = None
-                    self._active_bg_stage = ""
-                has_more = bool(self._utterance_queue)
-                rec_active = self._recording_active or self._stopping_capture
-                new_state = self._recompute_state_locked()
-                if not self._stop_evt.is_set():
-                    if task.silent_hud:
-                        if not rec_active and not has_more and self._main_hud_visible:
-                            hud_calls.append(("hide", 0, None, None))
-                    elif rec_active:
-                        if hud_st == "copied":
-                            hud_calls.append(("copied", hud_dur_ms, "toast", False))
-                        elif hud_st and is_toast_hud_state(hud_st):
-                            hud_calls.append((hud_st, hud_dur_ms, None, False))
-                    elif has_more and not self._utterance_queue[0].silent_hud:
-                        if new_state == "recognizing" and self._main_hud_state != "recognizing":
-                            hud_calls.append(("recognizing", 0, None, None))
-                        if hud_st == "copied":
-                            hud_calls.append(("copied", hud_dur_ms, "toast", False))
-                        elif hud_st and is_toast_hud_state(hud_st):
-                            hud_calls.append((hud_st, hud_dur_ms, None, False))
-                        play_beep = beep_k
-                    else:
-                        if hud_st:
-                            hud_calls.append(
-                                (
-                                    hud_st,
-                                    hud_dur_ms,
-                                    None,
-                                    True if is_toast_hud_state(hud_st) else None,
+            with self._hud_lock:
+                hud_calls: list[tuple[str, int, str | None, bool | None]] = []
+                with self._queue_cv:
+                    if self._commit_queue and self._commit_queue[0] is slot:
+                        self._commit_queue.popleft()
+                    has_more_active = self._inflight_or_queued_count_locked() > 0
+                    next_vis_stage = self._derive_bg_stage_locked(visible_only=True)
+                    rec_active = self._recording_active or self._stopping_capture
+                    new_state = self._recompute_state_locked()
+                    self._record_result_locked(summary)
+                    self._queue_cv.notify_all()
+                    if not self._stop_evt.is_set():
+                        if task.silent_hud:
+                            if not rec_active and not has_more_active and self._main_hud_visible:
+                                hud_calls.append(("hide", 0, None, None))
+                        elif rec_active:
+                            if hud_st == "copied":
+                                hud_calls.append(("copied", hud_dur_ms, "toast", False))
+                            elif hud_st and is_toast_hud_state(hud_st):
+                                hud_calls.append((hud_st, hud_dur_ms, None, False))
+                        elif next_vis_stage:
+                            if new_state == next_vis_stage and self._main_hud_state != next_vis_stage:
+                                hud_calls.append((next_vis_stage, 0, None, None))
+                            if hud_st == "copied":
+                                hud_calls.append(("copied", hud_dur_ms, "toast", False))
+                            elif hud_st and is_toast_hud_state(hud_st):
+                                hud_calls.append((hud_st, hud_dur_ms, None, False))
+                            play_beep = beep_k
+                        else:
+                            if hud_st:
+                                hud_calls.append(
+                                    (
+                                        hud_st,
+                                        hud_dur_ms,
+                                        None,
+                                        True if is_toast_hud_state(hud_st) else None,
+                                    )
                                 )
-                            )
-                        elif self._main_hud_visible:
-                            hud_calls.append(("hide", 0, None, None))
-                        play_beep = beep_k
-                    for st_n, _, lyr_n, clr_m_n in hud_calls:
-                        self._update_main_hud_visibility_locked(st_n, layer=lyr_n, clear_main=clr_m_n)
-            for st_name, dur_val, lyr_val, clr_main_val in hud_calls:
-                self._hud(
-                    st_name,
-                    duration_ms=dur_val,
-                    layer=lyr_val,
-                    clear_main=clr_main_val,
-                )
+                            elif not has_more_active and self._main_hud_visible:
+                                hud_calls.append(("hide", 0, None, None))
+                            play_beep = beep_k
+                        for st_n, _, lyr_n, clr_m_n in hud_calls:
+                            self._update_main_hud_visibility_locked(st_n, layer=lyr_n, clear_main=clr_m_n)
+                for st_name, dur_val, lyr_val, clr_main_val in hud_calls:
+                    self._invoke_platform_hud_unlocked(
+                        st_name,
+                        duration_ms=dur_val,
+                        layer=lyr_val,
+                        clear_main=clr_main_val,
+                    )
             if play_beep:
                 self.platform.beep(play_beep)
+
+    def _initiate_shutdown(self) -> list[threading.Thread]:
+        self._cancel_max_duration_timer()
+        tokens_to_abort: list[CancelToken] = []
+        cancelled_to_stash: list[tuple[_QueuedUtterance, AudioGateResult | None, SessionSnapshot | None, ForegroundWindow]] = []
+        bg_threads: list[threading.Thread] = []
+        seen_ids: set[int] = set()
+
+        def _collect(task: _QueuedUtterance, slot: _CommitSlot | None = None) -> None:
+            if task.seq_id in seen_ids:
+                return
+            seen_ids.add(task.seq_id)
+            tokens_to_abort.append(task.cancel_token)
+            if (
+                task.cancel_token.is_cancelled()
+                and task.cancel_token.reason == "cancelled"
+                and not task.stashed_done
+            ):
+                cancelled_to_stash.append(
+                    (
+                        task,
+                        slot.st.gate if slot is not None else None,
+                        slot.st.snap if slot is not None else None,
+                        slot.st.win if slot is not None else task.origin_win,
+                    )
+                )
+
+        with self._queue_cv:
+            self._stop_evt.set()
+            for s in self._commit_queue:
+                _collect(s.task, s)
+            for s2 in self._stage2_slots:
+                _collect(s2.task, s2)
+            if self._active_task is not None:
+                _collect(self._active_task)
+            for t in self._utterance_queue:
+                _collect(t)
+            self._utterance_queue.clear()
+            self._commit_queue.clear()
+            self._batch_unpasted_clips.clear()
+            self._recompute_state_locked()
+            if self._worker_thread is not None:
+                bg_threads.append(self._worker_thread)
+            if self._commit_thread is not None:
+                bg_threads.append(self._commit_thread)
+            bg_threads.extend(th for th in self._stage2_threads if th.is_alive())
+            self._queue_cv.notify_all()
+
+        CancelToken.cancel_many(tokens_to_abort, "shutdown")
+        for task_c, gate_c, snap_c, win_c in cancelled_to_stash:
+            self._stash_task_wav_once(
+                task_c,
+                gate=gate_c,
+                snap=snap_c,
+                win=win_c,
+                allow_during_shutdown=True,
+            )
+        return bg_threads
 
     def handle_control(self, req: Mapping[str, Any]) -> dict[str, Any]:
         cmd = str(req.get("cmd") or "status")
@@ -1866,6 +2680,16 @@ class VoiceInputDaemon:
                 else None
             )
             return self.handle_trigger({"toggle": "toggle", "rec_start": "ptt_start", "rec_stop": "ptt_stop"}[cmd], win, no_paste=bool(req.get("no_paste")), silent_hud=bool(req.get("silent_hud")), loopback=bool(req.get("loopback")))
+        if cmd == "cancel":
+            try:
+                seq_val = _parse_optional_seq_id(req.get("seq_id"))
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            return self.handle_cancel(
+                seq_id=seq_val,
+                silent_hud=bool(req.get("silent_hud")),
+                only_inflight=bool(req.get("only_inflight")),
+            )
         if cmd == "selftest_wav":
             wav_path = Path(str(req.get("wav_path") or "")).expanduser()
             if not wav_path.is_file():
@@ -1895,26 +2719,39 @@ class VoiceInputDaemon:
             self._append_telemetry(st_snap)
             return {"ok": res.ok, "seq_id": cur_seq, "skipped_reason": res.skipped_reason, "asr_text": res.asr.text if res.asr else "", "final_text": res.final_text, "summary": summary}
         if cmd == "shutdown":
-            self._stop_evt.set()
-            self._cancel_max_duration_timer()
-            with self._queue_cv:
-                self._utterance_queue.clear()
-                self._queue_cv.notify_all()
+            self._initiate_shutdown()
             return {"ok": True, "stopping": True}
         return {"ok": False, "error": f"unknown cmd: {cmd}"}
+
+    def _on_platform_event(self, m: Mapping[str, Any]) -> None:
+        ev = str(m.get("event") or "")
+        if ev in ("toggle", "ptt_start", "ptt_stop", "ptt_cancel"):
+            self.handle_trigger(ev, _window_from_mapping(m), from_hotkey=True)
+        elif ev == "hold_cancel":
+            win = _window_from_mapping(m)
+            if (win.process or win.bundle_id) and self._should_yield_hotkey(win) is not None:
+                return
+            self.handle_cancel(only_inflight=True)
+        elif ev == "cancel":
+            try:
+                seq_val = _parse_optional_seq_id(m.get("seq_id"))
+            except ValueError:
+                return
+            self.handle_cancel(seq_id=seq_val)
 
     def serve_forever(self) -> None:
         self.sock_path.unlink(missing_ok=True)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._srv_sock = srv
+        sig_stop = threading.Event()
         is_main = threading.current_thread() is threading.main_thread()
-        prev_int = signal.signal(signal.SIGINT, lambda *_: self._stop_evt.set()) if is_main else None
-        prev_term = signal.signal(signal.SIGTERM, lambda *_: self._stop_evt.set()) if is_main else None
+        prev_int = signal.signal(signal.SIGINT, lambda *_: sig_stop.set()) if is_main else None
+        prev_term = signal.signal(signal.SIGTERM, lambda *_: sig_stop.set()) if is_main else None
         try:
             self.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8"); os.chmod(self.pid_path, 0o600)
-            self.platform.start_event_listener(lambda m: self.handle_trigger(str(m.get("event")), _window_from_mapping(m), from_hotkey=True) if m.get("event") in ("toggle", "ptt_start", "ptt_stop", "ptt_cancel") else None)
+            self.platform.start_event_listener(self._on_platform_event)
             srv.bind(str(self.sock_path)); os.chmod(self.sock_path, 0o600); srv.listen(8); srv.settimeout(0.3)
-            while not self._stop_evt.is_set():
+            while not self._stop_evt.is_set() and not sig_stop.is_set():
                 try: conn, _ = srv.accept()
                 except socket.timeout: continue
                 except OSError: break
@@ -1946,22 +2783,20 @@ class VoiceInputDaemon:
             self._archive_threads = {t for t in self._archive_threads if t.is_alive()}
 
     def close(self) -> None:
-        self._stop_evt.set()
-        self._cancel_max_duration_timer()
-        worker: threading.Thread | None = None
-        with self._queue_cv:
-            self._utterance_queue.clear()
-            self._batch_unpasted_clips.clear()
-            worker = self._worker_thread
-            self._queue_cv.notify_all()
+        bg_threads = self._initiate_shutdown()
         if self._srv_sock is not None:
             try: self._srv_sock.close()
             except OSError: pass
             self._srv_sock = None
         self.sock_path.unlink(missing_ok=True); self.pid_path.unlink(missing_ok=True)
         self.refiner.close()
-        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
-            worker.join(timeout=1.5)
+        join_deadline = time.monotonic() + 3.0
+        cur_th = threading.current_thread()
+        for th in bg_threads:
+            if (rem := join_deadline - time.monotonic()) <= 0:
+                break
+            if th.is_alive() and th is not cur_th:
+                th.join(timeout=rem)
         self.wait_pending_archives(timeout_sec=2.0)
         self.platform.close()
 

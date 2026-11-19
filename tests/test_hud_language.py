@@ -893,6 +893,14 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertIn('st == "mic_disconnected"', shim)
         self.assertIn('st == "audio_recovered"', shim)
         self.assertIn('st == "paste_failed"', shim)
+        self.assertIn('st == "cancelled"', shim)
+        self.assertIn('"hold_cancel"', shim)
+        self.assertIn('$op -eq "key_state"', shim)
+        self.assertEqual(format_hud_text("cancelled", "zh"), "○ 已取消")
+        self.assertEqual(format_hud_text("cancelled", "en"), "○ Cancelled")
+        self.assertEqual(default_hud_duration_ms("cancelled"), 1600)
+        self.assertTrue(is_toast_hud_state("cancelled"))
+        self.assertEqual(hud_layer_for_state("cancelled"), "toast")
         for esc_lit, state_key in (
             (r"\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE", "no_mic"),
             (r"! \u9EA6\u514B\u98CE\u6682\u5FD9\uFF0C\u8BF7\u518D\u8BD5\u4E00\u6B21", "mic_unavailable"),
@@ -900,13 +908,14 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             (r"\u2715 \u9EA6\u514B\u98CE\u5DF2\u65AD\u5F00", "mic_disconnected"),
             (r"! \u9EA6\u514B\u98CE\u77ED\u6682\u4E2D\u65AD\uFF0C\u5DF2\u81EA\u52A8\u6062\u590D", "audio_recovered"),
             (r"\u2715 \u586B\u5165\u5931\u8D25", "paste_failed"),
+            (r"\u25CB \u5DF2\u53D6\u6D88", "cancelled"),
         ):
             self.assertIn(esc_lit, shim)
             self.assertEqual(
                 bytes(esc_lit, "ascii").decode("unicode_escape"),
                 format_hud_text(state_key, "zh"),
             )
-        for dur_decl in ("ms = 900;", "ms = 2000;", "ms = 2200;", "ms = 2400;", "ms = 2600;", "ms = 3200;"):
+        for dur_decl in ("ms = 900;", "ms = 1600;", "ms = 2000;", "ms = 2200;", "ms = 2400;", "ms = 2600;", "ms = 3200;"):
             self.assertIn(dur_decl, shim)
 
         # COM [PreserveSig] vtable integrity + WASAPI disconnect & seamless recovery contracts

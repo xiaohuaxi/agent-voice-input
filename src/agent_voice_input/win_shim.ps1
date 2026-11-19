@@ -21,7 +21,7 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
-public struct ShimEvent { public string Kind, Process, Title, Reason; public uint Vk, Scan; public bool Extended, IsDown, Tainted; public long Hwnd, RecGen; public ulong TsMs; public int GapMs; }
+public struct ShimEvent { public string Kind, Process, Title, Reason; public uint Vk, Scan; public bool Extended, IsDown, Tainted; public long Hwnd, RecGen; public ulong TsMs; public int GapMs, HoldMs; }
 
 [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] internal class MMDeviceEnumeratorComObject { }
 [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -989,6 +989,9 @@ public static class VoiceWinShim {
         } else if (st == "empty") {
             txt = zh ? "\u25CB \u672A\u68C0\u6D4B\u5230\u8BED\u97F3" : "\u25CB No speech detected";
             bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2200; iconKind = "empty_ring";
+        } else if (st == "cancelled") {
+            txt = zh ? "\u25CB \u5DF2\u53D6\u6D88" : "\u25CB Cancelled";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 1600; iconKind = "empty_ring";
         } else if (st == "mic_unavailable") {
             txt = zh ? "! \u9EA6\u514B\u98CE\u6682\u5FD9\uFF0C\u8BF7\u518D\u8BD5\u4E00\u6B21" : "! Microphone busy, try again";
             bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2600; iconKind = "warning";
@@ -1106,10 +1109,10 @@ public static class VoiceWinShim {
         if (pid > 0) { try { procName = Process.GetProcessById(pid).ProcessName ?? ""; } catch { procName = ""; } }
     }
 
-    private static void EnqueueTrigger(string kind, uint vk, uint scan, bool ext, bool isDown, bool tainted) {
+    private static void EnqueueTrigger(string kind, uint vk, uint scan, bool ext, bool isDown, bool tainted, int holdMs = 0) {
         long hwnd = 0; string proc = "", title = "";
-        if (kind == "toggle" || kind == "ptt_start" || kind == "ptt_stop") QueryForeground(out hwnd, out proc, out title);
-        EvtQueue.Enqueue(new ShimEvent { Kind = kind, Vk = vk, Scan = scan, Extended = ext, IsDown = isDown, Tainted = tainted, Hwnd = hwnd, Process = proc, Title = title, TsMs = GetTickCount64() });
+        if (kind == "toggle" || kind == "ptt_start" || kind == "ptt_stop" || kind == "hold_cancel") QueryForeground(out hwnd, out proc, out title);
+        EvtQueue.Enqueue(new ShimEvent { Kind = kind, Vk = vk, Scan = scan, Extended = ext, IsDown = isDown, Tainted = tainted, Hwnd = hwnd, Process = proc, Title = title, HoldMs = holdMs, TsMs = GetTickCount64() });
         if (_mainTid != 0) PostThreadMessage(_mainTid, WM_APP_WAKE, IntPtr.Zero, IntPtr.Zero);
     }
 
@@ -1131,7 +1134,11 @@ public static class VoiceWinShim {
                         if (_isPtt && !_chordTainted && (now - _lastFireTick) >= _debounceMs) { _lastFireTick = now; _pttActive = true; EnqueueTrigger("ptt_start", vk, kb.scanCode, ext, true, false); }
                     } else if (isUp && _targetDown) {
                         if (_isPtt) { if (_pttActive && !_chordTainted) { _lastFireTick = now; EnqueueTrigger("ptt_stop", vk, kb.scanCode, ext, false, false); } }
-                        else if (!_chordTainted && (now - _downTick) <= _tapMaxMs && (now - _lastFireTick) >= _debounceMs) { _lastFireTick = now; EnqueueTrigger("toggle", vk, kb.scanCode, ext, false, false); }
+                        else if (!_chordTainted && (now - _lastFireTick) >= _debounceMs) {
+                            ulong held = (now >= _downTick) ? (now - _downTick) : 0UL;
+                            if (held <= _tapMaxMs) { _lastFireTick = now; EnqueueTrigger("toggle", vk, kb.scanCode, ext, false, false); }
+                            else if (held <= 8000UL) { _lastFireTick = now; EnqueueTrigger("hold_cancel", vk, kb.scanCode, ext, false, false, (int)held); }
+                        }
                         _targetDown = false; _pttActive = false; _chordTainted = false;
                     }
                 } else if (vk != _ignoredCompanionVk) {
@@ -1754,6 +1761,8 @@ try {
                     Write-JsonLine @{ event = "rec_lost"; reason = [string]$ev.Reason; rec_gen = [long]$ev.RecGen }
                 } elseif ($ev.Kind -eq "rec_recovered") {
                     Write-JsonLine @{ event = "rec_recovered"; gap_ms = [int]$ev.GapMs; rec_gen = [long]$ev.RecGen }
+                } elseif ($ev.Kind -eq "hold_cancel") {
+                    Write-JsonLine @{ event = "hold_cancel"; hold_ms = [int]$ev.HoldMs; hwnd = $ev.Hwnd; process = $ev.Process; title = $ev.Title; ts_ms = $ev.TsMs }
                 } else {
                     Write-JsonLine @{ event = $ev.Kind; hwnd = $ev.Hwnd; process = $ev.Process; title = $ev.Title; ts_ms = $ev.TsMs }
                 }
@@ -1767,6 +1776,7 @@ try {
                 $cmdObj = $rawCmd | ConvertFrom-Json; $op = [string]$cmdObj.cmd; $seq = if ($null -ne $cmdObj.seq_id) { [int]$cmdObj.seq_id } else { 0 }
                 if ($op -eq "ping") { Write-JsonLine @{ type = "reply"; reply = "ping"; seq_id = $seq; ok = $true; wave_in_devs = [VoiceWinShim]::waveInGetNumDevs() } }
                 elseif ($op -eq "fg_window") { $h = 0L; $p = ""; $t = ""; [VoiceWinShim]::QueryForeground([ref]$h, [ref]$p, [ref]$t); Write-JsonLine @{ type = "reply"; reply = "fg_window"; seq_id = $seq; ok = $true; hwnd = $h; process = $p; title = $t } }
+                elseif ($op -eq "key_state") { Write-JsonLine @{ type = "reply"; reply = "key_state"; seq_id = $seq; ok = $true; hotkey_held = [bool][VoiceWinShim]::IsAnyPasteBlockingKeyDown() } }
                 elseif ($op -eq "beep") { Invoke-Tone ([string]$cmdObj.kind); Write-JsonLine @{ type = "reply"; reply = "beep"; seq_id = $seq; ok = $true } }
                 elseif ($op -eq "hud") {
                     $dms = if ($null -ne $cmdObj.duration_ms) { [int]$cmdObj.duration_ms } else { 0 }
@@ -1814,8 +1824,8 @@ try {
                                     if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
                                     Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "focus_changed" } else { "clipboard_failed" }); fg_process = $p2 }
                                 } elseif ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
-                                    if ($fbTxt -ne $txt) { [void](Set-ClipboardSafe $fbTxt) }
-                                    Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "hotkey_held"; fg_process = $p2 }
+                                    if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }
+                                    Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = [bool]$clipOk; reason = "hotkey_held"; fg_process = $p2 }
                                 } else {
                                     $sent = [VoiceWinShim]::SendPasteChord($pasteChord)
                                     if ($sent) {

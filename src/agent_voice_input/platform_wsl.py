@@ -650,8 +650,22 @@ class JsonlShimMixin:
                 self._event_worker = threading.Thread(target=self._event_loop, daemon=True)
                 self._event_worker.start()
 
+    def _flush_shim_events(self, timeout_sec: float = 0.05) -> None:
+        if (
+            self._event_worker is None
+            or not self._event_worker.is_alive()
+            or threading.current_thread() is self._event_worker
+        ):
+            return
+        done = threading.Event()
+        self._event_q.put({"_sync_evt": done})
+        done.wait(timeout=max(0.005, timeout_sec))
+
     def _event_loop(self) -> None:
         while (msg := self._event_q.get()) is not None:
+            if isinstance(sync_evt := msg.get("_sync_evt"), threading.Event):
+                sync_evt.set()
+                continue
             if str(msg.get("event") or "") in self._INTERNAL_SHIM_EVENTS:
                 try:
                     self._on_shim_internal_event(msg)
@@ -991,6 +1005,27 @@ class JsonlShimMixin:
             except Exception:
                 pass
         _reap_shim_proc(proc)
+
+
+def make_once_commit_guard(
+    cancelled_fn: Callable[[], bool],
+    before_commit: Callable[[], bool] | None,
+) -> Callable[[], bool]:
+    checked = False
+    allowed = True
+
+    def _confirm() -> bool:
+        nonlocal checked, allowed
+        if not checked:
+            checked = True
+            allowed = (
+                False
+                if cancelled_fn()
+                else (True if before_commit is None else bool(before_commit()))
+            )
+        return allowed
+
+    return _confirm
 
 
 class WslPlatform(JsonlShimMixin):
@@ -1375,6 +1410,7 @@ class WslPlatform(JsonlShimMixin):
         suppress_beep: bool | Callable[[], bool] = False,
         is_cancelled: Callable[[], bool] | None = None,
         before_clipboard_write: Callable[[], None] | None = None,
+        before_commit: Callable[[], bool] | None = None,
     ) -> PasteOutcome:
         del preserve_clipboard
         eff_hwnd = target_hwnd or (origin_window.hwnd if origin_window is not None else 0)
@@ -1383,8 +1419,11 @@ class WslPlatform(JsonlShimMixin):
         expect_terminal = not known_origin
         paste_chord = resolve_windows_paste_chord(origin_proc) if origin_proc else "ctrl_v"
         cancelled_fn = lambda: bool(is_cancelled is not None and is_cancelled())
+        _confirm_commit = make_once_commit_guard(cancelled_fn, before_commit)
 
         def _fallback_clipboard_via_shim() -> PasteOutcome:
+            if not _confirm_commit():
+                return PasteOutcome(False, False, "cancelled", "")
             fb_req: dict[str, Any] = {
                 "cmd": "paste",
                 "seq_id": seq_id,
@@ -1414,6 +1453,8 @@ class WslPlatform(JsonlShimMixin):
             return PasteOutcome(False, False, "cancelled", "")
         if before_clipboard_write is not None:
             before_clipboard_write()
+        if cancelled_fn():
+            return PasteOutcome(False, False, "cancelled", "")
         orig_session_tok = ""
         if (
             origin_window is not None
@@ -1423,8 +1464,35 @@ class WslPlatform(JsonlShimMixin):
             orig_session_tok = orig_hint.session_token
 
         hold_deadline = time.monotonic() + self._effective_paste_hold_timeout_sec()
+        prechecked_key_state = False
+        waited_for_key = False
+        if before_commit is not None and self._shim is not None and self._shim.poll() is None:
+            prechecked_key_state = True
+            while True:
+                if cancelled_fn():
+                    return PasteOutcome(False, False, "cancelled", "")
+                if self._shim is None or self._shim.poll() is not None:
+                    prechecked_key_state = False
+                    break
+                ks = self._dispatch_paste_rpc({"cmd": "key_state"}, timeout_sec=0.8)
+                if cancelled_fn():
+                    return PasteOutcome(False, False, "cancelled", "")
+                if not ks.get("hotkey_held"):
+                    break
+                rem_ks = hold_deadline - time.monotonic()
+                if rem_ks <= 0.0:
+                    return _fallback_clipboard_via_shim()
+                waited_for_key = True
+                _sleep_cooperative(min(0.05, rem_ks), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
+            if waited_for_key:
+                self._flush_shim_events()
+                if cancelled_fn():
+                    return PasteOutcome(False, False, "cancelled", "")
+
         while True:
             if cancelled_fn():
+                return PasteOutcome(False, False, "cancelled", "")
+            if not _confirm_commit():
                 return PasteOutcome(False, False, "cancelled", "")
             req: dict[str, Any] = {
                 "cmd": "paste",
@@ -1444,9 +1512,9 @@ class WslPlatform(JsonlShimMixin):
             res = self._dispatch_paste_rpc(req, timeout_sec=5.0)
             reason = str(res.get("reason") or "ok")
             fg_proc = str(res.get("fg_process") or "")
+            clip_ok = bool(res.get("clipboard"))
             if reason != "hotkey_held":
                 pasted = bool(res.get("pasted"))
-                clip_ok = bool(res.get("clipboard"))
                 return PasteOutcome(
                     pasted,
                     clip_ok,
@@ -1454,6 +1522,8 @@ class WslPlatform(JsonlShimMixin):
                     fg_proc,
                     used_clipboard_paste=bool(pasted and clip_ok),
                 )
+            if clip_ok or prechecked_key_state:
+                break
             rem = hold_deadline - time.monotonic()
             if rem <= 0.0:
                 break

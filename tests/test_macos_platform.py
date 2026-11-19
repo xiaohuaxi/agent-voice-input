@@ -1259,6 +1259,10 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn('case "mic_disconnected":', src)
         self.assertIn('case "audio_recovered":', src)
         self.assertIn('case "paste_failed":', src)
+        self.assertIn('case "cancelled":', src)
+        self.assertIn("○ 已取消", src)
+        self.assertIn("autoHideMs: 1600", src)
+        self.assertIn('"hold_cancel"', src)
         self.assertIn("✕ 无可用麦克风", src)
         self.assertIn("! 麦克风暂忙，请再试一次", src)
         self.assertIn("! 麦克风短暂中断，已自动恢复", src)
@@ -4132,6 +4136,43 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertEqual(cmd_v_count[0], 0, "must NEVER fire Cmd+V when managed shim disappears before confirming key release")
             self.assertLess(elapsed_disable, 1.0, "must fail over to clipboard immediately when shim becomes disabled")
             self.assertEqual(pbcopy_payloads, ["前段\n\nshim失效回退段"])
+
+            # 9. before_commit returning False aborts AFTER key_state release wait and BEFORE pbcopy / Cmd+V / Ghostty
+            pbcopy_payloads.clear()
+            cmd_v_count[0] = 0
+            key_seq_cancel = iter(
+                [
+                    {"ok": True, "hotkey_held": True},
+                    {"ok": True, "hotkey_held": False},
+                ]
+            )
+            held_handler[0] = lambda: next(key_seq_cancel)
+            commit_calls = [0]
+            out_cancel_cmdv = plat.deliver_text(
+                "绝不写入剪贴板或按Cmd+V",
+                seq_id=12,
+                origin_window=origin_iterm,
+                before_commit=lambda: (commit_calls.__setitem__(0, commit_calls[0] + 1) or False),
+            )
+            self.assertEqual(commit_calls[0], 1)
+            self.assertFalse(out_cancel_cmdv.pasted)
+            self.assertFalse(out_cancel_cmdv.clipboard)
+            self.assertEqual(out_cancel_cmdv.reason, "cancelled")
+            self.assertEqual(pbcopy_payloads, [])
+            self.assertEqual(cmd_v_count[0], 0)
+
+            ghostty_osa_calls: list[list[str]] = []
+            orig_run_osa = plat._run_osascript
+            plat._run_osascript = lambda args, timeout=2.5: (ghostty_osa_calls.append(list(args)) or orig_run_osa(args, timeout=timeout))  # type: ignore[method-assign]
+            out_cancel_ghostty = plat.deliver_text(
+                "绝不注入Ghostty",
+                seq_id=13,
+                origin_window=ForegroundWindow(100, "Ghostty", "agy", "com.mitchellh.ghostty", surface_id="surf-9"),
+                before_commit=lambda: False,
+            )
+            self.assertFalse(out_cancel_ghostty.pasted)
+            self.assertEqual(out_cancel_ghostty.reason, "cancelled")
+            self.assertEqual(ghostty_osa_calls, [])
 
 
 if __name__ == "__main__":

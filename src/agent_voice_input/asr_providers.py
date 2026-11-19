@@ -132,6 +132,142 @@ class AsrContext:
     single_hop_prepared: bool = False
 
 
+class CancelToken:
+    """Thread-safe three-state cancellation & commit token (ACTIVE -> CANCELLED | COMMITTED)."""
+
+    ACTIVE: int = 0
+    CANCELLED: int = 1
+    COMMITTED: int = 2
+
+    __slots__ = ("_lock", "_state", "_reason", "_next_id", "_hooks", "_events")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = 0  # 0: ACTIVE, 1: CANCELLED, 2: COMMITTED
+        self._reason = ""
+        self._next_id = 0
+        self._hooks: dict[int, Callable[[], None]] = {}
+        self._events: set[threading.Event] = set()
+
+    @property
+    def state(self) -> int:
+        with self._lock:
+            return self._state
+
+    @property
+    def reason(self) -> str:
+        with self._lock:
+            return self._reason
+
+    def is_cancelled(self) -> bool:
+        with self._lock:
+            return self._state == 1
+
+    def is_committed(self) -> bool:
+        with self._lock:
+            return self._state == 2
+
+    def try_commit(self) -> bool:
+        """Atomically transition ACTIVE -> COMMITTED. Returns False if already CANCELLED."""
+        with self._lock:
+            if self._state == 1:
+                return False
+            if self._state == 0:
+                self._state = 2
+                self._hooks.clear()
+                self._events.clear()
+            return True
+
+    def _mark_cancelled_locked(
+        self, reason: str
+    ) -> tuple[bool, bool, list[threading.Event], list[Callable[[], None]]]:
+        with self._lock:
+            if self._state == 2:
+                return False, True, [], []
+            if self._state != 0:
+                return False, False, [], []
+            self._state = 1
+            self._reason = reason or "cancelled"
+            events = list(self._events)
+            hooks = list(self._hooks.values())
+            self._events.clear()
+            self._hooks.clear()
+            return True, False, events, hooks
+
+    @staticmethod
+    def cancel_many(
+        tokens: Sequence[CancelToken],
+        reason: str = "cancelled",
+    ) -> tuple[list[CancelToken], list[CancelToken]]:
+        """Transition ALL active tokens to CANCELLED BEFORE firing any event or abort hook."""
+        cancelled: list[CancelToken] = []
+        committed: list[CancelToken] = []
+        events: list[threading.Event] = []
+        hooks: list[Callable[[], None]] = []
+        eff_reason = reason or "cancelled"
+        for tok in tokens:
+            did_cancel, was_committed, evs, hks = tok._mark_cancelled_locked(eff_reason)
+            if did_cancel:
+                cancelled.append(tok)
+                events.extend(evs)
+                hooks.extend(hks)
+            elif was_committed:
+                committed.append(tok)
+        for ev in events:
+            try:
+                ev.set()
+            except Exception:
+                pass
+        for fn in hooks:
+            try:
+                fn()
+            except Exception:
+                pass
+        return cancelled, committed
+
+    def cancel(self, reason: str = "cancelled") -> bool:
+        """Atomically transition ACTIVE -> CANCELLED and fire bound events/hooks outside lock."""
+        cancelled, _ = CancelToken.cancel_many((self,), reason)
+        return bool(cancelled)
+
+    def register_abort(self, fn: Callable[[], None]) -> int:
+        fire_now = False
+        hid = 0
+        with self._lock:
+            if self._state == 1:
+                fire_now = True
+            elif self._state == 0:
+                self._next_id += 1
+                hid = self._next_id
+                self._hooks[hid] = fn
+        if fire_now:
+            try:
+                fn()
+            except Exception:
+                pass
+        return hid
+
+    def unregister_abort(self, hook_id: int) -> None:
+        if not hook_id:
+            return
+        with self._lock:
+            self._hooks.pop(hook_id, None)
+
+    def bind_event(self, ev: threading.Event) -> None:
+        set_now = False
+        with self._lock:
+            if self._state == 1:
+                set_now = True
+            elif self._state == 0:
+                self._events.add(ev)
+        if set_now:
+            ev.set()
+
+    def unbind_event(self, ev: threading.Event) -> None:
+        with self._lock:
+            self._events.discard(ev)
+
+
 @dataclass(frozen=True)
 class HttpRequest:
     url: str
@@ -141,6 +277,7 @@ class HttpRequest:
     timeout_sec: float
     deadline: float | None = None
     connect_timeout_sec: float = DEFAULT_CONNECT_TIMEOUT_SEC
+    cancel_token: CancelToken | None = None
 
 
 @dataclass(frozen=True)
@@ -435,7 +572,29 @@ class _SameOriginSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
                 setattr(new_req, "_voice_req_timeout", getattr(req, "_voice_req_timeout"))
             if hasattr(req, "_voice_connect_timeout"):
                 setattr(new_req, "_voice_connect_timeout", getattr(req, "_voice_connect_timeout"))
+            if hasattr(req, "_voice_cancel_token"):
+                setattr(new_req, "_voice_cancel_token", getattr(req, "_voice_cancel_token"))
         return new_req
+
+
+_NONBLOCK_CONNECT_ERRNOS = frozenset(
+    e
+    for e in (
+        getattr(errno, "EINPROGRESS", None),
+        getattr(errno, "EALREADY", None),
+        getattr(errno, "EWOULDBLOCK", None),
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "EINTR", None),
+        getattr(errno, "WSAEINPROGRESS", None),
+        getattr(errno, "WSAEWOULDBLOCK", None),
+    )
+    if e is not None
+)
+_ABORT_ERRNO = getattr(errno, "ECANCELED", errno.ECONNABORTED)
+
+
+def _is_conn_aborted(conn_owner: Any) -> bool:
+    return bool(conn_owner is not None and getattr(conn_owner, "_aborted", False))
 
 
 def _create_connection_with_deadline(
@@ -443,33 +602,84 @@ def _create_connection_with_deadline(
     conn_deadline: float | None,
     source_address: tuple[str, int] | None = None,
     fallback_timeout: float | None = None,
+    conn_owner: Any = None,
 ) -> socket.socket:
     host, port = address
+    if _is_conn_aborted(conn_owner):
+        raise OSError(_ABORT_ERRNO, "HTTP TCP connect aborted")
     last_err: OSError | None = None
     infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
     if not infos:
         raise OSError("getaddrinfo returns an empty list")
+    abort_lock: threading.Lock | None = getattr(conn_owner, "_abort_lock", None) if conn_owner is not None else None
     for af, socktype, proto, _, sa in infos:
+        if _is_conn_aborted(conn_owner):
+            raise OSError(_ABORT_ERRNO, "HTTP TCP connect aborted")
+        now0 = time.monotonic()
         if conn_deadline is not None:
-            rem = conn_deadline - time.monotonic()
+            rem = conn_deadline - now0
             if rem <= 0:
                 raise TimeoutError(f"HTTP TCP connect timed out for {host}:{port}")
             step_timeout: float | None = max(0.005, rem)
+            eff_deadline: float | None = conn_deadline
+        elif fallback_timeout is not None and fallback_timeout > 0:
+            step_timeout = float(fallback_timeout)
+            eff_deadline = now0 + step_timeout
         else:
             step_timeout = fallback_timeout
+            eff_deadline = None
         sock: socket.socket | None = None
         try:
             sock = socket.socket(af, socktype, proto)
-            if step_timeout is not None:
-                sock.settimeout(step_timeout)
             if source_address:
                 sock.bind(source_address)
-            sock.connect(sa)
+            if abort_lock is not None:
+                with abort_lock:
+                    if _is_conn_aborted(conn_owner):
+                        raise OSError(_ABORT_ERRNO, "HTTP TCP connect aborted")
+                    setattr(conn_owner, "_cur_sock", sock)
+            sock.setblocking(False)
+            err = sock.connect_ex(sa)
+            if err != 0:
+                if err not in _NONBLOCK_CONNECT_ERRNOS:
+                    raise OSError(err, os.strerror(err))
+                with selectors.DefaultSelector() as sel:
+                    sel.register(sock, selectors.EVENT_WRITE)
+                    while True:
+                        if _is_conn_aborted(conn_owner):
+                            raise OSError(_ABORT_ERRNO, "HTTP TCP connect aborted")
+                        if eff_deadline is not None:
+                            rem_w = eff_deadline - time.monotonic()
+                            if rem_w <= 0:
+                                raise TimeoutError(f"HTTP TCP connect timed out for {host}:{port}")
+                            wait_s = min(0.05, rem_w)
+                        else:
+                            wait_s = 0.05
+                        ready = sel.select(max(0.001, wait_s))
+                        if _is_conn_aborted(conn_owner):
+                            raise OSError(_ABORT_ERRNO, "HTTP TCP connect aborted")
+                        if ready:
+                            so_err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                            if so_err != 0:
+                                raise OSError(so_err, os.strerror(so_err))
+                            break
+            if _is_conn_aborted(conn_owner):
+                raise OSError(_ABORT_ERRNO, "HTTP TCP connect aborted")
+            if step_timeout is not None:
+                sock.settimeout(step_timeout)
+            else:
+                sock.setblocking(True)
             return sock
         except OSError as exc:
             last_err = exc
+            if abort_lock is not None and sock is not None:
+                with abort_lock:
+                    if getattr(conn_owner, "_cur_sock", None) is sock:
+                        setattr(conn_owner, "_cur_sock", None)
             if sock is not None:
                 _close_quietly(sock)
+            if _is_conn_aborted(conn_owner):
+                raise
             if conn_deadline is not None and time.monotonic() >= conn_deadline:
                 raise TimeoutError(f"HTTP TCP connect timed out for {host}:{port}") from None
     assert last_err is not None
@@ -477,16 +687,18 @@ def _create_connection_with_deadline(
 
 
 class _DeadlineSocketIO(socket.SocketIO):
-    """SocketIO tightening per-recv socket timeout against a hard monotonic deadline."""
+    """SocketIO tightening per-recv socket timeout and releasing abort ownership before fd close."""
 
     def __init__(
         self,
         sock: socket.socket,
         mode: str,
         deadline_getter: Callable[[], float | None],
+        on_close: Callable[[socket.socket], None] | None = None,
     ) -> None:
         super().__init__(sock, mode)  # type: ignore[arg-type]
         self._deadline_getter = deadline_getter
+        self._on_close = on_close
 
     def readinto(self, b: Any) -> int | None:
         dl = self._deadline_getter()
@@ -500,9 +712,16 @@ class _DeadlineSocketIO(socket.SocketIO):
                 self._sock.settimeout(max(0.001, rem))  # type: ignore[attr-defined]
         return super().readinto(b)
 
+    def close(self) -> None:
+        cb, self._on_close = self._on_close, None
+        if cb is not None:
+            cb(self._sock)  # type: ignore[arg-type]
+        super().close()
+
 
 def _make_deadline_response_class(
     deadline_getter: Callable[[], float | None],
+    on_fp_closing: Callable[[Any], None] | None = None,
 ) -> type[http.client.HTTPResponse]:
     class _BoundDeadlineHTTPResponse(http.client.HTTPResponse):
         def __init__(
@@ -512,60 +731,83 @@ def _make_deadline_response_class(
             method: str | None = None,
             url: str | None = None,
         ) -> None:
+            self._raw_resp_sock = sock
             super().__init__(sock, debuglevel=debuglevel, method=method, url=url)
             if isinstance(sock, socket.socket):
                 old_fp = self.fp
                 sock._io_refs += 1  # type: ignore[attr-defined]
                 try:
-                    self.fp = io.BufferedReader(_DeadlineSocketIO(sock, "r", deadline_getter))
+                    self.fp = io.BufferedReader(
+                        _DeadlineSocketIO(sock, "r", deadline_getter, on_close=on_fp_closing)
+                    )
                 except BaseException:
                     sock._io_refs -= 1  # type: ignore[attr-defined]
                     raise
                 finally:
                     _close_quietly(old_fp)
 
+        def close(self) -> None:
+            if on_fp_closing is not None and not isinstance(self._raw_resp_sock, socket.socket):
+                on_fp_closing(self._raw_resp_sock)
+            super().close()
+
     return _BoundDeadlineHTTPResponse
 
 
-def _handshake_tls_with_deadline(tls_sock: Any, conn_deadline: float | None) -> None:
+def _handshake_tls_with_deadline(
+    tls_sock: Any, conn_deadline: float | None, conn_owner: Any = None
+) -> None:
     """Complete TLS handshake strictly within ``conn_deadline`` even under slow-drip flights."""
-    if conn_deadline is None:
+    if _is_conn_aborted(conn_owner):
+        raise OSError(_ABORT_ERRNO, "TLS handshake aborted")
+    if conn_deadline is None and conn_owner is None:
         tls_sock.do_handshake()
         return
     if not isinstance(tls_sock, ssl.SSLSocket):
-        rem = conn_deadline - time.monotonic()
-        if rem <= 0:
-            raise TimeoutError("TLS handshake timed out")
-        tls_sock.settimeout(max(0.005, rem))
+        if conn_deadline is not None:
+            rem = conn_deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError("TLS handshake timed out")
+            tls_sock.settimeout(max(0.005, rem))
         tls_sock.do_handshake()
-        if time.monotonic() > conn_deadline:
+        if _is_conn_aborted(conn_owner):
+            raise OSError(_ABORT_ERRNO, "TLS handshake aborted")
+        if conn_deadline is not None and time.monotonic() > conn_deadline:
             raise TimeoutError("TLS handshake exceeded connect timeout")
         return
 
     tls_sock.setblocking(False)
     with selectors.DefaultSelector() as sel:
         while True:
-            rem = conn_deadline - time.monotonic()
-            if rem <= 0:
-                raise TimeoutError("TLS handshake timed out")
+            if _is_conn_aborted(conn_owner):
+                raise OSError(_ABORT_ERRNO, "TLS handshake aborted")
+            if conn_deadline is not None:
+                rem = conn_deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError("TLS handshake timed out")
+                wait_s = min(0.05, rem) if conn_owner is not None else rem
+            else:
+                wait_s = 0.05
             try:
                 tls_sock.do_handshake()
+                if _is_conn_aborted(conn_owner):
+                    raise OSError(_ABORT_ERRNO, "TLS handshake aborted")
                 return
             except ssl.SSLWantReadError:
                 sel.register(tls_sock, selectors.EVENT_READ)
                 try:
-                    ready = sel.select(rem)
+                    ready = sel.select(max(0.001, wait_s))
                 finally:
                     sel.unregister(tls_sock)
-                if not ready:
+                if not ready and conn_deadline is not None and time.monotonic() >= conn_deadline:
                     raise TimeoutError("TLS handshake timed out") from None
             except ssl.SSLWantWriteError:
                 sel.register(tls_sock, selectors.EVENT_WRITE)
                 try:
-                    ready = sel.select(rem)
+                    ready = sel.select(max(0.001, wait_s))
                 finally:
                     sel.unregister(tls_sock)
-                if not ready:
+                if not ready and conn_deadline is not None and time.monotonic() >= conn_deadline:
                     raise TimeoutError("TLS handshake timed out") from None
 
 
@@ -579,6 +821,7 @@ def _connect_tcp_and_tunnel(
         conn_deadline,
         conn.source_address,
         fallback_timeout=fb_t,
+        conn_owner=conn,
     )
     try:
         try:
@@ -599,31 +842,88 @@ def _connect_tcp_and_tunnel(
             finally:
                 if hasattr(conn, "_phase_deadline"):
                     setattr(conn, "_phase_deadline", None)
+            if _is_conn_aborted(conn):
+                raise OSError(_ABORT_ERRNO, "HTTP proxy CONNECT aborted")
             if conn_deadline is not None and time.monotonic() > conn_deadline:
                 raise TimeoutError("HTTP proxy CONNECT exceeded connect timeout")
     except BaseException:
+        abort_lock = getattr(conn, "_abort_lock", None)
+        if abort_lock is not None:
+            with abort_lock:
+                setattr(conn, "_cur_sock", None)
         _close_quietly(conn.sock)
         conn.sock = None
         raise
 
 
-class _SplitTimeoutHTTPConnection(http.client.HTTPConnection):
-    """HTTPConnection separating cumulative connect/tunnel budget from request I/O timeout."""
+class _SplitTimeoutConnMixin:
+    """Shared connect/I/O deadline & socket.shutdown abort lifecycle for HTTP and HTTPS connections."""
 
-    def __init__(
+    sock: Any
+    timeout: Any
+
+    def _init_split_timeout(
         self,
-        host: str,
-        port: int | None = None,
-        *,
-        connect_timeout: float | None = DEFAULT_CONNECT_TIMEOUT_SEC,
-        io_deadline: float | None = None,
-        **kwargs: Any,
+        connect_timeout: float | None,
+        io_deadline: float | None,
+        cancel_token: CancelToken | None,
     ) -> None:
-        super().__init__(host, port, **kwargs)
         self._connect_timeout = connect_timeout
         self._io_deadline = io_deadline
         self._phase_deadline: float | None = None
-        self.response_class = _make_deadline_response_class(self._current_read_deadline)
+        self._abort_lock = threading.Lock()
+        self._aborted = False
+        self._cur_sock: socket.socket | None = None
+        self._in_getresponse = False
+        self._handed_off_to_resp = False
+        self._bound_token = cancel_token
+        self._bound_hook_id = cancel_token.register_abort(self.abort_inflight) if cancel_token is not None else 0
+        self.response_class = _make_deadline_response_class(  # type: ignore[misc]
+            self._current_read_deadline, self._on_response_fp_closing
+        )
+
+    def _release_bound_hook(self) -> None:
+        tok, hid = self._bound_token, self._bound_hook_id
+        self._bound_token, self._bound_hook_id = None, 0
+        if tok is not None and hid:
+            tok.unregister_abort(hid)
+
+    def _on_response_fp_closing(self, resp_sock: Any) -> None:
+        release_hook = False
+        with self._abort_lock:
+            if self._handed_off_to_resp or self.sock is None:
+                if self._cur_sock is resp_sock:
+                    self._cur_sock = None
+                self._handed_off_to_resp = False
+                release_hook = True
+        if release_hook:
+            self._release_bound_hook()
+
+    def abort_inflight(self) -> None:
+        with self._abort_lock:
+            self._aborted = True
+            sock = self._cur_sock
+            if sock is not None:
+                try:
+                    # REDLINE: Always call base socket.socket.shutdown, NEVER SSLSocket.shutdown
+                    # (which sets self._sslobj = None unsafely across threads)!
+                    socket.socket.shutdown(sock, socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        if self._in_getresponse:
+            # CPython HTTPConnection.getresponse() calls self.close() on Connection: close while
+            # handing the live socket to HTTPResponse; preserve _cur_sock & hook until fp closes.
+            with self._abort_lock:
+                self._handed_off_to_resp = True
+            super().close()  # type: ignore[misc]
+            return
+        self._release_bound_hook()
+        with self._abort_lock:
+            self._handed_off_to_resp = False
+            self._cur_sock = None
+        super().close()  # type: ignore[misc]
 
     def _current_read_deadline(self) -> float | None:
         if self._phase_deadline is not None and self._io_deadline is not None:
@@ -674,25 +974,54 @@ class _SplitTimeoutHTTPConnection(http.client.HTTPConnection):
         if eff_dl is not None and self.sock is not None:
             self.sock.settimeout(max(0.005, eff_dl - now))
 
+    def getresponse(self) -> http.client.HTTPResponse:
+        self._arm_response_deadline()
+        self._in_getresponse = True
+        try:
+            resp: http.client.HTTPResponse = super().getresponse()  # type: ignore[misc]
+        except BaseException:
+            self._in_getresponse = False
+            self._release_bound_hook()
+            with self._abort_lock:
+                self._handed_off_to_resp = False
+                self._cur_sock = None
+            raise
+        self._in_getresponse = False
+        if self._io_deadline is not None:
+            _install_deadline_proxy(resp, self._io_deadline)
+        return resp
+
+
+class _SplitTimeoutHTTPConnection(_SplitTimeoutConnMixin, http.client.HTTPConnection):
+    """HTTPConnection separating cumulative connect/tunnel budget from request I/O timeout."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        connect_timeout: float | None = DEFAULT_CONNECT_TIMEOUT_SEC,
+        io_deadline: float | None = None,
+        cancel_token: CancelToken | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(host, port, **kwargs)
+        self._init_split_timeout(connect_timeout, io_deadline, cancel_token)
+
     def connect(self) -> None:
         conn_dl = self._compute_connect_deadline()
         _connect_tcp_and_tunnel(self, conn_dl)
         try:
             self._apply_post_connect_timeout()
         except BaseException:
+            with self._abort_lock:
+                self._cur_sock = None
             _close_quietly(self.sock)
             self.sock = None
             raise
 
-    def getresponse(self) -> http.client.HTTPResponse:
-        self._arm_response_deadline()
-        resp = super().getresponse()
-        if self._io_deadline is not None:
-            _install_deadline_proxy(resp, self._io_deadline)
-        return resp
 
-
-class _SplitTimeoutHTTPSConnection(http.client.HTTPSConnection):
+class _SplitTimeoutHTTPSConnection(_SplitTimeoutConnMixin, http.client.HTTPSConnection):
     """HTTPSConnection bounding TCP + proxy CONNECT + TLS handshake under connect_timeout."""
 
     def __init__(
@@ -702,25 +1031,11 @@ class _SplitTimeoutHTTPSConnection(http.client.HTTPSConnection):
         *,
         connect_timeout: float | None = DEFAULT_CONNECT_TIMEOUT_SEC,
         io_deadline: float | None = None,
+        cancel_token: CancelToken | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(host, port, **kwargs)
-        self._connect_timeout = connect_timeout
-        self._io_deadline = io_deadline
-        self._phase_deadline: float | None = None
-        self.response_class = _make_deadline_response_class(self._current_read_deadline)
-
-    def _current_read_deadline(self) -> float | None:
-        return _SplitTimeoutHTTPConnection._current_read_deadline(self)  # type: ignore[arg-type]
-
-    def _compute_connect_deadline(self) -> float | None:
-        return _SplitTimeoutHTTPConnection._compute_connect_deadline(self)  # type: ignore[arg-type]
-
-    def _apply_post_connect_timeout(self) -> None:
-        _SplitTimeoutHTTPConnection._apply_post_connect_timeout(self)  # type: ignore[arg-type]
-
-    def _arm_response_deadline(self) -> None:
-        _SplitTimeoutHTTPConnection._arm_response_deadline(self)  # type: ignore[arg-type]
+        self._init_split_timeout(connect_timeout, io_deadline, cancel_token)
 
     def connect(self) -> None:
         conn_dl = self._compute_connect_deadline()
@@ -729,33 +1044,34 @@ class _SplitTimeoutHTTPSConnection(http.client.HTTPSConnection):
             server_hostname = self._tunnel_host if self._tunnel_host else self.host  # type: ignore[attr-defined]
             if conn_dl is not None and (conn_dl - time.monotonic()) <= 0:
                 raise TimeoutError("TLS handshake timed out")
-            self.sock = self._context.wrap_socket(  # type: ignore[attr-defined]
-                self.sock,
-                server_hostname=server_hostname,
-                do_handshake_on_connect=False,
-            )
-            _handshake_tls_with_deadline(self.sock, conn_dl)
+            with self._abort_lock:
+                if self._aborted:
+                    raise OSError(_ABORT_ERRNO, "HTTPS connect aborted before TLS wrap")
+                tls_sock = self._context.wrap_socket(  # type: ignore[attr-defined]
+                    self.sock,
+                    server_hostname=server_hostname,
+                    do_handshake_on_connect=False,
+                )
+                self.sock = tls_sock
+                self._cur_sock = tls_sock
+            _handshake_tls_with_deadline(self.sock, conn_dl, conn_owner=self)
             self._apply_post_connect_timeout()
         except BaseException:
+            with self._abort_lock:
+                self._cur_sock = None
             _close_quietly(self.sock)
             self.sock = None
             raise
-
-    def getresponse(self) -> http.client.HTTPResponse:
-        self._arm_response_deadline()
-        resp = super().getresponse()
-        if self._io_deadline is not None:
-            _install_deadline_proxy(resp, self._io_deadline)
-        return resp
 
 
 class _SplitTimeoutHTTPHandler(urllib.request.HTTPHandler):
     def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
         conn_t = getattr(req, "_voice_connect_timeout", DEFAULT_CONNECT_TIMEOUT_SEC)
         io_dl = getattr(req, "_voice_deadline", None)
+        ctok = getattr(req, "_voice_cancel_token", None)
         return self.do_open(
             lambda host, **kw: _SplitTimeoutHTTPConnection(
-                host, connect_timeout=conn_t, io_deadline=io_dl, **kw
+                host, connect_timeout=conn_t, io_deadline=io_dl, cancel_token=ctok, **kw
             ),
             req,
         )
@@ -765,9 +1081,10 @@ class _SplitTimeoutHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
         conn_t = getattr(req, "_voice_connect_timeout", DEFAULT_CONNECT_TIMEOUT_SEC)
         io_dl = getattr(req, "_voice_deadline", None)
+        ctok = getattr(req, "_voice_cancel_token", None)
         return self.do_open(
             lambda host, **kw: _SplitTimeoutHTTPSConnection(
-                host, connect_timeout=conn_t, io_deadline=io_dl, **kw
+                host, connect_timeout=conn_t, io_deadline=io_dl, cancel_token=ctok, **kw
             ),
             req,
             context=self._context,
@@ -860,7 +1177,11 @@ class _KeepAlivePool:
                 bucket = self._idle[k]
                 kept: list[tuple[http.client.HTTPConnection, float]] = []
                 for c, ts in bucket:
-                    if (now - ts) > self.idle_timeout_sec or getattr(c, "sock", None) is None:
+                    if (
+                        (now - ts) > self.idle_timeout_sec
+                        or getattr(c, "sock", None) is None
+                        or getattr(c, "_aborted", False)
+                    ):
                         to_close.append(c)
                     else:
                         kept.append((c, ts))
@@ -885,9 +1206,13 @@ class _KeepAlivePool:
                 if hasattr(reused_conn, "_phase_deadline"):
                     setattr(reused_conn, "_phase_deadline", None)
                 sock = getattr(reused_conn, "sock", None)
-                if sock is None:
+                if sock is None or getattr(reused_conn, "_aborted", False):
                     _close_quietly(reused_conn)
                 else:
+                    abort_lock = getattr(reused_conn, "_abort_lock", None)
+                    if abort_lock is not None:
+                        with abort_lock:
+                            setattr(reused_conn, "_cur_sock", sock)
                     sock.settimeout(timeout_sec)
                     return reused_conn, True
             except Exception:
@@ -980,6 +1305,46 @@ def _should_use_system_proxy(scheme: str, host: str, port: int | None = None) ->
     return True
 
 
+def _combine_cancel_check(
+    is_cancelled: Callable[[], bool] | None,
+    cancel_token: CancelToken | None,
+) -> Callable[[], bool] | None:
+    if cancel_token is None:
+        return is_cancelled
+    if is_cancelled is None:
+        return cancel_token.is_cancelled
+    return lambda: cancel_token.is_cancelled() or is_cancelled()
+
+
+def _register_conn_abort(cancel_token: CancelToken | None, conn: Any) -> int:
+    abort_fn = getattr(conn, "abort_inflight", None)
+    return cancel_token.register_abort(abort_fn) if (cancel_token is not None and callable(abort_fn)) else 0
+
+
+def _unregister_conn_abort(cancel_token: CancelToken | None, hook_id: int) -> None:
+    if cancel_token is not None and hook_id:
+        cancel_token.unregister_abort(hook_id)
+
+
+def _can_reuse_pooled_conn(
+    conn: Any,
+    resp: Any,
+    conn_header: str,
+    *,
+    body_drained: bool,
+    aborted: bool,
+) -> bool:
+    close_tokens = {tok_s.strip().lower() for tok_s in conn_header.split(",") if tok_s.strip()}
+    return (
+        body_drained
+        and not aborted
+        and not bool(getattr(resp, "_aborted", False))
+        and not bool(getattr(resp, "will_close", True))
+        and "close" not in close_tokens
+        and getattr(conn, "sock", None) is not None
+    )
+
+
 def _execute_keepalive(
     req: HttpRequest,
     *,
@@ -1020,7 +1385,11 @@ def _execute_keepalive(
 
         conn: http.client.HTTPConnection | None = None
         resp: http.client.HTTPResponse | None = None
+        hook_id = 0
+        tok = req.cancel_token
         for attempt in range(2):
+            if tok is not None and tok.is_cancelled():
+                raise HttpTransportError("HTTP request cancelled", retry_kind="never")
             conn, reused = _KEEPALIVE_POOL.acquire(
                 scheme,
                 host,
@@ -1030,6 +1399,7 @@ def _execute_keepalive(
                 connect_timeout_sec=conn_timeout,
                 io_deadline=wall_deadline,
             )
+            hook_id = _register_conn_abort(tok, conn)
             try:
                 if not reused:
                     conn.connect()
@@ -1042,19 +1412,20 @@ def _execute_keepalive(
                     sock.settimeout(max(0.005, min(float(req.timeout_sec), rem_resp)))
                 resp = conn.getresponse()
                 break
-            except _STALE_CONN_ERRORS:
+            except BaseException as exc:
+                _unregister_conn_abort(tok, hook_id)
+                hook_id = 0
+                aborted = getattr(conn, "_aborted", False) or (tok is not None and tok.is_cancelled())
                 _close_quietly(conn)
                 conn = None
-                if reused and attempt == 0:
+                if aborted:
+                    raise HttpTransportError("HTTP request cancelled", retry_kind="never") from None
+                if isinstance(exc, _STALE_CONN_ERRORS) and reused and attempt == 0:
                     rem_retry = wall_deadline - time.monotonic()
                     if rem_retry <= 0:
                         raise TimeoutError("HTTP retry exceeded total request deadline") from None
                     eff_timeout = max(0.005, min(float(req.timeout_sec), rem_retry))
                     continue
-                raise
-            except BaseException:
-                _close_quietly(conn)
-                conn = None
                 raise
 
         assert conn is not None and resp is not None
@@ -1072,33 +1443,34 @@ def _execute_keepalive(
 
         can_reuse = False
         try:
-            if is_redirect:
-                body = _read_stream_with_deadline(
-                    resp, wall_deadline, max_bytes=_STREAM_CHUNK_BYTES
-                )
-            else:
-                body = _read_stream_with_deadline(resp, wall_deadline)
-
-            conn_hdr = resp_hdrs.get("connection", "")
-            close_tokens = {tok.strip().lower() for tok in conn_hdr.split(",") if tok.strip()}
+            body = _read_stream_with_deadline(
+                resp, wall_deadline, max_bytes=(_STREAM_CHUNK_BYTES if is_redirect else None)
+            )
             body_fully_drained = (
                 cur_method == "HEAD"
                 or status in (204, 304)
                 or (bool(getattr(resp, "chunked", False)) and resp.isclosed())
                 or (not getattr(resp, "chunked", False) and getattr(resp, "length", None) == 0)
             )
-            can_reuse = (
-                body_fully_drained
-                and not bool(getattr(resp, "will_close", True))
-                and "close" not in close_tokens
-                and getattr(conn, "sock", None) is not None
+            can_reuse = _can_reuse_pooled_conn(
+                conn,
+                resp,
+                resp_hdrs.get("connection", ""),
+                body_drained=body_fully_drained,
+                aborted=bool(getattr(conn, "_aborted", False) or (tok is not None and tok.is_cancelled())),
             )
         finally:
+            _unregister_conn_abort(tok, hook_id)
+            if getattr(conn, "_aborted", False) or (tok is not None and tok.is_cancelled()):
+                can_reuse = False
             _close_quietly(resp)
             if can_reuse:
                 _KEEPALIVE_POOL.release(scheme, host, port, conn)
             else:
                 _close_quietly(conn)
+
+        if getattr(conn, "_aborted", False) or (tok is not None and tok.is_cancelled()):
+            raise HttpTransportError("HTTP request cancelled", retry_kind="never")
 
         if not is_redirect:
             return HttpResponse(status=status, headers=resp_hdrs, body=body)
@@ -1585,10 +1957,12 @@ class _ProviderRatePacer:
         clock_fn: Callable[[], float],
         sleep_fn: Callable[[float], None],
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> Iterator[bool]:
         if not key:
             yield False
             return
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
         now = clock_fn()
         with self._lock:
             b = self._buckets.get(key)
@@ -1605,16 +1979,16 @@ class _ProviderRatePacer:
         waited = False
         if need_serial:
             t_lock = clock_fn()
-            if is_cancelled is not None or (deadline is not None and clock_fn is time.monotonic):
+            if eff_cancelled is not None or (deadline is not None and clock_fn is time.monotonic):
                 while True:
-                    if is_cancelled is not None and is_cancelled():
+                    if eff_cancelled is not None and eff_cancelled():
                         yield False
                         return
                     if deadline is not None and clock_fn is time.monotonic:
                         rem_lock = deadline - clock_fn()
                         if rem_lock <= 0:
                             raise TimeoutError("rate-limit concurrency queue exceeded timeout budget")
-                        step_to = min(0.05, rem_lock) if is_cancelled is not None else max(0.005, rem_lock)
+                        step_to = min(0.05, rem_lock) if eff_cancelled is not None else max(0.005, rem_lock)
                     else:
                         step_to = 0.05
                     if inflight_lock.acquire(timeout=max(0.002, step_to)):
@@ -1640,7 +2014,12 @@ class _ProviderRatePacer:
                     wait_sec = 0.0
             if wait_sec > 0:
                 waited = True
-                _sleep_cooperative(wait_sec, sleep_fn=sleep_fn, is_cancelled=is_cancelled)
+                _sleep_cooperative(
+                    wait_sec,
+                    sleep_fn=sleep_fn,
+                    is_cancelled=eff_cancelled,
+                    cancel_token=cancel_token,
+                )
             yield waited
         finally:
             if acquired_serial:
@@ -1652,11 +2031,32 @@ def _sleep_cooperative(
     *,
     sleep_fn: Callable[[float], None],
     is_cancelled: Callable[[], bool] | None = None,
+    cancel_token: CancelToken | None = None,
 ) -> None:
     if seconds <= 0:
         return
-    if is_cancelled is not None and is_cancelled():
+    if (cancel_token is not None and cancel_token.is_cancelled()) or (
+        is_cancelled is not None and is_cancelled()
+    ):
         return
+    if sleep_fn is time.sleep and cancel_token is not None:
+        ev = threading.Event()
+        cancel_token.bind_event(ev)
+        try:
+            if is_cancelled is None:
+                ev.wait(seconds)
+                return
+            end_ev = time.monotonic() + seconds
+            while True:
+                if is_cancelled() or ev.is_set():
+                    return
+                rem_ev = end_ev - time.monotonic()
+                if rem_ev <= 0:
+                    return
+                if ev.wait(min(0.05, rem_ev)):
+                    return
+        finally:
+            cancel_token.unbind_event(ev)
     if sleep_fn is not time.sleep or is_cancelled is None or seconds <= 0.1:
         sleep_fn(seconds)
         return
@@ -1716,6 +2116,10 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
         setattr(ureq, "_voice_deadline", wall_deadline)
         setattr(ureq, "_voice_req_timeout", float(req.timeout_sec))
         setattr(ureq, "_voice_connect_timeout", conn_timeout)
+        if req.cancel_token is not None:
+            setattr(ureq, "_voice_cancel_token", req.cancel_token)
+            if req.cancel_token.is_cancelled():
+                raise HttpTransportError("HTTP request cancelled", retry_kind="never")
         cur_proxies = urllib.request.getproxies()
         opener = (
             _SAFE_OPENER
@@ -1731,9 +2135,13 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
             status = getattr(resp, "status", None) or resp.getcode() or 200
             hdrs = {k.lower(): v for k, v in resp.headers.items()}
             body = _read_stream_with_deadline(resp, wall_deadline)
+            if req.cancel_token is not None and req.cancel_token.is_cancelled():
+                raise HttpTransportError("HTTP request cancelled", retry_kind="never")
             return HttpResponse(status=int(status), headers=hdrs, body=body)
     except urllib.error.HTTPError as exc:
         try:
+            if req.cancel_token is not None and req.cancel_token.is_cancelled():
+                raise HttpTransportError("HTTP request cancelled", retry_kind="never") from None
             hdrs = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
             try:
                 body = _read_stream_with_deadline(exc, wall_deadline)
@@ -1741,10 +2149,14 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
                 raise
             except Exception:
                 body = b""
+            if req.cancel_token is not None and req.cancel_token.is_cancelled():
+                raise HttpTransportError("HTTP request cancelled", retry_kind="never") from None
             return HttpResponse(status=int(exc.code), headers=hdrs, body=body)
         finally:
             _close_quietly(exc)
     except (urllib.error.URLError, TimeoutError, socket.timeout, http.client.HTTPException, OSError) as exc:
+        if req.cancel_token is not None and req.cancel_token.is_cancelled():
+            raise HttpTransportError("HTTP request cancelled", retry_kind="never") from None
         rkind = classify_transport_error(exc)
         raise HttpTransportError(
             f"HTTP transport error for {req.url}: {exc}", retry_kind=rkind
@@ -2495,10 +2907,19 @@ class BaseAsrProvider:
         deadline: float | None = None,
         pacer_key: str = "",
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> HttpResponse:
+        eff_tok = cancel_token if cancel_token is not None else req.cancel_token
+        eff_cancelled = _combine_cancel_check(is_cancelled, eff_tok)
         now = self.clock_fn()
         budget_sec = max(float(self.cfg.asr.timeout_sec), float(req.timeout_sec))
         logical_deadline = deadline if deadline is not None else (now + float(req.timeout_sec))
+        if eff_cancelled is not None and eff_cancelled():
+            raise self._fail(
+                "ASR request cancelled",
+                extra_secrets=extra_secrets,
+                retry_kind="never",
+            )
         if now > logical_deadline:
             raise self._fail(
                 f"ASR HTTP request timed out before send (budget={budget_sec:.2f}s)",
@@ -2511,9 +2932,10 @@ class BaseAsrProvider:
                 deadline=logical_deadline,
                 clock_fn=self.clock_fn,
                 sleep_fn=self.sleep_fn,
-                is_cancelled=is_cancelled,
+                is_cancelled=eff_cancelled,
+                cancel_token=eff_tok,
             ) as pacer_waited:
-                if is_cancelled is not None and is_cancelled():
+                if eff_cancelled is not None and eff_cancelled():
                     raise self._fail(
                         "ASR request cancelled",
                         extra_secrets=extra_secrets,
@@ -2527,6 +2949,8 @@ class BaseAsrProvider:
                         retry_kind="transient",
                     )
                 eff_req = req
+                if eff_tok is not None and eff_req.cancel_token is None:
+                    eff_req = replace(eff_req, cancel_token=eff_tok)
                 rem_send = max(0.005, logical_deadline - now_send)
                 if pacer_waited or rem_send < float(req.timeout_sec) - 0.02:
                     eff_req = replace(
@@ -2539,11 +2963,23 @@ class BaseAsrProvider:
         except AsrError:
             raise
         except Exception as exc:
+            if eff_cancelled is not None and eff_cancelled():
+                raise self._fail(
+                    "ASR request cancelled",
+                    extra_secrets=extra_secrets,
+                    retry_kind="never",
+                ) from None
             rkind = classify_transport_error(exc)
             raise self._fail(
                 str(exc), extra_secrets=extra_secrets, retry_kind=rkind
             ) from None
 
+        if eff_cancelled is not None and eff_cancelled():
+            raise self._fail(
+                "ASR request cancelled",
+                extra_secrets=extra_secrets,
+                retry_kind="never",
+            )
         if self.clock_fn() > logical_deadline + 1e-9:
             raise self._fail(
                 f"ASR HTTP response exceeded timeout budget ({budget_sec:.2f}s)",
@@ -2561,7 +2997,9 @@ class BaseAsrProvider:
         deadline: float,
         pacer_key: str,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> bool:
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
         if err.retry_kind not in ("rate_limit", "transient"):
             return False
         now = self.clock_fn()
@@ -2574,7 +3012,7 @@ class BaseAsrProvider:
             )
         if retries_used >= max_retries:
             return False
-        if is_cancelled is not None and is_cancelled():
+        if eff_cancelled is not None and eff_cancelled():
             return False
         rem = deadline - now
         if rem <= 0.02:
@@ -2589,8 +3027,13 @@ class BaseAsrProvider:
         )
         if delay >= rem - 0.01:
             return False
-        _sleep_cooperative(delay, sleep_fn=self.sleep_fn, is_cancelled=is_cancelled)
-        if is_cancelled is not None and is_cancelled():
+        _sleep_cooperative(
+            delay,
+            sleep_fn=self.sleep_fn,
+            is_cancelled=eff_cancelled,
+            cancel_token=cancel_token,
+        )
+        if eff_cancelled is not None and eff_cancelled():
             return False
         if (deadline - self.clock_fn()) <= 0:
             return False
@@ -2604,13 +3047,15 @@ class BaseAsrProvider:
         is_cancelled: Callable[[], bool] | None,
         attempt_fn: Callable[[float], str],
         budget_sec: float | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> tuple[str, int, bool]:
         """Run ``attempt_fn(rem_sec)`` with bounded retries; returns ``(text, retries_used, cancelled)``."""
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
         max_retries = max(0, int(self.cfg.asr.max_retries))
         eff_budget = float(self.cfg.asr.timeout_sec) if budget_sec is None else float(budget_sec)
         retries_used = 0
         while True:
-            if is_cancelled is not None and is_cancelled():
+            if eff_cancelled is not None and eff_cancelled():
                 return "", retries_used, True
             raw_rem = deadline - self.clock_fn()
             rem = (
@@ -2620,9 +3065,11 @@ class BaseAsrProvider:
             )
             try:
                 out = attempt_fn(rem)
+                if eff_cancelled is not None and eff_cancelled():
+                    return "", retries_used, True
                 return out, retries_used, False
             except AsrError as err:
-                if is_cancelled is not None and is_cancelled():
+                if eff_cancelled is not None and eff_cancelled():
                     return "", retries_used, True
                 if not self._maybe_backoff_before_retry(
                     err,
@@ -2630,9 +3077,10 @@ class BaseAsrProvider:
                     max_retries=max_retries,
                     deadline=deadline,
                     pacer_key=pacer_key,
-                    is_cancelled=is_cancelled,
+                    is_cancelled=eff_cancelled,
+                    cancel_token=cancel_token,
                 ):
-                    if is_cancelled is not None and is_cancelled():
+                    if eff_cancelled is not None and eff_cancelled():
                         return "", retries_used, True
                     raise
                 retries_used += 1
@@ -2643,6 +3091,7 @@ class BaseAsrProvider:
         context: AsrContext | Mapping[str, Any] | None = None,
         *,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> AsrResult:
         raise NotImplementedError
 
@@ -2697,7 +3146,9 @@ class DashScopeAsrProvider(BaseAsrProvider):
         context: AsrContext | Mapping[str, Any] | None = None,
         *,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> AsrResult:
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
         model = self.cfg.asr.effective_model("dashscope")
         if not wav_bytes:
             return AsrResult(
@@ -2724,43 +3175,27 @@ class DashScopeAsrProvider(BaseAsrProvider):
         eff_timeout = float(self.cfg.asr.timeout_sec)
         t0 = self.clock_fn()
         deadline = t0 + eff_timeout
-        if use_native:
-            raw_text, retries_used, _ = self._execute_with_retry(
+        route_fn = self._call_native_route if use_native else self._call_compat_route
+        raw_text, retries_used, cancelled = self._execute_with_retry(
+            deadline=deadline,
+            pacer_key=pacer_key,
+            is_cancelled=eff_cancelled,
+            cancel_token=cancel_token,
+            attempt_fn=lambda rem: route_fn(
+                url,
+                headers,
+                model,
+                data_uri,
+                ctx_text,
+                cred.value,
+                timeout_sec=rem,
                 deadline=deadline,
                 pacer_key=pacer_key,
-                is_cancelled=is_cancelled,
-                attempt_fn=lambda rem: self._call_native_route(
-                    url,
-                    headers,
-                    model,
-                    data_uri,
-                    ctx_text,
-                    cred.value,
-                    timeout_sec=rem,
-                    deadline=deadline,
-                    pacer_key=pacer_key,
-                    is_cancelled=is_cancelled,
-                ),
-            )
-        else:
-            raw_text, retries_used, _ = self._execute_with_retry(
-                deadline=deadline,
-                pacer_key=pacer_key,
-                is_cancelled=is_cancelled,
-                attempt_fn=lambda rem: self._call_compat_route(
-                    url,
-                    headers,
-                    model,
-                    data_uri,
-                    ctx_text,
-                    cred.value,
-                    timeout_sec=rem,
-                    deadline=deadline,
-                    pacer_key=pacer_key,
-                    is_cancelled=is_cancelled,
-                ),
-            )
-        text = strip_lenticular_artifacts(raw_text).strip()
+                is_cancelled=eff_cancelled,
+                cancel_token=cancel_token,
+            ),
+        )
+        text = "" if cancelled else strip_lenticular_artifacts(raw_text).strip()
         latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
         return AsrResult(
             text=text,
@@ -2784,6 +3219,7 @@ class DashScopeAsrProvider(BaseAsrProvider):
         deadline: float | None = None,
         pacer_key: str = "",
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = []
         if ctx_text:
@@ -2817,11 +3253,13 @@ class DashScopeAsrProvider(BaseAsrProvider):
                 headers=headers,
                 body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 timeout_sec=self.cfg.asr.timeout_sec if timeout_sec is None else timeout_sec,
+                cancel_token=cancel_token,
             ),
             extra_secrets=(secret,),
             deadline=deadline,
             pacer_key=pacer_key,
             is_cancelled=is_cancelled,
+            cancel_token=cancel_token,
         )
         try:
             data = resp.json()
@@ -2878,6 +3316,7 @@ class DashScopeAsrProvider(BaseAsrProvider):
         deadline: float | None = None,
         pacer_key: str = "",
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = []
         if ctx_text:
@@ -2899,11 +3338,13 @@ class DashScopeAsrProvider(BaseAsrProvider):
                 headers=headers,
                 body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 timeout_sec=self.cfg.asr.timeout_sec if timeout_sec is None else timeout_sec,
+                cancel_token=cancel_token,
             ),
             extra_secrets=(secret,),
             deadline=deadline,
             pacer_key=pacer_key,
             is_cancelled=is_cancelled,
+            cancel_token=cancel_token,
         )
         try:
             data = resp.json()
@@ -3108,7 +3549,9 @@ class DoubaoAsrProvider(BaseAsrProvider):
         context: AsrContext | Mapping[str, Any] | None = None,
         *,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> AsrResult:
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
         model = self.cfg.asr.effective_model("doubao")
         if not wav_bytes:
             return AsrResult(text="", provider=self.provider_name, model=model, latency_ms=0)
@@ -3153,7 +3596,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
         retries_box = [0]
 
         for mode, rid in candidates:
-            if is_cancelled is not None and is_cancelled():
+            if eff_cancelled is not None and eff_cancelled():
                 return AsrResult(
                     text="",
                     provider=self.provider_name,
@@ -3173,7 +3616,8 @@ class DoubaoAsrProvider(BaseAsrProvider):
                         budget_sec=eff_timeout,
                         pacer_key=pacer_key,
                         retries_box=retries_box,
-                        is_cancelled=is_cancelled,
+                        is_cancelled=eff_cancelled,
+                        cancel_token=cancel_token,
                     )
                 else:
                     text, cancelled = self._run_submit_and_query(
@@ -3187,7 +3631,8 @@ class DoubaoAsrProvider(BaseAsrProvider):
                         budget_sec=eff_timeout,
                         pacer_key=pacer_key,
                         retries_box=retries_box,
-                        is_cancelled=is_cancelled,
+                        is_cancelled=eff_cancelled,
+                        cancel_token=cancel_token,
                     )
                 if not cancelled and is_auto_slot:
                     with _DOUBAO_SLOT_LOCK:
@@ -3260,6 +3705,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
         pacer_key: str = "",
         retries_box: list[int] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> tuple[str, bool]:
         max_retries = max(0, int(self.cfg.asr.max_retries))
         rbox = retries_box if retries_box is not None else [0]
@@ -3283,11 +3729,13 @@ class DoubaoAsrProvider(BaseAsrProvider):
                         headers=headers,
                         body=body_bytes,
                         timeout_sec=rem,
+                        cancel_token=cancel_token,
                     ),
                     extra_secrets=secrets,
                     deadline=deadline,
                     pacer_key=pacer_key,
                     is_cancelled=is_cancelled,
+                    cancel_token=cancel_token,
                 )
                 non_json = False
                 try:
@@ -3330,6 +3778,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
                     deadline=deadline,
                     pacer_key=pacer_key,
                     is_cancelled=is_cancelled,
+                    cancel_token=cancel_token,
                 ):
                     if is_cancelled is not None and is_cancelled():
                         return "", True
@@ -3350,6 +3799,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
         pacer_key: str = "",
         retries_box: list[int] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> tuple[str, bool]:
         max_retries = max(0, int(self.cfg.asr.max_retries))
         rbox = retries_box if retries_box is not None else [0]
@@ -3376,11 +3826,13 @@ class DoubaoAsrProvider(BaseAsrProvider):
                         headers=common_headers,
                         body=body_bytes,
                         timeout_sec=rem,
+                        cancel_token=cancel_token,
                     ),
                     extra_secrets=secrets,
                     deadline=deadline,
                     pacer_key=pacer_key,
                     is_cancelled=is_cancelled,
+                    cancel_token=cancel_token,
                 )
                 sub_non_json = False
                 try:
@@ -3418,6 +3870,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
                     deadline=deadline,
                     pacer_key=pacer_key,
                     is_cancelled=is_cancelled,
+                    cancel_token=cancel_token,
                 ):
                     if is_cancelled is not None and is_cancelled():
                         return "", True
@@ -3442,6 +3895,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
                         min(wait_sec, rem_before_sleep),
                         sleep_fn=self.sleep_fn,
                         is_cancelled=is_cancelled,
+                        cancel_token=cancel_token,
                     )
                     if is_cancelled is not None and is_cancelled():
                         return "", True
@@ -3457,11 +3911,13 @@ class DoubaoAsrProvider(BaseAsrProvider):
                         headers=common_headers,
                         body=query_body,
                         timeout_sec=rem_for_query,
+                        cancel_token=cancel_token,
                     ),
                     extra_secrets=secrets,
                     deadline=deadline,
                     pacer_key=pacer_key,
                     is_cancelled=is_cancelled,
+                    cancel_token=cancel_token,
                 )
                 q_non_json = False
                 try:
@@ -3508,6 +3964,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
                     deadline=deadline,
                     pacer_key=pacer_key,
                     is_cancelled=is_cancelled,
+                    cancel_token=cancel_token,
                 ):
                     if is_cancelled is not None and is_cancelled():
                         return "", True
@@ -3553,7 +4010,9 @@ class GeminiAudioProvider(BaseAsrProvider):
         context: AsrContext | Mapping[str, Any] | None = None,
         *,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> AsrResult:
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
         model = self.cfg.asr.effective_model("gemini")
         gen_cfg = build_gemini_generation_config(model, self.cfg.asr.effort, temperature=0.1)
         if not wav_bytes:
@@ -3628,11 +4087,13 @@ class GeminiAudioProvider(BaseAsrProvider):
                     headers=headers,
                     body=body_bytes,
                     timeout_sec=rem,
+                    cancel_token=cancel_token,
                 ),
                 extra_secrets=(cred.value,),
                 deadline=deadline,
                 pacer_key=pacer_key,
-                is_cancelled=is_cancelled,
+                is_cancelled=eff_cancelled,
+                cancel_token=cancel_token,
             )
             try:
                 data = resp.json()
@@ -3695,9 +4156,10 @@ class GeminiAudioProvider(BaseAsrProvider):
         raw_out, retries_used, cancelled = self._execute_with_retry(
             deadline=deadline,
             pacer_key=pacer_key,
-            is_cancelled=is_cancelled,
+            is_cancelled=eff_cancelled,
             attempt_fn=_attempt,
             budget_sec=eff_timeout,
+            cancel_token=cancel_token,
         )
         latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
         in_tok, cached_tok, out_tok, rsn_tok = usage_box[0] if not cancelled else _EMPTY_USAGE
@@ -3807,7 +4269,9 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
         context: AsrContext | Mapping[str, Any] | None = None,
         *,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> AsrResult:
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
         model = self.cfg.asr.effective_model(self.provider_name)
         base = self._resolve_base_url()
         if not wav_bytes:
@@ -3870,11 +4334,13 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
                     headers=headers,
                     body=body,
                     timeout_sec=rem,
+                    cancel_token=cancel_token,
                 ),
                 extra_secrets=secrets,
                 deadline=deadline,
                 pacer_key=pacer_key,
-                is_cancelled=is_cancelled,
+                is_cancelled=eff_cancelled,
+                cancel_token=cancel_token,
             )
 
             if resp.status != 200:
@@ -3925,8 +4391,9 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
         raw_out, retries_used, cancelled = self._execute_with_retry(
             deadline=deadline,
             pacer_key=pacer_key,
-            is_cancelled=is_cancelled,
+            is_cancelled=eff_cancelled,
             attempt_fn=_attempt,
+            cancel_token=cancel_token,
         )
         latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
         text = "" if cancelled else strip_lenticular_artifacts(raw_out).strip()
@@ -3962,7 +4429,9 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
         context: AsrContext | Mapping[str, Any] | None = None,
         *,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> AsrResult:
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
         model = self.cfg.asr.effective_model(self.provider_name)
         if self.provider_name == "dashscope":
             url = _resolve_dashscope_url(self.cfg.asr.base_url, use_native=False)
@@ -4072,11 +4541,13 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                     headers=headers,
                     body=body_bytes,
                     timeout_sec=rem,
+                    cancel_token=cancel_token,
                 ),
                 extra_secrets=secrets,
                 deadline=deadline,
                 pacer_key=pacer_key,
-                is_cancelled=is_cancelled,
+                is_cancelled=eff_cancelled,
+                cancel_token=cancel_token,
             )
             try:
                 data = resp.json()
@@ -4119,9 +4590,10 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
         raw_out, retries_used, cancelled = self._execute_with_retry(
             deadline=deadline,
             pacer_key=pacer_key,
-            is_cancelled=is_cancelled,
+            is_cancelled=eff_cancelled,
             attempt_fn=_attempt,
             budget_sec=eff_timeout,
+            cancel_token=cancel_token,
         )
         latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
         out_text = "" if cancelled else _normalize_single_hop_text(raw_out)
@@ -4215,6 +4687,7 @@ def transcribe(
     sleep_fn: Callable[[float], None] = time.sleep,
     rand_fn: Callable[[], float] = random.random,
     is_cancelled: Callable[[], bool] | None = None,
+    cancel_token: CancelToken | None = None,
 ) -> AsrResult:
     """Top-level transcribe entry point fixed across Chunk 1 and Chunk 2."""
     provider = create_asr_provider(
@@ -4226,4 +4699,9 @@ def transcribe(
         sleep_fn=sleep_fn,
         rand_fn=rand_fn,
     )
-    return provider.transcribe(wav_bytes, context=context, is_cancelled=is_cancelled)
+    return provider.transcribe(
+        wav_bytes,
+        context=context,
+        is_cancelled=is_cancelled,
+        cancel_token=cancel_token,
+    )

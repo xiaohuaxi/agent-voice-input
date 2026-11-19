@@ -45,6 +45,7 @@ struct EmittedEvent {
     let flags: UInt
     let isDown: Bool
     let tainted: Bool
+    var holdMs: Int = 0
 }
 
 private let FUNCTION_KEY_CODES: [Int: UInt16] = [
@@ -207,9 +208,15 @@ struct HotkeyEngine {
                         out.append(EmittedEvent(kind: "ptt_cancel", vk: actionVk, flags: rawFlags, isDown: false, tainted: true))
                     }
                 }
-            } else if !chordTainted && nowMs >= downTickMs && (nowMs - downTickMs) <= tapMaxMs && debouncePassed(nowMs) {
-                lastFireTickMs = nowMs; hasFiredOnce = true
-                out.append(EmittedEvent(kind: "toggle", vk: actionVk, flags: rawFlags, isDown: false, tainted: false))
+            } else if !chordTainted && nowMs >= downTickMs && debouncePassed(nowMs) {
+                let held = nowMs - downTickMs
+                if held <= tapMaxMs {
+                    lastFireTickMs = nowMs; hasFiredOnce = true
+                    out.append(EmittedEvent(kind: "toggle", vk: actionVk, flags: rawFlags, isDown: false, tainted: false))
+                } else if held <= 8000 {
+                    lastFireTickMs = nowMs; hasFiredOnce = true
+                    out.append(EmittedEvent(kind: "hold_cancel", vk: actionVk, flags: rawFlags, isDown: false, tainted: false, holdMs: Int(held)))
+                }
             }
             targetDown = false; pttActive = false; chordTainted = false
         } else {
@@ -475,6 +482,19 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
             mainText: toastMainText,
             hintText: toastHintText,
             autoHideMs: 2200,
+            iconKind: "empty_ring"
+        )
+    case "cancelled":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "○ 已取消" : "○ Cancelled",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 1600,
             iconKind: "empty_ring"
         )
     case "mic_unavailable":
@@ -1896,6 +1916,15 @@ private func runSelfCheck() -> Int32 {
         let recov = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 5600, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
         try check(recov.count == 1 && recov[0].kind == "toggle", "recovered toggle after swallowed keyUp")
 
+        // 7: Isolated long-press in tap_toggle (1200ms < held <= 8000ms) emits hold_cancel; >8000ms or chord-tainted is ignored
+        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 6000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        let hcOk = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 7500, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        try check(hcOk.count == 1 && hcOk[0].kind == "hold_cancel" && hcOk[0].holdMs == 1500, "tap_toggle hold_cancel")
+        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 8000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        try check(eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 17000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false }).isEmpty, "hold >8000ms ignored")
+        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 18000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        try check(eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 19500, keyDownCounter: 31, isKeyPhysicallyDown: { _ in false }).isEmpty, "chord-tainted hold ignored")
+
         try check(isZhUiCulture("zh-Hans-CN") && isZhUiCulture("zh_TW.UTF-8") && !isZhUiCulture("en-US"), "ui_culture zh detection")
         try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 58.0, "HUD bottom pillY")
         try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 58.0, "HUD default pillY")
@@ -1912,6 +1941,7 @@ private func runSelfCheck() -> Int32 {
         let stBusy = resolveHudVisualStyle(state: "mic_unavailable", zh: true)
         let stRecov = resolveHudVisualStyle(state: "audio_recovered", zh: true)
         let stEmpty = resolveHudVisualStyle(state: "empty", zh: true)
+        let stCancelled = resolveHudVisualStyle(state: "cancelled", zh: true)
         let stNoMic = resolveHudVisualStyle(state: "no_mic", zh: true)
         let stPerm = resolveHudVisualStyle(state: "mic_permission", zh: true)
         let stPaste = resolveHudVisualStyle(state: "paste_failed", zh: true)
@@ -1921,6 +1951,7 @@ private func runSelfCheck() -> Int32 {
         try check(stBusy.layer == "toast" && stBusy.iconKind == "warning" && stBusy.borderWidth == 1.0, "style mic_unavailable")
         try check(stRecov.layer == "toast" && stRecov.iconKind == "warning" && stRecov.bg == stBusy.bg && stRecov.border == stBusy.border, "style audio_recovered")
         try check(stEmpty.layer == "toast" && stEmpty.iconKind == "empty_ring" && stEmpty.border == stBusy.border, "style empty")
+        try check(stCancelled.layer == "toast" && stCancelled.iconKind == "empty_ring" && stCancelled.autoHideMs == 1600 && stCancelled.defaultText == "○ 已取消", "style cancelled")
         try check(stNoMic.layer == "toast" && stNoMic.iconKind == "cross" && stNoMic.bg == stBusy.bg && stNoMic.border != stBusy.border, "style no_mic")
         try check(stPerm.layer == "toast" && stPerm.iconKind == "cross" && stPerm.autoHideMs == 3200, "style mic_permission")
         try check(stPaste.layer == "toast" && stPaste.iconKind == "cross" && stPaste.border == stNoMic.border, "style paste_failed")
@@ -2064,7 +2095,9 @@ struct MacShimMain {
                     writeJsonLine(["event": item.kind, "vk": String(format: "0x%02X", item.vk), "key_name": kname, "flags": String(format: "0x%X", item.flags), "is_down": item.isDown, "tainted": item.tainted])
                 } else {
                     let fg = queryFrontmostApp()
-                    writeJsonLine(["event": item.kind, "hwnd": fg.hwnd, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": fg.title, "ax_trusted": fg.axTrusted, "ts_ms": now])
+                    var payload: [String: Any] = ["event": item.kind, "hwnd": fg.hwnd, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": fg.title, "ax_trusted": fg.axTrusted, "ts_ms": now]
+                    if item.kind == "hold_cancel" { payload["hold_ms"] = item.holdMs }
+                    writeJsonLine(payload)
                 }
             }
         }

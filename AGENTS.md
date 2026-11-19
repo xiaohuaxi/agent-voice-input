@@ -32,7 +32,7 @@
 ## 运行边界与验证
 
 - 测试隔离：`tests/` 保持离线可重入，不访问外网，不读写宿主机真实配置与运行期目录（`~/.config`、`$XDG_RUNTIME_DIR` 等）。
-- 脱敏与状态隐私：异常摘要、日志与 `status` 快照输出经 `redact_secrets` 脱敏，不在运行状态文件中落盘用户语音原文；录音仅在识别/投递失败时以 `0600` 权限原子暂存于运行目录 `failed/`（保留 24 小时内最近 10 条 WAV 供 `retry` 恢复），或用户显式开启 `audio.save_recordings = true` 时以 `0600` 权限环形归档于本地缓存目录 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`（绝不进状态文件或版本库）。
+- 脱敏与状态隐私：异常摘要、日志与 `status` 快照输出经 `redact_secrets` 脱敏，不在运行状态文件中落盘用户语音原文；录音仅在识别/投递失败或在识别/精修阶段由用户主动取消时以 `0600` 权限原子暂存于运行目录 `failed/`（保留 24 小时内最近 10 条 WAV 供 `retry` 恢复），或用户显式开启 `audio.save_recordings = true` 时以 `0600` 权限环形归档于本地缓存目录 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`（绝不进状态文件或版本库）。
 - WSL2 宿主机交互：改动 WSL2 桥接前先读 `src/agent_voice_input/platform_wsl.py`；宿主机可能关闭 `appendWindowsPath`（`powershell.exe` 不在 `PATH`），统一复用既有路径解析入口，单次非交互调用关闭标准输入防管道阻塞挂起。
 - macOS 宿主机交互：改动 macOS 桥接前先读 `src/agent_voice_input/platform_macos.py` 与 `src/agent_voice_input/mac_shim.swift`；macOS 麦克风 TCC 权限归属责任进程，经 SSH 仅作单测、编译与自检，实机录音用的守护进程在本机已获麦克风授权的图形终端（如 Ghostty）内启动或重启（经 `sshd` 拉起会被系统静默喂全 0 静音帧）。
 - 红线：`src/agent_voice_input/refiner.py` 的精修请求及凭据刷新拉起的 `codex` 子进程仅作无工具纯文本精修与认证状态读取，严禁开启 Fast 模式（不得传 `service_tier="fast"` 或任何 Fast 配置）。

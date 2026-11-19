@@ -31,7 +31,7 @@
 
 - **精准绑定活跃 Agent 上下文，同时开箱通用全桌面**：在终端内自动识别前台窗口、Ghostty 分屏或 `tmux` 焦点窗格（无需修改 `~/.tmux.conf`）中的主 Agent 会话，增量抽取最近对话与 `git status` 变更文件名纠偏，严格隔离后台 subagent 与相邻分屏；同时默认支持任意桌面窗口语音输入（`hotkey.scope = "all"`，亦可设为 `"coding"` 或 `"terminals"`）：IDE / 代码编辑器使用隔离后台会话历史的编程模式精修，日常聊天/浏览器/文档自动切换无代码偏置的通用顺句模式，聚焦远程桌面/虚拟机客户端时自动静默让行热键（`yield_remote_desktop = true`）。
 - **按渠道即插即用的「识别 + 精修」双引擎**：默认采用「极速语音转写 + 复用本机 `codex` 登录态的无状态 Keep-Alive 精修」，也支持切换任意内置云端/本地 API 渠道，或使用百炼 `qwen3.8-omni-flash` / Gemini / OpenRouter 多模态单跳共享 50K 缓存直出；日常只需指定 `provider`，自动匹配对应渠道的默认模型。
-- **面向长口述与连续口述的可靠录音链**：支持在上一句转写/精修期间直接开始下一段录音并按序串行上屏（切走窗口回退剪贴板的多段结果自动空行拼接、不覆盖前文）；内置静音门控与响度归一化拦截空触；单次默认最长 10 分钟（最后 15 秒胶囊倒计时提示），超过 3 分钟的长语音自动挑自然停顿处切分并并发转写；无麦克风或中途掉麦即时提醒；转写或上屏失败自动暂存音频，随时用 `agent-voice-input retry` 恢复，绝不丢话。
+- **面向长口述与连续口述的可靠录音链**：支持在上一句转写/精修期间直接开始下一段录音——二阶段无状态精修自动并发重叠、上屏严格按 `seq_id` 先后保序落字（切走窗口回退剪贴板的多段结果自动空行拼接、不覆盖前文）；支持随时用 `agent-voice-input cancel`（或在 `tap_toggle` 非录音态下单独长按热键 `1.2s–8s`、即超出 `hotkey.tap_max_ms` 后松开）即时取消当前录音或中断后台在途识别/精修；内置静音门控与响度归一化拦截空触；单次默认最长 10 分钟（最后 15 秒胶囊倒计时提示），超过 3 分钟的长语音自动挑自然停顿处切分并并发转写；无麦克风或中途掉麦即时提醒；转写/上屏失败或主动取消的有效语音均自动以 `0600` 权限暂存，随时用 `agent-voice-input retry` 恢复，绝不丢话。
 - **原生高分屏波形胶囊与防串窗安全粘贴**：Windows（Per-Monitor V2 HiDPI）与 macOS（Retina 原生面板）均提供不抢焦点的悬浮胶囊（计时、实时声波与阶段进度自动跟随系统中英文）；开始录音即锁定目标窗口/分屏，按进程自动路由粘贴快捷键（Windows 区分 `Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert`；macOS 在 Ghostty 与 `tmux` 内零触碰系统剪贴板直投，其余窗口走原生 `CGEvent` `Cmd+V`），只粘贴不自动回车，中途切走焦点则自动退回剪贴板防误投。
 - **零第三方 Python 依赖**：仅使用 Python `>= 3.10` 标准库与宿主机 `ffmpeg`（WSL2 复用系统内置 `powershell.exe`，macOS 首次启动自动编译缓存原生 `mac_shim`）。
 
@@ -77,7 +77,7 @@ DASHSCOPE_API_KEY="<your-dashscope-api-key>"
 EOF
 chmod 600 ~/.config/agent-voice-input/agent-voice-input.env
 
-# 自检环境、渠道解析与当前会话识别，然后后台启动（默认单击右 Ctrl 开始/完成录音）
+# 自检环境、渠道解析与当前会话识别，然后后台启动（默认单击右 Ctrl 开始/完成录音；识别/精修期间单独长按右 Ctrl 1.2s–8s 松开可取消）
 agent-voice-input doctor
 agent-voice-input start
 ```
@@ -181,6 +181,7 @@ agent-voice-input doctor                 # 全面自检音频链路、原生辅�
 agent-voice-input retry --list           # 查看暂存的失败录音（用 `agent-voice-input retry` 重新转写最近一条）
 agent-voice-input once --duration 4 --dry-run  # 单次录音验证流水线（不粘贴上屏）
 agent-voice-input toggle                 # 命令行触发开始/结束录音
+agent-voice-input cancel                 # 取消当前录音，或中断后台在途识别/精修（可用 `--seq N` 指定单条）
 agent-voice-input stop                   # 停止后台守护进程
 agent-voice-input key-test               # 测试按键扫描码与修饰键捕获
 ```

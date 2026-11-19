@@ -14,6 +14,7 @@ import select
 import selectors
 import shutil
 import signal
+import socket
 import ssl
 import subprocess
 import threading
@@ -26,6 +27,7 @@ from . import __version__
 from .asr_providers import (
     AsrContext,
     AsrResult,
+    CancelToken,
     DEFAULT_CONNECT_TIMEOUT_SEC,
     DEFAULT_USER_AGENT,
     GEMINI_DEFAULT_BASE_URL,
@@ -39,7 +41,9 @@ from .asr_providers import (
     _SplitTimeoutHTTPConnection,
     _SplitTimeoutHTTPSConnection,
     _TokenUsageTuple,
+    _can_reuse_pooled_conn,
     _close_quietly,
+    _combine_cancel_check,
     _extract_gemini_usage,
     _extract_token_usage,
     _is_loopback_url,
@@ -49,7 +53,9 @@ from .asr_providers import (
     _openrouter_reasoning_mandatory,
     _opt_int,
     _pick_opt_int,
+    _register_conn_abort,
     _sleep_cooperative,
+    _unregister_conn_abort,
     _validate_request_url,
     apply_chat_effort_params,
     build_gemini_generation_config,
@@ -668,6 +674,17 @@ def _parse_responses_sse_lines(
     return out_txt, usage, saw_eof
 
 
+def _cancel_fallback_kind(
+    cancel_token: CancelToken | None,
+    is_cancelled: Callable[[], bool] | None,
+) -> str:
+    if cancel_token is not None and cancel_token.is_cancelled():
+        return cancel_token.reason or "cancelled"
+    if is_cancelled is not None and is_cancelled():
+        return "superseded"
+    return ""
+
+
 def _run_refiner_retry_loop(
     *,
     cfg: Config,
@@ -687,6 +704,7 @@ def _run_refiner_retry_loop(
     on_401_refresh: Callable[[], None] | None = None,
     context_chars: int = 0,
     context_chunks: int = 0,
+    cancel_token: CancelToken | None = None,
 ) -> RefinerResult:
     deadline = t0 + tsec
     max_retries = max(0, int(cfg.refiner.max_retries))
@@ -694,7 +712,9 @@ def _run_refiner_retry_loop(
     refreshed_401 = False
     first_attempt = True
     total_init_ms = 0
-    cancelled = lambda: bool(is_cancelled is not None and is_cancelled())
+    eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
+    cancelled = (lambda: False) if eff_cancelled is None else eff_cancelled
+    _cancel_kind = lambda: _cancel_fallback_kind(cancel_token, is_cancelled) or "superseded"
 
     def _fb(kind: str, warn: str = "") -> RefinerResult:
         return _fallback_result(
@@ -713,7 +733,7 @@ def _run_refiner_retry_loop(
 
     while True:
         if cancelled():
-            return _fb("superseded")
+            return _fb(_cancel_kind())
         pacer_key = pacer_key_fn()
         secrets = secrets_fn()
         try:
@@ -728,10 +748,11 @@ def _run_refiner_retry_loop(
                     deadline=deadline,
                     clock_fn=clock_fn,
                     sleep_fn=sleep_fn,
-                    is_cancelled=is_cancelled,
+                    is_cancelled=cancelled,
+                    cancel_token=cancel_token,
                 ) as pacer_waited:
                     if cancelled():
-                        return _fb("superseded")
+                        return _fb(_cancel_kind())
                     now_send = clock_fn()
                     if now_send > deadline:
                         raise _RefinerAttemptError(
@@ -756,7 +777,7 @@ def _run_refiner_retry_loop(
                 raise _RefinerAttemptError(str(exc), retry_kind=classify_transport_error(exc)) from None
 
             if cancelled():
-                return _fb("superseded")
+                return _fb(_cancel_kind())
             if clock_fn() > deadline + 1e-9:
                 raise _RefinerAttemptError(
                     f"Refiner HTTP response exceeded timeout budget ({tsec:.2f}s)",
@@ -778,13 +799,15 @@ def _run_refiner_retry_loop(
             )
         except _RefinerAttemptError as err:
             if cancelled():
-                return _fb("superseded")
+                return _fb(_cancel_kind())
             if err.http_status == 401 and on_401_refresh is not None and not refreshed_401:
                 refreshed_401 = True
                 try:
                     on_401_refresh()
                     continue
                 except Exception as ref_exc:
+                    if cancelled():
+                        return _fb(_cancel_kind())
                     safe_401 = redact_secrets(
                         f"{err}; refresh failed: {ref_exc}",
                         env,
@@ -816,11 +839,18 @@ def _run_refiner_retry_loop(
                     if delay >= rem - 0.01:
                         can_retry = False
                     else:
-                        _sleep_cooperative(delay, sleep_fn=sleep_fn, is_cancelled=is_cancelled)
+                        _sleep_cooperative(
+                            delay,
+                            sleep_fn=sleep_fn,
+                            is_cancelled=cancelled,
+                            cancel_token=cancel_token,
+                        )
                         if cancelled():
-                            return _fb("superseded")
+                            return _fb(_cancel_kind())
                         if (deadline - clock_fn()) <= 0:
                             can_retry = False
+            if cancelled():
+                return _fb(_cancel_kind())
             if not can_retry:
                 return _fb("asr_draft", redact_secrets(str(err), env, cfg=cfg, extra_secrets=secrets))
             retries_used += 1
@@ -837,6 +867,7 @@ class BaseRefiner:
         tracker: SessionTracker | None = None,
         fallback_context: str = "",
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
         mode: str = "agent",
     ) -> RefinerResult:
         raise NotImplementedError
@@ -877,6 +908,7 @@ class _HttpTransportRefiner(BaseRefiner):
         pacer_secret: str,
         t0: float,
         is_cancelled: Callable[[], bool] | None,
+        cancel_token: CancelToken | None = None,
         parse_fn: Callable[[HttpResponse], tuple[str, _TokenUsageTuple]],
         context_chars: int,
         context_chunks: int,
@@ -887,8 +919,20 @@ class _HttpTransportRefiner(BaseRefiner):
 
         def _attempt(req_timeout: float, wall_dl: float | None, _is_first: bool) -> tuple[str, _TokenUsageTuple, int]:
             resp = self.transport(
-                HttpRequest(url=url, method="POST", headers=headers, body=body_bytes, timeout_sec=req_timeout, deadline=wall_dl)
+                HttpRequest(
+                    url=url,
+                    method="POST",
+                    headers=headers,
+                    body=body_bytes,
+                    timeout_sec=req_timeout,
+                    deadline=wall_dl,
+                    cancel_token=cancel_token,
+                )
             )
+            if (cancel_token is not None and cancel_token.is_cancelled()) or (
+                is_cancelled is not None and is_cancelled()
+            ):
+                raise _RefinerAttemptError("Refiner request cancelled", retry_kind="never")
             out_txt, usage = parse_fn(resp)
             return out_txt, usage, 0
 
@@ -909,6 +953,7 @@ class _HttpTransportRefiner(BaseRefiner):
             attempt_fn=_attempt,
             context_chars=context_chars,
             context_chunks=context_chunks,
+            cancel_token=cancel_token,
         )
 
 
@@ -923,6 +968,7 @@ class NoopRefiner(BaseRefiner):
         tracker: SessionTracker | None = None,
         fallback_context: str = "",
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
         mode: str = "agent",
     ) -> RefinerResult:
         draft, single_hop = _unpack(asr_input)
@@ -1087,7 +1133,13 @@ class OpenAIResponsesRefiner(BaseRefiner):
         self._last_identity_key: str = ""
         self._closed = False
 
-    def _resolve_endpoint_and_auth(self, *, force_refresh: bool = False) -> _ResponsesAuthTarget:
+    def _resolve_endpoint_and_auth(
+        self,
+        *,
+        force_refresh: bool = False,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> _ResponsesAuthTarget:
+        _ = (force_refresh, is_cancelled)
         base = self.cfg.refiner.effective_base_url(self.provider_name).strip()
         if self.provider_name == "openai-compatible" and not base:
             raise ConfigError("refiner.base_url must be explicitly set when refiner.provider is 'openai-compatible'")
@@ -1162,9 +1214,11 @@ class OpenAIResponsesRefiner(BaseRefiner):
 
     @staticmethod
     def _shutdown_and_close_conn(conn: http.client.HTTPConnection) -> None:
-        if (sock := getattr(conn, "sock", None)) is not None:
+        if callable(abort_fn := getattr(conn, "abort_inflight", None)):
+            abort_fn()
+        elif (sock := getattr(conn, "sock", None)) is not None:
             try:
-                sock.shutdown(2)
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
             except Exception:
                 pass
         _close_quietly(conn)
@@ -1384,6 +1438,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
         measure_init: bool,
         t_init_start: float,
         allow_empty_output: bool = False,
+        cancel_token: CancelToken | None = None,
     ) -> tuple[str, _TokenUsageTuple, int]:
         if self.transport is not None:
             init_ms = _ms(t_init_start, self.clock_fn) if measure_init else 0
@@ -1396,8 +1451,11 @@ class OpenAIResponsesRefiner(BaseRefiner):
                     body=body_bytes,
                     timeout_sec=req_timeout,
                     deadline=wall_deadline,
+                    cancel_token=cancel_token,
                 )
             )
+            if eff_cancelled():
+                return "", _EMPTY_USAGE, init_ms
             if sc_val := (resp.headers.get("set-cookie") or resp.headers.get("Set-Cookie")):
                 self._ingest_set_cookie_headers([sc_val], auth_target.identity_key)
             if resp.status != 200:
@@ -1421,6 +1479,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
 
         conn: http.client.HTTPConnection | None = None
         resp: http.client.HTTPResponse | None = None
+        hook_id = 0
         init_ms = 0
 
         for stale_attempt in range(2):
@@ -1442,6 +1501,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
                 conn_timeout=conn_timeout,
                 io_deadline=wall_deadline,
             )
+            hook_id = _register_conn_abort(cancel_token, conn)
             try:
                 t_conn0 = self.clock_fn()
                 if not reused:
@@ -1461,7 +1521,10 @@ class OpenAIResponsesRefiner(BaseRefiner):
                         sock.settimeout(max(0.005, min(req_timeout, rem_hdr)))
                 resp = conn.getresponse()
                 break
-            except _RESPONSES_STALE_CONN_ERRORS as exc:
+            except BaseException as exc:
+                _unregister_conn_abort(cancel_token, hook_id)
+                hook_id = 0
+                was_aborted = bool(getattr(conn, "_aborted", False)) or eff_cancelled()
                 self._finish_conn(
                     conn,
                     scheme=scheme,
@@ -1471,26 +1534,21 @@ class OpenAIResponsesRefiner(BaseRefiner):
                     can_reuse=False,
                 )
                 conn = None
-                if isinstance(exc, ssl.SSLCertVerificationError):
-                    raise
-                if reused and stale_attempt == 0:
+                if (
+                    isinstance(exc, _RESPONSES_STALE_CONN_ERRORS)
+                    and not isinstance(exc, ssl.SSLCertVerificationError)
+                    and not was_aborted
+                    and reused
+                    and stale_attempt == 0
+                ):
                     continue
-                raise
-            except BaseException:
-                self._finish_conn(
-                    conn,
-                    scheme=scheme,
-                    host=host,
-                    port=port,
-                    identity_key=auth_target.identity_key,
-                    can_reuse=False,
-                )
-                conn = None
                 raise
 
         assert conn is not None and resp is not None
         can_reuse = False
         try:
+            if eff_cancelled() or bool(getattr(conn, "_aborted", False)):
+                return "", _EMPTY_USAGE, init_ms
             if raw_scs := (resp.headers.get_all("Set-Cookie") or []):
                 self._ingest_set_cookie_headers(raw_scs, auth_target.identity_key)
 
@@ -1498,6 +1556,8 @@ class OpenAIResponsesRefiner(BaseRefiner):
             resp_hdrs = {k.lower(): v for k, v in resp.headers.items()}
             if status != 200:
                 err_body = resp.read(65536)
+                if eff_cancelled() or bool(getattr(conn, "_aborted", False)):
+                    return "", _EMPTY_USAGE, init_ms
                 self._raise_non_200_error(status, resp_hdrs, err_body, secrets)
 
             # CRITICAL: Codex backend HTTP 200 omits Content-Type header; never check Content-Type!
@@ -1508,19 +1568,22 @@ class OpenAIResponsesRefiner(BaseRefiner):
                 is_cancelled=eff_cancelled,
                 allow_empty_output=allow_empty_output,
             )
-            close_tokens = {tok.strip().lower() for tok in resp_hdrs.get("connection", "").split(",") if tok.strip()}
             eof_drained = saw_eof and (
                 (bool(getattr(resp, "chunked", False)) and resp.isclosed())
                 or (not getattr(resp, "chunked", False) and getattr(resp, "length", None) == 0)
             )
-            can_reuse = (
-                eof_drained
-                and not bool(getattr(resp, "will_close", True))
-                and "close" not in close_tokens
-                and getattr(conn, "sock", None) is not None
+            can_reuse = _can_reuse_pooled_conn(
+                conn,
+                resp,
+                resp_hdrs.get("connection", ""),
+                body_drained=eof_drained,
+                aborted=bool(getattr(conn, "_aborted", False) or eff_cancelled()),
             )
             return out_txt, usage, init_ms
         finally:
+            _unregister_conn_abort(cancel_token, hook_id)
+            if bool(getattr(conn, "_aborted", False)) or eff_cancelled():
+                can_reuse = False
             _close_quietly(resp)
             self._finish_conn(
                 conn,
@@ -1572,6 +1635,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
         tracker: SessionTracker | None = None,
         fallback_context: str = "",
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
         mode: str = "agent",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model(self.provider_name)
@@ -1588,9 +1652,16 @@ class OpenAIResponsesRefiner(BaseRefiner):
             return NoopRefiner().refine(asr_input, mode=mode)
 
         t0 = self.clock_fn()
-        eff_cancelled = lambda: self._closed or bool(is_cancelled is not None and is_cancelled())
+        _cancel_kind = lambda: _cancel_fallback_kind(cancel_token, is_cancelled) or (
+            "shutdown" if self._closed else "superseded"
+        )
+        eff_cancelled = lambda: (
+            self._closed
+            or (cancel_token is not None and cancel_token.is_cancelled())
+            or bool(is_cancelled is not None and is_cancelled())
+        )
         if eff_cancelled():
-            return _fallback_result(clean_draft, self.provider_name, model, t0, self.clock_fn, "superseded")
+            return _fallback_result(clean_draft, self.provider_name, model, t0, self.clock_fn, _cancel_kind())
 
         context_blocks, final_block = build_refiner_request_blocks(
             self.cfg,
@@ -1610,16 +1681,21 @@ class OpenAIResponsesRefiner(BaseRefiner):
         with self._state_lock:
             wait_prewarm = self._prewarm_active > 0
         if wait_prewarm:
-            with self._prewarm_lock:
-                pass
+            while not self._prewarm_lock.acquire(timeout=0.05):
+                if eff_cancelled():
+                    return _fallback_result(
+                        clean_draft, self.provider_name, model, t0, self.clock_fn, _cancel_kind(),
+                        context_chars=ctx_chars, context_chunks=ctx_chunks,
+                    )
+            self._prewarm_lock.release()
 
         try:
-            auth_box = [self._resolve_endpoint_and_auth(force_refresh=False)]
+            auth_box = [self._resolve_endpoint_and_auth(force_refresh=False, is_cancelled=eff_cancelled)]
             self._sync_auth_identity(auth_box[0])
         except Exception as exc:
             if eff_cancelled():
                 return _fallback_result(
-                    clean_draft, self.provider_name, model, t0, self.clock_fn, "superseded",
+                    clean_draft, self.provider_name, model, t0, self.clock_fn, _cancel_kind(),
                     context_chars=ctx_chars, context_chunks=ctx_chunks,
                 )
             warn = redact_secrets(str(exc), self.env, cfg=self.cfg, extra_secrets=self._extra_redaction_secrets(None))
@@ -1643,7 +1719,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
         body_box = [_encode_body(auth_box[0])]
 
         def _refresh_401() -> None:
-            new_auth = self._resolve_endpoint_and_auth(force_refresh=True)
+            new_auth = self._resolve_endpoint_and_auth(force_refresh=True, is_cancelled=eff_cancelled)
             self._sync_auth_identity(new_auth)
             if new_auth.is_codex_subscription != auth_box[0].is_codex_subscription:
                 body_box[0] = _encode_body(new_auth)
@@ -1677,10 +1753,12 @@ class OpenAIResponsesRefiner(BaseRefiner):
                 measure_init=is_first,
                 t_init_start=t_init0,
                 allow_empty_output=(len(clean_draft) <= 6),
+                cancel_token=cancel_token,
             ),
             on_401_refresh=(_refresh_401 if auth_box[0].can_refresh_on_401 else None),
             context_chars=ctx_chars,
             context_chunks=ctx_chunks,
+            cancel_token=cancel_token,
         )
 
     def close(self) -> None:
@@ -1693,7 +1771,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
         for conn in active:
             self._shutdown_and_close_conn(conn)
         self._pool.close_all()
-        deadline = time.monotonic() + 0.2
+        deadline = time.monotonic() + 1.0
         for th in threads:
             if (rem := deadline - time.monotonic()) <= 0:
                 break
@@ -1858,11 +1936,14 @@ class CodexRefiner(OpenAIResponsesRefiner):
             _close_quietly(pipe)
 
     def _call_codex_get_auth_status(
-        self, *, timeout_sec: float = CODEX_AUTH_RPC_TIMEOUT_SEC
+        self,
+        *,
+        timeout_sec: float = CODEX_AUTH_RPC_TIMEOUT_SEC,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[str, str]:
         """Run one-shot ``codex app-server`` ``initialize`` + ``getAuthStatus(includeToken, refreshToken)``."""
-        if self._closed:
-            raise RuntimeError("codex refiner closed")
+        if self._closed or (is_cancelled is not None and is_cancelled()):
+            raise RuntimeError("codex refiner closed or cancelled")
         cmd = self._build_auth_refresh_cmd()
         proc_env = _clean_env(self.env)
         proc_env.pop("OPENAI_API_KEY", None)
@@ -1884,13 +1965,13 @@ class CodexRefiner(OpenAIResponsesRefiner):
         )
         abort_now = False
         with self._state_lock:
-            if self._closed:
+            if self._closed or (is_cancelled is not None and is_cancelled()):
                 abort_now = True
             else:
                 self._refresh_procs.add(proc)
         if abort_now:
             self._terminate_proc(proc)
-            raise RuntimeError("codex refiner closed")
+            raise RuntimeError("codex refiner closed or cancelled")
 
         deadline = time.monotonic() + max(0.2, min(CODEX_AUTH_RPC_TIMEOUT_SEC, float(timeout_sec)))
         rx_buf = bytearray()
@@ -1903,6 +1984,8 @@ class CodexRefiner(OpenAIResponsesRefiner):
 
         def _wait_id(sel: selectors.BaseSelector, stdout_fd: int, expected_id: int) -> dict[str, Any]:
             while True:
+                if self._closed or (is_cancelled is not None and is_cancelled()):
+                    raise RuntimeError("codex auth check cancelled")
                 while (nl := rx_buf.find(b"\n")) >= 0:
                     raw_line = bytes(rx_buf[:nl]).strip()
                     del rx_buf[: nl + 1]
@@ -1918,8 +2001,10 @@ class CodexRefiner(OpenAIResponsesRefiner):
                         res = msg.get("result")
                         return res if isinstance(res, dict) else {}
                 rem = deadline - time.monotonic()
-                if rem <= 0 or not sel.select(rem):
+                if rem <= 0:
                     raise TimeoutError("codex getAuthStatus timed out")
+                if not sel.select(min(0.05, rem)):
+                    continue
                 chunk = os.read(stdout_fd, 8192)
                 if not chunk:
                     raise RuntimeError("codex app-server exited before getAuthStatus completed")
@@ -2007,8 +2092,18 @@ class CodexRefiner(OpenAIResponsesRefiner):
         else:
             self._refresh_cooldown_until = self.clock_fn() + CODEX_REFRESH_FAILURE_COOLDOWN_SEC
 
-    def _resolve_codex_credentials(self, *, force_refresh: bool = False) -> _CachedCodexCredentials:
-        with self._auth_lock:
+    def _resolve_codex_credentials(
+        self,
+        *,
+        force_refresh: bool = False,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> _CachedCodexCredentials:
+        while not self._auth_lock.acquire(timeout=0.05):
+            if self._closed or (is_cancelled is not None and is_cancelled()):
+                raise RuntimeError("codex credential resolution cancelled")
+        try:
+            if self._closed or (is_cancelled is not None and is_cancelled()):
+                raise RuntimeError("codex credential resolution cancelled")
             auth_path = self._resolve_auth_json_path()
             prev_creds = self._cached_creds
             parsed_this_call = False
@@ -2097,9 +2192,12 @@ class CodexRefiner(OpenAIResponsesRefiner):
 
             try:
                 rpc_method, rpc_token = self._call_codex_get_auth_status(
-                    timeout_sec=min(CODEX_AUTH_RPC_TIMEOUT_SEC, float(self.cfg.refiner.timeout_sec))
+                    timeout_sec=min(CODEX_AUTH_RPC_TIMEOUT_SEC, float(self.cfg.refiner.timeout_sec)),
+                    is_cancelled=is_cancelled,
                 )
             except Exception:
+                if self._closed or (is_cancelled is not None and is_cancelled()):
+                    raise
                 if still_usable and cur is not None:
                     self._refresh_cooldown_until = self.clock_fn() + CODEX_REFRESH_FAILURE_COOLDOWN_SEC
                     return cur
@@ -2151,9 +2249,18 @@ class CodexRefiner(OpenAIResponsesRefiner):
             if cur is None and auth_path is None:
                 raise RuntimeError("Codex credentials unavailable (no HOME/CODEX_HOME configured)")
             raise RuntimeError("Codex credentials unavailable or expired (run 'codex login')")
+        finally:
+            self._auth_lock.release()
 
-    def _resolve_endpoint_and_auth(self, *, force_refresh: bool = False) -> _ResponsesAuthTarget:
-        return self._to_auth_target(self._resolve_codex_credentials(force_refresh=force_refresh))
+    def _resolve_endpoint_and_auth(
+        self,
+        *,
+        force_refresh: bool = False,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> _ResponsesAuthTarget:
+        return self._to_auth_target(
+            self._resolve_codex_credentials(force_refresh=force_refresh, is_cancelled=is_cancelled)
+        )
 
     def close(self) -> None:
         super().close()
@@ -2190,6 +2297,7 @@ class GeminiRefiner(_HttpTransportRefiner):
         tracker: SessionTracker | None = None,
         fallback_context: str = "",
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
         mode: str = "agent",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model("gemini")
@@ -2200,6 +2308,8 @@ class GeminiRefiner(_HttpTransportRefiner):
         if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
             return NoopRefiner().refine(asr_input, mode=mode)
         t0 = self.clock_fn()
+        if c_kind := _cancel_fallback_kind(cancel_token, is_cancelled):
+            return _fallback_result(clean_draft, self.provider_name, model, t0, self.clock_fn, c_kind)
         secrets: tuple[str, ...] = tuple(self.creds.all_secret_values())
         try:
             key = _resolve_refiner_api_key(self.cfg, self.creds, "gemini")
@@ -2265,6 +2375,7 @@ class GeminiRefiner(_HttpTransportRefiner):
             pacer_secret=key,
             t0=t0,
             is_cancelled=is_cancelled,
+            cancel_token=cancel_token,
             parse_fn=_parse,
             context_chars=ctx_chars,
             context_chunks=ctx_chunks,
@@ -2299,6 +2410,7 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
         tracker: SessionTracker | None = None,
         fallback_context: str = "",
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
         mode: str = "agent",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model(self.provider_name)
@@ -2314,6 +2426,8 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
         if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
             return NoopRefiner().refine(asr_input, mode=mode)
         t0 = self.clock_fn()
+        if c_kind := _cancel_fallback_kind(cancel_token, is_cancelled):
+            return _fallback_result(clean_draft, self.provider_name, model, t0, self.clock_fn, c_kind)
         base = (self.cfg.refiner.effective_base_url(self.provider_name).strip() or OPENAI_DEFAULT_BASE_URL).rstrip("/")
         url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
         secrets: tuple[str, ...] = tuple(self.creds.all_secret_values())
@@ -2405,6 +2519,7 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
             pacer_secret=key,
             t0=t0,
             is_cancelled=is_cancelled,
+            cancel_token=cancel_token,
             parse_fn=_parse,
             context_chars=ctx_chars,
             context_chunks=ctx_chunks,
