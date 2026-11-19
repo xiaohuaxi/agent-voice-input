@@ -843,6 +843,13 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             self.assertIn("agent_voice_input/mac_shim.swift", wf_txt, wf_name)
             self.assertIn("agent_voice_input/_remote_probe.py", wf_txt, wf_name)
             self.assertIn("agent_voice_input/remote_ssh.py", wf_txt, wf_name)
+            for mod_rel in (
+                "agent_voice_input/http_transport.py",
+                "agent_voice_input/llm_common.py",
+                "agent_voice_input/platform_common.py",
+                "agent_voice_input/workspace_ctx.py",
+            ):
+                self.assertIn(mod_rel, wf_txt, wf_name)
             self.assertIn("/src/agent_voice_input/mac_shim.swift", wf_txt, wf_name)
             self.assertIn("/src/agent_voice_input/_remote_probe.py", wf_txt, wf_name)
             self.assertIn("/src/agent_voice_input/remote_ssh.py", wf_txt, wf_name)

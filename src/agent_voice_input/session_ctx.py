@@ -2466,6 +2466,36 @@ def collect_darwin_window_pty_tree(
     return tab_ttys, descendant_pids
 
 
+@dataclass
+class _ResolveCtx:
+    window_title: str
+    window_pid: int
+    window_process: str
+    bundle_id: str
+    document: str
+    rt_dirs: list[Path]
+    norm_tty: str
+    norm_cwd: str
+    hint: TitleHint | None
+    tmux_snap: TmuxServerSnapshot
+    has_proc: bool
+    is_real_proc: bool
+    is_real_darwin: bool
+    claimed_claude: dict[str, int]
+    all_tmux_pids: set[int]
+    darwin_ptys_probed: bool = False
+    darwin_ps_rows: list[tuple[int, int, str, str, list[str]]] | None = None
+    darwin_win_tab_ttys: set[str] = field(default_factory=set)
+    darwin_win_desc_pids: set[int] = field(default_factory=set)
+    active_target: tuple[TmuxClientInfo | None, TmuxPaneInfo] | None = None
+    outer_hint_owned_by_tmux: bool = False
+    stale_hint_fallthrough: bool = False
+    stale_hint_ttys: set[str] = field(default_factory=set)
+    neutralize_outer_title: bool = False
+    eff_title: str = ""
+    tty_matches_tmux_client: bool = False
+
+
 class SessionTracker:
     """Thread-safe stateful session resolver and incremental JSONL clean-turn extractor."""
 
@@ -3622,6 +3652,526 @@ class SessionTracker:
             remote_title=remote_fg.effective_title,
         )
 
+    def _return_remote_fg(self, rfg: RemoteForegroundInfo) -> SessionMatch | None:
+        if rfg.ide_remote_only or rfg.ambiguous_host or not rfg.host_candidate:
+            return None
+        hcfg = self.remote_cfg.lookup_host(rfg.host_candidate)
+        return self._remote_route_match(hcfg, rfg) if hcfg is not None else None
+
+    @staticmethod
+    def _with_fallback_cwd(hit: SessionMatch | None, norm_cwd: str) -> SessionMatch | None:
+        return (
+            replace(hit, cwd=norm_cwd)
+            if (hit is not None and norm_cwd and not hit.cwd)
+            else hit
+        )
+
+    def _resolve_phase0_window_veto(
+        self,
+        window_title: str,
+        *,
+        window_process: str,
+        bundle_id: str,
+        document: str,
+    ) -> tuple[bool, SessionMatch | None]:
+        early_remote = detect_remote_foreground(
+            window_title,
+            window_process=window_process,
+            bundle_id=bundle_id,
+            document=document,
+            local_hostnames=self._local_hostnames,
+            is_macos=(
+                sys.platform == "darwin"
+                or (self.proc_root == Path("/proc") and not Path("/proc").is_dir())
+            ),
+        )
+        if early_remote.is_remote:
+            return True, self._return_remote_fg(early_remote)
+
+        if _WIN_EXPLICIT_NON_WSL_TITLE_RE.match((window_title or "").strip()):
+            return True, None
+        proc_base_low = (
+            os.path.basename(window_process.replace("\\", "/")).lower()
+            if window_process
+            else ""
+        )
+        if proc_base_low in ("cmd", "cmd.exe") and parse_window_title_hint(window_title) is None:
+            return True, None
+        if (
+            proc_base_low in ("powershell", "powershell.exe", "pwsh", "pwsh.exe")
+            and parse_window_title_hint(window_title) is None
+            and re.match(
+                r"^(?:Administrator:\s+|管理员:\s*)?(?:Windows\s+)?PowerShell(?:\s+[\d.]+)?\s*$",
+                (window_title or "").strip(),
+                re.IGNORECASE,
+            )
+        ):
+            return True, None
+        return False, None
+
+    def _ensure_resolve_darwin_ptys(self, rctx: _ResolveCtx) -> None:
+        if rctx.darwin_ptys_probed:
+            return
+        rctx.darwin_ptys_probed = True
+        if rctx.norm_tty or rctx.window_pid <= 0 or rctx.has_proc or self.proc_root is None:
+            return
+        pinfo = ps_proc_info(rctx.window_pid)
+        if pinfo is not None and pinfo[2] and (
+            _classify_interactive_cli(pinfo[0], pinfo[3])
+            or pinfo[0].lower() in ("tmux", "screen", "zellij")
+        ):
+            rctx.norm_tty = pinfo[2]
+            return
+        if rctx.is_real_darwin and rctx.window_pid > 1:
+            rctx.darwin_ps_rows = self._list_darwin_user_ps_rows()
+            if rctx.darwin_ps_rows:
+                rctx.darwin_win_tab_ttys, rctx.darwin_win_desc_pids = collect_darwin_window_pty_tree(
+                    rctx.darwin_ps_rows, rctx.window_pid
+                )
+                if len(rctx.darwin_win_tab_ttys) == 1:
+                    rctx.norm_tty = next(iter(rctx.darwin_win_tab_ttys))
+
+    def _resolve_explicit_title_hint(
+        self, rctx: _ResolveCtx, *, early_tty_is_tmux_client: bool
+    ) -> tuple[bool, SessionMatch | None]:
+        hint = rctx.hint
+        assert hint is not None
+        reg_hit, saw_stale_exited = _lookup_in_registry_detailed(
+            hint, rctx.rt_dirs, self.home, self.proc_root
+        )
+        if reg_hit is not None:
+            if (
+                rctx.active_target is not None
+                and reg_hit.tmux_pane
+                and _same_tmux_server(reg_hit.tmux_socket, rctx.active_target[1].socket_path)
+            ):
+                rctx.outer_hint_owned_by_tmux = True
+                if reg_hit.tmux_pane != rctx.active_target[1].pane_id:
+                    rctx.neutralize_outer_title = True
+                return False, None
+            if not reg_hit.tmux_pane and (
+                early_tty_is_tmux_client
+                or (rctx.norm_tty and reg_hit.tty and not _tty_matches(rctx.norm_tty, reg_hit.tty))
+                or (
+                    rctx.darwin_win_desc_pids
+                    and reg_hit.agent_pid > 0
+                    and reg_hit.agent_pid not in rctx.darwin_win_desc_pids
+                )
+            ):
+                rctx.stale_hint_fallthrough = True
+                return False, None
+            return True, self._with_fallback_cwd(reg_hit.match, rctx.norm_cwd)
+
+        if saw_stale_exited:
+            rctx.stale_hint_fallthrough = True
+            rctx.stale_hint_ttys = _collect_stale_registry_ttys(hint, rctx.rt_dirs)
+            return False, None
+
+        all_proc_cands = (
+            scan_proc_root_sessions(
+                self.home,
+                self.proc_root,
+                claimed_claude_sids=rctx.claimed_claude,
+            )
+            if (rctx.has_proc and self.proc_root is not None)
+            else []
+        )
+        if hint.is_full_uuid:
+            disk_hit = _lookup_by_full_uuid(hint, self.home, self.proc_root)
+        else:
+            disk_hit = _lookup_by_short_prefix(
+                hint, self.home, self.proc_root, all_proc_cands
+            )
+        if disk_hit is None:
+            # Explicit session tag in title that matches no valid root session MUST return None
+            # rather than silently guessing an unrelated window's conversation!
+            return True, None
+        self._ensure_resolve_darwin_ptys(rctx)
+        hint_tty_is_tmux_client = bool(
+            rctx.norm_tty
+            and any(
+                c.client_tty and _tty_matches(c.client_tty, rctx.norm_tty)
+                for c in rctx.tmux_snap.clients
+            )
+        )
+        if hint_tty_is_tmux_client:
+            rctx.stale_hint_fallthrough = True
+            return False, None
+        if (
+            rctx.is_real_proc or any(c.cli == disk_hit.cli for c in all_proc_cands)
+        ) and not any(c.session_key == disk_hit.session_key for c in all_proc_cands):
+            # Bug D guard: dead historical transcript on disk MUST NOT return a dead match
+            # NOR fall through to hijack an unrelated background tab when not in tmux/tty!
+            if rctx.active_target is None and not rctx.norm_tty:
+                return True, None
+            rctx.stale_hint_fallthrough = True
+            return False, None
+        if (
+            rctx.is_real_darwin
+            and (
+                rctx.active_target is not None
+                or bool(rctx.norm_tty)
+                or bool(rctx.darwin_win_tab_ttys)
+            )
+            and not self._darwin_is_unhooked_session_live(
+                disk_hit,
+                rctx.tmux_snap,
+                norm_tty=rctx.norm_tty,
+                window_pid=rctx.window_pid,
+                allowed_pids=(rctx.darwin_win_desc_pids if rctx.darwin_win_desc_pids else None),
+                rows=rctx.darwin_ps_rows,
+            )
+        ):
+            if rctx.active_target is None and not rctx.norm_tty:
+                return True, None
+            rctx.stale_hint_fallthrough = True
+            return False, None
+        return True, self._with_fallback_cwd(disk_hit, rctx.norm_cwd)
+
+    def _resolve_scoped_tty_or_window_ssh(
+        self, rctx: _ResolveCtx
+    ) -> tuple[bool, SessionMatch | None]:
+        if rctx.norm_tty and not rctx.tty_matches_tmux_client:
+            ssh_tty_host = self._find_tty_ssh_target(
+                rctx.norm_tty, has_proc=rctx.has_proc, darwin_ps_rows=rctx.darwin_ps_rows
+            )
+            if ssh_tty_host is not None:
+                rfg_tty = detect_remote_foreground(
+                    rctx.eff_title,
+                    window_process=rctx.window_process,
+                    bundle_id=rctx.bundle_id,
+                    document=rctx.document,
+                    local_hostnames=self._local_hostnames,
+                    ssh_proc_host=ssh_tty_host,
+                )
+                return True, self._return_remote_fg(rfg_tty)
+            tty_hit, stop_fallback = _resolve_by_window_tty(
+                rctx.norm_tty,
+                norm_cwd=rctx.norm_cwd,
+                window_pid=rctx.window_pid,
+                window_title=rctx.eff_title,
+                runtime_dirs=rctx.rt_dirs,
+                home=self.home,
+                proc_root=self.proc_root,
+                claimed_claude_sids=rctx.claimed_claude,
+            )
+            if tty_hit is not None or stop_fallback:
+                return True, tty_hit
+
+        if not rctx.norm_tty and rctx.window_pid > 1 and rctx.active_target is None:
+            if rctx.has_proc and self.proc_root is not None:
+                wp_pids = _collect_descendant_pids(self.proc_root, (rctx.window_pid,)) - rctx.all_tmux_pids
+                ssh_wp_host = self._find_proc_ssh_target_in_pids(wp_pids)
+                if ssh_wp_host is not None:
+                    rfg_wp = detect_remote_foreground(
+                        rctx.eff_title,
+                        window_process=rctx.window_process,
+                        bundle_id=rctx.bundle_id,
+                        document=rctx.document,
+                        local_hostnames=self._local_hostnames,
+                        ssh_proc_host=ssh_wp_host,
+                    )
+                    return True, self._return_remote_fg(rfg_wp)
+            elif rctx.darwin_win_desc_pids and rctx.darwin_ps_rows:
+                excluded_ttys_d = self._collect_tmux_ttys(rctx.tmux_snap)
+                d_rows = [
+                    r
+                    for r in rctx.darwin_ps_rows
+                    if r[0] in rctx.darwin_win_desc_pids and (not r[3] or r[3] not in excluded_ttys_d)
+                ]
+                if d_rows and not any(
+                    _classify_interactive_cli(
+                        os.path.basename(r[4][0].replace("\\", "/")).lstrip("-").lower() if r[4] else "",
+                        r[4],
+                    )
+                    for r in d_rows
+                ):
+                    for _pid, _ppid, _st, _rtty, argv in d_rows:
+                        h_cand, is_int = extract_ssh_target_from_argv(argv)
+                        if is_int:
+                            rfg_d = detect_remote_foreground(
+                                rctx.eff_title,
+                                window_process=rctx.window_process,
+                                bundle_id=rctx.bundle_id,
+                                document=rctx.document,
+                                local_hostnames=self._local_hostnames,
+                                ssh_proc_host=h_cand,
+                                is_macos=True,
+                            )
+                            return True, self._return_remote_fg(rfg_d)
+        return False, None
+
+    def _check_active_pane_remote(
+        self, rctx: _ResolveCtx, active_pane: TmuxPaneInfo
+    ) -> tuple[bool, SessionMatch | None]:
+        pane_ssh_host: str | None = None
+        if rctx.has_proc and self.proc_root is not None:
+            p_pids = _collect_pane_pids(self.proc_root, active_pane.pane_pid, active_pane.pane_tty)
+            pane_ssh_host = self._find_proc_ssh_target_in_pids(p_pids)
+        elif self.proc_root is not None and active_pane.pane_tty:
+            pane_ssh_host = self._find_tty_ssh_target(
+                normalize_tty_path(active_pane.pane_tty),
+                has_proc=False,
+                darwin_ps_rows=rctx.darwin_ps_rows,
+            )
+        rfg_pane = detect_remote_foreground(
+            rctx.eff_title,
+            window_process=rctx.window_process,
+            bundle_id=rctx.bundle_id,
+            document=rctx.document,
+            local_hostnames=self._local_hostnames,
+            ssh_proc_host=pane_ssh_host,
+            pane_title_override=active_pane.pane_title,
+            is_macos=rctx.is_real_darwin,
+        )
+        if rfg_pane.is_remote:
+            return True, self._return_remote_fg(rfg_pane)
+        return False, None
+
+    def _collect_darwin_scoped_non_tmux_cands(self, rctx: _ResolveCtx) -> list[SessionMatch]:
+        scoped_cands: dict[str, SessionMatch] = {}
+        for cand in self._scan_darwin_live_non_tmux_sessions(
+            rctx.tmux_snap,
+            claimed_claude=rctx.claimed_claude,
+            allowed_pids=(rctx.darwin_win_desc_pids if rctx.darwin_win_desc_pids else None),
+            rows=rctx.darwin_ps_rows,
+        ):
+            scoped_cands[cand.session_key] = cand
+        if rctx.darwin_win_tab_ttys and rctx.darwin_ps_rows:
+            excluded_ttys = self._collect_tmux_ttys(rctx.tmux_snap)
+            pids_by_tty: dict[str, set[int]] = {}
+            clis_by_tty: dict[str, set[str]] = {}
+            for r_pid, _ppid, _stat, r_tty, r_argv in rctx.darwin_ps_rows:
+                if r_pid in rctx.darwin_win_desc_pids and r_tty and r_tty not in excluded_ttys:
+                    pids_by_tty.setdefault(r_tty, set()).add(r_pid)
+                    a0 = os.path.basename(r_argv[0].replace("\\", "/")).lstrip("-").lower() if r_argv else ""
+                    if cli_k := _classify_interactive_cli(a0, r_argv):
+                        clis_by_tty.setdefault(r_tty, set()).add(cli_k)
+            for tab_tty in sorted(rctx.darwin_win_tab_ttys):
+                if tab_tty in excluded_ttys:
+                    continue
+                reg_cand = _lookup_tty_in_registry(
+                    tab_tty,
+                    pids_by_tty.get(tab_tty, set()),
+                    clis_by_tty.get(tab_tty, set()),
+                    rctx.rt_dirs,
+                    self.home,
+                    self.proc_root,
+                    fallback_cwd=rctx.norm_cwd,
+                )
+                if reg_cand is not None:
+                    scoped_cands[reg_cand.session_key] = reg_cand
+        return list(scoped_cands.values())
+
+    def _resolve_active_tmux_phase(self, rctx: _ResolveCtx) -> SessionMatch | None:
+        assert rctx.active_target is not None
+        active_client, active_pane = rctx.active_target
+        tmux_is_scoped = bool(
+            rctx.outer_hint_owned_by_tmux
+            or rctx.tty_matches_tmux_client
+            or rctx.norm_tty
+            or rctx.window_pid > 0
+            or rctx.norm_cwd
+        )
+        if rctx.has_proc and self.proc_root is not None:
+            if not rctx.outer_hint_owned_by_tmux and not rctx.tty_matches_tmux_client:
+                non_tmux_cands = self._filter_by_title_affinity(
+                    scan_proc_root_sessions(
+                        self.home,
+                        self.proc_root,
+                        excluded_pids=rctx.all_tmux_pids,
+                        claimed_claude_sids=rctx.claimed_claude,
+                    ),
+                    rctx.eff_title,
+                    scoped=bool(rctx.norm_tty or rctx.norm_cwd),
+                )
+                if non_tmux_cands and self._should_prefer_non_tmux(
+                    rctx.eff_title, active_client, active_pane, non_tmux_cands
+                ):
+                    return _disambiguate_candidates(
+                        non_tmux_cands, rctx.eff_title, rctx.norm_cwd, self.home
+                    )
+            is_pane_rem, pane_rem_match = self._check_active_pane_remote(rctx, active_pane)
+            if is_pane_rem:
+                if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
+                    rctx.eff_title, active_pane, pane_rem_match
+                ):
+                    return None
+                return pane_rem_match
+            pane_res = self._resolve_tmux_active_pane(
+                active_pane,
+                rctx.rt_dirs,
+                window_title=rctx.eff_title,
+                claimed_claude=rctx.claimed_claude,
+            )
+            if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
+                rctx.eff_title, active_pane, pane_res
+            ):
+                return None
+            return pane_res
+
+        is_pane_rem, pane_rem_match = self._check_active_pane_remote(rctx, active_pane)
+        pane_hit, pane_authoritative_empty = (
+            (None, True)
+            if is_pane_rem
+            else self._resolve_tmux_active_pane_detailed(
+                active_pane,
+                rctx.rt_dirs,
+                window_title=rctx.eff_title,
+                claimed_claude=rctx.claimed_claude,
+            )
+        )
+        if rctx.outer_hint_owned_by_tmux or rctx.tty_matches_tmux_client:
+            return pane_rem_match if is_pane_rem else pane_hit
+        if rctx.is_real_darwin:
+            non_tmux_cands = self._filter_by_title_affinity(
+                self._collect_darwin_scoped_non_tmux_cands(rctx),
+                rctx.eff_title,
+                scoped=bool(rctx.darwin_win_tab_ttys or rctx.norm_tty or rctx.norm_cwd),
+            )
+            if non_tmux_cands and self._should_prefer_non_tmux(
+                rctx.eff_title, active_client, active_pane, non_tmux_cands
+            ):
+                return _disambiguate_candidates(
+                    non_tmux_cands, rctx.eff_title, rctx.norm_cwd, self.home
+                )
+            if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
+                rctx.eff_title, active_pane, pane_rem_match if is_pane_rem else pane_hit
+            ):
+                return None
+            return pane_rem_match if is_pane_rem else pane_hit
+        tmux_bound_keys = _collect_tmux_bound_session_keys(rctx.rt_dirs)
+        if pane_hit is not None:
+            tmux_bound_keys.add(pane_hit.session_key)
+        tmux_pane_uuids = {
+            ph.session_token
+            for p in rctx.tmux_snap.panes
+            for ph in (parse_window_title_hint(p.pane_title),)
+            if ph is not None and ph.is_full_uuid
+        }
+        all_fallback = _scan_nonproc_fallback_sessions(
+            self.home,
+            rctx.rt_dirs,
+            window_cwd=rctx.norm_cwd,
+            check_pid_alive=(self.proc_root is not None),
+        )
+        non_tmux_cands = self._filter_by_title_affinity(
+            [
+                c
+                for c in all_fallback
+                if c.session_key not in tmux_bound_keys
+                and c.session_id not in tmux_pane_uuids
+            ],
+            rctx.eff_title,
+            scoped=bool(rctx.norm_cwd),
+        )
+        if non_tmux_cands and self._should_prefer_non_tmux(
+            rctx.eff_title, active_client, active_pane, non_tmux_cands
+        ):
+            return _disambiguate_candidates(
+                non_tmux_cands, rctx.eff_title, rctx.norm_cwd, self.home
+            )
+        if is_pane_rem:
+            if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
+                rctx.eff_title, active_pane, pane_rem_match
+            ):
+                return None
+            return pane_rem_match
+        if (
+            pane_hit is not None
+            or pane_authoritative_empty
+            or (
+                _WORD_TMUX_RE.search(rctx.eff_title)
+                and not _TUI_SPINNER_RE.search(rctx.eff_title)
+            )
+        ):
+            if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
+                rctx.eff_title, active_pane, pane_hit
+            ):
+                return None
+            return pane_hit
+        filtered_fb = self._filter_by_title_affinity(
+            non_tmux_cands or all_fallback, rctx.eff_title, scoped=bool(rctx.norm_cwd)
+        )
+        return _disambiguate_candidates(
+            filtered_fb, rctx.eff_title, rctx.norm_cwd, self.home
+        )
+
+    def _resolve_non_tmux_proc_or_fallback(self, rctx: _ResolveCtx) -> SessionMatch | None:
+        if rctx.has_proc and self.proc_root is not None:
+            allowed_stale_pids: set[int] | None = None
+            if rctx.stale_hint_fallthrough:
+                if not rctx.stale_hint_ttys:
+                    return None
+                allowed_stale_pids = set()
+                for pdir in _iter_numeric_proc_dirs(self.proc_root):
+                    ptty = _read_proc_tty_path(pdir) or _readlink_clean(pdir / "fd" / "0")
+                    if ptty and any(
+                        ptty == st_t or _tty_matches(ptty, st_t) for st_t in rctx.stale_hint_ttys
+                    ):
+                        allowed_stale_pids.add(int(pdir.name))
+                if not allowed_stale_pids:
+                    return None
+            proc_cands = scan_proc_root_sessions(
+                self.home,
+                self.proc_root,
+                allowed_pids=allowed_stale_pids,
+                excluded_pids=rctx.all_tmux_pids or None,
+                claimed_claude_sids=rctx.claimed_claude,
+            )
+            if (
+                rctx.window_pid <= 0
+                and not rctx.norm_tty
+                and not rctx.stale_hint_fallthrough
+                and rctx.hint is None
+            ):
+                ssh_unscoped = self._find_unscoped_proc_ssh_target(
+                    window_title=rctx.eff_title,
+                    excluded_pids=rctx.all_tmux_pids,
+                    local_cands=proc_cands,
+                )
+                if ssh_unscoped is not None:
+                    rfg_u = detect_remote_foreground(
+                        rctx.eff_title,
+                        window_process=rctx.window_process,
+                        bundle_id=rctx.bundle_id,
+                        document=rctx.document,
+                        local_hostnames=self._local_hostnames,
+                        ssh_proc_host=ssh_unscoped,
+                    )
+                    return self._return_remote_fg(rfg_u)
+            proc_cands = self._filter_by_title_affinity(
+                proc_cands,
+                rctx.eff_title,
+                scoped=bool(rctx.norm_tty or rctx.norm_cwd or rctx.stale_hint_fallthrough),
+            )
+            if proc_cands:
+                return _disambiguate_candidates(proc_cands, rctx.eff_title, rctx.norm_cwd, self.home)
+            if rctx.stale_hint_fallthrough or rctx.is_real_proc:
+                return None
+
+        if rctx.is_real_darwin and len(rctx.darwin_win_tab_ttys) > 1:
+            scoped_list = self._filter_by_title_affinity(
+                self._collect_darwin_scoped_non_tmux_cands(rctx), rctx.eff_title, scoped=True
+            )
+            if scoped_list:
+                return _disambiguate_candidates(scoped_list, rctx.eff_title, rctx.norm_cwd, self.home)
+            return None
+
+        if rctx.stale_hint_fallthrough or (rctx.is_real_darwin and rctx.window_pid > 0):
+            return None
+
+        fallback_cands = _scan_nonproc_fallback_sessions(
+            self.home,
+            rctx.rt_dirs,
+            window_cwd=rctx.norm_cwd,
+            check_pid_alive=(self.proc_root is not None),
+        )
+        fallback_cands = self._filter_by_title_affinity(
+            fallback_cands, rctx.eff_title, scoped=bool(rctx.norm_cwd)
+        )
+        return _disambiguate_candidates(fallback_cands, rctx.eff_title, rctx.norm_cwd, self.home)
+
     def resolve_session(
         self,
         window_title: str = "",
@@ -3635,46 +4185,14 @@ class SessionTracker:
     ) -> SessionMatch | None:
         """Resolve foreground main CLI session via Phase 0 Remote Veto, title O(1) lookup, tmux active pane, TTY/CWD, or fallback."""
         with self._lock:
-            # Phase 0 Fast Check: Remote IDE or dedicated SSH client or explicit [@remote_host] / user@remote:path / ssh ...
-            early_remote = detect_remote_foreground(
+            done_p0, res_p0 = self._resolve_phase0_window_veto(
                 window_title,
                 window_process=window_process,
                 bundle_id=bundle_id,
                 document=document,
-                local_hostnames=self._local_hostnames,
-                is_macos=(sys.platform == "darwin" or (self.proc_root == Path("/proc") and not Path("/proc").is_dir())),
             )
-            if early_remote.is_remote:
-                if (
-                    early_remote.ide_remote_only
-                    or early_remote.ambiguous_host
-                    or not early_remote.host_candidate
-                ):
-                    return None
-                host_cfg = self.remote_cfg.lookup_host(early_remote.host_candidate)
-                if host_cfg is None:
-                    return None
-                return self._remote_route_match(host_cfg, early_remote)
-
-            if _WIN_EXPLICIT_NON_WSL_TITLE_RE.match((window_title or "").strip()):
-                return None
-            proc_base_low = (
-                os.path.basename(window_process.replace("\\", "/")).lower()
-                if window_process
-                else ""
-            )
-            if proc_base_low in ("cmd", "cmd.exe") and parse_window_title_hint(window_title) is None:
-                return None
-            if (
-                proc_base_low in ("powershell", "powershell.exe", "pwsh", "pwsh.exe")
-                and parse_window_title_hint(window_title) is None
-                and re.match(
-                    r"^(?:Administrator:\s+|管理员:\s*)?(?:Windows\s+)?PowerShell(?:\s+[\d.]+)?\s*$",
-                    (window_title or "").strip(),
-                    re.IGNORECASE,
-                )
-            ):
-                return None
+            if done_p0:
+                return res_p0
 
             rt_dirs = self._candidate_runtime_dirs()
             eff_wsl = _effective_is_wsl(env=self.env)
@@ -3689,46 +4207,6 @@ class SessionTracker:
             has_proc = self.proc_root is not None and self.proc_root.is_dir()
             is_real_proc = has_proc and self.proc_root == Path("/proc")
             is_real_darwin = not has_proc and self.proc_root == Path("/proc")
-
-            darwin_ptys_probed = False
-            darwin_ps_rows: list[tuple[int, int, str, str, list[str]]] | None = None
-            darwin_win_tab_ttys: set[str] = set()
-            darwin_win_desc_pids: set[int] = set()
-
-            def _ensure_darwin_window_ptys() -> None:
-                nonlocal norm_tty, darwin_ptys_probed, darwin_ps_rows, darwin_win_tab_ttys, darwin_win_desc_pids
-                if darwin_ptys_probed:
-                    return
-                darwin_ptys_probed = True
-                if norm_tty or window_pid <= 0 or has_proc or self.proc_root is None:
-                    return
-                pinfo = ps_proc_info(window_pid)
-                if pinfo is not None and pinfo[2] and (
-                    _classify_interactive_cli(pinfo[0], pinfo[3])
-                    or pinfo[0].lower() in ("tmux", "screen", "zellij")
-                ):
-                    norm_tty = pinfo[2]
-                    return
-                if is_real_darwin and window_pid > 1:
-                    darwin_ps_rows = self._list_darwin_user_ps_rows()
-                    if darwin_ps_rows:
-                        darwin_win_tab_ttys, darwin_win_desc_pids = collect_darwin_window_pty_tree(
-                            darwin_ps_rows, window_pid
-                        )
-                        if len(darwin_win_tab_ttys) == 1:
-                            norm_tty = next(iter(darwin_win_tab_ttys))
-
-            if not norm_tty and window_pid > 0 and (hint is None or bool(tmux_snap.clients)):
-                _ensure_darwin_window_ptys()
-
-            active_target = self._select_active_tmux_target(
-                tmux_snap,
-                window_title,
-                window_tty=norm_tty,
-                window_pid=window_pid,
-                allowed_client_ttys=(darwin_win_tab_ttys if len(darwin_win_tab_ttys) > 1 else None),
-                allowed_client_pids=(darwin_win_desc_pids if len(darwin_win_tab_ttys) > 1 else None),
-            )
             claimed_claude = (
                 _collect_live_claimed_claude_sids(rt_dirs, self.proc_root)
                 if self.proc_root is not None
@@ -3743,44 +4221,57 @@ class SessionTracker:
                 all_tmux_pids = _collect_descendant_pids(self.proc_root, roots)
                 for p in tmux_snap.panes:
                     if p.pane_pid <= 1 and p.pane_tty:
-                        all_tmux_pids.update(
-                            _collect_pane_pids(self.proc_root, 0, p.pane_tty)
-                        )
+                        all_tmux_pids.update(_collect_pane_pids(self.proc_root, 0, p.pane_tty))
 
-            def _return_remote_fg(rfg: RemoteForegroundInfo) -> SessionMatch | None:
-                if rfg.ide_remote_only or rfg.ambiguous_host or not rfg.host_candidate:
-                    return None
-                hcfg = self.remote_cfg.lookup_host(rfg.host_candidate)
-                return self._remote_route_match(hcfg, rfg) if hcfg is not None else None
-
-            def _with_cwd(hit: SessionMatch | None) -> SessionMatch | None:
-                return (
-                    replace(hit, cwd=norm_cwd)
-                    if (hit is not None and norm_cwd and not hit.cwd)
-                    else hit
-                )
-
-            outer_hint_owned_by_tmux = bool(
-                hint is not None
-                and active_target is not None
-                and self._outer_hint_belongs_to_tmux(window_title, hint, active_target[1])
+            rctx = _ResolveCtx(
+                window_title=window_title,
+                window_pid=window_pid,
+                window_process=window_process,
+                bundle_id=bundle_id,
+                document=document,
+                rt_dirs=rt_dirs,
+                norm_tty=norm_tty,
+                norm_cwd=norm_cwd,
+                hint=hint,
+                tmux_snap=tmux_snap,
+                has_proc=has_proc,
+                is_real_proc=is_real_proc,
+                is_real_darwin=is_real_darwin,
+                claimed_claude=claimed_claude,
+                all_tmux_pids=all_tmux_pids,
             )
-            stale_hint_fallthrough = False
-            stale_hint_ttys: set[str] = set()
-            neutralize_outer_title = False
 
+            if not rctx.norm_tty and window_pid > 0 and (hint is None or bool(tmux_snap.clients)):
+                self._ensure_resolve_darwin_ptys(rctx)
+
+            rctx.active_target = self._select_active_tmux_target(
+                tmux_snap,
+                window_title,
+                window_tty=rctx.norm_tty,
+                window_pid=window_pid,
+                allowed_client_ttys=(
+                    rctx.darwin_win_tab_ttys if len(rctx.darwin_win_tab_ttys) > 1 else None
+                ),
+                allowed_client_pids=(
+                    rctx.darwin_win_desc_pids if len(rctx.darwin_win_tab_ttys) > 1 else None
+                ),
+            )
+
+            rctx.outer_hint_owned_by_tmux = bool(
+                hint is not None
+                and rctx.active_target is not None
+                and self._outer_hint_belongs_to_tmux(window_title, hint, rctx.active_target[1])
+            )
             early_tty_is_tmux_client = bool(
-                norm_tty
+                rctx.norm_tty
                 and any(
-                    c.client_tty and _tty_matches(c.client_tty, norm_tty)
+                    c.client_tty and _tty_matches(c.client_tty, rctx.norm_tty)
                     for c in tmux_snap.clients
                 )
             )
-            # Phase 0 Priority: If the known foreground TTY is actively running interactive `ssh`,
-            # veto/route BEFORE any 8-hex `[#tag]` collision can return another TTY's local session!
-            if norm_tty and not early_tty_is_tmux_client and (has_proc or is_real_darwin):
+            if rctx.norm_tty and not early_tty_is_tmux_client and (has_proc or is_real_darwin):
                 ssh_tty_early = self._find_tty_ssh_target(
-                    norm_tty, has_proc=has_proc, darwin_ps_rows=darwin_ps_rows
+                    rctx.norm_tty, has_proc=has_proc, darwin_ps_rows=rctx.darwin_ps_rows
                 )
                 if ssh_tty_early is not None:
                     rfg_early = detect_remote_foreground(
@@ -3792,471 +4283,65 @@ class SessionTracker:
                         ssh_proc_host=ssh_tty_early,
                         is_macos=is_real_darwin,
                     )
-                    return _return_remote_fg(rfg_early)
+                    return self._return_remote_fg(rfg_early)
 
             if (
                 hint is not None
-                and active_target is not None
-                and not outer_hint_owned_by_tmux
+                and rctx.active_target is not None
+                and not rctx.outer_hint_owned_by_tmux
                 and any(
-                    p.pane_id != active_target[1].pane_id
-                    and _same_tmux_server(p.socket_path, active_target[1].socket_path)
+                    p.pane_id != rctx.active_target[1].pane_id
+                    and _same_tmux_server(p.socket_path, rctx.active_target[1].socket_path)
                     and self._outer_hint_belongs_to_tmux(window_title, hint, p)
                     for p in tmux_snap.panes
                 )
             ):
-                outer_hint_owned_by_tmux = True
-                neutralize_outer_title = True
+                rctx.outer_hint_owned_by_tmux = True
+                rctx.neutralize_outer_title = True
 
-            if hint is not None and not outer_hint_owned_by_tmux:
-                reg_hit, saw_stale_exited = _lookup_in_registry_detailed(
-                    hint, rt_dirs, self.home, self.proc_root
+            if hint is not None and not rctx.outer_hint_owned_by_tmux:
+                done_h, res_h = self._resolve_explicit_title_hint(
+                    rctx, early_tty_is_tmux_client=early_tty_is_tmux_client
                 )
-                if reg_hit is not None:
-                    if (
-                        active_target is not None
-                        and reg_hit.tmux_pane
-                        and _same_tmux_server(reg_hit.tmux_socket, active_target[1].socket_path)
-                    ):
-                        outer_hint_owned_by_tmux = True
-                        if reg_hit.tmux_pane != active_target[1].pane_id:
-                            neutralize_outer_title = True
-                    elif not reg_hit.tmux_pane and (
-                        early_tty_is_tmux_client
-                        or (norm_tty and reg_hit.tty and not _tty_matches(norm_tty, reg_hit.tty))
-                        or (
-                            darwin_win_desc_pids
-                            and reg_hit.agent_pid > 0
-                            and reg_hit.agent_pid not in darwin_win_desc_pids
-                        )
-                    ):
-                        stale_hint_fallthrough = True
-                    else:
-                        return _with_cwd(reg_hit.match)
-                elif saw_stale_exited:
-                    stale_hint_fallthrough = True
-                    stale_hint_ttys = _collect_stale_registry_ttys(hint, rt_dirs)
-                else:
-                    all_proc_cands = (
-                        scan_proc_root_sessions(
-                            self.home,
-                            self.proc_root,
-                            claimed_claude_sids=claimed_claude,
-                        )
-                        if (has_proc and self.proc_root is not None)
-                        else []
-                    )
-                    if hint.is_full_uuid:
-                        disk_hit = _lookup_by_full_uuid(hint, self.home, self.proc_root)
-                    else:
-                        disk_hit = _lookup_by_short_prefix(
-                            hint, self.home, self.proc_root, all_proc_cands
-                        )
-                    if disk_hit is None:
-                        # Explicit session tag in title that matches no valid root session MUST return None
-                        # rather than silently guessing an unrelated window's conversation!
-                        return None
-                    _ensure_darwin_window_ptys()
-                    hint_tty_is_tmux_client = bool(
-                        norm_tty
-                        and any(
-                            c.client_tty and _tty_matches(c.client_tty, norm_tty)
-                            for c in tmux_snap.clients
-                        )
-                    )
-                    if hint_tty_is_tmux_client:
-                        stale_hint_fallthrough = True
-                    elif (
-                        is_real_proc or any(c.cli == disk_hit.cli for c in all_proc_cands)
-                    ) and not any(
-                        c.session_key == disk_hit.session_key for c in all_proc_cands
-                    ):
-                        # Bug D guard: dead historical transcript on disk MUST NOT return a dead match
-                        # NOR fall through to hijack an unrelated background tab when not in tmux/tty!
-                        if active_target is None and not norm_tty:
-                            return None
-                        stale_hint_fallthrough = True
-                    elif (
-                        is_real_darwin
-                        and (
-                            active_target is not None
-                            or bool(norm_tty)
-                            or bool(darwin_win_tab_ttys)
-                        )
-                        and not self._darwin_is_unhooked_session_live(
-                            disk_hit,
-                            tmux_snap,
-                            norm_tty=norm_tty,
-                            window_pid=window_pid,
-                            allowed_pids=(darwin_win_desc_pids if darwin_win_desc_pids else None),
-                            rows=darwin_ps_rows,
-                        )
-                    ):
-                        if active_target is None and not norm_tty:
-                            return None
-                        stale_hint_fallthrough = True
-                    else:
-                        return _with_cwd(disk_hit)
+                if done_h:
+                    return res_h
 
-            eff_title = (
+            rctx.eff_title = (
                 ""
-                if (stale_hint_fallthrough or neutralize_outer_title)
+                if (rctx.stale_hint_fallthrough or rctx.neutralize_outer_title)
                 else (window_title or "")
             )
+            self._ensure_resolve_darwin_ptys(rctx)
 
-            _ensure_darwin_window_ptys()
-
-            if stale_hint_fallthrough or norm_tty or len(darwin_win_tab_ttys) > 1:
-                active_target = self._select_active_tmux_target(
+            if rctx.stale_hint_fallthrough or rctx.norm_tty or len(rctx.darwin_win_tab_ttys) > 1:
+                rctx.active_target = self._select_active_tmux_target(
                     tmux_snap,
-                    eff_title,
-                    window_tty=norm_tty,
+                    rctx.eff_title,
+                    window_tty=rctx.norm_tty,
                     window_pid=window_pid,
                     allowed_client_ttys=(
-                        darwin_win_tab_ttys if len(darwin_win_tab_ttys) > 1 else None
+                        rctx.darwin_win_tab_ttys if len(rctx.darwin_win_tab_ttys) > 1 else None
                     ),
                     allowed_client_pids=(
-                        darwin_win_desc_pids if len(darwin_win_tab_ttys) > 1 else None
+                        rctx.darwin_win_desc_pids if len(rctx.darwin_win_tab_ttys) > 1 else None
                     ),
                 )
 
-            tty_matches_tmux_client = bool(
-                norm_tty
+            rctx.tty_matches_tmux_client = bool(
+                rctx.norm_tty
                 and any(
-                    c.client_tty and _tty_matches(c.client_tty, norm_tty)
+                    c.client_tty and _tty_matches(c.client_tty, rctx.norm_tty)
                     for c in tmux_snap.clients
                 )
             )
-            if norm_tty and not tty_matches_tmux_client:
-                ssh_tty_host = self._find_tty_ssh_target(
-                    norm_tty, has_proc=has_proc, darwin_ps_rows=darwin_ps_rows
-                )
-                if ssh_tty_host is not None:
-                    rfg_tty = detect_remote_foreground(
-                        eff_title,
-                        window_process=window_process,
-                        bundle_id=bundle_id,
-                        document=document,
-                        local_hostnames=self._local_hostnames,
-                        ssh_proc_host=ssh_tty_host,
-                    )
-                    return _return_remote_fg(rfg_tty)
-                tty_hit, stop_fallback = _resolve_by_window_tty(
-                    norm_tty,
-                    norm_cwd=norm_cwd,
-                    window_pid=window_pid,
-                    window_title=eff_title,
-                    runtime_dirs=rt_dirs,
-                    home=self.home,
-                    proc_root=self.proc_root,
-                    claimed_claude_sids=claimed_claude,
-                )
-                if tty_hit is not None or stop_fallback:
-                    return tty_hit
+            done_tty, res_tty = self._resolve_scoped_tty_or_window_ssh(rctx)
+            if done_tty:
+                return res_tty
 
-            if not norm_tty and window_pid > 1 and active_target is None:
-                if has_proc and self.proc_root is not None:
-                    wp_pids = _collect_descendant_pids(self.proc_root, (window_pid,)) - all_tmux_pids
-                    ssh_wp_host = self._find_proc_ssh_target_in_pids(wp_pids)
-                    if ssh_wp_host is not None:
-                        rfg_wp = detect_remote_foreground(
-                            eff_title,
-                            window_process=window_process,
-                            bundle_id=bundle_id,
-                            document=document,
-                            local_hostnames=self._local_hostnames,
-                            ssh_proc_host=ssh_wp_host,
-                        )
-                        return _return_remote_fg(rfg_wp)
-                elif darwin_win_desc_pids and darwin_ps_rows:
-                    excluded_ttys_d = self._collect_tmux_ttys(tmux_snap)
-                    d_rows = [
-                        r
-                        for r in darwin_ps_rows
-                        if r[0] in darwin_win_desc_pids and (not r[3] or r[3] not in excluded_ttys_d)
-                    ]
-                    if d_rows and not any(
-                        _classify_interactive_cli(
-                            os.path.basename(r[4][0].replace("\\", "/")).lstrip("-").lower() if r[4] else "",
-                            r[4],
-                        )
-                        for r in d_rows
-                    ):
-                        for _pid, _ppid, _st, _rtty, argv in d_rows:
-                            h_cand, is_int = extract_ssh_target_from_argv(argv)
-                            if is_int:
-                                rfg_d = detect_remote_foreground(
-                                    eff_title,
-                                    window_process=window_process,
-                                    bundle_id=bundle_id,
-                                    document=document,
-                                    local_hostnames=self._local_hostnames,
-                                    ssh_proc_host=h_cand,
-                                    is_macos=True,
-                                )
-                                return _return_remote_fg(rfg_d)
+            if rctx.active_target is not None:
+                return self._resolve_active_tmux_phase(rctx)
 
-            def _check_active_pane_remote(active_pane: TmuxPaneInfo) -> tuple[bool, SessionMatch | None]:
-                pane_ssh_host: str | None = None
-                if has_proc and self.proc_root is not None:
-                    p_pids = _collect_pane_pids(self.proc_root, active_pane.pane_pid, active_pane.pane_tty)
-                    pane_ssh_host = self._find_proc_ssh_target_in_pids(p_pids)
-                elif self.proc_root is not None and active_pane.pane_tty:
-                    pane_ssh_host = self._find_tty_ssh_target(
-                        normalize_tty_path(active_pane.pane_tty),
-                        has_proc=False,
-                        darwin_ps_rows=darwin_ps_rows,
-                    )
-                rfg_pane = detect_remote_foreground(
-                    eff_title,
-                    window_process=window_process,
-                    bundle_id=bundle_id,
-                    document=document,
-                    local_hostnames=self._local_hostnames,
-                    ssh_proc_host=pane_ssh_host,
-                    pane_title_override=active_pane.pane_title,
-                    is_macos=is_real_darwin,
-                )
-                if rfg_pane.is_remote:
-                    return True, _return_remote_fg(rfg_pane)
-                return False, None
-
-            def _collect_darwin_scoped_non_tmux_cands() -> list[SessionMatch]:
-                scoped_cands: dict[str, SessionMatch] = {}
-                for cand in self._scan_darwin_live_non_tmux_sessions(
-                    tmux_snap,
-                    claimed_claude=claimed_claude,
-                    allowed_pids=(darwin_win_desc_pids if darwin_win_desc_pids else None),
-                    rows=darwin_ps_rows,
-                ):
-                    scoped_cands[cand.session_key] = cand
-                if darwin_win_tab_ttys and darwin_ps_rows:
-                    excluded_ttys = self._collect_tmux_ttys(tmux_snap)
-                    pids_by_tty: dict[str, set[int]] = {}
-                    clis_by_tty: dict[str, set[str]] = {}
-                    for r_pid, _ppid, _stat, r_tty, r_argv in darwin_ps_rows:
-                        if r_pid in darwin_win_desc_pids and r_tty and r_tty not in excluded_ttys:
-                            pids_by_tty.setdefault(r_tty, set()).add(r_pid)
-                            a0 = os.path.basename(r_argv[0].replace("\\", "/")).lstrip("-").lower() if r_argv else ""
-                            if cli_k := _classify_interactive_cli(a0, r_argv):
-                                clis_by_tty.setdefault(r_tty, set()).add(cli_k)
-                    for tab_tty in sorted(darwin_win_tab_ttys):
-                        if tab_tty in excluded_ttys:
-                            continue
-                        reg_cand = _lookup_tty_in_registry(
-                            tab_tty,
-                            pids_by_tty.get(tab_tty, set()),
-                            clis_by_tty.get(tab_tty, set()),
-                            rt_dirs,
-                            self.home,
-                            self.proc_root,
-                            fallback_cwd=norm_cwd,
-                        )
-                        if reg_cand is not None:
-                            scoped_cands[reg_cand.session_key] = reg_cand
-                return list(scoped_cands.values())
-
-            if active_target is not None:
-                active_client, active_pane = active_target
-                tmux_is_scoped = bool(
-                    outer_hint_owned_by_tmux
-                    or tty_matches_tmux_client
-                    or norm_tty
-                    or window_pid > 0
-                    or norm_cwd
-                )
-                if has_proc and self.proc_root is not None:
-                    if not outer_hint_owned_by_tmux and not tty_matches_tmux_client:
-                        non_tmux_cands = self._filter_by_title_affinity(
-                            scan_proc_root_sessions(
-                                self.home,
-                                self.proc_root,
-                                excluded_pids=all_tmux_pids,
-                                claimed_claude_sids=claimed_claude,
-                            ),
-                            eff_title,
-                            scoped=bool(norm_tty or norm_cwd),
-                        )
-                        if non_tmux_cands and self._should_prefer_non_tmux(
-                            eff_title, active_client, active_pane, non_tmux_cands
-                        ):
-                            return _disambiguate_candidates(
-                                non_tmux_cands, eff_title, norm_cwd, self.home
-                            )
-                    # Phase 0 Scope B: Active local tmux pane running interactive `ssh` or [@remote_host]
-                    is_pane_rem, pane_rem_match = _check_active_pane_remote(active_pane)
-                    if is_pane_rem:
-                        if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
-                            eff_title, active_pane, pane_rem_match
-                        ):
-                            return None
-                        return pane_rem_match
-                    pane_res = self._resolve_tmux_active_pane(
-                        active_pane,
-                        rt_dirs,
-                        window_title=eff_title,
-                        claimed_claude=claimed_claude,
-                    )
-                    if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
-                        eff_title, active_pane, pane_res
-                    ):
-                        return None
-                    return pane_res
-
-                is_pane_rem, pane_rem_match = _check_active_pane_remote(active_pane)
-                pane_hit, pane_authoritative_empty = (
-                    (None, True)
-                    if is_pane_rem
-                    else self._resolve_tmux_active_pane_detailed(
-                        active_pane,
-                        rt_dirs,
-                        window_title=eff_title,
-                        claimed_claude=claimed_claude,
-                    )
-                )
-                if outer_hint_owned_by_tmux or tty_matches_tmux_client:
-                    return pane_rem_match if is_pane_rem else pane_hit
-                if is_real_darwin:
-                    non_tmux_cands = self._filter_by_title_affinity(
-                        _collect_darwin_scoped_non_tmux_cands(),
-                        eff_title,
-                        scoped=bool(darwin_win_tab_ttys or norm_tty or norm_cwd),
-                    )
-                    if non_tmux_cands and self._should_prefer_non_tmux(
-                        eff_title, active_client, active_pane, non_tmux_cands
-                    ):
-                        return _disambiguate_candidates(
-                            non_tmux_cands, eff_title, norm_cwd, self.home
-                        )
-                    if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
-                        eff_title, active_pane, pane_rem_match if is_pane_rem else pane_hit
-                    ):
-                        return None
-                    return pane_rem_match if is_pane_rem else pane_hit
-                tmux_bound_keys = _collect_tmux_bound_session_keys(rt_dirs)
-                if pane_hit is not None:
-                    tmux_bound_keys.add(pane_hit.session_key)
-                tmux_pane_uuids = {
-                    ph.session_token
-                    for p in tmux_snap.panes
-                    for ph in (parse_window_title_hint(p.pane_title),)
-                    if ph is not None and ph.is_full_uuid
-                }
-                all_fallback = _scan_nonproc_fallback_sessions(
-                    self.home,
-                    rt_dirs,
-                    window_cwd=norm_cwd,
-                    check_pid_alive=(self.proc_root is not None),
-                )
-                non_tmux_cands = self._filter_by_title_affinity(
-                    [
-                        c
-                        for c in all_fallback
-                        if c.session_key not in tmux_bound_keys
-                        and c.session_id not in tmux_pane_uuids
-                    ],
-                    eff_title,
-                    scoped=bool(norm_cwd),
-                )
-                if non_tmux_cands and self._should_prefer_non_tmux(
-                    eff_title, active_client, active_pane, non_tmux_cands
-                ):
-                    return _disambiguate_candidates(
-                        non_tmux_cands, eff_title, norm_cwd, self.home
-                    )
-                if is_pane_rem:
-                    if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
-                        eff_title, active_pane, pane_rem_match
-                    ):
-                        return None
-                    return pane_rem_match
-                if (
-                    pane_hit is not None
-                    or pane_authoritative_empty
-                    or (
-                        _WORD_TMUX_RE.search(eff_title)
-                        and not _TUI_SPINNER_RE.search(eff_title)
-                    )
-                ):
-                    if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
-                        eff_title, active_pane, pane_hit
-                    ):
-                        return None
-                    return pane_hit
-                filtered_fb = self._filter_by_title_affinity(
-                    non_tmux_cands or all_fallback, eff_title, scoped=bool(norm_cwd)
-                )
-                return _disambiguate_candidates(
-                    filtered_fb, eff_title, norm_cwd, self.home
-                )
-
-            if has_proc and self.proc_root is not None:
-                allowed_stale_pids: set[int] | None = None
-                if stale_hint_fallthrough:
-                    if not stale_hint_ttys:
-                        return None
-                    allowed_stale_pids = set()
-                    for pdir in _iter_numeric_proc_dirs(self.proc_root):
-                        ptty = _read_proc_tty_path(pdir) or _readlink_clean(pdir / "fd" / "0")
-                        if ptty and any(
-                            ptty == st_t or _tty_matches(ptty, st_t) for st_t in stale_hint_ttys
-                        ):
-                            allowed_stale_pids.add(int(pdir.name))
-                    if not allowed_stale_pids:
-                        return None
-                proc_cands = scan_proc_root_sessions(
-                    self.home,
-                    self.proc_root,
-                    allowed_pids=allowed_stale_pids,
-                    excluded_pids=all_tmux_pids or None,
-                    claimed_claude_sids=claimed_claude,
-                )
-                # Phase 0 Scope D: Unscoped /proc interactive SSH tab with newer TTY activity
-                if window_pid <= 0 and not norm_tty and not stale_hint_fallthrough and hint is None:
-                    ssh_unscoped = self._find_unscoped_proc_ssh_target(
-                        window_title=eff_title,
-                        excluded_pids=all_tmux_pids,
-                        local_cands=proc_cands,
-                    )
-                    if ssh_unscoped is not None:
-                        rfg_u = detect_remote_foreground(
-                            eff_title,
-                            window_process=window_process,
-                            bundle_id=bundle_id,
-                            document=document,
-                            local_hostnames=self._local_hostnames,
-                            ssh_proc_host=ssh_unscoped,
-                        )
-                        return _return_remote_fg(rfg_u)
-                proc_cands = self._filter_by_title_affinity(
-                    proc_cands, eff_title, scoped=bool(norm_tty or norm_cwd or stale_hint_fallthrough)
-                )
-                if proc_cands:
-                    return _disambiguate_candidates(proc_cands, eff_title, norm_cwd, self.home)
-                if stale_hint_fallthrough or is_real_proc:
-                    return None
-
-            if is_real_darwin and len(darwin_win_tab_ttys) > 1:
-                scoped_list = self._filter_by_title_affinity(
-                    _collect_darwin_scoped_non_tmux_cands(), eff_title, scoped=True
-                )
-                if scoped_list:
-                    return _disambiguate_candidates(scoped_list, eff_title, norm_cwd, self.home)
-                return None
-
-            if stale_hint_fallthrough or (is_real_darwin and window_pid > 0):
-                return None
-
-            fallback_cands = _scan_nonproc_fallback_sessions(
-                self.home,
-                rt_dirs,
-                window_cwd=norm_cwd,
-                check_pid_alive=(self.proc_root is not None),
-            )
-            fallback_cands = self._filter_by_title_affinity(
-                fallback_cands, eff_title, scoped=bool(norm_cwd)
-            )
-            return _disambiguate_candidates(fallback_cands, eff_title, norm_cwd, self.home)
+            return self._resolve_non_tmux_proc_or_fallback(rctx)
 
     def _reset_state(self, state: SessionState, new_path: str) -> None:
         state.jsonl_path = new_path

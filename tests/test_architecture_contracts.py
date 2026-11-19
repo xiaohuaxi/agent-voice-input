@@ -317,8 +317,9 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
             mod = importlib.import_module(
                 "agent_voice_input" if stem == "__init__" else f"agent_voice_input.{stem}"
             )
+            mod_symbols = {k for k in set(mod.__dict__.keys()) | set(dir(mod)) if hasattr(mod, k)}
             compiled = compile(py_path.read_text(encoding="utf-8"), str(py_path), "exec")
-            _walk_code(compiled, stem, set(mod.__dict__.keys()))
+            _walk_code(compiled, stem, mod_symbols)
 
         self.assertEqual(
             missing_globals,
@@ -368,6 +369,37 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
                         non_stdlib.append(f"{mod_name}:{node.lineno} from {node.module}")
 
         self.assertEqual(non_stdlib, [], f"Unexpected third-party runtime imports: {non_stdlib}")
+
+    def test_cli_session_hook_fast_path_avoids_heavy_imports_and_no_kwarg_probe_shell(self) -> None:
+        import subprocess
+
+        code = (
+            "import sys; "
+            "from agent_voice_input.cli import main; "
+            "sys.stdin = __import__('io').StringIO('{}'); "
+            "rc = main(['session-hook', '--cli', 'claude', '--quiet']); "
+            "assert rc == 0; "
+            "heavy = [m for m in ('asr_providers', 'refiner', 'daemon', 'http_transport', "
+            "'platform_common', 'platform_wsl', 'platform_macos', 'audio_proc', 'hud', 'prompts') "
+            "if f'agent_voice_input.{m}' in sys.modules]; "
+            "assert not heavy, f'session-hook loaded heavy modules: {heavy}'"
+        )
+        p = subprocess.run(
+            [sys.executable, "-c", code],
+            env={"PYTHONPATH": str(SRC_DIR)},
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(p.returncode, 0, p.stderr or p.stdout)
+
+        for py_path in sorted(PKG_DIR.glob("*.py")):
+            self.assertNotIn(
+                "_callable_accepts_kwarg",
+                py_path.read_text(encoding="utf-8"),
+                f"{py_path.name} still references legacy _callable_accepts_kwarg shell",
+            )
 
 
 class TestMockPatchTargetGuards(unittest.TestCase):

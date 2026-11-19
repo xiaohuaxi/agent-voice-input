@@ -1898,9 +1898,9 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 ops.append("fg_window")
                 return self.fg
 
-            def hud(self, state: str, text: str = "", duration_ms: int = 0) -> None:
+            def hud(self, state: str, text: str = "", duration_ms: int = 0, **kw: object) -> None:
                 ops.append(f"hud:{state}")
-                super().hud(state, text, duration_ms)
+                super().hud(state, text, duration_ms, **kw)
 
             def beep(self, kind: str) -> None:
                 ops.append(f"beep:{kind}")
@@ -1982,7 +1982,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             return v
 
         class _DrainPlatform(_FakePlatform):
-            def hud(self, state: str, text: str = "", duration_ms: int = 0) -> None:
+            def hud(self, state: str, text: str = "", duration_ms: int = 0, **_kw: object) -> None:
                 drain_ops.append(f"hud:{state}")
 
             def start_recording(self, runtime_dir: Path) -> None:
@@ -2972,7 +2972,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             beeps: list[str] = []
             mplat = MacOSPlatform(Config(), env={"HOME": td}, cache_dir=Path(td) / "cache", shim_cmd_factory=lambda: None)
             mplat._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", no_dev_src])
-            mplat.hud = lambda st, text="", duration_ms=0: hud_events.append((st, duration_ms))  # type: ignore[method-assign]
+            mplat.hud = lambda st, text="", duration_ms=0, **_kw: hud_events.append((st, duration_ms))  # type: ignore[method-assign]
             mplat.beep = lambda kind: beeps.append(kind)  # type: ignore[method-assign]
             mplat.resolve_foreground_window = lambda win=None: ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty")  # type: ignore[method-assign]
 
@@ -3002,7 +3002,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             # 2. WSL2 WASAPI E_NOTFOUND (0x80070490) fails fast with NoMicrophoneError without dead pulse fallback
             wplat = WslPlatform(Config(), env={})
             wplat._use_winmm = True
-            wplat._shim_rpc = lambda req, timeout_sec=4.0: {"ok": False, "rec_error": "wasapi_endpoint_hr_0x80070490"}  # type: ignore[method-assign]
+            wplat._shim_rpc = lambda req, timeout_sec=4.0, **_kw: {"ok": False, "rec_error": "wasapi_endpoint_hr_0x80070490"}  # type: ignore[method-assign]
             with self.assertRaises(NoMicrophoneError):
                 wplat.start_recording(rt)
 
@@ -3020,7 +3020,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             beep_short: list[str] = []
             mplat_short = MacOSPlatform(Config(), env={"HOME": td}, cache_dir=Path(td) / "cache_short", shim_cmd_factory=lambda: None)
             mplat_short._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", short_drop_src])
-            mplat_short.hud = lambda st, text="", duration_ms=0: hud_short.append((st, duration_ms))  # type: ignore[method-assign]
+            mplat_short.hud = lambda st, text="", duration_ms=0, **_kw: hud_short.append((st, duration_ms))  # type: ignore[method-assign]
             mplat_short.beep = lambda kind: beep_short.append(kind)  # type: ignore[method-assign]
             mplat_short.resolve_foreground_window = lambda win=None: ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty")  # type: ignore[method-assign]
             daemon_short = VoiceInputDaemon(
@@ -3081,7 +3081,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             pasted_mid: list[str] = []
             mplat2 = MacOSPlatform(Config(), env={"HOME": td}, cache_dir=Path(td) / "cache2", shim_cmd_factory=lambda: None)
             mplat2._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", mid_drop_src])
-            mplat2.hud = lambda st, text="", duration_ms=0: hud_mid.append(st)  # type: ignore[method-assign]
+            mplat2.hud = lambda st, text="", duration_ms=0, **_kw: hud_mid.append(st)  # type: ignore[method-assign]
             mplat2.beep = lambda kind: beep_mid.append(kind)  # type: ignore[method-assign]
             mplat2.resolve_foreground_window = lambda win=None: ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty")  # type: ignore[method-assign]
             mplat2.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None: (pasted_mid.append(txt) or PasteOutcome(True, True, "ok", "Ghostty"))  # type: ignore[method-assign]
@@ -3159,7 +3159,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             mplat_max._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", live_stream_src])
             mplat_max._has_managed_shim = lambda: True  # type: ignore[method-assign]
             mplat_max.hud_level = lambda lvl: levels_seen.append(lvl)  # type: ignore[method-assign]
-            mplat_max.hud = lambda st, text="", duration_ms=0: hud_max.append(st)  # type: ignore[method-assign]
+            mplat_max.hud = lambda st, text="", duration_ms=0, **_kw: hud_max.append(st)  # type: ignore[method-assign]
             mplat_max.beep = lambda kind: beep_max.append(kind)  # type: ignore[method-assign]
             mplat_max.resolve_foreground_window = lambda win=None: ForegroundWindow(0, "Ghostty", "agy", "com.mitchellh.ghostty")  # type: ignore[method-assign]
             mplat_max.deliver_text = lambda txt, seq_id, target_hwnd=0, *, origin_window=None: (pasted_max.append(txt) or PasteOutcome(True, True, "ok", "Ghostty"))  # type: ignore[method-assign]
@@ -3508,7 +3508,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
 
             wplat_race = WslPlatform(Config(audio=AudioConfig(wsl_source="winmm")), env={"HOME": td})
             early_lost_evt = threading.Event()
-            wplat_race.set_recorder_lost_callback(early_lost_evt.set)
+            wplat_race.set_recorder_lost_callback(lambda seq_id=None: early_lost_evt.set())
 
             seen_rec_gens: list[int] = []
 

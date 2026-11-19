@@ -91,7 +91,6 @@ from .config import (
     resolve_credentials,
     select_refiner_provider,
 )
-from .platform_common import _callable_accepts_kwarg
 from .prompts import (
     CODEX_NO_TOOLS_NOTE,
     REFINER_AGENT_MODE_ADDENDUM,
@@ -423,10 +422,9 @@ def build_refiner_context_chunks(
     git_ctx = ""
     if tracker is not None and (session_key or workspace_cwd):
         ctx_kw: dict[str, Any] = {"max_chars": max_chars, "include_git_status": include_git}
-        if workspace_cwd and _callable_accepts_kwarg(tracker.get_refiner_context, "workspace_cwd"):
+        if workspace_cwd:
             ctx_kw["workspace_cwd"] = workspace_cwd
-        if session_key or "workspace_cwd" in ctx_kw:
-            raw_chunks, git_ctx = tracker.get_refiner_context(session_key, **ctx_kw)
+        raw_chunks, git_ctx = tracker.get_refiner_context(session_key, **ctx_kw)
     if not raw_chunks and max_chars > 0 and fallback_context.strip():
         if not (tracker is not None and session_key and tracker.get_state(session_key) is not None):
             fb_trimmed = strip_lenticular_artifacts(fallback_context).strip()

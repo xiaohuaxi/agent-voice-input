@@ -27,7 +27,6 @@ from .platform_common import (
     MicrophoneUnavailableError,
     NoMicrophoneError,
     PasteOutcome,
-    _callable_accepts_kwarg,
     _reap_shim_proc,
     classify_ffmpeg_startup_error,
     invoke_recorder_lost_callback,
@@ -325,7 +324,6 @@ class WslPlatform(JsonlShimMixin):
         self.last_audio_error = ""
         eff_loopback = bool(loopback or self.env.get("AGENT_VOICE_INPUT_WASAPI_LOOPBACK") == "1" or self.env.get("VOICE_INPUT_WASAPI_LOOPBACK") == "1")
         if self._use_winmm:
-            has_before_write = _callable_accepts_kwarg(self._shim_rpc, "before_write")
             with self._winmm_state_lock:
                 if self._closed:
                     raise RuntimeError(f"{type(self).__name__} is closed")
@@ -334,26 +332,33 @@ class WslPlatform(JsonlShimMixin):
                 self._active_seq_id = seq_id
                 self._rec_mode = ""
                 self._winmm_starting = True
-                self._winmm_rpc_dispatched = not has_before_write
+                self._winmm_rpc_dispatched = False
                 self._pending_winmm_lost_reason = ""
                 self._pending_winmm_recovered_gaps.clear()
             req: dict[str, Any] = {"cmd": "rec_start", "rec_gen": my_gen}
             if eff_loopback:
                 req["loopback"] = True
 
+            before_write_ran = False
+
             def _on_before_write() -> None:
+                nonlocal before_write_ran
                 with self._winmm_state_lock:
                     if self._closed or self._winmm_gen != my_gen:
                         raise self._classify_wasapi_start_error("mic_busy:wasapi_aborted")
                     self._winmm_rpc_dispatched = True
+                    before_write_ran = True
 
-            rpc_kw: dict[str, Any] = {}
-            if _callable_accepts_kwarg(self._shim_rpc, "allow_retry"):
-                rpc_kw["allow_retry"] = False
-            if has_before_write:
-                rpc_kw["before_write"] = _on_before_write
             try:
-                res = self._shim_rpc(req, timeout_sec=4.0, **rpc_kw) or {}
+                res = (
+                    self._shim_rpc(
+                        req,
+                        timeout_sec=4.0,
+                        allow_retry=False,
+                        before_write=_on_before_write,
+                    )
+                    or {}
+                )
             except Exception as shim_exc:
                 fb_gen = 0
                 with self._winmm_state_lock:
@@ -427,7 +432,7 @@ class WslPlatform(JsonlShimMixin):
                         early_gaps = list(self._pending_winmm_recovered_gaps)
                         self._pending_winmm_recovered_gaps.clear()
                 if stale_ok:
-                    if not has_before_write and not self._closed:
+                    if not before_write_ran and not self._closed:
                         try:
                             self._shim_rpc({"cmd": "rec_stop"}, timeout_sec=2.0)
                         except Exception:
@@ -545,9 +550,7 @@ class WslPlatform(JsonlShimMixin):
         return max(15.0, float(self.cfg.audio.max_duration_sec) + 2.0)
 
     def _dispatch_paste_rpc(self, req: dict[str, Any], timeout_sec: float = 5.0) -> dict[str, Any]:
-        if _callable_accepts_kwarg(self._shim_rpc, "allow_retry"):
-            return self._shim_rpc(req, timeout_sec=timeout_sec, allow_retry=False) or {}
-        return self._shim_rpc(req, timeout_sec=timeout_sec) or {}
+        return self._shim_rpc(req, timeout_sec=timeout_sec, allow_retry=False) or {}
 
     def deliver_text(
         self,

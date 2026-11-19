@@ -1632,234 +1632,239 @@ def _parse_remote_hosts_value(raw_hosts: Any) -> tuple[RemoteHostConfig, ...]:
     return tuple(parsed)
 
 
+def _apply_hotkey_section(cfg: Config, hk: Any) -> None:
+    if not isinstance(hk, Mapping):
+        raise ConfigError("[hotkey] must be a table/object")
+    has_explicit_scope = hk.get("scope") is not None
+    oit_val: bool | None = None
+    for k, v in hk.items():
+        if v is None:
+            continue
+        if k == "key":
+            cfg.hotkey.key = _as_str(v, "hotkey.key").strip()
+        elif k == "trigger_mode":
+            cfg.hotkey.trigger_mode = _as_str(v, "hotkey.trigger_mode").strip().lower()
+        elif k == "tap_max_ms":
+            cfg.hotkey.tap_max_ms = _as_int(v, "hotkey.tap_max_ms")
+        elif k == "debounce_ms":
+            cfg.hotkey.debounce_ms = _as_int(v, "hotkey.debounce_ms")
+        elif k == "scope":
+            cfg.hotkey.scope = _as_str(v, "hotkey.scope").strip().lower()
+        elif k == "yield_remote_desktop":
+            cfg.hotkey.yield_remote_desktop = _as_bool(v, "hotkey.yield_remote_desktop")
+        elif k == "ignore_apps":
+            cfg.hotkey.ignore_apps = _as_app_patterns(v, "hotkey.ignore_apps")
+        elif k == "only_in_terminals":
+            oit_val = _as_bool(v, "hotkey.only_in_terminals")
+        else:
+            raise ConfigError(f"unknown hotkey option {k!r}")
+    if oit_val is not None and not has_explicit_scope:
+        cfg.hotkey.scope = "terminals" if oit_val else "all"
+
+
+def _apply_ui_section(cfg: Config, ui: Any) -> None:
+    if not isinstance(ui, Mapping):
+        raise ConfigError("[ui] must be a table/object")
+    for k, v in ui.items():
+        if v is None:
+            continue
+        if k == "language":
+            cfg.ui.language = normalize_ui_language(v, "ui.language")
+        elif k == "position":
+            cfg.ui.position = normalize_ui_position(v, "ui.position")
+        else:
+            raise ConfigError(f"unknown ui option {k!r}")
+
+
+def _apply_audio_section(cfg: Config, au: Any) -> None:
+    if not isinstance(au, Mapping):
+        raise ConfigError("[audio] must be a table/object")
+    for k, v in au.items():
+        if v is None:
+            continue
+        if k == "floor_dbfs":
+            cfg.audio.floor_dbfs = _as_float(v, "audio.floor_dbfs")
+        elif k == "target_dbfs":
+            cfg.audio.target_dbfs = _as_float(v, "audio.target_dbfs")
+        elif k == "max_gain_db":
+            cfg.audio.max_gain_db = _as_float(v, "audio.max_gain_db")
+        elif k == "min_duration_sec":
+            cfg.audio.min_duration_sec = _as_float(v, "audio.min_duration_sec")
+        elif k == "min_voiced_sec":
+            cfg.audio.min_voiced_sec = _as_float(v, "audio.min_voiced_sec")
+        elif k == "max_duration_sec":
+            cfg.audio.max_duration_sec = _parse_max_duration_sec(v, "audio.max_duration_sec")
+        elif k == "wsl_source":
+            cfg.audio.wsl_source = _as_str(v, "audio.wsl_source").strip().lower()
+        elif k == "macos_device":
+            cfg.audio.macos_device = _as_str(v, "audio.macos_device").strip()
+        elif k == "beep":
+            cfg.audio.beep = _as_bool(v, "audio.beep")
+        elif k == "tail_drain_sec":
+            cfg.audio.tail_drain_sec = _as_float(v, "audio.tail_drain_sec")
+        elif k == "save_recordings":
+            cfg.audio.save_recordings = _as_bool(v, "audio.save_recordings")
+        elif k == "save_recordings_max_count":
+            cfg.audio.save_recordings_max_count = _as_int(v, "audio.save_recordings_max_count")
+        else:
+            raise ConfigError(f"unknown audio option {k!r}")
+
+
+def _apply_asr_section(cfg: Config, asr: Any) -> None:
+    if not isinstance(asr, Mapping):
+        raise ConfigError("[asr] must be a table/object")
+    prev_asr_provider = cfg.asr.provider
+    has_explicit_asr_provider = asr.get("provider") is not None
+    has_explicit_asr_model = asr.get("model") is not None and str(asr.get("model")).strip() != ""
+    has_explicit_asr_api = asr.get("api") is not None and str(asr.get("api")).strip() != ""
+    has_explicit_asr_base_url = (
+        asr.get("base_url") is not None and str(asr.get("base_url")).strip() != ""
+    )
+    has_explicit_asr_key_env = (
+        asr.get("api_key_env") is not None and str(asr.get("api_key_env")).strip() != ""
+    )
+    for k, v in asr.items():
+        if v is None:
+            continue
+        if k == "provider":
+            cfg.asr.provider = _as_str(v, "asr.provider").strip().lower()
+        elif k == "model":
+            cfg.asr.model = _as_str(v, "asr.model").strip()
+        elif k == "api":
+            cfg.asr.api = _as_str(v, "asr.api").strip().lower()
+        elif k == "effort":
+            cfg.asr.effort = _as_str(v, "asr.effort").strip().lower()
+        elif k == "resource_id":
+            cfg.asr.resource_id = _as_str(v, "asr.resource_id").strip()
+        elif k == "doubao_mode":
+            cfg.asr.doubao_mode = _as_str(v, "asr.doubao_mode").strip().lower()
+        elif k == "base_url":
+            cfg.asr.base_url = _as_str(v, "asr.base_url").strip()
+        elif k == "api_key_env":
+            cfg.asr.api_key_env = _as_str(v, "asr.api_key_env").strip()
+        elif k == "hotwords_file":
+            cfg.asr.hotwords_file = _as_str(v, "asr.hotwords_file").strip()
+        elif k == "timeout_sec":
+            cfg.asr.timeout_sec = _as_float(v, "asr.timeout_sec")
+        elif k == "max_retries":
+            cfg.asr.max_retries = _as_int(v, "asr.max_retries")
+        else:
+            raise ConfigError(f"unknown asr option {k!r}")
+    if has_explicit_asr_provider and cfg.asr.provider != prev_asr_provider:
+        if not has_explicit_asr_model:
+            cfg.asr.model = ""
+        if not has_explicit_asr_api:
+            cfg.asr.api = "auto"
+        if not has_explicit_asr_base_url:
+            cfg.asr.base_url = ""
+        if not has_explicit_asr_key_env:
+            cfg.asr.api_key_env = ""
+
+
+def _apply_refiner_section(cfg: Config, ref: Any) -> None:
+    if not isinstance(ref, Mapping):
+        raise ConfigError("[refiner] must be a table/object")
+    prev_ref_provider = cfg.refiner.provider
+    has_explicit_ref_provider = ref.get("provider") is not None
+    has_explicit_ref_model = ref.get("model") is not None and str(ref.get("model")).strip() != ""
+    has_explicit_ref_api = ref.get("api") is not None and str(ref.get("api")).strip() != ""
+    has_explicit_ref_effort = (
+        ref.get("effort") is not None and str(ref.get("effort")).strip() != ""
+    )
+    has_explicit_ref_base_url = (
+        ref.get("base_url") is not None and str(ref.get("base_url")).strip() != ""
+    )
+    has_explicit_ref_key_env = (
+        ref.get("api_key_env") is not None and str(ref.get("api_key_env")).strip() != ""
+    )
+    for k, v in ref.items():
+        if v is None:
+            continue
+        if k == "provider":
+            cfg.refiner.provider = _normalize_refiner_provider(v)
+        elif k == "model":
+            cfg.refiner.model = _as_str(v, "refiner.model").strip()
+            cfg.refiner._model_explicit = bool(cfg.refiner.model)
+        elif k == "api":
+            cfg.refiner.api = _as_str(v, "refiner.api").strip().lower()
+        elif k == "effort":
+            cfg.refiner.effort = _as_str(v, "refiner.effort").strip().lower()
+        elif k == "prompt":
+            cfg.refiner.prompt = _as_str(v, "refiner.prompt")
+        elif k == "include_git_status":
+            cfg.refiner.include_git_status = _as_bool(v, "refiner.include_git_status")
+        elif k == "context_max_chars":
+            cfg.refiner.context_max_chars = _as_int(v, "refiner.context_max_chars")
+        elif k == "base_url":
+            cfg.refiner.base_url = _as_str(v, "refiner.base_url").strip()
+        elif k == "api_key_env":
+            cfg.refiner.api_key_env = _as_str(v, "refiner.api_key_env").strip()
+        elif k == "max_turns_per_thread":
+            cfg.refiner.max_turns_per_thread = _as_int(v, "refiner.max_turns_per_thread")
+        elif k == "timeout_sec":
+            cfg.refiner.timeout_sec = _as_float(v, "refiner.timeout_sec")
+        elif k == "max_retries":
+            cfg.refiner.max_retries = _as_int(v, "refiner.max_retries")
+        elif k == "force_on_single_hop":
+            cfg.refiner.force_on_single_hop = _as_bool(v, "refiner.force_on_single_hop")
+        else:
+            raise ConfigError(f"unknown refiner option {k!r}")
+    if has_explicit_ref_provider and cfg.refiner.provider != prev_ref_provider:
+        if not has_explicit_ref_model:
+            cfg.refiner._model_explicit = False
+            cfg.refiner.model = (
+                ""
+                if cfg.refiner.provider in ("auto", "off")
+                else DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
+            )
+        if not has_explicit_ref_api:
+            cfg.refiner.api = "auto"
+        if not has_explicit_ref_effort:
+            cfg.refiner.effort = (
+                ""
+                if cfg.refiner.provider in ("auto", "off")
+                else DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
+            )
+        if not has_explicit_ref_base_url:
+            cfg.refiner.base_url = ""
+        if not has_explicit_ref_key_env:
+            cfg.refiner.api_key_env = ""
+
+
+def _apply_remote_section(cfg: Config, rem: Any) -> None:
+    if not isinstance(rem, Mapping):
+        raise ConfigError("[remote] must be a table/object")
+    for k, v in rem.items():
+        if v is None:
+            continue
+        if k == "hosts":
+            cfg.remote.hosts = _parse_remote_hosts_value(v)
+        elif k == "timeout_ms":
+            cfg.remote.timeout_ms = _as_int(v, "remote.timeout_ms")
+        elif k == "ssh_bin":
+            cfg.remote.ssh_bin = _validate_ssh_bin_str(v, "remote.ssh_bin")
+        else:
+            raise ConfigError(f"unknown remote option {k!r}")
+
+
+_SECTION_APPLIERS: dict[str, Callable[[Config, Any], None]] = {
+    "hotkey": _apply_hotkey_section,
+    "ui": _apply_ui_section,
+    "audio": _apply_audio_section,
+    "asr": _apply_asr_section,
+    "refiner": _apply_refiner_section,
+    "remote": _apply_remote_section,
+}
+
+
 def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
-    allowed_top = {"hotkey", "ui", "audio", "asr", "refiner", "remote"}
     for k in data:
-        if k not in allowed_top:
+        if k not in _SECTION_APPLIERS:
             raise ConfigError(f"unknown top-level config section {k!r}")
-
-    hk = data.get("hotkey")
-    if hk is not None:
-        if not isinstance(hk, Mapping):
-            raise ConfigError("[hotkey] must be a table/object")
-        has_explicit_scope = hk.get("scope") is not None
-        oit_val: bool | None = None
-        for k, v in hk.items():
-            if v is None:
-                continue
-            if k == "key":
-                cfg.hotkey.key = _as_str(v, "hotkey.key").strip()
-            elif k == "trigger_mode":
-                cfg.hotkey.trigger_mode = _as_str(v, "hotkey.trigger_mode").strip().lower()
-            elif k == "tap_max_ms":
-                cfg.hotkey.tap_max_ms = _as_int(v, "hotkey.tap_max_ms")
-            elif k == "debounce_ms":
-                cfg.hotkey.debounce_ms = _as_int(v, "hotkey.debounce_ms")
-            elif k == "scope":
-                cfg.hotkey.scope = _as_str(v, "hotkey.scope").strip().lower()
-            elif k == "yield_remote_desktop":
-                cfg.hotkey.yield_remote_desktop = _as_bool(v, "hotkey.yield_remote_desktop")
-            elif k == "ignore_apps":
-                cfg.hotkey.ignore_apps = _as_app_patterns(v, "hotkey.ignore_apps")
-            elif k == "only_in_terminals":
-                oit_val = _as_bool(v, "hotkey.only_in_terminals")
-            else:
-                raise ConfigError(f"unknown hotkey option {k!r}")
-        if oit_val is not None and not has_explicit_scope:
-            cfg.hotkey.scope = "terminals" if oit_val else "all"
-
-    ui = data.get("ui")
-    if ui is not None:
-        if not isinstance(ui, Mapping):
-            raise ConfigError("[ui] must be a table/object")
-        for k, v in ui.items():
-            if v is None:
-                continue
-            if k == "language":
-                cfg.ui.language = normalize_ui_language(v, "ui.language")
-            elif k == "position":
-                cfg.ui.position = normalize_ui_position(v, "ui.position")
-            else:
-                raise ConfigError(f"unknown ui option {k!r}")
-
-    au = data.get("audio")
-    if au is not None:
-        if not isinstance(au, Mapping):
-            raise ConfigError("[audio] must be a table/object")
-        for k, v in au.items():
-            if v is None:
-                continue
-            if k == "floor_dbfs":
-                cfg.audio.floor_dbfs = _as_float(v, "audio.floor_dbfs")
-            elif k == "target_dbfs":
-                cfg.audio.target_dbfs = _as_float(v, "audio.target_dbfs")
-            elif k == "max_gain_db":
-                cfg.audio.max_gain_db = _as_float(v, "audio.max_gain_db")
-            elif k == "min_duration_sec":
-                cfg.audio.min_duration_sec = _as_float(v, "audio.min_duration_sec")
-            elif k == "min_voiced_sec":
-                cfg.audio.min_voiced_sec = _as_float(v, "audio.min_voiced_sec")
-            elif k == "max_duration_sec":
-                cfg.audio.max_duration_sec = _parse_max_duration_sec(v, "audio.max_duration_sec")
-            elif k == "wsl_source":
-                cfg.audio.wsl_source = _as_str(v, "audio.wsl_source").strip().lower()
-            elif k == "macos_device":
-                cfg.audio.macos_device = _as_str(v, "audio.macos_device").strip()
-            elif k == "beep":
-                cfg.audio.beep = _as_bool(v, "audio.beep")
-            elif k == "tail_drain_sec":
-                cfg.audio.tail_drain_sec = _as_float(v, "audio.tail_drain_sec")
-            elif k == "save_recordings":
-                cfg.audio.save_recordings = _as_bool(v, "audio.save_recordings")
-            elif k == "save_recordings_max_count":
-                cfg.audio.save_recordings_max_count = _as_int(v, "audio.save_recordings_max_count")
-            else:
-                raise ConfigError(f"unknown audio option {k!r}")
-
-    asr = data.get("asr")
-    if asr is not None:
-        if not isinstance(asr, Mapping):
-            raise ConfigError("[asr] must be a table/object")
-        prev_asr_provider = cfg.asr.provider
-        has_explicit_asr_provider = asr.get("provider") is not None
-        has_explicit_asr_model = (
-            asr.get("model") is not None and str(asr.get("model")).strip() != ""
-        )
-        has_explicit_asr_api = (
-            asr.get("api") is not None and str(asr.get("api")).strip() != ""
-        )
-        has_explicit_asr_base_url = (
-            asr.get("base_url") is not None and str(asr.get("base_url")).strip() != ""
-        )
-        has_explicit_asr_key_env = (
-            asr.get("api_key_env") is not None and str(asr.get("api_key_env")).strip() != ""
-        )
-        for k, v in asr.items():
-            if v is None:
-                continue
-            if k == "provider":
-                cfg.asr.provider = _as_str(v, "asr.provider").strip().lower()
-            elif k == "model":
-                cfg.asr.model = _as_str(v, "asr.model").strip()
-            elif k == "api":
-                cfg.asr.api = _as_str(v, "asr.api").strip().lower()
-            elif k == "effort":
-                cfg.asr.effort = _as_str(v, "asr.effort").strip().lower()
-            elif k == "resource_id":
-                cfg.asr.resource_id = _as_str(v, "asr.resource_id").strip()
-            elif k == "doubao_mode":
-                cfg.asr.doubao_mode = _as_str(v, "asr.doubao_mode").strip().lower()
-            elif k == "base_url":
-                cfg.asr.base_url = _as_str(v, "asr.base_url").strip()
-            elif k == "api_key_env":
-                cfg.asr.api_key_env = _as_str(v, "asr.api_key_env").strip()
-            elif k == "hotwords_file":
-                cfg.asr.hotwords_file = _as_str(v, "asr.hotwords_file").strip()
-            elif k == "timeout_sec":
-                cfg.asr.timeout_sec = _as_float(v, "asr.timeout_sec")
-            elif k == "max_retries":
-                cfg.asr.max_retries = _as_int(v, "asr.max_retries")
-            else:
-                raise ConfigError(f"unknown asr option {k!r}")
-        if has_explicit_asr_provider and cfg.asr.provider != prev_asr_provider:
-            if not has_explicit_asr_model:
-                cfg.asr.model = ""
-            if not has_explicit_asr_api:
-                cfg.asr.api = "auto"
-            if not has_explicit_asr_base_url:
-                cfg.asr.base_url = ""
-            if not has_explicit_asr_key_env:
-                cfg.asr.api_key_env = ""
-
-    ref = data.get("refiner")
-    if ref is not None:
-        if not isinstance(ref, Mapping):
-            raise ConfigError("[refiner] must be a table/object")
-        prev_ref_provider = cfg.refiner.provider
-        has_explicit_ref_provider = ref.get("provider") is not None
-        has_explicit_ref_model = (
-            ref.get("model") is not None and str(ref.get("model")).strip() != ""
-        )
-        has_explicit_ref_api = (
-            ref.get("api") is not None and str(ref.get("api")).strip() != ""
-        )
-        has_explicit_ref_effort = (
-            ref.get("effort") is not None and str(ref.get("effort")).strip() != ""
-        )
-        has_explicit_ref_base_url = (
-            ref.get("base_url") is not None and str(ref.get("base_url")).strip() != ""
-        )
-        has_explicit_ref_key_env = (
-            ref.get("api_key_env") is not None and str(ref.get("api_key_env")).strip() != ""
-        )
-        for k, v in ref.items():
-            if v is None:
-                continue
-            if k == "provider":
-                cfg.refiner.provider = _normalize_refiner_provider(v)
-            elif k == "model":
-                cfg.refiner.model = _as_str(v, "refiner.model").strip()
-                cfg.refiner._model_explicit = bool(cfg.refiner.model)
-            elif k == "api":
-                cfg.refiner.api = _as_str(v, "refiner.api").strip().lower()
-            elif k == "effort":
-                cfg.refiner.effort = _as_str(v, "refiner.effort").strip().lower()
-            elif k == "prompt":
-                cfg.refiner.prompt = _as_str(v, "refiner.prompt")
-            elif k == "include_git_status":
-                cfg.refiner.include_git_status = _as_bool(v, "refiner.include_git_status")
-            elif k == "context_max_chars":
-                cfg.refiner.context_max_chars = _as_int(v, "refiner.context_max_chars")
-            elif k == "base_url":
-                cfg.refiner.base_url = _as_str(v, "refiner.base_url").strip()
-            elif k == "api_key_env":
-                cfg.refiner.api_key_env = _as_str(v, "refiner.api_key_env").strip()
-            elif k == "max_turns_per_thread":
-                cfg.refiner.max_turns_per_thread = _as_int(v, "refiner.max_turns_per_thread")
-            elif k == "timeout_sec":
-                cfg.refiner.timeout_sec = _as_float(v, "refiner.timeout_sec")
-            elif k == "max_retries":
-                cfg.refiner.max_retries = _as_int(v, "refiner.max_retries")
-            elif k == "force_on_single_hop":
-                cfg.refiner.force_on_single_hop = _as_bool(v, "refiner.force_on_single_hop")
-            else:
-                raise ConfigError(f"unknown refiner option {k!r}")
-        if has_explicit_ref_provider and cfg.refiner.provider != prev_ref_provider:
-            if not has_explicit_ref_model:
-                cfg.refiner._model_explicit = False
-                cfg.refiner.model = (
-                    ""
-                    if cfg.refiner.provider in ("auto", "off")
-                    else DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
-                )
-            if not has_explicit_ref_api:
-                cfg.refiner.api = "auto"
-            if not has_explicit_ref_effort:
-                cfg.refiner.effort = (
-                    ""
-                    if cfg.refiner.provider in ("auto", "off")
-                    else DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
-                )
-            if not has_explicit_ref_base_url:
-                cfg.refiner.base_url = ""
-            if not has_explicit_ref_key_env:
-                cfg.refiner.api_key_env = ""
-
-    rem = data.get("remote")
-    if rem is not None:
-        if not isinstance(rem, Mapping):
-            raise ConfigError("[remote] must be a table/object")
-        for k, v in rem.items():
-            if v is None:
-                continue
-            if k == "hosts":
-                cfg.remote.hosts = _parse_remote_hosts_value(v)
-            elif k == "timeout_ms":
-                cfg.remote.timeout_ms = _as_int(v, "remote.timeout_ms")
-            elif k == "ssh_bin":
-                cfg.remote.ssh_bin = _validate_ssh_bin_str(v, "remote.ssh_bin")
-            else:
-                raise ConfigError(f"unknown remote option {k!r}")
+    for sec_name, applier in _SECTION_APPLIERS.items():
+        sec_val = data.get(sec_name)
+        if sec_val is not None:
+            applier(cfg, sec_val)
 
 
 def _expand_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -2048,7 +2053,7 @@ def resolve_asr_api(
     return "audio-transcriptions"
 
 
-def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> None:
+def _validate_hotkey_config(cfg: Config) -> None:
     if not cfg.hotkey.key:
         raise ConfigError("hotkey.key must not be empty")
     if cfg.hotkey.trigger_mode not in VALID_TRIGGER_MODES:
@@ -2071,9 +2076,13 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
         )
     cfg.hotkey.ignore_apps = _as_app_patterns(cfg.hotkey.ignore_apps, "hotkey.ignore_apps")
 
+
+def _validate_ui_config(cfg: Config) -> None:
     cfg.ui.language = normalize_ui_language(cfg.ui.language, "ui.language")
     cfg.ui.position = normalize_ui_position(cfg.ui.position, "ui.position")
 
+
+def _validate_audio_config(cfg: Config) -> None:
     if cfg.audio.wsl_source not in VALID_WSL_SOURCES:
         raise ConfigError(
             f"audio.wsl_source must be one of {sorted(VALID_WSL_SOURCES)}, "
@@ -2111,6 +2120,8 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
             "audio.save_recordings_max_count must satisfy 1 <= save_recordings_max_count <= 5000"
         )
 
+
+def _validate_asr_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> None:
     if cfg.asr.provider not in VALID_ASR_PROVIDERS:
         raise ConfigError(
             f"asr.provider must be one of {sorted(VALID_ASR_PROVIDERS)}, got {cfg.asr.provider!r}"
@@ -2180,6 +2191,8 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
                 cfg.asr.base_url,
             )
 
+
+def _validate_refiner_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> None:
     if cfg.refiner.provider not in VALID_REFINER_PROVIDERS:
         raise ConfigError(
             f"refiner.provider must be one of {sorted(VALID_REFINER_PROVIDERS)}, "
@@ -2250,6 +2263,8 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
     ):
         raise ConfigError("refiner.max_retries must satisfy 0 <= max_retries <= 10")
 
+
+def _validate_remote_config(cfg: Config) -> None:
     if (
         isinstance(cfg.remote.timeout_ms, bool)
         or not isinstance(cfg.remote.timeout_ms, int)
@@ -2270,6 +2285,15 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
             seen_remote_keys[key_label] = h.name
         if seen_remote_keys.get(h.name) == h.name and sum(1 for x in cfg.remote.hosts if x.name == h.name) > 1:
             raise ConfigError(f"remote.hosts: duplicate host name {h.name!r}")
+
+
+def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> None:
+    _validate_hotkey_config(cfg)
+    _validate_ui_config(cfg)
+    _validate_audio_config(cfg)
+    _validate_asr_config(cfg, env=env)
+    _validate_refiner_config(cfg, env=env)
+    _validate_remote_config(cfg)
 
 
 def _load_config_file(path: Path) -> dict[str, Any]:

@@ -12,8 +12,17 @@ import sys
 from typing import Any, Callable, Mapping
 
 from . import _tmux
-from . import session_ctx as _sctx
 from .config import get_runtime_dir
+
+_sctx: Any = None
+
+
+def _ensure_sctx() -> None:
+    global _sctx
+    if _sctx is None:
+        from . import session_ctx as mod_sctx
+
+        _sctx = mod_sctx
 
 _SID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{0,56}$")
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -94,6 +103,7 @@ def _is_test_runner_proc(comm: str, args: list[str]) -> bool:
 def _has_proc_tty(pdir: Path, tty_nr: int, *, allow_fixture_tty: bool = False) -> bool:
     if tty_nr > 0:
         return True
+    _ensure_sctx()
     for fn in ("0", "2"):
         t = _sctx._readlink_clean(pdir / "fd" / fn)
         if not t or t == "/dev/null":
@@ -108,6 +118,7 @@ def _has_proc_tty(pdir: Path, tty_nr: int, *, allow_fixture_tty: bool = False) -
 def _walk_ancestor(
     pid0: int, proc_root: Path, pred: Callable[[str, list[str]], bool]
 ) -> tuple[int, list[str]]:
+    _ensure_sctx()
     cur, seen = pid0, set()
     use_proc = proc_root.is_dir()
     allow_fixture_tty = use_proc and proc_root != Path("/proc")
@@ -157,6 +168,7 @@ def _find_ancestor_cli(pid0: int, proc_root: Path, target_cli: str) -> tuple[int
 
 
 def _find_tty(start_pid: int, proc_root: Path) -> str:
+    _ensure_sctx()
     if not proc_root.is_dir():
         cur, seen = start_pid, set()
         for _ in range(32):
@@ -283,7 +295,7 @@ def _resolve_and_sync_tmux_pane(
         if probe.returncode != 0:
             return "", ""
         pane_tty = probe.stdout.decode("utf-8", errors="ignore").strip()
-        if not pane_tty or not _sctx._norm_same_path(pane_tty, tty_path):
+        if not pane_tty or not _tmux._norm_same_path(pane_tty, tty_path):
             return "", ""
         # Verified in tmux 3.2a: `select-pane -t <pane> -T <title>` updates #{pane_title} only
         # and never changes pane_active or pane_last focus state.
@@ -348,6 +360,7 @@ def update_agy_session(
     lock_file = eff_home / ".gemini" / "antigravity-cli" / "presence" / f"{cid}.lock"
     if not lock_file.is_file():
         return False
+    _ensure_sctx()
     resolved = _sctx._resolve_agy_transcript_path(eff_home, cid)
     raw_tp = str(payload.get("transcriptPath") or payload.get("transcript_path") or "").strip()
     tp_str = (
@@ -369,7 +382,7 @@ def update_agy_session(
         if not agy_pid or _sctx._is_headless_cli_invocation("agy", eff_args):
             return False
         anc_tty = _find_tty(agy_pid, proc_root)
-        if tty0 and anc_tty and not _sctx._norm_same_path(tty0, anc_tty):
+        if tty0 and anc_tty and not _tmux._norm_same_path(tty0, anc_tty):
             return False
         agy_dir, lock_real, sfx = (
             proc_root / str(agy_pid),
@@ -404,7 +417,7 @@ def update_agy_session(
         tty_path = tty0
         if agy_pid:
             anc_tty = _find_tty(agy_pid, proc_root)
-            if not (tty0 and anc_tty and not _sctx._norm_same_path(tty0, anc_tty)):
+            if not (tty0 and anc_tty and not _tmux._norm_same_path(tty0, anc_tty)):
                 if _sctx._is_headless_cli_invocation("agy", eff_args):
                     return False
                 cwd = cwd or _sctx._query_pid_cwd_nonproc(agy_pid)
@@ -448,6 +461,7 @@ def update_claude_session(
     sid = str(payload.get("session_id") or payload.get("sessionId") or "").strip().lower()
     if (payload.get("agent_id") or payload.get("agentId") or "") or not _SID_RE.match(sid):
         return False
+    _ensure_sctx()
     eff_home = home or Path((eff_env.get("HOME") or "").strip() or os.path.expanduser("~"))
     cwd = _payload_cwd(payload)
     tp = str(payload.get("transcript_path") or payload.get("transcriptPath") or "").strip()
@@ -471,7 +485,7 @@ def update_claude_session(
     if cl_pid:
         anc_tty = _find_tty(cl_pid, proc_root)
         # Ignore ancestor across a setsid + fresh PTY boundary (e.g. isolated PTY unit tests)
-        if not (tty0 and anc_tty and not _sctx._norm_same_path(tty0, anc_tty)):
+        if not (tty0 and anc_tty and not _tmux._norm_same_path(tty0, anc_tty)):
             if _sctx._is_headless_cli_invocation("claude", eff_args):
                 return False
             agent_pid = cl_pid

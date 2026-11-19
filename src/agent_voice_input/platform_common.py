@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import inspect
 import io
 import json
 import os
@@ -13,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Protocol
 
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, normalize_ui_position, redact_secrets
@@ -74,29 +73,33 @@ class MicrophoneUnavailableError(RuntimeError):
         self.hud_state = hud_state
 
 
-def _callable_accepts_kwarg(cb: Callable[..., Any], kw: str) -> bool:
-    try:
-        sig = inspect.signature(cb)
-    except (TypeError, ValueError):
-        return False
-    return kw in sig.parameters or any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-    )
+class RecorderLostCallback(Protocol):
+    def __call__(self, *, seq_id: int | None = None) -> Any: ...
 
 
-def invoke_recorder_lost_callback(cb: Callable[..., Any] | None, seq_id: int | None = None) -> None:
+class RecorderRecoveredCallback(Protocol):
+    def __call__(self, gap_ms: int, *, seq_id: int | None = None) -> Any: ...
+
+
+def invoke_recorder_lost_callback(
+    cb: RecorderLostCallback | Callable[..., Any] | None, seq_id: int | None = None
+) -> None:
     if cb is None:
         return
-    if seq_id is not None and _callable_accepts_kwarg(cb, "seq_id"):
+    if seq_id is not None:
         cb(seq_id=seq_id)
         return
     cb()
 
 
-def invoke_recorder_recovered_callback(cb: Callable[..., Any] | None, gap_ms: int, seq_id: int | None = None) -> None:
+def invoke_recorder_recovered_callback(
+    cb: RecorderRecoveredCallback | Callable[..., Any] | None,
+    gap_ms: int,
+    seq_id: int | None = None,
+) -> None:
     if cb is None:
         return
-    if seq_id is not None and _callable_accepts_kwarg(cb, "seq_id"):
+    if seq_id is not None:
         cb(gap_ms, seq_id=seq_id)
         return
     cb(gap_ms)

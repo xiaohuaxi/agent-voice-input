@@ -1089,7 +1089,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     env={"HOME": str(tmp), "AGENT_VOICE_INPUT_SWIFTC": "none"},
                     cache_dir=tmp / "cache",
                 )
-                plat.hud = lambda state, text="", *, duration_ms=0: hud_calls.append(state)  # type: ignore[method-assign]
+                plat.hud = lambda state, text="", *, duration_ms=0, **_kw: hud_calls.append(state)  # type: ignore[method-assign]
                 plat.beep = lambda kind: beep_calls.append(kind)  # type: ignore[method-assign]
                 plat.start_recording = lambda _rt, *, loopback=False: rec_starts.append(loopback)  # type: ignore[method-assign]
                 plat.stop_recording = lambda *, drain=True: (_voiced_wav(), "avfoundation")  # type: ignore[method-assign]

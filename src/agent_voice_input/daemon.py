@@ -1621,21 +1621,8 @@ class VoiceInputDaemon:
             kw["clear_toast"] = clear_toast
         try:
             fn(state, **kw)
-            return
         except TypeError:
-            pass
-        except Exception:
-            return
-        try:
-            if duration_ms > 0:
-                fn(state, duration_ms=duration_ms)
-            else:
-                fn(state)
-        except TypeError:
-            try:
-                fn(state)
-            except Exception:
-                pass
+            raise
         except Exception:
             pass
 

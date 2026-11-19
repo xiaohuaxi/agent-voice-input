@@ -32,7 +32,6 @@ from .platform_common import (
     MicrophoneUnavailableError,
     NoMicrophoneError,
     PasteOutcome,
-    _callable_accepts_kwarg,
     invoke_recorder_lost_callback,
     invoke_recorder_recovered_callback,
     make_once_commit_guard,
@@ -2020,10 +2019,7 @@ class MacOSPlatform(JsonlShimMixin):
         if not self._has_managed_shim():
             return None
         try:
-            if _callable_accepts_kwarg(self._shim_rpc, "allow_retry"):
-                res = self._shim_rpc({"cmd": "key_state"}, timeout_sec=0.8, allow_retry=False)
-            else:
-                res = self._shim_rpc({"cmd": "key_state"}, timeout_sec=0.8)
+            res = self._shim_rpc({"cmd": "key_state"}, timeout_sec=0.8, allow_retry=False)
         except Exception:
             return None
         if not isinstance(res, dict) or res.get("ok") is not True:
@@ -2100,10 +2096,7 @@ class MacOSPlatform(JsonlShimMixin):
             req: dict[str, Any] = {"cmd": "paste_cmd_v"}
             self._populate_paste_expectations(req, origin_window=origin_window, expected_fg=expected_fg)
             try:
-                if _callable_accepts_kwarg(self._shim_rpc, "allow_retry"):
-                    res = self._shim_rpc(req, timeout_sec=1.0, allow_retry=False)
-                else:
-                    res = self._shim_rpc(req, timeout_sec=1.0)
+                res = self._shim_rpc(req, timeout_sec=1.0, allow_retry=False)
             except Exception:
                 # Never fall back to osascript after an in-flight RPC error/timeout to prevent double paste.
                 return False, "shim_paste_unconfirmed", cur_proc
@@ -2149,10 +2142,7 @@ class MacOSPlatform(JsonlShimMixin):
         self._populate_paste_expectations(req, origin_window=origin_window, expected_fg=expected_fg)
         res: dict[str, Any] | None = None
         try:
-            if _callable_accepts_kwarg(self._shim_rpc, "allow_retry"):
-                res = self._shim_rpc(req, timeout_sec=1.5, allow_retry=False)
-            else:
-                res = self._shim_rpc(req, timeout_sec=1.5)
+            res = self._shim_rpc(req, timeout_sec=1.5, allow_retry=False)
         except Exception:
             res = None
         if (
