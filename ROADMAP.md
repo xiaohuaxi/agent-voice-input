@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前版本基线**：`v0.9.0`（完整版本变更记录见 [CHANGELOG.md](CHANGELOG.md)）
+> **当前版本基线**：`v0.10.0`（完整版本变更记录见 [CHANGELOG.md](CHANGELOG.md)）
 >
 > **项目工程规范**：[AGENTS.md](AGENTS.md)
 
@@ -43,24 +43,7 @@
 
 ## 二、后续阶段演进规划
 
-已完成版本（`v0.1.0` ～ `v0.9.0`）的演进详情已归档至根目录 [CHANGELOG.md](CHANGELOG.md)。后续路线按 **`v0.10.0` -> `v0.11.0` -> `v1.0.0`** 分阶段推进。
-
----
-
-### `v0.10.0`：外部开箱零门槛、运行期健壮性与双平台 CI 门禁
-
-聚焦消除外部用户首次安装配置摩擦、补齐端到端诊断真体检，并加固守护进程常驻卫生与三平台 CI 必跑门禁：
-
-1. **外部开箱零门槛（`refiner.provider = "auto"` + 内置 `deepseek` + 公开 Codex 回退）**：
-   - 默认 `refiner.provider = "auto"`：零子进程优先复用本机已登录 `codex`，否则按已配置环境变量凭据自动对齐至内置渠道（无精修凭据时平滑旁路回退 `"off"`，不阻断 Stage 1 语音识别）；
-   - 新增内置 `deepseek` 渠道（默认高速长上下文 `deepseek-flash` 并自动关闭隐式思考链），并为公开版 Codex 账号补齐静态/运行期可用模型自动回退。
-2. **诊断真体检与初始化引导（`doctor --ping` & `init`）**：
-   - 升级 `doctor` 补齐 macOS 只读权限/编译核查与 WSL2 无损 WASAPI 默认采集端点检查（不触发蓝牙切 HFP），支持可选 `--ping` 实测上游连通性，消除配置假绿；
-   - 新增 `agent-voice-input init` 快速生成安全权限（`0700`/`0600`）配置与凭据模板引导。
-3. **常驻运行期卫生、Windows CI 门禁与底噪防幻觉**：
-   - 引入 `daemon.lock` `flock` 单实例互斥锁、修正 `retry` 粘贴与标准输出重复打印、惰性清理持久化 `sessions/*.json` 中的过期死进程记录；
-   - 新增无头离线 `win_shim.ps1 -Mode self-check` 并纳入 GitHub Actions `windows-latest` CI 必跑门禁；
-   - 在 `audio_proc` 增加长录音超稀疏叹气/底噪滑窗集中度门控，拦截近静音长片段触发单跳音频模型幻觉。
+已完成版本（`v0.1.0` ～ `v0.10.0`）的演进详情已归档至根目录 [CHANGELOG.md](CHANGELOG.md)。后续路线按 **`v0.11.0` -> `v1.0.0`** 分阶段推进。
 
 ---
 
