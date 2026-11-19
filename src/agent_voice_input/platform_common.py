@@ -859,7 +859,10 @@ class JsonlShimMixin:
                 if not self.last_shim_error:
                     self.last_shim_error = f"{self._shim_label} failed to become ready"
                 if self._shim_graceful and not self._shim_ever_ready:
-                    self._disable_shim_once(self.last_shim_error)
+                    # Fatal early exit / ok=false disables immediately; pure readiness timeout
+                    # (proc still alive, e.g. macOS cold XProtect scan) gets up to 2 bg retries.
+                    if proc.poll() is not None or self._shim_fail_count >= 3:
+                        self._disable_shim_once(self.last_shim_error)
         self._reap_owned_shim(reap_failed)
         if closed_err:
             raise RuntimeError(f"{type(self).__name__} is closed")

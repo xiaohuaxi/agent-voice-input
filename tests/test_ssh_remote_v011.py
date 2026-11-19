@@ -2470,6 +2470,137 @@ sys.exit(p.returncode)
                 local_tracker.close()
                 remote_tracker.close()
 
+    def test_win_ssh_path_spaces_runtime_setgid_broad_dirs_and_half_open_preservation(self) -> None:
+        from agent_voice_input._remote_probe import _is_trusted_runtime_dir
+        from agent_voice_input.remote_ssh import _parse_title_remote_hints
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # 1. Windows drive path with spaces in `ssh_bin` & SSH command titles
+            fake_pf_ssh = root / "Program Files" / "OpenSSH" / "ssh.exe"
+            fake_pf_ssh.parent.mkdir(parents=True)
+            fake_pf_ssh.write_text("", encoding="utf-8")
+            orig_is_file = Path.is_file
+
+            def _map_mnt_c(p_self: Path) -> bool:
+                s = str(p_self)
+                if s == "/mnt/c/Program Files/OpenSSH/ssh.exe":
+                    return orig_is_file(fake_pf_ssh)
+                return orig_is_file(p_self)
+
+            with mock.patch.object(Path, "is_file", _map_mnt_c):
+                self.assertEqual(
+                    resolve_ssh_executable(r"C:\Program Files\OpenSSH\ssh.exe", env={"PATH": "/usr/bin"}),
+                    "/mnt/c/Program Files/OpenSSH/ssh.exe",
+                )
+                self.assertEqual(
+                    resolve_ssh_executable(r'"C:\Program Files\OpenSSH\ssh.exe"', env={"PATH": "/usr/bin"}),
+                    "/mnt/c/Program Files/OpenSSH/ssh.exe",
+                )
+
+            self.assertEqual(
+                _parse_title_remote_hints(r"C:\Program Files\OpenSSH\ssh.exe _svc@dev_box", set()),
+                (True, "dev_box", ""),
+            )
+            self.assertEqual(
+                _parse_title_remote_hints(r'"C:\Program Files\OpenSSH\ssh.exe" -p 2222 alice+ops@192.168.1.10', set()),
+                (True, "192.168.1.10", ""),
+            )
+            h_corp = RemoteHostConfig(name="_dev_box", ssh_target="alice+ops@192.168.1.10")
+            self.assertEqual(h_corp.name, "_dev_box")
+
+            # Copied daemon env dict (matching host HOME, PATH='/opt/homebrew/bin') falls back to /usr/bin/ssh
+            with mock.patch.dict(os.environ, {"HOME": str(root), "PATH": "/opt/homebrew/bin"}, clear=False), mock.patch(
+                "agent_voice_input.remote_ssh.os.path.isfile",
+                side_effect=lambda p: str(p) == "/usr/bin/ssh",
+            ), mock.patch(
+                "agent_voice_input.remote_ssh.os.access",
+                side_effect=lambda p, _m: str(p) == "/usr/bin/ssh",
+            ):
+                self.assertEqual(
+                    resolve_ssh_executable("ssh", env={"HOME": str(root), "PATH": "/opt/homebrew/bin"}),
+                    "/usr/bin/ssh",
+                )
+
+            # 2. `_is_trusted_runtime_dir` tolerates setgid/sticky (`02700`/`01700`) while rejecting group/other bits
+            rt_sgid = root / "rt_sgid"
+            rt_sgid.mkdir(mode=0o700)
+            with mock.patch(
+                "agent_voice_input._remote_probe.os.lstat",
+                return_value=os.stat_result((stat.S_IFDIR | 0o2700, 1, 1, 2, os.getuid(), os.getgid(), 0, 0, 0, 0)),
+            ):
+                self.assertTrue(_is_trusted_runtime_dir(rt_sgid))
+            with mock.patch(
+                "agent_voice_input._remote_probe.os.lstat",
+                return_value=os.stat_result((stat.S_IFDIR | 0o1700, 1, 1, 2, os.getuid(), os.getgid(), 0, 0, 0, 0)),
+            ):
+                self.assertTrue(_is_trusted_runtime_dir(rt_sgid))
+            with mock.patch(
+                "agent_voice_input._remote_probe.os.lstat",
+                return_value=os.stat_result((stat.S_IFDIR | 0o0750, 1, 1, 2, os.getuid(), os.getgid(), 0, 0, 0, 0)),
+            ):
+                self.assertFalse(_is_trusted_runtime_dir(rt_sgid))
+
+            # 3. `_is_broad_or_unsafe_workspace_dir` blocks `/opt`, `/srv`, `/home/u` roots only, never real repos or data-disk symlinks
+            fake_home = root / "home" / "alice"
+            data_repo = root / "data" / "my-repo"
+            opt_repo = root / "opt_sim"
+            (fake_home / "work").mkdir(parents=True)
+            data_repo.mkdir(parents=True)
+            opt_repo.mkdir(parents=True)
+            sym_repo = fake_home / "work" / "my-repo"
+            sym_repo.symlink_to(data_repo)
+            self.assertTrue(_is_broad_or_unsafe_workspace_dir("/srv", fake_home))
+            self.assertTrue(_is_broad_or_unsafe_workspace_dir("/opt", fake_home))
+            self.assertFalse(_is_broad_or_unsafe_workspace_dir("/srv/web-app", fake_home))
+            self.assertFalse(_is_broad_or_unsafe_workspace_dir("/opt/my-company-repo", fake_home))
+            self.assertFalse(_is_broad_or_unsafe_workspace_dir(str(sym_repo), fake_home))
+
+            # 4. In-flight half-open recovery probe is NOT aborted when `fetch_with_budget(allow_half_open=False)` misses cache_key
+            fake_clock = [1000.0]
+            rem_cfg = RemoteConfig(hosts=(RemoteHostConfig(name="devbox", ssh_target="devbox"),))
+            mgr = RemoteSshManager(rem_cfg, runtime_dir=root / "rt", clock_fn=lambda: fake_clock[0])
+            probe_started = threading.Event()
+            release_probe = threading.Event()
+            try:
+                def _controlled_probe(
+                    _hcfg: RemoteHostConfig,
+                    req: Any,
+                    *,
+                    abort_evt: threading.Event | None = None,
+                    timeout_sec: float | None = None,
+                ) -> tuple[dict[str, Any] | None, str, bool, bool]:
+                    del timeout_sec
+                    if req.get("fail"):
+                        return None, "conn_refused", False, False
+                    probe_started.set()
+                    release_probe.wait(timeout=3.0)
+                    if abort_evt is not None and abort_evt.is_set():
+                        return None, "aborted", False, True
+                    return {"ok": True, "cli": "claude", "session_id": "11111111-2222-3333-4444-555555555555", "turns": []}, "", False, False
+
+                mgr._run_ssh_probe_once = _controlled_probe  # type: ignore[method-assign]
+                h0 = rem_cfg.hosts[0]
+                mgr.fetch_with_budget(h0, {"fail": True}, cache_key=("k0",), budget_ms=100)
+                mgr.fetch_with_budget(h0, {"fail": True}, cache_key=("k0b",), budget_ms=100)
+                self.assertTrue(mgr.breaker_snapshot()["devbox"]["open"])
+
+                fake_clock[0] += 65.0
+                self.assertTrue(mgr.start_prefetch(h0, {"fail": False}, cache_key=("k1",), seq_id=1))
+                self.assertTrue(probe_started.wait(timeout=2.0))
+                # Shifted cache_key with allow_half_open=False returns None WITHOUT killing k1 recovery probe!
+                self.assertIsNone(
+                    mgr.fetch_with_budget(h0, {"fail": False}, cache_key=("k2",), budget_ms=50, allow_half_open=False)
+                )
+                release_probe.set()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and mgr.breaker_snapshot()["devbox"]["tripped"]:
+                    time.sleep(0.02)
+                self.assertFalse(mgr.breaker_snapshot()["devbox"]["tripped"])
+            finally:
+                release_probe.set()
+                mgr.close()
+
 
 if __name__ == "__main__":
     unittest.main()

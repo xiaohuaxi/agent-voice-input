@@ -4380,6 +4380,110 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             finally:
                 plat.close()
 
+    def test_graceful_shim_cold_timeout_recovers_and_iterm2_osa_cooldown_expires(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            spawns = [0]
+            ready_evt = threading.Event()
+            cold_then_fast_script = (
+                "import json, sys, time\n"
+                "gen = int(sys.argv[1])\n"
+                "if gen == 1:\n"
+                "    time.sleep(5.0)\n"
+                "sys.stdout.write(json.dumps({'event': 'ready'}) + '\\n')\n"
+                "sys.stdout.flush()\n"
+                "sys.stdout.write(json.dumps({'event': 'test_online', 'gen': gen}) + '\\n')\n"
+                "sys.stdout.flush()\n"
+                "for ln in sys.stdin:\n"
+                "    pass\n"
+            )
+
+            class _FastTimeoutMacPlatform(MacOSPlatform):
+                _shim_ready_timeout = 0.12
+                _shim_backoff_base = 0.05
+
+            seen_gen: list[int] = []
+            plat = _FastTimeoutMacPlatform(
+                Config(),
+                env={"HOME": str(tmp)},
+                cache_dir=tmp / "cache",
+                shim_cmd_factory=lambda: (
+                    spawns.__setitem__(0, spawns[0] + 1)
+                    or [sys.executable, "-u", "-c", cold_then_fast_script, str(spawns[0])]
+                ),
+            )
+            try:
+                plat.start_event_listener(
+                    lambda m: (seen_gen.append(int(m["gen"])), ready_evt.set())
+                    if m.get("event") == "test_online"
+                    else None
+                )
+                self.assertFalse(plat._shim_disabled, "single cold readiness timeout must not permanently disable mac_shim")
+                self.assertTrue(ready_evt.wait(timeout=3.0), "background respawn did not recover mac_shim after cold timeout")
+                self.assertEqual(seen_gen, [2])
+                self.assertFalse(plat._shim_disabled)
+            finally:
+                plat.close()
+
+            # iTerm2 -1743 Automation denial cools down and recovers once permission is granted
+            plat_it = MacOSPlatform(Config(), env={"HOME": str(tmp), "PATH": "/usr/bin"}, cache_dir=tmp / "cache")
+            try:
+                osa_mode = ["denied"]
+                fake_now = [100.0]
+
+                def _fake_osa(_args: list[str], *, timeout: float = 2.5) -> subprocess.CompletedProcess[str]:
+                    del timeout
+                    if osa_mode[0] == "denied":
+                        return subprocess.CompletedProcess(["osascript"], 1, "", "execution error: Not authorized (-1743)")
+                    return subprocess.CompletedProcess(
+                        ["osascript"],
+                        0,
+                        _APPLE_SEP.join(["it1", "77", "/dev/ttys008", "claude", "proj"]) + "\n",
+                        "",
+                    )
+
+                with mock.patch("agent_voice_input.platform_macos._can_automate_bundle_without_prompt", return_value=True), mock.patch.object(
+                    plat_it, "_run_osascript", side_effect=_fake_osa
+                ), mock.patch("agent_voice_input.platform_macos.time.monotonic", side_effect=lambda: fake_now[0]):
+                    self.assertIsNone(plat_it._query_iterm2_terminal())
+                    osa_mode[0] = "ok"
+                    # Within 60s cooldown: skipped without invoking osascript
+                    fake_now[0] = 120.0
+                    self.assertIsNone(plat_it._query_iterm2_terminal())
+                    # Past 60s cooldown: recovers automatically without daemon restart!
+                    fake_now[0] = 165.0
+                    res = plat_it._query_iterm2_terminal()
+                    self.assertIsNotNone(res)
+                    assert res is not None
+                    self.assertEqual(res[2], "/dev/ttys008")
+            finally:
+                plat_it.close()
+
+            # Copied daemon env dict (matching host HOME, PATH='/opt/homebrew/bin') falls back to /usr/bin/pbcopy & /usr/bin/osascript
+            with mock.patch.dict(os.environ, {"HOME": str(tmp), "PATH": "/opt/homebrew/bin"}, clear=False):
+                daemon_dict_env = {"HOME": str(tmp), "PATH": "/opt/homebrew/bin"}
+                plat_dict = MacOSPlatform(Config(), env=daemon_dict_env, cache_dir=tmp / "cache_dict")
+                try:
+                    spawned_argv: list[list[str]] = []
+
+                    def _spy_run(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+                        spawned_argv.append(list(cmd))
+                        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                    with mock.patch(
+                        "agent_voice_input.platform_macos.os.path.isfile",
+                        side_effect=lambda p: str(p) in ("/usr/bin/pbcopy", "/usr/bin/osascript"),
+                    ), mock.patch(
+                        "agent_voice_input.platform_macos.os.access",
+                        side_effect=lambda p, _m: str(p) in ("/usr/bin/pbcopy", "/usr/bin/osascript"),
+                    ), mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=_spy_run):
+                        self.assertTrue(plat_dict._copy_to_clipboard("回退剪贴板文本"))
+                        self.assertIsNotNone(plat_dict._run_osascript(["-e", "return 1"]))
+                    self.assertEqual(spawned_argv[0], ["/usr/bin/pbcopy"])
+                    self.assertEqual(spawned_argv[1][0], "/usr/bin/osascript")
+                finally:
+                    plat_dict.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1514,6 +1514,92 @@ class AudioProcTests(unittest.TestCase):
                 pcm_back = decode_to_16k_mono_pcm(mp3_bytes)
                 self.assertGreater(len(pcm_back), 60000 * 2)
 
+    def test_nvm_codex_shebang_path_auto_keyring_ffmpeg_fallback_and_recordings_parent_perms(self) -> None:
+        import json
+        import stat
+        from agent_voice_input._remote_probe import _is_trusted_runtime_dir
+        from agent_voice_input.audio_proc import resolve_ffmpeg_bin
+        from agent_voice_input.config import (
+            Config,
+            find_codex_bin,
+            get_runtime_dir,
+            has_codex_local_auth,
+            resolve_saved_recordings_dir,
+        )
+        from agent_voice_input.refiner import CodexRefiner
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            nvm_v18 = home / ".nvm" / "versions" / "node" / "v18.20.0" / "bin"
+            nvm_v22 = home / ".nvm" / "versions" / "node" / "v22.14.0" / "bin"
+            nvm_v18.mkdir(parents=True)
+            nvm_v22.mkdir(parents=True)
+
+            # Fake `node` exists ONLY inside nvm v22 bin, NOT in minimal `/usr/bin:/bin` PATH!
+            fake_node = nvm_v22 / "node"
+            fake_node.write_text(f"#!{sys.executable}\nimport runpy, sys\nrunpy.run_path(sys.argv[1], run_name='__main__')\n", encoding="utf-8")
+            fake_node.chmod(0o755)
+
+            old_codex = nvm_v18 / "codex"
+            old_codex.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            old_codex.chmod(0o755)
+
+            codex_script = nvm_v22 / "codex"
+            codex_script.write_text(
+                "#!/usr/bin/env node\n"
+                "import json, sys\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line)\n"
+                "    mid = msg.get('id')\n"
+                "    method = msg.get('method', '')\n"
+                "    if method == 'initialize':\n"
+                "        sys.stdout.write(json.dumps({'id': mid, 'result': {'userAgent': 'test'}}) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "    elif method == 'getAuthStatus':\n"
+                "        sys.stdout.write(json.dumps({'id': mid, 'result': {'authMethod': 'apikey', 'authToken': 'sk-nvm-ok'}}) + '\\n')\n"
+                "        sys.stdout.flush()\n"
+                "        break\n",
+                encoding="utf-8",
+            )
+            codex_script.chmod(0o755)
+
+            codex_home = home / ".codex"
+            codex_home.mkdir(parents=True)
+            (codex_home / "config.toml").write_text('cli_auth_credentials_store = "auto"\n', encoding="utf-8")
+
+            min_env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+            self.assertEqual(find_codex_bin(min_env), str(codex_script))
+            self.assertTrue(has_codex_local_auth(min_env))
+
+            ref = CodexRefiner(Config(), env=min_env)
+            try:
+                method, tok = ref._call_codex_get_auth_status(timeout_sec=3.0)
+                self.assertEqual((method, tok), ("apikey", "sk-nvm-ok"))
+            finally:
+                ref.close()
+
+            # resolve_ffmpeg_bin falls back to ~/.local/bin/ffmpeg when preferred & PATH miss
+            local_ff = home / ".local" / "bin" / "ffmpeg"
+            local_ff.parent.mkdir(parents=True, exist_ok=True)
+            local_ff.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            local_ff.chmod(0o755)
+            with mock.patch("agent_voice_input.audio_proc.os.path.isfile", side_effect=lambda p: str(p) == str(local_ff)), mock.patch(
+                "agent_voice_input.audio_proc.os.access", side_effect=lambda p, _m: str(p) == str(local_ff)
+            ):
+                self.assertEqual(
+                    resolve_ffmpeg_bin("/usr/bin/ffmpeg", env={"HOME": str(home), "PATH": "/nonexistent"}),
+                    str(local_ff),
+                )
+
+            # resolve_saved_recordings_dir(create=True) secures ~/.cache/agent-voice-input (0700) when XDG_RUNTIME_DIR is unset
+            no_xdg_env = {"HOME": str(home)}
+            rec_dir = resolve_saved_recordings_dir(no_xdg_env, create=True)
+            rt_dir = get_runtime_dir(no_xdg_env, create=False)
+            self.assertEqual(rec_dir.parent, rt_dir)
+            self.assertEqual(stat.S_IMODE(os.lstat(rt_dir).st_mode), 0o700)
+            self.assertTrue(_is_trusted_runtime_dir(rt_dir))
+
 
 if __name__ == "__main__":
     unittest.main()

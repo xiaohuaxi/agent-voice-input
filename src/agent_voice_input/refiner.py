@@ -1961,6 +1961,17 @@ class CodexRefiner(OpenAIResponsesRefiner):
     def _resolve_codex_home(self) -> Path | None:
         return resolve_codex_home_dir(self.env if self._explicit_env else None)
 
+    def _sync_auth_identity(self, auth_target: _ResponsesAuthTarget) -> None:
+        reset_pool = False
+        with self._state_lock:
+            if self._last_identity_key and self._last_identity_key != auth_target.identity_key:
+                self._cookies.clear()
+                self._runtime_fallback_model = ""
+                reset_pool = True
+            self._last_identity_key = auth_target.identity_key
+        if reset_pool:
+            self._pool.close_all()
+
     def _select_request_model(self) -> str:
         if self.cfg.refiner.has_explicit_model("codex"):
             return self.cfg.refiner.effective_model("codex")
@@ -2095,6 +2106,51 @@ class CodexRefiner(OpenAIResponsesRefiner):
         for pipe in (proc.stdin, proc.stdout, proc.stderr):
             _close_quietly(pipe)
 
+    @staticmethod
+    def _build_codex_subprocess_path(exe: str, cur_path: str, home: Path | None) -> str:
+        """Ensure ``Path(exe).parent`` and standard Node/Homebrew dirs are in ``PATH`` for ``#!/usr/bin/env node``."""
+        prepend: list[str] = []
+        if exe and ("/" in exe or "\\" in exe):
+            exe_p = Path(exe)
+            if str(exe_p.parent):
+                prepend.append(str(exe_p.parent))
+            try:
+                if exe_p.is_symlink():
+                    real_p = exe_p.resolve()
+                    if str(real_p.parent) and str(real_p.parent) not in prepend:
+                        prepend.append(str(real_p.parent))
+                    for anc in real_p.parents:
+                        if anc.name == "lib":
+                            prefix_bin = str(anc.parent / "bin")
+                            if prefix_bin not in prepend:
+                                prepend.append(prefix_bin)
+                            break
+            except OSError:
+                pass
+        existing = [seg for seg in (cur_path or "").split(os.pathsep) if seg]
+        fallbacks: list[str] = []
+        if home is not None:
+            fallbacks.extend(
+                str(home / rel)
+                for rel in (
+                    ".local/bin",
+                    ".volta/bin",
+                    ".local/share/mise/shims",
+                    ".asdf/shims",
+                    ".bun/bin",
+                )
+            )
+        fallbacks.extend(
+            ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/usr/bin", "/bin")
+        )
+        merged: list[str] = []
+        seen: set[str] = set()
+        for entry in (*prepend, *existing, *fallbacks):
+            if entry and entry not in seen:
+                seen.add(entry)
+                merged.append(entry)
+        return os.pathsep.join(merged)
+
     def _call_codex_get_auth_status(
         self,
         *,
@@ -2111,8 +2167,14 @@ class CodexRefiner(OpenAIResponsesRefiner):
         for k in list(proc_env.keys()):
             if "FAST" in k.upper() and "CODEX" in k.upper():
                 proc_env.pop(k, None)
-        if (codex_home := self._resolve_codex_home()) is not None:
+        codex_home = self._resolve_codex_home()
+        if codex_home is not None:
             proc_env["CODEX_HOME"] = str(codex_home)
+        raw_home = (proc_env.get("HOME") or "").strip()
+        home_dir = Path(raw_home) if raw_home else (codex_home.parent if codex_home is not None else None)
+        proc_env["PATH"] = self._build_codex_subprocess_path(
+            cmd[0] if cmd else "", proc_env.get("PATH", ""), home_dir
+        )
 
         proc = subprocess.Popen(
             cmd,

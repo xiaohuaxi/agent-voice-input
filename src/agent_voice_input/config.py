@@ -192,8 +192,8 @@ _NON_SECRET_ENV_SUFFIXES = (
 
 _UNSET: Any = object()
 
-_SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$")
-_HOST_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._@+-]{0,127}$")
+_HOST_ALIAS_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
 _BARE_SSH_BIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _SSH_CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -226,7 +226,7 @@ class RemoteHostConfig:
         if not isinstance(self.ssh_target, str) or not _SSH_TARGET_RE.match(self.ssh_target.strip()):
             raise ConfigError(
                 f"remote.hosts.ssh_target: invalid SSH target {self.ssh_target!r} "
-                "(must match ^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$ and never start with '-')"
+                "(must match ^[A-Za-z0-9_][A-Za-z0-9._@+-]{0,127}$ and never start with '-')"
             )
         clean_target = self.ssh_target.strip()
         raw_name = (self.name or "").strip().lower().rstrip(".")
@@ -680,6 +680,7 @@ def resolve_saved_recordings_dir(
         base_home = expand_user_path(raw_home, env=src_env) if raw_home else Path.home()
         rec_dir = base_home / ".cache" / "agent-voice-input" / "recordings"
     if create:
+        ensure_secure_dir(rec_dir.parent, expected_uid=uid)
         ensure_secure_dir(rec_dir, expected_uid=uid)
     return rec_dir
 
@@ -2425,8 +2426,47 @@ def resolve_credentials(
 
 
 _CODEX_KEYRING_STORE_RE = re.compile(
-    r'^\s*cli_auth_credentials_store\s*=\s*["\']keyring["\']', re.MULTILINE
+    r'^\s*cli_auth_credentials_store\s*=\s*["\'](?:keyring|auto)["\']', re.MULTILINE
 )
+
+
+def _node_version_sort_key(ver_name: str) -> tuple[int, ...]:
+    nums = [int(x) for x in re.findall(r"\d+", ver_name)]
+    return tuple(nums) if nums else (0,)
+
+
+def _iter_node_manager_codex_bins(home: Path, src: Mapping[str, str], *, explicit: bool) -> list[Path]:
+    out: list[Path] = []
+    nvm_roots: list[Path] = []
+    if raw_nvm := (src.get("NVM_DIR") or "").strip():
+        if not (explicit and raw_nvm.startswith("~") and _is_other_user_tilde(raw_nvm)):
+            nvm_roots.append(expand_user_path(raw_nvm, env=src))
+    nvm_roots.append(home / ".nvm")
+    seen_roots: set[Path] = set()
+    for nr in nvm_roots:
+        if nr in seen_roots:
+            continue
+        seen_roots.add(nr)
+        vers_dir = nr / "versions" / "node"
+        try:
+            if vers_dir.is_dir():
+                subdirs = [d for d in vers_dir.iterdir() if d.is_dir()]
+                subdirs.sort(key=lambda d: _node_version_sort_key(d.name), reverse=True)
+                out.extend(d / "bin" / "codex" for d in subdirs)
+        except OSError:
+            pass
+    for fnm_base in (
+        home / ".local" / "share" / "fnm" / "node-versions",
+        home / "Library" / "Application Support" / "fnm" / "node-versions",
+    ):
+        try:
+            if fnm_base.is_dir():
+                subdirs = [d for d in fnm_base.iterdir() if d.is_dir()]
+                subdirs.sort(key=lambda d: _node_version_sort_key(d.name), reverse=True)
+                out.extend(d / "installation" / "bin" / "codex" for d in subdirs)
+        except OSError:
+            pass
+    return out
 
 
 def _is_other_user_tilde(raw: str) -> bool:
@@ -2451,6 +2491,15 @@ def resolve_codex_home_dir(env: Mapping[str, str] | None = None) -> Path | None:
     return expand_user_path("~", env=os.environ) / ".codex"
 
 
+def is_hermetic_env(env: Mapping[str, str] | None) -> bool:
+    """Return True when ``env`` is an isolated test mapping (missing ``PATH``/``HOME`` or non-host ``HOME``)."""
+    if env is None or env is os.environ:
+        return False
+    src_home = (env.get("HOME") or "").strip()
+    host_home = (os.environ.get("HOME") or "").strip()
+    return "PATH" not in env or not src_home or (bool(host_home) and src_home != host_home)
+
+
 def find_codex_bin(env: Mapping[str, str] | None = None) -> str | None:
     explicit = env is not None and env is not os.environ
     src = os.environ if env is None else env
@@ -2461,12 +2510,7 @@ def find_codex_bin(env: Mapping[str, str] | None = None) -> str | None:
         cb_path = expand_user_path(raw_cb, env=src)
         if cb_path.is_file() and os.access(str(cb_path), os.X_OK):
             return str(cb_path)
-    host_home = (os.environ.get("HOME") or "").strip()
-    hermetic = explicit and (
-        "PATH" not in src
-        or not src_home
-        or (bool(host_home) and src_home != host_home)
-    )
+    hermetic = is_hermetic_env(env)
     raw_path = src.get("PATH")
     if raw_path is not None:
         if raw_path and (found := shutil.which("codex", path=raw_path)):
@@ -2477,9 +2521,26 @@ def find_codex_bin(env: Mapping[str, str] | None = None) -> str | None:
     if hermetic and not src_home:
         return None
     home = expand_user_path("~", env=src)
-    cands = [home / ".local/bin/codex"]
+    cands: list[Path] = [
+        home / ".local/bin/codex",
+        home / ".npm-global/bin/codex",
+        home / ".volta/bin/codex",
+        home / ".local/share/mise/shims/codex",
+        home / ".asdf/shims/codex",
+        home / ".bun/bin/codex",
+        home / "Library/pnpm/codex",
+        home / ".local/share/pnpm/codex",
+        *_iter_node_manager_codex_bins(home, src, explicit=explicit),
+    ]
     if not hermetic:
-        cands.extend((Path("/usr/local/bin/codex"), Path("/opt/homebrew/bin/codex")))
+        cands.extend(
+            (
+                Path("/opt/homebrew/bin/codex"),
+                Path("/usr/local/bin/codex"),
+                Path("/opt/local/bin/codex"),
+                Path("/home/linuxbrew/.linuxbrew/bin/codex"),
+            )
+        )
     return next((str(p) for p in cands if p.is_file() and os.access(str(p), os.X_OK)), None)
 
 

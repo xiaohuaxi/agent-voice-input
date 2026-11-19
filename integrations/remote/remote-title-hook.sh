@@ -5,7 +5,7 @@
 #   Antigravity CLI (~/.gemini/hooks.json): ~/.local/bin/remote-title-hook.sh agy
 set -u
 exec python3 -c '
-import json, os, re, socket, stat, subprocess, sys
+import json, os, re, shutil, socket, stat, subprocess, sys
 
 mode = sys.argv[1].strip().lower()
 emit_json = mode in ("agy", "gemini")
@@ -58,7 +58,8 @@ try:
                 pane = (os.environ.get("TMUX_PANE") or "").strip()
                 if re.match(r"^%\d+$", pane):
                     esc = title.replace("#", "##")
-                    subprocess.run(["tmux", "select-pane", "-t", pane, "-T", esc], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.4)
+                    tbin = shutil.which("tmux") or next((p for p in ("/usr/bin/tmux", "/usr/local/bin/tmux", "/opt/homebrew/bin/tmux", os.path.expanduser("~/.local/bin/tmux")) if os.path.isfile(p) and os.access(p, os.X_OK)), "tmux")
+                    subprocess.run([tbin, "select-pane", "-t", pane, "-T", esc], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.4)
 except Exception:
     pass
 if emit_json:

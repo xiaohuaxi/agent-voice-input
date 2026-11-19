@@ -16,10 +16,10 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 import wave
 
-from .config import AudioConfig, ensure_secure_dir
+from .config import AudioConfig, ensure_secure_dir, is_hermetic_env
 
 TARGET_SAMPLE_RATE = 16000
 TARGET_CHANNELS = 1
@@ -54,13 +54,38 @@ class AudioGateResult:
     all_zero: bool = False
 
 
-def resolve_ffmpeg_bin(preferred: str = "/usr/bin/ffmpeg") -> str:
+_FFMPEG_FALLBACK_PATHS: tuple[str, ...] = (
+    "/opt/homebrew/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+    "/opt/local/bin/ffmpeg",
+    "/home/linuxbrew/.linuxbrew/bin/ffmpeg",
+)
+
+
+def resolve_ffmpeg_bin(
+    preferred: str = "/usr/bin/ffmpeg",
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str:
     if preferred and os.path.isfile(preferred) and os.access(preferred, os.X_OK):
         return preferred
-    found = shutil.which("ffmpeg")
+    src_env = os.environ if env is None else env
+    raw_path = src_env.get("PATH")
+    found = shutil.which("ffmpeg", path=raw_path) if raw_path is not None else shutil.which("ffmpeg")
     if found:
         return found
-    raise AudioError("ffmpeg binary not found (expected /usr/bin/ffmpeg or in PATH)")
+    if preferred == "/usr/bin/ffmpeg":
+        raw_home = (src_env.get("HOME") or "").strip()
+        local_ff = (
+            str(Path(raw_home).expanduser() / ".local" / "bin" / "ffmpeg")
+            if raw_home
+            else (str(Path.home() / ".local" / "bin" / "ffmpeg") if env is None else "")
+        )
+        cands = (local_ff,) if is_hermetic_env(env) else (*_FFMPEG_FALLBACK_PATHS, local_ff)
+        for cand in cands:
+            if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+    raise AudioError("ffmpeg binary not found (expected in PATH, /opt/homebrew/bin, /usr/local/bin, or /usr/bin/ffmpeg)")
 
 
 def pack_pcm16_mono_wav(

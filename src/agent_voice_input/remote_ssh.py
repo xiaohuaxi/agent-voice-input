@@ -27,6 +27,7 @@ from .config import (
     RemoteHostConfig,
     ensure_secure_dir,
     expand_user_path,
+    is_hermetic_env,
     redact_secrets,
 )
 
@@ -52,32 +53,34 @@ _NON_INTERACTIVE_SSH_CMDS = frozenset(
 # OpenSSH flags that consume a separate argument when not attached (e.g. `-p 2222`)
 _SSH_ARG_FLAGS = frozenset(list("BbcDEeFIiJLlmOopQRSWw"))
 
-_HOST_TAG_RE = re.compile(r"\[@([A-Za-z0-9][A-Za-z0-9._-]{0,63})\](?=$|[^0-9A-Za-z_])")
+_HOST_TAG_RE = re.compile(r"\[@([A-Za-z0-9_][A-Za-z0-9._-]{0,63})\](?=$|[^0-9A-Za-z_])")
 _RAW_BRACKET_AT_RE = re.compile(r"\[@([^\]]{1,128})\]")
-_SSH_IDE_HOST_RE = re.compile(r"\[\s*SSH\s*:\s*([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*\]", re.IGNORECASE)
+_SSH_IDE_HOST_RE = re.compile(r"\[\s*SSH\s*:\s*([A-Za-z0-9_][A-Za-z0-9._-]{0,127})\s*\]", re.IGNORECASE)
 _TAB_PREFIX_RE = re.compile(r"^(?:\[\d+/\d+\]\s+|\d+:\d+(?:\.\d+)?\*?\s+|[\u25cf\u2022*]\s+)+")
 _TERM_DIM_TAIL_RE = re.compile(r"\s*(?:[—–-]|\s)\s*\d+\s*[×x]\s*\d+\s*$")
 _TRAILING_TAGS_RE = re.compile(r"(?:\s*\[(?:#|§|@|(?:agy|gemini|claude|codex):)[^\]]*\])+\s*$", re.IGNORECASE)
 
 # Standard prompt: `user@host: ~/path` or `user@host:/srv/app`
 _USER_HOST_COLON_RE = re.compile(
-    r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*:\s*(?P<cwd>~(?:[/\\].*)?|/.*|[A-Za-z]:[/\\].*)$"
+    r"^(?P<user>[A-Za-z0-9._+-]+)@(?P<host>[A-Za-z0-9_][A-Za-z0-9._-]{0,127})\s*:\s*(?P<cwd>~(?:[/\\].*)?|/.*|[A-Za-z]:[/\\].*)$"
 )
 # RHEL/CentOS prompt: `[user@host dir]$` or `[user@host ~/dir]#`
 _BRACKET_PROMPT_RE = re.compile(
-    r"^\[(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9][A-Za-z0-9._-]{0,127})\s+(?P<cwd>[^\]]+)\][$#%]?\s*$"
+    r"^\[(?P<user>[A-Za-z0-9._+-]+)@(?P<host>[A-Za-z0-9_][A-Za-z0-9._-]{0,127})\s+(?P<cwd>[^\]]+)\][$#%]?\s*$"
 )
 # Dedicated client title: `ubuntu@devbox - PuTTY` or `devbox - PuTTY`
 _PUTTY_STYLE_TITLE_RE = re.compile(
-    r"^(?:[A-Za-z0-9._-]+@)?(?P<host>[A-Za-z0-9][A-Za-z0-9._-]{0,127})\s+[-—–]\s+"
+    r"^(?:[A-Za-z0-9._+-]+@)?(?P<host>[A-Za-z0-9_][A-Za-z0-9._-]{0,127})\s+[-—–]\s+"
     r"(?:PuTTY|KiTTY|MobaXterm|WindTerm|SecureCRT|Xshell|Termius)\b",
     re.IGNORECASE,
 )
-# Explicit ssh command in title: `ssh devbox`, `ssh -p 2222 user@devbox`, `C:\...\ssh.exe user@devbox`
+# Explicit ssh command in title: `ssh devbox`, `ssh -p 2222 user@devbox`, `C:\Program Files\OpenSSH\ssh.exe user@devbox`
 _SSH_CMD_TITLE_RE = re.compile(
-    r"^(?:Administrator:\s+)?(?:[^\s/\\]+[/\\])*(?P<bin>ssh(?:\.exe)?|autossh|mosh(?:-client)?|slogin)(?P<rest>(?:\s+.*)?)$",
+    r'^(?:Administrator:\s+)?(?P<q>")?(?:(?=[A-Za-z]:[/\\])[A-Za-z]:[/\\](?:[^/\\:*?"<>|\r\n]+[/\\])*|(?:[^\s/\\"]+[/\\])*)'
+    r'(?P<bin>ssh(?:\.exe)?|autossh|mosh(?:-client)?|slogin)(?(q)")(?P<rest>(?:\s+.*)?)$',
     re.IGNORECASE,
 )
+_WIN_DRIVE_SSH_PATH_RE = re.compile(r"^([A-Za-z]):[/\\](.*)$")
 # Hook/TUI middle-dot cwd: `claude · ~/repos/foo [#id8] [@devbox]`
 _MIDDOT_CWD_RE = re.compile(r"·\s*(?P<cwd>~(?:/[^\r\n\[]*)?|/[^\r\n\[]*)")
 
@@ -490,23 +493,31 @@ def resolve_ssh_executable(
     if not s or s.startswith("-") or any(ord(c) < 0x20 or ord(c) == 0x7F for c in s):
         return None
 
-    explicit_env = env is not None and env is not os.environ
+    hermetic = is_hermetic_env(env)
     raw_path = src_env.get("PATH")
 
     if "/" in s or "\\" in s or s.startswith("~"):
-        p = expand_user_path(s, env=src_env)
+        s_unq = s[1:-1].strip() if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'") else s
+        if not s_unq or s_unq.startswith("-"):
+            return None
+        p = expand_user_path(s_unq, env=src_env)
         if p.is_file() and (os.access(str(p), os.X_OK) or str(p).lower().endswith(".exe")):
             return str(p)
+        if m_win := _WIN_DRIVE_SSH_PATH_RE.match(s_unq):
+            rest_posix = m_win.group(2).replace("\\", "/").lstrip("/")
+            wsl_cand = Path(f"/mnt/{m_win.group(1).lower()}/{rest_posix}")
+            if wsl_cand.is_file():
+                return str(wsl_cand)
         return None
 
     if s.lower() == "ssh.exe":
         if raw_path is not None:
             if raw_path and (found := shutil.which("ssh.exe", path=raw_path)):
                 return found
-        elif not explicit_env:
+        elif not hermetic:
             if found := shutil.which("ssh.exe"):
                 return found
-        if not explicit_env or bool(src_env.get("WSL_DISTRO_NAME") or src_env.get("WSL_INTEROP")):
+        if not hermetic or bool(src_env.get("WSL_DISTRO_NAME") or src_env.get("WSL_INTEROP")):
             for cand in WSL_SYSTEM32_OPENSSH_Candidates:
                 if os.path.isfile(cand):
                     return cand
@@ -515,11 +526,19 @@ def resolve_ssh_executable(
     if raw_path is not None:
         if raw_path and (found := shutil.which(s, path=raw_path)):
             return found
-        return None
-    if not explicit_env:
+        if hermetic:
+            return None
+    elif not hermetic:
         if found := shutil.which(s):
             return found
-        for std_p in (f"/usr/bin/{s}", f"/bin/{s}"):
+    if not hermetic:
+        for std_p in (
+            f"/usr/bin/{s}",
+            f"/bin/{s}",
+            f"/opt/homebrew/bin/{s}",
+            f"/usr/local/bin/{s}",
+            f"/opt/local/bin/{s}",
+        ):
             if os.path.isfile(std_p) and os.access(std_p, os.X_OK):
                 return std_p
     return None
@@ -1056,27 +1075,41 @@ class RemoteSshManager:
             if self._closed or (seq_id > 0 and seq_id in self._cancelled_seqs):
                 return None
             existing = self._inflight.get(host_cfg.name)
-            if (
-                existing is not None
-                and not existing.done_evt.is_set()
-                and not existing.abort_evt.is_set()
-            ):
-                if existing.cache_key == cache_key:
-                    if seq_id > 0:
-                        existing.seq_id = seq_id
-                    return existing
-                existing.abort_evt.set()
+            active_existing = (
+                existing
+                if (
+                    existing is not None
+                    and not existing.done_evt.is_set()
+                    and not existing.abort_evt.is_set()
+                )
+                else None
+            )
+            if active_existing is not None and active_existing.cache_key == cache_key:
+                if seq_id > 0:
+                    active_existing.seq_id = seq_id
+                return active_existing
+
+            if active_existing is not None and active_existing.owns_half_open:
+                if not allow_half_open:
+                    # Keep the in-flight half-open recovery probe running uninterrupted
+                    return None
+                active_existing.owns_half_open = False
+                active_existing.abort_evt.set()
                 self._inflight.pop(host_cfg.name, None)
+                can_run, claimed_ho = True, True
+            else:
+                can_run, claimed_ho = self._can_attempt_locked(
+                    host_cfg.name, allow_half_open=allow_half_open
+                )
+                if not can_run:
+                    return None
+                if active_existing is not None:
+                    active_existing.abort_evt.set()
+                    self._inflight.pop(host_cfg.name, None)
 
             comp_prev = self._completed.get(host_cfg.name)
             if comp_prev is not None and comp_prev.cache_key != cache_key:
                 self._completed.pop(host_cfg.name, None)
-
-            can_run, claimed_ho = self._can_attempt_locked(
-                host_cfg.name, allow_half_open=allow_half_open
-            )
-            if not can_run:
-                return None
 
             gen = self._host_gen.get(host_cfg.name, 0) + 1
             self._host_gen[host_cfg.name] = gen

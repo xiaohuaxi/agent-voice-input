@@ -160,8 +160,17 @@ def resolve_tmux_bin(env: Mapping[str, str] | None = None) -> str:
     found = shutil.which("tmux", path=eff_path)
     if found:
         return found
-    for fallback in ("/usr/bin/tmux", "/usr/local/bin/tmux", "/opt/homebrew/bin/tmux"):
-        if os.path.isfile(fallback) and os.access(fallback, os.X_OK):
+    raw_home = ((env.get("HOME") if env is not None else None) or os.environ.get("HOME") or "").strip()
+    local_tmux = os.path.join(os.path.expanduser(raw_home), ".local", "bin", "tmux") if raw_home else ""
+    for fallback in (
+        "/usr/bin/tmux",
+        "/usr/local/bin/tmux",
+        "/opt/homebrew/bin/tmux",
+        "/opt/local/bin/tmux",
+        "/home/linuxbrew/.linuxbrew/bin/tmux",
+        local_tmux,
+    ):
+        if fallback and os.path.isfile(fallback) and os.access(fallback, os.X_OK):
             return fallback
     return ""
 

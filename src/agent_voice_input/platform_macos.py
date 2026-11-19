@@ -23,7 +23,7 @@ from .app_scope import (
     MACOS_TERMINALS,
 )
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
-from .config import Config, ensure_secure_dir, expand_user_path, get_runtime_dir, redact_secrets
+from .config import Config, ensure_secure_dir, expand_user_path, get_runtime_dir, is_hermetic_env, redact_secrets
 from .hud import resolve_ui_language
 from .platform_common import (
     FfmpegWavRecorder,
@@ -595,7 +595,14 @@ def probe_macos_host(
     audio_dev = resolve_macos_audio_device(cfg, eff_env)
     info: dict[str, Any] = {
         "avfoundation_ok": False, "audio_devices": [], "configured_audio_device": f":{audio_dev}",
-        "pbcopy_ok": bool(shutil.which("pbcopy", path=eff_env.get("PATH"))),
+        "pbcopy_ok": bool(
+            shutil.which("pbcopy", path=eff_env.get("PATH"))
+            or (
+                not is_hermetic_env(env)
+                and os.path.isfile("/usr/bin/pbcopy")
+                and os.access("/usr/bin/pbcopy", os.X_OK)
+            )
+        ),
         "tmux_active": bool(eff_env.get("TMUX")),
         "clt_ok": True, "clt_error": "",
         "swiftc_ok": False, "swiftc_bin": "", "mac_shim_ok": False, "mac_shim_bin": "", "mac_shim_error": "",
@@ -743,6 +750,7 @@ class MacOSPlatform(JsonlShimMixin):
         self_check_fn: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> None:
         self.cfg = cfg
+        self._hermetic_env = is_hermetic_env(env)
         self.env = dict(os.environ if env is None else env)
         self.audio_dev = resolve_macos_audio_device(self.cfg, self.env)
         self._cache_dir = cache_dir
@@ -771,7 +779,7 @@ class MacOSPlatform(JsonlShimMixin):
         self._cur_session: _MacRecSession | None = None
         self._busy_wait_timeout_sec: float = 4.0
         self._paste_hold_timeout_sec: float | None = None
-        self._iterm2_osa_denied: bool = False
+        self._iterm2_osa_retry_after: float = 0.0
         self.last_audio_error = ""
         self._init_shim_bridge()
 
@@ -963,19 +971,29 @@ class MacOSPlatform(JsonlShimMixin):
                 invoke_recorder_lost_callback(lost_cb, claimed_session.daemon_seq_id)
 
     def _which(self, name: str) -> str | None:
-        return shutil.which(name, path=self.env.get("PATH")) if "PATH" in self.env else shutil.which(name)
+        if "PATH" in self.env:
+            if found := shutil.which(name, path=self.env.get("PATH")):
+                return found
+            if not self._hermetic_env and name in ("osascript", "pbcopy", "afplay", "ps"):
+                sys_p = "/bin/ps" if name == "ps" else f"/usr/bin/{name}"
+                if os.path.isfile(sys_p) and os.access(sys_p, os.X_OK):
+                    return sys_p
+            return None
+        return shutil.which(name)
 
     def _resolve_tmux_exe(self) -> str:
         if found := self._which("tmux"):
             return found if os.path.sep in found and Path(found).name == "tmux" else "tmux"
-        return resolve_tmux_bin(self.env) if "PATH" in self.env else ""
+        return resolve_tmux_bin(self.env) if ("PATH" in self.env or not self._hermetic_env) else ""
 
     def _run_osascript(self, args: list[str], *, timeout: float = 2.5) -> subprocess.CompletedProcess[str] | None:
-        if not self._which("osascript"):
+        osa_bin = self._which("osascript")
+        if not osa_bin:
             return None
+        exe = osa_bin if os.path.sep in osa_bin and Path(osa_bin).name == "osascript" else "osascript"
         try:
             return subprocess.run(
-                ["osascript", *args], stdin=subprocess.DEVNULL,
+                [exe, *args], stdin=subprocess.DEVNULL,
                 capture_output=True, text=True, env=self.env, timeout=timeout, check=False,
             )
         except (OSError, subprocess.SubprocessError):
@@ -1060,7 +1078,7 @@ class MacOSPlatform(JsonlShimMixin):
         return win_id, eff_title, tab_tty, wname
 
     def _query_iterm2_terminal(self) -> tuple[int, str, str, str] | None:
-        if self._iterm2_osa_denied or not _can_automate_bundle_without_prompt(ITERM2_BUNDLE_ID):
+        if time.monotonic() < self._iterm2_osa_retry_after or not _can_automate_bundle_without_prompt(ITERM2_BUNDLE_ID):
             return None
         p = self._run_osascript(["-e", _ITERM2_QUERY_SCRIPT], timeout=1.5)
         if p is None:
@@ -1068,7 +1086,7 @@ class MacOSPlatform(JsonlShimMixin):
         if p.returncode != 0:
             err_low = (p.stderr or "").lower()
             if "-1743" in err_low or "(1743)" in err_low or "-1744" in err_low or "not authorized" in err_low:
-                self._iterm2_osa_denied = True
+                self._iterm2_osa_retry_after = time.monotonic() + 60.0
             return None
         if not p.stdout.strip():
             return None
@@ -1315,9 +1333,11 @@ class MacOSPlatform(JsonlShimMixin):
 
     def beep(self, kind: str) -> None:
         snd = f"/System/Library/Sounds/{SOUND_MAP.get(kind, 'Basso.aiff')}"
-        if self.cfg.audio.beep and self._which("afplay") and os.path.isfile(snd):
+        af_bin = self._which("afplay") if self.cfg.audio.beep else None
+        if af_bin and os.path.isfile(snd):
+            exe = af_bin if os.path.sep in af_bin and Path(af_bin).name == "afplay" else "afplay"
             try:
-                subprocess.Popen(["afplay", snd], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen([exe, snd], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except OSError:
                 pass
 
@@ -1736,11 +1756,13 @@ class MacOSPlatform(JsonlShimMixin):
         return False
 
     def _copy_to_clipboard(self, text: str) -> bool:
-        if not self._which("pbcopy"):
+        pb_bin = self._which("pbcopy")
+        if not pb_bin:
             return False
+        exe = pb_bin if os.path.sep in pb_bin and Path(pb_bin).name == "pbcopy" else "pbcopy"
         try:
             p = subprocess.run(
-                ["pbcopy"], input=text, text=True, encoding="utf-8", env=self.env,
+                [exe], input=text, text=True, encoding="utf-8", env=self.env,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, check=False,
             )
             return p.returncode == 0

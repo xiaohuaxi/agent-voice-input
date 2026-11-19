@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import posixpath
 import re
+import shutil
 import stat
 import struct
 import subprocess
@@ -125,6 +126,7 @@ _BROAD_SYSTEM_DIRS_LOW = frozenset(
         "/library",
         "/applications",
         "/opt",
+        "/srv",
         "/mnt",
     }
 )
@@ -1012,7 +1014,7 @@ def _is_trusted_runtime_dir(rt_dir: Path) -> bool:
         return False
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
         return False
-    if stat.S_IMODE(st.st_mode) != 0o700:
+    if (st.st_mode & 0o077) != 0 or (st.st_mode & 0o700) != 0o700:
         return False
     return st.st_uid == os.getuid()
 
@@ -1276,13 +1278,35 @@ def _collect_descendants(proc_root: Path, root_pid: int) -> set[int]:
     return visited
 
 
+def _resolve_remote_tool_bin(name: str, env: Mapping[str, str] | None = None) -> str:
+    src = os.environ if env is None else env
+    raw_path = src.get("PATH")
+    found = shutil.which(name, path=raw_path) if raw_path is not None else shutil.which(name)
+    if found:
+        return found
+    raw_home = (src.get("HOME") or os.environ.get("HOME") or "").strip()
+    local_bin = os.path.join(os.path.expanduser(raw_home), ".local", "bin", name) if raw_home else ""
+    for cand in (
+        f"/usr/bin/{name}",
+        f"/usr/local/bin/{name}",
+        f"/opt/homebrew/bin/{name}",
+        f"/opt/local/bin/{name}",
+        f"/home/linuxbrew/.linuxbrew/bin/{name}",
+        local_bin,
+    ):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return name
+
+
 def _probe_remote_tmux_active_pane(env: Mapping[str, str]) -> dict[str, Any] | None:
     if env.get("AVI_DISABLE_TMUX_PROBE") == "1":
         return None
     if env.get("AVI_REMOTE_PROC_ROOT") and not env.get("AVI_REMOTE_TMUX_SOCK"):
         return None
     sock_arg = (env.get("AVI_REMOTE_TMUX_SOCK") or "").strip()
-    tmux_cmd = ["tmux", "-S", sock_arg] if sock_arg else ["tmux"]
+    tmux_bin = _resolve_remote_tool_bin("tmux", env)
+    tmux_cmd = [tmux_bin, "-S", sock_arg] if sock_arg else [tmux_bin]
     sep = "\x1f"
     try:
         rc_c = subprocess.run(
@@ -2242,8 +2266,9 @@ def _has_git_worktree(real_cwd: str, home: Path) -> bool:
 
 
 def _read_remote_git_status(real_cwd: str) -> tuple[str, list[str]]:
+    git_bin = _resolve_remote_tool_bin("git")
     cmd = [
-        "git",
+        git_bin,
         "--no-optional-locks",
         "-c",
         "core.fsmonitor=false",
@@ -2289,7 +2314,8 @@ def _read_remote_git_status(real_cwd: str) -> tuple[str, list[str]]:
 
 
 def _read_remote_repo_files(real_cwd: str, max_files: int = 20) -> list[str]:
-    base = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", real_cwd]
+    git_bin = _resolve_remote_tool_bin("git")
+    base = [git_bin, "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", real_cwd]
     git_env = {**os.environ, "GIT_NO_LAZY_FETCH": "1"}
 
     def _run_nul(args: list[str]) -> list[str]:

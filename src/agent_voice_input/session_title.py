@@ -26,7 +26,7 @@ def _ensure_sctx() -> None:
 
 _SID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{0,56}$")
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_HOST_TAG_VAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_HOST_TAG_VAL_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$")
 
 
 def _resolve_ssh_host_tag(
