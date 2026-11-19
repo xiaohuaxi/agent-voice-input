@@ -90,7 +90,7 @@ _OSA_CODE_RE = re.compile(r"\((-?\d+)\)")
 _FRONTMOST_APP_SCRIPT = """\
 tell application "System Events"
     set p to first process whose frontmost is true
-    set {appName, bundleId, appPid, winTitle} to {"", "", 0, ""}
+    set {appName, bundleId, appPid, winTitle, winDoc} to {"", "", 0, "", ""}
     try
         set appName to name of p
     end try
@@ -104,9 +104,12 @@ tell application "System Events"
         try
             set winTitle to value of attribute "AXTitle" of front window of p
         end try
+        try
+            set winDoc to value of attribute "AXDocument" of front window of p
+        end try
     end if
     set sep to character id 31
-    return appName & sep & bundleId & sep & (appPid as text) & sep & winTitle
+    return appName & sep & bundleId & sep & (appPid as text) & sep & winTitle & sep & (winDoc as text)
 end tell"""
 
 _FRONTMOST_AXTITLE_SCRIPT = """\
@@ -941,6 +944,7 @@ class MacOSPlatform(JsonlShimMixin):
         self._fg_tls.hwnd = 0
         self._fg_tls.from_shim = False
         self._fg_tls.ax_trusted = None
+        self._fg_tls.document = ""
         if self._has_managed_shim():
             r = self._shim_rpc({"cmd": "fg_window"}, timeout_sec=1.5)
             if r is not None:
@@ -951,6 +955,8 @@ class MacOSPlatform(JsonlShimMixin):
                 self._fg_tls.from_shim = True
                 raw_ax = r.get("ax_trusted")
                 self._fg_tls.ax_trusted = raw_ax if isinstance(raw_ax, bool) else None
+                raw_doc = str(r.get("document") or "").strip()
+                self._fg_tls.document = raw_doc if raw_doc.lower().startswith("file://") else ""
                 shim_title = str(r.get("title") or "").strip()
                 if is_ghostty_app(app_name, bundle_id):
                     return app_name or "Ghostty", bundle_id or GHOSTTY_BUNDLE_ID, shim_title, app_pid
@@ -966,6 +972,8 @@ class MacOSPlatform(JsonlShimMixin):
             app_pid = int(parts[2].strip()) if len(parts) > 2 and parts[2].strip() else 0
         except ValueError:
             app_pid = 0
+        raw_osa_doc = parts[4].strip() if len(parts) > 4 else ""
+        self._fg_tls.document = raw_osa_doc if raw_osa_doc.lower().startswith("file://") else ""
         return (
             parts[0].strip() if len(parts) > 0 else "",
             parts[1].strip() if len(parts) > 1 else "",
@@ -1041,6 +1049,8 @@ class MacOSPlatform(JsonlShimMixin):
                 hint.pid,
                 hint.hwnd,
             )
+            raw_hint_doc = (hint.document or "").strip()
+            win_doc = raw_hint_doc if raw_hint_doc.lower().startswith("file://") else ""
             from_shim = hint.ax_trusted is not None
             ax_trusted = hint.ax_trusted
             if (
@@ -1055,10 +1065,12 @@ class MacOSPlatform(JsonlShimMixin):
             self._fg_tls.hwnd = 0
             self._fg_tls.from_shim = False
             self._fg_tls.ax_trusted = None
+            self._fg_tls.document = ""
             app_name, bundle_id, win_title, app_pid = self._query_frontmost_process_and_title()
             app_hwnd = int(getattr(self._fg_tls, "hwnd", 0) or 0)
             from_shim = bool(getattr(self._fg_tls, "from_shim", False))
             ax_trusted = getattr(self._fg_tls, "ax_trusted", None)
+            win_doc = str(getattr(self._fg_tls, "document", "") or "")
 
         if is_ghostty_app(app_name, bundle_id):
             eff_name, eff_bundle = app_name or "Ghostty", bundle_id or GHOSTTY_BUNDLE_ID
@@ -1138,6 +1150,7 @@ class MacOSPlatform(JsonlShimMixin):
             bundle_id,
             pid=app_pid,
             ax_trusted=ax_trusted,
+            document=win_doc,
         )
         return self._enrich_window_tmux_target(other_win) if not (from_shim and app_hwnd <= 0) else other_win
 

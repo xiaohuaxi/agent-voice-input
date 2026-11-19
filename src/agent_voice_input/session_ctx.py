@@ -11,6 +11,7 @@ Supports ``codex``, ``claude`` (Claude Code), and ``agy`` (Antigravity CLI) acro
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 import errno
 import fcntl
@@ -19,12 +20,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import stat
 import subprocess
+import sys
 import threading
 import time
-from typing import Any, BinaryIO, Callable, Collection, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Collection, Iterable, Iterator, Mapping, Sequence
 import urllib.parse
 import uuid
 
@@ -45,6 +48,7 @@ from ._tmux import (
     probe_tmux_snapshot,
     resolve_tmux_bin,
 )
+from .app_scope import parse_ide_window_title
 from .asr_providers import AsrContext
 from .config import ensure_secure_dir, get_runtime_dir
 
@@ -2762,14 +2766,741 @@ def _keep_tech_token(m: re.Match[str]) -> str | None:
     return tok
 
 
+def _detect_host_is_wsl() -> bool:
+    if sys.platform != "linux":
+        return False
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        return "microsoft" in os.uname().release.lower()
+    except (AttributeError, OSError):
+        return False
+
+
+_HOST_IS_WSL: bool = _detect_host_is_wsl()
+
+
+def _effective_is_wsl(wsl: bool | None = None, env: Mapping[str, str] | None = None) -> bool:
+    if wsl is not None:
+        return bool(wsl)
+    src = env if env is not None else os.environ
+    return _HOST_IS_WSL or bool((src.get("WSL_DISTRO_NAME") or "").strip() or (src.get("WSL_INTEROP") or "").strip())
+
+
+def is_wsl_slow_mount_path(
+    path_str: str, *, wsl: bool | None = None, env: Mapping[str, str] | None = None
+) -> bool:
+    """Pure-string zero-I/O check blocking WSL2 ``/mnt/`` DrvFS and UNC mounts."""
+    if not _effective_is_wsl(wsl, env):
+        return False
+    s = (path_str or "").strip()
+    if not s:
+        return False
+    if s.lower().startswith("file://"):
+        parsed = urllib.parse.urlparse(s)
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            return True
+        s = urllib.parse.unquote(parsed.path or "")
+    if s.startswith(("\\\\", "//")) or (len(s) >= 2 and s[0].isalpha() and s[1] == ":"):
+        return True
+    if s.startswith(("/", "\\")):
+        norm = posixpath.normpath("/" + s.replace("\\", "/").lstrip("/"))
+        return norm == "/mnt" or norm.startswith("/mnt/")
+    return False
+
+
+def _safe_realpath(path_str: str, *, wsl: bool) -> str:
+    """Resolve symlinks without ever calling ``lstat``/``stat`` on WSL2 ``/mnt/`` slow mounts."""
+    if not path_str or is_wsl_slow_mount_path(path_str, wsl=wsl):
+        return ""
+    if not wsl:
+        try:
+            return _normalize_cwd(os.path.realpath(path_str))
+        except OSError:
+            return ""
+    abs_p = path_str if path_str.startswith("/") else os.path.abspath(path_str)
+    if is_wsl_slow_mount_path(abs_p, wsl=True):
+        return ""
+    todo = [seg for seg in abs_p.split("/") if seg and seg != "."]
+    resolved: list[str] = []
+    hops = 0
+    while todo:
+        seg = todo.pop(0)
+        if seg == "..":
+            if resolved:
+                resolved.pop()
+            continue
+        cand = "/" + "/".join([*resolved, seg])
+        if is_wsl_slow_mount_path(cand, wsl=True):
+            return ""
+        try:
+            st = os.lstat(cand)
+        except OSError:
+            tail = posixpath.normpath("/" + "/".join([*resolved, seg, *todo]))
+            return "" if is_wsl_slow_mount_path(tail, wsl=True) else _normalize_cwd(tail)
+        if stat.S_ISLNK(st.st_mode):
+            hops += 1
+            if hops > 40:
+                return ""
+            try:
+                target = os.readlink(cand)
+            except OSError:
+                return ""
+            if is_wsl_slow_mount_path(target, wsl=True):
+                return ""
+            if target.startswith("/"):
+                resolved = []
+            todo = [x for x in target.split("/") if x and x != "."] + todo
+        else:
+            resolved.append(seg)
+    out = "/" + "/".join(resolved)
+    return "" if is_wsl_slow_mount_path(out, wsl=True) else _normalize_cwd(out)
+
+
+def _resolve_safe_local_dir(path_str: str, *, wsl: bool) -> str:
+    """Validate directory without touching ``/mnt/`` before, during, or after symlink resolution."""
+    real = _safe_realpath(path_str, wsl=wsl)
+    if not real:
+        return ""
+    try:
+        return real if os.path.isdir(real) else ""
+    except OSError:
+        return ""
+
+
+_BROAD_SYSTEM_DIRS_LOW: frozenset[str] = frozenset({
+    "/", "/tmp", "/private", "/private/tmp", "/var", "/private/var", "/users", "/home", "/root",
+    "/private/var/root", "/etc", "/private/etc", "/usr", "/system", "/library", "/applications", "/opt", "/mnt",
+})
+
+
+def _is_broad_or_unsafe_workspace_dir(dir_path: str, home: Path | None = None, *, wsl: bool = False) -> bool:
+    norm = posixpath.normpath(_normalize_cwd(dir_path)) if dir_path else ""
+    if not norm or norm == "." or norm.lower() in _BROAD_SYSTEM_DIRS_LOW:
+        return True
+    if posixpath.dirname(norm).lower() in ("/home", "/users"):
+        return True
+    if home is not None:
+        h_norm = posixpath.normpath(_normalize_cwd(str(home)))
+        h_real = _safe_realpath(h_norm, wsl=wsl)
+        h_set = {p for p in (h_norm, h_real) if p}
+        if norm in h_set or norm.lower() in {p.lower() for p in h_set}:
+            return True
+    return False
+
+
+def _has_git_marker(dir_path: str) -> bool:
+    try:
+        return bool(dir_path) and os.path.exists(os.path.join(dir_path, ".git"))
+    except OSError:
+        return False
+
+
+def _is_inside_git_worktree(dir_path: str, *, home: Path | None = None, max_depth: int = 12) -> bool:
+    cur = _normalize_cwd(dir_path)
+    for _ in range(max_depth + 1):
+        if not cur:
+            return False
+        if _has_git_marker(cur):
+            return True
+        if _is_broad_or_unsafe_workspace_dir(cur, home):
+            return False
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:
+            return False
+        cur = parent
+    return False
+
+
+_SHALLOW_SKIP_DIRS_LOW: frozenset[str] = frozenset(
+    d.lower()
+    for d in (
+        _REPO_SKIP_DIRS
+        | {
+            ".git", ".hg", ".svn", ".venv", "venv", "env", ".env", ".tox", ".mypy_cache",
+            ".pytest_cache", ".ruff_cache", ".next", ".nuxt", ".turbo", ".cache",
+            "coverage", "htmlcov", "Pods", "DerivedData", "Library", "Logs", "Temp", "tmp",
+        }
+    )
+)
+_SHALLOW_DOC_AND_CODE_EXTS: frozenset[str] = _REPO_CORE_EXTS | frozenset(
+    ".md .markdown .mdx .txt .rst .adoc .org .tex .pdf .doc .docx .xls .xlsx .ppt .pptx "
+    ".csv .tsv .json .jsonl .yaml .yml .xml .html .css .scss .ipynb .proto .graphql .prisma".split()
+)
+_SHALLOW_SKIP_BASES_LOW: frozenset[str] = frozenset(
+    b.lower() for b in (_REPO_SKIP_BASES | {".ds_store", "thumbs.db", "desktop.ini"})
+)
+
+
+def _file_stems_for_hotwords(filenames: Sequence[str], *, limit: int = 12) -> list[str]:
+    out: list[str] = []
+    seen_low: set[str] = set()
+    for fname in filenames[:limit]:
+        stem = os.path.splitext(fname)[0].strip()
+        if not stem or len(stem) > 48 or stem.isdigit():
+            continue
+        min_len = 2 if any(ord(ch) > 127 for ch in stem) else 3
+        if len(stem) >= min_len and (low := stem.lower()) not in seen_low:
+            seen_low.add(low)
+            out.append(stem)
+    return out
+
+
+def read_workspace_shallow_files(
+    cwd: str,
+    *,
+    home: Path | None = None,
+    max_files: int = 20,
+    max_entries: int = 200,
+    wsl: bool | None = None,
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Bounded ``os.scandir`` fallback (root + 1 subdir level) for non-Git folders."""
+    eff_wsl = _effective_is_wsl(wsl, env)
+    eff_home = home if home is not None else Path(((env or os.environ).get("HOME") or "").strip() or Path.home())
+    if _is_broad_or_unsafe_workspace_dir(cwd, eff_home, wsl=eff_wsl):
+        return []
+    real_cwd = _resolve_safe_local_dir(cwd, wsl=eff_wsl)
+    if (
+        not real_cwd
+        or _is_broad_or_unsafe_workspace_dir(real_cwd, eff_home, wsl=eff_wsl)
+        or _is_inside_git_worktree(real_cwd, home=eff_home)
+    ):
+        return []
+
+    scanned = 0
+
+    def _accept_file_name(name: str) -> bool:
+        if not name or name.startswith((".", "~$")) or name.lower() in _SHALLOW_SKIP_BASES_LOW:
+            return False
+        stem, ext = os.path.splitext(name)
+        return ext.lower() in _SHALLOW_DOC_AND_CODE_EXTS and 2 <= len(stem.strip()) <= 64
+
+    def _scan_dir(dir_path: str, *, include_dirs: bool) -> tuple[list[str], list[str]]:
+        nonlocal scanned
+        files: list[str] = []
+        dirs: list[str] = []
+        try:
+            with os.scandir(dir_path) as it:
+                for entry in it:
+                    if scanned >= max_entries:
+                        break
+                    scanned += 1
+                    ename = entry.name
+                    if not ename or ename.startswith((".", "~$")):
+                        continue
+                    try:
+                        if include_dirs and entry.is_dir(follow_symlinks=False):
+                            if ename.lower() not in _SHALLOW_SKIP_DIRS_LOW:
+                                dirs.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False) and _accept_file_name(ename):
+                            files.append(ename)
+                    except OSError:
+                        continue
+        except OSError:
+            return [], []
+        files.sort(key=str.lower)
+        dirs.sort(key=lambda p: os.path.basename(p).lower())
+        return files, dirs
+
+    root_files, sub_dirs = _scan_dir(real_cwd, include_dirs=True)
+    sub_files: list[str] = []
+    for sdir in sub_dirs:
+        if scanned >= max_entries or len(root_files) + len(sub_files) >= max_files * 2:
+            break
+        lvl_files, _ = _scan_dir(sdir, include_dirs=False)
+        sub_files.extend(lvl_files)
+
+    out: list[str] = []
+    seen_low: set[str] = set()
+    for fname in (*root_files, *sub_files):
+        if (low := fname.lower()) not in seen_low:
+            seen_low.add(low)
+            out.append(fname)
+            if len(out) >= max_files:
+                break
+    return out
+
+
+_IDE_SEARCH_SUBDIRS: tuple[str, ...] = (
+    "repos", "projects", "code", "work", "dev", "src", "github", "workspace", "Developer", "Documents", "Desktop",
+)
+_IDE_HOME_SKIP_NAMES: frozenset[str] = frozenset({
+    "library", ".cache", ".local", ".ssh", ".gnupg", ".npm", ".cargo", ".gemini", ".claude", ".codex",
+})
+
+
+def _expand_home_prefix(raw_path: str, home: Path) -> str:
+    s = raw_path.strip()
+    return str(home) if s == "~" else (str(home / s[2:]) if s.startswith("~/") else s)
+
+
+def _collect_bounded_ancestors(start_path: str, *, home: Path, wsl: bool, max_levels: int = 12) -> list[str]:
+    real = _safe_realpath(start_path, wsl=wsl)
+    if not real:
+        return []
+    cur = _normalize_cwd(real if os.path.isdir(real) else os.path.dirname(real))
+    ancestors: list[str] = []
+    for _ in range(max_levels + 1):
+        if not cur or _is_broad_or_unsafe_workspace_dir(cur, home, wsl=wsl):
+            break
+        if os.path.isdir(cur):
+            ancestors.append(cur)
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:
+            break
+        cur = _normalize_cwd(parent)
+    return ancestors
+
+
+def _pick_unique_workspace_dir(candidates: Iterable[str], *, home: Path, wsl: bool) -> str:
+    """Deduplicate by ``(st_dev, st_ino)``; accept unique dir, prefer sole ``.git`` on ties, or return ``''``."""
+    unique_items: list[tuple[str, bool]] = []
+    seen_inodes: set[tuple[int, int]] = set()
+    for raw in candidates:
+        safe_dir = _resolve_safe_local_dir(raw, wsl=wsl)
+        if not safe_dir or _is_broad_or_unsafe_workspace_dir(safe_dir, home, wsl=wsl):
+            continue
+        try:
+            st = os.stat(safe_dir)
+        except OSError:
+            continue
+        fid = (st.st_dev, st.st_ino)
+        if fid not in seen_inodes:
+            seen_inodes.add(fid)
+            unique_items.append((safe_dir, _has_git_marker(safe_dir)))
+    if len(unique_items) == 1:
+        return unique_items[0][0]
+    git_dirs = [p for p, has_git in unique_items if has_git]
+    return git_dirs[0] if len(git_dirs) == 1 else ""
+
+
+def resolve_ide_workspace_cwd(
+    win: Any,
+    *,
+    home: Path,
+    known_cwds: Iterable[str] = (),
+    wsl: bool | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve local IDE workspace directory (Git repo or ordinary folder) without directory recursion."""
+    eff_wsl = _effective_is_wsl(wsl, env)
+    title_info = parse_ide_window_title(win)
+    if title_info is not None and title_info.remote_kind == "remote":
+        return ""
+
+    root_name = title_info.root_name.strip() if title_info is not None else ""
+    if root_name in (".", "..") or any(ch in root_name for ch in ("/", "\\", "\x00")):
+        root_name = ""
+    want_low = root_name.lower()
+
+    # 1. macOS AXDocument file:// URL
+    raw_doc = (getattr(win, "document", "") or "").strip()
+    if raw_doc.lower().startswith("file://") and not is_wsl_slow_mount_path(raw_doc, wsl=eff_wsl):
+        parsed_doc = urllib.parse.urlparse(raw_doc)
+        if not parsed_doc.netloc or parsed_doc.netloc.lower() == "localhost":
+            ancestors = _collect_bounded_ancestors(urllib.parse.unquote(parsed_doc.path or ""), home=home, wsl=eff_wsl)
+            if want_low:
+                if hit := next((a for a in ancestors if os.path.basename(a).lower() == want_low), ""):
+                    return hit
+                # External document outside named workspace (e.g. ~/.zshrc): ignore document and fall through.
+            elif hit := next((a for a in ancestors if _has_git_marker(a)), ""):
+                return hit
+
+    # 2. Explicit path in IDE title (e.g. JetBrains [~/repos/proj] or Sublime ~/repos/proj/a.py):
+    # authoritative for that window — never fall back to guessing same-named local folders if invalid/slow-mount.
+    if title_info is not None and title_info.explicit_path:
+        exp_expanded = _expand_home_prefix(title_info.explicit_path, home)
+        if is_wsl_slow_mount_path(exp_expanded, wsl=eff_wsl):
+            return ""
+        exp_dir = _resolve_safe_local_dir(exp_expanded, wsl=eff_wsl)
+        if exp_dir and not _is_broad_or_unsafe_workspace_dir(exp_dir, home, wsl=eff_wsl) and _has_git_marker(exp_dir):
+            return exp_dir
+        ancs = _collect_bounded_ancestors(exp_dir or exp_expanded, home=home, wsl=eff_wsl)
+        if want_low and (hit := next((a for a in ancs if os.path.basename(a).lower() == want_low), "")):
+            return hit
+        if hit := next((a for a in ancs if _has_git_marker(a)), ""):
+            return hit
+        return exp_dir if (exp_dir and not _is_broad_or_unsafe_workspace_dir(exp_dir, home, wsl=eff_wsl)) else ""
+
+    if not want_low:
+        return ""
+
+    # 3. Combine known active session CWDs and fixed 1-level candidate roots under unified inode/conflict rules.
+    probe_cands = [
+        c for c in known_cwds
+        if c and not is_wsl_slow_mount_path(c, wsl=eff_wsl) and os.path.basename(c.rstrip("/\\")).lower() == want_low
+    ]
+    probe_cands.extend(str(home / sub / root_name) for sub in _IDE_SEARCH_SUBDIRS)
+    if want_low not in _IDE_HOME_SKIP_NAMES:
+        probe_cands.append(str(home / root_name))
+    return _pick_unique_workspace_dir(probe_cands, home=home, wsl=eff_wsl)
+
+
+_AGY_IDE_ACTIVE_WINDOW_SEC: float = 21600.0
+_AGY_IDE_MAX_CANDIDATES: int = 16
+_AGY_IDE_TAIL_SCAN_BYTES: int = 131072
+_AGY_TOOL_PATH_KEYS: frozenset[str] = frozenset({
+    "absolutepath", "cwd", "directorypath", "path", "searchdirectory", "targetfile",
+    "file_path", "filepath", "directory", "target_directory", "workdir",
+})
+_AGY_URI_RE = re.compile(r"(?:file|vscode-remote)://[^\s\"'<>)\]`]+", re.IGNORECASE)
+_AGY_ABS_PATH_RE = re.compile(
+    r"(?:^|[\s\"':=\[({`])(?<!://)(/(?:[A-Za-z0-9._\u0080-\uffff-]+/)+[A-Za-z0-9._\u0080-\uffff-]+)"
+)
+
+
+@dataclass(frozen=True)
+class _AgyIdeEvidence:
+    ws_uris: tuple[str, ...]
+    sys_cwds: tuple[str, ...]
+    l2_paths: tuple[str, ...]
+    l3_paths: tuple[str, ...]
+
+
+_AGY_REMOTE_URI_SENTINEL = "::remote_workspace::"
+_AGY_BRAIN_EVIDENCE_LOCK = threading.Lock()
+_AGY_BRAIN_EVIDENCE_CACHE: OrderedDict[tuple[Any, ...], _AgyIdeEvidence] = OrderedDict()
+_AGY_BRAIN_EVIDENCE_MAX = 64
+
+
+def _decode_agy_uri_or_path(raw: str, home: Path, *, keep_remote_sentinel: bool = False) -> str:
+    s = (raw or "").strip().rstrip(".,;:")
+    if not s:
+        return ""
+    low = s.lower()
+    if low.startswith("file://"):
+        parsed = urllib.parse.urlparse(s)
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            return _AGY_REMOTE_URI_SENTINEL if keep_remote_sentinel else ""
+        s = urllib.parse.unquote(parsed.path or "")
+    elif low.startswith("vscode-remote://"):
+        parsed = urllib.parse.urlparse(s)
+        if not (parsed.netloc or "").lower().startswith("wsl+"):
+            return _AGY_REMOTE_URI_SENTINEL if keep_remote_sentinel else ""
+        s = urllib.parse.unquote(parsed.path or "")
+    elif s.startswith("~/"):
+        s = str(home / s[2:])
+    elif not s.startswith("/"):
+        return ""
+    s = s.split("#L", 1)[0] if "#L" in s else s
+    # Preserve raw '..' segments here so _safe_realpath resolves symlinks before '..' in POSIX order.
+    return _normalize_cwd(s) if s.startswith("/") else ""
+
+
+def _canonical_evidence_path(cand_path: str, *, wsl: bool) -> str:
+    """Canonicalize an evidence path safely (resolving symlinks before ``..`` without touching ``/mnt/``)."""
+    if cand_path == _AGY_REMOTE_URI_SENTINEL:
+        return ""
+    return _safe_realpath(cand_path, wsl=wsl)
+
+
+def _path_is_within_ws(cand_path: str, safe_ws: str, *, wsl: bool) -> bool:
+    canon = _canonical_evidence_path(cand_path, wsl=wsl)
+    return bool(canon and (canon == safe_ws or canon.startswith(safe_ws + "/")))
+
+
+def _l1_matches_workspace(safe_ws: str, cand_path: str, home: Path, *, wsl: bool) -> bool:
+    canon = _canonical_evidence_path(cand_path, wsl=wsl)
+    if not canon:
+        return False
+    if canon == safe_ws:
+        return True
+    if not _is_broad_or_unsafe_workspace_dir(canon, home, wsl=wsl) and safe_ws.startswith(canon + "/"):
+        return True
+    return not _is_broad_or_unsafe_workspace_dir(safe_ws, home, wsl=wsl) and canon.startswith(safe_ws + "/")
+
+
+def _is_agy_noise_path(cand_path: str, home: Path, *, wsl: bool = False) -> bool:
+    if cand_path == _AGY_REMOTE_URI_SENTINEL:
+        return False
+    norm = posixpath.normpath(_normalize_cwd(cand_path)) if cand_path else ""
+    if not norm or norm.lower() in _BROAD_SYSTEM_DIRS_LOW:
+        return True
+    h_norm = posixpath.normpath(_normalize_cwd(str(home)))
+    h_real = _safe_realpath(h_norm, wsl=wsl)
+    for h_base in {p for p in (h_norm, h_real) if p}:
+        if norm == h_base:
+            return True
+        if norm.startswith(h_base + "/"):
+            for sub in (".gemini", ".claude", ".codex", ".agents", ".harness", ".cache", ".local", "Library"):
+                sub_dir = f"{h_base}/{sub}"
+                if norm == sub_dir or norm.startswith(sub_dir + "/"):
+                    return True
+            return norm.startswith(h_base + "/.") and "/" not in norm[len(h_base) + 2 :]
+    return norm.lower().startswith(
+        ("/tmp/", "/private/", "/var/", "/usr/", "/etc/", "/system/", "/library/", "/applications/")
+    )
+
+
+def _extract_paths_from_metadata_block(meta_text: str, home: Path) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for raw_val in (
+        *(m.group(0) for m in _AGY_URI_RE.finditer(meta_text)),
+        *(m.group(1) for m in _AGY_ABS_PATH_RE.finditer(_AGY_URI_RE.sub(" ", meta_text))),
+    ):
+        if (p := _decode_agy_uri_or_path(raw_val, home)) and p not in seen:
+            seen.add(p)
+            paths.append(p)
+    return paths
+
+
+def _extract_tool_call_paths(obj: Mapping[str, Any], home: Path) -> list[str]:
+    raw_calls = obj.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        return []
+    out: list[str] = []
+    for tc in raw_calls:
+        if not isinstance(tc, Mapping):
+            continue
+        fn_obj = tc.get("function")
+        arg_sources = [tc.get("args"), tc.get("arguments"), tc.get("input"), fn_obj.get("arguments") if isinstance(fn_obj, Mapping) else None]
+        for raw_args in arg_sources:
+            args_map: Mapping[str, Any] | None = raw_args if isinstance(raw_args, Mapping) else None
+            if args_map is None and isinstance(raw_args, str) and raw_args.lstrip().startswith("{"):
+                try:
+                    parsed = json.loads(raw_args)
+                    args_map = parsed if isinstance(parsed, Mapping) else None
+                except ValueError:
+                    pass
+            if args_map is None:
+                continue
+            for k, v in args_map.items():
+                if str(k).strip().lower() not in _AGY_TOOL_PATH_KEYS:
+                    continue
+                vals = (v,) if isinstance(v, str) else (v[:8] if isinstance(v, list) else ())
+                for item in vals:
+                    if isinstance(item, str) and (p := _decode_agy_uri_or_path(item, home)):
+                        out.append(p)
+    return out
+
+
+def _read_bounded_jsonl_dicts(f: BinaryIO, *, max_lines: int = 0) -> list[dict[str, Any]]:
+    objs: list[dict[str, Any]] = []
+    seen = 0
+    while max_lines <= 0 or seen < max_lines:
+        raw_ln, exceeded = _read_bounded_line(f, max_bytes=524288)
+        if not raw_ln:
+            break
+        seen += 1
+        if exceeded or not raw_ln.strip():
+            continue
+        try:
+            obj = json.loads(raw_ln.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            objs.append(obj)
+    return objs
+
+
+def _load_agy_ide_evidence(cid_dir: Path, tp: Path, st: os.stat_result, home: Path) -> _AgyIdeEvidence:
+    sub_dir = cid_dir / ".system_generated" / "subagents"
+    sub_files: list[Path] = []
+    sub_sig: list[tuple[str, int, int]] = []
+    if sub_dir.is_dir():
+        try:
+            for sf in sorted(sub_dir.glob("*.json"))[:16]:
+                try:
+                    sst = sf.stat()
+                except OSError:
+                    continue
+                sub_files.append(sf)
+                sub_sig.append((sf.name, sst.st_mtime_ns, sst.st_size))
+        except OSError:
+            pass
+    cache_key = (str(tp), st.st_mtime_ns, st.st_size, tuple(sub_sig))
+    with _AGY_BRAIN_EVIDENCE_LOCK:
+        if (cached := _AGY_BRAIN_EVIDENCE_CACHE.get(cache_key)) is not None:
+            _AGY_BRAIN_EVIDENCE_CACHE.move_to_end(cache_key)
+            return cached
+
+    ws_uris: list[str] = []
+    sys_cwds: list[str] = []
+
+    def _add_unique(dst: list[str], raw_u: str, *, keep_remote: bool = False) -> None:
+        if (p := _decode_agy_uri_or_path(raw_u, home, keep_remote_sentinel=keep_remote)) and p not in dst:
+            dst.append(p)
+
+    for sf, (_, _, sf_size) in zip(sub_files, sub_sig):
+        if sf_size > 262144:
+            continue
+        try:
+            sdata = json.loads(sf.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        raw_uris = (sdata.get("workspaceUris") or sdata.get("workspace_uris")) if isinstance(sdata, Mapping) else None
+        if isinstance(raw_uris, list):
+            for u in raw_uris:
+                raw_u = u if isinstance(u, str) else (u.get("uri") or u.get("path") if isinstance(u, Mapping) else "")
+                if isinstance(raw_u, str):
+                    _add_unique(ws_uris, raw_u, keep_remote=True)
+
+    records: list[dict[str, Any]] = []
+    try:
+        with open(tp, "rb") as f:
+            records = _read_bounded_jsonl_dicts(f, max_lines=32)
+            for obj in records[:8]:
+                if isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
+                    _add_unique(sys_cwds, obj["cwd"])
+                # Never extract workspace CWD from USER_EXPLICIT prose (users often paste logs from other repos).
+                if obj.get("source") == "SYSTEM":
+                    c_str = obj.get("content")
+                    if isinstance(c_str, str) and ("Working Directory:" in c_str or "Active Workspaces:" in c_str):
+                        if m_ws := _AGY_WS_CWD_RE.search(c_str):
+                            _add_unique(sys_cwds, m_ws.group(1))
+            head_end = f.tell()
+            if st.st_size > head_end:
+                seek_to = max(head_end, st.st_size - _AGY_IDE_TAIL_SCAN_BYTES)
+                f.seek(seek_to)
+                if seek_to > head_end:
+                    _read_bounded_line(f, max_bytes=524288)  # Drop partial mid-record prefix
+                records.extend(_read_bounded_jsonl_dicts(f))
+    except OSError:
+        pass
+
+    l2_paths: list[str] = []
+    for rec in reversed(records):
+        if rec.get("source") == "USER_EXPLICIT" or rec.get("type") == "USER_INPUT":
+            content = rec.get("content")
+            if isinstance(content, str) and (pos := content.find("<ADDITIONAL_METADATA")) >= 0:
+                if extracted := _extract_paths_from_metadata_block(content[pos:], home):
+                    l2_paths = extracted
+                    break
+
+    l3_paths = [
+        p
+        for rec in records
+        if rec.get("source") == "MODEL" or rec.get("type") == "PLANNER_RESPONSE"
+        for p in _extract_tool_call_paths(rec, home)
+    ]
+
+    ev = _AgyIdeEvidence(tuple(ws_uris), tuple(sys_cwds), tuple(l2_paths), tuple(l3_paths))
+    with _AGY_BRAIN_EVIDENCE_LOCK:
+        _AGY_BRAIN_EVIDENCE_CACHE[cache_key] = ev
+        _AGY_BRAIN_EVIDENCE_CACHE.move_to_end(cache_key)
+        while len(_AGY_BRAIN_EVIDENCE_CACHE) > _AGY_BRAIN_EVIDENCE_MAX:
+            _AGY_BRAIN_EVIDENCE_CACHE.popitem(last=False)
+    return ev
+
+
+def _classify_agy_evidence_for_workspace(
+    ev: _AgyIdeEvidence, safe_ws: str, home: Path, *, wsl: bool = False
+) -> str:
+    if not safe_ws:
+        return "unknown"
+
+    for tier_paths in (ev.ws_uris, ev.sys_cwds):
+        if tier_paths:
+            if any(_l1_matches_workspace(safe_ws, p, home, wsl=wsl) for p in tier_paths):
+                return "match"
+            if any(not _is_agy_noise_path(p, home, wsl=wsl) for p in tier_paths):
+                return "other"
+
+    if ev.l2_paths:
+        m_in = sum(1 for p in ev.l2_paths if _path_is_within_ws(p, safe_ws, wsl=wsl))
+        m_out = sum(
+            1 for p in ev.l2_paths
+            if not _path_is_within_ws(p, safe_ws, wsl=wsl) and not _is_agy_noise_path(p, home, wsl=wsl)
+        )
+        if m_in > m_out:
+            return "match"
+        if m_out > m_in:
+            return "other"
+
+    in_ws = sum(1 for p in ev.l3_paths if _path_is_within_ws(p, safe_ws, wsl=wsl))
+    out_ws = sum(
+        1 for p in ev.l3_paths
+        if not _path_is_within_ws(p, safe_ws, wsl=wsl) and not _is_agy_noise_path(p, home, wsl=wsl)
+    )
+    total = in_ws + out_ws
+    if in_ws >= 2 and total > 0 and (in_ws / total) >= 0.6:
+        return "match"
+    return "other" if (out_ws >= 2 and out_ws > in_ws) else "unknown"
+
+
+def resolve_antigravity_ide_session(
+    workspace_cwd: str,
+    *,
+    home: Path,
+    now_ts: float | None = None,
+    wsl: bool | None = None,
+    env: Mapping[str, str] | None = None,
+) -> SessionMatch | None:
+    """Match an active desktop Antigravity IDE ``brain/<cid>`` conversation to ``workspace_cwd``."""
+    eff_wsl = _effective_is_wsl(wsl, env)
+    safe_ws = _resolve_safe_local_dir(workspace_cwd, wsl=eff_wsl)
+    if not safe_ws or _is_broad_or_unsafe_workspace_dir(safe_ws, home, wsl=eff_wsl):
+        return None
+    eff_now = time.time() if now_ts is None else float(now_ts)
+
+    # Strictly isolate from CLI ~/.gemini/antigravity-cli/brain.
+    raw_cands: list[tuple[float, str, Path, Path, os.stat_result]] = []
+    seen_cids: set[str] = set()
+    for broot in (home / ".gemini" / "antigravity" / "brain", home / ".gemini" / "antigravity-ide" / "brain"):
+        real_broot = _resolve_safe_local_dir(str(broot), wsl=eff_wsl)
+        if not real_broot:
+            continue
+        try:
+            with os.scandir(real_broot) as bit:
+                for entry in bit:
+                    cid = entry.name.strip().lower()
+                    if not cid or cid.startswith(".") or cid in seen_cids:
+                        continue
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    cid_dir = Path(entry.path)
+                    logs_dir = cid_dir / ".system_generated" / "logs"
+                    tp = logs_dir / "transcript_full.jsonl"
+                    if not tp.is_file():
+                        tp = logs_dir / "transcript.jsonl"
+                        if not tp.is_file():
+                            continue
+                    try:
+                        st = tp.stat()
+                    except OSError:
+                        continue
+                    if st.st_size > 0 and (eff_now - st.st_mtime) <= _AGY_IDE_ACTIVE_WINDOW_SEC:
+                        seen_cids.add(cid)
+                        raw_cands.append((st.st_mtime, cid, cid_dir, tp, st))
+        except OSError:
+            continue
+
+    raw_cands.sort(key=lambda item: item[0], reverse=True)
+    matched = 0
+    for mtime, cid, cid_dir, tp, st in raw_cands[:64]:
+        if _is_agy_transcript_subagent(tp):
+            continue
+        matched += 1
+        ev = _load_agy_ide_evidence(cid_dir, tp, st, home)
+        if _classify_agy_evidence_for_workspace(ev, safe_ws, home, wsl=eff_wsl) == "match":
+            return SessionMatch(
+                cli="agy", session_id=cid, jsonl_path=str(tp), cwd=safe_ws, matched_by="ide_brain", jsonl_mtime=mtime
+            )
+        if matched >= _AGY_IDE_MAX_CANDIDATES:
+            break
+    return None
+
+
 def read_repo_core_files(
-    cwd: str, *, timeout_sec: float = 0.8, max_files: int = 20
+    cwd: str,
+    *,
+    timeout_sec: float = 0.8,
+    max_files: int = 20,
+    wsl: bool | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Return up to ``max_files`` core tracked basenames when ``git status`` is clean."""
-    if not cwd or not os.path.isdir(cwd):
+    eff_wsl = _effective_is_wsl(wsl, env)
+    real_cwd = _resolve_safe_local_dir(cwd, wsl=eff_wsl)
+    if not real_cwd:
         return []
-    base = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", cwd]
-    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1"}
+    base = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", real_cwd]
+    git_env = {**os.environ, "GIT_NO_LAZY_FETCH": "1"}
 
     def _run_nul(args: list[str]) -> list[str]:
         try:
@@ -2780,7 +3511,7 @@ def read_repo_core_files(
                 stderr=subprocess.DEVNULL,
                 timeout=timeout_sec,
                 check=False,
-                env=env,
+                env=git_env,
             )
         except (OSError, subprocess.TimeoutExpired):
             return []
@@ -2835,10 +3566,17 @@ def read_repo_core_files(
 
 
 def read_git_status_summary(
-    cwd: str, *, timeout_sec: float = 1.5, max_lines: int = 40
+    cwd: str,
+    *,
+    timeout_sec: float = 1.5,
+    max_lines: int = 40,
+    wsl: bool | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[str, list[str]]:
     """Run read-only ``git status --short`` (<= 1.5s timeout) and extract changed filenames."""
-    if not cwd or not os.path.isdir(cwd):
+    eff_wsl = _effective_is_wsl(wsl, env)
+    real_cwd = _resolve_safe_local_dir(cwd, wsl=eff_wsl)
+    if not real_cwd:
         return "", []
     cmd = [
         "git",
@@ -2846,7 +3584,7 @@ def read_git_status_summary(
         "-c",
         "core.fsmonitor=false",
         "-C",
-        cwd,
+        real_cwd,
         "status",
         "--short",
         "--untracked-files=normal",
@@ -3096,6 +3834,7 @@ class SessionTracker:
         self._states: dict[str, SessionState] = {}
         self._git_cache: dict[str, tuple[float, str, list[str]]] = {}
         self._repo_cache: dict[str, tuple[float, list[str]]] = {}
+        self._shallow_cache: dict[str, tuple[float, list[str]]] = {}
 
     def _has_explicit_tmux_override(self) -> bool:
         return bool(
@@ -4395,30 +5134,123 @@ class SessionTracker:
                 state.clean_turns = list(state.codex_resp_turns)
 
     def _get_git_info(self, cwd: str) -> tuple[str, list[str]]:
-        if not cwd:
+        if not cwd or is_wsl_slow_mount_path(cwd, env=self.env):
             return "", []
         now = time.monotonic()
         with self._lock:
             cached = self._git_cache.get(cwd)
             if cached is not None and (now - cached[0]) < self.git_cache_ttl_sec:
                 return cached[1], list(cached[2])
-        status_txt, hw = read_git_status_summary(cwd)
+        status_txt, hw = read_git_status_summary(cwd, env=self.env)
         with self._lock:
             self._git_cache[cwd] = (time.monotonic(), status_txt, hw)
         return status_txt, list(hw)
 
-    def _get_repo_files(self, cwd: str) -> list[str]:
-        if not cwd:
+    def _get_cached_files(
+        self, cache: dict[str, tuple[float, list[str]]], cwd: str, loader: Callable[[str], list[str]]
+    ) -> list[str]:
+        if not cwd or is_wsl_slow_mount_path(cwd, env=self.env):
             return []
         now = time.monotonic()
         with self._lock:
-            cached = self._repo_cache.get(cwd)
+            cached = cache.get(cwd)
             if cached is not None and (now - cached[0]) < self.repo_files_cache_ttl_sec:
                 return list(cached[1])
-        files = read_repo_core_files(cwd)
+        files = loader(cwd)
         with self._lock:
-            self._repo_cache[cwd] = (time.monotonic(), files)
+            cache[cwd] = (time.monotonic(), files)
         return list(files)
+
+    def _get_repo_files(self, cwd: str) -> list[str]:
+        return self._get_cached_files(self._repo_cache, cwd, lambda c: read_repo_core_files(c, env=self.env))
+
+    def _get_shallow_files(self, cwd: str) -> list[str]:
+        return self._get_cached_files(
+            self._shallow_cache, cwd, lambda c: read_workspace_shallow_files(c, home=self.home, env=self.env)
+        )
+
+    def _fallback_workspace_stems(self, cwd: str) -> list[str]:
+        files = self._get_repo_files(cwd) or self._get_shallow_files(cwd)
+        return _file_stems_for_hotwords(files, limit=12) if files else []
+
+    def active_session_cwds(self) -> list[str]:
+        with self._lock:
+            return list(dict.fromkeys(st.cwd for st in self._states.values() if st.cwd))
+
+    def build_workspace_hotwords(self, workspace_cwd: str) -> list[str]:
+        if not workspace_cwd or is_wsl_slow_mount_path(workspace_cwd, env=self.env):
+            return []
+        _, git_hw = self._get_git_info(workspace_cwd)
+        return list(git_hw[:24]) if git_hw else self._fallback_workspace_stems(workspace_cwd)
+
+    def _sync_resolved_match(
+        self,
+        eff_match: SessionMatch,
+        *,
+        include_git_info: bool = True,
+        prefer_match_cwd: bool = False,
+    ) -> SessionSnapshot:
+        with self._lock:
+            norm_path = (
+                _upgrade_agy_transcript_path(eff_match.jsonl_path)
+                if eff_match.cli == "agy"
+                else eff_match.jsonl_path
+            )
+
+            state = self._states.get(eff_match.session_key)
+            if state is None:
+                state = SessionState(
+                    session_key=eff_match.session_key,
+                    cli=eff_match.cli,
+                    session_id=eff_match.session_id,
+                    jsonl_path=norm_path,
+                    cwd=eff_match.cwd,
+                )
+                self._states[eff_match.session_key] = state
+            else:
+                if eff_match.cwd and (prefer_match_cwd or not state.cwd):
+                    state.cwd = eff_match.cwd
+                if norm_path != state.jsonl_path:
+                    self._reset_state(state, norm_path)
+
+            self._ingest_jsonl_delta(state)
+
+            eff_cwd = (eff_match.cwd if prefer_match_cwd and eff_match.cwd else state.cwd) or eff_match.cwd
+            if eff_cwd != eff_match.cwd or state.jsonl_path != eff_match.jsonl_path:
+                eff_match = replace(
+                    eff_match,
+                    jsonl_path=state.jsonl_path,
+                    cwd=eff_cwd,
+                    jsonl_mtime=_safe_mtime(state.jsonl_path) or eff_match.jsonl_mtime,
+                )
+            turns_tuple = tuple(state.clean_turns)
+            luna_idx = state.luna_synced_idx
+            gen = state.generation
+            boff = state.byte_offset
+
+        git_status, git_hw = self._get_git_info(eff_cwd) if include_git_info else ("", [])
+        repo_stems = self._fallback_workspace_stems(eff_cwd) if (include_git_info and eff_cwd and not git_hw) else []
+        turn_hw = extract_turn_hotwords(turns_tuple)
+        merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems]))
+
+        return SessionSnapshot(
+            match=eff_match,
+            clean_turns=turns_tuple,
+            luna_synced_idx=luna_idx,
+            generation=gen,
+            git_status=git_status,
+            hotwords=merged_hw,
+            byte_offset=boff,
+        )
+
+    def sync_ide_session(
+        self,
+        match: SessionMatch,
+        *,
+        include_git_info: bool = True,
+    ) -> SessionSnapshot:
+        """Incrementally ingest a matched desktop IDE conversation without touching ``sync_session``."""
+        return self._sync_resolved_match(match, include_git_info=include_git_info, prefer_match_cwd=True)
 
     def sync_session(
         self,
@@ -4444,63 +5276,7 @@ class SessionTracker:
             )
             if eff_match is None:
                 return None
-
-            norm_path = (
-                _upgrade_agy_transcript_path(eff_match.jsonl_path)
-                if eff_match.cli == "agy"
-                else eff_match.jsonl_path
-            )
-
-            state = self._states.get(eff_match.session_key)
-            if state is None:
-                state = SessionState(
-                    session_key=eff_match.session_key,
-                    cli=eff_match.cli,
-                    session_id=eff_match.session_id,
-                    jsonl_path=norm_path,
-                    cwd=eff_match.cwd,
-                )
-                self._states[eff_match.session_key] = state
-            else:
-                if eff_match.cwd and not state.cwd:
-                    state.cwd = eff_match.cwd
-                if norm_path != state.jsonl_path:
-                    self._reset_state(state, norm_path)
-
-            self._ingest_jsonl_delta(state)
-
-            eff_cwd = state.cwd or eff_match.cwd
-            if eff_cwd != eff_match.cwd or state.jsonl_path != eff_match.jsonl_path:
-                eff_match = replace(
-                    eff_match,
-                    jsonl_path=state.jsonl_path,
-                    cwd=eff_cwd,
-                    jsonl_mtime=_safe_mtime(state.jsonl_path) or eff_match.jsonl_mtime,
-                )
-            turns_tuple = tuple(state.clean_turns)
-            luna_idx = state.luna_synced_idx
-            gen = state.generation
-            boff = state.byte_offset
-
-        git_status, git_hw = self._get_git_info(eff_cwd) if include_git_info else ("", [])
-        repo_stems: list[str] = []
-        if include_git_info and eff_cwd and not git_hw:
-            for fname in self._get_repo_files(eff_cwd)[:12]:
-                stem = os.path.splitext(fname)[0]
-                if len(stem) >= 3:
-                    repo_stems.append(stem)
-        turn_hw = extract_turn_hotwords(turns_tuple)
-        merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems]))
-
-        return SessionSnapshot(
-            match=eff_match,
-            clean_turns=turns_tuple,
-            luna_synced_idx=luna_idx,
-            generation=gen,
-            git_status=git_status,
-            hotwords=merged_hw,
-            byte_offset=boff,
-        )
+        return self._sync_resolved_match(eff_match, include_git_info=include_git_info)
 
     def get_refiner_context(
         self,
@@ -4509,14 +5285,20 @@ class SessionTracker:
         max_chars: int = DEFAULT_REFINER_CONTEXT_MAX_CHARS,
         include_git_status: bool = True,
         chunk_chars: int | None = None,
+        workspace_cwd: str = "",
     ) -> tuple[list[str], str]:
         """Return ``(dialog_chunks, git_context_text)`` separated for message-boundary prefix caching."""
+        eff_ws = (
+            ""
+            if (not workspace_cwd or is_wsl_slow_mount_path(workspace_cwd, env=self.env))
+            else _resolve_safe_local_dir(workspace_cwd, wsl=_effective_is_wsl(None, self.env))
+        )
         with self._lock:
-            state = self._states.get(session_key)
-            if state is None:
+            state = self._states.get(session_key) if session_key else None
+            if state is None and not eff_ws:
                 return [], ""
-            turns_copy = list(state.clean_turns)
-            cwd = state.cwd
+            turns_copy = list(state.clean_turns) if state is not None else []
+            cwd = eff_ws or (state.cwd if state is not None else "")
 
         git_status, git_hw = (
             self._get_git_info(cwd) if include_git_status else ("", [])
@@ -4526,12 +5308,17 @@ class SessionTracker:
             if (include_git_status and cwd and not git_hw)
             else []
         )
+        shallow_files = (
+            self._get_shallow_files(cwd)
+            if (include_git_status and cwd and not git_hw and not repo_files)
+            else []
+        )
         dialog_chunks = chunk_turns_for_refiner(
             turns_copy, max_chars=max_chars, chunk_chars=chunk_chars
         )
         git_sections: list[str] = []
         if include_git_status:
-            if cwd:
+            if cwd and not is_wsl_slow_mount_path(cwd, env=self.env):
                 git_sections.append(f"cwd: {cwd}")
             if git_status:
                 git_sections.append(f"git_status:\n{git_status}")
@@ -4541,6 +5328,11 @@ class SessionTracker:
                 git_sections.append(
                     "repo_files (tracked, unchanged; spelling reference only): "
                     + ", ".join(repo_files[:20])
+                )
+            elif shallow_files:
+                git_sections.append(
+                    "workspace_files (local folder; spelling reference only): "
+                    + ", ".join(shallow_files[:20])
                 )
         return dialog_chunks, "\n\n".join(git_sections)
 

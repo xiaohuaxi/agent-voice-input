@@ -9,7 +9,9 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from . import __version__
 from .app_scope import (
+    classify_target_app_hint,
     classify_window_category,
+    is_antigravity_ide_window,
     is_remote_client_window,
     match_app_patterns,
 )
@@ -54,7 +56,13 @@ from .platform_wsl import (
     is_windows_terminal_process,
 )
 from .refiner import BaseRefiner, RefinerResult, attach_single_hop_context, create_refiner
-from .session_ctx import SessionSnapshot, SessionTracker, parse_window_title_hint
+from .session_ctx import (
+    SessionSnapshot,
+    SessionTracker,
+    parse_window_title_hint,
+    resolve_antigravity_ide_session,
+    resolve_ide_workspace_cwd,
+)
 
 
 TELEMETRY_FILENAME: str = "telemetry.jsonl"
@@ -357,6 +365,7 @@ def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
         ax_trusted=raw_ax if isinstance(raw_ax, bool) else None,
         tmux_socket=str(m.get("tmux_socket") or ""),
         tmux_pane=str(m.get("tmux_pane") or ""),
+        document=str(m.get("document") or ""),
     )
 
 
@@ -452,8 +461,10 @@ def _join_chunk_texts(parts: Sequence[str]) -> str:
     return "".join(out).strip()
 
 
-def _derive_failed_label(snap: SessionSnapshot | None, win: ForegroundWindow) -> str:
-    for cwd_cand in ((snap.match.cwd if snap else ""), win.cwd):
+def _derive_failed_label(
+    snap: SessionSnapshot | None, win: ForegroundWindow, workspace_cwd: str = ""
+) -> str:
+    for cwd_cand in ((snap.match.cwd if snap else ""), win.cwd, workspace_cwd):
         if cwd_cand and cwd_cand.strip():
             name = Path(cwd_cand.strip().rstrip("/\\")).name
             if name:
@@ -521,6 +532,8 @@ def _call_refiner_refine(
     is_cancelled: Callable[[], bool] | None,
     cancel_token: CancelToken | None = None,
     mode: str = "agent",
+    workspace_cwd: str = "",
+    target_hint: str = "",
 ) -> RefinerResult:
     try:
         params = inspect.signature(eff_refiner.refine).parameters
@@ -538,6 +551,10 @@ def _call_refiner_refine(
         kw["cancel_token"] = cancel_token
     if "mode" in params or (has_var_kw and mode != "agent"):
         kw["mode"] = mode
+    if workspace_cwd and ("workspace_cwd" in params or has_var_kw):
+        kw["workspace_cwd"] = workspace_cwd
+    if target_hint and ("target_hint" in params or has_var_kw):
+        kw["target_hint"] = target_hint
     return eff_refiner.refine(asr_res, **kw)
 
 
@@ -724,6 +741,8 @@ class _Stage1State:
     win: ForegroundWindow = field(default_factory=ForegroundWindow)
     eff_mode: str = "agent"
     snap: SessionSnapshot | None = None
+    workspace_cwd: str = ""
+    target_hint: str = ""
     asr_ctx_dialog: str = ""
     sync_ms: int = 0
     prep_ms: int = 0
@@ -862,6 +881,7 @@ def _execute_stage1(
         explicit_mode=explicit_mode,
     )
     st.eff_mode = eff_mode
+    extra_hw: list[str] = []
     if should_sync:
         st.snap = (
             tracker.sync_session(
@@ -873,15 +893,37 @@ def _execute_stage1(
             if window_title_override is None
             else tracker.sync_session(window_title=window_title_override)
         )
-    asr_ctx = tracker.build_asr_context(st.snap, mode=eff_mode)
+    elif eff_mode == "agent" and (win.process or win.bundle_id):
+        st.workspace_cwd = resolve_ide_workspace_cwd(
+            win,
+            home=tracker.home,
+            known_cwds=tracker.active_session_cwds(),
+            env=env,
+        )
+        if st.workspace_cwd and is_antigravity_ide_window(win):
+            ide_match = resolve_antigravity_ide_session(
+                st.workspace_cwd, home=tracker.home, env=env
+            )
+            if ide_match is not None:
+                st.snap = tracker.sync_ide_session(ide_match)
+        if st.snap is None and st.workspace_cwd:
+            extra_hw = tracker.build_workspace_hotwords(st.workspace_cwd)
+    elif eff_mode == "general" and (win.process or win.bundle_id):
+        st.target_hint = classify_target_app_hint(win)
+
+    asr_ctx = tracker.build_asr_context(st.snap, extra_hotwords=extra_hw, mode=eff_mode)
+    if st.target_hint:
+        asr_ctx.target_hint = st.target_hint
     st.asr_ctx_dialog = asr_ctx.dialog_text
     if _is_single_hop_asr_provider(eff_asr):
         asr_ctx = attach_single_hop_context(
             cfg,
             asr_ctx,
-            tracker=tracker if st.snap is not None else None,
+            tracker=tracker if (st.snap is not None or st.workspace_cwd) else None,
             session_key=st.snap.session_key if st.snap else "",
             mode=eff_mode,
+            workspace_cwd=st.workspace_cwd,
+            target_hint=st.target_hint,
         )
     st.sync_ms = _elapsed_ms(t_sync0)
 
@@ -975,7 +1017,7 @@ def run_pipeline_once(
             st.gate.wav_bytes,
             runtime_dir,
             duration_sec=st.gate.duration_sec,
-            label=_derive_failed_label(st.snap, st.win),
+            label=_derive_failed_label(st.snap, st.win, st.workspace_cwd),
         )
         stashed_path = str(saved) if saved is not None else ""
         return stashed_path
@@ -1055,6 +1097,8 @@ def run_pipeline_once(
                 is_cancelled=cancel_check,
                 cancel_token=cancel_token,
                 mode=st.eff_mode,
+                workspace_cwd=st.workspace_cwd,
+                target_hint=st.target_hint,
             )
             cand_text = (ref_res.text.strip() if ref_res else "") or st.asr_res.text.strip()
             if (c_rsn := _cancel_reason()) or (ref_res and ref_res.used_fallback in ("cancelled", "superseded", "shutdown")):
@@ -2132,6 +2176,7 @@ class VoiceInputDaemon:
         gate: AudioGateResult | None,
         snap: SessionSnapshot | None,
         win: ForegroundWindow,
+        workspace_cwd: str = "",
         allow_during_shutdown: bool = False,
     ) -> str:
         with task.stash_lock:
@@ -2156,7 +2201,7 @@ class VoiceInputDaemon:
                 eff_gate.wav_bytes,
                 self.runtime_dir,
                 duration_sec=eff_gate.duration_sec,
-                label=_derive_failed_label(snap, win),
+                label=_derive_failed_label(snap, win, workspace_cwd),
             )
             task.saved_audio = str(saved) if saved is not None else ""
             return task.saved_audio
@@ -2251,6 +2296,8 @@ class VoiceInputDaemon:
                     is_cancelled=cancel_fn,
                     cancel_token=task.cancel_token,
                     mode=st.eff_mode,
+                    workspace_cwd=st.workspace_cwd,
+                    target_hint=st.target_hint,
                 )
                 self._push_completed_stage1_slot(slot)
                 return
@@ -2295,6 +2342,9 @@ class VoiceInputDaemon:
             self._stage2_threads.add(th_s2)
             self._enqueue_commit_slot_locked(slot)
 
+        if not task.silent_hud and not cancel_fn():
+            self._maybe_emit_bg_main_hud("refining")
+
         try:
             th_s2.start()
         except Exception as start_exc:
@@ -2307,9 +2357,6 @@ class VoiceInputDaemon:
                 self._stage2_threads.discard(th_s2)
                 self._queue_cv.notify_all()
             return
-
-        if not task.silent_hud and not cancel_fn():
-            self._maybe_emit_bg_main_hud("refining")
 
     def _run_stage2_slot(self, slot: _CommitSlot) -> None:
         task = slot.task
@@ -2326,6 +2373,8 @@ class VoiceInputDaemon:
                 is_cancelled=cancel_fn,
                 cancel_token=task.cancel_token,
                 mode=st.eff_mode,
+                workspace_cwd=st.workspace_cwd,
+                target_hint=st.target_hint,
             )
         except Exception as exc:
             if not cancel_fn():
@@ -2355,10 +2404,15 @@ class VoiceInputDaemon:
                 audio_error=task.audio_error,
             )
 
+        def _stash_slot_wav() -> str:
+            return self._stash_task_wav_once(
+                task, gate=st.gate, snap=st.snap, win=st.win, workspace_cwd=st.workspace_cwd
+            )
+
         def _cancelled_outcome() -> tuple[dict[str, Any], str, int, str] | None:
             if self._stop_evt.is_set() or task.cancel_token.reason == "shutdown" or st.skipped_reason == "shutdown":
                 return None
-            saved_p = self._stash_task_wav_once(task, gate=st.gate, snap=st.snap, win=st.win)
+            saved_p = _stash_slot_wav()
             res_c = _make_pipeline_result(
                 task.seq_id,
                 task.audio_source,
@@ -2378,7 +2432,7 @@ class VoiceInputDaemon:
         if slot.exc is not None:
             if not task.cancel_token.try_commit():
                 return _cancelled_outcome()
-            saved_p = self._stash_task_wav_once(task, gate=st.gate, snap=st.snap, win=st.win)
+            saved_p = _stash_slot_wav()
             res_err = _make_pipeline_result(
                 task.seq_id,
                 task.audio_source,
@@ -2398,11 +2452,7 @@ class VoiceInputDaemon:
             if not task.cancel_token.try_commit():
                 return _cancelled_outcome()
             sr = st.skipped_reason
-            saved_p = (
-                self._stash_task_wav_once(task, gate=st.gate, snap=st.snap, win=st.win)
-                if sr == "empty_asr"
-                else ""
-            )
+            saved_p = _stash_slot_wav() if sr == "empty_asr" else ""
             res_skip = _make_pipeline_result(
                 task.seq_id,
                 task.audio_source,
@@ -2454,7 +2504,7 @@ class VoiceInputDaemon:
             task.cancel_token.try_commit()
 
         saved_p = (
-            self._stash_task_wav_once(task, gate=st.gate, snap=st.snap, win=st.win)
+            _stash_slot_wav()
             if (paste_out is not None and not paste_out.pasted and not paste_out.clipboard)
             else ""
         )
@@ -2675,6 +2725,7 @@ class VoiceInputDaemon:
                         "pid",
                         "tmux_socket",
                         "tmux_pane",
+                        "document",
                     )
                 )
                 else None

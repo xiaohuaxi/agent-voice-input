@@ -65,6 +65,8 @@ from .prompts import (
     SINGLE_HOP_GENERAL_SYSTEM_PROMPT,
     SINGLE_HOP_SYSTEM_PROMPT,
     SINGLE_HOP_TASK_REMINDER,
+    format_target_app_hint,
+    strip_target_hint_echo,
 )
 
 DEFAULT_USER_AGENT = "agent-voice-input/0.1"
@@ -130,6 +132,7 @@ class AsrContext:
     git_block: str = ""
     mode: str = "agent"
     single_hop_prepared: bool = False
+    target_hint: str = ""
 
 
 class CancelToken:
@@ -2221,6 +2224,7 @@ def _coerce_context(
             git_block=ctx.git_block or "",
             mode=(ctx.mode or "agent").strip().lower() or "agent",
             single_hop_prepared=bool(ctx.single_hop_prepared),
+            target_hint=(ctx.target_hint or "").strip().lower(),
         )
     if isinstance(ctx, Mapping):
         raw_hw = ctx.get("hotwords") or []
@@ -2240,6 +2244,7 @@ def _coerce_context(
             git_block=str(ctx.get("git_block") or ""),
             mode=str(ctx.get("mode") or "agent").strip().lower() or "agent",
             single_hop_prepared=bool(ctx.get("single_hop_prepared", False)),
+            target_hint=str(ctx.get("target_hint") or "").strip().lower(),
         )
     raise TypeError(f"unsupported context type: {type(ctx).__name__}")
 
@@ -2395,7 +2400,7 @@ _LITERAL_EMPTY_QUOTES = frozenset({'""', "''", "“”", "‘’", "``"})
 
 
 def _normalize_single_hop_text(raw: str) -> str:
-    cleaned = strip_lenticular_artifacts(raw).strip()
+    cleaned = strip_target_hint_echo(strip_lenticular_artifacts(raw)).strip()
     return "" if cleaned in _LITERAL_EMPTY_QUOTES else cleaned
 
 
@@ -4038,6 +4043,7 @@ class GeminiAudioProvider(BaseAsrProvider):
         parts: list[dict[str, Any]] = []
         ctx_chunks = 0
         ctx_chars = 0
+        hint_blk = format_target_app_hint(ctx.target_hint)
         if ctx.single_hop_prepared or ctx.context_blocks or ctx.git_block:
             blocks = list(ctx.context_blocks)
             ctx_chunks = len(blocks)
@@ -4045,7 +4051,7 @@ class GeminiAudioProvider(BaseAsrProvider):
             for blk in blocks:
                 parts.append({"text": blk})
             tail = "\n\n".join(
-                filter(None, [ctx.git_block, _format_vocabulary_hints(ctx.hotwords)])
+                filter(None, [ctx.git_block, _format_vocabulary_hints(ctx.hotwords), hint_blk])
             )
             if tail:
                 parts.append({"text": tail})
@@ -4053,6 +4059,8 @@ class GeminiAudioProvider(BaseAsrProvider):
             ctx_body = _compose_context_text(ctx, max_chars=16000)
             if ctx_body:
                 parts.append({"text": f"<session_context>\n{ctx_body}\n</session_context>"})
+            if hint_blk:
+                parts.append({"text": hint_blk})
         parts.append(
             {
                 "inlineData": {
@@ -4463,6 +4471,7 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
 
         ctx_chunks = 0
         ctx_chars = 0
+        hint_blk = format_target_app_hint(ctx.target_hint)
         if ctx.single_hop_prepared or ctx.context_blocks or ctx.git_block:
             blocks = list(ctx.context_blocks)
             ctx_chunks = len(blocks)
@@ -4477,7 +4486,7 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                 for idx, blk in enumerate(blocks)
             ]
             tail = "\n\n".join(
-                filter(None, [ctx.git_block, _format_vocabulary_hints(ctx.hotwords)])
+                filter(None, [ctx.git_block, _format_vocabulary_hints(ctx.hotwords), hint_blk])
             )
             user_content: list[dict[str, Any]] = [
                 *ctx_parts,
@@ -4492,9 +4501,10 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                 if ctx_body
                 else "<session_context>\n</session_context>"
             )
-            # Anti-hijacking sandwich: <session_context> -> input_audio -> <task_reminder>
+            # Anti-hijacking sandwich: <session_context> -> <target_app_hint> -> input_audio -> <task_reminder>
             user_content = [
                 {"type": "text", "text": session_tag},
+                *([{"type": "text", "text": hint_blk}] if hint_blk else []),
                 {"type": "input_audio", "input_audio": audio_obj},
                 {"type": "text", "text": CHAT_AUDIO_TASK_REMINDER},
             ]

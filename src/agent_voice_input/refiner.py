@@ -79,6 +79,7 @@ from .config import (
     redact_secrets,
     resolve_credentials,
 )
+from .platform_wsl import _callable_accepts_kwarg
 from .prompts import (
     CODEX_NO_TOOLS_NOTE,
     REFINER_AGENT_MODE_ADDENDUM,
@@ -87,6 +88,8 @@ from .prompts import (
     REFINER_GENERAL_SYSTEM_PROMPT,
     REFINER_SYSTEM_PROMPT,
     REFINER_TASK_REMINDER,
+    format_target_app_hint,
+    strip_target_hint_echo,
 )
 from .session_ctx import SessionTracker
 
@@ -207,6 +210,8 @@ def _unpack(asr_input: AsrResult | str) -> tuple[str, bool]:
 
 def _clean_out(text: str, fallback: str = "") -> str:
     cleaned = strip_lenticular_artifacts(text).strip()
+    if cleaned and "<target_app_hint" not in fallback.lower() and "</target_app_hint>" not in fallback.lower():
+        cleaned = strip_target_hint_echo(cleaned).strip()
     if cleaned and "<asr_draft_to_clean>" not in fallback and "</asr_draft_to_clean>" not in fallback:
         if cleaned.startswith("<asr_draft_to_clean>"):
             cleaned = cleaned.removeprefix("<asr_draft_to_clean>").strip()
@@ -325,10 +330,14 @@ def format_workspace_git_block(git_context: str) -> str:
     return ""
 
 
-def build_final_refiner_block(draft_text: str, *, git_context: str = "") -> str:
+def build_final_refiner_block(
+    draft_text: str, *, git_context: str = "", target_hint: str = ""
+) -> str:
     parts: list[str] = []
     if git_blk := format_workspace_git_block(git_context):
         parts.append(git_blk)
+    if hint_blk := format_target_app_hint(target_hint):
+        parts.append(hint_blk)
     parts.append(f"<asr_draft_to_clean>\n{draft_text.strip()}\n</asr_draft_to_clean>")
     parts.append(REFINER_TASK_REMINDER)
     return "\n".join(parts)
@@ -340,17 +349,18 @@ def build_refiner_context_chunks(
     session_key: str = "",
     tracker: SessionTracker | None = None,
     fallback_context: str = "",
+    workspace_cwd: str = "",
 ) -> tuple[list[str], str]:
     max_chars = max(0, int(cfg.refiner.context_max_chars))
     include_git = bool(cfg.refiner.include_git_status)
     raw_chunks: list[str] = []
     git_ctx = ""
-    if tracker is not None and session_key:
-        raw_chunks, git_ctx = tracker.get_refiner_context(
-            session_key,
-            max_chars=max_chars,
-            include_git_status=include_git,
-        )
+    if tracker is not None and (session_key or workspace_cwd):
+        ctx_kw: dict[str, Any] = {"max_chars": max_chars, "include_git_status": include_git}
+        if workspace_cwd and _callable_accepts_kwarg(tracker.get_refiner_context, "workspace_cwd"):
+            ctx_kw["workspace_cwd"] = workspace_cwd
+        if session_key or "workspace_cwd" in ctx_kw:
+            raw_chunks, git_ctx = tracker.get_refiner_context(session_key, **ctx_kw)
     if not raw_chunks and max_chars > 0 and fallback_context.strip():
         if not (tracker is not None and session_key and tracker.get_state(session_key) is not None):
             fb_trimmed = strip_lenticular_artifacts(fallback_context).strip()
@@ -368,8 +378,11 @@ def attach_single_hop_context(
     tracker: SessionTracker | None = None,
     session_key: str = "",
     mode: str = "agent",
+    workspace_cwd: str = "",
+    target_hint: str = "",
 ) -> AsrContext:
     eff_mode = (mode or "agent").strip().lower() or "agent"
+    eff_hint = (target_hint or base_ctx.target_hint or "").strip().lower()
     if eff_mode == "general":
         return replace(
             base_ctx,
@@ -379,12 +392,14 @@ def attach_single_hop_context(
             git_block="",
             mode="general",
             single_hop_prepared=True,
+            target_hint=eff_hint,
         )
     context_blocks, git_ctx = build_refiner_context_chunks(
         cfg,
         session_key=session_key,
         tracker=tracker,
         fallback_context=base_ctx.dialog_text,
+        workspace_cwd=workspace_cwd,
     )
     return replace(
         base_ctx,
@@ -394,6 +409,7 @@ def attach_single_hop_context(
         git_block=format_workspace_git_block(git_ctx),
         mode=eff_mode,
         single_hop_prepared=True,
+        target_hint=eff_hint,
     )
 
 
@@ -405,16 +421,21 @@ def build_refiner_request_blocks(
     tracker: SessionTracker | None = None,
     fallback_context: str = "",
     mode: str = "agent",
+    workspace_cwd: str = "",
+    target_hint: str = "",
 ) -> tuple[list[str], str]:
     if mode == "general":
-        return [], build_final_refiner_block(clean_draft, git_context="")
+        return [], build_final_refiner_block(clean_draft, git_context="", target_hint=target_hint)
     context_blocks, git_ctx = build_refiner_context_chunks(
         cfg,
         session_key=session_key,
         tracker=tracker,
         fallback_context=fallback_context,
+        workspace_cwd=workspace_cwd,
     )
-    return context_blocks, build_final_refiner_block(clean_draft, git_context=git_ctx)
+    return context_blocks, build_final_refiner_block(
+        clean_draft, git_context=git_ctx, target_hint=target_hint
+    )
 
 
 def build_refiner_envelope(context_delta: str, draft_text: str) -> str:
@@ -869,6 +890,8 @@ class BaseRefiner:
         is_cancelled: Callable[[], bool] | None = None,
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
+        workspace_cwd: str = "",
+        target_hint: str = "",
     ) -> RefinerResult:
         raise NotImplementedError
 
@@ -970,6 +993,8 @@ class NoopRefiner(BaseRefiner):
         is_cancelled: Callable[[], bool] | None = None,
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
+        workspace_cwd: str = "",
+        target_hint: str = "",
     ) -> RefinerResult:
         draft, single_hop = _unpack(asr_input)
         if single_hop and isinstance(asr_input, AsrResult):
@@ -1637,6 +1662,8 @@ class OpenAIResponsesRefiner(BaseRefiner):
         is_cancelled: Callable[[], bool] | None = None,
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
+        workspace_cwd: str = "",
+        target_hint: str = "",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model(self.provider_name)
         if self.provider_name == "openai-compatible":
@@ -1670,10 +1697,15 @@ class OpenAIResponsesRefiner(BaseRefiner):
             tracker=tracker,
             fallback_context=fallback_context,
             mode=mode,
+            workspace_cwd=workspace_cwd,
+            target_hint=target_hint,
         )
         ctx_chunks = len(context_blocks)
         ctx_chars = sum(len(b) for b in context_blocks)
-        session_uuid = _derive_session_uuid(session_key, self._default_session_uuid)
+        session_uuid = _derive_session_uuid(
+            session_key or (f"ws:{workspace_cwd}" if workspace_cwd else ""),
+            self._default_session_uuid,
+        )
         instructions = _compose_codex_instructions(resolve_refiner_prompt(self.cfg, mode=mode))
         tsec = effective_refiner_timeout_sec(self.cfg.refiner.timeout_sec, len(clean_draft))
 
@@ -2299,6 +2331,8 @@ class GeminiRefiner(_HttpTransportRefiner):
         is_cancelled: Callable[[], bool] | None = None,
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
+        workspace_cwd: str = "",
+        target_hint: str = "",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model("gemini")
         gen_cfg = build_gemini_generation_config(
@@ -2328,6 +2362,8 @@ class GeminiRefiner(_HttpTransportRefiner):
             tracker=tracker,
             fallback_context=fallback_context,
             mode=mode,
+            workspace_cwd=workspace_cwd,
+            target_hint=target_hint,
         )
         ctx_chunks, ctx_chars = len(context_blocks), sum(len(b) for b in context_blocks)
         payload = {
@@ -2412,6 +2448,8 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
         is_cancelled: Callable[[], bool] | None = None,
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
+        workspace_cwd: str = "",
+        target_hint: str = "",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model(self.provider_name)
         if self.provider_name == "openai-compatible":
@@ -2446,6 +2484,8 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
             tracker=tracker,
             fallback_context=fallback_context,
             mode=mode,
+            workspace_cwd=workspace_cwd,
+            target_hint=target_hint,
         )
         ctx_chunks, ctx_chars = len(context_blocks), sum(len(b) for b in context_blocks)
         bps = set(openrouter_cache_breakpoints(self.provider_name, model, ctx_chunks))

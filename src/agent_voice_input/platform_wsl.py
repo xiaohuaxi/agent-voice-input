@@ -62,6 +62,7 @@ class ForegroundWindow:
     ax_trusted: bool | None = None
     tmux_socket: str = ""
     tmux_pane: str = ""
+    document: str = ""
 
     @property
     def app_name(self) -> str:
