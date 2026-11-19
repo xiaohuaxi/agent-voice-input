@@ -6,7 +6,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, _remote_probe
+from .remote_ssh import RemoteSshManager, resolve_ssh_executable
 from .asr_providers import (
     GEMINI_DEFAULT_BASE_URL,
     HttpRequest,
@@ -611,6 +612,7 @@ def _cmd_doctor(
     env: dict[str, str],
     *,
     ping: bool = False,
+    remote_ping: bool = False,
     as_json: bool = False,
     transport: HttpTransport | None = None,
 ) -> int:
@@ -636,6 +638,7 @@ def _cmd_doctor(
         _emit(f"            Fix: {safe_fix}")
 
     fg_title, fg_tty, fg_cwd, fg_pid = "", "", "", 0
+    fg_process, fg_bundle_id, fg_document = "", "", ""
     _emit(f"[python]    OK ({sys.version.split()[0]}, runtime={rt_dir})")
     _emit(f"[config]    {cfg.config_path or 'defaults (no config.toml)'}")
     seen_env_inodes: set[tuple[int, int]] = set()
@@ -673,6 +676,9 @@ def _cmd_doctor(
         fg_tty = str(m.get("fg_tty") or "")
         fg_cwd = str(m.get("fg_cwd") or "")
         fg_pid = int(m.get("fg_pid") or 0)
+        fg_process = str(m.get("fg_process") or "")
+        fg_bundle_id = str(m.get("fg_bundle_id") or "")
+        fg_document = str(m.get("fg_document") or "")
         devs = m.get("audio_devices") or []
         devs_str = ", ".join(devs) if devs else "none listed (check mic device or grant Microphone permission)"
         is_ssh_env = any(str(env.get(k) or "").strip() for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"))
@@ -752,6 +758,7 @@ def _cmd_doctor(
         platform_kind = "wsl2"
         w = probe_wsl_host(cfg, env)
         fg_title = str(w.get("fg_title") or "")
+        fg_process = str(w.get("fg_process") or "")
         ps_ok = bool(w.get("powershell_ok"))
         pulse_ok = bool(w.get("pulse_rdp_ok"))
         winmm_n = int(w.get("winmm_devs") or 0)
@@ -825,16 +832,51 @@ def _cmd_doctor(
     else:
         _emit("[daemon]    stopped (start via 'agent-voice-input start')")
 
-    match = SessionTracker(env=env, runtime_dir=rt_dir).resolve_session(
+    match = SessionTracker(env=env, runtime_dir=rt_dir, remote_cfg=cfg.remote).resolve_session(
         fg_title,
         window_tty=fg_tty,
         window_cwd=fg_cwd,
         window_pid=fg_pid,
+        window_process=fg_process,
+        bundle_id=fg_bundle_id,
+        document=fg_document,
     )
     _emit(
         f"[session]   {match.session_key + ' (' + match.matched_by + ')' if match else 'none matched (will use empty context)'}"
     )
     _emit(f"[hooks]     {_inspect_hook_summary(env, rt_dir)}")
+
+    remote_ssh_ok: bool | None = None
+    resolved_default_ssh = ""
+    if not cfg.remote.hosts:
+        _emit('[remote]    off (optional: set [remote] hosts = ["<host>"] in config.toml for SSH Linux sessions)')
+    else:
+        missing_bins: list[str] = []
+        resolved_bins: list[str] = []
+        for h_cfg in cfg.remote.hosts:
+            raw_sb = h_cfg.ssh_bin or cfg.remote.ssh_bin or "ssh"
+            exe_sb = resolve_ssh_executable(raw_sb, env=env)
+            if exe_sb:
+                if exe_sb not in resolved_bins:
+                    resolved_bins.append(exe_sb)
+            elif raw_sb not in missing_bins:
+                missing_bins.append(raw_sb)
+        resolved_default_ssh = resolved_bins[0] if resolved_bins else ""
+        host_names_csv = ", ".join(h.name for h in cfg.remote.hosts)
+        if missing_bins:
+            remote_ssh_ok = False
+            ok_all = False
+            _emit(
+                f"[remote]    FAIL hosts=[{host_names_csv}] missing ssh_bin={', '.join(missing_bins)}"
+            )
+            _emit_fix(
+                'install openssh-client or set remote.ssh_bin = "ssh.exe" on WSL2'
+            )
+        else:
+            remote_ssh_ok = True
+            _emit(
+                f"[remote]    OK hosts=[{host_names_csv}] (timeout_ms={cfg.remote.timeout_ms}, ssh={resolved_default_ssh})"
+            )
 
     raw_ref_prov = cfg.refiner.provider.strip().lower()
     if raw_ref_prov in ("none", "false", "0", "disabled"):
@@ -947,6 +989,30 @@ def _cmd_doctor(
             if st_ref == "FAIL":
                 ok_all = False
 
+    if ping or remote_ping:
+        if not cfg.remote.hosts:
+            if remote_ping:
+                _emit("[ping]      remote: skipped (no [remote] hosts configured in config.toml)")
+                ping_results["remote"] = {}
+        elif remote_ssh_ok:
+            rem_ping_map: dict[str, dict[str, Any]] = {}
+            rm_doc = RemoteSshManager(cfg.remote, env=env, runtime_dir=rt_dir)
+            try:
+                for h_cfg in cfg.remote.hosts:
+                    st_rm, ms_rm, msg_rm = rm_doc.probe_host_ping(h_cfg, timeout_sec=3.0)
+                    rem_ping_map[h_cfg.name] = {
+                        "ssh_target": h_cfg.ssh_target,
+                        "status": st_rm,
+                        "latency_ms": ms_rm,
+                        "detail": _clean(msg_rm),
+                    }
+                    _emit(f"[ping]      remote({h_cfg.name}): {msg_rm}")
+                    if st_rm == "FAIL":
+                        ok_all = False
+            finally:
+                rm_doc.close()
+            ping_results["remote"] = rem_ping_map
+
     if as_json:
         def _redact_json_obj(val: Any) -> Any:
             if isinstance(val, str):
@@ -977,6 +1043,13 @@ def _cmd_doctor(
                 "model": eff_ref_model,
                 "bypassed": bool(asr_is_single_hop and not cfg.refiner.force_on_single_hop and raw_ref_prov != "off"),
             },
+            "remote": {
+                "enabled": cfg.remote.enabled,
+                "hosts": [h.name for h in cfg.remote.hosts],
+                "timeout_ms": cfg.remote.timeout_ms,
+                "ssh_bin": resolved_default_ssh or cfg.remote.ssh_bin,
+                "ssh_bin_ok": remote_ssh_ok,
+            },
             "session": (
                 {"session_key": match.session_key, "matched_by": match.matched_by}
                 if match is not None
@@ -985,7 +1058,7 @@ def _cmd_doctor(
             "fixes": fixes,
             "lines": lines_out,
         }
-        if ping:
+        if ping or remote_ping:
             report["ping"] = ping_results
         print(json.dumps(_redact_json_obj(report), ensure_ascii=False, indent=2))
 
@@ -1005,7 +1078,12 @@ def _run_wav_or_live(
     force_print: bool = False,
 ) -> int:
     rt_dir = get_runtime_dir(env, create=True)
-    plat = None if (wav_file and dry_run and title is not None) else create_platform(cfg, env=env)
+    is_native_linux = sys.platform == "linux" and not is_wsl(env)
+    plat = (
+        None
+        if (wav_file and dry_run and (title is not None or is_native_linux))
+        else create_platform(cfg, env=env)
+    )
     try:
         win = ForegroundWindow(0, "", title or "") if plat is None else plat.get_foreground_window()
         if wav_file:
@@ -1568,6 +1646,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run lightweight 5s online connectivity & auth checks for active endpoints",
     )
     p_doc.add_argument(
+        "--remote",
+        action="store_true",
+        dest="remote_ping",
+        help="Probe SSH connectivity and python3 readiness for configured [remote] hosts",
+    )
+    p_doc.add_argument(
         "--json",
         action="store_true",
         dest="as_json",
@@ -1616,6 +1700,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_hook = sub.add_parser("session-hook", help="Update terminal OSC 2 title and session registry from Agent hook stdin")
     p_hook.add_argument("--cli", choices=("auto", "claude", "agy", "gemini"), default="auto", help="Source Agent CLI type")
     p_hook.add_argument("--quiet", action="store_true", help="Suppress JSON '{}' stdout (e.g. when called from statusline)")
+    p_rctx = sub.add_parser("remote-ctx", help="Execute local read-only remote session probe from stdin JSON")
+    p_rctx.add_argument("--raw-json", action="store_true", help="Emit plain UTF-8 JSON instead of framed gzip")
     return parser
 
 
@@ -1623,6 +1709,18 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.subcmd == "session-hook":
         return run_session_hook(cli_mode=args.cli, quiet_stdout=args.quiet)
+    if args.subcmd == "remote-ctx":
+        raw_in = sys.stdin.buffer.read(131072)
+        req_obj = json.loads(raw_in.decode("utf-8")) if raw_in.strip() else {}
+        resp_obj = _remote_probe.run_probe(req_obj if isinstance(req_obj, Mapping) else {})
+        if args.raw_json or (isinstance(req_obj, Mapping) and req_obj.get("raw_json")):
+            sys.stdout.buffer.write(
+                json.dumps(resp_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+            )
+        else:
+            sys.stdout.buffer.write(_remote_probe.pack_probe_stdout(resp_obj))
+        sys.stdout.buffer.flush()
+        return 0
     if args.subcmd == "init":
         try:
             return _cmd_init(config_path=getattr(args, "config", None), force=bool(args.force))
@@ -1713,6 +1811,7 @@ def main(argv: list[str] | None = None) -> int:
                 cfg,
                 env,
                 ping=bool(getattr(args, "ping", False)),
+                remote_ping=bool(getattr(args, "remote_ping", False)),
                 as_json=bool(getattr(args, "as_json", False)),
             )
         if args.subcmd == "key-test":

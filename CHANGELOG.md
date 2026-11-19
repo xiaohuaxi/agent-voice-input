@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Zero-install SSH remote Linux session context routing (`[remote]`)**: Added stateless `ssh ... -- <target> python3 -` remote context probing (`_remote_probe.py` & `remote_ssh.py`) requiring zero remote daemon or pip installation across Claude Code, Codex CLI, Gemini CLI, and Antigravity CLI. Supports Tier 1 `[@host]` + `[#id8]`/`[§id8]`/UUID session lookup and Tier 2 `cwd`-scoped matching (selecting the latest `mtime` session within the same directory while blocking cross-directory crosstalk), non-Git shallow workspace filename fallback, broad privacy root refusal (`~`, `/`, `/tmp`, `/home`), ETag `not_modified` short-circuiting, forward-anchored `50K` whole-chunk eviction (`trim_turns_chunk_aligned`) for byte-identical LLM prefix caching, `start_recording` async prefetching with `400ms` release budget, per-host circuit breakers, WSL2 `ssh.exe` path resolution, `doctor [--remote|--ping]` health checks, `remote-ctx` CLI helper, and `integrations/remote/remote-title-hook.sh`.
+
+### Fixed
+- **Phase 0 foreground SSH & Remote IDE crosstalk isolation**: Added a pre-resolution Remote Veto Gate blocking local background CLI, `tmux`, and disk sessions from leaking into dedicated SSH clients (`PuTTY`, Windows `KiTTY`, `MobaXterm`, `WindTerm`, `SecureCRT`, `Xshell`, `Termius`), remote shell/SSH window titles (`user@host:path`, `[@host]`, `ssh ...`), foreground `ssh` processes on local TTYs/`tmux` panes, and Remote-SSH IDEs (`[SSH: host]`, `vscode-remote://ssh-remote+...`); tightened unscoped non-generic title affinity and stale registry TTY verification; and added zero-popup TCC preflight (`AEDeterminePermissionToAutomateTarget`) for macOS `iTerm2` session TTY lookup.
+
 ## [0.10.0] - 2026-11-19
 
 ### Added

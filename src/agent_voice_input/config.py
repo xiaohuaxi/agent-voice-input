@@ -182,6 +182,114 @@ _NON_SECRET_ENV_SUFFIXES = (
 
 _UNSET: Any = object()
 
+_SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$")
+_HOST_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_BARE_SSH_BIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+_SSH_CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _validate_ssh_bin_str(raw: Any, field_name: str, *, allow_empty: bool = False) -> str:
+    s = _as_str(raw, field_name).strip()
+    if not s:
+        if allow_empty:
+            return ""
+        raise ConfigError(f"{field_name} must not be empty")
+    if _SSH_CTRL_CHAR_RE.search(s):
+        raise ConfigError(f"{field_name}: control characters are not allowed")
+    if s.startswith("-"):
+        raise ConfigError(f"{field_name} must not start with '-': {raw!r}")
+    if "/" not in s and "\\" not in s and not s.startswith("~"):
+        if not _BARE_SSH_BIN_RE.match(s):
+            raise ConfigError(f"{field_name}: invalid executable name {raw!r}")
+    return s
+
+
+@dataclass(frozen=True)
+class RemoteHostConfig:
+    name: str
+    ssh_target: str
+    aliases: tuple[str, ...] = ()
+    ssh_bin: str = ""
+    timeout_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ssh_target, str) or not _SSH_TARGET_RE.match(self.ssh_target.strip()):
+            raise ConfigError(
+                f"remote.hosts.ssh_target: invalid SSH target {self.ssh_target!r} "
+                "(must match ^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$ and never start with '-')"
+            )
+        clean_target = self.ssh_target.strip()
+        raw_name = (self.name or "").strip().lower().rstrip(".")
+        if not raw_name:
+            raw_name = clean_target.rsplit("@", 1)[-1].lower().rstrip(".")
+        if not _HOST_ALIAS_RE.match(raw_name):
+            raise ConfigError(
+                f"remote.hosts.name: invalid host identifier {self.name!r} "
+                "(must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$)"
+            )
+        if isinstance(self.aliases, (list, tuple)):
+            raw_aliases = self.aliases
+        else:
+            raise ConfigError("remote.hosts.aliases: expected array of strings")
+        norm_aliases: list[str] = []
+        for item in raw_aliases:
+            if not isinstance(item, str):
+                raise ConfigError(f"remote.hosts.aliases: expected string, got {item!r}")
+            al = item.strip().lower().rstrip(".")
+            if not al:
+                continue
+            if not _HOST_ALIAS_RE.match(al):
+                raise ConfigError(f"remote.hosts.aliases: invalid alias {item!r}")
+            if al != raw_name and al not in norm_aliases:
+                norm_aliases.append(al)
+        clean_bin = _validate_ssh_bin_str(
+            self.ssh_bin, "remote.hosts.ssh_bin", allow_empty=True
+        )
+        object.__setattr__(self, "name", raw_name)
+        object.__setattr__(self, "ssh_target", clean_target)
+        object.__setattr__(self, "aliases", tuple(norm_aliases))
+        object.__setattr__(self, "ssh_bin", clean_bin)
+
+
+@dataclass
+class RemoteConfig:
+    hosts: tuple[RemoteHostConfig, ...] = ()
+    timeout_ms: int = 400
+    ssh_bin: str = "ssh"
+
+    def __post_init__(self) -> None:
+        if isinstance(self.hosts, list):
+            self.hosts = tuple(self.hosts)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.hosts)
+
+    def lookup_host(self, tag_or_host: str) -> RemoteHostConfig | None:
+        """Look up a whitelisted ``RemoteHostConfig`` by name, alias, target host, or unique short label."""
+        if not self.hosts or not tag_or_host:
+            return None
+        raw = tag_or_host.strip().lower().rstrip(".")
+        if "@" in raw:
+            raw = raw.rsplit("@", 1)[-1].strip()
+        if not raw or not _HOST_ALIAS_RE.match(raw):
+            return None
+        for h in self.hosts:
+            target_host = h.ssh_target.rsplit("@", 1)[-1].lower().rstrip(".")
+            if raw == h.name or raw in h.aliases or raw == target_host:
+                return h
+        if "." not in raw:
+            short_hits = [
+                h
+                for h in self.hosts
+                if h.name.split(".", 1)[0] == raw
+                or h.ssh_target.rsplit("@", 1)[-1].lower().split(".", 1)[0] == raw
+                or any(a.split(".", 1)[0] == raw for a in h.aliases)
+            ]
+            if len(short_hits) == 1:
+                return short_hits[0]
+        return None
+
 
 @dataclass
 class HotkeyConfig:
@@ -393,6 +501,7 @@ class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     refiner: RefinerConfig = field(default_factory=RefinerConfig)
+    remote: RemoteConfig = field(default_factory=RemoteConfig)
     config_path: str | None = None
 
 
@@ -1169,12 +1278,13 @@ def _scan_toml_single_line_delim(src: str, pos: int, target: str) -> int:
 
 
 def _parse_simple_toml(text: str) -> dict[str, Any]:
-    """Pure-stdlib TOML parser for Python 3.10 fallback (supports multiline strings & arrays)."""
+    """Pure-stdlib TOML parser for Python 3.10 fallback (supports multiline strings, arrays, & [[array.of.tables]])."""
     if text.startswith("\ufeff"):
         text = text[1:]
     root: dict[str, Any] = {}
     current_table: dict[str, Any] = root
     explicit_tables: set[tuple[str, ...]] = set()
+    array_of_tables_ids: set[int] = set()
 
     pos = 0
     n = len(text)
@@ -1186,7 +1296,54 @@ def _parse_simple_toml(text: str) -> dict[str, Any]:
 
         if text[pos] == "[":
             if text.startswith("[[", pos):
-                raise ConfigError(f"line {lineno}: array of tables [[...]] is not supported")
+                close_idx = _scan_toml_single_line_delim(text, pos + 2, "]")
+                if close_idx == -1 or close_idx + 1 >= n or text[close_idx + 1] != "]":
+                    line_end = text.find("\n", pos)
+                    snippet = (text[pos:] if line_end == -1 else text[pos:line_end]).rstrip("\r").strip()
+                    raise ConfigError(f"line {lineno}: invalid array-of-tables header {snippet!r}")
+                header_body = text[pos + 2 : close_idx].strip()
+                path_parts = _parse_toml_key_path(header_body, lineno)
+                pos = _expect_toml_eol_or_eof(text, close_idx + 2)
+                path_tuple = tuple(path_parts)
+                if path_tuple in explicit_tables:
+                    raise ConfigError(
+                        f"line {lineno}: cannot redefine table [{header_body}] as array of tables"
+                    )
+                node = root
+                for part in path_parts[:-1]:
+                    existing = node.get(part)
+                    if existing is None:
+                        nxt_aot: dict[str, Any] = {}
+                        node[part] = nxt_aot
+                        node = nxt_aot
+                    elif isinstance(existing, dict):
+                        node = existing
+                    elif isinstance(existing, list) and id(existing) in array_of_tables_ids:
+                        node = existing[-1]
+                    else:
+                        raise ConfigError(
+                            f"line {lineno}: cannot traverse non-table key {part!r} in [[{header_body}]]"
+                        )
+                leaf_key = path_parts[-1]
+                leaf_existing = node.get(leaf_key)
+                if leaf_existing is None:
+                    arr_list: list[dict[str, Any]] = []
+                    array_of_tables_ids.add(id(arr_list))
+                    node[leaf_key] = arr_list
+                elif isinstance(leaf_existing, list) and id(leaf_existing) in array_of_tables_ids:
+                    arr_list = leaf_existing
+                else:
+                    raise ConfigError(
+                        f"line {lineno}: cannot redefine key {leaf_key!r} as array of tables"
+                    )
+                for p_ex in list(explicit_tables):
+                    if len(p_ex) > len(path_tuple) and p_ex[: len(path_tuple)] == path_tuple:
+                        explicit_tables.discard(p_ex)
+                new_elem: dict[str, Any] = {}
+                arr_list.append(new_elem)
+                current_table = new_elem
+                continue
+
             close_idx = _scan_toml_single_line_delim(text, pos + 1, "]")
             if close_idx == -1:
                 line_end = text.find("\n", pos)
@@ -1198,9 +1355,8 @@ def _parse_simple_toml(text: str) -> dict[str, Any]:
             path_tuple = tuple(path_parts)
             if path_tuple in explicit_tables:
                 raise ConfigError(f"line {lineno}: duplicate table [{header_body}]")
-            explicit_tables.add(path_tuple)
             node = root
-            for part in path_parts:
+            for idx_p, part in enumerate(path_parts):
                 existing = node.get(part)
                 if existing is None:
                     nxt: dict[str, Any] = {}
@@ -1208,10 +1364,17 @@ def _parse_simple_toml(text: str) -> dict[str, Any]:
                     node = nxt
                 elif isinstance(existing, dict):
                     node = existing
+                elif (
+                    idx_p < len(path_parts) - 1
+                    and isinstance(existing, list)
+                    and id(existing) in array_of_tables_ids
+                ):
+                    node = existing[-1]
                 else:
                     raise ConfigError(
-                        f"line {lineno}: cannot redefine scalar key {part!r} as table"
+                        f"line {lineno}: cannot redefine key {part!r} as table"
                     )
+            explicit_tables.add(path_tuple)
             current_table = node
             continue
 
@@ -1396,8 +1559,71 @@ def _as_app_patterns(val: Any, name: str = "hotkey.ignore_apps") -> tuple[str, .
     return tuple(dict.fromkeys(out))
 
 
+def _parse_remote_hosts_value(raw_hosts: Any) -> tuple[RemoteHostConfig, ...]:
+    if not isinstance(raw_hosts, (list, tuple)):
+        raise ConfigError(
+            f"remote.hosts: expected array of host strings or [[remote.hosts]] tables, got {type(raw_hosts).__name__}"
+        )
+    parsed: list[RemoteHostConfig] = []
+    for idx, item in enumerate(raw_hosts):
+        if isinstance(item, RemoteHostConfig):
+            parsed.append(item)
+        elif isinstance(item, str):
+            s = item.strip()
+            if not s:
+                raise ConfigError(f"remote.hosts[{idx}] must not be empty")
+            parsed.append(RemoteHostConfig(name="", ssh_target=s))
+        elif isinstance(item, Mapping):
+            allowed_keys = {"name", "ssh_target", "aliases", "ssh_bin"}
+            for hk in item:
+                if hk not in allowed_keys:
+                    raise ConfigError(f"unknown remote.hosts[{idx}] option {hk!r}")
+            raw_name = item.get("name")
+            raw_target = item.get("ssh_target")
+            name_str = _as_str(raw_name, f"remote.hosts[{idx}].name").strip() if raw_name is not None else ""
+            target_str = (
+                _as_str(raw_target, f"remote.hosts[{idx}].ssh_target").strip()
+                if raw_target is not None
+                else name_str
+            )
+            if not target_str:
+                raise ConfigError(
+                    f"remote.hosts[{idx}] must specify 'name' or 'ssh_target'"
+                )
+            raw_aliases = item.get("aliases")
+            if raw_aliases is None:
+                aliases_tup: tuple[str, ...] = ()
+            elif isinstance(raw_aliases, (list, tuple)):
+                aliases_tup = tuple(
+                    _as_str(a, f"remote.hosts[{idx}].aliases") for a in raw_aliases
+                )
+            else:
+                raise ConfigError(
+                    f"remote.hosts[{idx}].aliases: expected array of strings, got {type(raw_aliases).__name__}"
+                )
+            raw_sbin = item.get("ssh_bin")
+            sbin_str = (
+                _validate_ssh_bin_str(raw_sbin, f"remote.hosts[{idx}].ssh_bin", allow_empty=True)
+                if raw_sbin is not None
+                else ""
+            )
+            parsed.append(
+                RemoteHostConfig(
+                    name=name_str,
+                    ssh_target=target_str,
+                    aliases=aliases_tup,
+                    ssh_bin=sbin_str,
+                )
+            )
+        else:
+            raise ConfigError(
+                f"remote.hosts[{idx}]: expected string or table, got {type(item).__name__}"
+            )
+    return tuple(parsed)
+
+
 def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
-    allowed_top = {"hotkey", "ui", "audio", "asr", "refiner"}
+    allowed_top = {"hotkey", "ui", "audio", "asr", "refiner", "remote"}
     for k in data:
         if k not in allowed_top:
             raise ConfigError(f"unknown top-level config section {k!r}")
@@ -1608,6 +1834,22 @@ def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
                 cfg.refiner.base_url = ""
             if not has_explicit_ref_key_env:
                 cfg.refiner.api_key_env = ""
+
+    rem = data.get("remote")
+    if rem is not None:
+        if not isinstance(rem, Mapping):
+            raise ConfigError("[remote] must be a table/object")
+        for k, v in rem.items():
+            if v is None:
+                continue
+            if k == "hosts":
+                cfg.remote.hosts = _parse_remote_hosts_value(v)
+            elif k == "timeout_ms":
+                cfg.remote.timeout_ms = _as_int(v, "remote.timeout_ms")
+            elif k == "ssh_bin":
+                cfg.remote.ssh_bin = _validate_ssh_bin_str(v, "remote.ssh_bin")
+            else:
+                raise ConfigError(f"unknown remote option {k!r}")
 
 
 def _expand_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1997,6 +2239,27 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
         or not (0 <= cfg.refiner.max_retries <= 10)
     ):
         raise ConfigError("refiner.max_retries must satisfy 0 <= max_retries <= 10")
+
+    if (
+        isinstance(cfg.remote.timeout_ms, bool)
+        or not isinstance(cfg.remote.timeout_ms, int)
+        or not (0 <= cfg.remote.timeout_ms <= 10000)
+    ):
+        raise ConfigError("remote.timeout_ms must satisfy 0 <= timeout_ms <= 10000")
+    cfg.remote.ssh_bin = _validate_ssh_bin_str(cfg.remote.ssh_bin, "remote.ssh_bin")
+    cfg.remote.hosts = _parse_remote_hosts_value(cfg.remote.hosts)
+    seen_remote_keys: dict[str, str] = {}
+    for h in cfg.remote.hosts:
+        for key_label in (h.name, *h.aliases):
+            prev_owner = seen_remote_keys.get(key_label)
+            if prev_owner is not None and prev_owner != h.name:
+                raise ConfigError(
+                    f"remote.hosts: duplicate host name or alias {key_label!r} "
+                    f"(shared by {prev_owner!r} and {h.name!r})"
+                )
+            seen_remote_keys[key_label] = h.name
+        if seen_remote_keys.get(h.name) == h.name and sum(1 for x in cfg.remote.hosts if x.name == h.name) > 1:
+            raise ConfigError(f"remote.hosts: duplicate host name {h.name!r}")
 
 
 def _load_config_file(path: Path) -> dict[str, Any]:

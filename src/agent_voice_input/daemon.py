@@ -55,6 +55,7 @@ from .platform_wsl import (
     PasteOutcome,
     WslPlatform,
     is_windows_terminal_process,
+    is_wsl,
 )
 from .refiner import BaseRefiner, RefinerResult, attach_single_hop_context, create_refiner
 from .session_ctx import (
@@ -359,7 +360,13 @@ def merge_recent_results(
 
 
 def create_platform(cfg: Config, *, env: Mapping[str, str] | None = None) -> WslPlatform | MacOSPlatform:
-    return MacOSPlatform(cfg, env=env) if sys.platform == "darwin" else WslPlatform(cfg, env=env)
+    if sys.platform == "darwin":
+        return MacOSPlatform(cfg, env=env)
+    if sys.platform == "linux" and not is_wsl(env):
+        raise RuntimeError(
+            "Linux desktop host is not yet supported (use macOS or Windows+WSL2 as local voice host)"
+        )
+    return WslPlatform(cfg, env=env)
 
 
 def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
@@ -894,15 +901,37 @@ def _execute_stage1(
     st.eff_mode = eff_mode
     extra_hw: list[str] = []
     if should_sync:
+        sync_fn = tracker.sync_session
+        try:
+            sync_params = inspect.signature(sync_fn).parameters
+            accepts_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sync_params.values()
+            )
+        except (TypeError, ValueError):
+            sync_params = {}
+            accepts_var_kw = False
+        extra_sync_kw: dict[str, Any] = {}
+        if accepts_var_kw or "window_process" in sync_params:
+            extra_sync_kw["window_process"] = win.process
+        if accepts_var_kw or "bundle_id" in sync_params:
+            extra_sync_kw["bundle_id"] = win.bundle_id
+        if accepts_var_kw or "document" in sync_params:
+            extra_sync_kw["document"] = win.document
+        if cancel_check is not None and (accepts_var_kw or "cancel_token" in sync_params):
+            extra_sync_kw["cancel_token"] = cancel_check
         st.snap = (
-            tracker.sync_session(
+            sync_fn(
                 window_title=win.title,
                 window_tty=win.tty,
                 window_cwd=win.cwd,
                 window_pid=win.pid,
+                **extra_sync_kw,
             )
             if window_title_override is None
-            else tracker.sync_session(window_title=window_title_override)
+            else sync_fn(
+                window_title=window_title_override,
+                **{k: v for k, v in extra_sync_kw.items() if k == "cancel_token"},
+            )
         )
     elif eff_mode == "agent" and (win.process or win.bundle_id):
         st.workspace_cwd = resolve_ide_workspace_cwd(
@@ -999,7 +1028,13 @@ def run_pipeline_once(
 ) -> PipelineResult:
     eff_env = os.environ if env is None else env
     eff_creds = creds or resolve_credentials(cfg, eff_env)
-    eff_tracker = tracker or SessionTracker(env=eff_env)
+    owns_tracker = tracker is None
+    eff_tracker = tracker or SessionTracker(
+        env=eff_env,
+        runtime_dir=runtime_dir,
+        remote_cfg=cfg.remote,
+        context_max_chars=cfg.refiner.context_max_chars,
+    )
     eff_asr = asr_provider or create_asr_provider(cfg, eff_creds, env=eff_env)
     owns_refiner = refiner is None
     eff_refiner = refiner or create_refiner(cfg, eff_creds, env=env, runtime_dir=runtime_dir)
@@ -1170,6 +1205,8 @@ def run_pipeline_once(
     finally:
         if owns_refiner:
             eff_refiner.close()
+        if owns_tracker and (tr_cl := getattr(eff_tracker, "close", None)) is not None:
+            tr_cl()
         if local_archive_threads:
             wait_recording_archives(local_archive_threads, timeout_sec=2.0)
 
@@ -1238,7 +1275,24 @@ class VoiceInputDaemon:
         self.creds = resolve_credentials(cfg, self.env)
         self.runtime_dir = ensure_secure_dir(runtime_dir or get_runtime_dir(self.env, create=True))
         self.platform = platform or create_platform(cfg, env=self.env)
-        self.tracker = tracker or SessionTracker(env=self.env, runtime_dir=self.runtime_dir)
+        if tracker is None:
+            self.tracker = SessionTracker(
+                env=self.env,
+                runtime_dir=self.runtime_dir,
+                remote_cfg=cfg.remote,
+                context_max_chars=cfg.refiner.context_max_chars,
+            )
+        else:
+            self.tracker = tracker
+            if (cfg_rem := getattr(tracker, "configure_remote", None)) is not None:
+                if cfg.remote.enabled:
+                    cfg_rem(
+                        cfg.remote,
+                        runtime_dir=self.runtime_dir,
+                        context_max_chars=cfg.refiner.context_max_chars,
+                    )
+                elif cfg.refiner.context_max_chars != getattr(tracker, "context_max_chars", cfg.refiner.context_max_chars):
+                    tracker.context_max_chars = max(1000, int(cfg.refiner.context_max_chars))
         self.asr_provider = asr_provider or create_asr_provider(cfg, self.creds, env=self.env)
         ref_env: Mapping[str, str] | None = self.env if env is not None else None
         self.resolved_refiner_provider = select_refiner_provider(cfg, self.creds, ref_env)
@@ -1896,10 +1950,12 @@ class VoiceInputDaemon:
                 now = self.clock_fn()
                 resume_state = "idle"
                 stop_hud_stage = "recognizing"
+                cancelled_rec_seq = -1
                 if action == "ptt_cancel":
                     if not self._recording_active:
                         return {"ok": True, "state": self.state, "seq_id": self.seq_id}
                     eff_silent = bool(silent_hud or self._cur_silent_hud)
+                    cancelled_rec_seq = self._recording_seq_id
                     self._recording_active = False
                     self._recording_seq_id = -1
                     self._cur_no_paste, self._cur_silent_hud = False, False
@@ -1958,6 +2014,7 @@ class VoiceInputDaemon:
 
             if mode == "cancel":
                 self._cancel_max_duration_timer()
+                self._cancel_remote_prefetch(seq_id=cancelled_rec_seq if cancelled_rec_seq > 0 else None)
                 if not eff_silent:
                     resume_state = self._emit_recording_cancel_hud(show_cancelled_toast=False)
                 self.platform.cancel_recording()
@@ -2009,6 +2066,8 @@ class VoiceInputDaemon:
                     with self._lock:
                         if self._recording_active and self._recording_seq_id == cur_seq:
                             self._origin_win = win_now
+                    if not eff_loopback:
+                        self._maybe_prefetch_remote(win_now, seq_id=cur_seq)
                     self._arm_max_duration_timer(cur_seq)
                     return {"ok": True, "state": "recording", "seq_id": cur_seq}
                 except Exception as exc:
@@ -2174,6 +2233,7 @@ class VoiceInputDaemon:
 
             if cancel_rec_mode:
                 self._cancel_max_duration_timer()
+                self._cancel_remote_prefetch(seq_id=cancelled_rec_seq)
                 if not eff_rec_silent:
                     resume_state = self._emit_recording_cancel_hud(show_cancelled_toast=True)
                 self.platform.cancel_recording()
@@ -2194,6 +2254,8 @@ class VoiceInputDaemon:
             )
             cancelled_ids = [tok_to_task[tok].seq_id for tok in cancelled_toks]
             committed_ids = [tok_to_task[tok].seq_id for tok in committed_toks]
+            for cid in cancelled_ids:
+                self._cancel_remote_prefetch(seq_id=cid)
             any_visible_cancelled = any(not tok_to_task[tok].silent_hud for tok in cancelled_toks)
             cancelled_set = set(cancelled_ids)
 
@@ -2731,8 +2793,64 @@ class VoiceInputDaemon:
             if play_beep:
                 self.platform.beep(play_beep)
 
+    def _maybe_prefetch_remote(self, win: ForegroundWindow, *, seq_id: int) -> None:
+        if not self.cfg.remote.enabled:
+            return
+        pref_fn = getattr(self.tracker, "prefetch_remote_session", None)
+        if pref_fn is None:
+            return
+        try:
+            should_sync, _ = _resolve_pipeline_window_routing(
+                win,
+                platform=self.platform,
+                origin_window=win,
+                window_title_override=None,
+                audio_source="live",
+                explicit_mode="auto",
+            )
+            if not should_sync:
+                return
+            inc_git = bool(self.cfg.refiner.include_git_status)
+
+            def _do_prefetch() -> None:
+                with self._lock:
+                    if self._stop_evt.is_set() or (
+                        self._recording_seq_id != seq_id
+                        and not self._is_seq_inflight_locked(seq_id)
+                        and self.seq_id != seq_id
+                    ):
+                        return
+                pref_fn(
+                    win.title,
+                    window_tty=win.tty,
+                    window_cwd=win.cwd,
+                    window_pid=win.pid,
+                    window_process=win.process,
+                    bundle_id=win.bundle_id,
+                    document=win.document,
+                    seq_id=seq_id,
+                    include_git_info=inc_git,
+                )
+
+            rm = getattr(self.tracker, "remote_manager", None)
+            if rm is not None and hasattr(rm, "spawn_async_task"):
+                rm.spawn_async_task(_do_prefetch, seq_id=seq_id)
+            else:
+                _do_prefetch()
+        except Exception:
+            pass
+
+    def _cancel_remote_prefetch(self, *, seq_id: int | None = None) -> None:
+        cancel_fn = getattr(self.tracker, "cancel_remote_prefetch", None)
+        if cancel_fn is not None:
+            try:
+                cancel_fn(seq_id=seq_id)
+            except Exception:
+                pass
+
     def _initiate_shutdown(self) -> list[threading.Thread]:
         self._cancel_max_duration_timer()
+        self._cancel_remote_prefetch(seq_id=None)
         tokens_to_abort: list[CancelToken] = []
         cancelled_to_stash: list[tuple[_QueuedUtterance, AudioGateResult | None, SessionSnapshot | None, ForegroundWindow]] = []
         bg_threads: list[threading.Thread] = []
@@ -2813,6 +2931,10 @@ class VoiceInputDaemon:
                 }
                 if shim_err:
                     resp["shim_error"] = shim_err
+                if self.cfg.remote.enabled and (rm := getattr(self.tracker, "remote_manager", None)) is not None:
+                    bs = rm.breaker_snapshot()
+                    if bs:
+                        resp["remote_hosts"] = bs
                 mem_snap = [dict(r) for r in self.recent_results] if want_hist else []
             if want_hist:
                 disk_items = read_telemetry_history(
@@ -2979,6 +3101,11 @@ class VoiceInputDaemon:
                 self.sock_path.unlink(missing_ok=True)
                 self.pid_path.unlink(missing_ok=True)
             self.refiner.close()
+            if (tr_close := getattr(self.tracker, "close", None)) is not None:
+                try:
+                    tr_close()
+                except Exception:
+                    pass
             join_deadline = time.monotonic() + 3.0
             cur_th = threading.current_thread()
             for th in bg_threads:

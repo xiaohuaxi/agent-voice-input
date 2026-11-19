@@ -31,6 +31,7 @@ from typing import Any, BinaryIO, Callable, Collection, Iterable, Iterator, Mapp
 import urllib.parse
 import uuid
 
+from ._remote_probe import trim_turns_chunk_aligned
 from ._tmux import (
     _MAX_TMUX_SOCKET_TARGETS,
     _TMUX_PANE_ID_RE,
@@ -48,9 +49,19 @@ from ._tmux import (
     probe_tmux_snapshot,
     resolve_tmux_bin,
 )
-from .app_scope import parse_ide_window_title
+from .app_scope import is_remote_ide_window, parse_ide_window_title
 from .asr_providers import AsrContext
-from .config import ensure_secure_dir, get_runtime_dir
+from .config import RemoteConfig, RemoteHostConfig, ensure_secure_dir, get_runtime_dir
+from .remote_ssh import (
+    RemoteForegroundInfo,
+    RemoteSshManager,
+    collect_local_hostnames,
+    detect_remote_foreground,
+    extract_local_prompt_cwd,
+    extract_ssh_target_from_argv,
+    parse_window_host_tag,
+    strip_host_tags_from_title,
+)
 
 MAX_META_LINE_BYTES = 16 * 1024 * 1024  # 16 MiB safety cap per metadata/ingest line
 MAX_INGEST_LINE_BYTES = 16 * 1024 * 1024
@@ -65,7 +76,21 @@ _PREFIXED_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 _HASH_TAG_RE = re.compile(
-    r"\[#([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{8,36})\](?=$|[^0-9A-Za-z_])"
+    r"\[[#§]([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{6,36})\](?=$|[^0-9A-Za-z_])"
+)
+_WIN_EXPLICIT_NON_WSL_TITLE_RE = re.compile(
+    r"^(?:Administrator:\s+|管理员:\s*)?(?:Command Prompt|命令提示符|PS\s+[A-Za-z]:\\|[A-Za-z]:\\)",
+    re.IGNORECASE,
+)
+_GENERIC_LOCAL_TERM_TITLE_RE = re.compile(
+    r"^(?:\[\d+/\d+\]\s+|\d+:\d+(?:\.\d+)?\*?\s+|[\u25cf\u2022*]\s+)*"
+    r"(?:-?(?:bash|zsh|fish|sh|dash|ash|ksh|tcsh|csh|nu|pwsh|powershell|login)"
+    r"|windows\s+powershell|windows\s+terminal|terminal|ghostty|iterm2?|alacritty|kitty"
+    r"|wezterm|warp|konsole|gnome[- ]terminal|foot|tilix|terminator"
+    r"|ubuntu(?:[- ][0-9.]+)?(?:\s+lts)?|debian(?:[- ][0-9.]+)?|arch(?:\s*linux)?|fedora"
+    r"|kali(?:\s*linux)?|alpine|nixos|opensuse|wsl2?|linux)"
+    r"(?:\s*(?:[—–-]|\s)\s*\d+\s*[×x]\s*\d+)?\s*$",
+    re.IGNORECASE,
 )
 _FULL_UUID_RE = re.compile(
     r"(?:^|[^0-9a-fA-F-])([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?=$|[^0-9a-fA-F-])"
@@ -132,21 +157,27 @@ class TitleHint:
     is_full_uuid: bool
     cli: str | None = None
     explicit_cli: bool = False
+    host_tag: str | None = None
 
 
 @dataclass(frozen=True)
 class SessionMatch:
-    cli: str  # "codex" | "claude" | "agy"
+    cli: str  # "codex" | "claude" | "agy" | "workspace" | "remote"
     session_id: str
     jsonl_path: str
     cwd: str = ""
-    matched_by: str = ""  # "registry" | "title_uuid" | "title_prefix" | "tmux_registry" | "tmux_pane_title" | "tmux_proc_scan" | "tty_registry" | "tty_ps" | "proc_scan" | "recent_root"
+    matched_by: str = ""  # "registry" | "title_uuid" | "title_prefix" | "tmux_registry" | "tmux_pane_title" | "tmux_proc_scan" | "tty_registry" | "tty_ps" | "proc_scan" | "recent_root" | "remote_*"
     pts_mtime: float = 0.0
     jsonl_mtime: float = 0.0
     thread_name: str = ""
+    origin: str = "local"
+    host_name: str = ""
+    remote_title: str = ""
 
     @property
     def session_key(self) -> str:
+        if self.origin == "remote" and self.host_name:
+            return f"remote:{self.host_name}:{self.cli}:{self.session_id}"
         return f"{self.cli}:{self.session_id}"
 
 
@@ -170,6 +201,16 @@ class SessionState:
     codex_item_turns: list[tuple[str, str]] = field(default_factory=list)
     codex_resp_turns: list[tuple[str, str]] = field(default_factory=list)
     claude_just_compacted: bool = False
+    is_remote: bool = False
+    host_name: str = ""
+    remote_etag: str = ""
+    remote_max_chars: int = 0
+    remote_evicted_chunks: int = 0
+    remote_compaction_count: int = 0
+    remote_git_status: str = ""
+    remote_git_hotwords: list[str] = field(default_factory=list)
+    remote_repo_files: list[str] = field(default_factory=list)
+    remote_shallow_files: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -205,7 +246,10 @@ def parse_window_title_hint(window_title: str) -> TitleHint | None:
     if not window_title or not window_title.strip():
         return None
 
-    prefixed_matches = list(_PREFIXED_TAG_RE.finditer(window_title))
+    host_tag, _, _ = parse_window_host_tag(window_title)
+    clean_title = strip_host_tags_from_title(window_title)
+
+    prefixed_matches = list(_PREFIXED_TAG_RE.finditer(clean_title))
     if prefixed_matches:
         m = prefixed_matches[-1]
         cli = m.group(1).lower()
@@ -215,26 +259,29 @@ def parse_window_title_hint(window_title: str) -> TitleHint | None:
             is_full_uuid=bool(_STRICT_UUID_RE.match(tok)),
             cli=cli,
             explicit_cli=True,
+            host_tag=host_tag,
         )
 
-    hash_matches = list(_HASH_TAG_RE.finditer(window_title))
+    hash_matches = list(_HASH_TAG_RE.finditer(clean_title))
     if hash_matches:
         tok = hash_matches[-1].group(1).lower()
         return TitleHint(
             session_token=tok,
             is_full_uuid=bool(_STRICT_UUID_RE.match(tok)),
-            cli=_infer_cli_word_from_title(window_title),
+            cli=_infer_cli_word_from_title(clean_title),
             explicit_cli=False,
+            host_tag=host_tag,
         )
 
-    uuid_matches = list(_FULL_UUID_RE.finditer(window_title))
+    uuid_matches = list(_FULL_UUID_RE.finditer(clean_title))
     if uuid_matches:
         tok = uuid_matches[-1].group(1).lower()
         return TitleHint(
             session_token=tok,
             is_full_uuid=True,
-            cli=_infer_cli_word_from_title(window_title) or "codex",
+            cli=_infer_cli_word_from_title(clean_title) or "codex",
             explicit_cli=False,
+            host_tag=host_tag,
         )
 
     return None
@@ -261,6 +308,8 @@ def normalize_tty_path(raw_tty: str) -> str:
         if norm.startswith("/dev/tty") and norm != "/dev/tty":
             return norm
         return ""
+    if s.startswith("/") and os.path.basename(s).lower().startswith(("pts", "tty")) and os.path.exists(s):
+        return "/" + "/".join(part for part in s.split("/") if part)
     if s.startswith("pts/") and len(s) > 4:
         return f"/dev/{s}"
     if s.startswith("tty") and len(s) > 3:
@@ -1126,6 +1175,22 @@ def _read_proc_ppid(proc_pid_dir: Path) -> int:
     except (OSError, ValueError):
         pass
     return 0
+
+
+def _read_proc_stat_state_pgrp_tpgid(proc_pid_dir: Path) -> tuple[str, int, int]:
+    """Return ``(proc_state_char, pgrp, tpgid)`` from ``/proc/<pid>/stat``."""
+    try:
+        stat_txt = (proc_pid_dir / "stat").read_text(encoding="utf-8", errors="replace")
+        rpar = stat_txt.rfind(")")
+        if rpar != -1:
+            fields_after = stat_txt[rpar + 2 :].split()
+            if len(fields_after) >= 6:
+                return fields_after[0], int(fields_after[2]), int(fields_after[5])
+            if len(fields_after) >= 3:
+                return fields_after[0], int(fields_after[2]), 0
+    except (OSError, ValueError):
+        pass
+    return "", 0, 0
 
 
 def _collect_descendant_pids(proc_root: Path, root_pids: Sequence[int]) -> set[int]:
@@ -2200,6 +2265,33 @@ def _lookup_in_registry_detailed(
     return hits[0][3], False
 
 
+def _collect_stale_registry_ttys(
+    hint: TitleHint,
+    runtime_dirs: Sequence[Path],
+) -> set[str]:
+    """Collect exact TTY identifiers recorded on dead local registry entries matching ``hint``."""
+    prefix8 = hint.session_token[:8].lower()
+    clis = (hint.cli,) if (hint.explicit_cli and hint.cli) else _ordered_clis(hint.cli)
+    ttys: set[str] = set()
+    for _dir_idx, sdir in _iter_trusted_sessions_dirs(runtime_dirs):
+        for cli in clis:
+            if not cli:
+                continue
+            rec = _read_trusted_registry_json(sdir / f"{cli}-{prefix8}.json")
+            if rec is None:
+                continue
+            sid = str(rec.get("session_id") or "").strip().lower()
+            if not sid or not sid.startswith(hint.session_token):
+                continue
+            raw_tty = str(rec.get("tty") or "").strip()
+            if raw_tty and raw_tty not in ("?", "??", "-", "/dev/tty", "/dev/null"):
+                ttys.add(raw_tty)
+                norm_t = normalize_tty_path(raw_tty)
+                if norm_t:
+                    ttys.add(norm_t)
+    return ttys
+
+
 def _collect_live_claimed_claude_sids(
     runtime_dirs: Sequence[Path],
     proc_root: Path | None,
@@ -3154,12 +3246,10 @@ def _has_git_marker(dir_path: str) -> bool:
 def _is_inside_git_worktree(dir_path: str, *, home: Path | None = None, max_depth: int = 12) -> bool:
     cur = _normalize_cwd(dir_path)
     for _ in range(max_depth + 1):
-        if not cur:
+        if not cur or _is_broad_or_unsafe_workspace_dir(cur, home):
             return False
         if _has_git_marker(cur):
             return True
-        if _is_broad_or_unsafe_workspace_dir(cur, home):
-            return False
         parent = os.path.dirname(cur)
         if not parent or parent == cur:
             return False
@@ -3339,6 +3429,8 @@ def resolve_ide_workspace_cwd(
     env: Mapping[str, str] | None = None,
 ) -> str:
     """Resolve local IDE workspace directory (Git repo or ordinary folder) without directory recursion."""
+    if is_remote_ide_window(win):
+        return ""
     eff_wsl = _effective_is_wsl(wsl, env)
     title_info = parse_ide_window_title(win)
     if title_info is not None and title_info.remote_kind == "remote":
@@ -4066,6 +4158,10 @@ class SessionTracker:
         tmux_socket: str | Path | None = None,
         tmux_socket_name: str | None = None,
         tmux_probe_fn: Callable[[], TmuxServerSnapshot] | None = None,
+        remote_cfg: RemoteConfig | None = None,
+        local_hostnames: Iterable[str] | None = None,
+        remote_manager: RemoteSshManager | None = None,
+        context_max_chars: int = DEFAULT_REFINER_CONTEXT_MAX_CHARS,
     ) -> None:
         self.env = os.environ if env is None else env
         self.home = (
@@ -4082,6 +4178,7 @@ class SessionTracker:
         self.proc_root = Path(proc_root) if proc_root is not None else None
         self.git_cache_ttl_sec = git_cache_ttl_sec
         self.repo_files_cache_ttl_sec = repo_files_cache_ttl_sec
+        self.context_max_chars = max(1000, int(context_max_chars))
         self._tmux_socket = str(tmux_socket).strip() if tmux_socket is not None else ""
         self._tmux_socket_name = (tmux_socket_name or "").strip()
         self._tmux_probe_fn = tmux_probe_fn
@@ -4090,6 +4187,56 @@ class SessionTracker:
         self._git_cache: dict[str, tuple[float, str, list[str]]] = {}
         self._repo_cache: dict[str, tuple[float, list[str]]] = {}
         self._shallow_cache: dict[str, tuple[float, list[str]]] = {}
+        self._remote_files_cache: dict[tuple[str, str], tuple[float, list[str], list[str]]] = {}
+        self._custom_local_hostnames: tuple[str, ...] | None = (
+            tuple(local_hostnames) if local_hostnames is not None else None
+        )
+        self.remote_cfg: RemoteConfig = remote_cfg if remote_cfg is not None else RemoteConfig()
+        self.remote_manager: RemoteSshManager = (
+            remote_manager
+            if remote_manager is not None
+            else RemoteSshManager(self.remote_cfg, env=self.env, runtime_dir=self.runtime_dir)
+        )
+        self._rebuild_local_hostnames()
+
+    def _rebuild_local_hostnames(self) -> None:
+        remote_names: list[str] = []
+        for h in self.remote_cfg.hosts:
+            remote_names.append(h.name)
+            remote_names.extend(h.aliases)
+            t_host = h.ssh_target.rsplit("@", 1)[-1].lower()
+            if t_host:
+                remote_names.append(t_host)
+        is_synthetic = self.proc_root != Path("/proc")
+        self._local_hostnames: frozenset[str] = collect_local_hostnames(
+            self.env,
+            extra=self._custom_local_hostnames,
+            include_synthetic_defaults=(is_synthetic and self._custom_local_hostnames is None),
+            include_mac_placeholder=(self.proc_root is None and self._custom_local_hostnames is None),
+            configured_remote_names=remote_names,
+        )
+
+    def configure_remote(
+        self,
+        remote_cfg: RemoteConfig,
+        *,
+        runtime_dir: Path | None = None,
+        local_hostnames: Iterable[str] | None = None,
+        context_max_chars: int | None = None,
+    ) -> None:
+        with self._lock:
+            self.remote_cfg = remote_cfg
+            if runtime_dir is not None:
+                self.runtime_dir = Path(runtime_dir)
+            if local_hostnames is not None:
+                self._custom_local_hostnames = tuple(local_hostnames)
+            if context_max_chars is not None:
+                self.context_max_chars = max(1000, int(context_max_chars))
+            self._rebuild_local_hostnames()
+            self.remote_manager.update_config(remote_cfg, runtime_dir=self.runtime_dir)
+
+    def close(self) -> None:
+        self.remote_manager.close()
 
     def _has_explicit_tmux_override(self) -> bool:
         return bool(
@@ -4807,6 +4954,331 @@ class SessionTracker:
             )
         return True
 
+    def _filter_by_title_affinity(
+        self,
+        candidates: Sequence[SessionMatch],
+        eff_title: str,
+        *,
+        scoped: bool = False,
+    ) -> list[SessionMatch]:
+        if not candidates or not eff_title:
+            return list(candidates)
+        s_title = eff_title.strip()
+        if not s_title:
+            return list(candidates)
+        if _WIN_EXPLICIT_NON_WSL_TITLE_RE.match(s_title):
+            return []
+        local_prompt_cwd = extract_local_prompt_cwd(s_title, self._local_hostnames)
+        if scoped and local_prompt_cwd is None:
+            return list(candidates)
+        if not scoped and _GENERIC_LOCAL_TERM_TITLE_RE.match(s_title):
+            return list(candidates)
+        cli_word = _infer_cli_word_from_title(s_title)
+        if _WORD_TMUX_RE.search(s_title) or _TUI_SPINNER_RE.search(s_title):
+            return list(candidates)
+        if local_prompt_cwd is not None and cli_word:
+            return list(candidates)
+        expanded = (
+            _expand_home_prefix(local_prompt_cwd, self.home)
+            if local_prompt_cwd is not None
+            else ""
+        )
+        title_low = s_title.lower()
+        return [
+            c
+            for c in candidates
+            if (local_prompt_cwd is None and cli_word and c.cli == cli_word)
+            or (
+                c.cwd
+                and (
+                    (expanded and _cwd_match_rank(expanded, c.cwd, self.home) > 0)
+                    or (local_prompt_cwd != "~" and _dir_basename_in_title(s_title, c.cwd))
+                )
+            )
+            or (
+                c.thread_name
+                and len(c.thread_name) >= 2
+                and c.thread_name.lower() in title_low
+            )
+        ]
+
+    def _tmux_target_matches_unscoped_title(
+        self,
+        eff_title: str,
+        active_pane: TmuxPaneInfo,
+        pane_hit: SessionMatch | None,
+    ) -> bool:
+        s_title = (eff_title or "").strip()
+        if not s_title or _GENERIC_LOCAL_TERM_TITLE_RE.match(s_title):
+            return True
+        if _WIN_EXPLICIT_NON_WSL_TITLE_RE.match(s_title):
+            return False
+        if (
+            _WORD_TMUX_RE.search(s_title)
+            or _TUI_SPINNER_RE.search(s_title)
+            or _infer_cli_word_from_title(s_title)
+        ):
+            return True
+        title_low = s_title.lower()
+        ptitle_low = (active_pane.pane_title or "").strip().lower()
+        if len(ptitle_low) >= 2 and ptitle_low in title_low:
+            return True
+        local_prompt_cwd = extract_local_prompt_cwd(s_title, self._local_hostnames)
+        if local_prompt_cwd is not None:
+            expanded = _expand_home_prefix(local_prompt_cwd, self.home)
+            for p_cwd in (active_pane.current_path, pane_hit.cwd if pane_hit else ""):
+                if p_cwd and (
+                    _cwd_match_rank(expanded, p_cwd, self.home) > 0
+                    or (local_prompt_cwd != "~" and _dir_basename_in_title(s_title, p_cwd))
+                ):
+                    return True
+            return False
+        for p_cwd in (active_pane.current_path, pane_hit.cwd if pane_hit else ""):
+            if p_cwd and _dir_basename_in_title(s_title, p_cwd):
+                return True
+        if (
+            pane_hit is not None
+            and pane_hit.thread_name
+            and len(pane_hit.thread_name) >= 2
+            and pane_hit.thread_name.lower() in title_low
+        ):
+            return True
+        return False
+
+    def _find_proc_ssh_target_in_pids(self, pids: Iterable[int]) -> str | None:
+        if self.proc_root is None or not self.proc_root.is_dir():
+            return None
+        pid_list = [p for p in pids if p > 0]
+        if not pid_list:
+            return None
+        active_clis: list[tuple[int, int, int]] = []
+        active_sshs: list[tuple[int, int, int, str]] = []
+        for pid in pid_list:
+            pdir = self.proc_root / str(pid)
+            st_ch, pgrp, tpgid = _read_proc_stat_state_pgrp_tpgid(pdir)
+            if st_ch in ("T", "t", "Z"):
+                continue
+            if _classify_proc_cli(pdir) is not None:
+                active_clis.append((pid, pgrp, tpgid))
+                continue
+            argv = _read_proc_cmdline_args(pdir)
+            if not argv:
+                continue
+            host_cand, is_inter = extract_ssh_target_from_argv(argv)
+            if is_inter:
+                active_sshs.append((pid, pgrp, tpgid, host_cand))
+        if not active_sshs:
+            return None
+        # Foreground process group (`pgrp == tpgid`) beats backgrounded CLI on the same TTY
+        fg_sshs = [s for s in active_sshs if s[2] > 0 and s[1] == s[2]]
+        fg_clis = [c for c in active_clis if c[2] > 0 and c[1] == c[2]]
+        if fg_sshs and not fg_clis:
+            for _pid, _pgrp, _tpgid, h_cand in fg_sshs:
+                if h_cand:
+                    return h_cand
+            return ""
+        if active_clis:
+            return None
+        for _pid, _pgrp, _tpgid, h_cand in active_sshs:
+            if h_cand:
+                return h_cand
+        return ""
+
+    def _find_tty_ssh_target(
+        self,
+        norm_tty: str,
+        *,
+        has_proc: bool,
+        darwin_ps_rows: Sequence[tuple[int, int, str, str, list[str]]] | None = None,
+    ) -> str | None:
+        if not norm_tty:
+            return None
+        if has_proc and self.proc_root is not None:
+            tty_pids: list[int] = []
+            for pdir in _iter_numeric_proc_dirs(self.proc_root):
+                ptty = _read_proc_tty_path(pdir) or _readlink_clean(pdir / "fd" / "0")
+                if ptty and _tty_matches(ptty, norm_tty):
+                    tty_pids.append(int(pdir.name))
+            return self._find_proc_ssh_target_in_pids(tty_pids)
+        if self.proc_root is None:
+            return None
+        rows: list[tuple[int, int, str, str, list[str]]] = []
+        if darwin_ps_rows is not None:
+            rows = [r for r in darwin_ps_rows if r[3] and _tty_matches(r[3], norm_tty)]
+        else:
+            tty_arg = norm_tty[5:] if norm_tty.startswith("/dev/") else norm_tty
+            try:
+                r = subprocess.run(
+                    ["ps", "-ww", "-o", "pid=,ppid=,stat=,tty=,args=", "-t", tty_arg],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1.0,
+                    check=False,
+                )
+                rows = [
+                    row
+                    for row in _parse_ps_table(r.stdout.decode("utf-8", errors="ignore"))
+                    if not row[3] or _tty_matches(row[3], norm_tty)
+                ]
+            except (OSError, subprocess.SubprocessError):
+                return None
+        active_cli_rows: list[str] = []
+        active_ssh_rows: list[tuple[bool, str]] = []
+        for _pid, _ppid, stat_s, _rtty, argv in rows:
+            if "T" in stat_s or "Z" in stat_s:
+                continue
+            a0 = os.path.basename(argv[0].replace("\\", "/")).lstrip("-").lower() if argv else ""
+            if _classify_interactive_cli(a0, argv) is not None:
+                active_cli_rows.append(stat_s)
+                continue
+            host_cand, is_inter = extract_ssh_target_from_argv(argv)
+            if is_inter:
+                active_ssh_rows.append(("+" in stat_s, host_cand))
+        if not active_ssh_rows:
+            return None
+        fg_ssh = [h for is_fg, h in active_ssh_rows if is_fg]
+        has_fg_cli = any("+" in st for st in active_cli_rows)
+        if fg_ssh and not has_fg_cli:
+            for h in fg_ssh:
+                if h:
+                    return h
+            return ""
+        if active_cli_rows:
+            return None
+        for _is_fg, h in active_ssh_rows:
+            if h:
+                return h
+        return ""
+
+    def _find_unscoped_proc_ssh_target(
+        self,
+        *,
+        window_title: str,
+        excluded_pids: set[int],
+        local_cands: Sequence[SessionMatch],
+    ) -> str | None:
+        """When WSL2/Linux lacks window_tty & window_pid, veto local crosstalk if an SSH tab has newer TTY activity."""
+        if not local_cands or self.proc_root is None or not self.proc_root.is_dir():
+            return None
+        wtitle = (window_title or "").strip()
+        if wtitle:
+            if _WIN_EXPLICIT_NON_WSL_TITLE_RE.match(wtitle):
+                return None
+            if _infer_cli_word_from_title(wtitle) or _TUI_SPINNER_RE.search(wtitle):
+                return None
+            title_low = wtitle.lower()
+            if any(
+                (c.cwd and _dir_basename_in_title(wtitle, c.cwd))
+                or (c.thread_name and len(c.thread_name) >= 2 and c.thread_name.lower() in title_low)
+                for c in local_cands
+            ):
+                return None
+            if extract_local_prompt_cwd(wtitle, self._local_hostnames) is not None:
+                return None
+
+        cli_ttys: set[str] = set()
+        ssh_by_tty: dict[str, float] = {}
+        for pdir in _iter_numeric_proc_dirs(self.proc_root):
+            pid = int(pdir.name)
+            if pid in excluded_pids:
+                continue
+            st_ch, _pgrp, _tpgid = _read_proc_stat_state_pgrp_tpgid(pdir)
+            if st_ch in ("T", "t", "Z"):
+                continue
+            ptty = _read_proc_tty_path(pdir)
+            if not ptty:
+                continue
+            if _classify_proc_cli(pdir) is not None:
+                cli_ttys.add(ptty)
+                continue
+            argv = _read_proc_cmdline_args(pdir)
+            if not argv:
+                continue
+            host_cand, is_inter = extract_ssh_target_from_argv(argv)
+            if not is_inter:
+                continue
+            if host_cand and host_cand in self._local_hostnames:
+                continue
+            mtime = _safe_mtime(ptty)
+            prev = ssh_by_tty.get(ptty)
+            if prev is None or mtime >= prev:
+                ssh_by_tty[ptty] = mtime
+
+        valid_ssh = [mtime for tty, mtime in ssh_by_tty.items() if tty not in cli_ttys]
+        if not valid_ssh:
+            return None
+        best_ssh_mtime = max(valid_ssh)
+        best_local_mtime = max(max(c.pts_mtime, c.jsonl_mtime) for c in local_cands)
+        if best_ssh_mtime > 0.0 and best_ssh_mtime >= best_local_mtime:
+            # Return neutral "" so unscoped background SSH vetoes local crosstalk
+            # without authorizing an outbound SSH connection from an untitled local shell!
+            return ""
+        return None
+
+    def _find_cached_remote_state(
+        self,
+        host_name: str,
+        *,
+        hint: TitleHint | None = None,
+        cwd_hint: str = "",
+    ) -> SessionState | None:
+        with self._lock:
+            host_states = [
+                st for st in self._states.values() if st.is_remote and st.host_name == host_name
+            ]
+            if not host_states:
+                return None
+            if hint is not None and hint.session_token:
+                tok = hint.session_token.lower()
+                for st in reversed(host_states):
+                    if st.session_id.startswith(tok) and (
+                        not hint.explicit_cli or not hint.cli or st.cli == hint.cli
+                    ):
+                        return st
+                return None
+            if cwd_hint:
+                tail = cwd_hint[2:].rstrip("/") if cwd_hint.startswith("~/") else cwd_hint.rstrip("/")
+                for st in reversed(host_states):
+                    if st.cwd and (
+                        st.cwd == cwd_hint
+                        or (tail and (st.cwd == tail or st.cwd.endswith("/" + tail)))
+                    ):
+                        return st
+                return None
+            return host_states[-1] if len(host_states) == 1 else None
+
+    def _remote_route_match(
+        self, host_cfg: RemoteHostConfig, remote_fg: RemoteForegroundInfo
+    ) -> SessionMatch:
+        r_hint = parse_window_title_hint(remote_fg.effective_title)
+        cached_st = self._find_cached_remote_state(
+            host_cfg.name, hint=r_hint, cwd_hint=remote_fg.cwd_hint
+        )
+        if cached_st is not None:
+            return SessionMatch(
+                cli=cached_st.cli,
+                session_id=cached_st.session_id,
+                jsonl_path="",
+                cwd=remote_fg.cwd_hint,
+                matched_by="remote_cache",
+                origin="remote",
+                host_name=host_cfg.name,
+                remote_title=remote_fg.effective_title,
+            )
+        cli_val = (r_hint.cli or "remote") if r_hint is not None else "remote"
+        sid_val = r_hint.session_token if r_hint is not None else f"pending-{host_cfg.name}"
+        return SessionMatch(
+            cli=cli_val,
+            session_id=sid_val,
+            jsonl_path="",
+            cwd=remote_fg.cwd_hint,
+            matched_by="remote_whitelist",
+            origin="remote",
+            host_name=host_cfg.name,
+            remote_title=remote_fg.effective_title,
+        )
+
     def resolve_session(
         self,
         window_title: str = "",
@@ -4814,9 +5286,53 @@ class SessionTracker:
         window_tty: str = "",
         window_cwd: str = "",
         window_pid: int = 0,
+        window_process: str = "",
+        bundle_id: str = "",
+        document: str = "",
     ) -> SessionMatch | None:
-        """Resolve foreground main CLI session via title O(1) lookup, tmux active pane, split TTY/CWD, or fallback."""
+        """Resolve foreground main CLI session via Phase 0 Remote Veto, title O(1) lookup, tmux active pane, TTY/CWD, or fallback."""
         with self._lock:
+            # Phase 0 Fast Check: Remote IDE or dedicated SSH client or explicit [@remote_host] / user@remote:path / ssh ...
+            early_remote = detect_remote_foreground(
+                window_title,
+                window_process=window_process,
+                bundle_id=bundle_id,
+                document=document,
+                local_hostnames=self._local_hostnames,
+                is_macos=(sys.platform == "darwin" or (self.proc_root == Path("/proc") and not Path("/proc").is_dir())),
+            )
+            if early_remote.is_remote:
+                if (
+                    early_remote.ide_remote_only
+                    or early_remote.ambiguous_host
+                    or not early_remote.host_candidate
+                ):
+                    return None
+                host_cfg = self.remote_cfg.lookup_host(early_remote.host_candidate)
+                if host_cfg is None:
+                    return None
+                return self._remote_route_match(host_cfg, early_remote)
+
+            if _WIN_EXPLICIT_NON_WSL_TITLE_RE.match((window_title or "").strip()):
+                return None
+            proc_base_low = (
+                os.path.basename(window_process.replace("\\", "/")).lower()
+                if window_process
+                else ""
+            )
+            if proc_base_low in ("cmd", "cmd.exe") and parse_window_title_hint(window_title) is None:
+                return None
+            if (
+                proc_base_low in ("powershell", "powershell.exe", "pwsh", "pwsh.exe")
+                and parse_window_title_hint(window_title) is None
+                and re.match(
+                    r"^(?:Administrator:\s+|管理员:\s*)?(?:Windows\s+)?PowerShell(?:\s+[\d.]+)?\s*$",
+                    (window_title or "").strip(),
+                    re.IGNORECASE,
+                )
+            ):
+                return None
+
             rt_dirs = self._candidate_runtime_dirs()
             norm_tty = normalize_tty_path(window_tty)
             norm_cwd = _normalize_cwd(window_cwd)
@@ -4871,6 +5387,24 @@ class SessionTracker:
                 else {}
             )
 
+            all_tmux_pids: set[int] = set()
+            if has_proc and self.proc_root is not None and (tmux_snap.panes or tmux_snap.clients):
+                roots = [p.pane_pid for p in tmux_snap.panes if p.pane_pid > 1] + [
+                    c.client_pid for c in tmux_snap.clients if c.client_pid > 1
+                ]
+                all_tmux_pids = _collect_descendant_pids(self.proc_root, roots)
+                for p in tmux_snap.panes:
+                    if p.pane_pid <= 1 and p.pane_tty:
+                        all_tmux_pids.update(
+                            _collect_pane_pids(self.proc_root, 0, p.pane_tty)
+                        )
+
+            def _return_remote_fg(rfg: RemoteForegroundInfo) -> SessionMatch | None:
+                if rfg.ide_remote_only or rfg.ambiguous_host or not rfg.host_candidate:
+                    return None
+                hcfg = self.remote_cfg.lookup_host(rfg.host_candidate)
+                return self._remote_route_match(hcfg, rfg) if hcfg is not None else None
+
             def _with_cwd(hit: SessionMatch | None) -> SessionMatch | None:
                 return (
                     replace(hit, cwd=norm_cwd)
@@ -4884,7 +5418,33 @@ class SessionTracker:
                 and self._outer_hint_belongs_to_tmux(window_title, hint, active_target[1])
             )
             stale_hint_fallthrough = False
+            stale_hint_ttys: set[str] = set()
             neutralize_outer_title = False
+
+            early_tty_is_tmux_client = bool(
+                norm_tty
+                and any(
+                    c.client_tty and _tty_matches(c.client_tty, norm_tty)
+                    for c in tmux_snap.clients
+                )
+            )
+            # Phase 0 Priority: If the known foreground TTY is actively running interactive `ssh`,
+            # veto/route BEFORE any 8-hex `[#tag]` collision can return another TTY's local session!
+            if norm_tty and not early_tty_is_tmux_client and (has_proc or is_real_darwin):
+                ssh_tty_early = self._find_tty_ssh_target(
+                    norm_tty, has_proc=has_proc, darwin_ps_rows=darwin_ps_rows
+                )
+                if ssh_tty_early is not None:
+                    rfg_early = detect_remote_foreground(
+                        window_title or "",
+                        window_process=window_process,
+                        bundle_id=bundle_id,
+                        document=document,
+                        local_hostnames=self._local_hostnames,
+                        ssh_proc_host=ssh_tty_early,
+                        is_macos=is_real_darwin,
+                    )
+                    return _return_remote_fg(rfg_early)
 
             if (
                 hint is not None
@@ -4914,13 +5474,7 @@ class SessionTracker:
                         if reg_hit.tmux_pane != active_target[1].pane_id:
                             neutralize_outer_title = True
                     elif not reg_hit.tmux_pane and (
-                        (
-                            norm_tty
-                            and any(
-                                c.client_tty and _tty_matches(c.client_tty, norm_tty)
-                                for c in tmux_snap.clients
-                            )
-                        )
+                        early_tty_is_tmux_client
                         or (norm_tty and reg_hit.tty and not _tty_matches(norm_tty, reg_hit.tty))
                         or (
                             darwin_win_desc_pids
@@ -4933,6 +5487,7 @@ class SessionTracker:
                         return _with_cwd(reg_hit.match)
                 elif saw_stale_exited:
                     stale_hint_fallthrough = True
+                    stale_hint_ttys = _collect_stale_registry_ttys(hint, rt_dirs)
                 else:
                     all_proc_cands = (
                         scan_proc_root_sessions(
@@ -4963,9 +5518,15 @@ class SessionTracker:
                     )
                     if hint_tty_is_tmux_client:
                         stale_hint_fallthrough = True
-                    elif is_real_proc and not any(
+                    elif (
+                        is_real_proc or any(c.cli == disk_hit.cli for c in all_proc_cands)
+                    ) and not any(
                         c.session_key == disk_hit.session_key for c in all_proc_cands
                     ):
+                        # Bug D guard: dead historical transcript on disk MUST NOT return a dead match
+                        # NOR fall through to hijack an unrelated background tab when not in tmux/tty!
+                        if active_target is None and not norm_tty:
+                            return None
                         stale_hint_fallthrough = True
                     elif (
                         is_real_darwin
@@ -4983,6 +5544,8 @@ class SessionTracker:
                             rows=darwin_ps_rows,
                         )
                     ):
+                        if active_target is None and not norm_tty:
+                            return None
                         stale_hint_fallthrough = True
                     else:
                         return _with_cwd(disk_hit)
@@ -5017,6 +5580,19 @@ class SessionTracker:
                 )
             )
             if norm_tty and not tty_matches_tmux_client:
+                ssh_tty_host = self._find_tty_ssh_target(
+                    norm_tty, has_proc=has_proc, darwin_ps_rows=darwin_ps_rows
+                )
+                if ssh_tty_host is not None:
+                    rfg_tty = detect_remote_foreground(
+                        eff_title,
+                        window_process=window_process,
+                        bundle_id=bundle_id,
+                        document=document,
+                        local_hostnames=self._local_hostnames,
+                        ssh_proc_host=ssh_tty_host,
+                    )
+                    return _return_remote_fg(rfg_tty)
                 tty_hit, stop_fallback = _resolve_by_window_tty(
                     norm_tty,
                     norm_cwd=norm_cwd,
@@ -5030,17 +5606,72 @@ class SessionTracker:
                 if tty_hit is not None or stop_fallback:
                     return tty_hit
 
-            all_tmux_pids: set[int] = set()
-            if has_proc and self.proc_root is not None and (tmux_snap.panes or tmux_snap.clients):
-                roots = [p.pane_pid for p in tmux_snap.panes if p.pane_pid > 1] + [
-                    c.client_pid for c in tmux_snap.clients if c.client_pid > 1
-                ]
-                all_tmux_pids = _collect_descendant_pids(self.proc_root, roots)
-                for p in tmux_snap.panes:
-                    if p.pane_pid <= 1 and p.pane_tty:
-                        all_tmux_pids.update(
-                            _collect_pane_pids(self.proc_root, 0, p.pane_tty)
+            if not norm_tty and window_pid > 1 and active_target is None:
+                if has_proc and self.proc_root is not None:
+                    wp_pids = _collect_descendant_pids(self.proc_root, (window_pid,)) - all_tmux_pids
+                    ssh_wp_host = self._find_proc_ssh_target_in_pids(wp_pids)
+                    if ssh_wp_host is not None:
+                        rfg_wp = detect_remote_foreground(
+                            eff_title,
+                            window_process=window_process,
+                            bundle_id=bundle_id,
+                            document=document,
+                            local_hostnames=self._local_hostnames,
+                            ssh_proc_host=ssh_wp_host,
                         )
+                        return _return_remote_fg(rfg_wp)
+                elif darwin_win_desc_pids and darwin_ps_rows:
+                    excluded_ttys_d = self._collect_tmux_ttys(tmux_snap)
+                    d_rows = [
+                        r
+                        for r in darwin_ps_rows
+                        if r[0] in darwin_win_desc_pids and (not r[3] or r[3] not in excluded_ttys_d)
+                    ]
+                    if d_rows and not any(
+                        _classify_interactive_cli(
+                            os.path.basename(r[4][0].replace("\\", "/")).lstrip("-").lower() if r[4] else "",
+                            r[4],
+                        )
+                        for r in d_rows
+                    ):
+                        for _pid, _ppid, _st, _rtty, argv in d_rows:
+                            h_cand, is_int = extract_ssh_target_from_argv(argv)
+                            if is_int:
+                                rfg_d = detect_remote_foreground(
+                                    eff_title,
+                                    window_process=window_process,
+                                    bundle_id=bundle_id,
+                                    document=document,
+                                    local_hostnames=self._local_hostnames,
+                                    ssh_proc_host=h_cand,
+                                    is_macos=True,
+                                )
+                                return _return_remote_fg(rfg_d)
+
+            def _check_active_pane_remote(active_pane: TmuxPaneInfo) -> tuple[bool, SessionMatch | None]:
+                pane_ssh_host: str | None = None
+                if has_proc and self.proc_root is not None:
+                    p_pids = _collect_pane_pids(self.proc_root, active_pane.pane_pid, active_pane.pane_tty)
+                    pane_ssh_host = self._find_proc_ssh_target_in_pids(p_pids)
+                elif self.proc_root is not None and active_pane.pane_tty:
+                    pane_ssh_host = self._find_tty_ssh_target(
+                        normalize_tty_path(active_pane.pane_tty),
+                        has_proc=False,
+                        darwin_ps_rows=darwin_ps_rows,
+                    )
+                rfg_pane = detect_remote_foreground(
+                    eff_title,
+                    window_process=window_process,
+                    bundle_id=bundle_id,
+                    document=document,
+                    local_hostnames=self._local_hostnames,
+                    ssh_proc_host=pane_ssh_host,
+                    pane_title_override=active_pane.pane_title,
+                    is_macos=is_real_darwin,
+                )
+                if rfg_pane.is_remote:
+                    return True, _return_remote_fg(rfg_pane)
+                return False, None
 
             def _collect_darwin_scoped_non_tmux_cands() -> list[SessionMatch]:
                 scoped_cands: dict[str, SessionMatch] = {}
@@ -5079,13 +5710,24 @@ class SessionTracker:
 
             if active_target is not None:
                 active_client, active_pane = active_target
+                tmux_is_scoped = bool(
+                    outer_hint_owned_by_tmux
+                    or tty_matches_tmux_client
+                    or norm_tty
+                    or window_pid > 0
+                    or norm_cwd
+                )
                 if has_proc and self.proc_root is not None:
                     if not outer_hint_owned_by_tmux and not tty_matches_tmux_client:
-                        non_tmux_cands = scan_proc_root_sessions(
-                            self.home,
-                            self.proc_root,
-                            excluded_pids=all_tmux_pids,
-                            claimed_claude_sids=claimed_claude,
+                        non_tmux_cands = self._filter_by_title_affinity(
+                            scan_proc_root_sessions(
+                                self.home,
+                                self.proc_root,
+                                excluded_pids=all_tmux_pids,
+                                claimed_claude_sids=claimed_claude,
+                            ),
+                            eff_title,
+                            scoped=bool(norm_tty or norm_cwd),
                         )
                         if non_tmux_cands and self._should_prefer_non_tmux(
                             eff_title, active_client, active_pane, non_tmux_cands
@@ -5093,30 +5735,56 @@ class SessionTracker:
                             return _disambiguate_candidates(
                                 non_tmux_cands, eff_title, norm_cwd, self.home
                             )
-                    return self._resolve_tmux_active_pane(
+                    # Phase 0 Scope B: Active local tmux pane running interactive `ssh` or [@remote_host]
+                    is_pane_rem, pane_rem_match = _check_active_pane_remote(active_pane)
+                    if is_pane_rem:
+                        if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
+                            eff_title, active_pane, pane_rem_match
+                        ):
+                            return None
+                        return pane_rem_match
+                    pane_res = self._resolve_tmux_active_pane(
                         active_pane,
                         rt_dirs,
                         window_title=eff_title,
                         claimed_claude=claimed_claude,
                     )
+                    if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
+                        eff_title, active_pane, pane_res
+                    ):
+                        return None
+                    return pane_res
 
-                pane_hit, pane_authoritative_empty = self._resolve_tmux_active_pane_detailed(
-                    active_pane,
-                    rt_dirs,
-                    window_title=eff_title,
-                    claimed_claude=claimed_claude,
+                is_pane_rem, pane_rem_match = _check_active_pane_remote(active_pane)
+                pane_hit, pane_authoritative_empty = (
+                    (None, True)
+                    if is_pane_rem
+                    else self._resolve_tmux_active_pane_detailed(
+                        active_pane,
+                        rt_dirs,
+                        window_title=eff_title,
+                        claimed_claude=claimed_claude,
+                    )
                 )
                 if outer_hint_owned_by_tmux or tty_matches_tmux_client:
-                    return pane_hit
+                    return pane_rem_match if is_pane_rem else pane_hit
                 if is_real_darwin:
-                    non_tmux_cands = _collect_darwin_scoped_non_tmux_cands()
+                    non_tmux_cands = self._filter_by_title_affinity(
+                        _collect_darwin_scoped_non_tmux_cands(),
+                        eff_title,
+                        scoped=bool(darwin_win_tab_ttys or norm_tty or norm_cwd),
+                    )
                     if non_tmux_cands and self._should_prefer_non_tmux(
                         eff_title, active_client, active_pane, non_tmux_cands
                     ):
                         return _disambiguate_candidates(
                             non_tmux_cands, eff_title, norm_cwd, self.home
                         )
-                    return pane_hit
+                    if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
+                        eff_title, active_pane, pane_rem_match if is_pane_rem else pane_hit
+                    ):
+                        return None
+                    return pane_rem_match if is_pane_rem else pane_hit
                 tmux_bound_keys = _collect_tmux_bound_session_keys(rt_dirs)
                 if pane_hit is not None:
                     tmux_bound_keys.add(pane_hit.session_key)
@@ -5132,18 +5800,28 @@ class SessionTracker:
                     window_cwd=norm_cwd,
                     check_pid_alive=(self.proc_root is not None),
                 )
-                non_tmux_cands = [
-                    c
-                    for c in all_fallback
-                    if c.session_key not in tmux_bound_keys
-                    and c.session_id not in tmux_pane_uuids
-                ]
+                non_tmux_cands = self._filter_by_title_affinity(
+                    [
+                        c
+                        for c in all_fallback
+                        if c.session_key not in tmux_bound_keys
+                        and c.session_id not in tmux_pane_uuids
+                    ],
+                    eff_title,
+                    scoped=bool(norm_cwd),
+                )
                 if non_tmux_cands and self._should_prefer_non_tmux(
                     eff_title, active_client, active_pane, non_tmux_cands
                 ):
                     return _disambiguate_candidates(
                         non_tmux_cands, eff_title, norm_cwd, self.home
                     )
+                if is_pane_rem:
+                    if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
+                        eff_title, active_pane, pane_rem_match
+                    ):
+                        return None
+                    return pane_rem_match
                 if (
                     pane_hit is not None
                     or pane_authoritative_empty
@@ -5152,17 +5830,58 @@ class SessionTracker:
                         and not _TUI_SPINNER_RE.search(eff_title)
                     )
                 ):
+                    if not tmux_is_scoped and not self._tmux_target_matches_unscoped_title(
+                        eff_title, active_pane, pane_hit
+                    ):
+                        return None
                     return pane_hit
+                filtered_fb = self._filter_by_title_affinity(
+                    non_tmux_cands or all_fallback, eff_title, scoped=bool(norm_cwd)
+                )
                 return _disambiguate_candidates(
-                    non_tmux_cands or all_fallback, eff_title, norm_cwd, self.home
+                    filtered_fb, eff_title, norm_cwd, self.home
                 )
 
             if has_proc and self.proc_root is not None:
+                allowed_stale_pids: set[int] | None = None
+                if stale_hint_fallthrough:
+                    if not stale_hint_ttys:
+                        return None
+                    allowed_stale_pids = set()
+                    for pdir in _iter_numeric_proc_dirs(self.proc_root):
+                        ptty = _read_proc_tty_path(pdir) or _readlink_clean(pdir / "fd" / "0")
+                        if ptty and any(
+                            ptty == st_t or _tty_matches(ptty, st_t) for st_t in stale_hint_ttys
+                        ):
+                            allowed_stale_pids.add(int(pdir.name))
+                    if not allowed_stale_pids:
+                        return None
                 proc_cands = scan_proc_root_sessions(
                     self.home,
                     self.proc_root,
+                    allowed_pids=allowed_stale_pids,
                     excluded_pids=all_tmux_pids or None,
                     claimed_claude_sids=claimed_claude,
+                )
+                # Phase 0 Scope D: Unscoped /proc interactive SSH tab with newer TTY activity
+                if window_pid <= 0 and not norm_tty and not stale_hint_fallthrough and hint is None:
+                    ssh_unscoped = self._find_unscoped_proc_ssh_target(
+                        window_title=eff_title,
+                        excluded_pids=all_tmux_pids,
+                        local_cands=proc_cands,
+                    )
+                    if ssh_unscoped is not None:
+                        rfg_u = detect_remote_foreground(
+                            eff_title,
+                            window_process=window_process,
+                            bundle_id=bundle_id,
+                            document=document,
+                            local_hostnames=self._local_hostnames,
+                            ssh_proc_host=ssh_unscoped,
+                        )
+                        return _return_remote_fg(rfg_u)
+                proc_cands = self._filter_by_title_affinity(
+                    proc_cands, eff_title, scoped=bool(norm_tty or norm_cwd or stale_hint_fallthrough)
                 )
                 if proc_cands:
                     return _disambiguate_candidates(proc_cands, eff_title, norm_cwd, self.home)
@@ -5170,12 +5889,14 @@ class SessionTracker:
                     return None
 
             if is_real_darwin and len(darwin_win_tab_ttys) > 1:
-                scoped_list = _collect_darwin_scoped_non_tmux_cands()
+                scoped_list = self._filter_by_title_affinity(
+                    _collect_darwin_scoped_non_tmux_cands(), eff_title, scoped=True
+                )
                 if scoped_list:
                     return _disambiguate_candidates(scoped_list, eff_title, norm_cwd, self.home)
                 return None
 
-            if stale_hint_fallthrough and self.proc_root is not None:
+            if stale_hint_fallthrough or (is_real_darwin and window_pid > 0):
                 return None
 
             fallback_cands = _scan_nonproc_fallback_sessions(
@@ -5183,6 +5904,9 @@ class SessionTracker:
                 rt_dirs,
                 window_cwd=norm_cwd,
                 check_pid_alive=(self.proc_root is not None),
+            )
+            fallback_cands = self._filter_by_title_affinity(
+                fallback_cands, eff_title, scoped=bool(norm_cwd)
             )
             return _disambiguate_candidates(fallback_cands, eff_title, norm_cwd, self.home)
 
@@ -5430,13 +6154,377 @@ class SessionTracker:
 
     def active_session_cwds(self) -> list[str]:
         with self._lock:
-            return list(dict.fromkeys(st.cwd for st in self._states.values() if st.cwd))
+            return list(
+                dict.fromkeys(
+                    st.cwd for st in self._states.values() if st.cwd and not st.is_remote
+                )
+            )
 
     def build_workspace_hotwords(self, workspace_cwd: str) -> list[str]:
         if not workspace_cwd or is_wsl_slow_mount_path(workspace_cwd, env=self.env):
             return []
         _, git_hw = self._get_git_info(workspace_cwd)
         return list(git_hw[:24]) if git_hw else self._fallback_workspace_stems(workspace_cwd)
+
+    def _build_remote_req_and_key(
+        self,
+        host_cfg: RemoteHostConfig,
+        *,
+        effective_title: str,
+        cwd_hint: str,
+        include_git_info: bool,
+        max_chars: int | None = None,
+    ) -> tuple[dict[str, Any], tuple[Any, ...]]:
+        eff_max_chars = (
+            max(1000, int(max_chars)) if max_chars is not None else self.context_max_chars
+        )
+        clean_title = strip_host_tags_from_title(effective_title or "")
+        hint = parse_window_title_hint(clean_title)
+        token = hint.session_token if hint is not None else ""
+        cli_hint = (hint.cli or "") if hint is not None else (_infer_cli_word_from_title(clean_title) or "")
+        explicit_cli = bool(hint.explicit_cli) if hint is not None else False
+        spin_free_title = _TUI_SPINNER_RE.sub("", clean_title).strip()
+
+        if token:
+            cache_key: tuple[Any, ...] = (host_cfg.name, f"tok:{cli_hint}:{token}", "", "", eff_max_chars)
+        elif cwd_hint:
+            cache_key = (host_cfg.name, "", cwd_hint, cli_hint, eff_max_chars)
+        else:
+            cache_key = (host_cfg.name, "", "", spin_free_title, eff_max_chars)
+
+        cached_st = self._find_cached_remote_state(host_cfg.name, hint=hint, cwd_hint=cwd_hint)
+        etag = (
+            cached_st.remote_etag
+            if (cached_st is not None and cached_st.remote_max_chars == eff_max_chars)
+            else ""
+        )
+        skey_hint = f"{cached_st.cli}:{cached_st.session_id}" if cached_st is not None else ""
+        include_repo_files = bool(include_git_info)
+        if include_repo_files and cached_st is not None and cached_st.cwd:
+            with self._lock:
+                f_entry = self._remote_files_cache.get((host_cfg.name, cached_st.cwd))
+                if f_entry is not None and (time.monotonic() - f_entry[0]) < self.repo_files_cache_ttl_sec:
+                    include_repo_files = False
+
+        req_dict: dict[str, Any] = {
+            "v": 1,
+            "token": token,
+            "cli": cli_hint,
+            "explicit_cli": explicit_cli,
+            "title": spin_free_title[:512],
+            "cwd_hint": (cwd_hint or "")[:512],
+            "etag": etag,
+            "session_key_hint": skey_hint,
+            "max_chars": eff_max_chars,
+            "include_git": bool(include_git_info),
+            "include_repo_files": include_repo_files,
+        }
+        return req_dict, cache_key
+
+    def _update_remote_files_state_locked(
+        self,
+        host_name: str,
+        state: SessionState,
+        *,
+        files_included: bool,
+        repo_f: list[str],
+        shallow_f: list[str],
+    ) -> None:
+        now = time.monotonic()
+        if files_included:
+            state.remote_repo_files = repo_f
+            state.remote_shallow_files = shallow_f
+            if state.cwd:
+                self._remote_files_cache[(host_name, state.cwd)] = (now, repo_f, shallow_f)
+        elif state.cwd:
+            cached_f = self._remote_files_cache.get((host_name, state.cwd))
+            if cached_f is not None:
+                if (now - cached_f[0]) < self.repo_files_cache_ttl_sec:
+                    state.remote_repo_files = list(cached_f[1])
+                    state.remote_shallow_files = list(cached_f[2])
+                else:
+                    self._remote_files_cache.pop((host_name, state.cwd), None)
+                    state.remote_repo_files = []
+                    state.remote_shallow_files = []
+
+    def _apply_remote_probe_response(
+        self,
+        host_cfg: RemoteHostConfig,
+        resp: Mapping[str, Any],
+        *,
+        req_max_chars: int | None = None,
+    ) -> SessionState | None:
+        if not resp.get("ok") or resp.get("pong"):
+            return None
+        cli = str(resp.get("cli") or "").strip().lower()
+        sid = str(resp.get("session_id") or "").strip().lower()
+        if not cli or not sid:
+            return None
+        skey = f"remote:{host_cfg.name}:{cli}:{sid}"
+        not_mod = bool(resp.get("not_modified") or resp.get("unchanged"))
+        etag = str(resp.get("etag") or "")
+        rem_cwd = _normalize_cwd(str(resp.get("cwd") or ""))
+        git_status = str(resp.get("git_status") or "")
+        git_hw = list(resp.get("git_hotwords") or [])
+        repo_f = list(resp.get("repo_files") or [])
+        shallow_f = list(resp.get("shallow_files") or [])
+        files_inc = bool(resp.get("files_included") or repo_f or shallow_f)
+        eff_max_chars = (
+            max(1000, int(req_max_chars))
+            if req_max_chars is not None
+            else self.context_max_chars
+        )
+
+        with self._lock:
+            state = self._states.get(skey)
+            if not_mod:
+                if state is None or (etag and state.remote_etag != etag):
+                    return None
+                if rem_cwd:
+                    state.cwd = rem_cwd
+                state.remote_git_status = git_status
+                state.remote_git_hotwords = git_hw
+                self._update_remote_files_state_locked(
+                    host_cfg.name,
+                    state,
+                    files_included=files_inc,
+                    repo_f=repo_f,
+                    shallow_f=shallow_f,
+                )
+                return state
+
+            new_turns = [(str(r), str(t)) for r, t in (resp.get("turns") or [])]
+            evicted = int(resp.get("evicted_chunks") or 0)
+            comp_cnt = int(resp.get("compaction_count") or 0)
+
+            if state is None:
+                state = SessionState(
+                    session_key=skey,
+                    cli=cli,
+                    session_id=sid,
+                    jsonl_path="",
+                    cwd=rem_cwd,
+                    clean_turns=new_turns,
+                    is_remote=True,
+                    host_name=host_cfg.name,
+                    remote_etag=etag,
+                    remote_max_chars=eff_max_chars,
+                    remote_evicted_chunks=evicted,
+                    remote_compaction_count=comp_cnt,
+                    remote_git_status=git_status,
+                    remote_git_hotwords=git_hw,
+                )
+                self._states[skey] = state
+            else:
+                old_turns = state.clean_turns
+                same_epoch = (
+                    comp_cnt == state.remote_compaction_count
+                    and evicted == state.remote_evicted_chunks
+                    and eff_max_chars == state.remote_max_chars
+                )
+                if same_epoch and new_turns == old_turns:
+                    pass
+                elif (
+                    same_epoch
+                    and len(new_turns) >= len(old_turns)
+                    and new_turns[: len(old_turns)] == old_turns
+                ):
+                    state.clean_turns = new_turns
+                else:
+                    if (
+                        old_turns
+                        or comp_cnt != state.remote_compaction_count
+                        or evicted != state.remote_evicted_chunks
+                        or eff_max_chars != state.remote_max_chars
+                    ):
+                        state.generation += 1
+                    state.luna_synced_idx = 0
+                    state.clean_turns = new_turns
+                if rem_cwd:
+                    state.cwd = rem_cwd
+                state.remote_etag = etag
+                state.remote_max_chars = eff_max_chars
+                state.remote_evicted_chunks = evicted
+                state.remote_compaction_count = comp_cnt
+                state.remote_git_status = git_status
+                state.remote_git_hotwords = git_hw
+
+            self._update_remote_files_state_locked(
+                host_cfg.name,
+                state,
+                files_included=files_inc,
+                repo_f=repo_f,
+                shallow_f=shallow_f,
+            )
+            return state
+
+    def _make_remote_result_cb(
+        self, req_max_chars: int
+    ) -> Callable[[RemoteHostConfig, dict[str, Any]], None]:
+        def _cb(hcfg: RemoteHostConfig, r: dict[str, Any]) -> None:
+            self._apply_remote_probe_response(hcfg, r, req_max_chars=req_max_chars)
+
+        return _cb
+
+    def prefetch_remote_session(
+        self,
+        window_title: str = "",
+        *,
+        window_tty: str = "",
+        window_cwd: str = "",
+        window_pid: int = 0,
+        window_process: str = "",
+        bundle_id: str = "",
+        document: str = "",
+        seq_id: int = 0,
+        include_git_info: bool = True,
+    ) -> bool:
+        """Start non-blocking SSH remote context prefetch during ``start_recording``."""
+        if not self.remote_cfg.enabled:
+            return False
+        match = self.resolve_session(
+            window_title,
+            window_tty=window_tty,
+            window_cwd=window_cwd,
+            window_pid=window_pid,
+            window_process=window_process,
+            bundle_id=bundle_id,
+            document=document,
+        )
+        if match is None or match.origin != "remote" or not match.host_name:
+            return False
+        host_cfg = self.remote_cfg.lookup_host(match.host_name)
+        if host_cfg is None:
+            return False
+        eff_max = self.context_max_chars
+        req_dict, cache_key = self._build_remote_req_and_key(
+            host_cfg,
+            effective_title=(match.remote_title or window_title),
+            cwd_hint=match.cwd,
+            include_git_info=include_git_info,
+            max_chars=eff_max,
+        )
+        return self.remote_manager.start_prefetch(
+            host_cfg,
+            req_dict,
+            cache_key=cache_key,
+            seq_id=seq_id,
+            on_result=self._make_remote_result_cb(eff_max),
+        )
+
+    def cancel_remote_prefetch(self, *, seq_id: int | None = None) -> None:
+        self.remote_manager.cancel_prefetch(seq_id=seq_id)
+
+    def _sync_remote_match(
+        self,
+        eff_match: SessionMatch,
+        *,
+        window_title: str = "",
+        include_git_info: bool = True,
+        cancel_token: Any = None,
+        elapsed_ms: int = 0,
+    ) -> SessionSnapshot | None:
+        host_cfg = self.remote_cfg.lookup_host(eff_match.host_name)
+        if host_cfg is None:
+            return None
+        synth_title = eff_match.remote_title or window_title
+        eff_cwd_hint = eff_match.cwd
+        if not eff_match.remote_title and window_title:
+            rfg_now = detect_remote_foreground(
+                window_title, local_hostnames=self._local_hostnames
+            )
+            if rfg_now.effective_title:
+                synth_title = rfg_now.effective_title
+            if rfg_now.cwd_hint:
+                eff_cwd_hint = rfg_now.cwd_hint
+        elif (
+            not synth_title
+            and eff_match.cli in ("codex", "claude", "agy")
+            and eff_match.session_id
+            and not eff_match.session_id.startswith("pending-")
+        ):
+            synth_title = f"[{eff_match.cli}:#{eff_match.session_id}]"
+        eff_max = self.context_max_chars
+        req_dict, cache_key = self._build_remote_req_and_key(
+            host_cfg,
+            effective_title=synth_title,
+            cwd_hint=eff_cwd_hint,
+            include_git_info=include_git_info,
+            max_chars=eff_max,
+        )
+        cfg_budget_ms = (
+            host_cfg.timeout_ms
+            if host_cfg.timeout_ms is not None
+            else self.remote_cfg.timeout_ms
+        )
+        rem_budget_ms = max(0, int(cfg_budget_ms) - max(0, int(elapsed_ms)))
+        cancel_fn: Callable[[], bool] | None = None
+        if cancel_token is not None:
+            if hasattr(cancel_token, "is_cancelled"):
+                cancel_fn = cancel_token.is_cancelled
+            elif hasattr(cancel_token, "is_set"):
+                cancel_fn = cancel_token.is_set
+            elif callable(cancel_token):
+                cancel_fn = cancel_token
+        resp = self.remote_manager.fetch_with_budget(
+            host_cfg,
+            req_dict,
+            cache_key=cache_key,
+            budget_ms=rem_budget_ms,
+            allow_start_if_missing=True,
+            allow_half_open=False,
+            is_cancelled=cancel_fn,
+            on_result=self._make_remote_result_cb(eff_max),
+        )
+        if resp is None or not resp.get("ok"):
+            return None
+        state: SessionState | None = None
+        if resp.get("_already_applied"):
+            skey_done = (
+                f"remote:{host_cfg.name}:"
+                f"{str(resp.get('cli') or '').strip().lower()}:"
+                f"{str(resp.get('session_id') or '').strip().lower()}"
+            )
+            with self._lock:
+                cand_st = self._states.get(skey_done)
+                if cand_st is not None and (
+                    not resp.get("etag") or cand_st.remote_etag == resp.get("etag")
+                ):
+                    state = cand_st
+        if state is None:
+            state = self._apply_remote_probe_response(
+                host_cfg, resp, req_max_chars=eff_max
+            )
+        if state is None:
+            return None
+        with self._lock:
+            turns_tuple = tuple(state.clean_turns)
+            luna_idx = state.luna_synced_idx
+            gen = state.generation
+            git_status = state.remote_git_status if include_git_info else ""
+            git_hw = list(state.remote_git_hotwords) if include_git_info else []
+            rem_files = list(state.remote_repo_files or state.remote_shallow_files) if include_git_info else []
+            resolved_match = SessionMatch(
+                cli=state.cli,
+                session_id=state.session_id,
+                jsonl_path="",
+                cwd=state.cwd,
+                matched_by=str(resp.get("matched_by") or "remote"),
+                origin="remote",
+                host_name=host_cfg.name,
+            )
+        repo_stems = _file_stems_for_hotwords(rem_files, limit=12) if (rem_files and not git_hw) else []
+        turn_hw = extract_turn_hotwords(turns_tuple)
+        merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems]))
+        return SessionSnapshot(
+            match=resolved_match,
+            clean_turns=turns_tuple,
+            luna_synced_idx=luna_idx,
+            generation=gen,
+            git_status=git_status,
+            hotwords=merged_hw,
+            byte_offset=0,
+        )
 
     def _sync_resolved_match(
         self,
@@ -5515,9 +6603,14 @@ class SessionTracker:
         window_tty: str = "",
         window_cwd: str = "",
         window_pid: int = 0,
+        window_process: str = "",
+        bundle_id: str = "",
+        document: str = "",
         include_git_info: bool = True,
+        cancel_token: Any = None,
     ) -> SessionSnapshot | None:
         """Resolve (if needed) and incrementally ingest new JSONL lines for the active session."""
+        t0 = time.monotonic()
         with self._lock:
             eff_match = (
                 match
@@ -5527,10 +6620,22 @@ class SessionTracker:
                     window_tty=window_tty,
                     window_cwd=window_cwd,
                     window_pid=window_pid,
+                    window_process=window_process,
+                    bundle_id=bundle_id,
+                    document=document,
                 )
             )
             if eff_match is None:
                 return None
+        if eff_match.origin == "remote":
+            resolve_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+            return self._sync_remote_match(
+                eff_match,
+                window_title=window_title,
+                include_git_info=include_git_info,
+                cancel_token=cancel_token,
+                elapsed_ms=resolve_ms,
+            )
         return self._sync_resolved_match(eff_match, include_git_info=include_git_info)
 
     def get_refiner_context(
@@ -5543,6 +6648,38 @@ class SessionTracker:
         workspace_cwd: str = "",
     ) -> tuple[list[str], str]:
         """Return ``(dialog_chunks, git_context_text)`` separated for message-boundary prefix caching."""
+        with self._lock:
+            state = self._states.get(session_key) if session_key else None
+            if state is not None and state.is_remote:
+                turns_copy = list(state.clean_turns)
+                rem_cwd = state.cwd
+                rem_git_status = state.remote_git_status if include_git_status else ""
+                rem_git_hw = list(state.remote_git_hotwords) if include_git_status else []
+                rem_repo_files = list(state.remote_repo_files) if include_git_status else []
+                rem_shallow_files = list(state.remote_shallow_files) if include_git_status else []
+                dialog_chunks_rem = chunk_turns_for_refiner(
+                    turns_copy, max_chars=max_chars, chunk_chars=chunk_chars
+                )
+                rem_sections: list[str] = []
+                if include_git_status:
+                    if rem_cwd:
+                        rem_sections.append(f"cwd: {rem_cwd}")
+                    if rem_git_status:
+                        rem_sections.append(f"git_status:\n{rem_git_status}")
+                    if rem_git_hw:
+                        rem_sections.append("changed_files: " + ", ".join(rem_git_hw[:30]))
+                    elif rem_repo_files:
+                        rem_sections.append(
+                            "repo_files (tracked, unchanged; spelling reference only): "
+                            + ", ".join(rem_repo_files[:20])
+                        )
+                    elif rem_shallow_files:
+                        rem_sections.append(
+                            "workspace_files (local folder; spelling reference only): "
+                            + ", ".join(rem_shallow_files[:20])
+                        )
+                return dialog_chunks_rem, "\n\n".join(rem_sections)
+
         eff_ws = (
             ""
             if (not workspace_cwd or is_wsl_slow_mount_path(workspace_cwd, env=self.env))
@@ -5606,7 +6743,10 @@ class SessionTracker:
             start_idx = 0 if full else min(state.luna_synced_idx, len(state.clean_turns))
             delta_turns = state.clean_turns[start_idx:]
             sections: list[str] = []
-            git_status, git_hw = self._get_git_info(state.cwd)
+            if state.is_remote:
+                git_status, git_hw = state.remote_git_status, list(state.remote_git_hotwords)
+            else:
+                git_status, git_hw = self._get_git_info(state.cwd)
             if full and state.cwd:
                 sections.append(f"cwd: {state.cwd}")
             if git_status:

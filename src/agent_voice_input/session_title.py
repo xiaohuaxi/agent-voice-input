@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import stat
 import subprocess
 import sys
@@ -16,6 +17,35 @@ from .config import get_runtime_dir
 
 _SID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{0,56}$")
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_HOST_TAG_VAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _resolve_ssh_host_tag(
+    env: Mapping[str, str], *, explicit_env: bool, proc_root: Path
+) -> str:
+    """Return ``' [@<host_tag>]'`` when running inside an SSH session or with explicit host override."""
+    override = _CTRL_RE.sub("", (env.get("AGENT_VOICE_INPUT_HOST_TAG") or "").strip()).lower().rstrip(".")
+    if override and _HOST_TAG_VAL_RE.match(override):
+        return f" [@{override}]"
+    if not explicit_env and proc_root != Path("/proc"):
+        return ""
+    if not any((env.get(k) or "").strip() for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
+        return ""
+    raw_host = (env.get("HOSTNAME") or "").strip()
+    if not raw_host and hasattr(os, "uname"):
+        try:
+            raw_host = os.uname().nodename
+        except OSError:
+            raw_host = ""
+    if not raw_host:
+        try:
+            raw_host = socket.gethostname()
+        except OSError:
+            raw_host = ""
+    short = _CTRL_RE.sub("", raw_host.strip()).lower().rstrip(".").split(".", 1)[0]
+    if short and _HOST_TAG_VAL_RE.match(short):
+        return f" [@{short}]"
+    return ""
 
 
 def _short_cwd(cwd: str, home: str) -> str:
@@ -380,7 +410,8 @@ def update_agy_session(
                 cwd = cwd or _sctx._query_pid_cwd_nonproc(agy_pid)
                 agent_pid = agy_pid
                 tty_path = anc_tty or tty0
-    title = f"agy · {_short_cwd(cwd, str(eff_home))} [#{cid[:8]}]"
+    host_sfx = _resolve_ssh_host_tag(eff_env, explicit_env=(env is not None), proc_root=proc_root)
+    title = f"agy · {_short_cwd(cwd, str(eff_home))} [#{cid[:8]}]{host_sfx}"
     tmux_sock, tmux_pane = _resolve_and_sync_tmux_pane(
         eff_env,
         tty_path=tty_path,
@@ -458,7 +489,8 @@ def update_claude_session(
                         if encs
                         else ""
                     )
-    title = f"claude · {_short_cwd(cwd, str(eff_home))} [#{sid[:8]}]"
+    host_sfx = _resolve_ssh_host_tag(eff_env, explicit_env=(env is not None), proc_root=proc_root)
+    title = f"claude · {_short_cwd(cwd, str(eff_home))} [#{sid[:8]}]{host_sfx}"
     tmux_sock, tmux_pane = _resolve_and_sync_tmux_pane(
         eff_env,
         tty_path=tty_path,

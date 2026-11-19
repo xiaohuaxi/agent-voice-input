@@ -99,3 +99,24 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
   1. **已配钩子或 Codex 标题 UUID**：优先匹配焦点窗格 `#{pane_title}` 中的 `[#tag]` / UUID 或注册表中绑定的 `tmux_pane`，同时核验记录的 `agent_pid` 与窗格内存活进程，确保旧会话退出或重开新会话时不命中过期记录。
   2. **未配钩子**：将交互式根会话扫描严格收敛到当前焦点窗格内（Linux/WSL2 走 `/proc` 后代进程树，macOS 走 `ps`/`lsof` 控制终端扫描），隔壁后台 teammate 分屏刷屏不会串台，切到空 shell 分屏时也不会误抓相邻分屏上下文。
 - **多标签页/分屏混用防误伤**：当一个终端标签页或分屏挂着 attached `tmux`、同时切到另一个普通非 `tmux` 标签页/分屏运行 Agent 时，守护进程会综合外层 `window_tty`（Ghostty）、`[#tag]`、CLI / 动画标记 / 目录名标题与客户端交互时间区分当前前台目标，避免后台 `tmux` 抢走上下文。
+
+---
+
+## 5. SSH 远端 Linux 主机（零安装直连 + 可选单文件标题钩子）
+
+当你在本地 macOS 或 Windows+WSL2 上按热键说话、向远端无头 Linux 服务器上的 CLI Agent 输入时：
+
+1. **在本地配置白名单**（`~/.config/agent-voice-input/config.toml`）：
+   ```toml
+   [remote]
+   hosts = ["devbox"]
+   ```
+2. **远端零安装开箱即用（默认）**：远端无需安装 `agent-voice-input`、无需 `ffmpeg` 或任何 API Key（仅需系统自带 Python 3.10+ 标准库）。本地守护进程在按下热键录音期间通过 `ssh -- <target> python3 -` 异步预取远端活跃会话（自动匹配 `user@devbox: ~/repos/my-app` 目录、远端活跃 `tmux` 焦点窗格及远端 `/proc` 交互根会话，支持非 Git 普通目录浅层文件名提取）；未列入 `[remote]` 白名单的 SSH 终端与 Remote-SSH IDE 窗口也会触发本地硬否决闸门，彻底杜绝本地后台会话串台。
+3. **远端 `tmux` 标题透传（多远端标签页推荐，2 行配置）**：在远端 `~/.tmux.conf` 加入以下两行，使外层本地终端自动收到窗格标题与 `[@<短主机名>]` 标记：
+   ```tmux
+   set -g set-titles on
+   set -g set-titles-string '#T [@#h]'
+   ```
+4. **可选 O(1) 同机多会话精准消歧**：
+   - 若远端已装有本仓库，`agent-voice-input session-hook` 在检测到 `SSH_CONNECTION` 时会自动追加 `[@<short_hostname>]`（亦可通过环境变量 `AGENT_VOICE_INPUT_HOST_TAG` 指定别名）。
+   - 若远端保持零安装，只需将单文件脚本 [`remote/remote-title-hook.sh`](remote/remote-title-hook.sh) 拷至远端 `~/.local/bin/remote-title-hook.sh`（`chmod +x`），在 Claude Code（`~/.local/bin/remote-title-hook.sh claude`）或 Antigravity CLI（`~/.local/bin/remote-title-hook.sh agy`）钩子中调用即可。

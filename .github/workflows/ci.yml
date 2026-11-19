@@ -115,6 +115,8 @@ jobs:
                   "agent_voice_input/daemon.py",
                   "agent_voice_input/prompts.py",
                   "agent_voice_input/app_scope.py",
+                  "agent_voice_input/_remote_probe.py",
+                  "agent_voice_input/remote_ssh.py",
                   "agent_voice_input/win_shim.ps1",
                   "agent_voice_input/mac_shim.swift",
               ):
@@ -137,6 +139,8 @@ jobs:
                   "/config.example.env",
                   "/src/agent_voice_input/prompts.py",
                   "/src/agent_voice_input/app_scope.py",
+                  "/src/agent_voice_input/_remote_probe.py",
+                  "/src/agent_voice_input/remote_ssh.py",
                   "/src/agent_voice_input/win_shim.ps1",
                   "/src/agent_voice_input/mac_shim.swift",
               ):

@@ -1286,6 +1286,10 @@ class TmuxRealIsolatedIntegrationTests(unittest.TestCase):
             "AGENT_VOICE_INPUT_TMUX_HINT",
             "AGENT_VOICE_INPUT_RUNTIME_DIR",
             "VOICE_INPUT_RUNTIME_DIR",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "AGENT_VOICE_INPUT_HOST_TAG",
         ):
             self.base_env.pop(_pop_key, None)
 

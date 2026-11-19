@@ -42,6 +42,7 @@ from .session_ctx import (
 
 GHOSTTY_BUNDLE_ID = "com.mitchellh.ghostty"
 APPLE_TERMINAL_BUNDLE_ID = "com.apple.terminal"
+ITERM2_BUNDLE_ID = "com.googlecode.iterm2"
 MAC_SHIM_SCRIPT = Path(__file__).resolve().with_name("mac_shim.swift")
 SHIM_SCHEMA_VERSION = 5
 MACOS_TERMINALS = frozenset(
@@ -190,6 +191,34 @@ tell application id "com.apple.Terminal"
     return "at1" & sep & (wid as text) & sep & ttty & sep & wname & sep & tcustom
 end tell"""
 
+_ITERM2_QUERY_SCRIPT = """\
+tell application id "com.googlecode.iterm2"
+    if not running or (count of windows) is 0 then return ""
+    set w to current window
+    try
+        if (miniaturized of w) or not (visible of w) then return ""
+    end try
+    set wid to 0
+    set {wname, stty, sname} to {"", "", ""}
+    try
+        set wid to id of w
+    end try
+    try
+        set wname to name of w
+    end try
+    try
+        set s to current session of current tab of w
+        try
+            set stty to tty of s
+        end try
+        try
+            set sname to name of s
+        end try
+    end try
+    set sep to character id 31
+    return "it1" & sep & (wid as text) & sep & stty & sep & wname & sep & sname
+end tell"""
+
 _CMD_V_SCRIPT = 'tell application "System Events" to keystroke "v" using command down'
 
 MACOS_PERMISSIONS_HINT = (
@@ -212,6 +241,61 @@ def is_apple_terminal_app(app_name: str, bundle_id: str = "") -> bool:
     if proc.endswith(".app"):
         proc = proc[:-4]
     return proc in ("terminal", "终端")
+
+
+def is_iterm2_app(app_name: str, bundle_id: str = "") -> bool:
+    bid = (bundle_id or "").strip().lower()
+    if bid:
+        return bid == ITERM2_BUNDLE_ID
+    proc = (app_name or "").strip().lower()
+    if proc.endswith(".app"):
+        proc = proc[:-4]
+    return proc in ("iterm2", "iterm")
+
+
+def _can_automate_bundle_without_prompt(bundle_id: str) -> bool:
+    """Non-interactive TCC preflight via ``AEDeterminePermissionToAutomateTarget(..., askUserIfNeeded=False)``.
+
+    Returns True only when Automation is already granted (status == 0), and False when sending
+    AppleEvents would trigger a modal consent dialog (-1744), is denied (-1743), or is unavailable.
+    """
+    if sys.platform != "darwin" or not bundle_id:
+        return False
+    try:
+        import ctypes
+
+        ae_lib = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+
+        class _AEDesc(ctypes.Structure):
+            _fields_ = [("descriptorType", ctypes.c_uint32), ("dataHandle", ctypes.c_void_p)]
+
+        create_fn = ae_lib.AECreateDesc
+        create_fn.argtypes = [ctypes.c_uint32, ctypes.c_char_p, ctypes.c_long, ctypes.POINTER(_AEDesc)]
+        create_fn.restype = ctypes.c_int16
+
+        det_fn = getattr(ae_lib, "AEDeterminePermissionToAutomateTarget", None)
+        if det_fn is None:
+            return False
+        det_fn.argtypes = [ctypes.POINTER(_AEDesc), ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint8]
+        det_fn.restype = ctypes.c_int32
+
+        dispose_fn = ae_lib.AEDisposeDesc
+        dispose_fn.argtypes = [ctypes.POINTER(_AEDesc)]
+        dispose_fn.restype = ctypes.c_int16
+
+        raw = bundle_id.encode("utf-8")
+        desc = _AEDesc()
+        type_bundle = int.from_bytes(b"bund", "big")
+        type_wildcard = int.from_bytes(b"****", "big")
+        if create_fn(type_bundle, raw, len(raw), ctypes.byref(desc)) != 0:
+            return False
+        try:
+            status = int(det_fn(ctypes.byref(desc), type_wildcard, type_wildcard, 0))
+            return status == 0
+        finally:
+            dispose_fn(ctypes.byref(desc))
+    except Exception:
+        return False
 
 
 def is_macos_terminal_window(process: str, bundle_id: str = "") -> bool:
@@ -717,6 +801,7 @@ class MacOSPlatform(JsonlShimMixin):
         self._cur_session: _MacRecSession | None = None
         self._busy_wait_timeout_sec: float = 4.0
         self._paste_hold_timeout_sec: float | None = None
+        self._iterm2_osa_denied: bool = False
         self.last_audio_error = ""
         self._init_shim_bridge()
 
@@ -1004,6 +1089,34 @@ class MacOSPlatform(JsonlShimMixin):
         eff_title = f"{wname} {tcustom}".strip() if (tcustom and tcustom not in wname) else (wname or tcustom)
         return win_id, eff_title, tab_tty, wname
 
+    def _query_iterm2_terminal(self) -> tuple[int, str, str, str] | None:
+        if self._iterm2_osa_denied or not _can_automate_bundle_without_prompt(ITERM2_BUNDLE_ID):
+            return None
+        p = self._run_osascript(["-e", _ITERM2_QUERY_SCRIPT], timeout=1.5)
+        if p is None:
+            return None
+        if p.returncode != 0:
+            err_low = (p.stderr or "").lower()
+            if "-1743" in err_low or "(1743)" in err_low or "-1744" in err_low or "not authorized" in err_low:
+                self._iterm2_osa_denied = True
+            return None
+        if not p.stdout.strip():
+            return None
+        parts = p.stdout.rstrip("\r\n").split(_APPLE_SEP)
+        if len(parts) < 4 or parts[0] != "it1":
+            return None
+        try:
+            win_id = max(0, int(parts[1].strip())) if parts[1].strip() else 0
+        except ValueError:
+            win_id = 0
+        tab_tty = normalize_tty_path(parts[2].strip())
+        if not tab_tty:
+            return None
+        wname = parts[3].strip()
+        sname = parts[4].strip() if len(parts) > 4 else ""
+        eff_title = f"{wname} {sname}".strip() if (sname and sname not in wname) else (wname or sname)
+        return win_id, eff_title, tab_tty, wname
+
     def _query_ghostty_terminal(self) -> tuple[str, str, str, str, int] | None:
         p = self._run_osascript(["-e", _GHOSTTY_QUERY_SCRIPT], timeout=2.5)
         if p is None or p.returncode != 0 or not p.stdout.strip():
@@ -1060,6 +1173,7 @@ class MacOSPlatform(JsonlShimMixin):
             if (
                 not is_ghostty_app(app_name, bundle_id)
                 and not is_apple_terminal_app(app_name, bundle_id)
+                and not is_iterm2_app(app_name, bundle_id)
                 and not win_title
                 and not from_shim
                 and ax_trusted is not False
@@ -1147,6 +1261,51 @@ class MacOSPlatform(JsonlShimMixin):
                 return self._enrich_window_tmux_target(term_win)
             return term_win
 
+        if is_iterm2_app(app_name, bundle_id):
+            eff_name = app_name or "iTerm2"
+            eff_bundle = bundle_id or ITERM2_BUNDLE_ID
+            saw_other_iterm_panel = False
+            if not (from_shim and app_hwnd <= 0):
+                if (it_info := self._query_iterm2_terminal()) is not None:
+                    it_wid, it_title, it_tty, it_wname = it_info
+                    is_other_iterm_panel = bool(
+                        win_title
+                        and it_wname
+                        and _normalize_title_for_drift(win_title) != _normalize_title_for_drift(it_wname)
+                        and (it_wname not in win_title and win_title not in it_wname)
+                    )
+                    if not is_other_iterm_panel:
+                        eff_hwnd = app_hwnd if app_hwnd > 0 else it_wid
+                        merged_it_title = win_title or it_title
+                        if it_title and win_title and it_title not in win_title:
+                            merged_it_title = f"{win_title} {it_title}".strip()
+                        return self._enrich_window_tmux_target(
+                            ForegroundWindow(
+                                eff_hwnd,
+                                eff_name,
+                                self._append_tmux_pane_title(merged_it_title, eff_name, eff_bundle),
+                                eff_bundle,
+                                tty=it_tty,
+                                pid=app_pid,
+                                ax_trusted=ax_trusted,
+                            )
+                        )
+                    saw_other_iterm_panel = True
+            if hint is not None and not win_title and not from_shim and ax_trusted is not False:
+                win_title = self._query_ax_title()
+            iterm_win = ForegroundWindow(
+                app_hwnd,
+                eff_name,
+                self._append_tmux_pane_title(win_title, eff_name, eff_bundle),
+                eff_bundle,
+                pid=app_pid,
+                ax_trusted=ax_trusted,
+                document=win_doc,
+            )
+            if not (from_shim and app_hwnd <= 0) and not saw_other_iterm_panel:
+                return self._enrich_window_tmux_target(iterm_win)
+            return iterm_win
+
         other_win = ForegroundWindow(
             app_hwnd,
             app_name,
@@ -1166,6 +1325,10 @@ class MacOSPlatform(JsonlShimMixin):
                 return self._enrich_window_tmux_target(window)
             return self.get_foreground_window(hint=window)
         if is_apple_terminal_app(window.process, window.bundle_id):
+            if window.tty or (window.title and not self._which("osascript")):
+                return self._enrich_window_tmux_target(window)
+            return self.get_foreground_window(hint=window)
+        if is_iterm2_app(window.process, window.bundle_id):
             if window.tty or (window.title and not self._which("osascript")):
                 return self._enrich_window_tmux_target(window)
             return self.get_foreground_window(hint=window)

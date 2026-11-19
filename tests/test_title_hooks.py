@@ -405,7 +405,15 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
             env = {
                 k: v
                 for k, v in os.environ.items()
-                if k not in ("AGENT_VOICE_INPUT_RUNTIME_DIR", "VOICE_INPUT_RUNTIME_DIR")
+                if k
+                not in (
+                    "AGENT_VOICE_INPUT_RUNTIME_DIR",
+                    "VOICE_INPUT_RUNTIME_DIR",
+                    "SSH_CONNECTION",
+                    "SSH_CLIENT",
+                    "SSH_TTY",
+                    "AGENT_VOICE_INPUT_HOST_TAG",
+                )
             }
             env.update(
                 {

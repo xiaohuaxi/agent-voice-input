@@ -140,6 +140,23 @@ api_key_env = ""
 # Set true to run Stage 2 refinement even when Stage 1 already performed single-hop multimodal refinement
 force_on_single_hop = false
 
+[remote]
+# Optional zero-install SSH remote Linux session context routing (no remote daemon, no remote pip install, no remote API keys).
+# Only hosts explicitly listed here may be queried via `ssh ... -- <target> python3 -` (protects against untrusted OSC 2 terminal titles).
+# Even when `hosts = []`, foreground SSH terminals and Remote-SSH IDEs automatically veto local background session crosstalk.
+hosts = []
+# Hard post-stop wait cap in milliseconds (recording-start async prefetch hides SSH handshake latency during speech)
+timeout_ms = 400
+# Optional SSH client binary (on WSL2 when keys/1Password live only on Windows, set `ssh_bin = "ssh.exe"`):
+# ssh_bin = "ssh"
+#
+# Advanced multi-alias form (optional, when remote hostname in prompt/[@tag] differs from ~/.ssh/config Host alias):
+# [[remote.hosts]]
+# name = "devbox"
+# ssh_target = "my-cloud-gpu-01"
+# aliases = ["gpu01", "ubuntu-prod"]
+# ssh_bin = "ssh"
+
 # -----------------------------------------------------------------------------
 # Quick Recipes (replace the [asr] / [refiner] values above as needed)
 # -----------------------------------------------------------------------------

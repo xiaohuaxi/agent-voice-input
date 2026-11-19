@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
 from typing import Callable, Iterable, Literal, Protocol
 
 WindowCategory = Literal["terminal", "coding_gui", "general_gui"]
@@ -160,9 +161,11 @@ CODING_GUI_PATTERNS: tuple[str, ...] = (
 
 WINDOWS_SHIFT_INSERT_PROCS: frozenset[str] = frozenset(
     {
-        "mintty",   # Git Bash / MSYS2 / Cygwin (ClipShortcuts=yes by default; Ctrl+V sends literal ^V)
-        "putty",    # PuTTY (Shift+Insert default)
-        "kitty",    # Windows KiTTY (PuTTY fork, NOT Kovid Goyal's kitty; Shift+Insert default)
+        "mintty",     # Git Bash / MSYS2 / Cygwin (ClipShortcuts=yes by default; Ctrl+V sends literal ^V)
+        "putty",      # PuTTY (Shift+Insert default)
+        "kitty",      # Windows KiTTY (PuTTY fork, NOT Kovid Goyal's kitty; Shift+Insert default)
+        "mobaxterm",  # MobaXterm SSH terminal (Shift+Insert default)
+        "xshell",     # NetSarang Xshell (Shift+Insert default)
         "emacs",
     }
 )
@@ -174,10 +177,47 @@ WINDOWS_CTRL_SHIFT_V_PROCS: frozenset[str] = frozenset(
         "wezterm-gui",
         "rio",
         "ghostty",
-        "tabby",    # Tabby default paste on Windows is Ctrl+Shift+V (Ctrl+V unbound by default)
-        "hyper",    # Vercel Hyper win32.json maps editor:paste to ctrl+shift+v
+        "tabby",      # Tabby default paste on Windows is Ctrl+Shift+V (Ctrl+V unbound by default)
+        "hyper",      # Vercel Hyper win32.json maps editor:paste to ctrl+shift+v
+        "windterm",   # WindTerm SSH client
+        "securecrt",  # VanDyke SecureCRT
+        "termius",    # Termius SSH client
+        "electerm",   # Electerm SSH client
     }
 )
+
+# Dedicated SSH / remote-terminal GUI clients (always remote sessions; never bind local /proc or tmux).
+# Note: bare "kitty" on macOS (net.kovidgoyal.kitty) is a local GPU terminal, whereas "kitty.exe" on Windows is KiTTY (PuTTY fork).
+DEDICATED_SSH_CLIENT_PATTERNS: tuple[str, ...] = (
+    "putty",
+    "mobaxterm",
+    "windterm",
+    "securecrt",
+    "xshell",
+    "termius",
+    "finalshell",
+    "electerm",
+    "royalts*",
+    "com.termius*",
+    "com.vandyke.securecrt*",
+    "com.lemonmojo.royaltsx*",
+    "sh.blink.blinkshell",
+)
+
+
+def is_dedicated_ssh_client_window(win: WindowLike, *, is_macos: bool | None = None) -> bool:
+    """Return True when ``win`` is a dedicated SSH client (e.g. PuTTY, KiTTY on Windows, MobaXterm, WindTerm, SecureCRT)."""
+    if match_app_patterns(win, DEDICATED_SSH_CLIENT_PATTERNS):
+        return True
+    raw_proc = (win.process or "").strip().lower()
+    if normalize_app_token(raw_proc) == "kitty":
+        bid = (win.bundle_id or "").strip().lower()
+        if bid == "net.kovidgoyal.kitty":
+            return False
+        eff_mac = (sys.platform == "darwin") if is_macos is None else bool(is_macos)
+        if raw_proc.endswith(".exe") or (not bid and not eff_mac):
+            return True
+    return False
 
 
 def is_remote_client_window(win: WindowLike) -> bool:
@@ -187,7 +227,7 @@ def is_remote_client_window(win: WindowLike) -> bool:
 def classify_window_category(
     win: WindowLike, *, is_terminal: Callable[[WindowLike], bool]
 ) -> WindowCategory:
-    if is_terminal(win):
+    if is_terminal(win) or is_dedicated_ssh_client_window(win):
         return "terminal"
     if match_app_patterns(win, CODING_GUI_PATTERNS):
         return "coding_gui"
@@ -441,3 +481,26 @@ def parse_ide_window_title(win: WindowLike) -> IdeTitleInfo | None:
         return IdeTitleInfo(root_name=root_name) if root_name else None
 
     return None
+
+
+def is_remote_ide_window(win: WindowLike) -> bool:
+    """Return True when an IDE window or document URI is connected to a non-WSL remote host (SSH/Codespaces/Tunnel)."""
+    raw_doc = (getattr(win, "document", "") or "").strip().lower()
+    if raw_doc.startswith(("ssh://", "sftp://")):
+        return True
+    if raw_doc.startswith("vscode-remote://"):
+        authority = raw_doc[len("vscode-remote://") :].split("/", 1)[0]
+        if not authority.startswith("wsl+"):
+            return True
+    title_low = (win.title or "").lower()
+    if "vscode-remote://" in title_low:
+        after = title_low.split("vscode-remote://", 1)[1]
+        if not after.startswith("wsl+"):
+            return True
+    if any(
+        tok in title_low
+        for tok in ("[ssh:", "[ssh ", "[codespaces:", "[tunnel:", "[remote:", "ssh://")
+    ):
+        return True
+    parsed = parse_ide_window_title(win)
+    return bool(parsed is not None and parsed.remote_kind == "remote")

@@ -99,3 +99,24 @@ The hook checks `presence/<cid>.lock` file locks, the opening JSONL record, and 
   1. **With Hooks / Codex Title UUID**: Matches `[#tag]` / UUID in `#{pane_title}` or `tmux_pane` in the runtime session registry, verifying the recorded `agent_pid` and pane process tree are still alive so exited sessions never leave stale matches.
   2. **Without Hooks**: Scopes interactive root-session discovery strictly to the active pane (`/proc` descendant process tree on Linux/WSL2, or `ps`/`lsof` controlling-TTY inspection on macOS), keeping background teammate panes and empty shell panes isolated.
 - **Multi-Tab / Split Coexistence**: If `tmux` stays attached in one terminal tab/split while you switch to a regular non-`tmux` tab/split running another agent, outer `window_tty` matching (Ghostty), `[#tag]` hints, CLI/spinner/directory titles, and client activity comparison keep the foreground non-`tmux` session from being hijacked by the background `tmux` session.
+
+---
+
+## 5. SSH Remote Linux Hosts (Zero-Install + Optional Title Hook)
+
+When dictating from a local macOS or Windows+WSL2 machine into a headless remote Linux server over SSH:
+
+1. **Whitelist the host locally** in `~/.config/agent-voice-input/config.toml`:
+   ```toml
+   [remote]
+   hosts = ["devbox"]
+   ```
+2. **Zero-Install Mode (Default)**: Nothing needs to be installed on the remote server (`python3` 3.10+ stdlib only). Standard SSH shell/tmux window titles (`user@devbox: ~/repos/my-app`), active attached remote `tmux` panes, and live remote `/proc` interactive sessions are matched automatically—while unconfigured SSH/Remote-IDE windows are strictly isolated from leaking local background sessions.
+3. **Remote `tmux` Outer Title Forwarding (Recommended when running multiple SSH tabs)**: Add 2 lines to `~/.tmux.conf` on the remote host so the outer local terminal receives `[@<short_hostname>]` and pane titles:
+   ```tmux
+   set -g set-titles on
+   set -g set-titles-string '#T [@#h]'
+   ```
+4. **Optional O(1) Multi-Session Disambiguation**:
+   - If `agent-voice-input` is already on the remote host, `agent-voice-input session-hook` automatically appends `[@<short_hostname>]` (or `$AGENT_VOICE_INPUT_HOST_TAG`) when `$SSH_CONNECTION` is present.
+   - Without installing `agent-voice-input` on the remote host, you can copy the single standalone script [`remote/remote-title-hook.sh`](remote/remote-title-hook.sh) to `~/.local/bin/remote-title-hook.sh` (`chmod +x`) and wire it into Claude Code (`~/.local/bin/remote-title-hook.sh claude`) or Antigravity CLI (`~/.local/bin/remote-title-hook.sh agy`).
