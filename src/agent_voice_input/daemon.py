@@ -65,6 +65,8 @@ from .session_ctx import (
     SessionTracker,
     parse_window_title_hint,
     prune_stale_session_registry,
+)
+from .workspace_ctx import (
     resolve_antigravity_ide_session,
     resolve_ide_workspace_cwd,
 )

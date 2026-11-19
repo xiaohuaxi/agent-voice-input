@@ -75,7 +75,9 @@ from .llm_common import (
 )
 from .config import (
     _CODEX_KEYRING_STORE_RE,
+    CODEX_SUBSCRIPTION_BASE_URL,
     DEFAULT_REFINER_MODELS,
+    OPENAI_DEFAULT_BASE_URL,
     Config,
     ConfigError,
     ProviderCredentials,
@@ -105,8 +107,6 @@ from .session_ctx import SessionTracker
 
 DEFAULT_REFINER_PROMPT = REFINER_SYSTEM_PROMPT
 
-OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
-CODEX_SUBSCRIPTION_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CODEX_ORIGINATOR = "codex_cli_rs"
 CODEX_USER_AGENT = "codex_cli_rs/0.169.0"
 CODEX_PUBLIC_FALLBACK_MODELS: tuple[str, ...] = (

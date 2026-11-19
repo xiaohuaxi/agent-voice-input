@@ -23,8 +23,12 @@ if str(SRC_DIR) not in sys.path:
 from agent_voice_input import hud as hud_mod  # noqa: E402
 from agent_voice_input.app_scope import (  # noqa: E402
     DEDICATED_SSH_CLIENT_PATTERNS,
+    MACOS_TERMINAL_BUNDLE_IDS,
+    MACOS_TERMINALS,
     WINDOWS_CTRL_SHIFT_V_PROCS,
     WINDOWS_SHIFT_INSERT_PROCS,
+    WINDOWS_TERMINALS,
+    resolve_windows_paste_chord,
 )
 from agent_voice_input.asr_providers import BaseAsrProvider, create_asr_provider  # noqa: E402
 from agent_voice_input.config import (  # noqa: E402
@@ -42,11 +46,6 @@ from agent_voice_input.config import (  # noqa: E402
     RefinerConfig,
     resolve_credentials,
 )
-from agent_voice_input.platform_macos import (  # noqa: E402
-    MACOS_TERMINAL_BUNDLE_IDS,
-    MACOS_TERMINALS,
-)
-from agent_voice_input.platform_wsl import WINDOWS_TERMINALS  # noqa: E402
 from agent_voice_input.refiner import BaseRefiner, NoopRefiner, create_refiner  # noqa: E402
 
 # Python 3.10 does not list Python 3.11+ ``tomllib`` in ``sys.stdlib_module_names``.
@@ -60,8 +59,7 @@ MACOS_ONLY_TERMINALS: frozenset[str] = frozenset(
 WINDOWS_ONLY_TERMINALS: frozenset[str] = frozenset(
     {"windowsterminal", "openconsole", "mintty", "conhost", "putty"}
 )
-# Pending Windows terminal list alignment scheduled for Batch 2 P1 (app_scope terminal consolidation).
-_PENDING_WINDOWS_TERMINAL_PARITY: frozenset[str] = frozenset({"warp"})
+_PENDING_WINDOWS_TERMINAL_PARITY: frozenset[str] = frozenset()
 
 
 def _parse_package_asts() -> dict[str, ast.Module]:
@@ -153,7 +151,7 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
     def test_intra_package_imports_form_strict_dag(self) -> None:
         trees = _parse_package_asts()
         known_modules = set(trees.keys())
-        self.assertGreaterEqual(len(known_modules), 17)
+        self.assertEqual(len(known_modules), 21)
         init_defined_symbols = {
             t.id
             for stmt in trees["__init__"].body
@@ -794,6 +792,32 @@ class TestProviderCompletenessContracts(unittest.TestCase):
                 self.assertIsInstance(instance, BaseRefiner)
                 self.assertNotIsInstance(instance, NoopRefiner)
 
+    def test_vendor_default_base_url_literals_live_solely_in_config(self) -> None:
+        canonical_urls = (
+            set(DEFAULT_ASR_BASE_URLS.values())
+            | set(DEFAULT_REFINER_BASE_URLS.values())
+            | {
+                "https://chatgpt.com/backend-api/codex",
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+            }
+        )
+        violations: list[str] = []
+        for py_path in sorted(PKG_DIR.glob("*.py")):
+            if py_path.stem == "config":
+                continue
+            tree = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    s = node.value.strip().rstrip("/")
+                    for u in canonical_urls:
+                        if s == u or s.startswith(u + "/"):
+                            violations.append(f"{py_path.name}:{node.lineno} -> {node.value!r}")
+        self.assertEqual(
+            violations,
+            [],
+            f"Hardcoded vendor default URLs found outside config.py: {violations}",
+        )
+
 
 class TestCrossPlatformTerminalSymmetry(unittest.TestCase):
     def test_desktop_terminal_sets_are_symmetric_modulo_explicit_platform_sets(self) -> None:
@@ -802,8 +826,8 @@ class TestCrossPlatformTerminalSymmetry(unittest.TestCase):
         self.assertTrue(WINDOWS_ONLY_TERMINALS.issubset(WINDOWS_TERMINALS))
         self.assertTrue(WINDOWS_ONLY_TERMINALS.isdisjoint(MACOS_TERMINALS))
 
-        pending_win = _PENDING_WINDOWS_TERMINAL_PARITY - WINDOWS_TERMINALS
-        macos_cross_platform = MACOS_TERMINALS - MACOS_ONLY_TERMINALS - pending_win
+        self.assertEqual(_PENDING_WINDOWS_TERMINAL_PARITY, frozenset())
+        macos_cross_platform = MACOS_TERMINALS - MACOS_ONLY_TERMINALS
         windows_cross_platform = WINDOWS_TERMINALS - WINDOWS_ONLY_TERMINALS
         self.assertEqual(
             macos_cross_platform,
@@ -811,13 +835,17 @@ class TestCrossPlatformTerminalSymmetry(unittest.TestCase):
             "Cross-platform terminal set drifted between MACOS_TERMINALS and WINDOWS_TERMINALS; "
             "update both platforms or declare genuinely OS-exclusive apps in *_ONLY_TERMINALS.",
         )
+        self.assertIn("warp", WINDOWS_TERMINALS)
+        self.assertEqual(resolve_windows_paste_chord("warp.exe"), "ctrl_shift_v")
 
         # Verify win_shim.ps1 $AllowedTerminals default array stays aligned with WINDOWS_TERMINALS
+        # and accepts -AllowedTerminals CLI override from Python WslPlatform._build_shim_cmd
         win_ps1 = (PKG_DIR / "win_shim.ps1").read_text(encoding="utf-8")
         m_shim = re.search(r"\$AllowedTerminals\s*=\s*@\(([^)]+)\)", win_ps1)
         self.assertIsNotNone(m_shim)
         shim_terms = set(re.findall(r'"([^"]+)"', m_shim.group(1)))  # type: ignore[union-attr]
         self.assertEqual(shim_terms, set(WINDOWS_TERMINALS))
+        self.assertIn('[Alias("AllowedTerminals")]', win_ps1)
 
         # Every Windows paste-chord override proc must be an allowed terminal, dedicated SSH GUI, or emacs
         dedicated_ssh = {

@@ -337,7 +337,7 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 self.assertNotIn(unwanted, shallow)
 
             # Privacy guardrails: ~, /, /tmp, /Users, /home/<user> (including APFS case variants) -> [] & ZERO os.scandir!
-            with mock.patch("agent_voice_input.session_ctx.os.scandir") as mock_scandir:
+            with mock.patch("agent_voice_input.workspace_ctx.os.scandir") as mock_scandir:
                 for forbidden in (
                     str(home), "/", "/tmp", "/PRIVATE/TMP", "/Users", "/users", "/home/alice", "/Users/alice", "/users/demo"
                 ):
@@ -374,7 +374,7 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             self.assertIn("Q4架构设计.md", user_msg)
             self.assertNotIn("私人身份证扫描", user_msg)
 
-            with mock.patch("agent_voice_input.session_ctx.os.scandir") as mock_scan2:
+            with mock.patch("agent_voice_input.workspace_ctx.os.scandir") as mock_scan2:
                 res2 = run_pipeline_once(
                     _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
                     platform=_DummyPlatform(ide_win), origin_window=ide_win, audio_source="winmm", dry_run=True, env=env,
@@ -463,10 +463,10 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                     raise AssertionError(f"stat called on WSL slow mount: {s}")
                 return orig_stat(p, *a, **kw)  # type: ignore[arg-type]
 
-            with mock.patch("agent_voice_input.session_ctx.subprocess.run") as mock_run, mock.patch(
+            with mock.patch("agent_voice_input.workspace_ctx.subprocess.run") as mock_run, mock.patch(
                 "os.lstat", side_effect=_no_mnt_lstat
             ), mock.patch("os.stat", side_effect=_no_mnt_stat), mock.patch(
-                "agent_voice_input.session_ctx._HOST_IS_WSL", True
+                "agent_voice_input.workspace_ctx._HOST_IS_WSL", True
             ):
                 # Stripped env ({}) still honors _HOST_IS_WSL; explicit Windows path in JetBrains title never falls back to local repo!
                 self.assertTrue(is_wsl_slow_mount_path("/mnt/d/work", env={}))
@@ -676,7 +676,7 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 305, "Antigravity", "alpha_engine.py — repo-a — Antigravity", bundle_id="com.google.antigravity"
             )
 
-            with mock.patch("agent_voice_input.session_ctx.time.time", return_value=now_ts):
+            with mock.patch("agent_voice_input.workspace_ctx.time.time", return_value=now_ts):
                 r1 = run_pipeline_once(
                     _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
                     platform=_DummyPlatform(agy_win), origin_window=agy_win, audio_source="winmm", dry_run=True, env=env,
@@ -705,7 +705,7 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 )
             os.utime(tp_a1, (now_ts - 10, now_ts - 10))
 
-            with mock.patch("agent_voice_input.session_ctx.time.time", return_value=now_ts):
+            with mock.patch("agent_voice_input.workspace_ctx.time.time", return_value=now_ts):
                 r2 = run_pipeline_once(
                     _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
                     platform=_DummyPlatform(agy_win), origin_window=agy_win, audio_source="winmm", dry_run=True, env=env,

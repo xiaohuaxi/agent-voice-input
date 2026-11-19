@@ -10,7 +10,12 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
-from .app_scope import normalize_app_token, resolve_windows_paste_chord
+from .app_scope import (
+    WINDOWS_TERMINALS,
+    is_windows_terminal_process,
+    normalize_app_token,
+    resolve_windows_paste_chord,
+)
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, redact_secrets
 from .http_transport import sleep_cooperative
@@ -35,30 +40,6 @@ from .session_ctx import parse_window_title_hint
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 WSLG_PULSE_SOCK = "/mnt/wslg/PulseServer"
 SHIM_SCRIPT = Path(__file__).resolve().with_name("win_shim.ps1")
-WINDOWS_TERMINALS = frozenset(
-    {
-        "windowsterminal",
-        "openconsole",
-        "mintty",
-        "wezterm",
-        "wezterm-gui",
-        "alacritty",
-        "ghostty",
-        "conhost",
-        "putty",
-        "tabby",
-        "hyper",
-        "kitty",
-        "rio",
-    }
-)
-
-
-def is_windows_terminal_process(process: str) -> bool:
-    p = (process or "").strip().lower()
-    if p.endswith(".exe"):
-        p = p[:-4]
-    return bool(p) and p in WINDOWS_TERMINALS
 
 
 
@@ -267,7 +248,30 @@ class WslPlatform(JsonlShimMixin):
             return self._shim_cmd_factory()
         if not os.path.isfile(POWERSHELL_EXE):
             raise RuntimeError(f"PowerShell not found at {POWERSHELL_EXE}")
-        return [POWERSHELL_EXE, "-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "bridge", "-Hotkey", self.cfg.hotkey.key, "-TriggerMode", self.cfg.hotkey.trigger_mode, "-TapMaxMs", str(self.cfg.hotkey.tap_max_ms), "-DebounceMs", str(self.cfg.hotkey.debounce_ms), "-Beep", "1" if self.cfg.audio.beep else "0"]
+        return [
+            POWERSHELL_EXE,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Sta",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            to_windows_path(SHIM_SCRIPT),
+            "-Mode",
+            "bridge",
+            "-Hotkey",
+            self.cfg.hotkey.key,
+            "-TriggerMode",
+            self.cfg.hotkey.trigger_mode,
+            "-TapMaxMs",
+            str(self.cfg.hotkey.tap_max_ms),
+            "-DebounceMs",
+            str(self.cfg.hotkey.debounce_ms),
+            "-Beep",
+            "1" if self.cfg.audio.beep else "0",
+            "-AllowedTerminals",
+            ",".join(sorted(WINDOWS_TERMINALS)),
+        ]
 
     def is_allowed_terminal(self, window: ForegroundWindow) -> bool:
         return is_windows_terminal_process(window.process)

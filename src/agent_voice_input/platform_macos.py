@@ -15,6 +15,13 @@ from ._tmux import (
     resolve_tmux_bin,
 )
 from .http_transport import sleep_cooperative
+from .app_scope import (
+    APPLE_TERMINAL_BUNDLE_ID,
+    GHOSTTY_BUNDLE_ID,
+    ITERM2_BUNDLE_ID,
+    MACOS_TERMINAL_BUNDLE_IDS,
+    MACOS_TERMINALS,
+)
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
 from .config import Config, ensure_secure_dir, expand_user_path, get_runtime_dir, redact_secrets
 from .hud import resolve_ui_language
@@ -40,44 +47,8 @@ from .session_ctx import (
     parse_window_title_hint,
 )
 
-GHOSTTY_BUNDLE_ID = "com.mitchellh.ghostty"
-APPLE_TERMINAL_BUNDLE_ID = "com.apple.terminal"
-ITERM2_BUNDLE_ID = "com.googlecode.iterm2"
 MAC_SHIM_SCRIPT = Path(__file__).resolve().with_name("mac_shim.swift")
 SHIM_SCHEMA_VERSION = 5
-MACOS_TERMINALS = frozenset(
-    {
-        "terminal",
-        "终端",
-        "iterm2",
-        "iterm",
-        "wezterm",
-        "wezterm-gui",
-        "alacritty",
-        "ghostty",
-        "kitty",
-        "warp",
-        "hyper",
-        "rio",
-        "tabby",
-    }
-)
-MACOS_TERMINAL_BUNDLE_IDS = frozenset(
-    {
-        GHOSTTY_BUNDLE_ID,
-        "com.apple.terminal",
-        "com.googlecode.iterm2",
-        "com.github.wez.wezterm",
-        "org.alacritty",
-        "io.alacritty",
-        "net.kovidgoyal.kitty",
-        "dev.warp.warp-stable",
-        "dev.warp.warp",
-        "co.zeit.hyper",
-        "com.raphaelamorim.rio",
-        "org.tabby",
-    }
-)
 SOUND_MAP = {"start": "Tink.aiff", "stop": "Pop.aiff", "focus": "Glass.aiff", "error": "Basso.aiff"}
 
 _APPLE_SEP = "\x1f"

@@ -31,6 +31,10 @@ from .audio_proc import (
 )
 from .config import (
     CREDENTIAL_ENV_ORDER,
+    DASHSCOPE_COMPAT_BASE_URL,
+    DASHSCOPE_NATIVE_MULTIMODAL_URL,
+    DOUBAO_DEFAULT_BASE_URL,
+    OPENAI_DEFAULT_BASE_URL,
     Config,
     ConfigError,
     CredentialItem,
@@ -650,10 +654,8 @@ class BaseAsrProvider:
 # 1. Alibaba Bailian / DashScope (dashscope)
 # ---------------------------------------------------------------------------
 
-DASHSCOPE_COMPAT_DEFAULT_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-DASHSCOPE_NATIVE_DEFAULT_URL = (
-    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
-)
+DASHSCOPE_COMPAT_DEFAULT_URL = f"{DASHSCOPE_COMPAT_BASE_URL}/chat/completions"
+DASHSCOPE_NATIVE_DEFAULT_URL = DASHSCOPE_NATIVE_MULTIMODAL_URL
 
 
 def _resolve_dashscope_url(base_url: str, use_native: bool) -> str:
@@ -935,7 +937,6 @@ class DashScopeAsrProvider(BaseAsrProvider):
 # 2. Volcengine Doubao BigModel ASR (doubao)
 # ---------------------------------------------------------------------------
 
-DOUBAO_DEFAULT_BASE_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel"
 DOUBAO_AUTO_SLOT_CHAIN: tuple[tuple[str, str], ...] = (
     ("flash", "volc.bigasr.auc_turbo"),
     ("submit", "volc.seedasr.auc"),
@@ -1732,7 +1733,6 @@ class GeminiAudioProvider(BaseAsrProvider):
 # 4. Dedicated STT Audio Transcriptions (/audio/transcriptions)
 # ---------------------------------------------------------------------------
 
-OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _OPENROUTER_KEYTERMS_PREFIXES = ("deepgram/", "assemblyai/")
 
 

@@ -1,6 +1,7 @@
 param(
     [string]$Mode = "bridge", [string]$Hotkey = "RControl", [string]$TriggerMode = "tap_toggle",
-    [int]$TapMaxMs = 1200, [int]$DebounceMs = 180, [int]$Seconds = 10, [int]$Beep = 0
+    [int]$TapMaxMs = 1200, [int]$DebounceMs = 180, [int]$Seconds = 10, [int]$Beep = 0,
+    [Alias("AllowedTerminals")][string]$AllowedTerminalsCsv = ""
 )
 $ErrorActionPreference = "Stop"
 [Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -2485,7 +2486,10 @@ if ($Mode -eq "probe") {
 
 $targetVk = [VoiceWinShim]::ResolveKeyName($Hotkey)
 $isPtt = ($TriggerMode -eq "ptt" -or $TriggerMode -eq "push_to_talk")
-$AllowedTerminals = @("windowsterminal", "openconsole", "mintty", "wezterm", "wezterm-gui", "alacritty", "ghostty", "conhost", "putty", "tabby", "hyper", "kitty", "rio")
+$AllowedTerminals = @("windowsterminal", "openconsole", "mintty", "wezterm", "wezterm-gui", "alacritty", "ghostty", "conhost", "putty", "tabby", "hyper", "kitty", "rio", "warp")
+if (-not [string]::IsNullOrWhiteSpace($AllowedTerminalsCsv)) {
+    $AllowedTerminals = @($AllowedTerminalsCsv.Split(',') | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ -ne "" })
+}
 try {
     if ($Mode -eq "key-test") {
         [VoiceWinShim]::StartHook($targetVk, $isPtt, $TapMaxMs, $DebounceMs, $true, ($Seconds * 1000))

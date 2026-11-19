@@ -7,12 +7,12 @@ from typing import Any, Mapping
 
 from .config import (
     CREDENTIAL_ENV_ORDER,
+    GEMINI_DEFAULT_BASE_URL,
     ConfigError,
     VALID_EFFORTS,
     _host_matches_domain,
 )
 
-GEMINI_DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 _GEMINI_BLOCKED_FINISH_REASONS = frozenset(
     {"SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"}
 )

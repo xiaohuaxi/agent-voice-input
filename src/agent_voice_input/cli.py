@@ -16,9 +16,14 @@ from .http_transport import (
     _validate_request_url,
     urllib_http_transport,
 )
-from .llm_common import GEMINI_DEFAULT_BASE_URL, _missing_key_hint
+from .llm_common import _missing_key_hint
 from .audio_proc import get_failed_audio_dir, list_failed_audios, resolve_failed_audio, resolve_ffmpeg_bin
 from .config import (
+    CODEX_SUBSCRIPTION_BASE_URL,
+    DASHSCOPE_COMPAT_BASE_URL,
+    GEMINI_DEFAULT_BASE_URL,
+    OPENAI_DEFAULT_BASE_URL,
+    OPENROUTER_DEFAULT_BASE_URL,
     Config,
     ConfigError,
     ProviderCredentials,
@@ -60,7 +65,6 @@ from .platform_macos import (
 )
 from .platform_wsl import is_wsl, probe_wsl_host, run_key_test
 from .refiner import (
-    CODEX_SUBSCRIPTION_BASE_URL,
     CodexRefiner,
     _build_responses_url,
     find_codex_bin,
@@ -412,12 +416,12 @@ def _build_ping_http_spec(
         return f"{root}/models?pageSize=1", {"x-goog-api-key": key}
     if prov == "openrouter":
         if not b or _host_matches_domain(b, "openrouter.ai"):
-            root = b or "https://openrouter.ai/api/v1"
+            root = b or OPENROUTER_DEFAULT_BASE_URL
             return f"{root}/key", {"Authorization": f"Bearer {key}"}
         return f"{b}/models", {"Authorization": f"Bearer {key}"}
     if prov == "dashscope":
         if not b:
-            url = "https://dashscope.aliyuncs.com/compatible-mode/v1/models"
+            url = f"{DASHSCOPE_COMPAT_BASE_URL}/models"
         elif "/compatible-mode" in b:
             host_root = b.split("/compatible-mode", 1)[0]
             url = f"{host_root}/compatible-mode/v1/models"
@@ -429,7 +433,7 @@ def _build_ping_http_spec(
         else:
             url = f"{b}/models"
         return url, {"Authorization": f"Bearer {key}"}
-    root = b or "https://api.openai.com/v1"
+    root = b or OPENAI_DEFAULT_BASE_URL
     url = root if root.endswith("/models") else f"{root}/models"
     return url, ({"Authorization": f"Bearer {key}"} if key else {})
 
@@ -471,7 +475,7 @@ def _probe_stage_ping(
                 return "FAIL", ms, f"FAIL ({ms}ms: Codex ping exceeded 5.0s deadline)"
             if c_item.mode == "api_key":
                 url, hdrs = _build_ping_http_spec(
-                    "openai", cfg.refiner.base_url or "https://api.openai.com/v1", c_item.token
+                    "openai", cfg.refiner.base_url or OPENAI_DEFAULT_BASE_URL, c_item.token
                 )
                 resp = eff_tx(
                     HttpRequest(

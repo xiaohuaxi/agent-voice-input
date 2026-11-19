@@ -138,6 +138,16 @@ DEFAULT_REFINER_BASE_URLS: dict[str, str] = {
     "siliconflow": "https://api.siliconflow.cn/v1",
 }
 
+OPENAI_DEFAULT_BASE_URL: str = DEFAULT_ASR_BASE_URLS["openai"]
+GEMINI_DEFAULT_BASE_URL: str = DEFAULT_ASR_BASE_URLS["gemini"]
+DOUBAO_DEFAULT_BASE_URL: str = DEFAULT_ASR_BASE_URLS["doubao"]
+OPENROUTER_DEFAULT_BASE_URL: str = DEFAULT_ASR_BASE_URLS["openrouter"]
+DASHSCOPE_COMPAT_BASE_URL: str = DEFAULT_REFINER_BASE_URLS["dashscope"]
+DASHSCOPE_NATIVE_MULTIMODAL_URL: str = (
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+)
+CODEX_SUBSCRIPTION_BASE_URL: str = "https://chatgpt.com/backend-api/codex"
+
 # Strict credential lookup priority (canonical vendor env var first, legacy aliases second).
 # REDLINE: DOUBAO_ASR_API_ID / API_ID_DOUBAO_ASR typos MUST NEVER be added here.
 CREDENTIAL_ENV_ORDER: dict[str, tuple[str, ...]] = {

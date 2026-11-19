@@ -159,6 +159,70 @@ CODING_GUI_PATTERNS: tuple[str, ...] = (
     "android studio",
 )
 
+GHOSTTY_BUNDLE_ID = "com.mitchellh.ghostty"
+APPLE_TERMINAL_BUNDLE_ID = "com.apple.terminal"
+ITERM2_BUNDLE_ID = "com.googlecode.iterm2"
+
+WINDOWS_TERMINALS: frozenset[str] = frozenset(
+    {
+        "windowsterminal",
+        "openconsole",
+        "mintty",
+        "wezterm",
+        "wezterm-gui",
+        "alacritty",
+        "ghostty",
+        "conhost",
+        "putty",
+        "tabby",
+        "hyper",
+        "kitty",
+        "rio",
+        "warp",
+    }
+)
+
+MACOS_TERMINALS: frozenset[str] = frozenset(
+    {
+        "terminal",
+        "终端",
+        "iterm2",
+        "iterm",
+        "wezterm",
+        "wezterm-gui",
+        "alacritty",
+        "ghostty",
+        "kitty",
+        "warp",
+        "hyper",
+        "rio",
+        "tabby",
+    }
+)
+
+MACOS_TERMINAL_BUNDLE_IDS: frozenset[str] = frozenset(
+    {
+        GHOSTTY_BUNDLE_ID,
+        APPLE_TERMINAL_BUNDLE_ID,
+        ITERM2_BUNDLE_ID,
+        "com.github.wez.wezterm",
+        "org.alacritty",
+        "io.alacritty",
+        "net.kovidgoyal.kitty",
+        "dev.warp.warp-stable",
+        "dev.warp.warp",
+        "co.zeit.hyper",
+        "com.raphaelamorim.rio",
+        "org.tabby",
+    }
+)
+
+
+def is_windows_terminal_process(process: str) -> bool:
+    p = normalize_app_token(process)
+    return bool(p) and p in WINDOWS_TERMINALS
+
+
 WINDOWS_SHIFT_INSERT_PROCS: frozenset[str] = frozenset(
     {
         "mintty",     # Git Bash / MSYS2 / Cygwin (ClipShortcuts=yes by default; Ctrl+V sends literal ^V)
@@ -177,6 +241,7 @@ WINDOWS_CTRL_SHIFT_V_PROCS: frozenset[str] = frozenset(
         "wezterm-gui",
         "rio",
         "ghostty",
+        "warp",       # Warp on Windows/Linux maps Terminal:Paste to Ctrl+Shift+V by default
         "tabby",      # Tabby default paste on Windows is Ctrl+Shift+V (Ctrl+V unbound by default)
         "hyper",      # Vercel Hyper win32.json maps editor:paste to ctrl+shift+v
         "windterm",   # WindTerm SSH client

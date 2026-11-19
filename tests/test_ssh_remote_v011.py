@@ -1841,7 +1841,7 @@ sys.exit(p.returncode)
                 "os.lstat", side_effect=_forbid_mnt_lstat
             ), mock.patch(
                 "os.path.realpath", side_effect=_forbid_mnt_realpath
-            ), mock.patch("agent_voice_input.session_ctx._HOST_IS_WSL", True):
+            ), mock.patch("agent_voice_input.workspace_ctx._HOST_IS_WSL", True):
                 self.assertTrue(
                     _is_broad_or_unsafe_workspace_dir("/mnt/d/sleeping_hdd/proj", link_home, wsl=True)
                 )
