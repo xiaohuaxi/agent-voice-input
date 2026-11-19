@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-19
+
 ### Added
 - **Desktop IDE workspace & Antigravity IDE conversation binding**: Added bounded non-recursive workspace resolution across VS Code, Cursor, Windsurf, Antigravity IDE, Zed, JetBrains IDEs, Xcode, and Sublime Text (via window title parsing and macOS `AXDocument` `file://` URLs, with zero-slow-mount-I/O WSL2 `/mnt/` guards), injecting workspace `git status` and core filenames without leaking unrelated terminal CLI sessions, plus 3-tier `brain/<cid>` root-session matching (selecting the latest matching conversation for that workspace) and incremental `50K` cached context sync for desktop Antigravity IDE.
 - **Non-Git folder filename & hotword fallback**: Added a bounded shallow `os.scandir` fallback (up to `200` entries across root + 1 subdir level, cached for `300s`, with strict `~` / `/` / `/tmp` / `/Users` / `/home/<user>` privacy guards) across both CLI sessions and desktop IDE workspaces so ordinary document/project folders without `.git` still supply local filenames and stems as spelling references and Stage 1 hotwords.
@@ -84,7 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Initial WSL2 release**: Two-stage context-aware voice input daemon and CLI for coding agents (**Codex**, **Claude Code**, **AGY**) on Windows + WSL2, featuring native `win_shim.ps1` WASAPI capture, global hotkey & HUD bridge, active terminal session discovery, `ffmpeg` loudness normalization with local silence gating, and safe paste without auto-pressing `Enter`.
 
-[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.6.1...v0.7.0

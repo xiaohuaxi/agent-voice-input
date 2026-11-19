@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前已发布基线**：`v0.8.0`（已发布版本的完整变更记录见 [CHANGELOG.md](CHANGELOG.md)）
+> **当前版本基线**：`v0.9.0`（完整版本变更记录见 [CHANGELOG.md](CHANGELOG.md)）
 >
 > **项目工程规范**：[AGENTS.md](AGENTS.md)
 
@@ -41,25 +41,9 @@
 
 ---
 
-## 二、未发布阶段演进规划
+## 二、后续阶段演进规划
 
-已发布版本（`v0.1.0` ～ `v0.8.0`）的演进详情已归档至根目录 [CHANGELOG.md](CHANGELOG.md)。后续路线按 **`v0.9.0` -> `v0.10.0` -> `v0.11.0` -> `v1.0.0`** 分阶段推进。
-
----
-
-### `v0.9.0`：操控韧性、原生桥接自愈与桌面 GUI 场景感知（收官中）
-
-聚焦在途可控性、连发口述并发吞吐、双端剪贴板无损保护与高投入产出比的桌面开发/对话场景感知：
-
-- **已合入 `Unreleased`（`v0.9-2a` / `v0.9-2b`）**：
-  - **单进程在途取消**：支持 `agent-voice-input cancel [--seq N]` 与 `tap_toggle` 空闲长按热键取消（`hold_cancel`），`CancelToken` 贯穿分片识别、重试轮询与精修，`shutdown(SHUT_RDWR)` 即时唤醒阻塞 Socket，取消后将已过门控录音原子暂存至 `failed/`（`0600`）供 `retry` 恢复；
-  - **Stage 2 有界并发与严格保序落字**：Stage 1 ASR 保持串行防上游限流，Stage 2 无状态精修并发重叠执行并按 `seq_id` 严格 FIFO 投递上屏；
-  - **WSL2 `win_shim` 编译缓存与自愈 + 双端单槽位剪贴板恢复**：按脚本 SHA-256 将编译后的 C# DLL 缓存在 `%LOCALAPPDATA%\agent-voice-input\` 并支持未就绪异常自动重拉；Windows 与 macOS 模拟粘贴路径补齐单槽位防连发竞态的多格式图文剪贴板备份恢复，并对密码管理器敏感剪贴板项执行到期安全清空。
-- **待完成收口（`v0.9-3`）**：
-  - **桌面版 Antigravity IDE 同构会话精准关联**：解析前台 IDE 窗口工作区，按路径证据精准匹配近期活跃的同构 `brain/<cid>/.system_generated/logs/transcript_full.jsonl` 主会话，无缝复用现有增量读取与 50K 封口分块前缀缓存；
-  - **主流桌面 IDE 工作区定位与非 Git 普通文件夹浅层文件名兜底**：从 VS Code / Cursor / Windsurf / Zed / JetBrains / Xcode 等窗口标题及 macOS `AXDocument` 定向解析本地工作区 `cwd`，优先注入 Git 变更与核心文件热词，对**非 Git 普通文件夹提供有界浅层文件名提取兜底**；
-  - **WSL2 `/mnt/` 跨盘慢挂载硬拦截**：纯字符串前置拦截 `/mnt/` 及跨盘软链路径，确保 WSL2 下对 9P 挂载盘启动的 `git` / 目录扫描次数为零，杜绝大仓阻塞；
-  - **桌面 AI 对话与即时通讯 `<target_app_hint>` 轻提示**：在不改动静态系统提示词（100% 保护前缀缓存）的前提下，于尾部动态块为桌面 AI 聊天（`ai_chat`）与 IM 应用（`im_chat`）注入单行只读场景倾向提示并做防回显剥离。
+已完成版本（`v0.1.0` ～ `v0.9.0`）的演进详情已归档至根目录 [CHANGELOG.md](CHANGELOG.md)。后续路线按 **`v0.10.0` -> `v0.11.0` -> `v1.0.0`** 分阶段推进。
 
 ---
 
