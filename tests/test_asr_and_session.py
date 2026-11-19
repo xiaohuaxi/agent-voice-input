@@ -1108,7 +1108,7 @@ class AsrProvidersTests(unittest.TestCase):
                     {**base_clean_env, "HTTP_PROXY": "http://127.0.0.1:9999"},
                     clear=True,
                 ),
-                mock.patch("agent_voice_input.asr_providers._SAFE_OPENER", _FakeOpener()),
+                mock.patch("agent_voice_input.http_transport._SAFE_OPENER", _FakeOpener()),
             ):
                 r_prox = urllib_http_transport(HttpRequest(f"{base}/echo", "GET", {}, b"", 3.0))
                 self.assertEqual(r_prox.json(), {"via": "proxy"})
@@ -1120,7 +1120,7 @@ class AsrProvidersTests(unittest.TestCase):
                     {**base_clean_env, "HTTP_PROXY": "http://127.0.0.1:9999", "NO_PROXY": "127.0.0.1"},
                     clear=True,
                 ),
-                mock.patch("agent_voice_input.asr_providers._SAFE_OPENER", _FakeOpener()),
+                mock.patch("agent_voice_input.http_transport._SAFE_OPENER", _FakeOpener()),
             ):
                 r_bypass = urllib_http_transport(HttpRequest(f"{base}/echo", "GET", {}, b"", 3.0))
                 self.assertEqual(r_bypass.json()["path"], "/echo")
@@ -1223,7 +1223,7 @@ class AsrProvidersTests(unittest.TestCase):
         try:
             # 1a. Direct Keep-Alive HTTPS path: TCP accepted immediately, ServerHello never arrives
             t0 = time.monotonic()
-            with mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=False):
+            with mock.patch("agent_voice_input.http_transport._should_use_system_proxy", return_value=False):
                 with self.assertRaises(HttpTransportError) as cm_direct:
                     urllib_http_transport(
                         HttpRequest(
@@ -1245,7 +1245,7 @@ class AsrProvidersTests(unittest.TestCase):
             proxy_url = f"http://127.0.0.1:{stalled_port}"
             t1 = time.monotonic()
             with (
-                mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=True),
+                mock.patch("agent_voice_input.http_transport._should_use_system_proxy", return_value=True),
                 mock.patch("urllib.request.getproxies", return_value={"https": proxy_url}),
                 mock.patch("urllib.request.proxy_bypass", return_value=False),
             ):
@@ -1316,7 +1316,7 @@ class AsrProvidersTests(unittest.TestCase):
             # Slow-drip CONNECT headers bounded by connect_timeout_sec=0.12s (even with timeout_sec=3.0s)
             t_dc = time.monotonic()
             with (
-                mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=True),
+                mock.patch("agent_voice_input.http_transport._should_use_system_proxy", return_value=True),
                 mock.patch("urllib.request.getproxies", return_value={"https": f"http://127.0.0.1:{drip_port}"}),
                 mock.patch("urllib.request.proxy_bypass", return_value=False),
             ):
@@ -1335,7 +1335,7 @@ class AsrProvidersTests(unittest.TestCase):
 
             # Slow-drip HTTP response headers bounded by timeout_sec=0.12s
             t_dh = time.monotonic()
-            with mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=False):
+            with mock.patch("agent_voice_input.http_transport._should_use_system_proxy", return_value=False):
                 with self.assertRaises(HttpTransportError):
                     urllib_http_transport(
                         HttpRequest(
@@ -1378,7 +1378,7 @@ class AsrProvidersTests(unittest.TestCase):
         t_http.start()
         try:
             slow_url = f"http://127.0.0.1:{httpd.server_port}/slow"
-            with mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=False):
+            with mock.patch("agent_voice_input.http_transport._should_use_system_proxy", return_value=False):
                 r1 = urllib_http_transport(
                     HttpRequest(
                         url=slow_url,
@@ -1432,7 +1432,7 @@ class AsrProvidersTests(unittest.TestCase):
 
             _KEEPALIVE_POOL.close_all()
             with (
-                mock.patch("agent_voice_input.asr_providers._should_use_system_proxy", return_value=False),
+                mock.patch("agent_voice_input.http_transport._should_use_system_proxy", return_value=False),
                 mock.patch.object(_KEEPALIVE_POOL, "_get_ssl_context", return_value=_FakeTlsCtx()),
             ):
                 r_https = urllib_http_transport(
