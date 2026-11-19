@@ -19,6 +19,7 @@ venv/
 .DS_Store
 
 # Agent harness runtime paths
+.agents/local/
 .agents/worktrees/
 .agents/tmp-*
 .agents/settings.local.json
