@@ -63,6 +63,23 @@ import base64
 import http.server
 
 
+def _wait_for_control_socket(runtime_dir: Path, timeout_sec: float = 3.0) -> dict[str, object]:
+    """Wait until the daemon control socket finishes bind -> chmod(0o600) -> listen and answers status."""
+    deadline = time.monotonic() + timeout_sec
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            resp = send_control_command(runtime_dir, {"cmd": "status"}, timeout_sec=0.5)
+            if resp.get("ok"):
+                return resp
+        except Exception as exc:
+            last_err = exc
+        time.sleep(0.02)
+    raise AssertionError(
+        f"daemon control socket at {runtime_dir / 'control.sock'} did not become ready within {timeout_sec}s: {last_err!r}"
+    )
+
+
 def _make_fake_jwt(
     *,
     exp: int | None = 4102444800,
@@ -1468,9 +1485,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             t = threading.Thread(target=daemon.serve_forever, daemon=True)
             t.start()
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline and not daemon.sock_path.exists():
-                time.sleep(0.02)
+            _wait_for_control_socket(rt, timeout_sec=3.0)
             self.assertEqual(daemon.sock_path.stat().st_mode & 0o777, 0o600)
 
             # Client disconnecting before reading reply must NOT crash serve_forever with BrokenPipeError
@@ -2676,9 +2691,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             t_srv = threading.Thread(target=daemon_srv.serve_forever, daemon=True)
             t_srv.start()
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline and not daemon_srv.sock_path.exists():
-                time.sleep(0.02)
+            _wait_for_control_socket(rt_srv, timeout_sec=3.0)
             assert plat_srv.listener is not None
             try:
                 # Non-terminal event from shim listener is ignored
@@ -6198,9 +6211,7 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
             srv_thread = threading.Thread(target=daemon.serve_forever, daemon=True)
             srv_thread.start()
             try:
-                deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline and not (rt / "control.sock").exists():
-                    time.sleep(0.02)
+                _wait_for_control_socket(rt, timeout_sec=3.0)
 
                 # Run 2 live utterances on the current daemon (seq 1, 2)
                 for _ in range(2):
@@ -7920,9 +7931,7 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
             )
             srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
             srv_th.start()
-            deadline_sock = time.monotonic() + 2.0
-            while time.monotonic() < deadline_sock and not daemon.sock_path.exists():
-                time.sleep(0.01)
+            _wait_for_control_socket(rt, timeout_sec=3.0)
             try:
                 # 1. Idle hold_cancel -> ignored ('not_inflight')
                 r_idle_hc = daemon.handle_cancel(only_inflight=True)

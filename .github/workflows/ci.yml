@@ -49,8 +49,8 @@ jobs:
           command -v ffmpeg >/dev/null 2>&1 || pkgs="$pkgs ffmpeg"
           command -v tmux >/dev/null 2>&1 || pkgs="$pkgs tmux"
           if [ -n "$pkgs" ]; then
-            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update
-            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 install -y --no-install-recommends $pkgs
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y --no-install-recommends $pkgs
           fi
 
       - name: Run offline unit tests with tiered statement & pure-branch coverage gate
