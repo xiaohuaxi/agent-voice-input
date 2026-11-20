@@ -646,6 +646,196 @@ class MetricsAndReplayTests(unittest.TestCase):
                 self.assertEqual(gen_sample["session_tag"], "none")
                 self.assertEqual(gen_sample["ctx_chunks"], 0)
 
+    def test_v010_asr_cache_slot_isolation_and_manifest_denominator_accuracy(self) -> None:
+        # 1. Same (provider, model) with different Doubao slot / mode / API / effort / base_url produce distinct cache keys
+        k_default, _ = EVAL.make_asr_cache_key("sha1a", "doubao", "bigmodel", ("Codex",))
+        k_turbo, _ = EVAL.make_asr_cache_key(
+            "sha1a", "doubao", "bigmodel", ("Codex",), resource_id="volc.bigasr.auc_turbo", doubao_mode="flash"
+        )
+        k_seed2, _ = EVAL.make_asr_cache_key(
+            "sha1a", "doubao", "bigmodel", ("Codex",), resource_id="volc.seedasr.auc", doubao_mode="submit"
+        )
+        k_submit1, _ = EVAL.make_asr_cache_key(
+            "sha1a", "doubao", "bigmodel", ("Codex",), resource_id="volc.bigasr.auc", doubao_mode="submit"
+        )
+        k_custom_url, _ = EVAL.make_asr_cache_key(
+            "sha1a", "doubao", "bigmodel", ("Codex",), base_url="https://custom.example.test/api"
+        )
+        k_effort, _ = EVAL.make_asr_cache_key(
+            "sha1a", "dashscope", "qwen3-asr-flash", ("Codex",), asr_effort="low"
+        )
+        k_api, _ = EVAL.make_asr_cache_key(
+            "sha1a", "dashscope", "qwen3-asr-flash", ("Codex",), asr_api="chat-completions"
+        )
+        self.assertEqual(len({k_default, k_turbo, k_seed2, k_submit1, k_custom_url}), 5)
+        self.assertNotEqual(k_effort, k_api)
+        # All slots (including default) use versioned v2 cache key with slot fingerprint to prevent legacy cache collision
+        self.assertTrue(k_default.startswith("v2:"))
+        self.assertIn(":slot=", k_default)
+        self.assertTrue(k_turbo.startswith("v2:"))
+        self.assertIn(":slot=", k_turbo)
+        # Alias provider name normalizes identically in cache key
+        k_volc_alias, _ = EVAL.make_asr_cache_key("sha1a", "volcengine", "bigmodel", ("Codex",))
+        self.assertEqual(k_volc_alias, k_default)
+
+        # 2. End-to-end replay: Doubao 1.0 vs Doubao 2.0 slots do NOT collide in asr_cache.json,
+        #    and --manifest-from deduplicates identical SHA1s & reports accurate expected/missing denominators
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home, rec_dir, eval_dir, host_rt = root / "home", root / "rec", root / "eval", root / "rt"
+            rec_dir.mkdir(parents=True)
+            host_rt.mkdir(parents=True)
+            cfg_file = home / ".config" / "agent-voice-input" / "config.toml"
+            cfg_file.parent.mkdir(parents=True)
+            cfg_file.write_text('[asr]\nprovider = "doubao"\n[refiner]\nprovider = "off"\n', encoding="utf-8")
+
+            t0 = 1794967200.0
+            r1 = rec_dir / "rec-20261118-100010-111111.wav"
+            r2 = rec_dir / "rec-20261118-100020-222222.wav"
+            wav1 = _make_voiced_wav(3.0, freq_hz=220.0)
+            wav2 = _make_voiced_wav(4.0, freq_hz=330.0)
+            r1.write_bytes(wav1)
+            r2.write_bytes(wav2)
+            os.utime(r1, (t0 + 10.0, t0 + 10.0))
+            os.utime(r2, (t0 + 20.0, t0 + 20.0))
+
+            seen_rids: list[str] = []
+
+            def _make_fake_asr(cfg_arg, *_a, **_kw):
+                rid = cfg_arg.asr.resource_id
+
+                class _SlotAsr:
+                    provider_name = "doubao"
+                    single_hop = False
+
+                    def transcribe(self, _wav: bytes, context=None, **kw) -> AsrResult:
+                        seen_rids.append(rid)
+                        return AsrResult(text=f"slot-{rid}", provider="doubao", model="bigmodel", latency_ms=100)
+
+                return _SlotAsr()
+
+            common = [
+                "--config", str(cfg_file),
+                "--home-dir", str(home),
+                "--recordings-dir", str(rec_dir),
+                "--eval-dir", str(eval_dir),
+                "--host-runtime-dir", str(host_rt),
+                "--no-git-status",
+            ]
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home), "DOUBAO_ASR_API_KEY": "db-key-test"}, clear=False),
+                mock.patch.object(EVAL, "create_asr_provider", side_effect=_make_fake_asr),
+            ):
+                with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                    rc1 = EVAL.main([
+                        *common, "--tag", "db_v1",
+                        "--asr-resource-id", "volc.bigasr.auc_turbo", "--asr-doubao-mode", "flash",
+                    ])
+                    rc2 = EVAL.main([
+                        *common, "--tag", "db_v2",
+                        "--asr-resource-id", "volc.seedasr.auc", "--asr-doubao-mode", "submit",
+                    ])
+                self.assertEqual((rc1, rc2), (0, 0))
+                # Both slots ran 2 ASR calls (4 total, zero cross-slot cache collision!)
+                self.assertEqual(
+                    seen_rids,
+                    ["volc.bigasr.auc_turbo", "volc.bigasr.auc_turbo", "volc.seedasr.auc", "volc.seedasr.auc"],
+                )
+
+                # Add a duplicate copy of r1 (same SHA1) and verify --manifest-from deduplicates it (2 samples, not 3)
+                r1_dup = rec_dir / "rec-20261118-100015-dup111.wav"
+                r1_dup.write_bytes(wav1)
+                os.utime(r1_dup, (t0 + 15.0, t0 + 15.0))
+                with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                    rc_dedup = EVAL.main([
+                        *common, "--tag", "db_v1_dedup", "--manifest-from", "db_v1",
+                        "--asr-resource-id", "volc.bigasr.auc_turbo", "--asr-doubao-mode", "flash",
+                    ])
+                self.assertEqual(rc_dedup, 0)
+                dedup_doc = json.loads((eval_dir / "db_v1_dedup.json").read_text(encoding="utf-8"))
+                self.assertEqual(dedup_doc["aggregate"]["total_recordings"], 2)
+                self.assertEqual(dedup_doc["aggregate"]["manifest_expected"], 2)
+                self.assertEqual(dedup_doc["aggregate"]["manifest_missing"], 0)
+                # Cache WAS reused for the same slot (no extra ASR calls!)
+                self.assertEqual(len(seen_rids), 4)
+
+                # Alias --asr-provider volcengine when config has asr.provider="doubao" preserves config resource_id/doubao_mode!
+                cfg_file.write_text(
+                    '[asr]\nprovider = "doubao"\nresource_id = "volc.seedasr.auc"\ndoubao_mode = "submit"\n'
+                    '[refiner]\nprovider = "off"\n',
+                    encoding="utf-8",
+                )
+                with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                    rc_alias = EVAL.main([
+                        *common, "--tag", "db_v2_alias", "--manifest-from", "db_v1",
+                        "--asr-provider", "volcengine",
+                    ])
+                self.assertEqual(rc_alias, 0)
+                alias_doc = json.loads((eval_dir / "db_v2_alias.json").read_text(encoding="utf-8"))
+                self.assertEqual(alias_doc["meta"]["asr_resource_id"], "volc.seedasr.auc")
+                self.assertEqual(alias_doc["meta"]["asr_doubao_mode"], "submit")
+                # Reused db_v2 cache with 0 extra ASR calls (alias did NOT wipe slot!)
+                self.assertEqual(len(seen_rids), 4)
+
+                # Under --limit 5 + --min-duration 3.5 when both manifest files exist on disk (r1=3s filtered, r2=4s kept):
+                # missing_on_disk MUST be 0 (not miscounted as missing due to --limit > 0!) and filtered MUST be 1.
+                err_filt = io.StringIO()
+                with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", err_filt):
+                    rc_filt = EVAL.main([
+                        *common, "--tag", "db_v2_filt", "--manifest-from", "db_v1",
+                        "--limit", "5", "--min-duration", "3.5",
+                    ])
+                self.assertEqual(rc_filt, 0)
+                filt_doc = json.loads((eval_dir / "db_v2_filt.json").read_text(encoding="utf-8"))
+                self.assertEqual(filt_doc["meta"]["manifest_missing_on_disk"], 0)
+                self.assertEqual(filt_doc["meta"]["manifest_filtered"], 1)
+                self.assertIn("missing_on_disk=0, filtered_by_gate_or_duration=1", err_filt.getvalue())
+
+                # Restore plain config for remaining assertions
+                cfg_file.write_text('[asr]\nprovider = "doubao"\n[refiner]\nprovider = "off"\n', encoding="utf-8")
+
+                # Respect --limit on --manifest-from without false missing count
+                with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                    rc_lim = EVAL.main([
+                        *common, "--tag", "db_v1_lim1", "--manifest-from", "db_v1", "--limit", "1",
+                        "--asr-resource-id", "volc.bigasr.auc_turbo", "--asr-doubao-mode", "flash",
+                    ])
+                self.assertEqual(rc_lim, 0)
+                lim_doc = json.loads((eval_dir / "db_v1_lim1.json").read_text(encoding="utf-8"))
+                self.assertEqual(lim_doc["aggregate"]["manifest_expected"], 1)
+                self.assertEqual(lim_doc["aggregate"]["manifest_missing"], 0)
+
+                # Delete r2 from disk -> --manifest-from warns and records accurate 1/2 matched, 1 missing; compare_runs notes partial pairing
+                r2.unlink()
+                out_part, err_part = io.StringIO(), io.StringIO()
+                with mock.patch("sys.stdout", out_part), mock.patch("sys.stderr", err_part):
+                    rc_part = EVAL.main([
+                        *common, "--tag", "db_v1_partial", "--manifest-from", "db_v1",
+                        "--asr-resource-id", "volc.bigasr.auc_turbo", "--asr-doubao-mode", "flash",
+                    ])
+                self.assertEqual(rc_part, 0)
+                self.assertIn("matched 1/2", err_part.getvalue())
+                self.assertIn("Manifest aligned", out_part.getvalue())
+                part_doc = json.loads((eval_dir / "db_v1_partial.json").read_text(encoding="utf-8"))
+                self.assertEqual(part_doc["meta"]["manifest_total"], 2)
+                self.assertEqual(part_doc["meta"]["manifest_missing"], 1)
+                self.assertEqual(part_doc["aggregate"]["manifest_expected"], 2)
+                self.assertEqual(part_doc["aggregate"]["manifest_missing"], 1)
+
+                cmp_part = EVAL.compare_runs(
+                    json.loads((eval_dir / "db_v1.json").read_text(encoding="utf-8")),
+                    part_doc,
+                )
+                self.assertIn("paired=`1`, base=`2`, cand=`1`", cmp_part)
+
+                # Deleting all manifest files fails fast using manifest_expected as denominator (0/1 under --limit 1)
+                r1.unlink()
+                r1_dup.unlink()
+                with self.assertRaises(SystemExit) as zero_ctx:
+                    with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                        EVAL.main([*common, "--tag", "db_v1_empty", "--manifest-from", "db_v1", "--limit", "1"])
+                self.assertIn("matched 0/1", str(zero_ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

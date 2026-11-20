@@ -13,7 +13,7 @@ if str(_SRC_ROOT) not in sys.path:
 from agent_voice_input import __version__  # noqa: E402
 from agent_voice_input.asr_providers import AsrResult, create_asr_provider, load_hotwords_file  # noqa: E402
 from agent_voice_input.audio_proc import _write_temp_0600, list_saved_recordings, process_wav  # noqa: E402
-from agent_voice_input.config import ensure_secure_dir, expand_user_path, get_runtime_dir, load_config, redact_secrets, resolve_credentials, resolve_saved_recordings_dir, select_asr_provider  # noqa: E402
+from agent_voice_input.config import DEFAULT_ASR_BASE_URLS, ensure_secure_dir, expand_user_path, get_runtime_dir, load_config, normalize_asr_provider, normalize_refiner_provider, redact_secrets, resolve_credentials, resolve_saved_recordings_dir, select_asr_provider  # noqa: E402
 from agent_voice_input.daemon import _call_refiner_refine, _may_run_stage2_refiner, _transcribe_wav_chunks, read_telemetry_history  # noqa: E402
 from agent_voice_input.refiner import attach_single_hop_context, create_refiner  # noqa: E402
 from agent_voice_input.session_ctx import SessionMatch, SessionTracker, _clean_agy_record, _clean_claude_record, _collect_claude_storage_matches, _collect_codex_storage_matches, _extract_agy_transcript_cwd, _extract_codex_item_completed, _extract_codex_response_item, _is_agy_transcript_subagent, _resolve_agy_transcript_path  # noqa: E402
@@ -227,12 +227,26 @@ def make_asr_cache_key(
     *,
     git_status: str = "",
     dialog_text: str = "",
+    asr_api: str = "",
+    asr_effort: str = "",
+    resource_id: str = "",
+    doubao_mode: str = "",
+    base_url: str = "",
 ) -> tuple[str, str]:
     raw_ctx = "\n".join(hotwords)
     if git_status or dialog_text:
         raw_ctx = f"{raw_ctx}\0{git_status}\0{dialog_text[-2500:]}"
     hw_sha1 = hashlib.sha1(raw_ctx.encode("utf-8")).hexdigest()
-    return f"{rec_sha1}:{asr_provider}:{asr_model}:{hw_sha1}", hw_sha1
+    prov = normalize_asr_provider(asr_provider) if asr_provider.strip() else ""
+    norm_api = (asr_api or "auto").strip().lower() or "auto"
+    norm_effort = (asr_effort or "auto").strip().lower() or "auto"
+    norm_rid = (resource_id or "auto").strip().lower() or "auto"
+    norm_dmode = (doubao_mode or "auto").strip().lower() or "auto"
+    default_url = DEFAULT_ASR_BASE_URLS.get(prov, "").rstrip("/")
+    norm_url = (base_url or "").strip().rstrip("/") or default_url
+    slot_canon = f"api={norm_api}\0effort={norm_effort}\0rid={norm_rid}\0dmode={norm_dmode}\0url={norm_url}"
+    slot_sig = hashlib.sha1(slot_canon.encode("utf-8")).hexdigest()[:12]
+    return f"v2:{rec_sha1}:{prov}:{asr_model}:{hw_sha1}:slot={slot_sig}", hw_sha1
 
 
 def _contains_tech_term(text: str, term: str) -> bool:
@@ -269,7 +283,11 @@ def _sample_e2e_ms(s: Mapping[str, Any]) -> int:
     return int(s.get("asr_ms") or 0) + int(s.get("prep_ms") or 0) + int(s.get("refine_ms") or 0)
 
 
-def aggregate_run_metrics(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def aggregate_run_metrics(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    manifest_expected: int | None = None,
+) -> dict[str, Any]:
     valid = [s for s in samples if s.get("ok")]
     long_s = [s for s in valid if float(s.get("duration_sec") or 0.0) >= 10.0]
     e2e_ms = [_sample_e2e_ms(s) for s in valid]
@@ -281,7 +299,7 @@ def aggregate_run_metrics(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any
     ret = [float(s["char_retention"]) for s in valid if int(s.get("asr_chars") or 0) > 0 and isinstance(s.get("char_retention"), (int, float))]
     long_ret = [float(s["char_retention"]) for s in long_s if int(s.get("asr_chars") or 0) > 0 and isinstance(s.get("char_retention"), (int, float))]
     r1 = lambda v: round(v, 1) if v is not None else None
-    return {
+    out: dict[str, Any] = {
         "total_recordings": len(samples), "valid_samples": len(valid), "long_samples": len(long_s),
         "skipped_samples": len(samples) - len(valid), "asr_cache_hits": sum(1 for s in samples if s.get("asr_cached")),
         "e2e_ms_p50": r1(_percentile(e2e_ms, 50)), "e2e_ms_p90": r1(_percentile(e2e_ms, 90)),
@@ -302,11 +320,24 @@ def aggregate_run_metrics(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any
         "fallback_count": sum(1 for s in valid if s.get("is_fallback")),
         "hard_gate_fails": sum(1 for s in valid if s.get("hard_gate_fail")),
     }
+    if manifest_expected is not None:
+        out["manifest_expected"] = int(manifest_expected)
+        out["manifest_missing"] = max(0, int(manifest_expected) - len(samples))
+    return out
 
 def _summary_rows(a: Mapping[str, Any]) -> list[tuple[str, str]]:
     f = lambda v, s="": "-" if v is None else f"{v}{s}"
-    return [
+    rows: list[tuple[str, str]] = [
         ("Valid / Total / Long (`>=10s`)", f"{a['valid_samples']} / {a['total_recordings']} / {a['long_samples']}"),
+    ]
+    if a.get("manifest_expected") is not None:
+        rows.append(
+            (
+                "Manifest aligned (matched / expected / missing)",
+                f"{a['total_recordings']} / {a['manifest_expected']} / {a.get('manifest_missing', 0)}",
+            )
+        )
+    rows.extend([
         ("Stage 1 ASR cache hits", f"{a['asr_cache_hits']} / {a['total_recordings']}"),
         ("End-to-end `e2e_ms` (p50 / p90 / `>=10s` p50)", f"{f(a.get('e2e_ms_p50'))} / {f(a.get('e2e_ms_p90'))} / {f(a.get('long_e2e_ms_p50'))} ms"),
         ("Stage 1 `asr_ms` (p50 / p90)", f"{f(a['asr_ms_p50'])} / {f(a['asr_ms_p90'])} ms"),
@@ -318,7 +349,8 @@ def _summary_rows(a: Mapping[str, Any]) -> list[tuple[str, str]]:
         ("Canonical tech-term hits / Homophone errors", f"{a['canonical_tech_hits']} / {a['homophone_error_hits']}"),
         ("Inline backtick violations (hits / samples)", f"{a.get('backtick_hits', 0)} / {a.get('backtick_samples', 0)}"),
         ("Fallbacks / Hard-gate fails", f"{a['fallback_count']} / {a['hard_gate_fails']}"),
-    ]
+    ])
+    return rows
 
 
 def _rescore_paired_sample(s: Mapping[str, Any], shared_hw: Sequence[str], *, fallback_asr_draft: str = "") -> tuple[dict[str, Any], bool]:
@@ -382,7 +414,12 @@ def compare_runs(
                 f"- Submitted User Ref: {redact_fn(str(bs.get('submitted_user_ref') or cs.get('submitted_user_ref') or '-'))}", "",
             ])
         _atomic_write_0600(diff_out_path, "\n".join(md))
-    out = [f"# Replay A/B Comparison: `{b_tag}` vs `{c_tag}` (paired=`{len(keys)}`)", ""]
+    pair_note = (
+        f"paired=`{len(keys)}`, base=`{len(b_map)}`, cand=`{len(c_map)}`"
+        if (len(keys) != len(b_map) or len(keys) != len(c_map))
+        else f"paired=`{len(keys)}`"
+    )
+    out = [f"# Replay A/B Comparison: `{b_tag}` vs `{c_tag}` ({pair_note})", ""]
     if diff_disp:
         out.append(f"- Detailed Diff (`0600`): `{diff_disp}`")
     if used_paired_ret:
@@ -405,6 +442,8 @@ def main(argv: list[str] | None = None) -> int:
         ("--min-duration", {"type": float, "default": 0.0}), ("--limit", {"type": int, "default": 0}),
         ("--asr-provider", {"default": ""}), ("--asr-model", {"default": ""}),
         ("--asr-api", {"default": ""}), ("--asr-effort", {"default": ""}),
+        ("--asr-resource-id", {"default": ""}), ("--asr-doubao-mode", {"default": ""}),
+        ("--asr-base-url", {"default": ""}),
         ("--refiner-provider", {"default": ""}), ("--refiner-model", {"default": ""}),
         ("--refiner-api", {"default": ""}), ("--refiner-effort", {"default": ""}),
         ("--refiner-base-url", {"default": ""}), ("--refiner-api-key-env", {"default": ""}),
@@ -434,16 +473,28 @@ def main(argv: list[str] | None = None) -> int:
 
     tag = _validate_tag(args.tag)
     ov: dict[str, Any] = {"audio.save_recordings": False}
-    if ap_val := args.asr_provider.strip().lower():
+    if args.asr_provider.strip():
+        ap_val = normalize_asr_provider(args.asr_provider)
         ov["asr.provider"] = ap_val
-        if ap_val != base_cfg.asr.provider:
-            ov.update({"asr.model": "", "asr.api": "auto", "asr.base_url": "", "asr.api_key_env": ""})
-    for attr, key in (("asr_model", "asr.model"), ("asr_api", "asr.api"), ("asr_effort", "asr.effort")):
+        if ap_val != base_cfg.asr.canonical_provider():
+            ov.update({
+                "asr.model": "", "asr.api": "auto", "asr.base_url": "", "asr.api_key_env": "",
+                "asr.resource_id": "auto", "asr.doubao_mode": "auto",
+            })
+    for attr, key in (
+        ("asr_model", "asr.model"),
+        ("asr_api", "asr.api"),
+        ("asr_effort", "asr.effort"),
+        ("asr_resource_id", "asr.resource_id"),
+        ("asr_doubao_mode", "asr.doubao_mode"),
+        ("asr_base_url", "asr.base_url"),
+    ):
         if val := getattr(args, attr).strip():
             ov[key] = val
-    if rp := args.refiner_provider.strip().lower():
+    if args.refiner_provider.strip():
+        rp = normalize_refiner_provider(args.refiner_provider)
         ov["refiner.provider"] = rp
-        if rp != base_cfg.refiner.provider:
+        if rp != normalize_refiner_provider(base_cfg.refiner.provider):
             ov.update({"refiner.model": "", "refiner.api": "auto", "refiner.effort": "", "refiner.base_url": "", "refiner.api_key_env": ""})
     for attr, key in (
         ("refiner_model", "refiner.model"),
@@ -468,16 +519,23 @@ def main(argv: list[str] | None = None) -> int:
     rec_dir = expand_user_path(args.recordings_dir, env=env) if args.recordings_dir else resolve_saved_recordings_dir(env)
     raw_recs = sorted(list_saved_recordings(rec_dir), key=lambda p: (p.stat().st_mtime, p.name))
     allowed_sha1: set[str] | None = None
+    manifest_tag = ""
+    manifest_total: int | None = None
+    manifest_expected: int | None = None
     if args.manifest_from.strip():
-        mf_tag = _validate_tag(args.manifest_from)
-        mf_doc = _load_json_dict(eval_dir / f"{mf_tag}.json")
+        manifest_tag = _validate_tag(args.manifest_from)
+        mf_doc = _load_json_dict(eval_dir / f"{manifest_tag}.json")
         if not mf_doc or not isinstance(mf_doc.get("samples"), list) or not mf_doc["samples"]:
-            raise SystemExit(f"missing or empty --manifest-from file in {_display_path(eval_dir, home)} for {mf_tag!r}")
+            raise SystemExit(f"missing or empty --manifest-from file in {_display_path(eval_dir, home)} for {manifest_tag!r}")
         allowed_sha1 = {
             str(s["recording_sha1"])
             for s in mf_doc["samples"]
             if isinstance(s, Mapping) and s.get("recording_sha1")
         }
+        if not allowed_sha1:
+            raise SystemExit(f"--manifest-from file {manifest_tag!r} contains no valid recording_sha1 entries")
+        manifest_total = len(allowed_sha1)
+        manifest_expected = min(manifest_total, args.limit) if args.limit > 0 else manifest_total
     asr_from_doc: dict[str, Any] | None = None
     asr_from_map: dict[str, Mapping[str, Any]] | None = None
     if args.asr_from.strip():
@@ -491,15 +549,39 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(s, Mapping) and s.get("recording_sha1")
         }
     prepared = []
+    seen_sha1: set[str] = set()
+    manifest_seen_on_disk: set[str] = set()
     for p in raw_recs:
         sha1 = hashlib.sha1(p.read_bytes()).hexdigest()
-        if allowed_sha1 is not None and sha1 not in allowed_sha1:
-            continue
+        if allowed_sha1 is not None:
+            if sha1 not in allowed_sha1:
+                continue
+            manifest_seen_on_disk.add(sha1)
+            if sha1 in seen_sha1:
+                continue
         gate = process_wav(p, cfg.audio)
         if gate.passed and gate.duration_sec >= args.min_duration:
+            seen_sha1.add(sha1)
             prepared.append((p, sha1, p.stat().st_mtime, gate))
             if args.limit > 0 and len(prepared) >= args.limit:
                 break
+    manifest_missing_on_disk = 0
+    manifest_filtered = 0
+    if allowed_sha1 is not None:
+        if not prepared:
+            raise SystemExit(
+                f"--manifest-from {manifest_tag!r} matched 0/{manifest_expected} recordings in {_display_path(rec_dir, home)}"
+            )
+        assert manifest_expected is not None
+        missing_n = max(0, manifest_expected - len(prepared))
+        if missing_n > 0:
+            # Reaching missing_n > 0 means the loop scanned all of raw_recs without hitting --limit.
+            manifest_missing_on_disk = len(allowed_sha1 - manifest_seen_on_disk)
+            manifest_filtered = len(manifest_seen_on_disk - seen_sha1)
+            sys.stderr.write(
+                f"[eval] WARN: --manifest-from {manifest_tag!r} matched {len(prepared)}/{manifest_expected} "
+                f"(missing_on_disk={manifest_missing_on_disk}, filtered_by_gate_or_duration={manifest_filtered})\n"
+            )
 
     host_rt = expand_user_path(args.host_runtime_dir, env=env) if args.host_runtime_dir else get_runtime_dir(env, create=False)
     tel_map = _match_telemetry([(p, mt, g.duration_sec) for p, _, mt, g in prepared], read_telemetry_history(host_rt, limit=1000) if host_rt.is_dir() else [])
@@ -589,7 +671,17 @@ def main(argv: list[str] | None = None) -> int:
                     asr_cached = False
                 else:
                     ckey, hw_sha1 = make_asr_cache_key(
-                        rec_sha1, asr_prov, asr_mod, asr_ctx.hotwords, git_status=asr_ctx.git_status, dialog_text=asr_ctx.dialog_text
+                        rec_sha1,
+                        asr_prov,
+                        asr_mod,
+                        asr_ctx.hotwords,
+                        git_status=asr_ctx.git_status,
+                        dialog_text=asr_ctx.dialog_text,
+                        asr_api=cfg.asr.api,
+                        asr_effort=cfg.asr.effort,
+                        resource_id=cfg.asr.resource_id,
+                        doubao_mode=cfg.asr.doubao_mode,
+                        base_url=cfg.asr.effective_base_url(asr_prov),
                     )
                     hit = asr_entries.get(ckey) if (args.use_asr_cache and not args.refresh_asr) else None
                     if isinstance(hit, Mapping) and "text" in hit:
@@ -597,7 +689,15 @@ def main(argv: list[str] | None = None) -> int:
                     else:
                         asr_res, chunks_n, _ = _transcribe_wav_chunks(gate.wav_bytes, eff_asr=eff_asr, asr_ctx=asr_ctx, floor_dbfs=cfg.audio.floor_dbfs)
                         asr_cached = False
-                        asr_entries[ckey] = {"recording_sha1": rec_sha1, "asr_provider": asr_prov, "asr_model": asr_mod, "hotwords_sha1": hw_sha1, "hotword_count": len(asr_ctx.hotwords), "text": redact_fn(asr_res.text), "latency_ms": asr_res.latency_ms, "is_single_hop_refined": asr_res.is_single_hop_refined, "chunks": chunks_n, "cached_at": int(time.time())}
+                        asr_entries[ckey] = {
+                            "recording_sha1": rec_sha1, "asr_provider": asr_prov, "asr_model": asr_mod,
+                            "asr_api": cfg.asr.api, "asr_effort": cfg.asr.effort,
+                            "asr_resource_id": cfg.asr.resource_id, "asr_doubao_mode": cfg.asr.doubao_mode,
+                            "hotwords_sha1": hw_sha1, "hotword_count": len(asr_ctx.hotwords),
+                            "text": redact_fn(asr_res.text), "latency_ms": asr_res.latency_ms,
+                            "is_single_hop_refined": asr_res.is_single_hop_refined, "chunks": chunks_n,
+                            "cached_at": int(time.time()),
+                        }
                         _atomic_write_0600(asr_cache_path, json.dumps({"version": 1, "entries": asr_entries}, ensure_ascii=False, indent=2) + "\n")
                 if not asr_res.text.strip():
                     if is_single_hop_asr and eff_skey and asr_res.context_chunks > 0:
@@ -667,8 +767,31 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             eff_ref.close()
 
-    meta = {"version": __version__, "created_at": int(time.time()), "asr_provider": asr_prov, "asr_model": asr_mod, "refiner_provider": cfg.refiner.provider, "refiner_model": cfg.refiner.effective_model(cfg.refiner.provider), "refiner_effort": cfg.refiner.effort, "context_max_chars": cfg.refiner.context_max_chars}
-    agg = aggregate_run_metrics(samples_out)
+    meta: dict[str, Any] = {
+        "version": __version__,
+        "created_at": int(time.time()),
+        "asr_provider": asr_prov,
+        "asr_model": asr_mod,
+        "asr_api": cfg.asr.api,
+        "asr_effort": cfg.asr.effort,
+        "asr_resource_id": cfg.asr.resource_id,
+        "asr_doubao_mode": cfg.asr.doubao_mode,
+        "refiner_provider": cfg.refiner.provider,
+        "refiner_model": cfg.refiner.effective_model(cfg.refiner.provider),
+        "refiner_effort": cfg.refiner.effort,
+        "context_max_chars": cfg.refiner.context_max_chars,
+    }
+    if manifest_tag:
+        meta.update({
+            "manifest_from": manifest_tag,
+            "manifest_total": manifest_total,
+            "manifest_expected": manifest_expected,
+            "manifest_matched": len(samples_out),
+            "manifest_missing": max(0, (manifest_expected or 0) - len(samples_out)),
+            "manifest_missing_on_disk": manifest_missing_on_disk,
+            "manifest_filtered": manifest_filtered,
+        })
+    agg = aggregate_run_metrics(samples_out, manifest_expected=manifest_expected)
     out_path = eval_dir / f"{tag}.json"
     _atomic_write_0600(out_path, json.dumps({"tag": tag, "meta": meta, "aggregate": agg, "samples": samples_out}, ensure_ascii=False, indent=2) + "\n")
     rows_md = "\n".join(f"| {lbl} | `{val}` |" for lbl, val in _summary_rows(agg))
