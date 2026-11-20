@@ -32,9 +32,14 @@ import urllib.parse
 import uuid
 
 from ._remote_probe import (
+    COLD_START_PRIOR_MAX_CHARS,
+    COLD_START_PRIOR_MAX_TURNS,
+    COLD_START_SWEET_MIN_TURNS,
     DEFAULT_REFINER_CHUNK_CHARS,
     DEFAULT_REFINER_CONTEXT_MAX_CHARS,
     MAX_LINE_BYTES,
+    PRIOR_SESSION_WRAPPER_OVERHEAD_CHARS,
+    SESSION_REF_WRAPPER_OVERHEAD_CHARS,
     _AGY_WS_CWD_RE,
     _BROAD_SYSTEM_DIRS_LOW,
     _FULL_UUID_RE,
@@ -85,7 +90,13 @@ from ._remote_probe import (
     _resolve_agy_transcript_path,
     _safe_mtime,
     _safe_realpath,
+    aggregate_prior_candidates_hotwords,
+    discover_cli_prior_sessions,
     encode_claude_project_dir,
+    extract_prior_sessions_hotwords,
+    format_prior_turns_body,
+    prior_chunk_body_budget,
+    select_cold_start_prior_candidate,
     trim_turns_chunk_aligned,
 )
 from ._tmux import (
@@ -133,6 +144,7 @@ from .workspace_ctx import (
     _is_inside_git_worktree,
     _keep_tech_token,
     _resolve_safe_local_dir,
+    discover_antigravity_ide_prior_sessions,
     extract_turn_hotwords,
     is_wsl_slow_mount_path,
     read_git_status_summary,
@@ -248,6 +260,13 @@ class SessionState:
     remote_git_hotwords: list[str] = field(default_factory=list)
     remote_repo_files: list[str] = field(default_factory=list)
     remote_shallow_files: list[str] = field(default_factory=list)
+    matched_by: str = ""
+    cold_start_prior_checked: bool = False
+    cold_start_prior_hotwords_checked: bool = False
+    cold_start_prior_chunk: str = ""
+    cold_start_prior_hotwords: tuple[str, ...] = ()
+    cold_start_prior_cwd: str = ""
+    cold_start_prior_retired: bool = False
 
 
 @dataclass(frozen=True)
@@ -259,6 +278,7 @@ class SessionSnapshot:
     git_status: str
     hotwords: tuple[str, ...]
     byte_offset: int
+    prior_hotwords_used: bool = False
 
     @property
     def session_key(self) -> str:
@@ -2501,6 +2521,8 @@ class SessionTracker:
         local_hostnames: Iterable[str] | None = None,
         remote_manager: RemoteSshManager | None = None,
         context_max_chars: int = DEFAULT_REFINER_CONTEXT_MAX_CHARS,
+        cold_start_fallback: str = "auto",
+        prior_cache_ttl_sec: float = 60.0,
     ) -> None:
         self.env = os.environ if env is None else env
         self.home = (
@@ -2518,14 +2540,19 @@ class SessionTracker:
         self.git_cache_ttl_sec = git_cache_ttl_sec
         self.repo_files_cache_ttl_sec = repo_files_cache_ttl_sec
         self.context_max_chars = max(1000, int(context_max_chars))
+        self.cold_start_fallback = (cold_start_fallback or "auto").strip().lower()
+        self.prior_cache_ttl_sec = max(0.0, float(prior_cache_ttl_sec))
         self._tmux_socket = str(tmux_socket).strip() if tmux_socket is not None else ""
         self._tmux_socket_name = (tmux_socket_name or "").strip()
         self._tmux_probe_fn = tmux_probe_fn
         self._lock = threading.RLock()
+        self._tls = threading.local()
         self._states: dict[str, SessionState] = {}
         self._git_cache: dict[str, tuple[float, str, list[str]]] = {}
         self._repo_cache: dict[str, tuple[float, list[str]]] = {}
         self._shallow_cache: dict[str, tuple[float, list[str]]] = {}
+        self._prior_cache: OrderedDict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = OrderedDict()
+        self._prior_cache_max_entries: int = 16
         self._remote_files_cache: dict[tuple[str, str], tuple[float, list[str], list[str]]] = {}
         self._custom_local_hostnames: tuple[str, ...] | None = (
             tuple(local_hostnames) if local_hostnames is not None else None
@@ -2576,6 +2603,10 @@ class SessionTracker:
 
     def close(self) -> None:
         self.remote_manager.close()
+
+    @property
+    def last_sync_remote_vetoed(self) -> bool:
+        return bool(getattr(self._tls, "last_sync_remote_vetoed", False))
 
     def _has_explicit_tmux_override(self) -> bool:
         return bool(
@@ -3639,6 +3670,7 @@ class SessionTracker:
         )
 
     def _return_remote_fg(self, rfg: RemoteForegroundInfo) -> SessionMatch | None:
+        self._tls.last_sync_remote_vetoed = True
         if rfg.ide_remote_only or rfg.ambiguous_host or not rfg.host_candidate:
             return None
         hcfg = self.remote_cfg.lookup_host(rfg.host_candidate)
@@ -3675,6 +3707,7 @@ class SessionTracker:
             return True, self._return_remote_fg(early_remote)
 
         if _WIN_EXPLICIT_NON_WSL_TITLE_RE.match((window_title or "").strip()):
+            self._tls.last_sync_remote_vetoed = True
             return True, None
         proc_base_low = (
             os.path.basename(window_process.replace("\\", "/")).lower()
@@ -3682,6 +3715,7 @@ class SessionTracker:
             else ""
         )
         if proc_base_low in ("cmd", "cmd.exe") and parse_window_title_hint(window_title) is None:
+            self._tls.last_sync_remote_vetoed = True
             return True, None
         if (
             proc_base_low in ("powershell", "powershell.exe", "pwsh", "pwsh.exe")
@@ -3692,6 +3726,7 @@ class SessionTracker:
                 re.IGNORECASE,
             )
         ):
+            self._tls.last_sync_remote_vetoed = True
             return True, None
         return False, None
 
@@ -3770,7 +3805,12 @@ class SessionTracker:
             )
         if disk_hit is None:
             # Explicit session tag in title that matches no valid root session MUST return None
-            # rather than silently guessing an unrelated window's conversation!
+            # rather than silently guessing an unrelated window's conversation — but check window/tmux
+            # SSH first so remote terminals still set remote-veto (or route to whitelisted hosts) and
+            # never leak local win.cwd via Layer 0.
+            is_rem_hint, rem_hit = self._detect_window_or_tmux_remote_fg(rctx)
+            if is_rem_hint:
+                return True, rem_hit
             return True, None
         self._ensure_resolve_darwin_ptys(rctx)
         hint_tty_is_tmux_client = bool(
@@ -3789,6 +3829,9 @@ class SessionTracker:
             # Bug D guard: dead historical transcript on disk MUST NOT return a dead match
             # NOR fall through to hijack an unrelated background tab when not in tmux/tty!
             if rctx.active_target is None and not rctx.norm_tty:
+                is_rem_hint, rem_hit = self._detect_window_or_tmux_remote_fg(rctx)
+                if is_rem_hint:
+                    return True, rem_hit
                 return True, None
             rctx.stale_hint_fallthrough = True
             return False, None
@@ -3809,10 +3852,98 @@ class SessionTracker:
             )
         ):
             if rctx.active_target is None and not rctx.norm_tty:
+                is_rem_hint, rem_hit = self._detect_window_or_tmux_remote_fg(rctx)
+                if is_rem_hint:
+                    return True, rem_hit
                 return True, None
             rctx.stale_hint_fallthrough = True
             return False, None
         return True, self._with_fallback_cwd(disk_hit, rctx.norm_cwd)
+
+    def _tmux_target_bound_to_window(self, rctx: _ResolveCtx) -> bool:
+        """Return True only when ``rctx.active_target`` is positively bound to the focused window."""
+        if rctx.active_target is None:
+            return False
+        client = rctx.active_target[0]
+        if rctx.norm_tty and client.client_tty and _tty_matches(client.client_tty, rctx.norm_tty):
+            return True
+        if rctx.window_pid > 1 and client.client_pid > 1:
+            if client.client_pid == rctx.window_pid:
+                return True
+            if rctx.has_proc and self.proc_root is not None:
+                if client.client_pid in _collect_descendant_pids(self.proc_root, (rctx.window_pid,)):
+                    return True
+            elif rctx.darwin_win_desc_pids and client.client_pid in rctx.darwin_win_desc_pids:
+                return True
+        if (
+            rctx.darwin_win_tab_ttys
+            and client.client_tty
+            and any(_tty_matches(client.client_tty, t) for t in rctx.darwin_win_tab_ttys)
+        ):
+            return True
+        return False
+
+    def _detect_window_or_tmux_remote_fg(
+        self, rctx: _ResolveCtx, *, title: str | None = None
+    ) -> tuple[bool, SessionMatch | None]:
+        """Check positively window-bound tmux pane or window descendant processes for foreground SSH."""
+        eff_title = (rctx.eff_title or rctx.window_title) if title is None else title
+        if not rctx.norm_tty and rctx.window_pid > 1:
+            self._ensure_resolve_darwin_ptys(rctx)
+        tmux_bound = self._tmux_target_bound_to_window(rctx)
+        if tmux_bound and rctx.active_target is not None:
+            prev_eff = rctx.eff_title
+            rctx.eff_title = eff_title
+            try:
+                is_pane_rem, pane_rem_match = self._check_active_pane_remote(
+                    rctx, rctx.active_target[1]
+                )
+            finally:
+                rctx.eff_title = prev_eff
+            if is_pane_rem:
+                return True, pane_rem_match
+        if not rctx.norm_tty and rctx.window_pid > 1 and not tmux_bound:
+            if rctx.has_proc and self.proc_root is not None:
+                wp_pids = _collect_descendant_pids(self.proc_root, (rctx.window_pid,)) - rctx.all_tmux_pids
+                ssh_wp_host = self._find_proc_ssh_target_in_pids(wp_pids)
+                if ssh_wp_host is not None:
+                    rfg_wp = detect_remote_foreground(
+                        eff_title,
+                        window_process=rctx.window_process,
+                        bundle_id=rctx.bundle_id,
+                        document=rctx.document,
+                        local_hostnames=self._local_hostnames,
+                        ssh_proc_host=ssh_wp_host,
+                    )
+                    return True, self._return_remote_fg(rfg_wp)
+            elif rctx.darwin_win_desc_pids and rctx.darwin_ps_rows:
+                excluded_ttys_d = self._collect_tmux_ttys(rctx.tmux_snap)
+                d_rows = [
+                    r
+                    for r in rctx.darwin_ps_rows
+                    if r[0] in rctx.darwin_win_desc_pids and (not r[3] or r[3] not in excluded_ttys_d)
+                ]
+                if d_rows and not any(
+                    _classify_interactive_cli(
+                        os.path.basename(r[4][0].replace("\\", "/")).lstrip("-").lower() if r[4] else "",
+                        r[4],
+                    )
+                    for r in d_rows
+                ):
+                    for _pid, _ppid, _st, _rtty, argv in d_rows:
+                        h_cand, is_int = extract_ssh_target_from_argv(argv)
+                        if is_int:
+                            rfg_d = detect_remote_foreground(
+                                eff_title,
+                                window_process=rctx.window_process,
+                                bundle_id=rctx.bundle_id,
+                                document=rctx.document,
+                                local_hostnames=self._local_hostnames,
+                                ssh_proc_host=h_cand,
+                                is_macos=True,
+                            )
+                            return True, self._return_remote_fg(rfg_d)
+        return False, None
 
     def _resolve_scoped_tty_or_window_ssh(
         self, rctx: _ResolveCtx
@@ -3845,46 +3976,7 @@ class SessionTracker:
                 return True, tty_hit
 
         if not rctx.norm_tty and rctx.window_pid > 1 and rctx.active_target is None:
-            if rctx.has_proc and self.proc_root is not None:
-                wp_pids = _collect_descendant_pids(self.proc_root, (rctx.window_pid,)) - rctx.all_tmux_pids
-                ssh_wp_host = self._find_proc_ssh_target_in_pids(wp_pids)
-                if ssh_wp_host is not None:
-                    rfg_wp = detect_remote_foreground(
-                        rctx.eff_title,
-                        window_process=rctx.window_process,
-                        bundle_id=rctx.bundle_id,
-                        document=rctx.document,
-                        local_hostnames=self._local_hostnames,
-                        ssh_proc_host=ssh_wp_host,
-                    )
-                    return True, self._return_remote_fg(rfg_wp)
-            elif rctx.darwin_win_desc_pids and rctx.darwin_ps_rows:
-                excluded_ttys_d = self._collect_tmux_ttys(rctx.tmux_snap)
-                d_rows = [
-                    r
-                    for r in rctx.darwin_ps_rows
-                    if r[0] in rctx.darwin_win_desc_pids and (not r[3] or r[3] not in excluded_ttys_d)
-                ]
-                if d_rows and not any(
-                    _classify_interactive_cli(
-                        os.path.basename(r[4][0].replace("\\", "/")).lstrip("-").lower() if r[4] else "",
-                        r[4],
-                    )
-                    for r in d_rows
-                ):
-                    for _pid, _ppid, _st, _rtty, argv in d_rows:
-                        h_cand, is_int = extract_ssh_target_from_argv(argv)
-                        if is_int:
-                            rfg_d = detect_remote_foreground(
-                                rctx.eff_title,
-                                window_process=rctx.window_process,
-                                bundle_id=rctx.bundle_id,
-                                document=rctx.document,
-                                local_hostnames=self._local_hostnames,
-                                ssh_proc_host=h_cand,
-                                is_macos=True,
-                            )
-                            return True, self._return_remote_fg(rfg_d)
+            return self._detect_window_or_tmux_remote_fg(rctx, title=rctx.eff_title)
         return False, None
 
     def _check_active_pane_remote(
@@ -4170,6 +4262,7 @@ class SessionTracker:
         document: str = "",
     ) -> SessionMatch | None:
         """Resolve foreground main CLI session via Phase 0 Remote Veto, title O(1) lookup, tmux active pane, TTY/CWD, or fallback."""
+        self._tls.last_sync_remote_vetoed = False
         with self._lock:
             done_p0, res_p0 = self._resolve_phase0_window_veto(
                 window_title,
@@ -4356,6 +4449,8 @@ class SessionTracker:
                     state.clean_turns.append(("assistant", cp_summary))
                 state.luna_synced_idx = 0
                 state.generation += 1
+                state.cold_start_prior_retired = True
+                state.cold_start_prior_checked = True
                 return
             turn = _clean_agy_record(obj)
             if turn is not None:
@@ -4368,6 +4463,8 @@ class SessionTracker:
                     state.luna_synced_idx = 0
                     state.generation += 1
                     state.claude_just_compacted = True
+                    state.cold_start_prior_retired = True
+                    state.cold_start_prior_checked = True
                     return
                 if obj.get("type") == "user" and bool(obj.get("isCompactSummary")):
                     state.clean_turns.clear()
@@ -4375,6 +4472,8 @@ class SessionTracker:
                     if not state.claude_just_compacted:
                         state.generation += 1
                     state.claude_just_compacted = False
+                    state.cold_start_prior_retired = True
+                    state.cold_start_prior_checked = True
                     summary_txt = _extract_claude_message_text(obj.get("message"), role="user")
                     if summary_txt:
                         state.clean_turns.append(("assistant", summary_txt))
@@ -4398,6 +4497,8 @@ class SessionTracker:
                 state.clean_turns.clear()
                 state.luna_synced_idx = 0
                 state.generation += 1
+                state.cold_start_prior_retired = True
+                state.cold_start_prior_checked = True
             elif typ == "event_msg" and isinstance(payload, dict):
                 if payload.get("type") == "item_completed":
                     turn = _extract_codex_item_completed(payload)
@@ -4588,6 +4689,79 @@ class SessionTracker:
         _, git_hw = self._get_git_info(workspace_cwd)
         return list(git_hw[:24]) if git_hw else self._fallback_workspace_stems(workspace_cwd)
 
+    def _canonical_prior_cwd(self, raw_cwd: str, *, is_remote: bool = False) -> str:
+        if not raw_cwd:
+            return ""
+        if is_remote:
+            return _normalize_cwd(raw_cwd)
+        eff_wsl = _effective_is_wsl(env=self.env)
+        return _safe_realpath(raw_cwd, wsl=eff_wsl) or _normalize_cwd(raw_cwd, wsl=eff_wsl)
+
+    @staticmethod
+    def _retire_prior_on_cwd_change_locked(state: SessionState, canon_cwd: str) -> None:
+        if state.cold_start_prior_cwd and canon_cwd and state.cold_start_prior_cwd != canon_cwd:
+            state.cold_start_prior_chunk = ""
+            state.cold_start_prior_hotwords = ()
+            state.cold_start_prior_retired = True
+            state.cold_start_prior_checked = True
+            state.cold_start_prior_hotwords_checked = True
+
+    def _get_prior_candidates_cached(
+        self, cwd: str, *, scope: str = "cli"
+    ) -> list[dict[str, Any]]:
+        eff_wsl = _effective_is_wsl(env=self.env)
+        if not cwd or _is_broad_or_unsafe_workspace_dir(cwd, self.home, wsl=eff_wsl):
+            return []
+        canon = _safe_realpath(cwd, wsl=eff_wsl) or _normalize_cwd(cwd, wsl=eff_wsl)
+        if not canon or _is_broad_or_unsafe_workspace_dir(canon, self.home, wsl=eff_wsl):
+            return []
+        cache_key = (scope, canon)
+        now = time.monotonic()
+        with self._lock:
+            cached = self._prior_cache.get(cache_key)
+            if cached is not None and (now - cached[0]) < self.prior_cache_ttl_sec:
+                self._prior_cache.move_to_end(cache_key)
+                return list(cached[1])
+        if scope == "agy_ide":
+            found = discover_antigravity_ide_prior_sessions(
+                canon, home=self.home, wsl=eff_wsl, env=self.env
+            )
+        else:
+            found = discover_cli_prior_sessions(canon, home=self.home, wsl=eff_wsl)
+        now_write = time.monotonic()
+        with self._lock:
+            expired = [
+                k for k, (ts, _) in self._prior_cache.items() if (now_write - ts) >= self.prior_cache_ttl_sec
+            ]
+            for k in expired:
+                self._prior_cache.pop(k, None)
+            self._prior_cache[cache_key] = (now_write, found)
+            self._prior_cache.move_to_end(cache_key)
+            while len(self._prior_cache) > self._prior_cache_max_entries:
+                self._prior_cache.popitem(last=False)
+        return list(found)
+
+    def get_workspace_prior_hotwords(
+        self,
+        workspace_cwd: str,
+        *,
+        scope: str = "cli",
+        cold_start_fallback: str | None = None,
+    ) -> list[str]:
+        """Extract Layer 1 high-frequency technical identifiers from recent same-cwd prior sessions."""
+        eff_fb = (
+            self.cold_start_fallback
+            if cold_start_fallback is None
+            else (cold_start_fallback or "auto").strip().lower()
+        )
+        if eff_fb == "off" or not workspace_cwd:
+            return []
+        cands = self._get_prior_candidates_cached(workspace_cwd, scope=scope)
+        if not cands:
+            return []
+        _, top5 = select_cold_start_prior_candidate(cands)
+        return aggregate_prior_candidates_hotwords(top5) if top5 else []
+
     def _build_remote_req_and_key(
         self,
         host_cfg: RemoteHostConfig,
@@ -4596,9 +4770,15 @@ class SessionTracker:
         cwd_hint: str,
         include_git_info: bool,
         max_chars: int | None = None,
+        cold_start_fallback: str | None = None,
     ) -> tuple[dict[str, Any], tuple[Any, ...]]:
         eff_max_chars = (
             max(1000, int(max_chars)) if max_chars is not None else self.context_max_chars
+        )
+        eff_fb = (
+            self.cold_start_fallback
+            if cold_start_fallback is None
+            else (cold_start_fallback or "auto").strip().lower()
         )
         clean_title = strip_host_tags_from_title(effective_title or "")
         hint = parse_window_title_hint(clean_title)
@@ -4628,6 +4808,16 @@ class SessionTracker:
                 if f_entry is not None and (time.monotonic() - f_entry[0]) < self.repo_files_cache_ttl_sec:
                     include_repo_files = False
 
+        prior_checked_sid = ""
+        if cached_st is not None and eff_fb != "off":
+            already_checked = (
+                cached_st.cold_start_prior_checked
+                if eff_fb == "auto"
+                else cached_st.cold_start_prior_hotwords_checked
+            )
+            if already_checked:
+                prior_checked_sid = cached_st.session_id
+
         req_dict: dict[str, Any] = {
             "v": 1,
             "token": token,
@@ -4640,6 +4830,8 @@ class SessionTracker:
             "max_chars": eff_max_chars,
             "include_git": bool(include_git_info),
             "include_repo_files": include_repo_files,
+            "cold_start_fallback": eff_fb,
+            "prior_checked_session_id": prior_checked_sid,
         }
         return req_dict, cache_key
 
@@ -4675,6 +4867,7 @@ class SessionTracker:
         resp: Mapping[str, Any],
         *,
         req_max_chars: int | None = None,
+        cold_start_fallback: str | None = None,
     ) -> SessionState | None:
         if not resp.get("ok") or resp.get("pong"):
             return None
@@ -4696,6 +4889,11 @@ class SessionTracker:
             if req_max_chars is not None
             else self.context_max_chars
         )
+        eff_fb = (
+            self.cold_start_fallback
+            if cold_start_fallback is None
+            else (cold_start_fallback or "auto").strip().lower()
+        )
 
         with self._lock:
             state = self._states.get(skey)
@@ -4704,6 +4902,9 @@ class SessionTracker:
                     return None
                 if rem_cwd:
                     state.cwd = rem_cwd
+                    self._retire_prior_on_cwd_change_locked(
+                        state, self._canonical_prior_cwd(rem_cwd, is_remote=True)
+                    )
                 state.remote_git_status = git_status
                 state.remote_git_hotwords = git_hw
                 self._update_remote_files_state_locked(
@@ -4716,6 +4917,12 @@ class SessionTracker:
                 return state
 
             new_turns = [(str(r), str(t)) for r, t in (resp.get("turns") or [])]
+            raw_prior_turns = [(str(r), str(t)) for r, t in (resp.get("prior_turns") or [])]
+            raw_prior_hw = [
+                str(w).strip()
+                for w in (resp.get("prior_hotwords") or [])
+                if isinstance(w, str) and w.strip()
+            ]
             evicted = int(resp.get("evicted_chunks") or 0)
             comp_cnt = int(resp.get("compaction_count") or 0)
 
@@ -4771,6 +4978,48 @@ class SessionTracker:
                 state.remote_git_status = git_status
                 state.remote_git_hotwords = git_hw
 
+            rem_canon_cwd = self._canonical_prior_cwd(state.cwd, is_remote=True)
+            self._retire_prior_on_cwd_change_locked(state, rem_canon_cwd)
+
+            if evicted > 0 or comp_cnt > 0:
+                state.cold_start_prior_retired = True
+                state.cold_start_prior_checked = True
+                state.cold_start_prior_hotwords_checked = True
+            elif len(new_turns) >= COLD_START_SWEET_MIN_TURNS:
+                if not state.cold_start_prior_checked:
+                    state.cold_start_prior_checked = True
+                    state.cold_start_prior_hotwords_checked = True
+                    state.cold_start_prior_retired = True
+            elif eff_fb != "off" and not state.cold_start_prior_retired:
+                if not state.cold_start_prior_hotwords_checked:
+                    if raw_prior_hw:
+                        state.cold_start_prior_hotwords = tuple(_dedupe_hotwords_ci(raw_prior_hw))
+                        if rem_canon_cwd:
+                            state.cold_start_prior_cwd = rem_canon_cwd
+                    elif raw_prior_turns:
+                        state.cold_start_prior_hotwords = tuple(
+                            extract_prior_sessions_hotwords([raw_prior_turns])
+                        )
+                        if rem_canon_cwd:
+                            state.cold_start_prior_cwd = rem_canon_cwd
+                    state.cold_start_prior_hotwords_checked = True
+                if (
+                    eff_fb == "auto"
+                    and not state.cold_start_prior_checked
+                    and not state.cold_start_prior_retired
+                ):
+                    if cli != "workspace" and raw_prior_turns:
+                        body_cap = prior_chunk_body_budget(eff_max_chars)
+                        if body_cap > 0:
+                            state.cold_start_prior_chunk = format_prior_turns_body(
+                                raw_prior_turns,
+                                max_chars=body_cap,
+                                max_turns=COLD_START_PRIOR_MAX_TURNS,
+                            )
+                            if state.cold_start_prior_chunk and rem_canon_cwd:
+                                state.cold_start_prior_cwd = rem_canon_cwd
+                    state.cold_start_prior_checked = True
+
             self._update_remote_files_state_locked(
                 host_cfg.name,
                 state,
@@ -4781,10 +5030,12 @@ class SessionTracker:
             return state
 
     def _make_remote_result_cb(
-        self, req_max_chars: int
+        self, req_max_chars: int, *, cold_start_fallback: str | None = None
     ) -> Callable[[RemoteHostConfig, dict[str, Any]], None]:
         def _cb(hcfg: RemoteHostConfig, r: dict[str, Any]) -> None:
-            self._apply_remote_probe_response(hcfg, r, req_max_chars=req_max_chars)
+            self._apply_remote_probe_response(
+                hcfg, r, req_max_chars=req_max_chars, cold_start_fallback=cold_start_fallback
+            )
 
         return _cb
 
@@ -4845,10 +5096,16 @@ class SessionTracker:
         include_git_info: bool = True,
         cancel_token: Any = None,
         elapsed_ms: int = 0,
+        cold_start_fallback: str | None = None,
     ) -> SessionSnapshot | None:
         host_cfg = self.remote_cfg.lookup_host(eff_match.host_name)
         if host_cfg is None:
             return None
+        eff_fb = (
+            self.cold_start_fallback
+            if cold_start_fallback is None
+            else (cold_start_fallback or "auto").strip().lower()
+        )
         synth_title = eff_match.remote_title or window_title
         eff_cwd_hint = eff_match.cwd
         if not eff_match.remote_title and window_title:
@@ -4873,6 +5130,7 @@ class SessionTracker:
             cwd_hint=eff_cwd_hint,
             include_git_info=include_git_info,
             max_chars=eff_max,
+            cold_start_fallback=eff_fb,
         )
         cfg_budget_ms = (
             host_cfg.timeout_ms
@@ -4896,7 +5154,7 @@ class SessionTracker:
             allow_start_if_missing=True,
             allow_half_open=False,
             is_cancelled=cancel_fn,
-            on_result=self._make_remote_result_cb(eff_max),
+            on_result=self._make_remote_result_cb(eff_max, cold_start_fallback=eff_fb),
         )
         if resp is None or not resp.get("ok"):
             return None
@@ -4915,7 +5173,7 @@ class SessionTracker:
                     state = cand_st
         if state is None:
             state = self._apply_remote_probe_response(
-                host_cfg, resp, req_max_chars=eff_max
+                host_cfg, resp, req_max_chars=eff_max, cold_start_fallback=eff_fb
             )
         if state is None:
             return None
@@ -4926,6 +5184,11 @@ class SessionTracker:
             git_status = state.remote_git_status if include_git_info else ""
             git_hw = list(state.remote_git_hotwords) if include_git_info else []
             rem_files = list(state.remote_repo_files or state.remote_shallow_files) if include_git_info else []
+            prior_hw = (
+                list(state.cold_start_prior_hotwords)
+                if (eff_fb != "off" and len(turns_tuple) < COLD_START_SWEET_MIN_TURNS)
+                else []
+            )
             resolved_match = SessionMatch(
                 cli=state.cli,
                 session_id=state.session_id,
@@ -4937,7 +5200,7 @@ class SessionTracker:
             )
         repo_stems = _file_stems_for_hotwords(rem_files, limit=12) if (rem_files and not git_hw) else []
         turn_hw = extract_turn_hotwords(turns_tuple)
-        merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems]))
+        merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems, *prior_hw]))
         return SessionSnapshot(
             match=resolved_match,
             clean_turns=turns_tuple,
@@ -4946,6 +5209,7 @@ class SessionTracker:
             git_status=git_status,
             hotwords=merged_hw,
             byte_offset=0,
+            prior_hotwords_used=bool(prior_hw),
         )
 
     def _sync_resolved_match(
@@ -4954,7 +5218,15 @@ class SessionTracker:
         *,
         include_git_info: bool = True,
         prefer_match_cwd: bool = False,
+        cold_start_fallback: str | None = None,
     ) -> SessionSnapshot:
+        eff_fb = (
+            self.cold_start_fallback
+            if cold_start_fallback is None
+            else (cold_start_fallback or "auto").strip().lower()
+        )
+        need_prior_discovery = False
+        prior_scope = "agy_ide" if eff_match.matched_by == "ide_brain" else "cli"
         with self._lock:
             norm_path = (
                 _upgrade_agy_transcript_path(eff_match.jsonl_path)
@@ -4970,9 +5242,12 @@ class SessionTracker:
                     session_id=eff_match.session_id,
                     jsonl_path=norm_path,
                     cwd=eff_match.cwd,
+                    matched_by=eff_match.matched_by,
                 )
                 self._states[eff_match.session_key] = state
             else:
+                if eff_match.matched_by and not state.matched_by:
+                    state.matched_by = eff_match.matched_by
                 if eff_match.cwd and (prefer_match_cwd or not state.cwd):
                     state.cwd = eff_match.cwd
                 if norm_path != state.jsonl_path:
@@ -4992,11 +5267,85 @@ class SessionTracker:
             luna_idx = state.luna_synced_idx
             gen = state.generation
             boff = state.byte_offset
+            state_cli = state.cli
+            state_sid = state.session_id
+            state_key = state.session_key
+            if state.matched_by == "ide_brain":
+                prior_scope = "agy_ide"
+            target_canon_cwd = self._canonical_prior_cwd(eff_cwd, is_remote=False)
+            self._retire_prior_on_cwd_change_locked(state, target_canon_cwd)
+
+            if len(turns_tuple) >= COLD_START_SWEET_MIN_TURNS:
+                if not state.cold_start_prior_checked:
+                    state.cold_start_prior_checked = True
+                    state.cold_start_prior_hotwords_checked = True
+                    state.cold_start_prior_retired = True
+            elif eff_fb != "off" and eff_cwd and not state.cold_start_prior_retired:
+                if eff_fb == "auto" and not state.cold_start_prior_checked:
+                    need_prior_discovery = True
+                elif eff_fb == "hotwords" and not state.cold_start_prior_hotwords_checked:
+                    need_prior_discovery = True
+
+        if need_prior_discovery:
+            prior_cands = self._get_prior_candidates_cached(eff_cwd, scope=prior_scope)
+            best_prior, top5_prior = select_cold_start_prior_candidate(
+                prior_cands, preferred_cli=state_cli, exclude_session_id=state_sid
+            )
+            discovered_hw = (
+                tuple(aggregate_prior_candidates_hotwords(top5_prior))
+                if top5_prior
+                else ()
+            )
+            body_cap = prior_chunk_body_budget(self.context_max_chars)
+            best_turns = (
+                (best_prior.get("tail_turns") or best_prior.get("turns") or ())
+                if best_prior is not None
+                else ()
+            )
+            discovered_chunk = (
+                format_prior_turns_body(
+                    best_turns,
+                    max_chars=body_cap,
+                    max_turns=COLD_START_PRIOR_MAX_TURNS,
+                )
+                if (eff_fb == "auto" and body_cap > 0 and best_turns)
+                else ""
+            )
+            with self._lock:
+                cur_st = self._states.get(state_key)
+                if cur_st is not None:
+                    cur_canon = self._canonical_prior_cwd(cur_st.cwd, is_remote=cur_st.is_remote)
+                    if (
+                        not cur_st.cold_start_prior_retired
+                        and (not cur_canon or cur_canon == target_canon_cwd)
+                    ):
+                        if not cur_st.cold_start_prior_hotwords_checked:
+                            cur_st.cold_start_prior_hotwords = discovered_hw
+                            cur_st.cold_start_prior_hotwords_checked = True
+                            if discovered_hw and target_canon_cwd:
+                                cur_st.cold_start_prior_cwd = target_canon_cwd
+                        if eff_fb == "auto" and not cur_st.cold_start_prior_checked:
+                            cur_st.cold_start_prior_chunk = discovered_chunk
+                            cur_st.cold_start_prior_checked = True
+                            if discovered_chunk and target_canon_cwd:
+                                cur_st.cold_start_prior_cwd = target_canon_cwd
+
+        with self._lock:
+            cur_st = self._states.get(state_key)
+            prior_hw = (
+                list(cur_st.cold_start_prior_hotwords)
+                if (
+                    cur_st is not None
+                    and eff_fb != "off"
+                    and len(turns_tuple) < COLD_START_SWEET_MIN_TURNS
+                )
+                else []
+            )
 
         git_status, git_hw = self._get_git_info(eff_cwd) if include_git_info else ("", [])
         repo_stems = self._fallback_workspace_stems(eff_cwd) if (include_git_info and eff_cwd and not git_hw) else []
         turn_hw = extract_turn_hotwords(turns_tuple)
-        merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems]))
+        merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems, *prior_hw]))
 
         return SessionSnapshot(
             match=eff_match,
@@ -5006,6 +5355,7 @@ class SessionTracker:
             git_status=git_status,
             hotwords=merged_hw,
             byte_offset=boff,
+            prior_hotwords_used=bool(prior_hw),
         )
 
     def sync_ide_session(
@@ -5013,9 +5363,15 @@ class SessionTracker:
         match: SessionMatch,
         *,
         include_git_info: bool = True,
+        cold_start_fallback: str | None = None,
     ) -> SessionSnapshot:
         """Incrementally ingest a matched desktop IDE conversation without touching ``sync_session``."""
-        return self._sync_resolved_match(match, include_git_info=include_git_info, prefer_match_cwd=True)
+        return self._sync_resolved_match(
+            match,
+            include_git_info=include_git_info,
+            prefer_match_cwd=True,
+            cold_start_fallback=cold_start_fallback,
+        )
 
     def sync_session(
         self,
@@ -5030,9 +5386,11 @@ class SessionTracker:
         document: str = "",
         include_git_info: bool = True,
         cancel_token: Any = None,
+        cold_start_fallback: str | None = None,
     ) -> SessionSnapshot | None:
         """Resolve (if needed) and incrementally ingest new JSONL lines for the active session."""
         t0 = time.monotonic()
+        self._tls.last_sync_remote_vetoed = False
         with self._lock:
             eff_match = (
                 match
@@ -5050,6 +5408,7 @@ class SessionTracker:
             if eff_match is None:
                 return None
         if eff_match.origin == "remote":
+            self._tls.last_sync_remote_vetoed = True
             resolve_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
             return self._sync_remote_match(
                 eff_match,
@@ -5057,10 +5416,58 @@ class SessionTracker:
                 include_git_info=include_git_info,
                 cancel_token=cancel_token,
                 elapsed_ms=resolve_ms,
+                cold_start_fallback=cold_start_fallback,
             )
-        return self._sync_resolved_match(eff_match, include_git_info=include_git_info)
+        return self._sync_resolved_match(
+            eff_match,
+            include_git_info=include_git_info,
+            cold_start_fallback=cold_start_fallback,
+        )
 
-    def get_refiner_context(
+    @staticmethod
+    def _resolve_prior_chunk_for_window_locked(
+        state: SessionState | None,
+        current_chunks: Sequence[str],
+        turns_copy: Sequence[tuple[str, str]],
+        *,
+        max_chars: int,
+        allow_prior: bool,
+        canon_cwd: str = "",
+    ) -> str:
+        if (
+            not allow_prior
+            or max_chars <= 0
+            or state is None
+            or state.cold_start_prior_retired
+            or not state.cold_start_prior_chunk
+        ):
+            return ""
+        if state.cold_start_prior_cwd and canon_cwd and state.cold_start_prior_cwd != canon_cwd:
+            state.cold_start_prior_chunk = ""
+            state.cold_start_prior_hotwords = ()
+            state.cold_start_prior_retired = True
+            return ""
+        if state.remote_evicted_chunks > 0 or state.remote_compaction_count > 0:
+            state.cold_start_prior_retired = True
+            return ""
+        raw_total = sum(
+            (10 if r == "user" else 12) + len(t) for r, t in turns_copy
+        ) + max(0, 2 * (len(turns_copy) - 1))
+        cur_total = sum(len(c) for c in current_chunks) + max(0, 2 * (len(current_chunks) - 1))
+        wrapped_cur_total = sum(
+            len(c) + SESSION_REF_WRAPPER_OVERHEAD_CHARS for c in current_chunks
+        )
+        prior = state.cold_start_prior_chunk
+        wrapped_prior_len = len(prior) + PRIOR_SESSION_WRAPPER_OVERHEAD_CHARS
+        inter_block_seps = 2 * len(current_chunks)
+        combined_with_sep = wrapped_prior_len + (2 + cur_total if current_chunks else 0)
+        combined_wrapped = wrapped_prior_len + wrapped_cur_total + inter_block_seps
+        if raw_total > max_chars or combined_with_sep > max_chars or combined_wrapped > max_chars:
+            state.cold_start_prior_retired = True
+            return ""
+        return prior
+
+    def get_refiner_context_with_prior(
         self,
         session_key: str,
         *,
@@ -5068,8 +5475,12 @@ class SessionTracker:
         include_git_status: bool = True,
         chunk_chars: int | None = None,
         workspace_cwd: str = "",
-    ) -> tuple[list[str], str]:
-        """Return ``(dialog_chunks, git_context_text)`` separated for message-boundary prefix caching."""
+        allow_prior: bool | None = None,
+    ) -> tuple[str, list[str], str]:
+        """Return ``(frozen_prior_chunk, dialog_chunks, git_context_text)`` with natural eviction."""
+        eff_allow_prior = (
+            self.cold_start_fallback == "auto" if allow_prior is None else bool(allow_prior)
+        )
         with self._lock:
             state = self._states.get(session_key) if session_key else None
             if state is not None and state.is_remote:
@@ -5081,6 +5492,14 @@ class SessionTracker:
                 rem_shallow_files = list(state.remote_shallow_files) if include_git_status else []
                 dialog_chunks_rem = chunk_turns_for_refiner(
                     turns_copy, max_chars=max_chars, chunk_chars=chunk_chars
+                )
+                prior_chunk_rem = self._resolve_prior_chunk_for_window_locked(
+                    state,
+                    dialog_chunks_rem,
+                    turns_copy,
+                    max_chars=max_chars,
+                    allow_prior=eff_allow_prior,
+                    canon_cwd=self._canonical_prior_cwd(rem_cwd, is_remote=True),
                 )
                 rem_sections: list[str] = []
                 if include_git_status:
@@ -5100,7 +5519,7 @@ class SessionTracker:
                             "workspace_files (local folder; spelling reference only): "
                             + ", ".join(rem_shallow_files[:20])
                         )
-                return dialog_chunks_rem, "\n\n".join(rem_sections)
+                return prior_chunk_rem, dialog_chunks_rem, "\n\n".join(rem_sections)
 
         eff_ws = (
             ""
@@ -5110,9 +5529,20 @@ class SessionTracker:
         with self._lock:
             state = self._states.get(session_key) if session_key else None
             if state is None and not eff_ws:
-                return [], ""
+                return "", [], ""
             turns_copy = list(state.clean_turns) if state is not None else []
             cwd = eff_ws or (state.cwd if state is not None else "")
+            dialog_chunks = chunk_turns_for_refiner(
+                turns_copy, max_chars=max_chars, chunk_chars=chunk_chars
+            )
+            prior_chunk = self._resolve_prior_chunk_for_window_locked(
+                state,
+                dialog_chunks,
+                turns_copy,
+                max_chars=max_chars,
+                allow_prior=eff_allow_prior,
+                canon_cwd=self._canonical_prior_cwd(cwd, is_remote=False),
+            )
 
         git_status, git_hw = (
             self._get_git_info(cwd) if include_git_status else ("", [])
@@ -5126,9 +5556,6 @@ class SessionTracker:
             self._get_shallow_files(cwd)
             if (include_git_status and cwd and not git_hw and not repo_files)
             else []
-        )
-        dialog_chunks = chunk_turns_for_refiner(
-            turns_copy, max_chars=max_chars, chunk_chars=chunk_chars
         )
         git_sections: list[str] = []
         if include_git_status:
@@ -5148,7 +5575,27 @@ class SessionTracker:
                     "workspace_files (local folder; spelling reference only): "
                     + ", ".join(shallow_files[:20])
                 )
-        return dialog_chunks, "\n\n".join(git_sections)
+        return prior_chunk, dialog_chunks, "\n\n".join(git_sections)
+
+    def get_refiner_context(
+        self,
+        session_key: str,
+        *,
+        max_chars: int = DEFAULT_REFINER_CONTEXT_MAX_CHARS,
+        include_git_status: bool = True,
+        chunk_chars: int | None = None,
+        workspace_cwd: str = "",
+    ) -> tuple[list[str], str]:
+        """Return ``(dialog_chunks, git_context_text)`` separated for message-boundary prefix caching."""
+        _, dialog_chunks, git_ctx = self.get_refiner_context_with_prior(
+            session_key,
+            max_chars=max_chars,
+            include_git_status=include_git_status,
+            chunk_chars=chunk_chars,
+            workspace_cwd=workspace_cwd,
+            allow_prior=False,
+        )
+        return dialog_chunks, git_ctx
 
     def get_luna_delta(
         self,

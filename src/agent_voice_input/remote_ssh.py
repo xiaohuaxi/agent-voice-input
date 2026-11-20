@@ -697,6 +697,7 @@ def _validate_probe_response_schema(data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("invalid remote session_id")
     not_mod = bool(data.get("not_modified") or data.get("unchanged"))
     turns_out: list[tuple[str, str]] = []
+    prior_turns_out: list[tuple[str, str]] = []
     if not not_mod:
         raw_turns = data.get("turns") or []
         if not isinstance(raw_turns, list) or len(raw_turns) > 5000:
@@ -710,6 +711,23 @@ def _validate_probe_response_schema(data: dict[str, Any]) -> dict[str, Any]:
             ):
                 raise ValueError("invalid remote turn entry")
             turns_out.append((item[0], item[1]))
+        raw_prior = data.get("prior_turns") or []
+        if not isinstance(raw_prior, list) or len(raw_prior) > _remote_probe.COLD_START_PRIOR_MAX_TURNS:
+            raise ValueError("invalid remote prior_turns list")
+        prior_chars = 0
+        prior_char_cap = _remote_probe.COLD_START_PRIOR_MAX_CHARS + 5000
+        for item in raw_prior:
+            if (
+                not isinstance(item, (list, tuple))
+                or len(item) != 2
+                or item[0] not in ("user", "assistant")
+                or not isinstance(item[1], str)
+            ):
+                raise ValueError("invalid remote prior_turn entry")
+            prior_chars += len(item[1])
+            if prior_chars > prior_char_cap:
+                raise ValueError("remote prior_turns exceeds size limit")
+            prior_turns_out.append((item[0], item[1]))
 
     def _clean_str_list(key: str, cap: int) -> list[str]:
         raw = data.get(key) or []
@@ -738,6 +756,8 @@ def _validate_probe_response_schema(data: dict[str, Any]) -> dict[str, Any]:
         "shallow_files": _clean_str_list("shallow_files", 32),
         "files_included": bool(data.get("files_included")),
         "turns": turns_out,
+        "prior_turns": prior_turns_out,
+        "prior_hotwords": _clean_str_list("prior_hotwords", _remote_probe.COLD_START_PRIOR_MAX_HOTWORDS),
         "evicted_chunks": int(evicted_raw) if isinstance(evicted_raw, int) and not isinstance(evicted_raw, bool) else 0,
         "compaction_count": int(comp_raw) if isinstance(comp_raw, int) and not isinstance(comp_raw, bool) else 0,
     }

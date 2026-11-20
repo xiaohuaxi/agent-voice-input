@@ -137,6 +137,11 @@ prompt = ""
 include_git_status = true
 # Maximum recent session dialogue characters extracted for Stage 2 context (0 disables dialogue history; ~1/4-window eviction)
 context_max_chars = 200000
+# Cold-start fallback when the active coding session is empty/very short (or a workspace has no active session):
+# - "auto" (default): Stage 1 hotwords from recent same-cwd sessions + frozen <=25K prior same-cwd session block for Stage 2 / single-hop (naturally evicted once the new session fills context_max_chars)
+# - "hotwords": Stage 1 technical hotwords from recent same-cwd sessions only (no prior dialogue prose)
+# - "off": disable cold-start prior-session fallback
+cold_start_fallback = "auto"
 # Required when provider = "openai-compatible" (e.g. "http://127.0.0.1:8000/v1"); built-in providers resolve base_url automatically
 base_url = ""
 api_key_env = ""

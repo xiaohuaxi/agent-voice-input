@@ -150,7 +150,11 @@ _TELEMETRY_ENUM_FIELDS: frozenset[str] = frozenset(
         "refiner_model",
         "refiner_fallback",
         "paste_reason",
+        "ctx_fallback",
     }
+)
+_VALID_CTX_FALLBACK_ENUMS: frozenset[str] = frozenset(
+    {"", "prior_hotwords", "prior_session"}
 )
 _TELEMETRY_DIAG_TEXT_FIELDS: frozenset[str] = frozenset(
     {
@@ -180,7 +184,10 @@ def _sanitize_telemetry_record(rec: Mapping[str, Any], redact_fn: Any) -> dict[s
             clean[k] = rec[k]
     for k in _TELEMETRY_ENUM_FIELDS:
         if k in rec and isinstance(rec[k], str):
-            clean[k] = _clean_single_line(rec[k], redact_fn, max_chars=120) if rec[k] else ""
+            val = _clean_single_line(rec[k], redact_fn, max_chars=120) if rec[k] else ""
+            if k == "ctx_fallback" and val not in _VALID_CTX_FALLBACK_ENUMS:
+                val = ""
+            clean[k] = val
     for k in _TELEMETRY_DIAG_TEXT_FIELDS:
         if k in rec and isinstance(rec[k], str) and rec[k].strip():
             clean[k] = _clean_single_line(rec[k], redact_fn, max_chars=200)

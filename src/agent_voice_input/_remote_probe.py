@@ -28,6 +28,65 @@ PROBE_FRAME_MAGIC = b"__AVI_GZ__\x00"
 MAX_LINE_BYTES = 16 * 1024 * 1024
 DEFAULT_REFINER_CONTEXT_MAX_CHARS = 200000
 DEFAULT_REFINER_CHUNK_CHARS = DEFAULT_REFINER_CONTEXT_MAX_CHARS // 4
+COLD_START_PRIOR_MAX_CHARS = 25000
+COLD_START_PRIOR_MAX_TURNS = 500
+COLD_START_PRIOR_MAX_HOTWORDS = 48
+COLD_START_SWEET_MIN_TURNS = 4
+COLD_START_SWEET_MIN_CHARS = 3000
+COLD_START_FALLBACK_MIN_CHARS = 1000
+COLD_START_TOP_K = 5
+COLD_START_CODEX_SCAN_LIMIT = 100
+COLD_START_AGY_SCAN_LIMIT = 48
+
+PRIOR_SESSION_PREFIX = (
+    '<prior_session_reference read_only="true" scope="same_workspace_previous_session">\n'
+    "[READ-ONLY PRIOR SESSION REFERENCE — Excerpt from an earlier conversation in the same workspace. "
+    "You are NOT a participant; use it ONLY for workspace terminology, identifiers, and spelling. "
+    "If <session_reference_log> or <workspace_git_status> shows a different current topic, always follow "
+    "the current session and workspace.]\n"
+)
+PRIOR_SESSION_SUFFIX = "\n</prior_session_reference>"
+PRIOR_SESSION_WRAPPER_OVERHEAD_CHARS = len(PRIOR_SESSION_PREFIX) + len(PRIOR_SESSION_SUFFIX)
+
+SESSION_REF_HEADER_BODY = (
+    "[READ-ONLY BACKGROUND LOG — Transcript between the speaker and a separate downstream CLI agent. "
+    "You are NOT a participant in this dialogue; use it ONLY to spell filenames, identifiers, and "
+    "domain terms correctly, and never reply to it or copy its wording into the output.]\n"
+)
+SESSION_REF_SUFFIX = "\n</session_reference_log>"
+SESSION_REF_WRAPPER_OVERHEAD_CHARS = (
+    len('<session_reference_log read_only="true">\n')
+    + len(SESSION_REF_HEADER_BODY)
+    + len(SESSION_REF_SUFFIX)
+)
+
+_TECH_EXT = (
+    r"(?:jsonl|json|pyi|py|sh|ps1|swift|toml|md|tsx|ts|jsx|mjs|js|vue|svelte|scss|css|html|sql|rs|go"
+    r"|cpp|cc|c|hpp|h|java|kt|rb|php|yaml|yml|lock|ini|cfg|zsh|bash|env)"
+)
+_TECH_IDENT_RE = re.compile(
+    rf"(?<![A-Za-z0-9_.\-])(?P<file>[A-Za-z0-9_][A-Za-z0-9_.\-]*\.{_TECH_EXT})(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_.\-])(?P<flag>--[a-z][a-z0-9]*(?:-[a-z0-9]+)*)(?![A-Za-z0-9_\-])"
+    r"|(?<![A-Za-z0-9_])(?P<snake>_*[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])(?P<camel>[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+)(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])(?P<pascal>[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+|[A-Z]{2,}[a-z0-9]{2,}(?:[A-Z][a-z0-9]*)*)(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_.\-])(?P<kebab>[A-Za-z][A-Za-z0-9]*(?:\.[0-9]+)*(?:-[A-Za-z0-9]+(?:\.[0-9]+)*)+)(?![A-Za-z0-9_\-])"
+)
+_KEBAB_STOP_SEGS = frozenset(
+    "a an and as at by for from in into is it non of off on one or out over per re self step the to up well with".split()
+)
+_KEBAB_STOP_WORDS = frozenset({
+    "read-only", "real-time", "short-term", "long-term", "high-level", "low-level",
+    "trade-off", "trade-offs", "code-switching", "false-positive", "false-positives",
+    "open-source", "full-text", "plain-text", "single-hop", "two-stage", "multi-turn",
+    "utf-8", "utf-16", "sha-256", "covid-19",
+})
+_KEBAB_NUM_PREFIX_STOP = frozenset({
+    "top", "utf", "sha", "iso", "rfc", "http", "line", "step", "part", "item", "page", "phase", "wave", "rule",
+})
+_IDENT_STOP = frozenset({"__init__", "__main__"})
+_VER_ONLY_RE = re.compile(r"^[vV]?[0-9]+(?:\.[0-9]+)*(?:-[A-Za-z0-9.]+)?$")
+_HASH_HEX_RE = re.compile(r"^[0-9a-fA-F]{7,}(?:-[0-9a-fA-F]{4,})+$")
 
 _TOKEN_RE = re.compile(r"^[0-9a-f]{6}[0-9a-f-]{0,58}$")
 _STRICT_UUID_RE = re.compile(
@@ -279,6 +338,193 @@ def trim_turns_chunk_aligned(
 
     evicted_chunks = max(0, len(chunk_meta) - kept_chunks)
     return norm_turns[first_kept_idx:], evicted_chunks
+
+
+def _keep_tech_token(m: re.Match[str]) -> str | None:
+    tok = m.group(0)
+    if not (4 <= len(tok) <= 48) or tok in _IDENT_STOP:
+        return None
+    if m.group("file"):
+        stem = tok.rsplit(".", 1)[0]
+        return tok if len(stem) >= 2 and any(c.isalpha() for c in stem) else None
+    if m.group("kebab"):
+        low = tok.lower()
+        if len(tok) < 5 or low in _KEBAB_STOP_WORDS or _VER_ONLY_RE.match(tok) or _HASH_HEX_RE.match(tok):
+            return None
+        segs = low.split("-")
+        if _KEBAB_STOP_SEGS.intersection(segs):
+            return None
+        if len(segs) == 2 and segs[1].isdigit() and segs[0] in _KEBAB_NUM_PREFIX_STOP:
+            return None
+    return tok
+
+
+def _extract_session_hotword_counts(
+    turns: Sequence[tuple[str, str]], *, max_words: int = COLD_START_PRIOR_MAX_HOTWORDS
+) -> tuple[tuple[str, int], ...]:
+    if not turns or max_words <= 0:
+        return ()
+    canonical: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    first_seen: dict[str, int] = {}
+    order = 0
+    for _, text in reversed(turns[-40:]):
+        for m in _TECH_IDENT_RE.finditer(text):
+            tok = _keep_tech_token(m)
+            if not tok:
+                continue
+            low = tok.lower()
+            if low not in canonical:
+                canonical[low] = tok
+                first_seen[low] = order
+                order += 1
+            prev = counts.get(low, 0)
+            if prev < 20:
+                counts[low] = prev + 1
+    ranked = sorted(canonical.keys(), key=lambda low: (-counts[low], first_seen[low]))
+    return tuple((canonical[low], counts[low]) for low in ranked[:max_words])
+
+
+def extract_prior_sessions_hotwords(
+    sessions_turns: Sequence[Sequence[tuple[str, str]]],
+    *,
+    max_words: int = 24,
+) -> list[str]:
+    """Aggregate high-frequency technical identifiers across recent prior same-cwd sessions."""
+    if not sessions_turns or max_words <= 0:
+        return []
+    per_sess = [
+        {"hotword_counts": _extract_session_hotword_counts(turns, max_words=max(max_words, COLD_START_PRIOR_MAX_HOTWORDS))}
+        for turns in sessions_turns
+    ]
+    return aggregate_prior_candidates_hotwords(per_sess, max_words=max_words)
+
+
+def aggregate_prior_candidates_hotwords(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    max_words: int = 24,
+) -> list[str]:
+    """Aggregate high-frequency technical identifiers from slimmed prior candidate dicts."""
+    if not candidates or max_words <= 0:
+        return []
+    canonical: dict[str, str] = {}
+    doc_freq: dict[str, int] = {}
+    term_freq: dict[str, int] = {}
+    first_seen: dict[str, int] = {}
+    order = 0
+    for cand in candidates:
+        hw_counts = cand.get("hotword_counts")
+        if hw_counts is None:
+            raw_turns = cand.get("tail_turns") or cand.get("turns") or ()
+            hw_counts = _extract_session_hotword_counts(
+                raw_turns, max_words=max(max_words, COLD_START_PRIOR_MAX_HOTWORDS)
+            )
+        seen_in_doc: set[str] = set()
+        for tok, cnt in hw_counts:
+            low = str(tok).lower()
+            if not low or low in seen_in_doc:
+                continue
+            seen_in_doc.add(low)
+            if low not in canonical:
+                canonical[low] = str(tok)
+                first_seen[low] = order
+                order += 1
+            doc_freq[low] = doc_freq.get(low, 0) + 1
+            term_freq[low] = term_freq.get(low, 0) + max(1, int(cnt))
+    ranked = sorted(
+        canonical.keys(),
+        key=lambda low: (-doc_freq[low], -term_freq[low], first_seen[low]),
+    )
+    return [canonical[low] for low in ranked[:max_words]]
+
+
+def prior_chunk_body_budget(
+    max_chars: int, *, prior_max_chars: int = COLD_START_PRIOR_MAX_CHARS
+) -> int:
+    """Return max prior chunk body chars so wrapped ``<prior_session_reference>`` stays <= both caps."""
+    if max_chars <= 0:
+        return 0
+    total_cap = min(max(0, int(prior_max_chars)), max(0, int(max_chars)))
+    return max(0, total_cap - PRIOR_SESSION_WRAPPER_OVERHEAD_CHARS)
+
+
+def slice_prior_turns_tail(
+    turns: Sequence[tuple[str, str]],
+    *,
+    max_chars: int = COLD_START_PRIOR_MAX_CHARS,
+    max_turns: int = COLD_START_PRIOR_MAX_TURNS,
+) -> list[tuple[str, str]]:
+    """Return trailing complete turns fitting within ``max_chars`` formatted length and ``max_turns``."""
+    if not turns or max_chars <= 0 or max_turns <= 0:
+        return []
+    kept: list[tuple[str, str]] = []
+    total = 0
+    for role, text in reversed(turns):
+        if len(kept) >= max_turns:
+            break
+        norm_role = "user" if role == "user" else "assistant"
+        prefix_len = 10 if norm_role == "user" else 12  # "[Speaker]\n" vs "[CLI Agent]\n"
+        entry_len = prefix_len + len(text)
+        sep = 2 if kept else 0
+        if kept and total + sep + entry_len > max_chars:
+            break
+        if not kept and entry_len > max_chars:
+            rem = max(0, max_chars - prefix_len)
+            if rem > 0:
+                kept.append((norm_role, text[-rem:]))
+            break
+        kept.append((norm_role, text))
+        total += sep + entry_len
+    kept.reverse()
+    return kept
+
+
+def format_prior_turns_body(
+    turns: Sequence[tuple[str, str]],
+    *,
+    max_chars: int = COLD_START_PRIOR_MAX_CHARS,
+    max_turns: int = COLD_START_PRIOR_MAX_TURNS,
+) -> str:
+    """Format trailing prior turns as a single frozen reference chunk body (<= ``max_chars``)."""
+    sliced = slice_prior_turns_tail(turns, max_chars=max_chars, max_turns=max_turns)
+    if not sliced:
+        return ""
+    return "\n\n".join(
+        f"[{'Speaker' if r == 'user' else 'CLI Agent'}]\n{t}" for r, t in sliced
+    )
+
+
+def build_slim_prior_candidate(
+    *,
+    cli: str,
+    session_id: str,
+    jsonl_path: str,
+    cwd: str,
+    jsonl_mtime: float,
+    turns: Sequence[tuple[str, str]],
+) -> dict[str, Any] | None:
+    """Build a memory-bounded prior candidate keeping only counts, bounded hotwords, and <=25K tail turns."""
+    total_chars = sum(len(t) for _, t in turns)
+    if not turns or total_chars < COLD_START_FALLBACK_MIN_CHARS:
+        return None
+    tail_budget = prior_chunk_body_budget(COLD_START_PRIOR_MAX_CHARS)
+    tail_turns = tuple(
+        slice_prior_turns_tail(turns, max_chars=tail_budget, max_turns=COLD_START_PRIOR_MAX_TURNS)
+    )
+    if not tail_turns:
+        return None
+    return {
+        "cli": cli,
+        "session_id": session_id.lower(),
+        "jsonl_path": jsonl_path,
+        "cwd": cwd,
+        "jsonl_mtime": float(jsonl_mtime),
+        "turn_count": len(turns),
+        "total_chars": total_chars,
+        "hotword_counts": _extract_session_hotword_counts(turns, max_words=COLD_START_PRIOR_MAX_HOTWORDS),
+        "tail_turns": tail_turns,
+    }
 
 
 def _is_wsl_slow_mount_str(path_str: str) -> bool:
@@ -543,7 +789,9 @@ def _is_path_under_dir(
     return real_t == real_r or real_t.startswith(real_r.rstrip(os.sep) + os.sep)
 
 
-def _resolve_safe_transcript_path(cli: str, raw_path: str | Path, home: Path) -> str:
+def _resolve_safe_transcript_path(
+    cli: str, raw_path: str | Path, home: Path, *, wsl: bool = False
+) -> str:
     """Validate transcript path is an owned regular ``.jsonl`` file inside the CLI's transcript root."""
     s = str(raw_path or "").strip()
     if not s or "\x00" in s:
@@ -556,11 +804,11 @@ def _resolve_safe_transcript_path(cli: str, raw_path: str | Path, home: Path) ->
         root = home / ".gemini" / "antigravity-cli" / "brain"
     else:
         return ""
-    if not _is_path_under_dir(s, root):
+    if not _is_path_under_dir(s, root, wsl=wsl):
         return ""
     try:
-        real_p = os.path.realpath(s)
-        if not real_p.endswith(".jsonl"):
+        real_p = _safe_realpath(s, wsl=True) if wsl else os.path.realpath(s)
+        if not real_p or not real_p.endswith(".jsonl"):
             return ""
         st = os.stat(real_p)
     except OSError:
@@ -898,7 +1146,9 @@ def _is_agy_subagent(jsonl_path: str | Path) -> bool:
     return False
 
 
-def _extract_agy_cwd(jsonl_path: str | Path, *, wsl: bool = False) -> str:
+def _extract_agy_cwd(
+    jsonl_path: str | Path, *, wsl: bool = False, strict_system_only: bool = False
+) -> str:
     try:
         with open(jsonl_path, "rb") as f:
             for _ in range(8):
@@ -915,6 +1165,8 @@ def _extract_agy_cwd(jsonl_path: str | Path, *, wsl: bool = False) -> str:
                     continue
                 if isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
                     return _normalize_cwd(obj["cwd"], wsl=wsl)
+                if strict_system_only and obj.get("source") != "SYSTEM":
+                    continue
                 c = obj.get("content")
                 if isinstance(c, str) and (
                     "Working Directory:" in c or "Active Workspaces:" in c
@@ -1583,30 +1835,121 @@ def _lookup_by_token(
     return dir_hits[0]
 
 
+def _iter_codex_rollout_files_desc(
+    home: Path,
+    *,
+    max_files: int = COLD_START_CODEX_SCAN_LIMIT,
+    wsl: bool = False,
+) -> list[str]:
+    """Walk ``~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`` in reverse date order with a hard file cap."""
+    root = home / ".codex" / "sessions"
+    if wsl:
+        real_root = _safe_realpath(str(root), wsl=True)
+        if not real_root or not os.path.isdir(real_root):
+            return []
+        root = Path(real_root)
+    elif not root.is_dir():
+        return []
+
+    def _subdirs_desc(parent: Path) -> list[Path]:
+        items: list[tuple[str, Path]] = []
+        try:
+            with os.scandir(parent) as it:
+                for entry in it:
+                    if entry.name.startswith("."):
+                        continue
+                    if wsl and not _safe_realpath(entry.path, wsl=True):
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=True):
+                            items.append((entry.name, Path(entry.path)))
+                    except OSError:
+                        continue
+        except OSError:
+            return []
+        items.sort(key=lambda pair: pair[0], reverse=True)
+        return [p for _, p in items]
+
+    collected: list[tuple[float, str]] = []
+    for y_dir in _subdirs_desc(root):
+        for m_dir in _subdirs_desc(y_dir):
+            for d_dir in _subdirs_desc(m_dir):
+                day_files: list[tuple[float, str]] = []
+                try:
+                    with os.scandir(d_dir) as it:
+                        for entry in it:
+                            name = entry.name
+                            if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                                continue
+                            safe_p = _resolve_safe_transcript_path("codex", entry.path, home, wsl=wsl)
+                            if safe_p:
+                                day_files.append((_safe_mtime(safe_p), safe_p))
+                except OSError:
+                    continue
+                day_files.sort(key=lambda item: item[0], reverse=True)
+                for item in day_files:
+                    collected.append(item)
+                    if max_files > 0 and len(collected) >= max_files:
+                        collected.sort(key=lambda x: x[0], reverse=True)
+                        return [p for _, p in collected]
+    collected.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in collected]
+
+
 def _scan_storage_for_cwd(
-    target_cwd: str, home: Path, codex_names: Mapping[str, str]
+    target_cwd: str,
+    home: Path,
+    codex_names: Mapping[str, str],
+    *,
+    exact_only: bool = False,
+    codex_limit: int = 32,
+    agy_limit: int = 24,
+    include_claude_global: bool = True,
+    wsl: bool = False,
 ) -> list[dict[str, Any]]:
     """Tier 2 zero-hook storage scan strictly scoped to ``target_cwd`` (never cross-directory)."""
-    if _is_broad_or_unsafe_workspace_dir(target_cwd, home):
+    if _is_broad_or_unsafe_workspace_dir(target_cwd, home, wsl=wsl):
         return []
+    min_rank = 2 if exact_only else 1
     cands: list[dict[str, Any]] = []
 
-    # 1. Claude projects matching encoded target_cwd (exact + global subdir check)
+    # 1. Claude projects matching encoded target_cwd (exact + optional global subdir check)
     seen_cl: set[str] = set()
-    for enc in _encode_claude_dirs(target_cwd):
+    for enc in _encode_claude_dirs(target_cwd, wsl=wsl):
         pdir = home / ".claude" / "projects" / enc
-        if not pdir.is_dir():
-            continue
-        for jf in sorted(pdir.glob("*.jsonl"), key=_safe_mtime, reverse=True)[:24]:
-            safe_jf = _resolve_safe_transcript_path("claude", jf, home)
-            if not safe_jf:
+        if wsl:
+            real_pdir = _safe_realpath(str(pdir), wsl=True)
+            if not real_pdir or not os.path.isdir(real_pdir):
                 continue
+            pdir = Path(real_pdir)
+        elif not pdir.is_dir():
+            continue
+        cl_entries: list[tuple[float, str]] = []
+        try:
+            with os.scandir(pdir) as it:
+                for entry in it:
+                    if not entry.name.endswith(".jsonl"):
+                        continue
+                    safe_jf = _resolve_safe_transcript_path("claude", entry.path, home, wsl=wsl)
+                    if safe_jf:
+                        cl_entries.append((_safe_mtime(safe_jf), safe_jf))
+        except OSError:
+            continue
+        cl_entries.sort(key=lambda item: item[0], reverse=True)
+        for jm, safe_jf in cl_entries[:24]:
             seen_cl.add(safe_jf)
-            ok_cl, sid, mcwd = _read_claude_root_meta(safe_jf, allow_empty_or_meta_only=False)
+            ok_cl, sid, mcwd = _read_claude_root_meta(
+                safe_jf, allow_empty_or_meta_only=False, wsl=wsl
+            )
             if not ok_cl or not sid:
                 continue
-            eff_mcwd = mcwd or target_cwd
-            if _cwd_match_rank(target_cwd, eff_mcwd, home) > 0:
+            if exact_only:
+                if not mcwd:
+                    continue
+                eff_mcwd = mcwd
+            else:
+                eff_mcwd = mcwd or target_cwd
+            if _cwd_match_rank(target_cwd, eff_mcwd, home, wsl=wsl) >= min_rank:
                 cands.append(
                     {
                         "cli": "claude",
@@ -1615,22 +1958,24 @@ def _scan_storage_for_cwd(
                         "cwd": eff_mcwd,
                         "matched_by": "remote_cwd",
                         "pts_mtime": 0.0,
-                        "jsonl_mtime": _safe_mtime(safe_jf),
+                        "jsonl_mtime": jm,
                         "thread_name": "",
                     }
                 )
-    if not cands:
+    if include_claude_global and not cands:
         all_cl = sorted(
             glob.glob(str(home / ".claude" / "projects" / "*" / "*.jsonl")),
             key=_safe_mtime,
             reverse=True,
         )[:32]
         for clf in all_cl:
-            safe_clf = _resolve_safe_transcript_path("claude", clf, home)
+            safe_clf = _resolve_safe_transcript_path("claude", clf, home, wsl=wsl)
             if not safe_clf or safe_clf in seen_cl:
                 continue
-            ok_cl, sid, mcwd = _read_claude_root_meta(safe_clf, allow_empty_or_meta_only=False)
-            if ok_cl and sid and mcwd and _cwd_match_rank(target_cwd, mcwd, home) > 0:
+            ok_cl, sid, mcwd = _read_claude_root_meta(
+                safe_clf, allow_empty_or_meta_only=False, wsl=wsl
+            )
+            if ok_cl and sid and mcwd and _cwd_match_rank(target_cwd, mcwd, home, wsl=wsl) >= min_rank:
                 cands.append(
                     {
                         "cli": "claude",
@@ -1644,18 +1989,10 @@ def _scan_storage_for_cwd(
                     }
                 )
 
-    # 2. Codex rollouts matching target_cwd
-    cx_files = sorted(
-        glob.glob(str(home / ".codex" / "sessions" / "*" / "*" / "*" / "rollout-*.jsonl")),
-        key=_safe_mtime,
-        reverse=True,
-    )[:32]
-    for cf in cx_files:
-        safe_cf = _resolve_safe_transcript_path("codex", cf, home)
-        if not safe_cf:
-            continue
-        ok_c, sid, mcwd = _read_codex_root_meta(safe_cf)
-        if ok_c and sid and mcwd and _cwd_match_rank(target_cwd, mcwd, home) > 0:
+    # 2. Codex rollouts matching target_cwd (reverse YYYY/MM/DD bounded walk)
+    for safe_cf in _iter_codex_rollout_files_desc(home, max_files=codex_limit, wsl=wsl):
+        ok_c, sid, mcwd = _read_codex_root_meta(safe_cf, wsl=wsl)
+        if ok_c and sid and mcwd and _cwd_match_rank(target_cwd, mcwd, home, wsl=wsl) >= min_rank:
             cands.append(
                 {
                     "cli": "codex",
@@ -1669,27 +2006,36 @@ def _scan_storage_for_cwd(
                 }
             )
 
-    # 3. Antigravity CLI brain transcripts matching target_cwd
+    # 3. Antigravity CLI brain transcripts matching target_cwd (no live presence lock required)
     broot = home / ".gemini" / "antigravity-cli" / "brain"
-    if broot.is_dir():
+    broot_ok = (
+        bool(_safe_realpath(str(broot), wsl=True)) and broot.is_dir()
+        if wsl
+        else broot.is_dir()
+    )
+    if broot_ok:
         agy_items: list[tuple[float, str, str]] = []
         try:
             with os.scandir(broot) as it:
                 for entry in it:
                     if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
                         continue
-                    tp = _resolve_agy_transcript_path(home, entry.name)
-                    safe_tp = _resolve_safe_transcript_path("agy", tp, home) if tp is not None else ""
+                    tp = _resolve_agy_transcript_path(home, entry.name, wsl=wsl)
+                    safe_tp = (
+                        _resolve_safe_transcript_path("agy", tp, home, wsl=wsl)
+                        if tp is not None
+                        else ""
+                    )
                     if safe_tp:
                         agy_items.append((_safe_mtime(safe_tp), entry.name.lower(), safe_tp))
         except OSError:
             pass
         agy_items.sort(key=lambda x: x[0], reverse=True)
-        for jm, cid, safe_tp in agy_items[:24]:
+        for jm, cid, safe_tp in agy_items[:agy_limit]:
             if _is_agy_subagent(safe_tp):
                 continue
-            acwd = _extract_agy_cwd(safe_tp)
-            if acwd and _cwd_match_rank(target_cwd, acwd, home) > 0:
+            acwd = _extract_agy_cwd(safe_tp, wsl=wsl, strict_system_only=exact_only)
+            if acwd and _cwd_match_rank(target_cwd, acwd, home, wsl=wsl) >= min_rank:
                 cands.append(
                     {
                         "cli": "agy",
@@ -1703,6 +2049,118 @@ def _scan_storage_for_cwd(
                     }
                 )
     return cands
+
+
+def select_cold_start_prior_candidate(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    preferred_cli: str = "",
+    exclude_session_id: str = "",
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Select Layer 2 prior session and Top-5 substantial pool from exact-cwd historical candidates."""
+    excl = (exclude_session_id or "").strip().lower()
+    pref = (preferred_cli or "").strip().lower()
+    pool: list[dict[str, Any]] = []
+    for item in candidates:
+        sid = str(item.get("session_id") or "").strip().lower()
+        if excl and sid == excl:
+            continue
+        raw_turns = item.get("tail_turns") if "tail_turns" in item else (item.get("turns") or ())
+        turn_cnt = int(item["turn_count"]) if "turn_count" in item else len(raw_turns)
+        total_chars = int(item.get("total_chars") or 0)
+        if turn_cnt <= 0 or not raw_turns or total_chars < COLD_START_FALLBACK_MIN_CHARS:
+            continue
+        pool.append(dict(item))
+    pool.sort(key=lambda c: float(c.get("jsonl_mtime") or 0.0), reverse=True)
+    top5 = pool[:COLD_START_TOP_K]
+    if not top5:
+        return None, []
+    sweet = [
+        c
+        for c in top5
+        if (
+            int(c["turn_count"])
+            if "turn_count" in c
+            else len(c.get("tail_turns") if "tail_turns" in c else (c.get("turns") or ()))
+        )
+        >= COLD_START_SWEET_MIN_TURNS
+        and int(c.get("total_chars") or 0) >= COLD_START_SWEET_MIN_CHARS
+    ]
+    if sweet:
+        sweet.sort(
+            key=lambda c: (
+                1 if (pref and str(c.get("cli") or "").strip().lower() == pref) else 0,
+                float(c.get("jsonl_mtime") or 0.0),
+            ),
+            reverse=True,
+        )
+        return sweet[0], top5
+    fallback = sorted(
+        top5,
+        key=lambda c: (
+            int(c.get("total_chars") or 0),
+            1 if (pref and str(c.get("cli") or "").strip().lower() == pref) else 0,
+            float(c.get("jsonl_mtime") or 0.0),
+        ),
+        reverse=True,
+    )
+    return fallback[0], top5
+
+
+def discover_cli_prior_sessions(
+    target_cwd: str,
+    *,
+    home: Path,
+    wsl: bool = False,
+    max_keep: int = COLD_START_TOP_K + 2,
+) -> list[dict[str, Any]]:
+    """Discover substantial exact-cwd historical CLI sessions (Claude / Codex / agy) without age/branch limits."""
+    if _is_broad_or_unsafe_workspace_dir(target_cwd, home, wsl=wsl):
+        return []
+    raw_cands = _scan_storage_for_cwd(
+        target_cwd,
+        home,
+        {},
+        exact_only=True,
+        codex_limit=COLD_START_CODEX_SCAN_LIMIT,
+        agy_limit=COLD_START_AGY_SCAN_LIMIT,
+        include_claude_global=False,
+        wsl=wsl,
+    )
+    if not raw_cands:
+        return []
+    by_id: dict[tuple[str, str], dict[str, Any]] = {}
+    for c in raw_cands:
+        key = (str(c.get("cli") or "").lower(), str(c.get("session_id") or "").lower())
+        prev = by_id.get(key)
+        if prev is None or float(c.get("jsonl_mtime") or 0.0) > float(prev.get("jsonl_mtime") or 0.0):
+            by_id[key] = c
+    ordered = sorted(by_id.values(), key=lambda c: float(c.get("jsonl_mtime") or 0.0), reverse=True)
+    parsed: list[dict[str, Any]] = []
+    max_inspect = max(20, max_keep * 3)
+    for c in ordered[:max_inspect]:
+        cli = str(c.get("cli") or "")
+        jpath = str(c.get("jsonl_path") or "")
+        if not cli or not jpath:
+            continue
+        turns, disc_cwd, _ = _clean_jsonl_file(cli, jpath, home=home, wsl=wsl)
+        eff_cand_cwd = disc_cwd or str(c.get("cwd") or "")
+        if not eff_cand_cwd or _cwd_match_rank(target_cwd, eff_cand_cwd, home, wsl=wsl) < 2:
+            continue
+        slim = build_slim_prior_candidate(
+            cli=cli,
+            session_id=str(c.get("session_id") or ""),
+            jsonl_path=jpath,
+            cwd=eff_cand_cwd,
+            jsonl_mtime=float(c.get("jsonl_mtime") or 0.0),
+            turns=turns,
+        )
+        if slim is None:
+            continue
+        parsed.append(slim)
+        if len(parsed) >= max_keep:
+            break
+    return parsed
 
 
 def _pick_best_for_same_cwd(
@@ -2084,7 +2542,7 @@ _extract_codex_compacted = _extract_codex_compacted_turns
 
 
 def _clean_jsonl_file(
-    cli: str, jsonl_path: str, *, home: Path | None = None
+    cli: str, jsonl_path: str, *, home: Path | None = None, wsl: bool = False
 ) -> tuple[list[tuple[str, str]], str, int]:
     """Return ``(clean_turns, discovered_cwd, compaction_count)``."""
     turns: list[tuple[str, str]] = []
@@ -2099,7 +2557,7 @@ def _clean_jsonl_file(
     if not jsonl_path:
         return [], "", 0
     eff_path = (
-        _resolve_safe_transcript_path(cli, jsonl_path, home)
+        _resolve_safe_transcript_path(cli, jsonl_path, home, wsl=wsl)
         if home is not None
         else (jsonl_path if os.path.isfile(jsonl_path) else "")
     )
@@ -2563,6 +3021,48 @@ def run_probe(
         resp["turns"] = [[r, t] for r, t in kept_turns]
         resp["evicted_chunks"] = evicted_chunks
         resp["compaction_count"] = compaction_count
+        cold_start_mode = str(req.get("cold_start_fallback") or "auto").strip().lower()
+        prior_checked_sid = str(req.get("prior_checked_session_id") or "").strip().lower()
+        prior_already_checked = bool(
+            prior_checked_sid and prior_checked_sid in (sid, f"{cli}:{sid}")
+        )
+        if (
+            cold_start_mode in ("auto", "hotwords")
+            and not prior_already_checked
+            and len(kept_turns) < COLD_START_SWEET_MIN_TURNS
+            and evicted_chunks == 0
+            and compaction_count == 0
+            and eff_cwd
+            and not _is_broad_or_unsafe_workspace_dir(eff_cwd, home)
+        ):
+            prior_cands = discover_cli_prior_sessions(eff_cwd, home=home, wsl=False)
+            best_prior, top5_prior = select_cold_start_prior_candidate(
+                prior_cands,
+                preferred_cli=("" if cli == "workspace" else cli),
+                exclude_session_id=sid,
+            )
+            if top5_prior:
+                prior_hw = aggregate_prior_candidates_hotwords(
+                    top5_prior, max_words=COLD_START_PRIOR_MAX_HOTWORDS
+                )
+                if prior_hw:
+                    resp["prior_hotwords"] = prior_hw
+            if (
+                cold_start_mode == "auto"
+                and cli != "workspace"
+                and best_prior is not None
+                and max_chars > 0
+            ):
+                body_cap = prior_chunk_body_budget(max_chars)
+                prior_src_turns = best_prior.get("tail_turns") or best_prior.get("turns") or ()
+                if body_cap > 0 and prior_src_turns:
+                    sliced_prior = slice_prior_turns_tail(
+                        prior_src_turns,
+                        max_chars=body_cap,
+                        max_turns=COLD_START_PRIOR_MAX_TURNS,
+                    )
+                    if sliced_prior:
+                        resp["prior_turns"] = [[r, t] for r, t in sliced_prior]
     return resp
 
 

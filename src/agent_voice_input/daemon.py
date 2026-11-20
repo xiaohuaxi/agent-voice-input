@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from . import __version__
+from ._remote_probe import _is_broad_or_unsafe_workspace_dir
 from .app_scope import (
     classify_target_app_hint,
     classify_window_category,
@@ -68,6 +69,9 @@ from .session_ctx import (
     prune_stale_session_registry,
 )
 from .workspace_ctx import (
+    _dedupe_hotwords_ci,
+    _effective_is_wsl,
+    _resolve_safe_local_dir,
     resolve_antigravity_ide_session,
     resolve_ide_workspace_cwd,
 )
@@ -117,6 +121,7 @@ class PipelineResult:
     ctx_chars: int = 0
     ctx_chunks: int = 0
     mode: str = "agent"
+    ctx_fallback: str = ""
 
 
 def build_pipeline_summary(
@@ -168,6 +173,7 @@ def build_pipeline_summary(
         "final_chars": len(res.final_text),
         "ctx_chars": res.ctx_chars,
         "ctx_chunks": res.ctx_chunks,
+        "ctx_fallback": res.ctx_fallback,
         "input_tokens": in_tok,
         "cached_input_tokens": cached_tok,
         "output_tokens": out_tok,
@@ -727,6 +733,7 @@ class _Stage1State:
     asr_chunks: int = 1
     asr_chunk_secs: tuple[float, ...] = ()
     skipped_reason: str = ""
+    ctx_fallback: str = ""
 
 
 def _make_pipeline_result(
@@ -743,6 +750,15 @@ def _make_pipeline_result(
     saved_audio: str = "",
     error: str = "",
 ) -> PipelineResult:
+    eff_ctx_fb = ""
+    if st.eff_mode != "general":
+        if (
+            (refined is not None and getattr(refined, "used_prior_session", False))
+            or st.ctx_fallback == "prior_session"
+        ):
+            eff_ctx_fb = "prior_session"
+        elif st.ctx_fallback == "prior_hotwords":
+            eff_ctx_fb = "prior_hotwords"
     return PipelineResult(
         ok,
         seq_id,
@@ -768,6 +784,7 @@ def _make_pipeline_result(
         ctx_chars=refined.context_chars if refined else 0,
         ctx_chunks=refined.context_chunks if refined else 0,
         mode=st.eff_mode,
+        ctx_fallback=eff_ctx_fb,
     )
 
 
@@ -878,6 +895,8 @@ def _execute_stage1(
             extra_sync_kw["document"] = win.document
         if cancel_check is not None and (accepts_var_kw or "cancel_token" in sync_params):
             extra_sync_kw["cancel_token"] = cancel_check
+        if accepts_var_kw or "cold_start_fallback" in sync_params:
+            extra_sync_kw["cold_start_fallback"] = cfg.refiner.cold_start_fallback
         st.snap = (
             sync_fn(
                 window_title=win.title,
@@ -889,9 +908,36 @@ def _execute_stage1(
             if window_title_override is None
             else sync_fn(
                 window_title=window_title_override,
-                **{k: v for k, v in extra_sync_kw.items() if k == "cancel_token"},
+                **{
+                    k: v
+                    for k, v in extra_sync_kw.items()
+                    if k in ("cancel_token", "cold_start_fallback")
+                },
             )
         )
+        if (
+            st.snap is None
+            and window_title_override is None
+            and win.cwd
+            and not getattr(tracker, "last_sync_remote_vetoed", False)
+        ):
+            eff_wsl = _effective_is_wsl(env=env)
+            safe_cwd = _resolve_safe_local_dir(win.cwd, wsl=eff_wsl)
+            if safe_cwd and not _is_broad_or_unsafe_workspace_dir(
+                safe_cwd, getattr(tracker, "home", None), wsl=eff_wsl
+            ):
+                st.workspace_cwd = safe_cwd
+                extra_hw = tracker.build_workspace_hotwords(st.workspace_cwd)
+                if cfg.refiner.cold_start_fallback != "off" and (
+                    prior_hw_fn := getattr(tracker, "get_workspace_prior_hotwords", None)
+                ) is not None:
+                    if prior_hw := prior_hw_fn(
+                        st.workspace_cwd,
+                        scope="cli",
+                        cold_start_fallback=cfg.refiner.cold_start_fallback,
+                    ):
+                        extra_hw = _dedupe_hotwords_ci([*extra_hw, *prior_hw])
+                        st.ctx_fallback = "prior_hotwords"
     elif eff_mode == "agent" and (win.process or win.bundle_id):
         st.workspace_cwd = resolve_ide_workspace_cwd(
             win,
@@ -904,11 +950,33 @@ def _execute_stage1(
                 st.workspace_cwd, home=tracker.home, env=env
             )
             if ide_match is not None:
-                st.snap = tracker.sync_ide_session(ide_match)
+                st.snap = tracker.sync_ide_session(
+                    ide_match, cold_start_fallback=cfg.refiner.cold_start_fallback
+                )
         if st.snap is None and st.workspace_cwd:
             extra_hw = tracker.build_workspace_hotwords(st.workspace_cwd)
+            if cfg.refiner.cold_start_fallback != "off" and (
+                prior_hw_fn := getattr(tracker, "get_workspace_prior_hotwords", None)
+            ) is not None:
+                ide_scope = "agy_ide" if is_antigravity_ide_window(win) else "cli"
+                if prior_hw := prior_hw_fn(
+                    st.workspace_cwd,
+                    scope=ide_scope,
+                    cold_start_fallback=cfg.refiner.cold_start_fallback,
+                ):
+                    extra_hw = _dedupe_hotwords_ci([*extra_hw, *prior_hw])
+                    st.ctx_fallback = "prior_hotwords"
     elif eff_mode == "general" and (win.process or win.bundle_id):
         st.target_hint = classify_target_app_hint(win)
+
+    if (
+        eff_mode != "general"
+        and st.snap is not None
+        and getattr(st.snap, "prior_hotwords_used", False)
+        and cfg.refiner.cold_start_fallback != "off"
+        and not st.ctx_fallback
+    ):
+        st.ctx_fallback = "prior_hotwords"
 
     asr_ctx = tracker.build_asr_context(st.snap, extra_hotwords=extra_hw, mode=eff_mode)
     if st.target_hint:
@@ -924,6 +992,10 @@ def _execute_stage1(
             workspace_cwd=st.workspace_cwd,
             target_hint=st.target_hint,
         )
+        if eff_mode != "general" and any(
+            b.startswith("<prior_session_reference") for b in asr_ctx.context_blocks
+        ):
+            st.ctx_fallback = "prior_session"
     st.sync_ms = _elapsed_ms(t_sync0)
 
     if (
@@ -993,6 +1065,7 @@ def run_pipeline_once(
         runtime_dir=runtime_dir,
         remote_cfg=cfg.remote,
         context_max_chars=cfg.refiner.context_max_chars,
+        cold_start_fallback=cfg.refiner.cold_start_fallback,
     )
     eff_asr = asr_provider or create_asr_provider(cfg, eff_creds, env=eff_env)
     owns_refiner = refiner is None
@@ -1438,9 +1511,12 @@ class VoiceInputDaemon:
                 runtime_dir=self.runtime_dir,
                 remote_cfg=cfg.remote,
                 context_max_chars=cfg.refiner.context_max_chars,
+                cold_start_fallback=cfg.refiner.cold_start_fallback,
             )
         else:
             self.tracker = tracker
+            if hasattr(tracker, "cold_start_fallback"):
+                tracker.cold_start_fallback = cfg.refiner.cold_start_fallback
             if (cfg_rem := getattr(tracker, "configure_remote", None)) is not None:
                 if cfg.remote.enabled:
                     cfg_rem(

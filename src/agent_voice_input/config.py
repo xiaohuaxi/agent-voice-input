@@ -80,6 +80,7 @@ CODEX_PUBLIC_FALLBACK_MODELS: tuple[str, ...] = (
     "codex-mini-latest",
 )
 VALID_REFINER_APIS = frozenset({"auto", "chat-completions", "responses"})
+VALID_COLD_START_FALLBACKS = frozenset({"auto", "hotwords", "off"})
 VALID_EFFORTS = frozenset(
     {"auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
@@ -481,6 +482,7 @@ class RefinerConfig:
     prompt: str = ""
     include_git_status: bool = True
     context_max_chars: int = 200000
+    cold_start_fallback: str = "auto"
     base_url: str = ""
     api_key_env: str = ""
     max_turns_per_thread: int = 20
@@ -1874,6 +1876,8 @@ def _apply_refiner_section(cfg: Config, ref: Any) -> None:
             cfg.refiner.include_git_status = _as_bool(v, "refiner.include_git_status")
         elif k == "context_max_chars":
             cfg.refiner.context_max_chars = _as_int(v, "refiner.context_max_chars")
+        elif k == "cold_start_fallback":
+            cfg.refiner.cold_start_fallback = _as_str(v, "refiner.cold_start_fallback").strip().lower()
         elif k == "base_url":
             cfg.refiner.base_url = _as_str(v, "refiner.base_url").strip()
         elif k == "api_key_env":
@@ -2326,6 +2330,14 @@ def _validate_refiner_config(cfg: Config, *, env: Mapping[str, str] | None = Non
         or cfg.refiner.context_max_chars < 0
     ):
         raise ConfigError("refiner.context_max_chars must be an integer >= 0")
+    if (
+        not isinstance(cfg.refiner.cold_start_fallback, str)
+        or cfg.refiner.cold_start_fallback not in VALID_COLD_START_FALLBACKS
+    ):
+        raise ConfigError(
+            f"refiner.cold_start_fallback must be one of {sorted(VALID_COLD_START_FALLBACKS)}, "
+            f"got {cfg.refiner.cold_start_fallback!r}"
+        )
     if cfg.refiner.provider == "openai-compatible":
         if not cfg.refiner.base_url.strip():
             raise ConfigError(

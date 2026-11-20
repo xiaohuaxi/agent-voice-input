@@ -16,6 +16,8 @@ from typing import Any, BinaryIO, Iterable, Mapping, Sequence
 import urllib.parse
 
 from ._remote_probe import (
+    COLD_START_FALLBACK_MIN_CHARS,
+    COLD_START_TOP_K,
     _AGY_WS_CWD_RE,
     _BROAD_SYSTEM_DIRS_LOW,
     _REPO_CORE_EXTS,
@@ -26,12 +28,19 @@ from ._remote_probe import (
     _SHALLOW_DOC_AND_CODE_EXTS,
     _SHALLOW_SKIP_BASES_LOW,
     _SHALLOW_SKIP_DIRS_LOW,
+    _TECH_IDENT_RE,
+    _clean_jsonl_file,
+    _cwd_match_rank,
     _is_agy_subagent,
     _is_broad_or_unsafe_workspace_dir,
+    _is_path_under_dir,
     _is_wsl_slow_mount_str,
+    _keep_tech_token,
     _normalize_cwd,
     _read_bounded_line,
     _safe_realpath,
+    build_slim_prior_candidate,
+    extract_prior_sessions_hotwords,
 )
 from .app_scope import is_remote_ide_window, parse_ide_window_title
 
@@ -61,35 +70,6 @@ class SessionMatch:
 # Git status & technical identifier hotword extraction
 # ---------------------------------------------------------------------------
 
-_TECH_EXT = (
-    r"(?:jsonl|json|pyi|py|sh|ps1|swift|toml|md|tsx|ts|jsx|mjs|js|vue|svelte|scss|css|html|sql|rs|go"
-    r"|cpp|cc|c|hpp|h|java|kt|rb|php|yaml|yml|lock|ini|cfg|zsh|bash|env)"
-)
-_TECH_IDENT_RE = re.compile(
-    rf"(?<![A-Za-z0-9_.\-])(?P<file>[A-Za-z0-9_][A-Za-z0-9_.\-]*\.{_TECH_EXT})(?![A-Za-z0-9_])"
-    r"|(?<![A-Za-z0-9_.\-])(?P<flag>--[a-z][a-z0-9]*(?:-[a-z0-9]+)*)(?![A-Za-z0-9_\-])"
-    r"|(?<![A-Za-z0-9_])(?P<snake>_*[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)(?![A-Za-z0-9_])"
-    r"|(?<![A-Za-z0-9_])(?P<camel>[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+)(?![A-Za-z0-9_])"
-    r"|(?<![A-Za-z0-9_])(?P<pascal>[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+|[A-Z]{2,}[a-z0-9]{2,}(?:[A-Z][a-z0-9]*)*)(?![A-Za-z0-9_])"
-    r"|(?<![A-Za-z0-9_.\-])(?P<kebab>[A-Za-z][A-Za-z0-9]*(?:\.[0-9]+)*(?:-[A-Za-z0-9]+(?:\.[0-9]+)*)+)(?![A-Za-z0-9_\-])"
-)
-
-_KEBAB_STOP_SEGS = frozenset(
-    "a an and as at by for from in into is it non of off on one or out over per re self step the to up well with".split()
-)
-_KEBAB_STOP_WORDS = frozenset({
-    "read-only", "real-time", "short-term", "long-term", "high-level", "low-level",
-    "trade-off", "trade-offs", "code-switching", "false-positive", "false-positives",
-    "open-source", "full-text", "plain-text", "single-hop", "two-stage", "multi-turn",
-    "utf-8", "utf-16", "sha-256", "covid-19",
-})
-_KEBAB_NUM_PREFIX_STOP = frozenset({
-    "top", "utf", "sha", "iso", "rfc", "http", "line", "step", "part", "item", "page", "phase", "wave", "rule",
-})
-_IDENT_STOP = frozenset({"__init__", "__main__"})
-_VER_ONLY_RE = re.compile(r"^[vV]?[0-9]+(?:\.[0-9]+)*(?:-[A-Za-z0-9.]+)?$")
-_HASH_HEX_RE = re.compile(r"^[0-9a-fA-F]{7,}(?:-[0-9a-fA-F]{4,})+$")
-
 BUILTIN_AGENT_HOTWORDS: tuple[str, ...] = (
     "Codex", "Claude Code", "Gemini", "Flash-Lite", "Luna", "Astra", "Sol",
     "Opus", "Sonnet", "Haiku", "Antigravity", "agy", "Ghostty", "tmux", "WSL2", "CLI",
@@ -109,25 +89,6 @@ def _dedupe_hotwords_ci(words: Sequence[str]) -> list[str]:
             seen_low.add(low)
             out.append(w)
     return out
-
-
-def _keep_tech_token(m: re.Match[str]) -> str | None:
-    tok = m.group(0)
-    if not (4 <= len(tok) <= 48) or tok in _IDENT_STOP:
-        return None
-    if m.group("file"):
-        stem = tok.rsplit(".", 1)[0]
-        return tok if len(stem) >= 2 and any(c.isalpha() for c in stem) else None
-    if m.group("kebab"):
-        low = tok.lower()
-        if len(tok) < 5 or low in _KEBAB_STOP_WORDS or _VER_ONLY_RE.match(tok) or _HASH_HEX_RE.match(tok):
-            return None
-        segs = low.split("-")
-        if _KEBAB_STOP_SEGS.intersection(segs):
-            return None
-        if len(segs) == 2 and segs[1].isdigit() and segs[0] in _KEBAB_NUM_PREFIX_STOP:
-            return None
-    return tok
 
 
 def _detect_host_is_wsl() -> bool:
@@ -559,19 +520,31 @@ def _read_bounded_jsonl_dicts(f: BinaryIO, *, max_lines: int = 0) -> list[dict[s
     return objs
 
 
-def _load_agy_ide_evidence(cid_dir: Path, tp: Path, st: os.stat_result, home: Path) -> _AgyIdeEvidence:
+def _load_agy_ide_evidence(
+    cid_dir: Path, tp: Path, st: os.stat_result, home: Path, *, wsl: bool = False
+) -> _AgyIdeEvidence:
     sub_dir = cid_dir / ".system_generated" / "subagents"
     sub_files: list[Path] = []
     sub_sig: list[tuple[str, int, int]] = []
-    if sub_dir.is_dir():
+    safe_sub_dir = _resolve_safe_local_dir(str(sub_dir), wsl=wsl)
+    if safe_sub_dir:
         try:
-            for sf in sorted(sub_dir.glob("*.json"))[:16]:
+            sub_entries: list[tuple[str, Path]] = []
+            with os.scandir(safe_sub_dir) as sit:
+                for entry in sit:
+                    if entry.name.endswith(".json"):
+                        sub_entries.append((entry.name, Path(entry.path)))
+            sub_entries.sort(key=lambda pair: pair[0])
+            for name, sf in sub_entries[:16]:
+                safe_sf = _safe_realpath(str(sf), wsl=wsl)
+                if not safe_sf or not os.path.isfile(safe_sf):
+                    continue
                 try:
-                    sst = sf.stat()
+                    sst = os.stat(safe_sf)
                 except OSError:
                     continue
-                sub_files.append(sf)
-                sub_sig.append((sf.name, sst.st_mtime_ns, sst.st_size))
+                sub_files.append(Path(safe_sf))
+                sub_sig.append((name, sst.st_mtime_ns, sst.st_size))
         except OSError:
             pass
     cache_key = (str(tp), st.st_mtime_ns, st.st_size, tuple(sub_sig))
@@ -748,7 +721,7 @@ def resolve_antigravity_ide_session(
         if _is_agy_subagent(tp):
             continue
         matched += 1
-        ev = _load_agy_ide_evidence(cid_dir, tp, st, home)
+        ev = _load_agy_ide_evidence(cid_dir, tp, st, home, wsl=eff_wsl)
         if _classify_agy_evidence_for_workspace(ev, safe_ws, home, wsl=eff_wsl) == "match":
             return SessionMatch(
                 cli="agy", session_id=cid, jsonl_path=str(tp), cwd=safe_ws, matched_by="ide_brain", jsonl_mtime=mtime
@@ -756,6 +729,108 @@ def resolve_antigravity_ide_session(
         if matched >= _AGY_IDE_MAX_CANDIDATES:
             break
     return None
+
+
+def _agy_ide_evidence_matches_exact_workspace(
+    ev: _AgyIdeEvidence, safe_ws: str, home: Path, *, wsl: bool = False
+) -> bool:
+    """Require explicit ``workspaceUris`` or system ``cwd`` exact match (rank == 2); never L2/L3 path guesses."""
+    if not safe_ws:
+        return False
+    for tier_paths in (ev.ws_uris, ev.sys_cwds):
+        if tier_paths:
+            return any(
+                _cwd_match_rank(safe_ws, p, home, wsl=wsl) == 2
+                for p in tier_paths
+                if p != _AGY_REMOTE_URI_SENTINEL
+            )
+    return False
+
+
+def discover_antigravity_ide_prior_sessions(
+    workspace_cwd: str,
+    *,
+    home: Path,
+    wsl: bool | None = None,
+    env: Mapping[str, str] | None = None,
+    max_keep: int = COLD_START_TOP_K + 2,
+) -> list[dict[str, Any]]:
+    """Discover historical desktop Antigravity IDE ``brain/<cid>`` sessions for exact ``workspace_cwd``.
+
+    Strictly isolated to ``~/.gemini/antigravity/brain`` and ``~/.gemini/antigravity-ide/brain``
+    with no age limit, excluding subagents and broad/unsafe workspaces.
+    """
+    eff_wsl = _effective_is_wsl(wsl, env)
+    safe_ws = _resolve_safe_local_dir(workspace_cwd, wsl=eff_wsl)
+    if not safe_ws or _is_broad_or_unsafe_workspace_dir(safe_ws, home, wsl=eff_wsl):
+        return []
+
+    raw_cands: list[tuple[float, str, Path, Path, os.stat_result, Path]] = []
+    seen_cids: set[str] = set()
+    for broot in (home / ".gemini" / "antigravity" / "brain", home / ".gemini" / "antigravity-ide" / "brain"):
+        real_broot = _resolve_safe_local_dir(str(broot), wsl=eff_wsl)
+        if not real_broot:
+            continue
+        broot_path = Path(real_broot)
+        try:
+            with os.scandir(real_broot) as bit:
+                for entry in bit:
+                    cid = entry.name.strip().lower()
+                    if not cid or cid.startswith(".") or cid in seen_cids:
+                        continue
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    cid_dir = Path(entry.path)
+                    logs_dir = cid_dir / ".system_generated" / "logs"
+                    tp: Path | None = None
+                    for cand_name in ("transcript_full.jsonl", "transcript.jsonl"):
+                        cand_tp = logs_dir / cand_name
+                        if not _is_path_under_dir(cand_tp, broot_path, wsl=eff_wsl):
+                            continue
+                        safe_tp = _safe_realpath(str(cand_tp), wsl=eff_wsl)
+                        if safe_tp and os.path.isfile(safe_tp):
+                            tp = Path(safe_tp)
+                            break
+                    if tp is None:
+                        continue
+                    try:
+                        st = tp.stat()
+                    except OSError:
+                        continue
+                    if st.st_size > 0 and st.st_uid == os.getuid():
+                        seen_cids.add(cid)
+                        raw_cands.append((st.st_mtime, cid, cid_dir, tp, st, broot_path))
+        except OSError:
+            continue
+
+    raw_cands.sort(key=lambda item: item[0], reverse=True)
+    parsed: list[dict[str, Any]] = []
+    inspected = 0
+    for mtime, cid, cid_dir, tp, st, _ in raw_cands[:64]:
+        if _is_agy_subagent(tp):
+            continue
+        inspected += 1
+        ev = _load_agy_ide_evidence(cid_dir, tp, st, home, wsl=eff_wsl)
+        if _agy_ide_evidence_matches_exact_workspace(ev, safe_ws, home, wsl=eff_wsl):
+            turns, _, _ = _clean_jsonl_file("agy", str(tp), home=None)
+            slim = build_slim_prior_candidate(
+                cli="agy",
+                session_id=cid,
+                jsonl_path=str(tp),
+                cwd=safe_ws,
+                jsonl_mtime=mtime,
+                turns=turns,
+            )
+            if slim is not None:
+                parsed.append(slim)
+                if len(parsed) >= max_keep:
+                    break
+        if inspected >= 24:
+            break
+    return parsed
 
 
 def read_repo_core_files(

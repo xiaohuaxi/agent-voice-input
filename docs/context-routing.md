@@ -46,6 +46,11 @@
    - **已知焦点 `tty`/`cwd` 或带目录/任务线索的标题**：目录匹配按“精确同目录（`rank=2`）优先于非宽泛父子子目录（`rank=1`，已排除 `~`/`/home` 等宽泛根目录）”分级，再结合标题中的 CLI 名、末级目录名与 Codex `thread_name` 打分；当窗口标题与所有候选的完整路径、末级目录名（非 `~` 时）、CLI 名及 `thread_name` 均无交集，或明确为 Windows 原生 `cmd` / `PowerShell` 时，直接返回空（注：无焦点 `tty`/`cwd` 时，不同父路径下的同名末级目录如 `/work/a/app` 与 `/work/b/app` 仍会通过末级目录名亲和保留并按活跃时间决胜）；
    - **无焦点 `tty`/`cwd` 且标题缺少目录区分度**（如 WSL2 默认通用标题 `Ubuntu`、`bash`、`zsh`，或仅含裸 CLI 名/TUI 动画符如 `codex`、`✳ ...` 而本机同时跑着多个同类会话）：由于宿主机未提供窗口 `tty` 或目录线索，解析器会在通过标题过滤的存活交互式候选中按终端/日志最新活跃时间（`max(pts_mtime, jsonl_mtime)`）选取刚交互过的会话（且含 CLI 名或动画符的标题会优先视为本地 CLI 窗口，跳过无焦点后台 SSH 活动探测）。若常在多个不同仓库同时开无 `tmux` 的独立 WSL2 窗口，配置 `session-hook` 即可升级为第一档精确隔离。
 
+4. **冷启动回退（`refiner.cold_start_fallback = "auto" | "hotwords" | "off"`，默认 `"auto"`）**：
+   - **Layer 0（终端无会话兜底）**：当终端 `sync_session` 未命中活跃会话（如刚启动尚未建 `rollout` 的 Codex、空 shell 或未集成的 CLI），且非远端否决、存在合法安全的焦点 `window_cwd` 时，自动回落注入该工作区的 `git status` / `repo_files` / `shallow_files` 静态参考与热词（遵守宽泛目录与 WSL2 `/mnt/` 守卫）。
+   - **Layer 1（Stage 1 零风险热词兜底）**：当前会话不足 2 轮（`< 4` 条消息）或无活跃会话但存在合法 `workspace_cwd`（含普通桌面 IDE 工作区），且未设为 `"off"` 时，从同精确目录（`rank == 2`、不限天数、不看 Git 分支、排除 subagent 与当前 `session_id`）的近期 Top-5 充实历史会话提取高频技术标识符，低优先级补入 Stage 1 热词（排在用户手工热词与 `git` 变更文件之后、`BUILTIN_AGENT_HOTWORDS` 之前；候选发现按 `cwd` 短时缓存 `60s`）。
+   - **Layer 2（Stage 2 & 单跳独立冻结第 0 块 + 自然淘汰）**：面向 Agent 会话且设为 `"auto"` 时，冷启动首次从同精确目录 Top-5 充实历史会话（跨 Claude Code / Codex / `agy` 互通，优先满足 `>= 4` 条消息且 `>= 3,000` 字符的甜点会话，同档内同 CLI 略优先再按 `mtime` 降序；均不满 `3,000` 字符时取 `>= 1,000` 字符中内容最多者；Antigravity IDE 独立隔离在自身 `brain/` 目录）截取尾部 `<= 25,000` 字符作为**独立只读冻结块**（`<prior_session_reference read_only="true" scope="same_workspace_previous_session">`）置于当前会话分块之前，绝不混入 `clean_turns` 也不随原旧文件后续追加而变化，`prompt_cache_key` 始终绑定当前新会话；随着新会话增长直至超出总上下文滑窗或触发 compaction 时整块自然滑出淘汰且不再回拼（普通桌面 IDE 仅享 Layer 1 热词，不注入旧对话原文）。
+
 ---
 
 ## 二、桌面 GUI 应用（代码 IDE 与日常窗口）
@@ -103,7 +108,7 @@ hosts = ["devbox"]
 核心工作机制：
 
 - **`stdin` 注入纯标准库只读探针**：本地通过 `ssh -T -x -a -o BatchMode=yes -o RequestTTY=no -o RemoteCommand=none -o ClearAllForwardings=yes ... -- <target> python3 -` 将压缩后的纯标准库探针（`_remote_probe.py`）写入 `stdin` 执行。远端无需安装 `agent-voice-input`、无需常驻守护进程、无需 `ffmpeg` 或任何云端凭据，仅需系统自带 Python 3.10+（macOS / Linux 本地 `ssh` 自动启用短路径 `ControlMaster` 复用连接）。
-- **ETag 未变短路 + 正向 50K 整块对齐裁剪**：探针定位目标会话后先比对远端 JSONL 的 `(st_dev, st_ino, st_mtime_ns, st_size)` ETag，文件未变时直接标记 `not_modified` 跳过全文读取与清洗（仅按需刷新远端 `git status`）；有新对话时在远端完成字节预筛与清洗，通过 `trim_turns_chunk_aligned` 从第 0 轮起按轮次边界与默认 `50K` 字符目标正向切块、整块淘汰超出默认 `200K`（随 `refiner.context_max_chars` 联动）的旧块后以 `gzip` 帧回传（通常仅数 KB）。由于切块边界与本地 `chunk_turns_for_refiner` 保持逐字节一致，无需双端同步 `byte_offset` 即可稳定复用上游前缀缓存；同时带回远端目录的 `git status`、追踪源码文件名或非 Git 浅层文件名（严禁扫描远端 `~`、`/`、`/tmp` 等宽泛目录，且绝不混读本机同名路径）。
+- **ETag 未变短路 + 正向 50K 整块对齐裁剪 + 单趟冷启动回退**：探针定位目标会话后先比对远端 JSONL 的 `(st_dev, st_ino, st_mtime_ns, st_size)` ETag，文件未变时直接标记 `not_modified` 跳过全文读取与清洗（仅按需刷新远端 `git status`）；有新对话时在远端完成字节预筛与清洗，通过 `trim_turns_chunk_aligned` 从第 0 轮起按轮次边界与默认 `50K` 字符目标正向切块、整块淘汰超出默认 `200K`（随 `refiner.context_max_chars` 联动）的旧块后以 `gzip` 帧回传（通常仅数 KB）。当远端命中的当前会话处于冷启动态（`< 4` 条消息且未禁用 `cold_start_fallback`）时，同趟在远端复用 `_scan_storage_for_cwd` 从同精确目录（`rank == 2`、不限天数、不看分支、排除 subagent 与当前会话）的 Top-5 充实历史会话聚合提取 `prior_hotwords`，并在 `auto` 模式且命中真实 Agent 会话（非 `workspace` 纯目录回退）时额外截取首选历史会话尾部 `<= 25K`（计入包装开销）随 `prior_turns` 字段回传（零额外 SSH RTT；`hotwords` 模式仅传热词不传原文）。由于切块边界与本地 `chunk_turns_for_refiner` 保持逐字节一致，无需双端同步 `byte_offset` 即可稳定复用上游前缀缓存；同时带回远端目录的 `git status`、追踪源码文件名或非 Git 浅层文件名（严禁扫描远端 `~`、`/`、`/tmp` 等宽泛目录，且绝不混读本机同名路径）。
 - **按下热键异步预取 + 松键剩余预算控制 + 主机熔断器**：按下热键开始录音（`start_recording`）瞬间即脱锁在后台并发启动远端预取，把跨机握手与清洗耗时藏进说话时间里；松手结束录音进入 `sync_session` 时，若预取已在 `15s` 新鲜期内完成则直接内存命中，未完成最多等待扣减本地解析耗时后的剩余 `timeout_ms`（默认 `400ms`，可配 `0–10000ms`；设为 `0` 表示松手零等待、仅消费已完成预取）预算即平滑降级继续转写（后台任务完成后仍会预热下一句缓存）。目标主机连续 2 次连接超时自动熔断冷却 `60s`，遇鉴权或 HostKey 失败立即熔断冷却 `300s`。
 
 ### 3.3 什么时候远端“完全零文件”就够用，什么时候挂可选单文件钩子
