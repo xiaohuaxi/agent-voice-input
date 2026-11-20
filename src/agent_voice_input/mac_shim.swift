@@ -448,6 +448,43 @@ struct HotkeyEngine {
         res.events.append(EmittedEvent(kind: "hold_cancel", vk: spec.primaryKeyCode, flags: rawFlags, isDown: true, tainted: false, holdMs: Int(held)))
         return res
     }
+
+    mutating func resetForPowerResume() -> HotkeyStepResult {
+        var res = HotkeyStepResult()
+        let wasPttActive = (isPtt && pttActive)
+        holdGen &+= 1
+        targetDown = false
+        pttActive = false
+        chordTainted = false
+        holdFired = false
+        holdHintShown = false
+        otherKeysDown.removeAll()
+        res.cancelTimers = true
+        res.clearHoldPreview = true
+        if wasPttActive {
+            res.events.append(EmittedEvent(kind: "ptt_stop", vk: spec.primaryKeyCode, flags: 0, isDown: false, tainted: false))
+        }
+        return res
+    }
+}
+
+struct PowerResumeDebouncer {
+    let debounceMs: UInt64
+    private var hasEmitted = false
+    private var lastEmitMs: UInt64 = 0
+
+    init(debounceMs: UInt64 = 2000) {
+        self.debounceMs = debounceMs
+    }
+
+    mutating func shouldEmit(nowMs: UInt64) -> Bool {
+        if !hasEmitted || nowMs < lastEmitMs || (nowMs - lastEmitMs) >= debounceMs {
+            hasEmitted = true
+            lastEmitMs = nowMs
+            return true
+        }
+        return false
+    }
 }
 
 struct HudRgba: Equatable {
@@ -3441,6 +3478,52 @@ private func runSelfCheck() -> Int32 {
         _ = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 37900, keyDownCounter: 80, isKeyPhysicallyDown: { _ in false }, hasOtherNonModifierKeyDown: { false })
         hotkeyFsmChecks += 1
 
+        // 13: Power resume reset clears stuck hold/preview/otherKeysDown/PTT and debounces duplicate wake events
+        let wakeDown = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 40000, keyDownCounter: 90)
+        let wakeHint = eng.onHoldHintTimeout(gen: wakeDown.timerGen, nowMs: 40260, keyDownCounter: 90, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK)
+        try check(eng.targetDown && eng.holdHintShown && wakeHint.showHoldPreview, "power_resume setup hold preview")
+        _ = eng.handleEventStep(kind: .keyDown, keyCode: 0x00, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 40300, keyDownCounter: 91)
+        try check(!eng.otherKeysDown.isEmpty, "power_resume setup otherKeysDown")
+        let wakeReset = eng.resetForPowerResume()
+        try check(
+            !eng.targetDown && !eng.pttActive && !eng.chordTainted && !eng.holdFired && !eng.holdHintShown && eng.otherKeysDown.isEmpty,
+            "power_resume clears all stuck engine state"
+        )
+        try check(wakeReset.cancelTimers && wakeReset.clearHoldPreview, "power_resume cancels timers and clears preview")
+        try check(
+            eng.onHoldCancelTimeout(gen: wakeDown.timerGen, nowMs: 41000, keyDownCounter: 91, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK).events.isEmpty,
+            "power_resume invalidates stale pre-sleep timer gen"
+        )
+        _ = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 42000, keyDownCounter: 92)
+        let wakeTapUp = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 42120, keyDownCounter: 92)
+        try check(wakeTapUp.events.count == 1 && wakeTapUp.events[0].kind == "toggle", "post-resume fresh tap emits toggle")
+        var wakePtt = HotkeyEngine(spec: rctrl, isPtt: true, tapMaxMs: 500, holdCancelMs: 800, holdHintMs: 250, debounceMs: 180, keyTest: false)
+        _ = wakePtt.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 1000, keyDownCounter: 1)
+        try check(wakePtt.pttActive && wakePtt.targetDown, "power_resume ptt setup")
+        let wakePttReset = wakePtt.resetForPowerResume()
+        try check(!wakePtt.pttActive && !wakePtt.targetDown && wakePttReset.cancelTimers && wakePttReset.clearHoldPreview, "power_resume clears ptt state")
+        try check(wakePttReset.events.count == 1 && wakePttReset.events[0].kind == "ptt_stop", "power_resume emits exactly one ptt_stop for active PTT")
+        let wakePttUp = wakePtt.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 1400, keyDownCounter: 1)
+        try check(wakePttUp.events.isEmpty, "post-resume PTT key-up must not re-emit ptt_stop")
+        let wakePttIdleReset = wakePtt.resetForPowerResume()
+        try check(wakePttIdleReset.events.isEmpty, "idle PTT resume emits no ptt_stop")
+        // Debounce gate runs BEFORE reset so a duplicate wake never wipes a fresh press between wake 1 and wake 2
+        var wakeDebouncer = PowerResumeDebouncer(debounceMs: 2000)
+        try check(wakeDebouncer.shouldEmit(nowMs: 50000), "power_resume debouncer allows wake 1")
+        _ = eng.resetForPowerResume()
+        _ = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 50050, keyDownCounter: 93)
+        try check(eng.targetDown, "fresh key-down after wake 1 is active")
+        if wakeDebouncer.shouldEmit(nowMs: 50100) {
+            _ = eng.resetForPowerResume()
+            try check(false, "power_resume debouncer must suppress wake 2 within 100ms")
+        }
+        try check(eng.targetDown, "debounced wake 2 must not wipe active key-down")
+        let wake2Up = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 50180, keyDownCounter: 93)
+        try check(wake2Up.events.count == 1 && wake2Up.events[0].kind == "toggle", "key pressed across debounced wake 2 still emits toggle")
+        try check(!wakeDebouncer.shouldEmit(nowMs: 51999), "power_resume debouncer suppresses 1999ms duplicate")
+        try check(wakeDebouncer.shouldEmit(nowMs: 52000), "power_resume debouncer allows after window")
+        hotkeyFsmChecks += 1
+
         try check(isZhUiCulture("zh-Hans-CN") && isZhUiCulture("zh_TW.UTF-8") && !isZhUiCulture("en-US"), "ui_culture zh detection")
         try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 58.0, "HUD bottom pillY")
         try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "") == 58.0, "HUD default pillY")
@@ -3703,6 +3786,8 @@ struct MacShimMain {
             keyTest: isKeyTest
         )
         var globalMonitor: Any?
+        var wakeObserver: NSObjectProtocol?
+        var powerResumeDebouncer = PowerResumeDebouncer()
         var holdHintWorkItem: DispatchWorkItem?
         var holdCancelWorkItem: DispatchWorkItem?
 
@@ -3713,6 +3798,7 @@ struct MacShimMain {
 
         let cleanupAndExit: (Int32) -> Never = { code in
             cancelHoldWorkItems()
+            if let wo = wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wo); wakeObserver = nil }
             if let gm = globalMonitor { NSEvent.removeMonitor(gm); globalMonitor = nil }
             pasteboardGuard.flushPendingRestore()
             audioMonitor.stop()
@@ -3844,6 +3930,17 @@ struct MacShimMain {
         }
 
         let initialAudioStatus = audioMonitor.start()
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            let now = monotonicMs()
+            guard powerResumeDebouncer.shouldEmit(nowMs: now) else { return }
+            let resetStep = engine.resetForPowerResume()
+            applyStep(resetStep, now: now)
+            writeJsonLine(["event": "power_resume", "ts_ms": now])
+        }
         var postAccessPrompted = false
 
         let stdinThread = Thread {

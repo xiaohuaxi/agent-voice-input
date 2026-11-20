@@ -275,6 +275,73 @@ public sealed class WinHotkeyEngine {
         AddEvent(ref res, "hold_cancel", _targetVk, _downScan, _downExt, true, false, (int)held);
         return res;
     }
+
+    public HotkeyStepResult ResetForPowerResume() {
+        HotkeyStepResult res = new HotkeyStepResult();
+        bool wasPttActive = (_isPtt && _pttActive);
+        uint pttScan = _downScan;
+        bool pttExt = _downExt;
+        _holdGen++;
+        _targetDown = false;
+        _pttActive = false;
+        _chordTainted = false;
+        _holdFired = false;
+        _holdHintShown = false;
+        _otherDown.Clear();
+        res.CancelTimers = true;
+        res.ClearHoldPreview = true;
+        if (wasPttActive) {
+            AddEvent(ref res, "ptt_stop", _targetVk, pttScan, pttExt, false, false);
+        }
+        return res;
+    }
+}
+
+public sealed class PowerResumeDebouncer {
+    public const int WM_POWERBROADCAST = 0x0218;
+    public const int PBT_APMRESUMESUSPEND = 0x0007;
+    public const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+    public const ulong DefaultDebounceMs = 2000UL;
+
+    private readonly ulong _debounceMs;
+    private bool _hasEmitted = false;
+    private ulong _lastEmitMs = 0UL;
+
+    public PowerResumeDebouncer(ulong debounceMs = DefaultDebounceMs) {
+        _debounceMs = debounceMs;
+    }
+
+    public static bool IsResumeWParam(IntPtr wParam) {
+        long val = wParam.ToInt64();
+        return val == PBT_APMRESUMEAUTOMATIC || val == PBT_APMRESUMESUSPEND;
+    }
+
+    public bool ShouldEmit(ulong nowMs) {
+        if (!_hasEmitted || nowMs < _lastEmitMs || (nowMs - _lastEmitMs) >= _debounceMs) {
+            _hasEmitted = true;
+            _lastEmitMs = nowMs;
+            return true;
+        }
+        return false;
+    }
+}
+
+internal sealed class PowerBroadcastWindow : NativeWindow {
+    public PowerBroadcastWindow() {
+        CreateParams cp = new CreateParams();
+        cp.Caption = "AviPowerMsgWin";
+        cp.Style = 0;
+        cp.ExStyle = 0x08000080; // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW (hidden top-level broadcast receiver)
+        cp.Parent = IntPtr.Zero;
+        CreateHandle(cp);
+    }
+
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == PowerResumeDebouncer.WM_POWERBROADCAST && PowerResumeDebouncer.IsResumeWParam(m.WParam)) {
+            VoiceWinShim.OnPowerResume(VoiceWinShim.GetTickCount64());
+        }
+        base.WndProc(ref m);
+    }
 }
 
 [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] internal class MMDeviceEnumeratorComObject { }
@@ -1138,6 +1205,8 @@ public static class VoiceWinShim {
     public static volatile bool StdinClosed = false;
     private static IntPtr _hook = IntPtr.Zero;
     private static LowLevelKeyboardProc _procRef;
+    private static PowerBroadcastWindow _powerWin = null;
+    private static PowerResumeDebouncer _powerResumeDebouncer = new PowerResumeDebouncer();
     private static HudPillForm _hud;
     private static HudPillForm _toastHud;
     private static bool _headlessHudMode = false;
@@ -1700,14 +1769,53 @@ public static class VoiceWinShim {
         return CallNextHookEx(_hook, nCode, wParam, lParam);
     }
 
+    private static bool ReinstallKeyboardHook() {
+        if (_procRef == null) return false;
+        try {
+            IntPtr newHook = IntPtr.Zero;
+            using (Process cur = Process.GetCurrentProcess()) using (ProcessModule mod = cur.MainModule) {
+                newHook = SetWindowsHookEx(WH_KEYBOARD_LL, _procRef, GetModuleHandle(mod.ModuleName), 0);
+            }
+            if (newHook == IntPtr.Zero) return false;
+            IntPtr oldHook = _hook;
+            _hook = newHook;
+            if (oldHook != IntPtr.Zero) {
+                try { UnhookWindowsHookEx(oldHook); } catch { }
+            }
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    public static void OnPowerResume(ulong nowMs) {
+        if (_keyTest) return;
+        if (!_powerResumeDebouncer.ShouldEmit(nowMs)) return;
+        ReinstallKeyboardHook();
+        if (_hotkeyEngine != null) {
+            HotkeyStepResult resetStep = _hotkeyEngine.ResetForPowerResume();
+            ApplyHotkeyStep(resetStep);
+        } else {
+            StopHoldTimers();
+            StopHoldPreviewSafetyTimer();
+            if (_hud != null && !_hud.IsDisposed) _hud.SetHoldCancelPreview(false, _headlessHudMode);
+        }
+        EvtQueue.Enqueue(new ShimEvent { Kind = "power_resume", TsMs = nowMs });
+        if (_mainTid != 0) PostThreadMessage(_mainTid, WM_APP_WAKE, IntPtr.Zero, IntPtr.Zero);
+    }
+
     public static void StartHook(uint targetVk, bool isPtt, int tapMaxMs, int debounceMs, bool keyTest, int timerMs, int holdCancelMs = 800, int holdHintMs = 250) {
         _mainTid = GetCurrentThreadId(); MSG initMsg; PeekMessage(out initMsg, IntPtr.Zero, 0, 0, 0);
         _targetVk = targetVk; _isPtt = isPtt; _keyTest = keyTest; _hasQuitTimer = (timerMs > 0);
         _hotkeyEngine = new WinHotkeyEngine(targetVk, isPtt, tapMaxMs, holdCancelMs, holdHintMs, debounceMs, keyTest);
+        _powerResumeDebouncer = new PowerResumeDebouncer();
         EnsureHoldTimers();
         _procRef = HookCallback;
         using (Process cur = Process.GetCurrentProcess()) using (ProcessModule mod = cur.MainModule) { _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _procRef, GetModuleHandle(mod.ModuleName), 0); }
         if (_hook == IntPtr.Zero) throw new InvalidOperationException("SetWindowsHookEx failed: " + Marshal.GetLastWin32Error());
+        if (!keyTest) {
+            try { _powerWin = new PowerBroadcastWindow(); } catch { _powerWin = null; }
+        }
         if (_hasQuitTimer) SetTimer(IntPtr.Zero, new IntPtr(1), (uint)timerMs, IntPtr.Zero);
     }
 
@@ -2747,6 +2855,7 @@ public static class VoiceWinShim {
         FlushPendingClipRestore();
         if (_clipRestoreTimer != null) { try { _clipRestoreTimer.Stop(); _clipRestoreTimer.Dispose(); } catch { } _clipRestoreTimer = null; }
         if (_clipHwnd != IntPtr.Zero) { try { DestroyWindow(_clipHwnd); } catch { } _clipHwnd = IntPtr.Zero; }
+        if (_powerWin != null) { try { _powerWin.DestroyHandle(); } catch { } _powerWin = null; }
         if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
         if (_hud != null) { try { _hud.Dispose(); } catch { } _hud = null; }
         if (_toastHud != null) { try { _toastHud.Dispose(); } catch { } _toastHud = null; }
@@ -3262,6 +3371,81 @@ public static class VoiceWinShim {
         return checks;
     }
 
+    public static void RunPowerResumeSelfCheck() {
+        const uint VK_RCTRL = 0xA3u;
+        const uint VK_A = 0x41u;
+        Func<uint, bool> onlyTargetDown = vk => vk == VK_RCTRL;
+        Func<uint, bool> noneDown = vk => false;
+
+        // 1) Stuck tap_toggle + hold preview + stale otherDown reset cleanly on power resume
+        WinHotkeyEngine eng = new WinHotkeyEngine(VK_RCTRL, false, 500, 800, 250, 180, false);
+        HotkeyStepResult d1 = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 1000UL, onlyTargetDown);
+        HotkeyStepResult h1 = eng.OnHoldHintTimeout(d1.TimerGen, 1260UL, onlyTargetDown);
+        if (!eng.TargetDown || !eng.HoldHintShown || !h1.ShowHoldPreview)
+            throw new InvalidOperationException("power_resume check 1a: setup hold preview failed");
+        eng.ProcessKeyEvent(VK_A, 0x1E, false, true, false, 1300UL, vk => vk == VK_RCTRL || vk == VK_A);
+        if (eng.OtherDownCount != 1)
+            throw new InvalidOperationException("power_resume check 1b: setup otherDown failed");
+
+        HotkeyStepResult r1 = eng.ResetForPowerResume();
+        if (eng.TargetDown || eng.PttActive || eng.ChordTainted || eng.HoldFired || eng.HoldHintShown || eng.OtherDownCount != 0)
+            throw new InvalidOperationException("power_resume check 1c: engine state not fully reset");
+        if (!r1.CancelTimers || !r1.ClearHoldPreview)
+            throw new InvalidOperationException("power_resume check 1d: reset must cancel timers and clear preview");
+        // Stale timer from pre-sleep gen must be ignored
+        HotkeyStepResult staleCancel = eng.OnHoldCancelTimeout(d1.TimerGen, 2000UL, onlyTargetDown);
+        if (staleCancel.Events != null && staleCancel.Events.Count > 0)
+            throw new InvalidOperationException("power_resume check 1e: stale pre-sleep timer fired after reset");
+        // Subsequent fresh tap works immediately
+        eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 3000UL, onlyTargetDown);
+        HotkeyStepResult u1 = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 3120UL, noneDown);
+        if (u1.Events == null || u1.Events.Count != 1 || u1.Events[0].Kind != "toggle")
+            throw new InvalidOperationException("power_resume check 1f: post-resume toggle failed");
+
+        // 2) Active PTT across sleep emits exactly one ptt_stop on power resume; subsequent key-up is silent
+        WinHotkeyEngine ptt = new WinHotkeyEngine(VK_RCTRL, true, 500, 800, 250, 180, false);
+        ptt.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 1000UL, onlyTargetDown);
+        if (!ptt.PttActive || !ptt.TargetDown)
+            throw new InvalidOperationException("power_resume check 2a: ptt setup failed");
+        HotkeyStepResult rp = ptt.ResetForPowerResume();
+        if (ptt.PttActive || ptt.TargetDown || !rp.CancelTimers || !rp.ClearHoldPreview)
+            throw new InvalidOperationException("power_resume check 2b: ptt state not cleared");
+        if (rp.Events == null || rp.Events.Count != 1 || rp.Events[0].Kind != "ptt_stop")
+            throw new InvalidOperationException("power_resume check 2c: active PTT must emit exactly one ptt_stop on resume");
+        HotkeyStepResult rpUp = ptt.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 1400UL, noneDown);
+        if (rpUp.Events != null && rpUp.Events.Count > 0)
+            throw new InvalidOperationException("power_resume check 2d: post-resume key-up must not re-emit ptt_stop");
+        // Idle PTT emits zero events on resume
+        HotkeyStepResult rpIdle = ptt.ResetForPowerResume();
+        if (rpIdle.Events != null && rpIdle.Events.Count > 0)
+            throw new InvalidOperationException("power_resume check 2e: idle PTT must not emit ptt_stop on resume");
+
+        // 3) WM_POWERBROADCAST wParam filtering and debounce window (RESUMEAUTOMATIC + RESUMESUSPEND)
+        if (!PowerResumeDebouncer.IsResumeWParam(new IntPtr(PowerResumeDebouncer.PBT_APMRESUMEAUTOMATIC)))
+            throw new InvalidOperationException("power_resume check 3a: PBT_APMRESUMEAUTOMATIC not recognized");
+        if (!PowerResumeDebouncer.IsResumeWParam(new IntPtr(PowerResumeDebouncer.PBT_APMRESUMESUSPEND)))
+            throw new InvalidOperationException("power_resume check 3b: PBT_APMRESUMESUSPEND not recognized");
+        if (PowerResumeDebouncer.IsResumeWParam(new IntPtr(0x0004)))
+            throw new InvalidOperationException("power_resume check 3c: PBT_APMSUSPEND falsely recognized as resume");
+
+        PowerResumeDebouncer db = new PowerResumeDebouncer(2000UL);
+        if (!db.ShouldEmit(10000UL))
+            throw new InvalidOperationException("power_resume check 3d: first resume must emit");
+        // Press between duplicate wakes must NOT be wiped by debounced second wake
+        eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 10020UL, onlyTargetDown);
+        if (db.ShouldEmit(10040UL))
+            throw new InvalidOperationException("power_resume check 3e: duplicate resume within 40ms must be debounced");
+        if (!eng.TargetDown)
+            throw new InvalidOperationException("power_resume check 3e2: debounced wake must preserve active press");
+        HotkeyStepResult afterDbUp = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 10120UL, noneDown);
+        if (afterDbUp.Events == null || afterDbUp.Events.Count != 1 || afterDbUp.Events[0].Kind != "toggle")
+            throw new InvalidOperationException("power_resume check 3e3: press across debounced wake must still toggle");
+        if (db.ShouldEmit(11999UL))
+            throw new InvalidOperationException("power_resume check 3f: resume at 1999ms must be debounced");
+        if (!db.ShouldEmit(12000UL))
+            throw new InvalidOperationException("power_resume check 3g: resume at 2000ms must emit");
+    }
+
     public static int RunHeadlessSelfCheck(out int hotkeyFsmChecks) {
         if (ResolveKeyName("RControl") != 0xA3u) throw new InvalidOperationException("ResolveKeyName RControl failed");
         if (ResolveKeyName("RAlt") != 0xA5u) throw new InvalidOperationException("ResolveKeyName RAlt failed");
@@ -3310,6 +3494,7 @@ public static class VoiceWinShim {
 
         RunClipStateSelfCheck();
         RunToastSingleSlotSelfCheck();
+        RunPowerResumeSelfCheck();
         hotkeyFsmChecks = RunHotkeyFsmSelfCheck();
         return RunHudLayoutSelfCheck();
     }
@@ -3521,6 +3706,8 @@ try {
                     Write-JsonLine @{ event = "rec_recovered"; gap_ms = [int]$ev.GapMs; rec_gen = [long]$ev.RecGen }
                 } elseif ($ev.Kind -eq "hold_cancel") {
                     Write-JsonLine @{ event = "hold_cancel"; hold_ms = [int]$ev.HoldMs; hwnd = $ev.Hwnd; process = $ev.Process; title = $ev.Title; ts_ms = $ev.TsMs }
+                } elseif ($ev.Kind -eq "power_resume") {
+                    Write-JsonLine @{ event = "power_resume"; ts_ms = $ev.TsMs }
                 } else {
                     Write-JsonLine @{ event = $ev.Kind; hwnd = $ev.Hwnd; process = $ev.Process; title = $ev.Title; ts_ms = $ev.TsMs }
                 }

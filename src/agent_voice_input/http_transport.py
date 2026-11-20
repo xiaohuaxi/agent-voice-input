@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import contextlib
 from dataclasses import dataclass, field
 import datetime
@@ -10,10 +11,12 @@ import errno
 import hashlib
 import http.client
 import io
+import ipaddress
 import json
 import math
 import os
 import random
+import select
 import selectors
 import socket
 import ssl
@@ -493,10 +496,105 @@ _NONBLOCK_CONNECT_ERRNOS = frozenset(
     if e is not None
 )
 _ABORT_ERRNO = getattr(errno, "ECANCELED", errno.ECONNABORTED)
+_DNS_MAX_INFLIGHT = 8
 
 
 def _is_conn_aborted(conn_owner: Any) -> bool:
     return bool(conn_owner is not None and getattr(conn_owner, "_aborted", False))
+
+
+class _BoundedDnsResolver:
+    """Bounded-concurrency, cancelable and deadline-enforced DNS resolver (lazy daemon workers)."""
+
+    def __init__(self, *, max_inflight: int = _DNS_MAX_INFLIGHT) -> None:
+        self.max_inflight = max(1, int(max_inflight))
+        self._sem = threading.BoundedSemaphore(self.max_inflight)
+
+    def resolve(
+        self,
+        host: str,
+        port: int,
+        *,
+        deadline: float | None = None,
+        conn_owner: Any = None,
+        resolver_fn: Callable[..., list[Any]] | None = None,
+    ) -> list[Any]:
+        if _is_conn_aborted(conn_owner):
+            raise OSError(_ABORT_ERRNO, "HTTP DNS lookup aborted")
+        if deadline is not None and (deadline - time.monotonic()) <= 0:
+            raise TimeoutError(f"HTTP DNS lookup timed out for {host}:{port}")
+
+        acquired = self._sem.acquire(blocking=False)
+        while not acquired:
+            if _is_conn_aborted(conn_owner):
+                raise OSError(_ABORT_ERRNO, "HTTP DNS lookup aborted")
+            if deadline is not None:
+                rem_slot = deadline - time.monotonic()
+                if rem_slot <= 0:
+                    raise TimeoutError(f"HTTP DNS lookup timed out for {host}:{port}")
+                wait_slot = min(0.02, rem_slot)
+            else:
+                wait_slot = 0.02
+            acquired = self._sem.acquire(timeout=max(0.001, wait_slot))
+
+        done_evt = threading.Event()
+        completed = [False]
+        result_box: list[list[Any] | None] = [None]
+        err_box: list[BaseException | None] = [None]
+        fn = resolver_fn if resolver_fn is not None else socket.getaddrinfo
+
+        def _worker() -> None:
+            try:
+                result_box[0] = fn(host, port, 0, socket.SOCK_STREAM)
+            except BaseException as exc:
+                err_box[0] = exc
+            finally:
+                completed[0] = True
+                done_evt.set()
+                self._sem.release()
+
+        reg_wait = getattr(conn_owner, "_register_wait_event", None)
+        unreg_wait = getattr(conn_owner, "_unregister_wait_event", None)
+        if callable(reg_wait):
+            reg_wait(done_evt)
+        try:
+            try:
+                th = threading.Thread(target=_worker, name="avi-dns-resolve", daemon=True)
+                th.start()
+            except BaseException:
+                self._sem.release()
+                raise
+
+            has_wake_hook = callable(reg_wait)
+            while True:
+                if _is_conn_aborted(conn_owner):
+                    raise OSError(_ABORT_ERRNO, "HTTP DNS lookup aborted")
+                if completed[0]:
+                    break
+                if deadline is not None:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        raise TimeoutError(f"HTTP DNS lookup timed out for {host}:{port}")
+                    wait_s = rem if has_wake_hook else min(0.02, rem)
+                else:
+                    wait_s = 0.05 if has_wake_hook else 0.02
+                done_evt.wait(max(0.001, wait_s))
+                if _is_conn_aborted(conn_owner):
+                    raise OSError(_ABORT_ERRNO, "HTTP DNS lookup aborted")
+                if completed[0]:
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"HTTP DNS lookup timed out for {host}:{port}")
+        finally:
+            if callable(unreg_wait):
+                unreg_wait(done_evt)
+
+        if err_box[0] is not None:
+            raise err_box[0]
+        return result_box[0] or []
+
+
+_DNS_RESOLVER = _BoundedDnsResolver()
 
 
 def _create_connection_with_deadline(
@@ -510,7 +608,19 @@ def _create_connection_with_deadline(
     if _is_conn_aborted(conn_owner):
         raise OSError(_ABORT_ERRNO, "HTTP TCP connect aborted")
     last_err: OSError | None = None
-    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if conn_deadline is not None:
+        dns_deadline: float | None = conn_deadline
+    elif fallback_timeout is not None and fallback_timeout > 0:
+        dns_deadline = time.monotonic() + float(fallback_timeout)
+    else:
+        dns_deadline = None
+    infos = _DNS_RESOLVER.resolve(
+        host,
+        port,
+        deadline=dns_deadline,
+        conn_owner=conn_owner,
+        resolver_fn=socket.getaddrinfo,
+    )
     if not infos:
         raise OSError("getaddrinfo returns an empty list")
     abort_lock: threading.Lock | None = getattr(conn_owner, "_abort_lock", None) if conn_owner is not None else None
@@ -777,6 +887,7 @@ class _SplitTimeoutConnMixin:
         self._aborted = False
         self._borrow_gen = 0
         self._cur_sock: socket.socket | None = None
+        self._wait_events: set[threading.Event] = set()
         self._in_getresponse = False
         self._handed_off_to_resp = False
         self._bound_token = cancel_token
@@ -815,11 +926,29 @@ class _SplitTimeoutConnMixin:
         if release_hook:
             self._release_bound_hook()
 
+    def _register_wait_event(self, ev: threading.Event) -> None:
+        wake_now = False
+        with self._abort_lock:
+            if self._aborted:
+                wake_now = True
+            else:
+                self._wait_events.add(ev)
+        if wake_now:
+            ev.set()
+
+    def _unregister_wait_event(self, ev: threading.Event) -> None:
+        with self._abort_lock:
+            self._wait_events.discard(ev)
+
     def abort_inflight(self, *, expected_gen: int | None = None) -> None:
+        wait_evts: list[threading.Event] = []
         with self._abort_lock:
             if expected_gen is not None and expected_gen != self._borrow_gen:
                 return
             self._aborted = True
+            if self._wait_events:
+                wait_evts = list(self._wait_events)
+                self._wait_events.clear()
             sock = self._cur_sock
             if sock is not None:
                 try:
@@ -828,6 +957,11 @@ class _SplitTimeoutConnMixin:
                     socket.socket.shutdown(sock, socket.SHUT_RDWR)
                 except OSError:
                     pass
+        for ev in wait_evts:
+            try:
+                ev.set()
+            except Exception:
+                pass
 
     def close(self) -> None:
         if self._in_getresponse:
@@ -1009,16 +1143,42 @@ class _SplitTimeoutHTTPSHandler(urllib.request.HTTPSHandler):
         )
 
 
+class _NoDnsProxyHandler(urllib.request.ProxyHandler):
+    """ProxyHandler routing by pre-decided request proxy without calling blocking proxy_bypass()."""
+
+    def proxy_open(self, req: urllib.request.Request, proxy: str, type: str) -> Any:
+        _ = type
+        orig_type = req.type
+        parsed_p = urllib.parse.urlsplit(proxy if "://" in proxy else f"{orig_type}://{proxy}")
+        proxy_type = (parsed_p.scheme or orig_type).lower()
+        hostport = parsed_p.netloc or parsed_p.path
+        if not hostport:
+            return None
+        if parsed_p.username is not None:
+            user = urllib.parse.unquote(parsed_p.username)
+            pw = urllib.parse.unquote(parsed_p.password or "")
+            creds = base64.b64encode(f"{user}:{pw}".encode("utf-8")).decode("ascii")
+            req.add_header("Proxy-authorization", f"Basic {creds}")
+        if "@" in hostport:
+            hostport = hostport.rsplit("@", 1)[1]
+        req.set_proxy(urllib.parse.unquote(hostport), proxy_type)
+        if orig_type == proxy_type or orig_type == "https":
+            return None
+        return self.parent.open(req, timeout=req.timeout)
+
+
+_INITIAL_PROXIES = urllib.request.getproxies()
 _SAFE_OPENER = urllib.request.build_opener(
+    _NoDnsProxyHandler(_INITIAL_PROXIES),
     _SplitTimeoutHTTPHandler(),
     _SplitTimeoutHTTPSHandler(),
     _SameOriginSafeRedirectHandler(),
 )
 _DEFAULT_SAFE_OPENER = _SAFE_OPENER
-_INITIAL_PROXIES = urllib.request.getproxies()
 
-_OriginKey = tuple[str, str, int]
+_OriginKey = tuple[str, str, int, str]
 _MAX_REDIRECTS = 5
+_SLEEP_WALL_DRIFT_SEC: float = 15.0
 _STALE_CONN_ERRORS = (
     http.client.RemoteDisconnected,
     http.client.CannotSendRequest,
@@ -1028,18 +1188,150 @@ _STALE_CONN_ERRORS = (
 )
 
 
+def _is_idle_socket_stale(sock: Any) -> bool:
+    """0ms non-blocking probe for an idle keep-alive socket (detects EOF/RST/dirty bytes)."""
+    if sock is None:
+        return True
+    if callable(pending_fn := getattr(sock, "pending", None)):
+        try:
+            if int(pending_fn()) > 0:
+                return True
+        except Exception:
+            return True
+    fileno_fn = getattr(sock, "fileno", None)
+    if not callable(fileno_fn):
+        return False
+    try:
+        fd = fileno_fn()
+    except (AttributeError, io.UnsupportedOperation, TypeError):
+        return False
+    except (OSError, ValueError):
+        return True
+    if not isinstance(fd, int) or fd < 0:
+        return True
+    try:
+        rlist, _, _ = select.select([sock], [], [], 0.0)
+        return bool(rlist)
+    except (OSError, ValueError):
+        return True
+
+
+def _normalize_proxy_fingerprint(proxy_url: str) -> str:
+    raw = proxy_url.strip()
+    if not raw:
+        return ""
+    parsed = urllib.parse.urlsplit(raw if "://" in raw else f"http://{raw}")
+    scheme = (parsed.scheme or "http").lower()
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    auth_part = ""
+    if parsed.username is not None or parsed.password is not None:
+        cred = f"{parsed.username or ''}:{parsed.password or ''}".encode("utf-8")
+        auth_part = f"|auth:{hashlib.sha256(cred).hexdigest()[:12]}"
+    return f"{scheme}://{host}:{port if port is not None else ''}{auth_part}"
+
+
+def _proxy_bypass_no_dns(host: str, port: int | None = None) -> bool:
+    """Pure local NO_PROXY matcher without ever invoking blocking DNS (socket.gethostbyname)."""
+    raw_no_proxy = (
+        os.environ["no_proxy"]
+        if "no_proxy" in os.environ
+        else os.environ.get("NO_PROXY", "")
+    )
+    no_proxy = raw_no_proxy.strip()
+    if not no_proxy:
+        return False
+    h_low = host.strip().lower().strip("[]")
+    if not h_low:
+        return False
+    host_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
+    try:
+        host_ip = ipaddress.ip_address(h_low)
+    except ValueError:
+        host_ip = None
+
+    for raw_pat in no_proxy.split(","):
+        pat = raw_pat.strip().lower()
+        if not pat:
+            continue
+        if pat == "*":
+            return True
+        pat_host = pat
+        pat_port: int | None = None
+        if pat.startswith("["):
+            end_br = pat.find("]")
+            if end_br > 0:
+                pat_host = pat[1:end_br]
+                rest = pat[end_br + 1 :]
+                if rest.startswith(":") and rest[1:].isdigit():
+                    pat_port = int(rest[1:])
+        elif pat.count(":") == 1:
+            h_part, p_part = pat.split(":", 1)
+            if p_part.isdigit():
+                pat_host = h_part
+                pat_port = int(p_part)
+        if pat_port is not None and port is not None and pat_port != port:
+            continue
+        if "/" in pat_host:
+            if host_ip is not None:
+                try:
+                    if host_ip in ipaddress.ip_network(pat_host, strict=False):
+                        return True
+                except ValueError:
+                    pass
+            continue
+        if host_ip is not None:
+            try:
+                if host_ip == ipaddress.ip_address(pat_host):
+                    return True
+            except ValueError:
+                pass
+        pat_norm = pat_host.lstrip(".")
+        if pat_norm and (h_low == pat_norm or h_low.endswith("." + pat_norm)):
+            return True
+    return False
+
+
+def _resolve_system_proxy_key(scheme: str, host: str, port: int | None = None) -> str:
+    proxies = urllib.request.getproxies()
+    if not proxies:
+        return ""
+    proxy_url = (proxies.get(scheme.lower()) or proxies.get("all") or "").strip()
+    if not proxy_url:
+        return ""
+    if _proxy_bypass_no_dns(host, port):
+        return ""
+    return _normalize_proxy_fingerprint(proxy_url)
+
+
 class _KeepAlivePool:
-    """Thread-safe same-origin HTTP/1.1 Keep-Alive connection pool."""
+    """Thread-safe same-origin HTTP/1.1 Keep-Alive connection pool with dual-clock sleep eviction."""
 
     _MAX_IDLE_PER_ORIGIN = 5
+    _SLEEP_WALL_DRIFT_SEC = _SLEEP_WALL_DRIFT_SEC
 
     def __init__(
-        self, *, max_per_origin: int = _MAX_IDLE_PER_ORIGIN, idle_timeout_sec: float = 45.0
+        self,
+        *,
+        max_per_origin: int = _MAX_IDLE_PER_ORIGIN,
+        idle_timeout_sec: float = 45.0,
+        sleep_drift_sec: float = _SLEEP_WALL_DRIFT_SEC,
+        mono_fn: Callable[[], float] = time.monotonic,
+        wall_fn: Callable[[], float] = time.time,
     ) -> None:
         self.max_per_origin = max_per_origin
         self.idle_timeout_sec = idle_timeout_sec
+        self.sleep_drift_sec = max(0.0, float(sleep_drift_sec))
+        self._mono_fn = mono_fn
+        self._wall_fn = wall_fn
         self._lock = threading.Lock()
-        self._idle: dict[_OriginKey, list[tuple[http.client.HTTPConnection, float]]] = {}
+        self._evict_gen: int = 0
+        self._idle: dict[_OriginKey, list[tuple[http.client.HTTPConnection, float, float]]] = {}
         self._ssl_ctx: ssl.SSLContext | None = None
 
     def _get_ssl_context(self) -> ssl.SSLContext:
@@ -1047,6 +1339,22 @@ class _KeepAlivePool:
             if self._ssl_ctx is None:
                 self._ssl_ctx = ssl.create_default_context()
             return self._ssl_ctx
+
+    def _resolve_proxy_key(self, scheme: str, host: str, port: int) -> str:
+        return _resolve_system_proxy_key(scheme, host, port)
+
+    def _is_entry_expired(
+        self, mono_ts: float, wall_ts: float, now_mono: float, now_wall: float
+    ) -> bool:
+        mono_age = now_mono - mono_ts
+        wall_age = now_wall - wall_ts
+        if mono_age < 0.0 or mono_age > self.idle_timeout_sec:
+            return True
+        if wall_age > self.idle_timeout_sec:
+            return True
+        if abs(wall_age - mono_age) > self.sleep_drift_sec:
+            return True
+        return False
 
     def _new_connection(
         self,
@@ -1075,6 +1383,28 @@ class _KeepAlivePool:
             io_deadline=io_deadline,
         )
 
+    def _prune_idle_locked(
+        self, now_mono: float, now_wall: float
+    ) -> list[http.client.HTTPConnection]:
+        to_close: list[http.client.HTTPConnection] = []
+        for k in list(self._idle.keys()):
+            bucket = self._idle[k]
+            kept: list[tuple[http.client.HTTPConnection, float, float]] = []
+            for c, m_ts, w_ts in bucket:
+                if (
+                    self._is_entry_expired(m_ts, w_ts, now_mono, now_wall)
+                    or getattr(c, "sock", None) is None
+                    or getattr(c, "_aborted", False)
+                ):
+                    to_close.append(c)
+                else:
+                    kept.append((c, m_ts, w_ts))
+            if kept:
+                self._idle[k] = kept
+            else:
+                del self._idle[k]
+        return to_close
+
     def acquire(
         self,
         scheme: str,
@@ -1085,37 +1415,44 @@ class _KeepAlivePool:
         allow_reuse: bool = True,
         connect_timeout_sec: float = DEFAULT_CONNECT_TIMEOUT_SEC,
         io_deadline: float | None = None,
+        proxy_key: str | None = None,
     ) -> tuple[http.client.HTTPConnection, bool]:
-        now = time.monotonic()
-        to_close: list[http.client.HTTPConnection] = []
-        reused_conn: http.client.HTTPConnection | None = None
-        key: _OriginKey = (scheme, host, port)
-        with self._lock:
-            for k in list(self._idle.keys()):
-                bucket = self._idle[k]
-                kept: list[tuple[http.client.HTTPConnection, float]] = []
-                for c, ts in bucket:
-                    if (
-                        (now - ts) > self.idle_timeout_sec
-                        or getattr(c, "sock", None) is None
-                        or getattr(c, "_aborted", False)
-                    ):
-                        to_close.append(c)
-                    else:
-                        kept.append((c, ts))
-                if kept:
-                    self._idle[k] = kept
-                else:
-                    del self._idle[k]
-            if allow_reuse and key in self._idle:
-                bucket = self._idle[key]
-                reused_conn, _ = bucket.pop()
-                if not bucket:
-                    del self._idle[key]
-        for c in to_close:
-            _close_quietly(c)
-        if reused_conn is not None:
+        eff_proxy_key = (
+            self._resolve_proxy_key(scheme, host, port)
+            if proxy_key is None
+            else str(proxy_key)
+        )
+        key: _OriginKey = (scheme, host, port, eff_proxy_key)
+        now_mono = self._mono_fn()
+        now_wall = self._wall_fn()
+        first_pass = True
+
+        while True:
+            reused_conn: http.client.HTTPConnection | None = None
+            with self._lock:
+                cur_gen = self._evict_gen
+                to_close = self._prune_idle_locked(now_mono, now_wall) if first_pass else []
+                first_pass = False
+                if allow_reuse and key in self._idle:
+                    bucket = self._idle[key]
+                    reused_conn, _, _ = bucket.pop()
+                    if not bucket:
+                        del self._idle[key]
+            for c in to_close:
+                _close_quietly(c)
+
+            if reused_conn is None:
+                break
+
             try:
+                sock = getattr(reused_conn, "sock", None)
+                if (
+                    sock is None
+                    or getattr(reused_conn, "_aborted", False)
+                    or _is_idle_socket_stale(sock)
+                ):
+                    _close_quietly(reused_conn)
+                    continue
                 reused_conn.timeout = timeout_sec
                 if hasattr(reused_conn, "_connect_timeout"):
                     setattr(reused_conn, "_connect_timeout", connect_timeout_sec)
@@ -1123,44 +1460,50 @@ class _KeepAlivePool:
                     setattr(reused_conn, "_io_deadline", io_deadline)
                 if hasattr(reused_conn, "_phase_deadline"):
                     setattr(reused_conn, "_phase_deadline", None)
-                sock = getattr(reused_conn, "sock", None)
-                if sock is None or getattr(reused_conn, "_aborted", False):
+                abort_lock = getattr(reused_conn, "_abort_lock", None)
+                aborted_race = False
+                if abort_lock is not None:
+                    with abort_lock:
+                        if getattr(reused_conn, "_aborted", False):
+                            aborted_race = True
+                        else:
+                            setattr(
+                                reused_conn,
+                                "_borrow_gen",
+                                int(getattr(reused_conn, "_borrow_gen", 0)) + 1,
+                            )
+                            setattr(reused_conn, "_cur_sock", sock)
+                if aborted_race:
                     _close_quietly(reused_conn)
-                else:
-                    abort_lock = getattr(reused_conn, "_abort_lock", None)
-                    aborted_race = False
-                    if abort_lock is not None:
-                        with abort_lock:
-                            if getattr(reused_conn, "_aborted", False):
-                                aborted_race = True
-                            else:
-                                setattr(
-                                    reused_conn,
-                                    "_borrow_gen",
-                                    int(getattr(reused_conn, "_borrow_gen", 0)) + 1,
-                                )
-                                setattr(reused_conn, "_cur_sock", sock)
-                    if aborted_race:
-                        _close_quietly(reused_conn)
-                    else:
-                        sock.settimeout(timeout_sec)
-                        return reused_conn, True
+                    continue
+                setattr(reused_conn, "_pool_evict_gen", cur_gen)
+                setattr(reused_conn, "_pool_proxy_key", eff_proxy_key)
+                sock.settimeout(timeout_sec)
+                return reused_conn, True
             except Exception:
                 _close_quietly(reused_conn)
-        return (
-            self._new_connection(
-                scheme,
-                host,
-                port,
-                timeout_sec,
-                connect_timeout_sec=connect_timeout_sec,
-                io_deadline=io_deadline,
-            ),
-            False,
+                continue
+
+        new_conn = self._new_connection(
+            scheme,
+            host,
+            port,
+            timeout_sec,
+            connect_timeout_sec=connect_timeout_sec,
+            io_deadline=io_deadline,
         )
+        setattr(new_conn, "_pool_evict_gen", cur_gen)
+        setattr(new_conn, "_pool_proxy_key", eff_proxy_key)
+        return new_conn, False
 
     def release(
-        self, scheme: str, host: str, port: int, conn: http.client.HTTPConnection
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        conn: http.client.HTTPConnection,
+        *,
+        proxy_key: str | None = None,
     ) -> None:
         if hasattr(conn, "_io_deadline"):
             setattr(conn, "_io_deadline", None)
@@ -1179,55 +1522,87 @@ class _KeepAlivePool:
             if abort_aborted:
                 _close_quietly(conn)
                 return
+        sock = getattr(conn, "sock", None)
         if (
-            getattr(conn, "sock", None) is None
+            sock is None
             or getattr(conn, "_aborted", False)
             or self.max_per_origin <= 0
+            or _is_idle_socket_stale(sock)
         ):
             _close_quietly(conn)
             return
-        now = time.monotonic()
-        key: _OriginKey = (scheme, host, port)
+        eff_proxy_key = (
+            self._resolve_proxy_key(scheme, host, port)
+            if proxy_key is None
+            else str(proxy_key)
+        )
+        conn_proxy_key = getattr(conn, "_pool_proxy_key", eff_proxy_key)
+        if conn_proxy_key != eff_proxy_key:
+            _close_quietly(conn)
+            return
+
+        now_mono = self._mono_fn()
+        now_wall = self._wall_fn()
+        key: _OriginKey = (scheme, host, port, eff_proxy_key)
         to_close: list[http.client.HTTPConnection] = []
         with self._lock:
-            bucket = self._idle.get(key, [])
-            kept: list[tuple[http.client.HTTPConnection, float]] = []
-            for c, ts in bucket:
-                if (
-                    (now - ts) > self.idle_timeout_sec
-                    or getattr(c, "sock", None) is None
-                    or getattr(c, "_aborted", False)
-                ):
-                    to_close.append(c)
-                else:
-                    kept.append((c, ts))
-            while len(kept) >= self.max_per_origin:
-                old_c, _ = kept.pop(0)
-                to_close.append(old_c)
-            if getattr(conn, "_aborted", False) or getattr(conn, "sock", None) is None:
+            conn_gen = getattr(conn, "_pool_evict_gen", self._evict_gen)
+            if conn_gen != self._evict_gen:
                 to_close.append(conn)
             else:
-                kept.append((conn, now))
-            if kept:
-                self._idle[key] = kept
-            else:
-                self._idle.pop(key, None)
+                bucket = self._idle.get(key, [])
+                kept: list[tuple[http.client.HTTPConnection, float, float]] = []
+                for c, m_ts, w_ts in bucket:
+                    if (
+                        self._is_entry_expired(m_ts, w_ts, now_mono, now_wall)
+                        or getattr(c, "sock", None) is None
+                        or getattr(c, "_aborted", False)
+                    ):
+                        to_close.append(c)
+                    else:
+                        kept.append((c, m_ts, w_ts))
+                while len(kept) >= self.max_per_origin:
+                    old_c, _, _ = kept.pop(0)
+                    to_close.append(old_c)
+                if getattr(conn, "_aborted", False) or getattr(conn, "sock", None) is None:
+                    to_close.append(conn)
+                else:
+                    kept.append((conn, now_mono, now_wall))
+                if kept:
+                    self._idle[key] = kept
+                else:
+                    self._idle.pop(key, None)
         for c in to_close:
             _close_quietly(c)
 
-    def close_all(self) -> None:
+    def evict_all(self) -> int:
+        """Close and evict all idle connections and invalidate any in-flight pre-eviction leases."""
         to_close: list[http.client.HTTPConnection] = []
         with self._lock:
+            self._evict_gen += 1
             for bucket in self._idle.values():
-                for c, _ in bucket:
+                for c, _, _ in bucket:
                     to_close.append(c)
             self._idle.clear()
         for c in to_close:
+            abort_lock = getattr(c, "_abort_lock", None)
+            if abort_lock is not None:
+                with abort_lock:
+                    setattr(c, "_borrow_gen", int(getattr(c, "_borrow_gen", 0)) + 1)
             _close_quietly(c)
+        return len(to_close)
+
+    def close_all(self) -> None:
+        self.evict_all()
 
 
 _KEEPALIVE_POOL = _KeepAlivePool()
 atexit.register(_KEEPALIVE_POOL.close_all)
+
+
+def evict_all_keepalive_connections() -> int:
+    """Evict all idle sockets from the shared HTTP keep-alive pool (e.g. on power_resume)."""
+    return _KEEPALIVE_POOL.evict_all()
 
 
 def _validate_request_url(
@@ -1246,20 +1621,7 @@ def _validate_request_url(
 
 
 def _should_use_system_proxy(scheme: str, host: str, port: int | None = None) -> bool:
-    proxies = urllib.request.getproxies()
-    if not proxies:
-        return False
-    proxy_url = (proxies.get(scheme.lower()) or proxies.get("all") or "").strip()
-    if not proxy_url:
-        return False
-    try:
-        if urllib.request.proxy_bypass(host):
-            return False
-        if port is not None and ":" not in host and urllib.request.proxy_bypass(f"{host}:{port}"):
-            return False
-    except Exception:
-        pass
-    return True
+    return bool(_resolve_system_proxy_key(scheme, host, port))
 
 
 def _combine_cancel_check(
@@ -1310,6 +1672,7 @@ def _execute_keepalive(
     *,
     wall_deadline: float,
     hdrs_init: dict[str, str],
+    proxy_key: str = "",
 ) -> HttpResponse:
     cur_url = req.url
     cur_method = req.method.upper()
@@ -1358,6 +1721,7 @@ def _execute_keepalive(
                 allow_reuse=(attempt == 0),
                 connect_timeout_sec=conn_timeout,
                 io_deadline=wall_deadline,
+                proxy_key=proxy_key,
             )
             hook_id = _register_conn_abort(tok, conn)
             try:
@@ -1425,7 +1789,7 @@ def _execute_keepalive(
                 can_reuse = False
             _close_quietly(resp)
             if can_reuse:
-                _KEEPALIVE_POOL.release(scheme, host, port, conn)
+                _KEEPALIVE_POOL.release(scheme, host, port, conn, proxy_key=proxy_key)
             else:
                 _close_quietly(conn)
 
@@ -2069,7 +2433,9 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
         scheme, host, port, _, _ = origin
 
         if not _should_use_system_proxy(scheme, host, port):
-            return _execute_keepalive(req, wall_deadline=wall_deadline, hdrs_init=hdrs_out)
+            return _execute_keepalive(
+                req, wall_deadline=wall_deadline, hdrs_init=hdrs_out, proxy_key=""
+            )
 
         ureq = urllib.request.Request(
             req.url,
@@ -2089,7 +2455,7 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
             _SAFE_OPENER
             if (_SAFE_OPENER is not _DEFAULT_SAFE_OPENER or cur_proxies == _INITIAL_PROXIES)
             else urllib.request.build_opener(
-                urllib.request.ProxyHandler(cur_proxies),
+                _NoDnsProxyHandler(cur_proxies),
                 _SplitTimeoutHTTPHandler(),
                 _SplitTimeoutHTTPSHandler(),
                 _SameOriginSafeRedirectHandler(),

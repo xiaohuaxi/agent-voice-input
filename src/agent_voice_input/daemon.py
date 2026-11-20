@@ -50,6 +50,7 @@ from .config import (
     select_refiner_provider,
 )
 from .hotwords import load_hotwords_file
+from .http_transport import evict_all_keepalive_connections
 from .hud import is_toast_hud_state
 from .platform_common import (
     ForegroundWindow,
@@ -82,6 +83,148 @@ from .workspace_ctx import (
 TELEMETRY_FILENAME: str = "telemetry.jsonl"
 TELEMETRY_MAX_BYTES: int = 256 * 1024
 RECENT_RESULTS_MAXLEN: int = 20
+DAEMON_LOG_FILENAME: str = "daemon.log"
+DAEMON_LOG_BACKUP_FILENAME: str = "daemon.log.1"
+DEFAULT_DAEMON_LOG_MAX_BYTES: int = 2 * 1024 * 1024
+_LOG_ROTATE_CHECK_INTERVAL_SEC: float = 60.0
+
+
+def rotate_daemon_log_if_needed(
+    log_path: Path,
+    *,
+    max_bytes: int = DEFAULT_DAEMON_LOG_MAX_BYTES,
+    rebind_stdio: bool = True,
+) -> bool:
+    """Safely rotate ``daemon.log`` -> ``daemon.log.1`` (0600) once size reaches ``max_bytes``."""
+    if max_bytes <= 0:
+        return False
+    try:
+        st = os.lstat(log_path)
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        backup_path = log_path.with_name(f"{log_path.name}.1")
+        bst: os.stat_result | None = None
+        try:
+            bst = os.lstat(backup_path)
+            if not stat.S_ISREG(bst.st_mode):
+                return False
+        except FileNotFoundError:
+            bst = None
+
+        # Idempotent self-heal: if a prior rotation partially failed dup2 and left fd 1/2
+        # still pointing at daemon.log.1 while daemon.log exists, rebind those fds back now.
+        if rebind_stdio and bst is not None:
+            backup_fid = (bst.st_dev, bst.st_ino)
+            stale_fds: list[int] = []
+            for fd_num in (1, 2):
+                try:
+                    fst = os.fstat(fd_num)
+                    if (fst.st_dev, fst.st_ino) == backup_fid:
+                        stale_fds.append(fd_num)
+                except OSError:
+                    pass
+            if stale_fds:
+                for fd_num, stream in ((1, sys.stdout), (2, sys.stderr)):
+                    if fd_num in stale_fds:
+                        try:
+                            stream.flush()
+                        except Exception:
+                            pass
+                heal_flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+                heal_fd: int | None = None
+                try:
+                    heal_fd = os.open(str(log_path), heal_flags, 0o600)
+                    for fd_num in stale_fds:
+                        try:
+                            os.dup2(heal_fd, fd_num)
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+                finally:
+                    if heal_fd is not None:
+                        try:
+                            os.close(heal_fd)
+                        except OSError:
+                            pass
+
+        if st.st_size < max_bytes:
+            return False
+
+        rebind_fds: list[int] = []
+        if rebind_stdio:
+            target_fid = (st.st_dev, st.st_ino)
+            for fd_num in (1, 2):
+                try:
+                    fst = os.fstat(fd_num)
+                    if (fst.st_dev, fst.st_ino) == target_fid:
+                        rebind_fds.append(fd_num)
+                except OSError:
+                    pass
+            if 1 in rebind_fds:
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+            if 2 in rebind_fds:
+                try:
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+
+        tmp_path = log_path.with_name(
+            f".{log_path.name}.rotate.{os.getpid()}.{time.monotonic_ns()}.tmp"
+        )
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_APPEND
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        new_fd: int | None = None
+        tmp_exists = False
+        try:
+            new_fd = os.open(str(tmp_path), flags, 0o600)
+            tmp_exists = True
+            os.fchmod(new_fd, 0o600)
+
+            os.replace(log_path, backup_path)
+            try:
+                os.replace(tmp_path, log_path)
+                tmp_exists = False
+            except BaseException:
+                # Best-effort rollback so log_path never stays permanently missing on .1
+                try:
+                    os.replace(backup_path, log_path)
+                except OSError:
+                    pass
+                raise
+
+            try:
+                os.chmod(backup_path, 0o600)
+            except OSError:
+                pass
+            dup_failed = False
+            for fd_num in rebind_fds:
+                try:
+                    os.dup2(new_fd, fd_num)
+                except OSError:
+                    dup_failed = True
+            return not dup_failed
+        finally:
+            if new_fd is not None:
+                try:
+                    os.close(new_fd)
+                except OSError:
+                    pass
+            if tmp_exists:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    except Exception:
+        return False
 
 
 class DaemonAlreadyRunningError(RuntimeError):
@@ -1520,6 +1663,7 @@ class VoiceInputDaemon:
         clock_fn: Callable[[], float] = time.monotonic,
         sleep_fn: Callable[[float], None] = time.sleep,
         paste_settle_sec: float = DEFAULT_PASTE_SETTLE_SEC,
+        log_max_bytes: int = DEFAULT_DAEMON_LOG_MAX_BYTES,
     ) -> None:
         self.cfg, self.env = cfg, dict(os.environ if env is None else env)
         self.creds = resolve_credentials(cfg, self.env)
@@ -1592,6 +1736,9 @@ class VoiceInputDaemon:
         self._archive_threads: set[threading.Thread] = set()
         self._lock_fd: int | None = None
         self._owns_runtime_files: bool = False
+        self._log_max_bytes: int = max(0, int(log_max_bytes))
+        self._log_rotate_lock = threading.Lock()
+        self._last_log_rotate_check: float = -1e9
         if (setter := getattr(self.platform, "set_recorder_lost_callback", None)) is not None:
             setter(self._on_recorder_lost)
         if (rec_setter := getattr(self.platform, "set_recorder_recovered_callback", None)) is not None:
@@ -1609,6 +1756,26 @@ class VoiceInputDaemon:
     def sock_path(self) -> Path: return self.runtime_dir / "control.sock"
     @property
     def telemetry_path(self) -> Path: return self.runtime_dir / TELEMETRY_FILENAME
+    @property
+    def log_path(self) -> Path: return self.runtime_dir / DAEMON_LOG_FILENAME
+
+    def _maybe_rotate_daemon_log(self, *, force: bool = False) -> bool:
+        if self._log_max_bytes <= 0:
+            return False
+        now = self.clock_fn()
+        with self._log_rotate_lock:
+            if not force and (now - self._last_log_rotate_check) < _LOG_ROTATE_CHECK_INTERVAL_SEC:
+                return False
+            self._last_log_rotate_check = now
+            return rotate_daemon_log_if_needed(self.log_path, max_bytes=self._log_max_bytes)
+
+    def _log_info(self, message: str) -> None:
+        self._maybe_rotate_daemon_log(force=True)
+        clean = self._redact(message)
+        try:
+            print(f"[agent-voice-input] INFO: {clean}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
     def _read_pid_file_fallback(self) -> int | None:
         try:
@@ -1712,6 +1879,7 @@ class VoiceInputDaemon:
 
     def _append_telemetry(self, summary: Mapping[str, Any]) -> None:
         append_telemetry_record(self.runtime_dir, summary)
+        self._maybe_rotate_daemon_log()
 
     def is_current_seq(self, seq_id: int) -> bool:
         with self._lock:
@@ -3395,6 +3563,37 @@ class VoiceInputDaemon:
             return {"ok": True, "stopping": True}
         return {"ok": False, "error": f"unknown cmd: {cmd}"}
 
+    def _handle_power_resume(self, m: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        _ = m
+        shared_evicted = evict_all_keepalive_connections()
+        refiner_evicted = 0
+        if callable(evict_fn := getattr(self.refiner, "evict_connections", None)):
+            try:
+                refiner_evicted = int(evict_fn() or 0)
+            except Exception:
+                pass
+        # Follow strict global lock hierarchy: _trigger_lock (T) -> _lock (L)
+        with self._trigger_lock:
+            with self._lock:
+                self._last_trigger_ts = -1e9
+                self._clipboard_busy_until = -1e9
+                if not self._recording_active:
+                    self._origin_win = ForegroundWindow()
+                    self._recorder_lost_seq = -1
+                    self._recorder_lost_ts = -1e9
+                    self._recorder_lost_stop_absorbed = False
+                    self._auto_stop_seq = -1
+                    self._auto_stop_ts = -1e9
+                    self._auto_stop_absorbed = False
+        self._log_info(
+            f"power_resume handled (evicted_shared={shared_evicted}, evicted_refiner={refiner_evicted})"
+        )
+        return {
+            "ok": True,
+            "evicted_shared": shared_evicted,
+            "evicted_refiner": refiner_evicted,
+        }
+
     def _on_platform_event(self, m: Mapping[str, Any]) -> None:
         ev = str(m.get("event") or "")
         if ev in ("toggle", "ptt_start", "ptt_stop", "ptt_cancel"):
@@ -3407,6 +3606,8 @@ class VoiceInputDaemon:
             except ValueError:
                 return
             self.handle_cancel(seq_id=seq_val)
+        elif ev == "power_resume":
+            self._handle_power_resume(m)
 
     def serve_forever(self) -> None:
         sig_stop = threading.Event()
@@ -3443,7 +3644,9 @@ class VoiceInputDaemon:
                 )
             while not self._stop_evt.is_set() and not sig_stop.is_set():
                 try: conn, _ = srv.accept()
-                except socket.timeout: continue
+                except socket.timeout:
+                    self._maybe_rotate_daemon_log()
+                    continue
                 except OSError: break
                 with conn:
                     try:

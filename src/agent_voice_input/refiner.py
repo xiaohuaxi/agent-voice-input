@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import random
 import re
-import select
 import selectors
 import shutil
 import signal
@@ -46,6 +45,7 @@ from .http_transport import (
     _can_reuse_pooled_conn,
     _close_quietly,
     _combine_cancel_check,
+    _is_idle_socket_stale,
     _is_loopback_url,
     _register_conn_abort,
     _unregister_conn_abort,
@@ -936,6 +936,9 @@ class BaseRefiner:
     def prepare_session(self, session_key: str = "") -> None:
         pass
 
+    def evict_connections(self) -> int:
+        return 0
+
     def close(self) -> None:
         pass
 
@@ -1111,6 +1114,17 @@ class _InstanceKeepAlivePool(_KeepAlivePool):
             hdrs["Proxy-Authorization"] = f"Basic {tok}"
         return parsed.hostname, p_port, hdrs
 
+    def _resolve_proxy_key(self, scheme: str, host: str, port: int) -> str:
+        if scheme != "https":
+            return ""
+        proxy_cfg = self._resolve_https_proxy(host, port)
+        if proxy_cfg is None:
+            return ""
+        p_host, p_port, p_hdrs = proxy_cfg
+        auth = p_hdrs.get("Proxy-Authorization", "")
+        auth_part = f"|auth:{hashlib.sha256(auth.encode('utf-8')).hexdigest()[:12]}" if auth else ""
+        return f"https-connect://{p_host.lower()}:{p_port}{auth_part}"
+
     def _new_connection(
         self,
         scheme: str,
@@ -1262,20 +1276,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
 
     @staticmethod
     def _is_conn_stale(conn: http.client.HTTPConnection) -> bool:
-        sock = getattr(conn, "sock", None)
-        if sock is None:
-            return True
-        if callable(pending_fn := getattr(sock, "pending", None)):
-            try:
-                if int(pending_fn()) > 0:
-                    return True
-            except Exception:
-                return True
-        try:
-            rlist, _, _ = select.select([sock], [], [], 0.0)
-            return bool(rlist)
-        except Exception:
-            return False
+        return _is_idle_socket_stale(getattr(conn, "sock", None))
 
     @staticmethod
     def _shutdown_and_close_conn(conn: http.client.HTTPConnection) -> None:
@@ -1855,6 +1856,9 @@ class OpenAIResponsesRefiner(BaseRefiner):
             used_prior_session=used_prior,
             cancel_token=cancel_token,
         )
+
+    def evict_connections(self) -> int:
+        return self._pool.evict_all()
 
     def close(self) -> None:
         with self._state_lock:

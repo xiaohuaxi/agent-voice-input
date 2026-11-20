@@ -240,6 +240,8 @@ class SessionState:
     byte_offset: int = 0
     file_id: tuple[int, int] | None = None
     last_mtime_ns: int = 0
+    last_ctime_ns: int = 0
+    verified_stat: tuple[int, int, int, int, int] | None = None
     prefix_hasher: Any = field(
         default_factory=lambda: hashlib.blake2b(digest_size=16), repr=False
     )
@@ -2502,6 +2504,10 @@ class _ResolveCtx:
     tty_matches_tmux_client: bool = False
 
 
+DEFAULT_SESSION_STATES_MAX = 64
+DEFAULT_WORKSPACE_CACHE_MAX = 64
+
+
 class SessionTracker:
     """Thread-safe stateful session resolver and incremental JSONL clean-turn extractor."""
 
@@ -2523,6 +2529,8 @@ class SessionTracker:
         context_max_chars: int = DEFAULT_REFINER_CONTEXT_MAX_CHARS,
         cold_start_fallback: str = "auto",
         prior_cache_ttl_sec: float = 60.0,
+        max_states: int = DEFAULT_SESSION_STATES_MAX,
+        max_workspace_cache: int = DEFAULT_WORKSPACE_CACHE_MAX,
     ) -> None:
         self.env = os.environ if env is None else env
         self.home = (
@@ -2542,18 +2550,21 @@ class SessionTracker:
         self.context_max_chars = max(1000, int(context_max_chars))
         self.cold_start_fallback = (cold_start_fallback or "auto").strip().lower()
         self.prior_cache_ttl_sec = max(0.0, float(prior_cache_ttl_sec))
+        self._max_states: int = max(1, int(max_states))
+        self._max_workspace_cache: int = max(1, int(max_workspace_cache))
         self._tmux_socket = str(tmux_socket).strip() if tmux_socket is not None else ""
         self._tmux_socket_name = (tmux_socket_name or "").strip()
         self._tmux_probe_fn = tmux_probe_fn
         self._lock = threading.RLock()
         self._tls = threading.local()
-        self._states: dict[str, SessionState] = {}
-        self._git_cache: dict[str, tuple[float, str, list[str]]] = {}
-        self._repo_cache: dict[str, tuple[float, list[str]]] = {}
-        self._shallow_cache: dict[str, tuple[float, list[str]]] = {}
+        self._states: OrderedDict[str, SessionState] = OrderedDict()
+        self._active_state_refs: dict[str, int] = {}
+        self._git_cache: OrderedDict[str, tuple[float, str, list[str]]] = OrderedDict()
+        self._repo_cache: OrderedDict[str, tuple[float, list[str]]] = OrderedDict()
+        self._shallow_cache: OrderedDict[str, tuple[float, list[str]]] = OrderedDict()
         self._prior_cache: OrderedDict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = OrderedDict()
         self._prior_cache_max_entries: int = 16
-        self._remote_files_cache: dict[tuple[str, str], tuple[float, list[str], list[str]]] = {}
+        self._remote_files_cache: OrderedDict[tuple[str, str], tuple[float, list[str], list[str]]] = OrderedDict()
         self._custom_local_hostnames: tuple[str, ...] | None = (
             tuple(local_hostnames) if local_hostnames is not None else None
         )
@@ -3108,7 +3119,10 @@ class SessionTracker:
 
     def get_state(self, session_key: str) -> SessionState | None:
         with self._lock:
-            return self._states.get(session_key)
+            state = self._states.get(session_key)
+            if state is not None:
+                self._touch_state_locked(session_key)
+            return state
 
     @staticmethod
     def _collect_tmux_ttys(tmux_snap: TmuxServerSnapshot) -> set[str]:
@@ -4422,11 +4436,61 @@ class SessionTracker:
 
             return self._resolve_non_tmux_proc_or_fallback(rctx)
 
+    def _touch_state_locked(self, session_key: str) -> None:
+        if session_key in self._states:
+            self._states.move_to_end(session_key)
+
+    def _evict_states_locked(self, *, protect_key: str = "") -> None:
+        if len(self._states) <= self._max_states:
+            return
+        for cand_key in list(self._states.keys()):
+            if len(self._states) <= self._max_states:
+                break
+            if cand_key == protect_key or self._active_state_refs.get(cand_key, 0) > 0:
+                continue
+            self._states.pop(cand_key, None)
+
+    def _put_state_locked(self, session_key: str, state: SessionState) -> None:
+        self._states[session_key] = state
+        self._states.move_to_end(session_key)
+        self._evict_states_locked(protect_key=session_key)
+
+    def _pin_state_locked(self, session_key: str) -> None:
+        self._active_state_refs[session_key] = self._active_state_refs.get(session_key, 0) + 1
+
+    def _unpin_state_locked(self, session_key: str) -> None:
+        cnt = self._active_state_refs.get(session_key, 0)
+        if cnt <= 1:
+            self._active_state_refs.pop(session_key, None)
+        else:
+            self._active_state_refs[session_key] = cnt - 1
+        self._evict_states_locked()
+
+    @staticmethod
+    def _put_bounded_ttl_cache_locked(
+        cache: OrderedDict[Any, Any],
+        key: Any,
+        entry: tuple[Any, ...],
+        *,
+        now: float,
+        ttl_sec: float,
+        max_entries: int,
+    ) -> None:
+        expired = [k for k, v in cache.items() if (now - float(v[0])) >= ttl_sec]
+        for k in expired:
+            cache.pop(k, None)
+        cache[key] = entry
+        cache.move_to_end(key)
+        while len(cache) > max_entries:
+            cache.popitem(last=False)
+
     def _reset_state(self, state: SessionState, new_path: str) -> None:
         state.jsonl_path = new_path
         state.byte_offset = 0
         state.file_id = None
         state.last_mtime_ns = 0
+        state.last_ctime_ns = 0
+        state.verified_stat = None
         state.prefix_hasher = hashlib.blake2b(digest_size=16)
         state.clean_turns.clear()
         state.luna_synced_idx = 0
@@ -4540,6 +4604,21 @@ class SessionTracker:
             with open(path, "rb") as f:
                 st = os.fstat(f.fileno())
                 current_fid = (st.st_dev, st.st_ino)
+                current_stat = (
+                    st.st_dev,
+                    st.st_ino,
+                    st.st_size,
+                    st.st_mtime_ns,
+                    st.st_ctime_ns,
+                )
+
+                # O(1) unchanged shortcut: skip full-file prefix re-hash when stat 5-tuple and size match byte_offset
+                if (
+                    state.byte_offset > 0
+                    and st.st_size == state.byte_offset
+                    and state.verified_stat == current_stat
+                ):
+                    return
 
                 if state.file_id is not None and state.file_id != current_fid:
                     # Atomic replacement (new inode)
@@ -4552,13 +4631,27 @@ class SessionTracker:
                         # Caught in-place overwrite anywhere in [0 : byte_offset] regardless of file size
                         self._reset_state(state, path)
                     elif st.st_size == state.byte_offset:
-                        state.file_id = current_fid
-                        state.last_mtime_ns = st.st_mtime_ns
+                        st_after = os.fstat(f.fileno())
+                        post_verify_stat = (
+                            st_after.st_dev,
+                            st_after.st_ino,
+                            st_after.st_size,
+                            st_after.st_mtime_ns,
+                            st_after.st_ctime_ns,
+                        )
+                        state.file_id = (st_after.st_dev, st_after.st_ino)
+                        state.last_mtime_ns = st_after.st_mtime_ns
+                        state.last_ctime_ns = st_after.st_ctime_ns
+                        state.verified_stat = (
+                            post_verify_stat if post_verify_stat == current_stat else None
+                        )
                         return
 
                 if st.st_size == 0 and state.byte_offset == 0:
                     state.file_id = current_fid
                     state.last_mtime_ns = st.st_mtime_ns
+                    state.last_ctime_ns = st.st_ctime_ns
+                    state.verified_stat = None
                     return
 
                 f.seek(state.byte_offset)
@@ -4618,8 +4711,26 @@ class SessionTracker:
                     if isinstance(obj, dict):
                         self._consume_parsed_record(state, obj)
 
-                state.file_id = current_fid
-                state.last_mtime_ns = st.st_mtime_ns
+                st_end = os.fstat(f.fileno())
+                post_stat = (
+                    st_end.st_dev,
+                    st_end.st_ino,
+                    st_end.st_size,
+                    st_end.st_mtime_ns,
+                    st_end.st_ctime_ns,
+                )
+                state.file_id = (st_end.st_dev, st_end.st_ino)
+                state.last_mtime_ns = st_end.st_mtime_ns
+                state.last_ctime_ns = st_end.st_ctime_ns
+                state.verified_stat = (
+                    post_stat
+                    if (
+                        state.byte_offset > 0
+                        and post_stat == current_stat
+                        and st_end.st_size == state.byte_offset
+                    )
+                    else None
+                )
         except OSError:
             if state.byte_offset > 0 and not os.path.exists(path):
                 self._reset_state(state, path)
@@ -4642,14 +4753,26 @@ class SessionTracker:
         with self._lock:
             cached = self._git_cache.get(cwd)
             if cached is not None and (now - cached[0]) < self.git_cache_ttl_sec:
+                self._git_cache.move_to_end(cwd)
                 return cached[1], list(cached[2])
         status_txt, hw = read_git_status_summary(cwd, env=self.env)
+        now_write = time.monotonic()
         with self._lock:
-            self._git_cache[cwd] = (time.monotonic(), status_txt, hw)
+            self._put_bounded_ttl_cache_locked(
+                self._git_cache,
+                cwd,
+                (now_write, status_txt, hw),
+                now=now_write,
+                ttl_sec=self.git_cache_ttl_sec,
+                max_entries=self._max_workspace_cache,
+            )
         return status_txt, list(hw)
 
     def _get_cached_files(
-        self, cache: dict[str, tuple[float, list[str]]], cwd: str, loader: Callable[[str], list[str]]
+        self,
+        cache: OrderedDict[str, tuple[float, list[str]]],
+        cwd: str,
+        loader: Callable[[str], list[str]],
     ) -> list[str]:
         if not cwd or is_wsl_slow_mount_path(cwd, env=self.env):
             return []
@@ -4657,10 +4780,19 @@ class SessionTracker:
         with self._lock:
             cached = cache.get(cwd)
             if cached is not None and (now - cached[0]) < self.repo_files_cache_ttl_sec:
+                cache.move_to_end(cwd)
                 return list(cached[1])
         files = loader(cwd)
+        now_write = time.monotonic()
         with self._lock:
-            cache[cwd] = (time.monotonic(), files)
+            self._put_bounded_ttl_cache_locked(
+                cache,
+                cwd,
+                (now_write, files),
+                now=now_write,
+                ttl_sec=self.repo_files_cache_ttl_sec,
+                max_entries=self._max_workspace_cache,
+            )
         return list(files)
 
     def _get_repo_files(self, cwd: str) -> list[str]:
@@ -4771,6 +4903,7 @@ class SessionTracker:
         include_git_info: bool,
         max_chars: int | None = None,
         cold_start_fallback: str | None = None,
+        pin_target_out: list[str] | None = None,
     ) -> tuple[dict[str, Any], tuple[Any, ...]]:
         eff_max_chars = (
             max(1000, int(max_chars)) if max_chars is not None else self.context_max_chars
@@ -4794,29 +4927,34 @@ class SessionTracker:
         else:
             cache_key = (host_cfg.name, "", "", spin_free_title, eff_max_chars)
 
-        cached_st = self._find_cached_remote_state(host_cfg.name, hint=hint, cwd_hint=cwd_hint)
-        etag = (
-            cached_st.remote_etag
-            if (cached_st is not None and cached_st.remote_max_chars == eff_max_chars)
-            else ""
-        )
-        skey_hint = f"{cached_st.cli}:{cached_st.session_id}" if cached_st is not None else ""
-        include_repo_files = bool(include_git_info)
-        if include_repo_files and cached_st is not None and cached_st.cwd:
-            with self._lock:
+        with self._lock:
+            cached_st = self._find_cached_remote_state(host_cfg.name, hint=hint, cwd_hint=cwd_hint)
+            etag = (
+                cached_st.remote_etag
+                if (cached_st is not None and cached_st.remote_max_chars == eff_max_chars)
+                else ""
+            )
+            if cached_st is not None:
+                self._touch_state_locked(cached_st.session_key)
+                if etag and pin_target_out is not None:
+                    self._pin_state_locked(cached_st.session_key)
+                    pin_target_out.append(cached_st.session_key)
+            skey_hint = f"{cached_st.cli}:{cached_st.session_id}" if cached_st is not None else ""
+            include_repo_files = bool(include_git_info)
+            if include_repo_files and cached_st is not None and cached_st.cwd:
                 f_entry = self._remote_files_cache.get((host_cfg.name, cached_st.cwd))
                 if f_entry is not None and (time.monotonic() - f_entry[0]) < self.repo_files_cache_ttl_sec:
                     include_repo_files = False
 
-        prior_checked_sid = ""
-        if cached_st is not None and eff_fb != "off":
-            already_checked = (
-                cached_st.cold_start_prior_checked
-                if eff_fb == "auto"
-                else cached_st.cold_start_prior_hotwords_checked
-            )
-            if already_checked:
-                prior_checked_sid = cached_st.session_id
+            prior_checked_sid = ""
+            if cached_st is not None and eff_fb != "off":
+                already_checked = (
+                    cached_st.cold_start_prior_checked
+                    if eff_fb == "auto"
+                    else cached_st.cold_start_prior_hotwords_checked
+                )
+                if already_checked:
+                    prior_checked_sid = cached_st.session_id
 
         req_dict: dict[str, Any] = {
             "v": 1,
@@ -4849,11 +4987,19 @@ class SessionTracker:
             state.remote_repo_files = repo_f
             state.remote_shallow_files = shallow_f
             if state.cwd:
-                self._remote_files_cache[(host_name, state.cwd)] = (now, repo_f, shallow_f)
+                self._put_bounded_ttl_cache_locked(
+                    self._remote_files_cache,
+                    (host_name, state.cwd),
+                    (now, repo_f, shallow_f),
+                    now=now,
+                    ttl_sec=self.repo_files_cache_ttl_sec,
+                    max_entries=self._max_workspace_cache,
+                )
         elif state.cwd:
             cached_f = self._remote_files_cache.get((host_name, state.cwd))
             if cached_f is not None:
                 if (now - cached_f[0]) < self.repo_files_cache_ttl_sec:
+                    self._remote_files_cache.move_to_end((host_name, state.cwd))
                     state.remote_repo_files = list(cached_f[1])
                     state.remote_shallow_files = list(cached_f[2])
                 else:
@@ -4900,6 +5046,7 @@ class SessionTracker:
             if not_mod:
                 if state is None or (etag and state.remote_etag != etag):
                     return None
+                self._touch_state_locked(skey)
                 if rem_cwd:
                     state.cwd = rem_cwd
                     self._retire_prior_on_cwd_change_locked(
@@ -4943,8 +5090,9 @@ class SessionTracker:
                     remote_git_status=git_status,
                     remote_git_hotwords=git_hw,
                 )
-                self._states[skey] = state
+                self._put_state_locked(skey, state)
             else:
+                self._touch_state_locked(skey)
                 old_turns = state.clean_turns
                 same_epoch = (
                     comp_cnt == state.remote_compaction_count
@@ -5124,6 +5272,7 @@ class SessionTracker:
         ):
             synth_title = f"[{eff_match.cli}:#{eff_match.session_id}]"
         eff_max = self.context_max_chars
+        pinned_etag_keys: list[str] = []
         req_dict, cache_key = self._build_remote_req_and_key(
             host_cfg,
             effective_title=synth_title,
@@ -5131,73 +5280,108 @@ class SessionTracker:
             include_git_info=include_git_info,
             max_chars=eff_max,
             cold_start_fallback=eff_fb,
+            pin_target_out=pinned_etag_keys,
         )
-        cfg_budget_ms = (
-            host_cfg.timeout_ms
-            if host_cfg.timeout_ms is not None
-            else self.remote_cfg.timeout_ms
-        )
-        rem_budget_ms = max(0, int(cfg_budget_ms) - max(0, int(elapsed_ms)))
-        cancel_fn: Callable[[], bool] | None = None
-        if cancel_token is not None:
-            if hasattr(cancel_token, "is_cancelled"):
-                cancel_fn = cancel_token.is_cancelled
-            elif hasattr(cancel_token, "is_set"):
-                cancel_fn = cancel_token.is_set
-            elif callable(cancel_token):
-                cancel_fn = cancel_token
-        resp = self.remote_manager.fetch_with_budget(
-            host_cfg,
-            req_dict,
-            cache_key=cache_key,
-            budget_ms=rem_budget_ms,
-            allow_start_if_missing=True,
-            allow_half_open=False,
-            is_cancelled=cancel_fn,
-            on_result=self._make_remote_result_cb(eff_max, cold_start_fallback=eff_fb),
-        )
-        if resp is None or not resp.get("ok"):
-            return None
-        state: SessionState | None = None
-        if resp.get("_already_applied"):
-            skey_done = (
-                f"remote:{host_cfg.name}:"
-                f"{str(resp.get('cli') or '').strip().lower()}:"
-                f"{str(resp.get('session_id') or '').strip().lower()}"
+        try:
+            cfg_budget_ms = (
+                host_cfg.timeout_ms
+                if host_cfg.timeout_ms is not None
+                else self.remote_cfg.timeout_ms
             )
+            rem_budget_ms = max(0, int(cfg_budget_ms) - max(0, int(elapsed_ms)))
+            cancel_fn: Callable[[], bool] | None = None
+            if cancel_token is not None:
+                if hasattr(cancel_token, "is_cancelled"):
+                    cancel_fn = cancel_token.is_cancelled
+                elif hasattr(cancel_token, "is_set"):
+                    cancel_fn = cancel_token.is_set
+                elif callable(cancel_token):
+                    cancel_fn = cancel_token
+            fetch_t0 = time.monotonic()
+            resp = self.remote_manager.fetch_with_budget(
+                host_cfg,
+                req_dict,
+                cache_key=cache_key,
+                budget_ms=rem_budget_ms,
+                allow_start_if_missing=True,
+                allow_half_open=False,
+                is_cancelled=cancel_fn,
+                on_result=self._make_remote_result_cb(eff_max, cold_start_fallback=eff_fb),
+            )
+            if resp is None or not resp.get("ok"):
+                return None
+            state: SessionState | None = None
+            if resp.get("_already_applied"):
+                skey_done = (
+                    f"remote:{host_cfg.name}:"
+                    f"{str(resp.get('cli') or '').strip().lower()}:"
+                    f"{str(resp.get('session_id') or '').strip().lower()}"
+                )
+                with self._lock:
+                    cand_st = self._states.get(skey_done)
+                    if cand_st is not None and (
+                        not resp.get("etag") or cand_st.remote_etag == resp.get("etag")
+                    ):
+                        self._touch_state_locked(skey_done)
+                        state = cand_st
+            if state is None:
+                state = self._apply_remote_probe_response(
+                    host_cfg, resp, req_max_chars=eff_max, cold_start_fallback=eff_fb
+                )
+            if (
+                state is None
+                and bool(resp.get("not_modified") or resp.get("unchanged"))
+                and not (cancel_fn is not None and cancel_fn())
+            ):
+                # Fallback unconditional fetch if local cached state was evicted before not_modified arrived
+                spent_ms = max(0, int((time.monotonic() - fetch_t0) * 1000))
+                retry_budget_ms = max(0, rem_budget_ms - spent_ms)
+                if retry_budget_ms > 0:
+                    uncond_req = dict(req_dict)
+                    uncond_req["etag"] = ""
+                    resp2 = self.remote_manager.fetch_with_budget(
+                        host_cfg,
+                        uncond_req,
+                        cache_key=(*cache_key, "uncond"),
+                        budget_ms=retry_budget_ms,
+                        allow_start_if_missing=True,
+                        allow_half_open=False,
+                        is_cancelled=cancel_fn,
+                        on_result=self._make_remote_result_cb(eff_max, cold_start_fallback=eff_fb),
+                    )
+                    if resp2 is not None and resp2.get("ok"):
+                        resp = resp2
+                        state = self._apply_remote_probe_response(
+                            host_cfg, resp2, req_max_chars=eff_max, cold_start_fallback=eff_fb
+                        )
+            if state is None:
+                return None
             with self._lock:
-                cand_st = self._states.get(skey_done)
-                if cand_st is not None and (
-                    not resp.get("etag") or cand_st.remote_etag == resp.get("etag")
-                ):
-                    state = cand_st
-        if state is None:
-            state = self._apply_remote_probe_response(
-                host_cfg, resp, req_max_chars=eff_max, cold_start_fallback=eff_fb
-            )
-        if state is None:
-            return None
-        with self._lock:
-            turns_tuple = tuple(state.clean_turns)
-            luna_idx = state.luna_synced_idx
-            gen = state.generation
-            git_status = state.remote_git_status if include_git_info else ""
-            git_hw = list(state.remote_git_hotwords) if include_git_info else []
-            rem_files = list(state.remote_repo_files or state.remote_shallow_files) if include_git_info else []
-            prior_hw = (
-                list(state.cold_start_prior_hotwords)
-                if (eff_fb != "off" and len(turns_tuple) < COLD_START_SWEET_MIN_TURNS)
-                else []
-            )
-            resolved_match = SessionMatch(
-                cli=state.cli,
-                session_id=state.session_id,
-                jsonl_path="",
-                cwd=state.cwd,
-                matched_by=str(resp.get("matched_by") or "remote"),
-                origin="remote",
-                host_name=host_cfg.name,
-            )
+                turns_tuple = tuple(state.clean_turns)
+                luna_idx = state.luna_synced_idx
+                gen = state.generation
+                git_status = state.remote_git_status if include_git_info else ""
+                git_hw = list(state.remote_git_hotwords) if include_git_info else []
+                rem_files = list(state.remote_repo_files or state.remote_shallow_files) if include_git_info else []
+                prior_hw = (
+                    list(state.cold_start_prior_hotwords)
+                    if (eff_fb != "off" and len(turns_tuple) < COLD_START_SWEET_MIN_TURNS)
+                    else []
+                )
+                resolved_match = SessionMatch(
+                    cli=state.cli,
+                    session_id=state.session_id,
+                    jsonl_path="",
+                    cwd=state.cwd,
+                    matched_by=str(resp.get("matched_by") or "remote"),
+                    origin="remote",
+                    host_name=host_cfg.name,
+                )
+        finally:
+            if pinned_etag_keys:
+                with self._lock:
+                    for pk in pinned_etag_keys:
+                        self._unpin_state_locked(pk)
         repo_stems = _file_stems_for_hotwords(rem_files, limit=12) if (rem_files and not git_hw) else []
         turn_hw = extract_turn_hotwords(turns_tuple)
         merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems, *prior_hw]))
@@ -5244,8 +5428,9 @@ class SessionTracker:
                     cwd=eff_match.cwd,
                     matched_by=eff_match.matched_by,
                 )
-                self._states[eff_match.session_key] = state
+                self._put_state_locked(eff_match.session_key, state)
             else:
+                self._touch_state_locked(eff_match.session_key)
                 if eff_match.matched_by and not state.matched_by:
                     state.matched_by = eff_match.matched_by
                 if eff_match.cwd and (prefer_match_cwd or not state.cwd):
@@ -5285,62 +5470,70 @@ class SessionTracker:
                     need_prior_discovery = True
                 elif eff_fb == "hotwords" and not state.cold_start_prior_hotwords_checked:
                     need_prior_discovery = True
+            self._pin_state_locked(state_key)
 
-        if need_prior_discovery:
-            prior_cands = self._get_prior_candidates_cached(eff_cwd, scope=prior_scope)
-            best_prior, top5_prior = select_cold_start_prior_candidate(
-                prior_cands, preferred_cli=state_cli, exclude_session_id=state_sid
-            )
-            discovered_hw = (
-                tuple(aggregate_prior_candidates_hotwords(top5_prior))
-                if top5_prior
-                else ()
-            )
-            body_cap = prior_chunk_body_budget(self.context_max_chars)
-            best_turns = (
-                (best_prior.get("tail_turns") or best_prior.get("turns") or ())
-                if best_prior is not None
-                else ()
-            )
-            discovered_chunk = (
-                format_prior_turns_body(
-                    best_turns,
-                    max_chars=body_cap,
-                    max_turns=COLD_START_PRIOR_MAX_TURNS,
+        try:
+            if need_prior_discovery:
+                prior_cands = self._get_prior_candidates_cached(eff_cwd, scope=prior_scope)
+                best_prior, top5_prior = select_cold_start_prior_candidate(
+                    prior_cands, preferred_cli=state_cli, exclude_session_id=state_sid
                 )
-                if (eff_fb == "auto" and body_cap > 0 and best_turns)
-                else ""
-            )
+                discovered_hw = (
+                    tuple(aggregate_prior_candidates_hotwords(top5_prior))
+                    if top5_prior
+                    else ()
+                )
+                body_cap = prior_chunk_body_budget(self.context_max_chars)
+                best_turns = (
+                    (best_prior.get("tail_turns") or best_prior.get("turns") or ())
+                    if best_prior is not None
+                    else ()
+                )
+                discovered_chunk = (
+                    format_prior_turns_body(
+                        best_turns,
+                        max_chars=body_cap,
+                        max_turns=COLD_START_PRIOR_MAX_TURNS,
+                    )
+                    if (eff_fb == "auto" and body_cap > 0 and best_turns)
+                    else ""
+                )
+                with self._lock:
+                    cur_st = self._states.get(state_key)
+                    if cur_st is not None:
+                        self._touch_state_locked(state_key)
+                        cur_canon = self._canonical_prior_cwd(cur_st.cwd, is_remote=cur_st.is_remote)
+                        if (
+                            not cur_st.cold_start_prior_retired
+                            and (not cur_canon or cur_canon == target_canon_cwd)
+                        ):
+                            if not cur_st.cold_start_prior_hotwords_checked:
+                                cur_st.cold_start_prior_hotwords = discovered_hw
+                                cur_st.cold_start_prior_hotwords_checked = True
+                                if discovered_hw and target_canon_cwd:
+                                    cur_st.cold_start_prior_cwd = target_canon_cwd
+                            if eff_fb == "auto" and not cur_st.cold_start_prior_checked:
+                                cur_st.cold_start_prior_chunk = discovered_chunk
+                                cur_st.cold_start_prior_checked = True
+                                if discovered_chunk and target_canon_cwd:
+                                    cur_st.cold_start_prior_cwd = target_canon_cwd
+
             with self._lock:
                 cur_st = self._states.get(state_key)
                 if cur_st is not None:
-                    cur_canon = self._canonical_prior_cwd(cur_st.cwd, is_remote=cur_st.is_remote)
+                    self._touch_state_locked(state_key)
+                prior_hw = (
+                    list(cur_st.cold_start_prior_hotwords)
                     if (
-                        not cur_st.cold_start_prior_retired
-                        and (not cur_canon or cur_canon == target_canon_cwd)
-                    ):
-                        if not cur_st.cold_start_prior_hotwords_checked:
-                            cur_st.cold_start_prior_hotwords = discovered_hw
-                            cur_st.cold_start_prior_hotwords_checked = True
-                            if discovered_hw and target_canon_cwd:
-                                cur_st.cold_start_prior_cwd = target_canon_cwd
-                        if eff_fb == "auto" and not cur_st.cold_start_prior_checked:
-                            cur_st.cold_start_prior_chunk = discovered_chunk
-                            cur_st.cold_start_prior_checked = True
-                            if discovered_chunk and target_canon_cwd:
-                                cur_st.cold_start_prior_cwd = target_canon_cwd
-
-        with self._lock:
-            cur_st = self._states.get(state_key)
-            prior_hw = (
-                list(cur_st.cold_start_prior_hotwords)
-                if (
-                    cur_st is not None
-                    and eff_fb != "off"
-                    and len(turns_tuple) < COLD_START_SWEET_MIN_TURNS
+                        cur_st is not None
+                        and eff_fb != "off"
+                        and len(turns_tuple) < COLD_START_SWEET_MIN_TURNS
+                    )
+                    else []
                 )
-                else []
-            )
+        finally:
+            with self._lock:
+                self._unpin_state_locked(state_key)
 
         git_status, git_hw = self._get_git_info(eff_cwd) if include_git_info else ("", [])
         repo_stems = self._fallback_workspace_stems(eff_cwd) if (include_git_info and eff_cwd and not git_hw) else []
@@ -5484,6 +5677,7 @@ class SessionTracker:
         with self._lock:
             state = self._states.get(session_key) if session_key else None
             if state is not None and state.is_remote:
+                self._touch_state_locked(session_key)
                 turns_copy = list(state.clean_turns)
                 rem_cwd = state.cwd
                 rem_git_status = state.remote_git_status if include_git_status else ""
@@ -5530,6 +5724,8 @@ class SessionTracker:
             state = self._states.get(session_key) if session_key else None
             if state is None and not eff_ws:
                 return "", [], ""
+            if state is not None:
+                self._touch_state_locked(session_key)
             turns_copy = list(state.clean_turns) if state is not None else []
             cwd = eff_ws or (state.cwd if state is not None else "")
             dialog_chunks = chunk_turns_for_refiner(
@@ -5609,6 +5805,7 @@ class SessionTracker:
             state = self._states.get(session_key)
             if state is None:
                 return "", 0, 0
+            self._touch_state_locked(session_key)
             start_idx = 0 if full else min(state.luna_synced_idx, len(state.clean_turns))
             delta_turns = state.clean_turns[start_idx:]
             sections: list[str] = []
@@ -5634,6 +5831,7 @@ class SessionTracker:
             state = self._states.get(session_key)
             if state is None:
                 return
+            self._touch_state_locked(session_key)
             if generation is not None and state.generation != generation:
                 return
             state.luna_synced_idx = max(0, min(synced_idx, len(state.clean_turns)))

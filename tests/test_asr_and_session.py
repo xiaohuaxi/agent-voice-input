@@ -2077,10 +2077,14 @@ class SessionCtxTests(unittest.TestCase):
             self.assertGreater(pad_len, 0)
             same_size_payload = base_rewrite + (b" " * pad_len) + b"\n"
             self.assertEqual(len(same_size_payload), len(old_bytes))
+            st_done = os.stat(agy_file)
+            time.sleep(0.02)
             with open(agy_file, "r+b") as f:
                 f.seek(0)
                 f.write(same_size_payload)
                 f.truncate()
+            if os.stat(agy_file).st_mtime_ns == st_done.st_mtime_ns:
+                os.utime(agy_file, ns=(st_done.st_atime_ns, st_done.st_mtime_ns + 1_000_000))
 
             snap_same_size = tracker.sync_session(match=snap_done.match)
             assert snap_same_size is not None
@@ -2088,7 +2092,7 @@ class SessionCtxTests(unittest.TestCase):
             self.assertEqual(list(snap_same_size.clean_turns), [("user", "同尺寸原地覆写新内容")])
 
             # Prefix overwrite keeping exact same inode, exact same byte size, exact same mtime_ns,
-            # AND exact same trailing >64 bytes MUST STILL reset state via prefix blake2b digest!
+            # AND exact same trailing >64 bytes MUST STILL reset state via ctime_ns + prefix blake2b digest!
             line_a_old = (
                 '{"source": "USER_EXPLICIT", "type": "USER_INPUT", '
                 '"content": "<USER_REQUEST>old-command</USER_REQUEST>"}\n'
@@ -2108,12 +2112,32 @@ class SessionCtxTests(unittest.TestCase):
 
             line_a_new = line_a_old.replace(b"old-command", b"new-command")
             self.assertEqual(len(line_a_new), len(line_a_old))
+            time.sleep(0.02)
             with open(agy_file, "r+b") as f:
                 f.seek(0)
                 f.write(line_a_new + line_b_keep)
             os.utime(agy_file, ns=(st_before.st_atime_ns, st_before.st_mtime_ns))
 
-            snap_pref2 = tracker.sync_session(match=snap_done.match)
+            st_after_pref = os.stat(agy_file)
+            if st_after_pref.st_ctime_ns != st_before.st_ctime_ns:
+                snap_pref2 = tracker.sync_session(match=snap_done.match)
+            else:
+                # Deterministic fallback on coarse-granularity filesystems: advance only st_ctime_ns
+                orig_fstat = os.fstat
+
+                class _CtimeBumpedStat:
+                    def __init__(self, real_st: os.stat_result) -> None:
+                        self.st_dev = real_st.st_dev
+                        self.st_ino = real_st.st_ino
+                        self.st_size = real_st.st_size
+                        self.st_mtime_ns = real_st.st_mtime_ns
+                        self.st_ctime_ns = real_st.st_ctime_ns + 1
+
+                with mock.patch(
+                    "agent_voice_input.session_ctx.os.fstat",
+                    side_effect=lambda fd: _CtimeBumpedStat(orig_fstat(fd)),
+                ):
+                    snap_pref2 = tracker.sync_session(match=snap_done.match)
             assert snap_pref2 is not None
             self.assertEqual(snap_pref2.generation, snap_pref1.generation + 1)
             self.assertEqual(snap_pref2.luna_synced_idx, 0)

@@ -210,12 +210,28 @@ def read_redacted_log_tail(
 ) -> str:
     """Read newly appended regular-file log lines since ``start_offset`` with secret redaction."""
     try:
-        st = os.lstat(log_path)
-        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+        target_path = log_path
+        st: os.stat_result | None = None
+        try:
+            cand_st = os.lstat(target_path)
+            if stat.S_ISREG(cand_st.st_mode):
+                st = cand_st
+        except OSError:
+            st = None
+        if (st is None or st.st_size <= 0) and start_offset < 0:
+            backup_path = log_path.with_name(f"{log_path.name}.1")
+            try:
+                bst = os.lstat(backup_path)
+                if stat.S_ISREG(bst.st_mode) and bst.st_size > 0:
+                    target_path = backup_path
+                    st = bst
+            except OSError:
+                pass
+        if st is None or st.st_size <= 0:
             return ""
         base = start_offset if 0 <= start_offset < st.st_size else max(0, st.st_size - max_bytes)
         seek_pos = max(base, st.st_size - max(256, int(max_bytes)))
-        with open(log_path, "rb") as f:
+        with open(target_path, "rb") as f:
             if seek_pos > 0:
                 f.seek(seek_pos)
             raw = f.read()
