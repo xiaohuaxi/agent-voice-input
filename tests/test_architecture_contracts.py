@@ -824,6 +824,25 @@ class TestHudCrossPlatformContracts(unittest.TestCase):
         self.assertIn(" to end)", self.mac_swift)
         self.assertNotIn(" to finish)", self.mac_swift)
 
+        # Hold-to-cancel bilingual preview hint + cancellable state set + real-time FSM parity across all three ends
+        zh_hold, en_hold = hud_mod.HOLD_CANCEL_HINT_COPY
+        self.assertEqual(hud_mod.format_hold_cancel_hint("zh"), zh_hold)
+        self.assertEqual(hud_mod.format_hold_cancel_hint("en"), en_hold)
+        self.assertIn(zh_hold, self.mac_swift)
+        self.assertIn(en_hold, self.mac_swift)
+        self.assertIn(r"\u7EE7\u7EED\u6309\u4F4F\u53D6\u6D88\u2026", self.win_ps1)
+        self.assertIn(r"keep holding to cancel\u2026", self.win_ps1)
+        self.assertIn("OnHoldCancelTimeout", self.win_ps1)
+        self.assertIn("onHoldCancelTimeout", self.mac_swift)
+        self.assertIn("PruneStaleOtherKeys", self.win_ps1)
+        self.assertIn("hasAnyNonModifierKeyPhysicallyDown", self.mac_swift)
+        self.assertIn("preserveHoldPreview", self.win_ps1)
+        self.assertIn("HoldCancelMs", self.win_ps1)
+        self.assertIn("--hold-cancel-ms", self.mac_swift)
+        self.assertIn("RunHotkeyFsmSelfCheck", self.win_ps1)
+        self.assertIn("hotkey_fsm_checks", self.win_ps1)
+        self.assertIn("hotkey_fsm_checks", self.mac_swift)
+
 
 class TestProviderCompletenessContracts(unittest.TestCase):
     def test_asr_providers_complete_across_models_credentials_and_factory(self) -> None:

@@ -904,6 +904,16 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertIn('st == "cancelled"', shim)
         self.assertIn('"hold_cancel"', shim)
         self.assertIn('$op -eq "key_state"', shim)
+        from agent_voice_input.hud import (
+            CANCELLABLE_HUD_STATES,
+            HOLD_CANCEL_HINT_COPY,
+            format_hold_cancel_hint,
+        )
+        self.assertEqual(CANCELLABLE_HUD_STATES, frozenset({"recording", "recognizing", "processing", "refining"}))
+        self.assertEqual(format_hold_cancel_hint("zh"), HOLD_CANCEL_HINT_COPY[0])
+        self.assertEqual(format_hold_cancel_hint("en"), HOLD_CANCEL_HINT_COPY[1])
+        self.assertEqual(format_hold_cancel_hint("zh"), "继续按住取消…")
+        self.assertEqual(format_hold_cancel_hint("en"), "keep holding to cancel…")
         self.assertEqual(format_hud_text("cancelled", "zh"), "○ 已取消")
         self.assertEqual(format_hud_text("cancelled", "en"), "○ Cancelled")
         self.assertEqual(default_hud_duration_ms("cancelled"), 1600)

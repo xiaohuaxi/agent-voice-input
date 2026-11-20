@@ -317,24 +317,34 @@ class RemoteConfig:
         return None
 
 
+MIN_TAP_MAX_MS: int = 50
+DEFAULT_TAP_MAX_MS: int = 500
+DEFAULT_HOLD_CANCEL_MS: int = 800
+DEFAULT_HOLD_HINT_MS: int = 250
+DEFAULT_HOLD_DEADZONE_MS: int = 300
+
+
 @dataclass
 class HotkeyConfig:
     key: str = "RControl"
     trigger_mode: str = "tap_toggle"
-    tap_max_ms: int = 1200
+    tap_max_ms: int = DEFAULT_TAP_MAX_MS
+    hold_cancel_ms: int = DEFAULT_HOLD_CANCEL_MS
     debounce_ms: int = 180
     scope: str = "all"
     yield_remote_desktop: bool = True
     ignore_apps: tuple[str, ...] = ()
+    _hold_cancel_ms_explicit: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __init__(
         self,
         key: str = "RControl",
         trigger_mode: str = "tap_toggle",
-        tap_max_ms: int = 1200,
+        tap_max_ms: int = DEFAULT_TAP_MAX_MS,
         debounce_ms: int = 180,
         only_in_terminals: Any = _UNSET,
         *,
+        hold_cancel_ms: Any = _UNSET,
         scope: Any = _UNSET,
         yield_remote_desktop: bool = True,
         ignore_apps: tuple[str, ...] = (),
@@ -342,6 +352,12 @@ class HotkeyConfig:
         self.key = key
         self.trigger_mode = trigger_mode
         self.tap_max_ms = tap_max_ms
+        if hold_cancel_ms is _UNSET or hold_cancel_ms is None:
+            self.hold_cancel_ms = DEFAULT_HOLD_CANCEL_MS
+            self._hold_cancel_ms_explicit = False
+        else:
+            self.hold_cancel_ms = hold_cancel_ms
+            self._hold_cancel_ms_explicit = True
         self.debounce_ms = debounce_ms
         self.yield_remote_desktop = yield_remote_desktop
         self.ignore_apps = (
@@ -357,6 +373,22 @@ class HotkeyConfig:
             self.scope = "terminals" if only_in_terminals else "all"
         else:
             self.scope = "all"
+
+    def effective_hold_cancel_ms(self) -> int:
+        if self.hold_cancel_ms <= 0:
+            return 0
+        eff_tap = max(MIN_TAP_MAX_MS, self.tap_max_ms)
+        if not self._hold_cancel_ms_explicit:
+            return max(self.hold_cancel_ms, eff_tap + DEFAULT_HOLD_DEADZONE_MS)
+        if self.hold_cancel_ms <= eff_tap:
+            return eff_tap + DEFAULT_HOLD_DEADZONE_MS
+        return self.hold_cancel_ms
+
+    def effective_hold_hint_ms(self) -> int:
+        hc = self.effective_hold_cancel_ms()
+        if hc <= 1:
+            return 0
+        return min(DEFAULT_HOLD_HINT_MS, hc // 2)
 
     @property
     def only_in_terminals(self) -> bool:
@@ -1690,6 +1722,9 @@ def _apply_hotkey_section(cfg: Config, hk: Any) -> None:
             cfg.hotkey.trigger_mode = _as_str(v, "hotkey.trigger_mode").strip().lower()
         elif k == "tap_max_ms":
             cfg.hotkey.tap_max_ms = _as_int(v, "hotkey.tap_max_ms")
+        elif k == "hold_cancel_ms":
+            cfg.hotkey.hold_cancel_ms = _as_int(v, "hotkey.hold_cancel_ms")
+            cfg.hotkey._hold_cancel_ms_explicit = True
         elif k == "debounce_ms":
             cfg.hotkey.debounce_ms = _as_int(v, "hotkey.debounce_ms")
         elif k == "scope":
@@ -2106,8 +2141,29 @@ def _validate_hotkey_config(cfg: Config) -> None:
             f"hotkey.trigger_mode must be one of {sorted(VALID_TRIGGER_MODES)}, "
             f"got {cfg.hotkey.trigger_mode!r}"
         )
-    if cfg.hotkey.tap_max_ms <= 0:
-        raise ConfigError("hotkey.tap_max_ms must be > 0")
+    if (
+        isinstance(cfg.hotkey.tap_max_ms, bool)
+        or not isinstance(cfg.hotkey.tap_max_ms, int)
+        or cfg.hotkey.tap_max_ms < MIN_TAP_MAX_MS
+    ):
+        raise ConfigError(f"hotkey.tap_max_ms must be >= {MIN_TAP_MAX_MS}")
+    if (
+        isinstance(cfg.hotkey.hold_cancel_ms, bool)
+        or not isinstance(cfg.hotkey.hold_cancel_ms, int)
+        or cfg.hotkey.hold_cancel_ms < 0
+    ):
+        raise ConfigError("hotkey.hold_cancel_ms must be >= 0")
+    if cfg.hotkey.hold_cancel_ms > 0:
+        if cfg.hotkey._hold_cancel_ms_explicit:
+            if cfg.hotkey.hold_cancel_ms <= cfg.hotkey.tap_max_ms:
+                raise ConfigError(
+                    "hotkey.hold_cancel_ms must be 0 (disabled) or > hotkey.tap_max_ms"
+                )
+        else:
+            cfg.hotkey.hold_cancel_ms = max(
+                DEFAULT_HOLD_CANCEL_MS,
+                cfg.hotkey.tap_max_ms + DEFAULT_HOLD_DEADZONE_MS,
+            )
     if cfg.hotkey.debounce_ms < 0:
         raise ConfigError("hotkey.debounce_ms must be >= 0")
     if not isinstance(cfg.hotkey.scope, str) or cfg.hotkey.scope not in VALID_HOTKEY_SCOPES:

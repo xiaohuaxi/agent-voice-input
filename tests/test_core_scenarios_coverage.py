@@ -767,7 +767,7 @@ class TestConfigTomlAndValidationScenarios(unittest.TestCase):
             ({"hotkey": {"bad_opt": 1}}, "unknown hotkey option"),
             ({"hotkey": {"key": "   "}}, "hotkey.key must not be empty"),
             ({"hotkey": {"trigger_mode": "hold"}}, "hotkey.trigger_mode"),
-            ({"hotkey": {"tap_max_ms": 0}}, "hotkey.tap_max_ms must be > 0"),
+            ({"hotkey": {"tap_max_ms": 0}}, "hotkey.tap_max_ms must be >= 50"),
             ({"hotkey": {"debounce_ms": -5}}, "hotkey.debounce_ms must be >= 0"),
             ({"hotkey": {"debounce_ms": "1_00"}}, "NEVER_RAISE"),  # valid string int check below
             ({"hotkey": {"scope": "desktop"}}, "hotkey.scope"),

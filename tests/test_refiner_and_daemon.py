@@ -7930,8 +7930,9 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                 self.assertEqual(r_idle_hc["ignored"], "not_inflight")
 
                 # 2. #1 in Stage 2 + #2 actively recording:
-                #    - hold_cancel during recording is ignored ('not_inflight') so user never loses active recording;
-                #    - explicit cancel without --seq cancels ONLY recording #2, restores 'refining' + toast, and #1 delivers!
+                #    - explicit only_inflight=True still ignores while recording ('not_inflight');
+                #    - hold_cancel uses layered cancel: cancels ONLY active recording #2, restores 'refining' + toast,
+                #      never stashes cancelled recording in failed/, and lets #1 deliver!
                 daemon.handle_trigger("toggle")
                 daemon._last_trigger_ts = -1e9
                 r_u1 = daemon.handle_trigger("toggle")
@@ -7941,13 +7942,13 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                 r_u2_rec = daemon.handle_trigger("toggle")
                 self.assertEqual(daemon.state, "recording")
 
-                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 1500})
-                self.assertEqual(daemon.state, "recording", "hold_cancel must NOT cancel active recording")
+                r_only_inf = daemon.handle_cancel(only_inflight=True)
+                self.assertFalse(r_only_inf["ok"])
+                self.assertEqual(r_only_inf["ignored"], "not_inflight")
+                self.assertEqual(daemon.state, "recording")
 
-                c_rec = daemon.handle_cancel()
-                self.assertTrue(c_rec["ok"])
-                self.assertEqual(c_rec["cancelled_recording"], r_u2_rec["seq_id"])
-                self.assertEqual(c_rec["state"], "refining")
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 800})
+                self.assertEqual(daemon.state, "refining")
                 self.assertEqual(daemon._main_hud_state, "refining")
                 self.assertEqual(plat.hud_events[-1]["state"], "cancelled")
                 self.assertIs(plat.hud_events[-1].get("clear_main"), False)
@@ -8035,6 +8036,232 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                 unstoppable_hang.set()
                 daemon.close()
                 srv_th.join(timeout=2.0)
+
+    def test_hold_cancel_full_state_matrix_layered_yield_and_pre_paste_intercept(self) -> None:
+        from agent_voice_input.audio_proc import list_failed_audios
+        from agent_voice_input.http_transport import sleep_cooperative
+        from agent_voice_input.refiner import BaseRefiner
+
+        refine_entered = threading.Event()
+        refine_gate = threading.Event()
+        deliver_wait_entered = threading.Event()
+        deliver_exited = threading.Event()
+        mode_box = ["hold_refine"]
+
+        class _MatrixPlatform(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.start_count = 0
+                self.cancel_rec_count = 0
+                self.pasted_texts: list[str] = []
+
+            def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
+                _ = (loopback, seq_id)
+                self.start_count += 1
+                super().start_recording(runtime_dir)
+
+            def cancel_recording(self) -> None:
+                self.cancel_rec_count += 1
+                super().cancel_recording()
+
+            def stop_recording(self, drain: bool = True) -> tuple[bytes, str]:
+                _ = drain
+                return _voiced_wav(), "winmm"
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                is_cancelled: object = None,
+                before_clipboard_write: object = None,
+                before_commit: object = None,
+                **_kw: object,
+            ) -> PasteOutcome:
+                if callable(before_clipboard_write):
+                    before_clipboard_write()
+                cancelled_fn = (lambda: bool(is_cancelled())) if callable(is_cancelled) else (lambda: False)
+                if mode_box[0] == "pre_paste_wait":
+                    deliver_wait_entered.set()
+                    # Simulate waiting in key_state release loop while user holds hotkey toward 800ms
+                    sleep_cooperative(2.0, sleep_fn=time.sleep, is_cancelled=cancelled_fn)
+                    deliver_exited.set()
+                if cancelled_fn() or (callable(before_commit) and not before_commit()):
+                    return PasteOutcome(False, False, "cancelled", "")
+                self.pasted_texts.append(text)
+                self.deliveries.append((text, seq_id, target_hwnd))
+                return PasteOutcome(True, True, "ok", "WindowsTerminal", used_clipboard_paste=True)
+
+        class _MatrixAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                pass
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, *, cancel_token: object = None, **_kw: object) -> AsrResult:
+                return AsrResult(text="测试语音内容", provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
+
+        class _MatrixRefiner(BaseRefiner):
+            provider_name = "codex"
+
+            def refine(self, asr_input: object, *, cancel_token: object = None, **_kw: object) -> RefinerResult:
+                raw = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                if mode_box[0] == "hold_refine":
+                    ev = threading.Event()
+                    if cancel_token is not None:
+                        getattr(cancel_token, "bind_event")(ev)
+                    refine_entered.set()
+                    while not ev.is_set() and not refine_gate.is_set():
+                        ev.wait(timeout=0.05)
+                    if cancel_token is not None and getattr(cancel_token, "is_cancelled")():
+                        return RefinerResult(text=raw, provider="codex", model="gpt-6-luna", latency_ms=5, used_fallback="cancelled")
+                return RefinerResult(text=f"精修:{raw}", provider="codex", model="gpt-6-luna", latency_ms=5)
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir()
+            plat = _MatrixPlatform()
+            cfg = Config(
+                hotkey=HotkeyConfig(debounce_ms=0, scope="all", yield_remote_desktop=True),
+                refiner=RefinerConfig(provider="codex"),
+            )
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_MatrixAsr(),
+                refiner=_MatrixRefiner(),
+                tracker=_isolated_tracker(rt),
+                paste_settle_sec=0.0,
+            )
+            try:
+                # 1) idle + hold_cancel -> completely silent, no mic open, no HUD emitted
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 800, "process": "WindowsTerminal"})
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(plat.start_count, 0)
+                self.assertEqual(plat.hud_events, [])
+                self.assertEqual(list_failed_audios(rt), [])
+
+                # 2) recording only + hold_cancel (even when focus moved to yielded remote desktop mstsc!)
+                #    -> active recording MUST bypass yield, cancel recording, discard audio (no failed/), show cancelled toast
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                self.assertEqual(daemon.state, "recording")
+                self.assertEqual(plat.start_count, 1)
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 800, "process": "mstsc.exe", "title": "Remote"})
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(plat.cancel_rec_count, 1)
+                self.assertEqual(plat.hud_events[-1]["state"], "cancelled")
+                self.assertIs(plat.hud_events[-1].get("clear_main"), True)
+                self.assertEqual(list_failed_audios(rt), [])
+
+                # 3) inflight only + hold_cancel:
+                #    - first verify non-recording hold_cancel in yielded remote desktop IS yielded;
+                #    - then hold_cancel in normal window cancels inflight, never opens mic, stashes voiced WAV in failed/
+                refine_entered.clear()
+                refine_gate.clear()
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                self.assertTrue(refine_entered.wait(timeout=2.0))
+                starts_before_hc = plat.start_count
+
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 800, "process": "mstsc.exe", "title": "Remote"})
+                self.assertEqual(daemon.state, "refining", "non-recording hold_cancel in mstsc should still yield")
+
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 800, "process": "WindowsTerminal", "title": "term"})
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(plat.start_count, starts_before_hc, "hold_cancel must never trigger new recording")
+                self.assertEqual(plat.hud_events[-1]["state"], "cancelled")
+                self.assertIs(plat.hud_events[-1].get("clear_main"), True)
+                self.assertEqual(len(list_failed_audios(rt)), 1)
+
+                # 4) recording + inflight: two consecutive hold_cancel events perform layered cancel
+                refine_entered.clear()
+                refine_gate.clear()
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                self.assertTrue(refine_entered.wait(timeout=2.0))
+                # Start back-to-back recording #2 while #1 is refining
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                self.assertEqual(daemon.state, "recording")
+                failed_before_layered = len(list_failed_audios(rt))
+
+                # First hold_cancel cancels ONLY recording #2, restores 'refining' main pill + toast, no new failed/ WAV
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 800, "process": "WindowsTerminal"})
+                self.assertEqual(daemon.state, "refining")
+                self.assertEqual(daemon._main_hud_state, "refining")
+                self.assertEqual(plat.hud_events[-1]["state"], "cancelled")
+                self.assertIs(plat.hud_events[-1].get("clear_main"), False)
+                self.assertEqual(len(list_failed_audios(rt)), failed_before_layered)
+
+                # Second hold_cancel cancels background refining #1, stashes its WAV in failed/, transitions to idle
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 800, "process": "WindowsTerminal"})
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(plat.hud_events[-1]["state"], "cancelled")
+                self.assertIs(plat.hud_events[-1].get("clear_main"), True)
+                self.assertEqual(len(list_failed_audios(rt)), failed_before_layered + 1)
+
+                # 5) Pre-paste key-release wait intercept: hold_cancel aborts delivery immediately (<200ms)
+                mode_box[0] = "pre_paste_wait"
+                deliver_wait_entered.clear()
+                deliver_exited.clear()
+                failed_before_paste = len(list_failed_audios(rt))
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                self.assertTrue(deliver_wait_entered.wait(timeout=2.0))
+
+                t_hc0 = time.monotonic()
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 800, "process": "WindowsTerminal"})
+                self.assertTrue(deliver_exited.wait(timeout=1.0))
+                self.assertLess((time.monotonic() - t_hc0) * 1000.0, 250.0)
+                dl_idle = time.monotonic() + 2.0
+                while time.monotonic() < dl_idle and daemon.state != "idle":
+                    time.sleep(0.01)
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(plat.pasted_texts, [], "intercepted utterance must never paste")
+                self.assertEqual(len(list_failed_audios(rt)), failed_before_paste + 1)
+
+                # 6) Critical-section yield atomicity: if recording finishes while hold_cancel from a yielded
+                #    remote-desktop window is waiting on _trigger_lock, hold_cancel MUST yield inside the lock
+                #    instead of cancelling the earlier background refining task!
+                mode_box[0] = "hold_refine"
+                refine_entered.clear()
+                refine_gate.clear()
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                self.assertTrue(refine_entered.wait(timeout=2.0))
+                daemon.handle_trigger("toggle", ForegroundWindow(hwnd=1, process="WindowsTerminal", title="term"), from_hotkey=True)
+                self.assertEqual(daemon.state, "recording")
+
+                hc_started = threading.Event()
+                hc_done = threading.Event()
+
+                def _late_yield_hc() -> None:
+                    hc_started.set()
+                    daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 800, "process": "mstsc.exe", "title": "Remote"})
+                    hc_done.set()
+
+                with daemon._trigger_lock:
+                    t_hc = threading.Thread(target=_late_yield_hc, daemon=True)
+                    t_hc.start()
+                    self.assertTrue(hc_started.wait(timeout=1.0))
+                    # Give _late_yield_hc a moment to block on _trigger_lock while _recording_active is still True
+                    time.sleep(0.03)
+                    # Simulate active recording auto-ending before hold_cancel enters the critical section
+                    with daemon._lock:
+                        daemon._recording_active = False
+                        daemon._recording_seq_id = -1
+                        daemon._recompute_state_locked()
+                self.assertTrue(hc_done.wait(timeout=2.0))
+                t_hc.join(timeout=1.0)
+                self.assertEqual(daemon.state, "refining", "yielded hold_cancel must not cancel background refining after recording ended")
+                # Cleanly cancel the remaining background refining task
+                daemon._on_platform_event({"event": "hold_cancel", "hold_ms": 800, "process": "WindowsTerminal"})
+                self.assertEqual(daemon.state, "idle")
+            finally:
+                refine_gate.set()
+                daemon.close()
 
     def test_slow_background_hud_never_overwrites_recording_and_drain_hides_main_hud(self) -> None:
         from agent_voice_input.refiner import BaseRefiner

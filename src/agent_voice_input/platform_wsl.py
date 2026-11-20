@@ -153,7 +153,18 @@ def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[st
 def run_key_test(cfg: Config, seconds: int = 10) -> int:
     if not os.path.isfile(POWERSHELL_EXE):
         raise RuntimeError(f"PowerShell not found at {POWERSHELL_EXE}")
-    cmd = [POWERSHELL_EXE, "-NoProfile", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "key-test", "-Hotkey", cfg.hotkey.key, "-TriggerMode", cfg.hotkey.trigger_mode, "-TapMaxMs", str(cfg.hotkey.tap_max_ms), "-DebounceMs", str(cfg.hotkey.debounce_ms), "-Seconds", str(max(1, seconds))]
+    cmd = [
+        POWERSHELL_EXE, "-NoProfile", "-Sta", "-ExecutionPolicy", "Bypass",
+        "-File", to_windows_path(SHIM_SCRIPT),
+        "-Mode", "key-test",
+        "-Hotkey", cfg.hotkey.key,
+        "-TriggerMode", cfg.hotkey.trigger_mode,
+        "-TapMaxMs", str(cfg.hotkey.tap_max_ms),
+        "-HoldCancelMs", str(cfg.hotkey.effective_hold_cancel_ms()),
+        "-HoldHintMs", str(cfg.hotkey.effective_hold_hint_ms()),
+        "-DebounceMs", str(cfg.hotkey.debounce_ms),
+        "-Seconds", str(max(1, seconds)),
+    ]
     return stream_key_test_proc(cmd)
 
 
@@ -274,6 +285,10 @@ class WslPlatform(JsonlShimMixin):
             self.cfg.hotkey.trigger_mode,
             "-TapMaxMs",
             str(self.cfg.hotkey.tap_max_ms),
+            "-HoldCancelMs",
+            str(self.cfg.hotkey.effective_hold_cancel_ms()),
+            "-HoldHintMs",
+            str(self.cfg.hotkey.effective_hold_hint_ms()),
             "-DebounceMs",
             str(self.cfg.hotkey.debounce_ms),
             "-Beep",

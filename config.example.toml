@@ -9,10 +9,14 @@
 # - macOS: RControl (default Right Ctrl, 0x3E / NX_DEVICERCTLKEYMASK) | LControl | ROption/RAlt | RCommand | Fn | F1..F20 | 0xNN
 key = "RControl"
 # Trigger mode:
-# - "tap_toggle": isolated tap toggles recording start/stop (chords such as RControl+C pass through untouched)
+# - "tap_toggle": isolated short tap (<= tap_max_ms) toggles recording start/stop (or starts a back-to-back recording while refining);
+#                 holding the hotkey alone for hold_cancel_ms triggers layered cancel immediately without waiting for release (chords like RControl+C pass through untouched)
 # - "ptt": push-to-talk (hold to speak, release to transcribe; pressing another key cancels)
 trigger_mode = "tap_toggle"
-# tap_max_ms = 1200
+# Maximum isolated tap duration in ms for "tap_toggle" (default 500ms; 500ms..hold_cancel_ms is a silent hesitation deadzone)
+# tap_max_ms = 500
+# Hold-to-cancel threshold in ms for "tap_toggle" (default 800ms, fires immediately while held with a 250ms preview hint; set 0 to disable)
+# hold_cancel_ms = 800
 # debounce_ms = 180
 # Hotkey activation scope for starting new recordings (stopping/canceling an active recording works from any window):
 # - "all" (default): dictate anywhere (terminals bind to active CLI session; IDEs use isolated coding mode; general apps use everyday prose mode)

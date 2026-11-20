@@ -322,6 +322,148 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 load_config(
                     env={"HOME": str(home)},
                     home_dir=home,
+                    cli_overrides={"hotkey.hold_cancel_ms": 800.5},
+                )
+
+    def test_hotkey_hold_cancel_defaults_legacy_alignment_and_validation(self) -> None:
+        from agent_voice_input.config import HotkeyConfig, _validate_hotkey_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cfg_def, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(cfg_def.hotkey.tap_max_ms, 500)
+            self.assertEqual(cfg_def.hotkey.hold_cancel_ms, 800)
+            self.assertEqual(cfg_def.hotkey.effective_hold_cancel_ms(), 800)
+            self.assertEqual(cfg_def.hotkey.effective_hold_hint_ms(), 250)
+
+            # Legacy configs with only a custom tap_max_ms auto-align hold_cancel_ms = max(800, tap_max_ms + 300)
+            legacy_p = home / "legacy.toml"
+            legacy_p.write_text("[hotkey]\ntap_max_ms = 1200\n", encoding="utf-8")
+            cfg_leg, _ = load_config(config_path=legacy_p, env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(cfg_leg.hotkey.tap_max_ms, 1200)
+            self.assertEqual(cfg_leg.hotkey.hold_cancel_ms, 1500)
+            self.assertEqual(cfg_leg.hotkey.effective_hold_cancel_ms(), 1500)
+            self.assertEqual(cfg_leg.hotkey.effective_hold_hint_ms(), 250)
+
+            legacy_mid = home / "legacy_mid.toml"
+            legacy_mid.write_text("[hotkey]\ntap_max_ms = 700\n", encoding="utf-8")
+            cfg_mid, _ = load_config(config_path=legacy_mid, env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(cfg_mid.hotkey.tap_max_ms, 700)
+            self.assertEqual(cfg_mid.hotkey.hold_cancel_ms, 1000)
+            self.assertEqual(cfg_mid.hotkey.effective_hold_cancel_ms(), 1000)
+            self.assertEqual(cfg_mid.hotkey.effective_hold_hint_ms(), 250)
+
+            legacy_short = home / "legacy_short.toml"
+            legacy_short.write_text("[hotkey]\ntap_max_ms = 300\n", encoding="utf-8")
+            cfg_short, _ = load_config(config_path=legacy_short, env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(cfg_short.hotkey.tap_max_ms, 300)
+            self.assertEqual(cfg_short.hotkey.hold_cancel_ms, 800)
+
+            # Direct Python construction with custom tap_max_ms also stays aligned via effective_hold_cancel_ms()
+            self.assertEqual(HotkeyConfig(tap_max_ms=1200).effective_hold_cancel_ms(), 1500)
+            self.assertEqual(HotkeyConfig(tap_max_ms=700).effective_hold_cancel_ms(), 1000)
+            self.assertEqual(HotkeyConfig(tap_max_ms=50, hold_cancel_ms=60).effective_hold_hint_ms(), 30)
+            self.assertEqual(HotkeyConfig(tap_max_ms=100, hold_cancel_ms=80).effective_hold_cancel_ms(), 400)
+
+            # Explicit hold_cancel_ms = 0 disables hold-to-cancel & preview hint
+            cfg_off, _ = load_config(
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={"hotkey.hold_cancel_ms": 0},
+            )
+            self.assertEqual(cfg_off.hotkey.hold_cancel_ms, 0)
+            self.assertEqual(cfg_off.hotkey.effective_hold_cancel_ms(), 0)
+            self.assertEqual(cfg_off.hotkey.effective_hold_hint_ms(), 0)
+
+            # Tight custom thresholds stay aligned with shim lower bound (>=50) and hold_hint_ms < hold_cancel_ms
+            cfg_tight, _ = load_config(
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={"hotkey.tap_max_ms": 50, "hotkey.hold_cancel_ms": 80},
+            )
+            self.assertEqual(cfg_tight.hotkey.tap_max_ms, 50)
+            self.assertEqual(cfg_tight.hotkey.effective_hold_cancel_ms(), 80)
+            self.assertEqual(cfg_tight.hotkey.effective_hold_hint_ms(), 40)
+            self.assertLess(cfg_tight.hotkey.effective_hold_hint_ms(), cfg_tight.hotkey.effective_hold_cancel_ms())
+
+            # tap_max_ms < 50 (e.g. 20 / 49) rejected to match native shim lower bound
+            for bad_tap in (20, 49):
+                with self.assertRaisesRegex(ConfigError, "hotkey.tap_max_ms must be >= 50"):
+                    load_config(
+                        env={"HOME": str(home)},
+                        home_dir=home,
+                        cli_overrides={"hotkey.tap_max_ms": bad_tap},
+                    )
+
+            # Explicit conflicting hold_cancel_ms <= tap_max_ms or negative / bool raises ConfigError
+            with self.assertRaisesRegex(ConfigError, "hotkey.hold_cancel_ms must be 0"):
+                load_config(
+                    env={"HOME": str(home)},
+                    home_dir=home,
+                    cli_overrides={"hotkey.tap_max_ms": 900, "hotkey.hold_cancel_ms": 600},
+                )
+            with self.assertRaisesRegex(ConfigError, "hotkey.hold_cancel_ms must be 0"):
+                load_config(
+                    env={"HOME": str(home)},
+                    home_dir=home,
+                    cli_overrides={"hotkey.tap_max_ms": 500, "hotkey.hold_cancel_ms": 500},
+                )
+            with self.assertRaisesRegex(ConfigError, "hotkey.hold_cancel_ms must be >= 0"):
+                load_config(
+                    env={"HOME": str(home)},
+                    home_dir=home,
+                    cli_overrides={"hotkey.hold_cancel_ms": -1},
+                )
+            with self.assertRaisesRegex(ConfigError, "expected integer, got boolean"):
+                load_config(
+                    env={"HOME": str(home)},
+                    home_dir=home,
+                    cli_overrides={"hotkey.hold_cancel_ms": True},
+                )
+            with self.assertRaisesRegex(ConfigError, "hotkey.hold_cancel_ms must be >= 0"):
+                bad_cfg = Config(hotkey=HotkeyConfig(hold_cancel_ms=True))
+                _validate_hotkey_config(bad_cfg)
+
+            # Verify both platform shim builders forward tap_max_ms / effective hold_cancel_ms / hold_hint_ms
+            from unittest.mock import patch
+            from agent_voice_input.platform_macos import MacOSPlatform
+            from agent_voice_input.platform_wsl import WslPlatform
+
+            for cfg_case, exp_tap, exp_hc, exp_hint in (
+                (cfg_def, "500", "800", "250"),
+                (cfg_leg, "1200", "1500", "250"),
+                (cfg_off, "500", "0", "0"),
+                (cfg_tight, "50", "80", "40"),
+            ):
+                wsl_p = WslPlatform(cfg_case, env={"HOME": str(home)})
+                with (
+                    patch("agent_voice_input.platform_wsl.os.path.isfile", return_value=True),
+                    patch("agent_voice_input.platform_wsl.to_windows_path", return_value=r"C:\shim.ps1"),
+                ):
+                    wcmd = wsl_p._build_shim_cmd()
+                self.assertEqual(wcmd[wcmd.index("-TapMaxMs") + 1], exp_tap)
+                self.assertEqual(wcmd[wcmd.index("-HoldCancelMs") + 1], exp_hc)
+                self.assertEqual(wcmd[wcmd.index("-HoldHintMs") + 1], exp_hint)
+
+                mac_p = MacOSPlatform(cfg_case, env={"HOME": str(home)})
+                with patch(
+                    "agent_voice_input.platform_macos.compile_mac_shim",
+                    return_value=(home / "mac_shim", ""),
+                ):
+                    mcmd = mac_p._build_shim_cmd()
+                self.assertIsNotNone(mcmd)
+                assert mcmd is not None
+                self.assertEqual(mcmd[mcmd.index("--tap-max-ms") + 1], exp_tap)
+                self.assertEqual(mcmd[mcmd.index("--hold-cancel-ms") + 1], exp_hc)
+                self.assertEqual(mcmd[mcmd.index("--hold-hint-ms") + 1], exp_hint)
+
+    def test_rejects_nonfinite_float_and_invalid_effort_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with self.assertRaises(ConfigError):
+                load_config(
+                    env={"HOME": str(home)},
+                    home_dir=home,
                     cli_overrides={"audio.floor_dbfs": float("nan")},
                 )
             # All 9 canonical effort levels are accepted on both stages; bogus values raise ConfigError

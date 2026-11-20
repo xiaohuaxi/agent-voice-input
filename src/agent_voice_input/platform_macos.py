@@ -480,6 +480,8 @@ def run_macos_key_test(
     cmd = [
         str(bin_path), "--mode", "key-test", "--hotkey", cfg.hotkey.key,
         "--trigger-mode", cfg.hotkey.trigger_mode, "--tap-max-ms", str(cfg.hotkey.tap_max_ms),
+        "--hold-cancel-ms", str(cfg.hotkey.effective_hold_cancel_ms()),
+        "--hold-hint-ms", str(cfg.hotkey.effective_hold_hint_ms()),
         "--debounce-ms", str(cfg.hotkey.debounce_ms), "--seconds", str(max(1, seconds)),
     ]
     return stream_key_test_proc(cmd, env=os.environ if env is None else env)
@@ -1011,6 +1013,8 @@ class MacOSPlatform(JsonlShimMixin):
         return [
             str(bin_path), "--mode", "bridge", "--hotkey", self.cfg.hotkey.key,
             "--trigger-mode", self.cfg.hotkey.trigger_mode, "--tap-max-ms", str(self.cfg.hotkey.tap_max_ms),
+            "--hold-cancel-ms", str(self.cfg.hotkey.effective_hold_cancel_ms()),
+            "--hold-hint-ms", str(self.cfg.hotkey.effective_hold_hint_ms()),
             "--debounce-ms", str(self.cfg.hotkey.debounce_ms),
         ]
 

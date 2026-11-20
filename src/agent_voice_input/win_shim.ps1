@@ -1,8 +1,9 @@
 param(
     [string]$Mode = "bridge", [string]$Hotkey = "RControl", [string]$TriggerMode = "tap_toggle",
-    [int]$TapMaxMs = 1200, [int]$DebounceMs = 180, [int]$Seconds = 10, [int]$Beep = 0,
+    [int]$TapMaxMs = 500, [int]$DebounceMs = 180, [int]$Seconds = 10, [int]$Beep = 0,
     [Alias("AllowedTerminals")][string]$AllowedTerminalsCsv = "",
-    [string]$CacheDir = ""
+    [string]$CacheDir = "",
+    [int]$HoldCancelMs = 800, [int]$HoldHintMs = 250
 )
 $ErrorActionPreference = "Stop"
 [Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -24,6 +25,257 @@ using System.Threading;
 using System.Windows.Forms;
 
 public struct ShimEvent { public string Kind, Process, Title, Reason; public uint Vk, Scan; public bool Extended, IsDown, Tainted; public long Hwnd, RecGen; public ulong TsMs; public int GapMs, HoldMs; }
+
+public struct HotkeyAction {
+    public string Kind;
+    public uint Vk, Scan;
+    public bool Extended, IsDown, Tainted;
+    public int HoldMs;
+}
+
+public struct HotkeyStepResult {
+    public List<HotkeyAction> Events;
+    public bool ArmTimers;
+    public bool CancelTimers;
+    public ulong TimerGen;
+    public int HintDelayMs;
+    public int CancelDelayMs;
+    public bool ShowHoldPreview;
+    public bool ClearHoldPreview;
+    public bool ArmPreviewSafetyClear;
+}
+
+public sealed class WinHotkeyEngine {
+    private readonly uint _targetVk;
+    private readonly uint _ignoredCompanionVk;
+    private readonly bool _isPtt;
+    private readonly bool _keyTest;
+    private readonly ulong _tapMaxMs;
+    private readonly ulong _holdCancelMs;
+    private readonly ulong _holdHintMs;
+    private readonly ulong _debounceMs;
+
+    private bool _targetDown = false;
+    private bool _pttActive = false;
+    private bool _chordTainted = false;
+    private bool _holdFired = false;
+    private bool _holdHintShown = false;
+    private bool _hasFiredOnce = false;
+    private ulong _holdGen = 0UL;
+    private ulong _downTick = 0UL;
+    private ulong _lastFireTick = 0UL;
+    private uint _downScan = 0u;
+    private bool _downExt = false;
+    private readonly HashSet<uint> _otherDown = new HashSet<uint>();
+
+    public WinHotkeyEngine(uint targetVk, bool isPtt, int tapMaxMs, int holdCancelMs, int holdHintMs, int debounceMs, bool keyTest) {
+        _targetVk = targetVk;
+        _ignoredCompanionVk = (targetVk == 0xA2u || targetVk == 0xA3u) ? 0x11u : ((targetVk == 0xA4u || targetVk == 0xA5u) ? 0x12u : ((targetVk == 0xA0u || targetVk == 0xA1u) ? 0x10u : 0u));
+        _isPtt = isPtt;
+        _keyTest = keyTest;
+        _tapMaxMs = (ulong)Math.Max(50, tapMaxMs);
+        _debounceMs = (ulong)Math.Max(0, debounceMs);
+        if (holdCancelMs <= 0) {
+            _holdCancelMs = 0UL;
+            _holdHintMs = 0UL;
+        } else {
+            ulong hc = (ulong)holdCancelMs;
+            if (hc <= _tapMaxMs) hc = _tapMaxMs + 300UL;
+            _holdCancelMs = hc;
+            if (holdHintMs <= 0 || _holdCancelMs <= 1UL) {
+                _holdHintMs = 0UL;
+            } else {
+                ulong maxHint = _holdCancelMs / 2UL;
+                _holdHintMs = Math.Min((ulong)holdHintMs, maxHint);
+            }
+        }
+    }
+
+    public uint TargetVk { get { return _targetVk; } }
+    public bool TargetDown { get { return _targetDown; } }
+    public bool PttActive { get { return _pttActive; } }
+    public bool ChordTainted { get { return _chordTainted; } }
+    public bool HoldFired { get { return _holdFired; } }
+    public bool HoldHintShown { get { return _holdHintShown; } }
+    public ulong HoldGen { get { return _holdGen; } }
+    public int OtherDownCount { get { return _otherDown.Count; } }
+    public ulong TapMaxMs { get { return _tapMaxMs; } }
+    public ulong HoldCancelMs { get { return _holdCancelMs; } }
+    public ulong HoldHintMs { get { return _holdHintMs; } }
+
+    private bool DebouncePassed(ulong nowMs) {
+        return !_hasFiredOnce || (nowMs >= _lastFireTick && (nowMs - _lastFireTick) >= _debounceMs);
+    }
+
+    private void PruneStaleOtherKeys(Func<uint, bool> isKeyPhysicallyDown) {
+        if (_otherDown.Count == 0 || isKeyPhysicallyDown == null) return;
+        List<uint> stale = null;
+        foreach (uint k in _otherDown) {
+            if (!isKeyPhysicallyDown(k)) {
+                if (stale == null) stale = new List<uint>();
+                stale.Add(k);
+            }
+        }
+        if (stale != null) {
+            for (int i = 0; i < stale.Count; i++) _otherDown.Remove(stale[i]);
+        }
+    }
+
+    private static void AddEvent(ref HotkeyStepResult res, string kind, uint vk, uint scan, bool ext, bool isDown, bool tainted, int holdMs = 0) {
+        if (res.Events == null) res.Events = new List<HotkeyAction>(2);
+        res.Events.Add(new HotkeyAction { Kind = kind, Vk = vk, Scan = scan, Extended = ext, IsDown = isDown, Tainted = tainted, HoldMs = holdMs });
+    }
+
+    public HotkeyStepResult ProcessKeyEvent(uint vk, uint scan, bool ext, bool isDown, bool isUp, ulong nowMs, Func<uint, bool> isKeyPhysicallyDown = null) {
+        HotkeyStepResult res = new HotkeyStepResult();
+        PruneStaleOtherKeys(isKeyPhysicallyDown);
+        if (_keyTest && (isDown || isUp)) {
+            AddEvent(ref res, "key_event", vk, scan, ext, isDown, _chordTainted);
+        }
+        if (vk == _targetVk) {
+            if (isDown && !_targetDown) {
+                _targetDown = true;
+                _downTick = nowMs;
+                _downScan = scan;
+                _downExt = ext;
+                _holdFired = false;
+                _holdHintShown = false;
+                _holdGen++;
+                _chordTainted = (_otherDown.Count > 0);
+                if (_isPtt) {
+                    if (!_chordTainted && DebouncePassed(nowMs)) {
+                        _lastFireTick = nowMs;
+                        _hasFiredOnce = true;
+                        _pttActive = true;
+                        AddEvent(ref res, "ptt_start", vk, scan, ext, true, false);
+                    }
+                } else if (!_chordTainted && _holdCancelMs > 0UL) {
+                    res.ArmTimers = true;
+                    res.TimerGen = _holdGen;
+                    res.HintDelayMs = (int)_holdHintMs;
+                    res.CancelDelayMs = (int)_holdCancelMs;
+                }
+            } else if (isUp && _targetDown) {
+                _holdGen++;
+                res.CancelTimers = true;
+                bool wasHoldFired = _holdFired;
+                bool wasHintShown = _holdHintShown;
+                if (_isPtt) {
+                    if (_pttActive && !_chordTainted) {
+                        _lastFireTick = nowMs;
+                        _hasFiredOnce = true;
+                        AddEvent(ref res, "ptt_stop", vk, scan, ext, false, false);
+                    }
+                } else if (!wasHoldFired && !_chordTainted && nowMs >= _downTick && DebouncePassed(nowMs)) {
+                    ulong held = nowMs - _downTick;
+                    if (held <= _tapMaxMs) {
+                        _lastFireTick = nowMs;
+                        _hasFiredOnce = true;
+                        AddEvent(ref res, "toggle", vk, scan, ext, false, false);
+                    } else if (_holdCancelMs > 0UL && held >= _holdCancelMs) {
+                        _lastFireTick = nowMs;
+                        _hasFiredOnce = true;
+                        wasHoldFired = true;
+                        AddEvent(ref res, "hold_cancel", vk, scan, ext, false, false, (int)held);
+                    }
+                }
+                if (wasHintShown) {
+                    if (wasHoldFired) res.ArmPreviewSafetyClear = true;
+                    else res.ClearHoldPreview = true;
+                }
+                _targetDown = false;
+                _pttActive = false;
+                _chordTainted = false;
+                _holdFired = false;
+                _holdHintShown = false;
+            }
+        } else if (vk != _ignoredCompanionVk) {
+            if (isDown) _otherDown.Add(vk);
+            else if (isUp) _otherDown.Remove(vk);
+            if (_targetDown && (isDown || isUp)) {
+                _chordTainted = true;
+                _holdGen++;
+                res.CancelTimers = true;
+                if (_holdHintShown) {
+                    _holdHintShown = false;
+                    res.ClearHoldPreview = true;
+                }
+                if (_isPtt && _pttActive) {
+                    _pttActive = false;
+                    AddEvent(ref res, "ptt_cancel", vk, scan, ext, isDown, true);
+                }
+            }
+        }
+        return res;
+    }
+
+    public HotkeyStepResult OnHoldHintTimeout(ulong gen, ulong nowMs, Func<uint, bool> isKeyPhysicallyDown = null) {
+        HotkeyStepResult res = new HotkeyStepResult();
+        if (_isPtt || !_targetDown || _chordTainted || _holdFired || gen != _holdGen || _holdCancelMs == 0UL || _holdHintMs == 0UL) {
+            return res;
+        }
+        PruneStaleOtherKeys(isKeyPhysicallyDown);
+        if (isKeyPhysicallyDown != null && !isKeyPhysicallyDown(_targetVk)) {
+            bool hadHint = _holdHintShown;
+            _targetDown = false; _pttActive = false; _chordTainted = false; _holdFired = false; _holdHintShown = false;
+            _holdGen++;
+            res.CancelTimers = true;
+            if (hadHint) res.ClearHoldPreview = true;
+            return res;
+        }
+        if (_otherDown.Count > 0) {
+            _chordTainted = true;
+            _holdGen++;
+            res.CancelTimers = true;
+            return res;
+        }
+        ulong held = (nowMs >= _downTick) ? (nowMs - _downTick) : 0UL;
+        if (held < _holdHintMs || held >= _holdCancelMs) return res;
+        _holdHintShown = true;
+        res.ShowHoldPreview = true;
+        return res;
+    }
+
+    public HotkeyStepResult OnHoldCancelTimeout(ulong gen, ulong nowMs, Func<uint, bool> isKeyPhysicallyDown = null) {
+        HotkeyStepResult res = new HotkeyStepResult();
+        if (_isPtt || !_targetDown || _chordTainted || _holdFired || gen != _holdGen || _holdCancelMs == 0UL) {
+            return res;
+        }
+        PruneStaleOtherKeys(isKeyPhysicallyDown);
+        if (isKeyPhysicallyDown != null && !isKeyPhysicallyDown(_targetVk)) {
+            bool hadHint = _holdHintShown;
+            _targetDown = false; _pttActive = false; _chordTainted = false; _holdFired = false; _holdHintShown = false;
+            _holdGen++;
+            res.CancelTimers = true;
+            if (hadHint) res.ClearHoldPreview = true;
+            return res;
+        }
+        if (_otherDown.Count > 0) {
+            _chordTainted = true;
+            _holdGen++;
+            res.CancelTimers = true;
+            if (_holdHintShown) { _holdHintShown = false; res.ClearHoldPreview = true; }
+            return res;
+        }
+        ulong held = (nowMs >= _downTick) ? (nowMs - _downTick) : 0UL;
+        if (held < _holdCancelMs) return res;
+        if (!DebouncePassed(nowMs)) {
+            if (_holdHintShown) { _holdHintShown = false; res.ClearHoldPreview = true; }
+            return res;
+        }
+        _holdFired = true;
+        _lastFireTick = nowMs;
+        _hasFiredOnce = true;
+        _holdGen++;
+        res.CancelTimers = true;
+        if (_holdHintShown) {
+            _holdHintShown = false;
+            res.ArmPreviewSafetyClear = true;
+        }
+        AddEvent(ref res, "hold_cancel", _targetVk, _downScan, _downExt, true, false, (int)held);
+        return res;
+    }
+}
 
 [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] internal class MMDeviceEnumeratorComObject { }
 [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -124,8 +376,8 @@ public sealed class HudPillForm : Form {
     private int _frameIdx = 0;
     private long _recStartTick = 0L, _elapsedOverrideSec = -1L;
     private int _maxDurationSec = 0, _warnRemainSec = 0, _bgCount = 0;
-    private bool _isWaveRecording = false, _shown = false;
-    private string _text = "", _position = "bottom", _iconKind = "";
+    private bool _isWaveRecording = false, _shown = false, _holdPreview = false;
+    private string _text = "", _position = "bottom", _iconKind = "", _stateName = "", _lastRenderedHint = "";
     private Color _bgColor = DefaultBgColor, _iconColor = Color.White, _mainColor = Color.White, _hintColor = RecHintColor, _borderColor = Color.Gray;
     private IntPtr _fgHwnd = IntPtr.Zero;
     private Rectangle _anchoredWorkArea = Rectangle.Empty;
@@ -136,6 +388,10 @@ public sealed class HudPillForm : Form {
     public bool IsToast { get { return _isToast; } }
     public bool IsShown { get { return _shown; } }
     public string CurrentText { get { return _text; } }
+    public string CurrentStateName { get { return _stateName; } }
+    public string LastRenderedHint { get { return _lastRenderedHint; } }
+    public bool HoldCancelPreviewActive { get { return _holdPreview; } }
+    public bool CanShowHoldCancelPreview { get { return _shown && !_isToast && !IsDisposed && VoiceWinShim.IsCancellableMainHudState(_stateName); } }
     public int CurrentBgCount { get { return _bgCount; } }
     public int LastAutoHideMs { get { return _lastAutoHideMs; } }
     public int ShowUpdateCount { get { return _showUpdates; } }
@@ -388,12 +644,28 @@ public sealed class HudPillForm : Form {
         base.WndProc(ref m);
     }
     public void HideNoActivate() {
-        _hideTimer.Stop(); _animTimer.Stop(); _isWaveRecording = false; _shown = false;
+        _hideTimer.Stop(); _animTimer.Stop(); _isWaveRecording = false; _shown = false; _holdPreview = false;
+        _stateName = ""; _lastRenderedHint = "";
         _maxDurationSec = 0; _warnRemainSec = 0; _bgCount = 0;
         if (IsHandleCreated) ShowWindow(Handle, 0);
     }
-    public void ShowStatus(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int autoHideMs, IntPtr fgHwnd, string position, bool waveMode = false, string iconKind = "", int maxDurationSec = 0, int warnRemainSec = 0, Rectangle? workAreaOverride = null, int dpiOverride = 0, int bgCount = 0, bool headlessNoShow = false) {
+    public void SetHoldCancelPreview(bool active, bool headlessNoShow = false) {
+        bool target = active && CanShowHoldCancelPreview;
+        if (_holdPreview == target) return;
+        _holdPreview = target;
+        if (!_shown || IsDisposed) return;
+        if (headlessNoShow) {
+            int dx, dy; HudLayoutMetrics dm;
+            Rectangle wa = (_anchoredWorkArea.Width > 0 && _anchoredWorkArea.Height > 0) ? _anchoredWorkArea : new Rectangle(0, 0, 1920, 1080);
+            using (Bitmap tmp = BuildPillPArgbBitmap(wa, out dx, out dy, out dm)) { }
+        } else {
+            RenderPill(false);
+        }
+    }
+    public void ShowStatus(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int autoHideMs, IntPtr fgHwnd, string position, bool waveMode = false, string iconKind = "", int maxDurationSec = 0, int warnRemainSec = 0, Rectangle? workAreaOverride = null, int dpiOverride = 0, int bgCount = 0, bool headlessNoShow = false, string stateName = "", bool preserveHoldPreview = false) {
         _hideTimer.Stop();
+        _stateName = (stateName ?? "").Trim().ToLowerInvariant();
+        _holdPreview = preserveHoldPreview && !_isToast && VoiceWinShim.IsCancellableMainHudState(_stateName);
         _text = text ?? ""; _bgColor = bgColor; _iconColor = iconColor; _mainColor = mainColor; _hintColor = hintColor; _borderColor = border;
         _iconKind = iconKind ?? ""; _fgHwnd = fgHwnd; _position = position ?? "bottom";
         _bgCount = (waveMode && !_isToast && bgCount > 0) ? bgCount : 0;
@@ -455,9 +727,11 @@ public sealed class HudPillForm : Form {
         return RenderOffscreenBitmapWithMetrics(text, bgColor, iconColor, mainColor, hintColor, border, dpi, workArea, waveMode, iconKind, barNormsOverride, elapsedSec, maxDurationSec, warnRemainSec, out unused, position, bgCount);
     }
 
-    public Bitmap RenderOffscreenBitmapWithMetrics(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int dpi, Rectangle workArea, bool waveMode, string iconKind, float[] barNormsOverride, long elapsedSec, int maxDurationSec, int warnRemainSec, out HudLayoutMetrics layout, string position = "bottom", int bgCount = 0) {
+    public Bitmap RenderOffscreenBitmapWithMetrics(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int dpi, Rectangle workArea, bool waveMode, string iconKind, float[] barNormsOverride, long elapsedSec, int maxDurationSec, int warnRemainSec, out HudLayoutMetrics layout, string position = "bottom", int bgCount = 0, bool holdCancelPreview = false, string stateName = "") {
         _text = text ?? ""; _bgColor = bgColor; _iconColor = iconColor; _mainColor = mainColor; _hintColor = hintColor; _borderColor = border;
         _iconKind = iconKind ?? ""; _position = position ?? "bottom"; _isWaveRecording = waveMode && !_isToast;
+        _stateName = (stateName ?? "").Trim().ToLowerInvariant();
+        _holdPreview = holdCancelPreview && !_isToast && (string.IsNullOrEmpty(_stateName) || VoiceWinShim.IsCancellableMainHudState(_stateName));
         _maxDurationSec = (_isWaveRecording && maxDurationSec > 0) ? maxDurationSec : 0;
         _warnRemainSec = (_maxDurationSec > 0) ? ((warnRemainSec > 0) ? warnRemainSec : VoiceWinShim.RecordingCountdownWarnSec(_maxDurationSec)) : 0;
         _bgCount = (_isWaveRecording && bgCount > 0) ? bgCount : 0;
@@ -518,7 +792,12 @@ public sealed class HudPillForm : Form {
                 effMain = RecMainColor;
                 effHintCol = RecHintColor;
             }
-            effHint = VoiceWinShim.StripOuterParens(effHint);
+            if (_holdPreview) {
+                effHint = VoiceWinShim.FormatHoldCancelHint(zhHint);
+                effHintCol = WarnHintColor;
+            } else {
+                effHint = VoiceWinShim.StripOuterParens(effHint);
+            }
             durStr = VoiceWinShim.FormatRecordingDuration(elapsedSec);
             string slotTpl = VoiceWinShim.DurationSlotTemplate(elapsedSec);
             Size actDurSz = TextRenderer.MeasureText(durStr, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
@@ -528,7 +807,7 @@ public sealed class HudPillForm : Form {
             if (effHint.Length > 0) {
                 hintSz = TextRenderer.MeasureText(effHint, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
                 hintMeasuredW = hintSz.Width;
-                if (isWarn) {
+                if (isWarn && !_holdPreview) {
                     string hintTpl = VoiceWinShim.StripOuterParens(VoiceWinShim.CountdownHintSlotTemplate((int)remainSec, zhHint));
                     Size tplHintSz = TextRenderer.MeasureText(hintTpl, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
                     hintSlotW = Math.Max(hintSz.Width, tplHintSz.Width);
@@ -551,6 +830,13 @@ public sealed class HudPillForm : Form {
             totalTextW = slotW + gap1 + waveBoxW + gap2 + hintSlotW + badgeGap + badgeSlotW;
             textH = Math.Max(Math.Max(actDurSz.Height, hintSz.Height), badgeH);
         } else {
+            if (_holdPreview) {
+                bool zhHint = (_text.Length > 0) ? HasCjk(_text) : _cjkFont;
+                hintSeg = "(" + VoiceWinShim.FormatHoldCancelHint(zhHint) + ")";
+                spBeforeHint = true;
+                effHintCol = WarnHintColor;
+                effHint = hintSeg;
+            }
             iconBox = (iconSeg.Length > 0 || (_isToast && !string.IsNullOrEmpty(_iconKind))) ? ScalePx(11) : 0;
             mainSz = (mainSeg.Length > 0) ? TextRenderer.MeasureText(mainSeg, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags) : Size.Empty;
             hintSz = (hintSeg.Length > 0) ? TextRenderer.MeasureText(hintSeg, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags) : Size.Empty;
@@ -559,6 +845,7 @@ public sealed class HudPillForm : Form {
             totalTextW = iconBox + iconGap + mainSz.Width + hintGap + hintSz.Width;
             textH = Math.Max(iconBox, Math.Max(mainSz.Height, hintSz.Height));
         }
+        _lastRenderedHint = effHint;
         if (textH <= 0) textH = TextRenderer.MeasureText("Ag", _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags).Height;
 
         int rawW = Math.Max(minW, totalTextW + padL + padR);
@@ -858,10 +1145,13 @@ public static class VoiceWinShim {
     private static int _headlessDefaultDpi = 96;
     private static string _hotkeyLabel = "\u53F3 Ctrl";
     private static readonly Dictionary<string, SoundPlayer> _tones = new Dictionary<string, SoundPlayer>(StringComparer.OrdinalIgnoreCase);
-    private static uint _mainTid = 0, _targetVk = 0xA3, _ignoredCompanionVk = 0x11;
-    private static ulong _tapMaxMs = 1200, _debounceMs = 180, _downTick = 0, _lastFireTick = 0;
-    private static bool _isPtt = false, _keyTest = false, _hasQuitTimer = false, _targetDown = false, _pttActive = false, _chordTainted = false;
-    private static readonly HashSet<uint> _otherDown = new HashSet<uint>();
+    private static uint _mainTid = 0, _targetVk = 0xA3;
+    private static bool _isPtt = false, _keyTest = false, _hasQuitTimer = false;
+    private static WinHotkeyEngine _hotkeyEngine = null;
+    private static System.Windows.Forms.Timer _holdHintTimer = null;
+    private static System.Windows.Forms.Timer _holdCancelTimer = null;
+    private static System.Windows.Forms.Timer _holdPreviewSafetyTimer = null;
+    private static ulong _armedTimerGen = 0UL;
     private static readonly Dictionary<string, uint> _keyMap = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase) {
         {"rcontrol",0xA3},{"rctrl",0xA3},{"lcontrol",0xA2},{"lctrl",0xA2},{"ralt",0xA5},{"rmenu",0xA5},
         {"lalt",0xA4},{"lmenu",0xA4},{"rshift",0xA1},{"lshift",0xA0},{"capslock",0x14},{"scrolllock",0x91},
@@ -1106,6 +1396,15 @@ public static class VoiceWinShim {
         return 0f;
     }
 
+    public static bool IsCancellableMainHudState(string st) {
+        string s = (st ?? "").Trim().ToLowerInvariant();
+        return s == "recording" || s == "recognizing" || s == "processing" || s == "refining";
+    }
+
+    public static string FormatHoldCancelHint(bool zh) {
+        return zh ? "\u7EE7\u7EED\u6309\u4F4F\u53D6\u6D88\u2026" : "keep holding to cancel\u2026";
+    }
+
     public static string ResolveHudLayer(string st, string explicitLayer) {
         if (st == "" || st == "idle" || st == "hide" || st == "hide_toast" || st == "hide_all") return "control";
         string lyr = (explicitLayer ?? "").Trim().ToLowerInvariant();
@@ -1197,19 +1496,41 @@ public static class VoiceWinShim {
         return RenderHudSnapshotWithMetrics(state, customText, dpi, workWidth, workHeight, barNorms, out unused, elapsedSec, maxDurationSec, warnRemainSec, zh, isToast, bgCount);
     }
 
-    public static Bitmap RenderHudSnapshotWithMetrics(string state, string customText, int dpi, int workWidth, int workHeight, float[] barNorms, out HudLayoutMetrics layout, long elapsedSec = 0L, int maxDurationSec = 0, int warnRemainSec = 0, bool zh = true, bool isToast = false, int bgCount = 0) {
+    public static Bitmap RenderHudSnapshotWithMetrics(string state, string customText, int dpi, int workWidth, int workHeight, float[] barNorms, out HudLayoutMetrics layout, long elapsedSec = 0L, int maxDurationSec = 0, int warnRemainSec = 0, bool zh = true, bool isToast = false, int bgCount = 0, bool holdCancelPreview = false) {
         string st = (state ?? "error").Trim().ToLowerInvariant();
         string txt, iconKind; Color bg, ic, mc, hc, bd; int ms; bool waveMode;
         ResolveHudVisualStyle(st, zh, customText, isToast, out txt, out bg, out ic, out mc, out hc, out bd, out ms, out waveMode, out iconKind);
         using (HudPillForm f = new HudPillForm(isToast)) {
-            return f.RenderOffscreenBitmapWithMetrics(txt, bg, ic, mc, hc, bd, dpi, new Rectangle(0, 0, workWidth, workHeight), waveMode, iconKind, barNorms, elapsedSec, maxDurationSec, warnRemainSec, out layout, "bottom", bgCount);
+            return f.RenderOffscreenBitmapWithMetrics(txt, bg, ic, mc, hc, bd, dpi, new Rectangle(0, 0, workWidth, workHeight), waveMode, iconKind, barNorms, elapsedSec, maxDurationSec, warnRemainSec, out layout, "bottom", bgCount, holdCancelPreview, st);
         }
+    }
+
+    private static void StopHoldPreviewSafetyTimer() {
+        if (_holdPreviewSafetyTimer != null) { try { _holdPreviewSafetyTimer.Stop(); } catch { } }
+    }
+
+    private static void ArmHoldPreviewSafetyTimer() {
+        if (_headlessHudMode) return;
+        if (_holdPreviewSafetyTimer == null) {
+            _holdPreviewSafetyTimer = new System.Windows.Forms.Timer();
+            _holdPreviewSafetyTimer.Interval = 400;
+            _holdPreviewSafetyTimer.Tick += (s, e) => {
+                StopHoldPreviewSafetyTimer();
+                if (_hud != null && !_hud.IsDisposed && _hud.HoldCancelPreviewActive) {
+                    _hud.SetHoldCancelPreview(false, _headlessHudMode);
+                }
+            };
+        }
+        _holdPreviewSafetyTimer.Stop();
+        _holdPreviewSafetyTimer.Interval = 400;
+        _holdPreviewSafetyTimer.Start();
     }
 
     public static void UpdateHud(string state, string customText, int durationMs, string position = "bottom", int maxDurationSec = 0, int warnRemainSec = 0, string layer = "", bool? clearMain = null, bool? clearToast = null, int bgCount = 0) {
         try {
             string st = (state ?? "").Trim().ToLowerInvariant();
             if (st == "" || st == "idle" || st == "hide") {
+                StopHoldPreviewSafetyTimer();
                 if (_hud != null) _hud.HideNoActivate();
                 if (clearToast == true && _toastHud != null) _toastHud.HideNoActivate();
                 return;
@@ -1219,6 +1540,7 @@ public static class VoiceWinShim {
                 return;
             }
             if (st == "hide_all") {
+                StopHoldPreviewSafetyTimer();
                 if (_hud != null) _hud.HideNoActivate();
                 if (_toastHud != null) _toastHud.HideNoActivate();
                 return;
@@ -1232,6 +1554,7 @@ public static class VoiceWinShim {
             bool headless = _headlessHudMode;
             IntPtr fg = headless ? IntPtr.Zero : GetForegroundWindow();
             if (!isToast) {
+                StopHoldPreviewSafetyTimer();
                 bool shouldClearToast = clearToast.HasValue ? clearToast.Value : (st == "recording");
                 if (shouldClearToast && _toastHud != null) _toastHud.HideNoActivate();
                 if (_hud == null || _hud.IsDisposed) _hud = new HudPillForm(false);
@@ -1248,7 +1571,8 @@ public static class VoiceWinShim {
                     inheritWa = _headlessDefaultWa;
                     inheritDpi = _headlessDefaultDpi;
                 }
-                _hud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, fg, position, waveMode, iconKind, maxDurationSec, warnRemainSec, inheritWa, inheritDpi, bgCount, headless);
+                bool keepHoldPreview = (_hotkeyEngine != null && _hotkeyEngine.HoldHintShown && !_hotkeyEngine.HoldFired && IsCancellableMainHudState(st));
+                _hud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, fg, position, waveMode, iconKind, maxDurationSec, warnRemainSec, inheritWa, inheritDpi, bgCount, headless, st, keepHoldPreview);
                 if (!shouldClearToast && _toastHud != null && !_toastHud.IsDisposed && _toastHud.IsShown) {
                     _toastHud.SyncAnchor(_hud.AnchoredWorkArea, _hud.AnchoredDpi, position, headless);
                 }
@@ -1265,9 +1589,12 @@ public static class VoiceWinShim {
                     anchorWa = _headlessDefaultWa;
                     anchorDpi = _headlessDefaultDpi;
                 }
-                if (clearMain == true && _hud != null) _hud.HideNoActivate();
+                if (clearMain == true) {
+                    StopHoldPreviewSafetyTimer();
+                    if (_hud != null) _hud.HideNoActivate();
+                }
                 if (_toastHud == null || _toastHud.IsDisposed) _toastHud = new HudPillForm(true);
-                _toastHud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, fg, position, false, iconKind, 0, 0, anchorWa, anchorDpi, 0, headless);
+                _toastHud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, fg, position, false, iconKind, 0, 0, anchorWa, anchorDpi, 0, headless, st);
             }
         } catch { }
     }
@@ -1287,6 +1614,72 @@ public static class VoiceWinShim {
         if (_mainTid != 0) PostThreadMessage(_mainTid, WM_APP_WAKE, IntPtr.Zero, IntPtr.Zero);
     }
 
+    private static bool IsVkPhysicallyDown(uint vk) {
+        return vk > 0u && (GetAsyncKeyState((int)vk) & 0x8000) != 0;
+    }
+
+    private static void StopHoldTimers() {
+        if (_holdHintTimer != null) { try { _holdHintTimer.Stop(); } catch { } }
+        if (_holdCancelTimer != null) { try { _holdCancelTimer.Stop(); } catch { } }
+    }
+
+    private static void EnsureHoldTimers() {
+        if (_holdHintTimer == null) {
+            _holdHintTimer = new System.Windows.Forms.Timer();
+            _holdHintTimer.Tick += (s, e) => {
+                _holdHintTimer.Stop();
+                if (_hotkeyEngine == null) return;
+                HotkeyStepResult step = _hotkeyEngine.OnHoldHintTimeout(_armedTimerGen, GetTickCount64(), IsVkPhysicallyDown);
+                ApplyHotkeyStep(step);
+            };
+        }
+        if (_holdCancelTimer == null) {
+            _holdCancelTimer = new System.Windows.Forms.Timer();
+            _holdCancelTimer.Tick += (s, e) => {
+                _holdCancelTimer.Stop();
+                if (_hotkeyEngine == null) return;
+                HotkeyStepResult step = _hotkeyEngine.OnHoldCancelTimeout(_armedTimerGen, GetTickCount64(), IsVkPhysicallyDown);
+                ApplyHotkeyStep(step);
+            };
+        }
+    }
+
+    private static void ApplyHotkeyStep(HotkeyStepResult step) {
+        if (step.CancelTimers) StopHoldTimers();
+        if (step.ArmTimers) {
+            EnsureHoldTimers();
+            StopHoldTimers();
+            _armedTimerGen = step.TimerGen;
+            if (step.HintDelayMs > 0) {
+                _holdHintTimer.Interval = Math.Max(1, step.HintDelayMs);
+                _holdHintTimer.Start();
+            }
+            if (step.CancelDelayMs > 0) {
+                _holdCancelTimer.Interval = Math.Max(1, step.CancelDelayMs);
+                _holdCancelTimer.Start();
+            }
+        }
+        if (step.ClearHoldPreview) {
+            StopHoldPreviewSafetyTimer();
+            if (_hud != null && !_hud.IsDisposed) _hud.SetHoldCancelPreview(false, _headlessHudMode);
+        } else if (step.ShowHoldPreview) {
+            StopHoldPreviewSafetyTimer();
+            if (_hud != null && !_hud.IsDisposed && _hud.CanShowHoldCancelPreview) {
+                _hud.SetHoldCancelPreview(true, _headlessHudMode);
+            }
+        } else if (step.ArmPreviewSafetyClear) {
+            if (_hud != null && !_hud.IsDisposed && _hud.HoldCancelPreviewActive) {
+                ArmHoldPreviewSafetyTimer();
+            }
+        }
+        if (step.Events != null) {
+            for (int i = 0; i < step.Events.Count; i++) {
+                HotkeyAction ev = step.Events[i];
+                EnqueueTrigger(ev.Kind, ev.Vk, ev.Scan, ev.Extended, ev.IsDown, ev.Tainted, ev.HoldMs);
+            }
+        }
+    }
+
     private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam) {
         if (nCode >= 0) {
             KBDLLHOOKSTRUCT kb = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
@@ -1294,38 +1687,25 @@ public static class VoiceWinShim {
                 int msg = wParam.ToInt32();
                 bool isDown = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN), isUp = (msg == WM_KEYUP || msg == WM_SYSKEYUP), ext = (kb.flags & LLKHF_EXTENDED) != 0;
                 uint vk = kb.vkCode;
-                if (_keyTest && (isDown || isUp)) {
-                    if (isDown && vk == 0x1B && _mainTid != 0) { PostThreadMessage(_mainTid, WM_QUIT, IntPtr.Zero, IntPtr.Zero); return CallNextHookEx(_hook, nCode, wParam, lParam); }
-                    EnqueueTrigger("key_event", vk, kb.scanCode, ext, isDown, _chordTainted);
+                if (_keyTest && isDown && vk == 0x1B && _mainTid != 0) {
+                    PostThreadMessage(_mainTid, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+                    return CallNextHookEx(_hook, nCode, wParam, lParam);
                 }
-                if (vk == _targetVk) {
-                    ulong now = GetTickCount64();
-                    if (isDown && !_targetDown) {
-                        _targetDown = true; _downTick = now; _chordTainted = (_otherDown.Count > 0);
-                        if (_isPtt && !_chordTainted && (now - _lastFireTick) >= _debounceMs) { _lastFireTick = now; _pttActive = true; EnqueueTrigger("ptt_start", vk, kb.scanCode, ext, true, false); }
-                    } else if (isUp && _targetDown) {
-                        if (_isPtt) { if (_pttActive && !_chordTainted) { _lastFireTick = now; EnqueueTrigger("ptt_stop", vk, kb.scanCode, ext, false, false); } }
-                        else if (!_chordTainted && (now - _lastFireTick) >= _debounceMs) {
-                            ulong held = (now >= _downTick) ? (now - _downTick) : 0UL;
-                            if (held <= _tapMaxMs) { _lastFireTick = now; EnqueueTrigger("toggle", vk, kb.scanCode, ext, false, false); }
-                            else if (held <= 8000UL) { _lastFireTick = now; EnqueueTrigger("hold_cancel", vk, kb.scanCode, ext, false, false, (int)held); }
-                        }
-                        _targetDown = false; _pttActive = false; _chordTainted = false;
-                    }
-                } else if (vk != _ignoredCompanionVk) {
-                    if (isDown) _otherDown.Add(vk); else if (isUp) _otherDown.Remove(vk);
-                    if (_targetDown && (isDown || isUp)) { _chordTainted = true; if (_isPtt && _pttActive) { _pttActive = false; EnqueueTrigger("ptt_cancel", vk, kb.scanCode, ext, isDown, true); } }
+                if (_hotkeyEngine != null && (isDown || isUp)) {
+                    HotkeyStepResult step = _hotkeyEngine.ProcessKeyEvent(vk, kb.scanCode, ext, isDown, isUp, GetTickCount64(), IsVkPhysicallyDown);
+                    ApplyHotkeyStep(step);
                 }
             }
         }
         return CallNextHookEx(_hook, nCode, wParam, lParam);
     }
 
-    public static void StartHook(uint targetVk, bool isPtt, int tapMaxMs, int debounceMs, bool keyTest, int timerMs) {
+    public static void StartHook(uint targetVk, bool isPtt, int tapMaxMs, int debounceMs, bool keyTest, int timerMs, int holdCancelMs = 800, int holdHintMs = 250) {
         _mainTid = GetCurrentThreadId(); MSG initMsg; PeekMessage(out initMsg, IntPtr.Zero, 0, 0, 0);
         _targetVk = targetVk; _isPtt = isPtt; _keyTest = keyTest; _hasQuitTimer = (timerMs > 0);
-        _ignoredCompanionVk = (targetVk == 0xA2 || targetVk == 0xA3) ? 0x11u : ((targetVk == 0xA4 || targetVk == 0xA5) ? 0x12u : ((targetVk == 0xA0 || targetVk == 0xA1) ? 0x10u : 0u));
-        _tapMaxMs = (ulong)Math.Max(50, tapMaxMs); _debounceMs = (ulong)Math.Max(0, debounceMs); _procRef = HookCallback;
+        _hotkeyEngine = new WinHotkeyEngine(targetVk, isPtt, tapMaxMs, holdCancelMs, holdHintMs, debounceMs, keyTest);
+        EnsureHoldTimers();
+        _procRef = HookCallback;
         using (Process cur = Process.GetCurrentProcess()) using (ProcessModule mod = cur.MainModule) { _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _procRef, GetModuleHandle(mod.ModuleName), 0); }
         if (_hook == IntPtr.Zero) throw new InvalidOperationException("SetWindowsHookEx failed: " + Marshal.GetLastWin32Error());
         if (_hasQuitTimer) SetTimer(IntPtr.Zero, new IntPtr(1), (uint)timerMs, IntPtr.Zero);
@@ -2358,6 +2738,12 @@ public static class VoiceWinShim {
 
     public static void StopHook() {
         int dummyBytes; string dummyErr; StopRecording(out dummyBytes, out dummyErr);
+        StopHoldTimers();
+        StopHoldPreviewSafetyTimer();
+        if (_holdHintTimer != null) { try { _holdHintTimer.Dispose(); } catch { } _holdHintTimer = null; }
+        if (_holdCancelTimer != null) { try { _holdCancelTimer.Dispose(); } catch { } _holdCancelTimer = null; }
+        if (_holdPreviewSafetyTimer != null) { try { _holdPreviewSafetyTimer.Dispose(); } catch { } _holdPreviewSafetyTimer = null; }
+        _hotkeyEngine = null;
         FlushPendingClipRestore();
         if (_clipRestoreTimer != null) { try { _clipRestoreTimer.Stop(); _clipRestoreTimer.Dispose(); } catch { } _clipRestoreTimer = null; }
         if (_clipHwnd != IntPtr.Zero) { try { DestroyWindow(_clipHwnd); } catch { } _clipHwnd = IntPtr.Zero; }
@@ -2367,7 +2753,7 @@ public static class VoiceWinShim {
     }
 
     public static bool IsAnyPasteBlockingKeyDown() {
-        if (_targetDown) return true;
+        if (_hotkeyEngine != null && _hotkeyEngine.TargetDown) return true;
         int[] vks = new int[] { 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x10, 0xA0, 0xA1, 0x5B, 0x5C, (int)_targetVk };
         foreach (int vk in vks) {
             if (vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0) return true;
@@ -2433,10 +2819,10 @@ public static class VoiceWinShim {
         return false;
     }
 
-    private static void VerifyHudLayoutCase(string label, string state, string customText, int dpi, int workW, int workH, bool zh, bool isToast, long elapsedSec, int maxDurSec, int warnRemSec, int bgCount) {
+    private static void VerifyHudLayoutCase(string label, string state, string customText, int dpi, int workW, int workH, bool zh, bool isToast, long elapsedSec, int maxDurSec, int warnRemSec, int bgCount, bool holdCancelPreview = false) {
         float[] bars = new float[] { 0.15f, 0.35f, 0.65f, 0.90f, 1.00f, 0.85f, 0.60f, 0.30f, 0.12f };
         HudLayoutMetrics m;
-        using (Bitmap bmp = RenderHudSnapshotWithMetrics(state, customText, dpi, workW, workH, bars, out m, elapsedSec, maxDurSec, warnRemSec, zh, isToast, bgCount)) {
+        using (Bitmap bmp = RenderHudSnapshotWithMetrics(state, customText, dpi, workW, workH, bars, out m, elapsedSec, maxDurSec, warnRemSec, zh, isToast, bgCount, holdCancelPreview)) {
             if (bmp == null) throw new InvalidOperationException(label + ": null bitmap");
             if (bmp.Width != m.Width || bmp.Height != m.Height)
                 throw new InvalidOperationException(label + ": bitmap size mismatch");
@@ -2444,6 +2830,13 @@ public static class VoiceWinShim {
                 throw new InvalidOperationException(label + ": pill bounds invalid w=" + m.Width + " maxW=" + m.MaxWidth + " h=" + m.Height);
             if (m.Truncated)
                 throw new InvalidOperationException(label + ": unexpected truncation w=" + m.Width + " maxW=" + m.MaxWidth);
+            if (holdCancelPreview) {
+                string expHold = FormatHoldCancelHint(zh);
+                if (m.IsWaveRecording && m.HintText != expHold)
+                    throw new InvalidOperationException(label + ": wave hold hint mismatch got=" + m.HintText);
+                if (!m.IsWaveRecording && (m.HintText != ("(" + expHold + ")") || m.HintSegMeasuredW <= 0))
+                    throw new InvalidOperationException(label + ": status hold hint mismatch got=" + m.HintText);
+            }
 
             if (m.IsWaveRecording) {
                 if (m.DurRect.Left < m.PadL)
@@ -2569,6 +2962,17 @@ public static class VoiceWinShim {
                 cases++;
                 VerifyHudLayoutCase("rec_warn5_bg2_" + langTag + "_dpi" + dpi, "recording", recTexts[2], dpi, ww, wh, zh, false, 55L, 60, 15, 2);
                 cases++;
+                // Hold-to-cancel preview in recording (normal, bg_count=2, countdown) and cancellable main states
+                VerifyHudLayoutCase("rec_hold_" + langTag + "_dpi" + dpi, "recording", recTexts[0], dpi, ww, wh, zh, false, 12L, 0, 0, 0, true);
+                cases++;
+                VerifyHudLayoutCase("rec_hold_bg2_" + langTag + "_dpi" + dpi, "recording", recTexts[2], dpi, ww, wh, zh, false, 65L, 600, 15, 2, true);
+                cases++;
+                VerifyHudLayoutCase("rec_hold_warn_" + langTag + "_dpi" + dpi, "recording", recTexts[0], dpi, ww, wh, zh, false, 55L, 60, 15, 1, true);
+                cases++;
+                VerifyHudLayoutCase("main_recognizing_hold_" + langTag + "_dpi" + dpi, "recognizing", "", dpi, ww, wh, zh, false, 0L, 0, 0, 0, true);
+                cases++;
+                VerifyHudLayoutCase("main_refining_hold_" + langTag + "_dpi" + dpi, "refining", "", dpi, ww, wh, zh, false, 0L, 0, 0, 0, true);
+                cases++;
 
                 // All non-wave main states + cancelling custom main copy
                 foreach (string st in mainStates) {
@@ -2652,8 +3056,52 @@ public static class VoiceWinShim {
             UpdateHud("recording", "", 0, "bottom", 60, 15, "", null, true, 0);
             if (!_hud.IsShown || _hud.AnchoredWorkArea != mon2 || _hud.AnchoredDpi != 144)
                 throw new InvalidOperationException("single-slot check: fresh recording failed to re-anchor to monitor2");
+
+            // 6) Hold-cancel preview works ONLY on cancellable main states, preserves anchor/toast/bgCount,
+            //    survives single-pass bg_count refresh without flashing, and restores cleanly
+            UpdateHud("recording", "\u25CF \u5F55\u97F3\u4E2D\u2026 (\u6309\u53F3 Ctrl \u7ED3\u675F)", 0, "bottom", 60, 15, "", null, false, 2);
+            UpdateHud("audio_recovered", "", 0, "bottom", 0, 0, "toast", false, null, 0);
+            _hud.SetHoldCancelPreview(true, true);
+            if (!_hud.HoldCancelPreviewActive || _hud.LastRenderedHint != FormatHoldCancelHint(true) || _hud.CurrentBgCount != 2 || _hud.AnchoredWorkArea != mon2 || !_toastHud.IsShown)
+                throw new InvalidOperationException("single-slot check: recording hold preview failed");
+            WinHotkeyEngine prevEng = _hotkeyEngine;
+            try {
+                WinHotkeyEngine simEng = new WinHotkeyEngine(0xA3u, false, 500, 800, 250, 180, false);
+                HotkeyStepResult simD = simEng.ProcessKeyEvent(0xA3u, 0x1D, true, true, false, 1000UL, vk => vk == 0xA3u);
+                simEng.OnHoldHintTimeout(simD.TimerGen, 1250UL, vk => vk == 0xA3u);
+                _hotkeyEngine = simEng;
+                int beforeUpd = _hud.ShowUpdateCount;
+                UpdateHud("recording", "\u25CF \u5F55\u97F3\u4E2D\u2026 (\u6309\u53F3 Ctrl \u7ED3\u675F)", 0, "bottom", 60, 15, "", null, false, 1);
+                if (_hud.ShowUpdateCount != beforeUpd + 1 || !_hud.HoldCancelPreviewActive || _hud.LastRenderedHint != FormatHoldCancelHint(true) || _hud.CurrentBgCount != 1 || _hud.AnchoredWorkArea != mon2 || !_toastHud.IsShown)
+                    throw new InvalidOperationException("single-slot check: single-pass bgCount refresh during hold preview failed");
+            } finally {
+                _hotkeyEngine = prevEng;
+            }
+            _hud.SetHoldCancelPreview(false, true);
+            if (_hud.HoldCancelPreviewActive || _hud.LastRenderedHint == FormatHoldCancelHint(true) || _hud.CurrentBgCount != 1 || !_toastHud.IsShown)
+                throw new InvalidOperationException("single-slot check: recording hold preview restore failed");
+
+            UpdateHud("refining", "\u25C8 Refining\u2026", 0, "bottom", 0, 0, "main", null, false, 0);
+            _hud.SetHoldCancelPreview(true, true);
+            if (!_hud.HoldCancelPreviewActive || _hud.LastRenderedHint != ("(" + FormatHoldCancelHint(false) + ")"))
+                throw new InvalidOperationException("single-slot check: refining hold preview en failed");
+            _hud.SetHoldCancelPreview(false, true);
+            if (_hud.HoldCancelPreviewActive || _hud.LastRenderedHint != "")
+                throw new InvalidOperationException("single-slot check: refining hold preview restore failed");
+
+            // Non-cancellable main states (done / copied / hidden) MUST ignore hold preview
+            UpdateHud("done", "", 900, "bottom", 0, 0, "main", null, false, 0);
+            _hud.SetHoldCancelPreview(true, true);
+            if (_hud.HoldCancelPreviewActive)
+                throw new InvalidOperationException("single-slot check: done must ignore hold preview");
+            UpdateHud("copied", "", 2000, "bottom", 0, 0, "main", null, false, 0);
+            _hud.SetHoldCancelPreview(true, true);
+            if (_hud.HoldCancelPreviewActive)
+                throw new InvalidOperationException("single-slot check: copied must ignore hold preview");
+
             UpdateHud("hide_all", "", 0);
-            if (_hud.IsShown || _toastHud.IsShown)
+            _hud.SetHoldCancelPreview(true, true);
+            if (_hud.IsShown || _toastHud.IsShown || _hud.HoldCancelPreviewActive)
                 throw new InvalidOperationException("single-slot check: hide_all failed");
         } finally {
             _headlessHudMode = false;
@@ -2664,7 +3112,157 @@ public static class VoiceWinShim {
         }
     }
 
-    public static int RunHeadlessSelfCheck() {
+    public static int RunHotkeyFsmSelfCheck() {
+        int checks = 0;
+        const uint VK_RCTRL = 0xA3u;
+        const uint VK_CTRL = 0x11u;
+        const uint VK_C = 0x43u;
+        const uint VK_A = 0x41u;
+        Func<uint, bool> noneDown = vk => false;
+        Func<uint, bool> onlyTargetDown = vk => vk == VK_RCTRL;
+
+        // 1) Short tap (<=500ms) -> toggle, boundary 500ms -> toggle, companion VK_CONTROL ignored
+        WinHotkeyEngine eng = new WinHotkeyEngine(VK_RCTRL, false, 500, 800, 250, 180, false);
+        HotkeyStepResult s1d = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 1000UL, onlyTargetDown);
+        if (!s1d.ArmTimers || s1d.HintDelayMs != 250 || s1d.CancelDelayMs != 800 || (s1d.Events != null && s1d.Events.Count > 0))
+            throw new InvalidOperationException("fsm check 1a: tap down arm mismatch");
+        HotkeyStepResult s1c = eng.ProcessKeyEvent(VK_CTRL, 0x1D, false, true, false, 1010UL, onlyTargetDown);
+        if (eng.ChordTainted || s1c.CancelTimers)
+            throw new InvalidOperationException("fsm check 1b: companion VK_CONTROL must not taint");
+        HotkeyStepResult s1u = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 1120UL, noneDown);
+        if (!s1u.CancelTimers || s1u.ClearHoldPreview || s1u.Events == null || s1u.Events.Count != 1 || s1u.Events[0].Kind != "toggle")
+            throw new InvalidOperationException("fsm check 1c: short tap 120ms toggle mismatch");
+        checks++;
+
+        // Boundary 500ms exact -> toggle
+        eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 2000UL, onlyTargetDown);
+        HotkeyStepResult s1b = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 2500UL, noneDown);
+        if (s1b.Events == null || s1b.Events.Count != 1 || s1b.Events[0].Kind != "toggle")
+            throw new InvalidOperationException("fsm check 1d: boundary 500ms toggle mismatch");
+        checks++;
+
+        // 2) Hesitation deadzone (501ms..799ms): 250ms preview activates, release clears preview and emits ZERO events
+        HotkeyStepResult s2d = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 3000UL, onlyTargetDown);
+        HotkeyStepResult s2h = eng.OnHoldHintTimeout(s2d.TimerGen, 3250UL, onlyTargetDown);
+        if (!s2h.ShowHoldPreview || !eng.HoldHintShown)
+            throw new InvalidOperationException("fsm check 2a: 250ms hold preview failed");
+        HotkeyStepResult s2u = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 3600UL, noneDown);
+        if (!s2u.CancelTimers || !s2u.ClearHoldPreview || (s2u.Events != null && s2u.Events.Count > 0))
+            throw new InvalidOperationException("fsm check 2b: 600ms deadzone must be silent and clear preview");
+        // Boundaries 501ms and 799ms
+        eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 4000UL, onlyTargetDown);
+        HotkeyStepResult s2b1 = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 4501UL, noneDown);
+        if (s2b1.Events != null && s2b1.Events.Count > 0)
+            throw new InvalidOperationException("fsm check 2c: 501ms deadzone must be silent");
+        eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 5000UL, onlyTargetDown);
+        HotkeyStepResult s2b2 = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 5799UL, noneDown);
+        if (s2b2.Events != null && s2b2.Events.Count > 0)
+            throw new InvalidOperationException("fsm check 2d: 799ms deadzone must be silent");
+        checks++;
+
+        // 3) Real-time 800ms hold_cancel BEFORE keyup + keyup swallowed even after >8000ms + stale gen ignored
+        HotkeyStepResult s3d = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 6000UL, onlyTargetDown);
+        ulong g3 = s3d.TimerGen;
+        HotkeyStepResult s3h = eng.OnHoldHintTimeout(g3, 6250UL, onlyTargetDown);
+        if (!s3h.ShowHoldPreview) throw new InvalidOperationException("fsm check 3a: hint at 250ms");
+        HotkeyStepResult s3c = eng.OnHoldCancelTimeout(g3, 6800UL, onlyTargetDown);
+        if (!eng.HoldFired || !s3c.ArmPreviewSafetyClear || s3c.Events == null || s3c.Events.Count != 1 || s3c.Events[0].Kind != "hold_cancel" || s3c.Events[0].HoldMs != 800)
+            throw new InvalidOperationException("fsm check 3b: real-time 800ms hold_cancel mismatch");
+        // Stale timer callback must be ignored
+        HotkeyStepResult s3stale = eng.OnHoldCancelTimeout(g3, 6900UL, onlyTargetDown);
+        if (s3stale.Events != null && s3stale.Events.Count > 0)
+            throw new InvalidOperationException("fsm check 3c: stale timer fired");
+        // Keyup after 12000ms (>8000ms old cap) MUST be swallowed cleanly
+        HotkeyStepResult s3u = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 18000UL, noneDown);
+        if ((s3u.Events != null && s3u.Events.Count > 0) || eng.TargetDown || eng.HoldFired)
+            throw new InvalidOperationException("fsm check 3d: post-hold_cancel keyup after 12s not swallowed");
+        checks++;
+
+        // 4) Timer jitter fallback: keyup at 805ms before timer fires still emits hold_cancel once
+        HotkeyStepResult s4d = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 20000UL, onlyTargetDown);
+        eng.OnHoldHintTimeout(s4d.TimerGen, 20250UL, onlyTargetDown);
+        HotkeyStepResult s4u = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 20805UL, noneDown);
+        if (s4u.Events == null || s4u.Events.Count != 1 || s4u.Events[0].Kind != "hold_cancel" || s4u.Events[0].HoldMs != 805 || !s4u.ArmPreviewSafetyClear)
+            throw new InvalidOperationException("fsm check 4: jitter fallback hold_cancel mismatch");
+        checks++;
+
+        // 5) Chord taint (RControl+C) before 250ms AND during 250-800ms preview restores preview immediately
+        HotkeyStepResult s5d = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 22000UL, onlyTargetDown);
+        HotkeyStepResult s5c = eng.ProcessKeyEvent(VK_C, 0x2E, false, true, false, 22100UL, vk => vk == VK_RCTRL || vk == VK_C);
+        if (!eng.ChordTainted || !s5c.CancelTimers)
+            throw new InvalidOperationException("fsm check 5a: early chord taint failed");
+        if (eng.OnHoldHintTimeout(s5d.TimerGen, 22250UL, vk => vk == VK_RCTRL || vk == VK_C).ShowHoldPreview)
+            throw new InvalidOperationException("fsm check 5b: tainted hint must not show");
+        eng.ProcessKeyEvent(VK_C, 0x2E, false, false, true, 22150UL, onlyTargetDown);
+        HotkeyStepResult s5u = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 22900UL, noneDown);
+        if (s5u.Events != null && s5u.Events.Count > 0)
+            throw new InvalidOperationException("fsm check 5c: tainted release must be silent");
+
+        HotkeyStepResult s5d2 = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 24000UL, onlyTargetDown);
+        HotkeyStepResult s5h2 = eng.OnHoldHintTimeout(s5d2.TimerGen, 24250UL, onlyTargetDown);
+        if (!s5h2.ShowHoldPreview) throw new InvalidOperationException("fsm check 5d: preview did not activate");
+        HotkeyStepResult s5c2 = eng.ProcessKeyEvent(VK_C, 0x2E, false, true, false, 24400UL, vk => vk == VK_RCTRL || vk == VK_C);
+        if (!s5c2.ClearHoldPreview || !s5c2.CancelTimers || eng.HoldHintShown)
+            throw new InvalidOperationException("fsm check 5e: mid-preview chord must immediately clear preview");
+        eng.ProcessKeyEvent(VK_C, 0x2E, false, false, true, 24450UL, onlyTargetDown);
+        HotkeyStepResult s5u2 = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 24900UL, noneDown);
+        if (s5u2.Events != null && s5u2.Events.Count > 0)
+            throw new InvalidOperationException("fsm check 5f: mid-preview tainted release must be silent");
+        checks++;
+
+        // 6) Stale _otherDown self-healing (swallowed WM_KEYUP from UAC/lock screen) + stuck _targetDown recovery
+        eng.ProcessKeyEvent(VK_A, 0x1E, false, true, false, 26000UL, vk => vk == VK_A);
+        if (eng.OtherDownCount != 1) throw new InvalidOperationException("fsm check 6a: otherDown not recorded");
+        // No WM_KEYUP for VK_A; physical state reports VK_A is UP -> pruned on RControl down!
+        HotkeyStepResult s6d = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 26500UL, onlyTargetDown);
+        if (eng.OtherDownCount != 0 || eng.ChordTainted || !s6d.ArmTimers)
+            throw new InvalidOperationException("fsm check 6b: stale _otherDown self-heal failed");
+        HotkeyStepResult s6u = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 26620UL, noneDown);
+        if (s6u.Events == null || s6u.Events.Count != 1 || s6u.Events[0].Kind != "toggle")
+            throw new InvalidOperationException("fsm check 6c: toggle after stale self-heal failed");
+        // Stuck _targetDown when WM_KEYUP of target itself was lost -> timer sees physical UP and resets
+        HotkeyStepResult s6td = eng.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 27000UL, onlyTargetDown);
+        HotkeyStepResult s6th = eng.OnHoldHintTimeout(s6td.TimerGen, 27250UL, noneDown);
+        if (s6th.ShowHoldPreview || eng.TargetDown)
+            throw new InvalidOperationException("fsm check 6d: stuck _targetDown recovery failed");
+        checks++;
+
+        // 7) holdCancelMs = 0 disables hold_cancel and timers while keeping tap_toggle intact; tight threshold keeps HoldHintMs < HoldCancelMs
+        WinHotkeyEngine noHold = new WinHotkeyEngine(VK_RCTRL, false, 500, 0, 250, 180, false);
+        if (noHold.HoldCancelMs != 0UL || noHold.HoldHintMs != 0UL)
+            throw new InvalidOperationException("fsm check 7a: holdCancelMs=0 should disable timers");
+        HotkeyStepResult s7d = noHold.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 1000UL, onlyTargetDown);
+        if (s7d.ArmTimers) throw new InvalidOperationException("fsm check 7b: disabled hold must not arm timers");
+        HotkeyStepResult s7u = noHold.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 2500UL, noneDown);
+        if (s7u.Events != null && s7u.Events.Count > 0)
+            throw new InvalidOperationException("fsm check 7c: disabled hold must ignore >tapMaxMs release");
+        WinHotkeyEngine tightEng = new WinHotkeyEngine(VK_RCTRL, false, 50, 80, 250, 0, false);
+        if (tightEng.TapMaxMs != 50UL || tightEng.HoldCancelMs != 80UL || tightEng.HoldHintMs != 40UL || tightEng.HoldHintMs >= tightEng.HoldCancelMs)
+            throw new InvalidOperationException("fsm check 7d: tight HoldHintMs must be strictly < HoldCancelMs");
+        checks++;
+
+        // 8) PTT mode zero regression: immediate ptt_start, no hold timers, >800ms release -> ptt_stop, chord -> ptt_cancel
+        WinHotkeyEngine ptt = new WinHotkeyEngine(VK_RCTRL, true, 500, 800, 250, 180, false);
+        HotkeyStepResult p1 = ptt.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 1000UL, onlyTargetDown);
+        if (p1.ArmTimers || p1.Events == null || p1.Events.Count != 1 || p1.Events[0].Kind != "ptt_start")
+            throw new InvalidOperationException("fsm check 8a: ptt_start mismatch");
+        HotkeyStepResult p2 = ptt.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 2500UL, noneDown);
+        if (p2.Events == null || p2.Events.Count != 1 || p2.Events[0].Kind != "ptt_stop")
+            throw new InvalidOperationException("fsm check 8b: ptt_stop mismatch");
+        ptt.ProcessKeyEvent(VK_RCTRL, 0x1D, true, true, false, 3000UL, onlyTargetDown);
+        HotkeyStepResult p3 = ptt.ProcessKeyEvent(VK_C, 0x2E, false, true, false, 3100UL, vk => vk == VK_RCTRL || vk == VK_C);
+        if (p3.Events == null || p3.Events.Count != 1 || p3.Events[0].Kind != "ptt_cancel")
+            throw new InvalidOperationException("fsm check 8c: ptt_cancel mismatch");
+        ptt.ProcessKeyEvent(VK_C, 0x2E, false, false, true, 3150UL, onlyTargetDown);
+        HotkeyStepResult p4 = ptt.ProcessKeyEvent(VK_RCTRL, 0x1D, true, false, true, 3200UL, noneDown);
+        if (p4.Events != null && p4.Events.Count > 0)
+            throw new InvalidOperationException("fsm check 8d: post-ptt_cancel release must be silent");
+        checks++;
+
+        return checks;
+    }
+
+    public static int RunHeadlessSelfCheck(out int hotkeyFsmChecks) {
         if (ResolveKeyName("RControl") != 0xA3u) throw new InvalidOperationException("ResolveKeyName RControl failed");
         if (ResolveKeyName("RAlt") != 0xA5u) throw new InvalidOperationException("ResolveKeyName RAlt failed");
         if (ResolveKeyName("F13") != 0x7Cu) throw new InvalidOperationException("ResolveKeyName F13 failed");
@@ -2712,7 +3310,12 @@ public static class VoiceWinShim {
 
         RunClipStateSelfCheck();
         RunToastSingleSlotSelfCheck();
+        hotkeyFsmChecks = RunHotkeyFsmSelfCheck();
         return RunHudLayoutSelfCheck();
+    }
+    public static int RunHeadlessSelfCheck() {
+        int unused;
+        return RunHeadlessSelfCheck(out unused);
     }
 }
 "@
@@ -2852,7 +3455,8 @@ if ($Mode -eq "self-check") {
                 throw ("AST parse errors: " + $parseErrors.Count)
             }
         }
-        $hudLayoutCases = [VoiceWinShim]::RunHeadlessSelfCheck()
+        $hotkeyFsmChecks = 0
+        $hudLayoutCases = [VoiceWinShim]::RunHeadlessSelfCheck([ref]$hotkeyFsmChecks)
         $t1 = "agy " + ([char]0x00B7) + " ~/repo [#a1b2c3d4]"
         if ((Get-TitleSessionToken $t1) -ne "a1b2c3d4") { throw "Get-TitleSessionToken hash tag failed" }
         if ((Get-TitleSessionToken "claude [claude:#DEADBEEF]") -ne "deadbeef") { throw "Get-TitleSessionToken prefixed tag failed" }
@@ -2862,7 +3466,7 @@ if ($Mode -eq "self-check") {
         if ((-not $protoSample.ok) -or ($protoSample.reply -ne "ping") -or ([int]$protoSample.seq_id -ne 1)) {
             throw "JSON roundtrip check failed"
         }
-        Write-JsonLine @{ ok = $true; mode = "self-check"; ps_version = $PSVersionTable.PSVersion.ToString(); clr_version = $PSVersionTable.CLRVersion.ToString(); cache_hit = [bool]$csCacheHit; hud_layout_cases = [int]$hudLayoutCases }
+        Write-JsonLine @{ ok = $true; mode = "self-check"; ps_version = $PSVersionTable.PSVersion.ToString(); clr_version = $PSVersionTable.CLRVersion.ToString(); cache_hit = [bool]$csCacheHit; hud_layout_cases = [int]$hudLayoutCases; hotkey_fsm_checks = [int]$hotkeyFsmChecks }
         exit 0
     } catch {
         [Console]::Error.WriteLine("win_shim self-check failed: " + [string]$_.Exception.Message)
@@ -2889,18 +3493,22 @@ if (-not [string]::IsNullOrWhiteSpace($AllowedTerminalsCsv)) {
 }
 try {
     if ($Mode -eq "key-test") {
-        [VoiceWinShim]::StartHook($targetVk, $isPtt, $TapMaxMs, $DebounceMs, $true, ($Seconds * 1000))
-        Write-JsonLine @{ event = "key_test_ready"; hotkey = $Hotkey; target_vk = ("0x{0:X2}" -f $targetVk); mode = $TriggerMode; seconds = $Seconds }
+        [VoiceWinShim]::StartHook($targetVk, $isPtt, $TapMaxMs, $DebounceMs, $true, ($Seconds * 1000), $HoldCancelMs, $HoldHintMs)
+        Write-JsonLine @{ event = "key_test_ready"; hotkey = $Hotkey; target_vk = ("0x{0:X2}" -f $targetVk); mode = $TriggerMode; seconds = $Seconds; tap_max_ms = $TapMaxMs; hold_cancel_ms = $HoldCancelMs; hold_hint_ms = $HoldHintMs }
         while ([VoiceWinShim]::PumpOnce()) {
             $ev = New-Object ShimEvent
             while ([VoiceWinShim]::EvtQueue.TryDequeue([ref]$ev)) {
                 $kname = try { ([System.Windows.Forms.Keys][int]$ev.Vk).ToString() } catch { "VK_$($ev.Vk)" }
-                Write-JsonLine @{ event = $ev.Kind; vk = ("0x{0:X2}" -f $ev.Vk); key_name = $kname; scan = $ev.Scan; extended = $ev.Extended; is_down = $ev.IsDown; tainted = $ev.Tainted }
+                if ($ev.Kind -eq "hold_cancel") {
+                    Write-JsonLine @{ event = $ev.Kind; hold_ms = [int]$ev.HoldMs; vk = ("0x{0:X2}" -f $ev.Vk); key_name = $kname; scan = $ev.Scan; extended = $ev.Extended; is_down = $ev.IsDown; tainted = $ev.Tainted }
+                } else {
+                    Write-JsonLine @{ event = $ev.Kind; vk = ("0x{0:X2}" -f $ev.Vk); key_name = $kname; scan = $ev.Scan; extended = $ev.Extended; is_down = $ev.IsDown; tainted = $ev.Tainted }
+                }
             }
         }
         exit 0
     }
-    [VoiceWinShim]::StartHook($targetVk, $isPtt, $TapMaxMs, $DebounceMs, $false, 0)
+    [VoiceWinShim]::StartHook($targetVk, $isPtt, $TapMaxMs, $DebounceMs, $false, 0, $HoldCancelMs, $HoldHintMs)
     [VoiceWinShim]::StartStdinReader()
     Write-JsonLine @{ event = "ready"; target_vk = ("0x{0:X2}" -f $targetVk); mode = $TriggerMode; wave_in_devs = [VoiceWinShim]::waveInGetNumDevs(); ui_culture = [VoiceWinShim]::GetHostUiCulture() }
     :bridgeLoop while ([VoiceWinShim]::PumpOnce()) {

@@ -48,6 +48,18 @@ struct EmittedEvent {
     var holdMs: Int = 0
 }
 
+struct HotkeyStepResult {
+    var events: [EmittedEvent] = []
+    var armTimers: Bool = false
+    var cancelTimers: Bool = false
+    var timerGen: UInt64 = 0
+    var hintDelayMs: Int = 0
+    var cancelDelayMs: Int = 0
+    var showHoldPreview: Bool = false
+    var clearHoldPreview: Bool = false
+    var armPreviewSafetyClear: Bool = false
+}
+
 private let FUNCTION_KEY_CODES: [Int: UInt16] = [
     1: 0x7A, 2: 0x78, 3: 0x63, 4: 0x76, 5: 0x60, 6: 0x61, 7: 0x62, 8: 0x64, 9: 0x65, 10: 0x6D,
     11: 0x67, 12: 0x6F, 13: 0x69, 14: 0x6B, 15: 0x71, 16: 0x6A, 17: 0x40, 18: 0x4F, 19: 0x50, 20: 0x5A,
@@ -80,6 +92,30 @@ private let KEY_CODE_NAMES: [UInt16: String] = {
     return m
 }()
 
+private let MODIFIER_KEY_CODES: Set<UInt16> = [
+    0x36, // RCommand
+    0x37, // LCommand
+    0x38, // LShift
+    0x39, // CapsLock
+    0x3A, // LOption
+    0x3B, // LControl
+    0x3C, // RShift
+    0x3D, // ROption
+    0x3E, // RControl
+    0x3F, // Fn
+    0xB3, // Globe
+]
+
+private func hasAnyNonModifierKeyPhysicallyDown(excluding spec: TargetKeySpec) -> Bool {
+    for kc: UInt16 in 0..<128 {
+        if MODIFIER_KEY_CODES.contains(kc) || spec.matchesKeyCode(kc) { continue }
+        if CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(kc)) {
+            return true
+        }
+    }
+    return false
+}
+
 func resolveTargetKey(_ raw: String) throws -> TargetKeySpec {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     let k = (trimmed.isEmpty ? "RControl" : trimmed).lowercased()
@@ -102,22 +138,49 @@ struct HotkeyEngine {
     let spec: TargetKeySpec
     let isPtt: Bool
     let tapMaxMs: UInt64
+    let holdCancelMs: UInt64
+    let holdHintMs: UInt64
     let debounceMs: UInt64
     let keyTest: Bool
 
     private(set) var targetDown = false
     private(set) var pttActive = false
     private(set) var chordTainted = false
+    private(set) var holdFired = false
+    private(set) var holdHintShown = false
+    private(set) var holdGen: UInt64 = 0
     private var downTickMs: UInt64 = 0
     private var lastFireTickMs: UInt64 = 0
     private var hasFiredOnce = false
     private var downKeyCounter: UInt32 = 0
     private(set) var otherKeysDown: Set<UInt16> = []
 
-    init(spec: TargetKeySpec, isPtt: Bool, tapMaxMs: Int, debounceMs: Int, keyTest: Bool) {
+    init(
+        spec: TargetKeySpec,
+        isPtt: Bool,
+        tapMaxMs: Int = 500,
+        holdCancelMs: Int = 800,
+        holdHintMs: Int = 250,
+        debounceMs: Int = 180,
+        keyTest: Bool = false
+    ) {
         self.spec = spec
         self.isPtt = isPtt
-        self.tapMaxMs = UInt64(max(50, tapMaxMs))
+        let effTap = UInt64(max(50, tapMaxMs))
+        self.tapMaxMs = effTap
+        if holdCancelMs <= 0 {
+            self.holdCancelMs = 0
+            self.holdHintMs = 0
+        } else {
+            var effHold = UInt64(holdCancelMs)
+            if effHold <= effTap { effHold = effTap + 300 }
+            self.holdCancelMs = effHold
+            if holdHintMs <= 0 || effHold <= 1 {
+                self.holdHintMs = 0
+            } else {
+                self.holdHintMs = min(UInt64(holdHintMs), effHold / 2)
+            }
+        }
         self.debounceMs = UInt64(max(0, debounceMs))
         self.keyTest = keyTest
     }
@@ -131,6 +194,19 @@ struct HotkeyEngine {
         if !spec.isModifier { return (rawFlags & allHigh) != 0 }
         if (rawFlags & (allHigh & ~spec.highFlag)) != 0 { return true }
         return spec.oppositeDeviceMask != 0 && (rawFlags & spec.oppositeDeviceMask) != 0
+    }
+
+    private func isTargetPhysicallyDown(
+        rawFlags: UInt,
+        isKeyPhysicallyDown: (UInt16) -> Bool
+    ) -> Bool {
+        if spec.isModifier {
+            if spec.highFlag == FLAG_CAPSLOCK { return targetDown }
+            if spec.highFlag != 0 { return (rawFlags & spec.highFlag) != 0 }
+            return isKeyPhysicallyDown(spec.primaryKeyCode)
+        }
+        return isKeyPhysicallyDown(spec.primaryKeyCode)
+            || spec.altKeyCodes.contains(where: isKeyPhysicallyDown)
     }
 
     private func evaluateModifierDown(kind: RawEventKind, keyCode: UInt16, rawFlags: UInt) -> Bool {
@@ -156,9 +232,33 @@ struct HotkeyEngine {
         isARepeat: Bool,
         nowMs: UInt64,
         keyDownCounter: UInt32,
-        isKeyPhysicallyDown: (UInt16) -> Bool = { _ in true }
+        isKeyPhysicallyDown: (UInt16) -> Bool = { _ in true },
+        hasOtherNonModifierKeyDown: () -> Bool = { false }
     ) -> [EmittedEvent] {
-        if kind == .keyDown && isARepeat { return [] }
+        handleEventStep(
+            kind: kind,
+            keyCode: keyCode,
+            rawFlags: rawFlags,
+            isARepeat: isARepeat,
+            nowMs: nowMs,
+            keyDownCounter: keyDownCounter,
+            isKeyPhysicallyDown: isKeyPhysicallyDown,
+            hasOtherNonModifierKeyDown: hasOtherNonModifierKeyDown
+        ).events
+    }
+
+    mutating func handleEventStep(
+        kind: RawEventKind,
+        keyCode: UInt16,
+        rawFlags: UInt,
+        isARepeat: Bool,
+        nowMs: UInt64,
+        keyDownCounter: UInt32,
+        isKeyPhysicallyDown: (UInt16) -> Bool = { _ in true },
+        hasOtherNonModifierKeyDown: () -> Bool = { false }
+    ) -> HotkeyStepResult {
+        var res = HotkeyStepResult()
+        if kind == .keyDown && isARepeat { return res }
         // Prune stale keys whose .keyUp was swallowed by Cmd+Tab, lock screen, or Secure Input
         if !otherKeysDown.isEmpty {
             otherKeysDown = otherKeysDown.filter(isKeyPhysicallyDown)
@@ -178,60 +278,175 @@ struct HotkeyEngine {
         }
         let isTargetTransition = (nowDown != targetDown)
 
-        var out: [EmittedEvent] = []
         if keyTest {
             let dispVk = (kind == .flagsChanged && keyCode == 0x3B && (rawFlags & NX_DEVICERCTLKEYMASK) != 0) ? UInt16(0x3E) : keyCode
             let allMods = FLAG_SHIFT | FLAG_CONTROL | FLAG_OPTION | FLAG_COMMAND | FLAG_FUNCTION | FLAG_CAPSLOCK
             let evDown = (kind == .keyDown) ? true : ((kind == .keyUp) ? false : (isTargetTransition ? nowDown : ((rawFlags & allMods) != 0)))
-            out.append(EmittedEvent(kind: "key_event", vk: dispVk, flags: rawFlags, isDown: evDown, tainted: chordTainted))
+            res.events.append(EmittedEvent(kind: "key_event", vk: dispVk, flags: rawFlags, isDown: evDown, tainted: chordTainted))
         }
 
         if nowDown && !targetDown {
             targetDown = true
             downTickMs = nowMs
             downKeyCounter = keyDownCounter
-            chordTainted = !otherKeysDown.isEmpty || hasOtherModifiersActive(rawFlags)
-            if isPtt && !chordTainted && debouncePassed(nowMs) {
-                lastFireTickMs = nowMs; hasFiredOnce = true; pttActive = true
-                out.append(EmittedEvent(kind: "ptt_start", vk: actionVk, flags: rawFlags, isDown: true, tainted: false))
+            holdFired = false
+            holdHintShown = false
+            holdGen &+= 1
+            chordTainted = !otherKeysDown.isEmpty || hasOtherModifiersActive(rawFlags) || hasOtherNonModifierKeyDown()
+            if isPtt {
+                if !chordTainted && debouncePassed(nowMs) {
+                    lastFireTickMs = nowMs; hasFiredOnce = true; pttActive = true
+                    res.events.append(EmittedEvent(kind: "ptt_start", vk: actionVk, flags: rawFlags, isDown: true, tainted: false))
+                }
+            } else if !chordTainted && holdCancelMs > 0 {
+                res.armTimers = true
+                res.timerGen = holdGen
+                res.hintDelayMs = Int(holdHintMs)
+                res.cancelDelayMs = Int(holdCancelMs)
             }
         } else if !nowDown && targetDown {
-            if (spec.isModifier && keyDownCounter != downKeyCounter) || hasOtherModifiersActive(rawFlags) || !otherKeysDown.isEmpty {
+            holdGen &+= 1
+            res.cancelTimers = true
+            var wasHoldFired = holdFired
+            let wasHintShown = holdHintShown
+            if (spec.isModifier && keyDownCounter != downKeyCounter) || hasOtherModifiersActive(rawFlags) || !otherKeysDown.isEmpty || hasOtherNonModifierKeyDown() {
                 chordTainted = true
             }
             if isPtt {
                 if pttActive {
                     if !chordTainted {
                         lastFireTickMs = nowMs; hasFiredOnce = true
-                        out.append(EmittedEvent(kind: "ptt_stop", vk: actionVk, flags: rawFlags, isDown: false, tainted: false))
+                        res.events.append(EmittedEvent(kind: "ptt_stop", vk: actionVk, flags: rawFlags, isDown: false, tainted: false))
                     } else {
-                        out.append(EmittedEvent(kind: "ptt_cancel", vk: actionVk, flags: rawFlags, isDown: false, tainted: true))
+                        res.events.append(EmittedEvent(kind: "ptt_cancel", vk: actionVk, flags: rawFlags, isDown: false, tainted: true))
                     }
                 }
-            } else if !chordTainted && nowMs >= downTickMs && debouncePassed(nowMs) {
+            } else if !wasHoldFired && !chordTainted && nowMs >= downTickMs && debouncePassed(nowMs) {
                 let held = nowMs - downTickMs
                 if held <= tapMaxMs {
                     lastFireTickMs = nowMs; hasFiredOnce = true
-                    out.append(EmittedEvent(kind: "toggle", vk: actionVk, flags: rawFlags, isDown: false, tainted: false))
-                } else if held <= 8000 {
+                    res.events.append(EmittedEvent(kind: "toggle", vk: actionVk, flags: rawFlags, isDown: false, tainted: false))
+                } else if holdCancelMs > 0 && held >= holdCancelMs {
                     lastFireTickMs = nowMs; hasFiredOnce = true
-                    out.append(EmittedEvent(kind: "hold_cancel", vk: actionVk, flags: rawFlags, isDown: false, tainted: false, holdMs: Int(held)))
+                    wasHoldFired = true
+                    res.events.append(EmittedEvent(kind: "hold_cancel", vk: actionVk, flags: rawFlags, isDown: false, tainted: false, holdMs: Int(held)))
                 }
             }
-            targetDown = false; pttActive = false; chordTainted = false
+            if wasHintShown {
+                if wasHoldFired { res.armPreviewSafetyClear = true }
+                else { res.clearHoldPreview = true }
+            }
+            targetDown = false; pttActive = false; chordTainted = false; holdFired = false; holdHintShown = false
         } else {
             if kind == .keyDown { otherKeysDown.insert(keyCode) }
             else if kind == .keyUp { otherKeysDown.remove(keyCode) }
             let modTaint = (kind == .flagsChanged) && (spec.isModifier ? !spec.matchesKeyCode(keyCode) : hasOtherModifiersActive(rawFlags))
             if targetDown && (kind == .keyDown || kind == .keyUp || modTaint || hasOtherModifiersActive(rawFlags)) {
                 chordTainted = true
+                holdGen &+= 1
+                res.cancelTimers = true
+                if holdHintShown {
+                    holdHintShown = false
+                    res.clearHoldPreview = true
+                }
                 if isPtt && pttActive {
                     pttActive = false
-                    out.append(EmittedEvent(kind: "ptt_cancel", vk: keyCode, flags: rawFlags, isDown: kind == .keyDown, tainted: true))
+                    res.events.append(EmittedEvent(kind: "ptt_cancel", vk: keyCode, flags: rawFlags, isDown: kind == .keyDown, tainted: true))
                 }
             }
         }
-        return out
+        return res
+    }
+
+    mutating func onHoldHintTimeout(
+        gen: UInt64,
+        nowMs: UInt64,
+        keyDownCounter: UInt32,
+        rawFlags: UInt,
+        isKeyPhysicallyDown: (UInt16) -> Bool = { _ in true },
+        hasOtherNonModifierKeyDown: () -> Bool = { false }
+    ) -> HotkeyStepResult {
+        var res = HotkeyStepResult()
+        if isPtt || !targetDown || chordTainted || holdFired || gen != holdGen || holdCancelMs == 0 || holdHintMs == 0 {
+            return res
+        }
+        if !otherKeysDown.isEmpty {
+            otherKeysDown = otherKeysDown.filter(isKeyPhysicallyDown)
+        }
+        if !isTargetPhysicallyDown(rawFlags: rawFlags, isKeyPhysicallyDown: isKeyPhysicallyDown) {
+            let hadHint = holdHintShown
+            targetDown = false; pttActive = false; chordTainted = false; holdFired = false; holdHintShown = false
+            holdGen &+= 1
+            res.cancelTimers = true
+            if hadHint { res.clearHoldPreview = true }
+            return res
+        }
+        if (spec.isModifier && keyDownCounter != downKeyCounter) || hasOtherModifiersActive(rawFlags) || !otherKeysDown.isEmpty || hasOtherNonModifierKeyDown() {
+            chordTainted = true
+            holdGen &+= 1
+            res.cancelTimers = true
+            return res
+        }
+        let held = (nowMs >= downTickMs) ? (nowMs - downTickMs) : 0
+        if held < holdHintMs || held >= holdCancelMs { return res }
+        holdHintShown = true
+        res.showHoldPreview = true
+        return res
+    }
+
+    mutating func onHoldCancelTimeout(
+        gen: UInt64,
+        nowMs: UInt64,
+        keyDownCounter: UInt32,
+        rawFlags: UInt,
+        isKeyPhysicallyDown: (UInt16) -> Bool = { _ in true },
+        hasOtherNonModifierKeyDown: () -> Bool = { false }
+    ) -> HotkeyStepResult {
+        var res = HotkeyStepResult()
+        if isPtt || !targetDown || chordTainted || holdFired || gen != holdGen || holdCancelMs == 0 {
+            return res
+        }
+        if !otherKeysDown.isEmpty {
+            otherKeysDown = otherKeysDown.filter(isKeyPhysicallyDown)
+        }
+        if !isTargetPhysicallyDown(rawFlags: rawFlags, isKeyPhysicallyDown: isKeyPhysicallyDown) {
+            let hadHint = holdHintShown
+            targetDown = false; pttActive = false; chordTainted = false; holdFired = false; holdHintShown = false
+            holdGen &+= 1
+            res.cancelTimers = true
+            if hadHint { res.clearHoldPreview = true }
+            return res
+        }
+        if (spec.isModifier && keyDownCounter != downKeyCounter) || hasOtherModifiersActive(rawFlags) || !otherKeysDown.isEmpty || hasOtherNonModifierKeyDown() {
+            chordTainted = true
+            holdGen &+= 1
+            res.cancelTimers = true
+            if holdHintShown {
+                holdHintShown = false
+                res.clearHoldPreview = true
+            }
+            return res
+        }
+        let held = (nowMs >= downTickMs) ? (nowMs - downTickMs) : 0
+        if held < holdCancelMs { return res }
+        if !debouncePassed(nowMs) {
+            if holdHintShown {
+                holdHintShown = false
+                res.clearHoldPreview = true
+            }
+            return res
+        }
+        holdFired = true
+        lastFireTickMs = nowMs
+        hasFiredOnce = true
+        holdGen &+= 1
+        res.cancelTimers = true
+        if holdHintShown {
+            holdHintShown = false
+            res.armPreviewSafetyClear = true
+        }
+        res.events.append(EmittedEvent(kind: "hold_cancel", vk: spec.primaryKeyCode, flags: rawFlags, isDown: true, tainted: false, holdMs: Int(held)))
+        return res
     }
 }
 
@@ -373,6 +588,15 @@ struct HudVisualStyle: Equatable {
     let hintText: HudRgba
     let autoHideMs: Int
     let iconKind: String
+}
+
+func isCancellableMainHudState(_ state: String) -> Bool {
+    let st = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return st == "recording" || st == "recognizing" || st == "processing" || st == "refining"
+}
+
+func formatHoldCancelHint(zh: Bool) -> String {
+    zh ? "继续按住取消…" : "keep holding to cancel…"
 }
 
 func resolveHudLayer(state: String, explicitLayer: String = "") -> String {
@@ -1034,6 +1258,14 @@ final class HudPillController {
     private var lastHintSlotTemplate: String = ""
     private var lastWarnState: Bool = false
     private var lastBgCount: Int = 0
+    private var lastHoldPreviewState: Bool = false
+    private var currentMainState: String = ""
+    private var currentMainText: String = ""
+    private var currentMainStyle: HudVisualStyle? = nil
+    private var currentMainPosition: String = "bottom"
+    private var currentMainZh: Bool = false
+    private var holdCancelPreview: Bool = false
+    private var holdPreviewSafetyWorkItem: DispatchWorkItem?
 
     private let hotkeyLabel: String
     private let hotkeyLabelEn: String
@@ -1045,9 +1277,19 @@ final class HudPillController {
     private var toastLastText: String = ""
     private var toastLastAutoHideMs: Int = 0
 
+    var canShowHoldCancelPreview: Bool { isMainVisible && isCancellableMainHudState(currentMainState) }
     fileprivate var debugMainVisible: Bool { isMainVisible }
     fileprivate var debugToastVisible: Bool { isToastVisible }
     fileprivate var debugMainBgCount: Int { recBgCount }
+    fileprivate var debugHoldPreviewActive: Bool { holdCancelPreview }
+    fileprivate var debugMainEffectiveHint: String {
+        if holdCancelPreview {
+            let effZh = isWaveRecording ? recZhHint : (currentMainText.isEmpty ? currentMainZh : containsCjkScalar(currentMainText))
+            let hint = formatHoldCancelHint(zh: effZh)
+            return isWaveRecording ? hint : "(\(hint))"
+        }
+        return isWaveRecording ? stripOuterParens(recHintText) : splitHudSegments(currentMainText).hint
+    }
     fileprivate var debugToastSlotCount: Int { toastSlotCount }
     fileprivate var debugToastUpdateCount: Int { toastUpdateCount }
     fileprivate var debugToastLastText: String { toastLastText }
@@ -1281,25 +1523,33 @@ final class HudPillController {
             remainSec = max(0, maxDurationSec - elapsedSec)
             isWarn = (remainSec <= warnRemainSec)
         }
-        let rawEffHint = isWarn ? formatCountdownHint(remainSec, zh: recZhHint) : recHintText
-        let effHint = stripOuterParens(rawEffHint)
-        let hintSlotTpl = isWarn ? stripOuterParens(countdownHintSlotTemplate(remainSec, zh: recZhHint)) : effHint
+        let effHint: String
+        let hintSlotTpl: String
+        if holdCancelPreview {
+            effHint = formatHoldCancelHint(zh: recZhHint)
+            hintSlotTpl = effHint
+        } else {
+            let rawEffHint = isWarn ? formatCountdownHint(remainSec, zh: recZhHint) : recHintText
+            effHint = stripOuterParens(rawEffHint)
+            hintSlotTpl = isWarn ? stripOuterParens(countdownHintSlotTemplate(remainSec, zh: recZhHint)) : effHint
+        }
         let durStr = formatRecordingDuration(elapsedSec)
         let slotTpl = durationSlotTemplate(elapsedSec)
 
-        if !forceFrame && durStr == lastDurText && slotTpl == lastSlotTemplate && isWarn == lastWarnState && hintSlotTpl == lastHintSlotTemplate && recBgCount == lastBgCount {
+        if !forceFrame && durStr == lastDurText && slotTpl == lastSlotTemplate && isWarn == lastWarnState && hintSlotTpl == lastHintSlotTemplate && recBgCount == lastBgCount && holdCancelPreview == lastHoldPreviewState {
             return
         }
-        let needRelayout = forceFrame || (slotTpl != lastSlotTemplate) || (isWarn != lastWarnState) || (hintSlotTpl != lastHintSlotTemplate) || (recBgCount != lastBgCount)
+        let needRelayout = forceFrame || (slotTpl != lastSlotTemplate) || (isWarn != lastWarnState) || (hintSlotTpl != lastHintSlotTemplate) || (recBgCount != lastBgCount) || (holdCancelPreview != lastHoldPreviewState)
         lastDurText = durStr
         lastSlotTemplate = slotTpl
         lastHintSlotTemplate = hintSlotTpl
         lastWarnState = isWarn
         lastBgCount = recBgCount
+        lastHoldPreviewState = holdCancelPreview
 
         if !needRelayout {
             durLabel.stringValue = durStr
-            if isWarn {
+            if isWarn && !holdCancelPreview {
                 hintLabel.stringValue = effHint
             }
             return
@@ -1310,7 +1560,7 @@ final class HudPillController {
         waveView.activeColor = isWarn ? Self.warnWaveActive : Self.recWaveActive
         waveView.quietColor = isWarn ? Self.warnWaveQuiet : Self.recWaveQuiet
         durLabel.textColor = isWarn ? Self.warnMainText : Self.recMainText
-        hintLabel.textColor = isWarn ? Self.warnHintTextCol : Self.recHintTextCol
+        hintLabel.textColor = (isWarn || holdCancelPreview) ? Self.warnHintTextCol : Self.recHintTextCol
 
         iconView.isHidden = true
         label.isHidden = true
@@ -1332,7 +1582,7 @@ final class HudPillController {
         var hintH: CGFloat = 0.0
         if !effHint.isEmpty {
             var tplHintW: CGFloat = 0.0
-            if isWarn {
+            if isWarn && !holdCancelPreview {
                 hintLabel.stringValue = hintSlotTpl
                 hintLabel.sizeToFit()
                 tplHintW = ceil(hintLabel.frame.size.width)
@@ -1407,13 +1657,133 @@ final class HudPillController {
 
     func hideMain() {
         hideWorkItem?.cancel(); hideWorkItem = nil
+        holdPreviewSafetyWorkItem?.cancel(); holdPreviewSafetyWorkItem = nil
         stopWaveTimer()
+        holdCancelPreview = false; lastHoldPreviewState = false
+        currentMainState = ""; currentMainText = ""; currentMainStyle = nil
         maxDurationSec = 0; warnRemainSec = 0
         recBgCount = 0; lastBgCount = 0
         bgBadgeView?.isHidden = true
         isMainVisible = false
         currentMainPillH = 36.0
         panel?.orderOut(nil)
+    }
+
+    func setHoldCancelPreview(_ active: Bool) {
+        holdPreviewSafetyWorkItem?.cancel(); holdPreviewSafetyWorkItem = nil
+        let target = active && canShowHoldCancelPreview
+        if holdCancelPreview == target { return }
+        holdCancelPreview = target
+        if headless || !isMainVisible { return }
+        if isWaveRecording {
+            layoutWavePill(forceFrame: true)
+        } else if let style = currentMainStyle {
+            renderNonWaveMainPill(style: style, rawText: currentMainText, position: currentMainPosition, zh: currentMainZh)
+        }
+    }
+
+    func scheduleHoldPreviewSafetyClear(delayMs: Int = 400) {
+        holdPreviewSafetyWorkItem?.cancel(); holdPreviewSafetyWorkItem = nil
+        guard holdCancelPreview, !headless else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.holdPreviewSafetyWorkItem = nil
+            self?.setHoldCancelPreview(false)
+        }
+        holdPreviewSafetyWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(max(50, delayMs)), execute: work)
+    }
+
+    private func renderNonWaveMainPill(
+        style: HudVisualStyle,
+        rawText: String,
+        position: String,
+        zh: Bool
+    ) {
+        guard let panel = panel, let bgView = bgView, let iconView = iconView, let label = label else { return }
+        let baseSeg = splitHudSegments(rawText)
+        let effZh = rawText.isEmpty ? zh : containsCjkScalar(rawText)
+        let seg: HudSegments
+        let hintColor: NSColor
+        if holdCancelPreview {
+            seg = HudSegments(
+                icon: baseSeg.icon,
+                main: baseSeg.main,
+                hint: "(\(formatHoldCancelHint(zh: effZh)))",
+                hasSpaceBeforeHint: true
+            )
+            hintColor = Self.warnHintTextCol
+        } else {
+            seg = baseSeg
+            hintColor = style.hintText.nsColor
+        }
+        let mainColor = style.mainText.nsColor
+        let iconColor = style.icon.nsColor
+        let bgCol = style.bg.nsColor
+        let bd = style.border.nsColor
+
+        let hasIcon = !seg.icon.isEmpty || !style.iconKind.isEmpty
+        let hasBody = !seg.main.isEmpty || !seg.hint.isEmpty
+        let para = NSMutableParagraphStyle()
+        para.alignment = hasIcon ? .left : .center
+        para.lineBreakMode = .byTruncatingTail
+        let attr = NSMutableAttributedString()
+        if !seg.main.isEmpty {
+            attr.append(NSAttributedString(string: seg.main, attributes: [
+                .font: Self.hudFont, .foregroundColor: mainColor, .paragraphStyle: para,
+            ]))
+        }
+        if !seg.hint.isEmpty {
+            if !seg.hasSpaceBeforeHint && attr.length > 0 {
+                attr.addAttribute(.kern, value: 1.5, range: NSRange(location: attr.length - 1, length: 1))
+            }
+            let prefixSpace = (seg.hasSpaceBeforeHint && attr.length > 0) ? " " : ""
+            attr.append(NSAttributedString(string: prefixSpace + seg.hint, attributes: [
+                .font: Self.hudFont, .foregroundColor: hintColor, .paragraphStyle: para,
+            ]))
+        }
+        label.attributedStringValue = attr
+        label.sizeToFit()
+        label.isHidden = !hasBody
+
+        let textSize = hasBody ? label.frame.size : NSSize(width: 0, height: 18)
+        let (scale, vf) = resolveAnchoredScreenMetrics(refresh: false)
+        let geom = computeStatusHudLayout(
+            isToast: false,
+            hasIcon: hasIcon,
+            hasBody: hasBody,
+            textW: textSize.width,
+            textH: textSize.height,
+            visibleWidth: vf.width,
+            scale: scale
+        )
+        let pillW = geom.pillW
+        let pillH = geom.pillH
+        let pillX = snapToPixel(vf.midX - pillW / 2.0, scale: scale)
+        let pillY = computeHudPillY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, pillH: pillH, position: position)
+        currentMainPillH = pillH
+
+        panel.setFrame(NSRect(x: pillX, y: pillY, width: pillW, height: pillH), display: false)
+        syncToastToAnchor(position: position)
+        bgView.frame = NSRect(x: 0, y: 0, width: pillW, height: pillH)
+        bgView.layer?.contentsScale = scale
+        bgView.layer?.cornerRadius = pillH / 2.0
+        bgView.layer?.backgroundColor = bgCol.cgColor
+        bgView.layer?.borderColor = bd.cgColor
+        bgView.layer?.borderWidth = style.borderWidth
+
+        if hasIcon {
+            iconView.configuredSize = StatusIconView.mainBoxSize
+            iconView.iconKind = Self.resolveIconKind(stateKind: style.iconKind, iconSeg: seg.icon)
+            iconView.iconColor = iconColor
+            iconView.frame = alignSubviewRect(geom.iconFrame, in: bgView, scale: scale)
+            iconView.layer?.contentsScale = scale
+            iconView.isHidden = false
+        } else {
+            iconView.isHidden = true
+        }
+        if hasBody {
+            label.frame = alignSubviewRect(geom.labelFrame, in: bgView, scale: scale)
+        }
     }
 
     func hideToast() {
@@ -1447,9 +1817,11 @@ final class HudPillController {
         maxDurationSec: Int,
         warnRemainSec: Int,
         zh: Bool,
-        bgCount: Int = 0
+        bgCount: Int = 0,
+        preserveHoldPreview: Bool = false
     ) {
         hideWorkItem?.cancel(); hideWorkItem = nil
+        holdPreviewSafetyWorkItem?.cancel(); holdPreviewSafetyWorkItem = nil
 
         var txt = style.defaultText
         var waveMode = false
@@ -1463,6 +1835,13 @@ final class HudPillController {
         if !customText.isEmpty { txt = customText }
         let autoHideMs = (durationMs > 0) ? durationMs : style.autoHideMs
         let seg = splitHudSegments(txt)
+
+        currentMainState = st
+        currentMainText = txt
+        currentMainStyle = style
+        currentMainPosition = position
+        currentMainZh = zh
+        holdCancelPreview = preserveHoldPreview && isCancellableMainHudState(st)
 
         if headless {
             if waveMode {
@@ -1486,7 +1865,7 @@ final class HudPillController {
         }
 
         ensurePanel()
-        guard let panel = panel, let bgView = bgView, let iconView = iconView, let label = label else { return }
+        guard let panel = panel else { return }
 
         if waveMode {
             recHintText = seg.hint
@@ -1507,6 +1886,7 @@ final class HudPillController {
                 lastHintSlotTemplate = ""
                 lastWarnState = false
                 lastBgCount = -1
+                lastHoldPreviewState = false
                 let initLvl = currentLiveLevel()
                 waveView?.barNorms = (initLvl > 0.0) ? stepWaveEnvelope(initLvl) : Array(repeating: 0.0, count: 9)
             }
@@ -1523,75 +1903,7 @@ final class HudPillController {
             hintLabel?.isHidden = true
             bgBadgeView?.isHidden = true
 
-            let mainColor = style.mainText.nsColor
-            let hintColor = style.hintText.nsColor
-            let iconColor = style.icon.nsColor
-            let bgCol = style.bg.nsColor
-            let bd = style.border.nsColor
-
-            let hasIcon = !seg.icon.isEmpty || !style.iconKind.isEmpty
-            let hasBody = !seg.main.isEmpty || !seg.hint.isEmpty
-            let para = NSMutableParagraphStyle()
-            para.alignment = hasIcon ? .left : .center
-            para.lineBreakMode = .byTruncatingTail
-            let attr = NSMutableAttributedString()
-            if !seg.main.isEmpty {
-                attr.append(NSAttributedString(string: seg.main, attributes: [
-                    .font: Self.hudFont, .foregroundColor: mainColor, .paragraphStyle: para,
-                ]))
-            }
-            if !seg.hint.isEmpty {
-                if !seg.hasSpaceBeforeHint && attr.length > 0 {
-                    attr.addAttribute(.kern, value: 1.5, range: NSRange(location: attr.length - 1, length: 1))
-                }
-                let prefixSpace = (seg.hasSpaceBeforeHint && attr.length > 0) ? " " : ""
-                attr.append(NSAttributedString(string: prefixSpace + seg.hint, attributes: [
-                    .font: Self.hudFont, .foregroundColor: hintColor, .paragraphStyle: para,
-                ]))
-            }
-            label.attributedStringValue = attr
-            label.sizeToFit()
-            label.isHidden = !hasBody
-
-            let textSize = hasBody ? label.frame.size : NSSize(width: 0, height: 18)
-            let (scale, vf) = resolveAnchoredScreenMetrics(refresh: false)
-            let geom = computeStatusHudLayout(
-                isToast: false,
-                hasIcon: hasIcon,
-                hasBody: hasBody,
-                textW: textSize.width,
-                textH: textSize.height,
-                visibleWidth: vf.width,
-                scale: scale
-            )
-            let pillW = geom.pillW
-            let pillH = geom.pillH
-            let pillX = snapToPixel(vf.midX - pillW / 2.0, scale: scale)
-            let pillY = computeHudPillY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, pillH: pillH, position: position)
-            currentMainPillH = pillH
-
-            panel.setFrame(NSRect(x: pillX, y: pillY, width: pillW, height: pillH), display: false)
-            syncToastToAnchor(position: position)
-            bgView.frame = NSRect(x: 0, y: 0, width: pillW, height: pillH)
-            bgView.layer?.contentsScale = scale
-            bgView.layer?.cornerRadius = pillH / 2.0
-            bgView.layer?.backgroundColor = bgCol.cgColor
-            bgView.layer?.borderColor = bd.cgColor
-            bgView.layer?.borderWidth = style.borderWidth
-
-            if hasIcon {
-                iconView.configuredSize = StatusIconView.mainBoxSize
-                iconView.iconKind = Self.resolveIconKind(stateKind: style.iconKind, iconSeg: seg.icon)
-                iconView.iconColor = iconColor
-                iconView.frame = alignSubviewRect(geom.iconFrame, in: bgView, scale: scale)
-                iconView.layer?.contentsScale = scale
-                iconView.isHidden = false
-            } else {
-                iconView.isHidden = true
-            }
-            if hasBody {
-                label.frame = alignSubviewRect(geom.labelFrame, in: bgView, scale: scale)
-            }
+            renderNonWaveMainPill(style: style, rawText: txt, position: position, zh: zh)
             isMainVisible = true
             panel.orderFrontRegardless()
         }
@@ -1731,7 +2043,8 @@ final class HudPillController {
         layer: String = "",
         clearMain: Bool? = nil,
         clearToast: Bool? = nil,
-        bgCount: Int = 0
+        bgCount: Int = 0,
+        preserveHoldPreview: Bool = false
     ) {
         let st = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if st.isEmpty || st == "idle" || st == "hide" {
@@ -1764,7 +2077,8 @@ final class HudPillController {
                 maxDurationSec: maxDurationSec,
                 warnRemainSec: warnRemainSec,
                 zh: zh,
-                bgCount: bgCount
+                bgCount: bgCount,
+                preserveHoldPreview: preserveHoldPreview
             )
         } else {
             updateToast(
@@ -2428,7 +2742,8 @@ private func runHudLayoutSelfCheck() throws -> Int {
         bgCount: Int,
         zh: Bool,
         visibleW: CGFloat,
-        scale: CGFloat
+        scale: CGFloat,
+        holdCancelPreview: Bool = false
     ) throws {
         let seg = splitHudSegments(text)
         var isWarn = false
@@ -2437,9 +2752,16 @@ private func runHudLayoutSelfCheck() throws -> Int {
             remainSec = max(0, maxDurSec - elapsedSec)
             isWarn = (remainSec <= warnRemSec)
         }
-        let rawHint = isWarn ? formatCountdownHint(remainSec, zh: zh) : seg.hint
-        let effHint = stripOuterParens(rawHint)
-        let hintTpl = isWarn ? stripOuterParens(countdownHintSlotTemplate(remainSec, zh: zh)) : effHint
+        let effHint: String
+        let hintTpl: String
+        if holdCancelPreview {
+            effHint = formatHoldCancelHint(zh: zh)
+            hintTpl = effHint
+        } else {
+            let rawHint = isWarn ? formatCountdownHint(remainSec, zh: zh) : seg.hint
+            effHint = stripOuterParens(rawHint)
+            hintTpl = isWarn ? stripOuterParens(countdownHintSlotTemplate(remainSec, zh: zh)) : effHint
+        }
         let durStr = formatRecordingDuration(elapsedSec)
         let durTpl = durationSlotTemplate(elapsedSec)
 
@@ -2449,7 +2771,7 @@ private func runHudLayoutSelfCheck() throws -> Int {
         leftPara.alignment = .left
 
         let mainCol = isWarn ? rgba(254, 252, 232) : rgba(248, 250, 252)
-        let hintCol = isWarn ? rgba(251, 191, 36, 1.0) : rgba(188, 178, 192, 1.0)
+        let hintCol = (isWarn || holdCancelPreview) ? rgba(251, 191, 36, 1.0) : rgba(188, 178, 192, 1.0)
         let bgCol = isWarn ? rgba(72, 38, 12, 0.98) : rgba(64, 18, 26, 0.98)
         let borderCol = isWarn ? rgba(245, 158, 11, 0.72) : rgba(232, 88, 102, 0.68)
         let waveCol = isWarn ? rgba(251, 191, 36, 1.0) : rgba(255, 104, 112, 1.0)
@@ -2588,12 +2910,18 @@ private func runHudLayoutSelfCheck() throws -> Int {
         explicitLayer: String,
         zh: Bool,
         visibleW: CGFloat,
-        scale: CGFloat
+        scale: CGFloat,
+        holdCancelPreview: Bool = false
     ) throws {
         let style = resolveHudVisualStyle(state: state, explicitLayer: explicitLayer, zh: zh)
         let isToast = (style.layer == "toast")
         let rawTxt = customText.isEmpty ? style.defaultText : customText
-        let seg = splitHudSegments(rawTxt)
+        let baseSeg = splitHudSegments(rawTxt)
+        let effHold = holdCancelPreview && !isToast && isCancellableMainHudState(state)
+        let seg = effHold
+            ? HudSegments(icon: baseSeg.icon, main: baseSeg.main, hint: "(\(formatHoldCancelHint(zh: zh)))", hasSpaceBeforeHint: true)
+            : baseSeg
+        let hintCol = effHold ? rgba(251, 191, 36, 1.0) : style.hintText.nsColor
         let effIconKind = HudPillController.resolveIconKind(stateKind: style.iconKind, iconSeg: seg.icon)
         let hasIcon = isToast ? !effIconKind.isEmpty : (!seg.icon.isEmpty || !style.iconKind.isEmpty)
         let bodyTxt = isToast ? stripLeadingHudSymbol(rawTxt) : (seg.main + (seg.hint.isEmpty ? "" : ((seg.hasSpaceBeforeHint ? " " : "") + seg.hint)))
@@ -2612,7 +2940,7 @@ private func runHudLayoutSelfCheck() throws -> Int {
             }
             if !seg.hint.isEmpty {
                 let prefixSpace = (seg.hasSpaceBeforeHint && attr.length > 0) ? " " : ""
-                attr.append(NSAttributedString(string: prefixSpace + seg.hint, attributes: [.font: font, .foregroundColor: style.hintText.nsColor, .paragraphStyle: para]))
+                attr.append(NSAttributedString(string: prefixSpace + seg.hint, attributes: [.font: font, .foregroundColor: hintCol, .paragraphStyle: para]))
             }
         }
         let measured = hasBody ? measureCell(attr) : NSSize(width: 0.0, height: isToast ? 17.0 : 18.0)
@@ -2764,6 +3092,67 @@ private func runHudLayoutSelfCheck() throws -> Int {
                 scale: spec.scale
             )
             cases += 1
+            try renderAndVerifyWave(
+                label: "mac_rec_hold_\(langTag)_s\(Int(spec.scale))",
+                text: recTexts[0],
+                elapsedSec: 12,
+                maxDurSec: 0,
+                warnRemSec: 0,
+                bgCount: 0,
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale,
+                holdCancelPreview: true
+            )
+            cases += 1
+            try renderAndVerifyWave(
+                label: "mac_rec_hold_bg2_\(langTag)_s\(Int(spec.scale))",
+                text: recTexts[2],
+                elapsedSec: 65,
+                maxDurSec: 600,
+                warnRemSec: 15,
+                bgCount: 2,
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale,
+                holdCancelPreview: true
+            )
+            cases += 1
+            try renderAndVerifyWave(
+                label: "mac_rec_hold_warn_\(langTag)_s\(Int(spec.scale))",
+                text: recTexts[0],
+                elapsedSec: 55,
+                maxDurSec: 60,
+                warnRemSec: 15,
+                bgCount: 1,
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale,
+                holdCancelPreview: true
+            )
+            cases += 1
+            try renderAndVerifyStatus(
+                label: "mac_main_recognizing_hold_\(langTag)_s\(Int(spec.scale))",
+                state: "recognizing",
+                customText: "",
+                explicitLayer: "main",
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale,
+                holdCancelPreview: true
+            )
+            cases += 1
+            try renderAndVerifyStatus(
+                label: "mac_main_refining_hold_\(langTag)_s\(Int(spec.scale))",
+                state: "refining",
+                customText: "",
+                explicitLayer: "main",
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale,
+                holdCancelPreview: true
+            )
+            cases += 1
 
             for st in mainStates {
                 try renderAndVerifyStatus(
@@ -2842,8 +3231,31 @@ private func runHudLayoutSelfCheck() throws -> Int {
     try assertLayout(ctrl.debugToastVisible && ctrl.debugToastSlotCount == 1, "slot re-show toast reuses single slot")
     ctrl.update(state: "recording", customText: "", durationMs: 0, clearToast: nil, bgCount: 0)
     try assertLayout(ctrl.debugMainVisible && !ctrl.debugToastVisible, "slot fresh recording default clearToast clears toast")
+
+    // Verify hold-to-cancel preview activates ONLY on cancellable main states and restores cleanly
+    ctrl.update(state: "recording", customText: "● 录音中… (按右 Ctrl 结束)", durationMs: 0, clearToast: false, bgCount: 2)
+    ctrl.update(state: "audio_recovered", customText: "", durationMs: 0, layer: "toast", clearMain: false)
+    ctrl.setHoldCancelPreview(true)
+    try assertLayout(ctrl.debugHoldPreviewActive && ctrl.debugMainEffectiveHint == formatHoldCancelHint(zh: true) && ctrl.debugMainBgCount == 2 && ctrl.debugToastVisible, "slot recording hold preview zh")
+    ctrl.setHoldCancelPreview(false)
+    try assertLayout(!ctrl.debugHoldPreviewActive && ctrl.debugMainEffectiveHint != formatHoldCancelHint(zh: true) && ctrl.debugMainBgCount == 2 && ctrl.debugToastVisible, "slot recording hold preview restore")
+
+    ctrl.update(state: "refining", customText: "◈ Refining…", durationMs: 0, layer: "main", clearToast: false)
+    ctrl.setHoldCancelPreview(true)
+    try assertLayout(ctrl.debugHoldPreviewActive && ctrl.debugMainEffectiveHint == "(\(formatHoldCancelHint(zh: false)))", "slot refining hold preview en")
+    ctrl.setHoldCancelPreview(false)
+    try assertLayout(!ctrl.debugHoldPreviewActive && ctrl.debugMainEffectiveHint.isEmpty, "slot refining hold preview restore")
+
+    ctrl.update(state: "done", customText: "", durationMs: 900, layer: "main", clearToast: false)
+    ctrl.setHoldCancelPreview(true)
+    try assertLayout(!ctrl.debugHoldPreviewActive, "slot done ignores hold preview")
+    ctrl.update(state: "copied", customText: "", durationMs: 2000, layer: "main", clearToast: false)
+    ctrl.setHoldCancelPreview(true)
+    try assertLayout(!ctrl.debugHoldPreviewActive, "slot copied ignores hold preview")
+
     ctrl.update(state: "hide_all", customText: "", durationMs: 0)
-    try assertLayout(!ctrl.debugMainVisible && !ctrl.debugToastVisible, "slot hide_all clears both")
+    ctrl.setHoldCancelPreview(true)
+    try assertLayout(!ctrl.debugMainVisible && !ctrl.debugToastVisible && !ctrl.debugHoldPreviewActive, "slot hide_all clears both")
 
     return cases
 }
@@ -2862,44 +3274,172 @@ private func runSelfCheck() -> Int32 {
         try check(try resolveTargetKey("F8").primaryKeyCode == 0x64 && (try resolveTargetKey("F20")).primaryKeyCode == 0x5A, "F-keys")
 
         // 1-3: RControl via standard (0x3E+mask), mask-only (0x3B+0x2000), and keyCode-only (0x3E+FLAG_CONTROL)
-        var eng = HotkeyEngine(spec: rctrl, isPtt: false, tapMaxMs: 1200, debounceMs: 180, keyTest: false)
+        var hotkeyFsmChecks = 0
+        var eng = HotkeyEngine(spec: rctrl, isPtt: false, tapMaxMs: 500, holdCancelMs: 800, holdHintMs: 250, debounceMs: 180, keyTest: false)
         for (idx, (kc, flags)) in [(UInt16(0x3E), FLAG_CONTROL | NX_DEVICERCTLKEYMASK), (UInt16(0x3B), FLAG_CONTROL | NX_DEVICERCTLKEYMASK), (UInt16(0x3E), FLAG_CONTROL)].enumerated() {
             let t = UInt64(1000 + idx * 500)
-            try check(eng.handleEvent(kind: .flagsChanged, keyCode: kc, rawFlags: flags, isARepeat: false, nowMs: t, keyDownCounter: 10).isEmpty, "down \(idx)")
-            let up = eng.handleEvent(kind: .flagsChanged, keyCode: kc, rawFlags: 0, isARepeat: false, nowMs: t + 100, keyDownCounter: 10)
-            try check(up.count == 1 && up[0].kind == "toggle", "up \(idx)")
+            let downStep = eng.handleEventStep(kind: .flagsChanged, keyCode: kc, rawFlags: flags, isARepeat: false, nowMs: t, keyDownCounter: 10)
+            try check(downStep.events.isEmpty && downStep.armTimers && downStep.hintDelayMs == 250 && downStep.cancelDelayMs == 800, "down \(idx)")
+            let upStep = eng.handleEventStep(kind: .flagsChanged, keyCode: kc, rawFlags: 0, isARepeat: false, nowMs: t + 100, keyDownCounter: 10)
+            try check(upStep.cancelTimers && !upStep.clearHoldPreview && upStep.events.count == 1 && upStep.events[0].kind == "toggle", "up \(idx)")
         }
+        // Boundary 500ms exact -> toggle
+        _ = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 3000, keyDownCounter: 10)
+        let tap500 = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 3500, keyDownCounter: 10)
+        try check(tap500.events.count == 1 && tap500.events[0].kind == "toggle", "tap 500ms boundary")
+        hotkeyFsmChecks += 1
 
         // 4: LControl must NOT trigger RControl
-        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3B, rawFlags: FLAG_CONTROL | NX_DEVICELCTLKEYMASK, isARepeat: false, nowMs: 2600, keyDownCounter: 10)
-        try check(eng.handleEvent(kind: .flagsChanged, keyCode: 0x3B, rawFlags: 0, isARepeat: false, nowMs: 2700, keyDownCounter: 10).isEmpty, "LControl isolation")
+        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3B, rawFlags: FLAG_CONTROL | NX_DEVICELCTLKEYMASK, isARepeat: false, nowMs: 4000, keyDownCounter: 10)
+        try check(eng.handleEvent(kind: .flagsChanged, keyCode: 0x3B, rawFlags: 0, isARepeat: false, nowMs: 4100, keyDownCounter: 10).isEmpty, "LControl isolation")
+        hotkeyFsmChecks += 1
 
         // 5: FlagsChanged-only + counter increment suppresses tap_toggle AND emits ptt_cancel on PTT release
-        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 3000, keyDownCounter: 10)
-        try check(eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 3120, keyDownCounter: 11).isEmpty, "counter chord tap suppression")
+        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 4500, keyDownCounter: 10)
+        try check(eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 4620, keyDownCounter: 11).isEmpty, "counter chord tap suppression")
 
-        var pttEng = HotkeyEngine(spec: rctrl, isPtt: true, tapMaxMs: 1200, debounceMs: 180, keyTest: false)
-        let ps1 = pttEng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 4000, keyDownCounter: 20)
-        let pc1 = pttEng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 4150, keyDownCounter: 21)
-        try check(ps1.count == 1 && ps1[0].kind == "ptt_start" && pc1.count == 1 && pc1[0].kind == "ptt_cancel", "counter-only ptt_cancel")
+        var pttEng = HotkeyEngine(spec: rctrl, isPtt: true, tapMaxMs: 500, holdCancelMs: 800, holdHintMs: 250, debounceMs: 180, keyTest: false)
+        let ps1 = pttEng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 5000, keyDownCounter: 20)
+        let pc1 = pttEng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 5150, keyDownCounter: 21)
+        try check(!ps1.armTimers && ps1.events.count == 1 && ps1.events[0].kind == "ptt_start" && pc1.events.count == 1 && pc1.events[0].kind == "ptt_cancel", "counter-only ptt_cancel")
+        let ps2 = pttEng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 6000, keyDownCounter: 21)
+        let pe2 = pttEng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 7500, keyDownCounter: 21)
+        try check(!ps2.armTimers && ps2.events.count == 1 && ps2.events[0].kind == "ptt_start" && pe2.events.count == 1 && pe2.events[0].kind == "ptt_stop", "ptt >800ms release emits ptt_stop")
+        hotkeyFsmChecks += 1
 
         // 6: Swallowed .keyUp recovery via isKeyPhysicallyDown physical state check
-        _ = eng.handleEvent(kind: .keyDown, keyCode: 0x08, rawFlags: 0, isARepeat: false, nowMs: 5000, keyDownCounter: 30)
+        _ = eng.handleEvent(kind: .keyDown, keyCode: 0x08, rawFlags: 0, isARepeat: false, nowMs: 8000, keyDownCounter: 30)
         try check(eng.otherKeysDown.contains(0x08), "otherKeysDown recorded")
         // Physical state reports key 0x08 is no longer held -> pruned, so subsequent RControl tap succeeds!
-        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 5500, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 8500, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
         try check(eng.otherKeysDown.isEmpty, "stale key pruned")
-        let recov = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 5600, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        let recov = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 8600, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
         try check(recov.count == 1 && recov[0].kind == "toggle", "recovered toggle after swallowed keyUp")
+        hotkeyFsmChecks += 1
 
-        // 7: Isolated long-press in tap_toggle (1200ms < held <= 8000ms) emits hold_cancel; >8000ms or chord-tainted is ignored
-        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 6000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
-        let hcOk = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 7500, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
-        try check(hcOk.count == 1 && hcOk[0].kind == "hold_cancel" && hcOk[0].holdMs == 1500, "tap_toggle hold_cancel")
-        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 8000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
-        try check(eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 17000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false }).isEmpty, "hold >8000ms ignored")
-        _ = eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 18000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
-        try check(eng.handleEvent(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 19500, keyDownCounter: 31, isKeyPhysicallyDown: { _ in false }).isEmpty, "chord-tainted hold ignored")
+        // 7: Hesitation deadzone (501ms..799ms): 250ms preview shows, release restores preview and emits ZERO events
+        let dzDown = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 9000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        let dzHint = eng.onHoldHintTimeout(gen: dzDown.timerGen, nowMs: 9250, keyDownCounter: 30, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false })
+        try check(dzHint.showHoldPreview && eng.holdHintShown, "250ms hold preview activates")
+        let dzUp = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 9600, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        try check(dzUp.cancelTimers && dzUp.clearHoldPreview && dzUp.events.isEmpty, "600ms deadzone silent & clears preview")
+        _ = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 10000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        try check(eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 10501, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false }).events.isEmpty, "501ms deadzone silent")
+        _ = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 11000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        try check(eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 11799, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false }).events.isEmpty, "799ms deadzone silent")
+        hotkeyFsmChecks += 1
+
+        // 8: Real-time 800ms hold_cancel BEFORE keyup + keyup swallowed even after >8000ms + stale gen ignored
+        let hcDown = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 12000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        let hcHint = eng.onHoldHintTimeout(gen: hcDown.timerGen, nowMs: 12250, keyDownCounter: 30, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false })
+        try check(hcHint.showHoldPreview, "hold hint before real-time cancel")
+        let hcFire = eng.onHoldCancelTimeout(gen: hcDown.timerGen, nowMs: 12800, keyDownCounter: 30, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false })
+        try check(eng.holdFired && hcFire.armPreviewSafetyClear && hcFire.events.count == 1 && hcFire.events[0].kind == "hold_cancel" && hcFire.events[0].holdMs == 800, "real-time 800ms hold_cancel")
+        let hcStale = eng.onHoldCancelTimeout(gen: hcDown.timerGen, nowMs: 12900, keyDownCounter: 30, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false })
+        try check(hcStale.events.isEmpty, "stale hold timer ignored")
+        let hcUpLate = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 24000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        try check(hcUpLate.events.isEmpty && !eng.targetDown && !eng.holdFired, "post-hold_cancel keyup after 12s swallowed")
+        hotkeyFsmChecks += 1
+
+        // 9: Timer jitter fallback: release at 805ms before timer tick still emits hold_cancel once
+        let jitDown = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 25000, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        _ = eng.onHoldHintTimeout(gen: jitDown.timerGen, nowMs: 25250, keyDownCounter: 30, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false })
+        let jitUp = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 25805, keyDownCounter: 30, isKeyPhysicallyDown: { _ in false })
+        try check(jitUp.events.count == 1 && jitUp.events[0].kind == "hold_cancel" && jitUp.events[0].holdMs == 805 && jitUp.armPreviewSafetyClear, "jitter fallback hold_cancel")
+        hotkeyFsmChecks += 1
+
+        // 10: No Input Monitoring timer callback secondary check (keyDownCounter increment + other modifier + lost release)
+        let nmDown = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 27000, keyDownCounter: 40, isKeyPhysicallyDown: { _ in false })
+        let nmHintBlocked = eng.onHoldHintTimeout(gen: nmDown.timerGen, nowMs: 27250, keyDownCounter: 41, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false })
+        try check(!nmHintBlocked.showHoldPreview && eng.chordTainted, "timer hint recheck catches counter increment")
+        let nmCancelBlocked = eng.onHoldCancelTimeout(gen: nmDown.timerGen, nowMs: 27800, keyDownCounter: 41, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false })
+        try check(nmCancelBlocked.events.isEmpty, "timer cancel blocked after counter taint")
+        _ = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 27900, keyDownCounter: 41, isKeyPhysicallyDown: { _ in false })
+
+        // Mid-preview counter taint at 800ms clears preview & blocks cancel
+        let mpDown = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 29000, keyDownCounter: 50, isKeyPhysicallyDown: { _ in false })
+        let mpHint = eng.onHoldHintTimeout(gen: mpDown.timerGen, nowMs: 29250, keyDownCounter: 50, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false })
+        try check(mpHint.showHoldPreview, "mid-preview hint shown")
+        let mpCancel = eng.onHoldCancelTimeout(gen: mpDown.timerGen, nowMs: 29800, keyDownCounter: 51, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false })
+        try check(mpCancel.events.isEmpty && mpCancel.clearHoldPreview && eng.chordTainted, "800ms counter recheck clears preview & blocks cancel")
+        _ = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 29900, keyDownCounter: 51, isKeyPhysicallyDown: { _ in false })
+
+        // Other modifier (Shift) or target no longer physically down in timer callback
+        let modDown = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 31000, keyDownCounter: 60, isKeyPhysicallyDown: { _ in false })
+        let modCancel = eng.onHoldCancelTimeout(gen: modDown.timerGen, nowMs: 31800, keyDownCounter: 60, rawFlags: FLAG_CONTROL | FLAG_SHIFT, isKeyPhysicallyDown: { _ in false })
+        try check(modCancel.events.isEmpty && eng.chordTainted, "timer cancel catches other modifier flags")
+        _ = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 31900, keyDownCounter: 60, isKeyPhysicallyDown: { _ in false })
+
+        let lostDown = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 33000, keyDownCounter: 70, isKeyPhysicallyDown: { _ in false })
+        let lostCheck = eng.onHoldHintTimeout(gen: lostDown.timerGen, nowMs: 33250, keyDownCounter: 70, rawFlags: 0, isKeyPhysicallyDown: { _ in false })
+        try check(!lostCheck.showHoldPreview && !eng.targetDown, "timer recovers stuck targetDown when rawFlags=0")
+        hotkeyFsmChecks += 1
+
+        // 11: holdCancelMs = 0 disables hold timers cleanly; tight threshold keeps holdHintMs strictly < holdCancelMs
+        var noHoldEng = HotkeyEngine(spec: rctrl, isPtt: false, tapMaxMs: 500, holdCancelMs: 0, holdHintMs: 250, debounceMs: 180, keyTest: false)
+        try check(noHoldEng.holdCancelMs == 0 && noHoldEng.holdHintMs == 0, "holdCancelMs=0 disables timers")
+        let nhDown = noHoldEng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 1000, keyDownCounter: 1)
+        try check(!nhDown.armTimers, "holdCancelMs=0 does not arm timers")
+        try check(noHoldEng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 2500, keyDownCounter: 1).events.isEmpty, "holdCancelMs=0 ignores long release")
+        let tightEng = HotkeyEngine(spec: rctrl, isPtt: false, tapMaxMs: 50, holdCancelMs: 80, holdHintMs: 250, debounceMs: 0, keyTest: false)
+        try check(tightEng.tapMaxMs == 50 && tightEng.holdCancelMs == 80 && tightEng.holdHintMs == 40 && tightEng.holdHintMs < tightEng.holdCancelMs, "tight holdHintMs strictly < holdCancelMs")
+        hotkeyFsmChecks += 1
+
+        // 12: No Input Monitoring pre-held regular key before pressing modifier hotkey -> immediately taints & blocks both hold_cancel and toggle
+        let preKeyDown = eng.handleEventStep(
+            kind: .flagsChanged,
+            keyCode: 0x3E,
+            rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK,
+            isARepeat: false,
+            nowMs: 35000,
+            keyDownCounter: 80,
+            isKeyPhysicallyDown: { _ in false },
+            hasOtherNonModifierKeyDown: { true }
+        )
+        try check(eng.chordTainted && !preKeyDown.armTimers && preKeyDown.events.isEmpty, "pre-held normal key taints modifier down")
+        try check(
+            !eng.onHoldHintTimeout(
+                gen: preKeyDown.timerGen,
+                nowMs: 35250,
+                keyDownCounter: 80,
+                rawFlags: FLAG_CONTROL,
+                isKeyPhysicallyDown: { _ in false },
+                hasOtherNonModifierKeyDown: { true }
+            ).showHoldPreview,
+            "pre-held normal key blocks hint"
+        )
+        try check(
+            eng.onHoldCancelTimeout(
+                gen: preKeyDown.timerGen,
+                nowMs: 35800,
+                keyDownCounter: 80,
+                rawFlags: FLAG_CONTROL,
+                isKeyPhysicallyDown: { _ in false },
+                hasOtherNonModifierKeyDown: { true }
+            ).events.isEmpty,
+            "pre-held normal key blocks hold_cancel"
+        )
+        try check(
+            eng.handleEventStep(
+                kind: .flagsChanged,
+                keyCode: 0x3E,
+                rawFlags: 0,
+                isARepeat: false,
+                nowMs: 35900,
+                keyDownCounter: 80,
+                isKeyPhysicallyDown: { _ in false },
+                hasOtherNonModifierKeyDown: { false }
+            ).events.isEmpty,
+            "pre-held normal key release swallowed"
+        )
+        // Normal key detected physically down at 800ms timer callback clears preview and blocks hold_cancel
+        let midScanDown = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: FLAG_CONTROL | NX_DEVICERCTLKEYMASK, isARepeat: false, nowMs: 37000, keyDownCounter: 80, isKeyPhysicallyDown: { _ in false }, hasOtherNonModifierKeyDown: { false })
+        let midScanHint = eng.onHoldHintTimeout(gen: midScanDown.timerGen, nowMs: 37250, keyDownCounter: 80, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false }, hasOtherNonModifierKeyDown: { false })
+        try check(midScanHint.showHoldPreview, "mid-scan preview shown")
+        let midScanCancel = eng.onHoldCancelTimeout(gen: midScanDown.timerGen, nowMs: 37800, keyDownCounter: 80, rawFlags: FLAG_CONTROL, isKeyPhysicallyDown: { _ in false }, hasOtherNonModifierKeyDown: { true })
+        try check(midScanCancel.events.isEmpty && midScanCancel.clearHoldPreview && eng.chordTainted, "mid-scan physical normal key clears preview & blocks hold_cancel")
+        _ = eng.handleEventStep(kind: .flagsChanged, keyCode: 0x3E, rawFlags: 0, isARepeat: false, nowMs: 37900, keyDownCounter: 80, isKeyPhysicallyDown: { _ in false }, hasOtherNonModifierKeyDown: { false })
+        hotkeyFsmChecks += 1
 
         try check(isZhUiCulture("zh-Hans-CN") && isZhUiCulture("zh_TW.UTF-8") && !isZhUiCulture("en-US"), "ui_culture zh detection")
         try check(computeHudPillY(visibleMinY: 50.0, visibleMaxY: 900.0, pillH: 36.0, position: "bottom") == 58.0, "HUD bottom pillY")
@@ -3107,7 +3647,7 @@ private func runSelfCheck() -> Int32 {
         #else
         let archName = "unknown"
         #endif
-        writeJsonLine(["ok": true, "mode": "self-check", "arch": archName, "rcontrol_vk": String(format: "0x%02X", rctrl.primaryKeyCode), "rcontrol_mask": String(format: "0x%04X", rctrl.deviceMask), "ui_culture": hostUiCulture(), "ax_trusted": AXIsProcessTrusted(), "listen_event_access": CGPreflightListenEventAccess(), "hud_layout_cases": hudLayoutCases, "audio_status": audioSt])
+        writeJsonLine(["ok": true, "mode": "self-check", "arch": archName, "rcontrol_vk": String(format: "0x%02X", rctrl.primaryKeyCode), "rcontrol_mask": String(format: "0x%04X", rctrl.deviceMask), "ui_culture": hostUiCulture(), "ax_trusted": AXIsProcessTrusted(), "listen_event_access": CGPreflightListenEventAccess(), "hud_layout_cases": hudLayoutCases, "hotkey_fsm_checks": hotkeyFsmChecks, "audio_status": audioSt])
         return 0
     } catch {
         fputs("self-check error: \(error.localizedDescription)\n", stderr)
@@ -3118,7 +3658,7 @@ private func runSelfCheck() -> Int32 {
 @main
 struct MacShimMain {
     static func main() {
-        var (mode, hotkey, triggerMode, tapMaxMs, debounceMs, seconds) = ("bridge", "RControl", "tap_toggle", 1200, 180, 10)
+        var (mode, hotkey, triggerMode, tapMaxMs, holdCancelMs, holdHintMs, debounceMs, seconds) = ("bridge", "RControl", "tap_toggle", 500, 800, 250, 180, 10)
         let args = CommandLine.arguments
         var i = 1
         while i < args.count {
@@ -3130,6 +3670,8 @@ struct MacShimMain {
             case "--hotkey", "-hotkey": if let v = nextVal { hotkey = v; i += 2 } else { i += 1 }
             case "--trigger-mode", "-triggermode": if let v = nextVal { triggerMode = v.lowercased(); i += 2 } else { i += 1 }
             case "--tap-max-ms", "-tapmaxms": if let v = nextVal, let n = Int(v) { tapMaxMs = n; i += 2 } else { i += 1 }
+            case "--hold-cancel-ms", "-holdcancelms": if let v = nextVal, let n = Int(v) { holdCancelMs = n; i += 2 } else { i += 1 }
+            case "--hold-hint-ms", "-holdhintms": if let v = nextVal, let n = Int(v) { holdHintMs = n; i += 2 } else { i += 1 }
             case "--debounce-ms", "-debouncems": if let v = nextVal, let n = Int(v) { debounceMs = n; i += 2 } else { i += 1 }
             case "--seconds", "-seconds": if let v = nextVal, let n = Int(v) { seconds = max(1, n); i += 2 } else { i += 1 }
             default: i += 1
@@ -3151,15 +3693,111 @@ struct MacShimMain {
         let hud = HudPillController(hotkeyLabel: spec.hudLabel, hotkeyLabelEn: spec.hudLabelEn, isPtt: isPtt)
         let audioMonitor = CoreAudioInputMonitor()
         let pasteboardGuard = PasteboardGuard()
-        var engine = HotkeyEngine(spec: spec, isPtt: isPtt, tapMaxMs: tapMaxMs, debounceMs: debounceMs, keyTest: isKeyTest)
+        var engine = HotkeyEngine(
+            spec: spec,
+            isPtt: isPtt,
+            tapMaxMs: tapMaxMs,
+            holdCancelMs: holdCancelMs,
+            holdHintMs: holdHintMs,
+            debounceMs: debounceMs,
+            keyTest: isKeyTest
+        )
         var globalMonitor: Any?
+        var holdHintWorkItem: DispatchWorkItem?
+        var holdCancelWorkItem: DispatchWorkItem?
+
+        let cancelHoldWorkItems: () -> Void = {
+            holdHintWorkItem?.cancel(); holdHintWorkItem = nil
+            holdCancelWorkItem?.cancel(); holdCancelWorkItem = nil
+        }
 
         let cleanupAndExit: (Int32) -> Never = { code in
+            cancelHoldWorkItems()
             if let gm = globalMonitor { NSEvent.removeMonitor(gm); globalMonitor = nil }
             pasteboardGuard.flushPendingRestore()
             audioMonitor.stop()
             hud.close()
             Foundation.exit(code)
+        }
+
+        let emitStepEvents: ([EmittedEvent], UInt64) -> Void = { emitted, now in
+            for item in emitted {
+                if isKeyTest {
+                    let kname = KEY_CODE_NAMES[item.vk] ?? String(format: "VK_0x%02X", item.vk)
+                    var ktPayload: [String: Any] = ["event": item.kind, "vk": String(format: "0x%02X", item.vk), "key_name": kname, "flags": String(format: "0x%X", item.flags), "is_down": item.isDown, "tainted": item.tainted]
+                    if item.kind == "hold_cancel" { ktPayload["hold_ms"] = item.holdMs }
+                    writeJsonLine(ktPayload)
+                } else {
+                    let fg = queryFrontmostApp()
+                    var payload: [String: Any] = ["event": item.kind, "hwnd": fg.hwnd, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": fg.title, "document": fg.document, "ax_trusted": fg.axTrusted, "ts_ms": now]
+                    if item.kind == "hold_cancel" { payload["hold_ms"] = item.holdMs }
+                    writeJsonLine(payload)
+                }
+            }
+        }
+
+        let checkOtherNonModDown: () -> Bool = {
+            spec.isModifier ? hasAnyNonModifierKeyPhysicallyDown(excluding: spec) : false
+        }
+
+        func applyStep(_ step: HotkeyStepResult, now: UInt64) {
+            if step.cancelTimers {
+                cancelHoldWorkItems()
+            }
+            if step.armTimers {
+                cancelHoldWorkItems()
+                let gen = step.timerGen
+                if step.hintDelayMs > 0 {
+                    let hw = DispatchWorkItem {
+                        if engine.holdGen == gen { holdHintWorkItem = nil }
+                        let tNow = monotonicMs()
+                        let kdCount = CGEventSource.counterForEventType(.combinedSessionState, eventType: .keyDown)
+                        let liveFlags = UInt(truncatingIfNeeded: CGEventSource.flagsState(.combinedSessionState).rawValue)
+                        let hStep = engine.onHoldHintTimeout(
+                            gen: gen,
+                            nowMs: tNow,
+                            keyDownCounter: kdCount,
+                            rawFlags: liveFlags,
+                            isKeyPhysicallyDown: { CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0)) },
+                            hasOtherNonModifierKeyDown: checkOtherNonModDown
+                        )
+                        applyStep(hStep, now: tNow)
+                    }
+                    holdHintWorkItem = hw
+                    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(step.hintDelayMs), execute: hw)
+                }
+                if step.cancelDelayMs > 0 {
+                    let cw = DispatchWorkItem {
+                        if engine.holdGen == gen { holdCancelWorkItem = nil }
+                        let tNow = monotonicMs()
+                        let kdCount = CGEventSource.counterForEventType(.combinedSessionState, eventType: .keyDown)
+                        let liveFlags = UInt(truncatingIfNeeded: CGEventSource.flagsState(.combinedSessionState).rawValue)
+                        let cStep = engine.onHoldCancelTimeout(
+                            gen: gen,
+                            nowMs: tNow,
+                            keyDownCounter: kdCount,
+                            rawFlags: liveFlags,
+                            isKeyPhysicallyDown: { CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0)) },
+                            hasOtherNonModifierKeyDown: checkOtherNonModDown
+                        )
+                        applyStep(cStep, now: tNow)
+                    }
+                    holdCancelWorkItem = cw
+                    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(step.cancelDelayMs), execute: cw)
+                }
+            }
+            if !isKeyTest {
+                if step.clearHoldPreview {
+                    hud.setHoldCancelPreview(false)
+                } else if step.showHoldPreview {
+                    hud.setHoldCancelPreview(true)
+                } else if step.armPreviewSafetyClear {
+                    hud.scheduleHoldPreviewSafetyClear(delayMs: 400)
+                }
+            }
+            if !step.events.isEmpty {
+                emitStepEvents(step.events, now)
+            }
         }
 
         signal(SIGINT, SIG_IGN); signal(SIGTERM, SIG_IGN)
@@ -3186,30 +3824,21 @@ struct MacShimMain {
 
             let now = monotonicMs()
             let kdCount = CGEventSource.counterForEventType(.combinedSessionState, eventType: .keyDown)
-            let emitted = engine.handleEvent(
+            let step = engine.handleEventStep(
                 kind: rawKind,
                 keyCode: ev.keyCode,
                 rawFlags: ev.modifierFlags.rawValue,
                 isARepeat: (rawKind == .keyDown) ? ev.isARepeat : false,
                 nowMs: now,
                 keyDownCounter: kdCount,
-                isKeyPhysicallyDown: { CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0)) }
+                isKeyPhysicallyDown: { CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0)) },
+                hasOtherNonModifierKeyDown: checkOtherNonModDown
             )
-            for item in emitted {
-                if isKeyTest {
-                    let kname = KEY_CODE_NAMES[item.vk] ?? String(format: "VK_0x%02X", item.vk)
-                    writeJsonLine(["event": item.kind, "vk": String(format: "0x%02X", item.vk), "key_name": kname, "flags": String(format: "0x%X", item.flags), "is_down": item.isDown, "tainted": item.tainted])
-                } else {
-                    let fg = queryFrontmostApp()
-                    var payload: [String: Any] = ["event": item.kind, "hwnd": fg.hwnd, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": fg.title, "document": fg.document, "ax_trusted": fg.axTrusted, "ts_ms": now]
-                    if item.kind == "hold_cancel" { payload["hold_ms"] = item.holdMs }
-                    writeJsonLine(payload)
-                }
-            }
+            applyStep(step, now: now)
         }
 
         if isKeyTest {
-            writeJsonLine(["event": "key_test_ready", "hotkey": hotkey, "target_vk": String(format: "0x%02X", spec.primaryKeyCode), "mode": triggerMode, "seconds": seconds, "listen_access": hasListenAccess])
+            writeJsonLine(["event": "key_test_ready", "hotkey": hotkey, "target_vk": String(format: "0x%02X", spec.primaryKeyCode), "mode": triggerMode, "seconds": seconds, "tap_max_ms": tapMaxMs, "hold_cancel_ms": holdCancelMs, "hold_hint_ms": holdHintMs, "listen_access": hasListenAccess])
             DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(seconds)) { cleanupAndExit(0) }
             app.run(); cleanupAndExit(0)
         }
@@ -3427,7 +4056,8 @@ struct MacShimMain {
                             layer: layer,
                             clearMain: clearMain,
                             clearToast: clearToast,
-                            bgCount: bgCount
+                            bgCount: bgCount,
+                            preserveHoldPreview: engine.holdHintShown && !engine.holdFired
                         )
                         writeJsonLine(["type": "reply", "reply": "hud", "seq_id": seqId, "ok": true])
                     case "hud_level":

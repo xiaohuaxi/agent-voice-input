@@ -2406,6 +2406,7 @@ class VoiceInputDaemon:
         seq_id: int | None = None,
         silent_hud: bool = False,
         only_inflight: bool = False,
+        yield_window: ForegroundWindow | None = None,
     ) -> dict[str, Any]:
         with self._trigger_lock:
             cancel_rec_mode = False
@@ -2416,6 +2417,20 @@ class VoiceInputDaemon:
             with self._lock:
                 if self._stop_evt.is_set():
                     return {"ok": False, "ignored": "stopping", "state": self.state, "seq_id": self.seq_id}
+                if (
+                    not self._recording_active
+                    and yield_window is not None
+                    and (yield_window.process or yield_window.bundle_id)
+                    and (yield_reason := self._should_yield_hotkey(yield_window)) is not None
+                ):
+                    return {
+                        "ok": False,
+                        "ignored": yield_reason,
+                        "cancelled_ids": [],
+                        "committed_ids": [],
+                        "state": self.state,
+                        "seq_id": self.seq_id,
+                    }
                 if only_inflight and (
                     self._recording_active
                     or self._stopping_capture
@@ -3289,10 +3304,7 @@ class VoiceInputDaemon:
         if ev in ("toggle", "ptt_start", "ptt_stop", "ptt_cancel"):
             self.handle_trigger(ev, _window_from_mapping(m), from_hotkey=True)
         elif ev == "hold_cancel":
-            win = _window_from_mapping(m)
-            if (win.process or win.bundle_id) and self._should_yield_hotkey(win) is not None:
-                return
-            self.handle_cancel(only_inflight=True)
+            self.handle_cancel(yield_window=_window_from_mapping(m))
         elif ev == "cancel":
             try:
                 seq_val = _parse_optional_seq_id(m.get("seq_id"))

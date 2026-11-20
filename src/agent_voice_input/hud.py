@@ -93,6 +93,12 @@ _PERSISTENT_HUD_STATES: frozenset[str] = frozenset(
     {*_CONTROL_HUD_STATES, "recording", "recognizing", "processing", "refining"}
 )
 
+CANCELLABLE_HUD_STATES: frozenset[str] = frozenset(
+    {"recording", "recognizing", "processing", "refining"}
+)
+
+HOLD_CANCEL_HINT_COPY: tuple[str, str] = ("继续按住取消…", "keep holding to cancel…")
+
 HUD_STATE_DURATIONS_MS: dict[str, int] = {
     "done": 900,
     "copied": 2000,
@@ -234,6 +240,15 @@ def format_countdown_hint(remain_sec: int, lang: str = "en") -> str:
     return f"(auto-finish in {r}s)"
 
 
+def format_hold_cancel_hint(lang: str = "en") -> str:
+    """Format hold-to-cancel preview hint copy in Chinese ('zh') or English ('en')."""
+    return (
+        HOLD_CANCEL_HINT_COPY[0]
+        if (lang or "en").strip().lower() == "zh"
+        else HOLD_CANCEL_HINT_COPY[1]
+    )
+
+
 def pcm16le_rms_level(pcm_bytes: bytes | bytearray | memoryview) -> float:
     """Compute normalized visual audio level in [0.0, 1.0] from 16-bit signed LE PCM bytes."""
     even_n = len(pcm_bytes) - (len(pcm_bytes) % 2)
@@ -255,7 +270,9 @@ def pcm16le_rms_level(pcm_bytes: bytes | bytearray | memoryview) -> float:
 
 
 __all__ = [
+    "CANCELLABLE_HUD_STATES",
     "DEFAULT_ERROR_HUD_DURATION_MS",
+    "HOLD_CANCEL_HINT_COPY",
     "HUD_STATE_DURATIONS_MS",
     "POSIX_LOCALE_VARS",
     "VALID_UI_LANGUAGES",
@@ -263,6 +280,7 @@ __all__ = [
     "default_hud_duration_ms",
     "format_bg_count_badge",
     "format_countdown_hint",
+    "format_hold_cancel_hint",
     "format_hotkey_label",
     "format_hud_text",
     "format_recording_duration",
