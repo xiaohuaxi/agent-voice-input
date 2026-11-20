@@ -6,6 +6,7 @@ import sys
 from typing import Callable, Iterable, Literal, Protocol
 
 WindowCategory = Literal["terminal", "coding_gui", "general_gui"]
+HotwordsScope = Literal["global", "chat", "coding"]
 
 
 class WindowLike(Protocol):
@@ -377,6 +378,44 @@ def classify_target_app_hint(win: WindowLike) -> str:
     if normalize_app_token(win.process) == "claude" and not (win.bundle_id or "").strip():
         return "ai_chat" if _is_windows_claude_desktop_title(win.title) else ""
     return "im_chat" if match_app_patterns(win, IM_CHAT_PATTERNS) else ""
+
+
+def resolve_hotwords_scope(
+    win: WindowLike | None = None,
+    *,
+    window_category: str = "",
+    target_hint: str = "",
+    mode: str = "",
+    has_agent_session: bool = False,
+    is_terminal: Callable[[WindowLike], bool] | None = None,
+) -> HotwordsScope:
+    """Map foreground window classification, target hint, mode, or Agent session to a hotwords scene."""
+    eff_mode = (mode or "").strip().lower()
+    eff_hint = (target_hint or "").strip().lower()
+    if eff_mode == "general":
+        if eff_hint in ("im_chat", "ai_chat"):
+            return "chat"
+        if win is not None and (win.process or win.bundle_id):
+            if classify_target_app_hint(win) in ("im_chat", "ai_chat"):
+                return "chat"
+        return "global"
+    if has_agent_session or eff_mode == "agent":
+        return "coding"
+    if eff_hint in ("im_chat", "ai_chat"):
+        return "chat"
+    eff_cat = (window_category or "").strip().lower()
+    if eff_cat in ("terminal", "coding_gui"):
+        return "coding"
+    if win is not None and (win.process or win.bundle_id):
+        if not eff_cat and is_terminal is not None:
+            eff_cat = classify_window_category(win, is_terminal=is_terminal)
+        if eff_cat in ("terminal", "coding_gui"):
+            return "coding"
+        if not eff_cat and match_app_patterns(win, CODING_GUI_PATTERNS):
+            return "coding"
+        if classify_target_app_hint(win) in ("im_chat", "ai_chat"):
+            return "chat"
+    return "global"
 
 
 def is_antigravity_ide_window(win: WindowLike) -> bool:

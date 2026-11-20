@@ -152,7 +152,7 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
     def test_intra_package_imports_form_strict_dag(self) -> None:
         trees = _parse_package_asts()
         known_modules = set(trees.keys())
-        self.assertEqual(len(known_modules), 22)
+        self.assertEqual(len(known_modules), 23)
         init_defined_symbols = {
             t.id
             for stmt in trees["__init__"].body

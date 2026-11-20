@@ -45,6 +45,7 @@ TIER_1_MODULES: tuple[str, ...] = (
     "prompts",
     "llm_common",
     "config",
+    "hotwords",
 )
 
 TIER_2_MODULES: tuple[str, ...] = (

@@ -15,6 +15,7 @@ from .app_scope import (
     is_antigravity_ide_window,
     is_remote_client_window,
     match_app_patterns,
+    resolve_hotwords_scope,
 )
 from .asr_providers import (
     AsrError,
@@ -48,6 +49,7 @@ from .config import (
     select_asr_provider,
     select_refiner_provider,
 )
+from .hotwords import load_hotwords_file
 from .hud import is_toast_hud_state
 from .platform_common import (
     ForegroundWindow,
@@ -978,7 +980,25 @@ def _execute_stage1(
     ):
         st.ctx_fallback = "prior_hotwords"
 
-    asr_ctx = tracker.build_asr_context(st.snap, extra_hotwords=extra_hw, mode=eff_mode)
+    hw_scope = resolve_hotwords_scope(
+        win,
+        target_hint=st.target_hint,
+        mode=eff_mode,
+        has_agent_session=(st.snap is not None),
+    )
+    has_hw_file = bool(cfg.asr.hotwords_file.strip())
+    manual_hw = (
+        load_hotwords_file(cfg.asr.hotwords_file, env=env, scene=hw_scope)
+        if has_hw_file
+        else []
+    )
+    asr_ctx = tracker.build_asr_context(
+        st.snap,
+        extra_hotwords=[*manual_hw, *extra_hw],
+        mode=eff_mode,
+    )
+    asr_ctx.hotwords_scope = hw_scope
+    asr_ctx.manual_hotwords_loaded = has_hw_file
     if st.target_hint:
         asr_ctx.target_hint = st.target_hint
     st.asr_ctx_dialog = asr_ctx.dialog_text

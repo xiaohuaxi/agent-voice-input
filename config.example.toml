@@ -88,7 +88,9 @@ doubao_mode = "auto"
 base_url = ""
 # Optional custom environment variable name holding the Stage 1 API key
 api_key_env = ""
-# Custom universal user hotwords (highest priority; in coding-agent mode, active git/session identifiers and built-in AI/CLI terms are appended automatically)
+# Custom layered plain-text hotwords file (hot-reloaded on change, no daemon restart needed).
+# Supports optional [global], [chat] (IM/AI chat), and [coding] (terminal/IDE/Agent) sections; flat files map to [global].
+# Manage via `agent-voice-input hotwords list|add|remove` (manual terms always take top priority over dynamic/built-in words).
 hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 # timeout_sec = 60.0
 # Extra retry attempts within the same provider on rate-limit / transient network errors (0 disables retry)

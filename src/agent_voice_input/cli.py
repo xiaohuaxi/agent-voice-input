@@ -1,4 +1,4 @@
-"""CLI entrypoint for agent-voice-input (init, daemon, start, restart, stop, status, toggle, cancel, once, retry, doctor, diagnose, key-test, session-hook)."""
+"""CLI entrypoint for agent-voice-input (init, daemon, start, restart, stop, status, toggle, cancel, once, retry, hotwords, doctor, diagnose, key-test, session-hook)."""
 from __future__ import annotations
 
 import argparse, dataclasses, errno, fcntl, json, os, shlex, signal, socket, stat, subprocess, sys, time
@@ -1797,6 +1797,197 @@ def _cmd_stop(env: dict[str, str]) -> int:
     return 0
 
 
+def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) -> int:
+    from .config import ConfigError, explain_pipeline_selection, resolve_credentials
+    from .hotwords import (
+        MAINSTREAM_QUOTA_PROVIDERS,
+        VALID_HOTWORD_SCOPES,
+        add_hotwords,
+        budget_hotwords_for_provider,
+        format_budget_line,
+        load_hotwords_table,
+        remove_hotwords,
+        resolve_hotwords_path,
+        summarize_hotwords_budgets,
+    )
+
+    action = str(getattr(args, "hotwords_action", "") or "").strip().lower()
+    as_json = bool(getattr(args, "as_json", False))
+    hw_path = resolve_hotwords_path(cfg.asr.hotwords_file, env=env)
+    if hw_path is None:
+        raise ConfigError(
+            "asr.hotwords_file is empty; set a file path in config.toml before managing hotwords"
+        )
+
+    creds = resolve_credentials(cfg, env)
+    asr_info = explain_pipeline_selection(cfg, creds, env)["asr"]
+    eff_asr = str(asr_info["provider"])
+    eff_asr_model = str(asr_info["model"])
+    eff_asr_api = str(asr_info["api"])
+    eff_asr_url = cfg.asr.effective_base_url(eff_asr)
+
+    def _scene_label(sc: str) -> str:
+        return "global" if sc == "global" else f"{sc}+global"
+
+    if action == "list":
+        scope_filter = str(getattr(args, "scope", "all") or "all").strip().lower()
+        table = load_hotwords_table(hw_path, env=env, use_cache=False)
+        if scope_filter == "all":
+            budgets = summarize_hotwords_budgets(
+                table.global_terms,
+                {"chat": table.chat_terms, "coding": table.coding_terms},
+                active_provider=eff_asr,
+                active_model=eff_asr_model,
+                active_api=eff_asr_api,
+                active_base_url=eff_asr_url,
+            )
+            display_scopes: tuple[str, ...] = VALID_HOTWORD_SCOPES
+            ref_scene = str(budgets["reference_scene"])
+            ref_terms = table.merged_for_scene(ref_scene)
+        elif scope_filter == "global":
+            budgets = summarize_hotwords_budgets(
+                table.global_terms,
+                None,
+                active_provider=eff_asr,
+                active_model=eff_asr_model,
+                active_api=eff_asr_api,
+                active_base_url=eff_asr_url,
+            )
+            display_scopes = ("global",)
+            ref_scene = "global"
+            ref_terms = table.merged_for_scene("global")
+        else:
+            budgets = summarize_hotwords_budgets(
+                table.global_terms,
+                table.terms_for_scope(scope_filter),
+                active_provider=eff_asr,
+                active_model=eff_asr_model,
+                active_api=eff_asr_api,
+                active_base_url=eff_asr_url,
+            )
+            display_scopes = (scope_filter,)
+            ref_scene = scope_filter
+            ref_terms = table.merged_for_scene(scope_filter)
+
+        if as_json:
+            payload: dict[str, Any] = {
+                "path": str(hw_path),
+                "exists": table.exists,
+                "scope": scope_filter,
+                "active_asr": {
+                    "provider": eff_asr,
+                    "model": eff_asr_model,
+                    "api": eff_asr_api,
+                },
+                "scopes": {sc: list(table.terms_for_scope(sc)) for sc in display_scopes},
+                "mounted": {sc: table.merged_for_scene(sc) for sc in display_scopes},
+                "budgets": budgets,
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+
+        status_lbl = "exists" if table.exists else "not created yet"
+        print(f"Hotwords file: {hw_path} ({status_lbl})")
+        print(f"Active ASR:    {eff_asr}/{eff_asr_model} (api={eff_asr_api})")
+        for sc in display_scopes:
+            sc_terms = table.terms_for_scope(sc)
+            mount_note = (
+                f"; mounts {sc}+global={len(table.merged_for_scene(sc))} terms"
+                if sc != "global"
+                else ""
+            )
+            print(f"\n[{sc}] ({len(sc_terms)} terms{mount_note})")
+            if sc_terms:
+                for term in sc_terms:
+                    print(f"  {term}")
+            else:
+                print("  (empty)")
+
+        print("\nProvider quotas (manual hotwords before dynamic session/workspace terms):")
+        for sc in display_scopes:
+            active_res = budget_hotwords_for_provider(
+                table.merged_for_scene(sc),
+                eff_asr,
+                model=eff_asr_model,
+                api=eff_asr_api,
+                base_url=eff_asr_url,
+            )
+            print(f"  [active] {format_budget_line(active_res, name=f'{eff_asr} ({_scene_label(sc)})')}")
+        print(f"  Mainstream reference ({_scene_label(ref_scene)}, {len(ref_terms)} manual terms):")
+        for prov in MAINSTREAM_QUOTA_PROVIDERS:
+            ref_res = budget_hotwords_for_provider(ref_terms, prov)
+            print(f"    {format_budget_line(ref_res, name=prov)}")
+        if not table.exists:
+            print(
+                "\nTip: run 'agent-voice-input hotwords add <term...> [--scope global|chat|coding]' to create it."
+            )
+        return 0
+
+    raw_terms = list(getattr(args, "terms", ()) or ())
+    scope = str(getattr(args, "scope", "global") or "global").strip().lower()
+    try:
+        if action == "add":
+            edit_res = add_hotwords(hw_path, raw_terms, scope=scope)
+        elif action == "remove":
+            edit_res = remove_hotwords(hw_path, raw_terms, scope=scope)
+        else:  # pragma: no cover - guarded by argparse required subparser
+            raise ConfigError(f"unsupported hotwords action: {action!r}")
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from None
+
+    table_after = load_hotwords_table(hw_path, env=env, use_cache=False)
+    eval_scene = (
+        max(
+            ("coding", "chat", "global"),
+            key=lambda s: (len(table_after.merged_for_scene(s)), sum(len(w) for w in table_after.merged_for_scene(s))),
+        )
+        if scope == "all"
+        else scope
+    )
+    active_budget = budget_hotwords_for_provider(
+        table_after.merged_for_scene(eval_scene),
+        eff_asr,
+        model=eff_asr_model,
+        api=eff_asr_api,
+        base_url=eff_asr_url,
+    )
+
+    if as_json:
+        out_obj: dict[str, Any] = {
+            "action": action,
+            "path": str(edit_res.path),
+            "scope": edit_res.scope,
+            "changed": edit_res.changed,
+            "added": list(edit_res.added),
+            "skipped": list(edit_res.skipped),
+            "removed": list(edit_res.removed),
+            "not_found": list(edit_res.not_found),
+            "active_asr": {
+                "provider": eff_asr,
+                "model": eff_asr_model,
+                "api": eff_asr_api,
+                "scene": _scene_label(eval_scene),
+                "budget": active_budget.as_dict(),
+            },
+        }
+        print(json.dumps(out_obj, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Hotwords file: {edit_res.path} (scope={edit_res.scope})")
+    if action == "add":
+        if edit_res.added:
+            print(f"Added ({len(edit_res.added)}):   {', '.join(edit_res.added)}")
+        if edit_res.skipped:
+            print(f"Skipped ({len(edit_res.skipped)}): {', '.join(edit_res.skipped)} (already present)")
+    else:
+        if edit_res.removed:
+            print(f"Removed ({len(edit_res.removed)}):   {', '.join(edit_res.removed)}")
+        if edit_res.not_found:
+            print(f"Not found ({len(edit_res.not_found)}): {', '.join(edit_res.not_found)}")
+    print(f"Active ASR quota ({_scene_label(eval_scene)}): {format_budget_line(active_budget, name=eff_asr)}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-voice-input",
@@ -1917,6 +2108,65 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print recovered text to stdout even when automatically pasted",
     )
     p_retry.add_argument("--title", help="Optional window title override for session matching")
+    p_hw = sub.add_parser(
+        "hotwords",
+        help="Manage layered plain-text ASR hotwords (list, add, remove) and inspect provider quotas",
+    )
+    _add_common_flags(p_hw, is_sub=True)
+    hw_sub = p_hw.add_subparsers(dest="hotwords_action", required=True)
+    p_hw_list = hw_sub.add_parser(
+        "list",
+        help="Show hotwords file path, scoped terms, and active/mainstream ASR provider quota usage",
+    )
+    _add_common_flags(p_hw_list, is_sub=True)
+    p_hw_list.add_argument(
+        "--scope",
+        choices=("all", "global", "chat", "coding"),
+        default="all",
+        help="Filter displayed scope (default: all)",
+    )
+    p_hw_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit structured JSON output",
+    )
+    p_hw_add = hw_sub.add_parser(
+        "add",
+        help="Add one or more hotwords to a scope (default: global)",
+    )
+    _add_common_flags(p_hw_add, is_sub=True)
+    p_hw_add.add_argument("terms", nargs="+", help="One or more hotwords or phrases to add")
+    p_hw_add.add_argument(
+        "--scope",
+        choices=("global", "chat", "coding"),
+        default="global",
+        help="Target scope section (default: global)",
+    )
+    p_hw_add.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit structured JSON output",
+    )
+    p_hw_rm = hw_sub.add_parser(
+        "remove",
+        help="Remove one or more hotwords from a scope (default: global; use 'all' for all scopes)",
+    )
+    _add_common_flags(p_hw_rm, is_sub=True)
+    p_hw_rm.add_argument("terms", nargs="+", help="One or more hotwords or phrases to remove")
+    p_hw_rm.add_argument(
+        "--scope",
+        choices=("global", "chat", "coding", "all"),
+        default="global",
+        help="Target scope section to remove from (default: global)",
+    )
+    p_hw_rm.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit structured JSON output",
+    )
     p_kt = sub.add_parser(
         "key-test",
         help="Test global hotkey capture and display raw key/modifier events",
@@ -2061,6 +2311,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_once(args, cfg, env)
         if args.subcmd == "retry":
             return _cmd_retry(args, cfg, env)
+        if args.subcmd == "hotwords":
+            return _cmd_hotwords(args, cfg, env)
         if args.subcmd == "doctor":
             return _cmd_doctor(
                 cfg,

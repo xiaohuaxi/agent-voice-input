@@ -42,7 +42,6 @@ from .config import (
     ProviderCredentials,
     VALID_EFFORTS,
     _host_matches_domain,
-    expand_user_path,
     is_dashscope_native_multimodal_model,
     is_dashscope_omni_chat_model,
     is_gemini_native_url,
@@ -50,6 +49,11 @@ from .config import (
     resolve_asr_api,
     resolve_credentials,
     select_asr_provider,
+)
+from .hotwords import (
+    budget_hotwords_for_provider,
+    dedupe_hotwords_ci,
+    load_hotwords_file as _load_hotwords_file_impl,
 )
 from .http_transport import (
     CancelToken,
@@ -149,39 +153,20 @@ def load_hotwords_file(
     path_str: str,
     *,
     env: Mapping[str, str] | None = None,
+    scene: str = "global",
 ) -> list[str]:
-    """Load optional user hotwords file (one word/phrase per line, '#' comments allowed)."""
-    if not path_str or not path_str.strip():
-        return []
-    raw_spec = path_str.strip()
-    path = expand_user_path(raw_spec, env=env)
-    if not path.is_file() and raw_spec == "~/.config/agent-voice-input/hotwords.txt":
-        path = expand_user_path("~/.config/voice-input/hotwords.txt", env=env)
-    if not path.is_file():
-        return []
-    try:
-        raw = path.read_text(encoding="utf-8-sig")
-    except OSError:
-        return []
-    words: list[str] = []
-    seen: set[str] = set()
-    for line in raw.splitlines():
-        cleaned = line.split("#", 1)[0].strip()
-        if cleaned and cleaned not in seen:
-            seen.add(cleaned)
-            words.append(cleaned)
-    return words
+    """Load optional user hotwords file for ``scene`` (delegates to ``hotwords.load_hotwords_file``)."""
+    return _load_hotwords_file_impl(path_str, env=env, scene=scene)
 
 
-def _dedupe_words_ci(words: Sequence[str]) -> list[str]:
-    out: list[str] = []
-    seen_low: set[str] = set()
-    for raw in words:
-        w = raw.strip()
-        if w and (low := w.lower()) not in seen_low:
-            seen_low.add(low)
-            out.append(w)
-    return out
+def _derive_context_hotwords_scope(mode: str, target_hint: str, explicit_scope: str = "") -> str:
+    s = (explicit_scope or "").strip().lower()
+    if s in ("global", "chat", "coding"):
+        return s
+    hint = (target_hint or "").strip().lower()
+    if hint in ("im_chat", "ai_chat"):
+        return "chat"
+    return "global" if (mode or "agent").strip().lower() == "general" else "coding"
 
 
 def _coerce_context(
@@ -190,25 +175,53 @@ def _coerce_context(
     *,
     env: Mapping[str, str] | None = None,
 ) -> AsrContext:
-    file_words = load_hotwords_file(hotwords_file, env=env)
+    has_hw_file = bool(hotwords_file and hotwords_file.strip())
     if ctx is None:
-        return AsrContext(hotwords=file_words)
+        file_words = load_hotwords_file(hotwords_file, env=env, scene="global") if has_hw_file else []
+        return AsrContext(
+            hotwords=file_words,
+            hotwords_scope="global",
+            manual_hotwords_loaded=has_hw_file,
+        )
     if isinstance(ctx, AsrContext):
-        merged_words = _dedupe_words_ci([*file_words, *ctx.hotwords])
+        eff_mode = (ctx.mode or "agent").strip().lower() or "agent"
+        eff_hint = (ctx.target_hint or "").strip().lower()
+        eff_scope = _derive_context_hotwords_scope(eff_mode, eff_hint, ctx.hotwords_scope)
+        if ctx.manual_hotwords_loaded or not has_hw_file:
+            merged_words = dedupe_hotwords_ci(ctx.hotwords)
+            loaded = bool(ctx.manual_hotwords_loaded)
+        else:
+            file_words = load_hotwords_file(hotwords_file, env=env, scene=eff_scope)
+            merged_words = dedupe_hotwords_ci([*file_words, *ctx.hotwords])
+            loaded = True
         return AsrContext(
             hotwords=merged_words,
             git_status=ctx.git_status or "",
             dialog_text=ctx.dialog_text or "",
             context_blocks=tuple(str(b) for b in (ctx.context_blocks or ()) if str(b).strip()),
             git_block=ctx.git_block or "",
-            mode=(ctx.mode or "agent").strip().lower() or "agent",
+            mode=eff_mode,
             single_hop_prepared=bool(ctx.single_hop_prepared),
-            target_hint=(ctx.target_hint or "").strip().lower(),
+            target_hint=eff_hint,
+            hotwords_scope=eff_scope,
+            manual_hotwords_loaded=loaded,
         )
     if isinstance(ctx, Mapping):
         raw_hw = ctx.get("hotwords") or []
         hw_list = [str(w).strip() for w in raw_hw if str(w).strip()]
-        merged_words = _dedupe_words_ci([*file_words, *hw_list])
+        eff_mode = str(ctx.get("mode") or "agent").strip().lower() or "agent"
+        eff_hint = str(ctx.get("target_hint") or "").strip().lower()
+        eff_scope = _derive_context_hotwords_scope(
+            eff_mode, eff_hint, str(ctx.get("hotwords_scope") or "")
+        )
+        preloaded = bool(ctx.get("manual_hotwords_loaded", False))
+        if preloaded or not has_hw_file:
+            merged_words = dedupe_hotwords_ci(hw_list)
+            loaded = preloaded
+        else:
+            file_words = load_hotwords_file(hotwords_file, env=env, scene=eff_scope)
+            merged_words = dedupe_hotwords_ci([*file_words, *hw_list])
+            loaded = True
         raw_blocks = ctx.get("context_blocks") or ()
         blk_tuple = (
             (str(raw_blocks),)
@@ -221,23 +234,21 @@ def _coerce_context(
             dialog_text=str(ctx.get("dialog_text") or ""),
             context_blocks=blk_tuple,
             git_block=str(ctx.get("git_block") or ""),
-            mode=str(ctx.get("mode") or "agent").strip().lower() or "agent",
+            mode=eff_mode,
             single_hop_prepared=bool(ctx.get("single_hop_prepared", False)),
-            target_hint=str(ctx.get("target_hint") or "").strip().lower(),
+            target_hint=eff_hint,
+            hotwords_scope=eff_scope,
+            manual_hotwords_loaded=loaded,
         )
     raise TypeError(f"unsupported context type: {type(ctx).__name__}")
 
 
 
 def _format_vocabulary_hints(hotwords: Sequence[str]) -> str:
-    picked = [w.strip() for w in hotwords[:45] if w.strip()]
-    if not picked:
+    budget = budget_hotwords_for_provider(hotwords, "single_hop")
+    if not budget.kept:
         return ""
-    body = ", ".join(picked)
-    if len(body) > 480:
-        body = body[:480].rsplit(",", 1)[0].strip()
-    if not body:
-        return ""
+    body = ", ".join(budget.kept)
     return f'<vocabulary_hints read_only="true">\n{body}\n</vocabulary_hints>'
 
 
@@ -267,20 +278,23 @@ def effective_single_hop_timeout_sec(configured_sec: float, wav_bytes: bytes) ->
 
 
 
-def _compose_context_text(ctx: AsrContext, max_chars: int) -> str:
+def _compose_context_text(
+    ctx: AsrContext, max_chars: int, *, include_hotwords: bool = True
+) -> str:
     """Compose prioritized context text (hotwords -> git status -> dialog tail) within budget."""
     if max_chars <= 0:
         return ""
     sections: list[str] = []
     used = 0
 
-    if ctx.hotwords:
-        hw_str = "常用技术术语：" + "、".join(ctx.hotwords[:45])
-        hw_cap = max(64, min(420, max_chars // 2))
-        if len(hw_str) > hw_cap:
-            hw_str = hw_str[:hw_cap]
-        sections.append(hw_str)
-        used += len(hw_str) + 1
+    if include_hotwords and ctx.hotwords:
+        hw_prefix = "常用技术术语："
+        hw_cap = max(16, max(64, min(420, max_chars // 2)) - len(hw_prefix))
+        hw_budget = budget_hotwords_for_provider(ctx.hotwords, "dashscope", max_chars=hw_cap)
+        if hw_budget.kept:
+            hw_str = hw_prefix + "、".join(hw_budget.kept)
+            sections.append(hw_str)
+            used += len(hw_str) + 1
 
     if ctx.git_status.strip() and used < max_chars - 40:
         git_budget = min(600, max_chars - used - 20)
@@ -303,6 +317,14 @@ def _compose_context_text(ctx: AsrContext, max_chars: int) -> str:
     return combined
 
 
+def _compose_single_hop_unprepared_context(ctx: AsrContext, max_chars: int = 16000) -> str:
+    """Compose direct single-hop context using the 480-char single-hop vocabulary budget without duplication."""
+    vocab_blk = _format_vocabulary_hints(ctx.hotwords)
+    rem = max(0, max_chars - (len(vocab_blk) + 2 if vocab_blk else 0))
+    ctx_body = _compose_context_text(ctx, max_chars=rem, include_hotwords=False)
+    return "\n\n".join(filter(None, [vocab_blk, ctx_body]))
+
+
 def _compose_stt_prompt_text(ctx: AsrContext, max_chars: int = 2000) -> str:
     """Compose Whisper-compatible STT ``prompt`` with high-priority ``hotwords`` at the END.
 
@@ -314,24 +336,13 @@ def _compose_stt_prompt_text(ctx: AsrContext, max_chars: int = 2000) -> str:
         return ""
     hw_str = ""
     if ctx.hotwords:
-        picked_hw: list[str] = []
         hw_prefix = "常用技术术语："
         hw_cap = max(16, min(360, max(64, max_chars // 2)) - len(hw_prefix))
-        used_hw = 0
-        for raw_w in ctx.hotwords[:35]:
-            w = raw_w.strip()
-            if not w:
-                continue
-            add_len = len(w) + (1 if picked_hw else 0)
-            if picked_hw and used_hw + add_len > hw_cap:
-                continue
-            if not picked_hw and len(w) > hw_cap:
-                w = w[:hw_cap]
-                add_len = len(w)
-            picked_hw.append(w)
-            used_hw += add_len
-        if picked_hw:
-            hw_str = hw_prefix + "、".join(reversed(picked_hw))
+        hw_budget = budget_hotwords_for_provider(ctx.hotwords, "whisper", max_chars=hw_cap)
+        if hw_budget.kept:
+            # Select head-first (highest-priority manual terms first), then place reversed at prompt tail
+            # so #1 highest-priority term sits at the rightmost end of Whisper's ~224-token tail window.
+            hw_str = hw_prefix + "、".join(reversed(hw_budget.kept))
 
     reserved = (len(hw_str) + 1) if hw_str else 0
     bg_budget = max(0, max_chars - reserved)
@@ -980,31 +991,8 @@ def _resolve_doubao_base_url(raw_base: str) -> str:
 
 def _build_doubao_corpus_context(ctx: AsrContext) -> str | None:
     """Build serialized Doubao corpus.context strictly within 30 words/180 chars + 600 dialog chars."""
-    cleaned_words = [w for raw in ctx.hotwords if (w := raw.strip())]
-    canonical_by_low: dict[str, str] = {}
-    for w in cleaned_words:
-        canonical_by_low.setdefault(w.lower(), w)
-
-    hw_objs: list[dict[str, str]] = []
-    hw_chars = 0
-    added_low: set[str] = set()
-    for w in cleaned_words:
-        if "." in w:
-            stem, ext = w.rsplit(".", 1)
-            if len(stem) >= 3 and ext.isalnum() and stem.lower() in canonical_by_low:
-                w = canonical_by_low[stem.lower()]
-        if len(w) > 60:
-            w = w[:60]
-        w_low = w.lower()
-        if w_low in added_low:
-            continue
-        if len(hw_objs) >= 30 or hw_chars >= 180:
-            break
-        if hw_chars + len(w) > 180:
-            continue
-        added_low.add(w_low)
-        hw_objs.append({"word": w})
-        hw_chars += len(w)
+    hw_budget = budget_hotwords_for_provider(ctx.hotwords, "doubao")
+    hw_objs = [{"word": w} for w in hw_budget.kept]
 
     dialog_parts: list[str] = []
     if ctx.git_status.strip():
@@ -1690,7 +1678,7 @@ class GeminiAudioProvider(BaseAsrProvider):
             if tail:
                 parts.append({"text": tail})
         else:
-            ctx_body = _compose_context_text(ctx, max_chars=16000)
+            ctx_body = _compose_single_hop_unprepared_context(ctx, max_chars=16000)
             if ctx_body:
                 parts.append({"text": f"<session_context>\n{ctx_body}\n</session_context>"})
             if hint_blk:
@@ -1826,8 +1814,6 @@ class GeminiAudioProvider(BaseAsrProvider):
 # 4. Dedicated STT Audio Transcriptions (/audio/transcriptions)
 # ---------------------------------------------------------------------------
 
-_OPENROUTER_KEYTERMS_PREFIXES = ("deepgram/", "assemblyai/")
-
 
 def _encode_multipart_formdata(
     fields: Sequence[tuple[str, str]],
@@ -1943,10 +1929,12 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
                 "input_audio": {"data": b64_wav, "format": "wav"},
                 "response_format": "json",
             }
-            if ctx.hotwords and model.strip().lower().startswith(_OPENROUTER_KEYTERMS_PREFIXES):
-                clean_terms = [w.strip() for w in ctx.hotwords[:50] if w.strip()]
-                if clean_terms:
-                    json_payload["keyterms"] = clean_terms
+            if ctx.hotwords:
+                kt_budget = budget_hotwords_for_provider(
+                    ctx.hotwords, "openrouter", model=model, api="audio-transcriptions"
+                )
+                if kt_budget.kept:
+                    json_payload["keyterms"] = list(kt_budget.kept)
             headers["Content-Type"] = "application/json"
             body = json.dumps(json_payload, ensure_ascii=False).encode("utf-8")
         else:
@@ -2128,7 +2116,7 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                 {"type": "text", "text": CHAT_AUDIO_TASK_REMINDER},
             ]
         else:
-            ctx_body = _compose_context_text(ctx, max_chars=16000)
+            ctx_body = _compose_single_hop_unprepared_context(ctx, max_chars=16000)
             session_tag = (
                 f"<session_context>\n{ctx_body}\n</session_context>"
                 if ctx_body

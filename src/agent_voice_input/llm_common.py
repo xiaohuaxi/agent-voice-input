@@ -45,6 +45,8 @@ class AsrContext:
     mode: str = "agent"
     single_hop_prepared: bool = False
     target_hint: str = ""
+    hotwords_scope: str = ""
+    manual_hotwords_loaded: bool = False
 
 
 _TokenUsageTuple = tuple[int | None, int | None, int | None, int | None]
