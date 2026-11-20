@@ -37,6 +37,7 @@ COLD_START_FALLBACK_MIN_CHARS = 1000
 COLD_START_TOP_K = 5
 COLD_START_CODEX_SCAN_LIMIT = 100
 COLD_START_AGY_SCAN_LIMIT = 48
+COLD_START_CLAUDE_PROJ_SCAN_LIMIT = 64
 
 PRIOR_SESSION_PREFIX = (
     '<prior_session_reference read_only="true" scope="same_workspace_previous_session">\n'
@@ -727,8 +728,18 @@ def encode_claude_project_dir(cwd: str, *, wsl: bool = False) -> list[str]:
     norm = _normalize_cwd(cwd)
     if not norm or (wsl and _is_wsl_slow_mount_str(norm)):
         return []
+    candidates: list[str] = [norm]
+    real = _safe_realpath(norm, wsl=wsl)
+    if real:
+        candidates.append(real)
+        for pfx in ("/private/var/", "/private/tmp/", "/private/etc/"):
+            if real.startswith(pfx):
+                unprefixed = real[len("/private") :]
+                if _safe_realpath(unprefixed, wsl=wsl) == real:
+                    candidates.append(unprefixed)
+                break
     out: list[str] = []
-    for candidate in (norm, _safe_realpath(norm, wsl=wsl)):
+    for candidate in candidates:
         if not candidate:
             continue
         enc = re.sub(r"[^A-Za-z0-9]", "-", candidate)
@@ -1905,6 +1916,7 @@ def _scan_storage_for_cwd(
     codex_limit: int = 32,
     agy_limit: int = 24,
     include_claude_global: bool = True,
+    claude_proj_limit: int = COLD_START_CLAUDE_PROJ_SCAN_LIMIT,
     wsl: bool = False,
 ) -> list[dict[str, Any]]:
     """Tier 2 zero-hook storage scan strictly scoped to ``target_cwd`` (never cross-directory)."""
@@ -1913,81 +1925,130 @@ def _scan_storage_for_cwd(
     min_rank = 2 if exact_only else 1
     cands: list[dict[str, Any]] = []
 
-    # 1. Claude projects matching encoded target_cwd (exact + optional global subdir check)
-    seen_cl: set[str] = set()
-    for enc in _encode_claude_dirs(target_cwd, wsl=wsl):
-        pdir = home / ".claude" / "projects" / enc
-        if wsl:
-            real_pdir = _safe_realpath(str(pdir), wsl=True)
-            if not real_pdir or not os.path.isdir(real_pdir):
-                continue
-            pdir = Path(real_pdir)
-        elif not pdir.is_dir():
-            continue
-        cl_entries: list[tuple[float, str]] = []
+    def _list_claude_dir_jsonl_desc(pdir: Path) -> list[tuple[float, str]]:
+        files: list[tuple[float, str]] = []
         try:
-            with os.scandir(pdir) as it:
-                for entry in it:
-                    if not entry.name.endswith(".jsonl"):
+            with os.scandir(pdir) as fit:
+                for fentry in fit:
+                    fname = fentry.name
+                    if not fname.endswith(".jsonl") or fname.lower().startswith("agent-"):
                         continue
-                    safe_jf = _resolve_safe_transcript_path("claude", entry.path, home, wsl=wsl)
-                    if safe_jf:
-                        cl_entries.append((_safe_mtime(safe_jf), safe_jf))
+                    try:
+                        fst = fentry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(fst.st_mode):
+                        if wsl and not _safe_realpath(fentry.path, wsl=True):
+                            continue
+                        fm = _safe_mtime(fentry.path)
+                    elif stat.S_ISREG(fst.st_mode):
+                        fm = fst.st_mtime
+                    else:
+                        continue
+                    files.append((fm, fentry.path))
         except OSError:
-            continue
-        cl_entries.sort(key=lambda item: item[0], reverse=True)
-        for jm, safe_jf in cl_entries[:24]:
-            seen_cl.add(safe_jf)
-            ok_cl, sid, mcwd = _read_claude_root_meta(
-                safe_jf, allow_empty_or_meta_only=False, wsl=wsl
+            return []
+        files.sort(key=lambda item: item[0], reverse=True)
+        return files
+
+    def _append_claude_file(
+        raw_fp: str, *, allow_fallback_cwd: bool, seen_cl: set[str]
+    ) -> tuple[bool, bool]:
+        """Validate and append one Claude JSONL; returns ``(had_valid_meta_cwd, matched)``."""
+        safe_jf = _resolve_safe_transcript_path("claude", raw_fp, home, wsl=wsl)
+        if not safe_jf or safe_jf in seen_cl:
+            return False, False
+        seen_cl.add(safe_jf)
+        ok_cl, sid, mcwd = _read_claude_root_meta(
+            safe_jf, allow_empty_or_meta_only=False, wsl=wsl
+        )
+        if not ok_cl or not sid:
+            return False, False
+        if exact_only or not allow_fallback_cwd:
+            if not mcwd:
+                return False, False
+            eff_mcwd = mcwd
+        else:
+            eff_mcwd = mcwd or target_cwd
+        if _cwd_match_rank(target_cwd, eff_mcwd, home, wsl=wsl) >= min_rank:
+            cands.append(
+                {
+                    "cli": "claude",
+                    "session_id": sid,
+                    "jsonl_path": safe_jf,
+                    "cwd": eff_mcwd,
+                    "matched_by": "remote_cwd",
+                    "pts_mtime": 0.0,
+                    "jsonl_mtime": _safe_mtime(safe_jf),
+                    "thread_name": "",
+                }
             )
-            if not ok_cl or not sid:
+            return bool(mcwd), True
+        return bool(mcwd), False
+
+    # 1. Claude projects matching encoded target_cwd (exact + symlink-alias / optional global check)
+    seen_cl: set[str] = set()
+    seen_pdirs: set[str] = set()
+    projects_root = home / ".claude" / "projects"
+    real_proot_str = _safe_realpath(str(projects_root), wsl=wsl)
+    projects_root_ok = bool(real_proot_str and os.path.isdir(real_proot_str))
+    eff_projects_root = Path(real_proot_str) if projects_root_ok else projects_root
+
+    if projects_root_ok:
+        for enc in _encode_claude_dirs(target_cwd, wsl=wsl):
+            pdir = eff_projects_root / enc
+            real_pdir = _safe_realpath(str(pdir), wsl=wsl)
+            if (
+                not real_pdir
+                or real_pdir in seen_pdirs
+                or not os.path.isdir(real_pdir)
+                or not _is_path_under_dir(real_pdir, eff_projects_root, wsl=wsl)
+            ):
                 continue
-            if exact_only:
-                if not mcwd:
-                    continue
-                eff_mcwd = mcwd
-            else:
-                eff_mcwd = mcwd or target_cwd
-            if _cwd_match_rank(target_cwd, eff_mcwd, home, wsl=wsl) >= min_rank:
-                cands.append(
-                    {
-                        "cli": "claude",
-                        "session_id": sid,
-                        "jsonl_path": safe_jf,
-                        "cwd": eff_mcwd,
-                        "matched_by": "remote_cwd",
-                        "pts_mtime": 0.0,
-                        "jsonl_mtime": jm,
-                        "thread_name": "",
-                    }
-                )
-    if include_claude_global and not cands:
-        all_cl = sorted(
-            glob.glob(str(home / ".claude" / "projects" / "*" / "*.jsonl")),
-            key=_safe_mtime,
-            reverse=True,
-        )[:32]
-        for clf in all_cl:
-            safe_clf = _resolve_safe_transcript_path("claude", clf, home, wsl=wsl)
-            if not safe_clf or safe_clf in seen_cl:
+            seen_pdirs.add(real_pdir)
+            for _, raw_fp in _list_claude_dir_jsonl_desc(Path(real_pdir))[:24]:
+                _append_claude_file(raw_fp, allow_fallback_cwd=True, seen_cl=seen_cl)
+
+    if projects_root_ok and (
+        (include_claude_global and not cands)
+        or (exact_only and len(cands) < COLD_START_TOP_K + 1)
+    ):
+        other_pdirs: list[tuple[float, Path]] = []
+        try:
+            with os.scandir(eff_projects_root) as it:
+                for entry in it:
+                    if entry.name.startswith("."):
+                        continue
+                    real_d = _safe_realpath(entry.path, wsl=wsl)
+                    if (
+                        not real_d
+                        or real_d in seen_pdirs
+                        or not os.path.isdir(real_d)
+                        or not _is_path_under_dir(real_d, eff_projects_root, wsl=wsl)
+                    ):
+                        continue
+                    seen_pdirs.add(real_d)
+                    other_pdirs.append((_safe_mtime(real_d), Path(real_d)))
+        except OSError:
+            other_pdirs = []
+        other_pdirs.sort(key=lambda item: item[0], reverse=True)
+        for _, pdir_cand in other_pdirs[:claude_proj_limit]:
+            dir_files = _list_claude_dir_jsonl_desc(pdir_cand)
+            if not dir_files:
                 continue
-            ok_cl, sid, mcwd = _read_claude_root_meta(
-                safe_clf, allow_empty_or_meta_only=False, wsl=wsl
-            )
-            if ok_cl and sid and mcwd and _cwd_match_rank(target_cwd, mcwd, home, wsl=wsl) >= min_rank:
-                cands.append(
-                    {
-                        "cli": "claude",
-                        "session_id": sid,
-                        "jsonl_path": safe_clf,
-                        "cwd": mcwd,
-                        "matched_by": "remote_cwd",
-                        "pts_mtime": 0.0,
-                        "jsonl_mtime": _safe_mtime(safe_clf),
-                        "thread_name": "",
-                    }
+            dir_matched = False
+            for _, raw_fp in dir_files[:8]:
+                had_mcwd, matched = _append_claude_file(
+                    raw_fp, allow_fallback_cwd=False, seen_cl=seen_cl
                 )
+                if matched:
+                    dir_matched = True
+                    break
+                if had_mcwd:
+                    break
+            if dir_matched:
+                for _, raw_fp in dir_files[:24]:
+                    _append_claude_file(raw_fp, allow_fallback_cwd=False, seen_cl=seen_cl)
 
     # 2. Codex rollouts matching target_cwd (reverse YYYY/MM/DD bounded walk)
     for safe_cf in _iter_codex_rollout_files_desc(home, max_files=codex_limit, wsl=wsl):

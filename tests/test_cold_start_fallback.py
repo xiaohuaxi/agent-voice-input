@@ -1646,6 +1646,209 @@ class TestColdStartAstraReviewFixes(unittest.TestCase):
             self.assertEqual(ev.ws_uris, ())
             self.assertEqual(ev.sys_cwds, (str(home / "repos" / "ok"),))
 
+    def test_symlink_workspace_prior_discovery_across_realpath_and_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            home = base / "home"
+            real_root = base / "data_vol"
+            real_ws = real_root / "symproj"
+            sub_ws = real_ws / "subpkg"
+            other_ws = real_root / "otherproj"
+            for d in (home / "repos", real_ws, sub_ws, other_ws):
+                d.mkdir(parents=True, exist_ok=True)
+            (real_ws / "sym_core.py").write_text("x = 1\n", encoding="utf-8")
+
+            link_ws = home / "repos" / "symproj"
+            link_ws2 = home / "work_alias"
+            broad_link = home / "broad_home_link"
+            os.symlink(real_ws, link_ws)
+            os.symlink(real_ws, link_ws2)
+            os.symlink(home, broad_link)
+
+            now = time.time()
+            # Prior Claude session recorded under logical symlink path `link_ws`
+            # (exact mirror of macOS /var/folders -> /private/var/folders & user symlink workspaces)
+            _write_claude_jsonl(
+                home,
+                str(link_ws),
+                "prior-sym-claude",
+                _make_rich_turns("SymPrior", pairs=2, pad_chars=900),
+                mtime=now - 120,
+            )
+            # Decoy sessions in parent, child, sibling, and broad home: MUST NEVER match!
+            _write_claude_jsonl(home, str(real_root), "decoy-parent", _make_rich_turns("ParentDecoy"), mtime=now - 10)
+            _write_claude_jsonl(home, str(sub_ws), "decoy-child", _make_rich_turns("ChildDecoy"), mtime=now - 10)
+            _write_claude_jsonl(home, str(other_ws), "decoy-other", _make_rich_turns("OtherDecoy"), mtime=now - 10)
+            _write_claude_jsonl(home, str(home), "decoy-home", _make_rich_turns("HomeDecoy"), mtime=now - 10)
+
+            # 1) Direct discovery succeeds from realpath, original symlink, AND second symlink alias
+            for probe_cwd in (str(real_ws), str(link_ws), str(link_ws2)):
+                cands = rp_mod.discover_cli_prior_sessions(probe_cwd, home=home, wsl=False)
+                self.assertEqual([c["session_id"] for c in cands], ["prior-sym-claude"], probe_cwd)
+
+            # Cross-directory & broad symlink isolation strictly preserved
+            empty_other = real_root / "clean_other"
+            empty_other.mkdir(parents=True, exist_ok=True)
+            self.assertEqual(
+                [c["session_id"] for c in rp_mod.discover_cli_prior_sessions(str(other_ws), home=home, wsl=False)],
+                ["decoy-other"],
+            )
+            self.assertEqual(
+                [c["session_id"] for c in rp_mod.discover_cli_prior_sessions(str(sub_ws), home=home, wsl=False)],
+                ["decoy-child"],
+            )
+            self.assertEqual(
+                [c["session_id"] for c in rp_mod.discover_cli_prior_sessions(str(real_root), home=home, wsl=False)],
+                ["decoy-parent"],
+            )
+            self.assertEqual(rp_mod.discover_cli_prior_sessions(str(empty_other), home=home, wsl=False), [])
+            self.assertEqual(rp_mod.discover_cli_prior_sessions(str(broad_link), home=home, wsl=False), [])
+
+            # 2) Brand-new empty Claude session stored under REALPATH still finds prior stored under SYMLINK,
+            #    and SessionTracker shares canonical cache across realpath & symlink queries (only 1 scan!)
+            cur_real = _write_claude_jsonl(home, str(real_ws), "cur-real-cold", [], mtime=now - 2)
+            env = {"HOME": str(home), "WSL_DISTRO_NAME": "", "WSL_INTEROP": ""}
+            cfg = Config(refiner=RefinerConfig(provider="auto", cold_start_fallback="auto"))
+            tracker = SessionTracker(home_dir=home, proc_root=None, env=env, prior_cache_ttl_sec=60.0)
+            with patch(
+                "agent_voice_input.session_ctx.discover_cli_prior_sessions",
+                wraps=rp_mod.discover_cli_prior_sessions,
+            ) as m_disc:
+                snap = tracker.sync_session(
+                    SessionMatch(
+                        cli="claude", session_id="cur-real-cold", jsonl_path=str(cur_real), cwd=str(real_ws)
+                    ),
+                    include_git_info=False,
+                )
+                self.assertIsNotNone(snap)
+                self.assertTrue(snap.prior_hotwords_used)
+                self.assertIn("SymPriorController", snap.hotwords)
+                self.assertNotIn("OtherDecoyController", snap.hotwords)
+                blocks, _ = build_refiner_context_chunks(cfg, session_key=snap.session_key, tracker=tracker)
+                self.assertEqual(len(blocks), 1)
+                self.assertIn("SymPriorController", blocks[0])
+                # Canonical cache hit across symlink & second alias (0 extra scans!)
+                self.assertIn("SymPriorController", tracker.get_workspace_prior_hotwords(str(link_ws)))
+                self.assertIn("SymPriorController", tracker.get_workspace_prior_hotwords(str(link_ws2)))
+                self.assertEqual(m_disc.call_count, 1)
+
+            # 3) Layer 0 terminal fallback (daemon resolves win.cwd -> realpath) finds symlink-stored prior
+            asr_l0 = _CaptureAsr()
+            ref_l0 = _CaptureRefiner(cfg)
+            with patch.object(tracker, "resolve_session", return_value=None):
+                res_l0 = run_pipeline_once(
+                    _make_voiced_wav(),
+                    cfg=cfg,
+                    tracker=tracker,
+                    asr_provider=asr_l0,
+                    refiner=ref_l0,
+                    origin_window=ForegroundWindow(
+                        1, "Ghostty", "zsh", cwd=str(link_ws), bundle_id="com.mitchellh.ghostty"
+                    ),
+                    env=env,
+                    dry_run=True,
+                )
+            self.assertEqual(res_l0.ctx_fallback, "prior_hotwords")
+            self.assertIn("SymPriorController", asr_l0.seen_contexts[0].hotwords)
+            self.assertEqual(ref_l0.seen_calls[0][3], str(real_ws.resolve()))
+
+            # 4) Ordinary IDE (resolve_ide_workspace_cwd returns realpath) gets Layer 1 hotwords only
+            asr_ide = _CaptureAsr()
+            ref_ide = _CaptureRefiner(cfg)
+            res_ide = run_pipeline_once(
+                _make_voiced_wav(),
+                cfg=cfg,
+                tracker=tracker,
+                asr_provider=asr_ide,
+                refiner=ref_ide,
+                origin_window=ForegroundWindow(
+                    2, "Cursor", "sym_core.py — symproj — Cursor", bundle_id="com.todesktop.230313mzl4w4u92"
+                ),
+                env=env,
+                dry_run=True,
+            )
+            self.assertEqual(res_ide.ctx_fallback, "prior_hotwords")
+            self.assertIn("SymPriorController", asr_ide.seen_contexts[0].hotwords)
+            self.assertEqual(ref_ide.seen_calls[0][0], [])
+            tracker.close()
+
+            # 5) Antigravity IDE prior stored under symlink is found symmetrically via realpath & alias
+            _write_agy_jsonl(home, str(link_ws), "ide-sym-prior", _make_rich_turns("IdeSymPrior"), ide=True, mtime=now - 50)
+            for probe_cwd in (str(real_ws), str(link_ws), str(link_ws2)):
+                ide_cands = discover_antigravity_ide_prior_sessions(probe_cwd, home=home, wsl=False)
+                self.assertEqual([c["session_id"] for c in ide_cands], ["ide-sym-prior"], probe_cwd)
+            self.assertEqual(discover_antigravity_ide_prior_sessions(str(other_ws), home=home, wsl=False), [])
+
+    def test_encode_claude_project_dir_macos_private_prefix_and_wsl_mnt_project_scan_guard(self) -> None:
+        # 1) Deterministic macOS /private/(var|tmp|etc) reverse symlink encoding (runs on Linux too!)
+        def _fake_macos_realpath(p: str, *, wsl: bool = False) -> str:
+            if p in ("/var/folders/xx/repo", "/private/var/folders/xx/repo"):
+                return "/private/var/folders/xx/repo"
+            return p
+
+        with patch.object(rp_mod, "_safe_realpath", side_effect=_fake_macos_realpath):
+            encs_real = rp_mod.encode_claude_project_dir("/private/var/folders/xx/repo", wsl=False)
+            self.assertEqual(encs_real, ["-private-var-folders-xx-repo", "-var-folders-xx-repo"])
+            encs_link = rp_mod.encode_claude_project_dir("/var/folders/xx/repo", wsl=False)
+            self.assertEqual(encs_link, ["-var-folders-xx-repo", "-private-var-folders-xx-repo"])
+
+        # Non-macOS / distinct /private/var path MUST NOT fabricate an unrelated /var alias
+        with patch.object(rp_mod, "_safe_realpath", side_effect=lambda p, *, wsl=False: p):
+            self.assertEqual(
+                rp_mod.encode_claude_project_dir("/private/var/folders/xx/repo", wsl=False),
+                ["-private-var-folders-xx-repo"],
+            )
+
+        # 2) WSL2 zero-I/O /mnt/ guard during Claude project-dir alias scan
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            home = base / "home"
+            real_ws = base / "real_wsl_proj"
+            link_ws = home / "repos" / "wsl_link"
+            real_ws.mkdir(parents=True, exist_ok=True)
+            link_ws.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(real_ws, link_ws)
+
+            _write_claude_jsonl(home, str(link_ws), "wsl-sym-ok", _make_rich_turns("WslSafeSym"), mtime=time.time() - 30)
+            # Poison ~/.claude/projects with /mnt/ dir symlink, /mnt/ file symlink, and /mnt/ cwd JSONL
+            projects_dir = home / ".claude" / "projects"
+            os.symlink("/mnt/c/slow_mount_trap", projects_dir / "-mnt-trap-dir")
+            other_pdir = projects_dir / "-other-proj"
+            other_pdir.mkdir(parents=True, exist_ok=True)
+            os.symlink("/mnt/c/slow_mount_trap/trap.jsonl", other_pdir / "trap.jsonl")
+            (other_pdir / "mnt_cwd.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": "mnt-cwd-sess",
+                        "cwd": "/mnt/c/Users/alice/repo",
+                        "isSidechain": False,
+                        "message": {"role": "user", "content": "x" * 1500},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            real_stat = os.stat
+            real_lstat = os.lstat
+            touched_mnt: list[str] = []
+
+            def _guard_stat(path, *args, **kwargs):
+                if "/mnt/" in str(path):
+                    touched_mnt.append(f"stat:{path}")
+                return real_stat(path, *args, **kwargs)
+
+            def _guard_lstat(path, *args, **kwargs):
+                if "/mnt/" in str(path):
+                    touched_mnt.append(f"lstat:{path}")
+                return real_lstat(path, *args, **kwargs)
+
+            with patch("os.stat", side_effect=_guard_stat), patch("os.lstat", side_effect=_guard_lstat):
+                cands = rp_mod.discover_cli_prior_sessions(str(real_ws), home=home, wsl=True)
+            self.assertEqual(touched_mnt, [])
+            self.assertEqual([c["session_id"] for c in cands], ["wsl-sym-ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

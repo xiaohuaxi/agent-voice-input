@@ -4859,7 +4859,7 @@ class SessionTracker:
                 canon, home=self.home, wsl=eff_wsl, env=self.env
             )
         else:
-            found = discover_cli_prior_sessions(canon, home=self.home, wsl=eff_wsl)
+            found = discover_cli_prior_sessions(cwd, home=self.home, wsl=eff_wsl)
         now_write = time.monotonic()
         with self._lock:
             expired = [
