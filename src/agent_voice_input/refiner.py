@@ -75,6 +75,7 @@ from .llm_common import (
 )
 from .config import (
     _CODEX_KEYRING_STORE_RE,
+    CODEX_PUBLIC_FALLBACK_MODELS,
     CODEX_SUBSCRIPTION_BASE_URL,
     DEFAULT_REFINER_MODELS,
     OPENAI_DEFAULT_BASE_URL,
@@ -83,10 +84,13 @@ from .config import (
     ProviderCredentials,
     VALID_EFFORTS,
     VALID_REFINER_PROVIDERS,
+    _read_codex_models_cache_slugs,
+    classify_codex_auth_json,
     expand_user_path,
     find_codex_bin,
     has_codex_local_auth,
     redact_secrets,
+    resolve_codex_default_model,
     resolve_codex_home_dir,
     resolve_credentials,
     select_refiner_provider,
@@ -108,11 +112,6 @@ DEFAULT_REFINER_PROMPT = REFINER_SYSTEM_PROMPT
 
 CODEX_ORIGINATOR = "codex_cli_rs"
 CODEX_USER_AGENT = "codex_cli_rs/0.169.0"
-CODEX_PUBLIC_FALLBACK_MODELS: tuple[str, ...] = (
-    "gpt-5.4-mini",
-    "gpt-5-codex-mini",
-    "codex-mini-latest",
-)
 
 CODEX_REFRESH_WINDOW_SEC: float = 1800.0
 CODEX_HARD_EXPIRY_SKEW_SEC: float = 60.0
@@ -298,58 +297,6 @@ _CODEX_PARAM_OR_CTX_ERR_RE = re.compile(
     r"(?i)\b(?:unsupported|invalid|unknown)\s+(?:parameter|value|argument|field|option|header)\b"
     r"|context_length_exceeded|maximum\s+context\s+length"
 )
-
-
-def _read_codex_models_cache_slugs(env: Mapping[str, str] | None = None) -> list[str]:
-    codex_home = resolve_codex_home_dir(env)
-    if codex_home is None:
-        return []
-    cache_path = codex_home / "models_cache.json"
-    try:
-        st = os.stat(cache_path)
-    except OSError:
-        return []
-    if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > 4_194_304:
-        return []
-    try:
-        data = json.loads(cache_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    if not isinstance(data, Mapping):
-        return []
-    models = data.get("models")
-    if not isinstance(models, list):
-        return []
-    slugs: list[str] = []
-    seen: set[str] = set()
-    for item in models:
-        if isinstance(item, Mapping):
-            s = str(item.get("slug") or "").strip()
-            if s and s not in seen:
-                seen.add(s)
-                slugs.append(s)
-    return slugs
-
-
-def resolve_codex_default_model(cfg: Config, env: Mapping[str, str] | None = None) -> str:
-    """Resolve effective Codex model, falling back to a public mini model when internal ``gpt-6-luna`` is absent."""
-    if cfg.refiner.has_explicit_model("codex"):
-        return cfg.refiner.effective_model("codex")
-    default_mod = DEFAULT_REFINER_MODELS["codex"]
-    ordered_slugs = _read_codex_models_cache_slugs(env)
-    if not ordered_slugs:
-        return default_mod
-    slug_set = set(ordered_slugs)
-    if default_mod in slug_set:
-        return default_mod
-    for cand in CODEX_PUBLIC_FALLBACK_MODELS:
-        if cand in slug_set:
-            return cand
-    for s in ordered_slugs:
-        low = s.lower()
-        if "mini" in low or "luna" in low:
-            return s
-    return CODEX_PUBLIC_FALLBACK_MODELS[0]
 
 
 def _is_codex_model_unsupported_error(err: _RefinerAttemptError) -> bool:
@@ -2023,31 +1970,18 @@ class CodexRefiner(OpenAIResponsesRefiner):
         if not isinstance(data, Mapping):
             raise RuntimeError(f"invalid root in codex {auth_path.name}")
 
-        auth_mode = str(data.get("auth_mode") or "").strip().lower()
-        file_api_key = str(data.get("OPENAI_API_KEY") or "").strip()
-        env_api_key = str(self.env.get("OPENAI_API_KEY") or "").strip()
-        tokens = data.get("tokens") if isinstance(data.get("tokens"), Mapping) else {}
-        access_token = str(tokens.get("access_token") or "").strip()
-        account_id = str(tokens.get("account_id") or "").strip()
-
-        is_api_key_mode = auth_mode in ("api_key", "apikey") or (
-            auth_mode not in ("chatgpt", "chatgptauthtokens")
-            and not access_token
-            and bool(file_api_key or env_api_key)
+        mode, token_or_key, account_id = classify_codex_auth_json(
+            data, self.env, allow_empty_auth_env_key=True
         )
-        if is_api_key_mode:
-            resolved_key = file_api_key or env_api_key
-            if not resolved_key:
-                return None, st.st_mtime_ns
-            return _CachedCodexCredentials(mode="api_key", token=resolved_key, source="auth.json"), st.st_mtime_ns
-
-        if not access_token:
+        if mode == "api_key":
+            return _CachedCodexCredentials(mode="api_key", token=token_or_key, source="auth.json"), st.st_mtime_ns
+        if mode != "chatgpt":
             return None, st.st_mtime_ns
-        exp, jwt_acct_id, is_fedramp = _extract_jwt_metadata(access_token)
+        exp, jwt_acct_id, is_fedramp = _extract_jwt_metadata(token_or_key)
         return (
             _CachedCodexCredentials(
                 mode="chatgpt",
-                token=access_token,
+                token=token_or_key,
                 account_id=account_id or jwt_acct_id,
                 exp=exp,
                 is_fedramp=is_fedramp,

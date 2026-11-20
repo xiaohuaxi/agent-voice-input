@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-import concurrent.futures, errno, fcntl, inspect, json, os, signal, socket, stat, sys, threading, time
+import concurrent.futures, copy, errno, fcntl, hashlib, inspect, json, os, signal, socket, stat, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -39,6 +39,7 @@ from .config import (
     Config,
     ProviderCredentials,
     ensure_secure_dir,
+    explain_pipeline_selection,
     get_runtime_dir,
     redact_secrets,
     resolve_credentials,
@@ -1169,6 +1170,127 @@ def run_pipeline_once(
             wait_recording_archives(local_archive_threads, timeout_sec=2.0)
 
 
+CONTROL_RESPONSE_MAX_BYTES: int = 1_048_576
+_BRIDGE_ASSET_NAMES: tuple[str, ...] = ("mac_shim.swift", "win_shim.ps1")
+
+
+class _MalformedControlResponseError(ValueError):
+    """Raised when control.sock returns EOF, malformed JSON, or an incomplete status payload."""
+
+
+def compute_package_build_id(pkg_dir: Path | None = None) -> str:
+    """Compute a lightweight deterministic 12-char SHA-256 fingerprint of package ``*.py`` and bridge assets."""
+    root = pkg_dir if pkg_dir is not None else Path(__file__).resolve().parent
+    h = hashlib.sha256()
+    try:
+        candidates: list[Path] = sorted(root.glob("*.py"))
+        for asset in _BRIDGE_ASSET_NAMES:
+            ap = root / asset
+            if ap.is_file():
+                candidates.append(ap)
+        candidates.sort(key=lambda p: p.name)
+        for path in candidates:
+            if not path.is_file():
+                continue
+            h.update(path.name.encode("utf-8"))
+            h.update(b"\0")
+            h.update(path.read_bytes())
+            h.update(b"\0")
+    except OSError:
+        return ""
+    return h.hexdigest()[:12]
+
+
+def describe_daemon_drift(
+    daemon_status: Mapping[str, Any],
+    *,
+    current_version: str = __version__,
+    current_build_id: str | None = None,
+) -> dict[str, Any]:
+    """Compare a running daemon's reported version/build_id against the current CLI process."""
+    run_ver = str(daemon_status.get("version") or "").strip()
+    run_bid = str(daemon_status.get("build_id") or "").strip()
+    cur_bid = current_build_id if current_build_id is not None else compute_package_build_id()
+    ver_diff = bool(run_ver and run_ver != current_version)
+    bid_diff = bool(run_bid and cur_bid and run_bid != cur_bid)
+    drifted = ver_diff or bid_diff
+    missing_bid = bool(run_ver and not ver_diff and not run_bid and cur_bid)
+    if ver_diff and bid_diff:
+        reason = f"version/code mismatch (running={run_ver}/{run_bid}, current={current_version}/{cur_bid})"
+    elif ver_diff:
+        reason = f"version mismatch (running={run_ver}, current={current_version})"
+    elif bid_diff:
+        reason = f"code changed (running={run_bid}, current={cur_bid})"
+    else:
+        reason = ""
+    note = (
+        f"running daemon (v{run_ver}) omits build_id; run 'agent-voice-input restart' if you updated code"
+        if missing_bid
+        else ""
+    )
+    return {
+        "drifted": drifted,
+        "missing_build_id": missing_bid,
+        "running_version": run_ver,
+        "running_build_id": run_bid,
+        "current_version": current_version,
+        "current_build_id": cur_bid,
+        "reason": reason,
+        "note": note,
+    }
+
+
+def _read_positive_pid(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+        val = int(raw)
+        return val if val > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _inspect_daemon_lock_holder(runtime_dir: Path) -> tuple[bool, int | None]:
+    """Return ``(lock_held, holder_pid)`` without creating or modifying ``daemon.lock``."""
+    lock_path = runtime_dir / "daemon.lock"
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(str(lock_path), flags)
+    except OSError:
+        return False, None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return False, None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as exc:
+            if isinstance(exc, OSError) and exc.errno not in (
+                errno.EACCES,
+                errno.EAGAIN,
+                errno.EWOULDBLOCK,
+            ):
+                return False, None
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw_pid = os.read(fd, 64).decode("utf-8", errors="ignore").strip()
+            holder_pid = (
+                int(raw_pid)
+                if (raw_pid.isdigit() and int(raw_pid) > 0)
+                else _read_positive_pid(runtime_dir / "daemon.pid")
+            )
+            return True, holder_pid
+        else:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            return False, None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def send_control_command(runtime_dir: Path, payload: Mapping[str, Any], timeout_sec: float = 8.0) -> dict[str, Any]:
     sock_path = runtime_dir / "control.sock"
     if not sock_path.exists():
@@ -1177,9 +1299,86 @@ def send_control_command(runtime_dir: Path, payload: Mapping[str, Any], timeout_
         s.settimeout(timeout_sec); s.connect(str(sock_path))
         s.sendall((json.dumps(dict(payload), ensure_ascii=False) + "\n").encode("utf-8"))
         buf = b""
-        while b"\n" not in buf and len(buf) < 65536 and (chunk := s.recv(16384)):
+        while b"\n" not in buf and len(buf) < CONTROL_RESPONSE_MAX_BYTES and (chunk := s.recv(16384)):
             buf += chunk
-    return json.loads(buf.decode("utf-8", errors="replace").strip() or "{}")
+    if not buf.strip():
+        raise _MalformedControlResponseError("empty control response (EOF)")
+    return json.loads(buf.decode("utf-8", errors="replace").strip())
+
+
+def probe_daemon_status(
+    runtime_dir: Path,
+    *,
+    timeout_sec: float = 8.0,
+    history: int | None = None,
+) -> dict[str, Any]:
+    """Query daemon status and distinguish genuinely ``stopped`` from live-but-``unresponsive``."""
+    req: dict[str, Any] = {"cmd": "status"}
+    if history is not None:
+        req["history"] = history
+    try:
+        resp = send_control_command(runtime_dir, req, timeout_sec=timeout_sec)
+        if (
+            isinstance(resp, Mapping)
+            and resp.get("ok") is True
+            and isinstance(resp.get("state"), str)
+            and resp["state"].strip()
+        ):
+            return dict(resp)
+        err_detail = str(resp.get("error") or "") if isinstance(resp, Mapping) else ""
+        raise _MalformedControlResponseError(
+            err_detail or "malformed or error status response from daemon"
+        )
+    except Exception as exc:
+        lock_held, holder_pid = _inspect_daemon_lock_holder(runtime_dir)
+        sock_exists = (runtime_dir / "control.sock").exists()
+        is_timeout = isinstance(exc, (TimeoutError, socket.timeout))
+        is_backlog_busy = isinstance(exc, OSError) and exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
+        is_malformed = (
+            isinstance(exc, (_MalformedControlResponseError, ValueError)) and sock_exists
+        )
+        if lock_held or is_timeout or is_backlog_busy or is_malformed:
+            if holder_pid is None:
+                cand_pid = _read_positive_pid(runtime_dir / "daemon.pid")
+                if cand_pid is not None:
+                    try:
+                        os.kill(cand_pid, 0)
+                        holder_pid = cand_pid
+                    except PermissionError:
+                        holder_pid = cand_pid
+                    except OSError:
+                        holder_pid = None
+            if is_timeout:
+                err_msg = f"control socket timed out after {timeout_sec:.1f}s (daemon busy or hung)"
+            elif lock_held:
+                err_msg = f"daemon.lock is held but control socket is unreachable ({exc})"
+            else:
+                err_msg = f"control socket error ({exc})"
+            out: dict[str, Any] = {
+                "ok": False,
+                "state": "unresponsive",
+                "lock_held": lock_held,
+                "error": err_msg,
+            }
+            if holder_pid is not None:
+                out["pid"] = holder_pid
+            return out
+        is_offline_err = (
+            isinstance(exc, (RuntimeError, FileNotFoundError, ConnectionRefusedError))
+            or (
+                isinstance(exc, OSError)
+                and exc.errno in (errno.ENOENT, errno.ECONNREFUSED, errno.ENOTSOCK, errno.EPROTOTYPE)
+            )
+            or (isinstance(exc, (_MalformedControlResponseError, ValueError)) and not sock_exists)
+        )
+        if not is_offline_err:
+            return {
+                "ok": False,
+                "state": "error",
+                "lock_held": False,
+                "error": f"control socket error ({exc})",
+            }
+        return {"ok": False, "state": "stopped"}
 
 
 @dataclass(slots=True)
@@ -1253,8 +1452,14 @@ class VoiceInputDaemon:
                     tracker.context_max_chars = max(1000, int(cfg.refiner.context_max_chars))
         self.asr_provider = asr_provider or create_asr_provider(cfg, self.creds, env=self.env)
         ref_env: Mapping[str, str] | None = self.env if env is not None else None
+        self._refiner_env = ref_env
+        self.build_id: str = compute_package_build_id()
         self.resolved_refiner_provider = select_refiner_provider(cfg, self.creds, ref_env)
         self.refiner = refiner or create_refiner(cfg, self.creds, env=ref_env, runtime_dir=self.runtime_dir)
+        self.active_pipeline: dict[str, Any] = explain_pipeline_selection(cfg, self.creds, ref_env)
+        if (actual_asr := str(getattr(self.asr_provider, "provider_name", "") or "").strip()):
+            self.active_pipeline["asr"]["provider"] = actual_asr
+        self.active_pipeline["refiner"]["provider"] = self.resolved_refiner_provider
         self.clock_fn, self.sleep_fn = clock_fn, sleep_fn
         self._paste_settle_sec = max(0.0, float(paste_settle_sec))
         # Strict global lock hierarchy: _trigger_lock (T) -> _hud_lock (H) -> _lock / _queue_cv (L) -> Leaf locks
@@ -2865,12 +3070,14 @@ class VoiceInputDaemon:
                 resp: dict[str, Any] = {
                     "ok": True,
                     "version": __version__,
+                    "build_id": self.build_id,
                     "pid": os.getpid(),
                     "state": self.state,
                     "seq_id": self.seq_id,
                     "pending_count": self._inflight_or_queued_count_locked(),
-                    "asr_provider": select_asr_provider(self.cfg, self.creds),
+                    "asr_provider": self.active_pipeline["asr"]["provider"],
                     "refiner_provider": self.resolved_refiner_provider,
+                    "pipeline": copy.deepcopy(self.active_pipeline),
                     "shim_ok": shim_ok,
                     "last_result": dict(self.last_result),
                 }

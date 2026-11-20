@@ -26,6 +26,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .config import is_loopback_url as _is_loopback_url
+
 DEFAULT_USER_AGENT = "agent-voice-input/0.1"
 DEFAULT_CONNECT_TIMEOUT_SEC: float = 9.0
 _STREAM_CHUNK_BYTES = 65536
@@ -208,14 +210,6 @@ class HttpResponse:
 
 
 HttpTransport = Callable[[HttpRequest], HttpResponse]
-
-
-def _is_loopback_url(url: str) -> bool:
-    try:
-        host = (urllib.parse.urlparse(url).hostname or "").lower()
-    except ValueError:
-        return False
-    return host in ("127.0.0.1", "localhost", "::1")
 
 
 def _origin_tuple(parsed: urllib.parse.SplitResult) -> tuple[str, str, int | None, str | None, str | None]:

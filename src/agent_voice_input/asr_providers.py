@@ -28,6 +28,7 @@ import uuid
 from .audio_proc import (
     SINGLE_HOP_MP3_MIN_WAV_BYTES,
     encode_wav_to_mp3_bytes,
+    pack_pcm16_mono_wav,
 )
 from .config import (
     CREDENTIAL_ENV_ORDER,
@@ -1208,6 +1209,98 @@ class DoubaoAsrProvider(BaseAsrProvider):
             "Doubao ASR: no granted/allowed resource slot available: " + "; ".join(slot_errors),
             extra_secrets=secrets,
         )
+
+    def probe_ping(self, *, timeout_sec: float = 5.0) -> tuple[str, int, str]:
+        """Lightweight online connectivity, auth, and slot probe for Doubao BigModel ASR (1.0/2.0)."""
+        t0 = self.clock_fn()
+        budget = max(0.5, float(timeout_sec))
+        deadline = t0 + budget
+        secrets: tuple[str, ...] = ()
+        try:
+            app_id, api_key, secrets = self._resolve_auth()
+            base_url = _resolve_doubao_base_url(self.cfg.asr.base_url)
+            cache_key = self._make_cache_key(base_url, app_id, api_key)
+            _, candidates = self._build_candidate_slots(cache_key)
+            auth_hdrs = self._auth_headers(app_id, api_key)
+            silent_wav = pack_pcm16_mono_wav([0] * 1600, sample_rate=16000)
+            payload = {
+                "user": {"uid": "agent-voice-input"},
+                "audio": {
+                    "data": base64.b64encode(silent_wav).decode("ascii"),
+                    "format": "wav",
+                    "rate": 16000,
+                    "bits": 16,
+                    "channel": 1,
+                },
+                "request": {
+                    "model_name": self.cfg.asr.effective_model("doubao") or "bigmodel",
+                },
+            }
+            body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            slot_errors: list[str] = []
+            for mode, rid in candidates:
+                rem = deadline - self.clock_fn()
+                if rem <= 0.05:
+                    ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
+                    return "FAIL", ms, f"FAIL ({ms}ms: Doubao ping exceeded {budget:.1f}s deadline)"
+                endpoint = f"{base_url}/recognize/flash" if mode == "flash" else f"{base_url}/submit"
+                headers = {
+                    **auth_hdrs,
+                    "Content-Type": "application/json",
+                    "X-Api-Resource-Id": rid,
+                    "X-Api-Request-Id": str(uuid.uuid4()),
+                    "X-Api-Sequence": "-1",
+                }
+                resp = self.transport(
+                    HttpRequest(
+                        url=endpoint,
+                        method="POST",
+                        headers=headers,
+                        body=body_bytes,
+                        timeout_sec=rem,
+                        connect_timeout_sec=rem,
+                    )
+                )
+                ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
+                api_code, api_msg = self._extract_doubao_status(resp, data, secrets)
+                if 200 <= resp.status < 300:
+                    is_ok = api_code in ("20000000", "20000003") or (
+                        mode == "flash"
+                        and not api_code
+                        and isinstance(data, Mapping)
+                        and "result" in data
+                    )
+                    if is_ok:
+                        return "OK", ms, f"OK ({ms}ms, slot={rid}/{mode})"
+                if self._is_recoverable_slot_error(resp.status, api_code, api_msg):
+                    slot_errors.append(f"{rid}({mode}): {api_code or resp.status}")
+                    continue
+                if resp.status in (401, 403):
+                    return (
+                        "FAIL",
+                        ms,
+                        f"FAIL (HTTP {resp.status} unauthorized, {ms}ms; check DOUBAO_ASR_APP_ID / DOUBAO_ASR_API_KEY)",
+                    )
+                detail = api_msg or "unexpected status"
+                return (
+                    "FAIL",
+                    ms,
+                    f"FAIL (HTTP {resp.status} code={api_code or '-'}, {ms}ms: {detail[:140]})",
+                )
+            ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
+            return (
+                "FAIL",
+                ms,
+                f"FAIL ({ms}ms: no granted Doubao ASR slot; tried {', '.join(slot_errors)})",
+            )
+        except Exception as exc:
+            ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
+            safe = self._safe_excerpt(str(exc), secrets, limit=160)
+            return "FAIL", ms, f"FAIL ({ms}ms: {safe})"
 
     def _extract_doubao_status(
         self, resp: HttpResponse, data: Mapping[str, Any], secrets: Sequence[str]

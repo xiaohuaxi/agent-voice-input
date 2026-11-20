@@ -848,15 +848,25 @@ class ConfigAndCredentialsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            # Legacy v0.1.0 aliases and stage-mismatched providers MUST raise ConfigError
-            for bad_asr in ("ali", "qwen", "gemini-flash-audio", "codex-luna", "volcengine", "codex", "deepseek", "off"):
+            # Legacy v0.1.0 aliases and genuinely stage-incompatible providers MUST raise ConfigError
+            for bad_asr in ("ali", "qwen", "gemini-flash-audio", "codex-luna", "codex", "deepseek", "off"):
                 with self.subTest(bad_asr=bad_asr):
                     with self.assertRaises(ConfigError):
                         load_config(env={"HOME": str(home)}, home_dir=home, cli_overrides={"asr.provider": bad_asr})
-            for bad_refiner in ("codex-luna", "ali", "qwen", "gemini-flash-audio", "doubao"):
+            for bad_refiner in ("codex-luna", "ali", "qwen", "gemini-flash-audio"):
                 with self.subTest(bad_refiner=bad_refiner):
                     with self.assertRaises(ConfigError):
                         load_config(env={"HOME": str(home)}, home_dir=home, cli_overrides={"refiner.provider": bad_refiner})
+            # Cross-stage Volcengine/Doubao aliases normalize cleanly to each stage's canonical provider
+            cfg_asr_volc, _ = load_config(
+                env={"HOME": str(home)}, home_dir=home, cli_overrides={"asr.provider": "volcengine"}
+            )
+            self.assertEqual(cfg_asr_volc.asr.provider, "doubao")
+            cfg_ref_db, _ = load_config(
+                env={"HOME": str(home)}, home_dir=home, cli_overrides={"refiner.provider": "doubao"}
+            )
+            self.assertEqual(cfg_ref_db.refiner.provider, "volcengine")
+            self.assertEqual(cfg_ref_db.refiner.model, DEFAULT_REFINER_MODELS["volcengine"])
 
             # openai-compatible requires explicit base_url (and explicit model on Refiner)
             with self.assertRaises(ConfigError):

@@ -45,6 +45,11 @@ VALID_ASR_PROVIDERS = frozenset(
         "openai-compatible",
     }
 )
+ASR_PROVIDER_ALIASES: dict[str, str] = {
+    "volcengine": "doubao",
+    "volc": "doubao",
+    "bailian": "dashscope",
+}
 VALID_ASR_APIS = frozenset({"auto", "audio-transcriptions", "chat-completions"})
 VALID_DOUBAO_MODES = frozenset({"auto", "flash", "submit"})
 VALID_REFINER_PROVIDERS = frozenset(
@@ -62,6 +67,17 @@ VALID_REFINER_PROVIDERS = frozenset(
         "openai-compatible",
         "off",
     }
+)
+REFINER_PROVIDER_ALIASES: dict[str, str] = {
+    "doubao": "volcengine",
+    "volc": "volcengine",
+    "ark": "volcengine",
+    "bailian": "dashscope",
+}
+CODEX_PUBLIC_FALLBACK_MODELS: tuple[str, ...] = (
+    "gpt-5.4-mini",
+    "gpt-5-codex-mini",
+    "codex-mini-latest",
 )
 VALID_REFINER_APIS = frozenset({"auto", "chat-completions", "responses"})
 VALID_EFFORTS = frozenset(
@@ -399,19 +415,28 @@ class AsrConfig:
     timeout_sec: float = 60.0
     max_retries: int = 2
 
+    def __post_init__(self) -> None:
+        if isinstance(self.provider, str):
+            self.provider = ASR_PROVIDER_ALIASES.get(
+                self.provider.strip().lower(), self.provider.strip().lower()
+            )
+
     def canonical_provider(self) -> str:
-        return self.provider.strip().lower()
+        low = self.provider.strip().lower()
+        return ASR_PROVIDER_ALIASES.get(low, low)
 
     def effective_model(self, resolved_provider: str | None = None) -> str:
         if self.model and self.model.strip():
             return self.model.strip()
-        prov = (resolved_provider or self.provider).strip().lower()
+        raw_p = (resolved_provider or self.provider).strip().lower()
+        prov = ASR_PROVIDER_ALIASES.get(raw_p, raw_p)
         return DEFAULT_ASR_MODELS.get(prov, DEFAULT_ASR_MODELS["dashscope"])
 
     def effective_base_url(self, resolved_provider: str | None = None) -> str:
         if self.base_url and self.base_url.strip():
             return self.base_url.strip()
-        prov = (resolved_provider or self.provider).strip().lower()
+        raw_p = (resolved_provider or self.provider).strip().lower()
+        prov = ASR_PROVIDER_ALIASES.get(raw_p, raw_p)
         return DEFAULT_ASR_BASE_URLS.get(prov, "")
 
 
@@ -433,9 +458,13 @@ class RefinerConfig:
     _model_explicit: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        prov = self.provider.strip().lower()
-        if prov in ("none", "false", "0", "disabled"):
+        raw_p = self.provider.strip().lower() if isinstance(self.provider, str) else ""
+        if raw_p in ("none", "false", "0", "disabled"):
             prov = "off"
+        else:
+            prov = REFINER_PROVIDER_ALIASES.get(raw_p, raw_p)
+        if prov and prov in REFINER_PROVIDER_ALIASES.values() and raw_p in REFINER_PROVIDER_ALIASES:
+            self.provider = prov
         self._model_explicit = bool(self.model and self.model.strip())
         if prov not in ("auto", "off"):
             if not self.model or not self.model.strip():
@@ -449,25 +478,29 @@ class RefinerConfig:
             return False
         if self._model_explicit:
             return True
-        prov = (resolved_provider or self.provider).strip().lower()
+        raw_p = (resolved_provider or self.provider).strip().lower()
+        prov = REFINER_PROVIDER_ALIASES.get(raw_p, raw_p)
         return m != DEFAULT_REFINER_MODELS.get(prov, "")
 
     def effective_model(self, resolved_provider: str | None = None) -> str:
         if self.model and self.model.strip():
             return self.model.strip()
-        prov = (resolved_provider or self.provider).strip().lower()
+        raw_p = (resolved_provider or self.provider).strip().lower()
+        prov = REFINER_PROVIDER_ALIASES.get(raw_p, raw_p)
         return DEFAULT_REFINER_MODELS.get(prov, "")
 
     def effective_effort(self, resolved_provider: str | None = None) -> str:
         if self.effort and self.effort.strip():
             return self.effort.strip().lower()
-        prov = (resolved_provider or self.provider).strip().lower()
+        raw_p = (resolved_provider or self.provider).strip().lower()
+        prov = REFINER_PROVIDER_ALIASES.get(raw_p, raw_p)
         return DEFAULT_REFINER_EFFORTS.get(prov, "auto")
 
     def effective_base_url(self, resolved_provider: str | None = None) -> str:
         if self.base_url and self.base_url.strip():
             return self.base_url.strip()
-        prov = (resolved_provider or self.provider).strip().lower()
+        raw_p = (resolved_provider or self.provider).strip().lower()
+        prov = REFINER_PROVIDER_ALIASES.get(raw_p, raw_p)
         return DEFAULT_REFINER_BASE_URLS.get(prov, "")
 
     def effective_api(self, resolved_provider: str | None = None) -> str:
@@ -478,9 +511,11 @@ class RefinerConfig:
             raise ConfigError(
                 f"refiner.api must be one of {sorted(VALID_REFINER_APIS)}, got {self.api!r}"
             )
-        prov = (resolved_provider or self.provider).strip().lower()
-        if prov in ("", "none", "false", "0", "disabled"):
+        raw_p = (resolved_provider or self.provider).strip().lower()
+        if raw_p in ("", "none", "false", "0", "disabled"):
             prov = "off"
+        else:
+            prov = REFINER_PROVIDER_ALIASES.get(raw_p, raw_p)
         if prov == "off":
             return "off"
         if prov == "auto":
@@ -1545,13 +1580,21 @@ def normalize_ui_position(raw: Any = "bottom", field_name: str = "ui.position") 
     )
 
 
+def normalize_asr_provider(raw: Any) -> str:
+    s = _as_str(raw, "asr.provider").strip().lower()
+    return ASR_PROVIDER_ALIASES.get(s, s)
+
+
 def _normalize_refiner_provider(raw: Any) -> str:
     if raw is False:
         return "off"
     s = _as_str(raw, "refiner.provider").strip().lower()
     if s in ("none", "false", "0", "disabled"):
         return "off"
-    return s
+    return REFINER_PROVIDER_ALIASES.get(s, s)
+
+
+normalize_refiner_provider = _normalize_refiner_provider
 
 
 def _as_app_patterns(val: Any, name: str = "hotkey.ignore_apps") -> tuple[str, ...]:
@@ -1728,7 +1771,7 @@ def _apply_asr_section(cfg: Config, asr: Any) -> None:
         if v is None:
             continue
         if k == "provider":
-            cfg.asr.provider = _as_str(v, "asr.provider").strip().lower()
+            cfg.asr.provider = normalize_asr_provider(v)
         elif k == "model":
             cfg.asr.model = _as_str(v, "asr.model").strip()
         elif k == "api":
@@ -1996,7 +2039,8 @@ def resolve_asr_api(
     base_url: str = "",
 ) -> str:
     """Resolve effective Stage 1 ASR wire protocol and reject incompatible combinations."""
-    prov = provider.strip().lower()
+    raw_prov = provider.strip().lower()
+    prov = ASR_PROVIDER_ALIASES.get(raw_prov, raw_prov)
     req_api = (api or "auto").strip().lower()
     if req_api not in VALID_ASR_APIS:
         raise ConfigError(
@@ -2544,12 +2588,49 @@ def find_codex_bin(env: Mapping[str, str] | None = None) -> str | None:
     return next((str(p) for p in cands if p.is_file() and os.access(str(p), os.X_OK)), None)
 
 
-def has_codex_local_auth(env: Mapping[str, str] | None = None) -> bool:
-    """Zero-subprocess check for local Codex CLI login state (hermetic when ``env`` is passed)."""
+def classify_codex_auth_json(
+    data: Mapping[str, Any],
+    env: Mapping[str, str] | None = None,
+    *,
+    allow_empty_auth_env_key: bool = False,
+) -> tuple[str, str, str]:
+    """Classify parsed Codex ``auth.json`` into ``(mode, token_or_key, account_id)``.
+
+    ``mode`` is ``'chatgpt'``, ``'chatgpt_refresh'``, ``'api_key'``, or ``'none'``.
+    Shared by ``config.py`` auto-selection and ``refiner.py`` credential parsing.
+    """
+    src = os.environ if env is None else env
+    auth_mode = str(data.get("auth_mode") or "").strip().lower()
+    file_api_key = str(data.get("OPENAI_API_KEY") or "").strip()
+    env_api_key = str(src.get("OPENAI_API_KEY") or "").strip()
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), Mapping) else {}
+    access_token = str(tokens.get("access_token") or "").strip()
+    refresh_token = str(tokens.get("refresh_token") or "").strip()
+    account_id = str(tokens.get("account_id") or "").strip()
+
+    if auth_mode in ("api_key", "apikey"):
+        resolved_key = file_api_key or env_api_key
+        return ("api_key", resolved_key, "") if resolved_key else ("none", "", "")
+
+    if access_token:
+        return "chatgpt", access_token, account_id
+
+    if auth_mode not in ("chatgpt", "chatgptauthtokens"):
+        if file_api_key:
+            return "api_key", file_api_key, ""
+        if env_api_key and (refresh_token or allow_empty_auth_env_key):
+            return "api_key", env_api_key, ""
+
+    if refresh_token:
+        return "chatgpt_refresh", refresh_token, account_id
+    return "none", "", ""
+
+
+def detect_codex_local_auth_mode(env: Mapping[str, str] | None = None) -> str:
+    """Zero-subprocess classification of local Codex auth: ``'chatgpt' | 'api_key' | 'keyring' | 'none'``."""
     codex_home = resolve_codex_home_dir(env)
     if codex_home is None:
-        return False
-    src = os.environ if env is None else env
+        return "none"
     auth_path = codex_home / "auth.json"
     try:
         st = os.stat(auth_path)
@@ -2561,32 +2642,33 @@ def has_codex_local_auth(env: Mapping[str, str] | None = None) -> bool:
         except (OSError, ValueError):
             data = None
         if isinstance(data, Mapping):
-            tokens = data.get("tokens")
-            if isinstance(tokens, Mapping):
-                if str(tokens.get("access_token") or "").strip() or str(
-                    tokens.get("refresh_token") or ""
-                ).strip():
-                    return True
-            if str(data.get("OPENAI_API_KEY") or "").strip():
-                return True
-            auth_mode = str(data.get("auth_mode") or "").strip().lower()
-            if auth_mode in ("api_key", "apikey") and str(src.get("OPENAI_API_KEY") or "").strip():
-                return True
+            mode, _, _ = classify_codex_auth_json(data, env, allow_empty_auth_env_key=False)
+            if mode in ("chatgpt", "chatgpt_refresh"):
+                return "chatgpt"
+            if mode == "api_key":
+                return "api_key"
+            if str(data.get("auth_mode") or "").strip().lower() in ("api_key", "apikey"):
+                return "none"
 
     cfg_path = codex_home / "config.toml"
     try:
         cst = os.stat(cfg_path)
     except OSError:
-        return False
+        return "none"
     if not stat.S_ISREG(cst.st_mode) or cst.st_size <= 0 or cst.st_size > 1_048_576:
-        return False
+        return "none"
     try:
         cfg_txt = cfg_path.read_text(encoding="utf-8-sig")
     except (OSError, ValueError):
-        return False
+        return "none"
     if _CODEX_KEYRING_STORE_RE.search(cfg_txt) and find_codex_bin(env) is not None:
-        return True
-    return False
+        return "keyring"
+    return "none"
+
+
+def has_codex_local_auth(env: Mapping[str, str] | None = None) -> bool:
+    """Zero-subprocess check for local Codex CLI login state (hermetic when ``env`` is passed)."""
+    return detect_codex_local_auth_mode(env) != "none"
 
 
 def _infer_provider_from_explicit_refiner_hints(ref_cfg: RefinerConfig) -> str | None:
@@ -2642,12 +2724,15 @@ def select_refiner_provider(
     if inferred is not None:
         return inferred
 
-    if has_codex_local_auth(env):
+    codex_mode = detect_codex_local_auth_mode(env)
+    if codex_mode == "chatgpt":
         return "codex"
 
     for candidate in REFINER_AUTO_PRIORITY:
         if creds.for_provider(candidate) is not None:
             return candidate
+    if codex_mode in ("keyring", "api_key"):
+        return "codex"
     return "off"
 
 
@@ -2708,6 +2793,252 @@ def select_asr_provider(cfg: Config, creds: ProviderCredentials) -> str:
         if creds.for_provider(candidate) is not None:
             return candidate
     return "dashscope"
+
+
+def _read_codex_models_cache_slugs(env: Mapping[str, str] | None = None) -> list[str]:
+    codex_home = resolve_codex_home_dir(env)
+    if codex_home is None:
+        return []
+    cache_path = codex_home / "models_cache.json"
+    try:
+        st = os.stat(cache_path)
+        if not stat.S_ISREG(st.st_mode) or not (0 < st.st_size <= 4_194_304):
+            return []
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    models = data.get("models") if isinstance(data, Mapping) else None
+    if not isinstance(models, list):
+        return []
+    slugs: list[str] = []
+    seen: set[str] = set()
+    for item in models:
+        if isinstance(item, Mapping):
+            s = str(item.get("slug") or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                slugs.append(s)
+    return slugs
+
+
+def resolve_codex_default_model(cfg: Config, env: Mapping[str, str] | None = None) -> str:
+    """Resolve effective Codex model, falling back to a public mini model when internal ``gpt-6-luna`` is absent."""
+    if cfg.refiner.has_explicit_model("codex"):
+        return cfg.refiner.effective_model("codex")
+    default_mod = DEFAULT_REFINER_MODELS["codex"]
+    ordered_slugs = _read_codex_models_cache_slugs(env)
+    if not ordered_slugs:
+        return default_mod
+    slug_set = set(ordered_slugs)
+    if default_mod in slug_set:
+        return default_mod
+    for cand in CODEX_PUBLIC_FALLBACK_MODELS:
+        if cand in slug_set:
+            return cand
+    for s in ordered_slugs:
+        low = s.lower()
+        if "mini" in low or "luna" in low:
+            return s
+    return CODEX_PUBLIC_FALLBACK_MODELS[0]
+
+
+def is_loopback_url(url: str) -> bool:
+    """Return True only when ``url`` targets a local loopback host (127.0.0.1 / localhost / ::1)."""
+    s = (url or "").strip()
+    if not s:
+        return False
+    try:
+        host = (urllib.parse.urlparse(s).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def sanitize_base_url(url: str) -> str:
+    """Return ``scheme://host[:port]/path`` with userinfo, query, and fragment stripped."""
+    s = (url or "").strip()
+    if not s:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(s)
+        host = (parsed.hostname or "").strip()
+        port = parsed.port
+    except ValueError:
+        return ""
+    if not parsed.scheme or not host:
+        return ""
+    host_fmt = f"[{host}]" if ":" in host else host
+    netloc = f"{host_fmt}:{port}" if port is not None else host_fmt
+    return f"{parsed.scheme.lower()}://{netloc}{parsed.path}"
+
+
+def explain_pipeline_selection(
+    cfg: Config,
+    creds: ProviderCredentials | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Single source of truth explaining active Stage 1 ASR + Stage 2 Refiner selection and ready alternatives."""
+    eff_creds = creds if creds is not None else resolve_credentials(cfg, env)
+    codex_mode = detect_codex_local_auth_mode(env)
+    codex_ready = codex_mode != "none"
+
+    # --- Stage 1: ASR ---
+    raw_asr_prov = cfg.asr.canonical_provider()
+    eff_asr = select_asr_provider(cfg, eff_creds)
+    eff_asr_model = cfg.asr.effective_model(eff_asr)
+    eff_asr_url = cfg.asr.effective_base_url(eff_asr)
+    eff_asr_api = resolve_asr_api(eff_asr, eff_asr_model, cfg.asr.api, cfg.asr.base_url)
+    asr_is_single_hop = eff_asr_api == "gemini-native" or (
+        eff_asr_api == "chat-completions"
+        and (eff_asr != "dashscope" or is_dashscope_omni_chat_model(eff_asr_model, cfg.asr.base_url))
+    )
+    if cfg.asr.api_key_env.strip():
+        asr_ready = bool(eff_creds.asr_custom and eff_creds.asr_custom.value)
+        asr_cred_src = eff_creds.asr_custom.source_env if eff_creds.asr_custom else cfg.asr.api_key_env.strip()
+    elif eff_asr == "openai-compatible":
+        asr_ready = bool(eff_creds.openai or is_loopback_url(eff_asr_url))
+        asr_cred_src = eff_creds.openai.source_env if eff_creds.openai else "loopback"
+    else:
+        asr_item = eff_creds.for_provider(eff_asr)
+        asr_ready = bool(asr_item)
+        asr_cred_src = asr_item.source_env if asr_item else ""
+
+    if raw_asr_prov != "auto":
+        asr_reason = f"explicit asr.provider={eff_asr}"
+    elif _infer_provider_from_explicit_asr_hints(cfg.asr) is not None:
+        asr_reason = f"inferred from explicit asr config ({eff_asr})"
+    elif asr_ready:
+        asr_reason = f"auto priority ({asr_cred_src})"
+    else:
+        asr_reason = "auto default fallback (no ASR credentials configured)"
+
+    asr_alternatives = [
+        p for p in ASR_AUTO_PRIORITY if p != eff_asr and eff_creds.for_provider(p) is not None
+    ]
+
+    # --- Stage 2: Refiner ---
+    raw_ref_prov = _normalize_refiner_provider(cfg.refiner.provider)
+    resolved_ref = select_refiner_provider(cfg, eff_creds, env)
+    ref_bypassed = bool(
+        asr_is_single_hop and not cfg.refiner.force_on_single_hop and raw_ref_prov != "off"
+    )
+    if resolved_ref == "off" or ref_bypassed:
+        eff_ref_model = ""
+        eff_ref_api = "off"
+        eff_ref_effort = ""
+        eff_ref_url = ""
+        ref_ready = False
+        ref_cred_src = ""
+    elif resolved_ref == "codex":
+        eff_ref_model = resolve_codex_default_model(cfg, env)
+        eff_ref_api = cfg.refiner.effective_api("codex")
+        eff_ref_effort = cfg.refiner.effective_effort("codex")
+        eff_ref_url = cfg.refiner.base_url.strip() or (
+            OPENAI_DEFAULT_BASE_URL if codex_mode == "api_key" else CODEX_SUBSCRIPTION_BASE_URL
+        )
+        ref_ready = codex_ready
+        ref_cred_src = "Codex API key" if codex_mode == "api_key" else "local Codex login"
+    else:
+        eff_ref_model = cfg.refiner.effective_model(resolved_ref)
+        eff_ref_api = cfg.refiner.effective_api(resolved_ref)
+        eff_ref_effort = cfg.refiner.effective_effort(resolved_ref)
+        eff_ref_url = cfg.refiner.effective_base_url(resolved_ref)
+        if cfg.refiner.api_key_env.strip():
+            ref_ready = bool(eff_creds.refiner_custom and eff_creds.refiner_custom.value)
+            ref_cred_src = (
+                eff_creds.refiner_custom.source_env
+                if eff_creds.refiner_custom
+                else cfg.refiner.api_key_env.strip()
+            )
+        elif resolved_ref == "openai-compatible":
+            ref_ready = bool(eff_creds.openai or is_loopback_url(eff_ref_url))
+            ref_cred_src = eff_creds.openai.source_env if eff_creds.openai else "loopback"
+        else:
+            ref_item = eff_creds.for_provider(resolved_ref)
+            ref_ready = bool(ref_item)
+            ref_cred_src = ref_item.source_env if ref_item else ""
+
+    if raw_ref_prov == "off":
+        ref_reason = "explicit refiner.provider=off"
+    elif ref_bypassed:
+        ref_reason = "bypassed (single-hop ASR passthrough)"
+    elif raw_ref_prov != "auto":
+        ref_reason = (
+            "explicit refiner.provider=codex (API key billing)"
+            if (resolved_ref == "codex" and codex_mode == "api_key")
+            else f"explicit refiner.provider={resolved_ref}"
+        )
+    elif _infer_provider_from_explicit_refiner_hints(cfg.refiner) is not None:
+        ref_reason = f"inferred from explicit refiner config ({resolved_ref})"
+    elif resolved_ref == "codex":
+        if codex_mode == "chatgpt":
+            ref_reason = "auto preferred local Codex subscription login (zero extra API billing)"
+        elif codex_mode == "keyring":
+            ref_reason = "auto fallback to local Codex keyring (auth mode unverified offline)"
+        else:
+            ref_reason = "auto fallback to Codex API key (OpenAI API billing)"
+    elif resolved_ref == "off":
+        ref_reason = "auto degraded to off (no Stage 2 credentials configured)"
+    else:
+        ref_reason = f"auto priority ({ref_cred_src})"
+
+    ref_alternatives: list[str] = []
+    if codex_ready and (ref_bypassed or resolved_ref != "codex"):
+        ref_alternatives.append("codex")
+    for p in REFINER_AUTO_PRIORITY:
+        if (ref_bypassed or p != resolved_ref) and eff_creds.for_provider(p) is not None:
+            ref_alternatives.append(p)
+
+    # --- Human-readable single-line summary ---
+    asr_part = f"ASR {eff_asr}/{eff_asr_model} ({asr_reason})"
+    if raw_ref_prov == "off":
+        ref_part = "Refiner off"
+    elif ref_bypassed:
+        ref_part = "Refiner bypassed (single-hop ASR)"
+    elif resolved_ref == "off":
+        ref_part = f"Refiner off ({ref_reason})"
+    else:
+        ref_part = f"Refiner {resolved_ref}/{eff_ref_model} ({ref_reason})"
+
+    alt_bits: list[str] = []
+    if asr_alternatives:
+        alt_bits.append(f"asr=[{', '.join(asr_alternatives)}]")
+    if ref_alternatives:
+        alt_bits.append(f"refiner=[{', '.join(ref_alternatives)}]")
+    alt_tail = f" | alternatives: {', '.join(alt_bits)}" if alt_bits else ""
+    summary = f"{asr_part} -> {ref_part}{alt_tail}"
+
+    ref_dict: dict[str, Any] = {
+        "configured_provider": raw_ref_prov,
+        "provider": resolved_ref,
+        "model": eff_ref_model,
+        "api": eff_ref_api,
+        "base_url": sanitize_base_url(eff_ref_url),
+        "effort": eff_ref_effort,
+        "ready": ref_ready,
+        "bypassed": ref_bypassed,
+        "reason": ref_reason,
+        "alternatives": ref_alternatives,
+    }
+    if resolved_ref == "codex" and not ref_bypassed:
+        ref_dict["auth_mode"] = codex_mode
+
+    return {
+        "asr": {
+            "configured_provider": raw_asr_prov,
+            "provider": eff_asr,
+            "model": eff_asr_model,
+            "api": eff_asr_api,
+            "base_url": sanitize_base_url(eff_asr_url),
+            "effort": cfg.asr.effort,
+            "ready": asr_ready,
+            "single_hop": asr_is_single_hop,
+            "reason": asr_reason,
+            "alternatives": asr_alternatives,
+        },
+        "refiner": ref_dict,
+        "summary": summary,
+    }
 
 
 # ---------------------------------------------------------------------------

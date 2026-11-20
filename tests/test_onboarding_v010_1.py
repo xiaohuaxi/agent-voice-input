@@ -641,7 +641,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 self.assertEqual(cli_mod._cmd_doctor(cfg_mac, merged_mac), 1)
             self.assertIn("ms-settings:privacy-microphone", buf_wsl_fail.getvalue())
 
-            # 4. Native Linux + auto->off (Doubao ASR ready, no Stage 2 credentials) -> rc=0 + doubao ping SKIP
+            # 4. Native Linux + auto->off (Doubao ASR ready, no Stage 2 credentials) -> rc=0 + doubao 1.0 ping OK
             env_doubao = {
                 "HOME": str(root / "no_cfg_home"),
                 "PATH": "",
@@ -649,6 +649,16 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 "DOUBAO_ASR_APP_ID": "db_app_9999",
                 "DOUBAO_ASR_API_KEY": "db_test_aaaa7777",
             }
+            db_ping_reqs: list[HttpRequest] = []
+
+            def _doubao_ping_tx(req: HttpRequest) -> HttpResponse:
+                db_ping_reqs.append(req)
+                return HttpResponse(
+                    status=200,
+                    headers={"X-Api-Status-Code": "20000003", "X-Api-Message": "silence"},
+                    body=b"{}",
+                )
+
             buf_db = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
@@ -656,11 +666,18 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_db),
             ):
-                self.assertEqual(cli_mod._cmd_doctor(Config(), env_doubao, ping=True), 0, buf_db.getvalue())
+                self.assertEqual(
+                    cli_mod._cmd_doctor(Config(), env_doubao, ping=True, transport=_doubao_ping_tx),
+                    0,
+                    buf_db.getvalue(),
+                )
             out_db = buf_db.getvalue()
             self.assertIn("[platform]  INFO native Linux", out_db)
             self.assertIn("[refiner]   WARN auto -> off", out_db)
-            self.assertIn("asr(doubao): SKIP", out_db)
+            self.assertIn("asr(doubao): OK", out_db)
+            self.assertIn("volc.bigasr.auc_turbo/flash", out_db)
+            self.assertEqual(len(db_ping_reqs), 1)
+            self.assertTrue(db_ping_reqs[0].url.endswith("/recognize/flash"))
             self.assertNotIn("db_test_aaaa7777", out_db)
 
             # 5. `--ping` shared endpoint deduplication (DashScope Stage 1 + auto->dashscope Stage 2 = 1 HTTP GET) & 401 redaction
@@ -812,7 +829,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             env_keyring = {
                 **env_clean,
                 "CODEX_BIN": str(fake_codex),
-                "DASHSCOPE_API_KEY": "ds_asr_aaaa1111",
+                "DOUBAO_ASR_API_KEY": "db_asr_aaaa1111",
             }
             buf_doc_kr = io.StringIO()
             with (

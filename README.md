@@ -174,10 +174,11 @@ provider = "codex"               # Or "dashscope" / "volcengine" if Codex CLI is
 
 ```bash
 agent-voice-input init                   # Create 0600 config.toml and commented agent-voice-input.env (--force overwrites)
-agent-voice-input start                  # Start background daemon
-agent-voice-input restart                # Restart daemon after config changes
-agent-voice-input status                 # Inspect daemon state, last latency, and redacted errors
-agent-voice-input doctor [--ping] [--remote]  # Check audio bridge, native shim, credentials, session/SSH readiness, and endpoint ping (--json supported)
+agent-voice-input start                  # Start background daemon (idempotent; warns if running code/version drifted)
+agent-voice-input restart                # Unconditionally stop and restart daemon after config/code changes
+agent-voice-input status                 # Inspect daemon state (stopped/unresponsive/running), active pipeline, and drift (--history N)
+agent-voice-input doctor [--ping] [--remote]  # Check audio bridge, native shim, credentials, active pipeline, session/SSH readiness, and endpoint ping (--json supported)
+agent-voice-input diagnose [--last N] [--json]  # Run read-only live diagnostics on daemon health, latency p50, cache hits, failed/ count, and redacted log tail
 agent-voice-input retry [--list] [--print]  # List or re-run stashed failed recordings (skips duplicate stdout when auto-pasted; --print forces stdout)
 agent-voice-input once --duration 4 --dry-run  # Record once and print result without pasting
 agent-voice-input toggle                 # Toggle recording start/stop from CLI
@@ -191,11 +192,11 @@ agent-voice-input key-test               # Inspect raw key scancodes / modifier 
 | CLI Flag | Description |
 | :--- | :--- |
 | `--config PATH` | Path to `config.toml` or `config.json` (also supports `AGENT_VOICE_INPUT_CONFIG` and `XDG_CONFIG_HOME`) |
-| `--asr`, `--asr-provider` | Stage 1 provider (`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`) |
+| `--asr`, `--asr-provider` | Stage 1 provider (`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`; aliases `volcengine`/`volc` → `doubao`, `bailian` → `dashscope`) |
 | `--asr-model` | Stage 1 upstream model ID |
 | `--asr-api` | Stage 1 protocol (`auto`, `audio-transcriptions`, `chat-completions`) |
 | `--asr-effort` | Stage 1 thinking budget |
-| `--refiner`, `--refiner-provider` | Stage 2 provider (`auto`, `codex`, `deepseek`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`) |
+| `--refiner`, `--refiner-provider` | Stage 2 provider (`auto`, `codex`, `deepseek`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`; aliases `doubao`/`volc`/`ark` → `volcengine`, `bailian` → `dashscope`) |
 | `--refiner-model` | Stage 2 upstream model ID |
 | `--refiner-api` | Stage 2 protocol (`auto`, `chat-completions`, `responses`) |
 | `--refiner-effort`, `--effort` | Stage 2 thinking budget |

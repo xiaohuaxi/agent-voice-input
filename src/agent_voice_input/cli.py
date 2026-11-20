@@ -1,4 +1,4 @@
-"""CLI entrypoint for agent-voice-input (init, daemon, start, restart, stop, status, toggle, cancel, once, retry, doctor, key-test, session-hook)."""
+"""CLI entrypoint for agent-voice-input (init, daemon, start, restart, stop, status, toggle, cancel, once, retry, doctor, diagnose, key-test, session-hook)."""
 from __future__ import annotations
 
 import argparse, dataclasses, errno, fcntl, json, os, shlex, signal, socket, stat, subprocess, sys, time
@@ -420,14 +420,12 @@ def _probe_stage_ping(
     from .refiner import CodexRefiner, _build_responses_url
 
     prov = provider.strip().lower()
-    if prov == "doubao":
-        return (
-            "SKIP",
-            0,
-            "SKIP (verify audio with 'agent-voice-input once --file <wav> --dry-run')",
-        )
-
     eff_tx = transport or urllib_http_transport
+    if prov == "doubao":
+        from .asr_providers import DoubaoAsrProvider
+
+        db_prov = DoubaoAsrProvider(cfg, creds, env=env, transport=eff_tx)
+        return db_prov.probe_ping(timeout_sec=5.0)
     if prov == "codex":
         t0 = time.monotonic()
         deadline = t0 + 5.0
@@ -612,6 +610,12 @@ class _DoctorState:
     daemon_running: bool = False
     daemon_pid: int | None = None
     daemon_state: str = "stopped"
+    daemon_version: str = ""
+    daemon_build_id: str = ""
+    daemon_code_drift: bool = False
+    daemon_drift_reason: str = ""
+    daemon_build_id_note: str = ""
+    daemon_error: str = ""
     match: Any = None
     remote_ssh_ok: bool | None = None
     resolved_default_ssh: str = ""
@@ -620,6 +624,7 @@ class _DoctorState:
     eff_ref_model: str = ""
     eff_ref_url: str = ""
     ref_ping_needed: bool = False
+    pipeline: dict[str, Any] = dataclasses.field(default_factory=dict)
     ping_results: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     def clean(self, text: str) -> str:
@@ -804,20 +809,14 @@ def _doctor_check_platform(st: _DoctorState) -> None:
 
 
 def _doctor_check_asr(st: _DoctorState) -> None:
-    from .config import resolve_asr_api, select_asr_provider
-    from .http_transport import _is_loopback_url
-
     cfg, creds = st.cfg, st.creds
-    st.eff_asr = select_asr_provider(cfg, creds)
-    st.eff_asr_model = cfg.asr.effective_model(st.eff_asr)
+    asr_info = st.pipeline["asr"]
+    st.eff_asr = str(asr_info["provider"])
+    st.eff_asr_model = str(asr_info["model"])
     st.eff_asr_url = cfg.asr.effective_base_url(st.eff_asr)
-    st.eff_asr_api = resolve_asr_api(st.eff_asr, st.eff_asr_model, cfg.asr.api, cfg.asr.base_url)
-    if cfg.asr.api_key_env.strip():
-        st.asr_ready = bool(creds.asr_custom and creds.asr_custom.value)
-    elif st.eff_asr == "openai-compatible":
-        st.asr_ready = bool(creds.openai or _is_loopback_url(st.eff_asr_url))
-    else:
-        st.asr_ready = bool(creds.for_provider(st.eff_asr))
+    st.eff_asr_api = str(asr_info["api"])
+    st.asr_ready = bool(asr_info["ready"])
+    st.asr_is_single_hop = bool(asr_info["single_hop"])
     asr_creds_tail = f", asr_custom={_cred_label(creds.asr_custom)}" if cfg.asr.api_key_env.strip() else ""
     st.emit(
         f"[asr]       selected={st.eff_asr} (model={st.eff_asr_model}, api={st.eff_asr_api}, effort={cfg.asr.effort}) -> "
@@ -841,21 +840,45 @@ def _doctor_check_asr(st: _DoctorState) -> None:
 
 
 def _doctor_check_daemon_and_session(st: _DoctorState) -> None:
-    from .daemon import send_control_command
+    from .daemon import describe_daemon_drift, probe_daemon_status
     from .session_ctx import SessionTracker
 
-    if (st.rt_dir / "control.sock").exists():
-        try:
-            dst = send_control_command(st.rt_dir, {"cmd": "status"}, timeout_sec=0.5)
-            if dst.get("ok"):
-                st.daemon_running = True
-                st.daemon_pid = int(dst.get("pid") or 0) or None
-                st.daemon_state = str(dst.get("state") or "idle")
-        except Exception:
-            pass
-    if st.daemon_running:
-        st.emit(f"[daemon]    running (pid={st.daemon_pid}, state={st.daemon_state})")
+    dst = probe_daemon_status(st.rt_dir, timeout_sec=0.5)
+    if dst.get("ok"):
+        st.daemon_running = True
+        st.daemon_pid = int(dst.get("pid") or 0) or None
+        st.daemon_state = str(dst.get("state") or "idle")
+        drift = describe_daemon_drift(dst)
+        st.daemon_version = drift["running_version"]
+        st.daemon_build_id = drift["running_build_id"]
+        st.daemon_code_drift = bool(drift["drifted"])
+        st.daemon_drift_reason = drift["reason"]
+        st.daemon_build_id_note = drift.get("note", "")
+        ver_tag = f", version={st.daemon_version}" if st.daemon_version else ""
+        st.emit(f"[daemon]    running (pid={st.daemon_pid}, state={st.daemon_state}{ver_tag})")
+        if st.daemon_code_drift:
+            st.emit(
+                f"[daemon]    WARN {st.daemon_drift_reason}; run 'agent-voice-input restart' to update"
+            )
+        elif st.daemon_build_id_note:
+            st.emit(f"[daemon]    INFO {st.daemon_build_id_note}")
+    elif dst.get("state") == "unresponsive":
+        st.daemon_running = False
+        st.daemon_pid = int(dst.get("pid") or 0) or None
+        st.daemon_state = "unresponsive"
+        st.daemon_error = str(dst.get("error") or "control socket unresponsive")
+        st.emit(
+            f"[daemon]    WARN unresponsive (pid={st.daemon_pid or '-'}, {st.daemon_error}; "
+            "try 'agent-voice-input restart')"
+        )
+    elif dst.get("state") == "error":
+        st.daemon_running = False
+        st.daemon_state = "error"
+        st.daemon_error = str(dst.get("error") or "control socket error")
+        st.ok_all = False
+        st.emit(f"[daemon]    FAIL {st.daemon_error}")
     else:
+        st.daemon_state = "stopped"
         st.emit("[daemon]    stopped (start via 'agent-voice-input start')")
 
     st.match = SessionTracker(env=st.env, runtime_dir=st.rt_dir, remote_cfg=st.cfg.remote).resolve_session(
@@ -905,46 +928,41 @@ def _doctor_check_remote_ssh(st: _DoctorState) -> None:
 
 
 def _doctor_check_refiner(st: _DoctorState) -> None:
-    from .config import is_dashscope_omni_chat_model, select_refiner_provider
-    from .http_transport import _is_loopback_url
     from .llm_common import _missing_key_hint
     from .refiner import (
         find_codex_bin,
         inspect_codex_auth_status,
-        resolve_codex_default_model,
     )
 
-    cfg, creds = st.cfg, st.creds
-    raw_ref_prov = cfg.refiner.provider.strip().lower()
-    if raw_ref_prov in ("none", "false", "0", "disabled"):
-        raw_ref_prov = "off"
+    cfg = st.cfg
+    ref_info = st.pipeline["refiner"]
+    raw_ref_prov = str(ref_info["configured_provider"])
     st.raw_ref_prov = raw_ref_prov
-    st.resolved_ref_prov = select_refiner_provider(cfg, creds, st.env)
+    st.resolved_ref_prov = str(ref_info["provider"])
     prompt_tag = ", prompt=custom" if cfg.refiner.prompt.strip() else ""
-    st.asr_is_single_hop = st.eff_asr_api == "gemini-native" or (
-        st.eff_asr_api == "chat-completions"
-        and (st.eff_asr != "dashscope" or is_dashscope_omni_chat_model(st.eff_asr_model, cfg.asr.base_url))
-    )
 
     if raw_ref_prov == "off":
         st.emit("[refiner]   off")
+        st.emit(f"[pipeline]  {st.pipeline['summary']}")
         return
-    if st.asr_is_single_hop and not cfg.refiner.force_on_single_hop:
+    if ref_info["bypassed"]:
         target_lbl = st.resolved_ref_prov if raw_ref_prov != "auto" else "Stage 2"
         st.emit(
             f"[refiner]   bypassed (single-hop ASR passthrough; set refiner.force_on_single_hop=true to run {target_lbl})"
         )
+        st.emit(f"[pipeline]  {st.pipeline['summary']}")
         return
     if raw_ref_prov == "auto" and st.resolved_ref_prov == "off":
         st.emit(
             "[refiner]   WARN auto -> off (no Stage 2 credentials set; raw Stage 1 ASR draft will be delivered. "
             "Optional fix: set DEEPSEEK_API_KEY / DASHSCOPE_API_KEY or run 'codex login')"
         )
+        st.emit(f"[pipeline]  {st.pipeline['summary']}")
         return
     if st.resolved_ref_prov == "codex":
-        eff_ref_api = cfg.refiner.effective_api("codex")
-        eff_ref_effort = cfg.refiner.effective_effort("codex")
-        st.eff_ref_model = resolve_codex_default_model(cfg, st.env)
+        eff_ref_api = str(ref_info["api"])
+        eff_ref_effort = str(ref_info["effort"])
+        st.eff_ref_model = str(ref_info["model"])
         prov_disp = "auto -> codex" if raw_ref_prov == "auto" else "codex"
         auth_state, auth_note = inspect_codex_auth_status(cfg, st.env)
         if auth_state in ("OK", "WARN"):
@@ -963,19 +981,15 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
             )
             st.emit_fix("run 'codex login' or set DEEPSEEK_API_KEY / DASHSCOPE_API_KEY in agent-voice-input.env")
             st.ok_all = False
+        st.emit(f"[pipeline]  {st.pipeline['summary']}")
         return
 
-    eff_ref_api = cfg.refiner.effective_api(st.resolved_ref_prov)
-    eff_ref_effort = cfg.refiner.effective_effort(st.resolved_ref_prov)
-    st.eff_ref_model = cfg.refiner.effective_model(st.resolved_ref_prov)
+    eff_ref_api = str(ref_info["api"])
+    eff_ref_effort = str(ref_info["effort"])
+    st.eff_ref_model = str(ref_info["model"])
     st.eff_ref_url = cfg.refiner.effective_base_url(st.resolved_ref_prov)
     prov_disp = f"auto -> {st.resolved_ref_prov}" if raw_ref_prov == "auto" else st.resolved_ref_prov
-    if cfg.refiner.api_key_env.strip():
-        ref_ready = bool(creds.refiner_custom and creds.refiner_custom.value)
-    elif st.resolved_ref_prov == "openai-compatible":
-        ref_ready = bool(creds.openai or _is_loopback_url(st.eff_ref_url))
-    else:
-        ref_ready = bool(creds.for_provider(st.resolved_ref_prov))
+    ref_ready = bool(ref_info["ready"])
     st.emit(
         f"[refiner]   {'OK' if ref_ready else 'MISSING KEY'} {prov_disp} "
         f"(model={st.eff_ref_model}, api={eff_ref_api}, effort={eff_ref_effort}{prompt_tag})"
@@ -988,6 +1002,7 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
             st.emit_fix(f"set {cfg.refiner.api_key_env.strip()} in agent-voice-input.env")
         else:
             st.emit_fix(_missing_key_hint(st.resolved_ref_prov, stage="refiner"))
+    st.emit(f"[pipeline]  {st.pipeline['summary']}")
 
 
 def _doctor_run_pings(
@@ -1078,13 +1093,28 @@ def _doctor_emit_json_report(st: _DoctorState, *, include_ping: bool) -> None:
         return val
 
     cfg = st.cfg
+    daemon_report: dict[str, Any] = {
+        "running": st.daemon_running,
+        "pid": st.daemon_pid,
+        "state": st.daemon_state,
+        "version": st.daemon_version,
+        "build_id": st.daemon_build_id,
+        "code_drift": st.daemon_code_drift,
+    }
+    if st.daemon_drift_reason:
+        daemon_report["drift_reason"] = st.daemon_drift_reason
+    if st.daemon_build_id_note:
+        daemon_report["build_id_note"] = st.daemon_build_id_note
+    if st.daemon_error:
+        daemon_report["error"] = st.daemon_error
     report: dict[str, Any] = {
         "ok": st.ok_all,
         "version": __version__,
         "platform": st.platform_kind,
         "config_path": cfg.config_path or "",
         "ffmpeg_ok": st.ffmpeg_ok,
-        "daemon": {"running": st.daemon_running, "pid": st.daemon_pid, "state": st.daemon_state},
+        "daemon": daemon_report,
+        "pipeline": st.pipeline,
         "asr": {
             "provider": st.eff_asr,
             "model": st.eff_asr_model,
@@ -1129,9 +1159,10 @@ def _cmd_doctor(
     as_json: bool = False,
     transport: HttpTransport | None = None,
 ) -> int:
-    from .config import get_runtime_dir, resolve_credentials
+    from .config import explain_pipeline_selection, get_runtime_dir, resolve_credentials
 
     creds = resolve_credentials(cfg, env)
+    pipeline = explain_pipeline_selection(cfg, creds, env)
     st = _DoctorState(
         cfg=cfg,
         env=env,
@@ -1139,6 +1170,7 @@ def _cmd_doctor(
         rt_dir=get_runtime_dir(env, create=True),
         as_json=as_json,
         all_secrets=tuple(creds.all_secret_values()),
+        pipeline=pipeline,
     )
     _doctor_check_env_and_ffmpeg(st)
     _doctor_check_platform(st)
@@ -1379,38 +1411,6 @@ def _trim_log_file_if_needed(
         pass
 
 
-def _read_redacted_log_tail(
-    log_path: Path,
-    start_offset: int,
-    env: Mapping[str, str],
-    *,
-    cfg: Config | None = None,
-    max_bytes: int = 2048,
-    max_lines: int = 12,
-) -> str:
-    """Read newly appended regular-file log lines since ``start_offset`` with secret redaction."""
-    from .config import redact_secrets, resolve_credentials
-
-    try:
-        st = os.lstat(log_path)
-        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
-            return ""
-        base = start_offset if 0 <= start_offset < st.st_size else max(0, st.st_size - max_bytes)
-        seek_pos = max(base, st.st_size - max(256, int(max_bytes)))
-        with open(log_path, "rb") as f:
-            if seek_pos > 0:
-                f.seek(seek_pos)
-            raw = f.read()
-        lines = [ln.rstrip() for ln in raw.decode("utf-8", errors="replace").splitlines() if ln.strip()]
-        if not lines:
-            return ""
-        creds = resolve_credentials(cfg, env) if cfg is not None else None
-        extra = creds.all_secret_values() if creds is not None else ()
-        return redact_secrets("\n".join(lines[-max_lines:]), env, cfg=cfg, extra_secrets=extra)
-    except Exception:
-        return ""
-
-
 def _warn_degraded_shim(st: Mapping[str, Any]) -> None:
     if st.get("shim_ok") is False and (se := str(st.get("shim_error") or "").strip()):
         print(
@@ -1421,9 +1421,31 @@ def _warn_degraded_shim(st: Mapping[str, Any]) -> None:
         )
 
 
+def _pipeline_from_legacy_daemon_status(st: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Build a non-contradictory pipeline summary from a legacy daemon's reported provider fields."""
+    asr_p = str(st.get("asr_provider") or "").strip()
+    ref_p = str(st.get("refiner_provider") or "").strip()
+    if not asr_p and not ref_p:
+        return None
+    asr_lbl = asr_p or "unknown"
+    ref_lbl = ref_p or "unknown"
+    return {
+        "asr": {"provider": asr_lbl, "model": ""},
+        "refiner": {"provider": ref_lbl, "model": ""},
+        "summary": f"ASR {asr_lbl} -> Refiner {ref_lbl} (reported by running daemon)",
+        "source": "legacy_daemon_status",
+    }
+
+
 def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | None = None) -> int:
-    from .config import get_runtime_dir, redact_secrets
-    from .daemon import send_control_command
+    from .config import (
+        explain_pipeline_selection,
+        get_runtime_dir,
+        redact_secrets,
+        resolve_credentials,
+    )
+    from .daemon import describe_daemon_drift, probe_daemon_status, send_control_command
+    from .diagnose import read_redacted_log_tail
     from .platform_macos import (
         classify_macos_mic_permission,
         compile_mac_shim,
@@ -1432,22 +1454,67 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
 
     rt_dir = get_runtime_dir(env, create=True)
     has_overrides = any(getattr(args, attr, None) for _, attr in _CLI_OVERRIDE_FLAGS)
-    try:
-        if (st := send_control_command(rt_dir, {"cmd": "status"}, timeout_sec=1.0)).get("ok"):
-            _warn_degraded_shim(st)
-            if has_overrides:
-                print(
-                    f"already running (pid={st.get('pid')}, state={st.get('state')}); "
-                    "run 'agent-voice-input restart' to apply new flags/config"
-                )
-            else:
-                print(
-                    f"already running (pid={st.get('pid')}, state={st.get('state')}) "
-                    "(use 'restart' to reload config)"
-                )
-            return 0
-    except Exception:
-        pass
+    pipeline_summary = ""
+    if cfg is not None:
+        pipeline_summary = str(
+            explain_pipeline_selection(cfg, resolve_credentials(cfg, env), env)["summary"]
+        )
+    st = probe_daemon_status(rt_dir, timeout_sec=1.0)
+    if st.get("ok"):
+        _warn_degraded_shim(st)
+        drift = describe_daemon_drift(st)
+        if drift["drifted"]:
+            print(
+                f"already running (pid={st.get('pid')}, state={st.get('state')}, {drift['reason']}); "
+                "run 'agent-voice-input restart' to update"
+            )
+        elif has_overrides:
+            print(
+                f"already running (pid={st.get('pid')}, state={st.get('state')}); "
+                "run 'agent-voice-input restart' to apply new flags/config"
+            )
+        else:
+            print(
+                f"already running (pid={st.get('pid')}, state={st.get('state')}) "
+                "(use 'restart' to reload config)"
+            )
+            if drift.get("note"):
+                print(f"[daemon]    INFO {drift['note']}")
+        running_pipe = st.get("pipeline")
+        running_summary = (
+            str(running_pipe.get("summary") or "").strip()
+            if isinstance(running_pipe, Mapping)
+            else ""
+        )
+        if running_summary:
+            print(f"[pipeline]  {running_summary}")
+        elif legacy_pipe := _pipeline_from_legacy_daemon_status(st):
+            print(f"[pipeline]  {legacy_pipe['summary']}")
+        elif cfg is not None and not has_overrides and pipeline_summary:
+            print(f"[pipeline]  {pipeline_summary}")
+        return 0
+    if st.get("state") == "unresponsive":
+        err_note = redact_secrets(
+            str(st.get("error") or "control socket temporarily unresponsive"),
+            env,
+            cfg=cfg,
+        )
+        print(
+            f"already running (pid={st.get('pid') or '-'}, state=unresponsive: {err_note}); "
+            "run 'agent-voice-input diagnose' or 'agent-voice-input restart'"
+        )
+        return 0
+    if st.get("state") == "error":
+        err_note = redact_secrets(
+            str(st.get("error") or "control socket error"),
+            env,
+            cfg=cfg,
+        )
+        print(
+            f"error: cannot verify daemon state in {rt_dir}: {err_note}",
+            file=sys.stderr,
+        )
+        return 1
     src_root = Path(__file__).resolve().parents[1]
     child_env = _sanitize_daemon_tmux_env(os.environ)
     if (src_root / "agent_voice_input").is_dir():
@@ -1524,7 +1591,7 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             print(f"daemon exited early (rc={proc.returncode}); check {log_path}", file=sys.stderr)
-            if diag := _read_redacted_log_tail(log_path, start_offset, env, cfg=cfg):
+            if diag := read_redacted_log_tail(log_path, start_offset, env, cfg=cfg):
                 print(diag, file=sys.stderr)
             return 1
         try:
@@ -1532,10 +1599,14 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
                 if not warned_shim:
                     _warn_degraded_shim(st)
                 print(f"started (pid={st.get('pid')})")
+                if pipeline_summary:
+                    print(f"[pipeline]  {pipeline_summary}")
                 return 0
         except Exception:
             time.sleep(0.15)
     print(f"started process pid={proc.pid} (socket warming up)")
+    if pipeline_summary:
+        print(f"[pipeline]  {pipeline_summary}")
     return 0
 
 
@@ -1749,8 +1820,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Atomically overwrite existing files",
     )
-    for name in ("daemon", "start", "restart", "stop", "toggle"):
-        _add_common_flags(sub.add_parser(name), is_sub=True)
+    for name, help_text in (
+        ("daemon", "Run the voice input daemon in the foreground"),
+        ("start", "Start the background daemon (idempotent if already running)"),
+        ("restart", "Stop and restart the background daemon"),
+        ("stop", "Stop the background daemon"),
+        ("toggle", "Toggle recording start/stop on the running daemon"),
+    ):
+        _add_common_flags(sub.add_parser(name, help=help_text), is_sub=True)
     p_doc = sub.add_parser("doctor", help="Check audio bridge, native shim, credentials, and session binding")
     _add_common_flags(p_doc, is_sub=True)
     p_doc.add_argument(
@@ -1770,6 +1847,33 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="as_json",
         help="Emit redacted diagnostic report as JSON",
     )
+    p_diag = sub.add_parser(
+        "diagnose",
+        help="Run read-only live diagnostics on daemon health, latency, cache hits, and logs",
+    )
+    _add_common_flags(p_diag, is_sub=True)
+    p_diag.add_argument(
+        "--last",
+        type=int,
+        default=10,
+        help="Number of recent utterances to inspect (default: 10)",
+    )
+    p_diag.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit machine-readable redacted JSON instead of Markdown",
+    )
+    p_diag.add_argument(
+        "--runtime-dir",
+        default="",
+        help="Override runtime directory path",
+    )
+    p_diag.add_argument(
+        "--window-title",
+        default="",
+        help="Optional window title hint for session matching check",
+    )
     p_cancel = sub.add_parser("cancel", help="Cancel active recording or in-flight voice tasks")
     _add_common_flags(p_cancel, is_sub=True)
     p_cancel.add_argument(
@@ -1779,7 +1883,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Cancel only the task matching seq_id",
     )
-    p_status = sub.add_parser("status")
+    p_status = sub.add_parser(
+        "status",
+        help="Show running daemon status, active pipeline, and optional recent history",
+    )
     _add_common_flags(p_status, is_sub=True)
     p_status.add_argument(
         "--history",
@@ -1789,7 +1896,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Include last N redacted numeric records (default: 10)",
     )
-    p_once = sub.add_parser("once")
+    p_once = sub.add_parser(
+        "once",
+        help="Run a single recording or audio file through the transcription pipeline",
+    )
     _add_common_flags(p_once, is_sub=True)
     p_once.add_argument("--file", "--wav", dest="wav_file", help="Input audio/WAV file instead of live mic")
     p_once.add_argument("--duration", type=float, default=4.0, help="Live capture seconds when --file is omitted")
@@ -1807,7 +1917,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print recovered text to stdout even when automatically pasted",
     )
     p_retry.add_argument("--title", help="Optional window title override for session matching")
-    p_kt = sub.add_parser("key-test")
+    p_kt = sub.add_parser(
+        "key-test",
+        help="Test global hotkey capture and display raw key/modifier events",
+    )
     _add_common_flags(p_kt, is_sub=True)
     p_kt.add_argument("--seconds", type=int, default=10, help="Probe duration in seconds (Esc exits early)")
     p_hook = sub.add_parser("session-hook", help="Update terminal OSC 2 title and session registry from Agent hook stdin")
@@ -1891,16 +2004,41 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_start(args, env, cfg=cfg)
         if args.subcmd == "stop":
             return _cmd_stop(env)
-        if args.subcmd in ("status", "toggle", "cancel"):
-            from .daemon import read_telemetry_history, send_control_command
+        if args.subcmd == "status":
+            from .daemon import describe_daemon_drift, probe_daemon_status, read_telemetry_history
+
+            rt_dir_st = get_runtime_dir(env, create=False)
+            raw_hist = getattr(args, "history", None)
+            hist_limit = max(0, min(500, int(raw_hist))) if raw_hist is not None else None
+            resp = probe_daemon_status(rt_dir_st, timeout_sec=8.0, history=hist_limit)
+            if resp.get("ok"):
+                drift = describe_daemon_drift(resp)
+                resp["code_drift"] = bool(drift["drifted"])
+                if drift["drifted"]:
+                    resp["current_version"] = drift["current_version"]
+                    resp["current_build_id"] = drift["current_build_id"]
+                    resp["drift_warning"] = f"{drift['reason']}; run 'agent-voice-input restart'"
+                elif drift.get("note"):
+                    resp["build_id_note"] = drift["note"]
+                if not isinstance(resp.get("pipeline"), Mapping):
+                    if legacy_pipe := _pipeline_from_legacy_daemon_status(resp):
+                        resp["pipeline"] = legacy_pipe
+                print(json.dumps(resp, ensure_ascii=False))
+                return 0
+            if resp.get("error"):
+                resp["error"] = redact_secrets(str(resp["error"]), env, cfg=cfg)
+            if hist_limit is not None:
+                disk_hist = read_telemetry_history(rt_dir_st, limit=hist_limit)
+                resp["last_result"] = dict(disk_hist[-1]) if disk_hist else {}
+                resp["recent_results"] = disk_hist
+            print(json.dumps(resp, ensure_ascii=False))
+            return 1
+        if args.subcmd in ("toggle", "cancel"):
+            from .daemon import send_control_command
 
             ctrl_timeout = 20.0 if args.subcmd == "toggle" else 8.0
             rt_dir_st = get_runtime_dir(env, create=False)
-            raw_hist = getattr(args, "history", None) if args.subcmd == "status" else None
-            hist_limit = max(0, min(500, int(raw_hist))) if raw_hist is not None else None
             ctrl_req: dict[str, Any] = {"cmd": args.subcmd}
-            if hist_limit is not None:
-                ctrl_req["history"] = hist_limit
             if args.subcmd == "cancel" and getattr(args, "seq_id", None) is not None:
                 ctrl_req["seq_id"] = int(args.seq_id)
             try:
@@ -1912,14 +2050,6 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(resp, ensure_ascii=False))
                 return 0 if resp.get("ok") else 1
             except Exception as exc:
-                if args.subcmd == "status":
-                    out_st: dict[str, Any] = {"ok": False, "state": "stopped"}
-                    if hist_limit is not None:
-                        disk_hist = read_telemetry_history(rt_dir_st, limit=hist_limit)
-                        out_st["last_result"] = dict(disk_hist[-1]) if disk_hist else {}
-                        out_st["recent_results"] = disk_hist
-                    print(json.dumps(out_st, ensure_ascii=False))
-                    return 1
                 msg = (
                     "agent-voice-input daemon control request timed out"
                     if isinstance(exc, (TimeoutError, socket.timeout))
@@ -1937,6 +2067,17 @@ def main(argv: list[str] | None = None) -> int:
                 env,
                 ping=bool(getattr(args, "ping", False)),
                 remote_ping=bool(getattr(args, "remote_ping", False)),
+                as_json=bool(getattr(args, "as_json", False)),
+            )
+        if args.subcmd == "diagnose":
+            from .diagnose import run_diagnose_command
+
+            return run_diagnose_command(
+                cfg,
+                env,
+                runtime_dir=str(getattr(args, "runtime_dir", "") or ""),
+                window_title=str(getattr(args, "window_title", "") or ""),
+                last=int(getattr(args, "last", 10)),
                 as_json=bool(getattr(args, "as_json", False)),
             )
         if args.subcmd == "key-test":

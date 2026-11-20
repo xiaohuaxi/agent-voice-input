@@ -173,10 +173,11 @@ effort = "auto"
 
 ```bash
 agent-voice-input init                   # 初始化生成 0600 权限 config.toml 与全注释 agent-voice-input.env（支持 --force 覆盖）
-agent-voice-input start                  # 后台启动守护进程
-agent-voice-input restart                # 重启守护进程（修改配置后常用）
-agent-voice-input status                 # 查看运行状态、最近一次耗时与错误摘要
-agent-voice-input doctor [--ping] [--remote]  # 全面自检音频链路、原生辅助层、凭据、会话/SSH 就绪度及端点探活（支持 --json）
+agent-voice-input start                  # 后台启动守护进程（已运行时幂等返回 0，代码/版本漂移时提示 restart）
+agent-voice-input restart                # 无条件停止并重启守护进程（修改配置或更新代码后常用）
+agent-voice-input status                 # 查看运行状态（区分 stopped / unresponsive / running）、当前生效管线与漂移信息（支持 --history N）
+agent-voice-input doctor [--ping] [--remote]  # 全面自检音频链路、原生辅助层、凭据、生效管线、会话/SSH 就绪度及端点探活（支持 --json）
+agent-voice-input diagnose [--last N] [--json]  # 本地只读诊断：汇总守护进程健康度、延迟 p50、降级、缓存命中率、失败录音数与脱敏日志尾部
 agent-voice-input retry [--list] [--print]  # 查看或重跑暂存的失败录音（自动粘贴时不重复打印，加 --print 强制输出 stdout）
 agent-voice-input once --duration 4 --dry-run  # 单次录音验证流水线（不粘贴上屏）
 agent-voice-input toggle                 # 命令行触发开始/结束录音
@@ -190,11 +191,11 @@ agent-voice-input key-test               # 测试按键扫描码与修饰键捕�
 | CLI 参数 | 说明 |
 | :--- | :--- |
 | `--config PATH` | 指定 `config.toml` 或 `config.json` 路径（亦可通过 `AGENT_VOICE_INPUT_CONFIG` 或 `XDG_CONFIG_HOME` 指定） |
-| `--asr`, `--asr-provider` | 一阶段渠道（`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`） |
+| `--asr`, `--asr-provider` | 一阶段渠道（`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`；支持别名 `volcengine`/`volc` → `doubao`、`bailian` → `dashscope`） |
 | `--asr-model` | 一阶段上游模型 ID |
 | `--asr-api` | 一阶段协议（`auto`, `audio-transcriptions`, `chat-completions`） |
 | `--asr-effort` | 一阶段思考档位 |
-| `--refiner`, `--refiner-provider` | 二阶段渠道（`auto`, `codex`, `deepseek`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`） |
+| `--refiner`, `--refiner-provider` | 二阶段渠道（`auto`, `codex`, `deepseek`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`；支持别名 `doubao`/`volc`/`ark` → `volcengine`、`bailian` → `dashscope`） |
 | `--refiner-model` | 二阶段上游模型 ID |
 | `--refiner-api` | 二阶段协议（`auto`, `chat-completions`, `responses`） |
 | `--refiner-effort`, `--effort` | 二阶段思考档位 |

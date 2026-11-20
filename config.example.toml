@@ -55,6 +55,7 @@ beep = false
 [asr]
 # Stage 1 speech-to-text provider:
 # "auto" | "dashscope" | "doubao" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible"
+# Cross-stage aliases accepted: "volcengine"/"volc" -> "doubao", "bailian" -> "dashscope"
 # When "auto", selects the first configured credential in priority order:
 #   dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow
 provider = "auto"
@@ -92,9 +93,10 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 [refiner]
 # Stage 2 context-aware refinement provider:
 # "auto" | "codex" | "deepseek" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
-# When "auto" (default), prefers local `codex` CLI login if present, otherwise selects the first configured credential in order:
+# Cross-stage aliases accepted: "doubao"/"volc"/"ark" -> "volcengine", "bailian" -> "dashscope"
+# When "auto" (default), prefers confirmed local `codex` ChatGPT subscription login (zero extra API billing), otherwise selects the first configured credential in order:
 #   deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow
-# (falls back cleanly to "off" if no Stage 2 credentials are set).
+# (then falls back to Codex keyring / API-key login if present, or cleanly to "off" if no Stage 2 credentials are set).
 # Built-in default models (used when model = "" or when provider is overridden via CLI without a new model):
 # - codex             -> "gpt-6-luna" (stateless Keep-Alive HTTP /responses reusing local codex login, with automatic public mini-model fallback when internal models are unavailable; never enables Fast mode)
 # - deepseek          -> "deepseek-flash" (official https://api.deepseek.com/v1 with thinking disabled by default)

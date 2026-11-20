@@ -923,11 +923,14 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         self.assertEqual(gem_fb.used_fallback, "asr_draft")
         self.assertNotIn(gem_fake, gem_fb.warning)
 
-        # Legacy / invalid refiner provider raises ConfigError
+        # Legacy / invalid refiner provider raises ConfigError; cross-stage alias 'doubao' normalizes to 'volcengine'
         with self.assertRaises(ConfigError):
             create_refiner(Config(refiner=RefinerConfig(provider="codex-luna")))
         with self.assertRaises(ConfigError):
-            create_refiner(Config(refiner=RefinerConfig(provider="doubao")))
+            create_refiner(Config(refiner=RefinerConfig(provider="unknown-refiner")))
+        ref_db_alias = create_refiner(Config(refiner=RefinerConfig(provider="doubao")), env=env)
+        self.assertIsInstance(ref_db_alias, OpenAICompatibleRefiner)
+        self.assertEqual(ref_db_alias.provider_name, "volcengine")
 
     def test_http_refiners_redact_secret_spanning_180_char_truncation_boundary(self) -> None:
         volc_secret = "volcprefix-" + ("0" * 16)
@@ -3930,7 +3933,10 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             ):
                 rc_st_to = cli_mod.main(["status"])
             self.assertEqual(rc_st_to, 1)
-            self.assertEqual(json.loads(st_to_out.getvalue()), {"ok": False, "state": "stopped"})
+            st_to_obj = json.loads(st_to_out.getvalue())
+            self.assertFalse(st_to_obj["ok"])
+            self.assertEqual(st_to_obj["state"], "unresponsive")
+            self.assertIn("timed out", st_to_obj["error"])
 
 
 class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
