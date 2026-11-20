@@ -1423,11 +1423,25 @@ class TestConcurrencyRaces(unittest.TestCase):
                     self.assertTrue(ping_ok.get("ok"))
 
                     # Explicit cooldown fast-skip check under _trigger_lock (scheduler-independent):
-                    # Ensure daemon starts from idle, enter backoff window, and verify handle_trigger("ptt_start")
-                    # invokes hud("recording") -> _ensure_shim() while holding _trigger_lock and fast-returns False
+                    # Ensure daemon starts from idle (drain hammer utterances first), enter backoff window,
+                    # and verify handle_trigger("ptt_start") invokes hud("recording") -> _ensure_shim()
+                    # while holding _trigger_lock and fast-returns False
                     assert isinstance(plat, JsonlShimMixin)
                     if daemon._recording_active:
-                        daemon.handle_trigger("ptt_stop", ForegroundWindow(hwnd=301, process="WindowsTerminal.exe", title="codex"))
+                        daemon.handle_trigger("ptt_cancel", ForegroundWindow(hwnd=301, process="WindowsTerminal.exe", title="codex"))
+                    idle_deadline = time.monotonic() + 5.0
+                    while time.monotonic() < idle_deadline:
+                        with daemon._lock:
+                            if (
+                                not daemon._recording_active
+                                and daemon._inflight_or_queued_count_locked() == 0
+                                and daemon._raw_pending_count_locked() == 0
+                            ):
+                                break
+                        time.sleep(0.01)
+                    with daemon._lock:
+                        self.assertEqual(daemon._inflight_or_queued_count_locked(), 0)
+                        self.assertEqual(daemon._raw_pending_count_locked(), 0)
                     with plat._shim_lock:
                         live_p, plat._shim = plat._shim, None
                         plat._spawned_shim = None
