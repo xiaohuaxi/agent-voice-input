@@ -24,6 +24,10 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+
+def _is_ci() -> bool:
+    return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+
 from agent_voice_input import session_title as VST  # noqa: E402
 from agent_voice_input._tmux import (  # noqa: E402
     parse_tmux_clients_output,
@@ -1248,9 +1252,12 @@ class TmuxMockUnitTests(unittest.TestCase):
             self.assertEqual((m_p0.cli, m_p0.session_id, m_p0.matched_by), ("claude", sid_0, "tmux_registry"))
 
 
-@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
 class TmuxRealIsolatedIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
+        if shutil.which("tmux") is None:
+            if _is_ci():
+                self.fail("tmux must be installed in CI (silent skip forbidden)")
+            self.skipTest("tmux not installed")
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name)

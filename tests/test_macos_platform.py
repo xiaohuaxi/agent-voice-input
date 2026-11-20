@@ -19,6 +19,10 @@ _SRC_ROOT = _REPO_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+
+def _is_ci() -> bool:
+    return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+
 from agent_voice_input import cli as cli_mod  # noqa: E402
 from agent_voice_input.asr_providers import AsrContext, AsrResult, BaseAsrProvider  # noqa: E402
 from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
@@ -3366,12 +3370,15 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertIn("[macos-fg]  app='Terminal' tty=/dev/ttys004 cwd=- title='zsh — 80×24'", doc_out.getvalue())
 
     @unittest.skipUnless(
-        sys.platform == "darwin" and bool(resolve_tmux_bin()),
-        "macOS + tmux required for unattended real Darwin PTY + tmux integration test",
+        sys.platform == "darwin",
+        "macOS required for unattended real Darwin PTY + tmux integration test",
     )
     def test_real_darwin_pty_and_tmux_unattended_daemon_session_and_paste_e2e(self) -> None:
-        tmux_bin = resolve_tmux_bin()
-        assert tmux_bin
+        tmux_bin = shutil.which("tmux") or ("" if _is_ci() else resolve_tmux_bin())
+        if not tmux_bin:
+            if _is_ci():
+                self.fail("tmux must be installed on macOS CI (silent skip forbidden)")
+            self.skipTest("tmux not installed")
         short_dir = Path(tempfile.mkdtemp(prefix="avi_m_", dir="/tmp"))
         sock_path = short_dir / "t.sock"
         gui_proc: subprocess.Popen[str] | None = None

@@ -13,7 +13,7 @@ jobs:
   test-and-build:
     name: Run unit tests and build distributions
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,6 +22,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install ffmpeg and tmux for integration tests
+        run: |
+          pkgs=""
+          command -v ffmpeg >/dev/null 2>&1 || pkgs="$pkgs ffmpeg"
+          command -v tmux >/dev/null 2>&1 || pkgs="$pkgs tmux"
+          if [ -n "$pkgs" ]; then
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 install -y --no-install-recommends $pkgs
+          fi
 
       - name: Run unit tests
         run: PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests -v

@@ -16,6 +16,10 @@ _SRC_ROOT = _REPO_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+
+def _is_ci() -> bool:
+    return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+
 from agent_voice_input.asr_providers import (  # noqa: E402
     AsrContext,
     AsrError,
@@ -6648,10 +6652,14 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
         speech_band_wav = pack_pcm16_mono_wav(
             [int(5000 * math.sin(2.0 * math.pi * 440.0 * i / 16000.0)) for i in range(9600)]
         )
-        has_ffmpeg = bool(os.path.isfile("/usr/bin/ffmpeg") or shutil.which("ffmpeg"))
+        ffmpeg_exe = shutil.which("ffmpeg")
+        if ffmpeg_exe is None and not _is_ci() and os.path.isfile("/usr/bin/ffmpeg"):
+            ffmpeg_exe = "/usr/bin/ffmpeg"
+        has_ffmpeg = ffmpeg_exe is not None
+        if not has_ffmpeg and _is_ci():
+            self.fail("ffmpeg must be installed in CI for recording archive test (silent downgrade forbidden)")
         has_mp3_encoder = False
         if has_ffmpeg:
-            ffmpeg_exe = "/usr/bin/ffmpeg" if os.path.isfile("/usr/bin/ffmpeg") else shutil.which("ffmpeg")
             assert ffmpeg_exe is not None
             enc_proc = subprocess.run(
                 [ffmpeg_exe, "-nostdin", "-hide_banner", "-encoders"],

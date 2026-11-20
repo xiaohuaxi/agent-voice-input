@@ -33,20 +33,25 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install tmux for integration tests (macOS)
+      - name: Install tmux and ffmpeg for integration tests (macOS)
         if: runner.os == 'macOS'
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
-        run: command -v tmux >/dev/null 2>&1 || brew install tmux
-
-      - name: Install ffmpeg for audio_proc tests and branch coverage gate (Linux 3.12)
-        if: runner.os == 'Linux' && matrix.python-version == '3.12'
         run: |
-          command -v ffmpeg >/dev/null 2>&1 || (
+          command -v tmux >/dev/null 2>&1 || brew install tmux
+          command -v ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+
+      - name: Install ffmpeg and tmux for integration tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pkgs=""
+          command -v ffmpeg >/dev/null 2>&1 || pkgs="$pkgs ffmpeg"
+          command -v tmux >/dev/null 2>&1 || pkgs="$pkgs tmux"
+          if [ -n "$pkgs" ]; then
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update
-            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 install -y --no-install-recommends ffmpeg
-          )
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 install -y --no-install-recommends $pkgs
+          fi
 
       - name: Run offline unit tests with tiered statement & pure-branch coverage gate
         if: runner.os == 'Linux' && matrix.python-version == '3.12'

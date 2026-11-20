@@ -21,6 +21,10 @@ _SRC_ROOT = _REPO_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
+
+def _is_ci() -> bool:
+    return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+
 from agent_voice_input.audio_proc import (  # noqa: E402
     DEFAULT_MAX_CHUNK_SEC,
     PEAK_LIMIT_INT16,
@@ -1212,6 +1216,8 @@ class AudioProcTests(unittest.TestCase):
 
     def test_ffmpeg_converts_48k_stereo_wav_to_16k_mono(self) -> None:
         if shutil.which("ffmpeg") is None:
+            if _is_ci():
+                self.fail("ffmpeg must be installed in CI (silent skip forbidden)")
             self.skipTest("ffmpeg not installed")
         sr_in = 48000
         n_frames = int(0.5 * sr_in)
@@ -1266,6 +1272,8 @@ class AudioProcTests(unittest.TestCase):
 
         # 2. Real ffmpeg streaming s16le pipe with low-latency flags + tail_drain_sec
         if shutil.which("ffmpeg") is None:
+            if _is_ci():
+                self.fail("ffmpeg must be installed in CI (silent skip forbidden)")
             self.skipTest("ffmpeg not installed")
         rec_live = FfmpegWavRecorder()
         with tempfile.TemporaryDirectory() as td:
@@ -1490,7 +1498,10 @@ class AudioProcTests(unittest.TestCase):
         ):
             self.assertIsNone(encode_wav_to_mp3_bytes(valid_1s_wav, ffmpeg_bin="/usr/bin/ffmpeg", timeout_sec=0.01))
         ff_bin = shutil.which("ffmpeg")
-        if ff_bin is not None:
+        if ff_bin is None:
+            if _is_ci():
+                self.fail("ffmpeg must be installed in CI for MP3 encoding test (silent skip forbidden)")
+        else:
             enc_probe = subprocess.run(
                 [ff_bin, "-hide_banner", "-encoders"],
                 stdin=subprocess.DEVNULL,
