@@ -22,25 +22,25 @@
 
 ## 布局与指针
 
-- `src/agent_voice_input/`：核心包实现及随包分发的 `win_shim.ps1`（运行时通过 `Path(__file__).resolve().with_name("win_shim.ps1")` 定位，改动打包配置时保持 `[tool.setuptools.package-data]` 与 `MANIFEST.in` 收录该文件）。
-- `bin/agent-voice-input`：源码直跑入口（便于本地软链开发）。当前运行时仅使用 Python 3.10+ 标准库与宿主机 `ffmpeg`（WSL2 下调用系统自带 `powershell.exe`）；非必要不引入第三方运行时包，确需新增时交维护者拍板并同步评估该直跑入口。
-- `config.example.toml`、`config.example.env`：公开配置与凭据模板。常规参数收归 `config.toml`（及必要的 CLI 参数），不逐一镜像 `AGENT_VOICE_INPUT_*` 环境变量覆盖；环境变量只留给厂商凭据（`CREDENTIAL_ENV_ORDER` 后缀风格优先、兼容前缀别名）、引导路径（`AGENT_VOICE_INPUT_CONFIG`、`AGENT_VOICE_INPUT_RUNTIME_DIR`）及底层进程协作与诊断开关。改动配置字段或凭据解析前先看 `src/agent_voice_input/config.py`，并同步更新模板与 `README.md`、`README.zh-CN.md`。
-- `integrations/`：各 CLI Agent 的终端标题及会话注册接入示例；改动钩子或会话定位契约时，同步核对 `src/agent_voice_input/session_title.py` 与 `integrations/README.md`、`integrations/README.zh-CN.md`。
+- `src/agent_voice_input/`：核心包实现及随包分发的原生桥接源码 `win_shim.ps1`、`mac_shim.swift`（运行时均通过 `Path(__file__).resolve().with_name(...)` 定位；改动桥接资源文件或打包配置时保持 `pyproject.toml` 的 `[tool.setuptools.package-data]` 与 `MANIFEST.in` 同步收录，增删或重命名包内 `.py` 模块时同步更新 `scripts/check_coverage.py` 的分档表）。
+- `bin/agent-voice-input`：源码直跑入口（便于本地软链开发）。Python 3.10+ 运行时仅使用标准库，外部能力调用宿主机系统工具（音频处理用 `ffmpeg`，WSL2 桥接调用系统自带 `powershell.exe`，macOS 桥接经系统 `swiftc` 按需编译 `mac_shim.swift` 并配合 `osascript`）；非必要不引入第三方 Python 运行时包，确需新增时交维护者拍板并同步评估该直跑入口。
+- `config.example.toml`、`config.example.env`：公开配置与凭据模板。常规参数收归 `config.toml`（及必要的 CLI 参数），不逐一镜像 `AGENT_VOICE_INPUT_*` 环境变量覆盖；环境变量只留给厂商凭据（`CREDENTIAL_ENV_ORDER` 后缀风格优先、兼容前缀别名）、引导路径（`AGENT_VOICE_INPUT_CONFIG`、`AGENT_VOICE_INPUT_RUNTIME_DIR`）及底层进程协作与诊断开关。改动配置字段或凭据解析前先看 `src/agent_voice_input/config.py`，影响对外配置或凭据用法时同步更新模板与 `README.md`、`README.zh-CN.md`。
+- `integrations/`：各 CLI Agent 的终端标题、会话注册及远端 SSH 标题标记（`integrations/remote/`）接入示例；改动钩子或会话定位契约时，同步核对 `src/agent_voice_input/session_title.py`、`src/agent_voice_input/session_ctx.py` 与 `integrations/README.md`、`integrations/README.zh-CN.md`。
 - `scripts/check_coverage.py`：分层纯语句与纯分支覆盖率门禁脚本（标准库支持行覆盖快检，分支门禁依赖 `coverage`）。
 - `tests/`：离线单元测试套件。
-- `CHANGELOG.md`、`ROADMAP.md`：根目录版本变更记录与能力里程碑路线图（版本号与实际对外发布 1:1 绑定，未发布变更归入 `[Unreleased]`）；专题技术文档以 `kebab-case`（全小写连字符）放 `docs/` 按需查阅（如上下文路由与防串台全流程见 `docs/context-routing.md`），不在本文件堆叠实现细节。
+- `CHANGELOG.md`、`ROADMAP.md`：根目录版本变更记录与能力里程碑路线图（版本号与实际对外发布 1:1 绑定，未发布变更归入 `[Unreleased]`）；专题技术文档以 `kebab-case`（全小写连字符）放 `docs/` 按需查阅（触及会话匹配、终端或桌面焦点及 SSH 远端防串台路由时，开工前先读 `docs/context-routing.md`），不在本文件堆叠实现细节。
 
 ## 运行边界与验证
 
-- 单用户信任边界与环境兼容：本工具运行于单用户桌面可信域（同 UID 本地进程、配置与运行目录视为受信任输入），外部不可信边界聚焦终端可控窗口标题（如远端输出触发的 OSC 2 序列）及网络/远端探针返回报文。新增校验、目录权限检查或外部命令调用前，反向核对常见合法用户环境，避免误伤非交互精简 `PATH` 下的版本管理器与包管理器路径（`nvm`、`fnm`、`Homebrew`）、macOS 系统目录软链、父目录继承的 `setgid`/`sticky` 权限位、企业或团队订阅账号及上游可空字段；上游网络或本地辅助进程瞬态异常优先采用指数退避与冷却恢复，不将单次超时锁死为永久不可用。
-- 测试隔离：`tests/` 保持离线可重入，不访问外网，不读写宿主机真实配置与运行期目录（`~/.config`、`$XDG_RUNTIME_DIR` 等）。
-- 脱敏与状态隐私：异常摘要、日志与 `status` 快照输出经 `redact_secrets` 脱敏，不在运行状态文件中落盘用户语音原文；录音仅在识别/投递失败或在识别/精修阶段由用户主动取消时以 `0600` 权限原子暂存于运行目录 `failed/`（保留 24 小时内最近 10 条 WAV 供 `retry` 恢复），或用户显式开启 `audio.save_recordings = true` 时以 `0600` 权限环形归档于本地缓存目录 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`（绝不进状态文件或版本库）。
-- WSL2 宿主机交互：改动 WSL2 桥接前先读 `src/agent_voice_input/platform_wsl.py`；宿主机可能关闭 `appendWindowsPath`（`powershell.exe` 不在 `PATH`），统一复用既有路径解析入口，单次非交互调用关闭标准输入防管道阻塞挂起。
-- macOS 宿主机交互：改动 macOS 桥接前先读 `src/agent_voice_input/platform_macos.py` 与 `src/agent_voice_input/mac_shim.swift`；macOS 麦克风 TCC 权限归属责任进程，经 SSH 仅作单测、编译与自检，实机录音用的守护进程在本机已获麦克风授权的图形终端（如 Ghostty）内启动或重启（经 `sshd` 拉起会被系统静默喂全 0 静音帧）。
-- 红线：`src/agent_voice_input/refiner.py` 的精修请求及凭据刷新拉起的 `codex` 子进程仅作无工具纯文本精修与认证状态读取，严禁开启 Fast 模式（不得传 `service_tier="fast"` 或任何 Fast 配置）。
-- 独立冷审与防叠甲裁决：关键或高风险改动交别家最强档独立窗口冷审时，在派单中写明上述单用户桌面信任边界；修复后复核优先续跑原审查会话比对增量 diff。对审查意见核实源码调用链证据与真实用户影响后自主取舍，不盲收脱离单用户运行前提的合成微竞态，也不为迎合审查倒逼生产代码增加无实质收益的测试兼容壳或重复防御。
-- 单元测试：`PYTHONPATH=src python3 -m unittest discover -s tests -v`
-- 场景测试与分层覆盖率门禁：运行 `python3 scripts/check_coverage.py`（已装 `coverage` 的隔离虚拟环境或 CI 传 `--require-branch` 校验独立计算的纯语句与纯分支双指标，裸环境支持 `--stdlib-trace` 行覆盖快检）。第一档纯确定性逻辑核（`__init__`、`hud`、`app_scope`、`prompts`、`llm_common`、`config`）单模块及整体保持纯语句 `>= 95%`、纯分支 `>= 90%`，第二档并发与本地 I/O 层及全包保持纯语句 `>= 85%`、纯分支 `>= 74%` 防退化底线。测试以真实业务输入、临时目录与本地环回服务覆盖为主，不为刷覆盖率对底层系统 I/O 构造脆弱假 mock；确需排除统计的跨解释器版本导入或物理不可达防御分支，在同一行注明 `# pragma: no cover - <原因>`。
-- 真实系统自检、精修基准与线上诊断：后续新增功能或性能优化触及 ASR、精修器、会话上下文、守护进程或终端投递时，除离线单测外，须通过 `.agents/skills/voice-eval/`（`e2e_system.py` / `bench_refiner.py`）在本机隔离运行目录完成真实系统自检；排查实机口述变慢与缓存未命中时用 `diagnose_live.py` 只读核验（严禁把真实会话、录音或运行流水入库）。
+- 单用户信任边界与环境兼容：本工具运行于单用户桌面环境，设防重心放在跨信任边界的外部不可信输入（如远端输出可控的终端 OSC 2 窗口标题、网络响应及 SSH 远端探针返回报文），以及常规配置合法性校验与针对其他 UID 的本地文件隐私保护，不对同 UID 本地环境堆砌防蓄意篡改的重型对抗机制。例如正常校验 `config.toml` 语法与值域、保持本工具管理的私有运行/录音目录 `0700` 与凭据/状态/音频文件 `0600` 权限及防符号链接与原子写保护；但不对同 UID 本地进程做防篡改锁死，新增校验、目录权限检查或外部命令调用前反向核对常见合法用户环境，避免误伤非交互精简 `PATH` 下的版本管理器与包管理器路径（`nvm`、`fnm`、`Homebrew`）、macOS 系统目录软链、父目录继承的 `setgid`/`sticky` 权限位、企业或团队订阅账号及上游可空字段。上游网络或本地辅助进程瞬态异常优先采用指数退避与冷却恢复，不将单次超时锁死为永久不可用。
+- 测试隔离：`tests/` 保持离线可重入，不访问外网，不读写宿主机真实配置、缓存与运行期目录（`~/.config`、`~/.cache`、`$XDG_RUNTIME_DIR` 等）。
+- 脱敏与状态隐私：异常摘要、日志、`status` 快照与 `telemetry.jsonl` 中的自由文本经 `redact_secrets` 脱敏，不在运行状态或遥测文件中落盘用户语音原文。用户音频仅在两类场景下以 `0600` 权限落盘：一是实时口述在结束录音进入处理管线后，遇识别、精修、投递失败或管线内取消且符合恢复条件时，将通过音频门控的有效录音原子暂存于运行目录 `failed/`（录音期间主动取消直接丢弃不落盘；`failed/` 保留 24 小时内最近 10 条 WAV 供 `retry` 恢复）；二是用户显式开启 `audio.save_recordings = true` 时环形归档于本地缓存目录 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`。
+- WSL2 宿主机交互：改动 WSL2 桥接前先读 `src/agent_voice_input/platform_wsl.py`（涉及双端共享录音器或 JSONL 桥接基类时并看 `platform_common.py`，改 Windows 侧脚本看 `win_shim.ps1`）；宿主机可能关闭 `appendWindowsPath`（`powershell.exe` 不在 `PATH`），统一复用既有路径解析入口；无需输入的一次性非交互调用关闭标准输入防管道阻塞挂起（常驻桥接保留 JSONL 命令管道），`win_shim.ps1` 保持纯 7-bit ASCII 编码以兼容 Windows PowerShell 5.1 无 BOM 读取。
+- macOS 宿主机交互：改动 macOS 桥接前先读 `src/agent_voice_input/platform_macos.py` 与 `src/agent_voice_input/mac_shim.swift`（涉及共享桥接基类时并看 `platform_common.py`）；macOS 麦克风 TCC 权限归属责任进程，SSH 会话可正常执行单测、编译与无需现场收音的自检，涉及真实麦克风收音的守护进程则在本机已获授权的图形终端（如 Ghostty）内启动或重启（经 `sshd` 拉起会被系统静默喂全 0 静音帧）。
+- 红线：`src/agent_voice_input/refiner.py` 的精修请求限于无工具纯文本处理，凭据读取与刷新拉起的 `codex` 子进程仅作认证状态读取与刷新，严禁开启 Fast 模式（不得传 `service_tier="fast"` 或通过任何参数、配置、环境变量开启 Fast）。
+- 独立冷审与防叠甲裁决：关键或高风险改动交别家最强档独立窗口冷审时，在派单中写明上述单用户桌面信任边界；修复后复核优先续跑原审查会话比对增量 diff。冷审旨在借独立视角查漏补缺，对审查意见结合源码调用链证据与预期用户影响自主权衡：切中真实缺陷的扎实修好，脱离运行前提的防御叠甲不盲收。例如同一用户连续口述或常规并发即可触发的卡死、丢音、乱序、跨窗口串台、凭据泄漏或状态文件半写损坏，有可达路径就应修复；而依赖同 UID 恶意进程对抗、脱离单用户桌面实际前提的极端合成边角，或迫使生产代码为迁就测试探针增加无实质收益兼容壳的建议，核实后说明依据舍去。
+- 单元测试：`PYTHONPATH=src python3 -W error::ResourceWarning -m unittest discover -s tests -v`
+- 场景测试、Mock 取舍与分层覆盖率门禁：运行 `python3 scripts/check_coverage.py`（已装 `coverage` 的隔离虚拟环境或 CI 传 `--require-branch` 校验独立计算的纯语句与纯分支双指标，裸环境支持 `--stdlib-trace` 行覆盖快检）。第一档纯确定性逻辑核（`__init__`、`hud`、`app_scope`、`prompts`、`llm_common`、`config`）单模块及该档合计保持纯语句 `>= 95%`、纯分支 `>= 90%`，第二档并发与本地 I/O 层合计及全包合计（含第三档平台桥接与云端渠道）保持纯语句 `>= 85%`、纯分支 `>= 74%` 防退化底线。测试优先用真实业务输入、临时目录与本地环回服务覆盖主链路；不要为了凑覆盖率数字而写凑数的 mock，但正常、有价值的 mock 仍然需要写。例如跨操作系统桥接或外部子进程隔离，以及模拟写盘 `ENOSPC`、子进程超时、权限拒绝或上游异常响应以验证状态转移、降级恢复、失败录音暂存或原子写不损坏原文件等有价值的故障注入，可正常使用 mock；而对不影响业务状态与后续行为的纯收尾吞错（如临时文件清理阶段的 `except OSError: pass`），不必纯粹为了刷行号去打补丁。确需排除统计的跨解释器版本导入或物理不可达防御分支，在同一行注明 `# pragma: no cover - <原因>`。
+- 真实系统自检、精修基准与线上诊断：离线单测无法替代真实模型对提示词与分块的遵循度、线上前缀缓存命中率及宿主机音频与 `tmux` 实机配合。当改动触及这些需真模型或真管线实证的 ASR、精修提示词/分块/缓存、渠道实现、守护进程排队取消或终端投递行为（而非离线单测已确定性覆盖的局部逻辑小修）时，按影响面通过 `.agents/skills/voice-eval/` 在隔离运行目录选跑对应验证（如提示词、分块或缓存改动跑 `bench_refiner.py` 或 `eval_recordings.py`，守护进程管线或落字改动跑 `e2e_system.py`）；若当前环境缺少真实云端凭据、网络或所需宿主工具，先跑通可执行的离线门禁并在交付说明中注明未验环节及原因。排查实机口述变慢、降级与缓存未命中时用 `diagnose_live.py` 只读核验。红线：严禁把真实会话、录音样本、运行流水或未脱敏凭据入库。
 - 提交前密钥扫描：`gitleaks protect --staged -v` 与 `gitleaks detect --source . -v`
-- 推送与远端工作流闭环：仓库启用了 GitHub Actions（`.github/workflows/ci.yml` 覆盖 Python 3.10+ 多版本与双平台矩阵，推 `v*` tag 另触发 `.github/workflows/publish.yml`）；执行 `git push`（含推分支或推 tag）后不直接结束任务，继续通过 `gh run list` / `gh run watch` 跟进当次触发的远端工作流直至全绿，遇失败当场定位修复。
+- 推送与远端工作流闭环：仓库启用了 GitHub Actions（`.github/workflows/ci.yml` 在推送 `main` 或目标为 `main` 的 PR 时运行 Ubuntu 多版本与 macOS 单测、覆盖率门禁、Windows `win_shim.ps1` 自检及打包解包校验；推 `v*` tag 另触发 `.github/workflows/publish.yml`）。执行触发远端工作流的 `git push` 后不直接结束任务，继续通过 `gh run list` / `gh run watch` 跟进当次运行直至全绿，遇失败当场定位修复（未命中触发条件的普通分支推送无需空等）。
