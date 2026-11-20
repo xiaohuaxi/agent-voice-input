@@ -2203,6 +2203,24 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertEqual(sc_err, "")
             self.assertEqual(sc_parsed["audio_status"]["mic_auth"], "not_determined")
 
+            # Strict payload validation: empty output, non-JSON, non-dict, and ok != True MUST fail
+            for idx, body in enumerate(
+                [
+                    "",
+                    "print('not valid json')",
+                    "print('[1, 2, 3]')",
+                    "print('{\"ok\": false, \"mode\": \"self-check\"}')",
+                    "print('{\"mode\": \"self-check\"}')",
+                ]
+            ):
+                bad_sc = tmp / f"bad_selfcheck_{idx}"
+                bad_sc.write_text(f"#!{sys.executable}\n{body}\n", encoding="utf-8")
+                bad_sc.chmod(0o755)
+                b_ok, b_parsed, b_err = run_mac_shim_self_check(bad_sc, {"HOME": str(tmp)})
+                self.assertFalse(b_ok, f"case {idx} should fail")
+                self.assertEqual(b_parsed, {})
+                self.assertTrue(bool(b_err))
+
             parser = cli_mod._build_parser()
             rt_cli = tmp / "rt_cli"
             rt_cli.mkdir()

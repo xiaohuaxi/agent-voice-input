@@ -645,6 +645,103 @@ private func containsCjkScalar(_ s: String) -> Bool {
     s.unicodeScalars.contains(where: { $0.value >= 0x2E80 && $0.value <= 0x9FFF })
 }
 
+private func addStatusIconQuadCurve(_ path: NSBezierPath, from p0: NSPoint, control ctrl: NSPoint, to p1: NSPoint) {
+    let c1 = NSPoint(x: p0.x + (ctrl.x - p0.x) * (2.0 / 3.0), y: p0.y + (ctrl.y - p0.y) * (2.0 / 3.0))
+    let c2 = NSPoint(x: p1.x + (ctrl.x - p1.x) * (2.0 / 3.0), y: p1.y + (ctrl.y - p1.y) * (2.0 / 3.0))
+    path.curve(to: p1, controlPoint1: c1, controlPoint2: c2)
+}
+
+func drawStatusIcon(
+    kind iconKind: String,
+    color iconColor: NSColor,
+    bounds: NSRect,
+    box configuredSize: CGFloat,
+    isFlipped: Bool
+) {
+    let box = min(configuredSize, min(bounds.width, bounds.height))
+    if box <= 2.0 { return }
+    let ox = bounds.minX + (bounds.width - box) * 0.5
+    let oy = bounds.minY + (bounds.height - box) * 0.5
+    let dySign: CGFloat = isFlipped ? 1.0 : -1.0
+    func py(_ frac: CGFloat) -> CGFloat {
+        oy + (isFlipped ? (box * frac) : (box * (1.0 - frac)))
+    }
+
+    switch iconKind {
+    case "recognizing":
+        let ins: CGFloat = 1.1
+        let d = max(2.0, box - ins * 2.0)
+        let ovalRect = NSRect(x: ox + ins, y: oy + ins, width: d, height: d)
+        let ring = NSBezierPath(ovalIn: ovalRect)
+        ring.lineWidth = 1.8
+        iconColor.setStroke()
+        ring.stroke()
+        NSGraphicsContext.saveGraphicsState()
+        NSRect(x: ox, y: oy, width: box * 0.5, height: box).clip()
+        iconColor.setFill()
+        NSBezierPath(ovalIn: ovalRect).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    case "refining":
+        let cx = ox + box * 0.5
+        let cy = oy + box * 0.5
+        let top = NSPoint(x: cx, y: py(0.04))
+        let right = NSPoint(x: ox + box * 0.96, y: cy)
+        let bottom = NSPoint(x: cx, y: py(0.96))
+        let left = NSPoint(x: ox + box * 0.04, y: cy)
+        let pull = box * 0.085
+        let sp = NSBezierPath()
+        sp.move(to: top)
+        addStatusIconQuadCurve(sp, from: top, control: NSPoint(x: cx + pull, y: cy - dySign * pull), to: right)
+        addStatusIconQuadCurve(sp, from: right, control: NSPoint(x: cx + pull, y: cy + dySign * pull), to: bottom)
+        addStatusIconQuadCurve(sp, from: bottom, control: NSPoint(x: cx - pull, y: cy + dySign * pull), to: left)
+        addStatusIconQuadCurve(sp, from: left, control: NSPoint(x: cx - pull, y: cy - dySign * pull), to: top)
+        sp.close()
+        iconColor.setFill()
+        sp.fill()
+    case "done":
+        let p = NSBezierPath()
+        p.lineWidth = 2.0
+        p.lineCapStyle = .round
+        p.lineJoinStyle = .round
+        p.move(to: NSPoint(x: ox + box * 0.14, y: py(0.54)))
+        p.line(to: NSPoint(x: ox + box * 0.40, y: py(0.80)))
+        p.line(to: NSPoint(x: ox + box * 0.88, y: py(0.24)))
+        iconColor.setStroke()
+        p.stroke()
+    case "empty", "empty_ring":
+        let ins: CGFloat = 1.1
+        let d = max(2.0, box - ins * 2.0)
+        let ring = NSBezierPath(ovalIn: NSRect(x: ox + ins, y: oy + ins, width: d, height: d))
+        ring.lineWidth = 1.8
+        iconColor.setStroke()
+        ring.stroke()
+    case "warning":
+        let cx = ox + box * 0.5
+        let stem = NSBezierPath()
+        stem.lineWidth = 2.0
+        stem.lineCapStyle = .round
+        stem.move(to: NSPoint(x: cx, y: py(0.15)))
+        stem.line(to: NSPoint(x: cx, y: py(0.56)))
+        iconColor.setStroke()
+        stem.stroke()
+        let dotD = max(2.2, box * 0.17)
+        let dotRect = NSRect(x: cx - dotD * 0.5, y: py(0.82) - dotD * 0.5, width: dotD, height: dotD)
+        iconColor.setFill()
+        NSBezierPath(ovalIn: dotRect).fill()
+    default:
+        let ins = max(1.8, box * 0.16)
+        let p = NSBezierPath()
+        p.lineWidth = 2.0
+        p.lineCapStyle = .round
+        p.move(to: NSPoint(x: ox + ins, y: oy + ins))
+        p.line(to: NSPoint(x: ox + box - ins, y: oy + box - ins))
+        p.move(to: NSPoint(x: ox + box - ins, y: oy + ins))
+        p.line(to: NSPoint(x: ox + ins, y: oy + box - ins))
+        iconColor.setStroke()
+        p.stroke()
+    }
+}
+
 final class StatusIconView: NSView {
     static let mainBoxSize: CGFloat = 13.0
     static let toastBoxSize: CGFloat = 12.0
@@ -662,92 +759,9 @@ final class StatusIconView: NSView {
         didSet { needsDisplay = true }
     }
 
-    private func addQuadCurve(_ path: NSBezierPath, from p0: NSPoint, control ctrl: NSPoint, to p1: NSPoint) {
-        let c1 = NSPoint(x: p0.x + (ctrl.x - p0.x) * (2.0 / 3.0), y: p0.y + (ctrl.y - p0.y) * (2.0 / 3.0))
-        let c2 = NSPoint(x: p1.x + (ctrl.x - p1.x) * (2.0 / 3.0), y: p1.y + (ctrl.y - p1.y) * (2.0 / 3.0))
-        path.curve(to: p1, controlPoint1: c1, controlPoint2: c2)
-    }
-
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        let box = min(configuredSize, min(bounds.width, bounds.height))
-        if box <= 2.0 { return }
-        let ox = (bounds.width - box) * 0.5
-        let oy = (bounds.height - box) * 0.5
-
-        switch iconKind {
-        case "recognizing":
-            let ins: CGFloat = 1.1
-            let d = max(2.0, box - ins * 2.0)
-            let ovalRect = NSRect(x: ox + ins, y: oy + ins, width: d, height: d)
-            let ring = NSBezierPath(ovalIn: ovalRect)
-            ring.lineWidth = 1.8
-            iconColor.setStroke()
-            ring.stroke()
-            NSGraphicsContext.saveGraphicsState()
-            NSRect(x: ox, y: oy, width: box * 0.5, height: box).clip()
-            iconColor.setFill()
-            NSBezierPath(ovalIn: ovalRect).fill()
-            NSGraphicsContext.restoreGraphicsState()
-        case "refining":
-            let cx = ox + box * 0.5
-            let cy = oy + box * 0.5
-            let top = NSPoint(x: cx, y: oy + box * 0.04)
-            let right = NSPoint(x: ox + box * 0.96, y: cy)
-            let bottom = NSPoint(x: cx, y: oy + box * 0.96)
-            let left = NSPoint(x: ox + box * 0.04, y: cy)
-            let pull = box * 0.085
-            let sp = NSBezierPath()
-            sp.move(to: top)
-            addQuadCurve(sp, from: top, control: NSPoint(x: cx + pull, y: cy - pull), to: right)
-            addQuadCurve(sp, from: right, control: NSPoint(x: cx + pull, y: cy + pull), to: bottom)
-            addQuadCurve(sp, from: bottom, control: NSPoint(x: cx - pull, y: cy + pull), to: left)
-            addQuadCurve(sp, from: left, control: NSPoint(x: cx - pull, y: cy - pull), to: top)
-            sp.close()
-            iconColor.setFill()
-            sp.fill()
-        case "done":
-            let p = NSBezierPath()
-            p.lineWidth = 2.0
-            p.lineCapStyle = .round
-            p.lineJoinStyle = .round
-            p.move(to: NSPoint(x: ox + box * 0.14, y: oy + box * 0.54))
-            p.line(to: NSPoint(x: ox + box * 0.40, y: oy + box * 0.80))
-            p.line(to: NSPoint(x: ox + box * 0.88, y: oy + box * 0.24))
-            iconColor.setStroke()
-            p.stroke()
-        case "empty", "empty_ring":
-            let ins: CGFloat = 1.1
-            let d = max(2.0, box - ins * 2.0)
-            let ring = NSBezierPath(ovalIn: NSRect(x: ox + ins, y: oy + ins, width: d, height: d))
-            ring.lineWidth = 1.8
-            iconColor.setStroke()
-            ring.stroke()
-        case "warning":
-            let cx = ox + box * 0.5
-            let stem = NSBezierPath()
-            stem.lineWidth = 2.0
-            stem.lineCapStyle = .round
-            stem.move(to: NSPoint(x: cx, y: oy + box * 0.15))
-            stem.line(to: NSPoint(x: cx, y: oy + box * 0.56))
-            iconColor.setStroke()
-            stem.stroke()
-            let dotD = max(2.2, box * 0.17)
-            let dotRect = NSRect(x: cx - dotD * 0.5, y: oy + box * 0.82 - dotD * 0.5, width: dotD, height: dotD)
-            iconColor.setFill()
-            NSBezierPath(ovalIn: dotRect).fill()
-        default:
-            let ins = max(1.8, box * 0.16)
-            let p = NSBezierPath()
-            p.lineWidth = 2.0
-            p.lineCapStyle = .round
-            p.move(to: NSPoint(x: ox + ins, y: oy + ins))
-            p.line(to: NSPoint(x: ox + box - ins, y: oy + box - ins))
-            p.move(to: NSPoint(x: ox + box - ins, y: oy + ins))
-            p.line(to: NSPoint(x: ox + ins, y: oy + box - ins))
-            iconColor.setStroke()
-            p.stroke()
-        }
+        drawStatusIcon(kind: iconKind, color: iconColor, bounds: bounds, box: configuredSize, isFlipped: true)
     }
 }
 
@@ -784,6 +798,174 @@ final class WaveBarsView: NSView {
     }
 }
 
+struct HudWaveLayoutGeometry {
+    let pillW: CGFloat
+    let pillH: CGFloat
+    let maxW: CGFloat
+    let padL: CGFloat
+    let padR: CGFloat
+    let truncated: Bool
+    let durFrame: NSRect
+    let waveFrame: NSRect
+    let hintFrame: NSRect
+    let badgeFrame: NSRect
+    let badgeLabelFrame: NSRect
+    let durSlotW: CGFloat
+    let hintSlotW: CGFloat
+    let badgeSlotW: CGFloat
+}
+
+struct HudStatusLayoutGeometry {
+    let pillW: CGFloat
+    let pillH: CGFloat
+    let maxW: CGFloat
+    let padL: CGFloat
+    let padR: CGFloat
+    let truncated: Bool
+    let iconFrame: NSRect
+    let labelFrame: NSRect
+    let textMeasuredW: CGFloat
+}
+
+func computeWaveHudLayout(
+    durSlotW: CGFloat,
+    durH: CGFloat,
+    hintW: CGFloat,
+    hintH: CGFloat,
+    hasHint: Bool,
+    badgeTextW: CGFloat,
+    badgeTextH: CGFloat,
+    hasBadge: Bool,
+    visibleWidth: CGFloat,
+    scale: CGFloat
+) -> HudWaveLayoutGeometry {
+    let padL: CGFloat = 16.0
+    let padR: CGFloat = 16.0
+    let waveW: CGFloat = WaveBarsView.totalWidth
+    let gap1: CGFloat = 10.0
+    let gap2: CGFloat = hasHint ? 10.0 : 0.0
+    let badgePadX: CGFloat = 5.0
+    let badgeSlotW: CGFloat = hasBadge ? max(22.0, ceil(badgeTextW) + badgePadX * 2.0) : 0.0
+    let badgeH: CGFloat = hasBadge ? max(18.0, ceil(badgeTextH) + 4.0) : 0.0
+    let badgeGap: CGFloat = hasBadge ? (hasHint ? 8.0 : 10.0) : 0.0
+    let effHintW: CGFloat = hasHint ? hintW : 0.0
+    let totalContentW = durSlotW + gap1 + waveW + gap2 + effHintW + badgeGap + badgeSlotW
+    let textH = max(max(durH, hasHint ? hintH : 0.0), badgeH)
+
+    let maxW = max(64.0, min(680.0, visibleWidth - 24.0))
+    let pillH: CGFloat = max(36.0, ceil(textH) + 12.0)
+    let rawW: CGFloat = max(64.0, snapToPixel(ceil(totalContentW) + padL + padR, scale: scale))
+    let truncated = rawW > maxW
+    let pillW: CGFloat = min(maxW, rawW)
+    let availW = max(1.0, pillW - padL - padR)
+    var curX = padL + ((totalContentW <= availW) ? snapToPixel((availW - totalContentW) * 0.5, scale: scale) : 0.0)
+
+    let durY = snapToPixel((pillH - durH) / 2.0, scale: scale)
+    let durFrame = NSRect(x: snapToPixel(curX, scale: scale), y: durY, width: durSlotW, height: durH)
+    curX += durSlotW + gap1
+
+    let waveFrame = NSRect(x: snapToPixel(curX, scale: scale), y: 0.0, width: waveW, height: pillH)
+    curX += waveW + gap2
+
+    let reservedRight = hasBadge ? (badgeGap + badgeSlotW) : 0.0
+    let hintFrame: NSRect
+    if hasHint {
+        let hx = snapToPixel(curX, scale: scale)
+        let remW = max(0.0, pillW - padR - reservedRight - hx)
+        let drawHintW = min(effHintW, remW)
+        let hintY = snapToPixel((pillH - hintH) / 2.0, scale: scale)
+        hintFrame = NSRect(x: hx, y: hintY, width: drawHintW, height: hintH)
+        curX = hx + drawHintW
+    } else {
+        hintFrame = .zero
+    }
+
+    let badgeFrame: NSRect
+    let badgeLabelFrame: NSRect
+    if hasBadge {
+        let bx = snapToPixel(curX + badgeGap, scale: scale)
+        let effBH = min(pillH - 6.0, badgeH)
+        let by = snapToPixel((pillH - effBH) / 2.0, scale: scale)
+        badgeFrame = NSRect(x: bx, y: by, width: badgeSlotW, height: effBH)
+        let lblY = snapToPixel((effBH - badgeTextH) / 2.0, scale: scale)
+        badgeLabelFrame = NSRect(x: 0.0, y: lblY, width: badgeSlotW, height: badgeTextH)
+    } else {
+        badgeFrame = .zero
+        badgeLabelFrame = .zero
+    }
+
+    return HudWaveLayoutGeometry(
+        pillW: pillW,
+        pillH: pillH,
+        maxW: maxW,
+        padL: padL,
+        padR: padR,
+        truncated: truncated,
+        durFrame: durFrame,
+        waveFrame: waveFrame,
+        hintFrame: hintFrame,
+        badgeFrame: badgeFrame,
+        badgeLabelFrame: badgeLabelFrame,
+        durSlotW: durSlotW,
+        hintSlotW: effHintW,
+        badgeSlotW: badgeSlotW
+    )
+}
+
+func computeStatusHudLayout(
+    isToast: Bool,
+    hasIcon: Bool,
+    hasBody: Bool,
+    textW: CGFloat,
+    textH: CGFloat,
+    visibleWidth: CGFloat,
+    scale: CGFloat
+) -> HudStatusLayoutGeometry {
+    let ceilTextW = hasBody ? ceil(textW) : 0.0
+    let iconBox: CGFloat = hasIcon ? (isToast ? StatusIconView.toastBoxSize : StatusIconView.mainBoxSize) : 0.0
+    let iconGap: CGFloat = (hasIcon && hasBody) ? (isToast ? 6.5 : 7.0) : 0.0
+    let padL: CGFloat = isToast ? 14.0 : 16.0
+    let padR: CGFloat = isToast ? 14.0 : 16.0
+    let contentW = iconBox + iconGap + ceilTextW
+    let pillH: CGFloat = isToast ? max(32.0, ceil(textH) + 10.0) : max(36.0, ceil(textH) + 12.0)
+    let maxW = max(64.0, min(680.0, visibleWidth - 24.0))
+    let rawW: CGFloat = max(64.0, snapToPixel(ceil(contentW) + padL + padR, scale: scale))
+    let truncated = rawW > maxW
+    let pillW: CGFloat = min(maxW, rawW)
+
+    let availW = max(1.0, pillW - padL - padR)
+    var curX = padL + ((contentW <= availW) ? snapToPixel((availW - contentW) * 0.5, scale: scale) : 0.0)
+    let iconFrame: NSRect
+    if hasIcon {
+        let iconY = snapToPixel((pillH - iconBox) / 2.0, scale: scale)
+        iconFrame = NSRect(x: snapToPixel(curX, scale: scale), y: iconY, width: iconBox, height: iconBox)
+        curX += iconBox + iconGap
+    } else {
+        iconFrame = .zero
+    }
+    let labelFrame: NSRect
+    if hasBody {
+        let lx = snapToPixel(curX, scale: scale)
+        let labelH = ceil(textH)
+        let labelY = snapToPixel((pillH - labelH) / 2.0, scale: scale)
+        let remW = max(0.0, pillW - padR - lx)
+        labelFrame = NSRect(x: lx, y: labelY, width: min(ceilTextW, remW), height: labelH)
+    } else {
+        labelFrame = .zero
+    }
+    return HudStatusLayoutGeometry(
+        pillW: pillW,
+        pillH: pillH,
+        maxW: maxW,
+        padL: padL,
+        padR: padR,
+        truncated: truncated,
+        iconFrame: iconFrame,
+        labelFrame: labelFrame,
+        textMeasuredW: ceilTextW
+    )
+}
+
 final class HudPillController {
     private static let recBg = rgba(64, 18, 26, 0.98)
     private static let recBorder = rgba(232, 88, 102, 0.68)
@@ -799,9 +981,14 @@ final class HudPillController {
     private static let warnMainText = rgba(254, 252, 232)
     private static let warnHintTextCol = rgba(251, 191, 36, 1.0)
 
-    private static let hudFont = NSFont.systemFont(ofSize: 13.5, weight: .regular)
-    private static let monoDurFont = NSFont.monospacedDigitSystemFont(ofSize: 13.5, weight: .regular)
-    private static let toastFont = NSFont.systemFont(ofSize: 12.5, weight: .regular)
+    fileprivate static let badgeBg = rgba(56, 189, 248, 0.22)
+    fileprivate static let badgeBorder = rgba(56, 189, 248, 0.58)
+    fileprivate static let badgeTextCol = rgba(186, 230, 253, 1.0)
+
+    fileprivate static let hudFont = NSFont.systemFont(ofSize: 13.5, weight: .regular)
+    fileprivate static let monoDurFont = NSFont.monospacedDigitSystemFont(ofSize: 13.5, weight: .regular)
+    fileprivate static let toastFont = NSFont.systemFont(ofSize: 12.5, weight: .regular)
+    fileprivate static let badgeFont = NSFont.monospacedDigitSystemFont(ofSize: 11.0, weight: .semibold)
     private static let bellWeight: [CGFloat] = [1.00, 0.92, 0.78, 0.58, 0.40]
 
     private var panel: NSPanel?
@@ -811,6 +998,8 @@ final class HudPillController {
     private var waveView: WaveBarsView?
     private var durLabel: NSTextField?
     private var hintLabel: NSTextField?
+    private var bgBadgeView: NSView?
+    private var bgBadgeLabel: NSTextField?
     private var hideWorkItem: DispatchWorkItem?
     private var animTimer: DispatchSourceTimer?
 
@@ -837,21 +1026,38 @@ final class HudPillController {
     private var recHintText: String = ""
     private var recZhHint: Bool = false
     private var recPosition: String = "bottom"
+    private var recBgCount: Int = 0
     private var maxDurationSec: Int = 0
     private var warnRemainSec: Int = 0
     private var lastDurText: String = ""
     private var lastSlotTemplate: String = ""
     private var lastHintSlotTemplate: String = ""
     private var lastWarnState: Bool = false
+    private var lastBgCount: Int = 0
 
     private let hotkeyLabel: String
     private let hotkeyLabelEn: String
     private let isPtt: Bool
+    private let headless: Bool
+    private var toastSlotAllocated: Bool = false
+    private var toastSlotCount: Int = 0
+    private var toastUpdateCount: Int = 0
+    private var toastLastText: String = ""
+    private var toastLastAutoHideMs: Int = 0
 
-    init(hotkeyLabel: String, hotkeyLabelEn: String, isPtt: Bool) {
+    fileprivate var debugMainVisible: Bool { isMainVisible }
+    fileprivate var debugToastVisible: Bool { isToastVisible }
+    fileprivate var debugMainBgCount: Int { recBgCount }
+    fileprivate var debugToastSlotCount: Int { toastSlotCount }
+    fileprivate var debugToastUpdateCount: Int { toastUpdateCount }
+    fileprivate var debugToastLastText: String { toastLastText }
+    fileprivate var debugToastLastAutoHideMs: Int { toastLastAutoHideMs }
+
+    init(hotkeyLabel: String, hotkeyLabelEn: String, isPtt: Bool, headless: Bool = false) {
         self.hotkeyLabel = hotkeyLabel
         self.hotkeyLabelEn = hotkeyLabelEn
         self.isPtt = isPtt
+        self.headless = headless
     }
 
     private func alignSubviewRect(_ rect: NSRect, in container: NSView, scale: CGFloat) -> NSRect {
@@ -916,8 +1122,26 @@ final class HudPillController {
         hl.isHidden = true
         container.addSubview(hl)
 
+        let bv = NSView(frame: NSRect(x: 0, y: 0, width: 22, height: 18))
+        bv.wantsLayer = true
+        bv.layer?.backgroundColor = Self.badgeBg.cgColor
+        bv.layer?.borderColor = Self.badgeBorder.cgColor
+        bv.layer?.borderWidth = 0.85
+        bv.layer?.cornerRadius = 9.0
+        bv.layer?.masksToBounds = true
+        bv.isHidden = true
+
+        let bl = NSTextField(labelWithString: "")
+        bl.font = Self.badgeFont
+        bl.textColor = Self.badgeTextCol
+        bl.alignment = .center
+        bl.lineBreakMode = .byClipping
+        bl.maximumNumberOfLines = 1
+        bv.addSubview(bl)
+        container.addSubview(bv)
+
         p.contentView = container
-        panel = p; bgView = container; iconView = iv; label = tf; waveView = wv; durLabel = dl; hintLabel = hl
+        panel = p; bgView = container; iconView = iv; label = tf; waveView = wv; durLabel = dl; hintLabel = hl; bgBadgeView = bv; bgBadgeLabel = bl
     }
 
     private func ensureToastPanel() {
@@ -1063,14 +1287,15 @@ final class HudPillController {
         let durStr = formatRecordingDuration(elapsedSec)
         let slotTpl = durationSlotTemplate(elapsedSec)
 
-        if !forceFrame && durStr == lastDurText && slotTpl == lastSlotTemplate && isWarn == lastWarnState && hintSlotTpl == lastHintSlotTemplate {
+        if !forceFrame && durStr == lastDurText && slotTpl == lastSlotTemplate && isWarn == lastWarnState && hintSlotTpl == lastHintSlotTemplate && recBgCount == lastBgCount {
             return
         }
-        let needRelayout = forceFrame || (slotTpl != lastSlotTemplate) || (isWarn != lastWarnState) || (hintSlotTpl != lastHintSlotTemplate)
+        let needRelayout = forceFrame || (slotTpl != lastSlotTemplate) || (isWarn != lastWarnState) || (hintSlotTpl != lastHintSlotTemplate) || (recBgCount != lastBgCount)
         lastDurText = durStr
         lastSlotTemplate = slotTpl
         lastHintSlotTemplate = hintSlotTpl
         lastWarnState = isWarn
+        lastBgCount = recBgCount
 
         if !needRelayout {
             durLabel.stringValue = durStr
@@ -1101,6 +1326,7 @@ final class HudPillController {
         let actW = ceil(durLabel.frame.size.width)
         let actH = ceil(durLabel.frame.size.height)
         let slotW = max(actW, tplW)
+        let durH = max(tplH, actH)
 
         var hintW: CGFloat = 0.0
         var hintH: CGFloat = 0.0
@@ -1121,17 +1347,35 @@ final class HudPillController {
             hintLabel.isHidden = true
         }
 
-        let padL: CGFloat = 16.0, padR: CGFloat = 16.0
-        let waveW: CGFloat = WaveBarsView.totalWidth
-        let gap1: CGFloat = 10.0
-        let gap2: CGFloat = effHint.isEmpty ? 0.0 : 10.0
-        let totalContentW = slotW + gap1 + waveW + gap2 + hintW
-        let textH = max(max(tplH, actH), hintH)
+        var badgeTextW: CGFloat = 0.0
+        var badgeTextH: CGFloat = 0.0
+        let hasBadge = (recBgCount > 0)
+        if hasBadge, let bl = bgBadgeLabel {
+            bl.stringValue = "+\(recBgCount)"
+            bl.sizeToFit()
+            badgeTextW = ceil(bl.frame.size.width)
+            badgeTextH = ceil(bl.frame.size.height)
+            bgBadgeView?.isHidden = false
+        } else {
+            bgBadgeLabel?.stringValue = ""
+            bgBadgeView?.isHidden = true
+        }
 
         let (scale, vf) = resolveAnchoredScreenMetrics(refresh: false)
-        let maxW = max(64.0, min(680.0, vf.width - 24.0))
-        let pillH: CGFloat = max(36.0, ceil(textH) + 12.0)
-        let pillW: CGFloat = min(maxW, max(64.0, snapToPixel(totalContentW + padL + padR, scale: scale)))
+        let geom = computeWaveHudLayout(
+            durSlotW: slotW,
+            durH: durH,
+            hintW: hintW,
+            hintH: hintH,
+            hasHint: !effHint.isEmpty,
+            badgeTextW: badgeTextW,
+            badgeTextH: badgeTextH,
+            hasBadge: hasBadge,
+            visibleWidth: vf.width,
+            scale: scale
+        )
+        let pillW = geom.pillW
+        let pillH = geom.pillH
         let pillX = snapToPixel(vf.midX - pillW / 2.0, scale: scale)
         let pillY = computeHudPillY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, pillH: pillH, position: recPosition)
         currentMainPillH = pillH
@@ -1145,23 +1389,19 @@ final class HudPillController {
         bgView.layer?.borderColor = effBorder.cgColor
         bgView.layer?.borderWidth = 1.0
 
-        let availW = max(1.0, pillW - padL - padR)
-        var curX = padL + ((totalContentW <= availW) ? snapToPixel((availW - totalContentW) * 0.5, scale: scale) : 0.0)
-
-        let durH = max(tplH, actH)
-        let durY = snapToPixel((pillH - durH) / 2.0, scale: scale)
-        durLabel.frame = alignSubviewRect(NSRect(x: curX, y: durY, width: slotW, height: durH), in: bgView, scale: scale)
-        curX += slotW + gap1
-
-        waveView.frame = alignSubviewRect(NSRect(x: snapToPixel(curX, scale: scale), y: 0, width: waveW, height: pillH), in: bgView, scale: scale)
+        durLabel.frame = alignSubviewRect(geom.durFrame, in: bgView, scale: scale)
+        waveView.frame = alignSubviewRect(geom.waveFrame, in: bgView, scale: scale)
         waveView.layer?.contentsScale = scale
-        curX += waveW + gap2
 
         if !effHint.isEmpty {
-            let curXSnap = snapToPixel(curX, scale: scale)
-            let remW = max(0.0, pillW - padR - curXSnap)
-            let hintY = snapToPixel((pillH - hintH) / 2.0, scale: scale)
-            hintLabel.frame = alignSubviewRect(NSRect(x: curXSnap, y: hintY, width: min(hintW, remW), height: hintH), in: bgView, scale: scale)
+            hintLabel.frame = alignSubviewRect(geom.hintFrame, in: bgView, scale: scale)
+        }
+        if hasBadge, let bv = bgBadgeView, let bl = bgBadgeLabel {
+            let alignedBadge = alignSubviewRect(geom.badgeFrame, in: bgView, scale: scale)
+            bv.frame = alignedBadge
+            bv.layer?.contentsScale = scale
+            bv.layer?.cornerRadius = alignedBadge.height / 2.0
+            bl.frame = alignSubviewRect(geom.badgeLabelFrame, in: bv, scale: scale)
         }
     }
 
@@ -1169,6 +1409,8 @@ final class HudPillController {
         hideWorkItem?.cancel(); hideWorkItem = nil
         stopWaveTimer()
         maxDurationSec = 0; warnRemainSec = 0
+        recBgCount = 0; lastBgCount = 0
+        bgBadgeView?.isHidden = true
         isMainVisible = false
         currentMainPillH = 36.0
         panel?.orderOut(nil)
@@ -1184,7 +1426,7 @@ final class HudPillController {
         hideMain()
     }
 
-    private static func resolveIconKind(stateKind: String, iconSeg: String) -> String {
+    fileprivate static func resolveIconKind(stateKind: String, iconSeg: String) -> String {
         if !stateKind.isEmpty { return stateKind }
         switch iconSeg {
         case "◐": return "recognizing"
@@ -1204,29 +1446,53 @@ final class HudPillController {
         position: String,
         maxDurationSec: Int,
         warnRemainSec: Int,
-        zh: Bool
+        zh: Bool,
+        bgCount: Int = 0
     ) {
         hideWorkItem?.cancel(); hideWorkItem = nil
-        ensurePanel()
-        guard let panel = panel, let bgView = bgView, let iconView = iconView, let label = label else { return }
 
         var txt = style.defaultText
         var waveMode = false
         if st == "recording" {
             txt = zh
-                ? "● 录音中… (\(isPtt ? "松开" : "按")\(hotkeyLabel) 完成)"
-                : "● Listening… (\(isPtt ? "release" : "press") \(hotkeyLabelEn) to finish)"
+                ? "● 录音中… (\(isPtt ? "松开" : "按")\(hotkeyLabel) 结束)"
+                : "● Listening… (\(isPtt ? "release" : "press") \(hotkeyLabelEn) to end)"
             let trimmedCustom = customText.trimmingCharacters(in: .whitespacesAndNewlines)
             waveMode = trimmedCustom.isEmpty || trimmedCustom.hasPrefix("● ")
         }
         if !customText.isEmpty { txt = customText }
         let autoHideMs = (durationMs > 0) ? durationMs : style.autoHideMs
-
         let seg = splitHudSegments(txt)
+
+        if headless {
+            if waveMode {
+                recHintText = seg.hint
+                recZhHint = txt.isEmpty ? zh : containsCjkScalar(txt)
+                recPosition = position
+                recBgCount = max(0, bgCount)
+                self.maxDurationSec = max(0, maxDurationSec)
+                self.warnRemainSec = (self.maxDurationSec > 0) ? (warnRemainSec > 0 ? warnRemainSec : recordingCountdownWarnSec(self.maxDurationSec)) : 0
+                if !isWaveRecording {
+                    isWaveRecording = true
+                    recStartMs = monotonicMs()
+                }
+            } else {
+                stopWaveTimer()
+                self.maxDurationSec = 0; self.warnRemainSec = 0
+                recBgCount = 0; lastBgCount = 0
+            }
+            isMainVisible = true
+            return
+        }
+
+        ensurePanel()
+        guard let panel = panel, let bgView = bgView, let iconView = iconView, let label = label else { return }
+
         if waveMode {
             recHintText = seg.hint
             recZhHint = txt.isEmpty ? zh : containsCjkScalar(txt)
             recPosition = position
+            recBgCount = max(0, bgCount)
             self.maxDurationSec = max(0, maxDurationSec)
             self.warnRemainSec = (self.maxDurationSec > 0) ? (warnRemainSec > 0 ? warnRemainSec : recordingCountdownWarnSec(self.maxDurationSec)) : 0
             if !isWaveRecording {
@@ -1240,6 +1506,7 @@ final class HudPillController {
                 lastSlotTemplate = ""
                 lastHintSlotTemplate = ""
                 lastWarnState = false
+                lastBgCount = -1
                 let initLvl = currentLiveLevel()
                 waveView?.barNorms = (initLvl > 0.0) ? stepWaveEnvelope(initLvl) : Array(repeating: 0.0, count: 9)
             }
@@ -1250,9 +1517,11 @@ final class HudPillController {
         } else {
             stopWaveTimer()
             self.maxDurationSec = 0; self.warnRemainSec = 0
+            recBgCount = 0; lastBgCount = 0
             waveView?.isHidden = true
             durLabel?.isHidden = true
             hintLabel?.isHidden = true
+            bgBadgeView?.isHidden = true
 
             let mainColor = style.mainText.nsColor
             let hintColor = style.hintText.nsColor
@@ -1285,16 +1554,18 @@ final class HudPillController {
             label.isHidden = !hasBody
 
             let textSize = hasBody ? label.frame.size : NSSize(width: 0, height: 18)
-            let textH = ceil(textSize.height)
-            let iconBox: CGFloat = hasIcon ? StatusIconView.mainBoxSize : 0.0
-            let iconGap: CGFloat = (hasIcon && hasBody) ? 7.0 : 0.0
-            let padL: CGFloat = 16.0, padR: CGFloat = 16.0
-            let contentW = iconBox + iconGap + ceil(textSize.width)
-            let pillH: CGFloat = max(36.0, ceil(textH) + 12.0)
-
             let (scale, vf) = resolveAnchoredScreenMetrics(refresh: false)
-            let maxW = max(64.0, min(680.0, vf.width - 24.0))
-            let pillW: CGFloat = min(maxW, max(64.0, snapToPixel(contentW + padL + padR, scale: scale)))
+            let geom = computeStatusHudLayout(
+                isToast: false,
+                hasIcon: hasIcon,
+                hasBody: hasBody,
+                textW: textSize.width,
+                textH: textSize.height,
+                visibleWidth: vf.width,
+                scale: scale
+            )
+            let pillW = geom.pillW
+            let pillH = geom.pillH
             let pillX = snapToPixel(vf.midX - pillW / 2.0, scale: scale)
             let pillY = computeHudPillY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, pillH: pillH, position: position)
             currentMainPillH = pillH
@@ -1308,24 +1579,18 @@ final class HudPillController {
             bgView.layer?.borderColor = bd.cgColor
             bgView.layer?.borderWidth = style.borderWidth
 
-            let availW = max(1.0, pillW - padL - padR)
-            var curX = padL + ((contentW <= availW) ? snapToPixel((availW - contentW) * 0.5, scale: scale) : 0.0)
             if hasIcon {
                 iconView.configuredSize = StatusIconView.mainBoxSize
                 iconView.iconKind = Self.resolveIconKind(stateKind: style.iconKind, iconSeg: seg.icon)
                 iconView.iconColor = iconColor
-                let iconY = snapToPixel((pillH - iconBox) / 2.0, scale: scale)
-                iconView.frame = alignSubviewRect(NSRect(x: curX, y: iconY, width: iconBox, height: iconBox), in: bgView, scale: scale)
+                iconView.frame = alignSubviewRect(geom.iconFrame, in: bgView, scale: scale)
                 iconView.layer?.contentsScale = scale
                 iconView.isHidden = false
-                curX += iconBox + iconGap
             } else {
                 iconView.isHidden = true
             }
             if hasBody {
-                let labelY = snapToPixel((pillH - textH) / 2.0, scale: scale)
-                let remW = max(0.0, pillW - padR - curX)
-                label.frame = alignSubviewRect(NSRect(x: curX, y: labelY, width: min(ceil(textSize.width), remW), height: textH), in: bgView, scale: scale)
+                label.frame = alignSubviewRect(geom.labelFrame, in: bgView, scale: scale)
             }
             isMainVisible = true
             panel.orderFrontRegardless()
@@ -1338,6 +1603,16 @@ final class HudPillController {
         }
     }
 
+    private func ensureToastSlot() {
+        if !toastSlotAllocated {
+            toastSlotAllocated = true
+            toastSlotCount += 1
+        }
+        if !headless {
+            ensureToastPanel()
+        }
+    }
+
     private func updateToast(
         style: HudVisualStyle,
         customText: String,
@@ -1345,11 +1620,19 @@ final class HudPillController {
         position: String
     ) {
         toastHideWorkItem?.cancel(); toastHideWorkItem = nil
-        ensureToastPanel()
+        let rawTxt = customText.isEmpty ? style.defaultText : customText
+        let autoHideMs = (durationMs > 0) ? durationMs : style.autoHideMs
+        ensureToastSlot()
+        toastUpdateCount += 1
+        toastLastText = rawTxt
+        toastLastAutoHideMs = autoHideMs
+        if headless {
+            isToastVisible = true
+            return
+        }
         guard let toastPanel = toastPanel, let toastBgView = toastBgView,
               let toastIconView = toastIconView, let toastLabel = toastLabel else { return }
 
-        let rawTxt = customText.isEmpty ? style.defaultText : customText
         let bodyTxt = stripLeadingHudSymbol(rawTxt)
         let seg = splitHudSegments(rawTxt)
         let effIconKind = Self.resolveIconKind(stateKind: style.iconKind, iconSeg: seg.icon)
@@ -1389,16 +1672,18 @@ final class HudPillController {
         toastLabel.isHidden = !hasBody
 
         let textSize = hasBody ? toastLabel.frame.size : NSSize(width: 0, height: 17)
-        let textH = ceil(textSize.height)
-        let iconBox: CGFloat = hasIcon ? StatusIconView.toastBoxSize : 0.0
-        let iconGap: CGFloat = (hasIcon && hasBody) ? 6.5 : 0.0
-        let padL: CGFloat = 14.0, padR: CGFloat = 14.0
-        let contentW = iconBox + iconGap + ceil(textSize.width)
-        let toastH: CGFloat = max(32.0, ceil(textH) + 10.0)
-
         let (scale, vf) = resolveAnchoredScreenMetrics(refresh: !(isMainVisible || isToastVisible))
-        let maxW = max(64.0, min(680.0, vf.width - 24.0))
-        let toastW: CGFloat = min(maxW, max(64.0, snapToPixel(contentW + padL + padR, scale: scale)))
+        let geom = computeStatusHudLayout(
+            isToast: true,
+            hasIcon: hasIcon,
+            hasBody: hasBody,
+            textW: textSize.width,
+            textH: textSize.height,
+            visibleWidth: vf.width,
+            scale: scale
+        )
+        let toastW = geom.pillW
+        let toastH = geom.pillH
         let toastX = snapToPixel(vf.midX - toastW / 2.0, scale: scale)
         let mainSlotH: CGFloat = isMainVisible ? max(36.0, currentMainPillH) : 36.0
         let toastY = computeHudToastY(visibleMinY: vf.minY, visibleMaxY: vf.maxY, mainH: mainSlotH, toastH: toastH, position: position)
@@ -1413,29 +1698,22 @@ final class HudPillController {
         toastBgView.layer?.borderColor = style.border.nsColor.cgColor
         toastBgView.layer?.borderWidth = style.borderWidth
 
-        let availW = max(1.0, toastW - padL - padR)
-        var curX = padL + ((contentW <= availW) ? snapToPixel((availW - contentW) * 0.5, scale: scale) : 0.0)
         if hasIcon {
             toastIconView.configuredSize = StatusIconView.toastBoxSize
             toastIconView.iconKind = effIconKind
             toastIconView.iconColor = style.icon.nsColor
-            let iconY = snapToPixel((toastH - iconBox) / 2.0, scale: scale)
-            toastIconView.frame = alignSubviewRect(NSRect(x: curX, y: iconY, width: iconBox, height: iconBox), in: toastBgView, scale: scale)
+            toastIconView.frame = alignSubviewRect(geom.iconFrame, in: toastBgView, scale: scale)
             toastIconView.layer?.contentsScale = scale
             toastIconView.isHidden = false
-            curX += iconBox + iconGap
         } else {
             toastIconView.isHidden = true
         }
         if hasBody {
-            let labelY = snapToPixel((toastH - textH) / 2.0, scale: scale)
-            let remW = max(0.0, toastW - padR - curX)
-            toastLabel.frame = alignSubviewRect(NSRect(x: curX, y: labelY, width: min(ceil(textSize.width), remW), height: textH), in: toastBgView, scale: scale)
+            toastLabel.frame = alignSubviewRect(geom.labelFrame, in: toastBgView, scale: scale)
         }
         isToastVisible = true
         toastPanel.orderFrontRegardless()
 
-        let autoHideMs = (durationMs > 0) ? durationMs : style.autoHideMs
         if autoHideMs > 0 {
             let work = DispatchWorkItem { [weak self] in self?.hideToast() }
             toastHideWorkItem = work
@@ -1452,7 +1730,8 @@ final class HudPillController {
         warnRemainSec: Int = 0,
         layer: String = "",
         clearMain: Bool? = nil,
-        clearToast: Bool? = nil
+        clearToast: Bool? = nil,
+        bgCount: Int = 0
     ) {
         let st = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if st.isEmpty || st == "idle" || st == "hide" {
@@ -1484,7 +1763,8 @@ final class HudPillController {
                 position: position,
                 maxDurationSec: maxDurationSec,
                 warnRemainSec: warnRemainSec,
-                zh: zh
+                zh: zh,
+                bgCount: bgCount
             )
         } else {
             updateToast(
@@ -1504,6 +1784,7 @@ final class HudPillController {
         hideToast()
         panel?.close(); panel = nil
         toastPanel?.close(); toastPanel = nil
+        toastSlotAllocated = false
     }
 }
 
@@ -2094,6 +2375,479 @@ final class PasteboardGuard {
     }
 }
 
+private func regionHasDistinctForeground(
+    data: UnsafeMutablePointer<UInt8>,
+    bpr: Int,
+    spp: Int,
+    pxW: Int,
+    pxH: Int,
+    rect: NSRect,
+    scale: CGFloat,
+    bgR: Int,
+    bgG: Int,
+    bgB: Int
+) -> Bool {
+    let leftPx = max(0, min(pxW, Int(floor(rect.minX * scale))))
+    let rightPx = max(0, min(pxW, Int(ceil(rect.maxX * scale))))
+    let topPx = max(2, min(pxH - 2, pxH - Int(ceil(rect.maxY * scale))))
+    let botPx = max(2, min(pxH - 2, pxH - Int(floor(rect.minY * scale))))
+    if leftPx >= rightPx || topPx >= botPx { return false }
+    for y in topPx..<botPx {
+        let row = y * bpr
+        for x in leftPx..<rightPx {
+            let idx = row + x * spp
+            let a = Int(data[idx + 3])
+            if a < 180 { continue }
+            let dr = abs(Int(data[idx]) - bgR)
+            let dg = abs(Int(data[idx + 1]) - bgG)
+            let db = abs(Int(data[idx + 2]) - bgB)
+            if dr + dg + db >= 36 { return true }
+        }
+    }
+    return false
+}
+
+private func runHudLayoutSelfCheck() throws -> Int {
+    func assertLayout(_ cond: Bool, _ msg: String) throws {
+        if !cond {
+            throw NSError(domain: "SelfCheck", code: 10, userInfo: [NSLocalizedDescriptionKey: "HUD layout check failed: \(msg)"])
+        }
+    }
+
+    func measureCell(_ attr: NSAttributedString) -> NSSize {
+        let raw = attr.size()
+        return NSSize(width: ceil(raw.width) + 4.0, height: ceil(raw.height))
+    }
+
+    func renderAndVerifyWave(
+        label: String,
+        text: String,
+        elapsedSec: Int,
+        maxDurSec: Int,
+        warnRemSec: Int,
+        bgCount: Int,
+        zh: Bool,
+        visibleW: CGFloat,
+        scale: CGFloat
+    ) throws {
+        let seg = splitHudSegments(text)
+        var isWarn = false
+        var remainSec = 0
+        if maxDurSec > 0 && warnRemSec > 0 {
+            remainSec = max(0, maxDurSec - elapsedSec)
+            isWarn = (remainSec <= warnRemSec)
+        }
+        let rawHint = isWarn ? formatCountdownHint(remainSec, zh: zh) : seg.hint
+        let effHint = stripOuterParens(rawHint)
+        let hintTpl = isWarn ? stripOuterParens(countdownHintSlotTemplate(remainSec, zh: zh)) : effHint
+        let durStr = formatRecordingDuration(elapsedSec)
+        let durTpl = durationSlotTemplate(elapsedSec)
+
+        let centerPara = NSMutableParagraphStyle()
+        centerPara.alignment = .center
+        let leftPara = NSMutableParagraphStyle()
+        leftPara.alignment = .left
+
+        let mainCol = isWarn ? rgba(254, 252, 232) : rgba(248, 250, 252)
+        let hintCol = isWarn ? rgba(251, 191, 36, 1.0) : rgba(188, 178, 192, 1.0)
+        let bgCol = isWarn ? rgba(72, 38, 12, 0.98) : rgba(64, 18, 26, 0.98)
+        let borderCol = isWarn ? rgba(245, 158, 11, 0.72) : rgba(232, 88, 102, 0.68)
+        let waveCol = isWarn ? rgba(251, 191, 36, 1.0) : rgba(255, 104, 112, 1.0)
+
+        let durAttr = NSAttributedString(string: durStr, attributes: [.font: HudPillController.monoDurFont, .foregroundColor: mainCol, .paragraphStyle: centerPara])
+        let durTplAttr = NSAttributedString(string: durTpl, attributes: [.font: HudPillController.monoDurFont, .foregroundColor: mainCol, .paragraphStyle: centerPara])
+        let durActSz = measureCell(durAttr)
+        let durTplSz = measureCell(durTplAttr)
+        let durSlotW = max(durActSz.width, durTplSz.width)
+        let durH = max(durActSz.height, durTplSz.height)
+
+        let hintAttr = NSAttributedString(string: effHint, attributes: [.font: HudPillController.hudFont, .foregroundColor: hintCol, .paragraphStyle: leftPara])
+        let hintTplAttr = NSAttributedString(string: hintTpl, attributes: [.font: HudPillController.hudFont, .foregroundColor: hintCol, .paragraphStyle: leftPara])
+        let hintActSz = effHint.isEmpty ? NSSize.zero : measureCell(hintAttr)
+        let hintTplSz = effHint.isEmpty ? NSSize.zero : measureCell(hintTplAttr)
+        let hintSlotW = max(hintActSz.width, hintTplSz.width)
+        let hintH = max(hintActSz.height, hintTplSz.height)
+
+        let hasBadge = bgCount > 0
+        let badgeStr = hasBadge ? "+\(bgCount)" : ""
+        let badgeAttr = NSAttributedString(string: badgeStr, attributes: [.font: HudPillController.badgeFont, .foregroundColor: HudPillController.badgeTextCol, .paragraphStyle: centerPara])
+        let badgeSz = hasBadge ? measureCell(badgeAttr) : NSSize.zero
+
+        let geom = computeWaveHudLayout(
+            durSlotW: durSlotW,
+            durH: durH,
+            hintW: hintSlotW,
+            hintH: hintH,
+            hasHint: !effHint.isEmpty,
+            badgeTextW: badgeSz.width,
+            badgeTextH: badgeSz.height,
+            hasBadge: hasBadge,
+            visibleWidth: visibleW,
+            scale: scale
+        )
+
+        try assertLayout(geom.pillW > 0.0 && geom.pillW <= geom.maxW && geom.pillH > 0.0 && geom.pillW >= geom.padL + geom.padR, "\(label): bounds invalid")
+        try assertLayout(!geom.truncated, "\(label): unexpected truncation pillW=\(geom.pillW) maxW=\(geom.maxW)")
+        try assertLayout(geom.durFrame.minX >= geom.padL - 0.5, "\(label): durFrame left padding")
+        try assertLayout(geom.durFrame.width >= durActSz.width && geom.durSlotW >= durActSz.width, "\(label): durFrame overflow")
+        try assertLayout(geom.durFrame.maxX < geom.waveFrame.minX, "\(label): durFrame overlaps waveFrame")
+        try assertLayout(geom.waveFrame.width > 0.0, "\(label): waveFrame empty")
+        if !effHint.isEmpty {
+            try assertLayout(geom.waveFrame.maxX < geom.hintFrame.minX, "\(label): waveFrame overlaps hintFrame")
+            try assertLayout(geom.hintFrame.width >= hintActSz.width && geom.hintSlotW >= hintActSz.width, "\(label): hintFrame overflow")
+        }
+        if hasBadge {
+            let prevRight = effHint.isEmpty ? geom.waveFrame.maxX : geom.hintFrame.maxX
+            try assertLayout(prevRight < geom.badgeFrame.minX, "\(label): badgeFrame overlaps previous segment")
+            try assertLayout(geom.badgeFrame.width >= badgeSz.width, "\(label): badgeFrame overflow")
+            try assertLayout(geom.badgeFrame.maxX <= geom.pillW - geom.padR, "\(label): badgeFrame right padding")
+        } else {
+            try assertLayout(geom.badgeFrame == .zero, "\(label): unexpected badgeFrame when bgCount=0")
+            let lastRight = effHint.isEmpty ? geom.waveFrame.maxX : geom.hintFrame.maxX
+            try assertLayout(lastRight <= geom.pillW - geom.padR, "\(label): hintFrame right padding")
+        }
+
+        let pxW = Int(round(geom.pillW * scale))
+        let pxH = Int(round(geom.pillH * scale))
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pxW,
+            pixelsHigh: pxH,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ), let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
+            throw NSError(domain: "SelfCheck", code: 11, userInfo: [NSLocalizedDescriptionKey: "\(label): failed to allocate offscreen bitmap"])
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        ctx.cgContext.scaleBy(x: scale, y: scale)
+        ctx.cgContext.clear(CGRect(x: 0.0, y: 0.0, width: geom.pillW, height: geom.pillH))
+
+        let capsule = NSBezierPath(roundedRect: NSRect(x: 0.5, y: 0.5, width: geom.pillW - 1.0, height: geom.pillH - 1.0), xRadius: (geom.pillH - 1.0) / 2.0, yRadius: (geom.pillH - 1.0) / 2.0)
+        bgCol.setFill()
+        capsule.fill()
+        borderCol.setStroke()
+        capsule.lineWidth = 1.0
+        capsule.stroke()
+
+        durAttr.draw(in: geom.durFrame)
+        let norms: [CGFloat] = [0.2, 0.45, 0.75, 0.95, 1.0, 0.85, 0.6, 0.35, 0.15]
+        let maxBarH = max(WaveBarsView.barWidth, min(geom.pillH - 8.0, WaveBarsView.maxBarHeight))
+        waveCol.setFill()
+        for idx in 0..<9 {
+            let bh = WaveBarsView.barWidth + norms[idx] * (maxBarH - WaveBarsView.barWidth)
+            let bx = geom.waveFrame.minX + CGFloat(idx) * (WaveBarsView.barWidth + WaveBarsView.barGap)
+            let by = (geom.pillH - bh) * 0.5
+            NSBezierPath(roundedRect: NSRect(x: bx, y: by, width: WaveBarsView.barWidth, height: bh), xRadius: WaveBarsView.barWidth * 0.5, yRadius: WaveBarsView.barWidth * 0.5).fill()
+        }
+        if !effHint.isEmpty {
+            hintAttr.draw(in: NSRect(x: geom.hintFrame.minX + 2.0, y: geom.hintFrame.minY, width: max(1.0, geom.hintFrame.width - 2.0), height: geom.hintFrame.height))
+        }
+        if hasBadge {
+            let bPath = NSBezierPath(roundedRect: geom.badgeFrame, xRadius: geom.badgeFrame.height / 2.0, yRadius: geom.badgeFrame.height / 2.0)
+            HudPillController.badgeBg.setFill()
+            bPath.fill()
+            HudPillController.badgeBorder.setStroke()
+            bPath.lineWidth = 0.85
+            bPath.stroke()
+            let drawBadgeRect = NSRect(x: geom.badgeFrame.minX, y: geom.badgeFrame.minY + geom.badgeLabelFrame.minY, width: geom.badgeFrame.width, height: geom.badgeLabelFrame.height)
+            badgeAttr.draw(in: drawBadgeRect)
+        }
+        ctx.flushGraphics()
+
+        guard let data = rep.bitmapData else {
+            throw NSError(domain: "SelfCheck", code: 12, userInfo: [NSLocalizedDescriptionKey: "\(label): missing bitmapData"])
+        }
+        let bpr = rep.bytesPerRow
+        let spp = rep.samplesPerPixel
+        try assertLayout(data[3] == 0, "\(label): top-left corner alpha not 0")
+        let bgX = max(3, min(pxW - 4, Int(round(geom.padL * 0.5 * scale))))
+        let bgIdx = (pxH / 2) * bpr + bgX * spp
+        try assertLayout(Int(data[bgIdx + 3]) >= 180, "\(label): interior pixel unexpectedly transparent")
+        let bgR = Int(data[bgIdx]), bgG = Int(data[bgIdx + 1]), bgB = Int(data[bgIdx + 2])
+        try assertLayout(regionHasDistinctForeground(data: data, bpr: bpr, spp: spp, pxW: pxW, pxH: pxH, rect: geom.durFrame, scale: scale, bgR: bgR, bgG: bgG, bgB: bgB), "\(label): durFrame blank")
+        try assertLayout(regionHasDistinctForeground(data: data, bpr: bpr, spp: spp, pxW: pxW, pxH: pxH, rect: geom.waveFrame, scale: scale, bgR: bgR, bgG: bgG, bgB: bgB), "\(label): waveFrame blank")
+        if !effHint.isEmpty {
+            try assertLayout(regionHasDistinctForeground(data: data, bpr: bpr, spp: spp, pxW: pxW, pxH: pxH, rect: geom.hintFrame, scale: scale, bgR: bgR, bgG: bgG, bgB: bgB), "\(label): hintFrame blank")
+        }
+        if hasBadge {
+            try assertLayout(regionHasDistinctForeground(data: data, bpr: bpr, spp: spp, pxW: pxW, pxH: pxH, rect: geom.badgeFrame, scale: scale, bgR: bgR, bgG: bgG, bgB: bgB), "\(label): badgeFrame blank")
+        }
+    }
+
+    func renderAndVerifyStatus(
+        label: String,
+        state: String,
+        customText: String,
+        explicitLayer: String,
+        zh: Bool,
+        visibleW: CGFloat,
+        scale: CGFloat
+    ) throws {
+        let style = resolveHudVisualStyle(state: state, explicitLayer: explicitLayer, zh: zh)
+        let isToast = (style.layer == "toast")
+        let rawTxt = customText.isEmpty ? style.defaultText : customText
+        let seg = splitHudSegments(rawTxt)
+        let effIconKind = HudPillController.resolveIconKind(stateKind: style.iconKind, iconSeg: seg.icon)
+        let hasIcon = isToast ? !effIconKind.isEmpty : (!seg.icon.isEmpty || !style.iconKind.isEmpty)
+        let bodyTxt = isToast ? stripLeadingHudSymbol(rawTxt) : (seg.main + (seg.hint.isEmpty ? "" : ((seg.hasSpaceBeforeHint ? " " : "") + seg.hint)))
+        let hasBody = !bodyTxt.isEmpty
+        let font = isToast ? HudPillController.toastFont : HudPillController.hudFont
+        let para = NSMutableParagraphStyle()
+        para.alignment = hasIcon ? .left : .center
+        let attr = NSMutableAttributedString()
+        if isToast && seg.hint.isEmpty {
+            if !bodyTxt.isEmpty {
+                attr.append(NSAttributedString(string: bodyTxt, attributes: [.font: font, .foregroundColor: style.mainText.nsColor, .paragraphStyle: para]))
+            }
+        } else {
+            if !seg.main.isEmpty {
+                attr.append(NSAttributedString(string: seg.main, attributes: [.font: font, .foregroundColor: style.mainText.nsColor, .paragraphStyle: para]))
+            }
+            if !seg.hint.isEmpty {
+                let prefixSpace = (seg.hasSpaceBeforeHint && attr.length > 0) ? " " : ""
+                attr.append(NSAttributedString(string: prefixSpace + seg.hint, attributes: [.font: font, .foregroundColor: style.hintText.nsColor, .paragraphStyle: para]))
+            }
+        }
+        let measured = hasBody ? measureCell(attr) : NSSize(width: 0.0, height: isToast ? 17.0 : 18.0)
+        let geom = computeStatusHudLayout(
+            isToast: isToast,
+            hasIcon: hasIcon,
+            hasBody: hasBody,
+            textW: measured.width,
+            textH: measured.height,
+            visibleWidth: visibleW,
+            scale: scale
+        )
+        try assertLayout(geom.pillW > 0.0 && geom.pillW <= geom.maxW && geom.pillH > 0.0 && geom.pillW >= geom.padL + geom.padR, "\(label): bounds invalid")
+        try assertLayout(!geom.truncated, "\(label): unexpected truncation pillW=\(geom.pillW) maxW=\(geom.maxW)")
+        if hasIcon {
+            try assertLayout(geom.iconFrame.minX >= geom.padL - 0.5, "\(label): iconFrame left padding")
+            if hasBody {
+                try assertLayout(geom.iconFrame.maxX < geom.labelFrame.minX, "\(label): iconFrame overlaps labelFrame")
+            }
+        }
+        if hasBody {
+            try assertLayout(geom.labelFrame.width >= measured.width - 0.5, "\(label): labelFrame smaller than measured text")
+            try assertLayout(geom.labelFrame.maxX <= geom.pillW - geom.padR + 0.5, "\(label): labelFrame right padding")
+        }
+
+        let pxW = Int(round(geom.pillW * scale))
+        let pxH = Int(round(geom.pillH * scale))
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pxW,
+            pixelsHigh: pxH,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ), let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
+            throw NSError(domain: "SelfCheck", code: 13, userInfo: [NSLocalizedDescriptionKey: "\(label): failed to allocate status offscreen bitmap"])
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        ctx.cgContext.scaleBy(x: scale, y: scale)
+        ctx.cgContext.clear(CGRect(x: 0.0, y: 0.0, width: geom.pillW, height: geom.pillH))
+
+        let capsule = NSBezierPath(roundedRect: NSRect(x: 0.5, y: 0.5, width: geom.pillW - 1.0, height: geom.pillH - 1.0), xRadius: (geom.pillH - 1.0) / 2.0, yRadius: (geom.pillH - 1.0) / 2.0)
+        style.bg.nsColor.setFill()
+        capsule.fill()
+        style.border.nsColor.setStroke()
+        capsule.lineWidth = style.borderWidth
+        capsule.stroke()
+
+        if hasIcon {
+            drawStatusIcon(
+                kind: effIconKind,
+                color: style.icon.nsColor,
+                bounds: geom.iconFrame,
+                box: isToast ? StatusIconView.toastBoxSize : StatusIconView.mainBoxSize,
+                isFlipped: false
+            )
+        }
+        if hasBody {
+            attr.draw(in: NSRect(x: geom.labelFrame.minX + 2.0, y: geom.labelFrame.minY, width: max(1.0, geom.labelFrame.width - 2.0), height: geom.labelFrame.height))
+        }
+        ctx.flushGraphics()
+
+        guard let data = rep.bitmapData else {
+            throw NSError(domain: "SelfCheck", code: 14, userInfo: [NSLocalizedDescriptionKey: "\(label): missing status bitmapData"])
+        }
+        let bpr = rep.bytesPerRow
+        let spp = rep.samplesPerPixel
+        try assertLayout(data[3] == 0, "\(label): status top-left corner alpha not 0")
+        let bgX = max(3, min(pxW - 4, Int(round(geom.padL * 0.5 * scale))))
+        let bgIdx = (pxH / 2) * bpr + bgX * spp
+        try assertLayout(Int(data[bgIdx + 3]) >= 180, "\(label): status interior pixel transparent")
+        let bgR = Int(data[bgIdx]), bgG = Int(data[bgIdx + 1]), bgB = Int(data[bgIdx + 2])
+        if hasIcon {
+            try assertLayout(regionHasDistinctForeground(data: data, bpr: bpr, spp: spp, pxW: pxW, pxH: pxH, rect: geom.iconFrame, scale: scale, bgR: bgR, bgG: bgG, bgB: bgB), "\(label): iconFrame blank")
+        }
+        if hasBody {
+            try assertLayout(regionHasDistinctForeground(data: data, bpr: bpr, spp: spp, pxW: pxW, pxH: pxH, rect: geom.labelFrame, scale: scale, bgR: bgR, bgG: bgG, bgB: bgB), "\(label): labelFrame blank")
+        }
+    }
+
+    var cases = 0
+    let scaleSpecs: [(scale: CGFloat, width: CGFloat)] = [(1.0, 1280.0), (2.0, 1440.0)]
+    let enRecTexts = [
+        "● Listening… (press Right Ctrl to end)",
+        "● Listening… (release Right Ctrl to end)",
+        "● Listening… (press Right Option to end)",
+        "● Listening… (release ScrollLock to end)",
+    ]
+    let zhRecTexts = [
+        "● 录音中… (按右 Ctrl 结束)",
+        "● 录音中… (松开右 Ctrl 结束)",
+        "● 录音中… (按右 Option 结束)",
+        "● 录音中… (松开 ScrollLock 结束)",
+    ]
+    let mainStates = ["recognizing", "processing", "refining", "done", "copied"]
+    let toastStates = [
+        "cancelled", "empty", "no_mic", "mic_unavailable", "mic_no_stream",
+        "mic_permission", "mic_disconnected", "audio_recovered", "paste_failed", "error",
+    ]
+
+    for spec in scaleSpecs {
+        for zh in [false, true] {
+            let langTag = zh ? "zh" : "en"
+            let recTexts = zh ? zhRecTexts : enRecTexts
+            for (rIdx, recTxt) in recTexts.enumerated() {
+                let dur = (rIdx == 0) ? 0 : ((rIdx == 1) ? 59 : ((rIdx == 2) ? 65 : 605))
+                for bg in [0, 1, 2] {
+                    try renderAndVerifyWave(
+                        label: "mac_rec_\(langTag)_s\(Int(spec.scale))_k\(rIdx)_bg\(bg)",
+                        text: recTxt,
+                        elapsedSec: dur,
+                        maxDurSec: 0,
+                        warnRemSec: 0,
+                        bgCount: bg,
+                        zh: zh,
+                        visibleW: spec.width,
+                        scale: spec.scale
+                    )
+                    cases += 1
+                }
+            }
+            try renderAndVerifyWave(
+                label: "mac_warn12_\(langTag)_s\(Int(spec.scale))",
+                text: recTexts[0],
+                elapsedSec: 48,
+                maxDurSec: 60,
+                warnRemSec: 15,
+                bgCount: 0,
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale
+            )
+            cases += 1
+            try renderAndVerifyWave(
+                label: "mac_warn5_bg2_\(langTag)_s\(Int(spec.scale))",
+                text: recTexts[2],
+                elapsedSec: 55,
+                maxDurSec: 60,
+                warnRemSec: 15,
+                bgCount: 2,
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale
+            )
+            cases += 1
+
+            for st in mainStates {
+                try renderAndVerifyStatus(
+                    label: "mac_main_\(st)_\(langTag)_s\(Int(spec.scale))",
+                    state: st,
+                    customText: "",
+                    explicitLayer: "main",
+                    zh: zh,
+                    visibleW: spec.width,
+                    scale: spec.scale
+                )
+                cases += 1
+            }
+            try renderAndVerifyStatus(
+                label: "mac_main_cancelling_\(langTag)_s\(Int(spec.scale))",
+                state: "processing",
+                customText: zh ? "○ 正在取消…" : "○ Cancelling…",
+                explicitLayer: "main",
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale
+            )
+            cases += 1
+
+            for tst in toastStates {
+                try renderAndVerifyStatus(
+                    label: "mac_toast_\(tst)_\(langTag)_s\(Int(spec.scale))",
+                    state: tst,
+                    customText: "",
+                    explicitLayer: "toast",
+                    zh: zh,
+                    visibleW: spec.width,
+                    scale: spec.scale
+                )
+                cases += 1
+            }
+            try renderAndVerifyStatus(
+                label: "mac_toast_copied_\(langTag)_s\(Int(spec.scale))",
+                state: "copied",
+                customText: "",
+                explicitLayer: "toast",
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale
+            )
+            cases += 1
+        }
+    }
+
+    // Verify single-slot toast replacement & clearMain/clearToast invariants through production HudPillController.update(...)
+    let ctrl = HudPillController(hotkeyLabel: "右 Ctrl", hotkeyLabelEn: "Right Ctrl", isPtt: false, headless: true)
+    defer { ctrl.close() }
+    ctrl.update(state: "recording", customText: "", durationMs: 0, bgCount: 2)
+    try assertLayout(ctrl.debugMainVisible && ctrl.debugMainBgCount == 2 && !ctrl.debugToastVisible && ctrl.debugToastSlotCount == 0, "slot init recording bg=2")
+    for (idx, (tst, expMs)) in [("mic_no_stream", 2600), ("copied", 2000), ("cancelled", 1600), ("audio_recovered", 2400)].enumerated() {
+        ctrl.update(state: tst, customText: "", durationMs: 0, layer: "toast", clearMain: false)
+        try assertLayout(
+            ctrl.debugToastSlotCount == 1
+                && ctrl.debugToastVisible
+                && ctrl.debugToastUpdateCount == idx + 1
+                && ctrl.debugToastLastAutoHideMs == expMs
+                && !ctrl.debugToastLastText.isEmpty
+                && ctrl.debugMainVisible,
+            "slot toast in-place replace \(tst)"
+        )
+    }
+    ctrl.update(state: "recording", customText: "", durationMs: 0, clearToast: false, bgCount: 1)
+    try assertLayout(ctrl.debugMainVisible && ctrl.debugMainBgCount == 1 && ctrl.debugToastVisible && ctrl.debugToastSlotCount == 1, "slot recording bg 2->1 keeps toast")
+    ctrl.update(state: "recording", customText: "", durationMs: 0, clearToast: false, bgCount: 0)
+    try assertLayout(ctrl.debugMainVisible && ctrl.debugMainBgCount == 0 && ctrl.debugToastVisible && ctrl.debugToastSlotCount == 1, "slot recording bg 1->0 keeps toast")
+    ctrl.update(state: "cancelled", customText: "", durationMs: 0, layer: "toast", clearMain: true)
+    try assertLayout(!ctrl.debugMainVisible && ctrl.debugMainBgCount == 0 && ctrl.debugToastVisible && ctrl.debugToastSlotCount == 1, "slot clearMain hides main keeps toast")
+    ctrl.update(state: "hide_toast", customText: "", durationMs: 0)
+    try assertLayout(!ctrl.debugMainVisible && !ctrl.debugToastVisible && ctrl.debugToastSlotCount == 1, "slot hide_toast clears toast")
+    ctrl.update(state: "mic_no_stream", customText: "", durationMs: 0, layer: "toast", clearMain: false)
+    try assertLayout(ctrl.debugToastVisible && ctrl.debugToastSlotCount == 1, "slot re-show toast reuses single slot")
+    ctrl.update(state: "recording", customText: "", durationMs: 0, clearToast: nil, bgCount: 0)
+    try assertLayout(ctrl.debugMainVisible && !ctrl.debugToastVisible, "slot fresh recording default clearToast clears toast")
+    ctrl.update(state: "hide_all", customText: "", durationMs: 0)
+    try assertLayout(!ctrl.debugMainVisible && !ctrl.debugToastVisible, "slot hide_all clears both")
+
+    return cases
+}
+
 private func runSelfCheck() -> Int32 {
     func check(_ cond: Bool, _ msg: String) throws {
         if !cond { throw NSError(domain: "SelfCheck", code: 1, userInfo: [NSLocalizedDescriptionKey: msg]) }
@@ -2200,8 +2954,8 @@ private func runSelfCheck() -> Int32 {
             "style copied toast"
         )
 
-        try check(splitHudSegments("● 录音中… (按右 Ctrl 完成)") == HudSegments(icon: "●", main: "录音中…", hint: "(按右 Ctrl 完成)", hasSpaceBeforeHint: true), "HUD split recording zh")
-        try check(stripOuterParens("(按右 Ctrl 完成)") == "按右 Ctrl 完成" && stripOuterParens("12s 后自动完成") == "12s 后自动完成" && stripOuterParens("") == "", "HUD strip outer parens")
+        try check(splitHudSegments("● 录音中… (按右 Ctrl 结束)") == HudSegments(icon: "●", main: "录音中…", hint: "(按右 Ctrl 结束)", hasSpaceBeforeHint: true), "HUD split recording zh")
+        try check(stripOuterParens("(按右 Ctrl 结束)") == "按右 Ctrl 结束" && stripOuterParens("12s 后自动完成") == "12s 后自动完成" && stripOuterParens("") == "", "HUD strip outer parens")
         try check(splitHudSegments("✓ 已复制(窗口已切换)") == HudSegments(icon: "✓", main: "已复制", hint: "(窗口已切换)", hasSpaceBeforeHint: false), "HUD split copied zh")
         try check(splitHudSegments("Custom HUD") == HudSegments(icon: "", main: "Custom HUD", hint: "", hasSpaceBeforeHint: false), "HUD split custom")
         try check(formatRecordingDuration(-5) == "0s" && formatRecordingDuration(0) == "0s" && formatRecordingDuration(9) == "9s" && formatRecordingDuration(59) == "59s", "HUD duration seconds")
@@ -2344,6 +3098,8 @@ private func runSelfCheck() -> Int32 {
             try check(!pbg.restorePending && testPb.data(forType: .tiff) == sampleTiff, "pb TIFF-only fallback restored")
         }
 
+        let hudLayoutCases = try runHudLayoutSelfCheck()
+
         #if arch(arm64)
         let archName = "arm64"
         #elseif arch(x86_64)
@@ -2351,7 +3107,7 @@ private func runSelfCheck() -> Int32 {
         #else
         let archName = "unknown"
         #endif
-        writeJsonLine(["ok": true, "mode": "self-check", "arch": archName, "rcontrol_vk": String(format: "0x%02X", rctrl.primaryKeyCode), "rcontrol_mask": String(format: "0x%04X", rctrl.deviceMask), "ui_culture": hostUiCulture(), "ax_trusted": AXIsProcessTrusted(), "listen_event_access": CGPreflightListenEventAccess(), "audio_status": audioSt])
+        writeJsonLine(["ok": true, "mode": "self-check", "arch": archName, "rcontrol_vk": String(format: "0x%02X", rctrl.primaryKeyCode), "rcontrol_mask": String(format: "0x%04X", rctrl.deviceMask), "ui_culture": hostUiCulture(), "ax_trusted": AXIsProcessTrusted(), "listen_event_access": CGPreflightListenEventAccess(), "hud_layout_cases": hudLayoutCases, "audio_status": audioSt])
         return 0
     } catch {
         fputs("self-check error: \(error.localizedDescription)\n", stderr)
@@ -2656,6 +3412,7 @@ struct MacShimMain {
                         let dms = (obj["duration_ms"] as? Int) ?? ((obj["duration_ms"] as? NSNumber)?.intValue ?? 0)
                         let maxDur = (obj["max_duration_sec"] as? Int) ?? ((obj["max_duration_sec"] as? NSNumber)?.intValue ?? 0)
                         let warnRem = (obj["warn_remain_sec"] as? Int) ?? ((obj["warn_remain_sec"] as? NSNumber)?.intValue ?? 0)
+                        let bgCount = (obj["bg_count"] as? Int) ?? ((obj["bg_count"] as? NSNumber)?.intValue ?? 0)
                         let pos = (obj["position"] as? String) ?? "bottom"
                         let layer = (obj["layer"] as? String) ?? ""
                         let clearMain = parseOptionalBool(obj["clear_main"])
@@ -2669,7 +3426,8 @@ struct MacShimMain {
                             warnRemainSec: warnRem,
                             layer: layer,
                             clearMain: clearMain,
-                            clearToast: clearToast
+                            clearToast: clearToast,
+                            bgCount: bgCount
                         )
                         writeJsonLine(["type": "reply", "reply": "hud", "seq_id": seqId, "ok": true])
                     case "hud_level":

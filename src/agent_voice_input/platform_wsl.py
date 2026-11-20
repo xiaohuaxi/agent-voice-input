@@ -73,6 +73,7 @@ def run_win_shim_self_check(
     mode: str = "self-check",
     *,
     env: Mapping[str, str] | None = None,
+    cache_dir: Path | str | None = None,
     timeout: float = 15.0,
 ) -> tuple[bool, dict[str, Any], str]:
     """Run ``win_shim.ps1 -Mode self-check`` (or ``clip-self-check``) headlessly with closed stdin."""
@@ -81,19 +82,28 @@ def run_win_shim_self_check(
     if not os.path.isfile(POWERSHELL_EXE):
         return False, {}, f"PowerShell not found at {POWERSHELL_EXE}"
     try:
+        cmd = [
+            POWERSHELL_EXE,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Sta",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            to_windows_path(SHIM_SCRIPT),
+            "-Mode",
+            mode,
+        ]
+        if cache_dir is not None and str(cache_dir).strip():
+            raw_cache = str(cache_dir).strip()
+            win_cache = (
+                raw_cache
+                if ((len(raw_cache) >= 2 and raw_cache[1] == ":") or raw_cache.startswith("\\\\"))
+                else to_windows_path(raw_cache)
+            )
+            cmd.extend(["-CacheDir", win_cache])
         p = subprocess.run(
-            [
-                POWERSHELL_EXE,
-                "-NoProfile",
-                "-NonInteractive",
-                "-Sta",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                to_windows_path(SHIM_SCRIPT),
-                "-Mode",
-                mode,
-            ],
+            cmd,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,

@@ -196,10 +196,16 @@ def format_hud_text(
         hk = format_hotkey_label(hotkey, "zh" if zh else "en")
         if zh:
             sep = " " if (hk and ord(hk[0]) <= 0x7F) else ""
-            return f"● 录音中… ({'松开' if is_ptt else '按'}{sep}{hk} 完成)"
-        return f"● Listening… ({'release' if is_ptt else 'press'} {hk} to finish)"
+            return f"● 录音中… ({'松开' if is_ptt else '按'}{sep}{hk} 结束)"
+        return f"● Listening… ({'release' if is_ptt else 'press'} {hk} to end)"
     pair = _STATIC_HUD_COPY.get(st, ("✕ 识别失败", "✕ Transcription failed"))
     return pair[0] if zh else pair[1]
+
+
+def format_bg_count_badge(bg_count: int) -> str:
+    """Return compact background in-flight count badge (e.g. '+1', '+2') or '' when zero."""
+    n = int(bg_count)
+    return f"+{n}" if n > 0 else ""
 
 
 def format_recording_duration(elapsed_sec: int | float) -> str:
@@ -255,6 +261,7 @@ __all__ = [
     "VALID_UI_LANGUAGES",
     "VALID_UI_POSITIONS",
     "default_hud_duration_ms",
+    "format_bg_count_badge",
     "format_countdown_hint",
     "format_hotkey_label",
     "format_hud_text",

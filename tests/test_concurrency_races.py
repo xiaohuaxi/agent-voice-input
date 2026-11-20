@@ -246,6 +246,7 @@ class _TorturePlatform:
         layer: str | None = None,
         clear_main: bool | None = None,
         clear_toast: bool | None = None,
+        bg_count: int = 0,
     ) -> None:
         self.hud_events.append(
             (
@@ -256,6 +257,7 @@ class _TorturePlatform:
                     "layer": layer,
                     "clear_main": clear_main,
                     "clear_toast": clear_toast,
+                    "bg_count": bg_count,
                 },
             )
         )

@@ -1,7 +1,8 @@
 param(
     [string]$Mode = "bridge", [string]$Hotkey = "RControl", [string]$TriggerMode = "tap_toggle",
     [int]$TapMaxMs = 1200, [int]$DebounceMs = 180, [int]$Seconds = 10, [int]$Beep = 0,
-    [Alias("AllowedTerminals")][string]$AllowedTerminalsCsv = ""
+    [Alias("AllowedTerminals")][string]$AllowedTerminalsCsv = "",
+    [string]$CacheDir = ""
 )
 $ErrorActionPreference = "Stop"
 [Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -68,6 +69,15 @@ internal interface IAudioCaptureClient {
     [PreserveSig] int GetNextPacketSize(out uint pNumFramesInNextPacket);
 }
 
+public struct HudLayoutMetrics {
+    public int Width, Height, MaxWidth, PadL, PadR, Dpi;
+    public bool IsToast, IsWaveRecording, Truncated, IsCountdownWarning;
+    public int BgCount;
+    public Rectangle DurRect, WaveRect, HintRect, BadgeRect, IconRect, MainTextRect;
+    public int DurMeasuredW, DurSlotW, HintMeasuredW, HintSlotW, BadgeMeasuredW, BadgeSlotW, MainMeasuredW, HintSegMeasuredW;
+    public string DurationText, HintText, BadgeText, MainText;
+}
+
 public sealed class HudPillForm : Form {
     [StructLayout(LayoutKind.Sequential)] private struct WinPoint { public int x, y; public WinPoint(int x, int y) { this.x = x; this.y = y; } }
     [StructLayout(LayoutKind.Sequential)] private struct WinSize { public int cx, cy; public WinSize(int cx, int cy) { this.cx = cx; this.cy = cy; } }
@@ -98,10 +108,13 @@ public sealed class HudPillForm : Form {
     private static readonly Color WarnWaveQuietColor = Color.FromArgb(220, 251, 191, 36);
     private static readonly Color WarnMainColor = Color.FromArgb(254, 252, 232);
     private static readonly Color WarnHintColor = Color.FromArgb(255, 251, 191, 36);
+    private static readonly Color BadgeBgColor = Color.FromArgb(64, 56, 189, 248);
+    private static readonly Color BadgeBorderColor = Color.FromArgb(148, 56, 189, 248);
+    private static readonly Color BadgeTextColor = Color.FromArgb(255, 186, 230, 253);
     private static readonly float[] BellWeight = new float[] { 1.00f, 0.92f, 0.78f, 0.58f, 0.40f };
     private readonly bool _isToast;
-    private Font _font;
-    private bool _ownsFont, _cjkFont;
+    private Font _font, _badgeFont;
+    private bool _ownsFont, _ownsBadgeFont, _cjkFont;
     private int _dpi = 96;
     private readonly System.Windows.Forms.Timer _hideTimer = new System.Windows.Forms.Timer();
     private readonly System.Windows.Forms.Timer _animTimer = new System.Windows.Forms.Timer();
@@ -110,16 +123,22 @@ public sealed class HudPillForm : Form {
     private float _smoothLevel = 0f;
     private int _frameIdx = 0;
     private long _recStartTick = 0L, _elapsedOverrideSec = -1L;
-    private int _maxDurationSec = 0, _warnRemainSec = 0;
+    private int _maxDurationSec = 0, _warnRemainSec = 0, _bgCount = 0;
     private bool _isWaveRecording = false, _shown = false;
     private string _text = "", _position = "bottom", _iconKind = "";
     private Color _bgColor = DefaultBgColor, _iconColor = Color.White, _mainColor = Color.White, _hintColor = RecHintColor, _borderColor = Color.Gray;
     private IntPtr _fgHwnd = IntPtr.Zero;
     private Rectangle _anchoredWorkArea = Rectangle.Empty;
     private int _lastX = int.MinValue, _lastY = int.MinValue, _lastW = 0, _lastH = 0;
+    private int _lastAutoHideMs = 0;
+    private int _showUpdates = 0;
 
     public bool IsToast { get { return _isToast; } }
     public bool IsShown { get { return _shown; } }
+    public string CurrentText { get { return _text; } }
+    public int CurrentBgCount { get { return _bgCount; } }
+    public int LastAutoHideMs { get { return _lastAutoHideMs; } }
+    public int ShowUpdateCount { get { return _showUpdates; } }
     public Rectangle AnchoredWorkArea { get { return _anchoredWorkArea; } }
     public int AnchoredDpi { get { return _dpi; } }
     public bool IsWaveAnimating { get { return _isWaveRecording && _animTimer.Enabled; } }
@@ -127,6 +146,7 @@ public sealed class HudPillForm : Form {
     public int LastY { get { return _lastY; } }
     public int LastWidth { get { return _lastW; } }
     public int LastHeight { get { return _lastH; } }
+    public bool IsWaveRecording { get { return _isWaveRecording; } }
     public bool IsCountdownWarning {
         get {
             if (!_isWaveRecording || _maxDurationSec <= 0 || _warnRemainSec <= 0) return false;
@@ -196,6 +216,35 @@ public sealed class HudPillForm : Form {
         }
         try { owns = true; return new Font(FontFamily.GenericSansSerif, pxSize, FontStyle.Regular, GraphicsUnit.Pixel); }
         catch { owns = false; return SystemFonts.DefaultFont; }
+    }
+
+    private static Font CreateBadgeFont(int dpi, out bool owns) {
+        float pxSize = Math.Max(10f, (float)Math.Round(11.0f * dpi / 96.0f));
+        string[] fams = new string[] { "Segoe UI", "Microsoft YaHei UI" };
+        foreach (string n in fams) {
+            try {
+                using (FontFamily ff = new FontFamily(n)) {
+                    FontStyle st = ff.IsStyleAvailable(FontStyle.Bold) ? FontStyle.Bold : FontStyle.Regular;
+                    owns = true;
+                    return new Font(ff, pxSize, st, GraphicsUnit.Pixel);
+                }
+            } catch { }
+        }
+        try { owns = true; return new Font(FontFamily.GenericSansSerif, pxSize, FontStyle.Bold, GraphicsUnit.Pixel); }
+        catch { owns = false; return SystemFonts.DefaultFont; }
+    }
+
+    private void EnsureFontsFor(bool wantCjk, int dpi) {
+        bool dpiChanged = (dpi != _dpi);
+        if (_font == null || wantCjk != _cjkFont || dpiChanged) {
+            if (_ownsFont && _font != null) _font.Dispose();
+            _cjkFont = wantCjk; _dpi = dpi;
+            _font = CreateHudFont(_cjkFont, _dpi, _isToast, out _ownsFont);
+        }
+        if (_badgeFont == null || dpiChanged) {
+            if (_ownsBadgeFont && _badgeFont != null) _badgeFont.Dispose();
+            _badgeFont = CreateBadgeFont(_dpi, out _ownsBadgeFont);
+        }
     }
 
     private static GraphicsPath BuildCapsulePath(float x, float y, float rw, float rh) {
@@ -318,6 +367,7 @@ public sealed class HudPillForm : Form {
         _cjkFont = VoiceWinShim.GetHostUiCulture().StartsWith("zh", StringComparison.OrdinalIgnoreCase);
         _dpi = VoiceWinShim.GetTargetDpi(IntPtr.Zero);
         _font = CreateHudFont(_cjkFont, _dpi, _isToast, out _ownsFont);
+        _badgeFont = CreateBadgeFont(_dpi, out _ownsBadgeFont);
         AutoScaleMode = AutoScaleMode.None;
         FormBorderStyle = FormBorderStyle.None; StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false; BackColor = DefaultBgColor;
@@ -339,23 +389,21 @@ public sealed class HudPillForm : Form {
     }
     public void HideNoActivate() {
         _hideTimer.Stop(); _animTimer.Stop(); _isWaveRecording = false; _shown = false;
-        _maxDurationSec = 0; _warnRemainSec = 0;
+        _maxDurationSec = 0; _warnRemainSec = 0; _bgCount = 0;
         if (IsHandleCreated) ShowWindow(Handle, 0);
     }
-    public void ShowStatus(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int autoHideMs, IntPtr fgHwnd, string position, bool waveMode = false, string iconKind = "", int maxDurationSec = 0, int warnRemainSec = 0, Rectangle? workAreaOverride = null, int dpiOverride = 0) {
+    public void ShowStatus(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int autoHideMs, IntPtr fgHwnd, string position, bool waveMode = false, string iconKind = "", int maxDurationSec = 0, int warnRemainSec = 0, Rectangle? workAreaOverride = null, int dpiOverride = 0, int bgCount = 0, bool headlessNoShow = false) {
         _hideTimer.Stop();
         _text = text ?? ""; _bgColor = bgColor; _iconColor = iconColor; _mainColor = mainColor; _hintColor = hintColor; _borderColor = border;
         _iconKind = iconKind ?? ""; _fgHwnd = fgHwnd; _position = position ?? "bottom";
+        _bgCount = (waveMode && !_isToast && bgCount > 0) ? bgCount : 0;
+        _lastAutoHideMs = (autoHideMs > 0) ? autoHideMs : 0;
+        _showUpdates++;
         int dpi = (dpiOverride > 0) ? dpiOverride : VoiceWinShim.GetTargetDpi(fgHwnd);
         _anchoredWorkArea = (workAreaOverride.HasValue && workAreaOverride.Value.Width > 0 && workAreaOverride.Value.Height > 0)
             ? workAreaOverride.Value
             : VoiceWinShim.GetTargetWorkArea(fgHwnd);
-        bool wantCjk = HasCjk(_text);
-        if (_font == null || wantCjk != _cjkFont || dpi != _dpi) {
-            if (_ownsFont && _font != null) _font.Dispose();
-            _cjkFont = wantCjk; _dpi = dpi;
-            _font = CreateHudFont(_cjkFont, _dpi, _isToast, out _ownsFont);
-        }
+        EnsureFontsFor(HasCjk(_text), dpi);
         if (waveMode && !_isToast) {
             _maxDurationSec = (maxDurationSec > 0) ? maxDurationSec : 0;
             _warnRemainSec = (_maxDurationSec > 0) ? ((warnRemainSec > 0) ? warnRemainSec : VoiceWinShim.RecordingCountdownWarnSec(_maxDurationSec)) : 0;
@@ -366,34 +414,53 @@ public sealed class HudPillForm : Form {
                 float initLvl = VoiceWinShim.GetLiveAudioLevel();
                 if (initLvl > 0f) StepWaveEnvelope(initLvl);
             }
-            RenderPill(true);
-            if (!_animTimer.Enabled) _animTimer.Start();
+            if (headlessNoShow) {
+                int dx, dy; HudLayoutMetrics dm;
+                using (Bitmap tmp = BuildPillPArgbBitmap(_anchoredWorkArea, out dx, out dy, out dm)) { _shown = true; }
+            } else {
+                RenderPill(true);
+                if (!_animTimer.Enabled) _animTimer.Start();
+            }
         } else {
             _animTimer.Stop();
             _isWaveRecording = false;
             _maxDurationSec = 0; _warnRemainSec = 0;
-            RenderPill(true);
+            if (headlessNoShow) {
+                int dx, dy; HudLayoutMetrics dm;
+                using (Bitmap tmp = BuildPillPArgbBitmap(_anchoredWorkArea, out dx, out dy, out dm)) { _shown = true; }
+            } else {
+                RenderPill(true);
+            }
         }
-        if (autoHideMs > 0) { _hideTimer.Interval = autoHideMs; _hideTimer.Start(); }
+        if (!headlessNoShow && autoHideMs > 0) { _hideTimer.Interval = autoHideMs; _hideTimer.Start(); }
     }
 
-    public void SyncAnchor(Rectangle workArea, int dpi, string position) {
+    public void SyncAnchor(Rectangle workArea, int dpi, string position, bool headlessNoShow = false) {
         if (!_shown || IsDisposed || workArea.Width <= 0 || workArea.Height <= 0) return;
         _anchoredWorkArea = workArea;
         if (!string.IsNullOrEmpty(position)) _position = position;
         if (dpi > 0 && dpi != _dpi) {
-            if (_ownsFont && _font != null) _font.Dispose();
-            _dpi = dpi;
-            _font = CreateHudFont(_cjkFont, _dpi, _isToast, out _ownsFont);
+            EnsureFontsFor(_cjkFont, dpi);
         }
-        RenderPill(false);
+        if (headlessNoShow) {
+            int dx, dy; HudLayoutMetrics dm;
+            using (Bitmap tmp = BuildPillPArgbBitmap(_anchoredWorkArea, out dx, out dy, out dm)) { }
+        } else {
+            RenderPill(false);
+        }
     }
 
-    public Bitmap RenderOffscreenBitmap(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int dpi, Rectangle workArea, bool waveMode, string iconKind, float[] barNormsOverride, long elapsedSec, int maxDurationSec, int warnRemainSec, string position = "bottom") {
+    public Bitmap RenderOffscreenBitmap(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int dpi, Rectangle workArea, bool waveMode, string iconKind, float[] barNormsOverride, long elapsedSec, int maxDurationSec, int warnRemainSec, string position = "bottom", int bgCount = 0) {
+        HudLayoutMetrics unused;
+        return RenderOffscreenBitmapWithMetrics(text, bgColor, iconColor, mainColor, hintColor, border, dpi, workArea, waveMode, iconKind, barNormsOverride, elapsedSec, maxDurationSec, warnRemainSec, out unused, position, bgCount);
+    }
+
+    public Bitmap RenderOffscreenBitmapWithMetrics(string text, Color bgColor, Color iconColor, Color mainColor, Color hintColor, Color border, int dpi, Rectangle workArea, bool waveMode, string iconKind, float[] barNormsOverride, long elapsedSec, int maxDurationSec, int warnRemainSec, out HudLayoutMetrics layout, string position = "bottom", int bgCount = 0) {
         _text = text ?? ""; _bgColor = bgColor; _iconColor = iconColor; _mainColor = mainColor; _hintColor = hintColor; _borderColor = border;
         _iconKind = iconKind ?? ""; _position = position ?? "bottom"; _isWaveRecording = waveMode && !_isToast;
         _maxDurationSec = (_isWaveRecording && maxDurationSec > 0) ? maxDurationSec : 0;
         _warnRemainSec = (_maxDurationSec > 0) ? ((warnRemainSec > 0) ? warnRemainSec : VoiceWinShim.RecordingCountdownWarnSec(_maxDurationSec)) : 0;
+        _bgCount = (_isWaveRecording && bgCount > 0) ? bgCount : 0;
         _elapsedOverrideSec = elapsedSec;
         Array.Clear(_barNorms, 0, _barNorms.Length);
         if (barNormsOverride != null) {
@@ -401,37 +468,34 @@ public sealed class HudPillForm : Form {
             for (int i = 0; i < n; i++) _barNorms[i] = barNormsOverride[i];
         }
         int clampedDpi = (dpi < 96) ? 96 : ((dpi > 480) ? 480 : dpi);
-        bool wantCjk = HasCjk(_text);
-        if (_font == null || wantCjk != _cjkFont || clampedDpi != _dpi) {
-            if (_ownsFont && _font != null) _font.Dispose();
-            _cjkFont = wantCjk; _dpi = clampedDpi;
-            _font = CreateHudFont(_cjkFont, _dpi, _isToast, out _ownsFont);
-        }
+        EnsureFontsFor(HasCjk(_text), clampedDpi);
         int dummyX, dummyY;
-        return BuildPillPArgbBitmap(workArea, out dummyX, out dummyY);
+        return BuildPillPArgbBitmap(workArea, out dummyX, out dummyY, out layout);
     }
 
-    private Bitmap BuildPillPArgbBitmap(Rectangle wa, out int x, out int y) {
+    private Bitmap BuildPillPArgbBitmap(Rectangle wa, out int x, out int y, out HudLayoutMetrics layout) {
         string iconSeg, mainSeg, hintSeg; bool spBeforeHint;
         VoiceWinShim.SplitHudSegments(_text, out iconSeg, out mainSeg, out hintSeg, out spBeforeHint);
         int padL = _isToast ? ScalePx(12) : ScalePx(15);
         int padR = _isToast ? ScalePx(12) : ScalePx(15);
         int minW = _isToast ? ScalePx(56) : ScalePx(64);
-        int maxW = Math.Max(minW, wa.Width - ScalePx(24));
+        int maxW = Math.Max(minW, Math.Min(ScalePx(680), wa.Width - ScalePx(24)));
 
         float dpiScale = _dpi / 96.0f;
         int textDy = _cjkFont ? -Math.Max(1, (int)Math.Round(0.5f * dpiScale)) : -ScalePx(1);
         float barW = 2.5f * dpiScale, barGap = 2.5f * dpiScale;
         int waveBoxW = (int)Math.Ceiling(9.0f * barW + 8.0f * barGap);
-        string durStr = "", effHint = hintSeg;
-        int slotW = 0, hintSlotW = 0, iconBox = 0, gap1 = 0, gap2 = 0, iconGap = 0, hintGap = 0, totalTextW = 0, textH = 0;
-        Size mainSz = Size.Empty, hintSz = Size.Empty;
+        string durStr = "", effHint = hintSeg, badgeStr = "";
+        int slotW = 0, hintSlotW = 0, badgeSlotW = 0, badgeH = 0, iconBox = 0;
+        int gap1 = 0, gap2 = 0, badgeGap = 0, iconGap = 0, hintGap = 0, totalTextW = 0, textH = 0;
+        int durMeasuredW = 0, hintMeasuredW = 0, badgeMeasuredW = 0;
+        bool isWarn = false;
+        Size mainSz = Size.Empty, hintSz = Size.Empty, badgeTextSz = Size.Empty;
         Color effBg = _bgColor, effBorder = _borderColor, effMain = _mainColor, effHintCol = _hintColor;
         Color effWaveActive = RecWaveActiveColor, effWaveQuiet = RecWaveQuietColor;
 
         if (_isWaveRecording) {
             long elapsedSec = GetEffectiveElapsedSec();
-            bool isWarn = false;
             long remainSec = 0L;
             if (_maxDurationSec > 0 && _warnRemainSec > 0) {
                 remainSec = Math.Max(0L, (long)_maxDurationSec - elapsedSec);
@@ -459,9 +523,11 @@ public sealed class HudPillForm : Form {
             string slotTpl = VoiceWinShim.DurationSlotTemplate(elapsedSec);
             Size actDurSz = TextRenderer.MeasureText(durStr, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
             Size tplDurSz = TextRenderer.MeasureText(slotTpl, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
+            durMeasuredW = actDurSz.Width;
             slotW = Math.Max(actDurSz.Width, tplDurSz.Width);
             if (effHint.Length > 0) {
                 hintSz = TextRenderer.MeasureText(effHint, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
+                hintMeasuredW = hintSz.Width;
                 if (isWarn) {
                     string hintTpl = VoiceWinShim.StripOuterParens(VoiceWinShim.CountdownHintSlotTemplate((int)remainSec, zhHint));
                     Size tplHintSz = TextRenderer.MeasureText(hintTpl, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
@@ -470,10 +536,20 @@ public sealed class HudPillForm : Form {
                     hintSlotW = hintSz.Width;
                 }
             }
+            if (_bgCount > 0) {
+                badgeStr = "+" + _bgCount.ToString(CultureInfo.InvariantCulture);
+                Font bf = _badgeFont ?? _font;
+                badgeTextSz = TextRenderer.MeasureText(badgeStr, bf, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
+                badgeMeasuredW = badgeTextSz.Width;
+                int badgePadX = ScalePx(5);
+                badgeSlotW = Math.Max(ScalePx(20), badgeTextSz.Width + badgePadX * 2);
+                badgeH = Math.Max(ScalePx(18), badgeTextSz.Height + ScalePx(4));
+            }
             gap1 = ScalePx(9);
             gap2 = (effHint.Length > 0) ? ScalePx(9) : 0;
-            totalTextW = slotW + gap1 + waveBoxW + gap2 + hintSlotW;
-            textH = Math.Max(actDurSz.Height, hintSz.Height);
+            badgeGap = (badgeSlotW > 0) ? ScalePx((effHint.Length > 0) ? 7 : 9) : 0;
+            totalTextW = slotW + gap1 + waveBoxW + gap2 + hintSlotW + badgeGap + badgeSlotW;
+            textH = Math.Max(Math.Max(actDurSz.Height, hintSz.Height), badgeH);
         } else {
             iconBox = (iconSeg.Length > 0 || (_isToast && !string.IsNullOrEmpty(_iconKind))) ? ScalePx(11) : 0;
             mainSz = (mainSeg.Length > 0) ? TextRenderer.MeasureText(mainSeg, _font, new Size(int.MaxValue, int.MaxValue), MeasureFlags) : Size.Empty;
@@ -500,6 +576,17 @@ public sealed class HudPillForm : Form {
             y = isTop ? (wa.Top + ScalePx(36)) : Math.Max(wa.Top + ScalePx(4), wa.Bottom - h - ScalePx(8));
         }
 
+        layout = new HudLayoutMetrics {
+            Width = w, Height = h, MaxWidth = maxW, PadL = padL, PadR = padR, Dpi = _dpi,
+            IsToast = _isToast, IsWaveRecording = _isWaveRecording, Truncated = truncated, IsCountdownWarning = isWarn,
+            BgCount = _bgCount,
+            DurMeasuredW = durMeasuredW, DurSlotW = slotW,
+            HintMeasuredW = hintMeasuredW, HintSlotW = hintSlotW,
+            BadgeMeasuredW = badgeMeasuredW, BadgeSlotW = badgeSlotW,
+            MainMeasuredW = mainSz.Width, HintSegMeasuredW = _isWaveRecording ? 0 : hintSz.Width,
+            DurationText = durStr, HintText = effHint, BadgeText = badgeStr, MainText = mainSeg
+        };
+
         Bitmap outBmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
         using (Bitmap rgbBmp = new Bitmap(w, h, PixelFormat.Format32bppRgb))
         using (Bitmap maskBmp = new Bitmap(w, h, PixelFormat.Format32bppArgb)) {
@@ -509,8 +596,10 @@ public sealed class HudPillForm : Form {
                 int bleed = ScalePx(2);
                 if (_isWaveRecording) {
                     int curX = padL + (truncated ? 0 : Math.Max(0, (availW - totalTextW) / 2));
+                    layout.DurRect = new Rectangle(curX, 0, slotW, h);
                     TextRenderer.DrawText(g, durStr, _font, new Rectangle(curX - bleed, textDy, slotW + bleed * 2, h), effMain, DurDrawFlags);
                     curX += slotW + gap1;
+                    layout.WaveRect = new Rectangle(curX, 0, waveBoxW, h);
                     g.SmoothingMode = SmoothingMode.AntiAlias;
                     g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                     float maxBarH = Math.Min(h - 8.0f * dpiScale, 15.0f * dpiScale);
@@ -528,39 +617,77 @@ public sealed class HudPillForm : Form {
                         }
                     }
                     curX += waveBoxW + gap2;
+                    int reservedBadgeW = (badgeSlotW > 0) ? (badgeGap + badgeSlotW) : 0;
                     if (effHint.Length > 0) {
-                        int remW = w - padR - curX;
-                        if (remW > 0) {
+                        int remW = Math.Max(0, w - padR - reservedBadgeW - curX);
+                        int drawHintW = truncated ? remW : hintSlotW;
+                        if (drawHintW > 0) {
+                            layout.HintRect = new Rectangle(curX, 0, drawHintW, h);
                             if (truncated) {
-                                TextRenderer.DrawText(g, effHint, _font, new Rectangle(curX, textDy, remW, h), effHintCol, SegDrawFlags | TextFormatFlags.EndEllipsis);
+                                TextRenderer.DrawText(g, effHint, _font, new Rectangle(curX, textDy, drawHintW, h), effHintCol, SegDrawFlags | TextFormatFlags.EndEllipsis);
                             } else {
                                 TextRenderer.DrawText(g, effHint, _font, new Rectangle(curX, textDy, hintSlotW + bleed, h), effHintCol, SegDrawFlags);
                             }
+                            curX += drawHintW;
+                        }
+                    }
+                    if (badgeSlotW > 0) {
+                        curX += badgeGap;
+                        if (curX + badgeSlotW <= w - padR + 1) {
+                            int bH = Math.Min(h - ScalePx(6), Math.Max(ScalePx(16), badgeH));
+                            int bY = (h - bH) / 2;
+                            Rectangle bRc = new Rectangle(curX, bY, badgeSlotW, bH);
+                            layout.BadgeRect = bRc;
+                            g.SmoothingMode = SmoothingMode.AntiAlias;
+                            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                            using (GraphicsPath bPath = BuildCapsulePath(bRc.X + 0.5f, bRc.Y + 0.5f, Math.Max(2f, bRc.Width - 1.0f), Math.Max(2f, bRc.Height - 1.0f)))
+                            using (SolidBrush bFill = new SolidBrush(BadgeBgColor))
+                            using (Pen bPen = new Pen(BadgeBorderColor, Math.Max(1.0f, 0.9f * dpiScale))) {
+                                g.FillPath(bFill, bPath);
+                                g.DrawPath(bPen, bPath);
+                            }
+                            Font bf = _badgeFont ?? _font;
+                            int badgeDy = -Math.Max(1, (int)Math.Round(0.5f * dpiScale));
+                            TextRenderer.DrawText(g, badgeStr, bf, new Rectangle(bRc.X - 1, bRc.Y + badgeDy, bRc.Width + 2, bRc.Height), BadgeTextColor, DurDrawFlags);
                         }
                     }
                 } else if (truncated) {
                     if (iconBox > 0) {
+                        int iy = (int)Math.Round((h - iconBox) * 0.5f);
+                        layout.IconRect = new Rectangle(padL, iy, iconBox, iconBox);
                         DrawStatusIcon(g, ResolveIconKind(_iconKind, iconSeg), _iconColor, (float)padL, (h - iconBox) * 0.5f, (float)iconBox, dpiScale);
                         int tx = padL + iconBox + iconGap;
                         string restTxt = mainSeg + ((hintSeg.Length > 0) ? ((spBeforeHint ? " " : "") + hintSeg) : "");
-                        if (w - padR - tx > 0 && restTxt.Length > 0) {
-                            TextRenderer.DrawText(g, restTxt, _font, new Rectangle(tx, textDy, w - padR - tx, h), effMain, SegDrawFlags | TextFormatFlags.EndEllipsis);
+                        int remTxtW = w - padR - tx;
+                        if (remTxtW > 0 && restTxt.Length > 0) {
+                            layout.MainTextRect = new Rectangle(tx, 0, remTxtW, h);
+                            TextRenderer.DrawText(g, restTxt, _font, new Rectangle(tx, textDy, remTxtW, h), effMain, SegDrawFlags | TextFormatFlags.EndEllipsis);
                         }
                     } else {
+                        layout.MainTextRect = new Rectangle(padL, 0, availW, h);
                         TextRenderer.DrawText(g, _text, _font, new Rectangle(padL, textDy, availW, h), effMain, TruncDrawFlags);
                     }
                 } else {
                     int curX = padL + Math.Max(0, (availW - totalTextW) / 2);
                     if (iconBox > 0) {
+                        int iy = (int)Math.Round((h - iconBox) * 0.5f);
+                        layout.IconRect = new Rectangle(curX, iy, iconBox, iconBox);
                         DrawStatusIcon(g, ResolveIconKind(_iconKind, iconSeg), _iconColor, (float)curX, (h - iconBox) * 0.5f, (float)iconBox, dpiScale);
                         curX += iconBox + iconGap;
                     }
+                    int textStartX = curX;
+                    int textTotalSpan = 0;
                     if (mainSeg.Length > 0) {
                         TextRenderer.DrawText(g, mainSeg, _font, new Rectangle(curX, textDy, mainSz.Width + bleed, h), effMain, SegDrawFlags);
                         curX += mainSz.Width + hintGap;
+                        textTotalSpan += mainSz.Width;
                     }
                     if (hintSeg.Length > 0) {
                         TextRenderer.DrawText(g, hintSeg, _font, new Rectangle(curX, textDy, hintSz.Width + bleed, h), effHintCol, SegDrawFlags);
+                        textTotalSpan += ((mainSeg.Length > 0) ? hintGap : 0) + hintSz.Width;
+                    }
+                    if (textTotalSpan > 0) {
+                        layout.MainTextRect = new Rectangle(textStartX, 0, textTotalSpan, h);
                     }
                 }
                 g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -619,8 +746,9 @@ public sealed class HudPillForm : Form {
             : VoiceWinShim.GetTargetWorkArea(_fgHwnd);
         int prevX = _lastX, prevY = _lastY, prevW = _lastW, prevH = _lastH;
         int x, y;
+        HudLayoutMetrics unusedLayout;
         IntPtr hdl = Handle;
-        using (Bitmap outBmp = BuildPillPArgbBitmap(wa, out x, out y)) {
+        using (Bitmap outBmp = BuildPillPArgbBitmap(wa, out x, out y, out unusedLayout)) {
             int w = outBmp.Width, h = outBmp.Height;
             IntPtr screenDc = IntPtr.Zero, memDc = IntPtr.Zero, hBmp = IntPtr.Zero, oldBmp = IntPtr.Zero;
             try {
@@ -646,7 +774,12 @@ public sealed class HudPillForm : Form {
         }
     }
     protected override void Dispose(bool disposing) {
-        if (disposing) { _hideTimer.Dispose(); _animTimer.Dispose(); if (_ownsFont && _font != null) _font.Dispose(); }
+        if (disposing) {
+            _hideTimer.Dispose();
+            _animTimer.Dispose();
+            if (_ownsFont && _font != null) _font.Dispose();
+            if (_ownsBadgeFont && _badgeFont != null) _badgeFont.Dispose();
+        }
         base.Dispose(disposing);
     }
 }
@@ -720,6 +853,9 @@ public static class VoiceWinShim {
     private static LowLevelKeyboardProc _procRef;
     private static HudPillForm _hud;
     private static HudPillForm _toastHud;
+    private static bool _headlessHudMode = false;
+    private static Rectangle _headlessDefaultWa = Rectangle.Empty;
+    private static int _headlessDefaultDpi = 96;
     private static string _hotkeyLabel = "\u53F3 Ctrl";
     private static readonly Dictionary<string, SoundPlayer> _tones = new Dictionary<string, SoundPlayer>(StringComparer.OrdinalIgnoreCase);
     private static uint _mainTid = 0, _targetVk = 0xA3, _ignoredCompanionVk = 0x11;
@@ -988,8 +1124,8 @@ public static class VoiceWinShim {
         if (st == "recording") {
             string hkEn = (_hotkeyLabel == "\u53F3 Ctrl") ? "Right Ctrl" : _hotkeyLabel.Trim();
             txt = zh
-                ? ("\u25CF \u5F55\u97F3\u4E2D\u2026 (" + (_isPtt ? "\u677E\u5F00" : "\u6309") + _hotkeyLabel + " \u5B8C\u6210)")
-                : ("\u25CF Listening\u2026 (" + (_isPtt ? "release " : "press ") + hkEn + " to finish)");
+                ? ("\u25CF \u5F55\u97F3\u4E2D\u2026 (" + (_isPtt ? "\u677E\u5F00" : "\u6309") + _hotkeyLabel + " \u7ED3\u675F)")
+                : ("\u25CF Listening\u2026 (" + (_isPtt ? "release " : "press ") + hkEn + " to end)");
             bg = Color.FromArgb(64, 18, 26); ic = Color.FromArgb(255, 104, 112); mc = Color.FromArgb(248, 250, 252); hc = Color.FromArgb(230, 188, 178, 192); bd = Color.FromArgb(196, 66, 80);
             string trimmedCustom = (customText ?? "").TrimStart();
             waveMode = !isToast && (string.IsNullOrEmpty(trimmedCustom) || trimmedCustom.StartsWith("\u25CF ", StringComparison.Ordinal));
@@ -1056,16 +1192,21 @@ public static class VoiceWinShim {
         return RenderHudSnapshotBitmap(state, customText, dpi, workWidth, workHeight, null, 0L, 0, 0, true, isToast);
     }
 
-    public static Bitmap RenderHudSnapshotBitmap(string state, string customText, int dpi, int workWidth, int workHeight, float[] barNorms, long elapsedSec = 0L, int maxDurationSec = 0, int warnRemainSec = 0, bool zh = true, bool isToast = false) {
+    public static Bitmap RenderHudSnapshotBitmap(string state, string customText, int dpi, int workWidth, int workHeight, float[] barNorms, long elapsedSec = 0L, int maxDurationSec = 0, int warnRemainSec = 0, bool zh = true, bool isToast = false, int bgCount = 0) {
+        HudLayoutMetrics unused;
+        return RenderHudSnapshotWithMetrics(state, customText, dpi, workWidth, workHeight, barNorms, out unused, elapsedSec, maxDurationSec, warnRemainSec, zh, isToast, bgCount);
+    }
+
+    public static Bitmap RenderHudSnapshotWithMetrics(string state, string customText, int dpi, int workWidth, int workHeight, float[] barNorms, out HudLayoutMetrics layout, long elapsedSec = 0L, int maxDurationSec = 0, int warnRemainSec = 0, bool zh = true, bool isToast = false, int bgCount = 0) {
         string st = (state ?? "error").Trim().ToLowerInvariant();
         string txt, iconKind; Color bg, ic, mc, hc, bd; int ms; bool waveMode;
         ResolveHudVisualStyle(st, zh, customText, isToast, out txt, out bg, out ic, out mc, out hc, out bd, out ms, out waveMode, out iconKind);
         using (HudPillForm f = new HudPillForm(isToast)) {
-            return f.RenderOffscreenBitmap(txt, bg, ic, mc, hc, bd, dpi, new Rectangle(0, 0, workWidth, workHeight), waveMode, iconKind, barNorms, elapsedSec, maxDurationSec, warnRemainSec);
+            return f.RenderOffscreenBitmapWithMetrics(txt, bg, ic, mc, hc, bd, dpi, new Rectangle(0, 0, workWidth, workHeight), waveMode, iconKind, barNorms, elapsedSec, maxDurationSec, warnRemainSec, out layout, "bottom", bgCount);
         }
     }
 
-    public static void UpdateHud(string state, string customText, int durationMs, string position = "bottom", int maxDurationSec = 0, int warnRemainSec = 0, string layer = "", bool? clearMain = null, bool? clearToast = null) {
+    public static void UpdateHud(string state, string customText, int durationMs, string position = "bottom", int maxDurationSec = 0, int warnRemainSec = 0, string layer = "", bool? clearMain = null, bool? clearToast = null, int bgCount = 0) {
         try {
             string st = (state ?? "").Trim().ToLowerInvariant();
             if (st == "" || st == "idle" || st == "hide") {
@@ -1088,23 +1229,28 @@ public static class VoiceWinShim {
             string txt, iconKind; Color bg, ic, mc, hc, bd; int ms; bool waveMode;
             ResolveHudVisualStyle(st, zh, customText, isToast, out txt, out bg, out ic, out mc, out hc, out bd, out ms, out waveMode, out iconKind);
             if (durationMs > 0) ms = durationMs;
-            IntPtr fg = GetForegroundWindow();
+            bool headless = _headlessHudMode;
+            IntPtr fg = headless ? IntPtr.Zero : GetForegroundWindow();
             if (!isToast) {
                 bool shouldClearToast = clearToast.HasValue ? clearToast.Value : (st == "recording");
                 if (shouldClearToast && _toastHud != null) _toastHud.HideNoActivate();
                 if (_hud == null || _hud.IsDisposed) _hud = new HudPillForm(false);
                 Rectangle? inheritWa = null;
                 int inheritDpi = 0;
-                if (st != "recording" && _hud.IsShown && _hud.AnchoredWorkArea.Width > 0) {
+                bool inPlaceRecordingUpdate = (st == "recording" && waveMode && _hud.IsShown && _hud.IsWaveRecording);
+                if ((st != "recording" || inPlaceRecordingUpdate) && _hud.IsShown && _hud.AnchoredWorkArea.Width > 0) {
                     inheritWa = _hud.AnchoredWorkArea;
                     inheritDpi = _hud.AnchoredDpi;
                 } else if (!shouldClearToast && _toastHud != null && !_toastHud.IsDisposed && _toastHud.IsShown && _toastHud.AnchoredWorkArea.Width > 0) {
                     inheritWa = _toastHud.AnchoredWorkArea;
                     inheritDpi = _toastHud.AnchoredDpi;
+                } else if (headless && _headlessDefaultWa.Width > 0 && _headlessDefaultWa.Height > 0) {
+                    inheritWa = _headlessDefaultWa;
+                    inheritDpi = _headlessDefaultDpi;
                 }
-                _hud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, fg, position, waveMode, iconKind, maxDurationSec, warnRemainSec, inheritWa, inheritDpi);
+                _hud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, fg, position, waveMode, iconKind, maxDurationSec, warnRemainSec, inheritWa, inheritDpi, bgCount, headless);
                 if (!shouldClearToast && _toastHud != null && !_toastHud.IsDisposed && _toastHud.IsShown) {
-                    _toastHud.SyncAnchor(_hud.AnchoredWorkArea, _hud.AnchoredDpi, position);
+                    _toastHud.SyncAnchor(_hud.AnchoredWorkArea, _hud.AnchoredDpi, position, headless);
                 }
             } else {
                 Rectangle? anchorWa = null;
@@ -1115,10 +1261,13 @@ public static class VoiceWinShim {
                 } else if (_toastHud != null && !_toastHud.IsDisposed && _toastHud.IsShown && _toastHud.AnchoredWorkArea.Width > 0) {
                     anchorWa = _toastHud.AnchoredWorkArea;
                     anchorDpi = _toastHud.AnchoredDpi;
+                } else if (headless && _headlessDefaultWa.Width > 0 && _headlessDefaultWa.Height > 0) {
+                    anchorWa = _headlessDefaultWa;
+                    anchorDpi = _headlessDefaultDpi;
                 }
                 if (clearMain == true && _hud != null) _hud.HideNoActivate();
                 if (_toastHud == null || _toastHud.IsDisposed) _toastHud = new HudPillForm(true);
-                _toastHud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, fg, position, false, iconKind, 0, 0, anchorWa, anchorDpi);
+                _toastHud.ShowStatus(txt, bg, ic, mc, hc, bd, ms, fg, position, false, iconKind, 0, 0, anchorWa, anchorDpi, 0, headless);
             }
         } catch { }
     }
@@ -2264,7 +2413,258 @@ public static class VoiceWinShim {
         return SendInput((uint)ins.Length, ins, Marshal.SizeOf(typeof(INPUT))) == (uint)ins.Length;
     }
 
-    public static void RunHeadlessSelfCheck() {
+    private static bool RegionHasDistinctForeground(byte[] px, int stride, int bmpW, int bmpH, Rectangle rc, byte bgB, byte bgG, byte bgR) {
+        int x0 = Math.Max(0, rc.Left);
+        int x1 = Math.Min(bmpW, rc.Right);
+        int y0 = Math.Max(2, rc.Top);
+        int y1 = Math.Min(bmpH - 2, rc.Bottom);
+        for (int y = y0; y < y1; y++) {
+            int row = y * stride;
+            for (int x = x0; x < x1; x++) {
+                int idx = row + x * 4;
+                byte a = px[idx + 3];
+                if (a < 180) continue;
+                int db = Math.Abs(px[idx] - bgB);
+                int dg = Math.Abs(px[idx + 1] - bgG);
+                int dr = Math.Abs(px[idx + 2] - bgR);
+                if (db + dg + dr >= 36) return true;
+            }
+        }
+        return false;
+    }
+
+    private static void VerifyHudLayoutCase(string label, string state, string customText, int dpi, int workW, int workH, bool zh, bool isToast, long elapsedSec, int maxDurSec, int warnRemSec, int bgCount) {
+        float[] bars = new float[] { 0.15f, 0.35f, 0.65f, 0.90f, 1.00f, 0.85f, 0.60f, 0.30f, 0.12f };
+        HudLayoutMetrics m;
+        using (Bitmap bmp = RenderHudSnapshotWithMetrics(state, customText, dpi, workW, workH, bars, out m, elapsedSec, maxDurSec, warnRemSec, zh, isToast, bgCount)) {
+            if (bmp == null) throw new InvalidOperationException(label + ": null bitmap");
+            if (bmp.Width != m.Width || bmp.Height != m.Height)
+                throw new InvalidOperationException(label + ": bitmap size mismatch");
+            if (m.Width <= 0 || m.Height <= 0 || m.Width > m.MaxWidth || m.Width < m.PadL + m.PadR)
+                throw new InvalidOperationException(label + ": pill bounds invalid w=" + m.Width + " maxW=" + m.MaxWidth + " h=" + m.Height);
+            if (m.Truncated)
+                throw new InvalidOperationException(label + ": unexpected truncation w=" + m.Width + " maxW=" + m.MaxWidth);
+
+            if (m.IsWaveRecording) {
+                if (m.DurRect.Left < m.PadL)
+                    throw new InvalidOperationException(label + ": DurRect violates left padding");
+                if (m.DurRect.Width < m.DurMeasuredW || m.DurSlotW < m.DurMeasuredW)
+                    throw new InvalidOperationException(label + ": DurRect overflows slot");
+                if (m.DurRect.Right >= m.WaveRect.Left)
+                    throw new InvalidOperationException(label + ": DurRect overlaps WaveRect (" + m.DurRect.Right + " >= " + m.WaveRect.Left + ")");
+                if (m.WaveRect.Width <= 0)
+                    throw new InvalidOperationException(label + ": WaveRect empty");
+                if (!string.IsNullOrEmpty(m.HintText)) {
+                    if (m.WaveRect.Right >= m.HintRect.Left)
+                        throw new InvalidOperationException(label + ": WaveRect overlaps HintRect (" + m.WaveRect.Right + " >= " + m.HintRect.Left + ")");
+                    if (m.HintRect.Width < m.HintMeasuredW || m.HintSlotW < m.HintMeasuredW)
+                        throw new InvalidOperationException(label + ": HintRect overflows slot");
+                }
+                if (bgCount > 0) {
+                    string expBadge = "+" + bgCount.ToString(CultureInfo.InvariantCulture);
+                    if (m.BadgeText != expBadge)
+                        throw new InvalidOperationException(label + ": BadgeText mismatch got=" + m.BadgeText);
+                    if (m.BadgeRect.Width < m.BadgeMeasuredW || m.BadgeSlotW < m.BadgeMeasuredW)
+                        throw new InvalidOperationException(label + ": BadgeRect overflows slot");
+                    int prevRight = (!string.IsNullOrEmpty(m.HintText)) ? m.HintRect.Right : m.WaveRect.Right;
+                    if (prevRight >= m.BadgeRect.Left)
+                        throw new InvalidOperationException(label + ": BadgeRect overlaps previous segment (" + prevRight + " >= " + m.BadgeRect.Left + ")");
+                    if (m.BadgeRect.Right > m.Width - m.PadR)
+                        throw new InvalidOperationException(label + ": BadgeRect violates right padding (" + m.BadgeRect.Right + " > " + (m.Width - m.PadR) + ")");
+                } else {
+                    if (m.BadgeRect.Width != 0)
+                        throw new InvalidOperationException(label + ": unexpected BadgeRect when bgCount=0");
+                    int lastRight = (!string.IsNullOrEmpty(m.HintText)) ? m.HintRect.Right : m.WaveRect.Right;
+                    if (lastRight > m.Width - m.PadR)
+                        throw new InvalidOperationException(label + ": HintRect violates right padding");
+                }
+            } else {
+                if (m.IconRect.Width > 0) {
+                    if (m.IconRect.Left < m.PadL)
+                        throw new InvalidOperationException(label + ": IconRect violates left padding");
+                    if (m.MainTextRect.Width > 0 && m.IconRect.Right >= m.MainTextRect.Left)
+                        throw new InvalidOperationException(label + ": IconRect overlaps MainTextRect");
+                }
+                if (m.MainTextRect.Width < m.MainMeasuredW + m.HintSegMeasuredW)
+                    throw new InvalidOperationException(label + ": MainTextRect smaller than measured text");
+                if (m.MainTextRect.Right > m.Width - m.PadR)
+                    throw new InvalidOperationException(label + ": MainTextRect violates right padding");
+            }
+
+            Rectangle full = new Rectangle(0, 0, bmp.Width, bmp.Height);
+            BitmapData bd = bmp.LockBits(full, ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+            try {
+                int len = bd.Stride * bmp.Height;
+                byte[] px = new byte[len];
+                Marshal.Copy(bd.Scan0, px, 0, len);
+                if (px[3] != 0)
+                    throw new InvalidOperationException(label + ": top-left corner pixel not transparent (alpha=" + px[3] + ")");
+                int midY = bmp.Height / 2;
+                int bgSampleX = Math.Max(3, Math.Min(bmp.Width - 4, m.PadL / 2));
+                int bgIdx = midY * bd.Stride + bgSampleX * 4;
+                if (px[bgIdx + 3] < 180)
+                    throw new InvalidOperationException(label + ": capsule interior unexpectedly transparent");
+                byte bgB = px[bgIdx], bgG = px[bgIdx + 1], bgR = px[bgIdx + 2];
+
+                if (m.IsWaveRecording) {
+                    if (!RegionHasDistinctForeground(px, bd.Stride, bmp.Width, bmp.Height, m.DurRect, bgB, bgG, bgR))
+                        throw new InvalidOperationException(label + ": DurRect has no rendered foreground pixels");
+                    if (!RegionHasDistinctForeground(px, bd.Stride, bmp.Width, bmp.Height, m.WaveRect, bgB, bgG, bgR))
+                        throw new InvalidOperationException(label + ": WaveRect has no rendered waveform pixels");
+                    if (!string.IsNullOrEmpty(m.HintText) && !RegionHasDistinctForeground(px, bd.Stride, bmp.Width, bmp.Height, m.HintRect, bgB, bgG, bgR))
+                        throw new InvalidOperationException(label + ": HintRect has no rendered hint pixels");
+                    if (bgCount > 0 && !RegionHasDistinctForeground(px, bd.Stride, bmp.Width, bmp.Height, m.BadgeRect, bgB, bgG, bgR))
+                        throw new InvalidOperationException(label + ": BadgeRect has no rendered badge pixels");
+                } else {
+                    if (m.IconRect.Width > 0 && !RegionHasDistinctForeground(px, bd.Stride, bmp.Width, bmp.Height, m.IconRect, bgB, bgG, bgR))
+                        throw new InvalidOperationException(label + ": IconRect has no rendered icon pixels");
+                    if (m.MainTextRect.Width > 0 && !RegionHasDistinctForeground(px, bd.Stride, bmp.Width, bmp.Height, m.MainTextRect, bgB, bgG, bgR))
+                        throw new InvalidOperationException(label + ": MainTextRect has no rendered text pixels");
+                }
+            } finally {
+                bmp.UnlockBits(bd);
+            }
+        }
+    }
+
+    public static int RunHudLayoutSelfCheck() {
+        int cases = 0;
+        int[][] dpiSpecs = new int[][] {
+            new int[] { 96, 1920, 1080 },
+            new int[] { 144, 2560, 1440 },
+            new int[] { 192, 3840, 2160 }
+        };
+        string[] enRecTexts = new string[] {
+            "\u25CF Listening\u2026 (press Right Ctrl to end)",
+            "\u25CF Listening\u2026 (release Right Ctrl to end)",
+            "\u25CF Listening\u2026 (press Right Option to end)",
+            "\u25CF Listening\u2026 (release ScrollLock to end)"
+        };
+        string[] zhRecTexts = new string[] {
+            "\u25CF \u5F55\u97F3\u4E2D\u2026 (\u6309\u53F3 Ctrl \u7ED3\u675F)",
+            "\u25CF \u5F55\u97F3\u4E2D\u2026 (\u677E\u5F00\u53F3 Ctrl \u7ED3\u675F)",
+            "\u25CF \u5F55\u97F3\u4E2D\u2026 (\u6309\u53F3 Option \u7ED3\u675F)",
+            "\u25CF \u5F55\u97F3\u4E2D\u2026 (\u677E\u5F00 ScrollLock \u7ED3\u675F)"
+        };
+        string[] mainStates = new string[] { "recognizing", "processing", "refining", "done", "copied" };
+        string[] toastStates = new string[] {
+            "cancelled", "empty", "no_mic", "mic_unavailable", "mic_no_stream",
+            "mic_permission", "mic_disconnected", "audio_recovered", "paste_failed", "error"
+        };
+
+        foreach (int[] ds in dpiSpecs) {
+            int dpi = ds[0], ww = ds[1], wh = ds[2];
+            foreach (bool zh in new bool[] { false, true }) {
+                string langTag = zh ? "zh" : "en";
+                string[] recTexts = zh ? zhRecTexts : enRecTexts;
+                for (int rIdx = 0; rIdx < recTexts.Length; rIdx++) {
+                    long dur = (rIdx == 0) ? 0L : ((rIdx == 1) ? 59L : ((rIdx == 2) ? 65L : 605L));
+                    foreach (int bg in new int[] { 0, 1, 2 }) {
+                        VerifyHudLayoutCase("rec_" + langTag + "_dpi" + dpi + "_k" + rIdx + "_bg" + bg, "recording", recTexts[rIdx], dpi, ww, wh, zh, false, dur, 0, 0, bg);
+                        cases++;
+                    }
+                }
+                // Countdown warning (12s & 5s remaining, with and without bg_count badge)
+                VerifyHudLayoutCase("rec_warn12_" + langTag + "_dpi" + dpi, "recording", recTexts[0], dpi, ww, wh, zh, false, 48L, 60, 15, 0);
+                cases++;
+                VerifyHudLayoutCase("rec_warn5_bg2_" + langTag + "_dpi" + dpi, "recording", recTexts[2], dpi, ww, wh, zh, false, 55L, 60, 15, 2);
+                cases++;
+
+                // All non-wave main states + cancelling custom main copy
+                foreach (string st in mainStates) {
+                    VerifyHudLayoutCase("main_" + st + "_" + langTag + "_dpi" + dpi, st, "", dpi, ww, wh, zh, false, 0L, 0, 0, 0);
+                    cases++;
+                }
+                string cancellingTxt = zh ? "\u25CB \u6B63\u5728\u53D6\u6D88\u2026" : "\u25CB Cancelling\u2026";
+                VerifyHudLayoutCase("main_cancelling_" + langTag + "_dpi" + dpi, "processing", cancellingTxt, dpi, ww, wh, zh, false, 0L, 0, 0, 0);
+                cases++;
+
+                // All toast states + copied routed as toast
+                foreach (string tst in toastStates) {
+                    VerifyHudLayoutCase("toast_" + tst + "_" + langTag + "_dpi" + dpi, tst, "", dpi, ww, wh, zh, true, 0L, 0, 0, 0);
+                    cases++;
+                }
+                VerifyHudLayoutCase("toast_copied_" + langTag + "_dpi" + dpi, "copied", "", dpi, ww, wh, zh, true, 0L, 0, 0, 0);
+                cases++;
+            }
+        }
+        return cases;
+    }
+
+    public static void RunToastSingleSlotSelfCheck() {
+        Rectangle mon1 = new Rectangle(0, 0, 1920, 1080);
+        Rectangle mon2 = new Rectangle(1920, 0, 2560, 1440);
+        _headlessHudMode = true;
+        _headlessDefaultWa = mon1;
+        _headlessDefaultDpi = 96;
+        try {
+            // 1) Start recording on monitor 1 via production UpdateHud
+            UpdateHud("recording", "", 0, "bottom", 60, 15, "", null, null, 2);
+            if (_hud == null || !_hud.IsShown || !_hud.IsWaveRecording || _hud.CurrentBgCount != 2)
+                throw new InvalidOperationException("single-slot check: UpdateHud recording bgCount=2 failed");
+            if (_hud.AnchoredWorkArea != mon1 || _hud.AnchoredDpi != 96)
+                throw new InvalidOperationException("single-slot check: initial monitor1 anchor mismatch");
+
+            // 2) Simulate foreground moving to monitor 2 WITH NO active toast:
+            //    in-place recording bg_count 2 -> 1 refresh MUST keep main pill anchored on monitor 1
+            _headlessDefaultWa = mon2;
+            _headlessDefaultDpi = 144;
+            UpdateHud("recording", "", 0, "bottom", 60, 15, "", null, false, 1);
+            if (!_hud.IsShown || !_hud.IsWaveRecording || _hud.CurrentBgCount != 1 || (_toastHud != null && _toastHud.IsShown))
+                throw new InvalidOperationException("single-slot check: bgCount 2->1 refresh without toast failed");
+            if (_hud.AnchoredWorkArea != mon1 || _hud.AnchoredDpi != 96)
+                throw new InvalidOperationException("single-slot check: recording bgCount refresh jumped monitor without toast");
+
+            // 3) Sequential toasts while foreground is on monitor 2 must reuse single _toastHud slot in-place and anchor to mon1
+            string[] seqToasts = new string[] { "mic_no_stream", "copied", "cancelled", "audio_recovered" };
+            int[] expDurs = new int[] { 2600, 2000, 1600, 2400 };
+            HudPillForm firstToastRef = null;
+            for (int i = 0; i < seqToasts.Length; i++) {
+                UpdateHud(seqToasts[i], "", 0, "bottom", 0, 0, "toast", false, null, 0);
+                if (_toastHud == null || !_toastHud.IsShown)
+                    throw new InvalidOperationException("single-slot check: toast not shown at " + seqToasts[i]);
+                if (firstToastRef == null) firstToastRef = _toastHud;
+                if (!object.ReferenceEquals(_toastHud, firstToastRef))
+                    throw new InvalidOperationException("single-slot check: toast slot instance changed");
+                if (_toastHud.LastAutoHideMs != expDurs[i] || _toastHud.ShowUpdateCount != i + 1 || string.IsNullOrEmpty(_toastHud.CurrentText))
+                    throw new InvalidOperationException("single-slot check: toast in-place replace mismatch at " + seqToasts[i]);
+                if (_toastHud.AnchoredWorkArea != mon1 || _toastHud.AnchoredDpi != 96 || !_hud.IsShown)
+                    throw new InvalidOperationException("single-slot check: toast anchor/main preservation failed at " + seqToasts[i]);
+            }
+
+            // 4) Refresh recording bg_count 1 -> 0 with clearToast=false while toast is active:
+            //    must NOT jump to monitor 2 and must NOT clear active toast
+            UpdateHud("recording", "", 0, "bottom", 60, 15, "", null, false, 0);
+            if (!_hud.IsShown || !_hud.IsWaveRecording || _hud.CurrentBgCount != 0 || !_toastHud.IsShown)
+                throw new InvalidOperationException("single-slot check: bgCount 1->0 clear failed");
+            if (_hud.AnchoredWorkArea != mon1 || _hud.AnchoredDpi != 96)
+                throw new InvalidOperationException("single-slot check: recording bgCount clear jumped monitor");
+
+            // 5) clearMain=true hides main slot while toast slot remains intact in-place; hide_toast clears toast
+            UpdateHud("cancelled", "", 0, "bottom", 0, 0, "toast", true, null, 0);
+            if (_hud.IsShown || _hud.CurrentBgCount != 0 || !_toastHud.IsShown || !object.ReferenceEquals(_toastHud, firstToastRef))
+                throw new InvalidOperationException("single-slot check: clearMain isolation failed");
+            UpdateHud("hide_toast", "", 0);
+            if (_toastHud.IsShown)
+                throw new InvalidOperationException("single-slot check: hide_toast failed");
+
+            // 5) Fresh recording start (not already recording) DOES re-anchor to monitor 2
+            UpdateHud("recording", "", 0, "bottom", 60, 15, "", null, true, 0);
+            if (!_hud.IsShown || _hud.AnchoredWorkArea != mon2 || _hud.AnchoredDpi != 144)
+                throw new InvalidOperationException("single-slot check: fresh recording failed to re-anchor to monitor2");
+            UpdateHud("hide_all", "", 0);
+            if (_hud.IsShown || _toastHud.IsShown)
+                throw new InvalidOperationException("single-slot check: hide_all failed");
+        } finally {
+            _headlessHudMode = false;
+            _headlessDefaultWa = Rectangle.Empty;
+            _headlessDefaultDpi = 96;
+            if (_hud != null) { try { _hud.Dispose(); } catch { } _hud = null; }
+            if (_toastHud != null) { try { _toastHud.Dispose(); } catch { } _toastHud = null; }
+        }
+    }
+
+    public static int RunHeadlessSelfCheck() {
         if (ResolveKeyName("RControl") != 0xA3u) throw new InvalidOperationException("ResolveKeyName RControl failed");
         if (ResolveKeyName("RAlt") != 0xA5u) throw new InvalidOperationException("ResolveKeyName RAlt failed");
         if (ResolveKeyName("F13") != 0x7Cu) throw new InvalidOperationException("ResolveKeyName F13 failed");
@@ -2287,8 +2687,8 @@ public static class VoiceWinShim {
             throw new InvalidOperationException("BuildPasteChordInputs shift_insert extended flags mismatch");
 
         string segIcon, segMain, segHint; bool segSp;
-        SplitHudSegments("\u25CF \u6B63\u5728\u8046\u542C 0:05 (\u70B9\u6309 \u53F3Ctrl \u5B8C\u6210)", out segIcon, out segMain, out segHint, out segSp);
-        if (segIcon != "\u25CF" || segMain != "\u6B63\u5728\u8046\u542C 0:05" || segHint != "(\u70B9\u6309 \u53F3Ctrl \u5B8C\u6210)" || !segSp)
+        SplitHudSegments("\u25CF \u5F55\u97F3\u4E2D\u2026 (\u6309\u53F3 Ctrl \u7ED3\u675F)", out segIcon, out segMain, out segHint, out segSp);
+        if (segIcon != "\u25CF" || segMain != "\u5F55\u97F3\u4E2D\u2026" || segHint != "(\u6309\u53F3 Ctrl \u7ED3\u675F)" || !segSp)
             throw new InvalidOperationException("SplitHudSegments mismatch");
         if (FormatRecordingDuration(5) != "5s" || FormatRecordingDuration(65) != "1m 05s")
             throw new InvalidOperationException("FormatRecordingDuration mismatch");
@@ -2311,25 +2711,23 @@ public static class VoiceWinShim {
             throw new InvalidOperationException("BuildPcm16MonoWav header mismatch");
 
         RunClipStateSelfCheck();
-
-        using (Bitmap bmp = RenderHudSnapshotBitmap("recording", "\u25CF \u6B63\u5728\u8046\u542C 0:03 (\u70B9\u6309 \u53F3Ctrl \u5B8C\u6210)", 96, 1920, 1080)) {
-            if (bmp == null || bmp.Width <= 120 || bmp.Height < 28)
-                throw new InvalidOperationException("RenderHudSnapshotBitmap dimensions invalid");
-            bool anyOpaque = false;
-            int cy = bmp.Height / 2;
-            for (int x = 0; x < bmp.Width; x += 4) {
-                if (bmp.GetPixel(x, cy).A > 0) { anyOpaque = true; break; }
-            }
-            if (!anyOpaque)
-                throw new InvalidOperationException("RenderHudSnapshotBitmap produced transparent bitmap");
-        }
+        RunToastSingleSlotSelfCheck();
+        return RunHudLayoutSelfCheck();
     }
 }
 "@
 $csCacheHit = $false
 if (-not ('VoiceWinShim' -as [type])) {
     try {
-        if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $resolvedCacheDir = ""
+        if (-not [string]::IsNullOrWhiteSpace($CacheDir)) {
+            $resolvedCacheDir = $CacheDir.Trim()
+        } elseif (-not [string]::IsNullOrWhiteSpace($env:AGENT_VOICE_INPUT_WIN_CACHE_DIR)) {
+            $resolvedCacheDir = $env:AGENT_VOICE_INPUT_WIN_CACHE_DIR.Trim()
+        } elseif (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            $resolvedCacheDir = Join-Path $env:LOCALAPPDATA "agent-voice-input\cache"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($resolvedCacheDir)) {
             $hashInput = "v1|" + $PSVersionTable.PSVersion.ToString() + "|" + $PSVersionTable.CLRVersion.ToString() + "|" + [IntPtr]::Size + "|" + $csSource
             $sha = [System.Security.Cryptography.SHA256]::Create()
             try {
@@ -2338,9 +2736,8 @@ if (-not ('VoiceWinShim' -as [type])) {
                 $sha.Dispose()
             }
             $csHash = ([System.BitConverter]::ToString($hashBytes, 0, 8) -replace '-', '').ToLowerInvariant()
-            $cacheDir = Join-Path $env:LOCALAPPDATA "agent-voice-input\cache"
             $dllName = "VoiceWinShim_$csHash.dll"
-            $dllPath = Join-Path $cacheDir $dllName
+            $dllPath = Join-Path $resolvedCacheDir $dllName
             if (Test-Path -LiteralPath $dllPath) {
                 try {
                     Add-Type -Path $dllPath -ErrorAction Stop
@@ -2352,7 +2749,7 @@ if (-not ('VoiceWinShim' -as [type])) {
                 }
             }
             if (-not ('VoiceWinShim' -as [type])) {
-                try { [void][System.IO.Directory]::CreateDirectory($cacheDir) } catch { }
+                try { [void][System.IO.Directory]::CreateDirectory($resolvedCacheDir) } catch { }
                 $randHex = [Guid]::NewGuid().ToString("N").Substring(0, 8)
                 $tmpDll = "$dllPath.$PID.$randHex.tmp.dll"
                 $provider = New-Object Microsoft.CSharp.CSharpCodeProvider
@@ -2392,7 +2789,7 @@ if (-not ('VoiceWinShim' -as [type])) {
                 }
                 try {
                     $staleCutoff = [DateTime]::UtcNow.AddMinutes(-5)
-                    foreach ($f in [System.IO.Directory]::GetFiles($cacheDir, "VoiceWinShim_*")) {
+                    foreach ($f in [System.IO.Directory]::GetFiles($resolvedCacheDir, "VoiceWinShim_*")) {
                         $fn = [System.IO.Path]::GetFileName($f)
                         if ($fn.Equals($dllName, [StringComparison]::OrdinalIgnoreCase)) { continue }
                         if ($fn.EndsWith(".tmp.dll", [StringComparison]::OrdinalIgnoreCase)) {
@@ -2455,7 +2852,7 @@ if ($Mode -eq "self-check") {
                 throw ("AST parse errors: " + $parseErrors.Count)
             }
         }
-        [VoiceWinShim]::RunHeadlessSelfCheck()
+        $hudLayoutCases = [VoiceWinShim]::RunHeadlessSelfCheck()
         $t1 = "agy " + ([char]0x00B7) + " ~/repo [#a1b2c3d4]"
         if ((Get-TitleSessionToken $t1) -ne "a1b2c3d4") { throw "Get-TitleSessionToken hash tag failed" }
         if ((Get-TitleSessionToken "claude [claude:#DEADBEEF]") -ne "deadbeef") { throw "Get-TitleSessionToken prefixed tag failed" }
@@ -2465,7 +2862,7 @@ if ($Mode -eq "self-check") {
         if ((-not $protoSample.ok) -or ($protoSample.reply -ne "ping") -or ([int]$protoSample.seq_id -ne 1)) {
             throw "JSON roundtrip check failed"
         }
-        Write-JsonLine @{ ok = $true; mode = "self-check"; ps_version = $PSVersionTable.PSVersion.ToString(); clr_version = $PSVersionTable.CLRVersion.ToString(); cache_hit = [bool]$csCacheHit }
+        Write-JsonLine @{ ok = $true; mode = "self-check"; ps_version = $PSVersionTable.PSVersion.ToString(); clr_version = $PSVersionTable.CLRVersion.ToString(); cache_hit = [bool]$csCacheHit; hud_layout_cases = [int]$hudLayoutCases }
         exit 0
     } catch {
         [Console]::Error.WriteLine("win_shim self-check failed: " + [string]$_.Exception.Message)
@@ -2538,7 +2935,8 @@ try {
                     $lyr = if ($null -ne $cmdObj.layer) { [string]$cmdObj.layer } else { "" }
                     $clrMain = if ($null -ne $cmdObj.clear_main) { [bool]$cmdObj.clear_main } else { $null }
                     $clrToast = if ($null -ne $cmdObj.clear_toast) { [bool]$cmdObj.clear_toast } else { $null }
-                    [VoiceWinShim]::UpdateHud([string]$cmdObj.state, [string]$cmdObj.text, $dms, [string]$cmdObj.position, $maxDur, $warnRem, $lyr, $clrMain, $clrToast)
+                    $bgCnt = if ($null -ne $cmdObj.bg_count) { [int]$cmdObj.bg_count } else { 0 }
+                    [VoiceWinShim]::UpdateHud([string]$cmdObj.state, [string]$cmdObj.text, $dms, [string]$cmdObj.position, $maxDur, $warnRem, $lyr, $clrMain, $clrToast, $bgCnt)
                     Write-JsonLine @{ type = "reply"; reply = "hud"; seq_id = $seq; ok = $true }
                 } elseif ($op -eq "hud_level") {
                     $lvl = if ($null -ne $cmdObj.level) { [float]$cmdObj.level } else { 0.0 }

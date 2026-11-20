@@ -118,8 +118,8 @@ class TestHudAndPromptsScenarios(unittest.TestCase):
         self.assertEqual(hud_mod.format_hotkey_label("0x", "en"), "0x")
         self.assertEqual(hud_mod.format_hotkey_label("PageDown", "zh"), "PageDown")
 
-        self.assertIn("松开右 Ctrl 完成", hud_mod.format_hud_text("recording", "zh", trigger_mode="ptt"))
-        self.assertIn("按 PageDown 完成", hud_mod.format_hud_text("recording", "zh", hotkey="PageDown"))
+        self.assertIn("松开右 Ctrl 结束", hud_mod.format_hud_text("recording", "zh", trigger_mode="ptt"))
+        self.assertIn("按 PageDown 结束", hud_mod.format_hud_text("recording", "zh", hotkey="PageDown"))
         self.assertEqual(hud_mod.format_hud_text("idle", "zh"), "")
         self.assertEqual(hud_mod.format_hud_text("unknown_err", "en"), "✕ Transcription failed")
 

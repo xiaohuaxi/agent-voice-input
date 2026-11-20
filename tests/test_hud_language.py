@@ -30,6 +30,7 @@ from agent_voice_input.hud import (  # noqa: E402
     DEFAULT_ERROR_HUD_DURATION_MS,
     HUD_STATE_DURATIONS_MS,
     default_hud_duration_ms,
+    format_bg_count_badge,
     format_countdown_hint,
     format_hotkey_label,
     format_hud_text,
@@ -330,7 +331,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(
                 [(c["state"], c.get("text")) for c in zh_cmds],
                 [
-                    ("recording", "● 录音中… (按右 Ctrl 完成)"),
+                    ("recording", "● 录音中… (按右 Ctrl 结束)"),
                     ("recognizing", "◐ 语音识别…"),
                     ("refining", "◈ 整理精修…"),
                     ("done", "✓ 已填入"),
@@ -369,7 +370,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(
                 [(c["state"], c.get("text")) for c in en_cmds],
                 [
-                    ("recording", "● Listening… (release Right Alt to finish)"),
+                    ("recording", "● Listening… (release Right Alt to end)"),
                     ("recognizing", "◐ Transcribing…"),
                     ("refining", "◈ Refining…"),
                     ("done", "✓ Inserted"),
@@ -390,7 +391,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 ready_ui_culture="__OMIT__",
                 calls=[("recording", "", 0)],
             )
-            self.assertEqual(omit_cmds[0].get("text"), "● Listening… (press Right Ctrl to finish)")
+            self.assertEqual(omit_cmds[0].get("text"), "● Listening… (press Right Ctrl to end)")
 
             # 4. Explicit config / env overrides ready ui_culture in real WslPlatform.hud RPC
             override_en_cmds = _run_hud_scenario(
@@ -399,7 +400,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 ready_ui_culture="zh-CN",
                 calls=[("recording", "", 0)],
             )
-            self.assertEqual(override_en_cmds[0].get("text"), "● Listening… (press Right Ctrl to finish)")
+            self.assertEqual(override_en_cmds[0].get("text"), "● Listening… (press Right Ctrl to end)")
 
             override_zh_cmds = _run_hud_scenario(
                 cfg=Config(ui=UiConfig(language="zh", position="top")),
@@ -407,7 +408,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 ready_ui_culture="en-US",
                 calls=[("recording", "", 0), ("hide", "", 0)],
             )
-            self.assertEqual(override_zh_cmds[0].get("text"), "● 录音中… (按右 Ctrl 完成)")
+            self.assertEqual(override_zh_cmds[0].get("text"), "● 录音中… (按右 Ctrl 结束)")
             self.assertEqual(override_zh_cmds[0].get("position"), "top")
             self.assertIsNone(override_zh_cmds[1].get("position"))
 
@@ -502,7 +503,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(
                 [(c["state"], c.get("text")) for c in mac_zh],
                 [
-                    ("recording", "● 录音中… (按右 Option 完成)"),
+                    ("recording", "● 录音中… (按右 Option 结束)"),
                     ("recognizing", "◐ 语音识别…"),
                     ("refining", "◈ 整理精修…"),
                     ("done", "✓ 已填入"),
@@ -532,7 +533,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(
                 [(c["state"], c.get("text")) for c in mac_en],
                 [
-                    ("recording", "● Listening… (release Right Cmd to finish)"),
+                    ("recording", "● Listening… (release Right Cmd to end)"),
                     ("refining", "◈ Refining…"),
                     ("copied", "✓ Copied (window switched)"),
                 ],
@@ -546,7 +547,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 ready_ui_culture="__OMIT__",
                 calls=[("recording", "", 0)],
             )
-            self.assertEqual(mac_posix_zh[0].get("text"), "● 录音中… (按 Fn 完成)")
+            self.assertEqual(mac_posix_zh[0].get("text"), "● 录音中… (按 Fn 结束)")
 
             # 4. Explicit config override wins over mac_shim ui_culture and forwards position='top'
             mac_override = _run_mac_hud_scenario(
@@ -555,7 +556,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 ready_ui_culture="zh-Hans-CN",
                 calls=[("recording", "", 0), ("hide", "", 0)],
             )
-            self.assertEqual(mac_override[0].get("text"), "● Listening… (press Right Option to finish)")
+            self.assertEqual(mac_override[0].get("text"), "● Listening… (press Right Option to end)")
             self.assertEqual(mac_override[0].get("position"), "top")
             self.assertIsNone(mac_override[1].get("position"))
 
@@ -627,52 +628,56 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
 
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="RControl", trigger_mode="tap_toggle"),
-            "● 录音中… (按右 Ctrl 完成)",
+            "● 录音中… (按右 Ctrl 结束)",
         )
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="RControl", trigger_mode="ptt"),
-            "● 录音中… (松开右 Ctrl 完成)",
+            "● 录音中… (松开右 Ctrl 结束)",
         )
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="ROption", trigger_mode="tap_toggle"),
-            "● 录音中… (按右 Option 完成)",
+            "● 录音中… (按右 Option 结束)",
         )
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="RCommand", trigger_mode="ptt"),
-            "● 录音中… (松开右 Cmd 完成)",
+            "● 录音中… (松开右 Cmd 结束)",
         )
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="CapsLock", trigger_mode="tap_toggle"),
-            "● 录音中… (按 CapsLock 完成)",
+            "● 录音中… (按 CapsLock 结束)",
         )
         self.assertEqual(
             format_hud_text("recording", "zh", hotkey="F8", trigger_mode="ptt"),
-            "● 录音中… (松开 F8 完成)",
+            "● 录音中… (松开 F8 结束)",
         )
         self.assertEqual(
             format_hud_text("recording", "en", hotkey="RControl", trigger_mode="tap_toggle"),
-            "● Listening… (press Right Ctrl to finish)",
+            "● Listening… (press Right Ctrl to end)",
         )
         self.assertEqual(
             format_hud_text("recording", "en", hotkey="RControl", trigger_mode="ptt"),
-            "● Listening… (release Right Ctrl to finish)",
+            "● Listening… (release Right Ctrl to end)",
         )
         self.assertEqual(
             format_hud_text("recording", "en", hotkey="ROption", trigger_mode="tap_toggle"),
-            "● Listening… (press Right Option to finish)",
+            "● Listening… (press Right Option to end)",
         )
         self.assertEqual(
             format_hud_text("recording", "en", hotkey="RCommand", trigger_mode="ptt"),
-            "● Listening… (release Right Cmd to finish)",
+            "● Listening… (release Right Cmd to end)",
         )
         self.assertEqual(
             format_hud_text("recording", "en", hotkey="RAlt", trigger_mode="tap_toggle"),
-            "● Listening… (press Right Alt to finish)",
+            "● Listening… (press Right Alt to end)",
         )
         self.assertEqual(
             format_hud_text("recording", "en", hotkey="CapsLock", trigger_mode="ptt"),
-            "● Listening… (release CapsLock to finish)",
+            "● Listening… (release CapsLock to end)",
         )
+        self.assertEqual(format_bg_count_badge(-1), "")
+        self.assertEqual(format_bg_count_badge(0), "")
+        self.assertEqual(format_bg_count_badge(1), "+1")
+        self.assertEqual(format_bg_count_badge(2), "+2")
 
         pairs = [
             ("recognizing", "◐ 语音识别…", "◐ Transcribing…"),
@@ -749,7 +754,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 mplat.start_event_listener(lambda _e: None)
                 for plat in (wplat, mplat):
                     plat.hud("recording")
-                    plat.hud("recording", clear_toast=False)
+                    plat.hud("recording", clear_toast=False, bg_count=2)
                     plat.hud("audio_recovered", clear_main=False)
                     plat.hud("recognizing")
                     plat.hud("mic_disconnected", duration_ms=3200, clear_main=False)
@@ -770,14 +775,16 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             self.assertEqual(len(mac_reqs), 12)
 
             for reqs, is_zh in ((wsl_reqs, True), (mac_reqs, False)):
-                # 0: recording defaults to layer='main' and clear_toast=True
+                # 0: recording defaults to layer='main', clear_toast=True, omits bg_count when 0
                 self.assertEqual(reqs[0]["layer"], "main")
                 self.assertIs(reqs[0]["clear_toast"], True)
                 self.assertNotIn("clear_main", reqs[0])
+                self.assertNotIn("bg_count", reqs[0])
 
-                # 1: recording with explicit clear_toast=False preserves False
+                # 1: recording with explicit clear_toast=False & bg_count=2 forwards both
                 self.assertEqual(reqs[1]["layer"], "main")
                 self.assertIs(reqs[1]["clear_toast"], False)
+                self.assertEqual(reqs[1]["bg_count"], 2)
 
                 # 2: audio_recovered routes to layer='toast' with clear_main=False & duration_ms=2400
                 self.assertEqual(reqs[2]["layer"], "toast")
@@ -985,9 +992,25 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             "cmdObj.layer",
             "cmdObj.clear_main",
             "cmdObj.clear_toast",
+            "cmdObj.bg_count",
             "bool isToast",
+            "0x00000020",
+            "RunHudLayoutSelfCheck()",
+            "RunToastSingleSlotSelfCheck()",
+            "inPlaceRecordingUpdate",
+            "[string]$CacheDir",
+            "AGENT_VOICE_INPUT_WIN_CACHE_DIR",
+            r" \u7ED3\u675F)",
+            " to end)",
         ):
             self.assertIn(toast_sym, shim)
+
+        # Single-slot check must exercise production UpdateHud(...) routing
+        m_slot = re.search(r"public static void RunToastSingleSlotSelfCheck\(\)\s*\{(.+?)public static int RunHeadlessSelfCheck\(\)", shim, re.S)
+        self.assertIsNotNone(m_slot)
+        assert m_slot is not None
+        self.assertIn('UpdateHud("recording"', m_slot.group(1))
+        self.assertIn("UpdateHud(seqToasts[i]", m_slot.group(1))
 
         # Single source of truth parity between platform_wsl.WINDOWS_TERMINALS and win_shim.ps1 $AllowedTerminals
         m = re.search(r"\$AllowedTerminals\s*=\s*@\(([^)]+)\)", shim)
@@ -1021,8 +1044,48 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             "monospacedDigitSystemFont",
             "updateAudioLevel(",
             'case "hud_level":',
+            "p.ignoresMouseEvents = true",
+            'obj["bg_count"]',
+            "func computeWaveHudLayout(",
+            "func computeStatusHudLayout(",
+            "func drawStatusIcon(",
+            "headless: true",
+            "ctrl.update(",
+            "private func runHudLayoutSelfCheck()",
+            " 结束)",
+            " to end)",
         ):
             self.assertIn(sym, mac_shim)
+        self.assertNotIn("renderPixels:", mac_shim)
+
+        # Verify platform_wsl.run_win_shim_self_check forwards optional cache_dir as -CacheDir
+        from agent_voice_input import platform_wsl as wsl_mod
+        seen_cmds: list[list[str]] = []
+
+        class _FakeProc:
+            returncode = 0
+            stdout = json.dumps({"ok": True, "mode": "self-check", "hud_layout_cases": 186})
+            stderr = ""
+
+        with (
+            mock.patch.object(wsl_mod.os.path, "isfile", return_value=True),
+            mock.patch.object(wsl_mod, "to_windows_path", side_effect=lambda p: f"C:\\win\\{Path(p).name}"),
+            mock.patch.object(wsl_mod.subprocess, "run", side_effect=lambda cmd, **_kw: (seen_cmds.append(list(cmd)), _FakeProc())[1]),
+        ):
+            sc_ok, sc_js, sc_err = wsl_mod.run_win_shim_self_check("self-check", cache_dir=Path("/tmp/iso_win_cache"))
+            self.assertTrue(sc_ok, sc_err)
+            self.assertEqual(sc_js.get("hud_layout_cases"), 186)
+            self.assertIn("-CacheDir", seen_cmds[0])
+            self.assertEqual(seen_cmds[0][seen_cmds[0].index("-CacheDir") + 1], r"C:\win\iso_win_cache")
+
+        with (
+            mock.patch.object(wsl_mod.os.path, "isfile", return_value=True),
+            mock.patch.object(wsl_mod, "to_windows_path", side_effect=RuntimeError("wslpath unavailable")),
+        ):
+            sc_ok_err, sc_js_err, sc_msg_err = wsl_mod.run_win_shim_self_check("self-check", cache_dir=Path("/tmp/iso_win_cache"))
+            self.assertFalse(sc_ok_err)
+            self.assertEqual(sc_js_err, {})
+            self.assertIn("wslpath unavailable", sc_msg_err)
 
     def test_countdown_warn_threshold_hint_copy_and_hud_rpc_fields(self) -> None:
         from agent_voice_input.config import AudioConfig

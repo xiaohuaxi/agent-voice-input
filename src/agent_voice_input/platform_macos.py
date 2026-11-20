@@ -573,15 +573,16 @@ def run_mac_shim_self_check(
     if sc.returncode != 0:
         raw_err = (sc.stderr or sc.stdout or f"self-check rc={sc.returncode}").strip()
         return False, {}, redact_secrets(raw_err, env, cfg=cfg)
-    sc_json: dict[str, Any] = {}
-    if out := (sc.stdout or "").strip():
-        try:
-            parsed = json.loads(out.splitlines()[-1])
-            if isinstance(parsed, dict):
-                sc_json = parsed
-        except ValueError:
-            pass
-    return True, sc_json, ""
+    out = (sc.stdout or "").strip()
+    if not out:
+        return False, {}, "empty self-check output"
+    try:
+        parsed = json.loads(out.splitlines()[-1])
+    except ValueError as exc:
+        return False, {}, f"invalid self-check JSON: {redact_secrets(str(exc), env, cfg=cfg)}"
+    if not isinstance(parsed, dict) or parsed.get("ok") is not True:
+        return False, {}, f"unexpected self-check payload: {redact_secrets(repr(parsed), env, cfg=cfg)}"
+    return True, parsed, ""
 
 
 def probe_macos_host(

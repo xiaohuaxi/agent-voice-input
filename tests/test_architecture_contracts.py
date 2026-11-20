@@ -806,6 +806,24 @@ class TestHudCrossPlatformContracts(unittest.TestCase):
             r"(?:Queue|List|Stack)<\s*HudPillForm\s*>",
         )
 
+        # Mouse pass-through + updated recording prompt copy parity across all three ends
+        self.assertIn("p.ignoresMouseEvents = true", self.mac_swift)
+        self.assertIn("0x00000020", self.win_ps1)
+        self.assertEqual(
+            hud_mod.format_hud_text("recording", "zh", hotkey="RControl", trigger_mode="tap_toggle"),
+            "● 录音中… (按右 Ctrl 结束)",
+        )
+        self.assertEqual(
+            hud_mod.format_hud_text("recording", "en", hotkey="RControl", trigger_mode="tap_toggle"),
+            "● Listening… (press Right Ctrl to end)",
+        )
+        self.assertIn(r" \u7ED3\u675F)", self.win_ps1)
+        self.assertIn(" to end)", self.win_ps1)
+        self.assertNotIn(" to finish)", self.win_ps1)
+        self.assertIn(" 结束)", self.mac_swift)
+        self.assertIn(" to end)", self.mac_swift)
+        self.assertNotIn(" to finish)", self.mac_swift)
+
 
 class TestProviderCompletenessContracts(unittest.TestCase):
     def test_asr_providers_complete_across_models_credentials_and_factory(self) -> None:

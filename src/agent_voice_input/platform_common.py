@@ -1111,6 +1111,7 @@ class JsonlShimMixin:
         layer: str | None = None,
         clear_main: bool | None = None,
         clear_toast: bool | None = None,
+        bg_count: int = 0,
     ) -> None:
         if not self._has_managed_shim():
             return
@@ -1129,11 +1130,14 @@ class JsonlShimMixin:
                 eff_layer = exp_layer if exp_layer in ("main", "toast") else base_layer
                 req["layer"] = eff_layer
                 req["position"] = normalize_ui_position(self.cfg.ui.position)
-                if st == "recording" and self.cfg.audio.max_duration_sec > 0:
-                    req["max_duration_sec"] = max(1, int(round(self.cfg.audio.max_duration_sec)))
-                    req["warn_remain_sec"] = recording_countdown_warn_sec(
-                        self.cfg.audio.max_duration_sec
-                    )
+                if st == "recording" and eff_layer == "main":
+                    if bg_count > 0:
+                        req["bg_count"] = int(bg_count)
+                    if self.cfg.audio.max_duration_sec > 0:
+                        req["max_duration_sec"] = max(1, int(round(self.cfg.audio.max_duration_sec)))
+                        req["warn_remain_sec"] = recording_countdown_warn_sec(
+                            self.cfg.audio.max_duration_sec
+                        )
                 if not eff_text:
                     lang = resolve_ui_language(
                         self.cfg.ui.language,

@@ -39,7 +39,7 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from agent_voice_input import __version__  # noqa: E402
-from agent_voice_input import _tmux, platform_wsl  # noqa: E402
+from agent_voice_input import _tmux, platform_macos, platform_wsl  # noqa: E402
 from agent_voice_input.asr_providers import BaseAsrProvider, ChatAudioAsrProvider, GeminiAudioProvider, create_asr_provider  # noqa: E402
 from agent_voice_input.audio_proc import (  # noqa: E402
     AudioConfig,
@@ -1660,6 +1660,67 @@ def main(argv: list[str] | None = None) -> int:
                         f"mode_0600={tel_mode_0600}, records={len(disk_records)}/{expected_total_records}, "
                         f"latency_fields={lat_keys_present}, zero_prose={not prose_leaked}, zero_secrets={not secret_leaked}"
                     ),
+                }
+            )
+
+            # Subcheck 7: Pure offscreen native HUD & shim geometry self-check (zero clipboard / desktop disruption)
+            t_hud_sc0 = time.monotonic()
+
+            def _validate_hud_self_check(
+                ok_flag: bool, payload: Mapping[str, Any], err_msg: str, label: str
+            ) -> tuple[bool, str]:
+                if not ok_flag:
+                    return False, f"{label} failed: {err_msg}"
+                if payload.get("ok") is not True or payload.get("mode") != "self-check":
+                    return (
+                        False,
+                        f"{label} unexpected payload: ok={payload.get('ok')!r}, mode={payload.get('mode')!r}",
+                    )
+                raw_cases = payload.get("hud_layout_cases")
+                if isinstance(raw_cases, bool) or not isinstance(raw_cases, int) or raw_cases <= 0:
+                    return False, f"{label} missing/invalid hud_layout_cases={raw_cases!r}"
+                extra = f", cache_hit={payload.get('cache_hit')}" if "cache_hit" in payload else ""
+                return True, f"{label} ok=True, hud_layout_cases={raw_cases}{extra}"
+
+            if sys.platform == "darwin":
+                shim_bin, shim_err = platform_macos.compile_mac_shim(
+                    env=e2e_env, cache_dir=iso_cache_dir, cfg=cfg
+                )
+                if shim_bin is not None:
+                    sc_ok_raw, sc_json, sc_err = platform_macos.run_mac_shim_self_check(
+                        shim_bin, e2e_env, cfg=cfg, timeout=15.0
+                    )
+                    sc_ok, hud_sc_detail = _validate_hud_self_check(
+                        sc_ok_raw, sc_json, sc_err, "mac_shim --self-check"
+                    )
+                else:
+                    sc_ok = False
+                    hud_sc_detail = f"mac_shim compile failed: {shim_err}"
+            elif platform_wsl.is_wsl(clean_env):
+                if not os.path.isfile(platform_wsl.POWERSHELL_EXE):
+                    sc_ok = False
+                    hud_sc_detail = (
+                        f"WSL detected but PowerShell not found at {platform_wsl.POWERSHELL_EXE}"
+                    )
+                else:
+                    win_cache_dir = iso_cache_dir / "win_shim_cache"
+                    win_cache_dir.mkdir(parents=True, exist_ok=True)
+                    sc_ok_raw, sc_json, sc_err = platform_wsl.run_win_shim_self_check(
+                        "self-check", env=clean_env, cache_dir=win_cache_dir, timeout=25.0
+                    )
+                    sc_ok, hud_sc_detail = _validate_hud_self_check(
+                        sc_ok_raw, sc_json, sc_err, "win_shim -Mode self-check"
+                    )
+            else:
+                sc_ok = True
+                hud_sc_detail = "skipped (no native Windows/macOS shim on pure Linux)"
+            hud_sc_ms = max(0, int(round((time.monotonic() - t_hud_sc0) * 1000)))
+            checks.append(
+                {
+                    "id": "C7_native_hud_self_check",
+                    "ok": sc_ok,
+                    "elapsed_ms": hud_sc_ms,
+                    "detail": hud_sc_detail,
                 }
             )
         finally:

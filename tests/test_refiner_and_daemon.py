@@ -1344,8 +1344,11 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(daemon.last_result["paste_reason"], "focus_changed")
             self.assertEqual(
                 plat.huds,
-                ["recording", "recognizing", "recording", "copied", "hide", "recording", "recognizing", "copied"],
+                ["recording", "recognizing", "recording", "recording", "copied", "hide", "recording", "recognizing", "copied"],
             )
+            self.assertEqual(plat.hud_events[2].get("bg_count"), 1)
+            self.assertIsNone(plat.hud_events[3].get("bg_count"))
+            self.assertIs(plat.hud_events[3].get("clear_toast"), False)
             daemon.close()
 
     def test_max_duration_sec_auto_stop_early_cancel_and_expected_seq_guard(self) -> None:
@@ -2300,7 +2303,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertEqual(daemon_sup.last_result.get("skipped_reason"), "empty_asr")
                 self.assertEqual(daemon_sup.state, "recording")
-                self.assertEqual(plat_sup.huds, [*huds_before, "empty"])
+                self.assertEqual(plat_sup.huds, [*huds_before, "recording", "empty"])
+                self.assertIs(plat_sup.hud_events[-2].get("clear_toast"), False)
                 self.assertIs(plat_sup.hud_events[-1].get("clear_main"), False)
                 self.assertEqual(plat_sup.beeps, beeps_before)
                 daemon_sup._last_trigger_ts = -1e9
@@ -8051,6 +8055,7 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                 layer: str | None = None,
                 clear_main: bool | None = None,
                 clear_toast: bool | None = None,
+                bg_count: int = 0,
             ) -> None:
                 if state in ("recognizing", "refining"):
                     bg_hud_entered.set()
@@ -8061,6 +8066,7 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                     layer=layer,
                     clear_main=clear_main,
                     clear_toast=clear_toast,
+                    bg_count=bg_count,
                 )
                 eff_lyr = (layer or "").strip().lower()
                 if eff_lyr != "toast":
@@ -8118,17 +8124,405 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                 while time.monotonic() < dl and daemon.last_result.get("seq_id") != s1["seq_id"]:
                     time.sleep(0.02)
 
-                # While #2 is recording, ZERO background main-capsule calls may appear after 'recording'!
-                self.assertEqual(plat.main_history[idx_rec2:], ["recording"])
+                # While #2 is recording, ZERO non-recording main-capsule calls (recognizing/refining/done) may overwrite it!
+                # The only allowed main update is refreshing recording's bg_count badge (1 -> 0) when #1 drains.
+                self.assertTrue(all(st == "recording" for st in plat.main_history[idx_rec2:]))
                 self.assertEqual(daemon._main_hud_state, "recording")
+                self.assertEqual(daemon._main_hud_bg_count, 0)
 
                 # Cancel recording #2 -> drains completely to idle with main HUD hidden (zero dangling HUD)
                 daemon.handle_cancel()
                 self.assertEqual(daemon.state, "idle")
                 self.assertFalse(daemon._main_hud_visible)
                 self.assertEqual(daemon._main_hud_state, "")
+                self.assertEqual(daemon._main_hud_bg_count, 0)
             finally:
                 asr_hold.set()
+                daemon.close()
+
+    def test_rapid_fire_recording_bg_count_badge_refresh_and_clear_main_invariants(self) -> None:
+        from agent_voice_input.refiner import BaseRefiner
+
+        gate1 = threading.Event()
+        gate2 = threading.Event()
+        s2_entered = threading.Event()
+        s2_second_entered = threading.Event()
+
+        class _HudRecordPlat(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.hud_log: list[tuple[str, dict[str, object]]] = []
+                self.copy_next_seq: set[int] = set()
+
+            def hud(self, state: str, text: str = "", duration_ms: int = 0, **kw: object) -> None:
+                super().hud(state, text=text, duration_ms=duration_ms, **kw)
+                self.hud_log.append((state, dict(kw)))
+
+            def deliver_text(self, text: str, seq_id: int, target_hwnd: int = 0, **kw: object) -> PasteOutcome:
+                if seq_id in self.copy_next_seq:
+                    if callable(bc := kw.get("before_commit")) and not bc():
+                        return PasteOutcome(False, False, "cancelled", "WindowsTerminal")
+                    return PasteOutcome(False, True, "focus_changed", "chrome")
+                return super().deliver_text(text, seq_id, target_hwnd=target_hwnd, **kw)
+
+        class _FastAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.n = 0
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
+                self.n += 1
+                return AsrResult(text=f"连发句子{self.n}", provider="dashscope", model="qwen3-asr-flash", latency_ms=4)
+
+        class _GatedRefiner(BaseRefiner):
+            provider_name = "codex"
+
+            def __init__(self) -> None:
+                self.n = 0
+                self._lk = threading.Lock()
+
+            def refine(self, asr_input: object, **_kw: object) -> RefinerResult:
+                with self._lk:
+                    self.n += 1
+                    idx = self.n
+                raw = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                if idx == 1:
+                    s2_entered.set()
+                    gate1.wait(timeout=3.0)
+                elif idx == 2:
+                    s2_second_entered.set()
+                    gate2.wait(timeout=3.0)
+                return RefinerResult(text=raw, provider="codex", model="gpt-6-luna", latency_ms=5)
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            plat = _HudRecordPlat()
+            daemon = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="codex")),
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FastAsr(),
+                refiner=_GatedRefiner(),
+                tracker=_isolated_tracker(rt),
+                paste_settle_sec=0.0,
+            )
+            try:
+                # 1. Start & stop #1 (enters Stage 2 refiner and blocks on gate1)
+                daemon.handle_trigger("toggle")
+                self.assertEqual(plat.hud_log[-1], ("recording", {"clear_toast": True}))
+                daemon._last_trigger_ts = -1e9
+                s1 = daemon.handle_trigger("toggle")
+                self.assertTrue(s2_entered.wait(timeout=2.0))
+
+                # 2. Start & stop #2 while #1 is in-flight -> recording receives bg_count=1
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                self.assertEqual(plat.hud_log[-1], ("recording", {"clear_toast": True, "bg_count": 1}))
+                self.assertEqual(daemon._main_hud_bg_count, 1)
+                daemon._last_trigger_ts = -1e9
+                s2 = daemon.handle_trigger("toggle")
+                plat.copy_next_seq.add(int(s2["seq_id"]))
+                self.assertTrue(s2_second_entered.wait(timeout=2.0))
+
+                # 3. Start #3 while BOTH #1 & #2 are in-flight -> recording receives bg_count=2
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                self.assertEqual(plat.hud_log[-1], ("recording", {"clear_toast": True, "bg_count": 2}))
+                self.assertEqual(daemon._main_hud_bg_count, 2)
+                log_mark = len(plat.hud_log)
+
+                # Release #1 while #3 is still recording -> refreshes bg_count 2 -> 1 with clear_toast=False
+                gate1.set()
+                dl = time.monotonic() + 2.0
+                while time.monotonic() < dl and daemon.last_result.get("seq_id") != s1["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(daemon._main_hud_bg_count, 1)
+                self.assertIn(("recording", {"clear_toast": False, "bg_count": 1}), plat.hud_log[log_mark:])
+
+                # Release #2 (focus-switched -> copied toast) while #3 is still recording:
+                # refreshes recording badge 1 -> 0 (clear_toast=False) BEFORE emitting copied toast (clear_main=False)!
+                log_mark2 = len(plat.hud_log)
+                gate2.set()
+                dl = time.monotonic() + 2.0
+                while time.monotonic() < dl and daemon.last_result.get("seq_id") != s2["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(daemon._main_hud_bg_count, 0)
+                tail2 = plat.hud_log[log_mark2:]
+                self.assertEqual(
+                    tail2,
+                    [
+                        ("recording", {"clear_toast": False}),
+                        ("copied", {"layer": "toast", "clear_main": False}),
+                    ],
+                )
+
+                # 4. Cancel recording #3 when zero background tasks remain -> cancelled toast sets clear_main=True
+                log_mark3 = len(plat.hud_log)
+                res_c3 = daemon.handle_cancel()
+                self.assertTrue(res_c3["ok"])
+                self.assertEqual(daemon.state, "idle")
+                self.assertFalse(daemon._main_hud_visible)
+                self.assertEqual(plat.hud_log[log_mark3:], [("cancelled", {"clear_main": True})])
+
+                # 5. Cancel background task while a new recording is active -> refreshes bg_count & keeps recording main
+                gate1.clear()
+                s2_entered.clear()
+                gate3 = threading.Event()
+                # Re-gate next refine by replacing refiner with a fresh gated refiner
+                class _BlockRefiner(BaseRefiner):
+                    provider_name = "codex"
+
+                    def refine(self, asr_input: object, *, cancel_token: object = None, **_kw: object) -> RefinerResult:
+                        s2_entered.set()
+                        gate3.wait(timeout=2.0)
+                        raw = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                        return RefinerResult(text=raw, provider="codex", model="gpt-6-luna", latency_ms=5)
+
+                daemon.refiner = _BlockRefiner()
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                s4 = daemon.handle_trigger("toggle")
+                self.assertTrue(s2_entered.wait(timeout=2.0))
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                self.assertEqual(plat.hud_log[-1], ("recording", {"clear_toast": True, "bg_count": 1}))
+                log_mark4 = len(plat.hud_log)
+                res_c4 = daemon.handle_cancel(seq_id=int(s4["seq_id"]))
+                gate3.set()
+                self.assertTrue(res_c4["ok"])
+                self.assertEqual(daemon._main_hud_bg_count, 0)
+                self.assertEqual(
+                    plat.hud_log[log_mark4:],
+                    [
+                        ("recording", {"clear_toast": False}),
+                        ("cancelled", {"clear_main": False}),
+                    ],
+                )
+                daemon.handle_cancel()
+                self.assertEqual(daemon.state, "idle")
+                self.assertFalse(daemon._main_hud_visible)
+            finally:
+                gate1.set()
+                gate2.set()
+                daemon.close()
+
+    def test_recorder_lost_stale_bg_snapshot_does_not_resurrect_permanent_main_hud(self) -> None:
+        """If the last visible background task finishes after _on_recorder_lost releases _lock
+        (e.g. during telemetry write), HUD emission MUST re-read state under _hud_lock and
+        NEVER re-emit a stale recognizing/refining main pill."""
+        from agent_voice_input.refiner import BaseRefiner
+
+        voiced = _voiced_wav()
+        s1_in_asr = threading.Event()
+        s1_release = threading.Event()
+
+        class _GatedAsr(BaseAsrProvider):
+            provider_name = "mock_asr"
+
+            def __init__(self) -> None:
+                pass
+
+            def transcribe(self, wav_bytes: bytes, context: object = None, **_kw: object) -> AsrResult:
+                s1_in_asr.set()
+                s1_release.wait(timeout=3.0)
+                return AsrResult(text="first sentence", provider="mock_asr", latency_ms=10)
+
+        class _PassRefiner(BaseRefiner):
+            provider_name = "codex"
+
+            def refine(self, asr_input: object, **_kw: object) -> RefinerResult:
+                raw = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                return RefinerResult(text=raw, provider="codex", model="gpt-6-luna", latency_ms=5)
+
+        class _LostPlat(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.hud_log: list[tuple[str, dict[str, Any]]] = []
+                self.stop_calls = 0
+
+            def hud(self, state: str, text: str = "", duration_ms: int = 0, **kw: Any) -> None:
+                super().hud(state, text=text, duration_ms=duration_ms, **kw)
+                self.hud_log.append((state, dict(kw)))
+
+            def stop_recording(self, drain: bool = True) -> tuple[bytes, str]:
+                self.stop_calls += 1
+                if self.stop_calls == 1:
+                    return voiced, "mock"
+                return b"", "mock"
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            plat = _LostPlat()
+            daemon = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="codex")),
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_GatedAsr(),
+                refiner=_PassRefiner(),
+                tracker=_isolated_tracker(rt),
+                paste_settle_sec=0.0,
+            )
+            orig_append = daemon._append_telemetry
+            hooked = [False]
+
+            def _racing_append(rec: dict[str, Any]) -> None:
+                orig_append(rec)
+                if not hooked[0] and rec.get("skipped_reason") == "mic_disconnected":
+                    hooked[0] = True
+                    # Utterance #1 finishes RIGHT HERE between releasing _lock and emitting error HUD!
+                    s1_release.set()
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline and daemon._visible_inflight_count_locked() > 0:
+                        time.sleep(0.01)
+
+            daemon._append_telemetry = _racing_append  # type: ignore[method-assign]
+            try:
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                s1 = daemon.handle_trigger("toggle")
+                self.assertTrue(s1["ok"])
+                self.assertTrue(s1_in_asr.wait(timeout=2.0))
+
+                daemon._last_trigger_ts = -1e9
+                s2 = daemon.handle_trigger("toggle")
+                self.assertTrue(s2["ok"])
+                seq2 = int(s2["seq_id"])
+
+                mark = len(plat.hud_log)
+                daemon._on_recorder_lost(seq_id=seq2)
+
+                tail = plat.hud_log[mark:]
+                # Must NOT resurrect recognizing/refining after #1 finished; mic_disconnected clears main!
+                disc_idx = next(i for i, (st, _) in enumerate(tail) if st == "mic_disconnected")
+                self.assertEqual(tail[disc_idx][1].get("clear_main"), True)
+                self.assertNotIn("recognizing", [st for st, _ in tail[disc_idx:]])
+                self.assertNotIn("refining", [st for st, _ in tail[disc_idx:]])
+                self.assertFalse(daemon._main_hud_visible)
+                self.assertEqual(daemon.state, "idle")
+            finally:
+                s1_release.set()
+                daemon.close()
+
+    def test_silent_task_coexisting_with_visible_task_preserves_visible_main_hud_on_error_and_cancel(self) -> None:
+        """When a silent_hud task is in refining (global state=refining) while a visible task is in
+        recognizing (visible_only=recognizing), stop-error and cancel HUD paths MUST preserve the
+        visible task's main pill instead of clearing it due to global_state != visible_stage."""
+        from agent_voice_input.daemon import _CommitSlot, _QueuedUtterance, _Stage1State
+        from agent_voice_input.platform_common import MicrophoneUnavailableError
+        from agent_voice_input.refiner import BaseRefiner
+
+        voiced = _voiced_wav()
+
+        class _ErrStopPlat(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.hud_log: list[tuple[str, dict[str, Any]]] = []
+
+            def hud(self, state: str, text: str = "", duration_ms: int = 0, **kw: Any) -> None:
+                super().hud(state, text=text, duration_ms=duration_ms, **kw)
+                self.hud_log.append((state, dict(kw)))
+
+            def stop_recording(self, drain: bool = True) -> tuple[bytes, str]:
+                raise MicrophoneUnavailableError("device busy", reason_code="mic_unavailable", hud_state="mic_unavailable")
+
+        class _NoopAsr(BaseAsrProvider):
+            provider_name = "mock_asr"
+
+            def __init__(self) -> None:
+                pass
+
+            def transcribe(self, wav_bytes: bytes, context: object = None, **_kw: object) -> AsrResult:
+                return AsrResult(text="ok", provider="mock_asr", latency_ms=1)
+
+        class _NoopRefiner(BaseRefiner):
+            provider_name = "codex"
+
+            def refine(self, asr_input: object, **_kw: object) -> RefinerResult:
+                return RefinerResult(text="ok", provider="codex", model="gpt-6-luna", latency_ms=1)
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            plat = _ErrStopPlat()
+            daemon = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="codex")),
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_NoopAsr(),
+                refiner=_NoopRefiner(),
+                tracker=_isolated_tracker(rt),
+                paste_settle_sec=0.0,
+            )
+            try:
+                # Seed a silent task in refining + visible tasks in recognizing (global != visible)
+                silent_task = _QueuedUtterance(
+                    seq_id=101,
+                    raw_wav=voiced,
+                    audio_source="mock",
+                    origin_win=ForegroundWindow(1, "WindowsTerminal.exe", "term"),
+                    no_paste=False,
+                    silent_hud=True,
+                )
+                silent_slot = _CommitSlot(task=silent_task, st=_Stage1State(t_total0=0.0), stage="refining")
+                vis_task = _QueuedUtterance(
+                    seq_id=102,
+                    raw_wav=voiced,
+                    audio_source="mock",
+                    origin_win=ForegroundWindow(1, "WindowsTerminal.exe", "term"),
+                    no_paste=False,
+                    silent_hud=False,
+                )
+                extra_vis = _QueuedUtterance(
+                    seq_id=103,
+                    raw_wav=voiced,
+                    audio_source="mock",
+                    origin_win=ForegroundWindow(1, "WindowsTerminal.exe", "term"),
+                    no_paste=False,
+                    silent_hud=False,
+                )
+                with daemon._lock:
+                    daemon._commit_queue.append(silent_slot)
+                    daemon._utterance_queue.append(vis_task)
+                    daemon._utterance_queue.append(extra_vis)
+                    daemon.seq_id = 103
+                    daemon._main_hud_state = "recognizing"
+                    daemon._main_hud_visible = True
+                    self.assertEqual(daemon._recompute_state_locked(), "refining")
+                    self.assertEqual(daemon._derive_bg_stage_locked(visible_only=True), "recognizing")
+
+                # 1. Start + failing stop_recording must NOT emit clear_main=True while vis_task is active
+                daemon._last_trigger_ts = -1e9
+                r_start = daemon.handle_trigger("toggle")
+                self.assertTrue(r_start["ok"])
+                plat.hud_log.clear()
+                daemon._last_trigger_ts = -1e9
+                r_stop = daemon.handle_trigger("toggle")
+                self.assertFalse(r_stop["ok"])
+                self.assertEqual(r_stop["state"], "refining")
+                self.assertTrue(daemon._main_hud_visible)
+                self.assertEqual(daemon._main_hud_state, "recognizing")
+                # First HUD event on stop MUST derive from visible tasks (recognizing), NEVER leak silent task's refining!
+                self.assertEqual(
+                    plat.hud_log,
+                    [("recognizing", {}), ("mic_unavailable", {"clear_main": False})],
+                )
+
+                # 2. Cancelling extra_vis while vis_task & silent_task remain must keep vis_task main pill
+                plat.hud_log.clear()
+                r_can = daemon.handle_cancel(seq_id=103)
+                self.assertTrue(r_can["ok"])
+                self.assertEqual(r_can["state"], "refining")
+                self.assertTrue(daemon._main_hud_visible)
+                self.assertEqual(daemon._main_hud_state, "recognizing")
+                self.assertEqual(plat.hud_log, [("cancelled", {"clear_main": False})])
+            finally:
+                with daemon._lock:
+                    daemon._commit_queue.clear()
+                    daemon._utterance_queue.clear()
                 daemon.close()
 
     def test_win_shim_dll_cache_and_clip_guard_static_contracts(self) -> None:
