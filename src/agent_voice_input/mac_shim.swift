@@ -2310,18 +2310,30 @@ private func runSelfCheck() -> Int32 {
             pbg.flushPendingRestore()
             try check(testPb.string(forType: .string) == "voice_oversize_2", "pb oversize #2 retained")
 
-            // 5) PNG + oversize TIFF coexistence deduplicates TIFF (only snapshots PNG, avoiding double bitmap quota), while TIFF-only falls back cleanly
+            // 5) PNG + oversize/small TIFF coexistence deduplicates TIFF (only snapshots PNG, avoiding double bitmap quota), while TIFF-only falls back cleanly
             testPb.clearContents()
             let dualImgItem = NSPasteboardItem()
+            let oversizeTiff = Data(repeating: 0xBB, count: 8192)
             let okDualPng = dualImgItem.setData(samplePng, forType: .png)
-            let okDualTiff = dualImgItem.setData(Data(repeating: 0xBB, count: 8192), forType: .tiff)
+            let okDualTiff = dualImgItem.setData(oversizeTiff, forType: .tiff)
             try check(okDualPng && okDualTiff && testPb.writeObjects([dualImgItem]), "pb seed PNG+TIFF")
             let dualSeedTypes = testPb.pasteboardItems?.first?.types ?? []
             try check(dualSeedTypes.contains(.png) && dualSeedTypes.contains(.tiff), "pb seed contains both PNG and TIFF")
             try check(pbg.writeTransientAndArm("voice_dual_img"), "pb transient over PNG+TIFF")
             try check(pbg.restorePending, "pb PNG+TIFF armed without double-counting oversize TIFF")
             pbg.flushPendingRestore()
-            try check(!pbg.restorePending && testPb.data(forType: .png) == samplePng && testPb.data(forType: .tiff) == nil, "pb PNG restored without TIFF duplication")
+            // AppKit NSPasteboard may implicitly expose a translated TIFF flavor when PNG is present;
+            // verify exact PNG restoration and that our seeded TIFF payloads were never snapshotted back.
+            let restoredDualTiff = testPb.data(forType: .tiff)
+            try check(!pbg.restorePending && testPb.data(forType: .png) == samplePng && restoredDualTiff != oversizeTiff, "pb PNG restored without TIFF duplication")
+
+            let tinySentinelTiff = Data([0x49, 0x49, 0x2A, 0x00, 0xDE, 0xAD, 0xBE, 0xEF])
+            testPb.clearContents()
+            let dualSmallItem = NSPasteboardItem()
+            try check(dualSmallItem.setData(samplePng, forType: .png) && dualSmallItem.setData(tinySentinelTiff, forType: .tiff) && testPb.writeObjects([dualSmallItem]), "pb seed PNG+small TIFF")
+            try check(pbg.writeTransientAndArm("voice_dual_small"), "pb transient over PNG+small TIFF")
+            pbg.flushPendingRestore()
+            try check(!pbg.restorePending && testPb.data(forType: .png) == samplePng && testPb.data(forType: .tiff) != tinySentinelTiff, "pb PNG+small TIFF skipped TIFF capture")
 
             let sampleTiff = Data([0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00])
             testPb.clearContents()

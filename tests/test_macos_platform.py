@@ -1636,11 +1636,15 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertEqual(wav_post_sw[44:], b"\x11\x22" * 3200)
 
             # Late EOF arriving AFTER 0.08s wait while post_st RPC is in flight must not be swallowed
+            late_exit_gate = tmp / "late_eof_go"
             late_eof_seg2 = (
-                "import os, sys, time\n"
+                "import os, pathlib, sys, time\n"
                 "os.write(1, b'\\x77\\x88' * 200)\n"
                 "sys.stdout.flush()\n"
-                "time.sleep(0.11)\n"
+                f"gate = pathlib.Path({str(late_exit_gate)!r})\n"
+                "deadline = time.monotonic() + 2.0\n"
+                "while not gate.exists() and time.monotonic() < deadline:\n"
+                "    time.sleep(0.005)\n"
                 "sys.exit(1)\n"
             )
             late_gen = [0]
@@ -1658,7 +1662,13 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 if payload.get("cmd") == "audio_status":
                     late_rpc_calls[0] += 1
                     if late_rpc_calls[0] >= 3:
-                        time.sleep(0.12)
+                        late_exit_gate.write_text("go", encoding="utf-8")
+                        wait_dl = time.monotonic() + 1.5
+                        while time.monotonic() < wait_dl:
+                            sess = plat_late._cur_session
+                            if sess is not None and (sess.pending_exit or not sess.rec.is_running):
+                                break
+                            time.sleep(0.005)
                 return plat_rec._shim_rpc(payload, timeout_sec=timeout_sec)
 
             plat_late._shim_rpc = _slow_post_rpc  # type: ignore[method-assign]

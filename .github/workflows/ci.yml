@@ -40,6 +40,11 @@ jobs:
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: command -v tmux >/dev/null 2>&1 || brew install tmux
 
+      - name: Install ffmpeg for audio_proc tests and branch coverage gate (Linux 3.12)
+        if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        run: |
+          command -v ffmpeg >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg)
+
       - name: Run offline unit tests with tiered statement & pure-branch coverage gate
         if: runner.os == 'Linux' && matrix.python-version == '3.12'
         run: |

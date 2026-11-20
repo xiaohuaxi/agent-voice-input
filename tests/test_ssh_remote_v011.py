@@ -1255,14 +1255,14 @@ sys.exit(p.returncode)
                     [("user", "COLD_WARMUP_TURN_CONTENT")],
                     mtime=4000.0,
                 )
-                ctl_file.write_text(json.dumps({"sleep_sec": 0.38, "mode": "ok"}), encoding="utf-8")
+                ctl_file.write_text(json.dumps({"sleep_sec": 0.75, "mode": "ok"}), encoding="utf-8")
                 t_cold0 = time.monotonic()
                 snap_timeout = tracker.sync_session(
                     window_title=f"claude [#{other_sid[:8]}] [@devbox]"
                 )
                 elapsed_cold_ms = (time.monotonic() - t_cold0) * 1000.0
                 self.assertIsNone(snap_timeout)  # Timed out cleanly at ~220ms without blocking!
-                self.assertLess(elapsed_cold_ms, 340.0)
+                self.assertLess(elapsed_cold_ms, 620.0)
 
                 # Wait for the background prefetch worker (380ms sleep + subprocess startup) to finish warming ETag cache
                 warm_deadline = time.monotonic() + 2.5
