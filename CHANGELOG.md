@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-20
+
+### Added
+- **Official `diagnose` CLI subcommand, Doubao 1.0 `--ping` & full `--help` coverage**: Added `agent-voice-input diagnose [--last N] [--json]` for read-only live diagnostics (daemon health, latency p50, prompt-cache hits, `failed/` count, and redacted log tail), added Doubao ASR 1.0 endpoint `--ping` probing in `doctor`, surfaced resolved active ASR/Refiner pipelines across `status` and `doctor`, and completed `--help` coverage across all subcommands.
+- **3-zone live hold-to-cancel hotkey FSM & in-place hold preview**: Replaced release-only cancel handling in `tap_toggle` mode with a responsive 3-zone state machine (`<= 500ms` isolated tap toggles recording, `500–800ms` silent hesitation deadzone, and `>= 800ms` configurable `hold_cancel_ms` firing `hold_cancel` immediately while still held and swallowing the subsequent release), displaying a live in-place preview hint (`"继续按住取消…"` / `"keep holding to cancel…"`) after `250ms` and enabling layered cancellation across both active recording and in-flight processing (lifting the `only_inflight=True` restriction).
+- **Back-to-back in-flight HUD badge (`+1`/`+2`) & bilingual offscreen layout self-checks**: Added background in-flight count badges (`+1`, `+2`, …) to the HUD pill during pipelined dictation, and added automated bilingual offscreen pixel-layout self-checks across Windows (`win_shim.ps1`, 216 cases) and macOS Retina (`mac_shim.swift`), wired into `e2e_system.py` (`C7`).
+
+### Changed
+- **Idempotent `start`, unconditional `restart` & explicit `status` states**: Made `agent-voice-input start` cleanly idempotent while warning when the running daemon's code or version has drifted from disk, made `restart` unconditionally stop and relaunch, and distinguished `stopped`, `unresponsive`, and `error` states in `status` (with `--history N`).
+- **Zero-surprise `auto` pipeline routing & cross-stage provider aliases**: Unified Codex subscription vs. API-key authentication mode checks and base-URL sanitization so `refiner.provider = "auto"` only reuses confirmed local ChatGPT subscription logins without unexpected API billing; added cross-stage aliases (`volcengine`/`volc` → `doubao` for Stage 1, `doubao`/`volc`/`ark` → `volcengine` for Stage 2, and `bailian` → `dashscope` on both stages).
+- **Refined 3-end recording copy & smooth `tap_max_ms` config migration**: Tightened recording HUD prompts across Python, Windows, and macOS (`"按右 Ctrl 结束"` / `"松开右 Ctrl 结束"` and matching English copy) and preserved smooth backward compatibility for legacy `hotkey.tap_max_ms` configurations alongside the new `500ms` default and `hold_cancel_ms = 800`.
+
+### Fixed
+- **Cross-platform hotkey chord state self-healing**: Added Windows stale `_otherDown` key state self-healing in `win_shim.ps1` and periodic macOS modifier-chord re-checks in `mac_shim.swift` so interrupted modifier chords do not leave hotkeys stuck.
+- **CI runner tool completeness & `voice-eval` cache isolation**: Installed `ffmpeg` and `tmux` across all GitHub Actions runners and forbade silent test skips in CI (`ci.yml` / `publish.yml`), and isolated per-slot ASR cache keys while fixing `--manifest-from` denominator counts in `eval_recordings.py`.
+
 ## [0.9.1] - 2026-11-20
 
 ### Added
@@ -110,7 +126,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Initial WSL2 release**: Two-stage context-aware voice input daemon and CLI for coding agents (**Codex**, **Claude Code**, **AGY**) on Windows + WSL2, featuring native `win_shim.ps1` WASAPI capture, global hotkey & HUD bridge, active terminal session discovery, `ffmpeg` loudness normalization with local silence gating, and safe paste without auto-pressing `Enter`.
 
-[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.7.1...v0.8.0
