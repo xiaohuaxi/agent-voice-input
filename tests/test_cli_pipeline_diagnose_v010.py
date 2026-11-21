@@ -748,27 +748,27 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
         cfg = Config(asr=AsrConfig(provider="doubao"))
         creds = resolve_credentials(cfg, env)
 
-        # 1. SeedASR 2.0 unavailable (45000030) -> Doubao 1.0 submit unavailable (45000000) -> 1.0 Turbo flash OK (20000000)
+        # 1. 1.0 Turbo flash unavailable (45000030) -> SeedASR 2.0 unavailable (45000000) -> 1.0 standard submit OK (20000000)
         seen_slots: list[tuple[str, str]] = []
 
         def _fallback_tx(req: HttpRequest) -> HttpResponse:
             rid = req.headers.get("X-Api-Resource-Id", "")
             seen_slots.append((req.url.rsplit("/", 1)[-1], rid))
-            if rid == "volc.seedasr.auc":
+            if rid == "volc.bigasr.auc_turbo":
                 return HttpResponse(200, {"X-Api-Status-Code": "45000030", "X-Api-Message": "resource not granted"}, b"{}")
-            if rid == "volc.bigasr.auc":
+            if rid == "volc.seedasr.auc":
                 return HttpResponse(200, {"X-Api-Status-Code": "45000000", "X-Api-Message": "resource not allowed"}, b"{}")
             return HttpResponse(200, {"X-Api-Status-Code": "20000000", "X-Api-Message": "OK"}, b"{}")
 
         st_ok, _, msg_ok = DoubaoAsrProvider(cfg, creds, env=env, transport=_fallback_tx).probe_ping(timeout_sec=5.0)
         self.assertEqual(st_ok, "OK")
-        self.assertIn("volc.bigasr.auc_turbo/flash", msg_ok)
+        self.assertIn("volc.bigasr.auc/submit", msg_ok)
         self.assertEqual(
             seen_slots,
             [
+                ("flash", "volc.bigasr.auc_turbo"),
                 ("submit", "volc.seedasr.auc"),
                 ("submit", "volc.bigasr.auc"),
-                ("flash", "volc.bigasr.auc_turbo"),
             ],
         )
 

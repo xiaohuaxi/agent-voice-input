@@ -278,15 +278,16 @@ class AsrProvidersTests(unittest.TestCase):
         self.assertEqual(
             [(u.rsplit("/", 1)[-1], r) for u, r, _, _, _ in calls],
             [
+                ("flash", "volc.bigasr.auc_turbo"),
                 ("submit", "volc.seedasr.auc"),
                 ("submit", "volc.bigasr.auc"),
                 ("query", "volc.bigasr.auc"),
                 ("query", "volc.bigasr.auc"),
             ],
         )
-        submit_call = calls[1]
-        query_call_1 = calls[2]
-        query_call_2 = calls[3]
+        submit_call = calls[2]
+        query_call_1 = calls[3]
+        query_call_2 = calls[4]
         self.assertEqual(submit_call[2], query_call_1[2])
         self.assertEqual(submit_call[2], query_call_2[2])
         self.assertEqual(submit_call[3]["X-Api-App-Key"], "fake_appid_value")
@@ -399,13 +400,7 @@ class AsrProvidersTests(unittest.TestCase):
 
         def param_err_transport(req: HttpRequest) -> HttpResponse:
             step[0] += 1
-            if step[0] == 1 and req.url.endswith("/submit"):
-                return HttpResponse(
-                    status=200,
-                    headers={"x-api-status-code": "20000000"},
-                    body=b"{}",
-                )
-            if step[0] == 2 and req.url.endswith("/query"):
+            if step[0] == 1 and req.url.endswith("/recognize/flash"):
                 return HttpResponse(
                     status=200,
                     headers={"x-api-status-code": "20000000"},
@@ -438,8 +433,8 @@ class AsrProvidersTests(unittest.TestCase):
                 clock_fn=fake_clock,
                 sleep_fn=fake_sleep,
             )
-        # Fails immediately on the cached 2.0 slot without falling through 3 slots
-        self.assertEqual(step[0], 3)
+        # Fails immediately on the cached flash slot without falling through 3 slots
+        self.assertEqual(step[0], 2)
         self.assertIn("invalid audio sample rate", str(perr_ctx.exception))
 
     def test_doubao_auto_mode_filter_flash_fallback_and_poll_backoff_ladder(self) -> None:
@@ -474,40 +469,76 @@ class AsrProvidersTests(unittest.TestCase):
             ],
         )
 
-        # 2. resource_id="auto" + doubao_mode="auto" falls all the way to 1.0 turbo flash when both submit slots 403
+        # 2. resource_id="auto" + doubao_mode="auto" tries low-latency flash first, falls back to 2.0 standard on 403,
+        #    and caches volc.seedasr.auc in-process so the next call skips flash with zero 403!
         reset_doubao_slot_cache()
-        seen_turbo_fb: list[tuple[str, str]] = []
+        seen_seed_fb: list[tuple[str, str]] = []
 
-        def tx_turbo_only(req: HttpRequest) -> HttpResponse:
+        def tx_seed_fallback(req: HttpRequest) -> HttpResponse:
             rid = req.headers.get("X-Api-Resource-Id", "")
-            seen_turbo_fb.append((req.url.rsplit("/", 1)[-1], rid))
-            if rid != "volc.bigasr.auc_turbo":
+            seen_seed_fb.append((req.url.rsplit("/", 1)[-1], rid))
+            if rid == "volc.bigasr.auc_turbo":
                 return HttpResponse(
                     status=403,
                     headers={"x-api-status-code": "45000030"},
                     body=b'{"message":"requested resource not granted"}',
                 )
-            return HttpResponse(
-                status=200,
-                headers={"x-api-status-code": "20000000"},
-                body=json.dumps({"result": {"text": "turbo fallback ok"}}).encode("utf-8"),
-            )
+            if req.url.endswith("/submit") and rid == "volc.seedasr.auc":
+                return HttpResponse(200, {"x-api-status-code": "20000000"}, b"{}")
+            if req.url.endswith("/query") and rid == "volc.seedasr.auc":
+                return HttpResponse(
+                    status=200,
+                    headers={"x-api-status-code": "20000000"},
+                    body=json.dumps({"result": {"text": "seed 2.0 fallback ok"}}).encode("utf-8"),
+                )
+            raise AssertionError(f"unexpected request: {req.url} rid={rid}")
 
         cfg_auto = Config()
         cfg_auto.asr.provider = "doubao"
         cfg_auto.asr.hotwords_file = ""
-        res_turbo = transcribe(_sample_wav(), cfg_auto, env=env, transport=tx_turbo_only, sleep_fn=lambda _: None)
-        self.assertEqual(res_turbo.text, "turbo fallback ok")
+        res_seed1 = transcribe(_sample_wav(), cfg_auto, env=env, transport=tx_seed_fallback, sleep_fn=lambda _: None)
+        self.assertEqual(res_seed1.text, "seed 2.0 fallback ok")
         self.assertEqual(
-            seen_turbo_fb,
+            seen_seed_fb,
+            [
+                ("flash", "volc.bigasr.auc_turbo"),
+                ("submit", "volc.seedasr.auc"),
+                ("query", "volc.seedasr.auc"),
+            ],
+        )
+        seen_seed_fb.clear()
+        res_seed2 = transcribe(_sample_wav(), cfg_auto, env=env, transport=tx_seed_fallback, sleep_fn=lambda _: None)
+        self.assertEqual(res_seed2.text, "seed 2.0 fallback ok")
+        self.assertEqual(
+            seen_seed_fb,
             [
                 ("submit", "volc.seedasr.auc"),
-                ("submit", "volc.bigasr.auc"),
-                ("flash", "volc.bigasr.auc_turbo"),
+                ("query", "volc.seedasr.auc"),
             ],
         )
 
-        # 3. Cached flash slot MUST NOT leak into an explicit doubao_mode="submit" auto call
+        # 3. Cached submit slot MUST NOT leak into an explicit doubao_mode="flash" auto call
+        seen_flash_only: list[tuple[str, str]] = []
+
+        def tx_flash_only(req: HttpRequest) -> HttpResponse:
+            rid = req.headers.get("X-Api-Resource-Id", "")
+            seen_flash_only.append((req.url.rsplit("/", 1)[-1], rid))
+            return HttpResponse(
+                200,
+                {"x-api-status-code": "20000000"},
+                json.dumps({"result": {"text": "flash mode ok"}}).encode("utf-8"),
+            )
+
+        cfg_flash = Config()
+        cfg_flash.asr.provider = "doubao"
+        cfg_flash.asr.resource_id = "auto"
+        cfg_flash.asr.doubao_mode = "flash"
+        cfg_flash.asr.hotwords_file = ""
+        res_fl = transcribe(_sample_wav(), cfg_flash, env=env, transport=tx_flash_only, sleep_fn=lambda _: None)
+        self.assertEqual(res_fl.text, "flash mode ok")
+        self.assertEqual(seen_flash_only, [("flash", "volc.bigasr.auc_turbo")])
+
+        # 4. Cached flash slot MUST NOT leak into an explicit doubao_mode="submit" auto call
         seen_after_flash_cache: list[tuple[str, str]] = []
 
         def tx_seed_ok(req: HttpRequest) -> HttpResponse:
@@ -530,27 +561,6 @@ class AsrProvidersTests(unittest.TestCase):
                 ("query", "volc.seedasr.auc"),
             ],
         )
-
-        # 4. Cached submit slot MUST NOT leak into an explicit doubao_mode="flash" auto call
-        seen_flash_only: list[tuple[str, str]] = []
-
-        def tx_flash_only(req: HttpRequest) -> HttpResponse:
-            rid = req.headers.get("X-Api-Resource-Id", "")
-            seen_flash_only.append((req.url.rsplit("/", 1)[-1], rid))
-            return HttpResponse(
-                200,
-                {"x-api-status-code": "20000000"},
-                json.dumps({"result": {"text": "flash mode ok"}}).encode("utf-8"),
-            )
-
-        cfg_flash = Config()
-        cfg_flash.asr.provider = "doubao"
-        cfg_flash.asr.resource_id = "auto"
-        cfg_flash.asr.doubao_mode = "flash"
-        cfg_flash.asr.hotwords_file = ""
-        res_fl = transcribe(_sample_wav(), cfg_flash, env=env, transport=tx_flash_only, sleep_fn=lambda _: None)
-        self.assertEqual(res_fl.text, "flash mode ok")
-        self.assertEqual(seen_flash_only, [("flash", "volc.bigasr.auc_turbo")])
 
         # 5. Adaptive /query polling backoff ladder: 0.30s (<=2s) -> 0.50s (2..6s) -> 0.80s (>6s), zero real sleep
         reset_doubao_slot_cache()

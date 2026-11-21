@@ -950,9 +950,9 @@ class DashScopeAsrProvider(BaseAsrProvider):
 # ---------------------------------------------------------------------------
 
 DOUBAO_AUTO_SLOT_CHAIN: tuple[tuple[str, str], ...] = (
+    ("flash", "volc.bigasr.auc_turbo"),
     ("submit", "volc.seedasr.auc"),
     ("submit", "volc.bigasr.auc"),
-    ("flash", "volc.bigasr.auc_turbo"),
 )
 
 
