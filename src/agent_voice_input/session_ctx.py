@@ -146,6 +146,7 @@ from .workspace_ctx import (
     _resolve_safe_local_dir,
     discover_antigravity_ide_prior_sessions,
     extract_turn_hotwords,
+    get_builtin_agent_hotwords,
     is_wsl_slow_mount_path,
     read_git_status_summary,
     read_repo_core_files,
@@ -5843,9 +5844,10 @@ class SessionTracker:
         extra_hotwords: Sequence[str] = (),
         max_dialog_chars: int = 16000,
         mode: str = "agent",
+        language: str = "auto",
     ) -> AsrContext:
         eff_mode = (mode or "agent").strip().lower() or "agent"
-        builtin_tail = () if eff_mode == "general" else BUILTIN_AGENT_HOTWORDS
+        builtin_tail = () if eff_mode == "general" else get_builtin_agent_hotwords(language)
         if eff_mode == "general" or snapshot is None:
             return AsrContext(
                 hotwords=_dedupe_hotwords_ci([*extra_hotwords, *builtin_tail]),

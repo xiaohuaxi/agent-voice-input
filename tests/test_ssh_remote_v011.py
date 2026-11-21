@@ -2520,6 +2520,86 @@ sys.exit(p.returncode)
                 _parse_title_remote_hints(r'"C:\Program Files\OpenSSH\ssh.exe" -p 2222 alice+ops@192.168.1.10', set()),
                 (True, "192.168.1.10", ""),
             )
+            # Eternal Terminal (`et`) & general SSH client title + argv recognition
+            from agent_voice_input.remote_ssh import extract_ssh_target_from_argv
+
+            self.assertEqual(_parse_title_remote_hints("et user@devbox", set()), (True, "devbox", ""))
+            self.assertEqual(_parse_title_remote_hints("et -p 2022 prod", set()), (True, "prod", ""))
+            self.assertEqual(_parse_title_remote_hints("et -u alice devbox", set()), (True, "devbox", ""))
+            self.assertEqual(_parse_title_remote_hints("et -t prod", set()), (True, "prod", ""))
+            self.assertEqual(_parse_title_remote_hints("et -L 8080:8080 prod", set()), (True, "prod", ""))
+            self.assertEqual(_parse_title_remote_hints("et --name work prod", set()), (True, "prod", ""))
+            self.assertEqual(_parse_title_remote_hints("et --ssh-config none prod", set()), (True, "prod", ""))
+            self.assertEqual(_parse_title_remote_hints("et --attach work", set()), (True, "", ""))
+            self.assertEqual(_parse_title_remote_hints("et --attach=work", set()), (True, "", ""))
+            self.assertEqual(_parse_title_remote_hints("et --port 2022 prod", set()), (True, "prod", ""))
+            self.assertEqual(_parse_title_remote_hints("et --port=2022 --username=alice prod", set()), (True, "prod", ""))
+            self.assertEqual(_parse_title_remote_hints("et user@devbox:2022", set()), (True, "devbox", ""))
+            self.assertEqual(_parse_title_remote_hints("/opt/homebrew/bin/et user@devbox", set()), (True, "devbox", ""))
+            self.assertEqual(_parse_title_remote_hints("/usr/bin/ssh devbox", set()), (True, "devbox", ""))
+            self.assertEqual(_parse_title_remote_hints("et", set()), (True, "", ""))
+            self.assertEqual(_parse_title_remote_hints("ssh", set()), (True, "", ""))
+            self.assertEqual(_parse_title_remote_hints("et localhost", {"localhost"}), (False, "", ""))
+            self.assertEqual(_parse_title_remote_hints("et --list", set()), (False, "", ""))
+            self.assertEqual(_parse_title_remote_hints("et --kill", set()), (False, "", ""))
+            self.assertEqual(_parse_title_remote_hints("et --help", set()), (False, "", ""))
+            self.assertEqual(_parse_title_remote_hints("et --version", set()), (False, "", ""))
+            self.assertEqual(_parse_title_remote_hints("et prod git-upload-pack repo", set()), (False, "", ""))
+            for non_et_title in (
+                "etc/hosts",
+                "/etc/hosts",
+                "etiquette",
+                "git fetch",
+                "rocket prod",
+                "et-tool devbox",
+                "~/repos/et",
+                "/home/user/et",
+                "/home/user/ssh",
+                "~/repos/mosh",
+                "/srv/autossh",
+                "~/work/slogin",
+            ):
+                self.assertEqual(
+                    _parse_title_remote_hints(non_et_title, set()),
+                    (False, "", ""),
+                    f"unexpected remote match for {non_et_title!r}",
+                )
+            for et_argv, expected_et in (
+                (["et", "-u", "alice", "devbox"], ("devbox", True)),
+                (["et", "-t", "prod"], ("prod", True)),
+                (["et", "-L", "8080:8080", "prod"], ("prod", True)),
+                (["et", "--name", "work", "prod"], ("prod", True)),
+                (["et", "--name=work", "prod"], ("prod", True)),
+                (["et", "--ssh-config", "none", "prod"], ("prod", True)),
+                (["et", "--attach", "work"], ("", True)),
+                (["et", "--attach=work"], ("", True)),
+                (["et", "--port", "2022", "prod"], ("prod", True)),
+                (["et", "--port=2022", "--username=alice", "prod"], ("prod", True)),
+                (["et", "user@devbox:2022"], ("devbox", True)),
+                (["et", "-c", "tmux", "--initial-dir", "/srv/app", "--tunnel", "8080:8080", "-r", "9090:9090", "--jumphost", "bastion", "--jport", "2022", "-l", "/tmp", "--serverfifo", "/tmp/f", "prod"], ("prod", True)),
+                (["et", "--host", "devbox", "--port", "2022"], ("devbox", True)),
+                (["et", "--host=devbox:2022"], ("devbox", True)),
+                (["et", "-v", "--", "devbox"], ("devbox", True)),
+                (["et", "-p2022", "-ualice", "devbox"], ("devbox", True)),
+                (["et", "prod", "tmux", "attach"], ("prod", True)),
+                (["et", "prod", "git-upload-pack", "repo"], ("", False)),
+                (["et", "--", "prod", "git-upload-pack", "repo"], ("", False)),
+                (["et", "prod", "python3", "-"], ("", False)),
+                (["et", "--list"], ("", False)),
+                (["et", "--kill"], ("", False)),
+                (["et", "--kill=work"], ("", False)),
+                (["et", "--help"], ("", False)),
+                (["et", "-h"], ("", False)),
+                (["et", "--version"], ("", False)),
+                (["et", "-N", "-L", "8080:8080", "prod"], ("", False)),
+                (["et", "--no-terminal", "prod"], ("", False)),
+                (["et", "-o", "BatchMode=yes", "prod"], ("", False)),
+                (["et", "-oBatchMode=yes", "prod"], ("", False)),
+                (["et", "--ssh-option", "BatchMode=yes", "prod"], ("", False)),
+                (["et", "--ssh-option=BatchMode=yes", "prod"], ("", False)),
+                (["et", "-v"], ("", True)),
+            ):
+                self.assertEqual(extract_ssh_target_from_argv(et_argv), expected_et, f"argv={et_argv!r}")
             h_corp = RemoteHostConfig(name="_dev_box", ssh_target="alice+ops@192.168.1.10")
             self.assertEqual(h_corp.name, "_dev_box")
 

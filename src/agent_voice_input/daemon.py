@@ -1219,6 +1219,7 @@ def _execute_stage1(
         st.snap,
         extra_hotwords=[*manual_hw, *extra_hw],
         mode=eff_mode,
+        language=cfg.ui.language,
     )
     asr_ctx.hotwords_scope = hw_scope
     asr_ctx.manual_hotwords_loaded = has_hw_file

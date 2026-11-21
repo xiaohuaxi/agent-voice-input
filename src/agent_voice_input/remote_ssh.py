@@ -52,6 +52,32 @@ _NON_INTERACTIVE_SSH_CMDS = frozenset(
 )
 # OpenSSH flags that consume a separate argument when not attached (e.g. `-p 2222`)
 _SSH_ARG_FLAGS = frozenset(list("BbcDEeFIiJLlmOopQRSWw"))
+# Eternal Terminal (`et`) CLI flags (short/long value-taking options & local-only flags)
+# Note: `-t` requests a PTY (no argument); tunnels use `-L`/`--tunnel` and `-r`/`-R`/`--reversetunnel`.
+_ET_SHORT_ARG_FLAGS = frozenset(list("upcrLlojR"))
+_ET_LONG_ARG_FLAGS = frozenset(
+    {
+        "--username",
+        "--port",
+        "--command",
+        "--initial-dir",
+        "--tunnel",
+        "--reversetunnel",
+        "--jport",
+        "--jumphost",
+        "--logdir",
+        "--ssh-option",
+        "--ssh-config",
+        "--serverfifo",
+        "--host",
+        "--prefix",
+        "--cfgfile",
+        "--terminal-path",
+        "--name",
+        "--attach",
+    }
+)
+_ET_NON_INTERACTIVE_FLAGS = frozenset({"--help", "--version", "--list", "--kill", "--no-terminal"})
 
 _HOST_TAG_RE = re.compile(r"\[@([A-Za-z0-9_][A-Za-z0-9._-]{0,63})\](?=$|[^0-9A-Za-z_])")
 _RAW_BRACKET_AT_RE = re.compile(r"\[@([^\]]{1,128})\]")
@@ -74,10 +100,10 @@ _PUTTY_STYLE_TITLE_RE = re.compile(
     r"(?:PuTTY|KiTTY|MobaXterm|WindTerm|SecureCRT|Xshell|Termius)\b",
     re.IGNORECASE,
 )
-# Explicit ssh command in title: `ssh devbox`, `ssh -p 2222 user@devbox`, `C:\Program Files\OpenSSH\ssh.exe user@devbox`
+# Explicit ssh command in title: `ssh devbox`, `ssh -p 2222 user@devbox`, `et user@devbox`, `C:\Program Files\OpenSSH\ssh.exe user@devbox`
 _SSH_CMD_TITLE_RE = re.compile(
-    r'^(?:Administrator:\s+)?(?P<q>")?(?:(?=[A-Za-z]:[/\\])[A-Za-z]:[/\\](?:[^/\\:*?"<>|\r\n]+[/\\])*|(?:[^\s/\\"]+[/\\])*)'
-    r'(?P<bin>ssh(?:\.exe)?|autossh|mosh(?:-client)?|slogin)(?(q)")(?P<rest>(?:\s+.*)?)$',
+    r'^(?:Administrator:\s+)?(?P<q>")?(?P<prefix>(?=[A-Za-z]:[/\\])[A-Za-z]:[/\\](?:[^/\\:*?"<>|\r\n]+[/\\])*|/?(?:[^\s/\\"]+[/\\])*)'
+    r'(?P<bin>ssh(?:\.exe)?|autossh|mosh(?:-client)?|slogin|et)(?(q)")(?P<rest>(?:\s+.*)?)$',
     re.IGNORECASE,
 )
 _WIN_DRIVE_SSH_PATH_RE = re.compile(r"^([A-Za-z]):[/\\](.*)$")
@@ -210,6 +236,102 @@ def strip_host_tags_from_title(window_title: str) -> str:
     return re.sub(r"\s*\[@[^\]]*\]", "", window_title).strip()
 
 
+def _extract_et_target_from_argv(argv: Sequence[str]) -> tuple[str, bool]:
+    """Parse Eternal Terminal (``et``) ``argv``; return ``(host_only_low, is_interactive_session)``."""
+    i = 1
+    n = len(argv)
+    dest = ""
+    host_from_flag = ""
+    remote_args: list[str] = []
+    saw_batch_yes = False
+    saw_no_term = False
+
+    while i < n:
+        tok = argv[i]
+        if tok == "--":
+            if i + 1 < n:
+                dest = argv[i + 1]
+                remote_args = list(argv[i + 2 :])
+            break
+        if tok.startswith("--") and len(tok) > 2:
+            if "=" in tok:
+                opt_name, opt_val = tok.split("=", 1)
+                opt_low = opt_name.lower()
+                if opt_low in _ET_NON_INTERACTIVE_FLAGS:
+                    return "", False
+                if opt_low == "--host" and opt_val.strip():
+                    host_from_flag = opt_val.strip()
+                elif opt_low == "--ssh-option" and opt_val.strip().lower() == "batchmode=yes":
+                    saw_batch_yes = True
+                i += 1
+                continue
+            opt_low = tok.lower()
+            if opt_low in _ET_NON_INTERACTIVE_FLAGS:
+                return "", False
+            if opt_low in _ET_LONG_ARG_FLAGS:
+                if i + 1 < n:
+                    val = argv[i + 1].strip()
+                    if opt_low == "--host" and val:
+                        host_from_flag = val
+                    elif opt_low == "--ssh-option" and val.lower() == "batchmode=yes":
+                        saw_batch_yes = True
+                i += 2
+                continue
+            i += 1
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            if tok in ("-h", "-?"):
+                return "", False
+            if tok == "-o" and i + 1 < n:
+                if argv[i + 1].strip().lower() == "batchmode=yes":
+                    saw_batch_yes = True
+                i += 2
+                continue
+            if tok.startswith("-o"):
+                if tok[2:].strip().lower() == "batchmode=yes":
+                    saw_batch_yes = True
+                i += 1
+                continue
+            flags_str = tok[1:]
+            consumed_next = False
+            for idx_f, ch in enumerate(flags_str):
+                if ch == "h":
+                    return "", False
+                if ch == "N":
+                    saw_no_term = True
+                if ch in _ET_SHORT_ARG_FLAGS:
+                    if idx_f == len(flags_str) - 1:
+                        i += 2
+                        consumed_next = True
+                    break
+            if not consumed_next:
+                i += 1
+            continue
+        dest = tok
+        remote_args = list(argv[i + 1 :])
+        break
+
+    if saw_batch_yes or saw_no_term:
+        return "", False
+    if remote_args:
+        first_rcmd = os.path.basename(remote_args[0].strip("'\"")).lower()
+        if first_rcmd in _NON_INTERACTIVE_SSH_CMDS or (
+            first_rcmd.startswith("python") and len(remote_args) >= 2 and remote_args[1] == "-"
+        ):
+            return "", False
+    clean_dest = (dest or host_from_flag or "").strip()
+    if "@" in clean_dest:
+        clean_dest = clean_dest.rsplit("@", 1)[-1]
+    if clean_dest.count(":") == 1:
+        host_part, port_part = clean_dest.rsplit(":", 1)
+        if host_part and port_part.isdigit():
+            clean_dest = host_part
+    clean_dest = clean_dest.strip().lower().rstrip(".")
+    if not clean_dest or clean_dest.startswith("-"):
+        return "", True
+    return clean_dest, True
+
+
 def extract_ssh_target_from_argv(argv: Sequence[str]) -> tuple[str, bool]:
     """Parse ``ssh`` command ``argv``; return ``(host_only_low, is_interactive_session)``.
 
@@ -218,6 +340,8 @@ def extract_ssh_target_from_argv(argv: Sequence[str]) -> tuple[str, bool]:
     if not argv:
         return "", False
     a0 = os.path.basename(argv[0].replace("\\", "/")).lstrip("-").lower()
+    if a0 == "et":
+        return _extract_et_target_from_argv(argv)
     if a0 not in _SSH_CLIENT_BINS and not a0.startswith("ssh"):
         return "", False
 
@@ -325,6 +449,8 @@ def _parse_title_remote_hints(
     if m_ssh:
         rest = (m_ssh.group("rest") or "").strip()
         if not rest:
+            if m_ssh.group("prefix"):
+                return False, "", ""
             return True, "", ""
         tokens = [m_ssh.group("bin"), *rest.split()]
         host_cand, is_inter = extract_ssh_target_from_argv(tokens)

@@ -624,7 +624,9 @@ def main(argv: list[str] | None = None) -> int:
                         include_git_info=cfg.refiner.include_git_status,
                     )
                 eff_skey = snap.session_key if snap else ""
-                asr_ctx = tracker.build_asr_context(snap, extra_hotwords=file_hotwords, mode=rec_mode)
+                asr_ctx = tracker.build_asr_context(
+                    snap, extra_hotwords=file_hotwords, mode=rec_mode, language=cfg.ui.language
+                )
                 is_single_hop_asr = bool(getattr(eff_asr, "single_hop", False))
                 if is_single_hop_asr and asr_from_map is None:
                     asr_ctx = attach_single_hop_context(

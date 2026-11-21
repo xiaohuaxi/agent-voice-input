@@ -126,7 +126,7 @@ Configuration uses two clean files (`CLI flags > config.toml > built-in defaults
 | **`codex`** | `refiner` | — | `gpt-6-luna` *(auto-falls back to public `gpt-5.4-mini` / `gpt-5-codex-mini`)* | Local `codex` CLI login *(stateless HTTP `/responses` + 30m safe refresh; never enables Fast mode)* |
 | **`deepseek`** | `refiner` | — | `deepseek-flash` | `DEEPSEEK_API_KEY` *(compat: `API_KEY_DEEPSEEK`)* |
 | **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` *(or single-hop `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(compat: `ALI_API_KEY`)* |
-| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` *(auto-probes granted slot)* |
+| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_API_KEY` *(single-header `X-Api-Key` or with `DOUBAO_ASR_APP_ID`; defaults to 2.0 `volc.seedasr.auc` with 1.0 fallback)* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(compat: `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
 | **`openrouter`** | `asr`, `refiner` | `qwen/qwen3-asr-1.7b` | `google/gemini-3.5-flash-lite` | `OPENROUTER_API_KEY` |
 | **`gemini`** | `asr`, `refiner` | `gemini-3.5-flash-lite` *(single-hop)* | `gemini-3.5-flash-lite` | `GEMINI_API_KEY` |

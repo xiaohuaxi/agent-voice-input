@@ -5886,6 +5886,61 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 srv_pre.close()
                 os.close(agy_lock_fd)
 
+    def test_pipeline_forwards_ui_language_to_builtin_hotword_filter(self) -> None:
+        from agent_voice_input.config import AsrConfig, UiConfig
+
+        seen_hotwords: list[list[str]] = []
+
+        class _CaptureAsr:
+            provider_name = "dashscope"
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **kw) -> AsrResult:
+                seen_hotwords.append(list(context.hotwords) if context is not None else [])
+                return AsrResult(text="hello", provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
+
+        class _PassRefiner:
+            def refine(self, asr_res: Any, **kw) -> RefinerResult:
+                txt = asr_res.text if isinstance(asr_res, AsrResult) else str(asr_res)
+                return RefinerResult(text=txt, provider="none", model="none", latency_ms=1)
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            hw_file = root / "hotwords.txt"
+            hw_file.write_text("自定义术语\n", encoding="utf-8")
+            env = {"HOME": str(root / "home"), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(root / "rt")}
+            voiced = _voiced_wav()
+
+            for lang in ("en", "auto", "zh"):
+                cfg = Config(
+                    asr=AsrConfig(hotwords_file=str(hw_file)),
+                    ui=UiConfig(language=lang),
+                )
+                res = run_pipeline_once(
+                    voiced,
+                    cfg=cfg,
+                    asr_provider=_CaptureAsr(),
+                    refiner=_PassRefiner(),  # type: ignore[arg-type]
+                    origin_window=ForegroundWindow(1, "WindowsTerminal.exe", "bash"),
+                    mode="agent",
+                    dry_run=True,
+                    env=env,
+                )
+                self.assertTrue(res.ok)
+
+        hw_en, hw_auto, hw_zh = seen_hotwords
+        self.assertIn("自定义术语", hw_en)
+        self.assertIn("Codex", hw_en)
+        self.assertNotIn("豆包", hw_en)
+        self.assertNotIn("竞态", hw_en)
+        for hw_cjk in (hw_auto, hw_zh):
+            self.assertIn("自定义术语", hw_cjk)
+            self.assertIn("Codex", hw_cjk)
+            self.assertIn("豆包", hw_cjk)
+            self.assertIn("竞态", hw_cjk)
+
 
 class ObservabilityAndTelemetryTests(unittest.TestCase):
     def test_refiner_token_usage_extraction_and_none_vs_zero_semantics(self) -> None:

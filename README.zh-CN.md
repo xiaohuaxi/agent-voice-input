@@ -125,7 +125,7 @@ agent-voice-input start
 | **`codex`** | `refiner` | — | `gpt-6-luna` *(公开账号自动回退 `gpt-5.4-mini` / `gpt-5-codex-mini`)* | 复用本机 `codex` CLI 登录态 *(无状态 HTTP `/responses` 直连 + 30 分钟提前安全刷新，绝不开启 Fast 模式)* |
 | **`deepseek`** | `refiner` | — | `deepseek-flash` | `DEEPSEEK_API_KEY` *(兼容 `API_KEY_DEEPSEEK`)* |
 | **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` *(或单跳 `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(兼容 `ALI_API_KEY`)* |
-| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` *(自动探测可用槽位)* |
+| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_API_KEY` *（支持新版单头 `X-Api-Key` 或搭配 `DOUBAO_ASR_APP_ID`；默认首选 2.0 `volc.seedasr.auc` 并自动回退 1.0 槽位）* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(兼容 `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
 | **`openrouter`** | `asr`, `refiner` | `qwen/qwen3-asr-1.7b` | `google/gemini-3.5-flash-lite` | `OPENROUTER_API_KEY` |
 | **`gemini`** | `asr`, `refiner` | `gemini-3.5-flash-lite` *(单跳)* | `gemini-3.5-flash-lite` | `GEMINI_API_KEY` |

@@ -77,6 +77,19 @@ BUILTIN_AGENT_HOTWORDS: tuple[str, ...] = (
     "subagent", "worktree", "rebase", "JSONL", "TOML", "竞态",
 )
 
+_CJK_HOTWORD_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_BUILTIN_AGENT_HOTWORDS_NON_CJK: tuple[str, ...] = tuple(
+    w for w in BUILTIN_AGENT_HOTWORDS if not _CJK_HOTWORD_RE.search(w)
+)
+
+
+def get_builtin_agent_hotwords(language: str = "auto") -> tuple[str, ...]:
+    """Return built-in agent hotwords, dropping CJK entries for explicit non-Chinese languages."""
+    raw = (language or "auto").strip().lower()
+    if not raw or raw == "auto" or raw == "zh" or raw.startswith(("zh-", "zh_", "zh.", "zh@")):
+        return BUILTIN_AGENT_HOTWORDS
+    return _BUILTIN_AGENT_HOTWORDS_NON_CJK
+
 REPO_FILES_CACHE_TTL_SEC: float = 300.0
 
 

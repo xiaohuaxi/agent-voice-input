@@ -277,22 +277,21 @@ class AsrProvidersTests(unittest.TestCase):
         self.assertEqual(
             [(u.rsplit("/", 1)[-1], r) for u, r, _, _, _ in calls],
             [
-                ("flash", "volc.bigasr.auc_turbo"),
                 ("submit", "volc.seedasr.auc"),
                 ("submit", "volc.bigasr.auc"),
                 ("query", "volc.bigasr.auc"),
                 ("query", "volc.bigasr.auc"),
             ],
         )
-        submit_call = calls[2]
-        query_call_1 = calls[3]
-        query_call_2 = calls[4]
+        submit_call = calls[1]
+        query_call_1 = calls[2]
+        query_call_2 = calls[3]
         self.assertEqual(submit_call[2], query_call_1[2])
         self.assertEqual(submit_call[2], query_call_2[2])
         self.assertEqual(submit_call[3]["X-Api-App-Key"], "fake_appid_value")
         self.assertEqual(submit_call[3]["X-Api-Access-Key"], "fake_access_key_value")
         self.assertEqual(query_call_1[4], b"{}")
-        self.assertEqual(sleeps, [0.15, 0.15])
+        self.assertEqual(sleeps, [0.30, 0.30])
 
         req_json = json.loads(submit_call[4].decode("utf-8"))
         corpus_ctx = json.loads(req_json["request"]["corpus"]["context"])
@@ -395,10 +394,17 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_auto.asr.resource_id = "auto"
         cfg_auto.asr.hotwords_file = ""
         step = [0]
+        now_box[0] = 300.0
 
         def param_err_transport(req: HttpRequest) -> HttpResponse:
             step[0] += 1
-            if step[0] == 1:
+            if step[0] == 1 and req.url.endswith("/submit"):
+                return HttpResponse(
+                    status=200,
+                    headers={"x-api-status-code": "20000000"},
+                    body=b"{}",
+                )
+            if step[0] == 2 and req.url.endswith("/query"):
                 return HttpResponse(
                     status=200,
                     headers={"x-api-status-code": "20000000"},
@@ -413,13 +419,185 @@ class AsrProvidersTests(unittest.TestCase):
                 body=b"{}",
             )
 
-        res_ok = transcribe(_sample_wav(), cfg_auto, env=env, transport=param_err_transport)
+        res_ok = transcribe(
+            _sample_wav(),
+            cfg_auto,
+            env=env,
+            transport=param_err_transport,
+            clock_fn=fake_clock,
+            sleep_fn=fake_sleep,
+        )
         self.assertEqual(res_ok.text, "ok")
         with self.assertRaises(AsrError) as perr_ctx:
-            transcribe(_sample_wav(), cfg_auto, env=env, transport=param_err_transport)
-        # Fails immediately on the cached slot without falling through 3 slots
-        self.assertEqual(step[0], 2)
+            transcribe(
+                _sample_wav(),
+                cfg_auto,
+                env=env,
+                transport=param_err_transport,
+                clock_fn=fake_clock,
+                sleep_fn=fake_sleep,
+            )
+        # Fails immediately on the cached 2.0 slot without falling through 3 slots
+        self.assertEqual(step[0], 3)
         self.assertIn("invalid audio sample rate", str(perr_ctx.exception))
+
+    def test_doubao_auto_mode_filter_flash_fallback_and_poll_backoff_ladder(self) -> None:
+        env = {
+            "DOUBAO_ASR_APP_ID": "fake_appid_mode",
+            "DOUBAO_ASR_API_KEY": "fake_token_mode",
+        }
+        # 1. resource_id="auto" + doubao_mode="submit" NEVER probes /recognize/flash
+        reset_doubao_slot_cache()
+        seen_submit_only: list[tuple[str, str]] = []
+
+        def tx_all_denied(req: HttpRequest) -> HttpResponse:
+            seen_submit_only.append((req.url.rsplit("/", 1)[-1], req.headers.get("X-Api-Resource-Id", "")))
+            return HttpResponse(
+                status=403,
+                headers={"x-api-status-code": "45000030"},
+                body=b'{"message":"requested resource not granted"}',
+            )
+
+        cfg_sub = Config()
+        cfg_sub.asr.provider = "doubao"
+        cfg_sub.asr.resource_id = "auto"
+        cfg_sub.asr.doubao_mode = "submit"
+        cfg_sub.asr.hotwords_file = ""
+        with self.assertRaises(AsrError):
+            transcribe(_sample_wav(), cfg_sub, env=env, transport=tx_all_denied, sleep_fn=lambda _: None)
+        self.assertEqual(
+            seen_submit_only,
+            [
+                ("submit", "volc.seedasr.auc"),
+                ("submit", "volc.bigasr.auc"),
+            ],
+        )
+
+        # 2. resource_id="auto" + doubao_mode="auto" falls all the way to 1.0 turbo flash when both submit slots 403
+        reset_doubao_slot_cache()
+        seen_turbo_fb: list[tuple[str, str]] = []
+
+        def tx_turbo_only(req: HttpRequest) -> HttpResponse:
+            rid = req.headers.get("X-Api-Resource-Id", "")
+            seen_turbo_fb.append((req.url.rsplit("/", 1)[-1], rid))
+            if rid != "volc.bigasr.auc_turbo":
+                return HttpResponse(
+                    status=403,
+                    headers={"x-api-status-code": "45000030"},
+                    body=b'{"message":"requested resource not granted"}',
+                )
+            return HttpResponse(
+                status=200,
+                headers={"x-api-status-code": "20000000"},
+                body=json.dumps({"result": {"text": "turbo fallback ok"}}).encode("utf-8"),
+            )
+
+        cfg_auto = Config()
+        cfg_auto.asr.provider = "doubao"
+        cfg_auto.asr.hotwords_file = ""
+        res_turbo = transcribe(_sample_wav(), cfg_auto, env=env, transport=tx_turbo_only, sleep_fn=lambda _: None)
+        self.assertEqual(res_turbo.text, "turbo fallback ok")
+        self.assertEqual(
+            seen_turbo_fb,
+            [
+                ("submit", "volc.seedasr.auc"),
+                ("submit", "volc.bigasr.auc"),
+                ("flash", "volc.bigasr.auc_turbo"),
+            ],
+        )
+
+        # 3. Cached flash slot MUST NOT leak into an explicit doubao_mode="submit" auto call
+        seen_after_flash_cache: list[tuple[str, str]] = []
+
+        def tx_seed_ok(req: HttpRequest) -> HttpResponse:
+            rid = req.headers.get("X-Api-Resource-Id", "")
+            seen_after_flash_cache.append((req.url.rsplit("/", 1)[-1], rid))
+            if req.url.endswith("/submit"):
+                return HttpResponse(200, {"x-api-status-code": "20000000"}, b"{}")
+            return HttpResponse(
+                200,
+                {"x-api-status-code": "20000000"},
+                json.dumps({"result": {"text": "submit mode ok"}}).encode("utf-8"),
+            )
+
+        res_sub = transcribe(_sample_wav(), cfg_sub, env=env, transport=tx_seed_ok, sleep_fn=lambda _: None)
+        self.assertEqual(res_sub.text, "submit mode ok")
+        self.assertEqual(
+            seen_after_flash_cache,
+            [
+                ("submit", "volc.seedasr.auc"),
+                ("query", "volc.seedasr.auc"),
+            ],
+        )
+
+        # 4. Cached submit slot MUST NOT leak into an explicit doubao_mode="flash" auto call
+        seen_flash_only: list[tuple[str, str]] = []
+
+        def tx_flash_only(req: HttpRequest) -> HttpResponse:
+            rid = req.headers.get("X-Api-Resource-Id", "")
+            seen_flash_only.append((req.url.rsplit("/", 1)[-1], rid))
+            return HttpResponse(
+                200,
+                {"x-api-status-code": "20000000"},
+                json.dumps({"result": {"text": "flash mode ok"}}).encode("utf-8"),
+            )
+
+        cfg_flash = Config()
+        cfg_flash.asr.provider = "doubao"
+        cfg_flash.asr.resource_id = "auto"
+        cfg_flash.asr.doubao_mode = "flash"
+        cfg_flash.asr.hotwords_file = ""
+        res_fl = transcribe(_sample_wav(), cfg_flash, env=env, transport=tx_flash_only, sleep_fn=lambda _: None)
+        self.assertEqual(res_fl.text, "flash mode ok")
+        self.assertEqual(seen_flash_only, [("flash", "volc.bigasr.auc_turbo")])
+
+        # 5. Adaptive /query polling backoff ladder: 0.30s (<=2s) -> 0.50s (2..6s) -> 0.80s (>6s), zero real sleep
+        reset_doubao_slot_cache()
+        now_box = [100.0]
+        poll_sleeps: list[float] = []
+        q_idx = [0]
+
+        def fake_clock() -> float:
+            return now_box[0]
+
+        def fake_sleep(dt: float) -> None:
+            poll_sleeps.append(round(dt, 2))
+            now_box[0] += dt
+
+        def tx_long_poll(req: HttpRequest) -> HttpResponse:
+            if req.url.endswith("/submit"):
+                return HttpResponse(200, {"x-api-status-code": "20000000"}, b"{}")
+            q_idx[0] += 1
+            # Advance clock to exercise every bracket: 0.30s -> <=2s, >2s -> 0.50s, >6s -> 0.80s
+            if q_idx[0] == 1:
+                now_box[0] += 0.2  # poll_elapsed = 0.5s <= 2.0 -> next wait 0.30
+                return HttpResponse(200, {"x-api-status-code": "20000001"}, b"{}")
+            if q_idx[0] == 2:
+                now_box[0] += 1.5  # poll_elapsed = 2.3s > 2.0 -> next wait 0.50
+                return HttpResponse(200, {"x-api-status-code": "20000001"}, b"{}")
+            if q_idx[0] == 3:
+                now_box[0] += 3.5  # poll_elapsed = 6.3s > 6.0 -> next wait 0.80
+                return HttpResponse(200, {"x-api-status-code": "20000002"}, b"{}")
+            return HttpResponse(
+                200,
+                {"x-api-status-code": "20000000"},
+                json.dumps({"result": {"text": "backoff ladder ok"}}).encode("utf-8"),
+            )
+
+        cfg_poll = Config()
+        cfg_poll.asr.provider = "doubao"
+        cfg_poll.asr.resource_id = "volc.seedasr.auc"
+        cfg_poll.asr.hotwords_file = ""
+        res_poll = transcribe(
+            _sample_wav(),
+            cfg_poll,
+            env=env,
+            transport=tx_long_poll,
+            clock_fn=fake_clock,
+            sleep_fn=fake_sleep,
+        )
+        self.assertEqual(res_poll.text, "backoff ladder ok")
+        self.assertEqual(poll_sleeps, [0.30, 0.30, 0.50, 0.80])
 
     def test_security_exception_chain_boundary_truncation_redirect_and_custom_key_env(self) -> None:
         secret = "boundary_secret_value_1234567890"
@@ -1631,9 +1809,13 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_db = Config()
         cfg_db.asr.provider = "doubao"
         cfg_db.asr.hotwords_file = ""
+        cfg_db_flash = Config()
+        cfg_db_flash.asr.provider = "doubao"
+        cfg_db_flash.asr.doubao_mode = "flash"
+        cfg_db_flash.asr.hotwords_file = ""
         prov_db = create_asr_provider(
-            cfg_db,
-            resolve_credentials(cfg_db, env),
+            cfg_db_flash,
+            resolve_credentials(cfg_db_flash, env),
             env=env,
             transport=tx_db_qps,
             clock_fn=lambda: now_db[0],
@@ -1719,8 +1901,8 @@ class AsrProvidersTests(unittest.TestCase):
             )
 
         prov_burst = create_asr_provider(
-            cfg_db,
-            resolve_credentials(cfg_db, env),
+            cfg_db_flash,
+            resolve_credentials(cfg_db_flash, env),
             env=env,
             transport=tx_qps_burst,
             rand_fn=lambda: 0.0,
@@ -3343,6 +3525,37 @@ class SessionCtxTests(unittest.TestCase):
         self.assertEqual(ctx_agent.hotwords[0], "UserPriorityTerm")
         self.assertIn("Codex", ctx_agent.hotwords)
         self.assertIn("Luna", ctx_agent.hotwords)
+        self.assertIn("豆包", ctx_agent.hotwords)
+        self.assertIn("竞态", ctx_agent.hotwords)
+
+        # Language-aware built-in hotword filtering: en/en-US drops CJK built-ins while preserving manual CJK & zh/auto
+        from agent_voice_input.workspace_ctx import BUILTIN_AGENT_HOTWORDS, get_builtin_agent_hotwords
+
+        self.assertEqual(get_builtin_agent_hotwords("auto"), BUILTIN_AGENT_HOTWORDS)
+        self.assertEqual(get_builtin_agent_hotwords(""), BUILTIN_AGENT_HOTWORDS)
+        self.assertEqual(get_builtin_agent_hotwords("zh"), BUILTIN_AGENT_HOTWORDS)
+        self.assertEqual(get_builtin_agent_hotwords("zh-CN"), BUILTIN_AGENT_HOTWORDS)
+        self.assertEqual(get_builtin_agent_hotwords("zh_TW.UTF-8"), BUILTIN_AGENT_HOTWORDS)
+        for en_lang in ("en", "en-US", "EN_GB"):
+            en_builtin = get_builtin_agent_hotwords(en_lang)
+            self.assertNotIn("豆包", en_builtin)
+            self.assertNotIn("竞态", en_builtin)
+            self.assertIn("Codex", en_builtin)
+            self.assertIn("TOML", en_builtin)
+            ctx_en = SessionTracker.build_asr_context(
+                None,
+                extra_hotwords=["UserPriorityTerm", "自定义中文词"],
+                mode="agent",
+                language=en_lang,
+            )
+            self.assertEqual(ctx_en.hotwords[0], "UserPriorityTerm")
+            self.assertIn("自定义中文词", ctx_en.hotwords)
+            self.assertNotIn("豆包", ctx_en.hotwords)
+            self.assertNotIn("竞态", ctx_en.hotwords)
+            self.assertIn("Codex", ctx_en.hotwords)
+        ctx_zh = SessionTracker.build_asr_context(None, mode="agent", language="zh-CN")
+        self.assertIn("豆包", ctx_zh.hotwords)
+        self.assertIn("竞态", ctx_zh.hotwords)
 
         ctx_gen = SessionTracker.build_asr_context(None, extra_hotwords=["UserPriorityTerm"], mode="general")
         self.assertEqual(ctx_gen.hotwords, ["UserPriorityTerm"])

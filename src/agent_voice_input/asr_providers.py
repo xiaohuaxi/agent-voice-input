@@ -950,10 +950,19 @@ class DashScopeAsrProvider(BaseAsrProvider):
 # ---------------------------------------------------------------------------
 
 DOUBAO_AUTO_SLOT_CHAIN: tuple[tuple[str, str], ...] = (
-    ("flash", "volc.bigasr.auc_turbo"),
     ("submit", "volc.seedasr.auc"),
     ("submit", "volc.bigasr.auc"),
+    ("flash", "volc.bigasr.auc_turbo"),
 )
+
+
+def _doubao_poll_wait_sec(poll_elapsed: float) -> float:
+    """Return adaptive /query poll interval (0.30s -> 0.50s -> 0.80s) to trim redundant 20000001 calls."""
+    if poll_elapsed > 6.0:
+        return 0.80
+    if poll_elapsed > 2.0:
+        return 0.50
+    return 0.30
 
 _DOUBAO_SLOT_LOCK = threading.Lock()
 _DOUBAO_SLOT_CACHE: dict[str, tuple[str, str]] = {}
@@ -1050,7 +1059,11 @@ class DoubaoAsrProvider(BaseAsrProvider):
         if rid.lower() == "auto" or not rid:
             cached = get_cached_doubao_slot(cache_key)
             chain = list(DOUBAO_AUTO_SLOT_CHAIN)
-            if cached is not None:
+            if explicit_mode in ("flash", "submit"):
+                filtered = [slot for slot in chain if slot[0] == explicit_mode]
+                if filtered:
+                    chain = filtered
+            if cached is not None and cached in chain:
                 chain = [cached, *[slot for slot in chain if slot != cached]]
             return True, chain
 
@@ -1511,7 +1524,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
 
         # Phase 2: poll /query reusing the exact same X-Api-Request-Id under unified deadline
         query_body = b"{}"
-        wait_sec = 0.15
+        wait_sec = _doubao_poll_wait_sec(0.0)
         poll_t0 = self.clock_fn()
         need_poll_sleep = True
 
@@ -1574,7 +1587,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
                             extra_secrets=secrets,
                             retry_kind="transient",
                         )
-                    wait_sec = 0.60 if poll_elapsed > 8.0 else (0.30 if poll_elapsed > 2.0 else 0.15)
+                    wait_sec = _doubao_poll_wait_sec(poll_elapsed)
                     continue
                 raise self._fail_http(
                     f"Doubao query ({rid}) failed HTTP {q_resp.status} code={q_code}: {q_msg}",

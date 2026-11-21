@@ -81,7 +81,9 @@ api = "auto"
 # Stage 1 thinking/reasoning budget:
 # "auto" (suppresses default thinking latency on supported multimodal models) | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 effort = "auto"
-# Doubao resource slot & mode: "auto" (auto-probes and caches available slot) or explicit e.g. "volc.seedasr.auc"
+# Doubao ASR resource slot & mode:
+# "auto" prefers Doubao 2.0 standard ("volc.seedasr.auc", async submit/query) and falls back to 1.0 ("volc.bigasr.auc", "volc.bigasr.auc_turbo"), caching the granted slot in memory.
+# Set resource_id explicitly (e.g. "volc.seedasr.auc") to skip cold-start slot probing; doubao_mode = "submit" | "flash" restricts "auto" probing to that mode.
 resource_id = "auto"
 doubao_mode = "auto"
 # Required when provider = "openai-compatible"; built-in providers resolve base_url automatically

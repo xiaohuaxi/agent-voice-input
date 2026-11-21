@@ -675,9 +675,9 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             self.assertIn("[platform]  INFO native Linux", out_db)
             self.assertIn("[refiner]   WARN auto -> off", out_db)
             self.assertIn("asr(doubao): OK", out_db)
-            self.assertIn("volc.bigasr.auc_turbo/flash", out_db)
+            self.assertIn("volc.seedasr.auc/submit", out_db)
             self.assertEqual(len(db_ping_reqs), 1)
-            self.assertTrue(db_ping_reqs[0].url.endswith("/recognize/flash"))
+            self.assertTrue(db_ping_reqs[0].url.endswith("/submit"))
             self.assertNotIn("db_test_aaaa7777", out_db)
 
             # 5. `--ping` shared endpoint deduplication (DashScope Stage 1 + auto->dashscope Stage 2 = 1 HTTP GET) & 401 redaction

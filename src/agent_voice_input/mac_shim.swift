@@ -539,6 +539,88 @@ func computeHudToastY(visibleMinY: CGFloat, visibleMaxY: CGFloat, mainH: CGFloat
     return round(visibleMinY + 8.0 + effMainH + 8.0)
 }
 
+struct CgWindowCandidate {
+    let ownerPid: Int
+    let layer: Int
+    let alpha: Double
+    let bounds: CGRect
+}
+
+func selectFrontmostWindowCgFrame(
+    from candidates: [CgWindowCandidate],
+    ownerPid: Int,
+    minLayer: Int = Int(CGWindowLevelForKey(.normalWindow)),
+    maxLayer: Int = Int(CGWindowLevelForKey(.floatingWindow))
+) -> CGRect? {
+    guard ownerPid > 0 else { return nil }
+    for win in candidates {
+        if win.ownerPid != ownerPid { continue }
+        if win.layer < minLayer || win.layer > maxLayer { continue }
+        if !win.alpha.isFinite || win.alpha <= 0.01 { continue }
+        let r = win.bounds
+        if !r.origin.x.isFinite || !r.origin.y.isFinite || !r.width.isFinite || !r.height.isFinite { continue }
+        if r.width >= 20.0 && r.height >= 20.0 {
+            return r
+        }
+    }
+    return nil
+}
+
+func primaryScreenHeight(from screenFrames: [CGRect]) -> CGFloat? {
+    if let originScreen = screenFrames.first(where: { abs($0.origin.x) < 0.5 && abs($0.origin.y) < 0.5 }) {
+        return originScreen.maxY
+    }
+    return screenFrames.first?.maxY
+}
+
+func cgRectToAppKit(_ cgRect: CGRect, primaryScreenMaxY: CGFloat) -> CGRect {
+    CGRect(
+        x: cgRect.origin.x,
+        y: primaryScreenMaxY - cgRect.origin.y - cgRect.size.height,
+        width: cgRect.size.width,
+        height: cgRect.size.height
+    )
+}
+
+func selectHudScreenIndex(
+    screenFrames: [CGRect],
+    focusedWindowCgFrame: CGRect?,
+    mouseLocation: CGPoint,
+    mainScreenIndex: Int? = nil
+) -> Int? {
+    guard !screenFrames.isEmpty else { return nil }
+    if let cgWin = focusedWindowCgFrame,
+       cgWin.origin.x.isFinite && cgWin.origin.y.isFinite && cgWin.width.isFinite && cgWin.height.isFinite,
+       cgWin.width > 0.0 && cgWin.height > 0.0,
+       let primaryMaxY = primaryScreenHeight(from: screenFrames) {
+        let winFrame = cgRectToAppKit(cgWin, primaryScreenMaxY: primaryMaxY)
+        let winCenter = CGPoint(x: winFrame.midX, y: winFrame.midY)
+        var bestIdx: Int? = nil
+        var bestArea: CGFloat = 0.0
+        for (idx, frame) in screenFrames.enumerated() {
+            let inter = frame.intersection(winFrame)
+            if inter.isNull || inter.isEmpty { continue }
+            let area = inter.width * inter.height
+            if area > bestArea + 0.5 {
+                bestArea = area
+                bestIdx = idx
+            } else if bestIdx != nil && abs(area - bestArea) <= 0.5 && frame.contains(winCenter) {
+                bestIdx = idx
+            }
+        }
+        if let idx = bestIdx {
+            return idx
+        }
+    }
+    if let mouseIdx = screenFrames.firstIndex(where: { $0.contains(mouseLocation) }) {
+        return mouseIdx
+    }
+    if let mainIdx = mainScreenIndex, mainIdx >= 0 && mainIdx < screenFrames.count {
+        return mainIdx
+    }
+    return 0
+}
+
 func stripOuterParens(_ raw: String) -> String {
     let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     if t.count >= 2 && t.first == "(" && t.last == ")" {
@@ -1546,8 +1628,18 @@ final class HudPillController {
     }
 
     private func activeScreenMetrics() -> (scale: CGFloat, visibleFrame: NSRect) {
-        let mouseLoc = NSEvent.mouseLocation
-        let activeScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLoc, $0.frame, false) }) ?? NSScreen.main ?? NSScreen.screens.first
+        let screens = NSScreen.screens
+        let screenFrames = screens.map { $0.frame }
+        let mainIdx = NSScreen.main.flatMap { mainScr in screens.firstIndex(where: { $0 === mainScr }) }
+        let pickedIdx = selectHudScreenIndex(
+            screenFrames: screenFrames,
+            focusedWindowCgFrame: queryFrontmostWindowCgFrame(),
+            mouseLocation: NSEvent.mouseLocation,
+            mainScreenIndex: mainIdx
+        )
+        let activeScreen = pickedIdx.flatMap { idx in (idx >= 0 && idx < screens.count) ? screens[idx] : nil }
+            ?? NSScreen.main
+            ?? screens.first
         let scale = activeScreen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
         let vf = activeScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         return (scale, vf)
@@ -1640,7 +1732,7 @@ final class HudPillController {
         layoutWavePill(forceFrame: false)
     }
 
-    private func layoutWavePill(forceFrame: Bool) {
+    private func layoutWavePill(forceFrame: Bool, screenMetrics: (scale: CGFloat, visibleFrame: NSRect)? = nil) {
         guard let panel = panel, let bgView = bgView, let iconView = iconView, let label = label,
               let waveView = waveView, let durLabel = durLabel, let hintLabel = hintLabel else { return }
         let now = monotonicMs()
@@ -1739,7 +1831,7 @@ final class HudPillController {
             bgBadgeView?.isHidden = true
         }
 
-        let (scale, vf) = resolveAnchoredScreenMetrics(refresh: false)
+        let (scale, vf) = screenMetrics ?? resolveAnchoredScreenMetrics(refresh: false)
         let geom = computeWaveHudLayout(
             durSlotW: slotW,
             durH: durH,
@@ -2002,8 +2094,9 @@ final class HudPillController {
             recBgCount = max(0, bgCount)
             self.maxDurationSec = max(0, maxDurationSec)
             self.warnRemainSec = (self.maxDurationSec > 0) ? (warnRemainSec > 0 ? warnRemainSec : recordingCountdownWarnSec(self.maxDurationSec)) : 0
+            var preResolvedMetrics: (scale: CGFloat, visibleFrame: NSRect)? = nil
             if !isWaveRecording {
-                _ = resolveAnchoredScreenMetrics(refresh: !isToastVisible)
+                preResolvedMetrics = resolveAnchoredScreenMetrics(refresh: !isToastVisible)
                 isWaveRecording = true
                 recStartMs = monotonicMs()
                 smoothLevel = 0.0
@@ -2018,7 +2111,7 @@ final class HudPillController {
                 let initLvl = currentLiveLevel()
                 waveView?.barNorms = (initLvl > 0.0) ? stepWaveEnvelope(initLvl) : Array(repeating: 0.0, count: 9)
             }
-            layoutWavePill(forceFrame: true)
+            layoutWavePill(forceFrame: true, screenMetrics: preResolvedMetrics)
             isMainVisible = true
             panel.orderFrontRegardless()
             startWaveTimerIfNeeded()
@@ -2297,6 +2390,59 @@ private func queryFrontmostApp() -> (name: String, bundleId: String, pid: Int, h
     let pid = Int(app.processIdentifier)
     let meta = queryFrontWindowMetadata(pid: pid, bundleId: bundleId)
     return (name, bundleId, pid, meta.hwnd, meta.title, meta.document, meta.axTrusted)
+}
+
+private func queryFrontmostWindowCgFrame() -> CGRect? {
+    guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+    let pid = Int(app.processIdentifier)
+    guard pid > 0 && pid != Int(ProcessInfo.processInfo.processIdentifier) else { return nil }
+
+    // Use AX focused/main window bounds for all apps (including Ghostty) so focus switching between
+    // an always-on-top floating window and a normal window always resolves the true focused window.
+    if AXIsProcessTrusted() {
+        let axApp = AXUIElementCreateApplication(pid_t(pid))
+        _ = AXUIElementSetMessagingTimeout(axApp, 0.15)
+        var winRef: CFTypeRef?
+        var st = AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &winRef)
+        if (st != .success || winRef == nil) && st != .cannotComplete {
+            st = AXUIElementCopyAttributeValue(axApp, kAXMainWindowAttribute as CFString, &winRef)
+        }
+        if st == .success, let w = winRef, CFGetTypeID(w) == AXUIElementGetTypeID() {
+            let axWin = unsafeBitCast(w, to: AXUIElement.self)
+            _ = AXUIElementSetMessagingTimeout(axWin, 0.15)
+            var posRef: CFTypeRef?
+            var sizeRef: CFTypeRef?
+            var pos = CGPoint.zero
+            var size = CGSize.zero
+            if AXUIElementCopyAttributeValue(axWin, kAXPositionAttribute as CFString, &posRef) == .success,
+               let pVal = posRef, CFGetTypeID(pVal) == AXValueGetTypeID(),
+               AXValueGetValue(unsafeBitCast(pVal, to: AXValue.self), .cgPoint, &pos),
+               AXUIElementCopyAttributeValue(axWin, kAXSizeAttribute as CFString, &sizeRef) == .success,
+               let sVal = sizeRef, CFGetTypeID(sVal) == AXValueGetTypeID(),
+               AXValueGetValue(unsafeBitCast(sVal, to: AXValue.self), .cgSize, &size),
+               size.width >= 20.0 && size.height >= 20.0 {
+                return CGRect(origin: pos, size: size)
+            }
+        }
+    }
+
+    if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+        var candidates: [CgWindowCandidate] = []
+        for entry in list {
+            let ownerPid = (entry[kCGWindowOwnerPID as String] as? Int) ?? ((entry[kCGWindowOwnerPID as String] as? NSNumber)?.intValue ?? 0)
+            if ownerPid != pid { continue }
+            let layer = (entry[kCGWindowLayer as String] as? Int) ?? ((entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1)
+            let alpha = (entry[kCGWindowAlpha as String] as? Double) ?? ((entry[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1.0)
+            if let boundsDict = entry[kCGWindowBounds as String] as? NSDictionary,
+               let cgRect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) {
+                candidates.append(CgWindowCandidate(ownerPid: ownerPid, layer: layer, alpha: alpha, bounds: cgRect))
+            }
+        }
+        if let picked = selectFrontmostWindowCgFrame(from: candidates, ownerPid: pid) {
+            return picked
+        }
+    }
+    return nil
 }
 
 private func parseOptionalBool(_ raw: Any?) -> Bool? {
@@ -3622,6 +3768,130 @@ private func runSelfCheck() -> Int32 {
         try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 36.0, toastH: 32.0, position: "bottom") == 102.0, "HUD bottom toastY")
         try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 0.0, toastH: 32.0, position: "") == 102.0, "HUD bottom toastY min mainH")
         try check(computeHudToastY(visibleMinY: 50.0, visibleMaxY: 900.0, mainH: 36.0, toastH: 32.0, position: " TOP ") == 810.0, "HUD top toastY")
+
+        // Multi-screen HUD selection self-check (CG top-left -> AppKit bottom-left coordinate conversion + fallbacks)
+        do {
+            let horizScreens: [CGRect] = [
+                CGRect(x: 0.0, y: 0.0, width: 1440.0, height: 900.0),       // primary
+                CGRect(x: 1440.0, y: -540.0, width: 2560.0, height: 1440.0), // taller right display top-aligned with primary
+            ]
+            let convRight = cgRectToAppKit(CGRect(x: 1800.0, y: 200.0, width: 1200.0, height: 800.0), primaryScreenMaxY: 900.0)
+            try check(convRight == CGRect(x: 1800.0, y: -100.0, width: 1200.0, height: 800.0), "cgRectToAppKit right display")
+            // Focused window on secondary screen while mouse stays on primary -> picks secondary (index 1)
+            try check(
+                selectHudScreenIndex(
+                    screenFrames: horizScreens,
+                    focusedWindowCgFrame: CGRect(x: 1800.0, y: 200.0, width: 1200.0, height: 800.0),
+                    mouseLocation: CGPoint(x: 500.0, y: 400.0),
+                    mainScreenIndex: 0
+                ) == 1,
+                "HUD screen prefers focused window on secondary over mouse on primary"
+            )
+            // Vertical stack: primary + display above (CG y < 0) + display below (CG y >= primaryH)
+            let vertScreens: [CGRect] = [
+                CGRect(x: 0.0, y: 0.0, width: 1920.0, height: 1080.0),     // primary
+                CGRect(x: 0.0, y: 1080.0, width: 1920.0, height: 1080.0),  // above primary (CG y in -1080..0)
+                CGRect(x: 0.0, y: -1080.0, width: 1920.0, height: 1080.0), // below primary (CG y in 1080..2160)
+            ]
+            try check(
+                selectHudScreenIndex(
+                    screenFrames: vertScreens,
+                    focusedWindowCgFrame: CGRect(x: 200.0, y: -900.0, width: 1000.0, height: 700.0),
+                    mouseLocation: CGPoint(x: 500.0, y: 500.0),
+                    mainScreenIndex: 0
+                ) == 1,
+                "HUD screen maps top display CG negative Y to AppKit upper display"
+            )
+            try check(
+                selectHudScreenIndex(
+                    screenFrames: vertScreens,
+                    focusedWindowCgFrame: CGRect(x: 200.0, y: 1200.0, width: 1000.0, height: 700.0),
+                    mouseLocation: CGPoint(x: 500.0, y: 500.0),
+                    mainScreenIndex: 0
+                ) == 2,
+                "HUD screen maps bottom display CG positive Y to AppKit lower display"
+            )
+            // No focused window frame -> falls back to mouse screen
+            try check(
+                selectHudScreenIndex(
+                    screenFrames: horizScreens,
+                    focusedWindowCgFrame: nil,
+                    mouseLocation: CGPoint(x: 2000.0, y: 100.0),
+                    mainScreenIndex: 0
+                ) == 1,
+                "HUD screen nil focused frame falls back to mouse screen"
+            )
+            // Off-screen focused window + out-of-bounds mouse -> falls back to mainScreenIndex then 0
+            try check(
+                selectHudScreenIndex(
+                    screenFrames: horizScreens,
+                    focusedWindowCgFrame: CGRect(x: 9000.0, y: 9000.0, width: 400.0, height: 300.0),
+                    mouseLocation: CGPoint(x: -500.0, y: -500.0),
+                    mainScreenIndex: 1
+                ) == 1,
+                "HUD screen off-screen window + mouse falls back to mainScreenIndex"
+            )
+            try check(
+                selectHudScreenIndex(
+                    screenFrames: horizScreens,
+                    focusedWindowCgFrame: nil,
+                    mouseLocation: CGPoint(x: -500.0, y: -500.0),
+                    mainScreenIndex: nil
+                ) == 0,
+                "HUD screen falls back to first screen when all signals absent"
+            )
+            // Straddling two screens: selects screen with larger intersection area
+            let sideBySide: [CGRect] = [
+                CGRect(x: 0.0, y: 0.0, width: 1440.0, height: 900.0),
+                CGRect(x: 1440.0, y: 0.0, width: 1440.0, height: 900.0),
+            ]
+            try check(
+                selectHudScreenIndex(
+                    screenFrames: sideBySide,
+                    focusedWindowCgFrame: CGRect(x: 1140.0, y: 100.0, width: 1000.0, height: 600.0), // 300px on 0, 700px on 1
+                    mouseLocation: CGPoint(x: 100.0, y: 100.0),
+                    mainScreenIndex: 0
+                ) == 1,
+                "HUD screen straddling window picks screen with larger overlap (secondary)"
+            )
+            try check(
+                selectHudScreenIndex(
+                    screenFrames: sideBySide,
+                    focusedWindowCgFrame: CGRect(x: 740.0, y: 100.0, width: 1000.0, height: 600.0), // 700px on 0, 300px on 1
+                    mouseLocation: CGPoint(x: 2000.0, y: 100.0),
+                    mainScreenIndex: 1
+                ) == 0,
+                "HUD screen straddling window picks screen with larger overlap (primary)"
+            )
+            try check(
+                selectHudScreenIndex(screenFrames: [], focusedWindowCgFrame: nil, mouseLocation: .zero) == nil,
+                "HUD screen empty screens returns nil"
+            )
+            // Floating always-on-top Ghostty window on secondary display ahead of normal primary window
+            let floatLayer = Int(CGWindowLevelForKey(.floatingWindow))
+            let normalLayer = Int(CGWindowLevelForKey(.normalWindow))
+            let floatWinRect = CGRect(x: 1800.0, y: 200.0, width: 1200.0, height: 800.0)
+            let normalWinRect = CGRect(x: 100.0, y: 100.0, width: 1000.0, height: 700.0)
+            let winCandidates: [CgWindowCandidate] = [
+                CgWindowCandidate(ownerPid: 999, layer: normalLayer, alpha: 1.0, bounds: normalWinRect),
+                CgWindowCandidate(ownerPid: 42, layer: Int(CGWindowLevelForKey(.statusWindow)), alpha: 1.0, bounds: normalWinRect),
+                CgWindowCandidate(ownerPid: 42, layer: floatLayer, alpha: 1.0, bounds: CGRect(x: 0.0, y: 0.0, width: 4.0, height: 4.0)),
+                CgWindowCandidate(ownerPid: 42, layer: floatLayer, alpha: 0.0, bounds: normalWinRect),
+                CgWindowCandidate(ownerPid: 42, layer: floatLayer, alpha: 1.0, bounds: floatWinRect),
+                CgWindowCandidate(ownerPid: 42, layer: normalLayer, alpha: 1.0, bounds: normalWinRect),
+            ]
+            let pickedFloatRect = selectFrontmostWindowCgFrame(from: winCandidates, ownerPid: 42)
+            try check(pickedFloatRect == floatWinRect, "floating always-on-top window on secondary preferred over trailing normal window")
+            try check(
+                selectHudScreenIndex(
+                    screenFrames: horizScreens,
+                    focusedWindowCgFrame: pickedFloatRect,
+                    mouseLocation: CGPoint(x: 500.0, y: 400.0),
+                    mainScreenIndex: 0
+                ) == 1,
+                "HUD screen anchors to floating secondary Ghostty window"
+            )
+        }
 
         try check(stripLeadingHudSymbol("! 麦克风暂忙") == "麦克风暂忙", "stripLeadingHudSymbol bang")
         try check(stripLeadingHudSymbol("⚠ 麦克风暂忙") == "麦克风暂忙", "stripLeadingHudSymbol warn")
