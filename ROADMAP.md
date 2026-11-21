@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前已发布基线**：`v0.10.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
+> **当前已发布基线**：`v0.11.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
 >
 > **工程规范与上下文路由架构**：[AGENTS.md](AGENTS.md) · [docs/context-routing.md](docs/context-routing.md)
 
@@ -50,7 +50,23 @@
 
 ---
 
-### 最新发版里程碑（`已发布 · v0.10.0`）
+### 最新发版里程碑（`已发布 · v0.11.0`）
+
+以下三项上下文冷启动、热词管理与跨周长稳自愈能力已在 `v0.11.0` 完成落地并正式发布：
+
+1. **Agent Session 冷启动回退（`[refiner].cold_start_fallback`）**：
+   - 新增 `"auto"` / `"hotwords"` / `"off"` 三层冷启动回退链路：Layer 0 在远程防串台门控下安全复用 `win.cwd` 工作区上下文，Layer 1 按同 `cwd` 跨 CLI 提取历史会话热词，Layer 2 注入可随当前对话自然驱逐的 `<=25K` 冻结前缀块 `<prior_session_reference>`；
+   - 同步补齐 SSH `_remote_probe.py` 单 RTT 远端冷启动对齐、macOS `/var -> /private/var` 软链 Claude 项目目录匹配，以及 `diagnose` 的脱敏 `ctx_fallback` 字段观测。
+2. **一等热词管理（`agent-voice-input hotwords`）**：
+   - 新增独立模块 `hotwords.py` 与 `hotwords list|add|remove [--scope global|chat|coding]` 子命令，支持 `[global]`/`[chat]`/`[coding]` 分段 `hotwords.txt`（保留 BOM/CRLF 与注释，经 `flock` + `0600` 原子写回），运行期免重启实时热加载；
+   - 落地四级优先级合并与跨 Doubao / Whisper / DashScope / Gemini / OpenRouter 的统一预算裁剪（`budget_hotwords_for_provider`）及配额可视化。
+3. **跨周休眠 / 切网长稳自愈**：
+   - 强化连接与解析自愈：`_KeepAlivePool` 双时钟休眠/漂移逐出、`0ms` 过期探测、代理零 DNS 直连与可取消 `_BoundedDnsResolver`；
+   - 强化双端唤醒与长跑稳定性：Windows `PowerBroadcastWindow`（`WM_POWERBROADCAST`）钩子原子重挂、macOS `didWakeNotification` 唤醒恢复与 PTT 安全收尾、O(1) 五元组 `verified_stat` 会话短路与 64 项有界 ETag LRU 缓存，以及 `2 MiB` `daemon.log` 原子轮转（`daemon.log.1`）与 `diagnose` 尾部回退读取。
+
+---
+
+### 已归档里程碑（`已发布 · v0.10.0`）
 
 以下四条日常可用性与操控闭环已在 `v0.10.0` 完成落地与全平台 CI 签收并正式发布：
 
@@ -91,16 +107,13 @@
 
 ### 后续演进里程碑
 
-#### 下一站里程碑（`规划中 · v0.11.0`）
+#### 后续演进方向（`规划中`）
 
-1. **Agent Session 冷启动回退**：补齐终端新建或代理刚启动尚未产出对话轨迹时的冷启动上下文回退策略，确保首句口述仍可安全隔离并获得当前工作区基础术语线索。
-2. **一等热词管理**：在坚持「不把未确认模型猜测直写持久化 `hotwords.txt`」原则的前提下，提供清晰易用的一等热词增删查验与预算可见性体验。
-3. **跨周休眠 / 切网长稳自愈**：增强系统合盖休眠、长时间驻留、Wi-Fi/VPN 切网后的连接池、桥接子进程与音频端点自愈能力。
-4. **真录音模型横评与原生 Gemini 单跳定向补测**：依托仓外隔离时间点回放基线，系统开展主流 ASR / 精修组合的真录音横向对比评测与原生 Gemini 单跳路径定向补测。
+1. **真录音模型横评与原生 Gemini 单跳定向补测**：依托仓外隔离时间点回放基线，系统开展主流 ASR / 精修组合的真录音横向对比评测与原生 Gemini 单跳路径定向补测。
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
 
-`v1.0` 不预设硬性时间表，待上述 `v0.10.0` 及 `v0.11.0` 核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
+`v1.0` 不预设硬性时间表，待 `v0.10.0` 与 `v0.11.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
 
 1. **外部用户零门槛开箱**：仅配置任意单一支持语音转写的主流渠道 API Key（可自动搭配本地 CLI 登录态或独立二阶段凭据），即可通过 `init` 与 `doctor --ping` 完成体检并稳定投入日常使用。
 2. **全场景安全投递与零串台**：本地终端、跨机 SSH 远端 Linux、主流桌面 IDE、普通桌面 GUI 应用与远程桌面自动让行均长期稳定运行；跨场景上下文严格隔离，系统剪贴板零意外污染，全链路严守不自动发送回车。

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-21
+
+### Added
+- **Agent session cold-start context fallback (`[refiner].cold_start_fallback`)**: Added three-layer cold-start fallback (`"auto"` default, `"hotwords"`, or `"off"`) when a newly opened terminal or coding agent session has no active transcript yet—combining Layer 0 safe `win.cwd` workspace/git fallback gated by the Remote Veto Gate, Layer 1 cross-CLI exact-`cwd` prior-session hotword extraction, and Layer 2 natural-eviction `<=25K` `<prior_session_reference>` frozen prefix blocks that drop cleanly once live turns grow; aligned single-RTT SSH `_remote_probe.py` cold-start probing and exposed a safe `ctx_fallback` field in `diagnose`.
+- **First-class scoped hotwords management (`agent-voice-input hotwords`)**: Added `src/agent_voice_input/hotwords.py` and `agent-voice-input hotwords list|add|remove [--scope global|chat|coding]` backed by scoped `[global]`/`[chat]`/`[coding]` sections in `hotwords.txt` (preserving UTF-8 BOM, CRLF line endings, and comments with `flock` + `0600` atomic writes), live file-stat reloading without restarting the daemon, 4-tier priority merging, and unified `budget_hotwords_for_provider` quota enforcement across Doubao, Whisper, DashScope, Gemini, and OpenRouter.
+- **Multi-week sleep/wake recovery & long-run self-healing**: Hardened long-lived daemon sessions across laptop sleep/wake and network switches with dual-clock `_KeepAlivePool` sleep/drift eviction, `0ms` stale-socket probing, zero-DNS proxy bypass, and cancellable `_BoundedDnsResolver` lookups; added Windows `PowerBroadcastWindow` (`WM_POWERBROADCAST`) atomic hook reinstallation and macOS `NSWorkspace.didWakeNotification` wake recovery with PTT safety stop; added O(1) 5-tuple `verified_stat` session short-circuiting and bounded 64-entry LRU caches with ETag pinning; and added `2 MiB` atomic `daemon.log` rotation to `daemon.log.1` with `diagnose` tail fallback.
+
+### Fixed
+- **macOS symlinked Claude project directory cold-start discovery**: Resolved symlinked project paths (such as `/var` -> `/private/var`) during local and remote cold-start prior-session discovery so Claude Code project directories match reliably on macOS.
+- **Test & CI stability**: Replaced fixed startup sleeps in daemon control-socket tests with `_wait_for_control_socket` readiness polling and added non-interactive `apt-get` HTTPS timeout flags in CI and publish workflows.
+
 ## [0.10.0] - 2026-11-20
 
 ### Added
@@ -126,7 +137,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Initial WSL2 release**: Two-stage context-aware voice input daemon and CLI for coding agents (**Codex**, **Claude Code**, **AGY**) on Windows + WSL2, featuring native `win_shim.ps1` WASAPI capture, global hotkey & HUD bridge, active terminal session discovery, `ffmpeg` loudness normalization with local silence gating, and safe paste without auto-pressing `Enter`.
 
-[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.8.0...v0.9.0

@@ -59,7 +59,7 @@
 - **ffmpeg**：Ubuntu / WSL2 执行 `sudo apt install ffmpeg`；macOS 执行 `brew install ffmpeg`
 - **Xcode Command Line Tools**（macOS 推荐）：执行 `xcode-select --install` 提供 `/usr/bin/swiftc`，首次启动会自动编译缓存原生热键与胶囊辅助程序（未安装时仍可用命令行 `toggle` / `once` 模式）。
 
-**2. 安装 CLI（`v0.10.0`）**
+**2. 安装 CLI（`v0.11.0`）**
 
 ```bash
 uv tool install agent-voice-input
@@ -78,7 +78,7 @@ agent-voice-input start
 
 **凭据搭配说明**：在 `~/.config/agent-voice-input/agent-voice-input.env` 中配置至少一把支持一阶段语音识别的凭据（如阿里百炼 `DASHSCOPE_API_KEY`、`OPENROUTER_API_KEY`、`GEMINI_API_KEY`、`OPENAI_API_KEY`、`GROQ_API_KEY`、`SILICONFLOW_API_KEY` 或豆包 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；二阶段可额外搭配 `DEEPSEEK_API_KEY`、`ARK_API_KEY` 或直接复用本机 `codex login`；无 `uv` 时可将 `uv tool` 替换为 `pipx`）。默认短按右 Ctrl（`<= 0.5s`）开始/完成录音，`tap_toggle` 模式下单独长按右 Ctrl 满 `0.8s` 不等松手即时取消当前录音或在途识别/精修（按住 `0.25s` 起轻提示）。
 
-> `agent-voice-input init` 已自动生成初始 `config.toml`；如需调整快捷键（如改为按住说话 `trigger_mode = "ptt"`）、胶囊位置（`bottom` / `top`）、`[remote]` 远端主机、录音时长上限或切换渠道，可参照 [`v0.10.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.10.0/config.example.toml)（或 [`main/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)）与 [`v0.10.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.10.0/config.example.env) 按需修改。
+> `agent-voice-input init` 已自动生成初始 `config.toml`；如需调整快捷键（如改为按住说话 `trigger_mode = "ptt"`）、胶囊位置（`bottom` / `top`）、`[remote]` 远端主机、录音时长上限或切换渠道，可参照 [`v0.11.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.11.0/config.example.toml)（或 [`main/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)）与 [`v0.11.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.11.0/config.example.env) 按需修改。
 
 ---
 

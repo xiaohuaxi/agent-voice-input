@@ -60,7 +60,7 @@ Please install and configure agent-voice-input (https://github.com/xiaohuaxi/age
 - **ffmpeg**: `sudo apt install ffmpeg` (Ubuntu / WSL2) or `brew install ffmpeg` (macOS)
 - **Xcode Command Line Tools** (recommended on macOS): `xcode-select --install` for `/usr/bin/swiftc` to compile and cache the native hotkey & HUD helper on first start (falls back to CLI `toggle` / `once` if absent).
 
-**2. Install (`v0.10.0`)**
+**2. Install (`v0.11.0`)**
 
 ```bash
 uv tool install agent-voice-input
@@ -79,7 +79,7 @@ agent-voice-input start
 
 **Stage 1 vs. Stage 2 credentials**: Set at least one Stage 1 speech-capable key in `~/.config/agent-voice-input/agent-voice-input.env` (`DASHSCOPE_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `SILICONFLOW_API_KEY`, or `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`; optional `DEEPSEEK_API_KEY`, `ARK_API_KEY`, or local `codex login` can pair with it for Stage 2; `pipx` works identically in place of `uv tool`).
 
-> Tap **Right Ctrl** (`RControl`) (`<= 0.5s`) inside your terminal to start and finish recording; in `tap_toggle` mode, holding `RControl` alone for `0.8s` cancels the current recording or in-flight processing immediately without waiting for release (with a live hold preview after `0.25s`). `agent-voice-input init` writes a starter `config.toml`; to customize hotkeys (`trigger_mode = "ptt"`, `tap_max_ms`, `hold_cancel_ms`), HUD position (`bottom` / `top`), `[remote]`, duration limits, or providers, see [`v0.10.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.10.0/config.example.toml) (or [`main/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)) and [`v0.10.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.10.0/config.example.env).
+> Tap **Right Ctrl** (`RControl`) (`<= 0.5s`) inside your terminal to start and finish recording; in `tap_toggle` mode, holding `RControl` alone for `0.8s` cancels the current recording or in-flight processing immediately without waiting for release (with a live hold preview after `0.25s`). `agent-voice-input init` writes a starter `config.toml`; to customize hotkeys (`trigger_mode = "ptt"`, `tap_max_ms`, `hold_cancel_ms`), HUD position (`bottom` / `top`), `[remote]`, duration limits, or providers, see [`v0.11.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.11.0/config.example.toml) (or [`main/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)) and [`v0.11.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.11.0/config.example.env).
 
 ---
 
