@@ -1030,9 +1030,14 @@ class DoubaoAsrProvider(BaseAsrProvider):
     def _resolve_auth(self) -> tuple[str | None, str, tuple[str, ...]]:
         key_item = self._resolve_custom_or_vendor_key(
             self.creds.doubao_key,
-            "missing Doubao ASR API key (set DOUBAO_ASR_API_KEY or API_KEY_DOUBAO_ASR)",
+            "missing Doubao Speech API key (set DOUBAO_SPEECH_API_KEY; legacy aliases: DOUBAO_ASR_API_KEY / API_KEY_DOUBAO_ASR)",
         )
-        app_id = self.creds.doubao_app_id.value if self.creds.doubao_app_id is not None else None
+        # Canonical DOUBAO_SPEECH_API_KEY uses single-header X-Api-Key auth; ignore any
+        # lingering legacy DOUBAO_ASR_APP_ID / APP_ID_DOUBAO_ASR to prevent 401/403 mismatches.
+        if key_item.source_env.strip().upper() == "DOUBAO_SPEECH_API_KEY":
+            app_id = None
+        else:
+            app_id = self.creds.doubao_app_id.value if self.creds.doubao_app_id is not None else None
         secrets: tuple[str, ...] = (
             (app_id, key_item.value) if app_id else (key_item.value,)
         )
@@ -1281,10 +1286,15 @@ class DoubaoAsrProvider(BaseAsrProvider):
                     slot_errors.append(f"{rid}({mode}): {api_code or resp.status}")
                     continue
                 if resp.status in (401, 403):
+                    auth_hint = (
+                        "DOUBAO_ASR_APP_ID / DOUBAO_ASR_API_KEY"
+                        if app_id
+                        else "DOUBAO_SPEECH_API_KEY"
+                    )
                     return (
                         "FAIL",
                         ms,
-                        f"FAIL (HTTP {resp.status} unauthorized, {ms}ms; check DOUBAO_ASR_APP_ID / DOUBAO_ASR_API_KEY)",
+                        f"FAIL (HTTP {resp.status} unauthorized, {ms}ms; check {auth_hint})",
                     )
                 detail = api_msg or "unexpected status"
                 return (

@@ -171,7 +171,7 @@ CREDENTIAL_ENV_ORDER: dict[str, tuple[str, ...]] = {
     "dashscope": ("DASHSCOPE_API_KEY", "ALI_API_KEY", "API_KEY_ALI"),
     "deepseek": ("DEEPSEEK_API_KEY", "API_KEY_DEEPSEEK"),
     "doubao_app_id": ("DOUBAO_ASR_APP_ID", "APP_ID_DOUBAO_ASR"),
-    "doubao_key": ("DOUBAO_ASR_API_KEY", "API_KEY_DOUBAO_ASR"),
+    "doubao_key": ("DOUBAO_SPEECH_API_KEY", "DOUBAO_ASR_API_KEY", "API_KEY_DOUBAO_ASR"),
     "volcengine": ("ARK_API_KEY", "VOLCENGINE_API_KEY", "HUOSHAN_API_KEY", "API_KEY_HUOSHAN"),
     "openrouter": ("OPENROUTER_API_KEY", "API_KEY_OPENROUTER"),
     "gemini": ("GEMINI_API_KEY", "API_KEY_GEMINI"),

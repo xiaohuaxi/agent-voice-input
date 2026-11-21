@@ -48,7 +48,7 @@ Copy and paste this prompt directly into **Codex**, **Claude Code**, or **AGY**:
 Please install and configure agent-voice-input (https://github.com/xiaohuaxi/agent-voice-input) for me:
 1. Check python3 (>=3.10) and ffmpeg (plus Xcode Command Line Tools `/usr/bin/swiftc` on macOS), then install via `uv tool install agent-voice-input` (fall back to `pipx` if `uv` is unavailable).
 2. Run `agent-voice-input init` to create `~/.config/agent-voice-input/config.toml` and `agent-voice-input.env` (chmod 600).
-3. Check if a Stage 1 speech-capable API key is already set in my environment (e.g. DASHSCOPE_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, SILICONFLOW_API_KEY, or DOUBAO_ASR_API_KEY; optional Stage 2 keys like DEEPSEEK_API_KEY / ARK_API_KEY can be added alongside it); if not, ask which provider I want to use and add it to `~/.config/agent-voice-input/agent-voice-input.env`.
+3. Check if a Stage 1 speech-capable API key is already set in my environment (e.g. DASHSCOPE_API_KEY, DOUBAO_SPEECH_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, or SILICONFLOW_API_KEY; optional Stage 2 keys like DEEPSEEK_API_KEY / ARK_API_KEY can be added alongside it); if not, ask which provider I want to use and add it to `~/.config/agent-voice-input/agent-voice-input.env`.
 4. Run `agent-voice-input doctor --ping` to verify all checks pass, then start the background daemon with `agent-voice-input start`.
 ```
 
@@ -77,7 +77,7 @@ agent-voice-input doctor --ping
 agent-voice-input start
 ```
 
-**Stage 1 vs. Stage 2 credentials**: Set at least one Stage 1 speech-capable key in `~/.config/agent-voice-input/agent-voice-input.env` (`DASHSCOPE_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, `SILICONFLOW_API_KEY`, or `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`; optional `DEEPSEEK_API_KEY`, `ARK_API_KEY`, or local `codex login` can pair with it for Stage 2; `pipx` works identically in place of `uv tool`).
+**Stage 1 vs. Stage 2 credentials**: Set at least one Stage 1 speech-capable key in `~/.config/agent-voice-input/agent-voice-input.env` (`DASHSCOPE_API_KEY`, `DOUBAO_SPEECH_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`, or `SILICONFLOW_API_KEY`; Doubao Speech uses single-header `X-Api-Key` with no `APP_ID` required and keeps legacy `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` compatible; optional `DEEPSEEK_API_KEY`, `ARK_API_KEY`, or local `codex login` can pair with it for Stage 2; `pipx` works identically in place of `uv tool`).
 
 > Tap **Right Ctrl** (`RControl`) (`<= 0.5s`) inside your terminal to start and finish recording; in `tap_toggle` mode, holding `RControl` alone for `0.8s` cancels the current recording or in-flight processing immediately without waiting for release (with a live hold preview after `0.25s`). `agent-voice-input init` writes a starter `config.toml`; to customize hotkeys (`trigger_mode = "ptt"`, `tap_max_ms`, `hold_cancel_ms`), HUD position (`bottom` / `top`), `[remote]`, duration limits, or providers, see [`v0.11.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.11.0/config.example.toml) (or [`main/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)) and [`v0.11.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.11.0/config.example.env).
 
@@ -126,7 +126,7 @@ Configuration uses two clean files (`CLI flags > config.toml > built-in defaults
 | **`codex`** | `refiner` | — | `gpt-6-luna` *(auto-falls back to public `gpt-5.4-mini` / `gpt-5-codex-mini`)* | Local `codex` CLI login *(stateless HTTP `/responses` + 30m safe refresh; never enables Fast mode)* |
 | **`deepseek`** | `refiner` | — | `deepseek-flash` | `DEEPSEEK_API_KEY` *(compat: `API_KEY_DEEPSEEK`)* |
 | **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` *(or single-hop `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(compat: `ALI_API_KEY`)* |
-| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_API_KEY` *(single-header `X-Api-Key` or with `DOUBAO_ASR_APP_ID`; defaults to 2.0 `volc.seedasr.auc` with 1.0 fallback)* |
+| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_SPEECH_API_KEY` *(single-header `X-Api-Key`, no `APP_ID` needed; compat: `DOUBAO_ASR_API_KEY` or legacy dual-header `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`; defaults to 2.0 `volc.seedasr.auc` with 1.0 fallback)* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(compat: `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
 | **`openrouter`** | `asr`, `refiner` | `qwen/qwen3-asr-1.7b` | `google/gemini-3.5-flash-lite` | `OPENROUTER_API_KEY` |
 | **`gemini`** | `asr`, `refiner` | `gemini-3.5-flash-lite` *(single-hop)* | `gemini-3.5-flash-lite` | `GEMINI_API_KEY` |

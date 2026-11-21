@@ -470,8 +470,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         for expected_key in (
             "DASHSCOPE_API_KEY",
             "DEEPSEEK_API_KEY",
-            "DOUBAO_ASR_APP_ID",
-            "DOUBAO_ASR_API_KEY",
+            "DOUBAO_SPEECH_API_KEY",
             "ARK_API_KEY",
             "OPENROUTER_API_KEY",
             "GEMINI_API_KEY",
@@ -480,6 +479,11 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
             "SILICONFLOW_API_KEY",
         ):
             self.assertIn(expected_key, loaded)
+        # Legacy dual-header Doubao credentials stay commented out in config.example.env
+        self.assertNotIn("DOUBAO_ASR_APP_ID", loaded)
+        self.assertNotIn("DOUBAO_ASR_API_KEY", loaded)
+        self.assertIn("# DOUBAO_ASR_APP_ID=", env_raw)
+        self.assertIn("# DOUBAO_ASR_API_KEY=", env_raw)
 
     def test_pyproject_and_package_data_integrity(self) -> None:
         pyproject_path = _REPO_ROOT / "pyproject.toml"

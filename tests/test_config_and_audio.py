@@ -593,6 +593,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 "ARK_API_KEY": "ark_canonical_v",
                 "DOUBAO_ASR_APP_ID": "db_appid_suffix",
                 "APP_ID_DOUBAO_ASR": "db_appid_prefix",
+                "DOUBAO_SPEECH_API_KEY": "db_speech_canonical",
                 "DOUBAO_ASR_API_KEY": "db_key_suffix",
                 "API_KEY_DOUBAO_ASR": "db_key_prefix",
                 "OPENROUTER_API_KEY": "or_suffix_v",
@@ -625,12 +626,35 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             ("ark_canonical_v", "ARK_API_KEY"),
         )
         self.assertEqual(
+            CREDENTIAL_ENV_ORDER["doubao_key"],
+            ("DOUBAO_SPEECH_API_KEY", "DOUBAO_ASR_API_KEY", "API_KEY_DOUBAO_ASR"),
+        )
+        self.assertEqual(
             (creds.doubao_app_id.value, creds.doubao_app_id.source_env),
             ("db_appid_suffix", "DOUBAO_ASR_APP_ID"),
         )
         self.assertEqual(
             (creds.doubao_key.value, creds.doubao_key.source_env),
+            ("db_speech_canonical", "DOUBAO_SPEECH_API_KEY"),
+        )
+        # Doubao key priority fallback chain: DOUBAO_ASR_API_KEY > API_KEY_DOUBAO_ASR
+        creds_db_legacy1 = resolve_credentials(
+            cfg,
+            {
+                "DOUBAO_ASR_API_KEY": "db_key_suffix",
+                "API_KEY_DOUBAO_ASR": "db_key_prefix",
+            },
+        )
+        assert creds_db_legacy1.doubao_key is not None
+        self.assertEqual(
+            (creds_db_legacy1.doubao_key.value, creds_db_legacy1.doubao_key.source_env),
             ("db_key_suffix", "DOUBAO_ASR_API_KEY"),
+        )
+        creds_db_legacy2 = resolve_credentials(cfg, {"API_KEY_DOUBAO_ASR": "db_key_prefix"})
+        assert creds_db_legacy2.doubao_key is not None
+        self.assertEqual(
+            (creds_db_legacy2.doubao_key.value, creds_db_legacy2.doubao_key.source_env),
+            ("db_key_prefix", "API_KEY_DOUBAO_ASR"),
         )
         self.assertEqual(
             (creds.openrouter.value, creds.openrouter.source_env),
@@ -701,10 +725,10 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             ASR_AUTO_PRIORITY,
             ("dashscope", "doubao", "openrouter", "gemini", "openai", "groq", "siliconflow"),
         )
-        # Full ordered priority chain check
+        # Full ordered priority chain check (canonical DOUBAO_SPEECH_API_KEY)
         full_env = {
             "DASHSCOPE_API_KEY": "k_dash",
-            "DOUBAO_ASR_API_KEY": "k_db",
+            "DOUBAO_SPEECH_API_KEY": "k_db",
             "OPENROUTER_API_KEY": "k_or",
             "GEMINI_API_KEY": "k_gem",
             "OPENAI_API_KEY": "k_oai",
@@ -713,7 +737,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         }
         expected_chain = [
             ("DASHSCOPE_API_KEY", "dashscope"),
-            ("DOUBAO_ASR_API_KEY", "doubao"),
+            ("DOUBAO_SPEECH_API_KEY", "doubao"),
             ("OPENROUTER_API_KEY", "openrouter"),
             ("GEMINI_API_KEY", "gemini"),
             ("OPENAI_API_KEY", "openai"),
@@ -760,6 +784,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         env = {
             "API_KEY_ALI": "supersecret_short",
             "ALI_API_KEY": "supersecret_short_extended_tail",
+            "DOUBAO_SPEECH_API_KEY": "db_speech_secret_xyz",
             "APP_ID_DOUBAO_ASR": "appid_val_98765",
             "GEMINI_API_KEY": url_raw_secret,
             "VOICE_INPUT_HOTKEY": "RControl",
@@ -777,7 +802,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         escaped_json_frag = r'{\"api_key\": \"esc_part1\\\"esc_part2\"}'
         raw = (
             f"err with supersecret_short_extended_tail and supersecret_short; "
-            f"appid=appid_val_98765; toml_custom=toml_custom_provider_secret; "
+            f"db_speech=db_speech_secret_xyz; appid=appid_val_98765; toml_custom=toml_custom_provider_secret; "
             f"Authorization: Bearer tok_xyz_123456; "
             f"Authorization: Basic dXNlcjpwYXNzX3NlY3JldA==; "
             f"Authorization: Token raw_tok_987654; "
@@ -791,6 +816,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         for forbidden in (
             "supersecret",
             "_extended_tail",
+            "db_speech_secret_xyz",
             "appid_val_98765",
             "toml_custom_provider_secret",
             "tok_xyz_123456",

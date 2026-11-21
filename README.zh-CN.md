@@ -47,7 +47,7 @@
 请帮我安装并配置 agent-voice-input（https://github.com/xiaohuaxi/agent-voice-input）：
 1. 检查 python3 (>=3.10) 与 ffmpeg（macOS 下顺带确认 Xcode Command Line Tools `/usr/bin/swiftc`），用 `uv tool install agent-voice-input` 安装（无 uv 则换用 pipx）；
 2. 运行 `agent-voice-input init` 初始化生成权限 600 的 `~/.config/agent-voice-input/config.toml` 与 `agent-voice-input.env`；
-3. 检查我当前环境中是否已有至少一把支持一阶段语音识别的凭据（如 DASHSCOPE_API_KEY、OPENROUTER_API_KEY、GEMINI_API_KEY、OPENAI_API_KEY、GROQ_API_KEY、SILICONFLOW_API_KEY 或 DOUBAO_ASR_API_KEY；二阶段可选搭配 DEEPSEEK_API_KEY / ARK_API_KEY 或本机 codex 登录），没有就问我用哪家，写入 `~/.config/agent-voice-input/agent-voice-input.env`；
+3. 检查我当前环境中是否已有至少一把支持一阶段语音识别的凭据（如 DASHSCOPE_API_KEY、DOUBAO_SPEECH_API_KEY、OPENROUTER_API_KEY、GEMINI_API_KEY、OPENAI_API_KEY、GROQ_API_KEY 或 SILICONFLOW_API_KEY；二阶段可选搭配 DEEPSEEK_API_KEY / ARK_API_KEY 或本机 codex 登录），没有就问我用哪家，写入 `~/.config/agent-voice-input/agent-voice-input.env`；
 4. 运行 `agent-voice-input doctor --ping` 确认各项检查通过后，执行 `agent-voice-input start` 启动后台守护进程。
 ```
 
@@ -76,7 +76,7 @@ agent-voice-input doctor --ping
 agent-voice-input start
 ```
 
-**凭据搭配说明**：在 `~/.config/agent-voice-input/agent-voice-input.env` 中配置至少一把支持一阶段语音识别的凭据（如阿里百炼 `DASHSCOPE_API_KEY`、`OPENROUTER_API_KEY`、`GEMINI_API_KEY`、`OPENAI_API_KEY`、`GROQ_API_KEY`、`SILICONFLOW_API_KEY` 或豆包 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；二阶段可额外搭配 `DEEPSEEK_API_KEY`、`ARK_API_KEY` 或直接复用本机 `codex login`；无 `uv` 时可将 `uv tool` 替换为 `pipx`）。默认短按右 Ctrl（`<= 0.5s`）开始/完成录音，`tap_toggle` 模式下单独长按右 Ctrl 满 `0.8s` 不等松手即时取消当前录音或在途识别/精修（按住 `0.25s` 起轻提示）。
+**凭据搭配说明**：在 `~/.config/agent-voice-input/agent-voice-input.env` 中配置至少一把支持一阶段语音识别的凭据（如阿里百炼 `DASHSCOPE_API_KEY`、豆包语音 `DOUBAO_SPEECH_API_KEY`（单头 `X-Api-Key` 无需 `APP_ID`，兼容旧版 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` 双头）、`OPENROUTER_API_KEY`、`GEMINI_API_KEY`、`OPENAI_API_KEY`、`GROQ_API_KEY` 或 `SILICONFLOW_API_KEY`；二阶段可额外搭配 `DEEPSEEK_API_KEY`、`ARK_API_KEY` 或直接复用本机 `codex login`；无 `uv` 时可将 `uv tool` 替换为 `pipx`）。默认短按右 Ctrl（`<= 0.5s`）开始/完成录音，`tap_toggle` 模式下单独长按右 Ctrl 满 `0.8s` 不等松手即时取消当前录音或在途识别/精修（按住 `0.25s` 起轻提示）。
 
 > `agent-voice-input init` 已自动生成初始 `config.toml`；如需调整快捷键（如改为按住说话 `trigger_mode = "ptt"`）、胶囊位置（`bottom` / `top`）、`[remote]` 远端主机、录音时长上限或切换渠道，可参照 [`v0.11.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.11.0/config.example.toml)（或 [`main/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)）与 [`v0.11.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.11.0/config.example.env) 按需修改。
 
@@ -125,7 +125,7 @@ agent-voice-input start
 | **`codex`** | `refiner` | — | `gpt-6-luna` *(公开账号自动回退 `gpt-5.4-mini` / `gpt-5-codex-mini`)* | 复用本机 `codex` CLI 登录态 *(无状态 HTTP `/responses` 直连 + 30 分钟提前安全刷新，绝不开启 Fast 模式)* |
 | **`deepseek`** | `refiner` | — | `deepseek-flash` | `DEEPSEEK_API_KEY` *(兼容 `API_KEY_DEEPSEEK`)* |
 | **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` *(或单跳 `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(兼容 `ALI_API_KEY`)* |
-| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_ASR_API_KEY` *（支持新版单头 `X-Api-Key` 或搭配 `DOUBAO_ASR_APP_ID`；默认首选 2.0 `volc.seedasr.auc` 并自动回退 1.0 槽位）* |
+| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_SPEECH_API_KEY` *（单头 `X-Api-Key`，无需 `APP_ID`；兼容旧 `DOUBAO_ASR_API_KEY` 或双头 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；默认首选 2.0 `volc.seedasr.auc` 并自动回退 1.0 槽位）* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(兼容 `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
 | **`openrouter`** | `asr`, `refiner` | `qwen/qwen3-asr-1.7b` | `google/gemini-3.5-flash-lite` | `OPENROUTER_API_KEY` |
 | **`gemini`** | `asr`, `refiner` | `gemini-3.5-flash-lite` *(单跳)* | `gemini-3.5-flash-lite` | `GEMINI_API_KEY` |

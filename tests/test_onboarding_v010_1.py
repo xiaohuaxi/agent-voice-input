@@ -485,7 +485,16 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(env_p.stat().st_mode), 0o600)
 
             # Commented .env MUST parse to {} so placeholder strings NEVER hijack auto provider selection!
-            self.assertEqual(parse_env_text(env_p.read_text(encoding="utf-8")), {})
+            env_template_text = env_p.read_text(encoding="utf-8")
+            self.assertEqual(parse_env_text(env_template_text), {})
+            self.assertIn('# DOUBAO_SPEECH_API_KEY="..."', env_template_text)
+            self.assertIn("Legacy dual-header", env_template_text)
+            # config.example.env stays aligned: promotes DOUBAO_SPEECH_API_KEY as canonical single-header key
+            example_env_text = (_REPO_ROOT / "config.example.env").read_text(encoding="utf-8")
+            example_env_parsed = parse_env_text(example_env_text)
+            self.assertIn("DOUBAO_SPEECH_API_KEY", example_env_parsed)
+            self.assertNotIn("DOUBAO_ASR_APP_ID", example_env_parsed)
+            self.assertNotIn("DOUBAO_ASR_API_KEY", example_env_parsed)
             # Both stdlib/3.10 TOML parsers and load_config parse generated config.toml cleanly
             parsed_a = parse_toml(toml_p.read_text(encoding="utf-8"))
             parsed_b = _parse_simple_toml(toml_p.read_text(encoding="utf-8"))
@@ -678,7 +687,51 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             self.assertIn("volc.seedasr.auc/submit", out_db)
             self.assertEqual(len(db_ping_reqs), 1)
             self.assertTrue(db_ping_reqs[0].url.endswith("/submit"))
+            self.assertEqual(db_ping_reqs[0].headers.get("X-Api-App-Key"), "db_app_9999")
+            self.assertEqual(db_ping_reqs[0].headers.get("X-Api-Access-Key"), "db_test_aaaa7777")
             self.assertNotIn("db_test_aaaa7777", out_db)
+
+            # 4b. DOUBAO_SPEECH_API_KEY with lingering legacy DOUBAO_ASR_APP_ID -> doctor pings single-header only
+            env_db_speech = {
+                "HOME": str(root / "no_cfg_home"),
+                "PATH": "",
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "DOUBAO_SPEECH_API_KEY": "db_speech_key_7777",
+                "DOUBAO_ASR_APP_ID": "db_stale_app_9999",
+            }
+            db_speech_reqs: list[HttpRequest] = []
+            buf_db_speech = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_db_speech),
+            ):
+                self.assertEqual(
+                    cli_mod._cmd_doctor(
+                        Config(),
+                        env_db_speech,
+                        ping=True,
+                        transport=lambda req: (
+                            db_speech_reqs.append(req),
+                            HttpResponse(
+                                status=200,
+                                headers={"X-Api-Status-Code": "20000003", "X-Api-Message": "silence"},
+                                body=b"{}",
+                            ),
+                        )[1],
+                    ),
+                    0,
+                    buf_db_speech.getvalue(),
+                )
+            out_db_speech = buf_db_speech.getvalue()
+            self.assertIn("doubao=OK (via DOUBAO_SPEECH_API_KEY)", out_db_speech)
+            self.assertIn("legacy app_id via DOUBAO_ASR_APP_ID ignored", out_db_speech)
+            self.assertEqual(len(db_speech_reqs), 1)
+            self.assertEqual(db_speech_reqs[0].headers.get("X-Api-Key"), "db_speech_key_7777")
+            self.assertNotIn("X-Api-App-Key", db_speech_reqs[0].headers)
+            self.assertNotIn("X-Api-Access-Key", db_speech_reqs[0].headers)
+            self.assertNotIn("db_speech_key_7777", out_db_speech)
 
             # 5. `--ping` shared endpoint deduplication (DashScope Stage 1 + auto->dashscope Stage 2 = 1 HTTP GET) & 401 redaction
             ping_reqs: list[HttpRequest] = []

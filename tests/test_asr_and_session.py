@@ -27,6 +27,7 @@ from agent_voice_input.asr_providers import (  # noqa: E402
     CHAT_AUDIO_TASK_REMINDER,
     ChatAudioAsrProvider,
     DEFAULT_CONNECT_TIMEOUT_SEC,
+    DoubaoAsrProvider,
     HttpRequest,
     HttpResponse,
     HttpTransportError,
@@ -598,6 +599,113 @@ class AsrProvidersTests(unittest.TestCase):
         )
         self.assertEqual(res_poll.text, "backoff ladder ok")
         self.assertEqual(poll_sleeps, [0.30, 0.30, 0.50, 0.80])
+
+    def test_doubao_speech_api_key_forces_single_header_and_legacy_compat(self) -> None:
+        cfg = Config()
+        cfg.asr.provider = "doubao"
+        cfg.asr.resource_id = "volc.bigasr.auc_turbo"
+        cfg.asr.hotwords_file = ""
+
+        # 1. DOUBAO_SPEECH_API_KEY + lingering DOUBAO_ASR_APP_ID / DOUBAO_ASR_API_KEY ->
+        #    strictly single-header X-Api-Key only (no X-Api-App-Key / X-Api-Access-Key).
+        for legacy_app_var in ("DOUBAO_ASR_APP_ID", "APP_ID_DOUBAO_ASR"):
+            seen_hdrs: list[dict[str, str]] = []
+
+            def _ok_flash_tx(req: HttpRequest) -> HttpResponse:
+                seen_hdrs.append(dict(req.headers))
+                return HttpResponse(
+                    200,
+                    {"x-api-status-code": "20000000"},
+                    json.dumps({"result": {"text": "单头鉴权成功"}}).encode("utf-8"),
+                )
+
+            env_mixed = {
+                "DOUBAO_SPEECH_API_KEY": "db_speech_fake_val",
+                "DOUBAO_ASR_API_KEY": "db_legacy_fake_val",
+                legacy_app_var: "db_appid_fake_val",
+            }
+            res = transcribe(
+                _sample_wav(), cfg, env=env_mixed, transport=_ok_flash_tx, sleep_fn=lambda _: None
+            )
+            self.assertEqual(res.text, "单头鉴权成功")
+            self.assertEqual(len(seen_hdrs), 1)
+            self.assertEqual(seen_hdrs[0].get("X-Api-Key"), "db_speech_fake_val")
+            self.assertNotIn("X-Api-App-Key", seen_hdrs[0])
+            self.assertNotIn("X-Api-Access-Key", seen_hdrs[0])
+
+            # probe_ping also uses pure single-header auth and guides toward DOUBAO_SPEECH_API_KEY on 401
+            ping_hdrs: list[dict[str, str]] = []
+
+            def _ping_401_tx(req: HttpRequest) -> HttpResponse:
+                ping_hdrs.append(dict(req.headers))
+                return HttpResponse(401, {}, b'{"message":"unauthorized"}')
+
+            creds_mixed = resolve_credentials(cfg, env_mixed)
+            st, _, msg = DoubaoAsrProvider(
+                cfg, creds_mixed, env=env_mixed, transport=_ping_401_tx
+            ).probe_ping(timeout_sec=5.0)
+            self.assertEqual(st, "FAIL")
+            self.assertIn("DOUBAO_SPEECH_API_KEY", msg)
+            self.assertEqual(ping_hdrs[0].get("X-Api-Key"), "db_speech_fake_val")
+            self.assertNotIn("X-Api-App-Key", ping_hdrs[0])
+            self.assertNotIn("X-Api-Access-Key", ping_hdrs[0])
+
+        # 2. Backward compat: legacy DOUBAO_ASR_API_KEY + DOUBAO_ASR_APP_ID -> dual-header auth
+        dual_hdrs: list[dict[str, str]] = []
+        env_dual = {
+            "DOUBAO_ASR_APP_ID": "legacy_app_id_only",
+            "DOUBAO_ASR_API_KEY": "legacy_token_only",
+        }
+        res_dual = transcribe(
+            _sample_wav(),
+            cfg,
+            env=env_dual,
+            transport=lambda r: (
+                dual_hdrs.append(dict(r.headers)),
+                HttpResponse(
+                    200,
+                    {"x-api-status-code": "20000000"},
+                    json.dumps({"result": {"text": "双头兼容成功"}}).encode("utf-8"),
+                ),
+            )[1],
+            sleep_fn=lambda _: None,
+        )
+        self.assertEqual(res_dual.text, "双头兼容成功")
+        self.assertEqual(dual_hdrs[0].get("X-Api-App-Key"), "legacy_app_id_only")
+        self.assertEqual(dual_hdrs[0].get("X-Api-Access-Key"), "legacy_token_only")
+        self.assertNotIn("X-Api-Key", dual_hdrs[0])
+
+        # 3. Backward compat: legacy DOUBAO_ASR_API_KEY alone (no APP_ID) -> single-header X-Api-Key
+        single_legacy_hdrs: list[dict[str, str]] = []
+        res_single_legacy = transcribe(
+            _sample_wav(),
+            cfg,
+            env={"DOUBAO_ASR_API_KEY": "legacy_single_key"},
+            transport=lambda r: (
+                single_legacy_hdrs.append(dict(r.headers)),
+                HttpResponse(
+                    200,
+                    {"x-api-status-code": "20000000"},
+                    json.dumps({"result": {"text": "旧单头兼容成功"}}).encode("utf-8"),
+                ),
+            )[1],
+            sleep_fn=lambda _: None,
+        )
+        self.assertEqual(res_single_legacy.text, "旧单头兼容成功")
+        self.assertEqual(single_legacy_hdrs[0].get("X-Api-Key"), "legacy_single_key")
+        self.assertNotIn("X-Api-App-Key", single_legacy_hdrs[0])
+        self.assertNotIn("X-Api-Access-Key", single_legacy_hdrs[0])
+
+        # 4. Missing Doubao key error message prioritizes DOUBAO_SPEECH_API_KEY
+        with self.assertRaises(AsrError) as miss_ctx:
+            transcribe(
+                _sample_wav(),
+                cfg,
+                env={},
+                transport=lambda _r: HttpResponse(200, {}, b"{}"),
+                sleep_fn=lambda _: None,
+            )
+        self.assertIn("DOUBAO_SPEECH_API_KEY", str(miss_ctx.exception))
 
     def test_security_exception_chain_boundary_truncation_redirect_and_custom_key_env(self) -> None:
         secret = "boundary_secret_value_1234567890"

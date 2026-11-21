@@ -81,7 +81,8 @@ api = "auto"
 # Stage 1 thinking/reasoning budget:
 # "auto" (suppresses default thinking latency on supported multimodal models) | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 effort = "auto"
-# Doubao ASR resource slot & mode:
+# Doubao Speech ASR auth, resource slot & mode:
+# Auth uses single-header DOUBAO_SPEECH_API_KEY (X-Api-Key, no APP_ID needed; legacy DOUBAO_ASR_APP_ID + DOUBAO_ASR_API_KEY dual-header remains compatible when DOUBAO_SPEECH_API_KEY is unset).
 # "auto" prefers Doubao 2.0 standard ("volc.seedasr.auc", async submit/query) and falls back to 1.0 ("volc.bigasr.auc", "volc.bigasr.auc_turbo"), caching the granted slot in memory.
 # Set resource_id explicitly (e.g. "volc.seedasr.auc") to skip cold-start slot probing; doubao_mode = "submit" | "flash" restricts "auto" probing to that mode.
 resource_id = "auto"

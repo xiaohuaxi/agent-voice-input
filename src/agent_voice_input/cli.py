@@ -47,9 +47,13 @@ _INIT_ENV_TEMPLATE = """\
 # Google Gemini (single-hop Stage 1 audio + context refinement, or Stage 2 Refiner)
 # GEMINI_API_KEY="AIza..."
 
-# Volcengine Doubao Speech (Stage 1 ASR) & Volcengine Ark (Stage 2 Refiner)
+# Volcengine Doubao Speech (Stage 1 ASR: single-header X-Api-Key, no APP_ID needed)
+# DOUBAO_SPEECH_API_KEY="..."
+# Legacy dual-header app credentials (optional; ignored when DOUBAO_SPEECH_API_KEY is set):
 # DOUBAO_ASR_APP_ID="..."
 # DOUBAO_ASR_API_KEY="..."
+
+# Volcengine Ark (Stage 2 Refiner: doubao-seed-2-0-mini-260428)
 # ARK_API_KEY="..."
 
 # OpenAI / Groq / SiliconFlow
@@ -818,12 +822,26 @@ def _doctor_check_asr(st: _DoctorState) -> None:
     st.asr_ready = bool(asr_info["ready"])
     st.asr_is_single_hop = bool(asr_info["single_hop"])
     asr_creds_tail = f", asr_custom={_cred_label(creds.asr_custom)}" if cfg.asr.api_key_env.strip() else ""
+    doubao_single_key = (
+        creds.doubao_key is not None
+        and creds.doubao_key.source_env.strip().upper() == "DOUBAO_SPEECH_API_KEY"
+    )
+    if doubao_single_key:
+        doubao_label = f"doubao={_cred_label(creds.doubao_key)}"
+        if creds.doubao_app_id is not None:
+            doubao_label += f" (legacy app_id via {creds.doubao_app_id.source_env} ignored)"
+    elif creds.doubao_app_id is not None:
+        doubao_label = (
+            f"doubao={_cred_label(creds.doubao_key)} (app_id={_cred_label(creds.doubao_app_id)})"
+        )
+    else:
+        doubao_label = f"doubao={_cred_label(creds.doubao_key)}"
     st.emit(
         f"[asr]       selected={st.eff_asr} (model={st.eff_asr_model}, api={st.eff_asr_api}, effort={cfg.asr.effort}) -> "
         f"{'OK' if st.asr_ready else 'MISSING KEY'} | "
         f"dashscope={_cred_label(creds.dashscope)}, "
         f"deepseek={_cred_label(creds.deepseek)}, "
-        f"doubao={_cred_label(creds.doubao_key)} (app_id={_cred_label(creds.doubao_app_id)}), "
+        f"{doubao_label}, "
         f"volcengine={_cred_label(creds.volcengine)}, "
         f"openrouter={_cred_label(creds.openrouter)}, "
         f"gemini={_cred_label(creds.gemini)}, "
@@ -834,7 +852,7 @@ def _doctor_check_asr(st: _DoctorState) -> None:
     if not st.asr_ready:
         st.ok_all = False
         st.emit_fix(
-            "run 'agent-voice-input init' then set DASHSCOPE_API_KEY (or OPENROUTER_API_KEY / GEMINI_API_KEY) "
+            "run 'agent-voice-input init' then set DASHSCOPE_API_KEY (or DOUBAO_SPEECH_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY) "
             "in ~/.config/agent-voice-input/agent-voice-input.env"
         )
 
