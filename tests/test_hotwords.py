@@ -364,7 +364,7 @@ class HotwordsParserAndEditorTests(unittest.TestCase):
             self.assertEqual(list(tmp.glob(".*.tmp")), [])
 
             # Unreadable file on load degrades cleanly to empty table
-            with mock.patch.object(Path, "read_text", side_effect=OSError("EACCES")):
+            with mock.patch.object(Path, "read_bytes", side_effect=OSError("EACCES")):
                 self.assertEqual(
                     load_hotwords_table(hw_path, use_cache=False),
                     HotwordsTable(path=hw_path, exists=False),

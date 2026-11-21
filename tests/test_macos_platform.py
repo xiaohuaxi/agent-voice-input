@@ -4145,10 +4145,12 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline and daemon_rf.last_result.get("seq_id") != r_rf["seq_id"]:
                     time.sleep(0.02)
+                self.assertFalse(daemon_rf.last_result["ok"])
                 self.assertFalse(daemon_rf.last_result["pasted"])
                 self.assertEqual(daemon_rf.last_result["paste_reason"], "clipboard_failed")
+                self.assertEqual(daemon_rf.last_result["delivery_status"], "undelivered_recoverable")
                 self.assertNotIn("copied", hud_seen)
-                self.assertIn("error", hud_seen)
+                self.assertIn("paste_failed_retry", hud_seen)
                 saved_wav = str(daemon_rf.last_result.get("saved_audio") or "")
                 self.assertTrue(saved_wav and Path(saved_wav).is_file())
             finally:

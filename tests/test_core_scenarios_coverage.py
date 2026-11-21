@@ -1432,17 +1432,18 @@ class TestCrossLayerHighValueScenarios(unittest.TestCase):
             assert p1 is not None and p2 is not None and p3 is not None
             self.assertNotEqual(p1, p2)  # collision suffix _2.wav
 
-            self.assertEqual(resolve_failed_audio(rt), p3)
-            self.assertEqual(resolve_failed_audio(rt, "1"), p3)
-            self.assertEqual(resolve_failed_audio(rt, str(p1)), p1)
-            self.assertEqual(resolve_failed_audio(rt, p2.stem), p2)
-            self.assertEqual(resolve_failed_audio(rt, "cancelled"), p3)
+            ref_ts = 1700000300.0
+            self.assertEqual(resolve_failed_audio(rt, now_ts=ref_ts), p3)
+            self.assertEqual(resolve_failed_audio(rt, "1", now_ts=ref_ts), p3)
+            self.assertEqual(resolve_failed_audio(rt, str(p1), now_ts=ref_ts), p1)
+            self.assertEqual(resolve_failed_audio(rt, p2.stem, now_ts=ref_ts), p2)
+            self.assertEqual(resolve_failed_audio(rt, "cancelled", now_ts=ref_ts), p3)
             with self.assertRaisesRegex(FileNotFoundError, "out of range"):
-                resolve_failed_audio(rt, "99")
+                resolve_failed_audio(rt, "99", now_ts=ref_ts)
             with self.assertRaisesRegex(FileNotFoundError, "ambiguous"):
-                resolve_failed_audio(rt, "asr_timeout")
+                resolve_failed_audio(rt, "asr_timeout", now_ts=ref_ts)
             with self.assertRaisesRegex(FileNotFoundError, "no failed audio matching"):
-                resolve_failed_audio(rt, "nonexistent_tag")
+                resolve_failed_audio(rt, "nonexistent_tag", now_ts=ref_ts)
 
 
 if __name__ == "__main__":

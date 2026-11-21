@@ -33,6 +33,7 @@ class AsrResult:
     context_chars: int = 0
     context_chunks: int = 0
     audio_tokens: int | None = None
+    missed_chunks: int = 0
 
 
 @dataclass

@@ -797,6 +797,97 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
             autoHideMs: 2400,
             iconKind: "warning"
         )
+    case "partial_asr":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "! 部分语音未识别，可重试" : "! Partial speech missed, retry available",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 3200,
+            iconKind: "warning"
+        )
+    case "partial_asr_unsaved":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "! 部分语音未识别" : "! Partial speech missed",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 3200,
+            iconKind: "warning"
+        )
+    case "partial_asr_copied":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "! 已复制，部分未识别可重试" : "! Copied; partial missed, can retry",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 3200,
+            iconKind: "warning"
+        )
+    case "partial_asr_copied_unsaved":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "! 已复制，部分语音未识别" : "! Copied; partial speech missed",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 3200,
+            iconKind: "warning"
+        )
+    case "asr_empty_retry":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "! 识别为空，已存录音可重试" : "! Empty transcript, audio saved for retry",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 3200,
+            iconKind: "warning"
+        )
+    case "asr_empty":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "✕ 识别为空" : "✕ Empty transcript",
+            bg: toastBg,
+            border: coralBorder,
+            borderWidth: 1.0,
+            icon: coralIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 2600,
+            iconKind: "cross"
+        )
+    case "paste_failed_retry":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "✕ 填入失败，已存录音可重试" : "✕ Insert failed, audio saved for retry",
+            bg: toastBg,
+            border: coralBorder,
+            borderWidth: 1.0,
+            icon: coralIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 3200,
+            iconKind: "cross"
+        )
     case "no_mic":
         return HudVisualStyle(
             layer: layer,

@@ -78,6 +78,13 @@ _STATIC_HUD_COPY: dict[str, tuple[str, str]] = {
     "mic_permission": ("✕ 麦克风权限未开启", "✕ Microphone access denied"),
     "mic_disconnected": ("✕ 麦克风已断开", "✕ Microphone disconnected"),
     "audio_recovered": ("! 麦克风短暂中断，已自动恢复", "! Mic briefly interrupted, resumed"),
+    "partial_asr": ("! 部分语音未识别，可重试", "! Partial speech missed, retry available"),
+    "partial_asr_unsaved": ("! 部分语音未识别", "! Partial speech missed"),
+    "partial_asr_copied": ("! 已复制，部分未识别可重试", "! Copied; partial missed, can retry"),
+    "partial_asr_copied_unsaved": ("! 已复制，部分语音未识别", "! Copied; partial speech missed"),
+    "asr_empty_retry": ("! 识别为空，已存录音可重试", "! Empty transcript, audio saved for retry"),
+    "asr_empty": ("✕ 识别为空", "✕ Empty transcript"),
+    "paste_failed_retry": ("✕ 填入失败，已存录音可重试", "✕ Insert failed, audio saved for retry"),
     "paste_failed": ("✕ 填入失败", "✕ Failed to insert text"),
 }
 
@@ -110,6 +117,13 @@ HUD_STATE_DURATIONS_MS: dict[str, int] = {
     "mic_permission": 3200,
     "mic_disconnected": 2200,
     "audio_recovered": 2400,
+    "partial_asr": 3200,
+    "partial_asr_unsaved": 3200,
+    "partial_asr_copied": 3200,
+    "partial_asr_copied_unsaved": 3200,
+    "asr_empty_retry": 3200,
+    "asr_empty": 2600,
+    "paste_failed_retry": 3200,
     "paste_failed": 2600,
     "error": 2600,
 }

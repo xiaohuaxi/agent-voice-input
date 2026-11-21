@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import threading
 import time
 from typing import Any, Iterator, Mapping, Sequence
@@ -37,6 +38,7 @@ _OPENROUTER_KEYTERMS_PREFIXES: tuple[str, ...] = ("deepgram/", "assemblyai/")
 
 _HOTWORDS_CACHE_LOCK = threading.Lock()
 _HOTWORDS_CACHE: dict[str, tuple[tuple[int, int, int, int, int], HotwordsTable]] = {}
+_HOTWORDS_BAD_ENCODING_WARNED: dict[str, tuple[int, int, int, int, int]] = {}
 _HOTWORDS_CACHE_MAX = 32
 
 
@@ -47,6 +49,7 @@ class HotwordsTable:
     coding_terms: tuple[str, ...] = ()
     path: Path | None = None
     exists: bool = False
+    encoding_error: str = ""
 
     def terms_for_scope(self, scope: str) -> tuple[str, ...]:
         s = normalize_hotword_scope(scope)
@@ -315,9 +318,74 @@ def resolve_hotwords_path(
 
 
 def clear_hotwords_cache() -> None:
-    """Clear in-process stat-validated hotwords file cache."""
+    """Clear in-process stat-validated hotwords file cache and encoding-warning state."""
     with _HOTWORDS_CACHE_LOCK:
         _HOTWORDS_CACHE.clear()
+        _HOTWORDS_BAD_ENCODING_WARNED.clear()
+
+
+class _BadHotwordsEncodingError(ValueError):
+    """Internal marker for non-UTF-8 or NUL-containing hotwords files."""
+
+
+def _describe_encoding_error(
+    target: Path,
+    raw_bytes: bytes,
+    exc: UnicodeDecodeError | None = None,
+) -> str:
+    if raw_bytes.startswith(b"\xff\xfe\x00\x00"):
+        enc_hint = "UTF-32 LE BOM detected"
+    elif raw_bytes.startswith(b"\x00\x00\xfe\xff"):
+        enc_hint = "UTF-32 BE BOM detected"
+    elif raw_bytes.startswith(b"\xff\xfe"):
+        enc_hint = "UTF-16 LE BOM detected"
+    elif raw_bytes.startswith(b"\xfe\xff"):
+        enc_hint = "UTF-16 BE BOM detected"
+    elif b"\x00" in raw_bytes:
+        enc_hint = "NUL byte detected (likely UTF-16/UTF-32 without BOM or binary file)"
+    elif exc is not None:
+        enc_hint = f"invalid UTF-8 byte at offset {exc.start}"
+    else:  # pragma: no cover - defensive fallback
+        enc_hint = "invalid UTF-8"
+    return f"hotwords file {target} is not valid UTF-8 ({enc_hint}); please re-save it as UTF-8"
+
+
+def _decode_hotwords_bytes(target: Path, raw_bytes: bytes) -> tuple[str, bool]:
+    """Decode UTF-8 (with optional UTF-8 BOM), rejecting NUL bytes and non-UTF-8 encodings."""
+    if b"\x00" in raw_bytes:
+        raise _BadHotwordsEncodingError(_describe_encoding_error(target, raw_bytes))
+    has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
+    try:
+        text = raw_bytes[3:].decode("utf-8") if has_bom else raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _BadHotwordsEncodingError(_describe_encoding_error(target, raw_bytes, exc)) from None
+    return text, has_bom
+
+
+def _warn_bad_encoding_once(
+    cache_key: str,
+    sig: tuple[int, int, int, int, int],
+    message: str,
+) -> None:
+    emit = False
+    with _HOTWORDS_CACHE_LOCK:
+        if _HOTWORDS_BAD_ENCODING_WARNED.get(cache_key) != sig:
+            if (
+                len(_HOTWORDS_BAD_ENCODING_WARNED) >= _HOTWORDS_CACHE_MAX
+                and cache_key not in _HOTWORDS_BAD_ENCODING_WARNED
+            ):
+                _HOTWORDS_BAD_ENCODING_WARNED.pop(next(iter(_HOTWORDS_BAD_ENCODING_WARNED)), None)
+            _HOTWORDS_BAD_ENCODING_WARNED[cache_key] = sig
+            emit = True
+    if emit:
+        try:
+            print(
+                f"[agent-voice-input] WARN: {message}; skipping manual hotwords until fixed",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:  # pragma: no cover - stderr write failure during diagnostic warning
+            pass
 
 
 def load_hotwords_table(
@@ -325,8 +393,9 @@ def load_hotwords_table(
     *,
     env: Mapping[str, str] | None = None,
     use_cache: bool = True,
+    strict_encoding: bool = False,
 ) -> HotwordsTable:
-    """Load and parse ``hotwords.txt`` with ``(path, mtime_ns, size, ino, dev)`` hot-reload caching."""
+    """Load and parse ``hotwords.txt`` with ``(mtime_ns, ctime_ns, size, ino, dev)`` hot-reload caching."""
     target = path_str if isinstance(path_str, Path) else resolve_hotwords_path(path_str, env=env)
     if target is None:
         return HotwordsTable(path=None, exists=False)
@@ -335,15 +404,17 @@ def load_hotwords_table(
     try:
         st = os.stat(target)
     except OSError:
-        if use_cache:
-            with _HOTWORDS_CACHE_LOCK:
+        with _HOTWORDS_CACHE_LOCK:
+            if use_cache:
                 _HOTWORDS_CACHE.pop(cache_key, None)
+            _HOTWORDS_BAD_ENCODING_WARNED.pop(cache_key, None)
         return HotwordsTable(path=target, exists=False)
 
     if not stat.S_ISREG(st.st_mode):
-        if use_cache:
-            with _HOTWORDS_CACHE_LOCK:
+        with _HOTWORDS_CACHE_LOCK:
+            if use_cache:
                 _HOTWORDS_CACHE.pop(cache_key, None)
+            _HOTWORDS_BAD_ENCODING_WARNED.pop(cache_key, None)
         return HotwordsTable(path=target, exists=False)
 
     sig = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino, st.st_dev)
@@ -351,16 +422,34 @@ def load_hotwords_table(
         with _HOTWORDS_CACHE_LOCK:
             cached = _HOTWORDS_CACHE.get(cache_key)
             if cached is not None and cached[0] == sig:
+                if strict_encoding and cached[1].encoding_error:
+                    raise ConfigError(cached[1].encoding_error)
                 return cached[1]
 
     try:
-        raw = target.read_text(encoding="utf-8-sig")
+        raw_bytes = target.read_bytes()
     except OSError:
         return HotwordsTable(path=target, exists=False)
 
+    try:
+        raw, _ = _decode_hotwords_bytes(target, raw_bytes)
+    except _BadHotwordsEncodingError as exc:
+        err_msg = str(exc)
+        if strict_encoding:
+            raise ConfigError(err_msg) from None
+        _warn_bad_encoding_once(cache_key, sig, err_msg)
+        bad_table = HotwordsTable(path=target, exists=True, encoding_error=err_msg)
+        if use_cache:
+            with _HOTWORDS_CACHE_LOCK:
+                if len(_HOTWORDS_CACHE) >= _HOTWORDS_CACHE_MAX and cache_key not in _HOTWORDS_CACHE:
+                    _HOTWORDS_CACHE.pop(next(iter(_HOTWORDS_CACHE)), None)
+                _HOTWORDS_CACHE[cache_key] = (sig, bad_table)
+        return bad_table
+
     table = parse_hotwords_text(raw, path=target, exists=True)
-    if use_cache:
-        with _HOTWORDS_CACHE_LOCK:
+    with _HOTWORDS_CACHE_LOCK:
+        _HOTWORDS_BAD_ENCODING_WARNED.pop(cache_key, None)
+        if use_cache:
             if len(_HOTWORDS_CACHE) >= _HOTWORDS_CACHE_MAX and cache_key not in _HOTWORDS_CACHE:
                 _HOTWORDS_CACHE.pop(next(iter(_HOTWORDS_CACHE)), None)
             _HOTWORDS_CACHE[cache_key] = (sig, table)
@@ -450,8 +539,10 @@ def _detect_eol(raw_lines: Sequence[str]) -> str:
 
 def _read_text_preserving_format(target: Path) -> tuple[str, bool, str]:
     raw_bytes = target.read_bytes()
-    has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
-    text = raw_bytes[3:].decode("utf-8") if has_bom else raw_bytes.decode("utf-8")
+    try:
+        text, has_bom = _decode_hotwords_bytes(target, raw_bytes)
+    except _BadHotwordsEncodingError as exc:
+        raise ConfigError(str(exc)) from None
     eol = _detect_eol(text.splitlines(keepends=True))
     return text, has_bom, eol
 

@@ -1524,6 +1524,27 @@ public static class VoiceWinShim {
         } else if (st == "audio_recovered") {
             txt = zh ? "! \u9EA6\u514B\u98CE\u77ED\u6682\u4E2D\u65AD\uFF0C\u5DF2\u81EA\u52A8\u6062\u590D" : "! Mic briefly interrupted, resumed";
             bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2400; iconKind = "warning";
+        } else if (st == "partial_asr") {
+            txt = zh ? "! \u90E8\u5206\u8BED\u97F3\u672A\u8BC6\u522B\uFF0C\u53EF\u91CD\u8BD5" : "! Partial speech missed, retry available";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 3200; iconKind = "warning";
+        } else if (st == "partial_asr_unsaved") {
+            txt = zh ? "! \u90E8\u5206\u8BED\u97F3\u672A\u8BC6\u522B" : "! Partial speech missed";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 3200; iconKind = "warning";
+        } else if (st == "partial_asr_copied") {
+            txt = zh ? "! \u5DF2\u590D\u5236\uFF0C\u90E8\u5206\u672A\u8BC6\u522B\u53EF\u91CD\u8BD5" : "! Copied; partial missed, can retry";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 3200; iconKind = "warning";
+        } else if (st == "partial_asr_copied_unsaved") {
+            txt = zh ? "! \u5DF2\u590D\u5236\uFF0C\u90E8\u5206\u8BED\u97F3\u672A\u8BC6\u522B" : "! Copied; partial speech missed";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 3200; iconKind = "warning";
+        } else if (st == "asr_empty_retry") {
+            txt = zh ? "! \u8BC6\u522B\u4E3A\u7A7A\uFF0C\u5DF2\u5B58\u5F55\u97F3\u53EF\u91CD\u8BD5" : "! Empty transcript, audio saved for retry";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 3200; iconKind = "warning";
+        } else if (st == "asr_empty") {
+            txt = zh ? "\u2715 \u8BC6\u522B\u4E3A\u7A7A" : "\u2715 Empty transcript";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2600; iconKind = "cross";
+        } else if (st == "paste_failed_retry") {
+            txt = zh ? "\u2715 \u586B\u5165\u5931\u8D25\uFF0C\u5DF2\u5B58\u5F55\u97F3\u53EF\u91CD\u8BD5" : "\u2715 Insert failed, audio saved for retry";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 3200; iconKind = "cross";
         } else if (st == "no_mic") {
             txt = zh ? "\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE" : "\u2715 No microphone found";
             bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2200; iconKind = "cross";
@@ -1863,8 +1884,15 @@ public static class VoiceWinShim {
             if (Pcm != null) { try { Pcm.Dispose(); } catch { } Pcm = null; }
         }
     }
+    private sealed class StoppedRecSlot {
+        public long RecGen = 0L;
+        public byte[] WavBytes = new byte[0];
+        public int PcmBytes = 0;
+        public string Err = "";
+    }
     private static readonly object _recSync = new object();
     private static volatile RecSession _recSess = null;
+    private static StoppedRecSlot _stoppedRecSlot = null;
     private static volatile float _extLevel = 0f;
     private static long _extLevelTick = 0L;
 
@@ -2062,12 +2090,28 @@ public static class VoiceWinShim {
             string s = raw.TrimStart();
             if (s.StartsWith("{\"cmd\":\"rec_stop\"", StringComparison.Ordinal) ||
                 s.StartsWith("{\"cmd\": \"rec_stop\"", StringComparison.Ordinal) ||
+                s.StartsWith("{\"cmd\":\"rec_cancel\"", StringComparison.Ordinal) ||
+                s.StartsWith("{\"cmd\": \"rec_cancel\"", StringComparison.Ordinal) ||
                 s.StartsWith("{\"cmd\":\"quit\"", StringComparison.Ordinal) ||
                 s.StartsWith("{\"cmd\": \"quit\"", StringComparison.Ordinal)) {
                 return true;
             }
         }
         return false;
+    }
+
+    public static void ReleaseStoppedRecording(long recGen = 0L) {
+        lock (_recSync) {
+            if (_stoppedRecSlot != null && (recGen <= 0L || _stoppedRecSlot.RecGen == recGen)) {
+                _stoppedRecSlot = null;
+            }
+        }
+    }
+
+    public static void CancelRecording(long recGen = 0L) {
+        int dummyBytes; string dummyErr;
+        StopRecording(recGen, out dummyBytes, out dummyErr, false);
+        ReleaseStoppedRecording(0L);
     }
 
     public static string StartRecording(bool loopback = false) {
@@ -2081,7 +2125,8 @@ public static class VoiceWinShim {
 
     public static bool StartRecording(bool loopback, long recGen, out string error) {
         int dummyBytes; string dummyErr;
-        StopRecording(out dummyBytes, out dummyErr);
+        StopRecording(0L, out dummyBytes, out dummyErr, false);
+        ReleaseStoppedRecording(0L);
         RecSession sess = new RecSession {
             RecGen = recGen,
             InitEvt = new ManualResetEvent(false),
@@ -2299,17 +2344,52 @@ public static class VoiceWinShim {
 
     public static byte[] StopRecording(out string error) {
         int dummyBytes;
-        return StopRecording(out dummyBytes, out error);
+        return StopRecording(0L, out dummyBytes, out error, true);
     }
 
     public static byte[] StopRecording(out int pcmBytes, out string error) {
+        return StopRecording(0L, out pcmBytes, out error, true);
+    }
+
+    private static void StoreStoppedRecSlot(long recGen, byte[] wavBytes, int pcmBytes, string err) {
+        lock (_recSync) {
+            if (recGen > 0L && _recSess == null) {
+                _stoppedRecSlot = new StoppedRecSlot {
+                    RecGen = recGen,
+                    WavBytes = wavBytes ?? new byte[0],
+                    PcmBytes = pcmBytes,
+                    Err = err ?? ""
+                };
+            } else {
+                _stoppedRecSlot = null;
+            }
+        }
+    }
+
+    public static byte[] StopRecording(long recGen, out int pcmBytes, out string error, bool retainSlot = true) {
         RecSession sess;
+        StoppedRecSlot cached = null;
         lock (_recSync) {
             sess = _recSess;
             _recSess = null;
+            if (sess == null) {
+                if (retainSlot && recGen > 0L && _stoppedRecSlot != null && _stoppedRecSlot.RecGen == recGen) {
+                    cached = _stoppedRecSlot;
+                } else if (!retainSlot) {
+                    _stoppedRecSlot = null;
+                }
+            } else {
+                _stoppedRecSlot = null;
+            }
+        }
+        if (cached != null) {
+            pcmBytes = cached.PcmBytes;
+            error = cached.Err ?? "";
+            return cached.WavBytes ?? new byte[0];
         }
         pcmBytes = 0; error = "";
         if (sess == null || sess.Worker == null) { error = "not_recording"; return new byte[0]; }
+        long activeGen = (sess.RecGen > 0L) ? sess.RecGen : recGen;
         sess.Run = false;
         try { if (sess.StopEvt != null) sess.StopEvt.Set(); } catch { }
         bool joined = false;
@@ -2323,6 +2403,13 @@ public static class VoiceWinShim {
         }
         if (!workerDone) {
             error = string.IsNullOrEmpty(sess.Err) ? "wasapi_stop_timeout" : sess.Err;
+            if (retainSlot && activeGen > 0L) StoreStoppedRecSlot(activeGen, new byte[0], 0, error);
+            return new byte[0];
+        }
+        if (!retainSlot) {
+            sess.DisposeResources();
+            ReleaseStoppedRecording(0L);
+            error = "";
             return new byte[0];
         }
         byte[] raw = new byte[0];
@@ -2332,10 +2419,74 @@ public static class VoiceWinShim {
         pcmBytes = evenLen;
         if (evenLen < 2) {
             error = string.IsNullOrEmpty(sess.Err) ? "wasapi_zero_packets" : sess.Err;
+            if (retainSlot && activeGen > 0L) StoreStoppedRecSlot(activeGen, new byte[0], 0, error);
             return new byte[0];
         }
         error = sess.Err ?? "";
-        return BuildPcm16MonoWav(raw, evenLen, 16000);
+        byte[] wav = BuildPcm16MonoWav(raw, evenLen, 16000);
+        if (retainSlot && activeGen > 0L) StoreStoppedRecSlot(activeGen, wav, evenLen, error);
+        return wav;
+    }
+
+    public static void RunStoppedRecSlotSelfCheck() {
+        try {
+            ReleaseStoppedRecording(0L);
+            byte[] pcm1 = new byte[320];
+            for (int i = 0; i < pcm1.Length; i += 2) { pcm1[i] = 0x34; pcm1[i + 1] = 0x12; }
+            byte[] wav1 = BuildPcm16MonoWav(pcm1, pcm1.Length, 16000);
+            StoreStoppedRecSlot(101L, wav1, pcm1.Length, "");
+
+            // 1. Idempotent retry returns identical WAV bytes for matching rec_gen
+            int pb1 = 0, pb2 = 0; string err1 = "", err2 = "";
+            byte[] r1 = StopRecording(101L, out pb1, out err1, true);
+            byte[] r2 = StopRecording(101L, out pb2, out err2, true);
+            if (r1 == null || r1.Length != wav1.Length || pb1 != pcm1.Length || !string.IsNullOrEmpty(err1))
+                throw new InvalidOperationException("StoppedRecSlot retry 1 mismatch");
+            if (r2 == null || r2.Length != wav1.Length || pb2 != pcm1.Length || !string.IsNullOrEmpty(err2))
+                throw new InvalidOperationException("StoppedRecSlot retry 2 mismatch");
+
+            // 2. Mismatched rec_gen never leaks previous slot
+            int pbWrong = 0; string errWrong = "";
+            byte[] rWrong = StopRecording(999L, out pbWrong, out errWrong, true);
+            if (rWrong.Length != 0 || errWrong != "not_recording")
+                throw new InvalidOperationException("StoppedRecSlot mismatched rec_gen leaked audio");
+
+            // 3. Mismatched ReleaseStoppedRecording does not evict slot 101
+            ReleaseStoppedRecording(999L);
+            int pbStill = 0; string errStill = "";
+            byte[] rStill = StopRecording(101L, out pbStill, out errStill, true);
+            if (rStill.Length != wav1.Length)
+                throw new InvalidOperationException("StoppedRecSlot wrong-gen release evicted active slot");
+
+            // 4. Matching ReleaseStoppedRecording frees slot 101
+            ReleaseStoppedRecording(101L);
+            int pbGone = 0; string errGone = "";
+            byte[] rGone = StopRecording(101L, out pbGone, out errGone, true);
+            if (rGone.Length != 0 || errGone != "not_recording")
+                throw new InvalidOperationException("StoppedRecSlot release failed to evict slot");
+
+            // 5. Overwriting slot with newer generation drops old generation cleanly
+            byte[] pcm2 = new byte[160];
+            byte[] wav2 = BuildPcm16MonoWav(pcm2, pcm2.Length, 16000);
+            StoreStoppedRecSlot(102L, wav1, pcm1.Length, "");
+            StoreStoppedRecSlot(103L, wav2, pcm2.Length, "");
+            int pbOld = 0, pbNew = 0; string errOld = "", errNew = "";
+            byte[] rOld = StopRecording(102L, out pbOld, out errOld, true);
+            byte[] rNew = StopRecording(103L, out pbNew, out errNew, true);
+            if (rOld.Length != 0 || errOld != "not_recording")
+                throw new InvalidOperationException("StoppedRecSlot overwrite kept old gen");
+            if (rNew.Length != wav2.Length || pbNew != pcm2.Length)
+                throw new InvalidOperationException("StoppedRecSlot overwrite corrupted new gen");
+
+            // 6. CancelRecording / discard clears single slot immediately
+            CancelRecording(103L);
+            int pbCan = 0; string errCan = "";
+            byte[] rCan = StopRecording(103L, out pbCan, out errCan, true);
+            if (rCan.Length != 0 || errCan != "not_recording")
+                throw new InvalidOperationException("StoppedRecSlot cancel failed to clear slot");
+        } finally {
+            ReleaseStoppedRecording(0L);
+        }
     }
 
     private const uint CF_DIB = 8u, CF_UNICODETEXT = 13u, CF_HDROP = 15u, CF_DIBV5 = 17u, GMEM_MOVEABLE = 0x0002u, GMEM_ZEROINIT = 0x0040u;
@@ -2845,7 +2996,8 @@ public static class VoiceWinShim {
     }
 
     public static void StopHook() {
-        int dummyBytes; string dummyErr; StopRecording(out dummyBytes, out dummyErr);
+        int dummyBytes; string dummyErr; StopRecording(0L, out dummyBytes, out dummyErr, false);
+        ReleaseStoppedRecording(0L);
         StopHoldTimers();
         StopHoldPreviewSafetyTimer();
         if (_holdHintTimer != null) { try { _holdHintTimer.Dispose(); } catch { } _holdHintTimer = null; }
@@ -3051,7 +3203,9 @@ public static class VoiceWinShim {
         string[] mainStates = new string[] { "recognizing", "processing", "refining", "done", "copied" };
         string[] toastStates = new string[] {
             "cancelled", "empty", "no_mic", "mic_unavailable", "mic_no_stream",
-            "mic_permission", "mic_disconnected", "audio_recovered", "paste_failed", "error"
+            "mic_permission", "mic_disconnected", "audio_recovered",
+            "partial_asr", "partial_asr_unsaved", "partial_asr_copied", "partial_asr_copied_unsaved",
+            "asr_empty_retry", "asr_empty", "paste_failed_retry", "paste_failed", "error"
         };
 
         foreach (int[] ds in dpiSpecs) {
@@ -3493,6 +3647,7 @@ public static class VoiceWinShim {
             throw new InvalidOperationException("BuildPcm16MonoWav header mismatch");
 
         RunClipStateSelfCheck();
+        RunStoppedRecSlotSelfCheck();
         RunToastSingleSlotSelfCheck();
         RunPowerResumeSelfCheck();
         hotkeyFsmChecks = RunHotkeyFsmSelfCheck();
@@ -3797,9 +3952,27 @@ try {
                     $recErr = ""; $okStart = [VoiceWinShim]::StartRecording($loopback, $recGen, [ref]$recErr)
                     Write-JsonLine @{ type = "reply"; reply = "rec_start"; seq_id = $seq; ok = [bool]$okStart; rec_error = [string]$recErr }
                 } elseif ($op -eq "rec_stop") {
-                    $pcmBytes = 0; $recErr = ""; $wavBytes = [VoiceWinShim]::StopRecording([ref]$pcmBytes, [ref]$recErr)
-                    $b64 = if ($wavBytes -and $wavBytes.Length -gt 0) { [Convert]::ToBase64String($wavBytes) } else { "" }
-                    Write-JsonLine @{ type = "reply"; reply = "rec_stop"; seq_id = $seq; ok = ($b64.Length -gt 0); pcm_bytes = $pcmBytes; wav_b64 = $b64; rec_error = [string]$recErr }
+                    $recGen = if ($null -ne $cmdObj.rec_gen) { [long]$cmdObj.rec_gen } else { 0L }
+                    $discard = ($null -ne $cmdObj.discard -and [bool]$cmdObj.discard)
+                    if ($discard) {
+                        [VoiceWinShim]::CancelRecording($recGen)
+                        Write-JsonLine @{ type = "reply"; reply = "rec_stop"; seq_id = $seq; ok = $false; rec_gen = $recGen; pcm_bytes = 0; wav_b64 = ""; rec_error = "" }
+                    } else {
+                        $pcmBytes = 0; $recErr = ""; $wavBytes = [VoiceWinShim]::StopRecording($recGen, [ref]$pcmBytes, [ref]$recErr, $true)
+                        $b64 = if ($wavBytes -and $wavBytes.Length -gt 0) { [Convert]::ToBase64String($wavBytes) } else { "" }
+                        $wavBytes = $null
+                        $okStop = ($b64.Length -gt 0)
+                        Write-JsonLine @{ type = "reply"; reply = "rec_stop"; seq_id = $seq; ok = $okStop; rec_gen = $recGen; pcm_bytes = $pcmBytes; wav_b64 = $b64; rec_error = [string]$recErr }
+                        $b64 = $null
+                    }
+                } elseif ($op -eq "rec_release" -or $op -eq "rec_ack") {
+                    $recGen = if ($null -ne $cmdObj.rec_gen) { [long]$cmdObj.rec_gen } else { 0L }
+                    [VoiceWinShim]::ReleaseStoppedRecording($recGen)
+                    if ($seq -gt 0) { Write-JsonLine @{ type = "reply"; reply = $op; seq_id = $seq; ok = $true; rec_gen = $recGen } }
+                } elseif ($op -eq "rec_cancel") {
+                    $recGen = if ($null -ne $cmdObj.rec_gen) { [long]$cmdObj.rec_gen } else { 0L }
+                    [VoiceWinShim]::CancelRecording($recGen)
+                    Write-JsonLine @{ type = "reply"; reply = "rec_cancel"; seq_id = $seq; ok = $true; rec_gen = $recGen }
                 } elseif ($op -eq "quit") { break bridgeLoop }
                 else { Write-JsonLine @{ type = "reply"; reply = $op; seq_id = $seq; ok = $false; error = "unknown_cmd:$op" } }
             } catch {

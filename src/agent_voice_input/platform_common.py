@@ -988,11 +988,14 @@ class JsonlShimMixin:
                 proc_ready.set()
             need_respawn = False
             stale_queues: list[queue.Queue[dict[str, Any]]] = []
+            seen_q_ids: set[int] = set()
             with self._shim_lock:
                 for k_sid, val in list(self._pending.items()):
                     owner_proc, wait_q = val if isinstance(val, tuple) else (proc, val)
                     if owner_proc is proc:
-                        stale_queues.append(wait_q)
+                        if id(wait_q) not in seen_q_ids:
+                            seen_q_ids.add(id(wait_q))
+                            stale_queues.append(wait_q)
                         self._pending.pop(k_sid, None)
                 if self._shim is proc:
                     self._shim = None
@@ -1027,71 +1030,107 @@ class JsonlShimMixin:
         before_write: Callable[[], None] | None = None,
     ) -> dict[str, Any] | None:
         max_attempts = 2 if allow_retry else 1
-        for attempt in range(max_attempts):
-            if not self._ensure_shim():
-                if self._shim_graceful:
-                    return None
-                raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
-            sid = 0
-            q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
-            sent_proc: subprocess.Popen[str] | None = None
-            broken: subprocess.Popen[str] | None = None
-            try:
-                with self._shim_lock:
-                    proc = self._shim
-                    if proc is None or proc.stdin is None or proc.poll() is not None:
-                        broken, self._shim = proc, None
-                        self._spawned_shim = None
-                        self._spawned_ready = False
-                        self._shim_caps = frozenset()
-                        raise BrokenPipeError("shim_not_running")
-                    sent_proc = proc
-                    self._rpc_seq += 1
-                    sid = self._rpc_seq
-                    self._pending[sid] = (proc, q)
-                line = json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n"
-                with self._stdin_lock:
-                    if before_write is not None:
-                        before_write()
-                    if (
-                        sent_proc.poll() is not None
-                        or getattr(sent_proc, "_deferred_close_stdin", False)
-                        or sent_proc.stdin is None
-                        or sent_proc.stdin.closed
-                    ):
-                        raise BrokenPipeError("shim_not_running")
-                    try:
-                        sent_proc.stdin.write(line)
-                        sent_proc.stdin.flush()
-                    except ValueError as exc:
-                        raise BrokenPipeError("shim_stdin_closed") from exc
-                res = q.get(timeout=timeout_sec)
-                if res.get("error") == "shim_eof" and (attempt + 1) < max_attempts and not self._closed and not self._shim_disabled:
-                    continue
-                if "error" in res:
+        shared_q: queue.Queue[dict[str, Any]] | None = None
+        shared_proc: subprocess.Popen[str] | None = None
+        registered: list[tuple[subprocess.Popen[str], int]] = []
+
+        def _unregister_registered_locked() -> None:
+            for reg_proc, reg_sid in registered:
+                cur_entry = self._pending.get(reg_sid)
+                if cur_entry is not None:
+                    owner_p = cur_entry[0] if isinstance(cur_entry, tuple) else reg_proc
+                    if owner_p is reg_proc:
+                        self._pending.pop(reg_sid, None)
+            registered.clear()
+
+        def _unregister_all() -> None:
+            if not registered:
+                return
+            with self._shim_lock:
+                _unregister_registered_locked()
+
+        try:
+            for attempt in range(max_attempts):
+                if not self._ensure_shim():
                     if self._shim_graceful:
                         return None
-                    raise RuntimeError(str(res["error"]))
-                return res
-            except (BrokenPipeError, OSError, queue.Empty):
-                if broken is not None:
-                    self._reap_owned_shim(broken)
-                if (attempt + 1) < max_attempts and not self._closed and not self._shim_disabled:
-                    continue
-                if self._shim_graceful:
-                    return None
-                raise
-            finally:
-                if sid:
+                    raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
+                sent_proc: subprocess.Popen[str] | None = None
+                broken: subprocess.Popen[str] | None = None
+                try:
                     with self._shim_lock:
-                        cur_entry = self._pending.get(sid)
-                        if cur_entry is not None:
-                            owner_p = cur_entry[0] if isinstance(cur_entry, tuple) else sent_proc
-                            if owner_p is sent_proc:
-                                self._pending.pop(sid, None)
-        if self._shim_graceful:
-            return None
-        raise RuntimeError("shim_rpc exhausted retries")
+                        proc = self._shim
+                        if proc is None or proc.stdin is None or proc.poll() is not None:
+                            broken, self._shim = proc, None
+                            self._spawned_shim = None
+                            self._spawned_ready = False
+                            self._shim_caps = frozenset()
+                            raise BrokenPipeError("shim_not_running")
+                        if shared_q is None or shared_proc is not proc:
+                            _unregister_registered_locked()
+                            shared_q = queue.Queue()
+                            shared_proc = proc
+                        else:
+                            # If a prior timed-out attempt's reply arrived just before retrying, consume it now.
+                            try:
+                                early_res = shared_q.get_nowait()
+                            except queue.Empty:
+                                early_res = None
+                            if early_res is not None and early_res.get("error") != "shim_eof":
+                                if "error" in early_res:
+                                    if self._shim_graceful:
+                                        return None
+                                    raise RuntimeError(str(early_res["error"]))
+                                return early_res
+                        sent_proc = proc
+                        self._rpc_seq += 1
+                        sid = self._rpc_seq
+                        self._pending[sid] = (proc, shared_q)
+                        registered.append((proc, sid))
+                    line = json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n"
+                    with self._stdin_lock:
+                        if before_write is not None:
+                            before_write()
+                        if (
+                            sent_proc.poll() is not None
+                            or getattr(sent_proc, "_deferred_close_stdin", False)
+                            or sent_proc.stdin is None
+                            or sent_proc.stdin.closed
+                        ):
+                            raise BrokenPipeError("shim_not_running")
+                        try:
+                            sent_proc.stdin.write(line)
+                            sent_proc.stdin.flush()
+                        except ValueError as exc:
+                            raise BrokenPipeError("shim_stdin_closed") from exc
+                    res = shared_q.get(timeout=timeout_sec)
+                    if res.get("error") == "shim_eof" and (attempt + 1) < max_attempts and not self._closed and not self._shim_disabled:
+                        _unregister_all()
+                        shared_q = None
+                        shared_proc = None
+                        continue
+                    if "error" in res:
+                        if self._shim_graceful:
+                            return None
+                        raise RuntimeError(str(res["error"]))
+                    return res
+                except (BrokenPipeError, OSError, queue.Empty) as exc:
+                    if broken is not None:
+                        self._reap_owned_shim(broken)
+                    if not isinstance(exc, queue.Empty):
+                        _unregister_all()
+                        shared_q = None
+                        shared_proc = None
+                    if (attempt + 1) < max_attempts and not self._closed and not self._shim_disabled:
+                        continue
+                    if self._shim_graceful:
+                        return None
+                    raise
+            if self._shim_graceful:
+                return None
+            raise RuntimeError("shim_rpc exhausted retries")
+        finally:
+            _unregister_all()
 
     def start_event_listener(self, on_hotkey_event: Callable[[dict[str, Any]], None]) -> None:
         self._closed = False
@@ -1166,14 +1205,13 @@ class JsonlShimMixin:
         except Exception:
             pass
 
-    def hud_level(self, level: float) -> None:
+    def _send_shim_fire_and_forget(self, payload: Mapping[str, Any]) -> None:
         if not self._has_managed_shim() or not self._ready.is_set():
             return
         proc = self._shim
         if proc is None or proc.stdin is None or proc.poll() is not None:
             return
-        clamped = round(max(0.0, min(1.0, float(level))), 3)
-        line = json.dumps({"cmd": "hud_level", "level": clamped}) + "\n"
+        line = json.dumps(dict(payload), ensure_ascii=False) + "\n"
         try:
             with self._stdin_lock:
                 if (
@@ -1186,6 +1224,10 @@ class JsonlShimMixin:
                     proc.stdin.flush()
         except Exception:
             pass
+
+    def hud_level(self, level: float) -> None:
+        clamped = round(max(0.0, min(1.0, float(level))), 3)
+        self._send_shim_fire_and_forget({"cmd": "hud_level", "level": clamped})
 
     def _on_recorder_level(self, level: float) -> None:
         if self._closed or not self._has_managed_shim():

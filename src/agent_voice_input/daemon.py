@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-import concurrent.futures, copy, errno, fcntl, hashlib, inspect, json, os, signal, socket, stat, sys, threading, time
+import concurrent.futures, copy, errno, fcntl, hashlib, inspect, json, math, os, signal, socket, stat, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -30,14 +30,18 @@ from .asr_providers import (
 from .audio_proc import (
     AudioGateResult,
     DEFAULT_MAX_CHUNK_SEC,
+    FAILED_AUDIO_MAX_AGE_SEC,
     SINGLE_HOP_MAX_CHUNK_SEC,
+    get_failed_audio_dir,
     inspect_wav_chunks,
     process_wav,
+    prune_failed_audio_dir,
     save_failed_audio,
     spawn_recording_archive,
     wait_recording_archives,
 )
 from .config import (
+    AudioConfig,
     Config,
     ProviderCredentials,
     ensure_secure_dir,
@@ -87,6 +91,7 @@ DAEMON_LOG_FILENAME: str = "daemon.log"
 DAEMON_LOG_BACKUP_FILENAME: str = "daemon.log.1"
 DEFAULT_DAEMON_LOG_MAX_BYTES: int = 2 * 1024 * 1024
 _LOG_ROTATE_CHECK_INTERVAL_SEC: float = 60.0
+_FAILED_PRUNE_CHECK_INTERVAL_SEC: float = 3600.0
 
 
 def rotate_daemon_log_if_needed(
@@ -256,6 +261,7 @@ class PipelineResult:
     error: str = ""
     asr_chunks: int = 1
     asr_chunk_secs: tuple[float, ...] = ()
+    asr_missed_chunks: int = 0
     saved_audio: str = ""
     gate_ms: int = 0
     sync_ms: int = 0
@@ -267,6 +273,18 @@ class PipelineResult:
     ctx_chunks: int = 0
     mode: str = "agent"
     ctx_fallback: str = ""
+
+
+def _derive_delivery_status(res: PipelineResult, *, dry_run: bool) -> str:
+    if res.ok:
+        if res.paste is None:
+            return "dry_run" if dry_run else "pasted"
+        if res.paste.pasted:
+            return "pasted"
+        if res.paste.clipboard:
+            return "copied"
+        return "undelivered_recoverable" if res.saved_audio else "undelivered_unrecoverable"
+    return "undelivered_recoverable" if res.saved_audio else "undelivered_unrecoverable"
 
 
 def build_pipeline_summary(
@@ -303,7 +321,9 @@ def build_pipeline_summary(
         "refiner_model": res.refined.model if res.refined else "",
         "refiner_fallback": res.refined.used_fallback if res.refined else "",
         "pasted": res.paste.pasted if res.paste else False,
+        "clipboard": res.paste.clipboard if res.paste else False,
         "paste_reason": res.paste.reason if res.paste else ("dry_run" if dry_run and res.ok else ""),
+        "delivery_status": _derive_delivery_status(res, dry_run=dry_run),
         "raw_audio_sec": round(res.gate.duration_sec, 3) if res.gate else 0.0,
         "voiced_audio_sec": round(res.gate.voiced_sec, 3) if res.gate else 0.0,
         "queue_wait_ms": eff_q_wait,
@@ -354,6 +374,8 @@ def build_pipeline_summary(
         summary["asr_chunks"] = res.asr_chunks
         if res.asr_chunk_secs:
             summary["asr_chunk_secs"] = list(res.asr_chunk_secs)
+    if res.asr_missed_chunks > 0:
+        summary["asr_missed_chunks"] = res.asr_missed_chunks
     if res.saved_audio:
         summary["saved_audio"] = res.saved_audio
     if dry_run:
@@ -693,12 +715,49 @@ def _is_single_hop_asr_provider(eff_asr: BaseAsrProvider) -> bool:
     )
 
 
+def _existing_recoverable_retry_audio(
+    raw_wav: bytes | str | Path,
+    runtime_dir: Path | None,
+) -> str:
+    """Return the existing unexpired ``failed/`` WAV path for ``audio_source == 'retry'`` without duplicating it."""
+    if runtime_dir is None or not isinstance(raw_wav, (str, Path)):
+        return ""
+    raw_str = str(raw_wav).strip()
+    if not raw_str:
+        return ""
+    cand = Path(raw_str).expanduser()
+    fdir = get_failed_audio_dir(runtime_dir, create=False)
+    try:
+        if not cand.is_file() or cand.is_symlink():
+            return ""
+        cand.resolve().relative_to(fdir.resolve())
+        st_f = cand.stat()
+        if st_f.st_size <= 0:
+            return ""
+        if FAILED_AUDIO_MAX_AGE_SEC > 0 and (time.time() - st_f.st_mtime) > FAILED_AUDIO_MAX_AGE_SEC:
+            return ""
+        return str(cand)
+    except (OSError, ValueError):
+        return ""
+
+
+def _normalized_chunk_floor_dbfs(floor_dbfs: float, gain_db: float) -> float:
+    """Map raw ``floor_dbfs`` into post-normalization scale using ``gate.gain_db``."""
+    base = float(floor_dbfs)
+    if not math.isfinite(gain_db) or gain_db == 0.0:
+        return base
+    shifted = base + float(gain_db)
+    return min(-3.0, shifted) if gain_db > 0.0 else shifted
+
+
 def _transcribe_wav_chunks(
     wav_bytes: bytes,
     *,
     eff_asr: BaseAsrProvider,
     asr_ctx: Any,
     floor_dbfs: float,
+    audio_cfg: AudioConfig | None = None,
+    gain_db: float = 0.0,
     max_chunk_sec: float | None = None,
     seq_id: int = 1,
     is_current_seq: Callable[[int], bool] | None = None,
@@ -711,7 +770,8 @@ def _transcribe_wav_chunks(
         if max_chunk_sec is None
         else float(max_chunk_sec)
     )
-    infos = inspect_wav_chunks(wav_bytes, max_chunk_sec=eff_max_chunk_sec, floor_dbfs=floor_dbfs)
+    norm_floor_dbfs = _normalized_chunk_floor_dbfs(floor_dbfs, gain_db)
+    infos = inspect_wav_chunks(wav_bytes, max_chunk_sec=eff_max_chunk_sec, floor_dbfs=norm_floor_dbfs)
     if len(infos) <= 1:
         if cancel_check is not None and cancel_check():
             return AsrResult(text="", provider=getattr(eff_asr, "provider_name", ""), model="", latency_ms=0), 1, ()
@@ -778,6 +838,23 @@ def _transcribe_wav_chunks(
 
     non_null = [r for r in results if r is not None]
     merged_text = _join_chunk_texts([r.text for r in non_null if r.text.strip()])
+    missed_chunks = 0
+    if not (cancel_check is not None and cancel_check()):
+        eff_audio_cfg = audio_cfg if audio_cfg is not None else AudioConfig(floor_dbfs=floor_dbfs)
+        chunk_min_dur = min(eff_audio_cfg.min_duration_sec, eff_audio_cfg.min_voiced_sec)
+        for idx, res_i in enumerate(results):
+            if res_i is None or res_i.text.strip():
+                continue
+            try:
+                if process_wav(
+                    infos[idx].wav_bytes,
+                    eff_audio_cfg,
+                    floor_dbfs=norm_floor_dbfs,
+                    min_duration_sec=chunk_min_dur,
+                ).passed:
+                    missed_chunks += 1
+            except Exception:
+                pass
     elapsed_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
     first = non_null[0] if non_null else None
     prov = first.provider if first else getattr(eff_asr, "provider_name", "")
@@ -799,6 +876,7 @@ def _transcribe_wav_chunks(
             context_chars=max((r.context_chars for r in non_null), default=0),
             context_chunks=max((r.context_chunks for r in non_null), default=0),
             audio_tokens=_sum_opt([r.audio_tokens for r in non_null]),
+            missed_chunks=missed_chunks,
         ),
         len(infos),
         chunk_secs,
@@ -877,6 +955,7 @@ class _Stage1State:
     asr_res: AsrResult | None = None
     asr_chunks: int = 1
     asr_chunk_secs: tuple[float, ...] = ()
+    asr_missed_chunks: int = 0
     skipped_reason: str = ""
     ctx_fallback: str = ""
 
@@ -919,6 +998,7 @@ def _make_pipeline_result(
         error=error,
         asr_chunks=st.asr_chunks,
         asr_chunk_secs=st.asr_chunk_secs,
+        asr_missed_chunks=st.asr_missed_chunks,
         saved_audio=saved_audio,
         gate_ms=st.gate_ms,
         sync_ms=st.sync_ms,
@@ -1179,6 +1259,8 @@ def _execute_stage1(
             eff_asr=eff_asr,
             asr_ctx=asr_ctx,
             floor_dbfs=cfg.audio.floor_dbfs,
+            audio_cfg=cfg.audio,
+            gain_db=gate.gain_db,
             max_chunk_sec=max_chunk_sec,
             seq_id=seq_id,
             is_current_seq=is_current_seq,
@@ -1196,6 +1278,7 @@ def _execute_stage1(
     st.asr_res = asr_res
     st.asr_chunks = chunk_count
     st.asr_chunk_secs = chunk_secs
+    st.asr_missed_chunks = max(0, int(getattr(asr_res, "missed_chunks", 0) or 0))
     if not asr_res.text.strip():
         st.skipped_reason = cancel_reason_fn() or "empty_asr"
     elif c_rsn := cancel_reason_fn():
@@ -1252,6 +1335,9 @@ def run_pipeline_once(
         if stashed_once:
             return stashed_path
         stashed_once = True
+        if audio_source == "retry":
+            stashed_path = _existing_recoverable_retry_audio(raw_wav, runtime_dir)
+            return stashed_path
         if not can_save_failed or runtime_dir is None or st.gate is None or not st.gate.passed or not st.gate.wav_bytes:
             return ""
         saved = save_failed_audio(
@@ -1290,6 +1376,7 @@ def run_pipeline_once(
         )
 
     eff_sink = archive_sink if archive_sink is not None else local_archive_threads.append
+    in_delivery = False
     try:
         try:
             _execute_stage1(
@@ -1358,10 +1445,13 @@ def run_pipeline_once(
                 if cancel_token is not None and not cancel_token.try_commit():
                     return _cancel_res(cancel_token.reason or "cancelled", draft=cand_text, refined=ref_res)
                 t_deliv0 = time.monotonic()
+                in_delivery = True
                 paste_out = deliver_fn(cand_text, st.win)
+                in_delivery = False
                 deliver_ms = _elapsed_ms(t_deliv0)
             else:
                 t_deliv0 = time.monotonic()
+                in_delivery = True
                 paste_out = platform.deliver_text(
                     cand_text,
                     seq_id=seq_id,
@@ -1370,19 +1460,31 @@ def run_pipeline_once(
                     is_cancelled=cancel_check,
                     before_commit=(cancel_token.try_commit if cancel_token is not None else None),
                 )
+                in_delivery = False
                 deliver_ms = _elapsed_ms(t_deliv0)
 
             if paste_out is not None and paste_out.reason == "cancelled":
                 return _cancel_res(_cancel_reason() or "cancelled", draft=cand_text, refined=ref_res, deliver_ms=deliver_ms)
             if cancel_token is not None:
                 cancel_token.try_commit()
-            saved_p = _stash_failed() if (paste_out is not None and not paste_out.pasted and not paste_out.clipboard) else ""
+            delivery_failed = paste_out is not None and not paste_out.pasted and not paste_out.clipboard
+            saved_p = _stash_failed() if (delivery_failed or st.asr_missed_chunks > 0) else ""
+            eff_skip = (
+                (
+                    paste_out.reason
+                    if (paste_out is not None and paste_out.reason and paste_out.reason != "ok")
+                    else "paste_failed"
+                )
+                if delivery_failed
+                else ""
+            )
             return _make_pipeline_result(
                 seq_id,
                 audio_source,
                 st,
-                ok=True,
+                ok=(not delivery_failed),
                 final_text=cand_text,
+                skipped_reason=eff_skip,
                 refined=ref_res,
                 paste=paste_out,
                 deliver_ms=deliver_ms,
@@ -1391,11 +1493,17 @@ def run_pipeline_once(
         except Exception as exc:
             if (c_rsn := _cancel_reason()) in ("cancelled", "shutdown"):
                 return _cancel_res(c_rsn)
-            if saved_p := _stash_failed():
-                try:
+            saved_p = _stash_failed()
+            ds_err = "undelivered_recoverable" if saved_p else "undelivered_unrecoverable"
+            try:
+                setattr(exc, "_delivery_status", ds_err)
+                if saved_p:
                     setattr(exc, "_saved_audio_path", saved_p)
-                except Exception:
-                    pass
+                if in_delivery:
+                    setattr(exc, "_skipped_reason", "delivery_error")
+                    setattr(exc, "_paste_reason", "delivery_error")
+            except Exception:
+                pass
             raise
     finally:
         if owns_refiner:
@@ -1739,6 +1847,8 @@ class VoiceInputDaemon:
         self._log_max_bytes: int = max(0, int(log_max_bytes))
         self._log_rotate_lock = threading.Lock()
         self._last_log_rotate_check: float = -1e9
+        self._failed_prune_lock = threading.Lock()
+        self._last_failed_prune_check: float = -1e9
         if (setter := getattr(self.platform, "set_recorder_lost_callback", None)) is not None:
             setter(self._on_recorder_lost)
         if (rec_setter := getattr(self.platform, "set_recorder_recovered_callback", None)) is not None:
@@ -1747,6 +1857,7 @@ class VoiceInputDaemon:
             prune_stale_session_registry(self.runtime_dir, proc_root=self.tracker.proc_root)
         except Exception:
             pass
+        self._maybe_prune_failed_audio(force=True)
 
     @property
     def lock_path(self) -> Path: return self.runtime_dir / "daemon.lock"
@@ -1768,6 +1879,18 @@ class VoiceInputDaemon:
                 return False
             self._last_log_rotate_check = now
             return rotate_daemon_log_if_needed(self.log_path, max_bytes=self._log_max_bytes)
+
+    def _maybe_prune_failed_audio(self, *, force: bool = False) -> bool:
+        now = self.clock_fn()
+        with self._failed_prune_lock:
+            if not force and (now - self._last_failed_prune_check) < _FAILED_PRUNE_CHECK_INTERVAL_SEC:
+                return False
+            self._last_failed_prune_check = now
+        try:
+            prune_failed_audio_dir(get_failed_audio_dir(self.runtime_dir, create=False))
+            return True
+        except Exception:
+            return False
 
     def _log_info(self, message: str) -> None:
         self._maybe_rotate_daemon_log(force=True)
@@ -1880,6 +2003,7 @@ class VoiceInputDaemon:
     def _append_telemetry(self, summary: Mapping[str, Any]) -> None:
         append_telemetry_record(self.runtime_dir, summary)
         self._maybe_rotate_daemon_log()
+        self._maybe_prune_failed_audio()
 
     def is_current_seq(self, seq_id: int) -> bool:
         with self._lock:
@@ -2899,9 +3023,12 @@ class VoiceInputDaemon:
             if (
                 (self._stop_evt.is_set() and not allow_during_shutdown)
                 or task.cancel_token.reason == "shutdown"
-                or task.audio_source in ("file", "selftest_wav", "retry")
+                or task.audio_source in ("file", "selftest_wav")
             ):
                 return ""
+            if task.audio_source == "retry":
+                task.saved_audio = _existing_recoverable_retry_audio(task.saved_audio, self.runtime_dir)
+                return task.saved_audio
             eff_gate = gate
             if eff_gate is None and len(task.raw_wav) > 44:
                 try:
@@ -3174,12 +3301,19 @@ class VoiceInputDaemon:
                 saved_audio=saved_p,
             )
             sum_skip = _summarize(res_skip)
-            if sr in ("too_short", "silence", "empty_audio", "empty_asr"):
+            if sr in ("too_short", "silence", "empty_audio"):
                 if task.recorder_lost:
                     hud_st, hud_dur_ms, beep_k = "mic_disconnected", 2200, ""
                     sum_skip["skipped_reason"] = "mic_disconnected"
                 else:
                     hud_st, beep_k = "empty", "error"
+            elif sr == "empty_asr":
+                if task.recorder_lost:
+                    hud_st, hud_dur_ms, beep_k = "mic_disconnected", 2200, ""
+                    sum_skip["skipped_reason"] = "mic_disconnected"
+                else:
+                    hud_st = "asr_empty_retry" if saved_p else "asr_empty"
+                    beep_k = "error"
             elif sr != "superseded":
                 hud_st, beep_k = "error", "error"
             if task.recorder_lost and beep_k == "error":
@@ -3210,31 +3344,63 @@ class VoiceInputDaemon:
             except Exception as deliv_exc:
                 if self._stop_evt.is_set() or task.cancel_token.is_cancelled():
                     return _cancelled_outcome()
-                slot.exc = deliv_exc
-                return self._finalize_commit_slot(slot)
+                if not task.cancel_token.try_commit():
+                    return _cancelled_outcome()
+                deliver_ms = _elapsed_ms(t_deliv0)
+                saved_p = _stash_slot_wav()
+                res_deliv_err = _make_pipeline_result(
+                    task.seq_id,
+                    task.audio_source,
+                    st,
+                    ok=False,
+                    final_text=final_text,
+                    skipped_reason="delivery_error",
+                    refined=ref_res,
+                    paste=PasteOutcome(False, False, "delivery_error", st.win.process, False),
+                    deliver_ms=deliver_ms,
+                    saved_audio=saved_p,
+                    error=self._redact(deliv_exc),
+                )
+                hud_st = "paste_failed_retry" if saved_p else "paste_failed"
+                beep_k = "" if task.recorder_lost else "error"
+                return _summarize(res_deliv_err), hud_st, hud_dur_ms, beep_k
             if paste_out.reason == "cancelled" or task.cancel_token.is_cancelled():
                 return _cancelled_outcome()
             task.cancel_token.try_commit()
 
-        saved_p = (
-            _stash_slot_wav()
-            if (paste_out is not None and not paste_out.pasted and not paste_out.clipboard)
+        delivery_failed = paste_out is not None and not paste_out.pasted and not paste_out.clipboard
+        copied_only = bool(paste_out and not paste_out.pasted and paste_out.clipboard)
+        saved_p = _stash_slot_wav() if (delivery_failed or st.asr_missed_chunks > 0) else ""
+        eff_skip = (
+            (
+                paste_out.reason
+                if (paste_out is not None and paste_out.reason and paste_out.reason != "ok")
+                else "paste_failed"
+            )
+            if delivery_failed
             else ""
         )
         res_ok = _make_pipeline_result(
             task.seq_id,
             task.audio_source,
             st,
-            ok=True,
+            ok=(not delivery_failed),
             final_text=final_text,
+            skipped_reason=eff_skip,
             refined=ref_res,
             paste=paste_out,
             deliver_ms=deliver_ms,
             saved_audio=saved_p,
         )
-        if paste_out and not paste_out.pasted and not paste_out.clipboard:
-            hud_st, beep_k = "error", ("" if task.recorder_lost else "error")
-        elif paste_out and not paste_out.pasted and paste_out.clipboard:
+        if delivery_failed:
+            hud_st = "paste_failed_retry" if saved_p else "paste_failed"
+            beep_k = "" if task.recorder_lost else "error"
+        elif st.asr_missed_chunks > 0:
+            if copied_only:
+                hud_st = "partial_asr_copied" if saved_p else "partial_asr_copied_unsaved"
+            else:
+                hud_st = "partial_asr" if saved_p else "partial_asr_unsaved"
+        elif copied_only:
             hud_st = "copied"
         else:
             hud_st = "done"
@@ -3646,6 +3812,7 @@ class VoiceInputDaemon:
                 try: conn, _ = srv.accept()
                 except socket.timeout:
                     self._maybe_rotate_daemon_log()
+                    self._maybe_prune_failed_audio()
                     continue
                 except OSError: break
                 with conn:

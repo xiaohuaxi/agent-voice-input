@@ -47,13 +47,40 @@ def mask_session_key(skey: str) -> str:
     return f"{cli}#{digest}"
 
 
+_DELIVERY_FAIL_REASONS: frozenset[str] = frozenset(
+    {"clipboard_failed", "paste_failed", "delivery_failed", "delivery_error"}
+)
+_VALID_DELIVERY_STATUS_ENUMS: frozenset[str] = frozenset(
+    {"", "pasted", "copied", "dry_run", "undelivered_recoverable", "undelivered_unrecoverable"}
+)
+
+
+def _is_record_delivered_ok(rec: Mapping[str, Any]) -> bool:
+    """Return True iff the telemetry record represents a genuinely delivered/dry-run success."""
+    if not rec.get("ok", False):
+        return False
+    ds = str(rec.get("delivery_status") or "").strip().lower()
+    if ds in ("undelivered_recoverable", "undelivered_unrecoverable"):
+        return False
+    if rec.get("pasted") is False and not rec.get("dry_run", False):
+        if rec.get("clipboard") is False:
+            return False
+        pr = str(rec.get("paste_reason") or "").strip().lower()
+        if pr in _DELIVERY_FAIL_REASONS:
+            return False
+    return True
+
+
 def diagnose_record_flags(rec: Mapping[str, Any], *, is_first_for_session: bool) -> list[str]:
     """Return diagnostic warning/anomaly flags for a single telemetry record."""
     flags: list[str] = []
-    if not rec.get("ok", False):
-        reason = str(rec.get("skipped_reason") or "error")
+    if not _is_record_delivered_ok(rec):
+        reason = str(rec.get("skipped_reason") or rec.get("paste_reason") or "error")
         flags.append(f"SKIP({reason})")
         return flags
+    missed_chunks = int(rec.get("asr_missed_chunks") or 0)
+    if missed_chunks > 0:
+        flags.append(f"PARTIAL_ASR({missed_chunks})")
     fb = str(rec.get("refiner_fallback") or "").strip()
     is_passthrough_sh = fb == "single_hop_passthrough" and int(rec.get("refine_ms") or 0) == 0
     is_single_hop_asr = bool(rec.get("is_single_hop_refined")) or is_passthrough_sh
@@ -125,6 +152,7 @@ _TELEMETRY_NUMERIC_FIELDS: frozenset[str] = frozenset(
         "asr_retries",
         "refiner_retries",
         "asr_chunks",
+        "asr_missed_chunks",
         "recovery_count",
         "recovery_gap_ms",
     }
@@ -134,6 +162,7 @@ _TELEMETRY_BOOL_FIELDS: frozenset[str] = frozenset(
         "ok",
         "switched_fallback",
         "pasted",
+        "clipboard",
         "is_single_hop_refined",
         "dry_run",
         "capture_interrupted",
@@ -150,6 +179,7 @@ _TELEMETRY_ENUM_FIELDS: frozenset[str] = frozenset(
         "refiner_model",
         "refiner_fallback",
         "paste_reason",
+        "delivery_status",
         "ctx_fallback",
     }
 )
@@ -186,6 +216,8 @@ def _sanitize_telemetry_record(rec: Mapping[str, Any], redact_fn: Any) -> dict[s
         if k in rec and isinstance(rec[k], str):
             val = _clean_single_line(rec[k], redact_fn, max_chars=120) if rec[k] else ""
             if k == "ctx_fallback" and val not in _VALID_CTX_FALLBACK_ENUMS:
+                val = ""
+            elif k == "delivery_status" and val not in _VALID_DELIVERY_STATUS_ENUMS:
                 val = ""
             clean[k] = val
     for k in _TELEMETRY_DIAG_TEXT_FIELDS:
@@ -311,7 +343,7 @@ def _percentile(vals: Sequence[float], pct: float) -> float | None:
 
 def summarize_telemetry_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Compute latency, fallback, failure, and prefix-cache hit summary over annotated records."""
-    ok_recs = [r for r in records if r.get("ok")]
+    ok_recs = [r for r in records if _is_record_delivered_ok(r)]
     asr_ms = [int(r["asr_ms"]) for r in ok_recs if isinstance(r.get("asr_ms"), (int, float))]
     ref_ms = [int(r["refine_ms"]) for r in ok_recs if isinstance(r.get("refine_ms"), (int, float))]
     tot_ms = [int(r["total_ms"]) for r in ok_recs if isinstance(r.get("total_ms"), (int, float))]

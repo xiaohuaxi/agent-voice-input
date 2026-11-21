@@ -1231,14 +1231,24 @@ def _run_wav_or_live(
             )
         except Exception as exc:
             creds_err = resolve_credentials(cfg, env)
+            saved_p = str(getattr(exc, "_saved_audio_path", "") or "")
+            ds_err = str(
+                getattr(exc, "_delivery_status", "")
+                or ("undelivered_recoverable" if saved_p else "undelivered_unrecoverable")
+            )
             err_rec: dict[str, Any] = {
                 "ts": round(time.time(), 6),
                 "seq_id": 1,
                 "ok": False,
                 "audio_source": src,
+                "delivery_status": ds_err,
                 "error": redact_secrets(str(exc), env, cfg=cfg, extra_secrets=creds_err.all_secret_values()),
             }
-            if saved_p := str(getattr(exc, "_saved_audio_path", "") or ""):
+            if sk_err := str(getattr(exc, "_skipped_reason", "") or ""):
+                err_rec["skipped_reason"] = sk_err
+            if pr_err := str(getattr(exc, "_paste_reason", "") or ""):
+                err_rec["paste_reason"] = pr_err
+            if saved_p:
                 err_rec["saved_audio"] = saved_p
                 print(
                     f"[agent-voice-input] saved failed audio: {saved_p} (recover via 'agent-voice-input retry')",
@@ -1259,7 +1269,16 @@ def _run_wav_or_live(
             if res.saved_audio:
                 msg += f" (saved: {res.saved_audio}; recover via 'agent-voice-input retry')"
             print(msg, file=sys.stderr)
+            if res.final_text and not dry_run:
+                print(res.final_text)
             return 1
+        if res.asr_missed_chunks > 0:
+            miss_msg = (
+                f"[agent-voice-input] WARN: {res.asr_missed_chunks} voiced audio chunk(s) returned empty ASR"
+            )
+            if res.saved_audio:
+                miss_msg += f" (saved: {res.saved_audio}; recover via 'agent-voice-input retry')"
+            print(miss_msg, file=sys.stderr)
         if dry_run and res.asr:
             fb = f" fallback={res.refined.used_fallback}" if (res.refined and res.refined.used_fallback) else ""
             tok_tag = ""
@@ -1831,7 +1850,7 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
 
     if action == "list":
         scope_filter = str(getattr(args, "scope", "all") or "all").strip().lower()
-        table = load_hotwords_table(hw_path, env=env, use_cache=False)
+        table = load_hotwords_table(hw_path, env=env, use_cache=False, strict_encoding=True)
         if scope_filter == "all":
             budgets = summarize_hotwords_budgets(
                 table.global_terms,

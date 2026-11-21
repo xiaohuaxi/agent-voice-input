@@ -723,11 +723,18 @@ def save_failed_audio(
         return None
 
 
-def list_failed_audios(runtime_dir: Path) -> list[Path]:
-    """Return saved failed WAV paths ordered newest-first (read-only; does not mutate disk)."""
+def list_failed_audios(
+    runtime_dir: Path,
+    *,
+    now_ts: float | None = None,
+    max_age_sec: float | None = FAILED_AUDIO_MAX_AGE_SEC,
+) -> list[Path]:
+    """Return unexpired saved failed WAV paths ordered newest-first (read-only; does not mutate disk)."""
     fdir = get_failed_audio_dir(runtime_dir, create=False)
     if not fdir.is_dir() or fdir.is_symlink():
         return []
+    now = time.time() if now_ts is None else now_ts
+    enforce_ttl = max_age_sec is not None and max_age_sec > 0
     items: list[tuple[float, str, Path]] = []
     try:
         for entry in fdir.iterdir():
@@ -737,22 +744,48 @@ def list_failed_audios(runtime_dir: Path) -> list[Path]:
                 st = entry.stat()
             except OSError:
                 continue
-            if st.st_size > 0:
-                items.append((st.st_mtime, entry.name, entry))
+            if st.st_size <= 0:
+                continue
+            if enforce_ttl and (now - st.st_mtime) > max_age_sec:
+                continue
+            items.append((st.st_mtime, entry.name, entry))
     except OSError:
         return []
     items.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return [p for _, _, p in items]
 
 
-def resolve_failed_audio(runtime_dir: Path, selector: str | None = None) -> Path:
+def resolve_failed_audio(
+    runtime_dir: Path,
+    selector: str | None = None,
+    *,
+    now_ts: float | None = None,
+    max_age_sec: float | None = FAILED_AUDIO_MAX_AGE_SEC,
+) -> Path:
     """Resolve a failed audio file by path, 1-based index (1=newest), filename, or unique substring."""
     sel = (selector or "").strip()
     if sel and (os.sep in sel or (os.altsep and os.altsep in sel) or sel.startswith("~") or sel.lower().endswith(".wav")):
         cand = Path(sel).expanduser()
         if cand.is_file():
+            fdir = get_failed_audio_dir(runtime_dir, create=False)
+            in_failed_dir = False
+            try:
+                cand.resolve().relative_to(fdir.resolve())
+                in_failed_dir = True
+            except (OSError, ValueError):
+                in_failed_dir = False
+            if in_failed_dir and max_age_sec is not None and max_age_sec > 0:
+                now = time.time() if now_ts is None else now_ts
+                try:
+                    st = cand.stat()
+                except OSError:
+                    raise FileNotFoundError(f"failed audio is unreadable: {cand}") from None
+                if (now - st.st_mtime) > max_age_sec:
+                    raise FileNotFoundError(
+                        f"failed audio has expired (>24h TTL): {cand.name} (run 'agent-voice-input retry --list')"
+                    )
             return cand
-    items = list_failed_audios(runtime_dir)
+    items = list_failed_audios(runtime_dir, now_ts=now_ts, max_age_sec=max_age_sec)
     if not items:
         raise FileNotFoundError(f"no saved failed audio found in {get_failed_audio_dir(runtime_dir)}")
     if not sel:

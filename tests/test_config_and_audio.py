@@ -1621,19 +1621,19 @@ class AudioProcTests(unittest.TestCase):
                     label=f"proj-{idx}",
                     now_ts=base_ts + 10 + idx,
                 )
-            kept = list_failed_audios(rt)
+            kept = list_failed_audios(rt, now_ts=base_ts + 30.0)
             self.assertEqual(len(kept), 10)
             self.assertIn("proj-10", kept[0].name)
             self.assertIn("proj-1", kept[-1].name)
 
-            self.assertEqual(resolve_failed_audio(rt), kept[0])
-            self.assertEqual(resolve_failed_audio(rt, "1"), kept[0])
-            self.assertEqual(resolve_failed_audio(rt, "10"), kept[-1])
-            self.assertEqual(resolve_failed_audio(rt, "proj-7"), [p for p in kept if "proj-7" in p.name][0])
+            self.assertEqual(resolve_failed_audio(rt, now_ts=base_ts + 30.0), kept[0])
+            self.assertEqual(resolve_failed_audio(rt, "1", now_ts=base_ts + 30.0), kept[0])
+            self.assertEqual(resolve_failed_audio(rt, "10", now_ts=base_ts + 30.0), kept[-1])
+            self.assertEqual(resolve_failed_audio(rt, "proj-7", now_ts=base_ts + 30.0), [p for p in kept if "proj-7" in p.name][0])
             with self.assertRaises(FileNotFoundError):
-                resolve_failed_audio(rt, "proj-")
+                resolve_failed_audio(rt, "proj-", now_ts=base_ts + 30.0)
             with self.assertRaises(FileNotFoundError):
-                resolve_failed_audio(rt, "99")
+                resolve_failed_audio(rt, "99", now_ts=base_ts + 30.0)
 
     def test_in_memory_mp3_encoding_and_single_hop_constants(self) -> None:
         import subprocess

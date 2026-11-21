@@ -2318,7 +2318,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertEqual(daemon_sup.last_result.get("skipped_reason"), "empty_asr")
                 self.assertEqual(daemon_sup.state, "recording")
-                self.assertEqual(plat_sup.huds, [*huds_before, "recording", "empty"])
+                self.assertEqual(plat_sup.huds, [*huds_before, "recording", "asr_empty_retry"])
                 self.assertIs(plat_sup.hud_events[-2].get("clear_toast"), False)
                 self.assertIs(plat_sup.hud_events[-1].get("clear_main"), False)
                 self.assertEqual(plat_sup.beeps, beeps_before)
@@ -2967,7 +2967,9 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline and daemon2.last_result.get("seq_id") != r_cf["seq_id"]:
                     time.sleep(0.02)
-                self.assertEqual(plat_clip_fail.huds[-1], "error")
+                self.assertEqual(plat_clip_fail.huds[-1], "paste_failed_retry")
+                self.assertFalse(daemon2.last_result["ok"])
+                self.assertEqual(daemon2.last_result["delivery_status"], "undelivered_recoverable")
                 self.assertIn("other-proj", Path(daemon2.last_result["saved_audio"]).name)
             finally:
                 daemon2.close()

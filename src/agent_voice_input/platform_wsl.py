@@ -203,6 +203,7 @@ class WslPlatform(JsonlShimMixin):
         self._recorder_lost_cb: Callable[..., Any] | None = None
         self._recorder_recovered_cb: Callable[..., Any] | None = None
         self._paste_hold_timeout_sec: float | None = None
+        self._rec_stop_timeout_sec: float = 15.0
         self._init_shim_bridge()
 
     def set_recorder_lost_callback(self, cb: Callable[..., Any] | None) -> None:
@@ -459,7 +460,11 @@ class WslPlatform(JsonlShimMixin):
                 if stale_ok:
                     if not before_write_ran and not self._closed:
                         try:
-                            self._shim_rpc({"cmd": "rec_stop"}, timeout_sec=2.0)
+                            self._shim_rpc(
+                                {"cmd": "rec_stop", "rec_gen": my_gen, "discard": True},
+                                timeout_sec=2.0,
+                                allow_retry=False,
+                            )
                         except Exception:
                             pass
                     self.last_audio_error = "mic_busy:wasapi_aborted"
@@ -527,9 +532,10 @@ class WslPlatform(JsonlShimMixin):
             raise self._classify_wasapi_start_error("mic_busy:wasapi_aborted")
         self._start_level_streamer(lambda: self._ff_rec.current_level)
 
-    def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
+    def stop_recording(self, *, drain: bool = True, _discard: bool = False) -> tuple[bytes, str]:
         self._stop_level_streamer()
         with self._winmm_state_lock:
+            stop_gen = self._winmm_gen
             self._winmm_gen += 1
             self._active_seq_id = None
             was_dispatched = self._winmm_rpc_dispatched
@@ -544,19 +550,42 @@ class WslPlatform(JsonlShimMixin):
                 return b"", "winmm"
             if drain_sec > 0.0:
                 time.sleep(drain_sec)
-            res = self._shim_rpc({"cmd": "rec_stop"}, timeout_sec=5.0) or {}
-            b64 = str(res.get("wav_b64") or "")
-            wav = base64.b64decode(b64) if b64 else b""
-            rec_err = str(res.get("rec_error") or "").strip()
-            self.last_audio_error = rec_err if rec_err else ("" if wav else "wasapi_empty_audio")
-            return wav, "winmm"
+            stop_req: dict[str, Any] = {"cmd": "rec_stop", "rec_gen": stop_gen}
+            if _discard:
+                stop_req["discard"] = True
+            should_release = False
+            try:
+                # Single generous wait on the serial JSONL pipe: avoids queuing a duplicate 25MB
+                # rec_stop that would block the immediately following rec_start.
+                res = (
+                    self._shim_rpc(
+                        stop_req,
+                        timeout_sec=self._rec_stop_timeout_sec,
+                        allow_retry=False,
+                    )
+                    or {}
+                )
+                b64 = str(res.get("wav_b64") or "")
+                wav = base64.b64decode(b64) if b64 else b""
+                if not _discard and stop_gen > 0 and (wav or res.get("rec_gen") == stop_gen):
+                    should_release = True
+                rec_err = str(res.get("rec_error") or "").strip()
+                self.last_audio_error = rec_err if rec_err else ("" if wav else "wasapi_empty_audio")
+                return wav, "winmm"
+            except Exception:
+                if not _discard and stop_gen > 0:
+                    should_release = True
+                raise
+            finally:
+                if should_release:
+                    self._send_shim_fire_and_forget({"cmd": "rec_release", "rec_gen": stop_gen})
         wav = self._ff_rec.stop(drain_sec=drain_sec)
         self.last_audio_error = "" if wav else self._ff_rec.diagnostic_summary()
         return wav, "pulse"
 
     def cancel_recording(self) -> None:
         self._stop_level_streamer()
-        try: self.stop_recording(drain=False)
+        try: self.stop_recording(drain=False, _discard=True)
         except Exception: pass
 
     def switch_to_fallback_audio(self) -> bool:
