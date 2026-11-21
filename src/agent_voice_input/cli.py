@@ -1,7 +1,7 @@
 """CLI entrypoint for agent-voice-input (init, daemon, start, restart, stop, status, toggle, cancel, once, retry, hotwords, doctor, diagnose, key-test, session-hook)."""
 from __future__ import annotations
 
-import argparse, dataclasses, errno, fcntl, json, os, shlex, signal, socket, stat, subprocess, sys, time
+import argparse, dataclasses, errno, fcntl, json, locale, os, shlex, signal, socket, stat, subprocess, sys, time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -2200,8 +2200,53 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_ASCII_STREAM_ENCODINGS = frozenset({"ascii", "ansi-x3.4-1968", "us-ascii", "646", "c", "posix"})
+
+
+def _normalize_enc_name(raw: str | None) -> str:
+    return str(raw or "").strip().lower().replace("_", "-")
+
+
+def _recover_utf8_surrogates(token: str) -> str:
+    """Decode POSIX ``LC_ALL=C`` surrogate-escaped UTF-8 CLI text tokens back to Unicode."""
+    if not any(0xDC80 <= ord(ch) <= 0xDCFF for ch in token):
+        return token
+    try:
+        return token.encode("utf-8", errors="surrogateescape").decode("utf-8")
+    except UnicodeDecodeError:
+        return token
+
+
+def _configure_posix_ascii_stdio(env: Mapping[str, str] | None = None) -> None:
+    """Upgrade stdio to UTF-8 only under POSIX ASCII locales when ``PYTHONIOENCODING`` is unset."""
+    eff_env = os.environ if env is None else env
+    if (eff_env.get("PYTHONIOENCODING") or "").strip():
+        return
+    if _normalize_enc_name(locale.getpreferredencoding(False)) not in _ASCII_STREAM_ENCODINGS:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if _normalize_enc_name(getattr(stream, "encoding", "")) in _ASCII_STREAM_ENCODINGS and callable(reconf):
+            try:
+                reconf(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError, ValueError):
+                pass
+
+
+def _recover_parsed_text_args(args: argparse.Namespace) -> None:
+    """Recover UTF-8 text business arguments without mutating OS filesystem path arguments."""
+    if getattr(args, "subcmd", None) == "hotwords" and isinstance(getattr(args, "terms", None), list):
+        args.terms = [_recover_utf8_surrogates(str(tok)) for tok in args.terms]
+    for attr in ("window_title", "title"):
+        val = getattr(args, attr, None)
+        if isinstance(val, str) and val:
+            setattr(args, attr, _recover_utf8_surrogates(val))
+
+
 def main(argv: list[str] | None = None) -> int:
+    _configure_posix_ascii_stdio()
     args = _build_parser().parse_args(argv)
+    _recover_parsed_text_args(args)
     if args.subcmd == "session-hook":
         from .session_title import run_session_hook
 

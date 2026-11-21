@@ -15,12 +15,12 @@ jobs:
   test:
     name: Unit tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.10", "3.12", "3.13"]
+        python-version: ["3.10", "3.12", "3.13", "3.14"]
         include:
           - os: macos-latest
             python-version: "3.12"
@@ -32,6 +32,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
 
       - name: Install tmux and ffmpeg for integration tests (macOS)
         if: runner.os == 'macOS'
@@ -42,12 +43,15 @@ jobs:
           command -v tmux >/dev/null 2>&1 || brew install tmux
           command -v ffmpeg >/dev/null 2>&1 || brew install ffmpeg
 
-      - name: Install ffmpeg and tmux for integration tests (Linux)
+      - name: Install ffmpeg, tmux, and openssh-server for integration tests (Linux)
         if: runner.os == 'Linux'
         run: |
           pkgs=""
           command -v ffmpeg >/dev/null 2>&1 || pkgs="$pkgs ffmpeg"
           command -v tmux >/dev/null 2>&1 || pkgs="$pkgs tmux"
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            pkgs="$pkgs openssh-server"
+          fi
           if [ -n "$pkgs" ]; then
             sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
             sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y --no-install-recommends $pkgs
@@ -55,51 +59,400 @@ jobs:
 
       - name: Run offline unit tests with tiered statement & pure-branch coverage gate
         if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        env:
+          AGENT_VOICE_INPUT_CI_NO_SKIP: "1"
         run: |
           python -m pip install coverage
           python scripts/check_coverage.py --require-branch -v
 
       - name: Run offline unit tests
         if: runner.os != 'Linux' || matrix.python-version != '3.12'
+        env:
+          AGENT_VOICE_INPUT_CI_NO_SKIP: "1"
         run: PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests -v
 
+      - name: Edge runtime guardrails (strict POSIX LC_ALL=C and minimal PATH)
+        if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        run: |
+          set -euo pipefail
+          PY_BIN="$(command -v python)"
+          REPO_SRC="$PWD/src"
+          EDGE_DIR="$(mktemp -d "${RUNNER_TEMP}/avi-edge-XXXXXX")"
+          trap 'rm -rf "$EDGE_DIR"' EXIT
+
+          # 1. Strict non-UTF-8 POSIX C locale (disabling PEP 538 coercion)
+          C_HOME="$EDGE_DIR/c_home"
+          C_RT="$EDGE_DIR/c_run"
+          mkdir -p "$C_HOME" "$C_RT"
+          chmod 700 "$C_RT"
+          env -i \
+            PATH="/usr/bin:/bin" \
+            HOME="$C_HOME" \
+            XDG_CONFIG_HOME="$C_HOME/.config" \
+            XDG_CACHE_HOME="$EDGE_DIR/c_cache" \
+            XDG_RUNTIME_DIR="$C_RT" \
+            LC_ALL="C" \
+            LANG="C" \
+            PYTHONCOERCECLOCALE="0" \
+            PYTHONUTF8="0" \
+            PYTHONPATH="$REPO_SRC" \
+            "$PY_BIN" - <<'PY'
+          import json, os, pathlib, subprocess, sys
+
+          c_home = os.fsencode(os.environ["HOME"])
+          cjk_cfg_dir = os.path.join(c_home, "中文配置".encode("utf-8"))
+          os.makedirs(cjk_cfg_dir, exist_ok=True)
+          cjk_cfg = os.path.join(cjk_cfg_dir, b"config.toml")
+          hw_file = pathlib.Path(os.environ["HOME"]) / "scoped_hotwords.txt"
+          with open(cjk_cfg, "wb") as fh:
+              fh.write(f'[asr]\nhotwords_file = "{hw_file.as_posix()}"\n'.encode("utf-8"))
+
+          zh_term = "豆包".encode("utf-8")
+
+          def run_cli(*args: str | bytes) -> subprocess.CompletedProcess[bytes]:
+              return subprocess.run(
+                  [sys.executable, "-m", "agent_voice_input.cli", *args],
+                  stdin=subprocess.DEVNULL,
+                  capture_output=True,
+                  timeout=15,
+                  check=False,
+              )
+
+          for sub in (
+              ("--help",),
+              ("--version",),
+              ("init",),
+              ("hotwords", "add", "Codex", "--scope", "coding", "--config", cjk_cfg),
+              ("hotwords", "add", zh_term, "--scope", "global", "--config", cjk_cfg),
+              ("hotwords", "list", "--config", cjk_cfg),
+              ("diagnose", "--json", "--config", cjk_cfg),
+          ):
+              p = run_cli(*sub)
+              assert p.returncode == 0, f"{sub!r} failed rc={p.returncode} stderr={p.stderr!r}"
+
+          lj = run_cli("hotwords", "list", "--json", "--config", cjk_cfg)
+          assert lj.returncode == 0, lj.stderr
+          data = json.loads(lj.stdout.decode("utf-8"))
+          assert "Codex" in data["scopes"]["coding"], data
+          assert "豆包" in data["scopes"]["global"], data
+
+          rm = run_cli("hotwords", "remove", zh_term, "--scope", "global", "--config", cjk_cfg)
+          assert rm.returncode == 0, rm.stderr
+          lj2 = json.loads(run_cli("hotwords", "list", "--json", "--config", cjk_cfg).stdout.decode("utf-8"))
+          assert "豆包" not in lj2["scopes"]["global"], lj2
+          print("Strict LC_ALL=C CLI smoke passed (bytes args + non-ASCII --config path)")
+          PY
+
+          LC_ALL=C LANG=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0 PYTHONPATH="$REPO_SRC" \
+            "$PY_BIN" -W error::ResourceWarning -m unittest \
+            tests/test_hotwords.py \
+            tests/test_config_and_audio.py \
+            tests/test_cli_pipeline_diagnose_v010.py -v
+
+          # 2. Minimal PATH=/usr/bin:/bin smoke
+          MIN_HOME="$EDGE_DIR/min_home"
+          MIN_RT="$EDGE_DIR/min_run"
+          mkdir -p "$MIN_HOME" "$MIN_RT"
+          chmod 700 "$MIN_RT"
+          for cmd_args in "--help" "--version" "init" "hotwords list --json" "diagnose --json"; do
+            # shellcheck disable=SC2086
+            env -i \
+              PATH="/usr/bin:/bin" \
+              HOME="$MIN_HOME" \
+              XDG_CONFIG_HOME="$MIN_HOME/.config" \
+              XDG_CACHE_HOME="$EDGE_DIR/min_cache" \
+              XDG_RUNTIME_DIR="$MIN_RT" \
+              PYTHONPATH="$REPO_SRC" \
+              "$PY_BIN" -m agent_voice_input.cli $cmd_args >/dev/null
+          done
+          echo "Minimal PATH smoke passed"
+
+      - name: Out-of-tree wheel install smoke test (Linux & macOS)
+        if: matrix.python-version == '3.12'
+        run: |
+          set -euo pipefail
+          SMOKE_DIR="$(mktemp -d "${RUNNER_TEMP}/avi-wheel-smoke-XXXXXX")"
+          PKG_DIR=""
+          cleanup() {
+            if [ -n "$PKG_DIR" ] && [ -d "$PKG_DIR" ]; then
+              chmod -R u+w "$PKG_DIR" || true
+            fi
+            rm -rf "$SMOKE_DIR"
+          }
+          trap cleanup EXIT
+
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir "$SMOKE_DIR/dist"
+
+          python -m venv "$SMOKE_DIR/venv"
+          VENV_PY="$SMOKE_DIR/venv/bin/python"
+          VENV_CLI="$SMOKE_DIR/venv/bin/agent-voice-input"
+
+          (
+            cd "$SMOKE_DIR"
+            unset PYTHONPATH
+            "$VENV_PY" -m pip install --no-deps "$SMOKE_DIR/dist"/*.whl
+
+            export HOME="$SMOKE_DIR/home"
+            export XDG_CONFIG_HOME="$HOME/.config"
+            export XDG_CACHE_HOME="$SMOKE_DIR/cache"
+            export XDG_RUNTIME_DIR="$SMOKE_DIR/run"
+            mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
+            chmod 700 "$XDG_RUNTIME_DIR"
+
+            "$VENV_CLI" --help >/dev/null
+            "$VENV_CLI" --version
+            "$VENV_CLI" init
+            "$VENV_CLI" hotwords add Codex --scope coding
+            "$VENV_CLI" hotwords list --json | "$VENV_PY" -c 'import json,sys; d=json.load(sys.stdin); assert "Codex" in d["scopes"]["coding"], d'
+            "$VENV_CLI" diagnose --json | "$VENV_PY" -c 'import json,sys; d=json.load(sys.stdin); assert d.get("version") and "daemon" in d, d'
+          )
+
+          if [ "$(uname -s)" = "Darwin" ]; then
+            PKG_DIR="$(cd "$SMOKE_DIR" && unset PYTHONPATH && "$VENV_PY" -c 'import agent_voice_input, pathlib; print(pathlib.Path(agent_voice_input.__file__).resolve().parent)')"
+            chmod -R a-w "$PKG_DIR"
+            (
+              cd "$SMOKE_DIR"
+              unset PYTHONPATH
+              export HOME="$SMOKE_DIR/home"
+              export XDG_CONFIG_HOME="$HOME/.config"
+              export XDG_CACHE_HOME="$SMOKE_DIR/cache"
+              export XDG_RUNTIME_DIR="$SMOKE_DIR/run"
+              "$VENV_PY" - "$PKG_DIR" <<'PY'
+          import json, os, pathlib, subprocess, sys, threading, time
+          from agent_voice_input.platform_macos import compile_mac_shim, run_mac_shim_self_check
+
+          pkg_dir = pathlib.Path(sys.argv[1]).resolve()
+          assert not os.access(pkg_dir, os.W_OK), f"expected read-only site-packages: {pkg_dir}"
+
+          iso_env = dict(os.environ)
+          bin1, err1 = compile_mac_shim(env=iso_env)
+          assert not err1 and bin1 is not None and bin1.is_file(), f"cold compile failed: {err1}"
+          cache_root = pathlib.Path(iso_env["XDG_CACHE_HOME"]).resolve()
+          assert cache_root in bin1.resolve().parents, f"expected binary under cache {cache_root}, got {bin1}"
+          st1 = bin1.stat()
+
+          ok_sc, sc_payload, sc_err = run_mac_shim_self_check(bin1, iso_env)
+          assert ok_sc and sc_payload.get("ok") is True, f"self-check failed: {sc_err} {sc_payload}"
+
+          bin2, err2 = compile_mac_shim(env=iso_env)
+          assert not err2 and bin2 == bin1, f"warm compile failed: {err2}"
+          st2 = bin2.stat()
+          assert (st1.st_ino, st1.st_mtime_ns) == (st2.st_ino, st2.st_mtime_ns), "expected cache hit without recompile"
+
+          # Headless bridge smoke on the cached binary compiled from read-only site-packages
+          proc = subprocess.Popen(
+              [str(bin2), "--mode", "bridge"],
+              stdin=subprocess.PIPE,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              text=True,
+              encoding="utf-8",
+              env=iso_env,
+          )
+          lines = []
+          def _read():
+              for ln in proc.stdout:
+                  lines.append(ln)
+          th = threading.Thread(target=_read, daemon=True)
+          th.start()
+          def _wait(pred, timeout=8.0):
+              end = time.monotonic() + timeout
+              idx = 0
+              while time.monotonic() < end:
+                  while idx < len(lines):
+                      s = lines[idx].strip()
+                      idx += 1
+                      if s:
+                          obj = json.loads(s)
+                          if isinstance(obj, dict) and pred(obj):
+                              return obj
+                  time.sleep(0.02)
+              raise AssertionError(f"bridge timeout; lines={lines!r}")
+          try:
+              _wait(lambda m: m.get("event") == "ready")
+              proc.stdin.write(json.dumps({"cmd": "ping", "seq_id": 1}) + "\n")
+              proc.stdin.flush()
+              rep = _wait(lambda m: m.get("type") == "reply" and m.get("seq_id") == 1)
+              assert rep.get("ok") is True and rep.get("reply") == "ping", rep
+              proc.stdin.close()
+              rc = proc.wait(timeout=6.0)
+              assert rc == 0, f"bridge rc={rc} stderr={proc.stderr.read()!r}"
+          finally:
+              if proc.poll() is None:
+                  proc.kill()
+                  proc.wait(timeout=3.0)
+              th.join(timeout=2.0)
+              for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                  if pipe is not None:
+                      try:
+                          pipe.close()
+                      except Exception:
+                          pass
+          print("macOS read-only site-packages compile cache + bridge smoke passed")
+          PY
+            )
+          fi
+
   win-shim:
-    name: Windows shim self-check (windows-latest)
+    name: Windows shim wheel self-check, Win32ClipStore & large JSONL pipe (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify win_shim.ps1 7-bit ASCII and headless self-check (cold + cached DLL)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and install into out-of-tree venv (Windows)
         shell: powershell
         run: |
-          $rawBytes = [System.IO.File]::ReadAllBytes("src/agent_voice_input/win_shim.ps1")
+          $smokeDir = Join-Path $env:RUNNER_TEMP "avi-win-smoke"
+          $wheelOut = Join-Path $smokeDir "dist"
+          $venvDir = Join-Path $smokeDir "venv"
+          New-Item -ItemType Directory -Force -Path $wheelOut | Out-Null
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir $wheelOut
+          $whls = @(Get-ChildItem -Path $wheelOut -Filter "*.whl")
+          if ($whls.Count -ne 1) { throw "Expected 1 wheel, got $($whls.Count)" }
+          python -m venv $venvDir
+          $venvPy = Join-Path $venvDir "Scripts\python.exe"
+          $prevPyPath = $env:PYTHONPATH
+          Push-Location $smokeDir
+          try {
+            Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+            & $venvPy -m pip install --no-deps $whls[0].FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $installedShim = @'
+          import importlib.metadata as m, pathlib, sys
+          dist = m.distribution("agent-voice-input")
+          p = pathlib.Path(dist.locate_file("agent_voice_input/win_shim.ps1")).resolve()
+          venv_root = pathlib.Path(sys.argv[1]).resolve()
+          assert p.is_file(), f"missing installed win_shim.ps1: {p}"
+          assert venv_root in p.parents, f"win_shim.ps1 not inside out-of-tree venv: {p}"
+          print(str(p))
+          '@ | & $venvPy - $venvDir
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $shimPath = ($installedShim | Select-Object -Last 1).Trim()
+            Write-Host "Installed wheel win_shim.ps1: $shimPath"
+            "AVI_INSTALLED_WIN_SHIM=$shimPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } finally {
+            Pop-Location
+            if ($null -ne $prevPyPath) { $env:PYTHONPATH = $prevPyPath }
+          }
+
+      - name: Verify installed win_shim.ps1 7-bit ASCII, real Win32ClipStore self-check, and 4 MiB JSONL bridge pipe
+        shell: powershell
+        run: |
+          $shimPath = $env:AVI_INSTALLED_WIN_SHIM
+          if ([string]::IsNullOrWhiteSpace($shimPath) -or -not (Test-Path -LiteralPath $shimPath)) {
+            throw "Installed win_shim.ps1 not found: $shimPath"
+          }
+          $rawBytes = [System.IO.File]::ReadAllBytes($shimPath)
           foreach ($b in $rawBytes) {
-            if ($b -gt 0x7F) { throw "Non-ASCII byte $b found in win_shim.ps1" }
+            if ($b -gt 0x7F) { throw "Non-ASCII byte $b found in installed win_shim.ps1" }
           }
           $isoAppData = Join-Path $env:RUNNER_TEMP ("avi-shim-ci-" + [Guid]::NewGuid().ToString("N"))
           New-Item -ItemType Directory -Force -Path $isoAppData | Out-Null
           $prevLocalAppData = $env:LOCALAPPDATA
+          $pipePy = @'
+          import base64, hashlib, json, os, subprocess, sys, threading, time
+
+          shim_path = sys.argv[1]
+          raw_bytes = os.urandom(3 * 1024 * 1024)
+          payload_b64 = base64.b64encode(raw_bytes).decode("ascii")
+          assert len(payload_b64) == 4 * 1024 * 1024, f"unexpected b64 len: {len(payload_b64)}"
+          want_sha = hashlib.sha256(payload_b64.encode("ascii")).hexdigest()
+
+          stdin_payload = "\n".join(
+              [
+                  json.dumps({"cmd": "ping", "seq_id": 1}),
+                  json.dumps({"cmd": "ping", "seq_id": 2, "echo_b64": payload_b64}),
+                  json.dumps({"cmd": "quit"}),
+              ]
+          ) + "\n"
+
+          proc = subprocess.Popen(
+              [
+                  "powershell.exe",
+                  "-NoProfile",
+                  "-NonInteractive",
+                  "-Sta",
+                  "-ExecutionPolicy",
+                  "Bypass",
+                  "-File",
+                  shim_path,
+                  "-Mode",
+                  "bridge",
+              ],
+              stdin=subprocess.PIPE,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              text=True,
+              encoding="utf-8",
+          )
+          t0 = time.monotonic()
+          wd_fired = [False]
+          def _kill_on_hang():
+              wd_fired[0] = True
+              try: proc.kill()
+              except Exception: pass
+          wd = threading.Timer(30.0, _kill_on_hang)
+          wd.start()
+          try:
+              stdout_txt, stderr_txt = proc.communicate(input=stdin_payload, timeout=30.0)
+          except subprocess.TimeoutExpired:
+              proc.kill()
+              stdout_txt, stderr_txt = proc.communicate(timeout=5.0)
+              raise AssertionError(f"bridge 4 MiB JSONL round-trip timed out after 30s; stderr={stderr_txt!r}")
+          finally:
+              wd.cancel()
+          assert not wd_fired[0], f"bridge 4 MiB JSONL watchdog killed hung subprocess after 30s; stderr={stderr_txt!r}"
+          dt_ms = (time.monotonic() - t0) * 1000.0
+          assert proc.returncode == 0, f"bridge exit rc={proc.returncode}, stderr={stderr_txt!r}"
+
+          msgs = [json.loads(ln) for ln in stdout_txt.splitlines() if ln.strip()]
+          assert any(m.get("event") == "ready" for m in msgs), f"missing ready event in {len(msgs)} messages"
+          replies = {m.get("seq_id"): m for m in msgs if m.get("type") == "reply"}
+
+          rep1 = replies.get(1)
+          assert rep1 and rep1.get("ok") is True and rep1.get("reply") == "ping", rep1
+
+          rep2 = replies.get(2)
+          assert rep2 and rep2.get("ok") is True and rep2.get("reply") == "ping", rep2
+          got_b64 = rep2.get("echo_b64")
+          assert isinstance(got_b64, str) and len(got_b64) == len(payload_b64)
+          got_sha = hashlib.sha256(got_b64.encode("ascii")).hexdigest()
+          assert got_sha == want_sha and got_b64 == payload_b64, "4 MiB Base64 mismatch"
+          print(f"4 MiB Base64 JSONL round-trip verified via communicate(timeout=30) in {dt_ms:.1f} ms (sha256={got_sha[:16]}...)")
+          '@
           try {
             $env:LOCALAPPDATA = $isoAppData
-            $out1 = & powershell.exe -NoProfile -NonInteractive -Sta -ExecutionPolicy Bypass -File src/agent_voice_input/win_shim.ps1 -Mode self-check
+            $out1 = & powershell.exe -NoProfile -NonInteractive -Sta -ExecutionPolicy Bypass -File $shimPath -Mode self-check -RealClipboard
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             Write-Host "Cold run: $out1"
             $p1 = ($out1 | Select-Object -Last 1) | ConvertFrom-Json
-            if (-not $p1.ok -or $p1.mode -ne "self-check" -or $p1.cache_hit) {
+            if (-not $p1.ok -or $p1.mode -ne "self-check" -or $p1.cache_hit -or -not $p1.real_clipboard_ok) {
               throw "Unexpected cold self-check output: $out1"
             }
-            $out2 = & powershell.exe -NoProfile -NonInteractive -Sta -ExecutionPolicy Bypass -File src/agent_voice_input/win_shim.ps1 -Mode self-check
+            $out2 = & powershell.exe -NoProfile -NonInteractive -Sta -ExecutionPolicy Bypass -File $shimPath -Mode self-check -RealClipboard
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             Write-Host "Warm run: $out2"
             $p2 = ($out2 | Select-Object -Last 1) | ConvertFrom-Json
-            if (-not $p2.ok -or $p2.mode -ne "self-check" -or -not $p2.cache_hit) {
+            if (-not $p2.ok -or $p2.mode -ne "self-check" -or -not $p2.cache_hit -or -not $p2.real_clipboard_ok) {
               throw "Unexpected cached self-check output: $out2"
             }
+
+            # Real powershell.exe bridge 4 MiB Base64 JSONL round-trip integrity & latency check
+            $pipePy | python - $shimPath
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           } finally {
             $env:LOCALAPPDATA = $prevLocalAppData
             Remove-Item -Recurse -Force -Path $isoAppData -ErrorAction SilentlyContinue
+            Remove-Item -Recurse -Force -Path (Join-Path $env:RUNNER_TEMP "avi-win-smoke") -ErrorAction SilentlyContinue
           }
 
   package-check:

@@ -3,7 +3,8 @@ param(
     [int]$TapMaxMs = 500, [int]$DebounceMs = 180, [int]$Seconds = 10, [int]$Beep = 0,
     [Alias("AllowedTerminals")][string]$AllowedTerminalsCsv = "",
     [string]$CacheDir = "",
-    [int]$HoldCancelMs = 800, [int]$HoldHintMs = 250
+    [int]$HoldCancelMs = 800, [int]$HoldHintMs = 250,
+    [switch]$RealClipboard
 )
 $ErrorActionPreference = "Stop"
 [Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -2995,6 +2996,126 @@ public static class VoiceWinShim {
         if (st.RestorePending || st.SavedClip != null) throw new InvalidOperationException("step7 hung owner armed restore");
     }
 
+    private static bool OpenWin32ClipWithRetry(Win32ClipStore store) {
+        for (int i = 0; i < 5; i++) {
+            if (store.Open()) return true;
+            Thread.Sleep(15);
+        }
+        return false;
+    }
+
+    public static void RunRealWin32ClipStoreSelfCheck() {
+        Win32ClipStore store = _win32ClipStore;
+        ClipGuardState st = new ClipGuardState();
+        int armed = 0, stopped = 0;
+        Action armFn = () => { armed++; };
+        Action stopFn = () => { stopped++; };
+        string runTag = "avi_sc_" + Guid.NewGuid().ToString("N");
+        string baseText = "\u6D4B\u8BD5_" + runTag + "_base";
+        string tempText = "\u8BED\u97F3\u4E34\u65F6_" + runTag + "_temp";
+        byte[] basePng = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D };
+        uint pngFmt = store.FormatPng;
+        if (pngFmt == 0u) throw new InvalidOperationException("win32 clip check: PNG format registration failed");
+        bool wroteSelfCheck = false;
+        uint lastOwnedSeq = 0u;
+        byte[] baselinePng = null;
+        try {
+            if (!OpenWin32ClipWithRetry(store)) throw new InvalidOperationException("win32 clip check: initial OpenClipboard failed");
+            try {
+                if (!store.IsEmptyWhenOpen())
+                    throw new InvalidOperationException("win32 clip check: refusing to run -RealClipboard on a non-empty clipboard");
+                if (!store.EmptyWhenOpen()) throw new InvalidOperationException("win32 clip check: initial EmptyClipboard failed");
+                wroteSelfCheck = true;
+                if (!store.SetFormatBytesWhenOpen(CF_UNICODETEXT, EncodeUnicodeClipBytes(baseText)))
+                    throw new InvalidOperationException("win32 clip check: SetClipboardData CF_UNICODETEXT failed");
+                if (!store.SetFormatBytesWhenOpen(pngFmt, basePng))
+                    throw new InvalidOperationException("win32 clip check: SetClipboardData PNG failed");
+                if (store.ReadFormatBytesWhenOpen(pngFmt, 4096, out baselinePng) != ClipReadStatus.Ok || baselinePng == null || baselinePng.Length < basePng.Length)
+                    throw new InvalidOperationException("win32 clip check: failed to read back baseline PNG snapshot");
+                for (int i = 0; i < basePng.Length; i++) {
+                    if (baselinePng[i] != basePng[i])
+                        throw new InvalidOperationException("win32 clip check: baseline PNG prefix mismatch at " + i);
+                }
+                lastOwnedSeq = store.SequenceNumber;
+            } finally {
+                store.Close();
+            }
+
+            if (store.SequenceNumber != lastOwnedSeq)
+                throw new InvalidOperationException("win32 clip check: external clipboard change detected before transient write");
+            if (!WriteClipTextCore(st, store, tempText, true, armFn, stopFn))
+                throw new InvalidOperationException("win32 clip check: transient WriteClipTextCore failed");
+            lastOwnedSeq = store.SequenceNumber;
+            if (!st.RestorePending || armed != 1)
+                throw new InvalidOperationException("win32 clip check: transient write did not arm restore");
+
+            if (!OpenWin32ClipWithRetry(store)) throw new InvalidOperationException("win32 clip check: OpenClipboard after transient write failed");
+            try {
+                byte[] curTxtRaw;
+                if (store.ReadFormatBytesWhenOpen(CF_UNICODETEXT, 4096, out curTxtRaw) != ClipReadStatus.Ok)
+                    throw new InvalidOperationException("win32 clip check: failed to read transient CF_UNICODETEXT");
+                if (DecodeUnicodeClipBytes(curTxtRaw) != tempText)
+                    throw new InvalidOperationException("win32 clip check: transient CF_UNICODETEXT mismatch");
+                if (!store.HasFormatWhenOpen(store.FormatAviTransient) || !store.HasFormatWhenOpen(store.FormatExcludeMonitor) || !store.HasFormatWhenOpen(store.FormatCanHistory))
+                    throw new InvalidOperationException("win32 clip check: transient exclusion markers missing");
+                lastOwnedSeq = store.SequenceNumber;
+            } finally {
+                store.Close();
+            }
+
+            FlushClipRestoreCore(st, store, null, stopFn);
+            lastOwnedSeq = store.SequenceNumber;
+            if (st.RestorePending || st.SavedClip != null)
+                throw new InvalidOperationException("win32 clip check: FlushClipRestoreCore did not clear pending state");
+
+            if (!OpenWin32ClipWithRetry(store)) throw new InvalidOperationException("win32 clip check: OpenClipboard after restore failed");
+            try {
+                byte[] restTxtRaw;
+                if (store.ReadFormatBytesWhenOpen(CF_UNICODETEXT, 4096, out restTxtRaw) != ClipReadStatus.Ok)
+                    throw new InvalidOperationException("win32 clip check: failed to read restored CF_UNICODETEXT");
+                if (DecodeUnicodeClipBytes(restTxtRaw) != baseText)
+                    throw new InvalidOperationException("win32 clip check: restored CF_UNICODETEXT mismatch");
+                byte[] restPng;
+                if (store.ReadFormatBytesWhenOpen(pngFmt, 4096, out restPng) != ClipReadStatus.Ok || restPng == null || restPng.Length != baselinePng.Length)
+                    throw new InvalidOperationException("win32 clip check: restored PNG missing or length mismatch vs baseline");
+                for (int i = 0; i < baselinePng.Length; i++) {
+                    if (restPng[i] != baselinePng[i])
+                        throw new InvalidOperationException("win32 clip check: restored PNG byte mismatch at " + i);
+                }
+                for (int i = 0; i < basePng.Length; i++) {
+                    if (restPng[i] != basePng[i])
+                        throw new InvalidOperationException("win32 clip check: restored PNG prefix mismatch at " + i);
+                }
+                if (!store.HasFormatWhenOpen(store.FormatAviRestored))
+                    throw new InvalidOperationException("win32 clip check: FormatAviRestored marker missing after restore");
+                lastOwnedSeq = store.SequenceNumber;
+            } finally {
+                store.Close();
+            }
+        } finally {
+            CancelClipRestoreCore(st, stopFn);
+            if (wroteSelfCheck && OpenWin32ClipWithRetry(store)) {
+                try {
+                    if (store.SequenceNumber == lastOwnedSeq) {
+                        byte[] curRaw;
+                        if (store.ReadFormatBytesWhenOpen(CF_UNICODETEXT, 4096, out curRaw) == ClipReadStatus.Ok) {
+                            string curTxt = DecodeUnicodeClipBytes(curRaw);
+                            if (curTxt.IndexOf(runTag, StringComparison.Ordinal) >= 0 && (curTxt == baseText || curTxt == tempText)) {
+                                store.EmptyWhenOpen();
+                            }
+                        }
+                    }
+                } finally {
+                    store.Close();
+                }
+            }
+            if (_clipHwnd != IntPtr.Zero) {
+                try { DestroyWindow(_clipHwnd); } catch { }
+                _clipHwnd = IntPtr.Zero;
+            }
+        }
+    }
+
     public static void StopHook() {
         int dummyBytes; string dummyErr; StopRecording(0L, out dummyBytes, out dummyErr, false);
         ReleaseStoppedRecording(0L);
@@ -3806,7 +3927,12 @@ if ($Mode -eq "self-check") {
         if ((-not $protoSample.ok) -or ($protoSample.reply -ne "ping") -or ([int]$protoSample.seq_id -ne 1)) {
             throw "JSON roundtrip check failed"
         }
-        Write-JsonLine @{ ok = $true; mode = "self-check"; ps_version = $PSVersionTable.PSVersion.ToString(); clr_version = $PSVersionTable.CLRVersion.ToString(); cache_hit = [bool]$csCacheHit; hud_layout_cases = [int]$hudLayoutCases; hotkey_fsm_checks = [int]$hotkeyFsmChecks }
+        $realClipOk = $false
+        if ($RealClipboard) {
+            [VoiceWinShim]::RunRealWin32ClipStoreSelfCheck()
+            $realClipOk = $true
+        }
+        Write-JsonLine @{ ok = $true; mode = "self-check"; ps_version = $PSVersionTable.PSVersion.ToString(); clr_version = $PSVersionTable.CLRVersion.ToString(); cache_hit = [bool]$csCacheHit; hud_layout_cases = [int]$hudLayoutCases; hotkey_fsm_checks = [int]$hotkeyFsmChecks; real_clipboard_ok = [bool]$realClipOk }
         exit 0
     } catch {
         [Console]::Error.WriteLine("win_shim self-check failed: " + [string]$_.Exception.Message)
@@ -3874,7 +4000,11 @@ try {
             $seq = 0; $op = "unknown"
             try {
                 $cmdObj = $rawCmd | ConvertFrom-Json; $op = [string]$cmdObj.cmd; $seq = if ($null -ne $cmdObj.seq_id) { [int]$cmdObj.seq_id } else { 0 }
-                if ($op -eq "ping") { Write-JsonLine @{ type = "reply"; reply = "ping"; seq_id = $seq; ok = $true; wave_in_devs = [VoiceWinShim]::waveInGetNumDevs() } }
+                if ($op -eq "ping") {
+                    $pingReply = @{ type = "reply"; reply = "ping"; seq_id = $seq; ok = $true; wave_in_devs = [VoiceWinShim]::waveInGetNumDevs() }
+                    if ($null -ne $cmdObj.echo_b64) { $pingReply.echo_b64 = [string]$cmdObj.echo_b64 }
+                    Write-JsonLine $pingReply
+                }
                 elseif ($op -eq "fg_window") { $h = 0L; $p = ""; $t = ""; [VoiceWinShim]::QueryForeground([ref]$h, [ref]$p, [ref]$t); Write-JsonLine @{ type = "reply"; reply = "fg_window"; seq_id = $seq; ok = $true; hwnd = $h; process = $p; title = $t } }
                 elseif ($op -eq "key_state") { Write-JsonLine @{ type = "reply"; reply = "key_state"; seq_id = $seq; ok = $true; hotkey_held = [bool][VoiceWinShim]::IsAnyPasteBlockingKeyDown() } }
                 elseif ($op -eq "beep") { Invoke-Tone ([string]$cmdObj.kind); Write-JsonLine @{ type = "reply"; reply = "beep"; seq_id = $seq; ok = $true } }

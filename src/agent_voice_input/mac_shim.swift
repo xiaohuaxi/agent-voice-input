@@ -4315,6 +4315,8 @@ struct MacShimMain {
                     let op = (obj["cmd"] as? String) ?? "unknown"
                     let seqId = (obj["seq_id"] as? Int) ?? ((obj["seq_id"] as? NSNumber)?.intValue ?? 0)
                     switch op {
+                    case "ping":
+                        writeJsonLine(["type": "reply", "reply": "ping", "seq_id": seqId, "ok": true, "ax_trusted": AXIsProcessTrusted(), "listen_event_access": CGPreflightListenEventAccess(), "audio_status": queryAudioInputStatus()])
                     case "fg_window":
                         let fg = queryFrontmostApp()
                         writeJsonLine(["type": "reply", "reply": "fg_window", "seq_id": seqId, "ok": true, "hwnd": fg.hwnd, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": fg.title, "document": fg.document, "ax_trusted": fg.axTrusted])

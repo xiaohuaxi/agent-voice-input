@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -29,6 +30,7 @@ from agent_voice_input.asr_providers import (
     transcribe,
 )
 from agent_voice_input.audio_proc import pack_pcm16_mono_wav
+from agent_voice_input import cli as cli_mod
 from agent_voice_input.cli import main as cli_main
 from agent_voice_input.config import Config, ConfigError
 from agent_voice_input.daemon import run_pipeline_once
@@ -1100,6 +1102,150 @@ class HotwordsCliTests(unittest.TestCase):
             rc, out, err = self._run_cli(["hotwords", "list", "--config", str(empty_cfg)], env)
             self.assertEqual(rc, 2)
             self.assertIn("asr.hotwords_file is empty", err)
+
+    def test_cli_posix_c_locale_and_minimal_path_cjk_hotwords(self) -> None:
+        # 1. Direct unit checks for surrogate recovery, stdio reconfiguration guard, and path preservation
+        surrogate_zh = "豆包".encode("utf-8").decode("ascii", errors="surrogateescape")
+        surrogate_cfg = "/tmp/" + "中文配置".encode("utf-8").decode("ascii", errors="surrogateescape") + "/config.toml"
+        self.assertEqual(cli_mod._recover_utf8_surrogates(surrogate_zh), "豆包")
+        self.assertEqual(cli_mod._recover_utf8_surrogates("Codex"), "Codex")
+        bad_bytes = b"\xff\xfe".decode("ascii", errors="surrogateescape")
+        self.assertEqual(cli_mod._recover_utf8_surrogates(bad_bytes), bad_bytes)
+
+        reconfigured: list[tuple[str, str]] = []
+
+        class _AsciiStream:
+            encoding = "ANSI_X3.4-1968"
+
+            def reconfigure(self, *, encoding: str, errors: str) -> None:
+                reconfigured.append((encoding, errors))
+
+        # Upgrades stdio only when POSIX locale is ASCII and PYTHONIOENCODING is unset
+        with (
+            mock.patch.object(sys, "stdout", _AsciiStream()),
+            mock.patch.object(sys, "stderr", _AsciiStream()),
+            mock.patch.object(cli_mod.locale, "getpreferredencoding", return_value="ANSI_X3.4-1968"),
+        ):
+            cli_mod._configure_posix_ascii_stdio(env={})
+        self.assertEqual(reconfigured, [("utf-8", "replace"), ("utf-8", "replace")])
+
+        # Respects explicit PYTHONIOENCODING even under ASCII locale
+        reconfigured.clear()
+        with (
+            mock.patch.object(sys, "stdout", _AsciiStream()),
+            mock.patch.object(sys, "stderr", _AsciiStream()),
+            mock.patch.object(cli_mod.locale, "getpreferredencoding", return_value="ANSI_X3.4-1968"),
+        ):
+            cli_mod._configure_posix_ascii_stdio(env={"PYTHONIOENCODING": "ascii"})
+        self.assertEqual(reconfigured, [])
+
+        # Does not override stdio when locale is already UTF-8 (e.g. C.UTF-8)
+        reconfigured.clear()
+        with (
+            mock.patch.object(sys, "stdout", _AsciiStream()),
+            mock.patch.object(sys, "stderr", _AsciiStream()),
+            mock.patch.object(cli_mod.locale, "getpreferredencoding", return_value="UTF-8"),
+        ):
+            cli_mod._configure_posix_ascii_stdio(env={})
+        self.assertEqual(reconfigured, [])
+
+        # Only text business fields are recovered; filesystem path arguments keep surrogateescape intact
+        parsed_hw = cli_mod._build_parser().parse_args(
+            ["hotwords", "add", surrogate_zh, "--config", surrogate_cfg]
+        )
+        cli_mod._recover_parsed_text_args(parsed_hw)
+        self.assertEqual(parsed_hw.terms, ["豆包"])
+        self.assertEqual(parsed_hw.config, surrogate_cfg)
+
+        surrogate_title = "终端 · 中文会话".encode("utf-8").decode("ascii", errors="surrogateescape")
+        surrogate_wav = "/tmp/" + "录音样本".encode("utf-8").decode("ascii", errors="surrogateescape") + ".wav"
+        parsed_once = cli_mod._build_parser().parse_args(
+            ["once", "--file", surrogate_wav, "--title", surrogate_title, "--config", surrogate_cfg]
+        )
+        cli_mod._recover_parsed_text_args(parsed_once)
+        self.assertEqual(parsed_once.title, "终端 · 中文会话")
+        self.assertEqual(parsed_once.wav_file, surrogate_wav)
+        self.assertEqual(parsed_once.config, surrogate_cfg)
+
+        parsed_retry = cli_mod._build_parser().parse_args(
+            ["retry", surrogate_wav, "--title", surrogate_title, "--config", surrogate_cfg]
+        )
+        cli_mod._recover_parsed_text_args(parsed_retry)
+        self.assertEqual(parsed_retry.title, "终端 · 中文会话")
+        self.assertEqual(parsed_retry.target, surrogate_wav)
+        self.assertEqual(parsed_retry.config, surrogate_cfg)
+
+        # 2. Subprocess end-to-end verification under strict non-UTF-8 POSIX C locale + minimal PATH
+        # Uses raw UTF-8 bytes for non-ASCII CLI args & paths so the test itself also passes when
+        # the parent Python process runs under LC_ALL=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home_dir = tmp / "home"
+            rt_dir = tmp / "run"
+            home_dir.mkdir(parents=True)
+            rt_dir.mkdir(parents=True, mode=0o700)
+
+            # Create a non-ASCII UTF-8 directory and config file using bytes paths (safe under ASCII fsencode)
+            cjk_cfg_dir_b = os.path.join(os.fsencode(tmp), "中文配置".encode("utf-8"))
+            os.makedirs(cjk_cfg_dir_b, exist_ok=True)
+            cjk_cfg_path_b = os.path.join(cjk_cfg_dir_b, b"config.toml")
+            hw_path_ascii = tmp / "scoped_hotwords.txt"
+            with open(cjk_cfg_path_b, "wb") as fh:
+                fh.write(f'[asr]\nhotwords_file = "{hw_path_ascii.as_posix()}"\n'.encode("utf-8"))
+
+            c_env = {
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(home_dir),
+                "XDG_CONFIG_HOME": str(home_dir / ".config"),
+                "XDG_CACHE_HOME": str(tmp / "cache"),
+                "XDG_RUNTIME_DIR": str(rt_dir),
+                "LC_ALL": "C",
+                "LANG": "C",
+                "PYTHONCOERCECLOCALE": "0",
+                "PYTHONUTF8": "0",
+                "PYTHONPATH": str(SRC_DIR),
+            }
+            zh_term_b = "豆包".encode("utf-8")
+
+            def _run(sub: list[str | bytes]) -> subprocess.CompletedProcess[bytes]:
+                return subprocess.run(
+                    [sys.executable, "-m", "agent_voice_input.cli", *sub],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    env=c_env,
+                    timeout=10,
+                    check=False,
+                )
+
+            for sub in (
+                ["--help"],
+                ["--version"],
+                ["init"],
+                ["hotwords", "add", "Codex", "--scope", "coding", "--config", cjk_cfg_path_b],
+                ["hotwords", "add", zh_term_b, "--scope", "global", "--config", cjk_cfg_path_b],
+                ["hotwords", "list", "--config", cjk_cfg_path_b],
+                ["diagnose", "--json", "--config", cjk_cfg_path_b],
+            ):
+                proc = _run(sub)
+                self.assertEqual(
+                    proc.returncode,
+                    0,
+                    f"subcmd={sub!r} failed under LC_ALL=C: stderr={proc.stderr!r} stdout={proc.stdout!r}",
+                )
+
+            list_json = _run(["hotwords", "list", "--json", "--config", cjk_cfg_path_b])
+            self.assertEqual(list_json.returncode, 0, list_json.stderr)
+            payload = json.loads(list_json.stdout.decode("utf-8"))
+            self.assertIn("豆包", payload["scopes"]["global"])
+            self.assertIn("Codex", payload["scopes"]["coding"])
+            self.assertEqual(hw_path_ascii.read_text(encoding="utf-8").count("豆包"), 1)
+
+            rm_proc = _run(["hotwords", "remove", zh_term_b, "--scope", "global", "--config", cjk_cfg_path_b])
+            self.assertEqual(rm_proc.returncode, 0, rm_proc.stderr)
+            list_after = json.loads(
+                _run(["hotwords", "list", "--json", "--config", cjk_cfg_path_b]).stdout.decode("utf-8")
+            )
+            self.assertNotIn("豆包", list_after["scopes"]["global"])
 
 
 if __name__ == "__main__":

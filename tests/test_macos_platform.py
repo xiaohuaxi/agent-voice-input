@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import Any, Callable
 import unittest
 from unittest import mock
 
@@ -2613,13 +2614,19 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             finally:
                 daemon_lost_perm.close()
 
-    @unittest.skipUnless(
-        sys.platform == "darwin"
-        and bool(os.path.isfile("/usr/bin/swiftc") or shutil.which("swiftc"))
-        and check_macos_clt_ready()[0],
-        "macOS swiftc + Xcode Command Line Tools required for native shim compile check",
-    )
+    def _require_macos_swiftc(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("macOS required for native mac_shim.swift test")
+        has_swiftc = bool(os.path.isfile("/usr/bin/swiftc") or shutil.which("swiftc"))
+        clt_ok, clt_err = check_macos_clt_ready()
+        if not has_swiftc or not clt_ok:
+            reason = f"macOS swiftc + Xcode Command Line Tools required (has_swiftc={has_swiftc}, clt={clt_err or 'missing'})"
+            if os.environ.get("AGENT_VOICE_INPUT_CI_NO_SKIP") == "1":
+                self.fail(f"AGENT_VOICE_INPUT_CI_NO_SKIP=1: {reason}")
+            self.skipTest(reason)
+
     def test_real_swiftc_compiles_mac_shim_and_passes_self_check(self) -> None:
+        self._require_macos_swiftc()
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             isolated_env = {
@@ -2656,6 +2663,106 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 aud_st.get("mic_auth"),
                 {"authorized", "denied", "restricted", "not_determined", "unknown"},
             )
+
+    def test_real_swiftc_mac_shim_bridge_headless_smoke(self) -> None:
+        self._require_macos_swiftc()
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            isolated_env = {
+                **os.environ,
+                "HOME": str(tmp),
+                "XDG_CACHE_HOME": str(tmp / "cache"),
+                "AGENT_VOICE_INPUT_CACHE_DIR": str(tmp / "shim_cache"),
+            }
+            bin_path, err = compile_mac_shim(env=isolated_env, cache_dir=tmp / "shim_cache")
+            self.assertEqual(err, "", f"mac_shim.swift failed to compile: {err}")
+            assert bin_path is not None
+
+            proc = subprocess.Popen(
+                [str(bin_path), "--mode", "bridge"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                env=isolated_env,
+            )
+            lines: list[str] = []
+            eof_evt = threading.Event()
+
+            def _reader() -> None:
+                assert proc.stdout is not None
+                try:
+                    for raw in proc.stdout:
+                        lines.append(raw)
+                finally:
+                    eof_evt.set()
+
+            reader_th = threading.Thread(target=_reader, daemon=True)
+            reader_th.start()
+
+            def _wait_for_json(predicate: Callable[[dict[str, Any]], bool], timeout: float = 8.0) -> dict[str, Any]:
+                deadline = time.monotonic() + timeout
+                seen = 0
+                while time.monotonic() < deadline:
+                    while seen < len(lines):
+                        ln = lines[seen].strip()
+                        seen += 1
+                        if not ln:
+                            continue
+                        obj = json.loads(ln)
+                        if isinstance(obj, dict) and predicate(obj):
+                            return obj
+                    if eof_evt.is_set() and seen >= len(lines):
+                        break
+                    time.sleep(0.02)
+                self.fail(f"timed out waiting for bridge JSONL; received lines={lines!r}")
+
+            try:
+                ready = _wait_for_json(lambda m: m.get("event") == "ready")
+                self.assertIsInstance(ready.get("audio_status"), dict)
+                self.assertIn("ui_culture", ready)
+
+                assert proc.stdin is not None
+                for req in (
+                    {"cmd": "ping", "seq_id": 101},
+                    {"cmd": "audio_status", "seq_id": 102},
+                    {"cmd": "fg_window", "seq_id": 103},
+                ):
+                    proc.stdin.write(json.dumps(req) + "\n")
+                proc.stdin.flush()
+
+                ping_rep = _wait_for_json(lambda m: m.get("type") == "reply" and m.get("seq_id") == 101)
+                self.assertTrue(ping_rep.get("ok"))
+                self.assertEqual(ping_rep.get("reply"), "ping")
+                self.assertIsInstance(ping_rep.get("ax_trusted"), bool)
+                self.assertIsInstance(ping_rep.get("audio_status"), dict)
+
+                aud_rep = _wait_for_json(lambda m: m.get("type") == "reply" and m.get("seq_id") == 102)
+                self.assertTrue(aud_rep.get("ok"))
+                self.assertIsInstance(aud_rep.get("audio_status"), dict)
+
+                fg_rep = _wait_for_json(lambda m: m.get("type") == "reply" and m.get("seq_id") == 103)
+                self.assertTrue(fg_rep.get("ok"))
+                self.assertEqual(fg_rep.get("reply"), "fg_window")
+                self.assertIn("process", fg_rep)
+
+                # Closing stdin must trigger graceful bridge exit with code 0 and no zombie.
+                proc.stdin.close()
+                rc = proc.wait(timeout=6.0)
+                stderr_txt = proc.stderr.read() if proc.stderr is not None else ""
+                self.assertEqual(rc, 0, f"bridge did not exit cleanly on stdin EOF: rc={rc}, stderr={stderr_txt!r}")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=3.0)
+                reader_th.join(timeout=2.0)
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
 
     def test_apple_terminal_tab_tty_shim_hwnd_focus_drift_and_daemon_tmux_paste(self) -> None:
         # 1. is_apple_terminal_app & Terminal Automation error summary
