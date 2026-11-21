@@ -3036,13 +3036,13 @@ public static class VoiceWinShim {
                     if (baselinePng[i] != basePng[i])
                         throw new InvalidOperationException("win32 clip check: baseline PNG prefix mismatch at " + i);
                 }
-                lastOwnedSeq = store.SequenceNumber;
             } finally {
                 store.Close();
             }
+            // Win32 CloseClipboard() bumps GetClipboardSequenceNumber() when committing writes;
+            // sample lastOwnedSeq strictly after Close(), matching WriteClipTextCore.
+            lastOwnedSeq = store.SequenceNumber;
 
-            if (store.SequenceNumber != lastOwnedSeq)
-                throw new InvalidOperationException("win32 clip check: external clipboard change detected before transient write");
             if (!WriteClipTextCore(st, store, tempText, true, armFn, stopFn))
                 throw new InvalidOperationException("win32 clip check: transient WriteClipTextCore failed");
             lastOwnedSeq = store.SequenceNumber;
@@ -3058,10 +3058,10 @@ public static class VoiceWinShim {
                     throw new InvalidOperationException("win32 clip check: transient CF_UNICODETEXT mismatch");
                 if (!store.HasFormatWhenOpen(store.FormatAviTransient) || !store.HasFormatWhenOpen(store.FormatExcludeMonitor) || !store.HasFormatWhenOpen(store.FormatCanHistory))
                     throw new InvalidOperationException("win32 clip check: transient exclusion markers missing");
-                lastOwnedSeq = store.SequenceNumber;
             } finally {
                 store.Close();
             }
+            lastOwnedSeq = store.SequenceNumber;
 
             FlushClipRestoreCore(st, store, null, stopFn);
             lastOwnedSeq = store.SequenceNumber;
@@ -3088,10 +3088,10 @@ public static class VoiceWinShim {
                 }
                 if (!store.HasFormatWhenOpen(store.FormatAviRestored))
                     throw new InvalidOperationException("win32 clip check: FormatAviRestored marker missing after restore");
-                lastOwnedSeq = store.SequenceNumber;
             } finally {
                 store.Close();
             }
+            lastOwnedSeq = store.SequenceNumber;
         } finally {
             CancelClipRestoreCore(st, stopFn);
             if (wroteSelfCheck && OpenWin32ClipWithRetry(store)) {

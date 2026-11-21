@@ -394,7 +394,7 @@ class RemoteSshLoopbackE2ETests(unittest.TestCase):
                 ssh_bin=str(fixture.ssh_wrapper),
                 aliases=("loopbox",),
             )
-            remote_cfg = RemoteConfig(enabled=True, hosts={"loopbox": host_cfg})
+            remote_cfg = RemoteConfig(hosts=(host_cfg,))
             client_env = {
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "HOME": str(fixture.client_home),
