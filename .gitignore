@@ -34,3 +34,6 @@ venv/
 *.flac
 recordings/
 telemetry.jsonl
+
+# Local model benchmark notes (not committed yet)
+docs/benchmarks/
