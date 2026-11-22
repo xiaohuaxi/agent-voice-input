@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security Vulnerability (Private Advisory)
+    url: https://github.com/xiaohuaxi/agent-voice-input/security/advisories/new
+    about: Please report security vulnerabilities privately via GitHub Security Advisories instead of opening a public issue.
+  - name: Documentation & Setup Guide
+    url: https://github.com/xiaohuaxi/agent-voice-input#readme
+    about: Browse setup instructions, provider configuration recipes, and troubleshooting guides.

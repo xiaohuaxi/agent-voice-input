@@ -30,6 +30,7 @@ from agent_voice_input.config import (  # noqa: E402
     Config,
     ConfigError,
     CredentialItem,
+    HotkeyConfig,
     ProviderCredentials,
     RefinerConfig,
     _parse_simple_toml,
@@ -995,6 +996,230 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 self.assertEqual(sse_models, ["gpt-6-luna", "gpt-5.4-mini"])
             finally:
                 ref_sse_fb.close()
+
+    def test_v100_doctor_agy_hooks_init_templates_and_start_readiness_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            home.mkdir(mode=0o700)
+            rt.mkdir(mode=0o700)
+            env_base = {"HOME": str(home), "PATH": "", "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
+
+            # 1. _inspect_hook_summary detects ~/.gemini/hooks.json, keeps ~/.gemini/settings.json fallback,
+            #    and deduplicates gemini/agy when both files contain session-hook.
+            self.assertEqual(
+                cli_mod._inspect_hook_summary(env_base, rt),
+                "hooks=none configured (optional), active_registry_entries=0",
+            )
+            gemini_dir = home / ".gemini"
+            gemini_dir.mkdir(mode=0o700)
+            hooks_json = gemini_dir / "hooks.json"
+            settings_json = gemini_dir / "settings.json"
+            hooks_json.write_text(
+                '{"voice-session-title":{"SessionStart":[{"command":"agent-voice-input session-hook --cli agy"}]}}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                cli_mod._inspect_hook_summary(env_base, rt),
+                "hooks=gemini/agy, active_registry_entries=0",
+            )
+            settings_json.write_text(
+                '{"hooks":{"SessionStart":[{"command":"agent-voice-input session-hook --cli gemini"}]}}\n',
+                encoding="utf-8",
+            )
+            both_summary = cli_mod._inspect_hook_summary(env_base, rt)
+            self.assertEqual(both_summary, "hooks=gemini/agy, active_registry_entries=0")
+            self.assertEqual(both_summary.count("gemini/agy"), 1)
+
+            hooks_json.unlink()
+            self.assertEqual(
+                cli_mod._inspect_hook_summary(env_base, rt),
+                "hooks=gemini/agy, active_registry_entries=0",
+            )
+
+            claude_dir = home / ".claude"
+            claude_dir.mkdir(mode=0o700)
+            (claude_dir / "settings.json").write_text(
+                '{"hooks":{"SessionStart":[{"hooks":[{"command":"agent-voice-input session-hook --cli claude"}]}]}}\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                cli_mod._inspect_hook_summary(env_base, rt),
+                "hooks=claude, gemini/agy, active_registry_entries=0",
+            )
+
+            # 2. Init template two-stage split, MacBook hotkey note, and next-step guidance
+            out_init = io.StringIO()
+            with mock.patch("sys.stdout", out_init):
+                self.assertEqual(cli_mod._cmd_init(env=env_base, home_dir=home), 0)
+            init_txt = out_init.getvalue()
+            self.assertIn("Stage 1", init_txt)
+            for key_name in (
+                "DASHSCOPE_API_KEY",
+                "OPENAI_API_KEY",
+                "GROQ_API_KEY",
+                "OPENROUTER_API_KEY",
+                "GEMINI_API_KEY",
+            ):
+                self.assertIn(key_name, init_txt)
+
+            gen_toml = (home / ".config" / "agent-voice-input" / "config.toml").read_text(encoding="utf-8")
+            gen_env = (home / ".config" / "agent-voice-input" / "agent-voice-input.env").read_text(encoding="utf-8")
+            self.assertIn('key = "RControl"', gen_toml)
+            self.assertIn("MacBook", gen_toml)
+            self.assertIn("ROption", gen_toml)
+            self.assertIn("Stage 1: Speech Recognition (REQUIRED", gen_env)
+            self.assertIn("Stage 2 Only: Optional Refiner", gen_env)
+            self.assertIn("codex login", gen_env)
+            self.assertEqual(parse_env_text(gen_env), {})
+            example_toml = (_REPO_ROOT / "config.example.toml").read_text(encoding="utf-8")
+            example_env = (_REPO_ROOT / "config.example.env").read_text(encoding="utf-8")
+            self.assertIn("MacBook", example_toml)
+            self.assertIn("Stage 1: Speech Recognition (REQUIRED", example_env)
+            self.assertIn("Stage 2 Only: Optional Refiner", example_env)
+
+            # 3. _cmd_start emits explicit WARN when asr_ready==False and mode-accurate Ready hint when asr_ready==True
+            parser = cli_mod._build_parser()
+
+            class _LiveProc:
+                pid = 42424
+                returncode = None
+
+                def poll(self) -> None:
+                    return None
+
+            def _run_fresh_start(cfg_in: Config, env_in: dict[str, str]) -> str:
+                calls = [0]
+
+                def _ctrl(_rt: Path, _req: dict[str, object], timeout_sec: float = 1.0) -> dict[str, object]:
+                    calls[0] += 1
+                    if calls[0] == 1:
+                        raise ConnectionRefusedError("not running")
+                    return {"ok": True, "pid": 42424, "state": "idle", "shim_ok": True}
+
+                buf = io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.daemon.send_control_command", side_effect=_ctrl),
+                    mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
+                    mock.patch("sys.stdout", buf),
+                ):
+                    rc = cli_mod._cmd_start(parser.parse_args(["start"]), env_in, cfg=cfg_in)
+                self.assertEqual(rc, 0)
+                return buf.getvalue()
+
+            # Stage 2-only key (DEEPSEEK_API_KEY) leaves asr_ready==False -> explicit WARN
+            out_no_asr = _run_fresh_start(
+                Config(),
+                {**env_base, "DEEPSEEK_API_KEY": "ds_only_stage2_test_key"},
+            )
+            self.assertIn("started (pid=42424)", out_no_asr)
+            self.assertIn(
+                "WARN: no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
+                out_no_asr,
+            )
+            self.assertNotIn("Ready:", out_no_asr)
+
+            # Stage 1 key ready + default tap_toggle
+            env_ready = {**env_base, "DASHSCOPE_API_KEY": "sk-dash-ready-test-key"}
+            out_tap = _run_fresh_start(Config(), env_ready)
+            self.assertIn("started (pid=42424)", out_tap)
+            self.assertIn(
+                "Ready: tap RControl to start/stop recording (hold 0.8s to cancel)",
+                out_tap,
+            )
+            self.assertNotIn("WARN: no Stage 1 ASR key", out_tap)
+
+            # Stage 1 key ready + ptt mode with custom hotkey
+            out_ptt = _run_fresh_start(
+                Config(hotkey=HotkeyConfig(key="ROption", trigger_mode="ptt")),
+                env_ready,
+            )
+            self.assertIn(
+                "Ready: hold ROption to speak, release to transcribe (press another key to cancel)",
+                out_ptt,
+            )
+
+            # Stage 1 key ready + tap_toggle with hold_cancel_ms=0 (hold-cancel disabled)
+            out_no_hc = _run_fresh_start(
+                Config(hotkey=HotkeyConfig(key="Fn", trigger_mode="tap_toggle", hold_cancel_ms=0)),
+                env_ready,
+            )
+            self.assertIn("Ready: tap Fn to start/stop recording", out_no_hc)
+            self.assertNotIn("hold", out_no_hc)
+
+            # Degraded CLI-only mode (shim_ok=False): MUST NOT print hotkey Ready line
+            def _run_degraded_start(cfg_in: Config, env_in: dict[str, str]) -> str:
+                calls = [0]
+
+                def _ctrl(_rt: Path, _req: dict[str, object], timeout_sec: float = 1.0) -> dict[str, object]:
+                    calls[0] += 1
+                    if calls[0] == 1:
+                        raise ConnectionRefusedError("not running")
+                    return {
+                        "ok": True,
+                        "pid": 42424,
+                        "state": "idle",
+                        "shim_ok": False,
+                        "shim_error": "native helper unavailable",
+                    }
+
+                buf = io.StringIO()
+                err_buf = io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.daemon.send_control_command", side_effect=_ctrl),
+                    mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
+                    mock.patch("sys.stdout", buf),
+                    mock.patch("sys.stderr", err_buf),
+                ):
+                    rc = cli_mod._cmd_start(parser.parse_args(["start"]), env_in, cfg=cfg_in)
+                self.assertEqual(rc, 0)
+                return buf.getvalue()
+
+            out_degraded = _run_degraded_start(Config(), env_ready)
+            self.assertIn("started (pid=42424)", out_degraded)
+            self.assertNotIn("Ready:", out_degraded)
+
+            # Socket warming-up timeout: MUST NOT print hotkey Ready line when ASR is ready,
+            # while missing Stage 1 ASR key WARN still prints independently.
+            def _run_warming_up_start(cfg_in: Config, env_in: dict[str, str]) -> str:
+                mono_vals = iter([0.0, 0.5, 11.0])
+
+                def _fake_mono() -> float:
+                    return next(mono_vals, 11.0)
+
+                buf = io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch(
+                        "agent_voice_input.daemon.send_control_command",
+                        side_effect=ConnectionRefusedError("not ready yet"),
+                    ),
+                    mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
+                    mock.patch.object(cli_mod.time, "monotonic", side_effect=_fake_mono),
+                    mock.patch.object(cli_mod.time, "sleep", return_value=None),
+                    mock.patch("sys.stdout", buf),
+                ):
+                    rc = cli_mod._cmd_start(parser.parse_args(["start"]), env_in, cfg=cfg_in)
+                self.assertEqual(rc, 0)
+                return buf.getvalue()
+
+            out_warm_ready = _run_warming_up_start(Config(), env_ready)
+            self.assertIn("started process pid=42424 (socket warming up)", out_warm_ready)
+            self.assertNotIn("Ready:", out_warm_ready)
+
+            out_warm_no_asr = _run_warming_up_start(
+                Config(),
+                {**env_base, "DEEPSEEK_API_KEY": "ds_only_stage2_test_key"},
+            )
+            self.assertIn("started process pid=42424 (socket warming up)", out_warm_no_asr)
+            self.assertIn(
+                "WARN: no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
+                out_warm_no_asr,
+            )
+            self.assertNotIn("Ready:", out_warm_no_asr)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,42 @@
+name: Feature Request
+description: Propose a new feature, provider integration, or workflow improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What workflow friction or missing capability are you trying to solve?
+      placeholder: E.g., When using <terminal/editor/provider>, I would like...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, CLI flag, or configuration option you envision.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Affected platform(s)
+      multiple: true
+      options:
+        - macOS
+        - Windows + WSL2
+        - Native Linux / Remote SSH
+        - All platforms
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered / additional context
+      description: Mention any workarounds, related providers/docs, or tradeoffs to keep in mind.
+    validations:
+      required: false

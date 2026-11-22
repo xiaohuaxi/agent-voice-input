@@ -7,6 +7,7 @@
 # Global hotkey:
 # - Windows/WSL2: RControl (default Right Ctrl, 0xA3) | RAlt | RShift | CapsLock | F1..F24 | 0xNN
 # - macOS: RControl (default Right Ctrl, 0x3E / NX_DEVICERCTLKEYMASK) | LControl | ROption/RAlt | RCommand | Fn | F1..F20 | 0xNN
+#   (Note: MacBook built-in keyboards lack a Right Ctrl key — macOS laptop users can set "ROption" or "Fn")
 key = "RControl"
 # Trigger mode:
 # - "tap_toggle": isolated short tap (<= tap_max_ms) toggles recording start/stop (or starts a back-to-back recording while refining);

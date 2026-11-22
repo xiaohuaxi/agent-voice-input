@@ -1,0 +1,90 @@
+name: Bug Report
+description: Report a bug, unexpected behavior, or platform compatibility issue
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please include the diagnostic outputs below so we can reproduce and fix the issue quickly.
+
+        > **Privacy reminder:** `agent-voice-input doctor` and `agent-voice-input diagnose` automatically redact configured secrets, **but never paste your `.env` file, API keys, OAuth tokens, or private audio recordings manually.**
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Briefly describe the bug and what you expected to happen instead.
+      placeholder: E.g., Tapping ROption on macOS starts recording, but no text is pasted into Ghostty...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to trigger the issue.
+      placeholder: |
+        1. Run `agent-voice-input start`
+        2. Focus terminal / app ...
+        3. Press hotkey ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: OS / Platform
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows 11 + WSL2
+        - Windows 10 + WSL2
+        - Native Linux / Remote SSH
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: app_terminal
+    attributes:
+      label: Terminal / Target Application
+      description: Which terminal, IDE, or desktop app was focused (and whether tmux / SSH was involved)?
+      placeholder: E.g., Ghostty + tmux + Codex CLI, Windows Terminal + WSL2 + Claude Code, VS Code, Slack
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: "`agent-voice-input --version`"
+      description: Output of `agent-voice-input --version` (plus Python version if known).
+      placeholder: "agent-voice-input 1.0.0 (Python 3.12)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor_output
+    attributes:
+      label: "`agent-voice-input doctor` output"
+      description: Run `agent-voice-input doctor` (or `doctor --ping`) and paste the output. Secrets are redacted automatically — please still double-check before submitting.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnose_output
+    attributes:
+      label: "`agent-voice-input diagnose --last 5` output"
+      description: Optional but very helpful for latency, fallback, cache-miss, or delivery bugs. Secrets and spoken text are omitted/redacted automatically.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: privacy_check
+    attributes:
+      label: Privacy & Redaction Check
+      options:
+        - label: I confirmed I did not paste any raw `.env` file contents or unredacted API keys/tokens.
+          required: true

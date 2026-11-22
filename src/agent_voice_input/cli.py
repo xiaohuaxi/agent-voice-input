@@ -17,7 +17,8 @@ _INIT_CONFIG_TOML = """\
 # Priority: CLI flags > config.toml > built-in defaults
 
 [hotkey]
-# Default Right Ctrl ("RControl"); also supports "RAlt", "Fn" (macOS), "F13".."F20", etc.
+# Default Right Ctrl ("RControl"); also supports "ROption"/"RAlt", "Fn" (macOS), "F13".."F20", etc.
+# Note: MacBook built-in keyboards lack a Right Ctrl key — macOS laptop users can switch to "ROption" or "Fn".
 key = "RControl"
 # "tap_toggle" (tap to start/finish) | "ptt" (hold to speak, release to transcribe)
 trigger_mode = "tap_toggle"
@@ -33,13 +34,20 @@ provider = "auto"
 
 _INIT_ENV_TEMPLATE = """\
 # agent-voice-input API credentials (chmod 600)
-# Uncomment and fill in AT LEAST ONE provider key below:
+# For cloud ASR, uncomment and fill in AT LEAST ONE Stage 1 speech recognition key below
+# (local loopback openai-compatible ASR endpoints need no API key):
+
+# === Stage 1: Speech Recognition (REQUIRED for cloud ASR — uncomment at least one; local loopback openai-compatible ASR needs no key) ===
+# (DashScope, OpenAI, Groq, OpenRouter, Gemini, and SiliconFlow can also handle Stage 2 refinement)
 
 # Alibaba Cloud Bailian / DashScope (Stage 1 qwen3-asr-flash + Stage 2 qwen3.8-flash, or single-hop qwen3.8-omni-flash)
 # DASHSCOPE_API_KEY="sk-..."
 
-# DeepSeek official API (fast Stage 2 refiner: deepseek-flash)
-# DEEPSEEK_API_KEY="sk-..."
+# OpenAI (Stage 1 gpt-4o-mini-transcribe + Stage 2 gpt-4o-mini)
+# OPENAI_API_KEY="sk-..."
+
+# Groq Cloud (fast Stage 1 whisper-large-v3-turbo + Stage 2 llama-3.3-70b-versatile)
+# GROQ_API_KEY="gsk_..."
 
 # OpenRouter (single key for Stage 1 ASR + Stage 2 Refiner)
 # OPENROUTER_API_KEY="sk-or-..."
@@ -53,13 +61,20 @@ _INIT_ENV_TEMPLATE = """\
 # DOUBAO_ASR_APP_ID="..."
 # DOUBAO_ASR_API_KEY="..."
 
+# SiliconFlow (Stage 1 SenseVoiceSmall + Stage 2 Refiner)
+# SILICONFLOW_API_KEY="sk-..."
+
+# === Stage 2 Only: Optional Refiner (pair with a Stage 1 key above) ===
+# Note: Setting ONLY a Stage 2 key below cannot transcribe speech on its own.
+# Local Codex CLI login (`codex login`, auto-detected) or Antigravity CLI (`refiner.provider = "agy"`)
+# can also reuse your existing CLI login for Stage 2 refinement when paired with Stage 1 ASR
+# (billing depends on your CLI auth mode, e.g., subscription login vs. API key).
+
+# DeepSeek official API (fast Stage 2 refiner: deepseek-flash)
+# DEEPSEEK_API_KEY="sk-..."
+
 # Volcengine Ark (Stage 2 Refiner: doubao-seed-2-0-mini-260428)
 # ARK_API_KEY="..."
-
-# OpenAI / Groq / SiliconFlow
-# OPENAI_API_KEY="sk-..."
-# GROQ_API_KEY="gsk_..."
-# SILICONFLOW_API_KEY="sk-..."
 """
 
 _MACOS_MODIFIER_HOTKEYS = frozenset(
@@ -349,7 +364,9 @@ def _cmd_init(
     cfg_flag = f" --config {shlex.quote(cli_cfg_str)}" if cli_cfg_str else ""
     print(
         "\nNext steps:\n"
-        f"  1. Add at least one API key in {env_path} (e.g. DASHSCOPE_API_KEY or GEMINI_API_KEY)\n"
+        f"  1. For cloud ASR, add at least one Stage 1 speech recognition API key in {env_path}\n"
+        "     (e.g. DASHSCOPE_API_KEY / OPENAI_API_KEY / GROQ_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY;\n"
+        "      local loopback openai-compatible ASR endpoints need no key)\n"
         f"  2. Verify setup:  agent-voice-input doctor{cfg_flag} --ping\n"
         f"  3. Start daemon:  agent-voice-input start{cfg_flag}"
     )
@@ -571,17 +588,19 @@ def _inspect_hook_summary(env: Mapping[str, str], rt_dir: Path) -> str:
     from .config import expand_user_path
 
     configured: list[str] = []
-    for label, rel in (
-        ("claude", "~/.claude/settings.json"),
-        ("gemini/agy", "~/.gemini/settings.json"),
+    for label, rels in (
+        ("claude", ("~/.claude/settings.json",)),
+        ("gemini/agy", ("~/.gemini/hooks.json", "~/.gemini/settings.json")),
     ):
-        p = expand_user_path(rel, env=env)
-        try:
-            if p.is_file() and not p.is_symlink() and p.stat().st_size <= 524_288:
-                if "session-hook" in p.read_text(encoding="utf-8", errors="ignore"):
-                    configured.append(label)
-        except OSError:
-            continue
+        for rel in rels:
+            p = expand_user_path(rel, env=env)
+            try:
+                if p.is_file() and not p.is_symlink() and p.stat().st_size <= 524_288:
+                    if "session-hook" in p.read_text(encoding="utf-8", errors="ignore"):
+                        configured.append(label)
+                        break
+            except OSError:
+                continue
     active_reg = 0
     sdir = rt_dir / "sessions"
     try:
@@ -1507,6 +1526,27 @@ def _pipeline_from_legacy_daemon_status(st: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
+def _format_start_readiness_line(
+    cfg: Config,
+    *,
+    asr_ready: bool,
+    hotkey_ready: bool = True,
+) -> str | None:
+    if not asr_ready:
+        return "WARN: no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating"
+    if not hotkey_ready:
+        return None
+    hotkey = (cfg.hotkey.key or "RControl").strip() or "RControl"
+    mode = (cfg.hotkey.trigger_mode or "tap_toggle").strip().lower()
+    if mode == "ptt":
+        return f"Ready: hold {hotkey} to speak, release to transcribe (press another key to cancel)"
+    hc_ms = cfg.hotkey.effective_hold_cancel_ms()
+    if hc_ms > 0:
+        sec_str = f"{round(hc_ms / 1000.0, 2):g}s"
+        return f"Ready: tap {hotkey} to start/stop recording (hold {sec_str} to cancel)"
+    return f"Ready: tap {hotkey} to start/stop recording"
+
+
 def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | None = None) -> int:
     from .config import (
         explain_pipeline_selection,
@@ -1525,10 +1565,11 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
     rt_dir = get_runtime_dir(env, create=True)
     has_overrides = any(getattr(args, attr, None) for _, attr in _CLI_OVERRIDE_FLAGS)
     pipeline_summary = ""
+    asr_ready: bool | None = None
     if cfg is not None:
-        pipeline_summary = str(
-            explain_pipeline_selection(cfg, resolve_credentials(cfg, env), env)["summary"]
-        )
+        pipe_info = explain_pipeline_selection(cfg, resolve_credentials(cfg, env), env)
+        pipeline_summary = str(pipe_info["summary"])
+        asr_ready = bool(pipe_info["asr"]["ready"])
     st = probe_daemon_status(rt_dir, timeout_sec=1.0)
     if st.get("ok"):
         _warn_degraded_shim(st)
@@ -1671,12 +1712,26 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
                 print(f"started (pid={st.get('pid')})")
                 if pipeline_summary:
                     print(f"[pipeline]  {pipeline_summary}")
+                if cfg is not None and asr_ready is not None:
+                    if readiness_line := _format_start_readiness_line(
+                        cfg,
+                        asr_ready=asr_ready,
+                        hotkey_ready=st.get("shim_ok") is True,
+                    ):
+                        print(readiness_line)
                 return 0
         except Exception:
             time.sleep(0.15)
     print(f"started process pid={proc.pid} (socket warming up)")
     if pipeline_summary:
         print(f"[pipeline]  {pipeline_summary}")
+    if cfg is not None and asr_ready is not None:
+        if readiness_line := _format_start_readiness_line(
+            cfg,
+            asr_ready=asr_ready,
+            hotkey_ready=False,
+        ):
+            print(readiness_line)
     return 0
 
 
