@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-23
+
+### Added
+- **Explicit Antigravity CLI subscription refiner (`refiner.provider = "agy"`)**: Added opt-in `agy` Stage 2 refiner backed by a resident, idle-reaped single `agy acp` worker reusing isolated tool-free plain-text sessions across turns with incremental prefix continuation (not auto-selected by `refiner.provider = "auto"`), along with `SessionTracker` self-contamination exclusion so refiner ACP sessions never pollute active dictation context.
+- **HTTP/HTTPS proxy Keep-Alive connection pooling**: Upgraded `_KeepAlivePool` in `http_transport.py` to pool persistent HTTP/1.1 `CONNECT` tunnels over `http://` proxies and single-layer TLS proxy connections, stripping/redacting caller `Proxy-Authorization` headers and failing closed on unsafe or malformed proxy URLs—significantly cutting cross-region and proxied API round-trip latency.
+- **Expanded multi-OS CI matrix & real loopback E2E**: Extended GitHub Actions CI across Python `3.10–3.14` with clean wheel installation smoke tests on Linux/macOS/Windows, real `sshd` loopback remote-probing tests, multi-process daemon lifecycle E2E, and Win32 clipboard sequence verification.
+
+### Changed
+- **Standardized single-header `DOUBAO_SPEECH_API_KEY`, flash-first fallback & polling tuning**: Standardized `DOUBAO_SPEECH_API_KEY` for single-header (`X-Api-Key`) Doubao Speech auth without requiring `APP_ID` (retaining legacy `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` compatibility), switched Doubao ASR internal routing to prefer the low-latency flash slot (`volc.bigasr.auc_turbo`) with cached fallback to Doubao 2.0 standard (`volc.seedasr.auc`), and tuned Doubao 2.0 asynchronous `/query` polling backoff.
+- **Refiner prompt & cross-platform context refinements**: Tightened anti-over-edit prompt guidance to avoid superfluous editorial comments or rewrites; anchored the macOS HUD capsule to the active focused window on multi-display setups; filtered built-in CJK hotwords for non-Chinese locales; added Eternal Terminal (`et`) remote SSH command recognition; and hardened POSIX `LC_ALL=C` strict ASCII locale compatibility.
+
+### Fixed
+- **Dictation, delivery & storage reliability hardening**: Guarded multi-chunk ASR against silent dropped-chunk data loss, fixed a Windows `rec_stop` race that could block recording completion, enabled proactive `24h` TTL cleanup for `failed/` audio snapshots, added graceful fallback when `hotwords.txt` contains invalid text encodings, unified the 4-state HUD / telemetry / `diagnose` delivery contract, and resolved macOS `/var` symlink path comparisons in tests.
+
 ## [0.11.0] - 2026-11-21
 
 ### Added
@@ -137,7 +151,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Initial WSL2 release**: Two-stage context-aware voice input daemon and CLI for coding agents (**Codex**, **Claude Code**, **AGY**) on Windows + WSL2, featuring native `win_shim.ps1` WASAPI capture, global hotkey & HUD bridge, active terminal session discovery, `ffmpeg` loudness normalization with local silence gating, and safe paste without auto-pressing `Enter`.
 
-[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.9.0...v0.9.1

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-voice-input"
-version = "0.11.0"
+version = "0.12.0"
 description = "Two-stage context-aware voice input for CLI coding agents."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,6 +29,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: User Interfaces",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]

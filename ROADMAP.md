@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前已发布基线**：`v0.11.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
+> **当前已发布基线**：`v0.12.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
 >
 > **工程规范与上下文路由架构**：[AGENTS.md](AGENTS.md) · [docs/context-routing.md](docs/context-routing.md)
 
@@ -50,7 +50,22 @@
 
 ---
 
-### 最新发版里程碑（`已发布 · v0.11.0`）
+### 最新发版里程碑（`已发布 · v0.12.0`）
+
+以下本地 `agy` 订阅精修、代理连接池复用、录音投递可靠性与全平台 CI 加固能力已在 `v0.12.0` 完成落地并正式发布：
+
+1. **显式 `refiner.provider = "agy"` 本地订阅精修渠道**：
+   - 支持显式配置复用本机 Antigravity CLI（常驻、空闲自动回收的单 `agy acp` worker）执行无工具纯文本隔离精修与跨轮增量续接（不参与 `auto` 自动选路），并在 `SessionTracker` 中排除精修自身会话防上下文自污染；同步收紧精修提示词防多余注释改写。
+2. **HTTP/HTTPS 代理 Keep-Alive 连接池复用**：
+   - 在 `http_transport.py` 中实现 `CONNECT` HTTP/1.1 隧道复用与单层 TLS 代理连接池，剥离并脱敏调用方 `Proxy-Authorization`，对不安全/畸形代理配置 fail-closed，大幅降低跨境及代理链路单次往返耗时。
+3. **录音/投递可靠性与跨平台细节加固**：
+   - 补齐多块 ASR 静默丢块保护、Windows `rec_stop` 竞态防阻塞、`failed/` 24h TTL 主动清理、`hotwords.txt` 异常编码优雅降级与统一 4 态 HUD/遥测/诊断契约；
+   - 新增 macOS 多屏聚焦窗口 HUD 锚定、非中文内建热词语言过滤、Eternal Terminal（`et`）远端识别、`DOUBAO_SPEECH_API_KEY` 统一单头凭据、豆包极速优先回退链与异步轮询退避优化及 POSIX `LC_ALL=C` 严格 ASCII locale 兼容；
+   - CI 矩阵扩展至 Python 3.10–3.14、三端 clean wheel 冒烟与真实 `sshd`/多进程 daemon 环回 E2E。
+
+---
+
+### 已归档里程碑（`已发布 · v0.11.0`）
 
 以下三项上下文冷启动、热词管理与跨周长稳自愈能力已在 `v0.11.0` 完成落地并正式发布：
 
@@ -110,13 +125,12 @@
 #### 后续演进方向（`演进中`）
 
 1. **本地 CLI 订阅精修渠道**：
-   - `refiner.provider = "agy"`（`开发中`）：显式复用本机 Antigravity CLI（`agy acp`）无工具纯文本隔离会话与增量续接前缀缓存，不参与 `auto` 自动选路；
-   - `refiner.provider = "claude"`（`规划中`）：待本机 Claude Code 环境就绪后实测落地无工具精修渠道。
+   - `refiner.provider = "claude"`（`规划中`）：待本机 Claude Code 环境就绪后实测落地无工具精修渠道（`agy` 已于 `v0.12.0` 正式发布）。
 2. **真录音模型横评与原生 Gemini 单跳定向补测**：依托仓外隔离时间点回放基线，系统开展主流 ASR / 精修组合的真录音横向对比评测与原生 Gemini 单跳路径定向补测。
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
 
-`v1.0` 不预设硬性时间表，待 `v0.10.0` 与 `v0.11.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
+`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.12.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
 
 1. **外部用户零门槛开箱**：仅配置任意单一支持语音转写的主流渠道 API Key（可自动搭配本地 CLI 登录态或独立二阶段凭据），即可通过 `init` 与 `doctor --ping` 完成体检并稳定投入日常使用。
 2. **全场景安全投递与零串台**：本地终端、跨机 SSH 远端 Linux、主流桌面 IDE、普通桌面 GUI 应用与远程桌面自动让行均长期稳定运行；跨场景上下文严格隔离，系统剪贴板零意外污染，全链路严守不自动发送回车。
