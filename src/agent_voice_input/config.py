@@ -56,6 +56,7 @@ VALID_REFINER_PROVIDERS = frozenset(
     {
         "auto",
         "codex",
+        "agy",
         "deepseek",
         "dashscope",
         "volcengine",
@@ -120,6 +121,7 @@ DEFAULT_ASR_MODELS: dict[str, str] = {
 
 DEFAULT_REFINER_MODELS: dict[str, str] = {
     "codex": "gpt-6-luna",
+    "agy": "gemini-3.8-flash",
     "deepseek": "deepseek-flash",
     "dashscope": "qwen3.8-flash",
     "volcengine": "doubao-seed-2-0-mini-260428",
@@ -132,6 +134,7 @@ DEFAULT_REFINER_MODELS: dict[str, str] = {
 
 DEFAULT_REFINER_EFFORTS: dict[str, str] = {
     "codex": "low",
+    "agy": "low",
     "openai": "low",
 }
 
@@ -490,6 +493,7 @@ class RefinerConfig:
     max_retries: int = 2
     force_on_single_hop: bool = False
     _model_explicit: bool = field(default=False, init=False, repr=False, compare=False)
+    _effort_explicit: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         raw_p = self.provider.strip().lower() if isinstance(self.provider, str) else ""
@@ -500,6 +504,7 @@ class RefinerConfig:
         if prov and prov in REFINER_PROVIDER_ALIASES.values() and raw_p in REFINER_PROVIDER_ALIASES:
             self.provider = prov
         self._model_explicit = bool(self.model and self.model.strip())
+        self._effort_explicit = bool(self.effort and self.effort.strip())
         if prov not in ("auto", "off"):
             if not self.model or not self.model.strip():
                 self.model = DEFAULT_REFINER_MODELS.get(prov, "")
@@ -515,6 +520,16 @@ class RefinerConfig:
         raw_p = (resolved_provider or self.provider).strip().lower()
         prov = REFINER_PROVIDER_ALIASES.get(raw_p, raw_p)
         return m != DEFAULT_REFINER_MODELS.get(prov, "")
+
+    def has_explicit_effort(self, resolved_provider: str | None = None) -> bool:
+        e = (self.effort or "").strip().lower()
+        if not e:
+            return False
+        if self._effort_explicit:
+            return True
+        raw_p = (resolved_provider or self.provider).strip().lower()
+        prov = REFINER_PROVIDER_ALIASES.get(raw_p, raw_p)
+        return e != DEFAULT_REFINER_EFFORTS.get(prov, "auto")
 
     def effective_model(self, resolved_provider: str | None = None) -> str:
         if self.model and self.model.strip():
@@ -568,6 +583,13 @@ class RefinerConfig:
                     "(uses stateless 'responses' API; keep refiner.api='auto' or 'responses')"
                 )
             return "responses"
+        if prov == "agy":
+            if req_api != "auto":
+                raise ConfigError(
+                    f"refiner.api={req_api!r} is incompatible with provider 'agy' "
+                    "(uses local 'agy acp' stdio JSON-RPC; keep refiner.api='auto')"
+                )
+            return "agy-acp"
         if req_api == "auto":
             return "chat-completions"
         return req_api
@@ -1870,6 +1892,7 @@ def _apply_refiner_section(cfg: Config, ref: Any) -> None:
             cfg.refiner.api = _as_str(v, "refiner.api").strip().lower()
         elif k == "effort":
             cfg.refiner.effort = _as_str(v, "refiner.effort").strip().lower()
+            cfg.refiner._effort_explicit = bool(cfg.refiner.effort)
         elif k == "prompt":
             cfg.refiner.prompt = _as_str(v, "refiner.prompt")
         elif k == "include_git_status":
@@ -1903,6 +1926,7 @@ def _apply_refiner_section(cfg: Config, ref: Any) -> None:
         if not has_explicit_ref_api:
             cfg.refiner.api = "auto"
         if not has_explicit_ref_effort:
+            cfg.refiner._effort_explicit = False
             cfg.refiner.effort = (
                 ""
                 if cfg.refiner.provider in ("auto", "off")
@@ -2656,6 +2680,42 @@ def find_codex_bin(env: Mapping[str, str] | None = None) -> str | None:
     return next((str(p) for p in cands if p.is_file() and os.access(str(p), os.X_OK)), None)
 
 
+def find_agy_bin(env: Mapping[str, str] | None = None) -> str | None:
+    explicit = env is not None and env is not os.environ
+    src = os.environ if env is None else env
+    src_home = (src.get("HOME") or "").strip()
+    if raw_ab := (src.get("AGY_BIN") or "").strip():
+        if explicit and raw_ab.startswith("~") and (not src_home or _is_other_user_tilde(raw_ab)):
+            return None
+        ab_path = expand_user_path(raw_ab, env=src)
+        if ab_path.is_file() and os.access(str(ab_path), os.X_OK):
+            return os.path.abspath(str(ab_path))
+    hermetic = is_hermetic_env(env)
+    raw_path = src.get("PATH")
+    if raw_path is not None:
+        if raw_path and (found := shutil.which("agy", path=raw_path)):
+            return os.path.abspath(found)
+    elif not hermetic:
+        if found := shutil.which("agy"):
+            return os.path.abspath(found)
+    if hermetic and not src_home:
+        return None
+    home = expand_user_path("~", env=src)
+    cands: list[Path] = [home / ".local/bin/agy"]
+    if not hermetic:
+        cands.extend(
+            (
+                Path("/opt/homebrew/bin/agy"),
+                Path("/usr/local/bin/agy"),
+                Path("/opt/local/bin/agy"),
+            )
+        )
+    return next(
+        (os.path.abspath(str(p)) for p in cands if p.is_file() and os.access(str(p), os.X_OK)),
+        None,
+    )
+
+
 def classify_codex_auth_json(
     data: Mapping[str, Any],
     env: Mapping[str, str] | None = None,
@@ -3006,6 +3066,14 @@ def explain_pipeline_selection(
         )
         ref_ready = codex_ready
         ref_cred_src = "Codex API key" if codex_mode == "api_key" else "local Codex login"
+    elif resolved_ref == "agy":
+        eff_ref_model = cfg.refiner.effective_model("agy")
+        eff_ref_api = cfg.refiner.effective_api("agy")
+        eff_ref_effort = cfg.refiner.effective_effort("agy")
+        eff_ref_url = ""
+        agy_bin = find_agy_bin(env)
+        ref_ready = bool(agy_bin)
+        ref_cred_src = agy_bin or ""
     else:
         eff_ref_model = cfg.refiner.effective_model(resolved_ref)
         eff_ref_api = cfg.refiner.effective_api(resolved_ref)
@@ -3031,11 +3099,16 @@ def explain_pipeline_selection(
     elif ref_bypassed:
         ref_reason = "bypassed (single-hop ASR passthrough)"
     elif raw_ref_prov != "auto":
-        ref_reason = (
-            "explicit refiner.provider=codex (API key billing)"
-            if (resolved_ref == "codex" and codex_mode == "api_key")
-            else f"explicit refiner.provider={resolved_ref}"
-        )
+        if resolved_ref == "codex" and codex_mode == "api_key":
+            ref_reason = "explicit refiner.provider=codex (API key billing)"
+        elif resolved_ref == "agy":
+            ref_reason = (
+                f"explicit refiner.provider=agy ({ref_cred_src})"
+                if ref_ready
+                else "explicit refiner.provider=agy (agy CLI not found)"
+            )
+        else:
+            ref_reason = f"explicit refiner.provider={resolved_ref}"
     elif _infer_provider_from_explicit_refiner_hints(cfg.refiner) is not None:
         ref_reason = f"inferred from explicit refiner config ({resolved_ref})"
     elif resolved_ref == "codex":

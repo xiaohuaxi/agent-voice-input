@@ -101,13 +101,15 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 
 [refiner]
 # Stage 2 context-aware refinement provider:
-# "auto" | "codex" | "deepseek" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
+# "auto" | "codex" | "agy" | "deepseek" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
 # Cross-stage aliases accepted: "doubao"/"volc"/"ark" -> "volcengine", "bailian" -> "dashscope"
 # When "auto" (default), prefers confirmed local `codex` ChatGPT subscription login (zero extra API billing), otherwise selects the first configured credential in order:
 #   deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow
 # (then falls back to Codex keyring / API-key login if present, or cleanly to "off" if no Stage 2 credentials are set).
+# Note: "agy" is explicit opt-in only (never selected by "auto").
 # Built-in default models (used when model = "" or when provider is overridden via CLI without a new model):
 # - codex             -> "gpt-6-luna" (stateless Keep-Alive HTTP /responses reusing local codex login, with automatic public mini-model fallback when internal models are unavailable; never enables Fast mode)
+# - agy               -> "gemini-3.8-flash" (explicit-only local `agy acp` zero-tool text refiner reusing local Antigravity CLI login; default effort = "low", supports stateful prefix-cache resume)
 # - deepseek          -> "deepseek-flash" (official https://api.deepseek.com/v1 with thinking disabled by default)
 # - dashscope         -> "qwen3.8-flash"
 # - volcengine        -> "doubao-seed-2-0-mini-260428"
@@ -122,9 +124,9 @@ provider = "auto"
 # Leave empty "" to use the selected provider's built-in default model above
 model = ""
 # Stage 2 wire protocol:
-# "auto" ("responses" for codex, "gemini" for gemini, "chat-completions" for other providers) | "chat-completions" | "responses"
+# "auto" ("responses" for codex, "agy-acp" for agy, "gemini" for gemini, "chat-completions" for other providers) | "chat-completions" | "responses"
 api = "auto"
-# Stage 2 thinking/reasoning budget (leave empty "" to use the provider default: "low" for codex/openai, "auto" zero-thinking fast mode for other providers):
+# Stage 2 thinking/reasoning budget (leave empty "" to use the provider default: "low" for codex/agy/openai, "auto" zero-thinking fast mode for other providers):
 # "auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 effort = ""
 # Custom Stage 2 system prompt (leave empty "" to use the built-in adaptive agent/general voice-dictation editor prompts;

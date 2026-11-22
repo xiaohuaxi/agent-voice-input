@@ -886,11 +886,11 @@ class TestProviderCompletenessContracts(unittest.TestCase):
         self.assertEqual(len(REFINER_AUTO_PRIORITY), len(set(REFINER_AUTO_PRIORITY)))
         self.assertEqual(
             set(REFINER_AUTO_PRIORITY),
-            concrete_refiner - {"codex", "openai-compatible"},
+            concrete_refiner - {"codex", "agy", "openai-compatible"},
         )
         self.assertEqual(
             set(DEFAULT_REFINER_BASE_URLS.keys()),
-            concrete_refiner - {"codex", "openai-compatible"},
+            concrete_refiner - {"codex", "agy", "openai-compatible"},
         )
 
         hermetic_env = {
@@ -910,7 +910,7 @@ class TestProviderCompletenessContracts(unittest.TestCase):
             self.assertIsInstance(noop, NoopRefiner)
 
             for prov in sorted(concrete_refiner):
-                if prov != "codex":
+                if prov not in ("codex", "agy"):
                     self.assertIsNotNone(
                         creds.for_provider(prov),
                         f"ProviderCredentials.for_provider({prov!r}) returned None",

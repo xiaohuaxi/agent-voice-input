@@ -147,7 +147,7 @@ def _add_common_flags(p: argparse.ArgumentParser, *, is_sub: bool = False) -> No
         "--refiner",
         "--refiner-provider",
         dest="refiner",
-        help="Override Stage 2 refiner provider (auto|codex|deepseek|dashscope|volcengine|openrouter|gemini|openai|groq|siliconflow|openai-compatible|off)",
+        help="Override Stage 2 refiner provider (auto|codex|agy|deepseek|dashscope|volcengine|openrouter|gemini|openai|groq|siliconflow|openai-compatible|off)",
         **kw,
     )
     p.add_argument("--refiner-model", dest="refiner_model", help="Override Stage 2 refiner model", **kw)
@@ -505,6 +505,18 @@ def _probe_stage_ping(
             return "FAIL", ms, f"FAIL ({ms}ms: {safe})"
         finally:
             ref.close()
+    if prov == "agy":
+        from .refiner import AgyRefiner
+
+        ping_cfg = dataclasses.replace(
+            cfg,
+            refiner=dataclasses.replace(cfg.refiner, timeout_sec=min(float(cfg.refiner.timeout_sec), 5.0)),
+        )
+        ref_agy = AgyRefiner(ping_cfg, creds, env=env)
+        try:
+            return ref_agy.probe_ping(timeout_sec=5.0)
+        finally:
+            ref_agy.close()
 
     custom_item = creds.asr_custom if stage == "asr" else creds.refiner_custom
     explicit_env_name = (cfg.asr.api_key_env if stage == "asr" else cfg.refiner.api_key_env).strip()
@@ -946,6 +958,7 @@ def _doctor_check_remote_ssh(st: _DoctorState) -> None:
 
 
 def _doctor_check_refiner(st: _DoctorState) -> None:
+    from .config import find_agy_bin
     from .llm_common import _missing_key_hint
     from .refiner import (
         find_codex_bin,
@@ -998,6 +1011,26 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
                 f"effort={eff_ref_effort}{prompt_tag}) -> {auth_note}"
             )
             st.emit_fix("run 'codex login' or set DEEPSEEK_API_KEY / DASHSCOPE_API_KEY in agent-voice-input.env")
+            st.ok_all = False
+        st.emit(f"[pipeline]  {st.pipeline['summary']}")
+        return
+    if st.resolved_ref_prov == "agy":
+        eff_ref_api = str(ref_info["api"])
+        eff_ref_effort = str(ref_info["effort"])
+        st.eff_ref_model = str(ref_info["model"])
+        agy_bin = find_agy_bin(st.env)
+        if agy_bin:
+            st.ref_ping_needed = True
+            st.emit(
+                f"[refiner]   OK agy (model={st.eff_ref_model}, api={eff_ref_api}, "
+                f"effort={eff_ref_effort}, bin={agy_bin}{prompt_tag})"
+            )
+        else:
+            st.emit(
+                f"[refiner]   FAIL agy (model={st.eff_ref_model}, api={eff_ref_api}, "
+                f"effort={eff_ref_effort}{prompt_tag}) -> agy CLI not found in PATH"
+            )
+            st.emit_fix("install Antigravity CLI ('agy'), set AGY_BIN, or switch refiner.provider")
             st.ok_all = False
         st.emit(f"[pipeline]  {st.pipeline['summary']}")
         return

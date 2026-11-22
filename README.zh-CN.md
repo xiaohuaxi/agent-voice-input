@@ -111,8 +111,8 @@ agent-voice-input start
 - **两阶段模式 vs 多模态单跳模式（`asr.api`）**：
   - 默认 `asr.api = "auto"` 会自动按渠道与模型选择协议：`dashscope`（默认 `qwen3-asr-flash`）、`doubao` 与专用 STT 模型（如 `qwen/qwen3-asr-1.7b`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）走一阶段纯转写 + 二阶段语境精修；
   - 原生 `gemini`、百炼 `qwen*-omni*`（如 `qwen3.8-omni-flash`）以及 OpenRouter / OpenAI 兼容渠道下的多模态音频理解模型（如 `gemini-3.5-flash-lite`、`google/gemini-3.5-flash-lite`、`qwen/qwen3.8-omni-flash`、`gpt-audio*`）自动共享同一套 50K 封口 `<session_reference_log>` 前缀缓存块（`agent` 模式下会将最多 `refiner.context_max_chars` 会话历史发往所选多模态 ASR 渠道）、对 `>= 3s` 语音内存压缩为 `64 kbps` MP3、以 `610s` 为整段上限一步完成转写与精修，并默认跳过二阶段（除非设置 `refiner.force_on_single_hop = true`）。在 `openrouter` 下使用未内置收录的新模型时，请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
-- **二阶段协议选择（`refiner.api`）**：支持 `"auto" | "chat-completions" | "responses"`。默认 `"auto"` 将 `codex` 路由至纯无状态 HTTP `/responses`（`store=false`、`stream=true`），将 `gemini` 路由至原生 `:generateContent`，其余兼容渠道保持 `/chat/completions`；在 `openai`、`openrouter` 或 `openai-compatible` 下亦可显式设 `refiner.api = "responses"` 启用无状态 `/responses` 引擎。
-- **思考档位控制（`effort`）**：支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`。`asr.effort` 默认 `"auto"`；`refiner.effort` 按渠道自动默认（`codex` / `openai` 默认 `"low"`，其余渠道默认 `"auto"` 自动映射对应渠道的零思考极速参数，如 Gemini 3+ `minimal`、百炼 `enable_thinking=false`、火山方舟/官方 DeepSeek `thinking.type="disabled"`）。
+- **二阶段协议选择（`refiner.api`）**：支持 `"auto" | "chat-completions" | "responses"`。默认 `"auto"` 将 `codex` 路由至纯无状态 HTTP `/responses`（`store=false`、`stream=true`），将 `agy` 路由至本机 `agy acp` stdio JSON-RPC（`agy-acp`），将 `gemini` 路由至原生 `:generateContent`，其余兼容渠道保持 `/chat/completions`；在 `openai`、`openrouter` 或 `openai-compatible` 下亦可显式设 `refiner.api = "responses"` 启用无状态 `/responses` 引擎。
+- **思考档位控制（`effort`）**：支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`。`asr.effort` 默认 `"auto"`；`refiner.effort` 按渠道自动默认（`codex` / `agy` / `openai` 默认 `"low"`，其余渠道默认 `"auto"` 自动映射对应渠道的零思考极速参数，如 Gemini 3+ `minimal`、百炼 `enable_thinking=false`、火山方舟/官方 DeepSeek `thinking.type="disabled"`）。
 - **精修提示词与前缀缓存组织（`refiner.prompt`、`include_git_status`、`context_max_chars`、`cold_start_fallback`）**：`prompt` 默认留空 `""` 时使用内置自适应英文语音听写编辑提示词（`agent` 模式结合只读 `<session_reference_log>`、`<workspace_git_status>` 与常见研发/AI 术语修准同音错词并消解口语中途改口，`general` 模式面向日常口述自然润色且不掺入代码语境；显式配置非空 `prompt = '''...'''` 则覆盖两模式默认提示词）。终端历史对话（默认上限 `context_max_chars = 200000` 字符，满窗按四分之一即 `50K` 整块滑出）按固定只读分块置于前部（`/responses` 下作 `developer` 消息块，`/chat/completions` 下置于单条 `user` 消息前部），末尾 `user` 块依次拼装 `<workspace_git_status>`（`include_git_status = true`，工作树干净时自动补充仓库核心追踪文件名作拼写参考）、`<asr_draft_to_clean>` 与 `<task_reminder>`，稳定命中前缀缓存（`codex` 配合确定性会话 `prompt_cache_key` 与负载均衡亲和性 Cookie 实现高缓存命中且零历史草稿残留；一阶段在 `agent` 模式下亦会在用户 `hotwords.txt` 与实时变更/对话标识符之后自动追加低优 AI/CLI 兜底热词）。新开空/极短 Agent 会话（或终端/桌面 IDE 仅有合法工作目录尚无活跃会话）时，`cold_start_fallback = "auto"`（默认；支持 `"hotwords"` 仅热词或 `"off"` 关闭）自动从同精确目录近期历史会话补齐一阶段热词，并为 Agent 会话在二阶段/单跳前拼 1 块逐字节冻结的 `<= 25K` `<prior_session_reference>` 只读块（随新会话填满滑窗后自然整块淘汰，SSH 远端单趟同步对齐）。
 - **分层纯文本热词表（`asr.hotwords_file` 与 `hotwords` 子命令）**：可直接手改 `~/.config/agent-voice-input/hotwords.txt` 或通过 `agent-voice-input hotwords list|add|remove` 管理，修改后无需重启守护进程、下一次口述自动热加载生效。100% 兼容存量无分组纯文本文件（归入 `[global]`），并支持可选 `[chat]`（微信/飞书/AI 聊天等）与 `[coding]`（终端/IDE/Agent 会话）分组按前台窗口自动挂载；手工词条永远最优先保头，并内置跨渠道配额预算与截断提示（`doubao`、`whisper`、`dashscope`、`gemini`）。
 - **同渠道重试与建连超时（`max_retries`）**：`[asr] max_retries` 与 `[refiner] max_retries` 默认 `2`（`0..10`，指首次请求之外的额外重试次数，`0` 关闭重试），在阶段 `timeout_sec` 总预算与独立的 9 秒建连/TLS 握手超时上限内，区分频率限流（`HTTP 429`、`Retry-After`、厂商 QPS 码）与瞬态通信/5xx 错误分别退避重试。
@@ -123,6 +123,7 @@ agent-voice-input start
 | `provider` | 可用阶段 | 内置默认 `asr.model` | 内置默认 `refiner.model` | 凭据来源 / 环境变量 |
 | :--- | :--- | :--- | :--- | :--- |
 | **`codex`** | `refiner` | — | `gpt-6-luna` *(公开账号自动回退 `gpt-5.4-mini` / `gpt-5-codex-mini`)* | 复用本机 `codex` CLI 登录态 *(无状态 HTTP `/responses` 直连 + 30 分钟提前安全刷新，绝不开启 Fast 模式)* |
+| **`agy`** | `refiner` | — | `gemini-3.8-flash` *(默认 `effort = "low"`；需显式启用，不参与 `auto` 自动选路)* | 复用本机已登录的 `agy` CLI *(零工具 `agy acp` stdio JSON-RPC + 增量续接前缀缓存)* |
 | **`deepseek`** | `refiner` | — | `deepseek-flash` | `DEEPSEEK_API_KEY` *(兼容 `API_KEY_DEEPSEEK`)* |
 | **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` *(或单跳 `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(兼容 `ALI_API_KEY`)* |
 | **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_SPEECH_API_KEY` *（单头 `X-Api-Key`，无需 `APP_ID`；兼容旧 `DOUBAO_ASR_API_KEY` 或双头 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；`auto` 默认优先低延迟同步 `volc.bigasr.auc_turbo`，未开通时进程内首次自动回退并缓存至 2.0 `volc.seedasr.auc` / 1.0 `volc.bigasr.auc`）* |
@@ -197,7 +198,7 @@ agent-voice-input key-test               # 测试按键扫描码与修饰键捕�
 | `--asr-model` | 一阶段上游模型 ID |
 | `--asr-api` | 一阶段协议（`auto`, `audio-transcriptions`, `chat-completions`） |
 | `--asr-effort` | 一阶段思考档位 |
-| `--refiner`, `--refiner-provider` | 二阶段渠道（`auto`, `codex`, `deepseek`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`；支持别名 `doubao`/`volc`/`ark` → `volcengine`、`bailian` → `dashscope`） |
+| `--refiner`, `--refiner-provider` | 二阶段渠道（`auto`, `codex`, `agy`, `deepseek`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`；支持别名 `doubao`/`volc`/`ark` → `volcengine`、`bailian` → `dashscope`） |
 | `--refiner-model` | 二阶段上游模型 ID |
 | `--refiner-api` | 二阶段协议（`auto`, `chat-completions`, `responses`） |
 | `--refiner-effort`, `--effort` | 二阶段思考档位 |

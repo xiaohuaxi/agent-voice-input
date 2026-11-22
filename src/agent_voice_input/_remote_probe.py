@@ -1123,37 +1123,69 @@ def _resolve_agy_transcript_path(
     return None
 
 
+_AGY_SUBAGENT_PREFIXES = ("[agy-run]", "[avi-refiner]")
+_AGY_HEAD_USER_RE = re.compile(r'"source"\s*:\s*"USER_EXPLICIT"')
+_AGY_HEAD_SYS_RE = re.compile(r'"source"\s*:\s*"SYSTEM"')
+_AGY_HEAD_SYS_TYPE_RE = re.compile(r'"type"\s*:\s*"(?:SYSTEM_MESSAGE|EPHEMERAL_MESSAGE)"')
+_AGY_HEAD_CONTENT_RE = re.compile(r'"content"\s*:\s*"((?:\\.|[^"\\]){0,256})')
+
+
+def _is_agy_user_prefix_subagent(content: str) -> bool:
+    c = content.lstrip()
+    if c.startswith("<USER_REQUEST>"):
+        c = c[len("<USER_REQUEST>") :].lstrip()
+    return c.startswith(_AGY_SUBAGENT_PREFIXES)
+
+
+def _is_agy_sys_subagent(content: str) -> bool:
+    return ("[Message] timestamp=" in content and "sender=" in content) or (
+        "<subagent_reminder>" in content or "invoked by a caller agent" in content
+    )
+
+
 def _is_agy_subagent(jsonl_path: str | Path) -> bool:
     try:
         with open(jsonl_path, "rb") as f:
-            while True:
+            seen_non_empty = 0
+            while seen_non_empty < 20:
                 line, exceeded = _read_bounded_line(f)
                 if not line:
                     return False
-                if line.strip():
-                    break
+                if not line.strip():
+                    continue
+                seen_non_empty += 1
+                if not exceeded:
+                    try:
+                        obj = json.loads(line.decode("utf-8", errors="replace"))
+                    except ValueError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    src, typ = obj.get("source"), obj.get("type")
+                    if src == "USER_EXPLICIT":
+                        return _is_agy_user_prefix_subagent(str(obj.get("content") or ""))
+                    if src == "SYSTEM" and typ in ("SYSTEM_MESSAGE", "EPHEMERAL_MESSAGE"):
+                        if _is_agy_sys_subagent(str(obj.get("content") or "")):
+                            return True
+                    continue
+
+                # Truncated oversized line (> MAX_LINE_BYTES): inspect bounded head.
+                head = line[:8192].decode("utf-8", errors="replace")
+                if _AGY_HEAD_USER_RE.search(head):
+                    m = _AGY_HEAD_CONTENT_RE.search(head)
+                    if not m:
+                        return False
+                    frag = m.group(1)
+                    try:
+                        decoded = json.loads(f'"{frag}"')
+                    except ValueError:
+                        decoded = frag.replace("\\n", "\n").replace('\\"', '"')
+                    return _is_agy_user_prefix_subagent(str(decoded))
+                if _AGY_HEAD_SYS_RE.search(head) and _AGY_HEAD_SYS_TYPE_RE.search(head):
+                    if _is_agy_sys_subagent(head):
+                        return True
     except OSError:
         return False
-    if exceeded:
-        return False
-    try:
-        obj = json.loads(line.decode("utf-8", errors="replace"))
-    except ValueError:
-        return False
-    if not isinstance(obj, dict):
-        return False
-    src, typ = obj.get("source"), obj.get("type")
-    if src == "USER_EXPLICIT":
-        c = str(obj.get("content") or "").lstrip()
-        if c.startswith("<USER_REQUEST>"):
-            c = c[len("<USER_REQUEST>") :].lstrip()
-        return c.startswith("[agy-run]")
-    if src == "SYSTEM" and typ in ("SYSTEM_MESSAGE", "EPHEMERAL_MESSAGE"):
-        c = str(obj.get("content") or "")
-        if ("[Message] timestamp=" in c and "sender=" in c) or (
-            "<subagent_reminder>" in c or "invoked by a caller agent" in c
-        ):
-            return True
     return False
 
 

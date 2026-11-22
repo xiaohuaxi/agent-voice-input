@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import base64
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
+import queue
 import random
 import re
 import selectors
@@ -92,8 +93,11 @@ from .config import (
     VALID_REFINER_PROVIDERS,
     _read_codex_models_cache_slugs,
     classify_codex_auth_json,
+    ensure_secure_dir,
     expand_user_path,
+    find_agy_bin,
     find_codex_bin,
+    get_runtime_dir,
     has_codex_local_auth,
     redact_secrets,
     resolve_codex_default_model,
@@ -2796,6 +2800,1199 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
         )
 
 
+_AGY_AGENT_NAME = "avi-refiner"
+_AGY_PROMPT_PREFIX = "[avi-refiner]\n"
+_AGY_AGENT_MD_CONTENT = (
+    "---\n"
+    "name: avi-refiner\n"
+    "description: Stateless text-only voice transcript refiner with zero tools.\n"
+    "inheritCustomizations: false\n"
+    "excludeDefaultComponents: true\n"
+    "subagent: false\n"
+    "tools: []\n"
+    "---\n"
+    "You are a stateless, non-conversational voice-dictation text editor with zero tools.\n"
+)
+_AGY_ENV_KEEP: frozenset[str] = frozenset(
+    {
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TMPDIR",
+        "TERM",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+        "GEMINI_API_KEY",
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "CLOUDSDK_CONFIG",
+    }
+)
+_AGY_ENV_PREFIXES: tuple[str, ...] = (
+    "AGY_",
+    "ANTIGRAVITY_",
+    "GEMINI_",
+    "GOOGLE_",
+    "XDG_",
+    "LC_",
+)
+_AGY_INTERNAL_TOOLS: frozenset[str] = frozenset({"manage_task", "finish"})
+_AGY_EFFORT_SUFFIXES: tuple[str, ...] = ("low", "medium", "high", "xhigh", "extra", "max")
+_AGY_FILTER_NOTICE = "This request was blocked by Gemini's filters"
+_AGY_REFUSAL_STOPS: frozenset[str] = frozenset({"refusal", "safety", "content_filter"})
+_AGY_ERROR_LINE_RE = re.compile(r"AGY_ERROR:\s*(\{.*\})\s*$", re.M)
+_AGY_PRINT_TIMEOUT_RE = re.compile(r"print timeout after \S+ with turn in progress")
+_AGY_RESUME_MISS_RE = re.compile(
+    r"(?:session|conversation).*(?:not found|invalid|unknown|missing|expired)", re.I
+)
+_AGY_NON_RETRYABLE_SOURCES: frozenset[str] = frozenset(
+    {
+        "denied",
+        "tool",
+        "filtered",
+        "refusal",
+        "config",
+        "missing_cli",
+        "max_tokens",
+        "max_turn_requests",
+        "cancelled",
+    }
+)
+_AGY_MAX_THREADS = 64
+
+
+class _AgyRpcError(RuntimeError):
+    def __init__(self, message: str, *, source: str) -> None:
+        super().__init__(message)
+        self.source = source
+
+
+@dataclass
+class _AgyThreadState:
+    conversation_id: str = ""
+    turn_count: int = 0
+    sent_blocks: tuple[str, ...] = ()
+    model: str = ""
+    effort: str = ""
+    prompt_hash: str = ""
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _agy_child_env(env: Mapping[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k, v in env.items():
+        if k in ("BASH_ENV", "ENV", "PROMPT_COMMAND", "PYTHONSTARTUP"):
+            continue
+        if k in _AGY_ENV_KEEP or k.startswith(_AGY_ENV_PREFIXES):
+            out[k] = v
+    return out
+
+
+def _agy_select_reject_option_id(options: Any) -> str | None:
+    if not isinstance(options, list):
+        return None
+    valid: list[tuple[str, str]] = []
+    for opt in options:
+        if not isinstance(opt, Mapping):
+            continue
+        oid = opt.get("optionId")
+        kind = opt.get("kind")
+        if not isinstance(oid, str) or not oid.strip() or not isinstance(kind, str) or not kind.strip():
+            continue
+        k_low = kind.strip().lower()
+        o_low = oid.strip().lower()
+        if "allow" in k_low or "allow" in o_low:
+            continue
+        valid.append((oid, k_low))
+    for target in ("reject_once", "reject_always"):
+        for oid, k_low in valid:
+            if k_low == target:
+                return oid
+    return None
+
+
+def _agy_config_entry(config_options: Any, cid: str) -> Mapping[str, Any] | None:
+    for item in config_options or ():
+        if isinstance(item, Mapping) and item.get("id") == cid:
+            return item
+    return None
+
+
+def _agy_option_values(entry: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(entry, Mapping):
+        return []
+    return [
+        val
+        for opt in (entry.get("options") or ())
+        if isinstance(opt, Mapping) and isinstance((val := opt.get("value")), str) and val
+    ]
+
+
+def _agy_canonical_effort_token(raw: str) -> str:
+    low = raw.strip().lower()
+    if low in ("none", "minimal"):
+        return "low"
+    if low in ("max", "extra"):
+        return "xhigh"
+    return low
+
+
+def _agy_match_model(requested_model: str, available_models: Sequence[str]) -> tuple[str | None, str | None]:
+    if not requested_model.strip():
+        return None, None
+    req = requested_model.strip().lower()
+    if not available_models:
+        raise _AgyRpcError("agy ACP returned an empty model list", source="config")
+    exact = [m for m in available_models if m.lower() == req]
+    if len(exact) == 1:
+        return exact[0], None
+    base, sep, suffix = req.rpartition("-")
+    if sep and base and suffix in _AGY_EFFORT_SUFFIXES:
+        exact_base = [m for m in available_models if m.lower() == base]
+        if len(exact_base) == 1:
+            return exact_base[0], suffix
+    raise _AgyRpcError(
+        f"unknown agy model {requested_model!r} (available: {', '.join(available_models)})",
+        source="config",
+    )
+
+
+def _agy_match_effort(
+    target_model: str | None,
+    effort: str,
+    *,
+    effort_explicit: bool,
+    implied_effort: str | None,
+    config_options: Sequence[Any],
+) -> str | None:
+    req_e = (effort or "").strip().lower()
+    is_passthrough = req_e in ("", "auto", "default")
+    explicit_concrete = None if is_passthrough else req_e
+    if effort_explicit and explicit_concrete and implied_effort:
+        if _agy_canonical_effort_token(explicit_concrete) != _agy_canonical_effort_token(implied_effort):
+            raise _AgyRpcError(
+                f"agy model {target_model!r} suffix effort {implied_effort!r} conflicts with refiner.effort={effort!r}",
+                source="config",
+            )
+    if effort_explicit and explicit_concrete:
+        desired: str | None = explicit_concrete
+    elif implied_effort:
+        desired = implied_effort
+    else:
+        desired = explicit_concrete
+
+    tl_entry = _agy_config_entry(config_options, "thought_level")
+    tl_values = _agy_option_values(tl_entry)
+    if not tl_values:
+        if desired is None:
+            return None
+        if target_model and target_model.lower().endswith(f"-{desired}"):
+            return None
+        if not effort_explicit and not implied_effort:
+            return None
+        raise _AgyRpcError(
+            f"agy model {target_model or '<default>'!r} does not support effort {desired!r}",
+            source="config",
+        )
+    if desired is None:
+        return None
+    cand = _agy_canonical_effort_token(desired)
+    if cand == "xhigh" and "extra" in tl_values and "xhigh" not in tl_values:
+        cand = "extra"
+    if cand not in tl_values:
+        raise _AgyRpcError(
+            f"agy model {target_model or '<default>'!r} does not accept effort {desired!r} "
+            f"(available: {', '.join(tl_values)})",
+            source="config",
+        )
+    return cand
+
+
+def _agy_convert_usage(raw_usage: Any) -> _TokenUsageTuple:
+    if not isinstance(raw_usage, Mapping) or not raw_usage:
+        return _EMPTY_USAGE
+    uncached_in = _opt_int(raw_usage.get("inputTokens"))
+    cached_read = _opt_int(raw_usage.get("cachedReadTokens"))
+    out_tok = _opt_int(raw_usage.get("outputTokens"))
+    thought_tok = _opt_int(raw_usage.get("thoughtTokens"))
+    total_in = (uncached_in + (cached_read or 0)) if uncached_in is not None else None
+    if total_in is None and cached_read is None and out_tok is None and thought_tok is None:
+        return _EMPTY_USAGE
+    return (total_in, cached_read, out_tok, thought_tok or 0)
+
+
+_AGY_SAFE_ERR_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,48}$")
+
+
+def _agy_safe_code(val: Any) -> str:
+    if isinstance(val, int) and not isinstance(val, bool):
+        return str(val)
+    if isinstance(val, str):
+        s = val.strip()
+        if s and _AGY_SAFE_ERR_CODE_RE.match(s):
+            return s
+    return ""
+
+
+def _agy_is_exact_filter_notice(text: str) -> bool:
+    s = text.strip()
+    return s == _AGY_FILTER_NOTICE or s == f"{_AGY_FILTER_NOTICE}."
+
+
+def _agy_check_filter_and_refusal(
+    texts: Sequence[str],
+    *,
+    stop_reason: Any = None,
+    edata: Any = None,
+) -> None:
+    if any(_agy_is_exact_filter_notice(t) for t in texts if t):
+        raise _AgyRpcError(
+            "Gemini safety filter blocked the agy reply",
+            source="filtered",
+        )
+    is_refusal = str(stop_reason or "").strip().lower() in _AGY_REFUSAL_STOPS
+    if not is_refusal and isinstance(edata, Mapping):
+        is_refusal = any(
+            str(edata.get(k) or "").strip().lower() in _AGY_REFUSAL_STOPS
+            for k in ("stopReason", "stop_reason", "finishReason", "finish_reason", "status", "reason")
+        )
+    if is_refusal:
+        raise _AgyRpcError("agy refused the refinement turn", source="refusal")
+
+
+def _agy_safe_stderr_summary(stderr_text: str) -> str:
+    """Extract only validated short structured error codes from ``AGY_ERROR`` (never free-text messages)."""
+    m = _AGY_ERROR_LINE_RE.search(stderr_text)
+    if not m:
+        return ""
+    try:
+        parsed = json.loads(m.group(1))
+    except ValueError:
+        return ""
+    if not isinstance(parsed, Mapping):
+        return ""
+    parts: list[str] = []
+    if code := _agy_safe_code(parsed.get("code")):
+        parts.append(f"code={code}")
+    if etype := _agy_safe_code(parsed.get("type") or parsed.get("status")):
+        parts.append(f"type={etype}")
+    return ", ".join(parts)
+
+
+def _agy_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - OS permission edge for process group probe
+        return True
+
+
+def _agy_stop_process_group(proc: subprocess.Popen[str], *, fast: bool = False) -> None:
+    pgid = proc.pid
+    if not fast and proc.poll() is None:
+        try:
+            if proc.stdin is not None and not proc.stdin.closed:
+                proc.stdin.close()
+        except OSError:
+            pass
+        grace_dl = time.monotonic() + 0.3
+        while time.monotonic() < grace_dl:
+            if proc.poll() is not None and not _agy_group_alive(pgid):
+                break
+            time.sleep(0.02)
+    stages = (
+        ((signal.SIGTERM, 0.15), (signal.SIGKILL, 1.0))
+        if fast
+        else ((signal.SIGINT, 0.3), (signal.SIGTERM, 0.5), (signal.SIGKILL, 1.0))
+    )
+    for sig, wait_s in stages:
+        if proc.poll() is not None and not _agy_group_alive(pgid):
+            break
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        dl = time.monotonic() + wait_s
+        while time.monotonic() < dl:
+            if proc.poll() is not None and not _agy_group_alive(pgid):
+                break
+            time.sleep(0.02)
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:  # pragma: no cover - unkillable D-state process
+        pass
+
+
+class AgyRefiner(BaseRefiner):
+    """Stage 2 text refiner backed by local Antigravity CLI (``agy acp``) with zero tools."""
+
+    provider_name = "agy"
+
+    def __init__(
+        self,
+        cfg: Config,
+        creds: ProviderCredentials | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        runtime_dir: Path | None = None,
+        clock_fn: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        rand_fn: Callable[[], float] = random.random,
+    ) -> None:
+        self.cfg = cfg
+        self.env: Mapping[str, str] = os.environ if env is None else env
+        self.creds = creds or resolve_credentials(cfg, self.env)
+        self._runtime_dir = runtime_dir
+        self.clock_fn, self.sleep_fn, self.rand_fn = clock_fn, sleep_fn, rand_fn
+        self._closed = False
+        self._threads_lock = threading.Lock()
+        self._threads: OrderedDict[tuple[str, str], _AgyThreadState] = OrderedDict()
+        self._procs_lock = threading.Lock()
+        self._active_procs: set[subprocess.Popen[str]] = set()
+        self._workdir_lock = threading.Lock()
+
+    def _ensure_agent_workdir(self) -> Path:
+        with self._workdir_lock:
+            base_rt = self._runtime_dir if self._runtime_dir is not None else get_runtime_dir(self.env)
+            ensure_secure_dir(base_rt)
+            workdir = ensure_secure_dir(base_rt / "agy-refiner")
+            agents_root = ensure_secure_dir(workdir / ".agents")
+            agents_dir = ensure_secure_dir(agents_root / "agents")
+            agent_md = agents_dir / f"{_AGY_AGENT_NAME}.md"
+            try:
+                st = os.lstat(agent_md)
+            except FileNotFoundError:
+                st = None
+            if st is not None:
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                    raise ConfigError(f"unsafe agy agent file (not a regular file): {agent_md}")
+                try:
+                    if (
+                        agent_md.read_text(encoding="utf-8") == _AGY_AGENT_MD_CONTENT
+                        and (st.st_mode & 0o777) == 0o600
+                    ):
+                        return workdir
+                except OSError:
+                    pass
+            tmp_path = agents_dir / f".{_AGY_AGENT_NAME}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(str(tmp_path), flags, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(_AGY_AGENT_MD_CONTENT)
+                os.replace(tmp_path, agent_md)
+            except BaseException:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            return workdir
+
+    def _get_thread_state(self, key: tuple[str, str]) -> _AgyThreadState:
+        with self._threads_lock:
+            state = self._threads.get(key)
+            if state is not None:
+                self._threads.move_to_end(key)
+                return state
+            state = _AgyThreadState()
+            self._threads[key] = state
+            while len(self._threads) > _AGY_MAX_THREADS:
+                self._threads.popitem(last=False)
+            return state
+
+    def _run_acp_session(
+        self,
+        *,
+        agy_bin: str,
+        workdir: Path,
+        timeout_sec: float,
+        prompt_text: str | None = None,
+        requested_model: str = "",
+        requested_effort: str = "",
+        effort_explicit: bool = False,
+        conversation_id: str = "",
+        is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
+    ) -> tuple[str, str, str, _TokenUsageTuple, int]:
+        """Run one ``agy acp`` process; when ``prompt_text is None`` only runs ``initialize``."""
+        cmd = [
+            agy_bin,
+            "acp",
+            "--agent",
+            _AGY_AGENT_NAME,
+            "--include-default-customizations=false",
+        ]
+        t_start = time.monotonic()
+        timeout_s = max(0.05, float(timeout_sec))
+        deadline = t_start + timeout_s
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
+
+        def _is_aborted() -> bool:
+            return self._closed or (eff_cancelled is not None and eff_cancelled())
+
+        if _is_aborted():
+            raise _AgyRpcError("agy request cancelled before spawn", source="cancelled")
+
+        proc: subprocess.Popen[str] | None = None
+        stdin_fd: int | None = None
+        events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        stderr_lines: list[str] = []
+        stderr_lock = threading.Lock()
+        t_out: threading.Thread | None = None
+        t_err: threading.Thread | None = None
+        abort_hook_id = 0
+        emergency_kill = False
+        text_chunks: list[str] = []
+        tools_by_id: dict[str, dict[str, Any]] = {}
+        denied_calls: list[bool] = []
+
+        def _err_full() -> str:
+            with stderr_lock:
+                return "".join(stderr_lines)
+
+        def _check_tools_and_denial() -> None:
+            if denied_calls:
+                raise _AgyRpcError(
+                    "agy ACP permission denied",
+                    source="denied",
+                )
+            bad = [c for c in tools_by_id.values() if c.get("name") and c.get("name") not in _AGY_INTERNAL_TOOLS]
+            if bad:
+                raise _AgyRpcError(
+                    "agy ACP blocked tool call",
+                    source="tool",
+                )
+
+        def _send_rpc(payload: Mapping[str, Any]) -> None:
+            if stdin_fd is None or proc is None:
+                return
+            data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+            view = memoryview(data)
+            sent = 0
+            total = len(data)
+            sel = selectors.DefaultSelector()
+            with sel:
+                try:
+                    sel.register(stdin_fd, selectors.EVENT_WRITE)
+                except (OSError, ValueError) as exc:
+                    if proc.poll() is not None:
+                        return
+                    raise _AgyRpcError(f"agy stdin register failed: {exc}", source="protocol") from None
+                while sent < total:
+                    if _is_aborted():
+                        raise _AgyRpcError("agy request cancelled", source="cancelled")
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        raise _AgyRpcError(
+                            f"agy did not finish within {timeout_s:.1f}s", source="hard_timeout"
+                        )
+                    if proc.poll() is not None:
+                        return
+                    ready = sel.select(timeout=min(0.05, max(0.005, rem)))
+                    if not ready:
+                        continue
+                    try:
+                        n = os.write(stdin_fd, view[sent:])
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except BrokenPipeError:
+                        return
+                    except OSError as exc:
+                        if proc.poll() is not None:
+                            return
+                        raise _AgyRpcError(f"agy stdin write failed: {exc}", source="protocol") from None
+                    if n == 0:
+                        if proc.poll() is not None:
+                            return
+                        raise _AgyRpcError("agy stdin write returned 0 bytes", source="protocol")
+                    sent += n
+
+        def _handle_server_msg(msg: Mapping[str, Any]) -> None:
+            nonlocal emergency_kill
+            if "id" in msg and "method" in msg:
+                method = msg.get("method")
+                if method == "session/request_permission":
+                    params = msg.get("params") if isinstance(msg.get("params"), Mapping) else {}
+                    opts = params.get("options")
+                    rej_id = _agy_select_reject_option_id(opts)
+                    denied_calls.append(True)
+                    if rej_id is not None:
+                        _send_rpc(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": msg["id"],
+                                "result": {"outcome": {"outcome": "selected", "optionId": rej_id}},
+                            }
+                        )
+                    else:
+                        emergency_kill = True
+                        _send_rpc(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": msg["id"],
+                                "result": {"outcome": {"outcome": "cancelled"}},
+                            }
+                        )
+                        _check_tools_and_denial()
+                else:
+                    _send_rpc(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": msg["id"],
+                            "error": {
+                                "code": -32601,
+                                "message": f"Method not supported in agent-voice-input: {method}",
+                            },
+                        }
+                    )
+                return
+
+            if msg.get("method") == "session/update":
+                params = msg.get("params") if isinstance(msg.get("params"), Mapping) else {}
+                upd = params.get("update") if isinstance(params.get("update"), Mapping) else {}
+                st = upd.get("sessionUpdate")
+                if st == "agent_message_chunk":
+                    content = upd.get("content")
+                    if isinstance(content, Mapping) and content.get("type") == "text":
+                        chunk_txt = content.get("text")
+                        if isinstance(chunk_txt, str):
+                            text_chunks.append(chunk_txt)
+                elif st in ("tool_call", "tool_call_update"):
+                    tc_id = str(upd.get("toolCallId") or f"anon_{len(tools_by_id)}")
+                    entry = tools_by_id.setdefault(tc_id, {"name": None})
+                    if upd.get("name") or upd.get("title"):
+                        entry["name"] = upd.get("name") or entry["name"] or upd.get("title")
+                    if entry["name"] and entry["name"] not in _AGY_INTERNAL_TOOLS:
+                        emergency_kill = True
+                        _check_tools_and_denial()
+
+        def _rpc_call(req_id: int, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
+            _send_rpc({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+            while True:
+                if _is_aborted():
+                    raise _AgyRpcError("agy request cancelled", source="cancelled")
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise _AgyRpcError(
+                        f"agy did not finish within {timeout_s:.1f}s", source="hard_timeout"
+                    )
+                try:
+                    ev_type, payload = events.get(timeout=min(0.05, max(0.005, rem)))
+                except queue.Empty:
+                    continue
+                if ev_type == "cancelled":
+                    raise _AgyRpcError("agy request cancelled", source="cancelled")
+                if ev_type == "eof":
+                    if t_out is not None:
+                        t_out.join(timeout=0.3)
+                    if t_err is not None:
+                        t_err.join(timeout=0.3)
+                    if proc is not None:
+                        try:
+                            proc.wait(timeout=0.3)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    _check_tools_and_denial()
+                    ef = _err_full()
+                    _agy_check_filter_and_refusal(["".join(text_chunks), ef])
+                    if _AGY_PRINT_TIMEOUT_RE.search(ef):
+                        raise _AgyRpcError("agy hit internal print timeout", source="print_timeout")
+                    rc = proc.returncode if proc is not None else None
+                    if rc not in (0, None):
+                        safe_detail = _agy_safe_stderr_summary(ef)
+                        suffix = f": {safe_detail}" if safe_detail else ""
+                        raise _AgyRpcError(f"agy exited {rc} during {method}{suffix}", source="exit")
+                    raise _AgyRpcError(
+                        f"agy produced no result for {method} (EOF)",
+                        source="no_result",
+                    )
+                if ev_type == "stdout" and isinstance(payload, str):
+                    line = payload.strip()
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(msg, Mapping):
+                        continue
+                    if "method" in msg:
+                        _handle_server_msg(msg)
+                        continue
+                    if msg.get("id") == req_id:
+                        return msg
+
+        def _unwrap_rpc(resp_msg: Mapping[str, Any], method: str) -> Mapping[str, Any]:
+            if method == "session/prompt":
+                _check_tools_and_denial()
+            err_obj = resp_msg.get("error")
+            if err_obj is not None:
+                if isinstance(err_obj, Mapping):
+                    code = err_obj.get("code")
+                    safe_code = _agy_safe_code(code)
+                    raw_msg = str(err_obj.get("message") or "").strip()
+                    edata = err_obj.get("data")
+                else:
+                    code, safe_code, raw_msg, edata = None, "", "", None
+                edata_resp = (
+                    str(edata.get("response"))
+                    if isinstance(edata, Mapping) and isinstance(edata.get("response"), str)
+                    else ""
+                )
+                edata_msg = (
+                    str(edata.get("message"))
+                    if isinstance(edata, Mapping) and isinstance(edata.get("message"), str)
+                    else ""
+                )
+                _agy_check_filter_and_refusal(
+                    ["".join(text_chunks), raw_msg, edata_msg, edata_resp], edata=edata
+                )
+                code_bit = f", code={safe_code}" if safe_code else ""
+                if method == "session/set_config_option" and code in (-32600, -32602):
+                    raise _AgyRpcError(
+                        f"agy rejected config option ({method}{code_bit})", source="config"
+                    )
+                if method == "session/resume" and (
+                    code in (-32600, -32602)
+                    or bool(_AGY_RESUME_MISS_RE.search(f"{raw_msg} {edata_msg}"))
+                ):
+                    raise _AgyRpcError(
+                        f"agy could not resume conversation ({method}{code_bit})",
+                        source="conversation",
+                    )
+                if method == "session/prompt" and isinstance(edata, Mapping):
+                    estatus = str(
+                        edata.get("stopReason") or edata.get("stop_reason") or edata.get("status") or ""
+                    ).strip().lower()
+                    if estatus in ("max_tokens", "cancelled", "max_turn_requests"):
+                        raise _AgyRpcError(
+                            f"agy RPC error ({method}{code_bit}, stopReason={estatus})",
+                            source=estatus,
+                        )
+                raise _AgyRpcError(f"agy RPC error ({method}{code_bit})", source="status")
+            res = resp_msg.get("result")
+            return res if isinstance(res, Mapping) else {}
+
+        try:
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=str(workdir),
+                    env=_agy_child_env(self.env),
+                    start_new_session=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+            except FileNotFoundError:
+                raise _AgyRpcError(f"{agy_bin} CLI not found", source="missing_cli") from None
+
+            with self._procs_lock:
+                if self._closed:
+                    emergency_kill = True
+                    raise _AgyRpcError("agy refiner closed", source="cancelled")
+                self._active_procs.add(proc)
+
+            assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+            stdin_fd = proc.stdin.fileno()
+            os.set_blocking(stdin_fd, False)
+
+            if cancel_token is not None:
+                def _on_abort() -> None:
+                    nonlocal emergency_kill
+                    emergency_kill = True
+                    events.put(("cancelled", None))
+                    if proc is not None and proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+
+                abort_hook_id = cancel_token.register_abort(_on_abort)
+
+            def _stdout_reader() -> None:
+                assert proc is not None and proc.stdout is not None
+                try:
+                    for line in proc.stdout:
+                        events.put(("stdout", line))
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    events.put(("eof", None))
+
+            def _stderr_reader() -> None:
+                assert proc is not None and proc.stderr is not None
+                try:
+                    for line in proc.stderr:
+                        with stderr_lock:
+                            stderr_lines.append(line)
+                            if len(stderr_lines) > 200:
+                                del stderr_lines[:100]
+                except (OSError, ValueError):
+                    pass
+
+            t_out = threading.Thread(target=_stdout_reader, daemon=True)
+            t_err = threading.Thread(target=_stderr_reader, daemon=True)
+            t_out.start()
+            t_err.start()
+
+            next_id = 1
+            _unwrap_rpc(
+                _rpc_call(
+                    next_id,
+                    "initialize",
+                    {
+                        "protocolVersion": 1,
+                        "clientInfo": {"name": "agent-voice-input", "version": __version__},
+                    },
+                ),
+                "initialize",
+            )
+            init_ms = max(0, int(round((time.monotonic() - t_start) * 1000)))
+            next_id += 1
+            if prompt_text is None:
+                return "", "", "", _EMPTY_USAGE, init_ms
+
+            if conversation_id:
+                sess_res = _unwrap_rpc(
+                    _rpc_call(
+                        next_id,
+                        "session/resume",
+                        {"sessionId": conversation_id, "cwd": str(workdir), "mcpServers": []},
+                    ),
+                    "session/resume",
+                )
+            else:
+                sess_res = _unwrap_rpc(
+                    _rpc_call(
+                        next_id,
+                        "session/new",
+                        {"cwd": str(workdir), "mcpServers": []},
+                    ),
+                    "session/new",
+                )
+            next_id += 1
+
+            sid = sess_res.get("sessionId")
+            if not isinstance(sid, str) or not sid.strip():
+                raise _AgyRpcError("agy did not report a sessionId", source="conversation")
+            sid = sid.strip()
+            if conversation_id and sid != conversation_id:
+                raise _AgyRpcError(
+                    f"agy answered in session {sid}, expected {conversation_id}",
+                    source="conversation",
+                )
+
+            config_options = list(sess_res.get("configOptions") or ())
+            model_entry = _agy_config_entry(config_options, "model")
+            available_models = _agy_option_values(model_entry)
+            current_model = str(model_entry.get("currentValue") or "") if isinstance(model_entry, Mapping) else ""
+
+            target_model, implied_effort = (
+                _agy_match_model(requested_model, available_models)
+                if requested_model.strip()
+                else (current_model or None, None)
+            )
+            if target_model and target_model != current_model:
+                cfg_res = _unwrap_rpc(
+                    _rpc_call(
+                        next_id,
+                        "session/set_config_option",
+                        {"sessionId": sid, "configId": "model", "value": target_model},
+                    ),
+                    "session/set_config_option",
+                )
+                next_id += 1
+                if isinstance(cfg_res.get("configOptions"), list):
+                    config_options = list(cfg_res["configOptions"])
+                model_entry = _agy_config_entry(config_options, "model")
+                current_model = (
+                    str(model_entry.get("currentValue") or "") if isinstance(model_entry, Mapping) else ""
+                ) or target_model
+
+            resolved_model = target_model or current_model or requested_model
+            eff_tl = _agy_match_effort(
+                resolved_model,
+                requested_effort,
+                effort_explicit=effort_explicit,
+                implied_effort=implied_effort,
+                config_options=config_options,
+            )
+            if eff_tl is not None:
+                tl_entry = _agy_config_entry(config_options, "thought_level")
+                current_tl = str(tl_entry.get("currentValue") or "") if isinstance(tl_entry, Mapping) else ""
+                if eff_tl != current_tl:
+                    _unwrap_rpc(
+                        _rpc_call(
+                            next_id,
+                            "session/set_config_option",
+                            {"sessionId": sid, "configId": "thought_level", "value": eff_tl},
+                        ),
+                        "session/set_config_option",
+                    )
+                    next_id += 1
+
+            prompt_res = _unwrap_rpc(
+                _rpc_call(
+                    next_id,
+                    "session/prompt",
+                    {"sessionId": sid, "prompt": [{"type": "text", "text": prompt_text}]},
+                ),
+                "session/prompt",
+            )
+            _check_tools_and_denial()
+
+            stop_reason = prompt_res.get("stopReason")
+            streamed = "".join(text_chunks)
+            raw_res_resp = prompt_res.get("response") if isinstance(prompt_res.get("response"), str) else ""
+            out_text = streamed.strip() or raw_res_resp.strip()
+            _agy_check_filter_and_refusal(
+                [out_text],
+                stop_reason=stop_reason,
+                edata=prompt_res,
+            )
+            if stop_reason not in ("end_turn", None):
+                s_low = str(stop_reason).strip().lower()
+                src = s_low if s_low in ("max_tokens", "cancelled", "max_turn_requests") else "status"
+                raise _AgyRpcError(f"agy stopReason={stop_reason}", source=src)
+
+            if not out_text:
+                raise _AgyRpcError("agy returned an empty answer", source="empty")
+            usage = _agy_convert_usage(prompt_res.get("usage"))
+            return out_text, sid, resolved_model, usage, init_ms
+        finally:
+            if cancel_token is not None and abort_hook_id:
+                cancel_token.unregister_abort(abort_hook_id)
+            if proc is not None:
+                with self._procs_lock:
+                    self._active_procs.discard(proc)
+                try:
+                    _agy_stop_process_group(proc, fast=emergency_kill or _is_aborted())
+                finally:
+                    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                        if pipe is not None:
+                            try:
+                                pipe.close()
+                            except OSError:
+                                pass
+                    if t_out is not None:
+                        t_out.join(timeout=1.0)
+                    if t_err is not None:
+                        t_err.join(timeout=1.0)
+
+    def probe_ping(self, *, timeout_sec: float = 5.0) -> tuple[str, int, str]:
+        """Lightweight ``agy acp`` ``initialize`` handshake probe (zero model prompt / zero quota)."""
+        t0 = self.clock_fn()
+        agy_bin = find_agy_bin(self.env)
+        if not agy_bin:
+            return "FAIL", 0, "FAIL (agy CLI not found in PATH)"
+        try:
+            workdir = self._ensure_agent_workdir()
+            _, _, _, _, _ = self._run_acp_session(
+                agy_bin=agy_bin,
+                workdir=workdir,
+                timeout_sec=timeout_sec,
+                prompt_text=None,
+            )
+            ms = _ms(t0, self.clock_fn)
+            return "OK", ms, f"OK ({ms}ms, ACP initialize handshake)"
+        except Exception as exc:
+            ms = _ms(t0, self.clock_fn)
+            safe = redact_secrets(str(exc), self.env, cfg=self.cfg)[:160]
+            return "FAIL", ms, f"FAIL ({ms}ms: {safe})"
+
+    def refine(
+        self,
+        asr_input: AsrResult | str,
+        *,
+        session_key: str = "",
+        tracker: SessionTracker | None = None,
+        fallback_context: str = "",
+        is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
+        mode: str = "agent",
+        workspace_cwd: str = "",
+        target_hint: str = "",
+    ) -> RefinerResult:
+        requested_model = self.cfg.refiner.effective_model("agy")
+        requested_effort = self.cfg.refiner.effective_effort("agy")
+        if requested_effort not in VALID_EFFORTS:
+            raise ConfigError(
+                f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, got {self.cfg.refiner.effort!r}"
+            )
+        clean_draft, single_hop = _unpack(asr_input)
+        if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
+            return NoopRefiner().refine(asr_input, mode=mode)
+        t0 = self.clock_fn()
+        if c_kind := _cancel_fallback_kind(cancel_token, is_cancelled):
+            return _fallback_result(clean_draft, self.provider_name, requested_model, t0, self.clock_fn, c_kind)
+
+        agy_bin = find_agy_bin(self.env)
+        if not agy_bin:
+            return _fallback_result(
+                clean_draft,
+                self.provider_name,
+                requested_model,
+                t0,
+                self.clock_fn,
+                "asr_draft",
+                "agy CLI not found in PATH (install Antigravity CLI or set AGY_BIN)",
+            )
+
+        eff_mode = (mode or "agent").strip().lower() or "agent"
+        context_blocks, final_block = build_refiner_request_blocks(
+            self.cfg,
+            clean_draft,
+            session_key=session_key,
+            tracker=tracker,
+            fallback_context=fallback_context,
+            mode=eff_mode,
+            workspace_cwd=workspace_cwd,
+            target_hint=target_hint,
+        )
+        ctx_chunks, ctx_chars = len(context_blocks), sum(len(b) for b in context_blocks)
+        used_prior = any(b.startswith("<prior_session_reference") for b in context_blocks)
+
+        try:
+            workdir = self._ensure_agent_workdir()
+        except Exception as exc:
+            warn = redact_secrets(str(exc), self.env, cfg=self.cfg)
+            return _fallback_result(
+                clean_draft,
+                self.provider_name,
+                requested_model,
+                t0,
+                self.clock_fn,
+                "asr_draft",
+                warn,
+                context_chars=ctx_chars,
+                context_chunks=ctx_chunks,
+                used_prior_session=used_prior,
+            )
+
+        sys_prompt = _compose_codex_instructions(resolve_refiner_prompt(self.cfg, mode=eff_mode))
+        prompt_hash = hashlib.sha256(sys_prompt.encode("utf-8")).hexdigest()[:16]
+        effort_explicit = self.cfg.refiner.has_explicit_effort("agy")
+        effort_key = f"{requested_effort}:{'1' if effort_explicit else '0'}"
+        max_turns = max(1, int(self.cfg.refiner.max_turns_per_thread))
+
+        # Only stateful-resume when an explicit session_key identifies a single session;
+        # stateless GUI apps without session_key must never share a conversation thread.
+        norm_session_key = session_key.strip()
+        thread_state: _AgyThreadState | None = (
+            self._get_thread_state((norm_session_key, eff_mode)) if norm_session_key else None
+        )
+
+        tsec = effective_refiner_timeout_sec(self.cfg.refiner.timeout_sec, len(clean_draft))
+        overall_deadline = t0 + tsec
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
+        resolved_model_box = [requested_model]
+        secrets: tuple[str, ...] = tuple(self.creds.all_secret_values())
+        pacer_key = make_rate_pacer_key("agy", f"local://{agy_bin}", "")
+
+        if thread_state is not None:
+            while True:
+                rem_lock = overall_deadline - self.clock_fn()
+                if rem_lock <= 0:
+                    return _fallback_result(
+                        clean_draft,
+                        self.provider_name,
+                        requested_model,
+                        t0,
+                        self.clock_fn,
+                        "asr_draft",
+                        f"agy refiner timed out waiting for session lock (budget={tsec:.2f}s)",
+                        context_chars=ctx_chars,
+                        context_chunks=ctx_chunks,
+                        used_prior_session=used_prior,
+                    )
+                if thread_state.lock.acquire(timeout=min(0.05, max(0.005, rem_lock))):
+                    break
+                if self._closed or (eff_cancelled is not None and eff_cancelled()):
+                    c_kind = _cancel_fallback_kind(cancel_token, is_cancelled) or "cancelled"
+                    return _fallback_result(
+                        clean_draft,
+                        self.provider_name,
+                        requested_model,
+                        t0,
+                        self.clock_fn,
+                        c_kind,
+                        context_chars=ctx_chars,
+                        context_chunks=ctx_chunks,
+                        used_prior_session=used_prior,
+                    )
+
+        pending_thread_commit: list[tuple[str, int]] = []
+
+        try:
+            def _attempt(
+                req_timeout: float, _wall_dl: float | None, _is_first: bool
+            ) -> tuple[str, _TokenUsageTuple, int]:
+                pending_thread_commit.clear()
+                attempt_deadline = min(overall_deadline, self.clock_fn() + req_timeout)
+                full_prompt = (
+                    f"{_AGY_PROMPT_PREFIX}{sys_prompt}\n\n"
+                    + "\n\n".join((*context_blocks, final_block))
+                )
+                resume_cid = ""
+                prev_turns = 0
+                prev_sent: tuple[str, ...] = ()
+                if thread_state is not None:
+                    can_resume = (
+                        bool(thread_state.conversation_id)
+                        and thread_state.turn_count < max_turns
+                        and thread_state.model == requested_model
+                        and thread_state.effort == effort_key
+                        and thread_state.prompt_hash == prompt_hash
+                        and len(context_blocks) >= len(thread_state.sent_blocks)
+                        and tuple(context_blocks[: len(thread_state.sent_blocks)]) == thread_state.sent_blocks
+                    )
+                    if can_resume:
+                        resume_cid = thread_state.conversation_id
+                        prev_turns = thread_state.turn_count
+                        prev_sent = thread_state.sent_blocks
+                    # Clear before running ACP so any timeout/cancel/EOF/RPC failure never leaves a dirty thread behind.
+                    thread_state.conversation_id = ""
+                    thread_state.turn_count = 0
+                    thread_state.sent_blocks = ()
+
+                def _remaining_or_timeout() -> float:
+                    rem = attempt_deadline - self.clock_fn()
+                    if rem <= 0.01:
+                        raise _AgyRpcError(
+                            f"agy did not finish within {tsec:.1f}s", source="hard_timeout"
+                        )
+                    return rem
+
+                try:
+                    if resume_cid:
+                        delta_blocks = context_blocks[len(prev_sent) :]
+                        resume_prompt = f"{_AGY_PROMPT_PREFIX}" + "\n\n".join((*delta_blocks, final_block))
+                        try:
+                            out_txt, sid, res_mod, usage, init_ms = self._run_acp_session(
+                                agy_bin=agy_bin,
+                                workdir=workdir,
+                                timeout_sec=_remaining_or_timeout(),
+                                prompt_text=resume_prompt,
+                                requested_model=requested_model,
+                                requested_effort=requested_effort,
+                                effort_explicit=effort_explicit,
+                                conversation_id=resume_cid,
+                                is_cancelled=is_cancelled,
+                                cancel_token=cancel_token,
+                            )
+                            resumed = True
+                        except _AgyRpcError as exc:
+                            if exc.source != "conversation":
+                                raise
+                            out_txt, sid, res_mod, usage, init_ms = self._run_acp_session(
+                                agy_bin=agy_bin,
+                                workdir=workdir,
+                                timeout_sec=_remaining_or_timeout(),
+                                prompt_text=full_prompt,
+                                requested_model=requested_model,
+                                requested_effort=requested_effort,
+                                effort_explicit=effort_explicit,
+                                conversation_id="",
+                                is_cancelled=is_cancelled,
+                                cancel_token=cancel_token,
+                            )
+                            resumed = False
+                    else:
+                        out_txt, sid, res_mod, usage, init_ms = self._run_acp_session(
+                            agy_bin=agy_bin,
+                            workdir=workdir,
+                            timeout_sec=_remaining_or_timeout(),
+                            prompt_text=full_prompt,
+                            requested_model=requested_model,
+                            requested_effort=requested_effort,
+                            effort_explicit=effort_explicit,
+                            conversation_id="",
+                            is_cancelled=is_cancelled,
+                            cancel_token=cancel_token,
+                        )
+                        resumed = False
+                except _AgyRpcError as exc:
+                    rkind = "never" if exc.source in _AGY_NON_RETRYABLE_SOURCES else "transient"
+                    raise _RefinerAttemptError(str(exc), retry_kind=rkind, error_code=exc.source) from None
+
+                pending_thread_commit.append((sid, (prev_turns + 1) if resumed else 1))
+                if res_mod:
+                    resolved_model_box[0] = res_mod
+                return out_txt, usage, init_ms
+
+            res = _run_refiner_retry_loop(
+                cfg=self.cfg,
+                env=self.env,
+                provider_name=self.provider_name,
+                model=requested_model,
+                model_fn=lambda: resolved_model_box[0],
+                clean_draft=clean_draft,
+                t0=t0,
+                tsec=tsec,
+                clock_fn=self.clock_fn,
+                sleep_fn=self.sleep_fn,
+                rand_fn=self.rand_fn,
+                is_cancelled=is_cancelled,
+                pacer_key_fn=lambda: pacer_key,
+                secrets_fn=lambda: secrets,
+                attempt_fn=_attempt,
+                context_chars=ctx_chars,
+                context_chunks=ctx_chunks,
+                used_prior_session=used_prior,
+                cancel_token=cancel_token,
+            )
+            if (
+                thread_state is not None
+                and not res.used_fallback
+                and pending_thread_commit
+                and not self._closed
+                and not (eff_cancelled is not None and eff_cancelled())
+                and self.clock_fn() <= overall_deadline + 1e-9
+            ):
+                committed_sid, committed_turns = pending_thread_commit[-1]
+                thread_state.conversation_id = committed_sid
+                thread_state.turn_count = committed_turns
+                thread_state.sent_blocks = tuple(context_blocks)
+                thread_state.model = requested_model
+                thread_state.effort = effort_key
+                thread_state.prompt_hash = prompt_hash
+            return res
+        finally:
+            if thread_state is not None:
+                thread_state.lock.release()
+
+    def close(self) -> None:
+        self._closed = True
+        with self._procs_lock:
+            procs = list(self._active_procs)
+            self._active_procs.clear()
+        for proc in procs:
+            _agy_stop_process_group(proc, fast=True)
+
+
 def create_refiner(
     cfg: Config,
     creds: ProviderCredentials | None = None,
@@ -2835,6 +4032,16 @@ def create_refiner(
     }
     if prov == "codex":
         return CodexRefiner(cfg, eff_creds, runtime_dir=runtime_dir, **common_kw)
+    if prov == "agy":
+        return AgyRefiner(
+            cfg,
+            eff_creds,
+            env=env,
+            runtime_dir=runtime_dir,
+            clock_fn=clock_fn,
+            sleep_fn=sleep_fn,
+            rand_fn=rand_fn,
+        )
     if eff_api == "gemini":
         return GeminiRefiner(cfg, eff_creds, **common_kw)
     if eff_api == "responses":

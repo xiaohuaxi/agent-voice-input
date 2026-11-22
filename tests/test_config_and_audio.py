@@ -960,7 +960,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         )
         self.assertEqual(
             VALID_REFINER_PROVIDERS,
-            frozenset({"auto", "codex", "deepseek", "dashscope", "volcengine", "openrouter", "gemini", "openai", "groq", "siliconflow", "openai-compatible", "off"}),
+            frozenset({"auto", "codex", "agy", "deepseek", "dashscope", "volcengine", "openrouter", "gemini", "openai", "groq", "siliconflow", "openai-compatible", "off"}),
         )
         self.assertEqual(VALID_ASR_APIS, frozenset({"auto", "audio-transcriptions", "chat-completions"}))
         self.assertEqual(
@@ -1001,7 +1001,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(DEFAULT_REFINER_MODELS["groq"], "llama-3.3-70b-versatile")
         self.assertEqual(DEFAULT_REFINER_MODELS["siliconflow"], "Qwen/Qwen2.5-7B-Instruct")
 
-        self.assertEqual(DEFAULT_REFINER_EFFORTS, {"codex": "low", "openai": "low"})
+        self.assertEqual(DEFAULT_REFINER_EFFORTS, {"codex": "low", "agy": "low", "openai": "low"})
         self.assertEqual(RefinerConfig(provider="codex").effort, "low")
         self.assertEqual(RefinerConfig(provider="openai").effort, "low")
         for non_codex in ("deepseek", "openrouter", "dashscope", "volcengine", "gemini", "openai-compatible"):
