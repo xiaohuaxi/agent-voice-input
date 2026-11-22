@@ -1,13 +1,18 @@
 """Offline tests for v0.11.0 long-running sleep/wake resilience and overhead bounds."""
 from __future__ import annotations
 
+import base64
 import errno
 import http.client
 import http.server
+import io
 import json
 import os
 from pathlib import Path
+import select
+import shutil
 import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -36,7 +41,11 @@ from agent_voice_input.http_transport import (  # noqa: E402
     _KEEPALIVE_POOL,
     _KeepAlivePool,
     _SplitTimeoutHTTPConnection,
+    _SplitTimeoutHTTPSConnection,
     _is_idle_socket_stale,
+    _normalize_proxy_fingerprint,
+    _parse_http_proxy_route,
+    _redact_proxy_error_text,
     _resolve_system_proxy_key,
     evict_all_keepalive_connections,
     urllib_http_transport,
@@ -528,6 +537,1323 @@ class KeepAlivePoolAndBoundedDnsTests(unittest.TestCase):
             resolver_fn=lambda host, port, *_: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))],
         )
         self.assertEqual(len(out), 1)
+
+
+def _recv_http_message(
+    sock: socket.socket, stop_evt: threading.Event
+) -> tuple[str, dict[str, str], bytes, list[tuple[str, str]]] | None:
+    """Read one HTTP/1.x request head + Content-Length body from a persistent loopback socket."""
+    buf = b""
+    sock.settimeout(0.05)
+    while b"\r\n\r\n" not in buf:
+        if stop_evt.is_set():
+            return None
+        try:
+            chunk = sock.recv(4096)
+        except TimeoutError:
+            continue
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+    head_bytes, rest = buf.split(b"\r\n\r\n", 1)
+    lines = head_bytes.decode("iso-8859-1").split("\r\n")
+    req_line = lines[0]
+    hdrs: dict[str, str] = {}
+    raw_hdr_pairs: list[tuple[str, str]] = []
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k_low = k.strip().lower()
+            v_str = v.strip()
+            hdrs[k_low] = v_str
+            raw_hdr_pairs.append((k_low, v_str))
+    clen = int(hdrs.get("content-length") or "0")
+    body = rest
+    while len(body) < clen:
+        if stop_evt.is_set():
+            return None
+        try:
+            chunk = sock.recv(max(4096, clen - len(body)))
+        except TimeoutError:
+            continue
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        body += chunk
+    return req_line, hdrs, body[:clen], raw_hdr_pairs
+
+
+class _LoopbackHttpProxyServer:
+    """Real loopback TCP/HTTP proxy supporting HTTP keep-alive forwarding and HTTPS CONNECT tunnels."""
+
+    def __init__(
+        self,
+        *,
+        expected_auth: str | None = None,
+        hang_connect: bool = False,
+        reject_connect_status: str | None = None,
+        truncate_connect_headers: bool = False,
+        drop_second_req_after_read: bool = False,
+    ) -> None:
+        self.expected_auth = expected_auth
+        self.hang_connect = hang_connect
+        self.reject_connect_status = reject_connect_status
+        self.truncate_connect_headers = truncate_connect_headers
+        self.drop_second_req_after_read = drop_second_req_after_read
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._active_socks: set[socket.socket] = set()
+        self._threads: list[threading.Thread] = []
+        self.tcp_accepts = 0
+        self.connect_lines: list[str] = []
+        self.connect_host_header_counts: list[int] = []
+        self.connect_requests: list[tuple[str, dict[str, str]]] = []
+        self.http_requests: list[tuple[str, str, dict[str, str], bytes]] = []
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(16)
+        self._srv.settimeout(0.05)
+        self.port = self._srv.getsockname()[1]
+        self._accept_th = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_th.start()
+
+    def _track(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._active_socks.add(sock)
+
+    def _untrack_and_close(self, sock: socket.socket | None) -> None:
+        if sock is None:
+            return
+        with self._lock:
+            self._active_socks.discard(sock)
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def close_all_client_sockets(self) -> None:
+        with self._lock:
+            socks = list(self._active_socks)
+        for s in socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+        self.close_all_client_sockets()
+        self._accept_th.join(timeout=2.0)
+        with self._lock:
+            ths = list(self._threads)
+        for th in ths:
+            th.join(timeout=2.0)
+
+    def _accept_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                client, _ = self._srv.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            with self._lock:
+                self.tcp_accepts += 1
+            self._track(client)
+            th = threading.Thread(target=self._handle_client, args=(client,), daemon=True)
+            with self._lock:
+                self._threads.append(th)
+            th.start()
+
+    def _handle_client(self, client: socket.socket) -> None:
+        upstream: socket.socket | None = None
+        req_count_on_conn = 0
+        try:
+            while not self._stop.is_set():
+                msg = _recv_http_message(client, self._stop)
+                if msg is None:
+                    break
+                req_line, hdrs, body, raw_hdr_pairs = msg
+                parts = req_line.split(" ", 2)
+                if len(parts) < 2:
+                    break
+                method, target = parts[0].upper(), parts[1]
+                req_count_on_conn += 1
+
+                if method == "CONNECT":
+                    with self._lock:
+                        self.connect_lines.append(req_line)
+                        self.connect_host_header_counts.append(
+                            sum(1 for k, _ in raw_hdr_pairs if k == "host")
+                        )
+                        self.connect_requests.append((target, dict(hdrs)))
+                    if self.hang_connect:
+                        self._stop.wait(timeout=5.0)
+                        break
+                    if self.truncate_connect_headers:
+                        client.sendall(b"HTTP/1.1 200 Connection Established\r\nX-Partial: 1\r\n")
+                        break
+                    if self.reject_connect_status:
+                        client.sendall(
+                            f"HTTP/1.1 {self.reject_connect_status}\r\n"
+                            "Proxy-Authenticate: Basic realm=\"corp\"\r\n"
+                            "Connection: close\r\n\r\n".encode("iso-8859-1")
+                        )
+                        break
+                    if self.expected_auth is not None and hdrs.get("proxy-authorization") != self.expected_auth:
+                        client.sendall(
+                            b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                            b"Proxy-Authenticate: Basic realm=\"corp\"\r\n"
+                            b"Connection: close\r\n\r\n"
+                        )
+                        break
+                    t_host, t_port_s = target.rsplit(":", 1)
+                    connect_host = (
+                        "127.0.0.1"
+                        if t_host.lower() in ("localhost", "[::1]")
+                        else t_host.strip("[]")
+                    )
+                    upstream = socket.create_connection((connect_host, int(t_port_s)), timeout=2.0)
+                    self._track(upstream)
+                    client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    self._relay_tunnel(client, upstream)
+                    break
+
+                with self._lock:
+                    self.http_requests.append((method, target, dict(hdrs), body))
+
+                if self.drop_second_req_after_read and req_count_on_conn == 2:
+                    self.drop_second_req_after_read = False
+                    break
+
+                if self.expected_auth is not None and hdrs.get("proxy-authorization") != self.expected_auth:
+                    err_body = b'{"error":"proxy_auth_required"}'
+                    client.sendall(
+                        b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Connection: keep-alive\r\n"
+                        + f"Content-Length: {len(err_body)}\r\n\r\n".encode("ascii")
+                        + err_body
+                    )
+                    continue
+
+                if target.endswith("/redir307"):
+                    base_prefix = target[: -len("/redir307")]
+                    client.sendall(
+                        b"HTTP/1.1 307 Temporary Redirect\r\n"
+                        + f"Location: {base_prefix}/echo\r\n".encode("iso-8859-1")
+                        + b"Content-Length: 0\r\n"
+                        b"Connection: keep-alive\r\n\r\n"
+                    )
+                    continue
+
+                if target.endswith("/407"):
+                    err_body = b'{"error":"auth"}'
+                    client.sendall(
+                        b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Connection: keep-alive\r\n"
+                        + f"Content-Length: {len(err_body)}\r\n\r\n".encode("ascii")
+                        + err_body
+                    )
+                    continue
+
+                payload = json.dumps(
+                    {
+                        "method": method,
+                        "target": target,
+                        "host": hdrs.get("host", ""),
+                        "proxy_auth": hdrs.get("proxy-authorization", ""),
+                        "body": body.decode("utf-8", errors="replace"),
+                        "conn_req_no": req_count_on_conn,
+                    }
+                ).encode("utf-8")
+                close_hdr = ""
+                should_close = False
+                if target.endswith("/close-proxy"):
+                    # Emit duplicate Proxy-Connection headers (close THEN keep-alive) and deliberately
+                    # keep the server socket OPEN so the test fails if the client drops earlier headers!
+                    close_hdr = "Proxy-Connection: close\r\nProxy-Connection: keep-alive\r\n"
+                    should_close = False
+                elif target.endswith("/close-conn"):
+                    close_hdr = "Connection: close\r\nConnection: keep-alive\r\n"
+                    should_close = False
+                else:
+                    close_hdr = "Connection: keep-alive\r\n"
+                client.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + close_hdr.encode("ascii")
+                    + f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+                    + payload
+                )
+                if should_close:
+                    break
+        except OSError:
+            pass
+        finally:
+            self._untrack_and_close(upstream)
+            self._untrack_and_close(client)
+
+    def _relay_tunnel(self, client: socket.socket, upstream: socket.socket) -> None:
+        client.setblocking(False)
+        upstream.setblocking(False)
+        while not self._stop.is_set():
+            try:
+                rlist, _, _ = select.select([client, upstream], [], [], 0.05)
+            except (OSError, ValueError):
+                break
+            if not rlist:
+                continue
+            for src in rlist:
+                dst = upstream if src is client else client
+                try:
+                    data = src.recv(16384)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    return
+                if not data:
+                    return
+                view = memoryview(data)
+                sent = 0
+                while sent < len(data) and not self._stop.is_set():
+                    try:
+                        n = dst.send(view[sent:])
+                        if n <= 0:
+                            return
+                        sent += n
+                    except BlockingIOError:
+                        select.select([], [dst], [], 0.05)
+                    except OSError:
+                        return
+
+
+class _LoopbackTlsOriginServer:
+    """Real OpenSSL TLS HTTP/1.1 origin server recording ClientHello SNI and Keep-Alive requests."""
+
+    def __init__(self, cert_path: Path, key_path: Path) -> None:
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._active_socks: set[socket.socket] = set()
+        self._threads: list[threading.Thread] = []
+        self.sni_names: list[str | None] = []
+        self.requests: list[tuple[str, str, dict[str, str], bytes]] = []
+        self.tls_handshakes = 0
+        self._ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+        self._ctx.sni_callback = self._on_sni
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(16)
+        self._srv.settimeout(0.05)
+        self.port = self._srv.getsockname()[1]
+        self._accept_th = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_th.start()
+
+    def _on_sni(self, _ssl_sock: ssl.SSLSocket, server_name: str | None, _ctx: ssl.SSLContext) -> None:
+        with self._lock:
+            self.sni_names.append(server_name)
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+        with self._lock:
+            socks = list(self._active_socks)
+            ths = list(self._threads)
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        self._accept_th.join(timeout=2.0)
+        for th in ths:
+            th.join(timeout=2.0)
+
+    def _accept_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                raw_sock, _ = self._srv.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            with self._lock:
+                self._active_socks.add(raw_sock)
+            th = threading.Thread(target=self._handle_conn, args=(raw_sock,), daemon=True)
+            with self._lock:
+                self._threads.append(th)
+            th.start()
+
+    def _handle_conn(self, raw_sock: socket.socket) -> None:
+        tls_sock: ssl.SSLSocket | None = None
+        req_no = 0
+        try:
+            raw_sock.settimeout(2.0)
+            tls_sock = self._ctx.wrap_socket(raw_sock, server_side=True)
+            with self._lock:
+                self._active_socks.discard(raw_sock)
+                self._active_socks.add(tls_sock)
+                self.tls_handshakes += 1
+            while not self._stop.is_set():
+                msg = _recv_http_message(tls_sock, self._stop)
+                if msg is None:
+                    break
+                req_line, hdrs, body, _ = msg
+                parts = req_line.split(" ", 2)
+                if len(parts) < 2:
+                    break
+                method, path = parts[0].upper(), parts[1]
+                req_no += 1
+                with self._lock:
+                    self.requests.append((method, path, dict(hdrs), body))
+                if path == "/redir307":
+                    tls_sock.sendall(
+                        b"HTTP/1.1 307 Temporary Redirect\r\n"
+                        b"Location: /v1/echo\r\n"
+                        b"Content-Length: 0\r\n"
+                        b"Connection: keep-alive\r\n\r\n"
+                    )
+                    continue
+                payload = json.dumps(
+                    {
+                        "method": method,
+                        "path": path,
+                        "host": hdrs.get("host", ""),
+                        "proxy_auth": hdrs.get("proxy-authorization", ""),
+                        "body": body.decode("utf-8", errors="replace"),
+                        "conn_req_no": req_no,
+                    }
+                ).encode("utf-8")
+                tls_sock.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Connection: keep-alive\r\n"
+                    + f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+                    + payload
+                )
+        except OSError:
+            pass
+        finally:
+            sock_to_close = tls_sock if tls_sock is not None else raw_sock
+            with self._lock:
+                self._active_socks.discard(raw_sock)
+                if tls_sock is not None:
+                    self._active_socks.discard(tls_sock)
+            try:
+                sock_to_close.close()
+            except OSError:
+                pass
+
+
+def _generate_localhost_cert(tmp_dir: Path) -> tuple[Path, Path]:
+    """Generate a self-signed cert valid ONLY for DNS:localhost and IP:::1 (NOT IP:127.0.0.1)."""
+    openssl_bin = shutil.which("openssl")
+    if not openssl_bin:
+        raise unittest.SkipTest("openssl binary unavailable for loopback TLS cert generation")
+    cfg_path = tmp_dir / "openssl.cnf"
+    cert_path = tmp_dir / "localhost.crt"
+    key_path = tmp_dir / "localhost.key"
+    cfg_path.write_text(
+        "[req]\n"
+        "prompt = no\n"
+        "distinguished_name = dn\n"
+        "x509_extensions = v3_req\n"
+        "[dn]\n"
+        "CN = localhost\n"
+        "[v3_req]\n"
+        "subjectAltName = DNS:localhost,IP:::1\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [
+            openssl_bin,
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            str(key_path),
+            "-out",
+            str(cert_path),
+            "-days",
+            "1",
+            "-config",
+            str(cfg_path),
+            "-extensions",
+            "v3_req",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"openssl cert generation failed: {proc.stderr.strip()}")
+    return cert_path, key_path
+
+
+class HttpProxyKeepAliveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _KEEPALIVE_POOL.evict_all()
+
+    def tearDown(self) -> None:
+        _KEEPALIVE_POOL.evict_all()
+
+    def _clean_proxy_env(self, extra: dict[str, str]) -> dict[str, str]:
+        base = {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+        base.update(extra)
+        return base
+
+    def test_https_target_via_http_connect_proxy_reuses_tunnel_and_verifies_target_sni(self) -> None:
+        expected_auth = "Basic " + base64.b64encode(b"alice:s@cret 1").decode("ascii")
+        with tempfile.TemporaryDirectory(prefix="avi-tls-proxy-") as td:
+            cert_path, key_path = _generate_localhost_cert(Path(td))
+            client_ssl_ctx = ssl.create_default_context(cafile=str(cert_path))
+            self.assertTrue(client_ssl_ctx.check_hostname)
+            self.assertEqual(client_ssl_ctx.verify_mode, ssl.CERT_REQUIRED)
+
+            origin = _LoopbackTlsOriginServer(cert_path, key_path)
+            proxy = _LoopbackHttpProxyServer(expected_auth=expected_auth)
+            try:
+                proxy_url = f"http://alice:s%40cret%201@127.0.0.1:{proxy.port}"
+                env_map = self._clean_proxy_env({"HTTPS_PROXY": proxy_url})
+                with (
+                    mock.patch.dict(os.environ, env_map, clear=True),
+                    mock.patch.object(_KEEPALIVE_POOL, "_get_ssl_context", return_value=client_ssl_ctx),
+                ):
+                    r1 = urllib_http_transport(
+                        HttpRequest(
+                            url=f"https://localhost:{origin.port}/v1/echo?n=1",
+                            method="GET",
+                            headers={},
+                            body=b"",
+                            timeout_sec=3.0,
+                        )
+                    )
+                    r2 = urllib_http_transport(
+                        HttpRequest(
+                            url=f"https://localhost:{origin.port}/v1/echo?n=2",
+                            method="POST",
+                            headers={"Content-Type": "application/json"},
+                            body=b'{"hello":"tunnel"}',
+                            timeout_sec=3.0,
+                        )
+                    )
+                    r3 = urllib_http_transport(
+                        HttpRequest(
+                            url=f"https://localhost:{origin.port}/redir307",
+                            method="POST",
+                            headers={"Content-Type": "text/plain"},
+                            body=b"keep-me",
+                            timeout_sec=3.0,
+                        )
+                    )
+
+                # Also verify schemeless proxy shorthand normalizes to the same pool key & reuses tunnel!
+                env_schemeless = self._clean_proxy_env(
+                    {"HTTPS_PROXY": f"alice:s%40cret%201@127.0.0.1:{proxy.port}"}
+                )
+                with (
+                    mock.patch.dict(os.environ, env_schemeless, clear=True),
+                    mock.patch.object(_KEEPALIVE_POOL, "_get_ssl_context", return_value=client_ssl_ctx),
+                ):
+                    r4 = urllib_http_transport(
+                        HttpRequest(
+                            url=f"https://localhost:{origin.port}/v1/echo?n=4",
+                            method="GET",
+                            headers={},
+                            body=b"",
+                            timeout_sec=3.0,
+                        )
+                    )
+
+                self.assertEqual(r1.status, 200)
+                self.assertEqual(r2.status, 200)
+                self.assertEqual(r3.status, 200)
+                self.assertEqual(r4.status, 200)
+                self.assertEqual(r1.json()["path"], "/v1/echo?n=1")
+                self.assertEqual(r1.json()["host"], f"localhost:{origin.port}")
+                self.assertEqual(r1.json()["proxy_auth"], "")
+                self.assertEqual(r2.json()["body"], '{"hello":"tunnel"}')
+                self.assertEqual(r3.json()["method"], "POST")
+                self.assertEqual(r3.json()["path"], "/v1/echo")
+                self.assertEqual(r3.json()["body"], "keep-me")
+                self.assertEqual(r4.json()["conn_req_no"], 5)
+
+                # Exactly ONE TCP connection, ONE CONNECT tunnel, and ONE TLS handshake for all 5 HTTPS hops!
+                self.assertEqual(proxy.tcp_accepts, 1)
+                self.assertEqual(len(proxy.connect_requests), 1)
+                self.assertEqual(proxy.connect_requests[0][0], f"localhost:{origin.port}")
+                self.assertEqual(proxy.connect_requests[0][1].get("proxy-authorization"), expected_auth)
+                self.assertEqual(origin.tls_handshakes, 1)
+                # Real TLS SNI + cert verification used target_host ("localhost"), NOT proxy_host ("127.0.0.1")!
+                self.assertEqual(origin.sni_names, ["localhost"])
+            finally:
+                _KEEPALIVE_POOL.evict_all()
+                proxy.stop()
+                origin.stop()
+
+    def test_http_target_via_http_proxy_reuses_connection_with_absolute_uri_and_auth(self) -> None:
+        expected_auth = "Basic " + base64.b64encode(b"bob:p:ss").decode("ascii")
+        proxy = _LoopbackHttpProxyServer(expected_auth=expected_auth)
+        direct_paths: list[tuple[str, str]] = []
+
+        class _DirectOriginHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                direct_paths.append((self.path, self.headers.get("Proxy-Authorization", "")))
+                body = b'{"direct":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        direct_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _DirectOriginHandler)
+        direct_port = direct_srv.server_address[1]
+        direct_th = threading.Thread(target=direct_srv.serve_forever, daemon=True)
+        direct_th.start()
+        try:
+            proxy_url = f"http://bob:p%3Ass@127.0.0.1:{proxy.port}"
+            env_map = self._clean_proxy_env({"HTTP_PROXY": proxy_url})
+            with mock.patch.dict(os.environ, env_map, clear=True):
+                r1 = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{direct_port}/v1/ping?k=1",
+                        method="GET",
+                        headers={},
+                        body=b"",
+                        timeout_sec=3.0,
+                    )
+                )
+                r2 = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{direct_port}/v1/ping?k=2",
+                        method="POST",
+                        headers={"Content-Type": "text/plain"},
+                        body=b"payload",
+                        timeout_sec=3.0,
+                    )
+                )
+                r3 = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{direct_port}/redir307",
+                        method="POST",
+                        headers={"Content-Type": "text/plain"},
+                        body=b"redir-body",
+                        timeout_sec=3.0,
+                    )
+                )
+
+                self.assertEqual(r1.status, 200)
+                self.assertEqual(r2.status, 200)
+                self.assertEqual(r3.status, 200)
+                self.assertEqual(r1.json()["target"], f"http://127.0.0.1:{direct_port}/v1/ping?k=1")
+                self.assertEqual(r1.json()["host"], f"127.0.0.1:{direct_port}")
+                self.assertEqual(r1.json()["proxy_auth"], expected_auth)
+                self.assertEqual(r2.json()["conn_req_no"], 2)
+                self.assertEqual(r3.json()["target"], f"http://127.0.0.1:{direct_port}/echo")
+                self.assertEqual(r3.json()["body"], "redir-body")
+                self.assertEqual(r3.json()["conn_req_no"], 4)
+                self.assertEqual(proxy.tcp_accepts, 1)
+
+                # Duplicate Proxy-Connection: close + keep-alive (with server socket kept OPEN)
+                # must still prevent returning the socket to the pool!
+                r_close = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{direct_port}/close-proxy",
+                        method="GET",
+                        headers={},
+                        body=b"",
+                        timeout_sec=3.0,
+                    )
+                )
+                self.assertEqual(r_close.status, 200)
+                r_next = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{direct_port}/v1/after-close",
+                        method="GET",
+                        headers={},
+                        body=b"",
+                        timeout_sec=3.0,
+                    )
+                )
+                self.assertEqual(r_next.status, 200)
+                self.assertEqual(r_next.json()["conn_req_no"], 1)
+                self.assertEqual(proxy.tcp_accepts, 2)
+
+                # Duplicate Connection: close + keep-alive (with server socket kept OPEN) also discards socket
+                r_close_conn = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{direct_port}/close-conn",
+                        method="GET",
+                        headers={},
+                        body=b"",
+                        timeout_sec=3.0,
+                    )
+                )
+                self.assertEqual(r_close_conn.status, 200)
+                r_after_conn_close = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{direct_port}/v1/after-conn-close",
+                        method="GET",
+                        headers={},
+                        body=b"",
+                        timeout_sec=3.0,
+                    )
+                )
+                self.assertEqual(r_after_conn_close.status, 200)
+                self.assertEqual(r_after_conn_close.json()["conn_req_no"], 1)
+                self.assertEqual(proxy.tcp_accepts, 3)
+
+                # Plain HTTP 407 is returned cleanly and NEVER pooled even if proxy sent keep-alive
+                r_407 = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{direct_port}/407",
+                        method="GET",
+                        headers={},
+                        body=b"",
+                        timeout_sec=3.0,
+                    )
+                )
+                self.assertEqual(r_407.status, 407)
+                r_post_407 = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{direct_port}/v1/after-407",
+                        method="GET",
+                        headers={},
+                        body=b"",
+                        timeout_sec=3.0,
+                    )
+                )
+                self.assertEqual(r_post_407.status, 200)
+                self.assertEqual(r_post_407.json()["conn_req_no"], 1)
+                self.assertEqual(proxy.tcp_accepts, 4)
+
+            # NO_PROXY bypass goes direct to origin with relative path & ZERO Proxy-Authorization leakage
+            env_bypass = self._clean_proxy_env({"HTTP_PROXY": proxy_url, "NO_PROXY": "127.0.0.1"})
+            with mock.patch.dict(os.environ, env_bypass, clear=True):
+                r_dir = urllib_http_transport(
+                    HttpRequest(
+                        url=f"http://127.0.0.1:{direct_port}/direct-check",
+                        method="GET",
+                        headers={},
+                        body=b"",
+                        timeout_sec=3.0,
+                    )
+                )
+            self.assertEqual(r_dir.status, 200)
+            self.assertEqual(r_dir.json(), {"direct": True})
+            self.assertEqual(direct_paths, [("/direct-check", "")])
+            self.assertEqual(proxy.tcp_accepts, 4)
+        finally:
+            _KEEPALIVE_POOL.evict_all()
+            proxy.stop()
+            direct_srv.shutdown()
+            direct_srv.server_close()
+            direct_th.join(timeout=2.0)
+
+    def test_http_proxy_pool_isolation_by_target_proxy_and_credentials(self) -> None:
+        proxy_a = _LoopbackHttpProxyServer()
+        proxy_b = _LoopbackHttpProxyServer()
+        try:
+            # 1. Same proxy, different target ports do NOT share pool bucket
+            env_a = self._clean_proxy_env({"HTTP_PROXY": f"http://127.0.0.1:{proxy_a.port}"})
+            with mock.patch.dict(os.environ, env_a, clear=True):
+                r_t1 = urllib_http_transport(HttpRequest("http://127.0.0.1:18001/a", "GET", {}, b"", 3.0))
+                r_t2 = urllib_http_transport(HttpRequest("http://127.0.0.1:18002/b", "GET", {}, b"", 3.0))
+                self.assertEqual(r_t1.json()["conn_req_no"], 1)
+                self.assertEqual(r_t2.json()["conn_req_no"], 1)
+                self.assertEqual(proxy_a.tcp_accepts, 2)
+                # Repeating both targets reuses their respective pooled sockets (still 2 accepts)
+                r_t1b = urllib_http_transport(HttpRequest("http://127.0.0.1:18001/a2", "GET", {}, b"", 3.0))
+                r_t2b = urllib_http_transport(HttpRequest("http://127.0.0.1:18002/b2", "GET", {}, b"", 3.0))
+                self.assertEqual(r_t1b.json()["conn_req_no"], 2)
+                self.assertEqual(r_t2b.json()["conn_req_no"], 2)
+                self.assertEqual(proxy_a.tcp_accepts, 2)
+
+            # 2. Different proxy server gets its own bucket
+            env_b = self._clean_proxy_env({"HTTP_PROXY": f"http://127.0.0.1:{proxy_b.port}"})
+            with mock.patch.dict(os.environ, env_b, clear=True):
+                r_b1 = urllib_http_transport(HttpRequest("http://127.0.0.1:18001/b1", "GET", {}, b"", 3.0))
+                r_b2 = urllib_http_transport(HttpRequest("http://127.0.0.1:18001/b2", "GET", {}, b"", 3.0))
+                self.assertEqual(r_b1.json()["conn_req_no"], 1)
+                self.assertEqual(r_b2.json()["conn_req_no"], 2)
+                self.assertEqual(proxy_b.tcp_accepts, 1)
+
+            # 3. Same proxy + same target, different credentials isolate buckets & never leak auth headers
+            env_u1 = self._clean_proxy_env({"HTTP_PROXY": f"http://u1:secretA@127.0.0.1:{proxy_a.port}"})
+            env_u2 = self._clean_proxy_env({"HTTP_PROXY": f"http://u2:secretB@127.0.0.1:{proxy_a.port}"})
+            auth_u1 = "Basic " + base64.b64encode(b"u1:secretA").decode("ascii")
+            auth_u2 = "Basic " + base64.b64encode(b"u2:secretB").decode("ascii")
+            with mock.patch.dict(os.environ, env_u1, clear=True):
+                ru1 = urllib_http_transport(HttpRequest("http://127.0.0.1:18001/u1", "GET", {}, b"", 3.0))
+            with mock.patch.dict(os.environ, env_u2, clear=True):
+                ru2 = urllib_http_transport(HttpRequest("http://127.0.0.1:18001/u2", "GET", {}, b"", 3.0))
+            with mock.patch.dict(os.environ, env_a, clear=True):
+                r_noauth = urllib_http_transport(HttpRequest("http://127.0.0.1:18001/noauth", "GET", {}, b"", 3.0))
+
+            self.assertEqual(ru1.json()["proxy_auth"], auth_u1)
+            self.assertEqual(ru1.json()["conn_req_no"], 1)
+            self.assertEqual(ru2.json()["proxy_auth"], auth_u2)
+            self.assertEqual(ru2.json()["conn_req_no"], 1)
+            self.assertEqual(r_noauth.json()["proxy_auth"], "")
+            self.assertEqual(r_noauth.json()["conn_req_no"], 3)
+            self.assertEqual(proxy_a.tcp_accepts, 4)
+        finally:
+            _KEEPALIVE_POOL.evict_all()
+            proxy_a.stop()
+            proxy_b.stop()
+
+    def test_http_proxy_connect_407_timeout_cancel_idle_close_eviction_and_redaction(self) -> None:
+        one_char_pw = "4"
+        auth_b64 = base64.b64encode(f"u:{one_char_pw}".encode("utf-8")).decode("ascii")
+
+        # 1. Proxy returns 407 on HTTPS CONNECT echoing 1-char password '4' + Basic token + custom text:
+        #    CONNECT failure exposes only numeric status code '407' intact (NOT '[REDACTED]07'!),
+        #    never leaks free-text reason phrase or Basic token, and closes socket without pooling!
+        proxy_407 = _LoopbackHttpProxyServer(
+            reject_connect_status=f"407 Proxy Auth Failed {one_char_pw} {auth_b64} LeakedReasonDetail"
+        )
+        try:
+            env_407 = self._clean_proxy_env(
+                {"HTTPS_PROXY": f"http://u:{one_char_pw}@127.0.0.1:{proxy_407.port}"}
+            )
+            with mock.patch.dict(os.environ, env_407, clear=True):
+                with self.assertRaises(HttpTransportError) as cm_407:
+                    urllib_http_transport(
+                        HttpRequest("https://api.example.invalid/v1/test", "POST", {}, b"{}", 3.0)
+                    )
+            err_407_msg = str(cm_407.exception)
+            self.assertEqual(cm_407.exception.retry_kind, "never")
+            self.assertIn("status 407", err_407_msg)
+            self.assertNotIn("[REDACTED]07", err_407_msg)
+            self.assertNotIn(auth_b64, err_407_msg)
+            self.assertNotIn("LeakedReasonDetail", err_407_msg)
+            self.assertEqual(evict_all_keepalive_connections(), 0)
+        finally:
+            proxy_407.stop()
+
+        # 1b. Short password redaction preserves normal digits ('status 407') while scrubbing URL userinfo & Basic token
+        route_short = _parse_http_proxy_route(f"http://u:{one_char_pw}@127.0.0.1:8080")
+        redacted_short = _redact_proxy_error_text(
+            f"status 407 via http://u:{one_char_pw}@127.0.0.1:8080 auth Basic {auth_b64} ({auth_b64})",
+            f"http://u:{one_char_pw}@127.0.0.1:8080",
+            route_short,
+        )
+        self.assertIn("status 407", redacted_short)
+        self.assertNotIn("[REDACTED]07", redacted_short)
+        self.assertNotIn(f"u:{one_char_pw}@", redacted_short)
+        self.assertNotIn(auth_b64, redacted_short)
+        self.assertIn("u:[REDACTED]@", redacted_short)
+
+        # 1c. Truncated CONNECT 200 response (EOF before end-of-headers blank line) raises error & never pools
+        proxy_trunc = _LoopbackHttpProxyServer(truncate_connect_headers=True)
+        try:
+            env_trunc = self._clean_proxy_env({"HTTPS_PROXY": f"http://127.0.0.1:{proxy_trunc.port}"})
+            with mock.patch.dict(os.environ, env_trunc, clear=True):
+                with self.assertRaises(HttpTransportError) as cm_trunc:
+                    urllib_http_transport(
+                        HttpRequest("https://api.example.invalid/v1/test", "GET", {}, b"", 3.0)
+                    )
+            self.assertEqual(cm_trunc.exception.retry_kind, "transient")
+            self.assertIn("truncated", str(cm_trunc.exception).lower())
+            self.assertEqual(evict_all_keepalive_connections(), 0)
+        finally:
+            proxy_trunc.stop()
+
+        # 2. Proxy hangs during CONNECT -> bounded by connect_timeout_sec AND interruptible by CancelToken
+        secret_pw = "ProxyTopSecret_407!"
+        proxy_hang = _LoopbackHttpProxyServer(hang_connect=True)
+        try:
+            env_hang = self._clean_proxy_env(
+                {"HTTPS_PROXY": f"http://corpuser:{secret_pw}@127.0.0.1:{proxy_hang.port}"}
+            )
+            with mock.patch.dict(os.environ, env_hang, clear=True):
+                t0 = time.monotonic()
+                with self.assertRaises(HttpTransportError) as cm_to:
+                    urllib_http_transport(
+                        HttpRequest(
+                            "https://api.example.invalid/v1/test",
+                            "POST",
+                            {},
+                            b"{}",
+                            timeout_sec=4.0,
+                            connect_timeout_sec=0.12,
+                        )
+                    )
+                self.assertLess(time.monotonic() - t0, 0.7)
+                self.assertEqual(cm_to.exception.retry_kind, "transient")
+                self.assertNotIn(secret_pw, str(cm_to.exception))
+                self.assertEqual(evict_all_keepalive_connections(), 0)
+
+                tok = CancelToken()
+                timer = threading.Timer(0.05, tok.cancel, args=("user_cancelled",))
+                timer.start()
+                t1 = time.monotonic()
+                try:
+                    with self.assertRaises(HttpTransportError) as cm_can:
+                        urllib_http_transport(
+                            HttpRequest(
+                                "https://api.example.invalid/v1/test",
+                                "POST",
+                                {},
+                                b"{}",
+                                timeout_sec=4.0,
+                                connect_timeout_sec=3.0,
+                                cancel_token=tok,
+                            )
+                        )
+                finally:
+                    timer.cancel()
+                self.assertLess(time.monotonic() - t1, 0.6)
+                self.assertEqual(cm_can.exception.retry_kind, "never")
+                self.assertIn("cancelled", str(cm_can.exception).lower())
+                self.assertEqual(evict_all_keepalive_connections(), 0)
+        finally:
+            proxy_hang.stop()
+
+        # 3. Idle server close, mid-send stale close retry, and evict_all_keepalive_connections()
+        proxy_live = _LoopbackHttpProxyServer(drop_second_req_after_read=True)
+        try:
+            env_live = self._clean_proxy_env({"HTTP_PROXY": f"http://127.0.0.1:{proxy_live.port}"})
+            with mock.patch.dict(os.environ, env_live, clear=True):
+                r1 = urllib_http_transport(HttpRequest("http://127.0.0.1:18080/one", "POST", {}, b"p1", 3.0))
+                self.assertEqual(r1.status, 200)
+                self.assertEqual(proxy_live.tcp_accepts, 1)
+
+                # 3a. Race-window stale close (server closes after reading 2nd req on reused socket):
+                #     keepalive transparently retries on a fresh socket!
+                r2 = urllib_http_transport(HttpRequest("http://127.0.0.1:18080/two", "POST", {}, b"p2", 3.0))
+                self.assertEqual(r2.status, 200)
+                self.assertEqual(r2.json()["body"], "p2")
+                self.assertEqual(proxy_live.tcp_accepts, 2)
+
+                # 3b. Idle close while sitting in pool: 0ms select probe drops dead socket and reconnects
+                proxy_live.close_all_client_sockets()
+                time.sleep(0.03)
+                r3 = urllib_http_transport(HttpRequest("http://127.0.0.1:18080/three", "POST", {}, b"p3", 3.0))
+                self.assertEqual(r3.status, 200)
+                self.assertEqual(proxy_live.tcp_accepts, 3)
+
+                # 3c. Power-resume evict_all_keepalive_connections() evicts the pooled proxy socket
+                evicted = evict_all_keepalive_connections()
+                self.assertGreaterEqual(evicted, 1)
+                r4 = urllib_http_transport(HttpRequest("http://127.0.0.1:18080/four", "GET", {}, b"", 3.0))
+                self.assertEqual(r4.status, 200)
+                self.assertEqual(r4.json()["conn_req_no"], 1)
+                self.assertEqual(proxy_live.tcp_accepts, 4)
+        finally:
+            _KEEPALIVE_POOL.evict_all()
+            proxy_live.stop()
+
+    def test_caller_proxy_authorization_stripped_from_origin_and_direct_requests(self) -> None:
+        caller_auth = "Basic " + base64.b64encode(b"caller:hdr-secret").decode("ascii")
+        url_auth = "Basic " + base64.b64encode(b"urluser:url-secret").decode("ascii")
+
+        direct_seen: list[tuple[str, str]] = []
+
+        class _DirectProbeHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                direct_seen.append((self.path, self.headers.get("Proxy-Authorization", "")))
+                body = b'{"direct":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        direct_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _DirectProbeHandler)
+        direct_port = direct_srv.server_address[1]
+        direct_th = threading.Thread(target=direct_srv.serve_forever, daemon=True)
+        direct_th.start()
+
+        with tempfile.TemporaryDirectory(prefix="avi-pauth-strip-") as td:
+            cert_path, key_path = _generate_localhost_cert(Path(td))
+            client_ssl_ctx = ssl.create_default_context(cafile=str(cert_path))
+            origin = _LoopbackTlsOriginServer(cert_path, key_path)
+            proxy = _LoopbackHttpProxyServer()
+            try:
+                # 1. HTTPS CONNECT via unauthenticated proxy URL + mixed-case caller Proxy-Authorization:
+                #    proxy receives caller_auth in CONNECT; origin NEVER sees it (neither initial nor 307 redirect)!
+                orig_hdrs = {"pRoXy-AuThOrIzAtIoN": caller_auth, "X-Test": "1"}
+                env_https = self._clean_proxy_env({"HTTPS_PROXY": f"http://127.0.0.1:{proxy.port}"})
+                with (
+                    mock.patch.dict(os.environ, env_https, clear=True),
+                    mock.patch.object(_KEEPALIVE_POOL, "_get_ssl_context", return_value=client_ssl_ctx),
+                ):
+                    r_https = urllib_http_transport(
+                        HttpRequest(f"https://localhost:{origin.port}/v1/echo", "GET", orig_hdrs, b"", 3.0)
+                    )
+                    r_redir = urllib_http_transport(
+                        HttpRequest(f"https://localhost:{origin.port}/redir307", "POST", orig_hdrs, b"ok", 3.0)
+                    )
+                self.assertEqual(r_https.status, 200)
+                self.assertEqual(r_redir.status, 200)
+                self.assertEqual(orig_hdrs["pRoXy-AuThOrIzAtIoN"], caller_auth)  # caller dict not mutated
+                self.assertEqual(proxy.connect_requests[0][1].get("proxy-authorization"), caller_auth)
+                self.assertEqual(r_https.json()["proxy_auth"], "")
+                self.assertEqual(r_redir.json()["proxy_auth"], "")
+
+                # 2. HTTPS CONNECT via authenticated proxy URL + caller Proxy-Authorization:
+                #    proxy URL creds win, caller header still stripped from origin!
+                env_https_urlauth = self._clean_proxy_env(
+                    {"HTTPS_PROXY": f"http://urluser:url-secret@127.0.0.1:{proxy.port}"}
+                )
+                with (
+                    mock.patch.dict(os.environ, env_https_urlauth, clear=True),
+                    mock.patch.object(_KEEPALIVE_POOL, "_get_ssl_context", return_value=client_ssl_ctx),
+                ):
+                    r_urlauth = urllib_http_transport(
+                        HttpRequest(
+                            f"https://localhost:{origin.port}/v1/urlauth",
+                            "GET",
+                            {"Proxy-Authorization": caller_auth},
+                            b"",
+                            3.0,
+                        )
+                    )
+                self.assertEqual(r_urlauth.status, 200)
+                self.assertEqual(proxy.connect_requests[-1][1].get("proxy-authorization"), url_auth)
+                self.assertEqual(r_urlauth.json()["proxy_auth"], "")
+
+                # 3. Plain HTTP proxy with unauthenticated proxy URL forwards caller Proxy-Authorization to proxy
+                env_http = self._clean_proxy_env({"HTTP_PROXY": f"http://127.0.0.1:{proxy.port}"})
+                with mock.patch.dict(os.environ, env_http, clear=True):
+                    r_http = urllib_http_transport(
+                        HttpRequest(
+                            f"http://127.0.0.1:{direct_port}/via-http-proxy",
+                            "GET",
+                            {"proxy-authorization": caller_auth},
+                            b"",
+                            3.0,
+                        )
+                    )
+                self.assertEqual(r_http.status, 200)
+                self.assertEqual(r_http.json()["proxy_auth"], caller_auth)
+
+                # 4. NO_PROXY direct request strips caller Proxy-Authorization (NEVER leaked to origin!)
+                env_direct = self._clean_proxy_env(
+                    {"HTTP_PROXY": f"http://127.0.0.1:{proxy.port}", "NO_PROXY": "127.0.0.1"}
+                )
+                with mock.patch.dict(os.environ, env_direct, clear=True):
+                    r_dir = urllib_http_transport(
+                        HttpRequest(
+                            f"http://127.0.0.1:{direct_port}/direct-no-leak",
+                            "GET",
+                            {"Proxy-Authorization": caller_auth},
+                            b"",
+                            3.0,
+                        )
+                    )
+                self.assertEqual(r_dir.status, 200)
+                self.assertEqual(direct_seen, [("/direct-no-leak", "")])
+
+                # 5. CRLF / non-latin-1 caller Proxy-Authorization is rejected BEFORE connecting
+                #    for BOTH plain HTTP proxy and HTTPS CONNECT proxy without echoing the value!
+                accepts_before_bad_auth = proxy.tcp_accepts
+                for bad_val in ("Basic c2VjcmV0\r\nX-Injected: evil", "Basic 非法编码"):
+                    for env_case, url_case in (
+                        (env_http, f"http://127.0.0.1:{direct_port}/bad-auth-http"),
+                        (env_https, f"https://localhost:{origin.port}/bad-auth-https"),
+                    ):
+                        with mock.patch.dict(os.environ, env_case, clear=True):
+                            with self.assertRaises(HttpTransportError) as cm_bad_auth:
+                                urllib_http_transport(
+                                    HttpRequest(url_case, "GET", {"Proxy-Authorization": bad_val}, b"", 3.0)
+                                )
+                        self.assertEqual(cm_bad_auth.exception.retry_kind, "never")
+                        self.assertEqual(str(cm_bad_auth.exception), "Invalid Proxy-Authorization header")
+                        self.assertNotIn("c2VjcmV0", str(cm_bad_auth.exception))
+                        self.assertNotIn("X-Injected", str(cm_bad_auth.exception))
+                self.assertEqual(proxy.tcp_accepts, accepts_before_bad_auth)
+            finally:
+                _KEEPALIVE_POOL.evict_all()
+                proxy.stop()
+                origin.stop()
+                direct_srv.shutdown()
+                direct_srv.server_close()
+                direct_th.join(timeout=2.0)
+
+    def test_ipv6_origin_connect_brackets_and_unbracketed_tls_server_hostname(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="avi-ipv6-proxy-") as td:
+            cert_path, key_path = _generate_localhost_cert(Path(td))
+            real_ctx = ssl.create_default_context(cafile=str(cert_path))
+            observed_server_hostnames: list[str | None] = []
+
+            class _SpySslCtx:
+                verify_mode = real_ctx.verify_mode
+                check_hostname = real_ctx.check_hostname
+
+                def wrap_socket(
+                    self,
+                    sock: socket.socket,
+                    *,
+                    server_hostname: str | None = None,
+                    do_handshake_on_connect: bool = True,
+                ) -> ssl.SSLSocket:
+                    observed_server_hostnames.append(server_hostname)
+                    return real_ctx.wrap_socket(
+                        sock,
+                        server_hostname=server_hostname,
+                        do_handshake_on_connect=do_handshake_on_connect,
+                    )
+
+            origin = _LoopbackTlsOriginServer(cert_path, key_path)
+            proxy = _LoopbackHttpProxyServer()
+            try:
+                env_map = self._clean_proxy_env({"HTTPS_PROXY": f"http://127.0.0.1:{proxy.port}"})
+                with (
+                    mock.patch.dict(os.environ, env_map, clear=True),
+                    mock.patch.object(_KEEPALIVE_POOL, "_get_ssl_context", return_value=_SpySslCtx()),
+                ):
+                    r1 = urllib_http_transport(
+                        HttpRequest(f"https://[::1]:{origin.port}/v1/ipv6", "GET", {}, b"", 3.0)
+                    )
+                    r2 = urllib_http_transport(
+                        HttpRequest(f"https://[::1]:{origin.port}/v1/ipv6-2", "GET", {}, b"", 3.0)
+                    )
+                self.assertEqual(r1.status, 200)
+                self.assertEqual(r2.status, 200)
+                # RFC-compliant HTTP/1.1 + single brackets + exactly one Host header across Python 3.10-3.14
+                self.assertEqual(proxy.connect_lines, [f"CONNECT [::1]:{origin.port} HTTP/1.1"])
+                self.assertEqual(proxy.connect_host_header_counts, [1])
+                self.assertEqual(proxy.connect_requests[0][1].get("host"), f"[::1]:{origin.port}")
+                # Unbracketed IPv6 passed to wrap_socket(..., server_hostname=...) and verified against IP:::1 SAN
+                self.assertEqual(observed_server_hostnames, ["::1"])
+                self.assertEqual(r1.json()["host"], f"[::1]:{origin.port}")
+                self.assertEqual(r2.json()["conn_req_no"], 2)
+                self.assertEqual(proxy.tcp_accepts, 1)
+
+                # Simulate CPython 3.12+ set_tunnel() pre-populating an unbracketed Host header in _tunnel_headers:
+                # _tunnel() must still emit exactly one canonical bracketed Host header matching CONNECT authority.
+                c_py312 = _SplitTimeoutHTTPSConnection(
+                    "127.0.0.1",
+                    proxy.port,
+                    timeout=3.0,
+                    context=_SpySslCtx(),
+                    connect_timeout=3.0,
+                )
+                try:
+                    c_py312.set_tunnel(
+                        "::1",
+                        origin.port,
+                        headers={"Host": f"::1:{origin.port}", "Proxy-Authorization": "Basic dTpw"},
+                    )
+                    c_py312.connect()
+                finally:
+                    c_py312.close()
+                self.assertEqual(proxy.connect_lines[-1], f"CONNECT [::1]:{origin.port} HTTP/1.1")
+                self.assertEqual(proxy.connect_host_header_counts[-1], 1)
+                self.assertEqual(proxy.connect_requests[-1][1].get("host"), f"[::1]:{origin.port}")
+                self.assertEqual(proxy.connect_requests[-1][1].get("proxy-authorization"), "Basic dTpw")
+                self.assertEqual(observed_server_hostnames[-1], "::1")
+            finally:
+                _KEEPALIVE_POOL.evict_all()
+                proxy.stop()
+                origin.stop()
+
+    def test_http_target_via_https_tls_proxy_reuses_encrypted_connection_and_https_target_still_fails_closed(
+        self,
+    ) -> None:
+        expected_auth = "Basic " + base64.b64encode(b"alice:tls-secret").decode("ascii")
+        with tempfile.TemporaryDirectory(prefix="avi-https-proxy-") as td:
+            cert_path, key_path = _generate_localhost_cert(Path(td))
+            client_ssl_ctx = ssl.create_default_context(cafile=str(cert_path))
+            tls_proxy = _LoopbackTlsOriginServer(cert_path, key_path)
+            try:
+                # 1. Valid single-layer TLS proxy: http:// target via https:// proxy
+                proxy_url = f"https://alice:tls-secret@localhost:{tls_proxy.port}"
+                env_http = self._clean_proxy_env({"HTTP_PROXY": proxy_url})
+                with (
+                    mock.patch.dict(os.environ, env_http, clear=True),
+                    mock.patch.object(_KEEPALIVE_POOL, "_get_ssl_context", return_value=client_ssl_ctx),
+                ):
+                    r1 = urllib_http_transport(
+                        HttpRequest("http://127.0.0.1:18080/v1/tls-proxy?n=1", "GET", {}, b"", 3.0)
+                    )
+                    r2 = urllib_http_transport(
+                        HttpRequest(
+                            "http://127.0.0.1:18080/v1/tls-proxy?n=2",
+                            "POST",
+                            {"Content-Type": "text/plain"},
+                            b"hello-tls-proxy",
+                            3.0,
+                        )
+                    )
+                self.assertEqual(r1.status, 200)
+                self.assertEqual(r2.status, 200)
+                self.assertEqual(r1.json()["path"], "http://127.0.0.1:18080/v1/tls-proxy?n=1")
+                self.assertEqual(r1.json()["host"], "127.0.0.1:18080")
+                self.assertEqual(r1.json()["proxy_auth"], expected_auth)
+                self.assertEqual(r2.json()["body"], "hello-tls-proxy")
+                self.assertEqual(r2.json()["conn_req_no"], 2)
+                self.assertEqual(tls_proxy.tls_handshakes, 1)
+                self.assertEqual(tls_proxy.sni_names, ["localhost"])
+
+                # 2. https:// target via https:// proxy STILL fails closed before any TCP/TLS handshake
+                env_https = self._clean_proxy_env({"HTTPS_PROXY": proxy_url})
+                with (
+                    mock.patch.dict(os.environ, env_https, clear=True),
+                    mock.patch.object(_KEEPALIVE_POOL, "_get_ssl_context", return_value=client_ssl_ctx),
+                ):
+                    with self.assertRaises(HttpTransportError) as cm_fc:
+                        urllib_http_transport(
+                            HttpRequest("https://api.example.invalid/v1/fail", "GET", {}, b"", 3.0)
+                        )
+                self.assertEqual(cm_fc.exception.retry_kind, "never")
+                self.assertIn("unsupported proxy scheme 'https'", str(cm_fc.exception).lower())
+                self.assertNotIn("tls-secret", str(cm_fc.exception))
+                self.assertEqual(tls_proxy.tls_handshakes, 1)
+            finally:
+                _KEEPALIVE_POOL.evict_all()
+                tls_proxy.stop()
+
+    def test_unsupported_and_malformed_proxies_fail_closed_without_connecting(self) -> None:
+        # 1. Route parser & fingerprint unit coverage
+        r_default_port = _parse_http_proxy_route("http://proxy.corp")
+        r_schemeless = _parse_http_proxy_route("proxy.corp")
+        self.assertIsNotNone(r_default_port)
+        self.assertEqual(r_default_port, r_schemeless)
+        assert r_default_port is not None
+        self.assertEqual((r_default_port.host, r_default_port.port), ("proxy.corp", 80))
+        self.assertEqual(r_default_port.proxy_key, "http://proxy.corp:80")
+
+        r_v6 = _parse_http_proxy_route("http://[::1]:8080/")
+        assert r_v6 is not None
+        self.assertEqual((r_v6.host, r_v6.port, r_v6.proxy_key), ("::1", 8080, "http://[::1]:8080"))
+
+        r_auth = _parse_http_proxy_route("http://u%401:p%3Aw@127.0.0.1:8080")
+        assert r_auth is not None
+        self.assertEqual(
+            r_auth.proxy_auth_header,
+            "Basic " + base64.b64encode(b"u@1:p:w").decode("ascii"),
+        )
+        self.assertNotIn("p:w", r_auth.proxy_key)
+        self.assertNotIn("p%3Aw", r_auth.proxy_key)
+        self.assertNotIn(r_auth.proxy_auth_header, repr(r_auth))
+
+        for non_poolable in (
+            "",
+            "https://127.0.0.1:8443",
+            "socks5://127.0.0.1:1080",
+            "socks5h://127.0.0.1:1080",
+            "http://",
+            "http://:8080",
+            "http://127.0.0.1:notaport",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:70000",
+            "http://[::1:8080",
+            "http://bad host:8080",
+        ):
+            self.assertIsNone(_parse_http_proxy_route(non_poolable), f"expected None for {non_poolable!r}")
+        self.assertTrue(_normalize_proxy_fingerprint("http://[::1:8080"))
+
+        # 2. Trap listeners proving ZERO TCP connections are made to either proxy OR origin on fail-closed
+        proxy_trap = _LoopbackHttpProxyServer()
+        origin_trap = _LoopbackHttpProxyServer()
+        try:
+            fail_closed_cases = (
+                (
+                    {"HTTPS_PROXY": f"https://user:TopSecretPass99@127.0.0.1:{proxy_trap.port}"},
+                    f"https://127.0.0.1:{origin_trap.port}/v1/x",
+                    "unsupported proxy scheme",
+                ),
+                (
+                    {"ALL_PROXY": f"socks5://user:TopSecretPass99@127.0.0.1:{proxy_trap.port}"},
+                    f"https://127.0.0.1:{origin_trap.port}/v1/x",
+                    "unsupported proxy scheme",
+                ),
+                (
+                    {"HTTPS_PROXY": "http://"},
+                    f"https://127.0.0.1:{origin_trap.port}/v1/x",
+                    "invalid proxy url",
+                ),
+                (
+                    {"HTTPS_PROXY": "http://user:TopSecretPass99@[::1:8080"},
+                    f"https://127.0.0.1:{origin_trap.port}/v1/x",
+                    "invalid proxy url",
+                ),
+                (
+                    {"HTTP_PROXY": "http://user:TopSecretPass99@127.0.0.1:notaport"},
+                    f"http://127.0.0.1:{origin_trap.port}/v1/x",
+                    "invalid proxy url",
+                ),
+            )
+            for proxy_env, target_url, expected_frag in fail_closed_cases:
+                env_bad = self._clean_proxy_env(proxy_env)
+                with mock.patch.dict(os.environ, env_bad, clear=True):
+                    with self.assertRaises(HttpTransportError) as cm_bad:
+                        urllib_http_transport(
+                            HttpRequest(
+                                target_url,
+                                "GET",
+                                {},
+                                b"",
+                                timeout_sec=1.0,
+                                connect_timeout_sec=0.2,
+                            )
+                        )
+                msg = str(cm_bad.exception)
+                self.assertEqual(cm_bad.exception.retry_kind, "never", f"for {proxy_env!r}")
+                self.assertIn(expected_frag, msg.lower(), f"for {proxy_env!r}: {msg}")
+                self.assertNotIn("TopSecretPass99", msg)
+                self.assertNotIn("[::1:8080", msg)
+                self.assertNotIn("socks5://", msg)
+                self.assertNotIn(f"https://user:", msg)
+
+            self.assertEqual(proxy_trap.tcp_accepts, 0)
+            self.assertEqual(origin_trap.tcp_accepts, 0)
+
+            # 3. Dual-protocol env (HTTP_PROXY=http://... + ALL_PROXY=socks5://...) selects scheme-specific
+            #    http:// proxy and keeps Keep-Alive working without false rejection!
+            env_dual = self._clean_proxy_env(
+                {
+                    "HTTP_PROXY": f"http://127.0.0.1:{proxy_trap.port}",
+                    "ALL_PROXY": "socks5://127.0.0.1:1080",
+                }
+            )
+            with mock.patch.dict(os.environ, env_dual, clear=True):
+                r_dual = urllib_http_transport(
+                    HttpRequest(f"http://127.0.0.1:{origin_trap.port}/dual", "GET", {}, b"", 2.0)
+                )
+            self.assertEqual(r_dual.status, 200)
+            self.assertEqual(proxy_trap.tcp_accepts, 1)
+            self.assertEqual(origin_trap.tcp_accepts, 0)
+        finally:
+            _KEEPALIVE_POOL.evict_all()
+            proxy_trap.stop()
+            origin_trap.stop()
 
 
 class PowerResumeAndDaemonLogRotationTests(unittest.TestCase):

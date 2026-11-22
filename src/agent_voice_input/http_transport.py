@@ -16,6 +16,7 @@ import json
 import math
 import os
 import random
+import re
 import select
 import selectors
 import socket
@@ -29,7 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .config import is_loopback_url as _is_loopback_url
+from .config import is_loopback_url as _is_loopback_url, redact_secrets as _redact_secrets
 
 DEFAULT_USER_AGENT = "agent-voice-input/0.1"
 DEFAULT_CONNECT_TIMEOUT_SEC: float = 9.0
@@ -868,11 +869,71 @@ def _connect_tcp_and_tunnel(
         raise
 
 
+_LEGAL_TUNNEL_HEADER_NAME_RE = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
 class _SplitTimeoutConnMixin:
     """Shared connect/I/O deadline & socket.shutdown abort lifecycle for HTTP and HTTPS connections."""
 
     sock: Any
     timeout: Any
+
+    def _tunnel(self) -> None:
+        tunnel_host = (getattr(self, "_tunnel_host", None) or "").strip()
+        tunnel_port = getattr(self, "_tunnel_port", None)
+        if not tunnel_host or tunnel_port is None:
+            return
+        bare_host = (
+            tunnel_host[1:-1]
+            if (tunnel_host.startswith("[") and tunnel_host.endswith("]"))
+            else tunnel_host
+        )
+        if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in bare_host):
+            raise ValueError(f"Tunnel host contains invalid characters: {bare_host!r}")
+        wire_host = f"[{bare_host}]" if ":" in bare_host else bare_host
+        try:
+            wire_host_bytes = wire_host.encode("ascii")
+        except UnicodeEncodeError:
+            wire_host_bytes = wire_host.encode("idna")
+        authority_bytes = b"%s:%d" % (wire_host_bytes, int(tunnel_port))
+        tunnel_headers = getattr(self, "_tunnel_headers", {}) or {}
+        connect_lines = [
+            b"CONNECT %s HTTP/1.1\r\n" % (authority_bytes,),
+            b"Host: %s\r\n" % (authority_bytes,),
+        ]
+        for header, value in tunnel_headers.items():
+            if str(header).lower() == "host":
+                continue
+            header_bytes = str(header).encode("latin-1")
+            value_bytes = str(value).encode("latin-1")
+            if not _LEGAL_TUNNEL_HEADER_NAME_RE.match(header_bytes) or any(
+                bad in value_bytes for bad in (b"\r", b"\n", b"\x00")
+            ):
+                raise ValueError(f"Invalid tunnel header: {header!r}")
+            connect_lines.append(b"%s: %s\r\n" % (header_bytes, value_bytes))
+        connect_lines.append(b"\r\n")
+        self.send(b"".join(connect_lines))  # type: ignore[attr-defined]
+
+        max_line = int(getattr(http.client, "_MAXLINE", 65536))
+        response = self.response_class(self.sock, method=getattr(self, "_method", None))  # type: ignore[attr-defined]
+        try:
+            _, code, _ = response._read_status()
+            if code != http.HTTPStatus.OK:
+                self.close()
+                raise OSError(f"HTTP proxy CONNECT failed with status {int(code)}")
+            while True:
+                line = response.fp.readline(max_line + 1)
+                if len(line) > max_line:
+                    raise http.client.LineTooLong("header line")
+                if not line:
+                    self.close()
+                    raise http.client.RemoteDisconnected(
+                        "HTTP proxy CONNECT response truncated before end of headers"
+                    )
+                if line in (b"\r\n", b"\n"):
+                    break
+        finally:
+            _close_quietly(response)
 
     def _init_split_timeout(
         self,
@@ -1093,7 +1154,12 @@ class _SplitTimeoutHTTPSConnection(_SplitTimeoutConnMixin, http.client.HTTPSConn
         conn_dl = self._compute_connect_deadline()
         _connect_tcp_and_tunnel(self, conn_dl)
         try:
-            server_hostname = self._tunnel_host if self._tunnel_host else self.host  # type: ignore[attr-defined]
+            raw_sni = self._tunnel_host if self._tunnel_host else self.host  # type: ignore[attr-defined]
+            server_hostname = (
+                raw_sni[1:-1]
+                if isinstance(raw_sni, str) and raw_sni.startswith("[") and raw_sni.endswith("]")
+                else raw_sni
+            )
             if conn_dl is not None and (conn_dl - time.monotonic()) <= 0:
                 raise TimeoutError("TLS handshake timed out")
             with self._abort_lock:
@@ -1216,11 +1282,41 @@ def _is_idle_socket_stale(sock: Any) -> bool:
         return True
 
 
+_ANY_SCHEME_USERINFO_SECRET_RE = re.compile(
+    r"([a-z][a-z0-9+.-]*://[^/\s:@]*:)[^/\s@]+(@)", re.IGNORECASE
+)
+_RAW_PROXY_PASSWORD_RE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://)?[^/\s:@]*:([^/\s@]+)@", re.IGNORECASE
+)
+_SAFE_PROXY_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]{0,15}$")
+
+
+@dataclass(frozen=True)
+class _HttpProxyRoute:
+    host: str
+    port: int
+    proxy_key: str
+    proxy_scheme: str = "http"
+    proxy_auth_header: str = field(default="", repr=False)
+
+
+def _validate_proxy_auth_value(val: str) -> None:
+    if any(bad in val for bad in ("\r", "\n", "\x00")):
+        raise HttpTransportError("Invalid Proxy-Authorization header", retry_kind="never")
+    try:
+        val.encode("latin-1")
+    except UnicodeEncodeError:
+        raise HttpTransportError("Invalid Proxy-Authorization header", retry_kind="never") from None
+
+
 def _normalize_proxy_fingerprint(proxy_url: str) -> str:
     raw = proxy_url.strip()
     if not raw:
         return ""
-    parsed = urllib.parse.urlsplit(raw if "://" in raw else f"http://{raw}")
+    try:
+        parsed = urllib.parse.urlsplit(raw if "://" in raw else f"http://{raw}")
+    except ValueError:
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     scheme = (parsed.scheme or "http").lower()
     host = (parsed.hostname or "").lower()
     if not host:
@@ -1229,11 +1325,150 @@ def _normalize_proxy_fingerprint(proxy_url: str) -> str:
         port = parsed.port
     except ValueError:
         port = -1
+    if port is None:
+        if scheme == "http":
+            port = 80
+        elif scheme == "https":
+            port = 443
     auth_part = ""
     if parsed.username is not None or parsed.password is not None:
-        cred = f"{parsed.username or ''}:{parsed.password or ''}".encode("utf-8")
+        user = urllib.parse.unquote(parsed.username or "")
+        pw = urllib.parse.unquote(parsed.password or "")
+        cred = f"{user}:{pw}".encode("utf-8")
         auth_part = f"|auth:{hashlib.sha256(cred).hexdigest()[:12]}"
-    return f"{scheme}://{host}:{port if port is not None else ''}{auth_part}"
+    host_disp = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{host_disp}:{port if port is not None else ''}{auth_part}"
+
+
+def _select_system_proxy_url(proxies: Mapping[str, str], scheme: str) -> str:
+    if not proxies:
+        return ""
+    return (proxies.get(scheme.lower()) or proxies.get("all") or "").strip()
+
+
+def _resolve_http_proxy_route(
+    proxy_url: str, *, target_scheme: str = "https"
+) -> tuple[_HttpProxyRoute | None, str]:
+    """Validate and parse a selected system proxy URL for Keep-Alive pooling.
+
+    Supports:
+    - Standard ``http://`` proxies (including schemeless ``host[:port]``) for both ``http://`` and
+      ``https://`` targets;
+    - Single-layer ``https://`` proxies for ``http://`` targets (TLS directly to proxy, no
+      TLS-over-TLS tunnel needed).
+
+    Fails closed for ``https://`` proxies with ``https://`` targets (to prevent plaintext CONNECT
+    credential leakage), unsupported schemes (e.g. ``socks5://``), and malformed proxy URLs.
+    """
+    raw = proxy_url.strip()
+    if not raw:
+        return None, "invalid proxy URL configuration"
+    try:
+        parsed = urllib.parse.urlsplit(raw if "://" in raw else f"http://{raw}")
+    except ValueError:
+        return None, "invalid proxy URL configuration"
+    proxy_scheme = (parsed.scheme or "").lower()
+    tgt_scheme = target_scheme.lower()
+    if proxy_scheme == "https" and tgt_scheme == "http":
+        default_port = 443
+    elif proxy_scheme == "http":
+        default_port = 80
+    elif proxy_scheme == "https":
+        return (
+            None,
+            "unsupported proxy scheme 'https' for https:// targets (only http:// proxies are supported)",
+        )
+    else:
+        if proxy_scheme and _SAFE_PROXY_SCHEME_RE.match(proxy_scheme):
+            return (
+                None,
+                f"unsupported proxy scheme '{proxy_scheme}' (only http:// proxies are supported)",
+            )
+        return None, "unsupported proxy scheme (only http:// proxies are supported)"
+    host = (parsed.hostname or "").strip()
+    if not host or any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in host):
+        return None, "invalid proxy URL configuration"
+    try:
+        port = parsed.port
+    except ValueError:
+        return None, "invalid proxy URL configuration"
+    if port is None:
+        port = default_port
+    if port <= 0 or port > 65535:
+        return None, "invalid proxy URL configuration"
+    auth_header = ""
+    if parsed.username is not None or parsed.password is not None:
+        user = urllib.parse.unquote(parsed.username or "")
+        pw = urllib.parse.unquote(parsed.password or "")
+        creds = base64.b64encode(f"{user}:{pw}".encode("utf-8")).decode("ascii")
+        auth_header = f"Basic {creds}"
+    return (
+        _HttpProxyRoute(
+            host=host,
+            port=port,
+            proxy_key=_normalize_proxy_fingerprint(raw),
+            proxy_scheme=proxy_scheme,
+            proxy_auth_header=auth_header,
+        ),
+        "",
+    )
+
+
+def _parse_http_proxy_route(
+    proxy_url: str, *, target_scheme: str = "https"
+) -> _HttpProxyRoute | None:
+    route, _ = _resolve_http_proxy_route(proxy_url, target_scheme=target_scheme)
+    return route
+
+
+def _redact_proxy_error_text(
+    text: str,
+    raw_proxy_url: str = "",
+    proxy_route: _HttpProxyRoute | None = None,
+    *,
+    caller_proxy_auth: str = "",
+) -> str:
+    if not text:
+        return text
+    out = _ANY_SCHEME_USERINFO_SECRET_RE.sub(r"\1[REDACTED]\2", text)
+    auth_secrets: set[str] = set()
+    for auth_val in (
+        proxy_route.proxy_auth_header if proxy_route is not None else "",
+        caller_proxy_auth,
+    ):
+        auth_s = (auth_val or "").strip()
+        if auth_s:
+            auth_secrets.add(auth_s)
+            parts = auth_s.split(None, 1)
+            if len(parts) == 2 and parts[1].strip():
+                auth_secrets.add(parts[1].strip())
+    long_pw_secrets: set[str] = set()
+    raw = raw_proxy_url.strip()
+    if raw:
+        raw_pw_candidates: list[str] = []
+        try:
+            parsed = urllib.parse.urlsplit(raw if "://" in raw else f"http://{raw}")
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.password:
+            raw_pw_candidates.append(parsed.password)
+        else:
+            m = _RAW_PROXY_PASSWORD_RE.match(raw)
+            if m and m.group(1):
+                raw_pw_candidates.append(m.group(1))
+        for raw_pw in raw_pw_candidates:
+            if len(raw_pw) >= 4:
+                long_pw_secrets.add(raw_pw)
+            unquoted_pw = urllib.parse.unquote(raw_pw)
+            if len(unquoted_pw) >= 4:
+                long_pw_secrets.add(unquoted_pw)
+                pct_pw = urllib.parse.quote(unquoted_pw, safe="")
+                if len(pct_pw) >= 4:
+                    long_pw_secrets.add(pct_pw)
+    all_secrets = auth_secrets | long_pw_secrets
+    for secret in sorted(all_secrets, key=len, reverse=True):
+        out = out.replace(secret, "[REDACTED]")
+    return _redact_secrets(out, env={}, extra_secrets=all_secrets)
 
 
 def _proxy_bypass_no_dns(host: str, port: int | None = None) -> bool:
@@ -1298,10 +1533,7 @@ def _proxy_bypass_no_dns(host: str, port: int | None = None) -> bool:
 
 
 def _resolve_system_proxy_key(scheme: str, host: str, port: int | None = None) -> str:
-    proxies = urllib.request.getproxies()
-    if not proxies:
-        return ""
-    proxy_url = (proxies.get(scheme.lower()) or proxies.get("all") or "").strip()
+    proxy_url = _select_system_proxy_url(urllib.request.getproxies(), scheme)
     if not proxy_url:
         return ""
     if _proxy_bypass_no_dns(host, port):
@@ -1365,7 +1597,41 @@ class _KeepAlivePool:
         *,
         connect_timeout_sec: float = DEFAULT_CONNECT_TIMEOUT_SEC,
         io_deadline: float | None = None,
+        proxy_route: _HttpProxyRoute | None = None,
     ) -> http.client.HTTPConnection:
+        if proxy_route is not None:
+            if scheme == "https":
+                conn = _SplitTimeoutHTTPSConnection(
+                    proxy_route.host,
+                    proxy_route.port,
+                    timeout=timeout_sec,
+                    context=self._get_ssl_context(),
+                    connect_timeout=connect_timeout_sec,
+                    io_deadline=io_deadline,
+                )
+                tunnel_hdrs = (
+                    {"Proxy-Authorization": proxy_route.proxy_auth_header}
+                    if proxy_route.proxy_auth_header
+                    else None
+                )
+                conn.set_tunnel(host, port, headers=tunnel_hdrs)
+                return conn
+            if proxy_route.proxy_scheme == "https":
+                return _SplitTimeoutHTTPSConnection(
+                    proxy_route.host,
+                    proxy_route.port,
+                    timeout=timeout_sec,
+                    context=self._get_ssl_context(),
+                    connect_timeout=connect_timeout_sec,
+                    io_deadline=io_deadline,
+                )
+            return _SplitTimeoutHTTPConnection(
+                proxy_route.host,
+                proxy_route.port,
+                timeout=timeout_sec,
+                connect_timeout=connect_timeout_sec,
+                io_deadline=io_deadline,
+            )
         if scheme == "https":
             return _SplitTimeoutHTTPSConnection(
                 host,
@@ -1416,12 +1682,14 @@ class _KeepAlivePool:
         connect_timeout_sec: float = DEFAULT_CONNECT_TIMEOUT_SEC,
         io_deadline: float | None = None,
         proxy_key: str | None = None,
+        proxy_route: _HttpProxyRoute | None = None,
     ) -> tuple[http.client.HTTPConnection, bool]:
-        eff_proxy_key = (
-            self._resolve_proxy_key(scheme, host, port)
-            if proxy_key is None
-            else str(proxy_key)
-        )
+        if proxy_key is not None:
+            eff_proxy_key = str(proxy_key)
+        elif proxy_route is not None:
+            eff_proxy_key = proxy_route.proxy_key
+        else:
+            eff_proxy_key = self._resolve_proxy_key(scheme, host, port)
         key: _OriginKey = (scheme, host, port, eff_proxy_key)
         now_mono = self._mono_fn()
         now_wall = self._wall_fn()
@@ -1484,14 +1752,25 @@ class _KeepAlivePool:
                 _close_quietly(reused_conn)
                 continue
 
-        new_conn = self._new_connection(
-            scheme,
-            host,
-            port,
-            timeout_sec,
-            connect_timeout_sec=connect_timeout_sec,
-            io_deadline=io_deadline,
-        )
+        if proxy_route is not None:
+            new_conn = self._new_connection(
+                scheme,
+                host,
+                port,
+                timeout_sec,
+                connect_timeout_sec=connect_timeout_sec,
+                io_deadline=io_deadline,
+                proxy_route=proxy_route,
+            )
+        else:
+            new_conn = self._new_connection(
+                scheme,
+                host,
+                port,
+                timeout_sec,
+                connect_timeout_sec=connect_timeout_sec,
+                io_deadline=io_deadline,
+            )
         setattr(new_conn, "_pool_evict_gen", cur_gen)
         setattr(new_conn, "_pool_proxy_key", eff_proxy_key)
         return new_conn, False
@@ -1648,15 +1927,42 @@ def _unregister_conn_abort(cancel_token: CancelToken | None, hook_id: int) -> No
         cancel_token.unregister_abort(hook_id)
 
 
+def _extract_header_values(resp: Any, name: str) -> list[str]:
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return []
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        vals = get_all(name)
+        return [str(v) for v in vals if v is not None] if vals else []
+    if isinstance(headers, Mapping):
+        target = name.lower()
+        return [str(v) for k, v in headers.items() if str(k).lower() == target and v is not None]
+    return []
+
+
 def _can_reuse_pooled_conn(
     conn: Any,
     resp: Any,
-    conn_header: str,
+    conn_header: str = "",
     *,
     body_drained: bool,
     aborted: bool,
+    proxy_conn_header: str = "",
 ) -> bool:
-    close_tokens = {tok_s.strip().lower() for tok_s in conn_header.split(",") if tok_s.strip()}
+    raw_headers = [
+        conn_header,
+        proxy_conn_header,
+        *_extract_header_values(resp, "connection"),
+        *_extract_header_values(resp, "proxy-connection"),
+    ]
+    close_tokens = {
+        tok_s.strip().lower()
+        for hdr in raw_headers
+        if hdr
+        for tok_s in hdr.split(",")
+        if tok_s.strip()
+    }
     return (
         body_drained
         and not aborted
@@ -1667,17 +1973,25 @@ def _can_reuse_pooled_conn(
     )
 
 
+def _format_http_proxy_request_target(host: str, port: int, target_path: str) -> str:
+    host_part = f"[{host}]" if ":" in host else host
+    authority = host_part if port == 80 else f"{host_part}:{port}"
+    return f"http://{authority}{target_path}"
+
+
 def _execute_keepalive(
     req: HttpRequest,
     *,
     wall_deadline: float,
     hdrs_init: dict[str, str],
     proxy_key: str = "",
+    proxy_route: _HttpProxyRoute | None = None,
 ) -> HttpResponse:
+    eff_proxy_key = proxy_key or (proxy_route.proxy_key if proxy_route is not None else "")
     cur_url = req.url
     cur_method = req.method.upper()
     cur_body = req.body
-    cur_headers = dict(hdrs_init)
+    cur_headers = {k: v for k, v in hdrs_init.items() if k.lower() != "proxy-authorization"}
     if not any(k.lower() == "connection" for k in cur_headers):
         cur_headers["Connection"] = "keep-alive"
     conn_timeout = max(0.005, float(req.connect_timeout_sec))
@@ -1700,6 +2014,14 @@ def _execute_keepalive(
         eff_timeout = max(0.005, min(float(req.timeout_sec), rem))
         path = parsed.path or "/"
         target_path = f"{path}?{parsed.query}" if parsed.query else path
+        if proxy_route is not None and scheme == "http":
+            wire_target = _format_http_proxy_request_target(host, port, target_path)
+            wire_headers = dict(cur_headers)
+            if proxy_route.proxy_auth_header:
+                wire_headers["Proxy-Authorization"] = proxy_route.proxy_auth_header
+        else:
+            wire_target = target_path
+            wire_headers = cur_headers
         wire_body: bytes | None = (
             cur_body
             if (cur_body or cur_method not in ("GET", "HEAD", "DELETE", "OPTIONS"))
@@ -1721,13 +2043,14 @@ def _execute_keepalive(
                 allow_reuse=(attempt == 0),
                 connect_timeout_sec=conn_timeout,
                 io_deadline=wall_deadline,
-                proxy_key=proxy_key,
+                proxy_key=eff_proxy_key,
+                proxy_route=proxy_route,
             )
             hook_id = _register_conn_abort(tok, conn)
             try:
                 if not reused:
                     conn.connect()
-                conn.request(cur_method, target_path, body=wire_body, headers=cur_headers)
+                conn.request(cur_method, wire_target, body=wire_body, headers=wire_headers)
                 rem_resp = wall_deadline - time.monotonic()
                 if rem_resp <= 0:
                     raise TimeoutError("HTTP response header wait exceeded total request deadline")
@@ -1776,12 +2099,18 @@ def _execute_keepalive(
                 or (bool(getattr(resp, "chunked", False)) and resp.isclosed())
                 or (not getattr(resp, "chunked", False) and getattr(resp, "length", None) == 0)
             )
-            can_reuse = _can_reuse_pooled_conn(
-                conn,
-                resp,
-                resp_hdrs.get("connection", ""),
-                body_drained=body_fully_drained,
-                aborted=bool(getattr(conn, "_aborted", False) or (tok is not None and tok.is_cancelled())),
+            can_reuse = (
+                status != 407
+                and _can_reuse_pooled_conn(
+                    conn,
+                    resp,
+                    resp_hdrs.get("connection", ""),
+                    body_drained=body_fully_drained,
+                    aborted=bool(
+                        getattr(conn, "_aborted", False) or (tok is not None and tok.is_cancelled())
+                    ),
+                    proxy_conn_header=resp_hdrs.get("proxy-connection", ""),
+                )
             )
         finally:
             _unregister_conn_abort(tok, hook_id)
@@ -1789,7 +2118,7 @@ def _execute_keepalive(
                 can_reuse = False
             _close_quietly(resp)
             if can_reuse:
-                _KEEPALIVE_POOL.release(scheme, host, port, conn, proxy_key=proxy_key)
+                _KEEPALIVE_POOL.release(scheme, host, port, conn, proxy_key=eff_proxy_key)
             else:
                 _close_quietly(conn)
 
@@ -2414,20 +2743,34 @@ def reset_rate_limit_pacers() -> None:
 
 
 def urllib_http_transport(req: HttpRequest) -> HttpResponse:
-    """Default pure-stdlib HTTP transport with Keep-Alive pooling, proxy compat, and safe redirects."""
+    """Default pure-stdlib HTTP transport with Keep-Alive pooling, HTTP proxy support, and safe redirects."""
     wall_deadline = (
         req.deadline if req.deadline is not None else (time.monotonic() + float(req.timeout_sec))
     )
-    conn_timeout = max(0.005, float(req.connect_timeout_sec))
-    hdrs_out = dict(req.headers)
+    caller_proxy_auth = ""
+    hdrs_out: dict[str, str] = {}
+    for k, v in req.headers.items():
+        if k.lower() == "proxy-authorization":
+            if v is not None:
+                raw_auth = str(v)
+                if raw_auth:
+                    _validate_proxy_auth_value(raw_auth)
+                    stripped_auth = raw_auth.strip()
+                    if stripped_auth:
+                        caller_proxy_auth = stripped_auth
+        else:
+            hdrs_out[k] = v
     if not any(k.lower() == "user-agent" for k in hdrs_out):
         hdrs_out["User-Agent"] = DEFAULT_USER_AGENT
 
+    raw_proxy_url = ""
+    proxy_route: _HttpProxyRoute | None = None
     try:
+        if req.cancel_token is not None and req.cancel_token.is_cancelled():
+            raise HttpTransportError("HTTP request cancelled", retry_kind="never")
         rem = wall_deadline - time.monotonic()
         if rem <= 0:
             raise TimeoutError(f"HTTP request exceeded deadline before send for {req.url}")
-        eff_timeout = min(float(req.timeout_sec), rem)
 
         _, origin = _validate_request_url(req.url)
         scheme, host, port, _, _ = origin
@@ -2437,57 +2780,43 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
                 req, wall_deadline=wall_deadline, hdrs_init=hdrs_out, proxy_key=""
             )
 
-        ureq = urllib.request.Request(
-            req.url,
-            data=req.body,
-            headers=hdrs_out,
-            method=req.method,
-        )
-        setattr(ureq, "_voice_deadline", wall_deadline)
-        setattr(ureq, "_voice_req_timeout", float(req.timeout_sec))
-        setattr(ureq, "_voice_connect_timeout", conn_timeout)
-        if req.cancel_token is not None:
-            setattr(ureq, "_voice_cancel_token", req.cancel_token)
-            if req.cancel_token.is_cancelled():
-                raise HttpTransportError("HTTP request cancelled", retry_kind="never")
         cur_proxies = urllib.request.getproxies()
-        opener = (
-            _SAFE_OPENER
-            if (_SAFE_OPENER is not _DEFAULT_SAFE_OPENER or cur_proxies == _INITIAL_PROXIES)
-            else urllib.request.build_opener(
-                _NoDnsProxyHandler(cur_proxies),
-                _SplitTimeoutHTTPHandler(),
-                _SplitTimeoutHTTPSHandler(),
-                _SameOriginSafeRedirectHandler(),
+        raw_proxy_url = _select_system_proxy_url(cur_proxies, scheme)
+        proxy_route, proxy_err = _resolve_http_proxy_route(raw_proxy_url, target_scheme=scheme)
+        if proxy_route is None:
+            safe_cfg_msg = _redact_proxy_error_text(
+                f"HTTP proxy configuration error for {req.url}: {proxy_err}",
+                raw_proxy_url,
+                None,
+                caller_proxy_auth=caller_proxy_auth,
             )
+            raise HttpTransportError(safe_cfg_msg, retry_kind="never")
+
+        if not proxy_route.proxy_auth_header and caller_proxy_auth:
+            auth_fp = hashlib.sha256(caller_proxy_auth.encode("utf-8")).hexdigest()[:12]
+            proxy_route = _HttpProxyRoute(
+                host=proxy_route.host,
+                port=proxy_route.port,
+                proxy_key=f"{proxy_route.proxy_key}|auth:{auth_fp}",
+                proxy_scheme=proxy_route.proxy_scheme,
+                proxy_auth_header=caller_proxy_auth,
+            )
+
+        return _execute_keepalive(
+            req,
+            wall_deadline=wall_deadline,
+            hdrs_init=hdrs_out,
+            proxy_key=proxy_route.proxy_key,
+            proxy_route=proxy_route,
         )
-        with opener.open(ureq, timeout=eff_timeout) as resp:
-            status = getattr(resp, "status", None) or resp.getcode() or 200
-            hdrs = {k.lower(): v for k, v in resp.headers.items()}
-            body = _read_stream_with_deadline(resp, wall_deadline)
-            if req.cancel_token is not None and req.cancel_token.is_cancelled():
-                raise HttpTransportError("HTTP request cancelled", retry_kind="never")
-            return HttpResponse(status=int(status), headers=hdrs, body=body)
-    except urllib.error.HTTPError as exc:
-        try:
-            if req.cancel_token is not None and req.cancel_token.is_cancelled():
-                raise HttpTransportError("HTTP request cancelled", retry_kind="never") from None
-            hdrs = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
-            try:
-                body = _read_stream_with_deadline(exc, wall_deadline)
-            except (TimeoutError, socket.timeout):
-                raise
-            except Exception:
-                body = b""
-            if req.cancel_token is not None and req.cancel_token.is_cancelled():
-                raise HttpTransportError("HTTP request cancelled", retry_kind="never") from None
-            return HttpResponse(status=int(exc.code), headers=hdrs, body=body)
-        finally:
-            _close_quietly(exc)
     except (urllib.error.URLError, TimeoutError, socket.timeout, http.client.HTTPException, OSError) as exc:
         if req.cancel_token is not None and req.cancel_token.is_cancelled():
             raise HttpTransportError("HTTP request cancelled", retry_kind="never") from None
         rkind = classify_transport_error(exc)
-        raise HttpTransportError(
-            f"HTTP transport error for {req.url}: {exc}", retry_kind=rkind
-        ) from None
+        safe_msg = _redact_proxy_error_text(
+            f"HTTP transport error for {req.url}: {exc}",
+            raw_proxy_url,
+            proxy_route,
+            caller_proxy_auth=caller_proxy_auth,
+        )
+        raise HttpTransportError(safe_msg, retry_kind=rkind) from None

@@ -1378,49 +1378,29 @@ class AsrProvidersTests(unittest.TestCase):
                         HttpRequest(f"{base}/slow", "GET", {}, b"", 3.0, deadline=time.monotonic() + 0.05)
                     )
 
-            # 6. Proxy env compatibility: HTTP_PROXY routes through _SAFE_OPENER; NO_PROXY bypasses back to pool!
-            import io
-
-            proxy_called = [0]
-
-            class _FakeOpenerResp(io.BytesIO):
-                status = 200
-                headers = {"Content-Type": "application/json"}
-
-                def __init__(self) -> None:
-                    super().__init__(b'{"via":"proxy"}')
-
-            class _FakeOpener:
-                def open(self, ureq: object, timeout: float | None = None) -> _FakeOpenerResp:
-                    proxy_called[0] += 1
-                    return _FakeOpenerResp()
-
+            # 6. Unsupported proxy schemes fail closed (never bypass/leak); NO_PROXY bypasses back to direct pool!
             base_clean_env = {
                 k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")
             }
-            with (
-                mock.patch.dict(
-                    os.environ,
-                    {**base_clean_env, "HTTP_PROXY": "http://127.0.0.1:9999"},
-                    clear=True,
-                ),
-                mock.patch("agent_voice_input.http_transport._SAFE_OPENER", _FakeOpener()),
+            accept_before_unsupported = accept_count[0]
+            with mock.patch.dict(
+                os.environ,
+                {**base_clean_env, "HTTP_PROXY": "socks5://127.0.0.1:9999"},
+                clear=True,
             ):
-                r_prox = urllib_http_transport(HttpRequest(f"{base}/echo", "GET", {}, b"", 3.0))
-                self.assertEqual(r_prox.json(), {"via": "proxy"})
-                self.assertEqual(proxy_called[0], 1)
+                with self.assertRaises(HttpTransportError) as cm_unsup:
+                    urllib_http_transport(HttpRequest(f"{base}/echo", "GET", {}, b"", 3.0))
+                self.assertEqual(cm_unsup.exception.retry_kind, "never")
+                self.assertIn("unsupported proxy scheme", str(cm_unsup.exception).lower())
+            self.assertEqual(accept_count[0], accept_before_unsupported)
 
-            with (
-                mock.patch.dict(
-                    os.environ,
-                    {**base_clean_env, "HTTP_PROXY": "http://127.0.0.1:9999", "NO_PROXY": "127.0.0.1"},
-                    clear=True,
-                ),
-                mock.patch("agent_voice_input.http_transport._SAFE_OPENER", _FakeOpener()),
+            with mock.patch.dict(
+                os.environ,
+                {**base_clean_env, "HTTP_PROXY": "socks5://127.0.0.1:9999", "NO_PROXY": "127.0.0.1"},
+                clear=True,
             ):
                 r_bypass = urllib_http_transport(HttpRequest(f"{base}/echo", "GET", {}, b"", 3.0))
                 self.assertEqual(r_bypass.json()["path"], "/echo")
-                self.assertEqual(proxy_called[0], 1)
 
             # 7. Default pool keeps 5 idle warm connections per origin; custom capacity eviction & idle expiry close sockets cleanly
             self.assertEqual(_KeepAlivePool._MAX_IDLE_PER_ORIGIN, 5)
