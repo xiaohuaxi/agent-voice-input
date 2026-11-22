@@ -739,12 +739,12 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
     let st = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     let layer = resolveHudLayer(state: st, explicitLayer: explicitLayer)
 
-    let toastBg = HudRgba(r: 30.0 / 255.0, g: 31.0 / 255.0, b: 36.0 / 255.0, a: 0.98)
+    let toastBg = HudRgba(r: 28.0 / 255.0, g: 28.0 / 255.0, b: 30.0 / 255.0, a: 0.96)
     let toastMainText = HudRgba(r: 244.0 / 255.0, g: 245.0 / 255.0, b: 248.0 / 255.0, a: 1.0)
     let toastHintText = HudRgba(r: 190.0 / 255.0, g: 195.0 / 255.0, b: 208.0 / 255.0, a: 1.0)
-    let amberBorder = HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 0.78)
+    let amberBorder = HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 0.52)
     let amberIcon = HudRgba(r: 251.0 / 255.0, g: 191.0 / 255.0, b: 36.0 / 255.0, a: 1.0)
-    let coralBorder = HudRgba(r: 248.0 / 255.0, g: 113.0 / 255.0, b: 113.0 / 255.0, a: 0.78)
+    let coralBorder = HudRgba(r: 248.0 / 255.0, g: 113.0 / 255.0, b: 113.0 / 255.0, a: 0.55)
     let coralIcon = HudRgba(r: 248.0 / 255.0, g: 113.0 / 255.0, b: 113.0 / 255.0, a: 1.0)
 
     switch st {
@@ -757,7 +757,7 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
             borderWidth: 1.0,
             icon: hudRgba(255, 104, 112, 1.0),
             mainText: hudRgba(248, 250, 252, 1.0),
-            hintText: hudRgba(188, 178, 192, 1.0),
+            hintText: hudRgba(200, 178, 182, 1.0),
             autoHideMs: 0,
             iconKind: ""
         )
@@ -1211,7 +1211,7 @@ final class WaveBarsView: NSView {
     var activeColor: NSColor = rgba(255, 104, 112, 1.0) {
         didSet { needsDisplay = true }
     }
-    var quietColor: NSColor = rgba(232, 92, 102, 1.0) {
+    var quietColor: NSColor = rgba(244, 104, 114, 0.52) {
         didSet { needsDisplay = true }
     }
 
@@ -1274,14 +1274,14 @@ func computeWaveHudLayout(
     scale: CGFloat
 ) -> HudWaveLayoutGeometry {
     let padL: CGFloat = 16.0
-    let padR: CGFloat = 16.0
+    let padR: CGFloat = hasBadge ? 10.0 : 16.0
     let waveW: CGFloat = WaveBarsView.totalWidth
     let gap1: CGFloat = 10.0
     let gap2: CGFloat = hasHint ? 10.0 : 0.0
-    let badgePadX: CGFloat = 5.0
+    let badgePadX: CGFloat = 6.0
     let badgeSlotW: CGFloat = hasBadge ? max(22.0, ceil(badgeTextW) + badgePadX * 2.0) : 0.0
-    let badgeH: CGFloat = hasBadge ? max(18.0, ceil(badgeTextH) + 4.0) : 0.0
-    let badgeGap: CGFloat = hasBadge ? (hasHint ? 8.0 : 10.0) : 0.0
+    let badgeH: CGFloat = hasBadge ? max(20.0, ceil(badgeTextH) + 4.0) : 0.0
+    let badgeGap: CGFloat = hasBadge ? 10.0 : 0.0
     let effHintW: CGFloat = hasHint ? hintW : 0.0
     let totalContentW = durSlotW + gap1 + waveW + gap2 + effHintW + badgeGap + badgeSlotW
     let textH = max(max(durH, hasHint ? hintH : 0.0), badgeH)
@@ -1403,26 +1403,30 @@ func computeStatusHudLayout(
 final class HudPillController {
     private static let recBg = rgba(64, 18, 26, 0.98)
     private static let recBorder = rgba(232, 88, 102, 0.68)
-    private static let recWaveActive = rgba(255, 104, 112, 1.0)
-    private static let recWaveQuiet = rgba(232, 92, 102, 1.0)
+    fileprivate static let recWaveActive = rgba(255, 104, 112, 1.0)
+    fileprivate static let recWaveQuiet = rgba(244, 104, 114, 0.52)
     private static let recMainText = rgba(248, 250, 252)
-    private static let recHintTextCol = rgba(188, 178, 192, 1.0)
+    private static let recHintTextCol = rgba(200, 178, 182, 1.0)
 
     private static let warnBg = rgba(72, 38, 12, 0.98)
     private static let warnBorder = rgba(245, 158, 11, 0.72)
-    private static let warnWaveActive = rgba(251, 191, 36, 1.0)
-    private static let warnWaveQuiet = rgba(251, 191, 36, 0.86)
+    fileprivate static let warnWaveActive = rgba(251, 191, 36, 1.0)
+    fileprivate static let warnWaveQuiet = rgba(251, 191, 36, 0.52)
     private static let warnMainText = rgba(254, 252, 232)
     private static let warnHintTextCol = rgba(251, 191, 36, 1.0)
 
-    fileprivate static let badgeBg = rgba(56, 189, 248, 0.22)
-    fileprivate static let badgeBorder = rgba(56, 189, 248, 0.58)
-    fileprivate static let badgeTextCol = rgba(186, 230, 253, 1.0)
+    fileprivate static let recBadgeBg = rgba(255, 255, 255, 0.14)
+    fileprivate static let recBadgeBorder = rgba(255, 214, 220, 0.28)
+    fileprivate static let recBadgeTextCol = rgba(255, 241, 242, 1.0)
+
+    fileprivate static let warnBadgeBg = rgba(254, 243, 199, 0.15)
+    fileprivate static let warnBadgeBorder = rgba(251, 191, 36, 0.36)
+    fileprivate static let warnBadgeTextCol = rgba(254, 243, 199, 1.0)
 
     fileprivate static let hudFont = NSFont.systemFont(ofSize: 13.5, weight: .regular)
     fileprivate static let monoDurFont = NSFont.monospacedDigitSystemFont(ofSize: 13.5, weight: .regular)
     fileprivate static let toastFont = NSFont.systemFont(ofSize: 12.5, weight: .regular)
-    fileprivate static let badgeFont = NSFont.monospacedDigitSystemFont(ofSize: 11.0, weight: .semibold)
+    fileprivate static let badgeFont = NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
     private static let bellWeight: [CGFloat] = [1.00, 0.92, 0.78, 0.58, 0.40]
 
     private var panel: NSPanel?
@@ -1574,18 +1578,18 @@ final class HudPillController {
         hl.isHidden = true
         container.addSubview(hl)
 
-        let bv = NSView(frame: NSRect(x: 0, y: 0, width: 22, height: 18))
+        let bv = NSView(frame: NSRect(x: 0, y: 0, width: 22, height: 20))
         bv.wantsLayer = true
-        bv.layer?.backgroundColor = Self.badgeBg.cgColor
-        bv.layer?.borderColor = Self.badgeBorder.cgColor
-        bv.layer?.borderWidth = 0.85
-        bv.layer?.cornerRadius = 9.0
+        bv.layer?.backgroundColor = Self.recBadgeBg.cgColor
+        bv.layer?.borderColor = Self.recBadgeBorder.cgColor
+        bv.layer?.borderWidth = 1.0
+        bv.layer?.cornerRadius = 10.0
         bv.layer?.masksToBounds = true
         bv.isHidden = true
 
         let bl = NSTextField(labelWithString: "")
         bl.font = Self.badgeFont
-        bl.textColor = Self.badgeTextCol
+        bl.textColor = Self.recBadgeTextCol
         bl.alignment = .center
         bl.lineBreakMode = .byClipping
         bl.maximumNumberOfLines = 1
@@ -1871,6 +1875,10 @@ final class HudPillController {
             bv.frame = alignedBadge
             bv.layer?.contentsScale = scale
             bv.layer?.cornerRadius = alignedBadge.height / 2.0
+            bv.layer?.backgroundColor = (isWarn ? Self.warnBadgeBg : Self.recBadgeBg).cgColor
+            bv.layer?.borderColor = (isWarn ? Self.warnBadgeBorder : Self.recBadgeBorder).cgColor
+            bv.layer?.borderWidth = 1.0
+            bl.textColor = isWarn ? Self.warnBadgeTextCol : Self.recBadgeTextCol
             bl.frame = alignSubviewRect(geom.badgeLabelFrame, in: bv, scale: scale)
         }
     }
@@ -3017,7 +3025,9 @@ private func runHudLayoutSelfCheck() throws -> Int {
         zh: Bool,
         visibleW: CGFloat,
         scale: CGFloat,
-        holdCancelPreview: Bool = false
+        holdCancelPreview: Bool = false,
+        barNorms: [CGFloat] = [0.2, 0.45, 0.75, 0.95, 1.0, 0.85, 0.6, 0.35, 0.15],
+        verifyPerBar: Bool = false
     ) throws {
         let seg = splitHudSegments(text)
         var isWarn = false
@@ -3045,10 +3055,14 @@ private func runHudLayoutSelfCheck() throws -> Int {
         leftPara.alignment = .left
 
         let mainCol = isWarn ? rgba(254, 252, 232) : rgba(248, 250, 252)
-        let hintCol = (isWarn || holdCancelPreview) ? rgba(251, 191, 36, 1.0) : rgba(188, 178, 192, 1.0)
+        let hintCol = (isWarn || holdCancelPreview) ? rgba(251, 191, 36, 1.0) : rgba(200, 178, 182, 1.0)
         let bgCol = isWarn ? rgba(72, 38, 12, 0.98) : rgba(64, 18, 26, 0.98)
         let borderCol = isWarn ? rgba(245, 158, 11, 0.72) : rgba(232, 88, 102, 0.68)
-        let waveCol = isWarn ? rgba(251, 191, 36, 1.0) : rgba(255, 104, 112, 1.0)
+        let waveActiveCol = isWarn ? HudPillController.warnWaveActive : HudPillController.recWaveActive
+        let waveQuietCol = isWarn ? HudPillController.warnWaveQuiet : HudPillController.recWaveQuiet
+        let badgeBgCol = isWarn ? HudPillController.warnBadgeBg : HudPillController.recBadgeBg
+        let badgeBorderCol = isWarn ? HudPillController.warnBadgeBorder : HudPillController.recBadgeBorder
+        let badgeTextCol = isWarn ? HudPillController.warnBadgeTextCol : HudPillController.recBadgeTextCol
 
         let durAttr = NSAttributedString(string: durStr, attributes: [.font: HudPillController.monoDurFont, .foregroundColor: mainCol, .paragraphStyle: centerPara])
         let durTplAttr = NSAttributedString(string: durTpl, attributes: [.font: HudPillController.monoDurFont, .foregroundColor: mainCol, .paragraphStyle: centerPara])
@@ -3066,7 +3080,7 @@ private func runHudLayoutSelfCheck() throws -> Int {
 
         let hasBadge = bgCount > 0
         let badgeStr = hasBadge ? "+\(bgCount)" : ""
-        let badgeAttr = NSAttributedString(string: badgeStr, attributes: [.font: HudPillController.badgeFont, .foregroundColor: HudPillController.badgeTextCol, .paragraphStyle: centerPara])
+        let badgeAttr = NSAttributedString(string: badgeStr, attributes: [.font: HudPillController.badgeFont, .foregroundColor: badgeTextCol, .paragraphStyle: centerPara])
         let badgeSz = hasBadge ? measureCell(badgeAttr) : NSSize.zero
 
         let geom = computeWaveHudLayout(
@@ -3093,11 +3107,13 @@ private func runHudLayoutSelfCheck() throws -> Int {
             try assertLayout(geom.hintFrame.width >= hintActSz.width && geom.hintSlotW >= hintActSz.width, "\(label): hintFrame overflow")
         }
         if hasBadge {
+            try assertLayout(geom.padR == 10.0, "\(label): expected optical padR=10.0 with badge, got \(geom.padR)")
             let prevRight = effHint.isEmpty ? geom.waveFrame.maxX : geom.hintFrame.maxX
             try assertLayout(prevRight < geom.badgeFrame.minX, "\(label): badgeFrame overlaps previous segment")
             try assertLayout(geom.badgeFrame.width >= badgeSz.width, "\(label): badgeFrame overflow")
             try assertLayout(geom.badgeFrame.maxX <= geom.pillW - geom.padR, "\(label): badgeFrame right padding")
         } else {
+            try assertLayout(geom.padR == 16.0, "\(label): expected padR=16.0 without badge, got \(geom.padR)")
             try assertLayout(geom.badgeFrame == .zero, "\(label): unexpected badgeFrame when bgCount=0")
             let lastRight = effHint.isEmpty ? geom.waveFrame.maxX : geom.hintFrame.maxX
             try assertLayout(lastRight <= geom.pillW - geom.padR, "\(label): hintFrame right padding")
@@ -3133,24 +3149,23 @@ private func runHudLayoutSelfCheck() throws -> Int {
         capsule.stroke()
 
         durAttr.draw(in: geom.durFrame)
-        let norms: [CGFloat] = [0.2, 0.45, 0.75, 0.95, 1.0, 0.85, 0.6, 0.35, 0.15]
-        let maxBarH = max(WaveBarsView.barWidth, min(geom.pillH - 8.0, WaveBarsView.maxBarHeight))
-        waveCol.setFill()
-        for idx in 0..<9 {
-            let bh = WaveBarsView.barWidth + norms[idx] * (maxBarH - WaveBarsView.barWidth)
-            let bx = geom.waveFrame.minX + CGFloat(idx) * (WaveBarsView.barWidth + WaveBarsView.barGap)
-            let by = (geom.pillH - bh) * 0.5
-            NSBezierPath(roundedRect: NSRect(x: bx, y: by, width: WaveBarsView.barWidth, height: bh), xRadius: WaveBarsView.barWidth * 0.5, yRadius: WaveBarsView.barWidth * 0.5).fill()
-        }
+        let waveView = WaveBarsView(frame: NSRect(origin: .zero, size: geom.waveFrame.size))
+        waveView.activeColor = waveActiveCol
+        waveView.quietColor = waveQuietCol
+        waveView.barNorms = barNorms
+        ctx.cgContext.saveGState()
+        ctx.cgContext.translateBy(x: geom.waveFrame.minX, y: geom.waveFrame.minY)
+        waveView.draw(waveView.bounds)
+        ctx.cgContext.restoreGState()
         if !effHint.isEmpty {
             hintAttr.draw(in: NSRect(x: geom.hintFrame.minX + 2.0, y: geom.hintFrame.minY, width: max(1.0, geom.hintFrame.width - 2.0), height: geom.hintFrame.height))
         }
         if hasBadge {
             let bPath = NSBezierPath(roundedRect: geom.badgeFrame, xRadius: geom.badgeFrame.height / 2.0, yRadius: geom.badgeFrame.height / 2.0)
-            HudPillController.badgeBg.setFill()
+            badgeBgCol.setFill()
             bPath.fill()
-            HudPillController.badgeBorder.setStroke()
-            bPath.lineWidth = 0.85
+            badgeBorderCol.setStroke()
+            bPath.lineWidth = 1.0
             bPath.stroke()
             let drawBadgeRect = NSRect(x: geom.badgeFrame.minX, y: geom.badgeFrame.minY + geom.badgeLabelFrame.minY, width: geom.badgeFrame.width, height: geom.badgeLabelFrame.height)
             badgeAttr.draw(in: drawBadgeRect)
@@ -3169,6 +3184,18 @@ private func runHudLayoutSelfCheck() throws -> Int {
         let bgR = Int(data[bgIdx]), bgG = Int(data[bgIdx + 1]), bgB = Int(data[bgIdx + 2])
         try assertLayout(regionHasDistinctForeground(data: data, bpr: bpr, spp: spp, pxW: pxW, pxH: pxH, rect: geom.durFrame, scale: scale, bgR: bgR, bgG: bgG, bgB: bgB), "\(label): durFrame blank")
         try assertLayout(regionHasDistinctForeground(data: data, bpr: bpr, spp: spp, pxW: pxW, pxH: pxH, rect: geom.waveFrame, scale: scale, bgR: bgR, bgG: bgG, bgB: bgB), "\(label): waveFrame blank")
+        if verifyPerBar {
+            for idx in 0..<9 {
+                let norm = (idx < barNorms.count) ? min(1.0, max(0.0, barNorms[idx])) : 0.0
+                let bx = geom.waveFrame.minX + CGFloat(idx) * (WaveBarsView.barWidth + WaveBarsView.barGap)
+                let barRect = NSRect(x: bx, y: geom.waveFrame.minY, width: WaveBarsView.barWidth, height: geom.waveFrame.height)
+                let kind = norm > 0.01 ? "active" : "quiet"
+                try assertLayout(
+                    regionHasDistinctForeground(data: data, bpr: bpr, spp: spp, pxW: pxW, pxH: pxH, rect: barRect, scale: scale, bgR: bgR, bgG: bgG, bgB: bgB),
+                    "\(label): wave bar[\(idx)] (\(kind), norm=\(norm)) invisible"
+                )
+            }
+        }
         if !effHint.isEmpty {
             try assertLayout(regionHasDistinctForeground(data: data, bpr: bpr, spp: spp, pxW: pxW, pxH: pxH, rect: geom.hintFrame, scale: scale, bgR: bgR, bgG: bgG, bgB: bgB), "\(label): hintFrame blank")
         }
@@ -3342,6 +3369,35 @@ private func runHudLayoutSelfCheck() throws -> Int {
                     cases += 1
                 }
             }
+            let mixedWaveNorms: [CGFloat] = [0.0, 0.005, 0.01, 0.25, 0.75, 1.0, 0.0, 0.01, 0.0]
+            try renderAndVerifyWave(
+                label: "mac_rec_wave_mixed_\(langTag)_s\(Int(spec.scale))",
+                text: recTexts[0],
+                elapsedSec: 5,
+                maxDurSec: 0,
+                warnRemSec: 0,
+                bgCount: 0,
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale,
+                barNorms: mixedWaveNorms,
+                verifyPerBar: true
+            )
+            cases += 1
+            try renderAndVerifyWave(
+                label: "mac_warn_wave_mixed_\(langTag)_s\(Int(spec.scale))",
+                text: recTexts[0],
+                elapsedSec: 55,
+                maxDurSec: 60,
+                warnRemSec: 15,
+                bgCount: 0,
+                zh: zh,
+                visibleW: spec.width,
+                scale: spec.scale,
+                barNorms: mixedWaveNorms,
+                verifyPerBar: true
+            )
+            cases += 1
             try renderAndVerifyWave(
                 label: "mac_warn12_\(langTag)_s\(Int(spec.scale))",
                 text: recTexts[0],

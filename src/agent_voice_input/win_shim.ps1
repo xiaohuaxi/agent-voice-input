@@ -417,20 +417,23 @@ public sealed class HudPillForm : Form {
     private const TextFormatFlags TruncDrawFlags = TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis;
     private static readonly Color DefaultBgColor = Color.FromArgb(64, 18, 26);
     private static readonly Color RecBgColor = Color.FromArgb(64, 18, 26);
-    private static readonly Color RecBorderColor = Color.FromArgb(196, 66, 80);
+    private static readonly Color RecBorderColor = Color.FromArgb(174, 232, 88, 102);
     private static readonly Color RecWaveActiveColor = Color.FromArgb(255, 255, 104, 112);
-    private static readonly Color RecWaveQuietColor = Color.FromArgb(255, 232, 92, 102);
+    private static readonly Color RecWaveQuietColor = Color.FromArgb(132, 244, 104, 114);
     private static readonly Color RecMainColor = Color.FromArgb(248, 250, 252);
-    private static readonly Color RecHintColor = Color.FromArgb(230, 188, 178, 192);
+    private static readonly Color RecHintColor = Color.FromArgb(200, 178, 182);
     private static readonly Color WarnBgColor = Color.FromArgb(72, 38, 12);
-    private static readonly Color WarnBorderColor = Color.FromArgb(224, 138, 28);
+    private static readonly Color WarnBorderColor = Color.FromArgb(184, 245, 158, 11);
     private static readonly Color WarnWaveActiveColor = Color.FromArgb(255, 251, 191, 36);
-    private static readonly Color WarnWaveQuietColor = Color.FromArgb(220, 251, 191, 36);
+    private static readonly Color WarnWaveQuietColor = Color.FromArgb(132, 251, 191, 36);
     private static readonly Color WarnMainColor = Color.FromArgb(254, 252, 232);
     private static readonly Color WarnHintColor = Color.FromArgb(255, 251, 191, 36);
-    private static readonly Color BadgeBgColor = Color.FromArgb(64, 56, 189, 248);
-    private static readonly Color BadgeBorderColor = Color.FromArgb(148, 56, 189, 248);
-    private static readonly Color BadgeTextColor = Color.FromArgb(255, 186, 230, 253);
+    private static readonly Color RecBadgeBgColor = Color.FromArgb(36, 255, 255, 255);
+    private static readonly Color RecBadgeBorderColor = Color.FromArgb(72, 255, 214, 220);
+    private static readonly Color RecBadgeTextColor = Color.FromArgb(255, 255, 241, 242);
+    private static readonly Color WarnBadgeBgColor = Color.FromArgb(38, 254, 243, 199);
+    private static readonly Color WarnBadgeBorderColor = Color.FromArgb(92, 251, 191, 36);
+    private static readonly Color WarnBadgeTextColor = Color.FromArgb(255, 254, 243, 199);
     private static readonly float[] BellWeight = new float[] { 1.00f, 0.92f, 0.78f, 0.58f, 0.40f };
     private readonly bool _isToast;
     private Font _font, _badgeFont;
@@ -446,7 +449,7 @@ public sealed class HudPillForm : Form {
     private int _maxDurationSec = 0, _warnRemainSec = 0, _bgCount = 0;
     private bool _isWaveRecording = false, _shown = false, _holdPreview = false;
     private string _text = "", _position = "bottom", _iconKind = "", _stateName = "", _lastRenderedHint = "";
-    private Color _bgColor = DefaultBgColor, _iconColor = Color.White, _mainColor = Color.White, _hintColor = RecHintColor, _borderColor = Color.Gray;
+    private Color _bgColor = DefaultBgColor, _iconColor = Color.White, _mainColor = Color.White, _hintColor = RecHintColor, _borderColor = RecBorderColor;
     private IntPtr _fgHwnd = IntPtr.Zero;
     private Rectangle _anchoredWorkArea = Rectangle.Empty;
     private int _lastX = int.MinValue, _lastY = int.MinValue, _lastW = 0, _lastH = 0;
@@ -543,6 +546,14 @@ public sealed class HudPillForm : Form {
     }
 
     private static Font CreateBadgeFont(int dpi, out bool owns) {
+        float semiPx = Math.Max(10f, (float)Math.Round(11.5f * dpi / 96.0f));
+        try {
+            using (FontFamily ff = new FontFamily("Segoe UI Semibold")) {
+                FontStyle st = ff.IsStyleAvailable(FontStyle.Regular) ? FontStyle.Regular : FontStyle.Bold;
+                owns = true;
+                return new Font(ff, semiPx, st, GraphicsUnit.Pixel);
+            }
+        } catch { }
         float pxSize = Math.Max(10f, (float)Math.Round(11.0f * dpi / 96.0f));
         string[] fams = new string[] { "Segoe UI", "Microsoft YaHei UI" };
         foreach (string n in fams) {
@@ -819,7 +830,7 @@ public sealed class HudPillForm : Form {
         string iconSeg, mainSeg, hintSeg; bool spBeforeHint;
         VoiceWinShim.SplitHudSegments(_text, out iconSeg, out mainSeg, out hintSeg, out spBeforeHint);
         int padL = _isToast ? ScalePx(12) : ScalePx(15);
-        int padR = _isToast ? ScalePx(12) : ScalePx(15);
+        int padR = _isToast ? ScalePx(12) : ((_isWaveRecording && _bgCount > 0) ? ScalePx(10) : ScalePx(15));
         int minW = _isToast ? ScalePx(56) : ScalePx(64);
         int maxW = Math.Max(minW, Math.Min(ScalePx(680), wa.Width - ScalePx(24)));
 
@@ -835,6 +846,7 @@ public sealed class HudPillForm : Form {
         Size mainSz = Size.Empty, hintSz = Size.Empty, badgeTextSz = Size.Empty;
         Color effBg = _bgColor, effBorder = _borderColor, effMain = _mainColor, effHintCol = _hintColor;
         Color effWaveActive = RecWaveActiveColor, effWaveQuiet = RecWaveQuietColor;
+        Color effBadgeBg = RecBadgeBgColor, effBadgeBorder = RecBadgeBorderColor, effBadgeText = RecBadgeTextColor;
 
         if (_isWaveRecording) {
             long elapsedSec = GetEffectiveElapsedSec();
@@ -851,6 +863,9 @@ public sealed class HudPillForm : Form {
                 effWaveQuiet = WarnWaveQuietColor;
                 effMain = WarnMainColor;
                 effHintCol = WarnHintColor;
+                effBadgeBg = WarnBadgeBgColor;
+                effBadgeBorder = WarnBadgeBorderColor;
+                effBadgeText = WarnBadgeTextColor;
                 effHint = VoiceWinShim.FormatCountdownHint((int)remainSec, zhHint);
             } else {
                 effBg = RecBgColor;
@@ -859,6 +874,9 @@ public sealed class HudPillForm : Form {
                 effWaveQuiet = RecWaveQuietColor;
                 effMain = RecMainColor;
                 effHintCol = RecHintColor;
+                effBadgeBg = RecBadgeBgColor;
+                effBadgeBorder = RecBadgeBorderColor;
+                effBadgeText = RecBadgeTextColor;
             }
             if (_holdPreview) {
                 effHint = VoiceWinShim.FormatHoldCancelHint(zhHint);
@@ -888,13 +906,13 @@ public sealed class HudPillForm : Form {
                 Font bf = _badgeFont ?? _font;
                 badgeTextSz = TextRenderer.MeasureText(badgeStr, bf, new Size(int.MaxValue, int.MaxValue), MeasureFlags);
                 badgeMeasuredW = badgeTextSz.Width;
-                int badgePadX = ScalePx(5);
-                badgeSlotW = Math.Max(ScalePx(20), badgeTextSz.Width + badgePadX * 2);
-                badgeH = Math.Max(ScalePx(18), badgeTextSz.Height + ScalePx(4));
+                int badgePadX = ScalePx(6);
+                badgeSlotW = Math.Max(ScalePx(22), badgeTextSz.Width + badgePadX * 2);
+                badgeH = Math.Max(ScalePx(19), badgeTextSz.Height + ScalePx(4));
             }
             gap1 = ScalePx(9);
             gap2 = (effHint.Length > 0) ? ScalePx(9) : 0;
-            badgeGap = (badgeSlotW > 0) ? ScalePx((effHint.Length > 0) ? 7 : 9) : 0;
+            badgeGap = (badgeSlotW > 0) ? ScalePx(9) : 0;
             totalTextW = slotW + gap1 + waveBoxW + gap2 + hintSlotW + badgeGap + badgeSlotW;
             textH = Math.Max(Math.Max(actDurSz.Height, hintSz.Height), badgeH);
         } else {
@@ -996,14 +1014,14 @@ public sealed class HudPillForm : Form {
                             g.SmoothingMode = SmoothingMode.AntiAlias;
                             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                             using (GraphicsPath bPath = BuildCapsulePath(bRc.X + 0.5f, bRc.Y + 0.5f, Math.Max(2f, bRc.Width - 1.0f), Math.Max(2f, bRc.Height - 1.0f)))
-                            using (SolidBrush bFill = new SolidBrush(BadgeBgColor))
-                            using (Pen bPen = new Pen(BadgeBorderColor, Math.Max(1.0f, 0.9f * dpiScale))) {
+                            using (SolidBrush bFill = new SolidBrush(effBadgeBg))
+                            using (Pen bPen = new Pen(effBadgeBorder, Math.Max(1.0f, 1.0f * dpiScale))) {
                                 g.FillPath(bFill, bPath);
                                 g.DrawPath(bPen, bPath);
                             }
                             Font bf = _badgeFont ?? _font;
                             int badgeDy = -Math.Max(1, (int)Math.Round(0.5f * dpiScale));
-                            TextRenderer.DrawText(g, badgeStr, bf, new Rectangle(bRc.X - 1, bRc.Y + badgeDy, bRc.Width + 2, bRc.Height), BadgeTextColor, DurDrawFlags);
+                            TextRenderer.DrawText(g, badgeStr, bf, new Rectangle(bRc.X - 1, bRc.Y + badgeDy, bRc.Width + 2, bRc.Height), effBadgeText, DurDrawFlags);
                         }
                     }
                 } else if (truncated) {
@@ -1047,7 +1065,7 @@ public sealed class HudPillForm : Form {
                 }
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                float penW = _isToast ? Math.Max(1.0f, _dpi / 96.0f) : Math.Max(1.0f, 1.1f * (_dpi / 96.0f));
+                float penW = Math.Max(1.0f, 1.0f * dpiScale);
                 float inset = penW * 0.5f + 0.5f;
                 using (GraphicsPath borderPath = BuildCapsulePath(inset, inset, Math.Max(4f, w - inset * 2.0f), Math.Max(4f, h - inset * 2.0f)))
                 using (Pen borderPen = new Pen(effBorder, penW)) {
@@ -1485,82 +1503,84 @@ public static class VoiceWinShim {
 
     private static void ResolveHudVisualStyle(string st, bool zh, string customText, bool isToast, out string txt, out Color bg, out Color ic, out Color mc, out Color hc, out Color bd, out int ms, out bool waveMode, out string iconKind) {
         ms = 0; waveMode = false; iconKind = "";
-        Color toastBg = Color.FromArgb(30, 31, 36);
+        Color toastBg = Color.FromArgb(28, 28, 30);
         Color toastMain = Color.FromArgb(244, 245, 248);
         Color toastHint = Color.FromArgb(190, 195, 208);
         Color toastAmber = Color.FromArgb(251, 191, 36);
+        Color toastAmberBorder = Color.FromArgb(148, 251, 191, 36);
         Color toastCoral = Color.FromArgb(248, 113, 113);
+        Color toastCoralBorder = Color.FromArgb(156, 248, 113, 113);
         if (st == "recording") {
             string hkEn = (_hotkeyLabel == "\u53F3 Ctrl") ? "Right Ctrl" : _hotkeyLabel.Trim();
             txt = zh
                 ? ("\u25CF \u5F55\u97F3\u4E2D\u2026 (" + (_isPtt ? "\u677E\u5F00" : "\u6309") + _hotkeyLabel + " \u7ED3\u675F)")
                 : ("\u25CF Listening\u2026 (" + (_isPtt ? "release " : "press ") + hkEn + " to end)");
-            bg = Color.FromArgb(64, 18, 26); ic = Color.FromArgb(255, 104, 112); mc = Color.FromArgb(248, 250, 252); hc = Color.FromArgb(230, 188, 178, 192); bd = Color.FromArgb(196, 66, 80);
+            bg = Color.FromArgb(64, 18, 26); ic = Color.FromArgb(255, 104, 112); mc = Color.FromArgb(248, 250, 252); hc = Color.FromArgb(200, 178, 182); bd = Color.FromArgb(174, 232, 88, 102);
             string trimmedCustom = (customText ?? "").TrimStart();
             waveMode = !isToast && (string.IsNullOrEmpty(trimmedCustom) || trimmedCustom.StartsWith("\u25CF ", StringComparison.Ordinal));
         } else if (st == "recognizing" || st == "processing") {
             txt = zh ? "\u25D0 \u8BED\u97F3\u8BC6\u522B\u2026" : "\u25D0 Transcribing\u2026";
-            bg = Color.FromArgb(16, 40, 72); ic = Color.FromArgb(56, 189, 248); mc = Color.FromArgb(244, 248, 252); hc = Color.FromArgb(176, 198, 222); bd = Color.FromArgb(52, 148, 212); iconKind = "recognizing";
+            bg = Color.FromArgb(16, 40, 72); ic = Color.FromArgb(56, 189, 248); mc = Color.FromArgb(244, 248, 252); hc = Color.FromArgb(176, 198, 222); bd = Color.FromArgb(166, 56, 189, 248); iconKind = "recognizing";
         } else if (st == "refining") {
             txt = zh ? "\u25C8 \u6574\u7406\u7CBE\u4FEE\u2026" : "\u25C8 Refining\u2026";
-            bg = Color.FromArgb(46, 22, 76); ic = Color.FromArgb(208, 156, 255); mc = Color.FromArgb(248, 245, 255); hc = Color.FromArgb(198, 182, 226); bd = Color.FromArgb(156, 88, 224); iconKind = "refining";
+            bg = Color.FromArgb(46, 22, 76); ic = Color.FromArgb(208, 156, 255); mc = Color.FromArgb(248, 245, 255); hc = Color.FromArgb(198, 182, 226); bd = Color.FromArgb(166, 192, 132, 252); iconKind = "refining";
         } else if (st == "done") {
             txt = zh ? "\u2713 \u5DF2\u586B\u5165" : "\u2713 Inserted";
-            bg = Color.FromArgb(14, 54, 36); ic = Color.FromArgb(74, 222, 128); mc = Color.FromArgb(242, 253, 246); hc = Color.FromArgb(174, 218, 192); bd = Color.FromArgb(48, 168, 102); ms = 900; iconKind = "done";
+            bg = Color.FromArgb(14, 54, 36); ic = Color.FromArgb(74, 222, 128); mc = Color.FromArgb(242, 253, 246); hc = Color.FromArgb(174, 218, 192); bd = Color.FromArgb(158, 74, 222, 128); ms = 900; iconKind = "done";
         } else if (st == "copied") {
             txt = zh ? "\u2713 \u5DF2\u590D\u5236(\u7A97\u53E3\u5DF2\u5207\u6362)" : "\u2713 Copied (window switched)";
-            bg = Color.FromArgb(28, 32, 82); ic = Color.FromArgb(144, 156, 255); mc = Color.FromArgb(240, 244, 255); hc = Color.FromArgb(186, 196, 238); bd = Color.FromArgb(108, 116, 242); ms = 2000; iconKind = "done";
+            bg = Color.FromArgb(28, 32, 82); ic = Color.FromArgb(144, 156, 255); mc = Color.FromArgb(240, 244, 255); hc = Color.FromArgb(186, 196, 238); bd = Color.FromArgb(174, 129, 140, 248); ms = 2000; iconKind = "done";
         } else if (st == "empty") {
             txt = zh ? "\u25CB \u672A\u68C0\u6D4B\u5230\u8BED\u97F3" : "\u25CB No speech detected";
-            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2200; iconKind = "empty_ring";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 2200; iconKind = "empty_ring";
         } else if (st == "cancelled") {
             txt = zh ? "\u25CB \u5DF2\u53D6\u6D88" : "\u25CB Cancelled";
-            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 1600; iconKind = "empty_ring";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 1600; iconKind = "empty_ring";
         } else if (st == "mic_unavailable") {
             txt = zh ? "! \u9EA6\u514B\u98CE\u6682\u5FD9\uFF0C\u8BF7\u518D\u8BD5\u4E00\u6B21" : "! Microphone busy, try again";
-            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2600; iconKind = "warning";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 2600; iconKind = "warning";
         } else if (st == "mic_no_stream") {
             txt = zh ? "! \u9EA6\u514B\u98CE\u65E0\u97F3\u9891\u6D41\uFF0C\u8BF7\u68C0\u67E5\u8033\u673A/\u8BBE\u5907" : "! No mic audio stream, check headset";
-            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2600; iconKind = "warning";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 2600; iconKind = "warning";
         } else if (st == "audio_recovered") {
             txt = zh ? "! \u9EA6\u514B\u98CE\u77ED\u6682\u4E2D\u65AD\uFF0C\u5DF2\u81EA\u52A8\u6062\u590D" : "! Mic briefly interrupted, resumed";
-            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 2400; iconKind = "warning";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 2400; iconKind = "warning";
         } else if (st == "partial_asr") {
             txt = zh ? "! \u90E8\u5206\u8BED\u97F3\u672A\u8BC6\u522B\uFF0C\u53EF\u91CD\u8BD5" : "! Partial speech missed, retry available";
-            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 3200; iconKind = "warning";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 3200; iconKind = "warning";
         } else if (st == "partial_asr_unsaved") {
             txt = zh ? "! \u90E8\u5206\u8BED\u97F3\u672A\u8BC6\u522B" : "! Partial speech missed";
-            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 3200; iconKind = "warning";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 3200; iconKind = "warning";
         } else if (st == "partial_asr_copied") {
             txt = zh ? "! \u5DF2\u590D\u5236\uFF0C\u90E8\u5206\u672A\u8BC6\u522B\u53EF\u91CD\u8BD5" : "! Copied; partial missed, can retry";
-            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 3200; iconKind = "warning";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 3200; iconKind = "warning";
         } else if (st == "partial_asr_copied_unsaved") {
             txt = zh ? "! \u5DF2\u590D\u5236\uFF0C\u90E8\u5206\u8BED\u97F3\u672A\u8BC6\u522B" : "! Copied; partial speech missed";
-            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 3200; iconKind = "warning";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 3200; iconKind = "warning";
         } else if (st == "asr_empty_retry") {
             txt = zh ? "! \u8BC6\u522B\u4E3A\u7A7A\uFF0C\u5DF2\u5B58\u5F55\u97F3\u53EF\u91CD\u8BD5" : "! Empty transcript, audio saved for retry";
-            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmber; ms = 3200; iconKind = "warning";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 3200; iconKind = "warning";
         } else if (st == "asr_empty") {
             txt = zh ? "\u2715 \u8BC6\u522B\u4E3A\u7A7A" : "\u2715 Empty transcript";
-            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2600; iconKind = "cross";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoralBorder; ms = 2600; iconKind = "cross";
         } else if (st == "paste_failed_retry") {
             txt = zh ? "\u2715 \u586B\u5165\u5931\u8D25\uFF0C\u5DF2\u5B58\u5F55\u97F3\u53EF\u91CD\u8BD5" : "\u2715 Insert failed, audio saved for retry";
-            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 3200; iconKind = "cross";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoralBorder; ms = 3200; iconKind = "cross";
         } else if (st == "no_mic") {
             txt = zh ? "\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE" : "\u2715 No microphone found";
-            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2200; iconKind = "cross";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoralBorder; ms = 2200; iconKind = "cross";
         } else if (st == "mic_permission") {
             txt = zh ? "\u2715 \u9EA6\u514B\u98CE\u6743\u9650\u672A\u5F00\u542F" : "\u2715 Microphone access denied";
-            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 3200; iconKind = "cross";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoralBorder; ms = 3200; iconKind = "cross";
         } else if (st == "mic_disconnected") {
             txt = zh ? "\u2715 \u9EA6\u514B\u98CE\u5DF2\u65AD\u5F00" : "\u2715 Microphone disconnected";
-            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2200; iconKind = "cross";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoralBorder; ms = 2200; iconKind = "cross";
         } else if (st == "paste_failed") {
             txt = zh ? "\u2715 \u586B\u5165\u5931\u8D25" : "\u2715 Failed to insert text";
-            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2600; iconKind = "cross";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoralBorder; ms = 2600; iconKind = "cross";
         } else {
             txt = zh ? "\u2715 \u8BC6\u522B\u5931\u8D25" : "\u2715 Transcription failed";
-            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoral; ms = 2600; iconKind = "cross";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoralBorder; ms = 2600; iconKind = "cross";
         }
         if (isToast && bg != toastBg) {
             bg = toastBg; mc = toastMain; hc = toastHint;
@@ -3236,6 +3256,8 @@ public static class VoiceWinShim {
                         throw new InvalidOperationException(label + ": HintRect overflows slot");
                 }
                 if (bgCount > 0) {
+                    if (m.PadR >= m.PadL)
+                        throw new InvalidOperationException(label + ": expected optical tighter PadR when badge present (padL=" + m.PadL + " padR=" + m.PadR + ")");
                     string expBadge = "+" + bgCount.ToString(CultureInfo.InvariantCulture);
                     if (m.BadgeText != expBadge)
                         throw new InvalidOperationException(label + ": BadgeText mismatch got=" + m.BadgeText);
@@ -3247,6 +3269,8 @@ public static class VoiceWinShim {
                     if (m.BadgeRect.Right > m.Width - m.PadR)
                         throw new InvalidOperationException(label + ": BadgeRect violates right padding (" + m.BadgeRect.Right + " > " + (m.Width - m.PadR) + ")");
                 } else {
+                    if (m.PadR != m.PadL)
+                        throw new InvalidOperationException(label + ": expected symmetric PadR when no badge (padL=" + m.PadL + " padR=" + m.PadR + ")");
                     if (m.BadgeRect.Width != 0)
                         throw new InvalidOperationException(label + ": unexpected BadgeRect when bgCount=0");
                     int lastRight = (!string.IsNullOrEmpty(m.HintText)) ? m.HintRect.Right : m.WaveRect.Right;
