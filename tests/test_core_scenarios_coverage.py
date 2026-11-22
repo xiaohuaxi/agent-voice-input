@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -80,8 +81,15 @@ from agent_voice_input.config import (  # noqa: E402
     select_asr_provider,
     select_refiner_provider,
 )
-from agent_voice_input.http_transport import _SameOriginSafeRedirectHandler  # noqa: E402
-from agent_voice_input.refiner import _InstanceKeepAlivePool  # noqa: E402
+from agent_voice_input.http_transport import (  # noqa: E402
+    HttpTransportError,
+    _SameOriginSafeRedirectHandler,
+)
+from agent_voice_input.refiner import (  # noqa: E402
+    OpenAIResponsesRefiner,
+    _InstanceKeepAlivePool,
+    _ResponsesAuthTarget,
+)
 from agent_voice_input.remote_ssh import extract_ssh_target_from_argv  # noqa: E402
 from agent_voice_input.session_ctx import write_session_registry_entry  # noqa: E402
 
@@ -889,35 +897,77 @@ class TestCrossLayerHighValueScenarios(unittest.TestCase):
         pool_no_exp = _InstanceKeepAlivePool({"HTTPS_PROXY": "http://10.0.0.2:8888"}, explicit_env=False)
         self.assertIsNone(pool_no_exp._resolve_https_proxy("127.0.0.1", 443))
         self.assertIsNone(pool_no_exp._resolve_https_proxy("localhost", 443))
+        self.assertIsNone(pool_no_exp._resolve_https_proxy("::1", 443))
+
+        # explicit_env=False delegates to urllib.request.getproxies() and os.environ NO_PROXY
+        with (
+            mock.patch.dict(os.environ, {"no_proxy": "", "NO_PROXY": ""}, clear=False),
+            mock.patch("urllib.request.getproxies", return_value={"https": "http://sys-gw.local:7890"}),
+        ):
+            self.assertEqual(pool_no_exp._resolve_https_proxy("api.openai.com", 443), ("sys-gw.local", 7890, {}))
 
         self.assertIsNone(
             _InstanceKeepAlivePool(
                 {"HTTPS_PROXY": "http://proxy.corp:8080", "NO_PROXY": "*"}, explicit_env=True
             )._resolve_https_proxy("api.deepseek.com", 443)
         )
+        # Full NO_PROXY support: .domain, *.domain (without false suffix match), port, CIDR, IPv6, and default port 80
         pool_np = _InstanceKeepAlivePool(
             {
                 "ALL_PROXY": "proxy.corp",
-                "no_proxy": ".internal.corp, direct.example.com:443",
+                "no_proxy": ".internal.corp, *.aliyuncs.com, direct.example.com:443, 10.0.0.0/8, [2001:db8::1]:443",
             },
             explicit_env=True,
         )
         self.assertIsNone(pool_np._resolve_https_proxy("svc.internal.corp", 443))
+        self.assertIsNone(pool_np._resolve_https_proxy("dashscope.aliyuncs.com", 443))
+        self.assertIsNone(pool_np._resolve_https_proxy("aliyuncs.com", 443))
+        self.assertEqual(pool_np._resolve_https_proxy("evilaliyuncs.com", 443), ("proxy.corp", 80, {}))
         self.assertIsNone(pool_np._resolve_https_proxy("direct.example.com", 443))
-        self.assertEqual(pool_np._resolve_https_proxy("api.openai.com", 443), ("proxy.corp", 8080, {}))
+        self.assertEqual(pool_np._resolve_https_proxy("direct.example.com", 8443), ("proxy.corp", 80, {}))
+        self.assertIsNone(pool_np._resolve_https_proxy("10.2.3.4", 443))
+        self.assertIsNone(pool_np._resolve_https_proxy("2001:db8::1", 443))
+        self.assertEqual(pool_np._resolve_https_proxy("api.openai.com", 443), ("proxy.corp", 80, {}))
 
-        # Unsupported scheme / invalid port / empty proxy -> None
+        # Case precedence: lowercase overrides uppercase, and empty lowercase clears uppercase
+        self.assertEqual(
+            _InstanceKeepAlivePool(
+                {"HTTPS_PROXY": "http://upper.corp:8080", "https_proxy": "http://lower.corp:3128"},
+                explicit_env=True,
+            )._resolve_https_proxy("api.openai.com", 443),
+            ("lower.corp", 3128, {}),
+        )
+        self.assertIsNone(
+            _InstanceKeepAlivePool(
+                {"HTTPS_PROXY": "http://upper.corp:8080", "https_proxy": ""},
+                explicit_env=True,
+            )._resolve_https_proxy("api.openai.com", 443)
+        )
+        self.assertEqual(
+            _InstanceKeepAlivePool(
+                {"HTTPS_PROXY": "http://upper.corp:8080", "NO_PROXY": "*", "no_proxy": ""},
+                explicit_env=True,
+            )._resolve_https_proxy("api.openai.com", 443),
+            ("upper.corp", 8080, {}),
+        )
+
+        # Empty proxy -> None; unsupported scheme / invalid port -> fail-closed redacted HttpTransportError
         self.assertIsNone(_InstanceKeepAlivePool({}, explicit_env=True)._resolve_https_proxy("api.openai.com", 443))
-        self.assertIsNone(
-            _InstanceKeepAlivePool({"HTTPS_PROXY": "socks5://127.0.0.1:1080"}, explicit_env=True)._resolve_https_proxy(
-                "api.openai.com", 443
-            )
-        )
-        self.assertIsNone(
-            _InstanceKeepAlivePool({"HTTPS_PROXY": "http://proxy.corp:99999"}, explicit_env=True)._resolve_https_proxy(
-                "api.openai.com", 443
-            )
-        )
+        for bad_proxy, expected_frag in (
+            ("socks5://user:SecretProxyPw9@127.0.0.1:1080", "unsupported proxy scheme 'socks5'"),
+            ("https://user:SecretProxyPw9@proxy.corp:8443", "unsupported proxy scheme 'https'"),
+            ("http://user:SecretProxyPw9@proxy.corp:99999", "invalid proxy url"),
+        ):
+            pool_bad = _InstanceKeepAlivePool({"HTTPS_PROXY": bad_proxy}, explicit_env=True)
+            with self.assertRaises(HttpTransportError) as cm_bad:
+                pool_bad._resolve_https_proxy("api.openai.com", 443)
+            self.assertEqual(cm_bad.exception.retry_kind, "never")
+            err_txt = str(cm_bad.exception)
+            self.assertIn(expected_frag, err_txt.lower())
+            self.assertNotIn("SecretProxyPw9", err_txt)
+            if "unsupported proxy scheme" in expected_frag:
+                self.assertIn("HTTP_PROXY/HTTPS_PROXY=http://...", err_txt)
+                self.assertIn("NO_PROXY", err_txt)
 
         # Basic Proxy-Authorization header with percent-encoded credentials
         pool_auth = _InstanceKeepAlivePool(
@@ -928,6 +978,75 @@ class TestCrossLayerHighValueScenarios(unittest.TestCase):
         self.assertEqual((host, port), ("gw.corp.local", 3128))
         expected_b64 = base64.b64encode(b"dev@corp:s3cr:t").decode("ascii")
         self.assertEqual(hdrs, {"Proxy-Authorization": f"Basic {expected_b64}"})
+
+        # In-flight proxy becoming invalid on release() closes connection safely without raising
+        mut_env = {"HTTPS_PROXY": "http://gw.corp.local:3128"}
+        pool_mut = _InstanceKeepAlivePool(mut_env, explicit_env=True)
+        conn_mut, reused_mut = pool_mut.acquire("https", "api.openai.com", 443, 2.0, allow_reuse=False)
+        self.assertFalse(reused_mut)
+        self.assertEqual((conn_mut.host, conn_mut.port), ("gw.corp.local", 3128))
+        orig_close = conn_mut.close
+        close_calls = [0]
+
+        def _spy_close() -> None:
+            close_calls[0] += 1
+            orig_close()
+
+        conn_mut.close = _spy_close  # type: ignore[method-assign]
+        mut_env["HTTPS_PROXY"] = "socks5://127.0.0.1:1080"
+        pool_mut.release("https", "api.openai.com", 443, conn_mut)
+        self.assertEqual(close_calls[0], 1)
+        self.assertIsNone(conn_mut.sock)
+        pool_mut.close_all()
+
+        # _execute_streaming_attempt redacts proxy secrets & Basic tokens from transport failures
+        proxy_secret = "ProxySecret_8899!"
+        proxy_url = f"http://alice:{proxy_secret}@proxy.corp.local:3128"
+        proxy_b64 = base64.b64encode(f"alice:{proxy_secret}".encode("utf-8")).decode("ascii")
+        ref = OpenAIResponsesRefiner(
+            Config(),
+            env={"OPENAI_API_KEY": "sk-test", "HTTPS_PROXY": proxy_url},
+        )
+        try:
+            class _FailingProxyConn:
+                def __init__(self) -> None:
+                    self.sock = None
+                    self._aborted = False
+                    self._avi_proxy_raw = proxy_url
+                    self._avi_proxy_route = ref._pool._resolve_proxy_route("https", "api.openai.com", 443)[0]
+
+                def connect(self) -> None:
+                    raise OSError(
+                        f"tunnel failed via {proxy_url} with Basic {proxy_b64} (pw={proxy_secret})"
+                    )
+
+                def close(self) -> None:
+                    pass
+
+            with mock.patch.object(ref, "_acquire_conn", return_value=(_FailingProxyConn(), False)):
+                with self.assertRaises(HttpTransportError) as cm_stream:
+                    ref._execute_streaming_attempt(
+                        auth_target=_ResponsesAuthTarget(
+                            url="https://api.openai.com/v1/responses",
+                            bearer_token="sk-test",
+                            identity_key="id-1",
+                        ),
+                        model="gpt-5-mini",
+                        session_uuid="sess-1",
+                        body_bytes=b"{}",
+                        req_timeout=2.0,
+                        wall_deadline=None,
+                        secrets=(),
+                        eff_cancelled=lambda: False,
+                        measure_init=False,
+                        t_init_start=0.0,
+                    )
+            stream_err = str(cm_stream.exception)
+            self.assertNotIn(proxy_secret, stream_err)
+            self.assertNotIn(proxy_b64, stream_err)
+            self.assertIn("[REDACTED]", stream_err)
+        finally:
+            ref.close()
 
     def test_same_origin_safe_redirect_handler_over_real_loopback_http(self) -> None:
         class _RedirectApp(http.server.BaseHTTPRequestHandler):

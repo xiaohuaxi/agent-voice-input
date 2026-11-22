@@ -23,6 +23,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 import urllib.parse
+import urllib.request
 import uuid
 
 from . import __version__
@@ -39,16 +40,21 @@ from .http_transport import (
     HttpRequest,
     HttpResponse,
     HttpTransport,
+    HttpTransportError,
+    _HttpProxyRoute,
     _KeepAlivePool,
     _RATE_PACER,
-    _SplitTimeoutHTTPConnection,
-    _SplitTimeoutHTTPSConnection,
     _can_reuse_pooled_conn,
     _close_quietly,
     _combine_cancel_check,
+    _get_proxies_from_env,
     _is_idle_socket_stale,
     _is_loopback_url,
+    _proxy_bypass_no_dns,
+    _redact_proxy_error_text,
     _register_conn_abort,
+    _resolve_http_proxy_route,
+    _select_system_proxy_url,
     _unregister_conn_abort,
     _validate_request_url,
     classify_http_failure,
@@ -1074,99 +1080,94 @@ class _ResponsesAuthTarget:
 
 
 class _InstanceKeepAlivePool(_KeepAlivePool):
-    """Per-refiner Keep-Alive pool with optional HTTP CONNECT proxy tunneling support."""
+    """Per-refiner Keep-Alive pool reusing the unified HTTP proxy routing engine."""
 
     def __init__(self, env: Mapping[str, str], *, explicit_env: bool = False) -> None:
         super().__init__(max_per_origin=4, idle_timeout_sec=55.0)
         self._env = env
         self._explicit_env = explicit_env
 
-    def _resolve_https_proxy(self, host: str, port: int) -> tuple[str, int, dict[str, str]] | None:
-        if host in ("127.0.0.1", "localhost", "::1"):
-            return None
+    def _resolve_proxy_route(
+        self, scheme: str, host: str, port: int
+    ) -> tuple[_HttpProxyRoute | None, str]:
+        if scheme != "https" or host in ("127.0.0.1", "localhost", "::1"):
+            return None, ""
         src = self._env if self._explicit_env else os.environ
-        no_proxy = (src.get("NO_PROXY") or src.get("no_proxy") or "").strip()
-        if no_proxy == "*":
-            return None
-        if no_proxy:
-            h_low = host.lower()
-            for pat in (p.strip().lower() for p in no_proxy.split(",") if p.strip()):
-                pat_host = pat.split(":", 1)[0].lstrip(".")
-                if pat_host and (h_low == pat_host or h_low.endswith(f".{pat_host}")):
-                    return None
-        raw_proxy = (
-            src.get("HTTPS_PROXY")
-            or src.get("https_proxy")
-            or src.get("ALL_PROXY")
-            or src.get("all_proxy")
-            or ""
-        ).strip()
+        if _proxy_bypass_no_dns(host, port, env=src):
+            return None, ""
+        proxies = _get_proxies_from_env(src) if self._explicit_env else urllib.request.getproxies()
+        raw_proxy = _select_system_proxy_url(proxies, scheme)
         if not raw_proxy:
+            return None, ""
+        route, err = _resolve_http_proxy_route(raw_proxy, target_scheme=scheme)
+        if route is None:
+            safe_msg = _redact_proxy_error_text(
+                f"HTTP proxy configuration error for {scheme}://{host}:{port}: {err}",
+                raw_proxy,
+                None,
+            )
+            raise HttpTransportError(safe_msg, retry_kind="never")
+        return route, raw_proxy
+
+    def _resolve_https_proxy(self, host: str, port: int) -> tuple[str, int, dict[str, str]] | None:
+        route, _ = self._resolve_proxy_route("https", host, port)
+        if route is None:
             return None
-        parsed = urllib.parse.urlsplit(raw_proxy if "://" in raw_proxy else f"http://{raw_proxy}")
-        if parsed.scheme.lower() != "http" or not parsed.hostname:
-            return None
-        try:
-            p_port = parsed.port or 8080
-        except ValueError:
-            return None
-        hdrs: dict[str, str] = {}
-        if parsed.username is not None:
-            user = urllib.parse.unquote(parsed.username)
-            pw = urllib.parse.unquote(parsed.password or "")
-            tok = base64.b64encode(f"{user}:{pw}".encode("utf-8")).decode("ascii")
-            hdrs["Proxy-Authorization"] = f"Basic {tok}"
-        return parsed.hostname, p_port, hdrs
+        hdrs = {"Proxy-Authorization": route.proxy_auth_header} if route.proxy_auth_header else {}
+        return route.host, route.port, hdrs
 
     def _resolve_proxy_key(self, scheme: str, host: str, port: int) -> str:
-        if scheme != "https":
-            return ""
-        proxy_cfg = self._resolve_https_proxy(host, port)
-        if proxy_cfg is None:
-            return ""
-        p_host, p_port, p_hdrs = proxy_cfg
-        auth = p_hdrs.get("Proxy-Authorization", "")
-        auth_part = f"|auth:{hashlib.sha256(auth.encode('utf-8')).hexdigest()[:12]}" if auth else ""
-        return f"https-connect://{p_host.lower()}:{p_port}{auth_part}"
+        route, _ = self._resolve_proxy_route(scheme, host, port)
+        return route.proxy_key if route is not None else ""
 
-    def _new_connection(
+    def acquire(
         self,
         scheme: str,
         host: str,
         port: int,
         timeout_sec: float,
         *,
+        allow_reuse: bool = True,
         connect_timeout_sec: float = DEFAULT_CONNECT_TIMEOUT_SEC,
         io_deadline: float | None = None,
-    ) -> http.client.HTTPConnection:
-        if scheme == "https":
-            if (proxy_cfg := self._resolve_https_proxy(host, port)) is not None:
-                p_host, p_port, p_hdrs = proxy_cfg
-                conn = _SplitTimeoutHTTPSConnection(
-                    p_host,
-                    p_port,
-                    timeout=timeout_sec,
-                    context=self._get_ssl_context(),
-                    connect_timeout=connect_timeout_sec,
-                    io_deadline=io_deadline,
-                )
-                conn.set_tunnel(host, port, headers=p_hdrs or None)
-                return conn
-            return _SplitTimeoutHTTPSConnection(
-                host,
-                port,
-                timeout=timeout_sec,
-                context=self._get_ssl_context(),
-                connect_timeout=connect_timeout_sec,
-                io_deadline=io_deadline,
-            )
-        return _SplitTimeoutHTTPConnection(
+        proxy_key: str | None = None,
+        proxy_route: _HttpProxyRoute | None = None,
+    ) -> tuple[http.client.HTTPConnection, bool]:
+        raw_proxy = ""
+        if proxy_route is None and proxy_key is None:
+            proxy_route, raw_proxy = self._resolve_proxy_route(scheme, host, port)
+            proxy_key = proxy_route.proxy_key if proxy_route is not None else ""
+        conn, reused = super().acquire(
+            scheme,
             host,
             port,
-            timeout=timeout_sec,
-            connect_timeout=connect_timeout_sec,
+            timeout_sec,
+            allow_reuse=allow_reuse,
+            connect_timeout_sec=connect_timeout_sec,
             io_deadline=io_deadline,
+            proxy_key=proxy_key,
+            proxy_route=proxy_route,
         )
+        setattr(conn, "_avi_proxy_raw", raw_proxy)
+        setattr(conn, "_avi_proxy_route", proxy_route)
+        return conn, reused
+
+    def release(
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        conn: http.client.HTTPConnection,
+        *,
+        proxy_key: str | None = None,
+    ) -> None:
+        if proxy_key is None:
+            try:
+                proxy_key = self._resolve_proxy_key(scheme, host, port)
+            except HttpTransportError:
+                _close_quietly(conn)
+                return
+        super().release(scheme, host, port, conn, proxy_key=proxy_key)
 
 
 class OpenAIResponsesRefiner(BaseRefiner):
@@ -1595,6 +1596,8 @@ class OpenAIResponsesRefiner(BaseRefiner):
                 _unregister_conn_abort(cancel_token, hook_id)
                 hook_id = 0
                 was_aborted = bool(getattr(conn, "_aborted", False)) or eff_cancelled()
+                proxy_raw = str(getattr(conn, "_avi_proxy_raw", "") or "")
+                proxy_route = getattr(conn, "_avi_proxy_route", None)
                 self._finish_conn(
                     conn,
                     scheme=scheme,
@@ -1612,9 +1615,18 @@ class OpenAIResponsesRefiner(BaseRefiner):
                     and stale_attempt == 0
                 ):
                     continue
+                if (
+                    not was_aborted
+                    and isinstance(exc, (TimeoutError, socket.timeout, http.client.HTTPException, OSError))
+                    and (proxy_raw or proxy_route is not None)
+                ):
+                    safe_msg = _redact_proxy_error_text(str(exc), proxy_raw, proxy_route)
+                    raise HttpTransportError(safe_msg, retry_kind=classify_transport_error(exc)) from None
                 raise
 
         assert conn is not None and resp is not None
+        proxy_raw = str(getattr(conn, "_avi_proxy_raw", "") or "")
+        proxy_route = getattr(conn, "_avi_proxy_route", None)
         can_reuse = False
         try:
             if eff_cancelled() or bool(getattr(conn, "_aborted", False)):
@@ -1650,6 +1662,14 @@ class OpenAIResponsesRefiner(BaseRefiner):
                 aborted=bool(getattr(conn, "_aborted", False) or eff_cancelled()),
             )
             return out_txt, usage, init_ms
+        except (TimeoutError, socket.timeout, http.client.HTTPException, OSError) as exc:
+            if (
+                not (bool(getattr(conn, "_aborted", False)) or eff_cancelled())
+                and (proxy_raw or proxy_route is not None)
+            ):
+                safe_msg = _redact_proxy_error_text(str(exc), proxy_raw, proxy_route)
+                raise HttpTransportError(safe_msg, retry_kind=classify_transport_error(exc)) from None
+            raise
         finally:
             _unregister_conn_abort(cancel_token, hook_id)
             if bool(getattr(conn, "_aborted", False)) or eff_cancelled():
@@ -2875,7 +2895,8 @@ _AGY_NON_RETRYABLE_SOURCES: frozenset[str] = frozenset(
 )
 _AGY_MAX_THREADS = 64
 _AGY_MAX_LOADED_SESSIONS = 64
-_AGY_IDLE_TTL_SEC: float = 180.0
+# 15 min idle TTL covers normal coding/thinking pauses; sleep/shutdown still stops worker immediately.
+_AGY_IDLE_TTL_SEC: float = 900.0
 
 
 class _AgyRpcError(RuntimeError):

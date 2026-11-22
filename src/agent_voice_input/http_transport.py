@@ -1340,10 +1340,39 @@ def _normalize_proxy_fingerprint(proxy_url: str) -> str:
     return f"{scheme}://{host_disp}:{port if port is not None else ''}{auth_part}"
 
 
+def _get_proxies_from_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Extract ``*_proxy`` map from ``env`` (lowercase overrides uppercase; empty lowercase clears)."""
+    proxies: dict[str, str] = {}
+    for name, value in env.items():
+        low = name.lower()
+        if not low.endswith("_proxy") or name == low:
+            continue
+        proto = low[:-6]
+        if proto and (val := str(value or "").strip()):
+            proxies[proto] = val
+    for name, value in env.items():
+        if not name.endswith("_proxy") or name != name.lower():
+            continue
+        proto = name[:-6]
+        if not proto:
+            continue
+        val = str(value or "").strip()
+        if val:
+            proxies[proto] = val
+        else:
+            proxies.pop(proto, None)
+    return proxies
+
+
 def _select_system_proxy_url(proxies: Mapping[str, str], scheme: str) -> str:
     if not proxies:
         return ""
     return (proxies.get(scheme.lower()) or proxies.get("all") or "").strip()
+
+
+_UNSUPPORTED_PROXY_HINT = (
+    "only http:// proxies are supported; set HTTP_PROXY/HTTPS_PROXY=http://... or configure NO_PROXY"
+)
 
 
 def _resolve_http_proxy_route(
@@ -1376,15 +1405,15 @@ def _resolve_http_proxy_route(
     elif proxy_scheme == "https":
         return (
             None,
-            "unsupported proxy scheme 'https' for https:// targets (only http:// proxies are supported)",
+            f"unsupported proxy scheme 'https' for https:// targets ({_UNSUPPORTED_PROXY_HINT})",
         )
     else:
         if proxy_scheme and _SAFE_PROXY_SCHEME_RE.match(proxy_scheme):
             return (
                 None,
-                f"unsupported proxy scheme '{proxy_scheme}' (only http:// proxies are supported)",
+                f"unsupported proxy scheme '{proxy_scheme}' ({_UNSUPPORTED_PROXY_HINT})",
             )
-        return None, "unsupported proxy scheme (only http:// proxies are supported)"
+        return None, f"unsupported proxy scheme ({_UNSUPPORTED_PROXY_HINT})"
     host = (parsed.hostname or "").strip()
     if not host or any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in host):
         return None, "invalid proxy URL configuration"
@@ -1471,13 +1500,12 @@ def _redact_proxy_error_text(
     return _redact_secrets(out, env={}, extra_secrets=all_secrets)
 
 
-def _proxy_bypass_no_dns(host: str, port: int | None = None) -> bool:
+def _proxy_bypass_no_dns(
+    host: str, port: int | None = None, *, env: Mapping[str, str] | None = None
+) -> bool:
     """Pure local NO_PROXY matcher without ever invoking blocking DNS (socket.gethostbyname)."""
-    raw_no_proxy = (
-        os.environ["no_proxy"]
-        if "no_proxy" in os.environ
-        else os.environ.get("NO_PROXY", "")
-    )
+    src = os.environ if env is None else env
+    raw_no_proxy = src["no_proxy"] if "no_proxy" in src else src.get("NO_PROXY", "")
     no_proxy = raw_no_proxy.strip()
     if not no_proxy:
         return False
@@ -1526,7 +1554,7 @@ def _proxy_bypass_no_dns(host: str, port: int | None = None) -> bool:
                     return True
             except ValueError:
                 pass
-        pat_norm = pat_host.lstrip(".")
+        pat_norm = (pat_host[2:] if pat_host.startswith("*.") else pat_host).lstrip(".")
         if pat_norm and (h_low == pat_norm or h_low.endswith("." + pat_norm)):
             return True
     return False

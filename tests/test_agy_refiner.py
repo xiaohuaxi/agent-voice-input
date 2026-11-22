@@ -37,6 +37,7 @@ from agent_voice_input.config import (  # noqa: E402
 from agent_voice_input.http_transport import CancelToken  # noqa: E402
 from agent_voice_input.llm_common import AsrResult  # noqa: E402
 from agent_voice_input.refiner import (  # noqa: E402
+    _AGY_IDLE_TTL_SEC,
     AgyRefiner,
     NoopRefiner,
     _AgyRpcError,
@@ -1286,6 +1287,13 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                 os.chdir(prev_cwd)
 
     def test_idle_worker_reuse_ttl_eviction_power_resume_and_failure_kill(self) -> None:
+        self.assertEqual(_AGY_IDLE_TTL_SEC, 900.0)
+        default_ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy")), env={})
+        try:
+            self.assertEqual(default_ref._idle_ttl_sec, 900.0)
+        finally:
+            default_ref.close()
+
         # 1. Same session_key across 3 consecutive turns: identical PID, Turns 2 & 3 send ONLY session/prompt
         with tempfile.TemporaryDirectory() as td:
             rt_dir, log_file, env = self._setup_fake_env(td)

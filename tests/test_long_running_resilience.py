@@ -259,7 +259,7 @@ class KeepAlivePoolAndBoundedDnsTests(unittest.TestCase):
                 os.environ,
                 {
                     "HTTPS_PROXY": "http://proxy.corp:8080",
-                    "NO_PROXY": "127.0.0.0/8,.internal.corp,localhost:8443",
+                    "NO_PROXY": "127.0.0.0/8,.internal.corp,*.aliyuncs.com,*.port.local:8443,*.,localhost:8443",
                 },
                 clear=False,
             ),
@@ -278,6 +278,11 @@ class KeepAlivePoolAndBoundedDnsTests(unittest.TestCase):
         ):
             self.assertEqual(_resolve_system_proxy_key("https", "127.0.0.1", 443), "")
             self.assertEqual(_resolve_system_proxy_key("https", "api.internal.corp", 443), "")
+            self.assertEqual(_resolve_system_proxy_key("https", "dashscope.aliyuncs.com", 443), "")
+            self.assertEqual(_resolve_system_proxy_key("https", "aliyuncs.com", 443), "")
+            self.assertIn("proxy.corp:8080", _resolve_system_proxy_key("https", "evilaliyuncs.com", 443))
+            self.assertEqual(_resolve_system_proxy_key("https", "svc.port.local", 8443), "")
+            self.assertIn("proxy.corp:8080", _resolve_system_proxy_key("https", "svc.port.local", 443))
             self.assertEqual(_resolve_system_proxy_key("https", "localhost", 8443), "")
             self.assertIn("proxy.corp:8080", _resolve_system_proxy_key("https", "localhost", 443))
             self.assertIn("proxy.corp:8080", _resolve_system_proxy_key("https", "api.openai.com", 443))
@@ -1827,6 +1832,9 @@ class HttpProxyKeepAliveTests(unittest.TestCase):
                 msg = str(cm_bad.exception)
                 self.assertEqual(cm_bad.exception.retry_kind, "never", f"for {proxy_env!r}")
                 self.assertIn(expected_frag, msg.lower(), f"for {proxy_env!r}: {msg}")
+                if "unsupported proxy scheme" in expected_frag:
+                    self.assertIn("HTTP_PROXY/HTTPS_PROXY=http://...", msg)
+                    self.assertIn("NO_PROXY", msg)
                 self.assertNotIn("TopSecretPass99", msg)
                 self.assertNotIn("[::1:8080", msg)
                 self.assertNotIn("socks5://", msg)
