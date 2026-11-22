@@ -61,9 +61,11 @@ AGENT_MODE_GUIDANCE = (
     "<workspace_git_status> shows a new or different topic, always prioritize the current session and workspace.\n"
     "- When a term is absent from those references, still repair clear acoustic mishearings of well-known "
     "software engineering, CLI-agent, and AI-model terms in technical context (e.g., To B X 订阅里的 "
-    "Lula 模型 -> Codex 订阅里的 Luna 模型). Never replace a capitalized name or product/model term "
-    "(e.g., Astra, Opus, Kimi) with a non-homophonous name (such as Codex or Gemini)—every term repair "
-    "must match the spoken sound.\n"
+    "Lula 模型 -> Codex 订阅里的 Luna 模型). Never replace a clearly intended distinct product or "
+    "model name (e.g., Astra, Opus, Kimi) with an unrelated name from context (such as Codex or "
+    "Gemini)—every repair must match the spoken sound. However, when a brand word is paired with an "
+    "unmistakable version or product cue belonging to a near-sounding brand (e.g., Kimi 3.8 Flash -> "
+    "Gemini 3.8 Flash), restore the matching brand name from sound and context.\n"
     "- Reference blocks supply spellings only—never copy their sentences, phrasing, or report style.\n"
 )
 

@@ -42,6 +42,7 @@ from agent_voice_input.refiner import (  # noqa: E402
     _AgyRpcError,
     _agy_child_env,
     _agy_convert_usage,
+    _agy_group_alive,
     _agy_match_effort,
     _agy_match_model,
     _agy_select_reject_option_id,
@@ -72,7 +73,7 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
         if state_path and os.path.exists(state_path):
             with open(state_path, "r", encoding="utf-8") as fh:
                 return json.load(fh)
-        return {{"calls": 0, "sessions": {{}}}}
+        return {{"calls": 0, "prompts": 0, "sess_seq": 0, "sessions": {{}}}}
 
     def _save_state(st):
         if not state_path:
@@ -91,6 +92,7 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
 
     _log({{
         "event": "spawn",
+        "pid": os.getpid(),
         "call_idx": call_idx,
         "argv": sys.argv[1:],
         "cwd": os.getcwd(),
@@ -123,10 +125,10 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
         {{"value": "high", "name": "High"}},
         {{"value": "xhigh", "name": "Extra High"}},
     ]
-    cur_model = "gemini-4-carbon"
-    cur_tl = "high"
+    sessions_cfg = {{}}
 
-    def _cfg_opts():
+    def _cfg_opts(sid):
+        cur_model, cur_tl = sessions_cfg.get(sid, ("gemini-4-carbon", "high"))
         opts = [
             {{"id": "model", "currentValue": cur_model, "options": model_options}},
         ]
@@ -142,18 +144,30 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
         mid = msg.get("id")
         method = msg.get("method")
         params = msg.get("params") or {{}}
-        _log({{"event": "rpc", "call_idx": call_idx, "method": method, "params": params}})
+        _log({{"event": "rpc", "pid": os.getpid(), "call_idx": call_idx, "method": method, "params": params}})
 
         if method == "initialize":
             _send({{"jsonrpc": "2.0", "id": mid, "result": {{"protocolVersion": 1, "serverInfo": {{"name": "fake-agy"}}}}}})
         elif method == "session/new":
-            sid = f"11111111-2222-3333-4444-{{call_idx:012d}}"
             st = _load_state()
+            st["sess_seq"] = st.get("sess_seq", 0) + 1
+            sseq = st["sess_seq"]
+            sid = f"11111111-2222-3333-4444-{{sseq:012d}}"
             st.setdefault("sessions", {{}})[sid] = True
             _save_state(st)
-            _send({{"jsonrpc": "2.0", "id": mid, "result": {{"sessionId": sid, "configOptions": _cfg_opts()}}}})
+            sessions_cfg[sid] = ("gemini-4-carbon", "high")
+            if scenario == "interleaved_other_sid_update":
+                _send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "PRE_PROMPT_STRAY_TEXT"}}}}}},
+                }})
+            _send({{"jsonrpc": "2.0", "id": mid, "result": {{"sessionId": sid, "configOptions": _cfg_opts(sid)}}}})
         elif method == "session/resume":
             sid = params.get("sessionId", "")
+            if scenario == "wrong_resume_sid":
+                _send({{"jsonrpc": "2.0", "id": mid, "result": {{"sessionId": "secret-upstream-sid-999", "configOptions": _cfg_opts(sid)}}}})
+                continue
             if scenario == "resume_expired" and call_idx == 2:
                 _send({{"jsonrpc": "2.0", "id": mid, "error": {{"code": -32602, "message": "conversation not found"}}}})
                 continue
@@ -161,28 +175,50 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
                 time.sleep(0.25)
                 _send({{"jsonrpc": "2.0", "id": mid, "error": {{"code": -32602, "message": "conversation not found"}}}})
                 continue
-            _send({{"jsonrpc": "2.0", "id": mid, "result": {{"sessionId": sid, "configOptions": _cfg_opts()}}}})
+            sessions_cfg.setdefault(sid, ("gemini-4-carbon", "high"))
+            _send({{"jsonrpc": "2.0", "id": mid, "result": {{"sessionId": sid, "configOptions": _cfg_opts(sid)}}}})
         elif method == "session/set_config_option":
+            sid = params.get("sessionId", "")
             cid = params.get("configId")
             val = params.get("value")
+            cur_model, cur_tl = sessions_cfg.get(sid, ("gemini-4-carbon", "high"))
             if cid == "model":
                 cur_model = val
             elif cid == "thought_level":
                 cur_tl = val
-            _send({{"jsonrpc": "2.0", "id": mid, "result": {{"configOptions": _cfg_opts()}}}})
+            sessions_cfg[sid] = (cur_model, cur_tl)
+            _send({{"jsonrpc": "2.0", "id": mid, "result": {{"configOptions": _cfg_opts(sid)}}}})
         elif method == "session/prompt":
+            sid = params.get("sessionId", "")
+            cur_model, cur_tl = sessions_cfg.get(sid, ("gemini-4-carbon", "high"))
+            st = _load_state()
+            st["prompts"] = st.get("prompts", 0) + 1
+            prompt_idx = st["prompts"]
+            _save_state(st)
             text = "".join(p.get("text", "") for p in (params.get("prompt") or []) if isinstance(p, dict))
             if scenario == "slow_hang" or (scenario == "slow_resume_expired" and call_idx == 3):
                 time.sleep(30.0)
                 _send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
                 continue
-            if scenario == "eof_on_call2" and call_idx == 2:
+            if scenario == "eof_on_call2" and prompt_idx == 2:
                 sys.exit(0)
+            if scenario == "forbidden_tool_on_prompt2" and prompt_idx == 2:
+                _send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{"update": {{"sessionUpdate": "tool_call", "toolCallId": "tc_p2", "name": "read_file"}}}},
+                }})
+                time.sleep(5.0)
+                continue
+            if scenario == "slow_hang_on_prompt2" and prompt_idx == 2:
+                time.sleep(30.0)
+                _send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
+                continue
             if scenario == "partial_stream_then_crash":
                 _send({{
                     "jsonrpc": "2.0",
                     "method": "session/update",
-                    "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "秘密合同金额一百万"}}}}}},
+                    "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "秘密合同金额一百万"}}}}}},
                 }})
                 sys.exit(2)
             if scenario == "rpc_error_with_secret_data":
@@ -206,7 +242,7 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
                 _send({{
                     "jsonrpc": "2.0",
                     "method": "session/update",
-                    "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "This request was blocked by Gemini's filters."}}}}}},
+                    "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "This request was blocked by Gemini's filters."}}}}}},
                 }})
                 _send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
                 continue
@@ -278,7 +314,7 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
                 _send({{
                     "jsonrpc": "2.0",
                     "method": "session/update",
-                    "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "This request was blocked by Gemini's filters"}}}}}},
+                    "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "This request was blocked by Gemini's filters"}}}}}},
                 }})
                 _send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
                 continue
@@ -287,6 +323,9 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
                 continue
             if scenario == "max_tokens":
                 _send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "max_tokens", "response": "partial"}}}})
+                continue
+            if scenario == "custom_free_text_stop_reason":
+                _send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "blocked: 机密口述草稿内容789", "response": "partial"}}}})
                 continue
             if scenario == "empty_once" and call_idx == 1:
                 _send({{"jsonrpc": "2.0", "id": mid, "result": {{"stopReason": "end_turn"}}}})
@@ -300,19 +339,41 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
                 draft = text.split(marker_s, 1)[1].split(marker_e, 1)[0]
             cleaned = f"CLEAN[{{cur_model}}/{{cur_tl}}]: {{draft}}"
             half = max(1, len(cleaned) // 2)
+            if scenario == "interleaved_other_sid_update" and prompt_idx == 2:
+                _send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{"sessionId": "11111111-2222-3333-4444-000000000001", "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "LEAKED_FROM_SESSION_A"}}}}}},
+                }})
+                _send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "FORGED_MISSING_SID"}}}}}},
+                }})
+                _send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{"sessionId": None, "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "FORGED_NULL_SID"}}}}}},
+                }})
             _send({{
                 "jsonrpc": "2.0",
                 "method": "session/update",
-                "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": cleaned[:half]}}}}}},
+                "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": cleaned[:half]}}}}}},
             }})
+            if scenario == "interleaved_other_sid_update" and prompt_idx == 2:
+                _send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{"sessionId": "11111111-2222-3333-4444-000000000001", "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "LEAKED_MID_CHUNK"}}}}}},
+                }})
             _send({{
                 "jsonrpc": "2.0",
                 "method": "session/update",
-                "params": {{"update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": cleaned[half:]}}}}}},
+                "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": cleaned[half:]}}}}}},
             }})
             usage = (
                 {{"inputTokens": 200, "cachedReadTokens": 1200, "outputTokens": 45, "thoughtTokens": 12}}
-                if call_idx >= 2
+                if prompt_idx >= 2
                 else {{"inputTokens": 1500, "cachedReadTokens": 0, "outputTokens": 50, "thoughtTokens": 20}}
             )
             _send({{
@@ -645,33 +706,50 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
 
             events = _read_jsonl(log_file)
             spawns = [e for e in events if e["event"] == "spawn"]
-            self.assertEqual(len(spawns), 4)
-            # Check command line & stripped secrets
-            for sp in spawns:
-                self.assertEqual(
-                    sp["argv"],
-                    ["acp", "--agent", "avi-refiner", "--include-default-customizations=false"],
-                )
-                self.assertNotIn("--dangerously-skip-permissions", sp["argv"])
-                self.assertNotIn("--sandbox", sp["argv"])
-                self.assertNotIn("OPENAI_API_KEY", sp["env_keys"])
+            # All 4 turns reuse a single live agy acp worker process!
+            self.assertEqual(len(spawns), 1)
+            worker_pid = spawns[0]["pid"]
+            self.assertEqual(
+                spawns[0]["argv"],
+                ["acp", "--agent", "avi-refiner", "--include-default-customizations=false"],
+            )
+            self.assertNotIn("--dangerously-skip-permissions", spawns[0]["argv"])
+            self.assertNotIn("--sandbox", spawns[0]["argv"])
+            self.assertNotIn("OPENAI_API_KEY", spawns[0]["env_keys"])
 
             rpcs = [e for e in events if e["event"] == "rpc"]
-            call1_methods = [e["method"] for e in rpcs if e["call_idx"] == 1]
-            call2_methods = [e["method"] for e in rpcs if e["call_idx"] == 2]
-            call3_methods = [e["method"] for e in rpcs if e["call_idx"] == 3]
-            call4_methods = [e["method"] for e in rpcs if e["call_idx"] == 4]
+            self.assertEqual({e["pid"] for e in rpcs}, {worker_pid})
+            methods = [e["method"] for e in rpcs]
+            # Turn 1: init + new + set_config(model) + set_config(thought_level) + prompt
+            # Turn 2 (hot same session): ONLY session/prompt!
+            # Turn 3 (max_turns rotation): new + set_config x2 + prompt (zero initialize)
+            # Turn 4 (prefix changed): new + set_config x2 + prompt (zero initialize)
             self.assertEqual(
-                call1_methods,
-                ["initialize", "session/new", "session/set_config_option", "session/set_config_option", "session/prompt"],
+                methods,
+                [
+                    "initialize",
+                    "session/new",
+                    "session/set_config_option",
+                    "session/set_config_option",
+                    "session/prompt",
+                    "session/prompt",
+                    "session/new",
+                    "session/set_config_option",
+                    "session/set_config_option",
+                    "session/prompt",
+                    "session/new",
+                    "session/set_config_option",
+                    "session/set_config_option",
+                    "session/prompt",
+                ],
             )
-            self.assertIn("session/resume", call2_methods)
-            self.assertIn("session/new", call3_methods)
-            self.assertIn("session/new", call4_methods)
+            self.assertEqual(r2.init_ms, 0)
+            self.assertEqual(r3.init_ms, 0)
+            self.assertEqual(r4.init_ms, 0)
 
             # Verify prompt payloads: turn 1 has [avi-refiner] + block one; turn 2 keeps [avi-refiner] prefix and omits already-sent block one
-            p1 = next(e["params"]["prompt"][0]["text"] for e in rpcs if e["call_idx"] == 1 and e["method"] == "session/prompt")
-            p2 = next(e["params"]["prompt"][0]["text"] for e in rpcs if e["call_idx"] == 2 and e["method"] == "session/prompt")
+            prompts_sent = [e["params"]["prompt"][0]["text"] for e in rpcs if e["method"] == "session/prompt"]
+            p1, p2 = prompts_sent[0], prompts_sent[1]
             self.assertTrue(p1.startswith("[avi-refiner]\n"))
             self.assertIn("block one context", p1)
             self.assertIn("<task_reminder>", p1)
@@ -692,7 +770,9 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             try:
                 r1 = ref.refine("turn 1", session_key="sess-exp", fallback_context="ctx-1")
                 self.assertEqual(r1.used_fallback, "")
-                # Turn 2 tries session/resume (call 2 fails with -32602), then transparently falls back to session/new (call 3)
+                # Evict idle worker to simulate idle TTL expiry before Turn 2 triggers session/resume
+                self.assertEqual(ref.evict_connections(), 1)
+                # Turn 2 tries session/resume (call 2 fails with -32602), kills worker, then transparently falls back to session/new (call 3)
                 r2 = ref.refine("turn 2", session_key="sess-exp", fallback_context="ctx-1")
                 self.assertEqual(r2.used_fallback, "")
                 self.assertEqual(r2.retries, 0)
@@ -1001,13 +1081,14 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             self.assertTrue(_remote_probe._is_agy_subagent(p_reordered_sub))
             self.assertFalse(_remote_probe._is_agy_subagent(p_reordered_user))
 
-        # Prompt anti-over-editing constraint present in both modes
+        # Prompt anti-over-editing constraint present in both modes & version-cue brand repair guidance in agent mode
         for prompt_txt in (prompts.REFINER_SYSTEM_PROMPT, prompts.REFINER_GENERAL_SYSTEM_PROMPT):
             self.assertIn("NEVER add unstated parenthetical alternatives", prompt_txt)
             self.assertIn("NEVER upgrade parallel or either-or items", prompt_txt)
+        self.assertIn("Kimi 3.8 Flash -> Gemini 3.8 Flash", prompts.REFINER_SYSTEM_PROMPT)
 
     def test_hardening_isolation_eof_clear_privacy_deadline_refusal_and_relpath(self) -> None:
-        # 1. Empty session_key never shares or stores a stateful conversation thread
+        # 1. Empty session_key reuses hot worker PID but never shares or stores a stateful conversation thread
         with tempfile.TemporaryDirectory() as td:
             rt_dir, log_file, env = self._setup_fake_env(td)
             ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy")), env=env, runtime_dir=rt_dir)
@@ -1019,10 +1100,14 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                 self.assertEqual(len(ref._threads), 0)
             finally:
                 ref.close()
-            rpcs = [e for e in _read_jsonl(log_file) if e["event"] == "rpc"]
+            events = _read_jsonl(log_file)
+            spawns = [e for e in events if e["event"] == "spawn"]
+            self.assertEqual(len(spawns), 1)
+            rpcs = [e for e in events if e["event"] == "rpc"]
+            self.assertEqual({e["pid"] for e in rpcs}, {spawns[0]["pid"]})
             self.assertEqual([e["method"] for e in rpcs if e["method"] in ("session/new", "session/resume")], ["session/new", "session/new"])
 
-        # 2. EOF failure on turn 2 clears conversation_id so turn 3 starts fresh with session/new
+        # 2. EOF failure on turn 2 kills worker & clears conversation_id so turn 3 spawns fresh PID with session/new
         with tempfile.TemporaryDirectory() as td:
             rt_dir, log_file, env = self._setup_fake_env(td, scenario="eof_on_call2")
             ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy", max_retries=0)), env=env, runtime_dir=rt_dir)
@@ -1034,16 +1119,21 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                 st_eof = ref._threads[("sess-eof", "agent")]
                 self.assertEqual(st_eof.conversation_id, "")
                 self.assertEqual(st_eof.sent_blocks, ())
+                self.assertIsNone(ref._worker)
                 r3 = ref.refine("turn 3", session_key="sess-eof", fallback_context="ctx-a")
                 self.assertEqual(r3.used_fallback, "")
             finally:
                 ref.close()
+            events = _read_jsonl(log_file)
+            spawns = [e for e in events if e["event"] == "spawn"]
+            self.assertEqual(len(spawns), 2)
+            self.assertNotEqual(spawns[0]["pid"], spawns[1]["pid"])
             sess_methods = [
                 (e["call_idx"], e["method"])
-                for e in _read_jsonl(log_file)
+                for e in events
                 if e["event"] == "rpc" and e["method"] in ("session/new", "session/resume")
             ]
-            self.assertEqual(sess_methods, [(1, "session/new"), (2, "session/resume"), (3, "session/new")])
+            self.assertEqual(sess_methods, [(1, "session/new"), (2, "session/new")])
 
         # 3. Privacy: partial streamed dictation text & error.data never leak into warning
         with tempfile.TemporaryDirectory() as td:
@@ -1128,6 +1218,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             try:
                 r1 = ref.refine("seed", session_key="sess-dl", fallback_context="ctx")
                 self.assertEqual(r1.used_fallback, "")
+                self.assertEqual(ref.evict_connections(), 1)
                 t0 = time.monotonic()
                 r2 = ref.refine("fallback timeout", session_key="sess-dl", fallback_context="ctx")
                 elapsed = time.monotonic() - t0
@@ -1193,6 +1284,273 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                     ref.close()
             finally:
                 os.chdir(prev_cwd)
+
+    def test_idle_worker_reuse_ttl_eviction_power_resume_and_failure_kill(self) -> None:
+        # 1. Same session_key across 3 consecutive turns: identical PID, Turns 2 & 3 send ONLY session/prompt
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, log_file, env = self._setup_fake_env(td)
+            ref = AgyRefiner(
+                Config(refiner=RefinerConfig(provider="agy", max_turns_per_thread=5)),
+                env=env,
+                runtime_dir=rt_dir,
+                idle_ttl_sec=30.0,
+            )
+            try:
+                r1 = ref.refine("第一轮", session_key="sess-hot", fallback_context="shared ctx")
+                r2 = ref.refine("第二轮", session_key="sess-hot", fallback_context="shared ctx")
+                r3 = ref.refine("第三轮", session_key="sess-hot", fallback_context="shared ctx")
+                self.assertEqual((r1.used_fallback, r2.used_fallback, r3.used_fallback), ("", "", ""))
+                self.assertEqual((r2.init_ms, r3.init_ms), (0, 0))
+                self.assertIsNotNone(ref._worker)
+                live_pid = ref._worker.proc.pid  # type: ignore[union-attr]
+                # probe_ping runs completely isolated without disturbing or replacing the warm worker
+                st_ping, _, _ = ref.probe_ping()
+                self.assertEqual(st_ping, "OK")
+                self.assertIsNotNone(ref._worker)
+                self.assertEqual(ref._worker.proc.pid, live_pid)  # type: ignore[union-attr]
+            finally:
+                ref.close()
+            self.assertEqual(len(ref._active_procs), 0)
+            self.assertIsNone(ref._worker)
+            self.assertFalse(_agy_group_alive(live_pid))
+
+            events = _read_jsonl(log_file)
+            spawns = [e for e in events if e["event"] == "spawn"]
+            # Spawn 1 = reusable worker (3 turns); Spawn 2 = isolated probe_ping
+            self.assertEqual(len(spawns), 2)
+            rpcs_w = [e["method"] for e in events if e["event"] == "rpc" and e["pid"] == live_pid]
+            self.assertEqual(
+                rpcs_w,
+                [
+                    "initialize",
+                    "session/new",
+                    "session/set_config_option",
+                    "session/set_config_option",
+                    "session/prompt",
+                    "session/prompt",
+                    "session/prompt",
+                ],
+            )
+            rpcs_ping = [e["method"] for e in events if e["event"] == "rpc" and e["pid"] == spawns[1]["pid"]]
+            self.assertEqual(rpcs_ping, ["initialize"])
+
+        # 2. Idle TTL expiry automatically reaps old PID; next turn spawns new PID and seamlessly session/resumes same conversation_id
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, log_file, env = self._setup_fake_env(td)
+            ref = AgyRefiner(
+                Config(refiner=RefinerConfig(provider="agy")),
+                env=env,
+                runtime_dir=rt_dir,
+                idle_ttl_sec=0.15,
+            )
+            try:
+                r1 = ref.refine("idle seed", session_key="sess-ttl", fallback_context="ttl ctx")
+                self.assertEqual(r1.used_fallback, "")
+                cid1 = ref._threads[("sess-ttl", "agent")].conversation_id
+                self.assertTrue(cid1)
+                pid1 = ref._worker.proc.pid  # type: ignore[union-attr]
+
+                # Wait for idle reaper timer to reap the worker
+                dl = time.monotonic() + 2.0
+                while time.monotonic() < dl and (ref._worker is not None or len(ref._active_procs) > 0):
+                    time.sleep(0.02)
+                self.assertIsNone(ref._worker)
+                self.assertEqual(len(ref._active_procs), 0)
+                self.assertFalse(_agy_group_alive(pid1))
+
+                # Turn 2 spawns a fresh PID and resumes cid1 via session/resume
+                r2 = ref.refine("after idle", session_key="sess-ttl", fallback_context="ttl ctx")
+                self.assertEqual(r2.used_fallback, "")
+                pid2 = ref._worker.proc.pid  # type: ignore[union-attr]
+                self.assertNotEqual(pid1, pid2)
+                self.assertEqual(ref._threads[("sess-ttl", "agent")].conversation_id, cid1)
+            finally:
+                ref.close()
+            self.assertEqual(len(ref._active_procs), 0)
+
+            events = _read_jsonl(log_file)
+            pid2_rpcs = [e for e in events if e["event"] == "rpc" and e["pid"] == pid2]
+            self.assertEqual(
+                [e["method"] for e in pid2_rpcs],
+                [
+                    "initialize",
+                    "session/resume",
+                    "session/set_config_option",
+                    "session/set_config_option",
+                    "session/prompt",
+                ],
+            )
+            resume_rpc = next(e for e in pid2_rpcs if e["method"] == "session/resume")
+            self.assertEqual(resume_rpc["params"]["sessionId"], cid1)
+
+        # 3. Power-resume hook (evict_connections) immediately stops idle worker and returns count
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, log_file, env = self._setup_fake_env(td)
+            ref = AgyRefiner(
+                Config(refiner=RefinerConfig(provider="agy")),
+                env=env,
+                runtime_dir=rt_dir,
+                idle_ttl_sec=60.0,
+            )
+            try:
+                self.assertEqual(ref.evict_connections(), 0)
+                r1 = ref.refine("before sleep", session_key="sess-wake", fallback_context="wake ctx")
+                self.assertEqual(r1.used_fallback, "")
+                pid_before = ref._worker.proc.pid  # type: ignore[union-attr]
+                self.assertEqual(ref.evict_connections(), 1)
+                self.assertEqual(ref.evict_connections(), 0)
+                self.assertIsNone(ref._worker)
+                self.assertEqual(len(ref._active_procs), 0)
+                self.assertFalse(_agy_group_alive(pid_before))
+                # Next turn spawns a fresh worker and resumes seamlessly
+                r2 = ref.refine("after wake", session_key="sess-wake", fallback_context="wake ctx")
+                self.assertEqual(r2.used_fallback, "")
+                self.assertNotEqual(ref._worker.proc.pid, pid_before)  # type: ignore[union-attr]
+            finally:
+                ref.close()
+
+        # 4. Forbidden tool / cancel / timeout on turn 2 immediately kills warm worker, clears thread_state, and turn 3 starts fresh
+        for scen, timeout_s, use_cancel in (
+            ("forbidden_tool_on_prompt2", 10.0, False),
+            ("slow_hang_on_prompt2", 0.25, False),
+            ("slow_hang_on_prompt2", 10.0, True),
+        ):
+            with tempfile.TemporaryDirectory() as td:
+                rt_dir, log_file, env = self._setup_fake_env(td, scenario=scen)
+                ref = AgyRefiner(
+                    Config(refiner=RefinerConfig(provider="agy", timeout_sec=timeout_s, max_retries=0)),
+                    env=env,
+                    runtime_dir=rt_dir,
+                    idle_ttl_sec=60.0,
+                )
+                try:
+                    r1 = ref.refine("turn 1 ok", session_key="sess-fail", fallback_context="ctx-f")
+                    self.assertEqual(r1.used_fallback, "")
+                    pid_old = ref._worker.proc.pid  # type: ignore[union-attr]
+
+                    tok = CancelToken() if use_cancel else None
+                    th = None
+                    if tok is not None:
+                        th = threading.Thread(target=lambda: (time.sleep(0.1), tok.cancel("user_cancelled")), daemon=True)
+                        th.start()
+                    try:
+                        r2 = ref.refine("turn 2 fail", session_key="sess-fail", fallback_context="ctx-f", cancel_token=tok)
+                    finally:
+                        if th is not None:
+                            th.join(timeout=1.0)
+                    self.assertNotEqual(r2.used_fallback, "")
+                    self.assertIsNone(ref._worker)
+                    self.assertEqual(len(ref._active_procs), 0)
+                    self.assertFalse(_agy_group_alive(pid_old))
+                    self.assertEqual(ref._threads[("sess-fail", "agent")].conversation_id, "")
+
+                    # Turn 3 starts fresh on a brand-new PID with session/new
+                    r3 = ref.refine("turn 3 fresh", session_key="sess-fail", fallback_context="ctx-f")
+                    self.assertEqual(r3.used_fallback, "")
+                    pid_new = ref._worker.proc.pid  # type: ignore[union-attr]
+                    self.assertNotEqual(pid_old, pid_new)
+                finally:
+                    ref.close()
+                events = _read_jsonl(log_file)
+                new_rpcs = [e["method"] for e in events if e["event"] == "rpc" and e["pid"] == pid_new]
+                self.assertIn("session/new", new_rpcs)
+                self.assertNotIn("session/resume", new_rpcs)
+
+    def test_review_hardening_session_id_filter_timer_error_sanitized_errors_and_deadline(self) -> None:
+        # 1. Interleaved session/update chunks from another sessionId or before session/prompt never contaminate output
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, _, env = self._setup_fake_env(td, scenario="interleaved_other_sid_update")
+            ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy")), env=env, runtime_dir=rt_dir)
+            try:
+                ra = ref.refine("会话A正文", session_key="sess-A", fallback_context="ctx-A")
+                rb = ref.refine("会话B正文", session_key="sess-B", fallback_context="ctx-B")
+                self.assertEqual(ra.used_fallback, "")
+                self.assertEqual(ra.text, "CLEAN[gemini-3.8-flash/low]: 会话A正文")
+                self.assertEqual(rb.used_fallback, "")
+                self.assertEqual(rb.text, "CLEAN[gemini-3.8-flash/low]: 会话B正文")
+                self.assertNotIn("PRE_PROMPT_STRAY_TEXT", ra.text)
+                self.assertNotIn("PRE_PROMPT_STRAY_TEXT", rb.text)
+                self.assertNotIn("LEAKED_FROM_SESSION_A", rb.text)
+                self.assertNotIn("LEAKED_MID_CHUNK", rb.text)
+                self.assertNotIn("FORGED_MISSING_SID", rb.text)
+                self.assertNotIn("FORGED_NULL_SID", rb.text)
+            finally:
+                ref.close()
+
+        # 2. Timer.start() failure synchronously reaps worker, releases both locks, and preserves the valid turn result
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, _, env = self._setup_fake_env(td)
+            ref = AgyRefiner(
+                Config(refiner=RefinerConfig(provider="agy")),
+                env=env,
+                runtime_dir=rt_dir,
+                idle_ttl_sec=60.0,
+            )
+            try:
+                with patch.object(threading.Timer, "start", side_effect=RuntimeError("can't start new thread")):
+                    r1 = ref.refine("定时器失败也返回结果", session_key="sess-timer", fallback_context="ctx-t")
+                self.assertEqual(r1.used_fallback, "")
+                self.assertEqual(r1.text, "CLEAN[gemini-3.8-flash/low]: 定时器失败也返回结果")
+                self.assertIsNone(ref._worker)
+                self.assertEqual(len(ref._active_procs), 0)
+                # Locks must be released: a follow-up refine on the same session_key succeeds immediately without deadlocking
+                r2 = ref.refine("后续轮次不死锁", session_key="sess-timer", fallback_context="ctx-t")
+                self.assertEqual(r2.used_fallback, "")
+                self.assertEqual(r2.text, "CLEAN[gemini-3.8-flash/low]: 后续轮次不死锁")
+            finally:
+                ref.close()
+
+        # 3. Unknown free-text stopReason & mismatched sessionId never leak upstream free text into warning / error
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, _, env = self._setup_fake_env(td, scenario="custom_free_text_stop_reason")
+            ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy", max_retries=0)), env=env, runtime_dir=rt_dir)
+            try:
+                res = ref.refine("自定义停止原因草稿")
+                self.assertEqual(res.used_fallback, "asr_draft")
+                self.assertIn("agy ACP unexpected stopReason", res.warning)
+                self.assertNotIn("机密口述草稿内容789", res.warning)
+            finally:
+                ref.close()
+
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, _, env = self._setup_fake_env(td, scenario="wrong_resume_sid")
+            ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy", max_retries=0)), env=env, runtime_dir=rt_dir)
+            try:
+                workdir = ref._ensure_agent_workdir()
+                with self.assertRaises(_AgyRpcError) as cm:
+                    ref._run_acp_session(
+                        agy_bin=env["AGY_BIN"],
+                        workdir=workdir,
+                        timeout_sec=5.0,
+                        prompt_text="[avi-refiner]\nhello",
+                        conversation_id="expected-local-cid-123",
+                    )
+                self.assertEqual(cm.exception.source, "conversation")
+                self.assertEqual(str(cm.exception), "agy answered in an unexpected session")
+                self.assertNotIn("secret-upstream-sid-999", str(cm.exception))
+                self.assertNotIn("expected-local-cid-123", str(cm.exception))
+            finally:
+                ref.close()
+
+        # 4. Exact sub-50ms deadline is respected without inflating remaining budget back to 50ms
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, _, env = self._setup_fake_env(td, scenario="slow_hang")
+            ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy", max_retries=0)), env=env, runtime_dir=rt_dir)
+            try:
+                workdir = ref._ensure_agent_workdir()
+                with self.assertRaises(_AgyRpcError) as cm_exp:
+                    ref._run_acp_session(
+                        agy_bin=env["AGY_BIN"],
+                        workdir=workdir,
+                        timeout_sec=0.02,
+                        deadline=time.monotonic() - 0.001,
+                        prompt_text="[avi-refiner]\nalready expired",
+                    )
+                self.assertEqual(cm_exp.exception.source, "hard_timeout")
+                # Never even spawned a worker when deadline was already exhausted
+                self.assertEqual(len(ref._active_procs), 0)
+            finally:
+                ref.close()
 
     def test_cli_doctor_and_ping_for_agy(self) -> None:
         with tempfile.TemporaryDirectory() as td:
