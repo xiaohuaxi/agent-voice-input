@@ -1173,10 +1173,10 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             try:
                 found_rel_env = find_agy_bin({"HOME": td, "PATH": "", "AGY_BIN": "./rel_bin/agy"})
                 found_rel_path = find_agy_bin({"HOME": td, "PATH": "./rel_bin"})
-                self.assertEqual(found_rel_env, os.path.abspath(str(fake_bin)))
-                self.assertEqual(found_rel_path, os.path.abspath(str(fake_bin)))
                 self.assertTrue(os.path.isabs(found_rel_env or ""))
                 self.assertTrue(os.path.isabs(found_rel_path or ""))
+                self.assertEqual(os.path.realpath(found_rel_env or ""), os.path.realpath(str(fake_bin)))
+                self.assertEqual(os.path.realpath(found_rel_path or ""), os.path.realpath(str(fake_bin)))
 
                 # Verify AgyRefiner works when cwd switches to workdir using relative AGY_BIN
                 rt_dir = root / "rt"
