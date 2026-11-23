@@ -740,6 +740,7 @@ class WslPlatform(JsonlShimMixin):
         is_cancelled: Callable[[], bool] | None = None,
         before_clipboard_write: Callable[[], None] | None = None,
         before_commit: Callable[[], bool] | None = None,
+        same_window_verifier: Callable[[ForegroundWindow], bool] | None = None,
     ) -> PasteOutcome:
         del preserve_clipboard
         eff_hwnd = target_hwnd or (origin_window.hwnd if origin_window is not None else 0)
@@ -823,6 +824,14 @@ class WslPlatform(JsonlShimMixin):
         while True:
             if cancelled_fn():
                 return PasteOutcome(False, False, "cancelled", "")
+            if same_window_verifier is not None:
+                try:
+                    cur_fg = self.get_foreground_window()
+                    verified = bool(same_window_verifier(cur_fg))
+                except Exception:
+                    verified = False
+                if not verified:
+                    return _fallback_clipboard_via_shim()
             if not _confirm_commit():
                 return PasteOutcome(False, False, "cancelled", "")
             req: dict[str, Any] = {

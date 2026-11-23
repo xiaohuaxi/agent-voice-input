@@ -153,6 +153,7 @@ from .workspace_ctx import (
     read_workspace_shallow_files,
     resolve_antigravity_ide_session,
     resolve_antigravity_ide_session_by_title,
+    resolve_codex_desktop_session_by_title,
     resolve_ide_workspace_cwd,
 )
 
@@ -4580,7 +4581,7 @@ class SessionTracker:
         eff_wsl = False if state.is_remote else _effective_is_wsl(env=self.env)
         if (
             not state.cwd
-            and state.matched_by != "ide_db_title"
+            and state.matched_by not in ("ide_db_title", "codex_desktop_db")
             and isinstance(obj.get("cwd"), str)
             and obj["cwd"].strip()
         ):
@@ -4631,7 +4632,12 @@ class SessionTracker:
         elif state.cli == "codex":
             typ = obj.get("type")
             payload = obj.get("payload")
-            if typ == "session_meta" and isinstance(payload, dict) and not state.cwd:
+            if (
+                typ == "session_meta"
+                and isinstance(payload, dict)
+                and not state.cwd
+                and state.matched_by != "codex_desktop_db"
+            ):
                 if isinstance(payload.get("cwd"), str):
                     state.cwd = _normalize_cwd(payload["cwd"], wsl=eff_wsl)
             elif typ == "compacted" and isinstance(payload, dict):
@@ -5542,7 +5548,7 @@ class SessionTracker:
             else (cold_start_fallback or "auto").strip().lower()
         )
         need_prior_discovery = False
-        authoritative_cwd = eff_match.matched_by == "ide_db_title"
+        authoritative_cwd = eff_match.matched_by in ("ide_db_title", "codex_desktop_db")
         prior_scope = "agy_ide" if eff_match.matched_by in ("ide_brain", "ide_db_title") else "cli"
         with self._lock:
             norm_path = (
@@ -5646,7 +5652,7 @@ class SessionTracker:
                         cur_canon = self._canonical_prior_cwd(cur_st.cwd, is_remote=cur_st.is_remote)
                         cwd_still_matches = (
                             (bool(cur_canon) and cur_canon == target_canon_cwd)
-                            if cur_st.matched_by == "ide_db_title"
+                            if cur_st.matched_by in ("ide_db_title", "codex_desktop_db")
                             else (not cur_canon or cur_canon == target_canon_cwd)
                         )
                         if not cur_st.cold_start_prior_retired and cwd_still_matches:
@@ -5671,6 +5677,15 @@ class SessionTracker:
                         cur_st is not None
                         and eff_fb != "off"
                         and len(turns_tuple) < COLD_START_SWEET_MIN_TURNS
+                        and bool(target_canon_cwd)
+                        and (
+                            not cur_st.cold_start_prior_cwd
+                            or cur_st.cold_start_prior_cwd == target_canon_cwd
+                        )
+                        and (
+                            self._canonical_prior_cwd(cur_st.cwd, is_remote=cur_st.is_remote)
+                            == target_canon_cwd
+                        )
                     )
                     else []
                 )
@@ -5785,10 +5800,7 @@ class SessionTracker:
             or not state.cold_start_prior_chunk
         ):
             return ""
-        if state.cold_start_prior_cwd and canon_cwd and state.cold_start_prior_cwd != canon_cwd:
-            state.cold_start_prior_chunk = ""
-            state.cold_start_prior_hotwords = ()
-            state.cold_start_prior_retired = True
+        if state.cold_start_prior_cwd and state.cold_start_prior_cwd != canon_cwd:
             return ""
         if state.remote_evicted_chunks > 0 or state.remote_compaction_count > 0:
             state.cold_start_prior_retired = True

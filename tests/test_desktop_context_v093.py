@@ -22,7 +22,10 @@ if str(_SRC_ROOT) not in sys.path:
 from agent_voice_input.app_scope import (  # noqa: E402
     IdeTitleInfo,
     classify_target_app_hint,
+    classify_window_category,
     is_antigravity_ide_window,
+    is_codex_desktop_window,
+    is_terminal_window,
     parse_ide_window_title,
 )
 from agent_voice_input.asr_providers import (  # noqa: E402
@@ -38,9 +41,14 @@ from agent_voice_input.asr_providers import (  # noqa: E402
 )
 from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
 from agent_voice_input.config import Config, resolve_credentials  # noqa: E402
-from agent_voice_input.daemon import VoiceInputDaemon, _window_from_mapping, run_pipeline_once  # noqa: E402
+from agent_voice_input.daemon import (  # noqa: E402
+    VoiceInputDaemon,
+    _window_from_mapping,
+    build_pipeline_summary,
+    run_pipeline_once,
+)
 from agent_voice_input.platform_macos import MAC_SHIM_SCRIPT, SHIM_SCHEMA_VERSION, MacOSPlatform, _APPLE_SEP  # noqa: E402
-from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome  # noqa: E402
+from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome, WslPlatform  # noqa: E402
 from agent_voice_input.prompts import (  # noqa: E402
     REFINER_GENERAL_SYSTEM_PROMPT,
     SINGLE_HOP_GENERAL_SYSTEM_PROMPT,
@@ -64,6 +72,7 @@ from agent_voice_input.session_ctx import (  # noqa: E402
     read_workspace_shallow_files,
     resolve_antigravity_ide_session,
     resolve_antigravity_ide_session_by_title,
+    resolve_codex_desktop_session_by_title,
     resolve_ide_workspace_cwd,
 )
 
@@ -1829,6 +1838,1149 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 self.assertIn("NewChatSecret.py", seen_msgs[-1])
             finally:
                 tracker_ph.close()
+
+    def test_is_codex_desktop_window_and_category_invariants(self) -> None:
+        # macOS unified ChatGPT/Codex desktop & Windows ChatGPT.exe / Codex.exe desktop titles
+        for desktop_win in (
+            ForegroundWindow(1, "ChatGPT", "Refactor auth", bundle_id="com.openai.codex"),
+            ForegroundWindow(2, "Codex", "New Chat", bundle_id="com.openai.codex"),
+            ForegroundWindow(3, "ChatGPT.exe", "Refactor auth"),
+            ForegroundWindow(4, "ChatGPT.exe", "ChatGPT"),
+            ForegroundWindow(5, "Codex.exe", "Codex"),
+            ForegroundWindow(6, "Codex.exe", "Refactor auth - Codex"),
+            ForegroundWindow(7, "Codex.exe", "Plan — ChatGPT"),
+            ForegroundWindow(8, "ChatGPT", "Any title"),
+        ):
+            self.assertTrue(is_codex_desktop_window(desktop_win), msg=f"missed {desktop_win}")
+            self.assertEqual(
+                classify_window_category(desktop_win, is_terminal=is_terminal_window),
+                "general_gui",
+                msg=f"category must remain general_gui for {desktop_win}",
+            )
+
+        # Terminals, SSH clients, CLI codex.exe, legacy com.openai.chat, and unrelated apps MUST be False
+        for non_desktop_win in (
+            ForegroundWindow(10, "WindowsTerminal.exe", "codex"),
+            ForegroundWindow(11, "WindowsTerminal.exe", "Refactor auth - Codex"),
+            ForegroundWindow(12, "Ghostty", "Codex", bundle_id="com.mitchellh.ghostty"),
+            ForegroundWindow(13, "Terminal", "ChatGPT", bundle_id="com.apple.Terminal"),
+            ForegroundWindow(14, "putty.exe", "Codex"),
+            ForegroundWindow(15, "codex.exe", "codex [#abcd1234]"),
+            ForegroundWindow(16, "codex.exe", "⠋ Working - Codex"),
+            ForegroundWindow(17, "codex.exe", "codex — ~/repos/app"),
+            ForegroundWindow(18, "codex.exe", ""),
+            ForegroundWindow(19, "ChatGPT", "New chat", bundle_id="com.openai.chat"),
+            ForegroundWindow(20, "Cursor", "a.py — repo — Cursor", bundle_id="com.todesktop.230313mzl4w4u92"),
+            ForegroundWindow(21, "Chrome.exe", "ChatGPT"),
+        ):
+            self.assertFalse(is_codex_desktop_window(non_desktop_win), msg=f"false positive for {non_desktop_win}")
+
+        self.assertTrue(is_terminal_window(ForegroundWindow(30, "WindowsTerminal.exe", "zsh")))
+        self.assertTrue(is_terminal_window(ForegroundWindow(31, "Ghostty", "zsh", bundle_id="com.mitchellh.ghostty")))
+        self.assertTrue(is_terminal_window(ForegroundWindow(32, "putty.exe", "devbox")))
+        self.assertFalse(is_terminal_window(ForegroundWindow(33, "ChatGPT", "Chat", bundle_id="com.openai.codex")))
+
+    def test_codex_desktop_session_binding_cloud_veto_promotion_and_security(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            repo_a = home / "repos" / "nebula-core"
+            repo_b = home / "repos" / "other-proj"
+            repo_dot = home / "repos" / "repo."
+            for r in (repo_a, repo_b, repo_dot):
+                r.mkdir(parents=True)
+            (repo_a / "NebulaEngine.py").write_text("class NebulaEngine: pass\n", encoding="utf-8")
+            (repo_b / "OtherTool.py").write_text("x = 1\n", encoding="utf-8")
+            (repo_dot / "DotMod.py").write_text("y = 2\n", encoding="utf-8")
+
+            codex_dir = home / ".codex"
+            sessions_day = codex_dir / "sessions" / "2026" / "11" / "23"
+            sessions_day.mkdir(parents=True)
+            sqlite_dir = codex_dir / "sqlite"
+            sqlite_dir.mkdir(parents=True)
+            codex_db = sqlite_dir / "codex.db"
+            state_db = codex_dir / "state_5.sqlite"
+
+            def _write_codex_rollout(
+                path: Path,
+                sid: str,
+                cwd: str,
+                turns: list[tuple[str, str]],
+                *,
+                source: object = "vscode",
+                extra_meta: dict[str, object] | None = None,
+            ) -> Path:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                meta_payload: dict[str, object] = {"id": sid, "cwd": cwd, "source": source}
+                if extra_meta:
+                    meta_payload.update(extra_meta)
+                lines = [json.dumps({"type": "session_meta", "payload": meta_payload}, ensure_ascii=False)]
+                for role, text in turns:
+                    lines.append(
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": role,
+                                    "content": [{"type": "input_text" if role == "user" else "output_text", "text": text}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return path
+
+            long_pad = "背景上下文填充数据 " * 8000
+            rp_local_a = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T10-00-00-tid-local-a.jsonl",
+                "tid-local-a",
+                str(repo_a),
+                [
+                    ("user", f"请排查 QuartzBatcher 的缓存过期问题。{long_pad}"),
+                    ("assistant", "好的，已定位 NebulaEngine.py 中的 QuartzBatcher。"),
+                ],
+                source="vscode",
+            )
+            rp_dup_old = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T09-00-00-tid-dup-old.jsonl",
+                "tid-dup-old",
+                str(repo_a),
+                [("user", "old dup"), ("assistant", "old")],
+            )
+            rp_dup_new = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T10-05-00-tid-dup-new.jsonl",
+                "tid-dup-new",
+                str(repo_a),
+                [("user", "new dup"), ("assistant", "new")],
+            )
+            rp_fw = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T10-06-00-tid-fullwidth.jsonl",
+                "tid-fullwidth",
+                str(repo_a),
+                [("user", "全角标题会话")],
+            )
+            rp_trunc_en = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T10-07-00-tid-trunc-en.jsonl",
+                "tid-trunc-en",
+                str(repo_a),
+                [("user", "long en title")],
+            )
+            rp_trunc_cjk = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T10-08-00-tid-trunc-cjk.jsonl",
+                "tid-trunc-cjk",
+                str(repo_a),
+                [("user", "中文截断标题")],
+            )
+            rp_exact_ellip = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T10-09-00-tid-exact-ellip.jsonl",
+                "tid-exact-ellip",
+                str(repo_a),
+                [("user", "literal ellipsis")],
+            )
+            rp_dot = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T10-10-00-tid-dot-dir.jsonl",
+                "tid-dot-dir",
+                str(repo_dot),
+                [("user", "dot dir")],
+            )
+            rp_cloud_trap = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T08-00-00-tid-cloud-shadow.jsonl",
+                "tid-cloud-shadow",
+                str(repo_b),
+                [("user", "Old local repo task that must NEVER bind for cloud chat")],
+            )
+            rp_fallback_scan = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T10-11-00-tid-sessions-scan.jsonl",
+                "tid-sessions-scan",
+                str(repo_a),
+                [("user", "Found via sessions/ fallback scan")],
+            )
+            rp_archived = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T10-12-00-tid-archived.jsonl",
+                "tid-archived",
+                str(repo_a),
+                [("user", "Archived thread")],
+            )
+            # Security trap rollouts
+            rp_outside = _write_codex_rollout(
+                tmp / "outside-sessions.jsonl",
+                "tid-outside",
+                str(repo_a),
+                [("user", "Outside sessions root")],
+            )
+            rp_symlink = sessions_day / "rollout-symlink.jsonl"
+            os.symlink(rp_local_a, rp_symlink)
+            rp_empty = sessions_day / "rollout-empty.jsonl"
+            rp_empty.write_bytes(b"")
+            rp_subagent_dict = _write_codex_rollout(
+                sessions_day / "rollout-sub-dict.jsonl",
+                "tid-sub-dict",
+                str(repo_a),
+                [("user", "Subagent dict")],
+                source={"subagent": "review"},
+            )
+            rp_subagent_str = _write_codex_rollout(
+                sessions_day / "rollout-sub-str.jsonl",
+                "tid-sub-str",
+                str(repo_a),
+                [("user", "Subagent str")],
+                source="subagent",
+            )
+            rp_subagent_parent = _write_codex_rollout(
+                sessions_day / "rollout-sub-parent.jsonl",
+                "tid-sub-parent",
+                str(repo_a),
+                [("user", "Subagent parent")],
+                extra_meta={"parent_thread_id": "tid-local-a"},
+            )
+            # Rich historical CLI Codex session in repo_a for cold-start prior reuse
+            _write_codex_rollout(
+                codex_dir / "sessions" / "2026" / "11" / "22" / "rollout-2026-11-22T10-00-00-tid-prior-cli.jsonl",
+                "tid-prior-cli",
+                str(repo_a),
+                [
+                    ("user", "Analyze HeliosPriorToken " + ("a" * 1600)),
+                    ("assistant", "Fixed HeliosPriorToken " + ("b" * 1600)),
+                    ("user", "Verify HeliosPriorToken2 " + ("c" * 800)),
+                    ("assistant", "Confirmed HeliosPriorToken2 " + ("d" * 800)),
+                ],
+                source="cli",
+            )
+            rp_cold = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T10-15-00-tid-cold-new.jsonl",
+                "tid-cold-new",
+                str(repo_a),
+                [("user", "刚开启的新 Codex 桌面任务")],
+                source="vscode",
+            )
+
+            with contextlib.closing(sqlite3.connect(str(state_db))) as sconn:
+                sconn.execute("PRAGMA journal_mode=WAL")
+                sconn.execute(
+                    """
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        name TEXT,
+                        cwd TEXT,
+                        rollout_path TEXT,
+                        originator TEXT,
+                        archived INTEGER DEFAULT 0,
+                        recency_at_ms INTEGER,
+                        updated_at INTEGER
+                    )
+                    """
+                )
+                sconn.executemany(
+                    "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("tid-local-a", "Refactor QuartzBatcher", str(repo_a), str(rp_local_a), "Codex Desktop", 0, 1_760_000_100_000, 1_760_000_100),
+                        ("tid-dup-old", "Duplicate Local Title", str(repo_a), str(rp_dup_old), "Codex Desktop", 0, 1_760_000_050_000, 1_760_000_050),
+                        ("tid-dup-new", "Duplicate Local Title", str(repo_a), str(rp_dup_new), "codex_work_desktop", 0, 1_760_000_200_000, 1_760_000_200),
+                        ("tid-fullwidth", "\u3000全角中文任务\u3000", str(repo_a), str(rp_fw), "Codex Desktop", 0, 1_760_000_110_000, 1_760_000_110),
+                        ("tid-trunc-en", "Investigate Codex Desktop Session Binding", str(repo_a), str(rp_trunc_en), "Codex Desktop", 0, 1_760_000_120_000, 1_760_000_120),
+                        ("tid-trunc-cjk", "修复桌面端会话分流与热词作用域问题", str(repo_a), str(rp_trunc_cjk), "Codex Desktop", 0, 1_760_000_130_000, 1_760_000_130),
+                        ("tid-exact-ellip", "Investigate Codex Desktop...", str(repo_a), str(rp_exact_ellip), "Codex Desktop", 0, 1_760_000_090_000, 1_760_000_090),
+                        ("tid-dot-dir", "Trailing Dot Repo Task", str(repo_dot), str(rp_dot), "Codex Desktop", 0, 1_760_000_140_000, 1_760_000_140),
+                        # Same title as cloud ChatGPT row! Must NEVER be bound when codex.db says cloud!
+                        ("tid-cloud-shadow", "Weekend Travel Plan", str(repo_b), str(rp_cloud_trap), "Codex Desktop", 0, 1_760_000_300_000, 1_760_000_300),
+                        ("tid-archived", "Archived Task", str(repo_a), str(rp_archived), "Codex Desktop", 1, 1_760_000_400_000, 1_760_000_400),
+                        ("tid-cli-only", "CLI Only Thread", str(repo_a), str(rp_local_a), "codex_cli_rs", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-outside", "Outside Rollout Trap", str(repo_a), str(rp_outside), "Codex Desktop", 0, 1_760_000_150_000, 1_760_000_150),
+                        ("tid-symlink", "Symlink Rollout Trap", str(repo_a), str(rp_symlink), "Codex Desktop", 0, 1_760_000_150_000, 1_760_000_150),
+                        ("tid-empty", "Empty Rollout Trap", str(repo_a), str(rp_empty), "Codex Desktop", 0, 1_760_000_150_000, 1_760_000_150),
+                        ("tid-sub-dict", "Subagent Dict Trap", str(repo_a), str(rp_subagent_dict), "Codex Desktop", 0, 1_760_000_150_000, 1_760_000_150),
+                        ("tid-sub-str", "Subagent Str Trap", str(repo_a), str(rp_subagent_str), "Codex Desktop", 0, 1_760_000_150_000, 1_760_000_150),
+                        ("tid-sub-parent", "Subagent Parent Trap", str(repo_a), str(rp_subagent_parent), "Codex Desktop", 0, 1_760_000_150_000, 1_760_000_150),
+                        ("tid-cold-new", "Cold Start Desktop Task", str(repo_a), str(rp_cold), "Codex Desktop", 0, 1_760_000_160_000, 1_760_000_160),
+                    ],
+                )
+                sconn.commit()
+
+            with contextlib.closing(sqlite3.connect(str(codex_db))) as cconn:
+                cconn.execute("PRAGMA journal_mode=WAL")
+                cconn.execute(
+                    """
+                    CREATE TABLE local_thread_catalog (
+                        thread_id TEXT,
+                        display_title TEXT,
+                        source_kind TEXT,
+                        host_id TEXT,
+                        cwd TEXT,
+                        missing_candidate INTEGER DEFAULT 0,
+                        source_recency_at TEXT,
+                        updated_at INTEGER
+                    )
+                    """
+                )
+                cconn.executemany(
+                    "INSERT INTO local_thread_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("tid-local-a", "Refactor QuartzBatcher", "codex", "local", str(repo_a), 0, "2026-11-23T10:00:00Z", 1_760_000_100),
+                        # Duplicate local title in SAME repo: tid-dup-new has higher source_recency_at even though tid-dup-old has newer updated_at
+                        ("tid-dup-old", "Duplicate Local Title", "codex", "local", str(repo_a), 0, "1760000100000", 1_760_000_999),
+                        ("tid-dup-new", "Duplicate Local Title", "codex", "local", str(repo_a), 0, "1760000200000", 1_760_000_100),
+                        ("tid-fullwidth", "\u3000全角中文任务\u3000", "codex", "local", str(repo_a), 0, "2026-11-23T10:06:00Z", 1_760_000_110),
+                        ("tid-trunc-en", "Investigate Codex Desktop Session Binding", "codex", "local", str(repo_a), 0, "2026-11-23T10:07:00Z", 1_760_000_120),
+                        ("tid-trunc-cjk", "修复桌面端会话分流与热词作用域问题", "codex", "local", str(repo_a), 0, "2026-11-23T10:08:00Z", 1_760_000_130),
+                        ("tid-exact-ellip", "Investigate Codex Desktop...", "codex", "local", str(repo_a), 0, "2026-11-23T09:00:00Z", 1_760_000_090),
+                        ("tid-dot-dir", "Trailing Dot Repo Task", "codex", "local", str(repo_dot), 0, "2026-11-23T10:10:00Z", 1_760_000_140),
+                        # Cloud ChatGPT rows (explicit veto even though older local row & state_5.sqlite share title!)
+                        (None, "Weekend Travel Plan", "chatgpt", "chatgpt:u1", None, 0, "2026-11-23T12:00:00Z", 1_760_000_900),
+                        ("tid-cloud-shadow", "Weekend Travel Plan", "codex", "local", str(repo_b), 0, "2026-11-23T08:00:00Z", 1_760_000_100),
+                        ("tid-cloud-host", "Remote Cloud Host Chat", "codex", "remote:box1", str(repo_a), 0, "2026-11-23T11:00:00Z", 1_760_000_200),
+                        ("tid-empty-cwd", "Empty CWD Chat", "codex", "local", "", 0, "2026-11-23T11:00:00Z", 1_760_000_200),
+                        ("tid-missing-cand", "Missing Candidate Task", "codex", "local", str(repo_a), 1, "2026-11-23T11:00:00Z", 1_760_000_200),
+                        # Missing in state_5.sqlite -> resolved by sessions/ fallback scan
+                        ("tid-sessions-scan", "Sessions Fallback Scan Task", "codex", "local", str(repo_a), 0, "2026-11-23T10:11:00Z", 1_760_000_145),
+                        ("tid-archived", "Archived Task", "codex", "local", str(repo_a), 0, "2026-11-23T10:12:00Z", 1_760_000_146),
+                        # Security traps
+                        ("tid-outside", "Outside Rollout Trap", "codex", "local", str(repo_a), 0, "2026-11-23T10:15:00Z", 1_760_000_150),
+                        ("tid-symlink", "Symlink Rollout Trap", "codex", "local", str(repo_a), 0, "2026-11-23T10:15:00Z", 1_760_000_150),
+                        ("tid-empty", "Empty Rollout Trap", "codex", "local", str(repo_a), 0, "2026-11-23T10:15:00Z", 1_760_000_150),
+                        ("tid-sub-dict", "Subagent Dict Trap", "codex", "local", str(repo_a), 0, "2026-11-23T10:15:00Z", 1_760_000_150),
+                        ("tid-sub-str", "Subagent Str Trap", "codex", "local", str(repo_a), 0, "2026-11-23T10:15:00Z", 1_760_000_150),
+                        ("tid-sub-parent", "Subagent Parent Trap", "codex", "local", str(repo_a), 0, "2026-11-23T10:15:00Z", 1_760_000_150),
+                        ("../escape-tid", "Traversal Thread ID Trap", "codex", "local", str(repo_a), 0, "2026-11-23T10:15:00Z", 1_760_000_150),
+                        ("tid-broad-home", "Broad Home CWD Trap", "codex", "local", str(home), 0, "2026-11-23T10:15:00Z", 1_760_000_150),
+                        ("tid-broad-root", "Broad Root CWD Trap", "codex", "local", "/", 0, "2026-11-23T10:15:00Z", 1_760_000_150),
+                        ("tid-wsl-mnt", "WSL Slow Mount Trap", "codex", "local", "/mnt/c/Users/demo/proj", 0, "2026-11-23T10:15:00Z", 1_760_000_150),
+                        ("tid-cold-new", "Cold Start Desktop Task", "codex", "local", str(repo_a), 0, "2026-11-23T10:16:00Z", 1_760_000_160),
+                    ],
+                )
+                cconn.commit()
+
+            # 1) Exact match, duplicate recency ordering, fullwidth strip, truncated prefix, trailing-dot cwd, Windows suffix
+            m_local = resolve_codex_desktop_session_by_title("Refactor QuartzBatcher", home=home, wsl=False)
+            assert m_local is not None
+            self.assertEqual(
+                (m_local.cli, m_local.session_id, m_local.matched_by, m_local.cwd, m_local.jsonl_path),
+                ("codex", "tid-local-a", "codex_desktop_db", os.path.realpath(repo_a), os.path.realpath(rp_local_a)),
+            )
+
+            m_win_suf = resolve_codex_desktop_session_by_title("Refactor QuartzBatcher - Codex", home=home, wsl=False)
+            assert m_win_suf is not None
+            self.assertEqual(m_win_suf.session_id, "tid-local-a")
+
+            m_dup = resolve_codex_desktop_session_by_title("Duplicate Local Title", home=home, wsl=False)
+            assert m_dup is not None
+            self.assertEqual((m_dup.session_id, m_dup.cwd), ("tid-dup-new", os.path.realpath(repo_a)))
+
+            m_fw = resolve_codex_desktop_session_by_title("全角中文任务", home=home, wsl=False)
+            assert m_fw is not None
+            self.assertEqual(m_fw.session_id, "tid-fullwidth")
+
+            m_exact_over_pfx = resolve_codex_desktop_session_by_title("Investigate Codex Desktop...", home=home, wsl=False)
+            assert m_exact_over_pfx is not None
+            self.assertEqual(m_exact_over_pfx.session_id, "tid-exact-ellip")
+
+            m_trunc_en = resolve_codex_desktop_session_by_title("Investigate Codex Desktop Session...", home=home, wsl=False)
+            assert m_trunc_en is not None
+            self.assertEqual(m_trunc_en.session_id, "tid-trunc-en")
+
+            m_trunc_uni = resolve_codex_desktop_session_by_title("Investigate Codex Desktop Session\u2026", home=home, wsl=False)
+            assert m_trunc_uni is not None
+            self.assertEqual(m_trunc_uni.session_id, "tid-trunc-en")
+
+            m_trunc_cjk = resolve_codex_desktop_session_by_title("修复桌面端会话...", home=home, wsl=False)
+            assert m_trunc_cjk is not None
+            self.assertEqual(m_trunc_cjk.session_id, "tid-trunc-cjk")
+
+            m_dot = resolve_codex_desktop_session_by_title("Trailing Dot Repo Task", home=home, wsl=False)
+            assert m_dot is not None
+            self.assertEqual(m_dot.cwd, os.path.realpath(repo_dot))
+
+            m_scan = resolve_codex_desktop_session_by_title("Sessions Fallback Scan Task", home=home, wsl=False)
+            assert m_scan is not None
+            self.assertEqual((m_scan.session_id, m_scan.jsonl_path), ("tid-sessions-scan", os.path.realpath(rp_fallback_scan)))
+
+            # 2) Cloud ChatGPT explicit veto, placeholders, short prefixes, archived, and security traps
+            for rejected in (
+                "", "   ", "ChatGPT", "Codex", "New Chat", "New Conversation",
+                "Settings", "Preferences", "Welcome", "About", "Search",
+                "Fix...", "修复...",
+                "Weekend Travel Plan", "Remote Cloud Host Chat", "Empty CWD Chat",
+                "Missing Candidate Task", "Archived Task",
+                "Outside Rollout Trap", "Symlink Rollout Trap", "Empty Rollout Trap",
+                "Subagent Dict Trap", "Subagent Str Trap", "Subagent Parent Trap",
+                "Traversal Thread ID Trap", "Broad Home CWD Trap", "Broad Root CWD Trap",
+            ):
+                self.assertIsNone(
+                    resolve_codex_desktop_session_by_title(rejected, home=home, wsl=False),
+                    msg=f"should reject {rejected!r}",
+                )
+
+            # WSL /mnt/ slow mount cwd rejected with zero stat/lstat on /mnt/
+            orig_lstat, orig_stat = os.lstat, os.stat
+
+            def _guard_mnt(fn):
+                def _wrapped(p: object, *a: object, **kw: object):
+                    s = os.fsdecode(p)  # type: ignore[arg-type]
+                    if s == "/mnt" or s.startswith("/mnt/"):
+                        raise AssertionError(f"touched /mnt/: {s}")
+                    return fn(p, *a, **kw)
+                return _wrapped
+
+            with mock.patch("os.lstat", side_effect=_guard_mnt(orig_lstat)), mock.patch(
+                "os.stat", side_effect=_guard_mnt(orig_stat)
+            ):
+                self.assertIsNone(
+                    resolve_codex_desktop_session_by_title("WSL Slow Mount Trap", home=home, wsl=True)
+                )
+
+            # 3) WAL uncheckpointed live visibility via mode=ro
+            rp_wal = _write_codex_rollout(
+                sessions_day / "rollout-2026-11-23T11-00-00-tid-live-wal.jsonl",
+                "tid-live-wal",
+                str(repo_a),
+                [("user", "WAL live task")],
+            )
+            with contextlib.closing(sqlite3.connect(str(codex_db))) as live_w:
+                live_w.execute("PRAGMA wal_autocheckpoint=0")
+                live_w.execute(
+                    "INSERT INTO local_thread_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("tid-live-wal", "Live WAL Codex Task", "codex", "local", str(repo_a), 0, "2026-11-23T11:00:00Z", 1_760_000_800),
+                )
+                live_w.commit()
+                m_wal = resolve_codex_desktop_session_by_title("Live WAL Codex Task", home=home, wsl=False)
+                assert m_wal is not None
+                self.assertEqual((m_wal.session_id, m_wal.jsonl_path), ("tid-live-wal", os.path.realpath(rp_wal)))
+
+            # 4) End-to-end daemon pipeline: dynamic promotion vs cloud ChatGPT general+ai_chat isolation
+            env = {"HOME": str(home), "OPENROUTER_API_KEY": "sk-or-test", "WSL_DISTRO_NAME": "", "WSL_INTEROP": ""}
+            cfg = Config()
+            cfg.refiner.provider = "openrouter"
+            rt = tmp / "rt"
+            rt.mkdir(mode=0o700)
+            tracker = SessionTracker(
+                home_dir=home, runtime_dir=rt, env=env, proc_root=tmp / "noproc", cold_start_fallback="auto"
+            )
+            seen_payloads: list[dict[str, object]] = []
+
+            def _transport(req: HttpRequest) -> HttpResponse:
+                seen_payloads.append(json.loads(req.body.decode("utf-8")))
+                return _json_resp({"choices": [{"message": {"content": "检查 QuartzBatcher。"}}]})
+
+            refiner = OpenAICompatibleRefiner(
+                cfg, resolve_credentials(cfg, env), provider_name="openrouter", env=env, transport=_transport
+            )
+            asr = _DummyAsr("检查 quartz batcher", env=env)
+            try:
+                # 4a) Local Codex Desktop task promotes general_gui -> agent + coding + workspace + 50K chunk cache
+                win_local = ForegroundWindow(801, "ChatGPT", "Refactor QuartzBatcher", bundle_id="com.openai.codex")
+                r1 = run_pipeline_once(
+                    _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                    platform=_DummyPlatform(win_local), origin_window=win_local, audio_source="winmm", dry_run=True, env=env,
+                )
+                self.assertTrue(r1.ok)
+                self.assertEqual(r1.mode, "agent")
+                assert r1.session is not None
+                self.assertEqual(r1.session.session_key, "codex:tid-local-a")
+                self.assertEqual(r1.session.match.matched_by, "codex_desktop_db")
+                self.assertEqual(r1.session.match.cwd, os.path.realpath(repo_a))
+                ctx1 = asr.seen_contexts[-1]
+                self.assertEqual(ctx1.mode, "agent")
+                self.assertEqual(ctx1.hotwords_scope, "coding")
+                self.assertEqual(ctx1.target_hint, "")
+                self.assertIn("QuartzBatcher", ctx1.hotwords)
+                self.assertIn("NebulaEngine", ctx1.hotwords)
+                msgs1 = seen_payloads[-1]["messages"]  # type: ignore[index]
+                self.assertNotIn("<target_app_hint>", str(msgs1[-1]["content"]))
+                self.assertIn("NebulaEngine.py", str(msgs1[-1]["content"]))
+                offset1 = r1.session.byte_offset
+                self.assertGreater(offset1, 0)
+                chunks1, _ = build_refiner_request_blocks(
+                    cfg, "draft1", session_key=r1.session.session_key, tracker=tracker, mode="agent"
+                )
+                self.assertGreaterEqual(len(chunks1), 2)
+
+                # Turn 2 incremental append preserves sealed chunk 0
+                with open(rp_local_a, "a", encoding="utf-8") as af:
+                    af.write(
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "再核对 VortexPool 的并发锁"}],
+                                },
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                r2 = run_pipeline_once(
+                    _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                    platform=_DummyPlatform(win_local), origin_window=win_local, audio_source="winmm", dry_run=True, env=env,
+                )
+                self.assertTrue(r2.ok)
+                assert r2.session is not None
+                self.assertGreater(r2.session.byte_offset, offset1)
+                self.assertIn("VortexPool", asr.seen_contexts[-1].hotwords)
+                chunks2, _ = build_refiner_request_blocks(
+                    cfg, "draft2", session_key=r2.session.session_key, tracker=tracker, mode="agent"
+                )
+                self.assertEqual(chunks2[0], chunks1[0])
+
+                # 4b) Cold-start Codex Desktop task reuses same-repo historical Codex CLI session!
+                win_cold = ForegroundWindow(802, "ChatGPT", "Cold Start Desktop Task", bundle_id="com.openai.codex")
+                r_cold = run_pipeline_once(
+                    _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                    platform=_DummyPlatform(win_cold), origin_window=win_cold, audio_source="winmm", dry_run=True, env=env,
+                )
+                self.assertTrue(r_cold.ok)
+                self.assertEqual(r_cold.mode, "agent")
+                assert r_cold.session is not None
+                self.assertIn("HeliosPriorToken", asr.seen_contexts[-1].hotwords)
+                prior_blk, _, _ = tracker.get_refiner_context_with_prior(r_cold.session.session_key)
+                self.assertIn("HeliosPriorToken", prior_blk)
+
+                # 4c) Cloud ChatGPT chat stays general + ai_chat + chat hotwords + zero workspace/session!
+                win_cloud = ForegroundWindow(803, "ChatGPT", "Weekend Travel Plan", bundle_id="com.openai.codex")
+                r_cloud = run_pipeline_once(
+                    _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                    platform=_DummyPlatform(win_cloud), origin_window=win_cloud, audio_source="winmm", dry_run=True, env=env,
+                )
+                self.assertTrue(r_cloud.ok)
+                self.assertEqual(r_cloud.mode, "general")
+                self.assertIsNone(r_cloud.session)
+                ctx_cloud = asr.seen_contexts[-1]
+                self.assertEqual(ctx_cloud.mode, "general")
+                self.assertEqual(ctx_cloud.hotwords_scope, "chat")
+                self.assertEqual(ctx_cloud.target_hint, "ai_chat")
+                self.assertNotIn("NebulaEngine", ctx_cloud.hotwords)
+                self.assertNotIn("OtherTool", ctx_cloud.hotwords)
+                self.assertIn(TARGET_APP_HINTS["ai_chat"], str(seen_payloads[-1]["messages"][-1]["content"]))  # type: ignore[index]
+
+                # 4d) Explicit mode="general" must NOT promote even for a local Codex Desktop task
+                r_forced_gen = run_pipeline_once(
+                    _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                    platform=_DummyPlatform(win_local), origin_window=win_local, audio_source="winmm", dry_run=True, env=env,
+                    mode="general",
+                )
+                self.assertTrue(r_forced_gen.ok)
+                self.assertEqual(r_forced_gen.mode, "general")
+                self.assertIsNone(r_forced_gen.session)
+
+                # 4e) Concurrent writeback guard for matched_by="codex_desktop_db"
+                entered_q = threading.Event()
+                release_q = threading.Event()
+                orig_prior_fn = tracker._get_prior_candidates_cached
+
+                def _block_prior(cwd: str, *, scope: str = "cli"):
+                    res_p = orig_prior_fn(cwd, scope=scope)
+                    entered_q.set()
+                    release_q.wait(timeout=5.0)
+                    return res_p
+
+                race_errs: list[BaseException] = []
+
+                def _race_worker() -> None:
+                    try:
+                        tracker.sync_ide_session(
+                            SessionMatch(
+                                cli="codex",
+                                session_id="tid-race-codex",
+                                jsonl_path=str(rp_cold),
+                                cwd=str(repo_a),
+                                matched_by="codex_desktop_db",
+                            ),
+                            include_git_info=False,
+                        )
+                    except BaseException as exc:
+                        race_errs.append(exc)
+
+                with mock.patch.object(tracker, "_get_prior_candidates_cached", side_effect=_block_prior):
+                    th = threading.Thread(target=_race_worker)
+                    th.start()
+                    self.assertTrue(entered_q.wait(timeout=5.0))
+                    tracker.sync_ide_session(
+                        SessionMatch(
+                            cli="codex",
+                            session_id="tid-race-codex",
+                            jsonl_path=str(rp_cold),
+                            cwd=str(repo_b),
+                            matched_by="codex_desktop_db",
+                        ),
+                        include_git_info=False,
+                    )
+                    release_q.set()
+                    th.join(timeout=5.0)
+                self.assertEqual(race_errs, [])
+                st_cx_race = tracker.get_state("codex:tid-race-codex")
+                assert st_cx_race is not None
+                self.assertEqual(st_cx_race.cwd, str(repo_b))
+                self.assertEqual(st_cx_race.cold_start_prior_chunk, "")
+                self.assertEqual(st_cx_race.cold_start_prior_hotwords, ())
+            finally:
+                tracker.close()
+
+            # 5) Degradation paths:
+            # 5a) Corrupt codex.db -> graceful None (no exception, no fallback to state_5)
+            backup_codex_bytes = codex_db.read_bytes()
+            for wal_ext in ("-wal", "-shm"):
+                p_ext = codex_db.with_name(codex_db.name + wal_ext)
+                if p_ext.exists():
+                    p_ext.unlink()
+            codex_db.write_bytes(b"corrupt sqlite header")
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Refactor QuartzBatcher", home=home, wsl=False))
+
+            # 5b) Symlink codex.db -> rejected cleanly
+            ext_db = tmp / "ext_codex.db"
+            ext_db.write_bytes(backup_codex_bytes)
+            codex_db.unlink()
+            os.symlink(ext_db, codex_db)
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Refactor QuartzBatcher", home=home, wsl=False))
+
+            # 5c) codex.db absent -> falls back to state_5.sqlite (filters archived=1 & originator='codex_cli_rs')
+            codex_db.unlink()
+            m_fb_desk = resolve_codex_desktop_session_by_title("Refactor QuartzBatcher", home=home, wsl=False)
+            assert m_fb_desk is not None
+            self.assertEqual((m_fb_desk.session_id, m_fb_desk.cwd), ("tid-local-a", os.path.realpath(repo_a)))
+            m_fb_work = resolve_codex_desktop_session_by_title("Duplicate Local Title", home=home, wsl=False)
+            assert m_fb_work is not None
+            self.assertEqual(m_fb_work.session_id, "tid-dup-new")
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Archived Task", home=home, wsl=False))
+            self.assertIsNone(resolve_codex_desktop_session_by_title("CLI Only Thread", home=home, wsl=False))
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Outside Rollout Trap", home=home, wsl=False))
+
+            # 5d) state_5.sqlite missing while codex.db present -> falls back to sessions/ scan by thread_id
+            codex_db.write_bytes(backup_codex_bytes)
+            for wal_ext in ("", "-wal", "-shm"):
+                p_st = state_db.with_name(state_db.name + wal_ext)
+                if p_st.exists():
+                    p_st.unlink()
+            m_no_state = resolve_codex_desktop_session_by_title("Refactor QuartzBatcher", home=home, wsl=False)
+            assert m_no_state is not None
+            self.assertEqual((m_no_state.session_id, m_no_state.jsonl_path), ("tid-local-a", os.path.realpath(rp_local_a)))
+
+            # 5e) Both codex.db absent and state_5.sqlite corrupt -> graceful None
+            codex_db.unlink()
+            state_db.write_bytes(b"corrupt state_5")
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Refactor QuartzBatcher", home=home, wsl=False))
+
+    def test_codex_desktop_astra_review_regressions(self) -> None:
+        """Regression tests for Astra cold review: P1 #1/#2 & P2 #3/#4/#5/#6."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            repo_a = home / "repos" / "alpha-repo"
+            repo_b = home / "repos" / "beta-repo"
+            for r in (repo_a, repo_b):
+                r.mkdir(parents=True)
+            (repo_a / "AlphaCore.py").write_text("class AlphaCore: pass\n", encoding="utf-8")
+            (repo_b / "BetaCore.py").write_text("class BetaCore: pass\n", encoding="utf-8")
+
+            codex_dir = home / ".codex"
+            sessions_day = codex_dir / "sessions" / "2026" / "11" / "23"
+            sessions_day.mkdir(parents=True)
+            sqlite_dir = codex_dir / "sqlite"
+            sqlite_dir.mkdir(parents=True)
+            codex_db = sqlite_dir / "codex.db"
+            state_db = codex_dir / "state_5.sqlite"
+
+            def _mk_rollout(path: Path, sid: str, cwd: str, text: str, *, source: object = "vscode") -> Path:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                lines = [
+                    json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": cwd, "source": source}}, ensure_ascii=False),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
+                        },
+                        ensure_ascii=False,
+                    ),
+                ]
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return path
+
+            rp_newer_local = _mk_rollout(sessions_day / "rollout-tid-newer-local.jsonl", "tid-newer-local", str(repo_a), "local newer")
+            rp_pfx_local = _mk_rollout(sessions_day / "rollout-tid-pfx-local.jsonl", "tid-pfx-local", str(repo_a), "prefix local")
+            rp_win_plan = _mk_rollout(sessions_day / "rollout-tid-win-plan.jsonl", "tid-win-plan", str(repo_a), "win plan local")
+            rp_xrepo_a = _mk_rollout(sessions_day / "rollout-tid-xrepo-a.jsonl", "tid-xrepo-a", str(repo_a), "xrepo a")
+            rp_xrepo_b = _mk_rollout(sessions_day / "rollout-tid-xrepo-b.jsonl", "tid-xrepo-b", str(repo_b), "xrepo b")
+            rp_drift_a = _mk_rollout(sessions_day / "rollout-tid-drift-a.jsonl", "tid-drift-a", str(repo_a), "drift thread a")
+            rp_drift_b = _mk_rollout(sessions_day / "rollout-tid-drift-b.jsonl", "tid-drift-b", str(repo_b), "drift thread b")
+            rp_arch_keep = _mk_rollout(sessions_day / "rollout-tid-arch-keep.jsonl", "tid-arch-keep", str(repo_a), "archived rollout")
+            rp_rel_dot = _mk_rollout(sessions_day / "rollout-tid-rel-dot.jsonl", "tid-rel-dot", str(repo_a), "relative dot")
+            rp_rel_sub = _mk_rollout(sessions_day / "rollout-tid-rel-sub.jsonl", "tid-rel-sub", str(repo_a), "relative sub")
+            rp_file_uri = _mk_rollout(sessions_day / "rollout-tid-file-uri.jsonl", "tid-file-uri", str(repo_a), "file uri cwd")
+            rp_lit_build = _mk_rollout(sessions_day / "rollout-tid-lit-build.jsonl", "tid-lit-build", str(repo_a), "literal ellipsis local")
+
+            # P2 #4 invalid meta files
+            rp_no_meta = sessions_day / "rollout-tid-no-meta.jsonl"
+            rp_no_meta.write_text(
+                json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": []}}) + "\n",
+                encoding="utf-8",
+            )
+            rp_bad_json = sessions_day / "rollout-tid-bad-json.jsonl"
+            rp_bad_json.write_text("{broken json line\n", encoding="utf-8")
+            rp_id_mismatch = _mk_rollout(
+                sessions_day / "rollout-tid-id-mismatch.jsonl", "tid-someone-else", str(repo_a), "wrong session id"
+            )
+            rp_exceeded = _mk_rollout(sessions_day / "rollout-tid-exceeded.jsonl", "tid-exceeded", str(repo_a), "exceeded")
+
+            with contextlib.closing(sqlite3.connect(str(state_db))) as sconn:
+                sconn.execute("PRAGMA journal_mode=WAL")
+                sconn.execute(
+                    """
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        name TEXT,
+                        cwd TEXT,
+                        rollout_path TEXT,
+                        originator TEXT,
+                        archived INTEGER DEFAULT 0,
+                        recency_at_ms INTEGER,
+                        updated_at INTEGER
+                    )
+                    """
+                )
+                sconn.executemany(
+                    "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("tid-newer-local", "Dual Cloud Local Title", str(repo_a), str(rp_newer_local), "Codex Desktop", 0, 1_760_000_900_000, 1_760_000_900),
+                        ("tid-pfx-local", "Shared Cloud Prefix Local Task", str(repo_a), str(rp_pfx_local), "Codex Desktop", 0, 1_760_000_900_000, 1_760_000_900),
+                        ("tid-win-plan", "Plan — ChatGPT", str(repo_a), str(rp_win_plan), "Codex Desktop", 0, 1_760_000_900_000, 1_760_000_900),
+                        ("tid-xrepo-a", "Cross Repo Ambiguous Title", str(repo_a), str(rp_xrepo_a), "Codex Desktop", 0, 1_760_000_900_000, 1_760_000_900),
+                        ("tid-xrepo-b", "Cross Repo Ambiguous Title", str(repo_b), str(rp_xrepo_b), "Codex Desktop", 0, 1_760_000_100_000, 1_760_000_100),
+                        ("tid-drift-a", "Optimize AlphaCore Pipeline", str(repo_a), str(rp_drift_a), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-drift-b", "Inspect BetaCore Metrics", str(repo_b), str(rp_drift_b), "Codex Desktop", 0, 1_760_000_400_000, 1_760_000_400),
+                        ("tid-arch-keep", "Archived Guard Task", str(repo_a), str(rp_arch_keep), "Codex Desktop", 1, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-no-meta", "Missing Session Meta", str(repo_a), str(rp_no_meta), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-bad-json", "Corrupt Session Meta", str(repo_a), str(rp_bad_json), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-id-mismatch", "Mismatched Meta ID", str(repo_a), str(rp_id_mismatch), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-exceeded", "Exceeded Meta Line", str(repo_a), str(rp_exceeded), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-rel-dot", "Relative Dot CWD", ".", str(rp_rel_dot), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-rel-sub", "Relative Sub CWD", "relative/dir", str(rp_rel_sub), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-file-uri", "File URI CWD Task", repo_a.as_uri(), str(rp_file_uri), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-lit-build", "Investigate build...", str(repo_a), str(rp_lit_build), "Codex Desktop", 0, 1_760_000_900_000, 1_760_000_900),
+                    ],
+                )
+                sconn.commit()
+
+            with contextlib.closing(sqlite3.connect(str(codex_db))) as cconn:
+                cconn.execute("PRAGMA journal_mode=WAL")
+                cconn.execute(
+                    """
+                    CREATE TABLE local_thread_catalog (
+                        thread_id TEXT,
+                        display_title TEXT,
+                        source_kind TEXT,
+                        host_id TEXT,
+                        cwd TEXT,
+                        missing_candidate INTEGER DEFAULT 0,
+                        source_recency_at TEXT,
+                        updated_at INTEGER
+                    )
+                    """
+                )
+                cconn.executemany(
+                    "INSERT INTO local_thread_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        # P1 #1(a): Local row is NEWER than cloud row with the same title -> MUST still veto!
+                        ("tid-newer-local", "Dual Cloud Local Title", "codex", "local", str(repo_a), 0, "2026-11-23T12:00:00Z", 1_760_000_900),
+                        ("tid-older-cloud", "Dual Cloud Local Title", "chatgpt", "chatgpt:u1", None, 0, "2026-11-23T08:00:00Z", 1_760_000_100),
+                        # P1 #1(b): Truncated prefix hits both newer local and older cloud -> MUST veto!
+                        ("tid-pfx-local", "Shared Cloud Prefix Local Task", "codex", "local", str(repo_a), 0, "2026-11-23T12:00:00Z", 1_760_000_900),
+                        ("tid-pfx-cloud", "Shared Cloud Prefix Cloud Chat", "chatgpt", "chatgpt:u1", None, 0, "2026-11-23T08:00:00Z", 1_760_000_100),
+                        # P1 #1(c): Windows raw title "Plan — ChatGPT" matches local AND stripped "Plan" matches cloud -> MUST veto!
+                        ("tid-win-plan", "Plan — ChatGPT", "codex", "local", str(repo_a), 0, "2026-11-23T12:00:00Z", 1_760_000_900),
+                        ("tid-cloud-plan", "Plan", "chatgpt", "chatgpt:u1", None, 0, "2026-11-23T08:00:00Z", 1_760_000_100),
+                        # P1 #1(d): Cross-repo same-title ambiguity -> MUST return None!
+                        ("tid-xrepo-a", "Cross Repo Ambiguous Title", "codex", "local", str(repo_a), 0, "2026-11-23T12:00:00Z", 1_760_000_900),
+                        ("tid-xrepo-b", "Cross Repo Ambiguous Title", "codex", "local", str(repo_b), 0, "2026-11-23T08:00:00Z", 1_760_000_100),
+                        # P1 #2 delivery drift targets
+                        ("tid-drift-a", "Optimize AlphaCore Pipeline", "codex", "local", str(repo_a), 0, "2026-11-23T10:00:00Z", 1_760_000_500),
+                        ("tid-drift-b", "Inspect BetaCore Metrics", "codex", "local", str(repo_b), 0, "2026-11-23T09:00:00Z", 1_760_000_400),
+                        ("tid-cloud-drift", "Casual Cloud Question", "chatgpt", "chatgpt:u1", None, 0, "2026-11-23T11:00:00Z", 1_760_000_600),
+                        # P2 #3 archived guard target
+                        ("tid-arch-keep", "Archived Guard Task", "codex", "local", str(repo_a), 0, "2026-11-23T10:00:00Z", 1_760_000_500),
+                        # P2 #4 invalid meta targets
+                        ("tid-no-meta", "Missing Session Meta", "codex", "local", str(repo_a), 0, "2026-11-23T10:00:00Z", 1_760_000_500),
+                        ("tid-bad-json", "Corrupt Session Meta", "codex", "local", str(repo_a), 0, "2026-11-23T10:00:00Z", 1_760_000_500),
+                        ("tid-id-mismatch", "Mismatched Meta ID", "codex", "local", str(repo_a), 0, "2026-11-23T10:00:00Z", 1_760_000_500),
+                        ("tid-exceeded", "Exceeded Meta Line", "codex", "local", str(repo_a), 0, "2026-11-23T10:00:00Z", 1_760_000_500),
+                        # P2 #5 relative cwd & file:// URI targets
+                        ("tid-rel-dot", "Relative Dot CWD", "codex", "local", ".", 0, "2026-11-23T10:00:00Z", 1_760_000_500),
+                        ("tid-rel-sub", "Relative Sub CWD", "codex", "local", "relative/dir", 0, "2026-11-23T10:00:00Z", 1_760_000_500),
+                        ("tid-file-uri", "File URI CWD Task", "codex", "local", repo_a.as_uri(), 0, "2026-11-23T10:00:00Z", 1_760_000_500),
+                        # Merged exact+prefix cloud veto: local literal "Investigate build..." vs cloud "Investigate build failures"
+                        ("tid-lit-build", "Investigate build...", "codex", "local", str(repo_a), 0, "2026-11-23T12:00:00Z", 1_760_000_900),
+                        ("tid-cloud-build", "Investigate build failures", "chatgpt", "chatgpt:u1", None, 0, "2026-11-23T08:00:00Z", 1_760_000_100),
+                    ],
+                )
+                cconn.commit()
+
+            # --- Verify P1 #1(a)(b)(c)(d) + merged exact/prefix cloud veto ---
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Dual Cloud Local Title", home=home, wsl=False))
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Shared Cloud Prefix...", home=home, wsl=False))
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Plan — ChatGPT", home=home, wsl=False))
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Cross Repo Ambiguous Title", home=home, wsl=False))
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Investigate build...", home=home, wsl=False))
+
+            # --- Verify P2 #4 (missing/corrupt/mismatched/exceeded session_meta) ---
+            for bad_meta_title in ("Missing Session Meta", "Corrupt Session Meta", "Mismatched Meta ID"):
+                self.assertIsNone(
+                    resolve_codex_desktop_session_by_title(bad_meta_title, home=home, wsl=False),
+                    msg=f"should reject {bad_meta_title}",
+                )
+            with mock.patch("agent_voice_input.workspace_ctx._read_bounded_line", return_value=(b'{"type":"session_meta"}', True)):
+                self.assertIsNone(resolve_codex_desktop_session_by_title("Exceeded Meta Line", home=home, wsl=False))
+
+            # --- Verify P2 #5 (relative cwd rejected; file:// URI accepted) ---
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Relative Dot CWD", home=home, wsl=False))
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Relative Sub CWD", home=home, wsl=False))
+            m_uri = resolve_codex_desktop_session_by_title("File URI CWD Task", home=home, wsl=False)
+            assert m_uri is not None
+            self.assertEqual((m_uri.session_id, m_uri.cwd), ("tid-file-uri", os.path.realpath(repo_a)))
+
+            # --- Verify P1 #2 (same-window Codex Desktop pre-delivery drift check via real MacOSPlatform.deliver_text) ---
+            env = {"HOME": str(home), "OPENROUTER_API_KEY": "sk-or-test", "WSL_DISTRO_NAME": "", "WSL_INTEROP": ""}
+            cfg = Config()
+            cfg.refiner.provider = "openrouter"
+            rt = tmp / "rt_drift"
+            rt.mkdir(mode=0o700)
+            tracker = SessionTracker(home_dir=home, runtime_dir=rt, env=env, proc_root=tmp / "noproc")
+            refiner = OpenAICompatibleRefiner(
+                cfg,
+                resolve_credentials(cfg, env),
+                provider_name="openrouter",
+                env=env,
+                transport=lambda _req: _json_resp({"choices": [{"message": {"content": "优化 AlphaCore 管线。"}}]}),
+            )
+            asr = _DummyAsr("优化 alpha core 管线", env=env)
+            plat = MacOSPlatform(cfg, env=env, shim_cmd_factory=lambda: None)
+            try:
+                orig_win = ForegroundWindow(901, "ChatGPT", "Optimize AlphaCore Pipeline", bundle_id="com.openai.codex")
+                copied_texts: list[str] = []
+                pasted_texts: list[str] = []
+
+                def _fake_copy(txt: str) -> bool:
+                    copied_texts.append(txt)
+                    return True
+
+                def _fake_post_cmd_v(*_a: object, **_kw: object) -> tuple[bool, str, str]:
+                    pasted_texts.append("cmd_v")
+                    return True, "ok", "ChatGPT"
+
+                # (i) Same hwnd switches to cloud ChatGPT chat -> intercepted, clipboard only, focus_changed
+                cloud_fg = ForegroundWindow(901, "ChatGPT", "Casual Cloud Question", bundle_id="com.openai.codex")
+                with mock.patch.object(plat, "get_foreground_window", return_value=cloud_fg), mock.patch.object(
+                    plat, "_query_paste_foreground_window", return_value=cloud_fg
+                ), mock.patch.object(plat, "_copy_to_clipboard", side_effect=_fake_copy), mock.patch.object(
+                    plat, "beep"
+                ), mock.patch.object(plat, "_post_cmd_v", side_effect=_fake_post_cmd_v):
+                    res_cloud_drift = run_pipeline_once(
+                        _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                        platform=plat, origin_window=orig_win, audio_source="winmm", dry_run=False, env=env,
+                    )
+                self.assertTrue(res_cloud_drift.ok)
+                assert res_cloud_drift.paste is not None
+                self.assertFalse(res_cloud_drift.paste.pasted)
+                self.assertTrue(res_cloud_drift.paste.clipboard)
+                self.assertEqual(res_cloud_drift.paste.reason, "focus_changed")
+                sum_cd = build_pipeline_summary(1, res_cloud_drift)
+                self.assertEqual(sum_cd["delivery_status"], "copied")
+                self.assertEqual(sum_cd["paste_reason"], "focus_changed")
+                self.assertEqual(pasted_texts, [])
+                self.assertEqual(len(copied_texts), 1)
+
+                # (ii) Same hwnd switches to ANOTHER local Codex thread -> intercepted, clipboard only, focus_changed
+                other_fg = ForegroundWindow(901, "ChatGPT", "Inspect BetaCore Metrics", bundle_id="com.openai.codex")
+                with mock.patch.object(plat, "get_foreground_window", return_value=other_fg), mock.patch.object(
+                    plat, "_query_paste_foreground_window", return_value=other_fg
+                ), mock.patch.object(plat, "_copy_to_clipboard", side_effect=_fake_copy), mock.patch.object(
+                    plat, "beep"
+                ), mock.patch.object(plat, "_post_cmd_v", side_effect=_fake_post_cmd_v):
+                    res_other_drift = run_pipeline_once(
+                        _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                        platform=plat, origin_window=orig_win, audio_source="winmm", dry_run=False, env=env,
+                    )
+                self.assertTrue(res_other_drift.ok)
+                assert res_other_drift.paste is not None
+                self.assertFalse(res_other_drift.paste.pasted)
+                self.assertTrue(res_other_drift.paste.clipboard)
+                self.assertEqual(res_other_drift.paste.reason, "focus_changed")
+                self.assertEqual(build_pipeline_summary(2, res_other_drift)["delivery_status"], "copied")
+                self.assertEqual(pasted_texts, [])
+
+                # (iii) Same hwnd title tweaks slightly (truncated) but still resolves to SAME thread_id -> pastes normally!
+                same_tid_fg = ForegroundWindow(901, "ChatGPT", "Optimize AlphaCore...", bundle_id="com.openai.codex")
+                with mock.patch.object(plat, "get_foreground_window", return_value=same_tid_fg), mock.patch.object(
+                    plat, "_query_paste_foreground_window", return_value=same_tid_fg
+                ), mock.patch.object(plat, "_copy_to_clipboard", side_effect=_fake_copy), mock.patch.object(
+                    plat, "beep"
+                ), mock.patch.object(plat, "_post_cmd_v", side_effect=_fake_post_cmd_v):
+                    res_same_tid = run_pipeline_once(
+                        _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                        platform=plat, origin_window=orig_win, audio_source="winmm", dry_run=False, env=env,
+                    )
+                self.assertTrue(res_same_tid.ok)
+                assert res_same_tid.paste is not None
+                self.assertTrue(res_same_tid.paste.pasted)
+                self.assertEqual(build_pipeline_summary(3, res_same_tid)["delivery_status"], "pasted")
+                self.assertEqual(len(pasted_texts), 1)
+
+                # (iv) Sampling exception during verification -> conservatively falls back to copied/focus_changed!
+                with mock.patch.object(
+                    plat, "_query_paste_foreground_window", side_effect=RuntimeError("AX timeout")
+                ), mock.patch.object(plat, "_copy_to_clipboard", side_effect=_fake_copy), mock.patch.object(
+                    plat, "beep"
+                ), mock.patch.object(plat, "_post_cmd_v", side_effect=_fake_post_cmd_v):
+                    res_sample_err = run_pipeline_once(
+                        _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                        platform=plat, origin_window=orig_win, audio_source="winmm", dry_run=False, env=env,
+                    )
+                self.assertTrue(res_sample_err.ok)
+                assert res_sample_err.paste is not None
+                self.assertFalse(res_sample_err.paste.pasted)
+                self.assertTrue(res_sample_err.paste.clipboard)
+                self.assertEqual(res_sample_err.paste.reason, "focus_changed")
+                self.assertEqual(build_pipeline_summary(4, res_sample_err)["delivery_status"], "copied")
+                self.assertEqual(len(pasted_texts), 1)
+
+                # (v) Window switches from local Codex thread -> cloud ChatGPT DURING key-release wait -> post-wait check intercepts!
+                fg_seq = iter([orig_win, cloud_fg])
+                key_seq = iter([True, False])
+                with mock.patch.object(
+                    plat, "_query_paste_foreground_window", side_effect=lambda: next(fg_seq)
+                ), mock.patch.object(plat, "_has_managed_shim", return_value=True), mock.patch.object(
+                    plat, "_query_shim_key_state", side_effect=lambda: next(key_seq)
+                ), mock.patch.object(plat, "_flush_shim_events"), mock.patch.object(
+                    plat, "_shim_supports_paste_clip", return_value=False
+                ), mock.patch.object(plat, "_copy_to_clipboard", side_effect=_fake_copy), mock.patch.object(
+                    plat, "beep"
+                ), mock.patch.object(plat, "_post_cmd_v", side_effect=_fake_post_cmd_v):
+                    res_key_wait_drift = run_pipeline_once(
+                        _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                        platform=plat, origin_window=orig_win, audio_source="winmm", dry_run=False, env=env,
+                    )
+                self.assertTrue(res_key_wait_drift.ok)
+                assert res_key_wait_drift.paste is not None
+                self.assertFalse(res_key_wait_drift.paste.pasted)
+                self.assertTrue(res_key_wait_drift.paste.clipboard)
+                self.assertEqual(res_key_wait_drift.paste.reason, "focus_changed")
+                self.assertEqual(build_pipeline_summary(5, res_key_wait_drift)["delivery_status"], "copied")
+                self.assertEqual(len(pasted_texts), 1)
+
+                # (vi) Real WslPlatform.deliver_text: empty ForegroundWindow(hwnd=0, process="", title="")
+                # MUST fail closed via _make_codex_desktop_same_window_verifier and send force_clipboard_only=True
+                wsl_plat = WslPlatform(cfg, env=env, shim_cmd_factory=lambda: ["true"])
+                try:
+                    wsl_rpcs: list[dict[str, object]] = []
+
+                    def _fake_wsl_rpc(req: dict[str, object], timeout_sec: float = 5.0) -> dict[str, object]:
+                        del timeout_sec
+                        wsl_rpcs.append(dict(req))
+                        return {"pasted": False, "clipboard": True, "reason": "focus_changed", "fg_process": ""}
+
+                    orig_wsl_win = ForegroundWindow(901, "ChatGPT.exe", "Optimize AlphaCore Pipeline")
+                    with mock.patch.object(
+                        wsl_plat, "get_foreground_window", return_value=ForegroundWindow(hwnd=0, process="", title="")
+                    ), mock.patch.object(wsl_plat, "_dispatch_paste_rpc", side_effect=_fake_wsl_rpc):
+                        res_wsl_empty = run_pipeline_once(
+                            _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
+                            platform=wsl_plat, origin_window=orig_wsl_win, audio_source="winmm", dry_run=False, env=env,
+                        )
+                    self.assertTrue(res_wsl_empty.ok)
+                    assert res_wsl_empty.paste is not None
+                    self.assertFalse(res_wsl_empty.paste.pasted)
+                    self.assertTrue(res_wsl_empty.paste.clipboard)
+                    self.assertEqual(res_wsl_empty.paste.reason, "focus_changed")
+                    self.assertEqual(len(wsl_rpcs), 1)
+                    self.assertEqual(wsl_rpcs[0].get("cmd"), "paste")
+                    self.assertIs(wsl_rpcs[0].get("force_clipboard_only"), True)
+                finally:
+                    wsl_plat.close()
+            finally:
+                plat.close()
+                tracker.close()
+
+            # --- Verify P2 #3 (state_5.sqlite present-but-unverifiable MUST NOT bypass archived=1) ---
+            state_backup = state_db.read_bytes()
+            for ext in ("-wal", "-shm"):
+                p_ext = state_db.with_name(state_db.name + ext)
+                if p_ext.exists():
+                    p_ext.unlink()
+
+            # (3a) Locked state_5.sqlite (OperationalError) -> None
+            orig_open_ro = __import__("agent_voice_input.workspace_ctx", fromlist=["_open_readonly_sqlite"])._open_readonly_sqlite
+
+            class _LockedConn:
+                def execute(self, *_a: object, **_kw: object):
+                    raise sqlite3.OperationalError("database is locked")
+
+                def close(self) -> None:
+                    pass
+
+            with mock.patch(
+                "agent_voice_input.workspace_ctx._open_readonly_sqlite",
+                side_effect=lambda dbp, *, wsl: _LockedConn() if dbp.name == "state_5.sqlite" else orig_open_ro(dbp, wsl=wsl),
+            ):
+                self.assertIsNone(resolve_codex_desktop_session_by_title("Archived Guard Task", home=home, wsl=False))
+
+            # (3b) Corrupt state_5.sqlite -> None (never falls back to sessions/ scan to resurrect archived=1!)
+            state_db.write_bytes(b"corrupt state_5 bytes")
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Archived Guard Task", home=home, wsl=False))
+
+            # (3c) state_5.sqlite missing 'archived' column -> None
+            state_db.unlink()
+            with contextlib.closing(sqlite3.connect(str(state_db))) as no_arch_conn:
+                no_arch_conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, cwd TEXT, rollout_path TEXT, originator TEXT)")
+                no_arch_conn.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?, ?, ?)",
+                    ("tid-arch-keep", "Archived Guard Task", str(repo_a), str(rp_arch_keep), "Codex Desktop"),
+                )
+                no_arch_conn.commit()
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Archived Guard Task", home=home, wsl=False))
+
+            # Restore valid state_5.sqlite
+            state_db.write_bytes(state_backup)
+
+            # --- Verify P1 #1(e) & missing source_kind fail-closed & P2 #5 on state_5.sqlite fallback ---
+            # codex.db exists but locked/corrupt -> MUST NOT fall back to state_5.sqlite
+            with mock.patch(
+                "agent_voice_input.workspace_ctx._open_readonly_sqlite",
+                side_effect=lambda dbp, *, wsl: _LockedConn() if dbp.name == "codex.db" else orig_open_ro(dbp, wsl=wsl),
+            ):
+                self.assertIsNone(resolve_codex_desktop_session_by_title("Optimize AlphaCore Pipeline", home=home, wsl=False))
+
+            # codex.db missing required 'source_kind' column -> fail-closed None (never falls back to state_5.sqlite!)
+            for ext in ("", "-wal", "-shm"):
+                p_c = codex_db.with_name(codex_db.name + ext)
+                if p_c.exists():
+                    p_c.unlink()
+            with contextlib.closing(sqlite3.connect(str(codex_db))) as no_sk_conn:
+                no_sk_conn.execute(
+                    "CREATE TABLE local_thread_catalog (thread_id TEXT, display_title TEXT, host_id TEXT, cwd TEXT)"
+                )
+                no_sk_conn.execute(
+                    "INSERT INTO local_thread_catalog VALUES (?, ?, ?, ?)",
+                    ("tid-drift-a", "Optimize AlphaCore Pipeline", "local", str(repo_a)),
+                )
+                no_sk_conn.commit()
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Optimize AlphaCore Pipeline", home=home, wsl=False))
+
+            # Remove codex.db -> state_5.sqlite fallback also rejects relative cwd "." / "relative/dir" & cross-repo dup
+            for ext in ("", "-wal", "-shm"):
+                p_c = codex_db.with_name(codex_db.name + ext)
+                if p_c.exists():
+                    p_c.unlink()
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Relative Dot CWD", home=home, wsl=False))
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Relative Sub CWD", home=home, wsl=False))
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Cross Repo Ambiguous Title", home=home, wsl=False))
+
+            # --- Verify P2 #6: concurrent repo A -> repo B cold-start prior read-back isolation ---
+            _mk_rollout(
+                codex_dir / "sessions" / "2026" / "11" / "21" / "rollout-prior-a.jsonl",
+                "tid-prior-a",
+                str(repo_a),
+                "Inspect AlphaOnlyPriorToken " + ("a" * 3500),
+                source="cli",
+            )
+            # Ensure >= 4 turns for sweet-spot prior in both repo_a and repo_b
+            for p_file, sid_p, cwd_p, tok_p in (
+                (codex_dir / "sessions" / "2026" / "11" / "21" / "rollout-prior-a.jsonl", "tid-prior-a", str(repo_a), "AlphaOnlyPriorToken"),
+                (codex_dir / "sessions" / "2026" / "11" / "21" / "rollout-prior-b.jsonl", "tid-prior-b", str(repo_b), "BetaOnlyPriorToken"),
+            ):
+                p_file.parent.mkdir(parents=True, exist_ok=True)
+                p_lines = [
+                    json.dumps({"type": "session_meta", "payload": {"id": sid_p, "cwd": cwd_p, "source": "cli"}}),
+                    *[
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": r,
+                                    "content": [{"type": "input_text" if r == "user" else "output_text", "text": f"{tok_p} " + ("z" * 1000)}],
+                                },
+                            }
+                        )
+                        for r in ("user", "assistant", "user", "assistant")
+                    ],
+                ]
+                p_file.write_text("\n".join(p_lines) + "\n", encoding="utf-8")
+
+            tracker_ab = SessionTracker(
+                home_dir=home, runtime_dir=tmp / "rt_ab", env=env, proc_root=tmp / "noproc", cold_start_fallback="auto"
+            )
+            try:
+                a_entered = threading.Event()
+                a_release = threading.Event()
+                orig_prior = tracker_ab._get_prior_candidates_cached
+
+                def _interleaved_prior(cwd: str, *, scope: str = "cli"):
+                    res_p = orig_prior(cwd, scope=scope)
+                    if os.path.realpath(cwd) == os.path.realpath(repo_a):
+                        a_entered.set()
+                        a_release.wait(timeout=5.0)
+                    return res_p
+
+                snap_a_box: list[object] = []
+                err_box: list[BaseException] = []
+
+                def _thread_a() -> None:
+                    try:
+                        snap_a_box.append(
+                            tracker_ab.sync_ide_session(
+                                SessionMatch(
+                                    cli="codex",
+                                    session_id="tid-ab-race",
+                                    jsonl_path=str(rp_drift_a),
+                                    cwd=str(repo_a),
+                                    matched_by="codex_desktop_db",
+                                ),
+                                include_git_info=False,
+                            )
+                        )
+                    except BaseException as exc:
+                        err_box.append(exc)
+
+                with mock.patch.object(tracker_ab, "_get_prior_candidates_cached", side_effect=_interleaved_prior):
+                    th_a = threading.Thread(target=_thread_a)
+                    th_a.start()
+                    self.assertTrue(a_entered.wait(timeout=5.0))
+                    # Thread B switches same session_key to repo_b and populates BetaOnlyPriorToken
+                    snap_b = tracker_ab.sync_ide_session(
+                        SessionMatch(
+                            cli="codex",
+                            session_id="tid-ab-race",
+                            jsonl_path=str(rp_drift_a),
+                            cwd=str(repo_b),
+                            matched_by="codex_desktop_db",
+                        ),
+                        include_git_info=False,
+                    )
+                    self.assertIn("BetaOnlyPriorToken", snap_b.hotwords)
+                    a_release.set()
+                    th_a.join(timeout=5.0)
+
+                self.assertEqual(err_box, [])
+                self.assertEqual(len(snap_a_box), 1)
+                snap_a = snap_a_box[0]
+                self.assertEqual(snap_a.match.cwd, str(repo_a))  # type: ignore[attr-defined]
+                self.assertNotIn("BetaOnlyPriorToken", snap_a.hotwords)  # type: ignore[attr-defined]
+                st_ab = tracker_ab.get_state("codex:tid-ab-race")
+                assert st_ab is not None
+                self.assertEqual(st_ab.cold_start_prior_cwd, os.path.realpath(repo_b))
+
+                # P2 #6 non-destructive read-back: stale repo_a read returns "" WITHOUT clearing repo_b's cached prior!
+                stale_prior_a, _, _ = tracker_ab.get_refiner_context_with_prior(
+                    "codex:tid-ab-race", workspace_cwd=str(repo_a)
+                )
+                self.assertEqual(stale_prior_a, "")
+                self.assertFalse(st_ab.cold_start_prior_retired)
+                self.assertIn("BetaOnlyPriorToken", st_ab.cold_start_prior_hotwords)
+                fresh_prior_b, _, _ = tracker_ab.get_refiner_context_with_prior(
+                    "codex:tid-ab-race", workspace_cwd=str(repo_b)
+                )
+                self.assertIn("BetaOnlyPriorToken", fresh_prior_b)
+            finally:
+                tracker_ab.close()
 
 
 if __name__ == "__main__":

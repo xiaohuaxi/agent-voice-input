@@ -13,9 +13,11 @@ from .app_scope import (
     classify_target_app_hint,
     classify_window_category,
     is_antigravity_ide_window,
+    is_codex_desktop_window,
     is_remote_client_window,
     is_remote_ide_window,
     match_app_patterns,
+    normalize_app_token,
     resolve_hotwords_scope,
 )
 from .asr_providers import (
@@ -83,6 +85,7 @@ from .workspace_ctx import (
     _resolve_safe_local_dir,
     resolve_antigravity_ide_session,
     resolve_antigravity_ide_session_by_title,
+    resolve_codex_desktop_session_by_title,
     resolve_ide_workspace_cwd,
 )
 
@@ -984,6 +987,82 @@ class _Stage1State:
     asr_missed_chunks: int = 0
     skipped_reason: str = ""
     ctx_fallback: str = ""
+    codex_promoted_sid: str = ""
+
+
+def _make_codex_desktop_same_window_verifier(
+    st: _Stage1State,
+    *,
+    tracker: SessionTracker,
+    env: Mapping[str, str],
+) -> Callable[[ForegroundWindow], bool] | None:
+    """Return a same-window thread verifier for ``codex_desktop_db``-promoted deliveries."""
+    orig_win = st.win
+    promoted_sid = st.codex_promoted_sid
+    if not promoted_sid or orig_win.origin_drifted:
+        return None
+    orig_title = (orig_win.title or "").strip()
+
+    def _verify(cur_win: ForegroundWindow) -> bool:
+        if cur_win is None or (
+            not cur_win.hwnd
+            and not (cur_win.process or "").strip()
+            and not (cur_win.bundle_id or "").strip()
+        ):
+            return False
+        same_window = (
+            (orig_win.hwnd > 0 and cur_win.hwnd == orig_win.hwnd)
+            or (orig_win.hwnd <= 0 and cur_win.hwnd <= 0)
+        )
+        same_desktop_proc = bool(
+            orig_win.hwnd > 0
+            and normalize_app_token(cur_win.process)
+            and normalize_app_token(cur_win.process) == normalize_app_token(orig_win.process)
+        )
+        if not same_window or not (is_codex_desktop_window(cur_win) or same_desktop_proc):
+            return True
+        cur_title = (cur_win.title or "").strip()
+        if cur_title == orig_title:
+            return True
+        try:
+            re_match = resolve_codex_desktop_session_by_title(
+                cur_title, home=tracker.home, env=env
+            )
+        except Exception:
+            return False
+        return bool(re_match is not None and re_match.session_id == promoted_sid)
+
+    return _verify
+
+
+def _platform_accepts_same_window_verifier(platform: Any) -> bool:
+    deliver_fn = getattr(platform, "deliver_text", None)
+    if not callable(deliver_fn):
+        return False
+    try:
+        params = inspect.signature(deliver_fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "same_window_verifier" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _apply_fallback_same_window_verifier(
+    orig_win: ForegroundWindow,
+    *,
+    platform: Any,
+    verifier: Callable[[ForegroundWindow], bool],
+) -> ForegroundWindow:
+    get_fg = getattr(platform, "get_foreground_window", None)
+    if not callable(get_fg):
+        return replace(orig_win, origin_drifted=True)
+    try:
+        cur_win = get_fg()
+        ok = bool(verifier(cur_win))
+    except Exception:
+        ok = False
+    return orig_win if ok else replace(orig_win, origin_drifted=True)
 
 
 def _make_pipeline_result(
@@ -1241,7 +1320,26 @@ def _execute_stage1(
                     extra_hw = _dedupe_hotwords_ci([*extra_hw, *prior_hw])
                     st.ctx_fallback = "prior_hotwords"
     elif eff_mode == "general" and (win.process or win.bundle_id):
-        st.target_hint = classify_target_app_hint(win)
+        codex_match = None
+        if (
+            not origin_drifted
+            and (explicit_mode or "auto").strip().lower() != "general"
+            and is_codex_desktop_window(win)
+        ):
+            codex_match = resolve_codex_desktop_session_by_title(
+                win.title, home=tracker.home, env=env
+            )
+        if codex_match is not None:
+            eff_mode = "agent"
+            st.eff_mode = "agent"
+            st.target_hint = ""
+            st.workspace_cwd = codex_match.cwd
+            st.codex_promoted_sid = codex_match.session_id
+            st.snap = tracker.sync_ide_session(
+                codex_match, cold_start_fallback=cfg.refiner.cold_start_fallback
+            )
+        else:
+            st.target_hint = classify_target_app_hint(win)
 
     if (
         eff_mode != "general"
@@ -1494,21 +1592,44 @@ def run_pipeline_once(
             elif deliver_fn is not None:
                 if cancel_token is not None and not cancel_token.try_commit():
                     return _cancel_res(cancel_token.reason or "cancelled", draft=cand_text, refined=ref_res)
+                verifier = _make_codex_desktop_same_window_verifier(
+                    st, tracker=eff_tracker, env=eff_env
+                )
+                deliver_win = (
+                    _apply_fallback_same_window_verifier(
+                        st.win, platform=platform, verifier=verifier
+                    )
+                    if (verifier is not None and platform is not None)
+                    else st.win
+                )
                 t_deliv0 = time.monotonic()
                 in_delivery = True
-                paste_out = deliver_fn(cand_text, st.win)
+                paste_out = deliver_fn(cand_text, deliver_win)
                 in_delivery = False
                 deliver_ms = _elapsed_ms(t_deliv0)
             else:
+                verifier = _make_codex_desktop_same_window_verifier(
+                    st, tracker=eff_tracker, env=eff_env
+                )
+                deliver_win = st.win
+                deliv_extra_kw: dict[str, Any] = {}
+                if verifier is not None:
+                    if _platform_accepts_same_window_verifier(platform):
+                        deliv_extra_kw["same_window_verifier"] = verifier
+                    else:
+                        deliver_win = _apply_fallback_same_window_verifier(
+                            st.win, platform=platform, verifier=verifier
+                        )
                 t_deliv0 = time.monotonic()
                 in_delivery = True
                 paste_out = platform.deliver_text(
                     cand_text,
                     seq_id=seq_id,
-                    target_hwnd=st.win.hwnd,
-                    origin_window=st.win,
+                    target_hwnd=deliver_win.hwnd,
+                    origin_window=deliver_win,
                     is_cancelled=cancel_check,
                     before_commit=(cancel_token.try_commit if cancel_token is not None else None),
+                    **deliv_extra_kw,
                 )
                 in_delivery = False
                 deliver_ms = _elapsed_ms(t_deliv0)
@@ -3112,11 +3233,16 @@ class VoiceInputDaemon:
         task: _QueuedUtterance,
         final_text: str,
         origin_win: ForegroundWindow,
+        *,
+        same_window_verifier: Callable[[ForegroundWindow], bool] | None = None,
     ) -> PasteOutcome:
         with self._lock:
             unpasted_snapshot = list(self._batch_unpasted_clips)
         fallback_txt = "\n\n".join([*unpasted_snapshot, final_text]) if unpasted_snapshot else None
         preserve_clip = bool(unpasted_snapshot)
+        extra_deliv_kw: dict[str, Any] = {}
+        if same_window_verifier is not None:
+            extra_deliv_kw["same_window_verifier"] = same_window_verifier
         paste_out = self.platform.deliver_text(
             final_text,
             seq_id=task.seq_id,
@@ -3128,6 +3254,7 @@ class VoiceInputDaemon:
             is_cancelled=lambda: self._stop_evt.is_set() or task.cancel_token.is_cancelled(),
             before_clipboard_write=lambda: self._wait_clipboard_settle(task.cancel_token),
             before_commit=task.cancel_token.try_commit,
+            **extra_deliv_kw,
         )
         now_done = self.clock_fn()
         with self._lock:
@@ -3473,8 +3600,22 @@ class VoiceInputDaemon:
                 return _cancelled_outcome()
         else:
             try:
+                verifier = _make_codex_desktop_same_window_verifier(
+                    st, tracker=self.tracker, env=self.env
+                )
+                deliver_win = st.win
+                pass_verifier: Callable[[ForegroundWindow], bool] | None = None
+                if verifier is not None:
+                    if _platform_accepts_same_window_verifier(self.platform):
+                        pass_verifier = verifier
+                    else:
+                        deliver_win = _apply_fallback_same_window_verifier(
+                            st.win, platform=self.platform, verifier=verifier
+                        )
                 t_deliv0 = time.monotonic()
-                paste_out = self._deliver_for_utterance(task, final_text, st.win)
+                paste_out = self._deliver_for_utterance(
+                    task, final_text, deliver_win, same_window_verifier=pass_verifier
+                )
                 deliver_ms = _elapsed_ms(t_deliv0)
             except Exception as deliv_exc:
                 if self._stop_evt.is_set() or task.cancel_token.is_cancelled():

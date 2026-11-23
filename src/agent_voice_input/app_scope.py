@@ -480,6 +480,32 @@ def is_antigravity_ide_window(win: WindowLike) -> bool:
     return match_app_patterns(win, _ANTIGRAVITY_IDE_PATTERNS)
 
 
+def is_terminal_window(win: WindowLike) -> bool:
+    """Return True when ``win`` is a known Windows/macOS terminal or dedicated SSH client."""
+    bid = (win.bundle_id or "").strip().lower()
+    if bid and bid in MACOS_TERMINAL_BUNDLE_IDS:
+        return True
+    proc = normalize_app_token(win.process)
+    if proc and (proc in WINDOWS_TERMINALS or proc in MACOS_TERMINALS):
+        return True
+    return is_dedicated_ssh_client_window(win)
+
+
+def is_codex_desktop_window(win: WindowLike) -> bool:
+    """Return True for unified ChatGPT / Codex desktop windows (excluding terminal CLI windows)."""
+    if is_terminal_window(win):
+        return False
+    bid = (win.bundle_id or "").strip().lower()
+    if bid:
+        return bid == "com.openai.codex"
+    proc = normalize_app_token(win.process)
+    if proc == "chatgpt":
+        return True
+    if proc == "codex":
+        return _is_desktop_ai_app_title(win.title, _DESKTOP_AI_COLLIDING_PROCS["codex"])
+    return False
+
+
 @dataclass(frozen=True)
 class IdeTitleInfo:
     root_name: str = ""

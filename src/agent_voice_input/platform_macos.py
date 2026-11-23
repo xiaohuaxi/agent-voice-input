@@ -2304,12 +2304,21 @@ class MacOSPlatform(JsonlShimMixin):
         is_cancelled: Callable[[], bool] | None = None,
         before_clipboard_write: Callable[[], None] | None = None,
         before_commit: Callable[[], bool] | None = None,
+        same_window_verifier: Callable[[ForegroundWindow], bool] | None = None,
     ) -> PasteOutcome:
         del target_hwnd, preserve_clipboard
         cancelled_fn = lambda: bool(is_cancelled is not None and is_cancelled())
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", "")
         _confirm_commit = make_once_commit_guard(cancelled_fn, before_commit)
+
+        def _verify_same_window(cur_fg: ForegroundWindow) -> bool:
+            if same_window_verifier is None:
+                return True
+            try:
+                return bool(same_window_verifier(cur_fg))
+            except Exception:
+                return False
 
         def _is_beep_suppressed() -> bool:
             return bool(suppress_beep() if callable(suppress_beep) else suppress_beep)
@@ -2353,7 +2362,12 @@ class MacOSPlatform(JsonlShimMixin):
             or origin_window.tty
             or origin_window.tmux_pane
         )
-        fg = self._query_paste_foreground_window()
+        try:
+            fg = self._query_paste_foreground_window()
+        except Exception:
+            if same_window_verifier is not None:
+                return _fallback_to_clipboard("focus_changed", origin_window.process if origin_window else "")
+            raise
         if (
             origin_window is None
             and fg.surface_id
@@ -2368,10 +2382,14 @@ class MacOSPlatform(JsonlShimMixin):
                 on_direct_success=_direct_success,
                 on_fallback=_fallback_to_clipboard,
             )
-        if self._is_focus_drifted(origin_window, fg) or (
-            unknown_origin
-            and (fg.process or fg.bundle_id)
-            and not self.is_allowed_terminal(fg)
+        if (
+            self._is_focus_drifted(origin_window, fg)
+            or (
+                unknown_origin
+                and (fg.process or fg.bundle_id)
+                and not self.is_allowed_terminal(fg)
+            )
+            or not _verify_same_window(fg)
         ):
             return _fallback_to_clipboard("focus_changed", fg.process)
         fg_is_term = self.is_allowed_terminal(fg)
@@ -2458,11 +2476,20 @@ class MacOSPlatform(JsonlShimMixin):
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", fg.process)
         if waited_for_settle or waited_for_key:
-            fg = self._query_paste_foreground_window()
-            if self._is_focus_drifted(origin_window, fg) or (
-                unknown_origin
-                and (fg.process or fg.bundle_id)
-                and not self.is_allowed_terminal(fg)
+            try:
+                fg = self._query_paste_foreground_window()
+            except Exception:
+                if same_window_verifier is not None:
+                    return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                raise
+            if (
+                self._is_focus_drifted(origin_window, fg)
+                or (
+                    unknown_origin
+                    and (fg.process or fg.bundle_id)
+                    and not self.is_allowed_terminal(fg)
+                )
+                or not _verify_same_window(fg)
             ):
                 return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
 

@@ -46,7 +46,12 @@ from ._remote_probe import (
     build_slim_prior_candidate,
     extract_prior_sessions_hotwords,
 )
-from .app_scope import _VSCODE_REJECT_TITLES, is_remote_ide_window, parse_ide_window_title
+from .app_scope import (
+    _VSCODE_REJECT_TITLES,
+    _strip_trailing_app_suffix,
+    is_remote_ide_window,
+    parse_ide_window_title,
+)
 
 
 @dataclass(frozen=True)
@@ -55,7 +60,7 @@ class SessionMatch:
     session_id: str
     jsonl_path: str
     cwd: str = ""
-    matched_by: str = ""  # "registry" | "title_uuid" | "title_prefix" | "tmux_registry" | "tmux_pane_title" | "tmux_proc_scan" | "tty_registry" | "tty_ps" | "proc_scan" | "recent_root" | "ide_brain" | "ide_db_title" | "remote_*"
+    matched_by: str = ""  # "registry" | "title_uuid" | "title_prefix" | "tmux_registry" | "tmux_pane_title" | "tmux_proc_scan" | "tty_registry" | "tty_ps" | "proc_scan" | "recent_root" | "ide_brain" | "ide_db_title" | "codex_desktop_db" | "remote_*"
     pts_mtime: float = 0.0
     jsonl_mtime: float = 0.0
     thread_name: str = ""
@@ -688,10 +693,24 @@ def _classify_agy_evidence_for_workspace(
 
 
 _ISO_FRAC_RE = re.compile(r"(\.\d{6})\d+")
+_NUM_TS_RE = re.compile(r"^\d+(?:\.\d+)?$")
 _AGY_DESKTOP_REJECT_TITLES: frozenset[str] = _VSCODE_REJECT_TITLES | frozenset({
     "new conversation",
     "new chat",
 })
+_CODEX_DESKTOP_REJECT_TITLES: frozenset[str] = frozenset({
+    "chatgpt",
+    "codex",
+    "new chat",
+    "new conversation",
+    "settings",
+    "preferences",
+    "welcome",
+    "about",
+    "search",
+})
+_CODEX_DESKTOP_APP_SUFFIXES: tuple[str, ...] = ("chatgpt", "codex")
+_CODEX_DESKTOP_ORIGINATORS: tuple[str, ...] = ("Codex Desktop", "codex_work_desktop")
 
 
 def _iter_agy_ide_roots(home: Path) -> tuple[Path, Path]:
@@ -716,6 +735,9 @@ def _parse_iso_timestamp(raw: Any) -> float:
     s = str(raw or "").strip()
     if not s:
         return 0.0
+    if _NUM_TS_RE.match(s):
+        val = float(s)
+        return val / 1000.0 if val > 1e12 else (val if val > 0.0 else 0.0)
     if s.endswith(("Z", "z")):
         s = s[:-1] + "+00:00"
     s = _ISO_FRAC_RE.sub(r"\1", s)
@@ -726,6 +748,18 @@ def _parse_iso_timestamp(raw: Any) -> float:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return max(0.0, dt.timestamp())
+
+
+def _compute_trunc_prefix(win_title: str) -> str:
+    if win_title.endswith("..."):
+        cand_pfx = win_title[:-3]
+    elif win_title.endswith("\u2026"):
+        cand_pfx = win_title[:-1]
+    else:
+        return ""
+    pfx_s = cand_pfx.strip()
+    min_pfx = 4 if _CJK_HOTWORD_RE.search(pfx_s) else 8
+    return cand_pfx if len(pfx_s) >= min_pfx else ""
 
 
 def _resolve_agy_ide_transcript(
@@ -777,9 +811,8 @@ def _stat_agy_annotation_mtime(root: Path, cid: str) -> float:
     return float(lst.st_mtime) if stat.S_ISREG(lst.st_mode) else 0.0
 
 
-def _open_agy_ide_db_ro(root: Path, *, wsl: bool) -> sqlite3.Connection | None:
-    """Open ``<root>/conversation_summaries.db`` read-only without ``immutable=1`` (WAL-safe)."""
-    db_path = root / "conversation_summaries.db"
+def _open_readonly_sqlite(db_path: Path, *, wsl: bool) -> sqlite3.Connection | None:
+    """Open a regular local SQLite DB read-only without ``immutable=1`` (WAL-safe, rejects symlinks)."""
     if is_wsl_slow_mount_path(str(db_path), wsl=wsl):
         return None
     try:
@@ -788,16 +821,28 @@ def _open_agy_ide_db_ro(root: Path, *, wsl: bool) -> sqlite3.Connection | None:
         return None
     if not stat.S_ISREG(lst.st_mode):
         return None
-    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    safe_db = _safe_realpath(str(db_path), wsl=wsl)
+    if not safe_db:
+        return None
+    uri = f"{Path(safe_db).as_uri()}?mode=ro"
     try:
         return sqlite3.connect(uri, uri=True, timeout=0.05)
     except (sqlite3.Error, OSError):
         return None
 
 
-def _get_agy_db_table_cols(conn: sqlite3.Connection) -> set[str]:
-    with contextlib.closing(conn.execute("PRAGMA table_info(conversation_summaries)")) as info_cur:
+def _get_sqlite_table_cols(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    with contextlib.closing(conn.execute(f"PRAGMA table_info({table_name})")) as info_cur:
         return {str(r[1]).lower() for r in info_cur.fetchall() if len(r) > 1}
+
+
+def _open_agy_ide_db_ro(root: Path, *, wsl: bool) -> sqlite3.Connection | None:
+    """Open ``<root>/conversation_summaries.db`` read-only without ``immutable=1`` (WAL-safe)."""
+    return _open_readonly_sqlite(root / "conversation_summaries.db", wsl=wsl)
+
+
+def _get_agy_db_table_cols(conn: sqlite3.Connection) -> set[str]:
+    return _get_sqlite_table_cols(conn, "conversation_summaries")
 
 
 def _query_agy_ide_db_title_rows(
@@ -983,18 +1028,7 @@ def resolve_antigravity_ide_session_by_title(
     eff_home = home if home is not None else Path((eff_env.get("HOME") or "").strip() or Path.home())
     eff_wsl = _effective_is_wsl(wsl, env)
 
-    trunc_prefix = ""
-    if win_title.endswith("..."):
-        cand_pfx = win_title[:-3]
-    elif win_title.endswith("\u2026"):
-        cand_pfx = win_title[:-1]
-    else:
-        cand_pfx = ""
-    if cand_pfx:
-        pfx_s = cand_pfx.strip()
-        min_pfx = 4 if _CJK_HOTWORD_RE.search(pfx_s) else 8
-        if len(pfx_s) >= min_pfx:
-            trunc_prefix = cand_pfx
+    trunc_prefix = _compute_trunc_prefix(win_title)
 
     exact_cands: list[tuple[Path, str, Path, os.stat_result, str, Any]] = []
     prefix_cands: list[tuple[Path, str, Path, os.stat_result, str, Any]] = []
@@ -1063,6 +1097,499 @@ def resolve_antigravity_ide_session_by_title(
         cwd=ws_cwd,
         matched_by="ide_db_title",
         jsonl_mtime=chosen[3].st_mtime,
+    )
+
+
+@dataclass(frozen=True)
+class _CodexCatalogRow:
+    thread_id: str
+    display_title: str
+    is_local: bool
+    cwd: str
+    rollout_path: str | None
+    recency_ts: float
+    updated_ts: float
+
+
+def _validate_codex_rollout_meta(
+    jsonl_path: str | Path, expected_thread_id: str
+) -> bool:
+    """Verify a Codex rollout's first line is a valid non-subagent ``session_meta`` matching ``expected_thread_id``."""
+    want_tid = (expected_thread_id or "").strip().lower()
+    if not want_tid:
+        return False
+    try:
+        with open(jsonl_path, "rb") as f:
+            first_line, exceeded = _read_bounded_line(f)
+    except OSError:
+        return False
+    if not first_line or exceeded:
+        return False
+    try:
+        obj = json.loads(first_line.decode("utf-8", errors="replace"))
+    except ValueError:
+        return False
+    if not isinstance(obj, dict) or obj.get("type") != "session_meta":
+        return False
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    meta_id = str(payload.get("id") or "").strip().lower()
+    if not meta_id or meta_id != want_tid:
+        return False
+    if bool(payload.get("is_subagent")) or bool(payload.get("parent_thread_id")):
+        return False
+    src = payload.get("source")
+    if isinstance(src, Mapping):
+        if "subagent" in src or any("subagent" in str(k).lower() for k in src):
+            return False
+    elif isinstance(src, str):
+        s_low = src.strip().lower()
+        if s_low == "subagent" or s_low.startswith("subagent:"):
+            return False
+    return True
+
+
+def _validate_codex_local_cwd(raw_cwd: str, *, home: Path, wsl: bool) -> str:
+    """Validate a structured absolute local workspace path (or ``file://`` URI) from Codex DB."""
+    s = (raw_cwd or "").strip()
+    if not s or "\x00" in s:
+        return ""
+    if s.lower().startswith(("file://", "vscode-remote://")):
+        s = _decode_structured_workspace_uri(s, wsl=wsl)
+        if not s:
+            return ""
+    if not os.path.isabs(s) or is_wsl_slow_mount_path(s, wsl=wsl):
+        return ""
+    safe_dir = _resolve_safe_local_dir(s, wsl=wsl)
+    if not safe_dir or _is_broad_or_unsafe_workspace_dir(safe_dir, home, wsl=wsl):
+        return ""
+    return safe_dir
+
+
+def _validate_codex_rollout_path(
+    raw_path: str, sessions_root: Path, expected_thread_id: str, *, wsl: bool
+) -> tuple[str, tuple[Path, os.stat_result] | None]:
+    """Validate a Codex rollout file is non-symlink, non-empty, under ``sessions_root``, and has matching root ``session_meta``."""
+    s = (raw_path or "").strip()
+    if not s or "\x00" in s or is_wsl_slow_mount_path(s, wsl=wsl):
+        return "rejected", None
+    rp = Path(s)
+    try:
+        lst = os.lstat(rp)
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "rejected", None
+    if not stat.S_ISREG(lst.st_mode) or lst.st_size <= 0:
+        return "rejected", None
+    if hasattr(os, "getuid") and lst.st_uid != os.getuid():
+        return "rejected", None
+    real_rp = _safe_realpath(str(rp), wsl=wsl)
+    if not real_rp:
+        return "rejected", None
+    real_rp_path = Path(real_rp)
+    if not real_rp_path.is_relative_to(sessions_root):
+        return "rejected", None
+    if not _validate_codex_rollout_meta(real_rp_path, expected_thread_id):
+        return "rejected", None
+    return "ok", (real_rp_path, lst)
+
+
+def _find_codex_rollout_in_sessions(
+    sessions_root: Path, thread_id: str, *, wsl: bool
+) -> tuple[Path, os.stat_result] | None:
+    """Lightweight bounded fallback scan under ``~/.codex/sessions/`` by ``thread_id``."""
+    tid_low = thread_id.strip().lower()
+    if not tid_low:
+        return None
+    best: tuple[float, Path, os.stat_result] | None = None
+
+    def _walk(dir_path: Path, depth: int) -> None:
+        nonlocal best
+        if depth > 4:
+            return
+        subdirs: list[Path] = []
+        try:
+            with os.scandir(dir_path) as it:
+                for entry in it:
+                    name = entry.name
+                    if not name or name.startswith("."):
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            subdirs.append(Path(entry.path))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    nlow = name.lower()
+                    if (
+                        nlow == f"{tid_low}.jsonl"
+                        or nlow.endswith(f"-{tid_low}.jsonl")
+                        or nlow.endswith(f"_{tid_low}.jsonl")
+                    ):
+                        status, hit = _validate_codex_rollout_path(
+                            entry.path, sessions_root, thread_id, wsl=wsl
+                        )
+                        if status == "ok" and hit is not None:
+                            rp_path, rp_st = hit
+                            if best is None or rp_st.st_mtime > best[0]:
+                                best = (rp_st.st_mtime, rp_path, rp_st)
+        except OSError:
+            return
+        subdirs.sort(key=lambda p: p.name, reverse=True)
+        for sd in subdirs:
+            _walk(sd, depth + 1)
+
+    _walk(sessions_root, 0)
+    return (best[1], best[2]) if best is not None else None
+
+
+def _lookup_codex_state_rollout(
+    codex_dir: Path, thread_id: str, *, wsl: bool
+) -> tuple[str, str]:
+    """Query ``~/.codex/state_5.sqlite`` ``threads`` for ``rollout_path`` by ``id``.
+
+    Distinguishes missing DB / absent row (``"missing"`` -> may scan ``sessions/``) from
+    present-but-unverifiable DB (``"unverifiable"`` -> reject to avoid bypassing ``archived=1``).
+    """
+    state_db = codex_dir / "state_5.sqlite"
+    if not os.path.lexists(state_db):
+        return "missing", ""
+    conn = _open_readonly_sqlite(state_db, wsl=wsl)
+    if conn is None:
+        return "unverifiable", ""
+    try:
+        with contextlib.closing(conn):
+            cols = _get_sqlite_table_cols(conn, "threads")
+            if "id" not in cols or "rollout_path" not in cols or "archived" not in cols:
+                return "unverifiable", ""
+            with contextlib.closing(
+                conn.execute(
+                    "SELECT rollout_path, COALESCE(archived, 0) FROM threads WHERE id = ?",
+                    (thread_id,),
+                )
+            ) as cur:
+                row = cur.fetchone()
+    except (sqlite3.Error, OSError):
+        return "unverifiable", ""
+    if row is None:
+        return "missing", ""
+    try:
+        is_archived = int(row[1] or 0) != 0
+    except (TypeError, ValueError):
+        return "unverifiable", ""
+    if is_archived:
+        return "archived", ""
+    rp = str(row[0] or "").strip()
+    return ("found", rp) if rp else ("missing", "")
+
+
+def _resolve_codex_rollout_for_thread(
+    codex_dir: Path,
+    thread_id: str,
+    *,
+    explicit_rollout_path: str | None = None,
+    wsl: bool,
+) -> tuple[Path, os.stat_result] | None:
+    if not _is_safe_agy_cid(thread_id):
+        return None
+    safe_sessions = _resolve_safe_local_dir(str(codex_dir / "sessions"), wsl=wsl)
+    if not safe_sessions:
+        return None
+    sessions_root = Path(safe_sessions)
+
+    if explicit_rollout_path is not None:
+        rp_str = explicit_rollout_path.strip()
+        if rp_str:
+            status, hit = _validate_codex_rollout_path(
+                rp_str, sessions_root, thread_id, wsl=wsl
+            )
+            if status == "ok":
+                return hit
+            if status == "rejected":
+                return None
+        return _find_codex_rollout_in_sessions(sessions_root, thread_id, wsl=wsl)
+
+    db_status, db_rp = _lookup_codex_state_rollout(codex_dir, thread_id, wsl=wsl)
+    if db_status in ("archived", "unverifiable"):
+        return None
+    if db_status == "found":
+        status, hit = _validate_codex_rollout_path(
+            db_rp, sessions_root, thread_id, wsl=wsl
+        )
+        if status == "ok":
+            return hit
+        if status == "rejected":
+            return None
+    return _find_codex_rollout_in_sessions(sessions_root, thread_id, wsl=wsl)
+
+
+def _query_codex_catalog_rows(db_path: Path, *, wsl: bool) -> list[_CodexCatalogRow]:
+    """Read all non-missing rows from ``~/.codex/sqlite/codex.db`` ``local_thread_catalog``."""
+    conn = _open_readonly_sqlite(db_path, wsl=wsl)
+    if conn is None:
+        return []
+    try:
+        with contextlib.closing(conn):
+            cols = _get_sqlite_table_cols(conn, "local_thread_catalog")
+            id_col = "thread_id" if "thread_id" in cols else ("id" if "id" in cols else "")
+            if (
+                not id_col
+                or "display_title" not in cols
+                or "source_kind" not in cols
+                or "host_id" not in cols
+                or "cwd" not in cols
+            ):
+                return []
+            sel_src = "source_kind"
+            sel_host = "host_id"
+            sel_cwd = "cwd"
+            rec_col = next(
+                (
+                    c
+                    for c in (
+                        "source_recency_at",
+                        "recency_at",
+                        "recency_ts",
+                        "recency_at_ms",
+                        "last_active_at",
+                    )
+                    if c in cols
+                ),
+                "",
+            )
+            upd_col = next(
+                (
+                    c
+                    for c in (
+                        "updated_at",
+                        "updated_ts",
+                        "updated_at_ms",
+                        "last_modified_at",
+                        "created_at",
+                    )
+                    if c in cols
+                ),
+                "",
+            )
+            sel_rec = rec_col if rec_col else "0"
+            sel_upd = upd_col if upd_col else "0"
+            wheres = ["COALESCE(display_title, '') != ''"]
+            if "missing_candidate" in cols:
+                wheres.insert(0, "COALESCE(missing_candidate, 0) = 0")
+            sql = (
+                f"SELECT {id_col}, display_title, {sel_src}, {sel_host}, {sel_cwd}, "
+                f"{sel_rec}, {sel_upd} FROM local_thread_catalog WHERE {' AND '.join(wheres)}"
+            )
+            with contextlib.closing(conn.execute(sql)) as cur:
+                raw_rows = cur.fetchall()
+    except (sqlite3.Error, OSError):
+        return []
+
+    out: list[_CodexCatalogRow] = []
+    for raw_tid, raw_title, raw_src, raw_host, raw_cwd, raw_rec, raw_upd in raw_rows:
+        tid = str(raw_tid or "").strip()
+        title = str(raw_title or "").strip()
+        if not title:
+            continue
+        src_kind = str(raw_src or "").strip().lower()
+        host_id = str(raw_host or "").strip().lower()
+        cwd_str = str(raw_cwd or "").strip()
+        is_local = src_kind != "chatgpt" and host_id == "local" and bool(cwd_str) and bool(tid)
+        out.append(
+            _CodexCatalogRow(
+                thread_id=tid,
+                display_title=title,
+                is_local=is_local,
+                cwd=cwd_str,
+                rollout_path=None,
+                recency_ts=_parse_iso_timestamp(raw_rec),
+                updated_ts=_parse_iso_timestamp(raw_upd),
+            )
+        )
+    return out
+
+
+def _query_codex_state_desktop_rows(db_path: Path, *, wsl: bool) -> list[_CodexCatalogRow]:
+    """Fallback query against ``~/.codex/state_5.sqlite`` ``threads`` when ``codex.db`` is absent."""
+    conn = _open_readonly_sqlite(db_path, wsl=wsl)
+    if conn is None:
+        return []
+    try:
+        with contextlib.closing(conn):
+            cols = _get_sqlite_table_cols(conn, "threads")
+            title_col = "name" if "name" in cols else ("title" if "title" in cols else "")
+            if (
+                not title_col
+                or "id" not in cols
+                or "cwd" not in cols
+                or "originator" not in cols
+                or "archived" not in cols
+            ):
+                return []
+            sel_rp = "rollout_path" if "rollout_path" in cols else "''"
+            rec_col = next(
+                (c for c in ("recency_at_ms", "source_recency_at", "recency_at") if c in cols),
+                "",
+            )
+            upd_col = next(
+                (c for c in ("updated_at_ms", "updated_at", "created_at") if c in cols),
+                "",
+            )
+            sel_rec = rec_col if rec_col else "0"
+            sel_upd = upd_col if upd_col else "0"
+            wheres = [
+                "COALESCE(archived, 0) = 0",
+                f"COALESCE({title_col}, '') != ''",
+                "originator IN (?, ?)",
+            ]
+            sql = (
+                f"SELECT id, {title_col}, cwd, {sel_rp}, {sel_rec}, {sel_upd} "
+                f"FROM threads WHERE {' AND '.join(wheres)}"
+            )
+            with contextlib.closing(conn.execute(sql, _CODEX_DESKTOP_ORIGINATORS)) as cur:
+                raw_rows = cur.fetchall()
+    except (sqlite3.Error, OSError):
+        return []
+
+    out: list[_CodexCatalogRow] = []
+    for raw_tid, raw_title, raw_cwd, raw_rp, raw_rec, raw_upd in raw_rows:
+        tid = str(raw_tid or "").strip()
+        title = str(raw_title or "").strip()
+        if not tid or not title:
+            continue
+        cwd_str = str(raw_cwd or "").strip()
+        out.append(
+            _CodexCatalogRow(
+                thread_id=tid,
+                display_title=title,
+                is_local=bool(cwd_str),
+                cwd=cwd_str,
+                rollout_path=str(raw_rp or "").strip(),
+                recency_ts=_parse_iso_timestamp(raw_rec),
+                updated_ts=_parse_iso_timestamp(raw_upd),
+            )
+        )
+    return out
+
+
+def _collect_codex_title_candidates(
+    rows: Sequence[_CodexCatalogRow], search_titles: Sequence[str]
+) -> list[tuple[_CodexCatalogRow, bool]]:
+    """Collect all rows matching any title variant by exact title or truncated prefix.
+
+    Merges both tiers before cloud veto and cross-repo uniqueness checks so any candidate
+    that could explain the displayed title participates in safety vetoes; exact matches
+    still rank ahead of truncated prefix matches after all safety checks pass.
+    """
+    by_idx: dict[int, tuple[_CodexCatalogRow, bool]] = {}
+    for raw_t in search_titles:
+        t = (raw_t or "").strip()
+        if not t:
+            continue
+        trunc_prefix = _compute_trunc_prefix(t)
+        for idx, row in enumerate(rows):
+            if row.display_title == t:
+                by_idx[idx] = (row, True)
+            elif (
+                idx not in by_idx
+                and trunc_prefix
+                and row.display_title.startswith(trunc_prefix)
+                and len(row.display_title) > len(trunc_prefix)
+            ):
+                by_idx[idx] = (row, False)
+    return list(by_idx.values())
+
+
+def resolve_codex_desktop_session_by_title(
+    window_title: str,
+    *,
+    home: Path | None = None,
+    wsl: bool | None = None,
+    env: Mapping[str, str] | None = None,
+) -> SessionMatch | None:
+    """Resolve a local-repo Codex Desktop thread by window title via ``~/.codex/sqlite/codex.db`` (or ``state_5.sqlite`` fallback).
+
+    Explicitly returns ``None`` whenever any matching candidate is a cloud/non-local conversation
+    or when local candidates span multiple distinct repositories.
+    """
+    win_title = (window_title or "").strip()
+    if not win_title or win_title.lower() in _CODEX_DESKTOP_REJECT_TITLES:
+        return None
+    eff_env = os.environ if env is None else env
+    eff_home = home if home is not None else Path((eff_env.get("HOME") or "").strip() or Path.home())
+    eff_wsl = _effective_is_wsl(wsl, env)
+
+    safe_codex_dir = _resolve_safe_local_dir(str(eff_home / ".codex"), wsl=eff_wsl)
+    if not safe_codex_dir:
+        return None
+    codex_dir = Path(safe_codex_dir)
+
+    codex_db_path = codex_dir / "sqlite" / "codex.db"
+    if os.path.lexists(codex_db_path):
+        # Present codex.db is authoritative: lock/corruption/missing columns must fail closed (never bypass cloud veto).
+        rows = _query_codex_catalog_rows(codex_db_path, wsl=eff_wsl)
+    else:
+        rows = _query_codex_state_desktop_rows(codex_dir / "state_5.sqlite", wsl=eff_wsl)
+    if not rows:
+        return None
+
+    search_titles = [win_title]
+    stripped_title = _strip_trailing_app_suffix(win_title, _CODEX_DESKTOP_APP_SUFFIXES)
+    if (
+        stripped_title
+        and stripped_title != win_title
+        and stripped_title.lower() not in _CODEX_DESKTOP_REJECT_TITLES
+    ):
+        search_titles.append(stripped_title)
+
+    pool = _collect_codex_title_candidates(rows, search_titles)
+    if not pool:
+        return None
+    # Cloud / non-local veto takes priority over recency and exact-vs-prefix across all matched candidates.
+    if any(not row.is_local for row, _ in pool):
+        return None
+
+    # Require all matched local candidates to converge to a single validated local workspace directory.
+    validated: list[tuple[_CodexCatalogRow, bool, str]] = []
+    distinct_cwds: set[str] = set()
+    for row, is_exact in pool:
+        safe_cwd = _validate_codex_local_cwd(row.cwd, home=eff_home, wsl=eff_wsl)
+        if not safe_cwd:
+            return None
+        validated.append((row, is_exact, safe_cwd))
+        distinct_cwds.add(safe_cwd)
+    if len(distinct_cwds) != 1:
+        return None
+
+    chosen, _, safe_cwd = max(
+        validated,
+        key=lambda item: (
+            1 if item[1] else 0,
+            item[0].recency_ts or item[0].updated_ts,
+            item[0].updated_ts,
+        ),
+    )
+
+    resolved = _resolve_codex_rollout_for_thread(
+        codex_dir,
+        chosen.thread_id,
+        explicit_rollout_path=chosen.rollout_path,
+        wsl=eff_wsl,
+    )
+    if resolved is None:
+        return None
+    rp_path, rp_stat = resolved
+    return SessionMatch(
+        cli="codex",
+        session_id=chosen.thread_id,
+        jsonl_path=str(rp_path),
+        cwd=safe_cwd,
+        matched_by="codex_desktop_db",
+        jsonl_mtime=rp_stat.st_mtime,
     )
 
 
