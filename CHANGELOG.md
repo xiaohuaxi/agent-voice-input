@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **First-class DeepSeek official ASR provider (`asr.provider = "deepseek"`)**: Added built-in DeepSeek Stage 1 speech recognition (`POST https://api.deepseek.com/v1/tools/asr`, default display model `deepseek-asr`, `asr.api = "auto"` only, automatic detection across 21 languages without hotword/language parameters), enabling zero-config two-stage dictation (`deepseek-asr` + `deepseek-flash`) with a single `DEEPSEEK_API_KEY`, and included `deepseek` in `asr.provider = "auto"` priority.
+- **Unified ChatGPT / Codex desktop app detection**: Added dedicated `ai_chat` recognition for the unified ChatGPT/Codex desktop app (`com.openai.codex` / legacy `com.openai.chat` on macOS; `ChatGPT.exe` / `Codex.exe` on Windows) with streaming-title drift handling and window-locked anti-crosstalk.
+- **Bilingual compatibility & verification status matrices (`✅` / `🧪` / `⚪`)**: Added explicit hardware-verified (`✅`), CI/unit-tested (`🧪`), and generic fallback (`⚪`) matrices across host platforms, terminals, SSH hosts, desktop apps, and model providers in `README.md` and `README.zh-CN.md`.
+
+### Fixed
+- **Bilingual README accuracy & boundary clarifications**: Corrected native Linux scope to offline file transcription (`once --file <wav> --dry-run`) and headless SSH remote targets only (no native daemon, hotkey, or `toggle` yet), clarified that zero-clipboard `tmux` direct injection applies only on macOS (WSL2 uses `win_shim` transient clipboard snapshots + shortcut paste without clobbering clipboard contents), documented official OpenAI single-hop audio models (`gpt-audio-1.5` / `gpt-audio-mini`), and explicitly stated IDE integrated terminal boundaries (`coding_gui` workspace context without CLI `sync_session` or split-pane distinction).
+
 ## [0.13.0] - 2026-11-23
 
 ### Added
