@@ -9138,5 +9138,1764 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
             plat_frozen.close()
 
 
+class ControlProbeAndSelftestWavTests(unittest.TestCase):
+    @staticmethod
+    def _write_codex_rollout(
+        path: Path,
+        sid: str,
+        cwd: str,
+        turns: list[tuple[str, str]],
+        *,
+        source: object = "cli",
+    ) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            json.dumps(
+                {"type": "session_meta", "payload": {"id": sid, "cwd": cwd, "source": source}},
+                ensure_ascii=False,
+            )
+        ]
+        for role, text in turns:
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": role,
+                            "content": [
+                                {
+                                    "type": "input_text" if role == "user" else "output_text",
+                                    "text": text,
+                                }
+                            ],
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_selftest_wav_no_telemetry_dry_run_redline_and_routing_mask(self) -> None:
+        from agent_voice_input.audio_proc import get_failed_audio_dir
+        from agent_voice_input.config import AudioConfig
+        from agent_voice_input.refiner import BaseRefiner, build_refiner_context_chunks
+
+        class _CtxTrackingRefiner(BaseRefiner):
+            provider_name = "deepseek"
+
+            def __init__(self, cfg: Config) -> None:
+                self._cfg = cfg
+
+            def refine(
+                self,
+                asr: AsrResult,
+                *,
+                session_key: str = "",
+                tracker: object = None,
+                fallback_context: str = "",
+                mode: str = "agent",
+                workspace_cwd: str = "",
+                target_hint: str = "",
+                **kw: object,
+            ) -> RefinerResult:
+                del target_hint, kw
+                blocks = (
+                    []
+                    if mode == "general"
+                    else build_refiner_context_chunks(
+                        self._cfg,
+                        session_key=session_key,
+                        tracker=tracker,  # type: ignore[arg-type]
+                        fallback_context=fallback_context,
+                        workspace_cwd=workspace_cwd,
+                    )[0]
+                )
+                return RefinerResult(
+                    text=f"refined:{asr.text}",
+                    provider="deepseek",
+                    model="deepseek-chat",
+                    latency_ms=3,
+                    context_chars=sum(len(b) for b in blocks),
+                    context_chunks=len(blocks),
+                )
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "private_home"
+            rt = tmp / "rt"
+            cache = tmp / "cache"
+            repo = home / "secret_parent" / "alpha-repo"
+            repo.mkdir(parents=True)
+            rt.mkdir(mode=0o700)
+            cache.mkdir(mode=0o700)
+
+            full_sid = "abcd1234-5678-90ef-1111-222233334444"
+            rollout = self._write_codex_rollout(
+                home / ".codex" / "sessions" / "2026" / "11" / "23" / f"rollout-2026-11-23T10-00-00-{full_sid}.jsonl",
+                full_sid,
+                str(repo),
+                [
+                    ("user", "请排查 PRIVATE_SELFTEST_DIALOG_5511 的路由问题"),
+                    ("assistant", "已确认 alpha-repo 上下文"),
+                ],
+            )
+            write_session_registry_entry(
+                rt,
+                cli="codex",
+                session_id=full_sid,
+                cwd=str(repo),
+                jsonl_path=str(rollout),
+                pid=os.getpid(),
+            )
+
+            env = {
+                "HOME": str(home),
+                "XDG_CACHE_HOME": str(cache),
+                "XDG_RUNTIME_DIR": str(rt),
+            }
+            cfg = Config(
+                audio=AudioConfig(save_recordings=True),
+                refiner=RefinerConfig(provider="deepseek"),
+            )
+            plat = _FakePlatform()
+            tracker = SessionTracker(home_dir=home, runtime_dir=rt, proc_root=tmp / "empty_proc", env=env)
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("原始语音文本"),
+                refiner=_CtxTrackingRefiner(cfg),
+                tracker=tracker,
+            )
+            try:
+                wav_file = tmp / "sample.wav"
+                wav_file.write_bytes(_voiced_wav())
+
+                # 1. no_telemetry=True + hostile dry_run=False / no_paste=False attempt
+                resp = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "process": "WindowsTerminal.exe",
+                        "title": "codex [#abcd1234]",
+                        "no_telemetry": True,
+                        "dry_run": False,
+                        "no_paste": False,
+                    }
+                )
+                self.assertTrue(resp["ok"], resp)
+                self.assertEqual(resp["seq_id"], 0)
+                self.assertEqual(resp["final_text"], "refined:原始语音文本")
+                # Zero telemetry / state pollution
+                self.assertEqual(daemon.seq_id, 0)
+                self.assertEqual(daemon.last_result, {})
+                self.assertEqual(list(daemon.recent_results), [])
+                self.assertFalse(daemon.telemetry_path.exists())
+                # Dry-run redline enforced: zero paste, HUD, beep, failed/, recordings/
+                self.assertEqual(plat.deliveries, [])
+                self.assertEqual(plat.huds, [])
+                self.assertEqual(plat.beeps, [])
+                self.assertFalse(get_failed_audio_dir(rt, create=False).exists())
+                rec_dir = cache / "agent-voice-input" / "recordings"
+                self.assertEqual(list(rec_dir.glob("*")) if rec_dir.exists() else [], [])
+
+                # Masked routing summary: no full path, no full UUID, no dialog text
+                routing = resp["routing"]
+                self.assertEqual(routing["mode"], "agent")
+                self.assertEqual(routing["session_key_masked"], "codex:abcd1234")
+                self.assertEqual(routing["workspace_name"], "alpha-repo")
+                self.assertGreater(routing["ctx_chars"], 0)
+                self.assertGreaterEqual(routing["ctx_chunks"], 1)
+                self.assertEqual(routing["ctx_fallback"], "")
+                routing_json = json.dumps(routing, ensure_ascii=False)
+                self.assertNotIn("secret_parent", routing_json)
+                self.assertNotIn(str(repo), routing_json)
+                self.assertNotIn(full_sid, routing_json)
+                self.assertNotIn("PRIVATE_SELFTEST_DIALOG_5511", routing_json)
+
+                # 2. Default no_telemetry=False stays backwards compatible
+                resp_legacy = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "process": "WindowsTerminal.exe",
+                        "title": "codex [#abcd1234]",
+                    }
+                )
+                self.assertTrue(resp_legacy["ok"], resp_legacy)
+                self.assertEqual(resp_legacy["seq_id"], 1)
+                self.assertEqual(daemon.seq_id, 1)
+                self.assertEqual(daemon.last_result.get("seq_id"), 1)
+                self.assertEqual(len(daemon.recent_results), 1)
+                self.assertTrue(daemon.telemetry_path.is_file())
+                self.assertEqual(resp_legacy["routing"]["session_key_masked"], "codex:abcd1234")
+            finally:
+                daemon.close()
+
+    def test_selftest_wav_use_live_window_vs_default(self) -> None:
+        class _CountingWindowPlatform(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fg = ForegroundWindow(hwnd=77, process="WeChat.exe", title="Alice")
+                self.fg_calls = 0
+
+            def get_foreground_window(self) -> ForegroundWindow:
+                self.fg_calls += 1
+                return self.fg
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            plat = _CountingWindowPlatform()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=tmp,
+                platform=plat,
+                asr_provider=_FakeAsr("测试文本"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(tmp),
+            )
+            try:
+                wav_file = tmp / "sample.wav"
+                wav_file.write_bytes(_voiced_wav())
+
+                # Default use_live_window=False -> empty ForegroundWindow(), never calls get_foreground_window()
+                r_default = daemon.handle_control(
+                    {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True}
+                )
+                self.assertTrue(r_default["ok"])
+                self.assertEqual(plat.fg_calls, 0)
+                self.assertEqual(r_default["routing"]["mode"], "agent")
+
+                # Explicit non-bool string "false" must NOT enable use_live_window
+                r_str = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "no_telemetry": True,
+                        "use_live_window": "false",
+                    }
+                )
+                self.assertTrue(r_str["ok"])
+                self.assertEqual(plat.fg_calls, 0)
+
+                # use_live_window=True with no window fields -> calls get_foreground_window() (WeChat -> general)
+                r_live = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "no_telemetry": True,
+                        "use_live_window": True,
+                    }
+                )
+                self.assertTrue(r_live["ok"])
+                self.assertEqual(plat.fg_calls, 1)
+                self.assertEqual(r_live["routing"]["mode"], "general")
+
+                # use_live_window=True WITH explicit window field -> explicit window wins, no live lookup
+                r_explicit = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "process": "WindowsTerminal.exe",
+                        "no_telemetry": True,
+                        "use_live_window": True,
+                    }
+                )
+                self.assertTrue(r_explicit["ok"])
+                self.assertEqual(plat.fg_calls, 1)
+                self.assertEqual(r_explicit["routing"]["mode"], "agent")
+
+                # Missing wav_path error
+                r_missing = daemon.handle_control({"cmd": "selftest_wav", "wav_path": ""})
+                self.assertFalse(r_missing["ok"])
+                self.assertIn("wav_path not found", r_missing["error"])
+            finally:
+                daemon.close()
+
+    def test_selftest_wav_nonblocking_control_plane_busy_latch_and_shutdown(self) -> None:
+        from agent_voice_input.http_transport import CancelToken
+
+        class _GateAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.cancelled_seen = threading.Event()
+
+            def transcribe(
+                self,
+                wav_bytes: bytes,
+                context: AsrContext | None = None,
+                *,
+                is_cancelled: object = None,
+                cancel_token: CancelToken | None = None,
+            ) -> AsrResult:
+                del wav_bytes, context
+                ev = threading.Event()
+                if cancel_token is not None:
+                    cancel_token.bind_event(ev)
+                try:
+                    self.entered.set()
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline:
+                        if ev.is_set() or (callable(is_cancelled) and is_cancelled()):
+                            self.cancelled_seen.set()
+                            raise AsrError("ASR cancelled")
+                        if self.release.is_set():
+                            return AsrResult("慢速自检文本", "dashscope", "mock", 12)
+                        ev.wait(timeout=0.01)
+                    return AsrResult("timeout", "dashscope", "mock", 12)
+                finally:
+                    if cancel_token is not None:
+                        cancel_token.unbind_event(ev)
+
+        with tempfile.TemporaryDirectory(prefix="avi-st-", dir="/tmp") as td:
+            rt = Path(td)
+            os.chmod(rt, 0o700)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            asr = _GateAsr()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            plat = _FakePlatform()
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=asr,
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            try:
+                _wait_for_control_socket(rt)
+
+                # 1. Start slow selftest_wav in background client thread
+                r1_box: list[dict[str, object]] = []
+
+                def _run_c1() -> None:
+                    r1_box.append(
+                        send_control_command(
+                            rt,
+                            {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                            timeout_sec=5.0,
+                        )
+                    )
+
+                c1_th = threading.Thread(target=_run_c1, daemon=True)
+                c1_th.start()
+                self.assertTrue(asr.entered.wait(timeout=2.0), "client 1 never entered ASR")
+
+                # 2. While selftest_wav is blocked in ASR: status & probe_route reply in ms, 2nd selftest_wav gets busy!
+                t_st0 = time.monotonic()
+                st_resp = send_control_command(rt, {"cmd": "status"}, timeout_sec=1.0)
+                self.assertTrue(st_resp.get("ok"), st_resp)
+                self.assertLess(time.monotonic() - t_st0, 0.5)
+
+                t_pr0 = time.monotonic()
+                pr_resp = send_control_command(
+                    rt,
+                    {"cmd": "probe_route", "process": "WeChat.exe", "title": "Alice"},
+                    timeout_sec=1.0,
+                )
+                self.assertTrue(pr_resp.get("ok"), pr_resp)
+                self.assertEqual(pr_resp.get("mode"), "general")
+                self.assertLess(time.monotonic() - t_pr0, 0.5)
+
+                t_busy0 = time.monotonic()
+                busy_resp = send_control_command(
+                    rt,
+                    {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                    timeout_sec=1.0,
+                )
+                self.assertFalse(busy_resp.get("ok"))
+                self.assertEqual(busy_resp.get("error"), "selftest_wav busy")
+                self.assertLess(time.monotonic() - t_busy0, 0.5)
+
+                # 3. Release Client 1 and immediately fire sequential Client 3 -> no false busy!
+                asr.release.set()
+                c1_th.join(timeout=3.0)
+                self.assertEqual(len(r1_box), 1)
+                self.assertTrue(r1_box[0].get("ok"), r1_box[0])
+                self.assertEqual(r1_box[0].get("final_text"), "慢速自检文本")
+
+                r3 = send_control_command(
+                    rt,
+                    {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                    timeout_sec=2.0,
+                )
+                self.assertTrue(r3.get("ok"), r3)
+
+                # 4. Shutdown while selftest_wav is in flight -> cancels cleanly, joins without hang
+                asr.entered.clear()
+                asr.release.clear()
+                r4_box: list[dict[str, object]] = []
+
+                def _run_c4() -> None:
+                    try:
+                        r4_box.append(
+                            send_control_command(
+                                rt,
+                                {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                                timeout_sec=3.0,
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                c4_th = threading.Thread(target=_run_c4, daemon=True)
+                c4_th.start()
+                self.assertTrue(asr.entered.wait(timeout=2.0))
+
+                t_shut0 = time.monotonic()
+                shut_resp = send_control_command(rt, {"cmd": "shutdown"}, timeout_sec=2.0)
+                self.assertTrue(shut_resp.get("ok"), shut_resp)
+                srv_th.join(timeout=3.0)
+                self.assertFalse(srv_th.is_alive(), "serve_forever did not exit promptly on shutdown")
+                self.assertLess(time.monotonic() - t_shut0, 2.5)
+                self.assertTrue(asr.cancelled_seen.wait(timeout=1.0))
+                c4_th.join(timeout=2.0)
+
+                # Post-shutdown direct control calls cleanly rejected
+                post_st = daemon.handle_control({"cmd": "selftest_wav", "wav_path": str(wav_file)})
+                self.assertFalse(post_st["ok"])
+                self.assertEqual(post_st["error"], "daemon stopping")
+                post_pr = daemon.handle_control({"cmd": "probe_route"})
+                self.assertFalse(post_pr["ok"])
+                self.assertEqual(post_pr["error"], "daemon stopping")
+            finally:
+                asr.release.set()
+                daemon.close()
+                srv_th.join(timeout=2.0)
+
+    def test_probe_route_matrix_zero_cost_read_only_and_isolation(self) -> None:
+        import contextlib
+        import sqlite3
+        from agent_voice_input.refiner import BaseRefiner
+
+        class _NeverCallAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **kw: object) -> AsrResult:
+                del wav_bytes, context, kw
+                self.calls += 1
+                raise AssertionError("probe_route must never invoke ASR")
+
+        class _NeverCallRefiner(BaseRefiner):
+            provider_name = "deepseek"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def refine(self, asr: AsrResult, **kw: object) -> RefinerResult:
+                del asr, kw
+                self.calls += 1
+                raise AssertionError("probe_route must never invoke Refiner")
+
+            def close(self) -> None:
+                pass
+
+        class _LiveCountingPlatform(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fg = ForegroundWindow(hwnd=88, process="WeChat.exe", title="Team Chat")
+                self.fg_calls = 0
+
+            def get_foreground_window(self) -> ForegroundWindow:
+                self.fg_calls += 1
+                return self.fg
+
+        with tempfile.TemporaryDirectory(prefix="avi-pr-", dir="/tmp") as td:
+            tmp = Path(td)
+            os.chmod(tmp, 0o700)
+            home = tmp / "home"
+            rt = tmp / "rt"
+            rt.mkdir(mode=0o700)
+            term_repo = home / "work" / "term-repo"
+            agy_repo = home / "work" / "agy-repo"
+            codex_repo = home / "work" / "codex-repo"
+            for r in (term_repo, agy_repo, codex_repo):
+                r.mkdir(parents=True)
+            (term_repo / "TermRouter.py").write_text("class TermRouter: pass\n", encoding="utf-8")
+            (agy_repo / "AgyKernel.py").write_text("class AgyKernel: pass\n", encoding="utf-8")
+            (codex_repo / "CodexBatcher.py").write_text("class CodexBatcher: pass\n", encoding="utf-8")
+
+            # 1. Terminal Codex session + registry entry
+            term_sid = "abcd1234-1111-2222-3333-444444444444"
+            term_rollout = self._write_codex_rollout(
+                home / ".codex" / "sessions" / "2026" / "11" / "23" / f"rollout-2026-11-23T10-00-00-{term_sid}.jsonl",
+                term_sid,
+                str(term_repo),
+                [
+                    ("user", "请帮我修复 PRIVATE_DIALOG_SENTENCE_9911 在 TermRouter 中的边界问题"),
+                    ("assistant", "已定位 TermRouter 中的问题并给出方案。"),
+                ],
+                source="cli",
+            )
+            write_session_registry_entry(
+                rt,
+                cli="codex",
+                session_id=term_sid,
+                cwd=str(term_repo),
+                jsonl_path=str(term_rollout),
+                pid=os.getpid(),
+            )
+
+            # 2. AGY 2.0 conversation_summaries.db + brain transcript
+            agy_cid = "75ae924a-aaaa-bbbb-cccc-dddddddddddd"
+            ide_root = home / ".gemini" / "antigravity"
+            agy_log = ide_root / "brain" / agy_cid / ".system_generated" / "logs" / "transcript_full.jsonl"
+            agy_log.parent.mkdir(parents=True, exist_ok=True)
+            agy_log.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "source": "USER_EXPLICIT",
+                                "type": "USER_INPUT",
+                                "content": "<USER_REQUEST>Refactor PRIVATE_AGY_BODY_8822 in AgyKernel</USER_REQUEST>",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "source": "MODEL",
+                                "type": "PLANNER_RESPONSE",
+                                "content": "Updating AgyKernel now.",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            agy_db = ide_root / "conversation_summaries.db"
+            with contextlib.closing(sqlite3.connect(str(agy_db))) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT,
+                        source TEXT,
+                        parent_conversation_id TEXT,
+                        nesting_depth INTEGER,
+                        agent_name TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        agy_cid,
+                        "AGY Routing Task",
+                        json.dumps([agy_repo.as_uri()]),
+                        "2026-11-23T10:05:00Z",
+                        "USER_EXPLICIT",
+                        None,
+                        0,
+                        "antigravity",
+                    ),
+                )
+                conn.commit()
+
+            # 3. ChatGPT/Codex desktop SQLite DBs (local repo promotion + cloud chat veto)
+            codex_sid = "01a207c8-9999-8888-7777-666666666666"
+            codex_rollout = self._write_codex_rollout(
+                home / ".codex" / "sessions" / "2026" / "11" / "23" / f"rollout-2026-11-23T10-05-00-{codex_sid}.jsonl",
+                codex_sid,
+                str(codex_repo),
+                [
+                    ("user", "分析 PRIVATE_CODEX_BODY_7733 与 CodexBatcher 吞吐"),
+                    ("assistant", "正在检查 CodexBatcher 实现。"),
+                ],
+                source="vscode",
+            )
+            state_db = home / ".codex" / "state_5.sqlite"
+            with contextlib.closing(sqlite3.connect(str(state_db))) as sconn:
+                sconn.execute(
+                    """
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        name TEXT,
+                        cwd TEXT,
+                        rollout_path TEXT,
+                        originator TEXT,
+                        archived INTEGER DEFAULT 0,
+                        recency_at_ms INTEGER,
+                        updated_at INTEGER
+                    )
+                    """
+                )
+                sconn.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        codex_sid,
+                        "Refactor QuartzBatcher",
+                        str(codex_repo),
+                        str(codex_rollout),
+                        "Codex Desktop",
+                        0,
+                        1_760_000_100_000,
+                        1_760_000_100,
+                    ),
+                )
+                sconn.commit()
+            codex_db = home / ".codex" / "sqlite" / "codex.db"
+            codex_db.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(str(codex_db))) as cconn:
+                cconn.execute(
+                    """
+                    CREATE TABLE local_thread_catalog (
+                        thread_id TEXT,
+                        display_title TEXT,
+                        source_kind TEXT,
+                        host_id TEXT,
+                        cwd TEXT,
+                        missing_candidate INTEGER DEFAULT 0,
+                        source_recency_at TEXT,
+                        updated_at INTEGER
+                    )
+                    """
+                )
+                cconn.executemany(
+                    "INSERT INTO local_thread_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (codex_sid, "Refactor QuartzBatcher", "codex", "local", str(codex_repo), 0, "2026-11-23T10:05:00Z", 1_760_000_100),
+                        (None, "Weekend Travel Plan", "chatgpt", "chatgpt:u1", None, 0, "2026-11-23T12:00:00Z", 1_760_000_900),
+                    ],
+                )
+                cconn.commit()
+
+            env = {"HOME": str(home), "XDG_RUNTIME_DIR": str(rt)}
+            cfg = Config(refiner=RefinerConfig(provider="deepseek"))
+            asr = _NeverCallAsr()
+            refiner = _NeverCallRefiner()
+            plat = _LiveCountingPlatform()
+            tracker = SessionTracker(home_dir=home, runtime_dir=rt, proc_root=tmp / "empty_proc", env=env)
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=asr,
+                refiner=refiner,
+                tracker=tracker,
+            )
+            try:
+                all_resps: list[dict[str, object]] = []
+                # Pre-populate one real session in production tracker to prove probe_route never touches it
+                pre_snap = tracker.sync_session(window_title="codex [#abcd1234]")
+                self.assertIsNotNone(pre_snap)
+                term_key = f"codex:{term_sid}"
+                self.assertIn(term_key, tracker._states)
+                prod_keys_before = list(tracker._states.keys())
+                term_turns_before = list(tracker._states[term_key].clean_turns)
+
+                # a) Terminal session hit
+                r_term = daemon.handle_control(
+                    {"cmd": "probe_route", "process": "WindowsTerminal.exe", "title": "codex [#abcd1234]"}
+                )
+                all_resps.append(r_term)
+                self.assertTrue(r_term["ok"])
+                self.assertEqual(r_term["window_category"], "terminal")
+                self.assertEqual(r_term["mode"], "agent")
+                self.assertTrue(r_term["should_sync"])
+                self.assertEqual(r_term["hotwords_scope"], "coding")
+                self.assertGreater(r_term["hotword_count"], 0)
+                self.assertEqual(r_term["session_key_masked"], "codex:abcd1234")
+                self.assertTrue(r_term["matched_by"])
+                self.assertFalse(r_term["remote_vetoed"])
+                self.assertEqual(r_term["workspace_name"], "term-repo")
+                self.assertGreater(r_term["ctx_chars"], 0)
+                self.assertGreaterEqual(r_term["ctx_chunks"], 1)
+                self.assertGreaterEqual(r_term["sync_ms"], 0)
+
+                # b) AGY 2.0 ide_db_title hit
+                r_agy = daemon.handle_control(
+                    {"cmd": "probe_route", "process": "Antigravity.exe", "title": "AGY Routing Task"}
+                )
+                all_resps.append(r_agy)
+                self.assertTrue(r_agy["ok"])
+                self.assertEqual(r_agy["window_category"], "coding_gui")
+                self.assertEqual(r_agy["mode"], "agent")
+                self.assertFalse(r_agy["should_sync"])
+                self.assertEqual(r_agy["hotwords_scope"], "coding")
+                self.assertEqual(r_agy["session_key_masked"], "agy:75ae924a")
+                self.assertEqual(r_agy["matched_by"], "ide_db_title")
+                self.assertFalse(r_agy["remote_vetoed"])
+                self.assertEqual(r_agy["workspace_name"], "agy-repo")
+                self.assertGreater(r_agy["ctx_chars"], 0)
+                self.assertGreaterEqual(r_agy["ctx_chunks"], 1)
+
+                # c) ChatGPT/Codex desktop local repo dynamic promotion to agent + coding
+                r_cdx_local = daemon.handle_control(
+                    {"cmd": "probe_route", "process": "ChatGPT.exe", "title": "Refactor QuartzBatcher"}
+                )
+                all_resps.append(r_cdx_local)
+                self.assertTrue(r_cdx_local["ok"])
+                self.assertEqual(r_cdx_local["window_category"], "general_gui")
+                self.assertEqual(r_cdx_local["mode"], "agent")
+                self.assertFalse(r_cdx_local["should_sync"])
+                self.assertEqual(r_cdx_local["target_app_hint"], "")
+                self.assertEqual(r_cdx_local["hotwords_scope"], "coding")
+                self.assertEqual(r_cdx_local["session_key_masked"], "codex:01a207c8")
+                self.assertEqual(r_cdx_local["matched_by"], "codex_desktop_db")
+                self.assertFalse(r_cdx_local["remote_vetoed"])
+                self.assertEqual(r_cdx_local["workspace_name"], "codex-repo")
+                self.assertGreater(r_cdx_local["ctx_chars"], 0)
+                self.assertGreaterEqual(r_cdx_local["ctx_chunks"], 1)
+
+                # d) ChatGPT/Codex desktop cloud chat veto stays general
+                r_cdx_cloud = daemon.handle_control(
+                    {"cmd": "probe_route", "process": "ChatGPT.exe", "title": "Weekend Travel Plan"}
+                )
+                all_resps.append(r_cdx_cloud)
+                self.assertTrue(r_cdx_cloud["ok"])
+                self.assertEqual(r_cdx_cloud["window_category"], "general_gui")
+                self.assertEqual(r_cdx_cloud["mode"], "general")
+                self.assertFalse(r_cdx_cloud["should_sync"])
+                self.assertEqual(r_cdx_cloud["session_key_masked"], "")
+                self.assertEqual(r_cdx_cloud["matched_by"], "")
+                self.assertFalse(r_cdx_cloud["remote_vetoed"])
+                self.assertEqual(r_cdx_cloud["workspace_name"], "")
+                self.assertEqual(r_cdx_cloud["ctx_chars"], 0)
+                self.assertEqual(r_cdx_cloud["ctx_chunks"], 0)
+
+                # e) general_gui hard isolation from background CLI sessions
+                r_wechat = daemon.handle_control(
+                    {"cmd": "probe_route", "process": "WeChat.exe", "title": "Alice"}
+                )
+                all_resps.append(r_wechat)
+                self.assertTrue(r_wechat["ok"])
+                self.assertEqual(r_wechat["window_category"], "general_gui")
+                self.assertEqual(r_wechat["mode"], "general")
+                self.assertFalse(r_wechat["should_sync"])
+                self.assertEqual(r_wechat["target_app_hint"], "im_chat")
+                self.assertEqual(r_wechat["hotwords_scope"], "chat")
+                self.assertEqual(r_wechat["session_key_masked"], "")
+                self.assertEqual(r_wechat["matched_by"], "")
+                self.assertFalse(r_wechat["remote_vetoed"])
+                self.assertEqual(r_wechat["workspace_name"], "")
+                self.assertEqual(r_wechat["ctx_chars"], 0)
+                self.assertEqual(r_wechat["ctx_chunks"], 0)
+
+                # f) SSH Phase 0 veto (terminal remote host tag + remote IDE window)
+                r_ssh = daemon.handle_control(
+                    {
+                        "cmd": "probe_route",
+                        "process": "WindowsTerminal.exe",
+                        "title": "[@prod-box] codex [#abcd1234]",
+                        "cwd": str(term_repo),
+                    }
+                )
+                all_resps.append(r_ssh)
+                self.assertTrue(r_ssh["ok"])
+                self.assertEqual(r_ssh["window_category"], "terminal")
+                self.assertTrue(r_ssh["should_sync"])
+                self.assertTrue(r_ssh["remote_vetoed"])
+                self.assertEqual(r_ssh["session_key_masked"], "")
+                self.assertEqual(r_ssh["workspace_name"], "")
+                self.assertEqual(r_ssh["ctx_chars"], 0)
+                self.assertEqual(r_ssh["ctx_chunks"], 0)
+
+                r_rem_ide = daemon.handle_control(
+                    {
+                        "cmd": "probe_route",
+                        "process": "Code.exe",
+                        "title": "main.py - term-repo [SSH: prod-box] - Visual Studio Code",
+                    }
+                )
+                all_resps.append(r_rem_ide)
+                self.assertTrue(r_rem_ide["ok"])
+                self.assertEqual(r_rem_ide["window_category"], "coding_gui")
+                self.assertEqual(r_rem_ide["mode"], "agent")
+                self.assertFalse(r_rem_ide["should_sync"])
+                self.assertTrue(r_rem_ide["remote_vetoed"])
+                self.assertEqual(r_rem_ide["session_key_masked"], "")
+                self.assertEqual(r_rem_ide["workspace_name"], "")
+
+                # g) use_live_window=False vs True
+                self.assertEqual(plat.fg_calls, 0)
+                r_empty = daemon.handle_control({"cmd": "probe_route"})
+                all_resps.append(r_empty)
+                self.assertEqual(plat.fg_calls, 0)
+                self.assertEqual(r_empty["mode"], "general")
+                r_live = daemon.handle_control({"cmd": "probe_route", "use_live_window": True})
+                all_resps.append(r_live)
+                self.assertEqual(plat.fg_calls, 1)
+                self.assertEqual(r_live["target_app_hint"], "im_chat")
+
+                # h) Global redlines: zero ASR/Refiner/telemetry/state/UI/path/dialog leakage & tracker isolation
+                self.assertEqual(asr.calls, 0)
+                self.assertEqual(refiner.calls, 0)
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(daemon.seq_id, 0)
+                self.assertEqual(daemon.last_result, {})
+                self.assertEqual(list(daemon.recent_results), [])
+                self.assertFalse(daemon.telemetry_path.exists())
+                self.assertEqual(plat.deliveries, [])
+                self.assertEqual(plat.huds, [])
+                self.assertEqual(plat.beeps, [])
+                self.assertEqual(list(tracker._states.keys()), prod_keys_before)
+                self.assertEqual(list(tracker._states[term_key].clean_turns), term_turns_before)
+
+                for resp in all_resps:
+                    blob = json.dumps(resp, ensure_ascii=False)
+                    for forbidden in (
+                        str(home),
+                        str(term_repo),
+                        str(agy_repo),
+                        str(codex_repo),
+                        term_sid,
+                        agy_cid,
+                        codex_sid,
+                        "PRIVATE_DIALOG_SENTENCE_9911",
+                        "PRIVATE_AGY_BODY_8822",
+                        "PRIVATE_CODEX_BODY_7733",
+                    ):
+                        self.assertNotIn(forbidden, blob)
+            finally:
+                daemon.close()
+
+    def test_selftest_wav_deliver_validation_rejects_unsafe_or_non_bool(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            wav_file = tmp / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            plat = _FakePlatform()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=tmp,
+                platform=plat,
+                asr_provider=_FakeAsr("绝不应投递"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(tmp),
+            )
+            try:
+                # 1. Non-bool deliver values rejected strictly
+                for bad_val in ("true", "false", 1, 0, None):
+                    r_bad = daemon.handle_control(
+                        {
+                            "cmd": "selftest_wav",
+                            "wav_path": str(wav_file),
+                            "use_live_window": True,
+                            "deliver": bad_val,
+                        }
+                    )
+                    self.assertFalse(r_bad["ok"], f"expected rejection for deliver={bad_val!r}")
+                    self.assertIn("boolean", str(r_bad.get("error", "")))
+
+                # 2. deliver=True without use_live_window=True rejected
+                r_no_live = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "deliver": True,
+                    }
+                )
+                self.assertFalse(r_no_live["ok"])
+                self.assertEqual(
+                    r_no_live["error"],
+                    "deliver requires use_live_window=true without window overrides",
+                )
+
+                # 3. deliver=True with use_live_window=True + virtual window override rejected
+                for override in (
+                    {"process": "WindowsTerminal.exe"},
+                    {"title": "codex [#abcd1234]"},
+                    {"hwnd": 123},
+                ):
+                    r_override = daemon.handle_control(
+                        {
+                            "cmd": "selftest_wav",
+                            "wav_path": str(wav_file),
+                            "use_live_window": True,
+                            "deliver": True,
+                            **override,
+                        }
+                    )
+                    self.assertFalse(r_override["ok"], f"expected rejection for override={override!r}")
+                    self.assertEqual(
+                        r_override["error"],
+                        "deliver requires use_live_window=true without window overrides",
+                    )
+
+                self.assertEqual(plat.deliveries, [])
+                self.assertEqual(daemon.seq_id, 0)
+                self.assertFalse(daemon.telemetry_path.exists())
+            finally:
+                daemon.close()
+
+    def test_selftest_wav_deliver_live_window_real_delivery_and_focus_drift(self) -> None:
+        from agent_voice_input.audio_proc import get_failed_audio_dir
+        from agent_voice_input.config import AudioConfig
+
+        class _DeliverCapturePlatform(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fg = ForegroundWindow(hwnd=321, process="WindowsTerminal.exe", title="codex")
+                self.fg_calls = 0
+                self.delivered_origins: list[ForegroundWindow | None] = []
+                self.suppress_beep_args: list[object] = []
+
+            def get_foreground_window(self) -> ForegroundWindow:
+                self.fg_calls += 1
+                return self.fg
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                origin_window: ForegroundWindow | None = None,
+                suppress_beep: object = False,
+                **kw: object,
+            ) -> PasteOutcome:
+                del kw
+                self.delivered_origins.append(origin_window)
+                self.suppress_beep_args.append(suppress_beep)
+                self.deliveries.append((text, seq_id, target_hwnd))
+                return self.paste_outcome
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            rt = tmp / "rt"
+            cache = tmp / "cache"
+            rt.mkdir(mode=0o700)
+            cache.mkdir(mode=0o700)
+            wav_file = tmp / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+
+            plat = _DeliverCapturePlatform()
+            cfg = Config(
+                audio=AudioConfig(save_recordings=True),
+                refiner=RefinerConfig(provider="off"),
+            )
+            env = {"XDG_CACHE_HOME": str(cache), "XDG_RUNTIME_DIR": str(rt)}
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("真实桌面落字测试"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                # 1. Explicit deliver=True + use_live_window=True + no_telemetry=True -> real delivery
+                r_ok = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "use_live_window": True,
+                        "deliver": True,
+                        "no_telemetry": True,
+                    }
+                )
+                self.assertTrue(r_ok["ok"], r_ok)
+                self.assertEqual(r_ok["seq_id"], 0)
+                self.assertTrue(r_ok["pasted"])
+                self.assertTrue(r_ok["clipboard"])
+                self.assertEqual(r_ok["paste_reason"], "ok")
+                self.assertEqual(r_ok["delivery_status"], "pasted")
+                self.assertTrue(r_ok["summary"]["pasted"])
+                self.assertEqual(r_ok["summary"]["delivery_status"], "pasted")
+                self.assertNotIn("dry_run", r_ok["summary"])
+                self.assertEqual(plat.fg_calls, 1)
+                self.assertEqual(len(plat.deliveries), 1)
+                self.assertEqual(plat.deliveries[0], ("真实桌面落字测试", 0, 321))
+                self.assertEqual(plat.delivered_origins[0], plat.fg)
+                self.assertIs(plat.suppress_beep_args[0], True)
+
+                # 2. Focus drift during deliver=True safely falls back to clipboard (copied)
+                plat.paste_outcome = PasteOutcome(False, True, "focus_changed", "Notepad.exe")
+                r_drift = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "use_live_window": True,
+                        "deliver": True,
+                        "no_telemetry": True,
+                    }
+                )
+                self.assertTrue(r_drift["ok"], r_drift)
+                self.assertFalse(r_drift["pasted"])
+                self.assertTrue(r_drift["clipboard"])
+                self.assertEqual(r_drift["paste_reason"], "focus_changed")
+                self.assertEqual(r_drift["delivery_status"], "copied")
+
+                # 3. Delivery failure during deliver=True never stashes to failed/ or recordings/
+                plat.paste_outcome = PasteOutcome(False, False, "paste_failed", "WindowsTerminal.exe")
+                r_fail = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "use_live_window": True,
+                        "deliver": True,
+                        "no_telemetry": True,
+                    }
+                )
+                self.assertFalse(r_fail["ok"])
+                self.assertFalse(r_fail["pasted"])
+                self.assertFalse(r_fail["clipboard"])
+                self.assertEqual(r_fail["delivery_status"], "undelivered_unrecoverable")
+
+                # Global zero-pollution invariants across all 3 deliver=True runs
+                self.assertEqual(daemon.seq_id, 0)
+                self.assertEqual(daemon.last_result, {})
+                self.assertEqual(list(daemon.recent_results), [])
+                self.assertFalse(daemon.telemetry_path.exists())
+                self.assertEqual(plat.huds, [])
+                self.assertEqual(plat.beeps, [])
+                self.assertFalse(get_failed_audio_dir(rt, create=False).exists())
+                rec_dir = cache / "agent-voice-input" / "recordings"
+                self.assertEqual(list(rec_dir.glob("*")) if rec_dir.exists() else [], [])
+            finally:
+                daemon.close()
+
+    def test_selftest_wav_live_window_pinned_before_wav_gate_and_rejects_empty_window(self) -> None:
+        from agent_voice_input import daemon as daemon_mod
+
+        events: list[str] = []
+        win_a = ForegroundWindow(hwnd=101, process="WindowsTerminal.exe", title="codex")
+        win_b = ForegroundWindow(hwnd=202, process="Notepad.exe", title="other")
+
+        class _DriftPlatform(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fg = win_a
+                self.seen_origin: ForegroundWindow | None = None
+                self.seen_suppress_beep: object = None
+
+            def get_foreground_window(self) -> ForegroundWindow:
+                events.append("get_fg")
+                return self.fg
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                origin_window: ForegroundWindow | None = None,
+                suppress_beep: object = False,
+                **kw: object,
+            ) -> PasteOutcome:
+                del text, seq_id, target_hwnd, kw
+                events.append("deliver_text")
+                self.seen_origin = origin_window
+                self.seen_suppress_beep = suppress_beep
+                if origin_window is None or origin_window.hwnd != self.fg.hwnd:
+                    return PasteOutcome(False, True, "focus_changed", self.fg.process)
+                return PasteOutcome(True, True, "ok", self.fg.process, used_clipboard_paste=True)
+
+        class _OrderAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **kw: object) -> AsrResult:
+                del wav_bytes, context, kw
+                self.calls += 1
+                events.append("asr")
+                return AsrResult("切窗测试文本", "dashscope", "mock", 5)
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            plat = _DriftPlatform()
+            asr = _OrderAsr()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=asr,
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            orig_process_wav = daemon_mod.process_wav
+
+            def _tracked_process_wav(*args: object, **kwargs: object) -> object:
+                events.append("process_wav")
+                # User switches to Window B while WAV gating runs!
+                plat.fg = win_b
+                return orig_process_wav(*args, **kwargs)  # type: ignore[arg-type]
+
+            try:
+                with unittest.mock.patch.object(daemon_mod, "process_wav", side_effect=_tracked_process_wav):
+                    r_drift = daemon.handle_control(
+                        {
+                            "cmd": "selftest_wav",
+                            "wav_path": str(wav_file),
+                            "use_live_window": True,
+                            "deliver": True,
+                            "no_telemetry": True,
+                        }
+                    )
+                self.assertTrue(r_drift["ok"], r_drift)
+                self.assertEqual(events, ["get_fg", "process_wav", "asr", "deliver_text"])
+                self.assertEqual(plat.seen_origin, win_a)
+                self.assertIs(plat.seen_suppress_beep, True)
+                self.assertFalse(r_drift["pasted"])
+                self.assertTrue(r_drift["clipboard"])
+                self.assertEqual(r_drift["paste_reason"], "focus_changed")
+                self.assertEqual(r_drift["delivery_status"], "copied")
+
+                # Empty live foreground window must be rejected immediately on deliver=True
+                events.clear()
+                asr_before = asr.calls
+                plat.fg = ForegroundWindow()
+                r_empty = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "use_live_window": True,
+                        "deliver": True,
+                        "no_telemetry": True,
+                    }
+                )
+                self.assertFalse(r_empty["ok"])
+                self.assertEqual(r_empty["error"], "no live foreground window")
+                self.assertEqual(events, ["get_fg"])
+                self.assertEqual(asr.calls, asr_before)
+            finally:
+                daemon.close()
+
+    def test_selftest_wav_deliver_serializes_with_main_dictation_and_respects_clipboard_settle(self) -> None:
+        now = [100.0]
+        sleeps: list[float] = []
+
+        def _clock() -> float:
+            return now[0]
+
+        def _sleep(sec: float) -> None:
+            sleeps.append(sec)
+            now[0] += sec
+
+        main_in_deliver = threading.Event()
+        release_main = threading.Event()
+        in_flight = [0]
+        max_concurrent = [0]
+        deliver_order: list[str] = []
+        suppress_beeps: dict[str, object] = {}
+        obs_lock = threading.Lock()
+
+        class _SerialDeliverPlatform(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fg = ForegroundWindow(hwnd=505, process="WindowsTerminal.exe", title="codex")
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                origin_window: ForegroundWindow | None = None,
+                suppress_beep: object = False,
+                before_clipboard_write: object = None,
+                before_commit: object = None,
+                **kw: object,
+            ) -> PasteOutcome:
+                del target_hwnd, origin_window, kw
+                with obs_lock:
+                    in_flight[0] += 1
+                    if in_flight[0] > max_concurrent[0]:
+                        max_concurrent[0] = in_flight[0]
+                try:
+                    if callable(before_clipboard_write):
+                        before_clipboard_write()
+                    if callable(before_commit) and not before_commit():
+                        return PasteOutcome(False, False, "cancelled", "")
+                    tag = "selftest" if seq_id == 0 else "main"
+                    with obs_lock:
+                        suppress_beeps[tag] = suppress_beep
+                        deliver_order.append(f"{tag}_start")
+                    if tag == "main":
+                        main_in_deliver.set()
+                        release_main.wait(timeout=3.0)
+                    with obs_lock:
+                        deliver_order.append(f"{tag}_end")
+                    return PasteOutcome(True, True, "ok", "WindowsTerminal.exe", used_clipboard_paste=True)
+                finally:
+                    with obs_lock:
+                        in_flight[0] -= 1
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            plat = _SerialDeliverPlatform()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("串行投递测试"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+                clock_fn=_clock,
+                sleep_fn=_sleep,
+                paste_settle_sec=0.15,
+            )
+            try:
+                daemon.handle_trigger("toggle")
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                self.assertTrue(main_in_deliver.wait(timeout=2.0), "main dictation did not enter deliver_text")
+
+                st_res: list[dict[str, object]] = []
+
+                def _run_st() -> None:
+                    st_res.append(
+                        daemon.handle_control(
+                            {
+                                "cmd": "selftest_wav",
+                                "wav_path": str(wav_file),
+                                "use_live_window": True,
+                                "deliver": True,
+                                "no_telemetry": True,
+                            }
+                        )
+                    )
+
+                st_th = threading.Thread(target=_run_st, daemon=True)
+                st_th.start()
+                time.sleep(0.08)
+                # selftest must still be blocked behind _deliver_lock until main finishes
+                self.assertEqual(max_concurrent[0], 1)
+                self.assertEqual(deliver_order, ["main_start"])
+
+                release_main.set()
+                st_th.join(timeout=3.0)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.state != "idle":
+                    time.sleep(0.01)
+
+                self.assertEqual(max_concurrent[0], 1)
+                self.assertEqual(deliver_order, ["main_start", "main_end", "selftest_start", "selftest_end"])
+                self.assertEqual(len(st_res), 1)
+                self.assertTrue(st_res[0]["ok"], st_res[0])
+                self.assertTrue(st_res[0]["pasted"])
+                self.assertIs(suppress_beeps["selftest"], True)
+                self.assertGreaterEqual(sum(sleeps), 0.149)
+            finally:
+                release_main.set()
+                daemon.close()
+
+    def test_probe_route_isolated_tracker_does_not_pollute_ide_disambiguation(self) -> None:
+        from agent_voice_input.daemon import _Stage1State, _resolve_stage1_context
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            rt = tmp / "rt"
+            rt.mkdir(mode=0o700)
+            # Real workspace under ~/repos/dup-proj
+            real_repo = home / "repos" / "dup-proj"
+            real_repo.mkdir(parents=True)
+            # Separate unrelated dir with the SAME basename used only by virtual probe_route
+            probe_repo = tmp / "sandbox_other" / "dup-proj"
+            probe_repo.mkdir(parents=True)
+
+            probe_sid = "1234abcd-1111-2222-3333-444444444444"
+            probe_rollout = self._write_codex_rollout(
+                home / ".codex" / "sessions" / "2026" / "11" / "23" / f"rollout-2026-11-23T10-00-00-{probe_sid}.jsonl",
+                probe_sid,
+                str(probe_repo),
+                [("user", "sandbox probe turn")],
+            )
+            write_session_registry_entry(
+                rt,
+                cli="codex",
+                session_id=probe_sid,
+                cwd=str(probe_repo),
+                jsonl_path=str(probe_rollout),
+                pid=os.getpid(),
+            )
+
+            env = {"HOME": str(home), "XDG_RUNTIME_DIR": str(rt)}
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            plat = _FakePlatform()
+            tracker = SessionTracker(home_dir=home, runtime_dir=rt, proc_root=tmp / "empty_proc", env=env)
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("ok"),
+                refiner=create_refiner(cfg),
+                tracker=tracker,
+            )
+            try:
+                self.assertEqual(dict(daemon.tracker._states), {})
+                r_probe = daemon.handle_control(
+                    {
+                        "cmd": "probe_route",
+                        "process": "WindowsTerminal.exe",
+                        "title": "codex [#1234abcd]",
+                    }
+                )
+                self.assertTrue(r_probe["ok"], r_probe)
+                self.assertEqual(r_probe["session_key_masked"], "codex:1234abcd")
+                self.assertEqual(r_probe["workspace_name"], "dup-proj")
+                # Production tracker MUST have zero state pollution!
+                self.assertEqual(dict(daemon.tracker._states), {})
+                self.assertEqual(daemon.tracker.active_session_cwds(), [])
+
+                # Real VS Code IDE window with same basename resolves cleanly to ~/repos/dup-proj
+                ide_st = _Stage1State(t_total0=time.monotonic())
+                _resolve_stage1_context(
+                    ide_st,
+                    cfg=cfg,
+                    env=env,
+                    tracker=daemon.tracker,
+                    platform=plat,
+                    origin_window=ForegroundWindow(
+                        hwnd=99,
+                        process="Code.exe",
+                        title="main.py - dup-proj - Visual Studio Code",
+                    ),
+                    window_title_override=None,
+                    audio_source="live",
+                    explicit_mode="auto",
+                    cancel_check=None,
+                    attach_single_hop=False,
+                )
+                self.assertEqual(os.path.realpath(ide_st.workspace_cwd), os.path.realpath(real_repo))
+            finally:
+                daemon.close()
+
+    def test_close_joins_inflight_control_thread_before_closing_refiner_and_tracker(self) -> None:
+        from agent_voice_input.http_transport import CancelToken
+        from agent_voice_input.refiner import BaseRefiner
+
+        order: list[str] = []
+        entered_refine = threading.Event()
+
+        class _OrderedBlockingRefiner(BaseRefiner):
+            provider_name = "deepseek"
+
+            def refine(
+                self,
+                asr: AsrResult,
+                *,
+                cancel_token: CancelToken | None = None,
+                is_cancelled: object = None,
+                **kw: object,
+            ) -> RefinerResult:
+                del kw
+                ev = threading.Event()
+                if cancel_token is not None:
+                    cancel_token.bind_event(ev)
+                try:
+                    entered_refine.set()
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline:
+                        if ev.is_set() or (callable(is_cancelled) and is_cancelled()):
+                            time.sleep(0.05)
+                            order.append("control_exited_refine")
+                            return RefinerResult(asr.text, "deepseek", "mock", 1, "shutdown")
+                        ev.wait(timeout=0.01)
+                    return RefinerResult(asr.text, "deepseek", "mock", 1, "")
+                finally:
+                    if cancel_token is not None:
+                        cancel_token.unbind_event(ev)
+
+            def close(self) -> None:
+                order.append("refiner_close")
+
+        with tempfile.TemporaryDirectory(prefix="avi-cl-", dir="/tmp") as td:
+            rt = Path(td)
+            os.chmod(rt, 0o700)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            tracker = _isolated_tracker(rt)
+            orig_tr_close = tracker.close
+
+            def _tracked_tr_close() -> None:
+                order.append("tracker_close")
+                orig_tr_close()
+
+            tracker.close = _tracked_tr_close  # type: ignore[method-assign]
+            cfg = Config(refiner=RefinerConfig(provider="deepseek"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("关闭顺序测试"),
+                refiner=_OrderedBlockingRefiner(),
+                tracker=tracker,
+            )
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            client_th: threading.Thread | None = None
+            try:
+                _wait_for_control_socket(rt)
+
+                def _call_st() -> None:
+                    try:
+                        send_control_command(
+                            rt,
+                            {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                            timeout_sec=4.0,
+                        )
+                    except Exception:
+                        pass
+
+                client_th = threading.Thread(target=_call_st, daemon=True)
+                client_th.start()
+                self.assertTrue(entered_refine.wait(timeout=2.0), "selftest_wav never entered refine")
+
+                daemon.close()
+                srv_th.join(timeout=3.0)
+                client_th.join(timeout=2.0)
+
+                self.assertIn("control_exited_refine", order)
+                self.assertIn("refiner_close", order)
+                self.assertIn("tracker_close", order)
+                self.assertLess(order.index("control_exited_refine"), order.index("refiner_close"))
+                self.assertLess(order.index("control_exited_refine"), order.index("tracker_close"))
+            finally:
+                daemon.close()
+                srv_th.join(timeout=2.0)
+                if client_th is not None:
+                    client_th.join(timeout=2.0)
+
+    def test_probe_route_and_selftest_sanitize_untrusted_matched_by_and_session_key(self) -> None:
+        import hashlib
+        from agent_voice_input.session_ctx import SessionSnapshot
+        from agent_voice_input.workspace_ctx import SessionMatch
+
+        class _UntrustedStubTracker:
+            def __init__(self, snap: SessionSnapshot) -> None:
+                self._snap = snap
+                self.home = Path("/tmp")
+                self.proc_root = None
+                self.last_sync_remote_vetoed = False
+                self.last_sync_target_drifted = False
+
+            def sync_session(self, **kw: object) -> SessionSnapshot:
+                del kw
+                return self._snap
+
+            def build_asr_context(
+                self,
+                snapshot: SessionSnapshot | None,
+                *,
+                extra_hotwords: object = (),
+                mode: str = "agent",
+                language: str = "auto",
+            ) -> AsrContext:
+                del snapshot, extra_hotwords, language
+                return AsrContext(hotwords=("demo",), mode=mode)
+
+            def get_refiner_context_with_prior(self, *args: object, **kw: object) -> tuple[str, list[str], str]:
+                del args, kw
+                return "", [], ""
+
+            def get_state(self, key: str) -> None:
+                del key
+                return None
+
+            def active_session_cwds(self) -> list[str]:
+                return []
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            expected_hash = hashlib.sha256(b"/a/b").hexdigest()[:8]
+
+            for origin, expected_mb in (("remote", "remote"), ("local", "other")):
+                bad_match = SessionMatch(
+                    cli="codex",
+                    session_id="/a/b",
+                    jsonl_path="",
+                    cwd="",
+                    matched_by="/demo/work",
+                    origin=origin,
+                    host_name="box1" if origin == "remote" else "",
+                )
+                bad_snap = SessionSnapshot(
+                    match=bad_match,
+                    clean_turns=(),
+                    luna_synced_idx=0,
+                    generation=1,
+                    git_status="",
+                    hotwords=(),
+                    byte_offset=0,
+                )
+                cfg = Config(refiner=RefinerConfig(provider="off"))
+                daemon = VoiceInputDaemon(
+                    cfg,
+                    env={},
+                    runtime_dir=rt,
+                    platform=_FakePlatform(),
+                    asr_provider=_FakeAsr("安全脱敏文本"),
+                    refiner=create_refiner(cfg),
+                    tracker=_UntrustedStubTracker(bad_snap),  # type: ignore[arg-type]
+                )
+                try:
+                    r_pr = daemon.handle_control(
+                        {
+                            "cmd": "probe_route",
+                            "process": "WindowsTerminal.exe",
+                            "title": "codex",
+                        }
+                    )
+                    self.assertTrue(r_pr["ok"], r_pr)
+                    self.assertEqual(r_pr["matched_by"], expected_mb)
+                    self.assertEqual(r_pr["session_key_masked"], f"codex:{expected_hash}")
+                    pr_blob = json.dumps(r_pr, ensure_ascii=False)
+                    self.assertNotIn("/demo/work", pr_blob)
+                    self.assertNotIn("/a/b", pr_blob)
+
+                    r_st = daemon.handle_control(
+                        {
+                            "cmd": "selftest_wav",
+                            "wav_path": str(wav_file),
+                            "process": "WindowsTerminal.exe",
+                            "title": "codex",
+                            "no_telemetry": True,
+                        }
+                    )
+                    self.assertTrue(r_st["ok"], r_st)
+                    self.assertEqual(r_st["routing"]["session_key_masked"], f"codex:{expected_hash}")
+                    st_routing_blob = json.dumps(r_st["routing"], ensure_ascii=False)
+                    self.assertNotIn("/demo/work", st_routing_blob)
+                    self.assertNotIn("/a/b", st_routing_blob)
+                finally:
+                    daemon.close()
+
+    def test_probe_route_uses_readonly_active_cwds_snapshot_without_mutating_tracker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            rt = tmp / "rt"
+            rt.mkdir(mode=0o700)
+            # Non-default workspace path outside ~/repos, ~/projects, etc.
+            custom_repo = tmp / "nondefault_vault" / "stealth-ide-proj"
+            custom_repo.mkdir(parents=True)
+
+            term_sid = "abcd5678-1111-2222-3333-444444444444"
+            term_rollout = self._write_codex_rollout(
+                home / ".codex" / "sessions" / "2026" / "11" / "23" / f"rollout-2026-11-23T11-00-00-{term_sid}.jsonl",
+                term_sid,
+                str(custom_repo),
+                [("user", "work in nondefault vault")],
+            )
+            write_session_registry_entry(
+                rt,
+                cli="codex",
+                session_id=term_sid,
+                cwd=str(custom_repo),
+                jsonl_path=str(term_rollout),
+                pid=os.getpid(),
+            )
+
+            env = {"HOME": str(home), "XDG_RUNTIME_DIR": str(rt)}
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            # Verify that without an active terminal session in tracker, IDE lookup does not find the nondefault dir
+            cold_tracker = SessionTracker(home_dir=home, runtime_dir=rt, proc_root=tmp / "empty_proc", env=env)
+            cold_daemon = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("ok"),
+                refiner=create_refiner(cfg),
+                tracker=cold_tracker,
+            )
+            try:
+                r_cold = cold_daemon.handle_control(
+                    {
+                        "cmd": "probe_route",
+                        "process": "Code.exe",
+                        "title": "app.py - stealth-ide-proj - Visual Studio Code",
+                    }
+                )
+                self.assertTrue(r_cold["ok"], r_cold)
+                self.assertEqual(r_cold["workspace_name"], "")
+            finally:
+                cold_daemon.close()
+
+            # Production tracker has synced the active terminal session in custom_repo
+            prod_tracker = SessionTracker(home_dir=home, runtime_dir=rt, proc_root=tmp / "empty_proc", env=env)
+            snap = prod_tracker.sync_session(window_title="codex [#abcd5678]")
+            self.assertIsNotNone(snap)
+            self.assertEqual(
+                [os.path.realpath(c) for c in prod_tracker.active_session_cwds()],
+                [os.path.realpath(custom_repo)],
+            )
+            before_states = {
+                k: (
+                    v.session_id,
+                    v.cwd,
+                    v.byte_offset,
+                    v.generation,
+                    v.cold_start_prior_checked,
+                    v.cold_start_prior_hotwords_checked,
+                )
+                for k, v in prod_tracker._states.items()
+            }
+
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("ok"),
+                refiner=create_refiner(cfg),
+                tracker=prod_tracker,
+            )
+            try:
+                r_ide = daemon.handle_control(
+                    {
+                        "cmd": "probe_route",
+                        "process": "Code.exe",
+                        "title": "app.py - stealth-ide-proj - Visual Studio Code",
+                    }
+                )
+                self.assertTrue(r_ide["ok"], r_ide)
+                self.assertEqual(r_ide["mode"], "agent")
+                self.assertEqual(r_ide["workspace_name"], "stealth-ide-proj")
+                after_states = {
+                    k: (
+                        v.session_id,
+                        v.cwd,
+                        v.byte_offset,
+                        v.generation,
+                        v.cold_start_prior_checked,
+                        v.cold_start_prior_hotwords_checked,
+                    )
+                    for k, v in daemon.tracker._states.items()
+                }
+                self.assertEqual(after_states, before_states)
+            finally:
+                daemon.close()
+
+    def test_close_skips_refiner_and_tracker_close_when_control_thread_exceeds_join_deadline(self) -> None:
+        from unittest import mock
+        from agent_voice_input.refiner import BaseRefiner
+
+        entered = threading.Event()
+        release_stuck = threading.Event()
+        closed_components: list[str] = []
+
+        class _StuckRefiner(BaseRefiner):
+            provider_name = "deepseek"
+
+            def refine(self, asr: AsrResult, **kw: object) -> RefinerResult:
+                del kw
+                entered.set()
+                release_stuck.wait(timeout=5.0)
+                return RefinerResult(asr.text, "deepseek", "mock", 1, "shutdown")
+
+            def close(self) -> None:
+                closed_components.append("refiner")
+
+        with tempfile.TemporaryDirectory(prefix="avi-stuck-", dir="/tmp") as td:
+            rt = Path(td)
+            os.chmod(rt, 0o700)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            tracker = _isolated_tracker(rt)
+            orig_tr_close = tracker.close
+
+            def _tracked_tr_close() -> None:
+                closed_components.append("tracker")
+                orig_tr_close()
+
+            tracker.close = _tracked_tr_close  # type: ignore[method-assign]
+            plat = _FakePlatform()
+            orig_plat_close = plat.close
+
+            def _tracked_plat_close() -> None:
+                closed_components.append("platform")
+                orig_plat_close()
+
+            plat.close = _tracked_plat_close  # type: ignore[method-assign]
+
+            cfg = Config(refiner=RefinerConfig(provider="deepseek"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("卡死控制线程"),
+                refiner=_StuckRefiner(),
+                tracker=tracker,
+            )
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            client_th: threading.Thread | None = None
+            try:
+                _wait_for_control_socket(rt)
+
+                def _call_st() -> None:
+                    try:
+                        send_control_command(
+                            rt,
+                            {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                            timeout_sec=4.0,
+                        )
+                    except Exception:
+                        pass
+
+                client_th = threading.Thread(target=_call_st, daemon=True)
+                client_th.start()
+                self.assertTrue(entered.wait(timeout=2.0), "selftest_wav never entered stuck refine")
+
+                with mock.patch("agent_voice_input.daemon._CLOSE_JOIN_TIMEOUT_SEC", 0.08):
+                    t0 = time.monotonic()
+                    daemon.close()
+                    elapsed = time.monotonic() - t0
+
+                self.assertLess(elapsed, 1.5, "close() must stay bounded when a control thread hangs")
+                self.assertNotIn("refiner", closed_components)
+                self.assertNotIn("tracker", closed_components)
+                self.assertIn("platform", closed_components)
+            finally:
+                release_stuck.set()
+                srv_th.join(timeout=3.0)
+                if client_th is not None:
+                    client_th.join(timeout=3.0)
+                # Wait briefly for control thread cleanup, then run clean final close so no resources leak
+                with daemon._lock:
+                    rem_ctrl = list(daemon._control_threads)
+                for th in rem_ctrl:
+                    th.join(timeout=2.0)
+                daemon.close()
+
+
 if __name__ == "__main__":
     unittest.main()

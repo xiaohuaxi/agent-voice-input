@@ -706,16 +706,24 @@ def build_safe_ssh_argv(
 
     is_win_exe = ssh_bin_path.lower().endswith(".exe")
     mux_args: list[str] = []
-    if enable_multiplexing and not is_win_exe:
-        ctl_pat = _resolve_control_socket_pattern(runtime_dir)
-        if ctl_pat:
+    if not is_win_exe:
+        if enable_multiplexing:
+            ctl_pat = _resolve_control_socket_pattern(runtime_dir)
+            if ctl_pat:
+                mux_args = [
+                    "-o",
+                    "ControlMaster=auto",
+                    "-o",
+                    f"ControlPath={ctl_pat}",
+                    "-o",
+                    "ControlPersist=10m",
+                ]
+        else:
             mux_args = [
                 "-o",
-                "ControlMaster=auto",
+                "ControlMaster=no",
                 "-o",
-                f"ControlPath={ctl_pat}",
-                "-o",
-                "ControlPersist=10m",
+                "ControlPath=none",
             ]
 
     eff_conn_to = max(1, min(10, int(connect_timeout_sec)))

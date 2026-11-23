@@ -71,7 +71,14 @@ from .platform_wsl import (
     is_windows_terminal_process,
     is_wsl,
 )
-from .refiner import BaseRefiner, RefinerResult, attach_single_hop_context, create_refiner
+from .refiner import (
+    BaseRefiner,
+    RefinerResult,
+    attach_single_hop_context,
+    build_refiner_context_chunks,
+    create_refiner,
+)
+from .remote_ssh import RemoteSshManager
 from .session_ctx import (
     SessionSnapshot,
     SessionTracker,
@@ -98,6 +105,7 @@ DAEMON_LOG_BACKUP_FILENAME: str = "daemon.log.1"
 DEFAULT_DAEMON_LOG_MAX_BYTES: int = 2 * 1024 * 1024
 _LOG_ROTATE_CHECK_INTERVAL_SEC: float = 60.0
 _FAILED_PRUNE_CHECK_INTERVAL_SEC: float = 3600.0
+_CLOSE_JOIN_TIMEOUT_SEC: float = 3.0
 
 
 def _resolve_effective_ui_language(
@@ -290,6 +298,7 @@ class PipelineResult:
     ctx_chunks: int = 0
     mode: str = "agent"
     ctx_fallback: str = ""
+    workspace_cwd: str = ""
 
 
 def _derive_delivery_status(res: PipelineResult, *, dry_run: bool) -> str:
@@ -568,6 +577,32 @@ def create_platform(cfg: Config, *, env: Mapping[str, str] | None = None) -> Wsl
     return WslPlatform(cfg, env=env)
 
 
+_WINDOW_REQ_KEYS: tuple[str, ...] = (
+    "hwnd",
+    "process",
+    "title",
+    "bundle_id",
+    "surface_id",
+    "tty",
+    "cwd",
+    "pid",
+    "tmux_socket",
+    "tmux_pane",
+    "document",
+)
+
+
+def _has_window_fields(req: Mapping[str, Any]) -> bool:
+    for k in _WINDOW_REQ_KEYS:
+        val = req.get(k)
+        if isinstance(val, str):
+            if val.strip():
+                return True
+        elif val:
+            return True
+    return False
+
+
 def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
     raw_ax = m.get("ax_trusted")
     return ForegroundWindow(
@@ -584,6 +619,102 @@ def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
         tmux_pane=str(m.get("tmux_pane") or ""),
         document=str(m.get("document") or ""),
     )
+
+
+def _resolve_control_origin_window(req: Mapping[str, Any]) -> ForegroundWindow | None:
+    if _has_window_fields(req):
+        return _window_from_mapping(req)
+    if req.get("use_live_window") is True:
+        return None
+    return ForegroundWindow()
+
+
+_SAFE_SESSION_ID_CHARS: frozenset[str] = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+)
+_KNOWN_MATCHED_BY: frozenset[str] = frozenset(
+    {
+        "registry",
+        "title_uuid",
+        "title_prefix",
+        "tty_registry",
+        "tty_ps",
+        "proc_scan",
+        "recent_root",
+        "tmux",
+        "tmux_pane",
+        "tmux_registry",
+        "tmux_pane_title",
+        "tmux_proc_scan",
+        "ide_brain",
+        "ide_db_title",
+        "codex_desktop_db",
+        "explicit",
+        "remote",
+        "remote_ssh",
+        "remote_cache",
+        "remote_whitelist",
+        "remote_proc",
+        "remote_registry",
+        "remote_title_token",
+        "remote_cwd",
+        "remote_cwd_only",
+        "remote_tmux_title",
+        "remote_tmux_proc",
+    }
+)
+
+
+def _is_safe_session_token(val: str) -> bool:
+    return bool(val) and all(ch in _SAFE_SESSION_ID_CHARS for ch in val)
+
+
+def _mask_session_token(raw_id: str) -> str:
+    if _is_safe_session_token(raw_id):
+        return raw_id[:8]
+    return hashlib.sha256(raw_id.encode("utf-8", errors="replace")).hexdigest()[:8]
+
+
+def _mask_session_key(snap: SessionSnapshot | None) -> str:
+    if snap is None:
+        return ""
+    m = getattr(snap, "match", None)
+    cli = str(getattr(m, "cli", "") or "").strip()
+    sid = str(getattr(m, "session_id", "") or "").strip()
+    if cli and sid:
+        safe_cli = cli if _is_safe_session_token(cli) else "other"
+        return f"{safe_cli}:{_mask_session_token(sid)}"
+    raw = str(getattr(snap, "session_key", "") or "").strip()
+    if not raw:
+        return ""
+    prefix, sep, tail = raw.rpartition(":")
+    if sep:
+        safe_cli = prefix if _is_safe_session_token(prefix) else "other"
+        return f"{safe_cli}:{_mask_session_token(tail)}"
+    return _mask_session_token(raw)
+
+
+def _sanitize_matched_by(snap: SessionSnapshot | None) -> str:
+    if snap is None:
+        return ""
+    m = getattr(snap, "match", None)
+    raw = str(getattr(m, "matched_by", "") or "").strip()
+    if not raw:
+        return ""
+    if raw in _KNOWN_MATCHED_BY:
+        return raw
+    is_remote = str(getattr(m, "origin", "") or "").strip().lower() == "remote" or bool(
+        str(getattr(m, "host_name", "") or "").strip()
+    )
+    return "remote" if is_remote else "other"
+
+
+def _workspace_basename(cwd: str) -> str:
+    cleaned = (cwd or "").replace("\\", "/").strip().rstrip("/")
+    if not cleaned:
+        return ""
+    name = Path(cleaned).name
+    return "" if (not name or name.endswith(":")) else name
 
 
 def _may_run_stage2_refiner(
@@ -912,6 +1043,21 @@ def _transcribe_wav_chunks(
     )
 
 
+def _classify_window_for_platform(win: ForegroundWindow, platform: Any) -> str:
+    if not (win.process or win.bundle_id):
+        return "general_gui"
+    checker = getattr(platform, "is_allowed_terminal", None)
+    is_term = (
+        (lambda w: bool(checker(w)))
+        if checker is not None
+        else (
+            lambda w: is_windows_terminal_process(w.process)
+            or is_macos_terminal_window(w.process, w.bundle_id)
+        )
+    )
+    return classify_window_category(win, is_terminal=is_term)
+
+
 def _resolve_pipeline_window_routing(
     win: ForegroundWindow,
     *,
@@ -939,16 +1085,7 @@ def _resolve_pipeline_window_routing(
         ):
             return True, "agent"
         return False, "general"
-    checker = getattr(platform, "is_allowed_terminal", None)
-    is_term = (
-        (lambda w: bool(checker(w)))
-        if checker is not None
-        else (
-            lambda w: is_windows_terminal_process(w.process)
-            or is_macos_terminal_window(w.process, w.bundle_id)
-        )
-    )
-    cat = classify_window_category(win, is_terminal=is_term)
+    cat = _classify_window_for_platform(win, platform)
     if cat == "terminal":
         return True, "agent"
     if cat == "coding_gui":
@@ -974,10 +1111,14 @@ class _Stage1State:
     gate_ms: int = 0
     switched_fallback: bool = False
     win: ForegroundWindow = field(default_factory=ForegroundWindow)
+    window_category: str = "general_gui"
+    should_sync: bool = False
     eff_mode: str = "agent"
     snap: SessionSnapshot | None = None
     workspace_cwd: str = ""
     target_hint: str = ""
+    hotwords_scope: str = "global"
+    remote_vetoed: bool = False
     asr_ctx_dialog: str = ""
     sync_ms: int = 0
     prep_ms: int = 0
@@ -1115,87 +1256,30 @@ def _make_pipeline_result(
         ctx_chunks=refined.context_chunks if refined else 0,
         mode=st.eff_mode,
         ctx_fallback=eff_ctx_fb,
+        workspace_cwd=st.workspace_cwd,
     )
 
 
-def _execute_stage1(
+def _resolve_stage1_context(
     st: _Stage1State,
-    raw_wav: bytes | str | Path,
     *,
     cfg: Config,
     env: Mapping[str, str],
     tracker: SessionTracker,
-    eff_asr: BaseAsrProvider,
-    eff_refiner: BaseRefiner,
     platform: Any,
     origin_window: ForegroundWindow | None,
     window_title_override: str | None,
     audio_source: str,
     explicit_mode: str,
-    seq_id: int,
-    max_chunk_sec: float | None,
-    is_current_seq: Callable[[int], bool] | None,
-    is_cancelled: Callable[[], bool] | None,
-    cancel_token: CancelToken | None,
     cancel_check: Callable[[], bool] | None,
-    cancel_reason_fn: Callable[[], str],
-    archive_sink: Callable[[threading.Thread], None] | None,
-) -> None:
-    if isinstance(raw_wav, (bytes, bytearray)) and len(raw_wav) == 0:
-        if c_rsn := cancel_reason_fn():
-            st.skipped_reason = c_rsn
-        else:
-            st.switched_fallback = (
-                bool(platform and platform.switch_to_fallback_audio())
-                if audio_source in ("pulse", "winmm")
-                else False
-            )
-            st.skipped_reason = "empty_audio"
-        return
-
-    t_gate0 = time.monotonic()
-    gate = process_wav(raw_wav, cfg.audio)
-    st.gate = gate
-    st.gate_ms = _elapsed_ms(t_gate0)
-    if not gate.passed:
-        if c_rsn := cancel_reason_fn():
-            st.skipped_reason = c_rsn
-        else:
-            st.switched_fallback = bool(
-                gate.all_zero
-                and gate.reason == "silence"
-                and audio_source == "pulse"
-                and platform
-                and platform.switch_to_fallback_audio()
-            )
-            st.skipped_reason = gate.reason
-        return
-
-    if c_rsn := cancel_reason_fn():
-        st.skipped_reason = c_rsn
-        return
-
-    if cfg.audio.save_recordings and audio_source not in ("retry", "selftest_wav") and archive_sink is not None:
-        try:
-            arch_bytes = (
-                bytes(raw_wav)
-                if isinstance(raw_wav, (bytes, bytearray, memoryview))
-                else (Path(raw_wav).read_bytes() or gate.wav_bytes)
-            )
-            if (
-                arch_th := spawn_recording_archive(
-                    arch_bytes,
-                    resolve_saved_recordings_dir(env),
-                    max_count=cfg.audio.save_recordings_max_count,
-                )
-            ) is not None:
-                archive_sink(arch_th)
-        except Exception:
-            pass
-
+    attach_single_hop: bool = False,
+    known_cwds_override: Sequence[str] | None = None,
+) -> Any:
+    """Shared real window routing, session/IDE/desktop context resolution, and hotwords builder."""
     t_sync0 = time.monotonic()
     win = origin_window or (platform.get_foreground_window() if platform else ForegroundWindow())
     st.win = win
+    st.window_category = _classify_window_for_platform(win, platform)
     should_sync, eff_mode = _resolve_pipeline_window_routing(
         win,
         platform=platform,
@@ -1204,7 +1288,9 @@ def _execute_stage1(
         audio_source=audio_source,
         explicit_mode=explicit_mode,
     )
+    st.should_sync = should_sync
     st.eff_mode = eff_mode
+    st.remote_vetoed = False
     extra_hw: list[str] = []
     origin_drifted = bool(win.origin_drifted and window_title_override is None)
     if should_sync and not origin_drifted:
@@ -1250,11 +1336,12 @@ def _execute_stage1(
                 },
             )
         )
+        st.remote_vetoed = bool(getattr(tracker, "last_sync_remote_vetoed", False))
         if (
             st.snap is None
             and window_title_override is None
             and win.cwd
-            and not getattr(tracker, "last_sync_remote_vetoed", False)
+            and not st.remote_vetoed
             and not getattr(tracker, "last_sync_target_drifted", False)
         ):
             eff_wsl = _effective_is_wsl(env=env)
@@ -1276,12 +1363,15 @@ def _execute_stage1(
                         st.ctx_fallback = "prior_hotwords"
     elif not origin_drifted and eff_mode == "agent" and (win.process or win.bundle_id):
         is_agy_ide = is_antigravity_ide_window(win)
+        is_rem_ide = is_remote_ide_window(win)
+        if is_rem_ide:
+            st.remote_vetoed = True
         skip_legacy_agy = bool(
             is_agy_ide
             and not (getattr(win, "document", "") or "").strip()
             and (win.title or "").strip().lower() in _AGY_DESKTOP_REJECT_TITLES
         )
-        if is_agy_ide and not is_remote_ide_window(win) and not skip_legacy_agy:
+        if is_agy_ide and not is_rem_ide and not skip_legacy_agy:
             ide_match = resolve_antigravity_ide_session_by_title(
                 win.title, home=tracker.home, env=env
             )
@@ -1295,7 +1385,11 @@ def _execute_stage1(
             st.workspace_cwd = resolve_ide_workspace_cwd(
                 win,
                 home=tracker.home,
-                known_cwds=tracker.active_session_cwds(),
+                known_cwds=(
+                    known_cwds_override
+                    if known_cwds_override is not None
+                    else tracker.active_session_cwds()
+                ),
                 env=env,
             )
             if st.workspace_cwd and is_agy_ide:
@@ -1356,6 +1450,7 @@ def _execute_stage1(
         mode=eff_mode,
         has_agent_session=(st.snap is not None),
     )
+    st.hotwords_scope = hw_scope
     has_hw_file = bool(cfg.asr.hotwords_file.strip())
     manual_hw = (
         load_hotwords_file(cfg.asr.hotwords_file, env=env, scene=hw_scope)
@@ -1373,7 +1468,7 @@ def _execute_stage1(
     if st.target_hint:
         asr_ctx.target_hint = st.target_hint
     st.asr_ctx_dialog = asr_ctx.dialog_text
-    if _is_single_hop_asr_provider(eff_asr):
+    if attach_single_hop:
         asr_ctx = attach_single_hop_context(
             cfg,
             asr_ctx,
@@ -1388,6 +1483,101 @@ def _execute_stage1(
         ):
             st.ctx_fallback = "prior_session"
     st.sync_ms = _elapsed_ms(t_sync0)
+    return asr_ctx
+
+
+def _execute_stage1(
+    st: _Stage1State,
+    raw_wav: bytes | str | Path,
+    *,
+    cfg: Config,
+    env: Mapping[str, str],
+    tracker: SessionTracker,
+    eff_asr: BaseAsrProvider,
+    eff_refiner: BaseRefiner,
+    platform: Any,
+    origin_window: ForegroundWindow | None,
+    window_title_override: str | None,
+    audio_source: str,
+    explicit_mode: str,
+    seq_id: int,
+    max_chunk_sec: float | None,
+    is_current_seq: Callable[[int], bool] | None,
+    is_cancelled: Callable[[], bool] | None,
+    cancel_token: CancelToken | None,
+    cancel_check: Callable[[], bool] | None,
+    cancel_reason_fn: Callable[[], str],
+    archive_sink: Callable[[threading.Thread], None] | None,
+) -> None:
+    if isinstance(raw_wav, (bytes, bytearray)) and len(raw_wav) == 0:
+        if c_rsn := cancel_reason_fn():
+            st.skipped_reason = c_rsn
+        else:
+            st.switched_fallback = (
+                bool(platform and platform.switch_to_fallback_audio())
+                if audio_source in ("pulse", "winmm")
+                else False
+            )
+            st.skipped_reason = "empty_audio"
+        return
+
+    if c_rsn := cancel_reason_fn():
+        st.skipped_reason = c_rsn
+        return
+
+    t_gate0 = time.monotonic()
+    gate = process_wav(raw_wav, cfg.audio)
+    st.gate = gate
+    st.gate_ms = _elapsed_ms(t_gate0)
+    if not gate.passed:
+        if c_rsn := cancel_reason_fn():
+            st.skipped_reason = c_rsn
+        else:
+            st.switched_fallback = bool(
+                gate.all_zero
+                and gate.reason == "silence"
+                and audio_source == "pulse"
+                and platform
+                and platform.switch_to_fallback_audio()
+            )
+            st.skipped_reason = gate.reason
+        return
+
+    if c_rsn := cancel_reason_fn():
+        st.skipped_reason = c_rsn
+        return
+
+    if cfg.audio.save_recordings and audio_source not in ("retry", "selftest_wav") and archive_sink is not None:
+        try:
+            arch_bytes = (
+                bytes(raw_wav)
+                if isinstance(raw_wav, (bytes, bytearray, memoryview))
+                else (Path(raw_wav).read_bytes() or gate.wav_bytes)
+            )
+            if (
+                arch_th := spawn_recording_archive(
+                    arch_bytes,
+                    resolve_saved_recordings_dir(env),
+                    max_count=cfg.audio.save_recordings_max_count,
+                )
+            ) is not None:
+                archive_sink(arch_th)
+        except Exception:
+            pass
+
+    asr_ctx = _resolve_stage1_context(
+        st,
+        cfg=cfg,
+        env=env,
+        tracker=tracker,
+        platform=platform,
+        origin_window=origin_window,
+        window_title_override=window_title_override,
+        audio_source=audio_source,
+        explicit_mode=explicit_mode,
+        cancel_check=cancel_check,
+        attach_single_hop=_is_single_hop_asr_provider(eff_asr),
+    )
 
     if (
         not (cancel_check is not None and cancel_check())
@@ -1443,6 +1633,7 @@ def run_pipeline_once(
     is_cancelled: Callable[[], bool] | None = None,
     cancel_token: CancelToken | None = None,
     deliver_fn: Callable[[str, ForegroundWindow], PasteOutcome] | None = None,
+    deliver_text_fn: Callable[..., PasteOutcome] | None = None,
     on_stage: Callable[[str], None] | None = None,
     runtime_dir: Path | None = None,
     max_chunk_sec: float | None = None,
@@ -1622,7 +1813,7 @@ def run_pipeline_once(
                         )
                 t_deliv0 = time.monotonic()
                 in_delivery = True
-                paste_out = platform.deliver_text(
+                paste_out = (deliver_text_fn or platform.deliver_text)(
                     cand_text,
                     seq_id=seq_id,
                     target_hwnd=deliver_win.hwnd,
@@ -2016,6 +2207,11 @@ class VoiceInputDaemon:
         self._auto_stop_seq, self._auto_stop_ts, self._auto_stop_absorbed = -1, -1e9, False
         self._max_dur_timer: threading.Timer | None = None
         self._archive_threads: set[threading.Thread] = set()
+        self._deliver_lock = threading.Lock()
+        self._selftest_lock = threading.Lock()
+        self._probe_sem = threading.BoundedSemaphore(4)
+        self._control_threads: set[threading.Thread] = set()
+        self._control_cancel_tokens: set[CancelToken] = set()
         self._lock_fd: int | None = None
         self._owns_runtime_files: bool = False
         self._log_max_bytes: int = max(0, int(log_max_bytes))
@@ -3228,6 +3424,12 @@ class VoiceInputDaemon:
             return True
         return False
 
+    def _note_clipboard_paste(self, paste_out: PasteOutcome) -> None:
+        if paste_out.used_clipboard_paste:
+            now_done = self.clock_fn()
+            with self._lock:
+                self._clipboard_busy_until = now_done + self._paste_settle_sec
+
     def _deliver_for_utterance(
         self,
         task: _QueuedUtterance,
@@ -3236,36 +3438,75 @@ class VoiceInputDaemon:
         *,
         same_window_verifier: Callable[[ForegroundWindow], bool] | None = None,
     ) -> PasteOutcome:
-        with self._lock:
-            unpasted_snapshot = list(self._batch_unpasted_clips)
-        fallback_txt = "\n\n".join([*unpasted_snapshot, final_text]) if unpasted_snapshot else None
-        preserve_clip = bool(unpasted_snapshot)
-        extra_deliv_kw: dict[str, Any] = {}
-        if same_window_verifier is not None:
-            extra_deliv_kw["same_window_verifier"] = same_window_verifier
-        paste_out = self.platform.deliver_text(
-            final_text,
-            seq_id=task.seq_id,
-            target_hwnd=origin_win.hwnd,
-            origin_window=origin_win,
-            fallback_clipboard_text=fallback_txt,
-            preserve_clipboard=preserve_clip,
-            suppress_beep=lambda: self._is_recording_or_stopping() or task.silent_hud,
-            is_cancelled=lambda: self._stop_evt.is_set() or task.cancel_token.is_cancelled(),
-            before_clipboard_write=lambda: self._wait_clipboard_settle(task.cancel_token),
-            before_commit=task.cancel_token.try_commit,
-            **extra_deliv_kw,
-        )
-        now_done = self.clock_fn()
-        with self._lock:
-            if paste_out.used_clipboard_paste:
-                self._clipboard_busy_until = now_done + self._paste_settle_sec
-            if paste_out.pasted:
-                if paste_out.used_clipboard_paste or paste_out.clipboard:
-                    self._batch_unpasted_clips.clear()
-            elif paste_out.clipboard:
-                self._batch_unpasted_clips.append(final_text)
-        return paste_out
+        with self._deliver_lock:
+            if self._stop_evt.is_set() or task.cancel_token.is_cancelled():
+                return PasteOutcome(False, False, "cancelled", "")
+            with self._lock:
+                unpasted_snapshot = list(self._batch_unpasted_clips)
+            fallback_txt = "\n\n".join([*unpasted_snapshot, final_text]) if unpasted_snapshot else None
+            preserve_clip = bool(unpasted_snapshot)
+            extra_deliv_kw: dict[str, Any] = {}
+            if same_window_verifier is not None:
+                extra_deliv_kw["same_window_verifier"] = same_window_verifier
+            paste_out = self.platform.deliver_text(
+                final_text,
+                seq_id=task.seq_id,
+                target_hwnd=origin_win.hwnd,
+                origin_window=origin_win,
+                fallback_clipboard_text=fallback_txt,
+                preserve_clipboard=preserve_clip,
+                suppress_beep=lambda: self._is_recording_or_stopping() or task.silent_hud,
+                is_cancelled=lambda: self._stop_evt.is_set() or task.cancel_token.is_cancelled(),
+                before_clipboard_write=lambda: self._wait_clipboard_settle(task.cancel_token),
+                before_commit=task.cancel_token.try_commit,
+                **extra_deliv_kw,
+            )
+            now_done = self.clock_fn()
+            with self._lock:
+                if paste_out.used_clipboard_paste:
+                    self._clipboard_busy_until = now_done + self._paste_settle_sec
+                if paste_out.pasted:
+                    if paste_out.used_clipboard_paste or paste_out.clipboard:
+                        self._batch_unpasted_clips.clear()
+                elif paste_out.clipboard:
+                    self._batch_unpasted_clips.append(final_text)
+            return paste_out
+
+    def _deliver_for_selftest(
+        self,
+        text: str,
+        *,
+        seq_id: int,
+        target_hwnd: int = 0,
+        origin_window: ForegroundWindow | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
+        before_commit: Callable[[], bool] | None = None,
+        same_window_verifier: Callable[[ForegroundWindow], bool] | None = None,
+        cancel_token: CancelToken | None = None,
+    ) -> PasteOutcome:
+        with self._deliver_lock:
+            if (
+                self._stop_evt.is_set()
+                or (cancel_token is not None and cancel_token.is_cancelled())
+                or (is_cancelled is not None and is_cancelled())
+            ):
+                return PasteOutcome(False, False, "cancelled", "")
+            extra_kw: dict[str, Any] = {}
+            if same_window_verifier is not None:
+                extra_kw["same_window_verifier"] = same_window_verifier
+            paste_out = self.platform.deliver_text(
+                text,
+                seq_id=seq_id,
+                target_hwnd=target_hwnd,
+                origin_window=origin_window,
+                suppress_beep=True,
+                is_cancelled=is_cancelled,
+                before_clipboard_write=lambda: self._wait_clipboard_settle(cancel_token),
+                before_commit=before_commit,
+                **extra_kw,
+            )
+            self._note_clipboard_paste(paste_out)
+            return paste_out
 
     def _stash_task_wav_once(
         self,
@@ -3905,11 +4146,13 @@ class VoiceInputDaemon:
             self._commit_queue.clear()
             self._batch_unpasted_clips.clear()
             self._recompute_state_locked()
+            bg_threads.extend(self._control_threads)
             if self._worker_thread is not None:
                 bg_threads.append(self._worker_thread)
             if self._commit_thread is not None:
                 bg_threads.append(self._commit_thread)
             bg_threads.extend(th for th in self._stage2_threads if th.is_alive())
+            tokens_to_abort.extend(self._control_cancel_tokens)
             self._queue_cv.notify_all()
 
         CancelToken.cancel_many(tokens_to_abort, "shutdown")
@@ -3971,26 +4214,7 @@ class VoiceInputDaemon:
                     resp["last_result"] = dict(merged[-1])
             return resp
         if cmd in ("toggle", "rec_start", "rec_stop"):
-            win = (
-                _window_from_mapping(req)
-                if any(
-                    req.get(k)
-                    for k in (
-                        "hwnd",
-                        "process",
-                        "title",
-                        "bundle_id",
-                        "surface_id",
-                        "tty",
-                        "cwd",
-                        "pid",
-                        "tmux_socket",
-                        "tmux_pane",
-                        "document",
-                    )
-                )
-                else None
-            )
+            win = _window_from_mapping(req) if _has_window_fields(req) else None
             return self.handle_trigger({"toggle": "toggle", "rec_start": "ptt_start", "rec_stop": "ptt_stop"}[cmd], win, no_paste=bool(req.get("no_paste")), silent_hud=bool(req.get("silent_hud")), loopback=bool(req.get("loopback")))
         if cmd == "cancel":
             try:
@@ -4003,37 +4227,297 @@ class VoiceInputDaemon:
                 only_inflight=bool(req.get("only_inflight")),
             )
         if cmd == "selftest_wav":
-            wav_path = Path(str(req.get("wav_path") or "")).expanduser()
-            if not wav_path.is_file():
-                return {"ok": False, "error": f"wav_path not found: {wav_path}"}
-            with self._lock:
-                self.seq_id += 1
-                cur_seq = self.seq_id
-            win = _window_from_mapping(req)
-            res = run_pipeline_once(
-                wav_path,
-                cfg=self.cfg,
-                creds=self.creds,
-                tracker=self.tracker,
-                asr_provider=self.asr_provider,
-                refiner=self.refiner,
-                platform=self.platform,
-                origin_window=win,
-                audio_source="selftest_wav",
-                seq_id=cur_seq,
-                dry_run=True,
-                runtime_dir=self.runtime_dir,
-                env=self.env,
-            )
-            summary = self._build_summary(cur_seq, res, dry_run=True, audio_error="")
-            with self._lock:
-                st_snap = self._record_result_locked(summary)
-            self._append_telemetry(st_snap)
-            return {"ok": res.ok, "seq_id": cur_seq, "skipped_reason": res.skipped_reason, "asr_text": res.asr.text if res.asr else "", "final_text": res.final_text, "summary": summary}
+            if self._stop_evt.is_set():
+                return {"ok": False, "error": "daemon stopping"}
+            if not self._selftest_lock.acquire(blocking=False):
+                return {"ok": False, "error": "selftest_wav busy"}
+            try:
+                return self._execute_selftest_wav(req)
+            finally:
+                self._selftest_lock.release()
+        if cmd == "probe_route":
+            return self._execute_probe_route(req)
         if cmd == "shutdown":
             self._initiate_shutdown()
             return {"ok": True, "stopping": True}
         return {"ok": False, "error": f"unknown cmd: {cmd}"}
+
+    def _make_probe_tracker(self) -> tuple[Any, bool]:
+        tr = self.tracker
+        if not isinstance(tr, SessionTracker):
+            return tr, False
+        probe_rm = RemoteSshManager(
+            tr.remote_cfg,
+            env=tr.env,
+            runtime_dir=tr.runtime_dir,
+            enable_multiplexing=False,
+        )
+        probe_tr = SessionTracker(
+            home_dir=tr.home,
+            runtime_dir=tr.runtime_dir,
+            proc_root=tr.proc_root,
+            env=tr.env,
+            tmux_socket=tr._tmux_socket or None,
+            tmux_socket_name=tr._tmux_socket_name or None,
+            tmux_probe_fn=tr._tmux_probe_fn,
+            remote_cfg=tr.remote_cfg,
+            local_hostnames=tr._custom_local_hostnames,
+            remote_manager=probe_rm,
+            context_max_chars=tr.context_max_chars,
+            cold_start_fallback=tr.cold_start_fallback,
+        )
+        return probe_tr, True
+
+    def _execute_selftest_wav(
+        self,
+        req: Mapping[str, Any],
+        *,
+        cancel_token: CancelToken | None = None,
+    ) -> dict[str, Any]:
+        if self._stop_evt.is_set() or (cancel_token is not None and cancel_token.is_cancelled()):
+            return {"ok": False, "error": "daemon stopping"}
+        raw_deliver = req.get("deliver", False)
+        if not isinstance(raw_deliver, bool):
+            return {"ok": False, "error": "deliver must be a boolean"}
+        deliver = raw_deliver
+        if deliver and (req.get("use_live_window") is not True or _has_window_fields(req)):
+            return {
+                "ok": False,
+                "error": "deliver requires use_live_window=true without window overrides",
+            }
+        raw_wav_path = str(req.get("wav_path") or "").strip()
+        wav_path = Path(raw_wav_path).expanduser() if raw_wav_path else None
+        if wav_path is None or not wav_path.is_file():
+            return {"ok": False, "error": f"wav_path not found: {raw_wav_path}"}
+        origin_win = _resolve_control_origin_window(req)
+        if origin_win is None:
+            origin_win = (
+                self.platform.get_foreground_window()
+                if self.platform is not None
+                else ForegroundWindow()
+            )
+            if deliver and (
+                not origin_win.hwnd
+                and not (origin_win.process or "").strip()
+                and not (origin_win.bundle_id or "").strip()
+            ):
+                return {"ok": False, "error": "no live foreground window"}
+        if self._stop_evt.is_set() or (cancel_token is not None and cancel_token.is_cancelled()):
+            return {"ok": False, "error": "daemon stopping"}
+        no_telemetry = req.get("no_telemetry") is True
+        if no_telemetry:
+            cur_seq = 0
+        else:
+            with self._lock:
+                self.seq_id += 1
+                cur_seq = self.seq_id
+        deliver_hook = (
+            (lambda text, **kw: self._deliver_for_selftest(text, cancel_token=cancel_token, **kw))
+            if deliver
+            else None
+        )
+        res = run_pipeline_once(
+            wav_path,
+            cfg=self.cfg,
+            creds=self.creds,
+            tracker=self.tracker,
+            asr_provider=self.asr_provider,
+            refiner=self.refiner,
+            platform=self.platform,
+            origin_window=origin_win,
+            audio_source="selftest_wav",
+            seq_id=cur_seq,
+            dry_run=(not deliver),
+            is_cancelled=self._stop_evt.is_set,
+            cancel_token=cancel_token,
+            deliver_text_fn=deliver_hook,
+            runtime_dir=self.runtime_dir,
+            env=self.env,
+            mode=str(req.get("mode") or "auto"),
+        )
+        summary = self._build_summary(cur_seq, res, dry_run=(not deliver), audio_error="")
+        if not no_telemetry and not self._stop_evt.is_set():
+            with self._lock:
+                st_snap = self._record_result_locked(summary)
+            self._append_telemetry(st_snap)
+        eff_cwd = (
+            res.session.match.cwd
+            if (res.session is not None and res.session.match.cwd)
+            else ""
+        ) or res.workspace_cwd
+        routing = {
+            "mode": res.mode,
+            "session_key_masked": _mask_session_key(res.session),
+            "ctx_chars": int(res.ctx_chars),
+            "ctx_chunks": int(res.ctx_chunks),
+            "ctx_fallback": res.ctx_fallback,
+            "workspace_name": _workspace_basename(eff_cwd),
+        }
+        return {
+            "ok": res.ok,
+            "seq_id": cur_seq,
+            "skipped_reason": res.skipped_reason,
+            "asr_text": res.asr.text if res.asr else "",
+            "final_text": res.final_text,
+            "pasted": bool(summary["pasted"]),
+            "clipboard": bool(summary["clipboard"]),
+            "paste_reason": str(summary["paste_reason"]),
+            "delivery_status": str(summary["delivery_status"]),
+            "summary": summary,
+            "routing": routing,
+        }
+
+    def _execute_probe_route(
+        self,
+        req: Mapping[str, Any],
+        *,
+        cancel_token: CancelToken | None = None,
+    ) -> dict[str, Any]:
+        if self._stop_evt.is_set() or (cancel_token is not None and cancel_token.is_cancelled()):
+            return {"ok": False, "error": "daemon stopping"}
+        known_cwds_snap = tuple(self.tracker.active_session_cwds())
+        probe_tracker, owns_tracker = self._make_probe_tracker()
+        try:
+            origin_win = _resolve_control_origin_window(req)
+            t0 = time.monotonic()
+            st = _Stage1State(t_total0=t0, win=origin_win or ForegroundWindow())
+            cancel_fn = (
+                (lambda: self._stop_evt.is_set() or cancel_token.is_cancelled())
+                if cancel_token is not None
+                else self._stop_evt.is_set
+            )
+            asr_ctx = _resolve_stage1_context(
+                st,
+                cfg=self.cfg,
+                env=self.env,
+                tracker=probe_tracker,
+                platform=self.platform,
+                origin_window=origin_win,
+                window_title_override=None,
+                audio_source="probe_route",
+                explicit_mode=str(req.get("mode") or "auto"),
+                cancel_check=cancel_fn,
+                attach_single_hop=False,
+                known_cwds_override=known_cwds_snap,
+            )
+            if st.eff_mode == "general":
+                ctx_blocks: list[str] = []
+            else:
+                ctx_blocks, _ = build_refiner_context_chunks(
+                    self.cfg,
+                    session_key=st.snap.session_key if st.snap else "",
+                    tracker=probe_tracker if (st.snap is not None or st.workspace_cwd) else None,
+                    fallback_context=st.asr_ctx_dialog,
+                    workspace_cwd=st.workspace_cwd,
+                )
+                if any(b.startswith("<prior_session_reference") for b in ctx_blocks):
+                    st.ctx_fallback = "prior_session"
+            eff_cwd = (
+                st.snap.match.cwd
+                if (st.snap is not None and st.snap.match.cwd)
+                else ""
+            ) or st.workspace_cwd
+            return {
+                "ok": True,
+                "window_category": st.window_category,
+                "mode": st.eff_mode,
+                "should_sync": bool(st.should_sync),
+                "target_app_hint": st.target_hint,
+                "hotwords_scope": st.hotwords_scope,
+                "hotword_count": len(asr_ctx.hotwords),
+                "session_key_masked": _mask_session_key(st.snap),
+                "matched_by": _sanitize_matched_by(st.snap),
+                "remote_vetoed": bool(st.remote_vetoed),
+                "workspace_name": _workspace_basename(eff_cwd),
+                "ctx_chars": sum(len(b) for b in ctx_blocks),
+                "ctx_chunks": len(ctx_blocks),
+                "ctx_fallback": st.ctx_fallback,
+                "sync_ms": _elapsed_ms(t0),
+            }
+        finally:
+            if owns_tracker:
+                try:
+                    probe_tracker.close()
+                except Exception:
+                    pass
+
+    def _send_control_reply(self, conn: socket.socket, resp: Mapping[str, Any]) -> None:
+        try:
+            conn.sendall((json.dumps(dict(resp), ensure_ascii=False) + "\n").encode("utf-8"))
+        except OSError:
+            pass
+
+    def _dispatch_control_async(
+        self,
+        conn: socket.socket,
+        req: Mapping[str, Any],
+        *,
+        cmd: str,
+    ) -> bool:
+        if self._stop_evt.is_set():
+            self._send_control_reply(conn, {"ok": False, "error": "daemon stopping"})
+            return False
+        is_selftest = cmd == "selftest_wav"
+        gate = self._selftest_lock if is_selftest else self._probe_sem
+        if not gate.acquire(blocking=False):
+            self._send_control_reply(conn, {"ok": False, "error": f"{cmd} busy"})
+            return False
+        cancel_tok = CancelToken()
+
+        def _worker() -> None:
+            released = False
+            try:
+                try:
+                    resp = (
+                        self._execute_selftest_wav(req, cancel_token=cancel_tok)
+                        if is_selftest
+                        else self._execute_probe_route(req, cancel_token=cancel_tok)
+                    )
+                except Exception as exc:
+                    resp = {"ok": False, "error": self._redact(exc)}
+                with self._lock:
+                    self._control_cancel_tokens.discard(cancel_tok)
+                gate.release()
+                released = True
+                self._send_control_reply(conn, resp)
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                with self._lock:
+                    self._control_threads.discard(threading.current_thread())
+                    self._control_cancel_tokens.discard(cancel_tok)
+                if not released:
+                    gate.release()
+
+        th = threading.Thread(
+            target=_worker,
+            name="avi-selftest-wav" if is_selftest else "avi-probe-route",
+            daemon=True,
+        )
+        stopping = False
+        with self._lock:
+            if self._stop_evt.is_set():
+                stopping = True
+            else:
+                self._control_threads = {t for t in self._control_threads if t.is_alive()}
+                self._control_threads.add(th)
+                self._control_cancel_tokens.add(cancel_tok)
+        if stopping:
+            gate.release()
+            self._send_control_reply(conn, {"ok": False, "error": "daemon stopping"})
+            return False
+        try:
+            th.start()
+            return True
+        except Exception as exc:
+            with self._lock:
+                self._control_threads.discard(th)
+                self._control_cancel_tokens.discard(cancel_tok)
+            gate.release()
+            self._send_control_reply(conn, {"ok": False, "error": self._redact(exc)})
+            return False
 
     def _handle_power_resume(self, m: Mapping[str, Any] | None = None) -> dict[str, Any]:
         _ = m
@@ -4158,15 +4642,26 @@ class VoiceInputDaemon:
                     self._maybe_prune_failed_audio()
                     continue
                 except OSError: break
-                with conn:
-                    try:
-                        conn.settimeout(2.0)
-                        raw = conn.recv(16384).decode("utf-8", errors="replace").strip()
-                        resp = self.handle_control(req if isinstance(req := (json.loads(raw) if raw else {}), dict) else {})
-                    except Exception as exc:
-                        resp = {"ok": False, "error": self._redact(exc)}
-                    try: conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
-                    except OSError: pass
+                handed_off = False
+                try:
+                    conn.settimeout(2.0)
+                    raw = conn.recv(16384).decode("utf-8", errors="replace").strip()
+                    parsed = json.loads(raw) if raw else {}
+                    req = parsed if isinstance(parsed, dict) else {}
+                    cmd = str(req.get("cmd") or "status")
+                    if cmd in ("selftest_wav", "probe_route"):
+                        handed_off = self._dispatch_control_async(conn, req, cmd=cmd)
+                    else:
+                        resp = self.handle_control(req)
+                        self._send_control_reply(conn, resp)
+                except Exception as exc:
+                    self._send_control_reply(conn, {"ok": False, "error": self._redact(exc)})
+                finally:
+                    if not handed_off:
+                        try:
+                            conn.close()
+                        except OSError:
+                            pass
         finally:
             if is_main and prev_int is not None: signal.signal(signal.SIGINT, prev_int)
             if is_main and prev_term is not None: signal.signal(signal.SIGTERM, prev_term)
@@ -4187,7 +4682,6 @@ class VoiceInputDaemon:
 
     def close(self) -> None:
         try:
-            bg_threads = self._initiate_shutdown()
             if self._srv_sock is not None:
                 try: self._srv_sock.close()
                 except OSError: pass
@@ -4195,19 +4689,28 @@ class VoiceInputDaemon:
             if self._owns_runtime_files:
                 self.sock_path.unlink(missing_ok=True)
                 self.pid_path.unlink(missing_ok=True)
-            self.refiner.close()
-            if (tr_close := getattr(self.tracker, "close", None)) is not None:
-                try:
-                    tr_close()
-                except Exception:
-                    pass
-            join_deadline = time.monotonic() + 3.0
+            bg_threads = self._initiate_shutdown()
+            join_deadline = time.monotonic() + _CLOSE_JOIN_TIMEOUT_SEC
             cur_th = threading.current_thread()
             for th in bg_threads:
                 if (rem := join_deadline - time.monotonic()) <= 0:
                     break
                 if th.is_alive() and th is not cur_th:
                     th.join(timeout=rem)
+            with self._lock:
+                control_still_alive = any(
+                    th.is_alive() and th is not cur_th for th in self._control_threads
+                )
+            if not control_still_alive:
+                self.refiner.close()
+                if (tr_close := getattr(self.tracker, "close", None)) is not None:
+                    try:
+                        tr_close()
+                    except Exception:
+                        pass
+            # Deliberate exception: if a stuck control thread outlives the bounded join deadline,
+            # skip destructive close() on shared refiner/tracker so we do not tear down state mid-use
+            # while still releasing runtime files, platform resources, and the daemon lock.
             self.wait_pending_archives(timeout_sec=2.0)
             self.platform.close()
         finally:

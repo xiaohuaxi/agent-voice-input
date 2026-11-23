@@ -749,6 +749,18 @@ aliases = ["gpu01", "prod-linux"]
             self.assertEqual(len(ctl_opts), 1)
             self.assertFalse(ctl_opts[0].split("=", 1)[1].startswith("/mnt/"))
 
+            argv_no_mux = build_safe_ssh_argv(
+                "/usr/bin/ssh",
+                h_gpu,
+                runtime_dir=root / "rt",
+                enable_multiplexing=False,
+            )
+            self.assertIn("ControlMaster=no", argv_no_mux)
+            self.assertIn("ControlPath=none", argv_no_mux)
+            self.assertEqual(argv_no_mux[argv_no_mux.index("ControlMaster=no") - 1], "-o")
+            self.assertEqual(argv_no_mux[argv_no_mux.index("ControlPath=none") - 1], "-o")
+            self.assertTrue(all(not a.startswith("ControlPersist=") for a in argv_no_mux))
+
     def test_remote_probe_tier1_tier2_non_git_privacy_and_etag_short_circuit(self) -> None:
         # Static AST check: `_remote_probe.py` MUST have zero intra-package imports!
         probe_ast = ast.parse((SRC_ROOT / "agent_voice_input" / "_remote_probe.py").read_text(encoding="utf-8"))
