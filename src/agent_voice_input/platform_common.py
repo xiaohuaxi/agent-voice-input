@@ -40,6 +40,7 @@ class ForegroundWindow:
     tmux_socket: str = ""
     tmux_pane: str = ""
     document: str = ""
+    origin_drifted: bool = False
 
     @property
     def app_name(self) -> str:
@@ -649,6 +650,7 @@ class JsonlShimMixin:
         self._spawned_shim: subprocess.Popen[str] | None = None
         self._spawned_ready: bool = False
         self._shim_caps: frozenset[str] = frozenset()
+        self._shim_instance_id: int = 0
         self._shim_ever_ready: bool = False
         self._shim_fail_count: int = 0
         self._shim_retry_after: float = 0.0
@@ -706,11 +708,16 @@ class JsonlShimMixin:
     def _on_shim_internal_event(self, msg: dict[str, Any]) -> None:
         pass
 
+    def _ensure_event_worker_locked(self) -> None:
+        if self._closed:
+            return
+        if self._event_worker is None or not self._event_worker.is_alive():
+            self._event_worker = threading.Thread(target=self._event_loop, daemon=True)
+            self._event_worker.start()
+
     def _ensure_event_worker(self) -> None:
         with self._shim_lock:
-            if self._event_worker is None or not self._event_worker.is_alive():
-                self._event_worker = threading.Thread(target=self._event_loop, daemon=True)
-                self._event_worker.start()
+            self._ensure_event_worker_locked()
 
     def _flush_shim_events(self, timeout_sec: float = 0.05) -> None:
         if (
@@ -820,6 +827,8 @@ class JsonlShimMixin:
                         else:
                             self._shim = proc
                             self._spawned_shim = proc
+                            self._shim_instance_id += 1
+                            setattr(proc, "_shim_instance_id", self._shim_instance_id)
                             reader_th = threading.Thread(target=self._shim_reader, args=(proc, proc_ready), daemon=True)
                             setattr(proc, "_shim_reader_th", reader_th)
                             reader_th.start()
@@ -930,6 +939,16 @@ class JsonlShimMixin:
         assert proc.stdout is not None
         managed_spawn = proc_ready is not None
         got_ready = False
+        ptt_active_in_proc = False
+        shim_id = int(getattr(proc, "_shim_instance_id", 0) or 0)
+        if shim_id <= 0:
+            with self._shim_lock:
+                self._shim_instance_id += 1
+                shim_id = self._shim_instance_id
+                try:
+                    setattr(proc, "_shim_instance_id", shim_id)
+                except Exception:
+                    pass
         try:
             for raw in iter(proc.stdout.readline, ""):
                 if not raw.strip():
@@ -975,9 +994,16 @@ class JsonlShimMixin:
                             if managed_spawn
                             else (self._shim is not None and self._shim is not proc)
                         )
-                    if not stale_proc:
-                        self._ensure_event_worker()
-                        self._event_q.put(msg)
+                        if not stale_proc and not self._closed:
+                            ev_name = str(msg.get("event") or "")
+                            if ev_name == "ptt_start":
+                                ptt_active_in_proc = True
+                            elif ev_name in ("ptt_stop", "ptt_cancel"):
+                                ptt_active_in_proc = False
+                            if ev_name not in self._INTERNAL_SHIM_EVENTS:
+                                msg = {**msg, "_shim_instance_id": shim_id}
+                            self._ensure_event_worker_locked()
+                            self._event_q.put(msg)
                 elif "reply" in msg or msg.get("type") == "reply":
                     with self._shim_lock:
                         entry = self._pending.get(int(msg.get("seq_id") or 0))
@@ -1018,6 +1044,11 @@ class JsonlShimMixin:
                             seen_q_ids.add(id(wait_q))
                             stale_queues.append(wait_q)
                         self._pending.pop(k_sid, None)
+                if ptt_active_in_proc and not self._closed and self._on_event is not None:
+                    # Enqueue under _shim_lock without recreating an event worker (ptt_start already started one);
+                    # close() serializes _closed + None sentinel under the same lock so no worker can leak.
+                    if self._event_worker is not None and self._event_worker.is_alive():
+                        self._event_q.put({"event": "shim_disconnected", "_shim_instance_id": shim_id})
                 if self._shim is proc:
                     self._shim = None
                     self._spawned_shim = None
@@ -1226,11 +1257,10 @@ class JsonlShimMixin:
         except Exception:
             pass
 
-    def _send_shim_fire_and_forget(self, payload: Mapping[str, Any]) -> None:
-        if not self._has_managed_shim() or not self._ready.is_set():
-            return
-        proc = self._shim
-        if proc is None or proc.stdin is None or proc.poll() is not None:
+    def _send_shim_fire_and_forget_to_proc(
+        self, proc: subprocess.Popen[str] | None, payload: Mapping[str, Any]
+    ) -> None:
+        if self._closed or proc is None or proc.stdin is None or proc.poll() is not None:
             return
         line = json.dumps(dict(payload), ensure_ascii=False) + "\n"
         try:
@@ -1245,6 +1275,11 @@ class JsonlShimMixin:
                     proc.stdin.flush()
         except Exception:
             pass
+
+    def _send_shim_fire_and_forget(self, payload: Mapping[str, Any]) -> None:
+        if not self._has_managed_shim() or not self._ready.is_set():
+            return
+        self._send_shim_fire_and_forget_to_proc(self._shim, payload)
 
     def hud_level(self, level: float) -> None:
         clamped = round(max(0.0, min(1.0, float(level))), 3)
@@ -1292,13 +1327,15 @@ class JsonlShimMixin:
             worker.join(timeout=0.5)
 
     def close(self) -> None:
-        self._closed = True
-        self._close_evt.set()
+        with self._shim_lock:
+            self._closed = True
+            self._close_evt.set()
+            self._on_event = None
+            ev_worker = self._event_worker
+            self._event_q.put(None)
         self._stop_level_streamer()
-        self._on_event = None
-        self._event_q.put(None)
-        if self._event_worker is not None and self._event_worker.is_alive() and self._event_worker is not threading.current_thread():
-            self._event_worker.join(timeout=1.0)
+        if ev_worker is not None and ev_worker.is_alive() and ev_worker is not threading.current_thread():
+            ev_worker.join(timeout=1.0)
         if (cancel := getattr(self, "cancel_recording", None)) is not None:
             cancel()
         with self._shim_lock:

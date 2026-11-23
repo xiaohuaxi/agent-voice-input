@@ -256,6 +256,7 @@ class SessionState:
     is_remote: bool = False
     host_name: str = ""
     remote_etag: str = ""
+    remote_applied_gen: int = 0
     remote_max_chars: int = 0
     remote_evicted_chunks: int = 0
     remote_compaction_count: int = 0
@@ -2565,7 +2566,7 @@ class SessionTracker:
         self._shallow_cache: OrderedDict[str, tuple[float, list[str]]] = OrderedDict()
         self._prior_cache: OrderedDict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = OrderedDict()
         self._prior_cache_max_entries: int = 16
-        self._remote_files_cache: OrderedDict[tuple[str, str], tuple[float, list[str], list[str]]] = OrderedDict()
+        self._remote_files_cache: OrderedDict[tuple[str, str], tuple[float, list[str], list[str], int]] = OrderedDict()
         self._custom_local_hostnames: tuple[str, ...] | None = (
             tuple(local_hostnames) if local_hostnames is not None else None
         )
@@ -2619,6 +2620,10 @@ class SessionTracker:
     @property
     def last_sync_remote_vetoed(self) -> bool:
         return bool(getattr(self._tls, "last_sync_remote_vetoed", False))
+
+    @property
+    def last_sync_target_drifted(self) -> bool:
+        return bool(getattr(self._tls, "last_sync_target_drifted", False))
 
     def _has_explicit_tmux_override(self) -> bool:
         return bool(
@@ -4275,10 +4280,77 @@ class SessionTracker:
         window_process: str = "",
         bundle_id: str = "",
         document: str = "",
+        tmux_socket: str = "",
+        tmux_pane: str = "",
     ) -> SessionMatch | None:
         """Resolve foreground main CLI session via Phase 0 Remote Veto, title O(1) lookup, tmux active pane, TTY/CWD, or fallback."""
         self._tls.last_sync_remote_vetoed = False
+        self._tls.last_sync_target_drifted = False
         with self._lock:
+            orig_tmux_pane = (tmux_pane or "").strip()
+            orig_tmux_sock = (tmux_socket or "").strip()
+            rt_dirs = self._candidate_runtime_dirs()
+            norm_tty = normalize_tty_path(window_tty)
+            tmux_snap: TmuxServerSnapshot | None = None
+            pinned_tmux_target: tuple[TmuxClientInfo, TmuxPaneInfo] | None = None
+            if orig_tmux_pane:
+                tmux_snap = self._probe_tmux(rt_dirs=rt_dirs)
+                check_target = self._select_active_tmux_target(
+                    tmux_snap,
+                    window_title,
+                    window_tty=norm_tty,
+                    window_pid=window_pid,
+                    allowed_client_ttys=((norm_tty,) if norm_tty else None),
+                    allowed_client_pids=None,
+                )
+                if (
+                    orig_tmux_sock
+                    and not norm_tty
+                    and (
+                        check_target is None
+                        or (
+                            check_target[1].socket_path
+                            and not _same_tmux_server(orig_tmux_sock, check_target[1].socket_path)
+                        )
+                    )
+                ):
+                    scoped_c = tuple(
+                        c
+                        for c in tmux_snap.clients
+                        if not c.socket_path or _same_tmux_server(c.socket_path, orig_tmux_sock)
+                    )
+                    scoped_p = tuple(
+                        p
+                        for p in tmux_snap.panes
+                        if not p.socket_path or _same_tmux_server(p.socket_path, orig_tmux_sock)
+                    )
+                    check_target = self._select_active_tmux_target(
+                        TmuxServerSnapshot(clients=scoped_c, panes=scoped_p),
+                        window_title,
+                        window_tty=norm_tty,
+                        window_pid=window_pid,
+                    )
+                if check_target is None:
+                    self._tls.last_sync_target_drifted = True
+                    return None
+                act_client, act_pane = check_target
+                if (
+                    act_pane.pane_id != orig_tmux_pane
+                    or (
+                        orig_tmux_sock
+                        and act_pane.socket_path
+                        and not _same_tmux_server(orig_tmux_sock, act_pane.socket_path)
+                    )
+                    or (
+                        norm_tty
+                        and act_client.client_tty
+                        and not _tty_matches(act_client.client_tty, norm_tty)
+                    )
+                ):
+                    self._tls.last_sync_target_drifted = True
+                    return None
+                pinned_tmux_target = check_target
+
             done_p0, res_p0 = self._resolve_phase0_window_veto(
                 window_title,
                 window_process=window_process,
@@ -4288,16 +4360,15 @@ class SessionTracker:
             if done_p0:
                 return res_p0
 
-            rt_dirs = self._candidate_runtime_dirs()
             eff_wsl = _effective_is_wsl(env=self.env)
-            norm_tty = normalize_tty_path(window_tty)
             norm_cwd = (
                 ""
                 if is_wsl_slow_mount_path(window_cwd, wsl=eff_wsl)
                 else _normalize_cwd(window_cwd)
             )
             hint = parse_window_title_hint(window_title)
-            tmux_snap = self._probe_tmux(rt_dirs=rt_dirs)
+            if tmux_snap is None:
+                tmux_snap = self._probe_tmux(rt_dirs=rt_dirs)
             has_proc = self.proc_root is not None and self.proc_root.is_dir()
             is_real_proc = has_proc and self.proc_root == Path("/proc")
             is_real_darwin = not has_proc and self.proc_root == Path("/proc")
@@ -4338,18 +4409,21 @@ class SessionTracker:
             if not rctx.norm_tty and window_pid > 0 and (hint is None or bool(tmux_snap.clients)):
                 self._ensure_resolve_darwin_ptys(rctx)
 
-            rctx.active_target = self._select_active_tmux_target(
-                tmux_snap,
-                window_title,
-                window_tty=rctx.norm_tty,
-                window_pid=window_pid,
-                allowed_client_ttys=(
-                    rctx.darwin_win_tab_ttys if len(rctx.darwin_win_tab_ttys) > 1 else None
-                ),
-                allowed_client_pids=(
-                    rctx.darwin_win_desc_pids if len(rctx.darwin_win_tab_ttys) > 1 else None
-                ),
-            )
+            if pinned_tmux_target is not None:
+                rctx.active_target = pinned_tmux_target
+            else:
+                rctx.active_target = self._select_active_tmux_target(
+                    tmux_snap,
+                    window_title,
+                    window_tty=rctx.norm_tty,
+                    window_pid=window_pid,
+                    allowed_client_ttys=(
+                        rctx.darwin_win_tab_ttys if len(rctx.darwin_win_tab_ttys) > 1 else None
+                    ),
+                    allowed_client_pids=(
+                        rctx.darwin_win_desc_pids if len(rctx.darwin_win_tab_ttys) > 1 else None
+                    ),
+                )
 
             rctx.outer_hint_owned_by_tmux = bool(
                 hint is not None
@@ -4407,7 +4481,7 @@ class SessionTracker:
             )
             self._ensure_resolve_darwin_ptys(rctx)
 
-            if rctx.stale_hint_fallthrough or rctx.norm_tty or len(rctx.darwin_win_tab_ttys) > 1:
+            if not orig_tmux_pane and (rctx.stale_hint_fallthrough or rctx.norm_tty or len(rctx.darwin_win_tab_ttys) > 1):
                 rctx.active_target = self._select_active_tmux_target(
                     tmux_snap,
                     rctx.eff_title,
@@ -4982,20 +5056,30 @@ class SessionTracker:
         files_included: bool,
         repo_f: list[str],
         shallow_f: list[str],
+        probe_gen: int = 0,
     ) -> None:
         now = time.monotonic()
         if files_included:
-            state.remote_repo_files = repo_f
-            state.remote_shallow_files = shallow_f
             if state.cwd:
+                ckey = (host_name, state.cwd)
+                existing = self._remote_files_cache.get(ckey)
+                if existing is not None and (now - existing[0]) < self.repo_files_cache_ttl_sec:
+                    existing_gen = existing[3] if len(existing) >= 4 else 0
+                    if probe_gen > 0 and existing_gen > 0 and probe_gen < existing_gen:
+                        self._remote_files_cache.move_to_end(ckey)
+                        state.remote_repo_files = list(existing[1])
+                        state.remote_shallow_files = list(existing[2])
+                        return
                 self._put_bounded_ttl_cache_locked(
                     self._remote_files_cache,
-                    (host_name, state.cwd),
-                    (now, repo_f, shallow_f),
+                    ckey,
+                    (now, list(repo_f), list(shallow_f), probe_gen),
                     now=now,
                     ttl_sec=self.repo_files_cache_ttl_sec,
                     max_entries=self._max_workspace_cache,
                 )
+            state.remote_repo_files = list(repo_f)
+            state.remote_shallow_files = list(shallow_f)
         elif state.cwd:
             cached_f = self._remote_files_cache.get((host_name, state.cwd))
             if cached_f is not None:
@@ -5015,6 +5099,7 @@ class SessionTracker:
         *,
         req_max_chars: int | None = None,
         cold_start_fallback: str | None = None,
+        probe_gen: int | None = None,
     ) -> SessionState | None:
         if not resp.get("ok") or resp.get("pong"):
             return None
@@ -5022,6 +5107,12 @@ class SessionTracker:
         sid = str(resp.get("session_id") or "").strip().lower()
         if not cli or not sid:
             return None
+        raw_gen = resp.get("_probe_gen") if probe_gen is None else probe_gen
+        eff_gen = (
+            int(raw_gen)
+            if isinstance(raw_gen, int) and not isinstance(raw_gen, bool) and raw_gen > 0
+            else 0
+        )
         skey = f"remote:{host_cfg.name}:{cli}:{sid}"
         not_mod = bool(resp.get("not_modified") or resp.get("unchanged"))
         etag = str(resp.get("etag") or "")
@@ -5044,10 +5135,20 @@ class SessionTracker:
 
         with self._lock:
             state = self._states.get(skey)
+            if (
+                eff_gen > 0
+                and state is not None
+                and state.remote_applied_gen > 0
+                and eff_gen < state.remote_applied_gen
+            ):
+                self._touch_state_locked(skey)
+                return state
             if not_mod:
                 if state is None or (etag and state.remote_etag != etag):
                     return None
                 self._touch_state_locked(skey)
+                if eff_gen > state.remote_applied_gen:
+                    state.remote_applied_gen = eff_gen
                 if rem_cwd:
                     state.cwd = rem_cwd
                     self._retire_prior_on_cwd_change_locked(
@@ -5061,6 +5162,7 @@ class SessionTracker:
                     files_included=files_inc,
                     repo_f=repo_f,
                     shallow_f=shallow_f,
+                    probe_gen=eff_gen,
                 )
                 return state
 
@@ -5085,6 +5187,7 @@ class SessionTracker:
                     is_remote=True,
                     host_name=host_cfg.name,
                     remote_etag=etag,
+                    remote_applied_gen=eff_gen,
                     remote_max_chars=eff_max_chars,
                     remote_evicted_chunks=evicted,
                     remote_compaction_count=comp_cnt,
@@ -5094,6 +5197,8 @@ class SessionTracker:
                 self._put_state_locked(skey, state)
             else:
                 self._touch_state_locked(skey)
+                if eff_gen > state.remote_applied_gen:
+                    state.remote_applied_gen = eff_gen
                 old_turns = state.clean_turns
                 same_epoch = (
                     comp_cnt == state.remote_compaction_count
@@ -5175,6 +5280,7 @@ class SessionTracker:
                 files_included=files_inc,
                 repo_f=repo_f,
                 shallow_f=shallow_f,
+                probe_gen=eff_gen,
             )
             return state
 
@@ -5198,6 +5304,8 @@ class SessionTracker:
         window_process: str = "",
         bundle_id: str = "",
         document: str = "",
+        tmux_socket: str = "",
+        tmux_pane: str = "",
         seq_id: int = 0,
         include_git_info: bool = True,
     ) -> bool:
@@ -5212,6 +5320,8 @@ class SessionTracker:
             window_process=window_process,
             bundle_id=bundle_id,
             document=document,
+            tmux_socket=tmux_socket,
+            tmux_pane=tmux_pane,
         )
         if match is None or match.origin != "remote" or not match.host_name:
             return False
@@ -5578,6 +5688,8 @@ class SessionTracker:
         window_process: str = "",
         bundle_id: str = "",
         document: str = "",
+        tmux_socket: str = "",
+        tmux_pane: str = "",
         include_git_info: bool = True,
         cancel_token: Any = None,
         cold_start_fallback: str | None = None,
@@ -5585,6 +5697,7 @@ class SessionTracker:
         """Resolve (if needed) and incrementally ingest new JSONL lines for the active session."""
         t0 = time.monotonic()
         self._tls.last_sync_remote_vetoed = False
+        self._tls.last_sync_target_drifted = False
         with self._lock:
             eff_match = (
                 match
@@ -5597,6 +5710,8 @@ class SessionTracker:
                     window_process=window_process,
                     bundle_id=bundle_id,
                     document=document,
+                    tmux_socket=tmux_socket,
+                    tmux_pane=tmux_pane,
                 )
             )
             if eff_match is None:

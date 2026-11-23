@@ -5,6 +5,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import queue
 import shutil
 import subprocess
 import threading
@@ -465,14 +466,16 @@ class WslPlatform(JsonlShimMixin):
                 req["loopback"] = True
 
             before_write_ran = False
+            dispatched_proc: subprocess.Popen[str] | None = None
 
             def _on_before_write() -> None:
-                nonlocal before_write_ran
+                nonlocal before_write_ran, dispatched_proc
                 with self._winmm_state_lock:
                     if self._closed or self._winmm_gen != my_gen:
                         raise self._classify_wasapi_start_error("mic_busy:wasapi_aborted")
                     self._winmm_rpc_dispatched = True
                     before_write_ran = True
+                    dispatched_proc = self._shim
 
             try:
                 res = (
@@ -486,8 +489,21 @@ class WslPlatform(JsonlShimMixin):
                 )
             except Exception as shim_exc:
                 fb_gen = 0
+                should_discard_winmm = False
                 with self._winmm_state_lock:
                     if self._winmm_gen == my_gen:
+                        should_discard_winmm = (
+                            (
+                                self._winmm_rpc_dispatched
+                                or before_write_ran
+                                or isinstance(shim_exc, (queue.Empty, TimeoutError))
+                            )
+                            and not self._closed
+                            and not isinstance(
+                                shim_exc,
+                                (BrokenPipeError, NoMicrophoneError, MicrophoneUnavailableError),
+                            )
+                        )
                         self._winmm_starting = False
                         self._winmm_rpc_dispatched = False
                         self._active_seq_id = None
@@ -503,6 +519,12 @@ class WslPlatform(JsonlShimMixin):
                             fb_gen = self._winmm_gen
                             self._active_seq_id = seq_id
                             self._rec_mode = "pulse"
+                if should_discard_winmm:
+                    discard_req = {"cmd": "rec_stop", "rec_gen": my_gen, "discard": True}
+                    if dispatched_proc is not None and dispatched_proc is not self._shim:
+                        self._send_shim_fire_and_forget_to_proc(dispatched_proc, discard_req)
+                    else:
+                        self._send_shim_fire_and_forget(discard_req)
                 self.last_audio_error = str(shim_exc)
                 if fb_gen:
                     try:
@@ -758,6 +780,8 @@ class WslPlatform(JsonlShimMixin):
 
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", "")
+        if origin_window is not None and origin_window.origin_drifted:
+            return _fallback_clipboard_via_shim()
         if before_clipboard_write is not None:
             before_clipboard_write()
         if cancelled_fn():

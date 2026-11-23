@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import concurrent.futures, copy, errno, fcntl, hashlib, inspect, json, math, os, signal, socket, stat, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -1112,7 +1112,8 @@ def _execute_stage1(
     )
     st.eff_mode = eff_mode
     extra_hw: list[str] = []
-    if should_sync:
+    origin_drifted = bool(win.origin_drifted and window_title_override is None)
+    if should_sync and not origin_drifted:
         sync_fn = tracker.sync_session
         try:
             sync_params = inspect.signature(sync_fn).parameters
@@ -1129,6 +1130,10 @@ def _execute_stage1(
             extra_sync_kw["bundle_id"] = win.bundle_id
         if accepts_var_kw or "document" in sync_params:
             extra_sync_kw["document"] = win.document
+        if accepts_var_kw or "tmux_socket" in sync_params:
+            extra_sync_kw["tmux_socket"] = win.tmux_socket
+        if accepts_var_kw or "tmux_pane" in sync_params:
+            extra_sync_kw["tmux_pane"] = win.tmux_pane
         if cancel_check is not None and (accepts_var_kw or "cancel_token" in sync_params):
             extra_sync_kw["cancel_token"] = cancel_check
         if accepts_var_kw or "cold_start_fallback" in sync_params:
@@ -1156,6 +1161,7 @@ def _execute_stage1(
             and window_title_override is None
             and win.cwd
             and not getattr(tracker, "last_sync_remote_vetoed", False)
+            and not getattr(tracker, "last_sync_target_drifted", False)
         ):
             eff_wsl = _effective_is_wsl(env=env)
             safe_cwd = _resolve_safe_local_dir(win.cwd, wsl=eff_wsl)
@@ -1174,7 +1180,7 @@ def _execute_stage1(
                     ):
                         extra_hw = _dedupe_hotwords_ci([*extra_hw, *prior_hw])
                         st.ctx_fallback = "prior_hotwords"
-    elif eff_mode == "agent" and (win.process or win.bundle_id):
+    elif not origin_drifted and eff_mode == "agent" and (win.process or win.bundle_id):
         st.workspace_cwd = resolve_ide_workspace_cwd(
             win,
             home=tracker.home,
@@ -1769,6 +1775,7 @@ class _CommitSlot:
 class VoiceInputDaemon:
     MAX_PENDING_UTTERANCES: int = MAX_PENDING_UTTERANCES
     MAX_STAGE2_CONCURRENCY: int = MAX_STAGE2_CONCURRENCY
+    _origin_resolve_timeout_sec: float = 3.0
 
     def __init__(
         self,
@@ -1831,6 +1838,8 @@ class VoiceInputDaemon:
         self.state, self.seq_id, self._last_trigger_ts = "idle", 0, -1e9
         self._recording_active: bool = False
         self._recording_seq_id: int = -1
+        self._recording_trigger_action: str = ""
+        self._recording_shim_id: int = 0
         self._stopping_capture: bool = False
         self._utterance_queue: deque[_QueuedUtterance] = deque()
         self._commit_queue: deque[_CommitSlot] = deque()
@@ -2340,6 +2349,8 @@ class VoiceInputDaemon:
                 cur_seq = self._recording_seq_id
                 self._recording_active = False
                 self._recording_seq_id = -1
+                self._recording_trigger_action = ""
+                self._recording_shim_id = 0
                 self._stopping_capture = True
                 eff_no_paste = self._cur_no_paste
                 eff_silent = self._cur_silent_hud
@@ -2513,7 +2524,7 @@ class VoiceInputDaemon:
             return None
         return "non_terminal" if scope == "terminals" else "out_of_scope"
 
-    def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False, from_hotkey: bool = False, expected_seq_id: int | None = None) -> dict[str, Any]:
+    def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False, from_hotkey: bool = False, expected_seq_id: int | None = None, shim_instance_id: int = 0, stop_before_hud: bool = False) -> dict[str, Any]:
         arrival_ts = self.clock_fn()
         with self._trigger_lock:
             queue_full_toast = False
@@ -2572,6 +2583,8 @@ class VoiceInputDaemon:
                     cancelled_rec_seq = self._recording_seq_id
                     self._recording_active = False
                     self._recording_seq_id = -1
+                    self._recording_trigger_action = ""
+                    self._recording_shim_id = 0
                     self._cur_no_paste, self._cur_silent_hud = False, False
                     self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
                     self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
@@ -2599,6 +2612,12 @@ class VoiceInputDaemon:
                         cur_seq = self.seq_id
                         self._recording_active = True
                         self._recording_seq_id = cur_seq
+                        self._recording_trigger_action = action
+                        self._recording_shim_id = (
+                            int(shim_instance_id or 0)
+                            if (from_hotkey and action == "ptt_start")
+                            else 0
+                        )
                         self._last_trigger_ts = now
                         self._recompute_state_locked()
                         mode = "start"
@@ -2606,6 +2625,8 @@ class VoiceInputDaemon:
                     cur_seq = self._recording_seq_id
                     self._recording_active = False
                     self._recording_seq_id = -1
+                    self._recording_trigger_action = ""
+                    self._recording_shim_id = 0
                     self._stopping_capture = True
                     eff_no_paste = bool(no_paste or self._cur_no_paste)
                     eff_silent = bool(silent_hud or self._cur_silent_hud)
@@ -2640,6 +2661,35 @@ class VoiceInputDaemon:
             if mode == "start":
                 self._cancel_max_duration_timer()
                 rec_started = False
+                trigger_win = window
+                resolver = getattr(self.platform, "resolve_foreground_window", None)
+                fg_box: list[ForegroundWindow | None] = [None]
+                fg_err: list[BaseException | None] = [None]
+                fg_done: threading.Event | None = None
+                fg_spawn_failed = False
+                if callable(resolver) and bool(getattr(self.platform, "_concurrent_origin_resolve", False)):
+                    fg_done = threading.Event()
+                    _res_fn = resolver
+                    _tw = trigger_win
+
+                    def _resolve_origin_bg() -> None:
+                        try:
+                            fg_box[0] = _res_fn(_tw)
+                        except BaseException as exc:
+                            fg_err[0] = exc
+                        finally:
+                            assert fg_done is not None
+                            fg_done.set()
+
+                    try:
+                        threading.Thread(
+                            target=_resolve_origin_bg,
+                            name=f"avi-origin-{cur_seq}",
+                            daemon=True,
+                        ).start()
+                    except Exception:
+                        fg_done = None
+                        fg_spawn_failed = True
                 try:
                     eff_loopback = bool(
                         loopback
@@ -2691,14 +2741,45 @@ class VoiceInputDaemon:
                         self._hud("audio_recovered", clear_main=False)
                     if not eff_silent and not eff_loopback:
                         self.platform.beep("start")
-                    if (resolver := getattr(self.platform, "resolve_foreground_window", None)) is not None:
-                        win_now = resolver(window)
+                    if fg_spawn_failed:
+                        win_now = (
+                            replace(trigger_win, origin_drifted=True)
+                            if trigger_win is not None
+                            else ForegroundWindow(origin_drifted=True)
+                        )
+                    elif fg_done is not None:
+                        finished = fg_done.wait(timeout=self._origin_resolve_timeout_sec)
+                        sampled = fg_box[0] if finished and fg_err[0] is None else None
+                        has_identity = sampled is not None and bool(
+                            sampled.hwnd > 0
+                            or sampled.process
+                            or sampled.bundle_id
+                            or sampled.title
+                            or sampled.surface_id
+                            or sampled.tty
+                            or sampled.tmux_pane
+                        )
+                        if not has_identity:
+                            win_now = (
+                                replace(trigger_win, origin_drifted=True)
+                                if trigger_win is not None
+                                else ForegroundWindow(origin_drifted=True)
+                            )
+                        else:
+                            assert sampled is not None
+                            win_now = sampled
+                    elif callable(resolver):
+                        win_now = resolver(trigger_win)
                     else:
-                        win_now = window if (window and (window.title or window.process or window.hwnd)) else self.platform.get_foreground_window()
+                        win_now = trigger_win if (trigger_win and (trigger_win.title or trigger_win.process or trigger_win.hwnd)) else self.platform.get_foreground_window()
+                    if trigger_win is not None and not win_now.origin_drifted:
+                        conflict_fn = getattr(self.platform, "origin_resolution_conflicted", None)
+                        if callable(conflict_fn) and conflict_fn(trigger_win, win_now):
+                            win_now = replace(trigger_win, origin_drifted=True)
                     with self._lock:
                         if self._recording_active and self._recording_seq_id == cur_seq:
                             self._origin_win = win_now
-                    if not eff_loopback:
+                    if not eff_loopback and not win_now.origin_drifted:
                         self._maybe_prefetch_remote(win_now, seq_id=cur_seq)
                     self._arm_max_duration_timer(cur_seq)
                     return {"ok": True, "state": "recording", "seq_id": cur_seq}
@@ -2719,6 +2800,8 @@ class VoiceInputDaemon:
                         if still_cur:
                             self._recording_active = False
                             self._recording_seq_id = -1
+                            self._recording_trigger_action = ""
+                            self._recording_shim_id = 0
                             self._cur_no_paste, self._cur_silent_hud = False, False
                             self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
                             self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
@@ -2743,7 +2826,7 @@ class VoiceInputDaemon:
                     return out_err
 
             self._cancel_max_duration_timer()
-            if not eff_silent:
+            if not eff_silent and not stop_before_hud:
                 self._hud(stop_hud_stage)
             try:
                 raw_wav, src_used = self.platform.stop_recording()
@@ -2755,6 +2838,8 @@ class VoiceInputDaemon:
                             self._auto_stop_seq = cur_seq
                             self._auto_stop_ts = done_ts
                             self._auto_stop_absorbed = False
+                if not eff_silent and stop_before_hud:
+                    self._hud(stop_hud_stage)
                 if not eff_silent:
                     self.platform.beep("stop")
             except Exception as exc:
@@ -2853,6 +2938,8 @@ class VoiceInputDaemon:
                     eff_rec_silent = bool(silent_hud or self._cur_silent_hud)
                     self._recording_active = False
                     self._recording_seq_id = -1
+                    self._recording_trigger_action = ""
+                    self._recording_shim_id = 0
                     self._cur_no_paste, self._cur_silent_hud = False, False
                     self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
                     self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
@@ -3034,10 +3121,11 @@ class VoiceInputDaemon:
         with task.stash_lock:
             if task.stashed_done:
                 return task.saved_audio
+            if self._stop_evt.is_set() and not allow_during_shutdown:
+                return ""
             task.stashed_done = True
             if (
-                (self._stop_evt.is_set() and not allow_during_shutdown)
-                or task.cancel_token.reason == "shutdown"
+                task.cancel_token.reason == "shutdown"
                 or task.audio_source in ("file", "selftest_wav")
             ):
                 return ""
@@ -3539,7 +3627,7 @@ class VoiceInputDaemon:
                 self.platform.beep(play_beep)
 
     def _maybe_prefetch_remote(self, win: ForegroundWindow, *, seq_id: int) -> None:
-        if not self.cfg.remote.enabled:
+        if not self.cfg.remote.enabled or win.origin_drifted:
             return
         pref_fn = getattr(self.tracker, "prefetch_remote_session", None)
         if pref_fn is None:
@@ -3565,6 +3653,19 @@ class VoiceInputDaemon:
                         and self.seq_id != seq_id
                     ):
                         return
+                pref_extra: dict[str, Any] = {}
+                try:
+                    pref_params = inspect.signature(pref_fn).parameters
+                    pref_var_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in pref_params.values()
+                    )
+                except (TypeError, ValueError):
+                    pref_params = {}
+                    pref_var_kw = False
+                if pref_var_kw or "tmux_socket" in pref_params:
+                    pref_extra["tmux_socket"] = win.tmux_socket
+                if pref_var_kw or "tmux_pane" in pref_params:
+                    pref_extra["tmux_pane"] = win.tmux_pane
                 pref_fn(
                     win.title,
                     window_tty=win.tty,
@@ -3575,6 +3676,7 @@ class VoiceInputDaemon:
                     document=win.document,
                     seq_id=seq_id,
                     include_git_info=inc_git,
+                    **pref_extra,
                 )
 
             rm = getattr(self.tracker, "remote_manager", None)
@@ -3597,7 +3699,7 @@ class VoiceInputDaemon:
         self._cancel_max_duration_timer()
         self._cancel_remote_prefetch(seq_id=None)
         tokens_to_abort: list[CancelToken] = []
-        cancelled_to_stash: list[tuple[_QueuedUtterance, AudioGateResult | None, SessionSnapshot | None, ForegroundWindow]] = []
+        inflight_candidates: list[tuple[_QueuedUtterance, AudioGateResult | None, SessionSnapshot | None, ForegroundWindow, str]] = []
         bg_threads: list[threading.Thread] = []
         seen_ids: set[int] = set()
 
@@ -3606,19 +3708,15 @@ class VoiceInputDaemon:
                 return
             seen_ids.add(task.seq_id)
             tokens_to_abort.append(task.cancel_token)
-            if (
-                task.cancel_token.is_cancelled()
-                and task.cancel_token.reason == "cancelled"
-                and not task.stashed_done
-            ):
-                cancelled_to_stash.append(
-                    (
-                        task,
-                        slot.st.gate if slot is not None else None,
-                        slot.st.snap if slot is not None else None,
-                        slot.st.win if slot is not None else task.origin_win,
-                    )
+            inflight_candidates.append(
+                (
+                    task,
+                    slot.st.gate if slot is not None else None,
+                    slot.st.snap if slot is not None else None,
+                    slot.st.win if slot is not None else task.origin_win,
+                    slot.st.workspace_cwd if slot is not None else "",
                 )
+            )
 
         with self._queue_cv:
             self._stop_evt.set()
@@ -3642,14 +3740,16 @@ class VoiceInputDaemon:
             self._queue_cv.notify_all()
 
         CancelToken.cancel_many(tokens_to_abort, "shutdown")
-        for task_c, gate_c, snap_c, win_c in cancelled_to_stash:
-            self._stash_task_wav_once(
-                task_c,
-                gate=gate_c,
-                snap=snap_c,
-                win=win_c,
-                allow_during_shutdown=True,
-            )
+        for task_c, gate_c, snap_c, win_c, ws_cwd_c in inflight_candidates:
+            if task_c.cancel_token.is_cancelled() and task_c.cancel_token.reason == "cancelled":
+                self._stash_task_wav_once(
+                    task_c,
+                    gate=gate_c,
+                    snap=snap_c,
+                    win=win_c,
+                    workspace_cwd=ws_cwd_c,
+                    allow_during_shutdown=True,
+                )
         return bg_threads
 
     def handle_control(self, req: Mapping[str, Any]) -> dict[str, Any]:
@@ -3793,10 +3893,47 @@ class VoiceInputDaemon:
             "evicted_refiner": refiner_evicted,
         }
 
+    def _handle_shim_disconnected(self, m: Mapping[str, Any]) -> dict[str, Any]:
+        raw_sid = m.get("_shim_instance_id")
+        shim_id = (
+            int(raw_sid)
+            if isinstance(raw_sid, int) and not isinstance(raw_sid, bool) and raw_sid > 0
+            else 0
+        )
+        target_seq: int | None = None
+        with self._lock:
+            if (
+                not self._stop_evt.is_set()
+                and self._recording_active
+                and self._recording_trigger_action == "ptt_start"
+                and self._recording_shim_id > 0
+                and shim_id == self._recording_shim_id
+            ):
+                target_seq = self._recording_seq_id
+        if target_seq is None:
+            return {"ok": True, "ignored": "not_matching_ptt"}
+        self._log_info(
+            f"shim disconnected during active PTT (seq={target_seq}, shim_id={shim_id}); auto-stopping PTT recording"
+        )
+        return self.handle_trigger("ptt_stop", expected_seq_id=target_seq, stop_before_hud=True)
+
     def _on_platform_event(self, m: Mapping[str, Any]) -> None:
         ev = str(m.get("event") or "")
         if ev in ("toggle", "ptt_start", "ptt_stop", "ptt_cancel"):
-            self.handle_trigger(ev, _window_from_mapping(m), from_hotkey=True)
+            raw_sid = m.get("_shim_instance_id")
+            shim_id = (
+                int(raw_sid)
+                if isinstance(raw_sid, int) and not isinstance(raw_sid, bool) and raw_sid > 0
+                else 0
+            )
+            self.handle_trigger(
+                ev,
+                _window_from_mapping(m),
+                from_hotkey=True,
+                shim_instance_id=shim_id,
+            )
+        elif ev == "shim_disconnected":
+            self._handle_shim_disconnected(m)
         elif ev == "hold_cancel":
             self.handle_cancel(yield_window=_window_from_mapping(m))
         elif ev == "cancel":

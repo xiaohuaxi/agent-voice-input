@@ -735,7 +735,7 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
                 }
             exp_tok = str(payload.get("expect_session_token") or "")
             cur_hint = parse_window_title_hint(cur_title)
-            if exp_tok and cur_hint is not None and cur_hint.session_token != exp_tok:
+            if exp_tok and (cur_hint is None or cur_hint.session_token != exp_tok):
                 return {
                     "ok": True,
                     "pasted": False,
@@ -792,18 +792,24 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
         self.assertTrue(out_unknown.pasted)
         self.assertIs(sent_rpcs[0]["expect_terminal"], True)
 
-        # 2. Windows Terminal dynamic title with SAME [#id8] or temporary spinner without [#id8] -> allowed via single paste RPC!
+        # 2. Windows Terminal dynamic title with SAME [#id8] -> allowed via single paste RPC;
+        # switching to a tab without the session token (e.g. plain shell) -> blocked & copied!
         wt_origin = ForegroundWindow(700, "WindowsTerminal.exe", "claude [#abcd1234] — Initial prompt")
-        for ok_title in (
-            "✳ claude [#abcd1234] — Editing 3 files",
-            "✳ Running bash command...",  # Agent temporarily overwrote title without [#id8]
-        ):
-            sent_rpcs.clear()
-            fg_reply[0] = {"ok": True, "hwnd": 700, "process": "WindowsTerminal.exe", "title": ok_title}
-            out_wt_ok = plat.deliver_text("动态标题不误判", seq_id=3, origin_window=wt_origin)
-            self.assertTrue(out_wt_ok.pasted, msg=ok_title)
-            self.assertEqual([r["cmd"] for r in sent_rpcs], ["paste"])
-            self.assertEqual(sent_rpcs[0].get("expect_session_token"), "abcd1234")
+        sent_rpcs.clear()
+        fg_reply[0] = {"ok": True, "hwnd": 700, "process": "WindowsTerminal.exe", "title": "✳ claude [#abcd1234] — Editing 3 files"}
+        out_wt_ok = plat.deliver_text("动态标题不误判", seq_id=3, origin_window=wt_origin)
+        self.assertTrue(out_wt_ok.pasted)
+        self.assertEqual([r["cmd"] for r in sent_rpcs], ["paste"])
+        self.assertEqual(sent_rpcs[0].get("expect_session_token"), "abcd1234")
+
+        sent_rpcs.clear()
+        fg_reply[0] = {"ok": True, "hwnd": 700, "process": "WindowsTerminal.exe", "title": "Ubuntu"}
+        out_wt_plain = plat.deliver_text("切普通shell拦截", seq_id=31, origin_window=wt_origin)
+        self.assertFalse(out_wt_plain.pasted)
+        self.assertTrue(out_wt_plain.clipboard)
+        self.assertEqual(out_wt_plain.reason, "focus_changed")
+        self.assertEqual([r["cmd"] for r in sent_rpcs], ["paste"])
+        self.assertEqual(sent_rpcs[0].get("expect_session_token"), "abcd1234")
 
         # 3. Windows Terminal same hwnd switched to a DIFFERENT [#id8] tab -> blocked & copied to clipboard!
         sent_rpcs.clear()

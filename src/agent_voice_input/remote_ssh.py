@@ -1281,6 +1281,7 @@ class RemoteSshManager:
                     )
                     lat_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
                     should_apply = False
+                    resp_with_gen: dict[str, Any] | None = None
                     with self._lock:
                         is_stale = (
                             aborted
@@ -1295,7 +1296,8 @@ class RemoteSshManager:
                         elif resp is not None:
                             self._record_success_locked(host_cfg.name, lat_ms)
                             ho_settled = True
-                            job.response = resp
+                            resp_with_gen = {**resp, "_probe_gen": job.gen}
+                            job.response = resp_with_gen
                             job.completed_mono = self.clock_fn()
                             should_apply = on_result is not None
                         else:
@@ -1304,9 +1306,9 @@ class RemoteSshManager:
                             )
                             ho_settled = True
 
-                    if should_apply and resp is not None and on_result is not None:
+                    if should_apply and resp_with_gen is not None and on_result is not None:
                         try:
-                            on_result(host_cfg, resp)
+                            on_result(host_cfg, resp_with_gen)
                             with self._lock:
                                 job.applied = True
                         except Exception:
@@ -1397,6 +1399,7 @@ class RemoteSshManager:
                 self._completed.pop(host_cfg.name, None)
                 out_fast = dict(comp.response)
                 out_fast["_already_applied"] = comp.applied
+                out_fast.setdefault("_probe_gen", comp.gen)
                 return out_fast
 
             inflight = self._inflight.get(host_cfg.name)
@@ -1444,6 +1447,7 @@ class RemoteSshManager:
                 return None
             out_resp = dict(job.response)
             out_resp["_already_applied"] = job.applied
+            out_resp.setdefault("_probe_gen", job.gen)
             return out_resp
 
     def cancel_prefetch(self, *, seq_id: int | None = None) -> None:

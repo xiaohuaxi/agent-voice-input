@@ -1203,9 +1203,14 @@ class MacOSPlatform(JsonlShimMixin):
             if not (from_shim and app_hwnd <= 0):
                 if (g_info := self._query_ghostty_terminal()) is not None:
                     surface_id, g_title, tty, cwd, t_pid = g_info
-                    return ForegroundWindow(
-                        app_hwnd, eff_name, g_title, eff_bundle, surface_id, tty, cwd, t_pid, ax_trusted=ax_trusted
+                    g_win = self._enrich_window_tmux_target(
+                        ForegroundWindow(
+                            app_hwnd, eff_name, g_title, eff_bundle, surface_id, tty, cwd, t_pid, ax_trusted=ax_trusted
+                        )
                     )
+                    if hint is not None and self.origin_resolution_conflicted(hint, g_win):
+                        return replace(hint, origin_drifted=True)
+                    return g_win
             if not win_title and not from_shim and ax_trusted is not False:
                 win_title = self._query_ax_title()
             g_win = ForegroundWindow(
@@ -1324,6 +1329,62 @@ class MacOSPlatform(JsonlShimMixin):
             document=win_doc,
         )
         return self._enrich_window_tmux_target(other_win) if not (from_shim and app_hwnd <= 0) else other_win
+
+    _concurrent_origin_resolve: bool = True
+    _GENERIC_TERMINAL_TITLES: frozenset[str] = frozenset(
+        {"ghostty", "terminal", "终端", "iterm2", "iterm", "alacritty", "wezterm", "kitty"}
+    )
+
+    def origin_resolution_conflicted(
+        self, trigger_win: ForegroundWindow | None, resolved: ForegroundWindow
+    ) -> bool:
+        if trigger_win is None:
+            return False
+        if trigger_win.origin_drifted or resolved.origin_drifted:
+            return True
+        if trigger_win.bundle_id and resolved.bundle_id:
+            if trigger_win.bundle_id.lower() != resolved.bundle_id.lower():
+                return True
+        elif trigger_win.process and resolved.process:
+            if trigger_win.process.lower() != resolved.process.lower():
+                return True
+        if trigger_win.hwnd > 0 and resolved.hwnd > 0 and trigger_win.hwnd != resolved.hwnd:
+            return True
+        if trigger_win.surface_id and resolved.surface_id and trigger_win.surface_id != resolved.surface_id:
+            return True
+        if trigger_win.tmux_pane:
+            if not resolved.tmux_pane or trigger_win.tmux_pane != resolved.tmux_pane:
+                return True
+            if (
+                trigger_win.tmux_socket
+                and resolved.tmux_socket
+                and not _same_tmux_server(trigger_win.tmux_socket, resolved.tmux_socket)
+            ):
+                return True
+        t_tty = normalize_tty_path(trigger_win.tty)
+        r_tty = normalize_tty_path(resolved.tty)
+        if t_tty and r_tty and t_tty != r_tty:
+            return True
+        t_title = (trigger_win.title or "").strip()
+        r_title = (resolved.title or "").strip()
+        if t_title and r_title and t_title.lower() not in self._GENERIC_TERMINAL_TITLES:
+            t_hint = parse_window_title_hint(t_title)
+            r_hint = parse_window_title_hint(r_title)
+            if t_hint is not None or r_hint is not None:
+                if t_hint is None or r_hint is None or t_hint.session_token != r_hint.session_token:
+                    return True
+            else:
+                norm_fn = (
+                    _normalize_tmux_title_for_drift
+                    if (trigger_win.tmux_pane or resolved.tmux_pane)
+                    else _normalize_title_for_drift
+                )
+                t_norm = norm_fn(t_title)
+                r_norm = norm_fn(r_title)
+                if t_norm and r_norm and t_norm != r_norm:
+                    if not (r_norm.startswith(t_norm + " ") or t_norm.startswith(r_norm + " ")):
+                        return True
+        return False
 
     def resolve_foreground_window(self, window: ForegroundWindow | None = None) -> ForegroundWindow:
         if window is None:
@@ -1792,6 +1853,8 @@ class MacOSPlatform(JsonlShimMixin):
     def _is_focus_drifted(self, origin: ForegroundWindow | None, current: ForegroundWindow) -> bool:
         if origin is None:
             return False
+        if origin.origin_drifted:
+            return True
         if origin.bundle_id and current.bundle_id:
             if origin.bundle_id.lower() != current.bundle_id.lower():
                 return True
@@ -1800,6 +1863,8 @@ class MacOSPlatform(JsonlShimMixin):
         if (origin.process or origin.bundle_id) and not (current.process or current.bundle_id):
             return True
         if origin.hwnd > 0 and current.hwnd > 0 and origin.hwnd != current.hwnd:
+            return True
+        if origin.surface_id and current.surface_id and origin.surface_id != current.surface_id:
             return True
         if (
             not self.is_allowed_terminal(origin)
@@ -1937,8 +2002,6 @@ class MacOSPlatform(JsonlShimMixin):
         allow_pid_single_tty: bool = True,
         strict_tty: bool = False,
     ) -> tuple[str, str]:
-        if win.surface_id:
-            return "", ""
         if (win.process or win.bundle_id) and not is_macos_terminal_window(win.process, win.bundle_id):
             return "", ""
         if self._tmux_probe_fn is None and not self._resolve_tmux_exe():
@@ -1975,7 +2038,7 @@ class MacOSPlatform(JsonlShimMixin):
                 if _tty_matches(client.client_tty, target_tty) and pane.pane_id:
                     return (pane.socket_path or client.socket_path), pane.pane_id
             return "", ""
-        if not strict_tty and (raw_tmux := (self.env.get("TMUX") or "").strip()):
+        if not strict_tty and not win.surface_id and (raw_tmux := (self.env.get("TMUX") or "").strip()):
             env_sock = parse_tmux_socket_from_env(raw_tmux)
             scoped_snap = snap
             if env_sock:
@@ -2271,7 +2334,9 @@ class MacOSPlatform(JsonlShimMixin):
         def _direct_success(reason_ok: str, fg_proc: str) -> PasteOutcome:
             return PasteOutcome(True, False, reason_ok, fg_proc, used_clipboard_paste=False)
 
-        if origin_window is not None and origin_window.surface_id:
+        if origin_window is not None and origin_window.origin_drifted:
+            return _fallback_to_clipboard("focus_changed", origin_window.process or "")
+        if origin_window is not None and origin_window.surface_id and not origin_window.tmux_pane:
             if not _confirm_commit():
                 return PasteOutcome(False, False, "cancelled", "Ghostty")
             return self._deliver_to_ghostty_surface(
@@ -2289,7 +2354,12 @@ class MacOSPlatform(JsonlShimMixin):
             or origin_window.tmux_pane
         )
         fg = self._query_paste_foreground_window()
-        if origin_window is None and fg.surface_id and is_ghostty_app(fg.process, fg.bundle_id):
+        if (
+            origin_window is None
+            and fg.surface_id
+            and not fg.tmux_pane
+            and is_ghostty_app(fg.process, fg.bundle_id)
+        ):
             if not _confirm_commit():
                 return PasteOutcome(False, False, "cancelled", "Ghostty")
             return self._deliver_to_ghostty_surface(

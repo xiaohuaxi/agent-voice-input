@@ -2152,7 +2152,7 @@ public static class VoiceWinShim {
     public static void CancelRecording(long recGen = 0L) {
         int dummyBytes; string dummyErr;
         StopRecording(recGen, out dummyBytes, out dummyErr, false);
-        ReleaseStoppedRecording(0L);
+        ReleaseStoppedRecording(recGen);
     }
 
     public static string StartRecording(bool loopback = false) {
@@ -2412,15 +2412,21 @@ public static class VoiceWinShim {
         StoppedRecSlot cached = null;
         lock (_recSync) {
             sess = _recSess;
-            _recSess = null;
-            if (sess == null) {
-                if (retainSlot && recGen > 0L && _stoppedRecSlot != null && _stoppedRecSlot.RecGen == recGen) {
-                    cached = _stoppedRecSlot;
-                } else if (!retainSlot) {
+            if (sess != null && recGen > 0L && sess.RecGen > 0L && sess.RecGen != recGen) {
+                sess = null;
+            } else {
+                _recSess = null;
+                if (sess == null) {
+                    if (retainSlot && recGen > 0L && _stoppedRecSlot != null && _stoppedRecSlot.RecGen == recGen) {
+                        cached = _stoppedRecSlot;
+                    } else if (!retainSlot) {
+                        if (recGen <= 0L || (_stoppedRecSlot != null && _stoppedRecSlot.RecGen == recGen)) {
+                            _stoppedRecSlot = null;
+                        }
+                    }
+                } else {
                     _stoppedRecSlot = null;
                 }
-            } else {
-                _stoppedRecSlot = null;
             }
         }
         if (cached != null) {
@@ -2449,7 +2455,7 @@ public static class VoiceWinShim {
         }
         if (!retainSlot) {
             sess.DisposeResources();
-            ReleaseStoppedRecording(0L);
+            ReleaseStoppedRecording(recGen > 0L ? recGen : 0L);
             error = "";
             return new byte[0];
         }
@@ -2525,6 +2531,25 @@ public static class VoiceWinShim {
             byte[] rCan = StopRecording(103L, out pbCan, out errCan, true);
             if (rCan.Length != 0 || errCan != "not_recording")
                 throw new InvalidOperationException("StoppedRecSlot cancel failed to clear slot");
+
+            // 7. Mismatched rec_gen StopRecording / CancelRecording never touches an active newer RecSession
+            RecSession guardSess = new RecSession { RecGen = 200L, Run = true };
+            try {
+                lock (_recSync) { _recSess = guardSess; }
+                CancelRecording(199L);
+                int pbMis = 0; string errMis = "";
+                byte[] rMis = StopRecording(199L, out pbMis, out errMis, true);
+                if (rMis.Length != 0 || errMis != "not_recording")
+                    throw new InvalidOperationException("Mismatched StopRecording returned unexpected audio");
+                lock (_recSync) {
+                    if (!object.ReferenceEquals(_recSess, guardSess) || !guardSess.Run)
+                        throw new InvalidOperationException("Mismatched rec_gen touched active RecSession");
+                }
+            } finally {
+                lock (_recSync) {
+                    if (object.ReferenceEquals(_recSess, guardSess)) _recSess = null;
+                }
+            }
         } finally {
             ReleaseStoppedRecording(0L);
         }
@@ -3943,11 +3968,13 @@ function Set-ClipboardTransient([string]$val) {
 }
 function Get-TitleSessionToken([string]$title) {
     if ([string]::IsNullOrWhiteSpace($title)) { return "" }
-    $m1 = [regex]::Matches($title, '(?i)\[(agy|claude|codex):#?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8,36})\]')
+    $clean = [regex]::Replace($title, '\s*\[@[^\]]*\]', '').Trim()
+    if ([string]::IsNullOrWhiteSpace($clean)) { return "" }
+    $m1 = [regex]::Matches($clean, '(?i)\[(agy|claude|codex):#?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8,36})\]')
     if ($m1.Count -gt 0) { return $m1[$m1.Count - 1].Groups[2].Value.ToLowerInvariant() }
-    $m2 = [regex]::Matches($title, '(?i)\[#([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8,36})\](?=$|[^0-9A-Za-z_])')
+    $m2 = [regex]::Matches($clean, '(?i)\[[#\u00a7]([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{6,36})\](?=$|[^0-9A-Za-z_])')
     if ($m2.Count -gt 0) { return $m2[$m2.Count - 1].Groups[1].Value.ToLowerInvariant() }
-    $m3 = [regex]::Matches($title, '(?i)(?:^|[^0-9a-f-])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=$|[^0-9a-f-])')
+    $m3 = [regex]::Matches($clean, '(?i)(?:^|[^0-9a-f-])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=$|[^0-9a-f-])')
     if ($m3.Count -gt 0) { return $m3[$m3.Count - 1].Groups[1].Value.ToLowerInvariant() }
     return ""
 }
@@ -3971,6 +3998,9 @@ if ($Mode -eq "self-check") {
         $hudLayoutCases = [VoiceWinShim]::RunHeadlessSelfCheck([ref]$hotkeyFsmChecks)
         $t1 = "agy " + ([char]0x00B7) + " ~/repo [#a1b2c3d4]"
         if ((Get-TitleSessionToken $t1) -ne "a1b2c3d4") { throw "Get-TitleSessionToken hash tag failed" }
+        $tSec = "claude [" + ([char]0x00A7) + "AbCdEf] [@devbox]"
+        if ((Get-TitleSessionToken $tSec) -ne "abcdef") { throw "Get-TitleSessionToken section 6-hex tag failed" }
+        if ((Get-TitleSessionToken "codex [#1a2b3c][@devbox]") -ne "1a2b3c") { throw "Get-TitleSessionToken 6-hex host suffix failed" }
         if ((Get-TitleSessionToken "claude [claude:#DEADBEEF]") -ne "deadbeef") { throw "Get-TitleSessionToken prefixed tag failed" }
         if ((Get-TitleSessionToken "feat/codex-config") -ne "") { throw "Get-TitleSessionToken false positive" }
         if ((Get-TitleSessionToken "old [#11112222] new [#33334444]") -ne "33334444") { throw "Get-TitleSessionToken multi-tag tail failed" }
@@ -4094,7 +4124,7 @@ try {
                     $h = 0L; $p = ""; $t = ""; [VoiceWinShim]::QueryForeground([ref]$h, [ref]$p, [ref]$t)
                     $pNorm = ($p -replace '\.exe$','').ToLowerInvariant()
                     $curTok = if ($expectTok -ne "") { Get-TitleSessionToken $t } else { "" }
-                    $tokConflict = ($expectTok -ne "") -and ($curTok -ne "") -and ($curTok -ne $expectTok)
+                    $tokConflict = ($expectTok -ne "") -and ($curTok -ne $expectTok)
                     $winMatch = (($thwnd -le 0) -or ($h -eq $thwnd)) -and (($expectProc -eq "") -or ($pNorm -eq $expectProc)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $pNorm)) -and (-not $tokConflict)
                     if ($winMatch -and (-not $forceClipOnly)) {
                         if ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
@@ -4107,7 +4137,7 @@ try {
                                 $h2 = 0L; $p2 = ""; $t2 = ""; [VoiceWinShim]::QueryForeground([ref]$h2, [ref]$p2, [ref]$t2)
                                 $p2Norm = ($p2 -replace '\.exe$','').ToLowerInvariant()
                                 $curTok2 = if ($expectTok -ne "") { Get-TitleSessionToken $t2 } else { "" }
-                                $tokConflict2 = ($expectTok -ne "") -and ($curTok2 -ne "") -and ($curTok2 -ne $expectTok)
+                                $tokConflict2 = ($expectTok -ne "") -and ($curTok2 -ne $expectTok)
                                 $winMatch2 = (($thwnd -le 0) -or ($h2 -eq $thwnd)) -and (($expectProc -eq "") -or ($p2Norm -eq $expectProc)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $p2Norm)) -and (-not $tokConflict2)
                                 if (-not $winMatch2) {
                                     if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }
