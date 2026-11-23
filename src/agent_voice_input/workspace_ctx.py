@@ -424,21 +424,56 @@ _AGY_BRAIN_EVIDENCE_CACHE: OrderedDict[tuple[Any, ...], _AgyIdeEvidence] = Order
 _AGY_BRAIN_EVIDENCE_MAX = 64
 
 
-def _decode_agy_uri_or_path(raw: str, home: Path, *, keep_remote_sentinel: bool = False) -> str:
+def _decode_vscode_remote_wsl_path(
+    parts: urllib.parse.SplitResult,
+    *,
+    wsl: bool,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Decode ``vscode-remote://wsl+<distro>/...`` (including ``wsl%2B``) only on a matching WSL host."""
+    if not wsl:
+        return ""
+    authority = urllib.parse.unquote(parts.netloc or "")
+    if not authority.lower().startswith("wsl+"):
+        return ""
+    uri_distro = authority[4:].strip()
+    src_env = os.environ if env is None else env
+    cur_distro = (src_env.get("WSL_DISTRO_NAME") or "").strip()
+    if cur_distro and (not uri_distro or uri_distro.lower() != cur_distro.lower()):
+        return ""
+    return urllib.parse.unquote(parts.path or "")
+
+
+def _decode_agy_uri_or_path(
+    raw: str,
+    home: Path,
+    *,
+    keep_remote_sentinel: bool = False,
+    wsl: bool | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
     s = (raw or "").strip().rstrip(".,;:")
     if not s:
         return ""
     low = s.lower()
     if low.startswith("file://"):
-        parsed = urllib.parse.urlparse(s)
+        try:
+            parsed = urllib.parse.urlsplit(s)
+        except ValueError:
+            return ""
         if parsed.netloc and parsed.netloc.lower() != "localhost":
             return _AGY_REMOTE_URI_SENTINEL if keep_remote_sentinel else ""
         s = urllib.parse.unquote(parsed.path or "")
     elif low.startswith("vscode-remote://"):
-        parsed = urllib.parse.urlparse(s)
-        if not (parsed.netloc or "").lower().startswith("wsl+"):
+        try:
+            parsed = urllib.parse.urlsplit(s)
+        except ValueError:
+            return ""
+        eff_wsl = _effective_is_wsl(wsl, env)
+        decoded_wsl = _decode_vscode_remote_wsl_path(parsed, wsl=eff_wsl, env=env)
+        if not decoded_wsl:
             return _AGY_REMOTE_URI_SENTINEL if keep_remote_sentinel else ""
-        s = urllib.parse.unquote(parsed.path or "")
+        s = decoded_wsl
     elif s.startswith("~/"):
         s = str(home / s[2:])
     elif not s.startswith("/"):
@@ -493,20 +528,32 @@ def _is_agy_noise_path(cand_path: str, home: Path, *, wsl: bool = False) -> bool
     )
 
 
-def _extract_paths_from_metadata_block(meta_text: str, home: Path) -> list[str]:
+def _extract_paths_from_metadata_block(
+    meta_text: str,
+    home: Path,
+    *,
+    wsl: bool = False,
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
     paths: list[str] = []
     seen: set[str] = set()
     for raw_val in (
         *(m.group(0) for m in _AGY_URI_RE.finditer(meta_text)),
         *(m.group(1) for m in _AGY_ABS_PATH_RE.finditer(_AGY_URI_RE.sub(" ", meta_text))),
     ):
-        if (p := _decode_agy_uri_or_path(raw_val, home)) and p not in seen:
+        if (p := _decode_agy_uri_or_path(raw_val, home, wsl=wsl, env=env)) and p not in seen:
             seen.add(p)
             paths.append(p)
     return paths
 
 
-def _extract_tool_call_paths(obj: Mapping[str, Any], home: Path) -> list[str]:
+def _extract_tool_call_paths(
+    obj: Mapping[str, Any],
+    home: Path,
+    *,
+    wsl: bool = False,
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
     raw_calls = obj.get("tool_calls")
     if not isinstance(raw_calls, list):
         return []
@@ -531,7 +578,7 @@ def _extract_tool_call_paths(obj: Mapping[str, Any], home: Path) -> list[str]:
                     continue
                 vals = (v,) if isinstance(v, str) else (v[:8] if isinstance(v, list) else ())
                 for item in vals:
-                    if isinstance(item, str) and (p := _decode_agy_uri_or_path(item, home)):
+                    if isinstance(item, str) and (p := _decode_agy_uri_or_path(item, home, wsl=wsl, env=env)):
                         out.append(p)
     return out
 
@@ -556,7 +603,13 @@ def _read_bounded_jsonl_dicts(f: BinaryIO, *, max_lines: int = 0) -> list[dict[s
 
 
 def _load_agy_ide_evidence(
-    cid_dir: Path, tp: Path, st: os.stat_result, home: Path, *, wsl: bool = False
+    cid_dir: Path,
+    tp: Path,
+    st: os.stat_result,
+    home: Path,
+    *,
+    wsl: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> _AgyIdeEvidence:
     sub_dir = cid_dir / ".system_generated" / "subagents"
     sub_files: list[Path] = []
@@ -582,7 +635,9 @@ def _load_agy_ide_evidence(
                 sub_sig.append((name, sst.st_mtime_ns, sst.st_size))
         except OSError:
             pass
-    cache_key = (str(tp), st.st_mtime_ns, st.st_size, tuple(sub_sig))
+    src_env = os.environ if env is None else env
+    cur_distro = (src_env.get("WSL_DISTRO_NAME") or "").strip().lower() if wsl else ""
+    cache_key = (str(tp), st.st_mtime_ns, st.st_size, tuple(sub_sig), bool(wsl), cur_distro)
     with _AGY_BRAIN_EVIDENCE_LOCK:
         if (cached := _AGY_BRAIN_EVIDENCE_CACHE.get(cache_key)) is not None:
             _AGY_BRAIN_EVIDENCE_CACHE.move_to_end(cache_key)
@@ -592,7 +647,9 @@ def _load_agy_ide_evidence(
     sys_cwds: list[str] = []
 
     def _add_unique(dst: list[str], raw_u: str, *, keep_remote: bool = False) -> None:
-        if (p := _decode_agy_uri_or_path(raw_u, home, keep_remote_sentinel=keep_remote)) and p not in dst:
+        if (
+            p := _decode_agy_uri_or_path(raw_u, home, keep_remote_sentinel=keep_remote, wsl=wsl, env=env)
+        ) and p not in dst:
             dst.append(p)
 
     for sf, (_, _, sf_size) in zip(sub_files, sub_sig):
@@ -637,7 +694,7 @@ def _load_agy_ide_evidence(
         if rec.get("source") == "USER_EXPLICIT" or rec.get("type") == "USER_INPUT":
             content = rec.get("content")
             if isinstance(content, str) and (pos := content.find("<ADDITIONAL_METADATA")) >= 0:
-                if extracted := _extract_paths_from_metadata_block(content[pos:], home):
+                if extracted := _extract_paths_from_metadata_block(content[pos:], home, wsl=wsl, env=env):
                     l2_paths = extracted
                     break
 
@@ -645,7 +702,7 @@ def _load_agy_ide_evidence(
         p
         for rec in records
         if rec.get("source") == "MODEL" or rec.get("type") == "PLANNER_RESPONSE"
-        for p in _extract_tool_call_paths(rec, home)
+        for p in _extract_tool_call_paths(rec, home, wsl=wsl, env=env)
     ]
 
     ev = _AgyIdeEvidence(tuple(ws_uris), tuple(sys_cwds), tuple(l2_paths), tuple(l3_paths))
@@ -849,16 +906,23 @@ def _query_agy_ide_db_title_rows(
     root: Path,
     *,
     wsl: bool,
-) -> list[tuple[str, str, str, Any]]:
-    """Read all non-CLI, root-level desktop conversation rows for Python-side Unicode title matching."""
+) -> tuple[list[tuple[str, str, str, Any]], bool]:
+    """Read all non-CLI, root-level desktop conversation rows for Python-side Unicode title matching.
+
+    Returns ``(rows, db_ok)`` where ``db_ok=False`` indicates ``conversation_summaries.db`` exists
+    on disk (including as a symlink) but could not be opened/queried or lacks required columns.
+    """
+    db_path = root / "conversation_summaries.db"
+    if not os.path.lexists(db_path):
+        return [], True
     conn = _open_agy_ide_db_ro(root, wsl=wsl)
     if conn is None:
-        return []
+        return [], False
     try:
         with contextlib.closing(conn):
             cols = _get_agy_db_table_cols(conn)
             if "conversation_id" not in cols or "title" not in cols:
-                return []
+                return [], False
             sel_ws = "workspace_uris" if "workspace_uris" in cols else "''"
             sel_lmt = "last_modified_time" if "last_modified_time" in cols else "''"
             wheres: list[str] = []
@@ -876,12 +940,15 @@ def _query_agy_ide_db_title_rows(
                 f"FROM conversation_summaries WHERE {' AND '.join(wheres)}"
             )
             with contextlib.closing(conn.execute(sql)) as cur:
-                return [
-                    (str(r[0] or ""), str(r[1] or ""), str(r[2] or ""), r[3])
-                    for r in cur.fetchall()
-                ]
+                return (
+                    [
+                        (str(r[0] or ""), str(r[1] or ""), str(r[2] or ""), r[3])
+                        for r in cur.fetchall()
+                    ],
+                    True,
+                )
     except (sqlite3.Error, OSError):
-        return []
+        return [], False
 
 
 def _decode_structured_workspace_uri(
@@ -899,20 +966,13 @@ def _decode_structured_workspace_uri(
     if scheme == "file":
         if parts.netloc and parts.netloc.lower() != "localhost":
             return ""
+        path = urllib.parse.unquote(parts.path or "")
     elif scheme == "vscode-remote":
-        if not wsl:
-            return ""
-        authority = urllib.parse.unquote(parts.netloc or "")
-        if not authority.lower().startswith("wsl+"):
-            return ""
-        uri_distro = authority[4:].strip()
-        src_env = os.environ if env is None else env
-        cur_distro = (src_env.get("WSL_DISTRO_NAME") or "").strip()
-        if cur_distro and (not uri_distro or uri_distro.lower() != cur_distro.lower()):
+        path = _decode_vscode_remote_wsl_path(parts, wsl=wsl, env=env)
+        if not path:
             return ""
     else:
         return ""
-    path = urllib.parse.unquote(parts.path or "")
     if not path.startswith("/") or "\x00" in path:
         return ""
     if is_wsl_slow_mount_path(path, wsl=wsl):
@@ -1050,20 +1110,22 @@ def resolve_antigravity_ide_session_by_title(
     eff_wsl = _effective_is_wsl(wsl, env)
 
     trunc_prefix = _compute_trunc_prefix(win_title)
+    is_truncated_title = win_title.endswith("...") or win_title.endswith("\u2026")
 
-    exact_cands: list[tuple[Path, str, Path, os.stat_result, str, Any]] = []
-    prefix_cands: list[tuple[Path, str, Path, os.stat_result, str, Any]] = []
-    seen_exact: set[str] = set()
-    seen_prefix: set[str] = set()
+    # Collect ALL title-matching DB rows across every root BEFORE checking transcripts so
+    # brand-new sessions without transcripts yet still participate in cross-repo ambiguity vetoes.
+    matched_rows: list[tuple[Path, str, str, Any, bool]] = []
+    seen_keys: set[tuple[Path, str]] = set()
 
     for root in _iter_agy_ide_roots(eff_home):
         real_root = _resolve_safe_local_dir(str(root), wsl=eff_wsl)
         if not real_root:
             continue
         root_path = Path(real_root)
-        for raw_cid, raw_title, raw_ws_uris, raw_lmt in _query_agy_ide_db_title_rows(
-            root_path, wsl=eff_wsl
-        ):
+        rows, db_ok = _query_agy_ide_db_title_rows(root_path, wsl=eff_wsl)
+        if not db_ok:
+            return None
+        for raw_cid, raw_title, raw_ws_uris, raw_lmt in rows:
             cid = raw_cid.strip()
             db_title = raw_title.strip()
             if not cid or not db_title:
@@ -1077,56 +1139,72 @@ def resolve_antigravity_ide_session_by_title(
             )
             if not is_exact and not is_prefix:
                 continue
-            cid_key = cid.lower()
-            if is_exact:
-                if cid_key in seen_exact:
-                    continue
-                resolved = _resolve_agy_ide_transcript(root_path, cid, wsl=eff_wsl)
-                if resolved is None:
-                    continue
-                tp, tp_st = resolved
-                seen_exact.add(cid_key)
-                exact_cands.append((root_path, cid, tp, tp_st, raw_ws_uris, raw_lmt))
-            elif not exact_cands and cid_key not in seen_prefix:
-                resolved = _resolve_agy_ide_transcript(root_path, cid, wsl=eff_wsl)
-                if resolved is None:
-                    continue
-                tp, tp_st = resolved
-                seen_prefix.add(cid_key)
-                prefix_cands.append((root_path, cid, tp, tp_st, raw_ws_uris, raw_lmt))
+            row_key = (root_path, cid.lower())
+            if row_key in seen_keys:
+                continue
+            seen_keys.add(row_key)
+            matched_rows.append((root_path, cid, raw_ws_uris, raw_lmt, is_exact))
 
-    cands = exact_cands if exact_cands else prefix_cands
-    if not cands:
+    if not matched_rows:
         return None
-    if len(cands) == 1:
-        chosen = cands[0]
-        _, ws_dirs = _parse_agy_db_workspace_uris(chosen[4], eff_home, wsl=eff_wsl, env=eff_env)
-        ws_cwd = ws_dirs[0] if ws_dirs else ""
-    else:
-        parsed_cands: list[tuple[tuple[Path, str, Path, os.stat_result, str, Any], str]] = []
-        distinct_ws: set[str] = set()
-        for item in cands:
-            has_raw, item_ws_dirs = _parse_agy_db_workspace_uris(
-                item[4], eff_home, wsl=eff_wsl, env=eff_env
-            )
-            if has_raw and not item_ws_dirs:
-                return None
-            primary_ws = item_ws_dirs[0] if item_ws_dirs else ""
-            distinct_ws.add(primary_ws)
-            parsed_cands.append((item, primary_ws))
-        if len(distinct_ws) != 1:
+
+    if not is_truncated_title:
+        exact_only = [r for r in matched_rows if r[4]]
+        if exact_only:
+            matched_rows = exact_only
+
+    if len(matched_rows) == 1:
+        row = matched_rows[0]
+        resolved = _resolve_agy_ide_transcript(row[0], row[1], wsl=eff_wsl)
+        if resolved is None:
             return None
+        tp, tp_st = resolved
+        _, ws_dirs = _parse_agy_db_workspace_uris(row[2], eff_home, wsl=eff_wsl, env=eff_env)
+        ws_cwd = ws_dirs[0] if ws_dirs else ""
+        return SessionMatch(
+            cli="agy",
+            session_id=row[1],
+            jsonl_path=str(tp),
+            cwd=ws_cwd,
+            matched_by="ide_db_title",
+            jsonl_mtime=tp_st.st_mtime,
+        )
 
-        def _cand_sort_key(
-            entry: tuple[tuple[Path, str, Path, os.stat_result, str, Any], str]
-        ) -> tuple[float, float, float, float]:
-            item = entry[0]
-            ann_mtime = _stat_agy_annotation_mtime(item[0], item[1])
-            db_lmt = _parse_iso_timestamp(item[5])
-            tp_mtime = float(item[3].st_mtime)
-            return (max(ann_mtime, db_lmt, tp_mtime), ann_mtime, db_lmt, tp_mtime)
+    # Multi-row match: verify full normalized workspace set convergence across ALL matched DB rows
+    # (including rows without transcripts yet) before filtering by transcript availability.
+    distinct_ws_sets: set[frozenset[str]] = set()
+    parsed_rows: list[tuple[Path, str, list[str], Any]] = []
+    for root_path, cid, raw_ws_uris, raw_lmt, _is_exact in matched_rows:
+        has_raw, item_ws_dirs = _parse_agy_db_workspace_uris(
+            raw_ws_uris, eff_home, wsl=eff_wsl, env=eff_env
+        )
+        if has_raw and not item_ws_dirs:
+            return None
+        distinct_ws_sets.add(frozenset(item_ws_dirs))
+        parsed_rows.append((root_path, cid, item_ws_dirs, raw_lmt))
+    if len(distinct_ws_sets) != 1:
+        return None
 
-        chosen, ws_cwd = max(parsed_cands, key=_cand_sort_key)
+    transcript_cands: list[tuple[Path, str, Path, os.stat_result, list[str], Any]] = []
+    for root_path, cid, item_ws_dirs, raw_lmt in parsed_rows:
+        resolved = _resolve_agy_ide_transcript(root_path, cid, wsl=eff_wsl)
+        if resolved is None:
+            continue
+        tp, tp_st = resolved
+        transcript_cands.append((root_path, cid, tp, tp_st, item_ws_dirs, raw_lmt))
+    if not transcript_cands:
+        return None
+
+    def _cand_sort_key(
+        item: tuple[Path, str, Path, os.stat_result, list[str], Any]
+    ) -> tuple[float, float, float, float]:
+        ann_mtime = _stat_agy_annotation_mtime(item[0], item[1])
+        db_lmt = _parse_iso_timestamp(item[5])
+        tp_mtime = float(item[3].st_mtime)
+        return (max(ann_mtime, db_lmt, tp_mtime), ann_mtime, db_lmt, tp_mtime)
+
+    chosen = max(transcript_cands, key=_cand_sort_key)
+    ws_cwd = chosen[4][0] if chosen[4] else ""
     return SessionMatch(
         cli="agy",
         session_id=chosen[1],
@@ -1751,7 +1829,7 @@ def resolve_antigravity_ide_session(
         if _is_agy_subagent(tp):
             continue
         matched += 1
-        ev = _load_agy_ide_evidence(cid_dir, tp, st, home, wsl=eff_wsl)
+        ev = _load_agy_ide_evidence(cid_dir, tp, st, home, wsl=eff_wsl, env=env)
         if _classify_agy_evidence_for_workspace(ev, safe_ws, home, wsl=eff_wsl) == "match":
             return SessionMatch(
                 cli="agy", session_id=cid, jsonl_path=str(tp), cwd=safe_ws, matched_by="ide_brain", jsonl_mtime=mtime
@@ -1901,7 +1979,7 @@ def discover_antigravity_ide_prior_sessions(
         if _is_agy_subagent(tp):
             continue
         inspected += 1
-        ev = _load_agy_ide_evidence(cid_dir, tp, st, home, wsl=eff_wsl)
+        ev = _load_agy_ide_evidence(cid_dir, tp, st, home, wsl=eff_wsl, env=env)
         if _agy_ide_evidence_matches_exact_workspace(ev, safe_ws, home, wsl=eff_wsl):
             turns, _, _ = _clean_jsonl_file("agy", str(tp), home=None)
             slim = build_slim_prior_candidate(
@@ -1938,7 +2016,7 @@ def read_repo_core_files(
     if not real_cwd:
         return []
     base = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", real_cwd]
-    git_env = {**os.environ, "GIT_NO_LAZY_FETCH": "1"}
+    git_env = {**(env if env is not None else os.environ), "GIT_NO_LAZY_FETCH": "1"}
 
     def _run_nul(args: list[str]) -> list[str]:
         try:
@@ -2027,6 +2105,7 @@ def read_git_status_summary(
         "--short",
         "--untracked-files=normal",
     ]
+    git_env = {**(env if env is not None else os.environ), "GIT_NO_LAZY_FETCH": "1"}
     try:
         proc = subprocess.run(
             cmd,
@@ -2035,6 +2114,7 @@ def read_git_status_summary(
             stderr=subprocess.DEVNULL,
             timeout=timeout_sec,
             check=False,
+            env=git_env,
         )
     except (OSError, subprocess.TimeoutExpired):
         return "", []

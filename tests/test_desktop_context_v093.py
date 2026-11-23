@@ -1151,10 +1151,11 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             assert m_rem is not None
             self.assertEqual((m_rem.session_id, m_rem.cwd), ("cid-remote-only", ""))
 
-            # 3) Truncated prefix ("..." and Unicode "…"), short prefix rejection, and exact-over-prefix priority
-            m_exact_wins = resolve_antigravity_ide_session_by_title("Investigate Antigravity 2...", home=home, wsl=False)
-            assert m_exact_wins is not None
-            self.assertEqual(m_exact_wins.session_id, "cid-exact-over-prefix")
+            # 3) Truncated prefix ("..." and Unicode "…"), short prefix rejection, and cross-repo exact+prefix fail-closed
+            # "Investigate Antigravity 2..." matches exact cid-exact-over-prefix (repo_b) AND prefix cid-trunc-en (repo_a) -> fail-closed None!
+            self.assertIsNone(
+                resolve_antigravity_ide_session_by_title("Investigate Antigravity 2...", home=home, wsl=False)
+            )
 
             m_trunc_en = resolve_antigravity_ide_session_by_title("Investigate Antigravity 2.0 Win...", home=home, wsl=False)
             assert m_trunc_en is not None
@@ -3350,6 +3351,228 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 parse_ide_window_title(ForegroundWindow(2, "Code.exe", "app.py — claude-code — Visual Studio Code")),
                 IdeTitleInfo(root_name="claude-code"),
             )
+
+    def test_r2_agy_title_no_transcript_multiroots_db_failclosed_legacy_wsl_uri_and_git_env(self) -> None:
+        """R2 polish regressions: AGY full-row veto/multi-root set/DB fail-closed, legacy wsl%2B URI, and git env isolation."""
+        from agent_voice_input.workspace_ctx import (
+            _AGY_REMOTE_URI_SENTINEL,
+            _decode_agy_uri_or_path,
+            _query_agy_ide_db_title_rows,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            repo_a = home / "repos" / "proj-a"
+            repo_b = home / "repos" / "proj-b"
+            repo_c = home / "repos" / "proj-c"
+            for d in (repo_a, repo_b, repo_c):
+                d.mkdir(parents=True)
+            ide_root = home / ".gemini" / "antigravity"
+            ide_brain = ide_root / "brain"
+            ide2_root = home / ".gemini" / "antigravity-ide"
+            ide2_brain = ide2_root / "brain"
+            db_path = ide_root / "conversation_summaries.db"
+            db2_path = ide2_root / "conversation_summaries.db"
+            base_t = 1_795_424_400.0
+
+            def _mk_sess(broot: Path, cid: str, mtime: float, **kw: object) -> Path:
+                return _write_agy_brain_session(
+                    broot,
+                    cid,
+                    [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": f"<USER_REQUEST>{cid}</USER_REQUEST>"}],
+                    mtime=mtime,
+                    **kw,  # type: ignore[arg-type]
+                )
+
+            def _write_db(path: Path, rows: list[tuple[object, ...]]) -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with contextlib.closing(sqlite3.connect(str(path))) as conn:
+                    conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS conversation_summaries (
+                            conversation_id TEXT PRIMARY KEY,
+                            title TEXT,
+                            workspace_uris TEXT,
+                            last_modified_time TEXT,
+                            source TEXT,
+                            parent_conversation_id TEXT,
+                            nesting_depth INTEGER,
+                            agent_name TEXT
+                        )
+                        """
+                    )
+                    conn.execute("DELETE FROM conversation_summaries")
+                    conn.executemany("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                    conn.commit()
+
+            # --- Item 1: No-transcript cross-repo veto, multi-root workspace full set, and truncated exact+prefix ---
+            _mk_sess(ide_brain, "cid-xrepo-has-tp", base_t + 10)
+            # cid-xrepo-no-tp intentionally has NO transcript file on disk yet
+            _mk_sess(ide_brain, "cid-same-has-tp", base_t + 10)
+            # cid-same-no-tp intentionally has NO transcript file on disk yet (same repo_a)
+            _mk_sess(ide_brain, "cid-multi-ab", base_t + 10)
+            _mk_sess(ide_brain, "cid-multi-ac", base_t + 20)
+            _mk_sess(ide_brain, "cid-multi-same-1", base_t + 10)
+            _mk_sess(ide_brain, "cid-multi-same-2", base_t + 300)
+            _mk_sess(ide_brain, "cid-trunc-exact-a", base_t + 10)
+            _mk_sess(ide_brain, "cid-trunc-pfx-b", base_t + 200)
+            _mk_sess(ide_brain, "cid-trunc-same-exact", base_t + 10)
+            _mk_sess(ide_brain, "cid-trunc-same-pfx", base_t + 400)
+            _mk_sess(ide_brain, "cid-multi-unres-local", base_t + 10)
+            _mk_sess(ide_brain, "cid-multi-unres-remote", base_t + 20)
+
+            _write_db(
+                db_path,
+                [
+                    ("cid-xrepo-has-tp", "New Session Cross Repo Veto", json.dumps([repo_a.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-xrepo-no-tp", "New Session Cross Repo Veto", json.dumps([repo_b.as_uri()]), "2026-11-23T09:05:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-same-has-tp", "New Session Same Repo OK", json.dumps([repo_a.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-same-no-tp", "New Session Same Repo OK", json.dumps([repo_a.as_uri()]), "2026-11-23T09:05:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-multi-ab", "Multi Root Diff Set", json.dumps([repo_a.as_uri(), repo_b.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-multi-ac", "Multi Root Diff Set", json.dumps([repo_a.as_uri(), repo_c.as_uri()]), "2026-11-23T09:00:20Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-multi-same-1", "Multi Root Same Set", json.dumps([repo_a.as_uri(), repo_b.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-multi-same-2", "Multi Root Same Set", json.dumps([repo_b.as_uri(), repo_a.as_uri()]), "2026-11-23T09:05:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-trunc-exact-a", "Deploy Cluster Alpha...", json.dumps([repo_a.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-trunc-pfx-b", "Deploy Cluster Alpha Production", json.dumps([repo_b.as_uri()]), "2026-11-23T09:03:20Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-trunc-same-exact", "Build Pipeline Beta\u2026", json.dumps([repo_a.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-trunc-same-pfx", "Build Pipeline Beta Release", json.dumps([repo_a.as_uri()]), "2026-11-23T09:06:40Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-multi-unres-local", "Unresolved URI Multi", json.dumps([repo_a.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-multi-unres-remote", "Unresolved URI Multi", json.dumps(["vscode-remote://ssh-remote+prod/srv/x"]), "2026-11-23T09:00:20Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ],
+            )
+            env_local = {"HOME": str(home), "WSL_DISTRO_NAME": ""}
+            # No-transcript row in repo_b vetoes cross-repo match on repo_a!
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("New Session Cross Repo Veto", home=home, wsl=False, env=env_local))
+            # No-transcript row in SAME repo_a converges and selects the valid-transcript candidate
+            m_same_nt = resolve_antigravity_ide_session_by_title("New Session Same Repo OK", home=home, wsl=False, env=env_local)
+            assert m_same_nt is not None
+            self.assertEqual((m_same_nt.session_id, m_same_nt.cwd), ("cid-same-has-tp", os.path.realpath(repo_a)))
+            # Multi-root workspace: [A, B] vs [A, C] fails closed even though primary ws is A for both
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("Multi Root Diff Set", home=home, wsl=False, env=env_local))
+            # Multi-root workspace: [A, B] vs [B, A] has identical frozenset -> picks latest activity
+            m_multi_same = resolve_antigravity_ide_session_by_title("Multi Root Same Set", home=home, wsl=False, env=env_local)
+            assert m_multi_same is not None
+            self.assertEqual(m_multi_same.session_id, "cid-multi-same-2")
+            # Truncated title ("..." / "…"): cross-repo exact vs prefix fails closed; same-repo converges and picks latest
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("Deploy Cluster Alpha...", home=home, wsl=False, env=env_local))
+            m_trunc_same = resolve_antigravity_ide_session_by_title("Build Pipeline Beta\u2026", home=home, wsl=False, env=env_local)
+            assert m_trunc_same is not None
+            self.assertEqual(m_trunc_same.session_id, "cid-trunc-same-pfx")
+            # Unresolved raw URI in multi-row pool fails closed
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("Unresolved URI Multi", home=home, wsl=False, env=env_local))
+
+            # --- Item 2: _query_agy_ide_db_title_rows (rows, db_ok) & dual-root fail-closed ---
+            ide2_root.mkdir(parents=True, exist_ok=True)
+            self.assertEqual(_query_agy_ide_db_title_rows(ide2_root, wsl=False), ([], True))
+            # Present-but-corrupt second root DB fails closed even when first root DB matches!
+            db2_path.write_bytes(b"corrupt secondary agy db")
+            self.assertEqual(_query_agy_ide_db_title_rows(ide2_root, wsl=False), ([], False))
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("New Session Same Repo OK", home=home, wsl=False, env=env_local))
+            # Missing required column in second root DB -> fail closed
+            db2_path.unlink()
+            with contextlib.closing(sqlite3.connect(str(db2_path))) as c_bad:
+                c_bad.execute("CREATE TABLE conversation_summaries (conversation_id TEXT)")
+                c_bad.commit()
+            self.assertEqual(_query_agy_ide_db_title_rows(ide2_root, wsl=False), ([], False))
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("New Session Same Repo OK", home=home, wsl=False, env=env_local))
+            # Symlink DB in second root -> fail closed
+            ext_db = tmp / "ext_r2.db"
+            _write_db(ext_db, [])
+            db2_path.unlink()
+            os.symlink(ext_db, db2_path)
+            self.assertEqual(_query_agy_ide_db_title_rows(ide2_root, wsl=False), ([], False))
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("New Session Same Repo OK", home=home, wsl=False, env=env_local))
+            # Lock timeout on second root DB -> fail closed
+            db2_path.unlink()
+            _write_db(db2_path, [])
+            orig_open_agy = __import__("agent_voice_input.workspace_ctx", fromlist=["_open_agy_ide_db_ro"])._open_agy_ide_db_ro
+
+            class _LockedAgyConn:
+                def execute(self, *_a: object, **_kw: object):
+                    raise sqlite3.OperationalError("database is locked")
+
+                def close(self) -> None:
+                    pass
+
+            with mock.patch(
+                "agent_voice_input.workspace_ctx._open_agy_ide_db_ro",
+                side_effect=lambda r, *, wsl: _LockedAgyConn() if r.name == "antigravity-ide" else orig_open_agy(r, wsl=wsl),
+            ):
+                self.assertIsNone(resolve_antigravity_ide_session_by_title("New Session Same Repo OK", home=home, wsl=False, env=env_local))
+            db2_path.unlink()
+            db_path.unlink()
+
+            # --- Item 3: Legacy brain/ _decode_agy_uri_or_path aligns wsl%2B + WSL_DISTRO_NAME & cache key ---
+            env_u = {"HOME": str(home), "WSL_DISTRO_NAME": "Ubuntu"}
+            env_d = {"HOME": str(home), "WSL_DISTRO_NAME": "Debian"}
+            uri_u = f"vscode-remote://wsl%2BUbuntu{repo_a}"
+            uri_d = f"vscode-remote://wsl%2BDebian{repo_a}"
+            self.assertEqual(_decode_agy_uri_or_path(uri_u, home, wsl=True, env=env_u), str(repo_a))
+            self.assertEqual(_decode_agy_uri_or_path(uri_d, home, keep_remote_sentinel=True, wsl=True, env=env_u), _AGY_REMOTE_URI_SENTINEL)
+            self.assertEqual(_decode_agy_uri_or_path(uri_d, home, keep_remote_sentinel=False, wsl=True, env=env_u), "")
+            self.assertEqual(_decode_agy_uri_or_path(uri_u, home, keep_remote_sentinel=True, wsl=False, env=env_local), _AGY_REMOTE_URI_SENTINEL)
+
+            # End-to-end legacy brain/ resolution & prior discovery with wsl%2B distro isolation (and cache key isolation)
+            for p in list(ide_brain.iterdir()):
+                if p.is_dir():
+                    import shutil
+                    shutil.rmtree(p)
+            rich_wsl = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": f"<USER_REQUEST>Work on {repo_a}</USER_REQUEST>\n<ADDITIONAL_METADATA>\nActive Document: {repo_a / 'a.py'}\n</ADDITIONAL_METADATA>"},
+                {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Done " + ("x" * 2000)},
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "Next " + ("y" * 1000)},
+                {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "All good " + ("z" * 1000)},
+            ]
+            _write_agy_brain_session(ide_brain, "cid-legacy-wsl-u", rich_wsl, mtime=base_t - 5, workspace_uris=[uri_u])
+            # Same file probed under Debian MUST NOT match (and must not poison cache for Ubuntu!)
+            self.assertIsNone(resolve_antigravity_ide_session(str(repo_a), home=home, now_ts=base_t, wsl=True, env=env_d))
+            self.assertEqual(discover_antigravity_ide_prior_sessions(str(repo_a), home=home, wsl=True, env=env_d), [])
+            # Now under Ubuntu it MUST resolve and discover as prior!
+            m_leg_u = resolve_antigravity_ide_session(str(repo_a), home=home, now_ts=base_t, wsl=True, env=env_u)
+            assert m_leg_u is not None
+            self.assertEqual(m_leg_u.session_id, "cid-legacy-wsl-u")
+            priors_leg_u = discover_antigravity_ide_prior_sessions(str(repo_a), home=home, wsl=True, env=env_u)
+            self.assertEqual([c["session_id"] for c in priors_leg_u], ["cid-legacy-wsl-u"])
+            # Under non-WSL host, vscode-remote://wsl%2B... must NOT match local repo
+            self.assertIsNone(resolve_antigravity_ide_session(str(repo_a), home=home, now_ts=base_t, wsl=False, env=env_local))
+
+            # --- Item 4: read_git_status_summary & read_repo_core_files honor caller env (no host GIT_DIR leak) ---
+            git_repo = home / "repos" / "isolated-git"
+            git_repo.mkdir(parents=True)
+            base_git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            base_git_env.update({"GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "t@example.com"})
+            subprocess.run(["git", "init", "-q"], cwd=str(git_repo), env=base_git_env, check=True)
+            (git_repo / "core_engine.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "core_engine.py"], cwd=str(git_repo), env=base_git_env, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(git_repo), env=base_git_env, check=True)
+            (git_repo / "dirty_module.py").write_text("y = 2\n", encoding="utf-8")
+
+            iso_git_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home)}
+            seen_envs: list[dict[str, str]] = []
+            orig_subproc_run = subprocess.run
+
+            def _spy_git_run(*args: object, **kwargs: object):
+                if isinstance(kwargs.get("env"), dict):
+                    seen_envs.append(dict(kwargs["env"]))  # type: ignore[arg-type]
+                return orig_subproc_run(*args, **kwargs)  # type: ignore[arg-type]
+
+            with mock.patch.dict(
+                os.environ,
+                {"GIT_DIR": str(tmp / "nonexistent-host-git-dir"), "GIT_WORK_TREE": str(tmp / "nonexistent-wt")},
+                clear=False,
+            ), mock.patch("agent_voice_input.workspace_ctx.subprocess.run", side_effect=_spy_git_run):
+                status_txt, status_hw = read_git_status_summary(str(git_repo), wsl=False, env=iso_git_env)
+                core_files = read_repo_core_files(str(git_repo), wsl=False, env=iso_git_env)
+
+            self.assertIn("dirty_module.py", status_txt)
+            self.assertIn("dirty_module.py", status_hw)
+            self.assertIn("core_engine.py", core_files)
+            self.assertGreaterEqual(len(seen_envs), 2)
+            for captured in seen_envs:
+                self.assertEqual(captured.get("GIT_NO_LAZY_FETCH"), "1")
+                self.assertNotIn("GIT_DIR", captured)
+                self.assertNotIn("GIT_WORK_TREE", captured)
 
 
 if __name__ == "__main__":

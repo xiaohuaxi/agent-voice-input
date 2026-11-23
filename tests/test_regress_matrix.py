@@ -533,6 +533,152 @@ class TestRegressMatrixLayerC(unittest.TestCase):
             self.assertEqual(c5["status"], "FAIL")
             self.assertIn("missing required columns", c5["detail"])
 
+    def test_newer_large_zero_turn_drift_not_masked_by_older_valid_session(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="avi-t-lc-drift-mask-") as raw_td:
+            home = Path(raw_td)
+            sess_dir = home / ".codex" / "sessions" / "2026" / "11" / "23"
+            older_ok = rm._write_codex_rollout(
+                sess_dir / "rollout-2026-11-23T08-00-00-aaaa1001-0000-4000-8000-000000000001.jsonl",
+                "aaaa1001-0000-4000-8000-000000000001",
+                str(home / "repo"),
+                [("user", "old valid turn"), ("assistant", "old valid reply")],
+            )
+            newer_drift = sess_dir / "rollout-2026-11-23T09-00-00-aaaa1002-0000-4000-8000-000000000002.jsonl"
+            newer_drift.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": "aaaa1002-0000-4000-8000-000000000002", "cwd": str(home), "source": "cli"},
+                    }
+                )
+                + "\n"
+                + json.dumps({"type": "unknown_v99_event", "blob": "X" * 5000})
+                + "\n",
+                encoding="utf-8",
+            )
+            os.utime(older_ok, (1700000100, 1700000100))
+            os.utime(newer_drift, (1700000200, 1700000200))
+
+            checks = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            c1 = next(c for c in checks if c["id"] == "C1_real_codex_cli")
+            self.assertEqual(c1["status"], "FAIL")
+            self.assertIn("schema drift", c1["detail"])
+            self.assertIn("candidate#1", c1["detail"])
+            self.assertIn("older candidate#2", c1["detail"])
+            self.assertEqual(c1["metrics"]["drift_candidate"], 1)
+            self.assertEqual(c1["metrics"]["older_ok_candidate"], 2)
+            self.assertEqual(c1["metrics"]["older_ok_turns"], 2)
+
+            # Even when candidate#1 is a small empty session and candidate#2 is >=4KB 0-turn drift,
+            # older candidate#3 with turns>0 MUST NOT turn the check into PASS!
+            newest_small_empty = rm._write_codex_rollout(
+                sess_dir / "rollout-2026-11-23T10-00-00-aaaa1003-0000-4000-8000-000000000003.jsonl",
+                "aaaa1003-0000-4000-8000-000000000003",
+                str(home / "repo"),
+                [],
+            )
+            os.utime(newest_small_empty, (1700000300, 1700000300))
+            checks2 = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            c1_b = next(c for c in checks2 if c["id"] == "C1_real_codex_cli")
+            self.assertEqual(c1_b["status"], "FAIL")
+            self.assertIn("schema drift", c1_b["detail"])
+            self.assertEqual(c1_b["metrics"]["drift_candidate"], 2)
+            self.assertEqual(c1_b["metrics"]["older_ok_candidate"], 3)
+
+    def test_newer_parse_exception_not_masked_by_older_valid_session(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="avi-t-lc-exc-mask-") as raw_td:
+            home = Path(raw_td)
+            sess_dir = home / ".codex" / "sessions" / "2026" / "11" / "23"
+            older_ok = rm._write_codex_rollout(
+                sess_dir / "rollout-2026-11-23T08-00-00-aaaa2001-0000-4000-8000-000000000001.jsonl",
+                "aaaa2001-0000-4000-8000-000000000001",
+                str(home / "repo"),
+                [("user", "old turn"), ("assistant", "old reply")],
+            )
+            newer_boom = rm._write_codex_rollout(
+                sess_dir / "rollout-2026-11-23T09-00-00-aaaa2002-0000-4000-8000-000000000002.jsonl",
+                "aaaa2002-0000-4000-8000-000000000002",
+                str(home / "repo"),
+                [("user", "new turn")],
+            )
+            os.utime(older_ok, (1700000100, 1700000100))
+            os.utime(newer_boom, (1700000200, 1700000200))
+
+            orig_clean = rm._clean_jsonl_file
+
+            def _boom_on_newer(cli: str, path_str: str, **kw):
+                if path_str == str(newer_boom):
+                    raise ValueError("corrupted upstream frame")
+                return orig_clean(cli, path_str, **kw)
+
+            with mock.patch.object(rm, "_clean_jsonl_file", side_effect=_boom_on_newer):
+                checks = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            c1 = next(c for c in checks if c["id"] == "C1_real_codex_cli")
+            self.assertEqual(c1["status"], "FAIL")
+            self.assertIn("corrupted upstream frame", c1["detail"])
+            self.assertIn("older candidate#2", c1["detail"])
+            self.assertEqual(c1["metrics"]["error_candidate"], 1)
+            self.assertEqual(c1["metrics"]["older_ok_candidate"], 2)
+
+    def test_c4_validates_all_existing_agy_db_roots(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="avi-t-lc4-all-") as raw_td:
+            home = Path(raw_td)
+            db1 = home / ".gemini" / "antigravity" / "conversation_summaries.db"
+            db2 = home / ".gemini" / "antigravity-ide" / "conversation_summaries.db"
+            _create_sqlite(
+                db1,
+                [
+                    ("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT)", ()),
+                    ("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("cid-1", "Root 1 Title", "[]")),
+                ],
+            )
+            _create_sqlite(
+                db2,
+                [
+                    ("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, workspace_uris TEXT)", ()),
+                    ("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("cid-2", "Root 2 Title", "[]")),
+                    ("INSERT INTO conversation_summaries VALUES (?, ?, ?)", ("cid-3", "Root 2 Second", "[]")),
+                ],
+            )
+
+            # 1) Both roots healthy -> PASS with both roots reported
+            checks_ok = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            c4_ok = next(c for c in checks_ok if c["id"] == "C4_real_agy2_db")
+            self.assertEqual(c4_ok["status"], "PASS")
+            self.assertEqual(c4_ok["metrics"]["roots_checked"], 2)
+            self.assertEqual(c4_ok["metrics"]["db_roots"], ["antigravity", "antigravity-ide"])
+            self.assertEqual(c4_ok["metrics"]["rows"], 3)
+
+            # 2) First root healthy, second root missing required 'title' column -> FAIL!
+            db2.unlink()
+            _create_sqlite(db2, [("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY)", ())])
+            checks_bad_cols = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            c4_bad_cols = next(c for c in checks_bad_cols if c["id"] == "C4_real_agy2_db")
+            self.assertEqual(c4_bad_cols["status"], "FAIL")
+            self.assertIn("antigravity-ide", c4_bad_cols["detail"])
+            self.assertIn("missing required columns", c4_bad_cols["detail"])
+            self.assertEqual(c4_bad_cols["metrics"]["roots_checked"], 2)
+
+            # 3) First root healthy, second root corrupt / unreadable -> FAIL!
+            db2.write_bytes(b"corrupt secondary sqlite file")
+            checks_corrupt = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            c4_corrupt = next(c for c in checks_corrupt if c["id"] == "C4_real_agy2_db")
+            self.assertEqual(c4_corrupt["status"], "FAIL")
+            self.assertIn("antigravity-ide", c4_corrupt["detail"])
+
+            # 4) First root healthy, second root is symlink -> FAIL!
+            ext_db = Path(raw_td) / "ext_c4.db"
+            _create_sqlite(
+                ext_db,
+                [("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)", ())],
+            )
+            db2.unlink()
+            os.symlink(ext_db, db2)
+            checks_sym = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            c4_sym = next(c for c in checks_sym if c["id"] == "C4_real_agy2_db")
+            self.assertEqual(c4_sym["status"], "FAIL")
+            self.assertIn("antigravity-ide", c4_sym["detail"])
+
 
 class TestRegressMatrixIsolationAndCli(unittest.TestCase):
     def test_layer_a_env_allowlist_strips_host_config_codex_home_and_secrets(self) -> None:

@@ -1790,64 +1790,97 @@ def _probe_real_cli_candidates(
     redact_fn: Callable[[Any], str],
     empty_msg: str,
 ) -> dict[str, Any]:
-    """Evaluate up to 5 latest root session candidates; catch >=4KB 0-turn schema drift."""
+    """Evaluate up to 5 latest root session candidates; never let older turns mask newer drift/errors."""
     if not candidates:
         return _make_check(check_id, "C", "SKIP", empty_msg)
 
-    drift_hit: tuple[int, int] | None = None
+    drift_hit: tuple[int, int, int] | None = None  # (candidate_idx, size_bytes, parse_ms)
+    first_exc: tuple[int, int, Exception] | None = None  # (candidate_idx, size_bytes, exc)
+    older_pass: tuple[int, int, int, int, int] | None = None  # (idx, turns, chars, size, parse_ms)
     max_small_size = 0
-    first_exc: Exception | None = None
+    checked = 0
 
     for idx, (size, path) in enumerate(candidates[:_LAYER_C_MAX_CANDIDATES], start=1):
+        checked = idx
         t0 = time.monotonic()
         try:
             turns, _, _ = _clean_jsonl_file(cli_name, str(path), home=home, wsl=eff_wsl)
             parse_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
         except Exception as exc:
             if first_exc is None:
-                first_exc = exc
+                first_exc = (idx, size, exc)
             continue
         if len(turns) > 0:
             chars = sum(len(txt) for _, txt in turns)
-            return _make_check(
-                check_id,
-                "C",
-                "PASS",
-                f"turns={len(turns)} chars={chars} file_kb={round(size / 1024.0, 1)} parse_ms={parse_ms}",
-                {
-                    "turns": len(turns),
-                    "chars": chars,
-                    "file_kb": round(size / 1024.0, 1),
-                    "parse_ms": parse_ms,
-                    "candidates_checked": idx,
-                },
-            )
+            if drift_hit is None and first_exc is None:
+                return _make_check(
+                    check_id,
+                    "C",
+                    "PASS",
+                    f"turns={len(turns)} chars={chars} file_kb={round(size / 1024.0, 1)} parse_ms={parse_ms}",
+                    {
+                        "turns": len(turns),
+                        "chars": chars,
+                        "file_kb": round(size / 1024.0, 1),
+                        "parse_ms": parse_ms,
+                        "candidates_checked": idx,
+                    },
+                )
+            older_pass = (idx, len(turns), chars, size, parse_ms)
+            break
         if size >= _LAYER_C_SCHEMA_DRIFT_MIN_BYTES:
-            if drift_hit is None or size > drift_hit[0]:
-                drift_hit = (size, parse_ms)
+            if drift_hit is None:
+                drift_hit = (idx, size, parse_ms)
         else:
             max_small_size = max(max_small_size, size)
 
-    checked = min(len(candidates), _LAYER_C_MAX_CANDIDATES)
-    if drift_hit is not None:
-        d_size, d_ms = drift_hit
+    older_note = (
+        f"; older candidate#{older_pass[0]} still parsed turns={older_pass[1]} (chars={older_pass[2]})"
+        if older_pass is not None
+        else ""
+    )
+    if drift_hit is not None and (first_exc is None or drift_hit[0] <= first_exc[0]):
+        d_idx, d_size, d_ms = drift_hit
         file_kb = round(d_size / 1024.0, 1)
+        metrics: dict[str, Any] = {
+            "turns": 0,
+            "chars": 0,
+            "file_kb": file_kb,
+            "size_bytes": d_size,
+            "parse_ms": d_ms,
+            "drift_candidate": d_idx,
+            "candidates_checked": checked,
+        }
+        if older_pass is not None:
+            metrics["older_ok_candidate"] = older_pass[0]
+            metrics["older_ok_turns"] = older_pass[1]
         return _make_check(
             check_id,
             "C",
             "FAIL",
-            f"possible upstream schema drift: file_kb={file_kb} ({d_size}B >= {_LAYER_C_SCHEMA_DRIFT_MIN_BYTES}B) parsed 0 turns (checked={checked})",
-            {
-                "turns": 0,
-                "chars": 0,
-                "file_kb": file_kb,
-                "size_bytes": d_size,
-                "parse_ms": d_ms,
-                "candidates_checked": checked,
-            },
+            f"possible upstream schema drift: candidate#{d_idx} file_kb={file_kb} ({d_size}B >= {_LAYER_C_SCHEMA_DRIFT_MIN_BYTES}B) parsed 0 turns (checked={checked}){older_note}",
+            metrics,
         )
     if first_exc is not None:
-        return _make_check(check_id, "C", "FAIL", redact_fn(first_exc))
+        e_idx, e_size, exc = first_exc
+        metrics = {
+            "turns": 0,
+            "chars": 0,
+            "file_kb": round(e_size / 1024.0, 1),
+            "size_bytes": e_size,
+            "error_candidate": e_idx,
+            "candidates_checked": checked,
+        }
+        if older_pass is not None:
+            metrics["older_ok_candidate"] = older_pass[0]
+            metrics["older_ok_turns"] = older_pass[1]
+        return _make_check(
+            check_id,
+            "C",
+            "FAIL",
+            f"parse error on candidate#{e_idx}: {redact_fn(exc)}{older_note}",
+            metrics,
+        )
     return _make_check(
         check_id,
         "C",
@@ -1950,51 +1983,112 @@ def run_layer_c_real_clis(raw_env: Mapping[str, str], redact_fn: Callable[[Any],
         )
     )
 
-    # 4) Antigravity 2.0 conversation_summaries.db (mode=ro, reuse _iter_agy_ide_roots)
-    agy_db: Path | None = None
-    for root in _iter_agy_ide_roots(home):
-        cand_db = root / "conversation_summaries.db"
-        if os.path.lexists(cand_db):
-            agy_db = cand_db
-            break
-    if agy_db is None:
+    # 4) Antigravity 2.0 conversation_summaries.db (mode=ro, validate ALL existing roots from _iter_agy_ide_roots)
+    agy_dbs: list[Path] = [
+        cand_db
+        for root in _iter_agy_ide_roots(home)
+        if os.path.lexists(cand_db := root / "conversation_summaries.db")
+    ]
+    if not agy_dbs:
         checks.append(_make_check("C4_real_agy2_db", "C", "SKIP", "conversation_summaries.db not present"))
     else:
-        t0 = time.monotonic()
-        conn = _open_readonly_sqlite(agy_db, wsl=eff_wsl)
-        if conn is None:
-            checks.append(_make_check("C4_real_agy2_db", "C", "FAIL", "failed to open conversation_summaries.db in mode=ro"))
-        else:
+        ok_roots: list[dict[str, Any]] = []
+        failed_roots: list[dict[str, Any]] = []
+        for agy_db in agy_dbs:
+            root_name = agy_db.parent.name
+            t0 = time.monotonic()
+            conn = _open_readonly_sqlite(agy_db, wsl=eff_wsl)
+            if conn is None:
+                failed_roots.append(
+                    {"db_root": root_name, "error": "failed to open conversation_summaries.db in mode=ro"}
+                )
+                continue
             try:
                 with contextlib.closing(conn):
                     cols = _get_sqlite_table_cols(conn, "conversation_summaries")
                     required = {"conversation_id", "title"}
                     missing = sorted(required - cols)
                     if missing:
-                        checks.append(
-                            _make_check("C4_real_agy2_db", "C", "FAIL", f"missing required columns: {missing}")
+                        failed_roots.append(
+                            {"db_root": root_name, "error": f"missing required columns: {missing}"}
                         )
                     else:
                         with contextlib.closing(conn.execute("SELECT COUNT(*) FROM conversation_summaries")) as cur:
                             row_count = int((cur.fetchone() or (0,))[0])
                         q_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
-                        checks.append(
-                            _make_check(
-                                "C4_real_agy2_db",
-                                "C",
-                                "PASS",
-                                f"mode=ro ok root={agy_db.parent.name} rows={row_count} has_workspace_uris={'workspace_uris' in cols} query_ms={q_ms}",
-                                {
-                                    "db_root": agy_db.parent.name,
-                                    "rows": row_count,
-                                    "has_workspace_uris": "workspace_uris" in cols,
-                                    "column_count": len(cols),
-                                    "query_ms": q_ms,
-                                },
-                            )
+                        ok_roots.append(
+                            {
+                                "db_root": root_name,
+                                "rows": row_count,
+                                "has_workspace_uris": "workspace_uris" in cols,
+                                "column_count": len(cols),
+                                "query_ms": q_ms,
+                            }
                         )
             except (sqlite3.Error, OSError) as exc:
-                checks.append(_make_check("C4_real_agy2_db", "C", "FAIL", redact_fn(exc)))
+                failed_roots.append({"db_root": root_name, "error": redact_fn(exc)})
+
+        if failed_roots:
+            fail_desc = "; ".join(f"{f['db_root']}: {f['error']}" for f in failed_roots)
+            ok_suffix = (
+                f" (ok roots: {', '.join(r['db_root'] for r in ok_roots)})"
+                if ok_roots
+                else ""
+            )
+            checks.append(
+                _make_check(
+                    "C4_real_agy2_db",
+                    "C",
+                    "FAIL",
+                    f"{fail_desc}{ok_suffix}",
+                    {
+                        "roots_checked": len(agy_dbs),
+                        "failed_roots": failed_roots,
+                        "passed_roots": ok_roots,
+                    },
+                )
+            )
+        elif len(ok_roots) == 1:
+            r0 = ok_roots[0]
+            checks.append(
+                _make_check(
+                    "C4_real_agy2_db",
+                    "C",
+                    "PASS",
+                    (
+                        f"mode=ro ok root={r0['db_root']} rows={r0['rows']} "
+                        f"has_workspace_uris={r0['has_workspace_uris']} query_ms={r0['query_ms']}"
+                    ),
+                    {
+                        **r0,
+                        "db_roots": [r0["db_root"]],
+                        "roots_checked": 1,
+                    },
+                )
+            )
+        else:
+            total_rows = sum(int(r["rows"]) for r in ok_roots)
+            total_ms = sum(int(r["query_ms"]) for r in ok_roots)
+            roots_summary = ", ".join(
+                f"{r['db_root']}(rows={r['rows']},ws={r['has_workspace_uris']})" for r in ok_roots
+            )
+            checks.append(
+                _make_check(
+                    "C4_real_agy2_db",
+                    "C",
+                    "PASS",
+                    f"mode=ro ok roots={len(ok_roots)} [{roots_summary}] query_ms={total_ms}",
+                    {
+                        "db_root": ",".join(r["db_root"] for r in ok_roots),
+                        "db_roots": [r["db_root"] for r in ok_roots],
+                        "roots_checked": len(ok_roots),
+                        "rows": total_rows,
+                        "has_workspace_uris": all(bool(r["has_workspace_uris"]) for r in ok_roots),
+                        "query_ms": total_ms,
+                        "per_root": ok_roots,
+                    },
+                )
+            )
 
     # 5) ChatGPT / Codex unified desktop codex.db (mode=ro; fallback to state_5.sqlite when codex.db absent)
     codex_db = home / ".codex" / "sqlite" / "codex.db"

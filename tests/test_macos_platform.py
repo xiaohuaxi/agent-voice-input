@@ -5372,6 +5372,137 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             finally:
                 plat.close()
 
+    def test_macos_hwnd_zero_applescript_terminal_identity_and_unwaited_same_window_verifier(self) -> None:
+        """R2 polish item 5: hwnd 0->positive respects AppleScript fallback & terminal identities; pre-commit same_window_verifier on unwaited path."""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Config()
+            plat = MacOSPlatform(
+                cfg, env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"}, cache_dir=Path(td) / "c_r2_5"
+            )
+            try:
+                # 1a. AppleScript fallback origin (ax_trusted=None, hwnd=0) -> shim-recovered hwnd>0 with same title is NOT drift
+                orig_osa = ForegroundWindow(0, "ChatGPT", "Optimize Alpha", bundle_id="com.openai.codex", ax_trusted=None)
+                cur_shim = ForegroundWindow(42, "ChatGPT", "Optimize Alpha", bundle_id="com.openai.codex", ax_trusted=True)
+                self.assertFalse(plat._is_focus_drifted(orig_osa, cur_shim))
+
+                # 1b. Independent terminal identities (surface_id / tty / tmux_pane) checked before hwnd 0->positive
+                orig_surf = ForegroundWindow(0, "Ghostty", "zsh", bundle_id=GHOSTTY_BUNDLE_ID, surface_id="surf-1", ax_trusted=True)
+                cur_surf_same = ForegroundWindow(77, "Ghostty", "zsh", bundle_id=GHOSTTY_BUNDLE_ID, surface_id="surf-1", ax_trusted=True)
+                cur_surf_diff = ForegroundWindow(77, "Ghostty", "zsh", bundle_id=GHOSTTY_BUNDLE_ID, surface_id="surf-2", ax_trusted=True)
+                cur_surf_lost = ForegroundWindow(77, "Ghostty", "zsh", bundle_id=GHOSTTY_BUNDLE_ID, surface_id="", ax_trusted=True)
+                self.assertFalse(plat._is_focus_drifted(orig_surf, cur_surf_same))
+                self.assertTrue(plat._is_focus_drifted(orig_surf, cur_surf_diff))
+                self.assertTrue(plat._is_focus_drifted(orig_surf, cur_surf_lost))
+
+                orig_tty = ForegroundWindow(0, "Terminal", "zsh", bundle_id=APPLE_TERMINAL_BUNDLE_ID, tty="/dev/ttys003", ax_trusted=True)
+                cur_tty_same = ForegroundWindow(88, "Terminal", "zsh", bundle_id=APPLE_TERMINAL_BUNDLE_ID, tty="/dev/ttys003", ax_trusted=True)
+                cur_tty_diff = ForegroundWindow(88, "Terminal", "zsh", bundle_id=APPLE_TERMINAL_BUNDLE_ID, tty="/dev/ttys004", ax_trusted=True)
+                cur_tty_lost = ForegroundWindow(88, "Terminal", "zsh", bundle_id=APPLE_TERMINAL_BUNDLE_ID, tty="", ax_trusted=True)
+                self.assertFalse(plat._is_focus_drifted(orig_tty, cur_tty_same))
+                self.assertTrue(plat._is_focus_drifted(orig_tty, cur_tty_diff))
+                self.assertTrue(plat._is_focus_drifted(orig_tty, cur_tty_lost))
+
+                orig_tmux = ForegroundWindow(0, "WezTerm", "tmux", bundle_id="com.github.wez.wezterm", tmux_pane="%5", ax_trusted=True)
+                cur_tmux_same = ForegroundWindow(99, "WezTerm", "tmux", bundle_id="com.github.wez.wezterm", tmux_pane="%5", ax_trusted=True)
+                cur_tmux_diff = ForegroundWindow(99, "WezTerm", "tmux", bundle_id="com.github.wez.wezterm", tmux_pane="%6", ax_trusted=True)
+                cur_tmux_lost = ForegroundWindow(99, "WezTerm", "tmux", bundle_id="com.github.wez.wezterm", tmux_pane="", ax_trusted=True)
+                self.assertFalse(plat._is_focus_drifted(orig_tmux, cur_tmux_same))
+                self.assertTrue(plat._is_focus_drifted(orig_tmux, cur_tmux_diff))
+                self.assertTrue(plat._is_focus_drifted(orig_tmux, cur_tmux_lost))
+
+                # 1c. No terminal identity + shim-confirmed ax_trusted (True or False) + hwnd 0->positive IS drift
+                orig_ax_false = ForegroundWindow(0, "ChatGPT", "", bundle_id="com.openai.codex", ax_trusted=False)
+                cur_popup = ForegroundWindow(55, "ChatGPT", "New Popup", bundle_id="com.openai.codex", ax_trusted=False)
+                self.assertTrue(plat._is_focus_drifted(orig_ax_false, cur_popup))
+
+                # 2. deliver_text unwaited path (waited_for_key=False, waited_for_settle=False) still re-verifies same_window_verifier before commit
+                orig_codex = ForegroundWindow(901, "ChatGPT", "Local Task", bundle_id="com.openai.codex", ax_trusted=True)
+                swapped_cloud = ForegroundWindow(901, "ChatGPT", "Cloud Chat", bundle_id="com.openai.codex", ax_trusted=True)
+
+                copied: list[str] = []
+                paste_rpcs: list[dict[str, object]] = []
+
+                def _fake_copy(txt: str) -> bool:
+                    copied.append(txt)
+                    return True
+
+                def _fake_rpc(payload: dict[str, object], timeout_sec: float = 1.5, **kw: object) -> dict[str, object]:
+                    del timeout_sec, kw
+                    op = payload.get("cmd")
+                    if op == "key_state":
+                        return {"ok": True, "hotkey_held": False}
+                    if op == "paste_cmd_v":
+                        paste_rpcs.append(dict(payload))
+                        return {"ok": True, "posted": True, "clipboard": True, "reason": "ok", "fg_process": "ChatGPT"}
+                    return {"ok": True}
+
+                plat._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat._shim_caps = frozenset({"paste_clip"})
+                plat._flush_shim_events = lambda timeout_sec=0.05: True  # type: ignore[method-assign]
+                plat._shim_rpc = _fake_rpc  # type: ignore[method-assign]
+                plat._copy_to_clipboard = _fake_copy  # type: ignore[method-assign]
+                plat.beep = lambda _k: None  # type: ignore[method-assign]
+
+                # 2a. First sample sees Local Task (passes), pre-commit sample sees Cloud Chat -> verifier rejects -> clipboard fallback, 0 paste RPCs!
+                fg_seq = iter([orig_codex, swapped_cloud])
+                verified_titles: list[str] = []
+                with mock.patch.object(plat, "_query_paste_foreground_window", side_effect=lambda: next(fg_seq)):
+                    out_drift = plat.deliver_text(
+                        "本地对话文本",
+                        seq_id=301,
+                        origin_window=orig_codex,
+                        fallback_clipboard_text="安全剪贴板兜底",
+                        same_window_verifier=lambda w: (verified_titles.append(w.title) or w.title == "Local Task"),
+                    )
+                self.assertFalse(out_drift.pasted)
+                self.assertTrue(out_drift.clipboard)
+                self.assertEqual(out_drift.reason, "focus_changed")
+                self.assertEqual(paste_rpcs, [])
+                self.assertEqual(copied, ["安全剪贴板兜底"])
+                self.assertEqual(verified_titles, ["Local Task", "Cloud Chat"])
+
+                # 2b. Pre-commit re-sample stays on Local Task -> verifier passes twice and pastes once
+                copied.clear()
+                paste_rpcs.clear()
+                verified_titles.clear()
+                with mock.patch.object(plat, "_query_paste_foreground_window", return_value=orig_codex):
+                    out_ok = plat.deliver_text(
+                        "本地对话正常粘贴",
+                        seq_id=302,
+                        origin_window=orig_codex,
+                        same_window_verifier=lambda w: (verified_titles.append(w.title) or w.title == "Local Task"),
+                    )
+                self.assertTrue(out_ok.pasted)
+                self.assertEqual(len(paste_rpcs), 1)
+                self.assertEqual(verified_titles, ["Local Task", "Local Task"])
+
+                # 2c. Pre-commit re-sample raises exception -> safely degrades to clipboard (never pastes blindly)
+                copied.clear()
+                paste_rpcs.clear()
+                fg_err_calls = [0]
+
+                def _fg_ok_then_err() -> ForegroundWindow:
+                    fg_err_calls[0] += 1
+                    if fg_err_calls[0] == 1:
+                        return orig_codex
+                    raise RuntimeError("AX re-sample failed")
+
+                with mock.patch.object(plat, "_query_paste_foreground_window", side_effect=_fg_ok_then_err):
+                    out_err = plat.deliver_text(
+                        "采样异常安全降级",
+                        seq_id=303,
+                        origin_window=orig_codex,
+                        fallback_clipboard_text="异常兜底文本",
+                        same_window_verifier=lambda w: w.title == "Local Task",
+                    )
+                self.assertFalse(out_err.pasted)
+                self.assertTrue(out_err.clipboard)
+                self.assertEqual(out_err.reason, "focus_changed")
+                self.assertEqual(paste_rpcs, [])
+                self.assertEqual(copied, ["异常兜底文本"])
+            finally:
+                plat.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1864,8 +1864,6 @@ class MacOSPlatform(JsonlShimMixin):
             return True
         if origin.hwnd > 0 and current.hwnd > 0 and origin.hwnd != current.hwnd:
             return True
-        if (origin.process or origin.bundle_id) and origin.hwnd <= 0 and current.hwnd > 0:
-            return True
         if origin.surface_id and current.surface_id and origin.surface_id != current.surface_id:
             return True
         if (
@@ -1901,6 +1899,19 @@ class MacOSPlatform(JsonlShimMixin):
                 if _normalize_tmux_title_for_drift(origin.title) != _normalize_tmux_title_for_drift(current.title):
                     return True
             return False
+        has_term_identity = bool(
+            (origin.surface_id and current.surface_id)
+            or (origin.tmux_pane and current.tmux_pane)
+            or (orig_tty and cur_tty)
+        )
+        if (
+            not has_term_identity
+            and (origin.process or origin.bundle_id)
+            and origin.ax_trusted is not None
+            and origin.hwnd <= 0
+            and current.hwnd > 0
+        ):
+            return True
         if (origin.process or origin.bundle_id) and origin.title and not current.title and current.hwnd <= 0 and not cur_tty:
             return True
         if (origin.process or origin.bundle_id) and origin.title and current.title:
@@ -2597,7 +2608,7 @@ class MacOSPlatform(JsonlShimMixin):
 
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", fg.process)
-        if waited_for_settle or waited_for_key:
+        if waited_for_settle or waited_for_key or same_window_verifier is not None:
             try:
                 fg = self._query_paste_foreground_window()
             except Exception:
