@@ -1,124 +1,160 @@
-[English](https://github.com/xiaohuaxi/agent-voice-input/blob/main/README.md) | **简体中文**
+[English](README.md) | **简体中文**
 
 # agent-voice-input
 
 [![PyPI version](https://img.shields.io/pypi/v/agent-voice-input.svg)](https://pypi.org/project/agent-voice-input/)
 [![Python 3.10+](https://img.shields.io/pypi/pyversions/agent-voice-input.svg)](https://pypi.org/project/agent-voice-input/)
 [![CI](https://github.com/xiaohuaxi/agent-voice-input/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaohuaxi/agent-voice-input/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/xiaohuaxi/agent-voice-input/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-专为命令行 Coding Agent（**Codex**、**Claude Code**、**Antigravity CLI / `agy`**）打造的**会话感知（Context-Aware）语音输入工具**。
-
-通用语音输入法听不懂你项目里的文件名和变量名；`agent-voice-input` 会自动锁定当前终端窗口/分屏里正在工作的 Agent 会话，结合近期对话与 `git status` 真实上下文对语音转写结果做轻量精修，在粘贴进终端前把同音标识符、中英混说术语与口语中途改口一次修准：
+**专为 CLI Coding Agent 打造的会话感知语音输入——听得懂你的仓库、对话与远端 SSH。**  
+支持 **Codex**、**Claude Code**、**Antigravity CLI (`agy`)**，同时开箱覆盖桌面 IDE 与日常桌面应用。
 
 ```text
 🎙️ 你对着终端随口说：
-   “帮我看一下那个平台微埃斯艾尔点派里面 max duration 秒数的默认值，
-    把三分钟改成五分钟，呃不对算了改成十分钟，顺便跑一下单测别接管道 head”
+   “呃帮我查一下 session router 点派里面 retry timeout 的默认值，
+    从五秒改成十秒——呃不对算了改成十五秒，跑一下单测别接管道 head”
 
 ❌ 普通语音听写：
-   帮我看一下那个平台WSL点派里面max duration秒数的默认值，把3分钟改成5分钟，呃不对算了改成10分钟，顺便跑一下单测别接管道head
+   呃帮我查一下 session router 点派里面 retry timeout 的默认值，从5秒改成10秒，呃不对算了改成15秒，跑一下单测别接管道head
 
-✅ agent-voice-input（结合当前 Agent 会话与代码仓上下文精修后粘贴，不自动按回车）：
-   帮我看一下 platform_wsl.py 里面 max_duration_sec 的默认值，改成 10 分钟，顺便跑一下单测，别接管道 head。
+✅ agent-voice-input（对齐当前仓库与活跃会话精修，只粘贴不自动回车）：
+   帮我查一下 session_router.py 里面 retry_timeout_sec 的默认值，改成 15 秒，跑一下单测，别接管道 head。
 ```
 
-> 已验证支持 **Windows Terminal + WSL2（含远程桌面与 `tmux`）** 与 **macOS（`Ghostty`、系统自带 `Terminal.app` /「终端」及 `tmux`）**；其他常用 macOS 终端（`iTerm2`、`WezTerm`、`Alacritty`、`Kitty`、`Warp` 等）已内置窗口级防串窗、子进程 PTY 会话发现与 `Cmd+V` / `tmux` 粘贴基线支持，欢迎在对应环境实测并提交 PR。
+---
+
+## 核心技术亮点与实际收益
+
+- **两段式 / 单跳双模式 + 50K 分块前缀缓存 → 高准确度、低延迟、省费用**：支持「一阶段专用转写 + 二阶段轻量精修」或「多模态单跳直出」；对话历史按固定 50K 只读块前置以稳定命中前缀缓存，连续说话后台并发精修、按顺序保序落字。
+- **窗口焦点 + 终端会话 + SSH 远端防串台路由 → 纠偏精准、上下文绝不串台**：自动锁定当前终端窗口、Ghostty 分屏或 `tmux` 窗格的活跃会话与 `git status` 文件名；切到桌面 IDE 仅挂载本地工作区不泄终端对话，切到聊天/浏览器自动切通用润色；SSH 远端默认硬隔离防本地串台，加一行白名单即可经 `ssh -- <host> python3 -` 零远端安装异步预取远端上下文。
+- **零第三方 Python 依赖纯标准库 + 声学静音门控 → 轻巧常驻、不浪费请求**：纯 Python `>= 3.10` 标准库搭配宿主机 `ffmpeg` 与原生轻量桥接（无 Electron）；本地静音门控与响度归一化拦截空触，支持默认最长 10 分钟口述（超 3 分钟按自然停顿自动切分并发转写），失败或取消在途任务的录音以 `0600` 权限暂存供 `retry` 恢复。
+- **Ghostty / `tmux` 零剪贴板直投 + 默认绝不自动回车 → 终端投递安全可控**：按下即锁起点窗口，处理期间切走焦点自动退回剪贴板防误贴；macOS Ghostty 与 `tmux` 直接注入不碰系统剪贴板（其余窗口支持剪贴板多格式快照还原）；默认只粘贴绝不自动按回车，避免误执行命令。
+- **100% 非交互式 CLI → 天然适合交给你的 AI Agent 一键安装与排障**：全部命令零 `y/n` 弹窗，自带 `doctor --ping --json` 与 `diagnose --json` 结构化自检，把一段提示词粘给 Codex / Claude Code / AGY 即可自动配好。
 
 ---
 
-## 核心亮点
+## 平台与支持终端矩阵
 
-- **精准绑定活跃 Agent 上下文，贯通本地、桌面与 SSH 远端**：在本地终端内自动识别前台窗口、Ghostty 分屏或 `tmux` 焦点窗格（无需修改 `~/.tmux.conf`）中的主 Agent 会话，增量抽取最近对话与 `git status` 变更文件名（非 Git 普通项目/文稿目录自动提取浅层文件名）纠偏，严格隔离后台 subagent 与相邻分屏；在 SSH 连接无头 Linux 服务器时，前台 SSH / Remote-SSH 窗口零配置自动阻断本地后台会话串台，配一行 `[remote] hosts = ["devbox"]` 即可在说话期间通过 `ssh -- <target> python3 -` 零远端安装异步预取远端会话上下文；同时默认支持任意桌面窗口语音输入（`hotkey.scope = "all"`，亦可设为 `"coding"` 或 `"terminals"`）：主流桌面 IDE（`VS Code`、`Cursor`、`Windsurf`、`Zed`、`JetBrains`、`Xcode` 等）自动定位当前本地工作区（兼容 Git 仓库与普通文件夹）挂载文件拼写参考且硬隔离后台终端会话，桌面版 **Antigravity IDE** 更可关联该工作区最近活跃的同构 `brain/` 主会话；AI 聊天桌面端、即时通讯与日常窗口自动切换自适应通用模式，聚焦远程桌面/虚拟机客户端时自动静默让行热键（`yield_remote_desktop = true`）。完整路由规则见 [`docs/context-routing.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/context-routing.md)。
-- **按渠道即插即用的「识别 + 精修」双引擎**：`asr.provider = "auto"` 与 `refiner.provider = "auto"` 只需配置一把支持语音转写的 API Key 即可开箱跑通（二阶段可自动优先复用本机 `codex` CLI 登录态并在普通 ChatGPT 账号上无感回退公开轻量模型，或搭配 `DEEPSEEK_API_KEY` 等独立精修凭据），支持切换任意内置云端/本地 API 渠道（`deepseek`、`dashscope`、`openrouter`、`gemini`、`volcengine`、`openai`、`groq`、`siliconflow`），或使用百炼 `qwen3.8-omni-flash` / Gemini / OpenRouter 多模态单跳共享 50K 缓存直出；日常只需指定 `provider`，自动匹配对应渠道的默认模型。
-- **面向长口述与连续口述的可靠录音链**：支持在上一句转写/精修期间直接开始下一段录音——二阶段无状态精修自动并发重叠、上屏严格按 `seq_id` 先后保序落字（切走窗口回退剪贴板的多段结果自动空行拼接、不覆盖前文）；支持随时用 `agent-voice-input cancel` 或在 `tap_toggle` 模式下单独长按热键满 `0.8s`（`hotkey.hold_cancel_ms`，不等松手实时触发、按住 `0.25s` 起轻提示；连发录音中先取消当前录音、再长按一次取消后台在途任务；`0.5s–0.8s` 为静默犹豫死区，高于默认短按上限 `hotkey.tap_max_ms = 500`）即时取消当前录音或中断后台在途识别/精修；内置静音门控与响度归一化拦截空触；单次默认最长 10 分钟（最后 15 秒胶囊倒计时提示），超过 3 分钟的长语音自动挑自然停顿处切分并并发转写；无麦克风或中途掉麦即时提醒；转写/上屏失败或取消在途任务的有效语音均自动以 `0600` 权限暂存，随时用 `agent-voice-input retry` 恢复，绝不丢话。
-- **原生高分屏波形胶囊与防串窗安全粘贴**：Windows（Per-Monitor V2 HiDPI）与 macOS（Retina 原生面板）均提供不抢焦点的悬浮胶囊（计时、实时声波与阶段进度自动跟随系统中英文）；开始录音即锁定目标窗口/分屏，按进程自动路由粘贴快捷键（Windows 区分 `Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert`；macOS 在 Ghostty 与 `tmux` 内零触碰系统剪贴板直投，其余窗口走原生 `CGEvent` `Cmd+V`），只粘贴不自动回车，中途切走焦点则自动退回剪贴板防误投。
-- **零第三方 Python 依赖**：仅使用 Python `>= 3.10` 标准库与宿主机 `ffmpeg`（WSL2 复用系统内置 `powershell.exe`，macOS 首次启动自动编译缓存原生 `mac_shim`）。
+| 环境 | 支持状态 | 已验证与内置支持范围 |
+| :--- | :--- | :--- |
+| **macOS** *（Apple Silicon & Intel）* | **已支持** | 已实测 **Ghostty**、系统自带 **Terminal.app** 与 **`tmux`**；内置支持 **iTerm2**、**WezTerm**、**Kitty**、**Alacritty**、**Warp**、主流桌面 IDE 及常规桌面应用 |
+| **Windows + WSL2** | **已支持** | 已实测 **Windows Terminal**（含远程桌面与 **`tmux`**）；内置按进程粘贴路由支持 **WezTerm**、**Alacritty**、**Tabby**、**Hyper**、**mintty** / **PuTTY**、桌面 IDE 及常规桌面应用 |
+| **SSH 远端 Linux** | **已支持（零安装）** | 远端无头 Linux 服务器无需装包、无需常驻进程、无需 API Key，仅需系统自带 Python `>= 3.10`；默认防本地会话串台，配一行 `[remote] hosts` 白名单即可预取远端会话与工作区文件名 |
+| **桌面 IDE 与常规应用** | **已支持** | **VS Code**、**Cursor**、**Windsurf**、**Zed**、**JetBrains**、**Xcode**、**Antigravity IDE**（自动挂载本地工作区并硬隔离终端会话），以及微信、浏览器等常规桌面应用（默认 `hotkey.scope = "all"`） |
+| **原生 Linux 桌面 / 无 WSL2 原生 Windows** | **暂未原生支持** | 暂不支持 Wayland/X11 与无 WSL2 纯原生 Windows 的全局热键与悬浮胶囊（Linux 下命令行 `once` / `toggle` 与作为 SSH 远端目标主机现已可用） |
+
+> [!TIP]
+> **零 Hook、零 `tmux` 配置、全桌面开箱即用**：单窗口终端、macOS Ghostty 分屏、`tmux` 多窗格（无需改 `~/.tmux.conf`）、桌面 IDE 与日常桌面软件全部零配置即装即用。仅在「WSL2 不用 `tmux` 且同目录开多窗」或「需拉取 SSH 远端上下文」时才需按需配置可选钩子或一行白名单。
 
 ---
 
-## 快速开始
+## 1 分钟快速上手
 
-### 方式一：直接让你的 Coding Agent 帮你安装配置（推荐）
+### 路径 A：让你的 AI Agent 帮你安装配置（推荐）
 
-把下面这段话直接发给终端里的 **Codex**、**Claude Code** 或 **AGY** 即可完成安装、配妥凭据并后台启动：
+全命令行 **100% 非交互**（零 `y/n` 确认弹窗），把下面这段话直接发给 **Codex**、**Claude Code** 或 **AGY** 即可：
 
 ```text
 请帮我安装并配置 agent-voice-input（https://github.com/xiaohuaxi/agent-voice-input）：
 1. 检查 python3 (>=3.10) 与 ffmpeg（macOS 下顺带确认 Xcode Command Line Tools `/usr/bin/swiftc`），用 `uv tool install agent-voice-input` 安装（无 uv 则换用 pipx）；
-2. 运行 `agent-voice-input init` 初始化生成权限 600 的 `~/.config/agent-voice-input/config.toml` 与 `agent-voice-input.env`；
-3. 检查我当前环境中是否已有至少一把支持一阶段语音识别的凭据（如 DASHSCOPE_API_KEY、DOUBAO_SPEECH_API_KEY、OPENROUTER_API_KEY、GEMINI_API_KEY、OPENAI_API_KEY、GROQ_API_KEY 或 SILICONFLOW_API_KEY；二阶段可选搭配 DEEPSEEK_API_KEY / ARK_API_KEY 或本机 codex 登录），没有就问我用哪家，写入 `~/.config/agent-voice-input/agent-voice-input.env`；
-4. 运行 `agent-voice-input doctor --ping` 确认各项检查通过后，执行 `agent-voice-input start` 启动后台守护进程。
+2. 运行 `agent-voice-input init` 生成 0600 权限的 `~/.config/agent-voice-input/config.toml` 与 `agent-voice-input.env`；
+3. 检查环境中是否已有至少一把一阶段语音识别凭据（如 DASHSCOPE_API_KEY、DOUBAO_SPEECH_API_KEY、OPENROUTER_API_KEY、GEMINI_API_KEY、OPENAI_API_KEY、GROQ_API_KEY 或 SILICONFLOW_API_KEY；二阶段可选搭配 DEEPSEEK_API_KEY / ARK_API_KEY 或本机 codex/agy 登录），没有就问我选哪家并写入 `agent-voice-input.env`；
+4. 运行 `agent-voice-input doctor --ping` 确认通过后，执行 `agent-voice-input start` 启动后台守护进程。
 ```
 
-### 方式二：手动三步安装
-
-**1. 准备前置工具**
-
-- **Python** `>= 3.10`
-- **ffmpeg**：Ubuntu / WSL2 执行 `sudo apt install ffmpeg`；macOS 执行 `brew install ffmpeg`
-- **Xcode Command Line Tools**（macOS 推荐）：执行 `xcode-select --install` 提供 `/usr/bin/swiftc`，首次启动会自动编译缓存原生热键与胶囊辅助程序（未安装时仍可用命令行 `toggle` / `once` 模式）。
-
-**2. 安装 CLI（`v0.12.0`）**
+### 路径 B：手动 3 步安装（`v0.12.0`）
 
 ```bash
-uv tool install agent-voice-input
-# 或使用 pipx：pipx install agent-voice-input
-# （如需直接跟踪 main 分支：uv tool install git+https://github.com/xiaohuaxi/agent-voice-input.git）
-```
+# 1. 安装前置 ffmpeg 与 CLI（WSL2: `sudo apt install ffmpeg` | macOS: `brew install ffmpeg` + `xcode-select --install`）
+uv tool install agent-voice-input          # 或 `pipx install agent-voice-input`
 
-**3. 初始化配置、填入凭据并启动**
-
-```bash
+# 2. 初始化 0600 权限配置文件，并在 agent-voice-input.env 中填入至少一把一阶段语音 Key
 agent-voice-input init
-# 编辑权限 600 的 ~/.config/agent-voice-input/agent-voice-input.env 取消注释填入至少一把一阶段语音凭据，然后：
-agent-voice-input doctor --ping
-agent-voice-input start
+
+# 3. 探活体检并启动（轻按右 Ctrl <= 0.5s 开始/结束录音；长按 0.8s 即时取消）
+agent-voice-input doctor --ping && agent-voice-input start
 ```
 
-**凭据搭配说明**：在 `~/.config/agent-voice-input/agent-voice-input.env` 中配置至少一把支持一阶段语音识别的凭据（如阿里百炼 `DASHSCOPE_API_KEY`、豆包语音 `DOUBAO_SPEECH_API_KEY`（单头 `X-Api-Key` 无需 `APP_ID`，兼容旧版 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY` 双头）、`OPENROUTER_API_KEY`、`GEMINI_API_KEY`、`OPENAI_API_KEY`、`GROQ_API_KEY` 或 `SILICONFLOW_API_KEY`；二阶段可额外搭配 `DEEPSEEK_API_KEY`、`ARK_API_KEY` 或直接复用本机 `codex login`；无 `uv` 时可将 `uv tool` 替换为 `pipx`）。默认短按右 Ctrl（`<= 0.5s`）开始/完成录音，`tap_toggle` 模式下单独长按右 Ctrl 满 `0.8s` 不等松手即时取消当前录音或在途识别/精修（按住 `0.25s` 起轻提示）。
+> MacBook 无右 Ctrl 键可在 `~/.config/agent-voice-input/config.toml` 的 `[hotkey]` 下改为 `key = "ROption"` 或 `"Fn"` 后执行 `agent-voice-input restart`。完整配置模板见 [`v0.12.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.12.0/config.example.toml)（[`main`](config.example.toml)）与 [`v0.12.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.12.0/config.example.env)（[`main`](config.example.env)）。
 
-> `agent-voice-input init` 已自动生成初始 `config.toml`；如需调整快捷键（如改为按住说话 `trigger_mode = "ptt"`）、胶囊位置（`bottom` / `top`）、`[remote]` 远端主机、录音时长上限或切换渠道，可参照 [`v0.12.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.12.0/config.example.toml)（或 [`main/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml)）与 [`v0.12.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.12.0/config.example.env) 按需修改。
+### 场景化推荐供应商组合
+
+| 使用场景 | 推荐一阶段（语音识别） | 推荐二阶段（语境精修） | 所需凭据 / 配置 |
+| :--- | :--- | :--- | :--- |
+| **复用现有 Codex / AGY 订阅** *（二阶段免另购 API）* | `dashscope`、`doubao`、`groq` 或 `openai` | `codex` *（`auto` 自动复用，绝不开 Fast）* 或 `agy` *（显式配置启用）* | 1 把语音识别 Key + 本机 `codex` 或 `agy` 登录态 |
+| **国内主力（中文 / 中英混排）** | `dashscope`（阿里百炼 `qwen3-asr-flash`）或 `doubao`（豆包语音 `bigmodel`） | `codex` / `agy` / `deepseek` / `dashscope` / `volcengine` | `DASHSCOPE_API_KEY` 或 `DOUBAO_SPEECH_API_KEY` *（单头 `X-Api-Key`，无需 `APP_ID`）* + 可选精修 Key |
+| **海外 / 纯英文主力** | `groq`（`whisper-large-v3-turbo`）或 `openai`（`gpt-4o-mini-transcribe`） | `codex` / `agy` / `openai` / `gemini` / `openrouter` | `GROQ_API_KEY` 或 `OPENAI_API_KEY` + 可选精修 Key |
+| **一把 Key 省心全包** | `dashscope`（国内两段式或 `qwen3.8-omni-flash` 单跳）、`gemini`（海外原生单跳）或 `openrouter`（两段式/单跳均可） | 同渠道内置默认，或单跳跳过二阶段 | 仅需 1 把 Key：`DASHSCOPE_API_KEY`、`GEMINI_API_KEY` 或 `OPENROUTER_API_KEY` |
+
+> **关于本地 / 私有部署模型**：当前版本重点聚焦并充分实测了主流云端 API 与现有 CLI 登录（Codex / AGY）。虽然底层已提供通用的 `openai-compatible` 自定义 `base_url` 接口，但经过完整实测的**本地/企业私有部署模型（自部署小型 ASR + 精修）一等公民支持**规划在后续版本（**`v1.1+`**）推进。
 
 ---
 
-## 双平台体验说明
+## 隐私与数据流向硬承诺
+
+1. **无作者服务器、零中转、完全由你掌控**：`agent-voice-input` **没有任何作者托管的服务器或中转服务**，也没有任何隐藏遥测；全部语音与上下文只从本机直连你自己在配置中选定的模型渠道，所有模型与凭据完全由用户自主选择和控制（Apache-2.0 全量开源）。
+2. **默认不落盘音频与原文**：运行状态、日志与遥测均做凭据脱敏且不记录用户口述原文；仅在识别/投递失败或主动取消在途任务时，将有效录音以 `0600` 权限暂存于 `failed/`（保留 24h 内最近 10 条）供 `retry` 恢复（录音中取消直接丢弃；可选 MP3 归档默认关闭）。
+3. **`0700`/`0600` 权限隔离与不越界抓取**：配置与运行目录严格私有权限；仅读取前台窗口名、macOS `AXDocument` 与 CLI Agent 明文日志——绝不读取 IDE 私有 SQLite，也不抓取聊天软件或浏览器的无障碍 DOM；切到非终端应用硬跳过终端会话，SSH 远端仅查显式白名单主机且零密钥落盘。
+4. **仅传当前窗口对话与文件名（不传仓库全文）+ `auto` 凭据说明**：编码模式下仅发送当前活跃会话近期对话与 `git status`/浅层文件名，绝不上传仓库全文。同时透明提示：默认 `provider = "auto"` 会检测环境变量/`.env` 及本机已有 `codex` CLI 登录态（`agy` 需显式配置，绝不自动触发）；如需固定渠道请显式指定 `provider` 或设 `refiner.provider = "off"`。
+
+---
+
+## 高频踩坑 FAQ
+
+- **MacBook 没有右 Ctrl 键怎么办？**  
+  在 `~/.config/agent-voice-input/config.toml` 的 `[hotkey]` 中改为 `key = "ROption"`（右 Option）或 `"Fn"`，运行 `agent-voice-input restart` 生效；可用 `agent-voice-input key-test` 确认键码。
+- **为什么通过 SSH 在 macOS 上启动守护进程录不到声音（全静音）？**  
+  macOS 的麦克风 TCC 权限归属责任图形进程，经 `sshd` 拉起的守护进程会被系统静默喂全 0 静音帧。请务必在本机已获麦克风授权的图形终端（如 Ghostty 或 `Terminal.app`）里执行 `agent-voice-input start` 或 `restart`。
+- **后台守护进程怎么走代理？**  
+  守护进程在启动时继承当前 shell 环境变量：请先在终端导出 `HTTPS_PROXY`（以及本机回环排除 `NO_PROXY=127.0.0.1,localhost`），再执行 `agent-voice-input restart`。由于纯标准库 HTTP 客户端仅支持 `http://` 代理，如果代理客户端只设置了 `ALL_PROXY=socks5://...`，请同时设置对应的 HTTP 混合端口（`HTTPS_PROXY=http://127.0.0.1:<port>`），并用 `agent-voice-input doctor --ping` 验证连通。
+- **为什么默认只粘贴不自动按回车？**  
+  终端与 SSH 下误听一条命令直接回车风险太高，因此默认只粘贴不发送 `Enter`，方便扫一眼再确认；处理期间若切走焦点，也会自动退回剪贴板而不强贴到别的窗口。
+- **两段式（STT + 精修）和一阶段单跳多模态怎么选？**  
+  **两段式**组合最灵活、可免费复用现有 Codex/AGY CLI 订阅，且长句与复杂术语纠偏最稳；**单跳多模态**（如原生 `gemini`、百炼 `qwen3.8-omni-flash` 或 OpenRouter 多模态模型）只需一把 Key 和一次请求，但会把音频与会话上下文一并直接发给该多模态渠道。
+
+---
+
+## 常用命令与可选增强
+
+```bash
+agent-voice-input init                   # 初始化 0600 权限 config.toml 与全注释 agent-voice-input.env（支持 --force）
+agent-voice-input start | restart | stop # 启停或重启后台守护进程（start 幂等，代码/版本漂移时提示 restart）
+agent-voice-input status                 # 查看运行状态、当前生效管线与漂移信息（支持 --history N）
+agent-voice-input doctor [--ping] [--remote] [--json]   # 全面自检音频、原生桥接、凭据、SSH 就绪度与端点探活
+agent-voice-input diagnose [--last N] [--json]          # 本地只读诊断：延迟 p50、缓存命中率、失败录音数与脱敏日志尾部
+agent-voice-input retry [--list] [--print]              # 查看或重跑暂存的失败录音
+agent-voice-input hotwords list|add|remove              # 管理 [global]/[chat]/[coding] 分层热词并查各渠道配额（--scope、--json）
+agent-voice-input once --duration 4 --dry-run           # 单次录音验证流水线（不粘贴上屏）
+agent-voice-input toggle | cancel        # 命令行触发起止录音或取消当前/后台在途任务（--seq N）
+agent-voice-input key-test               # 测试按键扫描码与修饰键捕获
+```
+
+- **可选多窗口钩子与 SSH 远端 Linux（`[remote]`）**：单窗口终端、Ghostty 分屏与 `tmux` 分屏零钩子即可用。若常在 WSL2 **同一项目目录**并行开多个独立终端窗口，或需拉取远端 Linux 服务器上的活跃 Agent 上下文（在 `config.toml` 配置 `[remote] hosts = ["devbox"]` 并运行 `agent-voice-input doctor --remote`），详见 [`integrations/README.zh-CN.md`](integrations/README.zh-CN.md) 与 [`docs/context-routing.md`](docs/context-routing.md)。
+
+---
+
+## 详细参考
+
+<details>
+<summary><b>双平台机制细节（WSL2 WASAPI / macOS TCC 权限与投递）</b></summary>
 
 ### Windows Terminal + WSL2（含远程桌面与 `tmux`）
+- **全局作用域、远程桌面让行与高分屏胶囊**：默认单击右 Ctrl（`RControl`）即可在终端、IDE 与日常桌面应用中开始/结束录音（`hotkey.scope = "all"`，可选 `"coding"` / `"terminals"`；组合键如 `RControl+C` 原样放行），显示原生 Per-Monitor V2 抗锯齿波形胶囊。聚焦远程桌面/虚拟机客户端（`mstsc`、`vmconnect`、Parsec、RustDesk 等）时静默让行热键（`yield_remote_desktop = true`；默认放行裸 `msrdc` 以保护 Win11 WSLg，非 WSLg 的 AVD/Windows 365 用户可加 `ignore_apps = ["msrdc"]`），并按进程路由 `Ctrl+V`、`Ctrl+Shift+V`（`WezTerm`、`Alacritty`、`Tabby`、`Hyper`）与 `Shift+Insert`（`mintty`、`PuTTY`、`KiTTY`）。
+- **原生 WASAPI 采集**：常驻 `win_shim` 直接调用 Windows WASAPI 16 kHz 采集，避开 WSLg `RDPSource` 休眠零包死锁；起止提示音默认关闭以免触发 RDP 音频通道唤醒延迟。
+- **零配置 `tmux` 分屏追踪**：无需改动 `~/.tmux.conf`，自动锁定当前 attached 客户端的焦点窗格。
 
-- **全局热键作用域、远程桌面让行与高分屏胶囊**：默认单击右 Ctrl（`RControl`）即可在终端、IDE 与日常桌面应用中开始/完成录音（`hotkey.scope = "all"`，可选 `"coding"` / `"terminals"`；组合键如 `RControl+C` 原样放行，录音中途切到别的应用仍可正常结束），屏幕底部（或顶部）显示原生 Per-Monitor V2 高分屏抗锯齿波形胶囊。聚焦远程桌面/虚拟机客户端（`mstsc`、`vmconnect`、Parsec、RustDesk 等）时自动静默让行新热键触发（`yield_remote_desktop = true`；默认不拦截裸 `msrdc` 以保护 Win11 本地 WSLg 应用，不使用 WSLg 的 Azure Virtual Desktop / Windows 365 用户可在配置中添加 `ignore_apps = ["msrdc"]`），并按终端进程自动路由 `Ctrl+V`、`Ctrl+Shift+V`（`WezTerm`、`Alacritty`、`Tabby`、`Hyper` 等）与 `Shift+Insert`（`mintty`、`PuTTY`、`KiTTY`）。
-- **原生 WASAPI 采集，告别 WSLg 与远程桌面卡顿**：默认通过常驻 `win_shim` 直接调用 Windows 原生 WASAPI 16 kHz 采集音频，彻底避开 WSLg `RDPSource` 休眠零包死锁；默认关闭起止提示音以避免远程桌面（RDP）1–2 秒音频通道唤醒延迟。
-- **`tmux` 分屏开箱即用**：无需改动 `~/.tmux.conf`，自动追踪当前 attached 客户端的焦点窗格并隔离相邻后台分屏。
+### macOS（`Ghostty`、`Terminal.app` 与 `tmux`）
+- **原生 Retina 胶囊与安全投递**：首次启动经 `/usr/bin/swiftc` 编译缓存原生 `mac_shim`，监听 `RControl` / `ROption` / `Fn` 短按或 `ptt` 按住说话、远程桌面自动让行（`Windows App`、`屏幕共享`、Parsec、VMware/Parallels 等）并渲染 Retina 胶囊。在 **Ghostty** 与 **`tmux`** 内直投不碰剪贴板；其他窗口锁定起点窗口 ID 后走原生 `CGEvent` `Cmd+V` 粘贴。
+- **零钩子分屏与 `tmux` 绑定**：读取 Ghostty 分屏 `tty`/`cwd`、`Terminal.app` 当前标签页 `tty` 或终端子进程 PTY 树（含 `tmux` 焦点窗格）绑定 `codex`/`claude`/`agy` 会话，并在非终端 GUI 窗口硬跳过会话查询；默认使用系统麦克风（`[audio] macos_device = "default"`）。
+- **轻量 TCC 权限**：需授予**麦克风权限**（供 `ffmpeg`）以及按所用终端授予一次**自动化（Automation → Ghostty 或 Terminal）**；默认修饰键热键**不需要**「输入监控（Input Monitoring）」；仅在向桌面 GUI 应用及非 `tmux` 下的非 Ghostty 终端发送 `Cmd+V` 时需为宿主终端开启「辅助功能（Accessibility）」（仅在 Ghostty 或 `tmux` 内直投时无需该权限）。
 
-### macOS（`Ghostty`、系统自带 `Terminal.app` 与 `tmux`）
+</details>
 
-- **原生胶囊与跨场景安全投递**：通过缓存的原生 `mac_shim` 监听右 Ctrl（或 `ptt` 按住说话）、在远程桌面/虚拟机窗口（`Windows App`、`屏幕共享`、Parsec、VMware/Parallels 等）静默让行热键并渲染 Retina 悬浮波形胶囊。在 **Ghostty** 与 **`tmux`** 中直接注入文本且零触碰系统剪贴板；在其他终端、IDE 及桌面 GUI 应用中锁定起点窗口 ID 并通过原生 `CGEvent` `Cmd+V` 粘贴，中途切换窗口或标签页均自动退回剪贴板防误投。
-- **零钩子标签页/分屏与 `tmux` 会话关联**：直接读取 Ghostty 分屏 `tty`/`cwd`、`Terminal.app` 当前选中标签页 `tty` 或终端窗口子进程 PTY 树（连接 `tmux` 时进一步定位对应焦点窗格），精准匹配当前标签页内的 `codex`、`claude` 或 `agy` 活跃会话，并在非终端 GUI 窗口中硬隔离后台 CLI 会话防跨仓串台；录音设备默认跟随系统麦克风（可通过 `[audio] macos_device` 指定）。
-- **轻量系统权限（TCC）**：需授予**麦克风权限**（供 `ffmpeg` 录音），以及按所用终端授予一次**自动化（Automation → Ghostty 或 Terminal）**确认；默认 `RControl` 修饰键热键**不需要**开启「输入监控（Input Monitoring）」，向桌面 GUI 应用及非 `tmux` 下的非 Ghostty 终端发送原生 `Cmd+V` 粘贴时需为宿主终端开启「辅助功能（Accessibility）」（仅在 Ghostty 或 `tmux` 内直投时无需该权限）。
+<details>
+<summary><b>内置渠道一览与常见 <code>config.toml</code> 配方</b></summary>
 
----
-
-## 配置与渠道参考
-
-配置由两个文件组成，覆盖优先级为 `CLI 参数 > config.toml > 内置默认值`：
-
-- **`~/.config/agent-voice-input/config.toml`**：结构化配置 `[hotkey]`、`[ui]`、`[audio]`、`[asr]`、`[refiner]` 与 `[remote]`。
-- **`~/.config/agent-voice-input/agent-voice-input.env`**：存放 API Key（兼容前缀别名，见 [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)）。
-
-### `provider`、`model` 与工作模式约定
-
-- **按 Agent / `provider` 选择即可，`model` 默认留空自动匹配**：`[asr]` 与 `[refiner]` 中的 `model` 留空（`""` 或不填）时，自动采用所选 `provider` 的内置默认模型；通过 CLI 切换 `provider` 且未显式指定 `model` 时，也会自动切回新渠道的默认模型，不会把旧渠道的模型名串过去。如需指定具体模型，原样填写该渠道的上游模型 ID 即可。
-- **两阶段模式 vs 多模态单跳模式（`asr.api`）**：
-  - 默认 `asr.api = "auto"` 会自动按渠道与模型选择协议：`dashscope`（默认 `qwen3-asr-flash`）、`doubao` 与专用 STT 模型（如 `qwen/qwen3-asr-1.7b`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）走一阶段纯转写 + 二阶段语境精修；
-  - 原生 `gemini`、百炼 `qwen*-omni*`（如 `qwen3.8-omni-flash`）以及 OpenRouter / OpenAI 兼容渠道下的多模态音频理解模型（如 `gemini-3.5-flash-lite`、`google/gemini-3.5-flash-lite`、`qwen/qwen3.8-omni-flash`、`gpt-audio*`）自动共享同一套 50K 封口 `<session_reference_log>` 前缀缓存块（`agent` 模式下会将最多 `refiner.context_max_chars` 会话历史发往所选多模态 ASR 渠道）、对 `>= 3s` 语音内存压缩为 `64 kbps` MP3、以 `610s` 为整段上限一步完成转写与精修，并默认跳过二阶段（除非设置 `refiner.force_on_single_hop = true`）。在 `openrouter` 下使用未内置收录的新模型时，请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
-- **二阶段协议选择（`refiner.api`）**：支持 `"auto" | "chat-completions" | "responses"`。默认 `"auto"` 将 `codex` 路由至纯无状态 HTTP `/responses`（`store=false`、`stream=true`），将 `agy` 路由至本机 `agy acp` stdio JSON-RPC（`agy-acp`），将 `gemini` 路由至原生 `:generateContent`，其余兼容渠道保持 `/chat/completions`；在 `openai`、`openrouter` 或 `openai-compatible` 下亦可显式设 `refiner.api = "responses"` 启用无状态 `/responses` 引擎。
-- **思考档位控制（`effort`）**：支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`。`asr.effort` 默认 `"auto"`；`refiner.effort` 按渠道自动默认（`codex` / `agy` / `openai` 默认 `"low"`，其余渠道默认 `"auto"` 自动映射对应渠道的零思考极速参数，如 Gemini 3+ `minimal`、百炼 `enable_thinking=false`、火山方舟/官方 DeepSeek `thinking.type="disabled"`）。
-- **精修提示词与前缀缓存组织（`refiner.prompt`、`include_git_status`、`context_max_chars`、`cold_start_fallback`）**：`prompt` 默认留空 `""` 时使用内置自适应英文语音听写编辑提示词（`agent` 模式结合只读 `<session_reference_log>`、`<workspace_git_status>` 与常见研发/AI 术语修准同音错词并消解口语中途改口，`general` 模式面向日常口述自然润色且不掺入代码语境；显式配置非空 `prompt = '''...'''` 则覆盖两模式默认提示词）。终端历史对话（默认上限 `context_max_chars = 200000` 字符，满窗按四分之一即 `50K` 整块滑出）按固定只读分块置于前部（`/responses` 下作 `developer` 消息块，`/chat/completions` 下置于单条 `user` 消息前部），末尾 `user` 块依次拼装 `<workspace_git_status>`（`include_git_status = true`，工作树干净时自动补充仓库核心追踪文件名作拼写参考）、`<asr_draft_to_clean>` 与 `<task_reminder>`，稳定命中前缀缓存（`codex` 配合确定性会话 `prompt_cache_key` 与负载均衡亲和性 Cookie 实现高缓存命中且零历史草稿残留；一阶段在 `agent` 模式下亦会在用户 `hotwords.txt` 与实时变更/对话标识符之后自动追加低优 AI/CLI 兜底热词）。新开空/极短 Agent 会话（或终端/桌面 IDE 仅有合法工作目录尚无活跃会话）时，`cold_start_fallback = "auto"`（默认；支持 `"hotwords"` 仅热词或 `"off"` 关闭）自动从同精确目录近期历史会话补齐一阶段热词，并为 Agent 会话在二阶段/单跳前拼 1 块逐字节冻结的 `<= 25K` `<prior_session_reference>` 只读块（随新会话填满滑窗后自然整块淘汰，SSH 远端单趟同步对齐）。
-- **分层纯文本热词表（`asr.hotwords_file` 与 `hotwords` 子命令）**：可直接手改 `~/.config/agent-voice-input/hotwords.txt` 或通过 `agent-voice-input hotwords list|add|remove` 管理，修改后无需重启守护进程、下一次口述自动热加载生效。100% 兼容存量无分组纯文本文件（归入 `[global]`），并支持可选 `[chat]`（微信/飞书/AI 聊天等）与 `[coding]`（终端/IDE/Agent 会话）分组按前台窗口自动挂载；手工词条永远最优先保头，并内置跨渠道配额预算与截断提示（`doubao`、`whisper`、`dashscope`、`gemini`）。
-- **同渠道重试与建连超时（`max_retries`）**：`[asr] max_retries` 与 `[refiner] max_retries` 默认 `2`（`0..10`，指首次请求之外的额外重试次数，`0` 关闭重试），在阶段 `timeout_sec` 总预算与独立的 9 秒建连/TLS 握手超时上限内，区分频率限流（`HTTP 429`、`Retry-After`、厂商 QPS 码）与瞬态通信/5xx 错误分别退避重试。
-- **可选本地 MP3 录音环形归档（`audio.save_recordings`）**：默认关闭（`false`）。显式设为 `true` 时，后台异步通过 `ffmpeg` 将有效非静音录音压缩为 `16 kHz` 单声道 `64 kbps` MP3 以 `0600` 权限保存至 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`，并按修改时间保留最新 `save_recordings_max_count`（默认 `300`，范围 `1..5000`）条，不阻塞实时识别与上屏耗时。
-
-### 内置渠道一览
+配置覆盖优先级：`CLI 参数 > ~/.config/agent-voice-input/config.toml > 内置默认值`。凭据存放于 `~/.config/agent-voice-input/agent-voice-input.env`（见 [`config.example.env`](config.example.env)）。
 
 | `provider` | 可用阶段 | 内置默认 `asr.model` | 内置默认 `refiner.model` | 凭据来源 / 环境变量 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -126,7 +162,7 @@ agent-voice-input start
 | **`agy`** | `refiner` | — | `gemini-3.8-flash` *(默认 `effort = "low"`；需显式启用，不参与 `auto` 自动选路)* | 复用本机已登录的 `agy` CLI *(零工具 `agy acp` stdio JSON-RPC + 增量续接前缀缓存)* |
 | **`deepseek`** | `refiner` | — | `deepseek-flash` | `DEEPSEEK_API_KEY` *(兼容 `API_KEY_DEEPSEEK`)* |
 | **`dashscope`** | `asr`, `refiner` | `qwen3-asr-flash` *(或单跳 `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(兼容 `ALI_API_KEY`)* |
-| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_SPEECH_API_KEY` *（单头 `X-Api-Key`，无需 `APP_ID`；兼容旧 `DOUBAO_ASR_API_KEY` 或双头 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；`auto` 默认优先低延迟同步 `volc.bigasr.auc_turbo`，未开通时进程内首次自动回退并缓存至 2.0 `volc.seedasr.auc` / 1.0 `volc.bigasr.auc`）* |
+| **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_SPEECH_API_KEY` *（单头 `X-Api-Key`，无需 `APP_ID`；兼容旧 `DOUBAO_ASR_API_KEY` 或双头 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；`auto` 优先同步 `volc.bigasr.auc_turbo`，未开通时自动回退并缓存 `volc.seedasr.auc` / `volc.bigasr.auc`）* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(兼容 `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
 | **`openrouter`** | `asr`, `refiner` | `qwen/qwen3-asr-1.7b` | `google/gemini-3.5-flash-lite` | `OPENROUTER_API_KEY` |
 | **`gemini`** | `asr`, `refiner` | `gemini-3.5-flash-lite` *(单跳)* | `gemini-3.5-flash-lite` | `GEMINI_API_KEY` |
@@ -135,23 +171,20 @@ agent-voice-input start
 | **`siliconflow`** | `asr`, `refiner` | `FunAudioLLM/SenseVoiceSmall` | `Qwen/Qwen2.5-7B-Instruct` | `SILICONFLOW_API_KEY` |
 | **`openai-compatible`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` *(需配 `base_url`)* | *(需显式配 `base_url` + `model`)* | `api_key_env` 或 `OPENAI_API_KEY` *(本机回环地址免 Key)* |
 
-- `asr.provider = "auto"`（默认）：按 `dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow` 顺序自动选用首个已配置凭据的渠道。
-- `refiner.provider = "auto"`（默认）：优先复用本机已登录的 `codex` CLI，否则按 `deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow` 顺序自动选用首个已配置凭据的渠道；若无任何精修凭据则优雅降级为 `"off"` 直出 ASR 初稿。
-- `refiner.provider = "off"`：关闭二阶段语境精修。
-
-### 常见 `config.toml` 配方
+- `asr.provider = "auto"`（默认）：按 `dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow` 顺序选用首个已配置凭据的渠道。
+- `refiner.provider = "auto"`（默认）：优先复用本机已登录的 `codex` CLI，否则按 `deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow` 选用，无凭据时降级为 `"off"`。（`agy` 仅显式配置启用。）
 
 ```toml
-# 配方 1：国内低延迟主力（百炼 ASR + 本机无状态 Codex 精修；未装 Codex 可将 refiner.provider 改为 "dashscope" 或 "volcengine"）
+# 配方 1：国内低延迟主力（百炼或豆包 ASR + 复用本机 Codex 或 AGY 订阅精修）
 [asr]
-provider = "dashscope"
+provider = "dashscope"           # 亦可改为 "doubao"（配 DOUBAO_SPEECH_API_KEY）
 
 [refiner]
-provider = "codex"
+provider = "codex"               # 或显式设为 "agy" 复用 Antigravity CLI，无订阅可改为 "deepseek" / "dashscope"
 ```
 
 ```toml
-# 配方 2：OpenRouter 一把 Key · 两阶段专用 STT + 轻量精修（自动使用各自默认模型）
+# 配方 2：OpenRouter 一把 Key · 两阶段专用 STT + 轻量精修
 [asr]
 provider = "openrouter"
 
@@ -160,55 +193,45 @@ provider = "openrouter"
 ```
 
 ```toml
-# 配方 3：多模态单跳音频 + 50K 缓存上下文直出（百炼 Qwen-Omni、OpenRouter 或原生 Gemini，自动跳过二阶段）
+# 配方 3：多模态单跳音频 + 50K 缓存上下文直出（自动跳过二阶段）
 [asr]
-provider = "dashscope"           # 亦可设为 provider = "openrouter" 搭配 model = "google/gemini-3.5-flash-lite"，或 provider = "gemini"
+provider = "dashscope"           # 亦可设为 "gemini"（免填 model）或 "openrouter" + model = "google/gemini-3.5-flash-lite"
 model = "qwen3.8-omni-flash"
 effort = "auto"
 ```
 
----
+</details>
 
-## 常用命令与覆盖参数
+<details>
+<summary><b>进阶配置说明（协议路由、前缀缓存、热词、重试与 MP3 归档）</b></summary>
 
-### 子命令速查
+- **按 `provider` 选渠道，`model` 默认留空自动匹配**：`[asr]` 与 `[refiner]` 的 `model` 留空时自动匹配内置默认模型；通过 CLI 切换 `provider` 且未传 `--*-model` 时也会重置为新渠道默认模型。显式指定 `model` 时原样透传上游 ID。
+- **两阶段 vs 单跳协议（`asr.api`）**：`"auto"` 将专用 STT（`qwen3-asr-flash`、`doubao`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）路由至一阶段 + 二阶段，将原生 `gemini`、百炼 `qwen*-omni*` 与 OpenRouter/OpenAI 兼容多模态模型路由至单跳（共享 50K `<session_reference_log>` 前缀块、`>= 3s` 内存压缩 `64 kbps` MP3、上限 `610s`；默认跳过二阶段，除非 `refiner.force_on_single_hop = true`）。在 `openrouter` 使用未收录新模型时请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
+- **二阶段协议与思考档位（`refiner.api`、`effort`）**：`refiner.api = "auto"` 将 `codex` 路由至无状态 HTTP `/responses`（`store=false`、`stream=true`），`agy` 路由至本机 `agy acp` stdio JSON-RPC，`gemini` 路由至 `:generateContent`，其余走 `/chat/completions`（`openai`/`openrouter`/`openai-compatible` 可显式启用 `"responses"`）。`effort` 支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`（`codex`/`agy`/`openai` 默认 `"low"`，其余渠道默认 `"auto"` 零思考极速档）。
+- **精修提示词、前缀缓存与冷启动回退（`refiner.prompt`、`include_git_status`、`context_max_chars`、`cold_start_fallback`）**：`prompt` 留空时使用内置自适应 `agent` / `general` 提示词（非空则覆盖两模式）。近期对话（上限 `context_max_chars = 200000`）按 `50K` 封口块前置，末尾拼装 `<workspace_git_status>`（工作树干净时补充核心追踪文件名）与 `<asr_draft_to_clean>`。新开空/极短会话时，`cold_start_fallback = "auto"`（可选 `"hotwords"` / `"off"`）自动从同目录近期历史会话补充热词并前置 1 块冻结的 `<= 25K` `<prior_session_reference>`。
+- **分层纯文本热词表（`asr.hotwords_file` 与 `hotwords` 子命令）**：直接编辑 `~/.config/agent-voice-input/hotwords.txt` 或运行 `agent-voice-input hotwords list|add|remove`，下一次口述自动热加载生效。无分组文件归入 `[global]`，可选 `[chat]` 与 `[coding]` 按前台窗口自动挂载，优先级高于动态仓库/会话词与内置程序员热词，并内置 `doubao`/`whisper`/`dashscope`/`gemini` 配额预算检查。
+- **同渠道重试与可选本地 MP3 归档（`max_retries`、`audio.save_recordings`）**：两阶段默认 `max_retries = 2`（`0..10`），在阶段 `timeout_sec` 与 9 秒建连/TLS 上限内分别对 `429`/QPS 限流与瞬态网络/5xx 退避重试。开启 `audio.save_recordings = true` 后，后台异步将有效录音压缩为 `0600` 权限 `16 kHz` `64 kbps` MP3 存入 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`（按修改时间环形保留最新 `save_recordings_max_count = 300` 条）。
 
-```bash
-agent-voice-input init                   # 初始化生成 0600 权限 config.toml 与全注释 agent-voice-input.env（支持 --force 覆盖）
-agent-voice-input start                  # 后台启动守护进程（已运行时幂等返回 0，代码/版本漂移时提示 restart）
-agent-voice-input restart                # 无条件停止并重启守护进程（修改配置或更新代码后常用）
-agent-voice-input status                 # 查看运行状态（区分 stopped / unresponsive / running）、当前生效管线与漂移信息（支持 --history N）
-agent-voice-input doctor [--ping] [--remote]  # 全面自检音频链路、原生辅助层、凭据、生效管线、会话/SSH 就绪度及端点探活（支持 --json）
-agent-voice-input diagnose [--last N] [--json]  # 本地只读诊断：汇总守护进程健康度、延迟 p50、降级、缓存命中率、失败录音数与脱敏日志尾部
-agent-voice-input retry [--list] [--print]  # 查看或重跑暂存的失败录音（自动粘贴时不重复打印，加 --print 强制输出 stdout）
-agent-voice-input hotwords list|add|remove  # 管理纯文本分层热词（[global]/[chat]/[coding]）并查看各 ASR 渠道配额占用（支持 --scope、--json）
-agent-voice-input once --duration 4 --dry-run  # 单次录音验证流水线（不粘贴上屏）
-agent-voice-input toggle                 # 命令行触发开始/结束录音
-agent-voice-input cancel                 # 取消当前录音，或中断后台在途识别/精修（可用 `--seq N` 指定单条）
-agent-voice-input stop                   # 停止后台守护进程
-agent-voice-input key-test               # 测试按键扫描码与修饰键捕获
-```
+</details>
 
-### 核心 CLI 参数
+<details>
+<summary><b>核心 CLI 覆盖参数</b></summary>
 
 | CLI 参数 | 说明 |
 | :--- | :--- |
-| `--config PATH` | 指定 `config.toml` 或 `config.json` 路径（亦可通过 `AGENT_VOICE_INPUT_CONFIG` 或 `XDG_CONFIG_HOME` 指定） |
-| `--asr`, `--asr-provider` | 一阶段渠道（`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`；支持别名 `volcengine`/`volc` → `doubao`、`bailian` → `dashscope`） |
+| `--config PATH` | 指定 `config.toml` 或 `config.json` 路径（亦支持 `AGENT_VOICE_INPUT_CONFIG` 与 `XDG_CONFIG_HOME`） |
+| `--asr`, `--asr-provider` | 一阶段渠道（`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`；别名 `volcengine`/`volc` → `doubao`、`bailian` → `dashscope`） |
 | `--asr-model` | 一阶段上游模型 ID |
 | `--asr-api` | 一阶段协议（`auto`, `audio-transcriptions`, `chat-completions`） |
 | `--asr-effort` | 一阶段思考档位 |
-| `--refiner`, `--refiner-provider` | 二阶段渠道（`auto`, `codex`, `agy`, `deepseek`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`；支持别名 `doubao`/`volc`/`ark` → `volcengine`、`bailian` → `dashscope`） |
+| `--refiner`, `--refiner-provider` | 二阶段渠道（`auto`, `codex`, `agy`, `deepseek`, `dashscope`, `volcengine`, `openrouter`, `gemini`, `openai`, `groq`, `siliconflow`, `openai-compatible`, `off`；别名 `doubao`/`volc`/`ark` → `volcengine`、`bailian` → `dashscope`） |
 | `--refiner-model` | 二阶段上游模型 ID |
 | `--refiner-api` | 二阶段协议（`auto`, `chat-completions`, `responses`） |
 | `--refiner-effort`, `--effort` | 二阶段思考档位 |
 
-*（环境变量用于存放各厂商凭据、引导路径 `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR` 及底层运行期诊断项；常规参数统一在 `config.toml` 中配置。）*
+*（环境变量用于厂商凭据、引导路径 `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR` 及底层运行期诊断项；常规参数统一放 `config.toml`。）*
 
-### 可选：多窗口会话标题钩子与 SSH 远端 Linux 主机
-
-- **本地多窗口标题钩子**：在单项目目录单窗口、macOS + Ghostty 多分屏或 `tmux` 分屏下均无需额外配置。若常在**同一项目目录**并行开启多个独立 WSL2 终端窗口或非 Ghostty 终端分屏，可参考 [`integrations/`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.zh-CN.md) 为 Codex、Claude Code 或 Antigravity CLI 接入轻量会话标题标签（`agent-voice-input session-hook`）。
-- **零远端安装 SSH Linux 上下文感知（`[remote]`）**：前台 SSH 终端与 Remote-SSH IDE 默认零配置硬隔离本地后台会话防串台；若需拉取远端 Linux 服务器上的活跃 Agent 对话与工作区文件名（远端零常驻服务、零 pip 装包、零云端凭据，仅需 Python 3.10+ 标准库，按下热键说话期间后台异步预取），只需在 `config.toml` 的 `[remote]` 下添加 `hosts = ["devbox"]` 并运行 `agent-voice-input doctor --remote` 验证（详见 [`integrations/`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.zh-CN.md) 与 [`docs/context-routing.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/context-routing.md)）。
+</details>
 
 ---
 
@@ -226,4 +249,4 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## License
 
-[Apache-2.0 License](https://github.com/xiaohuaxi/agent-voice-input/blob/main/LICENSE)
+[Apache-2.0 License](LICENSE)

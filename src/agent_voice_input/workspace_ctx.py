@@ -71,10 +71,23 @@ class SessionMatch:
 # ---------------------------------------------------------------------------
 
 BUILTIN_AGENT_HOTWORDS: tuple[str, ...] = (
-    "Codex", "Claude Code", "Gemini", "Flash-Lite", "Luna", "Astra", "Sol",
-    "Opus", "Sonnet", "Haiku", "Antigravity", "agy", "Ghostty", "tmux", "WSL2", "CLI",
-    "Qwen", "DeepSeek", "豆包", "Kimi", "Whisper", "Groq", "OpenRouter", "DashScope",
-    "subagent", "worktree", "rebase", "JSONL", "TOML", "竞态",
+    # Priority 1: Coding Agents & IDEs (kept first so low-quota ASR providers capture them first)
+    "Claude Code", "Codex", "Antigravity", "agy", "Cursor", "Windsurf",
+    "Aider", "OpenCode", "Gemini CLI", "VS Code", "JetBrains", "Copilot",
+    # Priority 2: Model families & common API providers
+    "Claude", "Opus", "Sonnet", "Haiku", "GPT", "OpenAI", "Gemini", "Flash",
+    "Qwen", "DeepSeek", "Kimi", "Whisper", "Groq", "OpenRouter", "DashScope",
+    "Ollama", "豆包",
+    # Priority 3: Agent engineering & terminal workflow terms
+    "subagent", "MCP", "SKILL.md", "AGENTS.md", "CLAUDE.md", "worktree",
+    "tmux", "Ghostty", "WSL2", "SSH", "CLI", "hotkey",
+    # Priority 4: Common software engineering terms
+    "GitHub", "Git", "rebase", "cherry-pick", "PR", "CI/CD",
+    "Docker", "Kubernetes", "Python", "TypeScript", "Rust", "Go",
+    "React", "Next.js", "Tailwind", "API", "REST", "GraphQL",
+    "OAuth", "JWT", "JSON", "JSONL", "YAML", "TOML",
+    "SQL", "PostgreSQL", "Redis", "pytest", "ffmpeg", "regex",
+    "async", "webhook", "stdout", "stderr", "README",
 )
 
 _CJK_HOTWORD_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")

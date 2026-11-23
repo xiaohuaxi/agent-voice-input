@@ -5941,13 +5941,13 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
         for hw_non_cjk in (hw_en, hw_auto_en):
             self.assertIn("自定义术语", hw_non_cjk)
             self.assertIn("Codex", hw_non_cjk)
+            self.assertIn("Claude Code", hw_non_cjk)
             self.assertNotIn("豆包", hw_non_cjk)
-            self.assertNotIn("竞态", hw_non_cjk)
         for hw_cjk in (hw_auto_zh, hw_zh):
             self.assertIn("自定义术语", hw_cjk)
             self.assertIn("Codex", hw_cjk)
+            self.assertIn("Claude Code", hw_cjk)
             self.assertIn("豆包", hw_cjk)
-            self.assertIn("竞态", hw_cjk)
 
 
 class ObservabilityAndTelemetryTests(unittest.TestCase):

@@ -3621,13 +3621,21 @@ class SessionCtxTests(unittest.TestCase):
 
         ctx_agent = SessionTracker.build_asr_context(None, extra_hotwords=["UserPriorityTerm"], mode="agent")
         self.assertEqual(ctx_agent.hotwords[0], "UserPriorityTerm")
+        self.assertIn("Claude Code", ctx_agent.hotwords)
         self.assertIn("Codex", ctx_agent.hotwords)
-        self.assertIn("Luna", ctx_agent.hotwords)
+        self.assertIn("Cursor", ctx_agent.hotwords)
+        self.assertIn("MCP", ctx_agent.hotwords)
         self.assertIn("豆包", ctx_agent.hotwords)
-        self.assertIn("竞态", ctx_agent.hotwords)
+        self.assertNotIn("Luna", ctx_agent.hotwords)
+        self.assertNotIn("竞态", ctx_agent.hotwords)
 
         # Language-aware built-in hotword filtering: en/en-US drops CJK built-ins while preserving manual CJK & zh/auto
         from agent_voice_input.workspace_ctx import BUILTIN_AGENT_HOTWORDS, get_builtin_agent_hotwords
+
+        # Built-in list sanity: concise, case-insensitively deduplicated, core coding agents ahead of general tech terms
+        self.assertEqual(len(BUILTIN_AGENT_HOTWORDS), len({w.lower() for w in BUILTIN_AGENT_HOTWORDS}))
+        self.assertLess(BUILTIN_AGENT_HOTWORDS.index("Claude Code"), BUILTIN_AGENT_HOTWORDS.index("Kubernetes"))
+        self.assertLess(BUILTIN_AGENT_HOTWORDS.index("Codex"), BUILTIN_AGENT_HOTWORDS.index("PostgreSQL"))
 
         self.assertEqual(get_builtin_agent_hotwords("auto"), BUILTIN_AGENT_HOTWORDS)
         self.assertEqual(get_builtin_agent_hotwords(""), BUILTIN_AGENT_HOTWORDS)
@@ -3637,8 +3645,9 @@ class SessionCtxTests(unittest.TestCase):
         for en_lang in ("en", "en-US", "EN_GB"):
             en_builtin = get_builtin_agent_hotwords(en_lang)
             self.assertNotIn("豆包", en_builtin)
-            self.assertNotIn("竞态", en_builtin)
+            self.assertIn("Claude Code", en_builtin)
             self.assertIn("Codex", en_builtin)
+            self.assertIn("MCP", en_builtin)
             self.assertIn("TOML", en_builtin)
             ctx_en = SessionTracker.build_asr_context(
                 None,
@@ -3649,11 +3658,10 @@ class SessionCtxTests(unittest.TestCase):
             self.assertEqual(ctx_en.hotwords[0], "UserPriorityTerm")
             self.assertIn("自定义中文词", ctx_en.hotwords)
             self.assertNotIn("豆包", ctx_en.hotwords)
-            self.assertNotIn("竞态", ctx_en.hotwords)
             self.assertIn("Codex", ctx_en.hotwords)
         ctx_zh = SessionTracker.build_asr_context(None, mode="agent", language="zh-CN")
         self.assertIn("豆包", ctx_zh.hotwords)
-        self.assertIn("竞态", ctx_zh.hotwords)
+        self.assertIn("Claude Code", ctx_zh.hotwords)
 
         ctx_gen = SessionTracker.build_asr_context(None, extra_hotwords=["UserPriorityTerm"], mode="general")
         self.assertEqual(ctx_gen.hotwords, ["UserPriorityTerm"])
