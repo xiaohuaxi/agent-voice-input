@@ -53,9 +53,9 @@
 | **终端** | **Windows Terminal (WSL2)** | `✅` | `win_shim` 瞬态剪贴板 + 快捷键粘贴（不污染原剪贴板）+ 同窗切 Tab 防串台 + 挂钩子/`tmux` 精准上下文 *（Codex / Claude Code / AGY CLI 真机实测）* |
 | **终端** | **本地 & 远端 `tmux`** | `✅` | **macOS** 零剪贴板直投 / **WSL2** 走 `win_shim` 瞬态剪贴板粘贴（不污染原剪贴板）；进程树按焦点窗格隔离；Linux & macOS CI 真实 `tmux` E2E 验证 |
 | **终端** | **其他内置终端与专用 SSH 客户端** | `🧪` | 已内置粘贴键位路由、防串台与识别规则（完整名单见下方折叠区），待真机实测反馈 |
-| **桌面 App** | **Antigravity / AGY 桌面版** | `🧪` | 已适配 **Antigravity 2.0 独立桌面版**（只读 `conversation_summaries.db` + 窗口标题精确/截断前缀匹配 + 工作区 `git`/文件名 + `brain/` 增量缓存），同时兼容老版 VS Code Fork *（WSL2 仅扫 WSL 内目录）* |
-| **桌面 App** | **ChatGPT / Codex 统一桌面端** | `🧪` | 支持**本地仓库 Codex 会话自动绑定与动态分流** *（macOS `com.openai.codex` / 旧 `com.openai.chat`；Windows `ChatGPT.exe` / `Codex.exe`）*：只读 `~/.codex/sqlite/codex.db` + `~/.codex/sessions/*.jsonl`，本地仓库任务自动升格为 `agent` 模式并挂载项目热词与增量缓存，普通云端 ChatGPT 聊天保持 `general + ai_chat` 零串台，同窗切换在投递前复核防串台 |
-| **桌面 App** | **Claude 桌面版** | `🧪` | 已专配 `ai_chat` *（macOS `com.anthropic.claudefordesktop`；Windows `Claude.exe`）* + 锁窗防串台；即使开 Claude Code 标签页暂不读本地仓或 CLI 会话 |
+| **桌面 App** | **Antigravity / AGY 桌面版** | `✅` *(macOS)* / `🧪` *(Windows)* | **Antigravity 2.0 独立桌面版**已在 macOS 真机实测通过（只读 `conversation_summaries.db` + 窗口标题精确/截断前缀匹配、工作区 `git`/文件名与 `brain/` 增量缓存及切会话防串台），同时兼容老版 VS Code Fork *（Windows 桌面版待真机反馈；WSL2 仅扫 WSL 内目录）* |
+| **桌面 App** | **ChatGPT / Codex 统一桌面端** | `✅` *(macOS)* / `🧪` *(Windows)* | 已在 macOS（`com.openai.codex` / 旧 `com.openai.chat`）真机实测通过：只读 `~/.codex/sqlite/codex.db` + `~/.codex/sessions/*.jsonl`，本地仓库任务自动升格为 `agent` 模式并挂载项目热词与增量缓存，普通云端 ChatGPT 聊天保持 `general + ai_chat` 零串台，同窗切会话在投递前复核防串台；Windows（`ChatGPT.exe` / `Codex.exe`）当前提供精修落字与锁窗防串台 *（Windows/WSL2 跨系统上下文绑定已列入路线图）* |
+| **桌面 App** | **Claude 桌面版** | `✅` *(macOS 落字)* / `🧪` *(Windows)* | macOS（`com.anthropic.claudefordesktop`）专属 `ai_chat` 基础精修落字与锁窗防串台已真机实测通过 *（Windows `Claude.exe` 待真机反馈）*；Code / Cowork 本地仓与会话上下文绑定已列入后续路线图 |
 | **桌面 App** | **其他桌面 IDE 与主流 IM** | `🧪` | IDE（**VS Code**、**Cursor**、**Windsurf**、**JetBrains**、**Zed** 等）走 `coding_gui` 并挂载宿主工作区 `git`/文件名；**在 IDE 内置终端运行 CLI Agent 时同样按 `coding_gui` 处理**（支持精修落字与工作区文件名参考，但**跳过 CLI `sync_session`**，不读内置终端里的 `codex`/`claude`/`agy` 对话历史，也不区分内置终端分屏）。IM（**微信**、**飞书**、**Slack**、**Discord** 等）走 `im_chat` |
 | **桌面 App** | **其他任意桌面 App** *（浏览器、笔记、邮件等）* | `⚪` | 默认 `hotkey.scope = "all"` 可直接语音精修落字 + 锁窗防串台，无专属上下文或语气适配 |
 

@@ -149,6 +149,7 @@
 4. **桌面端后续扩展**：跟进 Claude 桌面版（Chat / Code / Cowork 经浅层 `AXWebArea.AXTitle` 识别并同时兼容 `Claude` 与 `Claude-3p` 目录）及 WSL2 跨系统读取 Windows 宿主机桌面 App 上下文。
 5. **自动化无 GUI 真机回归体系**：扩展 `voice-eval`，在零屏幕焦点干扰下自动驱动本机与 macOS 真实 Codex / Claude Code / AGY CLI 新旧会话，并覆盖桌面端上下文只读验证。
 6. **桌面 GUI Computer Use 回归验收 Skill**：沉淀标准多桌面 App 落字、切换会话与切窗防串台清单，供支持 Computer Use 的 Agent 发版前自动执行。
+7. **脱离 WSL 的原生 Windows 独立运行**：覆盖未安装 WSL 的纯 Windows 桌面端用户，原生本地直读 Windows 宿主机 `.codex/`、`.gemini/` 与 Claude 会话目录并复用原生 WASAPI 采集与热键/HUD 桥接；针对同时使用 WSL 终端与 Windows 桌面 App 的混合用户，优先评估「原生 Windows 单守护进程 + 轻量 `wsl.exe` 探针（复用现有 SSH 远端探针模型）」的单热键共存架构，避免双系统热键状态机跳跃冲突。
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
 
