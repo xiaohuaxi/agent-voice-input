@@ -6,7 +6,11 @@ Never touches the host user's ``~/.ssh``, ``~/.claude``, ``~/.codex``, or system
 """
 from __future__ import annotations
 
+from email.parser import BytesParser
+from email.policy import default as email_policy_default
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -16,7 +20,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from typing import Any, Callable
 import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,12 +30,23 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from agent_voice_input.config import RemoteConfig, RemoteHostConfig  # noqa: E402
+from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
+from agent_voice_input.config import (  # noqa: E402
+    AsrConfig,
+    AudioConfig,
+    Config,
+    HotkeyConfig,
+    RefinerConfig,
+    RemoteConfig,
+    RemoteHostConfig,
+)
+from agent_voice_input.daemon import VoiceInputDaemon  # noqa: E402
+from agent_voice_input.platform_common import ForegroundWindow, PasteOutcome  # noqa: E402
 from agent_voice_input.remote_ssh import (  # noqa: E402
     BREAKER_CONN_COOLDOWN_SEC,
     RemoteSshManager,
 )
-from agent_voice_input.session_ctx import encode_claude_project_dir  # noqa: E402
+from agent_voice_input.session_ctx import SessionTracker, encode_claude_project_dir  # noqa: E402
 
 
 def _find_sshd_bin() -> str | None:
@@ -553,6 +570,466 @@ class RemoteSshLoopbackE2ETests(unittest.TestCase):
             if mgr is not None:
                 mgr.close()
             fixture.cleanup()
+
+    def _run_daemon_remote_devbox_prefetch_into_stage2_e2e(
+        self,
+        *,
+        base_dir: Path,
+        rt_dir: Path,
+        remote_home: Path,
+        client_home: Path,
+        ssh_bin: str,
+        ssh_target: str,
+        git_bin: str,
+        ssh_call_log: Path,
+        expect_control_master: bool,
+    ) -> None:
+        """Shared E2E driver: VoiceInputDaemon + [@devbox] async SSH prefetch -> loopback Stage 1/2 HTTP."""
+        repo_dir = remote_home / "work" / "alpha-service"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        git_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(remote_home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+        (repo_dir / "core_router.py").write_text("def route():\n    return 1\n", encoding="utf-8")
+        for gcmd in (
+            [git_bin, "init", "-q"],
+            [git_bin, "config", "user.email", "ci@example.com"],
+            [git_bin, "config", "user.name", "CI Runner"],
+            [git_bin, "add", "core_router.py"],
+            [git_bin, "commit", "-q", "-m", "init"],
+        ):
+            gp = subprocess.run(
+                gcmd,
+                cwd=str(repo_dir),
+                env=git_env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(gp.returncode, 0, f"{gcmd} failed: {gp.stderr!r}")
+        (repo_dir / "session_gateway.py").write_text("class SessionGateway:\n    pass\n", encoding="utf-8")
+
+        real_repo = str(repo_dir.resolve())
+        prior_sid = "11111111-2222-3333-4444-555555555555"
+        cur_sid = "aaaa1111-bbbb-2222-cccc-333333333333"
+        t_now = time.time()
+
+        prior_body = (
+            "We refactored GrpcStreamRouter and token_bucket_limiter.py to preserve "
+            "deterministic FIFO delivery across reconnects. "
+        ) * 8
+        _write_claude_jsonl(
+            remote_home,
+            prior_sid,
+            real_repo,
+            [
+                ("user", f"Review GrpcStreamRouter design: {prior_body}"),
+                ("assistant", f"Checked token_bucket_limiter.py metrics: {prior_body}"),
+                ("user", f"Check backpressure on GrpcStreamRouter: {prior_body}"),
+                ("assistant", f"Backpressure confirmed safe in token_bucket_limiter.py: {prior_body}"),
+                ("user", "Any follow-up?"),
+                ("assistant", "Ready for next session."),
+            ],
+            mtime=t_now - 120.0,
+        )
+        _write_claude_jsonl(
+            remote_home,
+            cur_sid,
+            real_repo,
+            [
+                ("user", "Check session_gateway.py routing behavior."),
+                ("assistant", "Inspecting session_gateway.py now."),
+            ],
+            mtime=t_now,
+        )
+
+        cfg_dir = client_home / ".config" / "agent-voice-input"
+        cfg_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        hw_file = cfg_dir / "hotwords.txt"
+        hw_file.write_text("[global]\nRemoteGlobalTerm\n\n[coding]\nRemoteDevboxTerm\n", encoding="utf-8")
+        os.chmod(hw_file, 0o600)
+
+        asr_reqs: list[dict[str, Any]] = []
+        refiner_reqs: list[dict[str, Any]] = []
+        srv_lock = threading.Lock()
+
+        class _LoopbackHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: Any) -> None:
+                del format, args
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or "0")
+                raw = self.rfile.read(length)
+                ctype = str(self.headers.get("Content-Type") or "")
+                if self.path.endswith("/audio/transcriptions"):
+                    msg = BytesParser(policy=email_policy_default).parsebytes(
+                        f"Content-Type: {ctype}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + raw
+                    )
+                    prompt_txt = ""
+                    if msg.is_multipart():
+                        for part in msg.iter_parts():
+                            if part.get_param("name", header="content-disposition") == "prompt":
+                                prompt_txt = (part.get_payload(decode=True) or b"").decode(
+                                    "utf-8", errors="replace"
+                                )
+                    with srv_lock:
+                        asr_reqs.append({"prompt": prompt_txt})
+                    body = json.dumps(
+                        {"text": "帮我检查 grpc stream router 和 session gateway 的限流逻辑"},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                if self.path.endswith("/responses"):
+                    req_obj = json.loads(raw.decode("utf-8"))
+                    with srv_lock:
+                        refiner_reqs.append(req_obj)
+                    ev1 = json.dumps(
+                        {
+                            "type": "response.output_text.delta",
+                            "delta": "帮我检查 GrpcStreamRouter 和 session_gateway.py 的限流逻辑",
+                        },
+                        ensure_ascii=False,
+                    )
+                    ev2 = json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "status": "completed",
+                                "usage": {
+                                    "input_tokens": 3200,
+                                    "input_tokens_details": {"cached_tokens": 0},
+                                    "output_tokens": 14,
+                                    "output_tokens_details": {"reasoning_tokens": 0},
+                                },
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    sse = (
+                        f"event: response.output_text.delta\ndata: {ev1}\n\n"
+                        f"event: response.completed\ndata: {ev2}\n\n"
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Content-Length", str(len(sse)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(sse)
+                    return
+
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackHandler)
+        port = int(server.server_address[1])
+        base_url = f"http://127.0.0.1:{port}/v1"
+        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        srv_thread.start()
+
+        sr = 16000
+        voiced_wav = pack_pcm16_mono_wav(
+            [int(10000 * math.sin(2.0 * math.pi * 260.0 * i / sr)) for i in range(int(sr * 0.45))],
+            sample_rate=sr,
+        )
+        remote_win = ForegroundWindow(
+            hwnd=601,
+            process="WindowsTerminal.exe",
+            title=f"[@devbox] claude · {real_repo} [#{cur_sid[:8]}]",
+        )
+        deliveries: list[str] = []
+
+        class _RemoteTestPlatform:
+            last_audio_error = ""
+
+            def set_recorder_lost_callback(self, cb: Callable[..., Any] | None) -> None:
+                del cb
+
+            def set_recorder_recovered_callback(self, cb: Callable[..., Any] | None) -> None:
+                del cb
+
+            def start_event_listener(self, on_hotkey_event: Callable[[dict[str, Any]], None]) -> None:
+                del on_hotkey_event
+
+            def is_allowed_terminal(self, window: ForegroundWindow) -> bool:
+                del window
+                return True
+
+            def get_foreground_window(self) -> ForegroundWindow:
+                return remote_win
+
+            def resolve_foreground_window(self, hint: ForegroundWindow | None = None) -> ForegroundWindow:
+                return hint if (hint and hint.process) else remote_win
+
+            def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
+                del runtime_dir, loopback, seq_id
+
+            def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
+                del drain
+                return voiced_wav, "remote_e2e_mic"
+
+            def cancel_recording(self) -> None:
+                pass
+
+            def hud(self, state: str, text: str = "", duration_ms: int = 0, **kwargs: Any) -> None:
+                del state, text, duration_ms, kwargs
+
+            def beep(self, kind: str) -> None:
+                del kind
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                **kwargs: Any,
+            ) -> PasteOutcome:
+                del seq_id, target_hwnd
+                bc = kwargs.get("before_commit")
+                if callable(bc) and not bc():
+                    return PasteOutcome(False, False, "cancelled", "")
+                deliveries.append(text)
+                return PasteOutcome(True, True, "pasted", remote_win.process, used_clipboard_paste=True)
+
+            def close(self) -> None:
+                pass
+
+        host_cfg = RemoteHostConfig(
+            name="devbox",
+            ssh_target=ssh_target,
+            ssh_bin=ssh_bin,
+            aliases=("devbox",),
+            timeout_ms=4000,
+        )
+        remote_cfg = RemoteConfig(timeout_ms=4000, hosts=(host_cfg,))
+        cfg = Config(
+            hotkey=HotkeyConfig(key="RControl", trigger_mode="tap_toggle", debounce_ms=0),
+            audio=AudioConfig(save_recordings=False),
+            asr=AsrConfig(
+                provider="openai-compatible",
+                api="audio-transcriptions",
+                base_url=base_url,
+                model="whisper-remote-e2e",
+                hotwords_file=str(hw_file),
+                max_retries=0,
+            ),
+            refiner=RefinerConfig(
+                provider="openai-compatible",
+                api="responses",
+                base_url=base_url,
+                model="refiner-remote-e2e",
+                max_retries=0,
+                include_git_status=True,
+                cold_start_fallback="auto",
+            ),
+            remote=remote_cfg,
+        )
+        client_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(client_home),
+            "XDG_CONFIG_HOME": str(client_home / ".config"),
+            "XDG_CACHE_HOME": str(base_dir / "cache"),
+            "XDG_RUNTIME_DIR": str(rt_dir),
+            "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt_dir),
+        }
+        empty_proc = base_dir / "empty_proc"
+        empty_proc.mkdir(exist_ok=True)
+        tracker = SessionTracker(
+            env=client_env,
+            runtime_dir=rt_dir,
+            proc_root=empty_proc,
+            remote_cfg=remote_cfg,
+            cold_start_fallback="auto",
+        )
+        if not expect_control_master:
+            tracker.remote_manager.enable_multiplexing = False
+
+        daemon: VoiceInputDaemon | None = None
+        try:
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=client_env,
+                runtime_dir=rt_dir,
+                platform=_RemoteTestPlatform(),
+                tracker=tracker,
+                paste_settle_sec=0.0,
+            )
+
+            # 1. Start recording on [@devbox] -> triggers async SSH prefetch during recording
+            r_start = daemon.handle_trigger("ptt_start", remote_win)
+            self.assertTrue(r_start["ok"], r_start)
+
+            # Wait for the background prefetch initiated by start_recording() to populate cache
+            pref_deadline = time.monotonic() + 6.0
+            prefetched_ready = False
+            while time.monotonic() < pref_deadline:
+                with tracker.remote_manager._lock:
+                    comp = tracker.remote_manager._completed.get("devbox")
+                    if comp is not None and comp.done_evt.is_set() and comp.response is not None:
+                        prefetched_ready = True
+                        break
+                time.sleep(0.02)
+            self.assertTrue(
+                prefetched_ready,
+                f"start_recording() async remote prefetch did not complete; breaker={tracker.remote_manager.breaker_snapshot()}",
+            )
+            if expect_control_master:
+                cm_socks = list(rt_dir.glob("cm-*"))
+                self.assertTrue(cm_socks, f"expected ControlMaster socket under {rt_dir}")
+                self.assertTrue(stat.S_ISSOCK(cm_socks[0].stat().st_mode))
+
+            calls_after_prefetch = len(
+                [ln for ln in ssh_call_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            )
+            self.assertEqual(calls_after_prefetch, 1, "expected exactly 1 SSH probe during start_recording prefetch")
+
+            # 2. Stop recording -> consumes prefetched remote snapshot into Stage 1 + Stage 2 loopback HTTP
+            r_stop = daemon.handle_trigger("ptt_stop")
+            self.assertTrue(r_stop["ok"], r_stop)
+
+            idle_deadline = time.monotonic() + 8.0
+            st_final: dict[str, Any] = {}
+            while time.monotonic() < idle_deadline:
+                st_final = daemon.handle_control({"cmd": "status"})
+                lr = st_final.get("last_result") if isinstance(st_final.get("last_result"), dict) else {}
+                if (
+                    st_final.get("state") == "idle"
+                    and int(st_final.get("pending_count", 0)) == 0
+                    and int(lr.get("seq_id") or 0) >= 1
+                ):
+                    break
+                time.sleep(0.02)
+
+            lr = st_final.get("last_result") or {}
+            self.assertTrue(lr.get("ok"), f"remote dictation failed: {lr!r}")
+            self.assertEqual(lr.get("session_key"), f"remote:devbox:claude:{cur_sid}")
+            self.assertEqual(lr.get("ctx_fallback"), "prior_session")
+            self.assertEqual(deliveries, ["帮我检查 GrpcStreamRouter 和 session_gateway.py 的限流逻辑"])
+
+            # Verify stop_recording() hit the prefetched remote cache without a duplicate SSH round-trip
+            calls_after_stop = len(
+                [ln for ln in ssh_call_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            )
+            self.assertEqual(
+                calls_after_stop,
+                calls_after_prefetch,
+                "stop_recording() should consume start_recording() prefetch cache without re-probing SSH",
+            )
+
+            # Verify Stage 1 received remote + manual hotwords
+            self.assertEqual(len(asr_reqs), 1)
+            s1_prompt = asr_reqs[0]["prompt"]
+            self.assertIn("RemoteDevboxTerm", s1_prompt)
+            self.assertTrue(
+                any(hw in s1_prompt for hw in ("session_gateway.py", "GrpcStreamRouter")),
+                f"expected remote hotwords in Stage 1 prompt, got {s1_prompt!r}",
+            )
+
+            # Verify Stage 2 loopback HTTP received remote current turns + cold-start prior_turns + git_status
+            self.assertEqual(len(refiner_reqs), 1)
+            s2_input = refiner_reqs[0]["input"]
+            dev_texts = "\n".join(
+                m["content"][0]["text"] for m in s2_input if m.get("role") == "developer"
+            )
+            user_text = s2_input[-1]["content"][0]["text"]
+            self.assertIn("<session_reference_log", dev_texts)
+            self.assertIn("session_gateway.py", dev_texts)
+            self.assertIn("<prior_session_reference", dev_texts)
+            self.assertIn("GrpcStreamRouter", dev_texts)
+            self.assertIn("<workspace_git_status", user_text)
+            self.assertIn("session_gateway.py", user_text)
+        finally:
+            if daemon is not None:
+                daemon.close()
+            server.shutdown()
+            server.server_close()
+            srv_thread.join(timeout=3.0)
+
+    def test_daemon_remote_devbox_prefetch_into_stage2_loopback_http_e2e(self) -> None:
+        """Real loopback ``sshd`` + ``ControlMaster`` + ``VoiceInputDaemon`` ``[@devbox]`` prefetch -> Stage 2 HTTP."""
+        sshd_bin, ssh_bin, keygen_bin, git_bin = self._require_loopback_sshd_tools()
+        fixture = _LoopbackSshdFixture(
+            sshd_bin=sshd_bin,
+            ssh_bin=ssh_bin,
+            ssh_keygen_bin=keygen_bin,
+        )
+        try:
+            fixture.start()
+            call_log = fixture.base_dir / "ssh_calls.log"
+            call_log.write_text("", encoding="utf-8")
+            counting_wrapper = fixture.base_dir / "ssh_counting_wrapper.sh"
+            counting_wrapper.write_text(
+                f'#!/bin/sh\necho 1 >> "{call_log}"\nexec "{fixture.ssh_bin}" -F "{fixture.ssh_config}" "$@"\n',
+                encoding="utf-8",
+            )
+            os.chmod(counting_wrapper, 0o700)
+
+            self._run_daemon_remote_devbox_prefetch_into_stage2_e2e(
+                base_dir=fixture.base_dir,
+                rt_dir=fixture.rt_dir,
+                remote_home=fixture.remote_home,
+                client_home=fixture.client_home,
+                ssh_bin=str(counting_wrapper),
+                ssh_target="loopbox",
+                git_bin=git_bin,
+                ssh_call_log=call_log,
+                expect_control_master=True,
+            )
+        finally:
+            fixture.cleanup()
+
+    def test_daemon_remote_devbox_prefetch_into_stage2_loopback_http_local_exec_e2e(self) -> None:
+        """Runs the exact ``VoiceInputDaemon`` ``[@devbox]`` async prefetch -> ``_remote_probe.py`` ->
+        Stage 2 loopback HTTP E2E path even on hosts without ``openssh-server`` installed."""
+        git_bin = shutil.which("git")
+        if not git_bin:
+            self.skipTest("requires git")
+        base_dir = Path(tempfile.mkdtemp(prefix="avi-rem-e2e-", dir="/tmp"))
+        os.chmod(base_dir, 0o700)
+        rt_dir = base_dir / "rt"
+        remote_home = base_dir / "rhome"
+        fake_proc = base_dir / "rproc"
+        client_home = base_dir / "chome"
+        for d in (rt_dir, remote_home, fake_proc, client_home):
+            d.mkdir(mode=0o700)
+        try:
+            call_log = base_dir / "ssh_calls.log"
+            call_log.write_text("", encoding="utf-8")
+            local_ssh_sim = base_dir / "local_ssh_exec.sh"
+            local_ssh_sim.write_text(
+                f'#!/bin/sh\n'
+                f'echo 1 >> "{call_log}"\n'
+                f'exec env HOME="{remote_home}" AVI_REMOTE_PROC_ROOT="{fake_proc}" "{sys.executable}" -\n',
+                encoding="utf-8",
+            )
+            os.chmod(local_ssh_sim, 0o700)
+
+            self._run_daemon_remote_devbox_prefetch_into_stage2_e2e(
+                base_dir=base_dir,
+                rt_dir=rt_dir,
+                remote_home=remote_home,
+                client_home=client_home,
+                ssh_bin=str(local_ssh_sim),
+                ssh_target="loopbox",
+                git_bin=git_bin,
+                ssh_call_log=call_log,
+                expect_control_master=False,
+            )
+        finally:
+            shutil.rmtree(base_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

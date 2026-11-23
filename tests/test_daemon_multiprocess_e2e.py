@@ -562,6 +562,370 @@ class DaemonMultiprocessE2ETests(unittest.TestCase):
             self._reap_proc(proc2)
             shutil.rmtree(base_dir, ignore_errors=True)
 
+    def test_real_cli_subprocess_operations_lifecycle_e2e(self) -> None:
+        """Real ``python3 -m agent_voice_input.cli`` subprocess lifecycle:
+        start (detached start_new_session + 0600 daemon.log) -> status -> toggle -> cancel
+        -> restart with CLI override & TMUX sanitization -> diagnose --json -> stop.
+        """
+        base_dir = Path(tempfile.mkdtemp(prefix="avi-cli-", dir="/tmp"))
+        os.chmod(base_dir, 0o700)
+        home_dir = base_dir / "home"
+        cfg_home = home_dir / ".config"
+        cache_home = base_dir / "cache"
+        rt_dir = base_dir / "rt"
+        sync_dir = base_dir / "sync"
+        harness_dir = base_dir / "harness"
+        for d in (home_dir, cfg_home, cache_home, rt_dir, sync_dir, harness_dir):
+            d.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+        cfg_dir = cfg_home / "agent-voice-input"
+        cfg_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        cfg_file = cfg_dir / "config.toml"
+        cfg_file.write_text(
+            "\n".join(
+                [
+                    "[hotkey]",
+                    'key = "RControl"',
+                    'trigger_mode = "tap_toggle"',
+                    "debounce_ms = 0",
+                    "",
+                    "[asr]",
+                    'provider = "openai-compatible"',
+                    'base_url = "http://127.0.0.1:19999/v1"',
+                    'model = "whisper-base-cfg"',
+                    "",
+                    "[refiner]",
+                    'provider = "off"',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(cfg_file, 0o600)
+
+        # Harness injected strictly into test child processes via PYTHONPATH sitecustomize.py
+        # so production cli._cmd_start spawns a real detached `cli daemon` process without
+        # touching host PowerShell / mac_shim bridges or host directories.
+        sitecustomize_src = '''\
+import json, os, sys, warnings
+from pathlib import Path
+
+_SYNC = os.environ.get("_AVI_CLI_E2E_SYNC_DIR", "").strip()
+if _SYNC:
+    if "daemon" in sys.argv:
+        warnings.simplefilter("error", ResourceWarning)
+    from agent_voice_input import daemon as _daemon_mod
+    from agent_voice_input.platform_common import ForegroundWindow, PasteOutcome
+
+    class _CliE2EPlatform:
+        def __init__(self, env):
+            self.last_audio_error = ""
+            self.last_shim_error = ""
+            self._rec_active = False
+            self._env = dict(env) if env is not None else dict(os.environ)
+
+        def is_shim_ok(self):
+            return True
+
+        def set_recorder_lost_callback(self, cb):
+            self._lost_cb = cb
+
+        def set_recorder_recovered_callback(self, cb):
+            self._recovered_cb = cb
+
+        def start_event_listener(self, on_hotkey_event):
+            self._on_event = on_hotkey_event
+
+        def is_allowed_terminal(self, window):
+            del window
+            return True
+
+        def get_foreground_window(self):
+            return ForegroundWindow(hwnd=301, process="WindowsTerminal.exe", title="codex")
+
+        def resolve_foreground_window(self, hint=None):
+            return hint if (hint and hint.process) else self.get_foreground_window()
+
+        def start_recording(self, runtime_dir, *, loopback=False, seq_id=None):
+            del runtime_dir, loopback, seq_id
+            self._rec_active = True
+
+        def stop_recording(self, *, drain=True):
+            del drain
+            self._rec_active = False
+            return b"", "cli_e2e_mic"
+
+        def cancel_recording(self):
+            self._rec_active = False
+
+        def hud(self, state, text="", duration_ms=0, *, layer=None, clear_main=None, clear_toast=None, bg_count=0):
+            del state, text, duration_ms, layer, clear_main, clear_toast, bg_count
+
+        def beep(self, kind):
+            del kind
+
+        def deliver_text(self, text, seq_id, target_hwnd=0, **kwargs):
+            del text, seq_id, target_hwnd, kwargs
+            return PasteOutcome(True, True, "pasted", "WindowsTerminal.exe", used_clipboard_paste=True)
+
+        def close(self):
+            pass
+
+    def _fake_create_platform(cfg, *, env=None):
+        del cfg
+        eff = dict(env) if env is not None else dict(os.environ)
+        rec = {
+            "pid": os.getpid(),
+            "sid": os.getsid(0),
+            "env_TMUX": eff.get("TMUX"),
+            "env_TMUX_PANE": eff.get("TMUX_PANE"),
+            "env_TMUX_HINT": eff.get("AGENT_VOICE_INPUT_TMUX_HINT"),
+            "os_TMUX": os.environ.get("TMUX"),
+            "os_TMUX_PANE": os.environ.get("TMUX_PANE"),
+            "os_TMUX_HINT": os.environ.get("AGENT_VOICE_INPUT_TMUX_HINT"),
+        }
+        out_path = Path(_SYNC) / "daemon_starts.jsonl"
+        with out_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        return _CliE2EPlatform(eff)
+
+    _daemon_mod.create_platform = _fake_create_platform
+
+    if sys.platform == "darwin":
+        from agent_voice_input import platform_macos as _mac_mod
+
+        _mac_mod.compile_mac_shim = lambda **kwargs: (None, "")
+'''
+        (harness_dir / "sitecustomize.py").write_text(sitecustomize_src, encoding="utf-8")
+
+        base_env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(home_dir),
+            "XDG_CONFIG_HOME": str(cfg_home),
+            "XDG_CACHE_HOME": str(cache_home),
+            "XDG_RUNTIME_DIR": str(rt_dir),
+            "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt_dir),
+            "PYTHONPATH": f"{SRC_ROOT}{os.pathsep}{harness_dir}",
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONWARNINGS": "error::ResourceWarning",
+            "_AVI_CLI_E2E_SYNC_DIR": str(sync_dir),
+        }
+
+        def _run_cli(
+            *cli_args: str,
+            extra_env: dict[str, str] | None = None,
+            timeout: float = 15.0,
+        ) -> subprocess.CompletedProcess[str]:
+            run_env = {**base_env, **(extra_env or {})}
+            warn_flags = ["-W", "error::ResourceWarning"]
+            # `cli._cmd_start` intentionally detaches a `start_new_session=True` daemon child;
+            # CPython's `Popen.__del__` emits `ResourceWarning: subprocess <pid> is still running`
+            # in the launcher process only. Filter only that launcher warning (removing PYTHONWARNINGS
+            # from launcher env so `-W` takes precedence; sitecustomize enforces strict ResourceWarning
+            # errors inside the detached `daemon` child) while keeping all other CLI calls strict.
+            if cli_args and cli_args[0] in ("start", "restart"):
+                run_env.pop("PYTHONWARNINGS", None)
+                warn_flags.extend(["-W", "ignore:subprocess :ResourceWarning"])
+            return subprocess.run(
+                [sys.executable, *warn_flags, "-m", "agent_voice_input.cli", *cli_args],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=run_env,
+                timeout=timeout,
+                check=False,
+            )
+
+        def _read_starts() -> list[dict[str, Any]]:
+            p = sync_dir / "daemon_starts.jsonl"
+            if not p.is_file():
+                return []
+            return [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+        def _pid_alive(pid: int) -> bool:
+            if pid <= 0:
+                return False
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except OSError:
+                return False
+
+        spawned_pids: set[int] = set()
+        try:
+            # 1. `start`: real start_new_session=True background daemon + 0600 daemon.log + TMUX sanitization
+            tmux_start = "/tmp/tmux-e2e-start/default,4242,0"
+            p_start = _run_cli(
+                "start",
+                "--config",
+                str(cfg_file),
+                extra_env={"TMUX": tmux_start, "TMUX_PANE": "%7"},
+            )
+            self.assertEqual(
+                p_start.returncode,
+                0,
+                f"cli start failed rc={p_start.returncode} stdout={p_start.stdout!r} stderr={p_start.stderr!r}",
+            )
+            self.assertIn("started (pid=", p_start.stdout)
+            self.assertIn("[pipeline]", p_start.stdout)
+            self.assertNotIn("ResourceWarning", p_start.stderr)
+
+            log_path = rt_dir / "daemon.log"
+            self.assertTrue(log_path.is_file(), "daemon.log was not created by cli start")
+            self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+
+            starts1 = _read_starts()
+            self.assertEqual(len(starts1), 1, f"expected 1 daemon start record, got {starts1!r}")
+            pid1 = int(starts1[0]["pid"])
+            spawned_pids.add(pid1)
+            self.assertEqual(starts1[0]["sid"], pid1, "daemon must run in its own session (start_new_session=True)")
+            self.assertIsNone(starts1[0]["os_TMUX"])
+            self.assertIsNone(starts1[0]["os_TMUX_PANE"])
+            self.assertEqual(starts1[0]["os_TMUX_HINT"], tmux_start)
+            self.assertIsNone(starts1[0]["env_TMUX"])
+            self.assertIsNone(starts1[0]["env_TMUX_PANE"])
+            self.assertEqual(starts1[0]["env_TMUX_HINT"], tmux_start)
+
+            # 2. `status`: live JSON status matches pid1 and configured model
+            p_st1 = _run_cli("status", "--config", str(cfg_file))
+            self.assertEqual(p_st1.returncode, 0, p_st1.stderr)
+            st1 = json.loads(p_st1.stdout)
+            self.assertTrue(st1["ok"])
+            self.assertEqual(st1["pid"], pid1)
+            self.assertEqual(st1["state"], "idle")
+            self.assertEqual(st1["pipeline"]["asr"]["model"], "whisper-base-cfg")
+            self.assertFalse(st1["code_drift"])
+
+            # 3. `toggle` (start recording) -> `status` (recording) -> `cancel` (abort recording cleanly)
+            p_tog = _run_cli("toggle", "--config", str(cfg_file))
+            self.assertEqual(p_tog.returncode, 0, f"toggle stderr={p_tog.stderr!r}")
+            tog_obj = json.loads(p_tog.stdout)
+            self.assertTrue(tog_obj["ok"])
+            self.assertEqual(tog_obj["state"], "recording")
+            self.assertEqual(tog_obj["seq_id"], 1)
+
+            p_st_rec = _run_cli("status", "--config", str(cfg_file))
+            self.assertEqual(p_st_rec.returncode, 0, p_st_rec.stderr)
+            self.assertEqual(json.loads(p_st_rec.stdout)["state"], "recording")
+
+            p_can = _run_cli("cancel", "--config", str(cfg_file))
+            self.assertEqual(p_can.returncode, 0, f"cancel stderr={p_can.stderr!r}")
+            can_obj = json.loads(p_can.stdout)
+            self.assertTrue(can_obj["ok"])
+            self.assertEqual(can_obj.get("cancelled_recording"), 1)
+            self.assertEqual(can_obj.get("cancelled_ids"), [1])
+            self.assertEqual(can_obj["state"], "idle")
+
+            # 4. `restart` with CLI override + new TMUX env: stops pid1, waits lock handoff, spawns pid2
+            tmux_restart = "/tmp/tmux-e2e-restart/default,9999,1"
+            p_rst = _run_cli(
+                "restart",
+                "--config",
+                str(cfg_file),
+                "--asr-model",
+                "whisper-override-v2",
+                extra_env={"TMUX": tmux_restart, "TMUX_PANE": "%12"},
+            )
+            self.assertEqual(
+                p_rst.returncode,
+                0,
+                f"cli restart failed rc={p_rst.returncode} stdout={p_rst.stdout!r} stderr={p_rst.stderr!r}",
+            )
+            self.assertIn("stopped", p_rst.stdout)
+            self.assertIn("started (pid=", p_rst.stdout)
+            self.assertNotIn("ResourceWarning", p_rst.stderr)
+
+            starts2 = _read_starts()
+            self.assertEqual(len(starts2), 2, f"expected 2 daemon starts after restart, got {starts2!r}")
+            pid2 = int(starts2[1]["pid"])
+            spawned_pids.add(pid2)
+            self.assertNotEqual(pid2, pid1)
+            self.assertEqual(starts2[1]["sid"], pid2)
+            self.assertIsNone(starts2[1]["os_TMUX"])
+            self.assertIsNone(starts2[1]["os_TMUX_PANE"])
+            self.assertEqual(starts2[1]["os_TMUX_HINT"], tmux_restart)
+            self.assertFalse(_pid_alive(pid1), f"previous daemon pid1={pid1} still alive after restart")
+
+            p_st2 = _run_cli("status", "--config", str(cfg_file))
+            self.assertEqual(p_st2.returncode, 0, p_st2.stderr)
+            st2 = json.loads(p_st2.stdout)
+            self.assertTrue(st2["ok"])
+            self.assertEqual(st2["pid"], pid2)
+            self.assertEqual(st2["state"], "idle")
+            self.assertEqual(st2["pipeline"]["asr"]["model"], "whisper-override-v2")
+
+            # 5. `diagnose --json` against the live restarted daemon
+            p_diag = _run_cli("diagnose", "--json", "--config", str(cfg_file))
+            self.assertEqual(p_diag.returncode, 0, f"diagnose stderr={p_diag.stderr!r}")
+            diag_obj = json.loads(p_diag.stdout)
+            self.assertTrue(diag_obj["daemon"]["online"])
+            self.assertEqual(diag_obj["daemon"]["pid"], pid2)
+            self.assertEqual(diag_obj["daemon"]["state"], "idle")
+            self.assertFalse(diag_obj["daemon"]["code_drift"])
+            self.assertEqual(diag_obj["pipeline"]["asr"]["model"], "whisper-override-v2")
+            self.assertEqual(diag_obj["storage"]["failed_audio_count"], 0)
+
+            # 6. `stop`: clean daemon exit, socket/pid removed, daemon.lock unlocked, 0600 log, no ResourceWarning
+            p_stop = _run_cli("stop", "--config", str(cfg_file))
+            self.assertEqual(p_stop.returncode, 0, f"stop stderr={p_stop.stderr!r}")
+            self.assertIn("stopped", p_stop.stdout)
+            self.assertNotIn("ResourceWarning", p_stop.stderr)
+
+            wait_gone = time.monotonic() + 4.0
+            while time.monotonic() < wait_gone and _pid_alive(pid2):
+                time.sleep(0.02)
+            self.assertFalse(_pid_alive(pid2), f"daemon pid2={pid2} remained alive after cli stop")
+            self.assertFalse((rt_dir / "control.sock").exists())
+            self.assertFalse((rt_dir / "daemon.pid").exists())
+
+            lock_file = rt_dir / "daemon.lock"
+            self.assertTrue(lock_file.is_file())
+            lfd = os.open(str(lock_file), os.O_RDWR)
+            try:
+                fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lfd, fcntl.LOCK_UN)
+            finally:
+                os.close(lfd)
+
+            self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+            log_txt = log_path.read_text(encoding="utf-8", errors="replace")
+            self.assertNotIn("ResourceWarning", log_txt)
+            self.assertNotIn("Traceback", log_txt)
+        finally:
+            # Best-effort guarantee that no detached daemon child survives even on test failure.
+            pid_file = rt_dir / "daemon.pid"
+            if pid_file.is_file():
+                try:
+                    spawned_pids.add(int(pid_file.read_text(encoding="utf-8").strip()))
+                except (OSError, ValueError):
+                    pass
+            for rec in _read_starts():
+                try:
+                    spawned_pids.add(int(rec.get("pid") or 0))
+                except (TypeError, ValueError):
+                    pass
+            for pid in sorted(p for p in spawned_pids if p > 0):
+                if _pid_alive(pid):
+                    try:
+                        os.kill(pid, 15)
+                    except OSError:
+                        pass
+            dl = time.monotonic() + 2.0
+            while time.monotonic() < dl and any(_pid_alive(p) for p in spawned_pids if p > 0):
+                time.sleep(0.02)
+            for pid in sorted(p for p in spawned_pids if p > 0):
+                if _pid_alive(pid):
+                    try:
+                        os.kill(pid, 9)
+                    except OSError:
+                        pass
+            shutil.rmtree(base_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "--child":
