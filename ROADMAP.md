@@ -147,8 +147,8 @@
 2. **真录音模型横评与原生 Gemini 单跳定向补测**：依托仓外隔离时间点回放基线，系统开展主流 ASR / 精修组合的真录音横向对比评测与原生 Gemini 单跳路径定向补测。
 3. **桌面版全新空会话首轮上下文关联**：在 Antigravity 2.0 与 ChatGPT/Codex 统一桌面端中，新建空对话在首句生成标题前尚无窗口级目录线索，当前保持宁缺毋滥防跨仓串台；后续视桌面端暴露活跃工作区/会话 ID 机制再评估零猜测首轮绑定。
 4. **桌面端后续扩展**：跟进 Claude 桌面版（Chat / Code / Cowork 经浅层 `AXWebArea.AXTitle` 识别并同时兼容 `Claude` 与 `Claude-3p` 目录）及 WSL2 跨系统读取 Windows 宿主机桌面 App 上下文。
-5. **自动化无 GUI 真机回归体系**：扩展 `voice-eval`，在零屏幕焦点干扰下自动驱动本机与 macOS 真实 Codex / Claude Code / AGY CLI 新旧会话，并覆盖桌面端上下文只读验证。
-6. **桌面 GUI Computer Use 回归验收 Skill**：沉淀标准多桌面 App 落字、切换会话与切窗防串台清单，供支持 Computer Use 的 Agent 发版前自动执行。
+5. **自动化无 GUI 真机回归体系**（`已落地`）：已通过 `.agents/skills/voice-eval/scripts/regress_matrix.py` 落地双端三层对称回归（Layer A 隔离无头全路由矩阵、Layer B 主守护进程 `control.sock` 探活与 `no_telemetry` 自检、Layer C 本机已装 CLI 与桌面端 SQLite 只读兼容性抽检），并由 `tests/test_regress_matrix.py` 覆盖离线门禁回归。
+6. **桌面 GUI 回归验收清单**（`已落地`）：已在 `.agents/skills/voice-eval/SKILL.md` 沉淀标准桌面 App 落字、切换会话与切窗防串台实机验收流程（配合 `regress_matrix.py --deliver-live`），供人工或支持 Computer Use 的 Agent 发版前执行。
 7. **脱离 WSL 的原生 Windows 独立运行**：覆盖未安装 WSL 的纯 Windows 桌面端用户，原生本地直读 Windows 宿主机 `.codex/`、`.gemini/` 与 Claude 会话目录并复用原生 WASAPI 采集与热键/HUD 桥接；针对同时使用 WSL 终端与 Windows 桌面 App 的混合用户，优先评估「原生 Windows 单守护进程 + 轻量 `wsl.exe` 探针（复用现有 SSH 远端探针模型）」的单热键共存架构，避免双系统热键状态机跳跃冲突。
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）

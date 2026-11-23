@@ -54,7 +54,7 @@
 | **终端** | **本地 & 远端 `tmux`** | `✅` | **macOS** 零剪贴板直投 / **WSL2** 走 `win_shim` 瞬态剪贴板粘贴（不污染原剪贴板）；进程树按焦点窗格隔离；Linux & macOS CI 真实 `tmux` E2E 验证 |
 | **终端** | **其他内置终端与专用 SSH 客户端** | `🧪` | 已内置粘贴键位路由、防串台与识别规则（完整名单见下方折叠区），待真机实测反馈 |
 | **桌面 App** | **Antigravity / AGY 桌面版** | `✅` *(macOS)* / `🧪` *(Windows)* | **Antigravity 2.0 独立桌面版**已在 macOS 真机实测通过（只读 `conversation_summaries.db` + 窗口标题精确/截断前缀匹配、工作区 `git`/文件名与 `brain/` 增量缓存及切会话防串台），同时兼容老版 VS Code Fork *（Windows 桌面版待真机反馈；WSL2 仅扫 WSL 内目录）* |
-| **桌面 App** | **ChatGPT / Codex 统一桌面端** | `✅` *(macOS)* / `🧪` *(Windows)* | 已在 macOS（`com.openai.codex` / 旧 `com.openai.chat`）真机实测通过：只读 `~/.codex/sqlite/codex.db` + `~/.codex/sessions/*.jsonl`，本地仓库任务自动升格为 `agent` 模式并挂载项目热词与增量缓存，普通云端 ChatGPT 聊天保持 `general + ai_chat` 零串台，同窗切会话在投递前复核防串台；Windows（`ChatGPT.exe` / `Codex.exe`）当前提供精修落字与锁窗防串台 *（Windows/WSL2 跨系统上下文绑定已列入路线图）* |
+| **桌面 App** | **ChatGPT / Codex 统一桌面端** | `✅` *(macOS)* / `🧪` *(Windows)* | 已在 macOS 真机实测通过：统一桌面端（`com.openai.codex`）只读 `~/.codex/sqlite/codex.db` + `~/.codex/sessions/*.jsonl`，本地仓库任务自动升格为 `agent` 模式并挂载项目热词与增量缓存，普通云端 ChatGPT 聊天保持 `general + ai_chat` 零串台，同窗切会话在投递前复核防串台；独立旧版 ChatGPT 桌面端（`com.openai.chat`）保持 `general + ai_chat` 精修落字与锁窗防串台；Windows（`ChatGPT.exe` / `Codex.exe`）当前提供精修落字与锁窗防串台 *（Windows/WSL2 跨系统上下文绑定已列入路线图）* |
 | **桌面 App** | **Claude 桌面版** | `✅` *(macOS 落字)* / `🧪` *(Windows)* | macOS（`com.anthropic.claudefordesktop`）专属 `ai_chat` 基础精修落字与锁窗防串台已真机实测通过 *（Windows `Claude.exe` 待真机反馈）*；Code / Cowork 本地仓与会话上下文绑定已列入后续路线图 |
 | **桌面 App** | **其他桌面 IDE 与主流 IM** | `🧪` | IDE（**VS Code**、**Cursor**、**Windsurf**、**JetBrains**、**Zed** 等）走 `coding_gui` 并挂载宿主工作区 `git`/文件名；**在 IDE 内置终端运行 CLI Agent 时同样按 `coding_gui` 处理**（支持精修落字与工作区文件名参考，但**跳过 CLI `sync_session`**，不读内置终端里的 `codex`/`claude`/`agy` 对话历史，也不区分内置终端分屏）。IM（**微信**、**飞书**、**Slack**、**Discord** 等）走 `im_chat` |
 | **桌面 App** | **其他任意桌面 App** *（浏览器、笔记、邮件等）* | `⚪` | 默认 `hotkey.scope = "all"` 可直接语音精修落字 + 锁窗防串台，无专属上下文或语气适配 |
@@ -218,7 +218,7 @@ effort = "auto"
 <summary><b>双平台机制细节（WSL2 WASAPI / macOS TCC 权限与投递）</b></summary>
 
 ### Windows Terminal + WSL2（含远程桌面与 `tmux`）
-- **全局作用域、远程桌面让行与高分屏胶囊**：默认单击右 Ctrl（`RControl`）即可在终端、IDE 与日常桌面应用中开始/结束录音（`hotkey.scope = "all"`，可选 `"coding"` / `"terminals"`；组合键如 `RControl+C` 原样放行），显示原生 Per-Monitor V2 抗锯齿波形胶囊。聚焦远程桌面/虚拟机客户端（`mstsc`、`vmconnect`、Parsec、RustDesk 等）时静默让行热键（`yield_remote_desktop = true`；默认放行裸 `msrdc` 以保护 Win11 WSLg，非 WSLg 的 AVD/Windows 365 用户可加 `ignore_apps = ["msrdc"]`）。WSL2 下即便在 `tmux` 内，投递仍走 `win_shim` 瞬态剪贴板快照 + 按进程路由粘贴快捷键（`Ctrl+V`、`Ctrl+Shift+V` 用于 `WezTerm`/`Alacritty`/`Ghostty`/`Tabby`/`Hyper`/`Rio`/`Warp`/`WindTerm`，`Shift+Insert` 用于 `mintty`/`PuTTY`/`KiTTY`/`MobaXterm`/`Xshell`），粘贴后还原且不污染原剪贴板内容。
+- **全局作用域、远程桌面让行与高分屏胶囊**：默认单击右 Ctrl（`RControl`）即可在终端、IDE 与日常桌面应用中开始/结束录音（`hotkey.scope = "all"`，可选 `"coding"` / `"terminals"`；组合键如 `RControl+C` 原样放行），显示原生 Per-Monitor V2 抗锯齿波形胶囊。聚焦远程桌面/虚拟机客户端（`mstsc`、`vmconnect`、Parsec、RustDesk 等）时静默让行热键（`yield_remote_desktop = true`；默认放行裸 `msrdc` 以保护 Win11 WSLg，非 WSLg 的 AVD/Windows 365 用户可加 `ignore_apps = ["msrdc"]`）。WSL2 下即便在 `tmux` 内，投递仍走 `win_shim` 瞬态剪贴板快照 + 按进程路由粘贴快捷键（`Ctrl+V`、`Ctrl+Shift+V` 用于 `WezTerm`/`Alacritty`/`Ghostty`/`Tabby`/`Hyper`/`Rio`/`Warp`/`WindTerm`/`SecureCRT`/`Termius`/`Electerm`，`Shift+Insert` 用于 `mintty`/`PuTTY`/`KiTTY`/`MobaXterm`/`Xshell`），粘贴后还原且不污染原剪贴板内容。
 - **原生 WASAPI 采集**：常驻 `win_shim` 直接调用 Windows WASAPI 16 kHz 采集，避开 WSLg `RDPSource` 休眠零包死锁；起止提示音默认关闭以免触发 RDP 音频通道唤醒延迟。
 - **零配置 `tmux` 分屏追踪**：无需改动 `~/.tmux.conf`，自动锁定当前 attached 客户端的焦点窗格。
 

@@ -54,7 +54,7 @@ PYTHONPATH=src python3 .agents/skills/voice-eval/scripts/bench_refiner.py --synt
 无需人工开口录音，也不启动 `win_shim.ps1` / `mac_shim` 抢占宿主机热键、HUD 或剪贴板，一键验证真机端到端闭环：
 
 ```bash
-# 自动利用系统内置 TTS 合成并缓存技术口述 WAV，并回放最新最多 2 条已归档真机录音，跑完整 6 项系统自检
+# 自动利用系统内置 TTS 合成并缓存技术口述 WAV，并回放最新最多 2 条已归档真机录音，跑完整 7 项系统自检
 PYTHONPATH=src python3 .agents/skills/voice-eval/scripts/e2e_system.py
 
 # 控制真机录音回放条数（--saved-limit 0 跳过宿主机回放）、输出脱敏 JSON 或指定外部测试 WAV
@@ -69,6 +69,7 @@ PYTHONPATH=src python3 .agents/skills/voice-eval/scripts/e2e_system.py --wav /tm
 - `C4_fault_recovery_redaction`：注入单次上游故障，校验当次音频以 `0600` 暂存至隔离 `failed/`、失败记录与异常摘要经 `redact_secrets` 脱敏，且 `diagnose_live.py --json` 报告 `has_saved_audio` 正常闭环。
 - `C5_mp3_archive_and_saved_replay`：在隔离 `XDG_CACHE_HOME` 验证 `audio.save_recordings=true` 真实产出 `0600` `64 kbps` `rec-*.mp3` 且能经 `ffmpeg` 还原为有效 `16kHz WAV`；同时检查宿主机 `resolve_saved_recordings_dir()`，若存在真实 `.mp3`/`.m4a`/`.wav` 历史录音则按 `--saved-limit`（默认最多 2 条，`0` 跳过宿主录音）选取最新录音还原后送入隔离守护进程 + 真 ASR + 真精修 + 隔离 `tmux` 落字验证（仅输出纯数值指标、零原文打印），尚无历史录音时标明 `SKIPPED (0 saved recordings yet)` 并跑通隔离 MP3 往返真链路回放。
 - `C6_non_git_and_ssh_isolation`：在隔离临时目录创建不含 `.git` 的普通文件夹（含 `budget_q4_plan.xlsx` / `custom_widget_spec.md`）并绑定隔离会话连续跑通两轮语音精修，验证非 Git 浅层文件名提取、热词还原与增量多轮上下文命中；随后在本地双会话在线场景下，向无头后端分别模拟终端 SSH 窗口标题与专用客户端（`putty.exe`）前台信息，验证触发 Phase 0 远端防串台硬否决（零本地上下文混入）。
+- `C7_native_hud_self_check`：在 macOS 执行 `mac_shim --self-check`、在 WSL2 执行 `win_shim.ps1 -Mode self-check`（纯非 WSL Linux 自动跳过），零屏幕/剪贴板打扰地离屏校验原生 HUD 胶囊像素布局用例（`hud_layout_cases > 0`）与桥接自检状态。
 
 ## 场景 3：本机运行期慢速与异常只读诊断（`scripts/diagnose_live.py`）
 

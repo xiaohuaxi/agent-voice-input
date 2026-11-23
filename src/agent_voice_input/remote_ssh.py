@@ -434,7 +434,7 @@ def _parse_title_remote_hints(
         return False, "", ""
 
     body = _TAB_PREFIX_RE.sub("", raw).strip()
-    # Unwrap quoted tmux set-titles format e.g. `0:0.0 "xhx@devbox: ~/repo"`
+    # Unwrap quoted tmux set-titles format e.g. `0:0.0 "dev@devbox: ~/repo"`
     if '"' in body and body.endswith('"'):
         qpos = body.find('"')
         if 0 <= qpos < len(body) - 2:
@@ -493,7 +493,7 @@ def _parse_title_remote_hints(
 
 
 def extract_local_prompt_cwd(window_title: str, local_hostnames: Collection[str]) -> str | None:
-    """When ``window_title`` is an explicit local shell prompt (e.g. ``xhx@MyPC: ~``), return its path."""
+    """When ``window_title`` is an explicit local shell prompt (e.g. ``dev@MyPC: ~``), return its path."""
     raw = (window_title or "").strip()
     if not raw:
         return None

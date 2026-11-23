@@ -82,8 +82,10 @@ from agent_voice_input.session_ctx import (  # noqa: E402
     write_session_registry_entry,
 )
 from agent_voice_input.workspace_ctx import (  # noqa: E402
+    _CODEX_DESKTOP_ORIGINATORS,
     _effective_is_wsl,
     _get_sqlite_table_cols,
+    _iter_agy_ide_roots,
     _open_readonly_sqlite,
 )
 
@@ -170,6 +172,58 @@ def _sanitize_process_env_no_fast() -> None:
         ku = k.upper()
         if "FAST" in ku and ("CODEX" in ku or "OPENAI" in ku or "VOICE" in ku):
             os.environ.pop(k, None)
+
+
+_LAYER_A_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+    "USER",
+    "LOGNAME",
+)
+_LAYER_C_MAX_CANDIDATES: int = 5
+_LAYER_C_SCHEMA_DRIFT_MIN_BYTES: int = 4096
+
+
+def _build_layer_a_env(
+    base_env: Mapping[str, str],
+    *,
+    iso_home: Path,
+    iso_config: Path,
+    iso_cache: Path,
+    rt_dir: Path,
+) -> dict[str, str]:
+    """Build a minimal allowlisted env for Layer A, stripping host config, CODEX_HOME & API keys."""
+    iso_env: dict[str, str] = {}
+    for key in _LAYER_A_ENV_ALLOWLIST:
+        val = base_env.get(key)
+        if val is not None:
+            iso_env[key] = val
+    iso_env["HOME"] = str(iso_home)
+    iso_env["XDG_CONFIG_HOME"] = str(iso_config)
+    iso_env["XDG_CACHE_HOME"] = str(iso_cache)
+    iso_env["XDG_RUNTIME_DIR"] = str(rt_dir)
+    iso_env["AGENT_VOICE_INPUT_RUNTIME_DIR"] = str(rt_dir)
+    iso_env["PYTHONPATH"] = str(_SRC_ROOT)
+    iso_env["PYTHONUTF8"] = "1"
+    return iso_env
+
+
+def _make_short_tempdir(prefix: str = "avi-regress-") -> tempfile.TemporaryDirectory[str]:
+    """Prefer ``/tmp`` on POSIX so AF_UNIX control.sock paths stay well below macOS's 104-byte cap."""
+    if os.name == "posix":
+        tmp_root = Path("/tmp")
+        if tmp_root.is_dir() and os.access(tmp_root, os.W_OK | os.X_OK):
+            try:
+                return tempfile.TemporaryDirectory(prefix=prefix, dir=str(tmp_root))
+            except OSError:
+                pass
+    return tempfile.TemporaryDirectory(prefix=prefix)
 
 
 class _DummyAsr(BaseAsrProvider):
@@ -469,15 +523,21 @@ def _create_wal_sqlite(db_path: Path, statements: list[tuple[str, tuple[Any, ...
         conn.close()
 
 
-def run_layer_a_matrix(clean_env: Mapping[str, str]) -> list[dict[str, Any]]:
+def run_layer_a_matrix(
+    clean_env: Mapping[str, str],
+    redact_fn: Callable[[Any], str] | None = None,
+) -> list[dict[str, Any]]:
     """Layer A: offline zero-cost routing matrix over real VoiceInputDaemon control.sock."""
     checks: list[dict[str, Any]] = []
     bin_avi = _REPO_ROOT / "bin" / "agent-voice-input"
+    redact = redact_fn if redact_fn is not None else (lambda s: redact_secrets(str(s), clean_env))
 
-    with tempfile.TemporaryDirectory(prefix="avi-regress-") as raw_td:
+    with _make_short_tempdir(prefix="avi-regress-") as raw_td:
         td = Path(os.path.realpath(raw_td))
         os.chmod(td, 0o700)
         iso_home = ensure_secure_dir(td / "home")
+        iso_config = ensure_secure_dir(td / "config")
+        iso_cache = ensure_secure_dir(td / "cache")
         rt_dir = ensure_secure_dir(td / "rt")
         no_proc = td / "no_proc"  # intentionally absent -> symmetric across Linux/WSL2 & macOS
 
@@ -492,12 +552,13 @@ def run_layer_a_matrix(clean_env: Mapping[str, str]) -> list[dict[str, Any]]:
         (repo_gamma / "worker_pool.py").write_text("class WorkerPool:\n    pass\n", encoding="utf-8")
         unrelated_dir.mkdir(parents=True, exist_ok=True)
 
-        iso_env = dict(clean_env)
-        iso_env["HOME"] = str(iso_home)
-        iso_env["AGENT_VOICE_INPUT_RUNTIME_DIR"] = str(rt_dir)
-        iso_env["PYTHONPATH"] = str(_SRC_ROOT)
-        for drop_k in ("TMUX", "TMUX_PANE", "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "AGENT_VOICE_INPUT_HOST_TAG"):
-            iso_env.pop(drop_k, None)
+        iso_env = _build_layer_a_env(
+            clean_env,
+            iso_home=iso_home,
+            iso_config=iso_config,
+            iso_cache=iso_cache,
+            rt_dir=rt_dir,
+        )
 
         # ---- Build CLI sessions (distinct 8-char prefixes for registry isolation) ----
         rich_pad = "RouterEngine SessionTracker incremental prefix cache chunk verification details. " * 28
@@ -740,33 +801,34 @@ def run_layer_a_matrix(clean_env: Mapping[str, str]) -> list[dict[str, Any]]:
                 timeout=15,
                 check=False,
             )
-            return proc.returncode, proc.stderr[:200]
+            return proc.returncode, redact(proc.stderr[:200])
 
         rc_cl_old, err_cl_old = _run_claude_hook(claude_old_sid, claude_old_path, repo_alpha)
         rc_cl_new, err_cl_new = _run_claude_hook(claude_new_gamma_sid, claude_new_gamma_path, repo_gamma)
 
         agy_helper_script = td / "agy"
         agy_helper_script.write_text(_AGY_HELPER_CODE, encoding="utf-8")
-        agy_proc = subprocess.Popen(
-            [sys.executable, str(agy_helper_script), str(agy_old_lock), str(agy_new_lock)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=iso_env,
-            start_new_session=True,
-        )
-
+        agy_proc: subprocess.Popen[str] | None = None
         daemon: VoiceInputDaemon | None = None
         srv_th: threading.Thread | None = None
         try:
+            agy_proc = subprocess.Popen(
+                [sys.executable, str(agy_helper_script), str(agy_old_lock), str(agy_new_lock)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=iso_env,
+                start_new_session=True,
+            )
             assert agy_proc.stdout is not None and agy_proc.stdin is not None
             ready_line = agy_proc.stdout.readline().strip()
             if ready_line != "READY":
-                stderr_tail = (agy_proc.stderr.read() if agy_proc.stderr else "")[:200]
+                stderr_tail = redact((agy_proc.stderr.read() if agy_proc.stderr else "")[:200])
                 raise RuntimeError(f"agy helper failed to start: ready={ready_line!r} err={stderr_tail!r}")
 
             def _run_agy_hook(cid: str, tp: Path, cwd: Path) -> tuple[int, str]:
+                assert agy_proc is not None and agy_proc.stdin is not None and agy_proc.stdout is not None
                 req = {
                     "op": "run_hook",
                     "argv": [sys.executable, str(bin_avi), "session-hook", "--cli", "agy", "--quiet"],
@@ -777,7 +839,7 @@ def run_layer_a_matrix(clean_env: Mapping[str, str]) -> list[dict[str, Any]]:
                 agy_proc.stdin.flush()
                 raw_resp = agy_proc.stdout.readline().strip()
                 parsed = json.loads(raw_resp) if raw_resp else {}
-                return int(parsed.get("rc", -1)), str(parsed.get("stderr") or "")
+                return int(parsed.get("rc", -1)), redact(str(parsed.get("stderr") or ""))
 
             rc_agy_old, err_agy_old = _run_agy_hook(agy_old_cid, agy_old_tp, repo_alpha)
             rc_agy_new, err_agy_new = _run_agy_hook(agy_new_alpha_cid, agy_new_tp, repo_alpha)
@@ -802,7 +864,7 @@ def run_layer_a_matrix(clean_env: Mapping[str, str]) -> list[dict[str, Any]]:
                         f"2.1.330 giant attachment ({len(giant_att_bytes)}B) prefiltered={prefilter_ok}"
                     )
                     if (hooks_ok and prefilter_ok)
-                    else (
+                    else redact(
                         f"hooks_ok={hooks_ok} prefilter_ok={prefilter_ok} "
                         f"rcs=({rc_cl_old},{rc_cl_new},{rc_agy_old},{rc_agy_new}) "
                         f"errs=({err_cl_old!r},{err_cl_new!r},{err_agy_old!r},{err_agy_new!r})"
@@ -811,27 +873,38 @@ def run_layer_a_matrix(clean_env: Mapping[str, str]) -> list[dict[str, Any]]:
             )
 
             # ---- Start real headless VoiceInputDaemon ----
-            cfg = Config(refiner=RefinerConfig(provider="off", cold_start_fallback="auto"))
-            tracker = SessionTracker(
-                home_dir=iso_home,
-                runtime_dir=rt_dir,
-                proc_root=no_proc,
-                env=iso_env,
-                tmux_probe_fn=lambda: TmuxServerSnapshot(),
-                cold_start_fallback="auto",
-            )
-            daemon = VoiceInputDaemon(
-                cfg,
-                env=iso_env,
-                runtime_dir=rt_dir,
-                platform=_HeadlessMatrixPlatform(),
-                asr_provider=_DummyAsr(),
-                refiner=_DummyRefiner(),
-                tracker=tracker,
-            )
-            srv_th = threading.Thread(target=daemon.serve_forever, name="avi-regress-daemon", daemon=True)
-            srv_th.start()
-            _wait_control_socket(rt_dir, timeout_sec=6.0)
+            try:
+                cfg = Config(refiner=RefinerConfig(provider="off", cold_start_fallback="auto"))
+                tracker = SessionTracker(
+                    home_dir=iso_home,
+                    runtime_dir=rt_dir,
+                    proc_root=no_proc,
+                    env=iso_env,
+                    tmux_probe_fn=lambda: TmuxServerSnapshot(),
+                    cold_start_fallback="auto",
+                )
+                daemon = VoiceInputDaemon(
+                    cfg,
+                    env=iso_env,
+                    runtime_dir=rt_dir,
+                    platform=_HeadlessMatrixPlatform(),
+                    asr_provider=_DummyAsr(),
+                    refiner=_DummyRefiner(),
+                    tracker=tracker,
+                )
+                srv_th = threading.Thread(target=daemon.serve_forever, name="avi-regress-daemon", daemon=True)
+                srv_th.start()
+                _wait_control_socket(rt_dir, timeout_sec=6.0)
+            except Exception as exc:
+                checks.append(
+                    _make_check(
+                        "A0_headless_daemon_startup",
+                        "A",
+                        "FAIL",
+                        f"headless daemon startup failed: {redact(exc)}",
+                    )
+                )
+                return checks
 
             def _probe(payload: dict[str, Any]) -> dict[str, Any]:
                 req = {"cmd": "probe_route", **payload}
@@ -1295,6 +1368,15 @@ def run_layer_a_matrix(clean_env: Mapping[str, str]) -> list[dict[str, Any]]:
                         ],
                     )
                 )
+        except Exception as exc:
+            checks.append(
+                _make_check(
+                    "A0_matrix_runtime_error",
+                    "A",
+                    "FAIL",
+                    f"layer A matrix failed: {redact(exc)}",
+                )
+            )
         finally:
             if daemon is not None:
                 try:
@@ -1303,24 +1385,25 @@ def run_layer_a_matrix(clean_env: Mapping[str, str]) -> list[dict[str, Any]]:
                     pass
             if srv_th is not None and srv_th.is_alive():
                 srv_th.join(timeout=4.0)
-            try:
-                if agy_proc.stdin is not None:
-                    agy_proc.stdin.write(json.dumps({"op": "quit"}) + "\n")
-                    agy_proc.stdin.flush()
-                    agy_proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                agy_proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                agy_proc.kill()
-                agy_proc.wait(timeout=2.0)
-            for pipe in (agy_proc.stdout, agy_proc.stderr):
-                if pipe is not None:
-                    try:
-                        pipe.close()
-                    except OSError:
-                        pass
+            if agy_proc is not None:
+                try:
+                    if agy_proc.stdin is not None:
+                        agy_proc.stdin.write(json.dumps({"op": "quit"}) + "\n")
+                        agy_proc.stdin.flush()
+                        agy_proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    agy_proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    agy_proc.kill()
+                    agy_proc.wait(timeout=2.0)
+                for pipe in (agy_proc.stdout, agy_proc.stderr):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except OSError:
+                            pass
 
     return checks
 
@@ -1353,8 +1436,13 @@ def _resolve_live_wav(
 
     if _e2e_mod is None:
         raise RuntimeError("e2e_system.py unavailable for OS TTS synthesis; pass --wav explicitly")
-    home = expand_user_path("~", env=clean_env)
-    cache_dir = ensure_secure_dir(home / ".cache" / "agent-voice-input" / "eval-wavs")
+    cache_home = (clean_env.get("XDG_CACHE_HOME") or "").strip()
+    base_cache = (
+        expand_user_path(cache_home, env=clean_env)
+        if cache_home
+        else (expand_user_path("~", env=clean_env) / ".cache")
+    )
+    cache_dir = ensure_secure_dir(base_cache / "agent-voice-input" / "eval-wavs")
     item = _e2e_mod._prepare_cached_tts_item(
         LIVE_PROBE_TTS_SPEC,
         cache_dir=cache_dir,
@@ -1518,6 +1606,26 @@ def run_layer_b_live_daemon(
     except Exception as exc:
         checks.append(_make_check("B2_probe_route_remote_veto", "B", "FAIL", redact_fn(exc)))
 
+    # Prepare WAV before optional delay_sec so TTS synthesis finishes before window switch.
+    check_name = "B3_deliver_live" if deliver_live else "B3_selftest_wav"
+    wav_info: tuple[Path, float, bool] | None = None
+    if not (skip_selftest_wav and not deliver_live):
+        try:
+            wav_info = _resolve_live_wav(wav_arg, cfg=cfg, clean_env=clean_env)
+        except Exception as exc:
+            checks.append(
+                _make_check(
+                    check_name,
+                    "B",
+                    "FAIL",
+                    f"WAV preparation failed: {redact_fn(exc)}",
+                )
+            )
+            return checks
+
+    if delay_sec > 0.0:
+        time.sleep(delay_sec)
+
     try:
         r_live = send_control_command(rt_dir, {"cmd": "probe_route", "use_live_window": True}, timeout_sec=5.0)
         checks.append(
@@ -1539,21 +1647,8 @@ def run_layer_b_live_daemon(
         checks.append(_make_check("B3_selftest_wav", "B", "SKIP", "skipped via --skip-selftest-wav"))
         return checks
 
-    try:
-        wav_path, dur_sec, used_tts = _resolve_live_wav(wav_arg, cfg=cfg, clean_env=clean_env)
-    except Exception as exc:
-        checks.append(
-            _make_check(
-                "B3_selftest_wav" if not deliver_live else "B3_deliver_live",
-                "B",
-                "FAIL",
-                f"WAV preparation failed: {redact_fn(exc)}",
-            )
-        )
-        return checks
-
-    if deliver_live and delay_sec > 0.0:
-        time.sleep(delay_sec)
+    assert wav_info is not None
+    wav_path, dur_sec, used_tts = wav_info
 
     tel_before = _count_telemetry_lines(rt_dir)
     req_st: dict[str, Any] = {
@@ -1565,7 +1660,6 @@ def run_layer_b_live_daemon(
         req_st["use_live_window"] = True
         req_st["deliver"] = True
 
-    check_name = "B3_deliver_live" if deliver_live else "B3_selftest_wav"
     try:
         res_st = send_control_command(rt_dir, req_st, timeout_sec=60.0)
     except Exception as exc:
@@ -1576,6 +1670,13 @@ def run_layer_b_live_daemon(
 
     summary = res_st.get("summary") if isinstance(res_st.get("summary"), Mapping) else {}
     routing = res_st.get("routing") if isinstance(res_st.get("routing"), Mapping) else {}
+    raw_final_chars = res_st.get("final_chars")
+    if raw_final_chars is None:
+        raw_final_chars = summary.get("final_chars")
+    if raw_final_chars is None and isinstance(res_st.get("final_text"), str):
+        raw_final_chars = len(res_st.get("final_text") or "")
+    final_chars = int(raw_final_chars or 0)
+
     b3_metrics: dict[str, Any] = {
         "duration_sec": dur_sec,
         "used_os_tts": used_tts,
@@ -1585,7 +1686,7 @@ def run_layer_b_live_daemon(
         "reasoning_tokens": summary.get("reasoning_tokens"),
         "cached_input_tokens": summary.get("cached_input_tokens"),
         "asr_chars": int(summary.get("asr_chars") or 0),
-        "final_chars": int(summary.get("final_chars") or 0),
+        "final_chars": final_chars,
         "telemetry_lines_delta": tel_delta,
         "routing": dict(routing),
     }
@@ -1605,20 +1706,34 @@ def run_layer_b_live_daemon(
     ok_res = bool(res_st.get("ok"))
     no_tel_ok = tel_delta == 0
     if deliver_live:
-        delivered_ok = bool(res_st.get("pasted") or res_st.get("clipboard"))
+        pasted_ok = bool(res_st.get("pasted"))
+        delivered_ok = pasted_ok and final_chars > 0
         passed = ok_res and no_tel_ok and delivered_ok
+        fail_prefix = ""
+        if ok_res and not pasted_ok and bool(res_st.get("clipboard")):
+            fail_prefix = (
+                f"clipboard-only fallback (not pasted; delivery_status={b3_metrics['delivery_status'] or '-'}, "
+                f"paste_reason={b3_metrics['paste_reason'] or '-'}); "
+            )
+        elif ok_res and not pasted_ok:
+            fail_prefix = (
+                f"not pasted (delivery_status={b3_metrics['delivery_status'] or '-'}, "
+                f"paste_reason={b3_metrics['paste_reason'] or '-'}); "
+            )
+        elif ok_res and final_chars <= 0:
+            fail_prefix = "empty final_chars=0; "
         detail = (
-            f"ok={ok_res} pasted={b3_metrics['pasted']} clipboard={b3_metrics['clipboard']} "
-            f"status={b3_metrics['delivery_status']} reason={b3_metrics['paste_reason']} "
-            f"asr_ms={b3_metrics['asr_ms']} refine_ms={b3_metrics['refine_ms']} "
+            f"{fail_prefix}ok={ok_res} pasted={b3_metrics['pasted']} clipboard={b3_metrics['clipboard']} "
+            f"delivery_status={b3_metrics['delivery_status']} paste_reason={b3_metrics['paste_reason']} "
+            f"final_chars={final_chars} asr_ms={b3_metrics['asr_ms']} refine_ms={b3_metrics['refine_ms']} "
             f"rsn_tok={b3_metrics['reasoning_tokens']} mode={routing.get('mode', '')} "
             f"key={routing.get('session_key_masked', '') or '-'} tel_delta={tel_delta}"
         )
     else:
-        passed = ok_res and no_tel_ok and int(summary.get("final_chars") or 0) > 0
+        passed = ok_res and no_tel_ok and final_chars > 0
         detail = (
             f"ok={ok_res} asr_ms={b3_metrics['asr_ms']} refine_ms={b3_metrics['refine_ms']} "
-            f"rsn_tok={b3_metrics['reasoning_tokens']} final_chars={b3_metrics['final_chars']} "
+            f"rsn_tok={b3_metrics['reasoning_tokens']} final_chars={final_chars} "
             f"mode={routing.get('mode', '')} key={routing.get('session_key_masked', '') or '-'} "
             f"tel_delta={tel_delta}"
         )
@@ -1665,77 +1780,143 @@ def _find_latest_files(root: Path, suffix: str, *, max_depth: int = 5, name_pref
     return found
 
 
+def _probe_real_cli_candidates(
+    check_id: str,
+    cli_name: str,
+    candidates: list[tuple[int, Path]],
+    *,
+    home: Path,
+    eff_wsl: bool,
+    redact_fn: Callable[[Any], str],
+    empty_msg: str,
+) -> dict[str, Any]:
+    """Evaluate up to 5 latest root session candidates; catch >=4KB 0-turn schema drift."""
+    if not candidates:
+        return _make_check(check_id, "C", "SKIP", empty_msg)
+
+    drift_hit: tuple[int, int] | None = None
+    max_small_size = 0
+    first_exc: Exception | None = None
+
+    for idx, (size, path) in enumerate(candidates[:_LAYER_C_MAX_CANDIDATES], start=1):
+        t0 = time.monotonic()
+        try:
+            turns, _, _ = _clean_jsonl_file(cli_name, str(path), home=home, wsl=eff_wsl)
+            parse_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+        except Exception as exc:
+            if first_exc is None:
+                first_exc = exc
+            continue
+        if len(turns) > 0:
+            chars = sum(len(txt) for _, txt in turns)
+            return _make_check(
+                check_id,
+                "C",
+                "PASS",
+                f"turns={len(turns)} chars={chars} file_kb={round(size / 1024.0, 1)} parse_ms={parse_ms}",
+                {
+                    "turns": len(turns),
+                    "chars": chars,
+                    "file_kb": round(size / 1024.0, 1),
+                    "parse_ms": parse_ms,
+                    "candidates_checked": idx,
+                },
+            )
+        if size >= _LAYER_C_SCHEMA_DRIFT_MIN_BYTES:
+            if drift_hit is None or size > drift_hit[0]:
+                drift_hit = (size, parse_ms)
+        else:
+            max_small_size = max(max_small_size, size)
+
+    checked = min(len(candidates), _LAYER_C_MAX_CANDIDATES)
+    if drift_hit is not None:
+        d_size, d_ms = drift_hit
+        file_kb = round(d_size / 1024.0, 1)
+        return _make_check(
+            check_id,
+            "C",
+            "FAIL",
+            f"possible upstream schema drift: file_kb={file_kb} ({d_size}B >= {_LAYER_C_SCHEMA_DRIFT_MIN_BYTES}B) parsed 0 turns (checked={checked})",
+            {
+                "turns": 0,
+                "chars": 0,
+                "file_kb": file_kb,
+                "size_bytes": d_size,
+                "parse_ms": d_ms,
+                "candidates_checked": checked,
+            },
+        )
+    if first_exc is not None:
+        return _make_check(check_id, "C", "FAIL", redact_fn(first_exc))
+    return _make_check(
+        check_id,
+        "C",
+        "SKIP",
+        f"all {checked} latest root session(s) are small empty sessions (<{_LAYER_C_SCHEMA_DRIFT_MIN_BYTES}B, 0 turns)",
+        {
+            "turns": 0,
+            "chars": 0,
+            "max_size_bytes": max_small_size,
+            "candidates_checked": checked,
+        },
+    )
+
+
 def run_layer_c_real_clis(raw_env: Mapping[str, str], redact_fn: Callable[[Any], str]) -> list[dict[str, Any]]:
     """Layer C: strictly read-only compatibility probe of local CLI transcripts & desktop DBs."""
     checks: list[dict[str, Any]] = []
     home = expand_user_path("~", env=raw_env)
     eff_wsl = _effective_is_wsl(env=raw_env)
 
-    # 1) Codex CLI latest root session
+    # 1) Codex CLI latest root sessions (scan top 5, prefer non-empty)
     codex_dir = home / ".codex" / "sessions"
-    codex_hit: tuple[int, Path] | None = None
+    codex_cands: list[tuple[int, Path]] = []
     if codex_dir.is_dir():
         for _, size, cand in _find_latest_files(codex_dir, ".jsonl", max_depth=5, name_prefix="rollout-"):
             is_cli, sid, _ = _read_codex_root_meta(cand, wsl=eff_wsl)
             if is_cli and sid:
-                codex_hit = (size, cand)
-                break
-    if codex_hit is None:
-        checks.append(_make_check("C1_real_codex_cli", "C", "SKIP", "no local Codex root session found"))
-    else:
-        size, path = codex_hit
-        t0 = time.monotonic()
-        try:
-            turns, _, _ = _clean_jsonl_file("codex", str(path), home=home, wsl=eff_wsl)
-            parse_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
-            chars = sum(len(txt) for _, txt in turns)
-            checks.append(
-                _make_check(
-                    "C1_real_codex_cli",
-                    "C",
-                    "PASS",
-                    f"turns={len(turns)} chars={chars} file_kb={round(size / 1024.0, 1)} parse_ms={parse_ms}",
-                    {"turns": len(turns), "chars": chars, "file_kb": round(size / 1024.0, 1), "parse_ms": parse_ms},
-                )
-            )
-        except Exception as exc:
-            checks.append(_make_check("C1_real_codex_cli", "C", "FAIL", redact_fn(exc)))
+                codex_cands.append((size, cand))
+                if len(codex_cands) >= _LAYER_C_MAX_CANDIDATES:
+                    break
+    checks.append(
+        _probe_real_cli_candidates(
+            "C1_real_codex_cli",
+            "codex",
+            codex_cands,
+            home=home,
+            eff_wsl=eff_wsl,
+            redact_fn=redact_fn,
+            empty_msg="no local Codex root session found",
+        )
+    )
 
-    # 2) Claude Code latest root session
+    # 2) Claude Code latest root sessions (scan top 5, prefer non-empty)
     claude_dir = home / ".claude" / "projects"
-    claude_hit: tuple[int, Path] | None = None
+    claude_cands: list[tuple[int, Path]] = []
     if claude_dir.is_dir():
         for _, size, cand in _find_latest_files(claude_dir, ".jsonl", max_depth=3):
             if cand.name.lower().startswith("agent-"):
                 continue
             is_root, sid, _ = _read_claude_root_meta(cand, wsl=eff_wsl)
             if is_root and sid:
-                claude_hit = (size, cand)
-                break
-    if claude_hit is None:
-        checks.append(_make_check("C2_real_claude_cli", "C", "SKIP", "no local Claude Code root session found"))
-    else:
-        size, path = claude_hit
-        t0 = time.monotonic()
-        try:
-            turns, _, _ = _clean_jsonl_file("claude", str(path), home=home, wsl=eff_wsl)
-            parse_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
-            chars = sum(len(txt) for _, txt in turns)
-            checks.append(
-                _make_check(
-                    "C2_real_claude_cli",
-                    "C",
-                    "PASS",
-                    f"turns={len(turns)} chars={chars} file_kb={round(size / 1024.0, 1)} parse_ms={parse_ms}",
-                    {"turns": len(turns), "chars": chars, "file_kb": round(size / 1024.0, 1), "parse_ms": parse_ms},
-                )
-            )
-        except Exception as exc:
-            checks.append(_make_check("C2_real_claude_cli", "C", "FAIL", redact_fn(exc)))
+                claude_cands.append((size, cand))
+                if len(claude_cands) >= _LAYER_C_MAX_CANDIDATES:
+                    break
+    checks.append(
+        _probe_real_cli_candidates(
+            "C2_real_claude_cli",
+            "claude",
+            claude_cands,
+            home=home,
+            eff_wsl=eff_wsl,
+            redact_fn=redact_fn,
+            empty_msg="no local Claude Code root session found",
+        )
+    )
 
-    # 3) AGY CLI latest root session
+    # 3) AGY CLI latest root sessions (scan top 5, prefer non-empty)
     agy_brain = home / ".gemini" / "antigravity-cli" / "brain"
-    agy_hit: tuple[int, Path] | None = None
+    agy_cands: list[tuple[int, Path]] = []
     if agy_brain.is_dir():
         cands: list[tuple[float, int, Path]] = []
         try:
@@ -1756,32 +1937,27 @@ def run_layer_c_real_clis(raw_env: Mapping[str, str], redact_fn: Callable[[Any],
         except OSError:
             pass
         cands.sort(key=lambda item: item[0], reverse=True)
-        if cands:
-            agy_hit = (cands[0][1], cands[0][2])
-    if agy_hit is None:
-        checks.append(_make_check("C3_real_agy_cli", "C", "SKIP", "no local AGY CLI root session found"))
-    else:
-        size, path = agy_hit
-        t0 = time.monotonic()
-        try:
-            turns, _, _ = _clean_jsonl_file("agy", str(path), home=home, wsl=eff_wsl)
-            parse_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
-            chars = sum(len(txt) for _, txt in turns)
-            checks.append(
-                _make_check(
-                    "C3_real_agy_cli",
-                    "C",
-                    "PASS",
-                    f"turns={len(turns)} chars={chars} file_kb={round(size / 1024.0, 1)} parse_ms={parse_ms}",
-                    {"turns": len(turns), "chars": chars, "file_kb": round(size / 1024.0, 1), "parse_ms": parse_ms},
-                )
-            )
-        except Exception as exc:
-            checks.append(_make_check("C3_real_agy_cli", "C", "FAIL", redact_fn(exc)))
+        agy_cands = [(size, tp) for _, size, tp in cands[:_LAYER_C_MAX_CANDIDATES]]
+    checks.append(
+        _probe_real_cli_candidates(
+            "C3_real_agy_cli",
+            "agy",
+            agy_cands,
+            home=home,
+            eff_wsl=eff_wsl,
+            redact_fn=redact_fn,
+            empty_msg="no local AGY CLI root session found",
+        )
+    )
 
-    # 4) Antigravity 2.0 conversation_summaries.db (mode=ro)
-    agy_db = home / ".gemini" / "antigravity" / "conversation_summaries.db"
-    if not os.path.lexists(agy_db):
+    # 4) Antigravity 2.0 conversation_summaries.db (mode=ro, reuse _iter_agy_ide_roots)
+    agy_db: Path | None = None
+    for root in _iter_agy_ide_roots(home):
+        cand_db = root / "conversation_summaries.db"
+        if os.path.lexists(cand_db):
+            agy_db = cand_db
+            break
+    if agy_db is None:
         checks.append(_make_check("C4_real_agy2_db", "C", "SKIP", "conversation_summaries.db not present"))
     else:
         t0 = time.monotonic()
@@ -1807,8 +1983,9 @@ def run_layer_c_real_clis(raw_env: Mapping[str, str], redact_fn: Callable[[Any],
                                 "C4_real_agy2_db",
                                 "C",
                                 "PASS",
-                                f"mode=ro ok rows={row_count} has_workspace_uris={'workspace_uris' in cols} query_ms={q_ms}",
+                                f"mode=ro ok root={agy_db.parent.name} rows={row_count} has_workspace_uris={'workspace_uris' in cols} query_ms={q_ms}",
                                 {
+                                    "db_root": agy_db.parent.name,
                                     "rows": row_count,
                                     "has_workspace_uris": "workspace_uris" in cols,
                                     "column_count": len(cols),
@@ -1819,11 +1996,10 @@ def run_layer_c_real_clis(raw_env: Mapping[str, str], redact_fn: Callable[[Any],
             except (sqlite3.Error, OSError) as exc:
                 checks.append(_make_check("C4_real_agy2_db", "C", "FAIL", redact_fn(exc)))
 
-    # 5) ChatGPT / Codex unified desktop codex.db (mode=ro)
+    # 5) ChatGPT / Codex unified desktop codex.db (mode=ro; fallback to state_5.sqlite when codex.db absent)
     codex_db = home / ".codex" / "sqlite" / "codex.db"
-    if not os.path.lexists(codex_db):
-        checks.append(_make_check("C5_real_codex_desktop_db", "C", "SKIP", "codex.db not present"))
-    else:
+    state_db = home / ".codex" / "state_5.sqlite"
+    if os.path.lexists(codex_db):
         t0 = time.monotonic()
         conn = _open_readonly_sqlite(codex_db, wsl=eff_wsl)
         if conn is None:
@@ -1860,8 +2036,9 @@ def run_layer_c_real_clis(raw_env: Mapping[str, str], redact_fn: Callable[[Any],
                                 "C5_real_codex_desktop_db",
                                 "C",
                                 "PASS",
-                                f"mode=ro ok rows={total_rows} local_repo_rows={local_rows} query_ms={q_ms}",
+                                f"mode=ro ok db=codex.db rows={total_rows} local_repo_rows={local_rows} query_ms={q_ms}",
                                 {
+                                    "db": "codex.db",
                                     "rows": total_rows,
                                     "local_repo_rows": local_rows,
                                     "column_count": len(cols),
@@ -1871,6 +2048,66 @@ def run_layer_c_real_clis(raw_env: Mapping[str, str], redact_fn: Callable[[Any],
                         )
             except (sqlite3.Error, OSError) as exc:
                 checks.append(_make_check("C5_real_codex_desktop_db", "C", "FAIL", redact_fn(exc)))
+    elif os.path.lexists(state_db):
+        t0 = time.monotonic()
+        conn = _open_readonly_sqlite(state_db, wsl=eff_wsl)
+        if conn is None:
+            checks.append(
+                _make_check("C5_real_codex_desktop_db", "C", "FAIL", "failed to open state_5.sqlite in mode=ro")
+            )
+        else:
+            try:
+                with contextlib.closing(conn):
+                    cols = _get_sqlite_table_cols(conn, "threads")
+                    has_title = "name" in cols or "title" in cols
+                    required = {"id", "cwd", "originator", "archived"}
+                    missing = sorted(required - cols)
+                    if not has_title:
+                        missing.insert(0, "name|title")
+                    if missing:
+                        checks.append(
+                            _make_check(
+                                "C5_real_codex_desktop_db",
+                                "C",
+                                "FAIL",
+                                f"state_5.sqlite missing required columns: {missing}",
+                            )
+                        )
+                    else:
+                        placeholders = ", ".join("?" for _ in _CODEX_DESKTOP_ORIGINATORS)
+                        with contextlib.closing(
+                            conn.execute(
+                                f"SELECT COUNT(*), "
+                                f"SUM(CASE WHEN COALESCE(archived, 0) = 0 "
+                                f"AND originator IN ({placeholders}) "
+                                f"AND COALESCE(cwd, '') != '' THEN 1 ELSE 0 END) "
+                                f"FROM threads",
+                                _CODEX_DESKTOP_ORIGINATORS,
+                            )
+                        ) as cur:
+                            r = cur.fetchone() or (0, 0)
+                            total_rows = int(r[0] or 0)
+                            desktop_rows = int(r[1] or 0)
+                        q_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
+                        checks.append(
+                            _make_check(
+                                "C5_real_codex_desktop_db",
+                                "C",
+                                "PASS",
+                                f"mode=ro ok db=state_5.sqlite rows={total_rows} local_repo_rows={desktop_rows} query_ms={q_ms}",
+                                {
+                                    "db": "state_5.sqlite",
+                                    "rows": total_rows,
+                                    "local_repo_rows": desktop_rows,
+                                    "column_count": len(cols),
+                                    "query_ms": q_ms,
+                                },
+                            )
+                        )
+            except (sqlite3.Error, OSError) as exc:
+                checks.append(_make_check("C5_real_codex_desktop_db", "C", "FAIL", redact_fn(exc)))
+    else:
+        checks.append(_make_check("C5_real_codex_desktop_db", "C", "SKIP", "codex.db and state_5.sqlite not present"))
 
     return checks
 
@@ -1922,31 +2159,59 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit structured machine-readable JSON")
     args = ap.parse_args(argv)
 
-    cfg, raw_env = load_config(config_path=args.config or None)
+    if args.skip_selftest_wav and args.deliver_live:
+        ap.error("--skip-selftest-wav and --deliver-live are mutually exclusive")
+    if not args.live_daemon:
+        layer_b_only: list[str] = []
+        if args.deliver_live:
+            layer_b_only.append("--deliver-live")
+        if args.skip_selftest_wav:
+            layer_b_only.append("--skip-selftest-wav")
+        if args.allow_drift:
+            layer_b_only.append("--allow-drift")
+        if args.wav:
+            layer_b_only.append("--wav")
+        if args.show_text:
+            layer_b_only.append("--show-text")
+        if layer_b_only:
+            ap.error(f"{', '.join(layer_b_only)} require --live-daemon")
+
+    raw_env: Mapping[str, str] = dict(os.environ)
     clean_env = _strip_fast_env(raw_env)
-    creds = resolve_credentials(cfg, clean_env)
-    real_secrets = [s for s in creds.all_secret_values() if s and len(s) >= 4]
-    redact_fn = lambda s: redact_secrets(str(s), clean_env, cfg=cfg, extra_secrets=real_secrets)
+    redact_fn: Callable[[Any], str] = lambda s: redact_secrets(str(s), clean_env)
 
     checks: list[dict[str, Any]] = []
     if not args.no_matrix:
-        checks.extend(run_layer_a_matrix(clean_env))
+        checks.extend(run_layer_a_matrix(clean_env, redact_fn=redact_fn))
     if args.live_daemon:
-        checks.extend(
-            run_layer_b_live_daemon(
-                cfg,
-                raw_env,
-                clean_env,
-                redact_fn,
-                runtime_dir_arg=args.runtime_dir,
-                wav_arg=args.wav,
-                allow_drift=bool(args.allow_drift),
-                skip_selftest_wav=bool(args.skip_selftest_wav),
-                deliver_live=bool(args.deliver_live),
-                delay_sec=max(0.0, float(args.delay_sec)),
-                show_text=bool(args.show_text),
+        cfg: Config | None = None
+        try:
+            cfg, loaded_env = load_config(config_path=args.config or None)
+            raw_env = loaded_env
+            clean_env = _strip_fast_env(raw_env)
+            creds = resolve_credentials(cfg, clean_env)
+            real_secrets = [s for s in creds.all_secret_values() if s and len(s) >= 4]
+            redact_fn = lambda s: redact_secrets(str(s), clean_env, cfg=cfg, extra_secrets=real_secrets)
+        except Exception as exc:
+            checks.append(
+                _make_check("B0_config_load", "B", "FAIL", f"config load failed: {redact_fn(exc)}")
             )
-        )
+        if cfg is not None:
+            checks.extend(
+                run_layer_b_live_daemon(
+                    cfg,
+                    raw_env,
+                    clean_env,
+                    redact_fn,
+                    runtime_dir_arg=args.runtime_dir,
+                    wav_arg=args.wav,
+                    allow_drift=bool(args.allow_drift),
+                    skip_selftest_wav=bool(args.skip_selftest_wav),
+                    deliver_live=bool(args.deliver_live),
+                    delay_sec=max(0.0, float(args.delay_sec)),
+                    show_text=bool(args.show_text),
+                )
+            )
     if args.probe_real_clis:
         checks.extend(run_layer_c_real_clis(raw_env, redact_fn))
 
@@ -1961,7 +2226,7 @@ def main(argv: list[str] | None = None) -> int:
         else ("wsl2" if _effective_is_wsl(env=raw_env) else sys.platform)
     )
     report: dict[str, Any] = {
-        "ok": counts["FAIL"] == 0,
+        "ok": bool(checks) and counts["FAIL"] == 0,
         "version": __version__,
         "platform": plat_label,
         "elapsed_ms": max(0, int(round((time.monotonic() - t0) * 1000))),

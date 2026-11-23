@@ -10,8 +10,8 @@
 | :--- | :--- | :--- | :--- |
 | **本地终端 CLI Agent**<br>（WSL2 Windows Terminal、macOS Ghostty / Terminal.app / iTerm2 等） | **Windows/WSL2**：`win_shim.ps1` 读取活动窗口进程与标题；<br>**macOS**：Ghostty 读分屏 `tty`/`cwd`/`pid`，Terminal.app 读选中标签页 `tty`，iTerm2 零弹窗预检后读 `tty` 或回退窗口子进程 PTY 树 | **第一档**：标题 `[#id8]` / `[§...]` / Codex UUID 优先查本地 `sessions/` 注册表或前缀直连；<br>**第二档**：有焦点 `tty`/`cwd` 或带路径/项目名的标题时按焦点与目录收敛（精确目录优先于非宽泛父子目录；标题与所有候选的路径、末级目录名、CLI 名及线程名均不匹配时返回空，无焦点 `tty` 下同名末级目录仍会通过目录名保留）；无焦点 `tty`/`cwd` 且标题为通用终端名（`Ubuntu`/`bash`）或仅含同类 CLI 名/动画符时，按 `max(pts_mtime, jsonl_mtime)` 选最近活跃会话 | **免配置开箱可用**；WSL2 多窗口跨项目（含同名子目录）并发时推荐挂 `session-hook` |
 | **本地 `tmux` 多分屏**<br>（WSL2 / macOS） | 自动查询当前 attached 客户端的活跃窗格（`pane_id`、`pane_pid`、`pane_tty`、`pane_current_path`、`pane_title`） | 优先匹配焦点窗格 `#{pane_title}` 指纹或注册表 `tmux_pane`；未挂钩子时将进程扫描严格限制在该焦点窗格后代进程树内，硬隔离相邻分屏与空 shell 分屏 | **零配置**（无需改 `~/.tmux.conf`） |
-| **桌面代码编辑器 / IDE**<br>（VS Code、Cursor、Windsurf、Antigravity IDE、Zed、JetBrains、Xcode、Sublime） | 硬跳过终端 `sync_session`；通过 macOS `AXDocument`（`file://`）或窗口标题项目名/显式路径非递归定位本地目录（Git 仓或非 Git 普通目录） | 注入当前工作区 `git status` 或浅层文件名作热词与拼写参考；**桌面版 Antigravity IDE** 额外通过三层路径证据关联该工作区最新活跃的 `brain/<cid>` 主会话 | **零配置** |
-| **日常桌面 GUI 应用**<br>（浏览器、微信/飞书/Slack 等 IM、桌面 AI 聊天、邮件、文档） | 识别为 `general_gui` 应用；硬跳过一切终端会话与代码工作区扫描 | 不绑定任何代码 Session，自动切入 `general` 通用润色画像（AI 聊天与 IM 窗口附加轻量 `<target_app_hint>` 适配句式，不影响缓存） | **零配置** |
+| **桌面代码编辑器 / IDE**<br>（VS Code、Cursor、Windsurf、Antigravity IDE、Zed、JetBrains、Xcode、Sublime） | 硬跳过终端 `sync_session`；通过 macOS `AXDocument`（`file://`）或窗口标题项目名/显式路径非递归定位本地目录（Git 仓或非 Git 普通目录） | 注入当前工作区 `git status` 或浅层文件名作热词与拼写参考；**Antigravity 2.0 独立桌面版**优先只读 `conversation_summaries.db` 按窗口标题精确/截断前缀直连 `brain/<cid>` 主会话并经结构化 URI 解析绑定本地工作区（老版 VS Code Fork 回退三层路径证据扫描） | **零配置** |
+| **日常桌面 GUI 应用**<br>（浏览器、微信/飞书/Slack 等 IM、桌面 AI 聊天、邮件、文档） | 识别为 `general_gui` 应用；默认硬跳过终端会话与代码工作区扫描 | 默认不绑定代码 Session，切入 `general` 通用润色画像（AI 聊天与 IM 窗口附加轻量 `<target_app_hint>` 适配句式，不影响缓存）；**ChatGPT / Codex 统一桌面端**例外——只读 `~/.codex/sqlite/codex.db`（缺失时回退 `state_5.sqlite`）验证本地仓任务后动态升格 `agent` 模式，普通云端聊天保持 `general + ai_chat` 零串台 | **零配置** |
 | **远程桌面 / 虚拟机客户端**<br>（`mstsc`、`Windows App`、Parsec、RustDesk、VMware 等） | `hotkey.yield_remote_desktop = true` 在触发入口直接识别前台远程桌面进程（豁免 Win11 WSLg `msrdc.exe`） | 本地静默让行新热键触发，把按键原样留给远端桌面处理 | **零配置** |
 | **SSH 远端 Linux 主机**<br>（Windows `ssh.exe`、PuTTY / MobaXterm / WindTerm、WSL2 / macOS `ssh`、远端 `tmux`、Remote-SSH IDE） | **Phase 0 远程否决闸门**识别 SSH 客户端进程、标题 `[@host]` / `user@host:cwd` / `[SSH: host]` 或本地 TTY 前台 `ssh` 进程，第一时间阻断本地后台会话串台 | 未配白名单时干净直出、零本地泄漏；配 `[remote] hosts` 后按下热键后台通过 `ssh -- <target> python3 -` 只读预取远端会话（ETag 短路 + 正向 `50K` 整块对齐裁剪） | **防串台零配置**；拉取远端上下文需在本地配一行 `[remote] hosts = [...]`（远端零安装） |
 
@@ -57,18 +57,29 @@
 
 默认 `hotkey.scope = "all"` 下，守护进程按前台窗口的进程名与 macOS `bundle_id` 将桌面窗口划分为 `terminal`、`coding_gui`、`general_gui` 三类，从源头隔离不同语境：
 
-### 2.1 日常桌面窗口：通用画像与硬隔离（`general_gui`）
+### 2.1 日常桌面窗口：通用画像、硬隔离与 ChatGPT/Codex 桌面端本地仓动态升格（`general_gui`）
 
-- 当焦点位于浏览器、文档、邮件、即时通讯（微信、飞书、钉钉、Slack、Discord、Telegram、QQ 等）或桌面 AI 客户端（ChatGPT、Claude Desktop、Perplexity、Cherry Studio、Chatbox 等）时，管线自动切入 `general` 通用润色模式，并**硬跳过终端 `sync_session`**。即便后台终端正挂着 200K 上下文的 Coding Agent，也绝不会把代码变量名或仓库术语塞进日常聊天。
+- 当焦点位于浏览器、文档、邮件、即时通讯（微信、飞书、钉钉、Slack、Discord、Telegram、QQ 等）或桌面 AI 客户端（独立旧版 ChatGPT `com.openai.chat`、Claude Desktop、Perplexity、Cherry Studio、Chatbox 等）时，管线自动切入 `general` 通用润色模式，并**硬跳过终端 `sync_session`**。即便后台终端正挂着 200K 上下文的 Coding Agent，也绝不会把代码变量名或仓库术语塞进日常聊天。
 - 对桌面 AI 聊天（`ai_chat`）与即时通讯（`im_chat`）窗口，精修请求仅在最末块 `<asr_draft_to_clean>` 前附加一行轻量 `<target_app_hint>` 微调自然语气与分段（带线性时间回显剥离），完全不触碰前部缓存前缀。
+- **ChatGPT / Codex 统一桌面端本地仓动态升格、云端隔离与同窗复核**：
+  - 仅在明确识别为统一桌面端窗口（排除终端进程后，macOS 匹配 `com.openai.codex`，无 `bundle_id` 时匹配进程 `ChatGPT` 或带桌面标题后缀的 `Codex`）且未显式强制 `mode = "general"` 时触发。
+  - **只读索引与 fail-closed 约束**：优先以 `mode=ro`（WAL 安全、拒绝软链与 WSL2 `/mnt/` 慢盘）只读 `~/.codex/sqlite/codex.db` 的 `local_thread_catalog` 表（若 `codex.db` 存在但损坏、被锁或缺少必要列则直接 fail-closed 返回空，绝不静默降级以防绕过云端否决）；仅当 `codex.db` 不存在时，回退只读 `~/.codex/state_5.sqlite` 的 `threads` 表（限定 `archived = 0` 且 `originator IN ('Codex Desktop', 'codex_work_desktop')`）。
+  - **标题匹配与云端硬隔离**：同时用原始窗口标题与剥离 `- ChatGPT` / `- Codex` 后的标题匹配 `display_title`（屏蔽 `ChatGPT`/`Codex`/`New Chat` 等泛化标题，支持精确匹配与尾部 `...`/`…` 截断前缀匹配）。**全局否决优先**：只要命中池中存在任意云端/非本地条目（`source_kind == 'chatgpt'`、`host_id != 'local'` 或空 `cwd`），立即整体否决不升格；若命中多个不同本地仓库目录，同样拒绝不猜。
+  - **本地仓升格与 rollout 核验**：仅当所有命中候选收敛至唯一合法本地工作区目录（避开宽泛系统/家目录），且对应线程在 `~/.codex/sessions/` 下具备真实非软链、同 UID、首行 `session_meta` 的 `id` 一致且非 subagent 的 `rollout-*.jsonl`（同时尊重 `state_5.sqlite` 的 `archived = 1` 否决）时，才动态升格为 `mode = "agent"`（`matched_by = "codex_desktop_db"`、`hotwords_scope = "coding"`、清空 `target_app_hint`），挂载本地仓库热词与增量前缀缓存；普通云端聊天则稳定保持 `general + ai_chat` 零串台。
+  - **投递前同窗切会话复核**：对 `codex_desktop_db` 升格的投递附加 `same_window_verifier`，在最终粘贴前核验同一窗口的当前标题——若标题发生变化则重新经 `resolve_codex_desktop_session_by_title` 复核是否仍为原 `session_id`，一旦检测到用户在录音或处理期间于同窗口内切到其他会话或云端聊天，立即中止粘贴并退回剪贴板（`focus_changed`）。
 
-### 2.2 桌面 IDE：工作区感知与 Antigravity IDE 会话联动（`coding_gui`）
+### 2.2 桌面 IDE：工作区感知与 Antigravity 桌面版会话联动（`coding_gui`）
 
 - **隔离后台终端 + 非递归定位工作区**：在 VS Code、Cursor、Windsurf、Zed、JetBrains 全家桶、Xcode、Sublime Text 等编辑器中口述时，同样跳过终端 CLI 会话扫描（防止后台终端跑 A 仓库时污染前台 IDE 打开的 B 仓库），改由 `resolve_ide_workspace_cwd` 定位当前窗口的本地目录：
   1. macOS 优先读取窗口 `AXDocument`（`file://` URL），向上有界回溯匹配窗口标题项目名或 `.git` 根；
   2. 解析窗口标题中的显式路径（如 JetBrains `[~/repos/app]`、Sublime 路径），或提取标题项目名与已知活跃工作目录及 `~/repos`、`~/projects`、`~/code`、`~/Developer`、`~/Documents` 等常见一级目录按 `(st_dev, st_ino)` 去重比对（同名目录冲突时唯一含 `.git` 的目录优先，仍冲突则放弃不猜；WSL2 下逐段校验路径，零 `lstat` 避开 `/mnt/` 慢盘与远程 URI）。
 - 定位到本地目录（兼容 Git 仓库与非 Git 文件夹）后，自动注入该目录的 `git status`、核心追踪文件名或浅层文件名供识别与精修纠偏。
-- **桌面版 Antigravity IDE 专属绑定**：当焦点位于桌面版 Antigravity IDE 且已确认本地工作区时，额外在 `~/.gemini/antigravity/brain`（及 `antigravity-ide/brain`，与命令行 `antigravity-cli/brain` 物理隔离）中扫描 6 小时内最新最多 `64` 条会话记录（评估前 `16` 个非 subagent 主会话），依次核验三层路径证据：
+- **Antigravity 2.0 独立桌面版专属绑定（优先路径，`matched_by = "ide_db_title"`）**：
+  - 严格与命令行 `~/.gemini/antigravity-cli` 物理隔离，仅扫描 `~/.gemini/antigravity` 与 `~/.gemini/antigravity-ide`。以 `mode=ro`（WAL 安全、拒软链）只读 `conversation_summaries.db` 的 `conversation_summaries` 表，过滤 CLI 来源（`source != 'CORTEX_TRAJECTORY_SOURCE_CLI'`）、子会话（`parent_conversation_id = ''`、`nesting_depth = 0`）与内部精修会话（`agent_name != 'avi-refiner'`）。
+  - 屏蔽 `New Chat`、`New Conversation`、`Agent Manager`、`Welcome` 等空窗/泛化标题（无 `AXDocument` 时同时跳过旧路径兜底防跨仓误抓）；其余标题先执行精确匹配，未命中再执行尾部 `...` / `…` 截断前缀匹配（中文前缀 `>= 4` 字符、英文 `>= 8` 字符），多候选并列时按 `annotations/<cid>.pbtxt` 修改时间 → DB `last_modified_time` → `transcript` `mtime` 择优。
+  - **结构化 URI 解析与工作区绑定**：对 DB 返回的 `workspace_uris` JSON 经结构化 URL 解析（`_decode_structured_workspace_uri`，仅接受本地 `file://` 及 WSL 下 `vscode-remote://wsl+...`，保留路径合法末尾标点，拒绝远端 URI 与 WSL `/mnt/` 慢盘）解析本地工作区目录，并核验 `brain/<cid>` 非 subagent 主日志后绑定工作区热词与增量缓存；冷启动历史扫描同样优先复用 DB 精确同目录记录，并对 DB 中已明确绑定到其他仓库或远端 URI 的会话施加权威否决。
+  - **同窗复核防错贴**：配合起点窗口锁定与投递前同窗会话复核，在录音/处理期间若于同窗口切到其他对话或切离窗口，中止直接粘贴并安全退回剪贴板，避免跨会话错贴。
+- **老版 Antigravity VS Code Fork 回退路径（`matched_by = "ide_brain"`）**：当独立桌面版 DB 未命中且窗口携带有效工作区线索（如 `AXDocument` 或含工作区名的编辑器标题）时，回退扫描 `~/.gemini/antigravity/brain`（及 `antigravity-ide/brain`）6 小时内最新最多 `64` 条记录（评估前 `16` 个非 subagent 主会话），依次核验三层路径证据：
   1. `subagents/*.json` `workspaceUris` 或系统记录的 `cwd`；
   2. 最近一条 `<ADDITIONAL_METADATA>` 中的工作区路径多数派；
   3. 模型 `tool_calls` 参数路径（须至少命中 `2` 条当前工作区内路径且占非噪声路径比例 `>= 60%`）。
