@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前已发布基线**：`v0.12.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
+> **当前已发布基线**：`v0.13.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
 >
 > **工程规范与上下文路由架构**：[AGENTS.md](AGENTS.md) · [docs/context-routing.md](docs/context-routing.md)
 
@@ -50,7 +50,23 @@
 
 ---
 
-### 最新发版里程碑（`已发布 · v0.12.0`）
+### 最新发版里程碑（`已发布 · v0.13.0`）
+
+以下默认模型升级、首屏开箱体验优化、并发与防串台深度加固及跨组件离线 E2E 能力已在 `v0.13.0` 完成落地并正式发布：
+
+1. **主流默认模型升级与渠道连接池统一**：
+   - OpenAI 默认升级为 `gpt-transcribe`（ASR）与 `gpt-6-luna`（Refiner），Gemini 公开 API 默认升级为 `gemini-3.7-flash`（AGY 订阅精修保持 `gemini-3.8-flash`），并将常驻 `agy acp` worker 空闲回收 TTL 由 `3` 分钟延至 `15` 分钟；
+   - Codex / OpenAI Responses 代理连接池统一复用 `http_transport.py`（新增 `NO_PROXY` 的 `*.domain` 通配与不支持 scheme 的可读修复引导），并阻断单跳音频 `content_filter`/`safety` 截断及为 `gemini-flash-latest` 显式设置 `thinkingLevel="low"`。
+2. **双端 HUD 视觉、内置热词与公开用户开箱闭环**：
+   - 精修双端连发 HUD 玻璃态 `+1`/`+2` 队列小胶囊，扩充 76 词程序员 / Agent / 模型默认内置热词；
+   - 完成双语 README 首屏改版与无作者服务器/零中转隐私声明，补齐 `SECURITY.md` 与 `.github/ISSUE_TEMPLATE/`，并修复热键名白名单校验、WSL 冷编译超时与 WSLg 无麦体检、全注释 `config.example.env`、`doctor` AGY hook 检测与 `start` 缺 Key/`ffmpeg` 提示。
+3. **跨窗口防串台、并发竞态与 3 套离线跨组件 E2E 门禁**：
+   - 补齐 Ghostty 同 surface 切换 `tmux` pane 防串台（0ms 并发起点采样 + 空窗口安全降级）、Windows Terminal 带标记标签页切普通 shell 拦截与双端 13 组标题标记对齐；
+   - 加固 WSL `rec_gen` discard-stop 与原生 `StopRecording` 错代保护、macOS PTT 崩溃 EOF 先停麦不泄线程、取消录音撞 `stop`/`restart` 恰好暂存一次及 SSH 远端预取/缓存单调代号防倒退，并新增 3 套离线跨组件 E2E 场景测试。
+
+---
+
+### 已归档里程碑（`已发布 · v0.12.0`）
 
 以下本地 `agy` 订阅精修、代理连接池复用、录音投递可靠性与全平台 CI 加固能力已在 `v0.12.0` 完成落地并正式发布：
 
@@ -130,7 +146,7 @@
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
 
-`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.12.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
+`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.13.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
 
 1. **外部用户零门槛开箱**：仅配置任意单一支持语音转写的主流渠道 API Key（可自动搭配本地 CLI 登录态或独立二阶段凭据），即可通过 `init` 与 `doctor --ping` 完成体检并稳定投入日常使用。
 2. **全场景安全投递与零串台**：本地终端、跨机 SSH 远端 Linux、主流桌面 IDE、普通桌面 GUI 应用与远程桌面自动让行均长期稳定运行；跨场景上下文严格隔离，系统剪贴板零意外污染，全链路严守不自动发送回车。

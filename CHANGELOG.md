@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-23
+
+### Added
+- **Cross-platform glassmorphic queue badge & HUD visual polish**: Refined the pipelined recording HUD across Windows (`win_shim.ps1`) and macOS (`mac_shim.swift`) with a unified glassmorphic `+1`/`+2` in-flight queue badge and consistent visual styling.
+- **76 curated built-in technical hotwords**: Expanded the low-priority built-in vocabulary with 76 high-value developer, CLI agent, and model terms to improve out-of-the-box Stage 1 recognition accuracy.
+- **User-first bilingual README & community documentation**: Redesigned the top-of-page onboarding experience in `README.md` / `README.zh-CN.md` with clear zero-relay / no-author-server privacy guarantees, and added `SECURITY.md` plus `.github/ISSUE_TEMPLATE/` templates.
+- **Three offline cross-component E2E test suites**: Added end-to-end offline tests covering real CLI subprocess lifecycle management (`start`/`status`/`stop`/`restart`), real `ffmpeg` + `SessionTracker` + hotwords + two-stage loopback HTTP + `retry` recovery, and `VoiceInputDaemon` with real `sshd ControlMaster` context prefetching.
+
+### Changed
+- **Upgraded OpenAI & Gemini public API default models**: Upgraded OpenAI defaults to `gpt-transcribe` (Stage 1 ASR) and `gpt-6-luna` (Stage 2 Refiner), and upgraded the Gemini public API default to `gemini-3.7-flash` (while keeping AGY subscription refinement on `gemini-3.8-flash`).
+- **Extended `agy` resident worker idle TTL**: Increased the idle reap timeout of the resident `agy acp` Stage 2 worker from `3` minutes to `15` minutes to preserve warm sessions across regular dictation pauses.
+- **Unified refiner proxy engine**: Migrated Codex and OpenAI Responses connection pooling onto the shared `http_transport.py` proxy parser, adding `*.domain` wildcard support in `NO_PROXY` and actionable guidance when an unsupported proxy URL scheme is configured.
+
+### Fixed
+- **Cross-window & tmux focus isolation**: Prevented Ghostty same-surface `tmux` pane switching from cross-talking or injecting wrong session context (with `0ms` mic-start concurrent origin sampling and empty-window safe fallback), blocked context leakage when switching from tagged Windows Terminal tabs to plain shells, and aligned 13 title-marker pairs across macOS and Windows.
+- **Recording, cancellation & SSH prefetch concurrency safety**: Sent a `rec_gen`-guarded discard-stop on WSL `rec_start` timeouts with stale-generation guards in native `StopRecording`; ensured macOS PTT crash EOF stops the microphone before refreshing the HUD without leaking event threads; guaranteed exactly-once `failed/` stashing when cancellation races with `stop`/`restart`; and enforced monotonic generations on SSH remote prefetch callbacks and shared-directory file caches to prevent stale rollbacks.
+- **Hotkey validation & cross-platform first-run diagnostics**: Added whitelist normalization for hotkey names and eliminated the WSL2 invalid-hotkey false-ready silent failure; relaxed WSL C# cold-compile/startup timeouts (`15s` / `18s`), surfaced `ps_error`, and fixed WSLg microphone-less false-green checks; distinguished `accessibility_denied` vs. `send_input_failed` clipboard-fallback HUD hints; and fixed `doctor` AGY `~/.gemini/hooks.json` & `voice-title.sh` checks, fully commented `config.example.env` (preventing placeholder `401` errors), `remote.hosts.timeout_ms` parsing whitelist, missing `doubao` API key hints, single-hop `content_filter`/`safety` truncation blocking, `thinkingLevel="low"` for `gemini-flash-latest`, and `start` missing-key/`ffmpeg` warnings with hotkey tips.
+
 ## [0.12.0] - 2026-11-23
 
 ### Added
@@ -151,7 +169,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Initial WSL2 release**: Two-stage context-aware voice input daemon and CLI for coding agents (**Codex**, **Claude Code**, **AGY**) on Windows + WSL2, featuring native `win_shim.ps1` WASAPI capture, global hotkey & HUD bridge, active terminal session discovery, `ffmpeg` loudness normalization with local silence gating, and safe paste without auto-pressing `Enter`.
 
-[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.9.1...v0.10.0
