@@ -852,6 +852,140 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
         self.assertEqual(out_wt_hold_switch.reason, "focus_changed")
         self.assertEqual(len(sent_rpcs), 2)
 
+    def test_wsl_deliver_text_flush_barrier_and_tap_toggle_hold_timeout(self) -> None:
+        """P1-C7 + P2-bridge-misc (b): WSL consumes _flush_shim_events (including waited_for_key=False) and caps tap_toggle timeout."""
+        from agent_voice_input.http_transport import CancelToken
+
+        # 1. _effective_paste_hold_timeout_sec aligns with macOS: tap_toggle capped at max(5.0, hold_cancel+2.0)
+        cfg_tap = Config()
+        cfg_tap.hotkey.trigger_mode = "tap_toggle"
+        cfg_tap.audio.max_duration_sec = 600
+        plat_tap = WslPlatform(cfg_tap, env={})
+        self.assertEqual(plat_tap._effective_paste_hold_timeout_sec(), 5.0)
+        plat_tap._paste_hold_timeout_sec = 0.25
+        self.assertEqual(plat_tap._effective_paste_hold_timeout_sec(), 0.25)
+
+        cfg_tap_long = Config()
+        cfg_tap_long.hotkey.trigger_mode = "tap_toggle"
+        cfg_tap_long.hotkey.hold_cancel_ms = 4000
+        self.assertEqual(WslPlatform(cfg_tap_long, env={})._effective_paste_hold_timeout_sec(), 6.0)
+
+        cfg_ptt = Config()
+        cfg_ptt.hotkey.trigger_mode = "ptt"
+        cfg_ptt.audio.max_duration_sec = 600
+        self.assertEqual(WslPlatform(cfg_ptt, env={})._effective_paste_hold_timeout_sec(), 602.0)
+
+        class _AliveShim:
+            def poll(self) -> None:
+                return None
+
+        # 2. Barrier timeout (waited_for_key=False, _flush_shim_events -> False) MUST NOT commit normal paste; degrades to clipboard
+        plat_to = WslPlatform(cfg_tap, env={})
+        plat_to._shim = _AliveShim()  # type: ignore[assignment]
+        plat_to._paste_hold_timeout_sec = 0.05
+        rpcs_to: list[dict[str, object]] = []
+        flush_calls_to = [0]
+
+        def _fake_flush_false(timeout_sec: float = 0.05) -> bool:
+            del timeout_sec
+            flush_calls_to[0] += 1
+            return False
+
+        def _fake_rpc_to(payload: dict[str, object], timeout_sec: float = 5.0) -> dict[str, object]:
+            del timeout_sec
+            rpcs_to.append(dict(payload))
+            if payload.get("cmd") == "key_state":
+                return {"ok": True, "hotkey_held": False}
+            if payload.get("force_clipboard_only"):
+                return {"ok": True, "pasted": False, "clipboard": True, "reason": "focus_changed", "fg_process": "Code.exe"}
+            return {"ok": True, "pasted": True, "clipboard": True, "reason": "ok", "fg_process": "Code.exe"}
+
+        plat_to._flush_shim_events = _fake_flush_false  # type: ignore[method-assign]
+        plat_to._dispatch_paste_rpc = _fake_rpc_to  # type: ignore[method-assign]
+        tok_to = CancelToken()
+        out_to = plat_to.deliver_text(
+            "屏障超时不提交粘贴",
+            seq_id=101,
+            origin_window=ForegroundWindow(401, "Code.exe", "main.py - VS Code"),
+            fallback_clipboard_text="安全兜底文本",
+            is_cancelled=tok_to.is_cancelled,
+            before_commit=tok_to.try_commit,
+        )
+        self.assertGreaterEqual(flush_calls_to[0], 1, "must invoke _flush_shim_events even when waited_for_key=False")
+        self.assertFalse(out_to.pasted)
+        self.assertTrue(out_to.clipboard)
+        self.assertEqual(out_to.reason, "focus_changed")
+        paste_rpcs_to = [r for r in rpcs_to if r.get("cmd") == "paste"]
+        self.assertEqual(len(paste_rpcs_to), 1)
+        self.assertIs(paste_rpcs_to[0].get("force_clipboard_only"), True)
+        self.assertEqual(paste_rpcs_to[0].get("fallback_text"), "安全兜底文本")
+
+        # 3. Real _event_worker blocked past 50ms slice with hold_cancel behind it (both waited_for_key=False and True):
+        #    deliver_text retries flush until hold_cancel drains, then cancels with ZERO paste RPCs and uncommitted token!
+        for case_idx, ks_values in enumerate(([False], [True, False])):
+            plat_fl = WslPlatform(cfg_tap, env={})
+            plat_fl._shim = _AliveShim()  # type: ignore[assignment]
+            plat_fl._paste_hold_timeout_sec = 2.0
+            blocker = threading.Event()
+            blocker_entered = threading.Event()
+            tok_fl = CancelToken()
+            flush_returns: list[bool] = []
+            paste_rpcs_fl: list[dict[str, object]] = []
+
+            def _on_evt(msg: dict[str, object], _blk=blocker, _ent=blocker_entered, _tok=tok_fl) -> None:
+                if msg.get("event") == "slow_prev":
+                    _ent.set()
+                    _blk.wait(timeout=2.0)
+                elif msg.get("event") == "hold_cancel":
+                    _tok.cancel("hold_cancel")
+
+            plat_fl._on_event = _on_evt
+            plat_fl._ensure_event_worker()
+            orig_flush = plat_fl._flush_shim_events
+
+            def _spy_flush(timeout_sec: float = 0.05, _orig=orig_flush, _rec=flush_returns, _blk=blocker) -> bool:
+                ok = _orig(timeout_sec=timeout_sec)
+                _rec.append(ok)
+                if not ok:
+                    _blk.set()
+                return ok
+
+            plat_fl._flush_shim_events = _spy_flush  # type: ignore[method-assign]
+            ks_iter = iter(ks_values)
+
+            def _rpc_fl(payload: dict[str, object], timeout_sec: float = 5.0, _it=ks_iter, _rec=paste_rpcs_fl) -> dict[str, object]:
+                del timeout_sec
+                if payload.get("cmd") == "key_state":
+                    return {"ok": True, "hotkey_held": next(_it, False)}
+                _rec.append(dict(payload))
+                return {"ok": True, "pasted": True, "clipboard": True, "reason": "ok", "fg_process": "Code.exe"}
+
+            plat_fl._dispatch_paste_rpc = _rpc_fl  # type: ignore[method-assign]
+            try:
+                plat_fl._event_q.put({"event": "slow_prev"})
+                plat_fl._event_q.put({"event": "hold_cancel"})
+                self.assertTrue(blocker_entered.wait(timeout=1.0))
+                try:
+                    out_fl = plat_fl.deliver_text(
+                        f"排空前禁止提交_{case_idx}",
+                        seq_id=200 + case_idx,
+                        origin_window=ForegroundWindow(401, "Code.exe", "main.py - VS Code"),
+                        is_cancelled=tok_fl.is_cancelled,
+                        before_commit=tok_fl.try_commit,
+                    )
+                finally:
+                    blocker.set()
+                self.assertFalse(out_fl.pasted)
+                self.assertFalse(out_fl.clipboard)
+                self.assertEqual(out_fl.reason, "cancelled")
+                self.assertTrue(tok_fl.is_cancelled())
+                self.assertFalse(tok_fl.is_committed())
+                self.assertEqual(paste_rpcs_fl, [])
+                self.assertIn(False, flush_returns)
+            finally:
+                plat_fl._shim = None
+                plat_fl.close()
+
     def test_macos_gui_delivery_tmux_env_isolation_dynamic_title_and_shim_cmd_v(self) -> None:
         pbcopy_writes: list[str] = []
         tmux_calls: list[list[str]] = []

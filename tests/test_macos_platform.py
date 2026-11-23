@@ -5236,6 +5236,142 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 finally:
                     plat_flush.close()
 
+    def test_macos_hwnd_zero_to_positive_drift_and_immediate_unavail_cap(self) -> None:
+        """P1-C8 + P2-bridge-misc (a): hwnd 0->positive is drift (0->0 allowed); immediate=True None keeps unavail_since."""
+        with tempfile.TemporaryDirectory() as td:
+            cfg_ptt = Config()
+            cfg_ptt.hotkey.trigger_mode = "ptt"
+            cfg_ptt.audio.max_duration_sec = 600
+            plat = MacOSPlatform(
+                cfg_ptt, env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"}, cache_dir=Path(td) / "c_p1c8"
+            )
+            try:
+                # 1. _is_focus_drifted: 0 -> 0 stays allowed (windowless overlay), 0 -> positive is focus drift!
+                orig_spot = ForegroundWindow(0, "Spotlight", "", bundle_id="com.apple.Spotlight", ax_trusted=True)
+                cur_spot = ForegroundWindow(0, "Spotlight", "", bundle_id="com.apple.Spotlight", ax_trusted=True)
+                self.assertFalse(plat._is_focus_drifted(orig_spot, cur_spot))
+
+                orig_cg = ForegroundWindow(0, "ChatGPT", "", bundle_id="com.openai.codex", ax_trusted=True)
+                cur_cg_pop = ForegroundWindow(42, "ChatGPT", "New Popup", bundle_id="com.openai.codex", ax_trusted=True)
+                self.assertTrue(plat._is_focus_drifted(orig_cg, cur_cg_pop))
+
+                orig_term0 = ForegroundWindow(0, "Terminal", "", bundle_id="com.apple.Terminal", ax_trusted=True)
+                cur_term_pop = ForegroundWindow(99, "Terminal", "zsh", bundle_id="com.apple.Terminal", ax_trusted=True)
+                self.assertTrue(plat._is_focus_drifted(orig_term0, cur_term_pop))
+
+                # 2. Alternating FIFO key_state=False + immediate=True -> None MUST hit 4.0s unavail cap (not 602s PTT cap!)
+                pbcopy_payloads: list[str] = []
+                paste_attempts = [0]
+                fake_now = [100.0]
+
+                def fake_sleep(sec: float) -> None:
+                    fake_now[0] += max(0.0, float(sec))
+
+                def fake_run(cmd, *, input=None, text=False, **kw):
+                    exe = Path(cmd[0]).name
+                    empty = "" if (text or kw.get("encoding")) else b""
+                    if exe == "pbcopy":
+                        raw = input.decode("utf-8") if isinstance(input, (bytes, bytearray)) else str(input or "")
+                        pbcopy_payloads.append(raw)
+                        return subprocess.CompletedProcess(cmd, 0, empty, empty)
+                    return subprocess.CompletedProcess(cmd, 1, empty, empty)
+
+                origin_iterm = ForegroundWindow(100, "iTerm2", "claude [#abcd1234]", "com.googlecode.iterm2")
+                plat._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat._shim_caps = frozenset({"paste_clip", "key_state_immediate"})
+                plat._flush_shim_events = lambda timeout_sec=0.05: True  # type: ignore[method-assign]
+                plat.beep = lambda _k: None  # type: ignore[method-assign]
+                plat._rec_active = True
+
+                def alt_fail_rpc(payload: dict[str, object], timeout_sec: float = 1.5, **kw: object):
+                    del timeout_sec, kw
+                    op = payload.get("cmd")
+                    if op == "fg_window":
+                        return {
+                            "ok": True,
+                            "hwnd": 100,
+                            "process": "iTerm2",
+                            "bundle_id": "com.googlecode.iterm2",
+                            "pid": 512,
+                            "title": "claude [#abcd1234]",
+                            "ax_trusted": True,
+                        }
+                    if op == "key_state":
+                        if payload.get("immediate"):
+                            return None  # simulates immediate RPC timeout/error
+                        return {"ok": True, "hotkey_held": False}
+                    if op == "paste_cmd_v":
+                        paste_attempts[0] += 1
+                        return {"ok": True, "posted": True, "clipboard": True, "reason": "ok"}
+                    return {"ok": True}
+
+                plat._shim_rpc = alt_fail_rpc  # type: ignore[method-assign]
+                with (
+                    mock.patch("agent_voice_input.platform_macos.shutil.which", return_value="/usr/bin/mock"),
+                    mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=fake_run),
+                    mock.patch("agent_voice_input.platform_macos.time.monotonic", side_effect=lambda: fake_now[0]),
+                    mock.patch("agent_voice_input.platform_macos.time.sleep", side_effect=fake_sleep),
+                ):
+                    out_alt = plat.deliver_text(
+                        "交替失败4秒回退",
+                        seq_id=201,
+                        origin_window=origin_iterm,
+                        fallback_clipboard_text="交替失败兜底",
+                    )
+                self.assertFalse(out_alt.pasted)
+                self.assertTrue(out_alt.clipboard)
+                self.assertEqual(out_alt.reason, "focus_changed")
+                self.assertEqual(paste_attempts[0], 0)
+                self.assertAlmostEqual(fake_now[0] - 100.0, 4.0, delta=0.15)
+                self.assertEqual(pbcopy_payloads, ["交替失败兜底"])
+
+                # 2b. Once immediate=True DOES recover to False (at t=2.0s), unavail_since is cleared so a slow
+                #     post-wait focus recheck (t=4.5s > 4.0s, still << 602s PTT deadline) does NOT false-timeout!
+                pbcopy_payloads.clear()
+                paste_attempts[0] = 0
+                fake_now[0] = 300.0
+                fg_calls = [0]
+
+                def recover_rpc(payload: dict[str, object], timeout_sec: float = 1.5, **kw: object):
+                    del timeout_sec, kw
+                    op = payload.get("cmd")
+                    if op == "fg_window":
+                        fg_calls[0] += 1
+                        if fg_calls[0] >= 2:
+                            fake_now[0] = 304.5
+                        return {
+                            "ok": True,
+                            "hwnd": 100,
+                            "process": "iTerm2",
+                            "bundle_id": "com.googlecode.iterm2",
+                            "pid": 512,
+                            "title": "claude [#abcd1234]",
+                            "ax_trusted": True,
+                        }
+                    if op == "key_state":
+                        if payload.get("immediate"):
+                            if (fake_now[0] - 300.0) < 2.0:
+                                return None
+                            return {"ok": True, "hotkey_held": False}
+                        return {"ok": True, "hotkey_held": False}
+                    if op == "paste_cmd_v":
+                        paste_attempts[0] += 1
+                        return {"ok": True, "posted": True, "clipboard": True, "reason": "ok", "fg_process": "iTerm2"}
+                    return {"ok": True}
+
+                plat._shim_rpc = recover_rpc  # type: ignore[method-assign]
+                with (
+                    mock.patch("agent_voice_input.platform_macos.shutil.which", return_value="/usr/bin/mock"),
+                    mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=fake_run),
+                    mock.patch("agent_voice_input.platform_macos.time.monotonic", side_effect=lambda: fake_now[0]),
+                    mock.patch("agent_voice_input.platform_macos.time.sleep", side_effect=fake_sleep),
+                ):
+                    out_rec = plat.deliver_text("恢复后清零正常粘贴", seq_id=202, origin_window=origin_iterm)
+                self.assertTrue(out_rec.pasted)
+                self.assertEqual(paste_attempts[0], 1)
+            finally:
+                plat.close()
+
 
 if __name__ == "__main__":
     unittest.main()

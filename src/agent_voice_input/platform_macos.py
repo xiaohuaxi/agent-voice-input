@@ -1864,6 +1864,8 @@ class MacOSPlatform(JsonlShimMixin):
             return True
         if origin.hwnd > 0 and current.hwnd > 0 and origin.hwnd != current.hwnd:
             return True
+        if (origin.process or origin.bundle_id) and origin.hwnd <= 0 and current.hwnd > 0:
+            return True
         if origin.surface_id and current.surface_id and origin.surface_id != current.surface_id:
             return True
         if (
@@ -2531,7 +2533,9 @@ class MacOSPlatform(JsonlShimMixin):
                 if not self._has_managed_shim():
                     return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
                 if key_state is False:
-                    unavail_since = None
+                    needs_immediate = self._shim_supports_key_state_immediate()
+                    if not needs_immediate:
+                        unavail_since = None
                     now_flush = time.monotonic()
                     eff_deadline = _effective_deadline(now_flush)
                     rem_flush = eff_deadline - now_flush
@@ -2553,7 +2557,7 @@ class MacOSPlatform(JsonlShimMixin):
                     now_post_flush = time.monotonic()
                     if (waited_for_key or hold_timeout_sec > 0.0) and (_effective_deadline(now_post_flush) - now_post_flush) <= 0.0:
                         return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
-                    if self._shim_supports_key_state_immediate():
+                    if needs_immediate:
                         imm_started = now_post_flush
                         imm_state = self._poll_shim_key_state(immediate=True)
                         if cancelled_fn():
@@ -2561,6 +2565,7 @@ class MacOSPlatform(JsonlShimMixin):
                         if not self._has_managed_shim():
                             return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
                         if imm_state is False:
+                            unavail_since = None
                             now_after_imm = time.monotonic()
                             if (waited_for_key or hold_timeout_sec > 0.0) and (_effective_deadline(now_after_imm) - now_after_imm) <= 0.0:
                                 return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)

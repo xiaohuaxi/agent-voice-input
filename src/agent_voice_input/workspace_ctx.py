@@ -884,7 +884,9 @@ def _query_agy_ide_db_title_rows(
         return []
 
 
-def _decode_structured_workspace_uri(raw_u: str, *, wsl: bool) -> str:
+def _decode_structured_workspace_uri(
+    raw_u: str, *, wsl: bool, env: Mapping[str, str] | None = None
+) -> str:
     """Parse structured local ``file://`` (and WSL-host ``vscode-remote://wsl+...``) URIs without stripping trailing punctuation."""
     s = (raw_u or "").strip()
     if not s:
@@ -898,7 +900,15 @@ def _decode_structured_workspace_uri(raw_u: str, *, wsl: bool) -> str:
         if parts.netloc and parts.netloc.lower() != "localhost":
             return ""
     elif scheme == "vscode-remote":
-        if not wsl or not (parts.netloc or "").lower().startswith("wsl+"):
+        if not wsl:
+            return ""
+        authority = urllib.parse.unquote(parts.netloc or "")
+        if not authority.lower().startswith("wsl+"):
+            return ""
+        uri_distro = authority[4:].strip()
+        src_env = os.environ if env is None else env
+        cur_distro = (src_env.get("WSL_DISTRO_NAME") or "").strip()
+        if cur_distro and (not uri_distro or uri_distro.lower() != cur_distro.lower()):
             return ""
     else:
         return ""
@@ -910,7 +920,9 @@ def _decode_structured_workspace_uri(raw_u: str, *, wsl: bool) -> str:
     return path
 
 
-def _parse_agy_db_workspace_uris(raw_ws_uris: Any, home: Path, *, wsl: bool) -> tuple[bool, list[str]]:
+def _parse_agy_db_workspace_uris(
+    raw_ws_uris: Any, home: Path, *, wsl: bool, env: Mapping[str, str] | None = None
+) -> tuple[bool, list[str]]:
     """Return ``(has_raw_entries, local_safe_dirs)`` from DB ``workspace_uris`` JSON."""
     if not isinstance(raw_ws_uris, str):
         return False, []
@@ -932,7 +944,7 @@ def _parse_agy_db_workspace_uris(raw_ws_uris: Any, home: Path, *, wsl: bool) -> 
         if not isinstance(raw_u, str) or not raw_u.strip():
             continue
         has_raw = True
-        decoded = _decode_structured_workspace_uri(raw_u, wsl=wsl)
+        decoded = _decode_structured_workspace_uri(raw_u, wsl=wsl, env=env)
         if not decoded:
             continue
         safe_dir = _resolve_safe_local_dir(decoded, wsl=wsl)
@@ -948,18 +960,27 @@ def _scan_agy_ide_db_for_prior(
     *,
     wsl: bool,
     excl_low: str,
-) -> tuple[list[tuple[float, str, Path]], set[str]]:
-    """Scan all DB rows under ``root`` for exact ``safe_ws`` prior candidates and authoritative DB vetoes."""
+    env: Mapping[str, str] | None = None,
+) -> tuple[list[tuple[float, str, Path]], set[str], bool]:
+    """Scan all DB rows under ``root`` for exact ``safe_ws`` prior candidates and authoritative DB vetoes.
+
+    Returns ``(matched_rows, vetoed_cids, db_ok)`` where ``db_ok=False`` indicates
+    ``conversation_summaries.db`` exists on disk but failed to open/query so the caller
+    must fail closed for that root (skip legacy ``brain/`` fallback).
+    """
+    db_path = root / "conversation_summaries.db"
+    if not os.path.lexists(db_path):
+        return [], set(), True
     conn = _open_agy_ide_db_ro(root, wsl=wsl)
     if conn is None:
-        return [], set()
+        return [], set(), False
     matched_rows: list[tuple[float, str, Path]] = []
     vetoed_cids: set[str] = set()
     try:
         with contextlib.closing(conn):
             cols = _get_agy_db_table_cols(conn)
             if "conversation_id" not in cols:
-                return [], set()
+                return [], set(), False
             sel_ws = "workspace_uris" if "workspace_uris" in cols else "''"
             sel_src = "source" if "source" in cols else "''"
             sel_parent = "parent_conversation_id" if "parent_conversation_id" in cols else "''"
@@ -972,7 +993,7 @@ def _scan_agy_ide_db_for_prior(
             with contextlib.closing(conn.execute(sql)) as cur:
                 rows = cur.fetchall()
     except (sqlite3.Error, OSError):
-        return [], set()
+        return [], set(), False
 
     seen_matched: set[str] = set()
     for raw_cid, raw_ws_uris, raw_src, raw_parent, raw_depth, raw_agent in rows:
@@ -996,7 +1017,7 @@ def _scan_agy_ide_db_for_prior(
             vetoed_cids.add(cid_low)
             continue
 
-        has_raw, ws_dirs = _parse_agy_db_workspace_uris(str(raw_ws_uris or ""), home, wsl=wsl)
+        has_raw, ws_dirs = _parse_agy_db_workspace_uris(str(raw_ws_uris or ""), home, wsl=wsl, env=env)
         if any(_cwd_match_rank(safe_ws, p, home, wsl=wsl) == 2 for p in ws_dirs):
             vetoed_cids.add(cid_low)
             if cid_low == excl_low or cid_low in seen_matched:
@@ -1010,7 +1031,7 @@ def _scan_agy_ide_db_for_prior(
             # DB explicitly binds this conversation to another workspace or remote URI; block legacy fallback.
             vetoed_cids.add(cid_low)
 
-    return matched_rows, vetoed_cids
+    return matched_rows, vetoed_cids, True
 
 
 def resolve_antigravity_ide_session_by_title(
@@ -1079,17 +1100,33 @@ def resolve_antigravity_ide_session_by_title(
         return None
     if len(cands) == 1:
         chosen = cands[0]
+        _, ws_dirs = _parse_agy_db_workspace_uris(chosen[4], eff_home, wsl=eff_wsl, env=eff_env)
+        ws_cwd = ws_dirs[0] if ws_dirs else ""
     else:
+        parsed_cands: list[tuple[tuple[Path, str, Path, os.stat_result, str, Any], str]] = []
+        distinct_ws: set[str] = set()
+        for item in cands:
+            has_raw, item_ws_dirs = _parse_agy_db_workspace_uris(
+                item[4], eff_home, wsl=eff_wsl, env=eff_env
+            )
+            if has_raw and not item_ws_dirs:
+                return None
+            primary_ws = item_ws_dirs[0] if item_ws_dirs else ""
+            distinct_ws.add(primary_ws)
+            parsed_cands.append((item, primary_ws))
+        if len(distinct_ws) != 1:
+            return None
+
         def _cand_sort_key(
-            item: tuple[Path, str, Path, os.stat_result, str, Any]
-        ) -> tuple[int, float, float, float]:
+            entry: tuple[tuple[Path, str, Path, os.stat_result, str, Any], str]
+        ) -> tuple[float, float, float, float]:
+            item = entry[0]
             ann_mtime = _stat_agy_annotation_mtime(item[0], item[1])
             db_lmt = _parse_iso_timestamp(item[5])
-            return (1 if ann_mtime > 0.0 else 0, ann_mtime, db_lmt, float(item[3].st_mtime))
+            tp_mtime = float(item[3].st_mtime)
+            return (max(ann_mtime, db_lmt, tp_mtime), ann_mtime, db_lmt, tp_mtime)
 
-        chosen = max(cands, key=_cand_sort_key)
-    _, ws_dirs = _parse_agy_db_workspace_uris(chosen[4], eff_home, wsl=eff_wsl)
-    ws_cwd = ws_dirs[0] if ws_dirs else ""
+        chosen, ws_cwd = max(parsed_cands, key=_cand_sort_key)
     return SessionMatch(
         cli="agy",
         session_id=chosen[1],
@@ -1150,13 +1187,15 @@ def _validate_codex_rollout_meta(
     return True
 
 
-def _validate_codex_local_cwd(raw_cwd: str, *, home: Path, wsl: bool) -> str:
+def _validate_codex_local_cwd(
+    raw_cwd: str, *, home: Path, wsl: bool, env: Mapping[str, str] | None = None
+) -> str:
     """Validate a structured absolute local workspace path (or ``file://`` URI) from Codex DB."""
     s = (raw_cwd or "").strip()
     if not s or "\x00" in s:
         return ""
     if s.lower().startswith(("file://", "vscode-remote://")):
-        s = _decode_structured_workspace_uri(s, wsl=wsl)
+        s = _decode_structured_workspace_uri(s, wsl=wsl, env=env)
         if not s:
             return ""
     if not os.path.isabs(s) or is_wsl_slow_mount_path(s, wsl=wsl):
@@ -1504,6 +1543,49 @@ def _collect_codex_title_candidates(
     return list(by_idx.values())
 
 
+def _query_codex_archived_thread_ids(
+    codex_dir: Path, thread_ids: Sequence[str], *, wsl: bool
+) -> set[str] | None:
+    """Batch-query ``state_5.sqlite`` ``threads`` for ``archived != 0`` among ``thread_ids``.
+
+    Returns ``None`` if ``state_5.sqlite`` is absent or unreadable (caller falls back to
+    single-candidate ``_resolve_codex_rollout_for_thread`` verification).
+    """
+    unique_ids = list(dict.fromkeys(tid for tid in thread_ids if tid))
+    if not unique_ids:
+        return set()
+    state_db = codex_dir / "state_5.sqlite"
+    if not os.path.lexists(state_db):
+        return None
+    conn = _open_readonly_sqlite(state_db, wsl=wsl)
+    if conn is None:
+        return None
+    archived: set[str] = set()
+    try:
+        with contextlib.closing(conn):
+            cols = _get_sqlite_table_cols(conn, "threads")
+            if "id" not in cols or "archived" not in cols:
+                return None
+            for i in range(0, len(unique_ids), 500):
+                batch = unique_ids[i : i + 500]
+                placeholders = ",".join("?" for _ in batch)
+                with contextlib.closing(
+                    conn.execute(
+                        f"SELECT id, COALESCE(archived, 0) FROM threads WHERE id IN ({placeholders})",
+                        batch,
+                    )
+                ) as cur:
+                    for raw_id, raw_arch in cur.fetchall():
+                        try:
+                            if int(raw_arch or 0) != 0:
+                                archived.add(str(raw_id or ""))
+                        except (TypeError, ValueError):
+                            return None
+    except (sqlite3.Error, OSError):
+        return None
+    return archived
+
+
 def resolve_codex_desktop_session_by_title(
     window_title: str,
     *,
@@ -1529,7 +1611,8 @@ def resolve_codex_desktop_session_by_title(
     codex_dir = Path(safe_codex_dir)
 
     codex_db_path = codex_dir / "sqlite" / "codex.db"
-    if os.path.lexists(codex_db_path):
+    from_codex_db = os.path.lexists(codex_db_path)
+    if from_codex_db:
         # Present codex.db is authoritative: lock/corruption/missing columns must fail closed (never bypass cloud veto).
         rows = _query_codex_catalog_rows(codex_db_path, wsl=eff_wsl)
     else:
@@ -1538,7 +1621,9 @@ def resolve_codex_desktop_session_by_title(
         return None
 
     search_titles = [win_title]
-    stripped_title = _strip_trailing_app_suffix(win_title, _CODEX_DESKTOP_APP_SUFFIXES)
+    stripped_title = _strip_trailing_app_suffix(
+        win_title, _CODEX_DESKTOP_APP_SUFFIXES, allow_tight_dash=True
+    )
     if (
         stripped_title
         and stripped_title != win_title
@@ -1557,13 +1642,22 @@ def resolve_codex_desktop_session_by_title(
     validated: list[tuple[_CodexCatalogRow, bool, str]] = []
     distinct_cwds: set[str] = set()
     for row, is_exact in pool:
-        safe_cwd = _validate_codex_local_cwd(row.cwd, home=eff_home, wsl=eff_wsl)
+        safe_cwd = _validate_codex_local_cwd(row.cwd, home=eff_home, wsl=eff_wsl, env=eff_env)
         if not safe_cwd:
             return None
         validated.append((row, is_exact, safe_cwd))
         distinct_cwds.add(safe_cwd)
     if len(distinct_cwds) != 1:
         return None
+
+    if from_codex_db and len(validated) > 1:
+        archived_ids = _query_codex_archived_thread_ids(
+            codex_dir, [row.thread_id for row, _, _ in validated], wsl=eff_wsl
+        )
+        if archived_ids is not None:
+            validated = [item for item in validated if item[0].thread_id not in archived_ids]
+            if not validated:
+                return None
 
     chosen, _, safe_cwd = max(
         validated,
@@ -1711,15 +1805,19 @@ def discover_antigravity_ide_prior_sessions(
     # 1. Antigravity 2.0 standalone desktop: exact workspace_uris matches & authoritative per-root DB vetoes
     db_cands: list[tuple[float, str, Path]] = []
     per_root_vetoes: dict[Path, set[str]] = {}
+    failed_db_roots: set[Path] = set()
     for root in _iter_agy_ide_roots(home):
         real_root = _resolve_safe_local_dir(str(root), wsl=eff_wsl)
         if not real_root:
             continue
         root_path = Path(real_root)
-        matched_rows, vetoed = _scan_agy_ide_db_for_prior(
-            root_path, safe_ws, home, wsl=eff_wsl, excl_low=excl_low
+        matched_rows, vetoed, db_ok = _scan_agy_ide_db_for_prior(
+            root_path, safe_ws, home, wsl=eff_wsl, excl_low=excl_low, env=env
         )
         per_root_vetoes[root_path] = vetoed
+        if not db_ok:
+            failed_db_roots.add(root_path)
+            continue
         for mtime, cid, tp in matched_rows:
             cid_low = cid.lower()
             if cid_low not in seen_cids:
@@ -1749,6 +1847,8 @@ def discover_antigravity_ide_prior_sessions(
         if not real_root:
             continue
         root_path = Path(real_root)
+        if root_path in failed_db_roots:
+            continue
         root_vetoes = per_root_vetoes.get(root_path, set())
         real_broot = _resolve_safe_local_dir(str(root_path / "brain"), wsl=eff_wsl)
         if not real_broot:

@@ -719,9 +719,14 @@ class WslPlatform(JsonlShimMixin):
             self._use_winmm = False
         return False
 
+    def _idle_paste_hold_timeout_sec(self) -> float:
+        return max(5.0, (self.cfg.hotkey.effective_hold_cancel_ms() / 1000.0) + 2.0)
+
     def _effective_paste_hold_timeout_sec(self) -> float:
         if self._paste_hold_timeout_sec is not None:
             return max(0.0, float(self._paste_hold_timeout_sec))
+        if self.cfg.hotkey.trigger_mode != "ptt":
+            return self._idle_paste_hold_timeout_sec()
         return max(15.0, float(self.cfg.audio.max_duration_sec) + 2.0)
 
     def _dispatch_paste_rpc(self, req: dict[str, Any], timeout_sec: float = 5.0) -> dict[str, Any]:
@@ -795,7 +800,8 @@ class WslPlatform(JsonlShimMixin):
         ):
             orig_session_tok = orig_hint.session_token
 
-        hold_deadline = time.monotonic() + self._effective_paste_hold_timeout_sec()
+        hold_timeout_sec = self._effective_paste_hold_timeout_sec()
+        hold_deadline = time.monotonic() + hold_timeout_sec
         prechecked_key_state = False
         waited_for_key = False
         if before_commit is not None and self._shim is not None and self._shim.poll() is None:
@@ -810,16 +816,31 @@ class WslPlatform(JsonlShimMixin):
                 if cancelled_fn():
                     return PasteOutcome(False, False, "cancelled", "")
                 if not ks.get("hotkey_held"):
+                    now_flush = time.monotonic()
+                    rem_flush = hold_deadline - now_flush
+                    if (waited_for_key or hold_timeout_sec > 0.0) and rem_flush <= 0.0:
+                        return _fallback_clipboard_via_shim()
+                    flush_wait = min(0.05, max(0.005, rem_flush)) if rem_flush > 0.0 else 0.005
+                    flushed = self._flush_shim_events(timeout_sec=flush_wait)
+                    if cancelled_fn():
+                        return PasteOutcome(False, False, "cancelled", "")
+                    if not flushed:
+                        waited_for_key = True
+                        now_after_flush = time.monotonic()
+                        rem = hold_deadline - now_after_flush
+                        if rem <= 0.0:
+                            return _fallback_clipboard_via_shim()
+                        if (now_after_flush - now_flush) < 0.005:
+                            sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
+                        continue
+                    if (waited_for_key or hold_timeout_sec > 0.0) and (hold_deadline - time.monotonic()) <= 0.0:
+                        return _fallback_clipboard_via_shim()
                     break
                 rem_ks = hold_deadline - time.monotonic()
                 if rem_ks <= 0.0:
                     return _fallback_clipboard_via_shim()
                 waited_for_key = True
                 sleep_cooperative(min(0.05, rem_ks), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
-            if waited_for_key:
-                self._flush_shim_events()
-                if cancelled_fn():
-                    return PasteOutcome(False, False, "cancelled", "")
 
         while True:
             if cancelled_fn():

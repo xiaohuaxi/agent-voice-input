@@ -66,6 +66,7 @@ from agent_voice_input.session_ctx import (  # noqa: E402
     BUILTIN_AGENT_HOTWORDS,
     SessionMatch,
     SessionTracker,
+    discover_antigravity_ide_prior_sessions,
     is_wsl_slow_mount_path,
     read_git_status_summary,
     read_repo_core_files,
@@ -1120,7 +1121,7 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                     ("cid-trunc-cjk", "修复语音输入桌面窗口上下文路由问题", json.dumps([repo_a.as_uri()]), "2026-11-23T09:04:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
                     ("cid-exact-over-prefix", "Investigate Antigravity 2...", json.dumps([repo_b.as_uri()]), "2026-11-23T08:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
                     ("cid-short-prefix", "Fix bug in parser", json.dumps([repo_a.as_uri()]), "2026-11-23T09:05:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
-                    ("cid-dup-old", "Shared Title Session", json.dumps([repo_b.as_uri()]), "2026-11-23T09:10:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-dup-old", "Shared Title Session", json.dumps([repo_a.as_uri()]), "2026-11-23T09:10:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
                     ("cid-dup-active", "Shared Title Session", json.dumps([repo_a.as_uri()]), "2026-11-23T08:10:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
                     ("cid-cli-src", "CLI Source Trap", json.dumps([repo_a.as_uri()]), "2026-11-23T09:20:00Z", "CORTEX_TRAJECTORY_SOURCE_CLI", "", 0, ""),
                     ("cid-refiner", "Refiner Trap", json.dumps([repo_a.as_uri()]), "2026-11-23T09:20:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, "avi-refiner"),
@@ -1456,10 +1457,10 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 conn.executemany("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
                 conn.commit()
 
-            # Verify P1 #3: ann_mtime (foreground view) beats newer db_lmt (background generation)
-            m_rank = resolve_antigravity_ide_session_by_title("Duplicate Foreground Title", home=home, wsl=False)
-            assert m_rank is not None
-            self.assertEqual((m_rank.session_id, m_rank.cwd), ("cid-view-a", os.path.realpath(repo_a)))
+            # Verify P1-B4a: cross-repo duplicate title (repo_a vs repo_b) fails closed instead of cross-binding
+            self.assertIsNone(
+                resolve_antigravity_ide_session_by_title("Duplicate Foreground Title", home=home, wsl=False)
+            )
 
             # Verify P2 #4: SQL pushdown finds row #221 (exact) and #222 (prefix) despite 220 newer unrelated rows
             m_221 = resolve_antigravity_ide_session_by_title("Ancient Exact Session 221", home=home, wsl=False)
@@ -1717,13 +1718,20 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             self.assertEqual(m_fw.session_id, "cid-fullwidth")
 
             # Verify 4: WSL vscode-remote://wsl+... resolves on WSL (preserving trailing dot), rejects ssh-remote+ & non-WSL
-            m_wsl = resolve_antigravity_ide_session_by_title("WSL Structured Workspace", home=home, wsl=True)
+            env_wsl_ubuntu = {"HOME": str(home), "WSL_DISTRO_NAME": "Ubuntu"}
+            m_wsl = resolve_antigravity_ide_session_by_title(
+                "WSL Structured Workspace", home=home, wsl=True, env=env_wsl_ubuntu
+            )
             assert m_wsl is not None
             self.assertEqual(m_wsl.cwd, os.path.realpath(repo_wsl_dot))
-            m_wsl_nonhost = resolve_antigravity_ide_session_by_title("WSL Structured Workspace", home=home, wsl=False)
+            m_wsl_nonhost = resolve_antigravity_ide_session_by_title(
+                "WSL Structured Workspace", home=home, wsl=False, env=env_wsl_ubuntu
+            )
             assert m_wsl_nonhost is not None
             self.assertEqual(m_wsl_nonhost.cwd, "")
-            m_ssh = resolve_antigravity_ide_session_by_title("SSH Structured Workspace", home=home, wsl=True)
+            m_ssh = resolve_antigravity_ide_session_by_title(
+                "SSH Structured Workspace", home=home, wsl=True, env=env_wsl_ubuntu
+            )
             assert m_ssh is not None
             self.assertEqual(m_ssh.cwd, "")
 
@@ -2981,6 +2989,367 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 self.assertIn("BetaOnlyPriorToken", fresh_prior_b)
             finally:
                 tracker_ab.close()
+
+    def test_batch1_agy_cross_repo_disambiguation_and_ann_mtime_ranking(self) -> None:
+        """P1-B4a/b: AGY 2.0 cross-repo ambiguity fails closed; same-repo ranks by max(ann_mtime, db_lmt, tp_mtime)."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            repo_a = home / "repos" / "proj-a"
+            repo_b = home / "repos" / "proj-b"
+            for d in (repo_a, repo_b):
+                d.mkdir(parents=True)
+            ide_root = home / ".gemini" / "antigravity"
+            ide_brain = ide_root / "brain"
+            db_path = ide_root / "conversation_summaries.db"
+            base_t = 1_795_424_400.0  # 2026-11-23T09:00:00Z
+
+            def _write_pb(cid: str, mtime: float) -> None:
+                p = ide_root / "annotations" / f"{cid}.pbtxt"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("viewed {}\n", encoding="utf-8")
+                os.utime(p, (mtime, mtime))
+
+            def _mk_sess(cid: str, mtime: float) -> None:
+                _write_agy_brain_session(
+                    ide_brain,
+                    cid,
+                    [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": f"<USER_REQUEST>{cid}</USER_REQUEST>"}],
+                    mtime=mtime,
+                )
+
+            # 1) Cross-repo exact duplicate & truncated prefix collision -> MUST return None
+            _mk_sess("cid-xrepo-a", base_t + 100)
+            _mk_sess("cid-xrepo-b", base_t + 10)
+            _write_pb("cid-xrepo-a", base_t + 500)
+            _mk_sess("cid-xpfx-a", base_t + 100)
+            _mk_sess("cid-xpfx-b", base_t + 10)
+            # 2) Ambiguous local vs empty workspace & remote-only vs remote-only -> MUST return None
+            _mk_sess("cid-mix-local", base_t + 100)
+            _mk_sess("cid-mix-empty", base_t + 10)
+            _mk_sess("cid-rem-1", base_t + 100)
+            _mk_sess("cid-rem-2", base_t + 10)
+            # 3) Same-repo: old session WITH annotation vs brand-new session WITHOUT annotation -> new wins!
+            _mk_sess("cid-same-old-ann", base_t + 10)
+            _write_pb("cid-same-old-ann", base_t + 20)
+            _mk_sess("cid-same-new-noann", base_t + 500)
+            # 4) Same-repo equal db_lmt/tp_mtime: recently viewed annotation wins tiebreak
+            _mk_sess("cid-tie-plain", base_t + 300)
+            _mk_sess("cid-tie-ann", base_t + 300)
+            _write_pb("cid-tie-ann", base_t + 300)
+            # 5) Both empty workspace -> allowed to rank by latest real activity
+            _mk_sess("cid-empty-old", base_t + 10)
+            _write_pb("cid-empty-old", base_t + 20)
+            _mk_sess("cid-empty-new", base_t + 400)
+
+            rows = [
+                ("cid-xrepo-a", "Cross Repo Exact Dup", json.dumps([repo_a.as_uri()]), "2026-11-23T09:01:40Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-xrepo-b", "Cross Repo Exact Dup", json.dumps([repo_b.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-xpfx-a", "Shared Prefix Cross Repo Alpha", json.dumps([repo_a.as_uri()]), "2026-11-23T09:01:40Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-xpfx-b", "Shared Prefix Cross Repo Beta", json.dumps([repo_b.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-mix-local", "Mixed Local Empty Dup", json.dumps([repo_a.as_uri()]), "2026-11-23T09:01:40Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-mix-empty", "Mixed Local Empty Dup", "", "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-rem-1", "Two Remote Only Dup", json.dumps(["vscode-remote://ssh-remote+box1/srv/a"]), "2026-11-23T09:01:40Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-rem-2", "Two Remote Only Dup", json.dumps(["vscode-remote://ssh-remote+box2/srv/b"]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-same-old-ann", "Same Repo Old Ann Vs New", json.dumps([repo_a.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-same-new-noann", "Same Repo Old Ann Vs New", json.dumps([repo_a.as_uri()]), "2026-11-23T09:08:20Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-tie-plain", "Same Repo Tiebreak", json.dumps([repo_a.as_uri()]), "2026-11-23T09:05:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-tie-ann", "Same Repo Tiebreak", json.dumps([repo_a.as_uri()]), "2026-11-23T09:05:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-empty-old", "Both Empty Workspace", "", "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-empty-new", "Both Empty Workspace", "", "2026-11-23T09:06:40Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+            ]
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT,
+                        source TEXT,
+                        parent_conversation_id TEXT,
+                        nesting_depth INTEGER,
+                        agent_name TEXT
+                    )
+                    """
+                )
+                conn.executemany("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                conn.commit()
+
+            env = {"HOME": str(home), "WSL_DISTRO_NAME": ""}
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("Cross Repo Exact Dup", home=home, wsl=False, env=env))
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("Shared Prefix Cross Repo...", home=home, wsl=False, env=env))
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("Mixed Local Empty Dup", home=home, wsl=False, env=env))
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("Two Remote Only Dup", home=home, wsl=False, env=env))
+
+            m_new = resolve_antigravity_ide_session_by_title("Same Repo Old Ann Vs New", home=home, wsl=False, env=env)
+            assert m_new is not None
+            self.assertEqual((m_new.session_id, m_new.cwd), ("cid-same-new-noann", os.path.realpath(repo_a)))
+
+            m_tie = resolve_antigravity_ide_session_by_title("Same Repo Tiebreak", home=home, wsl=False, env=env)
+            assert m_tie is not None
+            self.assertEqual(m_tie.session_id, "cid-tie-ann")
+
+            m_emp = resolve_antigravity_ide_session_by_title("Both Empty Workspace", home=home, wsl=False, env=env)
+            assert m_emp is not None
+            self.assertEqual((m_emp.session_id, m_emp.cwd), ("cid-empty-new", ""))
+
+    def test_batch1_agy_prior_db_read_failure_fails_closed(self) -> None:
+        """P1-B5: Present-but-unreadable conversation_summaries.db skips legacy brain/ fallback for that root."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            repo_a = home / "repos" / "proj-a"
+            repo_a.mkdir(parents=True)
+            ide_root = home / ".gemini" / "antigravity"
+            ide_brain = ide_root / "brain"
+            ide2_root = home / ".gemini" / "antigravity-ide"
+            ide2_brain = ide2_root / "brain"
+            db_path = ide_root / "conversation_summaries.db"
+            base_t = 1_795_424_400.0
+
+            rich_turns = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "Inspect VetoLeakToken " + ("a" * 1600)},
+                {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Updated VetoLeakToken " + ("b" * 1600)},
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "Verify VetoLeakToken2 " + ("c" * 800)},
+                {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Done VetoLeakToken2 " + ("d" * 800)},
+            ]
+            _write_agy_brain_session(ide_brain, "cid-legacy-veto", rich_turns, mtime=base_t - 10, workspace_uris=[repo_a.as_uri()])
+            _write_agy_brain_session(ide2_brain, "cid-other-root", rich_turns, mtime=base_t - 20, workspace_uris=[repo_a.as_uri()])
+
+            env = {"HOME": str(home), "WSL_DISTRO_NAME": ""}
+            # DB absent -> both roots discover via legacy brain/
+            cands_no_db = discover_antigravity_ide_prior_sessions(str(repo_a), home=home, wsl=False, env=env)
+            self.assertEqual({c["session_id"] for c in cands_no_db}, {"cid-legacy-veto", "cid-other-root"})
+
+            # 1) Corrupt DB -> root 1 fails closed (never resurrects cid-legacy-veto), root 2 unaffected
+            db_path.write_bytes(b"corrupt sqlite bytes")
+            cands_corrupt = discover_antigravity_ide_prior_sessions(str(repo_a), home=home, wsl=False, env=env)
+            self.assertEqual({c["session_id"] for c in cands_corrupt}, {"cid-other-root"})
+
+            # 2) Missing required conversation_id column -> root 1 fails closed
+            db_path.unlink()
+            with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute("CREATE TABLE conversation_summaries (title TEXT)")
+                conn.commit()
+            cands_bad_schema = discover_antigravity_ide_prior_sessions(str(repo_a), home=home, wsl=False, env=env)
+            self.assertEqual({c["session_id"] for c in cands_bad_schema}, {"cid-other-root"})
+
+            # 3) Locked DB (OperationalError on query) -> root 1 fails closed
+            class _LockedConn:
+                def execute(self, *_a: object, **_kw: object):
+                    raise sqlite3.OperationalError("database is locked")
+
+                def close(self) -> None:
+                    pass
+
+            with mock.patch("agent_voice_input.workspace_ctx._open_agy_ide_db_ro", return_value=_LockedConn()):
+                cands_locked = discover_antigravity_ide_prior_sessions(str(repo_a), home=home, wsl=False, env=env)
+            self.assertEqual({c["session_id"] for c in cands_locked}, {"cid-other-root"})
+
+            # 4) Symlink DB -> root 1 fails closed
+            ext_db = tmp / "ext.db"
+            ext_db.write_bytes(b"")
+            db_path.unlink()
+            os.symlink(ext_db, db_path)
+            cands_symlink = discover_antigravity_ide_prior_sessions(str(repo_a), home=home, wsl=False, env=env)
+            self.assertEqual({c["session_id"] for c in cands_symlink}, {"cid-other-root"})
+
+    def test_batch1_wsl_uri_percent2b_distro_check_codex_archived_and_tight_dash(self) -> None:
+        """P1-B6a/b (wsl%2B + distro check), Codex archived multi-cand filtering, and P2-bridge-misc (c) tight-dash strip."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            repo_a = home / "repos" / "proj-a"
+            repo_a.mkdir(parents=True)
+
+            # --- Part A: WSL vscode-remote://wsl%2B<distro> decoding & WSL_DISTRO_NAME check ---
+            ide_root = home / ".gemini" / "antigravity"
+            ide_brain = ide_root / "brain"
+            agy_db = ide_root / "conversation_summaries.db"
+            base_t = 1_795_424_400.0
+            rich_turns = [
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "Inspect WslDistroToken " + ("a" * 1600)},
+                {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Updated WslDistroToken " + ("b" * 1600)},
+                {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "Verify WslDistroToken2 " + ("c" * 800)},
+                {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Done WslDistroToken2 " + ("d" * 800)},
+            ]
+            for cid in ("cid-enc-u", "cid-other-d", "cid-empty-d"):
+                _write_agy_brain_session(ide_brain, cid, rich_turns, mtime=base_t)
+
+            agy_db.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(str(agy_db))) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT,
+                        source TEXT,
+                        parent_conversation_id TEXT,
+                        nesting_depth INTEGER,
+                        agent_name TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("cid-enc-u", "Encoded Ubuntu URI", json.dumps([f"vscode-remote://wsl%2BUbuntu{repo_a}"]), "2026-11-23T09:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-other-d", "Other Distro URI", json.dumps([f"vscode-remote://wsl%2BDebian{repo_a}"]), "2026-11-23T09:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-empty-d", "Empty Distro URI", json.dumps([f"vscode-remote://wsl%2B{repo_a}"]), "2026-11-23T09:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ],
+                )
+                conn.commit()
+
+            env_ubuntu = {"HOME": str(home), "WSL_DISTRO_NAME": "ubuntu"}
+            env_unset = {"HOME": str(home), "WSL_DISTRO_NAME": ""}
+            m_enc = resolve_antigravity_ide_session_by_title("Encoded Ubuntu URI", home=home, wsl=True, env=env_ubuntu)
+            assert m_enc is not None
+            self.assertEqual(m_enc.cwd, os.path.realpath(repo_a))
+
+            m_other_d = resolve_antigravity_ide_session_by_title("Other Distro URI", home=home, wsl=True, env=env_ubuntu)
+            assert m_other_d is not None
+            self.assertEqual(m_other_d.cwd, "")
+
+            m_empty_d = resolve_antigravity_ide_session_by_title("Empty Distro URI", home=home, wsl=True, env=env_ubuntu)
+            assert m_empty_d is not None
+            self.assertEqual(m_empty_d.cwd, "")
+
+            # Unset WSL_DISTRO_NAME remains backward-compatible
+            m_compat = resolve_antigravity_ide_session_by_title("Encoded Ubuntu URI", home=home, wsl=True, env=env_unset)
+            assert m_compat is not None
+            self.assertEqual(m_compat.cwd, os.path.realpath(repo_a))
+
+            # Prior scan also enforces distro match
+            priors_u = discover_antigravity_ide_prior_sessions(str(repo_a), home=home, wsl=True, env=env_ubuntu)
+            self.assertEqual([c["session_id"] for c in priors_u], ["cid-enc-u"])
+
+            # --- Part B: Codex same-repo duplicate archived filtering & WSL distro URI & tight-dash suffix ---
+            codex_dir = home / ".codex"
+            sessions_day = codex_dir / "sessions" / "2026" / "11" / "23"
+            sessions_day.mkdir(parents=True)
+            sqlite_dir = codex_dir / "sqlite"
+            sqlite_dir.mkdir(parents=True)
+            codex_db = sqlite_dir / "codex.db"
+            state_db = codex_dir / "state_5.sqlite"
+
+            def _mk_rollout(sid: str) -> Path:
+                p = sessions_day / f"rollout-{sid}.jsonl"
+                p.write_text(
+                    json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": str(repo_a), "source": "vscode"}}) + "\n"
+                    + json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": sid}]}}) + "\n",
+                    encoding="utf-8",
+                )
+                return p
+
+            rp_arch_new = _mk_rollout("tid-arch-new")
+            rp_act_mid = _mk_rollout("tid-act-mid")
+            rp_act_old = _mk_rollout("tid-act-old")
+            rp_all_arch1 = _mk_rollout("tid-all-arch-1")
+            rp_all_arch2 = _mk_rollout("tid-all-arch-2")
+            rp_cloud_act = _mk_rollout("tid-cloud-act")
+            rp_cloud_arch = _mk_rollout("tid-cloud-arch")
+            rp_wsl_ok = _mk_rollout("tid-wsl-ok")
+            rp_wsl_bad = _mk_rollout("tid-wsl-bad")
+            rp_tight = _mk_rollout("tid-tight-dash")
+
+            with contextlib.closing(sqlite3.connect(str(state_db))) as sconn:
+                sconn.execute(
+                    """
+                    CREATE TABLE threads (
+                        id TEXT PRIMARY KEY,
+                        name TEXT,
+                        cwd TEXT,
+                        rollout_path TEXT,
+                        originator TEXT,
+                        archived INTEGER DEFAULT 0,
+                        recency_at_ms INTEGER,
+                        updated_at INTEGER
+                    )
+                    """
+                )
+                sconn.executemany(
+                    "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("tid-arch-new", "Dup With Archived", str(repo_a), str(rp_arch_new), "Codex Desktop", 1, 1_760_000_900_000, 1_760_000_900),
+                        ("tid-act-mid", "Dup With Archived", str(repo_a), str(rp_act_mid), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-act-old", "Dup With Archived", str(repo_a), str(rp_act_old), "Codex Desktop", 0, 1_760_000_100_000, 1_760_000_100),
+                        ("tid-all-arch-1", "All Archived Dup", str(repo_a), str(rp_all_arch1), "Codex Desktop", 1, 1_760_000_900_000, 1_760_000_900),
+                        ("tid-all-arch-2", "All Archived Dup", str(repo_a), str(rp_all_arch2), "Codex Desktop", 1, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-cloud-act", "Cloud Veto With Arch", str(repo_a), str(rp_cloud_act), "Codex Desktop", 0, 1_760_000_900_000, 1_760_000_900),
+                        ("tid-cloud-arch", "Cloud Veto With Arch", str(repo_a), str(rp_cloud_arch), "Codex Desktop", 1, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-wsl-ok", "Codex WSL Good Distro", f"vscode-remote://wsl%2BUbuntu{repo_a}", str(rp_wsl_ok), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-wsl-bad", "Codex WSL Bad Distro", f"vscode-remote://wsl%2BDebian{repo_a}", str(rp_wsl_bad), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                        ("tid-tight-dash", "Fix Parser", str(repo_a), str(rp_tight), "Codex Desktop", 0, 1_760_000_500_000, 1_760_000_500),
+                    ],
+                )
+                sconn.commit()
+
+            with contextlib.closing(sqlite3.connect(str(codex_db))) as cconn:
+                cconn.execute(
+                    """
+                    CREATE TABLE local_thread_catalog (
+                        thread_id TEXT,
+                        display_title TEXT,
+                        source_kind TEXT,
+                        host_id TEXT,
+                        cwd TEXT,
+                        missing_candidate INTEGER DEFAULT 0,
+                        source_recency_at TEXT,
+                        updated_at INTEGER
+                    )
+                    """
+                )
+                cconn.executemany(
+                    "INSERT INTO local_thread_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("tid-arch-new", "Dup With Archived", "codex", "local", str(repo_a), 0, "2026-11-23T12:00:00Z", 1_760_000_900),
+                        ("tid-act-mid", "Dup With Archived", "codex", "local", str(repo_a), 0, "2026-11-23T11:00:00Z", 1_760_000_500),
+                        ("tid-act-old", "Dup With Archived", "codex", "local", str(repo_a), 0, "2026-11-23T10:00:00Z", 1_760_000_100),
+                        ("tid-all-arch-1", "All Archived Dup", "codex", "local", str(repo_a), 0, "2026-11-23T12:00:00Z", 1_760_000_900),
+                        ("tid-all-arch-2", "All Archived Dup", "codex", "local", str(repo_a), 0, "2026-11-23T11:00:00Z", 1_760_000_500),
+                        ("tid-cloud-act", "Cloud Veto With Arch", "codex", "local", str(repo_a), 0, "2026-11-23T12:00:00Z", 1_760_000_900),
+                        ("tid-cloud-arch", "Cloud Veto With Arch", "codex", "local", str(repo_a), 0, "2026-11-23T11:00:00Z", 1_760_000_500),
+                        ("tid-cloud-row", "Cloud Veto With Arch", "chatgpt", "chatgpt:u1", None, 0, "2026-11-23T08:00:00Z", 1_760_000_050),
+                        ("tid-wsl-ok", "Codex WSL Good Distro", "codex", "local", f"vscode-remote://wsl%2BUbuntu{repo_a}", 0, "2026-11-23T11:00:00Z", 1_760_000_500),
+                        ("tid-wsl-bad", "Codex WSL Bad Distro", "codex", "local", f"vscode-remote://wsl%2BDebian{repo_a}", 0, "2026-11-23T11:00:00Z", 1_760_000_500),
+                        ("tid-tight-dash", "Fix Parser", "codex", "local", str(repo_a), 0, "2026-11-23T11:00:00Z", 1_760_000_500),
+                    ],
+                )
+                cconn.commit()
+
+            # Same-repo duplicate with newer archived=1 -> skips archived and picks active tid-act-mid!
+            m_act = resolve_codex_desktop_session_by_title("Dup With Archived", home=home, wsl=False, env=env_unset)
+            assert m_act is not None
+            self.assertEqual(m_act.session_id, "tid-act-mid")
+
+            # All archived -> None
+            self.assertIsNone(resolve_codex_desktop_session_by_title("All Archived Dup", home=home, wsl=False, env=env_unset))
+
+            # Cloud veto still blocks even with archived siblings
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Cloud Veto With Arch", home=home, wsl=False, env=env_unset))
+
+            # Codex WSL %2B + distro match
+            m_cx_wsl = resolve_codex_desktop_session_by_title("Codex WSL Good Distro", home=home, wsl=True, env=env_ubuntu)
+            assert m_cx_wsl is not None
+            self.assertEqual((m_cx_wsl.session_id, m_cx_wsl.cwd), ("tid-wsl-ok", os.path.realpath(repo_a)))
+            self.assertIsNone(resolve_codex_desktop_session_by_title("Codex WSL Bad Distro", home=home, wsl=True, env=env_ubuntu))
+
+            # Tight-dash Windows Codex title stripping ("Fix Parser-Codex", "Fix Parser—Codex", "Fix Parser–Codex", "Fix Parser-ChatGPT")
+            for tight_title in ("Fix Parser-Codex", "Fix Parser\u2014Codex", "Fix Parser\u2013Codex", "Fix Parser-ChatGPT"):
+                self.assertTrue(is_codex_desktop_window(ForegroundWindow(1, "Codex.exe", tight_title)))
+                m_td = resolve_codex_desktop_session_by_title(tight_title, home=home, wsl=False, env=env_unset)
+                assert m_td is not None, f"failed to strip tight-dash title {tight_title!r}"
+                self.assertEqual(m_td.session_id, "tid-tight-dash")
+
+            # IDE parser must NOT strip hyphenated folder names like "claude-code"
+            self.assertEqual(
+                parse_ide_window_title(ForegroundWindow(2, "Code.exe", "app.py — claude-code — Visual Studio Code")),
+                IdeTitleInfo(root_name="claude-code"),
+            )
 
 
 if __name__ == "__main__":

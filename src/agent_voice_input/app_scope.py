@@ -520,7 +520,12 @@ def _strip_dirty_prefix(title: str) -> str:
     return s
 
 
-def _strip_trailing_app_suffix(title: str, suffixes: tuple[str, ...]) -> str:
+def _strip_trailing_app_suffix(
+    title: str,
+    suffixes: tuple[str, ...],
+    *,
+    allow_tight_dash: bool = False,
+) -> str:
     s = title.strip()
     low = s.lower()
     for admin_tag in (" [administrator]", " (admin)"):
@@ -532,6 +537,9 @@ def _strip_trailing_app_suffix(title: str, suffixes: tuple[str, ...]) -> str:
             tail = sep + app
             if low.endswith(tail):
                 return s[: -len(tail)].strip()
+        if allow_tight_dash and _matches_desktop_app_suffix(low, app) and low != app:
+            prefix = s[: -len(app)].rstrip()
+            return prefix[:-1].strip()
     return s
 
 
