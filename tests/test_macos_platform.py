@@ -5172,9 +5172,16 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 plat_flush._ensure_event_worker()
                 orig_flush = plat_flush._flush_shim_events
 
-                def spy_flush(timeout_sec: float = 0.05, _orig=orig_flush, _rec=flush_returns) -> bool:
+                def spy_flush(
+                    timeout_sec: float = 0.05,
+                    _orig=orig_flush,
+                    _rec=flush_returns,
+                    _blk=blocker,
+                ) -> bool:
                     ok = _orig(timeout_sec=timeout_sec)
                     _rec.append(ok)
+                    if not ok:
+                        _blk.set()
                     return ok
 
                 plat_flush._flush_shim_events = spy_flush  # type: ignore[method-assign]
@@ -5206,8 +5213,6 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     plat_flush._event_q.put({"event": "slow_prev"})
                     plat_flush._event_q.put({"event": "hold_cancel"})
                     self.assertTrue(blocker_entered.wait(timeout=1.0))
-                    release_timer = threading.Timer(0.14, blocker.set)
-                    release_timer.start()
                     try:
                         with (
                             mock.patch("agent_voice_input.platform_macos.shutil.which", return_value="/usr/bin/mock"),
@@ -5220,7 +5225,6 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                                 is_cancelled=lambda: cancelled[0],
                             )
                     finally:
-                        release_timer.cancel()
                         blocker.set()
                     self.assertFalse(out_cancel.pasted)
                     self.assertFalse(out_cancel.clipboard)
