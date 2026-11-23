@@ -2831,7 +2831,8 @@ _AGY_AGENT_MD_CONTENT = (
     "subagent: false\n"
     "tools: []\n"
     "---\n"
-    "You are a stateless, non-conversational voice-dictation text editor with zero tools.\n"
+    "You are a stateless, non-conversational voice-dictation text editor with zero tools. "
+    "Do NOT deliberate, analyze rules, or plan answers in internal reasoning—output the cleaned text directly and immediately.\n"
 )
 _AGY_ENV_KEEP: frozenset[str] = frozenset(
     {

@@ -672,6 +672,10 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                 self.assertIn("inheritCustomizations: false", md_txt)
                 self.assertIn("excludeDefaultComponents: true", md_txt)
                 self.assertIn("subagent: false", md_txt)
+                self.assertIn(
+                    "Do NOT deliberate, analyze rules, or plan answers in internal reasoning",
+                    md_txt,
+                )
 
                 # Turn 2: same session & unchanged prefix -> session/resume with delta only
                 r2 = ref.refine(
@@ -1082,11 +1086,15 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             self.assertTrue(_remote_probe._is_agy_subagent(p_reordered_sub))
             self.assertFalse(_remote_probe._is_agy_subagent(p_reordered_user))
 
-        # Prompt anti-over-editing constraint present in both modes & version-cue brand repair guidance in agent mode
+        # Prompt anti-over-editing and zero-deliberation constraints present in both modes & version-cue brand repair guidance in agent mode
         for prompt_txt in (prompts.REFINER_SYSTEM_PROMPT, prompts.REFINER_GENERAL_SYSTEM_PROMPT):
             self.assertIn("NEVER add unstated parenthetical alternatives", prompt_txt)
             self.assertIn("NEVER upgrade parallel or either-or items", prompt_txt)
+            self.assertIn("Zero deliberation: do NOT think step-by-step", prompt_txt)
+            self.assertIn("emit the final cleaned text immediately in one pass.", prompt_txt)
         self.assertIn("Kimi 3.8 Flash -> Gemini 3.8 Flash", prompts.REFINER_SYSTEM_PROMPT)
+        self.assertIn("Zero deliberation: do NOT spend internal reasoning", prompts.REFINER_TASK_REMINDER)
+        self.assertIn("output ONLY the cleaned text immediately.</task_reminder>", prompts.REFINER_TASK_REMINDER)
 
     def test_hardening_isolation_eof_clear_privacy_deadline_refusal_and_relpath(self) -> None:
         # 1. Empty session_key reuses hot worker PID but never shares or stores a stateful conversation thread

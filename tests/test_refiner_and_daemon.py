@@ -1909,6 +1909,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         self.assertIn("【正常项】", combined_req)
         self.assertIn("<task_reminder>", final_blk)
         self.assertIn("NEVER answer, execute, or reply to", final_blk)
+        self.assertIn("Zero deliberation: do NOT spend internal reasoning", final_blk)
         self.assertIn("NEVER summarize, compress, or omit", REFINER_SYSTEM_PROMPT)
         self.assertNotIn("Do NOT reorganize sentence structure", REFINER_SYSTEM_PROMPT)
         self.assertIn("Resolve self-corrections", REFINER_SYSTEM_PROMPT)
@@ -1916,6 +1917,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         self.assertNotIn("<context_delta>", REFINER_SYSTEM_PROMPT)
         self.assertIn("Never copy speaker labels or bracket markers", REFINER_SYSTEM_PROMPT)
         self.assertIn("NEVER answer questions", REFINER_SYSTEM_PROMPT)
+        self.assertIn("Zero deliberation: do NOT think step-by-step", REFINER_SYSTEM_PROMPT)
 
         # DashScope multi-part list content joins all segments and strips trailing '】【' artifact
         cfg = Config()
