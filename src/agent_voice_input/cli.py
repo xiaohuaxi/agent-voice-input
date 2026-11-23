@@ -24,7 +24,7 @@ key = "RControl"
 trigger_mode = "tap_toggle"
 
 [asr]
-# "auto" selects the first configured API key: dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow
+# "auto" selects the first configured API key: dashscope -> doubao -> openrouter -> gemini -> openai -> deepseek -> groq -> siliconflow
 provider = "auto"
 
 [refiner]
@@ -38,13 +38,16 @@ _INIT_ENV_TEMPLATE = """\
 # (local loopback openai-compatible ASR endpoints need no API key):
 
 # === Stage 1: Speech Recognition (REQUIRED for cloud ASR — uncomment at least one; local loopback openai-compatible ASR needs no key) ===
-# (DashScope, OpenAI, Groq, OpenRouter, Gemini, and SiliconFlow can also handle Stage 2 refinement)
+# (DashScope, OpenAI, DeepSeek, Groq, OpenRouter, Gemini, and SiliconFlow can also handle Stage 2 refinement)
 
 # Alibaba Cloud Bailian / DashScope (Stage 1 qwen3-asr-flash + Stage 2 qwen3.8-flash, or single-hop qwen3.8-omni-flash)
 # DASHSCOPE_API_KEY="sk-..."
 
-# OpenAI (Stage 1 gpt-transcribe + Stage 2 gpt-6-luna)
+# OpenAI (Stage 1 gpt-transcribe or single-hop gpt-audio-1.5/gpt-audio-mini + Stage 2 gpt-6-luna)
 # OPENAI_API_KEY="sk-..."
+
+# DeepSeek official API (single key for Stage 1 deepseek-asr + Stage 2 deepseek-flash)
+# DEEPSEEK_API_KEY="sk-..."
 
 # Groq Cloud (fast Stage 1 whisper-large-v3-turbo + Stage 2 llama-3.3-70b-versatile)
 # GROQ_API_KEY="gsk_..."
@@ -69,9 +72,6 @@ _INIT_ENV_TEMPLATE = """\
 # Local Codex CLI login (`codex login`, auto-detected) or Antigravity CLI (`refiner.provider = "agy"`)
 # can also reuse your existing CLI login for Stage 2 refinement when paired with Stage 1 ASR
 # (billing depends on your CLI auth mode, e.g., subscription login vs. API key).
-
-# DeepSeek official API (fast Stage 2 refiner: deepseek-flash)
-# DEEPSEEK_API_KEY="sk-..."
 
 # Volcengine Ark (Stage 2 Refiner: doubao-seed-2-0-mini-260428)
 # ARK_API_KEY="..."
@@ -142,7 +142,7 @@ def _add_common_flags(p: argparse.ArgumentParser, *, is_sub: bool = False) -> No
         "--asr",
         "--asr-provider",
         dest="asr",
-        help="Override Stage 1 ASR provider (auto|dashscope|doubao|openrouter|gemini|openai|groq|siliconflow|openai-compatible)",
+        help="Override Stage 1 ASR provider (auto|dashscope|doubao|openrouter|gemini|openai|deepseek|groq|siliconflow|openai-compatible)",
         **kw,
     )
     p.add_argument("--asr-model", dest="asr_model", help="Override Stage 1 ASR model", **kw)
@@ -365,7 +365,7 @@ def _cmd_init(
     print(
         "\nNext steps:\n"
         f"  1. For cloud ASR, add at least one Stage 1 speech recognition API key in {env_path}\n"
-        "     (e.g. DASHSCOPE_API_KEY / OPENAI_API_KEY / GROQ_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY;\n"
+        "     (e.g. DASHSCOPE_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY / GROQ_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY;\n"
         "      local loopback openai-compatible ASR endpoints need no key)\n"
         f"  2. Verify setup:  agent-voice-input doctor{cfg_flag} --ping\n"
         f"  3. Start daemon:  agent-voice-input start{cfg_flag}"
@@ -385,9 +385,15 @@ def _build_ping_http_spec(
         OPENROUTER_DEFAULT_BASE_URL,
         _host_matches_domain,
         is_gemini_native_url,
+        resolve_deepseek_endpoint_url,
     )
 
     prov = provider.strip().lower()
+    if prov == "deepseek":
+        return (
+            resolve_deepseek_endpoint_url(base_url, "/models"),
+            ({"Authorization": f"Bearer {key}"} if key else {}),
+        )
     b = base_url.strip().rstrip("/")
     for sfx in ("/chat/completions", "/audio/transcriptions", "/responses"):
         if b.endswith(sfx):
@@ -1037,7 +1043,7 @@ def _doctor_check_asr(st: _DoctorState) -> None:
     if not st.asr_ready:
         st.ok_all = False
         st.emit_fix(
-            "run 'agent-voice-input init' then set DASHSCOPE_API_KEY (or DOUBAO_SPEECH_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY) "
+            "run 'agent-voice-input init' then set DASHSCOPE_API_KEY (or DOUBAO_SPEECH_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY) "
             "in ~/.config/agent-voice-input/agent-voice-input.env"
         )
 

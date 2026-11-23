@@ -334,6 +334,11 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
             (ForegroundWindow(15, "chrome.exe", "GitHub"), "general_gui"),
             (ForegroundWindow(16, "Safari", "Docs", bundle_id="com.apple.Safari"), "general_gui"),
             (ForegroundWindow(17, "ChatGPT", "New chat", bundle_id="com.openai.chat"), "general_gui"),
+            (ForegroundWindow(171, "ChatGPT", "New chat", bundle_id="com.openai.codex"), "general_gui"),
+            (ForegroundWindow(172, "Codex", "Codex", bundle_id="com.openai.codex"), "general_gui"),
+            (ForegroundWindow(173, "Codex.exe", "Refactor - Codex"), "general_gui"),
+            (ForegroundWindow(174, "WindowsTerminal.exe", "[codex:550e8400-e29b-41d4-a716-446655440000]"), "terminal"),
+            (ForegroundWindow(175, "Ghostty", "codex [#abcd1234]", bundle_id=GHOSTTY_BUNDLE_ID), "terminal"),
             (ForegroundWindow(18, "Claude", "Chat", bundle_id="com.anthropic.claudefordesktop"), "general_gui"),
             (ForegroundWindow(19, "WeChat", "微信", bundle_id="com.tencent.xinWeChat"), "general_gui"),
         ]

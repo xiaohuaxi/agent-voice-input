@@ -500,7 +500,7 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
             sel = explain_pipeline_selection(cfg_auto, env=env_multi)
             self.assertEqual(sel["asr"]["provider"], "dashscope")
             self.assertTrue(sel["asr"]["ready"])
-            self.assertEqual(sel["asr"]["alternatives"], ["doubao", "openrouter"])
+            self.assertEqual(sel["asr"]["alternatives"], ["doubao", "openrouter", "deepseek"])
             # Codex subscription MUST win over paid DEEPSEEK/OPENROUTER/DASHSCOPE keys
             self.assertEqual(detect_codex_local_auth_mode(env_multi), "chatgpt")
             self.assertEqual(sel["refiner"]["provider"], "codex")

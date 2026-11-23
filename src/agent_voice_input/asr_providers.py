@@ -5,6 +5,7 @@ Implements verified contracts for:
   and native ``multimodal-generation`` for ``qwen-audio-*`` / ``fun-asr-*`` / ``paraformer*``)
 - ``doubao``: Volcengine BigModel ``recognize/flash`` + inline-Base64 ``submit``/``query``
   with process-local slot auto-fallback cache and dual/single-header auth
+- ``deepseek``: official DeepSeek ``/v1/tools/asr`` dedicated STT multipart upload
 - ``gemini``: native ``:generateContent`` single-hop audio + session context refinement
 - ``openrouter`` / ``openai`` / ``groq`` / ``siliconflow`` / ``openai-compatible``:
   dual-protocol routing across dedicated STT (``/audio/transcriptions``) and multimodal
@@ -15,6 +16,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field, replace
 import hashlib
+import io
 import json
 import os
 import random
@@ -24,6 +26,7 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 import urllib.parse
 import uuid
+import wave
 
 from .audio_proc import (
     SINGLE_HOP_MP3_MIN_WAV_BYTES,
@@ -48,6 +51,7 @@ from .config import (
     redact_secrets,
     resolve_asr_api,
     resolve_credentials,
+    resolve_deepseek_endpoint_url,
     select_asr_provider,
 )
 from .hotwords import (
@@ -374,6 +378,7 @@ def _compose_stt_prompt_text(ctx: AsrContext, max_chars: int = 2000) -> str:
 class BaseAsrProvider:
     provider_name: str = "base"
     single_hop: bool = False
+    max_chunk_sec: float | None = None
 
     def __init__(
         self,
@@ -2064,6 +2069,224 @@ OpenAICompatAsrProvider = AudioTranscriptionsAsrProvider
 
 
 # ---------------------------------------------------------------------------
+# 4b. DeepSeek Dedicated STT Provider (/v1/tools/asr)
+# ---------------------------------------------------------------------------
+
+DEEPSEEK_ASR_MAX_WAV_BYTES = 8 * 1024 * 1024
+DEEPSEEK_ASR_MAX_DURATION_SEC = 120.0
+DEEPSEEK_ASR_MAX_CHUNK_SEC = 115.0
+
+
+def _resolve_deepseek_asr_url(base_url: str) -> str:
+    return resolve_deepseek_endpoint_url(base_url, "/tools/asr")
+
+
+def _try_read_wav_duration_sec(wav_bytes: bytes) -> float | None:
+    """Safely parse RIFF/WAVE header duration; return None for non-WAV or malformed inputs."""
+    if len(wav_bytes) < 44 or wav_bytes[:4] != b"RIFF" or wav_bytes[8:12] != b"WAVE":
+        return None
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            rate = wf.getframerate()
+            nframes = wf.getnframes()
+            if rate <= 0 or nframes < 0:
+                return None
+            return float(nframes) / float(rate)
+    except (wave.Error, EOFError, OSError):
+        return None
+
+
+class DeepSeekAsrProvider(_BearerProviderMixin):
+    provider_name = "deepseek"
+    single_hop = False
+    max_chunk_sec = DEEPSEEK_ASR_MAX_CHUNK_SEC
+
+    def transcribe(
+        self,
+        wav_bytes: bytes,
+        context: AsrContext | Mapping[str, Any] | None = None,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
+    ) -> AsrResult:
+        del context  # DeepSeek /tools/asr only accepts the 'file' audio field (no prompt/hotwords/model).
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
+        model = self.cfg.asr.effective_model("deepseek")
+        if not wav_bytes:
+            return AsrResult(
+                text="",
+                provider=self.provider_name,
+                model=model,
+                latency_ms=0,
+                is_single_hop_refined=False,
+            )
+        if len(wav_bytes) > DEEPSEEK_ASR_MAX_WAV_BYTES:
+            size_mib = len(wav_bytes) / (1024 * 1024)
+            raise self._fail(
+                f"DeepSeek ASR audio payload exceeds 8 MiB limit ({size_mib:.2f} MiB > 8.00 MiB)",
+                retry_kind="never",
+            )
+        wav_dur_sec = _try_read_wav_duration_sec(wav_bytes)
+        if wav_dur_sec is not None and wav_dur_sec > DEEPSEEK_ASR_MAX_DURATION_SEC:
+            raise self._fail(
+                f"DeepSeek ASR audio duration exceeds 120s limit ({wav_dur_sec:.1f}s > 120.0s)",
+                retry_kind="never",
+            )
+
+        url = _resolve_deepseek_asr_url(self.cfg.asr.effective_base_url("deepseek"))
+        api_key = self._resolve_bearer_key(url)
+        assert api_key  # built-in deepseek always requires an API key
+        secrets: tuple[str, ...] = (api_key,)
+        pacer_key = make_rate_pacer_key(self.provider_name, url, api_key)
+
+        content_type, body = _encode_multipart_formdata(
+            (),
+            ("file", "audio.wav", "audio/wav", wav_bytes),
+        )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": content_type,
+        }
+
+        eff_timeout = float(self.cfg.asr.timeout_sec)
+        t0 = self.clock_fn()
+        deadline = t0 + eff_timeout
+        meta_box: list[tuple[str, int | None]] = [("", None)]
+
+        def _attempt(rem: float) -> str:
+            resp = self._send(
+                HttpRequest(
+                    url=url,
+                    method="POST",
+                    headers=headers,
+                    body=body,
+                    timeout_sec=rem,
+                    cancel_token=cancel_token,
+                ),
+                extra_secrets=secrets,
+                deadline=deadline,
+                pacer_key=pacer_key,
+                is_cancelled=eff_cancelled,
+                cancel_token=cancel_token,
+            )
+
+            if resp.status != 200:
+                try:
+                    err_data = resp.json()
+                    non_json = False
+                except ValueError:
+                    err_data = {}
+                    non_json = True
+                compat_err = extract_openai_compat_error(err_data) if err_data else None
+                raw_err_msg = (
+                    compat_err[1]
+                    if compat_err is not None
+                    else str(err_data.get("message") or resp.text())
+                )
+                excerpt = self._safe_excerpt(raw_err_msg, secrets)
+                status_note = (
+                    f"HTTP {resp.status} (payload too large; limit <= 8 MiB / 120s)"
+                    if resp.status == 413
+                    else f"HTTP {resp.status}"
+                )
+                raise self._fail_http(
+                    f"deepseek tools/asr {status_note}: {excerpt}",
+                    resp,
+                    err_data,
+                    extra_secrets=secrets,
+                    non_json=non_json,
+                )
+
+            try:
+                raw_json = json.loads(resp.text())
+            except ValueError:
+                raise self._fail_http(
+                    f"deepseek tools/asr returned non-JSON response (HTTP {resp.status}, {len(resp.body)} bytes)",
+                    resp,
+                    extra_secrets=secrets,
+                    non_json=True,
+                ) from None
+
+            if not isinstance(raw_json, dict):
+                raise self._fail(
+                    f"deepseek tools/asr returned non-object JSON (HTTP {resp.status}, got {type(raw_json).__name__})",
+                    extra_secrets=secrets,
+                    retry_kind="never",
+                )
+            data: dict[str, Any] = raw_json
+
+            if data.get("error"):
+                raw_err = data.get("error")
+                if isinstance(raw_err, Mapping):
+                    msg = raw_err.get("message")
+                    if isinstance(msg, str) and msg.strip():
+                        err_msg = msg
+                    elif msg is not None and not isinstance(msg, str):
+                        err_msg = f"malformed error.message ({type(msg).__name__})"
+                    else:
+                        err_msg = next(
+                            (
+                                v
+                                for v in (raw_err.get("code"), raw_err.get("type"))
+                                if isinstance(v, str) and v.strip()
+                            ),
+                            "upstream error",
+                        )
+                elif isinstance(raw_err, str) and raw_err.strip():
+                    err_msg = raw_err
+                else:
+                    err_msg = f"malformed error ({type(raw_err).__name__})"
+                excerpt = self._safe_excerpt(err_msg, secrets)
+                raise self._fail_http(
+                    f"deepseek tools/asr error: {excerpt}",
+                    resp,
+                    data,
+                    extra_secrets=secrets,
+                )
+
+            if "text" not in data or not isinstance(data["text"], str):
+                raw_type = type(data.get("text")).__name__ if "text" in data else "missing"
+                raise self._fail(
+                    f"deepseek tools/asr returned invalid response ('text' is {raw_type}, expected str)",
+                    extra_secrets=secrets,
+                    retry_kind="never",
+                )
+            raw_text = data["text"]
+            raw_req_id = data.get("request_id")
+            req_id = (
+                self._safe_excerpt(raw_req_id.strip(), secrets, limit=128)
+                if isinstance(raw_req_id, str) and raw_req_id.strip()
+                else ""
+            )
+            dur_ms = _opt_int(data.get("duration_ms"))
+            if dur_ms is not None and dur_ms < 0:
+                dur_ms = None
+            meta_box[0] = (req_id, dur_ms)
+            return raw_text
+
+        raw_out, retries_used, cancelled = self._execute_with_retry(
+            deadline=deadline,
+            pacer_key=pacer_key,
+            is_cancelled=eff_cancelled,
+            attempt_fn=_attempt,
+            cancel_token=cancel_token,
+        )
+        latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
+        text = "" if cancelled else strip_lenticular_artifacts(raw_out).strip()
+        req_id, dur_ms = meta_box[0] if not cancelled else ("", None)
+        return AsrResult(
+            text=text,
+            provider=self.provider_name,
+            model=model,
+            latency_ms=latency_ms,
+            is_single_hop_refined=False,
+            retries=retries_used,
+            request_id=req_id,
+            duration_ms=dur_ms,
+        )
+
+
+# ---------------------------------------------------------------------------
 # 5. Multimodal Single-Hop Chat Audio Provider (/chat/completions)
 # ---------------------------------------------------------------------------
 
@@ -2332,6 +2555,8 @@ def create_asr_provider(
         return DashScopeAsrProvider(cfg, eff_creds, **kwargs)
     if provider_name == "doubao":
         return DoubaoAsrProvider(cfg, eff_creds, **kwargs)
+    if provider_name == "deepseek":
+        return DeepSeekAsrProvider(cfg, eff_creds, **kwargs)
     if provider_name == "gemini" and is_gemini_native_url(cfg.asr.base_url):
         return GeminiAudioProvider(cfg, eff_creds, **kwargs)
     if resolved_api == "chat-completions":

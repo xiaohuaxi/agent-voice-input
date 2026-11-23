@@ -34,6 +34,8 @@ class AsrResult:
     context_chunks: int = 0
     audio_tokens: int | None = None
     missed_chunks: int = 0
+    request_id: str = ""
+    duration_ms: int | None = None
 
 
 @dataclass

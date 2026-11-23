@@ -59,23 +59,24 @@ beep = false
 
 [asr]
 # Stage 1 speech-to-text provider:
-# "auto" | "dashscope" | "doubao" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible"
+# "auto" | "dashscope" | "doubao" | "openrouter" | "gemini" | "openai" | "deepseek" | "groq" | "siliconflow" | "openai-compatible"
 # Cross-stage aliases accepted: "volcengine"/"volc" -> "doubao", "bailian" -> "dashscope"
 # When "auto", selects the first configured credential in priority order:
-#   dashscope -> doubao -> openrouter -> gemini -> openai -> groq -> siliconflow
+#   dashscope -> doubao -> openrouter -> gemini -> openai -> deepseek -> groq -> siliconflow
 provider = "auto"
 # Upstream model ID (kept verbatim; leave empty "" to use the provider's built-in default):
 # - dashscope         -> "qwen3-asr-flash" (dedicated STT; also supports "fun-asr-realtime", "qwen-audio-turbo-latest", or single-hop "qwen3.8-omni-flash")
 # - doubao            -> "bigmodel"
 # - openrouter        -> "qwen/qwen3-asr-1.7b" (dedicated STT) or e.g. "google/gemini-3.5-flash-lite" / "qwen/qwen3.8-omni-flash" / "openai/gpt-audio-mini" (single-hop chat audio)
 # - gemini            -> "gemini-3.7-flash" (native :generateContent single-hop audio + context refinement; skips Stage 2 by default)
-# - openai            -> "gpt-transcribe"
+# - openai            -> "gpt-transcribe" (dedicated STT) or e.g. "gpt-audio-1.5" / "gpt-audio-mini" (single-hop chat audio)
+# - deepseek          -> "deepseek-asr" (official /v1/tools/asr dedicated STT; <=8 MiB / <=120s per chunk; pairs with Stage 2 deepseek-flash)
 # - groq              -> "whisper-large-v3-turbo"
 # - siliconflow       -> "FunAudioLLM/SenseVoiceSmall"
 # - openai-compatible -> "gpt-4o-mini-transcribe" (requires explicit base_url, e.g. local faster-whisper-server)
 model = ""
-# Wire protocol for DashScope / OpenRouter / OpenAI-compatible channels:
-# "auto" | "audio-transcriptions" (dedicated STT -> Stage 2) | "chat-completions" (multimodal single-hop audio + 50K cached session context; skips Stage 2 by default)
+# Wire protocol for DashScope / OpenRouter / OpenAI / OpenAI-compatible channels (doubao / gemini / deepseek use fixed native endpoints; keep "auto"):
+# "auto" | "audio-transcriptions" (dedicated STT -> Stage 2) | "chat-completions" (multimodal single-hop audio + 50K cached session context, e.g. OpenAI gpt-audio-1.5 / gpt-audio-mini; skips Stage 2 by default)
 # Note: in coding-agent mode, single-hop audio models send up to refiner.context_max_chars of recent session dialogue to the selected ASR provider.
 # "auto" classifies known STT vs multimodal audio models automatically; for uncataloged models on "openrouter", set api explicitly.
 api = "auto"

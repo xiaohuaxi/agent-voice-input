@@ -40,6 +40,7 @@ VALID_ASR_PROVIDERS = frozenset(
         "openrouter",
         "gemini",
         "openai",
+        "deepseek",
         "groq",
         "siliconflow",
         "openai-compatible",
@@ -93,6 +94,7 @@ ASR_AUTO_PRIORITY: tuple[str, ...] = (
     "openrouter",
     "gemini",
     "openai",
+    "deepseek",
     "groq",
     "siliconflow",
 )
@@ -114,6 +116,7 @@ DEFAULT_ASR_MODELS: dict[str, str] = {
     "openrouter": "qwen/qwen3-asr-1.7b",
     "gemini": "gemini-3.7-flash",
     "openai": "gpt-transcribe",
+    "deepseek": "deepseek-asr",
     "groq": "whisper-large-v3-turbo",
     "siliconflow": "FunAudioLLM/SenseVoiceSmall",
     "openai-compatible": "gpt-4o-mini-transcribe",
@@ -143,6 +146,7 @@ DEFAULT_ASR_BASE_URLS: dict[str, str] = {
     "openrouter": "https://openrouter.ai/api/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
     "openai": "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
     "groq": "https://api.groq.com/openai/v1",
     "siliconflow": "https://api.siliconflow.cn/v1",
 }
@@ -159,6 +163,7 @@ DEFAULT_REFINER_BASE_URLS: dict[str, str] = {
 }
 
 OPENAI_DEFAULT_BASE_URL: str = DEFAULT_ASR_BASE_URLS["openai"]
+DEEPSEEK_DEFAULT_BASE_URL: str = DEFAULT_ASR_BASE_URLS["deepseek"]
 GEMINI_DEFAULT_BASE_URL: str = DEFAULT_ASR_BASE_URLS["gemini"]
 DOUBAO_DEFAULT_BASE_URL: str = DEFAULT_ASR_BASE_URLS["doubao"]
 OPENROUTER_DEFAULT_BASE_URL: str = DEFAULT_ASR_BASE_URLS["openrouter"]
@@ -2029,6 +2034,21 @@ def is_gemini_native_url(base_url: str) -> bool:
     return False
 
 
+def resolve_deepseek_endpoint_url(base_url: str, endpoint: str) -> str:
+    """Resolve DeepSeek ``endpoint`` (e.g. ``/tools/asr`` or ``/models``) preserving proxy path and query."""
+    raw = (base_url or "").strip() or DEEPSEEK_DEFAULT_BASE_URL
+    ep = "/" + endpoint.strip().lstrip("/")
+    parts = urllib.parse.urlsplit(raw)
+    path = (parts.path or "").rstrip("/")
+    for sfx in ("/tools/asr", "/chat/completions", "/responses", "/models"):
+        if path.endswith(sfx):
+            path = path[: -len(sfx)]
+            break
+    if not path and _host_matches_domain(raw, "deepseek.com"):
+        path = "/v1"
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, f"{path}{ep}", parts.query, ""))
+
+
 def is_dashscope_native_multimodal_model(model: str, base_url: str = "") -> bool:
     """Return True when DashScope model/URL uses the native multimodal-generation route."""
     b = base_url.strip().lower().rstrip("/")
@@ -2134,6 +2154,14 @@ def resolve_asr_api(
                 "(uses native Doubao ASR protocol; keep asr.api='auto')"
             )
         return "doubao-native"
+
+    if prov == "deepseek":
+        if req_api != "auto":
+            raise ConfigError(
+                f"asr.api={req_api!r} is incompatible with provider 'deepseek' "
+                "(uses native DeepSeek /tools/asr protocol; keep asr.api='auto')"
+            )
+        return "deepseek-native"
 
     if prov == "gemini" and is_gemini_native_url(base_url):
         if req_api != "auto":
@@ -2431,6 +2459,7 @@ def _validate_asr_config(cfg: Config, *, env: Mapping[str, str] | None = None) -
                     "openrouter",
                     "gemini",
                     "openai",
+                    "deepseek",
                     "groq",
                     "siliconflow",
                 )
@@ -3014,6 +3043,8 @@ def _infer_provider_from_explicit_asr_hints(asr_cfg: AsrConfig) -> str | None:
             return "gemini"
         if _host_matches_domain(url, "openai.com"):
             return "openai"
+        if _host_matches_domain(url, "deepseek.com"):
+            return "deepseek"
         if _host_matches_domain(url, "groq.com"):
             return "groq"
         if _host_matches_domain(url, "siliconflow.cn"):

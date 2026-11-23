@@ -312,7 +312,7 @@ def resolve_windows_paste_chord(process: str) -> str:
 
 
 AI_CHAT_PATTERNS: tuple[str, ...] = (
-    "com.openai.chat", "chatgpt", "com.anthropic.claudefordesktop",
+    "com.openai.chat", "com.openai.codex", "chatgpt", "com.anthropic.claudefordesktop",
     "ai.perplexity.mac", "perplexity",
     "cherry studio", "cherry-studio", "cherrystudio",
     "chatbox", "xyz.chatboxapp.app",
@@ -361,22 +361,80 @@ _JETBRAINS_SUFFIXES: tuple[str, ...] = (
 )
 
 
-def _is_windows_claude_desktop_title(title: str) -> bool:
+_DESKTOP_AI_COLLIDING_PROCS: dict[str, tuple[str, ...]] = {
+    "claude": ("claude",),
+    "codex": ("codex", "chatgpt"),
+}
+_DESKTOP_TITLE_DASHES: tuple[str, ...] = ("-", "\u2013", "\u2014")
+_HEX_CHARS: frozenset[str] = frozenset("0123456789abcdef")
+
+
+def _is_hex_session_token(tok: str, *, min_len: int) -> bool:
+    if len(tok) < min_len or len(tok) > 36:
+        return False
+    hex_n = 0
+    for ch in tok:
+        if ch in _HEX_CHARS:
+            hex_n += 1
+        elif ch != "-":
+            return False
+    return hex_n >= min_len
+
+
+def _has_cli_session_tag(t_low: str) -> bool:
+    """Detect real CLI session tokens like ``[#abcd1234]``, ``[§abcdef]``, ``[claude:<hex>]``, ``[codex:<hex>]``, ``[agy:<hex>]``."""
+    pos = 0
+    n = len(t_low)
+    while pos < n:
+        lb = t_low.find("[", pos)
+        if lb < 0:
+            return False
+        rb = t_low.find("]", lb + 1)
+        if rb < 0:
+            return False
+        body = t_low[lb + 1 : rb]
+        if body.startswith(("#", "\u00a7")) and _is_hex_session_token(body[1:], min_len=6):
+            return True
+        for pfx in ("claude:", "codex:", "agy:"):
+            if body.startswith(pfx):
+                rest = body[len(pfx) :]
+                if rest.startswith("#"):
+                    rest = rest[1:]
+                if _is_hex_session_token(rest, min_len=6):
+                    return True
+        pos = lb + 1
+    return False
+
+
+def _matches_desktop_app_suffix(t_low: str, name: str) -> bool:
+    if t_low == name:
+        return True
+    if not t_low.endswith(name):
+        return False
+    prefix = t_low[: -len(name)].rstrip()
+    if not prefix or not prefix.endswith(_DESKTOP_TITLE_DASHES):
+        return False
+    return bool(prefix[:-1].rstrip())
+
+
+def _is_desktop_ai_app_title(title: str, app_names: tuple[str, ...]) -> bool:
     t = (title or "").strip()
-    if not t or any(ch == "\u2733" or "\u2800" <= ch <= "\u28ff" for ch in t):
+    if not t or t[0] == "\u2733" or "\u2800" <= t[0] <= "\u28ff":
         return False
     t_low = t.lower()
-    if any(tag in t_low for tag in ("[#", "[claude:", "[codex:", "[agy:")):
+    if _has_cli_session_tag(t_low):
         return False
-    return t_low == "claude" or t_low.endswith((" - claude", " — claude", " – claude"))
+    return any(_matches_desktop_app_suffix(t_low, name) for name in app_names)
 
 
 def classify_target_app_hint(win: WindowLike) -> str:
     """Return ``'ai_chat' | 'im_chat' | ''`` for a ``general_gui`` foreground window (regex-free)."""
     if match_app_patterns(win, AI_CHAT_PATTERNS):
         return "ai_chat"
-    if normalize_app_token(win.process) == "claude" and not (win.bundle_id or "").strip():
-        return "ai_chat" if _is_windows_claude_desktop_title(win.title) else ""
+    if not (win.bundle_id or "").strip():
+        app_names = _DESKTOP_AI_COLLIDING_PROCS.get(normalize_app_token(win.process))
+        if app_names is not None:
+            return "ai_chat" if _is_desktop_ai_app_title(win.title, app_names) else ""
     return "im_chat" if match_app_patterns(win, IM_CHAT_PATTERNS) else ""
 
 

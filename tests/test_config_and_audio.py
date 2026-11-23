@@ -723,7 +723,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         cfg = Config()
         self.assertEqual(
             ASR_AUTO_PRIORITY,
-            ("dashscope", "doubao", "openrouter", "gemini", "openai", "groq", "siliconflow"),
+            ("dashscope", "doubao", "openrouter", "gemini", "openai", "deepseek", "groq", "siliconflow"),
         )
         # Full ordered priority chain check (canonical DOUBAO_SPEECH_API_KEY)
         full_env = {
@@ -732,6 +732,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             "OPENROUTER_API_KEY": "k_or",
             "GEMINI_API_KEY": "k_gem",
             "OPENAI_API_KEY": "k_oai",
+            "DEEPSEEK_API_KEY": "k_ds",
             "GROQ_API_KEY": "k_groq",
             "SILICONFLOW_API_KEY": "k_sf",
         }
@@ -741,6 +742,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             ("OPENROUTER_API_KEY", "openrouter"),
             ("GEMINI_API_KEY", "gemini"),
             ("OPENAI_API_KEY", "openai"),
+            ("DEEPSEEK_API_KEY", "deepseek"),
             ("GROQ_API_KEY", "groq"),
             ("SILICONFLOW_API_KEY", "siliconflow"),
         ]
@@ -956,7 +958,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
     def test_v020_legacy_provider_rejection_and_stage_validation_matrix(self) -> None:
         self.assertEqual(
             VALID_ASR_PROVIDERS,
-            frozenset({"auto", "dashscope", "doubao", "openrouter", "gemini", "openai", "groq", "siliconflow", "openai-compatible"}),
+            frozenset({"auto", "dashscope", "doubao", "openrouter", "gemini", "openai", "deepseek", "groq", "siliconflow", "openai-compatible"}),
         )
         self.assertEqual(
             VALID_REFINER_PROVIDERS,
@@ -987,6 +989,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(DEFAULT_ASR_MODELS["openrouter"], "qwen/qwen3-asr-1.7b")
         self.assertEqual(DEFAULT_ASR_MODELS["gemini"], "gemini-3.7-flash")
         self.assertEqual(DEFAULT_ASR_MODELS["openai"], "gpt-transcribe")
+        self.assertEqual(DEFAULT_ASR_MODELS["deepseek"], "deepseek-asr")
         self.assertEqual(DEFAULT_ASR_MODELS["groq"], "whisper-large-v3-turbo")
         self.assertEqual(DEFAULT_ASR_MODELS["siliconflow"], "FunAudioLLM/SenseVoiceSmall")
         self.assertEqual(DEFAULT_ASR_MODELS["openai-compatible"], "gpt-4o-mini-transcribe")
@@ -1009,6 +1012,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(RefinerConfig(provider=non_codex).effort, "auto")
 
         self.assertEqual(DEFAULT_ASR_BASE_URLS["openrouter"], "https://openrouter.ai/api/v1")
+        self.assertEqual(DEFAULT_ASR_BASE_URLS["deepseek"], "https://api.deepseek.com/v1")
         self.assertEqual(DEFAULT_ASR_BASE_URLS["groq"], "https://api.groq.com/openai/v1")
         self.assertEqual(DEFAULT_ASR_BASE_URLS["siliconflow"], "https://api.siliconflow.cn/v1")
         self.assertEqual(DEFAULT_REFINER_BASE_URLS["deepseek"], "https://api.deepseek.com/v1")
@@ -1018,10 +1022,43 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             # Legacy v0.1.0 aliases and genuinely stage-incompatible providers MUST raise ConfigError
-            for bad_asr in ("ali", "qwen", "gemini-flash-audio", "codex-luna", "codex", "deepseek", "off"):
+            for bad_asr in ("ali", "qwen", "gemini-flash-audio", "codex-luna", "codex", "off"):
                 with self.subTest(bad_asr=bad_asr):
                     with self.assertRaises(ConfigError):
                         load_config(env={"HOME": str(home)}, home_dir=home, cli_overrides={"asr.provider": bad_asr})
+            # DeepSeek ASR defaults, single-hop=False, base_url auto-inference, and asr.api="auto" enforcement
+            cfg_ds_asr, _ = load_config(
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={"asr.provider": "deepseek"},
+            )
+            self.assertEqual(cfg_ds_asr.asr.effective_model("deepseek"), "deepseek-asr")
+            self.assertEqual(cfg_ds_asr.asr.effective_base_url("deepseek"), "https://api.deepseek.com/v1")
+            self.assertEqual(
+                resolve_asr_api("deepseek", "", "auto"),
+                "deepseek-native",
+            )
+            self.assertEqual(classify_asr_model_api("deepseek-asr"), "audio-transcriptions")
+            for bad_ds_api in ("audio-transcriptions", "chat-completions"):
+                with self.assertRaises(ConfigError):
+                    load_config(
+                        env={"HOME": str(home)},
+                        home_dir=home,
+                        cli_overrides={"asr.provider": "deepseek", "asr.api": bad_ds_api},
+                    )
+                with self.assertRaises(ConfigError):
+                    load_config(
+                        env={"HOME": str(home), "DEEPSEEK_API_KEY": "sk-ds-auto-validate"},
+                        home_dir=home,
+                        cli_overrides={"asr.api": bad_ds_api},
+                        load_default_env_files=False,
+                    )
+            cfg_ds_url, _ = load_config(
+                env={"HOME": str(home)},
+                home_dir=home,
+                cli_overrides={"asr.base_url": "https://api.deepseek.com/v1/tools/asr"},
+            )
+            self.assertEqual(select_asr_provider(cfg_ds_url, resolve_credentials(cfg_ds_url, {})), "deepseek")
             for bad_refiner in ("codex-luna", "ali", "qwen", "gemini-flash-audio"):
                 with self.subTest(bad_refiner=bad_refiner):
                     with self.assertRaises(ConfigError):

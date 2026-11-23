@@ -811,12 +811,27 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
         self.assertFalse(has_codex_local_auth({"CODEX_HOME": "~/.codex"}))
         self.assertFalse(has_codex_local_auth({"HOME": "/tmp/iso", "CODEX_HOME": "~root/.codex"}))
 
-        # P2-5: OpenRouter full /chat/completions base_url strips suffix before appending /key
+        # P2-5: OpenRouter full /chat/completions base_url strips suffix before appending /key;
+        # DeepSeek /tools/asr base_url strips suffix and pings /models with Bearer auth.
         or_url, or_hdr = cli_mod._build_ping_http_spec(
             "openrouter", "https://openrouter.ai/api/v1/chat/completions", "sk-or-test"
         )
         self.assertEqual(or_url, "https://openrouter.ai/api/v1/key")
         self.assertEqual(or_hdr["Authorization"], "Bearer sk-or-test")
+        ds_url_full, ds_hdr_full = cli_mod._build_ping_http_spec(
+            "deepseek", "https://api.deepseek.com/v1/tools/asr", "sk-ds-ping-test"
+        )
+        self.assertEqual(ds_url_full, "https://api.deepseek.com/v1/models")
+        self.assertEqual(ds_hdr_full["Authorization"], "Bearer sk-ds-ping-test")
+        for raw_ds_base, want_ds_ping in (
+            ("", "https://api.deepseek.com/v1/models"),
+            ("https://api.deepseek.com", "https://api.deepseek.com/v1/models"),
+            ("https://api.deepseek.com/", "https://api.deepseek.com/v1/models"),
+            ("https://proxy.example/v1/tools/asr?tenant=demo", "https://proxy.example/v1/models?tenant=demo"),
+            ("https://proxy.example/custom/v1?tenant=demo", "https://proxy.example/custom/v1/models?tenant=demo"),
+        ):
+            got_url, _ = cli_mod._build_ping_http_spec("deepseek", raw_ds_base, "sk-ds-ping-test")
+            self.assertEqual(got_url, want_ds_ping, msg=f"base_url={raw_ds_base!r}")
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1111,10 +1126,10 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 return buf.getvalue()
 
-            # Stage 2-only key (DEEPSEEK_API_KEY) leaves asr_ready==False -> explicit WARN
+            # Stage 2-only key (ARK_API_KEY) leaves asr_ready==False -> explicit WARN
             out_no_asr = _run_fresh_start(
                 Config(),
-                {**env_base, "DEEPSEEK_API_KEY": "ds_only_stage2_test_key"},
+                {**env_base, "ARK_API_KEY": "ark_only_stage2_test_key"},
             )
             self.assertIn("started (pid=42424)", out_no_asr)
             self.assertIn(
@@ -1122,6 +1137,35 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 out_no_asr,
             )
             self.assertNotIn("Ready:", out_no_asr)
+
+            # DeepSeek single key now auto-selects BOTH Stage 1 ASR (deepseek) & Stage 2 Refiner (deepseek)
+            ds_ping_urls: list[str] = []
+
+            def _ds_ping_tx(req: HttpRequest) -> HttpResponse:
+                ds_ping_urls.append(req.url)
+                return HttpResponse(status=200, headers={}, body=b'{"data":[]}')
+
+            env_ds_auto = {**env_base, "DEEPSEEK_API_KEY": "sk-ds-single-key-ready"}
+            buf_ds_doc = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_ds_doc),
+            ):
+                rc_ds = cli_mod._cmd_doctor(Config(), env_ds_auto, ping=True, as_json=True, transport=_ds_ping_tx)
+            self.assertEqual(rc_ds, 0, buf_ds_doc.getvalue())
+            ds_doc = json.loads(buf_ds_doc.getvalue())
+            self.assertEqual(ds_doc["asr"]["provider"], "deepseek")
+            self.assertEqual(ds_doc["asr"]["model"], "deepseek-asr")
+            self.assertEqual(ds_doc["asr"]["api"], "deepseek-native")
+            self.assertTrue(ds_doc["asr"]["ready"])
+            self.assertFalse(ds_doc["asr"]["single_hop"])
+            self.assertEqual(ds_doc["refiner"]["resolved_provider"], "deepseek")
+            self.assertEqual(ds_doc["ping"]["asr"]["status"], "OK")
+            self.assertEqual(ds_doc["ping"]["refiner"]["status"], "OK")
+            self.assertIn("shared endpoint", ds_doc["ping"]["refiner"]["detail"])
+            self.assertEqual(ds_ping_urls, ["https://api.deepseek.com/v1/models"])
 
             # Stage 1 key ready + default tap_toggle
             env_ready = {**env_base, "DASHSCOPE_API_KEY": "sk-dash-ready-test-key"}
@@ -1215,7 +1259,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
 
             out_warm_no_asr = _run_warming_up_start(
                 Config(),
-                {**env_base, "DEEPSEEK_API_KEY": "ds_only_stage2_test_key"},
+                {**env_base, "ARK_API_KEY": "ark_only_stage2_test_key"},
             )
             self.assertIn("started process pid=42424 (socket warming up)", out_warm_no_asr)
             self.assertIn(

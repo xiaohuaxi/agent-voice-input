@@ -498,6 +498,25 @@ class HotwordsSceneAndDaemonHotReloadTests(unittest.TestCase):
             "chat",
         )
         self.assertEqual(
+            resolve_hotwords_scope(ForegroundWindow(51, "ChatGPT", "New chat", bundle_id="com.openai.codex")),
+            "chat",
+        )
+        self.assertEqual(
+            resolve_hotwords_scope(ForegroundWindow(52, "Codex.exe", "Refactor - Codex")),
+            "chat",
+        )
+        self.assertEqual(
+            resolve_hotwords_scope(
+                ForegroundWindow(53, "WindowsTerminal.exe", "codex [#abcd1234]"),
+                is_terminal=is_term,
+            ),
+            "coding",
+        )
+        ds_quota = budget_hotwords_for_provider(["Codex", "DeepSeek"], "deepseek")
+        self.assertEqual(ds_quota.max_terms, 0)
+        self.assertEqual(ds_quota.kept_count, 0)
+        self.assertIn("DeepSeek /tools/asr", ds_quota.note)
+        self.assertEqual(
             resolve_hotwords_scope(ForegroundWindow(6, "Safari", "Docs", bundle_id="com.apple.Safari")),
             "global",
         )

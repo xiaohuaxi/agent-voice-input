@@ -4011,6 +4011,337 @@ class SessionCtxTests(unittest.TestCase):
         )
         self.assertEqual(ok_prov.transcribe(_sample_wav()).text, "完整转写结果")
 
+    def test_deepseek_asr_wire_contract_limits_retries_and_redaction(self) -> None:
+        from agent_voice_input.asr_providers import (
+            DEEPSEEK_ASR_MAX_CHUNK_SEC,
+            DEEPSEEK_ASR_MAX_WAV_BYTES,
+            DeepSeekAsrProvider,
+        )
+        from agent_voice_input.daemon import build_pipeline_summary, run_pipeline_once
+        from agent_voice_input.refiner import NoopRefiner
+
+        secret = "ds_test_aaaa1111"
+        captured: list[HttpRequest] = []
+
+        def ok_tx(req: HttpRequest) -> HttpResponse:
+            captured.append(req)
+            return HttpResponse(
+                status=200,
+                headers={"content-type": "application/json"},
+                body=json.dumps(
+                    {
+                        "request_id": "req-ds-001",
+                        "text": "  DeepSeek 语音识别测试。 ",
+                        "duration_ms": 2340,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
+
+        cfg = Config()
+        cfg.asr.provider = "deepseek"
+        cfg.asr.hotwords_file = ""
+        env = {"DEEPSEEK_API_KEY": secret, "API_KEY_DEEPSEEK": "sk-legacy-unused-1122"}
+
+        prov = create_asr_provider(cfg, env=env, transport=ok_tx)
+        self.assertIsInstance(prov, DeepSeekAsrProvider)
+        self.assertFalse(prov.single_hop)
+        self.assertEqual(prov.max_chunk_sec, DEEPSEEK_ASR_MAX_CHUNK_SEC)
+
+        wav = _sample_wav()
+        res = prov.transcribe(
+            wav,
+            context=AsrContext(hotwords=["RControl", "DeepSeek"], dialog_text="不应该出现在 multipart 中"),
+        )
+        self.assertEqual(res.text, "DeepSeek 语音识别测试。")
+        self.assertEqual(res.provider, "deepseek")
+        self.assertEqual(res.model, "deepseek-asr")
+        self.assertFalse(res.is_single_hop_refined)
+        self.assertEqual(res.request_id, "req-ds-001")
+        self.assertEqual(res.duration_ms, 2340)
+
+        # Verify exact multipart wire contract: ONLY `file` (audio.wav, audio/wav), no model/language/prompt
+        self.assertEqual(len(captured), 1)
+        req = captured[0]
+        self.assertEqual(req.method, "POST")
+        self.assertEqual(req.url, "https://api.deepseek.com/v1/tools/asr")
+        self.assertEqual(req.headers.get("Authorization"), f"Bearer {secret}")
+        ctype = req.headers.get("Content-Type", "")
+        self.assertTrue(ctype.startswith("multipart/form-data; boundary="))
+        self.assertEqual(req.body.count(b"Content-Disposition: form-data;"), 1)
+        self.assertIn(b'name="file"; filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n', req.body)
+        self.assertIn(wav, req.body)
+        for forbidden_field in (b'name="model"', b'name="language"', b'name="prompt"', b'name="response_format"', b"RControl"):
+            self.assertNotIn(forbidden_field, req.body)
+
+        # URL concatenation: bare official domain, trailing slash, already ending in /tools/asr,
+        # and custom proxy base_url preserving path prefix + query string
+        for raw_base, want_url in (
+            ("", "https://api.deepseek.com/v1/tools/asr"),
+            ("https://api.deepseek.com", "https://api.deepseek.com/v1/tools/asr"),
+            ("https://api.deepseek.com/", "https://api.deepseek.com/v1/tools/asr"),
+            ("https://api.deepseek.com/v1/", "https://api.deepseek.com/v1/tools/asr"),
+            ("https://api.deepseek.com/v1/tools/asr", "https://api.deepseek.com/v1/tools/asr"),
+            ("https://api.deepseek.com/v1/tools/asr/", "https://api.deepseek.com/v1/tools/asr"),
+            ("https://proxy.example/v1/tools/asr?tenant=demo", "https://proxy.example/v1/tools/asr?tenant=demo"),
+            ("https://proxy.example/custom/v1?tenant=demo", "https://proxy.example/custom/v1/tools/asr?tenant=demo"),
+            ("https://proxy.example.test/deepseek/v1", "https://proxy.example.test/deepseek/v1/tools/asr"),
+        ):
+            captured.clear()
+            c_url = Config()
+            c_url.asr.provider = "deepseek"
+            c_url.asr.base_url = raw_base
+            c_url.asr.hotwords_file = ""
+            transcribe(wav, c_url, env=env, transport=ok_tx)
+            self.assertEqual(captured[0].url, want_url, msg=f"base_url={raw_base!r}")
+
+        # Empty wav returns empty AsrResult without HTTP call; {"text": ""} on HTTP 200 (silence) is valid
+        captured.clear()
+        empty_res = prov.transcribe(b"")
+        self.assertEqual(empty_res.text, "")
+        self.assertEqual(len(captured), 0)
+
+        for silent_body in (
+            json.dumps({"request_id": "req-silent", "text": "", "duration_ms": 0}).encode("utf-8"),
+            b'{"text": ""}',
+        ):
+            silence_res = transcribe(
+                wav,
+                cfg,
+                env={"API_KEY_DEEPSEEK": "sk-legacy-only-3344"},
+                transport=lambda r, _b=silent_body: HttpResponse(
+                    200, {"content-type": "application/json"}, _b
+                ),
+            )
+            self.assertEqual(silence_res.text, "")
+
+        # 8 MiB client-side pre-check: >8 MiB fails fast before calling transport; exact 8 MiB allowed
+        over_calls = [0]
+
+        def fail_if_called(_req: HttpRequest) -> HttpResponse:
+            over_calls[0] += 1
+            return HttpResponse(200, {}, b'{"text":"ok"}')
+
+        with self.assertRaises(AsrError) as over_ctx:
+            transcribe(
+                b"\x00" * (DEEPSEEK_ASR_MAX_WAV_BYTES + 1),
+                cfg,
+                env=env,
+                transport=fail_if_called,
+            )
+        self.assertEqual(over_calls[0], 0)
+        self.assertEqual(over_ctx.exception.retry_kind, "never")
+        self.assertIn("8 MiB", str(over_ctx.exception))
+
+        exact_calls = [0]
+
+        def exact_tx(_req: HttpRequest) -> HttpResponse:
+            exact_calls[0] += 1
+            return HttpResponse(200, {}, b'{"request_id":"req-8m","text":"exact 8m ok","duration_ms":1000}')
+
+        res_exact = transcribe(b"\x00" * DEEPSEEK_ASR_MAX_WAV_BYTES, cfg, env=env, transport=exact_tx)
+        self.assertEqual(exact_calls[0], 1)
+        self.assertEqual(res_exact.text, "exact 8m ok")
+
+        # 120s WAV duration pre-check: 130s valid 16kHz mono PCM WAV (~4.16 MiB <= 8 MiB) fails fast before transport
+        voiced_frame = (b"\xd0\x07" * 160) + (b"\x30\xf8" * 160)  # 20ms square wave @ 16kHz
+        silent_frame = b"\x00\x00" * 320  # 20ms silence
+        pcm_130s = (voiced_frame * 4900) + (silent_frame * 100) + (voiced_frame * 1500)  # 98s + 2s silence + 30s = 130s
+        wav_130s = pack_pcm16_mono_wav(pcm_130s, sample_rate=16000)
+        self.assertLessEqual(len(wav_130s), DEEPSEEK_ASR_MAX_WAV_BYTES)
+        over_dur_calls = [0]
+        with self.assertRaises(AsrError) as dur_ctx:
+            transcribe(
+                wav_130s,
+                cfg,
+                env=env,
+                transport=lambda _r: (over_dur_calls.__setitem__(0, over_dur_calls[0] + 1), HttpResponse(200, {}, b'{"text":"ok"}'))[1],
+            )
+        self.assertEqual(over_dur_calls[0], 0)
+        self.assertEqual(dur_ctx.exception.retry_kind, "never")
+        self.assertIn("120s", str(dur_ctx.exception))
+
+        # Transient errors (408, 429, 500, 502, 503, 504, connection reset) retry with backoff and succeed
+        for status_or_exc in (408, 429, 500, 502, 503, 504, ConnectionResetError("peer reset")):
+            with self.subTest(transient=status_or_exc):
+                reset_rate_limit_pacers()
+                attempts = [0]
+                now_box = [100.0]
+                sleeps: list[float] = []
+
+                def _adv_sleep(dt: float) -> None:
+                    sleeps.append(dt)
+                    now_box[0] += dt
+
+                def flaky_tx(_req: HttpRequest, _err: object = status_or_exc) -> HttpResponse:
+                    attempts[0] += 1
+                    if attempts[0] == 1:
+                        if isinstance(_err, Exception):
+                            raise _err
+                        return HttpResponse(
+                            int(_err),
+                            {"content-type": "application/json"},
+                            json.dumps({"error": {"message": "transient upstream"}}).encode("utf-8"),
+                        )
+                    return HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        b'{"request_id":"req-retry-ok","text":"retry ok","duration_ms":500}',
+                    )
+
+                res_r = transcribe(
+                    wav,
+                    cfg,
+                    env=env,
+                    transport=flaky_tx,
+                    clock_fn=lambda: now_box[0],
+                    sleep_fn=_adv_sleep,
+                    rand_fn=lambda: 0.5,
+                )
+                self.assertEqual(res_r.text, "retry ok")
+                self.assertEqual(res_r.retries, 1)
+                self.assertEqual(attempts[0], 2)
+                self.assertEqual(len(sleeps), 1)
+
+        # Non-transient errors (400, 401, 403, 413) fail fast on 1st attempt and redact secret
+        for bad_status in (400, 401, 403, 413):
+            with self.subTest(non_retryable=bad_status):
+                attempts = [0]
+
+                def bad_tx(_req: HttpRequest, _st: int = bad_status) -> HttpResponse:
+                    attempts[0] += 1
+                    return HttpResponse(
+                        _st,
+                        {"content-type": "application/json"},
+                        json.dumps({"error": {"message": f"rejected with key {secret}"}}).encode("utf-8"),
+                    )
+
+                with self.assertRaises(AsrError) as bad_ctx:
+                    transcribe(wav, cfg, env=env, transport=bad_tx, sleep_fn=lambda _s: None)
+                self.assertEqual(attempts[0], 1, f"HTTP {bad_status} must not retry")
+                self.assertEqual(bad_ctx.exception.retry_kind, "never")
+                self.assertNotIn(secret, str(bad_ctx.exception))
+                self.assertIn("[REDACTED]", str(bad_ctx.exception))
+                if bad_status == 413:
+                    self.assertIn("413", str(bad_ctx.exception))
+
+        # HTTP 200 non-JSON, API error, and malformed JSON structures ({}, [], {"text": null}, {"text": 123})
+        # Privacy redline: HTTP 200 malformed/non-JSON errors MUST NEVER echo raw response body / transcript text.
+        with self.assertRaises(AsrError) as non_json_ctx:
+            transcribe(
+                wav,
+                cfg,
+                env=env,
+                transport=lambda _r: HttpResponse(200, {}, b"synthetic transcript for review"),
+                sleep_fn=lambda _s: None,
+            )
+        self.assertNotIn("synthetic transcript", str(non_json_ctx.exception))
+        with self.assertRaises(AsrError):
+            transcribe(wav, cfg, env=env, transport=lambda _r: HttpResponse(200, {}, b'{"error":{"message":"bad"}}'), sleep_fn=lambda _s: None)
+        for err_200_body in (
+            b'{"error": {"message": {"text": "synthetic transcript"}}}',
+            b'{"error": {"code": "bad"}, "text": "synthetic transcript"}',
+        ):
+            with self.subTest(err_200_body=err_200_body):
+                with self.assertRaises(AsrError) as err_ctx:
+                    transcribe(
+                        wav,
+                        cfg,
+                        env=env,
+                        transport=lambda _r, _b=err_200_body: HttpResponse(
+                            200, {"content-type": "application/json"}, _b
+                        ),
+                        sleep_fn=lambda _s: None,
+                    )
+                self.assertNotIn("synthetic transcript", str(err_ctx.exception))
+        for bad_json_body in (
+            b"{}",
+            b"[]",
+            b'["synthetic transcript for review"]',
+            b'{"text": null}',
+            b'{"text": 123}',
+            b'{"text": ["synthetic transcript for review"]}',
+        ):
+            with self.subTest(bad_200_json=bad_json_body):
+                bad_calls = [0]
+                with self.assertRaises(AsrError) as mal_ctx:
+                    transcribe(
+                        wav,
+                        cfg,
+                        env=env,
+                        transport=lambda _r, _b=bad_json_body: (
+                            bad_calls.__setitem__(0, bad_calls[0] + 1),
+                            HttpResponse(200, {"content-type": "application/json"}, _b),
+                        )[1],
+                        sleep_fn=lambda _s: None,
+                    )
+                self.assertEqual(bad_calls[0], 1)
+                self.assertEqual(mal_ctx.exception.retry_kind, "never")
+                self.assertNotIn("synthetic transcript", str(mal_ctx.exception))
+
+        # Telemetry summary preserves redacted asr_request_id & asr_duration_ms,
+        # and 130s WAV auto-splits under DeepSeek's 115s provider cap (both default & explicit max_chunk_sec=180)
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(mode=0o700)
+            cfg_pipe = Config()
+            cfg_pipe.asr.provider = "deepseek"
+            cfg_pipe.asr.hotwords_file = ""
+            cfg_pipe.refiner.provider = "off"
+            pipe_res = run_pipeline_once(
+                wav,
+                cfg=cfg_pipe,
+                asr_provider=create_asr_provider(cfg_pipe, env=env, transport=ok_tx),
+                refiner=NoopRefiner(),
+                tracker=SessionTracker(home_dir=td, runtime_dir=rt, env=env, proc_root=Path(td) / "np"),
+                dry_run=True,
+                env=env,
+                runtime_dir=rt,
+            )
+            self.assertTrue(pipe_res.ok)
+            summary = build_pipeline_summary(1, pipe_res, dry_run=True)
+            self.assertEqual(summary["asr_provider"], "deepseek")
+            self.assertEqual(summary["asr_request_id"], "req-ds-001")
+            self.assertEqual(summary["asr_duration_ms"], 2340)
+
+            for explicit_cap in (None, 180.0):
+                with self.subTest(max_chunk_sec=explicit_cap):
+                    chunk_calls = [0]
+
+                    def chunk_tx(_req: HttpRequest) -> HttpResponse:
+                        chunk_calls[0] += 1
+                        return HttpResponse(
+                            200,
+                            {"content-type": "application/json"},
+                            json.dumps(
+                                {
+                                    "request_id": f"req-c{chunk_calls[0]}",
+                                    "text": f"分片{chunk_calls[0]}",
+                                    "duration_ms": 60000,
+                                },
+                                ensure_ascii=False,
+                            ).encode("utf-8"),
+                        )
+
+                    long_res = run_pipeline_once(
+                        wav_130s,
+                        cfg=cfg_pipe,
+                        asr_provider=create_asr_provider(cfg_pipe, env=env, transport=chunk_tx),
+                        refiner=NoopRefiner(),
+                        tracker=SessionTracker(home_dir=td, runtime_dir=rt, env=env, proc_root=Path(td) / "np"),
+                        dry_run=True,
+                        env=env,
+                        runtime_dir=rt,
+                        max_chunk_sec=explicit_cap,
+                    )
+                    self.assertTrue(long_res.ok)
+                    self.assertGreaterEqual(long_res.asr_chunks, 2)
+                    self.assertEqual(chunk_calls[0], long_res.asr_chunks)
+                    self.assertTrue(all(sec <= DEEPSEEK_ASR_MAX_CHUNK_SEC + 0.5 for sec in long_res.asr_chunk_secs))
+                    self.assertIsNotNone(long_res.asr)
+                    assert long_res.asr is not None
+                    self.assertEqual(long_res.asr.duration_ms, 60000 * long_res.asr_chunks)
+
 
 if __name__ == "__main__":
     unittest.main()

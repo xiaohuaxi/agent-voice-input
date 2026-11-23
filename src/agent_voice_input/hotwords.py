@@ -195,6 +195,14 @@ HOTWORDS_QUOTA_SPECS: dict[str, HotwordsQuotaSpec] = {
         separator="",
         note="OpenRouter /audio/transcriptions only passes keyterms to deepgram/* and assemblyai/*; use single-hop or Stage 2 refiner",
     ),
+    "deepseek_asr_unsupported": HotwordsQuotaSpec(
+        key="deepseek_asr_unsupported",
+        label="deepseek(asr)",
+        max_terms=0,
+        max_chars=0,
+        separator="",
+        note="DeepSeek /tools/asr does not accept hotwords/prompt fields; rely on Stage 2 refiner",
+    ),
 }
 
 MAINSTREAM_QUOTA_PROVIDERS: tuple[str, ...] = ("doubao", "whisper", "dashscope", "gemini")
@@ -789,6 +797,8 @@ def resolve_hotwords_quota_spec(
 
     if prov == "doubao":
         return HOTWORDS_QUOTA_SPECS["doubao"]
+    if prov == "deepseek":
+        return HOTWORDS_QUOTA_SPECS["deepseek_asr_unsupported"]
     if prov in ("whisper", "stt", "audio-transcriptions"):
         return HOTWORDS_QUOTA_SPECS["whisper"]
     if prov in ("single_hop", "single-hop", "chat-completions"):

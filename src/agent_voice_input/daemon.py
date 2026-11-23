@@ -375,6 +375,10 @@ def build_pipeline_summary(
             summary["asr_audio_tokens"] = res.asr.audio_tokens
     if res.asr and res.asr.retries > 0:
         summary["asr_retries"] = res.asr.retries
+    if res.asr and res.asr.duration_ms is not None:
+        summary["asr_duration_ms"] = res.asr.duration_ms
+    if res.asr and res.asr.request_id:
+        summary["asr_request_id"] = clean_str(res.asr.request_id)
     if res.refined and res.refined.retries > 0:
         summary["refiner_retries"] = res.refined.retries
     if res.refined and res.refined.warning:
@@ -776,10 +780,16 @@ def _transcribe_wav_chunks(
     cancel_token: CancelToken | None = None,
 ) -> tuple[AsrResult, int, tuple[float, ...]]:
     cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled, cancel_token)
-    eff_max_chunk_sec = (
+    base_chunk_sec = (
         (SINGLE_HOP_MAX_CHUNK_SEC if _is_single_hop_asr_provider(eff_asr) else DEFAULT_MAX_CHUNK_SEC)
         if max_chunk_sec is None
         else float(max_chunk_sec)
+    )
+    prov_chunk_sec = getattr(eff_asr, "max_chunk_sec", None)
+    eff_max_chunk_sec = (
+        min(base_chunk_sec, float(prov_chunk_sec))
+        if prov_chunk_sec is not None and float(prov_chunk_sec) > 0
+        else base_chunk_sec
     )
     norm_floor_dbfs = _normalized_chunk_floor_dbfs(floor_dbfs, gain_db)
     infos = inspect_wav_chunks(wav_bytes, max_chunk_sec=eff_max_chunk_sec, floor_dbfs=norm_floor_dbfs)
@@ -888,6 +898,8 @@ def _transcribe_wav_chunks(
             context_chunks=max((r.context_chunks for r in non_null), default=0),
             audio_tokens=_sum_opt([r.audio_tokens for r in non_null]),
             missed_chunks=missed_chunks,
+            request_id=",".join(r.request_id for r in non_null if r.request_id),
+            duration_ms=_sum_opt([r.duration_ms for r in non_null]),
         ),
         len(infos),
         chunk_secs,
