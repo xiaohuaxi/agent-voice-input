@@ -334,8 +334,8 @@ def _is_openai_reasoning_model(model: str) -> bool:
 
     Non-reasoning models such as ``gpt-4o-mini`` and ``gpt-audio-mini`` reject
     ``reasoning_effort`` with HTTP 400 on the official OpenAI API; keeping this strict
-    ensures ``[refiner] provider = 'openai'`` (where ``refiner.effort`` defaults to ``'low'``
-    and ``model`` defaults to ``'gpt-4o-mini'``) never fails with 400.
+    ensures non-reasoning overrides under ``[refiner] provider = 'openai'`` (where
+    ``refiner.effort`` defaults to ``'low'``) never fail with 400.
     """
     slug = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
     return slug.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6", "codex-mini")) or "reasoning" in slug

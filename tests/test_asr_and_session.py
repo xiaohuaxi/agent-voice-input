@@ -863,13 +863,13 @@ class AsrProvidersTests(unittest.TestCase):
         self.assertTrue(gem_res.is_single_hop_refined)
         self.assertEqual(gem_res.provider, "gemini")
         self.assertEqual(gem_res.text, "保留 A，改为调用 B")
-        self.assertIn(":generateContent", gem_reqs[0].url)
+        self.assertIn("models/gemini-3.7-flash:generateContent", gem_reqs[0].url)
         self.assertEqual(gem_reqs[0].headers["x-goog-api-key"], "fake_gemini_token_val")
         gem_payload = json.loads(gem_reqs[0].body.decode("utf-8"))
-        # Default effort='auto' on Gemini 3.5 Flash-Lite uses thinkingLevel='minimal'
+        # Default effort='auto' on Gemini 3.7 Flash clamps to thinkingLevel='low'
         self.assertEqual(
             gem_payload["generationConfig"]["thinkingConfig"],
-            {"thinkingLevel": "minimal"},
+            {"thinkingLevel": "low"},
         )
         gem_parts = gem_payload["contents"][0]["parts"]
         self.assertEqual(len(gem_parts), 3)
@@ -905,7 +905,7 @@ class AsrProvidersTests(unittest.TestCase):
         self.assertTrue(
             oai_reqs[0].headers["Content-Type"].startswith("multipart/form-data; boundary=")
         )
-        self.assertIn(b'name="model"\r\n\r\ngpt-4o-mini-transcribe', oai_reqs[0].body)
+        self.assertIn(b'name="model"\r\n\r\ngpt-transcribe', oai_reqs[0].body)
         self.assertIn(b'filename="audio.wav"', oai_reqs[0].body)
         self.assertIn(b"RIFF", oai_reqs[0].body)
 

@@ -85,7 +85,7 @@ agent-voice-input doctor --ping && agent-voice-input start
 | :--- | :--- | :--- | :--- |
 | **Reuse Existing Codex / AGY Subscription** *(zero extra Stage 2 API billing)* | `dashscope`, `doubao`, `groq`, or `openai` | `codex` *(auto-detected by `auto`; never enables Fast mode)* or `agy` *(explicit opt-in)* | 1 Stage 1 speech key + local `codex` or `agy` CLI login |
 | **Chinese / Mixed Chinese–English Daily Driver** | `dashscope` (`qwen3-asr-flash`) or `doubao` (`bigmodel`) | `codex` / `agy` / `deepseek` / `dashscope` / `volcengine` | `DASHSCOPE_API_KEY` or `DOUBAO_SPEECH_API_KEY` *(single-header `X-Api-Key`, no `APP_ID` needed)* + optional Stage 2 key |
-| **English / Global Daily Driver** | `groq` (`whisper-large-v3-turbo`) or `openai` (`gpt-4o-mini-transcribe`) | `codex` / `agy` / `openai` / `gemini` / `openrouter` | `GROQ_API_KEY` or `OPENAI_API_KEY` + optional Stage 2 key |
+| **English / Global Daily Driver** | `groq` (`whisper-large-v3-turbo`) or `openai` (`gpt-transcribe`) | `codex` / `agy` / `openai` / `gemini` / `openrouter` | `GROQ_API_KEY` or `OPENAI_API_KEY` + optional Stage 2 key |
 | **Single-Key Minimal Setup** | `gemini` *(native single-hop)*, `openrouter` *(two-stage or single-hop)*, or `dashscope` *(two-stage or `qwen3.8-omni-flash` single-hop)* | Built-in or skipped in single-hop | Just 1 key: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, or `DASHSCOPE_API_KEY` |
 
 > **On local / self-hosted models**: This release focuses on thoroughly tested mainstream cloud APIs and existing CLI logins (`codex` / `agy`). While a generic `openai-compatible` custom `base_url` hook already exists under the hood, fully verified **first-class support for local / private self-hosted models** (compact local ASR + refiner) is planned for **`v1.1+`**.
@@ -166,8 +166,8 @@ Configuration priority: `CLI flags > ~/.config/agent-voice-input/config.toml > b
 | **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_SPEECH_API_KEY` *(single-header `X-Api-Key`, no `APP_ID` needed; compat: `DOUBAO_ASR_API_KEY` or legacy `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`; `auto` prefers sync `volc.bigasr.auc_turbo` with cached fallback to `volc.seedasr.auc` / `volc.bigasr.auc`)* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(compat: `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
 | **`openrouter`** | `asr`, `refiner` | `qwen/qwen3-asr-1.7b` | `google/gemini-3.5-flash-lite` | `OPENROUTER_API_KEY` |
-| **`gemini`** | `asr`, `refiner` | `gemini-3.5-flash-lite` *(single-hop)* | `gemini-3.5-flash-lite` | `GEMINI_API_KEY` |
-| **`openai`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+| **`gemini`** | `asr`, `refiner` | `gemini-3.7-flash` *(single-hop)* | `gemini-3.7-flash` | `GEMINI_API_KEY` |
+| **`openai`** | `asr`, `refiner` | `gpt-transcribe` | `gpt-6-luna` | `OPENAI_API_KEY` |
 | **`groq`** | `asr`, `refiner` | `whisper-large-v3-turbo` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
 | **`siliconflow`** | `asr`, `refiner` | `FunAudioLLM/SenseVoiceSmall` | `Qwen/Qwen2.5-7B-Instruct` | `SILICONFLOW_API_KEY` |
 | **`openai-compatible`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` *(needs `base_url`)* | *(needs explicit `base_url` + `model`)* | `api_key_env` or `OPENAI_API_KEY` *(loopback URLs need no key)* |

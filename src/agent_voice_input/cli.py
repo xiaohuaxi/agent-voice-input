@@ -43,7 +43,7 @@ _INIT_ENV_TEMPLATE = """\
 # Alibaba Cloud Bailian / DashScope (Stage 1 qwen3-asr-flash + Stage 2 qwen3.8-flash, or single-hop qwen3.8-omni-flash)
 # DASHSCOPE_API_KEY="sk-..."
 
-# OpenAI (Stage 1 gpt-4o-mini-transcribe + Stage 2 gpt-4o-mini)
+# OpenAI (Stage 1 gpt-transcribe + Stage 2 gpt-6-luna)
 # OPENAI_API_KEY="sk-..."
 
 # Groq Cloud (fast Stage 1 whisper-large-v3-turbo + Stage 2 llama-3.3-70b-versatile)

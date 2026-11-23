@@ -68,8 +68,8 @@ provider = "auto"
 # - dashscope         -> "qwen3-asr-flash" (dedicated STT; also supports "fun-asr-realtime", "qwen-audio-turbo-latest", or single-hop "qwen3.8-omni-flash")
 # - doubao            -> "bigmodel"
 # - openrouter        -> "qwen/qwen3-asr-1.7b" (dedicated STT) or e.g. "google/gemini-3.5-flash-lite" / "qwen/qwen3.8-omni-flash" / "openai/gpt-audio-mini" (single-hop chat audio)
-# - gemini            -> "gemini-3.5-flash-lite" (native :generateContent single-hop audio + context refinement; skips Stage 2 by default)
-# - openai            -> "gpt-4o-mini-transcribe"
+# - gemini            -> "gemini-3.7-flash" (native :generateContent single-hop audio + context refinement; skips Stage 2 by default)
+# - openai            -> "gpt-transcribe"
 # - groq              -> "whisper-large-v3-turbo"
 # - siliconflow       -> "FunAudioLLM/SenseVoiceSmall"
 # - openai-compatible -> "gpt-4o-mini-transcribe" (requires explicit base_url, e.g. local faster-whisper-server)
@@ -115,8 +115,8 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 # - dashscope         -> "qwen3.8-flash"
 # - volcengine        -> "doubao-seed-2-0-mini-260428"
 # - openrouter        -> "google/gemini-3.5-flash-lite"
-# - gemini            -> "gemini-3.5-flash-lite"
-# - openai            -> "gpt-4o-mini"
+# - gemini            -> "gemini-3.7-flash"
+# - openai            -> "gpt-6-luna"
 # - groq              -> "llama-3.3-70b-versatile"
 # - siliconflow       -> "Qwen/Qwen2.5-7B-Instruct"
 # - openai-compatible -> requires explicit base_url and model (e.g. local loopback Ollama/vLLM without API key)

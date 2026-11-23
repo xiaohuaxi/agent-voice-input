@@ -84,7 +84,7 @@ agent-voice-input doctor --ping && agent-voice-input start
 | :--- | :--- | :--- | :--- |
 | **复用现有 Codex / AGY 订阅** *（二阶段免另购 API）* | `dashscope`、`doubao`、`groq` 或 `openai` | `codex` *（`auto` 自动复用，绝不开 Fast）* 或 `agy` *（显式配置启用）* | 1 把语音识别 Key + 本机 `codex` 或 `agy` 登录态 |
 | **国内主力（中文 / 中英混排）** | `dashscope`（阿里百炼 `qwen3-asr-flash`）或 `doubao`（豆包语音 `bigmodel`） | `codex` / `agy` / `deepseek` / `dashscope` / `volcengine` | `DASHSCOPE_API_KEY` 或 `DOUBAO_SPEECH_API_KEY` *（单头 `X-Api-Key`，无需 `APP_ID`）* + 可选精修 Key |
-| **海外 / 纯英文主力** | `groq`（`whisper-large-v3-turbo`）或 `openai`（`gpt-4o-mini-transcribe`） | `codex` / `agy` / `openai` / `gemini` / `openrouter` | `GROQ_API_KEY` 或 `OPENAI_API_KEY` + 可选精修 Key |
+| **海外 / 纯英文主力** | `groq`（`whisper-large-v3-turbo`）或 `openai`（`gpt-transcribe`） | `codex` / `agy` / `openai` / `gemini` / `openrouter` | `GROQ_API_KEY` 或 `OPENAI_API_KEY` + 可选精修 Key |
 | **一把 Key 省心全包** | `dashscope`（国内两段式或 `qwen3.8-omni-flash` 单跳）、`gemini`（海外原生单跳）或 `openrouter`（两段式/单跳均可） | 同渠道内置默认，或单跳跳过二阶段 | 仅需 1 把 Key：`DASHSCOPE_API_KEY`、`GEMINI_API_KEY` 或 `OPENROUTER_API_KEY` |
 
 > **关于本地 / 私有部署模型**：当前版本重点聚焦并充分实测了主流云端 API 与现有 CLI 登录（Codex / AGY）。虽然底层已提供通用的 `openai-compatible` 自定义 `base_url` 接口，但经过完整实测的**本地/企业私有部署模型（自部署小型 ASR + 精修）一等公民支持**规划在后续版本（**`v1.1+`**）推进。
@@ -165,8 +165,8 @@ agent-voice-input key-test               # 测试按键扫描码与修饰键捕�
 | **`doubao`** | `asr` | `bigmodel` | — | `DOUBAO_SPEECH_API_KEY` *（单头 `X-Api-Key`，无需 `APP_ID`；兼容旧 `DOUBAO_ASR_API_KEY` 或双头 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；`auto` 优先同步 `volc.bigasr.auc_turbo`，未开通时自动回退并缓存 `volc.seedasr.auc` / `volc.bigasr.auc`）* |
 | **`volcengine`** | `refiner` | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(兼容 `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
 | **`openrouter`** | `asr`, `refiner` | `qwen/qwen3-asr-1.7b` | `google/gemini-3.5-flash-lite` | `OPENROUTER_API_KEY` |
-| **`gemini`** | `asr`, `refiner` | `gemini-3.5-flash-lite` *(单跳)* | `gemini-3.5-flash-lite` | `GEMINI_API_KEY` |
-| **`openai`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` | `gpt-4o-mini` | `OPENAI_API_KEY` |
+| **`gemini`** | `asr`, `refiner` | `gemini-3.7-flash` *(单跳)* | `gemini-3.7-flash` | `GEMINI_API_KEY` |
+| **`openai`** | `asr`, `refiner` | `gpt-transcribe` | `gpt-6-luna` | `OPENAI_API_KEY` |
 | **`groq`** | `asr`, `refiner` | `whisper-large-v3-turbo` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
 | **`siliconflow`** | `asr`, `refiner` | `FunAudioLLM/SenseVoiceSmall` | `Qwen/Qwen2.5-7B-Instruct` | `SILICONFLOW_API_KEY` |
 | **`openai-compatible`** | `asr`, `refiner` | `gpt-4o-mini-transcribe` *(需配 `base_url`)* | *(需显式配 `base_url` + `model`)* | `api_key_env` 或 `OPENAI_API_KEY` *(本机回环地址免 Key)* |

@@ -233,7 +233,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg.hotkey.tap_max_ms, 900)
             self.assertEqual(cfg.hotkey.debounce_ms, 180)
             self.assertEqual(cfg.asr.provider, "gemini")
-            self.assertEqual(cfg.asr.effective_model(), "gemini-3.5-flash-lite")
+            self.assertEqual(cfg.asr.effective_model(), "gemini-3.7-flash")
             self.assertEqual(cfg.refiner.provider, "off")
             self.assertEqual(cfg.refiner.effort, "medium")
 
@@ -985,19 +985,20 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(DEFAULT_ASR_MODELS["dashscope"], "qwen3-asr-flash")
         self.assertEqual(DEFAULT_ASR_MODELS["doubao"], "bigmodel")
         self.assertEqual(DEFAULT_ASR_MODELS["openrouter"], "qwen/qwen3-asr-1.7b")
-        self.assertEqual(DEFAULT_ASR_MODELS["gemini"], "gemini-3.5-flash-lite")
-        self.assertEqual(DEFAULT_ASR_MODELS["openai"], "gpt-4o-mini-transcribe")
+        self.assertEqual(DEFAULT_ASR_MODELS["gemini"], "gemini-3.7-flash")
+        self.assertEqual(DEFAULT_ASR_MODELS["openai"], "gpt-transcribe")
         self.assertEqual(DEFAULT_ASR_MODELS["groq"], "whisper-large-v3-turbo")
         self.assertEqual(DEFAULT_ASR_MODELS["siliconflow"], "FunAudioLLM/SenseVoiceSmall")
         self.assertEqual(DEFAULT_ASR_MODELS["openai-compatible"], "gpt-4o-mini-transcribe")
 
         self.assertEqual(DEFAULT_REFINER_MODELS["codex"], "gpt-6-luna")
+        self.assertEqual(DEFAULT_REFINER_MODELS["agy"], "gemini-3.8-flash")
         self.assertEqual(DEFAULT_REFINER_MODELS["deepseek"], "deepseek-flash")
         self.assertEqual(DEFAULT_REFINER_MODELS["dashscope"], "qwen3.8-flash")
         self.assertEqual(DEFAULT_REFINER_MODELS["volcengine"], "doubao-seed-2-0-mini-260428")
         self.assertEqual(DEFAULT_REFINER_MODELS["openrouter"], "google/gemini-3.5-flash-lite")
-        self.assertEqual(DEFAULT_REFINER_MODELS["gemini"], "gemini-3.5-flash-lite")
-        self.assertEqual(DEFAULT_REFINER_MODELS["openai"], "gpt-4o-mini")
+        self.assertEqual(DEFAULT_REFINER_MODELS["gemini"], "gemini-3.7-flash")
+        self.assertEqual(DEFAULT_REFINER_MODELS["openai"], "gpt-6-luna")
         self.assertEqual(DEFAULT_REFINER_MODELS["groq"], "llama-3.3-70b-versatile")
         self.assertEqual(DEFAULT_REFINER_MODELS["siliconflow"], "Qwen/Qwen2.5-7B-Instruct")
 
@@ -1207,6 +1208,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         for stt_model in (
             "qwen/qwen3-asr-1.7b",
             "openai/whisper-large-v3-turbo",
+            "openai/gpt-transcribe",
             "openai/gpt-4o-mini-transcribe",
             "google/gemini-3.5-transcribe",
             "deepgram/nova-3",

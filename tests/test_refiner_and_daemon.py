@@ -851,8 +851,10 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             ("dashscope", "", "", "low", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.8-flash", {"enable_thinking": True}),
             ("groq", "", "", "low", "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile", {}),
             ("siliconflow", "", "", "low", "https://api.siliconflow.cn/v1/chat/completions", "Qwen/Qwen2.5-7B-Instruct", {}),
-            # gpt-4o-mini omits reasoning_effort so default [refiner] provider="openai" never 400s
-            ("openai", "", "", "low", "https://api.openai.com/v1/chat/completions", "gpt-4o-mini", {}),
+            # Default [refiner] provider="openai" uses gpt-6-luna (reasoning model: sends reasoning_effort, omits temperature)
+            ("openai", "", "", "low", "https://api.openai.com/v1/chat/completions", "gpt-6-luna", {"reasoning_effort": "low"}),
+            # Explicit non-reasoning override gpt-4o-mini omits reasoning_effort so it never 400s
+            ("openai", "gpt-4o-mini", "", "low", "https://api.openai.com/v1/chat/completions", "gpt-4o-mini", {}),
             # OpenAI reasoning models omit incompatible custom temperature (both with reasoning_effort and effort="default"/"auto")
             ("openai", "o4-mini", "", "medium", "https://api.openai.com/v1/chat/completions", "o4-mini", {"reasoning_effort": "medium"}),
             ("openai", "gpt-5-mini", "", "default", "https://api.openai.com/v1/chat/completions", "gpt-5-mini", {}),
@@ -920,8 +922,8 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         gem_out = gem_ref.refine("Gemini 初稿", fallback_context="上下文")
         self.assertEqual(gem_out.text, "Gemini 精修定稿")
         self.assertEqual(gem_out.provider, "gemini")
-        self.assertEqual(gem_out.model, "gemini-3.5-flash-lite")
-        self.assertIn("models/gemini-3.5-flash-lite:generateContent", gem_seen[0].url)
+        self.assertEqual(gem_out.model, "gemini-3.7-flash")
+        self.assertIn("models/gemini-3.7-flash:generateContent", gem_seen[0].url)
         gem_body = json.loads(gem_seen[0].body.decode("utf-8"))
         self.assertEqual(gem_body["generationConfig"]["thinkingConfig"], {"thinkingLevel": "low"})
 
