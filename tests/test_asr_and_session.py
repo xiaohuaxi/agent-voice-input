@@ -3875,6 +3875,10 @@ class SessionCtxTests(unittest.TestCase):
             build_gemini_generation_config("gemini-4-hydrogen", "auto")["thinkingConfig"],
             {"thinkingLevel": "low"},
         )
+        self.assertEqual(
+            build_gemini_generation_config("gemini-flash-latest", "auto")["thinkingConfig"],
+            {"thinkingLevel": "low"},
+        )
         captured.clear()
         cfg_ali.asr.effort = "low"
         ali_prov_low = create_asr_provider(cfg_ali, resolve_credentials(cfg_ali, env), env=env, transport=omni_tx)
@@ -3926,6 +3930,86 @@ class SessionCtxTests(unittest.TestCase):
         self.assertIn("<vocabulary_hints", gem_payload_str)
         self.assertNotIn("LEAKED_LEGACY_DIALOG", gem_payload_str)
         self.assertNotIn("LEAKED_LEGACY_GIT", gem_payload_str)
+
+    def test_chat_audio_asr_blocks_content_filter_and_safety_finish_reasons(self) -> None:
+        secret = "sk-or-filter-secret-" + ("f" * 16)
+        env = {"OPENROUTER_API_KEY": secret}
+        cfg = Config()
+        cfg.asr.provider = "openrouter"
+        cfg.asr.model = "google/gemini-2.5-flash"
+        cfg.asr.hotwords_file = ""
+        cfg.asr.max_retries = 2
+
+        for raw_reason, want_norm in (
+            ("content_filter", "content_filter"),
+            ("CONTENT_FILTER", "content_filter"),
+            ("safety", "safety"),
+            ("SAFETY", "safety"),
+        ):
+            with self.subTest(finish_reason=raw_reason):
+                calls = [0]
+
+                def blocked_tx(req: HttpRequest, _reason: str = raw_reason) -> HttpResponse:
+                    del req
+                    calls[0] += 1
+                    return HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps(
+                            {
+                                "choices": [
+                                    {
+                                        "finish_reason": _reason,
+                                        "message": {"content": "被截断的残片文本"},
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                    )
+
+                prov = ChatAudioAsrProvider(
+                    cfg,
+                    resolve_credentials(cfg, env),
+                    provider_name="openrouter",
+                    env=env,
+                    transport=blocked_tx,
+                    sleep_fn=lambda _s: None,
+                )
+                with self.assertRaises(AsrError) as cm:
+                    prov.transcribe(_sample_wav())
+                self.assertEqual(calls[0], 1, "safety/content_filter block must not retry")
+                self.assertEqual(cm.exception.retry_kind, "never")
+                self.assertIn(want_norm, str(cm.exception))
+                self.assertNotIn(secret, str(cm.exception))
+
+        # Normal finish_reason="stop" continues to return normalized text.
+        def ok_tx(req: HttpRequest) -> HttpResponse:
+            del req
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "stop",
+                                "message": {"content": "完整转写结果"},
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+            )
+
+        ok_prov = ChatAudioAsrProvider(
+            cfg,
+            resolve_credentials(cfg, env),
+            provider_name="openrouter",
+            env=env,
+            transport=ok_tx,
+        )
+        self.assertEqual(ok_prov.transcribe(_sample_wav()).text, "完整转写结果")
 
 
 if __name__ == "__main__":

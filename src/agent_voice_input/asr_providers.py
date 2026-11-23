@@ -2237,6 +2237,20 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                     api_msg=err_msg,
                 )
 
+            choices = data.get("choices")
+            c0 = (
+                choices[0]
+                if isinstance(choices, list) and choices and isinstance(choices[0], Mapping)
+                else {}
+            )
+            fin = str(c0.get("finish_reason") or "").strip().lower()
+            if fin in ("content_filter", "safety"):
+                raise self._fail(
+                    f"{self.provider_name} chat/completions blocked ({fin})",
+                    extra_secrets=secrets,
+                    retry_kind="never",
+                )
+
             usage_box[0] = _extract_token_usage(data, default_zero_details=False)
             audio_tok_box[0] = _extract_audio_tokens(data)
             return extract_chat_message_text(data)

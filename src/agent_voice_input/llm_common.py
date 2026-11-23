@@ -279,10 +279,7 @@ def build_gemini_generation_config(
     slug = model.strip().lower().removeprefix("models/").split("/", 1)[-1].split(":", 1)[0]
     if _is_gemini3_plus_model(model):
         lvl = _GEMINI_THINKING_LEVELS[eff]
-        supports_minimal = (
-            slug.startswith(("gemini-3-flash", "gemini-3.5-flash"))
-            or slug == "gemini-flash-latest"
-        )
+        supports_minimal = slug.startswith(("gemini-3-flash", "gemini-3.5-flash"))
         if lvl == "minimal" and not supports_minimal:
             lvl = "low"
         gen_cfg["thinkingConfig"] = {"thinkingLevel": lvl}
