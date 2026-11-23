@@ -1371,8 +1371,19 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn("stCopiedMain", src)
         self.assertIn("stCopiedToast", src)
         self.assertNotIn("pbpaste", src)
+        self.assertNotIn("import Carbon", src)
+        self.assertNotIn("DispatchQueue.main.sync", src)
+        self.assertIn("audioQueryQueue", src)
+        self.assertIn("windowQueryQueue", src)
+        self.assertIn("eventEmitQueue", src)
+        self.assertIn("static let defaultMaxCaptureMs: UInt64 = 200", src)
+        self.assertIn("if screens.count <= 1", src)
+        self.assertIn("queryFrontmostWindowNumber(pid:", src)
+        self.assertIn("postEventsIfWithinDeadline(", src)
+        self.assertIn('"reason": "key_held"', src)
         py_macos_src = (_REPO_ROOT / "src" / "agent_voice_input" / "platform_macos.py").read_text(encoding="utf-8")
         self.assertNotIn("pbpaste", py_macos_src)
+        self.assertIn("SHIM_SCHEMA_VERSION = 5", py_macos_src)
 
     def test_macos_coreaudio_fast_fail_busy_disconnect_and_seamless_respawn(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -4656,6 +4667,570 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     self.assertEqual(spawned_argv[1][0], "/usr/bin/osascript")
                 finally:
                     plat_dict.close()
+
+    def test_macos_paste_key_state_timeout_tightening_ptt_dynamic_idle_and_unavail_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            # 1. Timeout calculation contract: explicit override > tap_toggle idle cap > ptt max_duration cap
+            cfg_tap = Config()
+            cfg_tap.hotkey.trigger_mode = "tap_toggle"
+            cfg_tap.audio.max_duration_sec = 600
+            plat_tap = MacOSPlatform(cfg_tap, env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"}, cache_dir=Path(td) / "c_tap")
+            self.assertEqual(plat_tap._effective_paste_hold_timeout_sec(), 5.0)
+            plat_tap._paste_hold_timeout_sec = 0.25
+            self.assertEqual(plat_tap._effective_paste_hold_timeout_sec(), 0.25)
+            plat_tap._paste_hold_timeout_sec = None
+
+            cfg_tap_long_hc = Config()
+            cfg_tap_long_hc.hotkey.trigger_mode = "tap_toggle"
+            cfg_tap_long_hc.hotkey.hold_cancel_ms = 4000
+            plat_tap_long = MacOSPlatform(
+                cfg_tap_long_hc, env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"}, cache_dir=Path(td) / "c_tap2"
+            )
+            self.assertEqual(plat_tap_long._effective_paste_hold_timeout_sec(), 6.0)
+
+            cfg_ptt = Config()
+            cfg_ptt.hotkey.trigger_mode = "ptt"
+            cfg_ptt.audio.max_duration_sec = 600
+            plat_ptt = MacOSPlatform(cfg_ptt, env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"}, cache_dir=Path(td) / "c_ptt")
+            self.assertEqual(plat_ptt._effective_paste_hold_timeout_sec(), 602.0)
+
+            cfg_ptt_short = Config()
+            cfg_ptt_short.hotkey.trigger_mode = "ptt"
+            cfg_ptt_short.audio.max_duration_sec = 10
+            plat_ptt_short = MacOSPlatform(
+                cfg_ptt_short, env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"}, cache_dir=Path(td) / "c_ptt2"
+            )
+            self.assertEqual(plat_ptt_short._effective_paste_hold_timeout_sec(), 15.0)
+
+            origin_iterm = ForegroundWindow(100, "iTerm2", "claude [#abcd1234]", "com.googlecode.iterm2")
+            pbcopy_payloads: list[str] = []
+            cmd_v_count = [0]
+
+            def fake_run(cmd, *, stdin=None, input=None, capture_output=False, text=False, env=None, timeout=None, check=False, **kw):
+                del stdin, capture_output, env, timeout, check
+                exe = Path(cmd[0]).name
+                empty = "" if (text or kw.get("encoding")) else b""
+                if exe == "pbcopy":
+                    raw = input.decode("utf-8") if isinstance(input, (bytes, bytearray)) else str(input or "")
+                    pbcopy_payloads.append(raw)
+                    return subprocess.CompletedProcess(cmd, 0, empty, empty)
+                if exe == "osascript":
+                    script = cmd[2] if len(cmd) > 2 else ""
+                    if 'keystroke "v"' in script:
+                        cmd_v_count[0] += 1
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+                if exe in ("git", "ps", "lsof", "pgrep", "tmux"):
+                    return subprocess.CompletedProcess(cmd, 1, empty, empty)
+                raise AssertionError(f"unexpected cmd: {cmd}")
+
+            fake_now = [100.0]
+
+            def fake_sleep(sec: float) -> None:
+                fake_now[0] += max(0.0, float(sec))
+
+            def wire_plat(plat: MacOSPlatform, key_state_fn: Callable[[], bool | None]) -> None:
+                plat._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat._query_shim_key_state = key_state_fn  # type: ignore[method-assign]
+                plat._flush_shim_events = lambda timeout_sec=0.05: True  # type: ignore[method-assign]
+                plat.beep = lambda _k: None  # type: ignore[method-assign]
+                plat._shim_rpc = lambda payload, timeout_sec=0.8, **kw: (  # type: ignore[method-assign]
+                    {
+                        "ok": True,
+                        "hwnd": 100,
+                        "process": "iTerm2",
+                        "bundle_id": "com.googlecode.iterm2",
+                        "pid": 512,
+                        "title": "claude [#abcd1234]",
+                        "ax_trusted": True,
+                    }
+                    if payload.get("cmd") == "fg_window"
+                    else {"ok": True, "posted": True, "reason": "ok"}
+                )
+
+            with (
+                mock.patch("agent_voice_input.platform_macos.shutil.which", return_value="/usr/bin/mock"),
+                mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=fake_run),
+                mock.patch("agent_voice_input.platform_macos.time.monotonic", side_effect=lambda: fake_now[0]),
+                mock.patch("agent_voice_input.platform_macos.time.sleep", side_effect=fake_sleep),
+            ):
+                # 2. tap_toggle tightens default hold wait to 5.0s
+                pbcopy_payloads.clear()
+                cmd_v_count[0] = 0
+                fake_now[0] = 100.0
+                wire_plat(plat_tap, lambda: True)
+                out_tap_to = plat_tap.deliver_text(
+                    "tap模式5秒超时回退",
+                    seq_id=1,
+                    origin_window=origin_iterm,
+                    fallback_clipboard_text="tap兜底文本",
+                )
+                self.assertFalse(out_tap_to.pasted)
+                self.assertTrue(out_tap_to.clipboard)
+                self.assertEqual(out_tap_to.reason, "focus_changed")
+                self.assertAlmostEqual(fake_now[0] - 100.0, 5.0, delta=0.15)
+                self.assertEqual(pbcopy_payloads, ["tap兜底文本"])
+
+                # 3. PTT dynamic two-phase wait:
+                #    - First 0.04s startup race (_rec_active=False) is covered by idle_timeout=5.0s
+                #    - Then _rec_active=True for 12s (>5.0s idle cap) keeps waiting on full PTT deadline
+                #    - Once _rec_active flips back to False, stuck external modifier times out after 5.0s idle_timeout!
+                pbcopy_payloads.clear()
+                fake_now[0] = 200.0
+                plat_ptt._rec_active = False
+
+                def ptt_rec_then_stuck() -> bool:
+                    elapsed = fake_now[0] - 200.0
+                    plat_ptt._rec_active = 0.04 <= elapsed < 12.04
+                    return True
+
+                wire_plat(plat_ptt, ptt_rec_then_stuck)
+                out_ptt_idle = plat_ptt.deliver_text(
+                    "ptt录音后卡键回退",
+                    seq_id=2,
+                    origin_window=origin_iterm,
+                    fallback_clipboard_text="ptt兜底文本",
+                )
+                self.assertFalse(out_ptt_idle.pasted)
+                self.assertTrue(out_ptt_idle.clipboard)
+                self.assertEqual(out_ptt_idle.reason, "focus_changed")
+                self.assertGreaterEqual(fake_now[0] - 200.0, 17.0)
+                self.assertLess(fake_now[0] - 200.0, 17.3)
+                self.assertEqual(pbcopy_payloads, ["ptt兜底文本"])
+
+                # 3b. PTT recording > 8s followed by clean release pastes successfully
+                pbcopy_payloads.clear()
+                fake_now[0] = 300.0
+                plat_ptt._rec_active = True
+
+                def ptt_rec_then_release() -> bool:
+                    elapsed = fake_now[0] - 300.0
+                    if elapsed < 8.5:
+                        plat_ptt._rec_active = True
+                        return True
+                    plat_ptt._rec_active = False
+                    return elapsed < 9.0
+
+                wire_plat(plat_ptt, ptt_rec_then_release)
+                out_ptt_ok = plat_ptt.deliver_text("ptt长按录音后正常松键粘贴", seq_id=3, origin_window=origin_iterm)
+                self.assertTrue(out_ptt_ok.pasted)
+                self.assertAlmostEqual(fake_now[0] - 300.0, 9.0, delta=0.15)
+                self.assertEqual(pbcopy_payloads, ["ptt长按录音后正常松键粘贴"])
+
+                # 4. Consecutive key_state is None times out after 4.0s (even during active PTT),
+                #    while 3 transient Nones reset cleanly upon receiving True and still paste on False.
+                pbcopy_payloads.clear()
+                fake_now[0] = 400.0
+                plat_ptt._rec_active = True
+                wire_plat(plat_ptt, lambda: None)
+                out_unavail = plat_ptt.deliver_text(
+                    "shim无响应4秒回退",
+                    seq_id=4,
+                    origin_window=origin_iterm,
+                    fallback_clipboard_text="无响应兜底文本",
+                )
+                self.assertFalse(out_unavail.pasted)
+                self.assertTrue(out_unavail.clipboard)
+                self.assertEqual(out_unavail.reason, "focus_changed")
+                self.assertAlmostEqual(fake_now[0] - 400.0, 4.0, delta=0.15)
+                self.assertEqual(pbcopy_payloads, ["无响应兜底文本"])
+
+                pbcopy_payloads.clear()
+                fake_now[0] = 500.0
+                plat_ptt._rec_active = False
+                # 3 Nones -> True (resets unavail_since) -> 3 Nones -> False (releases cleanly)
+                jitter_seq = iter([None, None, None, True, None, None, None, False])
+                jitter_calls = [0]
+
+                def jitter_key_state() -> bool | None:
+                    jitter_calls[0] += 1
+                    return next(jitter_seq)
+
+                wire_plat(plat_tap, jitter_key_state)
+                out_jitter = plat_tap.deliver_text("瞬态None抖动恢复后粘贴", seq_id=5, origin_window=origin_iterm)
+                self.assertTrue(out_jitter.pasted)
+                self.assertEqual(jitter_calls[0], 8)
+                self.assertEqual(pbcopy_payloads, ["瞬态None抖动恢复后粘贴"])
+
+                # 4b. Two separate 3.0s None stretches separated by a single True (total 6.0s > 4.0s)
+                #     MUST reset unavail_since on True and paste cleanly when False arrives!
+                pbcopy_payloads.clear()
+                fake_now[0] = 600.0
+                plat_ptt._rec_active = True
+                saw_mid_true = [False]
+
+                def two_stretch_none_with_true_reset() -> bool | None:
+                    elapsed = fake_now[0] - 600.0
+                    if elapsed < 3.0:
+                        return None
+                    if not saw_mid_true[0]:
+                        saw_mid_true[0] = True
+                        return True
+                    if elapsed < 6.0:
+                        return None
+                    plat_ptt._rec_active = False
+                    return False
+
+                wire_plat(plat_ptt, two_stretch_none_with_true_reset)
+                out_reset_ok = plat_ptt.deliver_text("两段3秒None中间True清零后粘贴", seq_id=6, origin_window=origin_iterm)
+                self.assertTrue(out_reset_ok.pasted)
+                self.assertTrue(saw_mid_true[0])
+                self.assertGreaterEqual(fake_now[0] - 600.0, 6.0)
+                self.assertEqual(pbcopy_payloads, ["两段3秒None中间True清零后粘贴"])
+
+                # 5. Immediate key_state freshness recheck BEFORE before_commit() preserves real CancelToken cancellability;
+                #    if paste_cmd_v still hits <1ms key_held window after commit, degrade cleanly to clipboard (no retry loop).
+                from agent_voice_input.http_transport import CancelToken
+
+                pbcopy_payloads.clear()
+                fake_now[0] = 700.0
+                plat_clip = MacOSPlatform(
+                    cfg_tap, env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"}, cache_dir=Path(td) / "c_clip"
+                )
+                plat_clip._has_managed_shim = lambda: True  # type: ignore[method-assign]
+                plat_clip._shim_caps = frozenset({"paste_clip", "key_state_immediate"})
+                plat_clip._flush_shim_events = lambda timeout_sec=0.05: True  # type: ignore[method-assign]
+                plat_clip.beep = lambda _k: None  # type: ignore[method-assign]
+
+                # 5a. FIFO key_state=False -> flush ok -> immediate key_state=True re-enters wait while CancelToken stays ACTIVE;
+                #     cancelling the real CancelToken during re-wait aborts cleanly with 0 paste_cmd_v calls and uncommitted token!
+                tok_cancel = CancelToken()
+                paste_attempts_5a = [0]
+                ks_calls_5a: list[bool] = []
+
+                def clip_imm_rehold_then_cancel(
+                    payload: dict[str, object], timeout_sec: float = 1.5, **kw: object
+                ) -> dict[str, object]:
+                    del timeout_sec, kw
+                    op = payload.get("cmd")
+                    if op == "fg_window":
+                        return {
+                            "ok": True,
+                            "hwnd": 100,
+                            "process": "iTerm2",
+                            "bundle_id": "com.googlecode.iterm2",
+                            "pid": 512,
+                            "title": "claude [#abcd1234]",
+                            "ax_trusted": True,
+                        }
+                    if op == "key_state":
+                        is_imm = bool(payload.get("immediate"))
+                        ks_calls_5a.append(is_imm)
+                        if len(ks_calls_5a) == 1:
+                            return {"ok": True, "hotkey_held": False}
+                        if len(ks_calls_5a) == 2:
+                            self.assertTrue(is_imm)
+                            return {"ok": True, "hotkey_held": True}
+                        # Cancel real CancelToken during the re-entered wait (MUST still be ACTIVE, not COMMITTED!)
+                        self.assertTrue(tok_cancel.cancel("hold_cancel"))
+                        return {"ok": True, "hotkey_held": True}
+                    if op == "paste_cmd_v":
+                        paste_attempts_5a[0] += 1
+                        return {"ok": True, "posted": True, "clipboard": True, "reason": "ok"}
+                    return {"ok": True}
+
+                plat_clip._shim_rpc = clip_imm_rehold_then_cancel  # type: ignore[method-assign]
+                out_imm_cancel = plat_clip.deliver_text(
+                    "即时复核重等期间取消生效",
+                    seq_id=7,
+                    origin_window=origin_iterm,
+                    is_cancelled=tok_cancel.is_cancelled,
+                    before_commit=tok_cancel.try_commit,
+                )
+                self.assertFalse(out_imm_cancel.pasted)
+                self.assertFalse(out_imm_cancel.clipboard)
+                self.assertEqual(out_imm_cancel.reason, "cancelled")
+                self.assertTrue(tok_cancel.is_cancelled())
+                self.assertFalse(tok_cancel.is_committed())
+                self.assertEqual(paste_attempts_5a[0], 0)
+                self.assertEqual(pbcopy_payloads, [])
+                self.assertEqual(ks_calls_5a, [False, True, False])
+
+                # 5b. Immediate key_state=True re-enters wait, then releases cleanly -> commits & pastes once
+                pbcopy_payloads.clear()
+                fake_now[0] = 750.0
+                tok_ok = CancelToken()
+                paste_attempts_5b = [0]
+                ks_calls_5b: list[bool] = []
+
+                def clip_imm_rehold_then_paste(
+                    payload: dict[str, object], timeout_sec: float = 1.5, **kw: object
+                ) -> dict[str, object]:
+                    del timeout_sec, kw
+                    op = payload.get("cmd")
+                    if op == "fg_window":
+                        return {
+                            "ok": True,
+                            "hwnd": 100,
+                            "process": "iTerm2",
+                            "bundle_id": "com.googlecode.iterm2",
+                            "pid": 512,
+                            "title": "claude [#abcd1234]",
+                            "ax_trusted": True,
+                        }
+                    if op == "key_state":
+                        is_imm = bool(payload.get("immediate"))
+                        ks_calls_5b.append(is_imm)
+                        # 1: FIFO False -> 2: immediate True (re-wait) -> 3: FIFO False -> 4: immediate False (commit & paste)
+                        return {"ok": True, "hotkey_held": (len(ks_calls_5b) == 2)}
+                    if op == "paste_cmd_v":
+                        paste_attempts_5b[0] += 1
+                        return {"ok": True, "posted": True, "clipboard": True, "reason": "ok", "fg_process": "iTerm2"}
+                    return {"ok": True}
+
+                plat_clip._shim_rpc = clip_imm_rehold_then_paste  # type: ignore[method-assign]
+                out_imm_ok = plat_clip.deliver_text(
+                    "即时复核重等松键后粘贴",
+                    seq_id=8,
+                    origin_window=origin_iterm,
+                    is_cancelled=tok_ok.is_cancelled,
+                    before_commit=tok_ok.try_commit,
+                )
+                self.assertTrue(out_imm_ok.pasted)
+                self.assertTrue(tok_ok.is_committed())
+                self.assertEqual(paste_attempts_5b[0], 1)
+                self.assertEqual(ks_calls_5b, [False, True, False, True])
+
+                # 5c. Extreme <1ms window: paste_cmd_v returns reason="key_held" AFTER before_commit() ->
+                #     MUST degrade directly to persistent clipboard (copied/key_held) with ZERO retry RPCs!
+                pbcopy_payloads.clear()
+                fake_now[0] = 800.0
+                tok_narrow = CancelToken()
+                paste_attempts_5c = [0]
+
+                def clip_narrow_key_held(
+                    payload: dict[str, object], timeout_sec: float = 1.5, **kw: object
+                ) -> dict[str, object]:
+                    del timeout_sec, kw
+                    op = payload.get("cmd")
+                    if op == "fg_window":
+                        return {
+                            "ok": True,
+                            "hwnd": 100,
+                            "process": "iTerm2",
+                            "bundle_id": "com.googlecode.iterm2",
+                            "pid": 512,
+                            "title": "claude [#abcd1234]",
+                            "ax_trusted": True,
+                        }
+                    if op == "key_state":
+                        return {"ok": True, "hotkey_held": False}
+                    if op == "paste_cmd_v":
+                        paste_attempts_5c[0] += 1
+                        return {
+                            "type": "reply",
+                            "reply": "paste_cmd_v",
+                            "ok": False,
+                            "posted": False,
+                            "clipboard": False,
+                            "reason": "key_held",
+                        }
+                    return {"ok": True}
+
+                plat_clip._shim_rpc = clip_narrow_key_held  # type: ignore[method-assign]
+                out_kh_degrade = plat_clip.deliver_text(
+                    "极窄窗口key_held直接降级剪贴板",
+                    seq_id=9,
+                    origin_window=origin_iterm,
+                    fallback_clipboard_text="key_held安全兜底",
+                    is_cancelled=tok_narrow.is_cancelled,
+                    before_commit=tok_narrow.try_commit,
+                )
+                self.assertFalse(out_kh_degrade.pasted)
+                self.assertTrue(out_kh_degrade.clipboard)
+                self.assertEqual(out_kh_degrade.reason, "key_held")
+                self.assertTrue(tok_narrow.is_committed())
+                self.assertEqual(paste_attempts_5c[0], 1, "must never retry paste_cmd_v after CancelToken is committed")
+                self.assertEqual(pbcopy_payloads, ["key_held安全兜底"])
+
+                # 5d. Fake clock expires right after waking from wait -> NEVER sends paste_cmd_v, falls back to clipboard
+                pbcopy_payloads.clear()
+                fake_now[0] = 900.0
+                paste_attempts_5d = [0]
+                ks_step_5d = [0]
+
+                def clip_expire_on_wake(
+                    payload: dict[str, object], timeout_sec: float = 1.5, **kw: object
+                ) -> dict[str, object]:
+                    del timeout_sec, kw
+                    op = payload.get("cmd")
+                    if op == "fg_window":
+                        return {
+                            "ok": True,
+                            "hwnd": 100,
+                            "process": "iTerm2",
+                            "bundle_id": "com.googlecode.iterm2",
+                            "pid": 512,
+                            "title": "claude [#abcd1234]",
+                            "ax_trusted": True,
+                        }
+                    if op == "key_state":
+                        ks_step_5d[0] += 1
+                        if ks_step_5d[0] == 1:
+                            return {"ok": True, "hotkey_held": True}
+                        # Simulate RPC / wake crossing the 5.0s deadline before returning False
+                        fake_now[0] = 905.2
+                        return {"ok": True, "hotkey_held": False}
+                    if op == "paste_cmd_v":
+                        paste_attempts_5d[0] += 1
+                        return {"ok": True, "posted": True, "clipboard": True, "reason": "ok"}
+                    return {"ok": True}
+
+                plat_clip._shim_rpc = clip_expire_on_wake  # type: ignore[method-assign]
+                out_exp_wake = plat_clip.deliver_text(
+                    "醒来已超期禁止发粘贴RPC",
+                    seq_id=10,
+                    origin_window=origin_iterm,
+                    fallback_clipboard_text="超期不发粘贴兜底",
+                )
+                self.assertFalse(out_exp_wake.pasted)
+                self.assertTrue(out_exp_wake.clipboard)
+                self.assertEqual(out_exp_wake.reason, "focus_changed")
+                self.assertEqual(paste_attempts_5d[0], 0)
+                self.assertEqual(pbcopy_payloads, ["超期不发粘贴兜底"])
+
+                # 5e. Immediate key_state returns False at 4.9s (< 5.0s deadline), but the subsequent
+                #     focus recheck finishes at 5.2s (>= 5.0s) returning the same window -> MUST NOT
+                #     send paste_cmd_v, and must degrade cleanly to persistent clipboard.
+                pbcopy_payloads.clear()
+                fake_now[0] = 1000.0
+                paste_attempts_5e = [0]
+                fg_calls_5e = [0]
+                ks_calls_5e: list[bool] = []
+
+                def clip_expire_during_focus_recheck(
+                    payload: dict[str, object], timeout_sec: float = 1.5, **kw: object
+                ) -> dict[str, object]:
+                    del timeout_sec, kw
+                    op = payload.get("cmd")
+                    if op == "fg_window":
+                        fg_calls_5e[0] += 1
+                        if fg_calls_5e[0] >= 2:
+                            fake_now[0] = 1005.2
+                        return {
+                            "ok": True,
+                            "hwnd": 100,
+                            "process": "iTerm2",
+                            "bundle_id": "com.googlecode.iterm2",
+                            "pid": 512,
+                            "title": "claude [#abcd1234]",
+                            "ax_trusted": True,
+                        }
+                    if op == "key_state":
+                        is_imm = bool(payload.get("immediate"))
+                        ks_calls_5e.append(is_imm)
+                        if len(ks_calls_5e) == 1:
+                            return {"ok": True, "hotkey_held": True}
+                        fake_now[0] = 1004.9
+                        return {"ok": True, "hotkey_held": False}
+                    if op == "paste_cmd_v":
+                        paste_attempts_5e[0] += 1
+                        return {"ok": True, "posted": True, "clipboard": True, "reason": "ok"}
+                    return {"ok": True}
+
+                plat_clip._shim_rpc = clip_expire_during_focus_recheck  # type: ignore[method-assign]
+                out_focus_exp = plat_clip.deliver_text(
+                    "焦点复核跨过期限禁止提交粘贴",
+                    seq_id=11,
+                    origin_window=origin_iterm,
+                    fallback_clipboard_text="焦点复核超期兜底",
+                )
+                self.assertFalse(out_focus_exp.pasted)
+                self.assertTrue(out_focus_exp.clipboard)
+                self.assertEqual(out_focus_exp.reason, "focus_changed")
+                self.assertEqual(paste_attempts_5e[0], 0)
+                self.assertEqual(fg_calls_5e[0], 2)
+                self.assertEqual(ks_calls_5e, [False, False, True])
+                self.assertEqual(pbcopy_payloads, ["焦点复核超期兜底"])
+
+            # 6. Real _event_worker flush barrier on key_state == False (both [False] and [True, False]):
+            #    When a preceding event temporarily occupies _event_worker past a 50ms flush slice and
+            #    hold_cancel is queued right behind it, deliver_text MUST NOT paste prematurely and
+            #    MUST honor cancellation once the worker drains hold_cancel.
+            for case_idx, ks_values in enumerate(([False], [True, False])):
+                pbcopy_payloads.clear()
+                cmd_v_count[0] = 0
+                plat_flush = MacOSPlatform(
+                    cfg_tap,
+                    env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"},
+                    cache_dir=Path(td) / f"c_flush_{case_idx}",
+                )
+                plat_flush._paste_hold_timeout_sec = 2.0
+                blocker = threading.Event()
+                blocker_entered = threading.Event()
+                cancelled = [False]
+                flush_returns: list[bool] = []
+                paste_rpc_calls = [0]
+
+                def on_evt(msg: dict[str, Any], _blk=blocker, _ent=blocker_entered, _can=cancelled) -> None:
+                    if msg.get("event") == "slow_prev":
+                        _ent.set()
+                        _blk.wait(timeout=2.0)
+                    elif msg.get("event") == "hold_cancel":
+                        _can[0] = True
+
+                plat_flush._on_event = on_evt
+                plat_flush._ensure_event_worker()
+                orig_flush = plat_flush._flush_shim_events
+
+                def spy_flush(timeout_sec: float = 0.05, _orig=orig_flush, _rec=flush_returns) -> bool:
+                    ok = _orig(timeout_sec=timeout_sec)
+                    _rec.append(ok)
+                    return ok
+
+                plat_flush._flush_shim_events = spy_flush  # type: ignore[method-assign]
+                ks_iter = iter(ks_values)
+
+                def flush_rpc(payload: dict[str, object], timeout_sec: float = 0.8, **kw: object) -> dict[str, object]:
+                    del timeout_sec, kw
+                    op = payload.get("cmd")
+                    if op == "fg_window":
+                        return {
+                            "ok": True,
+                            "hwnd": 100,
+                            "process": "iTerm2",
+                            "bundle_id": "com.googlecode.iterm2",
+                            "pid": 512,
+                            "title": "claude [#abcd1234]",
+                            "ax_trusted": True,
+                        }
+                    if op == "key_state":
+                        return {"ok": True, "hotkey_held": next(ks_iter, False)}
+                    if op == "paste_cmd_v":
+                        paste_rpc_calls[0] += 1
+                        return {"ok": True, "posted": True, "clipboard": True, "reason": "ok"}
+                    return {"ok": True}
+
+                plat_flush._shim_rpc = flush_rpc  # type: ignore[method-assign]
+                plat_flush._shim_caps = frozenset({"paste_clip"})
+                try:
+                    plat_flush._event_q.put({"event": "slow_prev"})
+                    plat_flush._event_q.put({"event": "hold_cancel"})
+                    self.assertTrue(blocker_entered.wait(timeout=1.0))
+                    release_timer = threading.Timer(0.14, blocker.set)
+                    release_timer.start()
+                    try:
+                        with (
+                            mock.patch("agent_voice_input.platform_macos.shutil.which", return_value="/usr/bin/mock"),
+                            mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=fake_run),
+                        ):
+                            out_cancel = plat_flush.deliver_text(
+                                f"排空前禁止提前粘贴_{case_idx}",
+                                seq_id=100 + case_idx,
+                                origin_window=origin_iterm,
+                                is_cancelled=lambda: cancelled[0],
+                            )
+                    finally:
+                        release_timer.cancel()
+                        blocker.set()
+                    self.assertFalse(out_cancel.pasted)
+                    self.assertFalse(out_cancel.clipboard)
+                    self.assertEqual(out_cancel.reason, "cancelled")
+                    self.assertEqual(paste_rpc_calls[0], 0, f"case {ks_values}: must NEVER call paste_cmd_v before event queue drains")
+                    self.assertEqual(cmd_v_count[0], 0)
+                    self.assertEqual(pbcopy_payloads, [])
+                    self.assertIn(False, flush_returns, f"case {ks_values}: expected at least one _flush_shim_events timeout retry")
+                finally:
+                    plat_flush.close()
 
 
 if __name__ == "__main__":

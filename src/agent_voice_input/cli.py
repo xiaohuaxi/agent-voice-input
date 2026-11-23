@@ -682,13 +682,13 @@ def _inspect_hook_summary(env: Mapping[str, str], rt_dir: Path) -> str:
     configured: list[str] = []
     for label, rels in (
         ("claude", ("~/.claude/settings.json",)),
-        ("gemini/agy", ("~/.gemini/hooks.json", "~/.gemini/settings.json")),
+        ("gemini/agy", ("~/.gemini/config/hooks.json", "~/.gemini/hooks.json", "~/.gemini/settings.json")),
         ("codex", ("~/.codex/config.toml",)),
     ):
         for rel in rels:
             p = expand_user_path(rel, env=env)
             try:
-                if p.is_file() and not p.is_symlink() and p.stat().st_size <= 524_288:
+                if p.is_file() and p.stat().st_size <= 524_288:
                     hook_txt = p.read_text(encoding="utf-8", errors="ignore")
                     matched = False
                     if p.suffix.lower() == ".json":

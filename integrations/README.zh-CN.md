@@ -63,9 +63,9 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
 
 ---
 
-## 3. Antigravity CLI (`~/.gemini/hooks.json`)
+## 3. Antigravity CLI (`~/.gemini/config/hooks.json`)
 
-参考 [`gemini/hooks.json`](gemini/hooks.json)，在 `~/.gemini/hooks.json` 中加入 `voice-session-title`：
+参考 [`gemini/hooks.json`](gemini/hooks.json)，在 `~/.gemini/config/hooks.json` 中加入 `voice-session-title`（`doctor` 同时兼容旧路径 `~/.gemini/hooks.json` 与 `~/.gemini/settings.json`）：
 
 ```json
 {

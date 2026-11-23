@@ -2,7 +2,7 @@
 # Lightweight standalone OSC 2 title hook for headless remote Linux hosts without agent-voice-input installed.
 # Usage:
 #   Claude Code (~/.claude/settings.json):  ~/.local/bin/remote-title-hook.sh claude
-#   Antigravity CLI (~/.gemini/hooks.json): ~/.local/bin/remote-title-hook.sh agy
+#   Antigravity CLI (~/.gemini/config/hooks.json; legacy ~/.gemini/hooks.json): ~/.local/bin/remote-title-hook.sh agy
 set -u
 exec python3 -c '
 import json, os, re, shutil, socket, stat, subprocess, sys

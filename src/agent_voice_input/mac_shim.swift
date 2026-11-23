@@ -1633,17 +1633,22 @@ final class HudPillController {
 
     private func activeScreenMetrics() -> (scale: CGFloat, visibleFrame: NSRect) {
         let screens = NSScreen.screens
-        let screenFrames = screens.map { $0.frame }
-        let mainIdx = NSScreen.main.flatMap { mainScr in screens.firstIndex(where: { $0 === mainScr }) }
-        let pickedIdx = selectHudScreenIndex(
-            screenFrames: screenFrames,
-            focusedWindowCgFrame: queryFrontmostWindowCgFrame(),
-            mouseLocation: NSEvent.mouseLocation,
-            mainScreenIndex: mainIdx
-        )
-        let activeScreen = pickedIdx.flatMap { idx in (idx >= 0 && idx < screens.count) ? screens[idx] : nil }
-            ?? NSScreen.main
-            ?? screens.first
+        let activeScreen: NSScreen?
+        if screens.count <= 1 {
+            activeScreen = screens.first ?? NSScreen.main
+        } else {
+            let screenFrames = screens.map { $0.frame }
+            let mainIdx = NSScreen.main.flatMap { mainScr in screens.firstIndex(where: { $0 === mainScr }) }
+            let pickedIdx = selectHudScreenIndex(
+                screenFrames: screenFrames,
+                focusedWindowCgFrame: queryFrontmostWindowCgFrame(),
+                mouseLocation: NSEvent.mouseLocation,
+                mainScreenIndex: mainIdx
+            )
+            activeScreen = pickedIdx.flatMap { idx in (idx >= 0 && idx < screens.count) ? screens[idx] : nil }
+                ?? NSScreen.main
+                ?? screens.first
+        }
         let scale = activeScreen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
         let vf = activeScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         return (scale, vf)
@@ -2346,19 +2351,41 @@ private func monotonicMs() -> UInt64 {
     ProcessInfo.processInfo.systemUptime.isFinite ? UInt64(ProcessInfo.processInfo.systemUptime * 1000.0) : 0
 }
 
-private func queryFrontWindowMetadata(pid: Int, bundleId: String) -> (hwnd: Int, title: String, document: String, axTrusted: Bool) {
-    let trusted = AXIsProcessTrusted()
-    guard pid > 0 else { return (0, "", "", trusted) }
-    var winNum = 0
-    if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
-        for entry in list {
-            let ownerPid = (entry[kCGWindowOwnerPID as String] as? Int) ?? ((entry[kCGWindowOwnerPID as String] as? NSNumber)?.intValue ?? 0)
-            let layer = (entry[kCGWindowLayer as String] as? Int) ?? ((entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1)
-            if ownerPid == pid && layer == 0 {
-                winNum = (entry[kCGWindowNumber as String] as? Int) ?? ((entry[kCGWindowNumber as String] as? NSNumber)?.intValue ?? 0)
-                break
-            }
+private func queryFrontmostWindowNumber(pid: Int) -> Int {
+    guard pid > 0 else { return 0 }
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+        return 0
+    }
+    for entry in list {
+        let ownerPid = (entry[kCGWindowOwnerPID as String] as? Int) ?? ((entry[kCGWindowOwnerPID as String] as? NSNumber)?.intValue ?? 0)
+        let layer = (entry[kCGWindowLayer as String] as? Int) ?? ((entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1)
+        if ownerPid == pid && layer == 0 {
+            return (entry[kCGWindowNumber as String] as? Int) ?? ((entry[kCGWindowNumber as String] as? NSNumber)?.intValue ?? 0)
         }
+    }
+    return 0
+}
+
+private func queryFrontWindowMetadata(
+    pid: Int,
+    bundleId: String,
+    pinnedWindowId: Int? = nil,
+    liveWindowNumberProvider: (Int) -> Int = queryFrontmostWindowNumber
+) -> (hwnd: Int, title: String, document: String, axTrusted: Bool) {
+    let trusted = AXIsProcessTrusted()
+    guard pid > 0 else { return (pinnedWindowId ?? 0, "", "", trusted) }
+    let effectiveWinNum: Int
+    if let pinned = pinnedWindowId {
+        if pinned <= 0 {
+            return (0, "", "", trusted)
+        }
+        let liveWinNum = liveWindowNumberProvider(pid)
+        if liveWinNum != pinned {
+            return (pinned, "", "", trusted)
+        }
+        effectiveWinNum = pinned
+    } else {
+        effectiveWinNum = liveWindowNumberProvider(pid)
     }
     var axTitle = ""
     var axDoc = ""
@@ -2386,18 +2413,35 @@ private func queryFrontWindowMetadata(pid: Int, bundleId: String) -> (hwnd: Int,
                     axDoc = rawDoc
                 }
             }
+            if let pinned = pinnedWindowId, pinned > 0, liveWindowNumberProvider(pid) != pinned {
+                return (pinned, "", "", trusted)
+            }
         }
     }
-    return (winNum, axTitle, axDoc, trusted)
+    return (effectiveWinNum, axTitle, axDoc, trusted)
 }
 
-private func queryFrontmostApp() -> (name: String, bundleId: String, pid: Int, hwnd: Int, title: String, document: String, axTrusted: Bool) {
-    guard let app = NSWorkspace.shared.frontmostApplication else { return ("", "", 0, 0, "", "", AXIsProcessTrusted()) }
+private func postEventsIfWithinDeadline<T>(
+    events: [T],
+    deadlineMonoMs: UInt64,
+    nowMs: () -> UInt64 = monotonicMs,
+    postEvent: (T) -> Void
+) -> Bool {
+    if deadlineMonoMs > 0 && nowMs() >= deadlineMonoMs {
+        return false
+    }
+    for ev in events {
+        postEvent(ev)
+    }
+    return true
+}
+
+private func snapshotFrontmostAppBasic() -> (name: String, bundleId: String, pid: Int) {
+    guard let app = NSWorkspace.shared.frontmostApplication else { return ("", "", 0) }
     let name = app.localizedName ?? app.bundleURL?.deletingPathExtension().lastPathComponent ?? ""
     let bundleId = app.bundleIdentifier ?? ""
     let pid = Int(app.processIdentifier)
-    let meta = queryFrontWindowMetadata(pid: pid, bundleId: bundleId)
-    return (name, bundleId, pid, meta.hwnd, meta.title, meta.document, meta.axTrusted)
+    return (name, bundleId, pid)
 }
 
 private func queryFrontmostWindowCgFrame() -> CGRect? {
@@ -2779,6 +2823,7 @@ final class PasteboardGuard {
     }
 
     static let defaultMaxSnapshotBytes = 100 * 1024 * 1024
+    static let defaultMaxCaptureMs: UInt64 = 200
     static let defaultRestoreDelayMs = 250
     static let transientType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
     static let autoGeneratedType = NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType")
@@ -2787,7 +2832,7 @@ final class PasteboardGuard {
     static let ownRestoredMarker = NSPasteboard.PasteboardType("com.agentvoiceinput.restored")
     private static let baseWhitelistTypes: [NSPasteboard.PasteboardType] = [.string, .rtf, .html, .png, .fileURL]
 
-    private enum ClipSnap {
+    fileprivate enum ClipSnap {
         case clearOnly
         case items([[(NSPasteboard.PasteboardType, Data)]])
     }
@@ -2825,11 +2870,17 @@ final class PasteboardGuard {
         savedSnap = nil
     }
 
-    private func captureCurrent(pb: NSPasteboard) -> ClipSnap? {
+    fileprivate func captureCurrent(pb: NSPasteboard, deadlineMonoMs: UInt64? = nil) -> ClipSnap? {
+        if let dl = deadlineMonoMs, monotonicMs() >= dl {
+            return nil
+        }
         guard let rawItems = pb.pasteboardItems, !rawItems.isEmpty else {
             return .clearOnly
         }
         for item in rawItems {
+            if let dl = deadlineMonoMs, monotonicMs() >= dl {
+                return nil
+            }
             let itemTypes = item.types
             if itemTypes.contains(Self.concealedType) {
                 return .clearOnly
@@ -2844,6 +2895,9 @@ final class PasteboardGuard {
         var captured: [[(NSPasteboard.PasteboardType, Data)]] = []
         var totalBytes = 0
         for item in rawItems {
+            if let dl = deadlineMonoMs, monotonicMs() >= dl {
+                return nil
+            }
             let itemTypes = item.types
             var candidateTypes = Self.baseWhitelistTypes
             if !itemTypes.contains(.png) && itemTypes.contains(.tiff) {
@@ -2851,7 +2905,18 @@ final class PasteboardGuard {
             }
             var entries: [(NSPasteboard.PasteboardType, Data)] = []
             for t in candidateTypes where itemTypes.contains(t) {
-                guard let d = item.data(forType: t) else { continue }
+                if let dl = deadlineMonoMs, monotonicMs() >= dl {
+                    return nil
+                }
+                guard let d = item.data(forType: t) else {
+                    if let dl = deadlineMonoMs, monotonicMs() >= dl {
+                        return nil
+                    }
+                    continue
+                }
+                if let dl = deadlineMonoMs, monotonicMs() >= dl {
+                    return nil
+                }
                 if d.count > maxSnapshotBytes || (totalBytes + d.count) > maxSnapshotBytes {
                     return nil
                 }
@@ -2879,7 +2944,8 @@ final class PasteboardGuard {
     }
 
     func writeTransientChecked(_ text: String, deadlineMonoMs: UInt64) -> WriteOutcome {
-        if deadlineMonoMs > 0 && monotonicMs() >= deadlineMonoMs {
+        let nowMs = monotonicMs()
+        if deadlineMonoMs > 0 && nowMs >= deadlineMonoMs {
             return .expired
         }
         let pb = pasteboardProvider()
@@ -2889,7 +2955,15 @@ final class PasteboardGuard {
             }
             return pb.data(forType: Self.ownTransientMarker) == expTok
         }()
-        let nextSnap: ClipSnap? = isStillOurs ? savedSnap : captureCurrent(pb: pb)
+        let captureDeadlineMs: UInt64 = {
+            let capEnd = nowMs &+ Self.defaultMaxCaptureMs
+            if deadlineMonoMs == 0 {
+                return capEnd
+            }
+            let pasteReserveEnd = deadlineMonoMs > 250 ? (deadlineMonoMs - 250) : deadlineMonoMs
+            return min(capEnd, pasteReserveEnd)
+        }()
+        let nextSnap: ClipSnap? = isStillOurs ? savedSnap : captureCurrent(pb: pb, deadlineMonoMs: captureDeadlineMs)
         if deadlineMonoMs > 0 && monotonicMs() >= deadlineMonoMs {
             return .expired
         }
@@ -4136,6 +4210,56 @@ private func runSelfCheck() -> Int32 {
             try check(pbg.writeTransientAndArm("voice_tiff_only"), "pb transient over TIFF-only")
             pbg.flushPendingRestore()
             try check(!pbg.restorePending && testPb.data(forType: .tiff) == sampleTiff, "pb TIFF-only fallback restored")
+
+            // 6) Capture time budget guard: expired deadline returns nil immediately without blocking transient write
+            try check(PasteboardGuard.defaultMaxCaptureMs == 200, "pb defaultMaxCaptureMs 200ms")
+            testPb.clearContents()
+            let budgetItem = NSPasteboardItem()
+            try check(budgetItem.setString("budget_guard_seed", forType: .string) && testPb.writeObjects([budgetItem]), "pb seed budget guard")
+            try check(pbg.captureCurrent(pb: testPb, deadlineMonoMs: monotonicMs()) == nil, "pb captureCurrent expired returns nil")
+            let tightRes = pbg.writeTransientChecked("voice_tight_budget", deadlineMonoMs: monotonicMs() &+ 120)
+            try check(tightRes == .ok && !pbg.restorePending && testPb.string(forType: .string) == "voice_tight_budget", "pb tight deadline skips snapshot and writes transient")
+
+            // 7) Pre-keystroke total deadline recheck: expired deadline posts 0 events and flushes restored clipboard
+            testPb.clearContents()
+            let prePostSeed = NSPasteboardItem()
+            try check(prePostSeed.setString("restore_on_late_post", forType: .string) && testPb.writeObjects([prePostSeed]), "pb seed pre-post deadline")
+            let armedRes = pbg.writeTransientChecked("voice_late_post", deadlineMonoMs: monotonicMs() &+ 1250)
+            try check(armedRes == .ok && pbg.restorePending && testPb.string(forType: .string) == "voice_late_post", "pb armed before late post")
+            var postedExpiredCount = 0
+            let expiredOk = postEventsIfWithinDeadline(
+                events: [0x37, 0x09, 0x09, 0x37],
+                deadlineMonoMs: 1000,
+                nowMs: { 1000 },
+                postEvent: { _ in postedExpiredCount += 1 }
+            )
+            try check(!expiredOk && postedExpiredCount == 0, "pre-keystroke expired deadline posts zero keyboard events")
+            pbg.flushPendingRestore()
+            try check(!pbg.restorePending && testPb.string(forType: .string) == "restore_on_late_post", "pre-keystroke expired deadline restores original clipboard")
+            var postedValidCount = 0
+            let validOk = postEventsIfWithinDeadline(
+                events: [0x37, 0x09, 0x09, 0x37],
+                deadlineMonoMs: 1001,
+                nowMs: { 1000 },
+                postEvent: { _ in postedValidCount += 1 }
+            )
+            try check(validOk && postedValidCount == 4, "pre-keystroke valid deadline posts all 4 keyboard events")
+
+            // 8) Pinned trigger windowId mismatch & pinned==0 (no trigger-time window) both discard drifted window B metadata
+            let driftedMeta = queryFrontWindowMetadata(
+                pid: 4242,
+                bundleId: "com.example.editor",
+                pinnedWindowId: 101,
+                liveWindowNumberProvider: { _ in 202 }
+            )
+            try check(driftedMeta.hwnd == 101 && driftedMeta.title.isEmpty && driftedMeta.document.isEmpty, "pinned windowId drift discards window B title/document")
+            let zeroPinnedMeta = queryFrontWindowMetadata(
+                pid: 4242,
+                bundleId: "com.example.editor",
+                pinnedWindowId: 0,
+                liveWindowNumberProvider: { _ in 303 }
+            )
+            try check(zeroPinnedMeta.hwnd == 0 && zeroPinnedMeta.title.isEmpty && zeroPinnedMeta.document.isEmpty, "pinned windowId == 0 never backfills later window B")
         }
 
         let hudLayoutCases = try runHudLayoutSelfCheck()
@@ -4193,6 +4317,9 @@ struct MacShimMain {
         let hud = HudPillController(hotkeyLabel: spec.hudLabel, hotkeyLabelEn: spec.hudLabelEn, isPtt: isPtt)
         let audioMonitor = CoreAudioInputMonitor()
         let pasteboardGuard = PasteboardGuard()
+        let audioQueryQueue = DispatchQueue(label: "agent_voice_input.audio_query", qos: .userInitiated)
+        let windowQueryQueue = DispatchQueue(label: "agent_voice_input.window_query", qos: .userInitiated)
+        let eventEmitQueue = DispatchQueue(label: "agent_voice_input.event_emit", qos: .userInitiated)
         var engine = HotkeyEngine(
             spec: spec,
             isPtt: isPtt,
@@ -4224,15 +4351,25 @@ struct MacShimMain {
         }
 
         let emitStepEvents: ([EmittedEvent], UInt64) -> Void = { emitted, now in
-            for item in emitted {
-                if isKeyTest {
+            if isKeyTest {
+                for item in emitted {
                     let kname = KEY_CODE_NAMES[item.vk] ?? String(format: "VK_0x%02X", item.vk)
                     var ktPayload: [String: Any] = ["event": item.kind, "vk": String(format: "0x%02X", item.vk), "key_name": kname, "flags": String(format: "0x%X", item.flags), "is_down": item.isDown, "tainted": item.tainted]
                     if item.kind == "hold_cancel" { ktPayload["hold_ms"] = item.holdMs }
                     writeJsonLine(ktPayload)
-                } else {
-                    let fg = queryFrontmostApp()
-                    var payload: [String: Any] = ["event": item.kind, "hwnd": fg.hwnd, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": fg.title, "document": fg.document, "ax_trusted": fg.axTrusted, "ts_ms": now]
+                }
+                return
+            }
+            for item in emitted {
+                let appSnap = snapshotFrontmostAppBasic()
+                let pinnedHwnd = queryFrontmostWindowNumber(pid: appSnap.pid)
+                eventEmitQueue.async {
+                    let meta = queryFrontWindowMetadata(
+                        pid: appSnap.pid,
+                        bundleId: appSnap.bundleId,
+                        pinnedWindowId: pinnedHwnd
+                    )
+                    var payload: [String: Any] = ["event": item.kind, "hwnd": meta.hwnd, "process": appSnap.name, "bundle_id": appSnap.bundleId, "pid": appSnap.pid, "title": meta.title, "document": meta.document, "ax_trusted": meta.axTrusted, "ts_ms": now]
                     if item.kind == "hold_cancel" { payload["hold_ms"] = item.holdMs }
                     writeJsonLine(payload)
                 }
@@ -4356,38 +4493,70 @@ struct MacShimMain {
             guard powerResumeDebouncer.shouldEmit(nowMs: now) else { return }
             let resetStep = engine.resetForPowerResume()
             applyStep(resetStep, now: now)
-            writeJsonLine(["event": "power_resume", "ts_ms": now])
+            eventEmitQueue.async {
+                writeJsonLine(["event": "power_resume", "ts_ms": now])
+            }
         }
         var postAccessPrompted = false
+
+        let isHotkeyOrModifierHeld: () -> Bool = {
+            let modFlags = CGEventSource.flagsState(.combinedSessionState)
+            let blockingMods: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
+            let fnHeld = (spec.highFlag == FLAG_FUNCTION) && modFlags.contains(.maskSecondaryFn)
+            let nonModHeld = !spec.isModifier && (
+                CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(spec.primaryKeyCode))
+                || spec.altKeyCodes.contains(where: { CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0)) })
+            )
+            return engine.targetDown || !modFlags.intersection(blockingMods).isEmpty || fnHeld || nonModHeld
+        }
 
         let stdinThread = Thread {
             while let rawLine = readLine(strippingNewline: true) {
                 let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
                 if trimmed.isEmpty { continue }
                 let enqueuedMs = monotonicMs()
-                DispatchQueue.main.async {
-                    guard let data = trimmed.data(using: .utf8),
-                          let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
-                    let op = (obj["cmd"] as? String) ?? "unknown"
-                    let seqId = (obj["seq_id"] as? Int) ?? ((obj["seq_id"] as? NSNumber)?.intValue ?? 0)
-                    switch op {
-                    case "ping":
+                guard let data = trimmed.data(using: .utf8),
+                      let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+                let op = (obj["cmd"] as? String) ?? "unknown"
+                let seqId = (obj["seq_id"] as? Int) ?? ((obj["seq_id"] as? NSNumber)?.intValue ?? 0)
+                switch op {
+                case "ping":
+                    audioQueryQueue.async {
                         writeJsonLine(["type": "reply", "reply": "ping", "seq_id": seqId, "ok": true, "ax_trusted": AXIsProcessTrusted(), "listen_event_access": CGPreflightListenEventAccess(), "audio_status": queryAudioInputStatus()])
-                    case "fg_window":
-                        let fg = queryFrontmostApp()
-                        writeJsonLine(["type": "reply", "reply": "fg_window", "seq_id": seqId, "ok": true, "hwnd": fg.hwnd, "process": fg.name, "bundle_id": fg.bundleId, "pid": fg.pid, "title": fg.title, "document": fg.document, "ax_trusted": fg.axTrusted])
-                    case "audio_status":
+                    }
+                    continue
+                case "audio_status":
+                    audioQueryQueue.async {
                         writeJsonLine(["type": "reply", "reply": true, "seq_id": seqId, "ok": true, "audio_status": queryAudioInputStatus()])
+                    }
+                    continue
+                default:
+                    break
+                }
+                DispatchQueue.main.async {
+                    switch op {
+                    case "fg_window":
+                        let appSnap = snapshotFrontmostAppBasic()
+                        let pinnedHwnd = queryFrontmostWindowNumber(pid: appSnap.pid)
+                        windowQueryQueue.async {
+                            let meta = queryFrontWindowMetadata(
+                                pid: appSnap.pid,
+                                bundleId: appSnap.bundleId,
+                                pinnedWindowId: pinnedHwnd
+                            )
+                            writeJsonLine(["type": "reply", "reply": "fg_window", "seq_id": seqId, "ok": true, "hwnd": meta.hwnd, "process": appSnap.name, "bundle_id": appSnap.bundleId, "pid": appSnap.pid, "title": meta.title, "document": meta.document, "ax_trusted": meta.axTrusted])
+                        }
                     case "key_state":
-                        let modFlags = CGEventSource.flagsState(.combinedSessionState)
-                        let blockingMods: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
-                        let fnHeld = (spec.highFlag == FLAG_FUNCTION) && modFlags.contains(.maskSecondaryFn)
-                        let nonModHeld = !spec.isModifier && (
-                            CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(spec.primaryKeyCode))
-                            || spec.altKeyCodes.contains(where: { CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0)) })
-                        )
-                        let held = engine.targetDown || !modFlags.intersection(blockingMods).isEmpty || fnHeld || nonModHeld
-                        writeJsonLine(["type": "reply", "reply": "key_state", "seq_id": seqId, "ok": true, "hotkey_held": held])
+                        let held = isHotkeyOrModifierHeld()
+                        let immediate = parseOptionalBool(obj["immediate"]) ?? false
+                        let replyPayload: [String: Any] = ["type": "reply", "reply": "key_state", "seq_id": seqId, "ok": true, "hotkey_held": held]
+                        if immediate {
+                            writeJsonLine(replyPayload)
+                        } else {
+                            eventEmitQueue.async {
+                                writeJsonLine(replyPayload)
+                            }
+                        }
                     case "paste_cmd_v":
                         let pasteTextOpt = obj["text"] as? String
                         let fbText: String = {
@@ -4396,6 +4565,7 @@ struct MacShimMain {
                             }
                             return pasteTextOpt ?? ""
                         }()
+                        let forceClipboardOnly = parseOptionalBool(obj["force_clipboard_only"]) ?? false
                         let pasteDeadlineMs: UInt64 = enqueuedMs &+ 1250
                         if monotonicMs() >= pasteDeadlineMs {
                             if pasteTextOpt != nil {
@@ -4406,6 +4576,15 @@ struct MacShimMain {
                             } else {
                                 writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": false, "reason": "shim_paste_unconfirmed"])
                             }
+                            return
+                        }
+                        if !forceClipboardOnly && isHotkeyOrModifierHeld() {
+                            var heldPayload: [String: Any] = [
+                                "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": false,
+                                "posted": false, "reason": "key_held",
+                            ]
+                            if pasteTextOpt != nil { heldPayload["clipboard"] = false }
+                            writeJsonLine(heldPayload)
                             return
                         }
                         guard CGPreflightPostEventAccess() else {
@@ -4442,18 +4621,7 @@ struct MacShimMain {
                             let curProc = normProc(curName)
                             let curBundle = (curApp.bundleIdentifier ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                             let curPid = Int(curApp.processIdentifier)
-                            var curHwnd = 0
-                            if expHwnd > 0 && curPid > 0,
-                               let wlist = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
-                                for entry in wlist {
-                                    let ownerPid = (entry[kCGWindowOwnerPID as String] as? Int) ?? ((entry[kCGWindowOwnerPID as String] as? NSNumber)?.intValue ?? 0)
-                                    let wLayer = (entry[kCGWindowLayer as String] as? Int) ?? ((entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1)
-                                    if ownerPid == curPid && wLayer == 0 {
-                                        curHwnd = (entry[kCGWindowNumber as String] as? Int) ?? ((entry[kCGWindowNumber as String] as? NSNumber)?.intValue ?? 0)
-                                        break
-                                    }
-                                }
-                            }
+                            let curHwnd = (expHwnd > 0 && curPid > 0) ? queryFrontmostWindowNumber(pid: curPid) : 0
                             let appMismatch = (!expBundle.isEmpty && !curBundle.isEmpty && curBundle != expBundle)
                                 || ((expBundle.isEmpty || curBundle.isEmpty) && !expProc.isEmpty && !curProc.isEmpty && curProc != expProc)
                                 || (curBundle.isEmpty && curProc.isEmpty)
@@ -4528,8 +4696,22 @@ struct MacShimMain {
                         }
                         let postedOk = (events.count == steps.count)
                         if postedOk {
-                            for ev in events {
+                            let postedWithinDeadline = postEventsIfWithinDeadline(events: events, deadlineMonoMs: pasteDeadlineMs) { ev in
                                 ev.post(tap: .cghidEventTap)
+                            }
+                            if !postedWithinDeadline {
+                                if pasteTextOpt != nil {
+                                    pasteboardGuard.flushPendingRestore()
+                                    var expPayload: [String: Any] = [
+                                        "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
+                                        "posted": false, "clipboard": false, "reason": "shim_paste_unconfirmed",
+                                    ]
+                                    if !verifiedFgName.isEmpty { expPayload["fg_process"] = verifiedFgName }
+                                    writeJsonLine(expPayload)
+                                } else {
+                                    writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": false, "reason": "shim_paste_unconfirmed"])
+                                }
+                                return
                             }
                             if pasteTextOpt != nil {
                                 var okPayload: [String: Any] = [
@@ -4595,7 +4777,7 @@ struct MacShimMain {
         stdinThread.name = "mac-shim-stdin"
         stdinThread.start()
 
-        writeJsonLine(["event": "ready", "target_vk": String(format: "0x%02X", spec.primaryKeyCode), "mode": triggerMode, "listen_access": hasListenAccess, "ui_culture": hostUiCulture(), "caps": ["paste_clip"], "audio_status": initialAudioStatus])
+        writeJsonLine(["event": "ready", "target_vk": String(format: "0x%02X", spec.primaryKeyCode), "mode": triggerMode, "listen_access": hasListenAccess, "ui_culture": hostUiCulture(), "caps": ["paste_clip", "key_state_immediate"], "audio_status": initialAudioStatus])
         app.run(); cleanupAndExit(0)
     }
 }

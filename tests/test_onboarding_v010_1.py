@@ -1023,28 +1023,38 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             rt.mkdir(mode=0o700)
             env_base = {"HOME": str(home), "PATH": "", "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
 
-            # 1. _inspect_hook_summary detects ~/.gemini/hooks.json, keeps ~/.gemini/settings.json fallback,
-            #    and deduplicates gemini/agy when both files contain session-hook.
+            # 1. _inspect_hook_summary detects ~/.gemini/config/hooks.json (preferred), ~/.gemini/hooks.json,
+            #    and ~/.gemini/settings.json fallback, deduplicates across all 3 paths, and follows symlinked configs.
             self.assertEqual(
                 cli_mod._inspect_hook_summary(env_base, rt),
                 "hooks=none configured (optional), active_registry_entries=0",
             )
             gemini_dir = home / ".gemini"
-            gemini_dir.mkdir(mode=0o700)
+            gemini_cfg_dir = gemini_dir / "config"
+            gemini_cfg_dir.mkdir(parents=True, mode=0o700)
+            cfg_hooks_json = gemini_cfg_dir / "hooks.json"
             hooks_json = gemini_dir / "hooks.json"
             settings_json = gemini_dir / "settings.json"
-            hooks_json.write_text(
-                '{"voice-session-title":{"SessionStart":[{"command":"agent-voice-input session-hook --cli agy"}]}}\n',
-                encoding="utf-8",
+            agy_hook_payload = (
+                '{"voice-session-title":{"SessionStart":[{"command":"agent-voice-input session-hook --cli agy"}]}}\n'
             )
+            # 1a. ~/.gemini/config/hooks.json alone hits gemini/agy
+            cfg_hooks_json.write_text(agy_hook_payload, encoding="utf-8")
             self.assertEqual(
                 cli_mod._inspect_hook_summary(env_base, rt),
                 "hooks=gemini/agy, active_registry_entries=0",
             )
+            # 1b. Multi-path dedup when all 3 Gemini/AGY hook paths coexist
+            hooks_json.write_text(agy_hook_payload, encoding="utf-8")
             settings_json.write_text(
                 '{"hooks":{"SessionStart":[{"command":"agent-voice-input session-hook --cli gemini"}]}}\n',
                 encoding="utf-8",
             )
+            all_three_summary = cli_mod._inspect_hook_summary(env_base, rt)
+            self.assertEqual(all_three_summary, "hooks=gemini/agy, active_registry_entries=0")
+            self.assertEqual(all_three_summary.count("gemini/agy"), 1)
+
+            cfg_hooks_json.unlink()
             both_summary = cli_mod._inspect_hook_summary(env_base, rt)
             self.assertEqual(both_summary, "hooks=gemini/agy, active_registry_entries=0")
             self.assertEqual(both_summary.count("gemini/agy"), 1)
@@ -1054,13 +1064,36 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 cli_mod._inspect_hook_summary(env_base, rt),
                 "hooks=gemini/agy, active_registry_entries=0",
             )
+            settings_json.unlink()
+
+            # 1c. Dangling symlink alone MUST NOT match; symlinked dotfiles config (e.g. ~/.harness / Stow / chezmoi) hits cleanly
+            dotfiles_dir = root / "dotfiles"
+            dotfiles_dir.mkdir(mode=0o700)
+            cfg_hooks_json.symlink_to(dotfiles_dir / "missing_dangling.json")
+            hooks_json.symlink_to(dotfiles_dir / "missing_dangling_legacy.json")
+            self.assertEqual(
+                cli_mod._inspect_hook_summary(env_base, rt),
+                "hooks=none configured (optional), active_registry_entries=0",
+            )
+            cfg_hooks_json.unlink()
+            hooks_json.unlink()
+
+            real_agy_hooks = dotfiles_dir / "agy_hooks.json"
+            real_agy_hooks.write_text(agy_hook_payload, encoding="utf-8")
+            cfg_hooks_json.symlink_to(real_agy_hooks)
+            self.assertEqual(
+                cli_mod._inspect_hook_summary(env_base, rt),
+                "hooks=gemini/agy, active_registry_entries=0",
+            )
 
             claude_dir = home / ".claude"
             claude_dir.mkdir(mode=0o700)
-            (claude_dir / "settings.json").write_text(
+            real_claude_settings = dotfiles_dir / "claude_settings.json"
+            real_claude_settings.write_text(
                 '{"hooks":{"SessionStart":[{"hooks":[{"command":"agent-voice-input session-hook --cli claude"}]}]}}\n',
                 encoding="utf-8",
             )
+            (claude_dir / "settings.json").symlink_to(real_claude_settings)
             self.assertEqual(
                 cli_mod._inspect_hook_summary(env_base, rt),
                 "hooks=claude, gemini/agy, active_registry_entries=0",

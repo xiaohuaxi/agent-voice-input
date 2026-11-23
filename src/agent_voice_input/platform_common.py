@@ -719,16 +719,16 @@ class JsonlShimMixin:
         with self._shim_lock:
             self._ensure_event_worker_locked()
 
-    def _flush_shim_events(self, timeout_sec: float = 0.05) -> None:
+    def _flush_shim_events(self, timeout_sec: float = 0.05) -> bool:
         if (
             self._event_worker is None
             or not self._event_worker.is_alive()
             or threading.current_thread() is self._event_worker
         ):
-            return
+            return True
         done = threading.Event()
         self._event_q.put({"_sync_evt": done})
-        done.wait(timeout=max(0.005, timeout_sec))
+        return bool(done.wait(timeout=max(0.005, timeout_sec)))
 
     def _event_loop(self) -> None:
         while (msg := self._event_q.get()) is not None:

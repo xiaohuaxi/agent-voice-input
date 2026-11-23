@@ -63,9 +63,9 @@ What the hook does:
 
 ---
 
-## 3. Antigravity CLI (`~/.gemini/hooks.json`)
+## 3. Antigravity CLI (`~/.gemini/config/hooks.json`)
 
-Following [`gemini/hooks.json`](gemini/hooks.json), add `voice-session-title` to `~/.gemini/hooks.json`:
+Following [`gemini/hooks.json`](gemini/hooks.json), add `voice-session-title` to `~/.gemini/config/hooks.json` (legacy `~/.gemini/hooks.json` and `~/.gemini/settings.json` remain recognized by `doctor`):
 
 ```json
 {

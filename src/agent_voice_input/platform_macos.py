@@ -2115,21 +2115,39 @@ class MacOSPlatform(JsonlShimMixin):
             return "tmux"
         return "tmux_paste_failed" if orig_pane else ""
 
+    _PASTE_KEY_STATE_UNAVAIL_TIMEOUT_SEC: float = 4.0
+
+    def _idle_paste_hold_timeout_sec(self) -> float:
+        return max(5.0, (self.cfg.hotkey.effective_hold_cancel_ms() / 1000.0) + 2.0)
+
     def _effective_paste_hold_timeout_sec(self) -> float:
         if self._paste_hold_timeout_sec is not None:
             return max(0.0, float(self._paste_hold_timeout_sec))
+        if self.cfg.hotkey.trigger_mode != "ptt":
+            return self._idle_paste_hold_timeout_sec()
         return max(15.0, float(self.cfg.audio.max_duration_sec) + 2.0)
 
-    def _query_shim_key_state(self) -> bool | None:
+    def _query_shim_key_state(self, *, immediate: bool = False) -> bool | None:
         if not self._has_managed_shim():
             return None
+        req: dict[str, Any] = {"cmd": "key_state"}
+        if immediate:
+            req["immediate"] = True
         try:
-            res = self._shim_rpc({"cmd": "key_state"}, timeout_sec=0.8, allow_retry=False)
+            res = self._shim_rpc(req, timeout_sec=0.8, allow_retry=False)
         except Exception:
             return None
         if not isinstance(res, dict) or res.get("ok") is not True:
             return None
         return bool(res.get("hotkey_held"))
+
+    def _poll_shim_key_state(self, *, immediate: bool = False) -> bool | None:
+        if immediate:
+            try:
+                return self._query_shim_key_state(immediate=True)
+            except TypeError:
+                return self._query_shim_key_state()
+        return self._query_shim_key_state()
 
     def _query_paste_foreground_window(self) -> ForegroundWindow:
         fg = self.get_foreground_window()
@@ -2162,6 +2180,9 @@ class MacOSPlatform(JsonlShimMixin):
 
     def _shim_supports_paste_clip(self) -> bool:
         return self._has_managed_shim() and ("paste_clip" in self._shim_caps)
+
+    def _shim_supports_key_state_immediate(self) -> bool:
+        return self._has_managed_shim() and ("key_state_immediate" in self._shim_caps)
 
     def _populate_paste_expectations(
         self,
@@ -2206,6 +2227,9 @@ class MacOSPlatform(JsonlShimMixin):
                 # Never fall back to osascript after an in-flight RPC error/timeout to prevent double paste.
                 return False, "shim_paste_unconfirmed", cur_proc
             # _shim_graceful returns None on timeout/EOF/error; NEVER fall through to osascript!
+            if isinstance(res, dict) and res.get("reason") == "key_held" and not res.get("posted"):
+                res_proc = str(res.get("fg_process")) if "fg_process" in res else cur_proc
+                return False, "key_held", res_proc
             if not isinstance(res, dict) or res.get("ok") is not True:
                 return False, "shim_paste_unconfirmed", cur_proc
             if "posted" in res:
@@ -2250,6 +2274,19 @@ class MacOSPlatform(JsonlShimMixin):
             res = self._shim_rpc(req, timeout_sec=1.5, allow_retry=False)
         except Exception:
             res = None
+        if isinstance(res, dict) and res.get("reason") == "key_held" and not res.get("posted"):
+            eff_fg_proc = str(res.get("fg_process")) if "fg_process" in res else cur_proc
+            fb_txt = fallback_clipboard_text if fallback_clipboard_text is not None else text
+            clip_ok = self._copy_to_clipboard(fb_txt)
+            if clip_ok and not is_beep_suppressed():
+                self.beep("focus")
+            return PasteOutcome(
+                False,
+                clip_ok,
+                "key_held" if clip_ok else "clipboard_failed",
+                eff_fg_proc,
+                used_clipboard_paste=False,
+            )
         if (
             isinstance(res, dict)
             and res.get("ok") is True
@@ -2451,28 +2488,108 @@ class MacOSPlatform(JsonlShimMixin):
             return PasteOutcome(False, False, "cancelled", fg.process)
 
         waited_for_key = False
+        effective_deadline_fn: Callable[[float], float] | None = None
+        hold_timeout_sec = 0.0
         if self._has_managed_shim():
-            hold_deadline = time.monotonic() + self._effective_paste_hold_timeout_sec()
+            hold_timeout_sec = self._effective_paste_hold_timeout_sec()
+            hold_deadline = time.monotonic() + hold_timeout_sec
+            ptt_dynamic_idle = (
+                self._paste_hold_timeout_sec is None
+                and self.cfg.hotkey.trigger_mode == "ptt"
+            )
+            idle_timeout = self._idle_paste_hold_timeout_sec() if ptt_dynamic_idle else 0.0
+            idle_since: float | None = None
+            unavail_since: float | None = None
+
+            def _effective_deadline(now_ts: float) -> float:
+                nonlocal idle_since
+                eff = hold_deadline
+                if ptt_dynamic_idle:
+                    if self._rec_active:
+                        idle_since = None
+                    else:
+                        if idle_since is None:
+                            idle_since = now_ts
+                        eff = min(eff, idle_since + idle_timeout)
+                if unavail_since is not None:
+                    eff = min(eff, unavail_since + self._PASTE_KEY_STATE_UNAVAIL_TIMEOUT_SEC)
+                return eff
+
+            effective_deadline_fn = _effective_deadline
+
             while True:
                 if cancelled_fn():
                     return PasteOutcome(False, False, "cancelled", fg.process)
                 if not self._has_managed_shim():
                     return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
-                key_state = self._query_shim_key_state()
+                poll_started = time.monotonic()
+                if waited_for_key and (_effective_deadline(poll_started) - poll_started) <= 0.0:
+                    return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                key_state = self._poll_shim_key_state(immediate=False)
                 if cancelled_fn():
                     return PasteOutcome(False, False, "cancelled", fg.process)
-                if key_state is False:
-                    break
                 if not self._has_managed_shim():
                     return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
-                rem = hold_deadline - time.monotonic()
+                if key_state is False:
+                    unavail_since = None
+                    now_flush = time.monotonic()
+                    eff_deadline = _effective_deadline(now_flush)
+                    rem_flush = eff_deadline - now_flush
+                    if (waited_for_key or hold_timeout_sec > 0.0) and rem_flush <= 0.0:
+                        return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                    flush_wait = min(0.05, max(0.005, rem_flush)) if rem_flush > 0.0 else 0.005
+                    flushed = self._flush_shim_events(timeout_sec=flush_wait)
+                    if cancelled_fn():
+                        return PasteOutcome(False, False, "cancelled", fg.process)
+                    if not flushed:
+                        waited_for_key = True
+                        now_after_flush = time.monotonic()
+                        rem = _effective_deadline(now_after_flush) - now_after_flush
+                        if rem <= 0.0:
+                            return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                        if (now_after_flush - now_flush) < 0.005:
+                            sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
+                        continue
+                    now_post_flush = time.monotonic()
+                    if (waited_for_key or hold_timeout_sec > 0.0) and (_effective_deadline(now_post_flush) - now_post_flush) <= 0.0:
+                        return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                    if self._shim_supports_key_state_immediate():
+                        imm_started = now_post_flush
+                        imm_state = self._poll_shim_key_state(immediate=True)
+                        if cancelled_fn():
+                            return PasteOutcome(False, False, "cancelled", fg.process)
+                        if not self._has_managed_shim():
+                            return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                        if imm_state is False:
+                            now_after_imm = time.monotonic()
+                            if (waited_for_key or hold_timeout_sec > 0.0) and (_effective_deadline(now_after_imm) - now_after_imm) <= 0.0:
+                                return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                            break
+                        now_imm_fail = time.monotonic()
+                        if imm_state is None:
+                            if unavail_since is None:
+                                unavail_since = imm_started
+                        else:
+                            unavail_since = None
+                        rem = _effective_deadline(now_imm_fail) - now_imm_fail
+                        if rem <= 0.0:
+                            return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                        waited_for_key = True
+                        sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
+                        continue
+                    break
+                now_poll = time.monotonic()
+                if key_state is None:
+                    if unavail_since is None:
+                        unavail_since = poll_started
+                else:
+                    unavail_since = None
+                rem = _effective_deadline(now_poll) - now_poll
                 if rem <= 0.0:
                     return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
                 waited_for_key = True
                 sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
 
-        if waited_for_key:
-            self._flush_shim_events()
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", fg.process)
         if waited_for_settle or waited_for_key:
@@ -2491,6 +2608,11 @@ class MacOSPlatform(JsonlShimMixin):
                 )
                 or not _verify_same_window(fg)
             ):
+                return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+
+        if effective_deadline_fn is not None and (waited_for_key or hold_timeout_sec > 0.0):
+            now_pre_commit = time.monotonic()
+            if now_pre_commit >= effective_deadline_fn(now_pre_commit):
                 return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
 
         if not _confirm_commit():
