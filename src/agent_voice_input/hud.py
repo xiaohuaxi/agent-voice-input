@@ -222,6 +222,18 @@ def format_hud_text(
     return pair[0] if zh else pair[1]
 
 
+def format_copied_hud_text(reason: str = "", lang: str = "en") -> str:
+    """Format bilingual HUD copy for clipboard-only fallback reasons without adding new visual states."""
+    low = (reason or "").strip().lower()
+    zh = (lang or "en").strip().lower() == "zh"
+    if "accessibility_denied" in low:
+        return "✓ 已复制(需开启辅助功能)" if zh else "✓ Copied (grant Accessibility)"
+    if "send_input_failed" in low:
+        return "✓ 已复制(无法自动粘贴)" if zh else "✓ Copied (manual paste needed)"
+    pair = _STATIC_HUD_COPY["copied"]
+    return pair[0] if zh else pair[1]
+
+
 def format_bg_count_badge(bg_count: int) -> str:
     """Return compact background in-flight count badge (e.g. '+1', '+2') or '' when zero."""
     n = int(bg_count)
@@ -293,6 +305,7 @@ __all__ = [
     "VALID_UI_POSITIONS",
     "default_hud_duration_ms",
     "format_bg_count_badge",
+    "format_copied_hud_text",
     "format_countdown_hint",
     "format_hold_cancel_hint",
     "format_hotkey_label",

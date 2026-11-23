@@ -15,7 +15,7 @@ import time
 from typing import Any, Callable, Mapping, Protocol
 
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
-from .config import Config, normalize_ui_position, redact_secrets
+from .config import Config, ConfigError, normalize_ui_position, redact_secrets
 from .hud import (
     default_hud_duration_ms,
     format_hud_text,
@@ -690,6 +690,19 @@ class JsonlShimMixin:
             return (self._shim is not None and self._shim.poll() is None) or self._on_event is not None
         return self._shim is not None or self._on_event is not None
 
+    def is_shim_ok(self) -> bool:
+        """Return True when the native shim bridge is healthy (ready when listening, no startup failure)."""
+        if self._closed or self._shim_disabled:
+            return False
+        if self._on_event is not None:
+            proc = self._shim
+            return bool(
+                proc is not None
+                and proc.poll() is None
+                and (proc is not self._spawned_shim or self._spawned_ready)
+            )
+        return self._shim_fail_count == 0 and not self.last_shim_error
+
     def _on_shim_internal_event(self, msg: dict[str, Any]) -> None:
         pass
 
@@ -780,9 +793,13 @@ class JsonlShimMixin:
                 self._shim_caps = frozenset()
                 self._spawning_shim = True
                 try:
-                    cmd = self._build_shim_cmd()
+                    try:
+                        cmd = self._build_shim_cmd()
+                    except ConfigError as exc:
+                        self._disable_shim_once(str(exc))
+                        cmd = None
                     if not cmd:
-                        if self._shim_graceful:
+                        if self._shim_graceful or self._shim_disabled:
                             self._disable_shim_once(self.last_shim_error or f"{self._shim_label} unavailable")
                         else:
                             raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
@@ -969,11 +986,15 @@ class JsonlShimMixin:
                         if owner_proc is proc:
                             try: wait_q.put_nowait(msg)
                             except queue.Full: pass
-                elif self._shim_graceful and not got_ready and msg.get("ok") is False:
+                elif not got_ready and msg.get("ok") is False:
+                    err_msg = str(msg.get("error") or f"{self._shim_label} startup failed")
                     with self._shim_lock:
                         is_cur_err = self._shim is proc or (not managed_spawn and self._shim is None)
                     if is_cur_err:
-                        self._disable_shim_once(str(msg.get("error") or f"{self._shim_label} startup failed"))
+                        if self._shim_graceful:
+                            self._disable_shim_once(err_msg)
+                        else:
+                            self.last_shim_error = redact_secrets(err_msg, self.env, cfg=self.cfg)
                         self._ready.set()
                     if proc_ready is not None:
                         proc_ready.set()

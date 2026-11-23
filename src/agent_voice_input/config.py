@@ -275,6 +275,13 @@ class RemoteHostConfig:
         clean_bin = _validate_ssh_bin_str(
             self.ssh_bin, "remote.hosts.ssh_bin", allow_empty=True
         )
+        if self.timeout_ms is not None:
+            if (
+                isinstance(self.timeout_ms, bool)
+                or not isinstance(self.timeout_ms, int)
+                or not (0 <= self.timeout_ms <= 10000)
+            ):
+                raise ConfigError("remote.hosts.timeout_ms must satisfy 0 <= timeout_ms <= 10000")
         object.__setattr__(self, "name", raw_name)
         object.__setattr__(self, "ssh_target", clean_target)
         object.__setattr__(self, "aliases", tuple(norm_aliases))
@@ -1684,7 +1691,7 @@ def _parse_remote_hosts_value(raw_hosts: Any) -> tuple[RemoteHostConfig, ...]:
                 raise ConfigError(f"remote.hosts[{idx}] must not be empty")
             parsed.append(RemoteHostConfig(name="", ssh_target=s))
         elif isinstance(item, Mapping):
-            allowed_keys = {"name", "ssh_target", "aliases", "ssh_bin"}
+            allowed_keys = {"name", "ssh_target", "aliases", "ssh_bin", "timeout_ms"}
             for hk in item:
                 if hk not in allowed_keys:
                     raise ConfigError(f"unknown remote.hosts[{idx}] option {hk!r}")
@@ -1717,12 +1724,21 @@ def _parse_remote_hosts_value(raw_hosts: Any) -> tuple[RemoteHostConfig, ...]:
                 if raw_sbin is not None
                 else ""
             )
+            raw_tmo = item.get("timeout_ms")
+            tmo_val: int | None = None
+            if raw_tmo is not None:
+                tmo_val = _as_int(raw_tmo, f"remote.hosts[{idx}].timeout_ms")
+                if not (0 <= tmo_val <= 10000):
+                    raise ConfigError(
+                        f"remote.hosts[{idx}].timeout_ms must satisfy 0 <= timeout_ms <= 10000"
+                    )
             parsed.append(
                 RemoteHostConfig(
                     name=name_str,
                     ssh_target=target_str,
                     aliases=aliases_tup,
                     ssh_bin=sbin_str,
+                    timeout_ms=tmo_val,
                 )
             )
         else:
@@ -2161,9 +2177,122 @@ def resolve_asr_api(
     return "audio-transcriptions"
 
 
+_HOTKEY_SEP_RE = re.compile(r"[\s_-]+")
+_HOTKEY_FKEY_RE = re.compile(r"^f([0-9]+)$")
+_HOTKEY_HEX_RE = re.compile(r"^0x([0-9a-f]+)$")
+
+_WINDOWS_UNSUPPORTED_HOTKEYS: frozenset[str] = frozenset({"Fn"})
+_MACOS_UNSUPPORTED_HOTKEYS: frozenset[str] = frozenset(
+    {"ScrollLock", "Pause", "Insert", "F21", "F22", "F23", "F24"}
+)
+
+HOTKEY_KEY_ALIASES: dict[str, str] = {
+    "rcontrol": "RControl",
+    "rctrl": "RControl",
+    "rightcontrol": "RControl",
+    "rightctrl": "RControl",
+    "lcontrol": "LControl",
+    "lctrl": "LControl",
+    "leftcontrol": "LControl",
+    "leftctrl": "LControl",
+    "control": "LControl",
+    "ctrl": "LControl",
+    "ralt": "RAlt",
+    "rightalt": "RAlt",
+    "rmenu": "RAlt",
+    "roption": "ROption",
+    "rightoption": "ROption",
+    "lalt": "LAlt",
+    "leftalt": "LAlt",
+    "lmenu": "LAlt",
+    "alt": "LAlt",
+    "loption": "LOption",
+    "leftoption": "LOption",
+    "option": "LOption",
+    "rshift": "RShift",
+    "rightshift": "RShift",
+    "lshift": "LShift",
+    "leftshift": "LShift",
+    "shift": "LShift",
+    "rcommand": "RCommand",
+    "rcmd": "RCommand",
+    "rightcommand": "RCommand",
+    "rightcmd": "RCommand",
+    "rwin": "RCommand",
+    "rsuper": "RCommand",
+    "rightwin": "RCommand",
+    "rightsuper": "RCommand",
+    "lcommand": "LCommand",
+    "lcmd": "LCommand",
+    "leftcommand": "LCommand",
+    "leftcmd": "LCommand",
+    "lwin": "LCommand",
+    "lsuper": "LCommand",
+    "leftwin": "LCommand",
+    "leftsuper": "LCommand",
+    "command": "LCommand",
+    "cmd": "LCommand",
+    "win": "LCommand",
+    "super": "LCommand",
+    "fn": "Fn",
+    "function": "Fn",
+    "globe": "Fn",
+    "capslock": "CapsLock",
+    "scrolllock": "ScrollLock",
+    "pause": "Pause",
+    "insert": "Insert",
+    "space": "Space",
+}
+
+
+def normalize_hotkey_key(raw: Any, name: str = "hotkey.key") -> str:
+    """Validate and normalize a hotkey key name across Windows/macOS aliases, F1..F24, and hex 0x00..0xFF."""
+    s = _as_str(raw, name).strip()
+    if not s:
+        raise ConfigError(f"{name} must not be empty")
+    compact = _HOTKEY_SEP_RE.sub("", s.lower())
+    if canon := HOTKEY_KEY_ALIASES.get(compact):
+        return canon
+    if m_fn := _HOTKEY_FKEY_RE.match(compact):
+        fn = int(m_fn.group(1), 10)
+        if 1 <= fn <= 24:
+            return f"F{fn}"
+    if m_hex := _HOTKEY_HEX_RE.match(compact):
+        hex_val = int(m_hex.group(1), 16)
+        if 0 <= hex_val <= 0xFF:
+            return f"0x{hex_val:02X}"
+    raise ConfigError(
+        f"{name}: unsupported hotkey {raw!r} "
+        "(supported: RControl, LControl, RAlt/ROption, LAlt/LOption, RShift, LShift, "
+        "RCommand/RWin, LCommand/LWin, Fn, CapsLock, ScrollLock, Pause, Insert, Space, "
+        "F1..F24, or hex 0x00..0xFF)"
+    )
+
+
+def validate_hotkey_for_platform(raw: Any, platform: str, name: str = "hotkey.key") -> str:
+    """Validate a hotkey against host platform capabilities while keeping ``load_config`` cross-platform."""
+    canon = normalize_hotkey_key(raw, name)
+    plat = (platform or "").strip().lower()
+    if plat in ("wsl", "wsl2", "windows", "win32"):
+        if canon in _WINDOWS_UNSUPPORTED_HOTKEYS:
+            raise ConfigError(
+                f"{name}: {raw!r} (normalized {canon!r}) is not supported on Windows/WSL2 "
+                "(supported on Windows/WSL2: RControl, LControl, RAlt, LAlt, RShift, LShift, "
+                "RCommand/RWin, LCommand/LWin, CapsLock, ScrollLock, Pause, Insert, Space, "
+                "F1..F24, or hex 0x00..0xFF)"
+            )
+    elif plat in ("darwin", "macos", "mac"):
+        if canon in _MACOS_UNSUPPORTED_HOTKEYS:
+            raise ConfigError(
+                f"{name}: {raw!r} (normalized {canon!r}) is not supported on macOS "
+                "(supported on macOS: RControl, LControl, ROption/RAlt, LOption/LAlt, RShift, LShift, "
+                "RCommand, LCommand, Fn/Globe, CapsLock, Space, F1..F20, or hex 0x00..0xFF)"
+            )
+    return canon
+
+
 def _validate_hotkey_config(cfg: Config) -> None:
-    if not cfg.hotkey.key:
-        raise ConfigError("hotkey.key must not be empty")
+    cfg.hotkey.key = normalize_hotkey_key(cfg.hotkey.key, "hotkey.key")
     if cfg.hotkey.trigger_mode not in VALID_TRIGGER_MODES:
         raise ConfigError(
             f"hotkey.trigger_mode must be one of {sorted(VALID_TRIGGER_MODES)}, "
@@ -2446,7 +2575,10 @@ def _load_config_file(path: Path) -> dict[str, Any]:
         if not isinstance(parsed, dict):
             raise ConfigError(f"{path}: JSON config root must be an object")
         return parsed
-    return parse_toml(raw_text)
+    try:
+        return parse_toml(raw_text)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from None
 
 
 def load_config(

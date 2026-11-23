@@ -584,6 +584,92 @@ def _probe_stage_ping(
     return out
 
 
+def _command_matches_voice_hook(val: Any) -> bool:
+    return isinstance(val, str) and ("session-hook" in val or "voice-title.sh" in val)
+
+
+def _event_entries_have_voice_hook(entries: Any) -> bool:
+    if not isinstance(entries, list):
+        return False
+    for item in entries:
+        if not isinstance(item, Mapping):
+            continue
+        if _command_matches_voice_hook(item.get("command")):
+            return True
+        nested = item.get("hooks")
+        if isinstance(nested, list):
+            for sub in nested:
+                if isinstance(sub, Mapping) and _command_matches_voice_hook(sub.get("command")):
+                    return True
+    return False
+
+
+_KNOWN_HOOK_EVENT_NAMES: frozenset[str] = frozenset(
+    {
+        "SessionStart",
+        "SessionEnd",
+        "UserPromptSubmit",
+        "PreInvocation",
+        "PostInvocation",
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PermissionRequest",
+        "Notification",
+        "Stop",
+        "SubagentStart",
+        "SubagentStop",
+        "PreCompact",
+        "BeforeAgent",
+        "AfterAgent",
+        "BeforeModel",
+        "AfterModel",
+        "BeforeTool",
+        "AfterTool",
+        "BeforeToolSelection",
+        "PreCompress",
+    }
+)
+
+
+def _hook_map_has_voice_hook(obj: Any) -> bool:
+    if not isinstance(obj, Mapping):
+        return False
+    for key, val in obj.items():
+        if key in _KNOWN_HOOK_EVENT_NAMES and _event_entries_have_voice_hook(val):
+            return True
+        if isinstance(val, Mapping):
+            for sub_key, sub_val in val.items():
+                if sub_key in _KNOWN_HOOK_EVENT_NAMES and _event_entries_have_voice_hook(sub_val):
+                    return True
+    return False
+
+
+def _json_has_voice_hook_command(data: Any, *, is_hooks_file: bool) -> bool:
+    if not isinstance(data, Mapping):
+        return False
+    if "hooks" in data and _hook_map_has_voice_hook(data.get("hooks")):
+        return True
+    if is_hooks_file:
+        return _hook_map_has_voice_hook(data)
+    return False
+
+
+def _toml_has_codex_voice_hook(raw_text: str) -> bool:
+    from .config import ConfigError, parse_toml
+
+    try:
+        parsed = parse_toml(raw_text)
+    except ConfigError:
+        return False
+    notify = parsed.get("notify")
+    if isinstance(notify, str):
+        return _command_matches_voice_hook(notify)
+    if isinstance(notify, list):
+        return any(_command_matches_voice_hook(tok) for tok in notify)
+    return False
+
+
 def _inspect_hook_summary(env: Mapping[str, str], rt_dir: Path) -> str:
     from .config import expand_user_path
 
@@ -591,12 +677,25 @@ def _inspect_hook_summary(env: Mapping[str, str], rt_dir: Path) -> str:
     for label, rels in (
         ("claude", ("~/.claude/settings.json",)),
         ("gemini/agy", ("~/.gemini/hooks.json", "~/.gemini/settings.json")),
+        ("codex", ("~/.codex/config.toml",)),
     ):
         for rel in rels:
             p = expand_user_path(rel, env=env)
             try:
                 if p.is_file() and not p.is_symlink() and p.stat().st_size <= 524_288:
-                    if "session-hook" in p.read_text(encoding="utf-8", errors="ignore"):
+                    hook_txt = p.read_text(encoding="utf-8", errors="ignore")
+                    matched = False
+                    if p.suffix.lower() == ".json":
+                        try:
+                            parsed_json = json.loads(hook_txt)
+                        except ValueError:
+                            parsed_json = None
+                        matched = _json_has_voice_hook_command(
+                            parsed_json, is_hooks_file=(p.name.lower() == "hooks.json")
+                        )
+                    else:
+                        matched = _toml_has_codex_voice_hook(hook_txt)
+                    if matched:
                         configured.append(label)
                         break
             except OSError:
@@ -713,9 +812,15 @@ def _doctor_check_env_and_ffmpeg(st: _DoctorState) -> None:
 
 
 def _doctor_check_macos_host(st: _DoctorState) -> None:
+    from .config import ConfigError, validate_hotkey_for_platform
     from .platform_macos import probe_macos_host
 
     st.platform_kind = "darwin"
+    try:
+        validate_hotkey_for_platform(st.cfg.hotkey.key, "darwin")
+    except ConfigError as exc:
+        st.ok_all = False
+        st.emit(f"[hotkey]    FAIL {exc}")
     m = probe_macos_host(st.cfg, st.env, announce_compile=(not st.as_json))
     st.fg_title = str(m.get("fg_title") or "")
     st.fg_tty = str(m.get("fg_tty") or "")
@@ -755,7 +860,11 @@ def _doctor_check_macos_host(st: _DoctorState) -> None:
     st.emit(f"[mac-shim]  swiftc={swiftc_desc} shim={shim_desc}{mac_ui_info}")
     if shim_fail:
         st.ok_all = False
-        st.emit_fix("xcode-select --install")
+        shim_err_low = str(m.get("mac_shim_error") or "").lower()
+        if m.get("swiftc_ok") and "xcodebuild -license" in shim_err_low:
+            st.emit_fix("sudo xcodebuild -license accept")
+        else:
+            st.emit_fix("xcode-select --install")
     if m.get("fg_surface_id"):
         st.emit(
             f"[macos-fg]  app={m.get('fg_process')!r} surface={m.get('fg_surface_id')} "
@@ -780,6 +889,11 @@ def _doctor_check_macos_host(st: _DoctorState) -> None:
             f"[macos-tcc] WARN (current shell context: {caller_warn}; "
             "note: reflects this shell, not an already-running GUI daemon)"
         )
+    elif is_local_gui and caller_mic == "not_determined":
+        st.emit(
+            "[macos-tcc] INFO Microphone permission not yet requested; "
+            "macOS will prompt for authorization on your first recording."
+        )
     if avf_fail:
         st.ok_all = False
         st.emit_fix("connect/enable an input microphone in System Settings -> Sound -> Input")
@@ -802,28 +916,68 @@ def _doctor_check_macos_host(st: _DoctorState) -> None:
 
 
 def _doctor_check_wsl_host(st: _DoctorState) -> None:
-    from .platform_wsl import probe_wsl_host
+    from .config import ConfigError, validate_hotkey_for_platform
+    from .platform_wsl import probe_wsl_host, resolve_wsl_effective_audio_source
 
     st.platform_kind = "wsl2"
+    try:
+        validate_hotkey_for_platform(st.cfg.hotkey.key, "wsl")
+    except ConfigError as exc:
+        st.ok_all = False
+        st.emit(f"[hotkey]    FAIL {exc}")
     w = probe_wsl_host(st.cfg, st.env)
     st.fg_title = str(w.get("fg_title") or "")
     st.fg_process = str(w.get("fg_process") or "")
     ps_ok = bool(w.get("powershell_ok"))
-    pulse_ok = bool(w.get("pulse_rdp_ok"))
+    eff_backend, eff_pulse_src = resolve_wsl_effective_audio_source(
+        st.cfg, st.env, has_powershell=ps_ok
+    )
+    pulse_ok = (
+        bool(w.get("pulse_source_ok"))
+        if (eff_pulse_src != "RDPSource" and "pulse_source_ok" in w)
+        else bool(w.get("pulse_rdp_ok"))
+    )
     winmm_n = int(w.get("winmm_devs") or 0)
     has_wasapi_key = "wasapi_ok" in w
     wasapi_ok = bool(w.get("wasapi_ok")) if has_wasapi_key else False
-    has_wsl_audio = (wasapi_ok or pulse_ok or winmm_n > 0) if has_wasapi_key else (pulse_ok or winmm_n > 0)
+    wasapi_state = str(w.get("wasapi_state") or "").strip()
+    if eff_backend == "pulse":
+        has_wsl_audio = pulse_ok
+    elif has_wasapi_key:
+        # Both default auto/wasapi and legacy winmm use Windows WASAPI capture inside win_shim.ps1;
+        # do not let WSLg's virtual silent RDPSource or waveIn device count mask wasapi_ok=False.
+        has_wsl_audio = wasapi_ok
+    else:
+        has_wsl_audio = pulse_ok or winmm_n > 0
     ui_info = f" ui_lang={w.get('ui_lang')}" if w.get("ui_lang") else ""
-    wasapi_prefix = f"WASAPI={'OK' if wasapi_ok else 'WARN'}, " if has_wasapi_key else ""
+    wasapi_lbl = "OK" if wasapi_ok else ("WARN" if eff_backend == "pulse" else "FAIL")
+    wasapi_detail = f" ({wasapi_state})" if (not wasapi_ok and wasapi_state) else ""
+    wasapi_prefix = f"WASAPI={wasapi_lbl}{wasapi_detail}, " if has_wasapi_key else ""
+    pulse_lbl = f"PulseAudio ({eff_pulse_src})" if eff_pulse_src != "RDPSource" else "PulseAudio RDPSource"
     st.emit(
-        f"[wsl-audio] {wasapi_prefix}PulseAudio RDPSource={'OK' if pulse_ok else 'WARN'}, winmm waveIn devs={winmm_n}"
+        f"[wsl-audio] {wasapi_prefix}{pulse_lbl}={'OK' if pulse_ok else 'WARN'}, winmm waveIn devs={winmm_n}"
     )
     st.emit(
         f"[win-shim]  PowerShell={'OK (' + str(w.get('ps_version')) + ')' if ps_ok else 'FAIL'} fg={w.get('fg_process')!r}{ui_info}"
     )
     if not ps_ok:
         st.ok_all = False
+        if ps_err := str(w.get("ps_error") or "").strip()[:180]:
+            st.emit(f"[win-shim]  FAIL error={ps_err}")
+            low_pe = ps_err.lower()
+            if any(
+                tok in low_pe
+                for tok in (
+                    "executionpolicy",
+                    "execution policy",
+                    "constrainedlanguage",
+                    "constrained language",
+                )
+            ):
+                st.emit(
+                    "[win-shim]  HINT Windows PowerShell ExecutionPolicy/ConstrainedLanguage blocked win_shim.ps1; "
+                    "check Windows Group Policy / AppLocker or allow ExecutionPolicy Bypass"
+                )
         st.emit_fix("check WSL interop or /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
     if not has_wsl_audio:
         st.ok_all = False
@@ -1631,6 +1785,19 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
     if (src_root / "agent_voice_input").is_dir():
         prev_pp = child_env.get("PYTHONPATH", "")
         child_env["PYTHONPATH"] = f"{src_root}{os.pathsep}{prev_pp}" if prev_pp else str(src_root)
+    from .audio_proc import resolve_ffmpeg_bin
+
+    try:
+        ff_found = resolve_ffmpeg_bin(env=env)
+    except Exception:
+        ff_found = ""
+    if not ff_found:
+        ff_install = "brew install ffmpeg" if sys.platform == "darwin" else "sudo apt install ffmpeg"
+        print(
+            f"[agent-voice-input] WARN: ffmpeg not found (required for audio capture/conversion); install via: {ff_install}",
+            file=sys.stderr,
+            flush=True,
+        )
     warned_shim = False
     if sys.platform == "darwin" and cfg is not None:
         shim_bin, pre_err = compile_mac_shim(env=env, cfg=cfg, announce=True)
@@ -1698,7 +1865,10 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
             env=child_env,
             start_new_session=True,
         )
-    deadline = time.monotonic() + 10.0
+    from .platform_wsl import is_wsl
+
+    start_wait_sec = 18.0 if (sys.platform != "darwin" and is_wsl(env)) else 10.0
+    deadline = time.monotonic() + start_wait_sec
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             print(f"daemon exited early (rc={proc.returncode}); check {log_path}", file=sys.stderr)
@@ -2116,7 +2286,7 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-voice-input",
-        description="Two-stage context-aware voice input for CLI coding agents.",
+        description="Context-aware voice input for CLI coding agents and desktop apps.",
     )
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
     _add_common_flags(parser)

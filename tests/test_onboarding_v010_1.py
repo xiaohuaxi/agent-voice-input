@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -490,12 +491,13 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             self.assertEqual(parse_env_text(env_template_text), {})
             self.assertIn('# DOUBAO_SPEECH_API_KEY="..."', env_template_text)
             self.assertIn("Legacy dual-header", env_template_text)
-            # config.example.env stays aligned: promotes DOUBAO_SPEECH_API_KEY as canonical single-header key
+            # config.example.env stays aligned: all keys commented out & promotes DOUBAO_SPEECH_API_KEY
             example_env_text = (_REPO_ROOT / "config.example.env").read_text(encoding="utf-8")
             example_env_parsed = parse_env_text(example_env_text)
-            self.assertIn("DOUBAO_SPEECH_API_KEY", example_env_parsed)
-            self.assertNotIn("DOUBAO_ASR_APP_ID", example_env_parsed)
-            self.assertNotIn("DOUBAO_ASR_API_KEY", example_env_parsed)
+            self.assertEqual(example_env_parsed, {})
+            self.assertIn('# DOUBAO_SPEECH_API_KEY="', example_env_text)
+            self.assertIn('# DOUBAO_ASR_APP_ID="', example_env_text)
+            self.assertIn('# DOUBAO_ASR_API_KEY="', example_env_text)
             # Both stdlib/3.10 TOML parsers and load_config parse generated config.toml cleanly
             parsed_a = parse_toml(toml_p.read_text(encoding="utf-8"))
             parsed_b = _parse_simple_toml(toml_p.read_text(encoding="utf-8"))
@@ -1193,6 +1195,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 buf = io.StringIO()
                 with (
                     mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
                     mock.patch(
                         "agent_voice_input.daemon.send_control_command",
                         side_effect=ConnectionRefusedError("not ready yet"),
@@ -1220,6 +1223,691 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 out_warm_no_asr,
             )
             self.assertNotIn("Ready:", out_warm_no_asr)
+
+
+class V100ContractAndFirstRunPolishTests(unittest.TestCase):
+    def test_remote_hosts_timeout_ms_and_toml_error_path_prefix(self) -> None:
+        from agent_voice_input.config import ConfigError, RemoteHostConfig, load_config
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ok_cfg = root / "ok.toml"
+            ok_cfg.write_text(
+                '[remote]\ntimeout_ms = 400\n'
+                '[[remote.hosts]]\nname = "gpu1"\nssh_target = "gpu1.internal"\ntimeout_ms = 1500\n',
+                encoding="utf-8",
+            )
+            cfg, _ = load_config(config_path=ok_cfg, env={"HOME": str(root)}, load_default_env_files=False)
+            self.assertEqual(len(cfg.remote.hosts), 1)
+            self.assertEqual(cfg.remote.hosts[0].timeout_ms, 1500)
+
+            for idx, bad_tmo in enumerate((-1, 10001, True, 1.5, '"not_a_num"')):
+                bad_cfg = root / f"bad_{idx}.toml"
+                bad_cfg.write_text(
+                    f'[[remote.hosts]]\nname = "gpu1"\ntimeout_ms = {str(bad_tmo).lower()}\n',
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ConfigError, msg=f"expected ConfigError for timeout_ms={bad_tmo}"):
+                    load_config(config_path=bad_cfg, env={"HOME": str(root)}, load_default_env_files=False)
+
+            with self.assertRaises(ConfigError):
+                RemoteHostConfig(name="gpu1", ssh_target="gpu1", timeout_ms=-5)
+            with self.assertRaises(ConfigError):
+                RemoteHostConfig(name="gpu1", ssh_target="gpu1", timeout_ms=20000)
+
+            broken_toml = root / "broken_syntax.toml"
+            broken_toml.write_text('[hotkey]\nkey = "unterminated\n', encoding="utf-8")
+            with self.assertRaises(ConfigError) as ctx_err:
+                load_config(config_path=broken_toml, env={"HOME": str(root)}, load_default_env_files=False)
+            self.assertTrue(str(ctx_err.exception).startswith(f"{broken_toml}: "), str(ctx_err.exception))
+
+    def test_hotkey_normalization_whitelist_and_win_shim_invariants(self) -> None:
+        from agent_voice_input.config import ConfigError, load_config, normalize_hotkey_key
+
+        expected_pairs = [
+            ("RControl", "RControl"),
+            ("right_ctrl", "RControl"),
+            ("Right-Control", "RControl"),
+            ("lctrl", "LControl"),
+            ("left control", "LControl"),
+            ("RAlt", "RAlt"),
+            ("right_alt", "RAlt"),
+            ("rmenu", "RAlt"),
+            ("right-option", "ROption"),
+            ("ROption", "ROption"),
+            ("left_alt", "LAlt"),
+            ("left_option", "LOption"),
+            ("right_shift", "RShift"),
+            ("Left Shift", "LShift"),
+            ("rwin", "RCommand"),
+            ("rsuper", "RCommand"),
+            ("right_cmd", "RCommand"),
+            ("lwin", "LCommand"),
+            ("left_command", "LCommand"),
+            ("globe", "Fn"),
+            ("function", "Fn"),
+            ("caps_lock", "CapsLock"),
+            ("scroll-lock", "ScrollLock"),
+            ("f13", "F13"),
+            ("F001", "F1"),
+            ("f024", "F24"),
+            ("F24", "F24"),
+            ("0x7b", "0x7B"),
+            ("0xA3", "0xA3"),
+            ("0x00A3", "0xA3"),
+            ("0x003E", "0x3E"),
+            ("0x0000", "0x00"),
+        ]
+        for raw, canon in expected_pairs:
+            self.assertEqual(normalize_hotkey_key(raw), canon, raw)
+
+        for invalid in ("SpaceBar", "F0", "F00", "F25", "0x100", "0x0100", "0xZZ", "Ctrl+Alt+V", "MenuKey"):
+            with self.assertRaises(ConfigError) as err:
+                normalize_hotkey_key(invalid)
+            self.assertIn("unsupported hotkey", str(err.exception))
+            self.assertIn("RControl", str(err.exception))
+
+        # Portable load_config accepts cross-platform union keys; host validation rejects OS-exclusive keys
+        from agent_voice_input.config import validate_hotkey_for_platform
+        from agent_voice_input.platform_macos import MacOSPlatform, run_macos_key_test
+        from agent_voice_input.platform_wsl import WslPlatform, run_key_test
+
+        with tempfile.TemporaryDirectory() as td:
+            p_fn = Path(td) / "hk_fn.toml"
+            p_fn.write_text('[hotkey]\nkey = "Fn"\n', encoding="utf-8")
+            cfg_fn, _ = load_config(config_path=p_fn, env={"HOME": td}, load_default_env_files=False)
+            self.assertEqual(cfg_fn.hotkey.key, "Fn")
+
+            p_sl = Path(td) / "hk_sl.toml"
+            p_sl.write_text('[hotkey]\nkey = "ScrollLock"\n', encoding="utf-8")
+            cfg_sl, _ = load_config(config_path=p_sl, env={"HOME": td}, load_default_env_files=False)
+            self.assertEqual(cfg_sl.hotkey.key, "ScrollLock")
+
+            p_rc = Path(td) / "hk.toml"
+            p_rc.write_text('[hotkey]\nkey = "right_ctrl"\n', encoding="utf-8")
+            cfg_rc, _ = load_config(config_path=p_rc, env={"HOME": td}, load_default_env_files=False)
+            self.assertEqual(cfg_rc.hotkey.key, "RControl")
+
+            with self.assertRaises(ConfigError) as w_err:
+                validate_hotkey_for_platform("Globe", "wsl")
+            self.assertIn("not supported on Windows/WSL2", str(w_err.exception))
+            self.assertIn("F1..F24", str(w_err.exception))
+
+            for mac_bad in ("ScrollLock", "Pause", "Insert", "F21", "F24"):
+                with self.assertRaises(ConfigError) as m_err:
+                    validate_hotkey_for_platform(mac_bad, "darwin")
+                self.assertIn("not supported on macOS", str(m_err.exception))
+                self.assertIn("F1..F20", str(m_err.exception))
+
+            with self.assertRaises(ConfigError):
+                run_key_test(cfg_fn, seconds=1)
+            with self.assertRaises(ConfigError):
+                run_macos_key_test(cfg_sl, seconds=1, env={"HOME": td})
+
+            wplat_fn = WslPlatform(cfg_fn, env={"HOME": td})
+            try:
+                with self.assertRaises(ConfigError):
+                    wplat_fn._build_shim_cmd()
+                self.assertIn("Windows/WSL2", wplat_fn.last_shim_error)
+            finally:
+                wplat_fn.close()
+
+            mplat_sl = MacOSPlatform(cfg_sl, env={"HOME": td})
+            try:
+                self.assertIsNone(mplat_sl._build_shim_cmd())
+                self.assertIn("macOS", mplat_sl.last_shim_error)
+            finally:
+                mplat_sl.close()
+
+        win_ps1 = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
+        # 100% pure 7-bit ASCII
+        non_ascii = [(i + 1, ch) for i, ch in enumerate(win_ps1) if ord(ch) > 127]
+        self.assertEqual(non_ascii, [], f"win_shim.ps1 has non-ASCII characters: {non_ascii[:5]}")
+        self.assertNotIn("Add-Type -Path $dllPath", win_ps1)
+        self.assertEqual(win_ps1.count("Add-Type -LiteralPath $dllPath"), 2)
+        self.assertIn("Write-InitFailureAndExit", win_ps1)
+        self.assertLess(win_ps1.index("function Write-JsonLine"), win_ps1.index("Add-Type -AssemblyName"))
+        for alias in ("rightcontrol", "rightctrl", "rightalt", "leftcontrol", "leftctrl", "leftalt", "rightshift", "leftshift"):
+            self.assertIn(f'"{alias}"', win_ps1)
+
+    def test_wsl_shim_failure_reports_shim_ok_false_and_recovers_when_ready(self) -> None:
+        from agent_voice_input.daemon import VoiceInputDaemon
+        from agent_voice_input.platform_wsl import WslPlatform
+        from agent_voice_input.refiner import NoopRefiner
+
+        bad_shim_code = (
+            "import json, sys\n"
+            "sys.stdout.write(json.dumps({'ok': False, 'error': 'Unsupported hotkey name: BadKey'}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "sys.exit(1)\n"
+        )
+        ok_shim_code = (
+            "import json, sys\n"
+            "sys.stdout.write(json.dumps({'event': 'ready', 'ui_culture': 'en-US'}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "for line in sys.stdin:\n"
+            "    if 'quit' in line:\n"
+            "        break\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            plat_bad = WslPlatform(
+                Config(),
+                env={},
+                shim_cmd_factory=lambda: [sys.executable, "-u", "-c", bad_shim_code],
+            )
+            plat_bad._shim_respawn_delays = ()
+            d_bad = VoiceInputDaemon(
+                Config(),
+                platform=plat_bad,
+                refiner=NoopRefiner(),
+                runtime_dir=rt / "bad",
+                env={"HOME": td},
+            )
+            try:
+                plat_bad.start_event_listener(lambda _e: None)
+                st_bad = d_bad.handle_control({"cmd": "status"})
+                self.assertFalse(st_bad["shim_ok"])
+                self.assertIn("Unsupported hotkey name: BadKey", st_bad.get("shim_error", ""))
+            finally:
+                d_bad.close()
+
+            plat_ok = WslPlatform(
+                Config(),
+                env={},
+                shim_cmd_factory=lambda: [sys.executable, "-u", "-c", ok_shim_code],
+            )
+            d_ok = VoiceInputDaemon(
+                Config(),
+                platform=plat_ok,
+                refiner=NoopRefiner(),
+                runtime_dir=rt / "ok",
+                env={"HOME": td},
+            )
+            try:
+                plat_ok.start_event_listener(lambda _e: None)
+                st_ok = d_ok.handle_control({"cmd": "status"})
+                self.assertTrue(st_ok["shim_ok"])
+                self.assertNotIn("shim_error", st_ok)
+            finally:
+                d_ok.close()
+
+            # Host-unsupported hotkey (Fn on WSL) degrades shim cleanly without crashing daemon startup
+            plat_fn = WslPlatform(Config(hotkey=HotkeyConfig(key="Fn")), env={"HOME": td})
+            d_fn = VoiceInputDaemon(
+                Config(hotkey=HotkeyConfig(key="Fn")),
+                platform=plat_fn,
+                refiner=NoopRefiner(),
+                runtime_dir=rt / "wsl_fn",
+                env={"HOME": td},
+            )
+            try:
+                err_capture = io.StringIO()
+                with mock.patch("sys.stderr", err_capture):
+                    plat_fn.start_event_listener(lambda _e: None)
+                self.assertTrue(plat_fn._shim_disabled)
+                self.assertFalse(plat_fn._respawn_scheduled)
+                st_fn = d_fn.handle_control({"cmd": "status"})
+                self.assertTrue(st_fn["ok"])
+                self.assertFalse(st_fn["shim_ok"])
+                self.assertIn("not supported on Windows/WSL2", st_fn.get("shim_error", ""))
+            finally:
+                d_fn.close()
+
+    def test_copied_hud_accurate_reasons_and_daemon_forwarding(self) -> None:
+        from agent_voice_input.asr_providers import AsrResult
+        from agent_voice_input.audio_proc import pack_pcm16_mono_wav
+        from agent_voice_input.config import UiConfig
+        from agent_voice_input.daemon import VoiceInputDaemon
+        from agent_voice_input.hud import format_copied_hud_text
+        from agent_voice_input.platform_common import ForegroundWindow, PasteOutcome
+        from agent_voice_input.refiner import NoopRefiner
+
+        self.assertEqual(format_copied_hud_text("accessibility_denied", "zh"), "✓ 已复制(需开启辅助功能)")
+        self.assertEqual(format_copied_hud_text("accessibility_denied (grant ...)", "en"), "✓ Copied (grant Accessibility)")
+        self.assertEqual(format_copied_hud_text("send_input_failed", "zh"), "✓ 已复制(无法自动粘贴)")
+        self.assertEqual(format_copied_hud_text("send_input_failed", "en"), "✓ Copied (manual paste needed)")
+        self.assertEqual(format_copied_hud_text("focus_changed", "zh"), "✓ 已复制(窗口已切换)")
+        self.assertEqual(format_copied_hud_text("focus_changed", "en"), "✓ Copied (window switched)")
+
+        voiced = pack_pcm16_mono_wav(b"\x00\x20\x00\xe0" * 4000)
+
+        class _StaticAsr:
+            provider_name = "mock"
+            model_name = "mock"
+            def transcribe(self, *_a, **_kw):
+                return AsrResult(text="hello", provider="mock", model="mock", latency_ms=1)
+
+        class _SpyPlat:
+            def __init__(self, outcome: PasteOutcome) -> None:
+                self.outcome = outcome
+                self.hud_calls: list[tuple[str, dict[str, object]]] = []
+            def start_event_listener(self, _cb) -> None: pass
+            def is_allowed_terminal(self, _w) -> bool: return True
+            def get_foreground_window(self) -> ForegroundWindow: return ForegroundWindow(1, "Terminal", "zsh")
+            def start_recording(self, *_a, **_kw) -> None: pass
+            def stop_recording(self, **_kw): return voiced, "mock"
+            def cancel_recording(self) -> None: pass
+            def hud(self, state: str, **kw: object) -> None:
+                self.hud_calls.append((state, dict(kw)))
+            def beep(self, _k: str) -> None: pass
+            def deliver_text(self, *_a, **_kw) -> PasteOutcome: return self.outcome
+            def close(self) -> None: pass
+
+        for reason, lang, exp_text in (
+            ("accessibility_denied (grant Accessibility)", "zh", "✓ 已复制(需开启辅助功能)"),
+            ("send_input_failed", "en", "✓ Copied (manual paste needed)"),
+            ("focus_changed", "en", None),
+        ):
+            with tempfile.TemporaryDirectory() as td:
+                plat = _SpyPlat(PasteOutcome(False, True, reason, "Notes"))
+                d = VoiceInputDaemon(
+                    Config(hotkey=HotkeyConfig(debounce_ms=0), ui=UiConfig(language=lang)),
+                    platform=plat,  # type: ignore[arg-type]
+                    asr_provider=_StaticAsr(),  # type: ignore[arg-type]
+                    refiner=NoopRefiner(),
+                    runtime_dir=Path(td),
+                    env={"HOME": td},
+                )
+                try:
+                    d.handle_trigger("toggle", ForegroundWindow(1, "Terminal", "zsh"), from_hotkey=True)
+                    d.handle_trigger("toggle", ForegroundWindow(1, "Terminal", "zsh"), from_hotkey=True)
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
+                        st_now = d.handle_control({"cmd": "status"})
+                        if st_now.get("state") == "idle" and int(st_now.get("pending_count") or 0) == 0:
+                            break
+                        time.sleep(0.02)
+                    self.assertEqual(d.handle_control({"cmd": "status"}).get("state"), "idle")
+                finally:
+                    d.close()
+                copied_calls = [kw for st, kw in plat.hud_calls if st == "copied"]
+                self.assertEqual(len(copied_calls), 1, plat.hud_calls)
+                self.assertEqual(copied_calls[0].get("text"), exp_text)
+
+    def test_wsl_probe_powershell_resolution_and_doctor_and_start_polish(self) -> None:
+        from agent_voice_input import platform_wsl as pw
+        from agent_voice_input.config import AudioConfig
+
+        # 1. resolve_powershell_exe lookup order: POWERSHELL_EXE -> PATH -> /c/... -> None
+        with (
+            mock.patch("agent_voice_input.platform_wsl.os.path.isfile", side_effect=lambda p: str(p) == pw.POWERSHELL_EXE),
+            mock.patch("agent_voice_input.platform_wsl.shutil.which", return_value="/custom/powershell.exe"),
+        ):
+            self.assertEqual(pw.resolve_powershell_exe(), pw.POWERSHELL_EXE)
+        with (
+            mock.patch("agent_voice_input.platform_wsl.os.path.isfile", side_effect=lambda p: str(p) == "/custom/powershell.exe"),
+            mock.patch("agent_voice_input.platform_wsl.shutil.which", return_value="/custom/powershell.exe"),
+        ):
+            self.assertEqual(pw.resolve_powershell_exe({"PATH": "/custom"}), "/custom/powershell.exe")
+        with (
+            mock.patch("agent_voice_input.platform_wsl.os.path.isfile", side_effect=lambda p: str(p) == pw._POWERSHELL_EXE_ROOT_MOUNT),
+            mock.patch("agent_voice_input.platform_wsl.shutil.which", return_value=None),
+        ):
+            self.assertEqual(pw.resolve_powershell_exe({"PATH": ""}), pw._POWERSHELL_EXE_ROOT_MOUNT)
+        with (
+            mock.patch("agent_voice_input.platform_wsl.os.path.isfile", return_value=False),
+            mock.patch("agent_voice_input.platform_wsl.shutil.which", return_value=None),
+        ):
+            self.assertIsNone(pw.resolve_powershell_exe({"PATH": ""}))
+
+        # 2. probe_wsl_host timeout=15 + redacted first-line ps_error; WslPlatform._shim_ready_timeout=15.0
+        self.assertEqual(pw.WslPlatform._shim_ready_timeout, 15.0)
+        seen_timeouts: list[object] = []
+
+        def _fake_probe_run(cmd, **kw):
+            if cmd[0] == pw.POWERSHELL_EXE:
+                seen_timeouts.append(kw.get("timeout"))
+                return subprocess.CompletedProcess(
+                    cmd, 1, stdout="", stderr="AuthorizationManager check failed: ExecutionPolicy blocked secret_tok_999\nline2\n"
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="RDPSource\n", stderr="")
+
+        with (
+            mock.patch("agent_voice_input.platform_wsl.resolve_powershell_exe", return_value=pw.POWERSHELL_EXE),
+            mock.patch("agent_voice_input.platform_wsl.to_windows_path", return_value=r"C:\win_shim.ps1"),
+            mock.patch("agent_voice_input.platform_wsl.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+            mock.patch("agent_voice_input.platform_wsl.subprocess.run", side_effect=_fake_probe_run),
+        ):
+            pinfo = pw.probe_wsl_host(Config(), env={"OPENAI_API_KEY": "secret_tok_999"})
+        self.assertEqual(seen_timeouts, [15])
+        self.assertFalse(pinfo["powershell_ok"])
+        self.assertIn("ExecutionPolicy", pinfo["ps_error"])
+        self.assertNotIn("secret_tok_999", pinfo["ps_error"])
+        self.assertNotIn("line2", pinfo["ps_error"])
+
+        # 3. WSL doctor: wasapi_ok=False with WSLg pulse_rdp_ok=True MUST fail (no false green) unless wsl_source="pulse";
+        #    not ps_ok surfaces ps_error + ExecutionPolicy hint
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            env_wsl = {
+                "HOME": td,
+                "PATH": "",
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "DASHSCOPE_API_KEY": "ds_test_aaaa",
+            }
+            buf_nomic = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.probe_wsl_host",
+                    return_value={
+                        "powershell_ok": True,
+                        "ps_version": "5.1",
+                        "wasapi_ok": False,
+                        "wasapi_state": "mic_permission:0x80070005",
+                        "pulse_rdp_ok": True,
+                        "winmm_devs": 1,
+                    },
+                ),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_nomic),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env_wsl), 1)
+            out_nomic = buf_nomic.getvalue()
+            self.assertIn("WASAPI=FAIL (mic_permission:0x80070005)", out_nomic)
+            self.assertIn("ms-settings:privacy-microphone", out_nomic)
+
+            # Explicit wsl_source="winmm" with wasapi_ok=False & winmm_devs=1 MUST still fail (no false green)
+            buf_winmm_fail = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.probe_wsl_host",
+                    return_value={
+                        "powershell_ok": True,
+                        "ps_version": "5.1",
+                        "wasapi_ok": False,
+                        "wasapi_state": "mic_permission:0x80070005",
+                        "pulse_rdp_ok": True,
+                        "winmm_devs": 1,
+                    },
+                ),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_winmm_fail),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(audio=AudioConfig(wsl_source="winmm")), env_wsl), 1)
+            self.assertIn("WASAPI=FAIL", buf_winmm_fail.getvalue())
+
+            # auto + custom AGENT_VOICE_INPUT_PULSE_SOURCE selects Pulse backend & checks custom source (even when RDPSource=False & wasapi_ok=False)
+            env_custom_pulse = {**env_wsl, "AGENT_VOICE_INPUT_PULSE_SOURCE": "alsa_input.usb-Blue_Yeti"}
+            with (
+                mock.patch("agent_voice_input.platform_wsl.resolve_powershell_exe", return_value=None),
+                mock.patch("agent_voice_input.platform_wsl.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        ["ffmpeg"], 0, stdout="  alsa_input.usb-Blue_Yeti [Blue Yeti]\n", stderr=""
+                    ),
+                ),
+            ):
+                p_custom = pw.probe_wsl_host(Config(), env=env_custom_pulse)
+            self.assertFalse(p_custom["pulse_rdp_ok"])
+            self.assertEqual(p_custom["pulse_source"], "alsa_input.usb-Blue_Yeti")
+            self.assertTrue(p_custom["pulse_source_ok"])
+
+            # Exact token match: prefix substring `alsa_input.usb-Mic` MUST NOT match `alsa_input.usb-Mic_2`
+            env_prefix_pulse = {**env_wsl, "AGENT_VOICE_INPUT_PULSE_SOURCE": "alsa_input.usb-Mic"}
+            with (
+                mock.patch("agent_voice_input.platform_wsl.resolve_powershell_exe", return_value=None),
+                mock.patch("agent_voice_input.platform_wsl.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        ["ffmpeg"], 0, stdout="Auto-detected sources for pulse:\n* alsa_input.usb-Mic_2 [USB Microphone]\n", stderr=""
+                    ),
+                ),
+            ):
+                p_prefix = pw.probe_wsl_host(Config(), env=env_prefix_pulse)
+            self.assertFalse(p_prefix["pulse_source_ok"])
+
+            buf_custom_pulse = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.probe_wsl_host",
+                    return_value={
+                        "powershell_ok": True,
+                        "ps_version": "5.1",
+                        "wasapi_ok": False,
+                        "pulse_rdp_ok": False,
+                        "pulse_source": "alsa_input.usb-Blue_Yeti",
+                        "pulse_source_ok": True,
+                        "winmm_devs": 0,
+                    },
+                ),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_custom_pulse),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env_custom_pulse), 0, buf_custom_pulse.getvalue())
+            self.assertIn("PulseAudio (alsa_input.usb-Blue_Yeti)=OK", buf_custom_pulse.getvalue())
+
+            # Host-incompatible hotkey flagged by doctor on WSL2 (Fn) and macOS (F24)
+            buf_wsl_badhk = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.probe_wsl_host",
+                    return_value={"powershell_ok": True, "ps_version": "5.1", "wasapi_ok": True, "pulse_rdp_ok": False, "winmm_devs": 1},
+                ),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_wsl_badhk),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(hotkey=HotkeyConfig(key="Fn")), env_wsl), 1)
+            self.assertIn("[hotkey]    FAIL", buf_wsl_badhk.getvalue())
+            self.assertIn("Windows/WSL2", buf_wsl_badhk.getvalue())
+
+            # Explicit wsl_source="pulse" allows pulse_rdp_ok=True to pass
+            buf_pulse = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.probe_wsl_host",
+                    return_value={
+                        "powershell_ok": True,
+                        "ps_version": "5.1",
+                        "wasapi_ok": False,
+                        "pulse_rdp_ok": True,
+                        "winmm_devs": 0,
+                    },
+                ),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_pulse),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(audio=AudioConfig(wsl_source="pulse")), env_wsl), 0)
+
+            # PowerShell failure surfaces ps_error + ExecutionPolicy hint
+            buf_psfail = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.probe_wsl_host",
+                    return_value={
+                        "powershell_ok": False,
+                        "ps_error": "blocked by ConstrainedLanguage policy",
+                        "pulse_rdp_ok": True,
+                        "winmm_devs": 0,
+                    },
+                ),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_psfail),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env_wsl), 1)
+            self.assertIn("ConstrainedLanguage", buf_psfail.getvalue())
+            self.assertIn("[win-shim]  HINT", buf_psfail.getvalue())
+
+            # 4. macOS doctor: not_determined local GUI -> non-blocking INFO; xcodebuild -license -> sudo xcodebuild -license accept
+            probe_mac_nd = {
+                "avfoundation_ok": True,
+                "audio_devices": ["[0] Mic"],
+                "configured_audio_device": ":default",
+                "pbcopy_ok": True,
+                "tmux_active": False,
+                "clt_ok": True,
+                "swiftc_ok": True,
+                "swiftc_bin": "/usr/bin/swiftc",
+                "mac_shim_ok": True,
+                "mac_shim_bin": "/tmp/mac_shim",
+                "caller_mic_auth": "not_determined",
+                "caller_has_graphic_session": True,
+                "caller_is_remote_session": False,
+                "fg_process": "Ghostty",
+                "fg_title": "zsh",
+                "permissions_hint": "Microphone -> Ghostty",
+            }
+            buf_nd = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=probe_mac_nd),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_nd),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env_wsl), 0, buf_nd.getvalue())
+            self.assertIn("[macos-tcc] INFO", buf_nd.getvalue())
+
+            probe_mac_lic = {
+                **probe_mac_nd,
+                "mac_shim_ok": False,
+                "mac_shim_error": "You have not agreed to the Xcode license. Run 'sudo xcodebuild -license'",
+                "caller_mic_auth": "authorized",
+            }
+            buf_lic = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=probe_mac_lic),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_lic),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env_wsl), 1)
+            self.assertIn("Fix: sudo xcodebuild -license accept", buf_lic.getvalue())
+            self.assertNotIn("Fix: xcode-select --install", buf_lic.getvalue())
+
+            buf_mac_badhk = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=probe_mac_nd),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_mac_badhk),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(hotkey=HotkeyConfig(key="F24")), env_wsl), 1)
+            self.assertIn("[hotkey]    FAIL", buf_mac_badhk.getvalue())
+            self.assertIn("macOS", buf_mac_badhk.getvalue())
+
+            # 5. _inspect_hook_summary validates structured hooks.*.command fields & rejects unrelated JSON keys
+            claude_dir = Path(td) / ".claude"
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            gemini_dir = Path(td) / ".gemini"
+            gemini_dir.mkdir(parents=True, exist_ok=True)
+            codex_dir = Path(td) / ".codex"
+            codex_dir.mkdir(parents=True, exist_ok=True)
+
+            # Negative cases: unrelated `cmd`, `permissions`, or non-event nested `command` entries MUST NOT match
+            (claude_dir / "settings.json").write_text('{"cmd": "~/.local/bin/voice-title.sh"}', encoding="utf-8")
+            (gemini_dir / "hooks.json").write_text(
+                '{"metadata": {"permissions": [{"command": "voice-title.sh"}]}}', encoding="utf-8"
+            )
+            (codex_dir / "config.toml").write_text('[tui]\nterminal_title = ["thread-id"]\n# session-hook\n', encoding="utf-8")
+            self.assertIn("hooks=none configured (optional)", cli_mod._inspect_hook_summary(env_wsl, rt))
+
+            (claude_dir / "settings.json").write_text(
+                '{"permissions": {"allow": ["Bash(agent-voice-input session-hook *)"]}}', encoding="utf-8"
+            )
+            self.assertIn("hooks=none configured (optional)", cli_mod._inspect_hook_summary(env_wsl, rt))
+
+            # Positive cases: official repo Claude/Gemini hook JSON schemas + voice-title.sh + Codex notify
+            claude_official = json.loads(
+                (_REPO_ROOT / "integrations" / "claude" / "settings.hooks.json").read_text(encoding="utf-8")
+            )
+            claude_official["hooks"]["SessionStart"][0]["hooks"][0]["command"] = "~/.local/bin/voice-title.sh"
+            (claude_dir / "settings.json").write_text(json.dumps(claude_official), encoding="utf-8")
+            (gemini_dir / "hooks.json").write_text(
+                (_REPO_ROOT / "integrations" / "gemini" / "hooks.json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (codex_dir / "config.toml").write_text(
+                'notify = ["agent-voice-input", "session-hook", "--cli", "codex"]\n',
+                encoding="utf-8",
+            )
+            hook_sum = cli_mod._inspect_hook_summary(env_wsl, rt)
+            self.assertIn("claude", hook_sum)
+            self.assertIn("gemini/agy", hook_sum)
+            self.assertIn("codex", hook_sum)
+
+            # 6. _cmd_start missing ffmpeg warns non-blockingly; WSL waits >10s (up to 18s) for slow cold socket
+            parser = cli_mod._build_parser()
+            self.assertNotIn("Two-stage", parser.description or "")
+
+            class _FakeProc:
+                pid = 51515
+                returncode = None
+                def poll(self): return None
+
+            # WSL slow cold start: socket becomes ready at t=12.5s (past 10s, within 18s WSL budget)
+            wsl_times = iter([0.0, 5.0, 12.5, 13.0])
+            wsl_ctrl_calls = [0]
+
+            def _wsl_slow_ctrl(_rt, _req, timeout_sec: float = 1.0):
+                wsl_ctrl_calls[0] += 1
+                if wsl_ctrl_calls[0] <= 2:
+                    raise ConnectionRefusedError("starting win_shim")
+                return {"ok": True, "pid": 51515, "state": "idle", "shim_ok": True}
+
+            out_wsl_slow = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=_wsl_slow_ctrl),
+                mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
+                mock.patch.object(cli_mod.time, "monotonic", side_effect=lambda: next(wsl_times, 25.0)),
+                mock.patch.object(cli_mod.time, "sleep", return_value=None),
+                mock.patch("sys.stdout", out_wsl_slow),
+            ):
+                rc_wsl_slow = cli_mod._cmd_start(parser.parse_args(["start"]), env_wsl, cfg=Config())
+            self.assertEqual(rc_wsl_slow, 0)
+            self.assertIn("started (pid=51515)", out_wsl_slow.getvalue())
+            self.assertNotIn("socket warming up", out_wsl_slow.getvalue())
+
+            for plat_name, exp_cmd in (("linux", "sudo apt install ffmpeg"), ("darwin", "brew install ffmpeg")):
+                calls = [0]
+                def _ctrl(_rt, _req, timeout_sec: float = 1.0):
+                    calls[0] += 1
+                    if calls[0] == 1:
+                        raise ConnectionRefusedError("stopped")
+                    return {"ok": True, "pid": 51515, "state": "idle", "shim_ok": True}
+                out_s, err_s = io.StringIO(), io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", plat_name),
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", side_effect=FileNotFoundError("no ffmpeg")),
+                    mock.patch("agent_voice_input.platform_macos.compile_mac_shim", return_value=(None, "")),
+                    mock.patch("agent_voice_input.daemon.send_control_command", side_effect=_ctrl),
+                    mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
+                    mock.patch("sys.stdout", out_s),
+                    mock.patch("sys.stderr", err_s),
+                ):
+                    rc_s = cli_mod._cmd_start(parser.parse_args(["start"]), env_wsl, cfg=Config())
+                self.assertEqual(rc_s, 0)
+                self.assertIn("WARN: ffmpeg not found", err_s.getvalue())
+                self.assertIn(exp_cmd, err_s.getvalue())
+
+        # 7. pyproject.toml & __init__.py metadata updated while preserving version & Development Status
+        import agent_voice_input as pkg_init
+        from agent_voice_input.config import parse_toml
+
+        self.assertEqual(pkg_init.__version__, "0.12.0")
+        self.assertNotIn("Two-stage", pkg_init.__doc__ or "")
+        pyp = parse_toml((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(pyp["project"]["version"], "0.12.0")
+        self.assertIn("Development Status :: 4 - Beta", pyp["project"]["classifiers"])
+        self.assertNotIn("Two-stage", pyp["project"]["description"])
+        for kw in ("antigravity", "agy", "dictation", "tmux"):
+            self.assertIn(kw, pyp["project"]["keywords"])
 
 
 if __name__ == "__main__":

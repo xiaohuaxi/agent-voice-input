@@ -446,7 +446,9 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertEqual(parsed["refiner"]["provider"], "auto")
         self.assertEqual(parsed["refiner"]["model"], "")
         self.assertEqual(parsed["refiner"]["api"], "auto")
-        self.assertNotIn("max_turns_per_thread", toml_raw)
+        self.assertNotIn("max_turns_per_thread", parsed["refiner"])
+        self.assertIn("# max_turns_per_thread = 20", toml_raw)
+        self.assertIn("# timeout_ms = 800", toml_raw)
         self.assertNotIn("max_turns_per_thread", (_REPO_ROOT / "README.md").read_text(encoding="utf-8"))
         self.assertNotIn("max_turns_per_thread", (_REPO_ROOT / "README.zh-CN.md").read_text(encoding="utf-8"))
         cfg, _ = load_config(config_path=toml_path, env={"HOME": "/tmp/nonexistent-home"})
@@ -466,7 +468,9 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
 
         env_raw = env_path.read_text(encoding="utf-8")
         self.assertNotIn("API_ID", env_raw)
+        # All example placeholder API keys stay commented out (matches `init` template) to prevent 401 hijacking
         loaded = load_env_files({}, env_paths=[env_path])
+        self.assertEqual(loaded, {})
         for expected_key in (
             "DASHSCOPE_API_KEY",
             "DEEPSEEK_API_KEY",
@@ -478,10 +482,8 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
             "GROQ_API_KEY",
             "SILICONFLOW_API_KEY",
         ):
-            self.assertIn(expected_key, loaded)
+            self.assertIn(f"# {expected_key}=", env_raw)
         # Legacy dual-header Doubao credentials stay commented out in config.example.env
-        self.assertNotIn("DOUBAO_ASR_APP_ID", loaded)
-        self.assertNotIn("DOUBAO_ASR_API_KEY", loaded)
         self.assertIn("# DOUBAO_ASR_APP_ID=", env_raw)
         self.assertIn("# DOUBAO_ASR_API_KEY=", env_raw)
 
@@ -5914,10 +5916,11 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             root = Path(td)
             hw_file = root / "hotwords.txt"
             hw_file.write_text("自定义术语\n", encoding="utf-8")
-            env = {"HOME": str(root / "home"), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(root / "rt")}
+            env_en = {"HOME": str(root / "home"), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(root / "rt"), "LANG": "en_US.UTF-8"}
+            env_zh = {**env_en, "LANG": "zh_CN.UTF-8"}
             voiced = _voiced_wav()
 
-            for lang in ("en", "auto", "zh"):
+            for lang, cur_env in (("en", env_en), ("auto", env_en), ("auto", env_zh), ("zh", env_en)):
                 cfg = Config(
                     asr=AsrConfig(hotwords_file=str(hw_file)),
                     ui=UiConfig(language=lang),
@@ -5930,16 +5933,17 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                     origin_window=ForegroundWindow(1, "WindowsTerminal.exe", "bash"),
                     mode="agent",
                     dry_run=True,
-                    env=env,
+                    env=cur_env,
                 )
                 self.assertTrue(res.ok)
 
-        hw_en, hw_auto, hw_zh = seen_hotwords
-        self.assertIn("自定义术语", hw_en)
-        self.assertIn("Codex", hw_en)
-        self.assertNotIn("豆包", hw_en)
-        self.assertNotIn("竞态", hw_en)
-        for hw_cjk in (hw_auto, hw_zh):
+        hw_en, hw_auto_en, hw_auto_zh, hw_zh = seen_hotwords
+        for hw_non_cjk in (hw_en, hw_auto_en):
+            self.assertIn("自定义术语", hw_non_cjk)
+            self.assertIn("Codex", hw_non_cjk)
+            self.assertNotIn("豆包", hw_non_cjk)
+            self.assertNotIn("竞态", hw_non_cjk)
+        for hw_cjk in (hw_auto_zh, hw_zh):
             self.assertIn("自定义术语", hw_cjk)
             self.assertIn("Codex", hw_cjk)
             self.assertIn("豆包", hw_cjk)

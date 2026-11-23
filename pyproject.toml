@@ -5,17 +5,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-voice-input"
 version = "0.12.0"
-description = "Two-stage context-aware voice input for CLI coding agents."
+description = "Context-aware voice input for CLI coding agents and desktop apps (two-stage STT + refiner or single-hop multimodal)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 keywords = [
     "voice-input",
+    "dictation",
     "asr",
     "speech-to-text",
     "cli-agent",
     "codex",
     "claude-code",
+    "antigravity",
+    "agy",
+    "tmux",
     "wsl2",
     "macos",
 ]

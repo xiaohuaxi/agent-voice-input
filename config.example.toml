@@ -158,6 +158,8 @@ api_key_env = ""
 # max_retries = 2
 # Set true to run Stage 2 refinement even when Stage 1 already performed single-hop multimodal refinement
 force_on_single_hop = false
+# Advanced (currently applies to provider = "agy" only): max stateful thread turns before opening a fresh session
+# max_turns_per_thread = 20
 
 [remote]
 # Optional zero-install SSH remote Linux session context routing (no remote daemon, no remote pip install, no remote API keys).
@@ -175,6 +177,8 @@ timeout_ms = 400
 # ssh_target = "my-cloud-gpu-01"
 # aliases = ["gpu01", "ubuntu-prod"]
 # ssh_bin = "ssh"
+# Optional per-host post-stop wait cap in ms (0..10000; overrides [remote].timeout_ms for this host):
+# timeout_ms = 800
 
 # -----------------------------------------------------------------------------
 # Quick Recipes (replace the [asr] / [refiner] values above as needed)

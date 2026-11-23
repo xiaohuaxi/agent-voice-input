@@ -1,4 +1,4 @@
-"""agent-voice-input: Two-stage context-aware voice input for CLI coding agents."""
+"""agent-voice-input: Context-aware voice input for CLI coding agents and desktop apps."""
 from __future__ import annotations
 
 __version__ = "0.12.0"

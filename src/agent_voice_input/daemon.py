@@ -55,7 +55,7 @@ from .config import (
 )
 from .hotwords import load_hotwords_file
 from .http_transport import evict_all_keepalive_connections
-from .hud import is_toast_hud_state
+from .hud import format_copied_hud_text, is_toast_hud_state, resolve_ui_language
 from .platform_common import (
     ForegroundWindow,
     MicrophoneUnavailableError,
@@ -92,6 +92,17 @@ DAEMON_LOG_BACKUP_FILENAME: str = "daemon.log.1"
 DEFAULT_DAEMON_LOG_MAX_BYTES: int = 2 * 1024 * 1024
 _LOG_ROTATE_CHECK_INTERVAL_SEC: float = 60.0
 _FAILED_PRUNE_CHECK_INTERVAL_SEC: float = 3600.0
+
+
+def _resolve_effective_ui_language(
+    cfg: Config,
+    *,
+    env: Mapping[str, str] | None = None,
+    platform: Any = None,
+) -> str:
+    host_culture_fn = getattr(platform, "_host_ui_culture", None)
+    win_culture = host_culture_fn() if callable(host_culture_fn) else None
+    return resolve_ui_language(cfg.ui.language, env=env, win_ui_culture=win_culture)
 
 
 def rotate_daemon_log_if_needed(
@@ -1219,7 +1230,7 @@ def _execute_stage1(
         st.snap,
         extra_hotwords=[*manual_hw, *extra_hw],
         mode=eff_mode,
-        language=cfg.ui.language,
+        language=_resolve_effective_ui_language(cfg, env=env, platform=platform),
     )
     asr_ctx.hotwords_scope = hw_scope
     asr_ctx.manual_hotwords_loaded = has_hw_file
@@ -2164,6 +2175,7 @@ class VoiceInputDaemon:
         self,
         state: str,
         *,
+        text: str = "",
         duration_ms: int = 0,
         layer: str | None = None,
         clear_main: bool | None = None,
@@ -2173,6 +2185,8 @@ class VoiceInputDaemon:
         if (fn := getattr(self.platform, "hud", None)) is None:
             return
         kw: dict[str, Any] = {}
+        if text:
+            kw["text"] = text
         if duration_ms > 0:
             kw["duration_ms"] = duration_ms
         if layer is not None:
@@ -3441,11 +3455,22 @@ class VoiceInputDaemon:
             summary, hud_st, hud_dur_ms, beep_k = outcome
             summary.setdefault("ts", round(time.time(), 6))
             self._append_telemetry(summary)
+            copied_hud_text = ""
+            if hud_st == "copied":
+                paste_reason = str(summary.get("paste_reason") or "")
+                low_pr = paste_reason.strip().lower()
+                if "accessibility_denied" in low_pr or "send_input_failed" in low_pr:
+                    copied_hud_text = format_copied_hud_text(
+                        paste_reason,
+                        _resolve_effective_ui_language(
+                            self.cfg, env=self.env, platform=self.platform
+                        ),
+                    )
 
             task = slot.task
             play_beep = ""
             with self._hud_lock:
-                hud_calls: list[tuple[str, int, str | None, bool | None, bool | None, int]] = []
+                hud_calls: list[tuple[str, str, int, str | None, bool | None, bool | None, int]] = []
                 with self._queue_cv:
                     if self._commit_queue and self._commit_queue[0] is slot:
                         self._commit_queue.popleft()
@@ -3458,7 +3483,7 @@ class VoiceInputDaemon:
                     if not self._stop_evt.is_set():
                         if task.silent_hud:
                             if not rec_active and not next_vis_stage and self._main_hud_visible:
-                                hud_calls.append(("hide", 0, None, None, None, 0))
+                                hud_calls.append(("hide", "", 0, None, None, None, 0))
                         elif rec_active:
                             if (
                                 self._recording_active
@@ -3467,24 +3492,25 @@ class VoiceInputDaemon:
                                 and self._main_hud_state == "recording"
                                 and vis_inflight != self._main_hud_bg_count
                             ):
-                                hud_calls.append(("recording", 0, None, None, False, vis_inflight))
+                                hud_calls.append(("recording", "", 0, None, None, False, vis_inflight))
                             if hud_st == "copied":
-                                hud_calls.append(("copied", hud_dur_ms, "toast", False, None, 0))
+                                hud_calls.append(("copied", copied_hud_text, hud_dur_ms, "toast", False, None, 0))
                             elif hud_st and is_toast_hud_state(hud_st):
-                                hud_calls.append((hud_st, hud_dur_ms, None, False, None, 0))
+                                hud_calls.append((hud_st, "", hud_dur_ms, None, False, None, 0))
                         elif next_vis_stage:
                             if self._main_hud_state != next_vis_stage:
-                                hud_calls.append((next_vis_stage, 0, None, None, None, 0))
+                                hud_calls.append((next_vis_stage, "", 0, None, None, None, 0))
                             if hud_st == "copied":
-                                hud_calls.append(("copied", hud_dur_ms, "toast", False, None, 0))
+                                hud_calls.append(("copied", copied_hud_text, hud_dur_ms, "toast", False, None, 0))
                             elif hud_st and is_toast_hud_state(hud_st):
-                                hud_calls.append((hud_st, hud_dur_ms, None, False, None, 0))
+                                hud_calls.append((hud_st, "", hud_dur_ms, None, False, None, 0))
                             play_beep = beep_k
                         else:
                             if hud_st:
                                 hud_calls.append(
                                     (
                                         hud_st,
+                                        copied_hud_text if hud_st == "copied" else "",
                                         hud_dur_ms,
                                         None,
                                         True if is_toast_hud_state(hud_st) else None,
@@ -3493,15 +3519,16 @@ class VoiceInputDaemon:
                                     )
                                 )
                             elif self._main_hud_visible:
-                                hud_calls.append(("hide", 0, None, None, None, 0))
+                                hud_calls.append(("hide", "", 0, None, None, None, 0))
                             play_beep = beep_k
-                        for st_n, _, lyr_n, clr_m_n, _, bg_n in hud_calls:
+                        for st_n, _, _, lyr_n, clr_m_n, _, bg_n in hud_calls:
                             self._update_main_hud_visibility_locked(
                                 st_n, layer=lyr_n, clear_main=clr_m_n, bg_count=bg_n
                             )
-                for st_name, dur_val, lyr_val, clr_main_val, clr_toast_val, bg_val in hud_calls:
+                for st_name, txt_val, dur_val, lyr_val, clr_main_val, clr_toast_val, bg_val in hud_calls:
                     self._invoke_platform_hud_unlocked(
                         st_name,
+                        text=txt_val,
                         duration_ms=dur_val,
                         layer=lyr_val,
                         clear_main=clr_main_val,
@@ -3628,7 +3655,12 @@ class VoiceInputDaemon:
     def handle_control(self, req: Mapping[str, Any]) -> dict[str, Any]:
         cmd = str(req.get("cmd") or "status")
         if cmd == "status":
-            shim_ok = not bool(getattr(self.platform, "_shim_disabled", False))
+            is_ok_fn = getattr(self.platform, "is_shim_ok", None)
+            shim_ok = (
+                bool(is_ok_fn())
+                if callable(is_ok_fn)
+                else not bool(getattr(self.platform, "_shim_disabled", False))
+            )
             raw_shim_err = str(getattr(self.platform, "last_shim_error", "") or "")
             shim_err = self._redact_str(raw_shim_err) if raw_shim_err else ""
             raw_hist = req.get("history")

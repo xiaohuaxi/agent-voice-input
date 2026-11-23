@@ -5,6 +5,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import threading
 import time
@@ -17,7 +18,7 @@ from .app_scope import (
     resolve_windows_paste_chord,
 )
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
-from .config import Config, redact_secrets
+from .config import Config, ConfigError, redact_secrets, validate_hotkey_for_platform
 from .http_transport import sleep_cooperative
 from .hud import resolve_ui_language
 from .platform_common import (
@@ -37,8 +38,26 @@ from .platform_common import (
 from .session_ctx import parse_window_title_hint
 
 POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+_POWERSHELL_EXE_ROOT_MOUNT = "/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 WSLG_PULSE_SOCK = "/mnt/wslg/PulseServer"
 SHIM_SCRIPT = Path(__file__).resolve().with_name("win_shim.ps1")
+
+
+def resolve_powershell_exe(env: Mapping[str, str] | None = None) -> str | None:
+    """Locate Windows ``powershell.exe`` across default mount, PATH, and custom ``automount.root = /``."""
+    if os.path.isfile(POWERSHELL_EXE):
+        return POWERSHELL_EXE
+    raw_path = None if env is None else env.get("PATH")
+    found = (
+        shutil.which("powershell.exe", path=raw_path)
+        if raw_path is not None
+        else shutil.which("powershell.exe")
+    )
+    if found and os.path.isfile(found):
+        return found
+    if os.path.isfile(_POWERSHELL_EXE_ROOT_MOUNT):
+        return _POWERSHELL_EXE_ROOT_MOUNT
+    return None
 
 
 
@@ -79,11 +98,12 @@ def run_win_shim_self_check(
     """Run ``win_shim.ps1 -Mode self-check`` (or ``clip-self-check``) headlessly with closed stdin."""
     if mode not in ("self-check", "clip-self-check"):
         raise ValueError(f"unsupported win_shim self-check mode: {mode!r}")
-    if not os.path.isfile(POWERSHELL_EXE):
+    ps_exe = resolve_powershell_exe(env)
+    if not ps_exe:
         return False, {}, f"PowerShell not found at {POWERSHELL_EXE}"
     try:
         cmd = [
-            POWERSHELL_EXE,
+            ps_exe,
             "-NoProfile",
             "-NonInteractive",
             "-Sta",
@@ -127,17 +147,81 @@ def run_win_shim_self_check(
     return True, parsed, ""
 
 
+def resolve_wsl_effective_audio_source(
+    cfg: Config,
+    env: Mapping[str, str] | None = None,
+    *,
+    pulse_source: str = "RDPSource",
+    has_powershell: bool | None = None,
+) -> tuple[str, str]:
+    """Return ``(backend, effective_pulse_source)`` matching ``WslPlatform`` runtime capture selection."""
+    raw_env = os.environ if env is None else env
+    explicit_pulse = (
+        raw_env.get("AGENT_VOICE_INPUT_PULSE_SOURCE")
+        or raw_env.get("VOICE_INPUT_PULSE_SOURCE")
+        or ""
+    ).strip()
+    eff_pulse_src = explicit_pulse or pulse_source.strip() or "RDPSource"
+    wsl_src = (cfg.audio.wsl_source or "auto").strip().lower()
+    if wsl_src in ("winmm", "wasapi"):
+        return wsl_src, eff_pulse_src
+    if wsl_src == "pulse":
+        return "pulse", eff_pulse_src
+    has_custom_pulse = bool(explicit_pulse or pulse_source.strip() not in ("", "RDPSource"))
+    if has_custom_pulse:
+        return "pulse", eff_pulse_src
+    ps_avail = (
+        resolve_powershell_exe(raw_env) is not None
+        if has_powershell is None
+        else bool(has_powershell)
+    )
+    return ("wasapi" if ps_avail else "pulse"), eff_pulse_src
+
+
+def _extract_pulse_source_names(output: str) -> set[str]:
+    """Extract exact PulseAudio source identifiers from ``ffmpeg -sources pulse`` output."""
+    names: set[str] = set()
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith("auto-detected sources"):
+            continue
+        if line.startswith("*"):
+            line = line[1:].lstrip()
+        if not line:
+            continue
+        tok = line.split(None, 1)[0]
+        if tok:
+            names.add(tok)
+    return names
+
+
 def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[str, Any]:
     raw_env = os.environ if env is None else env
     eff_env = _pulse_env(raw_env)
-    info: dict[str, Any] = {"powershell_ok": False, "pulse_rdp_ok": False, "winmm_devs": 0, "fg_process": "", "fg_title": ""}
+    _, eff_pulse_src = resolve_wsl_effective_audio_source(cfg, raw_env)
+    info: dict[str, Any] = {
+        "powershell_ok": False,
+        "pulse_rdp_ok": False,
+        "pulse_source": eff_pulse_src,
+        "pulse_source_ok": False,
+        "winmm_devs": 0,
+        "fg_process": "",
+        "fg_title": "",
+    }
     try:
         p = subprocess.run([resolve_ffmpeg_bin(), "-nostdin", "-hide_banner", "-sources", "pulse"], stdin=subprocess.DEVNULL, capture_output=True, text=True, env=eff_env, timeout=5, check=False)
-        info["pulse_rdp_ok"] = "RDPSource" in (p.stdout + p.stderr)
+        if p.returncode == 0:
+            pulse_names = _extract_pulse_source_names(p.stdout + "\n" + p.stderr)
+            info["pulse_rdp_ok"] = "RDPSource" in pulse_names
+            info["pulse_source_ok"] = eff_pulse_src in pulse_names
     except Exception as exc: info["pulse_error"] = str(exc)
-    if os.path.isfile(POWERSHELL_EXE):
+    ps_exe = resolve_powershell_exe(raw_env)
+    if ps_exe:
         try:
-            p = subprocess.run([POWERSHELL_EXE, "-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "probe"], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8, check=False)
+            p = subprocess.run(
+                [ps_exe, "-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "probe"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
+            )
             if p.returncode == 0 and p.stdout.strip():
                 d = json.loads(p.stdout.strip().splitlines()[-1])
                 ui_cult = str(d.get("ui_culture") or "").strip()
@@ -146,18 +230,27 @@ def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[st
                     info["wasapi_ok"] = bool(d.get("wasapi_ok"))
                 if "wasapi_state" in d:
                     info["wasapi_state"] = str(d.get("wasapi_state") or "")
-        except Exception as exc: info["ps_error"] = str(exc)
+                if not d.get("ok") and d.get("error"):
+                    info["ps_error"] = redact_secrets(str(d.get("error")), raw_env, cfg=cfg)[:240]
+            else:
+                raw_lines = [ln.strip() for ln in (p.stderr or p.stdout or "").splitlines() if ln.strip()]
+                first_err = raw_lines[0] if raw_lines else f"exit code {p.returncode}"
+                info["ps_error"] = redact_secrets(first_err, raw_env, cfg=cfg)[:240]
+        except Exception as exc:
+            info["ps_error"] = redact_secrets(str(exc), raw_env, cfg=cfg)[:240]
     return info
 
 
 def run_key_test(cfg: Config, seconds: int = 10) -> int:
-    if not os.path.isfile(POWERSHELL_EXE):
+    hk = validate_hotkey_for_platform(cfg.hotkey.key, "wsl")
+    ps_exe = resolve_powershell_exe()
+    if not ps_exe:
         raise RuntimeError(f"PowerShell not found at {POWERSHELL_EXE}")
     cmd = [
-        POWERSHELL_EXE, "-NoProfile", "-Sta", "-ExecutionPolicy", "Bypass",
+        ps_exe, "-NoProfile", "-Sta", "-ExecutionPolicy", "Bypass",
         "-File", to_windows_path(SHIM_SCRIPT),
         "-Mode", "key-test",
-        "-Hotkey", cfg.hotkey.key,
+        "-Hotkey", hk,
         "-TriggerMode", cfg.hotkey.trigger_mode,
         "-TapMaxMs", str(cfg.hotkey.tap_max_ms),
         "-HoldCancelMs", str(cfg.hotkey.effective_hold_cancel_ms()),
@@ -170,7 +263,7 @@ def run_key_test(cfg: Config, seconds: int = 10) -> int:
 
 class WslPlatform(JsonlShimMixin):
     _shim_graceful = False
-    _shim_ready_timeout = 8.0
+    _shim_ready_timeout = 15.0
     _shim_label = "win_shim"
 
     def _host_ui_culture(self) -> str | None:
@@ -180,16 +273,16 @@ class WslPlatform(JsonlShimMixin):
     def __init__(self, cfg: Config, *, env: Mapping[str, str] | None = None, pulse_source: str = "RDPSource", shim_cmd_factory: Callable[[], list[str]] | None = None) -> None:
         raw_env = os.environ if env is None else env
         self.cfg, self.env = cfg, _pulse_env(raw_env)
-        explicit_pulse = (raw_env.get("AGENT_VOICE_INPUT_PULSE_SOURCE") or raw_env.get("VOICE_INPUT_PULSE_SOURCE") or "").strip()
-        self.pulse_source = explicit_pulse or pulse_source.strip() or "RDPSource"
+        eff_backend, self.pulse_source = resolve_wsl_effective_audio_source(
+            cfg, raw_env, pulse_source=pulse_source
+        )
         self._shim_cmd_factory = shim_cmd_factory
         if cfg.audio.wsl_source in ("winmm", "wasapi"):
             self._primary_winmm = True
         elif cfg.audio.wsl_source == "pulse":
             self._primary_winmm = False
         else:
-            has_custom_pulse = bool(explicit_pulse or pulse_source.strip() not in ("", "RDPSource"))
-            self._primary_winmm = bool(not has_custom_pulse and shim_cmd_factory is None and os.path.isfile(POWERSHELL_EXE))
+            self._primary_winmm = bool(shim_cmd_factory is None and eff_backend in ("wasapi", "winmm"))
         self._use_winmm = self._primary_winmm
         self.last_audio_error = ""
         self._ff_rec, self._rec_mode = FfmpegWavRecorder(), ""
@@ -267,10 +360,16 @@ class WslPlatform(JsonlShimMixin):
     def _build_shim_cmd(self) -> list[str]:
         if self._shim_cmd_factory is not None:
             return self._shim_cmd_factory()
-        if not os.path.isfile(POWERSHELL_EXE):
+        try:
+            hk = validate_hotkey_for_platform(self.cfg.hotkey.key, "wsl")
+        except ConfigError as exc:
+            self.last_shim_error = redact_secrets(str(exc), self.env, cfg=self.cfg)
+            raise
+        ps_exe = resolve_powershell_exe(self.env)
+        if not ps_exe:
             raise RuntimeError(f"PowerShell not found at {POWERSHELL_EXE}")
         return [
-            POWERSHELL_EXE,
+            ps_exe,
             "-NoProfile",
             "-NonInteractive",
             "-Sta",
@@ -281,7 +380,7 @@ class WslPlatform(JsonlShimMixin):
             "-Mode",
             "bridge",
             "-Hotkey",
-            self.cfg.hotkey.key,
+            hk,
             "-TriggerMode",
             self.cfg.hotkey.trigger_mode,
             "-TapMaxMs",

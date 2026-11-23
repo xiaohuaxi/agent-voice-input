@@ -8,7 +8,21 @@ param(
 )
 $ErrorActionPreference = "Stop"
 [Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+function Write-JsonLine($obj) { try { [Console]::Out.WriteLine(($obj | ConvertTo-Json -Compress -Depth 5)); [Console]::Out.Flush() } catch { } }
+function Write-InitFailureAndExit($errObj) {
+    $msg = if ($null -ne $errObj -and $null -ne $errObj.Exception) { [string]$errObj.Exception.Message } else { [string]$errObj }
+    if ($Mode -eq "bridge" -or $Mode -eq "probe" -or $Mode -eq "key-test") {
+        Write-JsonLine @{ ok = $false; error = $msg }
+    } else {
+        [Console]::Error.WriteLine("win_shim init failed: " + $msg)
+    }
+    exit 1
+}
+try {
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+} catch {
+    Write-InitFailureAndExit $_
+}
 $csSource = @"
 using System;
 using System.Collections.Concurrent;
@@ -1241,9 +1255,14 @@ public static class VoiceWinShim {
     private static System.Windows.Forms.Timer _holdPreviewSafetyTimer = null;
     private static ulong _armedTimerGen = 0UL;
     private static readonly Dictionary<string, uint> _keyMap = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase) {
-        {"rcontrol",0xA3},{"rctrl",0xA3},{"lcontrol",0xA2},{"lctrl",0xA2},{"ralt",0xA5},{"rmenu",0xA5},
-        {"lalt",0xA4},{"lmenu",0xA4},{"rshift",0xA1},{"lshift",0xA0},{"capslock",0x14},{"scrolllock",0x91},
-        {"pause",0x13},{"insert",0x2D},{"space",0x20}
+        {"rcontrol",0xA3},{"rctrl",0xA3},{"rightcontrol",0xA3},{"rightctrl",0xA3},
+        {"lcontrol",0xA2},{"lctrl",0xA2},{"leftcontrol",0xA2},{"leftctrl",0xA2},{"control",0xA2},{"ctrl",0xA2},
+        {"ralt",0xA5},{"rightalt",0xA5},{"rmenu",0xA5},{"roption",0xA5},{"rightoption",0xA5},
+        {"lalt",0xA4},{"leftalt",0xA4},{"lmenu",0xA4},{"alt",0xA4},{"loption",0xA4},{"leftoption",0xA4},{"option",0xA4},
+        {"rshift",0xA1},{"rightshift",0xA1},{"lshift",0xA0},{"leftshift",0xA0},{"shift",0xA0},
+        {"rcommand",0x5C},{"rcmd",0x5C},{"rightcommand",0x5C},{"rightcmd",0x5C},{"rwin",0x5C},{"rsuper",0x5C},{"rightwin",0x5C},{"rightsuper",0x5C},
+        {"lcommand",0x5B},{"lcmd",0x5B},{"leftcommand",0x5B},{"leftcmd",0x5B},{"lwin",0x5B},{"lsuper",0x5B},{"leftwin",0x5B},{"leftsuper",0x5B},{"command",0x5B},{"cmd",0x5B},{"win",0x5B},{"super",0x5B},
+        {"capslock",0x14},{"scrolllock",0x91},{"pause",0x13},{"insert",0x2D},{"space",0x20}
     };
 
     public static void EnableDpiAwareness() {
@@ -1364,11 +1383,12 @@ public static class VoiceWinShim {
 
     public static uint ResolveKeyName(string raw) {
         string k = (raw ?? "RControl").Trim();
-        _hotkeyLabel = (k.Equals("rcontrol", StringComparison.OrdinalIgnoreCase) || k.Equals("rctrl", StringComparison.OrdinalIgnoreCase)) ? "\u53F3 Ctrl" : (" " + k);
+        string compact = k.Replace("_", "").Replace("-", "").Replace(" ", "");
+        _hotkeyLabel = (compact.Equals("rcontrol", StringComparison.OrdinalIgnoreCase) || compact.Equals("rctrl", StringComparison.OrdinalIgnoreCase) || compact.Equals("rightcontrol", StringComparison.OrdinalIgnoreCase) || compact.Equals("rightctrl", StringComparison.OrdinalIgnoreCase)) ? "\u53F3 Ctrl" : (" " + k);
         uint vk; int fn;
-        if (k.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) return Convert.ToUInt32(k.Substring(2), 16);
-        if (_keyMap.TryGetValue(k, out vk)) return vk;
-        if ((k.StartsWith("f", StringComparison.OrdinalIgnoreCase)) && int.TryParse(k.Substring(1), out fn) && fn >= 1 && fn <= 24) return (uint)(0x6F + fn);
+        if (compact.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) return Convert.ToUInt32(compact.Substring(2), 16);
+        if (_keyMap.TryGetValue(compact, out vk)) return vk;
+        if ((compact.StartsWith("f", StringComparison.OrdinalIgnoreCase)) && int.TryParse(compact.Substring(1), out fn) && fn >= 1 && fn <= 24) return (uint)(0x6F + fn);
         throw new ArgumentException("Unsupported hotkey name: " + raw);
     }
 
@@ -3828,7 +3848,7 @@ if (-not ('VoiceWinShim' -as [type])) {
             $dllPath = Join-Path $resolvedCacheDir $dllName
             if (Test-Path -LiteralPath $dllPath) {
                 try {
-                    Add-Type -Path $dllPath -ErrorAction Stop
+                    Add-Type -LiteralPath $dllPath -ErrorAction Stop
                     if ('VoiceWinShim' -as [type]) { $csCacheHit = $true }
                 } catch {
                     if (-not ('VoiceWinShim' -as [type])) {
@@ -3866,7 +3886,7 @@ if (-not ('VoiceWinShim' -as [type])) {
                             try { [System.IO.File]::Delete($tmpDll) } catch { }
                         }
                         if (Test-Path -LiteralPath $dllPath) {
-                            Add-Type -Path $dllPath -ErrorAction Stop
+                            Add-Type -LiteralPath $dllPath -ErrorAction Stop
                         }
                     }
                 } finally {
@@ -3892,13 +3912,16 @@ if (-not ('VoiceWinShim' -as [type])) {
         }
     } catch { }
     if (-not ('VoiceWinShim' -as [type])) {
-        Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition $csSource
+        try {
+            Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition $csSource
+        } catch {
+            Write-InitFailureAndExit $_
+        }
     }
 } else {
     $csCacheHit = $true
 }
 
-function Write-JsonLine($obj) { try { [Console]::Out.WriteLine(($obj | ConvertTo-Json -Compress -Depth 5)); [Console]::Out.Flush() } catch { } }
 function Invoke-Tone([string]$kind) { [VoiceWinShim]::PlayTone($kind, [bool]$Beep) }
 function Set-ClipboardSafe([string]$val) {
     for ($i = 0; $i -lt 3; $i++) {
@@ -3929,7 +3952,11 @@ function Get-TitleSessionToken([string]$title) {
     return ""
 }
 
-[VoiceWinShim]::EnableDpiAwareness()
+try {
+    [VoiceWinShim]::EnableDpiAwareness()
+} catch {
+    Write-InitFailureAndExit $_
+}
 
 if ($Mode -eq "self-check") {
     try {
@@ -3975,16 +4002,23 @@ if ($Mode -eq "probe") {
     exit 0
 }
 
-$targetVk = [VoiceWinShim]::ResolveKeyName($Hotkey)
+try {
+    $targetVk = [VoiceWinShim]::ResolveKeyName($Hotkey)
+} catch {
+    Write-JsonLine @{ ok = $false; error = [string]$_.Exception.Message }
+    exit 1
+}
 $isPtt = ($TriggerMode -eq "ptt" -or $TriggerMode -eq "push_to_talk")
 $AllowedTerminals = @("windowsterminal", "openconsole", "mintty", "wezterm", "wezterm-gui", "alacritty", "ghostty", "conhost", "putty", "tabby", "hyper", "kitty", "rio", "warp")
 if (-not [string]::IsNullOrWhiteSpace($AllowedTerminalsCsv)) {
     $AllowedTerminals = @($AllowedTerminalsCsv.Split(',') | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ -ne "" })
 }
+$bridgeReady = $false
 try {
     if ($Mode -eq "key-test") {
         [VoiceWinShim]::StartHook($targetVk, $isPtt, $TapMaxMs, $DebounceMs, $true, ($Seconds * 1000), $HoldCancelMs, $HoldHintMs)
         Write-JsonLine @{ event = "key_test_ready"; hotkey = $Hotkey; target_vk = ("0x{0:X2}" -f $targetVk); mode = $TriggerMode; seconds = $Seconds; tap_max_ms = $TapMaxMs; hold_cancel_ms = $HoldCancelMs; hold_hint_ms = $HoldHintMs }
+        $bridgeReady = $true
         while ([VoiceWinShim]::PumpOnce()) {
             $ev = New-Object ShimEvent
             while ([VoiceWinShim]::EvtQueue.TryDequeue([ref]$ev)) {
@@ -4001,6 +4035,7 @@ try {
     [VoiceWinShim]::StartHook($targetVk, $isPtt, $TapMaxMs, $DebounceMs, $false, 0, $HoldCancelMs, $HoldHintMs)
     [VoiceWinShim]::StartStdinReader()
     Write-JsonLine @{ event = "ready"; target_vk = ("0x{0:X2}" -f $targetVk); mode = $TriggerMode; wave_in_devs = [VoiceWinShim]::waveInGetNumDevs(); ui_culture = [VoiceWinShim]::GetHostUiCulture() }
+    $bridgeReady = $true
     :bridgeLoop while ([VoiceWinShim]::PumpOnce()) {
         try {
             $ev = New-Object ShimEvent
@@ -4134,6 +4169,11 @@ try {
             }
         }
     }
+} catch {
+    if (-not $bridgeReady) {
+        Write-JsonLine @{ ok = $false; error = [string]$_.Exception.Message }
+    }
+    exit 1
 } finally {
     [VoiceWinShim]::StopHook()
 }

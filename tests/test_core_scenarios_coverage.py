@@ -440,6 +440,9 @@ class TestLlmCommonMappingsAndUsageScenarios(unittest.TestCase):
         )
 
         self.assertIn("DASHSCOPE_API_KEY", llm_mod._missing_key_hint("dashscope", stage="asr"))
+        doubao_hint = llm_mod._missing_key_hint("doubao", stage="asr")
+        self.assertIn("DOUBAO_SPEECH_API_KEY", doubao_hint)
+        self.assertNotIn("OPENAI_API_KEY", doubao_hint)
         self.assertEqual(
             llm_mod._missing_key_hint("openai-compatible", stage="refiner"),
             "missing openai-compatible API key (set refiner.api_key_env or OPENAI_API_KEY)",

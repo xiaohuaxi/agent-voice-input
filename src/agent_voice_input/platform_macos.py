@@ -23,7 +23,16 @@ from .app_scope import (
     MACOS_TERMINALS,
 )
 from .audio_proc import pack_pcm16_mono_wav, resolve_ffmpeg_bin
-from .config import Config, ensure_secure_dir, expand_user_path, get_runtime_dir, is_hermetic_env, redact_secrets
+from .config import (
+    Config,
+    ConfigError,
+    ensure_secure_dir,
+    expand_user_path,
+    get_runtime_dir,
+    is_hermetic_env,
+    redact_secrets,
+    validate_hotkey_for_platform,
+)
 from .hud import resolve_ui_language
 from .platform_common import (
     FfmpegWavRecorder,
@@ -474,11 +483,12 @@ def compile_mac_shim(
 def run_macos_key_test(
     cfg: Config, seconds: int = 10, *, env: Mapping[str, str] | None = None, cache_dir: Path | None = None
 ) -> int:
+    hk = validate_hotkey_for_platform(cfg.hotkey.key, "darwin")
     bin_path, err = compile_mac_shim(env=env, cache_dir=cache_dir, cfg=cfg, announce=True)
     if bin_path is None:
         raise RuntimeError(f"macOS key-test unavailable: {err}")
     cmd = [
-        str(bin_path), "--mode", "key-test", "--hotkey", cfg.hotkey.key,
+        str(bin_path), "--mode", "key-test", "--hotkey", hk,
         "--trigger-mode", cfg.hotkey.trigger_mode, "--tap-max-ms", str(cfg.hotkey.tap_max_ms),
         "--hold-cancel-ms", str(cfg.hotkey.effective_hold_cancel_ms()),
         "--hold-hint-ms", str(cfg.hotkey.effective_hold_hint_ms()),
@@ -1005,13 +1015,18 @@ class MacOSPlatform(JsonlShimMixin):
     def _build_shim_cmd(self) -> list[str] | None:
         if self._shim_cmd_factory is not None:
             return self._shim_cmd_factory()
+        try:
+            hk = validate_hotkey_for_platform(self.cfg.hotkey.key, "darwin")
+        except ConfigError as exc:
+            self.last_shim_error = redact_secrets(str(exc), self.env, cfg=self.cfg)
+            return None
         bin_path, err = compile_mac_shim(env=self.env, cache_dir=self._cache_dir, cfg=self.cfg, announce=True)
         if bin_path is None:
             self.last_shim_error = redact_secrets(err, self.env, cfg=self.cfg)
             return None
         self.last_shim_error = ""
         return [
-            str(bin_path), "--mode", "bridge", "--hotkey", self.cfg.hotkey.key,
+            str(bin_path), "--mode", "bridge", "--hotkey", hk,
             "--trigger-mode", self.cfg.hotkey.trigger_mode, "--tap-max-ms", str(self.cfg.hotkey.tap_max_ms),
             "--hold-cancel-ms", str(self.cfg.hotkey.effective_hold_cancel_ms()),
             "--hold-hint-ms", str(self.cfg.hotkey.effective_hold_hint_ms()),

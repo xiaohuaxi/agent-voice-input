@@ -475,7 +475,8 @@ def extract_openai_compat_error(data: Mapping[str, Any]) -> tuple[Any, str] | No
 
 def _missing_key_hint(provider_name: str, *, stage: str = "asr") -> str:
     prov = provider_name.strip().lower()
-    envs = CREDENTIAL_ENV_ORDER.get(prov)
+    cred_key = "doubao_key" if prov == "doubao" else prov
+    envs = CREDENTIAL_ENV_ORDER.get(cred_key)
     if envs:
         joined = ", ".join(envs)
         return f"missing {prov} API key (set {joined})"
