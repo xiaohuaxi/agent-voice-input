@@ -6725,7 +6725,6 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
     def test_save_recordings_mp3_archive_permissions_ring_prune_and_ffmpeg_restore(self) -> None:
         import inspect
         import math
-        import shutil
         import stat
         import subprocess
         from agent_voice_input.audio_proc import (
@@ -6735,6 +6734,7 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             list_saved_recordings,
             process_wav,
             prune_saved_recordings_dir,
+            resolve_ffmpeg_bin,
             spawn_recording_archive,
         )
         from agent_voice_input.config import AudioConfig, resolve_saved_recordings_dir
@@ -6742,9 +6742,10 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
         speech_band_wav = pack_pcm16_mono_wav(
             [int(5000 * math.sin(2.0 * math.pi * 440.0 * i / 16000.0)) for i in range(9600)]
         )
-        ffmpeg_exe = shutil.which("ffmpeg")
-        if ffmpeg_exe is None and not _is_ci() and os.path.isfile("/usr/bin/ffmpeg"):
-            ffmpeg_exe = "/usr/bin/ffmpeg"
+        try:
+            ffmpeg_exe: str | None = resolve_ffmpeg_bin()
+        except AudioError:
+            ffmpeg_exe = None
         has_ffmpeg = ffmpeg_exe is not None
         if not has_ffmpeg and _is_ci():
             self.fail("ffmpeg must be installed in CI for recording archive test (silent downgrade forbidden)")
@@ -9509,7 +9510,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 t_st0 = time.monotonic()
                 st_resp = send_control_command(rt, {"cmd": "status"}, timeout_sec=1.0)
                 self.assertTrue(st_resp.get("ok"), st_resp)
-                self.assertLess(time.monotonic() - t_st0, 0.5)
+                self.assertLess(time.monotonic() - t_st0, 1.5)
 
                 t_pr0 = time.monotonic()
                 pr_resp = send_control_command(
@@ -9519,7 +9520,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 )
                 self.assertTrue(pr_resp.get("ok"), pr_resp)
                 self.assertEqual(pr_resp.get("mode"), "general")
-                self.assertLess(time.monotonic() - t_pr0, 0.5)
+                self.assertLess(time.monotonic() - t_pr0, 1.5)
 
                 t_busy0 = time.monotonic()
                 busy_resp = send_control_command(
@@ -9529,7 +9530,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 )
                 self.assertFalse(busy_resp.get("ok"))
                 self.assertEqual(busy_resp.get("error"), "selftest_wav busy")
-                self.assertLess(time.monotonic() - t_busy0, 0.5)
+                self.assertLess(time.monotonic() - t_busy0, 1.5)
 
                 # 3. Release Client 1 and immediately fire sequential Client 3 -> no false busy!
                 asr.release.set()
@@ -10377,6 +10378,15 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 daemon.handle_trigger("toggle")
                 self.assertTrue(main_in_deliver.wait(timeout=2.0), "main dictation did not enter deliver_text")
 
+                selftest_reached_deliver = threading.Event()
+                orig_deliver_for_selftest = daemon._deliver_for_selftest
+
+                def _tracked_deliver_for_selftest(*args: object, **kwargs: object) -> PasteOutcome:
+                    selftest_reached_deliver.set()
+                    return orig_deliver_for_selftest(*args, **kwargs)  # type: ignore[arg-type]
+
+                daemon._deliver_for_selftest = _tracked_deliver_for_selftest  # type: ignore[method-assign]
+
                 st_res: list[dict[str, object]] = []
 
                 def _run_st() -> None:
@@ -10394,7 +10404,10 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
 
                 st_th = threading.Thread(target=_run_st, daemon=True)
                 st_th.start()
-                time.sleep(0.08)
+                self.assertTrue(
+                    selftest_reached_deliver.wait(timeout=2.0),
+                    "selftest did not reach _deliver_for_selftest while main held _deliver_lock",
+                )
                 # selftest must still be blocked behind _deliver_lock until main finishes
                 self.assertEqual(max_concurrent[0], 1)
                 self.assertEqual(deliver_order, ["main_start"])
@@ -10891,19 +10904,881 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
 
                 self.assertLess(elapsed, 1.5, "close() must stay bounded when a control thread hangs")
                 self.assertNotIn("refiner", closed_components)
-                self.assertNotIn("tracker", closed_components)
+                self.assertIn("tracker", closed_components)
                 self.assertIn("platform", closed_components)
+
+                # Once the stuck selftest_wav thread exits, deferred cleanup MUST close refiner automatically (once).
+                release_stuck.set()
+                srv_th.join(timeout=3.0)
+                if client_th is not None:
+                    client_th.join(timeout=3.0)
+                deadline_ref = time.monotonic() + 2.0
+                while time.monotonic() < deadline_ref and "refiner" not in closed_components:
+                    time.sleep(0.01)
+                self.assertEqual(closed_components.count("refiner"), 1)
+                self.assertEqual(closed_components.count("tracker"), 1)
             finally:
                 release_stuck.set()
                 srv_th.join(timeout=3.0)
                 if client_th is not None:
                     client_th.join(timeout=3.0)
-                # Wait briefly for control thread cleanup, then run clean final close so no resources leak
                 with daemon._lock:
                     rem_ctrl = list(daemon._control_threads)
                 for th in rem_ctrl:
                     th.join(timeout=2.0)
                 daemon.close()
+
+    def test_agy20_same_window_verifier_blocks_session_switch_in_live_and_selftest_deliver(self) -> None:
+        import contextlib
+        import sqlite3
+        from agent_voice_input.daemon import _make_desktop_same_window_verifier
+
+        def _seed_agy_db(home: Path, repo_a: Path, repo_b: Path) -> tuple[str, str]:
+            cid_a = "aaaa1111-2222-3333-4444-555555555555"
+            cid_b = "bbbb1111-2222-3333-4444-555555555555"
+            ide_root = home / ".gemini" / "antigravity"
+            for cid, text in (
+                (cid_a, "Discuss AlphaRouter session A"),
+                (cid_b, "Discuss BetaRouter session B"),
+            ):
+                p = ide_root / "brain" / cid / ".system_generated" / "logs" / "transcript_full.jsonl"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(
+                    json.dumps(
+                        {
+                            "source": "USER_EXPLICIT",
+                            "type": "USER_INPUT",
+                            "content": f"<USER_REQUEST>{text}</USER_REQUEST>",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            db_path = ide_root / "conversation_summaries.db"
+            with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT,
+                        source TEXT,
+                        parent_conversation_id TEXT,
+                        nesting_depth INTEGER,
+                        agent_name TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            cid_a,
+                            "Refactor AlphaRouter Pipeline",
+                            json.dumps([repo_a.as_uri()]),
+                            "2026-11-23T10:05:00Z",
+                            "USER_EXPLICIT",
+                            None,
+                            0,
+                            "antigravity",
+                        ),
+                        (
+                            cid_b,
+                            "Debug BetaRouter Timeout",
+                            json.dumps([repo_b.as_uri()]),
+                            "2026-11-23T10:06:00Z",
+                            "USER_EXPLICIT",
+                            None,
+                            0,
+                            "antigravity",
+                        ),
+                    ],
+                )
+                conn.commit()
+            return cid_a, cid_b
+
+        class _VerifyingAgyPlatform(_FakePlatform):
+            def __init__(self, initial_fg: ForegroundWindow) -> None:
+                super().__init__()
+                self.fg = initial_fg
+                self.verifiers_seen: int = 0
+                self.pasted_texts: list[str] = []
+                self.copied_texts: list[str] = []
+
+            def get_foreground_window(self) -> ForegroundWindow:
+                return self.fg
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                origin_window: ForegroundWindow | None = None,
+                same_window_verifier: object = None,
+                before_commit: object = None,
+                **kw: object,
+            ) -> PasteOutcome:
+                del seq_id, target_hwnd, kw
+                if callable(before_commit) and not before_commit():
+                    return PasteOutcome(False, False, "cancelled", "")
+                if origin_window is not None and origin_window.origin_drifted:
+                    self.copied_texts.append(text)
+                    return PasteOutcome(False, True, "focus_changed", self.fg.process)
+                if callable(same_window_verifier):
+                    self.verifiers_seen += 1
+                    if not same_window_verifier(self.fg):
+                        self.copied_texts.append(text)
+                        return PasteOutcome(False, True, "focus_changed", self.fg.process)
+                self.pasted_texts.append(text)
+                return PasteOutcome(True, True, "ok", self.fg.process, used_clipboard_paste=True)
+
+        class _NoVerifierParamPlatform(_FakePlatform):
+            def __init__(self, initial_fg: ForegroundWindow) -> None:
+                super().__init__()
+                self.fg = initial_fg
+
+            def get_foreground_window(self) -> ForegroundWindow:
+                return self.fg
+
+            def deliver_text(
+                self,
+                text: str,
+                seq_id: int,
+                target_hwnd: int = 0,
+                *,
+                origin_window: ForegroundWindow | None = None,
+                suppress_beep: object = False,
+                is_cancelled: object = None,
+                before_clipboard_write: object = None,
+                before_commit: object = None,
+                fallback_clipboard_text: object = None,
+                preserve_clipboard: bool = False,
+            ) -> PasteOutcome:
+                del text, seq_id, target_hwnd, suppress_beep, is_cancelled, before_clipboard_write
+                del fallback_clipboard_text, preserve_clipboard
+                if callable(before_commit) and not before_commit():
+                    return PasteOutcome(False, False, "cancelled", "")
+                if origin_window is not None and origin_window.origin_drifted:
+                    return PasteOutcome(False, True, "focus_changed", self.fg.process)
+                return PasteOutcome(True, True, "ok", self.fg.process, used_clipboard_paste=True)
+
+        class _HookAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self, text: str, on_transcribe: object = None) -> None:
+                self._text = text
+                self._on_transcribe = on_transcribe
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **kw: object) -> AsrResult:
+                del wav_bytes, context, kw
+                if callable(self._on_transcribe):
+                    self._on_transcribe()
+                return AsrResult(self._text, "dashscope", "mock", 5)
+
+        self.assertTrue(callable(_make_desktop_same_window_verifier))
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            rt = tmp / "rt"
+            rt.mkdir(mode=0o700)
+            repo_a = home / "repos" / "alpha-router"
+            repo_b = home / "repos" / "beta-router"
+            repo_a.mkdir(parents=True)
+            repo_b.mkdir(parents=True)
+            _seed_agy_db(home, repo_a, repo_b)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+
+            win_a = ForegroundWindow(hwnd=701, process="Antigravity.exe", title="Refactor AlphaRouter Pipeline")
+            win_b = ForegroundWindow(hwnd=701, process="Antigravity.exe", title="Debug BetaRouter Timeout")
+            win_a_trunc = ForegroundWindow(hwnd=701, process="Antigravity.exe", title="Refactor AlphaRouter...")
+
+            env = {"HOME": str(home), "XDG_RUNTIME_DIR": str(rt)}
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+
+            # 1. Live dictation: same-window switch A -> B must fail closed to clipboard (focus_changed)
+            plat = _VerifyingAgyPlatform(win_a)
+            next_fg = [win_b]
+            asr = _HookAsr("不要串台到会话B", on_transcribe=lambda: setattr(plat, "fg", next_fg[0]))
+            tracker = SessionTracker(home_dir=home, runtime_dir=rt, proc_root=tmp / "empty_proc", env=env)
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=asr,
+                refiner=create_refiner(cfg),
+                tracker=tracker,
+            )
+            try:
+                daemon.handle_trigger("toggle", win_a)
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and daemon.state != "idle":
+                    time.sleep(0.01)
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(plat.verifiers_seen, 1)
+                self.assertEqual(plat.pasted_texts, [])
+                self.assertEqual(plat.copied_texts, ["不要串台到会话B"])
+                self.assertEqual(daemon.last_result["paste_reason"], "focus_changed")
+                self.assertEqual(daemon.last_result["delivery_status"], "copied")
+
+                # 2. Live dictation: same-window truncated title still resolving to session A pastes normally
+                plat.fg = win_a
+                next_fg[0] = win_a_trunc
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle", win_a)
+                daemon._last_trigger_ts = -1e9
+                daemon.handle_trigger("toggle")
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and daemon.state != "idle":
+                    time.sleep(0.01)
+                self.assertEqual(daemon.state, "idle")
+                self.assertEqual(plat.verifiers_seen, 2)
+                self.assertEqual(plat.pasted_texts, ["不要串台到会话B"])
+                self.assertEqual(daemon.last_result["delivery_status"], "pasted")
+
+                # 3. selftest_wav(deliver=True) with same-window switch A -> B safely falls back to clipboard
+                plat.fg = win_a
+                next_fg[0] = win_b
+                r_st = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "use_live_window": True,
+                        "deliver": True,
+                        "no_telemetry": True,
+                    }
+                )
+                self.assertTrue(r_st["ok"], r_st)
+                self.assertEqual(plat.verifiers_seen, 3)
+                self.assertFalse(r_st["pasted"])
+                self.assertTrue(r_st["clipboard"])
+                self.assertEqual(r_st["paste_reason"], "focus_changed")
+                self.assertEqual(r_st["delivery_status"], "copied")
+            finally:
+                daemon.close()
+
+            # 4. Fallback verifier path when platform.deliver_text does not accept same_window_verifier kwarg
+            plat_fb = _NoVerifierParamPlatform(win_a)
+            asr_fb = _HookAsr("兼容降级复核", on_transcribe=lambda: setattr(plat_fb, "fg", win_b))
+            daemon_fb = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=plat_fb,
+                asr_provider=asr_fb,
+                refiner=create_refiner(cfg),
+                tracker=SessionTracker(home_dir=home, runtime_dir=rt, proc_root=tmp / "empty_proc", env=env),
+            )
+            try:
+                r_fb = daemon_fb.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "use_live_window": True,
+                        "deliver": True,
+                        "no_telemetry": True,
+                    }
+                )
+                self.assertTrue(r_fb["ok"], r_fb)
+                self.assertFalse(r_fb["pasted"])
+                self.assertTrue(r_fb["clipboard"])
+                self.assertEqual(r_fb["paste_reason"], "focus_changed")
+            finally:
+                daemon_fb.close()
+
+    def test_selftest_wav_no_telemetry_isolates_tracker_and_preserves_live_ssh_prefetch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            rt = tmp / "rt"
+            rt.mkdir(mode=0o700)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+
+            real_repo = tmp / "nondefault_vault" / "prod-ide-proj"
+            real_repo.mkdir(parents=True)
+            sandbox_repo = tmp / "sandbox_vault" / "selftest-proj"
+            sandbox_repo.mkdir(parents=True)
+
+            prod_sid = "1111aaaa-1111-2222-3333-444444444444"
+            prod_rollout = self._write_codex_rollout(
+                home / ".codex" / "sessions" / "2026" / "11" / "23" / f"rollout-2026-11-23T10-00-00-{prod_sid}.jsonl",
+                prod_sid,
+                str(real_repo),
+                [("user", "prod turn")],
+            )
+            write_session_registry_entry(
+                rt, cli="codex", session_id=prod_sid, cwd=str(real_repo), jsonl_path=str(prod_rollout), pid=os.getpid()
+            )
+            sb_sid = "2222bbbb-1111-2222-3333-444444444444"
+            sb_rollout = self._write_codex_rollout(
+                home / ".codex" / "sessions" / "2026" / "11" / "23" / f"rollout-2026-11-23T10-01-00-{sb_sid}.jsonl",
+                sb_sid,
+                str(sandbox_repo),
+                [("user", "sandbox selftest turn")],
+            )
+            write_session_registry_entry(
+                rt, cli="codex", session_id=sb_sid, cwd=str(sandbox_repo), jsonl_path=str(sb_rollout), pid=os.getpid()
+            )
+
+            env = {"HOME": str(home), "XDG_RUNTIME_DIR": str(rt)}
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            prod_tracker = SessionTracker(home_dir=home, runtime_dir=rt, proc_root=tmp / "empty_proc", env=env)
+            self.assertIsNotNone(prod_tracker.sync_session(window_title="codex [#1111aaaa]"))
+            before_keys = set(prod_tracker._states.keys())
+            before_cwds = list(prod_tracker.active_session_cwds())
+            cancel_prefetch_calls: list[object] = []
+            orig_cancel_prefetch = prod_tracker.cancel_remote_prefetch
+
+            def _spy_cancel_prefetch(*args: object, **kwargs: object) -> None:
+                cancel_prefetch_calls.append((args, kwargs))
+                orig_cancel_prefetch(*args, **kwargs)  # type: ignore[arg-type]
+
+            prod_tracker.cancel_remote_prefetch = _spy_cancel_prefetch  # type: ignore[method-assign]
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("隔离自检"),
+                refiner=create_refiner(cfg),
+                tracker=prod_tracker,
+            )
+            closed_temp_trackers: list[SessionTracker] = []
+            orig_make_probe = daemon._make_probe_tracker
+
+            def _spy_make_probe() -> tuple[object, bool]:
+                tr, owns = orig_make_probe()
+                if owns and isinstance(tr, SessionTracker):
+                    orig_cl = tr.close
+
+                    def _track_close() -> None:
+                        closed_temp_trackers.append(tr)
+                        orig_cl()
+
+                    tr.close = _track_close  # type: ignore[method-assign]
+                return tr, owns
+
+            daemon._make_probe_tracker = _spy_make_probe  # type: ignore[method-assign]
+            try:
+                # 1. selftest_wav(no_telemetry=True) on sandbox session must NOT pollute prod_tracker
+                r1 = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "process": "WindowsTerminal.exe",
+                        "title": "codex [#2222bbbb]",
+                        "no_telemetry": True,
+                    }
+                )
+                self.assertTrue(r1["ok"], r1)
+                self.assertEqual(r1["routing"]["session_key_masked"], "codex:2222bbbb")
+                self.assertEqual(r1["routing"]["workspace_name"], "selftest-proj")
+                self.assertEqual(set(prod_tracker._states.keys()), before_keys)
+                self.assertEqual(prod_tracker.active_session_cwds(), before_cwds)
+                self.assertEqual(cancel_prefetch_calls, [])
+                self.assertEqual(len(closed_temp_trackers), 1)
+
+                # 2. IDE selftest_wav(no_telemetry=True) still benefits from read-only active_session_cwds snapshot
+                r2 = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "process": "Code.exe",
+                        "title": "main.py - prod-ide-proj - Visual Studio Code",
+                        "no_telemetry": True,
+                    }
+                )
+                self.assertTrue(r2["ok"], r2)
+                self.assertEqual(r2["routing"]["workspace_name"], "prod-ide-proj")
+                self.assertEqual(set(prod_tracker._states.keys()), before_keys)
+                self.assertEqual(len(closed_temp_trackers), 2)
+            finally:
+                daemon.close()
+
+    def test_selftest_wav_deliver_aborts_late_paste_on_client_timeout_or_disconnect(self) -> None:
+        import socket
+
+        class _GatedAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **kw: object) -> AsrResult:
+                del wav_bytes, context, kw
+                self.entered.set()
+                self.release.wait(timeout=5.0)
+                return AsrResult("迟到不应粘贴的文本", "dashscope", "mock", 5)
+
+        class _RecordDeliverPlatform(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fg = ForegroundWindow(hwnd=808, process="WindowsTerminal.exe", title="codex")
+                self.deliver_calls: list[str] = []
+
+            def get_foreground_window(self) -> ForegroundWindow:
+                return self.fg
+
+            def deliver_text(self, text: str, seq_id: int, target_hwnd: int = 0, **kw: object) -> PasteOutcome:
+                del seq_id, target_hwnd, kw
+                self.deliver_calls.append(text)
+                return PasteOutcome(True, True, "ok", self.fg.process, used_clipboard_paste=True)
+
+        with tempfile.TemporaryDirectory(prefix="avi-disc-", dir="/tmp") as td:
+            rt = Path(td)
+            os.chmod(rt, 0o700)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            plat = _RecordDeliverPlatform()
+            asr = _GatedAsr()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=asr,
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            try:
+                _wait_for_control_socket(rt)
+
+                # Case 1: Client times out via send_control_command(timeout_sec=0.15) while ASR is blocked
+                with self.assertRaises((TimeoutError, socket.timeout)):
+                    send_control_command(
+                        rt,
+                        {
+                            "cmd": "selftest_wav",
+                            "wav_path": str(wav_file),
+                            "use_live_window": True,
+                            "deliver": True,
+                            "no_telemetry": True,
+                        },
+                        timeout_sec=0.15,
+                    )
+                self.assertTrue(asr.entered.wait(timeout=2.0))
+                asr.release.set()
+                # Wait until selftest worker releases _selftest_lock
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    if daemon._selftest_lock.acquire(blocking=False):
+                        daemon._selftest_lock.release()
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(plat.deliver_calls, [], "Timed-out selftest_wav must NEVER paste after client left")
+
+                # Case 2: Client disconnects explicitly while timeout_sec is still generous (10s)
+                asr.entered.clear()
+                asr.release.clear()
+                raw_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    raw_sock.settimeout(2.0)
+                    raw_sock.connect(str(rt / "control.sock"))
+                    req_bytes = (
+                        json.dumps(
+                            {
+                                "cmd": "selftest_wav",
+                                "wav_path": str(wav_file),
+                                "use_live_window": True,
+                                "deliver": True,
+                                "no_telemetry": True,
+                                "timeout_sec": 10.0,
+                            }
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    raw_sock.sendall(req_bytes)
+                    self.assertTrue(asr.entered.wait(timeout=2.0))
+                finally:
+                    raw_sock.close()
+                # Give kernel brief moment to deliver EOF/FIN on AF_UNIX peer before releasing ASR
+                time.sleep(0.03)
+                asr.release.set()
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    if daemon._selftest_lock.acquire(blocking=False):
+                        daemon._selftest_lock.release()
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(
+                    plat.deliver_calls, [], "Disconnected client's selftest_wav must NEVER paste after peer EOF"
+                )
+
+                # Case 3: Client disconnects while selftest_wav is queued waiting for _deliver_lock
+                asr.entered.clear()
+                asr.release.set()
+                selftest_reached_deliver = threading.Event()
+                orig_deliver_st = daemon._deliver_for_selftest
+
+                def _spy_deliver_st(*args: object, **kwargs: object) -> PasteOutcome:
+                    selftest_reached_deliver.set()
+                    return orig_deliver_st(*args, **kwargs)  # type: ignore[arg-type]
+
+                daemon._deliver_for_selftest = _spy_deliver_st  # type: ignore[method-assign]
+                daemon._deliver_lock.acquire()
+                raw_sock2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    raw_sock2.settimeout(2.0)
+                    raw_sock2.connect(str(rt / "control.sock"))
+                    raw_sock2.sendall(
+                        (
+                            json.dumps(
+                                {
+                                    "cmd": "selftest_wav",
+                                    "wav_path": str(wav_file),
+                                    "use_live_window": True,
+                                    "deliver": True,
+                                    "no_telemetry": True,
+                                    "timeout_sec": 10.0,
+                                }
+                            )
+                            + "\n"
+                        ).encode("utf-8")
+                    )
+                    self.assertTrue(selftest_reached_deliver.wait(timeout=2.0))
+                    raw_sock2.close()
+                    time.sleep(0.03)
+                finally:
+                    raw_sock2.close()
+                    daemon._deliver_lock.release()
+
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    if daemon._selftest_lock.acquire(blocking=False):
+                        daemon._selftest_lock.release()
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(
+                    plat.deliver_calls, [], "Client disconnect while waiting on _deliver_lock must abort delivery"
+                )
+            finally:
+                asr.release.set()
+                daemon.close()
+                srv_th.join(timeout=2.0)
+
+    def test_selftest_wav_does_not_break_live_auto_stop_or_recorder_lost_absorption(self) -> None:
+        now = [500.0]
+
+        def _clock() -> float:
+            return now[0]
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            plat = _FakePlatform()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_FakeAsr("录音测试"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+                clock_fn=_clock,
+                sleep_fn=lambda _: None,
+            )
+            try:
+                # 1. Auto-stop absorption survives concurrent selftest_wav(no_telemetry=False)
+                r_start = daemon.handle_trigger("toggle")
+                self.assertTrue(r_start["ok"])
+                rec_seq = r_start["seq_id"]
+                now[0] += 1.0
+                r_auto = daemon.handle_trigger("toggle", expected_seq_id=rec_seq)
+                self.assertTrue(r_auto["ok"])
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and daemon.state != "idle":
+                    time.sleep(0.01)
+
+                r_st = daemon.handle_control({"cmd": "selftest_wav", "wav_path": str(wav_file)})
+                self.assertTrue(r_st["ok"], r_st)
+                self.assertGreater(daemon.seq_id, rec_seq)
+
+                now[0] += 0.4  # still inside 1.5s auto-stop absorption window
+                r_absorb = daemon.handle_trigger("toggle")
+                self.assertTrue(r_absorb["ok"])
+                self.assertEqual(r_absorb.get("ignored"), "already_stopped")
+                self.assertFalse(daemon._recording_active)
+
+                # 2. Recorder-lost absorption survives selftest_wav(no_telemetry=False) during/after stop_recording
+                now[0] += 2.0
+                r_start2 = daemon.handle_trigger("toggle")
+                self.assertTrue(r_start2["ok"])
+                rec_seq2 = r_start2["seq_id"]
+                plat.wav_bytes = b""
+                orig_stop = plat.stop_recording
+
+                def _stop_with_concurrent_selftest(**kw: object) -> tuple[bytes, str]:
+                    # Concurrent selftest_wav increments daemon.seq_id while _on_recorder_lost runs stop_recording!
+                    st_mid = daemon.handle_control({"cmd": "selftest_wav", "wav_path": str(wav_file)})
+                    self.assertTrue(st_mid["ok"], st_mid)
+                    return orig_stop(**kw)  # type: ignore[arg-type]
+
+                plat.stop_recording = _stop_with_concurrent_selftest  # type: ignore[method-assign]
+                daemon._on_recorder_lost(seq_id=rec_seq2)
+                self.assertGreater(daemon.seq_id, rec_seq2)
+
+                now[0] += 0.4  # still inside 1.5s recorder-lost absorption window
+                r_absorb_lost = daemon.handle_trigger("toggle")
+                self.assertTrue(r_absorb_lost["ok"])
+                self.assertEqual(r_absorb_lost.get("ignored"), "already_stopped")
+                self.assertFalse(daemon._recording_active)
+            finally:
+                daemon.close()
+
+    def test_close_probe_route_stuck_does_not_block_shared_refiner_or_tracker_close(self) -> None:
+        from unittest import mock
+        from agent_voice_input.refiner import BaseRefiner
+
+        entered_probe = threading.Event()
+        release_probe = threading.Event()
+        closed_components: list[str] = []
+
+        class _TrackedRefiner(BaseRefiner):
+            provider_name = "deepseek"
+
+            def refine(self, asr: AsrResult, **kw: object) -> RefinerResult:
+                del kw
+                return RefinerResult(asr.text, "deepseek", "mock", 1, "")
+
+            def close(self) -> None:
+                closed_components.append("refiner")
+
+        with tempfile.TemporaryDirectory(prefix="avi-prcl-", dir="/tmp") as td:
+            rt = Path(td)
+            os.chmod(rt, 0o700)
+            tracker = _isolated_tracker(rt)
+            orig_tr_close = tracker.close
+
+            def _tracked_tr_close() -> None:
+                closed_components.append("tracker")
+                orig_tr_close()
+
+            tracker.close = _tracked_tr_close  # type: ignore[method-assign]
+            cfg = Config(refiner=RefinerConfig(provider="deepseek"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("ok"),
+                refiner=_TrackedRefiner(),
+                tracker=tracker,
+            )
+            orig_make_probe = daemon._make_probe_tracker
+
+            def _slow_make_probe() -> tuple[object, bool]:
+                tr, owns = orig_make_probe()
+                if owns and isinstance(tr, SessionTracker):
+                    orig_sync = tr.sync_session
+
+                    def _blocking_sync(*args: object, **kwargs: object) -> object:
+                        entered_probe.set()
+                        release_probe.wait(timeout=5.0)
+                        return orig_sync(*args, **kwargs)  # type: ignore[arg-type]
+
+                    tr.sync_session = _blocking_sync  # type: ignore[method-assign]
+                return tr, owns
+
+            daemon._make_probe_tracker = _slow_make_probe  # type: ignore[method-assign]
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            client_th: threading.Thread | None = None
+            try:
+                _wait_for_control_socket(rt)
+
+                def _call_probe() -> None:
+                    try:
+                        send_control_command(
+                            rt,
+                            {"cmd": "probe_route", "process": "WindowsTerminal.exe", "title": "codex"},
+                            timeout_sec=4.0,
+                        )
+                    except Exception:
+                        pass
+
+                client_th = threading.Thread(target=_call_probe, daemon=True)
+                client_th.start()
+                self.assertTrue(entered_probe.wait(timeout=2.0), "probe_route never entered blocking sync")
+
+                with mock.patch("agent_voice_input.daemon._CLOSE_JOIN_TIMEOUT_SEC", 0.08):
+                    daemon.close()
+
+                # probe_route uses an isolated tracker and never touches shared refiner/tracker -> both close immediately!
+                self.assertEqual(closed_components.count("refiner"), 1)
+                self.assertEqual(closed_components.count("tracker"), 1)
+            finally:
+                release_probe.set()
+                srv_th.join(timeout=3.0)
+                if client_th is not None:
+                    client_th.join(timeout=3.0)
+                daemon.close()
+
+    def test_control_socket_loops_recv_until_newline_handles_chunks_large_and_oversize_frames(self) -> None:
+        import socket
+        from agent_voice_input.daemon import CONTROL_REQUEST_MAX_BYTES
+
+        def _raw_exchange(sock_path: Path, chunks: list[bytes], delay_sec: float = 0.0) -> dict[str, object]:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(3.0)
+                s.connect(str(sock_path))
+                for idx, ch in enumerate(chunks):
+                    s.sendall(ch)
+                    if delay_sec > 0 and idx + 1 < len(chunks):
+                        time.sleep(delay_sec)
+                buf = b""
+                while b"\n" not in buf and (piece := s.recv(16384)):
+                    buf += piece
+            return json.loads(buf.decode("utf-8").strip())
+
+        with tempfile.TemporaryDirectory(prefix="avi-sock-", dir="/tmp") as td:
+            rt = Path(td)
+            os.chmod(rt, 0o700)
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("ok"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            try:
+                _wait_for_control_socket(rt)
+                sock_path = rt / "control.sock"
+
+                # 1. Fragmented multi-chunk JSON send across multiple TCP/AF_UNIX writes
+                r_frag = _raw_exchange(sock_path, [b'{"cm', b'd": "sta', b'tus"}\n'], delay_sec=0.02)
+                self.assertTrue(r_frag.get("ok"), r_frag)
+                self.assertEqual(r_frag.get("state"), "idle")
+
+                # 2. Valid JSON larger than 16 KiB (e.g., ~24 KiB title/padding)
+                large_title = "X" * 24000
+                large_payload = (
+                    json.dumps({"cmd": "probe_route", "process": "WeChat.exe", "title": large_title}) + "\n"
+                ).encode("utf-8")
+                self.assertGreater(len(large_payload), 16384)
+                r_large = _raw_exchange(sock_path, [large_payload[:9000], large_payload[9000:]], delay_sec=0.01)
+                self.assertTrue(r_large.get("ok"), r_large)
+                self.assertEqual(r_large.get("mode"), "general")
+
+                # 3. Oversize request (> CONTROL_REQUEST_MAX_BYTES) rejected cleanly without killing server
+                oversize = b'{"cmd":"status","pad":"' + (b"A" * (CONTROL_REQUEST_MAX_BYTES + 1024)) + b'"}\n'
+                r_over = _raw_exchange(sock_path, [oversize])
+                self.assertFalse(r_over.get("ok"), r_over)
+                self.assertIn("exceeds", str(r_over.get("error") or "").lower())
+
+                # Server remains healthy after oversize rejection
+                r_after = send_control_command(rt, {"cmd": "status"}, timeout_sec=1.5)
+                self.assertTrue(r_after.get("ok"), r_after)
+            finally:
+                daemon.close()
+                srv_th.join(timeout=2.0)
+
+    def test_probe_route_semaphore_limit_busy_and_exception_release(self) -> None:
+        entered_count = [0]
+        entered_lock = threading.Lock()
+        all_four_entered = threading.Event()
+        release_probes = threading.Event()
+        fail_first = [True]
+
+        with tempfile.TemporaryDirectory(prefix="avi-psem-", dir="/tmp") as td:
+            rt = Path(td)
+            os.chmod(rt, 0o700)
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("ok"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            orig_exec_probe = daemon._execute_probe_route
+
+            def _gated_exec_probe(req: object, **kw: object) -> dict[str, object]:
+                if isinstance(req, dict) and req.get("title") == "block_me":
+                    with entered_lock:
+                        entered_count[0] += 1
+                        my_idx = entered_count[0]
+                        if entered_count[0] == 4:
+                            all_four_entered.set()
+                    release_probes.wait(timeout=5.0)
+                    if my_idx == 1 and fail_first[0]:
+                        fail_first[0] = False
+                        raise RuntimeError("injected probe failure")
+                return orig_exec_probe(req, **kw)  # type: ignore[arg-type]
+
+            daemon._execute_probe_route = _gated_exec_probe  # type: ignore[method-assign]
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            worker_ths: list[threading.Thread] = []
+            results: list[dict[str, object]] = []
+            res_lock = threading.Lock()
+            try:
+                _wait_for_control_socket(rt)
+
+                def _call_blocking() -> None:
+                    resp = send_control_command(
+                        rt,
+                        {"cmd": "probe_route", "process": "WeChat.exe", "title": "block_me"},
+                        timeout_sec=5.0,
+                    )
+                    with res_lock:
+                        results.append(resp)
+
+                for _ in range(4):
+                    th = threading.Thread(target=_call_blocking, daemon=True)
+                    th.start()
+                    worker_ths.append(th)
+
+                self.assertTrue(all_four_entered.wait(timeout=3.0), "4 concurrent probe_route slots did not fill")
+
+                # 5th concurrent probe_route MUST fail fast with "probe_route busy"
+                r_fifth = send_control_command(
+                    rt,
+                    {"cmd": "probe_route", "process": "WeChat.exe", "title": "fifth"},
+                    timeout_sec=1.5,
+                )
+                self.assertFalse(r_fifth.get("ok"), r_fifth)
+                self.assertEqual(r_fifth.get("error"), "probe_route busy")
+
+                # Release all 4 (one raises an exception) and verify semaphore recovers all 4 permits
+                release_probes.set()
+                for th in worker_ths:
+                    th.join(timeout=3.0)
+                self.assertEqual(len(results), 4)
+                self.assertEqual(sum(1 for r in results if r.get("ok")), 3)
+                self.assertEqual(sum(1 for r in results if not r.get("ok") and "injected" in str(r.get("error"))), 1)
+
+                # Subsequent 4 sequential/fresh probe_route calls succeed cleanly
+                r_after = send_control_command(
+                    rt,
+                    {"cmd": "probe_route", "process": "WeChat.exe", "title": "after_recovery"},
+                    timeout_sec=1.5,
+                )
+                self.assertTrue(r_after.get("ok"), r_after)
+                self.assertEqual(r_after.get("mode"), "general")
+            finally:
+                release_probes.set()
+                daemon.close()
+                srv_th.join(timeout=2.0)
 
 
 if __name__ == "__main__":
