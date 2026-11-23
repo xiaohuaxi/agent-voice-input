@@ -49,12 +49,12 @@
 | **宿主机** | **Windows + WSL2** | `✅` | 日常主力；`win_shim` 原生 WASAPI 采集 + Per-Monitor V2 高分屏胶囊 |
 | **宿主机** | **SSH 远端 Linux 主机** | `✅` | 零远端安装探针（仅需 Python `>= 3.10`）+ 本地防串台；Ubuntu CI 真实 `sshd` E2E 验证 |
 | **宿主机** | **原生 Linux 桌面 / 纯原生 Windows（无 WSL2）** | `—` | 暂不支持守护进程、全局热键与 `toggle`；原生 Linux 当前可用于离线文件转写（`once --file <wav> --dry-run`）及作为 SSH 远端目标主机 |
-| **终端** | **macOS Ghostty** | `✅` | AppleScript 零剪贴板直投 + 同分屏切 `tmux` pane 防串台 + 零钩子完整上下文 |
-| **终端** | **Windows Terminal (WSL2)** | `✅` | `win_shim` 瞬态剪贴板 + 快捷键粘贴（不污染原剪贴板）+ 同窗切 Tab 防串台 + 挂钩子/`tmux` 精准上下文 |
+| **终端** | **macOS Ghostty** | `✅` | AppleScript 零剪贴板直投 + 同分屏切 `tmux` pane 防串台 + 零钩子完整上下文 *（Codex / Claude Code / AGY CLI 真机实测）* |
+| **终端** | **Windows Terminal (WSL2)** | `✅` | `win_shim` 瞬态剪贴板 + 快捷键粘贴（不污染原剪贴板）+ 同窗切 Tab 防串台 + 挂钩子/`tmux` 精准上下文 *（Codex / Claude Code / AGY CLI 真机实测）* |
 | **终端** | **本地 & 远端 `tmux`** | `✅` | **macOS** 零剪贴板直投 / **WSL2** 走 `win_shim` 瞬态剪贴板粘贴（不污染原剪贴板）；进程树按焦点窗格隔离；Linux & macOS CI 真实 `tmux` E2E 验证 |
 | **终端** | **其他内置终端与专用 SSH 客户端** | `🧪` | 已内置粘贴键位路由、防串台与识别规则（完整名单见下方折叠区），待真机实测反馈 |
-| **桌面 App** | **Antigravity / AGY 桌面版** | `🧪` | 一等专配：`coding_gui` + `agent` 模式 + 工作区 `git`/文件名 + 独有 `brain/` 对话历史增量同步 *（WSL2 仅扫 WSL 内目录）* |
-| **桌面 App** | **ChatGPT / Codex 统一桌面端** | `🧪` | 已专配 `ai_chat` *（macOS `com.openai.codex` / 旧 `com.openai.chat`；Windows `ChatGPT.exe` / `Codex.exe`）* + 流式标题防漂移 + 锁窗防串台；暂不读本地仓或 `~/.codex/sessions/` |
+| **桌面 App** | **Antigravity / AGY 桌面版** | `🧪` | 已适配 **Antigravity 2.0 独立桌面版**（只读 `conversation_summaries.db` + 窗口标题精确/截断前缀匹配 + 工作区 `git`/文件名 + `brain/` 增量缓存），同时兼容老版 VS Code Fork *（WSL2 仅扫 WSL 内目录）* |
+| **桌面 App** | **ChatGPT / Codex 统一桌面端** | `🧪` | 支持**本地仓库 Codex 会话自动绑定与动态分流** *（macOS `com.openai.codex` / 旧 `com.openai.chat`；Windows `ChatGPT.exe` / `Codex.exe`）*：只读 `~/.codex/sqlite/codex.db` + `~/.codex/sessions/*.jsonl`，本地仓库任务自动升格为 `agent` 模式并挂载项目热词与增量缓存，普通云端 ChatGPT 聊天保持 `general + ai_chat` 零串台，同窗切换在投递前复核防串台 |
 | **桌面 App** | **Claude 桌面版** | `🧪` | 已专配 `ai_chat` *（macOS `com.anthropic.claudefordesktop`；Windows `Claude.exe`）* + 锁窗防串台；即使开 Claude Code 标签页暂不读本地仓或 CLI 会话 |
 | **桌面 App** | **其他桌面 IDE 与主流 IM** | `🧪` | IDE（**VS Code**、**Cursor**、**Windsurf**、**JetBrains**、**Zed** 等）走 `coding_gui` 并挂载宿主工作区 `git`/文件名；**在 IDE 内置终端运行 CLI Agent 时同样按 `coding_gui` 处理**（支持精修落字与工作区文件名参考，但**跳过 CLI `sync_session`**，不读内置终端里的 `codex`/`claude`/`agy` 对话历史，也不区分内置终端分屏）。IM（**微信**、**飞书**、**Slack**、**Discord** 等）走 `im_chat` |
 | **桌面 App** | **其他任意桌面 App** *（浏览器、笔记、邮件等）* | `⚪` | 默认 `hotkey.scope = "all"` 可直接语音精修落字 + 锁窗防串台，无专属上下文或语气适配 |
@@ -121,7 +121,7 @@ agent-voice-input doctor --ping && agent-voice-input start
 
 1. **无作者服务器、零中转、完全由你掌控**：`agent-voice-input` **没有任何作者托管的服务器或中转服务**，也没有任何隐藏遥测；全部语音与上下文只从本机直连你自己在配置中选定的模型渠道，所有模型与凭据完全由用户自主选择和控制（Apache-2.0 全量开源）。
 2. **默认不落盘音频与原文**：运行状态、日志与遥测均做凭据脱敏且不记录用户口述原文；仅在识别/投递失败或主动取消在途任务时，将有效录音以 `0600` 权限暂存于 `failed/`（保留 24h 内最近 10 条）供 `retry` 恢复（录音中取消直接丢弃；可选 MP3 归档默认关闭）。
-3. **`0700`/`0600` 权限隔离与不越界抓取**：配置与运行目录严格私有权限；仅读取前台窗口名、macOS `AXDocument` 与 CLI Agent 明文日志——绝不读取 IDE 私有 SQLite，也不抓取聊天软件或浏览器的无障碍 DOM；切到非终端应用硬跳过终端 CLI 会话，SSH 远端仅查显式白名单主机且零密钥落盘。
+3. **`0700`/`0600` 权限隔离与不越界抓取**：配置与运行目录严格私有权限；仅读取前台窗口名、macOS `AXDocument`、CLI Agent 明文日志及 AGY/Codex 只读会话索引——绝不读取 VS Code/Cursor 私有状态库（`state.vscdb`），也不抓取聊天软件或浏览器的无障碍 DOM；切到非终端应用硬跳过终端 CLI 会话，SSH 远端仅查显式白名单主机且零密钥落盘。
 4. **仅传当前窗口对话与文件名（不传仓库全文）+ `auto` 凭据说明**：编码模式下仅发送当前活跃会话近期对话与 `git status`/浅层文件名，绝不上传仓库全文。同时透明提示：默认 `provider = "auto"` 会检测环境变量/`.env` 及本机已有 `codex` CLI 登录态（`agy` 需显式配置，绝不自动触发）；如需固定渠道请显式指定 `provider` 或设 `refiner.provider = "off"`。
 
 ---
