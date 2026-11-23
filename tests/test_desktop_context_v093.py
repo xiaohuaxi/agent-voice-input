@@ -430,11 +430,11 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             "os.path.realpath", side_effect=AssertionError("realpath forbidden")
         ):
             for slow in (
-                "/mnt/c/Users/xhx/proj", "/mnt/d/work", "/mnt/wslg/distro",
-                "//server/share/repo", r"\\wsl$\Ubuntu\home\user", r"C:\Users\xhx\repo",
+                "/mnt/c/Users/dev/proj", "/mnt/d/work", "/mnt/wslg/distro",
+                "//server/share/repo", r"\\wsl$\Ubuntu\home\user", r"C:\Users\dev\repo",
             ):
                 self.assertTrue(is_wsl_slow_mount_path(slow, wsl=True))
-            self.assertFalse(is_wsl_slow_mount_path("/mnt/c/Users/xhx/proj", wsl=False))
+            self.assertFalse(is_wsl_slow_mount_path("/mnt/c/Users/dev/proj", wsl=False))
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

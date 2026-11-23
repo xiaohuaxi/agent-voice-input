@@ -1230,7 +1230,7 @@ class TestCrossLayerHighValueScenarios(unittest.TestCase):
             (["ssh", "-oBatchMode=yes", "devbox"], ("", False)),
             (["ssh", "-fNT", "-L", "8080:localhost:80", "devbox"], ("", False)),
             (["ssh", "-W", "10.0.0.2:22", "bastion"], ("", False)),
-            (["ssh", "-vvp", "2222", "-p2222", "ssh://xhx@GPU-01.Corp:2222/"], ("gpu-01.corp", True)),
+            (["ssh", "-vvp", "2222", "-p2222", "ssh://dev@GPU-01.Corp:2222/"], ("gpu-01.corp", True)),
             (["ssh", "devbox", "python3", "-"], ("", False)),
             (["ssh", "-v"], ("", True)),
         ]

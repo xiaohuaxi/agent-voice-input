@@ -411,7 +411,7 @@ class SshRemoteLinuxV011Tests(unittest.TestCase):
 
             # Sanity check: explicit local session resolves normally
             m_local_ok = tracker.resolve_session(
-                "xhx@my-local-pc: ~/repos/agent-voice-input",
+                "dev@my-local-pc: ~/repos/agent-voice-input",
                 window_process="WindowsTerminal.exe",
             )
             assert m_local_ok is not None
@@ -450,12 +450,12 @@ class SshRemoteLinuxV011Tests(unittest.TestCase):
 
             # --- Path 2: Remote SSH window titles (`user@remote:path`, `[@host]`, `ssh ...`) ---
             for rem_title in (
-                "xhx@devbox: ~/repos/agent-voice-input",
-                "xhx@devbox: ~",
+                "dev@devbox: ~/repos/agent-voice-input",
+                "dev@devbox: ~",
                 "[root@gpu-node01 /srv/app]#",
                 f"claude · ~/repos/agent-voice-input [#{local_sid[:8]}] [@devbox]",
                 "ssh -p 2222 ubuntu@prod.internal",
-                "C:\\Windows\\System32\\OpenSSH\\ssh.exe xhx@devbox",
+                "C:\\Windows\\System32\\OpenSSH\\ssh.exe dev@devbox",
                 "ubuntu@devbox - PuTTY",
                 f"claude [#{local_sid[:8]}] [@-oProxyCommand=id]",
                 f"claude [#{local_sid[:8]}] [@box1] [@box2]",
@@ -465,13 +465,13 @@ class SshRemoteLinuxV011Tests(unittest.TestCase):
                     f"remote title {rem_title!r} leaked local session!",
                 )
 
-            # Tightened local shell prompts (`xhx@my-local-pc: ~`, unrelated folder, CMD / C:\) -> None!
+            # Tightened local shell prompts (`dev@my-local-pc: ~`, unrelated folder, CMD / C:\) -> None!
             for non_agent_local_title, wproc in (
-                ("xhx@my-local-pc: ~", "WindowsTerminal.exe"),
-                ("xhx@my-local-pc: ~/Downloads", "WindowsTerminal.exe"),
+                ("dev@my-local-pc: ~", "WindowsTerminal.exe"),
+                ("dev@my-local-pc: ~/Downloads", "WindowsTerminal.exe"),
                 ("C:\\WINDOWS\\system32\\cmd.exe", "cmd.exe"),
                 ("Command Prompt", "WindowsTerminal.exe"),
-                ("PS C:\\Users\\xhx>", "WindowsTerminal.exe"),
+                ("PS C:\\Users\\dev>", "WindowsTerminal.exe"),
             ):
                 self.assertIsNone(
                     tracker.resolve_session(non_agent_local_title, window_process=wproc),
@@ -500,7 +500,7 @@ class SshRemoteLinuxV011Tests(unittest.TestCase):
                 comm="ssh",
                 ppid=1,
                 cwd=str(home),
-                cmdline=["ssh", "-p", "2222", "xhx@devbox"],
+                cmdline=["ssh", "-p", "2222", "dev@devbox"],
                 fds={"0": str(pts_ssh)},
             )
             self.assertIsNone(tracker.resolve_session("Ubuntu", window_tty=str(pts_ssh)))
@@ -561,9 +561,9 @@ class SshRemoteLinuxV011Tests(unittest.TestCase):
                     "Cursor",
                     "daemon.py — agent-voice-input",
                     bundle_id="com.todesktop.230313mzl4w4u92",
-                    document="vscode-remote://ssh-remote+devbox/home/xhx/repos/agent-voice-input/daemon.py",
+                    document="vscode-remote://ssh-remote+devbox/home/dev/repos/agent-voice-input/daemon.py",
                 ),
-                ForegroundWindow(22, "Zed", "agent-voice-input — ssh://devbox/home/xhx/repos/agent-voice-input", bundle_id="dev.zed.Zed"),
+                ForegroundWindow(22, "Zed", "agent-voice-input — ssh://devbox/home/dev/repos/agent-voice-input", bundle_id="dev.zed.Zed"),
             ):
                 self.assertTrue(is_remote_ide_window(ide_win), ide_win.title)
                 self.assertEqual(
@@ -742,9 +742,9 @@ aliases = ["gpu01", "prod-linux"]
                     env={"PATH": "/usr/bin:/bin", "WSL_DISTRO_NAME": "Ubuntu"},
                 )
                 self.assertEqual(resolved_exe, str(fake_sys32_ssh))
-            argv_win = build_safe_ssh_argv(str(fake_sys32_ssh), h_gpu, runtime_dir=Path("/mnt/c/Users/xhx/rt"))
+            argv_win = build_safe_ssh_argv(str(fake_sys32_ssh), h_gpu, runtime_dir=Path("/mnt/c/Users/dev/rt"))
             self.assertTrue(all(not a.startswith("ControlMaster=") for a in argv_win))
-            argv_wsl_mnt = build_safe_ssh_argv("/usr/bin/ssh", h_gpu, runtime_dir=Path("/mnt/c/Users/xhx/rt"))
+            argv_wsl_mnt = build_safe_ssh_argv("/usr/bin/ssh", h_gpu, runtime_dir=Path("/mnt/c/Users/dev/rt"))
             ctl_opts = [a for a in argv_wsl_mnt if a.startswith("ControlPath=")]
             self.assertEqual(len(ctl_opts), 1)
             self.assertFalse(ctl_opts[0].split("=", 1)[1].startswith("/mnt/"))
@@ -1663,7 +1663,7 @@ sys.exit(p.returncode)
             )
             try:
                 # Cache session A first via its explicit cwd
-                snap_a = tr_sw.sync_session(window_title="xhx@devbox: ~/repos/svc-alpha")
+                snap_a = tr_sw.sync_session(window_title="dev@devbox: ~/repos/svc-alpha")
                 assert snap_a is not None
                 self.assertEqual(snap_a.match.session_id, sid_a)
 
@@ -1764,8 +1764,8 @@ sys.exit(p.returncode)
         # 2. Fork #2: `_normalize_cwd` strips `file://` URIs AND blocks raw or percent-encoded NUL bytes.
         self.assertIs(_normalize_cwd, _remote_probe._normalize_cwd)
         self.assertEqual(
-            _normalize_cwd("file://macbook.local/Users/xhx/my%20repo/"),
-            "/Users/xhx/my repo",
+            _normalize_cwd("file://macbook.local/Users/dev/my%20repo/"),
+            "/Users/dev/my repo",
         )
         self.assertEqual(_normalize_cwd("file:///tmp/work/"), "/tmp/work")
         self.assertEqual(_normalize_cwd("/tmp/bad\x00path"), "")

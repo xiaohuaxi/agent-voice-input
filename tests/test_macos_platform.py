@@ -2812,7 +2812,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             term_state = {
                 "wid": "42",
                 "tty": "/dev/ttys004",
-                "wname": "xhx — claude ∙ git — 80×24",
+                "wname": "dev — claude ∙ git — 80×24",
                 "tcustom": "claude · ~/proj [#abcd1234]",
                 "denied": False,
             }
@@ -2867,7 +2867,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 shim_hint = ForegroundWindow(
                     hwnd=999,
                     process="终端",
-                    title="xhx — claude ∙ git — 80×24",
+                    title="dev — claude ∙ git — 80×24",
                     bundle_id="com.apple.Terminal",
                     pid=601,
                 )
@@ -2878,7 +2878,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertIn("80×24", origin_term.title)
 
                 # 3. Same Terminal window + same tab TTY with dynamic foreground process/dimensions title update -> pasted=True!
-                term_state["wname"] = "xhx — zsh — 120×40"
+                term_state["wname"] = "dev — zsh — 120×40"
                 out_same_tab = plat.deliver_text("同标签页动态标题不误判漂移", seq_id=1, origin_window=origin_term)
                 self.assertTrue(out_same_tab.pasted)
                 self.assertEqual(out_same_tab.reason, "ok")
@@ -2901,7 +2901,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 deg_win = plat.resolve_foreground_window(shim_hint)
                 self.assertEqual(deg_win.hwnd, 999)
                 self.assertEqual(deg_win.tty, "")
-                self.assertEqual(deg_win.title, "xhx — claude ∙ git — 80×24")
+                self.assertEqual(deg_win.title, "dev — claude ∙ git — 80×24")
 
                 # 7. mac_shim fg_window hwnd + in-process title skips System Events osascript AND catches same-title window drift!
                 osa_scripts.clear()
@@ -3125,7 +3125,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 term_state["denied"] = False
                 term_state["wid"] = 42
                 term_state["tty"] = "/dev/ttys004"
-                term_state["wname"] = "xhx — tmux — 80×24"
+                term_state["wname"] = "dev — tmux — 80×24"
                 term_state["tcustom"] = ""
                 cur_tmux_box = [tmux_snap]
                 plat_term_untrusted = MacOSPlatform(
@@ -3201,7 +3201,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     "process": "终端",
                     "bundle_id": "com.apple.Terminal",
                     "pid": 601,
-                    "title": "xhx — tmux — 80×24",
+                    "title": "dev — tmux — 80×24",
                     "ax_trusted": True,
                 }
                 tmux_snap_pane4 = TmuxServerSnapshot(
@@ -3249,8 +3249,8 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertEqual((origin_p3.tmux_socket, origin_p3.tmux_pane), ("/tmp/avi_mock.sock", "%3"))
 
                 # Same pane %3 + Terminal window resize (80×24 -> 120×40) -> pasted=True via tmux!
-                term_state["wname"] = "xhx — tmux — 120×40"
-                shim_fg_box[0]["title"] = "xhx — tmux — 120×40"
+                term_state["wname"] = "dev — tmux — 120×40"
+                shim_fg_box[0]["title"] = "dev — tmux — 120×40"
                 osa_scripts.clear()
                 tmux_cmds.clear()
                 out_p3_resize = plat_term_untrusted.deliver_text("同窗格缩放直投", seq_id=73, origin_window=origin_p3)
@@ -3271,8 +3271,8 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertFalse(any('keystroke "v"' in s for s in osa_scripts))
 
                 # Switch active pane %3 -> %4 WITH CHANGED outer title -> focus_changed, zero Cmd+V!
-                term_state["wname"] = "xhx — tmux:1:vim — 120×40"
-                shim_fg_box[0]["title"] = "xhx — tmux:1:vim — 120×40"
+                term_state["wname"] = "dev — tmux:1:vim — 120×40"
+                shim_fg_box[0]["title"] = "dev — tmux:1:vim — 120×40"
                 osa_scripts.clear()
                 tmux_cmds.clear()
                 out_p4_diff_title = plat_term_untrusted.deliver_text(
@@ -3303,7 +3303,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 manual_origin = ForegroundWindow(
                     hwnd=42,
                     process="终端",
-                    title="xhx — tmux:0:codex — 80×24",
+                    title="dev — tmux:0:codex — 80×24",
                     bundle_id="com.apple.Terminal",
                     tty="/dev/ttys004",
                     pid=601,
@@ -3318,8 +3318,8 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertEqual(tmux_cmds, [])
                 self.assertFalse(any('keystroke "v"' in s for s in osa_scripts))
 
-                term_state["wname"] = "xhx — tmux:0:codex — 120×40"
-                shim_fg_box[0]["title"] = "xhx — tmux:0:codex — 120×40"
+                term_state["wname"] = "dev — tmux:0:codex — 120×40"
+                shim_fg_box[0]["title"] = "dev — tmux:0:codex — 120×40"
                 out_manual_resize = plat_term_untrusted.deliver_text(
                     "手工origin仅尺寸变化放行", seq_id=78, origin_window=manual_origin
                 )
@@ -3735,7 +3735,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 term_win = ForegroundWindow(
                     hwnd=77,
                     process="Terminal",
-                    title="xhx — tmux — 80×24",
+                    title="dev — tmux — 80×24",
                     bundle_id="com.apple.Terminal",
                     tty=client_tty,
                     pid=gui_pid,

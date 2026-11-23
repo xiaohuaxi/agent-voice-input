@@ -561,16 +561,16 @@ class TmuxMockUnitTests(unittest.TestCase):
             self.assertEqual((m_word.cli, m_word.session_id), ("claude", tab2_sid))
 
             # Rule 2b: Tab 2 shell title containing repo path 'tmux-support' MUST NOT false-match 'tmux' word!
-            m_dir_tab2 = tracker.resolve_session("xhx@host: ~/worktrees/tmux-support")
+            m_dir_tab2 = tracker.resolve_session("dev@host: ~/worktrees/tmux-support")
             assert m_dir_tab2 is not None
             self.assertEqual((m_dir_tab2.cli, m_dir_tab2.session_id), ("claude", tab2_sid))
 
             # Rule 2c: Tab 1 outer title explicitly 'tmux' or 'proj-alpha' -> picks Tab 1 tmux active pane!
-            m_tmux_word = tracker.resolve_session("xhx@host: ~ (tmux)")
+            m_tmux_word = tracker.resolve_session("dev@host: ~ (tmux)")
             assert m_tmux_word is not None
             self.assertEqual((m_tmux_word.cli, m_tmux_word.session_id), ("agy", agy_cid))
 
-            m_dir_tab1 = tracker.resolve_session("xhx@host: ~/repos/proj-alpha")
+            m_dir_tab1 = tracker.resolve_session("dev@host: ~/repos/proj-alpha")
             assert m_dir_tab1 is not None
             self.assertEqual((m_dir_tab1.cli, m_dir_tab1.session_id), ("agy", agy_cid))
 
@@ -752,7 +752,7 @@ class TmuxMockUnitTests(unittest.TestCase):
     def test_should_prefer_non_tmux_unquoted_set_titles_short_pane_and_midpath_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            home_base = root / "users" / "xhx"
+            home_base = root / "users" / "dev"
             rt, proc = root / "rt", root / "proc"
             proj_alpha = home_base / "repos" / "proj-alpha"
             proj_beta = home_base / "repos" / "proj-beta"
@@ -776,7 +776,7 @@ class TmuxMockUnitTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            # tmux client launched from /users/xhx (parent of /users/xhx/repos/proj-beta!)
+            # tmux client launched from /users/dev (parent of /users/dev/repos/proj-beta!)
             _write_fake_proc(proc, 400, comm="tmux", ppid=1, cwd=str(home_base))
             _write_fake_proc(proc, 500, comm="bash", ppid=1, cwd=str(proj_alpha), fds={"0": str(pts_tmux)})
             _write_fake_proc(
@@ -853,11 +853,11 @@ class TmuxMockUnitTests(unittest.TestCase):
             assert m_short_topic is not None
             self.assertEqual(m_short_topic.session_id, cx_tab2)
 
-            # Bug C: Intermediate parent directory '/xhx/' in 'xhx@host: /users/xhx/repos/proj-beta'
-            # MUST NOT false-match tmux cwd '/users/xhx', AND client_pid cwd is ignored when pane current_path is set!
+            # Bug C: Intermediate parent directory '/dev/' in 'dev@host: /users/dev/repos/proj-beta'
+            # MUST NOT false-match tmux cwd '/users/dev', AND client_pid cwd is ignored when pane current_path is set!
             pane_state["title"] = "bash"
             pane_state["cwd"] = str(home_base)
-            m_midpath = tracker.resolve_session(f"xhx@host: {proj_beta}")
+            m_midpath = tracker.resolve_session(f"dev@host: {proj_beta}")
             assert m_midpath is not None
             self.assertIn(m_midpath.session_id, (cl_tab2, cx_tab2))
 
@@ -866,7 +866,7 @@ class TmuxMockUnitTests(unittest.TestCase):
             (proc / "400" / "cwd").unlink()
             os.symlink(str(proj_beta), proc / "400" / "cwd")
             pane_state["cwd"] = str(proj_alpha)
-            m_pane_cwd_wins = tracker.resolve_session(f"xhx@host: {proj_alpha}")
+            m_pane_cwd_wins = tracker.resolve_session(f"dev@host: {proj_alpha}")
             assert m_pane_cwd_wins is not None
             self.assertEqual(m_pane_cwd_wins.session_id, cl_tmux)
 
@@ -2180,7 +2180,7 @@ class DarwinTmuxGhosttyUnitTests(unittest.TestCase):
 
         # 2. WSL2 multi-client tmux selection in SAME repo (window_tty='', window_pid=0):
         #    Shared _dir_basename_in_title ('shared-app') MUST NOT drown out exact [#tag] or pane_title on Client 1!
-        shared_cwd = "/home/xhx/repos/shared-app"
+        shared_cwd = "/home/dev/repos/shared-app"
         wsl_multi_snap = TmuxServerSnapshot(
             clients=(
                 TmuxClientInfo(
@@ -2638,7 +2638,7 @@ class DarwinTmuxGhosttyUnitTests(unittest.TestCase):
             # Alacritty (9000, no tty) -> login (9001, ttys010) -> -zsh (9002, ttys010)
             # -> agy (9003, ttys010) -> nested PTY tool runner (9004, ttys099!)
             (9000, 1, "Ss", "", ["/Applications/Alacritty.app/Contents/MacOS/alacritty"]),
-            (9001, 9000, "Ss", "/dev/ttys010", ["/usr/bin/login", "-fp", "xhx"]),
+            (9001, 9000, "Ss", "/dev/ttys010", ["/usr/bin/login", "-fp", "dev"]),
             (9002, 9001, "S", "/dev/ttys010", ["-zsh"]),
             (9003, 9002, "S+", "/dev/ttys010", ["agy"]),
             (9004, 9003, "Ss+", "/dev/ttys099", ["/bin/zsh", "-c", "pytest"]),

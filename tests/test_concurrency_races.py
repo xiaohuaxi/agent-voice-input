@@ -1008,7 +1008,7 @@ class TestConcurrencyRaces(unittest.TestCase):
 
             rem_cfg = RemoteConfig(
                 timeout_ms=250,
-                hosts=(RemoteHostConfig(name="devbox", ssh_target="xhx@127.0.0.1"),),
+                hosts=(RemoteHostConfig(name="devbox", ssh_target="dev@127.0.0.1"),),
             )
             tracker = SessionTracker(
                 env={"HOME": td},
