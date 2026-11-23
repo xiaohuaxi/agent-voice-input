@@ -1,23 +1,24 @@
 ---
 name: voice-eval
-description: 在本机真实长会话或合成样本上实测语音输入精修器（Refiner）、运行零打扰全链路系统自检、按历史会话快照做存量录音 A/B 回放评测，或只读诊断本机守护进程近期口述变慢、降级与缓存未命中问题。改动 ASR、精修提示词、上下文分块、缓存复用、渠道实现或守护进程投递管线需做实机基准与端到端回归，或需对比历史录音回放、排查实机口述延迟与润色异常时加载；日常纯离线单元测试、热键或 HUD 界面样式调整及常规文档修改不加载。
+description: 在本机真实长会话或合成样本上实测语音输入精修器（Refiner）、运行零打扰全链路系统自检与双端路由回归矩阵、按历史会话快照做存量录音 A/B 回放评测，或只读诊断本机守护进程近期口述变慢、降级与缓存未命中问题。改动 ASR、精修提示词、上下文分块、缓存复用、会话路由、桌面端绑定、渠道实现或守护进程投递管线需做实机基准、双端回归或桌面 GUI 端到端验收，或需对比历史录音回放、排查实机口述延迟与润色异常时加载；日常纯离线单元测试、热键或 HUD 界面样式调整及常规文档修改不加载。
 ---
 
 # 语音链路实测、全链路自检与线上诊断（voice-eval）
 
-覆盖四类本机实证验证与诊断任务：
+覆盖五类本机实证验证与诊断任务：
 1. 真实长会话精修基准（`scripts/bench_refiner.py`）：改动 Stage 2 精修器、提示词、`<session_reference_log>` 分块或前缀缓存机制后，用本机真实长会话（或 `--synthetic` 合成会话）跑连续多轮冷/热基准。
 2. 零打扰全链路系统自检（`scripts/e2e_system.py`）：触及音频管线、守护进程排队取消或终端落字改动后，在不触碰桌面热键、HUD、剪贴板与主守护进程的前提下，自动跑通「真实人声 WAV → 真 ASR → 真多块上下文 → 真无状态精修 → 真 `VoiceInputDaemon` 连续入队与按序落字 → 隔离 `tmux` 粘贴读回 → 遥测与故障恢复」全链路。
 3. 本机运行期只读诊断（`scripts/diagnose_live.py`）：用户反馈近期口述变慢、缓存未命中、专有名词未修对或偶发降级时，本地只读汇总分段耗时、缓存命中与会话匹配线索。
 4. 存量真实录音按时间点 A/B 回放评测（`scripts/eval_recordings.py`）：将已归档录音对齐当时的历史会话快照（`--manifest-from` 锁定同批样本、`--asr-from` 冻结 Stage 1 初稿以隔离转写波动纯测 Stage 2、`--compare` 生成配对对照），结果与逐条 diff 以 `0600` 写入 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/eval-runs/`（或 `--eval-dir`）。
+5. 双端对称路由回归与真机桌面端验收（`scripts/regress_matrix.py`）：跨 macOS 与 WSL2 统一验证离线全路由矩阵（Layer A，默认启用、零费用）、本机运行中守护进程 `control.sock` 探活与可选实机落字（Layer B，`--live-daemon` / `--deliver-live`），以及本机已装 CLI 与桌面端存储只读兼容性抽检（Layer C，`--probe-real-clis`）。
 
-运行前提：调用在线渠道的步骤需对应云端凭据与网络（`bench_refiner.py` 默认仅调精修渠道，附加 `--wav` 时串跑 ASR；`e2e_system.py` 需所选 ASR 渠道凭据，启用独立 Stage 2 精修时还需对应精修凭据，并依赖本地 `ffmpeg`、`tmux`，纯非 WSL Linux 无系统内置 TTS 时传 `--wav` 指定测试音频；`eval_recordings.py` 传 `--asr-from` 可免重跑 ASR，传 `--compare` 无需联网或云端凭据但会在评测目录写入或覆盖 `0600` 的 `diff_*.md`；`diagnose_live.py` 纯本地只读、无需联网或云端凭据）。当前环境缺少所需凭据或宿主工具时，先完成可运行的离线检查并在交付说明中注明未验环节。
+运行前提：调用在线渠道的步骤需对应云端凭据与网络（`bench_refiner.py` 默认仅调精修渠道，附加 `--wav` 时串跑 ASR；`e2e_system.py` 需所选 ASR 渠道凭据，启用独立 Stage 2 精修时还需对应精修凭据，并依赖本地 `ffmpeg`、`tmux`，纯非 WSL Linux 无系统内置 TTS 时传 `--wav` 指定测试音频；`eval_recordings.py` 传 `--asr-from` 可免重跑 ASR，传 `--compare` 无需联网或云端凭据但会在评测目录写入或覆盖 `0600` 的 `diff_*.md`；`regress_matrix.py` 的 Layer A 与 Layer C 纯本地零联网零费用，Layer B 需本机守护进程在线，且未设 `--skip-selftest-wav` 时需云端凭据与本地 TTS 或 `--wav`；`diagnose_live.py` 纯本地只读、无需联网或云端凭据）。当前环境缺少所需凭据或宿主工具时，先完成可运行的离线检查并在交付说明中注明未验环节。
 
 ## 安全与隐私红线
 
 - 红线：调用 `CodexRefiner` 或任何 `codex` 子进程做实测时，严禁通过参数、配置或环境变量开启 Fast 模式。
 - 红线：严禁将任何真实会话内容、语音样本、`telemetry.jsonl` / `daemon.log` 运行流水、宿主机隐私路径或未脱敏凭据写入版本库。
-- 本地输出脱敏与隔离边界：终端报告与仓外文件统一经 `redact_secrets` 过滤密钥，但不同产物的正文与路径留存边界不同。`diagnose_live.py` 不输出任何会话或口述正文（结果记录将 `saved_audio` 转为布尔字段 `has_saved_audio` 隐去失败录音路径，但脱敏后的 `daemon.log` 尾部及异常文本仍可能保留本机路径）；`e2e_system.py` 对宿主机 `recordings/` 真实历史录音回放仅报告音频时长、分段耗时、token/缓存命中数与落字字符长度，不打印真实用户口述原文或隐私路径；`bench_refiner.py` 仅对合成测试句及最多 2 个从会话提取的安全代码标识符展示精修对照（超长异常输出自动截断）；`eval_recordings.py` 终端仅打印聚合指标，但写入仓外私有评测目录（默认 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/eval-runs/`，目录权限 `0700`）的 `0600` 文件 `<tag>.json` 与 `diff_*.md` 保留过滤密钥后的识别初稿、精修正文与历史参考文本供本机复盘，不可当作无口述正文的公开报告外发。`bench_refiner.py` 与 `e2e_system.py` 全程在临时 `0700` `runtime_dir`（及隔离 `XDG_CACHE_HOME`）运行并自动清理，`e2e_system.py` 合成的测试 WAV 仅缓存于仓外 `~/.cache/agent-voice-input/eval-wavs/`（权限 `0700`）。
+- 本地输出脱敏与隔离边界：终端报告与仓外文件统一经 `redact_secrets` 过滤密钥，但不同产物的正文与路径留存边界不同。`diagnose_live.py` 不输出任何会话或口述正文（结果记录将 `saved_audio` 转为布尔字段 `has_saved_audio` 隐去失败录音路径，但脱敏后的 `daemon.log` 尾部及异常文本仍可能保留本机路径）；`e2e_system.py` 对宿主机 `recordings/` 真实历史录音回放仅报告音频时长、分段耗时、token/缓存命中数与落字字符长度，不打印真实用户口述原文或隐私路径；`bench_refiner.py` 仅对合成测试句及最多 2 个从会话提取的安全代码标识符展示精修对照（超长异常输出自动截断）；`eval_recordings.py` 终端仅打印聚合指标，但写入仓外私有评测目录（默认 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/eval-runs/`，目录权限 `0700`）的 `0600` 文件 `<tag>.json` 与 `diff_*.md` 保留过滤密钥后的识别初稿、精修正文与历史参考文本供本机复盘，不可当作无口述正文的公开报告外发。`bench_refiner.py`、`e2e_system.py` 与 `regress_matrix.py` Layer A 全程在临时 `0700` `runtime_dir`（及隔离 `HOME` 或 `XDG_CACHE_HOME`）运行并自动清理；`regress_matrix.py` 默认零对话正文输出（仅传 `--show-text` 时在本地终端回显合成测试句结果），`e2e_system.py` 与 `regress_matrix.py` 复用的合成测试 WAV 仅缓存于仓外 `~/.cache/agent-voice-input/eval-wavs/`（权限 `0700`）。
 
 ## 场景 1：真实长会话精修基准实测（`scripts/bench_refiner.py`）
 
@@ -102,3 +103,33 @@ PYTHONPATH=src python3 .agents/skills/voice-eval/scripts/eval_recordings.py \
 # 3) 纯本地读取两次结果生成配对对比表与 0600 逐条 diff（注意核对输出头部的 paired 样本数）
 PYTHONPATH=src python3 .agents/skills/voice-eval/scripts/eval_recordings.py --compare base_v1 cand_v1
 ```
+
+## 场景 5：双端对称路由回归与真机验收（`scripts/regress_matrix.py`）
+
+macOS 与 WSL2 共用同一入口，全报告经 `redact_secrets` 脱敏、默认零正文输出：
+
+```bash
+# 默认零费用回归：Layer A 离线全路由矩阵 + Layer C 本机已装 CLI 与桌面端 DB 只读抽检
+python3 .agents/skills/voice-eval/scripts/regress_matrix.py --probe-real-clis
+
+# 叠加 Layer B：直连本机运行中守护进程 control.sock（status 漂移检查 + probe_route + no_telemetry selftest_wav）
+python3 .agents/skills/voice-eval/scripts/regress_matrix.py --probe-real-clis --live-daemon --json
+
+# 仅跑 Layer B 轻量探活（跳过云端 selftest_wav，允许旧版本代码漂移降级为 WARN）
+python3 .agents/skills/voice-eval/scripts/regress_matrix.py --no-matrix --live-daemon --skip-selftest-wav --allow-drift
+
+# 显式开启桌面 GUI 实机落字验收（默认关闭；等待 2s 后向当前前台窗口真实投递测试 WAV）
+python3 .agents/skills/voice-eval/scripts/regress_matrix.py --no-matrix --live-daemon --deliver-live --delay-sec 2 --json
+```
+
+三层职责分工：
+- Layer A（默认启用，可用 `--no-matrix` 跳过）：在隔离 `0700` 临时 `HOME` 与 `runtime_dir` 拉起真实无头 `VoiceInputDaemon`，经真实 `control.sock` 的 `probe_route` 与仓库 `bin/agent-voice-input session-hook --cli claude|agy --quiet` 验证 Codex / Claude Code（含 `2.1.330` 超大 `attachment` 字节预过滤）/ AGY 新旧会话与跨 CLI `prior_session` 继承、空 shell 零串台，以及同时覆盖 macOS 与 Windows 窗口特征的 Antigravity 2.0 WAL DB、ChatGPT/Codex 统一桌面端本地仓升格与云端否决、Claude 桌面版 / 微信 / 浏览器（`general_gui`）、VS Code / Cursor（`coding_gui`）与 SSH 远端防串台（`putty.exe`、`[@remote]`、`[SSH: devbox]`）。
+- Layer B（`--live-daemon`，可选 `--runtime-dir`、`--wav`、`--allow-drift`、`--skip-selftest-wav`、`--deliver-live`、`--delay-sec`、`--show-text`）：不重启也不干扰主守护进程，校验 `status`（`ok`、`shim_ok`、`code_drift`）、虚拟与真机焦点 `probe_route` 以及 `selftest_wav(no_telemetry=True)`（核对 `telemetry.jsonl` 零行数增长与 `asr_ms`/`refine_ms`/`reasoning_tokens`/`routing`）。
+- Layer C（`--probe-real-clis`）：纯只读抽检本机 `~/.codex/sessions`、`~/.claude/projects`、`~/.gemini/antigravity-cli/brain` 最新各 1 条非 subagent 根会话解析兼容性，并以 `mode=ro` 校验 `~/.gemini/antigravity/conversation_summaries.db` 与 `~/.codex/sqlite/codex.db` 表结构与可查性（未安装对应工具时标 `SKIP`，仅输出纯数值）。
+
+## 桌面 GUI 真·端到端验收清单（Computer Use / 人工共用）
+
+1. 安全与审批前置：若由支持桌面 Computer Use 的 Agent 执行，先遵守对应平台的本地输入保护与审批规范，不尝试操控被安全禁止的终端应用；遇到系统权限或审批弹窗一律交由人工确认。
+2. 先完结非 GUI 检查：先运行 `python3 .agents/skills/voice-eval/scripts/regress_matrix.py --probe-real-clis --live-daemon`（默认 dry-run，不触碰桌面剪贴板与输入框），确认离线矩阵、本机存储兼容、主守护进程 `shim_ok`、真机焦点采集及无遥测污染的云端链路全部通过。
+3. 真·端到端桌面落字验收：将目标桌面 App（如 Antigravity 2.0、ChatGPT 本地仓库任务与普通云端聊天、Claude 桌面版）切到前台并点进输入框，执行 `python3 .agents/skills/voice-eval/scripts/regress_matrix.py --no-matrix --live-daemon --deliver-live --delay-sec 2 --json`（本地终端核对合成句落字时可附加 `--show-text`），逐项核对输入框实际落字与返回 JSON 中的 `routing.mode`、`routing.session_key_masked`、`pasted` 与 `reasoning_tokens == 0`。
+4. 清理与收尾：纯落字验证不按回车，核对完成后清空输入框中的测试文字；若需验证多轮上下文增长，仅在专用测试会话中发送极短消息（如“回复 OK”），避免污染日常会话。
