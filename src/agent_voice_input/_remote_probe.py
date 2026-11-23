@@ -2634,6 +2634,62 @@ def _extract_codex_compacted_turns(payload: Mapping[str, Any]) -> list[tuple[str
 _extract_codex_compacted = _extract_codex_compacted_turns
 
 
+_CLAUDE_KEEP_PREFILTER_MARKERS: tuple[bytes, ...] = (
+    b'"type":"user"',
+    b'"type": "user"',
+    b'"type":"assistant"',
+    b'"type": "assistant"',
+    b'"subtype":"compact_boundary"',
+    b'"subtype": "compact_boundary"',
+)
+_CLAUDE_SKIP_PREFILTER_MARKERS: tuple[bytes, ...] = (
+    b'"type":"attachment"',
+    b'"type": "attachment"',
+    b'"type":"api-request-shape"',
+    b'"type": "api-request-shape"',
+    b'"type":"api-request-blob"',
+    b'"type": "api-request-blob"',
+    b'"type":"api-request"',
+    b'"type": "api-request"',
+    b'"type":"progress"',
+    b'"type": "progress"',
+    b'"type":"file-history-snapshot"',
+    b'"type": "file-history-snapshot"',
+    b'"type":"queue-operation"',
+    b'"type": "queue-operation"',
+)
+
+
+def _should_prefilter_skip_jsonl_line(
+    cli: str, body: bytes, *, allow_agy_early_meta: bool = False
+) -> bool:
+    """Fast byte pre-filter on large lines (>1 KB) to skip giant non-dialogue JSON before ``json.loads``."""
+    if len(body) <= 1024:
+        return False
+    if cli == "agy":
+        if allow_agy_early_meta:
+            return False
+        return (
+            b"USER_INPUT" not in body
+            and b"PLANNER_RESPONSE" not in body
+            and b"CHECKPOINT" not in body
+        )
+    if cli == "codex":
+        return (
+            b"item_completed" not in body
+            and b"compacted" not in body
+            and b'"message"' not in body
+            and b"session_meta" not in body
+        )
+    if cli == "claude":
+        # Check retained Claude record markers first so real user/assistant/compact_boundary
+        # lines are never skipped even if they quote or nest non-dialogue type markers.
+        if any(tok in body for tok in _CLAUDE_KEEP_PREFILTER_MARKERS):
+            return False
+        return any(tok in body for tok in _CLAUDE_SKIP_PREFILTER_MARKERS)
+    return False
+
+
 def _clean_jsonl_file(
     cli: str, jsonl_path: str, *, home: Path | None = None, wsl: bool = False
 ) -> tuple[list[tuple[str, str]], str, int]:
@@ -2688,35 +2744,11 @@ def _clean_jsonl_file(
                     continue
                 line_no += 1
 
-                # Fast byte pre-filter on large lines (>1 KB) to skip giant tool_result/VIEW_FILE/thinking JSON
-                if len(body) > 1024:
-                    if cli == "agy":
-                        if (
-                            b"USER_INPUT" not in body
-                            and b"PLANNER_RESPONSE" not in body
-                            and b"CHECKPOINT" not in body
-                            and line_no > 8
-                        ):
-                            continue
-                    elif cli == "codex":
-                        if (
-                            b"item_completed" not in body
-                            and b"compacted" not in body
-                            and b'"message"' not in body
-                            and b"session_meta" not in body
-                        ):
-                            continue
-                    elif cli == "claude":
-                        if (
-                            b'"progress"' in body
-                            or b'"file-history-snapshot"' in body
-                            or b'"queue-operation"' in body
-                        ) and (
-                            b'"user"' not in body
-                            and b'"assistant"' not in body
-                            and b"compact_boundary" not in body
-                        ):
-                            continue
+                # Fast byte pre-filter on large lines (>1 KB) to skip giant non-dialogue JSON
+                if _should_prefilter_skip_jsonl_line(
+                    cli, body, allow_agy_early_meta=(line_no <= 8)
+                ):
+                    continue
 
                 try:
                     obj = json.loads(body.decode("utf-8", errors="replace"))

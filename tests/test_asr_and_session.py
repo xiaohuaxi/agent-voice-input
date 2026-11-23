@@ -3456,6 +3456,298 @@ class SessionCtxTests(unittest.TestCase):
             self.assertIn("LEGACY_POST_COMPACT_TURN", cx_joined2)
             os.close(agy_lock_fd)
 
+    def test_claude_2_1_330_large_non_dialogue_prefilter_and_false_positive_guard(self) -> None:
+        from agent_voice_input import _remote_probe, session_ctx as session_ctx_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            ws = root / "ws"
+            for d in (home, rt, ws):
+                d.mkdir(parents=True, exist_ok=True)
+            os.chmod(rt, 0o700)
+
+            cl_sid = "22334455-6666-4777-8888-999900001111"
+            cl_dir = home / ".claude" / "projects" / encode_claude_project_dir(str(ws))[0]
+            cl_dir.mkdir(parents=True, exist_ok=True)
+            cl_jsonl = cl_dir / f"{cl_sid}.jsonl"
+
+            compact_sep = (",", ":")
+            spaced_sep = (", ", ": ")
+
+            # Realistic Claude Code 2.1.330 giant non-dialogue records (>1 KB):
+            # - "type" is NOT always the first field;
+            # - both compact (`:`) and spaced (`: `) JSON formats;
+            # - api-request-blob contains nested `"role":"user"` / `"role":"assistant"` and escaped `\"type\":\"user\"`.
+            giant_attachment = json.dumps(
+                {
+                    "parentUuid": "00000000-0000-4000-8000-000000000001",
+                    "isSidechain": False,
+                    "userType": "external",
+                    "cwd": str(ws),
+                    "sessionId": cl_sid,
+                    "version": "2.1.330",
+                    "type": "attachment",
+                    "attachment": {
+                        "type": "file",
+                        "content": 'user assistant "role":"user" ' + ("A" * 2400),
+                    },
+                },
+                separators=compact_sep,
+            )
+            giant_api_blob = json.dumps(
+                {
+                    "sessionId": cl_sid,
+                    "version": "2.1.330",
+                    "type": "api-request-blob",
+                    "request": {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": 'previous turn quoting "type":"user" and "role":"user" ' + ("B" * 2200),
+                                    }
+                                ],
+                            },
+                            {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "reply body " + ("C" * 800)}],
+                            },
+                        ]
+                    },
+                },
+                separators=compact_sep,
+            )
+            giant_api_shape = json.dumps(
+                {
+                    "version": "2.1.330",
+                    "type": "api-request-shape",
+                    "shape": {"role": "user", "schema": "S" * 2400},
+                },
+                separators=spaced_sep,
+            )
+            giant_api_req = json.dumps(
+                {
+                    "version": "2.1.330",
+                    "type": "api-request",
+                    "payload": {"role": "assistant", "detail": "R" * 2200},
+                },
+                separators=compact_sep,
+            )
+            giant_progress = json.dumps(
+                {
+                    "version": "2.1.330",
+                    "type": "progress",
+                    "data": {"type": "bash_progress", "output": 'user "role":"user" ' + ("P" * 2000)},
+                },
+                separators=compact_sep,
+            )
+            small_attachment = json.dumps(
+                {
+                    "version": "2.1.330",
+                    "type": "attachment",
+                    "attachment": {"type": "file", "content": "small"},
+                },
+                separators=compact_sep,
+            )
+
+            # Anti-false-positive records (>2 KB):
+            # Real user/assistant turns whose body quotes non-dialogue type markers (and even nests an
+            # unescaped {"type": "attachment"} dict inside toolUseResult) MUST NEVER be skipped.
+            quoted_user_text = (
+                'Please inspect why "type":"attachment" and "type":"api-request-blob" '
+                'plus "type": "api-request-shape" and "type":"api-request" bloat JSONL. '
+                + ("user_detail " * 200)
+            )
+            quoted_assistant_text = (
+                'Confirmed: filtering "type":"attachment" and "type":"api-request-blob" '
+                "keeps real dialogue intact. "
+                + ("assistant_detail " * 200)
+            )
+            user_before = json.dumps(
+                {
+                    "isSidechain": False,
+                    "sessionId": cl_sid,
+                    "cwd": str(ws),
+                    "type": "user",
+                    "message": {"role": "user", "content": "TURN_BEFORE_BLOBS"},
+                },
+                separators=compact_sep,
+            )
+            user_quoting_markers = json.dumps(
+                {
+                    "parentUuid": "00000000-0000-4000-8000-000000000002",
+                    "isSidechain": False,
+                    "sessionId": cl_sid,
+                    "cwd": str(ws),
+                    "type": "user",
+                    "toolUseResult": {"type": "attachment", "note": "nested_obj"},
+                    "message": {"role": "user", "content": quoted_user_text},
+                },
+                separators=compact_sep,
+            )
+            assistant_quoting_markers = json.dumps(
+                {
+                    "parentUuid": "00000000-0000-4000-8000-000000000003",
+                    "isSidechain": False,
+                    "sessionId": cl_sid,
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": quoted_assistant_text}],
+                    },
+                },
+                separators=spaced_sep,
+            )
+            user_after = json.dumps(
+                {
+                    "isSidechain": False,
+                    "sessionId": cl_sid,
+                    "type": "user",
+                    "message": {"role": "user", "content": "TURN_AFTER_BLOBS"},
+                },
+                separators=compact_sep,
+            )
+
+            self.assertGreater(len(giant_attachment.encode("utf-8")), 2048)
+            self.assertGreater(len(giant_api_blob.encode("utf-8")), 2048)
+            self.assertGreater(len(giant_api_shape.encode("utf-8")), 2048)
+            self.assertGreater(len(giant_api_req.encode("utf-8")), 2048)
+            self.assertGreater(len(giant_progress.encode("utf-8")), 2048)
+            self.assertLessEqual(len(small_attachment.encode("utf-8")), 1024)
+            self.assertGreater(len(user_quoting_markers.encode("utf-8")), 2048)
+            self.assertGreater(len(assistant_quoting_markers.encode("utf-8")), 2048)
+
+            lines = [
+                user_before,
+                small_attachment,
+                giant_attachment,
+                giant_api_blob,
+                user_quoting_markers,
+                giant_api_shape,
+                assistant_quoting_markers,
+                giant_api_req,
+                giant_progress,
+                user_after,
+            ]
+            cl_jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            write_session_registry_entry(
+                rt, cli="claude", session_id=cl_sid, jsonl_path=str(cl_jsonl), cwd=str(ws)
+            )
+
+            real_loads = json.loads
+
+            # 1. Remote / stateless full cleaner (_remote_probe._clean_jsonl_file)
+            probe_parsed_types: list[str] = []
+
+            def spy_probe_loads(s: str, *args: object, **kwargs: object) -> object:
+                obj = real_loads(s, *args, **kwargs)
+                if isinstance(obj, dict):
+                    probe_parsed_types.append(str(obj.get("type") or ""))
+                return obj
+
+            with mock.patch.object(_remote_probe.json, "loads", side_effect=spy_probe_loads):
+                probe_turns, probe_cwd, probe_compactions = _remote_probe._clean_jsonl_file(
+                    "claude", str(cl_jsonl), home=home
+                )
+
+            expected_turns = [
+                ("user", "TURN_BEFORE_BLOBS"),
+                ("user", quoted_user_text.strip()),
+                ("assistant", quoted_assistant_text.strip()),
+                ("user", "TURN_AFTER_BLOBS"),
+            ]
+            self.assertEqual(probe_cwd, str(ws))
+            self.assertEqual(probe_compactions, 0)
+            self.assertEqual(probe_turns, expected_turns)
+            # Only the 4 dialogue records + the <=1KB small_attachment hit json.loads; all 5 >1KB non-dialogue lines skipped.
+            self.assertEqual(probe_parsed_types, ["user", "attachment", "user", "assistant", "user"])
+
+            # 2. Local incremental cleaner (SessionTracker._ingest_jsonl_delta & sync_session)
+            tracker = SessionTracker(home_dir=home, runtime_dir=rt, proc_root=None)
+            local_state = session_ctx_mod.SessionState(
+                session_key=f"claude:{cl_sid}",
+                cli="claude",
+                session_id=cl_sid,
+                jsonl_path=str(cl_jsonl),
+                cwd=str(ws),
+            )
+            local_parsed_types: list[str] = []
+
+            def spy_local_loads(s: str, *args: object, **kwargs: object) -> object:
+                obj = real_loads(s, *args, **kwargs)
+                if isinstance(obj, dict):
+                    local_parsed_types.append(str(obj.get("type") or ""))
+                return obj
+
+            with mock.patch.object(session_ctx_mod.json, "loads", side_effect=spy_local_loads):
+                tracker._ingest_jsonl_delta(local_state)
+            self.assertEqual(local_state.clean_turns, expected_turns)
+            self.assertEqual(local_parsed_types, ["user", "attachment", "user", "assistant", "user"])
+
+            # End-to-end sync_session matches remote cleaner identically
+            snap = tracker.sync_session(window_title=f"[claude:#{cl_sid[:8]}]")
+            assert snap is not None
+            self.assertEqual(list(snap.clean_turns), expected_turns)
+
+            # 3. Incremental append: >2 KB compact_boundary mentioning "type":"attachment" must NOT be skipped,
+            #    while subsequent giant api-request-blob IS skipped and trailing user turn is preserved.
+            big_compact = json.dumps(
+                {
+                    "isSidechain": False,
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "content": 'compacted after "type":"attachment" ' + ("K" * 1600),
+                    "extra": {"type": "attachment"},
+                },
+                separators=compact_sep,
+            )
+            post_compact_user = json.dumps(
+                {
+                    "isSidechain": False,
+                    "type": "user",
+                    "message": {"role": "user", "content": "POST_COMPACT_AFTER_PREFILTER"},
+                },
+                separators=compact_sep,
+            )
+            with cl_jsonl.open("a", encoding="utf-8") as f:
+                f.write("\n".join([big_compact, giant_api_blob, post_compact_user]) + "\n")
+
+            local_parsed_types.clear()
+            with mock.patch.object(session_ctx_mod.json, "loads", side_effect=spy_local_loads):
+                tracker._ingest_jsonl_delta(local_state)
+            self.assertEqual(local_state.clean_turns, [("user", "POST_COMPACT_AFTER_PREFILTER")])
+            self.assertEqual(local_parsed_types, ["system", "user"])
+
+            snap2 = tracker.sync_session(window_title=f"[claude:#{cl_sid[:8]}]")
+            assert snap2 is not None
+            self.assertGreater(snap2.generation, snap.generation)
+            self.assertEqual(list(snap2.clean_turns), [("user", "POST_COMPACT_AFTER_PREFILTER")])
+
+            # Remote probe end-to-end (run_probe) matches local incremental state after compaction
+            probe_parsed_types.clear()
+            with mock.patch.object(_remote_probe.json, "loads", side_effect=spy_probe_loads):
+                probe_turns2, _, probe_compactions2 = _remote_probe._clean_jsonl_file(
+                    "claude", str(cl_jsonl), home=home
+                )
+            self.assertEqual(probe_compactions2, 1)
+            self.assertEqual(probe_turns2, [("user", "POST_COMPACT_AFTER_PREFILTER")])
+            self.assertEqual(
+                probe_parsed_types,
+                ["user", "attachment", "user", "assistant", "user", "system", "user"],
+            )
+            probe_resp = _remote_probe.run_probe(
+                {"title": f"[claude:#{cl_sid[:8]}]", "include_git": False},
+                env={"AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)},
+                home_dir=home,
+                proc_root=root / "no_proc",
+            )
+            self.assertTrue(probe_resp["ok"])
+            self.assertEqual(probe_resp["turns"], [["user", "POST_COMPACT_AFTER_PREFILTER"]])
+
     def test_tech_ident_re_cjk_pascal_kebab_and_negative_guards(self) -> None:
         from agent_voice_input.session_ctx import extract_turn_hotwords
 

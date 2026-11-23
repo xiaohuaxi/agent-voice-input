@@ -90,6 +90,7 @@ from ._remote_probe import (
     _resolve_agy_transcript_path,
     _safe_mtime,
     _safe_realpath,
+    _should_prefilter_skip_jsonl_line,
     aggregate_prior_candidates_hotwords,
     discover_cli_prior_sessions,
     encode_claude_project_dir,
@@ -4790,6 +4791,10 @@ class SessionTracker:
 
                     body = raw_line[:-1].strip()
                     if not body:
+                        continue
+                    if _should_prefilter_skip_jsonl_line(
+                        state.cli, body, allow_agy_early_meta=(not state.cwd)
+                    ):
                         continue
                     try:
                         obj = json.loads(body.decode("utf-8", errors="replace"))
