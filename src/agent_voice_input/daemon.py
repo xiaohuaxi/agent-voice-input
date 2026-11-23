@@ -14,6 +14,7 @@ from .app_scope import (
     classify_window_category,
     is_antigravity_ide_window,
     is_remote_client_window,
+    is_remote_ide_window,
     match_app_patterns,
     resolve_hotwords_scope,
 )
@@ -76,10 +77,12 @@ from .session_ctx import (
     prune_stale_session_registry,
 )
 from .workspace_ctx import (
+    _AGY_DESKTOP_REJECT_TITLES,
     _dedupe_hotwords_ci,
     _effective_is_wsl,
     _resolve_safe_local_dir,
     resolve_antigravity_ide_session,
+    resolve_antigravity_ide_session_by_title,
     resolve_ide_workspace_cwd,
 )
 
@@ -1193,26 +1196,43 @@ def _execute_stage1(
                         extra_hw = _dedupe_hotwords_ci([*extra_hw, *prior_hw])
                         st.ctx_fallback = "prior_hotwords"
     elif not origin_drifted and eff_mode == "agent" and (win.process or win.bundle_id):
-        st.workspace_cwd = resolve_ide_workspace_cwd(
-            win,
-            home=tracker.home,
-            known_cwds=tracker.active_session_cwds(),
-            env=env,
+        is_agy_ide = is_antigravity_ide_window(win)
+        skip_legacy_agy = bool(
+            is_agy_ide
+            and not (getattr(win, "document", "") or "").strip()
+            and (win.title or "").strip().lower() in _AGY_DESKTOP_REJECT_TITLES
         )
-        if st.workspace_cwd and is_antigravity_ide_window(win):
-            ide_match = resolve_antigravity_ide_session(
-                st.workspace_cwd, home=tracker.home, env=env
+        if is_agy_ide and not is_remote_ide_window(win) and not skip_legacy_agy:
+            ide_match = resolve_antigravity_ide_session_by_title(
+                win.title, home=tracker.home, env=env
             )
             if ide_match is not None:
+                if ide_match.cwd:
+                    st.workspace_cwd = ide_match.cwd
                 st.snap = tracker.sync_ide_session(
                     ide_match, cold_start_fallback=cfg.refiner.cold_start_fallback
                 )
+        if st.snap is None and not skip_legacy_agy:
+            st.workspace_cwd = resolve_ide_workspace_cwd(
+                win,
+                home=tracker.home,
+                known_cwds=tracker.active_session_cwds(),
+                env=env,
+            )
+            if st.workspace_cwd and is_agy_ide:
+                ide_match = resolve_antigravity_ide_session(
+                    st.workspace_cwd, home=tracker.home, env=env
+                )
+                if ide_match is not None:
+                    st.snap = tracker.sync_ide_session(
+                        ide_match, cold_start_fallback=cfg.refiner.cold_start_fallback
+                    )
         if st.snap is None and st.workspace_cwd:
             extra_hw = tracker.build_workspace_hotwords(st.workspace_cwd)
             if cfg.refiner.cold_start_fallback != "off" and (
                 prior_hw_fn := getattr(tracker, "get_workspace_prior_hotwords", None)
             ) is not None:
-                ide_scope = "agy_ide" if is_antigravity_ide_window(win) else "cli"
+                ide_scope = "agy_ide" if is_agy_ide else "cli"
                 if prior_hw := prior_hw_fn(
                     st.workspace_cwd,
                     scope=ide_scope,

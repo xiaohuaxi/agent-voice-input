@@ -152,6 +152,7 @@ from .workspace_ctx import (
     read_repo_core_files,
     read_workspace_shallow_files,
     resolve_antigravity_ide_session,
+    resolve_antigravity_ide_session_by_title,
     resolve_ide_workspace_cwd,
 )
 
@@ -4577,7 +4578,12 @@ class SessionTracker:
 
     def _consume_parsed_record(self, state: SessionState, obj: Mapping[str, Any]) -> None:
         eff_wsl = False if state.is_remote else _effective_is_wsl(env=self.env)
-        if not state.cwd and isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
+        if (
+            not state.cwd
+            and state.matched_by != "ide_db_title"
+            and isinstance(obj.get("cwd"), str)
+            and obj["cwd"].strip()
+        ):
             state.cwd = _normalize_cwd(obj["cwd"], wsl=eff_wsl)
 
         if state.cli == "agy":
@@ -4905,10 +4911,25 @@ class SessionTracker:
         return _safe_realpath(raw_cwd, wsl=eff_wsl) or _normalize_cwd(raw_cwd, wsl=eff_wsl)
 
     @staticmethod
-    def _retire_prior_on_cwd_change_locked(state: SessionState, canon_cwd: str) -> None:
-        if state.cold_start_prior_cwd and canon_cwd and state.cold_start_prior_cwd != canon_cwd:
+    def _retire_prior_on_cwd_change_locked(
+        state: SessionState, canon_cwd: str, *, clear_on_empty: bool = False
+    ) -> None:
+        should_clear = bool(
+            (state.cold_start_prior_cwd and canon_cwd and state.cold_start_prior_cwd != canon_cwd)
+            or (
+                clear_on_empty
+                and not canon_cwd
+                and (
+                    state.cold_start_prior_cwd
+                    or state.cold_start_prior_chunk
+                    or state.cold_start_prior_hotwords
+                )
+            )
+        )
+        if should_clear:
             state.cold_start_prior_chunk = ""
             state.cold_start_prior_hotwords = ()
+            state.cold_start_prior_cwd = ""
             state.cold_start_prior_retired = True
             state.cold_start_prior_checked = True
             state.cold_start_prior_hotwords_checked = True
@@ -5521,7 +5542,8 @@ class SessionTracker:
             else (cold_start_fallback or "auto").strip().lower()
         )
         need_prior_discovery = False
-        prior_scope = "agy_ide" if eff_match.matched_by == "ide_brain" else "cli"
+        authoritative_cwd = eff_match.matched_by == "ide_db_title"
+        prior_scope = "agy_ide" if eff_match.matched_by in ("ide_brain", "ide_db_title") else "cli"
         with self._lock:
             norm_path = (
                 _upgrade_agy_transcript_path(eff_match.jsonl_path)
@@ -5542,16 +5564,22 @@ class SessionTracker:
                 self._put_state_locked(eff_match.session_key, state)
             else:
                 self._touch_state_locked(eff_match.session_key)
-                if eff_match.matched_by and not state.matched_by:
+                if eff_match.matched_by and (authoritative_cwd or not state.matched_by):
                     state.matched_by = eff_match.matched_by
-                if eff_match.cwd and (prefer_match_cwd or not state.cwd):
+                if authoritative_cwd:
+                    state.cwd = eff_match.cwd
+                elif eff_match.cwd and (prefer_match_cwd or not state.cwd):
                     state.cwd = eff_match.cwd
                 if norm_path != state.jsonl_path:
                     self._reset_state(state, norm_path)
 
             self._ingest_jsonl_delta(state)
 
-            eff_cwd = (eff_match.cwd if prefer_match_cwd and eff_match.cwd else state.cwd) or eff_match.cwd
+            if authoritative_cwd:
+                state.cwd = eff_match.cwd
+                eff_cwd = eff_match.cwd
+            else:
+                eff_cwd = (eff_match.cwd if prefer_match_cwd and eff_match.cwd else state.cwd) or eff_match.cwd
             if eff_cwd != eff_match.cwd or state.jsonl_path != eff_match.jsonl_path:
                 eff_match = replace(
                     eff_match,
@@ -5566,10 +5594,12 @@ class SessionTracker:
             state_cli = state.cli
             state_sid = state.session_id
             state_key = state.session_key
-            if state.matched_by == "ide_brain":
+            if state.matched_by in ("ide_brain", "ide_db_title"):
                 prior_scope = "agy_ide"
             target_canon_cwd = self._canonical_prior_cwd(eff_cwd, is_remote=False)
-            self._retire_prior_on_cwd_change_locked(state, target_canon_cwd)
+            self._retire_prior_on_cwd_change_locked(
+                state, target_canon_cwd, clear_on_empty=authoritative_cwd
+            )
 
             if len(turns_tuple) >= COLD_START_SWEET_MIN_TURNS:
                 if not state.cold_start_prior_checked:
@@ -5614,10 +5644,12 @@ class SessionTracker:
                     if cur_st is not None:
                         self._touch_state_locked(state_key)
                         cur_canon = self._canonical_prior_cwd(cur_st.cwd, is_remote=cur_st.is_remote)
-                        if (
-                            not cur_st.cold_start_prior_retired
-                            and (not cur_canon or cur_canon == target_canon_cwd)
-                        ):
+                        cwd_still_matches = (
+                            (bool(cur_canon) and cur_canon == target_canon_cwd)
+                            if cur_st.matched_by == "ide_db_title"
+                            else (not cur_canon or cur_canon == target_canon_cwd)
+                        )
+                        if not cur_st.cold_start_prior_retired and cwd_still_matches:
                             if not cur_st.cold_start_prior_hotwords_checked:
                                 cur_st.cold_start_prior_hotwords = discovered_hw
                                 cur_st.cold_start_prior_hotwords_checked = True
@@ -5646,7 +5678,9 @@ class SessionTracker:
             with self._lock:
                 self._unpin_state_locked(state_key)
 
-        git_status, git_hw = self._get_git_info(eff_cwd) if include_git_info else ("", [])
+        git_status, git_hw = (
+            self._get_git_info(eff_cwd) if (include_git_info and eff_cwd) else ("", [])
+        )
         repo_stems = self._fallback_workspace_stems(eff_cwd) if (include_git_info and eff_cwd and not git_hw) else []
         turn_hw = extract_turn_hotwords(turns_tuple)
         merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems, *prior_hw]))

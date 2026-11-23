@@ -1,11 +1,13 @@
 """Offline unit tests for Agent Session cold-start fallback (Layer 0, Layer 1, Layer 2, SSH remote, telemetry)."""
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import math
 import os
 from pathlib import Path
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -487,6 +489,127 @@ class TestColdStartDiscoverySelectionAndGuards(unittest.TestCase):
 
             self.assertEqual([c["session_id"] for c in cli_cands], ["cli-only-cid"])
             self.assertEqual([c["session_id"] for c in ide_cands], ["ide-old-cid"])
+
+    def test_agy20_db_prior_discovery_and_cold_start_sync_ide_db_title(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            repo = home / "repos" / "agy20-repo"
+            other_repo = home / "repos" / "other-repo"
+            sub_dir = repo / "subpkg"
+            for d in (repo, other_repo, sub_dir):
+                d.mkdir(parents=True, exist_ok=True)
+            now = time.time()
+
+            ide_root = home / ".gemini" / "antigravity"
+            ide_brain = ide_root / "brain"
+
+            def _write_plain_agy20_tp(cid: str, turns: list[tuple[str, str]], mtime: float) -> Path:
+                logs_dir = ide_brain / cid / ".system_generated" / "logs"
+                logs_dir.mkdir(parents=True, exist_ok=True)
+                tp = logs_dir / "transcript_full.jsonl"
+                lines = [
+                    json.dumps(
+                        {
+                            "source": "USER_EXPLICIT" if r == "user" else "MODEL",
+                            "type": "USER_INPUT" if r == "user" else "PLANNER_RESPONSE",
+                            "content": t,
+                        },
+                        ensure_ascii=False,
+                    )
+                    for r, t in turns
+                ]
+                tp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                os.utime(tp, (mtime, mtime))
+                return tp
+
+            # AGY 2.0 transcripts have NO SYSTEM/subagents L1 evidence; workspace link lives in DB!
+            _write_plain_agy20_tp("agy20-prior-rich", _make_rich_turns("PrismIndexer", pairs=2, pad_chars=900), now - 3600)
+            _write_plain_agy20_tp("agy20-other-repo", _make_rich_turns("OtherRepoLeak", pairs=2, pad_chars=900), now - 100)
+            _write_plain_agy20_tp("agy20-sub-dir", _make_rich_turns("SubDirLeak", pairs=2, pad_chars=900), now - 90)
+            cur_tp = _write_plain_agy20_tp("agy20-cur-cold", [("user", "Start new task")], now - 10)
+            # P1 #2: DB-vetoed sessions that STILL contain local SYSTEM cwd=repo in transcript MUST NOT be resurrected!
+            _write_agy_jsonl(home, str(repo), "agy20-remote-veto", _make_rich_turns("RemoteVetoLeak", pairs=2, pad_chars=900), ide=True, mtime=now - 15)
+            _write_agy_jsonl(home, str(repo), "agy20-parent-veto", _make_rich_turns("ParentVetoLeak", pairs=2, pad_chars=900), ide=True, mtime=now - 14)
+            _write_agy_jsonl(home, str(repo), "agy20-refiner-veto", _make_rich_turns("RefinerVetoLeak", pairs=2, pad_chars=900), ide=True, mtime=now - 13)
+            _write_agy_jsonl(home, str(repo), "agy20-other-veto", _make_rich_turns("OtherWsVetoLeak", pairs=2, pad_chars=900), ide=True, mtime=now - 12)
+            # CLI session in exact repo must remain strictly isolated from agy_ide scope
+            _write_agy_jsonl(home, str(repo), "cli-exact-cid", _make_rich_turns("CliLeak", pairs=2, pad_chars=900), ide=False, mtime=now - 5)
+
+            db_path = ide_root / "conversation_summaries.db"
+            db_rows: list[tuple[object, ...]] = [
+                ("agy20-prior-rich", "Prior Rich Task", json.dumps(["file://[invalid/path", repo.as_uri()]), "2025-01-01T10:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("agy20-other-repo", "Other Repo Task", json.dumps([other_repo.as_uri()]), "2026-11-23T08:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("agy20-sub-dir", "Sub Dir Task", json.dumps([sub_dir.as_uri()]), "2026-11-23T08:05:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("agy20-cur-cold", "Current Cold Task", json.dumps([repo.as_uri()]), "2026-11-23T09:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("agy20-remote-veto", "Remote SSH Session", json.dumps(["ssh://prod/srv/app"]), "2026-11-23T09:01:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("agy20-parent-veto", "Subagent Row", json.dumps([repo.as_uri()]), "2026-11-23T09:02:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "agy20-cur-cold", 0, ""),
+                ("agy20-refiner-veto", "Refiner Row", json.dumps([repo.as_uri()]), "2026-11-23T09:03:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, "avi-refiner"),
+                ("agy20-other-veto", "Rebound To Other Repo", json.dumps([other_repo.as_uri()]), "2026-11-23T09:04:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("agy20-bad-uri-only", "Malformed Unrelated Row", json.dumps(["file://[invalid/path"]), "2026-11-23T09:05:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+            ]
+            # Insert >210 newer unrelated rows so older repo prior is not truncated by a 200-row cap
+            for i in range(215):
+                db_rows.append((
+                    f"agy20-noise-{i:03d}",
+                    f"Noise {i:03d}",
+                    json.dumps([other_repo.as_uri()]),
+                    f"2026-11-23T11:{i // 60:02d}:{i % 60:02d}Z",
+                    "CORTEX_TRAJECTORY_SOURCE_CASCADE",
+                    "",
+                    0,
+                    "",
+                ))
+            with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT,
+                        source TEXT,
+                        parent_conversation_id TEXT,
+                        nesting_depth INTEGER,
+                        agent_name TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    db_rows,
+                )
+                conn.commit()
+
+            cands = discover_antigravity_ide_prior_sessions(
+                str(repo), home=home, wsl=False, exclude_session_id="agy20-cur-cold"
+            )
+            self.assertEqual([c["session_id"] for c in cands], ["agy20-prior-rich"])
+
+            # Verify sync_ide_session with matched_by="ide_db_title" uses prior_scope="agy_ide" (never leaks CLI prior!)
+            env = {"HOME": str(home), "WSL_DISTRO_NAME": "", "WSL_INTEROP": ""}
+            cfg = Config(refiner=RefinerConfig(provider="auto", cold_start_fallback="auto"))
+            tracker = SessionTracker(home_dir=home, proc_root=None, env=env, cold_start_fallback="auto")
+            try:
+                snap = tracker.sync_ide_session(
+                    SessionMatch(
+                        cli="agy",
+                        session_id="agy20-cur-cold",
+                        jsonl_path=str(cur_tp),
+                        cwd=str(repo),
+                        matched_by="ide_db_title",
+                    ),
+                    include_git_info=False,
+                )
+                self.assertTrue(snap.prior_hotwords_used)
+                self.assertIn("PrismIndexerController", snap.hotwords)
+                self.assertNotIn("CliLeakController", snap.hotwords)
+                blocks, _ = build_refiner_context_chunks(cfg, session_key=snap.session_key, tracker=tracker)
+                self.assertTrue(blocks and blocks[0].startswith("<prior_session_reference"))
+                self.assertIn("PrismIndexerController", blocks[0])
+                self.assertNotIn("CliLeakController", blocks[0])
+            finally:
+                tracker.close()
 
     def test_codex_reverse_date_bounded_scan_and_wsl_mnt_guard(self) -> None:
         with tempfile.TemporaryDirectory() as td:

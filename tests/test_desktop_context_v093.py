@@ -1,12 +1,15 @@
 """Offline unit tests for v0.9-3 desktop GUI scene awareness & non-Git workspace support."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -60,6 +63,7 @@ from agent_voice_input.session_ctx import (  # noqa: E402
     read_repo_core_files,
     read_workspace_shallow_files,
     resolve_antigravity_ide_session,
+    resolve_antigravity_ide_session_by_title,
     resolve_ide_workspace_cwd,
 )
 
@@ -158,6 +162,8 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             (ForegroundWindow(6, "Code", "x.py — repo [Dev Container: Python 3] — Visual Studio Code"), IdeTitleInfo(root_name="repo", remote_kind="container")),
             (ForegroundWindow(7, "Cursor", "bot.py — next.js — Cursor"), IdeTitleInfo(root_name="next.js")),
             (ForegroundWindow(8, "Cursor", "Q4产品规划 — Cursor"), IdeTitleInfo(root_name="Q4产品规划")),
+            (ForegroundWindow(17, "Antigravity", "main.py — New Chat — Antigravity", bundle_id="com.google.antigravity"), IdeTitleInfo(root_name="New Chat")),
+            (ForegroundWindow(18, "Code", "app.py — New Conversation — Visual Studio Code"), IdeTitleInfo(root_name="New Conversation")),
             (ForegroundWindow(20, "Zed", "my-proj — src/main.rs", bundle_id="dev.zed.zed"), IdeTitleInfo(root_name="my-proj")),
             (ForegroundWindow(30, "pycharm64.exe", "proj – [~/repos/proj] – app.py"), IdeTitleInfo(root_name="proj", explicit_path="~/repos/proj")),
             (ForegroundWindow(31, "IntelliJ IDEA", "proj [~/repos/proj] – Main.kt", bundle_id="com.jetbrains.intellij"), IdeTitleInfo(root_name="proj", explicit_path="~/repos/proj")),
@@ -954,6 +960,875 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 self.assertIn('category="im_chat"', seen_user_msgs[1])
             finally:
                 daemon.close()
+
+    def test_agy20_desktop_db_title_binding_disambiguation_isolation_and_daemon(self) -> None:
+        def _create_agy20_db(db_path: Path, rows: list[tuple[object, ...]]) -> None:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT,
+                        source TEXT,
+                        parent_conversation_id TEXT,
+                        nesting_depth INTEGER,
+                        agent_name TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT OR REPLACE INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+                conn.commit()
+
+        def _write_pbtxt(root: Path, cid: str, mtime: float) -> Path:
+            p = root / "annotations" / f"{cid}.pbtxt"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("last_user_view_time {}\n", encoding="utf-8")
+            os.utime(p, (mtime, mtime))
+            return p
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            repo_a = home / "repos" / "alpha-app"
+            repo_b = home / "repos" / "beta-app"
+            repo_a.mkdir(parents=True)
+            repo_b.mkdir(parents=True)
+            (repo_a / "ZephyrPipeline.py").write_text("class ZephyrEngine: pass\n", encoding="utf-8")
+            (repo_b / "OrbitWorker.py").write_text("class OrbitWorker: pass\n", encoding="utf-8")
+
+            ide_root = home / ".gemini" / "antigravity"
+            ide_brain = ide_root / "brain"
+            cli_brain = home / ".gemini" / "antigravity-cli" / "brain"
+            db_path = ide_root / "conversation_summaries.db"
+            # 2026-11-23T10:00:00Z — newer than the 09:xx DB timestamps below
+            now_ts = 1_795_428_000.0
+
+            # 1. Transcripts on disk (AGY 2.0 standalone format: no SYSTEM/subagents L1 evidence!)
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-exact-a",
+                [
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Refactor QuartzScheduler queue</USER_REQUEST>"},
+                    {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Updating QuartzScheduler."},
+                ],
+                mtime=now_ts - 120,
+            )
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-old-5d",
+                [
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Old five day task on OrbitWorker</USER_REQUEST>"},
+                ],
+                mtime=now_ts - 5 * 86400,
+            )
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-noworkspace",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Brainstorm NebulaDraft notes</USER_REQUEST>"}],
+                mtime=now_ts - 60,
+            )
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-remote-only",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Check RemoteBoxCluster</USER_REQUEST>"}],
+                mtime=now_ts - 50,
+            )
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-trunc-en",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Long English title session</USER_REQUEST>"}],
+                mtime=now_ts - 40,
+            )
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-trunc-cjk",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>中文长标题会话</USER_REQUEST>"}],
+                mtime=now_ts - 35,
+            )
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-exact-over-prefix",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Exact literal ellipsis title</USER_REQUEST>"}],
+                mtime=now_ts - 90,
+            )
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-short-prefix",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Short prefix trap</USER_REQUEST>"}],
+                mtime=now_ts - 30,
+            )
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-dup-old",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Duplicate older</USER_REQUEST>"}],
+                mtime=now_ts - 600,
+            )
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-dup-active",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Duplicate active via pbtxt</USER_REQUEST>"}],
+                mtime=now_ts - 800,
+            )
+            # Isolation traps: CLI source, avi-refiner, subagent parent, nesting_depth, CLI-only brain, bad cid
+            for trap_cid in ("cid-cli-src", "cid-refiner", "cid-child-parent", "cid-nested", "cid-sub-file"):
+                _write_agy_brain_session(
+                    ide_brain,
+                    trap_cid,
+                    [
+                        {
+                            "source": "SYSTEM" if trap_cid == "cid-sub-file" else "USER_EXPLICIT",
+                            "type": "SYSTEM_MESSAGE" if trap_cid == "cid-sub-file" else "USER_INPUT",
+                            "content": "[Message] sender=parent <subagent_reminder>" if trap_cid == "cid-sub-file" else "trap",
+                        }
+                    ],
+                    mtime=now_ts - 10,
+                )
+            _write_agy_brain_session(
+                cli_brain,
+                "cid-only-in-cli-brain",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>CLI brain secret</USER_REQUEST>"}],
+                mtime=now_ts - 5,
+            )
+            # Duplicate title: cid-dup-old has newer DB timestamp, but cid-dup-active has newer annotations/<cid>.pbtxt mtime
+            _write_pbtxt(ide_root, "cid-dup-old", now_ts - 500)
+            _write_pbtxt(ide_root, "cid-dup-active", now_ts - 5)
+
+            _create_agy20_db(
+                db_path,
+                [
+                    ("cid-exact-a", "Refactor QuartzScheduler", json.dumps([repo_a.as_uri()]), "2026-11-23T09:00:00.123456789Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-old-5d", "Audit OrbitWorker Retries", json.dumps([repo_b.as_uri()]), "2026-11-18T08:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-noworkspace", "Brainstorm NebulaDraft", "", "2026-11-23T09:01:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-remote-only", "Remote Prod Debug", json.dumps(["vscode-remote://ssh-remote+prod/home/dev/app", "ssh://prod/srv/app", f"file://{home}"]), "2026-11-23T09:02:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-trunc-en", "Investigate Antigravity 2.0 Window Title Binding", json.dumps([repo_a.as_uri()]), "2026-11-23T09:03:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-trunc-cjk", "修复语音输入桌面窗口上下文路由问题", json.dumps([repo_a.as_uri()]), "2026-11-23T09:04:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-exact-over-prefix", "Investigate Antigravity 2...", json.dumps([repo_b.as_uri()]), "2026-11-23T08:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-short-prefix", "Fix bug in parser", json.dumps([repo_a.as_uri()]), "2026-11-23T09:05:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-dup-old", "Shared Title Session", json.dumps([repo_b.as_uri()]), "2026-11-23T09:10:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-dup-active", "Shared Title Session", json.dumps([repo_a.as_uri()]), "2026-11-23T08:10:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-cli-src", "CLI Source Trap", json.dumps([repo_a.as_uri()]), "2026-11-23T09:20:00Z", "CORTEX_TRAJECTORY_SOURCE_CLI", "", 0, ""),
+                    ("cid-refiner", "Refiner Trap", json.dumps([repo_a.as_uri()]), "2026-11-23T09:20:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, "avi-refiner"),
+                    ("cid-child-parent", "Child Parent Trap", json.dumps([repo_a.as_uri()]), "2026-11-23T09:20:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "cid-exact-a", 0, ""),
+                    ("cid-nested", "Nested Depth Trap", json.dumps([repo_a.as_uri()]), "2026-11-23T09:20:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 1, ""),
+                    ("cid-sub-file", "Subagent File Trap", json.dumps([repo_a.as_uri()]), "2026-11-23T09:20:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("cid-only-in-cli-brain", "CLI Brain Only Trap", json.dumps([repo_a.as_uri()]), "2026-11-23T09:20:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ("../escape-cid", "Path Traversal Trap", json.dumps([repo_a.as_uri()]), "2026-11-23T09:20:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ],
+            )
+
+            # 1) Exact match + workspace_uris + multi-window isolation + 5-day-old session still matches
+            m_a = resolve_antigravity_ide_session_by_title("  Refactor QuartzScheduler  ", home=home, wsl=False)
+            assert m_a is not None
+            self.assertEqual((m_a.session_id, m_a.matched_by, m_a.cwd), ("cid-exact-a", "ide_db_title", os.path.realpath(repo_a)))
+
+            m_b = resolve_antigravity_ide_session_by_title("Audit OrbitWorker Retries", home=home, wsl=False)
+            assert m_b is not None
+            self.assertEqual((m_b.session_id, m_b.cwd), ("cid-old-5d", os.path.realpath(repo_b)))
+
+            # 2) Empty workspace_uris & remote-only/broad URIs -> cwd="" but session still binds
+            m_no_ws = resolve_antigravity_ide_session_by_title("Brainstorm NebulaDraft", home=home, wsl=False)
+            assert m_no_ws is not None
+            self.assertEqual((m_no_ws.session_id, m_no_ws.cwd), ("cid-noworkspace", ""))
+
+            m_rem = resolve_antigravity_ide_session_by_title("Remote Prod Debug", home=home, wsl=False)
+            assert m_rem is not None
+            self.assertEqual((m_rem.session_id, m_rem.cwd), ("cid-remote-only", ""))
+
+            # 3) Truncated prefix ("..." and Unicode "…"), short prefix rejection, and exact-over-prefix priority
+            m_exact_wins = resolve_antigravity_ide_session_by_title("Investigate Antigravity 2...", home=home, wsl=False)
+            assert m_exact_wins is not None
+            self.assertEqual(m_exact_wins.session_id, "cid-exact-over-prefix")
+
+            m_trunc_en = resolve_antigravity_ide_session_by_title("Investigate Antigravity 2.0 Win...", home=home, wsl=False)
+            assert m_trunc_en is not None
+            self.assertEqual(m_trunc_en.session_id, "cid-trunc-en")
+
+            m_trunc_uni = resolve_antigravity_ide_session_by_title("Investigate Antigravity 2.0 Win\u2026", home=home, wsl=False)
+            assert m_trunc_uni is not None
+            self.assertEqual(m_trunc_uni.session_id, "cid-trunc-en")
+
+            m_trunc_cjk = resolve_antigravity_ide_session_by_title("修复语音输入...", home=home, wsl=False)
+            assert m_trunc_cjk is not None
+            self.assertEqual(m_trunc_cjk.session_id, "cid-trunc-cjk")
+
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("Fix...", home=home, wsl=False))
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("修复...", home=home, wsl=False))
+
+            # 4) Duplicate title disambiguated by annotations/<cid>.pbtxt mtime
+            m_dup = resolve_antigravity_ide_session_by_title("Shared Title Session", home=home, wsl=False)
+            assert m_dup is not None
+            self.assertEqual((m_dup.session_id, m_dup.cwd), ("cid-dup-active", os.path.realpath(repo_a)))
+
+            # 5) Strict isolation traps & generic reject titles
+            for rejected in (
+                "", "   ", "New Conversation", "New Chat", "Antigravity", "Settings", "Welcome",
+                "CLI Source Trap", "Refiner Trap", "Child Parent Trap", "Nested Depth Trap",
+                "Subagent File Trap", "CLI Brain Only Trap", "Path Traversal Trap",
+            ):
+                self.assertIsNone(
+                    resolve_antigravity_ide_session_by_title(rejected, home=home, wsl=False),
+                    msg=f"should reject {rejected!r}",
+                )
+
+            # 6) WAL live visibility: uncheckpointed write from open writer is immediately visible via mode=ro
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-live-wal",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Live WAL write</USER_REQUEST>"}],
+                mtime=now_ts,
+            )
+            with contextlib.closing(sqlite3.connect(str(db_path))) as live_w:
+                live_w.execute("PRAGMA wal_autocheckpoint=0")
+                live_w.execute(
+                    "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("cid-live-wal", "Live WAL Realtime Title", json.dumps([repo_a.as_uri()]), "2026-11-23T09:59:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                )
+                live_w.commit()
+                m_wal = resolve_antigravity_ide_session_by_title("Live WAL Realtime Title", home=home, wsl=False)
+                assert m_wal is not None
+                self.assertEqual(m_wal.session_id, "cid-live-wal")
+
+            # 7) End-to-end daemon pipeline: binds AGY 2.0 session AND populates workspace_cwd for file hotwords/context
+            env = {"HOME": str(home), "OPENROUTER_API_KEY": "sk-or-test"}
+            cfg = Config()
+            cfg.refiner.provider = "openrouter"
+            rt = tmp / "rt"
+            rt.mkdir(mode=0o700)
+            tracker = SessionTracker(home_dir=home, runtime_dir=rt, env=env, proc_root=tmp / "noproc")
+            seen_user_msgs: list[str] = []
+
+            def _transport(req: HttpRequest) -> HttpResponse:
+                seen_user_msgs.append(str(json.loads(req.body.decode("utf-8"))["messages"][-1]["content"]))
+                return _json_resp({"choices": [{"message": {"content": "检查 QuartzScheduler 和 ZephyrPipeline.py。"}}]})
+
+            refiner = OpenAICompatibleRefiner(
+                cfg, resolve_credentials(cfg, env), provider_name="openrouter", env=env, transport=_transport
+            )
+            asr = _DummyAsr("检查 quartz scheduler 和 zephyr pipeline", env=env)
+            agy20_win = ForegroundWindow(
+                601, "Antigravity", "Refactor QuartzScheduler", bundle_id="com.google.antigravity"
+            )
+            res = run_pipeline_once(
+                _voiced_wav(),
+                cfg=cfg,
+                tracker=tracker,
+                asr_provider=asr,
+                refiner=refiner,
+                platform=_DummyPlatform(agy20_win),
+                origin_window=agy20_win,
+                audio_source="winmm",
+                dry_run=True,
+                env=env,
+            )
+            self.assertTrue(res.ok)
+            assert res.session is not None
+            self.assertEqual(res.session.session_key, "agy:cid-exact-a")
+            self.assertEqual(res.session.match.matched_by, "ide_db_title")
+            self.assertEqual(res.session.match.cwd, os.path.realpath(repo_a))
+            self.assertIn("QuartzScheduler", asr.seen_contexts[-1].hotwords)
+            self.assertIn("ZephyrPipeline", asr.seen_contexts[-1].hotwords)
+            self.assertIn("ZephyrPipeline.py", seen_user_msgs[-1])
+
+            # New Conversation in AGY 2.0 returns no session and does not cross-bind old sessions
+            agy20_new = ForegroundWindow(
+                602, "Antigravity", "New Conversation", bundle_id="com.google.antigravity"
+            )
+            res_new = run_pipeline_once(
+                _voiced_wav(),
+                cfg=cfg,
+                tracker=tracker,
+                asr_provider=asr,
+                refiner=refiner,
+                platform=_DummyPlatform(agy20_new),
+                origin_window=agy20_new,
+                audio_source="winmm",
+                dry_run=True,
+                env=env,
+            )
+            self.assertTrue(res_new.ok)
+            self.assertIsNone(res_new.session)
+
+            # 8) Minimal schema (missing optional filter cols), symlink DB rejection, corrupt DB graceful degradation,
+            #    and legacy VS Code Fork title path compatibility
+            ide2_root = home / ".gemini" / "antigravity-ide"
+            ide2_brain = ide2_root / "brain"
+            _write_agy_brain_session(
+                ide2_brain,
+                "cid-min-schema",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Minimal schema row</USER_REQUEST>"}],
+                mtime=now_ts - 15,
+            )
+            min_db = ide2_root / "conversation_summaries.db"
+            min_db.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(str(min_db))) as mconn:
+                mconn.execute("CREATE TABLE conversation_summaries (conversation_id TEXT, title TEXT, workspace_uris TEXT)")
+                mconn.execute(
+                    "INSERT INTO conversation_summaries VALUES (?, ?, ?)",
+                    ("cid-min-schema", "Minimal Schema Title", json.dumps(["file:///mnt/c/Users/demo/proj", repo_b.as_uri()])),
+                )
+                mconn.commit()
+            m_min = resolve_antigravity_ide_session_by_title("Minimal Schema Title", home=home, wsl=True)
+            assert m_min is not None
+            self.assertEqual((m_min.session_id, m_min.cwd), ("cid-min-schema", os.path.realpath(repo_b)))
+            min_db.unlink()
+
+            # Symlink DB must be ignored
+            real_ext_db = tmp / "external.db"
+            _create_agy20_db(
+                real_ext_db,
+                [("cid-min-schema", "Symlink DB Title", "", "2026-11-23T09:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, "")],
+            )
+            os.symlink(real_ext_db, min_db)
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("Symlink DB Title", home=home, wsl=False))
+            min_db.unlink()
+
+            db_path.write_bytes(b"not a valid sqlite database")
+            self.assertIsNone(resolve_antigravity_ide_session_by_title("Refactor QuartzScheduler", home=home, wsl=False))
+            legacy_tp = _write_agy_brain_session(
+                ide_brain,
+                "cid-legacy-fork",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Legacy Fork Alpha</USER_REQUEST>"}],
+                mtime=now_ts - 20,
+                workspace_uris=[repo_a.as_uri()],
+            )
+            self.assertTrue(legacy_tp.is_file())
+            legacy_win = ForegroundWindow(
+                603, "Antigravity", "ZephyrPipeline.py — alpha-app — Antigravity", bundle_id="com.google.antigravity"
+            )
+            with mock.patch("agent_voice_input.workspace_ctx.time.time", return_value=now_ts):
+                res_legacy = run_pipeline_once(
+                    _voiced_wav(),
+                    cfg=cfg,
+                    tracker=tracker,
+                    asr_provider=asr,
+                    refiner=refiner,
+                    platform=_DummyPlatform(legacy_win),
+                    origin_window=legacy_win,
+                    audio_source="winmm",
+                    dry_run=True,
+                    env=env,
+                )
+            self.assertTrue(res_legacy.ok)
+            assert res_legacy.session is not None
+            self.assertEqual(res_legacy.session.session_key, "agy:cid-legacy-fork")
+            self.assertEqual(res_legacy.session.match.matched_by, "ide_brain")
+            tracker.close()
+
+    def test_agy20_review_regressions_authoritative_cwd_ranking_sql_pushdown_and_structured_uris(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            repo_a = home / "repos" / "proj-a"
+            repo_b = home / "repos" / "proj-b"
+            repo_plain = home / "repos" / "repo"
+            repo_dot = home / "repos" / "repo."
+            for d in (repo_a, repo_b, repo_plain, repo_dot):
+                d.mkdir(parents=True)
+            (repo_a / "LocalOnlySentinel.py").write_text("x = 1\n", encoding="utf-8")
+
+            ide_root = home / ".gemini" / "antigravity"
+            ide_brain = ide_root / "brain"
+            db_path = ide_root / "conversation_summaries.db"
+            # Base timestamp T = 2026-11-23T09:00:00Z
+            base_t = 1_795_424_400.0
+
+            def _write_pb(cid: str, mtime: float) -> None:
+                p = ide_root / "annotations" / f"{cid}.pbtxt"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("viewed {}\n", encoding="utf-8")
+                os.utime(p, (mtime, mtime))
+
+            # P1 #3: Project A viewed more recently (ann_mtime = T+10, db_lmt = T+0) MUST beat
+            # Project B generating in background (ann_mtime = T-60, db_lmt = T+100)!
+            _write_agy_brain_session(
+                ide_brain, "cid-view-a",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Foreground A</USER_REQUEST>"}],
+                mtime=base_t,
+            )
+            _write_agy_brain_session(
+                ide_brain, "cid-bg-b",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Background B</USER_REQUEST>"}],
+                mtime=base_t + 100,
+            )
+            _write_pb("cid-view-a", base_t + 10)
+            _write_pb("cid-bg-b", base_t - 60)
+
+            # P2 #4: >220 newer unrelated rows MUST NOT push out older exact or prefix targets
+            _write_agy_brain_session(
+                ide_brain, "cid-old-221-exact",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Old 221 exact</USER_REQUEST>"}],
+                mtime=base_t - 86400,
+            )
+            _write_agy_brain_session(
+                ide_brain, "cid-old-222-prefix",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Old 222 prefix</USER_REQUEST>"}],
+                mtime=base_t - 86401,
+            )
+
+            # P2 #5: Trailing-dot directory name preserved & malformed URI skipped without ValueError
+            _write_agy_brain_session(
+                ide_brain, "cid-dot-dir",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Trailing dot dir</USER_REQUEST>"}],
+                mtime=base_t - 10,
+            )
+            _write_agy_brain_session(
+                ide_brain, "cid-bad-uri-skip",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Malformed URI recovery</USER_REQUEST>"}],
+                mtime=base_t - 10,
+            )
+
+            # P1 #1: Transcript containing SYSTEM cwd must NEVER backfill cwd when ide_db_title gives cwd=""
+            tp_empty_cwd = _write_agy_brain_session(
+                ide_brain, "cid-auth-empty-cwd",
+                [
+                    {"source": "SYSTEM", "type": "SYSTEM_PROMPT", "cwd": str(repo_a), "content": f"Working Directory: {repo_a}"},
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Remote task alpha</USER_REQUEST>"},
+                ],
+                mtime=base_t - 5,
+            )
+            # Rich prior in repo_a so we can test switching cid from repo_a -> empty cwd clears prior!
+            _write_agy_brain_session(
+                ide_brain, "cid-prior-repo-a",
+                [
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "Inspect QuartzPriorEngine " + ("x" * 1600)},
+                    {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Updated QuartzPriorEngine " + ("y" * 1600)},
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "Check QuartzPriorEngine2 " + ("x" * 800)},
+                    {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Done QuartzPriorEngine2 " + ("y" * 800)},
+                ],
+                mtime=base_t - 500,
+            )
+
+            rows: list[tuple[object, ...]] = [
+                ("cid-view-a", "Duplicate Foreground Title", json.dumps([repo_a.as_uri()]), "2026-11-23T09:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-bg-b", "Duplicate Foreground Title", json.dumps([repo_b.as_uri()]), "2026-11-23T09:01:40Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-old-221-exact", "Ancient Exact Session 221", json.dumps([repo_a.as_uri()]), "2025-01-01T00:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-old-222-prefix", "Ancient Truncated Prefix Conversation Beyond 220 Rows", json.dumps([repo_b.as_uri()]), "2025-01-01T00:00:01Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-dot-dir", "Trailing Dot Workspace", json.dumps([repo_dot.as_uri()]), "2026-11-23T09:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-bad-uri-skip", "Malformed URI Workspace", json.dumps(["file://[invalid/path", repo_a.as_uri()]), "2026-11-23T09:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                ("cid-prior-repo-a", "Prior Repo A", json.dumps([repo_a.as_uri()]), "2026-11-22T09:00:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+            ]
+            # Insert 220 newer unrelated rows
+            for i in range(220):
+                rows.append((
+                    f"cid-noise-{i:03d}",
+                    f"Unrelated Noise Conversation {i:03d}",
+                    json.dumps([repo_b.as_uri()]),
+                    f"2026-11-23T12:{i // 60:02d}:{i % 60:02d}Z",
+                    "CORTEX_TRAJECTORY_SOURCE_CASCADE",
+                    "",
+                    0,
+                    "",
+                ))
+
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT,
+                        source TEXT,
+                        parent_conversation_id TEXT,
+                        nesting_depth INTEGER,
+                        agent_name TEXT
+                    )
+                    """
+                )
+                conn.executemany("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                conn.commit()
+
+            # Verify P1 #3: ann_mtime (foreground view) beats newer db_lmt (background generation)
+            m_rank = resolve_antigravity_ide_session_by_title("Duplicate Foreground Title", home=home, wsl=False)
+            assert m_rank is not None
+            self.assertEqual((m_rank.session_id, m_rank.cwd), ("cid-view-a", os.path.realpath(repo_a)))
+
+            # Verify P2 #4: SQL pushdown finds row #221 (exact) and #222 (prefix) despite 220 newer unrelated rows
+            m_221 = resolve_antigravity_ide_session_by_title("Ancient Exact Session 221", home=home, wsl=False)
+            assert m_221 is not None
+            self.assertEqual(m_221.session_id, "cid-old-221-exact")
+            m_222 = resolve_antigravity_ide_session_by_title("Ancient Truncated Prefix...", home=home, wsl=False)
+            assert m_222 is not None
+            self.assertEqual(m_222.session_id, "cid-old-222-prefix")
+
+            # Verify P2 #5: Trailing-dot directory preserved (never stripped to 'repo') & bad URI skipped safely
+            m_dot = resolve_antigravity_ide_session_by_title("Trailing Dot Workspace", home=home, wsl=False)
+            assert m_dot is not None
+            self.assertEqual(m_dot.cwd, os.path.realpath(repo_dot))
+            self.assertNotEqual(m_dot.cwd, os.path.realpath(repo_plain))
+
+            m_bad_skip = resolve_antigravity_ide_session_by_title("Malformed URI Workspace", home=home, wsl=False)
+            assert m_bad_skip is not None
+            self.assertEqual(m_bad_skip.cwd, os.path.realpath(repo_a))
+
+            # Verify P1 #1a: First sync with ide_db_title + cwd="" ignores transcript SYSTEM cwd and never scans local git/files
+            env = {"HOME": str(home), "WSL_DISTRO_NAME": "", "WSL_INTEROP": ""}
+            tracker = SessionTracker(home_dir=home, runtime_dir=tmp / "rt1", env=env, proc_root=tmp / "noproc")
+            try:
+                with mock.patch.object(tracker, "_get_git_info", wraps=tracker._get_git_info) as spy_git, mock.patch(
+                    "agent_voice_input.session_ctx.read_workspace_shallow_files",
+                    wraps=read_workspace_shallow_files,
+                ) as spy_shallow:
+                    snap_empty = tracker.sync_ide_session(
+                        SessionMatch(
+                            cli="agy",
+                            session_id="cid-auth-empty-cwd",
+                            jsonl_path=str(tp_empty_cwd),
+                            cwd="",
+                            matched_by="ide_db_title",
+                        )
+                    )
+                    self.assertEqual(snap_empty.match.cwd, "")
+                    st_empty = tracker.get_state(snap_empty.session_key)
+                    assert st_empty is not None
+                    self.assertEqual(st_empty.cwd, "")
+                    self.assertEqual(snap_empty.git_status, "")
+                    self.assertNotIn("LocalOnlySentinel", snap_empty.hotwords)
+                    self.assertEqual(spy_git.call_count, 0)
+                    self.assertEqual(spy_shallow.call_count, 0)
+                    prior_blk, _, git_ctx = tracker.get_refiner_context_with_prior(snap_empty.session_key)
+                    self.assertEqual(prior_blk, "")
+                    self.assertEqual(git_ctx, "")
+            finally:
+                tracker.close()
+
+            # Verify P1 #1b: Same cid transitioning from local workspace -> empty/remote cwd clears cached cwd & prior refs
+            tracker2 = SessionTracker(
+                home_dir=home, runtime_dir=tmp / "rt2", env=env, proc_root=tmp / "noproc", cold_start_fallback="auto"
+            )
+            try:
+                snap_local = tracker2.sync_ide_session(
+                    SessionMatch(
+                        cli="agy",
+                        session_id="cid-auth-empty-cwd",
+                        jsonl_path=str(tp_empty_cwd),
+                        cwd=str(repo_a),
+                        matched_by="ide_db_title",
+                    )
+                )
+                self.assertEqual(snap_local.match.cwd, str(repo_a))
+                self.assertTrue(snap_local.prior_hotwords_used)
+                self.assertIn("QuartzPriorEngine", snap_local.hotwords)
+                prior_before, _, git_before = tracker2.get_refiner_context_with_prior(snap_local.session_key)
+                self.assertIn("QuartzPriorEngine", prior_before)
+                self.assertIn("LocalOnlySentinel.py", git_before)
+
+                with mock.patch.object(tracker2, "_get_git_info", wraps=tracker2._get_git_info) as spy_git2:
+                    snap_cleared = tracker2.sync_ide_session(
+                        SessionMatch(
+                            cli="agy",
+                            session_id="cid-auth-empty-cwd",
+                            jsonl_path=str(tp_empty_cwd),
+                            cwd="",
+                            matched_by="ide_db_title",
+                        )
+                    )
+                    self.assertEqual(snap_cleared.match.cwd, "")
+                    self.assertFalse(snap_cleared.prior_hotwords_used)
+                    self.assertNotIn("QuartzPriorEngine", snap_cleared.hotwords)
+                    self.assertNotIn("LocalOnlySentinel", snap_cleared.hotwords)
+                    self.assertEqual(spy_git2.call_count, 0)
+                    st_after = tracker2.get_state(snap_cleared.session_key)
+                    assert st_after is not None
+                    self.assertEqual(st_after.cwd, "")
+                    self.assertEqual(st_after.cold_start_prior_chunk, "")
+                    self.assertEqual(st_after.cold_start_prior_hotwords, ())
+                    prior_after, _, git_after = tracker2.get_refiner_context_with_prior(snap_cleared.session_key)
+                    self.assertEqual(prior_after, "")
+                    self.assertEqual(git_after, "")
+            finally:
+                tracker2.close()
+
+    def test_agy20_round2_concurrent_empty_cwd_placeholder_51_prefix_fullwidth_and_wsl_uri(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            repo_a = home / "repos" / "proj-a"
+            repo_new_chat = home / "repos" / "New Chat"
+            repo_wsl_dot = home / "repos" / "wsl-proj."
+            for d in (repo_a, repo_new_chat, repo_wsl_dot):
+                d.mkdir(parents=True)
+            (repo_new_chat / "NewChatSecret.py").write_text("x = 1\n", encoding="utf-8")
+            (repo_new_chat / "main.py").write_text("y = 2\n", encoding="utf-8")
+
+            ide_root = home / ".gemini" / "antigravity"
+            ide_brain = ide_root / "brain"
+            db_path = ide_root / "conversation_summaries.db"
+            base_t = 1_795_424_400.0
+
+            def _write_pb(cid: str, mtime: float) -> None:
+                p = ide_root / "annotations" / f"{cid}.pbtxt"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("viewed {}\n", encoding="utf-8")
+                os.utime(p, (mtime, mtime))
+
+            rows: list[tuple[object, ...]] = []
+            # 3a) 51 sessions sharing the same display prefix; the OLDEST #51 has newest annotations/<cid>.pbtxt mtime
+            for i in range(51):
+                cid = f"cid-pfx-{i:02d}"
+                _write_agy_brain_session(
+                    ide_brain,
+                    cid,
+                    [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": f"<USER_REQUEST>Prefix item {i}</USER_REQUEST>"}],
+                    mtime=base_t + (50 - i),
+                )
+                # Make i==50 the oldest DB row yet the most recently viewed in annotations/
+                lmt_sec = 50 - i
+                rows.append((
+                    cid,
+                    f"Shared Display Prefix Conversation Item {i:02d}",
+                    json.dumps([repo_a.as_uri()]),
+                    f"2026-11-23T09:00:{lmt_sec:02d}Z",
+                    "CORTEX_TRAJECTORY_SOURCE_CASCADE",
+                    "",
+                    0,
+                    "",
+                ))
+                _write_pb(cid, base_t + (500 if i == 50 else i))
+
+            # 3b) Fullwidth ideographic whitespace around DB title
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-fullwidth",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>全角空格标题</USER_REQUEST>"}],
+                mtime=base_t,
+            )
+            rows.append((
+                "cid-fullwidth",
+                "\u3000中文标题\u3000",
+                json.dumps([repo_a.as_uri()]),
+                "2026-11-23T09:10:00Z",
+                "CORTEX_TRAJECTORY_SOURCE_CASCADE",
+                "",
+                0,
+                "",
+            ))
+
+            # 4) WSL vscode-remote://wsl+Ubuntu/... structured URI (preserving trailing dot; rejecting ssh-remote+)
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-wsl-uri",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>WSL workspace</USER_REQUEST>"}],
+                mtime=base_t,
+            )
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-ssh-uri",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>SSH workspace</USER_REQUEST>"}],
+                mtime=base_t,
+            )
+            wsl_uri = f"vscode-remote://wsl+Ubuntu{repo_wsl_dot}"
+            rows.append((
+                "cid-wsl-uri",
+                "WSL Structured Workspace",
+                json.dumps(["vscode-remote://wsl+Ubuntu/mnt/c/Users/demo/slow", wsl_uri]),
+                "2026-11-23T09:11:00Z",
+                "CORTEX_TRAJECTORY_SOURCE_CASCADE",
+                "",
+                0,
+                "",
+            ))
+            rows.append((
+                "cid-ssh-uri",
+                "SSH Structured Workspace",
+                json.dumps(["vscode-remote://ssh-remote+prod/srv/project"]),
+                "2026-11-23T09:12:00Z",
+                "CORTEX_TRAJECTORY_SOURCE_CASCADE",
+                "",
+                0,
+                "",
+            ))
+
+            # 1) Prepare prior & current session for deterministic concurrent empty-cwd writeback race
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-race-prior",
+                [
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "Inspect RaceGuardEngine " + ("x" * 1600)},
+                    {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Updated RaceGuardEngine " + ("y" * 1600)},
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "Verify RaceGuardEngine2 " + ("x" * 800)},
+                    {"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Done RaceGuardEngine2 " + ("y" * 800)},
+                ],
+                mtime=base_t - 500,
+            )
+            tp_race_cur = _write_agy_brain_session(
+                ide_brain,
+                "cid-race-cur",
+                [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Cold race start</USER_REQUEST>"}],
+                mtime=base_t - 10,
+            )
+            rows.append((
+                "cid-race-prior",
+                "Race Prior Session",
+                json.dumps([repo_a.as_uri()]),
+                "2026-11-22T09:00:00Z",
+                "CORTEX_TRAJECTORY_SOURCE_CASCADE",
+                "",
+                0,
+                "",
+            ))
+
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT,
+                        source TEXT,
+                        parent_conversation_id TEXT,
+                        nesting_depth INTEGER,
+                        agent_name TEXT
+                    )
+                    """
+                )
+                conn.executemany("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                conn.commit()
+
+            # Verify 3a: 51st (oldest) prefix candidate with newest pbtxt mtime wins (no LIMIT 50 truncation)
+            m_51 = resolve_antigravity_ide_session_by_title("Shared Display Prefix...", home=home, wsl=False)
+            assert m_51 is not None
+            self.assertEqual(m_51.session_id, "cid-pfx-50")
+
+            # Verify 3b: Fullwidth whitespace stripped consistently with Python str.strip()
+            m_fw = resolve_antigravity_ide_session_by_title("中文标题", home=home, wsl=False)
+            assert m_fw is not None
+            self.assertEqual(m_fw.session_id, "cid-fullwidth")
+
+            # Verify 4: WSL vscode-remote://wsl+... resolves on WSL (preserving trailing dot), rejects ssh-remote+ & non-WSL
+            m_wsl = resolve_antigravity_ide_session_by_title("WSL Structured Workspace", home=home, wsl=True)
+            assert m_wsl is not None
+            self.assertEqual(m_wsl.cwd, os.path.realpath(repo_wsl_dot))
+            m_wsl_nonhost = resolve_antigravity_ide_session_by_title("WSL Structured Workspace", home=home, wsl=False)
+            assert m_wsl_nonhost is not None
+            self.assertEqual(m_wsl_nonhost.cwd, "")
+            m_ssh = resolve_antigravity_ide_session_by_title("SSH Structured Workspace", home=home, wsl=True)
+            assert m_ssh is not None
+            self.assertEqual(m_ssh.cwd, "")
+
+            # Verify 1: Deterministic concurrent interleave — switching cid to cwd="" mid-discovery blocks stale prior writeback
+            env = {"HOME": str(home), "OPENROUTER_API_KEY": "sk-or-test", "WSL_DISTRO_NAME": "", "WSL_INTEROP": ""}
+            tracker_race = SessionTracker(
+                home_dir=home, runtime_dir=tmp / "rt_race", env=env, proc_root=tmp / "noproc", cold_start_fallback="auto"
+            )
+            try:
+                entered_query = threading.Event()
+                release_query = threading.Event()
+                orig_get_prior = tracker_race._get_prior_candidates_cached
+
+                def _blocking_get_prior(cwd: str, *, scope: str = "cli"):
+                    res = orig_get_prior(cwd, scope=scope)
+                    entered_query.set()
+                    release_query.wait(timeout=5.0)
+                    return res
+
+                t_exc: list[BaseException] = []
+
+                def _thread_a() -> None:
+                    try:
+                        tracker_race.sync_ide_session(
+                            SessionMatch(
+                                cli="agy",
+                                session_id="cid-race-cur",
+                                jsonl_path=str(tp_race_cur),
+                                cwd=str(repo_a),
+                                matched_by="ide_db_title",
+                            ),
+                            include_git_info=False,
+                        )
+                    except BaseException as exc:
+                        t_exc.append(exc)
+
+                with mock.patch.object(tracker_race, "_get_prior_candidates_cached", side_effect=_blocking_get_prior):
+                    th = threading.Thread(target=_thread_a)
+                    th.start()
+                    self.assertTrue(entered_query.wait(timeout=5.0))
+                    # Thread B transitions same cid to authoritative empty cwd="" while Thread A's prior query is in flight
+                    tracker_race.sync_ide_session(
+                        SessionMatch(
+                            cli="agy",
+                            session_id="cid-race-cur",
+                            jsonl_path=str(tp_race_cur),
+                            cwd="",
+                            matched_by="ide_db_title",
+                        ),
+                        include_git_info=False,
+                    )
+                    release_query.set()
+                    th.join(timeout=5.0)
+                self.assertEqual(t_exc, [])
+                st_race = tracker_race.get_state("agy:cid-race-cur")
+                assert st_race is not None
+                self.assertEqual(st_race.cwd, "")
+                self.assertEqual(st_race.cold_start_prior_chunk, "")
+                self.assertEqual(st_race.cold_start_prior_hotwords, ())
+            finally:
+                tracker_race.close()
+
+            # Verify 2: Bare placeholder "New Chat" (no document) does NOT fall back to ~/repos/New Chat,
+            # while multi-segment legacy title & explicit document still bind ~/repos/New Chat!
+            cfg = Config()
+            cfg.refiner.provider = "openrouter"
+            rt_ph = tmp / "rt_ph"
+            rt_ph.mkdir(mode=0o700)
+            tracker_ph = SessionTracker(home_dir=home, runtime_dir=rt_ph, env=env, proc_root=tmp / "noproc")
+            seen_msgs: list[str] = []
+
+            def _transport(req: HttpRequest) -> HttpResponse:
+                seen_msgs.append(str(json.loads(req.body.decode("utf-8"))["messages"][-1]["content"]))
+                return _json_resp({"choices": [{"message": {"content": "好的。"}}]})
+
+            refiner = OpenAICompatibleRefiner(
+                cfg, resolve_credentials(cfg, env), provider_name="openrouter", env=env, transport=_transport
+            )
+            asr = _DummyAsr("测试文本", env=env)
+            try:
+                win_bare = ForegroundWindow(701, "Antigravity", "New Chat", bundle_id="com.google.antigravity")
+                res_bare = run_pipeline_once(
+                    _voiced_wav(), cfg=cfg, tracker=tracker_ph, asr_provider=asr, refiner=refiner,
+                    platform=_DummyPlatform(win_bare), origin_window=win_bare, audio_source="winmm", dry_run=True, env=env,
+                )
+                self.assertTrue(res_bare.ok)
+                self.assertIsNone(res_bare.session)
+                self.assertNotIn("NewChatSecret", asr.seen_contexts[-1].hotwords)
+                self.assertNotIn("NewChatSecret.py", seen_msgs[-1])
+
+                win_legacy = ForegroundWindow(
+                    702, "Antigravity", "main.py — New Chat — Antigravity", bundle_id="com.google.antigravity"
+                )
+                res_legacy = run_pipeline_once(
+                    _voiced_wav(), cfg=cfg, tracker=tracker_ph, asr_provider=asr, refiner=refiner,
+                    platform=_DummyPlatform(win_legacy), origin_window=win_legacy, audio_source="winmm", dry_run=True, env=env,
+                )
+                self.assertTrue(res_legacy.ok)
+                self.assertIn("NewChatSecret", asr.seen_contexts[-1].hotwords)
+                self.assertIn("NewChatSecret.py", seen_msgs[-1])
+
+                win_with_doc = ForegroundWindow(
+                    703, "Antigravity", "New Chat", bundle_id="com.google.antigravity",
+                    document=(repo_new_chat / "main.py").as_uri(),
+                )
+                res_doc = run_pipeline_once(
+                    _voiced_wav(), cfg=cfg, tracker=tracker_ph, asr_provider=asr, refiner=refiner,
+                    platform=_DummyPlatform(win_with_doc), origin_window=win_with_doc, audio_source="winmm", dry_run=True, env=env,
+                )
+                self.assertTrue(res_doc.ok)
+                self.assertIn("NewChatSecret", asr.seen_contexts[-1].hotwords)
+                self.assertIn("NewChatSecret.py", seen_msgs[-1])
+            finally:
+                tracker_ph.close()
 
 
 if __name__ == "__main__":
