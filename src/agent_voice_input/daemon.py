@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field, replace
-import concurrent.futures, copy, errno, fcntl, hashlib, inspect, json, math, os, signal, socket, stat, sys, threading, time
+import concurrent.futures, copy, errno, fcntl, hashlib, inspect, json, math, os, select, signal, socket, stat, sys, threading, time
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -822,6 +822,36 @@ def _call_asr_transcribe(
     if cancel_token is not None and ("cancel_token" in params or has_var_kw):
         kw["cancel_token"] = cancel_token
     return eff_asr.transcribe(wav_bytes, **kw)
+
+
+class _IsolatedSessionTrackerView:
+    """Read-only tracker view mapping empty ``session_key`` lookups to a fixed snapshot key."""
+
+    def __init__(self, inner: SessionTracker, bound_session_key: str) -> None:
+        self._inner = inner
+        self._bound_session_key = bound_session_key
+
+    def _eff_key(self, session_key: str) -> str:
+        return session_key or self._bound_session_key
+
+    def get_refiner_context_with_prior(self, session_key: str, *args: Any, **kwargs: Any) -> Any:
+        fn = getattr(self._inner, "get_refiner_context_with_prior", None)
+        if callable(fn):
+            return fn(self._eff_key(session_key), *args, **kwargs)
+        raw_chunks, git_ctx = self._inner.get_refiner_context(
+            self._eff_key(session_key),
+            **{k: v for k, v in kwargs.items() if k != "allow_prior"},
+        )
+        return "", raw_chunks, git_ctx
+
+    def get_refiner_context(self, session_key: str, *args: Any, **kwargs: Any) -> Any:
+        return self._inner.get_refiner_context(self._eff_key(session_key), *args, **kwargs)
+
+    def get_state(self, session_key: str) -> Any:
+        return self._inner.get_state(self._eff_key(session_key))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
 
 def _call_refiner_refine(
@@ -1675,6 +1705,7 @@ def run_pipeline_once(
     mode: str = "auto",
     queue_wait_ms: int = 0,
     known_cwds_override: Sequence[str] | None = None,
+    isolate_refiner_session: bool = False,
 ) -> PipelineResult:
     eff_env = os.environ if env is None else env
     eff_creds = creds or resolve_credentials(cfg, eff_env)
@@ -1790,16 +1821,38 @@ def run_pipeline_once(
             assert st.asr_res is not None
             if _will_run_stage2_refiner(cfg, eff_refiner, st.asr_res) and on_stage is not None:
                 on_stage("refining")
+            real_skey = st.snap.session_key if st.snap else ""
+            ref_session_key = "" if isolate_refiner_session else real_skey
+            ref_tracker: Any = eff_tracker
+            ref_workspace_cwd = st.workspace_cwd
+            ref_fallback_ctx = st.asr_ctx_dialog
+            if isolate_refiner_session and real_skey:
+                # Deliberate exception: pass empty session_key so stateful refiners (e.g. AgyRefiner)
+                # run statelessly without touching/evicting live session slots while keeping real st.snap context.
+                ref_tracker = _IsolatedSessionTrackerView(eff_tracker, real_skey)
+                if not ref_workspace_cwd and st.snap is not None and st.snap.match.cwd:
+                    ref_workspace_cwd = st.snap.match.cwd
+                if not ref_workspace_cwd and st.eff_mode != "general":
+                    try:
+                        raw_chunks, _ = eff_tracker.get_refiner_context(
+                            real_skey,
+                            max_chars=max(0, int(cfg.refiner.context_max_chars)),
+                            include_git_status=False,
+                        )
+                        if raw_chunks:
+                            ref_fallback_ctx = "\n\n".join(raw_chunks)
+                    except Exception:
+                        pass
             ref_res = _call_refiner_refine(
                 eff_refiner,
                 st.asr_res,
-                session_key=st.snap.session_key if st.snap else "",
-                tracker=eff_tracker,
-                fallback_context=st.asr_ctx_dialog,
+                session_key=ref_session_key,
+                tracker=ref_tracker,
+                fallback_context=ref_fallback_ctx,
                 is_cancelled=cancel_check,
                 cancel_token=cancel_token,
                 mode=st.eff_mode,
-                workspace_cwd=st.workspace_cwd,
+                workspace_cwd=ref_workspace_cwd,
                 target_hint=st.target_hint,
             )
             cand_text = (ref_res.text.strip() if ref_res else "") or st.asr_res.text.strip()
@@ -1923,45 +1976,46 @@ def run_pipeline_once(
 CONTROL_RESPONSE_MAX_BYTES: int = 1_048_576
 CONTROL_REQUEST_MAX_BYTES: int = 256 * 1024
 CONTROL_REQUEST_READ_TIMEOUT_SEC: float = 2.0
+CONTROL_MAX_TIMEOUT_SEC: float = 86_400.0
 _BRIDGE_ASSET_NAMES: tuple[str, ...] = ("mac_shim.swift", "win_shim.ps1")
 
 
 def _parse_optional_timeout_sec(raw: Any) -> float | None:
-    if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
+    if raw is None:
         return None
-    val = float(raw)
-    if not math.isfinite(val):
-        return None
-    return max(0.0, val)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("timeout_sec must be a finite non-negative number")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("timeout_sec out of range") from exc
+    if not math.isfinite(val) or val < 0.0 or val > CONTROL_MAX_TIMEOUT_SEC:
+        raise ValueError(f"timeout_sec must be between 0 and {CONTROL_MAX_TIMEOUT_SEC:g}")
+    return val
 
 
 def _is_control_peer_disconnected(conn: socket.socket | None) -> bool:
     if conn is None:
         return False
-    prev_timeout: float | None = None
-    changed_timeout = False
-    try:
-        if conn.fileno() < 0:
-            return True
-        prev_timeout = conn.gettimeout()
-        if prev_timeout != 0.0:
-            conn.settimeout(0.0)
-            changed_timeout = True
-        flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
-        data = conn.recv(1, flags)
-        return len(data) == 0
-    except (BlockingIOError, InterruptedError, TimeoutError, socket.timeout):
+    poll_factory = getattr(select, "poll", None)
+    if poll_factory is None:
         return False
-    except OSError as exc:
-        if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
-            return False
+    try:
+        fd = conn.fileno()
+        if fd < 0:
+            return True
+        hangup_mask = (
+            getattr(select, "POLLHUP", 0)
+            | getattr(select, "POLLERR", 0)
+            | getattr(select, "POLLNVAL", 0)
+        )
+        poller = poll_factory()
+        poller.register(fd, hangup_mask)
+        return any(bool(revents & hangup_mask) for _, revents in poller.poll(0))
+    except (InterruptedError, BlockingIOError, TimeoutError, socket.timeout):
+        return False
+    except (OSError, ValueError):
         return True
-    finally:
-        if changed_timeout:
-            try:
-                conn.settimeout(prev_timeout)
-            except OSError:
-                pass
 
 
 def _recv_control_request_line(
@@ -4488,7 +4542,10 @@ class VoiceInputDaemon:
             return {"ok": False, "error": "daemon stopping"}
         eff_deadline = deadline
         if eff_deadline is None:
-            parsed_timeout = _parse_optional_timeout_sec(req.get("timeout_sec"))
+            try:
+                parsed_timeout = _parse_optional_timeout_sec(req.get("timeout_sec"))
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
             if parsed_timeout is not None:
                 eff_deadline = time.monotonic() + parsed_timeout
         raw_deliver = req.get("deliver", False)
@@ -4605,6 +4662,7 @@ class VoiceInputDaemon:
                 env=self.env,
                 mode=str(req.get("mode") or "auto"),
                 known_cwds_override=known_cwds_snap,
+                isolate_refiner_session=True,
             )
             summary = self._build_summary(cur_seq, res, dry_run=(not deliver), audio_error="")
             if not no_telemetry and not self._stop_evt.is_set():
@@ -4749,85 +4807,98 @@ class VoiceInputDaemon:
             self._send_control_reply(conn, {"ok": False, "error": "daemon stopping"})
             return False
         is_selftest = cmd == "selftest_wav"
+        req_deadline: float | None = None
+        if is_selftest:
+            try:
+                parsed_timeout = _parse_optional_timeout_sec(req.get("timeout_sec"))
+            except ValueError as exc:
+                self._send_control_reply(conn, {"ok": False, "error": str(exc)})
+                return False
+            if parsed_timeout is not None:
+                req_deadline = time.monotonic() + parsed_timeout
         gate = self._selftest_lock if is_selftest else self._probe_sem
         if not gate.acquire(blocking=False):
             self._send_control_reply(conn, {"ok": False, "error": f"{cmd} busy"})
             return False
-        cancel_tok = CancelToken()
-        conn_closed_evt = threading.Event()
-        req_deadline: float | None = None
-        if is_selftest:
-            try:
-                conn.settimeout(0.0)
-            except OSError:
-                pass
-            parsed_timeout = _parse_optional_timeout_sec(req.get("timeout_sec"))
-            if parsed_timeout is not None:
-                req_deadline = time.monotonic() + parsed_timeout
+        gate_held = True
 
-        def _peer_disconnected() -> bool:
-            return conn_closed_evt.is_set() or _is_control_peer_disconnected(conn)
-
-        def _worker() -> None:
-            released = False
-            try:
-                try:
-                    resp = (
-                        self._execute_selftest_wav(
-                            req,
-                            cancel_token=cancel_tok,
-                            deadline=req_deadline,
-                            peer_disconnected=_peer_disconnected,
-                        )
-                        if is_selftest
-                        else self._execute_probe_route(req, cancel_token=cancel_tok)
-                    )
-                except Exception as exc:
-                    resp = {"ok": False, "error": self._redact(exc)}
-                with self._lock:
-                    self._control_cancel_tokens.discard(cancel_tok)
+        def _release_gate() -> None:
+            nonlocal gate_held
+            if gate_held:
+                gate_held = False
                 gate.release()
-                released = True
-                self._send_control_reply(conn, resp)
-            finally:
-                conn_closed_evt.set()
-                try:
-                    conn.close()
-                except OSError:
-                    pass
-                with self._lock:
-                    self._control_threads.discard(threading.current_thread())
-                    self._control_cancel_tokens.discard(cancel_tok)
-                if not released:
-                    gate.release()
 
-        th = threading.Thread(
-            target=_worker,
-            name="avi-selftest-wav" if is_selftest else "avi-probe-route",
-            daemon=True,
-        )
-        stopping = False
-        with self._lock:
-            if self._stop_evt.is_set():
-                stopping = True
-            else:
-                self._control_threads = {t for t in self._control_threads if t.is_alive()}
-                self._control_threads.add(th)
-                self._control_cancel_tokens.add(cancel_tok)
-        if stopping:
-            gate.release()
-            self._send_control_reply(conn, {"ok": False, "error": "daemon stopping"})
-            return False
+        cancel_tok = CancelToken()
+        th: threading.Thread | None = None
         try:
+            conn_closed_evt = threading.Event()
+
+            def _peer_disconnected() -> bool:
+                return conn_closed_evt.is_set() or _is_control_peer_disconnected(conn)
+
+            def _worker() -> None:
+                released = False
+                try:
+                    try:
+                        resp = (
+                            self._execute_selftest_wav(
+                                req,
+                                cancel_token=cancel_tok,
+                                deadline=req_deadline,
+                                peer_disconnected=_peer_disconnected,
+                            )
+                            if is_selftest
+                            else self._execute_probe_route(req, cancel_token=cancel_tok)
+                        )
+                    except Exception as exc:
+                        resp = {"ok": False, "error": self._redact(exc)}
+                    with self._lock:
+                        self._control_cancel_tokens.discard(cancel_tok)
+                    gate.release()
+                    released = True
+                    self._send_control_reply(conn, resp)
+                finally:
+                    conn_closed_evt.set()
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    with self._lock:
+                        self._control_threads.discard(threading.current_thread())
+                        self._control_cancel_tokens.discard(cancel_tok)
+                    if not released:
+                        gate.release()
+
+            th = threading.Thread(
+                target=_worker,
+                name="avi-selftest-wav" if is_selftest else "avi-probe-route",
+                daemon=True,
+            )
+            stopping = False
+            with self._lock:
+                if self._stop_evt.is_set():
+                    stopping = True
+                else:
+                    self._control_threads = {t for t in self._control_threads if t.is_alive()}
+                    self._control_threads.add(th)
+                    self._control_cancel_tokens.add(cancel_tok)
+            if stopping:
+                _release_gate()
+                self._send_control_reply(conn, {"ok": False, "error": "daemon stopping"})
+                return False
             th.start()
+            gate_held = False
             return True
         except Exception as exc:
             with self._lock:
-                self._control_threads.discard(th)
+                if th is not None:
+                    self._control_threads.discard(th)
                 self._control_cancel_tokens.discard(cancel_tok)
-            gate.release()
+            _release_gate()
             self._send_control_reply(conn, {"ok": False, "error": self._redact(exc)})
             return False
+        finally:
+            _release_gate()
 
     def _handle_power_resume(self, m: Mapping[str, Any] | None = None) -> dict[str, Any]:
         _ = m

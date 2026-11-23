@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Lightweight standalone OSC 2 title hook for headless remote Linux hosts without agent-voice-input installed.
 # Usage:
 #   Claude Code (~/.claude/settings.json):  ~/.local/bin/remote-title-hook.sh claude

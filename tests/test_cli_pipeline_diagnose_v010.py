@@ -911,6 +911,7 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                     "seq_id": 3,
                     "ok": False,
                     "skipped_reason": "asr_error",
+                    "asr_request_id": "free text prose leaked from legacy telemetry",
                     "error": f"bad auth {secret_key}",
                     "saved_audio": str(rt / "failed" / "secret-user-path.wav"),
                 },
@@ -969,6 +970,23 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
             self.assertEqual(data["recent_results"][1]["asr_duration_ms"], 1850)
             self.assertIn("[REDACTED]", data["recent_results"][1]["asr_request_id"])
             self.assertNotIn(secret_key, data["recent_results"][1]["asr_request_id"])
+            self.assertNotIn("asr_request_id", data["recent_results"][2])
+            self.assertNotIn("free text prose leaked", raw_j)
+            from agent_voice_input.diagnose import _sanitize_telemetry_record
+            san_valid = _sanitize_telemetry_record(
+                {"asr_request_id": "req_123:abc/def.456-789"}, lambda s: s
+            )
+            self.assertEqual(san_valid["asr_request_id"], "req_123:abc/def.456-789")
+            for bad_req_id in (
+                "contains space",
+                "line1\nline2",
+                "用户口述隐私文本",
+                "a" * 129,
+                "req?token=1",
+            ):
+                with self.subTest(bad_asr_request_id=bad_req_id[:24]):
+                    san_bad = _sanitize_telemetry_record({"asr_request_id": bad_req_id}, lambda s: s)
+                    self.assertNotIn("asr_request_id", san_bad)
             self.assertTrue(all(len(ln) <= 241 for ln in data["daemon_log_tail"].splitlines()))
             self.assertEqual(data["summary"]["total"], 3)
             self.assertEqual(data["summary"]["ok_count"], 2)
@@ -1076,9 +1094,21 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
         self.assertTrue(msg.startswith("FAIL ("))
         self.assertNotIn(secret, msg)
 
-        # 2. P2-remote-hook: works under stripped PATH="" and exits cleanly with {} for agy/gemini if python3 missing
+        # 2. P2-remote-hook: direct execution (shebang #!/bin/sh, not via /bin/bash) works under stripped PATH=""
         hook_sh = Path(__file__).resolve().parents[1] / "integrations" / "remote" / "remote-title-hook.sh"
-        bash_bin = "/bin/bash" if os.path.isfile("/bin/bash") else "/usr/bin/bash"
+        self.assertTrue(hook_sh.read_text(encoding="utf-8").startswith("#!/bin/sh\n"))
+        p_direct_bare = subprocess.run(
+            [str(hook_sh), "agy"],
+            input=b"{}",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": ""},
+            timeout=5.0,
+            check=False,
+        )
+        self.assertEqual(p_direct_bare.returncode, 0, msg=p_direct_bare.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(json.loads(p_direct_bare.stdout.decode("utf-8")), {})
+
         with tempfile.TemporaryDirectory() as td:
             proj = Path(td) / "demo-repo"
             proj.mkdir()
@@ -1087,7 +1117,7 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                 slave_tty = os.ttyname(slave_fd)
                 os.set_blocking(master_fd, False)
                 p_agy = subprocess.run(
-                    [bash_bin, str(hook_sh), "agy"],
+                    [str(hook_sh), "agy"],
                     input=json.dumps(
                         {"conversationId": "abcdef12-1111-4222-8333-444455556666", "workspacePaths": [str(proj)]}
                     ).encode("utf-8"),
@@ -1113,7 +1143,8 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                 os.close(master_fd)
                 os.close(slave_fd)
 
-        # Missing python3 fallback: agy/gemini emit {} and exit 0; claude/auto stay silent and exit 0
+        # Missing python3 fallback under POSIX /bin/sh & bash: agy/gemini emit {} and exit 0; claude/auto stay silent and exit 0
+        bash_bin = "/bin/bash" if os.path.isfile("/bin/bash") else "/usr/bin/bash"
         wrapper = (
             'command() { if [ "${1:-}" = "-v" ] && [ "${2:-}" = "python3" ]; then return 1; fi; '
             'builtin command "$@"; }; '

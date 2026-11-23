@@ -11780,6 +11780,414 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 daemon.close()
                 srv_th.join(timeout=2.0)
 
+    def test_control_peer_disconnected_distinguishes_shut_wr_from_close_and_e2e_delivery(self) -> None:
+        import select
+        import socket
+        from unittest import mock
+        from agent_voice_input.daemon import _is_control_peer_disconnected
+
+        # 1. Direct socketpair verification: SHUT_WR must NOT be treated as disconnect; close() MUST be.
+        srv_end, cli_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.assertFalse(_is_control_peer_disconnected(None))
+            self.assertFalse(_is_control_peer_disconnected(srv_end))
+            cli_end.sendall(b'{"cmd":"status"}\n')
+            cli_end.shutdown(socket.SHUT_WR)
+            self.assertEqual(srv_end.recv(1024), b'{"cmd":"status"}\n')
+            self.assertFalse(
+                _is_control_peer_disconnected(srv_end),
+                "Client half-close shutdown(SHUT_WR) must NOT be treated as disconnected",
+            )
+            with mock.patch.object(select, "poll", None, create=True):
+                self.assertFalse(_is_control_peer_disconnected(srv_end))
+            cli_end.close()
+            time.sleep(0.02)
+            self.assertTrue(
+                _is_control_peer_disconnected(srv_end),
+                "Full client close() MUST be detected as disconnected",
+            )
+        finally:
+            srv_end.close()
+            cli_end.close()
+
+        # 2. End-to-end against real control.sock:
+        #    (a) client sends selftest_wav + shutdown(SHUT_WR) -> succeeds & pastes normally;
+        #    (b) client sends selftest_wav + close() while ASR is gated -> late paste is blocked.
+        class _GatedAsr(BaseAsrProvider):
+            provider_name = "dashscope"
+
+            def __init__(self) -> None:
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.release.set()
+
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **kw: object) -> AsrResult:
+                del wav_bytes, context, kw
+                self.entered.set()
+                self.release.wait(timeout=5.0)
+                return AsrResult("半关闭正常投递测试", "dashscope", "mock", 5)
+
+        class _RecordDeliverPlatform(_FakePlatform):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fg = ForegroundWindow(hwnd=909, process="WindowsTerminal.exe", title="codex")
+                self.deliver_calls: list[str] = []
+
+            def get_foreground_window(self) -> ForegroundWindow:
+                return self.fg
+
+            def deliver_text(self, text: str, seq_id: int, target_hwnd: int = 0, **kw: object) -> PasteOutcome:
+                del seq_id, target_hwnd, kw
+                self.deliver_calls.append(text)
+                return PasteOutcome(True, True, "ok", self.fg.process, used_clipboard_paste=True)
+
+        with tempfile.TemporaryDirectory(prefix="avi-shutwr-", dir="/tmp") as td:
+            rt = Path(td)
+            os.chmod(rt, 0o700)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            plat = _RecordDeliverPlatform()
+            asr = _GatedAsr()
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=asr,
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            try:
+                _wait_for_control_socket(rt)
+                payload = (
+                    json.dumps(
+                        {
+                            "cmd": "selftest_wav",
+                            "wav_path": str(wav_file),
+                            "use_live_window": True,
+                            "deliver": True,
+                            "no_telemetry": True,
+                            "timeout_sec": 10.0,
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8")
+
+                # (a) Half-close SHUT_WR client (like socat/nc) MUST receive ok=True and deliver normally
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s_half:
+                    s_half.settimeout(3.0)
+                    s_half.connect(str(rt / "control.sock"))
+                    s_half.sendall(payload)
+                    s_half.shutdown(socket.SHUT_WR)
+                    buf = b""
+                    while b"\n" not in buf and (chunk := s_half.recv(16384)):
+                        buf += chunk
+                resp_half = json.loads(buf.decode("utf-8").strip())
+                self.assertTrue(resp_half.get("ok"), resp_half)
+                self.assertTrue(resp_half.get("pasted"), resp_half)
+                self.assertEqual(plat.deliver_calls, ["半关闭正常投递测试"])
+
+                # (b) Full close() while ASR is blocked MUST block late paste
+                plat.deliver_calls.clear()
+                asr.entered.clear()
+                asr.release.clear()
+                s_close = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    s_close.settimeout(2.0)
+                    s_close.connect(str(rt / "control.sock"))
+                    s_close.sendall(payload)
+                    self.assertTrue(asr.entered.wait(timeout=2.0))
+                finally:
+                    s_close.close()
+                time.sleep(0.03)
+                asr.release.set()
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    if daemon._selftest_lock.acquire(blocking=False):
+                        daemon._selftest_lock.release()
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(
+                    plat.deliver_calls,
+                    [],
+                    "Full close() peer disconnect must still block late paste",
+                )
+            finally:
+                asr.release.set()
+                daemon.close()
+                srv_th.join(timeout=2.0)
+
+    def test_selftest_wav_invalid_or_overflow_timeout_sec_rejects_cleanly_without_locking_gate(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory(prefix="avi-to-", dir="/tmp") as td:
+            rt = Path(td)
+            os.chmod(rt, 0o700)
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={},
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("正常自检"),
+                refiner=create_refiner(cfg),
+                tracker=_isolated_tracker(rt),
+            )
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            try:
+                _wait_for_control_socket(rt)
+
+                # Huge integer (10**400 triggers OverflowError in float()), huge finite float, negative, bool, string
+                for bad_timeout in (10**400, 1e300, -1.0, True, "5"):
+                    with self.subTest(bad_timeout=repr(bad_timeout)[:32]):
+                        resp_bad = send_control_command(
+                            rt,
+                            {
+                                "cmd": "selftest_wav",
+                                "wav_path": str(wav_file),
+                                "no_telemetry": True,
+                                "timeout_sec": bad_timeout,
+                            },
+                            timeout_sec=2.0,
+                        )
+                        self.assertFalse(resp_bad.get("ok"), resp_bad)
+                        self.assertIn("timeout_sec", str(resp_bad.get("error") or ""))
+
+                # Synchronous handle_control path also rejects overflow cleanly without leaking _selftest_lock
+                sync_bad = daemon.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "no_telemetry": True,
+                        "timeout_sec": 10**400,
+                    }
+                )
+                self.assertFalse(sync_bad.get("ok"), sync_bad)
+                self.assertIn("timeout_sec", str(sync_bad.get("error") or ""))
+
+                # Even if Thread.start raises after acquiring gate, gate must be released cleanly
+                with mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("thread_spawn_boom")):
+                    resp_boom = send_control_command(
+                        rt,
+                        {
+                            "cmd": "selftest_wav",
+                            "wav_path": str(wav_file),
+                            "no_telemetry": True,
+                            "timeout_sec": 5.0,
+                        },
+                        timeout_sec=2.0,
+                    )
+                self.assertFalse(resp_boom.get("ok"), resp_boom)
+                self.assertIn("thread_spawn_boom", str(resp_boom.get("error") or ""))
+
+                # Subsequent valid selftest_wav MUST succeed (never stuck on "selftest_wav busy")
+                resp_ok = send_control_command(
+                    rt,
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "no_telemetry": True,
+                        "timeout_sec": 5.0,
+                    },
+                    timeout_sec=3.0,
+                )
+                self.assertTrue(resp_ok.get("ok"), resp_ok)
+                self.assertEqual(resp_ok.get("final_text"), "正常自检")
+            finally:
+                daemon.close()
+                srv_th.join(timeout=2.0)
+
+    def test_selftest_wav_isolates_refiner_session_slot_while_preserving_real_session_context(self) -> None:
+        from unittest import mock
+        from agent_voice_input.refiner import (
+            AgyRefiner,
+            BaseRefiner,
+            _AgyThreadState,
+            build_refiner_request_blocks,
+        )
+        from agent_voice_input.session_ctx import SessionMatch, SessionSnapshot, SessionState
+
+        with tempfile.TemporaryDirectory(prefix="avi-iso-ref-", dir="/tmp") as td:
+            root = Path(td)
+            rt = root / "rt"
+            rt.mkdir(mode=0o700)
+            repo = root / "demo-proj"
+            repo.mkdir()
+            wav_file = rt / "sample.wav"
+            wav_file.write_bytes(_voiced_wav())
+
+            real_skey = "codex:real-live-slot-8888"
+            real_turns: list[tuple[str, str]] = [
+                ("user", "请排查 AgyRefiner 会话槽隔离问题"),
+                ("assistant", "好的，我会核对 _threads 键与上下文块构建逻辑。"),
+            ]
+
+            def _make_matched_tracker(cwd_val: str) -> SessionTracker:
+                tr = _isolated_tracker(rt)
+                match = SessionMatch(
+                    cli="codex",
+                    session_id="real-live-slot-8888",
+                    jsonl_path=str(rt / "sess.jsonl"),
+                    cwd=cwd_val,
+                    matched_by="title_prefix",
+                )
+                st_obj = SessionState(
+                    session_key=real_skey,
+                    cli="codex",
+                    session_id="real-live-slot-8888",
+                    jsonl_path=match.jsonl_path,
+                    cwd=cwd_val,
+                    clean_turns=list(real_turns),
+                )
+                snap = SessionSnapshot(
+                    match=match,
+                    clean_turns=tuple(real_turns),
+                    luna_synced_idx=0,
+                    generation=1,
+                    git_status="",
+                    hotwords=("AgyRefiner", "SessionTracker"),
+                    byte_offset=128,
+                )
+                tr._states[real_skey] = st_obj
+                tr.sync_session = lambda **_kw: snap  # type: ignore[method-assign]
+                return tr
+
+            # 1. Spy refiner confirms session_key == "" while mode, routing, and real context blocks stay intact
+            seen_calls: list[dict[str, object]] = []
+            cfg_spy = Config(refiner=RefinerConfig(provider="deepseek", include_git_status=False))
+
+            class _SpyRefiner(BaseRefiner):
+                provider_name = "deepseek"
+
+                def refine(self, asr_input: AsrResult | str, *, mode: str = "agent", **kw: object) -> RefinerResult:
+                    draft = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                    ctx_blocks, final_block = build_refiner_request_blocks(
+                        cfg_spy,
+                        draft,
+                        session_key=str(kw.get("session_key") or ""),
+                        tracker=kw.get("tracker"),  # type: ignore[arg-type]
+                        fallback_context=str(kw.get("fallback_context") or ""),
+                        mode=mode,
+                        workspace_cwd=str(kw.get("workspace_cwd") or ""),
+                        target_hint=str(kw.get("target_hint") or ""),
+                    )
+                    seen_calls.append(
+                        {
+                            "session_key": kw.get("session_key"),
+                            "mode": mode,
+                            "ctx_blocks": ctx_blocks,
+                            "final_block": final_block,
+                        }
+                    )
+                    return RefinerResult(
+                        text=f"refined:{draft}",
+                        provider="deepseek",
+                        model="mock",
+                        latency_ms=3,
+                        used_fallback="",
+                        context_chars=sum(len(b) for b in ctx_blocks),
+                        context_chunks=len(ctx_blocks),
+                    )
+
+            for cwd_case in (str(repo), ""):
+                seen_calls.clear()
+                tr_case = _make_matched_tracker(cwd_case)
+                daemon_spy = VoiceInputDaemon(
+                    cfg_spy,
+                    env={},
+                    runtime_dir=rt,
+                    platform=_FakePlatform(),
+                    asr_provider=_FakeAsr("帮我看看会花槽隔离"),
+                    refiner=_SpyRefiner(),
+                    tracker=tr_case,
+                )
+                daemon_spy._make_probe_tracker = lambda _t=tr_case: (_t, False)  # type: ignore[method-assign]
+                try:
+                    resp = daemon_spy.handle_control(
+                        {
+                            "cmd": "selftest_wav",
+                            "wav_path": str(wav_file),
+                            "process": "WindowsTerminal.exe",
+                            "title": "codex · demo-proj [#real-liv]",
+                            "no_telemetry": True,
+                        }
+                    )
+                    self.assertTrue(resp.get("ok"), resp)
+                    self.assertEqual(len(seen_calls), 1)
+                    self.assertEqual(seen_calls[0]["session_key"], "")
+                    self.assertEqual(seen_calls[0]["mode"], "agent")
+                    joined_ctx = "\n".join(seen_calls[0]["ctx_blocks"])  # type: ignore[arg-type]
+                    self.assertIn("AgyRefiner", joined_ctx)
+                    self.assertIn("_threads", joined_ctx)
+                    self.assertEqual(
+                        resp["routing"]["session_key_masked"],
+                        "codex:real-liv",
+                        resp["routing"],
+                    )
+                finally:
+                    daemon_spy.close()
+
+            # 2. Real AgyRefiner stateful _threads slot for the live session is neither read, mutated, nor evicted
+            cfg_agy = Config(refiner=RefinerConfig(provider="agy", model="flash", include_git_status=False))
+            agy_refiner = AgyRefiner(cfg_agy, env={}, runtime_dir=rt)
+            live_state = _AgyThreadState(
+                conversation_id="live-acp-conv-001",
+                turn_count=3,
+                sent_blocks=("<session_reference>old</session_reference>",),
+                model="flash",
+                effort="medium:0",
+                prompt_hash="deadbeef",
+            )
+            agy_refiner._threads[(real_skey, "agent")] = live_state
+            acp_calls: list[dict[str, object]] = []
+
+            def _fake_acp_session(**kw: object) -> tuple[str, str, str, tuple[int | None, ...], int]:
+                acp_calls.append(dict(kw))
+                return "帮我看看会话槽隔离", "ephemeral-selftest-sid", "flash", (100, 0, 10, None), 5
+
+            agy_refiner._run_acp_session = _fake_acp_session  # type: ignore[method-assign]
+            tr_agy = _make_matched_tracker(str(repo))
+            daemon_agy = VoiceInputDaemon(
+                cfg_agy,
+                env={},
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("帮我看看会花槽隔离"),
+                refiner=agy_refiner,
+                tracker=tr_agy,
+            )
+            daemon_agy._make_probe_tracker = lambda _t=tr_agy: (_t, False)  # type: ignore[method-assign]
+            try:
+                with mock.patch("agent_voice_input.refiner.find_agy_bin", return_value="/usr/bin/agy"):
+                    resp_agy = daemon_agy.handle_control(
+                        {
+                            "cmd": "selftest_wav",
+                            "wav_path": str(wav_file),
+                            "process": "WindowsTerminal.exe",
+                            "title": "codex · demo-proj [#real-liv]",
+                            "no_telemetry": True,
+                        }
+                    )
+                self.assertTrue(resp_agy.get("ok"), resp_agy)
+                self.assertEqual(resp_agy.get("final_text"), "帮我看看会话槽隔离")
+                self.assertEqual(len(acp_calls), 1)
+                self.assertEqual(acp_calls[0]["conversation_id"], "")
+                self.assertFalse(acp_calls[0]["track_loaded_session"])
+                self.assertIn("AgyRefiner", str(acp_calls[0]["prompt_text"]))
+                # Live session slot in AgyRefiner._threads is 100% untouched
+                self.assertEqual(list(agy_refiner._threads.keys()), [(real_skey, "agent")])
+                self.assertEqual(live_state.conversation_id, "live-acp-conv-001")
+                self.assertEqual(live_state.turn_count, 3)
+                self.assertEqual(live_state.sent_blocks, ("<session_reference>old</session_reference>",))
+            finally:
+                daemon_agy.close()
+
 
 if __name__ == "__main__":
     unittest.main()

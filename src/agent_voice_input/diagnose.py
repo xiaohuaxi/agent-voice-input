@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import time
@@ -195,6 +196,7 @@ _TELEMETRY_DIAG_TEXT_FIELDS: frozenset[str] = frozenset(
         "audio_error",
     }
 )
+_ASR_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,128}$")
 
 
 def _clean_single_line(text: str, redact_fn: Any, *, max_chars: int = 200) -> str:
@@ -224,7 +226,13 @@ def _sanitize_telemetry_record(rec: Mapping[str, Any], redact_fn: Any) -> dict[s
             clean[k] = val
     for k in _TELEMETRY_DIAG_TEXT_FIELDS:
         if k in rec and isinstance(rec[k], str) and rec[k].strip():
-            clean[k] = _clean_single_line(rec[k], redact_fn, max_chars=200)
+            if k == "asr_request_id":
+                raw_req_id = rec[k].strip()
+                if not _ASR_REQUEST_ID_RE.fullmatch(raw_req_id):
+                    continue
+                clean[k] = _clean_single_line(raw_req_id, redact_fn, max_chars=200)
+            else:
+                clean[k] = _clean_single_line(rec[k], redact_fn, max_chars=200)
     if "asr_chunk_secs" in rec and isinstance(rec["asr_chunk_secs"], list):
         clean["asr_chunk_secs"] = [
             float(x) for x in rec["asr_chunk_secs"] if isinstance(x, (int, float)) and not isinstance(x, bool)
