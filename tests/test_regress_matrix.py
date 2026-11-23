@@ -384,14 +384,15 @@ class TestRegressMatrixLayerC(unittest.TestCase):
                         "isSidechain": False,
                         "sessionId": "cccc0001-0000-4000-8000-000000000001",
                         "cwd": str(home),
-                        "blob": "Y" * 5000,
                     }
                 )
+                + "\n"
+                + json.dumps({"type": "future_unknown_v99", "blob": "Y" * 5000})
                 + "\n",
                 encoding="utf-8",
             )
 
-            # AGY >= 4096B with SYSTEM_INFO only (0 turns)
+            # AGY >= 4096B with SYSTEM_INFO + unparsed dialogue carrier (0 turns)
             agy_p = (
                 home
                 / ".gemini"
@@ -404,9 +405,9 @@ class TestRegressMatrixLayerC(unittest.TestCase):
             )
             agy_p.parent.mkdir(parents=True, exist_ok=True)
             agy_p.write_text(
-                json.dumps(
-                    {"source": "SYSTEM", "type": "SYSTEM_INFO", "cwd": str(home), "content": "S" * 5000}
-                )
+                json.dumps({"source": "SYSTEM", "type": "SYSTEM_INFO", "cwd": str(home), "content": "init"})
+                + "\n"
+                + json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "payload_v99": "S" * 5000})
                 + "\n",
                 encoding="utf-8",
             )
@@ -416,6 +417,120 @@ class TestRegressMatrixLayerC(unittest.TestCase):
             for cid in ("C1_real_codex_cli", "C2_real_claude_cli", "C3_real_agy_cli"):
                 self.assertEqual(by_id[cid]["status"], "FAIL", msg=f"{cid}: {by_id[cid]}")
                 self.assertIn("schema drift", by_id[cid]["detail"])
+
+    def test_layer_c_distinguishes_pure_metadata_large_empty_sessions_from_schema_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="avi-t-lc-meta-") as raw_td:
+            home = Path(raw_td)
+            # 1) Large (>=4096B) pure-metadata empty sessions skip to older valid session -> PASS
+            cx_dir = home / ".codex" / "sessions" / "2026" / "11" / "23"
+            cx_old = rm._write_codex_rollout(
+                cx_dir / "rollout-2026-11-23T08-00-00-aa010001-0000-4000-8000-000000000001.jsonl",
+                "aa010001-0000-4000-8000-000000000001",
+                str(home / "repo"),
+                [("user", "older codex turn"), ("assistant", "older codex reply")],
+            )
+            cx_meta = cx_dir / "rollout-2026-11-23T09-00-00-aa010002-0000-4000-8000-000000000002.jsonl"
+            cx_meta.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "session_meta", "payload": {"id": "aa010002-0000-4000-8000-000000000002", "cwd": str(home), "source": "cli"}}),
+                        json.dumps({"type": "turn_context", "payload": {"cwd": str(home), "pad": "M" * 4500}}),
+                        json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {"total": 0}}}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.utime(cx_old, (1700000100, 1700000100))
+            os.utime(cx_meta, (1700000200, 1700000200))
+
+            cl_dir = home / ".claude" / "projects" / "demo-proj"
+            cl_old, _ = rm._write_claude_jsonl(
+                cl_dir / "bb010001-0000-4000-8000-000000000001.jsonl",
+                "bb010001-0000-4000-8000-000000000001",
+                str(home / "repo"),
+                [("user", "older claude turn"), ("assistant", "older claude reply")],
+            )
+            cl_meta = cl_dir / "bb010002-0000-4000-8000-000000000002.jsonl"
+            cl_meta.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "system", "isSidechain": False, "sessionId": "bb010002-0000-4000-8000-000000000002", "cwd": str(home)}),
+                        json.dumps({"type": "queue-operation", "op": "noop"}),
+                        json.dumps({"type": "file-history-snapshot", "files": []}),
+                        json.dumps({"type": "progress", "pct": 0}),
+                        json.dumps({"type": "attachment", "blob": "A" * 4500}),
+                        json.dumps({"type": "api-request-shape", "fields": []}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.utime(cl_old, (1700000100, 1700000100))
+            os.utime(cl_meta, (1700000200, 1700000200))
+
+            agy_root = home / ".gemini" / "antigravity-cli" / "brain"
+            agy_old = rm._write_agy_transcript(
+                agy_root / "cc010001-0000-4000-8000-000000000001" / ".system_generated" / "logs" / "transcript_full.jsonl",
+                str(home / "repo"),
+                [("user", "older agy turn"), ("assistant", "older agy reply")],
+            )
+            agy_meta = agy_root / "cc010002-0000-4000-8000-000000000002" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            agy_meta.parent.mkdir(parents=True, exist_ok=True)
+            agy_meta.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"source": "SYSTEM", "type": "SYSTEM_INFO", "cwd": str(home), "content": "S" * 4500}),
+                        json.dumps({"source": "SYSTEM", "type": "metadata", "info": "boot"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.utime(agy_old, (1700000100, 1700000100))
+            os.utime(agy_meta, (1700000200, 1700000200))
+
+            checks_pass = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            by_pass = {c["id"]: c for c in checks_pass}
+            for cid in ("C1_real_codex_cli", "C2_real_claude_cli", "C3_real_agy_cli"):
+                self.assertEqual(by_pass[cid]["status"], "PASS", msg=f"{cid}: {by_pass[cid]}")
+                self.assertEqual(by_pass[cid]["metrics"]["candidates_checked"], 2)
+
+            # 2) When ONLY large pure-metadata empty sessions exist -> SKIP (not FAIL)
+            cx_old.unlink()
+            cl_old.unlink()
+            agy_old.unlink()
+            checks_skip = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            by_skip = {c["id"]: c for c in checks_skip}
+            for cid in ("C1_real_codex_cli", "C2_real_claude_cli", "C3_real_agy_cli"):
+                self.assertEqual(by_skip[cid]["status"], "SKIP", msg=f"{cid}: {by_skip[cid]}")
+                self.assertEqual(by_skip[cid]["metrics"]["empty_metadata_sessions"], 1)
+
+            # 3) Dialogue carriers yielding 0 turns or invalid JSON line -> FAIL (schema drift)
+            cx_meta.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": "aa010002-0000-4000-8000-000000000002", "cwd": str(home), "source": "cli"}})
+                + "\n"
+                + json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "v99_content": "R" * 4500}})
+                + "\n",
+                encoding="utf-8",
+            )
+            cl_meta.write_text(
+                json.dumps({"type": "system", "isSidechain": False, "sessionId": "bb010002-0000-4000-8000-000000000002", "cwd": str(home)})
+                + "\n"
+                + json.dumps({"type": "assistant", "isSidechain": False, "message": {"role": "assistant", "v99": "C" * 4500}})
+                + "\n",
+                encoding="utf-8",
+            )
+            agy_meta.write_text(
+                json.dumps({"source": "SYSTEM", "type": "SYSTEM_INFO", "cwd": str(home), "content": "S" * 4500})
+                + "\n{broken-json-line\n",
+                encoding="utf-8",
+            )
+            checks_fail = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            by_fail = {c["id"]: c for c in checks_fail}
+            for cid in ("C1_real_codex_cli", "C2_real_claude_cli", "C3_real_agy_cli"):
+                self.assertEqual(by_fail[cid]["status"], "FAIL", msg=f"{cid}: {by_fail[cid]}")
+                self.assertIn("schema drift", by_fail[cid]["detail"])
 
     def test_small_empty_sessions_mark_skip_not_pass(self) -> None:
         with tempfile.TemporaryDirectory(prefix="avi-t-lc3-") as raw_td:

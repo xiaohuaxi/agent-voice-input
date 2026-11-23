@@ -831,6 +831,10 @@ class _IsolatedSessionTrackerView:
         self._inner = inner
         self._bound_session_key = bound_session_key
 
+    @property
+    def has_bound_session(self) -> bool:
+        return bool(self._bound_session_key)
+
     def _eff_key(self, session_key: str) -> str:
         return session_key or self._bound_session_key
 
@@ -1422,9 +1426,10 @@ def _resolve_stage1_context(
             and not (getattr(win, "document", "") or "").strip()
             and (win.title or "").strip().lower() in _AGY_DESKTOP_REJECT_TITLES
         )
+        agy_db_veto: list[str] = []
         if is_agy_ide and not is_rem_ide and not skip_legacy_agy:
             ide_match = resolve_antigravity_ide_session_by_title(
-                win.title, home=tracker.home, env=env
+                win.title, home=tracker.home, env=env, veto_out=agy_db_veto
             )
             if ide_match is not None:
                 if ide_match.cwd:
@@ -1434,7 +1439,7 @@ def _resolve_stage1_context(
                 )
                 if st.snap is not None:
                     st.agy_bound_sid = st.snap.match.session_id or ide_match.session_id
-        if st.snap is None and not skip_legacy_agy:
+        if st.snap is None and not skip_legacy_agy and not agy_db_veto:
             st.workspace_cwd = resolve_ide_workspace_cwd(
                 win,
                 home=tracker.home,
@@ -1832,17 +1837,6 @@ def run_pipeline_once(
                 ref_tracker = _IsolatedSessionTrackerView(eff_tracker, real_skey)
                 if not ref_workspace_cwd and st.snap is not None and st.snap.match.cwd:
                     ref_workspace_cwd = st.snap.match.cwd
-                if not ref_workspace_cwd and st.eff_mode != "general":
-                    try:
-                        raw_chunks, _ = eff_tracker.get_refiner_context(
-                            real_skey,
-                            max_chars=max(0, int(cfg.refiner.context_max_chars)),
-                            include_git_status=False,
-                        )
-                        if raw_chunks:
-                            ref_fallback_ctx = "\n\n".join(raw_chunks)
-                    except Exception:
-                        pass
             ref_res = _call_refiner_refine(
                 eff_refiner,
                 st.asr_res,

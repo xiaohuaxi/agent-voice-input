@@ -12272,6 +12272,237 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
             finally:
                 daemon_agy.close()
 
+    def test_r3_agy_db_veto_blocks_legacy_brain_fallback_and_isolated_no_cwd_preserves_multichunk_prior(self) -> None:
+        """R3 polish items 1 & 6: AGY DB veto blocks legacy brain/ fallback; no-cwd isolated selftest keeps multi-chunk + prior."""
+        import contextlib
+        import sqlite3
+        from agent_voice_input.refiner import BaseRefiner, build_refiner_request_blocks
+        from agent_voice_input.session_ctx import SessionMatch, SessionSnapshot, SessionState
+
+        with tempfile.TemporaryDirectory(prefix="avi-r3-d-", dir="/tmp") as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            rt.mkdir(mode=0o700)
+            repo_a = home / "repos" / "repo-a"
+            repo_b = home / "repos" / "repo-b"
+            repo_a.mkdir(parents=True)
+            repo_b.mkdir(parents=True)
+            doc_a = repo_a / "app.py"
+            doc_a.write_text("print('a')\n", encoding="utf-8")
+
+            ide_root = home / ".gemini" / "antigravity"
+            db_path = ide_root / "conversation_summaries.db"
+            # Seed a rich legacy brain/ session in repo_a that legacy fallback would match if NOT vetoed
+            legacy_tp = ide_root / "brain" / "cid-legacy-a" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            legacy_tp.parent.mkdir(parents=True)
+            legacy_tp.write_text(
+                json.dumps({"source": "SYSTEM", "type": "SYSTEM_INFO", "cwd": str(repo_a), "content": f"Active Workspaces:\n- {repo_a}\n"})
+                + "\n"
+                + json.dumps({"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Legacy repo A session</USER_REQUEST>"})
+                + "\n"
+                + json.dumps({"source": "MODEL", "type": "PLANNER_RESPONSE", "content": "Legacy reply for repo A."})
+                + "\n",
+                encoding="utf-8",
+            )
+
+            # Seed DB with: (1) cross-repo duplicate title ("Dup Title") and (2) matched title without transcript ("Fresh Title")
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT,
+                        source TEXT,
+                        parent_conversation_id TEXT,
+                        nesting_depth INTEGER,
+                        agent_name TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("cid-dup-a", "Dup Title", json.dumps([repo_a.as_uri()]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-dup-b", "Dup Title", json.dumps([repo_b.as_uri()]), "2026-11-23T09:00:20Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-fresh-no-tp", "Fresh Title", json.dumps([repo_a.as_uri()]), "2026-11-23T09:01:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ],
+                )
+                conn.commit()
+
+            cfg_off = Config(refiner=RefinerConfig(provider="off", include_git_status=False))
+            env_iso = {"HOME": str(home), "WSL_DISTRO_NAME": ""}
+            daemon_v = VoiceInputDaemon(
+                cfg_off,
+                env=env_iso,
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("ok"),
+                refiner=create_refiner(cfg_off),
+                tracker=SessionTracker(home_dir=home, runtime_dir=rt, env=env_iso),
+            )
+            try:
+                # 1a. Ambiguous DB title MUST veto legacy brain/ fallback even with document pointing inside repo_a!
+                r_dup = daemon_v.handle_control(
+                    {
+                        "cmd": "probe_route",
+                        "process": "Antigravity",
+                        "bundle_id": "com.google.antigravity",
+                        "title": "Dup Title",
+                        "document": doc_a.as_uri(),
+                    }
+                )
+                self.assertTrue(r_dup.get("ok"), r_dup)
+                self.assertEqual(r_dup["session_key_masked"], "")
+                self.assertEqual(r_dup["workspace_name"], "")
+
+                # 1b. Matched DB title with no transcript yet MUST veto legacy brain/ fallback!
+                r_nt = daemon_v.handle_control(
+                    {
+                        "cmd": "probe_route",
+                        "process": "Antigravity",
+                        "bundle_id": "com.google.antigravity",
+                        "title": "Fresh Title",
+                        "document": doc_a.as_uri(),
+                    }
+                )
+                self.assertTrue(r_nt.get("ok"), r_nt)
+                self.assertEqual(r_nt["session_key_masked"], "")
+                self.assertEqual(r_nt["workspace_name"], "")
+
+                # 1c. Unmatched title (clean DB miss) STILL allows legacy document -> brain/ fallback
+                r_leg = daemon_v.handle_control(
+                    {
+                        "cmd": "probe_route",
+                        "process": "Antigravity",
+                        "bundle_id": "com.google.antigravity",
+                        "title": "app.py — repo-a — Antigravity",
+                        "document": doc_a.as_uri(),
+                    }
+                )
+                self.assertTrue(r_leg.get("ok"), r_leg)
+                self.assertEqual(r_leg["session_key_masked"], "agy:cid-lega")
+
+                # 1d. Corrupt DB MUST veto legacy brain/ fallback!
+                db_path.write_bytes(b"corrupt agy db bytes")
+                r_corrupt = daemon_v.handle_control(
+                    {
+                        "cmd": "probe_route",
+                        "process": "Antigravity",
+                        "bundle_id": "com.google.antigravity",
+                        "title": "app.py — repo-a — Antigravity",
+                        "document": doc_a.as_uri(),
+                    }
+                )
+                self.assertTrue(r_corrupt.get("ok"), r_corrupt)
+                self.assertEqual(r_corrupt["session_key_masked"], "")
+                self.assertEqual(r_corrupt["workspace_name"], "")
+            finally:
+                daemon_v.close()
+
+            # 2. Item 6: No-cwd isolated selftest preserves multi-chunk blocks and prior_chunk (never flattened)
+            wav_file = rt / "multi.wav"
+            wav_file.write_bytes(_voiced_wav())
+            skey_nocwd = "agy:nocwd-multi-9999"
+            tr_multi = _isolated_tracker(rt)
+            match_nocwd = SessionMatch(
+                cli="agy",
+                session_id="nocwd-multi-9999",
+                jsonl_path=str(rt / "nocwd.jsonl"),
+                cwd="",
+                matched_by="ide_db_title",
+            )
+            st_nocwd = SessionState(
+                session_key=skey_nocwd,
+                cli="agy",
+                session_id="nocwd-multi-9999",
+                jsonl_path=match_nocwd.jsonl_path,
+                cwd="",
+                clean_turns=[("user", "chunk one"), ("assistant", "chunk two")],
+            )
+            snap_nocwd = SessionSnapshot(
+                match=match_nocwd,
+                clean_turns=tuple(st_nocwd.clean_turns),
+                luna_synced_idx=0,
+                generation=1,
+                git_status="",
+                hotwords=("ChunkAlpha",),
+                byte_offset=64,
+            )
+            tr_multi._states[skey_nocwd] = st_nocwd
+            tr_multi.sync_session = lambda **_kw: snap_nocwd  # type: ignore[method-assign]
+            tr_multi.get_refiner_context_with_prior = (  # type: ignore[method-assign]
+                lambda sk, **_kw: ("PRIOR_REF_BODY", ["CHUNK_ONE_BODY", "CHUNK_TWO_BODY"], "")
+                if sk == skey_nocwd
+                else ("", [], "")
+            )
+
+            seen_blocks: list[list[str]] = []
+            cfg_spy = Config(refiner=RefinerConfig(provider="deepseek", include_git_status=False))
+
+            class _MultiChunkSpyRefiner(BaseRefiner):
+                provider_name = "deepseek"
+
+                def refine(self, asr_input: AsrResult | str, *, mode: str = "agent", **kw: object) -> RefinerResult:
+                    draft = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                    self.assert_tracker = kw.get("tracker")
+                    blocks, _final = build_refiner_request_blocks(
+                        cfg_spy,
+                        draft,
+                        session_key=str(kw.get("session_key") or ""),
+                        tracker=kw.get("tracker"),  # type: ignore[arg-type]
+                        fallback_context=str(kw.get("fallback_context") or ""),
+                        mode=mode,
+                        workspace_cwd=str(kw.get("workspace_cwd") or ""),
+                        target_hint=str(kw.get("target_hint") or ""),
+                    )
+                    seen_blocks.append(blocks)
+                    return RefinerResult(
+                        text=f"ok:{draft}",
+                        provider="deepseek",
+                        model="mock",
+                        latency_ms=1,
+                        context_chars=sum(len(b) for b in blocks),
+                        context_chunks=len(blocks),
+                    )
+
+            spy_ref = _MultiChunkSpyRefiner()
+            daemon_mc = VoiceInputDaemon(
+                cfg_spy,
+                env={},
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_FakeAsr("测试多块保留"),
+                refiner=spy_ref,
+                tracker=tr_multi,
+            )
+            daemon_mc._make_probe_tracker = lambda _t=tr_multi: (_t, False)  # type: ignore[method-assign]
+            try:
+                resp_mc = daemon_mc.handle_control(
+                    {
+                        "cmd": "selftest_wav",
+                        "wav_path": str(wav_file),
+                        "process": "WindowsTerminal.exe",
+                        "title": "agy [#nocwd-mu]",
+                        "no_telemetry": True,
+                    }
+                )
+                self.assertTrue(resp_mc.get("ok"), resp_mc)
+                self.assertTrue(getattr(spy_ref.assert_tracker, "has_bound_session", False))
+                self.assertEqual(len(seen_blocks), 1)
+                self.assertEqual(len(seen_blocks[0]), 3, seen_blocks[0])
+                self.assertTrue(seen_blocks[0][0].startswith("<prior_session_reference"))
+                self.assertIn("PRIOR_REF_BODY", seen_blocks[0][0])
+                self.assertTrue(seen_blocks[0][1].startswith("<session_reference_log"))
+                self.assertIn("CHUNK_ONE_BODY", seen_blocks[0][1])
+                self.assertTrue(seen_blocks[0][2].startswith("<session_reference_log"))
+                self.assertIn("CHUNK_TWO_BODY", seen_blocks[0][2])
+            finally:
+                daemon_mc.close()
+
 
 if __name__ == "__main__":
     unittest.main()

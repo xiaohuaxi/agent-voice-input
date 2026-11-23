@@ -227,10 +227,17 @@ def _sanitize_telemetry_record(rec: Mapping[str, Any], redact_fn: Any) -> dict[s
     for k in _TELEMETRY_DIAG_TEXT_FIELDS:
         if k in rec and isinstance(rec[k], str) and rec[k].strip():
             if k == "asr_request_id":
-                raw_req_id = rec[k].strip()
-                if not _ASR_REQUEST_ID_RE.fullmatch(raw_req_id):
+                parts: list[str] = []
+                for raw_part in rec[k].split(","):
+                    part = raw_part.strip()
+                    if part and _ASR_REQUEST_ID_RE.fullmatch(part):
+                        clean_part = _clean_single_line(part, redact_fn, max_chars=256)
+                        if clean_part:
+                            parts.append(clean_part)
+                if not parts:
                     continue
-                clean[k] = _clean_single_line(raw_req_id, redact_fn, max_chars=200)
+                joined = ",".join(parts)
+                clean[k] = joined[:256] if len(joined) > 256 else joined
             else:
                 clean[k] = _clean_single_line(rec[k], redact_fn, max_chars=200)
     if "asr_chunk_secs" in rec and isinstance(rec["asr_chunk_secs"], list):

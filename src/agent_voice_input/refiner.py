@@ -389,7 +389,9 @@ def build_refiner_context_chunks(
     prior_chunk = ""
     raw_chunks: list[str] = []
     git_ctx = ""
-    if tracker is not None and (session_key or workspace_cwd):
+    if tracker is not None and (
+        session_key or workspace_cwd or getattr(tracker, "has_bound_session", False)
+    ):
         ctx_kw: dict[str, Any] = {"max_chars": max_chars, "include_git_status": include_git}
         if workspace_cwd:
             ctx_kw["workspace_cwd"] = workspace_cwd

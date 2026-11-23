@@ -49,6 +49,7 @@ from agent_voice_input import __version__  # noqa: E402
 from agent_voice_input._remote_probe import (  # noqa: E402
     _clean_jsonl_file,
     _is_agy_subagent,
+    _read_bounded_line,
     _read_claude_root_meta,
     _read_codex_root_meta,
     _should_prefilter_skip_jsonl_line,
@@ -1780,6 +1781,97 @@ def _find_latest_files(root: Path, suffix: str, *, max_depth: int = 5, name_pref
     return found
 
 
+_CODEX_EMPTY_META_TYPES: frozenset[str] = frozenset(
+    {
+        "session_meta",
+        "turn_context",
+        "token_usage_record",
+        "world_state",
+        "inter_agent_communication_metadata",
+    }
+)
+_CLAUDE_EMPTY_META_TYPES: frozenset[str] = frozenset(
+    {
+        "system",
+        "queue-operation",
+        "file-history-snapshot",
+        "progress",
+        "attachment",
+        "last-prompt",
+        "cost-state",
+        "ai-title",
+        "atis-latch",
+        "summary",
+    }
+)
+_AGY_EMPTY_META_TYPES: frozenset[str] = frozenset(
+    {
+        "SYSTEM_INFO",
+        "SYSTEM_MESSAGE",
+        "USER_SETTINGS_CHANGE",
+        "METADATA",
+        "metadata",
+    }
+)
+
+
+def _is_known_empty_metadata_transcript(cli_name: str, path: Path) -> bool:
+    """Return True iff every non-empty JSONL line is valid JSON of a known non-dialogue metadata type."""
+    saw_any = False
+    try:
+        with open(path, "rb") as f:
+            while True:
+                raw_line, exceeded = _read_bounded_line(f)
+                if not raw_line:
+                    break
+                if exceeded:
+                    return False
+                body = raw_line.strip()
+                if not body:
+                    continue
+                saw_any = True
+                try:
+                    obj = json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    return False
+                if not isinstance(obj, dict):
+                    return False
+                typ = obj.get("type")
+                if not isinstance(typ, str) or not typ.strip():
+                    return False
+                if cli_name == "codex":
+                    if typ in _CODEX_EMPTY_META_TYPES:
+                        continue
+                    if typ == "event_msg":
+                        pl = obj.get("payload")
+                        if not isinstance(pl, dict):
+                            return False
+                        ptyp = str(pl.get("type") or "").strip()
+                        if ptyp in ("user_message", "agent_message"):
+                            return False
+                        if ptyp == "item_completed":
+                            item = pl.get("item")
+                            if isinstance(item, dict) and item.get("type") in ("UserMessage", "AgentMessage"):
+                                return False
+                        continue
+                    return False
+                if cli_name == "claude":
+                    if typ in _CLAUDE_EMPTY_META_TYPES or typ.startswith("api-request"):
+                        continue
+                    return False
+                if cli_name == "agy":
+                    src = obj.get("source")
+                    if src not in (None, "", "SYSTEM"):
+                        return False
+                    if typ in _AGY_EMPTY_META_TYPES:
+                        continue
+                    return False
+                return False
+    except OSError:
+        return False
+    return saw_any
+
+
 def _probe_real_cli_candidates(
     check_id: str,
     cli_name: str,
@@ -1797,7 +1889,8 @@ def _probe_real_cli_candidates(
     drift_hit: tuple[int, int, int] | None = None  # (candidate_idx, size_bytes, parse_ms)
     first_exc: tuple[int, int, Exception] | None = None  # (candidate_idx, size_bytes, exc)
     older_pass: tuple[int, int, int, int, int] | None = None  # (idx, turns, chars, size, parse_ms)
-    max_small_size = 0
+    max_empty_size = 0
+    empty_meta_count = 0
     checked = 0
 
     for idx, (size, path) in enumerate(candidates[:_LAYER_C_MAX_CANDIDATES], start=1):
@@ -1829,10 +1922,13 @@ def _probe_real_cli_candidates(
             older_pass = (idx, len(turns), chars, size, parse_ms)
             break
         if size >= _LAYER_C_SCHEMA_DRIFT_MIN_BYTES:
-            if drift_hit is None:
+            if _is_known_empty_metadata_transcript(cli_name, path):
+                empty_meta_count += 1
+                max_empty_size = max(max_empty_size, size)
+            elif drift_hit is None:
                 drift_hit = (idx, size, parse_ms)
         else:
-            max_small_size = max(max_small_size, size)
+            max_empty_size = max(max_empty_size, size)
 
     older_note = (
         f"; older candidate#{older_pass[0]} still parsed turns={older_pass[1]} (chars={older_pass[2]})"
@@ -1881,15 +1977,21 @@ def _probe_real_cli_candidates(
             f"parse error on candidate#{e_idx}: {redact_fn(exc)}{older_note}",
             metrics,
         )
+    empty_desc = (
+        f"all {checked} latest root session(s) are empty/metadata-only sessions (0 turns, {empty_meta_count} metadata-only >= {_LAYER_C_SCHEMA_DRIFT_MIN_BYTES}B)"
+        if empty_meta_count > 0
+        else f"all {checked} latest root session(s) are small empty sessions (<{_LAYER_C_SCHEMA_DRIFT_MIN_BYTES}B, 0 turns)"
+    )
     return _make_check(
         check_id,
         "C",
         "SKIP",
-        f"all {checked} latest root session(s) are small empty sessions (<{_LAYER_C_SCHEMA_DRIFT_MIN_BYTES}B, 0 turns)",
+        empty_desc,
         {
             "turns": 0,
             "chars": 0,
-            "max_size_bytes": max_small_size,
+            "max_size_bytes": max_empty_size,
+            "empty_metadata_sessions": empty_meta_count,
             "candidates_checked": checked,
         },
     )

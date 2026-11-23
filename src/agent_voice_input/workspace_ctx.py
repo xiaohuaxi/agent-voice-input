@@ -672,13 +672,13 @@ def _load_agy_ide_evidence(
             records = _read_bounded_jsonl_dicts(f, max_lines=32)
             for obj in records[:8]:
                 if isinstance(obj.get("cwd"), str) and obj["cwd"].strip():
-                    _add_unique(sys_cwds, obj["cwd"])
+                    _add_unique(sys_cwds, obj["cwd"], keep_remote=True)
                 # Never extract workspace CWD from USER_EXPLICIT prose (users often paste logs from other repos).
                 if obj.get("source") == "SYSTEM":
                     c_str = obj.get("content")
                     if isinstance(c_str, str) and ("Working Directory:" in c_str or "Active Workspaces:" in c_str):
                         if m_ws := _AGY_WS_CWD_RE.search(c_str):
-                            _add_unique(sys_cwds, m_ws.group(1))
+                            _add_unique(sys_cwds, m_ws.group(1), keep_remote=True)
             head_end = f.tell()
             if st.st_size > head_end:
                 seek_to = max(head_end, st.st_size - _AGY_IDE_TAIL_SCAN_BYTES)
@@ -980,23 +980,40 @@ def _decode_structured_workspace_uri(
     return path
 
 
+def _normalize_unresolved_agy_uri(raw_u: str) -> str:
+    s = (raw_u or "").strip().rstrip("/")
+    if not s:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(s)
+    except ValueError:
+        return s
+    if parts.scheme:
+        scheme = parts.scheme.lower()
+        netloc = urllib.parse.unquote(parts.netloc or "").lower()
+        path = posixpath.normpath(urllib.parse.unquote(parts.path or "")) if parts.path else ""
+        return f"{scheme}://{netloc}{path}"
+    return s
+
+
 def _parse_agy_db_workspace_uris(
     raw_ws_uris: Any, home: Path, *, wsl: bool, env: Mapping[str, str] | None = None
-) -> tuple[bool, list[str]]:
-    """Return ``(has_raw_entries, local_safe_dirs)`` from DB ``workspace_uris`` JSON."""
+) -> tuple[bool, list[str], list[str]]:
+    """Return ``(has_raw_entries, local_safe_dirs, unresolved_uris)`` from DB ``workspace_uris`` JSON."""
     if not isinstance(raw_ws_uris, str):
-        return False, []
+        return False, [], []
     s = raw_ws_uris.strip()
     if not s:
-        return False, []
+        return False, [], []
     try:
         parsed = json.loads(s)
     except ValueError:
-        return False, []
+        return False, [], []
     if not isinstance(parsed, list):
-        return False, []
+        return False, [], []
     has_raw = False
     out: list[str] = []
+    unresolved: list[str] = []
     for item in parsed:
         raw_u = item if isinstance(item, str) else (
             item.get("uri") or item.get("path") if isinstance(item, Mapping) else ""
@@ -1005,12 +1022,16 @@ def _parse_agy_db_workspace_uris(
             continue
         has_raw = True
         decoded = _decode_structured_workspace_uri(raw_u, wsl=wsl, env=env)
-        if not decoded:
-            continue
-        safe_dir = _resolve_safe_local_dir(decoded, wsl=wsl)
-        if safe_dir and not _is_broad_or_unsafe_workspace_dir(safe_dir, home, wsl=wsl) and safe_dir not in out:
-            out.append(safe_dir)
-    return has_raw, out
+        if decoded:
+            safe_dir = _resolve_safe_local_dir(decoded, wsl=wsl)
+            if safe_dir and not _is_broad_or_unsafe_workspace_dir(safe_dir, home, wsl=wsl):
+                if safe_dir not in out:
+                    out.append(safe_dir)
+                continue
+        norm_u = _normalize_unresolved_agy_uri(raw_u)
+        if norm_u and norm_u not in unresolved:
+            unresolved.append(norm_u)
+    return has_raw, out, unresolved
 
 
 def _scan_agy_ide_db_for_prior(
@@ -1077,7 +1098,7 @@ def _scan_agy_ide_db_for_prior(
             vetoed_cids.add(cid_low)
             continue
 
-        has_raw, ws_dirs = _parse_agy_db_workspace_uris(str(raw_ws_uris or ""), home, wsl=wsl, env=env)
+        has_raw, ws_dirs, _ = _parse_agy_db_workspace_uris(str(raw_ws_uris or ""), home, wsl=wsl, env=env)
         if any(_cwd_match_rank(safe_ws, p, home, wsl=wsl) == 2 for p in ws_dirs):
             vetoed_cids.add(cid_low)
             if cid_low == excl_low or cid_low in seen_matched:
@@ -1100,6 +1121,7 @@ def resolve_antigravity_ide_session_by_title(
     home: Path | None = None,
     wsl: bool | None = None,
     env: Mapping[str, str] | None = None,
+    veto_out: list[str] | None = None,
 ) -> SessionMatch | None:
     """Resolve an Antigravity 2.0 standalone desktop conversation directly by window title via ``conversation_summaries.db``."""
     win_title = (window_title or "").strip()
@@ -1108,6 +1130,10 @@ def resolve_antigravity_ide_session_by_title(
     eff_env = os.environ if env is None else env
     eff_home = home if home is not None else Path((eff_env.get("HOME") or "").strip() or Path.home())
     eff_wsl = _effective_is_wsl(wsl, env)
+
+    def _veto(reason: str) -> None:
+        if veto_out is not None:
+            veto_out.append(reason)
 
     trunc_prefix = _compute_trunc_prefix(win_title)
     is_truncated_title = win_title.endswith("...") or win_title.endswith("\u2026")
@@ -1124,6 +1150,7 @@ def resolve_antigravity_ide_session_by_title(
         root_path = Path(real_root)
         rows, db_ok = _query_agy_ide_db_title_rows(root_path, wsl=eff_wsl)
         if not db_ok:
+            _veto("db_error")
             return None
         for raw_cid, raw_title, raw_ws_uris, raw_lmt in rows:
             cid = raw_cid.strip()
@@ -1157,9 +1184,10 @@ def resolve_antigravity_ide_session_by_title(
         row = matched_rows[0]
         resolved = _resolve_agy_ide_transcript(row[0], row[1], wsl=eff_wsl)
         if resolved is None:
+            _veto("no_transcript")
             return None
         tp, tp_st = resolved
-        _, ws_dirs = _parse_agy_db_workspace_uris(row[2], eff_home, wsl=eff_wsl, env=eff_env)
+        _, ws_dirs, _ = _parse_agy_db_workspace_uris(row[2], eff_home, wsl=eff_wsl, env=eff_env)
         ws_cwd = ws_dirs[0] if ws_dirs else ""
         return SessionMatch(
             cli="agy",
@@ -1170,19 +1198,21 @@ def resolve_antigravity_ide_session_by_title(
             jsonl_mtime=tp_st.st_mtime,
         )
 
-    # Multi-row match: verify full normalized workspace set convergence across ALL matched DB rows
-    # (including rows without transcripts yet) before filtering by transcript availability.
-    distinct_ws_sets: set[frozenset[str]] = set()
+    # Multi-row match: verify full normalized workspace set (including unresolved roots) across ALL
+    # matched DB rows (including rows without transcripts yet) before filtering by transcript availability.
+    distinct_ws_sets: set[tuple[frozenset[str], frozenset[str]]] = set()
     parsed_rows: list[tuple[Path, str, list[str], Any]] = []
     for root_path, cid, raw_ws_uris, raw_lmt, _is_exact in matched_rows:
-        has_raw, item_ws_dirs = _parse_agy_db_workspace_uris(
+        has_raw, item_ws_dirs, item_unresolved = _parse_agy_db_workspace_uris(
             raw_ws_uris, eff_home, wsl=eff_wsl, env=eff_env
         )
         if has_raw and not item_ws_dirs:
+            _veto("ambiguous_workspace")
             return None
-        distinct_ws_sets.add(frozenset(item_ws_dirs))
+        distinct_ws_sets.add((frozenset(item_ws_dirs), frozenset(item_unresolved)))
         parsed_rows.append((root_path, cid, item_ws_dirs, raw_lmt))
     if len(distinct_ws_sets) != 1:
+        _veto("ambiguous_workspace")
         return None
 
     transcript_cands: list[tuple[Path, str, Path, os.stat_result, list[str], Any]] = []
@@ -1193,6 +1223,7 @@ def resolve_antigravity_ide_session_by_title(
         tp, tp_st = resolved
         transcript_cands.append((root_path, cid, tp, tp_st, item_ws_dirs, raw_lmt))
     if not transcript_cands:
+        _veto("no_transcript")
         return None
 
     def _cand_sort_key(

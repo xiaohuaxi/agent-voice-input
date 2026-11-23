@@ -1907,7 +1907,10 @@ class MacOSPlatform(JsonlShimMixin):
         if (
             not has_term_identity
             and (origin.process or origin.bundle_id)
-            and origin.ax_trusted is not None
+            and (
+                origin.ax_trusted is not None
+                or not ((origin.title or "").strip() and (current.title or "").strip())
+            )
             and origin.hwnd <= 0
             and current.hwnd > 0
         ):

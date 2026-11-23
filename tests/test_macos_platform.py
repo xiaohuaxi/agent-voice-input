@@ -5380,10 +5380,20 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 cfg, env={"HOME": td, "AGENT_VOICE_INPUT_SWIFTC": "none"}, cache_dir=Path(td) / "c_r2_5"
             )
             try:
-                # 1a. AppleScript fallback origin (ax_trusted=None, hwnd=0) -> shim-recovered hwnd>0 with same title is NOT drift
+                # 1a. AppleScript fallback origin (ax_trusted=None, hwnd=0) -> shim-recovered hwnd>0 with same non-empty title is NOT drift
                 orig_osa = ForegroundWindow(0, "ChatGPT", "Optimize Alpha", bundle_id="com.openai.codex", ax_trusted=None)
                 cur_shim = ForegroundWindow(42, "ChatGPT", "Optimize Alpha", bundle_id="com.openai.codex", ax_trusted=True)
                 self.assertFalse(plat._is_focus_drifted(orig_osa, cur_shim))
+
+                # 1a-empty. AppleScript fallback origin (ax_trusted=None, hwnd=0) with empty/whitespace title on either side MUST NOT claim new hwnd>0 popup!
+                orig_osa_empty = ForegroundWindow(0, "ChatGPT", "", bundle_id="com.openai.codex", ax_trusted=None)
+                orig_osa_ws = ForegroundWindow(0, "ChatGPT", "   ", bundle_id="com.openai.codex", ax_trusted=None)
+                cur_popup_titled = ForegroundWindow(42, "ChatGPT", "New Popup", bundle_id="com.openai.codex", ax_trusted=True)
+                cur_popup_empty = ForegroundWindow(42, "ChatGPT", "", bundle_id="com.openai.codex", ax_trusted=True)
+                self.assertTrue(plat._is_focus_drifted(orig_osa_empty, cur_popup_titled))
+                self.assertTrue(plat._is_focus_drifted(orig_osa_ws, cur_popup_titled))
+                self.assertTrue(plat._is_focus_drifted(orig_osa_empty, cur_popup_empty))
+                self.assertTrue(plat._is_focus_drifted(orig_osa, cur_popup_empty))
 
                 # 1b. Independent terminal identities (surface_id / tty / tmux_pane) checked before hwnd 0->positive
                 orig_surf = ForegroundWindow(0, "Ghostty", "zsh", bundle_id=GHOSTTY_BUNDLE_ID, surface_id="surf-1", ax_trusted=True)

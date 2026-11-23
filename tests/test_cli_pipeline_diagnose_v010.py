@@ -977,12 +977,26 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                 {"asr_request_id": "req_123:abc/def.456-789"}, lambda s: s
             )
             self.assertEqual(san_valid["asr_request_id"], "req_123:abc/def.456-789")
+            # Comma-joined multi-chunk asr_request_id: per-segment allowlist + redaction + 256-char cap
+            san_chunks = _sanitize_telemetry_record(
+                {"asr_request_id": f"req-1, bad prose here , req-{secret_key} , req-3"},
+                lambda s: s.replace(secret_key, "[REDACTED]"),
+            )
+            self.assertEqual(san_chunks["asr_request_id"], "req-1,req-[REDACTED],req-3")
+            san_capped = _sanitize_telemetry_record(
+                {"asr_request_id": ",".join(f"chunk{i}-{'x' * 60}" for i in range(6))},
+                lambda s: s,
+            )
+            self.assertEqual(len(san_capped["asr_request_id"]), 256)
+            self.assertTrue(san_capped["asr_request_id"].startswith("chunk0-"))
             for bad_req_id in (
                 "contains space",
                 "line1\nline2",
                 "用户口述隐私文本",
                 "a" * 129,
                 "req?token=1",
+                " , , ",
+                "bad prose one, bad prose two",
             ):
                 with self.subTest(bad_asr_request_id=bad_req_id[:24]):
                     san_bad = _sanitize_telemetry_record({"asr_request_id": bad_req_id}, lambda s: s)

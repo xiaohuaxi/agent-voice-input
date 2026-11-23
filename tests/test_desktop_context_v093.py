@@ -1313,6 +1313,26 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             legacy_win = ForegroundWindow(
                 603, "Antigravity", "ZephyrPipeline.py — alpha-app — Antigravity", bundle_id="com.google.antigravity"
             )
+            # Present-but-corrupt DB must fail closed and veto legacy brain/ fallback
+            with mock.patch("agent_voice_input.workspace_ctx.time.time", return_value=now_ts):
+                res_corrupt = run_pipeline_once(
+                    _voiced_wav(),
+                    cfg=cfg,
+                    tracker=tracker,
+                    asr_provider=asr,
+                    refiner=refiner,
+                    platform=_DummyPlatform(legacy_win),
+                    origin_window=legacy_win,
+                    audio_source="winmm",
+                    dry_run=True,
+                    env=env,
+                )
+            self.assertTrue(res_corrupt.ok)
+            self.assertIsNone(res_corrupt.session)
+            self.assertEqual(res_corrupt.workspace_cwd, "")
+
+            # True legacy fork without conversation_summaries.db still falls back to ide_brain
+            db_path.unlink()
             with mock.patch("agent_voice_input.workspace_ctx.time.time", return_value=now_ts):
                 res_legacy = run_pipeline_once(
                     _voiced_wav(),
@@ -3573,6 +3593,146 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 self.assertEqual(captured.get("GIT_NO_LAZY_FETCH"), "1")
                 self.assertNotIn("GIT_DIR", captured)
                 self.assertNotIn("GIT_WORK_TREE", captured)
+
+    def test_r3_agy_veto_out_unresolved_multiroot_and_legacy_sys_cwd_keep_remote(self) -> None:
+        """R3 polish items 1-3: veto_out reasons, unresolved multi-root disambiguation, and legacy sys_cwds keep_remote."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            shared = home / "repos" / "shared-core"
+            shared.mkdir(parents=True)
+            ide_root = home / ".gemini" / "antigravity"
+            ide_brain = ide_root / "brain"
+            db_path = ide_root / "conversation_summaries.db"
+            base_t = 1_795_424_400.0
+            env_u = {"HOME": str(home), "WSL_DISTRO_NAME": "Ubuntu"}
+
+            def _mk_sess(cid: str, mtime: float) -> Path:
+                return _write_agy_brain_session(
+                    ide_brain,
+                    cid,
+                    [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": f"<USER_REQUEST>{cid}</USER_REQUEST>"}],
+                    mtime=mtime,
+                )
+
+            _mk_sess("cid-del-a", base_t + 10)
+            _mk_sess("cid-del-b", base_t + 20)
+            _mk_sess("cid-same-del-1", base_t + 10)
+            _mk_sess("cid-same-del-2", base_t + 300)
+            _mk_sess("cid-wsl-mix-1", base_t + 10)
+            _mk_sess("cid-wsl-mix-2", base_t + 20)
+            # cid-single-no-tp and cid-multi-no-tp-1/2 intentionally have NO transcripts on disk
+
+            deleted_a = (home / "repos" / "deleted-a").as_uri()
+            deleted_b = (home / "repos" / "deleted-b").as_uri()
+            debian_uri = f"vscode-remote://wsl%2BDebian{home / 'repos' / 'other-wsl'}"
+
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT,
+                        source TEXT,
+                        parent_conversation_id TEXT,
+                        nesting_depth INTEGER,
+                        agent_name TEXT
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("cid-del-a", "Shared Plus Deleted Diff", json.dumps([shared.as_uri(), deleted_a]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-del-b", "Shared Plus Deleted Diff", json.dumps([shared.as_uri(), deleted_b]), "2026-11-23T09:00:20Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-same-del-1", "Shared Plus Deleted Same", json.dumps([shared.as_uri(), deleted_a]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-same-del-2", "Shared Plus Deleted Same", json.dumps([shared.as_uri(), deleted_a + "/"]), "2026-11-23T09:05:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-wsl-mix-1", "Shared Plus Foreign WSL", json.dumps([shared.as_uri(), debian_uri]), "2026-11-23T09:00:10Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-wsl-mix-2", "Shared Plus Foreign WSL", json.dumps([shared.as_uri()]), "2026-11-23T09:00:20Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-single-no-tp", "Brand New No Transcript", json.dumps([shared.as_uri()]), "2026-11-23T09:01:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-multi-no-tp-1", "Multi No Transcript", json.dumps([shared.as_uri()]), "2026-11-23T09:01:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                        ("cid-multi-no-tp-2", "Multi No Transcript", json.dumps([shared.as_uri()]), "2026-11-23T09:02:00Z", "CORTEX_TRAJECTORY_SOURCE_CASCADE", "", 0, ""),
+                    ],
+                )
+                conn.commit()
+
+            # 1. [shared, deleted-A] vs [shared, deleted-B] -> ambiguous_workspace veto
+            v_del: list[str] = []
+            self.assertIsNone(
+                resolve_antigravity_ide_session_by_title("Shared Plus Deleted Diff", home=home, wsl=True, env=env_u, veto_out=v_del)
+            )
+            self.assertEqual(v_del, ["ambiguous_workspace"])
+
+            # 2. [shared, deleted-A] vs [shared, deleted-A/] -> same normalized unresolved set -> converges
+            v_same: list[str] = []
+            m_same = resolve_antigravity_ide_session_by_title("Shared Plus Deleted Same", home=home, wsl=True, env=env_u, veto_out=v_same)
+            assert m_same is not None
+            self.assertEqual(m_same.session_id, "cid-same-del-2")
+            self.assertEqual(v_same, [])
+
+            # 3. [shared, wsl+Debian/...] vs [shared] -> ambiguous_workspace veto
+            v_wsl: list[str] = []
+            self.assertIsNone(
+                resolve_antigravity_ide_session_by_title("Shared Plus Foreign WSL", home=home, wsl=True, env=env_u, veto_out=v_wsl)
+            )
+            self.assertEqual(v_wsl, ["ambiguous_workspace"])
+
+            # 4. Single/multi matched DB rows without valid transcript -> no_transcript veto
+            v_nt1: list[str] = []
+            self.assertIsNone(
+                resolve_antigravity_ide_session_by_title("Brand New No Transcript", home=home, wsl=True, env=env_u, veto_out=v_nt1)
+            )
+            self.assertEqual(v_nt1, ["no_transcript"])
+
+            v_nt2: list[str] = []
+            self.assertIsNone(
+                resolve_antigravity_ide_session_by_title("Multi No Transcript", home=home, wsl=True, env=env_u, veto_out=v_nt2)
+            )
+            self.assertEqual(v_nt2, ["no_transcript"])
+
+            # 5. Clean title miss leaves veto_out empty (allows legacy fallback)
+            v_miss: list[str] = []
+            self.assertIsNone(
+                resolve_antigravity_ide_session_by_title("Unmatched Legacy Title", home=home, wsl=True, env=env_u, veto_out=v_miss)
+            )
+            self.assertEqual(v_miss, [])
+
+            # 6. Corrupt DB -> db_error veto
+            db_path.write_bytes(b"corrupted sqlite header")
+            v_err: list[str] = []
+            self.assertIsNone(
+                resolve_antigravity_ide_session_by_title("Unmatched Legacy Title", home=home, wsl=True, env=env_u, veto_out=v_err)
+            )
+            self.assertEqual(v_err, ["db_error"])
+            db_path.unlink()
+
+            # 7. Item 3: Legacy brain/ top-level cwd with foreign WSL URI keeps remote sentinel and blocks L2 fallback
+            import shutil
+
+            shutil.rmtree(ide_brain)
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-remote-top-cwd",
+                [
+                    {"source": "SYSTEM", "type": "SYSTEM_INFO", "cwd": f"vscode-remote://wsl%2BDebian{shared}", "content": "init"},
+                    {
+                        "source": "USER_EXPLICIT",
+                        "type": "USER_INPUT",
+                        "content": f"<USER_REQUEST>Check local</USER_REQUEST>\n<ADDITIONAL_METADATA>\nActive Document: {shared / 'main.py'}\n</ADDITIONAL_METADATA>",
+                    },
+                ],
+                mtime=base_t - 5,
+            )
+            # Foreign distro top-level cwd MUST classify as "other" and NOT fall through to L2 local metadata!
+            self.assertIsNone(resolve_antigravity_ide_session(str(shared), home=home, now_ts=base_t, wsl=True, env=env_u))
+            # Under matching Debian distro, top-level cwd decodes locally and matches!
+            env_d = {"HOME": str(home), "WSL_DISTRO_NAME": "Debian"}
+            m_deb = resolve_antigravity_ide_session(str(shared), home=home, now_ts=base_t, wsl=True, env=env_d)
+            assert m_deb is not None
+            self.assertEqual(m_deb.session_id, "cid-remote-top-cwd")
 
 
 if __name__ == "__main__":
