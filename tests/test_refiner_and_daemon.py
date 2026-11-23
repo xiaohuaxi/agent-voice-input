@@ -7492,14 +7492,23 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                     cancel_ms = (time.monotonic() - t_c0) * 1000.0
                     self.assertTrue(c_resp["ok"], c_resp)
                     self.assertEqual(c_resp["cancelled_ids"], [s1["seq_id"]])
-                    self.assertLess(cancel_ms, 150.0, f"cancel took too long: {cancel_ms:.1f}ms")
+                    # handle_cancel() caps its commit-drain wait_for() at 250ms while _commit_worker_loop
+                    # runs save_failed_audio() (os.fsync); under CI disk jitter a single fsync can hit that
+                    # 250ms cap, so bound well below the 5s server hang / 10s HTTP timeout instead of 150ms.
+                    self.assertLess(cancel_ms, 1000.0, f"cancel took too long: {cancel_ms:.1f}ms")
                     self.assertEqual(daemon.state, "idle")
                     self.assertEqual(daemon.handle_control({"cmd": "status"})["pending_count"], 0)
                     self.assertEqual(plat.deliveries, [], "cancelled request must NEVER fall back to asr_draft or paste!")
-                    self.assertEqual(daemon.last_result["skipped_reason"], "cancelled")
-                    self.assertFalse(daemon.last_result["ok"])
                     self.assertEqual(plat.hud_events[-1]["state"], "cancelled")
                     self.assertIs(plat.hud_events[-1].get("clear_main"), True)
+
+                    # If handle_cancel() returned at its 250ms wait cap while fsync was still finishing,
+                    # wait briefly for _commit_worker_loop to publish the cancelled summary & stashed WAV.
+                    cancel_dl = time.monotonic() + 1.5
+                    while time.monotonic() < cancel_dl and daemon.last_result.get("seq_id") != s1["seq_id"]:
+                        time.sleep(0.01)
+                    self.assertEqual(daemon.last_result["skipped_reason"], "cancelled")
+                    self.assertFalse(daemon.last_result["ok"])
 
                     failed_wavs = list_failed_audios(rt)
                     self.assertEqual(len(failed_wavs), 1)
