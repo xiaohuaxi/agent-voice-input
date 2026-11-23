@@ -26,6 +26,7 @@ def _is_ci() -> bool:
     return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
 
 from agent_voice_input.audio_proc import (  # noqa: E402
+    AudioError,
     DEFAULT_MAX_CHUNK_SEC,
     PEAK_LIMIT_INT16,
     SINGLE_HOP_MAX_CHUNK_SEC,
@@ -37,6 +38,7 @@ from agent_voice_input.audio_proc import (  # noqa: E402
     pack_pcm16_mono_wav,
     process_wav,
     resolve_failed_audio,
+    resolve_ffmpeg_bin,
     save_failed_audio,
     split_wav_chunks,
 )
@@ -1432,7 +1434,9 @@ class AudioProcTests(unittest.TestCase):
         self.assertAlmostEqual(out_dbfs, -20.0, delta=0.05)
 
     def test_ffmpeg_converts_48k_stereo_wav_to_16k_mono(self) -> None:
-        if shutil.which("ffmpeg") is None:
+        try:
+            resolve_ffmpeg_bin()
+        except AudioError:
             if _is_ci():
                 self.fail("ffmpeg must be installed in CI (silent skip forbidden)")
             self.skipTest("ffmpeg not installed")
@@ -1488,7 +1492,9 @@ class AudioProcTests(unittest.TestCase):
         self.assertTrue(all(v == 0x1234 for v in arr))
 
         # 2. Real ffmpeg streaming s16le pipe with low-latency flags + tail_drain_sec
-        if shutil.which("ffmpeg") is None:
+        try:
+            resolve_ffmpeg_bin()
+        except AudioError:
             if _is_ci():
                 self.fail("ffmpeg must be installed in CI (silent skip forbidden)")
             self.skipTest("ffmpeg not installed")
@@ -1714,7 +1720,10 @@ class AudioProcTests(unittest.TestCase):
             side_effect=subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=0.01),
         ):
             self.assertIsNone(encode_wav_to_mp3_bytes(valid_1s_wav, ffmpeg_bin="/usr/bin/ffmpeg", timeout_sec=0.01))
-        ff_bin = shutil.which("ffmpeg")
+        try:
+            ff_bin: str | None = resolve_ffmpeg_bin()
+        except AudioError:
+            ff_bin = None
         if ff_bin is None:
             if _is_ci():
                 self.fail("ffmpeg must be installed in CI for MP3 encoding test (silent skip forbidden)")

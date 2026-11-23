@@ -2075,6 +2075,7 @@ OpenAICompatAsrProvider = AudioTranscriptionsAsrProvider
 DEEPSEEK_ASR_MAX_WAV_BYTES = 8 * 1024 * 1024
 DEEPSEEK_ASR_MAX_DURATION_SEC = 120.0
 DEEPSEEK_ASR_MAX_CHUNK_SEC = 115.0
+_DEEPSEEK_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
 
 
 def _resolve_deepseek_asr_url(base_url: str) -> str:
@@ -2089,7 +2090,9 @@ def _try_read_wav_duration_sec(wav_bytes: bytes) -> float | None:
         with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
             rate = wf.getframerate()
             nframes = wf.getnframes()
-            if rate <= 0 or nframes < 0:
+            nch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            if rate <= 0 or nframes < 0 or nch <= 0 or sw <= 0 or nframes * nch * sw > len(wav_bytes):
                 return None
             return float(nframes) / float(rate)
     except (wave.Error, EOFError, OSError):
@@ -2133,7 +2136,14 @@ class DeepSeekAsrProvider(_BearerProviderMixin):
                 retry_kind="never",
             )
 
-        url = _resolve_deepseek_asr_url(self.cfg.asr.effective_base_url("deepseek"))
+        try:
+            url = _resolve_deepseek_asr_url(self.cfg.asr.effective_base_url("deepseek"))
+        except ValueError as exc:
+            raise self._fail(
+                f"invalid DeepSeek ASR base_url: {exc}",
+                extra_secrets=self.creds.all_secret_values(),
+                retry_kind="never",
+            ) from None
         api_key = self._resolve_bearer_key(url)
         assert api_key  # built-in deepseek always requires an API key
         secrets: tuple[str, ...] = (api_key,)
@@ -2253,9 +2263,10 @@ class DeepSeekAsrProvider(_BearerProviderMixin):
                 )
             raw_text = data["text"]
             raw_req_id = data.get("request_id")
+            stripped_req_id = raw_req_id.strip() if isinstance(raw_req_id, str) else ""
             req_id = (
-                self._safe_excerpt(raw_req_id.strip(), secrets, limit=128)
-                if isinstance(raw_req_id, str) and raw_req_id.strip()
+                self._safe_excerpt(stripped_req_id, secrets, limit=128)
+                if stripped_req_id and _DEEPSEEK_REQUEST_ID_RE.fullmatch(stripped_req_id)
                 else ""
             )
             dur_ms = _opt_int(data.get("duration_ms"))

@@ -130,6 +130,7 @@ _TELEMETRY_NUMERIC_FIELDS: frozenset[str] = frozenset(
         "gate_ms",
         "sync_ms",
         "asr_ms",
+        "asr_duration_ms",
         "refine_init_ms",
         "refine_ms",
         "deliver_ms",
@@ -188,6 +189,7 @@ _VALID_CTX_FALLBACK_ENUMS: frozenset[str] = frozenset(
 )
 _TELEMETRY_DIAG_TEXT_FIELDS: frozenset[str] = frozenset(
     {
+        "asr_request_id",
         "refiner_warning",
         "error",
         "audio_error",

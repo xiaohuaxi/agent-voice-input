@@ -549,17 +549,17 @@ def _probe_stage_ping(
         v_item = creds.for_provider(prov)
         key_val = v_item.value if v_item is not None else ""
 
-    url, hdrs = _build_ping_http_spec(prov, base_url, key_val)
-    cache_key = ("http", url, key_val)
-    if cache_key in cache:
-        prev_st, prev_ms, prev_msg = cache[cache_key]
-        if prev_st == "OK":
-            return "OK", prev_ms, f"OK ({prev_ms}ms, shared endpoint)"
-        return prev_st, prev_ms, prev_msg
-
     extra_sec = tuple(s for s in (*creds.all_secret_values(), key_val) if s)
     t0 = time.monotonic()
+    cache_key: tuple[str, str, str] | None = None
     try:
+        url, hdrs = _build_ping_http_spec(prov, base_url, key_val)
+        cache_key = ("http", url, key_val)
+        if cache_key in cache:
+            prev_st, prev_ms, prev_msg = cache[cache_key]
+            if prev_st == "OK":
+                return "OK", prev_ms, f"OK ({prev_ms}ms, shared endpoint)"
+            return prev_st, prev_ms, prev_msg
         resp = eff_tx(
             HttpRequest(
                 url=url,
@@ -586,7 +586,8 @@ def _probe_stage_ping(
         ms = max(0, int(round((time.monotonic() - t0) * 1000)))
         safe = redact_secrets(str(exc), env, cfg=cfg, extra_secrets=extra_sec)[:160]
         out = ("FAIL", ms, f"FAIL ({ms}ms: {safe})")
-    cache[cache_key] = out
+    if cache_key is not None:
+        cache[cache_key] = out
     return out
 
 

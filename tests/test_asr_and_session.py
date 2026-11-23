@@ -3667,7 +3667,7 @@ class SessionCtxTests(unittest.TestCase):
             self.assertEqual(probe_parsed_types, ["user", "attachment", "user", "assistant", "user"])
 
             # 2. Local incremental cleaner (SessionTracker._ingest_jsonl_delta & sync_session)
-            tracker = SessionTracker(home_dir=home, runtime_dir=rt, proc_root=None)
+            tracker = SessionTracker(home_dir=home, runtime_dir=rt, env={"HOME": str(home)}, proc_root=None)
             local_state = session_ctx_mod.SessionState(
                 session_key=f"claude:{cl_sid}",
                 cli="claude",
@@ -4633,6 +4633,152 @@ class SessionCtxTests(unittest.TestCase):
                     self.assertIsNotNone(long_res.asr)
                     assert long_res.asr is not None
                     self.assertEqual(long_res.asr.duration_ms, 60000 * long_res.asr_chunks)
+
+    def test_deepseek_request_id_whitelist_streaming_wav_ipv6_url_and_refiner_urls(self) -> None:
+        import struct
+        from agent_voice_input.asr_providers import _try_read_wav_duration_sec
+        from agent_voice_input.refiner import (
+            OpenAICompatibleRefiner,
+            OpenAIResponsesRefiner,
+            _build_responses_url,
+            create_refiner,
+        )
+
+        secret = "ds_test_aaaa1111"
+        env = {"DEEPSEEK_API_KEY": secret}
+        cfg = Config()
+        cfg.asr.provider = "deepseek"
+        cfg.asr.hotwords_file = ""
+        wav = _sample_wav()
+
+        # 1. P2-reqid: strict character whitelist + redaction
+        for raw_rid, want_rid in (
+            ("req-ds-001", "req-ds-001"),
+            ("trace/2026:abc_123.45-67", "trace/2026:abc_123.45-67"),
+            ("  req-trimmed-1  ", "req-trimmed-1"),
+            ("user said private transcript", ""),
+            ("包含中文的自由文本", ""),
+            ("req\ninjected", ""),
+            ("a" * 129, ""),
+            ("", ""),
+        ):
+            with self.subTest(raw_req_id=raw_rid):
+                res = transcribe(
+                    wav,
+                    cfg,
+                    env=env,
+                    transport=lambda _r, _rid=raw_rid: HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"request_id": _rid, "text": "ok", "duration_ms": 100}).encode("utf-8"),
+                    ),
+                )
+                self.assertEqual(res.request_id, want_rid)
+
+        res_secret_rid = transcribe(
+            wav,
+            cfg,
+            env=env,
+            transport=lambda _r: HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"request_id": f"req-{secret}", "text": "ok"}).encode("utf-8"),
+            ),
+        )
+        self.assertNotIn(secret, res_secret_rid.request_id)
+        self.assertIn("[REDACTED]", res_secret_rid.request_id)
+
+        # 2. P2-stream-wav: 1s streaming WAV with 0xFFFFFFFF RIFF/data sizes must NOT trigger 120s reject
+        wav_1s = bytearray(pack_pcm16_mono_wav([1000] * 16000, sample_rate=16000))
+        struct.pack_into("<I", wav_1s, 4, 0xFFFFFFFF)
+        data_off = wav_1s.index(b"data")
+        struct.pack_into("<I", wav_1s, data_off + 4, 0xFFFFFFFF)
+        stream_wav = bytes(wav_1s)
+        self.assertIsNone(_try_read_wav_duration_sec(stream_wav))
+        stream_calls = [0]
+
+        def stream_tx(_req: HttpRequest) -> HttpResponse:
+            stream_calls[0] += 1
+            return HttpResponse(200, {"content-type": "application/json"}, b'{"request_id":"req-s1","text":"stream ok"}')
+
+        stream_res = transcribe(stream_wav, cfg, env=env, transport=stream_tx)
+        self.assertEqual(stream_calls[0], 1)
+        self.assertEqual(stream_res.text, "stream ok")
+
+        # 3. P2-ipv6-url: malformed IPv6 base_url wrapped as AsrError(retry_kind="never") with redaction
+        cfg_bad = Config()
+        cfg_bad.asr.provider = "deepseek"
+        cfg_bad.asr.base_url = f"https://[invalid-ipv6/v1?token={secret}"
+        cfg_bad.asr.hotwords_file = ""
+        with self.assertRaises(AsrError) as ipv6_ctx:
+            transcribe(wav, cfg_bad, env=env, transport=stream_tx)
+        self.assertEqual(ipv6_ctx.exception.retry_kind, "never")
+        self.assertNotIn(secret, str(ipv6_ctx.exception))
+
+        # 4. P2-ds-refiner: DeepSeek Refiner reuses resolve_deepseek_endpoint_url for chat & responses
+        for raw_base, want_chat, want_resp in (
+            ("", "https://api.deepseek.com/v1/chat/completions", "https://api.deepseek.com/v1/responses"),
+            ("https://api.deepseek.com", "https://api.deepseek.com/v1/chat/completions", "https://api.deepseek.com/v1/responses"),
+            ("https://api.deepseek.com/v1/tools/asr", "https://api.deepseek.com/v1/chat/completions", "https://api.deepseek.com/v1/responses"),
+            (
+                "https://proxy.example/custom/v1?tenant=demo",
+                "https://proxy.example/custom/v1/chat/completions?tenant=demo",
+                "https://proxy.example/custom/v1/responses?tenant=demo",
+            ),
+            (
+                "https://proxy.example/v1/chat/completions?tenant=demo",
+                "https://proxy.example/v1/chat/completions?tenant=demo",
+                "https://proxy.example/v1/responses?tenant=demo",
+            ),
+        ):
+            with self.subTest(ds_refiner_base=raw_base):
+                seen_reqs: list[HttpRequest] = []
+
+                def ref_tx(req: HttpRequest) -> HttpResponse:
+                    seen_reqs.append(req)
+                    return HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"choices": [{"message": {"content": "精修文本"}}]}).encode("utf-8"),
+                    )
+
+                c_ref = Config()
+                c_ref.refiner.provider = "deepseek"
+                c_ref.refiner.base_url = raw_base
+                ref_chat = create_refiner(c_ref, env=env, transport=ref_tx)
+                self.assertIsInstance(ref_chat, OpenAICompatibleRefiner)
+                r_out = ref_chat.refine("测试草稿")
+                self.assertEqual(r_out.text, "精修文本")
+                self.assertEqual(seen_reqs[0].url, want_chat)
+                body_obj = json.loads(seen_reqs[0].body.decode("utf-8"))
+                self.assertNotIn("service_tier", body_obj)
+
+                self.assertEqual(
+                    _build_responses_url(raw_base, default_base_url="https://api.openai.com/v1", provider_name="deepseek"),
+                    want_resp,
+                )
+                c_resp = Config()
+                c_resp.refiner.provider = "deepseek"
+                c_resp.refiner.api = "responses"
+                c_resp.refiner.base_url = raw_base
+                ref_resp = create_refiner(c_resp, env=env)
+                self.assertIsInstance(ref_resp, OpenAIResponsesRefiner)
+                assert isinstance(ref_resp, OpenAIResponsesRefiner)
+                try:
+                    auth_target = ref_resp._resolve_endpoint_and_auth()
+                    self.assertEqual(auth_target.url, want_resp)
+                finally:
+                    ref_resp.close()
+
+        # Malformed IPv6 base_url on DeepSeek refiner degrades gracefully to asr_draft without crashing
+        c_bad_ref = Config()
+        c_bad_ref.refiner.provider = "deepseek"
+        c_bad_ref.refiner.base_url = f"https://[invalid-ipv6/v1?k={secret}"
+        ref_bad = create_refiner(c_bad_ref, env=env)
+        bad_out = ref_bad.refine("原始草稿")
+        self.assertEqual(bad_out.used_fallback, "asr_draft")
+        self.assertEqual(bad_out.text, "原始草稿")
+        self.assertNotIn(secret, bad_out.warning)
 
 
 if __name__ == "__main__":

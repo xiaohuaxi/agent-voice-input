@@ -4,6 +4,13 @@
 #   Claude Code (~/.claude/settings.json):  ~/.local/bin/remote-title-hook.sh claude
 #   Antigravity CLI (~/.gemini/config/hooks.json; legacy ~/.gemini/hooks.json): ~/.local/bin/remote-title-hook.sh agy
 set -u
+export PATH="${HOME:+$HOME/.local/bin:}/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+if ! command -v python3 >/dev/null 2>&1; then
+  case "${1:-auto}" in
+    [Aa][Gg][Yy]|[Gg][Ee][Mm][Ii][Nn][Ii]) printf '{}\n' ;;
+  esac
+  exit 0
+fi
 exec python3 -c '
 import json, os, re, shutil, socket, stat, subprocess, sys
 

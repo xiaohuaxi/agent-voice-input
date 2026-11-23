@@ -872,6 +872,8 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                     "cached_input_tokens": 0,
                     "reasoning_tokens": 0,
                     "asr_chunk_secs": [1.5, 2.5],
+                    "asr_duration_ms": 2340,
+                    "asr_request_id": "req-ds-001",
                     "text": "PRIVATE_DICTATION_SHOULD_BE_DROPPED",
                     "transcript": "SECRET_SYNTHETIC_FIELD",
                 },
@@ -885,6 +887,8 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                     "session_key": "agy:private-session-1111",
                     "asr_provider": "dashscope",
                     "refiner_provider": "deepseek",
+                    "asr_duration_ms": 1850,
+                    "asr_request_id": f"req-{secret_key}",
                     "refiner_fallback": "asr_draft",
                     "refiner_warning": f"upstream failed token={secret_key}",
                     "sync_ms": 5,
@@ -960,6 +964,11 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
             self.assertNotIn("SECRET_SYNTHETIC_FIELD", raw_j)
             data = json.loads(raw_j)
             self.assertEqual(data["recent_results"][0]["asr_chunk_secs"], [1.5, 2.5])
+            self.assertEqual(data["recent_results"][0]["asr_duration_ms"], 2340)
+            self.assertEqual(data["recent_results"][0]["asr_request_id"], "req-ds-001")
+            self.assertEqual(data["recent_results"][1]["asr_duration_ms"], 1850)
+            self.assertIn("[REDACTED]", data["recent_results"][1]["asr_request_id"])
+            self.assertNotIn(secret_key, data["recent_results"][1]["asr_request_id"])
             self.assertTrue(all(len(ln) <= 241 for ln in data["daemon_log_tail"].splitlines()))
             self.assertEqual(data["summary"]["total"], 3)
             self.assertEqual(data["summary"]["ok_count"], 2)
@@ -1039,6 +1048,90 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
             finally:
                 conn2.close()
             self.assertFalse(probe_optional_legacy_codex_sqlite(rt)["has_logs_table"])
+
+    def test_probe_stage_ping_invalid_ipv6_url_returns_fail_and_remote_hook_path_fallback(self) -> None:
+        import pty
+        import select
+        import subprocess
+        from agent_voice_input.config import Config, resolve_credentials
+
+        # 1. P2-ipv6-url: _probe_stage_ping catches ValueError from malformed IPv6 base_url cleanly
+        secret = "ds_test_bbbb2222"
+        cfg = Config()
+        cfg.asr.provider = "deepseek"
+        cfg.asr.base_url = f"https://[invalid-ipv6/v1?k={secret}"
+        env = {"DEEPSEEK_API_KEY": secret}
+        creds = resolve_credentials(cfg, env)
+        st, _ms, msg = cli_mod._probe_stage_ping(
+            stage="asr",
+            provider="deepseek",
+            cfg=cfg,
+            creds=creds,
+            env=env,
+            base_url=cfg.asr.base_url,
+            transport=lambda _r: self.fail("transport must not be called on invalid URL"),
+            cache={},
+        )
+        self.assertEqual(st, "FAIL")
+        self.assertTrue(msg.startswith("FAIL ("))
+        self.assertNotIn(secret, msg)
+
+        # 2. P2-remote-hook: works under stripped PATH="" and exits cleanly with {} for agy/gemini if python3 missing
+        hook_sh = Path(__file__).resolve().parents[1] / "integrations" / "remote" / "remote-title-hook.sh"
+        bash_bin = "/bin/bash" if os.path.isfile("/bin/bash") else "/usr/bin/bash"
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "demo-repo"
+            proj.mkdir()
+            master_fd, slave_fd = pty.openpty()
+            try:
+                slave_tty = os.ttyname(slave_fd)
+                os.set_blocking(master_fd, False)
+                p_agy = subprocess.run(
+                    [bash_bin, str(hook_sh), "agy"],
+                    input=json.dumps(
+                        {"conversationId": "abcdef12-1111-4222-8333-444455556666", "workspacePaths": [str(proj)]}
+                    ).encode("utf-8"),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={
+                        "HOME": td,
+                        "PATH": "",
+                        "AVI_TEST_TTY_PATH": slave_tty,
+                        "AGENT_VOICE_INPUT_HOST_TAG": "srv1",
+                        "TMUX_PANE": "",
+                    },
+                    timeout=5.0,
+                    check=False,
+                )
+                self.assertEqual(p_agy.returncode, 0, msg=p_agy.stderr.decode("utf-8", errors="replace"))
+                self.assertEqual(json.loads(p_agy.stdout.decode("utf-8")), {})
+                rlist, _, _ = select.select([master_fd], [], [], 0.3)
+                self.assertTrue(rlist, "remote-title-hook.sh must still find python3 and write OSC 2 under PATH=''")
+                osc = os.read(master_fd, 4096).decode("utf-8")
+                self.assertEqual(osc, "\033]2;agy · demo-repo [#abcdef12] [@srv1]\007")
+            finally:
+                os.close(master_fd)
+                os.close(slave_fd)
+
+        # Missing python3 fallback: agy/gemini emit {} and exit 0; claude/auto stay silent and exit 0
+        wrapper = (
+            'command() { if [ "${1:-}" = "-v" ] && [ "${2:-}" = "python3" ]; then return 1; fi; '
+            'builtin command "$@"; }; '
+            'source "$1" "$2"'
+        )
+        for mode, want_stdout in (("agy", "{}\n"), ("gemini", "{}\n"), ("claude", ""), ("auto", "")):
+            with self.subTest(missing_python3_mode=mode):
+                p_miss = subprocess.run(
+                    [bash_bin, "-c", wrapper, "_", str(hook_sh), mode],
+                    input=b"{}",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={"HOME": "/nonexistent", "PATH": ""},
+                    timeout=5.0,
+                    check=False,
+                )
+                self.assertEqual(p_miss.returncode, 0, msg=p_miss.stderr.decode("utf-8", errors="replace"))
+                self.assertEqual(p_miss.stdout.decode("utf-8"), want_stdout)
 
 
 if __name__ == "__main__":

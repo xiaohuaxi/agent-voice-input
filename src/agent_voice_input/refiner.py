@@ -109,6 +109,7 @@ from .config import (
     resolve_codex_default_model,
     resolve_codex_home_dir,
     resolve_credentials,
+    resolve_deepseek_endpoint_url,
     select_refiner_provider,
 )
 from .prompts import (
@@ -516,7 +517,9 @@ def _extract_jwt_metadata(token: str) -> tuple[int | None, str, bool]:
     return exp, "", False
 
 
-def _build_responses_url(base_url: str, *, default_base_url: str) -> str:
+def _build_responses_url(base_url: str, *, default_base_url: str, provider_name: str = "") -> str:
+    if provider_name.strip().lower() == "deepseek":
+        return resolve_deepseek_endpoint_url(base_url, "/responses")
     base = (base_url.strip() or default_base_url).rstrip("/")
     return base if base.endswith("/responses") else f"{base}/responses"
 
@@ -1227,7 +1230,11 @@ class OpenAIResponsesRefiner(BaseRefiner):
         base = self.cfg.refiner.effective_base_url(self.provider_name).strip()
         if self.provider_name == "openai-compatible" and not base:
             raise ConfigError("refiner.base_url must be explicitly set when refiner.provider is 'openai-compatible'")
-        url = _build_responses_url(base, default_base_url=OPENAI_DEFAULT_BASE_URL)
+        url = _build_responses_url(
+            base,
+            default_base_url=OPENAI_DEFAULT_BASE_URL,
+            provider_name=self.provider_name,
+        )
         key = _resolve_refiner_api_key(self.cfg, self.creds, self.provider_name, url)
         parsed = urllib.parse.urlsplit(url)
         origin = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
@@ -2718,10 +2725,19 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
         t0 = self.clock_fn()
         if c_kind := _cancel_fallback_kind(cancel_token, is_cancelled):
             return _fallback_result(clean_draft, self.provider_name, model, t0, self.clock_fn, c_kind)
-        base = (self.cfg.refiner.effective_base_url(self.provider_name).strip() or OPENAI_DEFAULT_BASE_URL).rstrip("/")
-        url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
         secrets: tuple[str, ...] = tuple(self.creds.all_secret_values())
         try:
+            if self.provider_name == "deepseek":
+                url = resolve_deepseek_endpoint_url(
+                    self.cfg.refiner.effective_base_url(self.provider_name),
+                    "/chat/completions",
+                )
+            else:
+                base = (
+                    self.cfg.refiner.effective_base_url(self.provider_name).strip()
+                    or OPENAI_DEFAULT_BASE_URL
+                ).rstrip("/")
+                url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
             key = _resolve_refiner_api_key(self.cfg, self.creds, self.provider_name, url)
         except Exception as exc:
             warn = redact_secrets(str(exc), self.env, cfg=self.cfg, extra_secrets=secrets)
