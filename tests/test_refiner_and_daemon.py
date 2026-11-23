@@ -11798,14 +11798,17 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 _is_control_peer_disconnected(srv_end),
                 "Client half-close shutdown(SHUT_WR) must NOT be treated as disconnected",
             )
-            with mock.patch.object(select, "poll", None, create=True):
-                self.assertFalse(_is_control_peer_disconnected(srv_end))
             cli_end.close()
             time.sleep(0.02)
             self.assertTrue(
                 _is_control_peer_disconnected(srv_end),
                 "Full client close() MUST be detected as disconnected",
             )
+            with (
+                mock.patch.object(select, "kqueue", None, create=True),
+                mock.patch.object(select, "poll", None, create=True),
+            ):
+                self.assertFalse(_is_control_peer_disconnected(srv_end))
         finally:
             srv_end.close()
             cli_end.close()
@@ -11919,6 +11922,87 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 asr.release.set()
                 daemon.close()
                 srv_th.join(timeout=2.0)
+
+    def test_control_peer_disconnected_kqueue_branch_flags_and_close(self) -> None:
+        import select
+        import types
+        from unittest import mock
+        from agent_voice_input.daemon import _is_control_peer_disconnected
+
+        KQ_FILTER_WRITE = -2
+        KQ_EV_ADD = 0x1
+        KQ_EV_ONESHOT = 0x10
+        KQ_EV_ERROR = 0x4000
+        KQ_EV_EOF = 0x8000
+
+        class _FakeConn:
+            def __init__(self, fd: int = 42) -> None:
+                self._fd = fd
+
+            def fileno(self) -> int:
+                return self._fd
+
+        created: list[_FakeKQueue] = []
+        captured_kevents: list[tuple[int, int, int]] = []
+        next_outcome: list[object] = [[]]
+
+        class _FakeKQueue:
+            def __init__(self) -> None:
+                self.closed = False
+                self.control_calls: list[tuple[list[object], int, int]] = []
+                created.append(self)
+
+            def control(self, changelist: list[object], max_events: int, timeout: int) -> list[object]:
+                self.control_calls.append((changelist, max_events, timeout))
+                outcome = next_outcome[0]
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                assert isinstance(outcome, list)
+                return outcome
+
+            def close(self) -> None:
+                self.closed = True
+
+        def _fake_kevent(ident: int, *, filter: int, flags: int) -> object:
+            captured_kevents.append((ident, filter, flags))
+            return types.SimpleNamespace(ident=ident, filter=filter, flags=flags)
+
+        with (
+            mock.patch.object(select, "kqueue", _FakeKQueue, create=True),
+            mock.patch.object(select, "kevent", _fake_kevent, create=True),
+            mock.patch.object(select, "KQ_FILTER_WRITE", KQ_FILTER_WRITE, create=True),
+            mock.patch.object(select, "KQ_EV_ADD", KQ_EV_ADD, create=True),
+            mock.patch.object(select, "KQ_EV_ONESHOT", KQ_EV_ONESHOT, create=True),
+            mock.patch.object(select, "KQ_EV_EOF", KQ_EV_EOF, create=True),
+            mock.patch.object(select, "KQ_EV_ERROR", KQ_EV_ERROR, create=True),
+        ):
+            conn = _FakeConn(42)
+            # 1. Empty event list (e.g. write buffer full) -> False, kq.close() called
+            next_outcome[0] = []
+            self.assertFalse(_is_control_peer_disconnected(conn))  # type: ignore[arg-type]
+            self.assertTrue(created[-1].closed)
+            self.assertEqual(captured_kevents[-1], (42, KQ_FILTER_WRITE, KQ_EV_ADD | KQ_EV_ONESHOT))
+            self.assertEqual(created[-1].control_calls[-1][1:], (1, 0))
+
+            # 2. Writable without KQ_EV_EOF (peer SHUT_WR on macOS/BSD: flags=0x1) -> False, kq.close() called
+            next_outcome[0] = [types.SimpleNamespace(flags=KQ_EV_ADD)]
+            self.assertFalse(_is_control_peer_disconnected(conn))  # type: ignore[arg-type]
+            self.assertTrue(created[-1].closed)
+
+            # 3. KQ_EV_EOF set (peer close() on macOS/BSD: flags=0x8001) -> True, kq.close() called
+            next_outcome[0] = [types.SimpleNamespace(flags=KQ_EV_ADD | KQ_EV_EOF)]
+            self.assertTrue(_is_control_peer_disconnected(conn))  # type: ignore[arg-type]
+            self.assertTrue(created[-1].closed)
+
+            # 4. KQ_EV_ERROR set -> True, kq.close() called
+            next_outcome[0] = [types.SimpleNamespace(flags=KQ_EV_ERROR)]
+            self.assertTrue(_is_control_peer_disconnected(conn))  # type: ignore[arg-type]
+            self.assertTrue(created[-1].closed)
+
+            # 5. OSError inside control() -> True, kq.close() still called via finally
+            next_outcome[0] = OSError("bad fd")
+            self.assertTrue(_is_control_peer_disconnected(conn))  # type: ignore[arg-type]
+            self.assertTrue(created[-1].closed)
 
     def test_selftest_wav_invalid_or_overflow_timeout_sec_rejects_cleanly_without_locking_gate(self) -> None:
         from unittest import mock

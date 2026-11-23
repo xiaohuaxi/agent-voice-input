@@ -1997,13 +1997,30 @@ def _parse_optional_timeout_sec(raw: Any) -> float | None:
 def _is_control_peer_disconnected(conn: socket.socket | None) -> bool:
     if conn is None:
         return False
-    poll_factory = getattr(select, "poll", None)
-    if poll_factory is None:
+    kqueue_factory = getattr(select, "kqueue", None)
+    kevent_factory = getattr(select, "kevent", None)
+    use_kqueue = callable(kqueue_factory) and callable(kevent_factory)
+    poll_factory = None if use_kqueue else getattr(select, "poll", None)
+    if not use_kqueue and not callable(poll_factory):
         return False
     try:
         fd = conn.fileno()
         if fd < 0:
             return True
+        if use_kqueue:
+            # BSD/macOS poll() sets POLLHUP on peer SHUT_WR; KQ_FILTER_WRITE
+            # only raises KQ_EV_EOF once the peer closes its read side too.
+            kq = kqueue_factory()
+            try:
+                ev = kevent_factory(
+                    fd,
+                    filter=select.KQ_FILTER_WRITE,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                )
+                eof_mask = select.KQ_EV_EOF | select.KQ_EV_ERROR
+                return any(bool(r.flags & eof_mask) for r in kq.control([ev], 1, 0))
+            finally:
+                kq.close()
         hangup_mask = (
             getattr(select, "POLLHUP", 0)
             | getattr(select, "POLLERR", 0)
