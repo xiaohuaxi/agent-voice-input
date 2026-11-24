@@ -751,14 +751,12 @@ class WslPlatform(JsonlShimMixin):
         *,
         origin_window: ForegroundWindow | None = None,
         fallback_clipboard_text: str | None = None,
-        preserve_clipboard: bool = False,
         suppress_beep: bool | Callable[[], bool] = False,
         is_cancelled: Callable[[], bool] | None = None,
         before_clipboard_write: Callable[[], None] | None = None,
         before_commit: Callable[[], bool] | None = None,
         same_window_verifier: Callable[[ForegroundWindow], bool] | None = None,
     ) -> PasteOutcome:
-        del preserve_clipboard
         eff_hwnd = target_hwnd or (origin_window.hwnd if origin_window is not None else 0)
         origin_proc = normalize_app_token(origin_window.process) if origin_window is not None else ""
         known_origin = (eff_hwnd > 0) or bool(origin_proc)
@@ -779,12 +777,18 @@ class WslPlatform(JsonlShimMixin):
                 "expect_process": origin_proc,
                 "paste_chord": paste_chord,
                 "force_clipboard_only": True,
+                "deadline_ms": 3800,
             }
             if fallback_clipboard_text is not None:
                 fb_req["fallback_text"] = fallback_clipboard_text
             if bool(suppress_beep() if callable(suppress_beep) else suppress_beep):
                 fb_req["suppress_beep"] = True
-            res_fb = self._dispatch_paste_rpc(fb_req, timeout_sec=5.0)
+            try:
+                res_fb = self._dispatch_paste_rpc(fb_req, timeout_sec=5.0)
+            except Exception:
+                return PasteOutcome(False, False, "shim_paste_unconfirmed", origin_proc, used_clipboard_paste=False)
+            if not isinstance(res_fb, dict) or res_fb.get("ok") is False or "error" in res_fb or "clipboard" not in res_fb:
+                return PasteOutcome(False, False, "shim_paste_unconfirmed", origin_proc, used_clipboard_paste=False)
             clip_ok = bool(res_fb.get("clipboard"))
             fg_proc_fb = str(res_fb.get("fg_process") or "")
             return PasteOutcome(
@@ -797,12 +801,12 @@ class WslPlatform(JsonlShimMixin):
 
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", "")
-        if origin_window is not None and origin_window.origin_drifted:
-            return _fallback_clipboard_via_shim()
         if before_clipboard_write is not None:
             before_clipboard_write()
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", "")
+        if origin_window is not None and origin_window.origin_drifted:
+            return _fallback_clipboard_via_shim()
         orig_session_tok = ""
         if (
             origin_window is not None
@@ -813,19 +817,21 @@ class WslPlatform(JsonlShimMixin):
 
         hold_timeout_sec = self._effective_paste_hold_timeout_sec()
         hold_deadline = time.monotonic() + hold_timeout_sec
-        prechecked_key_state = False
         waited_for_key = False
-        if before_commit is not None and self._shim is not None and self._shim.poll() is None:
-            prechecked_key_state = True
+        if not self._closed and self._shim is not None and self._shim.poll() is None:
             while True:
                 if cancelled_fn():
                     return PasteOutcome(False, False, "cancelled", "")
-                if self._shim is None or self._shim.poll() is not None:
-                    prechecked_key_state = False
+                if self._closed or self._shim is None or self._shim.poll() is not None:
                     break
-                ks = self._dispatch_paste_rpc({"cmd": "key_state"}, timeout_sec=0.8)
+                try:
+                    ks = self._dispatch_paste_rpc({"cmd": "key_state"}, timeout_sec=0.8)
+                except Exception:
+                    return PasteOutcome(False, False, "shim_paste_unconfirmed", origin_proc, used_clipboard_paste=False)
                 if cancelled_fn():
                     return PasteOutcome(False, False, "cancelled", "")
+                if not isinstance(ks, dict) or ks.get("ok") is False or "error" in ks:
+                    return PasteOutcome(False, False, "shim_paste_unconfirmed", origin_proc, used_clipboard_paste=False)
                 if not ks.get("hotkey_held"):
                     now_flush = time.monotonic()
                     rem_flush = hold_deadline - now_flush
@@ -853,54 +859,50 @@ class WslPlatform(JsonlShimMixin):
                 waited_for_key = True
                 sleep_cooperative(min(0.05, rem_ks), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
 
-        while True:
-            if cancelled_fn():
-                return PasteOutcome(False, False, "cancelled", "")
-            if same_window_verifier is not None:
-                try:
-                    cur_fg = self.get_foreground_window()
-                    verified = bool(same_window_verifier(cur_fg))
-                except Exception:
-                    verified = False
-                if not verified:
-                    return _fallback_clipboard_via_shim()
-            if not _confirm_commit():
-                return PasteOutcome(False, False, "cancelled", "")
-            req: dict[str, Any] = {
-                "cmd": "paste",
-                "seq_id": seq_id,
-                "text": text,
-                "target_hwnd": eff_hwnd,
-                "expect_terminal": expect_terminal,
-                "expect_process": origin_proc,
-                "paste_chord": paste_chord,
-            }
-            if orig_session_tok:
-                req["expect_session_token"] = orig_session_tok
-            if fallback_clipboard_text is not None and fallback_clipboard_text != text:
-                req["fallback_text"] = fallback_clipboard_text
-            if bool(suppress_beep() if callable(suppress_beep) else suppress_beep):
-                req["suppress_beep"] = True
-            res = self._dispatch_paste_rpc(req, timeout_sec=5.0)
-            reason = str(res.get("reason") or "ok")
-            fg_proc = str(res.get("fg_process") or "")
-            clip_ok = bool(res.get("clipboard"))
-            if reason != "hotkey_held":
-                pasted = bool(res.get("pasted"))
-                return PasteOutcome(
-                    pasted,
-                    clip_ok,
-                    reason,
-                    fg_proc,
-                    used_clipboard_paste=bool(pasted and clip_ok),
-                )
-            if clip_ok or prechecked_key_state:
-                break
-            rem = hold_deadline - time.monotonic()
-            if rem <= 0.0:
-                break
-            sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
-
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", "")
-        return _fallback_clipboard_via_shim()
+        if same_window_verifier is not None:
+            try:
+                cur_fg = self.get_foreground_window()
+                verified = bool(same_window_verifier(cur_fg))
+            except Exception:
+                verified = False
+            if not verified:
+                return _fallback_clipboard_via_shim()
+        if not _confirm_commit():
+            return PasteOutcome(False, False, "cancelled", "")
+        req: dict[str, Any] = {
+            "cmd": "paste",
+            "seq_id": seq_id,
+            "text": text,
+            "target_hwnd": eff_hwnd,
+            "expect_terminal": expect_terminal,
+            "expect_process": origin_proc,
+            "paste_chord": paste_chord,
+            "deadline_ms": 3800,
+        }
+        if orig_session_tok:
+            req["expect_session_token"] = orig_session_tok
+        if fallback_clipboard_text is not None and fallback_clipboard_text != text:
+            req["fallback_text"] = fallback_clipboard_text
+        if bool(suppress_beep() if callable(suppress_beep) else suppress_beep):
+            req["suppress_beep"] = True
+        try:
+            res = self._dispatch_paste_rpc(req, timeout_sec=5.0)
+        except Exception:
+            # RPC timed out or reply lost: NEVER send a second blind clipboard-overwrite RPC;
+            # return unconfirmed so daemon stashes WAV in failed/ for retry.
+            return PasteOutcome(False, False, "shim_paste_unconfirmed", origin_proc, used_clipboard_paste=False)
+        if not isinstance(res, dict) or res.get("ok") is False or "error" in res or "clipboard" not in res:
+            return PasteOutcome(False, False, "shim_paste_unconfirmed", origin_proc, used_clipboard_paste=False)
+        pasted = bool(res.get("pasted"))
+        clip_ok = bool(res.get("clipboard"))
+        reason = str(res.get("reason") or ("ok" if pasted else ("clipboard_only" if clip_ok else "clipboard_failed")))
+        fg_proc = str(res.get("fg_process") or "")
+        return PasteOutcome(
+            pasted,
+            clip_ok,
+            reason,
+            fg_proc,
+            used_clipboard_paste=bool(pasted and clip_ok),
+        )

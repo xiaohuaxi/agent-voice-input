@@ -730,6 +730,15 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
             sent_rpcs.append(dict(payload))
             cur_proc = str(fg_reply[0].get("process") or "WindowsTerminal.exe")
             cur_title = str(fg_reply[0].get("title") or "")
+            if payload.get("cmd") == "key_state":
+                if hold_steps[0] > 0:
+                    hold_steps[0] -= 1
+                    if on_hotkey_held:
+                        fn = on_hotkey_held[0]
+                        if callable(fn):
+                            fn()
+                    return {"ok": True, "hotkey_held": True}
+                return {"ok": True, "hotkey_held": False}
             if payload.get("force_clipboard_only"):
                 return {
                     "ok": True,
@@ -746,19 +755,6 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
                     "pasted": False,
                     "clipboard": True,
                     "reason": "focus_changed",
-                    "fg_process": cur_proc,
-                }
-            if hold_steps[0] > 0:
-                hold_steps[0] -= 1
-                if on_hotkey_held:
-                    fn = on_hotkey_held[0]
-                    if callable(fn):
-                        fn()
-                return {
-                    "ok": True,
-                    "pasted": False,
-                    "clipboard": False,
-                    "reason": "hotkey_held",
                     "fg_process": cur_proc,
                 }
             return {
@@ -832,7 +828,14 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
         self.assertEqual(sent_rpcs[0].get("expect_session_token"), "abcd1234")
         self.assertEqual(sent_rpcs[0].get("fallback_text"), "前段\n\n同窗切Tab拦截")
 
-        # 4. P0 Guard: Switching to a DIFFERENT [#id8] tab WHILE waiting for hotkey release (hotkey_held) is also blocked!
+        # 4. P0 Guard: Switching to a DIFFERENT [#id8] tab WHILE waiting for hotkey release (key_state) is also blocked
+        #    with a single paste RPC (no duplicate paste / no second force_clipboard_only RPC)!
+        class _AliveShim:
+            def poll(self) -> None:
+                return None
+
+        plat._shim = _AliveShim()  # type: ignore[assignment]
+        plat._flush_shim_events = lambda timeout_sec=0.05: True  # type: ignore[method-assign]
         sent_rpcs.clear()
         fg_reply[0] = {"ok": True, "hwnd": 700, "process": "WindowsTerminal.exe", "title": "claude [#abcd1234] — Tab A"}
         hold_steps[0] = 1
@@ -850,7 +853,9 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
         self.assertFalse(out_wt_hold_switch.pasted)
         self.assertTrue(out_wt_hold_switch.clipboard)
         self.assertEqual(out_wt_hold_switch.reason, "focus_changed")
-        self.assertEqual(len(sent_rpcs), 2)
+        paste_only_rpcs = [r for r in sent_rpcs if r.get("cmd") == "paste"]
+        self.assertEqual(len(paste_only_rpcs), 1)
+        self.assertEqual([r.get("cmd") for r in sent_rpcs], ["key_state", "key_state", "paste"])
 
     def test_wsl_deliver_text_flush_barrier_and_tap_toggle_hold_timeout(self) -> None:
         """P1-C7 + P2-bridge-misc (b): WSL consumes _flush_shim_events (including waited_for_key=False) and caps tap_toggle timeout."""
@@ -1111,6 +1116,7 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
             self.assertEqual(paste_rpc_calls[0][0].get("expect_bundle_id"), "com.openai.chat")
             self.assertEqual(paste_rpc_calls[0][0].get("expect_process"), "ChatGPT")
             self.assertEqual(paste_rpc_calls[0][0].get("expect_hwnd"), 42)
+            self.assertEqual(paste_rpc_calls[0][0].get("deadline_ms"), 750)
             self.assertEqual(pbcopy_writes, ["发给桌面版ChatGPT的内容"])
 
             # Empty ForegroundWindow() (origin capture failure) MUST NOT paste into non-terminal GUI!
@@ -1176,7 +1182,8 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
             self.assertEqual(beeps, ["focus"])
             self.assertEqual(pbcopy_writes, ["无辅助功能权限", "上一段\n\n无辅助功能权限"])
 
-            # 3. In-flight RPC timeout/EOF (both None from _shim_graceful AND Exception) -> NEVER falls back to osascript!
+            # 3. In-flight RPC timeout/EOF (both None from _shim_graceful AND Exception) -> NEVER falls back to osascript
+            #    and NEVER performs a second pbcopy overwrite (A+B); returns clipboard=False so daemon stashes in failed/.
             for idx_case, failure_beh in enumerate((None, TimeoutError("shim paste_cmd_v timed out")), start=1):
                 beeps.clear()
                 pbcopy_writes.clear()
@@ -1188,10 +1195,11 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
                     fallback_clipboard_text="前文\n\n超时防双贴",
                 )
                 self.assertFalse(out_rpc_err.pasted, msg=failure_beh)
-                self.assertTrue(out_rpc_err.clipboard, msg=failure_beh)
+                self.assertFalse(out_rpc_err.clipboard, msg=failure_beh)
                 self.assertEqual(out_rpc_err.reason, "shim_paste_unconfirmed", msg=failure_beh)
                 self.assertEqual(osa_cmd_v_calls[0], 0, msg=failure_beh)
-                self.assertEqual(pbcopy_writes, ["超时防双贴", "前文\n\n超时防双贴"])
+                self.assertEqual(beeps, [], msg=failure_beh)
+                self.assertEqual(pbcopy_writes, ["超时防双贴"], msg=failure_beh)
 
             # 3b. Focus drift caught inside mac_shim right before CGEvent post (during pbcopy race window)
             beeps.clear()
@@ -1242,7 +1250,6 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
                 "tmux直投零剪贴板",
                 seq_id=8,
                 origin_window=iterm_tmux_fg,
-                preserve_clipboard=False,
             )
             self.assertTrue(out_tmux_direct.pasted)
             self.assertFalse(out_tmux_direct.clipboard)

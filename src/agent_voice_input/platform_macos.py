@@ -2445,7 +2445,7 @@ class MacOSPlatform(JsonlShimMixin):
     ) -> tuple[bool, str, str]:
         cur_proc = expected_fg.process if expected_fg is not None else ""
         if self._has_managed_shim():
-            req: dict[str, Any] = {"cmd": "paste_cmd_v"}
+            req: dict[str, Any] = {"cmd": "paste_cmd_v", "deadline_ms": 750}
             self._populate_paste_expectations(req, origin_window=origin_window, expected_fg=expected_fg)
             try:
                 res = self._shim_rpc(req, timeout_sec=1.0, allow_retry=False)
@@ -2481,6 +2481,23 @@ class MacOSPlatform(JsonlShimMixin):
         )
         return False, reason, cur_proc
 
+    def _copy_via_shim_clip(self, text: str) -> tuple[bool, str]:
+        req: dict[str, Any] = {
+            "cmd": "paste_cmd_v",
+            "text": text,
+            "force_clipboard_only": True,
+            "deadline_ms": 1150,
+        }
+        try:
+            res = self._shim_rpc(req, timeout_sec=1.5, allow_retry=False)
+        except Exception:
+            res = None
+        if isinstance(res, dict) and res.get("ok") is True and bool(res.get("clipboard")):
+            return True, str(res.get("reason") or "clipboard_only")
+        if isinstance(res, dict) and res.get("reason"):
+            return False, str(res.get("reason"))
+        return False, "clipboard_failed"
+
     def _deliver_cmd_v_via_shim_clip(
         self,
         text: str,
@@ -2491,7 +2508,7 @@ class MacOSPlatform(JsonlShimMixin):
         is_beep_suppressed: Callable[[], bool],
     ) -> PasteOutcome:
         cur_proc = expected_fg.process
-        req: dict[str, Any] = {"cmd": "paste_cmd_v", "text": text}
+        req: dict[str, Any] = {"cmd": "paste_cmd_v", "text": text, "deadline_ms": 1150}
         if fallback_clipboard_text is not None and fallback_clipboard_text != text:
             req["fallback_text"] = fallback_clipboard_text
         self._populate_paste_expectations(req, origin_window=origin_window, expected_fg=expected_fg)
@@ -2500,25 +2517,7 @@ class MacOSPlatform(JsonlShimMixin):
             res = self._shim_rpc(req, timeout_sec=1.5, allow_retry=False)
         except Exception:
             res = None
-        if isinstance(res, dict) and res.get("reason") == "key_held" and not res.get("posted"):
-            eff_fg_proc = str(res.get("fg_process")) if "fg_process" in res else cur_proc
-            fb_txt = fallback_clipboard_text if fallback_clipboard_text is not None else text
-            clip_ok = self._copy_to_clipboard(fb_txt)
-            if clip_ok and not is_beep_suppressed():
-                self.beep("focus")
-            return PasteOutcome(
-                False,
-                clip_ok,
-                "key_held" if clip_ok else "clipboard_failed",
-                eff_fg_proc,
-                used_clipboard_paste=False,
-            )
-        if (
-            isinstance(res, dict)
-            and res.get("ok") is True
-            and "clipboard" in res
-            and res.get("reason") != "shim_paste_unconfirmed"
-        ):
+        if isinstance(res, dict) and res.get("ok") is True and "clipboard" in res:
             posted_ok = bool(res.get("posted"))
             clip_ok = bool(res.get("clipboard"))
             eff_fg_proc = str(res.get("fg_process")) if "fg_process" in res else cur_proc
@@ -2542,15 +2541,18 @@ class MacOSPlatform(JsonlShimMixin):
             if not is_beep_suppressed():
                 self.beep("focus")
             return PasteOutcome(False, True, post_reason, eff_fg_proc, used_clipboard_paste=False)
-        # RPC timed out or failed: NEVER send osascript Cmd+V (avoid double paste); ensure fallback text is on clipboard.
-        fb_txt = fallback_clipboard_text if fallback_clipboard_text is not None else text
-        clip_ok = self._copy_to_clipboard(fb_txt)
-        if clip_ok and not is_beep_suppressed():
-            self.beep("focus")
+        if isinstance(res, dict) and res.get("reason") == "key_held" and not res.get("posted"):
+            eff_fg_proc = str(res.get("fg_process")) if "fg_process" in res else cur_proc
+            clip_ok = bool(res.get("clipboard"))
+            if clip_ok and not is_beep_suppressed():
+                self.beep("focus")
+            return PasteOutcome(False, clip_ok, "key_held", eff_fg_proc, used_clipboard_paste=False)
+        # RPC timed out or reply lost: NEVER send osascript Cmd+V and NEVER blind-overwrite clipboard via pbcopy;
+        # return unconfirmed so daemon stashes WAV in failed/ for retry.
         return PasteOutcome(
             False,
-            clip_ok,
-            "shim_paste_unconfirmed" if clip_ok else "clipboard_failed",
+            False,
+            "shim_paste_unconfirmed",
             cur_proc,
             used_clipboard_paste=False,
         )
@@ -2563,18 +2565,27 @@ class MacOSPlatform(JsonlShimMixin):
         *,
         origin_window: ForegroundWindow | None = None,
         fallback_clipboard_text: str | None = None,
-        preserve_clipboard: bool = False,
         suppress_beep: bool | Callable[[], bool] = False,
         is_cancelled: Callable[[], bool] | None = None,
         before_clipboard_write: Callable[[], None] | None = None,
         before_commit: Callable[[], bool] | None = None,
         same_window_verifier: Callable[[ForegroundWindow], bool] | None = None,
     ) -> PasteOutcome:
-        del target_hwnd, preserve_clipboard
+        del target_hwnd
         cancelled_fn = lambda: bool(is_cancelled is not None and is_cancelled())
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", "")
         _confirm_commit = make_once_commit_guard(cancelled_fn, before_commit)
+        settled = False
+
+        def _ensure_clipboard_settled() -> bool:
+            nonlocal settled
+            if settled or before_clipboard_write is None:
+                return False
+            settled = True
+            t_settle0 = time.monotonic()
+            settle_ret = before_clipboard_write()
+            return bool(settle_ret) or (time.monotonic() - t_settle0) >= 0.001
 
         def _verify_same_window(cur_fg: ForegroundWindow) -> bool:
             if same_window_verifier is None:
@@ -2587,19 +2598,22 @@ class MacOSPlatform(JsonlShimMixin):
         def _is_beep_suppressed() -> bool:
             return bool(suppress_beep() if callable(suppress_beep) else suppress_beep)
 
-        def _fallback_to_clipboard(reason_if_ok: str, fg_proc: str, *, skip_settle: bool = False) -> PasteOutcome:
-            if before_clipboard_write is not None and not skip_settle:
-                before_clipboard_write()
+        def _fallback_to_clipboard(reason_if_ok: str, fg_proc: str) -> PasteOutcome:
+            _ensure_clipboard_settled()
             if not _confirm_commit():
                 return PasteOutcome(False, False, "cancelled", fg_proc)
             fb_txt = fallback_clipboard_text if fallback_clipboard_text is not None else text
-            clip_ok = self._copy_to_clipboard(fb_txt)
+            if self._shim_supports_paste_clip():
+                clip_ok, clip_reason = self._copy_via_shim_clip(fb_txt)
+            else:
+                clip_ok = self._copy_to_clipboard(fb_txt)
+                clip_reason = "clipboard_failed"
             if clip_ok and not _is_beep_suppressed():
                 self.beep("focus")
             return PasteOutcome(
                 False,
                 clip_ok,
-                reason_if_ok if clip_ok else "clipboard_failed",
+                reason_if_ok if clip_ok else (clip_reason or "clipboard_failed"),
                 fg_proc,
                 used_clipboard_paste=False,
             )
@@ -2706,11 +2720,7 @@ class MacOSPlatform(JsonlShimMixin):
             if tmux_out in ("focus_changed", "tmux_paste_failed"):
                 return _fallback_to_clipboard(tmux_out, fg.process)
 
-        waited_for_settle = False
-        if before_clipboard_write is not None:
-            t_settle0 = time.monotonic()
-            settle_ret = before_clipboard_write()
-            waited_for_settle = bool(settle_ret) or (time.monotonic() - t_settle0) >= 0.001
+        waited_for_settle = _ensure_clipboard_settled()
         if cancelled_fn():
             return PasteOutcome(False, False, "cancelled", fg.process)
 
@@ -2748,15 +2758,15 @@ class MacOSPlatform(JsonlShimMixin):
                 if cancelled_fn():
                     return PasteOutcome(False, False, "cancelled", fg.process)
                 if not self._has_managed_shim():
-                    return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                    return _fallback_to_clipboard("focus_changed", fg.process)
                 poll_started = time.monotonic()
                 if waited_for_key and (_effective_deadline(poll_started) - poll_started) <= 0.0:
-                    return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                    return _fallback_to_clipboard("focus_changed", fg.process)
                 key_state = self._poll_shim_key_state(immediate=False)
                 if cancelled_fn():
                     return PasteOutcome(False, False, "cancelled", fg.process)
                 if not self._has_managed_shim():
-                    return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                    return _fallback_to_clipboard("focus_changed", fg.process)
                 if key_state is False:
                     needs_immediate = self._shim_supports_key_state_immediate()
                     if not needs_immediate:
@@ -2765,7 +2775,7 @@ class MacOSPlatform(JsonlShimMixin):
                     eff_deadline = _effective_deadline(now_flush)
                     rem_flush = eff_deadline - now_flush
                     if (waited_for_key or hold_timeout_sec > 0.0) and rem_flush <= 0.0:
-                        return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                        return _fallback_to_clipboard("focus_changed", fg.process)
                     flush_wait = min(0.05, max(0.005, rem_flush)) if rem_flush > 0.0 else 0.005
                     flushed = self._flush_shim_events(timeout_sec=flush_wait)
                     if cancelled_fn():
@@ -2775,25 +2785,25 @@ class MacOSPlatform(JsonlShimMixin):
                         now_after_flush = time.monotonic()
                         rem = _effective_deadline(now_after_flush) - now_after_flush
                         if rem <= 0.0:
-                            return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                            return _fallback_to_clipboard("focus_changed", fg.process)
                         if (now_after_flush - now_flush) < 0.005:
                             sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
                         continue
                     now_post_flush = time.monotonic()
                     if (waited_for_key or hold_timeout_sec > 0.0) and (_effective_deadline(now_post_flush) - now_post_flush) <= 0.0:
-                        return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                        return _fallback_to_clipboard("focus_changed", fg.process)
                     if needs_immediate:
                         imm_started = now_post_flush
                         imm_state = self._poll_shim_key_state(immediate=True)
                         if cancelled_fn():
                             return PasteOutcome(False, False, "cancelled", fg.process)
                         if not self._has_managed_shim():
-                            return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                            return _fallback_to_clipboard("focus_changed", fg.process)
                         if imm_state is False:
                             unavail_since = None
                             now_after_imm = time.monotonic()
                             if (waited_for_key or hold_timeout_sec > 0.0) and (_effective_deadline(now_after_imm) - now_after_imm) <= 0.0:
-                                return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                                return _fallback_to_clipboard("focus_changed", fg.process)
                             break
                         now_imm_fail = time.monotonic()
                         if imm_state is None:
@@ -2803,7 +2813,7 @@ class MacOSPlatform(JsonlShimMixin):
                             unavail_since = None
                         rem = _effective_deadline(now_imm_fail) - now_imm_fail
                         if rem <= 0.0:
-                            return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                            return _fallback_to_clipboard("focus_changed", fg.process)
                         waited_for_key = True
                         sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
                         continue
@@ -2816,7 +2826,7 @@ class MacOSPlatform(JsonlShimMixin):
                     unavail_since = None
                 rem = _effective_deadline(now_poll) - now_poll
                 if rem <= 0.0:
-                    return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                    return _fallback_to_clipboard("focus_changed", fg.process)
                 waited_for_key = True
                 sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
 
@@ -2827,7 +2837,7 @@ class MacOSPlatform(JsonlShimMixin):
                 fg = self._query_paste_foreground_window()
             except Exception:
                 if same_window_verifier is not None:
-                    return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                    return _fallback_to_clipboard("focus_changed", fg.process)
                 raise
             if (
                 self._is_focus_drifted(origin_window, fg)
@@ -2838,12 +2848,12 @@ class MacOSPlatform(JsonlShimMixin):
                 )
                 or not _verify_same_window(fg)
             ):
-                return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                return _fallback_to_clipboard("focus_changed", fg.process)
 
         if effective_deadline_fn is not None and (waited_for_key or hold_timeout_sec > 0.0):
             now_pre_commit = time.monotonic()
             if now_pre_commit >= effective_deadline_fn(now_pre_commit):
-                return _fallback_to_clipboard("focus_changed", fg.process, skip_settle=True)
+                return _fallback_to_clipboard("focus_changed", fg.process)
 
         if not _confirm_commit():
             return PasteOutcome(False, False, "cancelled", fg.process)
@@ -2864,6 +2874,10 @@ class MacOSPlatform(JsonlShimMixin):
         )
         if posted_ok:
             return PasteOutcome(True, True, "ok", eff_fg_proc, used_clipboard_paste=True)
+        if post_reason in ("shim_paste_unconfirmed", "paste_deadline_exceeded"):
+            # RPC timed out / reply lost / paste unconfirmed: NEVER perform a second pbcopy
+            # overwrite with A+B, and return clipboard=False so daemon stashes WAV in failed/.
+            return PasteOutcome(False, False, post_reason, eff_fg_proc, used_clipboard_paste=False)
         if fallback_clipboard_text is not None and fallback_clipboard_text != text:
             clip_ok = self._copy_to_clipboard(fallback_clipboard_text)
         if not clip_ok:

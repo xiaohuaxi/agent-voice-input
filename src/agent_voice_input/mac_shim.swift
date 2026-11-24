@@ -3414,16 +3414,10 @@ final class CoreAudioInputMonitor {
     }
 }
 
-private let kPbReadyMagic: UInt32 = 0x41564959 // "AVIY"
-private let kPbReqMagic: UInt32 = 0x41564952 // "AVIR"
-private let kPbBeginMagic: UInt32 = 0x41564942 // "AVIB"
-private let kPbDoneMagic: UInt32 = 0x41564944 // "AVID"
-private let kPbRespMagic: UInt32 = 0x41564953 // "AVIS"
+private let kPbReadyByte: UInt8 = 0x52 // 'R'
 private let kPbStatusItems: UInt8 = 0
 private let kPbStatusClearOnly: UInt8 = 1
-private let kPbStatusReadFailed: UInt8 = 2
-private let kPbStatusOwnTransient: UInt8 = 3
-private let kPbStatusUnpreserved: UInt8 = 4
+private let kPbStatusNone: UInt8 = 2
 private let kPbMaxItems = 4096
 private let kPbMaxEntriesPerItem = 64
 
@@ -3454,11 +3448,6 @@ private func appendBigEndianUInt32(_ data: inout Data, _ value: UInt32) {
     withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
 }
 
-private func appendBigEndianUInt64(_ data: inout Data, _ value: UInt64) {
-    var be = value.bigEndian
-    withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
-}
-
 private func readBigEndianUInt32(_ data: Data, at offset: Int) -> UInt32? {
     guard offset >= 0, offset + 4 <= data.count else { return nil }
     let b0 = UInt32(data[data.startIndex + offset]) << 24
@@ -3466,15 +3455,6 @@ private func readBigEndianUInt32(_ data: Data, at offset: Int) -> UInt32? {
     let b2 = UInt32(data[data.startIndex + offset + 2]) << 8
     let b3 = UInt32(data[data.startIndex + offset + 3])
     return b0 | b1 | b2 | b3
-}
-
-private func readBigEndianUInt64(_ data: Data, at offset: Int) -> UInt64? {
-    guard offset >= 0, offset + 8 <= data.count else { return nil }
-    var val: UInt64 = 0
-    for i in 0..<8 {
-        val = (val << 8) | UInt64(data[data.startIndex + offset + i])
-    }
-    return val
 }
 
 private func readExactWithDeadline(fd: Int32, count: Int, deadlineMonoMs: UInt64) -> Data? {
@@ -3491,9 +3471,7 @@ private func readExactWithDeadline(fd: Int32, count: Int, deadlineMonoMs: UInt64
                 let remMs = min(deadlineMonoMs &- now, UInt64(Int32.max))
                 var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
                 let pr = Darwin.poll(&pfd, 1, Int32(remMs))
-                if pr == 0 {
-                    return false
-                }
+                if pr == 0 { return false }
                 if pr < 0 {
                     if errno == EINTR { continue }
                     return false
@@ -3595,28 +3573,7 @@ private func setCloseOnExec(_ fd: Int32) {
     }
 }
 
-private func encodePasteboardRequest(reqId: UInt64, maxSnapshotBytes: Int) -> Data {
-    var out = Data()
-    out.reserveCapacity(16)
-    appendBigEndianUInt32(&out, kPbReqMagic)
-    appendBigEndianUInt64(&out, reqId)
-    let clamped = UInt32(max(1, min(maxSnapshotBytes, PasteboardGuard.defaultMaxSnapshotBytes)))
-    appendBigEndianUInt32(&out, clamped)
-    return out
-}
-
-private func decodePasteboardRequest(_ header: Data) -> (reqId: UInt64, maxSnapshotBytes: Int)? {
-    guard header.count == 16,
-          let magic = readBigEndianUInt32(header, at: 0), magic == kPbReqMagic,
-          let reqId = readBigEndianUInt64(header, at: 4),
-          let maxBytes = readBigEndianUInt32(header, at: 12) else {
-        return nil
-    }
-    return (reqId, Int(maxBytes))
-}
-
-private func encodePasteboardResponseParts(
-    reqId: UInt64,
+private func encodePasteboardResponse(
     outcome: PasteboardGuard.ReadOnlyCaptureOutcome
 ) -> (header: Data, payload: Data) {
     let statusByte: UInt8
@@ -3626,7 +3583,7 @@ private func encodePasteboardResponseParts(
         let withinLimits = itemList.count <= kPbMaxItems
             && !itemList.contains(where: { $0.count > kPbMaxEntriesPerItem })
         if !withinLimits {
-            statusByte = kPbStatusUnpreserved
+            statusByte = kPbStatusNone
         } else {
             statusByte = kPbStatusItems
             var payloadBytes = 4
@@ -3651,51 +3608,38 @@ private func encodePasteboardResponseParts(
         }
     case .clearOnly:
         statusByte = kPbStatusClearOnly
-    case .readFailed:
-        statusByte = kPbStatusReadFailed
-    case .ownTransient:
-        statusByte = kPbStatusOwnTransient
-    case .unpreserved, .expired:
-        statusByte = kPbStatusUnpreserved
+    case .readFailed, .ownTransient, .unpreserved:
+        statusByte = kPbStatusNone
     }
     var header = Data()
-    header.reserveCapacity(20)
-    appendBigEndianUInt32(&header, kPbRespMagic)
-    appendBigEndianUInt64(&header, reqId)
+    header.reserveCapacity(5)
     header.append(statusByte)
-    header.append(0)
-    header.append(0)
-    header.append(0)
     appendBigEndianUInt32(&header, UInt32(payload.count))
     return (header, payload)
 }
 
 private func decodePasteboardResponse(
-    expectedReqId: UInt64,
     statusByte: UInt8,
     payload: Data
-) -> PasteboardGuard.ReadOnlyCaptureOutcome? {
-    _ = expectedReqId
+) -> PasteboardGuard.ClipSnap?? {
     switch statusByte {
     case kPbStatusClearOnly:
-        return .clearOnly
-    case kPbStatusReadFailed:
-        return .readFailed
-    case kPbStatusOwnTransient:
-        return .ownTransient
-    case kPbStatusUnpreserved:
-        return .unpreserved
+        return .some(.clearOnly)
+    case kPbStatusNone:
+        return .some(nil)
     case kPbStatusItems:
         var offset = 0
-        guard let itemCount = readBigEndianUInt32(payload, at: offset) else { return nil }
+        guard let itemCount = readBigEndianUInt32(payload, at: offset), itemCount <= UInt32(kPbMaxItems) else {
+            return nil
+        }
         offset += 4
-        if itemCount > UInt32(kPbMaxItems) { return nil }
         var items: [[(NSPasteboard.PasteboardType, Data)]] = []
         items.reserveCapacity(Int(itemCount))
         for _ in 0..<itemCount {
-            guard let entryCount = readBigEndianUInt32(payload, at: offset) else { return nil }
+            guard let entryCount = readBigEndianUInt32(payload, at: offset), entryCount <= UInt32(kPbMaxEntriesPerItem) else {
+                return nil
+            }
             offset += 4
-            if entryCount > UInt32(kPbMaxEntriesPerItem) { return nil }
             var entries: [(NSPasteboard.PasteboardType, Data)] = []
             entries.reserveCapacity(Int(entryCount))
             for _ in 0..<entryCount {
@@ -3717,7 +3661,7 @@ private func decodePasteboardResponse(
             items.append(entries)
         }
         guard offset == payload.count else { return nil }
-        return .items(items)
+        return .some(.items(items))
     default:
         return nil
     }
@@ -3761,28 +3705,6 @@ private func spawnChildProcess(
     return childPid
 }
 
-private final class CaptureRequestToken {
-    let reqId: UInt64
-    private let lock = NSLock()
-    private var _cancelled = false
-
-    init(reqId: UInt64) {
-        self.reqId = reqId
-    }
-
-    var isCancelled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return _cancelled
-    }
-
-    func cancel() {
-        lock.lock()
-        _cancelled = true
-        lock.unlock()
-    }
-}
-
 private final class PasteboardWorkerHandle {
     let pid: pid_t
     let inFd: Int32
@@ -3791,7 +3713,6 @@ private final class PasteboardWorkerHandle {
     private var killed = false
     private var fdsClosed = false
     private var reaped = false
-    private var _ready = false
 
     init(pid: pid_t, inFd: Int32, outFd: Int32) {
         self.pid = pid
@@ -3799,32 +3720,11 @@ private final class PasteboardWorkerHandle {
         self.outFd = outFd
     }
 
-    var isKilled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return killed
-    }
-
-    var isReady: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return _ready && !killed && !reaped
-    }
-
-    func markReady() {
-        lock.lock()
-        _ready = true
-        lock.unlock()
-    }
-
     func sigkill() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        // Execute Darwin.kill strictly inside the handle lock while !reaped so waitpid
-        // cannot reap and allow OS PID reuse before the signal is delivered.
-        if reaped || killed {
-            return false
-        }
+        // Send SIGKILL inside lock while !reaped so waitpid cannot allow OS PID reuse beforehand.
+        if reaped || killed { return false }
         killed = true
         let targetPid = pid
         if targetPid > 0 {
@@ -3833,10 +3733,8 @@ private final class PasteboardWorkerHandle {
         return true
     }
 
-    func closeFdsAndReapOnIoQueue(forceKill: Bool) {
-        if forceKill {
-            _ = sigkill()
-        }
+    func closeAndReapOnIoQueue(forceKill: Bool) -> Bool {
+        let didKill = forceKill ? sigkill() : false
         lock.lock()
         let needClose = !fdsClosed
         if needClose { fdsClosed = true }
@@ -3859,18 +3757,20 @@ private final class PasteboardWorkerHandle {
                 break
             }
         }
+        return didKill
     }
 }
 
+// Single-slot lazy persistent pasteboard reader subprocess:
+// - Lazily spawned on first snapshot request; reused across normal requests (~4-8ms roundtrip).
+// - Hard read timeout (default 200ms): immediately SIGKILL + waitpid reaps hung RDP/lazy Promise
+//   readers and respawns on demand on the next request.
 private final class PasteboardWorkerClient {
     private let pasteboardNameArg: String?
     private let executablePath: String
     private let ioQueue: DispatchQueue
     private let stateLock = NSLock()
-    private var currentWorker: PasteboardWorkerHandle?
-    private var inFlightWorker: PasteboardWorkerHandle?
-    private var warmingWorker: PasteboardWorkerHandle?
-    private var activeToken: CaptureRequestToken?
+    private var worker: PasteboardWorkerHandle?
     private var isShutdown = false
     private var _spawnCount = 0
     private var _killCount = 0
@@ -3886,44 +3786,34 @@ private final class PasteboardWorkerClient {
         self.ioQueue = DispatchQueue(label: "avi.pasteboard.worker_io", qos: .userInitiated)
     }
 
-    var workerSpawnCount: Int {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return _spawnCount
-    }
+    var workerSpawnCount: Int { stateLock.lock(); defer { stateLock.unlock() }; return _spawnCount }
+    var workerKillCount: Int { stateLock.lock(); defer { stateLock.unlock() }; return _killCount }
+    var requestCount: Int { stateLock.lock(); defer { stateLock.unlock() }; return _requestCount }
+    var currentWorkerPid: pid_t { stateLock.lock(); defer { stateLock.unlock() }; return worker?.pid ?? 0 }
 
-    var workerKillCount: Int {
+    private func killAndReapCurrentOnIoQueue(_ handle: PasteboardWorkerHandle) {
         stateLock.lock()
-        defer { stateLock.unlock() }
-        return _killCount
-    }
-
-    var requestCount: Int {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return _requestCount
-    }
-
-    var currentWorkerPid: pid_t {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return currentWorker?.pid ?? 0
-    }
-
-    var isCurrentWorkerReady: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return currentWorker?.isReady ?? false
-    }
-
-    private func spawnWorkerOnIoQueue(
-        forToken token: CaptureRequestToken?,
-        readyDeadlineMonoMs: UInt64
-    ) -> PasteboardWorkerHandle? {
-        stateLock.lock()
-        let shut = isShutdown || (token?.isCancelled ?? false)
+        if worker === handle { worker = nil }
         stateLock.unlock()
-        if shut || executablePath.isEmpty { return nil }
+        if handle.closeAndReapOnIoQueue(forceKill: true) {
+            stateLock.lock()
+            _killCount += 1
+            stateLock.unlock()
+        }
+    }
+
+    private func ensureWorkerOnIoQueue(readyDeadlineMonoMs: UInt64) -> PasteboardWorkerHandle? {
+        stateLock.lock()
+        if isShutdown {
+            stateLock.unlock()
+            return nil
+        }
+        if let existing = worker {
+            stateLock.unlock()
+            return existing
+        }
+        stateLock.unlock()
+        if executablePath.isEmpty { return nil }
 
         var inPipe: [Int32] = [-1, -1]
         var outPipe: [Int32] = [-1, -1]
@@ -3953,208 +3843,90 @@ private final class PasteboardWorkerClient {
             _ = Darwin.close(outPipe[0])
             return nil
         }
+
         let handle = PasteboardWorkerHandle(pid: pid, inFd: inPipe[1], outFd: outPipe[0])
         stateLock.lock()
-        if isShutdown || (token?.isCancelled ?? false) {
+        if isShutdown {
             stateLock.unlock()
-            handle.closeFdsAndReapOnIoQueue(forceKill: true)
+            _ = handle.closeAndReapOnIoQueue(forceKill: true)
             return nil
         }
+        worker = handle
         _spawnCount += 1
-        if let tok = token {
-            activeToken = tok
-            inFlightWorker = handle
-        } else {
-            warmingWorker = handle
-        }
         stateLock.unlock()
 
-        // Wait for explicit READY handshake ("AVIY") before marking worker ready or sending requests.
-        let effReadyDeadline = (readyDeadlineMonoMs > 0) ? readyDeadlineMonoMs : (monotonicMs() &+ 3000)
-        guard let readyBytes = readExactWithDeadline(fd: handle.outFd, count: 4, deadlineMonoMs: effReadyDeadline),
-              let readyMagic = readBigEndianUInt32(readyBytes, at: 0),
-              readyMagic == kPbReadyMagic,
-              !handle.isKilled else {
-            stateLock.lock()
-            if warmingWorker === handle { warmingWorker = nil }
-            if inFlightWorker === handle { inFlightWorker = nil }
-            if let tok = token, activeToken === tok { activeToken = nil }
-            stateLock.unlock()
-            handle.closeFdsAndReapOnIoQueue(forceKill: true)
+        guard let ready = readExactWithDeadline(fd: handle.outFd, count: 1, deadlineMonoMs: readyDeadlineMonoMs),
+              ready.first == kPbReadyByte else {
+            killAndReapCurrentOnIoQueue(handle)
             return nil
         }
-        handle.markReady()
-
-        stateLock.lock()
-        if warmingWorker === handle { warmingWorker = nil }
-        if isShutdown || (token?.isCancelled ?? false) || handle.isKilled {
-            if inFlightWorker === handle { inFlightWorker = nil }
-            if let tok = token, activeToken === tok { activeToken = nil }
-            stateLock.unlock()
-            handle.closeFdsAndReapOnIoQueue(forceKill: true)
-            return nil
-        }
-        currentWorker = handle
-        stateLock.unlock()
         return handle
     }
 
-    func warmUpAsync() {
-        ioQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.stateLock.lock()
-            let needSpawn = !self.isShutdown && (self.currentWorker == nil || !self.currentWorker!.isReady)
-            self.stateLock.unlock()
-            if needSpawn {
-                _ = self.spawnWorkerOnIoQueue(forToken: nil, readyDeadlineMonoMs: monotonicMs() &+ 3000)
-            }
-        }
-    }
-
     func requestSnapshotAsync(
-        token: CaptureRequestToken,
         maxSnapshotBytes: Int,
-        ioDeadlineMonoMs: UInt64,
-        onReadStarted: @escaping () -> Void,
-        onReadFinished: @escaping () -> Void,
-        completion: @escaping (PasteboardGuard.ReadOnlyCaptureOutcome?) -> Void
+        readTimeoutMs: UInt64,
+        overallDeadlineMonoMs: UInt64,
+        completion: @escaping (PasteboardGuard.ClipSnap?) -> Void
     ) {
-        let reqId = token.reqId
         ioQueue.async { [weak self] in
             guard let self = self else {
                 completion(nil)
                 return
             }
-            self.stateLock.lock()
-            if self.isShutdown || token.isCancelled {
-                self.stateLock.unlock()
+            let nowStart = monotonicMs()
+            if overallDeadlineMonoMs > 0 && nowStart >= overallDeadlineMonoMs {
                 completion(nil)
                 return
             }
-            let existing = self.currentWorker
-            self.stateLock.unlock()
+            let readyDeadline = (overallDeadlineMonoMs > 0)
+                ? min(overallDeadlineMonoMs, nowStart &+ 1000)
+                : (nowStart &+ 1500)
+            guard let handle = self.ensureWorkerOnIoQueue(readyDeadlineMonoMs: readyDeadline) else {
+                completion(nil)
+                return
+            }
 
-            var newlySpawned = false
-            let handle: PasteboardWorkerHandle
-            if let w = existing, w.isReady {
-                handle = w
-            } else {
-                if let stale = existing {
-                    self.stateLock.lock()
-                    if self.currentWorker === stale { self.currentWorker = nil }
-                    self.stateLock.unlock()
-                    stale.closeFdsAndReapOnIoQueue(forceKill: true)
-                }
-                guard let spawned = self.spawnWorkerOnIoQueue(forToken: token, readyDeadlineMonoMs: ioDeadlineMonoMs) else {
+            let nowReq = monotonicMs()
+            let readDeadline: UInt64
+            if overallDeadlineMonoMs > 0 {
+                if nowReq >= overallDeadlineMonoMs {
                     completion(nil)
                     return
                 }
-                handle = spawned
-                newlySpawned = true
+                readDeadline = min(overallDeadlineMonoMs, nowReq &+ max(1, readTimeoutMs))
+            } else {
+                readDeadline = nowReq &+ max(1, readTimeoutMs)
             }
 
             self.stateLock.lock()
-            if self.isShutdown || token.isCancelled || handle.isKilled {
-                if self.activeToken === token { self.activeToken = nil }
-                if self.inFlightWorker === handle { self.inFlightWorker = nil }
-                // Reap any killed/shutdown handle or a newly spawned handle detached during READY handoff cancellation.
-                let shouldReap = self.isShutdown || handle.isKilled || (newlySpawned && self.currentWorker !== handle)
-                if shouldReap && self.currentWorker === handle {
-                    self.currentWorker = nil
-                }
+            if self.isShutdown {
                 self.stateLock.unlock()
-                if shouldReap {
-                    handle.closeFdsAndReapOnIoQueue(forceKill: true)
-                }
                 completion(nil)
                 return
             }
-            self.activeToken = token
-            self.inFlightWorker = handle
             self._requestCount += 1
             self.stateLock.unlock()
 
-            let reqFrame = encodePasteboardRequest(reqId: reqId, maxSnapshotBytes: maxSnapshotBytes)
-            let maxAllowedPayload = max(1, min(maxSnapshotBytes, PasteboardGuard.defaultMaxSnapshotBytes)) + 1024 * 1024
-            var outcome: PasteboardGuard.ReadOnlyCaptureOutcome? = nil
-            var ioHealthy = false
+            let clampedMax = max(1, min(maxSnapshotBytes, PasteboardGuard.defaultMaxSnapshotBytes))
+            var reqBytes = Data()
+            reqBytes.reserveCapacity(4)
+            appendBigEndianUInt32(&reqBytes, UInt32(clampedMax))
 
-            // Phase 1: send request & wait for worker BEGIN ack ("AVIB") bounded by overall ioDeadlineMonoMs.
-            if writeAll(fd: handle.inFd, data: reqFrame),
-               let beginFrame = readExactWithDeadline(fd: handle.outFd, count: 12, deadlineMonoMs: ioDeadlineMonoMs),
-               let beginMagic = readBigEndianUInt32(beginFrame, at: 0), beginMagic == kPbBeginMagic,
-               let beginReqId = readBigEndianUInt64(beginFrame, at: 4), beginReqId == reqId {
-                // Phase 2: worker is now strictly inside captureCurrentReadOnly (NSPasteboard read).
-                // Arm the 200ms slow-Promise timer now; cancel it immediately upon 12B DONE ("AVID")
-                // BEFORE worker encodes or transfers large payloads.
-                onReadStarted()
-                let doneFrame = readExact(fd: handle.outFd, count: 12)
-                onReadFinished()
-                // Phase 3: payload encoding, 20B response header, payload transfer & decode bounded by overall ioDeadlineMonoMs.
-                if let done = doneFrame,
-                   let doneMagic = readBigEndianUInt32(done, at: 0), doneMagic == kPbDoneMagic,
-                   let doneReqId = readBigEndianUInt64(done, at: 4), doneReqId == reqId,
-                   let hdr = readExactWithDeadline(fd: handle.outFd, count: 20, deadlineMonoMs: ioDeadlineMonoMs),
-                   let magic = readBigEndianUInt32(hdr, at: 0), magic == kPbRespMagic,
-                   let respReqId = readBigEndianUInt64(hdr, at: 4), respReqId == reqId,
-                   let payloadLen = readBigEndianUInt32(hdr, at: 16), Int(payloadLen) <= maxAllowedPayload,
-                   let payload = readExactWithDeadline(fd: handle.outFd, count: Int(payloadLen), deadlineMonoMs: ioDeadlineMonoMs) {
-                    let statusByte = hdr[hdr.startIndex + 12]
-                    if let decoded = decodePasteboardResponse(expectedReqId: reqId, statusByte: statusByte, payload: payload) {
-                        outcome = decoded
-                        ioHealthy = true
-                    }
-                }
+            let maxAllowedPayload = clampedMax + 1024 * 1024
+            if writeAll(fd: handle.inFd, data: reqBytes),
+               let hdr = readExactWithDeadline(fd: handle.outFd, count: 5, deadlineMonoMs: readDeadline),
+               let payloadLen = readBigEndianUInt32(hdr, at: 1),
+               Int(payloadLen) <= maxAllowedPayload,
+               let payload = readExactWithDeadline(fd: handle.outFd, count: Int(payloadLen), deadlineMonoMs: readDeadline),
+               let decoded = decodePasteboardResponse(statusByte: hdr[hdr.startIndex], payload: payload) {
+                completion(decoded)
+                return
             }
 
-            self.stateLock.lock()
-            if self.activeToken === token {
-                self.activeToken = nil
-            }
-            if self.inFlightWorker === handle {
-                self.inFlightWorker = nil
-            }
-            let wasKilled = handle.isKilled
-            let shut = self.isShutdown
-            if !ioHealthy || wasKilled || shut {
-                if self.currentWorker === handle {
-                    self.currentWorker = nil
-                }
-            }
-            self.stateLock.unlock()
-
-            if !ioHealthy || wasKilled || shut {
-                handle.closeFdsAndReapOnIoQueue(forceKill: true)
-                if !shut && !wasKilled {
-                    self.warmUpAsync()
-                }
-            }
-            completion(outcome)
-        }
-    }
-
-    func killActiveWorkerAndRespawnAsync(for token: CaptureRequestToken) {
-        token.cancel()
-        stateLock.lock()
-        var toKill: PasteboardWorkerHandle? = nil
-        if activeToken === token, let w = inFlightWorker ?? currentWorker {
-            toKill = w
-            if currentWorker === w {
-                currentWorker = nil
-            }
-        }
-        let shut = isShutdown
-        stateLock.unlock()
-
-        if let target = toKill {
-            if target.sigkill() {
-                stateLock.lock()
-                _killCount += 1
-                stateLock.unlock()
-            }
-            if !shut {
-                warmUpAsync()
-            }
+            // Timeout (e.g. 60s RDP Promise), EOF, or protocol error: SIGKILL + waitpid reap immediately.
+            self.killAndReapCurrentOnIoQueue(handle)
+            completion(nil)
         }
     }
 
@@ -4165,62 +3937,20 @@ private final class PasteboardWorkerClient {
             return
         }
         isShutdown = true
-        let cur = currentWorker
-        let inflight = inFlightWorker
-        let warming = warmingWorker
-        let tok = activeToken
-        currentWorker = nil
-        inFlightWorker = nil
-        warmingWorker = nil
-        activeToken = nil
+        let active = worker
+        worker = nil
         stateLock.unlock()
 
-        tok?.cancel()
-        var uniqueHandles: [PasteboardWorkerHandle] = []
-        for h in [cur, inflight, warming].compactMap({ $0 }) {
-            if !uniqueHandles.contains(where: { $0 === h }) {
-                uniqueHandles.append(h)
-            }
-        }
-        for h in uniqueHandles {
-            _ = h.sigkill()
-        }
-
-        // Because every active worker received SIGKILL above, any blocked read/write on ioQueue
-        // unblocks immediately with EOF/EPIPE so ioQueue.sync completes in milliseconds.
+        _ = active?.sigkill()
+        // Active worker received SIGKILL above so any blocked poll/read on ioQueue unblocks immediately.
         ioQueue.sync {
-            for h in uniqueHandles {
-                h.closeFdsAndReapOnIoQueue(forceKill: true)
-            }
+            _ = active?.closeAndReapOnIoQueue(forceKill: true)
         }
     }
 }
 
 final class PasteboardGuard {
-    enum WriteOutcome {
-        case ok
-        case expired
-        case failed
-        case clipboardChanged
-        case workerFailed
-    }
-
-    fileprivate enum PreWriteDecision: Equatable {
-        case proceed
-        case retryCapture(retriesLeft: Int)
-        case abortClipboardChanged
-        case abortWorkerFailed
-        case abortExpired
-        case abortKeyHeld
-        case abortFocusChanged
-    }
-
-    fileprivate enum PostWriteAbortOutcome: Equatable {
-        case clipboardChanged
-        case allowFallback
-    }
-
-    static let defaultMaxSnapshotBytes = 100 * 1024 * 1024
+    static let defaultMaxSnapshotBytes = 10 * 1024 * 1024
     static let defaultMaxCaptureMs: UInt64 = 200
     static let defaultRestoreDelayMs = 250
     static let transientType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
@@ -4241,49 +3971,6 @@ final class PasteboardGuard {
         case readFailed
         case ownTransient
         case unpreserved
-        case expired
-
-        var clipSnap: ClipSnap? {
-            switch self {
-            case .items(let list): return .items(list)
-            case .clearOnly: return .clearOnly
-            case .readFailed, .ownTransient, .unpreserved, .expired: return nil
-            }
-        }
-    }
-
-    fileprivate enum CaptureStatus: Equatable {
-        case items
-        case clearOnly
-        case ownTransient
-        case unpreserved
-        case readFailed
-        case timedOut
-        case negCacheHit
-        case budgetExhausted
-        case workerFailed
-    }
-
-    fileprivate struct CaptureResult {
-        let snap: ClipSnap?
-        let status: CaptureStatus
-        let observedChangeCount: Int
-        let initialObservedChangeCount: Int
-        let retriesLeft: Int
-
-        init(
-            snap: ClipSnap?,
-            status: CaptureStatus,
-            observedChangeCount: Int,
-            initialObservedChangeCount: Int? = nil,
-            retriesLeft: Int
-        ) {
-            self.snap = snap
-            self.status = status
-            self.observedChangeCount = observedChangeCount
-            self.initialObservedChangeCount = initialObservedChangeCount ?? observedChangeCount
-            self.retriesLeft = retriesLeft
-        }
     }
 
     // All mutable state below and all pasteboard writes MUST remain strictly on DispatchQueue.main.
@@ -4293,14 +3980,10 @@ final class PasteboardGuard {
     private let maxSnapshotBytes: Int
     private let maxCaptureMs: UInt64
     private var savedSnap: ClipSnap?
-    private var ownedChangeCount: Int = -1
-    private var ownedToken: Data?
+    private var writtenChangeCount: Int = -1
     private(set) var restorePending: Bool = false
     private var restoreGen: UInt64 = 0
     private var restoreWork: DispatchWorkItem?
-    private var lastTimedOutChangeCount: Int?
-    private var nextCaptureReqId: UInt64 = 0
-    private var _captureRequestCount: Int = 0
 
     init(
         pasteboard: NSPasteboard? = nil,
@@ -4325,10 +4008,6 @@ final class PasteboardGuard {
         workerClient.shutdown()
     }
 
-    func warmUpWorkerAsync() {
-        workerClient.warmUpAsync()
-    }
-
     func shutdown() {
         cancelPendingRestore()
         workerClient.shutdown()
@@ -4336,11 +4015,9 @@ final class PasteboardGuard {
 
     fileprivate var workerSpawnCount: Int { workerClient.workerSpawnCount }
     fileprivate var workerKillCount: Int { workerClient.workerKillCount }
+    fileprivate var workerRequestCount: Int { workerClient.requestCount }
     fileprivate var currentWorkerPid: pid_t { workerClient.currentWorkerPid }
-    fileprivate var isCurrentWorkerReady: Bool { workerClient.isCurrentWorkerReady }
     fileprivate var currentChangeCount: Int { pasteboardProvider().changeCount }
-    fileprivate var captureRequestCount: Int { _captureRequestCount }
-    fileprivate var timedOutChangeCount: Int? { lastTimedOutChangeCount }
 
     func cancelPendingRestore() {
         restoreGen &+= 1
@@ -4350,50 +4027,9 @@ final class PasteboardGuard {
         savedSnap = nil
     }
 
-    private func clearOwnership() {
-        ownedChangeCount = -1
-        ownedToken = nil
-    }
-
-    private func isPasteboardStillOwnedByUs(_ pb: NSPasteboard) -> Bool {
-        guard let expTok = ownedToken, ownedChangeCount >= 0, pb.changeCount == ownedChangeCount else {
-            return false
-        }
-        return pb.data(forType: Self.ownTransientMarker) == expTok
-    }
-
-    func isOwnedClipboardIntact() -> Bool {
-        let pb = pasteboardProvider()
-        return isPasteboardStillOwnedByUs(pb)
-    }
-
-    fileprivate func handlePostWriteNonPost(
-        recapturedNewClipboard: Bool,
-        restoreOnNormalFallback: Bool
-    ) -> PostWriteAbortOutcome {
-        if !isOwnedClipboardIntact() {
-            cancelPendingRestore()
-            return .clipboardChanged
-        }
-        if recapturedNewClipboard {
-            _ = flushPendingRestore()
-            return .clipboardChanged
-        }
-        if restoreOnNormalFallback {
-            return flushPendingRestore() ? .allowFallback : .clipboardChanged
-        }
-        return .allowFallback
-    }
-
-    private func isCurrentPasteboardStillOursForRestore(_ pb: NSPasteboard) -> Bool {
-        guard restorePending else { return false }
-        return isPasteboardStillOwnedByUs(pb)
-    }
-
     fileprivate static func classifyRawPasteboardItems(_ rawItems: [NSPasteboardItem]?) -> ReadOnlyCaptureOutcome? {
         guard let items = rawItems else {
             // Apple docs: pasteboardItems == nil means read failure, NEVER empty board.
-            // Must NOT map to .clearOnly (which would actively clear the user's clipboard).
             return .readFailed
         }
         if items.isEmpty {
@@ -4415,15 +4051,10 @@ final class PasteboardGuard {
     }
 
     // Pure read-only snapshot invoked strictly on the isolated --pasteboard-worker main thread.
-    // Never touches any PasteboardGuard instance state and never runs on a background thread.
     fileprivate static func captureCurrentReadOnly(
         pasteboardName: NSPasteboard.Name,
-        maxSnapshotBytes: Int,
-        deadlineMonoMs: UInt64? = nil
+        maxSnapshotBytes: Int
     ) -> ReadOnlyCaptureOutcome {
-        if let dl = deadlineMonoMs, monotonicMs() >= dl {
-            return .expired
-        }
         let pb = NSPasteboard(name: pasteboardName)
         let rawItems = pb.pasteboardItems
         if let early = classifyRawPasteboardItems(rawItems) {
@@ -4435,9 +4066,6 @@ final class PasteboardGuard {
         var captured: [[(NSPasteboard.PasteboardType, Data)]] = []
         var totalBytes = 0
         for item in items {
-            if let dl = deadlineMonoMs, monotonicMs() >= dl {
-                return .expired
-            }
             let itemTypes = item.types
             var candidateTypes = Self.baseWhitelistTypes
             if !itemTypes.contains(.png) && itemTypes.contains(.tiff) {
@@ -4445,21 +4073,10 @@ final class PasteboardGuard {
             }
             var entries: [(NSPasteboard.PasteboardType, Data)] = []
             for t in candidateTypes where itemTypes.contains(t) {
-                if let dl = deadlineMonoMs, monotonicMs() >= dl {
-                    return .expired
-                }
                 let maybeData: Data? = autoreleasepool {
                     item.data(forType: t)
                 }
-                guard let d = maybeData else {
-                    if let dl = deadlineMonoMs, monotonicMs() >= dl {
-                        return .expired
-                    }
-                    continue
-                }
-                if let dl = deadlineMonoMs, monotonicMs() >= dl {
-                    return .expired
-                }
+                guard let d = maybeData else { continue }
                 if d.count > maxSnapshotBytes || (totalBytes + d.count) > maxSnapshotBytes {
                     return .unpreserved
                 }
@@ -4470,21 +4087,90 @@ final class PasteboardGuard {
                 captured.append(entries)
             }
         }
-        if captured.isEmpty {
-            return .unpreserved
-        }
-        return .items(captured)
+        return captured.isEmpty ? .unpreserved : .items(captured)
     }
 
     func writePersistentFallback(_ text: String) -> Bool {
         cancelPendingRestore()
-        clearOwnership()
+        writtenChangeCount = -1
         let pb = pasteboardProvider()
         pb.clearContents()
         if text.isEmpty {
             return true
         }
         return pb.setString(text, forType: .string)
+    }
+
+    func writePersistentFallbackIfWithinDeadline(
+        _ text: String,
+        deadlineMonoMs: UInt64,
+        nowMs: () -> UInt64 = monotonicMs
+    ) -> (written: Bool, reason: String) {
+        if deadlineMonoMs > 0 && nowMs() >= deadlineMonoMs {
+            return (false, "paste_deadline_exceeded")
+        }
+        let ok = writePersistentFallback(text)
+        return (ok, ok ? "clipboard_only" : "clipboard_failed")
+    }
+
+    fileprivate func captureSnapshotAsync(
+        deadlineMonoMs: UInt64,
+        completion: @escaping (_ preChangeCount: Int, _ snap: ClipSnap?) -> Void
+    ) {
+        let pb = pasteboardProvider()
+        let preChangeCount = pb.changeCount
+        // Rapid-fire burst: clipboard still holds our own transient voice text; reuse savedSnap without IPC.
+        if writtenChangeCount >= 0 && preChangeCount == writtenChangeCount {
+            completion(preChangeCount, restorePending ? savedSnap : nil)
+            return
+        }
+        if deadlineMonoMs > 0 && monotonicMs() >= deadlineMonoMs {
+            completion(preChangeCount, nil)
+            return
+        }
+        workerClient.requestSnapshotAsync(
+            maxSnapshotBytes: maxSnapshotBytes,
+            readTimeoutMs: maxCaptureMs,
+            overallDeadlineMonoMs: deadlineMonoMs
+        ) { snap in
+            DispatchQueue.main.async {
+                completion(preChangeCount, snap)
+            }
+        }
+    }
+
+    fileprivate func writeTransient(
+        _ text: String,
+        snap: ClipSnap?,
+        afterWriteHook: (() -> Void)? = nil
+    ) -> Bool {
+        let item = NSPasteboardItem()
+        guard item.setString(text, forType: .string),
+              item.setData(Data(), forType: Self.transientType),
+              item.setData(Data(), forType: Self.autoGeneratedType),
+              item.setData(Data(), forType: Self.ownTransientMarker) else {
+            return false
+        }
+        cancelPendingRestore()
+        let pb = pasteboardProvider()
+        let clearedChangeCount = pb.clearContents()
+        guard pb.writeObjects([item]) else {
+            writtenChangeCount = -1
+            return false
+        }
+        afterWriteHook?()
+        if pb.changeCount != clearedChangeCount {
+            // Concurrent external Cmd+C in the micro-window: never adopt its changeCount, arm restore,
+            // or let paste_cmd_v post Cmd+V over the user's newer clipboard item.
+            writtenChangeCount = -1
+            savedSnap = nil
+            restorePending = false
+            return false
+        }
+        writtenChangeCount = clearedChangeCount
+        savedSnap = snap
+        restorePending = (snap != nil)
+        return true
     }
 
     fileprivate func armPendingRestoreTimer() {
@@ -4520,398 +4206,28 @@ final class PasteboardGuard {
         return rebuilt
     }
 
-    fileprivate func finishWriteTransient(
-        _ text: String,
-        nextSnap: ClipSnap?,
-        deadlineMonoMs: UInt64,
-        armRestoreTimerImmediately: Bool = false
-    ) -> WriteOutcome {
-        if deadlineMonoMs > 0 && monotonicMs() >= deadlineMonoMs {
-            return .expired
-        }
-        // Build the complete transient item (including ownership token) BEFORE clearing the pasteboard
-        // or mutating guard state so a build failure leaves both pasteboard and savedSnap intact.
-        let nextGen = restoreGen &+ 1
-        let tokenData = Data("avi:\(nextGen)".utf8)
-        let item = NSPasteboardItem()
-        guard item.setString(text, forType: .string),
-              item.setData(Data(), forType: Self.transientType),
-              item.setData(Data(), forType: Self.autoGeneratedType),
-              item.setData(tokenData, forType: Self.ownTransientMarker) else {
-            return .failed
-        }
-
-        let pb = pasteboardProvider()
-        restoreWork?.cancel()
-        restoreWork = nil
-        let clearedCc = pb.clearContents()
-        guard pb.writeObjects([item]) else {
-            // If writeObjects failed after clearContents, rebuild ONLY this round's valid nextSnap
-            // and re-verify pb.changeCount == clearedCc right before writeObjects so a concurrent copy is never clobbered.
-            if case .items(let itemList) = nextSnap {
-                let rebuilt = Self.buildRestoreItems(from: itemList)
-                if !rebuilt.isEmpty && pb.changeCount == clearedCc {
-                    _ = pb.writeObjects(rebuilt)
-                }
-            }
-            restoreGen = nextGen
-            restorePending = false
-            savedSnap = nil
-            clearOwnership()
-            return .failed
-        }
-        // Commit state strictly after writeObjects succeeds; always record post-write ownership
-        // even when nextSnap == nil so pre-keystroke / focus3 checks catch concurrent user Cmd+C.
-        restoreGen = nextGen
-        ownedChangeCount = pb.changeCount
-        ownedToken = tokenData
-        savedSnap = nextSnap
-        restorePending = (nextSnap != nil)
-        if restorePending && armRestoreTimerImmediately {
-            armPendingRestoreTimer()
-        }
-        return .ok
-    }
-
-    fileprivate func remainingOverallCaptureBudgetMs(deadlineMonoMs: UInt64, nowMs: UInt64 = monotonicMs()) -> UInt64 {
-        if deadlineMonoMs == 0 {
-            return max(maxCaptureMs * 5, 1500)
-        }
-        let remainingPasteMs = (deadlineMonoMs > nowMs) ? (deadlineMonoMs - nowMs) : 0
-        return (remainingPasteMs > 250) ? (remainingPasteMs - 250) : 0
-    }
-
-    fileprivate func remainingCaptureBudgetMs(deadlineMonoMs: UInt64, nowMs: UInt64 = monotonicMs()) -> UInt64 {
-        if deadlineMonoMs == 0 {
-            return maxCaptureMs
-        }
-        return min(maxCaptureMs, remainingOverallCaptureBudgetMs(deadlineMonoMs: deadlineMonoMs, nowMs: nowMs))
-    }
-
-    fileprivate func isCapturedChangeCountStale(_ capturedChangeCount: Int?) -> Bool {
-        guard let cc = capturedChangeCount else { return false }
-        let livePb = pasteboardProvider()
-        return livePb.changeCount != cc && !isPasteboardStillOwnedByUs(livePb)
-    }
-
-    fileprivate func evaluatePreWriteDecision(
-        capture: CaptureResult,
-        deadlineMonoMs: UInt64,
-        keyHeld: Bool,
-        focusMatched: Bool,
-        nowMs: UInt64 = monotonicMs()
-    ) -> PreWriteDecision {
-        // Worker infrastructure failure always preserves user's clipboard before any fallback branch.
-        if capture.status == .workerFailed {
-            return .abortWorkerFailed
-        }
-        let latestStale = isCapturedChangeCountStale(capture.observedChangeCount)
-        let deliveryStale = latestStale || isCapturedChangeCountStale(capture.initialObservedChangeCount)
-        let expired = (deadlineMonoMs > 0 && nowMs >= deadlineMonoMs)
-        // Every early-return branch checks BOTH latest and delivery-initial changeCount so even after
-        // a mid-capture retry re-baselines observedChangeCount, a held Cmd key or focus2 drift never
-        // overwrites the user's fresh clipboard via focus2 fallback or Python pbcopy.
-        if expired {
-            return deliveryStale ? .abortClipboardChanged : .abortExpired
-        }
-        if keyHeld {
-            return deliveryStale ? .abortClipboardChanged : .abortKeyHeld
-        }
-        if !focusMatched {
-            return deliveryStale ? .abortClipboardChanged : .abortFocusChanged
-        }
-        if latestStale {
-            if capture.retriesLeft > 0 && remainingCaptureBudgetMs(deadlineMonoMs: deadlineMonoMs, nowMs: nowMs) > 0 {
-                return .retryCapture(retriesLeft: capture.retriesLeft - 1)
-            }
-            return .abortClipboardChanged
-        }
-        return .proceed
-    }
-
-    fileprivate func captureSnapshotAsync(
-        deadlineMonoMs: UInt64,
-        maxRetriesOnChange: Int = 1,
-        initialObservedChangeCount: Int? = nil,
-        completion: @escaping (CaptureResult) -> Void
-    ) {
-        let nowMs = monotonicMs()
-        let pb = pasteboardProvider()
-        let startChangeCount = pb.changeCount
-        let initCc = initialObservedChangeCount ?? startChangeCount
-        if deadlineMonoMs > 0 && nowMs >= deadlineMonoMs {
-            completion(CaptureResult(snap: nil, status: .budgetExhausted, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-            return
-        }
-        if isCurrentPasteboardStillOursForRestore(pb) {
-            completion(CaptureResult(snap: savedSnap, status: .ownTransient, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-            return
-        }
-        if isPasteboardStillOwnedByUs(pb) {
-            completion(CaptureResult(snap: nil, status: .ownTransient, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-            return
-        }
-        if let badChangeCount = lastTimedOutChangeCount, startChangeCount == badChangeCount {
-            completion(CaptureResult(snap: nil, status: .negCacheHit, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-            return
-        }
-        let overallBudgetMs = remainingOverallCaptureBudgetMs(deadlineMonoMs: deadlineMonoMs, nowMs: nowMs)
-        if overallBudgetMs == 0 {
-            completion(CaptureResult(snap: nil, status: .budgetExhausted, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-            return
-        }
-
-        nextCaptureReqId &+= 1
-        let reqId = nextCaptureReqId
-        let token = CaptureRequestToken(reqId: reqId)
-        let ioDeadlineMonoMs = nowMs &+ overallBudgetMs
-        _captureRequestCount += 1
-
-        // settled, overallWork, and readTimeoutWork are accessed exclusively on DispatchQueue.main.
-        var settled = false
-        var overallWork: DispatchWorkItem?
-        var readTimeoutWork: DispatchWorkItem?
-
-        let cancelTimers: () -> Void = {
-            overallWork?.cancel()
-            overallWork = nil
-            readTimeoutWork?.cancel()
-            readTimeoutWork = nil
-        }
-
-        // Overall safety deadline for worker spawn/READY handshake + encode + pipe transfer (NOT slow Promise).
-        // Expiry here reports .workerFailed and NEVER poisons lastTimedOutChangeCount.
-        let ow = DispatchWorkItem { [weak self] in
-            if settled { return }
-            settled = true
-            cancelTimers()
-            guard let self = self else {
-                completion(CaptureResult(snap: nil, status: .workerFailed, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                return
-            }
-            self.workerClient.killActiveWorkerAndRespawnAsync(for: token)
-            completion(CaptureResult(snap: nil, status: .workerFailed, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-        }
-        overallWork = ow
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(overallBudgetMs)), execute: ow)
-
-        // Strict 200ms slow-Promise timer armed ONLY when worker confirms READY and sends BEGIN ("AVIB")
-        // right before NSPasteboard read, and cancelled immediately upon DONE ("AVID") before payload encoding.
-        let onReadStarted: () -> Void = { [weak self] in
-            DispatchQueue.main.async { [weak self] in
-                if settled { return }
-                guard let self = self else { return }
-                let now = monotonicMs()
-                let remOverall = (ioDeadlineMonoMs > now) ? (ioDeadlineMonoMs &- now) : 0
-                let readBudgetMs = min(self.maxCaptureMs, max(1, remOverall))
-                let rw = DispatchWorkItem { [weak self] in
-                    if settled { return }
-                    settled = true
-                    cancelTimers()
-                    guard let self = self else {
-                        completion(CaptureResult(snap: nil, status: .timedOut, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                        return
-                    }
-                    self.lastTimedOutChangeCount = startChangeCount
-                    self.workerClient.killActiveWorkerAndRespawnAsync(for: token)
-                    let livePb = self.pasteboardProvider()
-                    if livePb.changeCount != startChangeCount {
-                        if self.isCurrentPasteboardStillOursForRestore(livePb) {
-                            completion(CaptureResult(snap: self.savedSnap, status: .ownTransient, observedChangeCount: livePb.changeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                            return
-                        }
-                        if maxRetriesOnChange > 0 {
-                            self.captureSnapshotAsync(
-                                deadlineMonoMs: deadlineMonoMs,
-                                maxRetriesOnChange: maxRetriesOnChange - 1,
-                                initialObservedChangeCount: initCc,
-                                completion: completion
-                            )
-                            return
-                        }
-                    }
-                    completion(CaptureResult(snap: nil, status: .timedOut, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                }
-                readTimeoutWork?.cancel()
-                readTimeoutWork = rw
-                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(readBudgetMs)), execute: rw)
-            }
-        }
-
-        let onReadFinished: () -> Void = {
-            DispatchQueue.main.async {
-                readTimeoutWork?.cancel()
-                readTimeoutWork = nil
-            }
-        }
-
-        workerClient.requestSnapshotAsync(
-            token: token,
-            maxSnapshotBytes: maxSnapshotBytes,
-            ioDeadlineMonoMs: ioDeadlineMonoMs,
-            onReadStarted: onReadStarted,
-            onReadFinished: onReadFinished
-        ) { [weak self] workerOutcome in
-            DispatchQueue.main.async { [weak self] in
-                if settled { return }
-                settled = true
-                cancelTimers()
-                guard let self = self else {
-                    completion(CaptureResult(snap: nil, status: .workerFailed, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                    return
-                }
-                let livePb = self.pasteboardProvider()
-                if livePb.changeCount != startChangeCount {
-                    if self.isCurrentPasteboardStillOursForRestore(livePb) {
-                        completion(CaptureResult(snap: self.savedSnap, status: .ownTransient, observedChangeCount: livePb.changeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                        return
-                    }
-                    if maxRetriesOnChange > 0 {
-                        self.captureSnapshotAsync(
-                            deadlineMonoMs: deadlineMonoMs,
-                            maxRetriesOnChange: maxRetriesOnChange - 1,
-                            initialObservedChangeCount: initCc,
-                            completion: completion
-                        )
-                        return
-                    }
-                    completion(CaptureResult(snap: nil, status: .unpreserved, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: 0))
-                    return
-                }
-                guard let outcome = workerOutcome else {
-                    completion(CaptureResult(snap: nil, status: .workerFailed, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                    return
-                }
-                switch outcome {
-                case .items(let list):
-                    completion(CaptureResult(snap: .items(list), status: .items, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                case .clearOnly:
-                    completion(CaptureResult(snap: .clearOnly, status: .clearOnly, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                case .readFailed:
-                    completion(CaptureResult(snap: nil, status: .readFailed, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                case .ownTransient:
-                    completion(CaptureResult(snap: nil, status: .ownTransient, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                case .unpreserved, .expired:
-                    completion(CaptureResult(snap: nil, status: .unpreserved, observedChangeCount: startChangeCount, initialObservedChangeCount: initCc, retriesLeft: maxRetriesOnChange))
-                }
-            }
-        }
-    }
-
-    func writeTransientCheckedAsync(
-        _ text: String,
-        deadlineMonoMs: UInt64,
-        maxRetriesOnChange: Int = 1,
-        armRestoreTimerImmediately: Bool = true,
-        completion: @escaping (WriteOutcome) -> Void
-    ) {
-        let nowMs = monotonicMs()
-        if deadlineMonoMs > 0 && nowMs >= deadlineMonoMs {
-            completion(.expired)
-            return
-        }
-        let pb = pasteboardProvider()
-        let initialCc = pb.changeCount
-        if isCurrentPasteboardStillOursForRestore(pb) {
-            completion(finishWriteTransient(text, nextSnap: savedSnap, deadlineMonoMs: deadlineMonoMs, armRestoreTimerImmediately: armRestoreTimerImmediately))
-            return
-        }
-        if isPasteboardStillOwnedByUs(pb) {
-            completion(finishWriteTransient(text, nextSnap: nil, deadlineMonoMs: deadlineMonoMs, armRestoreTimerImmediately: armRestoreTimerImmediately))
-            return
-        }
-        func runStep(_ retries: Int) {
-            captureSnapshotAsync(
-                deadlineMonoMs: deadlineMonoMs,
-                maxRetriesOnChange: retries,
-                initialObservedChangeCount: initialCc
-            ) { [weak self] capRes in
-                guard let self = self else {
-                    completion(.failed)
-                    return
-                }
-                switch self.evaluatePreWriteDecision(
-                    capture: capRes,
-                    deadlineMonoMs: deadlineMonoMs,
-                    keyHeld: false,
-                    focusMatched: true
-                ) {
-                case .retryCapture(let nextRetries):
-                    runStep(nextRetries)
-                case .abortClipboardChanged:
-                    completion(.clipboardChanged)
-                case .abortWorkerFailed:
-                    completion(.workerFailed)
-                case .abortExpired:
-                    completion(.expired)
-                case .abortKeyHeld, .abortFocusChanged:
-                    completion(.failed)
-                case .proceed:
-                    completion(self.finishWriteTransient(
-                        text,
-                        nextSnap: capRes.snap,
-                        deadlineMonoMs: deadlineMonoMs,
-                        armRestoreTimerImmediately: armRestoreTimerImmediately
-                    ))
-                }
-            }
-        }
-        runStep(maxRetriesOnChange)
-    }
-
     @discardableResult
     func flushPendingRestore() -> Bool {
         guard restorePending else { return true }
         let snap = savedSnap
-        let exp = ownedChangeCount
-        let expTok = ownedToken
-        restoreWork?.cancel()
-        restoreWork = nil
-        guard let snap = snap, let expTok = expTok, exp >= 0 else {
-            cancelPendingRestore()
-            clearOwnership()
-            return false
-        }
-        // Build all [NSPasteboardItem] in memory BEFORE verifying ownership, clearing the pasteboard, or releasing savedSnap.
-        var rebuilt: [NSPasteboardItem] = []
-        var rawItemList: [[(NSPasteboard.PasteboardType, Data)]] = []
-        switch snap {
-        case .clearOnly:
-            break
-        case .items(let itemList):
-            rawItemList = itemList
-            rebuilt = Self.buildRestoreItems(from: itemList)
-        }
+        let expectedCc = writtenChangeCount
+        cancelPendingRestore()
+        writtenChangeCount = -1
         let pb = pasteboardProvider()
-        guard pb.changeCount == exp, pb.data(forType: Self.ownTransientMarker) == expTok else {
-            cancelPendingRestore()
-            clearOwnership()
+        guard let snap = snap, expectedCc >= 0, pb.changeCount == expectedCc else {
             return false
         }
         switch snap {
         case .clearOnly:
             _ = pb.clearContents()
-            cancelPendingRestore()
-            clearOwnership()
             return true
-        case .items:
-            guard !rebuilt.isEmpty else {
-                cancelPendingRestore()
-                clearOwnership()
+        case .items(let itemList):
+            let rebuilt = Self.buildRestoreItems(from: itemList)
+            guard !rebuilt.isEmpty, pb.changeCount == expectedCc else {
                 return false
             }
-            let clearedCc = pb.clearContents()
-            var wroteOk = pb.writeObjects(rebuilt)
-            if !wroteOk && pb.changeCount == clearedCc {
-                let retryItems = Self.buildRestoreItems(from: rawItemList)
-                // Re-verify pb.changeCount == clearedCc strictly AFTER rebuilding retryItems and BEFORE writeObjects.
-                if !retryItems.isEmpty && pb.changeCount == clearedCc {
-                    wroteOk = pb.writeObjects(retryItems)
-                }
-            }
-            cancelPendingRestore()
-            clearOwnership()
-            return wroteOk
+            _ = pb.clearContents()
+            return pb.writeObjects(rebuilt)
         }
     }
 }
@@ -4929,49 +4245,22 @@ private func runPasteboardWorker(pasteboardName: String?) -> Int32 {
         }()
         // Warm AppKit pasteboard connection on worker main thread before signalling READY.
         _ = NSPasteboard(name: targetName)
-        var readyFrame = Data()
-        readyFrame.reserveCapacity(4)
-        appendBigEndianUInt32(&readyFrame, kPbReadyMagic)
-        guard writeAll(fd: STDOUT_FILENO, data: readyFrame) else {
+        guard writeAll(fd: STDOUT_FILENO, data: Data([kPbReadyByte])) else {
             return 0
         }
-        while true {
-            if getppid() != parentPid {
-                break
-            }
+        while getppid() == parentPid {
             let keepRunning = autoreleasepool { () -> Bool in
-                guard let header = readExact(fd: STDIN_FILENO, count: 16) else {
+                guard let reqData = readExact(fd: STDIN_FILENO, count: 4),
+                      getppid() == parentPid,
+                      let rawMax = readBigEndianUInt32(reqData, at: 0) else {
                     return false
                 }
-                if getppid() != parentPid {
-                    return false
-                }
-                guard let (reqId, maxBytes) = decodePasteboardRequest(header) else {
-                    return false
-                }
-                // Acknowledge request start right before NSPasteboard read so parent strictly times read phase.
-                var beginFrame = Data()
-                beginFrame.reserveCapacity(12)
-                appendBigEndianUInt32(&beginFrame, kPbBeginMagic)
-                appendBigEndianUInt64(&beginFrame, reqId)
-                guard writeAll(fd: STDOUT_FILENO, data: beginFrame) else {
-                    return false
-                }
+                let maxBytes = max(1, min(Int(rawMax), PasteboardGuard.defaultMaxSnapshotBytes))
                 let outcome = PasteboardGuard.captureCurrentReadOnly(
                     pasteboardName: targetName,
-                    maxSnapshotBytes: max(1, min(maxBytes, PasteboardGuard.defaultMaxSnapshotBytes)),
-                    deadlineMonoMs: nil
+                    maxSnapshotBytes: maxBytes
                 )
-                // Signal read-complete ("AVID") immediately BEFORE encoding up to 100 MiB payload
-                // so parent cancels the 200ms slow-Promise timer and handles encode/transfer under overall deadline.
-                var doneFrame = Data()
-                doneFrame.reserveCapacity(12)
-                appendBigEndianUInt32(&doneFrame, kPbDoneMagic)
-                appendBigEndianUInt64(&doneFrame, reqId)
-                guard writeAll(fd: STDOUT_FILENO, data: doneFrame) else {
-                    return false
-                }
-                let (respHeader, respPayload) = encodePasteboardResponseParts(reqId: reqId, outcome: outcome)
+                let (respHeader, respPayload) = encodePasteboardResponse(outcome: outcome)
                 guard writeAll(fd: STDOUT_FILENO, data: respHeader) else {
                     return false
                 }
@@ -4982,9 +4271,7 @@ private func runPasteboardWorker(pasteboardName: String?) -> Int32 {
                 }
                 return true
             }
-            if !keepRunning {
-                break
-            }
+            if !keepRunning { break }
         }
         return 0
     }
@@ -6141,16 +5428,29 @@ private func runSelfCheck() -> Int32 {
                 return unwrapped
             }
 
-            func writeTransientSync(_ guardObj: PasteboardGuard, _ text: String, deadlineMonoMs: UInt64 = 0) throws -> PasteboardGuard.WriteOutcome {
+            func captureSync(_ guardObj: PasteboardGuard, deadlineMonoMs: UInt64 = 0) throws -> (Int, PasteboardGuard.ClipSnap?) {
                 return try awaitMainAsync { done in
-                    guardObj.writeTransientCheckedAsync(text, deadlineMonoMs: deadlineMonoMs, completion: done)
+                    guardObj.captureSnapshotAsync(deadlineMonoMs: deadlineMonoMs) { preCc, snap in
+                        done((preCc, snap))
+                    }
                 }
             }
 
-            try check(PasteboardGuard.defaultMaxSnapshotBytes == 100 * 1024 * 1024, "pb defaultMaxSnapshotBytes 100MiB")
-            try check(PasteboardGuard.defaultMaxCaptureMs == 200, "pb defaultMaxCaptureMs 200ms")
+            func linearPasteSync(_ guardObj: PasteboardGuard, _ text: String, deadlineMonoMs: UInt64 = 0, armTimer: Bool = false) throws -> Bool {
+                let (preCc, snap) = try captureSync(guardObj, deadlineMonoMs: deadlineMonoMs)
+                let effSnap: PasteboardGuard.ClipSnap? = (guardObj.currentChangeCount == preCc) ? snap : nil
+                guard guardObj.writeTransient(text, snap: effSnap) else { return false }
+                if armTimer {
+                    guardObj.armPendingRestoreTimer()
+                }
+                return true
+            }
 
-            // 0) pasteboardItems == nil vs empty array semantics + binary frame round-trip
+            try check(PasteboardGuard.defaultMaxSnapshotBytes == 10 * 1024 * 1024, "pb defaultMaxSnapshotBytes 10MiB")
+            try check(PasteboardGuard.defaultMaxCaptureMs == 200, "pb defaultMaxCaptureMs 200ms")
+            try check(PasteboardGuard.defaultRestoreDelayMs == 250, "pb defaultRestoreDelayMs 250ms")
+
+            // 0) pasteboardItems == nil vs empty array semantics + minimal wire framing round-trip
             if case .readFailed = PasteboardGuard.classifyRawPasteboardItems(nil) {
                 // expected: read failure must NEVER map to .clearOnly
             } else {
@@ -6161,84 +5461,125 @@ private func runSelfCheck() -> Int32 {
             } else {
                 try check(false, "pb classifyRawPasteboardItems([]) must return .clearOnly")
             }
-            let (rtReadFailedHdr, rtReadFailedPayload) = encodePasteboardResponseParts(reqId: 42, outcome: .readFailed)
-            try check(rtReadFailedHdr.count == 20 && rtReadFailedPayload.isEmpty && rtReadFailedHdr[12] == kPbStatusReadFailed, "pb wire encode .readFailed")
-            if case .readFailed = decodePasteboardResponse(expectedReqId: 42, statusByte: rtReadFailedHdr[12], payload: rtReadFailedPayload) {
+            let (rtReadFailedHdr, rtReadFailedPayload) = encodePasteboardResponse(outcome: .readFailed)
+            try check(rtReadFailedHdr.count == 5 && rtReadFailedPayload.isEmpty && rtReadFailedHdr[0] == kPbStatusNone, "pb wire encode .readFailed")
+            if case .some(nil) = decodePasteboardResponse(statusByte: rtReadFailedHdr[0], payload: rtReadFailedPayload) {
                 // expected
             } else {
-                try check(false, "pb wire decode .readFailed")
+                try check(false, "pb wire decode .readFailed -> nil snap")
             }
-            // Symmetric 4096-item cap: encoder downgrades >4096 items to .unpreserved instead of emitting undecodable frame
             let overCapItems: [[(NSPasteboard.PasteboardType, Data)]] = Array(repeating: [(.string, Data("x".utf8))], count: kPbMaxItems + 1)
-            let (overCapHdr, overCapPayload) = encodePasteboardResponseParts(reqId: 43, outcome: .items(overCapItems))
-            try check(overCapHdr.count == 20 && overCapPayload.isEmpty && overCapHdr[12] == kPbStatusUnpreserved, "pb encoder caps >4096 items symmetrically with decoder")
-            if case .unpreserved = decodePasteboardResponse(expectedReqId: 43, statusByte: overCapHdr[12], payload: overCapPayload) {
+            let (overCapHdr, overCapPayload) = encodePasteboardResponse(outcome: .items(overCapItems))
+            try check(overCapHdr.count == 5 && overCapPayload.isEmpty && overCapHdr[0] == kPbStatusNone, "pb encoder caps >4096 items symmetrically")
+            if case .some(nil) = decodePasteboardResponse(statusByte: overCapHdr[0], payload: overCapPayload) {
                 // expected
             } else {
                 try check(false, "pb decoder accepts downgraded >4096 item frame")
             }
 
             let testPb = NSPasteboard.withUniqueName()
-            let pbg = PasteboardGuard(pasteboard: testPb, restoreDelayMs: 40, maxSnapshotBytes: 4096, maxCaptureMs: 500)
-            pbg.warmUpWorkerAsync()
+            let pbg = PasteboardGuard(pasteboard: testPb, restoreDelayMs: 50, maxSnapshotBytes: 4096, maxCaptureMs: 500)
             defer {
                 pbg.shutdown()
                 testPb.releaseGlobally()
             }
+            try check(pbg.workerSpawnCount == 0, "pb worker is lazily spawned on demand")
             let samplePng = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02])
             let sampleHtml = Data("<b>clip</b>".utf8)
 
-            // 1) Composite PNG + HTML + plain text snapshot via persistent --pasteboard-worker + rapid-fire #1 + #2 preserving Image0
+            // 1) Composite PNG + HTML + plain text via single-slot lazy worker + rapid-fire #1 + #2 preserving Image0
             testPb.clearContents()
             let seedItem = NSPasteboardItem()
             _ = seedItem.setData(samplePng, forType: .png)
             _ = seedItem.setData(sampleHtml, forType: .html)
             _ = seedItem.setString("orig_caption", forType: .string)
             try check(testPb.writeObjects([seedItem]), "pb seed composite")
-            try check(try writeTransientSync(pbg, "voice_1") == .ok, "pb transient #1")
+            try check(try linearPasteSync(pbg, "voice_1"), "pb transient #1")
             try check(pbg.restorePending && testPb.string(forType: .string) == "voice_1", "pb #1 armed")
-            try check(pbg.workerSpawnCount == 1 && pbg.workerKillCount == 0, "pb #1 used single persistent worker")
+            try check(pbg.workerSpawnCount == 1 && pbg.workerKillCount == 0 && pbg.workerRequestCount == 1, "pb #1 lazily spawned single worker")
             let p1Types = testPb.pasteboardItems?.first?.types ?? []
             try check(p1Types.contains(PasteboardGuard.transientType) && p1Types.contains(PasteboardGuard.autoGeneratedType), "pb #1 transient markers")
-            try check(try writeTransientSync(pbg, "voice_2") == .ok, "pb transient #2 rapid-fire")
+            try check(try linearPasteSync(pbg, "voice_2"), "pb transient #2 rapid-fire")
             try check(pbg.restorePending && testPb.string(forType: .string) == "voice_2", "pb #2 armed")
+            try check(pbg.workerRequestCount == 1, "pb #2 reused savedSnap synchronously without extra worker IPC")
             try check(pbg.flushPendingRestore(), "pb flush returned true")
             try check(!pbg.restorePending, "pb flushed idle")
             try check(testPb.data(forType: .png) == samplePng && testPb.data(forType: .html) == sampleHtml && testPb.string(forType: .string) == "orig_caption", "pb restored composite Image0")
 
-            // 2) Manual Cmd+C during pending window must NEVER be overwritten by flush OR re-baselined away by #2
-            try check(try writeTransientSync(pbg, "voice_3") == .ok, "pb transient #3")
-            testPb.clearContents()
-            _ = testPb.setString("user_cmd_c_new", forType: .string)
-            try check(!pbg.flushPendingRestore(), "pb flush returns false when user modified clipboard")
-            try check(testPb.string(forType: .string) == "user_cmd_c_new" && testPb.data(forType: .png) == nil, "pb preserved user Cmd+C on flush")
+            // 2) Timer restore succeeds when untouched, and ABORTS if clipboard changes before timer expires
+            try check(try linearPasteSync(pbg, "voice_timer_ok", armTimer: true), "pb timer ok write")
+            let restoreDeadline = Date().addingTimeInterval(0.5)
+            while pbg.restorePending && Date() < restoreDeadline {
+                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
+            }
+            try check(!pbg.restorePending && testPb.data(forType: .png) == samplePng && testPb.string(forType: .string) == "orig_caption", "pb timer restored original clipboard")
 
-            try check(try writeTransientSync(pbg, "voice_4a") == .ok, "pb transient #4a")
+            try check(try linearPasteSync(pbg, "voice_timer_abort", armTimer: true), "pb timer abort setup")
             testPb.clearContents()
-            _ = testPb.setString("user_between_bursts", forType: .string)
-            try check(try writeTransientSync(pbg, "voice_4b") == .ok, "pb transient #4b")
-            pbg.flushPendingRestore()
-            try check(testPb.string(forType: .string) == "user_between_bursts", "pb re-baselined user copy between bursts")
+            try check(testPb.setString("user_cmd_c_before_timer", forType: .string), "pb simulate user copy before timer")
+            let waitAbortUntil = Date().addingTimeInterval(0.12)
+            while Date() < waitAbortUntil {
+                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
+            }
+            try check(!pbg.restorePending && testPb.string(forType: .string) == "user_cmd_c_before_timer" && testPb.data(forType: .png) == nil, "pb timer aborted restore after changeCount mismatch")
 
-            // 3) Focus-drift persistent fallback cancels pending timer and omits TransientType
+            // 3) Focus-drift / force_clipboard_only persistent write cancels armed restore timer and omits TransientType
             testPb.clearContents()
             let seedImg2 = NSPasteboardItem()
             _ = seedImg2.setData(samplePng, forType: .png)
             _ = testPb.writeObjects([seedImg2])
-            try check(try writeTransientSync(pbg, "voice_5") == .ok, "pb transient #5")
-            try check(pbg.writePersistentFallback("fallback_keep"), "pb persistent fallback")
+            try check(try linearPasteSync(pbg, "voice_before_drift", armTimer: true), "pb transient before drift")
+            try check(pbg.restorePending, "pb timer armed before drift")
+            let expiredFb = pbg.writePersistentFallbackIfWithinDeadline(
+                "expired_stale_fallback",
+                deadlineMonoMs: 1000,
+                nowMs: { 1000 }
+            )
+            try check(!expiredFb.written && expiredFb.reason == "paste_deadline_exceeded", "pb force_clipboard_only expired deadline refuses write")
+            try check(pbg.restorePending && testPb.string(forType: .string) == "voice_before_drift", "pb expired force_clipboard_only left clipboard and timer intact")
+            let validFb = pbg.writePersistentFallbackIfWithinDeadline(
+                "fallback_keep",
+                deadlineMonoMs: 1001,
+                nowMs: { 1000 }
+            )
+            try check(validFb.written && validFb.reason == "clipboard_only", "pb persistent fallback within deadline")
             let fbTypes = testPb.pasteboardItems?.first?.types ?? []
-            try check(!pbg.restorePending && !fbTypes.contains(PasteboardGuard.transientType), "pb fallback no transient marker")
-            pbg.flushPendingRestore()
-            try check(testPb.string(forType: .string) == "fallback_keep", "pb fallback retained")
+            try check(!pbg.restorePending && !fbTypes.contains(PasteboardGuard.transientType), "pb fallback cancelled timer & omitted transient marker")
+            let waitCancelledUntil = Date().addingTimeInterval(0.12)
+            while Date() < waitCancelledUntil {
+                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
+            }
+            try check(testPb.string(forType: .string) == "fallback_keep" && testPb.data(forType: .png) == nil, "pb cancelled timer never overwrote fallback")
 
-            // 4) ConcealedType & external TransientType -> ClearOnly (never retains secret/transient) & oversize burst skip
+            // 3b) Micro-window external Cmd+C right after writeObjects bumps changeCount past clearContents() ->
+            //     writeTransient refuses to adopt foreign changeCount, skips arming restore, and returns false so Cmd+V is aborted.
+            testPb.clearContents()
+            let seedImgMicro = NSPasteboardItem()
+            _ = seedImgMicro.setData(samplePng, forType: .png)
+            try check(testPb.writeObjects([seedImgMicro]), "pb seed micro-window image")
+            let (microPreCc, microSnap) = try captureSync(pbg)
+            try check(microSnap != nil && pbg.currentChangeCount == microPreCc, "pb captured micro-window image")
+            let microWrote = pbg.writeTransient("voice_micro_window", snap: microSnap) {
+                let extPb = NSPasteboard(name: testPb.name)
+                extPb.clearContents()
+                _ = extPb.setString("user_micro_window_copy", forType: .string)
+            }
+            try check(!microWrote, "pb micro-window writeTransient returned false")
+            pbg.armPendingRestoreTimer()
+            try check(!pbg.restorePending, "pb micro-window mismatch skipped restore arm")
+            let waitMicroUntil = Date().addingTimeInterval(0.12)
+            while Date() < waitMicroUntil {
+                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
+            }
+            try check(testPb.string(forType: .string) == "user_micro_window_copy" && testPb.data(forType: .png) == nil, "pb micro-window concurrent user copy never overwritten")
+
+            // 4) ConcealedType & external TransientType -> clearOnly; oversize (>maxSnapshotBytes) -> nil snap & still pastes
             testPb.clearContents()
             let pwItem = NSPasteboardItem()
             _ = pwItem.setString("top_secret_pw", forType: .string)
             _ = pwItem.setData(Data(), forType: PasteboardGuard.concealedType)
             _ = testPb.writeObjects([pwItem])
-            try check(try writeTransientSync(pbg, "voice_6") == .ok, "pb transient over concealed")
+            try check(try linearPasteSync(pbg, "voice_over_concealed"), "pb transient over concealed")
             pbg.flushPendingRestore()
             try check((testPb.pasteboardItems ?? []).isEmpty && testPb.string(forType: .string) == nil, "pb concealed cleared")
 
@@ -6247,7 +5588,7 @@ private func runSelfCheck() -> Int32 {
             _ = extTrItem.setString("external_ephemeral_snippet", forType: .string)
             _ = extTrItem.setData(Data(), forType: PasteboardGuard.transientType)
             _ = testPb.writeObjects([extTrItem])
-            try check(try writeTransientSync(pbg, "voice_6b") == .ok, "pb transient over external transient")
+            try check(try linearPasteSync(pbg, "voice_over_ext_transient"), "pb transient over external transient")
             pbg.flushPendingRestore()
             try check((testPb.pasteboardItems ?? []).isEmpty && testPb.string(forType: .string) == nil, "pb external transient cleared")
 
@@ -6255,81 +5596,31 @@ private func runSelfCheck() -> Int32 {
             let bigItem = NSPasteboardItem()
             _ = bigItem.setData(Data(repeating: 0xAA, count: 8192), forType: .png)
             _ = testPb.writeObjects([bigItem])
-            try check(try writeTransientSync(pbg, "voice_oversize") == .ok, "pb transient over oversize")
-            try check(!pbg.restorePending && testPb.string(forType: .string) == "voice_oversize", "pb oversize skips restore arm")
-            try check(pbg.isOwnedClipboardIntact(), "pb oversize still records post-write ownership")
-            try check(try writeTransientSync(pbg, "voice_oversize_2") == .ok, "pb transient #2 after oversize")
+            try check(try linearPasteSync(pbg, "voice_oversize"), "pb transient over oversize")
+            try check(!pbg.restorePending && testPb.string(forType: .string) == "voice_oversize", "pb oversize skips restore arm and still pastes")
+            try check(try linearPasteSync(pbg, "voice_oversize_2"), "pb transient #2 after oversize")
             try check(!pbg.restorePending && testPb.string(forType: .string) == "voice_oversize_2", "pb oversize burst never snapshots voice_oversize")
-            pbg.flushPendingRestore()
-            try check(testPb.string(forType: .string) == "voice_oversize_2", "pb oversize #2 retained")
 
-            // 5) PNG + oversize/small TIFF coexistence deduplicates TIFF (only snapshots PNG, avoiding double bitmap quota), while TIFF-only falls back cleanly
+            // 5) PNG + TIFF deduplication & TIFF-only fallback
             testPb.clearContents()
             let dualImgItem = NSPasteboardItem()
             let oversizeTiff = Data(repeating: 0xBB, count: 8192)
-            let okDualPng = dualImgItem.setData(samplePng, forType: .png)
-            let okDualTiff = dualImgItem.setData(oversizeTiff, forType: .tiff)
-            try check(okDualPng && okDualTiff && testPb.writeObjects([dualImgItem]), "pb seed PNG+TIFF")
-            let dualSeedTypes = testPb.pasteboardItems?.first?.types ?? []
-            try check(dualSeedTypes.contains(.png) && dualSeedTypes.contains(.tiff), "pb seed contains both PNG and TIFF")
-            try check(try writeTransientSync(pbg, "voice_dual_img") == .ok, "pb transient over PNG+TIFF")
+            try check(dualImgItem.setData(samplePng, forType: .png) && dualImgItem.setData(oversizeTiff, forType: .tiff) && testPb.writeObjects([dualImgItem]), "pb seed PNG+TIFF")
+            try check(try linearPasteSync(pbg, "voice_dual_img"), "pb transient over PNG+TIFF")
             try check(pbg.restorePending, "pb PNG+TIFF armed without double-counting oversize TIFF")
             pbg.flushPendingRestore()
-            let restoredDualTiff = testPb.data(forType: .tiff)
-            try check(!pbg.restorePending && testPb.data(forType: .png) == samplePng && restoredDualTiff != oversizeTiff, "pb PNG restored without TIFF duplication")
-
-            let tinySentinelTiff = Data([0x49, 0x49, 0x2A, 0x00, 0xDE, 0xAD, 0xBE, 0xEF])
-            testPb.clearContents()
-            let dualSmallItem = NSPasteboardItem()
-            try check(dualSmallItem.setData(samplePng, forType: .png) && dualSmallItem.setData(tinySentinelTiff, forType: .tiff) && testPb.writeObjects([dualSmallItem]), "pb seed PNG+small TIFF")
-            try check(try writeTransientSync(pbg, "voice_dual_small") == .ok, "pb transient over PNG+small TIFF")
-            pbg.flushPendingRestore()
-            try check(!pbg.restorePending && testPb.data(forType: .png) == samplePng && testPb.data(forType: .tiff) != tinySentinelTiff, "pb PNG+small TIFF skipped TIFF capture")
+            try check(!pbg.restorePending && testPb.data(forType: .png) == samplePng && testPb.data(forType: .tiff) != oversizeTiff, "pb PNG restored without TIFF duplication")
 
             let sampleTiff = Data([0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00])
             testPb.clearContents()
             let tiffOnlyItem = NSPasteboardItem()
             try check(tiffOnlyItem.setData(sampleTiff, forType: .tiff) && testPb.writeObjects([tiffOnlyItem]), "pb seed TIFF-only")
-            try check(try writeTransientSync(pbg, "voice_tiff_only") == .ok, "pb transient over TIFF-only")
+            try check(try linearPasteSync(pbg, "voice_tiff_only"), "pb transient over TIFF-only")
             pbg.flushPendingRestore()
             try check(!pbg.restorePending && testPb.data(forType: .tiff) == sampleTiff, "pb TIFF-only fallback restored")
+            try check(pbg.workerSpawnCount == 1 && pbg.workerKillCount == 0, "pb reused single lazy worker across all normal tests")
 
-            // 6) Capture time budget guard: expired deadline returns .expired immediately without blocking transient write
-            testPb.clearContents()
-            let budgetItem = NSPasteboardItem()
-            try check(budgetItem.setString("budget_guard_seed", forType: .string) && testPb.writeObjects([budgetItem]), "pb seed budget guard")
-            if case .expired = PasteboardGuard.captureCurrentReadOnly(pasteboardName: testPb.name, maxSnapshotBytes: 4096, deadlineMonoMs: monotonicMs()) {
-                // expected
-            } else {
-                try check(false, "pb captureCurrentReadOnly expired must return .expired")
-            }
-            let tightRes = try writeTransientSync(pbg, "voice_tight_budget", deadlineMonoMs: monotonicMs() &+ 120)
-            try check(tightRes == .ok && !pbg.restorePending && testPb.string(forType: .string) == "voice_tight_budget", "pb tight deadline skips snapshot and writes transient")
-            try check(pbg.workerSpawnCount == 1 && pbg.workerKillCount == 0, "pb reused single persistent worker across all normal tests")
-
-            // 7) Pre-keystroke total deadline recheck + deferred restore timer arming after post
-            testPb.clearContents()
-            let prePostSeed = NSPasteboardItem()
-            try check(prePostSeed.setString("restore_on_late_post", forType: .string) && testPb.writeObjects([prePostSeed]), "pb seed pre-post deadline")
-            let deferredCap: PasteboardGuard.CaptureResult = try awaitMainAsync { done in
-                pbg.captureSnapshotAsync(deadlineMonoMs: monotonicMs() &+ 1250, completion: done)
-            }
-            try check(deferredCap.status == .items && deferredCap.snap != nil, "pb deferred timer capture ok")
-            let deferredWrite = pbg.finishWriteTransient("voice_deferred_timer", nextSnap: deferredCap.snap, deadlineMonoMs: monotonicMs() &+ 1250, armRestoreTimerImmediately: false)
-            try check(deferredWrite == .ok && pbg.restorePending && testPb.string(forType: .string) == "voice_deferred_timer", "pb deferred write armed without starting timer")
-            // Wait longer than restoreDelayMs (40ms): restore MUST NOT fire before armPendingRestoreTimer()
-            let holdUntil = Date().addingTimeInterval(0.075)
-            while Date() < holdUntil {
-                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
-            }
-            try check(pbg.restorePending && testPb.string(forType: .string) == "voice_deferred_timer", "pb deferred timer does NOT fire before post succeeds")
-            pbg.armPendingRestoreTimer()
-            let restoreDeadline = Date().addingTimeInterval(0.5)
-            while pbg.restorePending && Date() < restoreDeadline {
-                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
-            }
-            try check(!pbg.restorePending && testPb.string(forType: .string) == "restore_on_late_post", "pb armed post-keystroke timer restored clipboard")
-
+            // 6) postEventsIfWithinDeadline + resolveClaudeWebAreaDeadlineMs pure helpers
             var postedExpiredCount = 0
             let expiredOk = postEventsIfWithinDeadline(
                 events: [0x37, 0x09, 0x09, 0x37],
@@ -6346,9 +5637,18 @@ private func runSelfCheck() -> Int32 {
                 postEvent: { _ in postedValidCount += 1 }
             )
             try check(validOk && postedValidCount == 4, "pre-keystroke valid deadline posts all 4 keyboard events")
+            try check(
+                resolveClaudeWebAreaDeadlineMs(nowMs: 1000, budgetMs: 80, outerDeadlineMonoMs: 1180) == 1080,
+                "claude web area deadline caps at own 80ms budget when outer deadline is looser"
+            )
+            try check(
+                resolveClaudeWebAreaDeadlineMs(nowMs: 1000, budgetMs: 80, outerDeadlineMonoMs: 1035) == 1035,
+                "claude web area deadline honors tighter outer 200ms deadline"
+            )
 
-            // 8) Cross-process stalled Promise hard-timeout + real SIGKILL/waitpid worker recovery + zero 2-slot collateral damage + R3 races
-            //    Uses isolated named pasteboards and never touches NSPasteboard.general.
+            // 7) Cross-process stalled Promise (simulating 60s RDP hang):
+            //    200ms hard timeout -> SIGKILL + waitpid reap (0 zombie) -> voice paste proceeds with nil snap ->
+            //    next request lazily respawns worker and restores healthy clipboard.
             func spawnPromiseProvider(pbName: String, delayMs: Int, text: String) throws -> (pid: pid_t, inFd: Int32, cc: Int) {
                 var inPipe: [Int32] = [-1, -1]
                 var outPipe: [Int32] = [-1, -1]
@@ -6414,284 +5714,73 @@ private func runSelfCheck() -> Int32 {
                 return Darwin.kill(pid, 0) != 0 && errno == ESRCH
             }
 
-            func waitWorkerReady(_ g: PasteboardGuard, excludingPid: pid_t = 0, timeoutSec: TimeInterval = 2.0) -> pid_t {
-                let limit = Date().addingTimeInterval(timeoutSec)
-                while Date() < limit {
-                    let cur = g.currentWorkerPid
-                    if cur > 0 && cur != excludingPid && g.isCurrentWorkerReady {
-                        return cur
-                    }
-                    RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
-                }
-                return g.isCurrentWorkerReady ? g.currentWorkerPid : 0
-            }
-
             let promisePbNameStr = "avi.selfcheck.\(ProcessInfo.processInfo.processIdentifier).\(monotonicMs())"
-            let promisePbName = NSPasteboard.Name(promisePbNameStr)
-            let promisePb = NSPasteboard(name: promisePbName)
+            let promisePb = NSPasteboard(name: NSPasteboard.Name(promisePbNameStr))
             let promiseGuard = PasteboardGuard(pasteboard: promisePb, restoreDelayMs: 40, maxSnapshotBytes: 4096, maxCaptureMs: 200)
-            promiseGuard.warmUpWorkerAsync()
             defer {
                 promiseGuard.shutdown()
                 promisePb.releaseGlobally()
             }
-            // Warm up initial worker with a fast benign capture so timeout strictly measures Promise hang (not cold spawn)
+            // First healthy read lazily spawns workerPid1
             promisePb.clearContents()
             _ = promisePb.setString("warmup_ok", forType: .string)
-            let warmRes: PasteboardGuard.CaptureResult = try awaitMainAsync { done in
-                promiseGuard.captureSnapshotAsync(deadlineMonoMs: monotonicMs() &+ 2000, completion: done)
-            }
-            try check(warmRes.status == .items, "pb worker warmup capture succeeded")
+            let (_, warmSnap) = try captureSync(promiseGuard, deadlineMonoMs: monotonicMs() &+ 2000)
+            try check(warmSnap != nil && promiseGuard.workerSpawnCount == 1, "pb lazy worker warmup succeeded")
             let workerPid1 = promiseGuard.currentWorkerPid
             try check(workerPid1 > 0, "pb workerPid1 active")
 
-            // 8a) Stalled 2s cross-process Promise hits 200ms hard timeout, SIGKILLs workerPid1, reaps it cleanly, and caches badCc1
-            let prov1 = try spawnPromiseProvider(pbName: promisePbNameStr, delayMs: 2000, text: "stalled_1")
-            defer { stopPromiseProvider(prov1) }
-            let badCc1 = promisePb.changeCount
-            try check(badCc1 == prov1.cc, "pb stalled promise #1 changeCount matches")
+            // 7a) Stalled 2s Promise hits 200ms hard timeout -> SIGKILL + waitpid reap -> voice paste still proceeds cleanly
+            let provStall = try spawnPromiseProvider(pbName: promisePbNameStr, delayMs: 2000, text: "stalled_rdp")
+            defer { stopPromiseProvider(provStall) }
+            try check(promisePb.changeCount == provStall.cc, "pb stalled promise changeCount matches")
             let t0 = monotonicMs()
-            let capRes1: PasteboardGuard.CaptureResult = try awaitMainAsync { done in
-                promiseGuard.captureSnapshotAsync(deadlineMonoMs: t0 &+ 1250, completion: done)
-            }
-            let elapsed1 = monotonicMs() &- t0
-            try check(capRes1.status == .timedOut && capRes1.snap == nil, "pb stalled promise #1 timed out cleanly")
-            try check(promiseGuard.workerKillCount == 1, "pb stalled promise #1 killed worker once (got \(promiseGuard.workerKillCount))")
+            let (stallPreCc, stallSnap) = try captureSync(promiseGuard, deadlineMonoMs: t0 &+ 1250)
+            let elapsedStall = monotonicMs() &- t0
+            try check(stallSnap == nil, "pb stalled promise returned nil snapshot")
+            try check(promiseGuard.workerKillCount == 1, "pb stalled promise killed worker once (got \(promiseGuard.workerKillCount))")
             try check(waitPidReaped(workerPid1), "pb stalled workerPid1 SIGKILLed and reaped (zero zombie)")
-            try check(elapsed1 < 1000, "pb stalled promise #1 hard timeout well below 2s stall (got \(elapsed1)ms)")
-            try check(promiseGuard.timedOutChangeCount == badCc1 && promisePb.changeCount == badCc1, "pb stalled promise #1 cached and preserved badCc1")
+            try check(elapsedStall < 1000, "pb stalled promise hard timeout well below 2s stall (got \(elapsedStall)ms)")
+            try check(promiseGuard.currentChangeCount == stallPreCc, "pb stalled promise left clipboard intact until write")
+            try check(promiseGuard.writeTransient("voice_after_stalled_promise", snap: stallSnap), "pb paste succeeded after stalled promise")
+            try check(!promiseGuard.restorePending && promisePb.string(forType: .string) == "voice_after_stalled_promise", "pb voice text landed without restore arm")
 
-            // 8b) Negative cache hit on exact same badCc1 skips worker request and writes target text without restore arm
-            let reqCountBeforeNeg = promiseGuard.captureRequestCount
-            let tNeg = monotonicMs()
-            let negRes = try writeTransientSync(promiseGuard, "voice_neg_cache_hit", deadlineMonoMs: tNeg &+ 1250)
-            let elapsedNeg = monotonicMs() &- tNeg
-            try check(negRes == .ok && !promiseGuard.restorePending && promisePb.string(forType: .string) == "voice_neg_cache_hit", "pb negative cache wrote target text without restore arm")
-            try check(promiseGuard.captureRequestCount == reqCountBeforeNeg && promiseGuard.workerKillCount == 1, "pb negative cache skipped worker request and kill")
-            try check(elapsedNeg < 500, "pb negative cache did not stall (got \(elapsedNeg)ms)")
-
-            // 8c) 2nd stalled cross-process Promise triggers 2nd SIGKILL & automatic worker rebuild;
-            //     immediately following healthy local copy MUST capture & restore intact (zero 2-slot collateral damage!)
-            let workerPid2 = waitWorkerReady(promiseGuard, excludingPid: workerPid1)
-            try check(workerPid2 > 0 && workerPid2 != workerPid1, "pb worker respawned as workerPid2")
-            let prov2 = try spawnPromiseProvider(pbName: promisePbNameStr, delayMs: 2000, text: "stalled_2")
-            defer { stopPromiseProvider(prov2) }
-            let badCc2 = promisePb.changeCount
-            try check(badCc2 != badCc1, "pb stalled promise #2 has distinct changeCount")
-            let t2 = monotonicMs()
-            let badRes2 = try writeTransientSync(promiseGuard, "voice_over_bad_promise_2", deadlineMonoMs: t2 &+ 1250)
-            let elapsed2 = monotonicMs() &- t2
-            try check(badRes2 == .ok && !promiseGuard.restorePending && promisePb.string(forType: .string) == "voice_over_bad_promise_2", "pb stalled promise #2 timed out and wrote target text")
-            try check(promiseGuard.workerKillCount == 2 && promiseGuard.timedOutChangeCount == badCc2, "pb stalled promise #2 killed 2nd worker and updated negative cache")
-            try check(waitPidReaped(workerPid2), "pb stalled workerPid2 SIGKILLed and reaped (zero zombie)")
-            try check(elapsed2 < 1000, "pb stalled promise #2 hard timeout well below 2s stall (got \(elapsed2)ms)")
-
-            let workerPid3 = waitWorkerReady(promiseGuard, excludingPid: workerPid2)
-            try check(workerPid3 > 0 && workerPid3 != workerPid2, "pb worker automatically respawned as workerPid3 after 2nd kill")
+            // 7b) Next healthy copy lazily respawns workerPid2 and restores intact
             promisePb.clearContents()
-            try check(promisePb.setString("local_healthy_after_two_stalls", forType: .string), "pb seed healthy local copy after 2 stalls")
-            let healthyRes = try writeTransientSync(promiseGuard, "voice_after_two_stalls", deadlineMonoMs: monotonicMs() &+ 1250)
-            try check(healthyRes == .ok && promiseGuard.restorePending && promisePb.string(forType: .string) == "voice_after_two_stalls", "pb healthy copy captured cleanly after 2 stalled promises (no 2-slot collateral damage)")
-            try check(promiseGuard.flushPendingRestore(), "pb healthy copy restore succeeded")
-            try check(promisePb.string(forType: .string) == "local_healthy_after_two_stalls", "pb healthy local clipboard preserved verbatim after 2 stalls")
+            try check(promisePb.setString("local_healthy_after_stall", forType: .string), "pb seed healthy copy after stall")
+            try check(try linearPasteSync(promiseGuard, "voice_after_respawn", deadlineMonoMs: monotonicMs() &+ 2000), "pb healthy paste after stall")
+            let workerPid2 = promiseGuard.currentWorkerPid
+            try check(promiseGuard.workerSpawnCount == 2 && workerPid2 > 0 && workerPid2 != workerPid1, "pb lazily respawned workerPid2")
+            try check(promiseGuard.restorePending && promisePb.string(forType: .string) == "voice_after_respawn", "pb respawned worker armed restore")
+            try check(promiseGuard.flushPendingRestore() && promisePb.string(forType: .string) == "local_healthy_after_stall", "pb restored healthy copy after stall")
 
-            // 8d) R3 pre-write & post-write changeCount race guards
-            //     Pre-write race: non-whitelist private-only clipboard (snap == nil) STILL carries observedChangeCount;
-            //     user copying during focus2 is detected as stale, and persistent change aborts without overwriting user copy.
-            let privType = NSPasteboard.PasteboardType("com.example.avi.private.blob")
-            promisePb.clearContents()
-            let privItem = NSPasteboardItem()
-            try check(privItem.setData(Data([0xDE, 0xAD]), forType: privType) && promisePb.writeObjects([privItem]), "pb seed private-only format")
-            let privCc = promisePb.changeCount
-            let privCap: PasteboardGuard.CaptureResult = try awaitMainAsync { done in
-                promiseGuard.captureSnapshotAsync(deadlineMonoMs: monotonicMs() &+ 1250, completion: done)
+            // 8) Mid-read changeCount change (user Cmd+C during worker read):
+            //    NO recapture, NO paste refusal; drops stale snapshot so stale data never overwrites user's new copy.
+            let provMid = try spawnPromiseProvider(pbName: promisePbNameStr, delayMs: 80, text: "old_slow_clip")
+            defer { stopPromiseProvider(provMid) }
+            var midCaptured: (Int, PasteboardGuard.ClipSnap?)?
+            promiseGuard.captureSnapshotAsync(deadlineMonoMs: monotonicMs() &+ 1500) { preCc, snap in
+                midCaptured = (preCc, snap)
             }
-            try check(privCap.status == .unpreserved && privCap.snap == nil && privCap.observedChangeCount == privCc, "pb private-only returns nil snap WITH observedChangeCount")
-            promisePb.clearContents()
-            try check(promisePb.setString("user_copied_during_focus2", forType: .string), "pb simulate user Cmd+C during focus2")
-            try check(promiseGuard.isCapturedChangeCountStale(privCap.observedChangeCount), "pb detects stale changeCount even when initial snap was nil")
-            //     Shared evaluatePreWriteDecision verifies ALL early-exit fallbacks (key_held, focus2 drift, expired)
-            //     return .abortClipboardChanged when user copied concurrently, and .workerFailed preserves clipboard!
-            let nowEval = monotonicMs()
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: privCap, deadlineMonoMs: nowEval &+ 1000, keyHeld: true, focusMatched: true, nowMs: nowEval) == .abortClipboardChanged,
-                "pb evaluatePreWriteDecision key_held + concurrent copy -> .abortClipboardChanged"
-            )
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: privCap, deadlineMonoMs: nowEval &+ 1000, keyHeld: false, focusMatched: false, nowMs: nowEval) == .abortClipboardChanged,
-                "pb evaluatePreWriteDecision focus2 drift + concurrent copy -> .abortClipboardChanged"
-            )
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: privCap, deadlineMonoMs: nowEval, keyHeld: false, focusMatched: true, nowMs: nowEval) == .abortClipboardChanged,
-                "pb evaluatePreWriteDecision expired + concurrent copy -> .abortClipboardChanged"
-            )
-            let curCcEval = promisePb.changeCount
-            let freshCapEval = PasteboardGuard.CaptureResult(snap: nil, status: .unpreserved, observedChangeCount: curCcEval, retriesLeft: 1)
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: freshCapEval, deadlineMonoMs: nowEval &+ 1000, keyHeld: true, focusMatched: true, nowMs: nowEval) == .abortKeyHeld,
-                "pb evaluatePreWriteDecision key_held without copy -> .abortKeyHeld"
-            )
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: freshCapEval, deadlineMonoMs: nowEval &+ 1000, keyHeld: false, focusMatched: false, nowMs: nowEval) == .abortFocusChanged,
-                "pb evaluatePreWriteDecision focus2 drift without copy -> .abortFocusChanged"
-            )
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: freshCapEval, deadlineMonoMs: nowEval, keyHeld: false, focusMatched: true, nowMs: nowEval) == .abortExpired,
-                "pb evaluatePreWriteDecision expired without copy -> .abortExpired"
-            )
-            let wfCapEval = PasteboardGuard.CaptureResult(snap: nil, status: .workerFailed, observedChangeCount: curCcEval, retriesLeft: 1)
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: wfCapEval, deadlineMonoMs: nowEval &+ 1000, keyHeld: false, focusMatched: true, nowMs: nowEval) == .abortWorkerFailed,
-                "pb evaluatePreWriteDecision .workerFailed -> .abortWorkerFailed (preserves clipboard)"
-            )
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: wfCapEval, deadlineMonoMs: nowEval, keyHeld: true, focusMatched: false, nowMs: nowEval) == .abortWorkerFailed,
-                "pb evaluatePreWriteDecision .workerFailed takes priority over expired/key_held/focus2"
-            )
-            // After a mid-capture retry re-baselines observedChangeCount == liveCc, initialObservedChangeCount STILL catches
-            // the earlier user copy on key_held / focus2 drift / expired, while clean focus proceeds normally.
-            let rebaselinedCap = PasteboardGuard.CaptureResult(
-                snap: .items([[(.string, Data("user_copied_during_focus2".utf8))]]),
-                status: .items,
-                observedChangeCount: curCcEval,
-                initialObservedChangeCount: privCc,
-                retriesLeft: 0
-            )
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: rebaselinedCap, deadlineMonoMs: nowEval &+ 1000, keyHeld: true, focusMatched: true, nowMs: nowEval) == .abortClipboardChanged,
-                "pb re-baselined retry + key_held preserves fresh copy via initialObservedChangeCount"
-            )
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: rebaselinedCap, deadlineMonoMs: nowEval &+ 1000, keyHeld: false, focusMatched: false, nowMs: nowEval) == .abortClipboardChanged,
-                "pb re-baselined retry + focus2 drift preserves fresh copy via initialObservedChangeCount"
-            )
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: rebaselinedCap, deadlineMonoMs: nowEval, keyHeld: false, focusMatched: true, nowMs: nowEval) == .abortClipboardChanged,
-                "pb re-baselined retry + expired preserves fresh copy via initialObservedChangeCount"
-            )
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: rebaselinedCap, deadlineMonoMs: nowEval &+ 1000, keyHeld: false, focusMatched: true, nowMs: nowEval) == .proceed,
-                "pb re-baselined retry without early-exit proceeds cleanly to transient paste + restore"
-            )
-            let toCapEval = PasteboardGuard.CaptureResult(snap: nil, status: .timedOut, observedChangeCount: curCcEval, retriesLeft: 1)
-            try check(
-                promiseGuard.evaluatePreWriteDecision(capture: toCapEval, deadlineMonoMs: nowEval &+ 1000, keyHeld: false, focusMatched: true, nowMs: nowEval) == .proceed,
-                "pb evaluatePreWriteDecision confirmed slow Promise .timedOut -> .proceed"
-            )
-            try check(
-                resolveClaudeWebAreaDeadlineMs(nowMs: 1000, budgetMs: 80, outerDeadlineMonoMs: 1180) == 1080,
-                "claude web area deadline caps at own 80ms budget when outer deadline is looser"
-            )
-            try check(
-                resolveClaudeWebAreaDeadlineMs(nowMs: 1000, budgetMs: 80, outerDeadlineMonoMs: 1035) == 1035,
-                "claude web area deadline honors tighter outer 200ms deadline"
-            )
-
-            //     Post-write race (both nextSnap != nil and nextSnap == nil):
-            //     user pressing Cmd+C during focus3 invalidates ownership so Cmd+V / fallback will NOT mis-paste or overwrite.
-            let ownWithSnapRes = promiseGuard.finishWriteTransient("voice_focus3_with_snap", nextSnap: .clearOnly, deadlineMonoMs: monotonicMs() &+ 1250, armRestoreTimerImmediately: false)
-            try check(ownWithSnapRes == .ok && promiseGuard.isOwnedClipboardIntact(), "pb post-write ownership intact (nextSnap != nil)")
-            promisePb.clearContents()
-            try check(promisePb.setString("user_focus3_cmd_c_1", forType: .string), "pb simulate focus3 Cmd+C (with snap)")
-            try check(!promiseGuard.isOwnedClipboardIntact(), "pb detects focus3 user Cmd+C (nextSnap != nil)")
-            try check(!promiseGuard.flushPendingRestore() && promisePb.string(forType: .string) == "user_focus3_cmd_c_1", "pb refuses to clobber user focus3 Cmd+C")
-
-            let ownNilSnapRes = promiseGuard.finishWriteTransient("voice_focus3_nil_snap", nextSnap: nil, deadlineMonoMs: monotonicMs() &+ 1250, armRestoreTimerImmediately: false)
-            try check(ownNilSnapRes == .ok && !promiseGuard.restorePending && promiseGuard.isOwnedClipboardIntact(), "pb post-write ownership intact even when nextSnap == nil")
-            promisePb.clearContents()
-            try check(promisePb.setString("user_focus3_cmd_c_2", forType: .string), "pb simulate focus3 Cmd+C (nil snap)")
-            try check(!promiseGuard.isOwnedClipboardIntact(), "pb detects focus3 user Cmd+C even when nextSnap == nil")
-
-            //     Post-write non-post after mid-capture retry (recapturedNewClipboard == true):
-            //     BOTH focus3 drift (restoreOnNormalFallback: false) AND keystroke deadline expiry (restoreOnNormalFallback: true)
-            //     MUST restore recaptured user copy B and return .clipboardChanged (blocking persistent fallback & Python pbcopy).
-            let snapB: PasteboardGuard.ClipSnap = .items([[(.string, Data("user_recaptured_B".utf8))]])
-            try check(
-                promiseGuard.finishWriteTransient("voice_temp_over_B_focus3", nextSnap: snapB, deadlineMonoMs: monotonicMs() &+ 1250, armRestoreTimerImmediately: false) == .ok,
-                "pb seed transient over recaptured B for focus3 test"
-            )
-            try check(
-                promiseGuard.handlePostWriteNonPost(recapturedNewClipboard: true, restoreOnNormalFallback: false) == .clipboardChanged,
-                "pb focus3 drift after recapture returns .clipboardChanged (no persistent fallback overwrite)"
-            )
-            try check(!promiseGuard.restorePending && promisePb.string(forType: .string) == "user_recaptured_B", "pb focus3 drift after recapture restored user B")
-
-            try check(
-                promiseGuard.finishWriteTransient("voice_temp_over_B_expired", nextSnap: snapB, deadlineMonoMs: monotonicMs() &+ 1250, armRestoreTimerImmediately: false) == .ok,
-                "pb seed transient over recaptured B for keystroke-expired test"
-            )
-            try check(
-                promiseGuard.handlePostWriteNonPost(recapturedNewClipboard: true, restoreOnNormalFallback: true) == .clipboardChanged,
-                "pb keystroke-expired after recapture returns .clipboardChanged (blocks Python pbcopy over restored B)"
-            )
-            try check(!promiseGuard.restorePending && promisePb.string(forType: .string) == "user_recaptured_B", "pb keystroke-expired after recapture restored user B")
-
-            //     Control: normal non-recaptured focus3 drift / keystroke expiry still allows normal fallback when ownership intact.
-            try check(
-                promiseGuard.finishWriteTransient("voice_temp_normal_exp", nextSnap: snapB, deadlineMonoMs: monotonicMs() &+ 1250, armRestoreTimerImmediately: false) == .ok,
-                "pb seed transient normal expiry control"
-            )
-            try check(
-                promiseGuard.handlePostWriteNonPost(recapturedNewClipboard: false, restoreOnNormalFallback: true) == .allowFallback,
-                "pb normal keystroke expiry restores original clip and returns .allowFallback"
-            )
-            try check(!promiseGuard.restorePending && promisePb.string(forType: .string) == "user_recaptured_B", "pb normal keystroke expiry restored original clip")
-
-            // 8e) Mid-capture user Cmd+C across processes:
-            //     1 fast retry captures "user-fresh-copy" and restores it cleanly; a 2nd concurrent copy with 0 retries left aborts with .clipboardChanged without overwriting.
-            let midPbNameStr = "avi.selfcheck.mid.\(ProcessInfo.processInfo.processIdentifier).\(monotonicMs())"
-            let midPb = NSPasteboard(name: NSPasteboard.Name(midPbNameStr))
-            let midGuard = PasteboardGuard(pasteboard: midPb, restoreDelayMs: 40, maxSnapshotBytes: 4096, maxCaptureMs: 500)
-            midGuard.warmUpWorkerAsync()
-            defer {
-                midGuard.shutdown()
-                midPb.releaseGlobally()
-            }
-            midPb.clearContents()
-            _ = midPb.setString("mid_warmup", forType: .string)
-            let _: PasteboardGuard.CaptureResult = try awaitMainAsync { done in
-                midGuard.captureSnapshotAsync(deadlineMonoMs: monotonicMs() &+ 2000, completion: done)
-            }
-            let midProv = try spawnPromiseProvider(pbName: midPbNameStr, delayMs: 90, text: "old_slow_clip")
-            defer { stopPromiseProvider(midProv) }
-            var midOutcome: PasteboardGuard.WriteOutcome?
-            midGuard.writeTransientCheckedAsync("voice_after_mid_copy", deadlineMonoMs: monotonicMs() &+ 1500) { res in
-                midOutcome = res
-            }
-            let copyAt = Date().addingTimeInterval(0.025)
+            let copyAt = Date().addingTimeInterval(0.020)
             while Date() < copyAt {
                 RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
             }
-            midPb.clearContents()
-            try check(midPb.setString("user-fresh-copy", forType: .string), "pb simulate mid-capture user Cmd+C")
-            let midDoneLimit = Date().addingTimeInterval(2.0)
-            while midOutcome == nil && Date() < midDoneLimit {
+            promisePb.clearContents()
+            try check(promisePb.setString("user_fresh_mid_copy", forType: .string), "pb simulate mid-read user Cmd+C")
+            let midLimit = Date().addingTimeInterval(2.0)
+            while midCaptured == nil && Date() < midLimit {
                 RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
             }
-            try check(midOutcome == .ok, "pb mid-capture retry succeeded")
-            try check(midGuard.restorePending && midPb.string(forType: .string) == "voice_after_mid_copy", "pb mid-capture wrote voice text with armed restore")
-            midGuard.flushPendingRestore()
-            try check(!midGuard.restorePending && midPb.string(forType: .string) == "user-fresh-copy", "pb mid-capture restored user-fresh-copy cleanly")
-
-            //     If clipboard changes again when maxRetriesOnChange == 0, abort with .clipboardChanged and NEVER overwrite!
-            let midProv2 = try spawnPromiseProvider(pbName: midPbNameStr, delayMs: 90, text: "old_slow_clip_2")
-            defer { stopPromiseProvider(midProv2) }
-            var abortOutcome: PasteboardGuard.WriteOutcome?
-            midGuard.writeTransientCheckedAsync("voice_must_not_clobber", deadlineMonoMs: monotonicMs() &+ 1500, maxRetriesOnChange: 0) { res in
-                abortOutcome = res
+            guard let (midPreCc, midSnap) = midCaptured else {
+                try check(false, "pb mid-read capture timed out")
+                return 1
             }
-            let copyAt2 = Date().addingTimeInterval(0.025)
-            while Date() < copyAt2 {
-                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
-            }
-            midPb.clearContents()
-            try check(midPb.setString("user_second_copy_preserved", forType: .string), "pb simulate 2nd concurrent user Cmd+C")
-            let abortLimit = Date().addingTimeInterval(2.0)
-            while abortOutcome == nil && Date() < abortLimit {
-                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
-            }
-            try check(abortOutcome == .clipboardChanged, "pb repeated concurrent change aborts with .clipboardChanged")
-            try check(midPb.string(forType: .string) == "user_second_copy_preserved", "pb repeated concurrent change NEVER overwrites user clipboard")
+            try check(promiseGuard.currentChangeCount != midPreCc, "pb detected mid-read changeCount mismatch")
+            let midEffectiveSnap: PasteboardGuard.ClipSnap? = (promiseGuard.currentChangeCount == midPreCc) ? midSnap : nil
+            try check(midEffectiveSnap == nil, "pb dropped stale snapshot on mid-read changeCount mismatch")
+            try check(promiseGuard.writeTransient("voice_over_mid_copy", snap: midEffectiveSnap), "pb voice paste still succeeded on mid-read change")
+            promiseGuard.armPendingRestoreTimer()
+            try check(!promiseGuard.restorePending && promisePb.string(forType: .string) == "voice_over_mid_copy", "pb skipped restore so stale old_slow_clip is never restored")
 
             // 9) Pinned trigger windowId mismatch & pinned==0 (no trigger-time window) both discard drifted window B metadata
             let driftedMeta = queryFrontWindowMetadata(
@@ -7013,8 +6102,6 @@ struct MacShimMain {
             app.run(); cleanupAndExit(0)
         }
 
-        // Pre-warm the isolated --pasteboard-worker asynchronously in the background without blocking startup.
-        pasteboardGuard.warmUpWorkerAsync()
         let initialAudioStatus = audioMonitor.start()
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
@@ -7117,7 +6204,9 @@ struct MacShimMain {
                                 return pasteTextOpt ?? ""
                             }()
                             let forceClipboardOnly = parseOptionalBool(obj["force_clipboard_only"]) ?? false
-                            let pasteDeadlineMs: UInt64 = enqueuedMs &+ 1250
+                            let reqDeadlineMs = (obj["deadline_ms"] as? Int) ?? ((obj["deadline_ms"] as? NSNumber)?.intValue ?? 0)
+                            let effectiveBudgetMs: UInt64 = (reqDeadlineMs > 0) ? UInt64(min(reqDeadlineMs, 10_000)) : 1250
+                            let pasteDeadlineMs: UInt64 = enqueuedMs &+ effectiveBudgetMs
                             let normProc: (String) -> String = { raw in
                                 let low = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                                 return low.hasSuffix(".app") ? String(low.dropLast(4)).trimmingCharacters(in: .whitespacesAndNewlines) : low
@@ -7134,61 +6223,15 @@ struct MacShimMain {
                                     jobDone = true
                                     finishCurrentPasteJob()
                                 }
-                                let replyClipboardChanged: (String) -> Void = { fgName in
-                                    var chPayload: [String: Any] = [
-                                        "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                        "posted": false, "clipboard": false, "reason": "clipboard_changed",
+                                let replyPaste: (Bool, Bool?, String, String, Bool) -> Void = { posted, clip, reason, fgName, ok in
+                                    var payload: [String: Any] = [
+                                        "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": ok,
+                                        "posted": posted, "reason": reason,
                                     ]
-                                    if !fgName.isEmpty { chPayload["fg_process"] = fgName }
-                                    writeJsonLine(chPayload)
-                                }
-                                let replyWorkerFailed: (String) -> Void = { fgName in
-                                    var wfPayload: [String: Any] = [
-                                        "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                        "posted": false, "clipboard": false, "reason": "clipboard_worker_failed",
-                                    ]
-                                    if !fgName.isEmpty { wfPayload["fg_process"] = fgName }
-                                    writeJsonLine(wfPayload)
-                                }
-                                if monotonicMs() >= pasteDeadlineMs {
-                                    if pasteTextOpt != nil {
-                                        writeJsonLine([
-                                            "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                            "posted": false, "clipboard": false, "reason": "shim_paste_unconfirmed",
-                                        ])
-                                    } else {
-                                        writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": false, "reason": "shim_paste_unconfirmed"])
-                                    }
+                                    if let c = clip { payload["clipboard"] = c }
+                                    if !fgName.isEmpty { payload["fg_process"] = fgName }
+                                    writeJsonLine(payload)
                                     completeJob()
-                                    return
-                                }
-                                if !forceClipboardOnly && isHotkeyOrModifierHeld() {
-                                    var heldPayload: [String: Any] = [
-                                        "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": false,
-                                        "posted": false, "reason": "key_held",
-                                    ]
-                                    if pasteTextOpt != nil { heldPayload["clipboard"] = false }
-                                    writeJsonLine(heldPayload)
-                                    completeJob()
-                                    return
-                                }
-                                guard CGPreflightPostEventAccess() else {
-                                    if pasteTextOpt != nil {
-                                        let clipOk = pasteboardGuard.writePersistentFallback(fbText)
-                                        writeJsonLine([
-                                            "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                            "posted": false, "clipboard": clipOk,
-                                            "reason": clipOk ? "accessibility_denied" : "clipboard_failed",
-                                        ])
-                                    } else {
-                                        writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": false, "reason": "accessibility_denied"])
-                                    }
-                                    if !postAccessPrompted {
-                                        postAccessPrompted = true
-                                        DispatchQueue.main.async { _ = CGRequestPostEventAccess() }
-                                    }
-                                    completeJob()
-                                    return
                                 }
                                 let checkFocus: () -> (matched: Bool, fgName: String) = {
                                     if !hasFocusExpectation { return (true, "") }
@@ -7206,26 +6249,8 @@ struct MacShimMain {
                                     let hwndMismatch = (expHwnd > 0 && curHwnd != expHwnd)
                                     return (!(appMismatch || hwndMismatch), curName)
                                 }
-                                let replyFocusChanged: (String) -> Void = { fgName in
-                                    if pasteTextOpt != nil {
-                                        let clipOk = pasteboardGuard.writePersistentFallback(fbText)
-                                        writeJsonLine([
-                                            "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                            "posted": false, "clipboard": clipOk,
-                                            "reason": clipOk ? "focus_changed" : "clipboard_failed", "fg_process": fgName,
-                                        ])
-                                    } else {
-                                        writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": false, "reason": "focus_changed", "fg_process": fgName])
-                                    }
-                                }
-                                let finishAfterClipboard: (String, Bool) -> Void = { verifiedFgName, recapturedNewClipboard in
-                                    if pasteTextOpt != nil && !pasteboardGuard.isOwnedClipboardIntact() {
-                                        pasteboardGuard.cancelPendingRestore()
-                                        replyClipboardChanged(verifiedFgName)
-                                        completeJob()
-                                        return
-                                    }
-                                    let src = CGEventSource(stateID: .privateState)
+                                let buildCmdVEvents: () -> [CGEvent]? = {
+                                    guard let src = CGEventSource(stateID: .privateState) else { return nil }
                                     let steps: [(CGKeyCode, Bool, CGEventFlags)] = [
                                         (0x37, true, .maskCommand),
                                         (0x09, true, .maskCommand),
@@ -7233,209 +6258,107 @@ struct MacShimMain {
                                         (0x37, false, []),
                                     ]
                                     var events: [CGEvent] = []
-                                    if src != nil {
-                                        for (kc, isDown, fl) in steps {
-                                            guard let ev = CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: isDown) else {
-                                                events.removeAll()
-                                                break
-                                            }
-                                            ev.flags = fl
-                                            ev.setIntegerValueField(.eventSourceUserData, value: AVI_INJECT_TAG)
-                                            events.append(ev)
+                                    events.reserveCapacity(steps.count)
+                                    for (kc, isDown, fl) in steps {
+                                        guard let ev = CGEvent(keyboardEventSource: src, virtualKey: kc, keyDown: isDown) else {
+                                            return nil
                                         }
+                                        ev.flags = fl
+                                        ev.setIntegerValueField(.eventSourceUserData, value: AVI_INJECT_TAG)
+                                        events.append(ev)
                                     }
-                                    let postedOk = (events.count == steps.count)
-                                    if postedOk {
-                                        if pasteTextOpt != nil && !pasteboardGuard.isOwnedClipboardIntact() {
-                                            pasteboardGuard.cancelPendingRestore()
-                                            replyClipboardChanged(verifiedFgName)
-                                            completeJob()
-                                            return
-                                        }
-                                        let postedWithinDeadline = postEventsIfWithinDeadline(events: events, deadlineMonoMs: pasteDeadlineMs) { ev in
-                                            ev.post(tap: .cghidEventTap)
-                                        }
-                                        if !postedWithinDeadline {
-                                            if pasteTextOpt != nil {
-                                                if pasteboardGuard.handlePostWriteNonPost(
-                                                    recapturedNewClipboard: recapturedNewClipboard,
-                                                    restoreOnNormalFallback: true
-                                                ) == .clipboardChanged {
-                                                    replyClipboardChanged(verifiedFgName)
-                                                } else {
-                                                    var expPayload: [String: Any] = [
-                                                        "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                                        "posted": false, "clipboard": false, "reason": "shim_paste_unconfirmed",
-                                                    ]
-                                                    if !verifiedFgName.isEmpty { expPayload["fg_process"] = verifiedFgName }
-                                                    writeJsonLine(expPayload)
-                                                }
-                                            } else {
-                                                writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": false, "reason": "shim_paste_unconfirmed"])
-                                            }
-                                            completeJob()
-                                            return
-                                        }
-                                        if pasteTextOpt != nil {
-                                            // Start the 250ms clipboard restore timer strictly AFTER Cmd+V was posted.
-                                            pasteboardGuard.armPendingRestoreTimer()
-                                            var okPayload: [String: Any] = [
-                                                "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                                "posted": true, "clipboard": true, "reason": "ok",
-                                            ]
-                                            if !verifiedFgName.isEmpty { okPayload["fg_process"] = verifiedFgName }
-                                            writeJsonLine(okPayload)
-                                        } else {
-                                            writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": true, "reason": "ok"])
-                                        }
-                                    } else if pasteTextOpt != nil {
-                                        if pasteboardGuard.handlePostWriteNonPost(
-                                            recapturedNewClipboard: recapturedNewClipboard,
-                                            restoreOnNormalFallback: false
-                                        ) == .clipboardChanged {
-                                            replyClipboardChanged(verifiedFgName)
-                                            completeJob()
-                                            return
-                                        }
-                                        let clipOk = pasteboardGuard.writePersistentFallback(fbText)
-                                        var cgFailPayload: [String: Any] = [
-                                            "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                            "posted": false, "clipboard": clipOk,
-                                            "reason": clipOk ? "cgevent_failed" : "clipboard_failed",
-                                        ]
-                                        if !verifiedFgName.isEmpty { cgFailPayload["fg_process"] = verifiedFgName }
-                                        writeJsonLine(cgFailPayload)
-                                    } else {
-                                        writeJsonLine(["type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true, "posted": false, "reason": "cgevent_failed"])
-                                    }
-                                    completeJob()
+                                    return events
                                 }
 
-                                let focus1 = checkFocus()
-                                if !focus1.matched {
-                                    replyFocusChanged(focus1.fgName)
-                                    completeJob()
+                                // Fast-path: force_clipboard_only persists text on main thread without worker snapshot, focus, or AX checks,
+                                // while still honoring pasteDeadlineMs so an expired request never clobbers a newer user copy.
+                                if forceClipboardOnly, pasteTextOpt != nil {
+                                    let (clipOk, clipReason) = pasteboardGuard.writePersistentFallbackIfWithinDeadline(
+                                        fbText,
+                                        deadlineMonoMs: pasteDeadlineMs
+                                    )
+                                    replyPaste(false, clipOk, clipReason, "", true)
                                     return
                                 }
-                                guard let pasteTxt = pasteTextOpt else {
-                                    finishAfterClipboard(focus1.fgName, false)
+                                if monotonicMs() >= pasteDeadlineMs {
+                                    replyPaste(false, pasteTextOpt != nil ? false : nil, "shim_paste_unconfirmed", "", true)
                                     return
                                 }
-                                let deliveryInitialCc = pasteboardGuard.currentChangeCount
-                                func runCaptureAndFinish(_ maxRetries: Int) {
-                                    pasteboardGuard.captureSnapshotAsync(
-                                        deadlineMonoMs: pasteDeadlineMs,
-                                        maxRetriesOnChange: maxRetries,
-                                        initialObservedChangeCount: deliveryInitialCc
-                                    ) { capRes in
-                                        var verifiedFgName = focus1.fgName
-                                        let nowAfterCap = monotonicMs()
-                                        let isExpired = (nowAfterCap >= pasteDeadlineMs)
-                                        let keyHeld = (!isExpired && !forceClipboardOnly && isHotkeyOrModifierHeld())
-                                        var focusMatched = true
-                                        if !isExpired && !keyHeld && hasFocusExpectation {
-                                            let focus2 = checkFocus()
-                                            focusMatched = focus2.matched
-                                            verifiedFgName = focus2.fgName
-                                        }
-                                        // Shared pre-write decision preserves clipboard on .workerFailed FIRST and checks BOTH
-                                        // latest and delivery-initial changeCount across ALL early fallbacks (expired, key_held, focus2 drift).
-                                        switch pasteboardGuard.evaluatePreWriteDecision(
-                                            capture: capRes,
-                                            deadlineMonoMs: pasteDeadlineMs,
-                                            keyHeld: keyHeld,
-                                            focusMatched: focusMatched,
-                                            nowMs: nowAfterCap
-                                        ) {
-                                        case .abortClipboardChanged:
-                                            replyClipboardChanged(verifiedFgName)
-                                            completeJob()
-                                            return
-                                        case .abortWorkerFailed:
-                                            replyWorkerFailed(verifiedFgName)
-                                            completeJob()
-                                            return
-                                        case .abortExpired:
-                                            var expPayload: [String: Any] = [
-                                                "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                                "posted": false, "clipboard": false, "reason": "shim_paste_unconfirmed",
-                                            ]
-                                            if !verifiedFgName.isEmpty { expPayload["fg_process"] = verifiedFgName }
-                                            writeJsonLine(expPayload)
-                                            completeJob()
-                                            return
-                                        case .abortKeyHeld:
-                                            let heldPayload: [String: Any] = [
-                                                "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": false,
-                                                "posted": false, "clipboard": false, "reason": "key_held",
-                                            ]
-                                            writeJsonLine(heldPayload)
-                                            completeJob()
-                                            return
-                                        case .abortFocusChanged:
-                                            replyFocusChanged(verifiedFgName)
-                                            completeJob()
-                                            return
-                                        case .retryCapture(let nextRetries):
-                                            runCaptureAndFinish(nextRetries)
-                                            return
-                                        case .proceed:
-                                            break
-                                        }
-                                        let writeRes = pasteboardGuard.finishWriteTransient(
-                                            pasteTxt,
-                                            nextSnap: capRes.snap,
-                                            deadlineMonoMs: pasteDeadlineMs,
-                                            armRestoreTimerImmediately: false
-                                        )
-                                        if writeRes == .expired {
-                                            if pasteboardGuard.isCapturedChangeCountStale(capRes.observedChangeCount)
-                                                || pasteboardGuard.isCapturedChangeCountStale(capRes.initialObservedChangeCount) {
-                                                replyClipboardChanged(verifiedFgName)
-                                            } else {
-                                                var expPayload: [String: Any] = [
-                                                    "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                                    "posted": false, "clipboard": false, "reason": "shim_paste_unconfirmed",
-                                                ]
-                                                if !verifiedFgName.isEmpty { expPayload["fg_process"] = verifiedFgName }
-                                                writeJsonLine(expPayload)
-                                            }
-                                            completeJob()
-                                            return
-                                        }
-                                        if writeRes != .ok {
-                                            var failPayload: [String: Any] = [
-                                                "type": "reply", "reply": "paste_cmd_v", "seq_id": seqId, "ok": true,
-                                                "posted": false, "clipboard": false, "reason": "clipboard_failed",
-                                            ]
-                                            if !verifiedFgName.isEmpty { failPayload["fg_process"] = verifiedFgName }
-                                            writeJsonLine(failPayload)
-                                            completeJob()
-                                            return
-                                        }
-                                        let recapturedNewClipboard = (capRes.observedChangeCount != deliveryInitialCc)
-                                        if hasFocusExpectation {
-                                            let focus3 = checkFocus()
-                                            if !focus3.matched {
-                                                if pasteboardGuard.handlePostWriteNonPost(
-                                                    recapturedNewClipboard: recapturedNewClipboard,
-                                                    restoreOnNormalFallback: false
-                                                ) == .clipboardChanged {
-                                                    replyClipboardChanged(focus3.fgName)
-                                                    completeJob()
-                                                    return
-                                                }
-                                                pasteboardGuard.cancelPendingRestore()
-                                                replyFocusChanged(focus3.fgName)
-                                                completeJob()
-                                                return
-                                            }
-                                            verifiedFgName = focus3.fgName
-                                        }
-                                        finishAfterClipboard(verifiedFgName, recapturedNewClipboard)
+                                guard CGPreflightPostEventAccess() else {
+                                    if pasteTextOpt != nil {
+                                        let clipOk = pasteboardGuard.writePersistentFallback(fbText)
+                                        replyPaste(false, clipOk, clipOk ? "accessibility_denied" : "clipboard_failed", "", true)
+                                    } else {
+                                        replyPaste(false, nil, "accessibility_denied", "", true)
                                     }
+                                    if !postAccessPrompted {
+                                        postAccessPrompted = true
+                                        DispatchQueue.main.async { _ = CGRequestPostEventAccess() }
+                                    }
+                                    return
                                 }
-                                runCaptureAndFinish(1)
+                                // Legacy Cmd+V only mode (no managed clipboard text)
+                                guard let pasteTxt = pasteTextOpt else {
+                                    if isHotkeyOrModifierHeld() {
+                                        replyPaste(false, nil, "key_held", "", false)
+                                        return
+                                    }
+                                    let focus = checkFocus()
+                                    if !focus.matched {
+                                        replyPaste(false, nil, "focus_changed", focus.fgName, true)
+                                        return
+                                    }
+                                    guard let events = buildCmdVEvents() else {
+                                        replyPaste(false, nil, "cgevent_failed", focus.fgName, true)
+                                        return
+                                    }
+                                    let postedOk = postEventsIfWithinDeadline(events: events, deadlineMonoMs: pasteDeadlineMs) { ev in
+                                        ev.post(tap: .cghidEventTap)
+                                    }
+                                    replyPaste(postedOk, nil, postedOk ? "ok" : "shim_paste_unconfirmed", focus.fgName, true)
+                                    return
+                                }
+
+                                // Managed linear paste pipeline:
+                                // (a) One-shot snapshot via single-slot worker (nil on timeout/error/>10MiB; never retries or refuses)
+                                pasteboardGuard.captureSnapshotAsync(deadlineMonoMs: pasteDeadlineMs) { preChangeCount, snap in
+                                    // (b) Single pre-write gate on main thread: deadline -> focus -> modifier/hotkey held
+                                    if monotonicMs() >= pasteDeadlineMs {
+                                        replyPaste(false, false, "shim_paste_unconfirmed", "", true)
+                                        return
+                                    }
+                                    let focus = checkFocus()
+                                    if !focus.matched {
+                                        // (c) Focus drifted: cancel pending restore & persist fallback
+                                        let clipOk = pasteboardGuard.writePersistentFallback(fbText)
+                                        replyPaste(false, clipOk, clipOk ? "focus_changed" : "clipboard_failed", focus.fgName, true)
+                                        return
+                                    }
+                                    if isHotkeyOrModifierHeld() {
+                                        // (c) Modifier/hotkey held: cancel pending restore & persist fallback
+                                        let clipOk = pasteboardGuard.writePersistentFallback(fbText)
+                                        replyPaste(false, clipOk, clipOk ? "key_held" : "clipboard_failed", focus.fgName, true)
+                                        return
+                                    }
+                                    // (d) Same window & keys released: if clipboard changed during read, drop snapshot (no recapture, no refusal)
+                                    let effectiveSnap: PasteboardGuard.ClipSnap? = (pasteboardGuard.currentChangeCount == preChangeCount) ? snap : nil
+                                    guard let events = buildCmdVEvents() else {
+                                        let clipOk = pasteboardGuard.writePersistentFallback(fbText)
+                                        replyPaste(false, clipOk, clipOk ? "cgevent_failed" : "clipboard_failed", focus.fgName, true)
+                                        return
+                                    }
+                                    // Atomic main-thread sequence (<1ms, zero async, zero focus re-check):
+                                    // cancel old timer -> write transient text -> record writtenChangeCount -> post Cmd+V -> arm 250ms timer
+                                    guard pasteboardGuard.writeTransient(pasteTxt, snap: effectiveSnap) else {
+                                        replyPaste(false, false, "clipboard_failed", focus.fgName, true)
+                                        return
+                                    }
+                                    for ev in events {
+                                        ev.post(tap: .cghidEventTap)
+                                    }
+                                    pasteboardGuard.armPendingRestoreTimer()
+                                    replyPaste(true, true, "ok", focus.fgName, true)
+                                }
                             }
                             pendingPasteJobs.append(pasteJob)
                             runNextPasteJob()

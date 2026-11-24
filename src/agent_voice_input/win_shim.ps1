@@ -1233,7 +1233,12 @@ public static class VoiceWinShim {
     [DllImport("winmm.dll")] public static extern uint waveInGetNumDevs();
     [DllImport("winmm.dll", CharSet = CharSet.Unicode)] public static extern int mciSendString(string cmd, StringBuilder ret, int retLen, IntPtr hwnd);
 
-    public static readonly ConcurrentQueue<string> CmdQueue = new ConcurrentQueue<string>();
+    public sealed class QueuedCmd {
+        public readonly string Line;
+        public readonly long EnqueuedTick;
+        public QueuedCmd(string line, long enqueuedTick) { Line = line; EnqueuedTick = enqueuedTick; }
+    }
+    public static readonly ConcurrentQueue<QueuedCmd> CmdQueue = new ConcurrentQueue<QueuedCmd>();
     public static readonly ConcurrentQueue<ShimEvent> EvtQueue = new ConcurrentQueue<ShimEvent>();
     public static volatile bool StdinClosed = false;
     private static IntPtr _hook = IntPtr.Zero;
@@ -1883,7 +1888,7 @@ public static class VoiceWinShim {
 
     public static void StartStdinReader() {
         Thread t = new Thread(() => {
-            try { string line; while ((line = Console.In.ReadLine()) != null) { CmdQueue.Enqueue(line); if (_mainTid != 0) PostThreadMessage(_mainTid, WM_APP_WAKE, IntPtr.Zero, IntPtr.Zero); } } catch { }
+            try { string line; while ((line = Console.In.ReadLine()) != null) { CmdQueue.Enqueue(new QueuedCmd(line, Stopwatch.GetTimestamp())); if (_mainTid != 0) PostThreadMessage(_mainTid, WM_APP_WAKE, IntPtr.Zero, IntPtr.Zero); } } catch { }
             StdinClosed = true; if (_mainTid != 0) PostThreadMessage(_mainTid, WM_APP_WAKE, IntPtr.Zero, IntPtr.Zero);
         });
         t.IsBackground = true; t.Start();
@@ -1957,6 +1962,11 @@ public static class VoiceWinShim {
     private static long ElapsedStopwatchMs(long startTick, long endTick) {
         if (endTick <= startTick) return 0L;
         return (long)((endTick - startTick) * 1000.0 / Stopwatch.Frequency);
+    }
+
+    public static bool IsDeadlineExceeded(long startTick, int deadlineMs) {
+        if (deadlineMs <= 0) return false;
+        return ElapsedStopwatchMs(startTick, Stopwatch.GetTimestamp()) >= (long)deadlineMs;
     }
 
     private static void EnqueueAudioEvent(string kind, string reason, int gapMs, long recGen) {
@@ -2126,7 +2136,8 @@ public static class VoiceWinShim {
     }
 
     private static bool HasPendingStopOrQuitCmd() {
-        foreach (string raw in CmdQueue) {
+        foreach (QueuedCmd item in CmdQueue) {
+            string raw = (item != null) ? item.Line : null;
             if (string.IsNullOrEmpty(raw)) continue;
             string s = raw.TrimStart();
             if (s.StartsWith("{\"cmd\":\"rec_stop\"", StringComparison.Ordinal) ||
@@ -2556,7 +2567,7 @@ public static class VoiceWinShim {
     }
 
     private const uint CF_DIB = 8u, CF_UNICODETEXT = 13u, CF_HDROP = 15u, CF_DIBV5 = 17u, GMEM_MOVEABLE = 0x0002u, GMEM_ZEROINIT = 0x0040u;
-    public const int MaxClipSnapshotBytes = 100 * 1024 * 1024;
+    public const int MaxClipSnapshotBytes = 10 * 1024 * 1024;
     private const int ClipRestoreDelayMs = 250, ClipRestoreRetryDelayMs = 60, MaxClipRestoreRetries = 3;
     private static readonly byte[] DwordZeroBytes = new byte[4];
     private static IntPtr _clipHwnd = IntPtr.Zero;
@@ -2734,7 +2745,7 @@ public static class VoiceWinShim {
         return BitConverter.ToUInt64(raw, 0) == token;
     }
 
-    private static ClipSnap CaptureOpenClip(IClipStore store) {
+    private static ClipSnap CaptureOpenClip(IClipStore store, Func<bool> isDeadlineExceededFn = null) {
         if (store.IsEmptyWhenOpen()) return ClipSnap.ClearOnly;
         if (store.FormatViewerIgnore != 0u && store.HasFormatWhenOpen(store.FormatViewerIgnore)) return ClipSnap.ClearOnly;
         if (store.FormatViewerIgnoreSpaced != 0u && store.HasFormatWhenOpen(store.FormatViewerIgnoreSpaced)) return ClipSnap.ClearOnly;
@@ -2746,6 +2757,7 @@ public static class VoiceWinShim {
         List<ClipEntry> entries = new List<ClipEntry>(whitelist.Length);
         long totalBytes = 0L;
         for (int i = 0; i < whitelist.Length; i++) {
+            if (isDeadlineExceededFn != null && isDeadlineExceededFn()) return ClipSnap.Unrestorable;
             uint fmt = whitelist[i];
             if (fmt == 0u || !store.HasFormatWhenOpen(fmt)) continue;
             byte[] data;
@@ -2774,12 +2786,15 @@ public static class VoiceWinShim {
         st.SavedClip = null;
     }
 
-    private static bool WriteClipTextCore(ClipGuardState st, IClipStore store, string text, bool transientForPaste, Action armTimerFn, Action stopTimerFn) {
+    private static bool WriteClipTextCore(ClipGuardState st, IClipStore store, string text, bool transientForPaste, Action armTimerFn, Action stopTimerFn, Func<bool> isDeadlineExceededFn = null) {
+        if (isDeadlineExceededFn != null && isDeadlineExceededFn()) return false;
         if (!transientForPaste) {
             CancelClipRestoreCore(st, stopTimerFn);
             if (!store.Open()) return false;
             try {
+                if (isDeadlineExceededFn != null && isDeadlineExceededFn()) return false;
                 if (!store.EmptyWhenOpen()) return false;
+                if (isDeadlineExceededFn != null && isDeadlineExceededFn()) return false;
                 if (!string.IsNullOrEmpty(text)) {
                     if (!store.SetFormatBytesWhenOpen(CF_UNICODETEXT, EncodeUnicodeClipBytes(text))) return false;
                 }
@@ -2794,12 +2809,20 @@ public static class VoiceWinShim {
         ulong myToken = 0UL;
         bool wroteOk = false;
         try {
-            bool reuseExisting = st.RestorePending && (store.SequenceNumber == st.ExpectedSeq) && HasMatchingTransientTokenWhenOpen(store, st.ExpectedToken);
-            bool ownerHung = (!reuseExisting) && (preHung || store.IsOwnerHung());
-            nextSnap = reuseExisting ? st.SavedClip : (ownerHung ? ClipSnap.Unrestorable : CaptureOpenClip(store));
+            if (stopTimerFn != null) stopTimerFn();
+            try {
+                bool reuseExisting = st.RestorePending && (store.SequenceNumber == st.ExpectedSeq) && HasMatchingTransientTokenWhenOpen(store, st.ExpectedToken);
+                bool ownerHung = (!reuseExisting) && (preHung || store.IsOwnerHung());
+                nextSnap = reuseExisting ? st.SavedClip : (ownerHung ? ClipSnap.Unrestorable : CaptureOpenClip(store, isDeadlineExceededFn));
+            } catch {
+                nextSnap = ClipSnap.Unrestorable;
+            }
+            if (isDeadlineExceededFn != null && isDeadlineExceededFn()) return false;
             myToken = ++st.NextToken;
             if (myToken == 0UL) myToken = ++st.NextToken;
-            if (store.EmptyWhenOpen() && store.SetFormatBytesWhenOpen(CF_UNICODETEXT, EncodeUnicodeClipBytes(text ?? ""))) {
+            if (!store.EmptyWhenOpen()) return false;
+            if (isDeadlineExceededFn != null && isDeadlineExceededFn()) return false;
+            if (store.SetFormatBytesWhenOpen(CF_UNICODETEXT, EncodeUnicodeClipBytes(text ?? ""))) {
                 WriteExcludeMarkersWhenOpen(store);
                 if (store.FormatAviTransient != 0u) store.SetFormatBytesWhenOpen(store.FormatAviTransient, BitConverter.GetBytes(myToken));
                 wroteOk = true;
@@ -2808,7 +2831,6 @@ public static class VoiceWinShim {
             store.Close();
         }
         if (!wroteOk) return false;
-        if (stopTimerFn != null) stopTimerFn();
         if (nextSnap != null && nextSnap.Kind != SnapKind.Unrestorable) {
             st.SavedClip = nextSnap;
             st.ExpectedToken = myToken;
@@ -2895,7 +2917,12 @@ public static class VoiceWinShim {
     }
 
     public static bool WriteClipTextOnce(string text, bool transientForPaste) {
-        return WriteClipTextCore(_clipState, _win32ClipStore, text, transientForPaste, ArmMainClipTimer, StopMainClipTimer);
+        return WriteClipTextCore(_clipState, _win32ClipStore, text, transientForPaste, ArmMainClipTimer, StopMainClipTimer, null);
+    }
+
+    public static bool WriteClipTextOnce(string text, bool transientForPaste, long startTick, int deadlineMs) {
+        Func<bool> expiredFn = (deadlineMs > 0) ? (Func<bool>)(() => IsDeadlineExceeded(startTick, deadlineMs)) : null;
+        return WriteClipTextCore(_clipState, _win32ClipStore, text, transientForPaste, ArmMainClipTimer, StopMainClipTimer, expiredFn);
     }
 
     public static void FlushPendingClipRestore() {
@@ -2907,6 +2934,9 @@ public static class VoiceWinShim {
         public bool Hung = false;
         public int FailNextOpens = 0;
         public int OversizeFmt = 0;
+        public bool ThrowOnRead = false;
+        public Action OnRead = null;
+        public Action OnEmpty = null;
         public readonly Dictionary<uint, byte[]> Formats = new Dictionary<uint, byte[]>();
         public uint SequenceNumber { get { return Seq; } }
         public uint FormatExcludeMonitor { get { return 0xC101u; } }
@@ -2926,6 +2956,8 @@ public static class VoiceWinShim {
         public bool HasFormatWhenOpen(uint fmt) { return Formats.ContainsKey(fmt); }
         public ClipReadStatus ReadFormatBytesWhenOpen(uint fmt, int maxBytes, out byte[] data) {
             data = null;
+            if (OnRead != null) OnRead();
+            if (ThrowOnRead) throw new InvalidOperationException("simulated_read_fault");
             if ((uint)OversizeFmt == fmt) return ClipReadStatus.Oversize;
             byte[] src;
             if (!Formats.TryGetValue(fmt, out src) || src == null) return ClipReadStatus.Missing;
@@ -2934,7 +2966,7 @@ public static class VoiceWinShim {
             Buffer.BlockCopy(src, 0, data, 0, src.Length);
             return ClipReadStatus.Ok;
         }
-        public bool EmptyWhenOpen() { Formats.Clear(); Seq++; return true; }
+        public bool EmptyWhenOpen() { if (OnEmpty != null) OnEmpty(); Formats.Clear(); Seq++; return true; }
         public bool SetFormatBytesWhenOpen(uint fmt, byte[] data) {
             byte[] cp = new byte[data.Length];
             Buffer.BlockCopy(data, 0, cp, 0, data.Length);
@@ -2949,7 +2981,7 @@ public static class VoiceWinShim {
     }
 
     public static void RunClipStateSelfCheck() {
-        if (MaxClipSnapshotBytes != 100 * 1024 * 1024) throw new InvalidOperationException("MaxClipSnapshotBytes expected 100MiB");
+        if (MaxClipSnapshotBytes != 10 * 1024 * 1024) throw new InvalidOperationException("MaxClipSnapshotBytes expected 10MiB");
         MemClipStore mem = new MemClipStore();
         ClipGuardState st = new ClipGuardState();
         int armed = 0, retried = 0, stopped = 0;
@@ -3039,7 +3071,7 @@ public static class VoiceWinShim {
             if (st.SavedClip != null || mem.Formats.Count != 0) throw new InvalidOperationException("step5 password secret not cleared for fmt " + pwFmt);
         }
 
-        // 5. Oversize (>100MiB) or hung owner -> Unrestorable, and #2 burst does not snapshot #1's transient text
+        // 5. Oversize (>10MiB) or hung owner -> Unrestorable, and #2 burst does not snapshot #1's transient text
         mem.Formats.Clear();
         mem.Formats[mem.FormatPng] = png0;
         mem.OversizeFmt = (int)mem.FormatPng;
@@ -3059,6 +3091,47 @@ public static class VoiceWinShim {
         WriteClipTextCore(st, mem, "voice_eight", true, armFn, stopFn);
         mem.Hung = false;
         if (st.RestorePending || st.SavedClip != null) throw new InvalidOperationException("step7 hung owner armed restore");
+
+        // 6. Snapshot read exception -> voice-first: skips restore, still writes voice text; timer stopped before EmptyWhenOpen
+        mem.Formats.Clear();
+        mem.Formats[CF_UNICODETEXT] = EncodeUnicodeClipBytes("faulty_source");
+        mem.Seq++;
+        int stoppedBeforeEmpty = stopped;
+        bool stopCalledBeforeEmpty = false;
+        mem.OnEmpty = () => { stopCalledBeforeEmpty = (stopped > stoppedBeforeEmpty); };
+        mem.ThrowOnRead = true;
+        bool wroteOnReadErr = WriteClipTextCore(st, mem, "voice_nine_priority", true, armFn, stopFn);
+        mem.ThrowOnRead = false;
+        mem.OnEmpty = null;
+        if (!wroteOnReadErr) throw new InvalidOperationException("step8 read exception refused voice paste");
+        if (!stopCalledBeforeEmpty) throw new InvalidOperationException("step8 timer not stopped before EmptyWhenOpen");
+        if (st.RestorePending || st.SavedClip != null) throw new InvalidOperationException("step8 read exception armed restore");
+        if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "voice_nine_priority") throw new InvalidOperationException("step8 voice text not written");
+
+        // 7. Monotonic deadline_ms guard prevents late clipboard overwrite before open and after slow delayed-render read
+        long nowSw = Stopwatch.GetTimestamp();
+        if (IsDeadlineExceeded(nowSw, 0)) throw new InvalidOperationException("step9 zero deadline should never expire");
+        if (IsDeadlineExceeded(nowSw, 60000)) throw new InvalidOperationException("step9 future deadline should not expire");
+        if (!IsDeadlineExceeded(nowSw - Stopwatch.Frequency, 500)) throw new InvalidOperationException("step9 past deadline should expire");
+        mem.Formats.Clear();
+        mem.Formats[CF_UNICODETEXT] = EncodeUnicodeClipBytes("user_intact_clip");
+        mem.Seq++;
+        bool emptyCalledOnDeadline = false;
+        mem.OnEmpty = () => { emptyCalledOnDeadline = true; };
+        if (WriteClipTextCore(st, mem, "late_transient", true, armFn, stopFn, () => true))
+            throw new InvalidOperationException("step9 pre-expired transient write should abort");
+        if (WriteClipTextCore(st, mem, "late_persistent", false, armFn, stopFn, () => true))
+            throw new InvalidOperationException("step9 pre-expired persistent write should abort");
+        bool slowExpired = false;
+        mem.OnRead = () => { slowExpired = true; };
+        if (WriteClipTextCore(st, mem, "late_after_slow_render", true, armFn, stopFn, () => slowExpired))
+            throw new InvalidOperationException("step9 slow-render expired write should abort");
+        mem.OnRead = null;
+        mem.OnEmpty = null;
+        if (emptyCalledOnDeadline) throw new InvalidOperationException("step9 expired write touched EmptyWhenOpen");
+        if (st.RestorePending || st.SavedClip != null) throw new InvalidOperationException("step9 expired write armed restore");
+        if (DecodeUnicodeClipBytes(mem.Formats[CF_UNICODETEXT]) != "user_intact_clip")
+            throw new InvalidOperationException("step9 expired write clobbered user clipboard");
     }
 
     private static bool OpenWin32ClipWithRetry(Win32ClipStore store) {
@@ -3948,20 +4021,28 @@ if (-not ('VoiceWinShim' -as [type])) {
 }
 
 function Invoke-Tone([string]$kind) { [VoiceWinShim]::PlayTone($kind, [bool]$Beep) }
-function Set-ClipboardSafe([string]$val) {
+function Get-ClipFailReason([long]$startTick, [int]$deadlineMs) {
+    if ($deadlineMs -gt 0 -and [VoiceWinShim]::IsDeadlineExceeded($startTick, $deadlineMs)) { return "paste_deadline_exceeded" }
+    return "clipboard_failed"
+}
+function Set-ClipboardSafe([string]$val, [long]$startTick = 0L, [int]$deadlineMs = 0) {
     for ($i = 0; $i -lt 3; $i++) {
+        if ($deadlineMs -gt 0 -and [VoiceWinShim]::IsDeadlineExceeded($startTick, $deadlineMs)) { return $false }
         try {
-            if ([VoiceWinShim]::WriteClipTextOnce($val, $false)) { return $true }
+            if ([VoiceWinShim]::WriteClipTextOnce($val, $false, $startTick, $deadlineMs)) { return $true }
         } catch { }
+        if ($deadlineMs -gt 0 -and [VoiceWinShim]::IsDeadlineExceeded($startTick, $deadlineMs)) { return $false }
         if ($i -lt 2) { Start-Sleep -Milliseconds 10 }
     }
     return $false
 }
-function Set-ClipboardTransient([string]$val) {
+function Set-ClipboardTransient([string]$val, [long]$startTick = 0L, [int]$deadlineMs = 0) {
     for ($i = 0; $i -lt 3; $i++) {
+        if ($deadlineMs -gt 0 -and [VoiceWinShim]::IsDeadlineExceeded($startTick, $deadlineMs)) { return $false }
         try {
-            if ([VoiceWinShim]::WriteClipTextOnce($val, $true)) { return $true }
+            if ([VoiceWinShim]::WriteClipTextOnce($val, $true, $startTick, $deadlineMs)) { return $true }
         } catch { }
+        if ($deadlineMs -gt 0 -and [VoiceWinShim]::IsDeadlineExceeded($startTick, $deadlineMs)) { return $false }
         if ($i -lt 2) { Start-Sleep -Milliseconds 10 }
     }
     return $false
@@ -4083,8 +4164,10 @@ try {
                 }
             }
         } catch { }
-        $rawCmd = $null
-        while ([VoiceWinShim]::CmdQueue.TryDequeue([ref]$rawCmd)) {
+        $cmdItem = $null
+        while ([VoiceWinShim]::CmdQueue.TryDequeue([ref]$cmdItem)) {
+            $rawCmd = if ($null -ne $cmdItem) { [string]$cmdItem.Line } else { $null }
+            $cmdEnqueuedTick = if ($null -ne $cmdItem) { [long]$cmdItem.EnqueuedTick } else { [System.Diagnostics.Stopwatch]::GetTimestamp() }
             if ([string]::IsNullOrWhiteSpace($rawCmd)) { continue }
             $seq = 0; $op = "unknown"
             try {
@@ -4112,58 +4195,68 @@ try {
                     [VoiceWinShim]::SetExternalAudioLevel($lvl)
                     if ($seq -gt 0) { Write-JsonLine @{ type = "reply"; reply = "hud_level"; seq_id = $seq; ok = $true } }
                 } elseif ($op -eq "paste") {
-                    $txt = [string]$cmdObj.text
-                    $fbTxt = if ($null -ne $cmdObj.fallback_text -and ([string]$cmdObj.fallback_text).Length -gt 0) { [string]$cmdObj.fallback_text } else { $txt }
-                    $forceClipOnly = if ($null -ne $cmdObj.force_clipboard_only) { [bool]$cmdObj.force_clipboard_only } else { $false }
-                    $suppressBeep = if ($null -ne $cmdObj.suppress_beep) { [bool]$cmdObj.suppress_beep } else { $false }
-                    $expectTerm = if ($null -ne $cmdObj.expect_terminal) { [bool]$cmdObj.expect_terminal } else { $true }
-                    $expectProc = if ($null -ne $cmdObj.expect_process) { ([string]$cmdObj.expect_process -replace '\.exe$','').Trim().ToLowerInvariant() } else { "" }
-                    $expectTok = if ($null -ne $cmdObj.expect_session_token) { ([string]$cmdObj.expect_session_token).Trim().ToLowerInvariant() } else { "" }
-                    $pasteChord = if ($null -ne $cmdObj.paste_chord -and ([string]$cmdObj.paste_chord).Length -gt 0) { [string]$cmdObj.paste_chord } else { "ctrl_v" }
-                    $thwnd = if ($null -ne $cmdObj.target_hwnd) { [long]$cmdObj.target_hwnd } else { 0L }
-                    $h = 0L; $p = ""; $t = ""; [VoiceWinShim]::QueryForeground([ref]$h, [ref]$p, [ref]$t)
-                    $pNorm = ($p -replace '\.exe$','').ToLowerInvariant()
-                    $curTok = if ($expectTok -ne "") { Get-TitleSessionToken $t } else { "" }
-                    $tokConflict = ($expectTok -ne "") -and ($curTok -ne $expectTok)
-                    $winMatch = (($thwnd -le 0) -or ($h -eq $thwnd)) -and (($expectProc -eq "") -or ($pNorm -eq $expectProc)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $pNorm)) -and (-not $tokConflict)
-                    if ($winMatch -and (-not $forceClipOnly)) {
-                        if ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
-                            Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "hotkey_held"; fg_process = $p }
-                        } else {
-                            $clipOk = Set-ClipboardTransient $txt
-                            if (-not $clipOk) {
-                                Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "clipboard_failed"; fg_process = $p }
+                    $pasteDeadlineMs = if ($null -ne $cmdObj.deadline_ms) { [int]$cmdObj.deadline_ms } else { 0 }
+                    if ($pasteDeadlineMs -gt 0 -and [VoiceWinShim]::IsDeadlineExceeded($cmdEnqueuedTick, $pasteDeadlineMs)) {
+                        Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "paste_deadline_exceeded"; fg_process = "" }
+                    } else {
+                        $txt = [string]$cmdObj.text
+                        $fbTxt = if ($null -ne $cmdObj.fallback_text -and ([string]$cmdObj.fallback_text).Length -gt 0) { [string]$cmdObj.fallback_text } else { $txt }
+                        $forceClipOnly = if ($null -ne $cmdObj.force_clipboard_only) { [bool]$cmdObj.force_clipboard_only } else { $false }
+                        $suppressBeep = if ($null -ne $cmdObj.suppress_beep) { [bool]$cmdObj.suppress_beep } else { $false }
+                        $expectTerm = if ($null -ne $cmdObj.expect_terminal) { [bool]$cmdObj.expect_terminal } else { $true }
+                        $expectProc = if ($null -ne $cmdObj.expect_process) { ([string]$cmdObj.expect_process -replace '\.exe$','').Trim().ToLowerInvariant() } else { "" }
+                        $expectTok = if ($null -ne $cmdObj.expect_session_token) { ([string]$cmdObj.expect_session_token).Trim().ToLowerInvariant() } else { "" }
+                        $pasteChord = if ($null -ne $cmdObj.paste_chord -and ([string]$cmdObj.paste_chord).Length -gt 0) { [string]$cmdObj.paste_chord } else { "ctrl_v" }
+                        $thwnd = if ($null -ne $cmdObj.target_hwnd) { [long]$cmdObj.target_hwnd } else { 0L }
+                        $h = 0L; $p = ""; $t = ""; [VoiceWinShim]::QueryForeground([ref]$h, [ref]$p, [ref]$t)
+                        $pNorm = ($p -replace '\.exe$','').ToLowerInvariant()
+                        $curTok = if ($expectTok -ne "") { Get-TitleSessionToken $t } else { "" }
+                        $tokConflict = ($expectTok -ne "") -and ($curTok -ne $expectTok)
+                        $winMatch = (($thwnd -le 0) -or ($h -eq $thwnd)) -and (($expectProc -eq "") -or ($pNorm -eq $expectProc)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $pNorm)) -and (-not $tokConflict)
+                        if ($winMatch -and (-not $forceClipOnly)) {
+                            if ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
+                                $clipOk = Set-ClipboardSafe $fbTxt $cmdEnqueuedTick $pasteDeadlineMs
+                                if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
+                                Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "hotkey_held" } else { Get-ClipFailReason $cmdEnqueuedTick $pasteDeadlineMs }); fg_process = $p }
                             } else {
-                                $h2 = 0L; $p2 = ""; $t2 = ""; [VoiceWinShim]::QueryForeground([ref]$h2, [ref]$p2, [ref]$t2)
-                                $p2Norm = ($p2 -replace '\.exe$','').ToLowerInvariant()
-                                $curTok2 = if ($expectTok -ne "") { Get-TitleSessionToken $t2 } else { "" }
-                                $tokConflict2 = ($expectTok -ne "") -and ($curTok2 -ne $expectTok)
-                                $winMatch2 = (($thwnd -le 0) -or ($h2 -eq $thwnd)) -and (($expectProc -eq "") -or ($p2Norm -eq $expectProc)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $p2Norm)) -and (-not $tokConflict2)
-                                if (-not $winMatch2) {
-                                    if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }
-                                    else { $clipOk = Set-ClipboardSafe $txt }
-                                    if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
-                                    Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "focus_changed" } else { "clipboard_failed" }); fg_process = $p2 }
-                                } elseif ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
-                                    if ($fbTxt -ne $txt) { [void](Set-ClipboardTransient $fbTxt) }
-                                    Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = [bool]$clipOk; reason = "hotkey_held"; fg_process = $p2 }
+                                $clipOk = Set-ClipboardTransient $txt $cmdEnqueuedTick $pasteDeadlineMs
+                                if (-not $clipOk) {
+                                    Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = (Get-ClipFailReason $cmdEnqueuedTick $pasteDeadlineMs); fg_process = $p }
                                 } else {
-                                    $sent = [VoiceWinShim]::SendPasteChord($pasteChord)
-                                    if ($sent) {
-                                        Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $true; clipboard = $true; reason = "ok"; fg_process = $p2 }
-                                    } else {
-                                        if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }
-                                        else { $clipOk = Set-ClipboardSafe $txt }
+                                    $h2 = 0L; $p2 = ""; $t2 = ""; [VoiceWinShim]::QueryForeground([ref]$h2, [ref]$p2, [ref]$t2)
+                                    $p2Norm = ($p2 -replace '\.exe$','').ToLowerInvariant()
+                                    $curTok2 = if ($expectTok -ne "") { Get-TitleSessionToken $t2 } else { "" }
+                                    $tokConflict2 = ($expectTok -ne "") -and ($curTok2 -ne $expectTok)
+                                    $winMatch2 = (($thwnd -le 0) -or ($h2 -eq $thwnd)) -and (($expectProc -eq "") -or ($p2Norm -eq $expectProc)) -and ((-not $expectTerm) -or ($AllowedTerminals -contains $p2Norm)) -and (-not $tokConflict2)
+                                    if (-not $winMatch2) {
+                                        if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt $cmdEnqueuedTick $pasteDeadlineMs }
+                                        else { $clipOk = Set-ClipboardSafe $txt $cmdEnqueuedTick $pasteDeadlineMs }
                                         if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
-                                        Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "send_input_failed" } else { "clipboard_failed" }); fg_process = $p2 }
+                                        Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "focus_changed" } else { Get-ClipFailReason $cmdEnqueuedTick $pasteDeadlineMs }); fg_process = $p2 }
+                                    } elseif ([VoiceWinShim]::IsAnyPasteBlockingKeyDown()) {
+                                        $clipOk = Set-ClipboardSafe $fbTxt $cmdEnqueuedTick $pasteDeadlineMs
+                                        if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
+                                        Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "hotkey_held" } else { Get-ClipFailReason $cmdEnqueuedTick $pasteDeadlineMs }); fg_process = $p2 }
+                                    } elseif ($pasteDeadlineMs -gt 0 -and [VoiceWinShim]::IsDeadlineExceeded($cmdEnqueuedTick, $pasteDeadlineMs)) {
+                                        Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $false; reason = "paste_deadline_exceeded"; fg_process = $p2 }
+                                    } else {
+                                        $sent = [VoiceWinShim]::SendPasteChord($pasteChord)
+                                        if ($sent) {
+                                            Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $true; clipboard = $true; reason = "ok"; fg_process = $p2 }
+                                        } else {
+                                            if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt $cmdEnqueuedTick $pasteDeadlineMs }
+                                            else { $clipOk = Set-ClipboardSafe $txt $cmdEnqueuedTick $pasteDeadlineMs }
+                                            if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
+                                            Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "send_input_failed" } else { Get-ClipFailReason $cmdEnqueuedTick $pasteDeadlineMs }); fg_process = $p2 }
+                                        }
                                     }
                                 }
                             }
+                        } else {
+                            $clipOk = Set-ClipboardSafe $fbTxt $cmdEnqueuedTick $pasteDeadlineMs
+                            if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
+                            Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "focus_changed" } else { Get-ClipFailReason $cmdEnqueuedTick $pasteDeadlineMs }); fg_process = $p }
                         }
-                    } else {
-                        $clipOk = Set-ClipboardSafe $fbTxt
-                        if ($clipOk -and (-not $suppressBeep)) { Invoke-Tone "focus" }
-                        Write-JsonLine @{ type = "reply"; reply = "paste"; seq_id = $seq; ok = $true; pasted = $false; clipboard = $clipOk; reason = $(if ($clipOk) { "focus_changed" } else { "clipboard_failed" }); fg_process = $p }
                     }
                 } elseif ($op -eq "rec_start") {
                     $loopback = if ($null -ne $cmdObj.loopback) { [bool]$cmdObj.loopback } else { $false }

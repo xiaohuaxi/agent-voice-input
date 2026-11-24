@@ -311,13 +311,12 @@ class _RecordingDeliveryPlatform:
         *,
         origin_window: ForegroundWindow | None = None,
         fallback_clipboard_text: str | None = None,
-        preserve_clipboard: bool = False,
         suppress_beep: bool | Callable[[], bool] = False,
         is_cancelled: Callable[[], bool] | None = None,
         before_clipboard_write: Callable[[], None] | None = None,
         before_commit: Callable[[], bool] | None = None,
     ) -> PasteOutcome:
-        del seq_id, target_hwnd, origin_window, fallback_clipboard_text, preserve_clipboard, suppress_beep
+        del seq_id, target_hwnd, origin_window, fallback_clipboard_text, suppress_beep
         if is_cancelled is not None and is_cancelled():
             return PasteOutcome(False, False, "cancelled", "")
         if before_clipboard_write is not None:

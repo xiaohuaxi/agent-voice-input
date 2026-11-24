@@ -3858,7 +3858,6 @@ class VoiceInputDaemon:
             with self._lock:
                 unpasted_snapshot = list(self._batch_unpasted_clips)
             fallback_txt = "\n\n".join([*unpasted_snapshot, final_text]) if unpasted_snapshot else None
-            preserve_clip = bool(unpasted_snapshot)
             extra_deliv_kw: dict[str, Any] = {}
             if same_window_verifier is not None:
                 extra_deliv_kw["same_window_verifier"] = same_window_verifier
@@ -3868,7 +3867,6 @@ class VoiceInputDaemon:
                 target_hwnd=origin_win.hwnd,
                 origin_window=origin_win,
                 fallback_clipboard_text=fallback_txt,
-                preserve_clipboard=preserve_clip,
                 suppress_beep=lambda: self._is_recording_or_stopping() or task.silent_hud,
                 is_cancelled=lambda: self._stop_evt.is_set() or task.cancel_token.is_cancelled(),
                 before_clipboard_write=lambda: self._wait_clipboard_settle(task.cancel_token),

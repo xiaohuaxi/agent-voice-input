@@ -404,13 +404,12 @@ class _FakePlatform:
         *,
         origin_window: ForegroundWindow | None = None,
         fallback_clipboard_text: str | None = None,
-        preserve_clipboard: bool = False,
         suppress_beep: object = False,
         is_cancelled: object = None,
         before_clipboard_write: object = None,
         before_commit: object = None,
     ) -> PasteOutcome:
-        del origin_window, fallback_clipboard_text, preserve_clipboard, suppress_beep
+        del origin_window, fallback_clipboard_text, suppress_beep
         if callable(is_cancelled) and is_cancelled():
             return PasteOutcome(False, False, "cancelled", "")
         if callable(before_clipboard_write):
@@ -620,8 +619,8 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertIn("hotkey_held", shim)
         self.assertIn("force_clipboard_only", shim)
         self.assertIn("Set-ClipboardSafe", shim)
-        self.assertIn("if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt }", shim)
-        self.assertIn('if ($clipOk) { "send_input_failed" } else { "clipboard_failed" }', shim)
+        self.assertIn("if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt $cmdEnqueuedTick $pasteDeadlineMs }", shim)
+        self.assertIn('if ($clipOk) { "send_input_failed" } else { Get-ClipFailReason $cmdEnqueuedTick $pasteDeadlineMs }', shim)
         self.assertNotIn("$fbOk", shim)
         send_paste_block = shim.split("public static bool SendPasteChord(", 1)[1].split("private static void InitWaveTable()", 1)[0]
         self.assertNotIn("Thread.Sleep", send_paste_block)
@@ -1625,8 +1624,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertTrue(plat._ready.wait(timeout=2.0))
             self.assertTrue(done.wait(timeout=2.0), "hotkey event callback deadlocked on synchronous _shim_rpc")
             self.assertEqual(errors, [])
-            # Monotonic RPC seq_ids: beep=101, deliver_text(paste)=102, ping=103 (ignored payload seq_id=102!)
-            self.assertEqual(seen_sids, [101, 103])
+            # Monotonic RPC seq_ids: beep=101, deliver_text(key_state=102, paste=103), ping=104 (ignored payload seq_id=102!)
+            self.assertEqual(seen_sids, [101, 104])
         finally:
             plat.close()
 
@@ -4080,7 +4079,6 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 *,
                 origin_window: ForegroundWindow | None = None,
                 fallback_clipboard_text: str | None = None,
-                preserve_clipboard: bool = False,
                 suppress_beep: object = False,
                 is_cancelled: object = None,
                 before_clipboard_write: object = None,
@@ -4520,19 +4518,39 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 daemon2.close()
 
     def test_wsl_deliver_text_hotkey_held_deferral_no_blind_retry_and_hold_timeout_fallback(self) -> None:
+        from agent_voice_input.config import AudioConfig
+
+        class _AliveShim:
+            stdin = None
+            stdout = None
+
+            def poll(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                return 0
+
         plat = WslPlatform(Config(), env={})
+        plat._shim = _AliveShim()  # type: ignore[assignment]
+        plat._flush_shim_events = lambda timeout_sec=0.05: True  # type: ignore[method-assign]
         rpc_calls: list[tuple[dict[str, object], bool]] = []
-        replies = iter(
+        ks_replies = iter(
             [
-                {"ok": True, "pasted": False, "clipboard": False, "reason": "hotkey_held", "fg_process": "WindowsTerminal"},
-                {"ok": True, "pasted": False, "clipboard": False, "reason": "hotkey_held", "fg_process": "WindowsTerminal"},
-                {"ok": True, "pasted": True, "clipboard": True, "reason": "ok", "fg_process": "WindowsTerminal"},
+                {"ok": True, "hotkey_held": True},
+                {"ok": True, "hotkey_held": True},
+                {"ok": True, "hotkey_held": False},
             ]
         )
 
         def fake_rpc(payload: dict[str, object], timeout_sec: float = 3.0, *, allow_retry: bool = True) -> dict[str, object]:
             rpc_calls.append((dict(payload), allow_retry))
-            return next(replies)
+            if payload.get("cmd") == "key_state":
+                return next(ks_replies)
+            return {"ok": True, "pasted": True, "clipboard": True, "reason": "ok", "fg_process": "WindowsTerminal"}
 
         plat._shim_rpc = fake_rpc  # type: ignore[method-assign]
         before_clip_cnt = [0]
@@ -4550,19 +4568,22 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
         self.assertTrue(out.used_clipboard_paste)
         self.assertEqual(out.reason, "ok")
         self.assertEqual(before_clip_cnt[0], 1)
-        self.assertEqual(len(rpc_calls), 3)
+        self.assertEqual([p.get("cmd") for p, _ in rpc_calls], ["key_state", "key_state", "key_state", "paste"])
         for payload, allow_retry in rpc_calls:
-            self.assertFalse(allow_retry, "non-idempotent paste RPC must never set allow_retry=True")
-            self.assertEqual(payload["fallback_text"], "回退段\n\n按住右Ctrl松开后上屏")
+            self.assertFalse(allow_retry, "non-idempotent paste/key_state RPC must never set allow_retry=True")
+        self.assertEqual(rpc_calls[-1][0]["fallback_text"], "回退段\n\n按住右Ctrl松开后上屏")
 
-        # 2. Focus switched while hotkey was held -> upon key release shim returns focus_changed with clipboard=True
-        replies_drift = iter(
-            [
-                {"ok": True, "pasted": False, "clipboard": False, "reason": "hotkey_held", "fg_process": "WindowsTerminal"},
-                {"ok": True, "pasted": False, "clipboard": True, "reason": "focus_changed", "fg_process": "chrome"},
-            ]
-        )
-        plat._shim_rpc = lambda payload, timeout_sec=3.0, *, allow_retry=True: next(replies_drift)  # type: ignore[method-assign]
+        # 2. Focus switched while hotkey was held -> upon key release single paste RPC returns focus_changed with clipboard=True
+        ks_drift = iter([{"ok": True, "hotkey_held": True}, {"ok": True, "hotkey_held": False}])
+        drift_rpcs: list[dict[str, object]] = []
+
+        def fake_rpc_drift(payload: dict[str, object], timeout_sec: float = 3.0, *, allow_retry: bool = True) -> dict[str, object]:
+            drift_rpcs.append(dict(payload))
+            if payload.get("cmd") == "key_state":
+                return next(ks_drift)
+            return {"ok": True, "pasted": False, "clipboard": True, "reason": "focus_changed", "fg_process": "chrome"}
+
+        plat._shim_rpc = fake_rpc_drift  # type: ignore[method-assign]
         out_drift = plat.deliver_text(
             "松键时已切窗",
             seq_id=11,
@@ -4574,16 +4595,19 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
         self.assertTrue(out_drift.clipboard)
         self.assertFalse(out_drift.used_clipboard_paste)
         self.assertEqual(out_drift.reason, "focus_changed")
+        self.assertEqual([r.get("cmd") for r in drift_rpcs], ["key_state", "key_state", "paste"])
 
-        # 3. Hold timeout safety net -> sends force_clipboard_only=True so text safely lands in clipboard
+        # 3. Hold timeout safety net -> sends single force_clipboard_only=True so text safely lands in clipboard
         plat._paste_hold_timeout_sec = 0.08
         timeout_rpcs: list[dict[str, object]] = []
 
         def fake_held_forever(payload: dict[str, object], timeout_sec: float = 3.0, *, allow_retry: bool = True) -> dict[str, object]:
             timeout_rpcs.append(dict(payload))
+            if payload.get("cmd") == "key_state":
+                return {"ok": True, "hotkey_held": True}
             if payload.get("force_clipboard_only"):
                 return {"ok": True, "pasted": False, "clipboard": True, "reason": "focus_changed", "fg_process": "WindowsTerminal"}
-            return {"ok": True, "pasted": False, "clipboard": False, "reason": "hotkey_held", "fg_process": "WindowsTerminal"}
+            raise AssertionError("must not send normal auto-paste after hold timeout")
 
         plat._shim_rpc = fake_held_forever  # type: ignore[method-assign]
         out_to = plat.deliver_text(
@@ -4596,8 +4620,211 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
         self.assertFalse(out_to.pasted)
         self.assertTrue(out_to.clipboard)
         self.assertEqual(out_to.reason, "focus_changed")
-        self.assertTrue(timeout_rpcs[-1].get("force_clipboard_only"))
-        self.assertEqual(timeout_rpcs[-1].get("fallback_text"), "前段\n\n超时兜底写剪贴板")
+        paste_timeout_rpcs = [r for r in timeout_rpcs if r.get("cmd") == "paste"]
+        self.assertEqual(len(paste_timeout_rpcs), 1)
+        self.assertTrue(paste_timeout_rpcs[0].get("force_clipboard_only"))
+        self.assertEqual(paste_timeout_rpcs[0].get("fallback_text"), "前段\n\n超时兜底写剪贴板")
+
+        # 4. Single-owner contract: hotkey_held detected inside paste RPC is persistently copied by win_shim itself;
+        #    Python MUST return immediately in 1 single paste RPC with ZERO second force_clipboard_only RPC!
+        plat._paste_hold_timeout_sec = 2.0
+        single_rpc_calls: list[dict[str, object]] = []
+
+        def fake_paste_hotkey_held(payload: dict[str, object], timeout_sec: float = 3.0, *, allow_retry: bool = True) -> dict[str, object]:
+            single_rpc_calls.append(dict(payload))
+            if payload.get("cmd") == "key_state":
+                return {"ok": True, "hotkey_held": False}
+            if payload.get("force_clipboard_only"):
+                raise AssertionError("must NOT send second force_clipboard_only RPC after paste hotkey_held")
+            return {"ok": True, "pasted": False, "clipboard": True, "reason": "hotkey_held", "fg_process": "WindowsTerminal"}
+
+        plat._shim_rpc = fake_paste_hotkey_held  # type: ignore[method-assign]
+        out_held_single = plat.deliver_text(
+            "粘贴瞬间按住修饰键",
+            seq_id=13,
+            target_hwnd=321,
+            origin_window=origin,
+            fallback_clipboard_text="前段\n\n粘贴瞬间按住修饰键",
+        )
+        self.assertFalse(out_held_single.pasted)
+        self.assertTrue(out_held_single.clipboard)
+        self.assertFalse(out_held_single.used_clipboard_paste)
+        self.assertEqual(out_held_single.reason, "hotkey_held")
+        paste_single = [r for r in single_rpc_calls if r.get("cmd") == "paste"]
+        self.assertEqual(len(paste_single), 1)
+        self.assertNotIn("force_clipboard_only", paste_single[0])
+        self.assertEqual(paste_single[0].get("fallback_text"), "前段\n\n粘贴瞬间按住修饰键")
+
+        # 5. RPC timeout / unconfirmed reply -> NEVER sends second blind clipboard overwrite; returns shim_paste_unconfirmed
+        #    so daemon stashes WAV in failed/ for retry.
+        for bad_kind, bad_rpc in (
+            ("timeout", lambda payload, timeout_sec=3.0, *, allow_retry=True: (_ for _ in ()).throw(queue.Empty()) if payload.get("cmd") == "paste" else {"ok": True, "hotkey_held": False}),
+            ("empty_reply", lambda payload, timeout_sec=3.0, *, allow_retry=True: {} if payload.get("cmd") == "paste" else {"ok": True, "hotkey_held": False}),
+            ("error_reply", lambda payload, timeout_sec=3.0, *, allow_retry=True: {"ok": False, "error": "pipe_broken"} if payload.get("cmd") == "paste" else {"ok": True, "hotkey_held": False}),
+            ("key_state_timeout", lambda payload, timeout_sec=3.0, *, allow_retry=True: (_ for _ in ()).throw(TimeoutError("ks_timeout"))),
+        ):
+            seen_bad: list[dict[str, object]] = []
+
+            def _wrap_bad(payload: dict[str, object], timeout_sec: float = 3.0, *, allow_retry: bool = True, _fn=bad_rpc) -> dict[str, object]:
+                seen_bad.append(dict(payload))
+                return _fn(payload, timeout_sec=timeout_sec, allow_retry=allow_retry)
+
+            plat._shim_rpc = _wrap_bad  # type: ignore[method-assign]
+            out_bad = plat.deliver_text("超时不盲覆写", seq_id=14, target_hwnd=321, origin_window=origin)
+            self.assertFalse(out_bad.pasted, msg=bad_kind)
+            self.assertFalse(out_bad.clipboard, msg=bad_kind)
+            self.assertFalse(out_bad.used_clipboard_paste, msg=bad_kind)
+            self.assertEqual(out_bad.reason, "shim_paste_unconfirmed", msg=bad_kind)
+            self.assertFalse(
+                any(r.get("force_clipboard_only") for r in seen_bad),
+                msg=f"{bad_kind}: must never send blind force_clipboard_only overwrite",
+            )
+
+        # 5b. End-to-end with VoiceInputDaemon: paste RPC timeout stashes WAV into failed/ and triggers paste_failed_retry HUD
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir()
+            wsl_dplat = WslPlatform(Config(audio=AudioConfig(wsl_source="pulse", tail_drain_sec=0.0)), env={})
+            wsl_dplat._shim = _AliveShim()  # type: ignore[assignment]
+            wsl_dplat._flush_shim_events = lambda timeout_sec=0.05: True  # type: ignore[method-assign]
+            wsl_dplat.get_foreground_window = lambda: origin  # type: ignore[method-assign]
+            wsl_dplat.start_recording = lambda *a, **kw: None  # type: ignore[method-assign]
+            wsl_dplat.stop_recording = lambda *a, **kw: (_voiced_wav(), "pulse")  # type: ignore[method-assign]
+            wsl_dplat.beep = lambda _k: None  # type: ignore[method-assign]
+            hud_states: list[str] = []
+            wsl_dplat.hud = lambda st, *a, **kw: hud_states.append(st)  # type: ignore[method-assign]
+            d_rpcs: list[dict[str, object]] = []
+
+            def _timeout_on_paste(payload: dict[str, object], timeout_sec: float = 3.0, *, allow_retry: bool = True) -> dict[str, object]:
+                d_rpcs.append(dict(payload))
+                if payload.get("cmd") == "key_state":
+                    return {"ok": True, "hotkey_held": False}
+                raise queue.Empty()
+
+            wsl_dplat._shim_rpc = _timeout_on_paste  # type: ignore[method-assign]
+            daemon_to = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="off"), audio=AudioConfig(wsl_source="pulse", tail_drain_sec=0.0)),
+                env={},
+                runtime_dir=rt,
+                platform=wsl_dplat,
+                asr_provider=_FakeAsr("超时暂存语音"),
+                refiner=None,
+                tracker=_isolated_tracker(Path(td)),
+            )
+            try:
+                r_on = daemon_to.handle_trigger("toggle")
+                self.assertTrue(r_on.get("ok"), msg=r_on)
+                daemon_to._last_trigger_ts = -1e9
+                r_off = daemon_to.handle_trigger("toggle")
+                self.assertTrue(r_off.get("ok"), msg=r_off)
+                self.assertIsNotNone(r_off.get("seq_id"), msg=r_off)
+                dl = time.monotonic() + 3.0
+                while time.monotonic() < dl and daemon_to.last_result.get("seq_id") != r_off["seq_id"]:
+                    time.sleep(0.02)
+                self.assertEqual(daemon_to.last_result.get("seq_id"), r_off["seq_id"], msg=daemon_to.last_result)
+                self.assertFalse(daemon_to.last_result.get("ok"), msg=daemon_to.last_result)
+                self.assertEqual(daemon_to.last_result.get("skipped_reason"), "shim_paste_unconfirmed", msg=daemon_to.last_result)
+                saved_wav = str(daemon_to.last_result.get("saved_audio") or "")
+                self.assertTrue(saved_wav and Path(saved_wav).is_file(), f"expected WAV stashed in failed/, got {saved_wav!r}")
+                self.assertEqual(Path(saved_wav).parent.name, "failed")
+                self.assertIn("paste_failed_retry", hud_states)
+                self.assertFalse(any(r.get("force_clipboard_only") for r in d_rpcs))
+            finally:
+                wsl_dplat._shim = None
+                daemon_to.close()
+
+        # 6. WSL origin_drifted MUST respect before_clipboard_write settle interval (A paste -> B drifted copy-only)
+        now_t = [200.0]
+        order_log: list[tuple[str, float]] = []
+
+        def fake_sleep_ab(sec: float) -> None:
+            order_log.append(("sleep", round(sec, 4)))
+            now_t[0] += sec
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt_ab"
+            rt.mkdir()
+            wsl_ab = WslPlatform(Config(audio=AudioConfig(wsl_source="pulse", tail_drain_sec=0.0)), env={})
+            wsl_ab._shim = _AliveShim()  # type: ignore[assignment]
+            wsl_ab._flush_shim_events = lambda timeout_sec=0.05: True  # type: ignore[method-assign]
+            wsl_ab.beep = lambda _k: None  # type: ignore[method-assign]
+            wsl_ab.hud = lambda *a, **kw: None  # type: ignore[method-assign]
+
+            def _rpc_ab(payload: dict[str, object], timeout_sec: float = 3.0, *, allow_retry: bool = True) -> dict[str, object]:
+                if payload.get("cmd") == "key_state":
+                    return {"ok": True, "hotkey_held": False}
+                tag = "fallback_copy" if payload.get("force_clipboard_only") else "paste"
+                order_log.append((f"{tag}:{payload.get('text')}", round(now_t[0], 4)))
+                if payload.get("force_clipboard_only"):
+                    return {"ok": True, "pasted": False, "clipboard": True, "reason": "focus_changed", "fg_process": "chrome"}
+                return {"ok": True, "pasted": True, "clipboard": True, "reason": "ok", "fg_process": "WindowsTerminal"}
+
+            wsl_ab._shim_rpc = _rpc_ab  # type: ignore[method-assign]
+            daemon_ab = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="off")),
+                env={},
+                runtime_dir=rt,
+                platform=wsl_ab,
+                asr_provider=_FakeAsr("unused"),
+                refiner=None,
+                tracker=_isolated_tracker(Path(td)),
+                clock_fn=lambda: now_t[0],
+                sleep_fn=fake_sleep_ab,
+            )
+            try:
+                from agent_voice_input.daemon import _QueuedUtterance
+                from agent_voice_input.http_transport import CancelToken
+
+                t_a = _QueuedUtterance(seq_id=1, raw_wav=b"", audio_source="winmm", origin_win=origin, cancel_token=CancelToken())
+                out_a = daemon_ab._deliver_for_utterance(t_a, "第一句A", origin)
+                self.assertTrue(out_a.pasted and out_a.used_clipboard_paste)
+                # Advance only 30ms (< 150ms settle window) then deliver drifted utterance B
+                now_t[0] += 0.03
+                drifted_b = ForegroundWindow(hwnd=321, process="WindowsTerminal", title="codex", origin_drifted=True)
+                t_b = _QueuedUtterance(seq_id=2, raw_wav=b"", audio_source="winmm", origin_win=drifted_b, cancel_token=CancelToken())
+                out_b = daemon_ab._deliver_for_utterance(t_b, "切窗句B", drifted_b)
+                self.assertFalse(out_b.pasted)
+                self.assertTrue(out_b.clipboard)
+                self.assertEqual(out_b.reason, "focus_changed")
+                # B MUST have slept remaining ~0.12s BEFORE issuing force_clipboard_only!
+                self.assertEqual(
+                    order_log,
+                    [("paste:第一句A", 200.0), ("sleep", 0.12), ("fallback_copy:切窗句B", 200.15)],
+                )
+            finally:
+                wsl_ab._shim = None
+                daemon_ab.close()
+
+        # 6b. origin_drifted also handles force_clipboard_only RPC timeout cleanly (no crash -> shim_paste_unconfirmed)
+        plat._shim_rpc = lambda payload, timeout_sec=3.0, *, allow_retry=True: (_ for _ in ()).throw(queue.Empty())  # type: ignore[method-assign]
+        drifted_win = ForegroundWindow(hwnd=321, process="WindowsTerminal", title="codex", origin_drifted=True)
+        out_drifted_to = plat.deliver_text("漂移超时", seq_id=15, target_hwnd=321, origin_window=drifted_win)
+        self.assertFalse(out_drifted_to.pasted)
+        self.assertFalse(out_drifted_to.clipboard)
+        self.assertEqual(out_drifted_to.reason, "shim_paste_unconfirmed")
+
+        # 6c. WSL paste RPC always passes monotonic deadline_ms and surfaces paste_deadline_exceeded cleanly (clipboard=False)
+        deadline_seen: list[dict[str, object]] = []
+
+        def _fake_deadline_exceeded(payload: dict[str, object], timeout_sec: float = 3.0, *, allow_retry: bool = True) -> dict[str, object]:
+            deadline_seen.append(dict(payload))
+            if payload.get("cmd") == "key_state":
+                return {"ok": True, "hotkey_held": False}
+            return {"ok": True, "pasted": False, "clipboard": False, "reason": "paste_deadline_exceeded", "fg_process": "WindowsTerminal"}
+
+        plat._shim_rpc = _fake_deadline_exceeded  # type: ignore[method-assign]
+        out_dl = plat.deliver_text("超时截止不迟贴", seq_id=16, target_hwnd=321, origin_window=origin)
+        self.assertFalse(out_dl.pasted)
+        self.assertFalse(out_dl.clipboard)
+        self.assertEqual(out_dl.reason, "paste_deadline_exceeded")
+        out_dl_fb = plat.deliver_text("切窗截止不迟写", seq_id=17, target_hwnd=321, origin_window=drifted_win)
+        self.assertFalse(out_dl_fb.pasted)
+        self.assertFalse(out_dl_fb.clipboard)
+        self.assertEqual(out_dl_fb.reason, "paste_deadline_exceeded")
+        paste_dl_reqs = [r for r in deadline_seen if r.get("cmd") == "paste"]
+        self.assertEqual(len(paste_dl_reqs), 2)
+        for req_item in paste_dl_reqs:
+            self.assertEqual(int(req_item.get("deadline_ms") or 0), 3800)
 
     def test_audio_error_snapshot_queue_full_recorder_lost_absorption_and_fast_close(self) -> None:
         from agent_voice_input.daemon import MAX_PENDING_UTTERANCES
@@ -8861,8 +9088,11 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                 daemon.close()
 
     def test_win_shim_dll_cache_and_clip_guard_static_contracts(self) -> None:
-        shim = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
-        self.assertTrue(shim.isascii())
+        shim_path = _REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1"
+        raw_bytes = shim_path.read_bytes()
+        self.assertFalse(raw_bytes.startswith(b"\xef\xbb\xbf"), "win_shim.ps1 must have no UTF-8 BOM")
+        self.assertTrue(all(b < 128 for b in raw_bytes), "win_shim.ps1 must stay strictly 7-bit ASCII")
+        shim = raw_bytes.decode("ascii")
         for required_tok in (
             "CSharpCodeProvider",
             "CompileAssemblyFromSource",
@@ -8885,8 +9115,13 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
             "Set-ClipboardTransient",
             "RunClipStateSelfCheck",
             '$Mode -eq "clip-self-check"',
-            "MaxClipSnapshotBytes = 100 * 1024 * 1024",
+            "MaxClipSnapshotBytes = 10 * 1024 * 1024",
+            "IsDeadlineExceeded",
+            "paste_deadline_exceeded",
+            "deadline_ms",
             "store.HasFormatWhenOpen(CF_DIBV5) ? CF_DIBV5 : CF_DIB",
+            "step8 read exception refused voice paste",
+            'reason = $(if ($clipOk) { "hotkey_held" } else { Get-ClipFailReason',
         ):
             self.assertIn(required_tok, shim, msg=required_tok)
         for forbidden_tok in (
@@ -8894,8 +9129,22 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
             "GetText",
             "QueueUserWorkItem",
             "$fbOk",
+            "Set-ClipboardTransient $fbTxt",
         ):
             self.assertNotIn(forbidden_tok, shim, msg=forbidden_tok)
+        # In WriteClipTextCore, both branches check deadline after EmptyWhenOpen() and before SetFormatBytesWhenOpen();
+        # in the transient branch, pending restore timer must be stopped BEFORE EmptyWhenOpen().
+        wc_block = shim.split("private static bool WriteClipTextCore(", 1)[1].split("private static void FlushClipRestoreCore(", 1)[0]
+        persist_part, transient_part = wc_block.split("bool preHung = store.IsOwnerHung();", 1)
+        self.assertLess(
+            transient_part.index("if (stopTimerFn != null) stopTimerFn();"),
+            transient_part.index("store.EmptyWhenOpen()"),
+        )
+        self.assertIn("nextSnap = ClipSnap.Unrestorable;", transient_part)
+        for branch_name, branch_src in (("persistent", persist_part), ("transient", transient_part)):
+            after_empty = branch_src.split("store.EmptyWhenOpen()", 1)[1]
+            before_set = after_empty.split("store.SetFormatBytesWhenOpen(", 1)[0]
+            self.assertIn("isDeadlineExceededFn()", before_set, msg=f"{branch_name} branch missing post-EmptyWhenOpen deadline check")
 
     def test_jsonl_shim_unready_hang_reap_backoff_pulse_fallback_and_self_heal(self) -> None:
         import subprocess
@@ -11075,10 +11324,9 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 before_clipboard_write: object = None,
                 before_commit: object = None,
                 fallback_clipboard_text: object = None,
-                preserve_clipboard: bool = False,
             ) -> PasteOutcome:
                 del text, seq_id, target_hwnd, suppress_beep, is_cancelled, before_clipboard_write
-                del fallback_clipboard_text, preserve_clipboard
+                del fallback_clipboard_text
                 if callable(before_commit) and not before_commit():
                     return PasteOutcome(False, False, "cancelled", "")
                 if origin_window is not None and origin_window.origin_drifted:
