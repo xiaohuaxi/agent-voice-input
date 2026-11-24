@@ -1952,6 +1952,9 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
 
     def test_hud_precedes_stop_drain_and_beep_plus_stage_telemetry(self) -> None:
         ops: list[str] = []
+        hud_recording_evt = threading.Event()
+        hud_recognizing_evt = threading.Event()
+        hud_done_evt = threading.Event()
 
         class _OrderedPlatform(_FakePlatform):
             def get_foreground_window(self) -> ForegroundWindow:
@@ -1961,6 +1964,12 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             def hud(self, state: str, text: str = "", duration_ms: int = 0, **kw: object) -> None:
                 ops.append(f"hud:{state}")
                 super().hud(state, text, duration_ms, **kw)
+                if state == "recording":
+                    hud_recording_evt.set()
+                elif state == "recognizing":
+                    hud_recognizing_evt.set()
+                elif state == "done":
+                    hud_done_evt.set()
 
             def beep(self, kind: str) -> None:
                 ops.append(f"beep:{kind}")
@@ -1998,19 +2007,30 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             )
             try:
                 self.assertTrue(daemon.handle_trigger("toggle")["ok"])
-                self.assertEqual(ops, ["start_rec", "hud:recording", "beep:start", "fg_window"])
+                self.assertTrue(hud_recording_evt.wait(timeout=2.0))
+                self.assertEqual(ops[0], "start_rec")
+                self.assertLess(ops.index("start_rec"), ops.index("hud:recording"))
+                self.assertLess(ops.index("start_rec"), ops.index("beep:start"))
+                self.assertLess(ops.index("beep:start"), ops.index("fg_window"))
                 ops.clear()
                 daemon._last_trigger_ts = -1e9
                 r_stop = daemon.handle_trigger("toggle")
                 self.assertEqual(r_stop["state"], "recognizing")
-                # HUD switches to 'recognizing' BEFORE stop_recording() (and its tail_drain_sec) or beep!
-                self.assertEqual(ops[:3], ["hud:recognizing", "stop_rec", "beep:stop"])
+                self.assertTrue(hud_recognizing_evt.wait(timeout=2.0))
+                # stop_recording() runs BEFORE HUD 'recognizing' and beep so slow HUD RPCs never extend capture!
+                self.assertEqual(ops[0], "stop_rec")
+                self.assertLess(ops.index("stop_rec"), ops.index("hud:recognizing"))
+                self.assertLess(ops.index("stop_rec"), ops.index("beep:stop"))
 
+                self.assertTrue(hud_done_evt.wait(timeout=2.0))
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline and daemon.state != "idle":
                     time.sleep(0.02)
-                # Full two-stage HUD sequence: recognizing -> stop_rec -> beep:stop -> refining -> done!
-                self.assertEqual(ops, ["hud:recognizing", "stop_rec", "beep:stop", "hud:refining", "hud:done"])
+                # Full two-stage HUD batch order: recognizing -> refining -> done, all after stop_rec!
+                hud_seq = [op for op in ops if op.startswith("hud:")]
+                self.assertEqual(hud_seq, ["hud:recognizing", "hud:refining", "hud:done"])
+                self.assertIn("beep:stop", ops)
+                self.assertLess(ops.index("stop_rec"), ops.index("hud:recognizing"))
                 st = daemon.handle_control({"cmd": "status"})
                 lr = st["last_result"]
                 self.assertTrue(lr["ok"])
@@ -2076,7 +2096,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 t_stop = threading.Thread(target=lambda: out_stop.update(d2.handle_trigger("toggle")))
                 t_stop.start()
                 self.assertTrue(in_drain.wait(timeout=2.0))
-                self.assertEqual(drain_ops, ["hud:recognizing", "stop_rec_enter"])
+                self.assertEqual(drain_ops, ["stop_rec_enter"])
                 self.assertEqual(d2.handle_control({"cmd": "status"})["state"], "recognizing")
 
                 # Arrival at +50ms (<180ms debounce) while drain is still holding _trigger_lock
@@ -3437,7 +3457,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                     self.assertEqual(r_stop.get("skipped_reason"), exp_reason)
                     self.assertEqual(daemon.last_result.get("skipped_reason"), exp_reason)
                     self.assertEqual(daemon.state, "idle")
-                    self.assertEqual(events, ["hud:recognizing", f"hud:{exp_state}", "beep:error"])
+                    self.assertEqual(events, [f"hud:{exp_state}", "beep:error"])
                     self.assertEqual(hud_records[-1][0], exp_state)
                     self.assertEqual(hud_records[-1][1], exp_dur)
                     self.assertTrue(hud_records[-1][2].get("clear_main"))

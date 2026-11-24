@@ -7,7 +7,9 @@ import json
 import os
 from pathlib import Path
 import queue
+import select
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -338,45 +340,95 @@ class FfmpegWavRecorder:
         has_known_input: bool | None = None,
         on_unexpected_exit: Callable[[], None] | None = None,
         on_level: Callable[[float], None] | None = None,
+        spawn_lock: Any = None,
+        can_spawn: Callable[[], bool] | None = None,
+        on_spawned: Callable[[], None] | None = None,
     ) -> None:
         self.stop(drain_sec=0.0)
+        cmd = self._build_cmd(fmt, source)
         buf, err_buf = bytearray(), bytearray()
         startup_evt = threading.Event()
         start_ts = time.monotonic()
         self.last_stderr, self.last_returncode, self.first_chunk_ts, self.last_chunk_ts = "", None, 0.0, 0.0
-        proc = subprocess.Popen(self._build_cmd(fmt, source), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True, env=dict(os.environ if env is None else env))
-        assert proc.stdout is not None and proc.stderr is not None
-        err_reader = threading.Thread(target=self._read_pipe, args=(proc.stderr, err_buf, 512), daemon=True)
-        reader = threading.Thread(target=self._read_stdout, args=(proc.stdout, buf, startup_evt, proc, err_reader, err_buf), daemon=True)
-        with self._lock:
-            self._proc, self._reader, self._err_reader, self._buf, self._err_buf = proc, reader, err_reader, buf, err_buf
-            self._wd_stop_evt, self._wd_thread = None, None
-            self._stdout_eof = False
-            self._stopping = False
-            self._stall_triggered = False
-            self._last_chunk_ts = 0.0
-            self._unexpected_exit_cb = None
-            self._level_cb = on_level
-            self._live_level, self._live_level_ts = 0.0, 0.0
-        try:
-            err_reader.start(); reader.start()
-        except Exception:
+
+        def _spawn_and_register() -> tuple[subprocess.Popen[bytes], threading.Thread, threading.Thread] | None:
+            if can_spawn is not None and not can_spawn():
+                return None
+            proc_local = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                start_new_session=True,
+                env=dict(os.environ if env is None else env),
+            )
+            assert proc_local.stdout is not None and proc_local.stderr is not None
+            err_r = threading.Thread(target=self._read_pipe, args=(proc_local.stderr, err_buf, 512), daemon=True)
+            out_r = threading.Thread(
+                target=self._read_stdout,
+                args=(proc_local.stdout, buf, startup_evt, proc_local, err_r, err_buf),
+                daemon=True,
+            )
             with self._lock:
-                if self._proc is proc:
-                    self._proc, self._reader, self._err_reader, self._buf, self._err_buf = None, None, None, bytearray(), bytearray()
-                    self._stdout_eof = False
-                    self._stopping = False
-                    self._stall_triggered = False
-                    self._last_chunk_ts = 0.0
-                    self._unexpected_exit_cb = None
-                    self._level_cb = None
-                    self._live_level, self._live_level_ts = 0.0, 0.0
-            try: proc.kill(); proc.wait(timeout=0.5)
-            except Exception: pass
-            for pipe in (proc.stdout, proc.stderr):
-                try: pipe.close()
-                except Exception: pass
-            raise
+                self._proc, self._reader, self._err_reader, self._buf, self._err_buf = (
+                    proc_local,
+                    out_r,
+                    err_r,
+                    buf,
+                    err_buf,
+                )
+                self._wd_stop_evt, self._wd_thread = None, None
+                self._stdout_eof = False
+                self._stopping = False
+                self._stall_triggered = False
+                self._last_chunk_ts = 0.0
+                self._unexpected_exit_cb = None
+                self._level_cb = on_level
+                self._live_level, self._live_level_ts = 0.0, 0.0
+            try:
+                err_r.start()
+                out_r.start()
+            except Exception:
+                with self._lock:
+                    if self._proc is proc_local:
+                        self._proc, self._reader, self._err_reader, self._buf, self._err_buf = (
+                            None,
+                            None,
+                            None,
+                            bytearray(),
+                            bytearray(),
+                        )
+                        self._stdout_eof = False
+                        self._stopping = False
+                        self._stall_triggered = False
+                        self._last_chunk_ts = 0.0
+                        self._unexpected_exit_cb = None
+                        self._level_cb = None
+                        self._live_level, self._live_level_ts = 0.0, 0.0
+                try:
+                    proc_local.kill()
+                    proc_local.wait(timeout=0.5)
+                except Exception:
+                    pass
+                for pipe in (proc_local.stdout, proc_local.stderr):
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+                raise
+            if on_spawned is not None:
+                on_spawned()
+            return proc_local, err_r, out_r
+
+        if spawn_lock is not None:
+            with spawn_lock:
+                spawned = _spawn_and_register()
+        else:
+            spawned = _spawn_and_register()
+        if spawned is None:
+            return
+        proc, err_reader, _reader = spawned
 
         if verify_startup:
             startup_evt.wait(timeout=max(0.02, float(startup_timeout_sec)))
@@ -630,6 +682,117 @@ def _reap_shim_proc(
             pass
 
 
+class _ShimWriteTimeout(TimeoutError):
+    """Raised when writing a JSONL command to shim stdin exceeds the RPC deadline.
+
+    partial=False guarantees zero bytes of the command were written to stdin;
+    partial=True means a non-empty prefix entered the pipe before timeout.
+    """
+
+    def __init__(self, message: str, *, partial: bool = False) -> None:
+        super().__init__(message)
+        self.partial = partial
+        self.written = partial
+
+
+def _stream_pipe_fd(pipe: Any) -> int | None:
+    """Return POSIX fd only for real pipes/sockets (leaving StringIO/files/mocks on .write())."""
+    if os.name != "posix" or pipe is None:
+        return None
+    try:
+        fd = pipe.fileno()
+    except (AttributeError, io.UnsupportedOperation, OSError, ValueError):
+        return None
+    if not isinstance(fd, int) or fd < 0:
+        return None
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        return None
+    return fd if (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)) else None
+
+
+def _write_shim_line_with_deadline(pipe: Any, line: str, deadline: float) -> None:
+    fd = _stream_pipe_fd(pipe)
+    if fd is None:
+        try:
+            pipe.write(line)
+            pipe.flush()
+        except ValueError as exc:
+            raise BrokenPipeError("shim_stdin_closed") from exc
+        return
+    raw = line.encode("utf-8")
+    view = memoryview(raw)
+    written = 0
+    try:
+        os.set_blocking(fd, False)
+    except OSError as exc:
+        raise BrokenPipeError("shim_stdin_closed") from exc
+    while written < len(view):
+        rem = deadline - time.monotonic()
+        if rem <= 0.0:
+            raise _ShimWriteTimeout("shim_stdin_write_timeout", partial=(written > 0))
+        try:
+            _, ready_w, _ = select.select([], [fd], [], rem)
+        except (OSError, ValueError) as exc:
+            raise BrokenPipeError("shim_stdin_closed") from exc
+        if not ready_w:
+            raise _ShimWriteTimeout("shim_stdin_write_timeout", partial=(written > 0))
+        try:
+            n = os.write(fd, view[written:])
+        except BlockingIOError:
+            continue
+        except OSError as exc:
+            raise BrokenPipeError("shim_stdin_closed") from exc
+        if n <= 0:
+            raise BrokenPipeError("shim_stdin_closed")
+        written += n
+
+
+def _try_write_shim_line_nonblocking(pipe: Any, line: str) -> bool:
+    fd = _stream_pipe_fd(pipe)
+    if fd is None:
+        pipe.write(line)
+        pipe.flush()
+        return True
+    try:
+        _, ready_w, _ = select.select([], [fd], [], 0.0)
+    except (OSError, ValueError):
+        return False
+    if not ready_w:
+        return False
+    raw = line.encode("utf-8")
+    view = memoryview(raw)
+    try:
+        os.set_blocking(fd, False)
+        n = os.write(fd, view)
+    except (BlockingIOError, OSError):
+        return False
+    if n <= 0:
+        return False
+    written = n
+    if written < len(view):
+        # POSIX guarantees atomic writes up to PIPE_BUF (>=512B); finish any rare partial tail briefly.
+        tail_dl = time.monotonic() + 0.005
+        while written < len(view):
+            rem = tail_dl - time.monotonic()
+            if rem <= 0.0:
+                raise _ShimWriteTimeout("shim_stdin_nonblocking_partial_timeout", partial=True)
+            try:
+                _, rw, _ = select.select([], [fd], [], rem)
+                if not rw:
+                    raise _ShimWriteTimeout("shim_stdin_nonblocking_partial_timeout", partial=True)
+                m = os.write(fd, view[written:])
+            except BlockingIOError:
+                continue
+            except (OSError, ValueError):
+                raise _ShimWriteTimeout("shim_stdin_nonblocking_partial_error", partial=True)
+            if m <= 0:
+                raise _ShimWriteTimeout("shim_stdin_nonblocking_partial_eof", partial=True)
+            written += m
+    return True
+
+
 class JsonlShimMixin:
     _shim_graceful: bool = False
     _shim_ready_timeout: float = 8.0
@@ -647,6 +810,7 @@ class JsonlShimMixin:
         self._shim_disabled = False
         self._shim_lock = threading.Lock()
         self._shim_cond = threading.Condition(self._shim_lock)
+        self._shim_build_lock = threading.Lock()
         self._spawning_shim: bool = False
         self._spawned_shim: subprocess.Popen[str] | None = None
         self._spawned_ready: bool = False
@@ -773,6 +937,7 @@ class JsonlShimMixin:
         dead: subprocess.Popen[str] | None = None
         proc_ready: threading.Event | None = None
         proc: subprocess.Popen[str] | None = None
+        claimed_spawn = False
         spawn_started = False
         try:
             with self._shim_lock:
@@ -800,45 +965,62 @@ class JsonlShimMixin:
                 self._spawned_ready = False
                 self._shim_caps = frozenset()
                 self._spawning_shim = True
-                try:
+                claimed_spawn = True
+
+            if dead is not None:
+                self._reap_owned_shim(dead)
+                dead = None
+
+            cmd: list[str] | None = None
+            build_config_err: str | None = None
+            with self._shim_build_lock:
+                if not self._closed and not self._shim_disabled:
                     try:
                         cmd = self._build_shim_cmd()
                     except ConfigError as exc:
-                        self._disable_shim_once(str(exc))
-                        cmd = None
-                    if not cmd:
-                        if self._shim_graceful or self._shim_disabled:
-                            self._disable_shim_once(self.last_shim_error or f"{self._shim_label} unavailable")
-                        else:
-                            raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
-                    else:
-                        self._ready.clear()
-                        proc_ready = threading.Event()
-                        try:
-                            proc = subprocess.Popen(
-                                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                text=True, encoding="utf-8", errors="replace", bufsize=1,
-                                env=self.env if self._shim_graceful else None,
-                            )
-                        except OSError as exc:
-                            if self._shim_graceful:
-                                self._disable_shim_once(f"failed to spawn {self._shim_label}: {exc}")
-                            else:
-                                raise
-                        else:
-                            self._shim = proc
-                            self._spawned_shim = proc
-                            self._shim_instance_id += 1
-                            setattr(proc, "_shim_instance_id", self._shim_instance_id)
-                            reader_th = threading.Thread(target=self._shim_reader, args=(proc, proc_ready), daemon=True)
-                            setattr(proc, "_shim_reader_th", reader_th)
-                            reader_th.start()
-                            spawn_started = True
-                finally:
-                    if not spawn_started:
-                        self._spawning_shim = False
-                        self._shim_cond.notify_all()
+                        build_config_err = str(exc)
+
+            with self._shim_lock:
+                if self._closed:
+                    if self._shim_graceful:
+                        return False
+                    raise RuntimeError(f"{type(self).__name__} is closed")
+                if self._shim_disabled:
+                    return False
+                if build_config_err is not None:
+                    self._disable_shim_once(build_config_err)
+                    return False
+                if not cmd:
+                    if self._shim_graceful or self._shim_disabled:
+                        self._disable_shim_once(self.last_shim_error or f"{self._shim_label} unavailable")
+                        return False
+                    raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
+                self._ready.clear()
+                proc_ready = threading.Event()
+                try:
+                    proc = subprocess.Popen(
+                        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        text=True, encoding="utf-8", errors="replace", bufsize=1,
+                        env=self.env if self._shim_graceful else None,
+                    )
+                except OSError as exc:
+                    if self._shim_graceful:
+                        self._disable_shim_once(f"failed to spawn {self._shim_label}: {exc}")
+                        return False
+                    raise
+                self._shim = proc
+                self._spawned_shim = proc
+                self._shim_instance_id += 1
+                setattr(proc, "_shim_instance_id", self._shim_instance_id)
+                reader_th = threading.Thread(target=self._shim_reader, args=(proc, proc_ready), daemon=True)
+                setattr(proc, "_shim_reader_th", reader_th)
+                reader_th.start()
+                spawn_started = True
         finally:
+            if claimed_spawn and not spawn_started:
+                with self._shim_lock:
+                    self._spawning_shim = False
+                    self._shim_cond.notify_all()
             if dead is not None:
                 self._reap_owned_shim(dead)
         if not spawn_started:
@@ -1141,22 +1323,33 @@ class JsonlShimMixin:
                         self._pending[sid] = (proc, shared_q)
                         registered.append((proc, sid))
                     line = json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n"
-                    with self._stdin_lock:
+                    attempt_deadline = time.monotonic() + max(0.0, float(timeout_sec))
+                    rem_lock = attempt_deadline - time.monotonic()
+                    acquired = (
+                        self._stdin_lock.acquire(timeout=rem_lock)
+                        if rem_lock > 0.0
+                        else self._stdin_lock.acquire(blocking=False)
+                    )
+                    if not acquired:
+                        raise _ShimWriteTimeout("shim_stdin_lock_timeout", partial=False)
+                    try:
                         if before_write is not None:
                             before_write()
-                        if (
-                            sent_proc.poll() is not None
-                            or getattr(sent_proc, "_deferred_close_stdin", False)
-                            or sent_proc.stdin is None
-                            or sent_proc.stdin.closed
-                        ):
+                        if not self._is_proc_stdin_writable_locked(sent_proc, require_current=True):
                             raise BrokenPipeError("shim_not_running")
                         try:
-                            sent_proc.stdin.write(line)
-                            sent_proc.stdin.flush()
-                        except ValueError as exc:
-                            raise BrokenPipeError("shim_stdin_closed") from exc
-                    res = shared_q.get(timeout=timeout_sec)
+                            _write_shim_line_with_deadline(sent_proc.stdin, line, attempt_deadline)
+                        except _ShimWriteTimeout as w_exc:
+                            if w_exc.partial:
+                                # Mark poisoned BEFORE releasing _stdin_lock so no queued writer can append to a half-line.
+                                setattr(sent_proc, "_stdin_poisoned", True)
+                            raise
+                    finally:
+                        self._stdin_lock.release()
+                    rem_reply = attempt_deadline - time.monotonic()
+                    if rem_reply <= 0.0:
+                        raise queue.Empty()
+                    res = shared_q.get(timeout=rem_reply)
                     if res.get("error") == "shim_eof" and (attempt + 1) < max_attempts and not self._closed and not self._shim_disabled:
                         _unregister_all()
                         shared_q = None
@@ -1167,6 +1360,15 @@ class JsonlShimMixin:
                             return None
                         raise RuntimeError(str(res["error"]))
                     return res
+                except _ShimWriteTimeout as exc:
+                    if exc.partial and sent_proc is not None:
+                        self._detach_and_reap_poisoned_shim(sent_proc)
+                    _unregister_all()
+                    shared_q = None
+                    shared_proc = None
+                    if self._shim_graceful:
+                        return None
+                    raise
                 except (BrokenPipeError, OSError, queue.Empty) as exc:
                     if broken is not None:
                         self._reap_owned_shim(broken)
@@ -1258,33 +1460,112 @@ class JsonlShimMixin:
         except Exception:
             pass
 
-    def _send_shim_fire_and_forget_to_proc(
-        self, proc: subprocess.Popen[str] | None, payload: Mapping[str, Any]
-    ) -> None:
-        if self._closed or proc is None or proc.stdin is None or proc.poll() is not None:
-            return
-        line = json.dumps(dict(payload), ensure_ascii=False) + "\n"
-        try:
-            with self._stdin_lock:
-                if (
-                    proc.poll() is None
-                    and not getattr(proc, "_deferred_close_stdin", False)
-                    and proc.stdin is not None
-                    and not proc.stdin.closed
-                ):
-                    proc.stdin.write(line)
-                    proc.stdin.flush()
-        except Exception:
-            pass
+    def _is_proc_stdin_writable_locked(
+        self, proc: subprocess.Popen[str] | None, *, require_current: bool = True
+    ) -> bool:
+        if proc is None or self._closed:
+            return False
+        if require_current and self._shim is not proc:
+            return False
+        return (
+            proc.poll() is None
+            and not getattr(proc, "_stdin_poisoned", False)
+            and not getattr(proc, "_deferred_close_stdin", False)
+            and proc.stdin is not None
+            and not proc.stdin.closed
+        )
 
-    def _send_shim_fire_and_forget(self, payload: Mapping[str, Any]) -> None:
+    def _detach_and_reap_poisoned_shim(self, proc: subprocess.Popen[str]) -> None:
+        was_current = False
+        with self._shim_lock:
+            if self._shim is proc:
+                was_current = True
+                self._shim = None
+                self._spawned_shim = None
+                self._spawned_ready = False
+                self._shim_caps = frozenset()
+                self._shim_cond.notify_all()
+        self._reap_owned_shim(proc)
+        if was_current and not self._closed and not self._shim_disabled:
+            self._schedule_respawn_if_needed()
+
+    def _send_shim_fire_and_forget_to_proc(
+        self,
+        proc: subprocess.Popen[str] | None,
+        payload: Mapping[str, Any],
+        *,
+        drop_if_busy: bool = False,
+        timeout_sec: float = 0.25,
+        require_current: bool = False,
+    ) -> bool:
+        if self._closed or proc is None or proc.stdin is None or proc.poll() is not None:
+            return False
+        line = json.dumps(dict(payload), ensure_ascii=False) + "\n"
+        poisoned_proc: subprocess.Popen[str] | None = None
+        try:
+            if drop_if_busy:
+                if not self._stdin_lock.acquire(blocking=False):
+                    return False
+                try:
+                    if not self._is_proc_stdin_writable_locked(proc, require_current=require_current):
+                        return False
+                    try:
+                        return _try_write_shim_line_nonblocking(proc.stdin, line)
+                    except _ShimWriteTimeout as w_exc:
+                        if w_exc.partial:
+                            setattr(proc, "_stdin_poisoned", True)
+                            poisoned_proc = proc
+                        return False
+                finally:
+                    self._stdin_lock.release()
+            deadline = time.monotonic() + max(0.0, float(timeout_sec))
+            rem_lock = deadline - time.monotonic()
+            acquired = (
+                self._stdin_lock.acquire(timeout=rem_lock)
+                if rem_lock > 0.0
+                else self._stdin_lock.acquire(blocking=False)
+            )
+            if not acquired:
+                return False
+            try:
+                if not self._is_proc_stdin_writable_locked(proc, require_current=require_current):
+                    return False
+                try:
+                    _write_shim_line_with_deadline(proc.stdin, line, deadline)
+                    return True
+                except _ShimWriteTimeout as w_exc:
+                    if w_exc.partial:
+                        setattr(proc, "_stdin_poisoned", True)
+                        poisoned_proc = proc
+                    return False
+            finally:
+                self._stdin_lock.release()
+        except Exception:
+            return False
+        finally:
+            if poisoned_proc is not None:
+                self._detach_and_reap_poisoned_shim(poisoned_proc)
+
+    def _send_shim_fire_and_forget(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        drop_if_busy: bool = False,
+        timeout_sec: float = 0.25,
+    ) -> bool:
         if not self._has_managed_shim() or not self._ready.is_set():
-            return
-        self._send_shim_fire_and_forget_to_proc(self._shim, payload)
+            return False
+        return self._send_shim_fire_and_forget_to_proc(
+            self._shim,
+            payload,
+            drop_if_busy=drop_if_busy,
+            timeout_sec=timeout_sec,
+            require_current=True,
+        )
 
     def hud_level(self, level: float) -> None:
         clamped = round(max(0.0, min(1.0, float(level))), 3)
-        self._send_shim_fire_and_forget({"cmd": "hud_level", "level": clamped})
+        self._send_shim_fire_and_forget({"cmd": "hud_level", "level": clamped}, drop_if_busy=True)
 
     def _on_recorder_level(self, level: float) -> None:
         if self._closed or not self._has_managed_shim():
@@ -1349,7 +1630,11 @@ class JsonlShimMixin:
             quit_sent = False
             if self._stdin_lock.acquire(timeout=0.2):
                 try:
-                    if proc.stdin and not proc.stdin.closed:
+                    if (
+                        proc.stdin
+                        and not proc.stdin.closed
+                        and not getattr(proc, "_stdin_poisoned", False)
+                    ):
                         try:
                             fd = proc.stdin.fileno()
                         except (AttributeError, io.UnsupportedOperation, OSError):

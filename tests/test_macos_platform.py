@@ -2288,7 +2288,6 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertEqual(
                     hud_calls,
                     [
-                        ("recognizing", 0, {}),
                         ("mic_permission", 0, {"clear_main": True}),
                     ],
                 )

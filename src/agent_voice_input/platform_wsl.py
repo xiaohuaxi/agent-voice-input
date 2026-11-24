@@ -29,6 +29,7 @@ from .platform_common import (
     MicrophoneUnavailableError,
     NoMicrophoneError,
     PasteOutcome,
+    _ShimWriteTimeout,
     _reap_shim_proc,
     classify_ffmpeg_startup_error,
     invoke_recorder_lost_callback,
@@ -490,10 +491,12 @@ class WslPlatform(JsonlShimMixin):
             except Exception as shim_exc:
                 fb_gen = 0
                 should_discard_winmm = False
+                not_written = isinstance(shim_exc, _ShimWriteTimeout) and not shim_exc.partial
                 with self._winmm_state_lock:
                     if self._winmm_gen == my_gen:
                         should_discard_winmm = (
-                            (
+                            not not_written
+                            and (
                                 self._winmm_rpc_dispatched
                                 or before_write_ran
                                 or isinstance(shim_exc, (queue.Empty, TimeoutError))
@@ -521,10 +524,18 @@ class WslPlatform(JsonlShimMixin):
                             self._rec_mode = "pulse"
                 if should_discard_winmm:
                     discard_req = {"cmd": "rec_stop", "rec_gen": my_gen, "discard": True}
+                    with self._shim_lock:
+                        target_proc = dispatched_proc if dispatched_proc is not None else self._shim
                     if dispatched_proc is not None and dispatched_proc is not self._shim:
-                        self._send_shim_fire_and_forget_to_proc(dispatched_proc, discard_req)
+                        sent = self._send_shim_fire_and_forget_to_proc(dispatched_proc, discard_req)
                     else:
-                        self._send_shim_fire_and_forget(discard_req)
+                        sent = self._send_shim_fire_and_forget(discard_req)
+                    if not sent and target_proc is not None and not self._closed:
+                        try:
+                            setattr(target_proc, "_stdin_poisoned", True)
+                        except Exception:
+                            pass
+                        self._detach_and_reap_poisoned_shim(target_proc)
                 self.last_audio_error = str(shim_exc)
                 if fb_gen:
                     try:

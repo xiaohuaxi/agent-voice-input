@@ -3252,6 +3252,10 @@ class _AgyWorker:
         except (OSError, ValueError):
             pass
         finally:
+            try:
+                self.proc.stdout.close()
+            except OSError:
+                pass
             self.events.put(("eof", None))
 
     def _stderr_reader(self) -> None:
@@ -3264,6 +3268,11 @@ class _AgyWorker:
                         del self.stderr_lines[:100]
         except (OSError, ValueError):
             pass
+        finally:
+            try:
+                self.proc.stderr.close()
+            except OSError:
+                pass
 
     def is_alive(self) -> bool:
         return not self.closed and self.proc.poll() is None
@@ -3321,13 +3330,26 @@ class _AgyWorker:
             try:
                 _agy_stop_process_group(self.proc, fast=fast)
             finally:
-                self.t_out.join(timeout=0.3)
-                self.t_err.join(timeout=0.3)
-                _agy_close_pipes(self.proc)
-                if self.t_out.is_alive():
-                    self.t_out.join(timeout=1.0)
-                if self.t_err.is_alive():
-                    self.t_err.join(timeout=1.0)
+                if self.proc.stdin is not None:
+                    try:
+                        self.proc.stdin.close()
+                    except OSError:
+                        pass
+                cur_th = threading.current_thread()
+                if self.t_out is not cur_th:
+                    self.t_out.join(timeout=0.5)
+                if self.t_err is not cur_th:
+                    self.t_err.join(timeout=0.5)
+                if not self.t_out.is_alive() and self.proc.stdout is not None:
+                    try:
+                        self.proc.stdout.close()
+                    except OSError:
+                        pass
+                if not self.t_err.is_alive() and self.proc.stderr is not None:
+                    try:
+                        self.proc.stderr.close()
+                    except OSError:
+                        pass
                 self._on_stopped(self.proc)
 
 

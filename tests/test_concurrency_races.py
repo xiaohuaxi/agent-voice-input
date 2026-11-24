@@ -14,6 +14,7 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import random
 import socket
 import socketserver
@@ -1681,6 +1682,1636 @@ class TestConcurrencyRaces(unittest.TestCase):
                                 pipe.close()
                             except Exception:
                                 pass
+
+
+class TestBatch1BConcurrencyFixes(unittest.TestCase):
+    """Batch 1B targeted regression tests for daemon, platform_common, and platform_macos races."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.speech_wav = _build_voiced_wav(0.36)
+
+    def test_normal_stop_calls_stop_recording_before_hud_and_slow_hud_does_not_block_locks(self) -> None:
+        """1) Normal ptt_stop/toggle stops recording BEFORE HUD RPC; slow HUD never blocks _hud_lock/_trigger_lock."""
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            empty_proc = Path(td) / "empty_proc"
+            empty_proc.mkdir(parents=True, exist_ok=True)
+            cfg = Config(
+                asr=AsrConfig(provider="dashscope"),
+                refiner=RefinerConfig(provider="off", include_git_status=False),
+                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
+            )
+            call_order: list[str] = []
+            hud_entered = threading.Event()
+            release_hud = threading.Event()
+            block_next_hud = [False]
+
+            class _SlowHudPlatform(_TorturePlatform):
+                def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
+                    call_order.append("stop_recording")
+                    return super().stop_recording(drain=drain)
+
+                def hud(
+                    self,
+                    state: str,
+                    text: str = "",
+                    duration_ms: int = 0,
+                    *,
+                    layer: str | None = None,
+                    clear_main: bool | None = None,
+                    clear_toast: bool | None = None,
+                    bg_count: int = 0,
+                ) -> None:
+                    call_order.append(f"hud:{state}")
+                    if block_next_hud[0] and state == "recognizing":
+                        block_next_hud[0] = False
+                        hud_entered.set()
+                        release_hud.wait(timeout=3.0)
+                    super().hud(
+                        state,
+                        text=text,
+                        duration_ms=duration_ms,
+                        layer=layer,
+                        clear_main=clear_main,
+                        clear_toast=clear_toast,
+                        bg_count=bg_count,
+                    )
+
+            plat = _SlowHudPlatform(self.speech_wav)
+            tracker = SessionTracker(env={"HOME": td}, runtime_dir=rt, proc_root=empty_proc)
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td, "DASHSCOPE_API_KEY": "sk-test-q"},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_TaggingAsrProvider(),
+                tracker=tracker,
+                paste_settle_sec=0.0,
+            )
+            win = ForegroundWindow(hwnd=101, process="WindowsTerminal.exe", title="codex")
+            try:
+                # 1a. Normal ptt_stop: stop_recording MUST precede hud:recognizing even when HUD blocks!
+                self.assertTrue(daemon.handle_trigger("ptt_start", win)["ok"])
+                call_order.clear()
+                block_next_hud[0] = True
+                t_stop0 = time.monotonic()
+                res_stop = daemon.handle_trigger("ptt_stop", win)
+                stop_elapsed = time.monotonic() - t_stop0
+                self.assertTrue(res_stop["ok"])
+                self.assertTrue(hud_entered.wait(timeout=1.0))
+                self.assertLess(
+                    stop_elapsed,
+                    0.4,
+                    f"ptt_stop must not wait for 3s blocked HUD RPC (took {stop_elapsed:.3f}s)",
+                )
+                self.assertIn("stop_recording", call_order)
+                self.assertIn("hud:recognizing", call_order)
+                self.assertLess(
+                    call_order.index("stop_recording"),
+                    call_order.index("hud:recognizing"),
+                    f"stop_recording must run before HUD RPC, got {call_order}",
+                )
+
+                # 1b. While HUD worker is still blocked on the slow RPC, _hud_lock & _trigger_lock stay responsive!
+                t_next0 = time.monotonic()
+                res_next = daemon.handle_trigger("ptt_start", win)
+                self.assertTrue(res_next["ok"])
+                self.assertLess(time.monotonic() - t_next0, 0.3)
+                res_cancel = daemon.handle_cancel()
+                self.assertTrue(res_cancel["ok"])
+            finally:
+                release_hud.set()
+                daemon.close()
+                tracker.close()
+
+    def test_control_sock_status_stays_fast_during_slow_start_and_stop(self) -> None:
+        """2) control.sock offloads slow rec_start/rec_stop/toggle so status responds within tens of ms."""
+        from agent_voice_input.daemon import send_control_command
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            empty_proc = Path(td) / "empty_proc"
+            empty_proc.mkdir(parents=True, exist_ok=True)
+            cfg = Config(
+                asr=AsrConfig(provider="dashscope"),
+                refiner=RefinerConfig(provider="off", include_git_status=False),
+                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
+            )
+            start_entered = threading.Event()
+            release_start = threading.Event()
+            stop_entered = threading.Event()
+            release_stop = threading.Event()
+            exec_order: list[str] = []
+
+            class _SlowCapturePlatform(_TorturePlatform):
+                def start_recording(
+                    self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None
+                ) -> None:
+                    exec_order.append("start_begin")
+                    start_entered.set()
+                    release_start.wait(timeout=3.0)
+                    super().start_recording(runtime_dir, loopback=loopback, seq_id=seq_id)
+                    exec_order.append("start_end")
+
+                def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
+                    exec_order.append("stop_begin")
+                    stop_entered.set()
+                    release_stop.wait(timeout=3.0)
+                    res = super().stop_recording(drain=drain)
+                    exec_order.append("stop_end")
+                    return res
+
+            plat = _SlowCapturePlatform(self.speech_wav)
+            tracker = SessionTracker(env={"HOME": td}, runtime_dir=rt, proc_root=empty_proc)
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td, "DASHSCOPE_API_KEY": "sk-test-q"},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_TaggingAsrProvider(),
+                tracker=tracker,
+                paste_settle_sec=0.0,
+            )
+            srv_th = threading.Thread(target=daemon.serve_forever, name="test-ctrl-srv", daemon=True)
+            srv_th.start()
+            try:
+                dl = time.monotonic() + 3.0
+                while time.monotonic() < dl and not daemon.sock_path.exists():
+                    time.sleep(0.01)
+                self.assertTrue(daemon.sock_path.exists())
+
+                start_box: list[dict[str, Any]] = []
+                stop_box: list[dict[str, Any]] = []
+                t_start = threading.Thread(
+                    target=lambda: start_box.append(
+                        send_control_command(rt, {"cmd": "rec_start"}, timeout_sec=5.0)
+                    ),
+                    daemon=True,
+                )
+                t_start.start()
+                self.assertTrue(start_entered.wait(timeout=2.0))
+
+                # While rec_start is blocked in start_recording(), status MUST return in < 150ms!
+                t0 = time.monotonic()
+                st_during_start = send_control_command(rt, {"cmd": "status"}, timeout_sec=2.0)
+                st_dt1 = time.monotonic() - t0
+                self.assertTrue(st_during_start["ok"])
+                self.assertLess(st_dt1, 0.25, f"status blocked during slow rec_start ({st_dt1:.3f}s)")
+
+                # Queue rec_stop while rec_start is still running -> ordered worker runs stop AFTER start!
+                t_stop = threading.Thread(
+                    target=lambda: stop_box.append(
+                        send_control_command(rt, {"cmd": "rec_stop"}, timeout_sec=5.0)
+                    ),
+                    daemon=True,
+                )
+                t_stop.start()
+                time.sleep(0.03)
+                release_start.set()
+                self.assertTrue(stop_entered.wait(timeout=2.0))
+
+                # While rec_stop is blocked in stop_recording(), status MUST also stay fast!
+                t1 = time.monotonic()
+                st_during_stop = send_control_command(rt, {"cmd": "status"}, timeout_sec=2.0)
+                st_dt2 = time.monotonic() - t1
+                self.assertTrue(st_during_stop["ok"])
+                self.assertLess(st_dt2, 0.25, f"status blocked during slow rec_stop ({st_dt2:.3f}s)")
+
+                release_stop.set()
+                t_start.join(timeout=3.0)
+                t_stop.join(timeout=3.0)
+                self.assertEqual(len(start_box), 1)
+                self.assertEqual(len(stop_box), 1)
+                self.assertTrue(start_box[0]["ok"])
+                self.assertTrue(stop_box[0]["ok"])
+                self.assertEqual(exec_order, ["start_begin", "start_end", "stop_begin", "stop_end"])
+
+                ctrl_w = daemon._ctrl_trigger_worker
+                hud_w = daemon._hud_worker
+                shut_resp = send_control_command(rt, {"cmd": "shutdown"}, timeout_sec=2.0)
+                self.assertTrue(shut_resp["ok"])
+                srv_th.join(timeout=3.0)
+                self.assertFalse(srv_th.is_alive())
+                if ctrl_w is not None:
+                    self.assertFalse(ctrl_w.is_alive(), "control trigger worker leaked after shutdown")
+                if hud_w is not None:
+                    self.assertFalse(hud_w.is_alive(), "HUD worker leaked after shutdown")
+            finally:
+                release_start.set()
+                release_stop.set()
+                daemon.close()
+                srv_th.join(timeout=2.0)
+                tracker.close()
+
+    def test_macos_start_recording_probe_racing_with_close_never_leaves_closed_and_active(self) -> None:
+        """3) Concurrent MacOSPlatform.start_recording (slow audio probe) + close() never leaves closed=True & rec_active=True."""
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            probe_entered = threading.Event()
+            release_probe = threading.Event()
+            rec_starts = [0]
+            rec_stops = [0]
+
+            class _FakeRec:
+                def __init__(self) -> None:
+                    self._cmd_factory = None
+                    self.current_level = 0.0
+                    self.is_running = False
+
+                def start(self, *args: Any, **kwargs: Any) -> None:
+                    del args, kwargs
+                    rec_starts[0] += 1
+                    self.is_running = True
+
+                def stop(self, *, drain_sec: float = 0.0) -> bytes:
+                    del drain_sec
+                    rec_stops[0] += 1
+                    self.is_running = False
+                    return b""
+
+                def diagnostic_summary(self) -> str:
+                    return "fake"
+
+            def _slow_probe() -> dict[str, Any]:
+                probe_entered.set()
+                release_probe.wait(timeout=3.0)
+                return {
+                    "hal_ok": True,
+                    "has_input": True,
+                    "default_uid": "mic-1",
+                    "default_name": "Built-in Mic",
+                    "alive_uids": ["mic-1"],
+                    "mic_auth": "authorized",
+                }
+
+            plat = MacOSPlatform(
+                Config(),
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache",
+                self_check_fn=_slow_probe,
+            )
+            plat._ff_rec = _FakeRec()  # type: ignore[assignment]
+            start_errs: list[BaseException] = []
+
+            def _run_start() -> None:
+                try:
+                    plat.start_recording(rt, seq_id=1)
+                except BaseException as exc:
+                    start_errs.append(exc)
+
+            th = threading.Thread(target=_run_start, daemon=True)
+            th.start()
+            try:
+                self.assertTrue(probe_entered.wait(timeout=2.0))
+                plat.close()
+                release_probe.set()
+                th.join(timeout=2.0)
+                self.assertFalse(th.is_alive())
+                self.assertEqual(start_errs, [])
+                self.assertTrue(plat._closed)
+                self.assertFalse(plat._rec_active, "closed=True must never coexist with rec_active=True")
+                self.assertFalse(plat._recording)
+                self.assertIsNone(plat._cur_session)
+                self.assertEqual(rec_starts[0], 0, "stale start_recording after close() must never spawn ffmpeg")
+            finally:
+                release_probe.set()
+                th.join(timeout=1.0)
+                plat.close()
+
+    def test_shim_rpc_full_pipe_times_out_on_deadline_and_hud_level_drops_when_busy(self) -> None:
+        """4) Real full os.pipe() honors _shim_rpc timeout_sec=0.05 and hud_level drops frames without blocking."""
+        class _PipeBridge(JsonlShimMixin):
+            _shim_graceful = False
+            _shim_label = "pipe_test"
+
+            def __init__(self) -> None:
+                self.cfg = Config()
+                self.env = {}
+                self._init_shim_bridge()
+
+            def _build_shim_cmd(self) -> list[str] | None:
+                return None
+
+        r_fd, w_fd = os.pipe()
+        w_file = None
+        try:
+            # Fill kernel anonymous pipe buffer completely using non-blocking writes.
+            os.set_blocking(w_fd, False)
+            chunk = b"A" * 4096
+            while True:
+                try:
+                    os.write(w_fd, chunk)
+                except BlockingIOError:
+                    break
+            os.set_blocking(w_fd, True)
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+            w_fd = -1  # ownership transferred to w_file
+
+            class _FullPipeProc:
+                def __init__(self, stdin_obj: Any) -> None:
+                    self.stdin = stdin_obj
+                    self.stdout = None
+                    self.stderr = None
+
+                def poll(self) -> int | None:
+                    return None
+
+                def kill(self) -> None:
+                    pass
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            bridge = _PipeBridge()
+            proc = _FullPipeProc(w_file)
+            bridge._shim = proc  # type: ignore[assignment]
+            bridge._spawned_shim = proc  # type: ignore[assignment]
+            bridge._spawned_ready = True
+            bridge._ready.set()
+            bridge._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
+
+            # 4a. _shim_rpc(..., timeout_sec=0.05) MUST time out promptly despite full pipe!
+            t0 = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                bridge._shim_rpc({"cmd": "ping"}, timeout_sec=0.05, allow_retry=True)
+            dt_rpc = time.monotonic() - t0
+            self.assertGreaterEqual(dt_rpc, 0.04)
+            self.assertLess(dt_rpc, 0.35, f"_shim_rpc exceeded deadline on full pipe ({dt_rpc:.3f}s)")
+
+            # 4b. hud_level() on full pipe MUST drop frame immediately without blocking audio reader!
+            t_lvl0 = time.monotonic()
+            for idx in range(50):
+                bridge.hud_level(0.5 + (idx % 5) * 0.1)
+            dt_lvl = time.monotonic() - t_lvl0
+            self.assertLess(dt_lvl, 0.15, f"hud_level blocked on full pipe ({dt_lvl:.3f}s)")
+
+            # 4c. hud_level() while _stdin_lock is held MUST drop frame immediately!
+            self.assertTrue(bridge._stdin_lock.acquire())
+            try:
+                t_lock0 = time.monotonic()
+                for _ in range(20):
+                    bridge.hud_level(0.42)
+                self.assertLess(time.monotonic() - t_lock0, 0.05)
+
+                # And _shim_rpc waiting on held _stdin_lock honors the same deadline!
+                t_lk_rpc = time.monotonic()
+                with self.assertRaises(TimeoutError):
+                    bridge._shim_rpc({"cmd": "ping"}, timeout_sec=0.05, allow_retry=False)
+                self.assertLess(time.monotonic() - t_lk_rpc, 0.25)
+            finally:
+                bridge._stdin_lock.release()
+        finally:
+            if w_file is not None:
+                try:
+                    w_file.close()
+                except Exception:
+                    pass
+            if w_fd >= 0:
+                os.close(w_fd)
+            os.close(r_fd)
+
+    def test_ensure_shim_slow_build_does_not_block_is_shim_ok_or_close(self) -> None:
+        """5) _build_shim_cmd() runs outside _shim_lock so is_shim_ok() and close() never block on slow compile."""
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        build_entered = threading.Event()
+        release_build = threading.Event()
+
+        def _slow_build() -> list[str] | None:
+            build_entered.set()
+            release_build.wait(timeout=3.0)
+            return [sys.executable, "-c", "import time; time.sleep(5)"]
+
+        plat = MacOSPlatform(Config(), env={}, shim_cmd_factory=_slow_build)
+        plat._on_event = lambda _e: None
+        ensure_box: list[bool] = []
+        th = threading.Thread(target=lambda: ensure_box.append(plat._ensure_shim()), daemon=True)
+        th.start()
+        try:
+            self.assertTrue(build_entered.wait(timeout=2.0))
+            t0 = time.monotonic()
+            self.assertFalse(plat.is_shim_ok())
+            self.assertLess(time.monotonic() - t0, 0.05)
+
+            t_close0 = time.monotonic()
+            plat.close()
+            self.assertLess(time.monotonic() - t_close0, 0.2)
+            release_build.set()
+            th.join(timeout=2.0)
+            self.assertFalse(th.is_alive())
+            self.assertEqual(ensure_box, [False])
+            self.assertIsNone(plat._shim)
+        finally:
+            release_build.set()
+            th.join(timeout=1.0)
+            plat.close()
+
+    def test_macos_internal_audio_disconnect_does_not_block_shim_reader_or_event_worker(self) -> None:
+        """6) Slow rec.stop() on audio_devices_changed runs off _shim_reader/_event_worker threads."""
+        from agent_voice_input.platform_macos import MacOSPlatform, _MacRecSession
+
+        stop_entered = threading.Event()
+        release_stop = threading.Event()
+        lost_fired = threading.Event()
+
+        class _SlowStopRec:
+            def stop(self, *, drain_sec: float = 0.0) -> bytes:
+                del drain_sec
+                stop_entered.set()
+                release_stop.wait(timeout=3.0)
+                return b""
+
+        with tempfile.TemporaryDirectory() as td:
+            plat = MacOSPlatform(Config(), env={"HOME": td}, cache_dir=Path(td) / "cache")
+            try:
+                sess = _MacRecSession(
+                    1,
+                    _SlowStopRec(),  # type: ignore[arg-type]
+                    Path(td),
+                    active_uid="bt-mic",
+                    active_name="BT Mic",
+                    daemon_seq_id=7,
+                )
+                with plat._rec_cond:
+                    plat._cur_session = sess
+                    plat._rec_active = True
+                    plat._recording = True
+                plat.set_recorder_lost_callback(lambda *, seq_id=None: lost_fired.set())
+
+                t0 = time.monotonic()
+                plat._on_shim_internal_event(
+                    {
+                        "event": "audio_devices_changed",
+                        "hal_ok": True,
+                        "has_input": False,
+                        "alive_uids": [],
+                    }
+                )
+                dt = time.monotonic() - t0
+                self.assertLess(dt, 0.1, f"_on_shim_internal_event blocked caller ({dt:.3f}s)")
+                self.assertTrue(stop_entered.wait(timeout=1.0))
+                self.assertFalse(plat._rec_active)
+                release_stop.set()
+                self.assertTrue(lost_fired.wait(timeout=2.0))
+            finally:
+                release_stop.set()
+                plat.close()
+
+    def test_r2_p0_1_partial_write_timeout_poisons_before_unlock_and_schedules_respawn(self) -> None:
+        """P0-1: Partial JSONL write timeout poisons proc before releasing _stdin_lock and triggers respawn."""
+        class _PartialPipeBridge(JsonlShimMixin):
+            _shim_graceful = False
+            _shim_label = "partial_pipe_test"
+
+            def __init__(self) -> None:
+                self.cfg = Config()
+                self.env = {}
+                self._init_shim_bridge()
+
+            def _build_shim_cmd(self) -> list[str] | None:
+                return None
+
+        r_fd, w_fd = os.pipe()
+        w_file = None
+        respawn_calls = [0]
+        try:
+            # Fill pipe completely, then drain 8192 bytes (> PIPE_BUF) so a 128KB RPC writes a prefix then hits partial timeout.
+            os.set_blocking(w_fd, False)
+            os.set_blocking(r_fd, False)
+            total_filled = 0
+            while True:
+                try:
+                    total_filled += os.write(w_fd, b"X" * 4096)
+                except BlockingIOError:
+                    break
+            drained_head = os.read(r_fd, 8192)
+            self.assertEqual(len(drained_head), 8192)
+            os.set_blocking(w_fd, True)
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+            w_fd = -1
+
+            class _PartialProc:
+                def __init__(self, stdin_obj: Any) -> None:
+                    self.stdin = stdin_obj
+                    self.stdout = None
+                    self.stderr = None
+                    self.killed = False
+
+                def poll(self) -> int | None:
+                    return 1 if self.killed else None
+
+                def kill(self) -> None:
+                    self.killed = True
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 1
+
+            bridge = _PartialPipeBridge()
+            proc = _PartialProc(w_file)
+            bridge._shim = proc  # type: ignore[assignment]
+            bridge._spawned_shim = proc  # type: ignore[assignment]
+            bridge._spawned_ready = True
+            bridge._on_event = lambda _e: None
+            bridge._ready.set()
+            bridge._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
+            bridge._schedule_respawn_if_needed = lambda: respawn_calls.__setitem__(0, respawn_calls[0] + 1)  # type: ignore[method-assign]
+
+            # Hook _reap_owned_shim to pause AFTER _stdin_lock is released and BEFORE reap completes;
+            # a concurrent hud_level holding the stale proc reference MUST see _stdin_poisoned and refuse to write!
+            reap_hook_hit = threading.Event()
+            lvl_attempted = threading.Event()
+            orig_reap = bridge._reap_owned_shim
+
+            def _hooked_reap(p: Any) -> None:
+                reap_hook_hit.set()
+                lvl_attempted.wait(timeout=2.0)
+                orig_reap(p)
+
+            bridge._reap_owned_shim = _hooked_reap  # type: ignore[method-assign]
+
+            stale_sent: list[bool] = []
+            pre_drained: list[bytes] = []
+
+            def _stale_writer() -> None:
+                reap_hook_hit.wait(timeout=2.0)
+                # Drain kernel pipe space BEFORE the stale writer attempts to write so the pipe
+                # IS writable again; rejection MUST come from _stdin_poisoned rather than a full pipe.
+                try:
+                    pre_drained.append(os.read(r_fd, 16384))
+                except BlockingIOError:
+                    pass
+                stale_sent.append(
+                    bridge._send_shim_fire_and_forget_to_proc(
+                        proc,  # type: ignore[arg-type]
+                        {"cmd": "hud_level", "level": 0.9},
+                        drop_if_busy=True,
+                    )
+                )
+                lvl_attempted.set()
+
+            stale_th = threading.Thread(target=_stale_writer, daemon=True)
+            stale_th.start()
+            with self.assertRaises(TimeoutError):
+                bridge._shim_rpc({"cmd": "paste", "text": "Z" * 131072}, timeout_sec=0.04, allow_retry=False)
+            stale_th.join(timeout=2.0)
+            self.assertEqual(stale_sent, [False])
+            self.assertGreater(
+                sum(len(c) for c in pre_drained),
+                0,
+                "pipe must have writable space before stale writer runs",
+            )
+            self.assertTrue(getattr(proc, "_stdin_poisoned", False))
+            self.assertIsNone(bridge._shim)
+            self.assertEqual(respawn_calls[0], 1, "poisoned current shim must schedule respawn")
+
+            # Drain remaining kernel pipe bytes and confirm hud_level was NEVER appended after partial JSON prefix.
+            chunks: list[bytes] = list(pre_drained)
+            while True:
+                try:
+                    data = os.read(r_fd, 65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+                except BlockingIOError:
+                    break
+            tail = b"".join(chunks)[total_filled - 8192 :]
+            self.assertGreater(len(tail), 0, "expected partial JSON prefix written before timeout")
+            self.assertNotIn(b"hud_level", tail)
+        finally:
+            if w_file is not None:
+                try:
+                    w_file.close()
+                except Exception:
+                    pass
+            if w_fd >= 0:
+                os.close(w_fd)
+            os.close(r_fd)
+
+    def test_r2_p0_2_macos_close_never_allows_ffmpeg_popen_after_close_returns(self) -> None:
+        """P0-2: Guarded FfmpegWavRecorder.start prevents Popen after MacOSPlatform.close() returns."""
+        from agent_voice_input.platform_common import FfmpegWavRecorder
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            build_entered = threading.Event()
+            release_build = threading.Event()
+            popen_called = [0]
+
+            rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [sys.executable, "-c", "import time; time.sleep(5)"]
+            )
+            orig_build = rec._build_cmd
+
+            def _paused_build(fmt: str, src: str) -> list[str]:
+                cmd = orig_build(fmt, src)
+                build_entered.set()
+                release_build.wait(timeout=3.0)
+                return cmd
+
+            rec._build_cmd = _paused_build  # type: ignore[method-assign]
+            plat = MacOSPlatform(
+                Config(),
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache",
+                self_check_fn=lambda: {
+                    "hal_ok": True,
+                    "has_input": True,
+                    "default_uid": "mic-1",
+                    "default_name": "Built-in Mic",
+                    "alive_uids": ["mic-1"],
+                    "mic_auth": "authorized",
+                },
+            )
+            plat._ff_rec = rec
+            errs: list[BaseException] = []
+            orig_popen = subprocess.Popen
+
+            def _counting_popen(*args: Any, **kwargs: Any) -> Any:
+                popen_called[0] += 1
+                return orig_popen(*args, **kwargs)
+
+            def _run_start() -> None:
+                try:
+                    plat.start_recording(rt, seq_id=1)
+                except BaseException as exc:
+                    errs.append(exc)
+
+            with mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_counting_popen):
+                th = threading.Thread(target=_run_start, daemon=True)
+                th.start()
+                try:
+                    self.assertTrue(build_entered.wait(timeout=2.0))
+                    # close() returns while start_recording is parked right before Popen!
+                    plat.close()
+                    self.assertTrue(plat._closed)
+                    self.assertIsNone(plat._cur_session)
+                    release_build.set()
+                    th.join(timeout=2.0)
+                    self.assertFalse(th.is_alive())
+                    self.assertEqual(errs, [])
+                    self.assertEqual(popen_called[0], 0, "Popen must NOT run after close() returned")
+                    self.assertIsNone(rec._proc)
+                    self.assertFalse(plat._rec_active)
+                    self.assertIsNone(plat._cur_session)
+                finally:
+                    release_build.set()
+                    th.join(timeout=1.0)
+                    plat.close()
+
+    def test_r2_p0_3_agy_worker_readers_close_pipes_after_stop_join_timeout(self) -> None:
+        """P0-3: _AgyWorker stdout/stderr readers close streams in finally even if they exit after stop() join timeout."""
+        from agent_voice_input.refiner import _AgyWorker
+
+        in_r, in_w = os.pipe()
+        out_r, out_w = os.pipe()
+        err_r, err_w = os.pipe()
+        stdin_f = os.fdopen(in_w, "w", encoding="utf-8", buffering=1)
+        stdout_f = os.fdopen(out_r, "r", encoding="utf-8", buffering=1)
+        stderr_f = os.fdopen(err_r, "r", encoding="utf-8", buffering=1)
+        os.close(in_r)
+
+        class _FakeDeadProc:
+            def __init__(self) -> None:
+                self.pid = 999999
+                self.stdin = stdin_f
+                self.stdout = stdout_f
+                self.stderr = stderr_f
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                return 0
+
+        proc = _FakeDeadProc()
+        stopped_cb_seen: list[Any] = []
+        worker = _AgyWorker(
+            agy_bin="agy",
+            workdir=Path("."),
+            proc=proc,  # type: ignore[arg-type]
+            on_stopped=lambda p: stopped_cb_seen.append(p),
+        )
+        try:
+            # Keep out_w/err_w open so reader threads outlive stop()'s join timeout.
+            with mock.patch("agent_voice_input.refiner._agy_stop_process_group", lambda _p, fast=False: None):
+                worker.stop(fast=True)
+            self.assertEqual(len(stopped_cb_seen), 1)
+            self.assertTrue(stdin_f.closed)
+            self.assertTrue(worker.t_out.is_alive())
+            self.assertTrue(worker.t_err.is_alive())
+            # Release writer ends after stop() returned -> readers exit and close their own streams!
+            os.close(out_w)
+            out_w = -1
+            os.close(err_w)
+            err_w = -1
+            worker.t_out.join(timeout=2.0)
+            worker.t_err.join(timeout=2.0)
+            self.assertFalse(worker.t_out.is_alive())
+            self.assertFalse(worker.t_err.is_alive())
+            self.assertTrue(stdout_f.closed, "stdout must be closed by reader finally after late exit")
+            self.assertTrue(stderr_f.closed, "stderr must be closed by reader finally after late exit")
+        finally:
+            if out_w >= 0:
+                os.close(out_w)
+            if err_w >= 0:
+                os.close(err_w)
+            worker.t_out.join(timeout=1.0)
+            worker.t_err.join(timeout=1.0)
+            for fh in (stdin_f, stdout_f, stderr_f):
+                if not fh.closed:
+                    fh.close()
+
+    def test_r2_p1_1_unified_raw_fd_write_never_buffers_or_reorders_cleanup_vs_rpc(self) -> None:
+        """P1-1: Fire-and-forget cleanup uses raw fd (never Python TextIOWrapper buffer) so RPC never overtakes it."""
+        class _OrderBridge(JsonlShimMixin):
+            _shim_graceful = False
+            _shim_label = "order_test"
+
+            def __init__(self) -> None:
+                self.cfg = Config()
+                self.env = {}
+                self._init_shim_bridge()
+
+            def _build_shim_cmd(self) -> list[str] | None:
+                return None
+
+        r_fd, w_fd = os.pipe()
+        w_file = None
+        try:
+            os.set_blocking(w_fd, False)
+            os.set_blocking(r_fd, False)
+            filled = 0
+            while True:
+                try:
+                    filled += os.write(w_fd, b"F" * 4096)
+                except BlockingIOError:
+                    break
+            os.set_blocking(w_fd, True)
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+            w_fd = -1
+
+            class _PipeProc:
+                def __init__(self, stdin_obj: Any) -> None:
+                    self.stdin = stdin_obj
+                    self.stdout = None
+                    self.stderr = None
+
+                def poll(self) -> int | None:
+                    return None
+
+                def kill(self) -> None:
+                    pass
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            bridge = _OrderBridge()
+            proc = _PipeProc(w_file)
+            bridge._shim = proc  # type: ignore[assignment]
+            bridge._spawned_shim = proc  # type: ignore[assignment]
+            bridge._spawned_ready = True
+            bridge._ready.set()
+            bridge._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
+
+            # 1) On a full pipe, cleanup command times out cleanly without leaving anything in Python buffer.
+            sent = bridge._send_shim_fire_and_forget(
+                {"cmd": "rec_stop", "rec_gen": 1, "discard": True},
+                timeout_sec=0.02,
+            )
+            self.assertFalse(sent)
+
+            # Drain filler bytes completely.
+            drained = 0
+            while drained < filled:
+                drained += len(os.read(r_fd, 65536))
+
+            # 2) Subsequent cleanup + RPC arrive in strict FIFO order on the pipe.
+            self.assertTrue(
+                bridge._send_shim_fire_and_forget({"cmd": "rec_release", "rec_gen": 1}, timeout_sec=0.1)
+            )
+            # Send an RPC line (will time out waiting for reply since no reader replies, which is expected).
+            with self.assertRaises(queue.Empty):
+                bridge._shim_rpc({"cmd": "rec_start", "rec_gen": 2}, timeout_sec=0.02, allow_retry=False)
+
+            raw_out = os.read(r_fd, 65536).decode("utf-8")
+            cmds = [json.loads(ln)["cmd"] for ln in raw_out.splitlines() if ln.strip()]
+            self.assertEqual(cmds, ["rec_release", "rec_start"])
+        finally:
+            if w_file is not None:
+                try:
+                    w_file.close()
+                except Exception:
+                    pass
+            if w_fd >= 0:
+                os.close(w_fd)
+            os.close(r_fd)
+
+    def test_r2_p1_2_control_cancel_stays_in_same_fifo_behind_rec_stop(self) -> None:
+        """P1-2: control.sock cancel queued behind slow rec_start -> rec_stop never overtakes rec_stop."""
+        from agent_voice_input.daemon import send_control_command
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            empty_proc = Path(td) / "empty_proc"
+            empty_proc.mkdir(parents=True, exist_ok=True)
+            cfg = Config(
+                asr=AsrConfig(provider="dashscope"),
+                refiner=RefinerConfig(provider="off", include_git_status=False),
+                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
+            )
+            start_entered = threading.Event()
+            release_start = threading.Event()
+            asr_entered = threading.Event()
+            release_asr = threading.Event()
+
+            class _SlowStartPlat(_TorturePlatform):
+                def start_recording(
+                    self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None
+                ) -> None:
+                    start_entered.set()
+                    release_start.wait(timeout=3.0)
+                    super().start_recording(runtime_dir, loopback=loopback, seq_id=seq_id)
+
+            class _HeldAsr(BaseAsrProvider):
+                provider_name = "dashscope"
+
+                def __init__(self) -> None:
+                    pass
+
+                def transcribe(
+                    self,
+                    wav_bytes: bytes,
+                    context: AsrContext | None = None,
+                    *,
+                    is_cancelled: Callable[[], bool] | None = None,
+                    cancel_token: CancelToken | None = None,
+                ) -> AsrResult:
+                    del wav_bytes, context
+                    ev = threading.Event()
+                    if cancel_token is not None:
+                        cancel_token.bind_event(ev)
+                    try:
+                        asr_entered.set()
+                        dl = time.monotonic() + 2.0
+                        while time.monotonic() < dl and not release_asr.is_set() and not ev.is_set():
+                            ev.wait(timeout=0.01)
+                        if (cancel_token is not None and cancel_token.is_cancelled()) or (
+                            is_cancelled is not None and is_cancelled()
+                        ):
+                            raise HttpTransportError("cancelled", retry_kind="never")
+                        return AsrResult(text="hello", provider="dashscope", model="qwen", latency_ms=2)
+                    finally:
+                        if cancel_token is not None:
+                            cancel_token.unbind_event(ev)
+
+            plat = _SlowStartPlat(self.speech_wav)
+            tracker = SessionTracker(env={"HOME": td}, runtime_dir=rt, proc_root=empty_proc)
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td, "DASHSCOPE_API_KEY": "sk-test-q"},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_HeldAsr(),
+                tracker=tracker,
+                paste_settle_sec=0.0,
+            )
+            srv_th = threading.Thread(target=daemon.serve_forever, daemon=True)
+            srv_th.start()
+            try:
+                dl = time.monotonic() + 3.0
+                while time.monotonic() < dl and not daemon.sock_path.exists():
+                    time.sleep(0.01)
+                res_start: list[dict[str, Any]] = []
+                res_stop: list[dict[str, Any]] = []
+                res_cancel: list[dict[str, Any]] = []
+
+                t1 = threading.Thread(
+                    target=lambda: res_start.append(send_control_command(rt, {"cmd": "rec_start"}, timeout_sec=5.0)),
+                    daemon=True,
+                )
+                t1.start()
+                self.assertTrue(start_entered.wait(timeout=2.0))
+
+                # Enqueue rec_stop first, then cancel behind it while rec_start is still executing!
+                t2 = threading.Thread(
+                    target=lambda: res_stop.append(send_control_command(rt, {"cmd": "rec_stop"}, timeout_sec=5.0)),
+                    daemon=True,
+                )
+                t2.start()
+                dl_q1 = time.monotonic() + 2.0
+                while time.monotonic() < dl_q1:
+                    with daemon._ctrl_trigger_cv:
+                        if len(daemon._ctrl_trigger_q) >= 1:
+                            break
+                    time.sleep(0.005)
+                t3 = threading.Thread(
+                    target=lambda: res_cancel.append(send_control_command(rt, {"cmd": "cancel"}, timeout_sec=5.0)),
+                    daemon=True,
+                )
+                t3.start()
+                dl_q2 = time.monotonic() + 2.0
+                while time.monotonic() < dl_q2:
+                    with daemon._ctrl_trigger_cv:
+                        if len(daemon._ctrl_trigger_q) >= 2:
+                            break
+                    time.sleep(0.005)
+
+                release_start.set()
+                for t in (t1, t2, t3):
+                    t.join(timeout=3.0)
+                self.assertTrue(res_start[0]["ok"])
+                self.assertTrue(res_stop[0]["ok"])
+                self.assertEqual(res_stop[0]["state"], "recognizing")
+                self.assertTrue(res_cancel[0]["ok"])
+                self.assertNotIn(
+                    "cancelled_recording",
+                    res_cancel[0],
+                    f"cancel must not overtake rec_stop and drop active capture: {res_cancel[0]}",
+                )
+                self.assertIn(res_stop[0]["seq_id"], res_cancel[0].get("cancelled_ids") or [])
+            finally:
+                release_start.set()
+                release_asr.set()
+                daemon.close()
+                srv_th.join(timeout=2.0)
+                tracker.close()
+
+    def test_r2_p1_3_shutdown_during_slow_rec_stop_and_rec_start_rejects_enqueue_and_reports_stopping(self) -> None:
+        """P1-3: Shutdown racing with slow rec_stop or rec_start never enqueues into stopped pipeline or reports ok=True."""
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            empty_proc = Path(td) / "empty_proc"
+            empty_proc.mkdir(parents=True, exist_ok=True)
+            cfg = Config(
+                asr=AsrConfig(provider="dashscope"),
+                refiner=RefinerConfig(provider="off", include_git_status=False),
+                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
+            )
+            stop_entered = threading.Event()
+            release_stop = threading.Event()
+
+            class _SlowStopPlat(_TorturePlatform):
+                def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
+                    stop_entered.set()
+                    release_stop.wait(timeout=3.0)
+                    return super().stop_recording(drain=drain)
+
+            plat1 = _SlowStopPlat(self.speech_wav)
+            tracker = SessionTracker(env={"HOME": td}, runtime_dir=rt, proc_root=empty_proc)
+            d1 = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td, "DASHSCOPE_API_KEY": "sk-test-q"},
+                runtime_dir=rt,
+                platform=plat1,
+                asr_provider=_TaggingAsrProvider(),
+                tracker=tracker,
+                paste_settle_sec=0.0,
+            )
+            win = ForegroundWindow(hwnd=101, process="WindowsTerminal.exe", title="codex")
+            try:
+                self.assertTrue(d1.handle_trigger("ptt_start", win)["ok"])
+                stop_out: list[dict[str, Any]] = []
+                t_stop = threading.Thread(
+                    target=lambda: stop_out.append(d1.handle_trigger("ptt_stop", win)),
+                    daemon=True,
+                )
+                t_stop.start()
+                self.assertTrue(stop_entered.wait(timeout=2.0))
+                self.assertTrue(d1.handle_control({"cmd": "shutdown"})["ok"])
+                release_stop.set()
+                t_stop.join(timeout=2.0)
+                self.assertEqual(len(stop_out), 1)
+                self.assertFalse(stop_out[0]["ok"])
+                self.assertEqual(stop_out[0].get("ignored"), "stopping")
+                with d1._lock:
+                    self.assertEqual(len(d1._utterance_queue), 0)
+            finally:
+                release_stop.set()
+                d1.close()
+
+            # Slow rec_start racing with shutdown
+            start_entered = threading.Event()
+            release_start = threading.Event()
+
+            class _SlowStartPlat2(_TorturePlatform):
+                def start_recording(
+                    self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None
+                ) -> None:
+                    start_entered.set()
+                    release_start.wait(timeout=3.0)
+                    super().start_recording(runtime_dir, loopback=loopback, seq_id=seq_id)
+
+            plat2 = _SlowStartPlat2(self.speech_wav)
+            d2 = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td, "DASHSCOPE_API_KEY": "sk-test-q"},
+                runtime_dir=Path(td) / "rt2",
+                platform=plat2,
+                asr_provider=_TaggingAsrProvider(),
+                tracker=tracker,
+                paste_settle_sec=0.0,
+            )
+            try:
+                start_out: list[dict[str, Any]] = []
+                t_start = threading.Thread(
+                    target=lambda: start_out.append(d2.handle_trigger("ptt_start", win)),
+                    daemon=True,
+                )
+                t_start.start()
+                self.assertTrue(start_entered.wait(timeout=2.0))
+                self.assertTrue(d2.handle_control({"cmd": "shutdown"})["ok"])
+                release_start.set()
+                t_start.join(timeout=2.0)
+                self.assertEqual(len(start_out), 1)
+                self.assertFalse(start_out[0]["ok"])
+                self.assertEqual(start_out[0].get("ignored"), "stopping")
+                self.assertFalse(d2._recording_active)
+            finally:
+                release_start.set()
+                d2.close()
+                tracker.close()
+
+    def test_r2_p1_4_mic_disconnect_then_immediate_stop_preserves_disconnect_reason_once(self) -> None:
+        """P1-4: Immediate user ptt_stop during async disconnect cleanup preserves disconnect error & runs once."""
+        from agent_voice_input.platform_macos import MacOSPlatform, _MacRecSession
+
+        stop_entered = threading.Event()
+        release_stop = threading.Event()
+        lost_cb_count = [0]
+
+        class _SlowDisconnectRec:
+            def __init__(self, wav: bytes) -> None:
+                self._wav = wav
+                self.current_level = 0.0
+                self.stop_calls = 0
+
+            def start(self, *args: Any, **kwargs: Any) -> None:
+                del args, kwargs
+
+            def stop(self, *, drain_sec: float = 0.0) -> bytes:
+                del drain_sec
+                self.stop_calls += 1
+                if self.stop_calls == 1:
+                    stop_entered.set()
+                    release_stop.wait(timeout=3.0)
+                    return self._wav
+                return b""
+
+            def diagnostic_summary(self) -> str:
+                return "ok"
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            empty_proc = Path(td) / "empty_proc"
+            empty_proc.mkdir(parents=True, exist_ok=True)
+            cfg = Config(
+                asr=AsrConfig(provider="dashscope"),
+                refiner=RefinerConfig(provider="off", include_git_status=False),
+                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
+            )
+            plat = MacOSPlatform(
+                cfg,
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache",
+                self_check_fn=lambda: {
+                    "hal_ok": True,
+                    "has_input": True,
+                    "default_uid": "bt-mic",
+                    "default_name": "BT Mic",
+                    "alive_uids": ["bt-mic"],
+                    "mic_auth": "authorized",
+                },
+            )
+            fake_rec = _SlowDisconnectRec(self.speech_wav)
+            plat._ff_rec = fake_rec  # type: ignore[assignment]
+            plat.deliver_text = lambda text, seq_id, target_hwnd=0, **kw: (  # type: ignore[method-assign]
+                kw["before_commit"]() if kw.get("before_commit") else True,
+                PasteOutcome(True, False, "pasted", "Ghostty"),
+            )[1]
+            tracker = SessionTracker(env={"HOME": td}, runtime_dir=rt, proc_root=empty_proc)
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td, "DASHSCOPE_API_KEY": "sk-test-q"},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_TaggingAsrProvider(),
+                tracker=tracker,
+                paste_settle_sec=0.0,
+            )
+            orig_lost = daemon._on_recorder_lost
+
+            def _counting_lost(*, seq_id: int | None = None) -> None:
+                lost_cb_count[0] += 1
+                orig_lost(seq_id=seq_id)
+
+            plat.set_recorder_lost_callback(_counting_lost)
+            win = ForegroundWindow(hwnd=10, process="Ghostty", title="codex")
+            # Pin foreground window resolution so macOS tests never spawn real osascript.
+            plat.resolve_foreground_window = lambda w=None: w or win  # type: ignore[method-assign]
+            plat.active_window = lambda: win  # type: ignore[method-assign]
+            plat._run_osascript = (  # type: ignore[method-assign]
+                lambda *a, **kw: (_ for _ in ()).throw(AssertionError("unexpected real osascript call"))
+            )
+            stop_waiting_busy = threading.Event()
+            orig_wait_idle = plat._wait_session_idle_locked
+
+            def _wrapped_wait_idle(session: Any, timeout_sec: float) -> bool:
+                stop_waiting_busy.set()
+                return orig_wait_idle(session, timeout_sec)
+
+            plat._wait_session_idle_locked = _wrapped_wait_idle  # type: ignore[method-assign]
+            try:
+                self.assertTrue(daemon.handle_trigger("ptt_start", win)["ok"])
+                # CoreAudio disconnects while recording is active
+                plat._on_shim_internal_event(
+                    {
+                        "event": "audio_devices_changed",
+                        "hal_ok": True,
+                        "has_input": False,
+                        "alive_uids": [],
+                    }
+                )
+                self.assertTrue(stop_entered.wait(timeout=2.0))
+
+                # User releases PTT immediately while async disconnect cleanup is inside rec.stop()
+                stop_box: list[dict[str, Any]] = []
+                t_stop = threading.Thread(
+                    target=lambda: stop_box.append(daemon.handle_trigger("ptt_stop", win)),
+                    daemon=True,
+                )
+                t_stop.start()
+                self.assertTrue(
+                    stop_waiting_busy.wait(timeout=2.0),
+                    "ptt_stop must take over the session before releasing disconnect cleanup",
+                )
+                release_stop.set()
+                t_stop.join(timeout=2.0)
+
+                self.assertEqual(len(stop_box), 1)
+                self.assertTrue(stop_box[0]["ok"])
+                self.assertEqual(plat.last_audio_error, "coreaudio_device_disconnected")
+                self.assertEqual(lost_cb_count[0], 0, "disconnect callback must not double-finalize")
+
+                dl = time.monotonic() + 2.0
+                while time.monotonic() < dl and daemon.state != "idle":
+                    time.sleep(0.01)
+                lr = daemon.last_result
+                self.assertTrue(lr.get("capture_interrupted"))
+                self.assertEqual(lr.get("audio_error"), "coreaudio_device_disconnected")
+            finally:
+                release_stop.set()
+                daemon.close()
+                tracker.close()
+
+    def test_r2_p2_hud_full_queue_preserves_copied_toast_and_hide_clear(self) -> None:
+        """P2-1: Full HUD queue evicts intermediate stage updates before critical result toasts (copied) & hide."""
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            empty_proc = Path(td) / "empty_proc"
+            empty_proc.mkdir(parents=True, exist_ok=True)
+            cfg = Config(
+                asr=AsrConfig(provider="dashscope"),
+                refiner=RefinerConfig(provider="off", include_git_status=False),
+                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
+            )
+            first_hud_entered = threading.Event()
+            release_hud = threading.Event()
+            seen_states: list[str] = []
+            hide_seen = threading.Event()
+
+            class _BlockingHudPlat(_TorturePlatform):
+                def hud(
+                    self,
+                    state: str,
+                    text: str = "",
+                    duration_ms: int = 0,
+                    *,
+                    layer: str | None = None,
+                    clear_main: bool | None = None,
+                    clear_toast: bool | None = None,
+                    bg_count: int = 0,
+                ) -> None:
+                    if not first_hud_entered.is_set():
+                        first_hud_entered.set()
+                        release_hud.wait(timeout=3.0)
+                    seen_states.append(state)
+                    if state == "hide":
+                        hide_seen.set()
+                    super().hud(
+                        state,
+                        text=text,
+                        duration_ms=duration_ms,
+                        layer=layer,
+                        clear_main=clear_main,
+                        clear_toast=clear_toast,
+                        bg_count=bg_count,
+                    )
+
+            plat = _BlockingHudPlat(self.speech_wav)
+            tracker = SessionTracker(env={"HOME": td}, runtime_dir=rt, proc_root=empty_proc)
+            daemon = VoiceInputDaemon(
+                cfg,
+                env={"HOME": td, "DASHSCOPE_API_KEY": "sk-test-q"},
+                runtime_dir=rt,
+                platform=plat,
+                asr_provider=_TaggingAsrProvider(),
+                tracker=tracker,
+                paste_settle_sec=0.0,
+            )
+            daemon._hud_wait_timeout_sec = 0.001
+            try:
+                # 1st batch blocks the HUD worker
+                daemon._hud("recording")
+                self.assertTrue(first_hud_entered.wait(timeout=1.0))
+                # Enqueue critical result toast 'copied', then flood >64 intermediate stage updates, then 'hide'
+                daemon._hud("copied", layer="toast", clear_main=False)
+                for idx in range(70):
+                    daemon._hud("recognizing" if idx % 2 == 0 else "refining")
+                daemon._hud("hide")
+                release_hud.set()
+                self.assertTrue(hide_seen.wait(timeout=2.0))
+                self.assertIn("copied", seen_states, "copied toast must not be evicted by stage updates")
+                self.assertIn("hide", seen_states, "hide clear must be preserved")
+            finally:
+                release_hud.set()
+                daemon.close()
+                tracker.close()
+
+    def test_r3_p1_1_wsl_start_timeout_discard_write_failure_reaps_wedged_shim(self) -> None:
+        """R2 P1-1: WSL rec_start timeout whose discard rec_stop cannot be written must reap the wedged shim."""
+        import io
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            cfg = Config()
+            cfg.audio.wsl_source = "wasapi"
+            plat = WslPlatform(cfg, env={"PATH": "/usr/bin"})
+            respawn_calls = [0]
+
+            class _FakeWedgedProc:
+                def __init__(self) -> None:
+                    self.stdin = io.StringIO()
+                    self.stdout = None
+                    self.killed = False
+
+                def poll(self) -> int | None:
+                    return 1 if self.killed else None
+
+                def kill(self) -> None:
+                    self.killed = True
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 1
+
+            proc = _FakeWedgedProc()
+            plat._shim = proc  # type: ignore[assignment]
+            plat._spawned_shim = proc  # type: ignore[assignment]
+            plat._spawned_ready = True
+            plat._on_event = lambda _e: None
+            plat._ready.set()
+            plat._schedule_respawn_if_needed = (  # type: ignore[method-assign]
+                lambda: respawn_calls.__setitem__(0, respawn_calls[0] + 1)
+            )
+
+            lock_acquired = threading.Event()
+            release_lock = threading.Event()
+
+            def _hold_stdin_lock() -> None:
+                with plat._stdin_lock:
+                    lock_acquired.set()
+                    release_lock.wait(timeout=3.0)
+
+            orig_reap = plat._reap_owned_shim
+
+            def _reap_and_release(p: Any) -> None:
+                release_lock.set()
+                orig_reap(p)
+
+            plat._reap_owned_shim = _reap_and_release  # type: ignore[method-assign]
+
+            holder_th = threading.Thread(target=_hold_stdin_lock, daemon=True)
+
+            def _timeout_rpc(
+                payload: dict[str, Any],
+                timeout_sec: float = 5.0,
+                *,
+                allow_retry: bool = True,
+                before_write: Any = None,
+            ) -> dict[str, Any] | None:
+                del payload, timeout_sec, allow_retry
+                if before_write is not None:
+                    before_write()
+                # Wedge _stdin_lock right after rec_start was dispatched so the subsequent
+                # rec_stop(discard=True) cleanup exceeds its 0.25s write deadline and returns False.
+                holder_th.start()
+                self.assertTrue(lock_acquired.wait(timeout=2.0))
+                raise queue.Empty()
+
+            plat._shim_rpc = _timeout_rpc  # type: ignore[method-assign]
+            try:
+                with self.assertRaises(queue.Empty):
+                    plat.start_recording(rt)
+                holder_th.join(timeout=2.0)
+                self.assertTrue(getattr(proc, "_stdin_poisoned", False))
+                self.assertTrue(proc.killed, "wedged shim must be killed so host cannot keep recording")
+                self.assertIsNone(plat._shim)
+                self.assertEqual(respawn_calls[0], 1, "reaping wedged current shim must schedule respawn")
+            finally:
+                release_lock.set()
+                plat.close()
+
+    def test_r3_p1_2_macos_handoff_rejects_spawn_when_selected_uid_disconnects(self) -> None:
+        """R2 P1-2: MacOSPlatform handoff before Popen must reject start if selected mic UID disconnected."""
+        from agent_voice_input.platform_common import (
+            FfmpegWavRecorder,
+            MicrophoneUnavailableError,
+            NoMicrophoneError,
+        )
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            cfg = Config(
+                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
+            )
+
+            for label, disconnect_event, expected_exc in (
+                (
+                    "selected_uid_vanished_other_mic_left",
+                    {
+                        "event": "audio_devices_changed",
+                        "hal_ok": True,
+                        "has_input": True,
+                        "default_uid": "builtin-mic",
+                        "alive_uids": ["builtin-mic"],
+                    },
+                    MicrophoneUnavailableError,
+                ),
+                (
+                    "all_mics_disconnected",
+                    {
+                        "event": "audio_devices_changed",
+                        "hal_ok": True,
+                        "has_input": False,
+                        "default_uid": "",
+                        "alive_uids": [],
+                    },
+                    NoMicrophoneError,
+                ),
+            ):
+                with self.subTest(case=label):
+                    build_entered = threading.Event()
+                    release_build = threading.Event()
+                    popen_called = [0]
+
+                    rec = FfmpegWavRecorder(
+                        cmd_factory=lambda _f, _s: [sys.executable, "-c", "import time; time.sleep(5)"]
+                    )
+                    orig_build = rec._build_cmd
+
+                    def _paused_build(fmt: str, src: str) -> list[str]:
+                        cmd = orig_build(fmt, src)
+                        build_entered.set()
+                        release_build.wait(timeout=3.0)
+                        return cmd
+
+                    rec._build_cmd = _paused_build  # type: ignore[method-assign]
+                    plat = MacOSPlatform(
+                        cfg,
+                        env={"HOME": td},
+                        cache_dir=Path(td) / f"cache-{label}",
+                        self_check_fn=lambda: {
+                            "hal_ok": True,
+                            "has_input": True,
+                            "default_uid": "bt-mic",
+                            "default_name": "BT Mic",
+                            "alive_uids": ["bt-mic", "builtin-mic"],
+                            "mic_auth": "authorized",
+                        },
+                    )
+                    plat._ff_rec = rec
+                    exc_box: list[BaseException] = []
+
+                    def _run_start() -> None:
+                        try:
+                            plat.start_recording(rt)
+                        except BaseException as exc:
+                            exc_box.append(exc)
+
+                    def _counting_popen(*args: Any, **kwargs: Any) -> Any:
+                        popen_called[0] += 1
+                        raise AssertionError(f"Popen must not be called after {label}: {args} {kwargs}")
+
+                    try:
+                        with mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_counting_popen):
+                            th = threading.Thread(target=_run_start, daemon=True)
+                            th.start()
+                            self.assertTrue(build_entered.wait(timeout=2.0))
+                            plat._on_shim_internal_event(disconnect_event)
+                            release_build.set()
+                            th.join(timeout=2.0)
+                        self.assertEqual(popen_called[0], 0, "FFmpeg Popen must be rejected at handoff")
+                        self.assertEqual(len(exc_box), 1)
+                        self.assertIsInstance(exc_box[0], expected_exc)
+                        self.assertEqual(plat.last_audio_error, "coreaudio_device_disconnected")
+                        self.assertFalse(plat._rec_active)
+                        self.assertIsNone(plat._cur_session)
+                    finally:
+                        release_build.set()
+                        plat.close()
+
+    def test_r4_1_wsl_rec_start_lock_timeout_unwritten_does_not_kill_healthy_shim(self) -> None:
+        """R3-1: WSL rec_start timing out on _stdin_lock (0 bytes written) must NOT send discard or kill shim."""
+        import io
+        from agent_voice_input.platform_common import _ShimWriteTimeout
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            cfg = Config()
+            cfg.audio.wsl_source = "wasapi"
+            plat = WslPlatform(cfg, env={"PATH": "/usr/bin"})
+
+            class _HealthyPasteProc:
+                def __init__(self) -> None:
+                    self.stdin = io.StringIO()
+                    self.stdout = None
+                    self.killed = False
+
+                def poll(self) -> int | None:
+                    return 1 if self.killed else None
+
+                def kill(self) -> None:
+                    self.killed = True
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            proc = _HealthyPasteProc()
+            plat._shim = proc  # type: ignore[assignment]
+            plat._spawned_shim = proc  # type: ignore[assignment]
+            plat._spawned_ready = True
+            plat._on_event = lambda _e: None
+            plat._ready.set()
+            plat._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
+
+            lock_acquired = threading.Event()
+            release_lock = threading.Event()
+
+            def _long_paste_holder() -> None:
+                with plat._stdin_lock:
+                    lock_acquired.set()
+                    release_lock.wait(timeout=3.0)
+
+            orig_rpc = plat._shim_rpc
+
+            def _short_timeout_rpc(
+                payload: dict[str, Any],
+                timeout_sec: float = 5.0,
+                *,
+                allow_retry: bool = True,
+                before_write: Any = None,
+            ) -> dict[str, Any] | None:
+                return orig_rpc(
+                    payload,
+                    timeout_sec=0.04,
+                    allow_retry=allow_retry,
+                    before_write=before_write,
+                )
+
+            plat._shim_rpc = _short_timeout_rpc  # type: ignore[method-assign]
+            reap_calls = [0]
+            orig_detach = plat._detach_and_reap_poisoned_shim
+
+            def _counting_detach(p: Any) -> None:
+                reap_calls[0] += 1
+                orig_detach(p)
+
+            plat._detach_and_reap_poisoned_shim = _counting_detach  # type: ignore[method-assign]
+            holder_th = threading.Thread(target=_long_paste_holder, daemon=True)
+            holder_th.start()
+            self.assertTrue(lock_acquired.wait(timeout=2.0))
+            try:
+                with self.assertRaises(_ShimWriteTimeout) as ctx:
+                    plat.start_recording(rt)
+                self.assertFalse(ctx.exception.partial)
+                self.assertFalse(ctx.exception.written)
+                self.assertEqual(reap_calls[0], 0, "unwritten rec_start must NOT reap shim serving concurrent paste")
+                self.assertFalse(proc.killed, "healthy shim must remain alive")
+                self.assertFalse(getattr(proc, "_stdin_poisoned", False))
+                self.assertIs(plat._shim, proc)
+                self.assertEqual(proc.stdin.getvalue(), "", "no discard rec_stop should be written when 0 bytes sent")
+            finally:
+                release_lock.set()
+                holder_th.join(timeout=2.0)
+                plat.close()
+
+    def test_r4_2_macos_stale_probe_cannot_clobber_newer_disconnect_event_cache(self) -> None:
+        """R3-2: Stale macOS audio probe returning after a newer disconnect event must not clobber cache or spawn."""
+        from agent_voice_input.platform_common import FfmpegWavRecorder, MicrophoneUnavailableError
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            cfg = Config(
+                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
+            )
+            probe_entered = threading.Event()
+            release_probe = threading.Event()
+            popen_called = [0]
+
+            def _slow_stale_probe() -> dict[str, Any]:
+                probe_entered.set()
+                release_probe.wait(timeout=3.0)
+                # Stale snapshot taken BEFORE bt-mic disconnected
+                return {
+                    "hal_ok": True,
+                    "has_input": True,
+                    "default_uid": "bt-mic",
+                    "default_name": "BT Mic",
+                    "alive_uids": ["bt-mic", "builtin-mic"],
+                    "mic_auth": "authorized",
+                }
+
+            plat = MacOSPlatform(
+                cfg,
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache",
+                self_check_fn=_slow_stale_probe,
+            )
+            plat._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [sys.executable, "-c", "import time; time.sleep(5)"]
+            )
+            exc_box: list[BaseException] = []
+
+            def _run_start() -> None:
+                try:
+                    plat.start_recording(rt)
+                except BaseException as exc:
+                    exc_box.append(exc)
+
+            def _counting_popen(*args: Any, **kwargs: Any) -> Any:
+                popen_called[0] += 1
+                raise AssertionError(f"Popen must not be called when newer cache removed bt-mic: {args} {kwargs}")
+
+            try:
+                with mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_counting_popen):
+                    th = threading.Thread(target=_run_start, daemon=True)
+                    th.start()
+                    self.assertTrue(probe_entered.wait(timeout=2.0))
+                    # Newer disconnect event arrives WHILE slow probe is still in flight
+                    plat._on_shim_internal_event(
+                        {
+                            "event": "audio_devices_changed",
+                            "hal_ok": True,
+                            "has_input": True,
+                            "default_uid": "builtin-mic",
+                            "alive_uids": ["builtin-mic"],
+                        }
+                    )
+                    ver_after_ev = plat._audio_event_ver
+                    release_probe.set()
+                    th.join(timeout=2.0)
+
+                # Cache MUST retain the newer disconnect state, NOT be clobbered by the stale probe!
+                with plat._audio_cache_lock:
+                    self.assertEqual(plat._audio_event_ver, ver_after_ev)
+                    self.assertEqual(plat._alive_input_uids, {"builtin-mic"})
+                    self.assertEqual(plat._default_input_uid, "builtin-mic")
+                self.assertEqual(popen_called[0], 0, "FFmpeg Popen must be rejected using uncorrupted newer cache")
+                self.assertEqual(len(exc_box), 1)
+                self.assertIsInstance(exc_box[0], MicrophoneUnavailableError)
+                self.assertEqual(plat.last_audio_error, "coreaudio_device_disconnected")
+                self.assertFalse(plat._rec_active)
+                self.assertIsNone(plat._cur_session)
+            finally:
+                release_probe.set()
+                plat.close()
 
 
 if __name__ == "__main__":
