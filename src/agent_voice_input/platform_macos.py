@@ -801,7 +801,6 @@ class MacOSPlatform(JsonlShimMixin):
         self._self_check_fn = self_check_fn
         self._fg_tls = threading.local()
         self._ff_rec = FfmpegWavRecorder()
-        self._recording = False
         self._recorder_lost_cb: Callable[..., Any] | None = None
         self._recorder_recovered_cb: Callable[..., Any] | None = None
         self._audio_cache_lock = threading.Lock()
@@ -817,9 +816,13 @@ class MacOSPlatform(JsonlShimMixin):
         self._has_graphic_session: bool | None = None
         self._is_remote_session: bool | None = None
         self._rec_cond = threading.Condition()
-        self._rec_active: bool = False
         self._rec_gen: int = 0
+        self._rec_audio_event_ver: int = 0
         self._cur_session: _MacRecSession | None = None
+        self._spawning_recs: dict[int, Any] = {}
+        self._stopping_recs: dict[int, Any] = {}
+        self._stop_rec_seq: int = 0
+        self._pending_stop_gen: int = 0
         self._rec_cleanup_threads: set[threading.Thread] = set()
         self._busy_wait_timeout_sec: float = 4.0
         self._paste_hold_timeout_sec: float | None = None
@@ -834,9 +837,41 @@ class MacOSPlatform(JsonlShimMixin):
             self._rec_cond.wait(timeout=min(0.05, rem))
         return not session.busy
 
-    def _detach_busy_recorder_locked(self, session: _MacRecSession) -> None:
-        if self._ff_rec is session.rec:
-            self._ff_rec = FfmpegWavRecorder(cmd_factory=getattr(session.rec, "_cmd_factory", None))
+    def _new_recorder(self) -> Any:
+        # Allocate a dedicated FfmpegWavRecorder per session/respawn so concurrent stop_recording()
+        # and start_recording() never share a live subprocess or audio buffer. Non-FfmpegWavRecorder
+        # test doubles assigned to self._ff_rec are preserved directly.
+        tmpl = self._ff_rec
+        if type(tmpl) is FfmpegWavRecorder:
+            return FfmpegWavRecorder(cmd_factory=tmpl._cmd_factory)
+        return tmpl
+
+    @staticmethod
+    def _abort_recorder(rec: Any) -> None:
+        abort_fn = getattr(rec, "abort", None)
+        if callable(abort_fn):
+            abort_fn()
+        else:
+            rec.stop(drain_sec=0.0)
+
+    def _register_stopping_locked(self, rec: Any) -> int:
+        self._stop_rec_seq += 1
+        tok = self._stop_rec_seq
+        self._stopping_recs[tok] = rec
+        return tok
+
+    def _finish_stopping(self, tok: int) -> None:
+        if tok <= 0:
+            return
+        with self._rec_cond:
+            self._stopping_recs.pop(tok, None)
+            self._rec_cond.notify_all()
+
+    @property
+    def is_recording(self) -> bool:
+        with self._rec_cond:
+            s = self._cur_session
+            return s is not None and s.active and not s.aborted
 
     @property
     def _active_recording_uid(self) -> str:
@@ -986,8 +1021,12 @@ class MacOSPlatform(JsonlShimMixin):
         if str(msg.get("event") or "") != "audio_devices_changed":
             return
         has_input, _default_uid, alive_uids = self._update_audio_status_cache(msg, from_event=True)
+        with self._audio_cache_lock:
+            ev_ver = self._audio_event_ver
         claimed_session: _MacRecSession | None = None
         with self._rec_cond:
+            if ev_ver > self._rec_audio_event_ver:
+                self._rec_audio_event_ver = ev_ver
             session = self._cur_session
             if (
                 session is not None
@@ -1001,18 +1040,23 @@ class MacOSPlatform(JsonlShimMixin):
                     return
                 session.active = False
                 session.force_lost_reason = "coreaudio_device_disconnected"
-                self._rec_active = False
-                self._recording = False
                 session.busy = True
                 claimed_session = session
+                disc_stop_tok = self._register_stopping_locked(session.rec)
         if claimed_session is None:
             return
 
-        def _finish_disconnected_session(s: _MacRecSession = claimed_session) -> None:
+        def _finish_disconnected_session(
+            s: _MacRecSession = claimed_session,
+            stop_tok: int = disc_stop_tok,
+        ) -> None:
             try:
                 try:
                     self._stop_level_streamer()
-                    seg_wav = s.rec.stop(drain_sec=0.0)
+                    try:
+                        seg_wav = s.rec.stop(drain_sec=0.0)
+                    finally:
+                        self._finish_stopping(stop_tok)
                     with self._rec_cond:
                         if not s.aborted and len(seg_wav) > 44:
                             s.pcm.extend(seg_wav[44:])
@@ -1047,6 +1091,7 @@ class MacOSPlatform(JsonlShimMixin):
         except Exception:
             with self._rec_cond:
                 self._rec_cleanup_threads.discard(th)
+                self._stopping_recs.pop(disc_stop_tok, None)
                 claimed_session.busy = False
                 self._rec_cond.notify_all()
 
@@ -1495,6 +1540,28 @@ class MacOSPlatform(JsonlShimMixin):
             except OSError:
                 pass
 
+    def _check_selected_input_disconnected(
+        self,
+        *,
+        locked_uid: str,
+        had_locked_uid_in_alive: bool,
+        has_known_input: bool | None,
+    ) -> tuple[bool, bool, int]:
+        """Inspect cached CoreAudio input state outside _rec_cond (never nest locks)."""
+        with self._audio_cache_lock:
+            cur_ver = self._audio_event_ver
+            if not (has_known_input or locked_uid) or not self._audio_status_known:
+                return False, True, cur_ver
+            if not self._has_audio_input:
+                return True, False, cur_ver
+            if (
+                locked_uid
+                and (had_locked_uid_in_alive or bool(self._alive_input_uids))
+                and locked_uid not in self._alive_input_uids
+            ):
+                return True, bool(self._has_audio_input), cur_ver
+            return False, bool(self._has_audio_input), cur_ver
+
     def start_recording(
         self,
         runtime_dir: Path,
@@ -1502,15 +1569,15 @@ class MacOSPlatform(JsonlShimMixin):
         loopback: bool = False,
         seq_id: int | None = None,
     ) -> None:
+        del loopback
         self._stop_level_streamer()
         old_session: _MacRecSession | None = None
         old_idle = True
+        old_stop_tok = 0
         aborted_before_probe = False
         with self._rec_cond:
             self._rec_gen += 1
             start_gen = self._rec_gen
-            self._rec_active = False
-            self._recording = False
             old_session = self._cur_session
             self._cur_session = None
             if old_session is not None:
@@ -1518,12 +1585,15 @@ class MacOSPlatform(JsonlShimMixin):
                 old_session.aborted = True
                 self._rec_cond.notify_all()
                 old_idle = self._wait_session_idle_locked(old_session, self._busy_wait_timeout_sec)
-                if not old_idle:
-                    self._detach_busy_recorder_locked(old_session)
+                if old_idle:
+                    old_stop_tok = self._register_stopping_locked(old_session.rec)
             if self._closed or self._rec_gen != start_gen:
                 aborted_before_probe = True
         if old_session is not None and old_idle:
-            old_session.rec.stop(drain_sec=0.0)
+            try:
+                old_session.rec.stop(drain_sec=0.0)
+            finally:
+                self._finish_stopping(old_stop_tok)
         if aborted_before_probe:
             return
 
@@ -1588,30 +1658,26 @@ class MacOSPlatform(JsonlShimMixin):
                     locked_name_unique = def_uniq
                     had_locked_uid_in_alive = bool(locked_uid and locked_uid in init_alive)
 
-        handoff_disconnected = [False]
-        handoff_has_input = [True]
+        # Phase 1: check cached device state outside _rec_cond, then register in-flight spawn under _rec_cond.
+        disc_pre, has_in_pre, _ = self._check_selected_input_disconnected(
+            locked_uid=locked_uid,
+            had_locked_uid_in_alive=had_locked_uid_in_alive,
+            has_known_input=has_known_input,
+        )
+        if disc_pre:
+            self.last_audio_error = "coreaudio_device_disconnected"
+            if not has_in_pre:
+                raise NoMicrophoneError("no microphone input device available on macOS")
+            raise MicrophoneUnavailableError(
+                "selected microphone disconnected before capture start",
+                reason_code="mic_unavailable",
+                hud_state="mic_unavailable",
+            )
 
-        def _selected_input_disconnected() -> bool:
-            if not (has_known_input or locked_uid):
-                return False
-            with self._audio_cache_lock:
-                if not self._audio_status_known:
-                    return False
-                if not self._has_audio_input or (
-                    locked_uid
-                    and (had_locked_uid_in_alive or bool(self._alive_input_uids))
-                    and locked_uid not in self._alive_input_uids
-                ):
-                    handoff_disconnected[0] = True
-                    handoff_has_input[0] = bool(self._has_audio_input)
-                    return True
-            return False
-
-        pre_spawn_aborted = False
         with self._rec_cond:
             if self._closed or self._rec_gen != start_gen:
                 return
-            rec_obj = self._ff_rec
+            rec_obj = self._new_recorder()
             session = _MacRecSession(
                 start_gen,
                 rec_obj,
@@ -1622,67 +1688,44 @@ class MacOSPlatform(JsonlShimMixin):
                 daemon_seq_id=seq_id,
                 initial_mic_auth=initial_mic_auth,
             )
-            use_guarded_spawn = isinstance(rec_obj, FfmpegWavRecorder)
-            if not use_guarded_spawn:
-                if _selected_input_disconnected():
-                    pre_spawn_aborted = True
-                else:
-                    self._cur_session = session
-                    self._rec_active = True
-                    self._recording = True
+            self._spawning_recs[start_gen] = rec_obj
 
-        if pre_spawn_aborted:
-            self.last_audio_error = "coreaudio_device_disconnected"
-            if not handoff_has_input[0]:
-                raise NoMicrophoneError("no microphone input device available on macOS")
-            raise MicrophoneUnavailableError(
-                "selected microphone disconnected before capture start",
-                reason_code="mic_unavailable",
-                hud_state="mic_unavailable",
-            )
-
-        spawned_ok = [not use_guarded_spawn]
-
-        def _can_spawn_session() -> bool:
-            if self._closed or self._rec_gen != start_gen or self._ff_rec is not rec_obj:
-                return False
-            return not _selected_input_disconnected()
-
-        def _on_session_spawned() -> None:
-            spawned_ok[0] = True
-            self._cur_session = session
-            self._rec_active = True
-            self._recording = True
-
+        # Spawn and verify FFmpeg completely outside _rec_cond and _audio_cache_lock.
         startup_timeout = 15.0 if initial_mic_auth == "not_determined" else 0.85
-        start_kwargs: dict[str, Any] = {
-            "verify_startup": True,
-            "startup_timeout_sec": startup_timeout,
-            "stall_timeout_sec": 1.2,
-            "has_known_input": has_known_input,
-            "on_unexpected_exit": lambda s=session: self._on_ffmpeg_unexpected_exit(s),
-            "on_level": self._on_recorder_level,
-        }
-        if use_guarded_spawn:
-            start_kwargs["spawn_lock"] = self._rec_cond
-            start_kwargs["can_spawn"] = _can_spawn_session
-            start_kwargs["on_spawned"] = _on_session_spawned
+        start_exc: BaseException | None = None
         try:
             session.rec.start(
                 "avfoundation",
                 f":{self.audio_dev}",
                 runtime_dir,
                 self.env,
-                **start_kwargs,
+                verify_startup=True,
+                startup_timeout_sec=startup_timeout,
+                stall_timeout_sec=1.2,
+                has_known_input=has_known_input,
+                on_unexpected_exit=lambda s=session: self._on_ffmpeg_unexpected_exit(s),
+                on_level=self._on_recorder_level,
             )
-        except Exception:
+        except BaseException as exc:
+            start_exc = exc
+
+        if start_exc is not None:
             with self._rec_cond:
                 session.active = False
                 session.aborted = True
                 if self._cur_session is session:
                     self._cur_session = None
-                    self._rec_active = False
-                    self._recording = False
+                aborted_or_closed = self._closed or self._rec_gen != start_gen
+            if aborted_or_closed:
+                try:
+                    session.rec.stop(drain_sec=0.0)
+                finally:
+                    with self._rec_cond:
+                        self._spawning_recs.pop(start_gen, None)
+                        self._rec_cond.notify_all()
+                return
+            with self._rec_cond:
+                self._spawning_recs.pop(start_gen, None)
                 self._rec_cond.notify_all()
             if session.initial_mic_auth == "not_determined":
                 post_st = self._query_live_audio_status(timeout_sec=0.6)
@@ -1690,12 +1733,49 @@ class MacOSPlatform(JsonlShimMixin):
                     self.last_audio_error = "macos_mic_permission"
                     raise perm_err from None
             self.last_audio_error = session.rec.diagnostic_summary()
-            raise
+            raise start_exc
 
-        if not spawned_ok[0]:
-            if handoff_disconnected[0]:
+        # Phase 2: re-check audio cache outside _rec_cond, then atomically commit or abort under _rec_cond.
+        # If an audio_devices_changed event advanced _rec_audio_event_ver after our cache snapshot, re-read cache
+        # outside _rec_cond before committing so _rec_cond and _audio_cache_lock are never nested.
+        committed = False
+        pending_stop = False
+        stale_or_closed = False
+        disc_post = False
+        has_in_post = True
+        while True:
+            disc_post, has_in_post, ver_post = self._check_selected_input_disconnected(
+                locked_uid=locked_uid,
+                had_locked_uid_in_alive=had_locked_uid_in_alive,
+                has_known_input=has_known_input,
+            )
+            with self._rec_cond:
+                stale_or_closed = self._closed or self._rec_gen != start_gen
+                if stale_or_closed or disc_post:
+                    session.active = False
+                    session.aborted = True
+                    break
+                if self._rec_audio_event_ver > ver_post:
+                    continue
+                self._cur_session = session
+                committed = True
+                self._spawning_recs.pop(start_gen, None)
+                pending_stop = self._pending_stop_gen == start_gen
+                self._rec_cond.notify_all()
+                break
+
+        if not committed:
+            # Destroy the newly spawned FFmpeg outside _rec_cond BEFORE clearing _spawning_recs so
+            # close() waiting on _spawning_recs never returns with a live orphan FFmpeg.
+            try:
+                session.rec.stop(drain_sec=0.0)
+            finally:
+                with self._rec_cond:
+                    self._spawning_recs.pop(start_gen, None)
+                    self._rec_cond.notify_all()
+            if disc_post and not stale_or_closed:
                 self.last_audio_error = "coreaudio_device_disconnected"
-                if not handoff_has_input[0]:
+                if not has_in_post:
                     raise NoMicrophoneError("no microphone input device available on macOS")
                 raise MicrophoneUnavailableError(
                     "selected microphone disconnected before capture start",
@@ -1704,53 +1784,34 @@ class MacOSPlatform(JsonlShimMixin):
                 )
             return
 
-        cleanup_early_stop = False
-        owns_early_busy = False
-        with self._rec_cond:
-            if self._closed and self._cur_session is session:
-                session.active = False
-                session.aborted = True
-                self._cur_session = None
-                self._rec_active = False
-                self._recording = False
-                self._rec_cond.notify_all()
-            still_active = (
-                not self._closed
-                and session.active
-                and not session.aborted
-                and self._cur_session is session
-            )
-            if not still_active and not session.busy:
-                session.busy = True
-                owns_early_busy = True
-                cleanup_early_stop = True
-        if still_active:
+        if not pending_stop:
             self._start_level_streamer(lambda s=session: s.rec.current_level)
-        elif cleanup_early_stop:
-            try:
-                seg_wav = session.rec.stop(drain_sec=0.0)
-                with self._rec_cond:
-                    if not session.aborted and len(seg_wav) > 44:
-                        session.pcm.extend(seg_wav[44:])
-            finally:
-                if owns_early_busy:
-                    with self._rec_cond:
-                        session.busy = False
-                        owns_early_busy = False
-                        self._rec_cond.notify_all()
+            with self._rec_cond:
+                still_active = (
+                    not self._closed
+                    and self._cur_session is session
+                    and session.active
+                    and not session.aborted
+                )
+            if not still_active:
+                self._stop_level_streamer()
 
     def _on_ffmpeg_unexpected_exit(self, session: _MacRecSession) -> None:
         owns_busy = False
         with self._rec_cond:
-            if session.aborted or not session.active:
-                return
             if session.busy:
-                session.pending_exit = True
-                self._rec_cond.notify_all()
+                if not session.aborted and session.active:
+                    session.pending_exit = True
+                    self._rec_cond.notify_all()
+                return
+            while session.gen in self._spawning_recs and not session.aborted and not self._closed:
+                self._rec_cond.wait(timeout=0.05)
+            if self._closed or session.aborted or not session.active or self._cur_session is not session:
                 return
             session.pending_exit = False
             session.busy = True
             owns_busy = True
+            exit_stop_tok = self._register_stopping_locked(session.rec)
 
         recovered_gap_ms: int | None = None
         should_notify_lost = False
@@ -1758,7 +1819,10 @@ class MacOSPlatform(JsonlShimMixin):
         try:
             last_audio_ts = session.rec.last_chunk_ts or session.start_ts or time.monotonic()
             self._stop_level_streamer()
-            seg_wav = session.rec.stop(drain_sec=0.0)
+            try:
+                seg_wav = session.rec.stop(drain_sec=0.0)
+            finally:
+                self._finish_stopping(exit_stop_tok)
             diag = session.rec.diagnostic_summary() or "ffmpeg_unexpected_exit"
             with self._rec_cond:
                 if not session.aborted and len(seg_wav) > 44:
@@ -1795,107 +1859,115 @@ class MacOSPlatform(JsonlShimMixin):
                             can_respawn = True
 
                 if can_respawn:
+                    respawn_rec: Any = None
                     with self._rec_cond:
-                        if not session.active or session.aborted or session.force_lost_reason:
+                        if self._closed or not session.active or session.aborted or session.force_lost_reason:
                             can_respawn = False
                             if session.force_lost_reason:
                                 diag = session.force_lost_reason
                         else:
                             session.respawn_used = True
                             session.pending_exit = False
-                    if can_respawn:
-                        respawn_spawned = [not isinstance(session.rec, FfmpegWavRecorder)]
-                        respawn_kw: dict[str, Any] = {
-                            "verify_startup": True,
-                            "startup_timeout_sec": 0.85,
-                            "stall_timeout_sec": 1.2,
-                            "has_known_input": True,
-                            "on_unexpected_exit": lambda s=session: self._on_ffmpeg_unexpected_exit(s),
-                            "on_level": self._on_recorder_level,
-                        }
-                        if isinstance(session.rec, FfmpegWavRecorder):
-                            respawn_kw["spawn_lock"] = self._rec_cond
-                            respawn_kw["can_spawn"] = (
-                                lambda s=session: not self._closed
-                                and s.active
-                                and not s.aborted
-                                and not s.force_lost_reason
-                            )
-                            respawn_kw["on_spawned"] = lambda: respawn_spawned.__setitem__(0, True)
+                            respawn_rec = self._new_recorder()
+                            self._spawning_recs[session.gen] = respawn_rec
+                    if can_respawn and respawn_rec is not None:
                         try:
-                            session.rec.start(
-                                "avfoundation",
-                                f":{session.active_name}",
-                                session.runtime_dir,
-                                self.env,
-                                **respawn_kw,
-                            )
-                        except Exception:
-                            diag = session.rec.diagnostic_summary() or diag
-                        else:
-                            if not respawn_spawned[0]:
-                                with self._rec_cond:
-                                    if session.force_lost_reason:
-                                        diag = session.force_lost_reason
+                            try:
+                                respawn_rec.start(
+                                    "avfoundation",
+                                    f":{session.active_name}",
+                                    session.runtime_dir,
+                                    self.env,
+                                    verify_startup=True,
+                                    startup_timeout_sec=0.85,
+                                    stall_timeout_sec=1.2,
+                                    has_known_input=True,
+                                    on_unexpected_exit=lambda s=session: self._on_ffmpeg_unexpected_exit(s),
+                                    on_level=self._on_recorder_level,
+                                )
+                            except BaseException:
+                                diag = respawn_rec.diagnostic_summary() or diag
                             else:
                                 with self._rec_cond:
-                                    self._rec_cond.wait_for(
-                                        lambda: (
-                                            not session.active
-                                            or session.aborted
-                                            or session.pending_exit
-                                            or bool(session.force_lost_reason)
-                                        ),
-                                        timeout=0.08,
+                                    respawn_hard_aborted = (
+                                        self._closed
+                                        or session.aborted
+                                        or bool(session.force_lost_reason)
                                     )
-                                post_st = self._query_live_audio_status(timeout_sec=0.5)
-                                post_alive = (
-                                    {str(u).strip() for u in (post_st.get("alive_uids") or []) if str(u).strip()}
-                                    if isinstance(post_st, dict)
-                                    else set()
-                                )
-                                drifted = not (
-                                    isinstance(post_st, dict)
-                                    and bool(post_st.get("has_input", bool(post_alive)))
-                                    and session.active_uid in post_alive
-                                    and str(post_st.get("default_uid") or "").strip() == session.active_uid
-                                    and _is_unique_audio_device_name(post_st, session.active_uid, session.active_name)
-                                )
-                                child_dead = not session.rec.is_running
-                                resume_ts = session.rec.first_chunk_ts or session.rec.last_chunk_ts or time.monotonic()
-                                raw_gap_ms = max(0, int(round((resume_ts - last_audio_ts) * 1000.0)))
-                                pad_bytes = (min(30000, raw_gap_ms) * 32) & ~1
-
-                                aborted_mid = False
-                                forced_after = ""
-                                with self._rec_cond:
-                                    aborted_mid = not session.active or session.aborted
-                                    forced_after = session.force_lost_reason
-                                    immediate_eof = session.pending_exit or child_dead
-                                    if not aborted_mid and not forced_after and not immediate_eof and not drifted:
-                                        if pad_bytes > 0:
-                                            session.pcm.extend(b"\x00" * pad_bytes)
-                                        recovered_gap_ms = raw_gap_ms
-                                        session.busy = False
-                                        owns_busy = False
-                                        self._rec_cond.notify_all()
-
-                                if recovered_gap_ms is None:
-                                    seg_extra = session.rec.stop(drain_sec=0.0)
-                                    if not session.aborted and not drifted and len(seg_extra) > 44:
-                                        with self._rec_cond:
-                                            if not session.aborted:
-                                                if pad_bytes > 0:
-                                                    session.pcm.extend(b"\x00" * pad_bytes)
-                                                session.pcm.extend(seg_extra[44:])
-                                    if aborted_mid:
+                                    if session.force_lost_reason:
+                                        diag = session.force_lost_reason
+                                    elif not respawn_hard_aborted:
+                                        session.rec = respawn_rec
+                                if respawn_hard_aborted:
+                                    respawn_rec.stop(drain_sec=0.0)
+                                    if self._closed or session.aborted:
                                         return
-                                    if forced_after:
-                                        diag = forced_after
-                                    elif drifted:
-                                        diag = "coreaudio_default_input_switched"
-                                    else:
-                                        diag = session.rec.diagnostic_summary() or diag
+                                else:
+                                    with self._rec_cond:
+                                        self._rec_cond.wait_for(
+                                            lambda: (
+                                                self._closed
+                                                or not session.active
+                                                or session.aborted
+                                                or session.pending_exit
+                                                or bool(session.force_lost_reason)
+                                            ),
+                                            timeout=0.08,
+                                        )
+                                    post_st = self._query_live_audio_status(timeout_sec=0.5)
+                                    post_alive = (
+                                        {str(u).strip() for u in (post_st.get("alive_uids") or []) if str(u).strip()}
+                                        if isinstance(post_st, dict)
+                                        else set()
+                                    )
+                                    drifted = not (
+                                        isinstance(post_st, dict)
+                                        and bool(post_st.get("has_input", bool(post_alive)))
+                                        and session.active_uid in post_alive
+                                        and str(post_st.get("default_uid") or "").strip() == session.active_uid
+                                        and _is_unique_audio_device_name(post_st, session.active_uid, session.active_name)
+                                    )
+                                    child_dead = not respawn_rec.is_running
+                                    resume_ts = respawn_rec.first_chunk_ts or respawn_rec.last_chunk_ts or time.monotonic()
+                                    raw_gap_ms = max(0, int(round((resume_ts - last_audio_ts) * 1000.0)))
+                                    pad_bytes = (min(30000, raw_gap_ms) * 32) & ~1
+
+                                    aborted_mid = False
+                                    forced_after = ""
+                                    with self._rec_cond:
+                                        aborted_mid = self._closed or not session.active or session.aborted
+                                        forced_after = session.force_lost_reason
+                                        immediate_eof = session.pending_exit or child_dead
+                                        if not aborted_mid and not forced_after and not immediate_eof and not drifted:
+                                            if pad_bytes > 0:
+                                                session.pcm.extend(b"\x00" * pad_bytes)
+                                            recovered_gap_ms = raw_gap_ms
+                                            self._spawning_recs.pop(session.gen, None)
+                                            session.busy = False
+                                            owns_busy = False
+                                            self._rec_cond.notify_all()
+
+                                    if recovered_gap_ms is None:
+                                        seg_extra = respawn_rec.stop(drain_sec=0.0)
+                                        if not self._closed and not session.aborted and not drifted and len(seg_extra) > 44:
+                                            with self._rec_cond:
+                                                if not self._closed and not session.aborted:
+                                                    if pad_bytes > 0:
+                                                        session.pcm.extend(b"\x00" * pad_bytes)
+                                                    session.pcm.extend(seg_extra[44:])
+                                        if aborted_mid:
+                                            return
+                                        if forced_after:
+                                            diag = forced_after
+                                        elif drifted:
+                                            diag = "coreaudio_default_input_switched"
+                                        else:
+                                            diag = respawn_rec.diagnostic_summary() or diag
+                        finally:
+                            with self._rec_cond:
+                                if self._spawning_recs.get(session.gen) is respawn_rec:
+                                    self._spawning_recs.pop(session.gen, None)
+                                    self._rec_cond.notify_all()
 
             if recovered_gap_ms is None:
                 with self._rec_cond:
@@ -1903,9 +1975,6 @@ class MacOSPlatform(JsonlShimMixin):
                         session.force_lost_reason = diag
                     if session.active and not session.aborted:
                         session.active = False
-                        if self._cur_session is session:
-                            self._rec_active = False
-                            self._recording = False
                         should_notify_lost = True
                     session.pending_exit = False
                     session.busy = False
@@ -1944,26 +2013,71 @@ class MacOSPlatform(JsonlShimMixin):
     def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
         self._stop_level_streamer()
         self._last_stop_recorder_lost = False
+        timed_out_spawn_rec: Any = None
+        stop_tok = 0
+        preempted = False
+        closed_at_stop = False
         with self._rec_cond:
             session = self._cur_session
-            was_rec = (session is not None and session.active) or self._rec_active or self._recording
-            self._cur_session = None
-            self._rec_active = False
-            self._recording = False
-            idle = True
-            if session is not None:
-                session.active = False
+            if (
+                session is None
+                and not self._closed
+                and self._rec_gen > 0
+                and self._rec_gen in self._spawning_recs
+            ):
+                target_gen = self._rec_gen
+                self._pending_stop_gen = target_gen
                 self._rec_cond.notify_all()
-                idle = self._wait_session_idle_locked(session, self._busy_wait_timeout_sec)
-                if not idle:
-                    session.aborted = True
-                    self._detach_busy_recorder_locked(session)
+                wait_deadline = time.monotonic() + self._busy_wait_timeout_sec
+                while (
+                    not self._closed
+                    and self._cur_session is None
+                    and self._rec_gen == target_gen
+                    and target_gen in self._spawning_recs
+                ):
+                    rem = wait_deadline - time.monotonic()
+                    if rem <= 0.0:
+                        break
+                    self._rec_cond.wait(timeout=min(0.05, rem))
+                if self._pending_stop_gen == target_gen:
+                    self._pending_stop_gen = 0
+                if self._closed or self._rec_gen != target_gen:
+                    preempted = True
+                else:
+                    session = self._cur_session
+                    if session is None and target_gen in self._spawning_recs:
+                        timed_out_spawn_rec = self._spawning_recs.get(target_gen)
+            if not preempted:
+                self._rec_gen += 1
+                was_rec = session is not None and session.active and not session.aborted
+                self._cur_session = None
+                idle = True
+                if session is not None:
+                    session.active = False
                     self._rec_cond.notify_all()
-            lost_reason = (session.force_lost_reason if session is not None else "")
+                    idle = self._wait_session_idle_locked(session, self._busy_wait_timeout_sec)
+                    if not idle:
+                        session.aborted = True
+                        self._rec_cond.notify_all()
+                    else:
+                        closed_at_stop = self._closed
+                        stop_tok = self._register_stopping_locked(session.rec)
+                lost_reason = (session.force_lost_reason if session is not None else "")
+
+        if preempted:
+            return b"", "avfoundation"
+
+        if timed_out_spawn_rec is not None:
+            try:
+                self._abort_recorder(timed_out_spawn_rec)
+            except Exception:
+                pass
+            if not self.last_audio_error:
+                self.last_audio_error = "recorder_busy_timeout"
+            return b"", "avfoundation"
 
         if session is None:
-            drain_sec = self.cfg.audio.effective_tail_drain_sec(macos=True) if (drain and was_rec) else 0.0
-            wav = self._ff_rec.stop(drain_sec=drain_sec)
+            wav = self._ff_rec.stop(drain_sec=0.0)
             if not self.last_audio_error:
                 self.last_audio_error = "" if wav else self._ff_rec.diagnostic_summary()
             return wav, "avfoundation"
@@ -1977,8 +2091,17 @@ class MacOSPlatform(JsonlShimMixin):
                 self.last_audio_error = "recorder_busy_timeout"
             return b"", "avfoundation"
 
-        drain_sec = self.cfg.audio.effective_tail_drain_sec(macos=True) if (drain and was_rec) else 0.0
-        seg_wav = session.rec.stop(drain_sec=drain_sec)
+        drain_sec = (
+            self.cfg.audio.effective_tail_drain_sec(macos=True)
+            if (drain and was_rec and not closed_at_stop)
+            else 0.0
+        )
+        try:
+            if closed_at_stop:
+                self._abort_recorder(session.rec)
+            seg_wav = session.rec.stop(drain_sec=drain_sec)
+        finally:
+            self._finish_stopping(stop_tok)
         if session.pcm:
             pcm = bytearray(session.pcm)
             session.pcm.clear()
@@ -2008,31 +2131,68 @@ class MacOSPlatform(JsonlShimMixin):
 
     def cancel_recording(self) -> None:
         self._stop_level_streamer()
+        stop_tok = 0
         with self._rec_cond:
             self._rec_gen += 1
             session = self._cur_session
             self._cur_session = None
-            self._rec_active = False
-            self._recording = False
+            spawning = list(self._spawning_recs.values())
+            stopping = list(self._stopping_recs.values()) if self._closed else []
             idle = True
             if session is not None:
                 session.active = False
                 session.aborted = True
                 self._rec_cond.notify_all()
                 idle = self._wait_session_idle_locked(session, 1.5)
-                if not idle:
-                    self._detach_busy_recorder_locked(session)
-        if session is None:
-            self._ff_rec.stop(drain_sec=0.0)
-        elif idle:
-            session.rec.stop(drain_sec=0.0)
-            session.pcm.clear()
+                if idle:
+                    stop_tok = self._register_stopping_locked(session.rec)
+            else:
+                self._rec_cond.notify_all()
+        aborted_ids: set[int] = set()
+        for rec in (*spawning, *stopping):
+            if id(rec) not in aborted_ids:
+                aborted_ids.add(id(rec))
+                try:
+                    self._abort_recorder(rec)
+                except Exception:
+                    pass
+        try:
+            if session is None:
+                if id(self._ff_rec) not in aborted_ids:
+                    self._ff_rec.stop(drain_sec=0.0)
+            elif idle:
+                session.rec.stop(drain_sec=0.0)
+                session.pcm.clear()
+        finally:
+            self._finish_stopping(stop_tok)
 
     def close(self) -> None:
         super().close()
-        with self._rec_cond:
-            pending = [t for t in self._rec_cleanup_threads if t.is_alive()]
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + 5.0
+        aborted_ids: set[int] = set()
+        while True:
+            with self._rec_cond:
+                self._rec_gen += 1
+                in_flight = list(self._spawning_recs.values()) + list(self._stopping_recs.values())
+                self._rec_cond.notify_all()
+                if not in_flight:
+                    pending = [t for t in self._rec_cleanup_threads if t.is_alive()]
+                    break
+            for rec in in_flight:
+                if id(rec) not in aborted_ids:
+                    aborted_ids.add(id(rec))
+                    try:
+                        self._abort_recorder(rec)
+                    except Exception:
+                        pass
+            rem = deadline - time.monotonic()
+            if rem <= 0.0:
+                with self._rec_cond:
+                    pending = [t for t in self._rec_cleanup_threads if t.is_alive()]
+                break
+            with self._rec_cond:
+                if self._spawning_recs or self._stopping_recs:
+                    self._rec_cond.wait(timeout=min(0.05, rem))
         cur = threading.current_thread()
         for th in pending:
             rem = deadline - time.monotonic()
@@ -2742,7 +2902,7 @@ class MacOSPlatform(JsonlShimMixin):
                 nonlocal idle_since
                 eff = hold_deadline
                 if ptt_dynamic_idle:
-                    if self._rec_active:
+                    if self.is_recording:
                         idle_since = None
                     else:
                         if idle_since is None:

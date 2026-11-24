@@ -641,7 +641,8 @@ class TestA2WslRecStopTimeoutRetry(unittest.TestCase):
             finally:
                 plat_serial.close()
 
-            # 2. Final timeout abandonment STILL sends rec_release(rec_gen=stop_gen) in finally so large WAV never leaks!
+            # 2. P0-4: On rec_stop RPC timeout (queue.Empty), Python MUST NOT blindly send rec_release,
+            #    preserving Windows's bounded single StoppedRecSlot for recovery until next rec_start/cancel!
             plat_abandon = WslPlatform(
                 cfg,
                 env={},
@@ -658,18 +659,83 @@ class TestA2WslRecStopTimeoutRetry(unittest.TestCase):
             plat_abandon._rec_stop_timeout_sec = 0.08
             try:
                 plat_abandon.start_recording(rt)
+                timed_out_gen = plat_abandon._winmm_gen
                 with self.assertRaises(queue.Empty):
                     plat_abandon.stop_recording(drain=False)
-                # FIFO serial pipe guarantees dump executes AFTER the slow rec_stop AND our finally rec_release!
+                # FIFO serial pipe guarantees dump executes AFTER the slow rec_stop finishes saving the slot:
+                # rec_release must NOT have been sent, so the single slot stays intact!
                 dump_ab = plat_abandon._shim_rpc({"cmd": "dump"}, timeout_sec=2.0) or {}
-                self.assertFalse(dump_ab.get("slot_held"), "StoppedRecSlot must be freed even on rec_stop timeout")
+                self.assertTrue(dump_ab.get("slot_held"), "StoppedRecSlot must be preserved on rec_stop timeout")
                 stop_ab = [c for c in dump_ab.get("cmds", []) if c["cmd"] == "rec_stop"]
                 rel_ab = [c for c in dump_ab.get("cmds", []) if c["cmd"] == "rec_release"]
                 self.assertEqual(len(stop_ab), 1)
-                self.assertEqual(len(rel_ab), 1)
-                self.assertEqual(rel_ab[0]["rec_gen"], stop_ab[0]["rec_gen"])
+                self.assertEqual(len(rel_ab), 0)
+
+                # Same-gen bounded retrieval still gets the intact WAV from the preserved single slot!
+                res_recover = (
+                    plat_abandon._shim_rpc(
+                        {"cmd": "rec_stop", "rec_gen": timed_out_gen},
+                        timeout_sec=2.0,
+                        allow_retry=False,
+                    )
+                    or {}
+                )
+                self.assertEqual(base64.b64decode(res_recover.get("wav_b64") or ""), sample_wav)
+
+                # Starting the next recording automatically clears the bounded single slot (no memory leak).
+                plat_abandon.start_recording(rt)
+                dump_next = plat_abandon._shim_rpc({"cmd": "dump"}, timeout_sec=2.0) or {}
+                self.assertFalse(dump_next.get("slot_held"))
             finally:
                 plat_abandon.close()
+
+            # 2b. P0-4: Pipe write error / BrokenPipeError on rec_stop also never blindly sends rec_release,
+            #     while explicit rec_error reply DOES release the slot cleanly.
+            plat_err = WslPlatform(
+                cfg,
+                env={},
+                shim_cmd_factory=lambda: [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    _MOCK_WSL_REC_SHIM,
+                    "serial_slow",
+                    sample_b64,
+                    "0.0",
+                ],
+            )
+            try:
+                plat_err.start_recording(rt)
+                enqueued_rel: list[dict[str, object]] = []
+                orig_enq = plat_err._enqueue_shim_async
+
+                def _spy_enq(payload, **kw):
+                    if payload.get("cmd") == "rec_release":
+                        enqueued_rel.append(dict(payload))
+                    return orig_enq(payload, **kw)
+
+                plat_err._enqueue_shim_async = _spy_enq  # type: ignore[method-assign]
+                orig_rpc_err = plat_err._shim_rpc
+                plat_err._shim_rpc = lambda *a, **kw: (_ for _ in ()).throw(BrokenPipeError("pipe_broken"))  # type: ignore[method-assign]
+                with self.assertRaises(BrokenPipeError):
+                    plat_err.stop_recording(drain=False)
+                self.assertEqual(enqueued_rel, [], "BrokenPipeError on rec_stop must not send rec_release")
+
+                # Explicit rec_error reply (e.g. wasapi_zero_packets) DOES release the slot.
+                plat_err._shim_rpc = orig_rpc_err  # type: ignore[method-assign]
+                plat_err.start_recording(rt)
+                cur_gen_err = plat_err._winmm_gen
+                plat_err._shim_rpc = lambda payload, **kw: (  # type: ignore[method-assign]
+                    {"ok": False, "rec_gen": payload.get("rec_gen"), "wav_b64": "", "rec_error": "wasapi_zero_packets"}
+                )
+                wav_zero, src_zero = plat_err.stop_recording(drain=False)
+                self.assertEqual(wav_zero, b"")
+                self.assertEqual(src_zero, "winmm")
+                self.assertEqual(plat_err.last_audio_error, "wasapi_zero_packets")
+                self.assertEqual(len(enqueued_rel), 1)
+                self.assertEqual(enqueued_rel[0].get("rec_gen"), cur_gen_err)
+            finally:
+                plat_err.close()
 
             # 3. Contrast: explicit same-rec_gen retry returns WAV on single-slot shim vs not_recording on legacy shim
             for mode_name, expect_wav in (("legacy_lose", b""), ("single_slot", sample_wav)):

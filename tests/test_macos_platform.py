@@ -2191,13 +2191,13 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
 
             cur_audio_st["mic_auth"] = "authorized"
             seen_timeouts: list[float] = []
-            orig_rec_start = plat_pre._ff_rec.start
+            orig_rec_start = FfmpegWavRecorder.start
 
-            def _spy_start(*a, **kw):
+            def _spy_start(rec_self, *a, **kw):
                 seen_timeouts.append(float(kw.get("startup_timeout_sec", 0.0)))
-                return orig_rec_start(*a, **kw)
+                return orig_rec_start(rec_self, *a, **kw)
 
-            with mock.patch.object(plat_pre._ff_rec, "start", side_effect=_spy_start):
+            with mock.patch.object(FfmpegWavRecorder, "start", autospec=True, side_effect=_spy_start):
                 plat_pre.start_recording(rt)
             self.assertEqual(len(ff_spawns), 1)
             self.assertEqual(seen_timeouts, [0.85])
@@ -2243,11 +2243,11 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID
             )
 
-            orig_prompt_rec_start = plat_prompt._ff_rec.start
+            orig_prompt_rec_start = FfmpegWavRecorder.start
 
-            def _spy_prompt_start(*a, **kw):
+            def _spy_prompt_start(rec_self, *a, **kw):
                 prompt_timeouts.append(float(kw.get("startup_timeout_sec", 0.0)))
-                return orig_prompt_rec_start(*a, **kw)
+                return orig_prompt_rec_start(rec_self, *a, **kw)
 
             daemon_prompt = VoiceInputDaemon(
                 Config(audio=AudioConfig(tail_drain_sec=0.0), refiner=RefinerConfig(provider="off")),
@@ -2259,7 +2259,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 tracker=SessionTracker(home_dir=tmp, env=env, runtime_dir=rt, proc_root=tmp / "noproc"),
             )
             try:
-                with mock.patch.object(plat_prompt._ff_rec, "start", side_effect=_spy_prompt_start):
+                with mock.patch.object(FfmpegWavRecorder, "start", autospec=True, side_effect=_spy_prompt_start):
                     r_pstart = daemon_prompt.handle_trigger(
                         "toggle", ForegroundWindow(0, "Ghostty", "codex", GHOSTTY_BUNDLE_ID)
                     )
@@ -2513,13 +2513,13 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             once_st["has_graphic_session"] = True
             plat_once_gui = _make_once_plat()
             self.assertFalse(plat_once_gui._has_managed_shim())
-            orig_once_rec_start = plat_once_gui._ff_rec.start
+            orig_once_rec_start = FfmpegWavRecorder.start
 
-            def _spy_once_start(*a, **kw):
+            def _spy_once_start(rec_self, *a, **kw):
                 once_timeouts.append(float(kw.get("startup_timeout_sec", 0.0)))
-                return orig_once_rec_start(*a, **kw)
+                return orig_once_rec_start(rec_self, *a, **kw)
 
-            with mock.patch.object(plat_once_gui._ff_rec, "start", side_effect=_spy_once_start):
+            with mock.patch.object(FfmpegWavRecorder, "start", autospec=True, side_effect=_spy_once_start):
                 plat_once_gui.start_recording(rt_cli)
             self.assertEqual(once_timeouts, [15.0])
             once_st["mic_auth"] = "denied"
@@ -5001,16 +5001,24 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertEqual(pbcopy_payloads, ["tap兜底文本"])
 
                 # 3. PTT dynamic two-phase wait:
-                #    - First 0.04s startup race (_rec_active=False) is covered by idle_timeout=5.0s
-                #    - Then _rec_active=True for 12s (>5.0s idle cap) keeps waiting on full PTT deadline
-                #    - Once _rec_active flips back to False, stuck external modifier times out after 5.0s idle_timeout!
+                #    - First 0.04s startup race (not recording) is covered by idle_timeout=5.0s
+                #    - Then active session for 12s (>5.0s idle cap) keeps waiting on full PTT deadline
+                #    - Once recording ends, stuck external modifier times out after 5.0s idle_timeout!
+                from agent_voice_input.platform_macos import _MacRecSession
+
+                def _set_ptt_recording(plat_obj: MacOSPlatform, active: bool) -> None:
+                    with plat_obj._rec_cond:
+                        plat_obj._cur_session = (
+                            _MacRecSession(1, plat_obj._ff_rec, Path(td)) if active else None
+                        )
+
                 pbcopy_payloads.clear()
                 fake_now[0] = 200.0
-                plat_ptt._rec_active = False
+                _set_ptt_recording(plat_ptt, False)
 
                 def ptt_rec_then_stuck() -> bool:
                     elapsed = fake_now[0] - 200.0
-                    plat_ptt._rec_active = 0.04 <= elapsed < 12.04
+                    _set_ptt_recording(plat_ptt, 0.04 <= elapsed < 12.04)
                     return True
 
                 wire_plat(plat_ptt, ptt_rec_then_stuck)
@@ -5030,14 +5038,14 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 # 3b. PTT recording > 8s followed by clean release pastes successfully
                 pbcopy_payloads.clear()
                 fake_now[0] = 300.0
-                plat_ptt._rec_active = True
+                _set_ptt_recording(plat_ptt, True)
 
                 def ptt_rec_then_release() -> bool:
                     elapsed = fake_now[0] - 300.0
                     if elapsed < 8.5:
-                        plat_ptt._rec_active = True
+                        _set_ptt_recording(plat_ptt, True)
                         return True
-                    plat_ptt._rec_active = False
+                    _set_ptt_recording(plat_ptt, False)
                     return elapsed < 9.0
 
                 wire_plat(plat_ptt, ptt_rec_then_release)
@@ -5050,7 +5058,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 #    while 3 transient Nones reset cleanly upon receiving True and still paste on False.
                 pbcopy_payloads.clear()
                 fake_now[0] = 400.0
-                plat_ptt._rec_active = True
+                _set_ptt_recording(plat_ptt, True)
                 wire_plat(plat_ptt, lambda: None)
                 out_unavail = plat_ptt.deliver_text(
                     "shim无响应4秒回退",
@@ -5066,7 +5074,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
 
                 pbcopy_payloads.clear()
                 fake_now[0] = 500.0
-                plat_ptt._rec_active = False
+                _set_ptt_recording(plat_ptt, False)
                 # 3 Nones -> True (resets unavail_since) -> 3 Nones -> False (releases cleanly)
                 jitter_seq = iter([None, None, None, True, None, None, None, False])
                 jitter_calls = [0]
@@ -5085,7 +5093,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 #     MUST reset unavail_since on True and paste cleanly when False arrives!
                 pbcopy_payloads.clear()
                 fake_now[0] = 600.0
-                plat_ptt._rec_active = True
+                _set_ptt_recording(plat_ptt, True)
                 saw_mid_true = [False]
 
                 def two_stretch_none_with_true_reset() -> bool | None:
@@ -5097,7 +5105,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                         return True
                     if elapsed < 6.0:
                         return None
-                    plat_ptt._rec_active = False
+                    _set_ptt_recording(plat_ptt, False)
                     return False
 
                 wire_plat(plat_ptt, two_stretch_none_with_true_reset)
@@ -5525,7 +5533,10 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 plat._shim_caps = frozenset({"paste_clip", "key_state_immediate"})
                 plat._flush_shim_events = lambda timeout_sec=0.05: True  # type: ignore[method-assign]
                 plat.beep = lambda _k: None  # type: ignore[method-assign]
-                plat._rec_active = True
+                from agent_voice_input.platform_macos import _MacRecSession
+
+                with plat._rec_cond:
+                    plat._cur_session = _MacRecSession(1, plat._ff_rec, Path(td))
 
                 def alt_fail_rpc(payload: dict[str, object], timeout_sec: float = 1.5, **kw: object):
                     del timeout_sec, kw

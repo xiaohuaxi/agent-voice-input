@@ -171,6 +171,9 @@ class FfmpegWavRecorder:
         self._err_reader: threading.Thread | None = None
         self._wd_stop_evt: threading.Event | None = None
         self._wd_thread: threading.Thread | None = None
+        self._startup_evt: threading.Event | None = None
+        self._aborted = threading.Event()
+        self._force_kill = False
         self._buf = bytearray()
         self._err_buf = bytearray()
         self._stdout_eof = False
@@ -328,6 +331,31 @@ class FfmpegWavRecorder:
                         pass
                 return
 
+    def reset_abort(self) -> None:
+        """Clear abort latch before reusing a recorder instance sequentially."""
+        self._force_kill = False
+        self._aborted.clear()
+
+    def abort(self) -> None:
+        """Wake any startup or tail-drain wait and force-kill an active subprocess."""
+        self._force_kill = True
+        self._aborted.set()
+        with self._lock:
+            startup_evt = self._startup_evt
+            proc = self._proc
+        if startup_evt is not None:
+            startup_evt.set()
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+
     def start(
         self,
         fmt: str,
@@ -341,45 +369,64 @@ class FfmpegWavRecorder:
         has_known_input: bool | None = None,
         on_unexpected_exit: Callable[[], None] | None = None,
         on_level: Callable[[float], None] | None = None,
-        spawn_lock: Any = None,
-        can_spawn: Callable[[], bool] | None = None,
-        on_spawned: Callable[[], None] | None = None,
     ) -> None:
-        self.stop(drain_sec=0.0)
+        if self._aborted.is_set():
+            raise MicrophoneUnavailableError(
+                "microphone recording aborted",
+                reason_code="mic_unavailable",
+                hud_state="mic_unavailable",
+            )
+        if self._proc is not None:
+            self._stop_impl(drain_sec=0.0)
         cmd = self._build_cmd(fmt, source)
+        if self._aborted.is_set():
+            raise MicrophoneUnavailableError(
+                "microphone recording aborted",
+                reason_code="mic_unavailable",
+                hud_state="mic_unavailable",
+            )
         buf, err_buf = bytearray(), bytearray()
         startup_evt = threading.Event()
         start_ts = time.monotonic()
         self.last_stderr, self.last_returncode, self.first_chunk_ts, self.last_chunk_ts = "", None, 0.0, 0.0
 
-        def _spawn_and_register() -> tuple[subprocess.Popen[bytes], threading.Thread, threading.Thread] | None:
-            if can_spawn is not None and not can_spawn():
-                return None
-            proc_local = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-                start_new_session=True,
-                env=dict(os.environ if env is None else env),
-            )
-            assert proc_local.stdout is not None and proc_local.stderr is not None
-            err_r = threading.Thread(target=self._read_pipe, args=(proc_local.stderr, err_buf, 512), daemon=True)
-            out_r = threading.Thread(
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            start_new_session=True,
+            env=dict(os.environ if env is None else env),
+        )
+        err_reader: threading.Thread | None = None
+        reader: threading.Thread | None = None
+        wd_evt: threading.Event | None = None
+        wd_thr: threading.Thread | None = None
+        try:
+            assert proc.stdout is not None and proc.stderr is not None
+            err_reader = threading.Thread(target=self._read_pipe, args=(proc.stderr, err_buf, 512), daemon=True)
+            reader = threading.Thread(
                 target=self._read_stdout,
-                args=(proc_local.stdout, buf, startup_evt, proc_local, err_r, err_buf),
+                args=(proc.stdout, buf, startup_evt, proc, err_reader, err_buf),
                 daemon=True,
             )
             with self._lock:
+                if self._aborted.is_set():
+                    raise MicrophoneUnavailableError(
+                        "microphone recording aborted",
+                        reason_code="mic_unavailable",
+                        hud_state="mic_unavailable",
+                    )
                 self._proc, self._reader, self._err_reader, self._buf, self._err_buf = (
-                    proc_local,
-                    out_r,
-                    err_r,
+                    proc,
+                    reader,
+                    err_reader,
                     buf,
                     err_buf,
                 )
                 self._wd_stop_evt, self._wd_thread = None, None
+                self._startup_evt = startup_evt
                 self._stdout_eof = False
                 self._stopping = False
                 self._stall_triggered = False
@@ -387,136 +434,190 @@ class FfmpegWavRecorder:
                 self._unexpected_exit_cb = None
                 self._level_cb = on_level
                 self._live_level, self._live_level_ts = 0.0, 0.0
-            try:
-                err_r.start()
-                out_r.start()
-            except Exception:
-                with self._lock:
-                    if self._proc is proc_local:
-                        self._proc, self._reader, self._err_reader, self._buf, self._err_buf = (
-                            None,
-                            None,
-                            None,
-                            bytearray(),
-                            bytearray(),
+            err_reader.start()
+            reader.start()
+
+            if verify_startup:
+                deadline = time.monotonic() + max(0.02, float(startup_timeout_sec))
+                while not startup_evt.is_set():
+                    if self._aborted.is_set():
+                        raise MicrophoneUnavailableError(
+                            "microphone recording aborted",
+                            reason_code="mic_unavailable",
+                            hud_state="mic_unavailable",
                         )
-                        self._stdout_eof = False
-                        self._stopping = False
-                        self._stall_triggered = False
-                        self._last_chunk_ts = 0.0
-                        self._unexpected_exit_cb = None
-                        self._level_cb = None
-                        self._live_level, self._live_level_ts = 0.0, 0.0
-                try:
-                    proc_local.kill()
-                    proc_local.wait(timeout=0.5)
-                except Exception:
-                    pass
-                for pipe in (proc_local.stdout, proc_local.stderr):
-                    try:
-                        pipe.close()
-                    except Exception:
-                        pass
-                raise
-            if on_spawned is not None:
-                on_spawned()
-            return proc_local, err_r, out_r
+                    rem = deadline - time.monotonic()
+                    if rem <= 0.0:
+                        break
+                    startup_evt.wait(timeout=min(0.03, rem))
+                if self._aborted.is_set():
+                    raise MicrophoneUnavailableError(
+                        "microphone recording aborted",
+                        reason_code="mic_unavailable",
+                        hud_state="mic_unavailable",
+                    )
+                with self._lock:
+                    saw_eof = self._stdout_eof
+                if len(buf) < 2:
+                    exited = saw_eof or proc.poll() is not None
+                    if exited:
+                        try:
+                            rc = proc.wait(timeout=0.25)
+                        except subprocess.TimeoutExpired:
+                            rc = proc.poll()
+                        err_reader.join(timeout=0.15)
+                    else:
+                        rc = None
+                    err_txt = bytes(err_buf).decode("utf-8", errors="replace").strip()
+                    self._stop_impl(drain_sec=0.0)
+                    if exited:
+                        self.last_returncode = rc
+                        self.last_stderr = err_txt or ("startup_eof_rc0" if rc == 0 else "")
+                    else:
+                        self.last_returncode = None
+                        self.last_stderr = err_txt or "startup_timeout_no_frames"
+                    raise classify_ffmpeg_startup_error(
+                        self.last_stderr,
+                        rc,
+                        diagnostic=self.diagnostic_summary(),
+                        has_known_input=has_known_input,
+                    )
 
-        if spawn_lock is not None:
-            with spawn_lock:
-                spawned = _spawn_and_register()
-        else:
-            spawned = _spawn_and_register()
-        if spawned is None:
-            return
-        proc, err_reader, _reader = spawned
-
-        if verify_startup:
-            startup_evt.wait(timeout=max(0.02, float(startup_timeout_sec)))
-            with self._lock:
-                saw_eof = self._stdout_eof
-            if len(buf) < 2:
-                exited = saw_eof or proc.poll() is not None
-                if exited:
+            if on_unexpected_exit is not None:
+                early_eof = False
+                with self._lock:
+                    if self._aborted.is_set():
+                        raise MicrophoneUnavailableError(
+                            "microphone recording aborted",
+                            reason_code="mic_unavailable",
+                            hud_state="mic_unavailable",
+                        )
+                    if self._proc is proc and not self._stopping:
+                        if self._stdout_eof or proc.poll() is not None:
+                            early_eof = True
+                        else:
+                            self._unexpected_exit_cb = on_unexpected_exit
+                            if stall_timeout_sec > 0.0:
+                                wd_evt = threading.Event()
+                                wd_thr = threading.Thread(
+                                    target=self._watch_stall,
+                                    args=(proc, buf, wd_evt, start_ts, float(stall_timeout_sec)),
+                                    daemon=True,
+                                )
+                                self._wd_stop_evt = wd_evt
+                                self._wd_thread = wd_thr
+                if wd_thr is not None:
+                    wd_thr.start()
+                if early_eof:
                     try:
                         rc = proc.wait(timeout=0.25)
                     except subprocess.TimeoutExpired:
                         rc = proc.poll()
                     err_reader.join(timeout=0.15)
-                else:
-                    rc = None
-                err_txt = bytes(err_buf).decode("utf-8", errors="replace").strip()
-                self.stop(drain_sec=0.0)
-                if exited:
-                    self.last_returncode = rc
-                    self.last_stderr = err_txt or ("startup_eof_rc0" if rc == 0 else "")
-                else:
-                    self.last_returncode = None
-                    self.last_stderr = err_txt or "startup_timeout_no_frames"
-                raise classify_ffmpeg_startup_error(
-                    self.last_stderr,
-                    rc,
-                    diagnostic=self.diagnostic_summary(),
-                    has_known_input=has_known_input,
-                )
+                    should_fire = False
+                    with self._lock:
+                        if self._proc is proc and not self._stopping:
+                            self.last_returncode = rc
+                            raw_err = bytes(err_buf).decode("utf-8", errors="replace").strip()
+                            self.last_stderr = raw_err or ("unexpected_eof_rc0" if rc == 0 else "")
+                            should_fire = True
+                    if should_fire:
+                        threading.Thread(target=on_unexpected_exit, daemon=True).start()
 
-        if on_unexpected_exit is not None:
-            early_eof = False
-            wd_evt: threading.Event | None = None
-            wd_thr: threading.Thread | None = None
             with self._lock:
-                if self._proc is proc and not self._stopping:
-                    if self._stdout_eof or proc.poll() is not None:
-                        early_eof = True
-                    else:
-                        self._unexpected_exit_cb = on_unexpected_exit
-                        if stall_timeout_sec > 0.0:
-                            wd_evt = threading.Event()
-                            wd_thr = threading.Thread(
-                                target=self._watch_stall,
-                                args=(proc, buf, wd_evt, start_ts, float(stall_timeout_sec)),
-                                daemon=True,
-                            )
-                            self._wd_stop_evt = wd_evt
-                            self._wd_thread = wd_thr
-            if wd_thr is not None:
-                wd_thr.start()
-            if early_eof:
+                if self._startup_evt is startup_evt:
+                    self._startup_evt = None
+                if self._aborted.is_set():
+                    raise MicrophoneUnavailableError(
+                        "microphone recording aborted",
+                        reason_code="mic_unavailable",
+                        hud_state="mic_unavailable",
+                    )
+        except BaseException:
+            with self._lock:
+                if self._startup_evt is startup_evt:
+                    self._startup_evt = None
+                if self._proc is proc:
+                    self._proc, self._reader, self._err_reader, self._buf, self._err_buf = (
+                        None,
+                        None,
+                        None,
+                        bytearray(),
+                        bytearray(),
+                    )
+                    self._wd_stop_evt, self._wd_thread = None, None
+                    self._stdout_eof = False
+                    self._stopping = True
+                    self._stall_triggered = False
+                    self._last_chunk_ts = 0.0
+                    self._unexpected_exit_cb = None
+                    self._level_cb = None
+                    self._live_level, self._live_level_ts = 0.0, 0.0
+            if wd_evt is not None:
+                wd_evt.set()
+            if wd_thr is not None and wd_thr.ident is not None and wd_thr is not threading.current_thread():
+                wd_thr.join(timeout=0.5)
+            if proc.poll() is None:
                 try:
-                    rc = proc.wait(timeout=0.25)
-                except subprocess.TimeoutExpired:
-                    rc = proc.poll()
-                err_reader.join(timeout=0.15)
-                should_fire = False
-                with self._lock:
-                    if self._proc is proc and not self._stopping:
-                        self.last_returncode = rc
-                        raw_err = bytes(err_buf).decode("utf-8", errors="replace").strip()
-                        self.last_stderr = raw_err or ("unexpected_eof_rc0" if rc == 0 else "")
-                        should_fire = True
-                if should_fire:
-                    threading.Thread(target=on_unexpected_exit, daemon=True).start()
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+            if reader is not None and reader.ident is not None and reader is not threading.current_thread():
+                reader.join(timeout=1.0)
+            if err_reader is not None and err_reader.ident is not None and err_reader is not threading.current_thread():
+                err_reader.join(timeout=1.0)
+            for pipe, thr in ((proc.stdout, reader), (proc.stderr, err_reader)):
+                if pipe is not None and (thr is None or not thr.is_alive()):
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+            raise
 
     def stop(self, *, drain_sec: float = 0.0) -> bytes:
+        if drain_sec <= 0.0:
+            self._aborted.set()
+        return self._stop_impl(drain_sec=drain_sec)
+
+    def _stop_impl(self, *, drain_sec: float = 0.0) -> bytes:
         with self._lock:
             proc, reader, err_reader, buf, err_buf = self._proc, self._reader, self._err_reader, self._buf, self._err_buf
             wd_evt, wd_thr = self._wd_stop_evt, self._wd_thread
+            startup_evt = self._startup_evt
             self._proc, self._reader, self._err_reader, self._buf, self._err_buf = None, None, None, bytearray(), bytearray()
             self._wd_stop_evt, self._wd_thread = None, None
+            self._startup_evt = None
             self._stopping = True
             self._stdout_eof = False
             self._unexpected_exit_cb = None
             self._level_cb = None
             self._live_level, self._live_level_ts = 0.0, 0.0
+        if startup_evt is not None:
+            startup_evt.set()
         if wd_evt is not None:
             wd_evt.set()
-        if wd_thr is not None and wd_thr.is_alive() and wd_thr is not threading.current_thread():
+        if wd_thr is not None and wd_thr.ident is not None and wd_thr is not threading.current_thread():
             wd_thr.join(timeout=0.5)
         if proc is None:
             return b""
+        aborted_during_drain = False
         if drain_sec > 0.0 and proc.poll() is None:
-            time.sleep(drain_sec)
-        for sig, wait_s in ((signal.SIGTERM, 0.18), (signal.SIGKILL, 1.0)):
+            aborted_during_drain = self._aborted.wait(timeout=drain_sec)
+        sig_plan = (
+            ((signal.SIGKILL, 1.0),)
+            if (self._force_kill or aborted_during_drain)
+            else ((signal.SIGTERM, 0.18), (signal.SIGKILL, 1.0))
+        )
+        for sig, wait_s in sig_plan:
             if proc.poll() is not None:
                 break
             try: os.killpg(proc.pid, sig)
@@ -526,11 +627,11 @@ class FfmpegWavRecorder:
                 except ProcessLookupError: pass
             try: proc.wait(timeout=wait_s); break
             except subprocess.TimeoutExpired: continue
-        if reader is not None and reader is not threading.current_thread():
+        if reader is not None and reader.ident is not None and reader is not threading.current_thread():
             # Lock-safety invariant: join() must keep a finite timeout so stop_recording() held
             # under Daemon._trigger_lock never deadlocks with an exit callback awaiting _trigger_lock.
             reader.join(timeout=1.0)
-        if err_reader is not None and err_reader is not threading.current_thread():
+        if err_reader is not None and err_reader.ident is not None and err_reader is not threading.current_thread():
             err_reader.join(timeout=1.0)
         self._live_level, self._live_level_ts = 0.0, 0.0
         self.last_returncode = proc.returncode

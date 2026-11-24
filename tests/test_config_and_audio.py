@@ -1523,7 +1523,7 @@ class AudioProcTests(unittest.TestCase):
         self.assertGreaterEqual(gate.duration_sec, 0.30)
 
         # 3. WslPlatform (0.65s) & MacOSPlatform (0.20s) pass platform drain on stop, 0.0s on cancel
-        from agent_voice_input.platform_macos import MacOSPlatform
+        from agent_voice_input.platform_macos import MacOSPlatform, _MacRecSession
         from agent_voice_input.platform_wsl import WslPlatform
 
         seen_drains: list[float] = []
@@ -1535,10 +1535,12 @@ class AudioProcTests(unittest.TestCase):
         wplat.cancel_recording()
 
         mplat = MacOSPlatform(Config(), env={})
-        mplat._recording = True
         mplat._ff_rec.stop = lambda *, drain_sec=0.0: (seen_drains.append(drain_sec) or b"")  # type: ignore[method-assign]
+        with mplat._rec_cond:
+            mplat._cur_session = _MacRecSession(1, mplat._ff_rec, Path("."))
         mplat.stop_recording()
-        mplat._recording = True
+        with mplat._rec_cond:
+            mplat._cur_session = _MacRecSession(2, mplat._ff_rec, Path("."))
         mplat.cancel_recording()
         self.assertEqual(seen_drains, [0.65, 0.0, 0.20, 0.0])
 

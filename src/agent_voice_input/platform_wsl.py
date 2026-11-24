@@ -29,6 +29,7 @@ from .platform_common import (
     MicrophoneUnavailableError,
     NoMicrophoneError,
     PasteOutcome,
+    _ShimWriteTimeout,
     classify_ffmpeg_startup_error,
     invoke_recorder_lost_callback,
     invoke_recorder_recovered_callback,
@@ -521,6 +522,8 @@ class WslPlatform(JsonlShimMixin):
                             fb_gen = self._winmm_gen
                             self._active_seq_id = seq_id
                             self._rec_mode = "pulse"
+                            if isinstance(self._ff_rec, FfmpegWavRecorder):
+                                self._ff_rec.reset_abort()
                 if should_discard_winmm and target_writer is not None:
                     discard_req = {"cmd": "rec_stop", "rec_gen": my_gen, "discard": True}
                     status = self._write_shim_command(discard_req, writer=target_writer, timeout_sec=0.25)
@@ -623,6 +626,8 @@ class WslPlatform(JsonlShimMixin):
             p_gen = self._winmm_gen
             self._active_seq_id = seq_id
             self._rec_mode = "pulse"
+            if isinstance(self._ff_rec, FfmpegWavRecorder):
+                self._ff_rec.reset_abort()
         src = "RDPSink.monitor" if (eff_loopback and self.pulse_source == "RDPSource") else self.pulse_source
         try:
             self._ff_rec.start(
@@ -658,6 +663,8 @@ class WslPlatform(JsonlShimMixin):
         with self._winmm_state_lock:
             stop_gen = self._winmm_gen
             self._winmm_gen += 1
+            next_gen = self._winmm_gen
+            prev_seq_id = self._active_seq_id
             self._active_seq_id = None
             was_dispatched = self._winmm_rpc_dispatched
             rec_writer, self._rec_writer = self._rec_writer, None
@@ -690,16 +697,29 @@ class WslPlatform(JsonlShimMixin):
                 )
                 b64 = str(res.get("wav_b64") or "")
                 wav = base64.b64decode(b64) if b64 else b""
-                if not _discard and stop_gen > 0 and (wav or res.get("rec_gen") == stop_gen):
+                if not _discard and stop_gen > 0 and (wav or res.get("rec_gen") == stop_gen or res.get("rec_error")):
                     should_release = True
                 rec_err = str(res.get("rec_error") or "").strip()
                 self.last_audio_error = rec_err if rec_err else ("" if wav else "wasapi_empty_audio")
                 return wav, "winmm"
-            except Exception:
-                if not _discard and stop_gen > 0:
-                    should_release = True
+            except _ShimWriteTimeout as wto:
+                # Zero bytes entered stdin -> healthy Windows shim never received rec_stop and is
+                # still recording stop_gen. Restore session state so a subsequent cancel_recording()
+                # or retry stop_recording() still targets the same writer and rec_gen.
+                if wto.write_status == "not_sent":
+                    with self._winmm_state_lock:
+                        if not self._closed and self._winmm_gen == next_gen:
+                            self._winmm_gen = stop_gen
+                            self._rec_mode = mode
+                            self._rec_writer = rec_writer
+                            self._winmm_rpc_dispatched = was_dispatched
+                            self._active_seq_id = prev_seq_id
                 raise
             finally:
+                # Only release the Windows single-slot StoppedRecSlot after receiving and decoding
+                # an explicit rec_stop reply. On RPC/pipe timeout or error, never send rec_release
+                # blindly (Windows may still be finalizing the WAV, and the single slot is bounded
+                # and automatically cleared by the next rec_start / cancel_recording).
                 if should_release:
                     self._enqueue_shim_async(
                         {"cmd": "rec_release", "rec_gen": stop_gen},
@@ -712,8 +732,34 @@ class WslPlatform(JsonlShimMixin):
 
     def cancel_recording(self) -> None:
         self._stop_level_streamer()
-        try: self.stop_recording(drain=False, _discard=True)
-        except Exception: pass
+        with self._winmm_state_lock:
+            orig_gen = self._winmm_gen if (self._rec_mode == "winmm" or self._winmm_rpc_dispatched) else 0
+            orig_writer = self._rec_writer if orig_gen > 0 else None
+        try:
+            self.stop_recording(drain=False, _discard=True)
+        except _ShimWriteTimeout as wto:
+            if wto.write_status != "not_sent":
+                return
+            reap_writer: Any = None
+            with self._winmm_state_lock:
+                if self._closed:
+                    return
+                if orig_gen > 0 and self._winmm_gen == orig_gen and self._rec_writer is orig_writer:
+                    self._winmm_gen += 1
+                    self._active_seq_id = None
+                    self._rec_writer = None
+                    self._winmm_starting = False
+                    self._winmm_rpc_dispatched = False
+                    self._pending_winmm_lost_reason = ""
+                    self._pending_winmm_recovered_gaps.clear()
+                    self._rec_mode = ""
+                    reap_writer = orig_writer
+                elif orig_writer is not None and self._rec_writer is not orig_writer:
+                    reap_writer = orig_writer
+            if reap_writer is not None and not self._closed:
+                self._poison_and_reap_writer(reap_writer)
+        except Exception:
+            pass
 
     def switch_to_fallback_audio(self) -> bool:
         if self.cfg.audio.wsl_source != "auto":

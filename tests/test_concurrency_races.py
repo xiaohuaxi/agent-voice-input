@@ -1956,8 +1956,9 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 self.assertFalse(th.is_alive())
                 self.assertEqual(start_errs, [])
                 self.assertTrue(plat._closed)
-                self.assertFalse(plat._rec_active, "closed=True must never coexist with rec_active=True")
-                self.assertFalse(plat._recording)
+                self.assertFalse(plat.is_recording, "closed=True must never coexist with is_recording=True")
+                self.assertFalse(hasattr(plat, "_rec_active"))
+                self.assertFalse(hasattr(plat, "_recording"))
                 self.assertIsNone(plat._cur_session)
                 self.assertEqual(rec_starts[0], 0, "stale start_recording after close() must never spawn ffmpeg")
             finally:
@@ -2146,8 +2147,6 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 )
                 with plat._rec_cond:
                     plat._cur_session = sess
-                    plat._rec_active = True
-                    plat._recording = True
                 plat.set_recorder_lost_callback(lambda *, seq_id=None: lost_fired.set())
 
                 t0 = time.monotonic()
@@ -2162,7 +2161,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 dt = time.monotonic() - t0
                 self.assertLess(dt, 0.1, f"_on_shim_internal_event blocked caller ({dt:.3f}s)")
                 self.assertTrue(stop_entered.wait(timeout=1.0))
-                self.assertFalse(plat._rec_active)
+                self.assertFalse(plat.is_recording)
                 release_stop.set()
                 self.assertTrue(lost_fired.wait(timeout=2.0))
             finally:
@@ -2284,29 +2283,24 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             os.close(r_fd)
 
     def test_r2_p0_2_macos_close_never_allows_ffmpeg_popen_after_close_returns(self) -> None:
-        """P0-2: Guarded FfmpegWavRecorder.start prevents Popen after MacOSPlatform.close() returns."""
+        """P0-2: Lock-free spawn + close() convergence ensures zero live orphan FFmpeg when close() returns."""
         from agent_voice_input.platform_common import FfmpegWavRecorder
         from agent_voice_input.platform_macos import MacOSPlatform
 
+        pcm_src = (
+            "import os, sys, time\n"
+            "os.write(1, b'\\x01\\x02' * 800)\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(5.0)\n"
+        )
         with tempfile.TemporaryDirectory() as td:
             rt = Path(td) / "rt"
             rt.mkdir(parents=True, exist_ok=True)
-            build_entered = threading.Event()
-            release_build = threading.Event()
-            popen_called = [0]
+            popen_entered = threading.Event()
+            release_popen = threading.Event()
+            spawned_procs: list[subprocess.Popen[bytes]] = []
+            lock_free_during_popen: list[bool] = []
 
-            rec = FfmpegWavRecorder(
-                cmd_factory=lambda _f, _s: [sys.executable, "-c", "import time; time.sleep(5)"]
-            )
-            orig_build = rec._build_cmd
-
-            def _paused_build(fmt: str, src: str) -> list[str]:
-                cmd = orig_build(fmt, src)
-                build_entered.set()
-                release_build.wait(timeout=3.0)
-                return cmd
-
-            rec._build_cmd = _paused_build  # type: ignore[method-assign]
             plat = MacOSPlatform(
                 Config(),
                 env={"HOME": td},
@@ -2320,13 +2314,35 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                     "mic_auth": "authorized",
                 },
             )
-            plat._ff_rec = rec
+            plat._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [sys.executable, "-c", pcm_src]
+            )
             errs: list[BaseException] = []
             orig_popen = subprocess.Popen
 
+            def _probe_rec_cond_unlocked_from_other_thread() -> bool:
+                res_box: list[bool] = []
+
+                def _probe() -> None:
+                    acquired = plat._rec_cond.acquire(blocking=False)
+                    if acquired:
+                        plat._rec_cond.release()
+                    res_box.append(acquired)
+
+                pt = threading.Thread(target=_probe, daemon=True)
+                pt.start()
+                pt.join(timeout=1.0)
+                return bool(res_box and res_box[0])
+
             def _counting_popen(*args: Any, **kwargs: Any) -> Any:
-                popen_called[0] += 1
-                return orig_popen(*args, **kwargs)
+                # Verify _rec_cond is NEVER held across subprocess.Popen from a separate thread
+                # (same-thread acquire on Condition's default RLock would re-enter and mask a held lock).
+                lock_free_during_popen.append(_probe_rec_cond_unlocked_from_other_thread())
+                p = orig_popen(*args, **kwargs)
+                spawned_procs.append(p)
+                popen_entered.set()
+                release_popen.wait(timeout=3.0)
+                return p
 
             def _run_start() -> None:
                 try:
@@ -2334,26 +2350,43 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 except BaseException as exc:
                     errs.append(exc)
 
+            close_done = threading.Event()
+
+            def _run_close() -> None:
+                plat.close()
+                close_done.set()
+
             with mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_counting_popen):
                 th = threading.Thread(target=_run_start, daemon=True)
                 th.start()
+                th_close = threading.Thread(target=_run_close, daemon=True)
                 try:
-                    self.assertTrue(build_entered.wait(timeout=2.0))
-                    # close() returns while start_recording is parked right before Popen!
-                    plat.close()
-                    self.assertTrue(plat._closed)
-                    self.assertIsNone(plat._cur_session)
-                    release_build.set()
+                    self.assertTrue(popen_entered.wait(timeout=2.0))
+                    # Launch close() while start_recording is parked inside Popen:
+                    # close() must wait for the in-flight spawn to converge and kill any FFmpeg it creates!
+                    th_close.start()
+                    time.sleep(0.05)
+                    self.assertFalse(close_done.is_set(), "close() must wait for in-flight spawn to converge")
+                    release_popen.set()
+                    self.assertTrue(close_done.wait(timeout=3.0), "close() must finish once spawn aborts")
+                    # Assert BEFORE joining th: the instant close() returns, _spawning_recs is already empty
+                    # and every spawned subprocess is already dead (no orphan window after close() returns).
+                    with plat._rec_cond:
+                        self.assertEqual(plat._spawning_recs, {}, "_spawning_recs must be empty when close() returns")
+                    self.assertEqual(len(spawned_procs), 1)
+                    for p in spawned_procs:
+                        self.assertIsNotNone(p.poll(), "no orphan FFmpeg subprocess may survive when close() returns")
                     th.join(timeout=2.0)
                     self.assertFalse(th.is_alive())
                     self.assertEqual(errs, [])
-                    self.assertEqual(popen_called[0], 0, "Popen must NOT run after close() returned")
-                    self.assertIsNone(rec._proc)
-                    self.assertFalse(plat._rec_active)
+                    self.assertTrue(plat._closed)
                     self.assertIsNone(plat._cur_session)
+                    self.assertFalse(plat.is_recording)
+                    self.assertEqual(lock_free_during_popen, [True], "_rec_cond must not be held during Popen")
                 finally:
-                    release_build.set()
-                    th.join(timeout=1.0)
+                    release_popen.set()
+                    th_close.join(timeout=2.0)
+                    th.join(timeout=2.0)
                     plat.close()
 
     def test_r2_p0_3_agy_worker_readers_close_pipes_after_stop_join_timeout(self) -> None:
@@ -3083,7 +3116,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 os.close(r_fd)
 
     def test_r3_p1_2_macos_handoff_rejects_spawn_when_selected_uid_disconnects(self) -> None:
-        """R2 P1-2: MacOSPlatform handoff before Popen must reject start if selected mic UID disconnected."""
+        """R2 P1-2: MacOSPlatform phase-2 verification rejects commit & kills FFmpeg if selected mic UID disconnects during spawn."""
         from agent_voice_input.platform_common import (
             FfmpegWavRecorder,
             MicrophoneUnavailableError,
@@ -3091,6 +3124,12 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
         )
         from agent_voice_input.platform_macos import MacOSPlatform
 
+        pcm_src = (
+            "import os, sys, time\n"
+            "os.write(1, b'\\x01\\x02' * 800)\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(5.0)\n"
+        )
         with tempfile.TemporaryDirectory() as td:
             rt = Path(td) / "rt"
             rt.mkdir(parents=True, exist_ok=True)
@@ -3126,10 +3165,11 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 with self.subTest(case=label):
                     build_entered = threading.Event()
                     release_build = threading.Event()
-                    popen_called = [0]
+                    spawned_procs: list[subprocess.Popen[bytes]] = []
+                    lock_free_during_popen: list[bool] = []
 
                     rec = FfmpegWavRecorder(
-                        cmd_factory=lambda _f, _s: [sys.executable, "-c", "import time; time.sleep(5)"]
+                        cmd_factory=lambda _f, _s: [sys.executable, "-c", pcm_src]
                     )
                     orig_build = rec._build_cmd
 
@@ -3153,8 +3193,9 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                             "mic_auth": "authorized",
                         },
                     )
-                    plat._ff_rec = rec
+                    plat._new_recorder = lambda r=rec: r  # type: ignore[method-assign]
                     exc_box: list[BaseException] = []
+                    orig_popen = subprocess.Popen
 
                     def _run_start() -> None:
                         try:
@@ -3162,24 +3203,40 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                         except BaseException as exc:
                             exc_box.append(exc)
 
-                    def _counting_popen(*args: Any, **kwargs: Any) -> Any:
-                        popen_called[0] += 1
-                        raise AssertionError(f"Popen must not be called after {label}: {args} {kwargs}")
+                    def _tracking_popen(*args: Any, **kwargs: Any) -> Any:
+                        probe_ok: list[bool] = []
+
+                        def _probe_lock() -> None:
+                            acquired = plat._rec_cond.acquire(blocking=False)
+                            if acquired:
+                                plat._rec_cond.release()
+                            probe_ok.append(acquired)
+
+                        pt = threading.Thread(target=_probe_lock, daemon=True)
+                        pt.start()
+                        pt.join(timeout=1.0)
+                        lock_free_during_popen.append(bool(probe_ok and probe_ok[0]))
+                        p = orig_popen(*args, **kwargs)
+                        spawned_procs.append(p)
+                        return p
 
                     try:
-                        with mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_counting_popen):
+                        with mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_tracking_popen):
                             th = threading.Thread(target=_run_start, daemon=True)
                             th.start()
                             self.assertTrue(build_entered.wait(timeout=2.0))
                             plat._on_shim_internal_event(disconnect_event)
                             release_build.set()
-                            th.join(timeout=2.0)
-                        self.assertEqual(popen_called[0], 0, "FFmpeg Popen must be rejected at handoff")
+                            th.join(timeout=3.0)
+                        self.assertEqual(lock_free_during_popen, [True], "_rec_cond must not be held during Popen")
                         self.assertEqual(len(exc_box), 1)
                         self.assertIsInstance(exc_box[0], expected_exc)
                         self.assertEqual(plat.last_audio_error, "coreaudio_device_disconnected")
-                        self.assertFalse(plat._rec_active)
+                        self.assertFalse(plat.is_recording)
                         self.assertIsNone(plat._cur_session)
+                        self.assertIsNone(rec._proc)
+                        for p in spawned_procs:
+                            self.assertIsNotNone(p.poll(), "spawned FFmpeg must be terminated on disconnect abort")
                     finally:
                         release_build.set()
                         plat.close()
@@ -3366,7 +3423,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 self.assertEqual(len(exc_box), 1)
                 self.assertIsInstance(exc_box[0], MicrophoneUnavailableError)
                 self.assertEqual(plat.last_audio_error, "coreaudio_device_disconnected")
-                self.assertFalse(plat._rec_active)
+                self.assertFalse(plat.is_recording)
                 self.assertIsNone(plat._cur_session)
             finally:
                 release_probe.set()
@@ -4126,6 +4183,968 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 os.close(w_fd)
             if r_fd >= 0:
                 os.close(r_fd)
+
+    def test_stage3a_r2_p0_macos_close_aborts_pre_popen_and_15s_first_frame_wait(self) -> None:
+        """Stage 3A P0: close() aborts both pre-Popen spawn and 15s first-frame wait with zero live orphans on return."""
+        from agent_voice_input.platform_common import FfmpegWavRecorder
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+
+            # Part 1: close() called while start_recording() is parked before Popen -> Popen is NEVER executed.
+            build_entered = threading.Event()
+            release_build = threading.Event()
+            popen_calls_pre: list[int] = []
+            orig_build = FfmpegWavRecorder._build_cmd
+            orig_popen = subprocess.Popen
+
+            def _paused_build(rec_self: FfmpegWavRecorder, fmt: str, src: str) -> list[str]:
+                cmd = orig_build(rec_self, fmt, src)
+                build_entered.set()
+                release_build.wait(timeout=3.0)
+                return cmd
+
+            def _forbid_popen(*args: Any, **kwargs: Any) -> Any:
+                popen_calls_pre.append(1)
+                return orig_popen(*args, **kwargs)
+
+            plat_pre = MacOSPlatform(
+                Config(),
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache_pre",
+                self_check_fn=lambda: {
+                    "hal_ok": True,
+                    "has_input": True,
+                    "default_uid": "mic-1",
+                    "default_name": "Built-in Mic",
+                    "alive_uids": ["mic-1"],
+                    "mic_auth": "not_determined",
+                    "has_graphic_session": True,
+                },
+            )
+            plat_pre._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [sys.executable, "-c", "import time; time.sleep(20.0)"]
+            )
+            pre_errs: list[BaseException] = []
+            close_pre_done = threading.Event()
+
+            def _start_pre() -> None:
+                try:
+                    plat_pre.start_recording(rt, seq_id=1)
+                except BaseException as exc:
+                    pre_errs.append(exc)
+
+            def _close_pre() -> None:
+                plat_pre.close()
+                close_pre_done.set()
+
+            with (
+                mock.patch.object(FfmpegWavRecorder, "_build_cmd", _paused_build),
+                mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_forbid_popen),
+            ):
+                th_pre = threading.Thread(target=_start_pre, daemon=True)
+                th_close_pre = threading.Thread(target=_close_pre, daemon=True)
+                th_pre.start()
+                try:
+                    self.assertTrue(build_entered.wait(timeout=2.0))
+                    th_close_pre.start()
+                    time.sleep(0.05)
+                    self.assertFalse(close_pre_done.is_set())
+                    t_rel = time.monotonic()
+                    release_build.set()
+                    self.assertTrue(close_pre_done.wait(timeout=1.0), "close() must converge immediately after pre-Popen abort")
+                    self.assertLess(time.monotonic() - t_rel, 1.0)
+                    # Assert BEFORE joining th_pre: _spawning_recs is already empty and Popen was never called.
+                    with plat_pre._rec_cond:
+                        self.assertEqual(plat_pre._spawning_recs, {})
+                    self.assertEqual(popen_calls_pre, [], "aborted recorder must never invoke Popen")
+                    th_pre.join(timeout=2.0)
+                    self.assertEqual(pre_errs, [])
+                finally:
+                    release_build.set()
+                    th_close_pre.join(timeout=2.0)
+                    th_pre.join(timeout=2.0)
+                    plat_pre.close()
+
+            # Part 2: 15s first-frame wait (not_determined mic_auth, child emits 0 frames) ->
+            # close() aborts in <1s (never waits 2s or 15s) and child is ALREADY dead when close() returns!
+            child_spawned = threading.Event()
+            spawned_15s: list[subprocess.Popen[bytes]] = []
+
+            def _capture_popen(*args: Any, **kwargs: Any) -> Any:
+                p = orig_popen(*args, **kwargs)
+                spawned_15s.append(p)
+                child_spawned.set()
+                return p
+
+            plat_15s = MacOSPlatform(
+                Config(),
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache_15s",
+                self_check_fn=lambda: {
+                    "hal_ok": True,
+                    "has_input": True,
+                    "default_uid": "mic-1",
+                    "default_name": "Built-in Mic",
+                    "alive_uids": ["mic-1"],
+                    "mic_auth": "not_determined",
+                    "has_graphic_session": True,
+                },
+            )
+            plat_15s._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [sys.executable, "-c", "import time; time.sleep(20.0)"]
+            )
+            errs_15s: list[BaseException] = []
+
+            def _start_15s() -> None:
+                try:
+                    plat_15s.start_recording(rt, seq_id=2)
+                except BaseException as exc:
+                    errs_15s.append(exc)
+
+            with mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_capture_popen):
+                th_15s = threading.Thread(target=_start_15s, daemon=True)
+                th_15s.start()
+                try:
+                    self.assertTrue(child_spawned.wait(timeout=2.0))
+                    t0 = time.monotonic()
+                    plat_15s.close()
+                    dt = time.monotonic() - t0
+                    self.assertLess(dt, 1.0, f"close() should abort 15s first-frame wait quickly, took {dt:.3f}s")
+                    # Assert BEFORE joining th_15s: zero live orphans and empty _spawning_recs right as close() returns!
+                    with plat_15s._rec_cond:
+                        self.assertEqual(plat_15s._spawning_recs, {})
+                    self.assertEqual(len(spawned_15s), 1)
+                    self.assertIsNotNone(spawned_15s[0].poll(), "child must already be dead when close() returns")
+                    th_15s.join(timeout=2.0)
+                    self.assertFalse(th_15s.is_alive())
+                    self.assertEqual(errs_15s, [])
+                finally:
+                    plat_15s.close()
+                    th_15s.join(timeout=2.0)
+
+    def test_stage3a_r2_p1_1_macos_concurrent_stop_and_new_start_zero_crosstalk(self) -> None:
+        """Stage 3A P1 #1: Exclusive FfmpegWavRecorder per session eliminates concurrent stop/start crosstalk."""
+        from agent_voice_input.platform_common import FfmpegWavRecorder
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        seg1_src = (
+            "import os, sys, time\n"
+            "os.write(1, b'\\x01\\x00' * 800)\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(10.0)\n"
+        )
+        seg2_src = (
+            "import os, sys, time\n"
+            "os.write(1, b'\\x02\\x00' * 800)\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(10.0)\n"
+        )
+        call_n = [0]
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            plat = MacOSPlatform(
+                Config(audio=AudioConfig(tail_drain_sec=0.0)),
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache",
+                self_check_fn=lambda: {
+                    "hal_ok": True,
+                    "has_input": True,
+                    "default_uid": "mic-1",
+                    "default_name": "Built-in Mic",
+                    "alive_uids": ["mic-1"],
+                    "mic_auth": "authorized",
+                },
+            )
+            plat._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: (
+                    call_n.__setitem__(0, call_n[0] + 1)
+                    or [sys.executable, "-c", seg1_src if call_n[0] == 1 else seg2_src]
+                )
+            )
+            stop_entered = threading.Event()
+            release_stop = threading.Event()
+            stop1_res: list[tuple[bytes, str]] = []
+            try:
+                plat.start_recording(rt, seq_id=1)
+                sess1 = plat._cur_session
+                self.assertIsNotNone(sess1)
+                assert sess1 is not None
+                rec1 = sess1.rec
+                orig_rec1_stop = rec1.stop
+
+                def _paused_stop1(*, drain_sec: float = 0.0) -> bytes:
+                    stop_entered.set()
+                    release_stop.wait(timeout=3.0)
+                    return orig_rec1_stop(drain_sec=drain_sec)
+
+                rec1.stop = _paused_stop1  # type: ignore[method-assign]
+
+                def _run_stop1() -> None:
+                    stop1_res.append(plat.stop_recording(drain=False))
+
+                th_stop1 = threading.Thread(target=_run_stop1, daemon=True)
+                th_stop1.start()
+                self.assertTrue(stop_entered.wait(timeout=2.0))
+
+                # Start session 2 while session 1's stop_recording() is still executing rec1.stop() outside _rec_cond.
+                plat.start_recording(rt, seq_id=2)
+                sess2 = plat._cur_session
+                self.assertIsNotNone(sess2)
+                assert sess2 is not None
+                self.assertIsNot(sess2.rec, rec1, "new session must use a fresh FfmpegWavRecorder instance")
+                proc2 = sess2.rec._proc
+                self.assertIsNotNone(proc2)
+                assert proc2 is not None
+
+                release_stop.set()
+                th_stop1.join(timeout=2.0)
+                self.assertFalse(th_stop1.is_alive())
+                self.assertEqual(len(stop1_res), 1)
+                wav1, _ = stop1_res[0]
+                self.assertEqual(wav1[44:], b"\x01\x00" * 800, "old stop must return only session 1 PCM")
+                self.assertTrue(plat.is_recording, "old stop must never terminate session 2")
+                self.assertIsNone(proc2.poll(), "session 2 subprocess must remain alive")
+
+                wav2, _ = plat.stop_recording(drain=False)
+                self.assertEqual(wav2[44:], b"\x02\x00" * 800, "new stop must return only session 2 PCM")
+                self.assertIsNotNone(proc2.poll())
+            finally:
+                release_stop.set()
+                plat.close()
+
+    def test_stage3a_r2_p1_2_macos_normal_stop_during_mic_recovery_preserves_tail_audio(self) -> None:
+        """Stage 3A P1 #2: Normal stop_recording() during microphone recovery preserves both pre-drop and recovered tail PCM."""
+        from agent_voice_input.platform_common import FfmpegWavRecorder
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        seg1_src = (
+            "import os, sys, time\n"
+            "os.write(1, b'\\x11\\x22' * 800)\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(0.04)\n"
+            "sys.stderr.write('transient glitch\\n')\n"
+            "sys.exit(251)\n"
+        )
+        seg2_src = (
+            "import os, sys, time\n"
+            "os.write(1, b'\\x33\\x44' * 800)\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(10.0)\n"
+        )
+        call_n = [0]
+        respawn_started = threading.Event()
+        allow_respawn_return = threading.Event()
+        orig_rec_start = FfmpegWavRecorder.start
+
+        def _sync_start(rec_self: FfmpegWavRecorder, *a: Any, **kw: Any) -> None:
+            orig_rec_start(rec_self, *a, **kw)
+            if call_n[0] == 2:
+                # Respawn FFmpeg has already delivered its first PCM frames and is about to return to platform_macos.
+                respawn_started.set()
+                allow_respawn_return.wait(timeout=3.0)
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            plat = MacOSPlatform(
+                Config(audio=AudioConfig(tail_drain_sec=0.0)),
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache",
+            )
+            plat._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: (
+                    call_n.__setitem__(0, call_n[0] + 1)
+                    or [sys.executable, "-c", seg1_src if call_n[0] == 1 else seg2_src]
+                )
+            )
+            plat._has_managed_shim = lambda: True  # type: ignore[method-assign]
+            plat._shim_rpc = lambda payload, timeout_sec=0.8, **kw: (  # type: ignore[method-assign]
+                {
+                    "ok": True,
+                    "reply": True,
+                    "audio_status": {
+                        "has_input": True,
+                        "input_count": 1,
+                        "default_uid": "bt-earbuds:input",
+                        "default_name": "FreeClip",
+                        "alive_uids": ["bt-earbuds:input"],
+                    },
+                }
+                if payload.get("cmd") == "audio_status"
+                else {"ok": True}
+            )
+            stop_box: list[tuple[bytes, str]] = []
+            try:
+                with mock.patch.object(FfmpegWavRecorder, "start", autospec=True, side_effect=_sync_start):
+                    plat.start_recording(rt, seq_id=1)
+                    self.assertTrue(respawn_started.wait(timeout=2.5), "respawn did not reach first-frame readiness")
+
+                    def _do_stop() -> None:
+                        stop_box.append(plat.stop_recording(drain=False))
+
+                    th_stop = threading.Thread(target=_do_stop, daemon=True)
+                    th_stop.start()
+                    # Wait until stop_recording() has cleared _cur_session & set session.active=False, waiting on session.busy.
+                    dl = time.monotonic() + 2.0
+                    while time.monotonic() < dl:
+                        with plat._rec_cond:
+                            if plat._cur_session is None:
+                                break
+                        time.sleep(0.005)
+                    allow_respawn_return.set()
+                    th_stop.join(timeout=3.0)
+
+                self.assertFalse(th_stop.is_alive())
+                self.assertEqual(len(stop_box), 1)
+                wav_out, backend = stop_box[0]
+                self.assertEqual(backend, "avfoundation")
+                self.assertEqual(plat.last_audio_error, "")
+                self.assertFalse(plat._last_stop_recorder_lost)
+                pcm_out = wav_out[44:]
+                self.assertTrue(pcm_out.startswith(b"\x11\x22" * 800), "missing pre-drop head PCM")
+                self.assertTrue(pcm_out.endswith(b"\x33\x44" * 800), "recovered tail PCM was dropped during normal stop")
+                self.assertGreaterEqual(len(pcm_out), 3200)
+                with plat._rec_cond:
+                    self.assertEqual(plat._spawning_recs, {})
+            finally:
+                allow_respawn_return.set()
+                plat.close()
+
+    def test_stage3a_r2_p1_3_ffmpeg_start_reaps_child_when_thread_start_fails(self) -> None:
+        """Stage 3A P1 #3: Any failure after Popen (e.g. watchdog Thread.start() error) immediately reaps the child."""
+        from agent_voice_input.platform_common import FfmpegWavRecorder
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        pcm_src = (
+            "import os, sys, time\n"
+            "os.write(1, b'\\x01\\x02' * 800)\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(20.0)\n"
+        )
+        orig_popen = subprocess.Popen
+        orig_thread_start = threading.Thread.start
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            spawned: list[subprocess.Popen[bytes]] = []
+
+            def _track_popen(*args: Any, **kwargs: Any) -> Any:
+                p = orig_popen(*args, **kwargs)
+                spawned.append(p)
+                return p
+
+            # Subcase A: Watchdog Thread.start() fails after first frame arrives.
+            def _fail_watchdog_start(thr_self: threading.Thread) -> None:
+                target = getattr(thr_self, "_target", None)
+                if getattr(target, "__name__", "") == "_watch_stall":
+                    raise RuntimeError("can't start new thread (injected watchdog failure)")
+                orig_thread_start(thr_self)
+
+            plat = MacOSPlatform(
+                Config(),
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache",
+                self_check_fn=lambda: {
+                    "hal_ok": True,
+                    "has_input": True,
+                    "default_uid": "mic-1",
+                    "default_name": "Built-in Mic",
+                    "alive_uids": ["mic-1"],
+                    "mic_auth": "authorized",
+                },
+            )
+            plat._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [sys.executable, "-c", pcm_src]
+            )
+            try:
+                with (
+                    mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_track_popen),
+                    mock.patch.object(threading.Thread, "start", _fail_watchdog_start),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        plat.start_recording(rt, seq_id=1)
+                self.assertEqual(len(spawned), 1)
+                self.assertIsNotNone(spawned[0].poll(), "child must be reaped immediately when watchdog Thread.start fails")
+                self.assertFalse(plat.is_recording)
+                with plat._rec_cond:
+                    self.assertEqual(plat._spawning_recs, {})
+            finally:
+                plat.close()
+
+            # Subcase B: Reader Thread.start() fails right after Popen -> child reaped & pipes closed cleanly.
+            spawned_b: list[subprocess.Popen[bytes]] = []
+
+            def _track_popen_b(*args: Any, **kwargs: Any) -> Any:
+                p = orig_popen(*args, **kwargs)
+                spawned_b.append(p)
+                return p
+
+            def _fail_reader_start(thr_self: threading.Thread) -> None:
+                target = getattr(thr_self, "_target", None)
+                if getattr(target, "__name__", "") == "_read_stdout":
+                    raise RuntimeError("can't start new thread (injected reader failure)")
+                orig_thread_start(thr_self)
+
+            rec_b = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", pcm_src])
+            with (
+                mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_track_popen_b),
+                mock.patch.object(threading.Thread, "start", _fail_reader_start),
+            ):
+                with self.assertRaises(RuntimeError):
+                    rec_b.start("avfoundation", ":default", rt, {"HOME": td}, verify_startup=True)
+            self.assertEqual(len(spawned_b), 1)
+            self.assertIsNotNone(spawned_b[0].poll(), "child must be reaped immediately when reader Thread.start fails")
+            self.assertIsNone(rec_b._proc)
+
+    def test_stage3a_r2_p1_4_wsl_rec_stop_not_sent_preserves_session_for_cancel(self) -> None:
+        """Stage 3A P1 #4: Zero-byte write timeout (not_sent) on WSL rec_stop preserves session so cancel_recording stops shim."""
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        mock_shim_src = (
+            "import json, sys\n"
+            "log_path = sys.argv[1]\n"
+            "print(json.dumps({'event': 'ready', 'ok': True, 'caps': ['wasapi_v2']}), flush=True)\n"
+            "for raw in sys.stdin:\n"
+            "    raw = raw.strip()\n"
+            "    if not raw:\n"
+            "        continue\n"
+            "    msg = json.loads(raw)\n"
+            "    with open(log_path, 'a', encoding='utf-8') as f:\n"
+            "        f.write(json.dumps(msg) + '\\n')\n"
+            "    cmd = msg.get('cmd')\n"
+            "    sid = msg.get('seq_id', 0)\n"
+            "    if cmd == 'quit':\n"
+            "        break\n"
+            "    if cmd == 'rec_start':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True}), flush=True)\n"
+            "    elif cmd == 'rec_stop':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True, 'rec_gen': msg.get('rec_gen', 0), 'wav_b64': ''}), flush=True)\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cmd_log = tmp / "wsl_cmds.jsonl"
+            rt = tmp / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            wplat = WslPlatform(
+                Config(audio=AudioConfig(wsl_source="wasapi", tail_drain_sec=0.0)),
+                env={"HOME": td},
+                shim_cmd_factory=lambda: [sys.executable, "-u", "-c", mock_shim_src, str(cmd_log)],
+            )
+            try:
+                wplat.start_event_listener(lambda _e: None)
+                wplat.start_recording(rt, seq_id=7)
+                with wplat._winmm_state_lock:
+                    orig_gen = wplat._winmm_gen
+                    orig_writer = wplat._rec_writer
+                    self.assertEqual(wplat._rec_mode, "winmm")
+                self.assertIsNotNone(orig_writer)
+
+                # Force zero-byte write timeout (not_sent) on real _ShimWriter by setting deadline to 0.0s.
+                wplat._rec_stop_timeout_sec = 0.0
+                with self.assertRaises(_ShimWriteTimeout) as ctx:
+                    wplat.stop_recording(drain=False)
+                self.assertEqual(ctx.exception.write_status, "not_sent")
+
+                # Session state MUST remain intact pointing at the original writer & rec_gen!
+                with wplat._winmm_state_lock:
+                    self.assertEqual(wplat._rec_mode, "winmm")
+                    self.assertEqual(wplat._winmm_gen, orig_gen)
+                    self.assertIs(wplat._rec_writer, orig_writer)
+
+                # Shim has NOT received any rec_stop yet (still recording).
+                cmds_before = [
+                    json.loads(ln)
+                    for ln in cmd_log.read_text(encoding="utf-8").splitlines()
+                    if ln.strip()
+                ]
+                self.assertEqual([c.get("cmd") for c in cmds_before], ["rec_start"])
+
+                # Restore normal timeout and call cancel_recording() -> MUST send rec_stop(discard=True, rec_gen=orig_gen) to orig_writer!
+                wplat._rec_stop_timeout_sec = 5.0
+                wplat.cancel_recording()
+
+                deadline = time.monotonic() + 2.0
+                cmds_after: list[dict[str, Any]] = []
+                while time.monotonic() < deadline:
+                    cmds_after = [
+                        json.loads(ln)
+                        for ln in cmd_log.read_text(encoding="utf-8").splitlines()
+                        if ln.strip()
+                    ]
+                    if any(c.get("cmd") == "rec_stop" for c in cmds_after):
+                        break
+                    time.sleep(0.02)
+                stop_cmds = [c for c in cmds_after if c.get("cmd") == "rec_stop"]
+                self.assertEqual(len(stop_cmds), 1, f"expected cancel_recording() to send rec_stop, got {cmds_after}")
+                self.assertEqual(stop_cmds[0].get("rec_gen"), orig_gen)
+                self.assertIs(stop_cmds[0].get("discard"), True)
+            finally:
+                wplat.close()
+
+    def test_stage3a_r3_p0_macos_close_wakes_tail_drain_and_reaps_child(self) -> None:
+        """Stage 3A R3 P0: close() immediately wakes in-flight tail_drain (<0.3s) with child dead on return, while normal stop keeps tail audio."""
+        from agent_voice_input.platform_common import FfmpegWavRecorder
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        tail_src = (
+            "import os, sys, time\n"
+            "os.write(1, b'\\x01\\x00' * 400)\n"
+            "time.sleep(0.10)\n"
+            "os.write(1, b'\\x02\\x00' * 400)\n"
+            "time.sleep(10.0)\n"
+        )
+        ignore_term_src = (
+            "import os, signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "os.write(1, b'\\x03\\x00' * 400)\n"
+            "time.sleep(20.0)\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            mic_ok = lambda: {
+                "hal_ok": True,
+                "has_input": True,
+                "default_uid": "mic-1",
+                "default_name": "Built-in Mic",
+                "alive_uids": ["mic-1"],
+                "mic_auth": "authorized",
+            }
+
+            # Subcase A: normal stop(drain=True) must NOT skip legitimate tail drain.
+            plat_norm = MacOSPlatform(
+                Config(audio=AudioConfig(tail_drain_sec=0.22)),
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache_norm",
+                self_check_fn=mic_ok,
+            )
+            plat_norm._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [sys.executable, "-c", tail_src]
+            )
+            try:
+                plat_norm.start_recording(rt, seq_id=1)
+                t_norm = time.monotonic()
+                wav_norm, _ = plat_norm.stop_recording(drain=True)
+                dt_norm = time.monotonic() - t_norm
+                self.assertGreaterEqual(dt_norm, 0.16, f"normal stop skipped tail drain ({dt_norm:.3f}s)")
+                pcm_norm = wav_norm[44:]
+                self.assertIn(b"\x01\x00" * 400, pcm_norm)
+                self.assertIn(b"\x02\x00" * 400, pcm_norm)
+            finally:
+                plat_norm.close()
+
+            # Subcase B: concurrent close() during 0.45s tail_drain wakes immediately (<0.3s) and child is already dead.
+            plat = MacOSPlatform(
+                Config(audio=AudioConfig(tail_drain_sec=0.45)),
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache_close",
+                self_check_fn=mic_ok,
+            )
+            plat._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [sys.executable, "-c", ignore_term_src]
+            )
+            stop_out: list[tuple[bytes, str]] = []
+            try:
+                plat.start_recording(rt, seq_id=2)
+                sess = plat._cur_session
+                self.assertIsNotNone(sess)
+                assert sess is not None
+                child_proc = sess.rec._proc
+                self.assertIsNotNone(child_proc)
+                assert child_proc is not None
+                self.assertIsNone(child_proc.poll())
+
+                def _run_stop() -> None:
+                    stop_out.append(plat.stop_recording(drain=True))
+
+                th_stop = threading.Thread(target=_run_stop, daemon=True)
+                th_stop.start()
+                dl_wait = time.monotonic() + 2.0
+                while time.monotonic() < dl_wait:
+                    with plat._rec_cond:
+                        if plat._cur_session is None and plat._stopping_recs:
+                            break
+                    time.sleep(0.005)
+                with plat._rec_cond:
+                    self.assertTrue(plat._stopping_recs, "stop_recording did not enter tracked tail_drain")
+
+                t0 = time.monotonic()
+                plat.close()
+                dt_close = time.monotonic() - t0
+
+                # Assert immediately on close() return (before joining th_stop): <0.3s and child already dead.
+                self.assertLess(dt_close, 0.3, f"close() blocked on 0.45s tail_drain ({dt_close:.3f}s)")
+                self.assertIsNotNone(child_proc.poll(), "FFmpeg child must already be dead when close() returns")
+                with plat._rec_cond:
+                    self.assertEqual(plat._stopping_recs, {})
+                    self.assertEqual(plat._spawning_recs, {})
+
+                th_stop.join(timeout=2.0)
+                self.assertFalse(th_stop.is_alive())
+                self.assertEqual(len(stop_out), 1)
+            finally:
+                plat.close()
+
+    def test_stage3a_r3_p1_2_macos_stop_before_commit_preserves_initial_pcm(self) -> None:
+        """Stage 3A R3 P1 #2: Normal stop_recording() after first 8192B PCM arrives but before _cur_session commits preserves audio."""
+        from agent_voice_input.platform_common import FfmpegWavRecorder
+        from agent_voice_input.platform_macos import MacOSPlatform
+
+        pcm_payload = b"\x5a\xa5" * 4096
+        assert len(pcm_payload) == 8192
+        pcm_src = (
+            "import os, sys, time\n"
+            "os.write(1, b'\\x5a\\xa5' * 4096)\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(20.0)\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            plat = MacOSPlatform(
+                Config(audio=AudioConfig(tail_drain_sec=0.0)),
+                env={"HOME": td},
+                cache_dir=Path(td) / "cache",
+                self_check_fn=lambda: {
+                    "hal_ok": True,
+                    "has_input": True,
+                    "default_uid": "mic-1",
+                    "default_name": "Built-in Mic",
+                    "alive_uids": ["mic-1"],
+                    "mic_auth": "authorized",
+                },
+            )
+            plat._ff_rec = FfmpegWavRecorder(
+                cmd_factory=lambda _f, _s: [sys.executable, "-c", pcm_src]
+            )
+            orig_check = plat._check_selected_input_disconnected
+            check_calls = [0]
+            phase2_entered = threading.Event()
+            release_phase2 = threading.Event()
+            spawned_procs: list[subprocess.Popen[bytes]] = []
+            orig_popen = subprocess.Popen
+
+            def _track_popen(*args: Any, **kwargs: Any) -> Any:
+                p = orig_popen(*args, **kwargs)
+                spawned_procs.append(p)
+                return p
+
+            def _paused_check(**kw: Any) -> tuple[bool, bool, int]:
+                check_calls[0] += 1
+                res = orig_check(**kw)
+                if check_calls[0] == 2:
+                    # First 8192B PCM has already been read by FfmpegWavRecorder.start(); pause right before _cur_session commit.
+                    phase2_entered.set()
+                    release_phase2.wait(timeout=3.0)
+                return res
+
+            start_errs: list[BaseException] = []
+            stop_box: list[tuple[bytes, str]] = []
+
+            def _run_start() -> None:
+                try:
+                    plat.start_recording(rt, seq_id=1)
+                except BaseException as exc:
+                    start_errs.append(exc)
+
+            def _run_stop() -> None:
+                stop_box.append(plat.stop_recording(drain=False))
+
+            try:
+                plat._check_selected_input_disconnected = _paused_check  # type: ignore[method-assign]
+                with mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_track_popen):
+                    th_start = threading.Thread(target=_run_start, daemon=True)
+                    th_start.start()
+                    self.assertTrue(phase2_entered.wait(timeout=2.0), "start_recording did not reach pre-commit Phase 2")
+                    with plat._rec_cond:
+                        self.assertIsNone(plat._cur_session)
+                        orig_gen = plat._rec_gen
+                        self.assertIn(orig_gen, plat._spawning_recs)
+
+                    th_stop = threading.Thread(target=_run_stop, daemon=True)
+                    th_stop.start()
+                    dl = time.monotonic() + 2.0
+                    while time.monotonic() < dl:
+                        with plat._rec_cond:
+                            if plat._pending_stop_gen == orig_gen:
+                                break
+                        time.sleep(0.005)
+                    with plat._rec_cond:
+                        self.assertEqual(plat._pending_stop_gen, orig_gen)
+                        self.assertEqual(plat._rec_gen, orig_gen, "normal stop must wait instead of bumping _rec_gen")
+
+                    release_phase2.set()
+                    th_start.join(timeout=3.0)
+                    th_stop.join(timeout=3.0)
+
+                self.assertFalse(th_start.is_alive())
+                self.assertFalse(th_stop.is_alive())
+                self.assertEqual(start_errs, [])
+                self.assertEqual(len(stop_box), 1)
+                wav_out, backend = stop_box[0]
+                self.assertEqual(backend, "avfoundation")
+                self.assertEqual(plat.last_audio_error, "")
+                self.assertGreaterEqual(len(wav_out), 44 + 8192)
+                self.assertEqual(wav_out[44 : 44 + 8192], pcm_payload, "initial 8192B PCM was lost before commit")
+                self.assertEqual(len(spawned_procs), 1)
+                self.assertIsNotNone(spawned_procs[0].poll())
+                with plat._rec_cond:
+                    self.assertIsNone(plat._cur_session)
+                    self.assertEqual(plat._spawning_recs, {})
+                    self.assertEqual(plat._stopping_recs, {})
+            finally:
+                release_phase2.set()
+                plat.close()
+
+    def test_stage3a_r3_p1_3_wsl_cancel_not_sent_backpressure_delivers_rec_stop(self) -> None:
+        """Stage 3A R4: WSL cancel_recording() under sustained not_sent backpressure directly poisons & reaps orig_writer and respawns a clean shim."""
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        class _FastRespawnWslPlatform(WslPlatform):
+            _shim_respawn_delays = (0.02, 0.05)
+
+        mock_shim_src = (
+            "import json, os, sys, time\n"
+            "log_path, gate_path = sys.argv[1], sys.argv[2]\n"
+            "print(json.dumps({'event': 'ready', 'ok': True, 'caps': ['wasapi_v2']}), flush=True)\n"
+            "for raw in sys.stdin:\n"
+            "    raw = raw.strip()\n"
+            "    if not raw:\n"
+            "        continue\n"
+            "    msg = json.loads(raw)\n"
+            "    with open(log_path, 'a', encoding='utf-8') as f:\n"
+            "        f.write(json.dumps(msg) + '\\n')\n"
+            "    cmd = msg.get('cmd')\n"
+            "    sid = msg.get('seq_id', 0)\n"
+            "    if cmd == 'quit':\n"
+            "        break\n"
+            "    if cmd == 'ping':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True}), flush=True)\n"
+            "    elif cmd == 'rec_start':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True}), flush=True)\n"
+            "        while not os.path.exists(gate_path):\n"
+            "            time.sleep(0.01)\n"
+            "    elif cmd == 'rec_stop':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True, 'rec_gen': msg.get('rec_gen', 0), 'wav_b64': ''}), flush=True)\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cmd_log = tmp / "wsl_bp_cmds.jsonl"
+            gate_file = tmp / "drain.gate"
+            rt = tmp / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            wplat = _FastRespawnWslPlatform(
+                Config(audio=AudioConfig(wsl_source="wasapi", tail_drain_sec=0.0)),
+                env={"HOME": td},
+                shim_cmd_factory=lambda: [sys.executable, "-u", "-c", mock_shim_src, str(cmd_log), str(gate_file)],
+            )
+            try:
+                wplat.start_event_listener(lambda _e: None)
+                wplat.start_recording(rt, seq_id=9)
+                with wplat._winmm_state_lock:
+                    orig_gen = wplat._winmm_gen
+                    orig_writer = wplat._rec_writer
+                    self.assertEqual(wplat._rec_mode, "winmm")
+                self.assertIsNotNone(orig_writer)
+                assert orig_writer is not None
+                orig_proc = orig_writer.proc
+                self.assertIsNotNone(orig_proc.stdin)
+                assert orig_proc.stdin is not None
+
+                # Create real OS pipe backpressure while the child is wedged on gate_file.
+                pipe_fd = orig_proc.stdin.fileno()
+                os.set_blocking(pipe_fd, False)
+                filled = 0
+                while True:
+                    try:
+                        filled += os.write(pipe_fd, b"\n" * 4096)
+                    except BlockingIOError:
+                        break
+                self.assertGreater(filled, 0, "failed to fill real stdin pipe for backpressure test")
+
+                # Short timeout forces real _ShimWriteTimeout(write_status='not_sent') inside cancel_recording().
+                wplat._rec_stop_timeout_sec = 0.08
+                with mock.patch.object(wplat, "_enqueue_shim_async", wraps=wplat._enqueue_shim_async) as spy_async:
+                    wplat.cancel_recording()
+                    self.assertEqual(
+                        spy_async.call_count,
+                        0,
+                        "cancel_recording() must not enqueue async rec_stop into a wedged pipe",
+                    )
+
+                with wplat._winmm_state_lock:
+                    self.assertEqual(wplat._rec_mode, "")
+                    self.assertIsNone(wplat._rec_writer)
+                    self.assertGreater(wplat._winmm_gen, orig_gen)
+                self.assertIsNotNone(
+                    orig_proc.poll(),
+                    "wedged shim must be immediately reaped on not_sent backpressure to guarantee Windows recording stops",
+                )
+                self.assertIsNot(wplat._shim, orig_proc)
+
+                # Background respawn replaces the reaped shim with a fresh responsive process.
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if wplat._shim is not None and wplat._shim is not orig_proc and wplat._shim.poll() is None:
+                        break
+                    time.sleep(0.02)
+                self.assertIsNotNone(wplat._shim)
+                self.assertIsNot(wplat._shim, orig_proc)
+                ping_res = wplat._shim_rpc({"cmd": "ping"}, timeout_sec=1.5)
+                self.assertIsNotNone(ping_res)
+                assert ping_res is not None
+                self.assertTrue(ping_res.get("ok"))
+            finally:
+                gate_file.write_text("go", encoding="utf-8")
+                wplat.close()
+
+    def test_stage3a_r4_wsl_cancel_not_sent_does_not_clobber_gen2_on_new_shim(self) -> None:
+        """Stage 3A R4: Gen 1 cancel_recording() hitting not_sent must never clear or kill gen 2 started on a new shim."""
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        mock_shim_src = (
+            "import json, os, sys, time\n"
+            "log_path, gate_path, tag = sys.argv[1], sys.argv[2], sys.argv[3]\n"
+            "print(json.dumps({'event': 'ready', 'ok': True, 'caps': ['wasapi_v2']}), flush=True)\n"
+            "for raw in sys.stdin:\n"
+            "    raw = raw.strip()\n"
+            "    if not raw:\n"
+            "        continue\n"
+            "    msg = json.loads(raw)\n"
+            "    msg['_tag'] = tag\n"
+            "    with open(log_path, 'a', encoding='utf-8') as f:\n"
+            "        f.write(json.dumps(msg) + '\\n')\n"
+            "    cmd = msg.get('cmd')\n"
+            "    sid = msg.get('seq_id', 0)\n"
+            "    if cmd == 'quit':\n"
+            "        break\n"
+            "    if cmd == 'rec_start':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True}), flush=True)\n"
+            "        if tag == 'shim1':\n"
+            "            while not os.path.exists(gate_path):\n"
+            "                time.sleep(0.01)\n"
+            "    elif cmd == 'rec_stop':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True, 'rec_gen': msg.get('rec_gen', 0), 'wav_b64': ''}), flush=True)\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cmd_log = tmp / "wsl_gen2_cmds.jsonl"
+            gate_file = tmp / "shim1.gate"
+            rt = tmp / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            spawn_n = [0]
+
+            def _factory() -> list[str]:
+                spawn_n[0] += 1
+                tag = f"shim{spawn_n[0]}"
+                return [sys.executable, "-u", "-c", mock_shim_src, str(cmd_log), str(gate_file), tag]
+
+            wplat = WslPlatform(
+                Config(audio=AudioConfig(wsl_source="wasapi", tail_drain_sec=0.0)),
+                env={"HOME": td},
+                shim_cmd_factory=_factory,
+            )
+            gen1_wto_ready = threading.Event()
+            release_gen1_wto = threading.Event()
+            try:
+                wplat.start_event_listener(lambda _e: None)
+                wplat.start_recording(rt, seq_id=1)
+                with wplat._winmm_state_lock:
+                    gen1 = wplat._winmm_gen
+                    writer1 = wplat._rec_writer
+                    self.assertEqual(wplat._rec_mode, "winmm")
+                self.assertIsNotNone(writer1)
+                assert writer1 is not None
+                proc1 = writer1.proc
+                self.assertIsNotNone(proc1.stdin)
+                assert proc1.stdin is not None
+
+                # Wedge shim1's real stdin pipe so gen1 rec_stop hits genuine _ShimWriteTimeout('not_sent').
+                pipe_fd = proc1.stdin.fileno()
+                os.set_blocking(pipe_fd, False)
+                while True:
+                    try:
+                        os.write(pipe_fd, b"\n" * 4096)
+                    except BlockingIOError:
+                        break
+
+                orig_shim_rpc = wplat._shim_rpc
+
+                def _paused_rpc(req: dict[str, Any], **kw: Any) -> dict[str, Any] | None:
+                    if req.get("cmd") == "rec_stop" and kw.get("target_writer") is writer1:
+                        kw["timeout_sec"] = 0.06
+                        try:
+                            return orig_shim_rpc(req, **kw)
+                        except _ShimWriteTimeout:
+                            gen1_wto_ready.set()
+                            release_gen1_wto.wait(timeout=3.0)
+                            raise
+                    return orig_shim_rpc(req, **kw)
+
+                wplat._shim_rpc = _paused_rpc  # type: ignore[method-assign]
+                th_cancel1 = threading.Thread(target=wplat.cancel_recording, daemon=True)
+                th_cancel1.start()
+                self.assertTrue(
+                    gen1_wto_ready.wait(timeout=2.0),
+                    "gen1 cancel_recording() did not hit _ShimWriteTimeout(not_sent)",
+                )
+
+                # Detach wedged shim1 slot (without killing proc1 yet) and start gen2 on a brand-new shim2.
+                with wplat._shim_lock:
+                    wplat._shim = None
+                    wplat._shim_writer = None
+                    wplat._spawned_shim = None
+                    wplat._spawned_ready = False
+                wplat.start_recording(rt, seq_id=2)
+                with wplat._winmm_state_lock:
+                    gen2 = wplat._winmm_gen
+                    writer2 = wplat._rec_writer
+                    self.assertEqual(wplat._rec_mode, "winmm")
+                    self.assertEqual(wplat._active_seq_id, 2)
+                self.assertGreater(gen2, gen1)
+                self.assertIsNotNone(writer2)
+                assert writer2 is not None
+                self.assertIsNot(writer2, writer1)
+                proc2 = writer2.proc
+                self.assertIsNot(proc2, proc1)
+                self.assertIsNone(proc2.poll())
+
+                # Unblock gen1's _ShimWriteTimeout propagation into cancel_recording().
+                release_gen1_wto.set()
+                th_cancel1.join(timeout=3.0)
+                self.assertFalse(th_cancel1.is_alive())
+
+                # Gen2 recording state & shim2 must remain completely intact; orphaned wedged proc1 is reaped.
+                with wplat._winmm_state_lock:
+                    self.assertEqual(wplat._rec_mode, "winmm")
+                    self.assertEqual(wplat._winmm_gen, gen2)
+                    self.assertIs(wplat._rec_writer, writer2)
+                    self.assertEqual(wplat._active_seq_id, 2)
+                self.assertIsNone(proc2.poll(), "gen1 cancel must never kill gen2's new shim")
+                self.assertIs(wplat._shim, proc2)
+                self.assertIsNotNone(proc1.poll(), "wedged gen1 shim1 should still be reaped")
+
+                # Gen2 can stop cleanly on shim2 afterwards.
+                wplat._rec_stop_timeout_sec = 5.0
+                wplat.stop_recording(drain=False)
+                cmds = [
+                    json.loads(ln)
+                    for ln in cmd_log.read_text(encoding="utf-8").splitlines()
+                    if ln.strip()
+                ]
+                shim2_stops = [c for c in cmds if c.get("_tag") == "shim2" and c.get("cmd") == "rec_stop"]
+                self.assertEqual(len(shim2_stops), 1, f"expected clean gen2 rec_stop on shim2, got {cmds}")
+                self.assertEqual(shim2_stops[0].get("rec_gen"), gen2)
+                self.assertIsNone(proc2.poll())
+            finally:
+                release_gen1_wto.set()
+                gate_file.write_text("go", encoding="utf-8")
+                wplat.close()
 
 
 if __name__ == "__main__":
