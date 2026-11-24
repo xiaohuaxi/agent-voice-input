@@ -1549,7 +1549,7 @@ public static class VoiceWinShim {
             bg = Color.FromArgb(14, 54, 36); ic = Color.FromArgb(74, 222, 128); mc = Color.FromArgb(242, 253, 246); hc = Color.FromArgb(174, 218, 192); bd = Color.FromArgb(158, 74, 222, 128); ms = 900; iconKind = "done";
         } else if (st == "copied") {
             txt = zh ? "\u2713 \u5DF2\u590D\u5236(\u7A97\u53E3\u5DF2\u5207\u6362)" : "\u2713 Copied (window switched)";
-            bg = Color.FromArgb(28, 32, 82); ic = Color.FromArgb(144, 156, 255); mc = Color.FromArgb(240, 244, 255); hc = Color.FromArgb(186, 196, 238); bd = Color.FromArgb(174, 129, 140, 248); ms = 2000; iconKind = "done";
+            bg = Color.FromArgb(28, 32, 82); ic = Color.FromArgb(144, 156, 255); mc = Color.FromArgb(240, 244, 255); hc = Color.FromArgb(186, 196, 238); bd = Color.FromArgb(174, 129, 140, 248); ms = 5000; iconKind = "done";
         } else if (st == "empty") {
             txt = zh ? "\u25CB \u672A\u68C0\u6D4B\u5230\u8BED\u97F3" : "\u25CB No speech detected";
             bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 2200; iconKind = "empty_ring";
@@ -3474,7 +3474,7 @@ public static class VoiceWinShim {
 
             // 3) Sequential toasts while foreground is on monitor 2 must reuse single _toastHud slot in-place and anchor to mon1
             string[] seqToasts = new string[] { "mic_no_stream", "copied", "cancelled", "audio_recovered" };
-            int[] expDurs = new int[] { 2600, 2000, 1600, 2400 };
+            int[] expDurs = new int[] { 2600, 5000, 1600, 2400 };
             HudPillForm firstToastRef = null;
             for (int i = 0; i < seqToasts.Length; i++) {
                 UpdateHud(seqToasts[i], "", 0, "bottom", 0, 0, "toast", false, null, 0);
@@ -3547,7 +3547,7 @@ public static class VoiceWinShim {
             _hud.SetHoldCancelPreview(true, true);
             if (_hud.HoldCancelPreviewActive)
                 throw new InvalidOperationException("single-slot check: done must ignore hold preview");
-            UpdateHud("copied", "", 2000, "bottom", 0, 0, "main", null, false, 0);
+            UpdateHud("copied", "", 5000, "bottom", 0, 0, "main", null, false, 0);
             _hud.SetHoldCancelPreview(true, true);
             if (_hud.HoldCancelPreviewActive)
                 throw new InvalidOperationException("single-slot check: copied must ignore hold preview");

@@ -108,7 +108,7 @@ HOLD_CANCEL_HINT_COPY: tuple[str, str] = ("继续按住取消…", "keep holding
 
 HUD_STATE_DURATIONS_MS: dict[str, int] = {
     "done": 900,
-    "copied": 2000,
+    "copied": 5000,
     "cancelled": 1600,
     "empty": 2200,
     "no_mic": 2200,

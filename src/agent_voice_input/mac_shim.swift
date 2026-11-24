@@ -849,7 +849,7 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
             icon: hudRgba(144, 156, 255, 1.0),
             mainText: isToast ? toastMainText : hudRgba(240, 244, 255, 1.0),
             hintText: isToast ? toastHintText : hudRgba(186, 196, 238, 1.0),
-            autoHideMs: 2000,
+            autoHideMs: 5000,
             iconKind: "done"
         )
     case "empty":
@@ -5615,7 +5615,7 @@ private func runHudLayoutSelfCheck() throws -> Int {
     defer { ctrl.close() }
     ctrl.update(state: "recording", customText: "", durationMs: 0, bgCount: 2)
     try assertLayout(ctrl.debugMainVisible && ctrl.debugMainBgCount == 2 && !ctrl.debugToastVisible && ctrl.debugToastSlotCount == 0, "slot init recording bg=2")
-    for (idx, (tst, expMs)) in [("mic_no_stream", 2600), ("copied", 2000), ("cancelled", 1600), ("audio_recovered", 2400)].enumerated() {
+    for (idx, (tst, expMs)) in [("mic_no_stream", 2600), ("copied", 5000), ("cancelled", 1600), ("audio_recovered", 2400)].enumerated() {
         ctrl.update(state: tst, customText: "", durationMs: 0, layer: "toast", clearMain: false)
         try assertLayout(
             ctrl.debugToastSlotCount == 1
@@ -5657,7 +5657,7 @@ private func runHudLayoutSelfCheck() throws -> Int {
     ctrl.update(state: "done", customText: "", durationMs: 900, layer: "main", clearToast: false)
     ctrl.setHoldCancelPreview(true)
     try assertLayout(!ctrl.debugHoldPreviewActive, "slot done ignores hold preview")
-    ctrl.update(state: "copied", customText: "", durationMs: 2000, layer: "main", clearToast: false)
+    ctrl.update(state: "copied", customText: "", durationMs: 5000, layer: "main", clearToast: false)
     ctrl.setHoldCancelPreview(true)
     try assertLayout(!ctrl.debugHoldPreviewActive, "slot copied ignores hold preview")
 
@@ -6078,10 +6078,11 @@ private func runSelfCheck() -> Int32 {
         try check(stPerm.layer == "toast" && stPerm.iconKind == "cross" && stPerm.autoHideMs == 3200, "style mic_permission")
         try check(stPaste.layer == "toast" && stPaste.iconKind == "cross" && stPaste.border == stNoMic.border, "style paste_failed")
         try check(stRecog.layer == "main" && stRecog.iconKind == "recognizing", "style recognizing")
-        try check(stCopiedMain.layer == "main" && stCopiedMain.iconKind == "done" && stCopiedMain.bg != stBusy.bg, "style copied main")
+        try check(stCopiedMain.layer == "main" && stCopiedMain.iconKind == "done" && stCopiedMain.autoHideMs == 5000 && stCopiedMain.bg != stBusy.bg, "style copied main")
         try check(
             stCopiedToast.layer == "toast"
                 && stCopiedToast.iconKind == "done"
+                && stCopiedToast.autoHideMs == 5000
                 && stCopiedToast.bg == stBusy.bg
                 && stCopiedToast.mainText == stBusy.mainText
                 && stCopiedToast.hintText == stBusy.hintText

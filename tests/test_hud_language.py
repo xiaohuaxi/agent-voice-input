@@ -249,7 +249,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         ):
             self.assertEqual(default_hud_duration_ms(persistent), 0, msg=persistent)
         self.assertEqual(HUD_STATE_DURATIONS_MS["done"], 900)
-        self.assertEqual(HUD_STATE_DURATIONS_MS["copied"], 2000)
+        self.assertEqual(HUD_STATE_DURATIONS_MS["copied"], 5000)
         self.assertEqual(HUD_STATE_DURATIONS_MS["empty"], 2200)
         self.assertEqual(HUD_STATE_DURATIONS_MS["no_mic"], 2200)
         self.assertEqual(HUD_STATE_DURATIONS_MS["mic_unavailable"], 2600)
@@ -261,7 +261,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         self.assertEqual(DEFAULT_ERROR_HUD_DURATION_MS, 2600)
         self.assertEqual(default_hud_duration_ms("done"), 900)
         self.assertEqual(default_hud_duration_ms(" DONE "), 900)
-        self.assertEqual(default_hud_duration_ms("copied"), 2000)
+        self.assertEqual(default_hud_duration_ms("copied"), 5000)
         self.assertEqual(default_hud_duration_ms("empty"), 2200)
         self.assertEqual(default_hud_duration_ms("no_mic"), 2200)
         self.assertEqual(default_hud_duration_ms("mic_unavailable"), 2600)
@@ -345,7 +345,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             )
             self.assertEqual(
                 [c.get("duration_ms") for c in zh_cmds],
-                [None, None, None, 900, 2000, 2200, 2600, None, None, 1500],
+                [None, None, None, 900, 5000, 2200, 2600, None, None, 1500],
             )
             self.assertEqual(
                 [c.get("position") for c in zh_cmds],
@@ -381,7 +381,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             )
             self.assertEqual(
                 [c.get("duration_ms") for c in en_cmds],
-                [None, None, None, 900, 2000, 2200, 2600],
+                [None, None, None, 900, 5000, 2200, 2600],
             )
 
             # 3. Omitted ui_culture in ready event still passes empty string (never falls back to WSL Linux LANG=zh_CN.UTF-8)
@@ -516,7 +516,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
             )
             self.assertEqual(
                 [c.get("duration_ms") for c in mac_zh],
-                [None, None, None, 900, 2000, 2200, 2600, 1500, None],
+                [None, None, None, 900, 5000, 2200, 2600, 1500, None],
             )
             self.assertEqual(
                 [c.get("position") for c in mac_zh],
@@ -538,7 +538,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                     ("copied", "✓ Copied (window switched)"),
                 ],
             )
-            self.assertEqual([c.get("duration_ms") for c in mac_en], [None, None, 2000])
+            self.assertEqual([c.get("duration_ms") for c in mac_en], [None, None, 5000])
 
             # 3. Omitted ui_culture on MacOSPlatform falls back to POSIX LANG (win_ui_culture=None)
             mac_posix_zh = _run_mac_hud_scenario(
@@ -939,7 +939,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 bytes(esc_lit, "ascii").decode("unicode_escape"),
                 format_hud_text(state_key, "zh"),
             )
-        for dur_decl in ("ms = 900;", "ms = 1600;", "ms = 2000;", "ms = 2200;", "ms = 2400;", "ms = 2600;", "ms = 3200;"):
+        for dur_decl in ("ms = 900;", "ms = 1600;", "ms = 2200;", "ms = 2400;", "ms = 2600;", "ms = 3200;", "ms = 5000;"):
             self.assertIn(dur_decl, shim)
 
         # COM [PreserveSig] vtable integrity + WASAPI disconnect & seamless recovery contracts
