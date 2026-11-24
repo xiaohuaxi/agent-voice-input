@@ -755,7 +755,6 @@ class _DoctorState:
     daemon_build_id: str = ""
     daemon_code_drift: bool = False
     daemon_drift_reason: str = ""
-    daemon_build_id_note: str = ""
     daemon_error: str = ""
     match: Any = None
     remote_ssh_ok: bool | None = None
@@ -1050,7 +1049,7 @@ def _doctor_check_asr(st: _DoctorState) -> None:
 
 
 def _doctor_check_daemon_and_session(st: _DoctorState) -> None:
-    from .daemon import describe_daemon_drift, probe_daemon_status
+    from .control_ipc import describe_daemon_drift, probe_daemon_status
     from .session_ctx import SessionTracker
 
     dst = probe_daemon_status(st.rt_dir, timeout_sec=0.5)
@@ -1063,15 +1062,12 @@ def _doctor_check_daemon_and_session(st: _DoctorState) -> None:
         st.daemon_build_id = drift["running_build_id"]
         st.daemon_code_drift = bool(drift["drifted"])
         st.daemon_drift_reason = drift["reason"]
-        st.daemon_build_id_note = drift.get("note", "")
         ver_tag = f", version={st.daemon_version}" if st.daemon_version else ""
         st.emit(f"[daemon]    running (pid={st.daemon_pid}, state={st.daemon_state}{ver_tag})")
         if st.daemon_code_drift:
             st.emit(
                 f"[daemon]    WARN {st.daemon_drift_reason}; run 'agent-voice-input restart' to update"
             )
-        elif st.daemon_build_id_note:
-            st.emit(f"[daemon]    INFO {st.daemon_build_id_note}")
     elif dst.get("state") == "unresponsive":
         st.daemon_running = False
         st.daemon_pid = int(dst.get("pid") or 0) or None
@@ -1334,8 +1330,6 @@ def _doctor_emit_json_report(st: _DoctorState, *, include_ping: bool) -> None:
     }
     if st.daemon_drift_reason:
         daemon_report["drift_reason"] = st.daemon_drift_reason
-    if st.daemon_build_id_note:
-        daemon_report["build_id_note"] = st.daemon_build_id_note
     if st.daemon_error:
         daemon_report["error"] = st.daemon_error
     report: dict[str, Any] = {
@@ -1428,12 +1422,9 @@ def _run_wav_or_live(
     force_print: bool = False,
 ) -> int:
     from .config import get_runtime_dir, redact_secrets, resolve_credentials
-    from .daemon import (
-        append_telemetry_record,
-        build_pipeline_summary,
-        create_platform,
-        run_pipeline_once,
-    )
+    from .control_ipc import append_telemetry_record
+    from .daemon import create_platform
+    from .daemon_pipeline import build_pipeline_summary, run_pipeline_once
     from .platform_common import ForegroundWindow
     from .platform_wsl import is_wsl
 
@@ -1671,22 +1662,6 @@ def _warn_degraded_shim(st: Mapping[str, Any]) -> None:
         )
 
 
-def _pipeline_from_legacy_daemon_status(st: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Build a non-contradictory pipeline summary from a legacy daemon's reported provider fields."""
-    asr_p = str(st.get("asr_provider") or "").strip()
-    ref_p = str(st.get("refiner_provider") or "").strip()
-    if not asr_p and not ref_p:
-        return None
-    asr_lbl = asr_p or "unknown"
-    ref_lbl = ref_p or "unknown"
-    return {
-        "asr": {"provider": asr_lbl, "model": ""},
-        "refiner": {"provider": ref_lbl, "model": ""},
-        "summary": f"ASR {asr_lbl} -> Refiner {ref_lbl} (reported by running daemon)",
-        "source": "legacy_daemon_status",
-    }
-
-
 def _format_start_readiness_line(
     cfg: Config,
     *,
@@ -1715,7 +1690,7 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
         redact_secrets,
         resolve_credentials,
     )
-    from .daemon import describe_daemon_drift, probe_daemon_status, send_control_command
+    from .control_ipc import describe_daemon_drift, probe_daemon_status, send_control_command
     from .diagnose import read_redacted_log_tail
     from .platform_macos import (
         classify_macos_mic_permission,
@@ -1750,8 +1725,6 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
                 f"already running (pid={st.get('pid')}, state={st.get('state')}) "
                 "(use 'restart' to reload config)"
             )
-            if drift.get("note"):
-                print(f"[daemon]    INFO {drift['note']}")
         running_pipe = st.get("pipeline")
         running_summary = (
             str(running_pipe.get("summary") or "").strip()
@@ -1760,8 +1733,6 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
         )
         if running_summary:
             print(f"[pipeline]  {running_summary}")
-        elif legacy_pipe := _pipeline_from_legacy_daemon_status(st):
-            print(f"[pipeline]  {legacy_pipe['summary']}")
         elif cfg is not None and not has_overrides and pipeline_summary:
             print(f"[pipeline]  {pipeline_summary}")
         return 0
@@ -1999,28 +1970,16 @@ def _probe_pid_liveness(pid: int) -> str:
 
 def _cmd_stop(env: dict[str, str]) -> int:
     from .config import get_runtime_dir
-    from .daemon import send_control_command
+    from .control_ipc import send_control_command
 
     rt_dir = get_runtime_dir(env, create=False)
     pid_file = rt_dir / "daemon.pid"
     pid = _read_pid_file(pid_file)
     stop_deadline = time.monotonic() + 6.0
     shutdown_sent = False
-    socket_still_live = False
     try:
         send_control_command(rt_dir, {"cmd": "shutdown"}, timeout_sec=1.5)
         shutdown_sent = True
-    except (TimeoutError, socket.timeout, PermissionError):
-        socket_still_live = True
-    except OSError as sock_exc:
-        if sock_exc.errno not in (
-            None,
-            errno.ENOENT,
-            errno.ECONNREFUSED,
-            errno.ENOTSOCK,
-            errno.EPROTOTYPE,
-        ):
-            socket_still_live = True
     except Exception:
         pass
 
@@ -2064,16 +2023,7 @@ def _cmd_stop(env: dict[str, str]) -> int:
             try:
                 cur_pid = _read_pid_file(pid_file)
                 cur_liveness = _probe_pid_liveness(cur_pid)
-                # Under LOCK_EX with no live socket:
-                # - if shutdown was sent, only unlink once `pid` has actually exited (`gone`), preserving legacy live instances;
-                # - if shutdown failed with offline socket (e.g. SIGKILL remnant whose PID may even be recycled), safe to unlink unless `perm`.
-                can_unlink = (
-                    not socket_still_live
-                    and pid_liveness != "perm"
-                    and cur_liveness != "perm"
-                    and (not shutdown_sent or (pid_liveness == "gone" and cur_liveness == "gone"))
-                )
-                if can_unlink:
+                if pid_liveness != "perm" and cur_liveness != "perm":
                     for stale in (pid_file, rt_dir / "control.sock"):
                         try:
                             stale.unlink(missing_ok=True)
@@ -2089,7 +2039,7 @@ def _cmd_stop(env: dict[str, str]) -> int:
                 except OSError:
                     pass
 
-    if not shutdown_sent and (socket_still_live or not lock_confirmed_free or pid_liveness == "perm"):
+    if not shutdown_sent and (not lock_confirmed_free or pid_liveness == "perm"):
         print(
             f"error: could not confirm daemon stop in {rt_dir}; check running processes",
             file=sys.stderr,
@@ -2550,7 +2500,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     from .config import ConfigError, get_runtime_dir, load_config, load_env_files, redact_secrets
-    from .daemon import DaemonAlreadyRunningError
+    from .control_ipc import DaemonAlreadyRunningError
 
     if args.subcmd == "init":
         try:
@@ -2602,7 +2552,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcmd == "stop":
             return _cmd_stop(env)
         if args.subcmd == "status":
-            from .daemon import describe_daemon_drift, probe_daemon_status, read_telemetry_history
+            from .control_ipc import (
+                describe_daemon_drift,
+                probe_daemon_status,
+                read_telemetry_history,
+            )
 
             rt_dir_st = get_runtime_dir(env, create=False)
             raw_hist = getattr(args, "history", None)
@@ -2615,11 +2569,6 @@ def main(argv: list[str] | None = None) -> int:
                     resp["current_version"] = drift["current_version"]
                     resp["current_build_id"] = drift["current_build_id"]
                     resp["drift_warning"] = f"{drift['reason']}; run 'agent-voice-input restart'"
-                elif drift.get("note"):
-                    resp["build_id_note"] = drift["note"]
-                if not isinstance(resp.get("pipeline"), Mapping):
-                    if legacy_pipe := _pipeline_from_legacy_daemon_status(resp):
-                        resp["pipeline"] = legacy_pipe
                 print(json.dumps(resp, ensure_ascii=False))
                 return 0
             if resp.get("error"):
@@ -2631,7 +2580,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(resp, ensure_ascii=False))
             return 1
         if args.subcmd in ("toggle", "cancel"):
-            from .daemon import send_control_command
+            from .control_ipc import send_control_command
 
             ctrl_timeout = 20.0 if args.subcmd == "toggle" else 8.0
             rt_dir_st = get_runtime_dir(env, create=False)

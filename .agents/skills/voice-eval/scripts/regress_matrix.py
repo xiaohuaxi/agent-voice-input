@@ -237,8 +237,15 @@ class _DummyAsr(BaseAsrProvider):
     def __init__(self) -> None:
         pass
 
-    def transcribe(self, wav_bytes: bytes, *, context: Any = None, is_cancelled: Any = None) -> AsrResult:
-        del wav_bytes, context, is_cancelled
+    def transcribe(
+        self,
+        wav_bytes: bytes,
+        context: Any = None,
+        *,
+        is_cancelled: Any = None,
+        cancel_token: Any = None,
+    ) -> AsrResult:
+        del wav_bytes, context, is_cancelled, cancel_token
         return AsrResult(text="", provider="offline_dummy", model="none", latency_ms=0)
 
 

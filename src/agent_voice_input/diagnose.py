@@ -29,7 +29,7 @@ from .config import (
     redact_secrets,
     resolve_credentials,
 )
-from .daemon import (
+from .control_ipc import (
     TELEMETRY_FILENAME,
     describe_daemon_drift,
     probe_daemon_status,
@@ -533,7 +533,6 @@ def collect_live_diagnostics(
         "build_id": str(status_obj.get("build_id") or status_snapshot.get("build_id") or ""),
         "code_drift": bool(drift and drift["drifted"]),
         "drift_reason": str(drift["reason"]) if (drift and drift["drifted"]) else "",
-        "build_id_note": str(drift["note"]) if (drift and drift.get("note")) else "",
         "seq_id": status_obj.get("seq_id", 0),
         "pending_count": status_obj.get("pending_count", 0),
         "shim_ok": status_obj.get("shim_ok"),
@@ -606,8 +605,6 @@ def format_live_diagnostics_markdown(payload: Mapping[str, Any]) -> str:
         lines.append(
             f"- Version/Code Drift: `{d_info.get('drift_reason') or 'mismatch'}` — run `agent-voice-input restart`"
         )
-    elif d_info.get("build_id_note"):
-        lines.append(f"- Build Info: {d_info['build_id_note']}")
     pipeline_summary = str((payload.get("pipeline") or {}).get("summary") or "").strip()
     if pipeline_summary:
         lines.append(f"- Pipeline: {pipeline_summary}")

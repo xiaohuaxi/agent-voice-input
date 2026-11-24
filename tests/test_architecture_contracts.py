@@ -152,7 +152,7 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
     def test_intra_package_imports_form_strict_dag(self) -> None:
         trees = _parse_package_asts()
         known_modules = set(trees.keys())
-        self.assertEqual(len(known_modules), 23)
+        self.assertEqual(len(known_modules), 25)
         init_defined_symbols = {
             t.id
             for stmt in trees["__init__"].body
@@ -380,7 +380,7 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
             "sys.stdin = __import__('io').StringIO('{}'); "
             "rc = main(['session-hook', '--cli', 'claude', '--quiet']); "
             "assert rc == 0; "
-            "heavy = [m for m in ('asr_providers', 'refiner', 'daemon', 'http_transport', "
+            "heavy = [m for m in ('asr_providers', 'refiner', 'daemon', 'control_ipc', 'daemon_pipeline', 'http_transport', "
             "'platform_common', 'platform_wsl', 'platform_macos', 'audio_proc', 'hud', 'prompts') "
             "if f'agent_voice_input.{m}' in sys.modules]; "
             "assert not heavy, f'session-hook loaded heavy modules: {heavy}'"
@@ -427,14 +427,19 @@ class TestModuleImportDagAndProbeIsolation(unittest.TestCase):
         for py_path in sorted(PKG_DIR.glob("*.py")):
             src_txt = py_path.read_text(encoding="utf-8")
             self.assertNotIn(
-                "_callable_accepts_kwarg",
+                "_callable_accepts_kw",
                 src_txt,
-                f"{py_path.name} still references legacy _callable_accepts_kwarg shell",
+                f"{py_path.name} still references legacy _callable_accepts_kw shell",
             )
             self.assertNotIn(
                 "_deliver_with_origin",
                 src_txt,
                 f"{py_path.name} still references legacy _deliver_with_origin reflection shim",
+            )
+            self.assertNotIn(
+                "inspect.signature",
+                src_txt,
+                f"{py_path.name} still uses inspect.signature reflection compat shell",
             )
 
 

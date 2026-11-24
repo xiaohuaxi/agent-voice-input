@@ -315,6 +315,7 @@ class _RecordingDeliveryPlatform:
         is_cancelled: Callable[[], bool] | None = None,
         before_clipboard_write: Callable[[], None] | None = None,
         before_commit: Callable[[], bool] | None = None,
+        same_window_verifier: object = None,
     ) -> PasteOutcome:
         del seq_id, target_hwnd, origin_window, fallback_clipboard_text, suppress_beep
         if is_cancelled is not None and is_cancelled():

@@ -349,7 +349,7 @@ class _FakeAsr(BaseAsrProvider):
         self.gate_evt = gate_evt
         self.calls = 0
 
-    def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+    def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
         self.calls += 1
         if self.gate_evt is not None:
             self.gate_evt.wait(timeout=3.0)
@@ -383,7 +383,7 @@ class _FakePlatform:
         self.huds.append(state)
         self.hud_events.append({"state": state, "duration_ms": duration_ms, **kw})
 
-    def start_recording(self, runtime_dir: Path) -> None:
+    def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
         return None
 
     def stop_recording(self) -> tuple[bytes, str]:
@@ -408,6 +408,7 @@ class _FakePlatform:
         is_cancelled: object = None,
         before_clipboard_write: object = None,
         before_commit: object = None,
+        same_window_verifier: object = None,
     ) -> PasteOutcome:
         del origin_window, fallback_clipboard_text, suppress_beep
         if callable(is_cancelled) and is_cancelled():
@@ -1974,7 +1975,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 ops.append(f"beep:{kind}")
                 super().beep(kind)
 
-            def start_recording(self, runtime_dir: Path) -> None:
+            def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
                 ops.append("start_rec")
 
             def stop_recording(self) -> tuple[bytes, str]:
@@ -1985,7 +1986,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             def prepare_session(self, session_key: str = "") -> None:
                 return None
 
-            def refine(self, asr_input, *, session_key: str = "", tracker=None, fallback_context: str = ""):
+            def refine(self, asr_input, *, session_key: str = "", tracker=None, fallback_context: str = "", **_kw: object):
                 return RefinerResult("精修后完整句子不丢字。", "codex", "gpt-6-luna", 37)
 
             def close(self) -> None:
@@ -2064,7 +2065,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             def hud(self, state: str, text: str = "", duration_ms: int = 0, **_kw: object) -> None:
                 drain_ops.append(f"hud:{state}")
 
-            def start_recording(self, runtime_dir: Path) -> None:
+            def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
                 drain_ops.append("start_rec")
 
             def stop_recording(self) -> tuple[bytes, str]:
@@ -2134,7 +2135,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             def __init__(self, single_hop: bool = False) -> None:
                 self.single_hop = single_hop
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 in_asr.set()
                 release_asr.wait(timeout=2.0)
                 return AsrResult(
@@ -2149,7 +2150,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             def prepare_session(self, session_key: str = "") -> None:
                 return None
 
-            def refine(self, asr_input, *, session_key: str = "", tracker=None, fallback_context: str = ""):
+            def refine(self, asr_input, *, session_key: str = "", tracker=None, fallback_context: str = "", **_kw: object):
                 in_refiner.set()
                 release_refiner.wait(timeout=2.0)
                 return RefinerResult("双阶段整理精修定稿。", "codex", "gpt-6-luna", 28)
@@ -2231,7 +2232,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             class _RetryAsr(BaseAsrProvider):
                 provider_name = "openai"
 
-                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                     return AsrResult("初稿文本", "openai", "gpt-4o-mini-transcribe", 25, retries=2)
 
             class _RetryWarnRefiner(OpenAICompatibleRefiner):
@@ -2313,7 +2314,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             def __init__(self) -> None:
                 pass
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 sup_asr_in.set()
                 sup_asr_rel.wait(timeout=2.0)
                 return AsrResult(text="", provider="dashscope", model="qwen3-asr-flash", latency_ms=10)
@@ -2577,7 +2578,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             start_calls = [0]
 
             class _CountingFakePlatform(_FakePlatform):
-                def start_recording(self, runtime_dir: Path) -> None:
+                def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
                     start_calls[0] += 1
 
             plat = _CountingFakePlatform(paste_outcome=PasteOutcome(False, True, "focus_changed", "mstsc"))
@@ -2793,7 +2794,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 self._lk = threading.Lock()
                 self.n = 0
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 with self._lk:
                     self.n += 1
                     idx = self.n
@@ -2805,7 +2806,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.seen_drafts: list[str] = []
 
-            def refine(self, asr_input, *, session_key="", tracker=None, fallback_context=""):  # type: ignore[override]
+            def refine(self, asr_input, *, session_key="", tracker=None, fallback_context="", **_kw: object):  # type: ignore[override]
                 txt = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
                 self.seen_drafts.append(txt)
                 return RefinerResult(f"整篇精修：{txt}", "dashscope", "qwen-turbo-latest", 18)
@@ -2873,7 +2874,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 def __init__(self) -> None:
                     pass
 
-                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                     cid = _chunk_id_from_wav(wav_bytes)
                     barrier_5.wait()
                     return AsrResult(f"第{cid + 1}段", "dashscope", "qwen3-asr-flash", 10, False)
@@ -2896,7 +2897,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                     self.active = 0
                     self.peak_active = 0
 
-                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                     cid = _chunk_id_from_wav(wav_bytes)
                     with self._lk:
                         self.active += 1
@@ -2928,7 +2929,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 def __init__(self) -> None:
                     self.calls = 0
 
-                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                     self.calls += 1
                     if self.calls == 1:
                         raise RuntimeError("DashScope HTTP 400: The audio is too long")
@@ -3018,7 +3019,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             out_run, err_run = io.StringIO(), io.StringIO()
             with (
                 unittest.mock.patch.dict(os.environ, cli_env, clear=True),
-                unittest.mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_FakeAsr("找回的 post-studio 长语音内容")),
+                unittest.mock.patch("agent_voice_input.daemon_pipeline.create_asr_provider", return_value=_FakeAsr("找回的 post-studio 长语音内容")),
                 redirect_stdout(out_run),
                 redirect_stderr(err_run),
             ):
@@ -3151,7 +3152,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             release_asr = threading.Event()
 
             class _SlowRescueAsr(_FakeAsr):
-                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+                def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                     asr_entered.set()
                     release_asr.wait(timeout=2.0)
                     return AsrResult("断麦前已说的前半段内容", "fake", "m", 15)
@@ -3291,7 +3292,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 events.append(f"beep:{kind}")
                 super().beep(kind)
 
-            def start_recording(self, runtime_dir: Path, *, loopback: bool = False) -> None:
+            def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
                 events.append(f"start_rec:loopback={loopback}")
                 if start_exc[0] is not None:
                     raise start_exc[0]
@@ -3659,7 +3660,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                     hud_seq_order.append((state, kw.get("clear_toast")))
                     super().hud(state, text, duration_ms)
 
-                def start_recording(self, runtime_dir: Path, *, loopback: bool = False) -> None:
+                def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
                     daemon_er._on_recorder_recovered(350)
 
             plat_er = _EarlyRecoverPlatform()
@@ -3714,7 +3715,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             buf_plain = io.StringIO()
             with (
                 mock.patch(
-                    "agent_voice_input.daemon.send_control_command",
+                    "agent_voice_input.control_ipc.send_control_command",
                     return_value={"ok": True, "pid": 1234, "state": "idle"},
                 ),
                 mock.patch("sys.stdout", buf_plain),
@@ -3729,7 +3730,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             buf_ov = io.StringIO()
             with (
                 mock.patch(
-                    "agent_voice_input.daemon.send_control_command",
+                    "agent_voice_input.control_ipc.send_control_command",
                     return_value={"ok": True, "pid": 1234, "state": "idle"},
                 ),
                 mock.patch("sys.stdout", buf_ov),
@@ -3777,7 +3778,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 raise ProcessLookupError(3, "No such process")
 
             with (
-                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=ConnectionRefusedError("dead")),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=ConnectionRefusedError("dead")),
                 mock.patch.object(cli_mod.os, "kill", side_effect=fake_kill_dead),
                 mock.patch("sys.stdout", io.StringIO()),
             ):
@@ -3793,7 +3794,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 raise PermissionError(1, "Operation not permitted")
 
             with (
-                mock.patch("agent_voice_input.daemon.send_control_command", return_value={"ok": True}),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", return_value={"ok": True}),
                 mock.patch.object(cli_mod.os, "kill", side_effect=fake_kill_perm),
                 mock.patch("sys.stdout", io.StringIO()),
             ):
@@ -3864,7 +3865,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             warn_out, warn_err = io.StringIO(), io.StringIO()
             with (
                 mock.patch(
-                    "agent_voice_input.daemon.send_control_command",
+                    "agent_voice_input.control_ipc.send_control_command",
                     return_value={
                         "ok": True,
                         "pid": 2468,
@@ -3901,7 +3902,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
 
             early_err = io.StringIO()
             with (
-                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=ConnectionRefusedError("down")),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=ConnectionRefusedError("down")),
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
                 mock.patch.object(cli_mod.subprocess, "Popen", side_effect=fake_early_popen),
                 mock.patch("sys.stderr", early_err),
@@ -3944,7 +3945,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             toggle_out = io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=fake_toggle_ok),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=fake_toggle_ok),
                 mock.patch("sys.stdout", toggle_out),
             ):
                 rc_tog_ok = cli_mod.main(["toggle"])
@@ -3957,7 +3958,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 tog_to_err = io.StringIO()
                 with (
                     mock.patch.dict(os.environ, env, clear=True),
-                    mock.patch("agent_voice_input.daemon.send_control_command", side_effect=timeout_exc),
+                    mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=timeout_exc),
                     mock.patch("sys.stderr", tog_to_err),
                 ):
                     rc_tog_to = cli_mod.main(["toggle"])
@@ -3968,7 +3969,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             tog_down_err = io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=ConnectionRefusedError("refused")),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=ConnectionRefusedError("refused")),
                 mock.patch("sys.stderr", tog_down_err),
             ):
                 rc_tog_down = cli_mod.main(["toggle"])
@@ -3978,7 +3979,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             st_to_out = io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=TimeoutError("status timeout")),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=TimeoutError("status timeout")),
                 mock.patch("sys.stdout", st_to_out),
             ):
                 rc_st_to = cli_mod.main(["status"])
@@ -4013,7 +4014,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             def __init__(self) -> None:
                 self._idx = 0
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 with order_lock:
                     self._idx += 1
                     idx = self._idx
@@ -4085,6 +4086,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 is_cancelled: object = None,
                 before_clipboard_write: object = None,
                 before_commit: object = None,
+                same_window_verifier: object = None,
             ) -> PasteOutcome:
                 if callable(before_clipboard_write):
                     before_clipboard_write()
@@ -4219,7 +4221,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.n = 0
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 self.n += 1
                 timeline.append((f"asr:{self.n}", round(now[0], 4)))
                 if self.n == 2:
@@ -4314,7 +4316,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             def __init__(self) -> None:
                 pass
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 txt = next(asr_texts)
                 if txt == "第一段":
                     seg1_gate.wait(timeout=2.0)
@@ -4416,7 +4418,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             def __init__(self) -> None:
                 pass
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 return AsrResult(text=next(batch_texts), provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
 
         with tempfile.TemporaryDirectory() as td2:
@@ -4841,7 +4843,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.n = 0
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 self.n += 1
                 if self.n == 1:
                     s1_in_asr.set()
@@ -4857,7 +4859,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             def set_recorder_lost_callback(self, cb):
                 self._lost_cb = cb
 
-            def start_recording(self, runtime_dir: Path) -> None:
+            def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
                 # Starting a new recording resets platform.last_audio_error, just like real WslPlatform/MacOSPlatform
                 self.last_audio_error = ""
 
@@ -4935,7 +4937,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             def __init__(self) -> None:
                 pass
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 q_in_asr.set()
                 hold_q.wait(timeout=3.0)
                 return AsrResult(text="队列项", provider="dashscope", model="qwen3-asr-flash", latency_ms=2)
@@ -4943,7 +4945,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td_q:
             plat_q = _FakePlatform()
             start_calls = [0]
-            plat_q.start_recording = lambda _rt: start_calls.__setitem__(0, start_calls[0] + 1)  # type: ignore[method-assign]
+            plat_q.start_recording = lambda _rt, **_kw: start_calls.__setitem__(0, start_calls[0] + 1)  # type: ignore[method-assign]
             daemon_q = VoiceInputDaemon(
                 Config(refiner=RefinerConfig(provider="off")),
                 env={},
@@ -5074,7 +5076,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.n = 0
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 self.n += 1
                 if self.n in (1, 4):
                     in_t1.set()
@@ -5199,7 +5201,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                     gate_s6 = threading.Event()
                     orig_transcribe = daemon.asr_provider.transcribe
 
-                    def gated_transcribe(wav_b: bytes, context: AsrContext | None = None) -> AsrResult:
+                    def gated_transcribe(wav_b: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                         res_asr = orig_transcribe(wav_b, context)
                         if res_asr.text == "口述6":
                             in_s6.set()
@@ -6039,7 +6041,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             class _SpyAsr:
                 provider_name = "dashscope"
 
-                def transcribe(self, wav_bytes: bytes, context: object = None) -> AsrResult:
+                def transcribe(self, wav_bytes: bytes, context: object = None, **_kw: object) -> AsrResult:
                     hw = list(getattr(context, "hotwords", ()))
                     seen_asr_hw.append(hw)
                     return AsrResult(text="今天天气真好", provider="dashscope", model="qwen3-asr-flash", latency_ms=20)
@@ -6113,7 +6115,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 def __init__(self) -> None:
                     pass
 
-                def transcribe(self, wav_bytes: bytes, context: object = None, *, is_cancelled: object = None) -> AsrResult:
+                def transcribe(self, wav_bytes: bytes, context: object = None, *, is_cancelled: object = None, **_kw: object) -> AsrResult:
                     deadline_w = time.monotonic() + 1.5
                     while time.monotonic() < deadline_w:
                         # Verify prepare_session() connected TCP socket BEFORE any HTTP request is sent!
@@ -6354,7 +6356,7 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
         class _InstrumentedRefiner(BaseRefiner):
             provider_name = "codex"
 
-            def refine(self, asr_input, *, session_key="", tracker=None, fallback_context="", is_cancelled=None):
+            def refine(self, asr_input, *, session_key="", tracker=None, fallback_context="", is_cancelled=None, **_kw: object):
                 return RefinerResult(
                     text=secret_refined,
                     provider="codex",
@@ -10454,7 +10456,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 daemon.close()
 
     def test_selftest_wav_live_window_pinned_before_wav_gate_and_rejects_empty_window(self) -> None:
-        from agent_voice_input import daemon as daemon_mod
+        from agent_voice_input import daemon_pipeline as pipeline_mod
 
         events: list[str] = []
         win_a = ForegroundWindow(hwnd=101, process="WindowsTerminal.exe", title="codex")
@@ -10517,7 +10519,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 refiner=create_refiner(cfg),
                 tracker=_isolated_tracker(rt),
             )
-            orig_process_wav = daemon_mod.process_wav
+            orig_process_wav = pipeline_mod.process_wav
 
             def _tracked_process_wav(*args: object, **kwargs: object) -> object:
                 events.append("process_wav")
@@ -10526,7 +10528,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 return orig_process_wav(*args, **kwargs)  # type: ignore[arg-type]
 
             try:
-                with unittest.mock.patch.object(daemon_mod, "process_wav", side_effect=_tracked_process_wav):
+                with unittest.mock.patch.object(pipeline_mod, "process_wav", side_effect=_tracked_process_wav):
                     r_drift = daemon.handle_control(
                         {
                             "cmd": "selftest_wav",
@@ -11306,35 +11308,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.pasted_texts.append(text)
                 return PasteOutcome(True, True, "ok", self.fg.process, used_clipboard_paste=True)
 
-        class _NoVerifierParamPlatform(_FakePlatform):
-            def __init__(self, initial_fg: ForegroundWindow) -> None:
-                super().__init__()
-                self.fg = initial_fg
-
-            def get_foreground_window(self) -> ForegroundWindow:
-                return self.fg
-
-            def deliver_text(
-                self,
-                text: str,
-                seq_id: int,
-                target_hwnd: int = 0,
-                *,
-                origin_window: ForegroundWindow | None = None,
-                suppress_beep: object = False,
-                is_cancelled: object = None,
-                before_clipboard_write: object = None,
-                before_commit: object = None,
-                fallback_clipboard_text: object = None,
-            ) -> PasteOutcome:
-                del text, seq_id, target_hwnd, suppress_beep, is_cancelled, before_clipboard_write
-                del fallback_clipboard_text
-                if callable(before_commit) and not before_commit():
-                    return PasteOutcome(False, False, "cancelled", "")
-                if origin_window is not None and origin_window.origin_drifted:
-                    return PasteOutcome(False, True, "focus_changed", self.fg.process)
-                return PasteOutcome(True, True, "ok", self.fg.process, used_clipboard_paste=True)
-
         class _HookAsr(BaseAsrProvider):
             provider_name = "dashscope"
 
@@ -11432,35 +11405,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(r_st["delivery_status"], "copied")
             finally:
                 daemon.close()
-
-            # 4. Fallback verifier path when platform.deliver_text does not accept same_window_verifier kwarg
-            plat_fb = _NoVerifierParamPlatform(win_a)
-            asr_fb = _HookAsr("兼容降级复核", on_transcribe=lambda: setattr(plat_fb, "fg", win_b))
-            daemon_fb = VoiceInputDaemon(
-                cfg,
-                env=env,
-                runtime_dir=rt,
-                platform=plat_fb,
-                asr_provider=asr_fb,
-                refiner=create_refiner(cfg),
-                tracker=SessionTracker(home_dir=home, runtime_dir=rt, proc_root=tmp / "empty_proc", env=env),
-            )
-            try:
-                r_fb = daemon_fb.handle_control(
-                    {
-                        "cmd": "selftest_wav",
-                        "wav_path": str(wav_file),
-                        "use_live_window": True,
-                        "deliver": True,
-                        "no_telemetry": True,
-                    }
-                )
-                self.assertTrue(r_fb["ok"], r_fb)
-                self.assertFalse(r_fb["pasted"])
-                self.assertTrue(r_fb["clipboard"])
-                self.assertEqual(r_fb["paste_reason"], "focus_changed")
-            finally:
-                daemon_fb.close()
 
     def test_selftest_wav_no_telemetry_isolates_tracker_and_preserves_live_ssh_prefetch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -12772,6 +12716,68 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertIn("CHUNK_TWO_BODY", seen_blocks[0][2])
             finally:
                 daemon_mc.close()
+
+    def test_selftest_wav_asr_exception_releases_shared_refiner_and_allows_close(self) -> None:
+        from agent_voice_input.refiner import BaseRefiner
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td)
+            wav_file = rt / "boom.wav"
+            wav_file.write_bytes(_voiced_wav())
+
+            class _BoomAsr(BaseAsrProvider):
+                provider_name = "boom_asr"
+
+                def __init__(self) -> None:
+                    pass
+
+                def transcribe(
+                    self,
+                    wav_bytes: bytes,
+                    context: object = None,
+                    *,
+                    is_cancelled: object = None,
+                    cancel_token: object = None,
+                ) -> AsrResult:
+                    del wav_bytes, context, is_cancelled, cancel_token
+                    raise RuntimeError("injected ASR boom")
+
+            close_calls: list[str] = []
+
+            class _TrackedRefiner(BaseRefiner):
+                provider_name = "tracked"
+
+                def refine(self, asr_input: AsrResult | str, **kwargs: object) -> RefinerResult:
+                    del kwargs
+                    txt = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                    return RefinerResult(text=txt, provider="tracked", model="m", latency_ms=1)
+
+                def close(self) -> None:
+                    close_calls.append("refiner")
+
+            daemon = VoiceInputDaemon(
+                Config(refiner=RefinerConfig(provider="deepseek")),
+                env={},
+                runtime_dir=rt,
+                platform=_FakePlatform(),
+                asr_provider=_BoomAsr(),
+                refiner=_TrackedRefiner(),
+                tracker=_isolated_tracker(rt),
+            )
+            try:
+                with self.assertRaisesRegex(RuntimeError, "injected ASR boom"):
+                    daemon.handle_control(
+                        {
+                            "cmd": "selftest_wav",
+                            "wav_path": str(wav_file),
+                            "no_telemetry": True,
+                        }
+                    )
+                with daemon._lock:
+                    self.assertEqual(daemon._refiner_users, 0)
+            finally:
+                daemon.close()
+            self.assertEqual(close_calls, ["refiner"])
 
 
 if __name__ == "__main__":

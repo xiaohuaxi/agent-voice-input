@@ -1151,7 +1151,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 buf = io.StringIO()
                 with (
                     mock.patch.object(cli_mod.sys, "platform", "linux"),
-                    mock.patch("agent_voice_input.daemon.send_control_command", side_effect=_ctrl),
+                    mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
                     mock.patch("sys.stdout", buf),
                 ):
@@ -1248,7 +1248,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 err_buf = io.StringIO()
                 with (
                     mock.patch.object(cli_mod.sys, "platform", "linux"),
-                    mock.patch("agent_voice_input.daemon.send_control_command", side_effect=_ctrl),
+                    mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
                     mock.patch("sys.stdout", buf),
                     mock.patch("sys.stderr", err_buf),
@@ -1274,7 +1274,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                     mock.patch.object(cli_mod.sys, "platform", "linux"),
                     mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
                     mock.patch(
-                        "agent_voice_input.daemon.send_control_command",
+                        "agent_voice_input.control_ipc.send_control_command",
                         side_effect=ConnectionRefusedError("not ready yet"),
                     ),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
@@ -1940,7 +1940,7 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
                 mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
                 mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
-                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=_wsl_slow_ctrl),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_wsl_slow_ctrl),
                 mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
                 mock.patch.object(cli_mod.time, "monotonic", side_effect=lambda: next(wsl_times, 25.0)),
                 mock.patch.object(cli_mod.time, "sleep", return_value=None),
@@ -1963,7 +1963,7 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
                     mock.patch.object(cli_mod.sys, "platform", plat_name),
                     mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", side_effect=FileNotFoundError("no ffmpeg")),
                     mock.patch("agent_voice_input.platform_macos.compile_mac_shim", return_value=(None, "")),
-                    mock.patch("agent_voice_input.daemon.send_control_command", side_effect=_ctrl),
+                    mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
                     mock.patch("sys.stdout", out_s),
                     mock.patch("sys.stderr", err_s),

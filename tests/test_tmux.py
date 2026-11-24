@@ -1896,7 +1896,7 @@ class TmuxRealIsolatedIntegrationTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.contexts: list[AsrContext | None] = []
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 self.contexts.append(context)
                 return AsrResult(text="WSL端tmux全链路验证通过。", provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
 
@@ -2285,7 +2285,7 @@ class DarwinTmuxGhosttyUnitTests(unittest.TestCase):
                     clear=False,
                 ),
                 mock.patch(
-                    "agent_voice_input.daemon.send_control_command",
+                    "agent_voice_input.control_ipc.send_control_command",
                     side_effect=[{"ok": False}, {"ok": True, "pid": 4321}],
                 ),
                 mock.patch.object(

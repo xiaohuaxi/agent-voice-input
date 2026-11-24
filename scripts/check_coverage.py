@@ -50,6 +50,8 @@ TIER_1_MODULES: tuple[str, ...] = (
 
 TIER_2_MODULES: tuple[str, ...] = (
     "daemon",
+    "control_ipc",
+    "daemon_pipeline",
     "diagnose",
     "http_transport",
     "session_ctx",

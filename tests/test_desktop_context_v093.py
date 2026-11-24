@@ -111,7 +111,8 @@ class _DummyAsr(BaseAsrProvider):
 
     def transcribe(
         self, wav_bytes: bytes, context: AsrContext | None = None, *, is_cancelled: object = None
-    ) -> AsrResult:
+    ,
+        **_kw: object,) -> AsrResult:
         del wav_bytes, is_cancelled
         self.seen_contexts.append(_coerce_context(context, "", env=self.env))
         return AsrResult(text=self.text, provider="dashscope", model="qwen3-asr-flash", latency_ms=10)

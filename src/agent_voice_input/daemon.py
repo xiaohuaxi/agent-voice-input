@@ -1,65 +1,105 @@
-"""Core serial-pipelined two-stage state machine daemon and single-shot pipeline for agent-voice-input."""
+"""Core serial-pipelined two-stage state machine daemon for agent-voice-input."""
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field, replace
-import concurrent.futures, copy, errno, fcntl, hashlib, inspect, json, math, os, select, signal, socket, stat, sys, threading, time
+from dataclasses import dataclass, field
+import json
+import os
 from pathlib import Path
+import signal
+import socket
+import sys
+import threading
+import time
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from . import __version__
-from ._remote_probe import _is_broad_or_unsafe_workspace_dir
 from .app_scope import (
-    classify_target_app_hint,
     classify_window_category,
-    is_antigravity_ide_window,
-    is_claude_desktop_window,
-    is_codex_desktop_window,
     is_remote_client_window,
-    is_remote_ide_window,
     match_app_patterns,
-    normalize_app_token,
-    resolve_hotwords_scope,
 )
 from .asr_providers import (
-    AsrError,
-    AsrResult,
     BaseAsrProvider,
     CancelToken,
-    ChatAudioAsrProvider,
-    GeminiAudioProvider,
     _sleep_cooperative,
     create_asr_provider,
 )
 from .audio_proc import (
     AudioGateResult,
-    DEFAULT_MAX_CHUNK_SEC,
-    FAILED_AUDIO_MAX_AGE_SEC,
-    SINGLE_HOP_MAX_CHUNK_SEC,
     get_failed_audio_dir,
-    inspect_wav_chunks,
     process_wav,
     prune_failed_audio_dir,
     save_failed_audio,
-    spawn_recording_archive,
     wait_recording_archives,
 )
 from .config import (
-    AudioConfig,
     Config,
-    ProviderCredentials,
     ensure_secure_dir,
     explain_pipeline_selection,
     get_runtime_dir,
     redact_secrets,
     resolve_credentials,
-    resolve_saved_recordings_dir,
-    select_asr_provider,
     select_refiner_provider,
 )
-from .hotwords import load_hotwords_file
+from .control_ipc import (
+    CONTROL_REQUEST_MAX_BYTES,
+    CONTROL_REQUEST_READ_TIMEOUT_SEC,
+    DAEMON_LOG_FILENAME,
+    DEFAULT_DAEMON_LOG_MAX_BYTES,
+    RECENT_RESULTS_MAXLEN,
+    TELEMETRY_FILENAME,
+    TELEMETRY_MAX_BYTES,
+    DaemonAlreadyRunningError,
+    _has_window_fields,
+    _is_control_peer_disconnected,
+    _parse_optional_seq_id,
+    _parse_optional_timeout_sec,
+    _recv_control_request_line,
+    _window_from_mapping,
+    acquire_daemon_lock,
+    append_telemetry_record,
+    build_daemon_status_response,
+    compute_package_build_id,
+    describe_daemon_drift,
+    merge_recent_results,
+    probe_daemon_status,
+    read_telemetry_history,
+    release_daemon_lock,
+    rotate_daemon_log_if_needed,
+    send_control_command,
+    send_control_reply,
+    write_daemon_pid_file,
+)
+from .daemon_pipeline import (
+    DEFAULT_PASTE_SETTLE_SEC,
+    MAX_ASR_CHUNK_CONCURRENCY,
+    MAX_PENDING_UTTERANCES,
+    MAX_STAGE2_CONCURRENCY,
+    PipelineResult,
+    _OriginWindowProbe,
+    _Stage1State,
+    _derive_failed_label,
+    _execute_stage1,
+    _existing_recoverable_retry_audio,
+    _is_single_hop_asr_provider,
+    _make_desktop_same_window_verifier,
+    _resolve_effective_ui_language,
+    _resolve_pipeline_window_routing,
+    _resolve_stage1_context,
+    _transcribe_wav_chunks,
+    _will_run_stage2_refiner,
+    build_pipeline_summary,
+    classify_capture_error,
+    finalize_commit_slot_outcome,
+    make_isolated_probe_tracker,
+    plan_commit_hud_calls,
+    run_pipeline_once,
+    run_probe_route_request,
+    run_selftest_wav_request,
+    validate_selftest_wav_request,
+)
 from .http_transport import evict_all_keepalive_connections
-from .hud import format_copied_hud_text, is_toast_hud_state, resolve_ui_language
+from .hud import format_copied_hud_text
 from .platform_common import (
     ForegroundWindow,
     MicrophoneUnavailableError,
@@ -67,507 +107,13 @@ from .platform_common import (
     PasteOutcome,
 )
 from .platform_macos import MacOSPlatform, is_macos_terminal_window
-from .platform_wsl import (
-    WslPlatform,
-    is_windows_terminal_process,
-    is_wsl,
-)
-from .refiner import (
-    BaseRefiner,
-    RefinerResult,
-    attach_single_hop_context,
-    build_refiner_context_chunks,
-    create_refiner,
-)
-from .remote_ssh import RemoteSshManager
-from .session_ctx import (
-    SessionSnapshot,
-    SessionTracker,
-    parse_window_title_hint,
-    prune_stale_session_registry,
-)
-from .workspace_ctx import (
-    _AGY_DESKTOP_REJECT_TITLES,
-    _dedupe_hotwords_ci,
-    _effective_is_wsl,
-    _parse_claude_desktop_page_url,
-    _resolve_safe_local_dir,
-    resolve_antigravity_ide_session,
-    resolve_antigravity_ide_session_by_title,
-    resolve_claude_desktop_session_by_title,
-    resolve_codex_desktop_session_by_title,
-    resolve_ide_workspace_cwd,
-)
+from .platform_wsl import WslPlatform, is_windows_terminal_process, is_wsl
+from .refiner import BaseRefiner, RefinerResult, create_refiner
+from .session_ctx import SessionSnapshot, SessionTracker, prune_stale_session_registry
 
-
-TELEMETRY_FILENAME: str = "telemetry.jsonl"
-TELEMETRY_MAX_BYTES: int = 256 * 1024
-RECENT_RESULTS_MAXLEN: int = 20
-DAEMON_LOG_FILENAME: str = "daemon.log"
-DAEMON_LOG_BACKUP_FILENAME: str = "daemon.log.1"
-DEFAULT_DAEMON_LOG_MAX_BYTES: int = 2 * 1024 * 1024
 _LOG_ROTATE_CHECK_INTERVAL_SEC: float = 60.0
 _FAILED_PRUNE_CHECK_INTERVAL_SEC: float = 3600.0
 _CLOSE_JOIN_TIMEOUT_SEC: float = 3.0
-
-
-def _resolve_effective_ui_language(
-    cfg: Config,
-    *,
-    env: Mapping[str, str] | None = None,
-    platform: Any = None,
-) -> str:
-    host_culture_fn = getattr(platform, "_host_ui_culture", None)
-    win_culture = host_culture_fn() if callable(host_culture_fn) else None
-    return resolve_ui_language(cfg.ui.language, env=env, win_ui_culture=win_culture)
-
-
-def rotate_daemon_log_if_needed(
-    log_path: Path,
-    *,
-    max_bytes: int = DEFAULT_DAEMON_LOG_MAX_BYTES,
-    rebind_stdio: bool = True,
-) -> bool:
-    """Safely rotate ``daemon.log`` -> ``daemon.log.1`` (0600) once size reaches ``max_bytes``."""
-    if max_bytes <= 0:
-        return False
-    try:
-        st = os.lstat(log_path)
-        if not stat.S_ISREG(st.st_mode):
-            return False
-        backup_path = log_path.with_name(f"{log_path.name}.1")
-        bst: os.stat_result | None = None
-        try:
-            bst = os.lstat(backup_path)
-            if not stat.S_ISREG(bst.st_mode):
-                return False
-        except FileNotFoundError:
-            bst = None
-
-        # Idempotent self-heal: if a prior rotation partially failed dup2 and left fd 1/2
-        # still pointing at daemon.log.1 while daemon.log exists, rebind those fds back now.
-        if rebind_stdio and bst is not None:
-            backup_fid = (bst.st_dev, bst.st_ino)
-            stale_fds: list[int] = []
-            for fd_num in (1, 2):
-                try:
-                    fst = os.fstat(fd_num)
-                    if (fst.st_dev, fst.st_ino) == backup_fid:
-                        stale_fds.append(fd_num)
-                except OSError:
-                    pass
-            if stale_fds:
-                for fd_num, stream in ((1, sys.stdout), (2, sys.stderr)):
-                    if fd_num in stale_fds:
-                        try:
-                            stream.flush()
-                        except Exception:
-                            pass
-                heal_flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-                heal_fd: int | None = None
-                try:
-                    heal_fd = os.open(str(log_path), heal_flags, 0o600)
-                    for fd_num in stale_fds:
-                        try:
-                            os.dup2(heal_fd, fd_num)
-                        except OSError:
-                            pass
-                except OSError:
-                    pass
-                finally:
-                    if heal_fd is not None:
-                        try:
-                            os.close(heal_fd)
-                        except OSError:
-                            pass
-
-        if st.st_size < max_bytes:
-            return False
-
-        rebind_fds: list[int] = []
-        if rebind_stdio:
-            target_fid = (st.st_dev, st.st_ino)
-            for fd_num in (1, 2):
-                try:
-                    fst = os.fstat(fd_num)
-                    if (fst.st_dev, fst.st_ino) == target_fid:
-                        rebind_fds.append(fd_num)
-                except OSError:
-                    pass
-            if 1 in rebind_fds:
-                try:
-                    sys.stdout.flush()
-                except Exception:
-                    pass
-            if 2 in rebind_fds:
-                try:
-                    sys.stderr.flush()
-                except Exception:
-                    pass
-
-        tmp_path = log_path.with_name(
-            f".{log_path.name}.rotate.{os.getpid()}.{time.monotonic_ns()}.tmp"
-        )
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_APPEND
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        new_fd: int | None = None
-        tmp_exists = False
-        try:
-            new_fd = os.open(str(tmp_path), flags, 0o600)
-            tmp_exists = True
-            os.fchmod(new_fd, 0o600)
-
-            os.replace(log_path, backup_path)
-            try:
-                os.replace(tmp_path, log_path)
-                tmp_exists = False
-            except BaseException:
-                # Best-effort rollback so log_path never stays permanently missing on .1
-                try:
-                    os.replace(backup_path, log_path)
-                except OSError:
-                    pass
-                raise
-
-            try:
-                os.chmod(backup_path, 0o600)
-            except OSError:
-                pass
-            dup_failed = False
-            for fd_num in rebind_fds:
-                try:
-                    os.dup2(new_fd, fd_num)
-                except OSError:
-                    dup_failed = True
-            return not dup_failed
-        finally:
-            if new_fd is not None:
-                try:
-                    os.close(new_fd)
-                except OSError:
-                    pass
-            if tmp_exists:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-    except Exception:
-        return False
-
-
-class DaemonAlreadyRunningError(RuntimeError):
-    """Raised when another daemon instance already holds ``daemon.lock``."""
-
-    def __init__(self, pid: int | None = None) -> None:
-        self.pid = pid if (pid is not None and pid > 0) else None
-        suffix = f" (pid={self.pid})" if self.pid else ""
-        super().__init__(f"agent-voice-input daemon is already running{suffix}")
-
-
-def _elapsed_ms(t0: float, clock_fn: Callable[[], float] = time.monotonic) -> int:
-    return max(0, int(round((clock_fn() - t0) * 1000)))
-
-
-@dataclass(frozen=True)
-class PipelineResult:
-    ok: bool
-    seq_id: int
-    final_text: str = ""
-    skipped_reason: str = ""
-    audio_source: str = ""
-    switched_fallback: bool = False
-    gate: AudioGateResult | None = None
-    session: SessionSnapshot | None = None
-    asr: AsrResult | None = None
-    refined: RefinerResult | None = None
-    paste: PasteOutcome | None = None
-    error: str = ""
-    asr_chunks: int = 1
-    asr_chunk_secs: tuple[float, ...] = ()
-    asr_missed_chunks: int = 0
-    saved_audio: str = ""
-    gate_ms: int = 0
-    sync_ms: int = 0
-    refine_init_ms: int = 0
-    deliver_ms: int = 0
-    total_ms: int = 0
-    queue_wait_ms: int = 0
-    ctx_chars: int = 0
-    ctx_chunks: int = 0
-    mode: str = "agent"
-    ctx_fallback: str = ""
-    workspace_cwd: str = ""
-
-
-def _derive_delivery_status(res: PipelineResult, *, dry_run: bool) -> str:
-    if res.ok:
-        if res.paste is None:
-            return "dry_run" if dry_run else "pasted"
-        if res.paste.pasted:
-            return "pasted"
-        if res.paste.clipboard:
-            return "copied"
-        return "undelivered_recoverable" if res.saved_audio else "undelivered_unrecoverable"
-    return "undelivered_recoverable" if res.saved_audio else "undelivered_unrecoverable"
-
-
-def build_pipeline_summary(
-    seq_id: int,
-    res: PipelineResult,
-    *,
-    dry_run: bool = False,
-    recorder_lost: bool = False,
-    recovery_count: int = 0,
-    recovery_gap_ms: int = 0,
-    audio_error: str = "",
-    queue_wait_ms: int | None = None,
-    redact_fn: Callable[[str], str] | None = None,
-) -> dict[str, Any]:
-    """Build a strictly text-free, secret-redacted numeric summary for status & telemetry.jsonl."""
-    clean_str = redact_fn if redact_fn is not None else (lambda s: redact_secrets(s))
-    in_tok = res.refined.input_tokens if res.refined else None
-    cached_tok = res.refined.cached_input_tokens if res.refined else None
-    out_tok = res.refined.output_tokens if res.refined else None
-    rsn_tok = res.refined.reasoning_tokens if res.refined else None
-    eff_q_wait = max(0, int(res.queue_wait_ms if queue_wait_ms is None else queue_wait_ms))
-    summary: dict[str, Any] = {
-        "ts": round(time.time(), 6),
-        "seq_id": seq_id,
-        "ok": res.ok,
-        "skipped_reason": res.skipped_reason,
-        "audio_source": res.audio_source,
-        "mode": res.mode,
-        "switched_fallback": res.switched_fallback,
-        "session_key": res.session.session_key if res.session else "",
-        "asr_provider": res.asr.provider if res.asr else "",
-        "asr_model": res.asr.model if res.asr else "",
-        "refiner_provider": res.refined.provider if res.refined else "",
-        "refiner_model": res.refined.model if res.refined else "",
-        "refiner_fallback": res.refined.used_fallback if res.refined else "",
-        "pasted": res.paste.pasted if res.paste else False,
-        "clipboard": res.paste.clipboard if res.paste else False,
-        "paste_reason": res.paste.reason if res.paste else ("dry_run" if dry_run and res.ok else ""),
-        "delivery_status": _derive_delivery_status(res, dry_run=dry_run),
-        "raw_audio_sec": round(res.gate.duration_sec, 3) if res.gate else 0.0,
-        "voiced_audio_sec": round(res.gate.voiced_sec, 3) if res.gate else 0.0,
-        "queue_wait_ms": eff_q_wait,
-        "gate_ms": res.gate_ms,
-        "sync_ms": res.sync_ms,
-        "asr_ms": res.asr.latency_ms if res.asr else 0,
-        "refine_init_ms": res.refine_init_ms,
-        "refine_ms": res.refined.latency_ms if res.refined else 0,
-        "deliver_ms": res.deliver_ms,
-        "total_ms": res.total_ms,
-        "asr_chars": len(res.asr.text.strip()) if res.asr else 0,
-        "final_chars": len(res.final_text),
-        "ctx_chars": res.ctx_chars,
-        "ctx_chunks": res.ctx_chunks,
-        "ctx_fallback": res.ctx_fallback,
-        "input_tokens": in_tok,
-        "cached_input_tokens": cached_tok,
-        "output_tokens": out_tok,
-        "reasoning_tokens": rsn_tok,
-    }
-    if in_tok is not None and in_tok > 0 and cached_tok is not None:
-        summary["cache_hit_pct"] = round(100.0 * cached_tok / in_tok, 1)
-    if res.asr and res.asr.is_single_hop_refined:
-        summary["is_single_hop_refined"] = True
-    if res.refined and res.refined.audio_tokens is not None:
-        summary["audio_tokens"] = res.refined.audio_tokens
-    if (
-        res.asr
-        and (res.asr.input_tokens is not None or res.asr.audio_tokens is not None)
-        and (res.refined is None or res.refined.used_fallback != "single_hop_passthrough")
-    ):
-        if res.asr.input_tokens is not None:
-            summary["asr_input_tokens"] = res.asr.input_tokens
-            summary["asr_cached_input_tokens"] = res.asr.cached_input_tokens
-            summary["asr_output_tokens"] = res.asr.output_tokens
-            summary["asr_reasoning_tokens"] = res.asr.reasoning_tokens
-        if res.asr.audio_tokens is not None:
-            summary["asr_audio_tokens"] = res.asr.audio_tokens
-    if res.asr and res.asr.retries > 0:
-        summary["asr_retries"] = res.asr.retries
-    if res.asr and res.asr.duration_ms is not None:
-        summary["asr_duration_ms"] = res.asr.duration_ms
-    if res.asr and res.asr.request_id:
-        summary["asr_request_id"] = clean_str(res.asr.request_id)
-    if res.refined and res.refined.retries > 0:
-        summary["refiner_retries"] = res.refined.retries
-    if res.refined and res.refined.warning:
-        summary["refiner_warning"] = clean_str(res.refined.warning)
-    if res.error:
-        summary["error"] = clean_str(res.error)
-    if res.asr_chunks > 1:
-        summary["asr_chunks"] = res.asr_chunks
-        if res.asr_chunk_secs:
-            summary["asr_chunk_secs"] = list(res.asr_chunk_secs)
-    if res.asr_missed_chunks > 0:
-        summary["asr_missed_chunks"] = res.asr_missed_chunks
-    if res.saved_audio:
-        summary["saved_audio"] = res.saved_audio
-    if dry_run:
-        summary["dry_run"] = True
-    if recorder_lost:
-        summary["capture_interrupted"] = True
-    if recovery_count > 0:
-        summary["recovery_count"] = recovery_count
-        summary["recovery_gap_ms"] = recovery_gap_ms
-    if (not res.ok or recorder_lost) and audio_error:
-        summary["audio_error"] = clean_str(audio_error)
-    return summary
-
-
-def append_telemetry_record(
-    runtime_dir: Path,
-    record: Mapping[str, Any],
-    *,
-    max_bytes: int = TELEMETRY_MAX_BYTES,
-) -> None:
-    """Append one pure-numeric JSON record to ``0600`` ``telemetry.jsonl`` with atomic >256KB tail truncation."""
-    try:
-        rt = ensure_secure_dir(runtime_dir)
-        telemetry_path = rt / TELEMETRY_FILENAME
-        lock_path = rt / ".telemetry.lock"
-        line_bytes = (json.dumps(dict(record), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        lfd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | nofollow, 0o600)
-        os.fchmod(lfd, 0o600)
-        with os.fdopen(lfd, "r+", encoding="utf-8") as lf:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-            try:
-                try:
-                    st_pre = os.lstat(telemetry_path)
-                    if not stat.S_ISREG(st_pre.st_mode):
-                        return
-                except FileNotFoundError:
-                    pass
-                afd = os.open(
-                    str(telemetry_path),
-                    os.O_CREAT | os.O_WRONLY | os.O_APPEND | nofollow,
-                    0o600,
-                )
-                os.fchmod(afd, 0o600)
-                with os.fdopen(afd, "wb") as af:
-                    af.write(line_bytes)
-                    af.flush()
-                st = os.lstat(telemetry_path)
-                if not stat.S_ISREG(st.st_mode) or st.st_size <= max_bytes:
-                    return
-                keep_target = max(1, max_bytes // 2)
-                seek_pos = max(0, st.st_size - keep_target)
-                with open(telemetry_path, "rb") as rf:
-                    if seek_pos > 0:
-                        rf.seek(seek_pos)
-                    raw_tail = rf.read()
-                if seek_pos > 0:
-                    nl = raw_tail.find(b"\n")
-                    if 0 <= nl < len(raw_tail) - 1:
-                        tail = raw_tail[nl + 1 :]
-                    else:
-                        tail = line_bytes if len(line_bytes) <= max_bytes else b""
-                else:
-                    tail = raw_tail
-                tmp_path = rt / f".{TELEMETRY_FILENAME}.trim.{os.getpid()}.{time.monotonic_ns()}.tmp"
-                tfd = os.open(str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY | nofollow, 0o600)
-                closed_tfd = False
-                try:
-                    os.fchmod(tfd, 0o600)
-                    tf_obj = os.fdopen(tfd, "wb")
-                    closed_tfd = True
-                    with tf_obj as tf:
-                        tf.write(tail)
-                        tf.flush()
-                    os.replace(tmp_path, telemetry_path)
-                except Exception:
-                    if not closed_tfd:
-                        try:
-                            os.close(tfd)
-                        except OSError:
-                            pass
-                    try:
-                        tmp_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-            finally:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-    except Exception:
-        pass
-
-
-def read_telemetry_history(
-    runtime_dir: Path,
-    limit: int = 10,
-    *,
-    max_scan_bytes: int = TELEMETRY_MAX_BYTES + 65536,
-) -> list[dict[str, Any]]:
-    """Read up to ``limit`` most recent JSONL telemetry records from ``runtime_dir / telemetry.jsonl``."""
-    eff_limit = max(0, int(limit))
-    if eff_limit <= 0:
-        return []
-    telemetry_path = runtime_dir / TELEMETRY_FILENAME
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(str(telemetry_path), os.O_RDONLY | nofollow)
-        with os.fdopen(fd, "rb") as f:
-            st = os.fstat(f.fileno())
-            if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
-                return []
-            seek_pos = max(0, st.st_size - max(4096, int(max_scan_bytes)))
-            if seek_pos > 0:
-                f.seek(seek_pos)
-            raw = f.read()
-        if seek_pos > 0:
-            nl = raw.find(b"\n")
-            if 0 <= nl < len(raw) - 1:
-                raw = raw[nl + 1 :]
-        out: list[dict[str, Any]] = []
-        for raw_ln in raw.splitlines():
-            ln = raw_ln.strip()
-            if not ln:
-                continue
-            try:
-                obj = json.loads(ln.decode("utf-8", errors="replace"))
-            except ValueError:
-                continue
-            if isinstance(obj, dict):
-                out.append(obj)
-        return out[-eff_limit:]
-    except Exception:
-        return []
-
-
-def merge_recent_results(
-    mem_items: Sequence[Mapping[str, Any]],
-    disk_items: Sequence[Mapping[str, Any]],
-    limit: int = 10,
-) -> list[dict[str, Any]]:
-    """Merge persisted telemetry records with live in-memory ``recent_results`` without duplicates."""
-    eff_limit = max(0, int(limit))
-    if eff_limit <= 0:
-        return []
-    merged: list[dict[str, Any]] = []
-    seen: set[tuple[Any, Any]] = set()
-    for rec in disk_items:
-        d = dict(rec)
-        key = (d.get("ts"), d.get("seq_id"))
-        if d.get("ts") is not None:
-            seen.add(key)
-        merged.append(d)
-    for rec in mem_items:
-        d = dict(rec)
-        key = (d.get("ts"), d.get("seq_id"))
-        if d.get("ts") is not None and key in seen:
-            continue
-        if d.get("ts") is not None:
-            seen.add(key)
-        merged.append(d)
-    return merged[-eff_limit:]
 
 
 def create_platform(cfg: Config, *, env: Mapping[str, str] | None = None) -> WslPlatform | MacOSPlatform:
@@ -578,1754 +124,6 @@ def create_platform(cfg: Config, *, env: Mapping[str, str] | None = None) -> Wsl
             "Linux desktop host is not yet supported (use macOS or Windows+WSL2 as local voice host)"
         )
     return WslPlatform(cfg, env=env)
-
-
-_WINDOW_REQ_KEYS: tuple[str, ...] = (
-    "hwnd",
-    "process",
-    "title",
-    "bundle_id",
-    "surface_id",
-    "tty",
-    "cwd",
-    "pid",
-    "tmux_socket",
-    "tmux_pane",
-    "document",
-    "page_url",
-)
-
-
-def _has_window_fields(req: Mapping[str, Any]) -> bool:
-    for k in _WINDOW_REQ_KEYS:
-        val = req.get(k)
-        if isinstance(val, str):
-            if val.strip():
-                return True
-        elif val:
-            return True
-    return False
-
-
-def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
-    raw_ax = m.get("ax_trusted")
-    return ForegroundWindow(
-        hwnd=int(m.get("hwnd") or 0),
-        process=str(m.get("process") or ""),
-        title=str(m.get("title") or ""),
-        bundle_id=str(m.get("bundle_id") or ""),
-        surface_id=str(m.get("surface_id") or ""),
-        tty=str(m.get("tty") or ""),
-        cwd=str(m.get("cwd") or ""),
-        pid=int(m.get("pid") or 0),
-        ax_trusted=raw_ax if isinstance(raw_ax, bool) else None,
-        tmux_socket=str(m.get("tmux_socket") or ""),
-        tmux_pane=str(m.get("tmux_pane") or ""),
-        document=str(m.get("document") or ""),
-        page_url=str(m.get("page_url") or ""),
-    )
-
-
-def _resolve_control_origin_window(req: Mapping[str, Any]) -> ForegroundWindow | None:
-    if _has_window_fields(req):
-        return _window_from_mapping(req)
-    if req.get("use_live_window") is True:
-        return None
-    return ForegroundWindow()
-
-
-_SAFE_SESSION_ID_CHARS: frozenset[str] = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-)
-_KNOWN_MATCHED_BY: frozenset[str] = frozenset(
-    {
-        "registry",
-        "title_uuid",
-        "title_prefix",
-        "tty_registry",
-        "tty_ps",
-        "proc_scan",
-        "recent_root",
-        "tmux",
-        "tmux_pane",
-        "tmux_registry",
-        "tmux_pane_title",
-        "tmux_proc_scan",
-        "ide_brain",
-        "ide_db_title",
-        "codex_desktop_db",
-        "claude_desktop_code",
-        "claude_desktop_cowork",
-        "explicit",
-        "remote",
-        "remote_ssh",
-        "remote_cache",
-        "remote_whitelist",
-        "remote_proc",
-        "remote_registry",
-        "remote_title_token",
-        "remote_cwd",
-        "remote_cwd_only",
-        "remote_tmux_title",
-        "remote_tmux_proc",
-    }
-)
-
-
-def _is_safe_session_token(val: str) -> bool:
-    return bool(val) and all(ch in _SAFE_SESSION_ID_CHARS for ch in val)
-
-
-def _mask_session_token(raw_id: str) -> str:
-    if _is_safe_session_token(raw_id):
-        return raw_id[:8]
-    return hashlib.sha256(raw_id.encode("utf-8", errors="replace")).hexdigest()[:8]
-
-
-def _mask_session_key(snap: SessionSnapshot | None) -> str:
-    if snap is None:
-        return ""
-    m = getattr(snap, "match", None)
-    cli = str(getattr(m, "cli", "") or "").strip()
-    sid = str(getattr(m, "session_id", "") or "").strip()
-    if cli and sid:
-        safe_cli = cli if _is_safe_session_token(cli) else "other"
-        return f"{safe_cli}:{_mask_session_token(sid)}"
-    raw = str(getattr(snap, "session_key", "") or "").strip()
-    if not raw:
-        return ""
-    prefix, sep, tail = raw.rpartition(":")
-    if sep:
-        safe_cli = prefix if _is_safe_session_token(prefix) else "other"
-        return f"{safe_cli}:{_mask_session_token(tail)}"
-    return _mask_session_token(raw)
-
-
-def _sanitize_matched_by(snap: SessionSnapshot | None) -> str:
-    if snap is None:
-        return ""
-    m = getattr(snap, "match", None)
-    raw = str(getattr(m, "matched_by", "") or "").strip()
-    if not raw:
-        return ""
-    if raw in _KNOWN_MATCHED_BY:
-        return raw
-    is_remote = str(getattr(m, "origin", "") or "").strip().lower() == "remote" or bool(
-        str(getattr(m, "host_name", "") or "").strip()
-    )
-    return "remote" if is_remote else "other"
-
-
-def _workspace_basename(cwd: str) -> str:
-    cleaned = (cwd or "").replace("\\", "/").strip().rstrip("/")
-    if not cleaned:
-        return ""
-    name = Path(cleaned).name
-    return "" if (not name or name.endswith(":")) else name
-
-
-def _may_run_stage2_refiner(
-    cfg: Config, refiner: BaseRefiner, asr_provider: BaseAsrProvider
-) -> bool:
-    prov = cfg.refiner.provider.strip().lower()
-    if prov in ("", "off", "none", "false", "0", "disabled"):
-        return False
-    if getattr(refiner, "provider_name", "off") in ("", "off", "none"):
-        return False
-    if not cfg.refiner.force_on_single_hop and (
-        isinstance(asr_provider, (GeminiAudioProvider, ChatAudioAsrProvider))
-        or bool(getattr(asr_provider, "single_hop", False))
-    ):
-        return False
-    return True
-
-
-def _will_run_stage2_refiner(cfg: Config, refiner: BaseRefiner, asr_res: AsrResult) -> bool:
-    prov = cfg.refiner.provider.strip().lower()
-    if prov in ("", "off", "none", "false", "0", "disabled"):
-        return False
-    if getattr(refiner, "provider_name", "off") in ("", "off", "none"):
-        return False
-    if asr_res.is_single_hop_refined and not cfg.refiner.force_on_single_hop:
-        return False
-    return True
-
-
-def _join_chunk_texts(parts: Sequence[str]) -> str:
-    out: list[str] = []
-    for raw in parts:
-        s = raw.strip()
-        if not s:
-            continue
-        if not out:
-            out.append(s)
-            continue
-        prev = out[-1]
-        if prev[-1].isascii() and prev[-1].isalnum() and s[0].isascii() and s[0].isalnum():
-            out.append(" " + s)
-        elif prev[-1] in "，。！？；：,.!?;:\n":
-            out.append(s)
-        else:
-            out.append("，" + s if not prev[-1].isascii() else " " + s)
-    return "".join(out).strip()
-
-
-def _derive_failed_label(
-    snap: SessionSnapshot | None, win: ForegroundWindow, workspace_cwd: str = ""
-) -> str:
-    for cwd_cand in ((snap.match.cwd if snap else ""), win.cwd, workspace_cwd):
-        if cwd_cand and cwd_cand.strip():
-            name = Path(cwd_cand.strip().rstrip("/\\")).name
-            if name:
-                return name
-    if snap and snap.match.cli and snap.match.session_id:
-        return f"{snap.match.cli}-{snap.match.session_id[:8]}"
-    return ""
-
-
-MAX_ASR_CHUNK_CONCURRENCY: int = 5
-MAX_PENDING_UTTERANCES: int = 8
-MAX_STAGE2_CONCURRENCY: int = 2
-DEFAULT_PASTE_SETTLE_SEC: float = 0.15
-
-
-def _make_cancel_check(
-    seq_id: int,
-    is_current_seq: Callable[[int], bool] | None,
-    is_cancelled: Callable[[], bool] | None,
-    cancel_token: CancelToken | None = None,
-) -> Callable[[], bool] | None:
-    if is_current_seq is None and is_cancelled is None and cancel_token is None:
-        return None
-
-    def _check() -> bool:
-        if cancel_token is not None and cancel_token.is_cancelled():
-            return True
-        if is_cancelled is not None and is_cancelled():
-            return True
-        if is_current_seq is not None and not is_current_seq(seq_id):
-            return True
-        return False
-
-    return _check
-
-
-def _call_asr_transcribe(
-    eff_asr: BaseAsrProvider,
-    wav_bytes: bytes,
-    *,
-    context: Any,
-    is_cancelled: Callable[[], bool] | None,
-    cancel_token: CancelToken | None = None,
-) -> AsrResult:
-    try:
-        params = inspect.signature(eff_asr.transcribe).parameters
-    except (TypeError, ValueError):
-        params = {}
-    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-    kw: dict[str, Any] = {"context": context}
-    if is_cancelled is not None and ("is_cancelled" in params or has_var_kw):
-        kw["is_cancelled"] = is_cancelled
-    if cancel_token is not None and ("cancel_token" in params or has_var_kw):
-        kw["cancel_token"] = cancel_token
-    return eff_asr.transcribe(wav_bytes, **kw)
-
-
-class _IsolatedSessionTrackerView:
-    """Read-only tracker view mapping empty ``session_key`` lookups to a fixed snapshot key."""
-
-    def __init__(self, inner: SessionTracker, bound_session_key: str) -> None:
-        self._inner = inner
-        self._bound_session_key = bound_session_key
-
-    @property
-    def has_bound_session(self) -> bool:
-        return bool(self._bound_session_key)
-
-    def _eff_key(self, session_key: str) -> str:
-        return session_key or self._bound_session_key
-
-    def get_refiner_context_with_prior(self, session_key: str, *args: Any, **kwargs: Any) -> Any:
-        fn = getattr(self._inner, "get_refiner_context_with_prior", None)
-        if callable(fn):
-            return fn(self._eff_key(session_key), *args, **kwargs)
-        raw_chunks, git_ctx = self._inner.get_refiner_context(
-            self._eff_key(session_key),
-            **{k: v for k, v in kwargs.items() if k != "allow_prior"},
-        )
-        return "", raw_chunks, git_ctx
-
-    def get_refiner_context(self, session_key: str, *args: Any, **kwargs: Any) -> Any:
-        return self._inner.get_refiner_context(self._eff_key(session_key), *args, **kwargs)
-
-    def get_state(self, session_key: str) -> Any:
-        return self._inner.get_state(self._eff_key(session_key))
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
-
-
-def _call_refiner_refine(
-    eff_refiner: BaseRefiner,
-    asr_res: AsrResult,
-    *,
-    session_key: str,
-    tracker: SessionTracker,
-    fallback_context: str,
-    is_cancelled: Callable[[], bool] | None,
-    cancel_token: CancelToken | None = None,
-    mode: str = "agent",
-    workspace_cwd: str = "",
-    target_hint: str = "",
-) -> RefinerResult:
-    try:
-        params = inspect.signature(eff_refiner.refine).parameters
-    except (TypeError, ValueError):
-        params = {}
-    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-    kw: dict[str, Any] = {
-        "session_key": session_key,
-        "tracker": tracker,
-        "fallback_context": fallback_context,
-    }
-    if is_cancelled is not None and ("is_cancelled" in params or has_var_kw):
-        kw["is_cancelled"] = is_cancelled
-    if cancel_token is not None and ("cancel_token" in params or has_var_kw):
-        kw["cancel_token"] = cancel_token
-    if "mode" in params or (has_var_kw and mode != "agent"):
-        kw["mode"] = mode
-    if workspace_cwd and ("workspace_cwd" in params or has_var_kw):
-        kw["workspace_cwd"] = workspace_cwd
-    if target_hint and ("target_hint" in params or has_var_kw):
-        kw["target_hint"] = target_hint
-    return eff_refiner.refine(asr_res, **kw)
-
-
-def _is_single_hop_asr_provider(eff_asr: BaseAsrProvider) -> bool:
-    return bool(
-        isinstance(eff_asr, (GeminiAudioProvider, ChatAudioAsrProvider))
-        or getattr(eff_asr, "single_hop", False)
-    )
-
-
-def _existing_recoverable_retry_audio(
-    raw_wav: bytes | str | Path,
-    runtime_dir: Path | None,
-) -> str:
-    """Return the existing unexpired ``failed/`` WAV path for ``audio_source == 'retry'`` without duplicating it."""
-    if runtime_dir is None or not isinstance(raw_wav, (str, Path)):
-        return ""
-    raw_str = str(raw_wav).strip()
-    if not raw_str:
-        return ""
-    cand = Path(raw_str).expanduser()
-    fdir = get_failed_audio_dir(runtime_dir, create=False)
-    try:
-        if not cand.is_file() or cand.is_symlink():
-            return ""
-        cand.resolve().relative_to(fdir.resolve())
-        st_f = cand.stat()
-        if st_f.st_size <= 0:
-            return ""
-        if FAILED_AUDIO_MAX_AGE_SEC > 0 and (time.time() - st_f.st_mtime) > FAILED_AUDIO_MAX_AGE_SEC:
-            return ""
-        return str(cand)
-    except (OSError, ValueError):
-        return ""
-
-
-def _normalized_chunk_floor_dbfs(floor_dbfs: float, gain_db: float) -> float:
-    """Map raw ``floor_dbfs`` into post-normalization scale using ``gate.gain_db``."""
-    base = float(floor_dbfs)
-    if not math.isfinite(gain_db) or gain_db == 0.0:
-        return base
-    shifted = base + float(gain_db)
-    return min(-3.0, shifted) if gain_db > 0.0 else shifted
-
-
-def _transcribe_wav_chunks(
-    wav_bytes: bytes,
-    *,
-    eff_asr: BaseAsrProvider,
-    asr_ctx: Any,
-    floor_dbfs: float,
-    audio_cfg: AudioConfig | None = None,
-    gain_db: float = 0.0,
-    max_chunk_sec: float | None = None,
-    seq_id: int = 1,
-    is_current_seq: Callable[[int], bool] | None = None,
-    is_cancelled: Callable[[], bool] | None = None,
-    cancel_token: CancelToken | None = None,
-) -> tuple[AsrResult, int, tuple[float, ...]]:
-    cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled, cancel_token)
-    base_chunk_sec = (
-        (SINGLE_HOP_MAX_CHUNK_SEC if _is_single_hop_asr_provider(eff_asr) else DEFAULT_MAX_CHUNK_SEC)
-        if max_chunk_sec is None
-        else float(max_chunk_sec)
-    )
-    prov_chunk_sec = getattr(eff_asr, "max_chunk_sec", None)
-    eff_max_chunk_sec = (
-        min(base_chunk_sec, float(prov_chunk_sec))
-        if prov_chunk_sec is not None and float(prov_chunk_sec) > 0
-        else base_chunk_sec
-    )
-    norm_floor_dbfs = _normalized_chunk_floor_dbfs(floor_dbfs, gain_db)
-    infos = inspect_wav_chunks(wav_bytes, max_chunk_sec=eff_max_chunk_sec, floor_dbfs=norm_floor_dbfs)
-    if len(infos) <= 1:
-        if cancel_check is not None and cancel_check():
-            return AsrResult(text="", provider=getattr(eff_asr, "provider_name", ""), model="", latency_ms=0), 1, ()
-        return (
-            _call_asr_transcribe(
-                eff_asr, wav_bytes, context=asr_ctx, is_cancelled=cancel_check, cancel_token=cancel_token
-            ),
-            1,
-            (),
-        )
-
-    chunk_secs = tuple(round(c.duration_sec, 2) for c in infos)
-    t0 = time.monotonic()
-    results: list[AsrResult | None] = [None] * len(infos)
-    abort_evt = threading.Event()
-    if cancel_token is not None:
-        cancel_token.bind_event(abort_evt)
-    first_exc_lock = threading.Lock()
-    first_exc: list[Exception] = []
-
-    def _chunk_cancelled() -> bool:
-        return abort_evt.is_set() or (cancel_check is not None and cancel_check())
-
-    def _work(chunk_wav: bytes) -> AsrResult | None:
-        if _chunk_cancelled():
-            return None
-        try:
-            return _call_asr_transcribe(
-                eff_asr,
-                chunk_wav,
-                context=asr_ctx,
-                is_cancelled=_chunk_cancelled,
-                cancel_token=cancel_token,
-            )
-        except Exception as exc:
-            if (cancel_check is not None and cancel_check()) and isinstance(exc, AsrError) and "cancelled" in str(exc).lower():
-                return None
-            with first_exc_lock:
-                if not abort_evt.is_set():
-                    first_exc.append(exc)
-                    abort_evt.set()
-            raise
-
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_ASR_CHUNK_CONCURRENCY, len(infos))) as pool:
-            futs = [pool.submit(_work, c.wav_bytes) for c in infos]
-            try:
-                for idx, fut in enumerate(futs):
-                    results[idx] = fut.result()
-            except Exception:
-                abort_evt.set()
-                for f in futs:
-                    f.cancel()
-                if first_exc:
-                    raise first_exc[0]
-                raise
-    finally:
-        if cancel_token is not None:
-            cancel_token.unbind_event(abort_evt)
-
-    def _sum_opt(vals: Sequence[int | None]) -> int | None:
-        present = [v for v in vals if v is not None]
-        return sum(present) if present else None
-
-    non_null = [r for r in results if r is not None]
-    merged_text = _join_chunk_texts([r.text for r in non_null if r.text.strip()])
-    missed_chunks = 0
-    if not (cancel_check is not None and cancel_check()):
-        eff_audio_cfg = audio_cfg if audio_cfg is not None else AudioConfig(floor_dbfs=floor_dbfs)
-        chunk_min_dur = min(eff_audio_cfg.min_duration_sec, eff_audio_cfg.min_voiced_sec)
-        for idx, res_i in enumerate(results):
-            if res_i is None or res_i.text.strip():
-                continue
-            try:
-                if process_wav(
-                    infos[idx].wav_bytes,
-                    eff_audio_cfg,
-                    floor_dbfs=norm_floor_dbfs,
-                    min_duration_sec=chunk_min_dur,
-                ).passed:
-                    missed_chunks += 1
-            except Exception:
-                pass
-    elapsed_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
-    first = non_null[0] if non_null else None
-    prov = first.provider if first else getattr(eff_asr, "provider_name", "")
-    model = first.model if first else ""
-    single_hop = bool(non_null) and all(r.is_single_hop_refined for r in non_null)
-    total_retries = sum(r.retries for r in non_null)
-    return (
-        AsrResult(
-            text=merged_text,
-            provider=prov,
-            model=model,
-            latency_ms=elapsed_ms,
-            is_single_hop_refined=single_hop,
-            retries=total_retries,
-            input_tokens=_sum_opt([r.input_tokens for r in non_null]),
-            cached_input_tokens=_sum_opt([r.cached_input_tokens for r in non_null]),
-            output_tokens=_sum_opt([r.output_tokens for r in non_null]),
-            reasoning_tokens=_sum_opt([r.reasoning_tokens for r in non_null]),
-            context_chars=max((r.context_chars for r in non_null), default=0),
-            context_chunks=max((r.context_chunks for r in non_null), default=0),
-            audio_tokens=_sum_opt([r.audio_tokens for r in non_null]),
-            missed_chunks=missed_chunks,
-            request_id=",".join(r.request_id for r in non_null if r.request_id),
-            duration_ms=_sum_opt([r.duration_ms for r in non_null]),
-        ),
-        len(infos),
-        chunk_secs,
-    )
-
-
-def _classify_window_for_platform(win: ForegroundWindow, platform: Any) -> str:
-    if not (win.process or win.bundle_id):
-        return "general_gui"
-    checker = getattr(platform, "is_allowed_terminal", None)
-    is_term = (
-        (lambda w: bool(checker(w)))
-        if checker is not None
-        else (
-            lambda w: is_windows_terminal_process(w.process)
-            or is_macos_terminal_window(w.process, w.bundle_id)
-        )
-    )
-    return classify_window_category(win, is_terminal=is_term)
-
-
-def _resolve_pipeline_window_routing(
-    win: ForegroundWindow,
-    *,
-    platform: Any,
-    origin_window: ForegroundWindow | None,
-    window_title_override: str | None,
-    audio_source: str,
-    explicit_mode: str,
-) -> tuple[bool, str]:
-    """Return ``(should_sync_session, refiner_mode)`` for ``run_pipeline_once``."""
-    m = (explicit_mode or "auto").strip().lower()
-    if m == "general":
-        return False, "general"
-    if m == "agent":
-        return True, "agent"
-    if window_title_override is not None or bool(
-        win.tty or win.cwd or win.tmux_pane or win.surface_id
-    ):
-        return True, "agent"
-    if not (win.process or win.bundle_id):
-        if (
-            parse_window_title_hint(win.title) is not None
-            or audio_source in ("file", "selftest_wav", "retry")
-            or (platform is None and origin_window is None)
-        ):
-            return True, "agent"
-        return False, "general"
-    cat = _classify_window_for_platform(win, platform)
-    if cat == "terminal":
-        return True, "agent"
-    if cat == "coding_gui":
-        # v0.8-3: MUST skip sync_session so WSL2 /proc or macOS fallback never injects an
-        # unrelated background CLI repo's 200K session into VS Code / Cursor / Antigravity IDE!
-        return False, "agent"
-    return False, "general"
-
-
-def _parse_optional_seq_id(raw: Any) -> int | None:
-    if raw is None:
-        return None
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
-        raise ValueError(f"seq_id must be a positive integer, got {raw!r}")
-    return raw
-
-
-@dataclass(slots=True)
-class _Stage1State:
-    t_total0: float
-    queue_wait_ms: int = 0
-    gate: AudioGateResult | None = None
-    gate_ms: int = 0
-    switched_fallback: bool = False
-    win: ForegroundWindow = field(default_factory=ForegroundWindow)
-    window_category: str = "general_gui"
-    should_sync: bool = False
-    eff_mode: str = "agent"
-    snap: SessionSnapshot | None = None
-    workspace_cwd: str = ""
-    target_hint: str = ""
-    hotwords_scope: str = "global"
-    remote_vetoed: bool = False
-    asr_ctx_dialog: str = ""
-    sync_ms: int = 0
-    prep_ms: int = 0
-    asr_res: AsrResult | None = None
-    asr_chunks: int = 1
-    asr_chunk_secs: tuple[float, ...] = ()
-    asr_missed_chunks: int = 0
-    skipped_reason: str = ""
-    ctx_fallback: str = ""
-    codex_promoted_sid: str = ""
-    claude_promoted_sid: str = ""
-    claude_promoted_route_id: str = ""
-    agy_bound_sid: str = ""
-
-
-def _make_desktop_same_window_verifier(
-    st: _Stage1State,
-    *,
-    tracker: SessionTracker,
-    env: Mapping[str, str],
-) -> Callable[[ForegroundWindow], bool] | None:
-    """Return a same-window conversation verifier for Codex desktop, Claude Desktop, or AGY 2.0 deliveries."""
-    orig_win = st.win
-    codex_sid = st.codex_promoted_sid
-    claude_sid = st.claude_promoted_sid
-    claude_route_id = st.claude_promoted_route_id
-    agy_sid = st.agy_bound_sid
-    if (not codex_sid and not claude_sid and not agy_sid) or orig_win.origin_drifted:
-        return None
-    if codex_sid:
-        kind = "codex"
-        bound_sid = codex_sid
-    elif claude_sid:
-        kind = "claude"
-        bound_sid = claude_sid
-    else:
-        kind = "agy"
-        bound_sid = agy_sid
-    orig_title = (orig_win.title or "").strip()
-    orig_bundle = (orig_win.bundle_id or "").strip().lower()
-
-    def _verify(cur_win: ForegroundWindow) -> bool:
-        if cur_win is None or (
-            not cur_win.hwnd
-            and not (cur_win.process or "").strip()
-            and not (cur_win.bundle_id or "").strip()
-        ):
-            return False
-        same_window = (
-            (orig_win.hwnd > 0 and cur_win.hwnd == orig_win.hwnd)
-            or (orig_win.hwnd <= 0 and cur_win.hwnd <= 0)
-        )
-        same_desktop_proc = bool(
-            orig_win.hwnd > 0
-            and normalize_app_token(cur_win.process)
-            and normalize_app_token(cur_win.process) == normalize_app_token(orig_win.process)
-        )
-        same_desktop_bundle = bool(
-            orig_win.hwnd > 0
-            and orig_bundle
-            and (cur_win.bundle_id or "").strip().lower() == orig_bundle
-        )
-        if kind == "codex":
-            is_target_app = is_codex_desktop_window(cur_win)
-        elif kind == "claude":
-            is_target_app = is_claude_desktop_window(cur_win)
-        else:
-            is_target_app = is_antigravity_ide_window(cur_win)
-        if not same_window or not (is_target_app or same_desktop_proc or same_desktop_bundle):
-            return True
-        cur_title = (cur_win.title or "").strip()
-        if kind == "claude":
-            cur_page_url = (getattr(cur_win, "page_url", "") or "").strip()
-            if claude_route_id:
-                cur_rk, cur_rsid = _parse_claude_desktop_page_url(cur_page_url)
-                if cur_rk not in ("code", "cowork") or not cur_rsid:
-                    return False
-                if f"{cur_rk}:{cur_rsid.lower()}" != claude_route_id:
-                    return False
-            try:
-                re_match = resolve_claude_desktop_session_by_title(
-                    cur_title, page_url=cur_page_url, home=tracker.home, env=env
-                )
-            except Exception:
-                return False
-            return bool(re_match is not None and re_match.session_id == bound_sid)
-        if cur_title == orig_title:
-            return True
-        try:
-            if kind == "codex":
-                re_match = resolve_codex_desktop_session_by_title(cur_title, home=tracker.home, env=env)
-            else:
-                re_match = resolve_antigravity_ide_session_by_title(cur_title, home=tracker.home, env=env)
-        except Exception:
-            return False
-        return bool(re_match is not None and re_match.session_id == bound_sid)
-
-    return _verify
-
-
-_make_codex_desktop_same_window_verifier = _make_desktop_same_window_verifier
-
-
-def _callable_accepts_kw(fn: Any, kw_name: str) -> bool:
-    if not callable(fn):
-        return False
-    try:
-        params = inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return False
-    return kw_name in params or any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-    )
-
-
-def _platform_accepts_same_window_verifier(platform: Any) -> bool:
-    return _callable_accepts_kw(getattr(platform, "deliver_text", None), "same_window_verifier")
-
-
-def _apply_fallback_same_window_verifier(
-    orig_win: ForegroundWindow,
-    *,
-    platform: Any,
-    verifier: Callable[[ForegroundWindow], bool],
-) -> ForegroundWindow:
-    get_fg = getattr(platform, "get_foreground_window", None)
-    if not callable(get_fg):
-        return replace(orig_win, origin_drifted=True)
-    try:
-        cur_win = get_fg()
-        ok = bool(verifier(cur_win))
-    except Exception:
-        ok = False
-    return orig_win if ok else replace(orig_win, origin_drifted=True)
-
-
-def _make_pipeline_result(
-    seq_id: int,
-    audio_source: str,
-    st: _Stage1State,
-    *,
-    ok: bool = False,
-    final_text: str = "",
-    skipped_reason: str = "",
-    refined: RefinerResult | None = None,
-    paste: PasteOutcome | None = None,
-    deliver_ms: int = 0,
-    saved_audio: str = "",
-    error: str = "",
-) -> PipelineResult:
-    eff_ctx_fb = ""
-    if st.eff_mode != "general":
-        if (
-            (refined is not None and getattr(refined, "used_prior_session", False))
-            or st.ctx_fallback == "prior_session"
-        ):
-            eff_ctx_fb = "prior_session"
-        elif st.ctx_fallback == "prior_hotwords":
-            eff_ctx_fb = "prior_hotwords"
-    return PipelineResult(
-        ok,
-        seq_id,
-        final_text=final_text,
-        skipped_reason=skipped_reason,
-        audio_source=audio_source,
-        switched_fallback=st.switched_fallback,
-        gate=st.gate,
-        session=st.snap,
-        asr=st.asr_res,
-        refined=refined,
-        paste=paste,
-        error=error,
-        asr_chunks=st.asr_chunks,
-        asr_chunk_secs=st.asr_chunk_secs,
-        asr_missed_chunks=st.asr_missed_chunks,
-        saved_audio=saved_audio,
-        gate_ms=st.gate_ms,
-        sync_ms=st.sync_ms,
-        refine_init_ms=st.prep_ms + (refined.init_ms if refined else 0),
-        deliver_ms=deliver_ms,
-        total_ms=_elapsed_ms(st.t_total0),
-        queue_wait_ms=st.queue_wait_ms,
-        ctx_chars=refined.context_chars if refined else 0,
-        ctx_chunks=refined.context_chunks if refined else 0,
-        mode=st.eff_mode,
-        ctx_fallback=eff_ctx_fb,
-        workspace_cwd=st.workspace_cwd,
-    )
-
-
-def _resolve_stage1_context(
-    st: _Stage1State,
-    *,
-    cfg: Config,
-    env: Mapping[str, str],
-    tracker: SessionTracker,
-    platform: Any,
-    origin_window: ForegroundWindow | None,
-    window_title_override: str | None,
-    audio_source: str,
-    explicit_mode: str,
-    cancel_check: Callable[[], bool] | None,
-    attach_single_hop: bool = False,
-    known_cwds_override: Sequence[str] | None = None,
-) -> Any:
-    """Shared real window routing, session/IDE/desktop context resolution, and hotwords builder."""
-    t_sync0 = time.monotonic()
-    win = origin_window or (platform.get_foreground_window() if platform else ForegroundWindow())
-    st.win = win
-    st.window_category = _classify_window_for_platform(win, platform)
-    should_sync, eff_mode = _resolve_pipeline_window_routing(
-        win,
-        platform=platform,
-        origin_window=origin_window,
-        window_title_override=window_title_override,
-        audio_source=audio_source,
-        explicit_mode=explicit_mode,
-    )
-    st.should_sync = should_sync
-    st.eff_mode = eff_mode
-    st.remote_vetoed = False
-    extra_hw: list[str] = []
-    origin_drifted = bool(win.origin_drifted and window_title_override is None)
-    if should_sync and not origin_drifted:
-        sync_fn = tracker.sync_session
-        try:
-            sync_params = inspect.signature(sync_fn).parameters
-            accepts_var_kw = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sync_params.values()
-            )
-        except (TypeError, ValueError):
-            sync_params = {}
-            accepts_var_kw = False
-        extra_sync_kw: dict[str, Any] = {}
-        if accepts_var_kw or "window_process" in sync_params:
-            extra_sync_kw["window_process"] = win.process
-        if accepts_var_kw or "bundle_id" in sync_params:
-            extra_sync_kw["bundle_id"] = win.bundle_id
-        if accepts_var_kw or "document" in sync_params:
-            extra_sync_kw["document"] = win.document
-        if accepts_var_kw or "tmux_socket" in sync_params:
-            extra_sync_kw["tmux_socket"] = win.tmux_socket
-        if accepts_var_kw or "tmux_pane" in sync_params:
-            extra_sync_kw["tmux_pane"] = win.tmux_pane
-        if cancel_check is not None and (accepts_var_kw or "cancel_token" in sync_params):
-            extra_sync_kw["cancel_token"] = cancel_check
-        if accepts_var_kw or "cold_start_fallback" in sync_params:
-            extra_sync_kw["cold_start_fallback"] = cfg.refiner.cold_start_fallback
-        st.snap = (
-            sync_fn(
-                window_title=win.title,
-                window_tty=win.tty,
-                window_cwd=win.cwd,
-                window_pid=win.pid,
-                **extra_sync_kw,
-            )
-            if window_title_override is None
-            else sync_fn(
-                window_title=window_title_override,
-                **{
-                    k: v
-                    for k, v in extra_sync_kw.items()
-                    if k in ("cancel_token", "cold_start_fallback")
-                },
-            )
-        )
-        st.remote_vetoed = bool(getattr(tracker, "last_sync_remote_vetoed", False))
-        if (
-            st.snap is None
-            and window_title_override is None
-            and win.cwd
-            and not st.remote_vetoed
-            and not getattr(tracker, "last_sync_target_drifted", False)
-        ):
-            eff_wsl = _effective_is_wsl(env=env)
-            safe_cwd = _resolve_safe_local_dir(win.cwd, wsl=eff_wsl)
-            if safe_cwd and not _is_broad_or_unsafe_workspace_dir(
-                safe_cwd, getattr(tracker, "home", None), wsl=eff_wsl
-            ):
-                st.workspace_cwd = safe_cwd
-                extra_hw = tracker.build_workspace_hotwords(st.workspace_cwd)
-                if cfg.refiner.cold_start_fallback != "off" and (
-                    prior_hw_fn := getattr(tracker, "get_workspace_prior_hotwords", None)
-                ) is not None:
-                    if prior_hw := prior_hw_fn(
-                        st.workspace_cwd,
-                        scope="cli",
-                        cold_start_fallback=cfg.refiner.cold_start_fallback,
-                    ):
-                        extra_hw = _dedupe_hotwords_ci([*extra_hw, *prior_hw])
-                        st.ctx_fallback = "prior_hotwords"
-    elif not origin_drifted and eff_mode == "agent" and (win.process or win.bundle_id):
-        is_agy_ide = is_antigravity_ide_window(win)
-        is_rem_ide = is_remote_ide_window(win)
-        if is_rem_ide:
-            st.remote_vetoed = True
-        skip_legacy_agy = bool(
-            is_agy_ide
-            and not (getattr(win, "document", "") or "").strip()
-            and (win.title or "").strip().lower() in _AGY_DESKTOP_REJECT_TITLES
-        )
-        agy_db_veto: list[str] = []
-        if is_agy_ide and not is_rem_ide and not skip_legacy_agy:
-            ide_match = resolve_antigravity_ide_session_by_title(
-                win.title, home=tracker.home, env=env, veto_out=agy_db_veto
-            )
-            if ide_match is not None:
-                if ide_match.cwd:
-                    st.workspace_cwd = ide_match.cwd
-                st.snap = tracker.sync_ide_session(
-                    ide_match, cold_start_fallback=cfg.refiner.cold_start_fallback
-                )
-                if st.snap is not None:
-                    st.agy_bound_sid = st.snap.match.session_id or ide_match.session_id
-        if st.snap is None and not skip_legacy_agy and not agy_db_veto:
-            st.workspace_cwd = resolve_ide_workspace_cwd(
-                win,
-                home=tracker.home,
-                known_cwds=(
-                    known_cwds_override
-                    if known_cwds_override is not None
-                    else tracker.active_session_cwds()
-                ),
-                env=env,
-            )
-            if st.workspace_cwd and is_agy_ide:
-                ide_match = resolve_antigravity_ide_session(
-                    st.workspace_cwd, home=tracker.home, env=env
-                )
-                if ide_match is not None:
-                    st.snap = tracker.sync_ide_session(
-                        ide_match, cold_start_fallback=cfg.refiner.cold_start_fallback
-                    )
-        if st.snap is None and st.workspace_cwd:
-            extra_hw = tracker.build_workspace_hotwords(st.workspace_cwd)
-            if cfg.refiner.cold_start_fallback != "off" and (
-                prior_hw_fn := getattr(tracker, "get_workspace_prior_hotwords", None)
-            ) is not None:
-                ide_scope = "agy_ide" if is_agy_ide else "cli"
-                if prior_hw := prior_hw_fn(
-                    st.workspace_cwd,
-                    scope=ide_scope,
-                    cold_start_fallback=cfg.refiner.cold_start_fallback,
-                ):
-                    extra_hw = _dedupe_hotwords_ci([*extra_hw, *prior_hw])
-                    st.ctx_fallback = "prior_hotwords"
-    elif eff_mode == "general" and (win.process or win.bundle_id):
-        codex_match = None
-        claude_match = None
-        if not origin_drifted and (explicit_mode or "auto").strip().lower() != "general":
-            if is_codex_desktop_window(win):
-                codex_match = resolve_codex_desktop_session_by_title(
-                    win.title, home=tracker.home, env=env
-                )
-            elif is_claude_desktop_window(win):
-                claude_match = resolve_claude_desktop_session_by_title(
-                    win.title,
-                    page_url=getattr(win, "page_url", ""),
-                    home=tracker.home,
-                    env=env,
-                )
-        if codex_match is not None:
-            eff_mode = "agent"
-            st.eff_mode = "agent"
-            st.target_hint = ""
-            st.workspace_cwd = codex_match.cwd
-            st.codex_promoted_sid = codex_match.session_id
-            st.snap = tracker.sync_ide_session(
-                codex_match, cold_start_fallback=cfg.refiner.cold_start_fallback
-            )
-        elif claude_match is not None:
-            eff_mode = "agent"
-            st.eff_mode = "agent"
-            st.target_hint = ""
-            st.workspace_cwd = claude_match.cwd
-            st.claude_promoted_sid = claude_match.session_id
-            rk, rsid = _parse_claude_desktop_page_url(getattr(win, "page_url", ""))
-            st.claude_promoted_route_id = f"{rk}:{rsid.lower()}" if (rk in ("code", "cowork") and rsid) else ""
-            st.snap = tracker.sync_ide_session(
-                claude_match, cold_start_fallback=cfg.refiner.cold_start_fallback
-            )
-        else:
-            st.target_hint = classify_target_app_hint(win)
-
-    if (
-        eff_mode != "general"
-        and st.snap is not None
-        and getattr(st.snap, "prior_hotwords_used", False)
-        and cfg.refiner.cold_start_fallback != "off"
-        and not st.ctx_fallback
-    ):
-        st.ctx_fallback = "prior_hotwords"
-
-    hw_scope = resolve_hotwords_scope(
-        win,
-        target_hint=st.target_hint,
-        mode=eff_mode,
-        has_agent_session=(st.snap is not None),
-    )
-    st.hotwords_scope = hw_scope
-    has_hw_file = bool(cfg.asr.hotwords_file.strip())
-    manual_hw = (
-        load_hotwords_file(cfg.asr.hotwords_file, env=env, scene=hw_scope)
-        if has_hw_file
-        else []
-    )
-    asr_ctx = tracker.build_asr_context(
-        st.snap,
-        extra_hotwords=[*manual_hw, *extra_hw],
-        mode=eff_mode,
-        language=_resolve_effective_ui_language(cfg, env=env, platform=platform),
-    )
-    asr_ctx.hotwords_scope = hw_scope
-    asr_ctx.manual_hotwords_loaded = has_hw_file
-    if st.target_hint:
-        asr_ctx.target_hint = st.target_hint
-    st.asr_ctx_dialog = asr_ctx.dialog_text
-    if attach_single_hop:
-        asr_ctx = attach_single_hop_context(
-            cfg,
-            asr_ctx,
-            tracker=tracker if (st.snap is not None or st.workspace_cwd) else None,
-            session_key=st.snap.session_key if st.snap else "",
-            mode=eff_mode,
-            workspace_cwd=st.workspace_cwd,
-            target_hint=st.target_hint,
-        )
-        if eff_mode != "general" and any(
-            b.startswith("<prior_session_reference") for b in asr_ctx.context_blocks
-        ):
-            st.ctx_fallback = "prior_session"
-    st.sync_ms = _elapsed_ms(t_sync0)
-    return asr_ctx
-
-
-def _execute_stage1(
-    st: _Stage1State,
-    raw_wav: bytes | str | Path,
-    *,
-    cfg: Config,
-    env: Mapping[str, str],
-    tracker: SessionTracker,
-    eff_asr: BaseAsrProvider,
-    eff_refiner: BaseRefiner,
-    platform: Any,
-    origin_window: ForegroundWindow | None,
-    window_title_override: str | None,
-    audio_source: str,
-    explicit_mode: str,
-    seq_id: int,
-    max_chunk_sec: float | None,
-    is_current_seq: Callable[[int], bool] | None,
-    is_cancelled: Callable[[], bool] | None,
-    cancel_token: CancelToken | None,
-    cancel_check: Callable[[], bool] | None,
-    cancel_reason_fn: Callable[[], str],
-    archive_sink: Callable[[threading.Thread], None] | None,
-    known_cwds_override: Sequence[str] | None = None,
-) -> None:
-    if isinstance(raw_wav, (bytes, bytearray)) and len(raw_wav) == 0:
-        if c_rsn := cancel_reason_fn():
-            st.skipped_reason = c_rsn
-        else:
-            st.switched_fallback = (
-                bool(platform and platform.switch_to_fallback_audio())
-                if audio_source in ("pulse", "winmm")
-                else False
-            )
-            st.skipped_reason = "empty_audio"
-        return
-
-    if c_rsn := cancel_reason_fn():
-        st.skipped_reason = c_rsn
-        return
-
-    t_gate0 = time.monotonic()
-    gate = process_wav(raw_wav, cfg.audio)
-    st.gate = gate
-    st.gate_ms = _elapsed_ms(t_gate0)
-    if not gate.passed:
-        if c_rsn := cancel_reason_fn():
-            st.skipped_reason = c_rsn
-        else:
-            st.switched_fallback = bool(
-                gate.all_zero
-                and gate.reason == "silence"
-                and audio_source == "pulse"
-                and platform
-                and platform.switch_to_fallback_audio()
-            )
-            st.skipped_reason = gate.reason
-        return
-
-    if c_rsn := cancel_reason_fn():
-        st.skipped_reason = c_rsn
-        return
-
-    if cfg.audio.save_recordings and audio_source not in ("retry", "selftest_wav") and archive_sink is not None:
-        try:
-            arch_bytes = (
-                bytes(raw_wav)
-                if isinstance(raw_wav, (bytes, bytearray, memoryview))
-                else (Path(raw_wav).read_bytes() or gate.wav_bytes)
-            )
-            if (
-                arch_th := spawn_recording_archive(
-                    arch_bytes,
-                    resolve_saved_recordings_dir(env),
-                    max_count=cfg.audio.save_recordings_max_count,
-                )
-            ) is not None:
-                archive_sink(arch_th)
-        except Exception:
-            pass
-
-    asr_ctx = _resolve_stage1_context(
-        st,
-        cfg=cfg,
-        env=env,
-        tracker=tracker,
-        platform=platform,
-        origin_window=origin_window,
-        window_title_override=window_title_override,
-        audio_source=audio_source,
-        explicit_mode=explicit_mode,
-        cancel_check=cancel_check,
-        attach_single_hop=_is_single_hop_asr_provider(eff_asr),
-        known_cwds_override=known_cwds_override,
-    )
-
-    if (
-        not (cancel_check is not None and cancel_check())
-        and _may_run_stage2_refiner(cfg, eff_refiner, eff_asr)
-        and (prep_fn := getattr(eff_refiner, "prepare_session", None)) is not None
-    ):
-        t_prep0 = time.monotonic()
-        try:
-            prep_fn(st.snap.session_key if st.snap else "")
-        except Exception:
-            pass
-        st.prep_ms = _elapsed_ms(t_prep0)
-
-    try:
-        asr_res, chunk_count, chunk_secs = _transcribe_wav_chunks(
-            gate.wav_bytes,
-            eff_asr=eff_asr,
-            asr_ctx=asr_ctx,
-            floor_dbfs=cfg.audio.floor_dbfs,
-            audio_cfg=cfg.audio,
-            gain_db=gate.gain_db,
-            max_chunk_sec=max_chunk_sec,
-            seq_id=seq_id,
-            is_current_seq=is_current_seq,
-            is_cancelled=is_cancelled,
-            cancel_token=cancel_token,
-        )
-    except Exception as asr_exc:
-        if c_rsn := cancel_reason_fn():
-            if c_rsn in _HARD_CANCEL_REASONS or (
-                isinstance(asr_exc, AsrError) and "cancelled" in str(asr_exc).lower()
-            ):
-                st.skipped_reason = c_rsn
-                return
-        raise
-    st.asr_res = asr_res
-    st.asr_chunks = chunk_count
-    st.asr_chunk_secs = chunk_secs
-    st.asr_missed_chunks = max(0, int(getattr(asr_res, "missed_chunks", 0) or 0))
-    if not asr_res.text.strip():
-        st.skipped_reason = cancel_reason_fn() or "empty_asr"
-    elif c_rsn := cancel_reason_fn():
-        st.skipped_reason = c_rsn
-
-
-_HARD_CANCEL_REASONS: tuple[str, ...] = (
-    "cancelled",
-    "shutdown",
-    "client_timeout",
-    "client_disconnected",
-)
-
-
-def run_pipeline_once(
-    raw_wav: bytes | str | Path, *, cfg: Config, creds: ProviderCredentials | None = None,
-    tracker: SessionTracker | None = None, asr_provider: BaseAsrProvider | None = None,
-    refiner: BaseRefiner | None = None, platform: Any = None, origin_window: ForegroundWindow | None = None,
-    window_title_override: str | None = None,
-    audio_source: str = "file", seq_id: int = 1, dry_run: bool = False,
-    is_current_seq: Callable[[int], bool] | None = None,
-    is_cancelled: Callable[[], bool] | None = None,
-    cancel_token: CancelToken | None = None,
-    deliver_fn: Callable[[str, ForegroundWindow], PasteOutcome] | None = None,
-    deliver_text_fn: Callable[..., PasteOutcome] | None = None,
-    on_stage: Callable[[str], None] | None = None,
-    runtime_dir: Path | None = None,
-    max_chunk_sec: float | None = None,
-    env: Mapping[str, str] | None = None,
-    archive_sink: Callable[[threading.Thread], None] | None = None,
-    mode: str = "auto",
-    queue_wait_ms: int = 0,
-    known_cwds_override: Sequence[str] | None = None,
-    isolate_refiner_session: bool = False,
-) -> PipelineResult:
-    eff_env = os.environ if env is None else env
-    eff_creds = creds or resolve_credentials(cfg, eff_env)
-    owns_tracker = tracker is None
-    eff_tracker = tracker or SessionTracker(
-        env=eff_env,
-        runtime_dir=runtime_dir,
-        remote_cfg=cfg.remote,
-        context_max_chars=cfg.refiner.context_max_chars,
-        cold_start_fallback=cfg.refiner.cold_start_fallback,
-    )
-    eff_asr = asr_provider or create_asr_provider(cfg, eff_creds, env=eff_env)
-    owns_refiner = refiner is None
-    eff_refiner = refiner or create_refiner(cfg, eff_creds, env=env, runtime_dir=runtime_dir)
-    can_save_failed = runtime_dir is not None and audio_source not in ("file", "selftest_wav", "retry")
-    local_archive_threads: list[threading.Thread] = []
-    stashed_once = False
-    stashed_path = ""
-    cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled, cancel_token)
-    st = _Stage1State(t_total0=time.monotonic(), queue_wait_ms=queue_wait_ms, win=origin_window or ForegroundWindow())
-
-    def _cancel_reason() -> str:
-        if cancel_token is not None and cancel_token.is_cancelled():
-            return cancel_token.reason or "cancelled"
-        if cancel_check is not None and cancel_check():
-            return "superseded"
-        return ""
-
-    def _stash_failed() -> str:
-        nonlocal stashed_once, stashed_path
-        if stashed_once:
-            return stashed_path
-        stashed_once = True
-        if audio_source == "retry":
-            stashed_path = _existing_recoverable_retry_audio(raw_wav, runtime_dir)
-            return stashed_path
-        if not can_save_failed or runtime_dir is None or st.gate is None or not st.gate.passed or not st.gate.wav_bytes:
-            return ""
-        saved = save_failed_audio(
-            st.gate.wav_bytes,
-            runtime_dir,
-            duration_sec=st.gate.duration_sec,
-            label=_derive_failed_label(st.snap, st.win, st.workspace_cwd),
-        )
-        stashed_path = str(saved) if saved is not None else ""
-        return stashed_path
-
-    def _stash_for_cancel(reason: str) -> str:
-        if reason == "shutdown" or st.gate is None or not st.gate.passed:
-            return ""
-        if reason == "cancelled" or st.gate.duration_sec >= 15.0:
-            return _stash_failed()
-        return ""
-
-    def _cancel_res(
-        reason: str,
-        *,
-        draft: str = "",
-        refined: RefinerResult | None = None,
-        deliver_ms: int = 0,
-    ) -> PipelineResult:
-        out_txt = "" if reason in _HARD_CANCEL_REASONS else draft
-        return _make_pipeline_result(
-            seq_id,
-            audio_source,
-            st,
-            final_text=out_txt,
-            skipped_reason=reason,
-            refined=refined,
-            deliver_ms=deliver_ms,
-            saved_audio=_stash_for_cancel(reason),
-        )
-
-    eff_sink = archive_sink if archive_sink is not None else local_archive_threads.append
-    in_delivery = False
-    try:
-        try:
-            _execute_stage1(
-                st,
-                raw_wav,
-                cfg=cfg,
-                env=eff_env,
-                tracker=eff_tracker,
-                eff_asr=eff_asr,
-                eff_refiner=eff_refiner,
-                platform=platform,
-                origin_window=origin_window,
-                window_title_override=window_title_override,
-                audio_source=audio_source,
-                explicit_mode=mode,
-                seq_id=seq_id,
-                max_chunk_sec=max_chunk_sec,
-                is_current_seq=is_current_seq,
-                is_cancelled=is_cancelled,
-                cancel_token=cancel_token,
-                cancel_check=cancel_check,
-                cancel_reason_fn=_cancel_reason,
-                archive_sink=eff_sink,
-                known_cwds_override=known_cwds_override,
-            )
-            if st.skipped_reason:
-                sr = st.skipped_reason
-                if sr in (*_HARD_CANCEL_REASONS, "superseded"):
-                    return _cancel_res(sr, draft=(st.asr_res.text.strip() if st.asr_res else ""))
-                return _make_pipeline_result(
-                    seq_id,
-                    audio_source,
-                    st,
-                    skipped_reason=sr,
-                    saved_audio=(_stash_failed() if sr == "empty_asr" else ""),
-                )
-
-            assert st.asr_res is not None
-            if _will_run_stage2_refiner(cfg, eff_refiner, st.asr_res) and on_stage is not None:
-                on_stage("refining")
-            real_skey = st.snap.session_key if st.snap else ""
-            ref_session_key = "" if isolate_refiner_session else real_skey
-            ref_tracker: Any = eff_tracker
-            ref_workspace_cwd = st.workspace_cwd
-            ref_fallback_ctx = st.asr_ctx_dialog
-            if isolate_refiner_session and real_skey:
-                # Deliberate exception: pass empty session_key so stateful refiners (e.g. AgyRefiner)
-                # run statelessly without touching/evicting live session slots while keeping real st.snap context.
-                ref_tracker = _IsolatedSessionTrackerView(eff_tracker, real_skey)
-                if not ref_workspace_cwd and st.snap is not None and st.snap.match.cwd:
-                    ref_workspace_cwd = st.snap.match.cwd
-            ref_res = _call_refiner_refine(
-                eff_refiner,
-                st.asr_res,
-                session_key=ref_session_key,
-                tracker=ref_tracker,
-                fallback_context=ref_fallback_ctx,
-                is_cancelled=cancel_check,
-                cancel_token=cancel_token,
-                mode=st.eff_mode,
-                workspace_cwd=ref_workspace_cwd,
-                target_hint=st.target_hint,
-            )
-            cand_text = (ref_res.text.strip() if ref_res else "") or st.asr_res.text.strip()
-            if (c_rsn := _cancel_reason()) or (
-                ref_res and ref_res.used_fallback in (*_HARD_CANCEL_REASONS, "superseded")
-            ):
-                return _cancel_res(
-                    c_rsn or (ref_res.used_fallback if ref_res else "cancelled"),
-                    draft=cand_text,
-                    refined=ref_res,
-                )
-
-            deliver_ms = 0
-            if dry_run or (platform is None and deliver_fn is None):
-                if cancel_token is not None and not cancel_token.try_commit():
-                    return _cancel_res(cancel_token.reason or "cancelled", draft=cand_text, refined=ref_res)
-                paste_out = None
-            elif deliver_fn is not None:
-                if cancel_token is not None and not cancel_token.try_commit():
-                    return _cancel_res(cancel_token.reason or "cancelled", draft=cand_text, refined=ref_res)
-                verifier = _make_desktop_same_window_verifier(
-                    st, tracker=eff_tracker, env=eff_env
-                )
-                deliver_win = (
-                    _apply_fallback_same_window_verifier(
-                        st.win, platform=platform, verifier=verifier
-                    )
-                    if (verifier is not None and platform is not None)
-                    else st.win
-                )
-                t_deliv0 = time.monotonic()
-                in_delivery = True
-                paste_out = deliver_fn(cand_text, deliver_win)
-                in_delivery = False
-                deliver_ms = _elapsed_ms(t_deliv0)
-            else:
-                verifier = _make_desktop_same_window_verifier(
-                    st, tracker=eff_tracker, env=eff_env
-                )
-                deliver_win = st.win
-                deliv_extra_kw: dict[str, Any] = {}
-                target_deliv_fn = deliver_text_fn or platform.deliver_text
-                if verifier is not None:
-                    if (
-                        deliver_text_fn is not None
-                        and _callable_accepts_kw(deliver_text_fn, "same_window_verifier")
-                    ) or (
-                        deliver_text_fn is None
-                        and _platform_accepts_same_window_verifier(platform)
-                    ):
-                        deliv_extra_kw["same_window_verifier"] = verifier
-                    else:
-                        deliver_win = _apply_fallback_same_window_verifier(
-                            st.win, platform=platform, verifier=verifier
-                        )
-                t_deliv0 = time.monotonic()
-                in_delivery = True
-                paste_out = target_deliv_fn(
-                    cand_text,
-                    seq_id=seq_id,
-                    target_hwnd=deliver_win.hwnd,
-                    origin_window=deliver_win,
-                    is_cancelled=cancel_check,
-                    before_commit=(cancel_token.try_commit if cancel_token is not None else None),
-                    **deliv_extra_kw,
-                )
-                in_delivery = False
-                deliver_ms = _elapsed_ms(t_deliv0)
-
-            if paste_out is not None and paste_out.reason == "cancelled":
-                return _cancel_res(_cancel_reason() or "cancelled", draft=cand_text, refined=ref_res, deliver_ms=deliver_ms)
-            if cancel_token is not None:
-                cancel_token.try_commit()
-            delivery_failed = paste_out is not None and not paste_out.pasted and not paste_out.clipboard
-            saved_p = _stash_failed() if (delivery_failed or st.asr_missed_chunks > 0) else ""
-            eff_skip = (
-                (
-                    paste_out.reason
-                    if (paste_out is not None and paste_out.reason and paste_out.reason != "ok")
-                    else "paste_failed"
-                )
-                if delivery_failed
-                else ""
-            )
-            return _make_pipeline_result(
-                seq_id,
-                audio_source,
-                st,
-                ok=(not delivery_failed),
-                final_text=cand_text,
-                skipped_reason=eff_skip,
-                refined=ref_res,
-                paste=paste_out,
-                deliver_ms=deliver_ms,
-                saved_audio=saved_p,
-            )
-        except Exception as exc:
-            if (c_rsn := _cancel_reason()) in _HARD_CANCEL_REASONS:
-                return _cancel_res(c_rsn)
-            saved_p = _stash_failed()
-            ds_err = "undelivered_recoverable" if saved_p else "undelivered_unrecoverable"
-            try:
-                setattr(exc, "_delivery_status", ds_err)
-                if saved_p:
-                    setattr(exc, "_saved_audio_path", saved_p)
-                if in_delivery:
-                    setattr(exc, "_skipped_reason", "delivery_error")
-                    setattr(exc, "_paste_reason", "delivery_error")
-            except Exception:
-                pass
-            raise
-    finally:
-        if owns_refiner:
-            eff_refiner.close()
-        if owns_tracker and (tr_cl := getattr(eff_tracker, "close", None)) is not None:
-            tr_cl()
-        if local_archive_threads:
-            wait_recording_archives(local_archive_threads, timeout_sec=2.0)
-
-
-CONTROL_RESPONSE_MAX_BYTES: int = 1_048_576
-CONTROL_REQUEST_MAX_BYTES: int = 256 * 1024
-CONTROL_REQUEST_READ_TIMEOUT_SEC: float = 2.0
-CONTROL_MAX_TIMEOUT_SEC: float = 86_400.0
-_BRIDGE_ASSET_NAMES: tuple[str, ...] = ("mac_shim.swift", "win_shim.ps1")
-
-
-def _parse_optional_timeout_sec(raw: Any) -> float | None:
-    if raw is None:
-        return None
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        raise ValueError("timeout_sec must be a finite non-negative number")
-    try:
-        val = float(raw)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("timeout_sec out of range") from exc
-    if not math.isfinite(val) or val < 0.0 or val > CONTROL_MAX_TIMEOUT_SEC:
-        raise ValueError(f"timeout_sec must be between 0 and {CONTROL_MAX_TIMEOUT_SEC:g}")
-    return val
-
-
-def _is_control_peer_disconnected(conn: socket.socket | None) -> bool:
-    if conn is None:
-        return False
-    kqueue_factory = getattr(select, "kqueue", None)
-    kevent_factory = getattr(select, "kevent", None)
-    use_kqueue = callable(kqueue_factory) and callable(kevent_factory)
-    poll_factory = None if use_kqueue else getattr(select, "poll", None)
-    if not use_kqueue and not callable(poll_factory):
-        return False
-    try:
-        fd = conn.fileno()
-        if fd < 0:
-            return True
-        if use_kqueue:
-            # BSD/macOS poll() sets POLLHUP on peer SHUT_WR; KQ_FILTER_WRITE
-            # only raises KQ_EV_EOF once the peer closes its read side too.
-            kq = kqueue_factory()
-            try:
-                ev = kevent_factory(
-                    fd,
-                    filter=select.KQ_FILTER_WRITE,
-                    flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                )
-                eof_mask = select.KQ_EV_EOF | select.KQ_EV_ERROR
-                return any(bool(r.flags & eof_mask) for r in kq.control([ev], 1, 0))
-            finally:
-                kq.close()
-        hangup_mask = (
-            getattr(select, "POLLHUP", 0)
-            | getattr(select, "POLLERR", 0)
-            | getattr(select, "POLLNVAL", 0)
-        )
-        poller = poll_factory()
-        poller.register(fd, hangup_mask)
-        return any(bool(revents & hangup_mask) for _, revents in poller.poll(0))
-    except (InterruptedError, BlockingIOError, TimeoutError, socket.timeout):
-        return False
-    except (OSError, ValueError):
-        return True
-
-
-def _recv_control_request_line(
-    conn: socket.socket,
-    *,
-    max_bytes: int = CONTROL_REQUEST_MAX_BYTES,
-    timeout_sec: float = CONTROL_REQUEST_READ_TIMEOUT_SEC,
-) -> str:
-    buf = bytearray()
-    deadline = time.monotonic() + max(0.05, float(timeout_sec))
-    while True:
-        nl = buf.find(b"\n")
-        if nl >= 0:
-            if nl + 1 > max_bytes:
-                raise ValueError(f"control request exceeds {max_bytes} bytes")
-            return bytes(buf[:nl]).decode("utf-8", errors="replace").strip()
-        if len(buf) > max_bytes:
-            raise ValueError(f"control request exceeds {max_bytes} bytes")
-        rem = deadline - time.monotonic()
-        if rem <= 0.0:
-            raise socket.timeout("timed out reading control request")
-        conn.settimeout(rem)
-        chunk = conn.recv(min(16384, max_bytes - len(buf) + 1))
-        if not chunk:
-            break
-        buf.extend(chunk)
-    if len(buf) > max_bytes:
-        raise ValueError(f"control request exceeds {max_bytes} bytes")
-    return bytes(buf).decode("utf-8", errors="replace").strip()
-
-
-class _MalformedControlResponseError(ValueError):
-    """Raised when control.sock returns EOF, malformed JSON, or an incomplete status payload."""
-
-
-def compute_package_build_id(pkg_dir: Path | None = None) -> str:
-    """Compute a lightweight deterministic 12-char SHA-256 fingerprint of package ``*.py`` and bridge assets."""
-    root = pkg_dir if pkg_dir is not None else Path(__file__).resolve().parent
-    h = hashlib.sha256()
-    try:
-        candidates: list[Path] = sorted(root.glob("*.py"))
-        for asset in _BRIDGE_ASSET_NAMES:
-            ap = root / asset
-            if ap.is_file():
-                candidates.append(ap)
-        candidates.sort(key=lambda p: p.name)
-        for path in candidates:
-            if not path.is_file():
-                continue
-            h.update(path.name.encode("utf-8"))
-            h.update(b"\0")
-            h.update(path.read_bytes())
-            h.update(b"\0")
-    except OSError:
-        return ""
-    return h.hexdigest()[:12]
-
-
-def describe_daemon_drift(
-    daemon_status: Mapping[str, Any],
-    *,
-    current_version: str = __version__,
-    current_build_id: str | None = None,
-) -> dict[str, Any]:
-    """Compare a running daemon's reported version/build_id against the current CLI process."""
-    run_ver = str(daemon_status.get("version") or "").strip()
-    run_bid = str(daemon_status.get("build_id") or "").strip()
-    cur_bid = current_build_id if current_build_id is not None else compute_package_build_id()
-    ver_diff = bool(run_ver and run_ver != current_version)
-    bid_diff = bool(run_bid and cur_bid and run_bid != cur_bid)
-    drifted = ver_diff or bid_diff
-    missing_bid = bool(run_ver and not ver_diff and not run_bid and cur_bid)
-    if ver_diff and bid_diff:
-        reason = f"version/code mismatch (running={run_ver}/{run_bid}, current={current_version}/{cur_bid})"
-    elif ver_diff:
-        reason = f"version mismatch (running={run_ver}, current={current_version})"
-    elif bid_diff:
-        reason = f"code changed (running={run_bid}, current={cur_bid})"
-    else:
-        reason = ""
-    note = (
-        f"running daemon (v{run_ver}) omits build_id; run 'agent-voice-input restart' if you updated code"
-        if missing_bid
-        else ""
-    )
-    return {
-        "drifted": drifted,
-        "missing_build_id": missing_bid,
-        "running_version": run_ver,
-        "running_build_id": run_bid,
-        "current_version": current_version,
-        "current_build_id": cur_bid,
-        "reason": reason,
-        "note": note,
-    }
-
-
-def _read_positive_pid(path: Path) -> int | None:
-    try:
-        raw = path.read_text(encoding="utf-8").strip() if path.is_file() else ""
-        val = int(raw)
-        return val if val > 0 else None
-    except (OSError, ValueError):
-        return None
-
-
-def _inspect_daemon_lock_holder(runtime_dir: Path) -> tuple[bool, int | None]:
-    """Return ``(lock_held, holder_pid)`` without creating or modifying ``daemon.lock``."""
-    lock_path = runtime_dir / "daemon.lock"
-    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(str(lock_path), flags)
-    except OSError:
-        return False, None
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-            return False, None
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError, OSError) as exc:
-            if isinstance(exc, OSError) and exc.errno not in (
-                errno.EACCES,
-                errno.EAGAIN,
-                errno.EWOULDBLOCK,
-            ):
-                return False, None
-            os.lseek(fd, 0, os.SEEK_SET)
-            raw_pid = os.read(fd, 64).decode("utf-8", errors="ignore").strip()
-            holder_pid = (
-                int(raw_pid)
-                if (raw_pid.isdigit() and int(raw_pid) > 0)
-                else _read_positive_pid(runtime_dir / "daemon.pid")
-            )
-            return True, holder_pid
-        else:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            return False, None
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-
-def send_control_command(runtime_dir: Path, payload: Mapping[str, Any], timeout_sec: float = 8.0) -> dict[str, Any]:
-    sock_path = runtime_dir / "control.sock"
-    if not sock_path.exists():
-        raise RuntimeError(f"daemon socket not found at {sock_path}")
-    t0 = time.monotonic()
-    req_payload = dict(payload)
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout_sec); s.connect(str(sock_path))
-        if (
-            str(req_payload.get("cmd") or "") == "selftest_wav"
-            and "timeout_sec" not in req_payload
-            and isinstance(timeout_sec, (int, float))
-            and not isinstance(timeout_sec, bool)
-            and math.isfinite(timeout_sec)
-            and timeout_sec > 0
-        ):
-            rem_budget = max(0.01, float(timeout_sec) - (time.monotonic() - t0))
-            req_payload["timeout_sec"] = round(rem_budget, 4)
-        s.sendall((json.dumps(req_payload, ensure_ascii=False) + "\n").encode("utf-8"))
-        buf = b""
-        while b"\n" not in buf and len(buf) < CONTROL_RESPONSE_MAX_BYTES and (chunk := s.recv(16384)):
-            buf += chunk
-    if not buf.strip():
-        raise _MalformedControlResponseError("empty control response (EOF)")
-    return json.loads(buf.decode("utf-8", errors="replace").strip())
-
-
-def probe_daemon_status(
-    runtime_dir: Path,
-    *,
-    timeout_sec: float = 8.0,
-    history: int | None = None,
-) -> dict[str, Any]:
-    """Query daemon status and distinguish genuinely ``stopped`` from live-but-``unresponsive``."""
-    req: dict[str, Any] = {"cmd": "status"}
-    if history is not None:
-        req["history"] = history
-    try:
-        resp = send_control_command(runtime_dir, req, timeout_sec=timeout_sec)
-        if (
-            isinstance(resp, Mapping)
-            and resp.get("ok") is True
-            and isinstance(resp.get("state"), str)
-            and resp["state"].strip()
-        ):
-            return dict(resp)
-        err_detail = str(resp.get("error") or "") if isinstance(resp, Mapping) else ""
-        raise _MalformedControlResponseError(
-            err_detail or "malformed or error status response from daemon"
-        )
-    except Exception as exc:
-        lock_held, holder_pid = _inspect_daemon_lock_holder(runtime_dir)
-        sock_exists = (runtime_dir / "control.sock").exists()
-        is_timeout = isinstance(exc, (TimeoutError, socket.timeout))
-        is_backlog_busy = isinstance(exc, OSError) and exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
-        is_malformed = (
-            isinstance(exc, (_MalformedControlResponseError, ValueError)) and sock_exists
-        )
-        if lock_held or is_timeout or is_backlog_busy or is_malformed:
-            if holder_pid is None:
-                cand_pid = _read_positive_pid(runtime_dir / "daemon.pid")
-                if cand_pid is not None:
-                    try:
-                        os.kill(cand_pid, 0)
-                        holder_pid = cand_pid
-                    except PermissionError:
-                        holder_pid = cand_pid
-                    except OSError:
-                        holder_pid = None
-            if is_timeout:
-                err_msg = f"control socket timed out after {timeout_sec:.1f}s (daemon busy or hung)"
-            elif lock_held:
-                err_msg = f"daemon.lock is held but control socket is unreachable ({exc})"
-            else:
-                err_msg = f"control socket error ({exc})"
-            out: dict[str, Any] = {
-                "ok": False,
-                "state": "unresponsive",
-                "lock_held": lock_held,
-                "error": err_msg,
-            }
-            if holder_pid is not None:
-                out["pid"] = holder_pid
-            return out
-        is_offline_err = (
-            isinstance(exc, (RuntimeError, FileNotFoundError, ConnectionRefusedError))
-            or (
-                isinstance(exc, OSError)
-                and exc.errno in (errno.ENOENT, errno.ECONNREFUSED, errno.ENOTSOCK, errno.EPROTOTYPE)
-            )
-            or (isinstance(exc, (_MalformedControlResponseError, ValueError)) and not sock_exists)
-        )
-        if not is_offline_err:
-            return {
-                "ok": False,
-                "state": "error",
-                "lock_held": False,
-                "error": f"control socket error ({exc})",
-            }
-        return {"ok": False, "state": "stopped"}
 
 
 @dataclass(slots=True)
@@ -2522,97 +320,10 @@ class VoiceInputDaemon:
         except Exception:
             pass
 
-    def _read_pid_file_fallback(self) -> int | None:
-        try:
-            raw = self.pid_path.read_text(encoding="utf-8").strip()
-            val = int(raw)
-            return val if val > 0 else None
-        except (OSError, ValueError):
-            return None
-
     def acquire_lock(self) -> None:
         if self._lock_fd is not None:
             return
-        ensure_secure_dir(self.runtime_dir)
-        flags = (
-            os.O_RDWR
-            | os.O_CREAT
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-        )
-        fd = os.open(str(self.lock_path), flags, 0o600)
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-                raise RuntimeError(f"unsafe daemon lock file: {self.lock_path}")
-            os.fchmod(fd, 0o600)
-            os.set_inheritable(fd, False)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except (BlockingIOError, OSError) as exc:
-                if isinstance(exc, OSError) and exc.errno not in (
-                    errno.EACCES,
-                    errno.EAGAIN,
-                    errno.EWOULDBLOCK,
-                ):
-                    raise
-                os.lseek(fd, 0, os.SEEK_SET)
-                raw_pid = os.read(fd, 64).decode("utf-8", errors="ignore").strip()
-                holder_pid = (
-                    int(raw_pid)
-                    if (raw_pid.isdigit() and int(raw_pid) > 0)
-                    else self._read_pid_file_fallback()
-                )
-                raise DaemonAlreadyRunningError(holder_pid) from None
-            os.ftruncate(fd, 0)
-            if self.sock_path.exists():
-                legacy_pid: int | None = None
-                legacy_alive = False
-                try:
-                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe_sock:
-                        probe_sock.settimeout(0.6)
-                        probe_sock.connect(str(self.sock_path))
-                        # A successful AF_UNIX connect proves a live listener holds control.sock!
-                        legacy_alive = True
-                        try:
-                            probe_sock.sendall(b'{"cmd":"status"}\n')
-                            buf = b""
-                            while b"\n" not in buf and len(buf) < 65536 and (chunk := probe_sock.recv(16384)):
-                                buf += chunk
-                            st_resp = json.loads(buf.decode("utf-8", errors="replace").strip() or "{}")
-                            if isinstance(st_resp, Mapping):
-                                raw_lpid = st_resp.get("pid")
-                                if isinstance(raw_lpid, int) and not isinstance(raw_lpid, bool) and raw_lpid > 0:
-                                    legacy_pid = raw_lpid
-                        except Exception:
-                            pass
-                except (TimeoutError, socket.timeout, PermissionError):
-                    legacy_alive = True
-                except OSError as sock_exc:
-                    # Only treat explicit dead/non-socket errors as offline; EAGAIN/EWOULDBLOCK means full backlog on live listener!
-                    if sock_exc.errno in (
-                        errno.ENOENT,
-                        errno.ECONNREFUSED,
-                        errno.ENOTSOCK,
-                        errno.EPROTOTYPE,
-                    ):
-                        legacy_alive = False
-                    else:
-                        legacy_alive = True
-                if legacy_alive:
-                    if legacy_pid is None:
-                        legacy_pid = self._read_pid_file_fallback()
-                    raise DaemonAlreadyRunningError(legacy_pid)
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
-        except BaseException:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(fd)
-            raise
-        self._lock_fd = fd
+        self._lock_fd = acquire_daemon_lock(self.runtime_dir, self.lock_path, self.pid_path)
         self._owns_runtime_files = True
 
     def _record_result_locked(self, summary: dict[str, Any]) -> dict[str, Any]:
@@ -2689,6 +400,15 @@ class VoiceInputDaemon:
     def _is_recording_or_stopping(self) -> bool:
         with self._lock:
             return self._recording_active or self._stopping_capture
+
+    def _clear_recording_state_locked(self) -> None:
+        self._recording_active = False
+        self._recording_seq_id = -1
+        self._recording_trigger_action = ""
+        self._recording_shim_id = 0
+        self._cur_no_paste, self._cur_silent_hud = False, False
+        self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
+        self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
 
     def _enqueue_utterance_locked(self, task: _QueuedUtterance) -> None:
         self._utterance_queue.append(task)
@@ -2948,17 +668,11 @@ class VoiceInputDaemon:
                 if seq_id is not None and self._recording_seq_id != seq_id:
                     return
                 cur_seq = self._recording_seq_id
-                self._recording_active = False
-                self._recording_seq_id = -1
-                self._recording_trigger_action = ""
-                self._recording_shim_id = 0
-                self._stopping_capture = True
                 eff_no_paste = self._cur_no_paste
                 eff_silent = self._cur_silent_hud
                 rec_cnt, rec_gap = self._rec_recovery_count, self._rec_recovery_gap_ms
-                self._cur_no_paste, self._cur_silent_hud = False, False
-                self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
-                self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
+                self._clear_recording_state_locked()
+                self._stopping_capture = True
                 win_snap = self._origin_win
                 self._recompute_state_locked()
             self._cancel_max_duration_timer()
@@ -2984,63 +698,41 @@ class VoiceInputDaemon:
                     gate = None
             lost_ts = self.clock_fn()
             if gate is None or not gate.passed:
-                if stop_perm_exc is not None:
-                    perm_hud = str(getattr(stop_perm_exc, "hud_state", "mic_permission") or "mic_permission")
-                    perm_err = self._redact(stop_perm_exc)
-                    with self._lock:
-                        self._stopping_capture = False
-                        self._recompute_state_locked()
-                        still_cur = not self._recording_active and self._rec_seq_id == cur_seq
-                        if still_cur:
-                            self._recorder_lost_seq = cur_seq
-                            self._recorder_lost_ts = lost_ts
-                            self._recorder_lost_stop_absorbed = False
-                        perm_snap = self._record_result_locked(
-                            {
-                                "seq_id": cur_seq,
-                                "ok": False,
-                                "skipped_reason": "mic_permission",
-                                "audio_source": src_used,
-                                "error": perm_err,
-                            }
-                        )
-                    self._append_telemetry(perm_snap)
-                    if not eff_silent:
-                        self._emit_capture_error_hud(
-                            cur_seq=cur_seq,
-                            toast_state=perm_hud,
-                            duration_ms=0,
-                            restore_main_if_needed=True,
-                        )
-                        self.platform.beep("error")
-                    return
-                audio_err = self._redact_str(snap_audio_err or "mic_disconnected")
-                with self._lock:
-                    self._stopping_capture = False
-                    self._recompute_state_locked()
-                    still_cur = not self._recording_active and self._rec_seq_id == cur_seq
-                    if still_cur:
-                        self._recorder_lost_seq = cur_seq
-                        self._recorder_lost_ts = lost_ts
-                        self._recorder_lost_stop_absorbed = False
-                    lr_lost: dict[str, Any] = {
-                        "seq_id": cur_seq,
-                        "ok": False,
-                        "skipped_reason": "mic_disconnected",
-                        "audio_source": src_used,
-                        "error": audio_err,
-                        "capture_interrupted": True,
-                    }
+                is_perm = stop_perm_exc is not None
+                toast_st = (
+                    str(getattr(stop_perm_exc, "hud_state", "mic_permission") or "mic_permission")
+                    if is_perm
+                    else "mic_disconnected"
+                )
+                toast_dur = 0 if is_perm else 2200
+                lr_lost: dict[str, Any] = {
+                    "seq_id": cur_seq,
+                    "ok": False,
+                    "skipped_reason": "mic_permission" if is_perm else "mic_disconnected",
+                    "audio_source": src_used,
+                    "error": self._redact(stop_perm_exc)
+                    if stop_perm_exc is not None
+                    else self._redact_str(snap_audio_err or "mic_disconnected"),
+                }
+                if not is_perm:
+                    lr_lost["capture_interrupted"] = True
                     if rec_cnt > 0:
                         lr_lost["recovery_count"] = rec_cnt
                         lr_lost["recovery_gap_ms"] = rec_gap
+                with self._lock:
+                    self._stopping_capture = False
+                    self._recompute_state_locked()
+                    if not self._recording_active and self._rec_seq_id == cur_seq:
+                        self._recorder_lost_seq = cur_seq
+                        self._recorder_lost_ts = lost_ts
+                        self._recorder_lost_stop_absorbed = False
                     lost_snap = self._record_result_locked(lr_lost)
                 self._append_telemetry(lost_snap)
                 if not eff_silent:
                     self._emit_capture_error_hud(
                         cur_seq=cur_seq,
-                        toast_state="mic_disconnected",
-                        duration_ms=2200,
+                        toast_state=toast_st,
+                        duration_ms=toast_dur,
                         restore_main_if_needed=True,
                     )
                     self.platform.beep("error")
@@ -3117,6 +809,45 @@ class VoiceInputDaemon:
             return "remote_client"
         return None
 
+    def _handle_capture_failure(
+        self,
+        cur_seq: int,
+        exc: Exception,
+        *,
+        eff_silent: bool,
+        restore_main_if_needed: bool,
+        clear_recording: bool = False,
+        clear_stopping: bool = False,
+    ) -> dict[str, Any]:
+        err, err_reason, err_hud_state, err_hud_dur = classify_capture_error(exc, self._redact)
+        with self._lock:
+            still_cur = True
+            if clear_recording:
+                still_cur = self._recording_active and self._recording_seq_id == cur_seq
+                if still_cur:
+                    self._clear_recording_state_locked()
+            if clear_stopping:
+                self._stopping_capture = False
+            err_state = self._recompute_state_locked()
+            lr: dict[str, Any] = {"seq_id": cur_seq, "ok": False, "error": err}
+            if err_reason:
+                lr["skipped_reason"] = err_reason
+            lr_snap = self._record_result_locked(lr)
+        self._append_telemetry(lr_snap)
+        if still_cur and not eff_silent:
+            self._emit_capture_error_hud(
+                cur_seq=cur_seq,
+                toast_state=err_hud_state,
+                duration_ms=err_hud_dur,
+                restore_main_if_needed=restore_main_if_needed,
+            )
+        if not eff_silent:
+            self.platform.beep("error")
+        out_err: dict[str, Any] = {"ok": False, "error": err, "state": err_state, "seq_id": cur_seq}
+        if err_reason:
+            out_err["skipped_reason"] = err_reason
+        return out_err
+
     def _start_gate_reason(self, win: ForegroundWindow) -> str | None:
         if (yielded := self._should_yield_hotkey(win)) is not None:
             return yielded
@@ -3185,13 +916,7 @@ class VoiceInputDaemon:
                         return {"ok": True, "state": self.state, "seq_id": self.seq_id}
                     eff_silent = bool(silent_hud or self._cur_silent_hud)
                     cancelled_rec_seq = self._recording_seq_id
-                    self._recording_active = False
-                    self._recording_seq_id = -1
-                    self._recording_trigger_action = ""
-                    self._recording_shim_id = 0
-                    self._cur_no_paste, self._cur_silent_hud = False, False
-                    self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
-                    self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
+                    self._clear_recording_state_locked()
                     self.seq_id += 1
                     cur_seq = self.seq_id
                     self._rec_seq_id = cur_seq
@@ -3229,17 +954,11 @@ class VoiceInputDaemon:
                         mode = "start"
                 elif action in ("toggle", "ptt_stop") and self._recording_active:
                     cur_seq = self._recording_seq_id
-                    self._recording_active = False
-                    self._recording_seq_id = -1
-                    self._recording_trigger_action = ""
-                    self._recording_shim_id = 0
-                    self._stopping_capture = True
                     eff_no_paste = bool(no_paste or self._cur_no_paste)
                     eff_silent = bool(silent_hud or self._cur_silent_hud)
                     rec_cnt, rec_gap = self._rec_recovery_count, self._rec_recovery_gap_ms
-                    self._cur_no_paste, self._cur_silent_hud = False, False
-                    self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
-                    self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
+                    self._clear_recording_state_locked()
+                    self._stopping_capture = True
                     if expected_seq_id is None:
                         self._last_trigger_ts = now
                     win_snap = self._origin_win
@@ -3265,54 +984,17 @@ class VoiceInputDaemon:
             if mode == "start":
                 self._cancel_max_duration_timer()
                 rec_started = False
-                trigger_win = window
-                resolver = getattr(self.platform, "resolve_foreground_window", None)
-                fg_box: list[ForegroundWindow | None] = [None]
-                fg_err: list[BaseException | None] = [None]
-                fg_done: threading.Event | None = None
-                fg_spawn_failed = False
-                if callable(resolver) and bool(getattr(self.platform, "_concurrent_origin_resolve", False)):
-                    fg_done = threading.Event()
-                    _res_fn = resolver
-                    _tw = trigger_win
-
-                    def _resolve_origin_bg() -> None:
-                        try:
-                            fg_box[0] = _res_fn(_tw)
-                        except BaseException as exc:
-                            fg_err[0] = exc
-                        finally:
-                            assert fg_done is not None
-                            fg_done.set()
-
-                    try:
-                        threading.Thread(
-                            target=_resolve_origin_bg,
-                            name=f"avi-origin-{cur_seq}",
-                            daemon=True,
-                        ).start()
-                    except Exception:
-                        fg_done = None
-                        fg_spawn_failed = True
+                origin_probe = _OriginWindowProbe(self.platform, window, cur_seq)
                 try:
                     eff_loopback = bool(
                         loopback
                         or self.env.get("AGENT_VOICE_INPUT_WASAPI_LOOPBACK") == "1"
                         or self.env.get("VOICE_INPUT_WASAPI_LOOPBACK") == "1"
                     )
-                    start_fn = self.platform.start_recording
-                    try:
-                        start_params = inspect.signature(start_fn).parameters
-                        pass_seq = "seq_id" in start_params or any(
-                            p.kind == inspect.Parameter.VAR_KEYWORD for p in start_params.values()
-                        )
-                    except (TypeError, ValueError):
-                        pass_seq = False
-                    start_kw: dict[str, Any] = {"seq_id": cur_seq} if pass_seq else {}
                     if loopback:
-                        start_fn(self.runtime_dir, loopback=True, **start_kw)
+                        self.platform.start_recording(self.runtime_dir, loopback=True, seq_id=cur_seq)
                     else:
-                        start_fn(self.runtime_dir, **start_kw)
+                        self.platform.start_recording(self.runtime_dir, seq_id=cur_seq)
                     rec_started = True
                     if self._stop_evt.is_set():
                         self._cancel_max_duration_timer()
@@ -3322,13 +1004,7 @@ class VoiceInputDaemon:
                             pass
                         with self._lock:
                             if self._recording_active and self._recording_seq_id == cur_seq:
-                                self._recording_active = False
-                                self._recording_seq_id = -1
-                                self._recording_trigger_action = ""
-                                self._recording_shim_id = 0
-                                self._cur_no_paste, self._cur_silent_hud = False, False
-                                self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
-                                self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
+                                self._clear_recording_state_locked()
                             stop_st = self._recompute_state_locked()
                         return {"ok": False, "ignored": "stopping", "state": stop_st, "seq_id": cur_seq}
                     if not eff_silent:
@@ -3362,51 +1038,11 @@ class VoiceInputDaemon:
                         self._hud("audio_recovered", clear_main=False)
                     if not eff_silent and not eff_loopback:
                         self.platform.beep("start")
-                    if fg_spawn_failed:
-                        win_now = (
-                            replace(trigger_win, origin_drifted=True)
-                            if trigger_win is not None
-                            else ForegroundWindow(origin_drifted=True)
-                        )
-                    elif fg_done is not None:
-                        finished = fg_done.wait(timeout=self._origin_resolve_timeout_sec)
-                        sampled = fg_box[0] if finished and fg_err[0] is None else None
-                        has_identity = sampled is not None and bool(
-                            sampled.hwnd > 0
-                            or sampled.process
-                            or sampled.bundle_id
-                            or sampled.title
-                            or sampled.surface_id
-                            or sampled.tty
-                            or sampled.tmux_pane
-                        )
-                        if not has_identity:
-                            win_now = (
-                                replace(trigger_win, origin_drifted=True)
-                                if trigger_win is not None
-                                else ForegroundWindow(origin_drifted=True)
-                            )
-                        else:
-                            assert sampled is not None
-                            win_now = sampled
-                    elif callable(resolver):
-                        win_now = resolver(trigger_win)
-                    else:
-                        win_now = trigger_win if (trigger_win and (trigger_win.title or trigger_win.process or trigger_win.hwnd)) else self.platform.get_foreground_window()
-                    if trigger_win is not None and not win_now.origin_drifted:
-                        conflict_fn = getattr(self.platform, "origin_resolution_conflicted", None)
-                        if callable(conflict_fn) and conflict_fn(trigger_win, win_now):
-                            win_now = replace(trigger_win, origin_drifted=True)
+                    win_now = origin_probe.resolve(self._origin_resolve_timeout_sec)
                     with self._lock:
                         if self._stop_evt.is_set():
                             if self._recording_active and self._recording_seq_id == cur_seq:
-                                self._recording_active = False
-                                self._recording_seq_id = -1
-                                self._recording_trigger_action = ""
-                                self._recording_shim_id = 0
-                                self._cur_no_paste, self._cur_silent_hud = False, False
-                                self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
-                                self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
+                                self._clear_recording_state_locked()
                             stop_st_end = self._recompute_state_locked()
                             stopping_end = True
                         else:
@@ -3431,40 +1067,13 @@ class VoiceInputDaemon:
                             self.platform.cancel_recording()
                         except Exception:
                             pass
-                    err = self._redact(exc)
-                    is_mic_err = isinstance(exc, (NoMicrophoneError, MicrophoneUnavailableError))
-                    err_reason = str(getattr(exc, "reason_code", "no_mic")) if is_mic_err else ""
-                    err_hud_state = str(getattr(exc, "hud_state", "no_mic")) if is_mic_err else "error"
-                    err_hud_dur = 2200 if err_hud_state == "no_mic" else 0
-                    with self._lock:
-                        still_cur = self._recording_active and self._recording_seq_id == cur_seq
-                        if still_cur:
-                            self._recording_active = False
-                            self._recording_seq_id = -1
-                            self._recording_trigger_action = ""
-                            self._recording_shim_id = 0
-                            self._cur_no_paste, self._cur_silent_hud = False, False
-                            self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
-                            self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
-                        err_state = self._recompute_state_locked()
-                        lr: dict[str, Any] = {"seq_id": cur_seq, "ok": False, "error": err}
-                        if err_reason:
-                            lr["skipped_reason"] = err_reason
-                        lr_snap = self._record_result_locked(lr)
-                    self._append_telemetry(lr_snap)
-                    if still_cur and not eff_silent:
-                        self._emit_capture_error_hud(
-                            cur_seq=cur_seq,
-                            toast_state=err_hud_state,
-                            duration_ms=err_hud_dur,
-                            restore_main_if_needed=rec_started,
-                        )
-                    if not eff_silent:
-                        self.platform.beep("error")
-                    out_err: dict[str, Any] = {"ok": False, "error": err, "state": err_state, "seq_id": cur_seq}
-                    if err_reason:
-                        out_err["skipped_reason"] = err_reason
-                    return out_err
+                    return self._handle_capture_failure(
+                        cur_seq,
+                        exc,
+                        eff_silent=eff_silent,
+                        restore_main_if_needed=rec_started,
+                        clear_recording=True,
+                    )
 
             self._cancel_max_duration_timer()
             stop_rec_lost = False
@@ -3497,31 +1106,13 @@ class VoiceInputDaemon:
                     if not self._stop_evt.is_set():
                         self.platform.beep("stop")
             except Exception as exc:
-                err = self._redact(exc)
-                is_mic_err = isinstance(exc, (NoMicrophoneError, MicrophoneUnavailableError))
-                err_reason = str(getattr(exc, "reason_code", "no_mic")) if is_mic_err else ""
-                err_hud_state = str(getattr(exc, "hud_state", "no_mic")) if is_mic_err else "error"
-                err_hud_dur = 2200 if err_hud_state == "no_mic" else 0
-                with self._lock:
-                    self._stopping_capture = False
-                    err_stop_state = self._recompute_state_locked()
-                    lr_stop: dict[str, Any] = {"seq_id": cur_seq, "ok": False, "error": err}
-                    if err_reason:
-                        lr_stop["skipped_reason"] = err_reason
-                    lr_stop_snap = self._record_result_locked(lr_stop)
-                self._append_telemetry(lr_stop_snap)
-                if not eff_silent:
-                    self._emit_capture_error_hud(
-                        cur_seq=cur_seq,
-                        toast_state=err_hud_state,
-                        duration_ms=err_hud_dur,
-                        restore_main_if_needed=True,
-                    )
-                    self.platform.beep("error")
-                out_stop_err: dict[str, Any] = {"ok": False, "error": err, "state": err_stop_state, "seq_id": cur_seq}
-                if err_reason:
-                    out_stop_err["skipped_reason"] = err_reason
-                return out_stop_err
+                return self._handle_capture_failure(
+                    cur_seq,
+                    exc,
+                    eff_silent=eff_silent,
+                    restore_main_if_needed=True,
+                    clear_stopping=True,
+                )
 
             task = _QueuedUtterance(
                 seq_id=cur_seq,
@@ -3593,13 +1184,7 @@ class VoiceInputDaemon:
                     cancel_rec_mode = True
                     cancelled_rec_seq = self._recording_seq_id
                     eff_rec_silent = bool(silent_hud or self._cur_silent_hud)
-                    self._recording_active = False
-                    self._recording_seq_id = -1
-                    self._recording_trigger_action = ""
-                    self._recording_shim_id = 0
-                    self._cur_no_paste, self._cur_silent_hud = False, False
-                    self._rec_recovery_count, self._rec_recovery_gap_ms = 0, 0
-                    self._rec_hud_ready_seq, self._pending_recovery_toast_seq = -1, -1
+                    self._clear_recording_state_locked()
                     self.seq_id += 1
                     self._rec_seq_id = self.seq_id
                     self._last_trigger_ts = self.clock_fn()
@@ -3793,15 +1378,6 @@ class VoiceInputDaemon:
 
             if _aborted():
                 return PasteOutcome(False, False, "cancelled", "")
-            eff_origin = origin_window
-            extra_kw: dict[str, Any] = {}
-            if same_window_verifier is not None:
-                if _platform_accepts_same_window_verifier(self.platform):
-                    extra_kw["same_window_verifier"] = same_window_verifier
-                elif eff_origin is not None:
-                    eff_origin = _apply_fallback_same_window_verifier(
-                        eff_origin, platform=self.platform, verifier=same_window_verifier
-                    )
 
             def _guarded_before_commit() -> bool:
                 if _aborted():
@@ -3814,12 +1390,12 @@ class VoiceInputDaemon:
                 text,
                 seq_id=seq_id,
                 target_hwnd=target_hwnd,
-                origin_window=eff_origin,
+                origin_window=origin_window,
                 suppress_beep=True,
                 is_cancelled=_aborted,
                 before_clipboard_write=lambda: self._wait_clipboard_settle(cancel_token),
                 before_commit=_guarded_before_commit,
-                **extra_kw,
+                same_window_verifier=same_window_verifier,
             )
             self._note_clipboard_paste(paste_out)
             return paste_out
@@ -3946,8 +1522,7 @@ class VoiceInputDaemon:
                 return
             assert st.asr_res is not None
             if not _will_run_stage2_refiner(self.cfg, self.refiner, st.asr_res):
-                slot.stage2_ref_res = _call_refiner_refine(
-                    self.refiner,
+                slot.stage2_ref_res = self.refiner.refine(
                     st.asr_res,
                     session_key=st.snap.session_key if st.snap else "",
                     tracker=self.tracker,
@@ -4023,8 +1598,7 @@ class VoiceInputDaemon:
         cancel_fn = lambda: self._stop_evt.is_set() or task.cancel_token.is_cancelled()
         try:
             assert st.asr_res is not None
-            slot.stage2_ref_res = _call_refiner_refine(
-                self.refiner,
+            slot.stage2_ref_res = self.refiner.refine(
                 st.asr_res,
                 session_key=st.snap.session_key if st.snap else "",
                 tracker=self.tracker,
@@ -4048,12 +1622,20 @@ class VoiceInputDaemon:
                 self._queue_cv.notify_all()
 
     def _finalize_commit_slot(self, slot: _CommitSlot) -> tuple[dict[str, Any], str, int, str] | None:
-        task = slot.task
-        st = slot.st
-        hud_st, hud_dur_ms, beep_k = "", 0, ""
-
-        def _summarize(res: PipelineResult) -> dict[str, Any]:
-            return self._build_summary(
+        task, st = slot.task, slot.st
+        return finalize_commit_slot_outcome(
+            task=task,
+            st=st,
+            slot_exc=slot.exc,
+            stage2_ref_res=slot.stage2_ref_res,
+            stop_evt=self._stop_evt,
+            platform=self.platform,
+            tracker=self.tracker,
+            env=self.env,
+            asr_provider=self.asr_provider,
+            refiner=self.refiner,
+            redact_fn=self._redact,
+            summarize_fn=lambda res: self._build_summary(
                 task.seq_id,
                 res,
                 dry_run=task.no_paste,
@@ -4061,183 +1643,14 @@ class VoiceInputDaemon:
                 recovery_count=task.recovery_count,
                 recovery_gap_ms=task.recovery_gap_ms,
                 audio_error=task.audio_error,
-            )
-
-        def _stash_slot_wav() -> str:
-            return self._stash_task_wav_once(
+            ),
+            stash_fn=lambda: self._stash_task_wav_once(
                 task, gate=st.gate, snap=st.snap, win=st.win, workspace_cwd=st.workspace_cwd
-            )
-
-        def _cancelled_outcome() -> tuple[dict[str, Any], str, int, str] | None:
-            if self._stop_evt.is_set() or task.cancel_token.reason == "shutdown" or st.skipped_reason == "shutdown":
-                return None
-            saved_p = _stash_slot_wav()
-            res_c = _make_pipeline_result(
-                task.seq_id,
-                task.audio_source,
-                st,
-                skipped_reason="cancelled",
-                saved_audio=saved_p,
-            )
-            return _summarize(res_c), "", 0, ""
-
-        if (
-            self._stop_evt.is_set()
-            or task.cancel_token.is_cancelled()
-            or st.skipped_reason in ("cancelled", "shutdown")
-        ):
-            return _cancelled_outcome()
-
-        if slot.exc is not None:
-            if not task.cancel_token.try_commit():
-                return _cancelled_outcome()
-            saved_p = _stash_slot_wav()
-            res_err = _make_pipeline_result(
-                task.seq_id,
-                task.audio_source,
-                st,
-                refined=slot.stage2_ref_res,
-                saved_audio=saved_p,
-                error=self._redact(slot.exc),
-            )
-            sum_err = _summarize(res_err)
-            if not sum_err["asr_provider"]:
-                sum_err["asr_provider"] = getattr(self.asr_provider, "provider_name", "")
-            if not sum_err["refiner_provider"]:
-                sum_err["refiner_provider"] = getattr(self.refiner, "provider_name", "")
-            return sum_err, "error", 0, ("" if task.recorder_lost else "error")
-
-        if st.skipped_reason:
-            if not task.cancel_token.try_commit():
-                return _cancelled_outcome()
-            sr = st.skipped_reason
-            saved_p = _stash_slot_wav() if sr == "empty_asr" else ""
-            res_skip = _make_pipeline_result(
-                task.seq_id,
-                task.audio_source,
-                st,
-                skipped_reason=sr,
-                saved_audio=saved_p,
-            )
-            sum_skip = _summarize(res_skip)
-            if sr in ("too_short", "silence", "empty_audio"):
-                if task.recorder_lost:
-                    hud_st, hud_dur_ms, beep_k = "mic_disconnected", 2200, ""
-                    sum_skip["skipped_reason"] = "mic_disconnected"
-                else:
-                    hud_st, beep_k = "empty", "error"
-            elif sr == "empty_asr":
-                if task.recorder_lost:
-                    hud_st, hud_dur_ms, beep_k = "mic_disconnected", 2200, ""
-                    sum_skip["skipped_reason"] = "mic_disconnected"
-                else:
-                    hud_st = "asr_empty_retry" if saved_p else "asr_empty"
-                    beep_k = "error"
-            elif sr != "superseded":
-                hud_st, beep_k = "error", "error"
-            if task.recorder_lost and beep_k == "error":
-                beep_k = ""
-            return sum_skip, hud_st, hud_dur_ms, beep_k
-
-        ref_res = slot.stage2_ref_res
-        if (
-            self._stop_evt.is_set()
-            or task.cancel_token.is_cancelled()
-            or (ref_res is not None and ref_res.used_fallback in ("cancelled", "shutdown"))
-        ):
-            return _cancelled_outcome()
-
-        assert st.asr_res is not None
-        final_text = (ref_res.text.strip() if ref_res else "") or st.asr_res.text.strip()
-
-        deliver_ms = 0
-        paste_out: PasteOutcome | None = None
-        if task.no_paste or self.platform is None:
-            if not task.cancel_token.try_commit():
-                return _cancelled_outcome()
-        else:
-            try:
-                verifier = _make_desktop_same_window_verifier(
-                    st, tracker=self.tracker, env=self.env
-                )
-                deliver_win = st.win
-                pass_verifier: Callable[[ForegroundWindow], bool] | None = None
-                if verifier is not None:
-                    if _platform_accepts_same_window_verifier(self.platform):
-                        pass_verifier = verifier
-                    else:
-                        deliver_win = _apply_fallback_same_window_verifier(
-                            st.win, platform=self.platform, verifier=verifier
-                        )
-                t_deliv0 = time.monotonic()
-                paste_out = self._deliver_for_utterance(
-                    task, final_text, deliver_win, same_window_verifier=pass_verifier
-                )
-                deliver_ms = _elapsed_ms(t_deliv0)
-            except Exception as deliv_exc:
-                if self._stop_evt.is_set() or task.cancel_token.is_cancelled():
-                    return _cancelled_outcome()
-                if not task.cancel_token.try_commit():
-                    return _cancelled_outcome()
-                deliver_ms = _elapsed_ms(t_deliv0)
-                saved_p = _stash_slot_wav()
-                res_deliv_err = _make_pipeline_result(
-                    task.seq_id,
-                    task.audio_source,
-                    st,
-                    ok=False,
-                    final_text=final_text,
-                    skipped_reason="delivery_error",
-                    refined=ref_res,
-                    paste=PasteOutcome(False, False, "delivery_error", st.win.process, False),
-                    deliver_ms=deliver_ms,
-                    saved_audio=saved_p,
-                    error=self._redact(deliv_exc),
-                )
-                hud_st = "paste_failed_retry" if saved_p else "paste_failed"
-                beep_k = "" if task.recorder_lost else "error"
-                return _summarize(res_deliv_err), hud_st, hud_dur_ms, beep_k
-            if paste_out.reason == "cancelled" or task.cancel_token.is_cancelled():
-                return _cancelled_outcome()
-            task.cancel_token.try_commit()
-
-        delivery_failed = paste_out is not None and not paste_out.pasted and not paste_out.clipboard
-        copied_only = bool(paste_out and not paste_out.pasted and paste_out.clipboard)
-        saved_p = _stash_slot_wav() if (delivery_failed or st.asr_missed_chunks > 0) else ""
-        eff_skip = (
-            (
-                paste_out.reason
-                if (paste_out is not None and paste_out.reason and paste_out.reason != "ok")
-                else "paste_failed"
-            )
-            if delivery_failed
-            else ""
+            ),
+            deliver_fn=lambda t, txt, win, ver: self._deliver_for_utterance(
+                t, txt, win, same_window_verifier=ver
+            ),
         )
-        res_ok = _make_pipeline_result(
-            task.seq_id,
-            task.audio_source,
-            st,
-            ok=(not delivery_failed),
-            final_text=final_text,
-            skipped_reason=eff_skip,
-            refined=ref_res,
-            paste=paste_out,
-            deliver_ms=deliver_ms,
-            saved_audio=saved_p,
-        )
-        if delivery_failed:
-            hud_st = "paste_failed_retry" if saved_p else "paste_failed"
-            beep_k = "" if task.recorder_lost else "error"
-        elif st.asr_missed_chunks > 0:
-            if copied_only:
-                hud_st = "partial_asr_copied" if saved_p else "partial_asr_copied_unsaved"
-            else:
-                hud_st = "partial_asr" if saved_p else "partial_asr_unsaved"
-        elif copied_only:
-            hud_st = "copied"
-        else:
-            hud_st = "done"
-        return _summarize(res_ok), hud_st, hud_dur_ms, beep_k
 
     def _commit_worker_loop(self) -> None:
         while True:
@@ -4299,46 +1712,22 @@ class VoiceInputDaemon:
                     self._record_result_locked(summary)
                     self._queue_cv.notify_all()
                     if not self._stop_evt.is_set():
-                        if task.silent_hud:
-                            if not rec_active and not next_vis_stage and self._main_hud_visible:
-                                hud_calls.append(("hide", "", 0, None, None, None, 0))
-                        elif rec_active:
-                            if (
-                                self._recording_active
-                                and not self._stopping_capture
-                                and not self._cur_silent_hud
-                                and self._main_hud_state == "recording"
-                                and vis_inflight != self._main_hud_bg_count
-                            ):
-                                hud_calls.append(("recording", "", 0, None, None, False, vis_inflight))
-                            if hud_st == "copied":
-                                hud_calls.append(("copied", copied_hud_text, hud_dur_ms, "toast", False, None, 0))
-                            elif hud_st and is_toast_hud_state(hud_st):
-                                hud_calls.append((hud_st, "", hud_dur_ms, None, False, None, 0))
-                        elif next_vis_stage:
-                            if self._main_hud_state != next_vis_stage:
-                                hud_calls.append((next_vis_stage, "", 0, None, None, None, 0))
-                            if hud_st == "copied":
-                                hud_calls.append(("copied", copied_hud_text, hud_dur_ms, "toast", False, None, 0))
-                            elif hud_st and is_toast_hud_state(hud_st):
-                                hud_calls.append((hud_st, "", hud_dur_ms, None, False, None, 0))
-                            play_beep = beep_k
-                        else:
-                            if hud_st:
-                                hud_calls.append(
-                                    (
-                                        hud_st,
-                                        copied_hud_text if hud_st == "copied" else "",
-                                        hud_dur_ms,
-                                        None,
-                                        True if is_toast_hud_state(hud_st) else None,
-                                        None,
-                                        0,
-                                    )
-                                )
-                            elif self._main_hud_visible:
-                                hud_calls.append(("hide", "", 0, None, None, None, 0))
-                            play_beep = beep_k
+                        hud_calls, play_beep = plan_commit_hud_calls(
+                            silent_hud=task.silent_hud,
+                            rec_active=rec_active,
+                            recording_active=self._recording_active,
+                            stopping_capture=self._stopping_capture,
+                            cur_silent_hud=self._cur_silent_hud,
+                            main_hud_state=self._main_hud_state,
+                            main_hud_visible=self._main_hud_visible,
+                            main_hud_bg_count=self._main_hud_bg_count,
+                            next_vis_stage=next_vis_stage,
+                            vis_inflight=vis_inflight,
+                            hud_st=hud_st,
+                            copied_hud_text=copied_hud_text,
+                            hud_dur_ms=hud_dur_ms,
+                            beep_k=beep_k,
+                        )
                         for st_n, _, _, lyr_n, clr_m_n, _, bg_n in hud_calls:
                             self._update_main_hud_visibility_locked(
                                 st_n, layer=lyr_n, clear_main=clr_m_n, bg_count=bg_n
@@ -4374,19 +1763,6 @@ class VoiceInputDaemon:
                         and self._rec_seq_id != seq_id
                     ):
                         return
-                pref_extra: dict[str, Any] = {}
-                try:
-                    pref_params = inspect.signature(pref_fn).parameters
-                    pref_var_kw = any(
-                        p.kind == inspect.Parameter.VAR_KEYWORD for p in pref_params.values()
-                    )
-                except (TypeError, ValueError):
-                    pref_params = {}
-                    pref_var_kw = False
-                if pref_var_kw or "tmux_socket" in pref_params:
-                    pref_extra["tmux_socket"] = win.tmux_socket
-                if pref_var_kw or "tmux_pane" in pref_params:
-                    pref_extra["tmux_pane"] = win.tmux_pane
                 pref_fn(
                     win.title,
                     window_tty=win.tty,
@@ -4395,9 +1771,10 @@ class VoiceInputDaemon:
                     window_process=win.process,
                     bundle_id=win.bundle_id,
                     document=win.document,
+                    tmux_socket=win.tmux_socket,
+                    tmux_pane=win.tmux_pane,
                     seq_id=seq_id,
                     include_git_info=inc_git,
-                    **pref_extra,
                 )
 
             rm = getattr(self.tracker, "remote_manager", None)
@@ -4505,38 +1882,35 @@ class VoiceInputDaemon:
             shim_err = self._redact_str(raw_shim_err) if raw_shim_err else ""
             raw_hist = req.get("history")
             want_hist = raw_hist is not None and not isinstance(raw_hist, bool)
-            hist_limit = max(0, min(500, int(raw_hist))) if want_hist else 0
             with self._lock:
-                resp: dict[str, Any] = {
-                    "ok": True,
-                    "version": __version__,
-                    "build_id": self.build_id,
-                    "pid": os.getpid(),
-                    "state": self.state,
-                    "seq_id": self.seq_id,
-                    "pending_count": self._inflight_or_queued_count_locked(),
-                    "asr_provider": self.active_pipeline["asr"]["provider"],
-                    "refiner_provider": self.resolved_refiner_provider,
-                    "pipeline": copy.deepcopy(self.active_pipeline),
-                    "shim_ok": shim_ok,
-                    "last_result": dict(self.last_result),
-                }
-                if shim_err:
-                    resp["shim_error"] = shim_err
-                if self.cfg.remote.enabled and (rm := getattr(self.tracker, "remote_manager", None)) is not None:
-                    bs = rm.breaker_snapshot()
-                    if bs:
-                        resp["remote_hosts"] = bs
-                mem_snap = [dict(r) for r in self.recent_results] if want_hist else []
-            if want_hist:
-                disk_items = read_telemetry_history(
-                    self.runtime_dir, limit=max(hist_limit, RECENT_RESULTS_MAXLEN)
+                st_cur = self.state
+                seq_cur = self.seq_id
+                pending_cur = self._inflight_or_queued_count_locked()
+                last_res_snap = dict(self.last_result)
+                remote_hosts = (
+                    rm.breaker_snapshot()
+                    if (
+                        self.cfg.remote.enabled
+                        and (rm := getattr(self.tracker, "remote_manager", None)) is not None
+                    )
+                    else None
                 )
-                merged = merge_recent_results(mem_snap, disk_items, limit=hist_limit)
-                resp["recent_results"] = merged
-                if not resp["last_result"] and merged:
-                    resp["last_result"] = dict(merged[-1])
-            return resp
+                mem_snap = [dict(r) for r in self.recent_results] if want_hist else []
+            return build_daemon_status_response(
+                runtime_dir=self.runtime_dir,
+                req=req,
+                build_id=self.build_id,
+                state=st_cur,
+                seq_id=seq_cur,
+                pending_count=pending_cur,
+                active_pipeline=self.active_pipeline,
+                resolved_refiner_provider=self.resolved_refiner_provider,
+                shim_ok=shim_ok,
+                shim_error=shim_err,
+                last_result=last_res_snap,
+                remote_hosts=remote_hosts,
+                mem_recent_results=mem_snap,
+            )
         if cmd in ("toggle", "rec_start", "rec_stop"):
             win = _window_from_mapping(req) if _has_window_fields(req) else None
             return self.handle_trigger({"toggle": "toggle", "rec_start": "ptt_start", "rec_stop": "ptt_stop"}[cmd], win, no_paste=bool(req.get("no_paste")), silent_hud=bool(req.get("silent_hud")), loopback=bool(req.get("loopback")))
@@ -4567,30 +1941,7 @@ class VoiceInputDaemon:
         return {"ok": False, "error": f"unknown cmd: {cmd}"}
 
     def _make_probe_tracker(self) -> tuple[Any, bool]:
-        tr = self.tracker
-        if not isinstance(tr, SessionTracker):
-            return tr, False
-        probe_rm = RemoteSshManager(
-            tr.remote_cfg,
-            env=tr.env,
-            runtime_dir=tr.runtime_dir,
-            enable_multiplexing=False,
-        )
-        probe_tr = SessionTracker(
-            home_dir=tr.home,
-            runtime_dir=tr.runtime_dir,
-            proc_root=tr.proc_root,
-            env=tr.env,
-            tmux_socket=tr._tmux_socket or None,
-            tmux_socket_name=tr._tmux_socket_name or None,
-            tmux_probe_fn=tr._tmux_probe_fn,
-            remote_cfg=tr.remote_cfg,
-            local_hostnames=tr._custom_local_hostnames,
-            remote_manager=probe_rm,
-            context_max_chars=tr.context_max_chars,
-            cold_start_fallback=tr.cold_start_fallback,
-        )
-        return probe_tr, True
+        return make_isolated_probe_tracker(self.tracker)
 
     def _safe_close_refiner(self) -> None:
         try:
@@ -4658,166 +2009,60 @@ class VoiceInputDaemon:
     ) -> dict[str, Any]:
         if self._stop_evt.is_set() or (cancel_token is not None and cancel_token.is_cancelled()):
             return {"ok": False, "error": "daemon stopping"}
-        eff_deadline = deadline
-        if eff_deadline is None:
-            try:
-                parsed_timeout = _parse_optional_timeout_sec(req.get("timeout_sec"))
-            except ValueError as exc:
-                return {"ok": False, "error": str(exc)}
-            if parsed_timeout is not None:
-                eff_deadline = time.monotonic() + parsed_timeout
-        raw_deliver = req.get("deliver", False)
-        if not isinstance(raw_deliver, bool):
-            return {"ok": False, "error": "deliver must be a boolean"}
-        deliver = raw_deliver
-        if deliver and (req.get("use_live_window") is not True or _has_window_fields(req)):
-            return {
-                "ok": False,
-                "error": "deliver requires use_live_window=true without window overrides",
-            }
-        raw_wav_path = str(req.get("wav_path") or "").strip()
-        wav_path = Path(raw_wav_path).expanduser() if raw_wav_path else None
-        if wav_path is None or not wav_path.is_file():
-            return {"ok": False, "error": f"wav_path not found: {raw_wav_path}"}
-        origin_win = _resolve_control_origin_window(req)
-        if origin_win is None:
-            origin_win = (
-                self.platform.get_foreground_window()
-                if self.platform is not None
-                else ForegroundWindow()
-            )
-            if deliver and (
-                not origin_win.hwnd
-                and not (origin_win.process or "").strip()
-                and not (origin_win.bundle_id or "").strip()
-            ):
-                return {"ok": False, "error": "no live foreground window"}
-
-        req_cancel = CancelToken()
-        parent_hook_id = 0
-        deadline_timer: threading.Timer | None = None
-        if cancel_token is not None:
-            parent_hook_id = cancel_token.register_abort(
-                lambda: req_cancel.cancel(cancel_token.reason or "shutdown")
-            )
-        if eff_deadline is not None:
-            rem_sec = eff_deadline - time.monotonic()
-            if rem_sec <= 0.0:
-                req_cancel.cancel("client_timeout")
-            else:
-                deadline_timer = threading.Timer(
-                    rem_sec, lambda: req_cancel.cancel("client_timeout")
-                )
-                deadline_timer.daemon = True
-                deadline_timer.start()
-
-        def _abort_reason() -> str:
-            if self._stop_evt.is_set():
-                req_cancel.cancel("shutdown")
-                return "shutdown"
-            if cancel_token is not None and cancel_token.is_cancelled():
-                rsn = cancel_token.reason or "shutdown"
-                req_cancel.cancel(rsn)
-                return rsn
-            if req_cancel.is_cancelled():
-                return req_cancel.reason or "cancelled"
-            if eff_deadline is not None and time.monotonic() >= eff_deadline:
-                req_cancel.cancel("client_timeout")
-                return req_cancel.reason or "client_timeout"
-            if peer_disconnected is not None and peer_disconnected():
-                req_cancel.cancel("client_disconnected")
-                return req_cancel.reason or "client_disconnected"
-            return ""
-
-        def _is_req_aborted() -> bool:
-            return bool(_abort_reason())
+        wav_path, origin_win, deliver, eff_deadline, err_msg = validate_selftest_wav_request(
+            req, platform=self.platform, deadline=deadline
+        )
+        if err_msg or wav_path is None or origin_win is None:
+            return {"ok": False, "error": err_msg or "invalid selftest_wav request"}
 
         known_cwds_snap = tuple(self.tracker.active_session_cwds())
         selftest_tracker, owns_tracker = self._make_probe_tracker()
         acquired_shared = False
+
+        def _alloc_seq(no_telemetry: bool) -> int:
+            if no_telemetry:
+                return 0
+            with self._lock:
+                self.seq_id += 1
+                return self.seq_id
+
+        def _record_telemetry(summary: dict[str, Any]) -> None:
+            with self._lock:
+                st_snap = self._record_result_locked(summary)
+            self._append_telemetry(st_snap)
+
         try:
-            if init_abort := _abort_reason():
-                if init_abort == "shutdown":
-                    return {"ok": False, "error": "daemon stopping"}
-                return {
-                    "ok": False,
-                    "skipped_reason": init_abort,
-                    "error": init_abort,
-                    "pasted": False,
-                    "clipboard": False,
-                }
-            if not self._acquire_shared_resources(use_refiner=True, use_tracker=(not owns_tracker)):
+            if not self._acquire_shared_resources(
+                use_refiner=True, use_tracker=(not owns_tracker)
+            ):
                 return {"ok": False, "error": "daemon stopping"}
             acquired_shared = True
-            no_telemetry = req.get("no_telemetry") is True
-            if no_telemetry:
-                cur_seq = 0
-            else:
-                with self._lock:
-                    self.seq_id += 1
-                    cur_seq = self.seq_id
-            deliver_hook = (
-                (lambda text, **kw: self._deliver_for_selftest(text, cancel_token=req_cancel, **kw))
-                if deliver
-                else None
-            )
-            res = run_pipeline_once(
-                wav_path,
+            return run_selftest_wav_request(
+                req,
+                wav_path=wav_path,
+                origin_win=origin_win,
+                deliver=deliver,
+                eff_deadline=eff_deadline,
+                stop_evt=self._stop_evt,
+                cancel_token=cancel_token,
+                peer_disconnected=peer_disconnected,
                 cfg=self.cfg,
                 creds=self.creds,
-                tracker=selftest_tracker,
+                selftest_tracker=selftest_tracker,
                 asr_provider=self.asr_provider,
                 refiner=self.refiner,
                 platform=self.platform,
-                origin_window=origin_win,
-                audio_source="selftest_wav",
-                seq_id=cur_seq,
-                dry_run=(not deliver),
-                is_cancelled=_is_req_aborted,
-                cancel_token=req_cancel,
-                deliver_text_fn=deliver_hook,
                 runtime_dir=self.runtime_dir,
                 env=self.env,
-                mode=str(req.get("mode") or "auto"),
-                known_cwds_override=known_cwds_snap,
-                isolate_refiner_session=True,
+                known_cwds_snap=known_cwds_snap,
+                alloc_seq_fn=_alloc_seq,
+                deliver_for_selftest_fn=self._deliver_for_selftest,
+                build_summary_fn=lambda seq, res, dry: self._build_summary(
+                    seq, res, dry_run=dry, audio_error=""
+                ),
+                record_telemetry_fn=_record_telemetry,
             )
-            summary = self._build_summary(cur_seq, res, dry_run=(not deliver), audio_error="")
-            if not no_telemetry and not self._stop_evt.is_set():
-                with self._lock:
-                    st_snap = self._record_result_locked(summary)
-                self._append_telemetry(st_snap)
-            eff_cwd = (
-                res.session.match.cwd
-                if (res.session is not None and res.session.match.cwd)
-                else ""
-            ) or res.workspace_cwd
-            routing = {
-                "mode": res.mode,
-                "session_key_masked": _mask_session_key(res.session),
-                "ctx_chars": int(res.ctx_chars),
-                "ctx_chunks": int(res.ctx_chunks),
-                "ctx_fallback": res.ctx_fallback,
-                "workspace_name": _workspace_basename(eff_cwd),
-            }
-            return {
-                "ok": res.ok,
-                "seq_id": cur_seq,
-                "skipped_reason": res.skipped_reason,
-                "asr_text": res.asr.text if res.asr else "",
-                "final_text": res.final_text,
-                "pasted": bool(summary["pasted"]),
-                "clipboard": bool(summary["clipboard"]),
-                "paste_reason": str(summary["paste_reason"]),
-                "delivery_status": str(summary["delivery_status"]),
-                "summary": summary,
-                "routing": routing,
-            }
         finally:
-            if deadline_timer is not None:
-                deadline_timer.cancel()
-            if cancel_token is not None and parent_hook_id:
-                cancel_token.unregister_abort(parent_hook_id)
             if acquired_shared:
                 self._release_shared_resources(use_refiner=True, use_tracker=(not owns_tracker))
             if owns_tracker:
@@ -4842,62 +2087,20 @@ class VoiceInputDaemon:
                 if not self._acquire_shared_resources(use_refiner=False, use_tracker=True):
                     return {"ok": False, "error": "daemon stopping"}
                 acquired_tracker = True
-            origin_win = _resolve_control_origin_window(req)
-            t0 = time.monotonic()
-            st = _Stage1State(t_total0=t0, win=origin_win or ForegroundWindow())
             cancel_fn = (
                 (lambda: self._stop_evt.is_set() or cancel_token.is_cancelled())
                 if cancel_token is not None
                 else self._stop_evt.is_set
             )
-            asr_ctx = _resolve_stage1_context(
-                st,
+            return run_probe_route_request(
+                req,
                 cfg=self.cfg,
                 env=self.env,
-                tracker=probe_tracker,
+                probe_tracker=probe_tracker,
                 platform=self.platform,
-                origin_window=origin_win,
-                window_title_override=None,
-                audio_source="probe_route",
-                explicit_mode=str(req.get("mode") or "auto"),
-                cancel_check=cancel_fn,
-                attach_single_hop=False,
-                known_cwds_override=known_cwds_snap,
+                known_cwds_snap=known_cwds_snap,
+                cancel_fn=cancel_fn,
             )
-            if st.eff_mode == "general":
-                ctx_blocks: list[str] = []
-            else:
-                ctx_blocks, _ = build_refiner_context_chunks(
-                    self.cfg,
-                    session_key=st.snap.session_key if st.snap else "",
-                    tracker=probe_tracker if (st.snap is not None or st.workspace_cwd) else None,
-                    fallback_context=st.asr_ctx_dialog,
-                    workspace_cwd=st.workspace_cwd,
-                )
-                if any(b.startswith("<prior_session_reference") for b in ctx_blocks):
-                    st.ctx_fallback = "prior_session"
-            eff_cwd = (
-                st.snap.match.cwd
-                if (st.snap is not None and st.snap.match.cwd)
-                else ""
-            ) or st.workspace_cwd
-            return {
-                "ok": True,
-                "window_category": st.window_category,
-                "mode": st.eff_mode,
-                "should_sync": bool(st.should_sync),
-                "target_app_hint": st.target_hint,
-                "hotwords_scope": st.hotwords_scope,
-                "hotword_count": len(asr_ctx.hotwords),
-                "session_key_masked": _mask_session_key(st.snap),
-                "matched_by": _sanitize_matched_by(st.snap),
-                "remote_vetoed": bool(st.remote_vetoed),
-                "workspace_name": _workspace_basename(eff_cwd),
-                "ctx_chars": sum(len(b) for b in ctx_blocks),
-                "ctx_chunks": len(ctx_blocks),
-                "ctx_fallback": st.ctx_fallback,
-                "sync_ms": _elapsed_ms(t0),
-            }
         finally:
             if acquired_tracker:
                 self._release_shared_resources(use_refiner=False, use_tracker=True)
@@ -4908,11 +2111,7 @@ class VoiceInputDaemon:
                     pass
 
     def _send_control_reply(self, conn: socket.socket, resp: Mapping[str, Any]) -> None:
-        try:
-            conn.settimeout(2.0)
-            conn.sendall((json.dumps(dict(resp), ensure_ascii=False) + "\n").encode("utf-8"))
-        except OSError:
-            pass
+        send_control_reply(conn, resp)
 
     def _dispatch_control_async(
         self,
@@ -5203,16 +2402,7 @@ class VoiceInputDaemon:
             self.sock_path.unlink(missing_ok=True)
             srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._srv_sock = srv
-            pid_fd = os.open(
-                str(self.pid_path),
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
-            try:
-                os.fchmod(pid_fd, 0o600)
-                os.write(pid_fd, f"{os.getpid()}\n".encode("ascii"))
-            finally:
-                os.close(pid_fd)
+            write_daemon_pid_file(self.pid_path)
             self.platform.start_event_listener(self._on_platform_event)
             srv.bind(str(self.sock_path)); os.chmod(self.sock_path, 0o600); srv.listen(8); srv.settimeout(0.3)
             if (
@@ -5299,18 +2489,6 @@ class VoiceInputDaemon:
             # Never unlink daemon.lock: unlinking causes a classic inode race allowing two concurrent daemons.
             lock_fd, self._lock_fd = self._lock_fd, None
             self._owns_runtime_files = False
-            if lock_fd is not None:
-                try:
-                    os.ftruncate(lock_fd, 0)
-                except OSError:
-                    pass
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                try:
-                    os.close(lock_fd)
-                except OSError:
-                    pass
+            release_daemon_lock(lock_fd)
 
     stop = close

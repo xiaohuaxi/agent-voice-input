@@ -90,6 +90,7 @@ class _SpyAsr(BaseAsrProvider):
         context: AsrContext | None = None,
         *,
         is_cancelled: object = None,
+        **_kw: object,
     ) -> AsrResult:
         del wav_bytes, is_cancelled
         eff_ctx = _coerce_context(context, self.hotwords_file, env=self.env)
@@ -112,6 +113,7 @@ class _SpyRefiner(BaseRefiner):
         fallback_context: str = "",
         is_cancelled: object = None,
         mode: str = "agent",
+        **_kw: object,
     ) -> RefinerResult:
         del is_cancelled
         ctx_blocks: tuple[str, ...] = ()

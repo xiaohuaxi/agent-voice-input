@@ -110,18 +110,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                 current_build_id=bid1,
             )
             self.assertFalse(same["drifted"])
-            self.assertFalse(same["missing_build_id"])
             self.assertEqual(same["reason"], "")
-
-            # Same version omitting build_id -> not drifted, emits gentle note
-            same_no_bid = describe_daemon_drift(
-                {"version": __version__},
-                current_version=__version__,
-                current_build_id=bid1,
-            )
-            self.assertFalse(same_no_bid["drifted"])
-            self.assertTrue(same_no_bid["missing_build_id"])
-            self.assertIn("omits build_id", same_no_bid["note"])
 
             code_only = describe_daemon_drift(
                 {"version": __version__, "build_id": bid1},
@@ -172,7 +161,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
             out_start = io.StringIO()
             with (
                 mock.patch(
-                    "agent_voice_input.daemon.send_control_command",
+                    "agent_voice_input.control_ipc.send_control_command",
                     return_value={
                         "ok": True,
                         "pid": 5678,
@@ -196,7 +185,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
             out_ov = io.StringIO()
             with (
                 mock.patch(
-                    "agent_voice_input.daemon.send_control_command",
+                    "agent_voice_input.control_ipc.send_control_command",
                     return_value={
                         "ok": True,
                         "pid": 5678,
@@ -212,56 +201,11 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
             self.assertIn("ASR dashscope/qwen3-asr-flash (running)", out_ov.getvalue())
             self.assertNotIn("groq", out_ov.getvalue())
 
-            # 1c. `start` when daemon is running same version without build_id prints gentle INFO note
-            out_nobid = io.StringIO()
-            with (
-                mock.patch(
-                    "agent_voice_input.daemon.send_control_command",
-                    return_value={"ok": True, "pid": 5678, "state": "idle", "version": __version__},
-                ),
-                mock.patch("sys.stdout", out_nobid),
-            ):
-                rc_nb = cli_mod._cmd_start(parser.parse_args(["start"]), env, cfg=cfg)
-            self.assertEqual(rc_nb, 0)
-            self.assertIn("omits build_id", out_nobid.getvalue())
-
-            # 1d. Legacy daemon omitting `pipeline` but reporting `asr_provider`/`refiner_provider` MUST NOT synthesize contradicting local pipeline
-            legacy_daem = {
-                "ok": True,
-                "pid": 5679,
-                "state": "idle",
-                "version": __version__,
-                "asr_provider": "doubao",
-                "refiner_provider": "off",
-            }
-            out_leg_start = io.StringIO()
-            with (
-                mock.patch("agent_voice_input.daemon.send_control_command", return_value=dict(legacy_daem)),
-                mock.patch("sys.stdout", out_leg_start),
-            ):
-                rc_leg_start = cli_mod._cmd_start(parser.parse_args(["start"]), env, cfg=cfg)
-            self.assertEqual(rc_leg_start, 0)
-            self.assertIn("ASR doubao -> Refiner off (reported by running daemon)", out_leg_start.getvalue())
-            self.assertNotIn("dashscope", out_leg_start.getvalue())
-
-            out_leg_st = io.StringIO()
-            with (
-                mock.patch.dict(os.environ, env, clear=True),
-                mock.patch("agent_voice_input.daemon.send_control_command", return_value=dict(legacy_daem)),
-                mock.patch("sys.stdout", out_leg_st),
-            ):
-                rc_leg_st = cli_mod.main(["status"])
-            self.assertEqual(rc_leg_st, 0)
-            leg_st_obj = json.loads(out_leg_st.getvalue())
-            self.assertEqual(leg_st_obj["refiner_provider"], "off")
-            self.assertEqual(leg_st_obj["pipeline"]["refiner"]["provider"], "off")
-            self.assertEqual(leg_st_obj["pipeline"]["asr"]["provider"], "doubao")
-
             # 1e. Unlocked control socket PermissionError -> state="error", `start` returns 1 (NOT 0 / already running!)
             out_perm, err_perm = io.StringIO(), io.StringIO()
             with (
                 mock.patch(
-                    "agent_voice_input.daemon.send_control_command",
+                    "agent_voice_input.control_ipc.send_control_command",
                     side_effect=PermissionError("EACCES sk-dash-unit-0001"),
                 ),
                 mock.patch.object(cli_mod.subprocess, "Popen", side_effect=AssertionError("must not spawn")),
@@ -280,7 +224,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                 mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
                 mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch(
-                    "agent_voice_input.daemon.send_control_command",
+                    "agent_voice_input.control_ipc.send_control_command",
                     side_effect=PermissionError("EACCES"),
                 ),
                 mock.patch("sys.stdout", out_doc_perm),
@@ -346,11 +290,16 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                 "build_id": "deadbeef0000",
                 "asr_provider": "dashscope",
                 "refiner_provider": "dashscope",
+                "pipeline": {
+                    "asr": {"provider": "dashscope", "model": "qwen3-asr-flash"},
+                    "refiner": {"provider": "dashscope", "model": "qwen3-max"},
+                    "summary": "ASR dashscope -> Refiner dashscope",
+                },
             }
             out_st_drift = io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch("agent_voice_input.daemon.send_control_command", return_value=dict(drifted_resp)),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", return_value=dict(drifted_resp)),
                 mock.patch("sys.stdout", out_st_drift),
             ):
                 rc_st_drift = cli_mod.main(["status"])
@@ -365,7 +314,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
                 mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
                 mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
-                mock.patch("agent_voice_input.daemon.send_control_command", return_value=dict(drifted_resp)),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", return_value=dict(drifted_resp)),
                 mock.patch("sys.stdout", out_doc_drift),
             ):
                 rc_doc_drift = cli_mod._cmd_doctor(cfg, env, as_json=True)
@@ -382,7 +331,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
             sock_p.write_text("placeholder", encoding="utf-8")
             try:
                 for bad_resp in ({}, {"ok": False, "error": "busy"}, {"ok": True}):
-                    with mock.patch("agent_voice_input.daemon.send_control_command", return_value=bad_resp):
+                    with mock.patch("agent_voice_input.control_ipc.send_control_command", return_value=bad_resp):
                         pr_bad = probe_daemon_status(rt, timeout_sec=0.5)
                     self.assertEqual(pr_bad["state"], "unresponsive")
                     self.assertFalse(pr_bad["ok"])

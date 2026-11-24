@@ -259,82 +259,10 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             finally:
                 d_sym.close()
 
-            # Legacy online daemon (no daemon.lock held, active control.sock responding to `status`):
-            # new daemon detects it via status handshake, releases lock, and preserves legacy control.sock & daemon.pid!
-            import fcntl
-            import socket
-
-            rt_leg = ensure_secure_dir(Path(td) / "rt_leg")
-            leg_sock_path = rt_leg / "control.sock"
-            leg_pid_path = rt_leg / "daemon.pid"
-            leg_pid_path.write_text("424242\n", encoding="utf-8")
-            leg_srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            leg_srv.bind(str(leg_sock_path))
-            leg_srv.listen(2)
-            leg_stop = threading.Event()
-
-            def _serve_legacy() -> None:
-                leg_srv.settimeout(0.1)
-                while not leg_stop.is_set():
-                    try:
-                        c, _ = leg_srv.accept()
-                    except socket.timeout:
-                        continue
-                    except OSError:
-                        break
-                    with c:
-                        c.recv(4096)
-                        c.sendall(b'{"ok":true,"pid":424242,"state":"idle"}\n')
-
-            leg_th = threading.Thread(target=_serve_legacy, daemon=True)
-            leg_th.start()
-            try:
-                d_up = VoiceInputDaemon(
-                    cfg,
-                    env=env,
-                    runtime_dir=rt_leg,
-                    platform=_DummyPlatform(),
-                    asr_provider=_DummyAsr(),
-                    refiner=NoopRefiner(),
-                )
-                with self.assertRaises(DaemonAlreadyRunningError) as leg_err:
-                    d_up.serve_forever()
-                self.assertEqual(leg_err.exception.pid, 424242)
-                self.assertTrue(leg_sock_path.exists())
-                self.assertTrue(leg_pid_path.is_file())
-            finally:
-                leg_stop.set()
-                leg_srv.close()
-                leg_th.join(timeout=1.0)
-
-            # Busy/slow legacy online daemon (accepts AF_UNIX connection, stalls before replying):
-            # still detected as live listener via connect() and falls back to daemon.pid without clobbering!
-            rt_leg_slow = ensure_secure_dir(Path(td) / "rt_leg_slow")
-            slow_sock_path = rt_leg_slow / "control.sock"
-            slow_pid_path = rt_leg_slow / "daemon.pid"
-            slow_pid_path.write_text("434343\n", encoding="utf-8")
-            slow_srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            slow_srv.bind(str(slow_sock_path))
-            slow_srv.listen(2)
-            try:
-                d_up_slow = VoiceInputDaemon(
-                    cfg,
-                    env=env,
-                    runtime_dir=rt_leg_slow,
-                    platform=_DummyPlatform(),
-                    asr_provider=_DummyAsr(),
-                    refiner=NoopRefiner(),
-                )
-                with self.assertRaises(DaemonAlreadyRunningError) as slow_err:
-                    d_up_slow.serve_forever()
-                self.assertEqual(slow_err.exception.pid, 434343)
-                self.assertTrue(slow_sock_path.exists())
-                self.assertTrue(slow_pid_path.is_file())
-            finally:
-                slow_srv.close()
-
             # `_cmd_stop` NEVER sends SIGTERM to an old PID left in an unlocked `daemon.lock` OR a stale `daemon.pid`
             # whose PID has been recycled by a non-daemon same-user process (here: `os.getpid()` itself)!
+            import fcntl
+
             rt_stale_lock = ensure_secure_dir(Path(td) / "rt_stale_lock")
             (rt_stale_lock / "daemon.lock").write_text("765432\n", encoding="utf-8")
             os.chmod(rt_stale_lock / "daemon.lock", 0o600)
@@ -358,42 +286,6 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             self.assertFalse((rt_stale_lock / "daemon.pid").exists())
             self.assertFalse((rt_stale_lock / "control.sock").exists())
 
-            # When control socket times out on a live legacy daemon (no daemon.lock held), `_cmd_stop` preserves control files & returns 1
-            rt_indet = ensure_secure_dir(Path(td) / "rt_indet")
-            (rt_indet / "daemon.pid").write_text("565656\n", encoding="utf-8")
-            (rt_indet / "control.sock").write_text("live-legacy", encoding="utf-8")
-            err_indet = io.StringIO()
-            with (
-                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=TimeoutError("busy")),
-                redirect_stdout(io.StringIO()),
-                redirect_stderr(err_indet),
-            ):
-                rc_indet = cli_mod._cmd_stop({**env, "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt_indet)})
-            self.assertEqual(rc_indet, 1)
-            self.assertTrue((rt_indet / "daemon.pid").is_file())
-            self.assertTrue((rt_indet / "control.sock").exists())
-
-            # Full listen backlog on legacy control.sock (`connect()` raises EAGAIN): preserves legacy files & raises!
-            import errno
-
-            rt_leg_eagain = ensure_secure_dir(Path(td) / "rt_leg_eagain")
-            (rt_leg_eagain / "daemon.pid").write_text("444444\n", encoding="utf-8")
-            (rt_leg_eagain / "control.sock").write_text("sock-placeholder", encoding="utf-8")
-            d_eagain = VoiceInputDaemon(
-                cfg,
-                env=env,
-                runtime_dir=rt_leg_eagain,
-                platform=_DummyPlatform(),
-                asr_provider=_DummyAsr(),
-                refiner=NoopRefiner(),
-            )
-            with mock.patch("socket.socket.connect", side_effect=OSError(errno.EAGAIN, "Resource temporarily unavailable")):
-                with self.assertRaises(DaemonAlreadyRunningError) as eag_err:
-                    d_eagain.serve_forever()
-            self.assertEqual(eag_err.exception.pid, 444444)
-            self.assertTrue((rt_leg_eagain / "control.sock").exists())
-            self.assertTrue((rt_leg_eagain / "daemon.pid").is_file())
-
             # `_cmd_stop` & `restart` lock-coordination: if another live daemon holds daemon.lock,
             # `_cmd_stop` does not unlink its files and `restart` aborts cleanly instead of colliding.
             rt_race = ensure_secure_dir(Path(td) / "rt_race")
@@ -406,7 +298,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             try:
                 err_race = io.StringIO()
                 with (
-                    mock.patch("agent_voice_input.daemon.send_control_command", side_effect=ConnectionRefusedError("starting")),
+                    mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=ConnectionRefusedError("starting")),
                     mock.patch.object(cli_mod.os, "kill", side_effect=ProcessLookupError(3, "gone")),
                     mock.patch.object(cli_mod.time, "sleep", lambda _s: None),
                     mock.patch.object(cli_mod.time, "monotonic", side_effect=[0.0, 10.0, 20.0, 30.0]),
@@ -450,7 +342,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("agent_voice_input.daemon.create_platform", return_value=plat_pasted),
-                mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_DummyAsr(expected_text)),
+                mock.patch("agent_voice_input.daemon_pipeline.create_asr_provider", return_value=_DummyAsr(expected_text)),
                 redirect_stdout(out1),
                 redirect_stderr(err1),
             ):
@@ -467,7 +359,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("agent_voice_input.daemon.create_platform", return_value=plat_print),
-                mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_DummyAsr(expected_text)),
+                mock.patch("agent_voice_input.daemon_pipeline.create_asr_provider", return_value=_DummyAsr(expected_text)),
                 redirect_stdout(out2),
                 redirect_stderr(err2),
             ):
@@ -482,7 +374,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("agent_voice_input.daemon.create_platform", return_value=plat_clip),
-                mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_DummyAsr(expected_text)),
+                mock.patch("agent_voice_input.daemon_pipeline.create_asr_provider", return_value=_DummyAsr(expected_text)),
                 redirect_stdout(out3),
                 redirect_stderr(err3),
             ):
@@ -497,7 +389,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("agent_voice_input.daemon.create_platform", return_value=plat_once),
-                mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_DummyAsr(expected_text)),
+                mock.patch("agent_voice_input.daemon_pipeline.create_asr_provider", return_value=_DummyAsr(expected_text)),
                 redirect_stdout(out4),
                 redirect_stderr(err4),
             ):

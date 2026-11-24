@@ -2125,7 +2125,7 @@ class PowerResumeAndDaemonLogRotationTests(unittest.TestCase):
             # Error resilience 1: os.open ENOSPC leaves original daemon.log intact and rotation recovers later
             log_path.write_text(payload2, encoding="utf-8")
             with mock.patch(
-                "agent_voice_input.daemon.os.open",
+                "agent_voice_input.control_ipc.os.open",
                 side_effect=OSError(errno.ENOSPC, "No space left on device"),
             ):
                 self.assertFalse(rotate_daemon_log_if_needed(log_path, max_bytes=256, rebind_stdio=False))
@@ -2143,7 +2143,7 @@ class PowerResumeAndDaemonLogRotationTests(unittest.TestCase):
                     raise OSError(errno.ENOSPC, "No space left on device")
                 real_replace(src, dst)
 
-            with mock.patch("agent_voice_input.daemon.os.replace", side_effect=_fail_second_replace):
+            with mock.patch("agent_voice_input.control_ipc.os.replace", side_effect=_fail_second_replace):
                 self.assertFalse(rotate_daemon_log_if_needed(log_path, max_bytes=256, rebind_stdio=False))
             self.assertTrue(log_path.is_file())
             self.assertEqual(log_path.read_text(encoding="utf-8"), payload2)
@@ -2196,7 +2196,7 @@ class PowerResumeAndDaemonLogRotationTests(unittest.TestCase):
                 "    if calls[0] == 2:\n"
                 "        raise OSError(errno.EBADF, 'simulated partial dup2 failure')\n"
                 "    return real_dup2(fd, fd2)\n"
-                "with mock.patch('agent_voice_input.daemon.os.dup2', side_effect=_fail_second_dup2):\n"
+                "with mock.patch('agent_voice_input.control_ipc.os.dup2', side_effect=_fail_second_dup2):\n"
                 "    ok1 = rotate_daemon_log_if_needed(p, max_bytes=128, rebind_stdio=True)\n"
                 "assert ok1 is False\n"
                 "print('STILL_ON_BACKUP', file=sys.stderr, flush=True)\n"

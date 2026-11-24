@@ -14,7 +14,8 @@ from agent_voice_input import __version__  # noqa: E402
 from agent_voice_input.asr_providers import AsrResult, create_asr_provider, load_hotwords_file  # noqa: E402
 from agent_voice_input.audio_proc import _write_temp_0600, list_saved_recordings, process_wav  # noqa: E402
 from agent_voice_input.config import DEFAULT_ASR_BASE_URLS, ensure_secure_dir, expand_user_path, get_runtime_dir, load_config, normalize_asr_provider, normalize_refiner_provider, redact_secrets, resolve_credentials, resolve_saved_recordings_dir, select_asr_provider  # noqa: E402
-from agent_voice_input.daemon import _call_refiner_refine, _may_run_stage2_refiner, _transcribe_wav_chunks, read_telemetry_history  # noqa: E402
+from agent_voice_input.control_ipc import read_telemetry_history  # noqa: E402
+from agent_voice_input.daemon_pipeline import _may_run_stage2_refiner, _transcribe_wav_chunks  # noqa: E402
 from agent_voice_input.refiner import attach_single_hop_context, create_refiner  # noqa: E402
 from agent_voice_input.session_ctx import SessionMatch, SessionTracker, _clean_agy_record, _clean_claude_record, _collect_claude_storage_matches, _collect_codex_storage_matches, _extract_agy_transcript_cwd, _extract_codex_item_completed, _extract_codex_response_item, _is_agy_transcript_subagent, _resolve_agy_transcript_path  # noqa: E402
 
@@ -726,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
                     t_prep0 = time.monotonic()
                     eff_ref.prepare_session(eff_skey)
                     prep_ms = max(0, int(round((time.monotonic() - t_prep0) * 1000)))
-                ref_res = _call_refiner_refine(eff_ref, asr_res, session_key=eff_skey, tracker=tracker, fallback_context=asr_ctx.dialog_text, is_cancelled=None, mode=rec_mode)
+                ref_res = eff_ref.refine(asr_res, session_key=eff_skey, tracker=tracker, fallback_context=asr_ctx.dialog_text, is_cancelled=None, mode=rec_mode)
                 if eff_skey:
                     seen_warm.add(eff_skey)
                 final_txt = ref_res.text.strip() or asr_res.text.strip()

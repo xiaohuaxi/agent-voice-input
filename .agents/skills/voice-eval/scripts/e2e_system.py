@@ -645,18 +645,24 @@ class _ObservingAsrProxy(BaseAsrProvider):
         self.fail_error_msg: str = ""
         self._lock = threading.Lock()
 
-    def transcribe(self, wav_bytes: bytes, *, context: Any = None, is_cancelled: Any = None) -> Any:
+    def transcribe(
+        self,
+        wav_bytes: bytes,
+        context: Any = None,
+        *,
+        is_cancelled: Any = None,
+        cancel_token: Any = None,
+    ) -> Any:
         with self._lock:
             err_msg = self.fail_error_msg
         if err_msg:
             raise RuntimeError(err_msg)
-        if is_cancelled is not None:
-            try:
-                res = self._inner.transcribe(wav_bytes, context=context, is_cancelled=is_cancelled)
-            except TypeError:
-                res = self._inner.transcribe(wav_bytes, context=context)
-        else:
-            res = self._inner.transcribe(wav_bytes, context=context)
+        res = self._inner.transcribe(
+            wav_bytes,
+            context=context,
+            is_cancelled=is_cancelled,
+            cancel_token=cancel_token,
+        )
         with self._lock:
             self.asr_texts.append(res.text.strip())
         return res

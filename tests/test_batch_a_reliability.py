@@ -297,7 +297,7 @@ class TestA1MultiChunkMissedSpeechProtection(unittest.TestCase):
                 tracker=_isolated_tracker(base),
             )
             try:
-                with mock.patch("agent_voice_input.daemon.DEFAULT_MAX_CHUNK_SEC", 1.1):
+                with mock.patch("agent_voice_input.daemon_pipeline.DEFAULT_MAX_CHUNK_SEC", 1.1):
                     daemon.handle_trigger("toggle", plat.fg)
                     daemon._last_trigger_ts = -1e9
                     r_stop = daemon.handle_trigger("toggle", plat.fg)
@@ -335,7 +335,7 @@ class TestA1MultiChunkMissedSpeechProtection(unittest.TestCase):
             )
             try:
                 with (
-                    mock.patch("agent_voice_input.daemon.DEFAULT_MAX_CHUNK_SEC", 1.1),
+                    mock.patch("agent_voice_input.daemon_pipeline.DEFAULT_MAX_CHUNK_SEC", 1.1),
                     mock.patch("agent_voice_input.daemon.save_failed_audio", return_value=None),
                 ):
                     daemon_enospc.handle_trigger("toggle", plat_enospc.fg)
@@ -361,7 +361,7 @@ class TestA1MultiChunkMissedSpeechProtection(unittest.TestCase):
                 tracker=_isolated_tracker(base),
             )
             try:
-                with mock.patch("agent_voice_input.daemon.DEFAULT_MAX_CHUNK_SEC", 1.1):
+                with mock.patch("agent_voice_input.daemon_pipeline.DEFAULT_MAX_CHUNK_SEC", 1.1):
                     daemon_empty.handle_trigger("toggle", plat_all_empty.fg)
                     daemon_empty._last_trigger_ts = -1e9
                     r_stop3 = daemon_empty.handle_trigger("toggle", plat_all_empty.fg)
@@ -1313,7 +1313,7 @@ class TestA5UnifiedDeliveryHudAndDiagnoseContract(unittest.TestCase):
                         if fail_save
                         else mock.patch("agent_voice_input.daemon._LOG_ROTATE_CHECK_INTERVAL_SEC", 60.0)
                     )
-                    with mock.patch("agent_voice_input.daemon.DEFAULT_MAX_CHUNK_SEC", 1.1), save_cm:
+                    with mock.patch("agent_voice_input.daemon_pipeline.DEFAULT_MAX_CHUNK_SEC", 1.1), save_cm:
                         d_pc.handle_trigger("toggle", plat_pc.fg)
                         d_pc._last_trigger_ts = -1e9
                         r = d_pc.handle_trigger("toggle", plat_pc.fg)
@@ -1501,7 +1501,7 @@ class TestA5UnifiedDeliveryHudAndDiagnoseContract(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("agent_voice_input.daemon.create_platform", return_value=_BoomPlat(_voiced_wav(0.6))),
-                mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_SequenceAsr(["CLI重试投递抛错"])),
+                mock.patch("agent_voice_input.daemon_pipeline.create_asr_provider", return_value=_SequenceAsr(["CLI重试投递抛错"])),
                 redirect_stderr(err_buf),
             ):
                 rc_retry = cli_mod.main(["retry", "--refiner", "off"])
@@ -1513,7 +1513,7 @@ class TestA5UnifiedDeliveryHudAndDiagnoseContract(unittest.TestCase):
             with (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("agent_voice_input.daemon.create_platform", return_value=_BoomPlat(_voiced_wav(0.6))),
-                mock.patch("agent_voice_input.daemon.create_asr_provider", return_value=_SequenceAsr(["CLI文件投递抛错"])),
+                mock.patch("agent_voice_input.daemon_pipeline.create_asr_provider", return_value=_SequenceAsr(["CLI文件投递抛错"])),
                 redirect_stderr(err_once),
             ):
                 rc_once = cli_mod.main(["once", "--file", str(ext_wav), "--refiner", "off"])

@@ -82,7 +82,7 @@ class _StubAsr(BaseAsrProvider):
         self.text = text
         self.seen_contexts: list[AsrContext | None] = []
 
-    def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+    def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
         self.seen_contexts.append(context)
         return AsrResult(text=self.text, provider="dashscope", model="qwen3-asr-flash", latency_ms=10)
 
@@ -217,7 +217,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 # 2. Daemon start triggered from mac_shim event (process+bundle_id hint without title/surface_id)
                 #    enriches Ghostty split metadata WITHOUT needing System Events, matches session, and injects!
                 osa_calls.clear()
-                plat.start_recording = lambda _rt, *, loopback=False: None  # type: ignore[method-assign]
+                plat.start_recording = lambda _rt, *, loopback=False, seq_id=None: None  # type: ignore[method-assign]
                 plat.stop_recording = lambda *, drain=True: (_voiced_wav(), "avfoundation")  # type: ignore[method-assign]
                 asr = _StubAsr("安全直投到分屏A")
                 tracker = SessionTracker(home_dir=tmp, env={"HOME": str(tmp)}, runtime_dir=tmp, proc_root=tmp / "noproc")
@@ -689,7 +689,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertNotIn(sensitive_speech, out_priv.reason)
                 self.assertNotIn(secret_token, out_priv.reason)
 
-                plat_priv.start_recording = lambda _rt, *, loopback=False: None  # type: ignore[method-assign]
+                plat_priv.start_recording = lambda _rt, *, loopback=False, seq_id=None: None  # type: ignore[method-assign]
                 plat_priv.stop_recording = lambda *, drain=True: (_voiced_wav(), "avfoundation")  # type: ignore[method-assign]
                 daemon = VoiceInputDaemon(
                     Config(refiner=RefinerConfig(provider="off")),
@@ -1096,7 +1096,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 )
                 plat.hud = lambda state, text="", *, duration_ms=0, **_kw: hud_calls.append(state)  # type: ignore[method-assign]
                 plat.beep = lambda kind: beep_calls.append(kind)  # type: ignore[method-assign]
-                plat.start_recording = lambda _rt, *, loopback=False: rec_starts.append(loopback)  # type: ignore[method-assign]
+                plat.start_recording = lambda _rt, *, loopback=False, seq_id=None: rec_starts.append(loopback)  # type: ignore[method-assign]
                 plat.stop_recording = lambda *, drain=True: (_voiced_wav(), "avfoundation")  # type: ignore[method-assign]
                 plat.cancel_recording = lambda: cancel_calls.append(1)  # type: ignore[method-assign]
 
@@ -2367,7 +2367,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             with (
                 mock.patch.object(cli_mod.sys, "platform", "darwin"),
                 mock.patch(
-                    "agent_voice_input.daemon.send_control_command",
+                    "agent_voice_input.control_ipc.send_control_command",
                     return_value={"ok": True, "pid": 4321, "state": "idle", "shim_ok": True},
                 ),
                 mock.patch("agent_voice_input.platform_macos.compile_mac_shim") as mock_comp_run,
@@ -2404,7 +2404,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             out_fresh, err_fresh = io.StringIO(), io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "darwin"),
-                mock.patch("agent_voice_input.daemon.send_control_command", side_effect=_ctrl_down_then_up),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl_down_then_up),
                 mock.patch("agent_voice_input.platform_macos.compile_mac_shim", return_value=(fake_shim_bin, "")),
                 mock.patch("agent_voice_input.platform_macos.run_mac_shim_self_check", return_value=(True, sc_payload, "")) as mock_sc_fresh,
                 mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
@@ -3998,7 +3998,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             def __init__(self) -> None:
                 pass
 
-            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None) -> AsrResult:
+            def transcribe(self, wav_bytes: bytes, context: AsrContext | None = None, **_kw: object) -> AsrResult:
                 txt = next(asr_items)
                 if txt == "分屏A未贴第一段":
                     s1_gate.wait(timeout=2.0)
@@ -4038,7 +4038,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             tmp = Path(td)
             env = {"HOME": str(tmp), "AGENT_VOICE_INPUT_SWIFTC": "none"}
             plat = MacOSPlatform(Config(refiner=RefinerConfig(provider="off")), env=env, cache_dir=tmp / "cache")
-            plat.start_recording = lambda _rt, *, loopback=False: None  # type: ignore[method-assign]
+            plat.start_recording = lambda _rt, *, loopback=False, seq_id=None: None  # type: ignore[method-assign]
             plat.stop_recording = lambda *, drain=True: (_voiced_wav(), "avfoundation")  # type: ignore[method-assign]
 
             daemon = VoiceInputDaemon(
@@ -4378,7 +4378,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             # Verify end-to-end with VoiceInputDaemon: emits 'error' (never 'copied') and stashes failed WAV!
             hud_seen: list[str] = []
             plat.hud = lambda st, **_kw: hud_seen.append(st)  # type: ignore[method-assign]
-            plat.start_recording = lambda _rt, *, loopback=False: None  # type: ignore[method-assign]
+            plat.start_recording = lambda _rt, *, loopback=False, seq_id=None: None  # type: ignore[method-assign]
             plat.stop_recording = lambda *, drain=True: (_voiced_wav(), "avfoundation")  # type: ignore[method-assign]
             rt_fail = Path(td) / "rt_restore_fail"
             daemon_rf = VoiceInputDaemon(
