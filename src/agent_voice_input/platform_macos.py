@@ -563,8 +563,10 @@ def classify_macos_mic_permission(
     return None
 
 
-def run_mac_shim_self_check(
+def _run_mac_shim_json_mode(
     shim_bin: Path,
+    flag: str,
+    label: str,
     env: Mapping[str, str],
     *,
     cfg: Config | None = None,
@@ -572,7 +574,7 @@ def run_mac_shim_self_check(
 ) -> tuple[bool, dict[str, Any], str]:
     try:
         sc = subprocess.run(
-            [str(shim_bin), "--self-check"],
+            [str(shim_bin), flag],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -583,18 +585,38 @@ def run_mac_shim_self_check(
     except Exception as exc:
         return False, {}, redact_secrets(str(exc), env, cfg=cfg)
     if sc.returncode != 0:
-        raw_err = (sc.stderr or sc.stdout or f"self-check rc={sc.returncode}").strip()
+        raw_err = (sc.stderr or sc.stdout or f"{label} rc={sc.returncode}").strip()
         return False, {}, redact_secrets(raw_err, env, cfg=cfg)
     out = (sc.stdout or "").strip()
     if not out:
-        return False, {}, "empty self-check output"
+        return False, {}, f"empty {label} output"
     try:
         parsed = json.loads(out.splitlines()[-1])
     except ValueError as exc:
-        return False, {}, f"invalid self-check JSON: {redact_secrets(str(exc), env, cfg=cfg)}"
+        return False, {}, f"invalid {label} JSON: {redact_secrets(str(exc), env, cfg=cfg)}"
     if not isinstance(parsed, dict) or parsed.get("ok") is not True:
-        return False, {}, f"unexpected self-check payload: {redact_secrets(repr(parsed), env, cfg=cfg)}"
+        return False, {}, f"unexpected {label} payload: {redact_secrets(repr(parsed), env, cfg=cfg)}"
     return True, parsed, ""
+
+
+def run_mac_shim_self_check(
+    shim_bin: Path,
+    env: Mapping[str, str],
+    *,
+    cfg: Config | None = None,
+    timeout: float = 5.0,
+) -> tuple[bool, dict[str, Any], str]:
+    return _run_mac_shim_json_mode(shim_bin, "--self-check", "self-check", env, cfg=cfg, timeout=timeout)
+
+
+def run_mac_shim_audio_status(
+    shim_bin: Path,
+    env: Mapping[str, str],
+    *,
+    cfg: Config | None = None,
+    timeout: float = 2.0,
+) -> tuple[bool, dict[str, Any], str]:
+    return _run_mac_shim_json_mode(shim_bin, "--audio-status", "audio-status", env, cfg=cfg, timeout=timeout)
 
 
 def probe_macos_host(
@@ -898,7 +920,7 @@ class MacOSPlatform(JsonlShimMixin):
             )
             if bin_path is None:
                 return None
-            sc_ok, sc_json, _sc_err = run_mac_shim_self_check(
+            sc_ok, sc_json, _sc_err = run_mac_shim_audio_status(
                 bin_path, self.env, cfg=self.cfg, timeout=max(1.5, timeout_sec)
             )
             if not sc_ok:
@@ -2327,7 +2349,8 @@ class MacOSPlatform(JsonlShimMixin):
                     used_clipboard_paste=bool(posted_ok and clip_ok),
                 )
             if not clip_ok:
-                return PasteOutcome(False, False, "clipboard_failed", eff_fg_proc, used_clipboard_paste=False)
+                raw_reason = str(res.get("reason") or "clipboard_failed")
+                return PasteOutcome(False, False, raw_reason, eff_fg_proc, used_clipboard_paste=False)
             raw_reason = str(res.get("reason") or "cgevent_failed")
             post_reason = (
                 "accessibility_denied (grant Accessibility permission to your terminal app)"

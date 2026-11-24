@@ -50,6 +50,7 @@ from agent_voice_input.platform_macos import (  # noqa: E402
     parse_avfoundation_audio_devices,
     probe_macos_host,
     resolve_macos_audio_device,
+    run_mac_shim_audio_status,
     run_mac_shim_self_check,
     run_macos_key_test,
 )
@@ -1293,6 +1294,9 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertNotIn("preferredWindowNumber", src)
         self.assertIn("CGWindowLevelForKey(.floatingWindow)", src)
         self.assertIn("private func queryFrontmostWindowCgFrame()", src)
+        cg_frame_start = src.index("private func queryFrontmostWindowCgFrame()")
+        cg_frame_end = src.index("private func parseOptionalBool(", cg_frame_start)
+        self.assertNotIn("AXUIElement", src[cg_frame_start:cg_frame_end])
         self.assertIn("layoutWavePill(forceFrame: true, screenMetrics: preResolvedMetrics)", src)
         self.assertIn("kCGWindowBounds", src)
         self.assertIn("kAXPositionAttribute", src)
@@ -1387,28 +1391,53 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn("windowQueryQueue", src)
         self.assertIn("eventEmitQueue", src)
         self.assertIn("static let defaultMaxCaptureMs: UInt64 = 200", src)
-        self.assertIn("static let maxInFlightCaptures = 2", src)
+        self.assertIn("--pasteboard-worker", src)
+        self.assertIn("--audio-status", src)
+        self.assertIn("private final class PasteboardWorkerClient", src)
+        self.assertIn("private final class CaptureRequestToken", src)
+        self.assertNotIn("cancelledReqIds", src)
+        self.assertIn("kPbReadyMagic", src)
+        self.assertIn("kPbBeginMagic", src)
+        self.assertIn("kPbDoneMagic", src)
+        self.assertIn("kPbMaxItems = 4096", src)
+        self.assertIn("initialObservedChangeCount", src)
+        self.assertIn("resolveClaudeWebAreaDeadlineMs(", src)
+        self.assertIn("handlePostWriteNonPost(", src)
+        self.assertIn("recapturedNewClipboard", src)
+        self.assertIn("DispatchSource.makeProcessSource(", src)
+        self.assertIn("Darwin._exit(0)", src)
+        self.assertIn("avi.pasteboard.worker_io", src)
+        self.assertIn("Darwin.kill(targetPid, SIGKILL)", src)
+        self.assertIn("Darwin.waitpid(targetPid", src)
+        self.assertIn("classifyRawPasteboardItems(", src)
+        self.assertIn("evaluatePreWriteDecision(", src)
+        self.assertIn('"clipboard_worker_failed"', src)
+        self.assertIn("isOwnedClipboardIntact()", src)
+        self.assertIn("armPendingRestoreTimer()", src)
+        self.assertIn("shouldProbeAxForEventKind(", src)
         self.assertIn("lastTimedOutChangeCount", src)
-        self.assertIn("avi.pasteboard.capture", src)
         self.assertIn("captureCurrentReadOnly(", src)
         self.assertIn("writeTransientCheckedAsync(", src)
         self.assertIn("maxRetriesOnChange:", src)
         self.assertIn("maxCaptureMs: UInt64 = PasteboardGuard.defaultMaxCaptureMs", src)
-        self.assertIn("captureSpawnCount", src)
+        self.assertIn("workerKillCount", src)
+        self.assertIn("autoreleasepool", src)
         self.assertIn("isStaleKeyEventTimestamp(", src)
         self.assertIn("mutating func resetForStaleEvent()", src)
         self.assertIn("engine.resetForStaleEvent()", src)
         self.assertNotIn("func writeTransientChecked(", src)
         self.assertNotIn("func writeTransientAndArm(", src)
-        # In paste_cmd_v, async snapshot capture must run BEFORE key_held/focus2 validation, changeCount check,
-        # finishWriteTransient, and post-write focus3 re-verification before finishAfterClipboard
+        # In paste_cmd_v, async snapshot capture must run BEFORE key_held/focus2 validation, shared
+        # evaluatePreWriteDecision, finishWriteTransient, and post-write focus3 re-verification before
+        # finishAfterClipboard; post-write ownership must be checked before Cmd+V / fallback and
+        # restore timer armed strictly after posting.
         paste_case_start = src.index('case "paste_cmd_v":')
         paste_case_end = src.index('case "hud":', paste_case_start)
         paste_case_src = src[paste_case_start:paste_case_end]
         cap_call_idx = paste_case_src.index("pasteboardGuard.captureSnapshotAsync(")
         held_recheck_idx = paste_case_src.index("isHotkeyOrModifierHeld()", cap_call_idx)
         focus2_idx = paste_case_src.index("let focus2 = checkFocus()", cap_call_idx)
-        stale_cc_idx = paste_case_src.index("pasteboardGuard.isCapturedChangeCountStale(", focus2_idx)
+        stale_cc_idx = paste_case_src.index("pasteboardGuard.evaluatePreWriteDecision(", focus2_idx)
         finish_write_idx = paste_case_src.index("pasteboardGuard.finishWriteTransient(", cap_call_idx)
         focus3_idx = paste_case_src.index("let focus3 = checkFocus()", finish_write_idx)
         finish_after_idx = paste_case_src.index("finishAfterClipboard(", focus3_idx)
@@ -1418,6 +1447,10 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertLess(stale_cc_idx, finish_write_idx)
         self.assertLess(finish_write_idx, focus3_idx)
         self.assertLess(focus3_idx, finish_after_idx)
+        self.assertIn("pasteboardGuard.isOwnedClipboardIntact()", paste_case_src)
+        post_idx = paste_case_src.index("postEventsIfWithinDeadline(")
+        arm_timer_idx = paste_case_src.index("pasteboardGuard.armPendingRestoreTimer()")
+        self.assertLess(post_idx, arm_timer_idx)
         # item.data(forType:) must ONLY appear inside the off-main-thread static captureCurrentReadOnly helper
         pbg_start = src.index("final class PasteboardGuard")
         pbg_end = src.index("private func regionHasDistinctForeground", pbg_start)
@@ -2296,6 +2329,21 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertEqual(sc_err, "")
             self.assertEqual(sc_parsed["audio_status"]["mic_auth"], "not_determined")
 
+            # Lightweight --audio-status helper shares strict JSON validation without invoking --self-check
+            fake_as_script = tmp / "audiostatus_shim"
+            fake_as_script.write_text(
+                f"#!{sys.executable}\nimport json, sys\n"
+                f"assert sys.argv[1:] == ['--audio-status'], sys.argv\n"
+                f"print(json.dumps({{'ok': True, 'mode': 'audio-status', 'audio_status': {sc_payload['audio_status']!r}}}))\n",
+                encoding="utf-8",
+            )
+            fake_as_script.chmod(0o755)
+            as_ok, as_parsed, as_err = run_mac_shim_audio_status(fake_as_script, {"HOME": str(tmp)})
+            self.assertTrue(as_ok)
+            self.assertEqual(as_err, "")
+            self.assertEqual(as_parsed["mode"], "audio-status")
+            self.assertEqual(as_parsed["audio_status"]["mic_auth"], "not_determined")
+
             # Strict payload validation: empty output, non-JSON, non-dict, and ok != True MUST fail
             for idx, body in enumerate(
                 [
@@ -2486,7 +2534,8 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             plat_once_gui.close()
 
             # Darwin host fallback isolation: fake _ff_rec (unit test) skips host compile_mac_shim,
-            # while real default FfmpegWavRecorder (_cmd_factory is None) queries run_mac_shim_self_check.
+            # while real default FfmpegWavRecorder (_cmd_factory is None) queries lightweight run_mac_shim_audio_status
+            # (never full run_mac_shim_self_check!).
             plat_mock_iso = MacOSPlatform(Config(), env=cli_env, cache_dir=tmp / "c_iso_mock")
             plat_mock_iso._ff_rec = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", "pass"])
             with (
@@ -2501,15 +2550,17 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 mock.patch("agent_voice_input.platform_macos.sys.platform", "darwin"),
                 mock.patch("agent_voice_input.platform_macos.compile_mac_shim", return_value=(fake_shim_bin, "")) as mock_prod_comp,
                 mock.patch(
-                    "agent_voice_input.platform_macos.run_mac_shim_self_check",
-                    return_value=(True, sc_payload, ""),
-                ) as mock_prod_sc,
+                    "agent_voice_input.platform_macos.run_mac_shim_audio_status",
+                    return_value=(True, {"ok": True, "mode": "audio-status", "audio_status": sc_payload["audio_status"]}, ""),
+                ) as mock_prod_as,
+                mock.patch("agent_voice_input.platform_macos.run_mac_shim_self_check") as mock_prod_sc,
             ):
                 with self.assertRaises(MicrophoneUnavailableError) as prod_once_err:
                     plat_prod_once.start_recording(rt_cli)
             self.assertEqual(prod_once_err.exception.reason_code, "mic_permission")
             mock_prod_comp.assert_called_once()
-            mock_prod_sc.assert_called_once()
+            mock_prod_as.assert_called_once()
+            mock_prod_sc.assert_not_called()
 
             # 6. First-prompt TCC dialog denied AND ffmpeg exits early (_on_recorder_lost):
             #    reports mic_permission (NOT mic_disconnected!), absorbs follow-up toggle,
@@ -2730,6 +2781,11 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(proc.returncode, 0, f"--self-check failed: stderr={proc.stderr!r} stdout={proc.stdout!r}")
+            self.assertNotIn(
+                "synchronous promise fulfillment requested from a background thread",
+                proc.stderr or "",
+                f"--self-check leaked AppKit background promise warning: {proc.stderr!r}",
+            )
             payload = json.loads(proc.stdout.strip())
             self.assertTrue(payload.get("ok"))
             self.assertEqual(payload.get("mode"), "self-check")
@@ -2742,6 +2798,13 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 aud_st.get("mic_auth"),
                 {"authorized", "denied", "restricted", "not_determined", "unknown"},
             )
+
+            as_ok, as_payload, as_err = run_mac_shim_audio_status(bin_path, isolated_env, timeout=5.0)
+            self.assertTrue(as_ok, f"--audio-status failed: {as_err!r}")
+            self.assertEqual(as_payload.get("mode"), "audio-status")
+            as_aud = as_payload.get("audio_status")
+            self.assertIsInstance(as_aud, dict)
+            self.assertIsInstance(as_aud.get("hal_ok"), bool)
 
     def test_real_swiftc_mac_shim_bridge_headless_smoke(self) -> None:
         self._require_macos_swiftc()
@@ -4613,6 +4676,38 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertEqual(osa_cmd_v_calls[0], 0)
                 self.assertEqual(pbcopy_writes, ["超时保留兜底"])
                 self.assertEqual(beeps, ["focus"])
+
+                # 6. Concurrent user Cmd+C (reason="clipboard_changed", clipboard=False) AND worker infrastructure
+                #    failure (reason="clipboard_worker_failed", clipboard=False):
+                #    BOTH preserve user's clipboard (ZERO pbcopy overwrites!) and surface exact shim reason.
+                for safe_reason, seq_no in (("clipboard_changed", 9), ("clipboard_worker_failed", 10)):
+                    pbcopy_writes.clear()
+                    beeps.clear()
+                    plat._shim_rpc = lambda payload, timeout_sec=1.5, _r=safe_reason, **kw: (  # type: ignore[method-assign]
+                        {
+                            "type": "reply",
+                            "reply": "paste_cmd_v",
+                            "ok": True,
+                            "posted": False,
+                            "clipboard": False,
+                            "reason": _r,
+                            "fg_process": "Notes",
+                        }
+                        if payload.get("cmd") == "paste_cmd_v"
+                        else orig_rpc(payload, timeout_sec=timeout_sec, **kw)
+                    )
+                    out_safe = plat.deliver_text(
+                        f"安全保板_{safe_reason}",
+                        seq_id=seq_no,
+                        origin_window=origin,
+                        fallback_clipboard_text="绝不覆盖用户原剪贴板",
+                    )
+                    self.assertFalse(out_safe.pasted)
+                    self.assertFalse(out_safe.clipboard)
+                    self.assertEqual(out_safe.reason, safe_reason)
+                    self.assertEqual(out_safe.fg_process, "Notes")
+                    self.assertEqual(pbcopy_writes, [])
+                    self.assertEqual(osa_cmd_v_calls[0], 0)
             finally:
                 plat.close()
 
