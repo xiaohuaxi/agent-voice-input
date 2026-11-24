@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-24
+
 ### Added
 - **First-class DeepSeek official ASR provider (`asr.provider = "deepseek"`)**: Added built-in DeepSeek Stage 1 speech recognition (`POST https://api.deepseek.com/v1/tools/asr`, default display model `deepseek-asr`, `asr.api = "auto"` only, automatic detection across 21 languages without hotword/language parameters), enabling zero-config two-stage dictation (`deepseek-asr` + `deepseek-flash`) with a single `DEEPSEEK_API_KEY`, and included `deepseek` in `asr.provider = "auto"` priority.
 - **Unified ChatGPT / Codex desktop app detection**: Added dedicated `ai_chat` recognition for the unified ChatGPT/Codex desktop app (`com.openai.codex` / legacy `com.openai.chat` on macOS; `ChatGPT.exe` / `Codex.exe` on Windows) with streaming-title drift handling and window-locked anti-crosstalk.
@@ -187,7 +189,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Initial WSL2 release**: Two-stage context-aware voice input daemon and CLI for coding agents (**Codex**, **Claude Code**, **AGY**) on Windows + WSL2, featuring native `win_shim.ps1` WASAPI capture, global hotkey & HUD bridge, active terminal session discovery, `ffmpeg` loudness normalization with local silence gating, and safe paste without auto-pressing `Enter`.
 
-[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.10.0...v0.11.0

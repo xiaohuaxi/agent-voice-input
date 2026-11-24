@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前已发布基线**：`v0.13.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
+> **当前已发布基线**：`v0.14.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
 >
 > **工程规范与上下文路由架构**：[AGENTS.md](AGENTS.md) · [docs/context-routing.md](docs/context-routing.md)
 
@@ -52,7 +52,24 @@
 
 ---
 
-### 最新发版里程碑（`已发布 · v0.13.0`）
+### 最新发版里程碑（`已发布 · v0.14.0`）
+
+以下 DeepSeek 一等官方 ASR、主流 AI 桌面端（Antigravity 2.0 / ChatGPT & Codex 统一桌面端）深度上下文绑定、性能与桥接防串台加固及双端对称回归验收体系已在 `v0.14.0` 完成落地并正式发布：
+
+1. **DeepSeek 一等官方 ASR 与零推理延迟精修调优**：
+   - 新增内置 `asr.provider = "deepseek"`（`POST https://api.deepseek.com/v1/tools/asr`，默认 `deepseek-asr`，支持 21 语言自动识别并纳入 `asr.provider = "auto"`），仅需一把 `DEEPSEEK_API_KEY` 即可零配置完成两段式口述（`deepseek-asr` + `deepseek-flash`），并统一自定义 `base_url` 与遥测字段契约；
+   - 在二阶段精修系统提示词、`<task_reminder>` 及 `agy` 隔离规则中显式增加零反复推敲指令，降低精修输出延迟；在本地 `SessionTracker` 与 SSH `_remote_probe.py` 中共用字节级快速预过滤，跳过 Claude Code `2.1.330` 巨型非对话 JSONL 记录。
+2. **Antigravity 2.0 与 ChatGPT / Codex 统一桌面端上下文绑定及同窗防串台**：
+   - 支持 Antigravity 2.0 独立桌面版只读 `conversation_summaries.db` 精确/截断前缀标题匹配、工作区 URI 解析（含 WSL `vscode-remote://wsl+...`）、`annotations/*.pbtxt` 前台排序与 `brain/` `50K` 增量缓存，并兼容旧版 VS Code Fork；
+   - 支持 ChatGPT / Codex 统一桌面端（`com.openai.codex` / `ChatGPT.exe` / `Codex.exe`）识别与只读 `~/.codex/sqlite/codex.db` + `~/.codex/sessions/*.jsonl` 绑定：本地仓库任务自动升格为 `agent` 模式并挂载项目热词与增量缓存，云端聊天严守 `general + ai_chat` 零串台，并在双端落字前复核同窗活跃会话防切换串台。
+3. **双端桥接性能、兼容性透明矩阵与自动化真机回归体系**：
+   - `mac_shim.swift` 将 CoreAudio 与无障碍查询卸载到后台串行队列、单屏 HUD 跳过 AX IPC 并引入剪贴板快照/投递截止预算；对齐 `platform_macos.py` 与 `platform_wsl.py` 修饰键与焦点守卫，并更新 `doctor` 支持 `~/.gemini/config/hooks.json` 与 dotfiles 软链；
+   - 在双语 `README` 中新增 `✅` / `🧪` / `⚪` 兼容性与真机验证状态矩阵，明晰原生 Linux 边界、macOS/WSL2 `tmux` 投递差异及 IDE 内置终端边界；
+   - 落地非阻塞 `control.sock` `probe_route` 与隔离的 `selftest_wav`，并在 `.agents/skills/voice-eval/` 中交付对称双端回归套件 `scripts/regress_matrix.py`（三层无头路由矩阵、守护进程健康探活与本机 CLI/DB 只读抽检）及桌面 GUI 端到端回归验收清单。
+
+---
+
+### 已归档里程碑（`已发布 · v0.13.0`）
 
 以下默认模型升级、首屏开箱体验优化、并发与防串台深度加固及跨组件离线 E2E 能力已在 `v0.13.0` 完成落地并正式发布：
 
@@ -147,13 +164,11 @@
 2. **真录音模型横评与原生 Gemini 单跳定向补测**：依托仓外隔离时间点回放基线，系统开展主流 ASR / 精修组合的真录音横向对比评测与原生 Gemini 单跳路径定向补测。
 3. **桌面版全新空会话首轮上下文关联**：在 Antigravity 2.0 与 ChatGPT/Codex 统一桌面端中，新建空对话在首句生成标题前尚无窗口级目录线索，当前保持宁缺毋滥防跨仓串台；后续视桌面端暴露活跃工作区/会话 ID 机制再评估零猜测首轮绑定。
 4. **桌面端后续扩展**：跟进 Claude 桌面版（Chat / Code / Cowork 经浅层 `AXWebArea.AXTitle` 识别并同时兼容 `Claude` 与 `Claude-3p` 目录）及 WSL2 跨系统读取 Windows 宿主机桌面 App 上下文。
-5. **自动化无 GUI 真机回归体系**（`已落地`）：已通过 `.agents/skills/voice-eval/scripts/regress_matrix.py` 落地双端三层对称回归（Layer A 隔离无头全路由矩阵、Layer B 主守护进程 `control.sock` 探活与 `no_telemetry` 自检、Layer C 本机已装 CLI 与桌面端 SQLite 只读兼容性抽检），并由 `tests/test_regress_matrix.py` 覆盖离线门禁回归。
-6. **桌面 GUI 回归验收清单**（`已落地`）：已在 `.agents/skills/voice-eval/SKILL.md` 沉淀标准桌面 App 落字、切换会话与切窗防串台实机验收流程（配合 `regress_matrix.py --deliver-live`），供人工或支持 Computer Use 的 Agent 发版前执行。
-7. **脱离 WSL 的原生 Windows 独立运行**：覆盖未安装 WSL 的纯 Windows 桌面端用户，原生本地直读 Windows 宿主机 `.codex/`、`.gemini/` 与 Claude 会话目录并复用原生 WASAPI 采集与热键/HUD 桥接；针对同时使用 WSL 终端与 Windows 桌面 App 的混合用户，优先评估「原生 Windows 单守护进程 + 轻量 `wsl.exe` 探针（复用现有 SSH 远端探针模型）」的单热键共存架构，避免双系统热键状态机跳跃冲突。
+5. **脱离 WSL 的原生 Windows 独立运行**：覆盖未安装 WSL 的纯 Windows 桌面端用户，原生本地直读 Windows 宿主机 `.codex/`、`.gemini/` 与 Claude 会话目录并复用原生 WASAPI 采集与热键/HUD 桥接；针对同时使用 WSL 终端与 Windows 桌面 App 的混合用户，优先评估「原生 Windows 单守护进程 + 轻量 `wsl.exe` 探针（复用现有 SSH 远端探针模型）」的单热键共存架构，避免双系统热键状态机跳跃冲突。
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
 
-`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.13.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
+`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.14.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
 
 1. **外部用户零门槛开箱**：仅配置任意单一支持语音转写的主流渠道 API Key（可自动搭配本地 CLI 登录态或独立二阶段凭据），即可通过 `init` 与 `doctor --ping` 完成体检并稳定投入日常使用。
 2. **全场景安全投递与零串台**：本地终端、跨机 SSH 远端 Linux、主流桌面 IDE、普通桌面 GUI 应用与远程桌面自动让行均长期稳定运行；跨场景上下文严格隔离，系统剪贴板零意外污染，全链路严守不自动发送回车。

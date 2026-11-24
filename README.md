@@ -90,7 +90,7 @@ Please install and configure agent-voice-input (https://github.com/xiaohuaxi/age
 4. Run `agent-voice-input doctor --ping`, then start the background daemon with `agent-voice-input start`.
 ```
 
-### Path B: Manual Setup in 3 Steps (`v0.13.0`)
+### Path B: Manual Setup in 3 Steps (`v0.14.0`)
 
 ```bash
 # 1. Install ffmpeg + CLI (WSL2: `sudo apt install ffmpeg` | macOS: `brew install ffmpeg` + `xcode-select --install`)
@@ -103,7 +103,7 @@ agent-voice-input init
 agent-voice-input doctor --ping && agent-voice-input start
 ```
 
-> MacBook keyboards without a Right Ctrl key can set `key = "ROption"` or `"Fn"` under `[hotkey]` in `~/.config/agent-voice-input/config.toml` and run `agent-voice-input restart`. Full templates: [`v0.13.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.13.0/config.example.toml) ([`main`](config.example.toml)) and [`v0.13.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.13.0/config.example.env) ([`main`](config.example.env)).
+> MacBook keyboards without a Right Ctrl key can set `key = "ROption"` or `"Fn"` under `[hotkey]` in `~/.config/agent-voice-input/config.toml` and run `agent-voice-input restart`. Full templates: [`v0.14.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.14.0/config.example.toml) ([`main`](config.example.toml)) and [`v0.14.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.14.0/config.example.env) ([`main`](config.example.env)).
 
 ### Recommended Provider Combinations by Scenario
 
