@@ -95,13 +95,22 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
             (pkg / "a.py").write_text("X = 2\n", encoding="utf-8")
             bid2 = compute_package_build_id(pkg)
             self.assertNotEqual(bid1, bid2)
-            # Editing bridge assets (mac_shim.swift / win_shim.ps1) also changes fingerprint
-            (pkg / "mac_shim.swift").write_text("let v = 1\n", encoding="utf-8")
+            # Editing bridge assets (mac_shim/*.swift / win_shim.ps1) also changes fingerprint
+            mac_dir = pkg / "mac_shim"
+            mac_dir.mkdir()
+            (mac_dir / "BridgeMain.swift").write_text("let v = 1\n", encoding="utf-8")
             bid3 = compute_package_build_id(pkg)
             self.assertNotEqual(bid2, bid3)
+            # Editing/adding another Swift file under mac_shim/ also changes fingerprint
+            (mac_dir / "HotkeyEngine.swift").write_text("let k = 1\n", encoding="utf-8")
+            bid3b = compute_package_build_id(pkg)
+            self.assertNotEqual(bid3, bid3b)
+            (mac_dir / "HotkeyEngine.swift").write_text("let k = 2\n", encoding="utf-8")
+            bid3c = compute_package_build_id(pkg)
+            self.assertNotEqual(bid3b, bid3c)
             (pkg / "win_shim.ps1").write_text("$v = 1\n", encoding="utf-8")
             bid4 = compute_package_build_id(pkg)
-            self.assertNotEqual(bid3, bid4)
+            self.assertNotEqual(bid3c, bid4)
 
             # Drift matrix
             same = describe_daemon_drift(

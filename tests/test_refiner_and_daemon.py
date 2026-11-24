@@ -506,10 +506,10 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         )
         pkg_data = data["tool"]["setuptools"]["package-data"]["agent_voice_input"]
         self.assertIn("win_shim.ps1", pkg_data)
-        self.assertIn("mac_shim.swift", pkg_data)
+        self.assertIn("mac_shim/*.swift", pkg_data)
         manifest_raw = (_REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
         self.assertIn("win_shim.ps1", manifest_raw)
-        self.assertIn("mac_shim.swift", manifest_raw)
+        self.assertIn("recursive-include src/agent_voice_input/mac_shim *.swift", manifest_raw)
         self.assertIn("prune .agents", manifest_raw)
         self.assertIn("prune .claude", manifest_raw)
         self.assertTrue(SHIM_SCRIPT.is_file())

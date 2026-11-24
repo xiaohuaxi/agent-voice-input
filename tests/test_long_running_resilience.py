@@ -51,6 +51,7 @@ from agent_voice_input.http_transport import (  # noqa: E402
     urllib_http_transport,
 )
 from agent_voice_input.platform_common import ForegroundWindow  # noqa: E402
+from agent_voice_input.platform_macos import read_mac_shim_source  # noqa: E402
 from agent_voice_input.refiner import BaseRefiner, RefinerResult, _InstanceKeepAlivePool  # noqa: E402
 from agent_voice_input.session_ctx import SessionMatch, SessionTracker  # noqa: E402
 
@@ -2038,7 +2039,6 @@ class PowerResumeAndDaemonLogRotationTests(unittest.TestCase):
 
     def test_power_resume_bridge_contracts_in_win_and_mac_shims(self) -> None:
         win_path = REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1"
-        mac_path = REPO_ROOT / "src" / "agent_voice_input" / "mac_shim.swift"
         win_bytes = win_path.read_bytes()
         self.assertTrue(all(b < 0x80 for b in win_bytes), "win_shim.ps1 must stay strictly 7-bit ASCII")
 
@@ -2056,7 +2056,7 @@ class PowerResumeAndDaemonLogRotationTests(unittest.TestCase):
         ):
             self.assertIn(token, win_txt)
 
-        mac_txt = mac_path.read_text(encoding="utf-8")
+        mac_txt = read_mac_shim_source()
         for token in (
             "NSWorkspace.didWakeNotification",
             "resetForPowerResume",

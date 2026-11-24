@@ -1,4 +1,4 @@
-"""macOS native bridge: AVFoundation capture, Ghostty split-aware input, and mac_shim.swift hotkey/HUD."""
+"""macOS native bridge: AVFoundation capture, Ghostty split-aware input, and mac_shim hotkey/HUD."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -55,8 +55,23 @@ from .session_ctx import (
     parse_window_title_hint,
 )
 
-MAC_SHIM_SCRIPT = Path(__file__).resolve().with_name("mac_shim.swift")
+MAC_SHIM_DIR = Path(__file__).resolve().with_name("mac_shim")
 SHIM_SCHEMA_VERSION = 5
+
+
+def list_mac_shim_sources(swift_source: Path = MAC_SHIM_DIR) -> list[Path]:
+    if swift_source.is_dir():
+        return sorted(p for p in swift_source.glob("*.swift") if p.is_file())
+    if swift_source.is_file():
+        return [swift_source]
+    return []
+
+
+def read_mac_shim_source(swift_source: Path = MAC_SHIM_DIR) -> str:
+    sources = list_mac_shim_sources(swift_source)
+    if not sources:
+        raise FileNotFoundError(f"mac_shim Swift sources not found at {swift_source}")
+    return "\n".join(p.read_text(encoding="utf-8") for p in sources)
 SOUND_MAP = {"start": "Tink.aiff", "stop": "Pop.aiff", "focus": "Glass.aiff", "error": "Basso.aiff"}
 
 _APPLE_SEP = "\x1f"
@@ -386,21 +401,33 @@ def compile_mac_shim(
     *,
     env: Mapping[str, str] | None = None,
     cache_dir: Path | None = None,
-    swift_source: Path = MAC_SHIM_SCRIPT,
+    swift_source: Path = MAC_SHIM_DIR,
     swiftc_bin: str | None = None,
     cfg: Config | None = None,
     announce: bool = False,
 ) -> tuple[Path | None, str]:
     src_env = os.environ if env is None else env
-    if not swift_source.is_file():
-        return None, f"mac_shim.swift not found at {swift_source}"
+    source_files = list_mac_shim_sources(swift_source)
+    if not source_files:
+        return None, f"mac_shim Swift sources not found at {swift_source}"
+    h = hashlib.sha256()
+    h.update(f"schema={SHIM_SCHEMA_VERSION}\n".encode("utf-8"))
+    is_dir_source = swift_source.is_dir()
     try:
-        src_bytes = swift_source.read_bytes()
+        for src_path in source_files:
+            rel_name = src_path.relative_to(swift_source).as_posix() if is_dir_source else src_path.name
+            raw = src_path.read_bytes()
+            h.update(rel_name.encode("utf-8"))
+            h.update(b"\0")
+            h.update(str(len(raw)).encode("ascii"))
+            h.update(b"\0")
+            h.update(raw)
+            h.update(b"\0")
     except OSError as exc:
         return None, redact_secrets(f"cannot read {swift_source}: {exc}", src_env, cfg=cfg)
 
     arch = (py_platform.machine() or "unknown").lower()
-    digest = hashlib.sha256(f"schema={SHIM_SCHEMA_VERSION}\n".encode("utf-8") + src_bytes).hexdigest()[:16]
+    digest = h.hexdigest()[:16]
     try:
         target_dir = ensure_secure_dir(cache_dir if cache_dir is not None else get_macos_cache_dir(src_env, create=False))
     except Exception as exc:
@@ -428,7 +455,8 @@ def compile_mac_shim(
         tmp_path = target_dir / f".{bin_name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
         mod_cache = ensure_secure_dir(target_dir / "swift-modcache")
         cmd = [
-            eff_swiftc, "-O", "-parse-as-library", "-module-cache-path", str(mod_cache), str(swift_source),
+            eff_swiftc, "-O", "-parse-as-library", "-module-cache-path", str(mod_cache),
+            *(str(p) for p in source_files),
             "-framework", "AppKit", "-framework", "ApplicationServices", "-framework", "CoreAudio",
             "-framework", "AVFoundation", "-framework", "Security",
             "-o", str(tmp_path),

@@ -732,7 +732,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
         self.assertIn("windows-latest", ci_txt)
         self.assertIn("-Mode self-check", ci_txt)
         for wf_name, wf_txt in (("ci.yml", ci_txt), ("publish.yml", pub_txt)):
-            self.assertIn("agent_voice_input/mac_shim.swift", wf_txt, wf_name)
+            self.assertIn("agent_voice_input/mac_shim/BridgeMain.swift", wf_txt, wf_name)
             self.assertIn("agent_voice_input/_remote_probe.py", wf_txt, wf_name)
             self.assertIn("agent_voice_input/remote_ssh.py", wf_txt, wf_name)
             for mod_rel in (
@@ -742,7 +742,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
                 "agent_voice_input/workspace_ctx.py",
             ):
                 self.assertIn(mod_rel, wf_txt, wf_name)
-            self.assertIn("/src/agent_voice_input/mac_shim.swift", wf_txt, wf_name)
+            self.assertIn("/src/agent_voice_input/mac_shim/BridgeMain.swift", wf_txt, wf_name)
             self.assertIn("/src/agent_voice_input/_remote_probe.py", wf_txt, wf_name)
             self.assertIn("/src/agent_voice_input/remote_ssh.py", wf_txt, wf_name)
             self.assertIn("/docs/context-routing.md", wf_txt, wf_name)

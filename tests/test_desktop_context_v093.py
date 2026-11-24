@@ -48,7 +48,7 @@ from agent_voice_input.daemon import (  # noqa: E402
     build_pipeline_summary,
     run_pipeline_once,
 )
-from agent_voice_input.platform_macos import MAC_SHIM_SCRIPT, SHIM_SCHEMA_VERSION, MacOSPlatform, _APPLE_SEP  # noqa: E402
+from agent_voice_input.platform_macos import SHIM_SCHEMA_VERSION, MacOSPlatform, _APPLE_SEP, read_mac_shim_source  # noqa: E402
 from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome, WslPlatform  # noqa: E402
 from agent_voice_input.prompts import (  # noqa: E402
     REFINER_GENERAL_SYSTEM_PROMPT,
@@ -216,7 +216,7 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
 
     def test_macos_ax_document_shim_and_osascript_compat(self) -> None:
         self.assertEqual(SHIM_SCHEMA_VERSION, 5)
-        shim_src = MAC_SHIM_SCRIPT.read_text(encoding="utf-8")
+        shim_src = read_mac_shim_source()
         self.assertIn("kAXDocumentAttribute", shim_src)
         self.assertNotIn("import Carbon", shim_src)
         self.assertNotIn("requestAccess", shim_src)

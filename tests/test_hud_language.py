@@ -43,6 +43,7 @@ from agent_voice_input.hud import (  # noqa: E402
     resolve_ui_language,
 )
 from agent_voice_input.platform_macos import (  # noqa: E402
+    read_mac_shim_source,
     MacOSPlatform,
     probe_macos_host,
 )
@@ -1055,7 +1056,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         shim_terms = {item.strip().strip('"').strip("'") for item in m.group(1).split(",") if item.strip()}
         self.assertEqual(shim_terms, set(WINDOWS_TERMINALS))
 
-        # Dynamic waveform & recording duration contract across win_shim.ps1 and mac_shim.swift
+        # Dynamic waveform & recording duration contract across win_shim.ps1 and mac_shim/*.swift
         for sym in (
             "FormatRecordingDuration(",
             "DurationSlotTemplate(",
@@ -1068,7 +1069,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
         ):
             self.assertIn(sym, shim)
 
-        mac_shim = (_REPO_ROOT / "src" / "agent_voice_input" / "mac_shim.swift").read_text(encoding="utf-8")
+        mac_shim = read_mac_shim_source()
         for sym in (
             "func formatRecordingDuration(",
             "func durationSlotTemplate(",

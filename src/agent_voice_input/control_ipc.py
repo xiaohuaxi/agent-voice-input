@@ -30,7 +30,8 @@ CONTROL_RESPONSE_MAX_BYTES: int = 1_048_576
 CONTROL_REQUEST_MAX_BYTES: int = 256 * 1024
 CONTROL_REQUEST_READ_TIMEOUT_SEC: float = 2.0
 CONTROL_MAX_TIMEOUT_SEC: float = 86_400.0
-_BRIDGE_ASSET_NAMES: tuple[str, ...] = ("mac_shim.swift", "win_shim.ps1")
+_BRIDGE_ASSET_NAMES: tuple[str, ...] = ("win_shim.ps1",)
+_BRIDGE_ASSET_GLOBS: tuple[tuple[str, str], ...] = (("mac_shim", "*.swift"),)
 
 _WINDOW_REQ_KEYS: tuple[str, ...] = (
     "hwnd",
@@ -544,16 +545,22 @@ def compute_package_build_id(pkg_dir: Path | None = None) -> str:
     root = pkg_dir if pkg_dir is not None else Path(__file__).resolve().parent
     h = hashlib.sha256()
     try:
-        candidates: list[Path] = sorted(root.glob("*.py"))
+        candidates: list[tuple[str, Path]] = [(p.name, p) for p in root.glob("*.py") if p.is_file()]
         for asset in _BRIDGE_ASSET_NAMES:
             ap = root / asset
             if ap.is_file():
-                candidates.append(ap)
-        candidates.sort(key=lambda p: p.name)
-        for path in candidates:
+                candidates.append((asset, ap))
+        for subdir, pattern in _BRIDGE_ASSET_GLOBS:
+            ad = root / subdir
+            if ad.is_dir():
+                for ap in ad.glob(pattern):
+                    if ap.is_file():
+                        candidates.append((ap.relative_to(root).as_posix(), ap))
+        candidates.sort(key=lambda item: item[0])
+        for rel_name, path in candidates:
             if not path.is_file():
                 continue
-            h.update(path.name.encode("utf-8"))
+            h.update(rel_name.encode("utf-8"))
             h.update(b"\0")
             h.update(path.read_bytes())
             h.update(b"\0")

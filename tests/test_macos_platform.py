@@ -34,7 +34,7 @@ from agent_voice_input.platform_macos import (  # noqa: E402
     GHOSTTY_BUNDLE_ID,
     MACOS_TERMINALS,
     MACOS_TERMINAL_BUNDLE_IDS,
-    MAC_SHIM_SCRIPT,
+    MAC_SHIM_DIR,
     MacOSPlatform,
     SHIM_SCHEMA_VERSION,
     _APPLE_SEP,
@@ -47,8 +47,10 @@ from agent_voice_input.platform_macos import (  # noqa: E402
     get_macos_cache_dir,
     is_apple_terminal_app,
     is_macos_terminal_window,
+    list_mac_shim_sources,
     parse_avfoundation_audio_devices,
     probe_macos_host,
+    read_mac_shim_source,
     resolve_macos_audio_device,
     run_mac_shim_audio_status,
     run_mac_shim_self_check,
@@ -505,6 +507,66 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertNotEqual(b3, b1)
             self.assertTrue(b3.is_file())
             self.assertFalse(b1.exists())
+
+            # Multi-file Swift source directory: sorted invocation, warm cache hit, content/rename/add/delete invalidation, empty-dir error
+            multi_dir = tmp / "multi_shim"
+            multi_dir.mkdir()
+            empty_b, empty_e = compile_mac_shim(
+                env={"HOME": str(tmp)},
+                cache_dir=cache_dir,
+                swift_source=multi_dir,
+                swiftc_bin=str(fake_swiftc),
+            )
+            self.assertIsNone(empty_b)
+            self.assertIn("not found", empty_e)
+            with self.assertRaises(FileNotFoundError):
+                read_mac_shim_source(multi_dir)
+
+            (multi_dir / "B.swift").write_text("let b = 2\n", encoding="utf-8")
+            (multi_dir / "A.swift").write_text("let a = 1\n", encoding="utf-8")
+            seen_dir_cmds: list[list[str]] = []
+
+            def _spy_dir_swiftc(cmd, **_kw):
+                seen_dir_cmds.append(list(cmd))
+                out = Path(cmd[cmd.index("-o") + 1])
+                out.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            dir_cache = tmp / "dir_cache"
+            with mock.patch("agent_voice_input.platform_macos.subprocess.run", side_effect=_spy_dir_swiftc):
+                d1, de1 = compile_mac_shim(env={"HOME": str(tmp)}, cache_dir=dir_cache, swift_source=multi_dir, swiftc_bin="/opt/mock/swiftc")
+                self.assertEqual(de1, "")
+                assert d1 is not None
+                self.assertEqual(len(seen_dir_cmds), 1)
+                swift_args = [a for a in seen_dir_cmds[0] if a.endswith(".swift")]
+                self.assertEqual([Path(a).name for a in swift_args], ["A.swift", "B.swift"])
+
+                # Warm cache hit
+                d1_warm, de1_warm = compile_mac_shim(env={"HOME": str(tmp)}, cache_dir=dir_cache, swift_source=multi_dir, swiftc_bin="/opt/mock/swiftc")
+                self.assertEqual(de1_warm, "")
+                self.assertEqual(d1_warm, d1)
+                self.assertEqual(len(seen_dir_cmds), 1)
+
+                # Modifying one file invalidates hash
+                (multi_dir / "B.swift").write_text("let b = 3\n", encoding="utf-8")
+                d2, de2 = compile_mac_shim(env={"HOME": str(tmp)}, cache_dir=dir_cache, swift_source=multi_dir, swiftc_bin="/opt/mock/swiftc")
+                self.assertEqual(de2, "")
+                assert d2 is not None and d2 != d1
+                self.assertFalse(d1.exists())
+
+                # Renaming a file (same content!) invalidates hash
+                (multi_dir / "B.swift").rename(multi_dir / "C.swift")
+                d3, de3 = compile_mac_shim(env={"HOME": str(tmp)}, cache_dir=dir_cache, swift_source=multi_dir, swiftc_bin="/opt/mock/swiftc")
+                self.assertEqual(de3, "")
+                assert d3 is not None and d3 != d2
+                self.assertFalse(d2.exists())
+
+                # Adding a file invalidates hash
+                (multi_dir / "D.swift").write_text("let d = 4\n", encoding="utf-8")
+                d4, de4 = compile_mac_shim(env={"HOME": str(tmp)}, cache_dir=dir_cache, swift_source=multi_dir, swiftc_bin="/opt/mock/swiftc")
+                self.assertEqual(de4, "")
+                assert d4 is not None and d4 != d3
+                self.assertFalse(d3.exists())
 
             # 4. Managed bridge lifecycle: hotkey events, HUD RPC, crash self-healing, and clean shutdown
             mock_bridge = (
@@ -1219,8 +1281,9 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
 
     def test_mac_shim_static_invariants(self) -> None:
         self.assertEqual(SHIM_SCHEMA_VERSION, 5)
-        self.assertTrue(MAC_SHIM_SCRIPT.is_file())
-        src = MAC_SHIM_SCRIPT.read_text(encoding="utf-8")
+        self.assertTrue(MAC_SHIM_DIR.is_dir())
+        self.assertEqual(len(list_mac_shim_sources()), 8)
+        src = read_mac_shim_source()
         self.assertNotIn("import Carbon", src)
         self.assertIn("AVI_INJECT_TAG", src)
         self.assertIn("paste_cmd_v", src)
@@ -1293,10 +1356,10 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertIn("func selectFrontmostWindowCgFrame(", src)
         self.assertNotIn("preferredWindowNumber", src)
         self.assertIn("CGWindowLevelForKey(.floatingWindow)", src)
-        self.assertIn("private func queryFrontmostWindowCgFrame()", src)
-        cg_frame_start = src.index("private func queryFrontmostWindowCgFrame()")
-        cg_frame_end = src.index("private func parseOptionalBool(", cg_frame_start)
-        self.assertNotIn("AXUIElement", src[cg_frame_start:cg_frame_end])
+        wp_src = (MAC_SHIM_DIR / "WindowProbe.swift").read_text(encoding="utf-8")
+        self.assertIn("private func queryFrontmostWindowCgFrame()", wp_src)
+        cg_frame_start = wp_src.index("private func queryFrontmostWindowCgFrame()")
+        self.assertNotIn("AXUIElement", wp_src[cg_frame_start:])
         self.assertIn("layoutWavePill(forceFrame: true, screenMetrics: preResolvedMetrics)", src)
         self.assertIn("kCGWindowBounds", src)
         self.assertIn("kAXPositionAttribute", src)
@@ -1448,10 +1511,10 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertLess(write_idx, post_idx)
         self.assertLess(post_idx, arm_timer_idx)
         # item.data(forType:) must ONLY appear inside the isolated static captureCurrentReadOnly helper
-        pbg_start = src.index("final class PasteboardGuard")
-        pbg_end = src.index("private func regionHasDistinctForeground", pbg_start)
-        pbg_src = src[pbg_start:pbg_end]
-        cap_start = pbg_src.index("fileprivate static func captureCurrentReadOnly(")
+        cg_src = (MAC_SHIM_DIR / "ClipboardGuard.swift").read_text(encoding="utf-8")
+        pbg_start = cg_src.index("final class PasteboardGuard")
+        pbg_src = cg_src[pbg_start:]
+        cap_start = pbg_src.index("static func captureCurrentReadOnly(")
         cap_end = pbg_src.index("func writePersistentFallback(", cap_start)
         cap_body = pbg_src[cap_start:cap_end]
         pbg_outside_cap = pbg_src[:cap_start] + pbg_src[cap_end:]
@@ -2741,7 +2804,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
 
     def _require_macos_swiftc(self) -> None:
         if sys.platform != "darwin":
-            self.skipTest("macOS required for native mac_shim.swift test")
+            self.skipTest("macOS required for native mac_shim test")
         has_swiftc = bool(os.path.isfile("/usr/bin/swiftc") or shutil.which("swiftc"))
         clt_ok, clt_err = check_macos_clt_ready()
         if not has_swiftc or not clt_ok:
@@ -2761,7 +2824,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 "AGENT_VOICE_INPUT_CACHE_DIR": str(tmp / "shim_cache"),
             }
             bin_path, err = compile_mac_shim(env=isolated_env, cache_dir=tmp / "shim_cache")
-            self.assertEqual(err, "", f"mac_shim.swift failed to compile: {err}")
+            self.assertEqual(err, "", f"mac_shim failed to compile: {err}")
             self.assertIsNotNone(bin_path)
             assert bin_path is not None
             self.assertTrue(bin_path.is_file())
@@ -2812,7 +2875,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 "AGENT_VOICE_INPUT_CACHE_DIR": str(tmp / "shim_cache"),
             }
             bin_path, err = compile_mac_shim(env=isolated_env, cache_dir=tmp / "shim_cache")
-            self.assertEqual(err, "", f"mac_shim.swift failed to compile: {err}")
+            self.assertEqual(err, "", f"mac_shim failed to compile: {err}")
             assert bin_path is not None
 
             proc = subprocess.Popen(

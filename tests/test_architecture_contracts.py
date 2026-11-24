@@ -21,6 +21,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from agent_voice_input import hud as hud_mod  # noqa: E402
+from agent_voice_input.platform_macos import read_mac_shim_source  # noqa: E402
 from agent_voice_input.app_scope import (  # noqa: E402
     DEDICATED_SSH_CLIENT_PATTERNS,
     MACOS_TERMINAL_BUNDLE_IDS,
@@ -672,7 +673,7 @@ def outer(helper):
 class TestHudCrossPlatformContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.mac_swift = (PKG_DIR / "mac_shim.swift").read_text(encoding="utf-8")
+        cls.mac_swift = read_mac_shim_source()
         cls.win_ps1 = (PKG_DIR / "win_shim.ps1").read_text(encoding="utf-8")
 
     def test_hud_layer_routing_matches_across_python_macos_and_windows(self) -> None:
@@ -723,7 +724,7 @@ class TestHudCrossPlatformContracts(unittest.TestCase):
     def test_hud_visual_states_and_durations_match_across_three_ends(self) -> None:
         expected_visual_states = {"recording"} | set(hud_mod._STATIC_HUD_COPY.keys())
 
-        # Parse mac_shim.swift resolveHudVisualStyle switch cases and autoHideMs
+        # Parse mac_shim resolveHudVisualStyle switch cases and autoHideMs
         m_mac_style = re.search(
             r"func resolveHudVisualStyle\([^{]+\{(.*?)\n\}",
             self.mac_swift,
