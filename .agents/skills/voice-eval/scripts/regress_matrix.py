@@ -1643,6 +1643,69 @@ def _resolve_live_wav(
     return Path(item["wav_path"]), float(item["duration_sec"]), True
 
 
+def _extract_foreground_app_from_probe(resp: Mapping[str, Any]) -> tuple[str, str]:
+    """Extract (app_name/process, bundle_id) from a live probe_route response when present."""
+    actual_app = ""
+    for key in ("app_name", "process", "fg_process"):
+        val = str(resp.get(key) or "").strip()
+        if val:
+            actual_app = val
+            break
+    actual_bundle_id = ""
+    for key in ("bundle_id", "fg_bundle_id"):
+        val = str(resp.get(key) or "").strip()
+        if val:
+            actual_bundle_id = val
+            break
+    return actual_app, actual_bundle_id
+
+
+def _query_live_foreground_app(cfg: Config, env: Mapping[str, str]) -> tuple[str, str]:
+    """Read-only host foreground app fallback when daemon probe_route omits app_name/bundle_id."""
+    try:
+        if sys.platform == "darwin":
+            from agent_voice_input.platform_macos import MacOSPlatform
+
+            app_name, bundle_id, _, _ = MacOSPlatform(cfg, env=env)._query_frontmost_process_and_title()
+            return str(app_name or "").strip(), str(bundle_id or "").strip()
+        if _effective_is_wsl(env=env):
+            from agent_voice_input.platform_wsl import probe_wsl_host
+
+            info = probe_wsl_host(cfg, env)
+            return str(info.get("fg_process") or "").strip(), ""
+    except Exception:
+        pass
+    return "", ""
+
+
+def _match_expected_app(
+    expect_app: str,
+    *,
+    actual_app: str = "",
+    actual_bundle_id: str = "",
+) -> bool:
+    """Case-insensitive exact match against actual bundle_id or app_name/process (with .exe stem)."""
+    exp = expect_app.strip().lower()
+    if not exp:
+        return True
+    candidates: set[str] = set()
+    bid = actual_bundle_id.strip().lower()
+    if bid:
+        candidates.add(bid)
+    app = actual_app.strip().lower()
+    if app:
+        candidates.add(app)
+        if app.endswith(".exe") and len(app) > 4:
+            candidates.add(app[:-4])
+    if not candidates:
+        return False
+    if exp in candidates:
+        return True
+    if exp.endswith(".exe") and len(exp) > 4 and exp[:-4] in candidates:
+        return True
+    return False
+
+
 def run_layer_b_live_daemon(
     cfg: Config,
     raw_env: Mapping[str, str],
@@ -1656,6 +1719,7 @@ def run_layer_b_live_daemon(
     deliver_live: bool,
     delay_sec: float,
     show_text: bool,
+    expect_app: str = "",
 ) -> list[dict[str, Any]]:
     """Layer B: connect to host running daemon control.sock without restarting or disturbing it."""
     checks: list[dict[str, Any]] = []
@@ -1816,26 +1880,87 @@ def run_layer_b_live_daemon(
     if delay_sec > 0.0:
         time.sleep(delay_sec)
 
+    r_live: dict[str, Any] = {}
+    r_live_ok = False
+    r_live_err = ""
     try:
         r_live = send_control_command(rt_dir, {"cmd": "probe_route", "use_live_window": True}, timeout_sec=5.0)
+        r_live_ok = bool(r_live.get("ok") is True)
         checks.append(
             _check_asserts(
                 "B2_probe_route_live_window",
                 "B",
                 r_live,
                 [
-                    ("ok", r_live.get("ok") is True),
+                    ("ok", r_live_ok),
                     ("mode_valid", r_live.get("mode") in ("agent", "general")),
                 ],
             )
         )
     except Exception as exc:
-        checks.append(_make_check("B2_probe_route_live_window", "B", "FAIL", redact_fn(exc)))
+        r_live_err = redact_fn(exc)
+        checks.append(_make_check("B2_probe_route_live_window", "B", "FAIL", r_live_err))
 
     # B3: selftest_wav (dry-run by default, or opt-in --deliver-live)
     if skip_selftest_wav and not deliver_live:
         checks.append(_make_check("B3_selftest_wav", "B", "SKIP", "skipped via --skip-selftest-wav"))
         return checks
+
+    exp_app_norm = expect_app.strip()
+    actual_app = ""
+    actual_bundle_id = ""
+    if deliver_live and exp_app_norm:
+        if not r_live_ok:
+            reason = r_live_err or redact_fn(r_live.get("error") or "probe_route returned ok=False")
+            checks.append(
+                _make_check(
+                    check_name,
+                    "B",
+                    "FAIL",
+                    (
+                        f"aborted --deliver-live without pasting: live probe_route failed before "
+                        f"verifying expected_app={redact_fn(exp_app_norm)!r} ({reason})"
+                    ),
+                    {
+                        "aborted_before_deliver": True,
+                        "expected_app": exp_app_norm,
+                        "actual_app": "",
+                        "actual_bundle_id": "",
+                        "pasted": False,
+                        "clipboard": False,
+                    },
+                )
+            )
+            return checks
+        actual_app, actual_bundle_id = _extract_foreground_app_from_probe(r_live)
+        if not actual_app and not actual_bundle_id:
+            actual_app, actual_bundle_id = _query_live_foreground_app(cfg, clean_env)
+        if not _match_expected_app(
+            exp_app_norm,
+            actual_app=actual_app,
+            actual_bundle_id=actual_bundle_id,
+        ):
+            checks.append(
+                _make_check(
+                    check_name,
+                    "B",
+                    "FAIL",
+                    redact_fn(
+                        f"foreground app mismatch before --deliver-live (aborted without pasting): "
+                        f"expected_app={exp_app_norm!r} actual_app={actual_app!r} "
+                        f"actual_bundle_id={actual_bundle_id!r}"
+                    ),
+                    {
+                        "aborted_before_deliver": True,
+                        "expected_app": exp_app_norm,
+                        "actual_app": actual_app,
+                        "actual_bundle_id": actual_bundle_id,
+                        "pasted": False,
+                        "clipboard": False,
+                    },
+                )
+            )
+            return checks
 
     assert wav_info is not None
     wav_path, dur_sec, used_tts = wav_info
@@ -1889,6 +2014,14 @@ def run_layer_b_live_daemon(
                 "delivery_status": str(res_st.get("delivery_status") or ""),
             }
         )
+        if exp_app_norm:
+            b3_metrics.update(
+                {
+                    "expected_app": exp_app_norm,
+                    "actual_app": actual_app,
+                    "actual_bundle_id": actual_bundle_id,
+                }
+            )
     if show_text:
         b3_metrics["asr_text"] = redact_fn(res_st.get("asr_text") or "")
         b3_metrics["final_text"] = redact_fn(res_st.get("final_text") or "")
@@ -2620,7 +2753,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--deliver-live",
         action="store_true",
-        help="Opt-in Layer B GUI E2E delivery (selftest_wav with use_live_window=True, deliver=True, no_telemetry=True)",
+        help=(
+            "Opt-in Layer B GUI E2E delivery (selftest_wav with use_live_window=True, deliver=True, "
+            "no_telemetry=True; strongly recommended to pair with --expect-app)"
+        ),
+    )
+    ap.add_argument(
+        "--expect-app",
+        default="",
+        help=(
+            "Strongly recommended guard for --deliver-live: case-insensitive expected foreground "
+            "bundle_id or app_name/process verified after --delay-sec before pasting (aborts on mismatch)"
+        ),
     )
     ap.add_argument("--delay-sec", type=float, default=0.0, help="Seconds to wait before --deliver-live (default: 0)")
     ap.add_argument(
@@ -2638,6 +2782,8 @@ def main(argv: list[str] | None = None) -> int:
         layer_b_only: list[str] = []
         if args.deliver_live:
             layer_b_only.append("--deliver-live")
+        if args.expect_app.strip():
+            layer_b_only.append("--expect-app")
         if args.skip_selftest_wav:
             layer_b_only.append("--skip-selftest-wav")
         if args.allow_drift:
@@ -2648,6 +2794,8 @@ def main(argv: list[str] | None = None) -> int:
             layer_b_only.append("--show-text")
         if layer_b_only:
             ap.error(f"{', '.join(layer_b_only)} require --live-daemon")
+    if args.expect_app.strip() and not args.deliver_live:
+        ap.error("--expect-app requires --deliver-live")
 
     raw_env: Mapping[str, str] = dict(os.environ)
     clean_env = _strip_fast_env(raw_env)
@@ -2683,6 +2831,7 @@ def main(argv: list[str] | None = None) -> int:
                     deliver_live=bool(args.deliver_live),
                     delay_sec=max(0.0, float(args.delay_sec)),
                     show_text=bool(args.show_text),
+                    expect_app=str(args.expect_app or "").strip(),
                 )
             )
     if args.probe_real_clis:

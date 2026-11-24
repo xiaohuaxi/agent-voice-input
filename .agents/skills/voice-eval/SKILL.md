@@ -119,18 +119,20 @@ python3 .agents/skills/voice-eval/scripts/regress_matrix.py --probe-real-clis --
 # 仅跑 Layer B 轻量探活（跳过云端 selftest_wav，允许旧版本代码漂移降级为 WARN）
 python3 .agents/skills/voice-eval/scripts/regress_matrix.py --no-matrix --live-daemon --skip-selftest-wav --allow-drift
 
-# 显式开启桌面 GUI 实机落字验收（默认关闭；等待 2s 后向当前前台窗口真实投递测试 WAV）
-python3 .agents/skills/voice-eval/scripts/regress_matrix.py --no-matrix --live-daemon --deliver-live --delay-sec 2 --json
+# 显式开启桌面 GUI 实机落字验收（默认关闭；等待 2s 后校验前台目标应用再向当前前台窗口真实投递测试 WAV）
+python3 .agents/skills/voice-eval/scripts/regress_matrix.py \
+  --no-matrix --live-daemon --deliver-live --expect-app com.anthropic.claudefordesktop --delay-sec 2 --json
 ```
 
 三层职责分工：
 - Layer A（默认启用，可用 `--no-matrix` 跳过）：在隔离 `0700` 临时 `HOME` 与 `runtime_dir` 拉起真实无头 `VoiceInputDaemon`，经真实 `control.sock` 的 `probe_route` 与仓库 `bin/agent-voice-input session-hook --cli claude|agy --quiet` 验证 Codex / Claude Code（含 `2.1.330` 超大 `attachment` 字节预过滤）/ AGY 新旧会话与跨 CLI `prior_session` 继承、空 shell 零串台，以及同时覆盖 macOS 与 Windows 窗口特征的 Antigravity 2.0 WAL DB、ChatGPT/Codex 统一桌面端本地仓升格与云端否决、Claude 桌面版 / 微信 / 浏览器（`general_gui`）、VS Code / Cursor（`coding_gui`）与 SSH 远端防串台（`putty.exe`、`[@remote]`、`[SSH: devbox]`）。
-- Layer B（`--live-daemon`，可选 `--runtime-dir`、`--wav`、`--allow-drift`、`--skip-selftest-wav`、`--deliver-live`、`--delay-sec`、`--show-text`）：不重启也不干扰主守护进程，校验 `status`（`ok`、`shim_ok`、`code_drift`）、虚拟与真机焦点 `probe_route` 以及 `selftest_wav(no_telemetry=True)`（核对 `telemetry.jsonl` 零行数增长与 `asr_ms`/`refine_ms`/`reasoning_tokens`/`routing`）。
+- Layer B（`--live-daemon`，可选 `--runtime-dir`、`--wav`、`--allow-drift`、`--skip-selftest-wav`、`--deliver-live`、`--expect-app`、`--delay-sec`、`--show-text`）：不重启也不干扰主守护进程，校验 `status`（`ok`、`shim_ok`、`code_drift`）、虚拟与真机焦点 `probe_route` 以及 `selftest_wav(no_telemetry=True)`（核对 `telemetry.jsonl` 零行数增长与 `asr_ms`/`refine_ms`/`reasoning_tokens`/`routing`）；开启 `--deliver-live` 时强烈建议配 `--expect-app` 锁定预期前台应用，等待 `--delay-sec` 后若前台漂移则直接中止不触发粘贴。
 - Layer C（`--probe-real-clis`）：纯只读抽检本机 `~/.codex/sessions`、`~/.claude/projects`、`~/.gemini/antigravity-cli/brain` 最新各 1 条非 subagent 根会话解析兼容性，并以 `mode=ro` 校验 `~/.gemini/antigravity/conversation_summaries.db` 与 `~/.codex/sqlite/codex.db` 表结构与可查性（未安装对应工具时标 `SKIP`，仅输出纯数值）。
 
 ## 桌面 GUI 真·端到端验收清单（Computer Use / 人工共用）
 
-1. 安全与审批前置：若由支持桌面 Computer Use 的 Agent 执行，先遵守对应平台的本地输入保护与审批规范，不尝试操控被安全禁止的终端应用；遇到系统权限或审批弹窗一律交由人工确认。
-2. 先完结非 GUI 检查：先运行 `python3 .agents/skills/voice-eval/scripts/regress_matrix.py --probe-real-clis --live-daemon`（默认 dry-run，不触碰桌面剪贴板与输入框），确认离线矩阵、本机存储兼容、主守护进程 `shim_ok`、真机焦点采集及无遥测污染的云端链路全部通过。
-3. 真·端到端桌面落字验收：将目标桌面 App（如 Antigravity 2.0、ChatGPT 本地仓库任务与普通云端聊天、Claude 桌面版）切到前台并点进输入框，执行 `python3 .agents/skills/voice-eval/scripts/regress_matrix.py --no-matrix --live-daemon --deliver-live --delay-sec 2 --json`（本地终端核对合成句落字时可附加 `--show-text`），逐项核对输入框实际落字与返回 JSON 中的 `routing.mode`、`routing.session_key_masked`、`pasted` 与 `reasoning_tokens == 0`。
-4. 清理与收尾：纯落字验证不按回车，核对完成后清空输入框中的测试文字；若需验证多轮上下文增长，仅在专用测试会话中发送极短消息（如“回复 OK”），避免污染日常会话。
+1. 安全与审批前置：在 macOS 本机由支持 Computer Use 的 Agent 执行时，先加载 `computer-use-resilience` 再加载 `computer-use`，遵守本地输入中断保护，绝不绕过系统权限弹窗或锁屏（macOS 锁屏后 WindowServer 不暴露窗口，直接中止并等待解锁）。
+2. 切窗与应用边界：已知安全禁控应用为 `Ghostty` 与 `com.openai.codex`（ChatGPT/Codex 桌面端）；切普通目标桌面应用（如 Claude Desktop、Antigravity）优先用 `open -a` 配合 `fg_window` 核实前台后，再由 Computer Use 操作应用内视图与输入框。
+3. 先完结非 GUI 检查：先运行 `python3 .agents/skills/voice-eval/scripts/regress_matrix.py --probe-real-clis --live-daemon`（默认 dry-run，不触碰桌面剪贴板与输入框），确认离线矩阵、本机存储兼容、主守护进程 `shim_ok`、真机焦点采集及无遥测污染的云端链路全部通过。
+4. 真·端到端桌面落字验收：将目标桌面 App 切到前台并点进输入框，执行 `--deliver-live` 时必须配 `--expect-app <bundle_id或应用名>` 锁定预期目标应用（如 `python3 .agents/skills/voice-eval/scripts/regress_matrix.py --no-matrix --live-daemon --deliver-live --expect-app com.anthropic.claudefordesktop --delay-sec 2 --json`，本地终端核对合成句落字时可附加 `--show-text`），逐项核对输入框实际落字与返回 JSON 中的 `routing.mode`、`routing.session_key_masked`、`pasted` 与 `reasoning_tokens == 0`。
+5. 清理与收尾：核验输入框落字后严禁按回车并立即清空测试文本；若需验证多轮上下文增长，仅在专用测试会话中发送极短消息（如“回复 OK”），避免污染日常会话。
