@@ -1426,7 +1426,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                 ref.close()
 
         # 4. Forbidden tool / cancel / timeout on turn 2 immediately kills warm worker, clears thread_state, and turn 3 starts fresh
-        for scen, timeout_s, use_cancel in (
+        for scen, turn2_timeout_s, use_cancel in (
             ("forbidden_tool_on_prompt2", 10.0, False),
             ("slow_hang_on_prompt2", 0.25, False),
             ("slow_hang_on_prompt2", 10.0, True),
@@ -1434,7 +1434,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 rt_dir, log_file, env = self._setup_fake_env(td, scenario=scen)
                 ref = AgyRefiner(
-                    Config(refiner=RefinerConfig(provider="agy", timeout_sec=timeout_s, max_retries=0)),
+                    Config(refiner=RefinerConfig(provider="agy", timeout_sec=10.0, max_retries=0)),
                     env=env,
                     runtime_dir=rt_dir,
                     idle_ttl_sec=60.0,
@@ -1449,9 +1449,11 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                     if tok is not None:
                         th = threading.Thread(target=lambda: (time.sleep(0.1), tok.cancel("user_cancelled")), daemon=True)
                         th.start()
+                    ref.cfg.refiner.timeout_sec = turn2_timeout_s
                     try:
                         r2 = ref.refine("turn 2 fail", session_key="sess-fail", fallback_context="ctx-f", cancel_token=tok)
                     finally:
+                        ref.cfg.refiner.timeout_sec = 10.0
                         if th is not None:
                             th.join(timeout=1.0)
                     self.assertNotEqual(r2.used_fallback, "")
