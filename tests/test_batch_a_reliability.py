@@ -683,7 +683,7 @@ class TestA2WslRecStopTimeoutRetry(unittest.TestCase):
                         _MOCK_WSL_REC_SHIM,
                         m,
                         sample_b64,
-                        "0.15",
+                        "0.25",
                     ],
                 )
                 try:
@@ -692,7 +692,7 @@ class TestA2WslRecStopTimeoutRetry(unittest.TestCase):
                     res_retry = (
                         plat_cmp._shim_rpc(
                             {"cmd": "rec_stop", "rec_gen": gen_id},
-                            timeout_sec=0.10,
+                            timeout_sec=0.20,
                             allow_retry=True,
                         )
                         or {}
