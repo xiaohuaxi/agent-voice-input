@@ -528,14 +528,14 @@ class TestV100AuditFixes(unittest.TestCase):
                     timeout_sec: float = 5.0,
                     *,
                     allow_retry: bool = True,
-                    before_write: Any = None,
+                    target_writer: Any = None,
                 ) -> dict[str, Any] | None:
                     eff_to = 0.08 if payload.get("cmd") == "rec_start" else timeout_sec
                     return orig_rpc(
                         payload,
                         timeout_sec=eff_to,
                         allow_retry=allow_retry,
-                        before_write=before_write,
+                        target_writer=target_writer,
                     )
 
                 plat._shim_rpc = _fast_timeout_rpc  # type: ignore[method-assign]
@@ -582,14 +582,14 @@ class TestV100AuditFixes(unittest.TestCase):
                     timeout_sec: float = 5.0,
                     *,
                     allow_retry: bool = True,
-                    before_write: Any = None,
+                    target_writer: Any = None,
                 ) -> dict[str, Any] | None:
                     eff_to = 0.08 if payload.get("cmd") == "rec_start" else timeout_sec
                     return orig_rpc_auto(
                         payload,
                         timeout_sec=eff_to,
                         allow_retry=allow_retry,
-                        before_write=before_write,
+                        target_writer=target_writer,
                     )
 
                 plat_auto._shim_rpc = _fast_timeout_rpc_auto  # type: ignore[method-assign]

@@ -2361,8 +2361,6 @@ class VoiceInputDaemon:
     MAX_PENDING_UTTERANCES: int = MAX_PENDING_UTTERANCES
     MAX_STAGE2_CONCURRENCY: int = MAX_STAGE2_CONCURRENCY
     _origin_resolve_timeout_sec: float = 3.0
-    _hud_wait_timeout_sec: float = 0.05
-    _HUD_QUEUE_MAXLEN: int = 64
     _CTRL_TRIGGER_QUEUE_MAXLEN: int = 32
 
     def __init__(
@@ -2455,15 +2453,6 @@ class VoiceInputDaemon:
         self._deliver_lock = threading.Lock()
         self._selftest_lock = threading.Lock()
         self._probe_sem = threading.BoundedSemaphore(4)
-        self._hud_q_cv = threading.Condition()
-        self._hud_queue: deque[
-            tuple[
-                list[tuple[str, str, int, str | None, bool | None, bool | None, int]],
-                threading.Event,
-                list[BaseException | None],
-            ]
-        ] = deque()
-        self._hud_worker: threading.Thread | None = None
         self._ctrl_trigger_cv = threading.Condition()
         self._ctrl_trigger_q: deque[tuple[socket.socket, dict[str, Any]]] = deque()
         self._ctrl_trigger_worker: threading.Thread | None = None
@@ -2825,119 +2814,24 @@ class VoiceInputDaemon:
         except Exception:
             pass
 
-    def _hud_worker_loop(self) -> None:
-        while True:
-            batch: (
-                tuple[
-                    list[tuple[str, str, int, str | None, bool | None, bool | None, int]],
-                    threading.Event,
-                    list[BaseException | None],
-                ]
-                | None
-            ) = None
-            drained: list[threading.Event] = []
-            with self._hud_q_cv:
-                while not self._hud_queue and not self._stop_evt.is_set():
-                    self._hud_q_cv.wait()
-                if self._stop_evt.is_set():
-                    while self._hud_queue:
-                        _, ev, _ = self._hud_queue.popleft()
-                        drained.append(ev)
-                    break
-                batch = self._hud_queue.popleft()
-            if batch is None:
-                continue
-            calls, done_evt, err_box = batch
-            try:
-                for st_n, txt_n, dur_n, lyr_n, clr_m_n, clr_t_n, bg_n in calls:
-                    if self._stop_evt.is_set():
-                        break
-                    try:
-                        self._invoke_platform_hud_unlocked(
-                            st_n,
-                            text=txt_n,
-                            duration_ms=dur_n,
-                            layer=lyr_n,
-                            clear_main=clr_m_n,
-                            clear_toast=clr_t_n,
-                            bg_count=bg_n,
-                        )
-                    except TypeError as exc:
-                        if err_box[0] is None:
-                            err_box[0] = exc
-            finally:
-                done_evt.set()
-        for ev in drained:
-            ev.set()
-
-    _HUD_MERGEABLE_STAGE_STATES: frozenset[str] = frozenset(
-        {"recording", "recognizing", "processing", "refining"}
-    )
-
-    @classmethod
-    def _is_mergeable_hud_batch(
-        cls,
-        calls: Sequence[tuple[str, str, int, str | None, bool | None, bool | None, int]],
-    ) -> bool:
-        return bool(calls) and all(
-            st.strip().lower() in cls._HUD_MERGEABLE_STAGE_STATES
-            and (lyr or "").strip().lower() != "toast"
-            for st, _, _, lyr, _, _, _ in calls
-        )
-
-    def _enqueue_hud_calls_locked(
+    def _emit_hud_calls_unlocked(
         self,
         calls: Sequence[tuple[str, str, int, str | None, bool | None, bool | None, int]],
-    ) -> tuple[threading.Event, list[BaseException | None]] | None:
-        if not calls or getattr(self.platform, "hud", None) is None or self._stop_evt.is_set():
-            return None
-        done_evt = threading.Event()
-        err_box: list[BaseException | None] = [None]
-        dropped: list[threading.Event] = []
-        with self._hud_q_cv:
-            if self._stop_evt.is_set():
-                return None
-            while len(self._hud_queue) >= self._HUD_QUEUE_MAXLEN:
-                # Preserve critical result toasts (copied/done/error) and main-layer clears (hide)
-                # by evicting the oldest mergeable intermediate stage update first.
-                evict_idx: int | None = None
-                for idx, (q_calls, _, _) in enumerate(self._hud_queue):
-                    if self._is_mergeable_hud_batch(q_calls):
-                        evict_idx = idx
-                        break
-                if evict_idx is None:
-                    _, old_evt, _ = self._hud_queue.popleft()
-                else:
-                    old_item = self._hud_queue[evict_idx]
-                    del self._hud_queue[evict_idx]
-                    old_evt = old_item[1]
-                dropped.append(old_evt)
-            self._hud_queue.append((list(calls), done_evt, err_box))
-            if self._hud_worker is None or not self._hud_worker.is_alive():
-                w = threading.Thread(
-                    target=self._hud_worker_loop,
-                    name="avi-hud-worker",
-                    daemon=True,
-                )
-                self._hud_worker = w
-                w.start()
-            self._hud_q_cv.notify()
-        for old_evt in dropped:
-            old_evt.set()
-        return done_evt, err_box
-
-    def _wait_hud_event(
-        self,
-        handle: tuple[threading.Event, list[BaseException | None]] | None,
-        *,
-        timeout_sec: float | None = None,
     ) -> None:
-        if handle is None:
+        if not calls or getattr(self.platform, "hud", None) is None or self._stop_evt.is_set():
             return
-        done_evt, err_box = handle
-        eff_to = self._hud_wait_timeout_sec if timeout_sec is None else max(0.0, float(timeout_sec))
-        if done_evt.wait(timeout=eff_to) and err_box[0] is not None:
-            raise err_box[0]
+        for st_n, txt_n, dur_n, lyr_n, clr_m_n, clr_t_n, bg_n in calls:
+            if self._stop_evt.is_set():
+                break
+            self._invoke_platform_hud_unlocked(
+                st_n,
+                text=txt_n,
+                duration_ms=dur_n,
+                layer=lyr_n,
+                clear_main=clr_m_n,
+                clear_toast=clr_t_n,
+                bg_count=bg_n,
+            )
 
     def _hud(
         self,
@@ -2954,16 +2848,15 @@ class VoiceInputDaemon:
                 self._update_main_hud_visibility_locked(
                     state, layer=layer, clear_main=clear_main, bg_count=bg_count
                 )
-            hud_handle = self._enqueue_hud_calls_locked(
+            self._emit_hud_calls_unlocked(
                 [(state, "", duration_ms, layer, clear_main, clear_toast, bg_count)]
             )
-        self._wait_hud_event(hud_handle)
 
     def _maybe_emit_bg_main_hud(self, desired_stage: str) -> None:
         if self._stop_evt.is_set():
             return
         with self._hud_lock:
-            hud_handle = None
+            calls: list[tuple[str, str, int, str | None, bool | None, bool | None, int]] = []
             with self._lock:
                 if (
                     not self._stop_evt.is_set()
@@ -2974,10 +2867,8 @@ class VoiceInputDaemon:
                     vis_st = self._derive_bg_stage_locked(visible_only=True)
                     if vis_st == desired_stage and self._main_hud_state != desired_stage:
                         self._update_main_hud_visibility_locked(desired_stage)
-                        hud_handle = self._enqueue_hud_calls_locked(
-                            [(desired_stage, "", 0, None, None, None, 0)]
-                        )
-        self._wait_hud_event(hud_handle)
+                        calls.append((desired_stage, "", 0, None, None, None, 0))
+            self._emit_hud_calls_unlocked(calls)
 
     def _emit_recording_cancel_hud(self, *, show_cancelled_toast: bool) -> str:
         with self._hud_lock:
@@ -2998,8 +2889,7 @@ class VoiceInputDaemon:
                         calls.append(((vis_bg if vis_bg else "hide"), "", 0, None, None, True, 0))
                     for st_n, _, _, lyr_n, clr_m_n, _, _ in calls:
                         self._update_main_hud_visibility_locked(st_n, layer=lyr_n, clear_main=clr_m_n)
-            hud_handle = self._enqueue_hud_calls_locked(calls)
-        self._wait_hud_event(hud_handle)
+            self._emit_hud_calls_unlocked(calls)
         return cur_state
 
     def _emit_capture_error_hud(
@@ -3029,8 +2919,7 @@ class VoiceInputDaemon:
                         calls.append((toast_state, "", duration_ms, None, clr_m, None, 0))
                     for st_n, _, _, lyr_n, clr_m_n, _, _ in calls:
                         self._update_main_hud_visibility_locked(st_n, layer=lyr_n, clear_main=clr_m_n)
-            hud_handle = self._enqueue_hud_calls_locked(calls)
-        self._wait_hud_event(hud_handle)
+            self._emit_hud_calls_unlocked(calls)
 
     def _on_recorder_recovered(self, gap_ms: int = 0, *, seq_id: int | None = None) -> None:
         norm_gap = max(0, int(gap_ms or 0))
@@ -3239,7 +3128,7 @@ class VoiceInputDaemon:
             return None
         return "non_terminal" if scope == "terminals" else "out_of_scope"
 
-    def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False, from_hotkey: bool = False, expected_seq_id: int | None = None, shim_instance_id: int = 0, stop_before_hud: bool = False) -> dict[str, Any]:
+    def handle_trigger(self, action: str, window: ForegroundWindow | None = None, *, no_paste: bool = False, silent_hud: bool = False, loopback: bool = False, from_hotkey: bool = False, expected_seq_id: int | None = None, shim_instance_id: int = 0) -> dict[str, Any]:
         arrival_ts = self.clock_fn()
         with self._trigger_lock:
             queue_full_toast = False
@@ -3367,10 +3256,9 @@ class VoiceInputDaemon:
             if mode == "cancel":
                 self._cancel_max_duration_timer()
                 self._cancel_remote_prefetch(seq_id=cancelled_rec_seq if cancelled_rec_seq > 0 else None)
-                if not eff_silent:
-                    resume_state = self._emit_recording_cancel_hud(show_cancelled_toast=False)
                 self.platform.cancel_recording()
                 if not eff_silent:
+                    resume_state = self._emit_recording_cancel_hud(show_cancelled_toast=False)
                     self.platform.beep("error")
                 return {"ok": True, "state": resume_state, "seq_id": cur_seq}
 
@@ -3444,9 +3332,10 @@ class VoiceInputDaemon:
                             stop_st = self._recompute_state_locked()
                         return {"ok": False, "ignored": "stopping", "state": stop_st, "seq_id": cur_seq}
                     if not eff_silent:
-                        rec_hud_handle = None
                         with self._hud_lock:
-                            bg_cnt = 0
+                            rec_hud_calls: list[
+                                tuple[str, str, int, str | None, bool | None, bool | None, int]
+                            ] = []
                             with self._lock:
                                 if (
                                     not self._stop_evt.is_set()
@@ -3457,10 +3346,10 @@ class VoiceInputDaemon:
                                     self._update_main_hud_visibility_locked(
                                         "recording", bg_count=bg_cnt
                                     )
-                                    rec_hud_handle = self._enqueue_hud_calls_locked(
-                                        [("recording", "", 0, None, None, True, bg_cnt)]
+                                    rec_hud_calls.append(
+                                        ("recording", "", 0, None, None, True, bg_cnt)
                                     )
-                        self._wait_hud_event(rec_hud_handle)
+                            self._emit_hud_calls_unlocked(rec_hud_calls)
                     flush_rec_toast = False
                     with self._lock:
                         if self._recording_active and self._recording_seq_id == cur_seq:
@@ -3578,7 +3467,6 @@ class VoiceInputDaemon:
                     return out_err
 
             self._cancel_max_duration_timer()
-            del stop_before_hud
             stop_rec_lost = False
             try:
                 raw_wav, src_used = self.platform.stop_recording()
@@ -3592,18 +3480,20 @@ class VoiceInputDaemon:
                             self._auto_stop_ts = done_ts
                             self._auto_stop_absorbed = False
                 if not eff_silent and not self._stop_evt.is_set():
-                    stop_hud_handle = None
                     with self._hud_lock:
+                        stop_hud_calls: list[
+                            tuple[str, str, int, str | None, bool | None, bool | None, int]
+                        ] = []
                         with self._lock:
                             if not self._stop_evt.is_set():
                                 eff_stop_stage = (
                                     self._derive_bg_stage_locked(visible_only=True) or "recognizing"
                                 )
                                 self._update_main_hud_visibility_locked(eff_stop_stage)
-                                stop_hud_handle = self._enqueue_hud_calls_locked(
-                                    [(eff_stop_stage, "", 0, None, None, None, 0)]
+                                stop_hud_calls.append(
+                                    (eff_stop_stage, "", 0, None, None, None, 0)
                                 )
-                    self._wait_hud_event(stop_hud_handle)
+                        self._emit_hud_calls_unlocked(stop_hud_calls)
                     if not self._stop_evt.is_set():
                         self.platform.beep("stop")
             except Exception as exc:
@@ -3733,10 +3623,9 @@ class VoiceInputDaemon:
             if cancel_rec_mode:
                 self._cancel_max_duration_timer()
                 self._cancel_remote_prefetch(seq_id=cancelled_rec_seq)
-                if not eff_rec_silent:
-                    resume_state = self._emit_recording_cancel_hud(show_cancelled_toast=True)
                 self.platform.cancel_recording()
                 if not eff_rec_silent:
+                    resume_state = self._emit_recording_cancel_hud(show_cancelled_toast=True)
                     self.platform.beep("error")
                 return {
                     "ok": True,
@@ -3780,7 +3669,6 @@ class VoiceInputDaemon:
                 }
 
             if any_visible_cancelled:
-                cancel_hud_handle = None
                 with self._hud_lock:
                     cancel_calls: list[tuple[str, str, int, str | None, bool | None, bool | None, int]] = []
                     with self._lock:
@@ -3812,8 +3700,7 @@ class VoiceInputDaemon:
                                 self._update_main_hud_visibility_locked(
                                     st_n, layer=lyr_n, clear_main=clr_m_n, bg_count=bg_n
                                 )
-                    cancel_hud_handle = self._enqueue_hud_calls_locked(cancel_calls)
-                self._wait_hud_event(cancel_hud_handle)
+                    self._emit_hud_calls_unlocked(cancel_calls)
 
             return {
                 "ok": True,
@@ -4456,8 +4343,7 @@ class VoiceInputDaemon:
                             self._update_main_hud_visibility_locked(
                                 st_n, layer=lyr_n, clear_main=clr_m_n, bg_count=bg_n
                             )
-                commit_hud_handle = self._enqueue_hud_calls_locked(hud_calls)
-            self._wait_hud_event(commit_hud_handle)
+                self._emit_hud_calls_unlocked(hud_calls)
             if play_beep:
                 self.platform.beep(play_beep)
 
@@ -4575,17 +4461,6 @@ class VoiceInputDaemon:
             bg_threads.extend(th for th in self._stage2_threads if th.is_alive())
             tokens_to_abort.extend(self._control_cancel_tokens)
             self._queue_cv.notify_all()
-
-        drained_hud_evts: list[threading.Event] = []
-        with self._hud_q_cv:
-            while self._hud_queue:
-                _, ev, _ = self._hud_queue.popleft()
-                drained_hud_evts.append(ev)
-            if self._hud_worker is not None:
-                bg_threads.append(self._hud_worker)
-            self._hud_q_cv.notify_all()
-        for ev in drained_hud_evts:
-            ev.set()
 
         drained_ctrl_conns: list[socket.socket] = []
         with self._ctrl_trigger_cv:
@@ -5196,7 +5071,7 @@ class VoiceInputDaemon:
         self._log_info(
             f"shim disconnected during active PTT (seq={target_seq}, shim_id={shim_id}); auto-stopping PTT recording"
         )
-        return self.handle_trigger("ptt_stop", expected_seq_id=target_seq, stop_before_hud=True)
+        return self.handle_trigger("ptt_stop", expected_seq_id=target_seq)
 
     def _on_platform_event(self, m: Mapping[str, Any]) -> None:
         ev = str(m.get("event") or "")

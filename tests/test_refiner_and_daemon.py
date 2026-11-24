@@ -3603,6 +3603,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                     return {"ok": True}
                 return {"ok": True}
 
+            wplat_race._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
             wplat_race._shim_rpc = _racing_rpc  # type: ignore[method-assign]
             wplat_race.start_recording(rt, seq_id=1)
             self.assertEqual(seen_rec_gens, [1])
@@ -3613,6 +3614,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             # Stale queued Windows rec_lost / rec_recovered from rec_gen=1 must NEVER stop a newly started session!
             wplat_stale = WslPlatform(Config(audio=AudioConfig(wsl_source="winmm")), env={"HOME": td})
             stale_gens: list[int] = []
+            wplat_stale._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
             wplat_stale._shim_rpc = lambda payload, timeout_sec=4.0, **kw: (  # type: ignore[method-assign]
                 (stale_gens.append(int(payload.get("rec_gen") or 0)) or {"ok": True})
                 if payload.get("cmd") == "rec_start"

@@ -65,7 +65,8 @@ from agent_voice_input.platform_common import (  # noqa: E402
     ForegroundWindow,
     JsonlShimMixin,
     PasteOutcome,
-    _StdinGate,
+    _ShimWriteTimeout,
+    _ShimWriter,
     _reap_shim_proc,
 )
 from agent_voice_input.platform_wsl import WslPlatform  # noqa: E402
@@ -1426,8 +1427,8 @@ class TestConcurrencyRaces(unittest.TestCase):
 
                     # Explicit cooldown fast-skip check under _trigger_lock (scheduler-independent):
                     # Ensure daemon starts from idle (drain hammer utterances first), enter backoff window,
-                    # and verify handle_trigger("ptt_start") invokes hud("recording") -> _ensure_shim()
-                    # while holding _trigger_lock and fast-returns False
+                    # and verify handle_trigger("ptt_start") invokes hud("recording") while holding
+                    # _trigger_lock and immediately drops the frame without calling _ensure_shim().
                     assert isinstance(plat, JsonlShimMixin)
                     if daemon._recording_active:
                         daemon.handle_trigger("ptt_cancel", ForegroundWindow(hwnd=301, process="WindowsTerminal.exe", title="codex"))
@@ -1451,13 +1452,15 @@ class TestConcurrencyRaces(unittest.TestCase):
                         plat._shim_retry_after = time.monotonic() + 30.0
                     plat._reap_owned_shim(live_p)
                     spawns_before_cd = spawn_gen[0]
-                    hud_cooldown_calls: list[tuple[bool, bool]] = []
+                    hud_recording_locked: list[bool] = []
+                    hud_ensure_calls: list[tuple[bool, bool]] = []
                     in_hud_recording = [False]
                     orig_hud = plat.hud
                     orig_ensure = plat._ensure_shim
 
                     def _spy_hud(state: str, *args: Any, **kwargs: Any) -> None:
                         if state == "recording":
+                            hud_recording_locked.append(daemon._trigger_lock.locked())
                             in_hud_recording[0] = True
                             try:
                                 orig_hud(state, *args, **kwargs)
@@ -1470,7 +1473,7 @@ class TestConcurrencyRaces(unittest.TestCase):
                         locked_now = daemon._trigger_lock.locked()
                         ret = orig_ensure(ignore_cooldown=ignore_cooldown)
                         if not ignore_cooldown and in_hud_recording[0]:
-                            hud_cooldown_calls.append((locked_now, ret))
+                            hud_ensure_calls.append((locked_now, ret))
                         return ret
 
                     with mock.patch.object(plat, "hud", side_effect=_spy_hud), mock.patch.object(
@@ -1482,10 +1485,11 @@ class TestConcurrencyRaces(unittest.TestCase):
                         )
                     self.assertTrue(r_cd.get("ok"), f"ptt_start unexpectedly skipped: {r_cd}")
                     self.assertEqual(r_cd.get("state"), "recording")
+                    self.assertEqual(hud_recording_locked, [True])
                     self.assertEqual(
-                        hud_cooldown_calls,
-                        [(True, False)],
-                        f"Expected hud('recording')->_ensure_shim()->False under _trigger_lock, got {hud_cooldown_calls}",
+                        hud_ensure_calls,
+                        [],
+                        f"hud('recording') must not call _ensure_shim() under _trigger_lock, got {hud_ensure_calls}",
                     )
                     self.assertEqual(spawn_gen[0], spawns_before_cd)
                     daemon.handle_trigger(
@@ -1493,12 +1497,11 @@ class TestConcurrencyRaces(unittest.TestCase):
                         ForegroundWindow(hwnd=301, process="WindowsTerminal.exe", title="codex"),
                     )
 
-                    # Regression check A (enqueue before writer release): _reap_shim_proc neither hangs on
-                    # blocked stdout nor leaks deferred stdin when writer holds _StdinGate
+                    # Regression check A: _reap_shim_proc with single-owner _ShimWriter neither hangs on
+                    # blocked stdout nor leaks stdin; writer thread is the sole closer and exits promptly.
                     r_fd, w_fd = os.pipe()
                     r_file = os.fdopen(r_fd, "r", encoding="utf-8")
                     in_r_fd, in_w_fd = os.pipe()
-                    os.close(in_r_fd)
                     in_w_file = os.fdopen(in_w_fd, "w", encoding="utf-8")
                     blocked_reader_done = threading.Event()
 
@@ -1518,149 +1521,67 @@ class TestConcurrencyRaces(unittest.TestCase):
                     fake_proc.stdin = in_w_file
                     fake_proc.stdout = r_file
                     fake_proc._shim_reader_th = br_th
-                    fake_proc._deferred_close_stdin = False
-                    gate_a = _StdinGate()
-                    self.assertTrue(gate_a.acquire())
+                    writer_a = _ShimWriter(fake_proc)
                     try:
                         t_reap0 = time.monotonic()
-                        _reap_shim_proc(fake_proc, stdin_lock=gate_a)
+                        _reap_shim_proc(fake_proc, writer=writer_a)
                         reap_dt = time.monotonic() - t_reap0
                         self.assertLess(reap_dt, 1.5)
-                        self.assertTrue(fake_proc._deferred_close_stdin)
-                        self.assertFalse(in_w_file.closed)
-                        self.assertFalse(r_file.closed)
-                        # Writer releases _StdinGate -> closes deferred stdin automatically!
-                        gate_a.release()
                         self.assertTrue(in_w_file.closed)
-                        self.assertEqual(gate_a._deferred, [])
+                        self.assertFalse(writer_a._thread.is_alive())
+                        self.assertFalse(r_file.closed)
                     finally:
-                        if gate_a._writers > 0:
-                            gate_a.release()
+                        writer_a.close(send_quit=False)
                         if not in_w_file.closed:
                             in_w_file.close()
+                        os.close(in_r_fd)
                         os.close(w_fd)
                         self.assertTrue(blocked_reader_done.wait(timeout=1.0))
                         self.assertTrue(r_file.closed)
 
-                    # Regression check B (writer finishes release right after initial acquire timeout,
-                    # before reaper inspects _state_lock): reaper observes _writers == 0 and closes pipe
-                    in_r2, in_w2 = os.pipe()
-                    os.close(in_r2)
-                    in_w2_file = os.fdopen(in_w2, "w", encoding="utf-8")
-                    gate_b = _StdinGate()
-                    self.assertTrue(gate_b.acquire())
-                    real_io_lock_b = gate_b._io_lock
-                    calls_b = [0]
-
-                    class _ProxyIoLockB:
-                        def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
-                            calls_b[0] += 1
-                            if calls_b[0] == 1:
-                                # Simulate writer finishing release() right as timeout expires!
-                                gate_b.release()
-                                return False
-                            return (
-                                real_io_lock_b.acquire(blocking=blocking)
-                                if timeout < 0
-                                else real_io_lock_b.acquire(blocking=blocking, timeout=timeout)
-                            )
-
-                        def release(self) -> None:
-                            real_io_lock_b.release()
-
-                    gate_b._io_lock = _ProxyIoLockB()  # type: ignore[assignment]
-                    try:
-                        self.assertTrue(gate_b.close_or_defer(in_w2_file, timeout=0.01))
-                        self.assertTrue(in_w2_file.closed)
-                        self.assertEqual(gate_b._deferred, [])
-                    finally:
-                        if not in_w2_file.closed:
-                            in_w2_file.close()
-
-                    # Regression check C (writer already drained first batch inside release() while still
-                    # holding _io_lock -> reaper enqueues 2nd pipe before final _state_lock check):
-                    # writer's release() loop catches and closes the 2nd pipe before releasing _io_lock!
-                    p1_r, p1_w = os.pipe()
-                    p2_r, p2_w = os.pipe()
-                    os.close(p1_r)
-                    os.close(p2_r)
-                    p1_file = os.fdopen(p1_w, "w", encoding="utf-8")
-                    p2_file = os.fdopen(p2_w, "w", encoding="utf-8")
-                    gate_c = _StdinGate()
-                    self.assertTrue(gate_c.acquire())
-                    self.assertFalse(gate_c.close_or_defer(p1_file, timeout=0.0))
-
-                    p1_closing_evt = threading.Event()
-                    allow_p1_finish_evt = threading.Event()
-                    orig_p1_close = p1_file.close
-
-                    def _hooked_p1_close() -> None:
-                        p1_closing_evt.set()
-                        allow_p1_finish_evt.wait(timeout=2.0)
-                        orig_p1_close()
-
-                    p1_file.close = _hooked_p1_close  # type: ignore[method-assign]
-                    writer_rel_th = threading.Thread(target=gate_c.release, daemon=True)
-                    writer_rel_th.start()
-                    try:
-                        # Writer ALREADY drained _deferred once and is mid-release still holding _io_lock!
-                        self.assertTrue(p1_closing_evt.wait(timeout=2.0))
-                        self.assertFalse(gate_c.close_or_defer(p2_file, timeout=0.0))
-                        allow_p1_finish_evt.set()
-                        writer_rel_th.join(timeout=2.0)
-                        self.assertFalse(writer_rel_th.is_alive())
-                        self.assertTrue(p1_file.closed)
-                        self.assertTrue(p2_file.closed)
-                        self.assertEqual(gate_c._deferred, [])
-                        self.assertEqual(gate_c._writers, 0)
-                    finally:
-                        allow_p1_finish_evt.set()
-                        writer_rel_th.join(timeout=1.0)
-                        for pf in (p1_file, p2_file):
-                            if not pf.closed:
-                                orig_p1_close() if pf is p1_file else pf.close()
-
-                    # Regression check D (two concurrent reapers: Reaper 1 acquires gate and blocks inside
-                    # pipe1.close(); Reaper 2 times out promptly, enqueues pipe2, and Reaper 1 closes both!)
-                    d1_r, d1_w = os.pipe()
-                    d2_r, d2_w = os.pipe()
-                    os.close(d1_r)
-                    os.close(d2_r)
-                    d1_file = os.fdopen(d1_w, "w", encoding="utf-8")
-                    d2_file = os.fdopen(d2_w, "w", encoding="utf-8")
-                    gate_d = _StdinGate()
-                    d1_in_close = threading.Event()
-                    d1_unblock = threading.Event()
-                    orig_d1_close = d1_file.close
-
-                    def _slow_d1_close() -> None:
-                        d1_in_close.set()
-                        d1_unblock.wait(timeout=2.0)
-                        orig_d1_close()
-
-                    d1_file.close = _slow_d1_close  # type: ignore[method-assign]
-                    reaper1_th = threading.Thread(
-                        target=lambda: gate_d.close_or_defer(d1_file, timeout=0.2), daemon=True
+                    # Regression check B: _ShimWriter close() aborts an in-flight full-pipe write promptly
+                    # without leaking writer threads or stdin fds.
+                    fp_r, fp_w = os.pipe()
+                    os.set_blocking(fp_w, False)
+                    while True:
+                        try:
+                            os.write(fp_w, b"B" * 4096)
+                        except BlockingIOError:
+                            break
+                    os.set_blocking(fp_w, True)
+                    fp_w_file = os.fdopen(fp_w, "w", encoding="utf-8", buffering=1)
+                    fake_full = mock.MagicMock()
+                    fake_full.poll.return_value = None
+                    fake_full.stdin = fp_w_file
+                    fake_full.stdout = None
+                    writer_b = _ShimWriter(fake_full)
+                    write_res: list[tuple[str, str]] = []
+                    write_th = threading.Thread(
+                        target=lambda: write_res.append(
+                            writer_b.write_sync('{"cmd":"ping"}\n', time.monotonic() + 5.0)
+                        ),
+                        daemon=True,
                     )
-                    reaper1_th.start()
+                    write_th.start()
                     try:
-                        self.assertTrue(d1_in_close.wait(timeout=2.0))
-                        t_d2 = time.monotonic()
-                        self.assertFalse(gate_d.close_or_defer(d2_file, timeout=0.02))
-                        self.assertLess(time.monotonic() - t_d2, 0.25)
-                        d1_unblock.set()
-                        reaper1_th.join(timeout=2.0)
-                        self.assertFalse(reaper1_th.is_alive())
-                        self.assertTrue(d1_file.closed)
-                        self.assertTrue(d2_file.closed)
-                        self.assertEqual(gate_d._deferred, [])
-                        self.assertEqual(gate_d._writers, 0)
+                        time.sleep(0.03)
+                        t_cl0 = time.monotonic()
+                        quit_sent = writer_b.close(send_quit=False)
+                        cl_dt = time.monotonic() - t_cl0
+                        self.assertFalse(quit_sent)
+                        self.assertLess(cl_dt, 0.35)
+                        write_th.join(timeout=1.0)
+                        self.assertFalse(write_th.is_alive())
+                        self.assertFalse(writer_b._thread.is_alive())
+                        self.assertTrue(fp_w_file.closed)
+                        self.assertEqual(len(write_res), 1)
+                        self.assertEqual(write_res[0][0], "not_sent")
                     finally:
-                        d1_unblock.set()
-                        reaper1_th.join(timeout=1.0)
-                        for df in (d1_file, d2_file):
-                            if not df.closed:
-                                orig_d1_close() if df is d1_file else df.close()
+                        writer_b.close(send_quit=False)
+                        write_th.join(timeout=1.0)
+                        if not fp_w_file.closed:
+                            fp_w_file.close()
+                        os.close(fp_r)
             finally:
                 for th in hammer_threads:
                     if th.is_alive():
@@ -1691,7 +1612,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
         cls.speech_wav = _build_voiced_wav(0.36)
 
     def test_normal_stop_calls_stop_recording_before_hud_and_slow_hud_does_not_block_locks(self) -> None:
-        """1) Normal ptt_stop/toggle stops recording BEFORE HUD RPC; slow HUD never blocks _hud_lock/_trigger_lock."""
+        """1) Normal ptt_stop/cancel stops capture BEFORE HUD; non-blocking bridge HUD never stalls _trigger_lock."""
         with tempfile.TemporaryDirectory() as td:
             rt = Path(td) / "rt"
             empty_proc = Path(td) / "empty_proc"
@@ -1703,14 +1624,54 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
             )
             call_order: list[str] = []
-            hud_entered = threading.Event()
-            release_hud = threading.Event()
-            block_next_hud = [False]
 
-            class _SlowHudPlatform(_TorturePlatform):
+            # Real full pipe behind a JsonlShimMixin bridge simulates a slow/wedged native shim.
+            r_fd, w_fd = os.pipe()
+            os.set_blocking(w_fd, False)
+            while True:
+                try:
+                    os.write(w_fd, b"H" * 4096)
+                except BlockingIOError:
+                    break
+            os.set_blocking(w_fd, True)
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+
+            class _SlowBridgeProc:
+                def __init__(self, stdin_obj: Any) -> None:
+                    self.stdin = stdin_obj
+                    self.stdout = None
+                    self.stderr = None
+
+                def poll(self) -> int | None:
+                    return None
+
+                def kill(self) -> None:
+                    pass
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            class _OrderAndNonBlockingHudPlatform(_TorturePlatform, JsonlShimMixin):
+                _shim_graceful = False
+                _shim_label = "hud_order_test"
+
+                def __init__(self, wav: bytes) -> None:
+                    super().__init__(wav)
+                    self.cfg = cfg
+                    self.env = {}
+                    self._init_shim_bridge()
+
+                def _build_shim_cmd(self) -> list[str] | None:
+                    return None
+
                 def stop_recording(self, *, drain: bool = True) -> tuple[bytes, str]:
                     call_order.append("stop_recording")
                     return super().stop_recording(drain=drain)
+
+                def cancel_recording(self) -> None:
+                    call_order.append("cancel_recording")
+                    super().cancel_recording()
 
                 def hud(
                     self,
@@ -1724,11 +1685,8 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                     bg_count: int = 0,
                 ) -> None:
                     call_order.append(f"hud:{state}")
-                    if block_next_hud[0] and state == "recognizing":
-                        block_next_hud[0] = False
-                        hud_entered.set()
-                        release_hud.wait(timeout=3.0)
-                    super().hud(
+                    JsonlShimMixin.hud(
+                        self,
                         state,
                         text=text,
                         duration_ms=duration_ms,
@@ -1738,7 +1696,16 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                         bg_count=bg_count,
                     )
 
-            plat = _SlowHudPlatform(self.speech_wav)
+                def close(self) -> None:
+                    JsonlShimMixin.close(self)
+
+            plat = _OrderAndNonBlockingHudPlatform(self.speech_wav)
+            proc = _SlowBridgeProc(w_file)
+            plat._shim = proc  # type: ignore[assignment]
+            plat._spawned_shim = proc  # type: ignore[assignment]
+            plat._spawned_ready = True
+            plat._ready.set()
+            plat._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
             tracker = SessionTracker(env={"HOME": td}, runtime_dir=rt, proc_root=empty_proc)
             daemon = VoiceInputDaemon(
                 cfg,
@@ -1751,39 +1718,57 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             )
             win = ForegroundWindow(hwnd=101, process="WindowsTerminal.exe", title="codex")
             try:
-                # 1a. Normal ptt_stop: stop_recording MUST precede hud:recognizing even when HUD blocks!
+                # 1a. Normal ptt_stop: stop_recording precedes hud:recognizing and never blocks on full HUD pipe.
                 self.assertTrue(daemon.handle_trigger("ptt_start", win)["ok"])
                 call_order.clear()
-                block_next_hud[0] = True
                 t_stop0 = time.monotonic()
                 res_stop = daemon.handle_trigger("ptt_stop", win)
                 stop_elapsed = time.monotonic() - t_stop0
                 self.assertTrue(res_stop["ok"])
-                self.assertTrue(hud_entered.wait(timeout=1.0))
                 self.assertLess(
                     stop_elapsed,
-                    0.4,
-                    f"ptt_stop must not wait for 3s blocked HUD RPC (took {stop_elapsed:.3f}s)",
+                    0.25,
+                    f"ptt_stop must not wait on full shim HUD pipe (took {stop_elapsed:.3f}s)",
                 )
                 self.assertIn("stop_recording", call_order)
                 self.assertIn("hud:recognizing", call_order)
                 self.assertLess(
                     call_order.index("stop_recording"),
                     call_order.index("hud:recognizing"),
-                    f"stop_recording must run before HUD RPC, got {call_order}",
+                    f"stop_recording must run before HUD update, got {call_order}",
                 )
 
-                # 1b. While HUD worker is still blocked on the slow RPC, _hud_lock & _trigger_lock stay responsive!
+                # 1b. Subsequent ptt_start + handle_cancel + ptt_cancel stay responsive and cancel_recording precedes HUD.
                 t_next0 = time.monotonic()
-                res_next = daemon.handle_trigger("ptt_start", win)
-                self.assertTrue(res_next["ok"])
-                self.assertLess(time.monotonic() - t_next0, 0.3)
-                res_cancel = daemon.handle_cancel()
-                self.assertTrue(res_cancel["ok"])
+                self.assertTrue(daemon.handle_trigger("ptt_start", win)["ok"])
+                self.assertLess(time.monotonic() - t_next0, 0.25)
+                call_order.clear()
+                self.assertTrue(daemon.handle_cancel()["ok"])
+                self.assertIn("cancel_recording", call_order)
+                self.assertIn("hud:cancelled", call_order)
+                self.assertLess(
+                    call_order.index("cancel_recording"),
+                    call_order.index("hud:cancelled"),
+                    f"cancel_recording must precede HUD in handle_cancel, got {call_order}",
+                )
+
+                self.assertTrue(daemon.handle_trigger("ptt_start", win)["ok"])
+                call_order.clear()
+                self.assertTrue(daemon.handle_trigger("ptt_cancel", win)["ok"])
+                self.assertIn("cancel_recording", call_order)
+                self.assertTrue(any(c.startswith("hud:") for c in call_order))
+                first_hud_idx = next(i for i, c in enumerate(call_order) if c.startswith("hud:"))
+                self.assertLess(
+                    call_order.index("cancel_recording"),
+                    first_hud_idx,
+                    f"cancel_recording must precede HUD in ptt_cancel, got {call_order}",
+                )
             finally:
-                release_hud.set()
                 daemon.close()
                 tracker.close()
+                if not w_file.closed:
+                    w_file.close()
+                os.close(r_fd)
 
     def test_control_sock_status_stays_fast_during_slow_start_and_stop(self) -> None:
         """2) control.sock offloads slow rec_start/rec_stop/toggle so status responds within tens of ms."""
@@ -1889,15 +1874,12 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 self.assertEqual(exec_order, ["start_begin", "start_end", "stop_begin", "stop_end"])
 
                 ctrl_w = daemon._ctrl_trigger_worker
-                hud_w = daemon._hud_worker
                 shut_resp = send_control_command(rt, {"cmd": "shutdown"}, timeout_sec=2.0)
                 self.assertTrue(shut_resp["ok"])
                 srv_th.join(timeout=3.0)
                 self.assertFalse(srv_th.is_alive())
                 if ctrl_w is not None:
                     self.assertFalse(ctrl_w.is_alive(), "control trigger worker leaked after shutdown")
-                if hud_w is not None:
-                    self.assertFalse(hud_w.is_alive(), "HUD worker leaked after shutdown")
             finally:
                 release_start.set()
                 release_stop.set()
@@ -2036,36 +2018,60 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             bridge._ready.set()
             bridge._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
 
-            # 4a. _shim_rpc(..., timeout_sec=0.05) MUST time out promptly despite full pipe!
+            # 4a. _shim_rpc(..., timeout_sec=0.05) MUST time out promptly with write_status='not_sent' (0 bytes)
+            # and keep the healthy shim alive!
             t0 = time.monotonic()
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(_ShimWriteTimeout) as ctx_4a:
                 bridge._shim_rpc({"cmd": "ping"}, timeout_sec=0.05, allow_retry=True)
             dt_rpc = time.monotonic() - t0
+            self.assertEqual(ctx_4a.exception.write_status, "not_sent")
+            self.assertFalse(ctx_4a.exception.partial)
             self.assertGreaterEqual(dt_rpc, 0.04)
             self.assertLess(dt_rpc, 0.35, f"_shim_rpc exceeded deadline on full pipe ({dt_rpc:.3f}s)")
+            self.assertIs(bridge._shim, proc)
+            writer = bridge._current_shim_writer()
+            self.assertIsNotNone(writer)
+            assert writer is not None
+            self.assertFalse(writer.poisoned)
 
-            # 4b. hud_level() on full pipe MUST drop frame immediately without blocking audio reader!
+            # 4b. hud_level() on full pipe overwrites single slot without ever blocking audio reader!
             t_lvl0 = time.monotonic()
             for idx in range(50):
                 bridge.hud_level(0.5 + (idx % 5) * 0.1)
             dt_lvl = time.monotonic() - t_lvl0
-            self.assertLess(dt_lvl, 0.15, f"hud_level blocked on full pipe ({dt_lvl:.3f}s)")
+            self.assertLess(dt_lvl, 0.05, f"hud_level blocked on full pipe ({dt_lvl:.3f}s)")
 
-            # 4c. hud_level() while _stdin_lock is held MUST drop frame immediately!
-            self.assertTrue(bridge._stdin_lock.acquire())
-            try:
-                t_lock0 = time.monotonic()
-                for _ in range(20):
-                    bridge.hud_level(0.42)
-                self.assertLess(time.monotonic() - t_lock0, 0.05)
+            # 4c. While a slower RPC (0.35s) occupies the single writer on a full pipe, a queued shorter-deadline
+            # RPC (0.05s) still honors its own deadline with write_status='not_sent' and hud_level stays instant!
+            slow_done = threading.Event()
+            slow_errs: list[BaseException] = []
 
-                # And _shim_rpc waiting on held _stdin_lock honors the same deadline!
-                t_lk_rpc = time.monotonic()
-                with self.assertRaises(TimeoutError):
-                    bridge._shim_rpc({"cmd": "ping"}, timeout_sec=0.05, allow_retry=False)
-                self.assertLess(time.monotonic() - t_lk_rpc, 0.25)
-            finally:
-                bridge._stdin_lock.release()
+            def _slow_rpc() -> None:
+                try:
+                    bridge._shim_rpc({"cmd": "ping"}, timeout_sec=0.35, allow_retry=False)
+                except BaseException as exc:
+                    slow_errs.append(exc)
+                finally:
+                    slow_done.set()
+
+            slow_th = threading.Thread(target=_slow_rpc, daemon=True)
+            slow_th.start()
+            time.sleep(0.02)
+            t_lock0 = time.monotonic()
+            for _ in range(20):
+                bridge.hud_level(0.42)
+            self.assertLess(time.monotonic() - t_lock0, 0.05)
+
+            t_lk_rpc = time.monotonic()
+            with self.assertRaises(_ShimWriteTimeout) as ctx_4c:
+                bridge._shim_rpc({"cmd": "ping"}, timeout_sec=0.05, allow_retry=False)
+            self.assertEqual(ctx_4c.exception.write_status, "not_sent")
+            self.assertLess(time.monotonic() - t_lk_rpc, 0.25)
+            self.assertIs(bridge._shim, proc)
+            self.assertTrue(slow_done.wait(timeout=1.0))
+            self.assertEqual(len(slow_errs), 1)
+            self.assertIsInstance(slow_errs[0], _ShimWriteTimeout)
+            bridge.close()
         finally:
             if w_file is not None:
                 try:
@@ -2223,55 +2229,36 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             bridge._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
             bridge._schedule_respawn_if_needed = lambda: respawn_calls.__setitem__(0, respawn_calls[0] + 1)  # type: ignore[method-assign]
 
-            # Hook _reap_owned_shim to pause AFTER _stdin_lock is released and BEFORE reap completes;
-            # a concurrent hud_level holding the stale proc reference MUST see _stdin_poisoned and refuse to write!
-            reap_hook_hit = threading.Event()
-            lvl_attempted = threading.Event()
-            orig_reap = bridge._reap_owned_shim
+            writer = bridge._current_shim_writer()
+            self.assertIsNotNone(writer)
+            assert writer is not None
 
-            def _hooked_reap(p: Any) -> None:
-                reap_hook_hit.set()
-                lvl_attempted.wait(timeout=2.0)
-                orig_reap(p)
-
-            bridge._reap_owned_shim = _hooked_reap  # type: ignore[method-assign]
-
-            stale_sent: list[bool] = []
-            pre_drained: list[bytes] = []
-
-            def _stale_writer() -> None:
-                reap_hook_hit.wait(timeout=2.0)
-                # Drain kernel pipe space BEFORE the stale writer attempts to write so the pipe
-                # IS writable again; rejection MUST come from _stdin_poisoned rather than a full pipe.
-                try:
-                    pre_drained.append(os.read(r_fd, 16384))
-                except BlockingIOError:
-                    pass
-                stale_sent.append(
-                    bridge._send_shim_fire_and_forget_to_proc(
-                        proc,  # type: ignore[arg-type]
-                        {"cmd": "hud_level", "level": 0.9},
-                        drop_if_busy=True,
-                    )
-                )
-                lvl_attempted.set()
-
-            stale_th = threading.Thread(target=_stale_writer, daemon=True)
-            stale_th.start()
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(_ShimWriteTimeout) as ctx_partial:
                 bridge._shim_rpc({"cmd": "paste", "text": "Z" * 131072}, timeout_sec=0.04, allow_retry=False)
-            stale_th.join(timeout=2.0)
-            self.assertEqual(stale_sent, [False])
-            self.assertGreater(
-                sum(len(c) for c in pre_drained),
-                0,
-                "pipe must have writable space before stale writer runs",
-            )
-            self.assertTrue(getattr(proc, "_stdin_poisoned", False))
+            self.assertEqual(ctx_partial.exception.write_status, "partial")
+            self.assertTrue(ctx_partial.exception.partial)
+            self.assertTrue(writer.poisoned)
+            self.assertTrue(w_file.closed, "single writer must close stdin immediately on partial write")
+            self.assertTrue(proc.killed)
             self.assertIsNone(bridge._shim)
             self.assertEqual(respawn_calls[0], 1, "poisoned current shim must schedule respawn")
 
-            # Drain remaining kernel pipe bytes and confirm hud_level was NEVER appended after partial JSON prefix.
+            # Drain kernel pipe space so pipe WOULD be writable again, then attempt stale writes on old writer:
+            # single writer already closed stdin & marked poisoned, so nothing can ever append to the half-line!
+            pre_drained: list[bytes] = []
+            try:
+                pre_drained.append(os.read(r_fd, 16384))
+            except BlockingIOError:
+                pass
+            self.assertGreater(sum(len(c) for c in pre_drained), 0)
+            self.assertEqual(
+                bridge._write_shim_command({"cmd": "hud_level", "level": 0.9}, writer=writer),
+                "not_sent",
+            )
+            self.assertFalse(writer.enqueue_async('{"cmd":"after_poison"}\n'))
+            writer.submit_level('{"cmd":"hud_level","level":0.9}\n')
+
+            # Drain remaining kernel pipe bytes and confirm nothing was ever appended after partial JSON prefix.
             chunks: list[bytes] = list(pre_drained)
             while True:
                 try:
@@ -2284,6 +2271,8 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             tail = b"".join(chunks)[total_filled - 8192 :]
             self.assertGreater(len(tail), 0, "expected partial JSON prefix written before timeout")
             self.assertNotIn(b"hud_level", tail)
+            self.assertNotIn(b"after_poison", tail)
+            bridge.close()
         finally:
             if w_file is not None:
                 try:
@@ -2484,30 +2473,66 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             bridge._ready.set()
             bridge._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
 
-            # 1) On a full pipe, cleanup command times out cleanly without leaving anything in Python buffer.
-            sent = bridge._send_shim_fire_and_forget(
+            # 1) On a full pipe, cleanup command times out cleanly with 'not_sent' (0 bytes written).
+            status_full = bridge._write_shim_command(
                 {"cmd": "rec_stop", "rec_gen": 1, "discard": True},
                 timeout_sec=0.02,
             )
-            self.assertFalse(sent)
+            self.assertEqual(status_full, "not_sent")
 
             # Drain filler bytes completely.
             drained = 0
             while drained < filled:
                 drained += len(os.read(r_fd, 65536))
 
-            # 2) Subsequent cleanup + RPC arrive in strict FIFO order on the pipe.
-            self.assertTrue(
-                bridge._send_shim_fire_and_forget({"cmd": "rec_release", "rec_gen": 1}, timeout_sec=0.1)
+            # 2) Subsequent cleanup + RPC arrive in strict FIFO order on the pipe; full-sent RPC whose
+            # reply is lost raises queue.Empty while keeping the shim healthy!
+            self.assertEqual(
+                bridge._write_shim_command({"cmd": "rec_release", "rec_gen": 1}, timeout_sec=0.1),
+                "sent",
             )
-            # Send an RPC line (will time out waiting for reply since no reader replies, which is expected).
             with self.assertRaises(queue.Empty):
                 bridge._shim_rpc({"cmd": "rec_start", "rec_gen": 2}, timeout_sec=0.02, allow_retry=False)
 
             raw_out = os.read(r_fd, 65536).decode("utf-8")
             cmds = [json.loads(ln)["cmd"] for ln in raw_out.splitlines() if ln.strip()]
             self.assertEqual(cmds, ["rec_release", "rec_start"])
+
+            # 3) Close & restart isolation: detaching old shim and attaching new shim ensures
+            # late commands targeting the old writer NEVER land on the new shim's pipe!
+            old_writer = bridge._current_shim_writer()
+            self.assertIsNotNone(old_writer)
+            assert old_writer is not None
+            r2_fd, w2_fd = os.pipe()
+            w2_file = os.fdopen(w2_fd, "w", encoding="utf-8", buffering=1)
+            try:
+                proc2 = _PipeProc(w2_file)
+                with bridge._shim_lock:
+                    bridge._shim = proc2  # type: ignore[assignment]
+                    bridge._shim_writer = None
+                    bridge._spawned_shim = proc2  # type: ignore[assignment]
+                    bridge._spawned_ready = True
+                old_writer.close(send_quit=False)
+                self.assertEqual(
+                    bridge._write_shim_command({"cmd": "stale_old"}, writer=old_writer, timeout_sec=0.05),
+                    "not_sent",
+                )
+                self.assertEqual(
+                    bridge._write_shim_command({"cmd": "fresh_new"}, timeout_sec=0.1),
+                    "sent",
+                )
+                bridge.close()
+                os.set_blocking(r2_fd, False)
+                new_raw = os.read(r2_fd, 65536).decode("utf-8")
+                new_cmds = [json.loads(ln)["cmd"] for ln in new_raw.splitlines() if ln.strip()]
+                self.assertIn("fresh_new", new_cmds)
+                self.assertNotIn("stale_old", new_cmds)
+            finally:
+                if not w2_file.closed:
+                    w2_file.close()
+                os.close(r2_fd)
         finally:
+            bridge.close()
             if w_file is not None:
                 try:
                     w_file.close()
@@ -2878,85 +2903,113 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 tracker.close()
 
     def test_r2_p2_hud_full_queue_preserves_copied_toast_and_hide_clear(self) -> None:
-        """P2-1: Full HUD queue evicts intermediate stage updates before critical result toasts (copied) & hide."""
-        with tempfile.TemporaryDirectory() as td:
-            rt = Path(td) / "rt"
-            empty_proc = Path(td) / "empty_proc"
-            empty_proc.mkdir(parents=True, exist_ok=True)
-            cfg = Config(
-                asr=AsrConfig(provider="dashscope"),
-                refiner=RefinerConfig(provider="off", include_git_status=False),
-                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
-                hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
-            )
-            first_hud_entered = threading.Event()
-            release_hud = threading.Event()
-            seen_states: list[str] = []
-            hide_seen = threading.Event()
+        """P2-1 / ⑤: Single-writer HUD queue drops excess levels & stage updates while delivering copied toast & hide in order."""
+        class _HudPipeBridge(JsonlShimMixin):
+            _shim_graceful = False
+            _shim_label = "hud_pipe_test"
 
-            class _BlockingHudPlat(_TorturePlatform):
-                def hud(
-                    self,
-                    state: str,
-                    text: str = "",
-                    duration_ms: int = 0,
-                    *,
-                    layer: str | None = None,
-                    clear_main: bool | None = None,
-                    clear_toast: bool | None = None,
-                    bg_count: int = 0,
-                ) -> None:
-                    if not first_hud_entered.is_set():
-                        first_hud_entered.set()
-                        release_hud.wait(timeout=3.0)
-                    seen_states.append(state)
-                    if state == "hide":
-                        hide_seen.set()
-                    super().hud(
-                        state,
-                        text=text,
-                        duration_ms=duration_ms,
-                        layer=layer,
-                        clear_main=clear_main,
-                        clear_toast=clear_toast,
-                        bg_count=bg_count,
-                    )
+            def __init__(self) -> None:
+                self.cfg = Config()
+                self.env = {}
+                self._init_shim_bridge()
 
-            plat = _BlockingHudPlat(self.speech_wav)
-            tracker = SessionTracker(env={"HOME": td}, runtime_dir=rt, proc_root=empty_proc)
-            daemon = VoiceInputDaemon(
-                cfg,
-                env={"HOME": td, "DASHSCOPE_API_KEY": "sk-test-q"},
-                runtime_dir=rt,
-                platform=plat,
-                asr_provider=_TaggingAsrProvider(),
-                tracker=tracker,
-                paste_settle_sec=0.0,
-            )
-            daemon._hud_wait_timeout_sec = 0.001
-            try:
-                # 1st batch blocks the HUD worker
-                daemon._hud("recording")
-                self.assertTrue(first_hud_entered.wait(timeout=1.0))
-                # Enqueue critical result toast 'copied', then flood >64 intermediate stage updates, then 'hide'
-                daemon._hud("copied", layer="toast", clear_main=False)
-                for idx in range(70):
-                    daemon._hud("recognizing" if idx % 2 == 0 else "refining")
-                daemon._hud("hide")
-                release_hud.set()
-                self.assertTrue(hide_seen.wait(timeout=2.0))
-                self.assertIn("copied", seen_states, "copied toast must not be evicted by stage updates")
-                self.assertIn("hide", seen_states, "hide clear must be preserved")
-            finally:
-                release_hud.set()
-                daemon.close()
-                tracker.close()
+            def _build_shim_cmd(self) -> list[str] | None:
+                return None
+
+        r_fd, w_fd = os.pipe()
+        w_file = None
+        bridge = _HudPipeBridge()
+        try:
+            # Fill pipe so writer pauses on the first HUD item while callers flood levels & HUD states.
+            os.set_blocking(w_fd, False)
+            os.set_blocking(r_fd, False)
+            filled = 0
+            while True:
+                try:
+                    filled += os.write(w_fd, b"Q" * 4096)
+                except BlockingIOError:
+                    break
+            os.set_blocking(w_fd, True)
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+            w_fd = -1
+
+            class _HudPipeProc:
+                def __init__(self, stdin_obj: Any) -> None:
+                    self.stdin = stdin_obj
+                    self.stdout = None
+                    self.stderr = None
+
+                def poll(self) -> int | None:
+                    return None
+
+                def kill(self) -> None:
+                    pass
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            proc = _HudPipeProc(w_file)
+            bridge._shim = proc  # type: ignore[assignment]
+            bridge._spawned_shim = proc  # type: ignore[assignment]
+            bridge._spawned_ready = True
+            bridge._ready.set()
+            bridge._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
+
+            t0 = time.monotonic()
+            # 1st HUD enters the writer and waits on the full pipe; enqueue critical copied toast,
+            # flood 70 intermediate stage updates + 200 high-frequency hud_level pushes, then final hide.
+            bridge.hud("recording")
+            bridge.hud("copied", layer="toast", clear_main=False)
+            for idx in range(70):
+                bridge.hud("recognizing" if idx % 2 == 0 else "refining")
+                bridge.hud_level((idx % 10) / 10.0)
+                bridge.hud_level(((idx + 3) % 10) / 10.0)
+                bridge.hud_level(((idx + 6) % 10) / 10.0)
+            bridge.hud("hide")
+            enqueue_dt = time.monotonic() - t0
+            self.assertLess(enqueue_dt, 0.15, f"HUD + hud_level burst must never block callers ({enqueue_dt:.3f}s)")
+
+            # Now drain the filler bytes so the shim writer flushes its FIFO cleanly before quit.
+            drained = 0
+            while drained < filled:
+                drained += len(os.read(r_fd, 65536))
+            bridge.close()
+
+            raw_chunks: list[bytes] = []
+            while True:
+                try:
+                    data = os.read(r_fd, 65536)
+                    if not data:
+                        break
+                    raw_chunks.append(data)
+                except BlockingIOError:
+                    break
+            msgs = [json.loads(ln) for ln in b"".join(raw_chunks).decode("utf-8").splitlines() if ln.strip()]
+            hud_states = [m["state"] for m in msgs if m.get("cmd") == "hud"]
+            lvl_cmds = [m for m in msgs if m.get("cmd") == "hud_level"]
+            self.assertIn("copied", hud_states, "copied toast must not be evicted by stage updates")
+            self.assertIn("hide", hud_states, "hide clear must be preserved")
+            self.assertLess(hud_states.index("copied"), hud_states.index("hide"))
+            self.assertLessEqual(len(hud_states), 66, "intermediate stage updates must stay bounded")
+            self.assertLessEqual(len(lvl_cmds), 1, "high-frequency hud_level must coalesce into single slot")
+        finally:
+            bridge.close()
+            if w_file is not None:
+                try:
+                    w_file.close()
+                except Exception:
+                    pass
+            if w_fd >= 0:
+                os.close(w_fd)
+            os.close(r_fd)
 
     def test_r3_p1_1_wsl_start_timeout_discard_write_failure_reaps_wedged_shim(self) -> None:
-        """R2 P1-1: WSL rec_start timeout whose discard rec_stop cannot be written must reap the wedged shim."""
-        import io
+        """R2 P1-1: WSL rec_start reply timeout whose discard rec_stop cannot be written must reap the wedged shim."""
         from agent_voice_input.platform_wsl import WslPlatform
 
+        r_fd, w_fd = os.pipe()
+        w_file = None
         with tempfile.TemporaryDirectory() as td:
             rt = Path(td) / "rt"
             rt.mkdir(parents=True, exist_ok=True)
@@ -2964,79 +3017,70 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             cfg.audio.wsl_source = "wasapi"
             plat = WslPlatform(cfg, env={"PATH": "/usr/bin"})
             respawn_calls = [0]
-
-            class _FakeWedgedProc:
-                def __init__(self) -> None:
-                    self.stdin = io.StringIO()
-                    self.stdout = None
-                    self.killed = False
-
-                def poll(self) -> int | None:
-                    return 1 if self.killed else None
-
-                def kill(self) -> None:
-                    self.killed = True
-
-                def wait(self, timeout: float | None = None) -> int:
-                    del timeout
-                    return 1
-
-            proc = _FakeWedgedProc()
-            plat._shim = proc  # type: ignore[assignment]
-            plat._spawned_shim = proc  # type: ignore[assignment]
-            plat._spawned_ready = True
-            plat._on_event = lambda _e: None
-            plat._ready.set()
-            plat._schedule_respawn_if_needed = (  # type: ignore[method-assign]
-                lambda: respawn_calls.__setitem__(0, respawn_calls[0] + 1)
-            )
-
-            lock_acquired = threading.Event()
-            release_lock = threading.Event()
-
-            def _hold_stdin_lock() -> None:
-                with plat._stdin_lock:
-                    lock_acquired.set()
-                    release_lock.wait(timeout=3.0)
-
-            orig_reap = plat._reap_owned_shim
-
-            def _reap_and_release(p: Any) -> None:
-                release_lock.set()
-                orig_reap(p)
-
-            plat._reap_owned_shim = _reap_and_release  # type: ignore[method-assign]
-
-            holder_th = threading.Thread(target=_hold_stdin_lock, daemon=True)
-
-            def _timeout_rpc(
-                payload: dict[str, Any],
-                timeout_sec: float = 5.0,
-                *,
-                allow_retry: bool = True,
-                before_write: Any = None,
-            ) -> dict[str, Any] | None:
-                del payload, timeout_sec, allow_retry
-                if before_write is not None:
-                    before_write()
-                # Wedge _stdin_lock right after rec_start was dispatched so the subsequent
-                # rec_stop(discard=True) cleanup exceeds its 0.25s write deadline and returns False.
-                holder_th.start()
-                self.assertTrue(lock_acquired.wait(timeout=2.0))
-                raise queue.Empty()
-
-            plat._shim_rpc = _timeout_rpc  # type: ignore[method-assign]
             try:
+                os.set_blocking(w_fd, False)
+                while True:
+                    try:
+                        os.write(w_fd, b"W" * 4096)
+                    except BlockingIOError:
+                        break
+                os.set_blocking(w_fd, True)
+                w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+                w_fd = -1
+
+                class _FakeWedgedProc:
+                    def __init__(self, stdin_obj: Any) -> None:
+                        self.stdin = stdin_obj
+                        self.stdout = None
+                        self.killed = False
+
+                    def poll(self) -> int | None:
+                        return 1 if self.killed else None
+
+                    def kill(self) -> None:
+                        self.killed = True
+
+                    def wait(self, timeout: float | None = None) -> int:
+                        del timeout
+                        return 1
+
+                proc = _FakeWedgedProc(w_file)
+                plat._shim = proc  # type: ignore[assignment]
+                plat._spawned_shim = proc  # type: ignore[assignment]
+                plat._spawned_ready = True
+                plat._on_event = lambda _e: None
+                plat._ready.set()
+                plat._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
+                plat._schedule_respawn_if_needed = (  # type: ignore[method-assign]
+                    lambda: respawn_calls.__setitem__(0, respawn_calls[0] + 1)
+                )
+
+                def _reply_timeout_rpc(
+                    payload: dict[str, Any],
+                    timeout_sec: float = 5.0,
+                    *,
+                    allow_retry: bool = True,
+                    target_writer: Any = None,
+                ) -> dict[str, Any] | None:
+                    del payload, timeout_sec, allow_retry, target_writer
+                    # Simulate rec_start fully written, reply timed out (queue.Empty), while stdin pipe is now full
+                    # so subsequent rec_stop(discard=True) times out with 'not_sent'.
+                    raise queue.Empty()
+
+                plat._shim_rpc = _reply_timeout_rpc  # type: ignore[method-assign]
                 with self.assertRaises(queue.Empty):
                     plat.start_recording(rt)
-                holder_th.join(timeout=2.0)
-                self.assertTrue(getattr(proc, "_stdin_poisoned", False))
                 self.assertTrue(proc.killed, "wedged shim must be killed so host cannot keep recording")
+                self.assertTrue(w_file.closed)
                 self.assertIsNone(plat._shim)
                 self.assertEqual(respawn_calls[0], 1, "reaping wedged current shim must schedule respawn")
             finally:
-                release_lock.set()
                 plat.close()
+                if w_file is not None and not w_file.closed:
+                    w_file.close()
+                if w_fd >= 0:
+                    os.close(w_fd)
+                os.close(r_fd)
 
     def test_r3_p1_2_macos_handoff_rejects_spawn_when_selected_uid_disconnects(self) -> None:
         """R2 P1-2: MacOSPlatform handoff before Popen must reject start if selected mic UID disconnected."""
@@ -3141,92 +3185,108 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                         plat.close()
 
     def test_r4_1_wsl_rec_start_lock_timeout_unwritten_does_not_kill_healthy_shim(self) -> None:
-        """R3-1: WSL rec_start timing out on _stdin_lock (0 bytes written) must NOT send discard or kill shim."""
-        import io
-        from agent_voice_input.platform_common import _ShimWriteTimeout
+        """R3-1 / ①: WSL rec_start timing out with 0 bytes written ('not_sent') must NOT send discard or kill healthy shim."""
         from agent_voice_input.platform_wsl import WslPlatform
 
+        r_fd, w_fd = os.pipe()
+        w_file = None
         with tempfile.TemporaryDirectory() as td:
             rt = Path(td) / "rt"
             rt.mkdir(parents=True, exist_ok=True)
             cfg = Config()
             cfg.audio.wsl_source = "wasapi"
             plat = WslPlatform(cfg, env={"PATH": "/usr/bin"})
-
-            class _HealthyPasteProc:
-                def __init__(self) -> None:
-                    self.stdin = io.StringIO()
-                    self.stdout = None
-                    self.killed = False
-
-                def poll(self) -> int | None:
-                    return 1 if self.killed else None
-
-                def kill(self) -> None:
-                    self.killed = True
-
-                def wait(self, timeout: float | None = None) -> int:
-                    del timeout
-                    return 0
-
-            proc = _HealthyPasteProc()
-            plat._shim = proc  # type: ignore[assignment]
-            plat._spawned_shim = proc  # type: ignore[assignment]
-            plat._spawned_ready = True
-            plat._on_event = lambda _e: None
-            plat._ready.set()
-            plat._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
-
-            lock_acquired = threading.Event()
-            release_lock = threading.Event()
-
-            def _long_paste_holder() -> None:
-                with plat._stdin_lock:
-                    lock_acquired.set()
-                    release_lock.wait(timeout=3.0)
-
-            orig_rpc = plat._shim_rpc
-
-            def _short_timeout_rpc(
-                payload: dict[str, Any],
-                timeout_sec: float = 5.0,
-                *,
-                allow_retry: bool = True,
-                before_write: Any = None,
-            ) -> dict[str, Any] | None:
-                return orig_rpc(
-                    payload,
-                    timeout_sec=0.04,
-                    allow_retry=allow_retry,
-                    before_write=before_write,
-                )
-
-            plat._shim_rpc = _short_timeout_rpc  # type: ignore[method-assign]
-            reap_calls = [0]
-            orig_detach = plat._detach_and_reap_poisoned_shim
-
-            def _counting_detach(p: Any) -> None:
-                reap_calls[0] += 1
-                orig_detach(p)
-
-            plat._detach_and_reap_poisoned_shim = _counting_detach  # type: ignore[method-assign]
-            holder_th = threading.Thread(target=_long_paste_holder, daemon=True)
-            holder_th.start()
-            self.assertTrue(lock_acquired.wait(timeout=2.0))
             try:
+                os.set_blocking(w_fd, False)
+                os.set_blocking(r_fd, False)
+                filled = 0
+                while True:
+                    try:
+                        filled += os.write(w_fd, b"P" * 4096)
+                    except BlockingIOError:
+                        break
+                os.set_blocking(w_fd, True)
+                w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+                w_fd = -1
+
+                class _HealthyPasteProc:
+                    def __init__(self, stdin_obj: Any) -> None:
+                        self.stdin = stdin_obj
+                        self.stdout = None
+                        self.killed = False
+
+                    def poll(self) -> int | None:
+                        return 1 if self.killed else None
+
+                    def kill(self) -> None:
+                        self.killed = True
+
+                    def wait(self, timeout: float | None = None) -> int:
+                        del timeout
+                        return 0
+
+                proc = _HealthyPasteProc(w_file)
+                plat._shim = proc  # type: ignore[assignment]
+                plat._spawned_shim = proc  # type: ignore[assignment]
+                plat._spawned_ready = True
+                plat._on_event = lambda _e: None
+                plat._ready.set()
+                plat._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
+
+                orig_rpc = plat._shim_rpc
+
+                def _short_timeout_rpc(
+                    payload: dict[str, Any],
+                    timeout_sec: float = 5.0,
+                    *,
+                    allow_retry: bool = True,
+                    target_writer: Any = None,
+                ) -> dict[str, Any] | None:
+                    return orig_rpc(
+                        payload,
+                        timeout_sec=0.04,
+                        allow_retry=allow_retry,
+                        target_writer=target_writer,
+                    )
+
+                plat._shim_rpc = _short_timeout_rpc  # type: ignore[method-assign]
+                reap_calls = [0]
+                orig_poison = plat._poison_and_reap_writer
+
+                def _counting_poison(w: Any) -> None:
+                    reap_calls[0] += 1
+                    orig_poison(w)
+
+                plat._poison_and_reap_writer = _counting_poison  # type: ignore[method-assign]
                 with self.assertRaises(_ShimWriteTimeout) as ctx:
                     plat.start_recording(rt)
+                self.assertEqual(ctx.exception.write_status, "not_sent")
                 self.assertFalse(ctx.exception.partial)
                 self.assertFalse(ctx.exception.written)
-                self.assertEqual(reap_calls[0], 0, "unwritten rec_start must NOT reap shim serving concurrent paste")
+                self.assertEqual(reap_calls[0], 0, "unwritten rec_start must NOT reap healthy shim")
                 self.assertFalse(proc.killed, "healthy shim must remain alive")
-                self.assertFalse(getattr(proc, "_stdin_poisoned", False))
+                writer = plat._current_shim_writer()
+                self.assertIsNotNone(writer)
+                assert writer is not None
+                self.assertFalse(writer.poisoned)
                 self.assertIs(plat._shim, proc)
-                self.assertEqual(proc.stdin.getvalue(), "", "no discard rec_stop should be written when 0 bytes sent")
+
+                # Drain exact filler bytes and confirm zero rec_start/rec_stop bytes entered the pipe.
+                drained = 0
+                while drained < filled:
+                    drained += len(os.read(r_fd, 65536))
+                try:
+                    extra = os.read(r_fd, 4096)
+                except BlockingIOError:
+                    extra = b""
+                self.assertEqual(extra, b"", "no rec_start or discard rec_stop should be written on 0-byte timeout")
             finally:
-                release_lock.set()
-                holder_th.join(timeout=2.0)
                 plat.close()
+                if w_file is not None and not w_file.closed:
+                    w_file.close()
+                if w_fd >= 0:
+                    os.close(w_fd)
+                os.close(r_fd)
 
     def test_r4_2_macos_stale_probe_cannot_clobber_newer_disconnect_event_cache(self) -> None:
         """R3-2: Stale macOS audio probe returning after a newer disconnect event must not clobber cache or spawn."""
@@ -3311,6 +3371,761 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             finally:
                 release_probe.set()
                 plat.close()
+
+    def test_r5_p1_1_unpaired_surrogate_and_writer_exception_never_hang_write_sync(self) -> None:
+        """P1 #1: Lone UTF-16 surrogates serialize safely and unexpected writer exceptions always wake write_sync()."""
+        r_fd, w_fd = os.pipe()
+        w_file = None
+        try:
+            os.set_blocking(r_fd, False)
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+            w_fd = -1
+
+            class _Proc:
+                def __init__(self, stdin_obj: Any) -> None:
+                    self.stdin = stdin_obj
+                    self.stdout = None
+
+                def poll(self) -> int | None:
+                    return None
+
+                def kill(self) -> None:
+                    pass
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            # 1a. Real POSIX pipe + lone surrogate in both _dump_jsonl/direct write_sync must succeed without hanging
+            writer = _ShimWriter(_Proc(w_file))  # type: ignore[arg-type]
+            try:
+                bad_line = json.dumps({"cmd": "paste", "text": "hello\ud800world"}, ensure_ascii=False) + "\n"
+                st, rsn = writer.write_sync(bad_line, time.monotonic() + 1.0)
+                self.assertEqual((st, rsn), ("sent", ""))
+                raw = os.read(r_fd, 4096).decode("utf-8")
+                parsed = json.loads(raw.strip())
+                self.assertEqual(parsed["cmd"], "paste")
+                self.assertEqual(parsed["text"], "hello?world")
+            finally:
+                writer.close(send_quit=False)
+
+            # 1b. Unexpected exception inside writer thread MUST still finish active item and wake write_sync()
+            class _BoomPipe:
+                closed = False
+
+                def write(self, _s: str) -> int:
+                    raise RuntimeError("boom_inside_writer")
+
+                def flush(self) -> None:
+                    pass
+
+                def close(self) -> None:
+                    self.closed = True
+
+            boom_pipe = _BoomPipe()
+            writer2 = _ShimWriter(_Proc(boom_pipe))  # type: ignore[arg-type]
+            try:
+                res_box: list[tuple[str, str]] = []
+
+                def _call_sync() -> None:
+                    res_box.append(writer2.write_sync('{"cmd":"paste"}\n', time.monotonic() + 5.0))
+
+                t = threading.Thread(target=_call_sync, daemon=True)
+                t.start()
+                t.join(timeout=1.0)
+                self.assertFalse(t.is_alive(), "write_sync() hung after unexpected writer exception")
+                self.assertEqual(res_box, [("not_sent", "broken")])
+                self.assertTrue(boom_pipe.closed)
+            finally:
+                writer2.close(send_quit=False)
+        finally:
+            if w_file is not None and not w_file.closed:
+                w_file.close()
+            if w_fd >= 0:
+                os.close(w_fd)
+            os.close(r_fd)
+
+    def test_r5_p1_2_concurrent_reap_closes_stdin_strictly_once_via_writer(self) -> None:
+        """P1 #2: Concurrent _reap_owned_shim callers never bypass _ShimWriter to close proc.stdin directly."""
+        class _ReapBridge(JsonlShimMixin):
+            _shim_graceful = False
+            _shim_label = "reap_race_test"
+
+            def __init__(self) -> None:
+                self.cfg = Config()
+                self.env = {}
+                self._init_shim_bridge()
+
+            def _build_shim_cmd(self) -> list[str] | None:
+                return None
+
+        r_fd, w_fd = os.pipe()
+        w_file = None
+        bridge = _ReapBridge()
+        try:
+            # Fill pipe so writer thread stays active inside _write_line_to_pipe when two reapers arrive.
+            os.set_blocking(w_fd, False)
+            while True:
+                try:
+                    os.write(w_fd, b"X" * 4096)
+                except BlockingIOError:
+                    break
+            os.set_blocking(w_fd, True)
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+            w_fd = -1
+
+            close_events: list[str] = []
+
+            class _TrackedStdin:
+                def __init__(self, inner: Any) -> None:
+                    self._inner = inner
+
+                @property
+                def closed(self) -> bool:
+                    return bool(self._inner.closed)
+
+                def fileno(self) -> int:
+                    return int(self._inner.fileno())
+
+                def write(self, s: str) -> int:
+                    return int(self._inner.write(s))
+
+                def flush(self) -> None:
+                    self._inner.flush()
+
+                def close(self) -> None:
+                    close_events.append(threading.current_thread().name)
+                    self._inner.close()
+
+            class _Proc:
+                def __init__(self, stdin_obj: Any) -> None:
+                    self.stdin = stdin_obj
+                    self.stdout = None
+
+                def poll(self) -> int | None:
+                    return 0
+
+                def kill(self) -> None:
+                    pass
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            tracked = _TrackedStdin(w_file)
+            proc = _Proc(tracked)
+            writer = _ShimWriter(proc)  # type: ignore[arg-type]
+            with bridge._shim_lock:
+                bridge._shim = proc  # type: ignore[assignment]
+                bridge._shim_writer = writer
+                bridge._live_writers[id(proc)] = writer
+
+            # Keep writer busy polling full pipe when concurrent reaps fire
+            writer.enqueue_async('{"cmd":"hud","state":"recording"}\n', deadline_sec=1.0, is_hud=True)
+            time.sleep(0.02)
+
+            barrier = threading.Barrier(2)
+
+            def _reap_worker() -> None:
+                barrier.wait(timeout=2.0)
+                bridge._reap_owned_shim(proc)  # type: ignore[arg-type]
+
+            t1 = threading.Thread(target=_reap_worker, name="reap-reader-eof", daemon=True)
+            t2 = threading.Thread(target=_reap_worker, name="reap-ensure-shim", daemon=True)
+            t1.start()
+            t2.start()
+            t1.join(timeout=2.0)
+            t2.join(timeout=2.0)
+            self.assertFalse(t1.is_alive())
+            self.assertFalse(t2.is_alive())
+            self.assertFalse(writer._thread.is_alive())
+            self.assertEqual(
+                close_events,
+                ["avi-shim-writer"],
+                f"proc.stdin.close() must happen exactly once inside writer thread, got {close_events}",
+            )
+            self.assertNotIn(id(proc), bridge._live_writers)
+        finally:
+            bridge.close()
+            if w_file is not None and not w_file.closed:
+                w_file.close()
+            if w_fd >= 0:
+                os.close(w_fd)
+            os.close(r_fd)
+
+    def test_r5_p1_3_wsl_rec_start_discard_and_release_pinned_to_same_shim_writer(self) -> None:
+        """P1 #3: Dual-pipe shim swap between _ensure_shim and _shim_rpc never sends rec_start to B and discard/release to A."""
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        def _make_pipe_proc() -> tuple[int, Any, Any]:
+            r_fd, w_fd = os.pipe()
+            os.set_blocking(r_fd, False)
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+
+            class _PipeShimProc:
+                def __init__(self, stdin_obj: Any) -> None:
+                    self.stdin = stdin_obj
+                    self.stdout = None
+                    self.killed = False
+
+                def poll(self) -> int | None:
+                    return 1 if self.killed else None
+
+                def kill(self) -> None:
+                    self.killed = True
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 1
+
+            return r_fd, w_file, _PipeShimProc(w_file)
+
+        def _read_all_cmds(r_fd: int) -> list[dict[str, Any]]:
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    data = os.read(r_fd, 65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+                except BlockingIOError:
+                    break
+            return [json.loads(ln) for ln in b"".join(chunks).decode("utf-8").splitlines() if ln.strip()]
+
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            cfg = Config()
+            cfg.audio.wsl_source = "wasapi"
+            cfg.audio.tail_drain_sec = 0.0
+            plat = WslPlatform(cfg, env={"PATH": "/usr/bin"})
+            ra_fd, wa_file, proc_a = _make_pipe_proc()
+            rb_fd, wb_file, proc_b = _make_pipe_proc()
+            try:
+                plat._shim = proc_a  # type: ignore[assignment]
+                plat._spawned_shim = proc_a  # type: ignore[assignment]
+                plat._spawned_ready = True
+                plat._ready.set()
+                plat._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
+
+                # Swap plat._shim -> proc_b right after start_recording pins writer_a!
+                orig_cur_writer = plat._current_shim_writer
+                swapped = [False]
+
+                def _swap_after_pick() -> Any:
+                    w = orig_cur_writer()
+                    if not swapped[0]:
+                        swapped[0] = True
+                        with plat._shim_lock:
+                            plat._shim = proc_b  # type: ignore[assignment]
+                            plat._shim_writer = None
+                            plat._spawned_shim = proc_b  # type: ignore[assignment]
+                            plat._spawned_ready = True
+                    return w
+
+                orig_rpc = plat._shim_rpc
+
+                def _fast_rpc(
+                    payload: dict[str, Any],
+                    timeout_sec: float = 5.0,
+                    *,
+                    allow_retry: bool = True,
+                    target_writer: Any = None,
+                ) -> dict[str, Any] | None:
+                    return orig_rpc(
+                        payload,
+                        timeout_sec=0.05,
+                        allow_retry=allow_retry,
+                        target_writer=target_writer,
+                    )
+
+                plat._current_shim_writer = _swap_after_pick  # type: ignore[method-assign]
+                plat._shim_rpc = _fast_rpc  # type: ignore[method-assign]
+                with self.assertRaises(queue.Empty):
+                    plat.start_recording(rt)
+
+                # Wait briefly for discard flush on writer A, then inspect both pipes.
+                time.sleep(0.05)
+                cmds_a = _read_all_cmds(ra_fd)
+                cmds_b = _read_all_cmds(rb_fd)
+                self.assertEqual([c["cmd"] for c in cmds_a], ["rec_start", "rec_stop"])
+                self.assertIs(cmds_a[1].get("discard"), True)
+                self.assertEqual(cmds_a[0].get("rec_gen"), cmds_a[1].get("rec_gen"))
+                self.assertEqual(cmds_b, [], f"New shim B must receive zero commands when A was pinned, got {cmds_b}")
+                self.assertFalse(proc_b.killed)
+
+                # 3b. stop_recording + rec_release must also stay pinned to the original recording writer A!
+                plat._current_shim_writer = orig_cur_writer  # type: ignore[method-assign]
+                writer_a = getattr(proc_a, "_shim_writer_obj")
+                with plat._winmm_state_lock:
+                    plat._winmm_gen = 9
+                    plat._rec_mode = "winmm"
+                    plat._rec_writer = writer_a
+
+                def _reply_on_a(
+                    payload: dict[str, Any],
+                    timeout_sec: float = 5.0,
+                    *,
+                    allow_retry: bool = True,
+                    target_writer: Any = None,
+                ) -> dict[str, Any] | None:
+                    self.assertIs(target_writer, writer_a)
+                    return {"ok": True, "rec_gen": payload.get("rec_gen"), "wav_b64": ""}
+
+                plat._shim_rpc = _reply_on_a  # type: ignore[method-assign]
+                plat.stop_recording(drain=False)
+                time.sleep(0.05)
+                cmds_a2 = _read_all_cmds(ra_fd)
+                cmds_b2 = _read_all_cmds(rb_fd)
+                self.assertEqual([c["cmd"] for c in cmds_a2], ["rec_release"])
+                self.assertEqual(cmds_a2[0].get("rec_gen"), 9)
+                self.assertEqual(cmds_b2, [], f"rec_release must not leak to new shim B, got {cmds_b2}")
+            finally:
+                plat.close()
+                for wf in (wa_file, wb_file):
+                    if not wf.closed:
+                        wf.close()
+                os.close(ra_fd)
+                os.close(rb_fd)
+
+    def test_r5_p1_4_hud_never_blocks_during_slow_shim_respawn(self) -> None:
+        """P1 #4 + R2 P1 #2: hud('hide') and hud_level() return immediately (<50ms) even while Popen() holds _shim_lock for 350ms+."""
+        class _SlowRespawnBridge(JsonlShimMixin):
+            _shim_graceful = False
+            _shim_ready_timeout = 5.0
+            _shim_label = "slow_respawn_test"
+
+            def __init__(self) -> None:
+                self.cfg = Config()
+                self.env = {}
+                self._init_shim_bridge()
+
+            def _build_shim_cmd(self) -> list[str] | None:
+                return ["/fake/slow-shim"]
+
+        bridge = _SlowRespawnBridge()
+        bridge._on_event = lambda _e: None
+        popen_entered = threading.Event()
+        allow_popen_finish = threading.Event()
+
+        def _slow_popen(*_args: Any, **_kwargs: Any) -> Any:
+            popen_entered.set()
+            allow_popen_finish.wait(timeout=2.0)
+            raise OSError("simulated slow popen abort")
+
+        def _run_respawn() -> None:
+            try:
+                bridge._ensure_shim(ignore_cooldown=True)
+            except OSError:
+                pass
+
+        respawn_th = threading.Thread(target=_run_respawn, daemon=True)
+        try:
+            with mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_slow_popen):
+                respawn_th.start()
+                self.assertTrue(popen_entered.wait(timeout=1.0), "Popen() inside _shim_lock did not start")
+                acquired = bridge._shim_lock.acquire(blocking=False)
+                if acquired:
+                    bridge._shim_lock.release()
+                self.assertFalse(acquired, "_shim_lock must actually be held during Popen()")
+                t0 = time.monotonic()
+                self.assertIsNone(bridge._ready_shim_writer())
+                bridge.hud("hide")
+                bridge.hud("recording")
+                bridge.hud_level(0.75)
+                dt = time.monotonic() - t0
+                self.assertLess(dt, 0.05, f"hud/hud_level blocked while Popen() held _shim_lock ({dt:.3f}s)")
+                time.sleep(0.35)
+                self.assertTrue(
+                    respawn_th.is_alive(),
+                    "Popen() should still be holding _shim_lock after 350ms while hud already returned",
+                )
+        finally:
+            allow_popen_finish.set()
+            respawn_th.join(timeout=2.0)
+            bridge.close()
+
+    def test_r6_p1_1_wsl_rec_stop_detaching_exited_shim_schedules_respawn(self) -> None:
+        """R2 P1 #1: When WSL rec_stop detaches an exited shim before reader EOF, respawn still runs and restores hotkeys."""
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        respawned_shim_code = (
+            "import json, sys\n"
+            "print(json.dumps({'event': 'ready'}), flush=True)\n"
+            "print(json.dumps({'event': 'toggle', 'hwnd': 1, 'process': 'WindowsTerminal.exe', 'title': 'codex'}), flush=True)\n"
+            "for ln in sys.stdin:\n"
+            "    if not ln.strip(): continue\n"
+            "    req = json.loads(ln)\n"
+            "    if req.get('cmd') == 'quit': break\n"
+            "    print(json.dumps({'type': 'reply', 'reply': req.get('cmd'), 'seq_id': req.get('seq_id', 0), 'ok': True}), flush=True)\n"
+        )
+
+        in_r, in_w = os.pipe()
+        out_r, out_w = os.pipe()
+        in_w_file = os.fdopen(in_w, "w", encoding="utf-8", buffering=1)
+        out_r_file = os.fdopen(out_r, "r", encoding="utf-8")
+        out_w_file = os.fdopen(out_w, "w", encoding="utf-8", buffering=1)
+
+        class _ExitingShimProc:
+            def __init__(self, stdin_obj: Any, stdout_obj: Any) -> None:
+                self.stdin = stdin_obj
+                self.stdout = stdout_obj
+                self.exited = False
+
+            def poll(self) -> int | None:
+                return 1 if self.exited else None
+
+            def kill(self) -> None:
+                self.exited = True
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                self.exited = True
+                return 1
+
+        cfg = Config()
+        cfg.audio.wsl_source = "wasapi"
+        cfg.audio.tail_drain_sec = 0.0
+        spawn_count = [0]
+
+        def _factory() -> list[str]:
+            spawn_count[0] += 1
+            return [sys.executable, "-u", "-c", respawned_shim_code]
+
+        plat = WslPlatform(cfg, env={"PATH": "/usr/bin"}, shim_cmd_factory=_factory)
+        plat._shim_respawn_delays = (0.01,)
+        hotkey_events: list[dict[str, Any]] = []
+        got_toggle_evt = threading.Event()
+
+        def _on_ev(msg: dict[str, Any]) -> None:
+            hotkey_events.append(msg)
+            if msg.get("event") == "toggle":
+                got_toggle_evt.set()
+
+        reader_th: threading.Thread | None = None
+        try:
+            proc1 = _ExitingShimProc(in_w_file, out_r_file)
+            writer1 = _ShimWriter(proc1, on_poison=plat._on_writer_poison)  # type: ignore[arg-type]
+            plat._on_event = _on_ev
+            plat._ensure_event_worker()
+            with plat._shim_lock:
+                plat._shim = proc1  # type: ignore[assignment]
+                plat._shim_writer = writer1
+                plat._live_writers[id(proc1)] = writer1
+                plat._spawned_shim = proc1  # type: ignore[assignment]
+                plat._spawned_ready = False
+                plat._shim_ever_ready = True
+                plat._ready.clear()
+            reader_th = threading.Thread(target=plat._shim_reader, args=(proc1, None), daemon=True)
+            setattr(proc1, "_shim_reader_th", reader_th)
+            reader_th.start()
+
+            out_w_file.write(json.dumps({"event": "ready"}) + "\n")
+            out_w_file.flush()
+            self.assertTrue(plat._ready.wait(timeout=2.0), "shim #1 reader did not process ready")
+
+            with plat._winmm_state_lock:
+                plat._winmm_gen = 3
+                plat._rec_mode = "winmm"
+                plat._rec_writer = writer1
+
+            # Shim #1 exits BEFORE stdout reaches EOF in _shim_reader.
+            proc1.exited = True
+            with self.assertRaises(BrokenPipeError):
+                plat.stop_recording(drain=False)
+
+            # Confirm rec_stop won the race and detached self._shim before reader EOF ran.
+            self.assertIsNot(plat._shim, proc1)
+            self.assertTrue(reader_th.is_alive(), "reader should still be waiting on stdout before EOF")
+
+            # Now deliver EOF to reader #1; reader sees self._shim is already detached and skips respawn.
+            out_w_file.close()
+            reader_th.join(timeout=2.0)
+            self.assertFalse(reader_th.is_alive())
+
+            # Respawn scheduled by _shim_rpc must launch shim #2 and restore global hotkey delivery.
+            self.assertTrue(
+                got_toggle_evt.wait(timeout=3.0),
+                "respawn did not launch shim #2 and deliver hotkey event after rec_stop detached exited shim",
+            )
+            self.assertGreaterEqual(spawn_count[0], 1)
+            self.assertTrue(plat.is_shim_ok())
+        finally:
+            if not out_w_file.closed:
+                out_w_file.close()
+            plat.close()
+            if reader_th is not None and reader_th.is_alive():
+                reader_th.join(timeout=1.0)
+            for fobj in (in_w_file, out_r_file):
+                if not fobj.closed:
+                    fobj.close()
+            os.close(in_r)
+
+    def test_r5_p1_5_terminal_hud_frames_survive_650ms_pipe_backpressure(self) -> None:
+        """P1 #5: Terminal HUD frames (copied, hide) survive 650ms pipe backpressure after recording and arrive intact."""
+        class _BackpressureHudBridge(JsonlShimMixin):
+            _shim_graceful = False
+            _shim_label = "hud_bp_test"
+
+            def __init__(self) -> None:
+                self.cfg = Config()
+                self.env = {}
+                self._init_shim_bridge()
+
+            def _build_shim_cmd(self) -> list[str] | None:
+                return None
+
+        r_fd, w_fd = os.pipe()
+        w_file = None
+        bridge = _BackpressureHudBridge()
+        try:
+            os.set_blocking(r_fd, False)
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+            w_fd = -1
+
+            class _BpProc:
+                def __init__(self, stdin_obj: Any) -> None:
+                    self.stdin = stdin_obj
+                    self.stdout = None
+
+                def poll(self) -> int | None:
+                    return None
+
+                def kill(self) -> None:
+                    pass
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            proc = _BpProc(w_file)
+            bridge._shim = proc  # type: ignore[assignment]
+            bridge._spawned_shim = proc  # type: ignore[assignment]
+            bridge._spawned_ready = True
+            bridge._ready.set()
+
+            # 1) Deliver 'recording' first onto the empty pipe and confirm it arrived.
+            bridge.hud("recording")
+            rec_raw = b""
+            dl_rec = time.monotonic() + 1.0
+            while time.monotonic() < dl_rec and b"\n" not in rec_raw:
+                try:
+                    rec_raw += os.read(r_fd, 4096)
+                except BlockingIOError:
+                    time.sleep(0.005)
+            first_msg = json.loads(rec_raw.decode("utf-8").strip())
+            self.assertEqual(first_msg.get("state"), "recording")
+
+            # 2) Fill pipe to create sustained 650ms backpressure, then enqueue terminal copied + hide frames.
+            pipe_fd = w_file.fileno()
+            os.set_blocking(pipe_fd, False)
+            filled = 0
+            while True:
+                try:
+                    filled += os.write(pipe_fd, b"B" * 4096)
+                except BlockingIOError:
+                    break
+            os.set_blocking(pipe_fd, True)
+
+            bridge.hud("copied", layer="toast", clear_main=False)
+            bridge.hud("hide")
+            time.sleep(0.65)
+
+            # 3) Drain filler bytes and verify both copied and hide arrive cleanly before quit.
+            buf = bytearray()
+            while len(buf) < filled:
+                try:
+                    chunk = os.read(r_fd, 65536)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                except BlockingIOError:
+                    time.sleep(0.005)
+            bridge.close()
+
+            while True:
+                try:
+                    data = os.read(r_fd, 65536)
+                    if not data:
+                        break
+                    buf.extend(data)
+                except BlockingIOError:
+                    break
+            tail_bytes = bytes(buf[filled:])
+            msgs = [json.loads(ln) for ln in tail_bytes.decode("utf-8").splitlines() if ln.strip()]
+            hud_states = [m["state"] for m in msgs if m.get("cmd") == "hud"]
+            self.assertEqual(
+                hud_states,
+                ["copied", "hide"],
+                f"copied and hide must survive 650ms backpressure in order, got {hud_states}",
+            )
+        finally:
+            bridge.close()
+            if w_file is not None and not w_file.closed:
+                w_file.close()
+            if w_fd >= 0:
+                os.close(w_fd)
+            os.close(r_fd)
+
+    def test_r7_lockfree_ready_writer_nonblocking_popen_and_zero_terminal_hud_drops(self) -> None:
+        """R3 fix: _ready_shim_writer() is lock-free on healthy shims—(1) hud('hide') returns <50ms during 350ms Popen() holding _shim_lock, and (2) terminal hud('copied')/hud('hide') never drop under concurrent hud_level() & _shim_lock contention."""
+        class _R7Bridge(JsonlShimMixin):
+            _shim_graceful = False
+            _shim_ready_timeout = 5.0
+            _shim_label = "r7_hud_lockfree_test"
+
+            def __init__(self) -> None:
+                self.cfg = Config()
+                self.env = {}
+                self._init_shim_bridge()
+
+            def _build_shim_cmd(self) -> list[str] | None:
+                return ["/fake/r7-shim"]
+
+        # Part 1: _ensure_shim() holding _shim_lock inside Popen() for 350ms -> hud('hide') returns <50ms.
+        slow_bridge = _R7Bridge()
+        slow_bridge._on_event = lambda _e: None
+        popen_entered = threading.Event()
+        allow_popen_exit = threading.Event()
+
+        def _slow_popen(*_args: Any, **_kwargs: Any) -> Any:
+            popen_entered.set()
+            allow_popen_exit.wait(timeout=2.0)
+            raise OSError("simulated slow popen")
+
+        def _spawn_worker() -> None:
+            try:
+                slow_bridge._ensure_shim(ignore_cooldown=True)
+            except OSError:
+                pass
+
+        spawn_th = threading.Thread(target=_spawn_worker, daemon=True)
+        try:
+            with mock.patch("agent_voice_input.platform_common.subprocess.Popen", side_effect=_slow_popen):
+                spawn_th.start()
+                self.assertTrue(popen_entered.wait(timeout=1.0), "Popen() did not enter under _shim_lock")
+                t0 = time.monotonic()
+                slow_bridge.hud("hide")
+                slow_bridge.hud_level(0.4)
+                dt = time.monotonic() - t0
+                self.assertLess(dt, 0.05, f"hud('hide') blocked during slow Popen() ({dt:.3f}s)")
+                time.sleep(0.35)
+                self.assertTrue(spawn_th.is_alive(), "Popen() should still hold _shim_lock after 350ms")
+        finally:
+            allow_popen_exit.set()
+            spawn_th.join(timeout=2.0)
+            slow_bridge.close()
+
+        # Part 2: Healthy shim under heavy concurrent hud_level() + _shim_lock contention ->
+        # 100% of terminal hud('copied') & hud('hide') frames are enqueued and delivered without drops.
+        r_fd, w_fd = os.pipe()
+        w_file = None
+        r_file = None
+        bridge = _R7Bridge()
+        received: list[dict[str, Any]] = []
+        reader_done = threading.Event()
+
+        def _drain_pipe() -> None:
+            assert r_file is not None
+            try:
+                for raw in r_file:
+                    if raw.strip():
+                        received.append(json.loads(raw))
+            finally:
+                reader_done.set()
+
+        stop_storm = threading.Event()
+        storm_threads: list[threading.Thread] = []
+        try:
+            r_file = os.fdopen(r_fd, "r", encoding="utf-8")
+            r_fd = -1
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1)
+            w_fd = -1
+            drain_th = threading.Thread(target=_drain_pipe, daemon=True)
+            drain_th.start()
+
+            class _HealthyProc:
+                def __init__(self, stdin_obj: Any) -> None:
+                    self.stdin = stdin_obj
+                    self.stdout = None
+
+                def poll(self) -> int | None:
+                    return None
+
+                def kill(self) -> None:
+                    pass
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    return 0
+
+            proc = _HealthyProc(w_file)
+            writer = _ShimWriter(proc, on_poison=bridge._on_writer_poison)  # type: ignore[arg-type]
+            with bridge._shim_lock:
+                bridge._live_writers[id(proc)] = writer
+                bridge._spawned_shim = proc  # type: ignore[assignment]
+                bridge._spawned_ready = True
+                bridge._shim_writer = writer
+                bridge._shim = proc  # type: ignore[assignment]
+            bridge._ready.set()
+
+            def _level_storm() -> None:
+                i = 0
+                while not stop_storm.is_set():
+                    bridge.hud_level((i % 10) / 10.0)
+                    i += 1
+
+            def _lock_hog() -> None:
+                while not stop_storm.is_set():
+                    with bridge._shim_lock:
+                        time.sleep(0.002)
+
+            with preemption_watchdog(timeout_sec=10.0, switch_interval=1e-6):
+                for fn in (_level_storm, _level_storm, _lock_hog):
+                    th = threading.Thread(target=fn, daemon=True)
+                    th.start()
+                    storm_threads.append(th)
+
+                rounds = 30
+                for idx in range(rounds):
+                    bridge.hud("copied", text=f"copied-{idx}", layer="toast", clear_main=False)
+                    bridge.hud("hide")
+                    time.sleep(0.002)
+
+                stop_storm.set()
+                for th in storm_threads:
+                    th.join(timeout=2.0)
+                bridge.close()
+                self.assertTrue(reader_done.wait(timeout=3.0), "pipe reader did not reach EOF after close()")
+                drain_th.join(timeout=1.0)
+
+            hud_msgs = [m for m in received if m.get("cmd") == "hud"]
+            copied_texts = [m.get("text") for m in hud_msgs if m.get("state") == "copied"]
+            hide_count = sum(1 for m in hud_msgs if m.get("state") == "hide")
+            self.assertEqual(
+                copied_texts,
+                [f"copied-{i}" for i in range(rounds)],
+                f"Expected all {rounds} copied frames in order without drops, got {len(copied_texts)}",
+            )
+            self.assertEqual(
+                hide_count,
+                rounds,
+                f"Expected all {rounds} hide frames without drops, got {hide_count}",
+            )
+        finally:
+            stop_storm.set()
+            for th in storm_threads:
+                if th.is_alive():
+                    th.join(timeout=1.0)
+            bridge.close()
+            if w_file is not None and not w_file.closed:
+                w_file.close()
+            if r_file is not None and not r_file.closed:
+                r_file.close()
+            if w_fd >= 0:
+                os.close(w_fd)
+            if r_fd >= 0:
+                os.close(r_fd)
 
 
 if __name__ == "__main__":

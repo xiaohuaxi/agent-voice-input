@@ -29,8 +29,6 @@ from .platform_common import (
     MicrophoneUnavailableError,
     NoMicrophoneError,
     PasteOutcome,
-    _ShimWriteTimeout,
-    _reap_shim_proc,
     classify_ffmpeg_startup_error,
     invoke_recorder_lost_callback,
     invoke_recorder_recovered_callback,
@@ -293,6 +291,7 @@ class WslPlatform(JsonlShimMixin):
         self._active_seq_id: int | None = None
         self._winmm_starting = False
         self._winmm_rpc_dispatched = False
+        self._rec_writer: Any = None
         self._pending_winmm_lost_reason = ""
         self._pending_winmm_recovered_gaps: list[int] = []
         self._recorder_lost_cb: Callable[..., Any] | None = None
@@ -460,55 +459,55 @@ class WslPlatform(JsonlShimMixin):
                 self._rec_mode = ""
                 self._winmm_starting = True
                 self._winmm_rpc_dispatched = False
+                self._rec_writer = None
                 self._pending_winmm_lost_reason = ""
                 self._pending_winmm_recovered_gaps.clear()
             req: dict[str, Any] = {"cmd": "rec_start", "rec_gen": my_gen}
             if eff_loopback:
                 req["loopback"] = True
 
-            before_write_ran = False
-            dispatched_proc: subprocess.Popen[str] | None = None
-
-            def _on_before_write() -> None:
-                nonlocal before_write_ran, dispatched_proc
+            target_writer: Any = None
+            try:
+                if not self._ensure_shim():
+                    raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
+                target_writer = self._current_shim_writer()
+                if (
+                    target_writer is None
+                    and getattr(self._shim_rpc, "__func__", None) is JsonlShimMixin._shim_rpc
+                ):
+                    if not self._ensure_shim():
+                        raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
+                    target_writer = self._current_shim_writer()
+                    if target_writer is None:
+                        raise BrokenPipeError("shim_not_running")
                 with self._winmm_state_lock:
                     if self._closed or self._winmm_gen != my_gen:
                         raise self._classify_wasapi_start_error("mic_busy:wasapi_aborted")
                     self._winmm_rpc_dispatched = True
-                    before_write_ran = True
-                    dispatched_proc = self._shim
-
-            try:
+                    self._rec_writer = target_writer
                 res = (
                     self._shim_rpc(
                         req,
                         timeout_sec=4.0,
                         allow_retry=False,
-                        before_write=_on_before_write,
+                        target_writer=target_writer,
                     )
                     or {}
                 )
             except Exception as shim_exc:
                 fb_gen = 0
                 should_discard_winmm = False
-                not_written = isinstance(shim_exc, _ShimWriteTimeout) and not shim_exc.partial
                 with self._winmm_state_lock:
                     if self._winmm_gen == my_gen:
+                        # Only send discard when rec_start was fully written and only the reply timed out
+                        # (queue.Empty). On write_status=="not_sent" (0 bytes) or "partial" (writer already
+                        # closed stdin & reaped shim), never send discard or kill a healthy shim.
                         should_discard_winmm = (
-                            not not_written
-                            and (
-                                self._winmm_rpc_dispatched
-                                or before_write_ran
-                                or isinstance(shim_exc, (queue.Empty, TimeoutError))
-                            )
-                            and not self._closed
-                            and not isinstance(
-                                shim_exc,
-                                (BrokenPipeError, NoMicrophoneError, MicrophoneUnavailableError),
-                            )
+                            isinstance(shim_exc, queue.Empty) and not self._closed
                         )
                         self._winmm_starting = False
                         self._winmm_rpc_dispatched = False
+                        self._rec_writer = None
                         self._active_seq_id = None
                         self._pending_winmm_lost_reason = ""
                         self._pending_winmm_recovered_gaps.clear()
@@ -522,20 +521,11 @@ class WslPlatform(JsonlShimMixin):
                             fb_gen = self._winmm_gen
                             self._active_seq_id = seq_id
                             self._rec_mode = "pulse"
-                if should_discard_winmm:
+                if should_discard_winmm and target_writer is not None:
                     discard_req = {"cmd": "rec_stop", "rec_gen": my_gen, "discard": True}
-                    with self._shim_lock:
-                        target_proc = dispatched_proc if dispatched_proc is not None else self._shim
-                    if dispatched_proc is not None and dispatched_proc is not self._shim:
-                        sent = self._send_shim_fire_and_forget_to_proc(dispatched_proc, discard_req)
-                    else:
-                        sent = self._send_shim_fire_and_forget(discard_req)
-                    if not sent and target_proc is not None and not self._closed:
-                        try:
-                            setattr(target_proc, "_stdin_poisoned", True)
-                        except Exception:
-                            pass
-                        self._detach_and_reap_poisoned_shim(target_proc)
+                    status = self._write_shim_command(discard_req, writer=target_writer, timeout_sec=0.25)
+                    if status != "sent" and not self._closed:
+                        self._poison_and_reap_writer(target_writer)
                 self.last_audio_error = str(shim_exc)
                 if fb_gen:
                     try:
@@ -578,6 +568,7 @@ class WslPlatform(JsonlShimMixin):
                         if self._winmm_gen == my_gen:
                             self._winmm_starting = False
                             self._winmm_rpc_dispatched = False
+                            self._rec_writer = None
                             self._active_seq_id = None
                             self._pending_winmm_lost_reason = ""
                             self._pending_winmm_recovered_gaps.clear()
@@ -590,15 +581,12 @@ class WslPlatform(JsonlShimMixin):
                         early_gaps = list(self._pending_winmm_recovered_gaps)
                         self._pending_winmm_recovered_gaps.clear()
                 if stale_ok:
-                    if not before_write_ran and not self._closed:
-                        try:
-                            self._shim_rpc(
-                                {"cmd": "rec_stop", "rec_gen": my_gen, "discard": True},
-                                timeout_sec=2.0,
-                                allow_retry=False,
-                            )
-                        except Exception:
-                            pass
+                    if not self._closed and target_writer is not None:
+                        self._write_shim_command(
+                            {"cmd": "rec_stop", "rec_gen": my_gen, "discard": True},
+                            writer=target_writer,
+                            timeout_sec=0.25,
+                        )
                     self.last_audio_error = "mic_busy:wasapi_aborted"
                     raise self._classify_wasapi_start_error("mic_busy:wasapi_aborted")
                 if early_gaps:
@@ -619,6 +607,7 @@ class WslPlatform(JsonlShimMixin):
                 if self._winmm_gen == my_gen:
                     self._winmm_starting = False
                     self._winmm_rpc_dispatched = False
+                    self._rec_writer = None
                     self._active_seq_id = None
                     self._pending_winmm_lost_reason = ""
                     self._pending_winmm_recovered_gaps.clear()
@@ -671,6 +660,7 @@ class WslPlatform(JsonlShimMixin):
             self._winmm_gen += 1
             self._active_seq_id = None
             was_dispatched = self._winmm_rpc_dispatched
+            rec_writer, self._rec_writer = self._rec_writer, None
             self._winmm_starting = False
             self._winmm_rpc_dispatched = False
             self._pending_winmm_lost_reason = ""
@@ -694,6 +684,7 @@ class WslPlatform(JsonlShimMixin):
                         stop_req,
                         timeout_sec=self._rec_stop_timeout_sec,
                         allow_retry=False,
+                        target_writer=rec_writer,
                     )
                     or {}
                 )
@@ -710,7 +701,11 @@ class WslPlatform(JsonlShimMixin):
                 raise
             finally:
                 if should_release:
-                    self._send_shim_fire_and_forget({"cmd": "rec_release", "rec_gen": stop_gen})
+                    self._enqueue_shim_async(
+                        {"cmd": "rec_release", "rec_gen": stop_gen},
+                        deadline_sec=0.25,
+                        writer=rec_writer,
+                    )
         wav = self._ff_rec.stop(drain_sec=drain_sec)
         self.last_audio_error = "" if wav else self._ff_rec.diagnostic_summary()
         return wav, "pulse"

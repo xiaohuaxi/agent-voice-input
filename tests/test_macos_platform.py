@@ -534,10 +534,10 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             try:
                 plat_live.start_event_listener(lambda m: (received.append(m), got_evt.set()))
                 self.assertEqual(spawns[0], 1)
-                # First HUD crashes gen=1; _shim_rpc retries & respawns gen=2 transparently
+                # First HUD crashes gen=1; reader EOF schedules background respawn into gen=2 transparently
                 plat_live.hud("recording")
-                self.assertGreaterEqual(spawns[0], 2)
                 self.assertTrue(got_evt.wait(timeout=3.0))
+                self.assertGreaterEqual(spawns[0], 2)
                 self.assertEqual(received[0]["bundle_id"], GHOSTTY_BUNDLE_ID)
                 self.assertFalse(plat_live._shim_disabled)
                 ping_after_late = plat_live._shim_rpc({"cmd": "ping"}, timeout_sec=2.0)

@@ -1,6 +1,7 @@
 """Cross-platform window/paste models, FfmpegWavRecorder, and JsonlShimMixin bridge."""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import io
 import json
@@ -562,137 +563,19 @@ def stream_key_test_proc(cmd: list[str], *, env: Mapping[str, str] | None = None
             proc.terminate()
 
 
-class _StdinGate:
-    """Mutex for shim stdin writes with indivisible deferred-close handoff on release."""
-
-    def __init__(self) -> None:
-        self._io_lock = threading.Lock()
-        self._state_lock = threading.Lock()
-        self._writers = 0
-        self._deferred: list[Any] = []
-
-    def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
-        ok = (
-            self._io_lock.acquire(blocking=blocking)
-            if timeout < 0
-            else self._io_lock.acquire(blocking=blocking, timeout=timeout)
-        )
-        if ok:
-            with self._state_lock:
-                self._writers += 1
-        return ok
-
-    def release(self) -> None:
-        while True:
-            with self._state_lock:
-                if not self._deferred:
-                    self._writers -= 1
-                    self._io_lock.release()
-                    return
-                items = list(self._deferred)
-                self._deferred.clear()
-            for pipe in items:
-                try:
-                    pipe.close()
-                except Exception:
-                    pass
-
-    def __enter__(self) -> _StdinGate:
-        self.acquire()
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        self.release()
-
-    def close_or_defer(self, pipe: Any, *, timeout: float = 0.2) -> bool:
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        while True:
-            rem = deadline - time.monotonic()
-            got = (
-                self.acquire(timeout=rem)
-                if rem > 0.0
-                else self.acquire(blocking=False)
-            )
-            if got:
-                try:
-                    if pipe is not None:
-                        try:
-                            pipe.close()
-                        except Exception:
-                            pass
-                finally:
-                    self.release()
-                return True
-            with self._state_lock:
-                if pipe is None and not self._deferred:
-                    return True
-                if self._writers > 0:
-                    if pipe is not None:
-                        self._deferred.append(pipe)
-                    return False
-            time.sleep(0)
-
-
-def _reap_shim_proc(
-    proc: subprocess.Popen[str] | None,
-    *,
-    stdin_lock: _StdinGate | threading.Lock | None = None,
-) -> None:
-    if proc is None:
-        if isinstance(stdin_lock, _StdinGate):
-            stdin_lock.close_or_defer(None, timeout=0.2)
-        return
-    try:
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait(timeout=1.0)
-    except Exception:
-        pass
-    if proc.stdin is not None:
-        if stdin_lock is None:
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-        elif isinstance(stdin_lock, _StdinGate):
-            if not stdin_lock.close_or_defer(proc.stdin, timeout=0.2):
-                setattr(proc, "_deferred_close_stdin", True)
-        elif stdin_lock.acquire(timeout=0.2):
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-            finally:
-                stdin_lock.release()
-        else:
-            setattr(proc, "_deferred_close_stdin", True)
-    reader_th = getattr(proc, "_shim_reader_th", None)
-    if isinstance(reader_th, threading.Thread):
-        if reader_th.is_alive() and reader_th is not threading.current_thread():
-            reader_th.join(timeout=0.5)
-        if not reader_th.is_alive() and proc.stdout is not None:
-            try:
-                proc.stdout.close()
-            except Exception:
-                pass
-    elif proc.stdout is not None:
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
-
-
 class _ShimWriteTimeout(TimeoutError):
     """Raised when writing a JSONL command to shim stdin exceeds the RPC deadline.
 
-    partial=False guarantees zero bytes of the command were written to stdin;
-    partial=True means a non-empty prefix entered the pipe before timeout.
+    write_status is either:
+    - "not_sent": zero bytes entered stdin (healthy shim kept alive);
+    - "partial": a non-empty prefix entered the pipe before timeout (stdin closed & shim poisoned).
     """
 
-    def __init__(self, message: str, *, partial: bool = False) -> None:
+    def __init__(self, message: str, *, write_status: str = "not_sent") -> None:
         super().__init__(message)
-        self.partial = partial
-        self.written = partial
+        self.write_status = write_status
+        self.partial = write_status == "partial"
+        self.written = self.partial
 
 
 def _stream_pipe_fd(pipe: Any) -> int | None:
@@ -712,85 +595,454 @@ def _stream_pipe_fd(pipe: Any) -> int | None:
     return fd if (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)) else None
 
 
-def _write_shim_line_with_deadline(pipe: Any, line: str, deadline: float) -> None:
+def _dump_jsonl(payload: Mapping[str, Any]) -> str:
+    """Serialize one JSONL frame and replace lone UTF-16 surrogates so UTF-8 encoding never raises."""
+    return (
+        json.dumps(dict(payload), ensure_ascii=False)
+        .encode("utf-8", errors="replace")
+        .decode("utf-8")
+        + "\n"
+    )
+
+
+def _write_line_to_pipe(
+    pipe: Any,
+    line: str,
+    deadline: float,
+    abort_evt: threading.Event,
+    *,
+    nonblocking_start: bool = False,
+) -> tuple[str, str]:
+    """Write one JSONL line to a shim stdin stream with abortable poll deadline.
+
+    Returns ``(status, reason)`` where ``status`` is strictly ``"sent"``, ``"not_sent"``,
+    or ``"partial"``. Compatible with both real POSIX pipe fds and in-memory streams.
+    """
+    if pipe is None or getattr(pipe, "closed", False):
+        return "not_sent", "closed"
+    raw = line.encode("utf-8", errors="replace")
     fd = _stream_pipe_fd(pipe)
     if fd is None:
+        if abort_evt.is_set():
+            return "not_sent", "closed"
+        if not nonblocking_start and time.monotonic() >= deadline:
+            return "not_sent", "timeout"
         try:
-            pipe.write(line)
+            pipe.write(raw.decode("utf-8"))
             pipe.flush()
-        except ValueError as exc:
-            raise BrokenPipeError("shim_stdin_closed") from exc
-        return
-    raw = line.encode("utf-8")
+        except (BrokenPipeError, OSError, ValueError):
+            return "not_sent", "broken"
+        return "sent", ""
+
     view = memoryview(raw)
     written = 0
+    eff_deadline = deadline
     try:
         os.set_blocking(fd, False)
-    except OSError as exc:
-        raise BrokenPipeError("shim_stdin_closed") from exc
+    except OSError:
+        return "not_sent", "broken"
+
     while written < len(view):
-        rem = deadline - time.monotonic()
-        if rem <= 0.0:
-            raise _ShimWriteTimeout("shim_stdin_write_timeout", partial=(written > 0))
+        if abort_evt.is_set():
+            return ("partial", "aborted") if written > 0 else ("not_sent", "closed")
+        if written == 0 and nonblocking_start:
+            wait_s = 0.0
+        else:
+            rem = eff_deadline - time.monotonic()
+            if rem <= 0.0:
+                return ("partial", "timeout") if written > 0 else ("not_sent", "timeout")
+            wait_s = min(rem, 0.02)
         try:
-            _, ready_w, _ = select.select([], [fd], [], rem)
-        except (OSError, ValueError) as exc:
-            raise BrokenPipeError("shim_stdin_closed") from exc
+            _, ready_w, _ = select.select([], [fd], [], wait_s)
+        except (OSError, ValueError):
+            return ("partial", "broken") if written > 0 else ("not_sent", "broken")
         if not ready_w:
-            raise _ShimWriteTimeout("shim_stdin_write_timeout", partial=(written > 0))
+            if written == 0 and nonblocking_start:
+                return "not_sent", "busy"
+            continue
         try:
             n = os.write(fd, view[written:])
         except BlockingIOError:
+            if written == 0 and nonblocking_start:
+                return "not_sent", "busy"
             continue
-        except OSError as exc:
-            raise BrokenPipeError("shim_stdin_closed") from exc
+        except OSError:
+            return ("partial", "broken") if written > 0 else ("not_sent", "broken")
         if n <= 0:
-            raise BrokenPipeError("shim_stdin_closed")
+            return ("partial", "broken") if written > 0 else ("not_sent", "broken")
+        if written == 0 and nonblocking_start and n < len(view):
+            eff_deadline = time.monotonic() + 0.005
         written += n
+    return "sent", ""
 
 
-def _try_write_shim_line_nonblocking(pipe: Any, line: str) -> bool:
-    fd = _stream_pipe_fd(pipe)
-    if fd is None:
-        pipe.write(line)
-        pipe.flush()
-        return True
-    try:
-        _, ready_w, _ = select.select([], [fd], [], 0.0)
-    except (OSError, ValueError):
-        return False
-    if not ready_w:
-        return False
-    raw = line.encode("utf-8")
-    view = memoryview(raw)
-    try:
-        os.set_blocking(fd, False)
-        n = os.write(fd, view)
-    except (BlockingIOError, OSError):
-        return False
-    if n <= 0:
-        return False
-    written = n
-    if written < len(view):
-        # POSIX guarantees atomic writes up to PIPE_BUF (>=512B); finish any rare partial tail briefly.
-        tail_dl = time.monotonic() + 0.005
-        while written < len(view):
-            rem = tail_dl - time.monotonic()
-            if rem <= 0.0:
-                raise _ShimWriteTimeout("shim_stdin_nonblocking_partial_timeout", partial=True)
+@dataclass(slots=True)
+class _WriterItem:
+    line: str
+    deadline: float | None
+    is_rpc: bool = False
+    is_hud: bool = False
+    mergeable_hud: bool = False
+    is_quit: bool = False
+    state: str = "queued"
+    cancelled: bool = False
+    status: str = "not_sent"
+    reason: str = ""
+    done: threading.Event | None = None
+
+
+class _ShimWriter:
+    """Single-owner writer thread for one shim subprocess stdin pipe.
+
+    Owns all writes and the sole close() of ``proc.stdin``:
+    - Ordered FIFO queue for RPC frames, HUD state frames, cleanup commands, and quit sentinel.
+    - Single overwrite slot for ``hud_level`` (never blocks, never accumulates backlog).
+    - Bounded HUD queue (evicts oldest mergeable intermediate stage updates before toasts/hide).
+    """
+
+    _HUD_QUEUE_MAXLEN: int = 64
+    _TERMINAL_HUD_WRITE_TIMEOUT_SEC: float = 5.0
+
+    def __init__(
+        self,
+        proc: subprocess.Popen[str],
+        *,
+        on_poison: Callable[[subprocess.Popen[str], _ShimWriter], None] | None = None,
+    ) -> None:
+        self.proc = proc
+        self._pipe = proc.stdin
+        self._on_poison = on_poison
+        self._cond = threading.Condition()
+        self._fifo: deque[_WriterItem] = deque()
+        self._hud_queued_count: int = 0
+        self._pending_level: str | None = None
+        self._closing: bool = False
+        self._closed: bool = False
+        self._poisoned: bool = False
+        self._quit_sent: bool = False
+        self._pipe_closed: bool = False
+        self._poison_notified: bool = False
+        self._abort_evt = threading.Event()
+        try:
+            setattr(proc, "_shim_writer_obj", self)
+        except Exception:
+            pass
+        self._thread = threading.Thread(
+            target=self._run, name="avi-shim-writer", daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def is_open(self) -> bool:
+        with self._cond:
+            return not self._closed and not self._closing and not self._poisoned
+
+    @property
+    def poisoned(self) -> bool:
+        with self._cond:
+            return self._poisoned
+
+    def _close_pipe_once(self) -> None:
+        if self._pipe_closed:
+            return
+        self._pipe_closed = True
+        if self._pipe is not None:
             try:
-                _, rw, _ = select.select([], [fd], [], rem)
-                if not rw:
-                    raise _ShimWriteTimeout("shim_stdin_nonblocking_partial_timeout", partial=True)
-                m = os.write(fd, view[written:])
-            except BlockingIOError:
-                continue
-            except (OSError, ValueError):
-                raise _ShimWriteTimeout("shim_stdin_nonblocking_partial_error", partial=True)
-            if m <= 0:
-                raise _ShimWriteTimeout("shim_stdin_nonblocking_partial_eof", partial=True)
-            written += m
-    return True
+                self._pipe.close()
+            except Exception:
+                pass
+
+    def _finish_item_locked(self, item: _WriterItem, status: str, reason: str) -> None:
+        item.status = status
+        item.reason = reason
+        item.state = "done"
+        if item.done is not None:
+            item.done.set()
+
+    def _drain_pending_locked(self, reason: str) -> None:
+        while self._fifo:
+            it = self._fifo.popleft()
+            if it.is_hud:
+                self._hud_queued_count = max(0, self._hud_queued_count - 1)
+            if not it.cancelled and it.state != "done":
+                self._finish_item_locked(it, "not_sent", reason)
+        self._pending_level = None
+
+    def _notify_poison_once(self) -> None:
+        if self._poison_notified:
+            return
+        self._poison_notified = True
+        cb = self._on_poison
+        if cb is not None:
+            try:
+                cb(self.proc, self)
+            except Exception:
+                pass
+
+    def write_sync(self, line: str, deadline: float) -> tuple[str, str]:
+        """Enqueue a synchronous frame and wait for its 3-state receipt (sent/not_sent/partial)."""
+        done_evt = threading.Event()
+        item = _WriterItem(line=line, deadline=deadline, is_rpc=True, done=done_evt)
+        with self._cond:
+            if self._closed or self._closing or self._poisoned:
+                return "not_sent", "closed"
+            if time.monotonic() >= deadline:
+                return "not_sent", "timeout"
+            self._fifo.append(item)
+            self._cond.notify()
+
+        rem = max(0.0, deadline - time.monotonic())
+        if done_evt.wait(timeout=rem):
+            return item.status, item.reason
+
+        with self._cond:
+            if item.state == "done":
+                return item.status, item.reason
+            if item.state == "queued":
+                item.cancelled = True
+                self._finish_item_locked(item, "not_sent", "timeout")
+                return "not_sent", "timeout"
+        # Writer already picked up this item and checks item.deadline every <=20ms.
+        done_evt.wait()
+        return item.status, item.reason
+
+    def enqueue_async(
+        self,
+        line: str,
+        *,
+        deadline_sec: float | None = 0.5,
+        is_hud: bool = False,
+        mergeable_hud: bool = False,
+    ) -> bool:
+        """Non-blocking FIFO enqueue for HUD state updates and fire-and-forget cleanup."""
+        eff_deadline = (
+            None
+            if deadline_sec is None
+            else (time.monotonic() + max(0.01, float(deadline_sec)))
+        )
+        item = _WriterItem(
+            line=line,
+            deadline=eff_deadline,
+            is_hud=is_hud,
+            mergeable_hud=mergeable_hud,
+        )
+        with self._cond:
+            if self._closed or self._closing or self._poisoned:
+                return False
+            if is_hud:
+                while self._hud_queued_count >= self._HUD_QUEUE_MAXLEN:
+                    evict_idx: int | None = None
+                    fallback_idx: int | None = None
+                    for idx, cand in enumerate(self._fifo):
+                        if cand.is_hud and not cand.cancelled:
+                            if fallback_idx is None:
+                                fallback_idx = idx
+                            if cand.mergeable_hud:
+                                evict_idx = idx
+                                break
+                    drop_idx = evict_idx if evict_idx is not None else fallback_idx
+                    if drop_idx is None:
+                        break
+                    del self._fifo[drop_idx]
+                    self._hud_queued_count = max(0, self._hud_queued_count - 1)
+                self._hud_queued_count += 1
+            self._fifo.append(item)
+            self._cond.notify()
+            return True
+
+    def submit_level(self, line: str) -> None:
+        """Overwrite the single pending hud_level slot without ever blocking."""
+        with self._cond:
+            if self._closed or self._closing or self._poisoned:
+                return
+            self._pending_level = line
+            self._cond.notify()
+
+    def close(self, *, send_quit: bool = False, timeout_sec: float = 0.25) -> bool:
+        """Stop the writer thread, optionally flushing queued frames + quit first.
+
+        Returns True iff ``send_quit=True`` and the quit line was written completely.
+        """
+        eff_to = max(0.02, float(timeout_sec))
+        with self._cond:
+            already_closed = self._closed
+            if not already_closed:
+                if send_quit and not self._closing and not self._poisoned:
+                    self._closing = True
+                    self._pending_level = None
+                    self._fifo.append(
+                        _WriterItem(
+                            line='{"cmd":"quit"}\n',
+                            deadline=time.monotonic() + eff_to,
+                            is_quit=True,
+                        )
+                    )
+                else:
+                    self._closing = True
+                    self._pending_level = None
+                    self._abort_evt.set()
+                self._cond.notify_all()
+        cur = threading.current_thread()
+        if self._thread.is_alive() and self._thread is not cur:
+            self._thread.join(timeout=eff_to if send_quit else 0.5)
+            if self._thread.is_alive():
+                self._abort_evt.set()
+                with self._cond:
+                    self._cond.notify_all()
+                self._thread.join(timeout=0.5)
+        return self._quit_sent
+
+    def _run(self) -> None:
+        active_item: _WriterItem | None = None
+        try:
+            while True:
+                item: _WriterItem | None = None
+                level_line: str | None = None
+                with self._cond:
+                    while (
+                        not self._fifo
+                        and self._pending_level is None
+                        and not self._closing
+                        and not self._abort_evt.is_set()
+                    ):
+                        self._cond.wait()
+                    if self._abort_evt.is_set():
+                        self._drain_pending_locked("closed")
+                        self._closed = True
+                        break
+                    while self._fifo:
+                        cand = self._fifo.popleft()
+                        if cand.is_hud:
+                            self._hud_queued_count = max(0, self._hud_queued_count - 1)
+                        if cand.cancelled:
+                            continue
+                        if self._closing and cand.is_rpc:
+                            self._finish_item_locked(cand, "not_sent", "closed")
+                            continue
+                        cand.state = "writing"
+                        item = cand
+                        active_item = cand
+                        break
+                    if item is None:
+                        if self._closing:
+                            self._pending_level = None
+                            self._closed = True
+                            break
+                        if self._pending_level is not None:
+                            level_line = self._pending_level
+                            self._pending_level = None
+
+                if item is not None:
+                    eff_deadline = (
+                        item.deadline
+                        if item.deadline is not None
+                        else (time.monotonic() + self._TERMINAL_HUD_WRITE_TIMEOUT_SEC)
+                    )
+                    status, reason = _write_line_to_pipe(
+                        self._pipe, item.line, eff_deadline, self._abort_evt
+                    )
+                    if item.is_quit:
+                        with self._cond:
+                            self._quit_sent = status == "sent"
+                            self._finish_item_locked(item, status, reason)
+                            active_item = None
+                            self._drain_pending_locked("closed")
+                            self._closed = True
+                        break
+                    if status == "partial":
+                        self._close_pipe_once()
+                        with self._cond:
+                            self._poisoned = True
+                            self._closed = True
+                            self._drain_pending_locked("closed")
+                        if not self._abort_evt.is_set():
+                            self._notify_poison_once()
+                        with self._cond:
+                            self._finish_item_locked(item, "partial", reason)
+                            active_item = None
+                        break
+                    if reason == "broken":
+                        self._close_pipe_once()
+                        with self._cond:
+                            self._closed = True
+                            self._finish_item_locked(item, "not_sent", "broken")
+                            active_item = None
+                            self._drain_pending_locked("closed")
+                        break
+                    with self._cond:
+                        self._finish_item_locked(item, status, reason)
+                        active_item = None
+                elif level_line is not None:
+                    status, reason = _write_line_to_pipe(
+                        self._pipe,
+                        level_line,
+                        time.monotonic() + 0.005,
+                        self._abort_evt,
+                        nonblocking_start=True,
+                    )
+                    if status == "partial":
+                        self._close_pipe_once()
+                        with self._cond:
+                            self._poisoned = True
+                            self._closed = True
+                            self._drain_pending_locked("closed")
+                        if not self._abort_evt.is_set():
+                            self._notify_poison_once()
+                        break
+                    if reason == "broken":
+                        self._close_pipe_once()
+                        with self._cond:
+                            self._closed = True
+                            self._drain_pending_locked("closed")
+                        break
+        finally:
+            self._close_pipe_once()
+            with self._cond:
+                self._closed = True
+                if active_item is not None and active_item.state != "done":
+                    self._finish_item_locked(active_item, "not_sent", "broken")
+                self._drain_pending_locked("closed")
+                self._cond.notify_all()
+
+
+def _reap_shim_proc(
+    proc: subprocess.Popen[str] | None,
+    *,
+    writer: _ShimWriter | None = None,
+) -> None:
+    if writer is None and proc is not None:
+        attached = getattr(proc, "_shim_writer_obj", None)
+        if isinstance(attached, _ShimWriter) and attached.proc is proc:
+            writer = attached
+    if writer is not None:
+        writer.close(send_quit=False)
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=1.0)
+    except Exception:
+        pass
+    if writer is None and proc.stdin is not None and not getattr(proc.stdin, "closed", False):
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+    reader_th = getattr(proc, "_shim_reader_th", None)
+    if isinstance(reader_th, threading.Thread):
+        if reader_th.is_alive() and reader_th is not threading.current_thread():
+            reader_th.join(timeout=0.5)
+        if not reader_th.is_alive() and proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+    elif proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
 
 
 class JsonlShimMixin:
@@ -807,6 +1059,8 @@ class JsonlShimMixin:
         self._closed = False
         self._close_evt = threading.Event()
         self._shim: subprocess.Popen[str] | None = None
+        self._shim_writer: _ShimWriter | None = None
+        self._live_writers: dict[int, _ShimWriter] = {}
         self._shim_disabled = False
         self._shim_lock = threading.Lock()
         self._shim_cond = threading.Condition(self._shim_lock)
@@ -820,7 +1074,6 @@ class JsonlShimMixin:
         self._shim_fail_count: int = 0
         self._shim_retry_after: float = 0.0
         self._respawn_scheduled: bool = False
-        self._stdin_lock = _StdinGate()
         self._rpc_seq, self._pending, self._ready = 100, {}, threading.Event()
         self._event_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._event_worker: threading.Thread | None = None
@@ -863,10 +1116,12 @@ class JsonlShimMixin:
             return False
         if self._on_event is not None:
             proc = self._shim
+            writer = self._shim_writer
             return bool(
                 proc is not None
                 and proc.poll() is None
                 and (proc is not self._spawned_shim or self._spawned_ready)
+                and (writer is None or writer.proc is not proc or writer.is_open)
             )
         return self._shim_fail_count == 0 and not self.last_shim_error
 
@@ -954,13 +1209,17 @@ class JsonlShimMixin:
                 if self._shim_disabled:
                     return False
                 if self._shim is not None and self._shim.poll() is None:
-                    if self._shim is not self._spawned_shim or self._spawned_ready:
+                    cur_w = self._shim_writer
+                    writer_ok = cur_w is None or cur_w.proc is not self._shim or cur_w.is_open
+                    if writer_ok and (self._shim is not self._spawned_shim or self._spawned_ready):
                         return True
                 if self._spawning_shim:
                     return False
                 if not ignore_cooldown and time.monotonic() < self._shim_retry_after:
                     return False
                 dead, self._shim = self._shim, None
+                if self._shim_writer is not None and self._shim_writer.proc is dead:
+                    self._shim_writer = None
                 self._spawned_shim = None
                 self._spawned_ready = False
                 self._shim_caps = frozenset()
@@ -1008,11 +1267,16 @@ class JsonlShimMixin:
                         self._disable_shim_once(f"failed to spawn {self._shim_label}: {exc}")
                         return False
                     raise
-                self._shim = proc
+                writer = _ShimWriter(proc, on_poison=self._on_writer_poison)
+                self._live_writers[id(proc)] = writer
                 self._spawned_shim = proc
+                self._shim_writer = writer
+                self._shim = proc
                 self._shim_instance_id += 1
                 setattr(proc, "_shim_instance_id", self._shim_instance_id)
-                reader_th = threading.Thread(target=self._shim_reader, args=(proc, proc_ready), daemon=True)
+                reader_th = threading.Thread(
+                    target=self._shim_reader, args=(proc, proc_ready), daemon=True
+                )
                 setattr(proc, "_shim_reader_th", reader_th)
                 reader_th.start()
                 spawn_started = True
@@ -1035,6 +1299,7 @@ class JsonlShimMixin:
             if self._closed:
                 if self._shim is proc:
                     self._shim = None
+                    self._shim_writer = None
                     self._spawned_shim = None
                     self._spawned_ready = False
                     self._shim_caps = frozenset()
@@ -1055,6 +1320,7 @@ class JsonlShimMixin:
                     return True
                 if self._shim is proc:
                     self._shim = None
+                    self._shim_writer = None
                     self._spawned_shim = None
                     self._spawned_ready = False
                     self._shim_caps = frozenset()
@@ -1079,8 +1345,138 @@ class JsonlShimMixin:
             self._schedule_respawn_if_needed()
         return False
 
+    def _get_writer_locked(self, proc: subprocess.Popen[str] | None) -> _ShimWriter | None:
+        if proc is None or self._closed or proc.stdin is None or proc.poll() is not None:
+            return None
+        w = self._shim_writer
+        if w is not None and w.proc is proc:
+            return w
+        w = self._live_writers.get(id(proc))
+        if w is not None and w.proc is proc:
+            if self._shim is proc:
+                self._shim_writer = w
+            return w
+        existing = getattr(proc, "_shim_writer_obj", None)
+        if isinstance(existing, _ShimWriter) and existing.proc is proc:
+            return existing
+        if getattr(proc.stdin, "closed", False):
+            return None
+        w = _ShimWriter(proc, on_poison=self._on_writer_poison)
+        self._live_writers[id(proc)] = w
+        if self._shim is proc:
+            self._shim_writer = w
+        return w
+
+    def _current_shim_writer(self) -> _ShimWriter | None:
+        with self._shim_lock:
+            return self._get_writer_locked(self._shim)
+
+    def _ready_shim_writer(self) -> _ShimWriter | None:
+        """Return the current shim writer iff already alive & ready (never blocks or spawns)."""
+        proc = self._shim
+        if (
+            self._closed
+            or self._shim_disabled
+            or self._spawning_shim
+            or proc is None
+            or proc.poll() is not None
+            or (proc is self._spawned_shim and not self._spawned_ready)
+            or not self._ready.is_set()
+        ):
+            return None
+        writer = self._shim_writer
+        if writer is None or writer.proc is not proc:
+            attached = getattr(proc, "_shim_writer_obj", None)
+            writer = attached if (isinstance(attached, _ShimWriter) and attached.proc is proc) else None
+        if writer is not None:
+            return writer if writer.is_open else None
+        # Fallback for tests injecting a bare fake self._shim without a pre-attached writer;
+        # short timeout prevents blocking on slow Popen() while avoiding first-init race drops.
+        if not self._shim_lock.acquire(timeout=0.01):
+            return None
+        try:
+            if (
+                self._closed
+                or self._shim_disabled
+                or self._spawning_shim
+                or self._shim is not proc
+                or proc.poll() is not None
+                or (proc is self._spawned_shim and not self._spawned_ready)
+                or not self._ready.is_set()
+            ):
+                return None
+            writer = self._get_writer_locked(proc)
+            return writer if (writer is not None and writer.is_open) else None
+        finally:
+            self._shim_lock.release()
+
+    def _on_writer_poison(self, proc: subprocess.Popen[str], writer: _ShimWriter) -> None:
+        was_current = False
+        with self._shim_lock:
+            if self._shim is proc:
+                was_current = True
+                self._shim = None
+                self._shim_writer = None
+                self._spawned_shim = None
+                self._spawned_ready = False
+                self._shim_caps = frozenset()
+                self._shim_cond.notify_all()
+            elif self._shim_writer is writer:
+                self._shim_writer = None
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            reader_th = getattr(proc, "_shim_reader_th", None)
+            if not isinstance(reader_th, threading.Thread) or not reader_th.is_alive():
+                proc.wait(timeout=0.5)
+        except Exception:
+            pass
+        if was_current and not self._closed and not self._shim_disabled:
+            self._schedule_respawn_if_needed()
+
+    def _poison_and_reap_writer(self, writer: _ShimWriter | None) -> None:
+        if writer is None:
+            return
+        proc = writer.proc
+        was_current = False
+        with self._shim_lock:
+            if self._shim is proc:
+                was_current = True
+                self._shim = None
+                self._shim_writer = None
+                self._spawned_shim = None
+                self._spawned_ready = False
+                self._shim_caps = frozenset()
+                self._shim_cond.notify_all()
+            elif self._shim_writer is writer:
+                self._shim_writer = None
+            self._live_writers[id(proc)] = writer
+        self._reap_owned_shim(proc)
+        if was_current and not self._closed and not self._shim_disabled:
+            self._schedule_respawn_if_needed()
+
     def _reap_owned_shim(self, proc: subprocess.Popen[str] | None) -> None:
-        _reap_shim_proc(proc, stdin_lock=self._stdin_lock)
+        eff_writer: _ShimWriter | None = None
+        if proc is not None:
+            with self._shim_lock:
+                mapped = self._live_writers.get(id(proc))
+                if mapped is not None and mapped.proc is proc:
+                    eff_writer = mapped
+                if self._shim_writer is not None and (
+                    self._shim_writer is eff_writer or self._shim_writer.proc is proc
+                ):
+                    if eff_writer is None:
+                        eff_writer = self._shim_writer
+                    self._shim_writer = None
+            if eff_writer is None:
+                attached = getattr(proc, "_shim_writer_obj", None)
+                if isinstance(attached, _ShimWriter) and attached.proc is proc:
+                    eff_writer = attached
+        _reap_shim_proc(proc, writer=eff_writer)
+        if proc is not None and eff_writer is not None:
+            with self._shim_lock:
+                if self._live_writers.get(id(proc)) is eff_writer:
+                    self._live_writers.pop(id(proc), None)
 
     def _respawn_shim_bg(self) -> None:
         succeeded = False
@@ -1234,6 +1630,7 @@ class JsonlShimMixin:
                         self._event_q.put({"event": "shim_disconnected", "_shim_instance_id": shim_id})
                 if self._shim is proc:
                     self._shim = None
+                    self._shim_writer = None
                     self._spawned_shim = None
                     self._spawned_ready = False
                     self._shim_caps = frozenset()
@@ -1262,9 +1659,9 @@ class JsonlShimMixin:
         timeout_sec: float = 5.0,
         *,
         allow_retry: bool = True,
-        before_write: Callable[[], None] | None = None,
+        target_writer: _ShimWriter | None = None,
     ) -> dict[str, Any] | None:
-        max_attempts = 2 if allow_retry else 1
+        max_attempts = 1 if target_writer is not None else (2 if allow_retry else 1)
         shared_q: queue.Queue[dict[str, Any]] | None = None
         shared_proc: subprocess.Popen[str] | None = None
         registered: list[tuple[subprocess.Popen[str], int]] = []
@@ -1286,21 +1683,39 @@ class JsonlShimMixin:
 
         try:
             for attempt in range(max_attempts):
-                if not self._ensure_shim():
-                    if self._shim_graceful:
-                        return None
-                    raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
+                if target_writer is None:
+                    if not self._ensure_shim():
+                        if self._shim_graceful:
+                            return None
+                        raise RuntimeError(self.last_shim_error or f"{self._shim_label} unavailable")
                 sent_proc: subprocess.Popen[str] | None = None
+                sent_writer: _ShimWriter | None = None
                 broken: subprocess.Popen[str] | None = None
                 try:
                     with self._shim_lock:
-                        proc = self._shim
-                        if proc is None or proc.stdin is None or proc.poll() is not None:
-                            broken, self._shim = proc, None
-                            self._spawned_shim = None
-                            self._spawned_ready = False
-                            self._shim_caps = frozenset()
-                            raise BrokenPipeError("shim_not_running")
+                        if target_writer is not None:
+                            proc = target_writer.proc
+                            writer = target_writer
+                            if self._closed or proc is None or proc.poll() is not None or not writer.is_open:
+                                if proc is not None and self._shim is proc:
+                                    broken, self._shim = proc, None
+                                    if self._shim_writer is not None and self._shim_writer.proc is proc:
+                                        self._shim_writer = None
+                                    self._spawned_shim = None
+                                    self._spawned_ready = False
+                                    self._shim_caps = frozenset()
+                                raise BrokenPipeError("shim_not_running")
+                        else:
+                            proc = self._shim
+                            writer = self._get_writer_locked(proc)
+                            if proc is None or writer is None or not writer.is_open:
+                                broken, self._shim = proc, None
+                                if self._shim_writer is not None and self._shim_writer.proc is proc:
+                                    self._shim_writer = None
+                                self._spawned_shim = None
+                                self._spawned_ready = False
+                                self._shim_caps = frozenset()
+                                raise BrokenPipeError("shim_not_running")
                         if shared_q is None or shared_proc is not proc:
                             _unregister_registered_locked()
                             shared_q = queue.Queue()
@@ -1318,34 +1733,25 @@ class JsonlShimMixin:
                                     raise RuntimeError(str(early_res["error"]))
                                 return early_res
                         sent_proc = proc
+                        sent_writer = writer
                         self._rpc_seq += 1
                         sid = self._rpc_seq
                         self._pending[sid] = (proc, shared_q)
                         registered.append((proc, sid))
-                    line = json.dumps({**payload, "seq_id": sid}, ensure_ascii=False) + "\n"
+                    line = _dump_jsonl({**payload, "seq_id": sid})
                     attempt_deadline = time.monotonic() + max(0.0, float(timeout_sec))
-                    rem_lock = attempt_deadline - time.monotonic()
-                    acquired = (
-                        self._stdin_lock.acquire(timeout=rem_lock)
-                        if rem_lock > 0.0
-                        else self._stdin_lock.acquire(blocking=False)
-                    )
-                    if not acquired:
-                        raise _ShimWriteTimeout("shim_stdin_lock_timeout", partial=False)
-                    try:
-                        if before_write is not None:
-                            before_write()
-                        if not self._is_proc_stdin_writable_locked(sent_proc, require_current=True):
-                            raise BrokenPipeError("shim_not_running")
-                        try:
-                            _write_shim_line_with_deadline(sent_proc.stdin, line, attempt_deadline)
-                        except _ShimWriteTimeout as w_exc:
-                            if w_exc.partial:
-                                # Mark poisoned BEFORE releasing _stdin_lock so no queued writer can append to a half-line.
-                                setattr(sent_proc, "_stdin_poisoned", True)
-                            raise
-                    finally:
-                        self._stdin_lock.release()
+                    write_status, write_reason = sent_writer.write_sync(line, attempt_deadline)
+                    if write_status == "partial":
+                        self._reap_owned_shim(sent_proc)
+                        raise _ShimWriteTimeout(
+                            "shim_stdin_partial_write_timeout", write_status="partial"
+                        )
+                    if write_status == "not_sent":
+                        if write_reason == "timeout":
+                            raise _ShimWriteTimeout(
+                                "shim_stdin_write_timeout", write_status="not_sent"
+                            )
+                        raise BrokenPipeError(f"shim_stdin_{write_reason or 'closed'}")
                     rem_reply = attempt_deadline - time.monotonic()
                     if rem_reply <= 0.0:
                         raise queue.Empty()
@@ -1360,9 +1766,7 @@ class JsonlShimMixin:
                             return None
                         raise RuntimeError(str(res["error"]))
                     return res
-                except _ShimWriteTimeout as exc:
-                    if exc.partial and sent_proc is not None:
-                        self._detach_and_reap_poisoned_shim(sent_proc)
+                except _ShimWriteTimeout:
                     _unregister_all()
                     shared_q = None
                     shared_proc = None
@@ -1372,6 +1776,8 @@ class JsonlShimMixin:
                 except (BrokenPipeError, OSError, queue.Empty) as exc:
                     if broken is not None:
                         self._reap_owned_shim(broken)
+                        if not self._closed and not self._shim_disabled:
+                            self._schedule_respawn_if_needed()
                     if not isinstance(exc, queue.Empty):
                         _unregister_all()
                         shared_q = None
@@ -1409,16 +1815,16 @@ class JsonlShimMixin:
     ) -> None:
         if not self._has_managed_shim():
             return
+        writer = self._ready_shim_writer()
+        if writer is None:
+            return
         st = (state or "").strip().lower()
         try:
-            if not self._ensure_shim():
-                return
-            if not self._ready.is_set():
-                self._ready.wait(timeout=self._shim_ready_timeout)
-            req: dict[str, Any] = {"cmd": "hud", "state": state}
+            req: dict[str, Any] = {"cmd": "hud", "state": state, "seq_id": 0}
             eff_text = text
             eff_duration_ms = duration_ms if duration_ms > 0 else 0
             base_layer = hud_layer_for_state(st)
+            eff_layer = ""
             if base_layer != "control":
                 exp_layer = (layer or "").strip().lower()
                 eff_layer = exp_layer if exp_layer in ("main", "toast") else base_layer
@@ -1456,116 +1862,79 @@ class JsonlShimMixin:
                 req["text"] = eff_text
             if eff_duration_ms > 0:
                 req["duration_ms"] = eff_duration_ms
-            self._shim_rpc(req, timeout_sec=1.5)
+            mergeable = (
+                st in ("recording", "recognizing", "processing", "refining")
+                and eff_layer != "toast"
+            )
+            self._enqueue_shim_async(
+                req,
+                deadline_sec=0.5 if mergeable else None,
+                is_hud=True,
+                mergeable_hud=mergeable,
+                writer=writer,
+            )
         except Exception:
             pass
 
-    def _is_proc_stdin_writable_locked(
-        self, proc: subprocess.Popen[str] | None, *, require_current: bool = True
-    ) -> bool:
-        if proc is None or self._closed:
-            return False
-        if require_current and self._shim is not proc:
-            return False
-        return (
-            proc.poll() is None
-            and not getattr(proc, "_stdin_poisoned", False)
-            and not getattr(proc, "_deferred_close_stdin", False)
-            and proc.stdin is not None
-            and not proc.stdin.closed
-        )
-
-    def _detach_and_reap_poisoned_shim(self, proc: subprocess.Popen[str]) -> None:
-        was_current = False
-        with self._shim_lock:
-            if self._shim is proc:
-                was_current = True
-                self._shim = None
-                self._spawned_shim = None
-                self._spawned_ready = False
-                self._shim_caps = frozenset()
-                self._shim_cond.notify_all()
-        self._reap_owned_shim(proc)
-        if was_current and not self._closed and not self._shim_disabled:
-            self._schedule_respawn_if_needed()
-
-    def _send_shim_fire_and_forget_to_proc(
+    def _write_shim_command(
         self,
-        proc: subprocess.Popen[str] | None,
         payload: Mapping[str, Any],
         *,
-        drop_if_busy: bool = False,
+        writer: _ShimWriter | None = None,
         timeout_sec: float = 0.25,
-        require_current: bool = False,
+    ) -> str:
+        """Write one fire-and-forget JSONL command synchronously via the shim's single writer.
+
+        Returns ``"sent"``, ``"not_sent"``, or ``"partial"``.
+        """
+        if self._closed:
+            return "not_sent"
+        target_writer = writer
+        if target_writer is None:
+            if not self._has_managed_shim():
+                return "not_sent"
+            target_writer = self._ready_shim_writer()
+        if target_writer is None or not target_writer.is_open:
+            return "not_sent"
+        line = _dump_jsonl(payload)
+        status, _ = target_writer.write_sync(line, time.monotonic() + max(0.0, float(timeout_sec)))
+        return status
+
+    def _enqueue_shim_async(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        deadline_sec: float | None = 0.5,
+        is_hud: bool = False,
+        mergeable_hud: bool = False,
+        writer: _ShimWriter | None = None,
     ) -> bool:
-        if self._closed or proc is None or proc.stdin is None or proc.poll() is not None:
+        if self._closed:
             return False
-        line = json.dumps(dict(payload), ensure_ascii=False) + "\n"
-        poisoned_proc: subprocess.Popen[str] | None = None
-        try:
-            if drop_if_busy:
-                if not self._stdin_lock.acquire(blocking=False):
-                    return False
-                try:
-                    if not self._is_proc_stdin_writable_locked(proc, require_current=require_current):
-                        return False
-                    try:
-                        return _try_write_shim_line_nonblocking(proc.stdin, line)
-                    except _ShimWriteTimeout as w_exc:
-                        if w_exc.partial:
-                            setattr(proc, "_stdin_poisoned", True)
-                            poisoned_proc = proc
-                        return False
-                finally:
-                    self._stdin_lock.release()
-            deadline = time.monotonic() + max(0.0, float(timeout_sec))
-            rem_lock = deadline - time.monotonic()
-            acquired = (
-                self._stdin_lock.acquire(timeout=rem_lock)
-                if rem_lock > 0.0
-                else self._stdin_lock.acquire(blocking=False)
-            )
-            if not acquired:
+        target_writer = writer
+        if target_writer is None:
+            if not self._has_managed_shim():
                 return False
-            try:
-                if not self._is_proc_stdin_writable_locked(proc, require_current=require_current):
-                    return False
-                try:
-                    _write_shim_line_with_deadline(proc.stdin, line, deadline)
-                    return True
-                except _ShimWriteTimeout as w_exc:
-                    if w_exc.partial:
-                        setattr(proc, "_stdin_poisoned", True)
-                        poisoned_proc = proc
-                    return False
-            finally:
-                self._stdin_lock.release()
-        except Exception:
+            target_writer = self._ready_shim_writer()
+        if target_writer is None or not target_writer.is_open:
             return False
-        finally:
-            if poisoned_proc is not None:
-                self._detach_and_reap_poisoned_shim(poisoned_proc)
-
-    def _send_shim_fire_and_forget(
-        self,
-        payload: Mapping[str, Any],
-        *,
-        drop_if_busy: bool = False,
-        timeout_sec: float = 0.25,
-    ) -> bool:
-        if not self._has_managed_shim() or not self._ready.is_set():
-            return False
-        return self._send_shim_fire_and_forget_to_proc(
-            self._shim,
-            payload,
-            drop_if_busy=drop_if_busy,
-            timeout_sec=timeout_sec,
-            require_current=True,
+        line = _dump_jsonl(payload)
+        return target_writer.enqueue_async(
+            line,
+            deadline_sec=deadline_sec,
+            is_hud=is_hud,
+            mergeable_hud=mergeable_hud,
         )
 
     def hud_level(self, level: float) -> None:
+        if not self._has_managed_shim():
+            return
+        writer = self._ready_shim_writer()
+        if writer is None:
+            return
         clamped = round(max(0.0, min(1.0, float(level))), 3)
-        self._send_shim_fire_and_forget({"cmd": "hud_level", "level": clamped}, drop_if_busy=True)
+        line = _dump_jsonl({"cmd": "hud_level", "level": clamped})
+        writer.submit_level(line)
 
     def _on_recorder_level(self, level: float) -> None:
         if self._closed or not self._has_managed_shim():
@@ -1622,44 +1991,33 @@ class JsonlShimMixin:
             cancel()
         with self._shim_lock:
             proc, self._shim = self._shim, None
+            writer, self._shim_writer = self._shim_writer, None
+            if proc is not None:
+                mapped_w = self._live_writers.get(id(proc))
+                if writer is None or writer.proc is not proc:
+                    writer = mapped_w
+                if writer is not None:
+                    self._live_writers[id(proc)] = writer
+            stragglers = [
+                sw for pid_k, sw in list(self._live_writers.items()) if proc is None or pid_k != id(proc)
+            ]
             self._spawned_shim = None
             self._spawned_ready = False
             self._shim_caps = frozenset()
             self._shim_cond.notify_all()
-        if proc is not None and proc.poll() is None:
-            quit_sent = False
-            if self._stdin_lock.acquire(timeout=0.2):
-                try:
-                    if (
-                        proc.stdin
-                        and not proc.stdin.closed
-                        and not getattr(proc, "_stdin_poisoned", False)
-                    ):
-                        try:
-                            fd = proc.stdin.fileno()
-                        except (AttributeError, io.UnsupportedOperation, OSError):
-                            proc.stdin.write('{"cmd":"quit"}\n')
-                            proc.stdin.flush()
-                            proc.stdin.close()
-                            quit_sent = True
-                        else:
-                            os.set_blocking(fd, False)
-                            os.write(fd, b'{"cmd":"quit"}\n')
-                            quit_sent = True
-                            try:
-                                proc.stdin.close()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                finally:
-                    self._stdin_lock.release()
-            if quit_sent:
+        if proc is not None and proc.poll() is None and writer is not None:
+            if writer.close(send_quit=True, timeout_sec=0.25):
                 try:
                     proc.wait(timeout=2.0)
                 except Exception:
                     pass
         self._reap_owned_shim(proc)
+        for sw in stragglers:
+            if sw is not writer:
+                sw.close(send_quit=False)
+                with self._shim_lock:
+                    if self._live_writers.get(id(sw.proc)) is sw:
+                        self._live_writers.pop(id(sw.proc), None)
 
 
 def make_once_commit_guard(

@@ -1314,9 +1314,20 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
                 plat.start_event_listener(lambda _e: None)
                 plat.hud("recording")
                 # Direct one-way hud_level clamping & concurrent RPC safety
-                plat.hud_level(-0.5)
-                plat.hud_level(0.654321)
-                plat.hud_level(1.8)
+                # (wait for each single-slot level to flush before overwriting with the next test point)
+                for raw_lvl, exp_lvl in ((-0.5, 0.0), (0.654321, 0.654), (1.8, 1.0)):
+                    plat.hud_level(raw_lvl)
+                    dl_lvl = time.monotonic() + 1.5
+                    while time.monotonic() < dl_lvl:
+                        if log_path.exists():
+                            cur_lvls = [
+                                json.loads(ln)["level"]
+                                for ln in log_path.read_text(encoding="utf-8").splitlines()
+                                if ln.strip() and json.loads(ln).get("cmd") == "hud_level"
+                            ]
+                            if cur_lvls and cur_lvls[-1] == exp_lvl:
+                                break
+                        time.sleep(0.005)
 
                 rpc_errors: list[Exception] = []
 
