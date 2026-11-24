@@ -228,16 +228,21 @@ def _sanitize_telemetry_record(rec: Mapping[str, Any], redact_fn: Any) -> dict[s
         if k in rec and isinstance(rec[k], str) and rec[k].strip():
             if k == "asr_request_id":
                 parts: list[str] = []
+                total_len = 0
                 for raw_part in rec[k].split(","):
                     part = raw_part.strip()
                     if part and _ASR_REQUEST_ID_RE.fullmatch(part):
                         clean_part = _clean_single_line(part, redact_fn, max_chars=256)
-                        if clean_part:
-                            parts.append(clean_part)
+                        if not clean_part:
+                            continue
+                        added_len = len(clean_part) + (1 if parts else 0)
+                        if total_len + added_len > 256:
+                            break
+                        parts.append(clean_part)
+                        total_len += added_len
                 if not parts:
                     continue
-                joined = ",".join(parts)
-                clean[k] = joined[:256] if len(joined) > 256 else joined
+                clean[k] = ",".join(parts)
             else:
                 clean[k] = _clean_single_line(rec[k], redact_fn, max_chars=200)
     if "asr_chunk_secs" in rec and isinstance(rec["asr_chunk_secs"], list):

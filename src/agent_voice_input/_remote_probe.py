@@ -118,7 +118,7 @@ _CLAUDE_SUBAGENT_HEAD_RE = re.compile(
     rb'"(?:agentId|agent_id)"\s*:\s*"[^"]+"|"entrypoint"\s*:\s*"sdk-cli"'
 )
 _AGY_WS_CWD_RE = re.compile(
-    r"(?:Command Working Directory:\s*|Active Workspaces:\s*\r?\n-\s*)(/[^\r\n<]+)"
+    r"(?:Command Working Directory:\s*|Active Workspaces:\s*\r?\n-\s*)((?:/|(?i:vscode-remote|file)://)[^\r\n<]+)"
 )
 _AGY_TRAILING_META_RE = re.compile(
     r"\n<(?:ADDITIONAL_METADATA|SKILL|USER_SETTINGS_CHANGE)\b.*", re.DOTALL

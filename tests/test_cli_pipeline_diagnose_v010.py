@@ -983,12 +983,16 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                 lambda s: s.replace(secret_key, "[REDACTED]"),
             )
             self.assertEqual(san_chunks["asr_request_id"], "req-1,req-[REDACTED],req-3")
+            ids_64 = [f"chunk{i}-{'x' * 57}" for i in range(4)]
+            self.assertTrue(all(len(x) == 64 for x in ids_64))
             san_capped = _sanitize_telemetry_record(
-                {"asr_request_id": ",".join(f"chunk{i}-{'x' * 60}" for i in range(6))},
+                {"asr_request_id": ",".join([*ids_64, "short-5"])},
                 lambda s: s,
             )
-            self.assertEqual(len(san_capped["asr_request_id"]), 256)
-            self.assertTrue(san_capped["asr_request_id"].startswith("chunk0-"))
+            self.assertEqual(san_capped["asr_request_id"], ",".join(ids_64[:3]))
+            self.assertEqual(len(san_capped["asr_request_id"]), 194)
+            self.assertLessEqual(len(san_capped["asr_request_id"]), 256)
+            self.assertEqual(san_capped["asr_request_id"].split(","), ids_64[:3])
             for bad_req_id in (
                 "contains space",
                 "line1\nline2",

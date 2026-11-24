@@ -30,6 +30,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -47,6 +48,9 @@ for _p in (str(_SRC_ROOT), str(_SCRIPT_DIR)):
 
 from agent_voice_input import __version__  # noqa: E402
 from agent_voice_input._remote_probe import (  # noqa: E402
+    _CODEX_ENV_CTX_RE,
+    _CODEX_PERM_CTX_RE,
+    _CODEX_REC_PLUGINS_RE,
     _clean_jsonl_file,
     _is_agy_subagent,
     _read_bounded_line,
@@ -1790,6 +1794,31 @@ _CODEX_EMPTY_META_TYPES: frozenset[str] = frozenset(
         "inter_agent_communication_metadata",
     }
 )
+_CODEX_EMPTY_EVENT_MSG_TYPES: frozenset[str] = frozenset(
+    {
+        "token_count",
+        "agent_reasoning",
+        "agent_reasoning_raw_content",
+        "turn_started",
+        "turn_complete",
+        "turn_aborted",
+        "task_started",
+        "task_complete",
+        "context_compacted",
+        "thread_rolled_back",
+        "thread_settings_applied",
+        "session_configured",
+        "shutdown_complete",
+        "entered_review_mode",
+        "exited_review_mode",
+        "warning",
+        "error",
+        "background_event",
+    }
+)
+_CODEX_INSTRUCTIONS_CTX_RE = re.compile(
+    r"<INSTRUCTIONS>.*?</INSTRUCTIONS>", re.DOTALL | re.IGNORECASE
+)
 _CLAUDE_EMPTY_META_TYPES: frozenset[str] = frozenset(
     {
         "system",
@@ -1806,6 +1835,7 @@ _CLAUDE_EMPTY_META_TYPES: frozenset[str] = frozenset(
 )
 _AGY_EMPTY_META_TYPES: frozenset[str] = frozenset(
     {
+        "SYSTEM_PROMPT",
         "SYSTEM_INFO",
         "SYSTEM_MESSAGE",
         "USER_SETTINGS_CHANGE",
@@ -1813,6 +1843,37 @@ _AGY_EMPTY_META_TYPES: frozenset[str] = frozenset(
         "metadata",
     }
 )
+
+
+def _is_codex_bootstrap_response_item(payload: dict[str, Any]) -> bool:
+    """Return True iff a Codex ``response_item`` payload is pure startup/system instruction metadata."""
+    role = payload.get("role")
+    if role in ("developer", "system"):
+        return True
+    if payload.get("type") != "message" or role != "user":
+        return False
+    content = payload.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    for blk in content:
+        if not isinstance(blk, dict):
+            return False
+        if str(blk.get("type") or "").lower() not in ("input_text", "output_text", "text"):
+            return False
+        raw_t = blk.get("text")
+        if not isinstance(raw_t, str):
+            return False
+        s = raw_t.strip()
+        if not s or s.startswith("# AGENTS.md instructions"):
+            continue
+        s = _CODEX_ENV_CTX_RE.sub("", s)
+        s = _CODEX_PERM_CTX_RE.sub("", s)
+        s = _CODEX_REC_PLUGINS_RE.sub("", s)
+        s = _CODEX_INSTRUCTIONS_CTX_RE.sub("", s).strip()
+        if not s or s.startswith(("# AGENTS.md instructions", "<recommended_plugins>")):
+            continue
+        return False
+    return True
 
 
 def _is_known_empty_metadata_transcript(cli_name: str, path: Path) -> bool:
@@ -1842,18 +1903,26 @@ def _is_known_empty_metadata_transcript(cli_name: str, path: Path) -> bool:
                 if cli_name == "codex":
                     if typ in _CODEX_EMPTY_META_TYPES:
                         continue
+                    if typ == "response_item":
+                        pl = obj.get("payload")
+                        if isinstance(pl, dict) and _is_codex_bootstrap_response_item(pl):
+                            continue
+                        return False
                     if typ == "event_msg":
                         pl = obj.get("payload")
                         if not isinstance(pl, dict):
                             return False
                         ptyp = str(pl.get("type") or "").strip()
-                        if ptyp in ("user_message", "agent_message"):
-                            return False
                         if ptyp == "item_completed":
-                            item = pl.get("item")
-                            if isinstance(item, dict) and item.get("type") in ("UserMessage", "AgentMessage"):
-                                return False
-                        continue
+                            return False
+                        item = pl.get("item")
+                        if isinstance(item, dict) and item and any(
+                            k in item for k in ("role", "content", "text", "message")
+                        ):
+                            return False
+                        if ptyp in _CODEX_EMPTY_EVENT_MSG_TYPES:
+                            continue
+                        return False
                     return False
                 if cli_name == "claude":
                     if typ in _CLAUDE_EMPTY_META_TYPES or typ.startswith("api-request"):

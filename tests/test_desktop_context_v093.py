@@ -3734,6 +3734,52 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             assert m_deb is not None
             self.assertEqual(m_deb.session_id, "cid-remote-top-cwd")
 
+            # 8. SYSTEM Active Workspaces structured URI (no top-level cwd/workspaceUris) records remote sentinel
+            #    and blocks L2 ADDITIONAL_METADATA fallback to local same-named path on Ubuntu.
+            shutil.rmtree(ide_brain)
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-remote-sys-active-ws",
+                [
+                    {
+                        "source": "SYSTEM",
+                        "type": "SYSTEM_PROMPT",
+                        "content": f"<user_information>\nActive Workspaces:\n- vscode-remote://wsl%2BDebian{shared}\n</user_information>",
+                    },
+                    {
+                        "source": "USER_EXPLICIT",
+                        "type": "USER_INPUT",
+                        "content": f"<USER_REQUEST>Check local</USER_REQUEST>\n<ADDITIONAL_METADATA>\nActive Document: {shared / 'main.py'}\n</ADDITIONAL_METADATA>",
+                    },
+                ],
+                mtime=base_t - 5,
+            )
+            self.assertIsNone(resolve_antigravity_ide_session(str(shared), home=home, now_ts=base_t, wsl=True, env=env_u))
+            m_sys_deb = resolve_antigravity_ide_session(str(shared), home=home, now_ts=base_t, wsl=True, env=env_d)
+            assert m_sys_deb is not None
+            self.assertEqual(m_sys_deb.session_id, "cid-remote-sys-active-ws")
+
+            # Absolute paths with spaces continue matching via _AGY_WS_CWD_RE alongside file:// URIs
+            spaced_ws = home / "repos" / "my spaced app"
+            spaced_ws.mkdir(parents=True)
+            shutil.rmtree(ide_brain)
+            _write_agy_brain_session(
+                ide_brain,
+                "cid-spaced-sys-ws",
+                [
+                    {
+                        "source": "SYSTEM",
+                        "type": "SYSTEM_PROMPT",
+                        "content": f"Active Workspaces:\n- {spaced_ws}\n",
+                    },
+                    {"source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "<USER_REQUEST>Hi</USER_REQUEST>"},
+                ],
+                mtime=base_t - 5,
+            )
+            m_spaced = resolve_antigravity_ide_session(str(spaced_ws), home=home, now_ts=base_t, wsl=True, env=env_u)
+            assert m_spaced is not None
+            self.assertEqual(m_spaced.session_id, "cid-spaced-sys-ws")
+
 
 if __name__ == "__main__":
     unittest.main()

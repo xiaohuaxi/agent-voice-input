@@ -532,6 +532,123 @@ class TestRegressMatrixLayerC(unittest.TestCase):
                 self.assertEqual(by_fail[cid]["status"], "FAIL", msg=f"{cid}: {by_fail[cid]}")
                 self.assertIn("schema drift", by_fail[cid]["detail"])
 
+    def test_layer_c_startup_bootstrap_items_and_item_completed_missing_type_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="avi-t-lc-r4-") as raw_td:
+            home = Path(raw_td)
+            cx_dir = home / ".codex" / "sessions" / "2026" / "11" / "23"
+            cx_old = rm._write_codex_rollout(
+                cx_dir / "rollout-2026-11-23T08-00-00-ab010001-0000-4000-8000-000000000001.jsonl",
+                "ab010001-0000-4000-8000-000000000001",
+                str(home / "repo"),
+                [("user", "older codex turn"), ("assistant", "older codex reply")],
+            )
+            # (a) >4 KiB Codex session with only session_meta + # AGENTS.md instructions + developer prompt -> no FAIL
+            cx_boot = cx_dir / "rollout-2026-11-23T09-00-00-ab010002-0000-4000-8000-000000000002.jsonl"
+            cx_boot.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "session_meta", "payload": {"id": "ab010002-0000-4000-8000-000000000002", "cwd": str(home), "source": "cli"}}),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "developer",
+                                    "content": [{"type": "input_text", "text": "<permissions instructions>ok</permissions instructions>"}],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\n" + ("R" * 4500) + "\n</INSTRUCTIONS>",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "input_text", "text": "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}
+                                    ],
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.utime(cx_old, (1700000100, 1700000100))
+            os.utime(cx_boot, (1700000200, 1700000200))
+
+            # (b) >4 KiB AGY session with only source=SYSTEM, type=SYSTEM_PROMPT -> no FAIL
+            agy_root = home / ".gemini" / "antigravity-cli" / "brain"
+            agy_old = rm._write_agy_transcript(
+                agy_root / "cb010001-0000-4000-8000-000000000001" / ".system_generated" / "logs" / "transcript_full.jsonl",
+                str(home / "repo"),
+                [("user", "older agy turn"), ("assistant", "older agy reply")],
+            )
+            agy_boot = agy_root / "cb010002-0000-4000-8000-000000000002" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            agy_boot.parent.mkdir(parents=True, exist_ok=True)
+            agy_boot.write_text(
+                json.dumps({"source": "SYSTEM", "type": "SYSTEM_PROMPT", "cwd": str(home), "content": "P" * 4500}) + "\n",
+                encoding="utf-8",
+            )
+            os.utime(agy_old, (1700000100, 1700000100))
+            os.utime(agy_boot, (1700000200, 1700000200))
+
+            checks_ok = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            by_ok = {c["id"]: c for c in checks_ok}
+            self.assertEqual(by_ok["C1_real_codex_cli"]["status"], "PASS", msg=by_ok["C1_real_codex_cli"])
+            self.assertEqual(by_ok["C1_real_codex_cli"]["metrics"]["candidates_checked"], 2)
+            self.assertEqual(by_ok["C3_real_agy_cli"]["status"], "PASS", msg=by_ok["C3_real_agy_cli"])
+            self.assertEqual(by_ok["C3_real_agy_cli"]["metrics"]["candidates_checked"], 2)
+
+            # (c) >4 KiB newest Codex session with event_msg/item_completed carrying role="user" & non-empty content
+            #     but missing item.type MUST FAIL (not masked by older valid session!)
+            cx_drift = cx_dir / "rollout-2026-11-23T10-00-00-ab010003-0000-4000-8000-000000000003.jsonl"
+            cx_drift.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "session_meta", "payload": {"id": "ab010003-0000-4000-8000-000000000003", "cwd": str(home), "source": "cli"}}),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "item_completed",
+                                    "item": {
+                                        "role": "user",
+                                        "content": [{"type": "text", "text": "drifted turn " + ("D" * 4500)}],
+                                    },
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.utime(cx_drift, (1700000300, 1700000300))
+
+            checks_drift = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            c1_drift = next(c for c in checks_drift if c["id"] == "C1_real_codex_cli")
+            self.assertEqual(c1_drift["status"], "FAIL", msg=c1_drift)
+            self.assertIn("schema drift", c1_drift["detail"])
+            self.assertEqual(c1_drift["metrics"]["drift_candidate"], 1)
+            self.assertEqual(c1_drift["metrics"]["older_ok_candidate"], 3)
+
     def test_small_empty_sessions_mark_skip_not_pass(self) -> None:
         with tempfile.TemporaryDirectory(prefix="avi-t-lc3-") as raw_td:
             home = Path(raw_td)
