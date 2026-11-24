@@ -2385,22 +2385,333 @@ private func queryFrontmostWindowNumber(pid: Int) -> Int {
     return 0
 }
 
+private let kMaxWebAreaFieldLen = 512
+private let kRejectedWebAreaUrl = "about:rejected"
+
+private func shouldProbeWebAreaForEventKind(_ kind: String) -> Bool {
+    return kind == "ptt_start" || kind == "toggle"
+}
+
+private func shouldProbeWebAreaTitle(bundleId: String, windowTitle: String, allowDeepProbe: Bool = true) -> Bool {
+    guard allowDeepProbe else { return false }
+    guard bundleId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "com.anthropic.claudefordesktop" else {
+        return false
+    }
+    _ = windowTitle
+    return true
+}
+
+private func sanitizeWebAreaTitle(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty && trimmed.count <= kMaxWebAreaFieldLen else {
+        return ""
+    }
+    if trimmed.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
+        return ""
+    }
+    return trimmed
+}
+
+private func isClaudeTrustedOrigin(_ comps: URLComponents) -> Bool {
+    guard comps.port == nil,
+          comps.user == nil,
+          comps.password == nil,
+          comps.percentEncodedUser == nil,
+          comps.percentEncodedPassword == nil else {
+        return false
+    }
+    guard let scheme = comps.scheme?.lowercased(),
+          let host = comps.host?.lowercased() else {
+        return false
+    }
+    return (scheme == "app" && host == "localhost") || (scheme == "https" && host == "claude.ai")
+}
+
+private func sanitizeWebAreaUrl(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+        return ""
+    }
+    if trimmed.lowercased().hasPrefix("file://") {
+        return ""
+    }
+    guard trimmed.count <= kMaxWebAreaFieldLen,
+          !trimmed.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+        return kRejectedWebAreaUrl
+    }
+    guard var comps = URLComponents(string: trimmed),
+          isClaudeTrustedOrigin(comps),
+          let scheme = comps.scheme?.lowercased(),
+          let host = comps.host?.lowercased() else {
+        return kRejectedWebAreaUrl
+    }
+    comps.scheme = scheme
+    comps.host = host
+    comps.query = nil
+    comps.fragment = nil
+    guard let cleaned = comps.string,
+          !cleaned.isEmpty,
+          cleaned.count <= kMaxWebAreaFieldLen,
+          !cleaned.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+        return kRejectedWebAreaUrl
+    }
+    return cleaned
+}
+
+private func isClaudeShellWebArea(urlRaw: String, title: String) -> Bool {
+    let lowUrl = urlRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if lowUrl.hasPrefix("file://") {
+        return true
+    }
+    let cleanUrl = sanitizeWebAreaUrl(urlRaw)
+    if !cleanUrl.isEmpty {
+        return false
+    }
+    return sanitizeWebAreaTitle(title).isEmpty
+}
+
+private func isClaudeWebAreaTitleSuffix(_ title: String) -> Bool {
+    let trimmed = sanitizeWebAreaTitle(title)
+    guard !trimmed.isEmpty else { return false }
+    let low = trimmed.lowercased()
+    for suffix in ["claude code", "claude"] {
+        for sep in [" - ", " \u{2013} ", " \u{2014} "] {
+            let tail = sep + suffix
+            if low.hasSuffix(tail) {
+                let prefix = trimmed.dropLast(tail.count).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !prefix.isEmpty {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
+private func isGenericClaudeWebAreaTitle(_ trimmed: String) -> Bool {
+    let low = trimmed.lowercased()
+    if low.isEmpty || low == "claude" || low == "claude code" {
+        return true
+    }
+    let dashSet = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "-\u{2013}\u{2014}"))
+    let stripped = low.trimmingCharacters(in: dashSet)
+    return stripped.isEmpty || stripped == "claude" || stripped == "claude code"
+}
+
+private func selectPreferredWebAreaTitle(_ candidates: [String]) -> String {
+    var fallback = ""
+    for raw in candidates {
+        let trimmed = sanitizeWebAreaTitle(raw)
+        if isGenericClaudeWebAreaTitle(trimmed) {
+            continue
+        }
+        if isClaudeWebAreaTitleSuffix(trimmed) {
+            return trimmed
+        }
+        if fallback.isEmpty {
+            fallback = trimmed
+        }
+    }
+    return fallback
+}
+
+private func isClaudeTrustedOriginUrl(_ cleanUrl: String) -> Bool {
+    guard let comps = URLComponents(string: cleanUrl) else { return false }
+    return isClaudeTrustedOrigin(comps)
+}
+
+private func isStrictUuid36(_ s: Substring) -> Bool {
+    let bytes = Array(s.utf8)
+    guard bytes.count == 36 else { return false }
+    for (idx, b) in bytes.enumerated() {
+        if idx == 8 || idx == 13 || idx == 18 || idx == 23 {
+            if b != 0x2D { return false }
+        } else {
+            let isDigit = (b >= 0x30 && b <= 0x39)
+            let isLowerHex = (b >= 0x61 && b <= 0x66)
+            let isUpperHex = (b >= 0x41 && b <= 0x46)
+            if !(isDigit || isLowerHex || isUpperHex) { return false }
+        }
+    }
+    return true
+}
+
+private func isClaudeSessionRouteUrl(_ cleanUrl: String) -> Bool {
+    guard let comps = URLComponents(string: cleanUrl),
+          isClaudeTrustedOrigin(comps) else {
+        return false
+    }
+    var path = comps.percentEncodedPath
+    if path.hasSuffix("/") {
+        path.removeLast()
+    }
+    guard path.hasPrefix("/") else { return false }
+    let segs = path.dropFirst().split(separator: "/", omittingEmptySubsequences: false)
+    guard segs.count == 2 else { return false }
+    let mode = segs[0].lowercased()
+    guard mode == "cowork" || mode == "epitaxy" || mode == "code" else { return false }
+    let idSeg = segs[1]
+    guard idSeg.count == 42, idSeg.lowercased().hasPrefix("local_") else { return false }
+    return isStrictUuid36(idSeg.dropFirst(6))
+}
+
+private func selectPreferredWebAreaResult(
+    _ candidates: [(title: String, pageUrl: String)]
+) -> (title: String, pageUrl: String) {
+    var bestAppSession: (title: String, pageUrl: String)? = nil
+    var bestTrustedOther: (title: String, pageUrl: String)? = nil
+    var bestWeb: (title: String, pageUrl: String)? = nil
+    var titleOnlyList: [String] = []
+    for raw in candidates {
+        let cleanTitle = sanitizeWebAreaTitle(raw.title)
+        let cleanUrl = sanitizeWebAreaUrl(raw.pageUrl)
+        if cleanTitle.isEmpty && cleanUrl.isEmpty {
+            continue
+        }
+        if !cleanUrl.isEmpty {
+            if isClaudeSessionRouteUrl(cleanUrl) {
+                if bestAppSession == nil || (isClaudeWebAreaTitleSuffix(cleanTitle) && !isClaudeWebAreaTitleSuffix(bestAppSession!.title)) {
+                    bestAppSession = (cleanTitle, cleanUrl)
+                }
+            } else if isClaudeTrustedOriginUrl(cleanUrl) {
+                if bestTrustedOther == nil || (!cleanTitle.isEmpty && bestTrustedOther!.title.isEmpty) {
+                    bestTrustedOther = (cleanTitle, cleanUrl)
+                }
+            } else if bestWeb == nil {
+                bestWeb = (cleanTitle, cleanUrl)
+            }
+        } else {
+            titleOnlyList.append(cleanTitle)
+        }
+    }
+    if let hit = bestAppSession { return hit }
+    if let hit = bestTrustedOther { return hit }
+    if let hit = bestWeb { return hit }
+    return (selectPreferredWebAreaTitle(titleOnlyList), "")
+}
+
+private func readAxUrlString(_ el: AXUIElement) -> String {
+    var urlRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, "AXURL" as CFString, &urlRef) == .success,
+          let u = urlRef else {
+        return ""
+    }
+    if let s = u as? String { return s }
+    if let url = u as? URL { return url.absoluteString }
+    if let nsUrl = u as? NSURL { return nsUrl.absoluteString ?? "" }
+    return ""
+}
+
+private func queryClaudeWebAreaMetadata(
+    axWin: AXUIElement,
+    maxDepth: Int = 12,
+    maxNodes: Int = 96,
+    budgetMs: UInt64 = 80
+) -> (title: String, pageUrl: String) {
+    let containerRoles: Set<String> = [
+        "AXWindow",
+        "AXGroup",
+        "AXSplitGroup",
+        "AXTabGroup",
+        "AXScrollArea",
+        "AXSheet",
+        "AXLayoutArea",
+        "AXUnknown",
+    ]
+    let deadlineMs = monotonicMs() &+ budgetMs
+    func applyRemainingTimeout(_ el: AXUIElement) -> Bool {
+        let now = monotonicMs()
+        if now >= deadlineMs { return false }
+        let remMs = deadlineMs &- now
+        if remMs <= 5 { return false }
+        let timeoutSec = Float(min(remMs, budgetMs)) / 1000.0
+        _ = AXUIElementSetMessagingTimeout(el, timeoutSec)
+        return true
+    }
+
+    var queue: [(AXUIElement, Int)] = [(axWin, 0)]
+    var head = 0
+    var visited = 0
+    var candidates: [(title: String, pageUrl: String)] = []
+    while head < queue.count && visited < maxNodes {
+        let (cur, depth) = queue[head]
+        head += 1
+        visited += 1
+        guard applyRemainingTimeout(cur) else { break }
+        var roleRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(cur, kAXRoleAttribute as CFString, &roleRef) == .success,
+              let role = roleRef as? String else {
+            continue
+        }
+        if role == "AXWebArea" {
+            guard applyRemainingTimeout(cur) else { break }
+            let rawUrl = readAxUrlString(cur)
+            let cleanUrl = sanitizeWebAreaUrl(rawUrl)
+            guard applyRemainingTimeout(cur) else {
+                if !cleanUrl.isEmpty {
+                    candidates.append(("", cleanUrl))
+                }
+                break
+            }
+            var titleRef: CFTypeRef?
+            let rawTitle: String = {
+                if AXUIElementCopyAttributeValue(cur, kAXTitleAttribute as CFString, &titleRef) == .success,
+                   let s = titleRef as? String {
+                    return s
+                }
+                return ""
+            }()
+            let cleanTitle = sanitizeWebAreaTitle(rawTitle)
+            if !cleanUrl.isEmpty || !cleanTitle.isEmpty {
+                candidates.append((cleanTitle, cleanUrl))
+                if isClaudeSessionRouteUrl(cleanUrl) && isClaudeWebAreaTitleSuffix(cleanTitle) {
+                    return (cleanTitle, cleanUrl)
+                }
+            }
+            // Allow descending through the outer file:// Electron shell AXWebArea (depth 8 -> nested content AXWebArea at depth 9),
+            // but never descend into a business content AXWebArea's internal DOM.
+            if !(depth < maxDepth && isClaudeShellWebArea(urlRaw: rawUrl, title: rawTitle)) {
+                continue
+            }
+        } else if !(depth < maxDepth && containerRoles.contains(role)) {
+            continue
+        }
+        guard applyRemainingTimeout(cur) else { break }
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(cur, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let rawChildren = childrenRef as? [AnyObject] else {
+            continue
+        }
+        var enqueued = 0
+        for item in rawChildren {
+            if enqueued >= 24 { break }
+            guard CFGetTypeID(item) == AXUIElementGetTypeID() else { continue }
+            let child = unsafeBitCast(item, to: AXUIElement.self)
+            if CFEqual(child, cur) || CFEqual(child, axWin) { continue }
+            queue.append((child, depth + 1))
+            enqueued += 1
+        }
+    }
+    return selectPreferredWebAreaResult(candidates)
+}
+
 private func queryFrontWindowMetadata(
     pid: Int,
     bundleId: String,
     pinnedWindowId: Int? = nil,
+    allowDeepWebAreaProbe: Bool = true,
     liveWindowNumberProvider: (Int) -> Int = queryFrontmostWindowNumber
-) -> (hwnd: Int, title: String, document: String, axTrusted: Bool) {
+) -> (hwnd: Int, title: String, document: String, pageUrl: String, axTrusted: Bool) {
     let trusted = AXIsProcessTrusted()
-    guard pid > 0 else { return (pinnedWindowId ?? 0, "", "", trusted) }
+    guard pid > 0 else { return (pinnedWindowId ?? 0, "", "", "", trusted) }
     let effectiveWinNum: Int
     if let pinned = pinnedWindowId {
         if pinned <= 0 {
-            return (0, "", "", trusted)
+            return (0, "", "", "", trusted)
         }
         let liveWinNum = liveWindowNumberProvider(pid)
         if liveWinNum != pinned {
-            return (pinned, "", "", trusted)
+            return (pinned, "", "", "", trusted)
         }
         effectiveWinNum = pinned
     } else {
@@ -2408,6 +2719,7 @@ private func queryFrontWindowMetadata(
     }
     var axTitle = ""
     var axDoc = ""
+    var axPageUrl = ""
     if bundleId.lowercased() != "com.mitchellh.ghostty" && trusted {
         let axApp = AXUIElementCreateApplication(pid_t(pid))
         _ = AXUIElementSetMessagingTimeout(axApp, 0.25)
@@ -2432,12 +2744,21 @@ private func queryFrontWindowMetadata(
                     axDoc = rawDoc
                 }
             }
+            if shouldProbeWebAreaTitle(bundleId: bundleId, windowTitle: axTitle, allowDeepProbe: allowDeepWebAreaProbe) {
+                let webMeta = queryClaudeWebAreaMetadata(axWin: axWin, maxDepth: 12, maxNodes: 96, budgetMs: 80)
+                if !webMeta.title.isEmpty {
+                    axTitle = webMeta.title
+                }
+                if !webMeta.pageUrl.isEmpty {
+                    axPageUrl = webMeta.pageUrl
+                }
+            }
             if let pinned = pinnedWindowId, pinned > 0, liveWindowNumberProvider(pid) != pinned {
-                return (pinned, "", "", trusted)
+                return (pinned, "", "", "", trusted)
             }
         }
     }
-    return (effectiveWinNum, axTitle, axDoc, trusted)
+    return (effectiveWinNum, axTitle, axDoc, axPageUrl, trusted)
 }
 
 private func postEventsIfWithinDeadline<T>(
@@ -4671,6 +4992,60 @@ private func runSelfCheck() -> Int32 {
                 liveWindowNumberProvider: { _ in 303 }
             )
             try check(zeroPinnedMeta.hwnd == 0 && zeroPinnedMeta.title.isEmpty && zeroPinnedMeta.document.isEmpty, "pinned windowId == 0 never backfills later window B")
+
+            // 10) Claude Desktop AXWebArea title & URL probe gating, sanitization, shell descent & candidate selection
+            try check(shouldProbeWebAreaForEventKind("ptt_start") && shouldProbeWebAreaForEventKind("toggle"), "start/toggle events allow deep web area probe")
+            try check(!shouldProbeWebAreaForEventKind("ptt_stop") && !shouldProbeWebAreaForEventKind("ptt_cancel") && !shouldProbeWebAreaForEventKind("hold_cancel"), "stop/cancel events skip deep web area probe")
+            try check(shouldProbeWebAreaTitle(bundleId: "com.anthropic.claudefordesktop", windowTitle: "", allowDeepProbe: true), "claude desktop allows deep web area probe")
+            try check(!shouldProbeWebAreaTitle(bundleId: "com.anthropic.claudefordesktop", windowTitle: "Claude", allowDeepProbe: false), "claude desktop respects allowDeepProbe=false")
+            try check(!shouldProbeWebAreaTitle(bundleId: "com.openai.codex", windowTitle: "Claude", allowDeepProbe: true), "non-claude bundleId skips web area probe")
+            let sampleUuid = "11111111-2222-4333-8444-555555555555"
+            try check(isClaudeShellWebArea(urlRaw: "file:///Applications/Claude.app/Contents/Resources/main_window/index.html", title: ""), "file:// main_window shell AXWebArea allows descent")
+            try check(!isClaudeShellWebArea(urlRaw: "app://localhost/cowork/local_\(sampleUuid)", title: "Weekly Plan - Claude"), "app:// content AXWebArea blocks internal DOM descent")
+            try check(sanitizeWebAreaUrl("app://LOCALHOST/cowork/local_\(sampleUuid)?token=secret#frag") == "app://localhost/cowork/local_\(sampleUuid)", "sanitizeWebAreaUrl strips query/fragment and lowercases trusted scheme/host")
+            try check(sanitizeWebAreaUrl("app://user:pass@LOCALHOST/cowork/local_\(sampleUuid)?token=secret#frag") == kRejectedWebAreaUrl, "sanitizeWebAreaUrl rejects userinfo instead of laundering to localhost")
+            try check(sanitizeWebAreaUrl("app://@localhost/epitaxy/local_\(sampleUuid)") == kRejectedWebAreaUrl, "sanitizeWebAreaUrl rejects bare @ userinfo")
+            try check(sanitizeWebAreaUrl("app://localhost:8080/epitaxy/local_\(sampleUuid)") == kRejectedWebAreaUrl, "sanitizeWebAreaUrl rejects port as non-session sentinel")
+            try check(sanitizeWebAreaUrl("https://evil.example/code/local_\(sampleUuid)") == kRejectedWebAreaUrl, "sanitizeWebAreaUrl rejects untrusted host as non-session sentinel")
+            try check(sanitizeWebAreaUrl("file:///etc/passwd").isEmpty, "sanitizeWebAreaUrl skips file:// shell URLs")
+            try check(sanitizeWebAreaUrl("app://localhost/new\nInjected") == kRejectedWebAreaUrl, "sanitizeWebAreaUrl rejects control chars as non-session sentinel")
+            try check(isClaudeSessionRouteUrl("app://localhost/cowork/local_\(sampleUuid)"), "isClaudeSessionRouteUrl accepts app://localhost cowork UUID")
+            try check(isClaudeSessionRouteUrl("app://localhost/epitaxy/local_\(sampleUuid)"), "isClaudeSessionRouteUrl accepts app://localhost epitaxy UUID")
+            try check(isClaudeSessionRouteUrl("https://claude.ai/code/local_\(sampleUuid)"), "isClaudeSessionRouteUrl accepts https://claude.ai code UUID")
+            try check(!isClaudeSessionRouteUrl("app://evil.local/cowork/local_\(sampleUuid)"), "isClaudeSessionRouteUrl rejects untrusted app host")
+            try check(!isClaudeSessionRouteUrl("app://localhost:8080/cowork/local_\(sampleUuid)"), "isClaudeSessionRouteUrl rejects port on localhost")
+            try check(!isClaudeSessionRouteUrl("https://evil.example/cowork/local_\(sampleUuid)"), "isClaudeSessionRouteUrl rejects untrusted https host")
+            try check(!isClaudeSessionRouteUrl("https://claude.ai:8443/cowork/local_\(sampleUuid)"), "isClaudeSessionRouteUrl rejects port on claude.ai")
+            try check(!isClaudeSessionRouteUrl("app://localhost/cowork/local_short"), "isClaudeSessionRouteUrl rejects non-UUID local id")
+            try check(!isClaudeSessionRouteUrl("app://localhost/cowork/local_\(sampleUuid)/extra"), "isClaudeSessionRouteUrl rejects trailing path segments")
+            try check(!isClaudeSessionRouteUrl("app://localhost/prefix/cowork/local_\(sampleUuid)"), "isClaudeSessionRouteUrl rejects prefixed path segments")
+            try check(!isClaudeSessionRouteUrl(kRejectedWebAreaUrl), "isClaudeSessionRouteUrl rejects about:rejected sentinel")
+            try check(sanitizeWebAreaTitle("Line1\nLine2 - Claude").isEmpty, "sanitizeWebAreaTitle rejects control chars")
+            try check(sanitizeWebAreaTitle(String(repeating: "a", count: 600)).isEmpty, "sanitizeWebAreaTitle rejects oversized title > 512 chars")
+            try check(selectPreferredWebAreaTitle(["", "Claude", "  claude  "]).isEmpty, "selectPreferredWebAreaTitle ignores empty and generic Claude")
+            try check(selectPreferredWebAreaTitle(["Sidebar", "Refactor Auth - Claude Code", "Other - Claude"]) == "Refactor Auth - Claude Code", "selectPreferredWebAreaTitle prefers Claude Code suffix over plain title")
+            try check(selectPreferredWebAreaTitle(["Sidebar", "Weekly Plan \u{2014} Claude"]) == "Weekly Plan \u{2014} Claude", "selectPreferredWebAreaTitle prefers em-dash Claude suffix")
+            try check(selectPreferredWebAreaTitle([" - Claude", "Fallback Web Title"]) == "Fallback Web Title", "selectPreferredWebAreaTitle ignores empty-prefix suffix and falls back")
+            let selNested = selectPreferredWebAreaResult([
+                ("", ""),
+                ("Shell", ""),
+                ("Spoof - Claude", "https://evil.example/cowork/local_\(sampleUuid)"),
+                ("Weekly Plan - Claude", "app://localhost/cowork/local_\(sampleUuid)"),
+            ])
+            try check(selNested.title == "Weekly Plan - Claude" && selNested.pageUrl == "app://localhost/cowork/local_\(sampleUuid)", "selectPreferredWebAreaResult picks trusted app:// session WebArea over untrusted host")
+            let selTrustedOverUntrusted = selectPreferredWebAreaResult([
+                ("Spoof - Claude", "app://evil.host/cowork/local_\(sampleUuid)"),
+                ("Claude", "app://localhost/new"),
+            ])
+            try check(selTrustedOverUntrusted.pageUrl == "app://localhost/new", "selectPreferredWebAreaResult prefers trusted app://localhost/new over untrusted app:// host")
+            let selUserinfoOnly = selectPreferredWebAreaResult([
+                ("Refactor Auth - Claude Code", "app://user:pass@localhost/epitaxy/local_\(sampleUuid)"),
+            ])
+            try check(selUserinfoOnly.pageUrl == kRejectedWebAreaUrl, "selectPreferredWebAreaResult emits non-empty about:rejected for userinfo-only WebArea so Python stays fail-closed")
+            let selBlank = selectPreferredWebAreaResult([
+                ("Claude", "app://localhost/epitaxy"),
+            ])
+            try check(selBlank.title == "Claude" && selBlank.pageUrl == "app://localhost/epitaxy", "selectPreferredWebAreaResult preserves blank app:// route for Python fail-closed check")
         }
 
         let hudLayoutCases = try runHudLayoutSelfCheck()
@@ -4774,13 +5149,15 @@ struct MacShimMain {
             for item in emitted {
                 let appSnap = snapshotFrontmostAppBasic()
                 let pinnedHwnd = queryFrontmostWindowNumber(pid: appSnap.pid)
+                let allowDeepProbe = shouldProbeWebAreaForEventKind(item.kind)
                 eventEmitQueue.async {
                     let meta = queryFrontWindowMetadata(
                         pid: appSnap.pid,
                         bundleId: appSnap.bundleId,
-                        pinnedWindowId: pinnedHwnd
+                        pinnedWindowId: pinnedHwnd,
+                        allowDeepWebAreaProbe: allowDeepProbe
                     )
-                    var payload: [String: Any] = ["event": item.kind, "hwnd": meta.hwnd, "process": appSnap.name, "bundle_id": appSnap.bundleId, "pid": appSnap.pid, "title": meta.title, "document": meta.document, "ax_trusted": meta.axTrusted, "ts_ms": now]
+                    var payload: [String: Any] = ["event": item.kind, "hwnd": meta.hwnd, "process": appSnap.name, "bundle_id": appSnap.bundleId, "pid": appSnap.pid, "title": meta.title, "document": meta.document, "page_url": meta.pageUrl, "ax_trusted": meta.axTrusted, "ts_ms": now]
                     if item.kind == "hold_cancel" { payload["hold_ms"] = item.holdMs }
                     writeJsonLine(payload)
                 }
@@ -4971,9 +5348,10 @@ struct MacShimMain {
                             let meta = queryFrontWindowMetadata(
                                 pid: appSnap.pid,
                                 bundleId: appSnap.bundleId,
-                                pinnedWindowId: pinnedHwnd
+                                pinnedWindowId: pinnedHwnd,
+                                allowDeepWebAreaProbe: true
                             )
-                            writeJsonLine(["type": "reply", "reply": "fg_window", "seq_id": seqId, "ok": true, "hwnd": meta.hwnd, "process": appSnap.name, "bundle_id": appSnap.bundleId, "pid": appSnap.pid, "title": meta.title, "document": meta.document, "ax_trusted": meta.axTrusted])
+                            writeJsonLine(["type": "reply", "reply": "fg_window", "seq_id": seqId, "ok": true, "hwnd": meta.hwnd, "process": appSnap.name, "bundle_id": appSnap.bundleId, "pid": appSnap.pid, "title": meta.title, "document": meta.document, "page_url": meta.pageUrl, "ax_trusted": meta.axTrusted])
                         }
                     case "key_state":
                         let held = isHotkeyOrModifierHeld()

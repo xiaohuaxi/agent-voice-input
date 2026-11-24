@@ -1042,6 +1042,7 @@ class MacOSPlatform(JsonlShimMixin):
         self._fg_tls.from_shim = False
         self._fg_tls.ax_trusted = None
         self._fg_tls.document = ""
+        self._fg_tls.page_url = ""
         if self._has_managed_shim():
             r = self._shim_rpc({"cmd": "fg_window"}, timeout_sec=1.5)
             if r is not None:
@@ -1054,6 +1055,7 @@ class MacOSPlatform(JsonlShimMixin):
                 self._fg_tls.ax_trusted = raw_ax if isinstance(raw_ax, bool) else None
                 raw_doc = str(r.get("document") or "").strip()
                 self._fg_tls.document = raw_doc if raw_doc.lower().startswith("file://") else ""
+                self._fg_tls.page_url = str(r.get("page_url") or "").strip()
                 shim_title = str(r.get("title") or "").strip()
                 if is_ghostty_app(app_name, bundle_id):
                     return app_name or "Ghostty", bundle_id or GHOSTTY_BUNDLE_ID, shim_title, app_pid
@@ -1176,6 +1178,7 @@ class MacOSPlatform(JsonlShimMixin):
             )
             raw_hint_doc = (hint.document or "").strip()
             win_doc = raw_hint_doc if raw_hint_doc.lower().startswith("file://") else ""
+            win_page_url = (hint.page_url or "").strip()
             from_shim = hint.ax_trusted is not None
             ax_trusted = hint.ax_trusted
             if (
@@ -1192,11 +1195,13 @@ class MacOSPlatform(JsonlShimMixin):
             self._fg_tls.from_shim = False
             self._fg_tls.ax_trusted = None
             self._fg_tls.document = ""
+            self._fg_tls.page_url = ""
             app_name, bundle_id, win_title, app_pid = self._query_frontmost_process_and_title()
             app_hwnd = int(getattr(self._fg_tls, "hwnd", 0) or 0)
             from_shim = bool(getattr(self._fg_tls, "from_shim", False))
             ax_trusted = getattr(self._fg_tls, "ax_trusted", None)
             win_doc = str(getattr(self._fg_tls, "document", "") or "")
+            win_page_url = str(getattr(self._fg_tls, "page_url", "") or "")
 
         if is_ghostty_app(app_name, bundle_id):
             eff_name, eff_bundle = app_name or "Ghostty", bundle_id or GHOSTTY_BUNDLE_ID
@@ -1327,6 +1332,7 @@ class MacOSPlatform(JsonlShimMixin):
             pid=app_pid,
             ax_trusted=ax_trusted,
             document=win_doc,
+            page_url=win_page_url,
         )
         return self._enrich_window_tmux_target(other_win) if not (from_shim and app_hwnd <= 0) else other_win
 

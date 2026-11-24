@@ -24,6 +24,7 @@ from agent_voice_input.app_scope import (  # noqa: E402
     classify_target_app_hint,
     classify_window_category,
     is_antigravity_ide_window,
+    is_claude_desktop_window,
     is_codex_desktop_window,
     is_terminal_window,
     parse_ide_window_title,
@@ -76,6 +77,15 @@ from agent_voice_input.session_ctx import (  # noqa: E402
     resolve_codex_desktop_session_by_title,
     resolve_ide_workspace_cwd,
 )
+
+
+from agent_voice_input.workspace_ctx import (  # noqa: E402
+    _extract_cowork_folders,
+    _parse_claude_desktop_page_url,
+    _parse_claude_desktop_window_title,
+    resolve_claude_desktop_session_by_title,
+)
+from agent_voice_input._remote_probe import encode_claude_project_dir  # noqa: E402
 
 
 def _voiced_wav(duration_ms: int = 450, amp: int = 6000) -> bytes:
@@ -3797,6 +3807,1541 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             )
             self.assertEqual(_extract_agy_cwd(cli_uri_tp, wsl=False), "")
             self.assertEqual(_extract_agy_cwd(cli_uri_tp, wsl=True), "")
+
+
+class TestClaudeDesktopContextBinding(unittest.TestCase):
+    """Offline tests for Claude Desktop (Code + Cowork) binding, security guards, and Chat fallback."""
+
+    @staticmethod
+    def _write_claude_turn_jsonl(
+        path: Path,
+        sid: str,
+        turns: list[tuple[str, str]],
+        *,
+        cwd: str = "",
+        extra_lines: list[dict[str, object]] | None = None,
+        is_sidechain: bool = False,
+        use_snake_sid: bool = False,
+    ) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines: list[str] = []
+        if extra_lines:
+            for item in extra_lines:
+                lines.append(json.dumps(item, ensure_ascii=False))
+        for role, text in turns:
+            rec: dict[str, object] = {
+                "type": role,
+                "isSidechain": is_sidechain,
+                "message": {"role": role, "content": [{"type": "text", "text": text}]},
+            }
+            if use_snake_sid:
+                rec["session_id"] = sid
+            else:
+                rec["sessionId"] = sid
+            if cwd:
+                rec["cwd"] = cwd
+            lines.append(json.dumps(rec, ensure_ascii=False))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_app_scope_is_claude_desktop_window_matrix(self) -> None:
+        # Positive cases
+        for win in (
+            ForegroundWindow(process="Claude", bundle_id="com.anthropic.claudefordesktop", title="Claude"),
+            ForegroundWindow(process="Claude", bundle_id="com.anthropic.claudefordesktop", title="Fix bug - Claude Code"),
+            ForegroundWindow(process="Claude", bundle_id="COM.ANTHROPIC.CLAUDEFORDESKTOP", title="Weekly Plan — Claude"),
+            ForegroundWindow(process="Claude", bundle_id="", title="Fix bug - Claude Code"),
+            ForegroundWindow(process="Claude.exe", bundle_id="", title="Weekly Plan — Claude"),
+            ForegroundWindow(process="Claude.exe", bundle_id="", title="Claude"),
+        ):
+            self.assertTrue(is_claude_desktop_window(win), f"expected True for {win}")
+            self.assertEqual(classify_window_category(win, is_terminal=is_terminal_window), "general_gui")
+            self.assertEqual(classify_target_app_hint(win), "ai_chat")
+
+        # Negative cases (terminals, CLI spinners/tags, browsers, other desktop apps)
+        for win in (
+            ForegroundWindow(process="Ghostty", bundle_id="com.mitchellh.ghostty", title="claude · repo"),
+            ForegroundWindow(process="Terminal", bundle_id="com.apple.terminal", title="Claude"),
+            ForegroundWindow(process="iTerm2", bundle_id="com.googlecode.iterm2", title="Fix bug - Claude Code"),
+            ForegroundWindow(process="WindowsTerminal.exe", bundle_id="", title="claude [#abcd1234]"),
+            ForegroundWindow(process="putty.exe", bundle_id="", title="Claude"),
+            ForegroundWindow(process="claude", bundle_id="", title="✳ Fixing auth - Claude Code"),
+            ForegroundWindow(process="claude", bundle_id="", title="⠋ Thinking - Claude"),
+            ForegroundWindow(process="claude", bundle_id="", title="repo [#abcd1234] - Claude"),
+            ForegroundWindow(process="Google Chrome", bundle_id="com.google.Chrome", title="Chat - Claude"),
+            ForegroundWindow(process="ChatGPT", bundle_id="com.openai.codex", title="Claude"),
+            ForegroundWindow(process="", bundle_id="", title="Claude"),
+        ):
+            self.assertFalse(is_claude_desktop_window(win), f"expected False for {win}")
+
+    def test_title_parsing_and_code_resolution_dual_roots_and_guards(self) -> None:
+        # Title parsing edge cases
+        self.assertEqual(_parse_claude_desktop_window_title(""), ("", ""))
+        self.assertEqual(_parse_claude_desktop_window_title("Claude"), ("", ""))
+        self.assertEqual(_parse_claude_desktop_window_title("Claude Code"), ("", ""))
+        self.assertEqual(_parse_claude_desktop_window_title("New Session - Claude Code"), ("", ""))
+        self.assertEqual(_parse_claude_desktop_window_title("New Chat - Claude"), ("", ""))
+        self.assertEqual(_parse_claude_desktop_window_title("Random Title (Admin)"), ("", ""))
+        self.assertEqual(_parse_claude_desktop_window_title("Fix Auth - Claude Code [Administrator]"), ("code", "Fix Auth"))
+        self.assertEqual(_parse_claude_desktop_window_title("Fix Auth—Claude Code"), ("code", "Fix Auth"))
+        self.assertEqual(_parse_claude_desktop_window_title("Weekly Plan – Claude"), ("cowork", "Weekly Plan"))
+        self.assertEqual(_parse_claude_desktop_window_title("No Suffix At All"), ("", ""))
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            repo_a = home / "repos" / "alpha-app"
+            repo_b = home / "repos" / "beta-app"
+            real_target = home / "repos" / "gamma-real"
+            for d in (repo_a, repo_b, real_target):
+                d.mkdir(parents=True)
+            link_gamma = home / "repos" / "gamma-link"
+            os.symlink(real_target, link_gamma)
+
+            env = {"HOME": str(home)}
+            official_acct = (
+                home / "Library" / "Application Support" / "Claude" / "claude-code-sessions" / "org1" / "acct1"
+            )
+            third_party_acct = (
+                home / "Library" / "Application Support" / "Claude-3p" / "claude-code-sessions" / "org2" / "acct2"
+            )
+            official_acct.mkdir(parents=True)
+            third_party_acct.mkdir(parents=True)
+            # Noise dirs & invalid files that must be safely skipped
+            (official_acct.parent / "skills-plugin").mkdir(parents=True)
+            (official_acct / "local_bad_json.json").write_text("{not-json", encoding="utf-8")
+            (official_acct / "local_list.json").write_text("[]", encoding="utf-8")
+            (official_acct / "local_empty_title.json").write_text(json.dumps({"title": ""}), encoding="utf-8")
+            (official_acct / "local_oversized.json").write_bytes(b" " * (1048576 + 16))
+            sym_target = tmp / "outside.json"
+            sym_target.write_text(json.dumps({"title": "Symlink Meta"}), encoding="utf-8")
+            os.symlink(sym_target, official_acct / "local_symlink.json")
+
+            def _mk_code_session(
+                acct_dir: Path,
+                meta_name: str,
+                cli_sid: str,
+                title: str,
+                cwd: str,
+                *,
+                session_id_override: str | None = None,
+                fp_real: str = "",
+                is_archived: bool = False,
+                env_id: str = "",
+                last_focused: int = 1795446000000,
+                last_activity: int = 1795446000000,
+                create_jsonl: bool = True,
+                jsonl_cwd_encode: str | None = None,
+                is_sidechain: bool = False,
+                jsonl_sid_override: str = "",
+            ) -> Path | None:
+                payload: dict[str, object] = {
+                    "sessionId": f"local_{cli_sid}" if session_id_override is None else session_id_override,
+                    "cliSessionId": cli_sid,
+                    "title": title,
+                    "cwd": cwd,
+                    "isArchived": is_archived,
+                    "lastFocusedAt": last_focused,
+                    "lastActivityAt": last_activity,
+                    "createdAt": last_activity - 1000,
+                }
+                if fp_real:
+                    payload["folderPlace"] = {"cwd": cwd, "realPath": fp_real}
+                if env_id:
+                    payload["startedFromEnvironmentId"] = env_id
+                (acct_dir / f"local_{meta_name}.json").write_text(
+                    json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+                )
+                if not create_jsonl:
+                    return None
+                enc_src = jsonl_cwd_encode if jsonl_cwd_encode is not None else cwd
+                enc = encode_claude_project_dir(enc_src, wsl=False)[0]
+                tp = home / ".claude" / "projects" / enc / f"{cli_sid}.jsonl"
+                self._write_claude_turn_jsonl(
+                    tp,
+                    jsonl_sid_override or cli_sid,
+                    [("user", f"Work on {title}"), ("assistant", "Done.")],
+                    cwd=cwd,
+                    is_sidechain=is_sidechain,
+                )
+                return tp
+
+            # 1) Official root exact match + 3P root exact match + Chinese/English truncated prefix
+            sid_off = "aaaa1111-1111-4111-8111-111111111111"
+            sid_3p = "bbbb2222-2222-4222-8222-222222222222"
+            sid_cn = "cccc3333-3333-4333-8333-333333333333"
+            sid_gamma = "dddd4444-4444-4444-8444-444444444444"
+            _mk_code_session(official_acct, "off1", sid_off, "Official Pipeline Refactor", str(repo_a))
+            _mk_code_session(third_party_acct, "3p1", sid_3p, "ThirdParty Stream Optimization", str(repo_b))
+            _mk_code_session(third_party_acct, "cn1", sid_cn, "排查守护进程并发竞态问题", str(repo_a))
+            # Symlinked cwd where transcript lives under folderPlace.realPath encoded dir
+            _mk_code_session(
+                third_party_acct,
+                "gamma1",
+                sid_gamma,
+                "Gamma Symlink Repo Task",
+                str(link_gamma),
+                fp_real=str(real_target),
+                jsonl_cwd_encode=str(real_target),
+            )
+
+            m_off = resolve_claude_desktop_session_by_title("Official Pipeline Refactor - Claude Code", home=home, wsl=False, env=env)
+            assert m_off is not None
+            self.assertEqual(m_off.cli, "claude")
+            self.assertEqual(m_off.session_id, sid_off)
+            self.assertEqual(m_off.matched_by, "claude_desktop_code")
+            self.assertEqual(Path(m_off.cwd).resolve(), repo_a.resolve())
+
+            m_3p = resolve_claude_desktop_session_by_title("ThirdParty Stream... - Claude Code", home=home, wsl=False, env=env)
+            assert m_3p is not None
+            self.assertEqual(m_3p.session_id, sid_3p)
+            self.assertEqual(Path(m_3p.cwd).resolve(), repo_b.resolve())
+
+            # Too-short English truncated prefix rejected
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Third... - Claude Code", home=home, wsl=False, env=env))
+            # Chinese truncated prefix >= 4 chars matched
+            m_cn = resolve_claude_desktop_session_by_title("排查守护进… - Claude Code", home=home, wsl=False, env=env)
+            assert m_cn is not None
+            self.assertEqual(m_cn.session_id, sid_cn)
+            # Symlinked folderPlace.realPath lookup
+            m_gamma = resolve_claude_desktop_session_by_title("Gamma Symlink Repo Task - Claude Code", home=home, wsl=False, env=env)
+            assert m_gamma is not None
+            self.assertEqual(m_gamma.session_id, sid_gamma)
+            self.assertEqual(Path(m_gamma.cwd).resolve(), real_target.resolve())
+
+            # 2) Archived session ignored
+            _mk_code_session(official_acct, "arch1", "eeee5555-5555-4555-8555-555555555555", "Archived Code Task", str(repo_a), is_archived=True)
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Archived Code Task - Claude Code", home=home, wsl=False, env=env))
+
+            # 3) Cross-repo conflict across Claude & Claude-3p fails closed
+            _mk_code_session(official_acct, "conf_a", "11110000-0000-4000-8000-000000000001", "Shared Duplicate Title", str(repo_a))
+            _mk_code_session(third_party_acct, "conf_b", "11110000-0000-4000-8000-000000000002", "Shared Duplicate Title", str(repo_b))
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Shared Duplicate Title - Claude Code", home=home, wsl=False, env=env))
+
+            # 4) Non-local startedFromEnvironmentId fails closed; "local" passes
+            _mk_code_session(official_acct, "cloud_env", "22220000-0000-4000-8000-000000000001", "Cloud Env Session", str(repo_a), env_id="env_cloud_01")
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Cloud Env Session - Claude Code", home=home, wsl=False, env=env))
+            _mk_code_session(official_acct, "local_env", "22220000-0000-4000-8000-000000000002", "Explicit Local Env", str(repo_a), env_id="local")
+            m_loc = resolve_claude_desktop_session_by_title("Explicit Local Env - Claude Code", home=home, wsl=False, env=env)
+            assert m_loc is not None
+            self.assertEqual(m_loc.session_id, "22220000-0000-4000-8000-000000000002")
+
+            # 5) Same-repo multi-candidate with distinct active SIDs (e.g. Claude + Claude-3p) fails closed without URL,
+            #    while exact epitaxy/code page_url cleanly disambiguates each one!
+            sid_old = "33330000-0000-4000-8000-000000000001"
+            sid_new = "33330000-0000-4000-8000-000000000002"
+            _mk_code_session(official_acct, sid_old, sid_old, "Same Repo Tiebreak", str(repo_a), last_focused=1795446100000, last_activity=1795446900000)
+            _mk_code_session(third_party_acct, sid_new, sid_new, "Same Repo Tiebreak", str(repo_a), last_focused=1795446500000, last_activity=1795446200000)
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Same Repo Tiebreak - Claude Code", home=home, wsl=False, env=env))
+            m_tie_url = resolve_claude_desktop_session_by_title(
+                "Same Repo Tiebreak - Claude Code",
+                page_url=f"app://localhost/epitaxy/local_{sid_old}",
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            assert m_tie_url is not None
+            self.assertEqual(m_tie_url.session_id, sid_old)
+            # Blank /epitaxy or /new route MUST fail closed even if title matches
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "Official Pipeline Refactor - Claude Code",
+                    page_url="app://localhost/epitaxy",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "Official Pipeline Refactor - Claude Code",
+                    page_url="app://localhost/new",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+            # Duplicate same local_<uuid> across Claude & Claude-3p pointing to different cliSessionIds fails closed
+            dup_local = "33339999-0000-4000-8000-000000000009"
+            _mk_code_session(
+                official_acct,
+                dup_local,
+                "33339999-1111-4000-8000-000000000001",
+                "Dup Local A",
+                str(repo_a),
+                session_id_override=f"local_{dup_local}",
+            )
+            _mk_code_session(
+                third_party_acct,
+                dup_local,
+                "33339999-2222-4000-8000-000000000002",
+                "Dup Local B",
+                str(repo_a),
+                session_id_override=f"local_{dup_local}",
+            )
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "Dup Local A - Claude Code",
+                    page_url=f"app://localhost/epitaxy/local_{dup_local}",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+            # R2 P0: filename local_A.json whose internal sessionId is local_B (or missing) MUST be rejected
+            spoof_a = "33338888-0000-4000-8000-000000000001"
+            spoof_b = "33338888-0000-4000-8000-000000000002"
+            _mk_code_session(
+                official_acct,
+                spoof_a,
+                spoof_b,
+                "Spoofed Internal Id Code",
+                str(repo_a),
+                session_id_override=f"local_{spoof_b}",
+            )
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "Spoofed Internal Id Code - Claude Code",
+                    page_url=f"app://localhost/epitaxy/local_{spoof_a}",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+            missing_id_local = "33338888-0000-4000-8000-000000000003"
+            _mk_code_session(
+                official_acct,
+                missing_id_local,
+                missing_id_local,
+                "Missing Internal Id Code",
+                str(repo_a),
+                session_id_override="",
+            )
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "Missing Internal Id Code - Claude Code",
+                    page_url=f"app://localhost/epitaxy/local_{missing_id_local}",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+            # R2 P1 + R3 #1: untrusted host / port / userinfo / about:rejected fails closed (never falls back to title scanning)
+            for bad_origin_url in (
+                "about:rejected",
+                f"app://user:pass@localhost/epitaxy/local_{sid_old}",
+                f"app://evil.host/epitaxy/local_{sid_old}",
+                f"app://localhost:8080/epitaxy/local_{sid_old}",
+                f"https://evil.example/code/local_{sid_old}",
+                f"https://claude.ai:8443/code/local_{sid_old}",
+                f"http://localhost/epitaxy/local_{sid_old}",
+            ):
+                self.assertIsNone(
+                    resolve_claude_desktop_session_by_title(
+                        "Official Pipeline Refactor - Claude Code",
+                        page_url=bad_origin_url,
+                        home=home,
+                        wsl=False,
+                        env=env,
+                    ),
+                    f"expected None for untrusted URL {bad_origin_url!r}",
+                )
+            # Trusted https://claude.ai/code/local_<uuid> resolves cleanly
+            m_https_code = resolve_claude_desktop_session_by_title(
+                "Same Repo Tiebreak - Claude Code",
+                page_url=f"https://claude.ai/code/local_{sid_old}",
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            assert m_https_code is not None
+            self.assertEqual(m_https_code.session_id, sid_old)
+
+            # 6) Brand-new empty session (no JSONL yet) degrades cleanly without grabbing older sibling
+            _mk_code_session(official_acct, "blank_old", "44440000-0000-4000-8000-000000000001", "Fresh Blank Session", str(repo_a), last_focused=1795446100000, create_jsonl=True)
+            _mk_code_session(official_acct, "blank_new", "44440000-0000-4000-8000-000000000002", "Fresh Blank Session", str(repo_a), last_focused=1795446900000, create_jsonl=False)
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Fresh Blank Session - Claude Code", home=home, wsl=False, env=env))
+
+            # 7) Security guards & strict SID verification (no filename-stem fallback, no corrupt non-empty JSONL)
+            _mk_code_session(official_acct, "broad_home", "55550000-0000-4000-8000-000000000001", "Broad Home Dir", str(home))
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Broad Home Dir - Claude Code", home=home, wsl=False, env=env))
+            _mk_code_session(official_acct, "trav_sid", "../escape", "Traversal Sid", str(repo_a), create_jsonl=False)
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Traversal Sid - Claude Code", home=home, wsl=False, env=env))
+            _mk_code_session(official_acct, "sidechain_s", "55550000-0000-4000-8000-000000000002", "Sidechain Jsonl", str(repo_a), is_sidechain=True)
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Sidechain Jsonl - Claude Code", home=home, wsl=False, env=env))
+            _mk_code_session(official_acct, "mismatch_s", "55550000-0000-4000-8000-000000000003", "Mismatch Sid Jsonl", str(repo_a), jsonl_sid_override="other-sid")
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Mismatch Sid Jsonl - Claude Code", home=home, wsl=False, env=env))
+            # Transcript missing explicit sessionId (filename stem alone MUST NOT pass!)
+            sid_nosid = "55550000-0000-4000-8000-000000000006"
+            _mk_code_session(official_acct, "no_sid_tp", sid_nosid, "No Explicit Sid Jsonl", str(repo_a), create_jsonl=False)
+            enc_a = encode_claude_project_dir(str(repo_a), wsl=False)[0]
+            nosid_path = home / ".claude" / "projects" / enc_a / f"{sid_nosid}.jsonl"
+            nosid_path.parent.mkdir(parents=True, exist_ok=True)
+            nosid_path.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n", encoding="utf-8")
+            self.assertIsNone(resolve_claude_desktop_session_by_title("No Explicit Sid Jsonl - Claude Code", home=home, wsl=False, env=env))
+            # Non-empty corrupt primary JSONL rejected
+            sid_corrupt = "55550000-0000-4000-8000-000000000007"
+            _mk_code_session(official_acct, "corrupt_tp", sid_corrupt, "Corrupt NonEmpty Jsonl", str(repo_a), create_jsonl=False)
+            corrupt_path = home / ".claude" / "projects" / enc_a / f"{sid_corrupt}.jsonl"
+            corrupt_path.write_text("{corrupt json\nnot valid\n", encoding="utf-8")
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Corrupt NonEmpty Jsonl - Claude Code", home=home, wsl=False, env=env))
+            # Symlink JSONL rejected
+            sid_sym_tp = "55550000-0000-4000-8000-000000000004"
+            _mk_code_session(official_acct, "sym_tp", sid_sym_tp, "Symlink Transcript", str(repo_a), create_jsonl=False)
+            ext_tp = tmp / "external_tp.jsonl"
+            self._write_claude_turn_jsonl(ext_tp, sid_sym_tp, [("user", "hi")], cwd=str(repo_a))
+            sym_tp_path = home / ".claude" / "projects" / enc_a / f"{sid_sym_tp}.jsonl"
+            os.symlink(ext_tp, sym_tp_path)
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Symlink Transcript - Claude Code", home=home, wsl=False, env=env))
+            # WSL /mnt/ rejected
+            _mk_code_session(official_acct, "wsl_mnt", "55550000-0000-4000-8000-000000000005", "Wsl Slow Mount", "/mnt/c/Users/dev/repo", create_jsonl=False)
+            self.assertIsNone(resolve_claude_desktop_session_by_title("Wsl Slow Mount - Claude Code", home=home, wsl=True, env=env))
+
+            # 8) Incremental stat-keyed metadata cache avoids re-reading unchanged files & refreshes on mtime/size change
+            read_calls = 0
+            orig_read_text = Path.read_text
+
+            def _counting_read_text(self_p: Path, *args: object, **kwargs: object) -> str:
+                nonlocal read_calls
+                if self_p.name.startswith("local_") and self_p.suffix == ".json":
+                    read_calls += 1
+                return orig_read_text(self_p, *args, **kwargs)  # type: ignore[arg-type]
+
+            with mock.patch.object(Path, "read_text", _counting_read_text):
+                # Already cached from calls above -> 0 disk reads
+                m_cached = resolve_claude_desktop_session_by_title("Official Pipeline Refactor - Claude Code", home=home, wsl=False, env=env)
+                assert m_cached is not None
+                self.assertEqual(read_calls, 0)
+                # Update one metadata file's title -> only that changed file is re-read
+                target_meta = official_acct / "local_off1.json"
+                meta_obj = json.loads(orig_read_text(target_meta, encoding="utf-8"))
+                meta_obj["title"] = "Official Pipeline Refactor Updated"
+                target_meta.write_text(json.dumps(meta_obj), encoding="utf-8")
+                m_updated = resolve_claude_desktop_session_by_title("Official Pipeline Refactor Updated - Claude Code", home=home, wsl=False, env=env)
+                assert m_updated is not None
+                self.assertEqual(m_updated.session_id, sid_off)
+                self.assertEqual(read_calls, 1)
+
+            # 9) R2 P1: transient OSError MUST NOT write negative cache, MUST fail closed during title scan, and recover on next call
+            sid_transient = "66661111-1111-4111-8111-111111111111"
+            _mk_code_session(official_acct, sid_transient, sid_transient, "Transient IO Session", str(repo_a))
+            transient_meta = official_acct / f"local_{sid_transient}.json"
+            fail_once = {"armed": True}
+            io_attempts = 0
+
+            def _flaky_read_text(self_p: Path, *args: object, **kwargs: object) -> str:
+                nonlocal io_attempts
+                if self_p.name == transient_meta.name:
+                    io_attempts += 1
+                    if fail_once["armed"]:
+                        fail_once["armed"] = False
+                        raise OSError("transient disk error")
+                return orig_read_text(self_p, *args, **kwargs)  # type: ignore[arg-type]
+
+            with mock.patch.object(Path, "read_text", _flaky_read_text):
+                # Title scan hits OSError on transient_meta -> MUST fail closed even for an unrelated cached session
+                self.assertIsNone(
+                    resolve_claude_desktop_session_by_title("Official Pipeline Refactor Updated - Claude Code", home=home, wsl=False, env=env)
+                )
+                # Next call without modifying transient_meta recovers cleanly (no negative cache entry!)
+                m_rec = resolve_claude_desktop_session_by_title("Transient IO Session - Claude Code", home=home, wsl=False, env=env)
+                assert m_rec is not None
+                self.assertEqual(m_rec.session_id, sid_transient)
+                self.assertEqual(io_attempts, 2)
+
+            # Direct URL lookup also recovers after transient OSError without negative cache
+            sid_transient_url = "66662222-2222-4222-8222-222222222222"
+            _mk_code_session(official_acct, sid_transient_url, sid_transient_url, "Transient URL Session", str(repo_a))
+            transient_url_meta = official_acct / f"local_{sid_transient_url}.json"
+            fail_url_once = {"armed": True}
+            url_io_attempts = 0
+
+            def _flaky_url_read(self_p: Path, *args: object, **kwargs: object) -> str:
+                nonlocal url_io_attempts
+                if self_p.name == transient_url_meta.name:
+                    url_io_attempts += 1
+                    if fail_url_once["armed"]:
+                        fail_url_once["armed"] = False
+                        raise OSError("transient EIO")
+                return orig_read_text(self_p, *args, **kwargs)  # type: ignore[arg-type]
+
+            with mock.patch.object(Path, "read_text", _flaky_url_read):
+                self.assertIsNone(
+                    resolve_claude_desktop_session_by_title(
+                        "Transient URL Session - Claude Code",
+                        page_url=f"app://localhost/epitaxy/local_{sid_transient_url}",
+                        home=home,
+                        wsl=False,
+                        env=env,
+                    )
+                )
+                m_rec_url = resolve_claude_desktop_session_by_title(
+                    "Transient URL Session - Claude Code",
+                    page_url=f"app://localhost/epitaxy/local_{sid_transient_url}",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+                assert m_rec_url is not None
+                self.assertEqual(m_rec_url.session_id, sid_transient_url)
+                self.assertEqual(url_io_attempts, 2)
+
+            # 9b) R3 #2: lstat & scandir PermissionError propagate had_io_error (fail closed), while FileNotFoundError skips cleanly
+            orig_lstat = os.lstat
+
+            def _perm_err_lstat(p: object, *a: object, **kw: object) -> os.stat_result:
+                if os.path.basename(os.fspath(p)) == transient_meta.name:  # type: ignore[arg-type]
+                    raise PermissionError("EACCES on sibling candidate")
+                return orig_lstat(p, *a, **kw)  # type: ignore[arg-type]
+
+            with mock.patch("agent_voice_input.workspace_ctx.os.lstat", side_effect=_perm_err_lstat):
+                # Title fallback MUST fail closed when a sibling candidate's lstat raises PermissionError
+                self.assertIsNone(
+                    resolve_claude_desktop_session_by_title(
+                        "Official Pipeline Refactor Updated - Claude Code", home=home, wsl=False, env=env
+                    )
+                )
+                # Direct URL lookup on that unreadable file also fails closed
+                self.assertIsNone(
+                    resolve_claude_desktop_session_by_title(
+                        "Transient IO Session - Claude Code",
+                        page_url=f"app://localhost/epitaxy/local_{sid_transient}",
+                        home=home,
+                        wsl=False,
+                        env=env,
+                    )
+                )
+
+            def _enoent_lstat(p: object, *a: object, **kw: object) -> os.stat_result:
+                if os.path.basename(os.fspath(p)) == transient_meta.name:  # type: ignore[arg-type]
+                    raise FileNotFoundError("vanished mid-scan")
+                return orig_lstat(p, *a, **kw)  # type: ignore[arg-type]
+
+            with mock.patch("agent_voice_input.workspace_ctx.os.lstat", side_effect=_enoent_lstat):
+                m_enoent_ok = resolve_claude_desktop_session_by_title(
+                    "Official Pipeline Refactor Updated - Claude Code", home=home, wsl=False, env=env
+                )
+                assert m_enoent_ok is not None
+                self.assertEqual(m_enoent_ok.session_id, sid_off)
+
+            orig_scandir = os.scandir
+
+            def _perm_err_scandir(p: object = "."):
+                if os.path.basename(os.fspath(p)) == "org2":  # type: ignore[arg-type]
+                    raise PermissionError("EACCES on Claude-3p org dir")
+                return orig_scandir(p)  # type: ignore[arg-type]
+
+            with mock.patch("agent_voice_input.workspace_ctx.os.scandir", side_effect=_perm_err_scandir):
+                self.assertIsNone(
+                    resolve_claude_desktop_session_by_title(
+                        "Official Pipeline Refactor Updated - Claude Code", home=home, wsl=False, env=env
+                    )
+                )
+                self.assertIsNone(
+                    resolve_claude_desktop_session_by_title(
+                        "Transient URL Session - Claude Code",
+                        page_url=f"app://localhost/epitaxy/local_{sid_transient_url}",
+                        home=home,
+                        wsl=False,
+                        env=env,
+                    )
+                )
+
+            # 10) R2 P1 + R3 #3: long progress prefix (>64 lines) binds cleanly; strict remaining-byte & 512 physical-line caps hold
+            sid_long_ok = "66663333-3333-4333-8333-333333333333"
+            _mk_code_session(official_acct, sid_long_ok, sid_long_ok, "Long Prefix Valid Session", str(repo_a), create_jsonl=False)
+            long_ok_tp = home / ".claude" / "projects" / enc_a / f"{sid_long_ok}.jsonl"
+            progress_prefix = [{"type": "progress", "sessionId": sid_long_ok, "step": i} for i in range(80)]
+            self._write_claude_turn_jsonl(
+                long_ok_tp,
+                sid_long_ok,
+                [("user", "Line 81 real dialogue turn"), ("assistant", "Confirmed.")],
+                cwd=str(repo_a),
+                extra_lines=progress_prefix,
+            )
+            m_long_ok = resolve_claude_desktop_session_by_title(
+                "Long Prefix Valid Session - Claude Code",
+                page_url=f"app://localhost/epitaxy/local_{sid_long_ok}",
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            assert m_long_ok is not None
+            self.assertEqual(m_long_ok.session_id, sid_long_ok)
+
+            sid_long_foreign = "66664444-4444-4444-8444-444444444444"
+            _mk_code_session(official_acct, sid_long_foreign, sid_long_foreign, "Long Prefix Foreign Sid", str(repo_a), create_jsonl=False)
+            long_bad_tp = home / ".claude" / "projects" / enc_a / f"{sid_long_foreign}.jsonl"
+            bad_prefix = [{"type": "progress", "sessionId": sid_long_foreign, "step": i} for i in range(74)]
+            bad_prefix.append({"type": "progress", "sessionId": "foreign-sid-line-75", "step": 74})
+            self._write_claude_turn_jsonl(
+                long_bad_tp,
+                sid_long_foreign,
+                [("user", "Line 76 turn"), ("assistant", "Ack.")],
+                cwd=str(repo_a),
+                extra_lines=bad_prefix,
+            )
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "Long Prefix Foreign Sid - Claude Code",
+                    page_url=f"app://localhost/epitaxy/local_{sid_long_foreign}",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+
+            # R3 #3a: 1 MiB oversized single line MUST stop at 512 KiB + 1 without draining the whole line
+            from agent_voice_input.workspace_ctx import _validate_claude_desktop_jsonl
+
+            sid_giant = "66665555-5555-4555-8555-555555555555"
+            giant_tp = tmp / "giant_single_line.jsonl"
+            giant_line = (
+                '{"type":"progress","sessionId":"'
+                + sid_giant
+                + '","blob":"'
+                + ("x" * (1024 * 1024))
+                + '"}\n'
+            )
+            valid_tail = json.dumps(
+                {"type": "user", "sessionId": sid_giant, "message": {"role": "user", "content": "after giant"}}
+            ) + "\n"
+            giant_tp.write_text(giant_line + valid_tail, encoding="utf-8")
+            bytes_consumed = 0
+            orig_builtin_open = open
+
+            class _CountingBinaryFile:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return self._inner.__exit__(*exc)
+
+                def readline(self, limit: int = -1) -> bytes:
+                    nonlocal bytes_consumed
+                    chunk = self._inner.readline(limit)
+                    bytes_consumed += len(chunk)
+                    return chunk
+
+            def _counting_open(path, mode="r", *args, **kwargs):
+                fh = orig_builtin_open(path, mode, *args, **kwargs)
+                if path == giant_tp and "b" in mode:
+                    return _CountingBinaryFile(fh)
+                return fh
+
+            with mock.patch("builtins.open", side_effect=_counting_open):
+                ok_giant, _ = _validate_claude_desktop_jsonl(giant_tp, sid_giant)
+            self.assertFalse(ok_giant)
+            self.assertLessEqual(bytes_consumed, 524288 + 1)
+            self.assertLess(bytes_consumed, 600_000)
+
+            # R3 #3b: 512 blank physical lines MUST count toward the 512-line cap (line 513 not penetrated)
+            sid_blanks = "66666666-6666-4666-8666-666666666666"
+            blanks_tp = tmp / "blank_lines_overflow.jsonl"
+            blanks_tp.write_text(
+                ("\n" * 512)
+                + json.dumps(
+                    {"type": "user", "sessionId": sid_blanks, "message": {"role": "user", "content": "line 513"}}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ok_blanks, _ = _validate_claude_desktop_jsonl(blanks_tp, sid_blanks)
+            self.assertFalse(ok_blanks)
+
+            # R4 #2: valid head dialogue followed by oversized progress line containing nested "isSidechain": true
+            # MUST stop cleanly on byte cap and still pass based on fully parsed JSON lines
+            sid_nested_sc = "66667777-7777-4777-8777-777777777777"
+            nested_sc_tp = tmp / "oversized_progress_nested_sidechain.jsonl"
+            head_turn = json.dumps(
+                {"type": "user", "sessionId": sid_nested_sc, "message": {"role": "user", "content": "Main session prompt"}}
+            ) + "\n"
+            oversized_prog = (
+                '{"type":"progress","sessionId":"'
+                + sid_nested_sc
+                + '","data":{"message":{"isSidechain": true}},"blob":"'
+                + ("y" * (600 * 1024))
+                + '"}\n'
+            )
+            nested_sc_tp.write_text(head_turn + oversized_prog, encoding="utf-8")
+            ok_nested_sc, resolved_nested_sc = _validate_claude_desktop_jsonl(nested_sc_tp, sid_nested_sc)
+            self.assertTrue(ok_nested_sc)
+            self.assertEqual(resolved_nested_sc, sid_nested_sc)
+
+    def test_cowork_resolution_audit_dedup_authoritative_cwd_and_prior_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            docs_dir = home / "Documents" / "launch-notes"
+            extra_dir = home / "Documents" / "budget-sheets"
+            docs_dir.mkdir(parents=True)
+            extra_dir.mkdir(parents=True)
+            (docs_dir / "LaunchChecklist.md").write_text("# Checklist\n", encoding="utf-8")
+            env = {"HOME": str(home)}
+
+            cowork_acct = (
+                home / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions" / "org1" / "acct1"
+            )
+            cowork_3p_acct = (
+                home / "Library" / "Application Support" / "Claude-3p" / "local-agent-mode-sessions" / "org2" / "acct2"
+            )
+            cowork_acct.mkdir(parents=True)
+            cowork_3p_acct.mkdir(parents=True)
+
+            def _mk_cowork(
+                acct: Path,
+                raw_sid: str,
+                cli_sid: str,
+                title: str,
+                *,
+                folders: list[str] | None = None,
+                folder_kinds: list[dict[str, str]] | None = None,
+                last_activity: int = 1795446000000,
+                primary_turns: list[tuple[str, str]] | None = None,
+                audit_lines: list[dict[str, object]] | None = None,
+                primary_extra_lines: list[dict[str, object]] | None = None,
+            ) -> Path:
+                sid8 = raw_sid[:8]
+                sdir = acct / sid8
+                (sdir / "outputs").mkdir(parents=True, exist_ok=True)
+                meta: dict[str, object] = {
+                    "sessionId": f"local_{raw_sid}",
+                    "cliSessionId": cli_sid,
+                    "title": title,
+                    "cwd": str(sdir / "outputs"),  # internal sandbox outputs dir — MUST NEVER become match.cwd
+                    "userSelectedFolders": folders if folders is not None else [],
+                    "isArchived": False,
+                    "lastActivityAt": last_activity,
+                    "createdAt": last_activity - 1000,
+                }
+                if folder_kinds is not None:
+                    meta["resolvedFolderKinds"] = folder_kinds
+                (acct / f"local_{raw_sid}.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+                if primary_turns is not None:
+                    p_tp = sdir / ".claude" / "projects" / "session" / f"{cli_sid}.jsonl"
+                    self._write_claude_turn_jsonl(
+                        p_tp,
+                        cli_sid,
+                        primary_turns,
+                        extra_lines=primary_extra_lines,
+                    )
+                if audit_lines is not None:
+                    (sdir / "audit.jsonl").write_text(
+                        "\n".join(json.dumps(x, ensure_ascii=False) for x in audit_lines) + "\n",
+                        encoding="utf-8",
+                    )
+                return sdir
+
+            # 1) 0 mounted folders -> cwd == "", never sandbox outputs; requires /cowork/local_<uuid> route!
+            sid_zero = "1000aaaa-1111-4111-8111-111111111111"
+            raw_zero = "a1111111-0000-4000-8000-000000000001"
+            _mk_cowork(
+                cowork_acct,
+                raw_zero,
+                sid_zero,
+                "No Folder Cowork",
+                folders=[],
+                primary_extra_lines=[{"type": "system", "cwd": "/private/var/empty", "sessionId": sid_zero}],
+                primary_turns=[("user", "Summarize Q3 roadmap"), ("assistant", "Here is the Q3 summary.")],
+            )
+            # Same title WITHOUT route URL or WITH cloud Chat route MUST fail closed (P0-1 regression)
+            self.assertIsNone(resolve_claude_desktop_session_by_title("No Folder Cowork - Claude", home=home, wsl=False, env=env))
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "No Folder Cowork - Claude",
+                    page_url="app://localhost/chat/9999aaaa",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "No Folder Cowork - Claude",
+                    page_url="app://localhost/new",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+            # With exact /cowork/local_<uuid> route -> resolves cleanly
+            m_zero = resolve_claude_desktop_session_by_title(
+                "No Folder Cowork - Claude",
+                page_url=f"app://localhost/cowork/local_{raw_zero}",
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            assert m_zero is not None
+            self.assertEqual(m_zero.matched_by, "claude_desktop_cowork")
+            self.assertEqual(m_zero.session_id, sid_zero)
+            self.assertEqual(m_zero.cwd, "")
+
+            # 2) Single local folder + non-local filtered out (display matching & reordered explicit paths & dict map & fail-safe)
+            sid_one = "2000bbbb-2222-4222-8222-222222222222"
+            raw_one = "b2222222-0000-4000-8000-000000000002"
+            _mk_cowork(
+                cowork_3p_acct,
+                raw_one,
+                sid_one,
+                "Single Folder Cowork",
+                folders=[str(docs_dir), "/cloud/shared-drive"],
+                folder_kinds=[{"display": "/cloud/shared-drive", "kind": "remote"}, {"display": "launch-notes", "kind": "local"}],
+                primary_extra_lines=[{"type": "system", "cwd": "/private/var/empty", "sessionId": sid_one}],
+                primary_turns=[("user", "Check LaunchChecklist"), ("assistant", "Verified LaunchChecklist.")],
+            )
+            m_one = resolve_claude_desktop_session_by_title(
+                "Single Folder Cowork - Claude",
+                page_url=f"app://localhost/cowork/local_{raw_one}",
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            assert m_one is not None
+            self.assertEqual(Path(m_one.cwd).resolve(), docs_dir.resolve())
+
+            # P1-3 regressions: reordered explicit-path list, dict mapping, same-length pure strings, and uninterpretable kinds
+            vf_reordered, _ = _extract_cowork_folders(
+                [str(docs_dir), str(extra_dir)],
+                [{"path": str(extra_dir), "kind": "remote"}, {"path": str(docs_dir), "kind": "local"}],
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            self.assertEqual([Path(p).resolve() for p in vf_reordered], [docs_dir.resolve()])
+            vf_dict, _ = _extract_cowork_folders(
+                [str(docs_dir), str(extra_dir)],
+                {str(docs_dir): "local", str(extra_dir): "remote"},
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            self.assertEqual([Path(p).resolve() for p in vf_dict], [docs_dir.resolve()])
+            vf_str_list, _ = _extract_cowork_folders(
+                [str(docs_dir), str(extra_dir)],
+                ["local", "remote"],
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            self.assertEqual([Path(p).resolve() for p in vf_str_list], [docs_dir.resolve()])
+            vf_unknown, unres_unknown = _extract_cowork_folders(
+                [str(docs_dir)],
+                {"unexpected_other_path": "local"},
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            self.assertEqual(vf_unknown, ())
+            self.assertTrue(len(unres_unknown) == 1)
+            # R2 P2: mixed explicit-path item (no display) + display-only item resolves local cwd cleanly
+            vf_mixed, unres_mixed = _extract_cowork_folders(
+                [str(docs_dir), "/cloud/shared-drive"],
+                [{"path": str(docs_dir), "kind": "local"}, {"display": "shared-drive", "kind": "remote"}],
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            self.assertEqual([Path(p).resolve() for p in vf_mixed], [docs_dir.resolve()])
+            self.assertEqual(unres_mixed, ())
+            # Conflicting explicit path kinds or item missing both path & display still fail safe
+            vf_conflict, _ = _extract_cowork_folders(
+                [str(docs_dir)],
+                [{"path": str(docs_dir), "kind": "local"}, {"path": str(docs_dir), "kind": "remote"}],
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            self.assertEqual(vf_conflict, ())
+            vf_nodisp, _ = _extract_cowork_folders(
+                [str(docs_dir), "/cloud/shared-drive"],
+                [{"path": str(docs_dir), "kind": "local"}, {"kind": "remote"}],
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            self.assertEqual(vf_nodisp, ())
+
+            # R2 P0: Cowork local_A.json whose internal sessionId is local_B (pointing to valid B dir) MUST fail closed!
+            cowork_a_raw = "e5555551-0000-4000-8000-000000000001"
+            cowork_b_raw = "e5555552-0000-4000-8000-000000000002"
+            cowork_b_cli = "5000eeee-5555-4555-8555-555555555555"
+            _mk_cowork(
+                cowork_acct,
+                cowork_b_raw,
+                cowork_b_cli,
+                "Target B Cowork",
+                folders=[],
+                primary_turns=[("user", "Secret B"), ("assistant", "Secret B reply")],
+            )
+            spoof_meta = json.loads((cowork_acct / f"local_{cowork_b_raw}.json").read_text(encoding="utf-8"))
+            (cowork_acct / f"local_{cowork_a_raw}.json").write_text(json.dumps(spoof_meta), encoding="utf-8")
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "Target B Cowork - Claude",
+                    page_url=f"app://localhost/cowork/local_{cowork_a_raw}",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+
+            # 3) Multiple local folders -> cwd == ""
+            sid_multi = "3000cccc-3333-4333-8333-333333333333"
+            raw_multi = "c3333333-0000-4000-8000-000000000003"
+            _mk_cowork(
+                cowork_acct,
+                raw_multi,
+                sid_multi,
+                "Multi Folder Cowork",
+                folders=[str(docs_dir), str(extra_dir)],
+                primary_turns=[("user", "Compare both folders"), ("assistant", "Compared.")],
+            )
+            m_multi = resolve_claude_desktop_session_by_title(
+                "Multi Folder Cowork - Claude",
+                page_url=f"app://localhost/cowork/local_{raw_multi}",
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            assert m_multi is not None
+            self.assertEqual(m_multi.cwd, "")
+
+            # 4) P0-2 regression: unmounted external drive folders preserve raw unresolved paths for conflict disambiguation
+            dup_cowork_raw = "d4444444-0000-4000-8000-000000000004"
+            shared_cowork_sid = "4000dddd-4444-4444-8444-444444444444"
+            _mk_cowork(
+                cowork_acct,
+                dup_cowork_raw,
+                shared_cowork_sid,
+                "Unmounted Drive Cowork",
+                folders=["/Volumes/ExtDriveA/project"],
+                primary_turns=[("user", "a"), ("assistant", "b")],
+            )
+            _mk_cowork(
+                cowork_3p_acct,
+                dup_cowork_raw,
+                shared_cowork_sid,
+                "Unmounted Drive Cowork",
+                folders=["/Volumes/ExtDriveB/project"],
+                primary_turns=[("user", "a"), ("assistant", "b")],
+            )
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "Unmounted Drive Cowork - Claude",
+                    page_url=f"app://localhost/cowork/local_{dup_cowork_raw}",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+
+            # 5) P1-4 regression: audit.jsonl keeps lone desktop_app+_audit_hmac turn, then deduplicates matching uuid across incremental reads!
+            sid_audit = "6000ffff-6666-4666-8666-666666666666"
+            raw_audit = "f6666666-0000-4000-8000-000000000006"
+            sdir_audit = _mk_cowork(
+                cowork_acct,
+                raw_audit,
+                sid_audit,
+                "Audit Fallback Cowork",
+                folders=[],
+                primary_turns=None,
+                audit_lines=[
+                    {"type": "system", "cwd": "/private/var/empty", "session_id": sid_audit},
+                    {
+                        "type": "user",
+                        "uuid": "u-1",
+                        "session_id": sid_audit,
+                        "client_platform": "desktop_app",
+                        "_audit_hmac": "deadbeef",
+                        "_audit_timestamp": "2026-11-24T01:00:00Z",
+                        "message": {"role": "user", "content": [{"type": "text", "text": "Prepare release notes for CoworkSync."}]},
+                    },
+                ],
+            )
+            m_audit = resolve_claude_desktop_session_by_title(
+                "Audit Fallback Cowork - Claude",
+                page_url=f"app://localhost/cowork/local_{raw_audit}",
+                home=home,
+                wsl=False,
+                env=env,
+            )
+            assert m_audit is not None
+            self.assertTrue(m_audit.jsonl_path.endswith("audit.jsonl"))
+            self.assertEqual(m_audit.session_id, sid_audit)
+
+            # Non-empty corrupt primary JSONL must fail closed instead of falling back to audit.jsonl (P1-2)
+            sid_bad_pri = "7000aaaa-7777-4777-8777-777777777777"
+            raw_bad_pri = "a7777777-0000-4000-8000-000000000007"
+            sdir_bad = _mk_cowork(
+                cowork_acct,
+                raw_bad_pri,
+                sid_bad_pri,
+                "Corrupt Primary No Audit Bypass",
+                folders=[],
+                primary_turns=None,
+                audit_lines=[
+                    {"type": "user", "session_id": sid_bad_pri, "message": {"role": "user", "content": "ok"}},
+                ],
+            )
+            bad_pri = sdir_bad / ".claude" / "projects" / "session" / f"{sid_bad_pri}.jsonl"
+            bad_pri.parent.mkdir(parents=True, exist_ok=True)
+            bad_pri.write_text("{broken json\nstill broken\n", encoding="utf-8")
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "Corrupt Primary No Audit Bypass - Claude",
+                    page_url=f"app://localhost/cowork/local_{raw_bad_pri}",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+
+            # P1-2: Audit with no SID or with conflicting second-line SID fails closed
+            raw_nosid_audit = "a8888881-0000-4000-8000-000000000008"
+            _mk_cowork(
+                cowork_acct,
+                raw_nosid_audit,
+                "",
+                "No Sid Audit",
+                folders=[],
+                primary_turns=None,
+                audit_lines=[{"type": "user", "message": {"role": "user", "content": "orphan"}}],
+            )
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "No Sid Audit - Claude",
+                    page_url=f"app://localhost/cowork/local_{raw_nosid_audit}",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+            raw_mixed_audit = "a8888888-0000-4000-8000-000000000008"
+            sid_mixed_audit = "8000aaaa-8888-4888-8888-888888888888"
+            _mk_cowork(
+                cowork_acct,
+                raw_mixed_audit,
+                sid_mixed_audit,
+                "Mixed Sid Audit",
+                folders=[],
+                primary_turns=None,
+                audit_lines=[
+                    {"type": "user", "session_id": sid_mixed_audit, "message": {"role": "user", "content": "good"}},
+                    {"type": "assistant", "session_id": "foreign-sid-999", "message": {"role": "assistant", "content": "leaked"}},
+                ],
+            )
+            self.assertIsNone(
+                resolve_claude_desktop_session_by_title(
+                    "Mixed Sid Audit - Claude",
+                    page_url=f"app://localhost/cowork/local_{raw_mixed_audit}",
+                    home=home,
+                    wsl=False,
+                    env=env,
+                )
+            )
+
+            # 6) Chat isolation: unmatched "- Claude" title returns None
+            self.assertIsNone(resolve_claude_desktop_session_by_title("日常问答 - Claude", home=home, wsl=False, env=env))
+
+            # 7) SessionTracker checks: lone desktop_app turn preserved, incremental duplicate dropped, foreign SID isolated,
+            #    authoritative_cwd preserved, and Cowork skipping CLI prior_session
+            rich_cli_sid = "9999aaaa-9999-4999-8999-999999999999"
+            enc_docs = encode_claude_project_dir(str(docs_dir), wsl=False)[0]
+            rich_cli_tp = home / ".claude" / "projects" / enc_docs / f"{rich_cli_sid}.jsonl"
+            self._write_claude_turn_jsonl(
+                rich_cli_tp,
+                rich_cli_sid,
+                [
+                    ("user", "Implement UltraSecretCliPriorToken " + ("padding " * 80)),
+                    ("assistant", "Updated UltraSecretCliPriorToken " + ("details " * 80)),
+                    ("user", "Verify UltraSecretCliPriorToken " + ("checks " * 80)),
+                    ("assistant", "All UltraSecretCliPriorToken checks pass " + ("green " * 80)),
+                ],
+                cwd=str(docs_dir),
+            )
+
+            tracker = SessionTracker(home_dir=home, runtime_dir=tmp / "rt", env=env, cold_start_fallback="auto")
+            try:
+                # First sync: lone desktop_app+_audit_hmac user turn MUST be retained (not dropped!)
+                snap_audit_1 = tracker.sync_ide_session(m_audit, cold_start_fallback="auto")
+                self.assertEqual(
+                    snap_audit_1.clean_turns,
+                    (("user", "Prepare release notes for CoworkSync."),),
+                )
+                # Append backend duplicate of same uuid + dual-identity (uuid+mid vs mid-only) + distinct assistant text under same mid + foreign SID
+                with open(sdir_audit / "audit.jsonl", "a", encoding="utf-8") as af:
+                    af.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "uuid": "u-1",
+                                "session_id": sid_audit,
+                                "client_platform": None,
+                                "_audit_hmac": "deadbeef",
+                                "message": {"role": "user", "content": [{"type": "text", "text": "Prepare release notes for CoworkSync."}]},
+                            }
+                        )
+                        + "\n"
+                    )
+                    af.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "uuid": "u-foreign",
+                                "session_id": "foreign-sid-other",
+                                "message": {"role": "user", "content": [{"type": "text", "text": "Foreign leaked prompt"}]},
+                            }
+                        )
+                        + "\n"
+                    )
+                    af.write(
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "uuid": "a-1",
+                                "session_id": sid_audit,
+                                "_audit_hmac": "cafebabe",
+                                "message": {"id": "msg-a-1", "role": "assistant", "content": [{"type": "text", "text": "Drafted release notes for CoworkSync."}]},
+                            }
+                        )
+                        + "\n"
+                    )
+                    # R2 P1 #4a: duplicate carrying only message.id (matching prior uuid+message.id turn) MUST be dropped
+                    af.write(
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "session_id": sid_audit,
+                                "message": {"id": "msg-a-1", "role": "assistant", "content": [{"type": "text", "text": "Drafted release notes for CoworkSync."}]},
+                            }
+                        )
+                        + "\n"
+                    )
+                    # R2 P1 #4b: reverse order (message.id-only first, then uuid+message.id duplicate) MUST keep once
+                    af.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "session_id": sid_audit,
+                                "message": {"id": "msg-u-2", "role": "user", "content": [{"type": "text", "text": "Check changelog."}]},
+                            }
+                        )
+                        + "\n"
+                    )
+                    af.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "uuid": "u-2",
+                                "session_id": sid_audit,
+                                "message": {"id": "msg-u-2", "role": "user", "content": [{"type": "text", "text": "Check changelog."}]},
+                            }
+                        )
+                        + "\n"
+                    )
+                    # R2 P1 #4c: two assistant records sharing message.id with DIFFERENT text MUST BOTH be preserved, exact repeat dropped
+                    af.write(
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "session_id": sid_audit,
+                                "message": {"id": "msg-multi-2", "role": "assistant", "content": [{"type": "text", "text": "Part 1: verified dates."}]},
+                            }
+                        )
+                        + "\n"
+                    )
+                    af.write(
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "session_id": sid_audit,
+                                "message": {"id": "msg-multi-2", "role": "assistant", "content": [{"type": "text", "text": "Part 2: verified links."}]},
+                            }
+                        )
+                        + "\n"
+                    )
+                    af.write(
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "session_id": sid_audit,
+                                "message": {"id": "msg-multi-2", "role": "assistant", "content": [{"type": "text", "text": "Part 2: verified links."}]},
+                            }
+                        )
+                        + "\n"
+                    )
+                snap_audit_2 = tracker.sync_ide_session(m_audit, cold_start_fallback="auto")
+                self.assertEqual(
+                    snap_audit_2.clean_turns,
+                    (
+                        ("user", "Prepare release notes for CoworkSync."),
+                        ("assistant", "Drafted release notes for CoworkSync."),
+                        ("user", "Check changelog."),
+                        ("assistant", "Part 1: verified dates."),
+                        ("assistant", "Part 2: verified links."),
+                    ),
+                )
+                self.assertEqual(snap_audit_2.match.cwd, "")
+
+                snap_zero = tracker.sync_ide_session(m_zero, cold_start_fallback="auto")
+                self.assertEqual(snap_zero.match.cwd, "")
+
+                snap_one = tracker.sync_ide_session(m_one, cold_start_fallback="auto")
+                self.assertEqual(Path(snap_one.match.cwd).resolve(), docs_dir.resolve())
+                self.assertFalse(snap_one.prior_hotwords_used)
+                self.assertIn("LaunchChecklist", snap_one.hotwords)
+                self.assertNotIn("UltraSecretCliPriorToken", snap_one.hotwords)
+                prior_chunk, dialog_chunks, _ = tracker.get_refiner_context_with_prior(
+                    snap_one.session_key, workspace_cwd=snap_one.match.cwd
+                )
+                self.assertEqual(prior_chunk, "")
+                self.assertTrue(any("LaunchChecklist" in c for c in dialog_chunks))
+            finally:
+                tracker.close()
+
+    def test_daemon_promotion_probe_route_and_same_window_verifier(self) -> None:
+        from agent_voice_input.daemon import _Stage1State, _make_desktop_same_window_verifier
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            home = tmp / "home"
+            rt = tmp / "rt"
+            repo = home / "repos" / "voice-engine"
+            repo.mkdir(parents=True)
+            git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            git_env.update({"GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@e.com", "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@e.com"})
+            subprocess.run(["git", "init", "-q"], cwd=str(repo), env=git_env, check=True)
+            (repo / "router_core.py").write_text("x = 1\n", encoding="utf-8")
+
+            env = {"HOME": str(home)}
+            sid_code_1 = "1234aaaa-1111-4111-8111-111111111111"
+            sid_code_2 = "5678bbbb-2222-4222-8222-222222222222"
+            sid_cowork = "9012cccc-3333-4333-8333-333333333333"
+
+            code_acct = home / "Library" / "Application Support" / "Claude-3p" / "claude-code-sessions" / "org1" / "acct1"
+            code_acct.mkdir(parents=True)
+            enc_repo = encode_claude_project_dir(str(repo), wsl=False)[0]
+            for sid, title in (
+                (sid_code_1, "Refactor Voice Router Engine"),
+                (sid_code_2, "Another Code Thread"),
+            ):
+                (code_acct / f"local_{sid}.json").write_text(
+                    json.dumps(
+                        {
+                            "sessionId": f"local_{sid}",
+                            "cliSessionId": sid,
+                            "title": title,
+                            "cwd": str(repo),
+                            "isArchived": False,
+                            "lastFocusedAt": 1795446700000,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                self._write_claude_turn_jsonl(
+                    home / ".claude" / "projects" / enc_repo / f"{sid}.jsonl",
+                    sid,
+                    [("user", f"Inspect {title} in router_core.py"), ("assistant", f"Reviewed {title}.")],
+                    cwd=str(repo),
+                )
+
+            cowork_acct = home / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions" / "org1" / "acct1"
+            cowork_acct.mkdir(parents=True)
+            (cowork_acct / "local_c9012345-0000-4000-8000-000000000000.json").write_text(
+                json.dumps(
+                    {
+                        "sessionId": "local_c9012345-0000-4000-8000-000000000000",
+                        "cliSessionId": sid_cowork,
+                        "title": "Design Doc Review",
+                        "cwd": str(cowork_acct / "c9012345" / "outputs"),
+                        "userSelectedFolders": [],
+                        "isArchived": False,
+                        "lastActivityAt": 1795446800000,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._write_claude_turn_jsonl(
+                cowork_acct / "c9012345" / ".claude" / "projects" / "session" / f"{sid_cowork}.jsonl",
+                sid_cowork,
+                [("user", "Polish section 2 of Design Doc"), ("assistant", "Updated section 2.")],
+            )
+
+            class _FakePlat:
+                def is_allowed_terminal(self, win: ForegroundWindow) -> bool:
+                    return is_terminal_window(win)
+
+                def get_foreground_window(self) -> ForegroundWindow:
+                    return ForegroundWindow()
+
+                def deliver_text(self, *args: object, **kwargs: object) -> PasteOutcome:
+                    return PasteOutcome(True, False, "pasted", "fake")
+
+                def hud(self, *args: object, **kwargs: object) -> None:
+                    pass
+
+                def beep(self, *args: object, **kwargs: object) -> None:
+                    pass
+
+            tracker = SessionTracker(home_dir=home, runtime_dir=rt, env=env)
+            cfg = Config()
+            daemon = VoiceInputDaemon(
+                cfg,
+                env=env,
+                runtime_dir=rt,
+                platform=_FakePlat(),
+                asr_provider=_DummyAsr("test"),
+                tracker=tracker,
+            )
+            try:
+                # 1) probe_route for Code promotion
+                r_code = daemon._execute_probe_route(
+                    {
+                        "bundle_id": "com.anthropic.claudefordesktop",
+                        "process": "Claude",
+                        "title": "Refactor Voice Router Engine - Claude Code",
+                        "hwnd": 701,
+                    }
+                )
+                self.assertTrue(r_code["ok"])
+                self.assertEqual(r_code["mode"], "agent")
+                self.assertEqual(r_code["matched_by"], "claude_desktop_code")
+                self.assertEqual(r_code["hotwords_scope"], "coding")
+                self.assertEqual(r_code["target_app_hint"], "")
+                self.assertEqual(r_code["workspace_name"], "voice-engine")
+                self.assertGreater(r_code["ctx_chars"], 0)
+
+                # 2) probe_route for Cowork promotion (requires exact /cowork/local_<uuid> page_url)
+                r_cowork = daemon._execute_probe_route(
+                    {
+                        "bundle_id": "com.anthropic.claudefordesktop",
+                        "process": "Claude",
+                        "title": "Design Doc Review - Claude",
+                        "page_url": "app://localhost/cowork/local_c9012345-0000-4000-8000-000000000000",
+                        "hwnd": 702,
+                    }
+                )
+                self.assertTrue(r_cowork["ok"])
+                self.assertEqual(r_cowork["mode"], "agent")
+                self.assertEqual(r_cowork["matched_by"], "claude_desktop_cowork")
+                self.assertEqual(r_cowork["target_app_hint"], "")
+                self.assertEqual(r_cowork["workspace_name"], "")
+                self.assertGreater(r_cowork["ctx_chars"], 0)
+
+                # Same-titled cloud Chat (or missing page_url) MUST stay general + ai_chat (opposite routing!)
+                for chat_url in ("app://localhost/chat/99990000", "app://localhost/new", ""):
+                    r_same_title_chat = daemon._execute_probe_route(
+                        {
+                            "bundle_id": "com.anthropic.claudefordesktop",
+                            "process": "Claude",
+                            "title": "Design Doc Review - Claude",
+                            "page_url": chat_url,
+                            "hwnd": 702,
+                        }
+                    )
+                    self.assertEqual(r_same_title_chat["mode"], "general")
+                    self.assertEqual(r_same_title_chat["target_app_hint"], "ai_chat")
+                    self.assertEqual(r_same_title_chat["hotwords_scope"], "chat")
+                    self.assertEqual(r_same_title_chat["ctx_chars"], 0)
+
+                # 3) probe_route for Chat fallback and explicit_mode="general"
+                r_chat = daemon._execute_probe_route(
+                    {
+                        "bundle_id": "com.anthropic.claudefordesktop",
+                        "process": "Claude",
+                        "title": "Casual Lunch Ideas - Claude",
+                        "page_url": "app://localhost/chat/11223344",
+                        "hwnd": 703,
+                    }
+                )
+                self.assertEqual(r_chat["mode"], "general")
+                self.assertEqual(r_chat["target_app_hint"], "ai_chat")
+                self.assertEqual(r_chat["hotwords_scope"], "chat")
+                self.assertEqual(r_chat["ctx_chars"], 0)
+
+                r_explicit_gen = daemon._execute_probe_route(
+                    {
+                        "mode": "general",
+                        "bundle_id": "com.anthropic.claudefordesktop",
+                        "process": "Claude",
+                        "title": "Refactor Voice Router Engine - Claude Code",
+                        "page_url": f"app://localhost/epitaxy/local_{sid_code_1}",
+                        "hwnd": 701,
+                    }
+                )
+                self.assertEqual(r_explicit_gen["mode"], "general")
+                self.assertEqual(r_explicit_gen["target_app_hint"], "ai_chat")
+                self.assertEqual(r_explicit_gen["ctx_chars"], 0)
+
+                # 4a) Pre-delivery same_window_verifier for URL-promoted Claude Desktop (route identity enforced!)
+                orig_url = f"app://localhost/epitaxy/local_{sid_code_1}"
+                orig = ForegroundWindow(
+                    hwnd=701,
+                    process="Claude",
+                    bundle_id="com.anthropic.claudefordesktop",
+                    title="Refactor Voice Router Engine - Claude Code",
+                    page_url=orig_url,
+                )
+                st_route = _Stage1State(
+                    t_total0=time.monotonic(),
+                    win=orig,
+                    claude_promoted_sid=sid_code_1,
+                    claude_promoted_route_id=f"code:local_{sid_code_1}",
+                )
+                v_route = _make_desktop_same_window_verifier(st_route, tracker=tracker, env=env)
+                assert v_route is not None
+                # Same route -> allowed
+                self.assertTrue(v_route(orig))
+                # Same title but switched to another session URL, /new, /chat, or missing URL -> BLOCKED!
+                for bad_url in (
+                    f"app://localhost/epitaxy/local_{sid_code_2}",
+                    "app://localhost/new",
+                    "app://localhost/chat/12345",
+                    "",
+                ):
+                    self.assertFalse(
+                        v_route(
+                            ForegroundWindow(
+                                hwnd=701,
+                                process="Claude",
+                                bundle_id="com.anthropic.claudefordesktop",
+                                title="Refactor Voice Router Engine - Claude Code",
+                                page_url=bad_url,
+                            )
+                        ),
+                        f"expected blocked for bad_url={bad_url!r}",
+                    )
+
+                # 4b) Pre-delivery same_window_verifier for title-fallback Code promotion (NEVER skips re-resolution on same title!)
+                orig_no_url = ForegroundWindow(
+                    hwnd=701,
+                    process="Claude",
+                    bundle_id="com.anthropic.claudefordesktop",
+                    title="Refactor Voice Router Engine - Claude Code",
+                )
+                st_fb = _Stage1State(t_total0=time.monotonic(), win=orig_no_url, claude_promoted_sid=sid_code_1)
+                v_fb = _make_desktop_same_window_verifier(st_fb, tracker=tracker, env=env)
+                assert v_fb is not None
+                self.assertTrue(v_fb(orig_no_url))
+                self.assertTrue(
+                    v_fb(
+                        ForegroundWindow(
+                            hwnd=701,
+                            process="Claude",
+                            bundle_id="com.anthropic.claudefordesktop",
+                            title="Refactor Voice Router... - Claude Code",
+                        )
+                    )
+                )
+                # Switched to another Code thread or Chat -> blocked
+                self.assertFalse(
+                    v_fb(
+                        ForegroundWindow(
+                            hwnd=701,
+                            process="Claude",
+                            bundle_id="com.anthropic.claudefordesktop",
+                            title="Another Code Thread - Claude Code",
+                        )
+                    )
+                )
+                self.assertFalse(
+                    v_fb(
+                        ForegroundWindow(
+                            hwnd=701,
+                            process="Claude",
+                            bundle_id="com.anthropic.claudefordesktop",
+                            title="Casual Lunch Ideas - Claude",
+                        )
+                    )
+                )
+                # P0-2 regression: a second active session with the SAME title appears mid-dictation ->
+                # even though cur_title == orig_title, verifier MUST re-run resolver and fail closed!
+                sid_dup_live = "7777dddd-4444-4444-8444-444444444444"
+                (code_acct / f"local_{sid_dup_live}.json").write_text(
+                    json.dumps(
+                        {
+                            "sessionId": f"local_{sid_dup_live}",
+                            "cliSessionId": sid_dup_live,
+                            "title": "Refactor Voice Router Engine",
+                            "cwd": str(repo),
+                            "isArchived": False,
+                            "lastFocusedAt": 1795446999000,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                self._write_claude_turn_jsonl(
+                    home / ".claude" / "projects" / enc_repo / f"{sid_dup_live}.jsonl",
+                    sid_dup_live,
+                    [("user", "New conflicting session"), ("assistant", "Ack.")],
+                    cwd=str(repo),
+                )
+                self.assertFalse(v_fb(orig_no_url))
+
+                # 5) Page URL parser strict origin + 36-char UUID edge cases & MacOSPlatform page_url passthrough
+                valid_u = "a1b2c3d4-1111-4222-8333-444455556666"
+                self.assertEqual(_parse_claude_desktop_page_url(""), ("", ""))
+                self.assertEqual(_parse_claude_desktop_page_url(f"app://localhost/cowork/local_{valid_u}"), ("cowork", f"local_{valid_u}"))
+                self.assertEqual(_parse_claude_desktop_page_url(f"app://localhost/cowork/local_{valid_u}/"), ("cowork", f"local_{valid_u}"))
+                self.assertEqual(_parse_claude_desktop_page_url(f"app://localhost/epitaxy/local_{valid_u}"), ("code", f"local_{valid_u}"))
+                self.assertEqual(_parse_claude_desktop_page_url(f"app://localhost/code/local_{valid_u}"), ("code", f"local_{valid_u}"))
+                self.assertEqual(_parse_claude_desktop_page_url(f"https://claude.ai/cowork/local_{valid_u}"), ("cowork", f"local_{valid_u}"))
+                self.assertEqual(_parse_claude_desktop_page_url(f"https://claude.ai/code/local_{valid_u}"), ("code", f"local_{valid_u}"))
+                for bad_route in (
+                    "about:rejected",
+                    "app://localhost/new",
+                    "https://claude.ai/chat/123",
+                    "app://localhost/cowork/local_a1b2-c3d4",
+                    f"app://evil.local/cowork/local_{valid_u}",
+                    f"app://localhost:8080/cowork/local_{valid_u}",
+                    f"app://user@localhost/cowork/local_{valid_u}",
+                    f"https://evil.example/cowork/local_{valid_u}",
+                    f"https://claude.ai:443/cowork/local_{valid_u}",
+                    f"http://localhost/cowork/local_{valid_u}",
+                    f"app://localhost/cowork/local_{valid_u}/extra",
+                    f"app://localhost/prefix/cowork/local_{valid_u}",
+                    f"app://localhost/cowork/local_{valid_u}//",
+                    "app://localhost/cowork/local_a1\nb2",
+                ):
+                    self.assertEqual(_parse_claude_desktop_page_url(bad_route), ("non_session", ""), f"expected non_session for {bad_route!r}")
+
+                plat = MacOSPlatform(Config(), env=env)
+                try:
+                    hint_win = ForegroundWindow(
+                        hwnd=702,
+                        process="Claude",
+                        bundle_id="com.anthropic.claudefordesktop",
+                        title="Design Doc Review - Claude",
+                        ax_trusted=True,
+                        page_url="app://localhost/cowork/local_c9012345-0000-4000-8000-000000000000",
+                    )
+                    res_hint = plat.get_foreground_window(hint=hint_win)
+                    self.assertEqual(res_hint.page_url, hint_win.page_url)
+                    with mock.patch.object(plat, "_has_managed_shim", return_value=True), mock.patch.object(
+                        plat,
+                        "_shim_rpc",
+                        return_value={
+                            "ok": True,
+                            "hwnd": 702,
+                            "process": "Claude",
+                            "bundle_id": "com.anthropic.claudefordesktop",
+                            "pid": 1234,
+                            "title": "Design Doc Review - Claude",
+                            "document": "",
+                            "page_url": "app://localhost/cowork/local_c9012345-0000-4000-8000-000000000000",
+                            "ax_trusted": True,
+                        },
+                    ):
+                        res_rpc = plat.get_foreground_window()
+                    self.assertEqual(res_rpc.page_url, "app://localhost/cowork/local_c9012345-0000-4000-8000-000000000000")
+                finally:
+                    plat.close()
+            finally:
+                tracker.close()
 
 
 if __name__ == "__main__":

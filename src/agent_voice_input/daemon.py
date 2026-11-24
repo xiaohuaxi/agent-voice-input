@@ -13,6 +13,7 @@ from .app_scope import (
     classify_target_app_hint,
     classify_window_category,
     is_antigravity_ide_window,
+    is_claude_desktop_window,
     is_codex_desktop_window,
     is_remote_client_window,
     is_remote_ide_window,
@@ -89,9 +90,11 @@ from .workspace_ctx import (
     _AGY_DESKTOP_REJECT_TITLES,
     _dedupe_hotwords_ci,
     _effective_is_wsl,
+    _parse_claude_desktop_page_url,
     _resolve_safe_local_dir,
     resolve_antigravity_ide_session,
     resolve_antigravity_ide_session_by_title,
+    resolve_claude_desktop_session_by_title,
     resolve_codex_desktop_session_by_title,
     resolve_ide_workspace_cwd,
 )
@@ -589,6 +592,7 @@ _WINDOW_REQ_KEYS: tuple[str, ...] = (
     "tmux_socket",
     "tmux_pane",
     "document",
+    "page_url",
 )
 
 
@@ -618,6 +622,7 @@ def _window_from_mapping(m: Mapping[str, Any]) -> ForegroundWindow:
         tmux_socket=str(m.get("tmux_socket") or ""),
         tmux_pane=str(m.get("tmux_pane") or ""),
         document=str(m.get("document") or ""),
+        page_url=str(m.get("page_url") or ""),
     )
 
 
@@ -649,6 +654,8 @@ _KNOWN_MATCHED_BY: frozenset[str] = frozenset(
         "ide_brain",
         "ide_db_title",
         "codex_desktop_db",
+        "claude_desktop_code",
+        "claude_desktop_cowork",
         "explicit",
         "remote",
         "remote_ssh",
@@ -1163,6 +1170,8 @@ class _Stage1State:
     skipped_reason: str = ""
     ctx_fallback: str = ""
     codex_promoted_sid: str = ""
+    claude_promoted_sid: str = ""
+    claude_promoted_route_id: str = ""
     agy_bound_sid: str = ""
 
 
@@ -1172,14 +1181,23 @@ def _make_desktop_same_window_verifier(
     tracker: SessionTracker,
     env: Mapping[str, str],
 ) -> Callable[[ForegroundWindow], bool] | None:
-    """Return a same-window conversation verifier for Codex desktop or AGY 2.0 deliveries."""
+    """Return a same-window conversation verifier for Codex desktop, Claude Desktop, or AGY 2.0 deliveries."""
     orig_win = st.win
     codex_sid = st.codex_promoted_sid
+    claude_sid = st.claude_promoted_sid
+    claude_route_id = st.claude_promoted_route_id
     agy_sid = st.agy_bound_sid
-    if (not codex_sid and not agy_sid) or orig_win.origin_drifted:
+    if (not codex_sid and not claude_sid and not agy_sid) or orig_win.origin_drifted:
         return None
-    is_codex = bool(codex_sid)
-    bound_sid = codex_sid if is_codex else agy_sid
+    if codex_sid:
+        kind = "codex"
+        bound_sid = codex_sid
+    elif claude_sid:
+        kind = "claude"
+        bound_sid = claude_sid
+    else:
+        kind = "agy"
+        bound_sid = agy_sid
     orig_title = (orig_win.title or "").strip()
     orig_bundle = (orig_win.bundle_id or "").strip().lower()
 
@@ -1204,20 +1222,37 @@ def _make_desktop_same_window_verifier(
             and orig_bundle
             and (cur_win.bundle_id or "").strip().lower() == orig_bundle
         )
-        is_target_app = (
-            is_codex_desktop_window(cur_win) if is_codex else is_antigravity_ide_window(cur_win)
-        )
+        if kind == "codex":
+            is_target_app = is_codex_desktop_window(cur_win)
+        elif kind == "claude":
+            is_target_app = is_claude_desktop_window(cur_win)
+        else:
+            is_target_app = is_antigravity_ide_window(cur_win)
         if not same_window or not (is_target_app or same_desktop_proc or same_desktop_bundle):
             return True
         cur_title = (cur_win.title or "").strip()
+        if kind == "claude":
+            cur_page_url = (getattr(cur_win, "page_url", "") or "").strip()
+            if claude_route_id:
+                cur_rk, cur_rsid = _parse_claude_desktop_page_url(cur_page_url)
+                if cur_rk not in ("code", "cowork") or not cur_rsid:
+                    return False
+                if f"{cur_rk}:{cur_rsid.lower()}" != claude_route_id:
+                    return False
+            try:
+                re_match = resolve_claude_desktop_session_by_title(
+                    cur_title, page_url=cur_page_url, home=tracker.home, env=env
+                )
+            except Exception:
+                return False
+            return bool(re_match is not None and re_match.session_id == bound_sid)
         if cur_title == orig_title:
             return True
         try:
-            re_match = (
-                resolve_codex_desktop_session_by_title(cur_title, home=tracker.home, env=env)
-                if is_codex
-                else resolve_antigravity_ide_session_by_title(cur_title, home=tracker.home, env=env)
-            )
+            if kind == "codex":
+                re_match = resolve_codex_desktop_session_by_title(cur_title, home=tracker.home, env=env)
+            else:
+                re_match = resolve_antigravity_ide_session_by_title(cur_title, home=tracker.home, env=env)
         except Exception:
             return False
         return bool(re_match is not None and re_match.session_id == bound_sid)
@@ -1473,14 +1508,19 @@ def _resolve_stage1_context(
                     st.ctx_fallback = "prior_hotwords"
     elif eff_mode == "general" and (win.process or win.bundle_id):
         codex_match = None
-        if (
-            not origin_drifted
-            and (explicit_mode or "auto").strip().lower() != "general"
-            and is_codex_desktop_window(win)
-        ):
-            codex_match = resolve_codex_desktop_session_by_title(
-                win.title, home=tracker.home, env=env
-            )
+        claude_match = None
+        if not origin_drifted and (explicit_mode or "auto").strip().lower() != "general":
+            if is_codex_desktop_window(win):
+                codex_match = resolve_codex_desktop_session_by_title(
+                    win.title, home=tracker.home, env=env
+                )
+            elif is_claude_desktop_window(win):
+                claude_match = resolve_claude_desktop_session_by_title(
+                    win.title,
+                    page_url=getattr(win, "page_url", ""),
+                    home=tracker.home,
+                    env=env,
+                )
         if codex_match is not None:
             eff_mode = "agent"
             st.eff_mode = "agent"
@@ -1489,6 +1529,17 @@ def _resolve_stage1_context(
             st.codex_promoted_sid = codex_match.session_id
             st.snap = tracker.sync_ide_session(
                 codex_match, cold_start_fallback=cfg.refiner.cold_start_fallback
+            )
+        elif claude_match is not None:
+            eff_mode = "agent"
+            st.eff_mode = "agent"
+            st.target_hint = ""
+            st.workspace_cwd = claude_match.cwd
+            st.claude_promoted_sid = claude_match.session_id
+            rk, rsid = _parse_claude_desktop_page_url(getattr(win, "page_url", ""))
+            st.claude_promoted_route_id = f"{rk}:{rsid.lower()}" if (rk in ("code", "cowork") and rsid) else ""
+            st.snap = tracker.sync_ide_session(
+                claude_match, cold_start_fallback=cfg.refiner.cold_start_fallback
             )
         else:
             st.target_hint = classify_target_app_hint(win)

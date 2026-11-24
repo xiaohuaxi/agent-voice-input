@@ -362,7 +362,7 @@ _JETBRAINS_SUFFIXES: tuple[str, ...] = (
 
 
 _DESKTOP_AI_COLLIDING_PROCS: dict[str, tuple[str, ...]] = {
-    "claude": ("claude",),
+    "claude": ("claude code", "claude"),
     "codex": ("codex", "chatgpt"),
 }
 _DESKTOP_TITLE_DASHES: tuple[str, ...] = ("-", "\u2013", "\u2014")
@@ -503,6 +503,18 @@ def is_codex_desktop_window(win: WindowLike) -> bool:
         return True
     if proc == "codex":
         return _is_desktop_ai_app_title(win.title, _DESKTOP_AI_COLLIDING_PROCS["codex"])
+    return False
+
+
+def is_claude_desktop_window(win: WindowLike) -> bool:
+    """Return True for Claude Desktop windows (excluding terminal CLI windows)."""
+    if is_terminal_window(win):
+        return False
+    bid = (win.bundle_id or "").strip().lower()
+    if bid:
+        return bid == "com.anthropic.claudefordesktop"
+    if normalize_app_token(win.process) == "claude":
+        return _is_desktop_ai_app_title(win.title, _DESKTOP_AI_COLLIDING_PROCS["claude"])
     return False
 
 

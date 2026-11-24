@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Claude Desktop (Code + Cowork) local session binding & macOS nested `AXWebArea` route/title capture**: Added bounded read-only nested `AXWebArea` BFS probing (`maxDepth=12`, per-call remaining `80ms` timeout, skipped on stop/cancel hotkey events) in `mac_shim.swift` for `com.anthropic.claudefordesktop` to extract sanitized `AXTitle` and route `AXURL` (`app://localhost/cowork/local_<uuid>` / `app://localhost/epitaxy/local_<uuid>`), paired with direct route lookup plus stat-cached Code-title fallback across `~/Library/Application Support/Claude` and `Claude-3p`, strict transcript SID verification, Cowork `userSelectedFolders`/`resolvedFolderKinds` local-folder parsing (shielding internal sandbox `outputs` `cwd` and skipping cross-CLI prior blocks), per-message UUID deduplication scoped to Cowork `audit.jsonl` ingestion, and pre-delivery same-window route/SID re-verification while failing closed to `general` + `ai_chat` on cloud Chat, blank pages, or ambiguous routes.
+
 ## [0.14.0] - 2026-11-24
 
 ### Added

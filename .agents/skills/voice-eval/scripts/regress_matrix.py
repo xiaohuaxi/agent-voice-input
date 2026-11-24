@@ -794,6 +794,111 @@ def run_layer_a_matrix(
             ],
         )
 
+        # ---- Claude Desktop Code & Cowork fixtures (Claude + Claude-3p dual roots) ----
+        claude_desk_code_sid = "1111aaaa-2222-4333-8444-555566667777"
+        claude_desk_cowork_sid = "2222bbbb-3333-4444-8555-666677778888"
+        claude_desk_cowork_local_id = "local_abcdef12-3456-4789-8abc-def012345678"
+        claude_desk_code_tp = (
+            iso_home
+            / ".claude"
+            / "projects"
+            / encode_claude_project_dir(str(repo_alpha), wsl=False)[0]
+            / f"{claude_desk_code_sid}.jsonl"
+        )
+        _write_claude_jsonl(
+            claude_desk_code_tp,
+            claude_desk_code_sid,
+            str(repo_alpha),
+            [
+                ("user", "Inspect DesktopContextRouter and ClaudeCodeSessionBinder."),
+                ("assistant", "Checked DesktopContextRouter and verified ClaudeCodeSessionBinder invariants."),
+            ],
+        )
+        claude_3p_code_meta = (
+            iso_home
+            / "Library"
+            / "Application Support"
+            / "Claude-3p"
+            / "claude-code-sessions"
+            / "org-demo"
+            / "acct-demo"
+            / "local_1111aaaa-2222-4333-8444-555566667777.json"
+        )
+        claude_3p_code_meta.parent.mkdir(parents=True, exist_ok=True)
+        claude_3p_code_meta.write_text(
+            json.dumps(
+                {
+                    "sessionId": "local_1111aaaa-2222-4333-8444-555566667777",
+                    "cliSessionId": claude_desk_code_sid,
+                    "title": "Harden Desktop Router",
+                    "cwd": str(repo_alpha),
+                    "isArchived": False,
+                    "lastFocusedAt": 1795446700000,
+                    "lastActivityAt": 1795446700000,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        claude_cowork_acct = (
+            iso_home
+            / "Library"
+            / "Application Support"
+            / "Claude"
+            / "local-agent-mode-sessions"
+            / "org-demo"
+            / "acct-demo"
+        )
+        claude_cowork_acct.mkdir(parents=True, exist_ok=True)
+        (claude_cowork_acct / f"{claude_desk_cowork_local_id}.json").write_text(
+            json.dumps(
+                {
+                    "sessionId": claude_desk_cowork_local_id,
+                    "cliSessionId": claude_desk_cowork_sid,
+                    "title": "Quarterly Launch Brief",
+                    "cwd": str(claude_cowork_acct / "abcdef12" / "outputs"),
+                    "userSelectedFolders": [],
+                    "isArchived": False,
+                    "lastActivityAt": 1795446800000,
+                }
+            ),
+            encoding="utf-8",
+        )
+        claude_cowork_tp = (
+            claude_cowork_acct
+            / "abcdef12"
+            / ".claude"
+            / "projects"
+            / "session"
+            / f"{claude_desk_cowork_sid}.jsonl"
+        )
+        claude_cowork_tp.parent.mkdir(parents=True, exist_ok=True)
+        claude_cowork_tp.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "system", "cwd": "/private/var/empty", "sessionId": claude_desk_cowork_sid}),
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "isSidechain": False,
+                            "sessionId": claude_desk_cowork_sid,
+                            "message": {"role": "user", "content": [{"type": "text", "text": "Draft Q4 LaunchChecklist milestones."}]},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "isSidechain": False,
+                            "sessionId": claude_desk_cowork_sid,
+                            "message": {"role": "assistant", "content": [{"type": "text", "text": "Outlined Q4 LaunchChecklist owners."}]},
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
         # ---- Run real `bin/agent-voice-input session-hook` for Claude & AGY ----
         def _run_claude_hook(sid: str, tp: Path, cwd: Path) -> tuple[int, str]:
             proc = subprocess.run(
@@ -1220,6 +1325,86 @@ def run_layer_a_matrix(
                             ("hotwords_scope==chat", r_cc.get("hotwords_scope") == "chat"),
                             ("key==''", r_cc.get("session_key_masked") == ""),
                             ("ctx_chars==0", int(r_cc.get("ctx_chars") or 0) == 0),
+                        ],
+                    )
+                )
+
+            # 2b) Claude Desktop (Code + Cowork exact route promo vs same-title Chat / no-route fail-closed)
+            r_cl_code = _probe(
+                {
+                    "bundle_id": "com.anthropic.claudefordesktop",
+                    "process": "Claude",
+                    "title": "Harden Desktop Router - Claude Code",
+                    "page_url": "app://localhost/epitaxy/local_1111aaaa-2222-4333-8444-555566667777",
+                }
+            )
+            checks.append(
+                _check_asserts(
+                    "A2_claude_desktop_code_promo_mac",
+                    "A",
+                    r_cl_code,
+                    [
+                        ("ok", r_cl_code.get("ok") is True),
+                        ("mode==agent", r_cl_code.get("mode") == "agent"),
+                        ("hotwords_scope==coding", r_cl_code.get("hotwords_scope") == "coding"),
+                        ("matched==claude_desktop_code", r_cl_code.get("matched_by") == "claude_desktop_code"),
+                        ("key==claude_code", r_cl_code.get("session_key_masked") == f"claude:{claude_desk_code_sid[:8]}"),
+                        ("ws==alpha-service", r_cl_code.get("workspace_name") == "alpha-service"),
+                        ("ctx_chars>0", int(r_cl_code.get("ctx_chars") or 0) > 0),
+                    ],
+                )
+            )
+
+            r_cl_cowork = _probe(
+                {
+                    "bundle_id": "com.anthropic.claudefordesktop",
+                    "process": "Claude",
+                    "title": "Quarterly Launch Brief - Claude",
+                    "page_url": f"app://localhost/cowork/{claude_desk_cowork_local_id}",
+                }
+            )
+            checks.append(
+                _check_asserts(
+                    "A2_claude_desktop_cowork_promo_mac",
+                    "A",
+                    r_cl_cowork,
+                    [
+                        ("ok", r_cl_cowork.get("ok") is True),
+                        ("mode==agent", r_cl_cowork.get("mode") == "agent"),
+                        ("matched==claude_desktop_cowork", r_cl_cowork.get("matched_by") == "claude_desktop_cowork"),
+                        ("key==claude_cowork", r_cl_cowork.get("session_key_masked") == f"claude:{claude_desk_cowork_sid[:8]}"),
+                        ("ws==''", r_cl_cowork.get("workspace_name") == ""),
+                        ("ctx_fallback==''", r_cl_cowork.get("ctx_fallback") == ""),
+                        ("ctx_chars>0", int(r_cl_cowork.get("ctx_chars") or 0) > 0),
+                    ],
+                )
+            )
+
+            # Same title as Cowork ("Quarterly Launch Brief - Claude") on cloud Chat / blank route / no URL MUST stay general+ai_chat
+            for tag, chat_page_url in (
+                ("A2_claude_desktop_same_title_chat_route_veto", "app://localhost/chat/99998888"),
+                ("A2_claude_desktop_same_title_no_route_veto", ""),
+            ):
+                r_cl_chat_same = _probe(
+                    {
+                        "bundle_id": "com.anthropic.claudefordesktop",
+                        "process": "Claude",
+                        "title": "Quarterly Launch Brief - Claude",
+                        "page_url": chat_page_url,
+                    }
+                )
+                checks.append(
+                    _check_asserts(
+                        tag,
+                        "A",
+                        r_cl_chat_same,
+                        [
+                            ("ok", r_cl_chat_same.get("ok") is True),
+                            ("mode==general", r_cl_chat_same.get("mode") == "general"),
+                            ("target_app_hint==ai_chat", r_cl_chat_same.get("target_app_hint") == "ai_chat"),
+                            ("hotwords_scope==chat", r_cl_chat_same.get("hotwords_scope") == "chat"),
+                            ("key==''", r_cl_chat_same.get("session_key_masked") == ""),
+                            ("ctx_chars==0", int(r_cl_chat_same.get("ctx_chars") or 0) == 0),
                         ],
                     )
                 )

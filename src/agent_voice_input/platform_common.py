@@ -40,6 +40,7 @@ class ForegroundWindow:
     tmux_socket: str = ""
     tmux_pane: str = ""
     document: str = ""
+    page_url: str = ""
     origin_drifted: bool = False
 
     @property

@@ -256,6 +256,7 @@ class SessionState:
     codex_item_turns: list[tuple[str, str]] = field(default_factory=list)
     codex_resp_turns: list[tuple[str, str]] = field(default_factory=list)
     claude_just_compacted: bool = False
+    claude_seen_audit_ids: set[str] = field(default_factory=set)
     is_remote: bool = False
     host_name: str = ""
     remote_etag: str = ""
@@ -274,6 +275,14 @@ class SessionState:
     cold_start_prior_hotwords: tuple[str, ...] = ()
     cold_start_prior_cwd: str = ""
     cold_start_prior_retired: bool = False
+
+
+_AUTHORITATIVE_DESKTOP_MATCHED_BY: tuple[str, ...] = (
+    "ide_db_title",
+    "codex_desktop_db",
+    "claude_desktop_code",
+    "claude_desktop_cowork",
+)
 
 
 @dataclass(frozen=True)
@@ -4576,13 +4585,14 @@ class SessionTracker:
         state.codex_item_turns.clear()
         state.codex_resp_turns.clear()
         state.claude_just_compacted = False
+        state.claude_seen_audit_ids.clear()
         state.generation += 1
 
     def _consume_parsed_record(self, state: SessionState, obj: Mapping[str, Any]) -> None:
         eff_wsl = False if state.is_remote else _effective_is_wsl(env=self.env)
         if (
             not state.cwd
-            and state.matched_by not in ("ide_db_title", "codex_desktop_db")
+            and state.matched_by not in _AUTHORITATIVE_DESKTOP_MATCHED_BY
             and isinstance(obj.get("cwd"), str)
             and obj["cwd"].strip()
         ):
@@ -4604,12 +4614,23 @@ class SessionTracker:
                 state.clean_turns.append(turn)
 
         elif state.cli == "claude":
+            if (
+                state.matched_by in ("claude_desktop_code", "claude_desktop_cowork")
+                and state.session_id
+            ):
+                want_sid = state.session_id.strip().lower()
+                for sid_key in ("sessionId", "session_id"):
+                    raw_rec_sid = obj.get(sid_key)
+                    if isinstance(raw_rec_sid, str) and raw_rec_sid.strip():
+                        if raw_rec_sid.strip().lower() != want_sid:
+                            return
             if not _is_claude_sidechain_or_subagent(obj):
                 if obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
                     state.clean_turns.clear()
                     state.luna_synced_idx = 0
                     state.generation += 1
                     state.claude_just_compacted = True
+                    state.claude_seen_audit_ids.clear()
                     state.cold_start_prior_retired = True
                     state.cold_start_prior_checked = True
                     return
@@ -4619,6 +4640,7 @@ class SessionTracker:
                     if not state.claude_just_compacted:
                         state.generation += 1
                     state.claude_just_compacted = False
+                    state.claude_seen_audit_ids.clear()
                     state.cold_start_prior_retired = True
                     state.cold_start_prior_checked = True
                     summary_txt = _extract_claude_message_text(obj.get("message"), role="user")
@@ -4627,6 +4649,26 @@ class SessionTracker:
                     return
             turn = _clean_claude_record(obj)
             if turn is not None:
+                if (
+                    state.matched_by == "claude_desktop_cowork"
+                    and os.path.basename(state.jsonl_path) == "audit.jsonl"
+                ):
+                    dedup_keys: list[str] = []
+                    raw_uuid = obj.get("uuid")
+                    if isinstance(raw_uuid, str) and raw_uuid.strip():
+                        dedup_keys.append(f"uuid:{turn[0]}:{raw_uuid.strip()}")
+                    msg_obj = obj.get("message")
+                    raw_mid = msg_obj.get("id") if isinstance(msg_obj, Mapping) else None
+                    if isinstance(raw_mid, str) and raw_mid.strip():
+                        text_sig = hashlib.blake2b(
+                            turn[1].encode("utf-8", errors="replace"), digest_size=16
+                        ).hexdigest()
+                        dedup_keys.append(f"mid:{turn[0]}:{raw_mid.strip()}:{text_sig}")
+                    if dedup_keys:
+                        if any(k in state.claude_seen_audit_ids for k in dedup_keys):
+                            state.claude_seen_audit_ids.update(dedup_keys)
+                            return
+                        state.claude_seen_audit_ids.update(dedup_keys)
                 state.claude_just_compacted = False
                 state.clean_turns.append(turn)
 
@@ -4637,7 +4679,7 @@ class SessionTracker:
                 typ == "session_meta"
                 and isinstance(payload, dict)
                 and not state.cwd
-                and state.matched_by != "codex_desktop_db"
+                and state.matched_by not in _AUTHORITATIVE_DESKTOP_MATCHED_BY
             ):
                 if isinstance(payload.get("cwd"), str):
                     state.cwd = _normalize_cwd(payload["cwd"], wsl=eff_wsl)
@@ -5553,7 +5595,8 @@ class SessionTracker:
             else (cold_start_fallback or "auto").strip().lower()
         )
         need_prior_discovery = False
-        authoritative_cwd = eff_match.matched_by in ("ide_db_title", "codex_desktop_db")
+        authoritative_cwd = eff_match.matched_by in _AUTHORITATIVE_DESKTOP_MATCHED_BY
+        allow_cold_start_prior = eff_match.matched_by != "claude_desktop_cowork"
         prior_scope = "agy_ide" if eff_match.matched_by in ("ide_brain", "ide_db_title") else "cli"
         with self._lock:
             norm_path = (
@@ -5617,7 +5660,7 @@ class SessionTracker:
                     state.cold_start_prior_checked = True
                     state.cold_start_prior_hotwords_checked = True
                     state.cold_start_prior_retired = True
-            elif eff_fb != "off" and eff_cwd and not state.cold_start_prior_retired:
+            elif allow_cold_start_prior and eff_fb != "off" and eff_cwd and not state.cold_start_prior_retired:
                 if eff_fb == "auto" and not state.cold_start_prior_checked:
                     need_prior_discovery = True
                 elif eff_fb == "hotwords" and not state.cold_start_prior_hotwords_checked:
@@ -5657,7 +5700,7 @@ class SessionTracker:
                         cur_canon = self._canonical_prior_cwd(cur_st.cwd, is_remote=cur_st.is_remote)
                         cwd_still_matches = (
                             (bool(cur_canon) and cur_canon == target_canon_cwd)
-                            if cur_st.matched_by in ("ide_db_title", "codex_desktop_db")
+                            if cur_st.matched_by in _AUTHORITATIVE_DESKTOP_MATCHED_BY
                             else (not cur_canon or cur_canon == target_canon_cwd)
                         )
                         if not cur_st.cold_start_prior_retired and cwd_still_matches:
@@ -5680,6 +5723,7 @@ class SessionTracker:
                     list(cur_st.cold_start_prior_hotwords)
                     if (
                         cur_st is not None
+                        and allow_cold_start_prior
                         and eff_fb != "off"
                         and len(turns_tuple) < COLD_START_SWEET_MIN_TURNS
                         and bool(target_canon_cwd)

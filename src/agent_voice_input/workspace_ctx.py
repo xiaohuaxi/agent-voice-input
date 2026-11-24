@@ -32,6 +32,7 @@ from ._remote_probe import (
     _SHALLOW_SKIP_BASES_LOW,
     _SHALLOW_SKIP_DIRS_LOW,
     _TECH_IDENT_RE,
+    _clean_claude_record,
     _clean_jsonl_file,
     _cwd_match_rank,
     _is_agy_subagent,
@@ -43,6 +44,7 @@ from ._remote_probe import (
     _read_bounded_line,
     _safe_realpath,
     build_slim_prior_candidate,
+    encode_claude_project_dir,
     extract_prior_sessions_hotwords,
 )
 from .app_scope import (
@@ -59,7 +61,7 @@ class SessionMatch:
     session_id: str
     jsonl_path: str
     cwd: str = ""
-    matched_by: str = ""  # "registry" | "title_uuid" | "title_prefix" | "tmux_registry" | "tmux_pane_title" | "tmux_proc_scan" | "tty_registry" | "tty_ps" | "proc_scan" | "recent_root" | "ide_brain" | "ide_db_title" | "codex_desktop_db" | "remote_*"
+    matched_by: str = ""  # "registry" | "title_uuid" | "title_prefix" | "tmux_registry" | "tmux_pane_title" | "tmux_proc_scan" | "tty_registry" | "tty_ps" | "proc_scan" | "recent_root" | "ide_brain" | "ide_db_title" | "codex_desktop_db" | "claude_desktop_code" | "claude_desktop_cowork" | "remote_*"
     pts_mtime: float = 0.0
     jsonl_mtime: float = 0.0
     thread_name: str = ""
@@ -1796,6 +1798,832 @@ def resolve_codex_desktop_session_by_title(
         matched_by="codex_desktop_db",
         jsonl_mtime=rp_stat.st_mtime,
     )
+
+
+_CLAUDE_DESKTOP_REJECT_TITLES: frozenset[str] = frozenset(
+    {
+        "claude",
+        "claude code",
+        "new chat",
+        "new conversation",
+        "new session",
+        "settings",
+        "preferences",
+        "welcome",
+        "about",
+        "search",
+    }
+)
+_CLAUDE_DESKTOP_META_MAX_BYTES: int = 1048576  # 1 MiB safety cap
+_CLAUDE_DESKTOP_ROUTE_RE = re.compile(
+    r"^/(cowork|epitaxy|code)/(local_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/?$",
+    re.IGNORECASE,
+)
+_CLAUDE_JSONL_VALIDATE_HEAD_LINES: int = 64
+_CLAUDE_JSONL_VALIDATE_MAX_LINES: int = 512
+_CLAUDE_JSONL_VALIDATE_MAX_BYTES: int = 524288  # 512 KiB
+_CLAUDE_META_CACHE_LOCK = threading.Lock()
+_CLAUDE_META_CACHE_MAX: int = 2048
+
+
+@dataclass(frozen=True)
+class _ClaudeMetaSummary:
+    base_dir: Path
+    meta_path: Path
+    meta_mtime: float
+    session_id: str
+    cli_session_id: str
+    title: str
+    started_env_id: str
+    cwd: str
+    fp_real: str
+    fp_cwd: str
+    origin_cwd: str
+    user_selected_folders: Any
+    resolved_folder_kinds: Any
+    last_focused_ts: float
+    last_activity_ts: float
+    created_ts: float
+
+
+_CLAUDE_META_CACHE: OrderedDict[str, tuple[int, int, _ClaudeMetaSummary | None]] = OrderedDict()
+
+
+def _iter_claude_desktop_roots(home: Path) -> tuple[Path, Path]:
+    """Return official and 3P Claude Desktop Application Support roots."""
+    app_support = home / "Library" / "Application Support"
+    return (app_support / "Claude", app_support / "Claude-3p")
+
+
+def _parse_claude_desktop_page_url(page_url: str) -> tuple[str, str]:
+    """Classify a sanitized Claude Desktop AXWebArea URL into ``('code'|'cowork'|'non_session'|'', local_sid)``."""
+    raw = (page_url or "").strip()
+    if not raw:
+        return "", ""
+    if len(raw) > 512 or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        return "non_session", ""
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return "non_session", ""
+    scheme = parts.scheme.lower()
+    netloc = (parts.netloc or "").lower()
+    if not ((scheme == "app" and netloc == "localhost") or (scheme == "https" and netloc == "claude.ai")):
+        return "non_session", ""
+    m = _CLAUDE_DESKTOP_ROUTE_RE.match(parts.path or "")
+    if not m:
+        return "non_session", ""
+    kind = "cowork" if m.group(1).lower() == "cowork" else "code"
+    local_sid = m.group(2)
+    return (kind, local_sid) if _is_safe_agy_cid(local_sid) else ("non_session", "")
+
+
+def _parse_claude_desktop_window_title(window_title: str) -> tuple[str, str]:
+    """Classify a Claude Desktop window title into ``('code' | 'cowork' | '', stripped_title)``."""
+    raw = (window_title or "").strip()
+    if not raw or len(raw) > 512 or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        return "", ""
+    low = raw.lower()
+    for admin_tag in (" [administrator]", " (admin)"):
+        if low.endswith(admin_tag):
+            raw = raw[: -len(admin_tag)].rstrip()
+            low = raw.lower()
+    if not raw or low in _CLAUDE_DESKTOP_REJECT_TITLES:
+        return "", ""
+    stripped_code = _strip_trailing_app_suffix(raw, ("claude code",), allow_tight_dash=True)
+    if stripped_code != raw:
+        if stripped_code and stripped_code.lower() not in _CLAUDE_DESKTOP_REJECT_TITLES:
+            return "code", stripped_code
+        return "", ""
+    stripped_cowork = _strip_trailing_app_suffix(raw, ("claude",), allow_tight_dash=True)
+    if stripped_cowork != raw:
+        if stripped_cowork and stripped_cowork.lower() not in _CLAUDE_DESKTOP_REJECT_TITLES:
+            return "cowork", stripped_cowork
+        return "", ""
+    return "", ""
+
+
+def _iter_claude_account_dirs(
+    home: Path, subdir_name: str, *, wsl: bool
+) -> tuple[list[tuple[Path, Path]], bool]:
+    """Bounded 2-level enumeration of ``<root>/<subdir>/<org>/<account>`` across Claude & Claude-3p.
+
+    Returns ``(account_dirs, had_io_error)``. Missing paths (``FileNotFoundError`` /
+    ``NotADirectoryError``) are skipped cleanly, whereas real read/permission errors
+    propagate ``had_io_error=True`` so callers fail closed.
+    """
+    out: list[tuple[Path, Path]] = []
+    had_io_error = False
+    for root in _iter_claude_desktop_roots(home):
+        sub_path = root / subdir_name
+        try:
+            os.lstat(sub_path)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            had_io_error = True
+            continue
+        safe_sub = _resolve_safe_local_dir(str(sub_path), wsl=wsl)
+        if not safe_sub:
+            continue
+        base_dir = Path(safe_sub)
+        org_dirs: list[Path] = []
+        try:
+            with os.scandir(base_dir) as org_it:
+                for org_e in org_it:
+                    oname = org_e.name
+                    if not oname or oname.startswith(".") or oname.lower() == "skills-plugin":
+                        continue
+                    try:
+                        if org_e.is_dir(follow_symlinks=False):
+                            org_dirs.append(Path(org_e.path))
+                    except (FileNotFoundError, NotADirectoryError):
+                        continue
+                    except OSError:
+                        had_io_error = True
+                        continue
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            had_io_error = True
+            continue
+
+        for org_dir in org_dirs:
+            try:
+                with os.scandir(org_dir) as acct_it:
+                    for acct_e in acct_it:
+                        aname = acct_e.name
+                        if not aname or aname.startswith(".") or aname.lower() == "skills-plugin":
+                            continue
+                        try:
+                            if acct_e.is_dir(follow_symlinks=False):
+                                out.append((base_dir, Path(acct_e.path)))
+                        except (FileNotFoundError, NotADirectoryError):
+                            continue
+                        except OSError:
+                            had_io_error = True
+                            continue
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                had_io_error = True
+                continue
+    return out, had_io_error
+
+
+def _load_claude_meta_cached(
+    base_dir: Path, fpath: Path, lst: os.stat_result
+) -> tuple[_ClaudeMetaSummary | None, bool]:
+    """Stat-keyed cache of lightweight routing fields for a Claude Desktop ``local_*.json`` file.
+
+    Returns ``(summary, had_io_error)``. Transient ``OSError`` reads never poison the LRU cache.
+    """
+    cache_key = str(fpath)
+    sig_mtime = lst.st_mtime_ns
+    sig_size = lst.st_size
+    with _CLAUDE_META_CACHE_LOCK:
+        cached = _CLAUDE_META_CACHE.get(cache_key)
+        if cached is not None and cached[0] == sig_mtime and cached[1] == sig_size:
+            _CLAUDE_META_CACHE.move_to_end(cache_key)
+            return cached[2], False
+
+    try:
+        raw_text = fpath.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, True
+
+    summary: _ClaudeMetaSummary | None = None
+    try:
+        data = json.loads(raw_text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and not bool(data.get("isArchived")):
+        fp = data.get("folderPlace")
+        fp_real = str(fp.get("realPath") or "").strip() if isinstance(fp, Mapping) else ""
+        fp_cwd = str(fp.get("cwd") or "").strip() if isinstance(fp, Mapping) else ""
+        summary = _ClaudeMetaSummary(
+            base_dir=base_dir,
+            meta_path=fpath,
+            meta_mtime=float(lst.st_mtime),
+            session_id=str(data.get("sessionId") or "").strip(),
+            cli_session_id=str(data.get("cliSessionId") or "").strip(),
+            title=str(data.get("title") or "").strip(),
+            started_env_id=str(data.get("startedFromEnvironmentId") or "").strip(),
+            cwd=str(data.get("cwd") or "").strip(),
+            fp_real=fp_real,
+            fp_cwd=fp_cwd,
+            origin_cwd=str(data.get("originCwd") or "").strip(),
+            user_selected_folders=data.get("userSelectedFolders"),
+            resolved_folder_kinds=data.get("resolvedFolderKinds"),
+            last_focused_ts=_parse_iso_timestamp(data.get("lastFocusedAt")),
+            last_activity_ts=_parse_iso_timestamp(data.get("lastActivityAt")),
+            created_ts=_parse_iso_timestamp(data.get("createdAt")),
+        )
+
+    with _CLAUDE_META_CACHE_LOCK:
+        _CLAUDE_META_CACHE[cache_key] = (sig_mtime, sig_size, summary)
+        _CLAUDE_META_CACHE.move_to_end(cache_key)
+        while len(_CLAUDE_META_CACHE) > _CLAUDE_META_CACHE_MAX:
+            _CLAUDE_META_CACHE.popitem(last=False)
+    return summary, False
+
+
+def _stat_valid_claude_meta_file(
+    fpath: Path, cur_uid: int | None
+) -> tuple[os.stat_result | None, bool]:
+    """Return ``(stat_result, had_io_error)``; distinguishes missing paths from real I/O errors."""
+    try:
+        lst = os.lstat(fpath)
+    except (FileNotFoundError, NotADirectoryError):
+        return None, False
+    except OSError:
+        return None, True
+    if (
+        not stat.S_ISREG(lst.st_mode)
+        or lst.st_size <= 0
+        or lst.st_size > _CLAUDE_DESKTOP_META_MAX_BYTES
+    ):
+        return None, False
+    if cur_uid is not None and lst.st_uid != cur_uid:
+        return None, False
+    return lst, False
+
+
+def _find_claude_meta_by_local_id(
+    home: Path, subdir_name: str, local_sid: str, *, wsl: bool
+) -> list[_ClaudeMetaSummary]:
+    """Direct O(accounts) lookup of ``<local_sid>.json`` verifying internal ``sessionId == local_sid``."""
+    if not _is_safe_agy_cid(local_sid):
+        return []
+    want_local_low = local_sid.strip().lower()
+    cur_uid = os.getuid() if hasattr(os, "getuid") else None
+    fname = f"{local_sid}.json"
+    acct_dirs, dir_io_err = _iter_claude_account_dirs(home, subdir_name, wsl=wsl)
+    if dir_io_err:
+        return []
+    hits: list[_ClaudeMetaSummary] = []
+    for base_dir, acct_dir in acct_dirs:
+        fpath = acct_dir / fname
+        lst, stat_io_err = _stat_valid_claude_meta_file(fpath, cur_uid)
+        if stat_io_err:
+            return []
+        if lst is None:
+            continue
+        summary, io_err = _load_claude_meta_cached(base_dir, fpath, lst)
+        if io_err:
+            return []
+        if summary is not None:
+            if not summary.session_id or summary.session_id.strip().lower() != want_local_low:
+                return []
+            hits.append(summary)
+    return hits
+
+
+def _scan_claude_session_metas(
+    home: Path, subdir_name: str, *, wsl: bool
+) -> tuple[list[_ClaudeMetaSummary], bool]:
+    """Incremental stat-cached scan of ``local_*.json`` across Claude & Claude-3p.
+
+    Returns ``(summaries, had_io_error)``. Callers performing title disambiguation must
+    fail closed when ``had_io_error`` is ``True`` so unreadable candidates cannot hide conflicts.
+    """
+    cur_uid = os.getuid() if hasattr(os, "getuid") else None
+    out: list[_ClaudeMetaSummary] = []
+    scanned_bases: list[str] = []
+    live_paths: set[str] = set()
+    acct_dirs, had_io_error = _iter_claude_account_dirs(home, subdir_name, wsl=wsl)
+    for base_dir, acct_dir in acct_dirs:
+        b_pfx = str(base_dir) + os.sep
+        if b_pfx not in scanned_bases:
+            scanned_bases.append(b_pfx)
+        try:
+            with os.scandir(acct_dir) as file_it:
+                for f_e in file_it:
+                    fname = f_e.name
+                    if not (fname.startswith("local_") and fname.endswith(".json")):
+                        continue
+                    fpath = Path(f_e.path)
+                    lst, stat_io_err = _stat_valid_claude_meta_file(fpath, cur_uid)
+                    if stat_io_err:
+                        had_io_error = True
+                        continue
+                    if lst is None:
+                        continue
+                    live_paths.add(str(fpath))
+                    summary, io_err = _load_claude_meta_cached(base_dir, fpath, lst)
+                    if io_err:
+                        had_io_error = True
+                        continue
+                    if summary is not None and summary.title:
+                        out.append(summary)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            had_io_error = True
+            continue
+    if scanned_bases and not had_io_error:
+        with _CLAUDE_META_CACHE_LOCK:
+            stale = [
+                k
+                for k in _CLAUDE_META_CACHE
+                if any(k.startswith(pfx) for pfx in scanned_bases) and k not in live_paths
+            ]
+            for k in stale:
+                _CLAUDE_META_CACHE.pop(k, None)
+    return out, had_io_error
+
+
+def _validate_claude_desktop_jsonl(
+    jsonl_path: Path, expected_cli_sid: str
+) -> tuple[bool, str]:
+    """Strictly verify a Claude Desktop transcript or audit JSONL carries explicit matching SID & clean dialogue.
+
+    Enforces strict remaining-byte (512 KiB) and physical-line (512 lines, counting blank lines)
+    budgets via ``readline(remaining + 1)``, inspecting at least 64 physical lines (or EOF) and
+    stopping immediately without draining oversized lines when either budget is reached.
+    """
+    want_sid_low = (expected_cli_sid or "").strip().lower()
+    resolved_sid = (expected_cli_sid or "").strip()
+    saw_matching_sid = False
+    saw_turn = False
+    try:
+        with open(jsonl_path, "rb") as f:
+            phys_lines = 0
+            scanned_bytes = 0
+            while (
+                phys_lines < _CLAUDE_JSONL_VALIDATE_MAX_LINES
+                and scanned_bytes < _CLAUDE_JSONL_VALIDATE_MAX_BYTES
+            ):
+                remaining = _CLAUDE_JSONL_VALIDATE_MAX_BYTES - scanned_bytes
+                raw = f.readline(remaining + 1)
+                if not raw:
+                    break
+                phys_lines += 1
+                scanned_bytes += len(raw)
+                if len(raw) > remaining:
+                    break
+                if not raw.strip():
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if (
+                    obj.get("agentId")
+                    or obj.get("agent_id")
+                    or obj.get("entrypoint") == "sdk-cli"
+                    or bool(obj.get("isSidechain"))
+                ):
+                    return False, ""
+                for sid_key in ("sessionId", "session_id"):
+                    raw_sid = obj.get(sid_key)
+                    if isinstance(raw_sid, str) and raw_sid.strip():
+                        rec_sid = raw_sid.strip()
+                        rec_low = rec_sid.lower()
+                        if want_sid_low:
+                            if rec_low != want_sid_low:
+                                return False, ""
+                        else:
+                            want_sid_low = rec_low
+                            resolved_sid = rec_sid
+                        saw_matching_sid = True
+                if not saw_turn and _clean_claude_record(obj) is not None:
+                    saw_turn = True
+                if (
+                    phys_lines >= _CLAUDE_JSONL_VALIDATE_HEAD_LINES
+                    and saw_matching_sid
+                    and saw_turn
+                ):
+                    break
+    except OSError:
+        return False, ""
+    if saw_turn and saw_matching_sid and resolved_sid:
+        return True, resolved_sid
+    return False, ""
+
+
+def _resolve_claude_desktop_code_transcript(
+    home: Path,
+    cli_sid: str,
+    cwd_hints: Sequence[str],
+    *,
+    wsl: bool,
+) -> tuple[Path, os.stat_result] | None:
+    if not _is_safe_agy_cid(cli_sid):
+        return None
+    safe_projects = _resolve_safe_local_dir(str(home / ".claude" / "projects"), wsl=wsl)
+    if not safe_projects:
+        return None
+    projects_root = Path(safe_projects)
+    cur_uid = os.getuid() if hasattr(os, "getuid") else None
+    enc_dirs: list[str] = []
+    for raw_c in cwd_hints:
+        if not raw_c:
+            continue
+        for enc in encode_claude_project_dir(raw_c, wsl=wsl):
+            if enc not in enc_dirs:
+                enc_dirs.append(enc)
+    for enc in enc_dirs:
+        cand_tp = projects_root / enc / f"{cli_sid}.jsonl"
+        try:
+            tp_lst = os.lstat(cand_tp)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        if not stat.S_ISREG(tp_lst.st_mode) or tp_lst.st_size <= 0:
+            return None
+        if cur_uid is not None and tp_lst.st_uid != cur_uid:
+            return None
+        if not _is_path_under_dir(cand_tp, projects_root, wsl=wsl):
+            return None
+        ok, _ = _validate_claude_desktop_jsonl(cand_tp, cli_sid)
+        if not ok:
+            return None
+        return cand_tp, tp_lst
+    return None
+
+
+def _extract_kind_str(val: Any) -> str:
+    if isinstance(val, str):
+        return val.strip().lower()
+    if isinstance(val, Mapping):
+        raw_k = val.get("kind")
+        if isinstance(raw_k, str):
+            return raw_k.strip().lower()
+    return ""
+
+
+def _extract_cowork_folders(
+    raw_folders: Any,
+    raw_kinds: Any,
+    *,
+    home: Path,
+    wsl: bool,
+    env: Mapping[str, str] | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Extract ``(valid_local_folders, unresolved_raw_folders)`` from Cowork metadata.
+
+    Never reads internal sandbox ``cwd``. Resolves ``resolvedFolderKinds`` by explicit path
+    keys first, then unambiguous display matching, and uses positional indexing only for
+    same-length pure-string lists; when ``resolvedFolderKinds`` is present but cannot be
+    safely interpreted, keeps the session fail-safe with empty local folders while preserving
+    raw paths for conflict disambiguation.
+    """
+    if not isinstance(raw_folders, list):
+        return (), ()
+    selected = [f.strip() for f in raw_folders if isinstance(f, str) and f.strip()]
+    if not selected:
+        return (), ()
+
+    all_raw_unresolved = tuple(dict.fromkeys(_normalize_cwd(f, wsl=wsl) or f for f in selected))
+    local_selected: list[str] = []
+
+    if raw_kinds is None:
+        local_selected = list(selected)
+    elif isinstance(raw_kinds, Mapping):
+        kind_map: dict[str, str] = {}
+        for k, v in raw_kinds.items():
+            if not isinstance(k, str) or not k.strip():
+                continue
+            k_str = k.strip()
+            k_kind = _extract_kind_str(v)
+            if not k_kind:
+                return (), all_raw_unresolved
+            kind_map[k_str] = k_kind
+            norm_k = _normalize_cwd(k_str, wsl=wsl)
+            if norm_k:
+                kind_map[norm_k] = k_kind
+        for f_str in selected:
+            norm_f = _normalize_cwd(f_str, wsl=wsl)
+            kind = kind_map.get(f_str) or (kind_map.get(norm_f) if norm_f else "")
+            if not kind:
+                return (), all_raw_unresolved
+            if kind == "local":
+                local_selected.append(f_str)
+    elif isinstance(raw_kinds, list):
+        if not raw_kinds:
+            return (), all_raw_unresolved
+        if all(isinstance(x, str) for x in raw_kinds):
+            if len(raw_kinds) != len(selected):
+                return (), all_raw_unresolved
+            for f_str, raw_k in zip(selected, raw_kinds):
+                kind = raw_k.strip().lower()
+                if not kind:
+                    return (), all_raw_unresolved
+                if kind == "local":
+                    local_selected.append(f_str)
+        elif all(isinstance(x, Mapping) for x in raw_kinds):
+            explicit_path_map: dict[str, str] = {}
+            display_map: dict[str, str] = {}
+            for item in raw_kinds:
+                k_kind = _extract_kind_str(item)
+                if not k_kind:
+                    return (), all_raw_unresolved
+                p_val = ""
+                for pkey in ("path", "folderPath", "folder_path", "realPath", "uri"):
+                    rv = item.get(pkey)
+                    if isinstance(rv, str) and rv.strip():
+                        p_val = rv.strip()
+                        break
+                if p_val:
+                    if p_val in explicit_path_map and explicit_path_map[p_val] != k_kind:
+                        return (), all_raw_unresolved
+                    explicit_path_map[p_val] = k_kind
+                    norm_p = _normalize_cwd(p_val, wsl=wsl)
+                    if norm_p:
+                        if norm_p in explicit_path_map and explicit_path_map[norm_p] != k_kind:
+                            return (), all_raw_unresolved
+                        explicit_path_map[norm_p] = k_kind
+                else:
+                    disp = str(item.get("display") or "").strip()
+                    if not disp:
+                        return (), all_raw_unresolved
+                    if disp in display_map and display_map[disp] != k_kind:
+                        return (), all_raw_unresolved
+                    display_map[disp] = k_kind
+
+            resolved_kinds: list[str] = [""] * len(selected)
+            unmatched: list[tuple[int, str]] = []
+            for idx, f_str in enumerate(selected):
+                norm_f = _normalize_cwd(f_str, wsl=wsl)
+                kind = explicit_path_map.get(f_str) or (
+                    explicit_path_map.get(norm_f) if norm_f else ""
+                )
+                if kind:
+                    resolved_kinds[idx] = kind
+                else:
+                    unmatched.append((idx, f_str))
+
+            if unmatched:
+                rem_basenames = [os.path.basename(f.rstrip("/\\")) for _, f in unmatched]
+                dup_basenames = {b for b in rem_basenames if b and rem_basenames.count(b) > 1}
+                for (idx, f_str), bname in zip(unmatched, rem_basenames):
+                    kind = display_map.get(f_str, "")
+                    if not kind and bname and bname not in dup_basenames:
+                        kind = display_map.get(bname, "")
+                    if not kind:
+                        return (), all_raw_unresolved
+                    resolved_kinds[idx] = kind
+
+            for f_str, kind in zip(selected, resolved_kinds):
+                if kind == "local":
+                    local_selected.append(f_str)
+        else:
+            return (), all_raw_unresolved
+    else:
+        return (), all_raw_unresolved
+
+    valid: list[str] = []
+    unresolved: list[str] = []
+    for f_str in local_selected:
+        safe_dir = _validate_codex_local_cwd(f_str, home=home, wsl=wsl, env=env)
+        if safe_dir:
+            if safe_dir not in valid:
+                valid.append(safe_dir)
+        else:
+            norm_u = _normalize_cwd(f_str, wsl=wsl) or f_str
+            if norm_u not in unresolved:
+                unresolved.append(norm_u)
+    return tuple(valid), tuple(unresolved)
+
+
+def _resolve_claude_desktop_cowork_transcript(
+    summary: _ClaudeMetaSummary,
+    *,
+    wsl: bool,
+) -> tuple[Path, os.stat_result, str] | None:
+    session_id_raw = summary.session_id
+    raw_sid = session_id_raw[len("local_") :] if session_id_raw.startswith("local_") else session_id_raw
+    if len(raw_sid) < 8 or not _is_safe_agy_cid(raw_sid):
+        return None
+    session_dir = summary.meta_path.parent / raw_sid[:8]
+    try:
+        sd_lst = os.lstat(session_dir)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(sd_lst.st_mode) or not _is_path_under_dir(session_dir, summary.base_dir, wsl=wsl):
+        return None
+
+    cur_uid = os.getuid() if hasattr(os, "getuid") else None
+    cli_sid = summary.cli_session_id
+    if cli_sid:
+        if not _is_safe_agy_cid(cli_sid):
+            return None
+        primary_tp = session_dir / ".claude" / "projects" / "session" / f"{cli_sid}.jsonl"
+        try:
+            p_lst = os.lstat(primary_tp)
+        except FileNotFoundError:
+            p_lst = None
+        except OSError:
+            return None
+        if p_lst is not None:
+            if not stat.S_ISREG(p_lst.st_mode) or p_lst.st_size <= 0:
+                return None
+            if cur_uid is not None and p_lst.st_uid != cur_uid:
+                return None
+            if not _is_path_under_dir(primary_tp, summary.base_dir, wsl=wsl):
+                return None
+            ok, resolved_sid = _validate_claude_desktop_jsonl(primary_tp, cli_sid)
+            if not ok:
+                return None
+            return primary_tp, p_lst, resolved_sid
+
+    audit_tp = session_dir / "audit.jsonl"
+    try:
+        a_lst = os.lstat(audit_tp)
+    except OSError:
+        return None
+    if not stat.S_ISREG(a_lst.st_mode) or a_lst.st_size <= 0:
+        return None
+    if cur_uid is not None and a_lst.st_uid != cur_uid:
+        return None
+    if not _is_path_under_dir(audit_tp, summary.base_dir, wsl=wsl):
+        return None
+    ok, resolved_sid = _validate_claude_desktop_jsonl(audit_tp, cli_sid)
+    if not ok:
+        return None
+    return audit_tp, a_lst, resolved_sid
+
+
+def _finalize_claude_code_candidates(
+    pool: Sequence[tuple[_ClaudeMetaSummary, bool]],
+    *,
+    home: Path,
+    wsl: bool,
+    env: Mapping[str, str],
+) -> SessionMatch | None:
+    if not pool:
+        return None
+    code_cands: list[tuple[_ClaudeMetaSummary, bool, str, tuple[str, ...]]] = []
+    distinct_cwds: set[str] = set()
+    distinct_sids: set[str] = set()
+    for summary, is_exact in pool:
+        if summary.started_env_id and summary.started_env_id.lower() != "local":
+            return None
+        safe_cwd = ""
+        for cand_c in (summary.cwd, summary.fp_real, summary.fp_cwd):
+            if cand_c:
+                safe_cwd = _validate_codex_local_cwd(cand_c, home=home, wsl=wsl, env=env)
+                if safe_cwd:
+                    break
+        if not safe_cwd or not summary.cli_session_id:
+            return None
+        distinct_cwds.add(safe_cwd)
+        distinct_sids.add(summary.cli_session_id.lower())
+        code_cands.append(
+            (summary, is_exact, safe_cwd, (summary.cwd, summary.fp_real, summary.fp_cwd, safe_cwd, summary.origin_cwd))
+        )
+    # Fail closed if candidates span multiple repos OR multiple distinct active session IDs (e.g. Claude + Claude-3p).
+    if len(distinct_cwds) != 1 or len(distinct_sids) != 1:
+        return None
+
+    chosen_summary, _, safe_cwd, cwd_hints = max(
+        code_cands,
+        key=lambda item: (
+            1 if item[1] else 0,
+            item[0].last_focused_ts,
+            item[0].last_activity_ts,
+            item[0].created_ts,
+            item[0].meta_mtime,
+        ),
+    )
+    resolved_code = _resolve_claude_desktop_code_transcript(
+        home, chosen_summary.cli_session_id, cwd_hints, wsl=wsl
+    )
+    if resolved_code is None:
+        return None
+    tp_path, tp_stat = resolved_code
+    return SessionMatch(
+        cli="claude",
+        session_id=chosen_summary.cli_session_id,
+        jsonl_path=str(tp_path),
+        cwd=safe_cwd,
+        matched_by="claude_desktop_code",
+        jsonl_mtime=tp_stat.st_mtime,
+    )
+
+
+def _finalize_claude_cowork_candidates(
+    pool: Sequence[tuple[_ClaudeMetaSummary, bool]],
+    *,
+    home: Path,
+    wsl: bool,
+    env: Mapping[str, str],
+) -> SessionMatch | None:
+    if not pool:
+        return None
+    cowork_cands: list[tuple[_ClaudeMetaSummary, bool, tuple[str, ...]]] = []
+    distinct_identities: set[str] = set()
+    distinct_folder_sigs: set[tuple[frozenset[str], frozenset[str]]] = set()
+    for summary, is_exact in pool:
+        valid_folders, unresolved_raw = _extract_cowork_folders(
+            summary.user_selected_folders,
+            summary.resolved_folder_kinds,
+            home=home,
+            wsl=wsl,
+            env=env,
+        )
+        sid_id = (summary.cli_session_id or summary.session_id).strip().lower()
+        if not sid_id:
+            return None
+        distinct_identities.add(sid_id)
+        distinct_folder_sigs.add((frozenset(valid_folders), frozenset(unresolved_raw)))
+        cowork_cands.append((summary, is_exact, valid_folders))
+    if len(distinct_identities) != 1 or len(distinct_folder_sigs) != 1:
+        return None
+
+    chosen_summary, _, chosen_folders = max(
+        cowork_cands,
+        key=lambda item: (
+            1 if item[1] else 0,
+            item[0].last_activity_ts,
+            item[0].created_ts,
+            item[0].meta_mtime,
+        ),
+    )
+    resolved_cowork = _resolve_claude_desktop_cowork_transcript(chosen_summary, wsl=wsl)
+    if resolved_cowork is None:
+        return None
+    tp_path, tp_stat, eff_sid = resolved_cowork
+    eff_cwd = chosen_folders[0] if len(chosen_folders) == 1 else ""
+    return SessionMatch(
+        cli="claude",
+        session_id=eff_sid,
+        jsonl_path=str(tp_path),
+        cwd=eff_cwd,
+        matched_by="claude_desktop_cowork",
+        jsonl_mtime=tp_stat.st_mtime,
+    )
+
+
+def resolve_claude_desktop_session_by_title(
+    window_title: str,
+    *,
+    page_url: str = "",
+    home: Path | None = None,
+    wsl: bool | None = None,
+    env: Mapping[str, str] | None = None,
+) -> SessionMatch | None:
+    """Resolve a Claude Desktop Code or Cowork session via exact AXWebArea route URL or Code-title fallback.
+
+    Primary path uses ``page_url`` (``app://localhost/cowork/local_<uuid>`` or
+    ``app://localhost/epitaxy/local_<uuid>``) to directly pinpoint the session metadata file,
+    failing closed on cloud/blank routes (``/new``, ``/chat/...``, ``/epitaxy`` without ID).
+    When ``page_url`` is absent, only ``" - Claude Code"`` titles fall back to incremental
+    stat-cached scanning (failing closed on multi-SID ties), while bare ``" - Claude"`` titles
+    fail closed to prevent cloud Chat from matching same-titled Cowork sessions.
+    """
+    eff_env = os.environ if env is None else env
+    eff_home = home if home is not None else Path((eff_env.get("HOME") or "").strip() or Path.home())
+    eff_wsl = _effective_is_wsl(wsl, env)
+
+    route_kind, route_local_sid = _parse_claude_desktop_page_url(page_url)
+    if route_kind == "non_session":
+        return None
+    if route_kind == "code":
+        hits = _find_claude_meta_by_local_id(eff_home, "claude-code-sessions", route_local_sid, wsl=eff_wsl)
+        return _finalize_claude_code_candidates(
+            [(h, True) for h in hits], home=eff_home, wsl=eff_wsl, env=eff_env
+        )
+    if route_kind == "cowork":
+        hits = _find_claude_meta_by_local_id(eff_home, "local-agent-mode-sessions", route_local_sid, wsl=eff_wsl)
+        return _finalize_claude_cowork_candidates(
+            [(h, True) for h in hits], home=eff_home, wsl=eff_wsl, env=eff_env
+        )
+
+    # No page_url available: only " - Claude Code" may fall back to title scanning;
+    # " - Claude" without a /cowork/local_<uuid> route cannot distinguish Chat from Cowork -> fail closed.
+    mode_kind, stripped_title = _parse_claude_desktop_window_title(window_title)
+    if mode_kind != "code" or not stripped_title:
+        return None
+    summaries, had_io_error = _scan_claude_session_metas(eff_home, "claude-code-sessions", wsl=eff_wsl)
+    if had_io_error or not summaries:
+        return None
+
+    trunc_prefix = _compute_trunc_prefix(stripped_title)
+    is_truncated = stripped_title.endswith("...") or stripped_title.endswith("\u2026")
+    pool: list[tuple[_ClaudeMetaSummary, bool]] = []
+    for summary in summaries:
+        is_exact = summary.title == stripped_title
+        is_prefix = (
+            not is_exact
+            and bool(trunc_prefix)
+            and summary.title.startswith(trunc_prefix)
+            and len(summary.title) > len(trunc_prefix)
+        )
+        if is_exact or is_prefix:
+            pool.append((summary, is_exact))
+    if not pool:
+        return None
+
+    if not is_truncated:
+        exact_only = [item for item in pool if item[1]]
+        if exact_only:
+            pool = exact_only
+    return _finalize_claude_code_candidates(pool, home=eff_home, wsl=eff_wsl, env=eff_env)
 
 
 def resolve_antigravity_ide_session(
