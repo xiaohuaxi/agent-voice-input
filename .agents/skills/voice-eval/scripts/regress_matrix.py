@@ -1816,6 +1816,20 @@ _CODEX_EMPTY_EVENT_MSG_TYPES: frozenset[str] = frozenset(
         "background_event",
     }
 )
+_CODEX_NON_DIALOGUE_ITEM_TYPES: frozenset[str] = frozenset(
+    {
+        "commandexecution",
+        "contextcompaction",
+        "reasoning",
+        "filechange",
+        "mcptoolcall",
+        "websearch",
+        "collabtoolcall",
+        "imageview",
+        "enteredreviewmode",
+        "exitedreviewmode",
+    }
+)
 _CODEX_INSTRUCTIONS_CTX_RE = re.compile(
     r"<INSTRUCTIONS>.*?</INSTRUCTIONS>", re.DOTALL | re.IGNORECASE
 )
@@ -1914,6 +1928,15 @@ def _is_known_empty_metadata_transcript(cli_name: str, path: Path) -> bool:
                             return False
                         ptyp = str(pl.get("type") or "").strip()
                         if ptyp == "item_completed":
+                            item = pl.get("item")
+                            if not isinstance(item, dict):
+                                return False
+                            raw_item_type = item.get("type")
+                            item_type = raw_item_type.strip() if isinstance(raw_item_type, str) else ""
+                            norm_item_type = item_type.replace("_", "").replace("-", "").lower()
+                            has_role = bool(str(item.get("role") or "").strip())
+                            if norm_item_type in _CODEX_NON_DIALOGUE_ITEM_TYPES and not has_role:
+                                continue
                             return False
                         item = pl.get("item")
                         if isinstance(item, dict) and item and any(

@@ -649,6 +649,80 @@ class TestRegressMatrixLayerC(unittest.TestCase):
             self.assertEqual(c1_drift["metrics"]["drift_candidate"], 1)
             self.assertEqual(c1_drift["metrics"]["older_ok_candidate"], 3)
 
+    def test_layer_c_allows_known_non_dialogue_item_completed_and_rejects_missing_type(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="avi-t-lc-r5-") as raw_td:
+            home = Path(raw_td)
+            cx_dir = home / ".codex" / "sessions" / "2026" / "11" / "24"
+            cx_old = rm._write_codex_rollout(
+                cx_dir / "rollout-2026-11-24T08-00-00-ab020001-0000-4000-8000-000000000001.jsonl",
+                "ab020001-0000-4000-8000-000000000001",
+                str(home / "repo"),
+                [("user", "older codex turn"), ("assistant", "older codex reply")],
+            )
+            cx_non_dialog = cx_dir / "rollout-2026-11-24T09-00-00-ab020002-0000-4000-8000-000000000002.jsonl"
+            cx_non_dialog.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "session_meta", "payload": {"id": "ab020002-0000-4000-8000-000000000002", "cwd": str(home), "source": "cli"}}),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "item_completed",
+                                    "item": {"type": "CommandExecution", "command": "ls -la", "output": "X" * 2500},
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "item_completed",
+                                    "item": {"type": "ContextCompaction", "id": "cc-1", "summary": "C" * 2500},
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.utime(cx_old, (1700000100, 1700000100))
+            os.utime(cx_non_dialog, (1700000200, 1700000200))
+
+            checks_ok = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            c1_ok = next(c for c in checks_ok if c["id"] == "C1_real_codex_cli")
+            self.assertEqual(c1_ok["status"], "PASS", msg=c1_ok)
+            self.assertEqual(c1_ok["metrics"]["candidates_checked"], 2)
+
+            # Missing item.type in item_completed MUST still fail as schema drift
+            cx_missing_type = cx_dir / "rollout-2026-11-24T10-00-00-ab020003-0000-4000-8000-000000000003.jsonl"
+            cx_missing_type.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "session_meta", "payload": {"id": "ab020003-0000-4000-8000-000000000003", "cwd": str(home), "source": "cli"}}),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "item_completed",
+                                    "item": {"command": "ls", "output": "M" * 4500},
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.utime(cx_missing_type, (1700000300, 1700000300))
+
+            checks_fail = rm.run_layer_c_real_clis({"HOME": str(home)}, lambda s: str(s))
+            c1_fail = next(c for c in checks_fail if c["id"] == "C1_real_codex_cli")
+            self.assertEqual(c1_fail["status"], "FAIL", msg=c1_fail)
+            self.assertIn("schema drift", c1_fail["detail"])
+            self.assertEqual(c1_fail["metrics"]["drift_candidate"], 1)
+
     def test_small_empty_sessions_mark_skip_not_pass(self) -> None:
         with tempfile.TemporaryDirectory(prefix="avi-t-lc3-") as raw_td:
             home = Path(raw_td)

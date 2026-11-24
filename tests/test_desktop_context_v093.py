@@ -3759,7 +3759,7 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             assert m_sys_deb is not None
             self.assertEqual(m_sys_deb.session_id, "cid-remote-sys-active-ws")
 
-            # Absolute paths with spaces continue matching via _AGY_WS_CWD_RE alongside file:// URIs
+            # Absolute paths with spaces continue matching via _AGY_IDE_WS_CWD_RE alongside file:// URIs
             spaced_ws = home / "repos" / "my spaced app"
             spaced_ws.mkdir(parents=True)
             shutil.rmtree(ide_brain)
@@ -3779,6 +3779,24 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             m_spaced = resolve_antigravity_ide_session(str(spaced_ws), home=home, now_ts=base_t, wsl=True, env=env_u)
             assert m_spaced is not None
             self.assertEqual(m_spaced.session_id, "cid-spaced-sys-ws")
+
+            # 9. CLI _extract_agy_cwd keeps strict leading-'/' regex and rejects file://fileserver/... URIs
+            from agent_voice_input._remote_probe import _extract_agy_cwd
+
+            cli_uri_tp = home / "cli_remote_file_uri.jsonl"
+            cli_uri_tp.write_text(
+                json.dumps(
+                    {
+                        "source": "SYSTEM",
+                        "type": "SYSTEM_PROMPT",
+                        "content": f"<user_information>\nActive Workspaces:\n- file://fileserver{shared}\n</user_information>",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_extract_agy_cwd(cli_uri_tp, wsl=False), "")
+            self.assertEqual(_extract_agy_cwd(cli_uri_tp, wsl=True), "")
 
 
 if __name__ == "__main__":

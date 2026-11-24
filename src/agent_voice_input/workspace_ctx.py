@@ -22,7 +22,6 @@ import urllib.parse
 from ._remote_probe import (
     COLD_START_FALLBACK_MIN_CHARS,
     COLD_START_TOP_K,
-    _AGY_WS_CWD_RE,
     _BROAD_SYSTEM_DIRS_LOW,
     _REPO_CORE_EXTS,
     _REPO_PRIORITY_ROOTS,
@@ -405,6 +404,9 @@ _AGY_TOOL_PATH_KEYS: frozenset[str] = frozenset({
     "file_path", "filepath", "directory", "target_directory", "workdir",
 })
 _AGY_URI_RE = re.compile(r"(?:file|vscode-remote)://[^\s\"'<>)\]`]+", re.IGNORECASE)
+_AGY_IDE_WS_CWD_RE = re.compile(
+    r"(?:Command Working Directory:\s*|Active Workspaces:\s*\r?\n-\s*)((?:/|(?i:vscode-remote|file)://)[^\r\n<]+)"
+)
 _AGY_ABS_PATH_RE = re.compile(
     r"(?:^|[\s\"':=\[({`])(?<!://)(/(?:[A-Za-z0-9._\u0080-\uffff-]+/)+[A-Za-z0-9._\u0080-\uffff-]+)"
 )
@@ -677,7 +679,7 @@ def _load_agy_ide_evidence(
                 if obj.get("source") == "SYSTEM":
                     c_str = obj.get("content")
                     if isinstance(c_str, str) and ("Working Directory:" in c_str or "Active Workspaces:" in c_str):
-                        if m_ws := _AGY_WS_CWD_RE.search(c_str):
+                        if m_ws := _AGY_IDE_WS_CWD_RE.search(c_str):
                             _add_unique(sys_cwds, m_ws.group(1), keep_remote=True)
             head_end = f.tell()
             if st.st_size > head_end:
