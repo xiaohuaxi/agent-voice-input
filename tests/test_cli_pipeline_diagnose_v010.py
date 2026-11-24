@@ -95,7 +95,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
             (pkg / "a.py").write_text("X = 2\n", encoding="utf-8")
             bid2 = compute_package_build_id(pkg)
             self.assertNotEqual(bid1, bid2)
-            # Editing bridge assets (mac_shim/*.swift / win_shim.ps1) also changes fingerprint
+            # Editing bridge assets (mac_shim/*.swift / win_shim.ps1 / win_shim/*.cs) also changes fingerprint
             mac_dir = pkg / "mac_shim"
             mac_dir.mkdir()
             (mac_dir / "BridgeMain.swift").write_text("let v = 1\n", encoding="utf-8")
@@ -111,6 +111,15 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
             (pkg / "win_shim.ps1").write_text("$v = 1\n", encoding="utf-8")
             bid4 = compute_package_build_id(pkg)
             self.assertNotEqual(bid3c, bid4)
+            # Adding/editing C# files under win_shim/ also changes fingerprint
+            win_dir = pkg / "win_shim"
+            win_dir.mkdir()
+            (win_dir / "NativeBridge.cs").write_text("public static partial class VoiceWinShim {}\n", encoding="utf-8")
+            bid4b = compute_package_build_id(pkg)
+            self.assertNotEqual(bid4, bid4b)
+            (win_dir / "NativeBridge.cs").write_text("public static partial class VoiceWinShim { int x; }\n", encoding="utf-8")
+            bid4c = compute_package_build_id(pkg)
+            self.assertNotEqual(bid4b, bid4c)
 
             # Drift matrix
             same = describe_daemon_drift(

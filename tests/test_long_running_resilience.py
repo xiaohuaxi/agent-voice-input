@@ -52,6 +52,7 @@ from agent_voice_input.http_transport import (  # noqa: E402
 )
 from agent_voice_input.platform_common import ForegroundWindow  # noqa: E402
 from agent_voice_input.platform_macos import read_mac_shim_source  # noqa: E402
+from agent_voice_input.platform_wsl import list_win_shim_sources, read_win_shim_source  # noqa: E402
 from agent_voice_input.refiner import BaseRefiner, RefinerResult, _InstanceKeepAlivePool  # noqa: E402
 from agent_voice_input.session_ctx import SessionMatch, SessionTracker  # noqa: E402
 
@@ -2038,11 +2039,12 @@ class PowerResumeAndDaemonLogRotationTests(unittest.TestCase):
                 daemon.close()
 
     def test_power_resume_bridge_contracts_in_win_and_mac_shims(self) -> None:
-        win_path = REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1"
-        win_bytes = win_path.read_bytes()
-        self.assertTrue(all(b < 0x80 for b in win_bytes), "win_shim.ps1 must stay strictly 7-bit ASCII")
+        for win_path in list_win_shim_sources():
+            win_bytes = win_path.read_bytes()
+            self.assertFalse(win_bytes.startswith(b"\xef\xbb\xbf"), f"{win_path.name} must not have UTF-8 BOM")
+            self.assertTrue(all(b < 0x80 for b in win_bytes), f"{win_path.name} must stay strictly 7-bit ASCII")
 
-        win_txt = win_bytes.decode("ascii")
+        win_txt = read_win_shim_source()
         for token in (
             "WM_POWERBROADCAST",
             "PBT_APMRESUMEAUTOMATIC",

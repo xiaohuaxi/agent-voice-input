@@ -44,6 +44,7 @@ from agent_voice_input.config import (  # noqa: E402
     select_refiner_provider,
 )
 from agent_voice_input.daemon import VoiceInputDaemon, send_control_command  # noqa: E402
+from agent_voice_input.platform_wsl import list_win_shim_sources, read_win_shim_source  # noqa: E402
 from agent_voice_input.refiner import (  # noqa: E402
     CODEX_PUBLIC_FALLBACK_MODELS,
     CodexRefiner,
@@ -1436,10 +1437,12 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
             finally:
                 mplat_sl.close()
 
-        win_ps1 = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
-        # 100% pure 7-bit ASCII
-        non_ascii = [(i + 1, ch) for i, ch in enumerate(win_ps1) if ord(ch) > 127]
-        self.assertEqual(non_ascii, [], f"win_shim.ps1 has non-ASCII characters: {non_ascii[:5]}")
+        for src_path in list_win_shim_sources():
+            raw_bytes = src_path.read_bytes()
+            self.assertFalse(raw_bytes.startswith(b"\xef\xbb\xbf"), f"{src_path.name} must have no UTF-8 BOM")
+            non_ascii_b = [(i + 1, b) for i, b in enumerate(raw_bytes) if b >= 128]
+            self.assertEqual(non_ascii_b, [], f"{src_path.name} has non-ASCII bytes: {non_ascii_b[:5]}")
+        win_ps1 = read_win_shim_source()
         self.assertNotIn("Add-Type -Path $dllPath", win_ps1)
         self.assertEqual(win_ps1.count("Add-Type -LiteralPath $dllPath"), 2)
         self.assertIn("Write-InitFailureAndExit", win_ps1)

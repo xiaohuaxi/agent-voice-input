@@ -24,7 +24,7 @@ from agent_voice_input.config import Config, RemoteConfig, RemoteHostConfig
 from agent_voice_input.daemon import VoiceInputDaemon, _CommitSlot, _QueuedUtterance, _Stage1State
 from agent_voice_input.platform_common import ForegroundWindow, PasteOutcome
 from agent_voice_input.platform_macos import GHOSTTY_BUNDLE_ID, MacOSPlatform
-from agent_voice_input.platform_wsl import SHIM_SCRIPT, WslPlatform, resolve_powershell_exe, to_windows_path
+from agent_voice_input.platform_wsl import SHIM_SCRIPT, WslPlatform, list_win_shim_sources, read_win_shim_source, resolve_powershell_exe, to_windows_path
 from agent_voice_input.refiner import BaseRefiner, RefinerResult
 from agent_voice_input.remote_ssh import RemoteSshManager
 from agent_voice_input.session_ctx import (
@@ -368,10 +368,12 @@ class TestV100AuditFixes(unittest.TestCase):
     # Fix 2: Windows Terminal token -> plain shell blocked + cross-language title parser parity
     # ------------------------------------------------------------------
     def test_02_windows_terminal_token_plain_shell_block_and_title_parser_parity(self) -> None:
-        raw_ps1 = SHIM_SCRIPT.read_bytes()
-        non_ascii = [(i, b) for i, b in enumerate(raw_ps1) if b >= 128]
-        self.assertEqual(non_ascii, [], "win_shim.ps1 must stay strictly 7-bit ASCII")
-        ps1_text = raw_ps1.decode("ascii")
+        for src_path in list_win_shim_sources():
+            raw_src = src_path.read_bytes()
+            self.assertFalse(raw_src.startswith(b"\xef\xbb\xbf"), f"{src_path.name} must not have UTF-8 BOM")
+            non_ascii = [(i, b) for i, b in enumerate(raw_src) if b >= 128]
+            self.assertEqual(non_ascii, [], f"{src_path.name} must stay strictly 7-bit ASCII")
+        ps1_text = SHIM_SCRIPT.read_text(encoding="ascii")
 
         # Verify both paste focus checks require curTok == expectTok (missing token is treated as conflict)
         self.assertIn('$tokConflict = ($expectTok -ne "") -and ($curTok -ne $expectTok)', ps1_text)
@@ -487,7 +489,7 @@ class TestV100AuditFixes(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_03_wsl_rec_start_timeout_sends_discard_stop_and_rec_gen_guard(self) -> None:
         # 1) Verify C# StopRecording checks rec_gen BEFORE clearing _recSess and CancelRecording preserves recGen
-        ps1_text = SHIM_SCRIPT.read_text(encoding="ascii")
+        ps1_text = read_win_shim_source()
         self.assertIn(
             "if (sess != null && recGen > 0L && sess.RecGen > 0L && sess.RecGen != recGen)",
             ps1_text,

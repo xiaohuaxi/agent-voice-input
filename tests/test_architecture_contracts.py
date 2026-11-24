@@ -22,6 +22,7 @@ if str(SRC_DIR) not in sys.path:
 
 from agent_voice_input import hud as hud_mod  # noqa: E402
 from agent_voice_input.platform_macos import read_mac_shim_source  # noqa: E402
+from agent_voice_input.platform_wsl import read_win_shim_source  # noqa: E402
 from agent_voice_input.app_scope import (  # noqa: E402
     DEDICATED_SSH_CLIENT_PATTERNS,
     MACOS_TERMINAL_BUNDLE_IDS,
@@ -674,7 +675,7 @@ class TestHudCrossPlatformContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.mac_swift = read_mac_shim_source()
-        cls.win_ps1 = (PKG_DIR / "win_shim.ps1").read_text(encoding="utf-8")
+        cls.win_ps1 = read_win_shim_source()
 
     def test_hud_layer_routing_matches_across_python_macos_and_windows(self) -> None:
         expected_control = set(hud_mod._CONTROL_HUD_STATES)
@@ -986,7 +987,7 @@ class TestCrossPlatformTerminalSymmetry(unittest.TestCase):
 
         # Verify win_shim.ps1 $AllowedTerminals default array stays aligned with WINDOWS_TERMINALS
         # and accepts -AllowedTerminals CLI override from Python WslPlatform._build_shim_cmd
-        win_ps1 = (PKG_DIR / "win_shim.ps1").read_text(encoding="utf-8")
+        win_ps1 = read_win_shim_source()
         m_shim = re.search(r"\$AllowedTerminals\s*=\s*@\(([^)]+)\)", win_ps1)
         self.assertIsNotNone(m_shim)
         shim_terms = set(re.findall(r'"([^"]+)"', m_shim.group(1)))  # type: ignore[union-attr]

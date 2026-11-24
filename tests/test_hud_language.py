@@ -53,7 +53,9 @@ from agent_voice_input.platform_wsl import (  # noqa: E402
     POWERSHELL_EXE,
     WINDOWS_TERMINALS,
     WslPlatform,
+    list_win_shim_sources,
     probe_wsl_host,
+    read_win_shim_source,
 )
 
 
@@ -849,8 +851,12 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
     def test_win_shim_ascii_ui_culture_and_layout_contract(self) -> None:
         import re
 
-        shim = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
-        self.assertTrue(shim.isascii(), "win_shim.ps1 must stay pure 7-bit ASCII using C# \\uXXXX escapes")
+        for src_path in list_win_shim_sources():
+            raw = src_path.read_bytes()
+            self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), f"{src_path.name} must not have UTF-8 BOM")
+            self.assertTrue(all(b < 128 for b in raw), f"{src_path.name} must stay pure 7-bit ASCII")
+        shim = read_win_shim_source()
+        self.assertTrue(shim.isascii(), "win_shim sources must stay pure 7-bit ASCII using C# \\uXXXX escapes")
         self.assertNotIn("$UiLanguage", shim)
         self.assertIn("GetHostUiCulture()", shim)
         self.assertIn("CultureInfo.CurrentUICulture", shim)

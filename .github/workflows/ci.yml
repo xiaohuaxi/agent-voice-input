@@ -330,8 +330,11 @@ jobs:
           import importlib.metadata as m, pathlib, sys
           dist = m.distribution("agent-voice-input")
           p = pathlib.Path(dist.locate_file("agent_voice_input/win_shim.ps1")).resolve()
+          cs_dir = p.with_name("win_shim")
+          cs_files = sorted(f for f in cs_dir.glob("*.cs") if f.is_file())
           venv_root = pathlib.Path(sys.argv[1]).resolve()
           assert p.is_file(), f"missing installed win_shim.ps1: {p}"
+          assert cs_files, f"missing installed win_shim/*.cs under: {cs_dir}"
           assert venv_root in p.parents, f"win_shim.ps1 not inside out-of-tree venv: {p}"
           print(str(p))
           '@ | & $venvPy - $venvDir
@@ -344,16 +347,27 @@ jobs:
             if ($null -ne $prevPyPath) { $env:PYTHONPATH = $prevPyPath }
           }
 
-      - name: Verify installed win_shim.ps1 7-bit ASCII, real Win32ClipStore self-check, and 4 MiB JSONL bridge pipe
+      - name: Verify installed win_shim 7-bit ASCII, real Win32ClipStore self-check, and 4 MiB JSONL bridge pipe
         shell: powershell
         run: |
           $shimPath = $env:AVI_INSTALLED_WIN_SHIM
           if ([string]::IsNullOrWhiteSpace($shimPath) -or -not (Test-Path -LiteralPath $shimPath)) {
             throw "Installed win_shim.ps1 not found: $shimPath"
           }
-          $rawBytes = [System.IO.File]::ReadAllBytes($shimPath)
-          foreach ($b in $rawBytes) {
-            if ($b -gt 0x7F) { throw "Non-ASCII byte $b found in installed win_shim.ps1" }
+          $winShimDir = Join-Path (Split-Path -Parent $shimPath) "win_shim"
+          $csFiles = @([System.IO.Directory]::GetFiles($winShimDir, "*.cs"))
+          if ($csFiles.Count -eq 0) {
+            throw "Installed win_shim/*.cs not found under: $winShimDir"
+          }
+          $allShimFiles = @($shimPath) + $csFiles
+          foreach ($sf in $allShimFiles) {
+            $rawBytes = [System.IO.File]::ReadAllBytes($sf)
+            if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
+              throw "UTF-8 BOM found in installed $sf"
+            }
+            foreach ($b in $rawBytes) {
+              if ($b -gt 0x7F) { throw "Non-ASCII byte $b found in installed $sf" }
+            }
           }
           $isoAppData = Join-Path $env:RUNNER_TEMP ("avi-shim-ci-" + [Guid]::NewGuid().ToString("N"))
           New-Item -ItemType Directory -Force -Path $isoAppData | Out-Null
@@ -429,6 +443,40 @@ jobs:
           assert got_sha == want_sha and got_b64 == payload_b64, "4 MiB Base64 mismatch"
           print(f"4 MiB Base64 JSONL round-trip verified via communicate(timeout=30) in {dt_ms:.1f} ms (sha256={got_sha[:16]}...)")
           '@
+          $roCachePy = @'
+          import json, pathlib, subprocess, sys
+
+          shim_path, ro_dir = sys.argv[1], sys.argv[2]
+          proc = subprocess.run(
+              [
+                  "powershell.exe",
+                  "-NoProfile",
+                  "-NonInteractive",
+                  "-Sta",
+                  "-ExecutionPolicy",
+                  "Bypass",
+                  "-File",
+                  shim_path,
+                  "-Mode",
+                  "self-check",
+                  "-CacheDir",
+                  ro_dir,
+              ],
+              stdin=subprocess.DEVNULL,
+              capture_output=True,
+              text=True,
+              encoding="utf-8",
+              timeout=30,
+          )
+          assert proc.returncode == 0, f"ro-cache self-check failed rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+          assert "CS0016" in proc.stderr, f"expected CS0016 fallback warning in stderr, got: {proc.stderr!r}"
+          lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+          payload = json.loads(lines[-1])
+          assert payload.get("ok") is True and payload.get("mode") == "self-check" and payload.get("cache_hit") is False, payload
+          leftovers = list(pathlib.Path(ro_dir).iterdir())
+          assert not leftovers, f"unexpected files in read-only cache dir: {leftovers}"
+          print(f"Read-only cache CS0016 fallback verified: {lines[-1]}")
+          '@
           try {
             $env:LOCALAPPDATA = $isoAppData
             $out1 = & powershell.exe -NoProfile -NonInteractive -Sta -ExecutionPolicy Bypass -File $shimPath -Mode self-check -RealClipboard
@@ -444,6 +492,19 @@ jobs:
             $p2 = ($out2 | Select-Object -Last 1) | ConvertFrom-Json
             if (-not $p2.ok -or $p2.mode -ne "self-check" -or -not $p2.cache_hit -or -not $p2.real_clipboard_ok) {
               throw "Unexpected cached self-check output: $out2"
+            }
+
+            # Read-only cache directory must trigger CS0016 fallback to uncached Add-Type
+            $roCacheDir = Join-Path $isoAppData "ro-cache"
+            New-Item -ItemType Directory -Force -Path $roCacheDir | Out-Null
+            try {
+              & icacls $roCacheDir /deny "*S-1-1-0:(WD)" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "icacls /deny failed with exit code $LASTEXITCODE" }
+              $roCachePy | python - $shimPath $roCacheDir
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } finally {
+              try { & icacls $roCacheDir /remove:d "*S-1-1-0" | Out-Null } catch { }
+              Remove-Item -Recurse -Force -Path $roCacheDir -ErrorAction SilentlyContinue
             }
 
             # Real powershell.exe bridge 4 MiB Base64 JSONL round-trip integrity & latency check
@@ -489,8 +550,14 @@ jobs:
               for p in (pkg_root / "mac_shim").glob("*.swift")
               if p.is_file()
           )
+          win_shim_files = sorted(
+              p.relative_to(pkg_root).as_posix()
+              for p in (pkg_root / "win_shim").glob("*.cs")
+              if p.is_file()
+          )
           assert pkg_files, "no package files discovered"
           assert mac_shim_files, "no mac_shim/*.swift files discovered"
+          assert win_shim_files, "no win_shim/*.cs files discovered"
           expected_wheel = {
               "agent_voice_input/__init__.py",
               "agent_voice_input/cli.py",
@@ -504,9 +571,11 @@ jobs:
               "agent_voice_input/_remote_probe.py",
               "agent_voice_input/remote_ssh.py",
               "agent_voice_input/win_shim.ps1",
+              "agent_voice_input/win_shim/NativeBridge.cs",
               "agent_voice_input/mac_shim/BridgeMain.swift",
               *(f"agent_voice_input/{name}" for name in pkg_files),
               *(f"agent_voice_input/{rel}" for rel in mac_shim_files),
+              *(f"agent_voice_input/{rel}" for rel in win_shim_files),
           }
 
           whls = glob.glob("dist/*.whl")
@@ -551,9 +620,11 @@ jobs:
               "/src/agent_voice_input/_remote_probe.py",
               "/src/agent_voice_input/remote_ssh.py",
               "/src/agent_voice_input/win_shim.ps1",
+              "/src/agent_voice_input/win_shim/NativeBridge.cs",
               "/src/agent_voice_input/mac_shim/BridgeMain.swift",
               *(f"/src/agent_voice_input/{name}" for name in pkg_files),
               *(f"/src/agent_voice_input/{rel}" for rel in mac_shim_files),
+              *(f"/src/agent_voice_input/{rel}" for rel in win_shim_files),
               *integ_rels,
               *doc_rels,
           }

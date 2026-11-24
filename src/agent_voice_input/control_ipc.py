@@ -31,7 +31,10 @@ CONTROL_REQUEST_MAX_BYTES: int = 256 * 1024
 CONTROL_REQUEST_READ_TIMEOUT_SEC: float = 2.0
 CONTROL_MAX_TIMEOUT_SEC: float = 86_400.0
 _BRIDGE_ASSET_NAMES: tuple[str, ...] = ("win_shim.ps1",)
-_BRIDGE_ASSET_GLOBS: tuple[tuple[str, str], ...] = (("mac_shim", "*.swift"),)
+_BRIDGE_ASSET_GLOBS: tuple[tuple[str, str], ...] = (
+    ("mac_shim", "*.swift"),
+    ("win_shim", "*.cs"),
+)
 
 _WINDOW_REQ_KEYS: tuple[str, ...] = (
     "hwnd",

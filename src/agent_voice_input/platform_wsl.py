@@ -42,6 +42,32 @@ POWERSHELL_EXE = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 _POWERSHELL_EXE_ROOT_MOUNT = "/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 WSLG_PULSE_SOCK = "/mnt/wslg/PulseServer"
 SHIM_SCRIPT = Path(__file__).resolve().with_name("win_shim.ps1")
+WIN_SHIM_DIR = Path(__file__).resolve().with_name("win_shim")
+
+
+def list_win_shim_sources(
+    ps_script: Path = SHIM_SCRIPT,
+    cs_dir: Path | None = None,
+) -> list[Path]:
+    """Return ``win_shim.ps1`` followed by sorted ``win_shim/*.cs`` source files."""
+    sources: list[Path] = []
+    if ps_script.is_file():
+        sources.append(ps_script)
+    eff_cs_dir = cs_dir if cs_dir is not None else ps_script.resolve().with_name("win_shim")
+    if eff_cs_dir.is_dir():
+        sources.extend(sorted(p for p in eff_cs_dir.glob("*.cs") if p.is_file()))
+    return sources
+
+
+def read_win_shim_source(
+    ps_script: Path = SHIM_SCRIPT,
+    cs_dir: Path | None = None,
+) -> str:
+    """Read and join ``win_shim.ps1`` and all ``win_shim/*.cs`` sources."""
+    sources = list_win_shim_sources(ps_script, cs_dir=cs_dir)
+    if not sources:
+        raise FileNotFoundError(f"win_shim sources not found at {ps_script}")
+    return "\n".join(p.read_text(encoding="utf-8") for p in sources)
 
 
 def resolve_powershell_exe(env: Mapping[str, str] | None = None) -> str | None:

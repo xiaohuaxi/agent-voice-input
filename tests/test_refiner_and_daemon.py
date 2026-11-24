@@ -45,8 +45,11 @@ from agent_voice_input.platform_wsl import (  # noqa: E402
     NoMicrophoneError,
     PasteOutcome,
     SHIM_SCRIPT,
+    WIN_SHIM_DIR,
     WslPlatform,
     is_windows_terminal_process,
+    list_win_shim_sources,
+    read_win_shim_source,
 )
 from agent_voice_input.refiner import (  # noqa: E402
     CodexRefiner,
@@ -506,17 +509,21 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         )
         pkg_data = data["tool"]["setuptools"]["package-data"]["agent_voice_input"]
         self.assertIn("win_shim.ps1", pkg_data)
+        self.assertIn("win_shim/*.cs", pkg_data)
         self.assertIn("mac_shim/*.swift", pkg_data)
         manifest_raw = (_REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
         self.assertIn("win_shim.ps1", manifest_raw)
+        self.assertIn("recursive-include src/agent_voice_input/win_shim *.cs", manifest_raw)
         self.assertIn("recursive-include src/agent_voice_input/mac_shim *.swift", manifest_raw)
         self.assertIn("prune .agents", manifest_raw)
         self.assertIn("prune .claude", manifest_raw)
         self.assertTrue(SHIM_SCRIPT.is_file())
+        self.assertTrue(WIN_SHIM_DIR.is_dir())
         self.assertEqual(
             SHIM_SCRIPT.resolve(),
             (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").resolve(),
         )
+        self.assertGreaterEqual(len(list_win_shim_sources()), 7)
         self.assertTrue((_REPO_ROOT / "LICENSE").is_file())
         self.assertTrue((_REPO_ROOT / "bin" / "agent-voice-input").is_file())
 
@@ -584,7 +591,9 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
                 srv.close()
 
     def test_win_shim_static_safety_invariants(self) -> None:
-        shim = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
+        import re
+
+        shim = read_win_shim_source()
         self.assertIn("LLKHF_INJECTED", shim)
         self.assertIn("_chordTainted", shim)
         self.assertIn("ptt_cancel", shim)
@@ -623,9 +632,12 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertIn("if ($fbTxt -ne $txt) { $clipOk = Set-ClipboardSafe $fbTxt $cmdEnqueuedTick $pasteDeadlineMs }", shim)
         self.assertIn('if ($clipOk) { "send_input_failed" } else { Get-ClipFailReason $cmdEnqueuedTick $pasteDeadlineMs }', shim)
         self.assertNotIn("$fbOk", shim)
-        send_paste_block = shim.split("public static bool SendPasteChord(", 1)[1].split("private static void InitWaveTable()", 1)[0]
-        self.assertNotIn("Thread.Sleep", send_paste_block)
-        self.assertNotIn("Start-Sleep", shim.split('elseif ($op -eq "paste")', 1)[1])
+        m_send = re.search(r"public static bool SendPasteChord\([^)]*\)\s*\{[^}]*\}", shim, re.S)
+        self.assertIsNotNone(m_send)
+        assert m_send is not None
+        self.assertNotIn("Thread.Sleep", m_send.group(0))
+        ps1_only = SHIM_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("Start-Sleep", ps1_only.split('elseif ($op -eq "paste")', 1)[1])
 
 
 class RefinerProtocolAndFallbackTests(unittest.TestCase):
@@ -7198,8 +7210,8 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
         self.assertEqual(err_inact.reason_code, "no_mic")
         self.assertEqual(err_inact.hud_state, "no_mic")
 
-        # 2. Core Win32/WASAPI startup & reopen gate invariants in win_shim.ps1
-        shim = (_REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1").read_text(encoding="utf-8")
+        # 2. Core Win32/WASAPI startup & reopen gate invariants in win_shim/*.cs
+        shim = read_win_shim_source()
         start_rec_block = shim.split("public static bool StartRecording(bool loopback, long recGen, out string error)", 1)[1].split(
             "public static byte[] StopRecording(out string error)", 1
         )[0]
@@ -9092,11 +9104,19 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                 daemon.close()
 
     def test_win_shim_dll_cache_and_clip_guard_static_contracts(self) -> None:
-        shim_path = _REPO_ROOT / "src" / "agent_voice_input" / "win_shim.ps1"
-        raw_bytes = shim_path.read_bytes()
-        self.assertFalse(raw_bytes.startswith(b"\xef\xbb\xbf"), "win_shim.ps1 must have no UTF-8 BOM")
-        self.assertTrue(all(b < 128 for b in raw_bytes), "win_shim.ps1 must stay strictly 7-bit ASCII")
-        shim = raw_bytes.decode("ascii")
+        win_sources = list_win_shim_sources()
+        self.assertGreaterEqual(len(win_sources), 7)
+        for src_path in win_sources:
+            raw_bytes = src_path.read_bytes()
+            self.assertFalse(raw_bytes.startswith(b"\xef\xbb\xbf"), f"{src_path.name} must have no UTF-8 BOM")
+            self.assertTrue(all(b < 128 for b in raw_bytes), f"{src_path.name} must stay strictly 7-bit ASCII")
+            self.assertNotIn(b"\r", raw_bytes, f"{src_path.name} must use LF line endings")
+        shim = read_win_shim_source()
+        with tempfile.TemporaryDirectory() as empty_td:
+            missing_ps1 = Path(empty_td) / "missing_win_shim.ps1"
+            self.assertEqual(list_win_shim_sources(missing_ps1), [])
+            with self.assertRaises(FileNotFoundError):
+                read_win_shim_source(missing_ps1)
         for required_tok in (
             "CSharpCodeProvider",
             "CompileAssemblyFromSource",
@@ -9149,6 +9169,17 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
             after_empty = branch_src.split("store.EmptyWhenOpen()", 1)[1]
             before_set = after_empty.split("store.SetFormatBytesWhenOpen(", 1)[0]
             self.assertIn("isDeadlineExceededFn()", before_set, msg=f"{branch_name} branch missing post-EmptyWhenOpen deadline check")
+        # Read-only cache directory CS0016 write failures must fall back to uncached Add-Type without masking real C# errors.
+        ps1_text = SHIM_SCRIPT.read_text(encoding="ascii")
+        compile_err_block = ps1_text.split("if ($cr.Errors.HasErrors) {", 1)[1].split("} elseif (Test-Path -LiteralPath $tmpDll) {", 1)[0]
+        self.assertIn('"CS0016"', compile_err_block)
+        self.assertIn("$onlyOutputWriteErr", compile_err_block)
+        cs0016_branch, real_err_branch = compile_err_block.split("if ($hasNonWarningErr -and $onlyOutputWriteErr) {", 1)[1].split("} else {", 1)
+        self.assertIn("falling back to uncached Add-Type", cs0016_branch)
+        self.assertNotIn("$csCompileError =", cs0016_branch)
+        self.assertIn("$csCompileError =", real_err_branch)
+        self.assertIn('Write-InitFailureAndExit ("C# compile failed: " + $csCompileError)', ps1_text)
+        self.assertIn("Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition $mergedCsSource", ps1_text)
 
     def test_jsonl_shim_unready_hang_reap_backoff_pulse_fallback_and_self_heal(self) -> None:
         import subprocess

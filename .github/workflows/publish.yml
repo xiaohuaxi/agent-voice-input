@@ -57,8 +57,14 @@ jobs:
               for p in (pkg_root / "mac_shim").glob("*.swift")
               if p.is_file()
           )
+          win_shim_files = sorted(
+              p.relative_to(pkg_root).as_posix()
+              for p in (pkg_root / "win_shim").glob("*.cs")
+              if p.is_file()
+          )
           assert pkg_files, "no package files discovered"
           assert mac_shim_files, "no mac_shim/*.swift files discovered"
+          assert win_shim_files, "no win_shim/*.cs files discovered"
           expected_wheel = {
               "agent_voice_input/__init__.py",
               "agent_voice_input/cli.py",
@@ -72,9 +78,11 @@ jobs:
               "agent_voice_input/_remote_probe.py",
               "agent_voice_input/remote_ssh.py",
               "agent_voice_input/win_shim.ps1",
+              "agent_voice_input/win_shim/NativeBridge.cs",
               "agent_voice_input/mac_shim/BridgeMain.swift",
               *(f"agent_voice_input/{name}" for name in pkg_files),
               *(f"agent_voice_input/{rel}" for rel in mac_shim_files),
+              *(f"agent_voice_input/{rel}" for rel in win_shim_files),
           }
 
           whls = glob.glob("dist/*.whl")
@@ -119,9 +127,11 @@ jobs:
               "/src/agent_voice_input/_remote_probe.py",
               "/src/agent_voice_input/remote_ssh.py",
               "/src/agent_voice_input/win_shim.ps1",
+              "/src/agent_voice_input/win_shim/NativeBridge.cs",
               "/src/agent_voice_input/mac_shim/BridgeMain.swift",
               *(f"/src/agent_voice_input/{name}" for name in pkg_files),
               *(f"/src/agent_voice_input/{rel}" for rel in mac_shim_files),
+              *(f"/src/agent_voice_input/{rel}" for rel in win_shim_files),
               *integ_rels,
               *doc_rels,
           }

@@ -52,4 +52,4 @@ where = ["src"]
 include = ["agent_voice_input*"]
 
 [tool.setuptools.package-data]
-agent_voice_input = ["win_shim.ps1", "mac_shim/*.swift"]
+agent_voice_input = ["win_shim.ps1", "win_shim/*.cs", "mac_shim/*.swift"]

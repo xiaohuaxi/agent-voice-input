@@ -39,6 +39,8 @@ from agent_voice_input.platform_wsl import (  # noqa: E402
     ForegroundWindow,
     PasteOutcome,
     SHIM_SCRIPT,
+    list_win_shim_sources,
+    read_win_shim_source,
     run_win_shim_self_check,
 )
 from agent_voice_input.refiner import NoopRefiner  # noqa: E402
@@ -710,10 +712,14 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
         self.assertEqual(res_sub_zero.reason, "silence")
 
     def test_win_shim_ascii_and_ci_packaging_contracts(self) -> None:
-        raw_shim = SHIM_SCRIPT.read_bytes()
-        non_ascii = [b for b in raw_shim if b > 0x7F]
-        self.assertEqual(non_ascii, [], "win_shim.ps1 must remain strictly 7-bit ASCII")
-        shim_txt = raw_shim.decode("ascii")
+        win_sources = list_win_shim_sources()
+        self.assertGreaterEqual(len(win_sources), 7)
+        for src_path in win_sources:
+            raw_shim = src_path.read_bytes()
+            self.assertFalse(raw_shim.startswith(b"\xef\xbb\xbf"), f"{src_path.name} must not have UTF-8 BOM")
+            non_ascii = [b for b in raw_shim if b > 0x7F]
+            self.assertEqual(non_ascii, [], f"{src_path.name} must remain strictly 7-bit ASCII")
+        shim_txt = read_win_shim_source()
         self.assertIn("BuildPasteChordInputs", shim_txt)
         self.assertIn("RunHeadlessSelfCheck", shim_txt)
         self.assertIn('$Mode -eq "self-check"', shim_txt)
@@ -733,6 +739,7 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
         self.assertIn("-Mode self-check", ci_txt)
         for wf_name, wf_txt in (("ci.yml", ci_txt), ("publish.yml", pub_txt)):
             self.assertIn("agent_voice_input/mac_shim/BridgeMain.swift", wf_txt, wf_name)
+            self.assertIn("agent_voice_input/win_shim/NativeBridge.cs", wf_txt, wf_name)
             self.assertIn("agent_voice_input/_remote_probe.py", wf_txt, wf_name)
             self.assertIn("agent_voice_input/remote_ssh.py", wf_txt, wf_name)
             for mod_rel in (
