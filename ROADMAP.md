@@ -166,6 +166,10 @@
 4. **桌面端后续扩展**：跟进 Claude 桌面版（Chat / Code / Cowork 经浅层 `AXWebArea.AXTitle` 识别并同时兼容 `Claude` 与 `Claude-3p` 目录）及 WSL2 跨系统读取 Windows 宿主机桌面 App 上下文。
 5. **脱离 WSL 的原生 Windows 独立运行**：覆盖未安装 WSL 的纯 Windows 桌面端用户，原生本地直读 Windows 宿主机 `.codex/`、`.gemini/` 与 Claude 会话目录并复用原生 WASAPI 采集与热键/HUD 桥接；针对同时使用 WSL 终端与 Windows 桌面 App 的混合用户，优先评估「原生 Windows 单守护进程 + 轻量 `wsl.exe` 探针（复用现有 SSH 远端探针模型）」的单热键共存架构，避免双系统热键状态机跳跃冲突。
 
+#### 近期架构复评与技术债跟踪
+
+- **平台录音生命周期异步交接复评（Stage 3A 遗留警觉点）**：本轮平台桥接重构中，`MacOSPlatform`（`15s` 首帧授权等待、`0.45s` 尾音 `tail_drain`、麦克风热插拔自动恢复与 `close()` 收敛）与 `WslPlatform`（录音取消/停录代次交接）历经多轮独立冷审才将 P0 清零。当前实现已闭环可发布，但两处仍属于结构偏紧的高异步热点；发版后专门排期做架构简化评估，防止后续迭代再次滑向复杂失控。
+
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
 
 `v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.14.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
