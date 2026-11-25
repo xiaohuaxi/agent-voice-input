@@ -34,6 +34,11 @@ from agent_voice_input.config import (  # noqa: E402
     resolve_credentials,
     select_refiner_provider,
 )
+from agent_voice_input.daemon_pipeline import PipelineResult, build_pipeline_summary  # noqa: E402
+from agent_voice_input.diagnose import (  # noqa: E402
+    _TELEMETRY_NUMERIC_FIELDS,
+    diagnose_record_flags,
+)
 from agent_voice_input.http_transport import CancelToken  # noqa: E402
 from agent_voice_input.llm_common import AsrResult  # noqa: E402
 from agent_voice_input.refiner import (  # noqa: E402
@@ -47,7 +52,10 @@ from agent_voice_input.refiner import (  # noqa: E402
     _agy_match_effort,
     _agy_match_model,
     _agy_select_reject_option_id,
+    _compute_agy_context_delta,
     create_refiner,
+    format_prior_session_reference_chunk,
+    format_session_reference_chunk,
 )
 
 
@@ -148,7 +156,24 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
         _log({{"event": "rpc", "pid": os.getpid(), "call_idx": call_idx, "method": method, "params": params}})
 
         if method == "initialize":
-            _send({{"jsonrpc": "2.0", "id": mid, "result": {{"protocolVersion": 1, "serverInfo": {{"name": "fake-agy"}}}}}})
+            init_res = {{"protocolVersion": 1, "serverInfo": {{"name": "fake-agy"}}}}
+            if scenario != "no_list_capability":
+                init_res["agentCapabilities"] = {{"sessionCapabilities": {{"list": {{}}, "resume": {{}}}}}}
+            else:
+                init_res["agentCapabilities"] = {{"sessionCapabilities": {{"resume": {{}}}}}}
+            _send({{"jsonrpc": "2.0", "id": mid, "result": init_res}})
+        elif method == "session/list":
+            if scenario == "list_unsupported":
+                _send({{"jsonrpc": "2.0", "id": mid, "error": {{"code": -32601, "message": "Method not found"}}}})
+                continue
+            if scenario == "list_error":
+                _send({{"jsonrpc": "2.0", "id": mid, "error": {{"code": -32000, "message": "backend boot failed"}}}})
+                continue
+            if scenario == "slow_prewarm":
+                time.sleep(0.25)
+            elif scenario == "hang_prewarm":
+                time.sleep(30.0)
+            _send({{"jsonrpc": "2.0", "id": mid, "result": {{"sessions": []}}}})
         elif method == "session/new":
             st = _load_state()
             st["sess_seq"] = st.get("sess_seq", 0) + 1
@@ -356,6 +381,28 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
                     "method": "session/update",
                     "params": {{"sessionId": None, "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "FORGED_NULL_SID"}}}}}},
                 }})
+            if scenario == "thought_chunks":
+                _send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{"sessionId": "other-session-id", "update": {{"sessionUpdate": "agent_thought_chunk", "content": {{"type": "text", "text": "SECRET_OTHER_SID_THOUGHT"}}}}}},
+                }})
+                _send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_thought_chunk", "content": {{"type": "text", "text": "秘密思考片段一"}}}}}},
+                }})
+                _send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_thought_chunk", "content": {{"type": "text", "text": "secret_thought_2"}}}}}},
+                }})
+            elif scenario == "thought_bloat":
+                _send({{
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_thought_chunk", "content": {{"type": "text", "text": "x" * 500}}}}}},
+                }})
             _send({{
                 "jsonrpc": "2.0",
                 "method": "session/update",
@@ -372,11 +419,14 @@ FAKE_AGY_SCRIPT = textwrap.dedent(
                 "method": "session/update",
                 "params": {{"sessionId": sid, "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": cleaned[half:]}}}}}},
             }})
-            usage = (
-                {{"inputTokens": 200, "cachedReadTokens": 1200, "outputTokens": 45, "thoughtTokens": 12}}
-                if prompt_idx >= 2
-                else {{"inputTokens": 1500, "cachedReadTokens": 0, "outputTokens": 50, "thoughtTokens": 20}}
-            )
+            if scenario in ("thought_chunks", "thought_bloat"):
+                usage = {{"inputTokens": 1200, "cachedReadTokens": 0, "outputTokens": 180}}
+            else:
+                usage = (
+                    {{"inputTokens": 200, "cachedReadTokens": 1200, "outputTokens": 45, "thoughtTokens": 12}}
+                    if prompt_idx >= 2
+                    else {{"inputTokens": 1500, "cachedReadTokens": 0, "outputTokens": 50, "thoughtTokens": 20}}
+                )
             _send({{
                 "jsonrpc": "2.0",
                 "id": mid,
@@ -1295,10 +1345,10 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                 os.chdir(prev_cwd)
 
     def test_idle_worker_reuse_ttl_eviction_power_resume_and_failure_kill(self) -> None:
-        self.assertEqual(_AGY_IDLE_TTL_SEC, 900.0)
+        self.assertEqual(_AGY_IDLE_TTL_SEC, 3600.0)
         default_ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy")), env={})
         try:
-            self.assertEqual(default_ref._idle_ttl_sec, 900.0)
+            self.assertEqual(default_ref._idle_ttl_sec, 3600.0)
         finally:
             default_ref.close()
 
@@ -1637,6 +1687,386 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             self.assertEqual(rc_miss, 1)
             self.assertIn("[refiner]   FAIL agy", buf_miss.getvalue())
             self.assertIn("agy CLI not found", buf_miss.getvalue())
+
+    def test_prepare_session_prewarm_idempotent_concurrent_cancel_and_close(self) -> None:
+        # 1. Basic prewarm runs initialize + session/list (zero session/new or prompt); subsequent refine reuses same PID with init_ms == 0
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, log_file, env = self._setup_fake_env(td)
+            ref = AgyRefiner(
+                Config(refiner=RefinerConfig(provider="agy")),
+                env=env,
+                runtime_dir=rt_dir,
+                idle_ttl_sec=60.0,
+            )
+            try:
+                # Concurrent / repeated calls are strictly idempotent (single worker spawn, single session/list)
+                for _ in range(5):
+                    ref.prepare_session("sess-warm")
+                dl = time.monotonic() + 3.0
+                while time.monotonic() < dl and (ref._worker is None or ref._prewarm_active > 0):
+                    time.sleep(0.01)
+                self.assertIsNotNone(ref._worker)
+                self.assertEqual(ref._prewarm_active, 0)
+                warm_pid = ref._worker.proc.pid  # type: ignore[union-attr]
+
+                # Calling prepare_session again on an already-warm worker is a no-op
+                ref.prepare_session("sess-warm")
+                time.sleep(0.05)
+                self.assertEqual(ref._worker.proc.pid, warm_pid)  # type: ignore[union-attr]
+
+                events_pre = _read_jsonl(log_file)
+                self.assertEqual(len([e for e in events_pre if e["event"] == "spawn"]), 1)
+                self.assertEqual(
+                    [e["method"] for e in events_pre if e["event"] == "rpc"],
+                    ["initialize", "session/list"],
+                )
+
+                r1 = ref.refine("预热后首句", session_key="sess-warm", fallback_context="ctx-warm")
+                self.assertEqual(r1.used_fallback, "")
+                self.assertEqual(r1.init_ms, 0)
+                self.assertEqual(ref._worker.proc.pid, warm_pid)  # type: ignore[union-attr]
+            finally:
+                ref.close()
+            self.assertEqual(len(ref._active_procs), 0)
+            events = _read_jsonl(log_file)
+            self.assertEqual(len([e for e in events if e["event"] == "spawn"]), 1)
+            self.assertEqual(
+                [e["method"] for e in events if e["event"] == "rpc"],
+                [
+                    "initialize",
+                    "session/list",
+                    "session/new",
+                    "session/set_config_option",
+                    "session/set_config_option",
+                    "session/prompt",
+                ],
+            )
+
+        # 2. refine() arriving while slow_prewarm is still running waits once and reuses the warmed worker (zero duplicate spawn)
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, log_file, env = self._setup_fake_env(td, scenario="slow_prewarm")
+            ref = AgyRefiner(
+                Config(refiner=RefinerConfig(provider="agy")),
+                env=env,
+                runtime_dir=rt_dir,
+                idle_ttl_sec=60.0,
+            )
+            try:
+                ref.prepare_session("sess-overlap")
+                # Wait briefly until prewarm thread has spawned worker & entered session/list
+                dl = time.monotonic() + 2.0
+                while time.monotonic() < dl and not ref._worker_is_prewarm:
+                    time.sleep(0.005)
+                r1 = ref.refine("并发重叠到达", session_key="sess-overlap")
+                self.assertEqual(r1.used_fallback, "")
+                self.assertEqual(r1.init_ms, 0)
+            finally:
+                ref.close()
+            events = _read_jsonl(log_file)
+            self.assertEqual(len([e for e in events if e["event"] == "spawn"]), 1)
+            self.assertEqual(
+                [e["method"] for e in events if e["event"] == "rpc"][:3],
+                ["initialize", "session/list", "session/new"],
+            )
+
+        # 3. close() and evict_connections() cleanly abort an in-flight hang_prewarm with zero leaked procs/threads
+        for action in ("close", "evict"):
+            with tempfile.TemporaryDirectory() as td:
+                rt_dir, _, env = self._setup_fake_env(td, scenario="hang_prewarm")
+                ref = AgyRefiner(
+                    Config(refiner=RefinerConfig(provider="agy")),
+                    env=env,
+                    runtime_dir=rt_dir,
+                    idle_ttl_sec=60.0,
+                )
+                try:
+                    ref.prepare_session("sess-abort")
+                    dl = time.monotonic() + 2.0
+                    while time.monotonic() < dl and ref._worker is None:
+                        time.sleep(0.01)
+                    self.assertIsNotNone(ref._worker)
+                    pid = ref._worker.proc.pid  # type: ignore[union-attr]
+                    t0 = time.monotonic()
+                    if action == "close":
+                        ref.close()
+                    else:
+                        self.assertEqual(ref.evict_connections(), 1)
+                        dl2 = time.monotonic() + 2.0
+                        while time.monotonic() < dl2 and ref._prewarm_active > 0:
+                            time.sleep(0.01)
+                    self.assertLess(time.monotonic() - t0, 2.5)
+                    self.assertIsNone(ref._worker)
+                    self.assertEqual(len(ref._active_procs), 0)
+                    self.assertFalse(_agy_group_alive(pid))
+                    self.assertEqual(ref._prewarm_active, 0)
+                finally:
+                    ref.close()
+
+        # 4. idle_ttl_sec == 0 makes prepare_session() a no-op; -32601 list_unsupported degrades gracefully; list_error discards cleanly
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, log_file, env = self._setup_fake_env(td)
+            ref0 = AgyRefiner(
+                Config(refiner=RefinerConfig(provider="agy")),
+                env=env,
+                runtime_dir=rt_dir,
+                idle_ttl_sec=0.0,
+            )
+            try:
+                ref0.prepare_session("sess-nottl")
+                time.sleep(0.05)
+                self.assertIsNone(ref0._worker)
+                self.assertEqual(_read_jsonl(log_file), [])
+            finally:
+                ref0.close()
+
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, log_file, env = self._setup_fake_env(td, scenario="list_unsupported")
+            ref_u = AgyRefiner(
+                Config(refiner=RefinerConfig(provider="agy")),
+                env=env,
+                runtime_dir=rt_dir,
+                idle_ttl_sec=60.0,
+            )
+            try:
+                ref_u.prepare_session("sess-unsup")
+                dl = time.monotonic() + 2.0
+                while time.monotonic() < dl and (ref_u._worker is None or ref_u._prewarm_active > 0):
+                    time.sleep(0.01)
+                self.assertIsNotNone(ref_u._worker)
+                r1 = ref_u.refine("降级保留暖进程", session_key="sess-unsup")
+                self.assertEqual(r1.used_fallback, "")
+                self.assertEqual(r1.init_ms, 0)
+            finally:
+                ref_u.close()
+            self.assertEqual(len([e for e in _read_jsonl(log_file) if e["event"] == "spawn"]), 1)
+
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, _, env = self._setup_fake_env(td, scenario="list_error")
+            ref_e = AgyRefiner(
+                Config(refiner=RefinerConfig(provider="agy")),
+                env=env,
+                runtime_dir=rt_dir,
+                idle_ttl_sec=60.0,
+            )
+            try:
+                ref_e.prepare_session("sess-lerr")
+                dl = time.monotonic() + 2.0
+                while time.monotonic() < dl and ref_e._prewarm_active > 0:
+                    time.sleep(0.01)
+                # Failed prewarm must cleanly discard worker instead of leaving a broken process
+                self.assertIsNone(ref_e._worker)
+                self.assertEqual(len(ref_e._active_procs), 0)
+            finally:
+                ref_e.close()
+
+    def test_tail_append_incremental_continuation_and_reset_boundaries(self) -> None:
+        # 1. Pure unit checks for _compute_agy_context_delta covering sealed chunks, tail growth, prior ref, rollback, and eviction
+        b1 = format_session_reference_chunk("[Speaker]\n第一问\n\n[CLI Agent]\n第一答")
+        b1_grown = format_session_reference_chunk(
+            "[Speaker]\n第一问\n\n[CLI Agent]\n第一答\n\n[Speaker]\n第二问\n\n[CLI Agent]\n第二答"
+        )
+        b2 = format_session_reference_chunk("[Speaker]\n跨块第三问")
+        b2_grown = format_session_reference_chunk("[Speaker]\n跨块第三问\n\n[CLI Agent]\n跨块第三答")
+        prior_blk = format_prior_session_reference_chunk("[Speaker]\n上个会话历史")
+
+        # Same tail grows on newline boundary -> resume with only delta wrapped as session_reference_log
+        ok, delta = _compute_agy_context_delta((b1,), [b1_grown])
+        self.assertTrue(ok)
+        self.assertEqual(len(delta), 1)
+        self.assertNotIn("第一问", delta[0])
+        self.assertIn("第二问", delta[0])
+        self.assertIn("第二答", delta[0])
+
+        # Tail grows AND overflows into a new sealed+tail chunk -> resume with tail delta + new chunk
+        ok2, delta2 = _compute_agy_context_delta((b1,), [b1_grown, b2])
+        self.assertTrue(ok2)
+        self.assertEqual(len(delta2), 2)
+        self.assertIn("第二答", delta2[0])
+        self.assertEqual(delta2[1], b2)
+
+        # Sealed chunk 0 unchanged, tail chunk 1 grows -> resume with only chunk 1 delta
+        ok3, delta3 = _compute_agy_context_delta((b1_grown, b2), [b1_grown, b2_grown])
+        self.assertTrue(ok3)
+        self.assertEqual(len(delta3), 1)
+        self.assertNotIn("第一问", delta3[0])
+        self.assertNotIn("跨块第三问", delta3[0])
+        self.assertIn("跨块第三答", delta3[0])
+
+        # In-place mutation without newline boundary -> must NOT resume
+        b1_mut = format_session_reference_chunk("[Speaker]\n第一问\n\n[CLI Agent]\n第一答被原地改长")
+        self.assertEqual(_compute_agy_context_delta((b1,), [b1_mut]), (False, []))
+
+        # Truncation / rollback -> must NOT resume
+        self.assertEqual(_compute_agy_context_delta((b1_grown,), [b1]), (False, []))
+        self.assertEqual(_compute_agy_context_delta((b1_grown, b2), [b1_grown]), (False, []))
+
+        # 50K rolling eviction (sealed block 0 dropped) -> must NOT resume
+        self.assertEqual(_compute_agy_context_delta((b1_grown, b2), [b2, b2_grown]), (False, []))
+
+        # Prior session reference: unchanged prior + new current chunk resumes; retired/changed prior forces fresh session
+        self.assertEqual(_compute_agy_context_delta((prior_blk,), [prior_blk, b1]), (True, [b1]))
+        self.assertEqual(_compute_agy_context_delta((prior_blk, b1), [b1_grown]), (False, []))
+        prior_grown = format_prior_session_reference_chunk("[Speaker]\n上个会话历史\n\n[CLI Agent]\n新增")
+        self.assertEqual(_compute_agy_context_delta((prior_blk,), [prior_grown]), (False, []))
+
+        # 2. End-to-end AgyRefiner test with real SessionTracker-like multi-chunk growth, session switch, rollback, and max_turns
+        class _DynamicTracker:
+            has_bound_session = True
+
+            def __init__(self) -> None:
+                self.chunks_by_key: dict[str, list[str]] = {}
+
+            def get_refiner_context_with_prior(self, session_key: str, **_kw: object) -> tuple[str, list[str], str]:
+                return "", list(self.chunks_by_key.get(session_key, [])), ""
+
+            def get_state(self, session_key: str) -> object | None:
+                return object() if session_key in self.chunks_by_key else None
+
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, log_file, env = self._setup_fake_env(td)
+            tracker = _DynamicTracker()
+            ref = AgyRefiner(
+                Config(refiner=RefinerConfig(provider="agy", max_turns_per_thread=4, include_git_status=False)),
+                env=env,
+                runtime_dir=rt_dir,
+                idle_ttl_sec=60.0,
+            )
+            try:
+                # Turn 1 (sess-inc): initial chunk
+                tracker.chunks_by_key["sess-inc"] = ["[Speaker]\n第一轮内容\n\n[CLI Agent]\n第一轮回复"]
+                r1 = ref.refine("口述1", session_key="sess-inc", tracker=tracker)  # type: ignore[arg-type]
+                cid1 = ref._threads[("sess-inc", "agent")].conversation_id
+                self.assertEqual(r1.used_fallback, "")
+                self.assertTrue(cid1)
+
+                # Turn 2 (sess-inc): tail grows in-place -> MUST reuse cid1 & send ONLY delta!
+                tracker.chunks_by_key["sess-inc"] = [
+                    "[Speaker]\n第一轮内容\n\n[CLI Agent]\n第一轮回复\n\n[Speaker]\n第二轮新增"
+                ]
+                r2 = ref.refine("口述2", session_key="sess-inc", tracker=tracker)  # type: ignore[arg-type]
+                self.assertEqual(r2.used_fallback, "")
+                self.assertEqual(ref._threads[("sess-inc", "agent")].conversation_id, cid1)
+                self.assertEqual(ref._threads[("sess-inc", "agent")].turn_count, 2)
+
+                # Turn 3 (sess-inc): sealed chunk 0 + new chunk 1 -> STILL reuses cid1!
+                tracker.chunks_by_key["sess-inc"] = [
+                    "[Speaker]\n第一轮内容\n\n[CLI Agent]\n第一轮回复\n\n[Speaker]\n第二轮新增",
+                    "[Speaker]\n新块内容A",
+                ]
+                r3 = ref.refine("口述3", session_key="sess-inc", tracker=tracker)  # type: ignore[arg-type]
+                self.assertEqual(r3.used_fallback, "")
+                self.assertEqual(ref._threads[("sess-inc", "agent")].conversation_id, cid1)
+                self.assertEqual(ref._threads[("sess-inc", "agent")].turn_count, 3)
+
+                # Turn 4 (sess-inc): chunk 1 tail grows -> STILL reuses cid1 (turn 4/4)!
+                tracker.chunks_by_key["sess-inc"] = [
+                    "[Speaker]\n第一轮内容\n\n[CLI Agent]\n第一轮回复\n\n[Speaker]\n第二轮新增",
+                    "[Speaker]\n新块内容A\n\n[CLI Agent]\n新块回复B",
+                ]
+                r4 = ref.refine("口述4", session_key="sess-inc", tracker=tracker)  # type: ignore[arg-type]
+                self.assertEqual(r4.used_fallback, "")
+                self.assertEqual(ref._threads[("sess-inc", "agent")].conversation_id, cid1)
+                self.assertEqual(ref._threads[("sess-inc", "agent")].turn_count, 4)
+
+                # Turn 5 (sess-inc): hits max_turns_per_thread=4 -> MUST open fresh session/new!
+                r5 = ref.refine("口述5满轮", session_key="sess-inc", tracker=tracker)  # type: ignore[arg-type]
+                cid2 = ref._threads[("sess-inc", "agent")].conversation_id
+                self.assertEqual(r5.used_fallback, "")
+                self.assertNotEqual(cid2, cid1)
+                self.assertEqual(ref._threads[("sess-inc", "agent")].turn_count, 1)
+
+                # Turn 6 (sess-inc): context rollback (chunk 0 altered) -> MUST open fresh session/new!
+                tracker.chunks_by_key["sess-inc"] = ["[Speaker]\n被回滚重写的新历史"]
+                r6 = ref.refine("口述6回滚", session_key="sess-inc", tracker=tracker)  # type: ignore[arg-type]
+                cid3 = ref._threads[("sess-inc", "agent")].conversation_id
+                self.assertEqual(r6.used_fallback, "")
+                self.assertNotEqual(cid3, cid2)
+
+                # Turn 7 (other session): switching session_key -> independent conversation_id
+                tracker.chunks_by_key["sess-other"] = ["[Speaker]\n另一个项目会话"]
+                r7 = ref.refine("口述7切项目", session_key="sess-other", tracker=tracker)  # type: ignore[arg-type]
+                cid_other = ref._threads[("sess-other", "agent")].conversation_id
+                self.assertEqual(r7.used_fallback, "")
+                self.assertNotEqual(cid_other, cid3)
+            finally:
+                ref.close()
+
+            rpcs = [e for e in _read_jsonl(log_file) if e["event"] == "rpc"]
+            prompts_sent = [e["params"]["prompt"][0]["text"] for e in rpcs if e["method"] == "session/prompt"]
+            new_calls = [e for e in rpcs if e["method"] == "session/new"]
+            # Exactly 4 session/new calls: Turn 1 (initial), Turn 5 (max_turns), Turn 6 (rollback), Turn 7 (other session)
+            self.assertEqual(len(new_calls), 4)
+            # Turns 2, 3, 4 must all send [avi-refiner] prefix with delta only and NEVER repeat Turn 1 history
+            for p_delta in prompts_sent[1:4]:
+                self.assertTrue(p_delta.startswith("[avi-refiner]\n"))
+                self.assertNotIn("第一轮内容", p_delta)
+                self.assertNotIn("第一轮回复", p_delta)
+            self.assertIn("第二轮新增", prompts_sent[1])
+            self.assertIn("新块内容A", prompts_sent[2])
+            self.assertNotIn("第二轮新增", prompts_sent[2])
+            self.assertIn("新块回复B", prompts_sent[3])
+            self.assertNotIn("新块内容A", prompts_sent[3])
+
+    def test_agent_thought_chunk_observability_and_privacy(self) -> None:
+        self.assertIn("thought_chunks", _TELEMETRY_NUMERIC_FIELDS)
+        self.assertIn("thought_chars", _TELEMETRY_NUMERIC_FIELDS)
+
+        # 1. Normal zero-thought turn: thought_chunks/chars stay 0 and are omitted from telemetry summary
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, _, env = self._setup_fake_env(td)
+            ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy")), env=env, runtime_dir=rt_dir)
+            try:
+                r0 = ref.refine("零思考测试")
+                self.assertEqual(r0.used_fallback, "")
+                self.assertEqual((r0.thought_chunks, r0.thought_chars), (0, 0))
+                summ0 = build_pipeline_summary(1, PipelineResult(seq_id=1, ok=True, refined=r0, final_text=r0.text), dry_run=True)
+                self.assertNotIn("thought_chunks", summ0)
+                self.assertNotIn("thought_chars", summ0)
+            finally:
+                ref.close()
+
+        # 2. Streamed agent_thought_chunk counted accurately (ignoring other sessionId), zero content leaked
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, _, env = self._setup_fake_env(td, scenario="thought_chunks")
+            ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy")), env=env, runtime_dir=rt_dir)
+            try:
+                rt = ref.refine("带少量思考测试")
+                self.assertEqual(rt.used_fallback, "")
+                # "秘密思考片段一" (7 chars) + "secret_thought_2" (16 chars) = 23 chars across 2 chunks
+                self.assertEqual(rt.thought_chunks, 2)
+                self.assertEqual(rt.thought_chars, 23)
+                self.assertEqual(rt.reasoning_tokens, 0)
+                self.assertNotIn("秘密思考", rt.text)
+                self.assertNotIn("secret_thought_2", rt.text)
+                self.assertNotIn("SECRET_OTHER_SID_THOUGHT", rt.text)
+
+                summ = build_pipeline_summary(2, PipelineResult(seq_id=2, ok=True, refined=rt, final_text=rt.text), dry_run=True)
+                self.assertEqual(summ["thought_chunks"], 2)
+                self.assertEqual(summ["thought_chars"], 23)
+                dumped = json.dumps(summ, ensure_ascii=False)
+                self.assertNotIn("秘密思考", dumped)
+                self.assertNotIn("secret_thought_2", dumped)
+                self.assertNotIn("SECRET_OTHER_SID_THOUGHT", dumped)
+                flags = diagnose_record_flags(summ, is_first_for_session=True)
+                self.assertIn("THOUGHT(2/23c)", flags)
+                self.assertNotIn("REASONING_BLOAT", flags)
+            finally:
+                ref.close()
+
+        # 3. Heavy streamed thinking (>=400 chars) triggers REASONING_BLOAT even when usage.thoughtTokens == 0
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, _, env = self._setup_fake_env(td, scenario="thought_bloat")
+            ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy")), env=env, runtime_dir=rt_dir)
+            try:
+                rb = ref.refine("长思考告警测试")
+                self.assertEqual(rb.used_fallback, "")
+                self.assertEqual(rb.thought_chunks, 1)
+                self.assertEqual(rb.thought_chars, 500)
+                self.assertEqual(rb.reasoning_tokens, 0)
+                summ_b = build_pipeline_summary(3, PipelineResult(seq_id=3, ok=True, refined=rb, final_text=rb.text), dry_run=True)
+                self.assertIn("REASONING_BLOAT", diagnose_record_flags(summ_b, is_first_for_session=True))
+            finally:
+                ref.close()
 
 
 if __name__ == "__main__":

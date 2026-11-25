@@ -208,6 +208,8 @@ class RefinerResult:
     context_chunks: int = 0
     audio_tokens: int | None = None
     used_prior_session: bool = False
+    thought_chunks: int = 0
+    thought_chars: int = 0
 
 
 class _RefinerAttemptError(RuntimeError):
@@ -771,6 +773,7 @@ def _run_refiner_retry_loop(
     context_chunks: int = 0,
     used_prior_session: bool = False,
     cancel_token: CancelToken | None = None,
+    thought_stats_fn: Callable[[], tuple[int, int]] | None = None,
 ) -> RefinerResult:
     deadline = t0 + tsec
     max_retries = max(0, int(cfg.refiner.max_retries))
@@ -852,6 +855,9 @@ def _run_refiner_retry_loop(
                     f"Refiner HTTP response exceeded timeout budget ({tsec:.2f}s)",
                     retry_kind="transient",
                 )
+            thought_chunks, thought_chars = (
+                thought_stats_fn() if thought_stats_fn is not None else (0, 0)
+            )
             return RefinerResult(
                 _clean_out(out_txt, clean_draft),
                 provider_name,
@@ -866,6 +872,8 @@ def _run_refiner_retry_loop(
                 context_chars=context_chars,
                 context_chunks=context_chunks,
                 used_prior_session=used_prior_session,
+                thought_chunks=max(0, int(thought_chunks)),
+                thought_chars=max(0, int(thought_chars)),
             )
         except _RefinerAttemptError as err:
             if cancelled():
@@ -2914,8 +2922,68 @@ _AGY_NON_RETRYABLE_SOURCES: frozenset[str] = frozenset(
 )
 _AGY_MAX_THREADS = 64
 _AGY_MAX_LOADED_SESSIONS = 64
-# 15 min idle TTL covers normal coding/thinking pauses; sleep/shutdown still stops worker immediately.
-_AGY_IDLE_TTL_SEC: float = 900.0
+# 60 min idle TTL avoids frequent cold-boot stalls across work/thinking gaps; sleep/shutdown/errors still stop worker immediately.
+_AGY_IDLE_TTL_SEC: float = 3600.0
+_AGY_SESSION_REF_PREFIX = f'<session_reference_log read_only="true">\n{SESSION_REF_HEADER_BODY}'
+
+
+def _agy_should_probe_session_list(init_res: Mapping[str, Any]) -> bool:
+    caps = init_res.get("agentCapabilities")
+    if isinstance(caps, Mapping):
+        sess_caps = caps.get("sessionCapabilities")
+        if not isinstance(sess_caps, Mapping):
+            sess_caps = caps.get("session_capabilities")
+        if isinstance(sess_caps, Mapping):
+            return "list" in sess_caps
+    return True
+
+
+def _extract_session_ref_body(block: str) -> str | None:
+    if (
+        block.startswith(_AGY_SESSION_REF_PREFIX)
+        and block.endswith(SESSION_REF_SUFFIX)
+        and len(block) >= len(_AGY_SESSION_REF_PREFIX) + len(SESSION_REF_SUFFIX)
+    ):
+        return block[len(_AGY_SESSION_REF_PREFIX) : len(block) - len(SESSION_REF_SUFFIX)]
+    return None
+
+
+def _compute_agy_context_delta(
+    prev_blocks: tuple[str, ...], cur_blocks: Sequence[str]
+) -> tuple[bool, list[str]]:
+    """Return ``(can_resume, delta_blocks)`` for stateful AGY conversation continuation.
+
+    Sealed prefix blocks (including any ``<prior_session_reference>`` and sealed 50K chunks)
+    must match byte-for-byte; only the previously sent trailing ``<session_reference_log>``
+    chunk may grow append-only at a newline boundary (plus any newly opened chunks after it).
+    """
+    n_prev = len(prev_blocks)
+    if n_prev == 0:
+        return True, list(cur_blocks)
+    if len(cur_blocks) < n_prev:
+        return False, []
+    if tuple(cur_blocks[: n_prev - 1]) != prev_blocks[:-1]:
+        return False, []
+
+    prev_last = prev_blocks[-1]
+    cur_same = cur_blocks[n_prev - 1]
+    if cur_same == prev_last:
+        return True, list(cur_blocks[n_prev:])
+
+    prev_body = _extract_session_ref_body(prev_last)
+    cur_body = _extract_session_ref_body(cur_same)
+    if prev_body is None or cur_body is None or not cur_body.startswith(prev_body):
+        return False, []
+
+    tail_added = cur_body[len(prev_body) :]
+    if not tail_added.startswith("\n"):
+        return False, []
+
+    delta: list[str] = []
+    if formatted_tail := format_session_reference_chunk(tail_added):
+        delta.append(formatted_tail)
+    delta.extend(cur_blocks[n_prev:])
+    return True, delta
 
 
 class _AgyRpcError(RuntimeError):
@@ -3386,8 +3454,11 @@ class AgyRefiner(BaseRefiner):
         self._state_lock = threading.Lock()
         self._worker: _AgyWorker | None = None
         self._worker_busy = False
+        self._worker_is_prewarm = False
         self._idle_timer: threading.Timer | None = None
         self._idle_gen = 0
+        self._prewarm_active = 0
+        self._prewarm_threads: set[threading.Thread] = set()
 
     def _ensure_agent_workdir(self) -> Path:
         with self._workdir_lock:
@@ -3549,13 +3620,15 @@ class AgyRefiner(BaseRefiner):
         cancel_token: CancelToken | None = None,
         reuse_worker: bool = True,
         track_loaded_session: bool = True,
+        warm_backend: bool = False,
+        thought_stats_out: list[int] | None = None,
     ) -> tuple[str, str, str, _TokenUsageTuple, int]:
         """Run one ACP turn (reusing the warm ``agy acp`` worker when ``reuse_worker=True``)."""
         t_start = time.monotonic()
         timeout_s = max(0.0, float(timeout_sec))
         eff_deadline = float(deadline) if deadline is not None else (t_start + timeout_s)
         eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
-        use_reusable = reuse_worker and prompt_text is not None
+        use_reusable = bool(reuse_worker)
 
         def _is_aborted() -> bool:
             return self._closed or (eff_cancelled is not None and eff_cancelled())
@@ -3571,6 +3644,8 @@ class AgyRefiner(BaseRefiner):
         turn_ok = False
         active_prompt_sid: str | None = None
         text_chunks: list[str] = []
+        thought_chunks = 0
+        thought_chars = 0
         tools_by_id: dict[str, dict[str, Any]] = {}
         denied_calls: list[bool] = []
 
@@ -3632,7 +3707,7 @@ class AgyRefiner(BaseRefiner):
                     sent += n
 
         def _handle_server_msg(msg: Mapping[str, Any]) -> None:
-            nonlocal emergency_kill
+            nonlocal emergency_kill, thought_chunks, thought_chars
             if "id" in msg and "method" in msg:
                 method = msg.get("method")
                 if method == "session/request_permission":
@@ -3686,6 +3761,20 @@ class AgyRefiner(BaseRefiner):
                         chunk_txt = content.get("text")
                         if isinstance(chunk_txt, str):
                             text_chunks.append(chunk_txt)
+                elif st == "agent_thought_chunk":
+                    if active_prompt_sid is None:
+                        return
+                    msg_sid = params.get("sessionId")
+                    if not isinstance(msg_sid, str) or msg_sid != active_prompt_sid:
+                        return
+                    thought_chunks += 1
+                    content = upd.get("content")
+                    if isinstance(content, Mapping):
+                        t_txt = content.get("text")
+                        if isinstance(t_txt, str):
+                            thought_chars += len(t_txt)
+                    elif isinstance(content, str):
+                        thought_chars += len(content)
                 elif st in ("tool_call", "tool_call_update"):
                     tc_id = str(upd.get("toolCallId") or f"anon_{len(tools_by_id)}")
                     entry = tools_by_id.setdefault(tc_id, {"name": None})
@@ -3839,7 +3928,7 @@ class AgyRefiner(BaseRefiner):
                 abort_hook_id = cancel_token.register_abort(_on_abort)
 
             if not reused_worker:
-                _unwrap_rpc(
+                init_res = _unwrap_rpc(
                     _rpc_call(
                         "initialize",
                         {
@@ -3849,10 +3938,21 @@ class AgyRefiner(BaseRefiner):
                     ),
                     "initialize",
                 )
-                init_ms = max(0, int(round((time.monotonic() - t_start) * 1000)))
                 if prompt_text is None:
+                    if warm_backend and _agy_should_probe_session_list(init_res):
+                        list_resp = _rpc_call("session/list", {})
+                        list_err = list_resp.get("error")
+                        if list_err is not None:
+                            err_code = list_err.get("code") if isinstance(list_err, Mapping) else None
+                            if err_code != -32601:
+                                _unwrap_rpc(list_resp, "session/list")
+                    init_ms = max(0, int(round((time.monotonic() - t_start) * 1000)))
                     turn_ok = True
                     return "", "", "", _EMPTY_USAGE, init_ms
+                init_ms = max(0, int(round((time.monotonic() - t_start) * 1000)))
+            elif prompt_text is None:
+                turn_ok = True
+                return "", "", "", _EMPTY_USAGE, 0
 
             effort_key = f"{requested_effort}:{'1' if effort_explicit else '0'}"
             loaded_entry = worker.loaded_sessions.get(conversation_id) if conversation_id else None
@@ -3972,6 +4072,9 @@ class AgyRefiner(BaseRefiner):
             if not out_text:
                 raise _AgyRpcError("agy returned an empty answer", source="empty")
             usage = _agy_convert_usage(prompt_res.get("usage"))
+            if thought_stats_out is not None and len(thought_stats_out) >= 2:
+                thought_stats_out[0] = thought_chunks
+                thought_stats_out[1] = thought_chars
             turn_ok = True
             return out_text, sid, resolved_model, usage, init_ms
         finally:
@@ -3982,6 +4085,95 @@ class AgyRefiner(BaseRefiner):
                     worker.stop(fast=emergency_kill or _is_aborted())
                 elif not turn_ok or emergency_kill or _is_aborted():
                     self._discard_worker(worker, fast=True)
+
+    def prepare_session(self, session_key: str = "") -> None:
+        """Asynchronously prewarm ``agy acp`` worker + read-only backend boot (``initialize`` + ``session/list``)."""
+        if self._closed or self._idle_ttl_sec <= 0:
+            return
+        with self._state_lock:
+            if (
+                self._closed
+                or self._prewarm_active > 0
+                or self._worker_busy
+                or (self._worker is not None and self._worker.is_alive())
+            ):
+                return
+            self._prewarm_active += 1
+        th = threading.Thread(target=self._run_prewarm, name="avi-agy-prewarm", daemon=True)
+        with self._state_lock:
+            if self._closed:
+                self._prewarm_active = max(0, self._prewarm_active - 1)
+                return
+            self._prewarm_threads.add(th)
+        try:
+            th.start()
+        except Exception:
+            with self._state_lock:
+                self._prewarm_threads.discard(th)
+                self._prewarm_active = max(0, self._prewarm_active - 1)
+
+    def _run_prewarm(self) -> None:
+        worker_lock_acquired = False
+        worker_busy_marked = False
+        keep_worker = False
+        try:
+            if self._closed or self._idle_ttl_sec <= 0:
+                return
+            agy_bin = find_agy_bin(self.env)
+            if not agy_bin or self._closed:
+                return
+            if not self._worker_lock.acquire(blocking=False):
+                return
+            worker_lock_acquired = True
+            with self._state_lock:
+                if (
+                    self._closed
+                    or self._idle_ttl_sec <= 0
+                    or (self._worker is not None and self._worker.is_alive())
+                ):
+                    return
+                self._cancel_idle_timer_locked()
+                self._worker_busy = True
+                self._worker_is_prewarm = True
+                worker_busy_marked = True
+            workdir = self._ensure_agent_workdir()
+            prewarm_timeout = min(15.0, max(5.0, float(self.cfg.refiner.timeout_sec)))
+            self._run_acp_session(
+                agy_bin=agy_bin,
+                workdir=workdir,
+                timeout_sec=prewarm_timeout,
+                prompt_text=None,
+                reuse_worker=True,
+                warm_backend=True,
+            )
+            keep_worker = not self._closed and self._idle_ttl_sec > 0
+        except Exception:
+            pass
+        finally:
+            try:
+                if worker_busy_marked:
+                    worker_to_stop: _AgyWorker | None = None
+                    stop_fast = not keep_worker
+                    with self._state_lock:
+                        self._worker_busy = False
+                        self._worker_is_prewarm = False
+                        if keep_worker and not self._closed and self._worker is not None:
+                            if not self._arm_idle_timer_locked():
+                                worker_to_stop = self._worker
+                                self._worker = None
+                                stop_fast = False
+                        else:
+                            self._cancel_idle_timer_locked()
+                            worker_to_stop = self._worker
+                            self._worker = None
+                    if worker_to_stop is not None:
+                        worker_to_stop.stop(fast=stop_fast)
+            finally:
+                if worker_lock_acquired:
+                    self._worker_lock.release()
+                with self._state_lock:
+                    self._prewarm_active = max(0, self._prewarm_active - 1)
+                    self._prewarm_threads.discard(threading.current_thread())
 
     def probe_ping(self, *, timeout_sec: float = 5.0) -> tuple[str, int, str]:
         """Lightweight ``agy acp`` ``initialize`` handshake probe (zero model prompt / zero quota)."""
@@ -4134,6 +4326,7 @@ class AgyRefiner(BaseRefiner):
         worker_busy_marked = False
         keep_worker = False
         pending_thread_commit: list[tuple[str, int]] = []
+        thought_stats_box: list[int] = [0, 0]
         try:
             if lock_err := _agy_acquire_lock_until(
                 self._worker_lock, overall_deadline, self.clock_fn, _is_aborted
@@ -4152,6 +4345,8 @@ class AgyRefiner(BaseRefiner):
                 req_timeout: float, _wall_dl: float | None, _is_first: bool
             ) -> tuple[str, _TokenUsageTuple, int]:
                 pending_thread_commit.clear()
+                thought_stats_box[0] = 0
+                thought_stats_box[1] = 0
                 attempt_deadline = min(overall_deadline, self.clock_fn() + req_timeout)
                 full_prompt = (
                     f"{_AGY_PROMPT_PREFIX}{sys_prompt}\n\n"
@@ -4159,21 +4354,23 @@ class AgyRefiner(BaseRefiner):
                 )
                 resume_cid = ""
                 prev_turns = 0
-                prev_sent: tuple[str, ...] = ()
+                delta_blocks: list[str] = []
                 if thread_state is not None:
-                    can_resume = (
+                    can_resume_meta = (
                         bool(thread_state.conversation_id)
                         and thread_state.turn_count < max_turns
                         and thread_state.model == requested_model
                         and thread_state.effort == effort_key
                         and thread_state.prompt_hash == prompt_hash
-                        and len(context_blocks) >= len(thread_state.sent_blocks)
-                        and tuple(context_blocks[: len(thread_state.sent_blocks)]) == thread_state.sent_blocks
                     )
-                    if can_resume:
-                        resume_cid = thread_state.conversation_id
-                        prev_turns = thread_state.turn_count
-                        prev_sent = thread_state.sent_blocks
+                    if can_resume_meta:
+                        ctx_ok, computed_delta = _compute_agy_context_delta(
+                            thread_state.sent_blocks, context_blocks
+                        )
+                        if ctx_ok:
+                            resume_cid = thread_state.conversation_id
+                            prev_turns = thread_state.turn_count
+                            delta_blocks = computed_delta
                     # Clear before running ACP so any timeout/cancel/EOF/RPC failure never leaves a dirty thread behind.
                     thread_state.conversation_id = ""
                     thread_state.turn_count = 0
@@ -4191,7 +4388,6 @@ class AgyRefiner(BaseRefiner):
                 track_sess = thread_state is not None
                 try:
                     if resume_cid:
-                        delta_blocks = context_blocks[len(prev_sent) :]
                         resume_prompt = f"{_AGY_PROMPT_PREFIX}" + "\n\n".join((*delta_blocks, final_block))
                         try:
                             out_txt, sid, res_mod, usage, init_ms = self._run_acp_session(
@@ -4207,11 +4403,14 @@ class AgyRefiner(BaseRefiner):
                                 is_cancelled=is_cancelled,
                                 cancel_token=cancel_token,
                                 track_loaded_session=track_sess,
+                                thought_stats_out=thought_stats_box,
                             )
                             resumed = True
                         except _AgyRpcError as exc:
                             if exc.source != "conversation":
                                 raise
+                            thought_stats_box[0] = 0
+                            thought_stats_box[1] = 0
                             out_txt, sid, res_mod, usage, init_ms = self._run_acp_session(
                                 agy_bin=agy_bin,
                                 workdir=workdir,
@@ -4225,6 +4424,7 @@ class AgyRefiner(BaseRefiner):
                                 is_cancelled=is_cancelled,
                                 cancel_token=cancel_token,
                                 track_loaded_session=track_sess,
+                                thought_stats_out=thought_stats_box,
                             )
                             resumed = False
                     else:
@@ -4241,6 +4441,7 @@ class AgyRefiner(BaseRefiner):
                             is_cancelled=is_cancelled,
                             cancel_token=cancel_token,
                             track_loaded_session=track_sess,
+                            thought_stats_out=thought_stats_box,
                         )
                         resumed = False
                 except _AgyRpcError as exc:
@@ -4272,6 +4473,7 @@ class AgyRefiner(BaseRefiner):
                 context_chunks=ctx_chunks,
                 used_prior_session=used_prior,
                 cancel_token=cancel_token,
+                thought_stats_fn=lambda: (thought_stats_box[0], thought_stats_box[1]),
             )
             succeeded = (
                 not res.used_fallback
@@ -4316,14 +4518,19 @@ class AgyRefiner(BaseRefiner):
                     thread_state.lock.release()
 
     def evict_connections(self) -> int:
-        """Stop any idle reusable ``agy acp`` worker (e.g. on system ``power_resume``)."""
+        """Stop any idle (or background prewarming) reusable ``agy acp`` worker (e.g. on ``power_resume``)."""
         with self._state_lock:
             self._cancel_idle_timer_locked()
-            if self._worker is None or self._worker_busy:
+            if self._worker is None or (self._worker_busy and not self._worker_is_prewarm):
                 return 0
             worker = self._worker
             self._worker = None
-        worker.stop(fast=False)
+            was_prewarm = self._worker_is_prewarm
+        if was_prewarm:
+            worker.abort()
+            worker.stop(fast=True)
+        else:
+            worker.stop(fast=False)
         return 1
 
     def close(self) -> None:
@@ -4332,6 +4539,7 @@ class AgyRefiner(BaseRefiner):
             self._cancel_idle_timer_locked()
             worker = self._worker
             self._worker = None
+            prewarm_threads = list(self._prewarm_threads)
         if worker is not None:
             worker.abort()
             worker.stop(fast=True)
@@ -4340,6 +4548,10 @@ class AgyRefiner(BaseRefiner):
             self._active_procs.clear()
         for proc in procs:
             _agy_stop_process_group(proc, fast=True)
+        cur = threading.current_thread()
+        for th in prewarm_threads:
+            if th is not cur and th.is_alive():
+                th.join(timeout=1.0)
 
 
 def create_refiner(

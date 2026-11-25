@@ -116,8 +116,16 @@ def diagnose_record_flags(rec: Mapping[str, Any], *, is_first_for_session: bool)
         if (100.0 * cached_tok / in_tok) < 30.0:
             flags.append("CACHE_MISS")
     rsn_tok = rec.get("reasoning_tokens")
-    if isinstance(rsn_tok, int) and rsn_tok >= 256:
+    thought_chars = rec.get("thought_chars")
+    thought_chunks = rec.get("thought_chunks")
+    if (isinstance(rsn_tok, int) and rsn_tok >= 256) or (
+        isinstance(thought_chars, int) and thought_chars >= 400
+    ):
         flags.append("REASONING_BLOAT")
+    elif (isinstance(thought_chunks, int) and thought_chunks > 0) or (
+        isinstance(thought_chars, int) and thought_chars > 0
+    ):
+        flags.append(f"THOUGHT({int(thought_chunks or 0)}/{int(thought_chars or 0)}c)")
     return flags
 
 
@@ -144,6 +152,8 @@ _TELEMETRY_NUMERIC_FIELDS: frozenset[str] = frozenset(
         "cached_input_tokens",
         "output_tokens",
         "reasoning_tokens",
+        "thought_chunks",
+        "thought_chars",
         "cache_hit_pct",
         "audio_tokens",
         "asr_input_tokens",

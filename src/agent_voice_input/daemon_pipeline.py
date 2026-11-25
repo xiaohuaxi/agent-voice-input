@@ -258,6 +258,9 @@ def build_pipeline_summary(
         summary["is_single_hop_refined"] = True
     if res.refined and res.refined.audio_tokens is not None:
         summary["audio_tokens"] = res.refined.audio_tokens
+    if res.refined and (res.refined.thought_chunks > 0 or res.refined.thought_chars > 0):
+        summary["thought_chunks"] = res.refined.thought_chunks
+        summary["thought_chars"] = res.refined.thought_chars
     if (
         res.asr
         and (res.asr.input_tokens is not None or res.asr.audio_tokens is not None)
@@ -1217,7 +1220,8 @@ def _execute_stage1(
     )
 
     if (
-        not (cancel_check is not None and cancel_check())
+        audio_source != "selftest_wav"
+        and not (cancel_check is not None and cancel_check())
         and _may_run_stage2_refiner(cfg, eff_refiner, eff_asr)
         and (prep_fn := getattr(eff_refiner, "prepare_session", None)) is not None
     ):

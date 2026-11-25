@@ -83,6 +83,7 @@ from .daemon_pipeline import (
     _existing_recoverable_retry_audio,
     _is_single_hop_asr_provider,
     _make_desktop_same_window_verifier,
+    _may_run_stage2_refiner,
     _resolve_effective_ui_language,
     _resolve_pipeline_window_routing,
     _resolve_stage1_context,
@@ -1058,6 +1059,14 @@ class VoiceInputDaemon:
                         return {"ok": False, "ignored": "stopping", "state": stop_st_end, "seq_id": cur_seq}
                     if not eff_loopback and not win_now.origin_drifted:
                         self._maybe_prefetch_remote(win_now, seq_id=cur_seq)
+                    if (
+                        _may_run_stage2_refiner(self.cfg, self.refiner, self.asr_provider)
+                        and (prep_fn := getattr(self.refiner, "prepare_session", None)) is not None
+                    ):
+                        try:
+                            prep_fn("")
+                        except Exception:
+                            pass
                     self._arm_max_duration_timer(cur_seq)
                     return {"ok": True, "state": "recording", "seq_id": cur_seq}
                 except Exception as exc:
