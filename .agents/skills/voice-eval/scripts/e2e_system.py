@@ -515,8 +515,6 @@ class HeadlessTmuxPlatform:
             title=f"codex · avi [codex:#{session_id[:8]}]",
             tty=pane_tty,
             cwd=str(_REPO_ROOT),
-            tmux_socket=tmux_sock_path,
-            tmux_pane=tmux_pane,
         )
         self._wav_queue: deque[bytes] = deque()
         self._cur_wav: bytes = b""
@@ -1368,8 +1366,6 @@ def main(argv: list[str] | None = None) -> int:
                         title=f"codex · non-git-workspace [codex:#{ng_sid[:8]}]",
                         tty=pane_tty,
                         cwd=str(non_git_dir),
-                        tmux_socket=tmux_sock_path,
-                        tmux_pane=pane_id,
                     )
                 )
                 ng1_wav = Path(non_git_item["wav_path"]).read_bytes()
@@ -1457,8 +1453,6 @@ def main(argv: list[str] | None = None) -> int:
                         title="ubuntu@prod-bastion.invalid:~",
                         tty="",
                         cwd="",
-                        tmux_socket=tmux_sock_path,
-                        tmux_pane=pane_id,
                     )
                 )
                 _ssh1_seq, rec_ssh1, asr_ssh1, fin_ssh1 = _run_daemon_probe_utterance(ng2_wav)
