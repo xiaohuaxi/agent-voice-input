@@ -9173,6 +9173,7 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
         ps1_text = SHIM_SCRIPT.read_text(encoding="ascii")
         compile_err_block = ps1_text.split("if ($cr.Errors.HasErrors) {", 1)[1].split("} elseif (Test-Path -LiteralPath $tmpDll) {", 1)[0]
         self.assertIn('"CS0016"', compile_err_block)
+        self.assertIn('"CS1567"', compile_err_block)
         self.assertIn("$onlyOutputWriteErr", compile_err_block)
         cs0016_branch, real_err_branch = compile_err_block.split("if ($hasNonWarningErr -and $onlyOutputWriteErr) {", 1)[1].split("} else {", 1)
         self.assertIn("falling back to uncached Add-Type", cs0016_branch)

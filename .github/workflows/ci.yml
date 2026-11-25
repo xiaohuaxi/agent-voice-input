@@ -469,7 +469,7 @@ jobs:
               timeout=30,
           )
           assert proc.returncode == 0, f"ro-cache self-check failed rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
-          assert "CS0016" in proc.stderr, f"expected CS0016 fallback warning in stderr, got: {proc.stderr!r}"
+          assert ("CS0016" in proc.stderr or "CS1567" in proc.stderr), f"expected CS0016/CS1567 fallback warning in stderr, got: {proc.stderr!r}"
           lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
           payload = json.loads(lines[-1])
           assert payload.get("ok") is True and payload.get("mode") == "self-check" and payload.get("cache_hit") is False, payload

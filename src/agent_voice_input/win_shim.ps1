@@ -139,7 +139,8 @@ if (-not ('VoiceWinShim' -as [type])) {
                         foreach ($ce in $cr.Errors) {
                             if (-not $ce.IsWarning) {
                                 $hasNonWarningErr = $true
-                                if (-not [string]::Equals($ce.ErrorNumber, "CS0016", [StringComparison]::OrdinalIgnoreCase)) {
+                                $isOutWriteErr = [string]::Equals($ce.ErrorNumber, "CS0016", [StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($ce.ErrorNumber, "CS1567", [StringComparison]::OrdinalIgnoreCase)
+                                if (-not $isOutWriteErr) {
                                     $onlyOutputWriteErr = $false
                                 }
                                 if ($errMsgs.Count -lt 8) {
@@ -149,7 +150,7 @@ if (-not ('VoiceWinShim' -as [type])) {
                             }
                         }
                         if ($hasNonWarningErr -and $onlyOutputWriteErr) {
-                            [Console]::Error.WriteLine("win_shim cache write failed (CS0016), falling back to uncached Add-Type: " + ($errMsgs.ToArray() -join "; "))
+                            [Console]::Error.WriteLine("win_shim cache write failed (CS0016/CS1567), falling back to uncached Add-Type: " + ($errMsgs.ToArray() -join "; "))
                         } else {
                             $csCompileError = ($errMsgs.ToArray() -join "; ")
                         }
