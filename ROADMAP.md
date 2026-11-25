@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前已发布基线**：`v0.15.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
+> **当前已发布基线**：`v0.16.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
 >
 > **工程规范与上下文路由架构**：[AGENTS.md](AGENTS.md) · [docs/context-routing.md](docs/context-routing.md)
 
@@ -52,7 +52,21 @@
 
 ---
 
-### 最新发版里程碑（`已发布 · v0.15.0`）
+### 最新发版里程碑（`已发布 · v0.16.0`）
+
+以下一键安全集成命令、开箱与 CLI UX 升级、`AgyRefiner` 预热与增量续接提速及 Stage 3A 平台录音生命周期复评结案已在 `v0.16.0` 完成落地并正式发布：
+
+1. **官方一键安全集成（`agent-voice-input integrate`）与开箱体验升级**：
+   - 新增 `agent-voice-input integrate`（`--status`/`--dry-run`/`--cli`/`--uninstall`/`--json`），覆盖 Claude Code、Codex 与 Antigravity（`agy`），支持 dotfiles 软链写回真身、`~/.cache` 隔离备份、Codex TOML 保注释修补与卸载安全内联命令；
+   - 升级环境感知非交互 `init`（MacBook 自动 `ROption`、台式 Mac 保持 `RControl`，支持 `--asr`/`--refiner`/`--hotkey` 与已配 Key/Codex 摘要）、修复 `doctor` 漏检 Codex `[tui].terminal_title` 与 `CODEX_HOME` 一致性并补齐 `--json` `hooks`/`[keys]`/`Next:`、将 `start`/`restart`/`stop`/`init` 重排为 10 列对齐短标签块与两行对齐 `integrate` 兜底提示；后置 `ASR_AUTO_PRIORITY` 中 `openrouter` 并将 OpenRouter 默认精修模型升至 `google/gemini-3.8-flash`；双语 README 首屏改版 60 秒路径并新增 `docs/agent-setup.md`。
+2. **`AgyRefiner` 预热、增量续接与零正文思考观测**：
+   - 将 `agy acp` 常驻 worker 空闲 TTL 放宽至 `60m`，新增基于纯只读 `session/list` 的无副作用异步预热（录音与 ASR 双触发），支持同会话末尾活跃块追加增长及跨 `50K` 封口续接复用同一 `conversation_id`，并补充 `agent_thought_chunk` 零正文纯计数观测。
+3. **Stage 3A 平台录音生命周期复评结案与 WSL 护栏**：
+   - 补齐双端状态不变量与锁序文档，为 `WslPlatform.stop_recording()` 增加 `_expected_gen` 错代保护与 `cancel_recording()` 强杀前 writer 归属复核，完成 Stage 3A 架构复评结案。
+
+---
+
+### 已归档里程碑（`已发布 · v0.15.0`）
 
 以下 Claude 桌面版（macOS）本地会话绑定、剪贴板单所有权语音优先与防阻塞重构、桥接单写入/录音所有权收口以及核心模块与原生 Shim 多文件拆分已在 `v0.15.0` 完成落地并正式发布：
 
@@ -187,7 +201,7 @@
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
 
-`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.15.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
+`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.16.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
 
 1. **外部用户零门槛开箱**：仅配置任意单一支持语音转写的主流渠道 API Key（可自动搭配本地 CLI 登录态或独立二阶段凭据），即可通过 `init` 与 `doctor --ping` 完成体检并稳定投入日常使用。
 2. **全场景安全投递与零串台**：本地终端、跨机 SSH 远端 Linux、主流桌面 IDE、普通桌面 GUI 应用与远程桌面自动让行均长期稳定运行；跨场景上下文严格隔离，系统剪贴板零意外污染，全链路严守不自动发送回车。

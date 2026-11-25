@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-25
+
+### Added
+- **One-click CLI agent integration (`agent-voice-input integrate`)**: Added `agent-voice-input integrate` (`--status`, `--dry-run`, `--cli`, `--uninstall`, `--json`) for Claude Code, Codex, and Antigravity (`agy`), featuring dotfiles symlink target resolution, isolated `~/.cache` backups, comment-preserving Codex TOML patching, and uninstall-safe inline hook commands.
+- **Dedicated agent integration guide & redesigned 60-second quickstart**: Added `docs/agent-setup.md`, synced bilingual `integrations/` templates, and moved the 60-second quickstart path above the fold in `README.md` and `README.zh-CN.md`.
+
+### Changed
+- **Environment-aware `init`, aligned CLI UX & updated provider defaults**: Upgraded non-interactive `agent-voice-input init` to pick `ROption` on MacBooks while keeping `RControl` on desktop Macs (e.g., Mac mini), support `--asr`/`--refiner`/`--hotkey`, and summarize detected API keys and Codex login; realigned `start`/`restart`/`stop`/`init` output into 10-column label blocks with a 2-line aligned `integrate` fallback hint for missing hooks or ambiguous environments; deprioritized `openrouter` in `ASR_AUTO_PRIORITY` and upgraded OpenRouter's default refiner model to `google/gemini-3.8-flash`.
+- **`AgyRefiner` prewarming, `60m` idle TTL, tail-growing session reuse & thought-chunk telemetry**: Extended the `agy acp` resident worker idle TTL to `60m`, added side-effect-free asynchronous prewarming via read-only `session/list` (triggered at both recording start and ASR start), enabled reusing the same `conversation_id` across active tail-block growth and `50K` sealed-block continuations, and added zero-text count-only telemetry for `agent_thought_chunk`.
+
+### Fixed
+- **`doctor` Codex hook checks & JSON output completeness**: Fixed `doctor` omitting Codex `[tui].terminal_title` checks and `CODEX_HOME` consistency validation, and added `hooks`, `[keys]`, and `Next:` guidance to `doctor` / `--json` output.
+- **Stage 3A platform recording lifecycle review & WSL recording guards**: Closed the Stage 3A platform recording lifecycle review with cross-platform state-invariant and lock-order documentation, `_expected_gen` stale-generation protection in `WslPlatform.stop_recording()`, and writer-ownership verification before forced kills in `cancel_recording()`.
+
 ## [0.15.0] - 2026-11-25
 
 ### Added
@@ -204,7 +218,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Initial WSL2 release**: Two-stage context-aware voice input daemon and CLI for coding agents (**Codex**, **Claude Code**, **AGY**) on Windows + WSL2, featuring native `win_shim.ps1` WASAPI capture, global hotkey & HUD bridge, active terminal session discovery, `ffmpeg` loudness normalization with local silence gating, and safe paste without auto-pressing `Enter`.
 
-[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.12.0...v0.13.0
