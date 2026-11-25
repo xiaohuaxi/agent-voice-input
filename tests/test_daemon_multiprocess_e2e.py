@@ -771,8 +771,9 @@ if _SYNC:
                 0,
                 f"cli start failed rc={p_start.returncode} stdout={p_start.stdout!r} stderr={p_start.stderr!r}",
             )
-            self.assertIn("started (pid=", p_start.stdout)
-            self.assertIn("[pipeline]", p_start.stdout)
+            self.assertIn("Daemon    started (pid=", p_start.stdout)
+            self.assertIn("ASR       ", p_start.stdout)
+            self.assertIn("Refiner   ", p_start.stdout)
             self.assertNotIn("ResourceWarning", p_start.stderr)
 
             log_path = rt_dir / "daemon.log"
@@ -836,8 +837,9 @@ if _SYNC:
                 0,
                 f"cli restart failed rc={p_rst.returncode} stdout={p_rst.stdout!r} stderr={p_rst.stderr!r}",
             )
-            self.assertIn("stopped", p_rst.stdout)
-            self.assertIn("started (pid=", p_rst.stdout)
+            self.assertIn("Daemon    restarted (pid=", p_rst.stdout)
+            self.assertIn(f"pid={pid1} -> ", p_rst.stdout)
+            self.assertIn("ASR       ", p_rst.stdout)
             self.assertNotIn("ResourceWarning", p_rst.stderr)
 
             starts2 = _read_starts()

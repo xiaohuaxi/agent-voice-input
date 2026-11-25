@@ -572,6 +572,14 @@ def compute_package_build_id(pkg_dir: Path | None = None) -> str:
     return h.hexdigest()[:12]
 
 
+def _parse_version_tuple(ver: str) -> tuple[int, ...] | None:
+    core = ver.strip().split("-", 1)[0].split("+", 1)[0]
+    parts = core.split(".")
+    if not parts or any(not p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
 def describe_daemon_drift(
     daemon_status: Mapping[str, Any],
     *,
@@ -585,12 +593,13 @@ def describe_daemon_drift(
     ver_diff = bool(run_ver and run_ver != current_version)
     bid_diff = bool(run_bid and cur_bid and run_bid != cur_bid)
     drifted = ver_diff or bid_diff
-    if ver_diff and bid_diff:
-        reason = f"version/code mismatch (running={run_ver}/{run_bid}, current={current_version}/{cur_bid})"
-    elif ver_diff:
-        reason = f"version mismatch (running={run_ver}, current={current_version})"
+    if ver_diff:
+        rv = _parse_version_tuple(run_ver)
+        cv = _parse_version_tuple(current_version)
+        verb = "upgraded" if (rv is not None and cv is not None and cv > rv) else "changed"
+        reason = f"version {verb} ({run_ver} -> {current_version})"
     elif bid_diff:
-        reason = f"code changed (running={run_bid}, current={cur_bid})"
+        reason = f"code updated on disk ({run_bid} -> {cur_bid})"
     else:
         reason = ""
     return {

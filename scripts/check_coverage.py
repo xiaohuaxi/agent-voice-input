@@ -59,6 +59,7 @@ TIER_2_MODULES: tuple[str, ...] = (
     "remote_ssh",
     "workspace_ctx",
     "session_title",
+    "integrate",
     "_tmux",
     "audio_proc",
 )

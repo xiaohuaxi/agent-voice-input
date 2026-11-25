@@ -91,11 +91,11 @@ VALID_REFINER_EFFORTS = VALID_EFFORTS
 ASR_AUTO_PRIORITY: tuple[str, ...] = (
     "dashscope",
     "doubao",
-    "openrouter",
-    "gemini",
-    "openai",
     "deepseek",
+    "openai",
+    "gemini",
     "groq",
+    "openrouter",
     "siliconflow",
 )
 
@@ -128,7 +128,7 @@ DEFAULT_REFINER_MODELS: dict[str, str] = {
     "deepseek": "deepseek-flash",
     "dashscope": "qwen3.8-flash",
     "volcengine": "doubao-seed-2-0-mini-260428",
-    "openrouter": "google/gemini-3.5-flash-lite",
+    "openrouter": "google/gemini-3.8-flash",
     "gemini": "gemini-3.7-flash",
     "openai": "gpt-6-luna",
     "groq": "llama-3.3-70b-versatile",

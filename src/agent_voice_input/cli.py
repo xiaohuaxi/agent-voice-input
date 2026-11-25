@@ -1,8 +1,8 @@
-"""CLI entrypoint for agent-voice-input (init, daemon, start, restart, stop, status, toggle, cancel, once, retry, hotwords, doctor, diagnose, key-test, session-hook)."""
+"""CLI entrypoint for agent-voice-input (init, integrate, daemon, start, restart, stop, status, toggle, cancel, once, retry, hotwords, doctor, diagnose, key-test, session-hook)."""
 from __future__ import annotations
 
-import argparse, dataclasses, errno, fcntl, json, locale, os, shlex, signal, socket, stat, subprocess, sys, time
-from collections.abc import Mapping
+import argparse, dataclasses, errno, fcntl, json, locale, os, shlex, shutil, signal, socket, stat, subprocess, sys, time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -12,57 +12,68 @@ if TYPE_CHECKING:
     from .config import Config, ProviderCredentials
     from .http_transport import HttpTransport
 
-_INIT_CONFIG_TOML = """\
-# agent-voice-input configuration (chmod 600)
-# Priority: CLI flags > config.toml > built-in defaults
 
-[hotkey]
-# Default Right Ctrl ("RControl"); also supports "ROption"/"RAlt", "Fn" (macOS), "F13".."F20", etc.
-# Note: MacBook built-in keyboards lack a Right Ctrl key — macOS laptop users can switch to "ROption" or "Fn".
-key = "RControl"
-# "tap_toggle" (tap to start/finish) | "ptt" (hold to speak, release to transcribe)
-trigger_mode = "tap_toggle"
+def _render_init_config_toml(
+    *,
+    hotkey: str = "RControl",
+    asr_provider: str = "auto",
+    refiner_provider: str = "auto",
+) -> str:
+    return (
+        "# agent-voice-input configuration (chmod 600)\n"
+        "# Priority: CLI flags > config.toml > built-in defaults\n\n"
+        "[hotkey]\n"
+        '# Default Right Ctrl ("RControl"); also supports "ROption"/"RAlt", "Fn" (macOS), "F13".."F20", etc.\n'
+        '# Note: MacBook built-in keyboards lack a Right Ctrl key — macOS laptop users can switch to "ROption" or "Fn".\n'
+        f'key = "{hotkey}"\n'
+        '# "tap_toggle" (tap to start/finish) | "ptt" (hold to speak, release to transcribe)\n'
+        'trigger_mode = "tap_toggle"\n\n'
+        "[asr]\n"
+        '# "auto" selects the first configured API key: dashscope -> doubao -> deepseek -> openai -> gemini -> groq -> openrouter -> siliconflow\n'
+        f'provider = "{asr_provider}"\n\n'
+        "[refiner]\n"
+        '# "auto" prefers local `codex` login, then configured API keys (deepseek -> dashscope -> gemini -> openrouter -> ...), or falls back to "off"\n'
+        f'provider = "{refiner_provider}"\n'
+    )
 
-[asr]
-# "auto" selects the first configured API key: dashscope -> doubao -> openrouter -> gemini -> openai -> deepseek -> groq -> siliconflow
-provider = "auto"
 
-[refiner]
-# "auto" prefers local `codex` login, then configured API keys (deepseek -> dashscope -> gemini -> openrouter -> ...), or falls back to "off"
-provider = "auto"
-"""
+_INIT_CONFIG_TOML = _render_init_config_toml()
 
 _INIT_ENV_TEMPLATE = """\
 # agent-voice-input API credentials (chmod 600)
-# For cloud ASR, uncomment and fill in AT LEAST ONE Stage 1 speech recognition key below
+# For cloud ASR, uncomment and fill in 1 Stage 1 speech recognition key below
 # (local loopback openai-compatible ASR endpoints need no API key):
 
-# === Stage 1: Speech Recognition (REQUIRED for cloud ASR — uncomment at least one; local loopback openai-compatible ASR needs no key) ===
-# (DashScope, OpenAI, DeepSeek, Groq, OpenRouter, Gemini, and SiliconFlow can also handle Stage 2 refinement)
+# === Stage 1: Speech Recognition (REQUIRED for cloud ASR — uncomment 1 key below; local loopback openai-compatible ASR needs no key) ===
+# Simplest 1-Key Quick Start (each key below drives both Stage 1 ASR and Stage 2 Refiner):
+#   Mainland China: DASHSCOPE_API_KEY or DEEPSEEK_API_KEY
+#   Global:         OPENAI_API_KEY or GEMINI_API_KEY
 
-# Alibaba Cloud Bailian / DashScope (Stage 1 qwen3-asr-flash + Stage 2 qwen3.8-flash, or single-hop qwen3.8-omni-flash)
+# Alibaba Cloud Bailian / DashScope [Mainland China] (Stage 1 qwen3-asr-flash + Stage 2 qwen3.8-flash, or single-hop qwen3.8-omni-flash)
 # DASHSCOPE_API_KEY="sk-..."
 
-# OpenAI (Stage 1 gpt-transcribe or single-hop gpt-audio-1.5/gpt-audio-mini + Stage 2 gpt-6-luna)
-# OPENAI_API_KEY="sk-..."
-
-# DeepSeek official API (single key for Stage 1 deepseek-asr + Stage 2 deepseek-flash)
+# DeepSeek official API [Mainland China] (single key for Stage 1 deepseek-asr + Stage 2 deepseek-flash)
 # DEEPSEEK_API_KEY="sk-..."
 
-# Groq Cloud (fast Stage 1 whisper-large-v3-turbo + Stage 2 llama-3.3-70b-versatile)
-# GROQ_API_KEY="gsk_..."
+# OpenAI [Global] (Stage 1 gpt-transcribe or single-hop gpt-audio-1.5/gpt-audio-mini + Stage 2 gpt-6-luna)
+# OPENAI_API_KEY="sk-..."
 
-# OpenRouter (single key for Stage 1 ASR + Stage 2 Refiner)
-# OPENROUTER_API_KEY="sk-or-..."
-
-# Google Gemini (single-hop Stage 1 audio + context refinement, or Stage 2 Refiner)
+# Google Gemini [Global] (single-hop Stage 1 audio + context refinement, or Stage 2 Refiner)
 # GEMINI_API_KEY="AIza..."
+
+# --- Other Supported Stage 1 Providers & Legacy Credentials ---
 
 # Volcengine Doubao Speech (Stage 1 ASR: single-header X-Api-Key, no APP_ID needed)
 # DOUBAO_SPEECH_API_KEY="..."
 # Legacy dual-header app credentials (optional; ignored when DOUBAO_SPEECH_API_KEY is set):
 # DOUBAO_ASR_APP_ID="..."
 # DOUBAO_ASR_API_KEY="..."
+
+# Groq Cloud (fast Stage 1 whisper-large-v3-turbo + Stage 2 llama-3.3-70b-versatile)
+# GROQ_API_KEY="gsk_..."
+
+# OpenRouter (aggregator for Stage 1 ASR + Stage 2 Refiner: google/gemini-3.8-flash)
+# OPENROUTER_API_KEY="sk-or-..."
 
 # SiliconFlow (Stage 1 SenseVoiceSmall + Stage 2 Refiner)
 # SILICONFLOW_API_KEY="sk-..."
@@ -297,20 +308,337 @@ def _ensure_init_parent_dir(cfg_dir: Path, *, preserve_existing_mode: bool) -> N
     ensure_secure_dir(cfg_dir)
 
 
+def _is_macbook_laptop() -> bool:
+    """Return True only on macOS MacBook laptops (desktop Macs like Mac mini/Studio/iMac/Pro return False)."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        proc = subprocess.run(
+            ["sysctl", "-n", "hw.model"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+        model = (proc.stdout or "").strip().lower()
+        if proc.returncode == 0 and model:
+            if "macbook" in model:
+                return True
+            if any(tok in model for tok in ("macmini", "imac", "macpro", "macstudio")):
+                return False
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc = subprocess.run(
+            ["pmset", "-g", "batt"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+        if proc.returncode == 0 and "InternalBattery" in (proc.stdout or ""):
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
+
+
+def _which_from_env(env: Mapping[str, str] | None) -> Callable[[str], str | None]:
+    if env is None or "PATH" not in env:
+        return shutil.which
+    raw_path = env.get("PATH") or ""
+    if not raw_path:
+        return lambda _name: None
+    return lambda name: shutil.which(name, path=raw_path)
+
+
+_KV_LABEL_WIDTH: int = 10
+_ZERO_HOOK_MACOS_TERM_PROGRAMS: frozenset[str] = frozenset(
+    {"ghostty", "apple_terminal", "iterm.app"}
+)
+
+
+def _kv_line(label: str, value: str) -> str:
+    return f"{label:<{_KV_LABEL_WIDTH}}{value}"
+
+
+def _is_confirmed_zero_hook_env(
+    env: Mapping[str, str], *, platform_name: str | None = None
+) -> bool:
+    """Return True only when the current terminal is confirmed to support zero-hook exact routing."""
+    if (env.get("TMUX") or "").strip():
+        return True
+    plat = platform_name if platform_name is not None else sys.platform
+    if plat == "darwin":
+        term_prog = (env.get("TERM_PROGRAM") or "").strip().lower()
+        if term_prog in _ZERO_HOOK_MACOS_TERM_PROGRAMS:
+            return True
+    return False
+
+
+def _format_integrate_tip_lines(
+    env: Mapping[str, str],
+    *,
+    home_dir: str | Path | None = None,
+    platform_name: str | None = None,
+    which_fn: Callable[[str], str | None] | None = None,
+) -> list[str]:
+    if _is_confirmed_zero_hook_env(env, platform_name=platform_name):
+        return []
+    from .integrate import inspect_integrations
+    from .platform_wsl import is_wsl
+
+    eff_plat = platform_name if platform_name is not None else sys.platform
+    plat_tag = "darwin" if eff_plat == "darwin" else ("wsl" if is_wsl(env) else "linux")
+    statuses = inspect_integrations(
+        home_dir=home_dir,
+        env=env,
+        platform=plat_tag,
+        which_fn=which_fn if which_fn is not None else _which_from_env(env),
+    )
+    missing = [s.cli for s in statuses if s.installed and not s.configured]
+    if not missing:
+        return []
+    cli_list = ", ".join(missing)
+    pad = " " * _KV_LABEL_WIDTH
+    return [
+        _kv_line("Tip", f"run 'agent-voice-input integrate' (for {cli_list})"),
+        f"{pad}Without it, multi-window sessions may lose context or mix up project terms.",
+    ]
+
+
+def _format_pipeline_rows(
+    pipeline: Mapping[str, Any] | None,
+    *,
+    cfg: Config | None = None,
+    creds: ProviderCredentials | None = None,
+) -> list[str]:
+    if not isinstance(pipeline, Mapping) or not pipeline:
+        return []
+    asr = pipeline.get("asr")
+    ref = pipeline.get("refiner")
+    if not isinstance(asr, Mapping) and not isinstance(ref, Mapping):
+        summary = str(pipeline.get("summary") or "").strip()
+        return [_kv_line("Pipeline", summary)] if summary else []
+
+    rows: list[str] = []
+    if isinstance(asr, Mapping):
+        a_prov = str(asr.get("provider") or "").strip()
+        a_model = str(asr.get("model") or "").strip()
+        a_base = f"{a_prov} / {a_model}" if (a_prov and a_model) else (a_prov or a_model)
+        a_note = ""
+        if asr.get("ready") is False:
+            a_note = "missing API key"
+        elif cfg is not None and creds is not None:
+            if cfg.asr.api_key_env.strip():
+                a_note = (
+                    creds.asr_custom.source_env
+                    if creds.asr_custom is not None
+                    else cfg.asr.api_key_env.strip()
+                )
+            elif a_prov == "openai-compatible":
+                a_note = creds.openai.source_env if creds.openai is not None else "loopback"
+            else:
+                a_item = creds.for_provider(a_prov)
+                a_note = a_item.source_env if a_item is not None else ""
+        if a_base:
+            rows.append(_kv_line("ASR", f"{a_base} ({a_note})" if a_note else a_base))
+
+    if isinstance(ref, Mapping):
+        raw_prov = str(ref.get("configured_provider") or "").strip()
+        r_prov = str(ref.get("provider") or "").strip()
+        r_model = str(ref.get("model") or "").strip()
+        if ref.get("bypassed"):
+            r_txt = "bypassed (single-hop ASR)"
+        elif r_prov == "off":
+            r_txt = "off" if raw_prov == "off" else "off (no Stage 2 credentials)"
+        else:
+            r_base = f"{r_prov} / {r_model}" if (r_prov and r_model) else (r_prov or r_model)
+            r_note = ""
+            if ref.get("ready") is False:
+                if r_prov == "agy":
+                    r_note = "agy CLI not found"
+                elif r_prov == "codex":
+                    r_note = "not logged in"
+                else:
+                    r_note = "missing API key"
+            elif cfg is not None and creds is not None:
+                if r_prov == "codex":
+                    auth_mode = str(ref.get("auth_mode") or "")
+                    r_note = {
+                        "chatgpt": "local Codex subscription",
+                        "api_key": "Codex API key",
+                        "keyring": "local Codex keyring",
+                    }.get(auth_mode, "local Codex login")
+                elif r_prov == "agy":
+                    r_note = "local agy CLI login"
+                elif cfg.refiner.api_key_env.strip():
+                    r_note = (
+                        creds.refiner_custom.source_env
+                        if creds.refiner_custom is not None
+                        else cfg.refiner.api_key_env.strip()
+                    )
+                elif r_prov == "openai-compatible":
+                    r_note = creds.openai.source_env if creds.openai is not None else "loopback"
+                else:
+                    r_item = creds.for_provider(r_prov)
+                    r_note = r_item.source_env if r_item is not None else ""
+            r_txt = f"{r_base} ({r_note})" if r_note else r_base
+        if r_txt:
+            rows.append(_kv_line("Refiner", r_txt))
+
+    return rows
+
+
+def _parse_integrate_cli_targets(raw_cli: list[str] | None) -> str | list[str]:
+    if not raw_cli:
+        return "all"
+    tokens: list[str] = []
+    for raw in raw_cli:
+        for part in str(raw).split(","):
+            tok = part.strip().lower()
+            if tok:
+                tokens.append(tok)
+    if not tokens:
+        raise ValueError("--cli must specify 'all' or one or more of: claude, codex, agy")
+    return "all" if tokens == ["all"] else tokens
+
+
+def _cmd_integrate(
+    *,
+    status: bool = False,
+    dry_run: bool = False,
+    cli_targets: list[str] | None = None,
+    uninstall: bool = False,
+    as_json: bool = False,
+    env: Mapping[str, str] | None = None,
+    home_dir: str | Path | None = None,
+    cache_dir: str | Path | None = None,
+    platform: str | None = None,
+    which_fn: Callable[[str], str | None] | None = None,
+) -> int:
+    from .integrate import (
+        _normalize_targets,
+        apply_integrations,
+        format_actions_json,
+        format_actions_text,
+        format_status_json,
+        format_status_text,
+        inspect_integrations,
+    )
+
+    try:
+        parsed_targets = _parse_integrate_cli_targets(cli_targets)
+        is_all, selected = _normalize_targets(parsed_targets)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    eff_which = which_fn if which_fn is not None else _which_from_env(env)
+    if status:
+        statuses = inspect_integrations(
+            home_dir=home_dir, env=env, platform=platform, which_fn=eff_which
+        )
+        if not is_all:
+            sel_set = set(selected)
+            statuses = [s for s in statuses if s.cli in sel_set]
+        ok = not any(s.error for s in statuses)
+        if as_json:
+            payload = {
+                "ok": ok,
+                "mode": "status",
+                "items": format_status_json(statuses),
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(format_status_text(statuses))
+        return 0 if ok else 1
+
+    actions = apply_integrations(
+        parsed_targets,
+        dry_run=dry_run,
+        uninstall=uninstall,
+        home_dir=home_dir,
+        cache_dir=cache_dir,
+        env=env,
+        platform=platform,
+        which_fn=eff_which,
+    )
+    ok = not any(a.action == "error" for a in actions)
+    if as_json:
+        payload = {
+            "ok": ok,
+            "mode": "uninstall" if uninstall else "install",
+            "dry_run": bool(dry_run),
+            "actions": format_actions_json(actions),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(format_actions_text(actions, dry_run=dry_run))
+    return 0 if ok else 1
+
+
 def _cmd_init(
     config_path: str | Path | None = None,
     *,
     force: bool = False,
+    asr_provider: str | None = None,
+    refiner_provider: str | None = None,
+    hotkey: str | None = None,
     env: Mapping[str, str] | None = None,
     home_dir: str | Path | None = None,
 ) -> int:
+    from .audio_proc import resolve_ffmpeg_bin
     from .config import (
+        VALID_ASR_PROVIDERS,
+        VALID_REFINER_PROVIDERS,
+        Config,
         ConfigError,
         default_config_file_candidates,
+        detect_codex_local_auth_mode,
+        explain_pipeline_selection,
+        load_config,
+        load_env_files,
+        normalize_asr_provider,
+        normalize_refiner_provider,
+        resolve_credentials,
         resolve_target_config_paths,
+        validate_hotkey_for_platform,
     )
+    from .platform_wsl import is_wsl
 
     src_env = os.environ if env is None else env
+    plat_tag = "darwin" if sys.platform == "darwin" else ("wsl" if is_wsl(src_env) else "linux")
+
+    if asr_provider is not None:
+        norm_asr = normalize_asr_provider(asr_provider)
+        if norm_asr not in VALID_ASR_PROVIDERS:
+            raise ConfigError(
+                f"--asr must be one of {sorted(VALID_ASR_PROVIDERS)}, got {asr_provider!r}"
+            )
+    else:
+        norm_asr = "auto"
+
+    if refiner_provider is not None:
+        norm_ref = normalize_refiner_provider(refiner_provider)
+        if norm_ref not in VALID_REFINER_PROVIDERS:
+            raise ConfigError(
+                f"--refiner must be one of {sorted(VALID_REFINER_PROVIDERS)}, got {refiner_provider!r}"
+            )
+    else:
+        norm_ref = "auto"
+
+    auto_macbook_hotkey = False
+    if hotkey is not None:
+        norm_hotkey = validate_hotkey_for_platform(hotkey, plat_tag, "--hotkey")
+    elif _is_macbook_laptop():
+        norm_hotkey = "ROption"
+        auto_macbook_hotkey = True
+    else:
+        norm_hotkey = "RControl"
+
     cli_cfg_str = str(config_path).strip() if config_path is not None else ""
     has_explicit_cfg = bool(
         cli_cfg_str
@@ -343,33 +671,103 @@ def _cmd_init(
     if will_write_toml or will_write_env:
         _ensure_init_parent_dir(cfg_dir, preserve_existing_mode=has_explicit_cfg)
 
+    toml_content = _render_init_config_toml(
+        hotkey=norm_hotkey,
+        asr_provider=norm_asr,
+        refiner_provider=norm_ref,
+    )
     if shadowed_cfg is not None:
         print(
-            f"[init] kept existing {shadowed_cfg} "
-            f"(pass --force to create {toml_path} which takes precedence)"
+            _kv_line(
+                "Config",
+                f"kept {shadowed_cfg} (pass --force to create {toml_path} which takes precedence)",
+            )
         )
     else:
-        state_toml = _write_init_file_0600(cfg_dir, toml_path, _INIT_CONFIG_TOML, force=force)
+        state_toml = _write_init_file_0600(cfg_dir, toml_path, toml_content, force=force)
         if state_toml == "kept":
-            print(f"[init] kept existing {toml_path} (pass --force to overwrite)")
+            print(_kv_line("Config", f"kept {toml_path} (pass --force to overwrite)"))
         else:
-            print(f"[init] {state_toml} {toml_path} (0600)")
+            print(_kv_line("Config", f"{state_toml} {toml_path} (0600)"))
+            if auto_macbook_hotkey:
+                print(
+                    _kv_line(
+                        "Hotkey",
+                        "ROption (detected MacBook built-in keyboard; pass --hotkey RControl for external keyboard)",
+                    )
+                )
 
     state_env = _write_init_file_0600(cfg_dir, env_path, _INIT_ENV_TEMPLATE, force=force)
     if state_env == "kept":
-        print(f"[init] kept existing {env_path} (pass --force to overwrite)")
+        print(_kv_line("Env", f"kept {env_path} (pass --force to overwrite)"))
     else:
-        print(f"[init] {state_env} {env_path} (0600)")
+        print(_kv_line("Env", f"{state_env} {env_path} (0600)"))
+
+    # Zero-network local environment summary
+    try:
+        eff_cfg, eff_env = load_config(config_path=config_path, env=src_env, home_dir=home_dir)
+    except ConfigError:
+        eff_cfg = Config()
+        eff_env = load_env_files(src_env, config_path=config_path, home_dir=home_dir)
+
+    try:
+        resolve_ffmpeg_bin(env=eff_env)
+    except Exception:
+        ff_cmd = "brew install ffmpeg" if sys.platform == "darwin" else "sudo apt install ffmpeg"
+        print(_kv_line("Warning", f"ffmpeg not found (install via '{ff_cmd}')"))
+
+    creds = resolve_credentials(eff_cfg, eff_env)
+    pipe = explain_pipeline_selection(eff_cfg, creds, eff_env)
+    asr_ready = bool(pipe["asr"]["ready"])
+    codex_mode = detect_codex_local_auth_mode(eff_env)
 
     cfg_flag = f" --config {shlex.quote(cli_cfg_str)}" if cli_cfg_str else ""
-    print(
-        "\nNext steps:\n"
-        f"  1. For cloud ASR, add at least one Stage 1 speech recognition API key in {env_path}\n"
-        "     (e.g. DASHSCOPE_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY / GROQ_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY;\n"
-        "      local loopback openai-compatible ASR endpoints need no key)\n"
-        f"  2. Verify setup:  agent-voice-input doctor{cfg_flag} --ping\n"
-        f"  3. Start daemon:  agent-voice-input start{cfg_flag}"
-    )
+    print()
+    if asr_ready:
+        print(_kv_line("Status", "ready out of the box"))
+        for row in _format_pipeline_rows(pipe, cfg=eff_cfg, creds=creds):
+            print(row)
+        print(
+            _kv_line(
+                "Note",
+                f"No need to edit {env_path} unless you want a different provider.",
+            )
+        )
+        print(
+            _kv_line(
+                "Next",
+                f"agent-voice-input doctor{cfg_flag} --ping && agent-voice-input start{cfg_flag}",
+            )
+        )
+    else:
+        if codex_mode == "chatgpt":
+            print(
+                _kv_line(
+                    "Refiner",
+                    "codex (local subscription ready for free — just add 1 Stage 1 speech key)",
+                )
+            )
+        elif codex_mode != "none":
+            print(
+                _kv_line(
+                    "Refiner",
+                    "codex (local login ready — just add 1 Stage 1 speech key)",
+                )
+            )
+        pad = " " * _KV_LABEL_WIDTH
+        print(
+            f"{_kv_line('Next', f'1. Add 1 Stage 1 speech recognition API key in {env_path}:')}\n"
+            f"{pad}   - Mainland China: DASHSCOPE_API_KEY (Bailian) or DEEPSEEK_API_KEY\n"
+            f"{pad}   - Global:         OPENAI_API_KEY or GEMINI_API_KEY\n"
+            f"{pad}2. Verify & start: agent-voice-input doctor{cfg_flag} --ping && agent-voice-input start{cfg_flag}"
+        )
+
+    for tip_line in _format_integrate_tip_lines(
+        eff_env,
+        home_dir=home_dir,
+        platform_name=("darwin" if plat_tag == "darwin" else "linux"),
+    ):
+        print(tip_line)
     return 0
 
 
@@ -592,7 +990,9 @@ def _probe_stage_ping(
 
 
 def _command_matches_voice_hook(val: Any) -> bool:
-    return isinstance(val, str) and ("session-hook" in val or "voice-title.sh" in val)
+    from .integrate import _is_any_voice_hook
+
+    return _is_any_voice_hook(val)
 
 
 def _event_entries_have_voice_hook(entries: Any) -> bool:
@@ -664,30 +1064,52 @@ def _json_has_voice_hook_command(data: Any, *, is_hooks_file: bool) -> bool:
 
 def _toml_has_codex_voice_hook(raw_text: str) -> bool:
     from .config import ConfigError, parse_toml
+    from .integrate import has_codex_voice_title
 
     try:
         parsed = parse_toml(raw_text)
     except ConfigError:
         return False
-    notify = parsed.get("notify")
-    if isinstance(notify, str):
-        return _command_matches_voice_hook(notify)
-    if isinstance(notify, list):
-        return any(_command_matches_voice_hook(tok) for tok in notify)
-    return False
+    return has_codex_voice_title(parsed)
+
+
+def _count_active_session_registry(rt_dir: Path) -> int:
+    sdir = rt_dir / "sessions"
+    try:
+        if sdir.is_dir() and not sdir.is_symlink():
+            return sum(
+                1
+                for e in sdir.iterdir()
+                if e.name.endswith(".json") and not e.name.startswith(".")
+            )
+    except OSError:
+        return 0
+    return 0
 
 
 def _inspect_hook_summary(env: Mapping[str, str], rt_dir: Path) -> str:
     from .config import expand_user_path
 
+    codex_home_raw = (env.get("CODEX_HOME") or "").strip()
+    codex_cfg_path = (
+        expand_user_path(codex_home_raw, env=env) / "config.toml"
+        if codex_home_raw
+        else expand_user_path("~/.codex/config.toml", env=env)
+    )
     configured: list[str] = []
-    for label, rels in (
-        ("claude", ("~/.claude/settings.json",)),
-        ("gemini/agy", ("~/.gemini/config/hooks.json", "~/.gemini/hooks.json", "~/.gemini/settings.json")),
-        ("codex", ("~/.codex/config.toml",)),
+    for label, paths in (
+        ("claude", (expand_user_path("~/.claude/settings.json", env=env),)),
+        (
+            "gemini/agy",
+            (
+                expand_user_path("~/.gemini/config/hooks.json", env=env),
+                expand_user_path("~/.gemini/hooks.json", env=env),
+                expand_user_path("~/.gemini/settings.json", env=env),
+            ),
+        ),
+        ("codex", (codex_cfg_path,)),
     ):
-        for rel in rels:
-            p = expand_user_path(rel, env=env)
+        for p in paths:
             try:
                 if p.is_file() and p.stat().st_size <= 524_288:
                     hook_txt = p.read_text(encoding="utf-8", errors="ignore")
@@ -707,17 +1129,7 @@ def _inspect_hook_summary(env: Mapping[str, str], rt_dir: Path) -> str:
                         break
             except OSError:
                 continue
-    active_reg = 0
-    sdir = rt_dir / "sessions"
-    try:
-        if sdir.is_dir() and not sdir.is_symlink():
-            active_reg = sum(
-                1
-                for e in sdir.iterdir()
-                if e.name.endswith(".json") and not e.name.startswith(".")
-            )
-    except OSError:
-        active_reg = 0
+    active_reg = _count_active_session_registry(rt_dir)
     hooks_txt = ", ".join(configured) if configured else "none configured (optional)"
     return f"hooks={hooks_txt}, active_registry_entries={active_reg}"
 
@@ -766,6 +1178,7 @@ class _DoctorState:
     ref_ping_needed: bool = False
     pipeline: dict[str, Any] = dataclasses.field(default_factory=dict)
     ping_results: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+    hooks_report: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def clean(self, text: str) -> str:
         from .config import redact_secrets
@@ -822,11 +1235,18 @@ def _doctor_check_macos_host(st: _DoctorState) -> None:
     from .platform_macos import probe_macos_host
 
     st.platform_kind = "darwin"
+    canon_hk = ""
     try:
-        validate_hotkey_for_platform(st.cfg.hotkey.key, "darwin")
+        canon_hk = validate_hotkey_for_platform(st.cfg.hotkey.key, "darwin")
     except ConfigError as exc:
         st.ok_all = False
         st.emit(f"[hotkey]    FAIL {exc}")
+    if canon_hk == "RControl" and _is_macbook_laptop():
+        st.emit(
+            "[hotkey]    WARN hotkey is set to RControl on a MacBook "
+            '(ignore if using an external full-size keyboard with Right Ctrl; '
+            'for built-in keyboard, set key = "ROption" or "Fn" in config.toml)'
+        )
     m = probe_macos_host(st.cfg, st.env, announce_compile=(not st.as_json))
     st.fg_title = str(m.get("fg_title") or "")
     st.fg_tty = str(m.get("fg_tty") or "")
@@ -1012,7 +1432,15 @@ def _doctor_check_asr(st: _DoctorState) -> None:
     st.eff_asr_api = str(asr_info["api"])
     st.asr_ready = bool(asr_info["ready"])
     st.asr_is_single_hop = bool(asr_info["single_hop"])
-    asr_creds_tail = f", asr_custom={_cred_label(creds.asr_custom)}" if cfg.asr.api_key_env.strip() else ""
+
+    configured_keys: list[str] = []
+    for name, item in (
+        ("dashscope", creds.dashscope),
+        ("deepseek", creds.deepseek),
+    ):
+        if item is not None:
+            configured_keys.append(f"{name}={_cred_label(item)}")
+
     doubao_single_key = (
         creds.doubao_key is not None
         and creds.doubao_key.source_env.strip().upper() == "DOUBAO_SPEECH_API_KEY"
@@ -1021,25 +1449,33 @@ def _doctor_check_asr(st: _DoctorState) -> None:
         doubao_label = f"doubao={_cred_label(creds.doubao_key)}"
         if creds.doubao_app_id is not None:
             doubao_label += f" (legacy app_id via {creds.doubao_app_id.source_env} ignored)"
-    elif creds.doubao_app_id is not None:
-        doubao_label = (
-            f"doubao={_cred_label(creds.doubao_key)} (app_id={_cred_label(creds.doubao_app_id)})"
-        )
-    else:
-        doubao_label = f"doubao={_cred_label(creds.doubao_key)}"
+        configured_keys.append(doubao_label)
+    elif creds.doubao_key is not None or creds.doubao_app_id is not None:
+        if creds.doubao_app_id is not None:
+            configured_keys.append(
+                f"doubao={_cred_label(creds.doubao_key)} (app_id={_cred_label(creds.doubao_app_id)})"
+            )
+        else:
+            configured_keys.append(f"doubao={_cred_label(creds.doubao_key)}")
+
+    for name, item in (
+        ("volcengine", creds.volcengine),
+        ("openrouter", creds.openrouter),
+        ("gemini", creds.gemini),
+        ("openai", creds.openai),
+        ("groq", creds.groq),
+        ("siliconflow", creds.siliconflow),
+    ):
+        if item is not None:
+            configured_keys.append(f"{name}={_cred_label(item)}")
+    if cfg.asr.api_key_env.strip():
+        configured_keys.append(f"asr_custom={_cred_label(creds.asr_custom)}")
+
     st.emit(
         f"[asr]       selected={st.eff_asr} (model={st.eff_asr_model}, api={st.eff_asr_api}, effort={cfg.asr.effort}) -> "
-        f"{'OK' if st.asr_ready else 'MISSING KEY'} | "
-        f"dashscope={_cred_label(creds.dashscope)}, "
-        f"deepseek={_cred_label(creds.deepseek)}, "
-        f"{doubao_label}, "
-        f"volcengine={_cred_label(creds.volcengine)}, "
-        f"openrouter={_cred_label(creds.openrouter)}, "
-        f"gemini={_cred_label(creds.gemini)}, "
-        f"openai={_cred_label(creds.openai)}, "
-        f"groq={_cred_label(creds.groq)}, "
-        f"siliconflow={_cred_label(creds.siliconflow)}{asr_creds_tail}"
+        f"{'OK' if st.asr_ready else 'MISSING KEY'}"
     )
+    st.emit(f"[keys]      {', '.join(configured_keys) if configured_keys else 'none configured'}")
     if not st.asr_ready:
         st.ok_all = False
         st.emit_fix(
@@ -1100,6 +1536,32 @@ def _doctor_check_daemon_and_session(st: _DoctorState) -> None:
         f"[session]   {st.match.session_key + ' (' + st.match.matched_by + ')' if st.match else 'none matched (will use empty context)'}"
     )
     st.emit(f"[hooks]     {_inspect_hook_summary(st.env, st.rt_dir)}")
+    from .integrate import inspect_integrations
+
+    hook_statuses = inspect_integrations(
+        env=st.env,
+        platform=st.platform_kind,
+        which_fn=_which_from_env(st.env),
+    )
+    st.hooks_report = {
+        "necessity": hook_statuses[0].necessity if hook_statuses else "optional",
+        "note": hook_statuses[0].note if hook_statuses else "",
+        "active_registry_entries": _count_active_session_registry(st.rt_dir),
+        "clis": {
+            s.cli: {
+                "installed": s.installed,
+                "configured": s.configured,
+                "config_path": s.config_path,
+                "resolved_path": s.resolved_path,
+                "is_symlink": s.is_symlink,
+                "necessity": s.necessity,
+                "recommended": s.necessity == "recommended",
+                "detected_via": s.detected_via,
+                "error": s.error,
+            }
+            for s in hook_statuses
+        },
+    }
 
 
 def _doctor_check_remote_ssh(st: _DoctorState) -> None:
@@ -1367,12 +1829,33 @@ def _doctor_emit_json_report(st: _DoctorState, *, include_ping: bool) -> None:
             if st.match is not None
             else None
         ),
+        "hooks": st.hooks_report,
         "fixes": st.fixes,
         "lines": st.lines_out,
     }
     if include_ping:
         report["ping"] = st.ping_results
     print(json.dumps(_redact_json_obj(report), ensure_ascii=False, indent=2))
+
+
+def _format_doctor_next_line(st: _DoctorState) -> str:
+    if not st.ok_all:
+        return "Next: fix the FAIL item(s) above (see Fix:), then re-run 'agent-voice-input doctor --ping'"
+    if st.daemon_running and st.daemon_code_drift:
+        reason = st.daemon_drift_reason
+        suffix = f" ({reason})" if reason else ""
+        return f"Next: run 'agent-voice-input restart' to apply changes{suffix}"
+    if st.daemon_state == "unresponsive":
+        return "Next: daemon is unresponsive; run 'agent-voice-input diagnose' or 'agent-voice-input restart'"
+    if st.daemon_running:
+        hk = (st.cfg.hotkey.key or "RControl").strip() or "RControl"
+        verb = (
+            "hold"
+            if (st.cfg.hotkey.trigger_mode or "tap_toggle").strip().lower() == "ptt"
+            else "tap"
+        )
+        return f"Next: Ready — daemon is running; {verb} {hk} to dictate"
+    return "Next: run 'agent-voice-input start' to start the background daemon"
 
 
 def _cmd_doctor(
@@ -1404,6 +1887,7 @@ def _cmd_doctor(
     _doctor_check_remote_ssh(st)
     _doctor_check_refiner(st)
     _doctor_run_pings(st, ping=ping, remote_ping=remote_ping, transport=transport)
+    st.emit(_format_doctor_next_line(st))
     if as_json:
         _doctor_emit_json_report(st, include_ping=bool(ping or remote_ping))
     return 0 if st.ok_all else 1
@@ -1662,35 +2146,51 @@ def _warn_degraded_shim(st: Mapping[str, Any]) -> None:
         )
 
 
-def _format_start_readiness_line(
+def _format_start_readiness_row(
     cfg: Config,
     *,
     asr_ready: bool,
     hotkey_ready: bool = True,
-) -> str | None:
+) -> tuple[str, str] | None:
     if not asr_ready:
-        return "WARN: no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating"
+        return (
+            "Warning",
+            "no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
+        )
     if not hotkey_ready:
         return None
     hotkey = (cfg.hotkey.key or "RControl").strip() or "RControl"
     mode = (cfg.hotkey.trigger_mode or "tap_toggle").strip().lower()
     if mode == "ptt":
-        return f"Ready: hold {hotkey} to speak, release to transcribe (press another key to cancel)"
+        return (
+            "Hotkey",
+            f"hold {hotkey} to speak, release to transcribe (press another key to cancel)",
+        )
     hc_ms = cfg.hotkey.effective_hold_cancel_ms()
     if hc_ms > 0:
         sec_str = f"{round(hc_ms / 1000.0, 2):g}s"
-        return f"Ready: tap {hotkey} to start/stop recording (hold {sec_str} to cancel)"
-    return f"Ready: tap {hotkey} to start/stop recording"
+        return ("Hotkey", f"tap {hotkey} to start/stop (hold {sec_str} to cancel)")
+    return ("Hotkey", f"tap {hotkey} to start/stop")
 
 
-def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | None = None) -> int:
+def _cmd_start(
+    args: argparse.Namespace,
+    env: dict[str, str],
+    *,
+    cfg: Config | None = None,
+    restarted_from_pid: int | None = None,
+) -> int:
     from .config import (
         explain_pipeline_selection,
         get_runtime_dir,
         redact_secrets,
         resolve_credentials,
     )
-    from .control_ipc import describe_daemon_drift, probe_daemon_status, send_control_command
+    from .control_ipc import (
+        describe_daemon_drift,
+        probe_daemon_status,
+        send_control_command,
+    )
     from .diagnose import read_redacted_log_tail
     from .platform_macos import (
         classify_macos_mic_permission,
@@ -1699,42 +2199,43 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
     )
 
     rt_dir = get_runtime_dir(env, create=True)
-    has_overrides = any(getattr(args, attr, None) for _, attr in _CLI_OVERRIDE_FLAGS)
-    pipeline_summary = ""
+    passed_flags = [f for f, attr in _CLI_OVERRIDE_FLAGS if getattr(args, attr, None)]
+    has_overrides = bool(passed_flags)
+    creds: ProviderCredentials | None = None
+    pipe_info: dict[str, Any] | None = None
     asr_ready: bool | None = None
     if cfg is not None:
-        pipe_info = explain_pipeline_selection(cfg, resolve_credentials(cfg, env), env)
-        pipeline_summary = str(pipe_info["summary"])
+        creds = resolve_credentials(cfg, env)
+        pipe_info = explain_pipeline_selection(cfg, creds, env)
         asr_ready = bool(pipe_info["asr"]["ready"])
     st = probe_daemon_status(rt_dir, timeout_sec=1.0)
     if st.get("ok"):
         _warn_degraded_shim(st)
         drift = describe_daemon_drift(st)
-        if drift["drifted"]:
-            print(
-                f"already running (pid={st.get('pid')}, state={st.get('state')}, {drift['reason']}); "
-                "run 'agent-voice-input restart' to update"
-            )
-        elif has_overrides:
-            print(
-                f"already running (pid={st.get('pid')}, state={st.get('state')}); "
-                "run 'agent-voice-input restart' to apply new flags/config"
-            )
-        else:
-            print(
-                f"already running (pid={st.get('pid')}, state={st.get('state')}) "
-                "(use 'restart' to reload config)"
-            )
+        reasons: list[str] = [drift["reason"]] if drift["drifted"] and drift["reason"] else []
+        if passed_flags:
+            if len(passed_flags) == 1:
+                reasons.append(f"new CLI flag passed ({passed_flags[0]})")
+            elif len(passed_flags) == 2:
+                reasons.append(f"new CLI flags passed ({', '.join(passed_flags)})")
+            else:
+                reasons.append(f"new CLI flags passed ({len(passed_flags)} overrides)")
+        print(_kv_line("Daemon", f"already running (pid={st.get('pid')}, {st.get('state')})"))
+        if reasons:
+            print(_kv_line("Notice", "; ".join(reasons)))
         running_pipe = st.get("pipeline")
-        running_summary = (
-            str(running_pipe.get("summary") or "").strip()
-            if isinstance(running_pipe, Mapping)
-            else ""
+        if isinstance(running_pipe, Mapping) and running_pipe:
+            for row in _format_pipeline_rows(running_pipe):
+                print(row)
+        elif pipe_info is not None and not has_overrides:
+            for row in _format_pipeline_rows(pipe_info, cfg=cfg, creds=creds):
+                print(row)
+        next_msg = (
+            "run 'agent-voice-input restart' to apply changes"
+            if reasons
+            else "run 'agent-voice-input restart' to reload config"
         )
-        if running_summary:
-            print(f"[pipeline]  {running_summary}")
-        elif cfg is not None and not has_overrides and pipeline_summary:
-            print(f"[pipeline]  {pipeline_summary}")
+        print(_kv_line("Next", next_msg))
         return 0
     if st.get("state") == "unresponsive":
         err_note = redact_secrets(
@@ -1742,10 +2243,9 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
             env,
             cfg=cfg,
         )
-        print(
-            f"already running (pid={st.get('pid') or '-'}, state=unresponsive: {err_note}); "
-            "run 'agent-voice-input diagnose' or 'agent-voice-input restart'"
-        )
+        print(_kv_line("Daemon", f"already running (pid={st.get('pid') or '-'}, unresponsive)"))
+        print(_kv_line("Detail", err_note))
+        print(_kv_line("Next", "run 'agent-voice-input diagnose' or 'agent-voice-input restart'"))
         return 0
     if st.get("state") == "error":
         err_note = redact_secrets(
@@ -1857,29 +2357,60 @@ def _cmd_start(args: argparse.Namespace, env: dict[str, str], *, cfg: Config | N
             if (st := send_control_command(rt_dir, {"cmd": "status"}, timeout_sec=0.5)).get("ok"):
                 if not warned_shim:
                     _warn_degraded_shim(st)
-                print(f"started (pid={st.get('pid')})")
-                if pipeline_summary:
-                    print(f"[pipeline]  {pipeline_summary}")
+                new_pid = st.get("pid")
+                if restarted_from_pid is not None and restarted_from_pid > 0:
+                    print(_kv_line("Daemon", f"restarted (pid={restarted_from_pid} -> {new_pid})"))
+                else:
+                    print(_kv_line("Daemon", f"started (pid={new_pid})"))
+                for row in _format_pipeline_rows(pipe_info, cfg=cfg, creds=creds):
+                    print(row)
                 if cfg is not None and asr_ready is not None:
-                    if readiness_line := _format_start_readiness_line(
+                    if readiness := _format_start_readiness_row(
                         cfg,
                         asr_ready=asr_ready,
                         hotkey_ready=st.get("shim_ok") is True,
                     ):
-                        print(readiness_line)
+                        print(_kv_line(readiness[0], readiness[1]))
+                        if (
+                            asr_ready
+                            and st.get("shim_ok") is True
+                            and not (rt_dir / "telemetry.jsonl").exists()
+                        ):
+                            hk = (cfg.hotkey.key or "RControl").strip() or "RControl"
+                            verb = (
+                                "hold"
+                                if (cfg.hotkey.trigger_mode or "tap_toggle").strip().lower() == "ptt"
+                                else "tap"
+                            )
+                            print(
+                                _kv_line(
+                                    "Tip",
+                                    f"{verb} {hk} to test live, or run 'agent-voice-input once --duration 4 --dry-run'",
+                                )
+                            )
+                for tip_line in _format_integrate_tip_lines(env):
+                    print(tip_line)
                 return 0
         except Exception:
             time.sleep(0.15)
-    print(f"started process pid={proc.pid} (socket warming up)")
-    if pipeline_summary:
-        print(f"[pipeline]  {pipeline_summary}")
+    if restarted_from_pid is not None and restarted_from_pid > 0:
+        print(
+            _kv_line(
+                "Daemon",
+                f"restarting (pid={restarted_from_pid} -> {proc.pid}, socket warming up)",
+            )
+        )
+    else:
+        print(_kv_line("Daemon", f"starting (pid={proc.pid}, socket warming up)"))
+    for row in _format_pipeline_rows(pipe_info, cfg=cfg, creds=creds):
+        print(row)
     if cfg is not None and asr_ready is not None:
-        if readiness_line := _format_start_readiness_line(
+        if readiness := _format_start_readiness_row(
             cfg,
             asr_ready=asr_ready,
             hotkey_ready=False,
         ):
-            print(readiness_line)
+            print(_kv_line(readiness[0], readiness[1]))
     return 0
 
 
@@ -1968,7 +2499,7 @@ def _probe_pid_liveness(pid: int) -> str:
         return "gone"
 
 
-def _cmd_stop(env: dict[str, str]) -> int:
+def _cmd_stop(env: dict[str, str], *, quiet: bool = False) -> int:
     from .config import get_runtime_dir
     from .control_ipc import send_control_command
 
@@ -2045,7 +2576,13 @@ def _cmd_stop(env: dict[str, str]) -> int:
             file=sys.stderr,
         )
         return 1
-    print("stopped")
+    if not quiet:
+        if shutdown_sent and pid > 0:
+            print(_kv_line("Daemon", f"stopped (pid={pid})"))
+        elif shutdown_sent:
+            print(_kv_line("Daemon", "stopped"))
+        else:
+            print(_kv_line("Daemon", "stopped (not running)"))
     return 0
 
 
@@ -2258,10 +2795,61 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Target config.toml path (default: ~/.config/agent-voice-input/config.toml)",
     )
     p_init.add_argument(
+        "--asr",
+        "--asr-provider",
+        dest="asr",
+        default=argparse.SUPPRESS,
+        help="Initial Stage 1 ASR provider to write into config.toml (default: auto)",
+    )
+    p_init.add_argument(
+        "--refiner",
+        "--refiner-provider",
+        dest="refiner",
+        default=argparse.SUPPRESS,
+        help="Initial Stage 2 refiner provider to write into config.toml (default: auto)",
+    )
+    p_init.add_argument(
+        "--hotkey",
+        dest="hotkey",
+        default=None,
+        help="Initial global hotkey to write into config.toml (auto-selects ROption on MacBook, else RControl)",
+    )
+    p_init.add_argument(
         "-f",
         "--force",
         action="store_true",
         help="Atomically overwrite existing files",
+    )
+    p_int = sub.add_parser(
+        "integrate",
+        help="Safely inspect, install, or uninstall optional Claude Code / Codex / AGY session hooks",
+    )
+    p_int.add_argument(
+        "--status",
+        action="store_true",
+        help="Read-only check of detected CLIs, current hook state, and platform necessity",
+    )
+    p_int.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview exact changes without modifying any files",
+    )
+    p_int.add_argument(
+        "--cli",
+        action="append",
+        default=None,
+        help="Target CLI(s): all, or claude/codex/agy (comma-separated or repeatable; default: all)",
+    )
+    p_int.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Idempotently remove only agent-voice-input managed hooks",
+    )
+    p_int.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit machine-readable JSON output",
     )
     for name, help_text in (
         ("daemon", "Run the voice input daemon in the foreground"),
@@ -2502,9 +3090,24 @@ def main(argv: list[str] | None = None) -> int:
     from .config import ConfigError, get_runtime_dir, load_config, load_env_files, redact_secrets
     from .control_ipc import DaemonAlreadyRunningError
 
+    if args.subcmd == "integrate":
+        return _cmd_integrate(
+            status=bool(getattr(args, "status", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            cli_targets=getattr(args, "cli", None),
+            uninstall=bool(getattr(args, "uninstall", False)),
+            as_json=bool(getattr(args, "as_json", False)),
+            env=dict(os.environ),
+        )
     if args.subcmd == "init":
         try:
-            return _cmd_init(config_path=getattr(args, "config", None), force=bool(args.force))
+            return _cmd_init(
+                config_path=getattr(args, "config", None),
+                force=bool(args.force),
+                asr_provider=getattr(args, "asr", None),
+                refiner_provider=getattr(args, "refiner", None),
+                hotkey=getattr(args, "hotkey", None),
+            )
         except ConfigError as exc:
             eff_env = load_env_files()
             print(f"config error: {redact_secrets(str(exc), eff_env)}", file=sys.stderr)
@@ -2539,16 +3142,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcmd == "start":
             return _cmd_start(args, env, cfg=cfg)
         if args.subcmd == "restart":
-            rc_stop = _cmd_stop(env)
+            rt_dir_rst = get_runtime_dir(env, create=False)
+            prev_pid: int | None = None
+            if rt_dir_rst.is_dir():
+                from .control_ipc import _inspect_daemon_lock_holder
+
+                locked, holder_pid = _inspect_daemon_lock_holder(rt_dir_rst)
+                if locked and holder_pid is not None and holder_pid > 0:
+                    prev_pid = holder_pid
+                else:
+                    cand_pid = _read_pid_file(rt_dir_rst / "daemon.pid")
+                    if cand_pid > 0 and _probe_pid_liveness(cand_pid) == "alive":
+                        prev_pid = cand_pid
+            rc_stop = _cmd_stop(env, quiet=True)
             if rc_stop != 0:
                 return rc_stop
-            if not _wait_daemon_lock_free(get_runtime_dir(env, create=False), timeout_sec=2.0):
+            if not _wait_daemon_lock_free(rt_dir_rst, timeout_sec=2.0):
                 print(
                     "error: previous daemon still holds daemon.lock; run 'agent-voice-input stop' and retry",
                     file=sys.stderr,
                 )
                 return 1
-            return _cmd_start(args, env, cfg=cfg)
+            return _cmd_start(args, env, cfg=cfg, restarted_from_pid=prev_pid)
         if args.subcmd == "stop":
             return _cmd_stop(env)
         if args.subcmd == "status":

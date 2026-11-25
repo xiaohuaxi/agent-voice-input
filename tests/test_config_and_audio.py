@@ -725,27 +725,27 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         cfg = Config()
         self.assertEqual(
             ASR_AUTO_PRIORITY,
-            ("dashscope", "doubao", "openrouter", "gemini", "openai", "deepseek", "groq", "siliconflow"),
+            ("dashscope", "doubao", "deepseek", "openai", "gemini", "groq", "openrouter", "siliconflow"),
         )
         # Full ordered priority chain check (canonical DOUBAO_SPEECH_API_KEY)
         full_env = {
             "DASHSCOPE_API_KEY": "k_dash",
             "DOUBAO_SPEECH_API_KEY": "k_db",
-            "OPENROUTER_API_KEY": "k_or",
-            "GEMINI_API_KEY": "k_gem",
-            "OPENAI_API_KEY": "k_oai",
             "DEEPSEEK_API_KEY": "k_ds",
+            "OPENAI_API_KEY": "k_oai",
+            "GEMINI_API_KEY": "k_gem",
             "GROQ_API_KEY": "k_groq",
+            "OPENROUTER_API_KEY": "k_or",
             "SILICONFLOW_API_KEY": "k_sf",
         }
         expected_chain = [
             ("DASHSCOPE_API_KEY", "dashscope"),
             ("DOUBAO_SPEECH_API_KEY", "doubao"),
-            ("OPENROUTER_API_KEY", "openrouter"),
-            ("GEMINI_API_KEY", "gemini"),
-            ("OPENAI_API_KEY", "openai"),
             ("DEEPSEEK_API_KEY", "deepseek"),
+            ("OPENAI_API_KEY", "openai"),
+            ("GEMINI_API_KEY", "gemini"),
             ("GROQ_API_KEY", "groq"),
+            ("OPENROUTER_API_KEY", "openrouter"),
             ("SILICONFLOW_API_KEY", "siliconflow"),
         ]
         cur_env = dict(full_env)
@@ -1001,7 +1001,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(DEFAULT_REFINER_MODELS["deepseek"], "deepseek-flash")
         self.assertEqual(DEFAULT_REFINER_MODELS["dashscope"], "qwen3.8-flash")
         self.assertEqual(DEFAULT_REFINER_MODELS["volcengine"], "doubao-seed-2-0-mini-260428")
-        self.assertEqual(DEFAULT_REFINER_MODELS["openrouter"], "google/gemini-3.5-flash-lite")
+        self.assertEqual(DEFAULT_REFINER_MODELS["openrouter"], "google/gemini-3.8-flash")
         self.assertEqual(DEFAULT_REFINER_MODELS["gemini"], "gemini-3.7-flash")
         self.assertEqual(DEFAULT_REFINER_MODELS["openai"], "gpt-6-luna")
         self.assertEqual(DEFAULT_REFINER_MODELS["groq"], "llama-3.3-70b-versatile")
@@ -1197,7 +1197,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg_sw.asr.effective_model(), "qwen/qwen3-asr-1.7b")
             self.assertEqual(cfg_sw.asr.api_key_env, "")
             self.assertEqual(cfg_sw.refiner.effective_base_url(), "https://openrouter.ai/api/v1")
-            self.assertEqual(cfg_sw.refiner.model, "google/gemini-3.5-flash-lite")
+            self.assertEqual(cfg_sw.refiner.model, "google/gemini-3.8-flash")
             self.assertEqual(cfg_sw.refiner.effort, "auto")
             self.assertEqual(cfg_sw.refiner.api_key_env, "")
 

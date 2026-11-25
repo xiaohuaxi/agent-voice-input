@@ -136,7 +136,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                 current_build_id=bid2,
             )
             self.assertTrue(code_only["drifted"])
-            self.assertIn("code changed", code_only["reason"])
+            self.assertIn("code updated on disk", code_only["reason"])
 
             ver_only = describe_daemon_drift(
                 {"version": "0.8.0"},
@@ -144,7 +144,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                 current_build_id=bid2,
             )
             self.assertTrue(ver_only["drifted"])
-            self.assertIn("version mismatch", ver_only["reason"])
+            self.assertIn("version upgraded", ver_only["reason"])
 
             both = describe_daemon_drift(
                 {"version": "0.8.0", "build_id": bid1},
@@ -152,7 +152,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                 current_build_id=bid2,
             )
             self.assertTrue(both["drifted"])
-            self.assertIn("version/code mismatch", both["reason"])
+            self.assertIn("version upgraded (0.8.0 ->", both["reason"])
 
             legacy_mock = describe_daemon_drift(
                 {"ok": True, "pid": 123, "state": "idle"},
@@ -194,10 +194,11 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                 rc_start = cli_mod._cmd_start(parser.parse_args(["start"]), env, cfg=cfg)
             self.assertEqual(rc_start, 0)
             txt_start = out_start.getvalue()
-            self.assertIn("already running (pid=5678, state=idle", txt_start)
+            self.assertIn("Daemon    already running (pid=5678, idle)", txt_start)
+            self.assertIn("Notice    version upgraded (0.8.0 ->", txt_start)
             self.assertIn("agent-voice-input restart", txt_start)
-            self.assertIn("[pipeline]", txt_start)
-            self.assertIn("dashscope/qwen3-asr-flash", txt_start)
+            self.assertIn("ASR       dashscope / qwen3-asr-flash", txt_start)
+            self.assertIn("Refiner   dashscope / ", txt_start)
 
             # 1b. `start` with CLI overrides prefers running daemon's pipeline (does NOT show unapplied override!)
             out_ov = io.StringIO()
@@ -266,7 +267,9 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                 ):
                     rc_su = cli_mod._cmd_start(parser.parse_args(["start"]), env, cfg=cfg)
                 self.assertEqual(rc_su, 0)
-                self.assertIn("state=unresponsive", out_start_unresp.getvalue())
+                self.assertIn("Daemon    already running (pid=", out_start_unresp.getvalue())
+                self.assertIn("unresponsive)", out_start_unresp.getvalue())
+                self.assertIn("Detail    ", out_start_unresp.getvalue())
                 self.assertIn("diagnose", out_start_unresp.getvalue())
 
                 out_unresp = io.StringIO()
@@ -420,6 +423,7 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
         top_help = parser.format_help()
         expected_cmds = (
             "init",
+            "integrate",
             "daemon",
             "start",
             "restart",
@@ -467,7 +471,7 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
             sel = explain_pipeline_selection(cfg_auto, env=env_multi)
             self.assertEqual(sel["asr"]["provider"], "dashscope")
             self.assertTrue(sel["asr"]["ready"])
-            self.assertEqual(sel["asr"]["alternatives"], ["doubao", "openrouter", "deepseek"])
+            self.assertEqual(sel["asr"]["alternatives"], ["doubao", "deepseek", "openrouter"])
             # Codex subscription MUST win over paid DEEPSEEK/OPENROUTER/DASHSCOPE keys
             self.assertEqual(detect_codex_local_auth_mode(env_multi), "chatgpt")
             self.assertEqual(sel["refiner"]["provider"], "codex")
@@ -1148,6 +1152,256 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                 )
                 self.assertEqual(p_miss.returncode, 0, msg=p_miss.stderr.decode("utf-8", errors="replace"))
                 self.assertEqual(p_miss.stdout.decode("utf-8"), want_stdout)
+
+
+class CliTextUxDriftAndIntegrateTipTests(unittest.TestCase):
+    def test_drift_reasons_flags_and_doctor_keys_cleanup(self) -> None:
+        parser = cli_mod._build_parser()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            home.mkdir(mode=0o700)
+            rt.mkdir(mode=0o700)
+
+            env_base = {
+                "HOME": str(home),
+                "PATH": "",
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "DASHSCOPE_API_KEY": "sk-dash-ux-test-1",
+            }
+            cfg = Config(refiner=RefinerConfig(provider="off"))
+
+            # Version downgrade / non-upgrade direction says "version changed"
+            d_down = describe_daemon_drift(
+                {"version": "99.0.0", "build_id": "abc123456789"},
+                current_version=__version__,
+                current_build_id="def987654321",
+            )
+            self.assertTrue(d_down["drifted"])
+            self.assertIn("version changed (99.0.0 ->", d_down["reason"])
+
+            # Code updated on disk (same version) + 2 CLI flags and 3+ CLI flags
+            fake_code_drift = {
+                "ok": True,
+                "pid": 24438,
+                "state": "idle",
+                "version": __version__,
+                "build_id": "000000000000",
+                "asr_provider": "dashscope",
+                "refiner_provider": "off",
+                "pipeline": {
+                    "asr": {"provider": "dashscope", "model": "qwen3-asr-flash", "ready": True},
+                    "refiner": {
+                        "configured_provider": "off",
+                        "provider": "off",
+                        "model": "",
+                        "effort": "",
+                        "bypassed": False,
+                    },
+                    "summary": "ASR dashscope/qwen3-asr-flash -> Refiner off",
+                },
+            }
+
+            out_two = io.StringIO()
+            with (
+                mock.patch("agent_voice_input.control_ipc.send_control_command", return_value=dict(fake_code_drift)),
+                mock.patch("sys.stdout", out_two),
+            ):
+                rc_2 = cli_mod._cmd_start(
+                    parser.parse_args(["start", "--asr", "dashscope", "--refiner", "off"]),
+                    env_base,
+                    cfg=cfg,
+                )
+            self.assertEqual(rc_2, 0)
+            txt_2 = out_two.getvalue()
+            self.assertIn("Daemon    already running (pid=24438, idle)", txt_2)
+            self.assertIn("Notice    code updated on disk (000000000000 ->", txt_2)
+            self.assertIn("new CLI flags passed (--asr-provider, --refiner-provider)", txt_2)
+            self.assertIn("ASR       dashscope / qwen3-asr-flash", txt_2)
+            self.assertIn("Refiner   off", txt_2)
+            self.assertIn("Next      run 'agent-voice-input restart' to apply changes", txt_2)
+
+            out_three = io.StringIO()
+            with (
+                mock.patch(
+                    "agent_voice_input.control_ipc.send_control_command",
+                    return_value={**fake_code_drift, "build_id": ""},
+                ),
+                mock.patch("sys.stdout", out_three),
+            ):
+                rc_3 = cli_mod._cmd_start(
+                    parser.parse_args(
+                        ["start", "--asr", "dashscope", "--asr-model", "qwen3-asr-flash", "--refiner", "off"]
+                    ),
+                    env_base,
+                    cfg=cfg,
+                )
+            self.assertEqual(rc_3, 0)
+            self.assertIn("Notice    new CLI flags passed (3 overrides)", out_three.getvalue())
+
+            # Doctor separates [asr] and [keys] (only lists configured keys, no 8x 'not set' spam)
+            out_doc = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", return_value=dict(fake_code_drift)),
+                mock.patch("sys.stdout", out_doc),
+            ):
+                rc_doc = cli_mod._cmd_doctor(cfg, env_base)
+            self.assertEqual(rc_doc, 0)
+            doc_txt = out_doc.getvalue()
+            self.assertIn("[daemon]    WARN code updated on disk (000000000000 ->", doc_txt)
+            self.assertIn("[keys]      dashscope=OK (via DASHSCOPE_API_KEY)", doc_txt)
+            self.assertNotIn("openrouter=not set", doc_txt)
+            self.assertIn("Next: run 'agent-voice-input restart' to apply changes (code updated on disk", doc_txt)
+
+    def test_start_restart_integrate_tip_matrix_and_stop_format(self) -> None:
+        from agent_voice_input.integrate import CLAUDE_HOOK_COMMAND
+
+        parser = cli_mod._build_parser()
+
+        class _LiveProc:
+            pid = 24438
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            home.mkdir()
+            rt.mkdir()
+            (rt / "telemetry.jsonl").write_text('{"ok": true}\n', encoding="utf-8")
+
+            def _run_start_case(
+                *,
+                plat: str,
+                extra_env: dict[str, str],
+                restarted_from: int | None = None,
+                is_wsl_val: bool = False,
+            ) -> str:
+                calls = [0]
+
+                def _ctrl(_rt: Path, _req: dict[str, object], timeout_sec: float = 1.0) -> dict[str, object]:
+                    calls[0] += 1
+                    if calls[0] == 1:
+                        raise ConnectionRefusedError("stopped")
+                    return {"ok": True, "pid": 24438, "state": "idle", "shim_ok": True}
+
+                env_case = {
+                    "HOME": str(home),
+                    "PATH": "",
+                    "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                    "DOUBAO_SPEECH_API_KEY": "db-tip-matrix-key",
+                    **extra_env,
+                }
+                buf = io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", plat),
+                    mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=is_wsl_val),
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                    mock.patch("agent_voice_input.platform_macos.compile_mac_shim", return_value=(None, "")),
+                    mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
+                    mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
+                    mock.patch("sys.stdout", buf),
+                    mock.patch("sys.stderr", io.StringIO()),
+                ):
+                    rc = cli_mod._cmd_start(
+                        parser.parse_args(["start"]),
+                        env_case,
+                        cfg=Config(refiner=RefinerConfig(provider="off")),
+                        restarted_from_pid=restarted_from,
+                    )
+                self.assertEqual(rc, 0)
+                return buf.getvalue()
+
+            expected_tip_block = (
+                "Tip       run 'agent-voice-input integrate' (for claude, codex)\n"
+                "          Without it, multi-window sessions may lose context or mix up project terms."
+            )
+
+            # 1. No supported CLIs installed -> silent
+            out_none = _run_start_case(plat="linux", extra_env={"WSL_DISTRO_NAME": "Ubuntu"}, is_wsl_val=True)
+            self.assertNotIn("integrate", out_none)
+            self.assertNotIn("Without it", out_none)
+            self.assertIn("Daemon    started (pid=24438)", out_none)
+            self.assertIn("ASR       doubao / bigmodel (DOUBAO_SPEECH_API_KEY)", out_none)
+            self.assertIn("Refiner   off", out_none)
+
+            # Install unconfigured claude + codex
+            (home / ".claude").mkdir()
+            (home / ".codex").mkdir()
+
+            # 2. WSL2 without tmux -> emits aligned 2-line Tip with impact explanation
+            out_wsl = _run_start_case(plat="linux", extra_env={"WSL_DISTRO_NAME": "Ubuntu"}, is_wsl_val=True)
+            self.assertIn(expected_tip_block, out_wsl)
+
+            # 3. Inside tmux (any OS) -> silent
+            out_wsl_tmux = _run_start_case(
+                plat="linux",
+                extra_env={"WSL_DISTRO_NAME": "Ubuntu", "TMUX": "/tmp/tmux-1000/default,123,0"},
+                is_wsl_val=True,
+            )
+            self.assertNotIn("integrate", out_wsl_tmux)
+            self.assertNotIn("Without it", out_wsl_tmux)
+
+            # 4. macOS confirmed zero-hook terminals -> silent (case-insensitive)
+            for term in ("ghostty", "Ghostty", "Apple_Terminal", "iTerm.app"):
+                with self.subTest(macos_zero_hook_term=term):
+                    out_mac_ok = _run_start_case(plat="darwin", extra_env={"TERM_PROGRAM": term})
+                    self.assertNotIn("integrate", out_mac_ok)
+                    self.assertNotIn("Without it", out_mac_ok)
+
+            # 5. macOS tmux (even with unknown/other TERM_PROGRAM) -> silent
+            out_mac_tmux = _run_start_case(
+                plat="darwin",
+                extra_env={"TMUX": "/tmp/tmux-501/default,99,0", "TERM_PROGRAM": "WezTerm"},
+            )
+            self.assertNotIn("integrate", out_mac_tmux)
+
+            # 6. macOS unknown/empty TERM_PROGRAM or non-zero-hook terminal -> fallback 2-line Tip
+            for term in ("", "WezTerm", "Alacritty"):
+                with self.subTest(macos_fallback_term=term or "<unset>"):
+                    ex = {"TERM_PROGRAM": term} if term else {}
+                    out_mac_fb = _run_start_case(plat="darwin", extra_env=ex, restarted_from=24335)
+                    self.assertIn("Daemon    restarted (pid=24335 -> 24438)", out_mac_fb)
+                    self.assertIn(expected_tip_block, out_mac_fb)
+
+            # 7. Configure both claude and codex -> silent even on WSL2 without tmux
+            (home / ".claude" / "settings.json").write_text(
+                json.dumps({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}]}]}}),
+                encoding="utf-8",
+            )
+            (home / ".codex" / "config.toml").write_text(
+                '[tui]\nterminal_title = ["spinner", "thread-id"]\n',
+                encoding="utf-8",
+            )
+            out_all_done = _run_start_case(plat="linux", extra_env={"WSL_DISTRO_NAME": "Ubuntu"}, is_wsl_val=True)
+            self.assertNotIn("integrate", out_all_done)
+            self.assertNotIn("Without it", out_all_done)
+
+            # 8. `_cmd_stop` aligned output: running vs already stopped
+            (rt / "daemon.pid").write_text("999998\n", encoding="utf-8")
+            stop_live_out = io.StringIO()
+            with (
+                mock.patch("agent_voice_input.control_ipc.send_control_command", return_value={"ok": True}),
+                mock.patch.object(cli_mod.os, "kill", side_effect=ProcessLookupError(3, "gone")),
+                mock.patch("sys.stdout", stop_live_out),
+            ):
+                self.assertEqual(cli_mod._cmd_stop({"HOME": str(home), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}), 0)
+            self.assertEqual(stop_live_out.getvalue().strip(), "Daemon    stopped (pid=999998)")
+
+            stop_idle_out = io.StringIO()
+            with (
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=ConnectionRefusedError("down")),
+                mock.patch("sys.stdout", stop_idle_out),
+            ):
+                self.assertEqual(cli_mod._cmd_stop({"HOME": str(home), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}), 0)
+            self.assertEqual(stop_idle_out.getvalue().strip(), "Daemon    stopped (not running)")
 
 
 if __name__ == "__main__":

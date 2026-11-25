@@ -1060,7 +1060,9 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             }
             orig_st_init = SessionTracker
             buf = io.StringIO()
-            with mock.patch.object(cli_mod.sys, "platform", "darwin"), mock.patch(
+            with mock.patch.object(cli_mod.sys, "platform", "darwin"), mock.patch.object(
+                cli_mod, "_is_macbook_laptop", return_value=False
+            ), mock.patch(
                 "agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"
             ), mock.patch(
                 "agent_voice_input.platform_macos.probe_macos_host", return_value=fake_probe

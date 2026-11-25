@@ -850,10 +850,10 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
 
         # 2. OpenRouter, DashScope, Volcengine, DeepSeek, Groq, SiliconFlow, OpenAI, and keyless loopback openai-compatible
         matrix = [
-            ("openrouter", "", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.5-flash-lite", {"reasoning": {"effort": "minimal"}}),
-            ("openrouter", "", "", "none", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.5-flash-lite", {"reasoning": {"effort": "minimal"}}),
-            ("openrouter", "", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.5-flash-lite", {"reasoning": {"effort": "low"}}),
-            ("openrouter", "", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.5-flash-lite", {}),
+            ("openrouter", "", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "minimal"}}),
+            ("openrouter", "", "", "none", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "minimal"}}),
+            ("openrouter", "", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "low"}}),
+            ("openrouter", "", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {}),
             ("openrouter", "google/gemini-2.5-flash-lite", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "low"}}),
             ("openrouter", "google/gemini-2.5-flash-lite", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "none"}}),
             ("openrouter", "google/gemini-2.5-flash-lite", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {}),
@@ -1767,7 +1767,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn("selected=openrouter (model=qwen/qwen3-asr-1.7b, api=audio-transcriptions, effort=auto) -> OK", out)
             self.assertIn("openrouter=OK (via OPENROUTER_API_KEY)", out)
-            self.assertIn("[refiner]   OK openrouter (model=google/gemini-3.5-flash-lite, api=chat-completions, effort=low)", out)
+            self.assertIn("[refiner]   OK openrouter (model=google/gemini-3.8-flash, api=chat-completions, effort=low)", out)
             self.assertNotIn(secret_or, out)
 
             # Doctor with codex auth.json (verifying api=responses and zero leakage of access_token / account_id)
@@ -3723,7 +3723,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             rt.mkdir()
             env = {"HOME": str(root), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
 
-            # 1. `start` when already running: prints reload hint with or without CLI overrides
+            # 1. `start` when already running: prints aligned reload hint with or without CLI overrides
             buf_plain = io.StringIO()
             with (
                 mock.patch(
@@ -3736,7 +3736,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(rc1, 0)
             self.assertEqual(
                 buf_plain.getvalue().strip(),
-                "already running (pid=1234, state=idle) (use 'restart' to reload config)",
+                "Daemon    already running (pid=1234, idle)\n"
+                "Next      run 'agent-voice-input restart' to reload config",
             )
 
             buf_ov = io.StringIO()
@@ -3751,14 +3752,16 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(rc2, 0)
             self.assertEqual(
                 buf_ov.getvalue().strip(),
-                "already running (pid=1234, state=idle); run 'agent-voice-input restart' to apply new flags/config",
+                "Daemon    already running (pid=1234, idle)\n"
+                "Notice    new CLI flag passed (--asr-provider)\n"
+                "Next      run 'agent-voice-input restart' to apply changes",
             )
 
             # 2. `restart` in main(): stops then starts cleanly; bad config fails BEFORE stopping live daemon
             call_seq: list[str] = []
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch.object(cli_mod, "_cmd_stop", side_effect=lambda _e: (call_seq.append("stop") or 0)),
+                mock.patch.object(cli_mod, "_cmd_stop", side_effect=lambda _e, **_kw: (call_seq.append("stop") or 0)),
                 mock.patch.object(
                     cli_mod,
                     "_cmd_start",
@@ -3773,7 +3776,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             err_buf = io.StringIO()
             with (
                 mock.patch.dict(os.environ, env, clear=True),
-                mock.patch.object(cli_mod, "_cmd_stop", side_effect=lambda _e: (call_seq.append("stop") or 0)),
+                mock.patch.object(cli_mod, "_cmd_stop", side_effect=lambda _e, **_kw: (call_seq.append("stop") or 0)),
                 mock.patch("sys.stderr", err_buf),
             ):
                 rc_bad = cli_mod.main(["restart", "--config", str(root / "missing.toml")])

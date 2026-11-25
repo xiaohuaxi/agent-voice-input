@@ -476,7 +476,11 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             env = {"HOME": str(root / "home"), "XDG_CONFIG_HOME": str(xdg_dir)}
 
             out1 = io.StringIO()
-            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out1):
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(cli_mod, "_is_macbook_laptop", return_value=False),
+                mock.patch("sys.stdout", out1),
+            ):
                 rc1 = cli_mod.main(["init"])
             self.assertEqual(rc1, 0, out1.getvalue())
 
@@ -514,7 +518,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out2):
                 rc2 = cli_mod.main(["init"])
             self.assertEqual(rc2, 0)
-            self.assertIn("kept existing", out2.getvalue())
+            self.assertIn("Config    kept ", out2.getvalue())
             self.assertEqual(toml_p.read_text(encoding="utf-8"), "broken = [unterminated\n")
 
             # Symlink protection on --force: replaces symlink entry itself, NEVER overwrites victim target!
@@ -1102,15 +1106,14 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
 
             # 2. Init template two-stage split, MacBook hotkey note, and next-step guidance
             out_init = io.StringIO()
-            with mock.patch("sys.stdout", out_init):
+            with mock.patch.object(cli_mod, "_is_macbook_laptop", return_value=False), mock.patch("sys.stdout", out_init):
                 self.assertEqual(cli_mod._cmd_init(env=env_base, home_dir=home), 0)
             init_txt = out_init.getvalue()
             self.assertIn("Stage 1", init_txt)
             for key_name in (
                 "DASHSCOPE_API_KEY",
+                "DEEPSEEK_API_KEY",
                 "OPENAI_API_KEY",
-                "GROQ_API_KEY",
-                "OPENROUTER_API_KEY",
                 "GEMINI_API_KEY",
             ):
                 self.assertIn(key_name, init_txt)
@@ -1160,17 +1163,17 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 return buf.getvalue()
 
-            # Stage 2-only key (ARK_API_KEY) leaves asr_ready==False -> explicit WARN
+            # Stage 2-only key (ARK_API_KEY) leaves asr_ready==False -> explicit Warning
             out_no_asr = _run_fresh_start(
                 Config(),
                 {**env_base, "ARK_API_KEY": "ark_only_stage2_test_key"},
             )
-            self.assertIn("started (pid=42424)", out_no_asr)
+            self.assertIn("Daemon    started (pid=42424)", out_no_asr)
             self.assertIn(
-                "WARN: no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
+                "Warning   no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
                 out_no_asr,
             )
-            self.assertNotIn("Ready:", out_no_asr)
+            self.assertNotIn("Hotkey    ", out_no_asr)
 
             # DeepSeek single key now auto-selects BOTH Stage 1 ASR (deepseek) & Stage 2 Refiner (deepseek)
             ds_ping_urls: list[str] = []
@@ -1204,12 +1207,12 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             # Stage 1 key ready + default tap_toggle
             env_ready = {**env_base, "DASHSCOPE_API_KEY": "sk-dash-ready-test-key"}
             out_tap = _run_fresh_start(Config(), env_ready)
-            self.assertIn("started (pid=42424)", out_tap)
+            self.assertIn("Daemon    started (pid=42424)", out_tap)
             self.assertIn(
-                "Ready: tap RControl to start/stop recording (hold 0.8s to cancel)",
+                "Hotkey    tap RControl to start/stop (hold 0.8s to cancel)",
                 out_tap,
             )
-            self.assertNotIn("WARN: no Stage 1 ASR key", out_tap)
+            self.assertNotIn("Warning   no Stage 1 ASR key", out_tap)
 
             # Stage 1 key ready + ptt mode with custom hotkey
             out_ptt = _run_fresh_start(
@@ -1217,7 +1220,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 env_ready,
             )
             self.assertIn(
-                "Ready: hold ROption to speak, release to transcribe (press another key to cancel)",
+                "Hotkey    hold ROption to speak, release to transcribe (press another key to cancel)",
                 out_ptt,
             )
 
@@ -1226,7 +1229,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 Config(hotkey=HotkeyConfig(key="Fn", trigger_mode="tap_toggle", hold_cancel_ms=0)),
                 env_ready,
             )
-            self.assertIn("Ready: tap Fn to start/stop recording", out_no_hc)
+            self.assertIn("Hotkey    tap Fn to start/stop", out_no_hc)
             self.assertNotIn("hold", out_no_hc)
 
             # Degraded CLI-only mode (shim_ok=False): MUST NOT print hotkey Ready line
@@ -1259,11 +1262,11 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 return buf.getvalue()
 
             out_degraded = _run_degraded_start(Config(), env_ready)
-            self.assertIn("started (pid=42424)", out_degraded)
-            self.assertNotIn("Ready:", out_degraded)
+            self.assertIn("Daemon    started (pid=42424)", out_degraded)
+            self.assertNotIn("Hotkey    ", out_degraded)
 
-            # Socket warming-up timeout: MUST NOT print hotkey Ready line when ASR is ready,
-            # while missing Stage 1 ASR key WARN still prints independently.
+            # Socket warming-up timeout: MUST NOT print Hotkey line when ASR is ready,
+            # while missing Stage 1 ASR key Warning still prints independently.
             def _run_warming_up_start(cfg_in: Config, env_in: dict[str, str]) -> str:
                 mono_vals = iter([0.0, 0.5, 11.0])
 
@@ -1288,19 +1291,19 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 return buf.getvalue()
 
             out_warm_ready = _run_warming_up_start(Config(), env_ready)
-            self.assertIn("started process pid=42424 (socket warming up)", out_warm_ready)
-            self.assertNotIn("Ready:", out_warm_ready)
+            self.assertIn("Daemon    starting (pid=42424, socket warming up)", out_warm_ready)
+            self.assertNotIn("Hotkey    ", out_warm_ready)
 
             out_warm_no_asr = _run_warming_up_start(
                 Config(),
                 {**env_base, "ARK_API_KEY": "ark_only_stage2_test_key"},
             )
-            self.assertIn("started process pid=42424 (socket warming up)", out_warm_no_asr)
+            self.assertIn("Daemon    starting (pid=42424, socket warming up)", out_warm_no_asr)
             self.assertIn(
-                "WARN: no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
+                "Warning   no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
                 out_warm_no_asr,
             )
-            self.assertNotIn("Ready:", out_warm_no_asr)
+            self.assertNotIn("Hotkey    ", out_warm_no_asr)
 
 
 class V100ContractAndFirstRunPolishTests(unittest.TestCase):
@@ -1892,13 +1895,20 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
             (gemini_dir / "hooks.json").write_text(
                 '{"metadata": {"permissions": [{"command": "voice-title.sh"}]}}', encoding="utf-8"
             )
-            (codex_dir / "config.toml").write_text('[tui]\nterminal_title = ["thread-id"]\n# session-hook\n', encoding="utf-8")
+            (codex_dir / "config.toml").write_text('[tui]\nterminal_title = ["spinner"]\n# session-hook\n', encoding="utf-8")
             self.assertIn("hooks=none configured (optional)", cli_mod._inspect_hook_summary(env_wsl, rt))
 
             (claude_dir / "settings.json").write_text(
                 '{"permissions": {"allow": ["Bash(agent-voice-input session-hook *)"]}}', encoding="utf-8"
             )
             self.assertIn("hooks=none configured (optional)", cli_mod._inspect_hook_summary(env_wsl, rt))
+
+            # Positive case: Codex native [tui].terminal_title containing "thread-id" MUST match
+            (codex_dir / "config.toml").write_text(
+                '[tui]\nterminal_title = ["spinner", "project-name", "thread-title", "thread-id"]\n',
+                encoding="utf-8",
+            )
+            self.assertIn("hooks=codex", cli_mod._inspect_hook_summary(env_wsl, rt))
 
             # Positive cases: official repo Claude/Gemini hook JSON schemas + voice-title.sh + Codex notify
             claude_official = json.loads(
@@ -1988,6 +1998,577 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
         self.assertNotIn("Two-stage", pyp["project"]["description"])
         for kw in ("antigravity", "agy", "dictation", "tmux"):
             self.assertIn(kw, pyp["project"]["keywords"])
+
+
+class OobeP0CliIntegrationTests(unittest.TestCase):
+    def test_is_macbook_laptop_detection_matrix(self) -> None:
+        # 1. Non-darwin always returns False without invoking subprocess
+        with (
+            mock.patch.object(cli_mod.sys, "platform", "linux"),
+            mock.patch.object(cli_mod.subprocess, "run", side_effect=AssertionError("must not run on linux")),
+        ):
+            self.assertFalse(cli_mod._is_macbook_laptop())
+
+        # 2. Intel/M1 MacBook via sysctl hw.model -> True directly
+        with (
+            mock.patch.object(cli_mod.sys, "platform", "darwin"),
+            mock.patch.object(
+                cli_mod.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(["sysctl"], 0, stdout="MacBookPro18,1\n", stderr=""),
+            ) as m_run,
+        ):
+            self.assertTrue(cli_mod._is_macbook_laptop())
+            self.assertEqual(m_run.call_count, 1)
+
+        # 3. Desktop Macs (Mac mini / Mac Studio / iMac / Mac Pro) -> False directly
+        for desktop_model in ("Macmini9,1", "MacStudio1,1", "iMac21,1", "MacPro7,1"):
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(
+                    cli_mod.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(["sysctl"], 0, stdout=f"{desktop_model}\n", stderr=""),
+                ) as m_run,
+            ):
+                self.assertFalse(cli_mod._is_macbook_laptop(), desktop_model)
+                self.assertEqual(m_run.call_count, 1)
+
+        # 4. Apple Silicon Mac16,10 (M4 Mac mini) -> sysctl generic, pmset AC Power only -> False
+        def _run_mini(cmd, **_kw):
+            if cmd[0] == "sysctl":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Mac16,10\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="Now drawing from 'AC Power'\n", stderr="")
+
+        with (
+            mock.patch.object(cli_mod.sys, "platform", "darwin"),
+            mock.patch.object(cli_mod.subprocess, "run", side_effect=_run_mini),
+        ):
+            self.assertFalse(cli_mod._is_macbook_laptop())
+
+        # 5. Apple Silicon Mac15,3 (M3 MacBook Air) -> sysctl generic, pmset has InternalBattery -> True
+        def _run_mba(cmd, **_kw):
+            if cmd[0] == "sysctl":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Mac15,3\n", stderr="")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="Now drawing from 'Battery Power'\n -InternalBattery-0 (id=123)\t88%; discharging\n",
+                stderr="",
+            )
+
+        with (
+            mock.patch.object(cli_mod.sys, "platform", "darwin"),
+            mock.patch.object(cli_mod.subprocess, "run", side_effect=_run_mba),
+        ):
+            self.assertTrue(cli_mod._is_macbook_laptop())
+
+        # 6. Subprocess errors / timeouts fall back conservatively to False
+        with (
+            mock.patch.object(cli_mod.sys, "platform", "darwin"),
+            mock.patch.object(
+                cli_mod.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(cmd="sysctl", timeout=0.5),
+            ),
+        ):
+            self.assertFalse(cli_mod._is_macbook_laptop())
+
+    def test_init_env_aware_macbook_vs_desktop_flags_and_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            # 1. MacBook without --hotkey -> auto writes ROption + clear note
+            h_mb = root / "macbook"
+            h_mb.mkdir()
+            env_mb = {"HOME": str(h_mb), "PATH": ""}
+            out_mb = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env_mb, clear=True),
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(cli_mod, "_is_macbook_laptop", return_value=True),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("sys.stdout", out_mb),
+            ):
+                self.assertEqual(cli_mod.main(["init"]), 0, out_mb.getvalue())
+            toml_mb = (h_mb / ".config" / "agent-voice-input" / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('key = "ROption"', toml_mb)
+            self.assertIn("Hotkey    ROption (detected MacBook built-in keyboard", out_mb.getvalue())
+            self.assertIn("--hotkey RControl", out_mb.getvalue())
+
+            # 2. MacBook with explicit --hotkey RControl + --asr bailian + --refiner off
+            out_mb_exp = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env_mb, clear=True),
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(cli_mod, "_is_macbook_laptop", return_value=True),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("sys.stdout", out_mb_exp),
+            ):
+                rc_exp = cli_mod.main(
+                    ["init", "--force", "--asr", "bailian", "--refiner", "off", "--hotkey", "RControl"]
+                )
+            self.assertEqual(rc_exp, 0, out_mb_exp.getvalue())
+            toml_mb_exp = (h_mb / ".config" / "agent-voice-input" / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('key = "RControl"', toml_mb_exp)
+            self.assertIn('provider = "dashscope"', toml_mb_exp)
+            self.assertIn('provider = "off"', toml_mb_exp)
+            self.assertNotIn("MacBook built-in keyboard", out_mb_exp.getvalue())
+
+            # 3. Desktop Mac (Mac mini) -> keeps RControl without MacBook message
+            h_mini = root / "macmini"
+            h_mini.mkdir()
+            env_mini = {"HOME": str(h_mini), "PATH": ""}
+            out_mini = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env_mini, clear=True),
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(cli_mod, "_is_macbook_laptop", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("sys.stdout", out_mini),
+            ):
+                self.assertEqual(cli_mod.main(["init"]), 0, out_mini.getvalue())
+            self.assertIn(
+                'key = "RControl"',
+                (h_mini / ".config" / "agent-voice-input" / "config.toml").read_text(encoding="utf-8"),
+            )
+            self.assertNotIn("MacBook built-in keyboard", out_mini.getvalue())
+
+            # 4. Invalid --asr / --refiner / --hotkey return exit code 2 without creating files
+            h_bad = root / "bad_flags"
+            h_bad.mkdir()
+            env_bad = {"HOME": str(h_bad), "PATH": ""}
+            for argv in (
+                ["init", "--asr", "unknown_vendor"],
+                ["init", "--refiner", "unknown_ref"],
+                ["init", "--hotkey", "NotAKey"],
+            ):
+                err_b = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, env_bad, clear=True),
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("sys.stderr", err_b),
+                ):
+                    self.assertEqual(cli_mod.main(argv), 2, f"argv={argv} stderr={err_b.getvalue()}")
+                self.assertIn("config error:", err_b.getvalue())
+            self.assertFalse((h_bad / ".config" / "agent-voice-input" / "config.toml").exists())
+
+            # 5. Ready out of the box (Stage 1 DEEPSEEK_API_KEY + local Codex ChatGPT login)
+            h_ready = root / "ready_home"
+            (h_ready / ".codex").mkdir(parents=True)
+            (h_ready / ".codex" / "auth.json").write_text(
+                json.dumps({"tokens": {"access_token": _fake_jwt()}}), encoding="utf-8"
+            )
+            env_ready = {"HOME": str(h_ready), "PATH": "", "DEEPSEEK_API_KEY": "sk-ds-init-ready-1234"}
+            out_ready = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env_ready, clear=True),
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", out_ready),
+            ):
+                self.assertEqual(cli_mod.main(["init"]), 0)
+            txt_ready = out_ready.getvalue()
+            self.assertIn("Status    ready out of the box", txt_ready)
+            self.assertIn("ASR       deepseek / deepseek-asr", txt_ready)
+            self.assertIn("Refiner   codex / ", txt_ready)
+            self.assertIn("No need to edit", txt_ready)
+            self.assertIn("agent-voice-input doctor --ping && agent-voice-input start", txt_ready)
+            self.assertNotIn("sk-ds-init-ready-1234", txt_ready)
+
+            # 6. No Stage 1 key + local Codex login + WSL2 with unconfigured ~/.claude -> highlights free Codex,
+            #    lists 4 1-key recommendations, hints integrate, and NEVER modifies ~/.claude/settings.json
+            h_wsl = root / "wsl_home"
+            (h_wsl / ".codex").mkdir(parents=True)
+            (h_wsl / ".codex" / "auth.json").write_text(
+                json.dumps({"tokens": {"access_token": _fake_jwt()}}), encoding="utf-8"
+            )
+            (h_wsl / ".claude").mkdir(parents=True)
+            env_wsl = {"HOME": str(h_wsl), "PATH": "", "WSL_DISTRO_NAME": "Ubuntu"}
+            out_wsl = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env_wsl, clear=True),
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", out_wsl),
+            ):
+                self.assertEqual(cli_mod.main(["init"]), 0)
+            txt_wsl = out_wsl.getvalue()
+            self.assertIn("local subscription ready for free", txt_wsl)
+            for k in ("DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+                self.assertIn(k, txt_wsl)
+            self.assertIn("agent-voice-input integrate", txt_wsl)
+            self.assertFalse((h_wsl / ".claude" / "settings.json").exists())
+
+    def test_doctor_hooks_json_macbook_warn_vs_mini_and_next_line(self) -> None:
+        from agent_voice_input.integrate import AGY_HOOK_COMMAND, CLAUDE_HOOK_COMMAND
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            (home / ".codex").mkdir(parents=True)
+            (home / ".claude").mkdir(parents=True)
+            (home / ".gemini" / "config").mkdir(parents=True)
+            (home / ".codex" / "config.toml").write_text(
+                '[tui]\nterminal_title = ["spinner", "project-name", "thread-title", "thread-id"]\n',
+                encoding="utf-8",
+            )
+            (home / ".claude" / "settings.json").write_text(
+                json.dumps({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}]}]}}),
+                encoding="utf-8",
+            )
+            (home / ".gemini" / "config" / "hooks.json").write_text(
+                json.dumps({"voice-session-title": {"SessionStart": [{"type": "command", "command": AGY_HOOK_COMMAND}]}}),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(cli_mod._command_matches_voice_hook(CLAUDE_HOOK_COMMAND))
+            self.assertTrue(cli_mod._command_matches_voice_hook(AGY_HOOK_COMMAND))
+            self.assertTrue(cli_mod._command_matches_voice_hook("~/.local/bin/voice-title.sh"))
+            self.assertFalse(cli_mod._command_matches_voice_hook("echo hello"))
+
+            env = {
+                "HOME": str(home),
+                "PATH": "",
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "DEEPSEEK_API_KEY": "sk-ds-doc-test-9999",
+            }
+            probe_ok = {
+                "avfoundation_ok": True,
+                "audio_devices": ["[0] Mic"],
+                "configured_audio_device": ":default",
+                "pbcopy_ok": True,
+                "tmux_active": False,
+                "clt_ok": True,
+                "swiftc_ok": True,
+                "swiftc_bin": "/usr/bin/swiftc",
+                "mac_shim_ok": True,
+                "mac_shim_bin": "/tmp/mac_shim",
+                "caller_mic_auth": "authorized",
+                "caller_has_graphic_session": True,
+                "caller_is_remote_session": False,
+                "fg_process": "Ghostty",
+                "fg_title": "zsh",
+                "permissions_hint": "Microphone -> Ghostty",
+            }
+
+            # 1. MacBook + RControl -> gentle [hotkey] WARN, rc=0, Next: start
+            buf_mb = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(cli_mod, "_is_macbook_laptop", return_value=True),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=probe_ok),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_mb),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env), 0)
+            txt_mb = buf_mb.getvalue()
+            self.assertIn("[hotkey]    WARN", txt_mb)
+            self.assertIn("ROption", txt_mb)
+            self.assertIn("Next: run 'agent-voice-input start'", txt_mb)
+            self.assertIn("hooks=claude, gemini/agy, codex", txt_mb)
+
+            # 2. Desktop Mac (Mac mini) + RControl -> ZERO [hotkey] WARN!
+            buf_mini = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(cli_mod, "_is_macbook_laptop", return_value=False),
+                mock.patch("agent_voice_input.platform_macos.probe_macos_host", return_value=probe_ok),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_mini),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env), 0)
+            self.assertNotIn("[hotkey]    WARN", buf_mini.getvalue())
+
+            # 3. doctor --json emits structured `hooks` field with claude/codex/agy entries
+            buf_js = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch(
+                    "agent_voice_input.platform_wsl.probe_wsl_host",
+                    return_value={"powershell_ok": True, "ps_version": "5.1", "wasapi_ok": True, "pulse_rdp_ok": False, "winmm_devs": 1},
+                ),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_js),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env, as_json=True), 0)
+            rep = json.loads(buf_js.getvalue())
+            self.assertIn("hooks", rep)
+            self.assertEqual(rep["hooks"]["necessity"], "recommended")
+            for cli_name in ("claude", "codex", "agy"):
+                entry = rep["hooks"]["clis"][cli_name]
+                self.assertTrue(entry["installed"])
+                self.assertTrue(entry["configured"])
+                self.assertTrue(entry["recommended"])
+                self.assertTrue(entry["config_path"])
+
+            # 4. Next: variants (running healthy -> Ready; running drifted -> restart; failed -> Fix:)
+            buf_run = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch(
+                    "agent_voice_input.control_ipc.probe_daemon_status",
+                    return_value={"ok": True, "pid": 1234, "state": "idle"},
+                ),
+                mock.patch("sys.stdout", buf_run),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env), 0)
+            self.assertIn("Next: Ready", buf_run.getvalue())
+
+            buf_drift = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch(
+                    "agent_voice_input.control_ipc.probe_daemon_status",
+                    return_value={"ok": True, "pid": 1234, "state": "idle", "version": "0.1.0"},
+                ),
+                mock.patch("sys.stdout", buf_drift),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env), 0)
+            self.assertIn("Next: run 'agent-voice-input restart'", buf_drift.getvalue())
+
+            buf_fail = io.StringIO()
+            env_nokey = {"HOME": str(home), "PATH": "", "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_fail),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env_nokey), 1)
+            self.assertIn("Next: fix the FAIL item(s) above (see Fix:)", buf_fail.getvalue())
+            self.assertIn("agent-voice-input doctor --ping", buf_fail.getvalue())
+
+    def test_start_first_run_acceptance_tip_and_integrate_cli_subcommand(self) -> None:
+        parser = cli_mod._build_parser()
+
+        class _LiveProc:
+            pid = 61616
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            cache = root / "cache"
+            home.mkdir()
+            rt.mkdir()
+            env = {
+                "HOME": str(home),
+                "XDG_CACHE_HOME": str(cache),
+                "PATH": "",
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "DEEPSEEK_API_KEY": "sk-ds-start-tip-1234",
+            }
+
+            def _run_start(cfg_in: Config) -> str:
+                calls = [0]
+
+                def _ctrl(_rt: Path, _req: dict[str, object], timeout_sec: float = 1.0) -> dict[str, object]:
+                    calls[0] += 1
+                    if calls[0] == 1:
+                        raise ConnectionRefusedError("stopped")
+                    return {"ok": True, "pid": 61616, "state": "idle", "shim_ok": True}
+
+                buf = io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                    mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
+                    mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
+                    mock.patch("sys.stdout", buf),
+                ):
+                    rc = cli_mod._cmd_start(parser.parse_args(["start"]), env, cfg=cfg_in)
+                self.assertEqual(rc, 0)
+                return buf.getvalue()
+
+            # 1. First start (no telemetry.jsonl) emits Tip with configured hotkey
+            out_first = _run_start(Config(hotkey=HotkeyConfig(key="ROption")))
+            self.assertIn(
+                "Tip       tap ROption to test live, or run 'agent-voice-input once --duration 4 --dry-run'",
+                out_first,
+            )
+
+            # 2. Subsequent start (telemetry.jsonl exists) suppresses first-run Tip
+            (rt / "telemetry.jsonl").write_text('{"ok": true}\n', encoding="utf-8")
+            out_second = _run_start(Config(hotkey=HotkeyConfig(key="ROption")))
+            self.assertNotIn("once --duration 4 --dry-run", out_second)
+
+            # 3. `integrate` CLI subcommand forwarding (--status, --dry-run, --cli comma & repeat, --uninstall, --json, errors)
+            (home / ".claude").mkdir()
+            (home / ".codex").mkdir()
+            (home / ".gemini").mkdir()
+
+            out_st = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out_st):
+                self.assertEqual(cli_mod.main(["integrate", "--status", "--json"]), 0)
+            st_payload = json.loads(out_st.getvalue())
+            self.assertTrue(st_payload["ok"])
+            self.assertEqual(st_payload["mode"], "status")
+            self.assertEqual([x["cli"] for x in st_payload["items"]], ["claude", "codex", "agy"])
+
+            out_dry = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out_dry):
+                self.assertEqual(cli_mod.main(["integrate", "--dry-run", "--cli", "claude,codex", "--json"]), 0)
+            dry_payload = json.loads(out_dry.getvalue())
+            self.assertTrue(dry_payload["ok"])
+            self.assertTrue(dry_payload["dry_run"])
+            self.assertEqual([a["cli"] for a in dry_payload["actions"]], ["claude", "codex"])
+            self.assertEqual([a["action"] for a in dry_payload["actions"]], ["would_install", "would_install"])
+            self.assertFalse((home / ".claude" / "settings.json").exists())
+
+            out_apply = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out_apply):
+                self.assertEqual(cli_mod.main(["integrate", "--cli", "claude", "--cli", "agy", "--json"]), 0)
+            apply_payload = json.loads(out_apply.getvalue())
+            self.assertTrue(apply_payload["ok"])
+            self.assertEqual([a["action"] for a in apply_payload["actions"]], ["installed", "installed"])
+            self.assertTrue((home / ".claude" / "settings.json").is_file())
+            self.assertTrue((home / ".gemini" / "config" / "hooks.json").is_file())
+
+            out_un = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out_un):
+                self.assertEqual(cli_mod.main(["integrate", "--uninstall", "--cli", "claude,agy", "--json"]), 0)
+            un_payload = json.loads(out_un.getvalue())
+            self.assertTrue(un_payload["ok"])
+            self.assertEqual(un_payload["mode"], "uninstall")
+            self.assertEqual([a["action"] for a in un_payload["actions"]], ["uninstalled", "uninstalled"])
+
+            # Invalid CLI returns exit code 2
+            err_bad = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stderr", err_bad):
+                self.assertEqual(cli_mod.main(["integrate", "--cli", "unknown"]), 2)
+            self.assertIn("unsupported CLI target", err_bad.getvalue())
+
+            # Corrupt config triggers error action -> non-zero exit code 1
+            (home / ".claude" / "settings.json").write_text("{broken-json", encoding="utf-8")
+            out_err = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out_err):
+                self.assertEqual(cli_mod.main(["integrate", "--cli", "claude", "--json"]), 1)
+            err_payload = json.loads(out_err.getvalue())
+            self.assertFalse(err_payload["ok"])
+            self.assertEqual(err_payload["actions"][0]["action"], "error")
+
+    def test_cli_integrate_respects_codex_home_and_xdg_cache_home(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            custom_codex = root / "custom-codex"
+            custom_cache = root / "custom-xdg-cache"
+            home.mkdir()
+            custom_codex.mkdir()
+            codex_toml = custom_codex / "config.toml"
+            codex_toml.write_text('model = "gpt-5"\n', encoding="utf-8")
+
+            env = {
+                "HOME": str(home),
+                "PATH": "",
+                "CODEX_HOME": str(custom_codex),
+                "XDG_CACHE_HOME": str(custom_cache),
+            }
+
+            out_st1 = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out_st1):
+                self.assertEqual(cli_mod.main(["integrate", "--status", "--cli", "codex", "--json"]), 0)
+            st1 = json.loads(out_st1.getvalue())
+            self.assertTrue(st1["ok"])
+            self.assertEqual(len(st1["items"]), 1)
+            self.assertEqual(st1["items"][0]["config_path"], str(codex_toml))
+            self.assertTrue(st1["items"][0]["installed"])
+            self.assertFalse(st1["items"][0]["configured"])
+
+            out_apply = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out_apply):
+                self.assertEqual(cli_mod.main(["integrate", "--cli", "codex", "--json"]), 0)
+            applied = json.loads(out_apply.getvalue())
+            self.assertTrue(applied["ok"])
+            act = applied["actions"][0]
+            self.assertEqual(act["action"], "installed")
+            self.assertEqual(act["config_path"], str(codex_toml))
+            expected_backup_root = str(custom_cache / "agent-voice-input" / "integrate-backups")
+            self.assertTrue(act["backup_path"].startswith(expected_backup_root), act["backup_path"])
+            self.assertTrue(Path(act["backup_path"]).is_file())
+            self.assertIn("thread-id", parse_toml(codex_toml.read_text(encoding="utf-8"))["tui"]["terminal_title"])
+            self.assertFalse((home / ".codex").exists())
+            self.assertFalse((home / ".cache").exists())
+
+            out_st2 = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out_st2):
+                self.assertEqual(cli_mod.main(["integrate", "--status", "--cli", "codex", "--json"]), 0)
+            st2 = json.loads(out_st2.getvalue())
+            self.assertTrue(st2["items"][0]["configured"])
+
+    def test_doctor_hooks_consistent_under_custom_codex_home_and_ptt_next_line(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            custom_codex = root / "custom-codex"
+            home.mkdir()
+            custom_codex.mkdir()
+            codex_toml = custom_codex / "config.toml"
+            codex_toml.write_text('[tui]\nterminal_title = ["spinner", "thread-id"]\n', encoding="utf-8")
+
+            env = {
+                "HOME": str(home),
+                "PATH": "",
+                "CODEX_HOME": str(custom_codex),
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "DEEPSEEK_API_KEY": "sk-ds-codex-home-9999",
+            }
+
+            buf_txt = io.StringIO()
+            buf_json = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+            ):
+                with mock.patch("sys.stdout", buf_txt):
+                    self.assertEqual(cli_mod._cmd_doctor(Config(), env, as_json=False), 0)
+                with mock.patch("sys.stdout", buf_json):
+                    self.assertEqual(cli_mod._cmd_doctor(Config(), env, as_json=True), 0)
+
+            txt_out = buf_txt.getvalue()
+            rep = json.loads(buf_json.getvalue())
+            self.assertIn("[hooks]     hooks=codex,", txt_out)
+            self.assertNotIn("none configured", txt_out)
+            self.assertTrue(rep["hooks"]["clis"]["codex"]["configured"])
+            self.assertEqual(rep["hooks"]["clis"]["codex"]["config_path"], str(codex_toml))
+            self.assertTrue(any("[hooks]     hooks=codex," in ln for ln in rep["lines"]))
+            self.assertFalse((home / ".codex").exists())
+
+            # Running daemon Next: line respects trigger_mode ("ptt" -> hold, "tap_toggle" -> tap)
+            for mode, expected_verb in (("ptt", "hold"), ("tap_toggle", "tap")):
+                buf_mode = io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                    mock.patch(
+                        "agent_voice_input.control_ipc.probe_daemon_status",
+                        return_value={"ok": True, "pid": 4321, "state": "idle"},
+                    ),
+                    mock.patch("sys.stdout", buf_mode),
+                ):
+                    rc = cli_mod._cmd_doctor(
+                        Config(hotkey=HotkeyConfig(key="ROption", trigger_mode=mode)), env
+                    )
+                self.assertEqual(rc, 0)
+                self.assertIn(
+                    f"Next: Ready — daemon is running; {expected_verb} ROption to dictate",
+                    buf_mode.getvalue(),
+                )
 
 
 if __name__ == "__main__":
