@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-25
+
 ### Added
 - **Claude Desktop (Code & Cowork) local session binding on macOS**: Added bounded read-only `AXWebArea` route and title probing for `com.anthropic.claudefordesktop` with dual official (`Claude`) and 3P (`Claude-3p`) metadata discovery, `50K` incremental session caching, local Cowork folder resolution, and pre-paste same-window thread verification, while keeping cloud Chat isolated in `general` + `ai_chat` mode.
 
@@ -202,7 +204,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Initial WSL2 release**: Two-stage context-aware voice input daemon and CLI for coding agents (**Codex**, **Claude Code**, **AGY**) on Windows + WSL2, featuring native `win_shim.ps1` WASAPI capture, global hotkey & HUD bridge, active terminal session discovery, `ffmpeg` loudness normalization with local silence gating, and safe paste without auto-pressing `Enter`.
 
-[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.11.0...v0.12.0

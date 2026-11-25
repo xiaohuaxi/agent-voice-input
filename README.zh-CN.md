@@ -89,7 +89,7 @@
 4. 运行 `agent-voice-input doctor --ping` 确认通过后，执行 `agent-voice-input start` 启动后台守护进程。
 ```
 
-### 路径 B：手动 3 步安装（`v0.14.0`）
+### 路径 B：手动 3 步安装（`v0.15.0`）
 
 ```bash
 # 1. 安装前置 ffmpeg 与 CLI（WSL2: `sudo apt install ffmpeg` | macOS: `brew install ffmpeg` + `xcode-select --install`）
@@ -102,7 +102,7 @@ agent-voice-input init
 agent-voice-input doctor --ping && agent-voice-input start
 ```
 
-> MacBook 无右 Ctrl 键可在 `~/.config/agent-voice-input/config.toml` 的 `[hotkey]` 下改为 `key = "ROption"` 或 `"Fn"` 后执行 `agent-voice-input restart`。完整配置模板见 [`v0.14.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.14.0/config.example.toml)（[`main`](config.example.toml)）与 [`v0.14.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.14.0/config.example.env)（[`main`](config.example.env)）。
+> MacBook 无右 Ctrl 键可在 `~/.config/agent-voice-input/config.toml` 的 `[hotkey]` 下改为 `key = "ROption"` 或 `"Fn"` 后执行 `agent-voice-input restart`。完整配置模板见 [`v0.15.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.15.0/config.example.toml)（[`main`](config.example.toml)）与 [`v0.15.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.15.0/config.example.env)（[`main`](config.example.env)）。
 
 ### 场景化推荐供应商组合
 

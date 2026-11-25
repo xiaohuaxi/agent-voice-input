@@ -1980,10 +1980,10 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
         import agent_voice_input as pkg_init
         from agent_voice_input.config import parse_toml
 
-        self.assertEqual(pkg_init.__version__, "0.14.0")
+        self.assertEqual(pkg_init.__version__, "0.15.0")
         self.assertNotIn("Two-stage", pkg_init.__doc__ or "")
         pyp = parse_toml((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(pyp["project"]["version"], "0.14.0")
+        self.assertEqual(pyp["project"]["version"], "0.15.0")
         self.assertIn("Development Status :: 4 - Beta", pyp["project"]["classifiers"])
         self.assertNotIn("Two-stage", pyp["project"]["description"])
         for kw in ("antigravity", "agy", "dictation", "tmux"):
