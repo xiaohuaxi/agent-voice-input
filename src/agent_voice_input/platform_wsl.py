@@ -313,6 +313,17 @@ class WslPlatform(JsonlShimMixin):
         self._use_winmm = self._primary_winmm
         self.last_audio_error = ""
         self._ff_rec, self._rec_mode = FfmpegWavRecorder(), ""
+        # Recording lifecycle invariants:
+        # - Lock order: NEVER nest _winmm_state_lock with JsonlShimMixin._shim_lock (or run shim
+        #   RPC / subprocess I/O under either lock).
+        # - _winmm_gen is monotonic across both winmm and pulse captures; stop_recording() bumps it
+        #   before releasing _winmm_state_lock to invalidate in-flight start_recording() and rolls
+        #   back only on zero-byte write timeout ("not_sent") if no newer generation intervened.
+        # - _winmm_starting buffers early rec_lost/rec_recovered events arriving before rec_start
+        #   replies; _winmm_rpc_dispatched marks that rec_start is about to be / has been sent to
+        #   _rec_writer so concurrent stop/cancel knows to target that writer with rec_stop.
+        # - _rec_writer pins rec_stop/rec_release/reap operations to the shim instance that started
+        #   the capture; _reap_unowned_writer() never poisons a writer owned by an active gen.
         self._winmm_state_lock = threading.Lock()
         self._winmm_gen = 0
         self._active_seq_id: int | None = None
@@ -554,7 +565,7 @@ class WslPlatform(JsonlShimMixin):
                     discard_req = {"cmd": "rec_stop", "rec_gen": my_gen, "discard": True}
                     status = self._write_shim_command(discard_req, writer=target_writer, timeout_sec=0.25)
                     if status != "sent" and not self._closed:
-                        self._poison_and_reap_writer(target_writer)
+                        self._reap_unowned_writer(target_writer)
                 self.last_audio_error = str(shim_exc)
                 if fb_gen:
                     try:
@@ -684,14 +695,30 @@ class WslPlatform(JsonlShimMixin):
             raise self._classify_wasapi_start_error("mic_busy:wasapi_aborted")
         self._start_level_streamer(lambda: self._ff_rec.current_level)
 
-    def stop_recording(self, *, drain: bool = True, _discard: bool = False) -> tuple[bytes, str]:
-        self._stop_level_streamer()
+    def _reap_unowned_writer(self, writer: Any) -> None:
+        if writer is None:
+            return
         with self._winmm_state_lock:
+            if self._closed or self._rec_writer is writer:
+                return
+        self._poison_and_reap_writer(writer)
+
+    def stop_recording(
+        self,
+        *,
+        drain: bool = True,
+        _discard: bool = False,
+        _expected_gen: int | None = None,
+    ) -> tuple[bytes, str]:
+        with self._winmm_state_lock:
+            if _expected_gen is not None and self._winmm_gen != _expected_gen:
+                return b"", ("winmm" if self._use_winmm else "pulse")
             stop_gen = self._winmm_gen
             self._winmm_gen += 1
             next_gen = self._winmm_gen
             prev_seq_id = self._active_seq_id
             self._active_seq_id = None
+            was_starting = self._winmm_starting
             was_dispatched = self._winmm_rpc_dispatched
             rec_writer, self._rec_writer = self._rec_writer, None
             self._winmm_starting = False
@@ -699,6 +726,7 @@ class WslPlatform(JsonlShimMixin):
             self._pending_winmm_lost_reason = ""
             self._pending_winmm_recovered_gaps.clear()
             mode, self._rec_mode = self._rec_mode, ""
+        self._stop_level_streamer()
         drain_sec = self.cfg.audio.effective_tail_drain_sec(macos=False) if (drain and mode) else 0.0
         if mode == "winmm" or was_dispatched:
             if self._closed:
@@ -738,6 +766,7 @@ class WslPlatform(JsonlShimMixin):
                             self._winmm_gen = stop_gen
                             self._rec_mode = mode
                             self._rec_writer = rec_writer
+                            self._winmm_starting = was_starting
                             self._winmm_rpc_dispatched = was_dispatched
                             self._active_seq_id = prev_seq_id
                 raise
@@ -759,10 +788,16 @@ class WslPlatform(JsonlShimMixin):
     def cancel_recording(self) -> None:
         self._stop_level_streamer()
         with self._winmm_state_lock:
-            orig_gen = self._winmm_gen if (self._rec_mode == "winmm" or self._winmm_rpc_dispatched) else 0
-            orig_writer = self._rec_writer if orig_gen > 0 else None
+            is_winmm = self._rec_mode == "winmm" or self._winmm_rpc_dispatched
+            orig_gen = self._winmm_gen if (is_winmm or self._winmm_starting) else 0
+            orig_writer = self._rec_writer if is_winmm else None
+            expected_gen = (
+                self._winmm_gen
+                if (is_winmm or self._winmm_starting or self._rec_mode == "pulse")
+                else None
+            )
         try:
-            self.stop_recording(drain=False, _discard=True)
+            self.stop_recording(drain=False, _discard=True, _expected_gen=expected_gen)
         except _ShimWriteTimeout as wto:
             if wto.write_status != "not_sent":
                 return
@@ -770,7 +805,12 @@ class WslPlatform(JsonlShimMixin):
             with self._winmm_state_lock:
                 if self._closed:
                     return
-                if orig_gen > 0 and self._winmm_gen == orig_gen and self._rec_writer is orig_writer:
+                if (
+                    orig_gen > 0
+                    and self._winmm_gen == orig_gen
+                    and (orig_writer is None or self._rec_writer is orig_writer)
+                ):
+                    reap_writer = self._rec_writer if orig_writer is None else orig_writer
                     self._winmm_gen += 1
                     self._active_seq_id = None
                     self._rec_writer = None
@@ -779,11 +819,10 @@ class WslPlatform(JsonlShimMixin):
                     self._pending_winmm_lost_reason = ""
                     self._pending_winmm_recovered_gaps.clear()
                     self._rec_mode = ""
-                    reap_writer = orig_writer
                 elif orig_writer is not None and self._rec_writer is not orig_writer:
                     reap_writer = orig_writer
-            if reap_writer is not None and not self._closed:
-                self._poison_and_reap_writer(reap_writer)
+            if reap_writer is not None:
+                self._reap_unowned_writer(reap_writer)
         except Exception:
             pass
 

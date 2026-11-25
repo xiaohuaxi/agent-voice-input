@@ -745,6 +745,20 @@ def probe_macos_host(
 
 
 class _MacRecSession:
+    """Per-recording state guarded exclusively by ``MacOSPlatform._rec_cond``.
+
+    Flag invariants:
+    - ``active``: True while capturing or attempting single-shot auto-recovery; cleared on
+      normal ``stop_recording()``, disconnect loss, or hard abort.
+    - ``aborted``: True only on hard cancel/close/preemption/busy-timeout (discard audio).
+      Intentionally stays False during normal ``stop_recording()`` so an in-flight recovery
+      or disconnect worker still salvages captured PCM into ``pcm``.
+    - ``busy``: True while ``_on_ffmpeg_unexpected_exit`` or ``avi-mac-rec-disconnect``
+      exclusively owns ``rec``; ``start``/``stop``/``cancel`` wait on ``_rec_cond`` until clear.
+    - ``pending_exit`` / ``force_lost_reason``: Deferred signals recorded under ``_rec_cond``
+      while ``busy`` is True, reconciled before the owning worker clears ``busy``.
+    """
+
     def __init__(
         self,
         gen: int,
@@ -843,6 +857,20 @@ class MacOSPlatform(JsonlShimMixin):
         self._mic_auth: str = ""
         self._has_graphic_session: bool | None = None
         self._is_remote_session: bool | None = None
+        # Recording lifecycle invariants:
+        # - Lock order: NEVER nest _rec_cond and _audio_cache_lock (or run ffmpeg / shim RPC I/O
+        #   under either lock). CoreAudio events mirror _audio_event_ver -> _rec_audio_event_ver
+        #   under _rec_cond so start_recording() Phase 2 can re-verify without nesting locks.
+        # - Table coverage (all guarded by _rec_cond):
+        #   * _cur_session: set only after rec.start() verifies first audio frames, and cleared
+        #     before stop_recording() runs lock-free tail_drain.
+        #   * _spawning_recs[gen]: tracks recorders inside rec.start() (initial start or respawn)
+        #     until committed to _cur_session or fully stopped on abort/error.
+        #   * _stopping_recs[tok]: tracks recorders inside lock-free rec.stop() (incl. 0.45s
+        #     tail_drain), removed only in finally via _finish_stopping(). close() aborts and
+        #     drains _spawning_recs U _stopping_recs so no orphan ffmpeg survives.
+        #   * _pending_stop_gen: bridges the _spawning_recs -> _cur_session handoff when
+        #     stop_recording() arrives mid-start, skipping level-streamer startup on commit.
         self._rec_cond = threading.Condition()
         self._rec_gen: int = 0
         self._rec_audio_event_ver: int = 0

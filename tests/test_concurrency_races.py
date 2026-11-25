@@ -5147,6 +5147,208 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 gate_file.write_text("go", encoding="utf-8")
                 wplat.close()
 
+    def test_stage3a_wsl_stop_recording_expected_gen_and_cancel_handoff_guard(self) -> None:
+        """Stage 3A 0+: stop_recording(_expected_gen=...) rejects stale gen and cancel_recording() passes orig_gen."""
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        mock_shim_src = (
+            "import json, sys\n"
+            "log_path = sys.argv[1]\n"
+            "print(json.dumps({'event': 'ready', 'ok': True, 'caps': ['wasapi_v2']}), flush=True)\n"
+            "for raw in sys.stdin:\n"
+            "    raw = raw.strip()\n"
+            "    if not raw:\n"
+            "        continue\n"
+            "    msg = json.loads(raw)\n"
+            "    with open(log_path, 'a', encoding='utf-8') as f:\n"
+            "        f.write(json.dumps(msg) + '\\n')\n"
+            "    cmd = msg.get('cmd')\n"
+            "    sid = msg.get('seq_id', 0)\n"
+            "    if cmd == 'quit':\n"
+            "        break\n"
+            "    if cmd == 'rec_start':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True}), flush=True)\n"
+            "    elif cmd == 'rec_stop':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True, 'rec_gen': msg.get('rec_gen', 0), 'wav_b64': ''}), flush=True)\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cmd_log = tmp / "wsl_expected_gen.jsonl"
+            rt = tmp / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            wplat = WslPlatform(
+                Config(audio=AudioConfig(wsl_source="wasapi", tail_drain_sec=0.0)),
+                env={"HOME": td},
+                shim_cmd_factory=lambda: [sys.executable, "-u", "-c", mock_shim_src, str(cmd_log)],
+            )
+            try:
+                wplat.start_event_listener(lambda _e: None)
+                wplat.start_recording(rt, seq_id=1)
+                with wplat._winmm_state_lock:
+                    gen1 = wplat._winmm_gen
+                wplat.stop_recording(drain=False)
+
+                wplat.start_recording(rt, seq_id=2)
+                with wplat._winmm_state_lock:
+                    gen2 = wplat._winmm_gen
+                    writer2 = wplat._rec_writer
+                self.assertGreater(gen2, gen1)
+
+                # 1. Direct stale-gen stop_recording() must be a no-op and leave gen2 intact.
+                wav_stale, src_stale = wplat.stop_recording(drain=False, _expected_gen=gen1)
+                self.assertEqual((wav_stale, src_stale), (b"", "winmm"))
+                with wplat._winmm_state_lock:
+                    self.assertEqual(wplat._winmm_gen, gen2)
+                    self.assertEqual(wplat._rec_mode, "winmm")
+                    self.assertIs(wplat._rec_writer, writer2)
+                    self.assertEqual(wplat._active_seq_id, 2)
+
+                # 2. cancel_recording() forwards orig_gen so a concurrent gen3 started before
+                #    stop_recording() acquires _winmm_state_lock is never stopped.
+                seen_expected: list[int | None] = []
+                orig_stop = wplat.stop_recording
+
+                def _interleaved_stop(*, drain: bool = True, _discard: bool = False, _expected_gen: int | None = None) -> tuple[bytes, str]:
+                    seen_expected.append(_expected_gen)
+                    # Advance to gen3 before forwarding gen2's cancel into stop_recording().
+                    wplat.start_recording(rt, seq_id=3)
+                    return orig_stop(drain=drain, _discard=_discard, _expected_gen=_expected_gen)
+
+                wplat.stop_recording = _interleaved_stop  # type: ignore[method-assign]
+                try:
+                    wplat.cancel_recording()
+                finally:
+                    wplat.stop_recording = orig_stop  # type: ignore[method-assign]
+
+                self.assertEqual(seen_expected, [gen2])
+                with wplat._winmm_state_lock:
+                    gen3 = wplat._winmm_gen
+                    self.assertGreater(gen3, gen2)
+                    self.assertEqual(wplat._rec_mode, "winmm")
+                    self.assertIs(wplat._rec_writer, writer2)
+                    self.assertEqual(wplat._active_seq_id, 3)
+
+                # 3. Backward-compatible stop_recording(drain=False) (default _expected_gen=None) stops gen3.
+                wplat.stop_recording(drain=False)
+                cmds = [json.loads(ln) for ln in cmd_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                stop_gens = [c.get("rec_gen") for c in cmds if c.get("cmd") == "rec_stop"]
+                self.assertEqual(stop_gens, [gen1, gen3])
+            finally:
+                wplat.close()
+
+    def test_stage3a_wsl_cancel_reap_skips_writer_adopted_by_newer_gen(self) -> None:
+        """Stage 3A 0+: cancel_recording() never poisons a writer already adopted by a newer generation, and not_sent rollback preserves _winmm_starting."""
+        from agent_voice_input.platform_wsl import WslPlatform
+
+        mock_shim_src = (
+            "import json, os, sys, time\n"
+            "gate_path = sys.argv[1]\n"
+            "print(json.dumps({'event': 'ready', 'ok': True, 'caps': ['wasapi_v2']}), flush=True)\n"
+            "for raw in sys.stdin:\n"
+            "    raw = raw.strip()\n"
+            "    if not raw:\n"
+            "        continue\n"
+            "    msg = json.loads(raw)\n"
+            "    cmd = msg.get('cmd')\n"
+            "    sid = msg.get('seq_id', 0)\n"
+            "    if cmd == 'quit':\n"
+            "        break\n"
+            "    if cmd == 'rec_start':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True}), flush=True)\n"
+            "        while not os.path.exists(gate_path):\n"
+            "            time.sleep(0.01)\n"
+            "    elif cmd == 'rec_stop':\n"
+            "        print(json.dumps({'reply': True, 'seq_id': sid, 'ok': True, 'rec_gen': msg.get('rec_gen', 0), 'wav_b64': ''}), flush=True)\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            gate_file = tmp / "hold.gate"
+            rt = tmp / "rt"
+            rt.mkdir(parents=True, exist_ok=True)
+            wplat = WslPlatform(
+                Config(audio=AudioConfig(wsl_source="wasapi", tail_drain_sec=0.0)),
+                env={"HOME": td},
+                shim_cmd_factory=lambda: [sys.executable, "-u", "-c", mock_shim_src, str(gate_file)],
+            )
+            try:
+                wplat.start_event_listener(lambda _e: None)
+                wplat.start_recording(rt, seq_id=1)
+                with wplat._winmm_state_lock:
+                    gen1 = wplat._winmm_gen
+                    writer1 = wplat._rec_writer
+                self.assertIsNotNone(writer1)
+                assert writer1 is not None
+                proc1 = writer1.proc
+
+                # 1. Verify not_sent rollback also restores _winmm_starting when interrupted mid-start.
+                with wplat._winmm_state_lock:
+                    wplat._rec_mode = ""
+                    wplat._winmm_starting = True
+                    wplat._winmm_rpc_dispatched = True
+                with mock.patch.object(
+                    wplat, "_shim_rpc", side_effect=_ShimWriteTimeout("wedged", write_status="not_sent")
+                ):
+                    with self.assertRaises(_ShimWriteTimeout):
+                        wplat.stop_recording(drain=False)
+                with wplat._winmm_state_lock:
+                    self.assertEqual(wplat._winmm_gen, gen1)
+                    self.assertTrue(wplat._winmm_starting)
+                    self.assertTrue(wplat._winmm_rpc_dispatched)
+                    self.assertIs(wplat._rec_writer, writer1)
+                    # Restore steady winmm state for the cancel_recording() ownership race check.
+                    wplat._rec_mode = "winmm"
+                    wplat._winmm_starting = False
+                    wplat._winmm_rpc_dispatched = False
+
+                # 2. If gen2 adopts the same writer1 after cancel_recording() selects reap_writer
+                #    but before _reap_unowned_writer() runs, writer1 must NOT be poisoned/killed.
+                poison_calls: list[Any] = []
+                orig_reap_unowned = wplat._reap_unowned_writer
+                orig_poison = wplat._poison_and_reap_writer
+
+                def _counting_poison(w: Any) -> None:
+                    poison_calls.append(w)
+                    orig_poison(w)
+
+                gen2_holder: list[int] = []
+
+                def _adopt_before_reap(w: Any) -> None:
+                    with wplat._winmm_state_lock:
+                        wplat._winmm_gen += 1
+                        gen2_holder.append(wplat._winmm_gen)
+                        wplat._rec_mode = "winmm"
+                        wplat._rec_writer = w
+                        wplat._active_seq_id = 2
+                    orig_reap_unowned(w)
+
+                with (
+                    mock.patch.object(
+                        wplat, "_shim_rpc", side_effect=_ShimWriteTimeout("wedged", write_status="not_sent")
+                    ),
+                    mock.patch.object(wplat, "_poison_and_reap_writer", side_effect=_counting_poison),
+                    mock.patch.object(wplat, "_reap_unowned_writer", side_effect=_adopt_before_reap),
+                ):
+                    wplat.cancel_recording()
+
+                self.assertEqual(len(gen2_holder), 1)
+                self.assertEqual(poison_calls, [], "must not poison a writer adopted by a newer generation")
+                self.assertIsNone(proc1.poll(), "adopted shim process must stay alive")
+                with wplat._winmm_state_lock:
+                    self.assertEqual(wplat._winmm_gen, gen2_holder[0])
+                    self.assertEqual(wplat._rec_mode, "winmm")
+                    self.assertIs(wplat._rec_writer, writer1)
+                    self.assertEqual(wplat._active_seq_id, 2)
+
+                # 3. Positive control: once unowned, _reap_unowned_writer() reaps writer1 normally.
+                with wplat._winmm_state_lock:
+                    wplat._rec_writer = None
+                    wplat._rec_mode = ""
+                wplat._reap_unowned_writer(writer1)
+                self.assertIsNotNone(proc1.poll(), "unowned wedged shim should be reaped")
+            finally:
+                gate_file.write_text("go", encoding="utf-8")
+                wplat.close()
+
 
 if __name__ == "__main__":
     unittest.main()
