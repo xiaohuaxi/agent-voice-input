@@ -25,13 +25,50 @@ Built for **Codex**, **Claude Code**, and **Antigravity CLI (`agy`)**, while wor
 
 ---
 
+## Quick Start in 60 Seconds
+
+### Path A: Let Your AI Agent Set It Up (Recommended)
+
+The CLI is **100% non-interactive** (zero `y/n` prompts) with structured `--json` diagnostics. Paste this into **Codex**, **Claude Code**, or **AGY**:
+
+```text
+Install and configure agent-voice-input following docs/agent-setup.md (https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/agent-setup.md):
+1. Respect my local keyboard layout (auto-use ROption on MacBook built-in keyboards; keep RControl on desktop Macs such as Mac mini with external keyboards and on Windows/WSL2).
+2. Only run `agent-voice-input integrate` if my setup actually needs hooks (e.g., multiple non-tmux WSL2 windows in the same directory).
+3. After `doctor --ping --json` and `start`, guide me through a quick live or `--dry-run` connectivity check.
+```
+
+### Path B: Manual Setup in 3 Steps
+
+```bash
+# 1. Install prerequisites (macOS: `brew install ffmpeg` + `xcode-select --install` | WSL2: `sudo apt install ffmpeg`)
+uv tool install agent-voice-input          # or `pipx install agent-voice-input` / `pip install agent-voice-input`
+
+# 2. Initialize 0600 config.toml & agent-voice-input.env (optional: `--asr`, `--refiner`, `--hotkey`)
+agent-voice-input init
+
+# 3. Verify connectivity & start daemon (first start prints a quick test-dictation tip)
+agent-voice-input doctor --ping && agent-voice-input start
+```
+
+- **Keyboard-aware defaults**: `init` automatically sets `key = "ROption"` on MacBook built-in keyboards, and keeps `key = "RControl"` on desktop Macs (e.g., Mac mini with an external full-size keyboard) and Windows/WSL2. Tap hotkey `<= 0.5s` to start/stop; hold `0.8s` to cancel.
+- **Simplest 1-key setup**: `init` auto-detects existing environment keys and local `codex` CLI logins and tells you immediately if you are ready out of the box. If you have no Stage 1 key yet, add just **1 key** to `~/.config/agent-voice-input/agent-voice-input.env`:
+  - **Mainland China**: `DASHSCOPE_API_KEY` or `DEEPSEEK_API_KEY`
+  - **Global / Overseas**: `OPENAI_API_KEY` or `GEMINI_API_KEY`
+- Templates & full agent guide: [`config.example.toml`](config.example.toml), [`config.example.env`](config.example.env), and [`docs/agent-setup.md`](docs/agent-setup.md).
+
+> [!TIP]
+> **Zero hooks required for ~80% of daily workflows**: macOS Ghostty / `Terminal.app` / `iTerm2`, local or remote `tmux` on any platform (no `~/.tmux.conf` edits), all desktop apps, and WSL2 single-window or distinct-directory windows route accurately out of the box. Only if you run multiple standalone non-`tmux` windows in the **same directory** (e.g., Windows Terminal on WSL2) do you ever need one optional command: `agent-voice-input integrate` (see [`integrations/README.md`](integrations/README.md)).
+
+---
+
 ## Core Technical Highlights
 
-- **Two-Stage & Single-Hop Modes + 50K Block Prefix Caching → High Accuracy, Low Latency & Lower Cost**: Pair dedicated Stage 1 STT with lightweight Stage 2 refinement, or run single-hop multimodal audio; session history is segmented into immutable 50K read-only prefix blocks for high prompt-cache hits, while back-to-back utterances refine concurrently and paste in strict FIFO order.
-- **Focus-Aware Terminal, IDE & SSH Routing → Zero Context Crosstalk**: Automatically binds to the active coding session and `git status` filenames in your focused terminal window, Ghostty split, or `tmux` pane; desktop IDEs mount only the local workspace without leaking terminal sessions; everyday/chat apps switch to clean general dictation; SSH terminals block local session leaks by default and support zero-install remote context over `ssh -- <host> python3 -` with a 1-line whitelist.
-- **Zero Third-Party Python Dependencies + Acoustic Silence Gating → Lightweight & Waste-Free**: Pure Python `>= 3.10` standard library plus host `ffmpeg` and minimal native shims (no Electron); local silence gating and loudness normalization block empty triggers before calling APIs, recordings run up to 10 minutes (auto-splitting `> 3 min` clips at natural pauses), and failed or in-flight-cancelled audio is stashed (`0600`) for `retry`.
-- **Zero-Clipboard Injection in macOS Ghostty/`tmux` + Never Auto-Presses Enter → Terminal-Safe Delivery**: Locks onto the origin window on record start and falls back to clipboard if focus drifts; injects text directly in **macOS** Ghostty and **macOS** `tmux` without touching your clipboard (WSL2—including inside `tmux`—uses `win_shim` transient clipboard snapshots + shortcut paste, and other windows also snapshot and restore clipboard payloads without clobbering existing contents); paste-only by default so a misheard command never executes by accident.
-- **100% Non-Interactive CLI → Built for Your AI Agent to Install & Troubleshoot**: Every command runs without `y/n` prompts and supports structured `--json` diagnostics (`doctor --ping --json`, `diagnose --json`), so you can hand setup and troubleshooting straight to Codex, Claude Code, or AGY.
+- **Two-Stage & Single-Hop + 50K Block Prefix Caching**: Pair fast Stage 1 STT with lightweight Stage 2 refinement, or run single-hop multimodal audio; session history is sealed into immutable 50K prefix blocks for high cache hits while back-to-back utterances refine concurrently and paste in strict FIFO order.
+- **Focus-Aware Terminal, IDE & SSH Routing**: Automatically binds to the active session and `git status` filenames in your focused terminal, Ghostty split, or `tmux` pane; desktop IDEs mount only workspace context without leaking terminal sessions; chat/everyday apps switch to clean general dictation; SSH terminals block local leaks by default and support zero-install remote probing via a 1-line `[remote] hosts` whitelist.
+- **Zero Third-Party Python Dependencies + Acoustic Silence Gating**: Pure Python `>= 3.10` standard library plus host `ffmpeg` and minimal native shims (no Electron); local silence gating and loudness normalization filter empty triggers before API calls, recordings support up to 10 minutes (auto-splitting `> 3 min` clips at pauses), and failed or in-flight-cancelled clips stash (`0600`) for `retry`.
+- **Zero-Clipboard Injection in macOS Ghostty/`tmux` + Never Auto-Presses Enter**: Locks onto the origin window on record start and falls back to clipboard if focus drifts; injects directly in **macOS** Ghostty and **macOS** `tmux` without touching your clipboard (WSL2—including inside `tmux`—and other windows snapshot and restore clipboard contents); paste-only by default so misheard commands never auto-execute.
+- **100% Non-Interactive CLI for Human & Agent Workflows**: Every command runs without `y/n` prompts and supports `--json` output (`doctor --ping --json`, `diagnose --json`, `integrate --status --json`), so both humans and AI agents can install, verify, and troubleshoot cleanly.
 
 ---
 
@@ -71,41 +108,9 @@ Built for **Codex**, **Claude Code**, and **Antigravity CLI (`agy`)**, while wor
 
 > Using a `🧪` or `⚪` environment? If it works smoothly—or if you run into an edge case—please open an Issue with your **OS + terminal/app + provider** to help us light up more `✅`.
 
-> [!TIP]
-> **Zero hooks, zero `tmux` config, desktop-wide out of the box**: Single-window terminals, macOS Ghostty splits, `tmux` panes (no `~/.tmux.conf` edits), desktop IDEs, and everyday apps all work immediately. Optional title hooks or a 1-line `[remote] hosts` whitelist are only needed for multi-window same-directory WSL2 tabs or remote SSH context prefetch.
-
 ---
 
-## 1-Minute Quick Start
-
-### Path A: Let Your AI Agent Install & Configure It (Recommended)
-
-Because the CLI is **100% non-interactive** (zero `y/n` prompts), paste this directly into **Codex**, **Claude Code**, or **AGY**:
-
-```text
-Please install and configure agent-voice-input (https://github.com/xiaohuaxi/agent-voice-input) for me:
-1. Check python3 (>=3.10) and ffmpeg (plus Xcode Command Line Tools `/usr/bin/swiftc` on macOS), then install via `uv tool install agent-voice-input` (fall back to `pipx` if `uv` is unavailable).
-2. Run `agent-voice-input init` to create 0600 `~/.config/agent-voice-input/config.toml` and `agent-voice-input.env`.
-3. Check if a Stage 1 speech-capable API key is already configured (DASHSCOPE_API_KEY, DOUBAO_SPEECH_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, GROQ_API_KEY, or SILICONFLOW_API_KEY; optional Stage 2 keys like DEEPSEEK_API_KEY / ARK_API_KEY or local codex/agy CLI login can pair with it, and DEEPSEEK_API_KEY alone covers both stages); if none exists, ask which provider I prefer and add it to `agent-voice-input.env`.
-4. Run `agent-voice-input doctor --ping`, then start the background daemon with `agent-voice-input start`.
-```
-
-### Path B: Manual Setup in 3 Steps (`v0.15.0`)
-
-```bash
-# 1. Install ffmpeg + CLI (WSL2: `sudo apt install ffmpeg` | macOS: `brew install ffmpeg` + `xcode-select --install`)
-uv tool install agent-voice-input          # or `pipx install agent-voice-input`
-
-# 2. Create 0600 config.toml & agent-voice-input.env, then uncomment at least one Stage 1 key in .env
-agent-voice-input init
-
-# 3. Verify connectivity & start daemon (tap Right Ctrl <= 0.5s to start/stop; hold 0.8s to cancel)
-agent-voice-input doctor --ping && agent-voice-input start
-```
-
-> MacBook keyboards without a Right Ctrl key can set `key = "ROption"` or `"Fn"` under `[hotkey]` in `~/.config/agent-voice-input/config.toml` and run `agent-voice-input restart`. Full templates: [`v0.15.0/config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.15.0/config.example.toml) ([`main`](config.example.toml)) and [`v0.15.0/config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/v0.15.0/config.example.env) ([`main`](config.example.env)).
-
-### Recommended Provider Combinations by Scenario
+## Recommended Provider Combinations by Scenario
 
 | Scenario | Recommended Stage 1 (ASR) | Recommended Stage 2 (Refiner) | Keys / Setup Needed |
 | :--- | :--- | :--- | :--- |
@@ -130,7 +135,7 @@ agent-voice-input doctor --ping && agent-voice-input start
 ## FAQ & Common Gotchas
 
 - **My MacBook doesn't have a Right Ctrl key—what should I use?**  
-  Set `key = "ROption"` (Right Option) or `key = "Fn"` under `[hotkey]` in `~/.config/agent-voice-input/config.toml`, then run `agent-voice-input restart`. You can inspect raw keycodes anytime with `agent-voice-input key-test`.
+  `agent-voice-input init` automatically detects MacBook built-in keyboards and sets `key = "ROption"` (Right Option), while desktop Macs (e.g., Mac mini) and external full-size keyboards keep `key = "RControl"`. You can also switch anytime under `[hotkey]` in `~/.config/agent-voice-input/config.toml` (`"ROption"`, `"Fn"`, or `"RControl"`), run `agent-voice-input restart`, or inspect raw keycodes with `agent-voice-input key-test`.
 - **Why does macOS record pure silence when I start the daemon over SSH?**  
   macOS binds Microphone TCC permission to the responsible GUI process; daemons launched under `sshd` receive silent all-zero audio frames. Always run `agent-voice-input start` / `restart` inside an authorized local GUI terminal (such as Ghostty or `Terminal.app`).
 - **How do I route the background daemon through a proxy?**  
@@ -145,19 +150,21 @@ agent-voice-input doctor --ping && agent-voice-input start
 ## CLI Commands & Optional Integrations
 
 ```bash
-agent-voice-input init                   # Create 0600 config.toml and commented agent-voice-input.env (--force overwrites)
-agent-voice-input start | restart | stop # Manage background daemon (start is idempotent and warns on code/version drift)
-agent-voice-input status                 # Inspect daemon health, active pipeline, and drift (--history N)
-agent-voice-input doctor [--ping] [--remote] [--json]   # Check audio, native shim, credentials, SSH readiness, and endpoint ping
+agent-voice-input init [--asr P] [--refiner P] [--hotkey K] [--force]  # Create 0600 config.toml & agent-voice-input.env with smart defaults
+agent-voice-input start | restart | stop                # Manage background daemon (start is idempotent and warns on code/version drift)
+agent-voice-input status                                # Inspect daemon health, active pipeline, and drift (--history N)
+agent-voice-input doctor [--ping] [--remote] [--json]   # Check audio, native shim, credentials, hooks, SSH readiness, and endpoint ping
+agent-voice-input integrate [--status] [--dry-run] [--cli claude|codex|agy] [--uninstall] [--json]  # Safe optional CLI hook setup
 agent-voice-input diagnose [--last N] [--json]          # Read-only diagnostics: latency p50, cache hits, failed/ count, redacted log tail
 agent-voice-input retry [--list] [--print]              # List or re-run stashed failed recordings
 agent-voice-input hotwords list|add|remove              # Manage [global]/[chat]/[coding] hotwords & check provider quotas (--scope, --json)
 agent-voice-input once --duration 4 --dry-run           # Record once and print without pasting (or `--file <wav> --dry-run` on Linux)
-agent-voice-input toggle | cancel        # Trigger start/stop or cancel active/in-flight jobs (--seq N)
-agent-voice-input key-test               # Inspect raw key scancodes / modifier events
+agent-voice-input toggle | cancel                       # Trigger start/stop or cancel active/in-flight jobs (--seq N)
+agent-voice-input key-test                              # Inspect raw key scancodes / modifier events
 ```
 
-- **Optional multi-window hooks & SSH remote Linux (`[remote]`)**: Single-window terminals, Ghostty splits, and `tmux` panes work with zero hooks. For multiple standalone WSL2 windows in the **same project directory**, or to enable zero-install SSH remote context (`[remote] hosts = ["devbox"]`, verified with `agent-voice-input doctor --remote`), see [`integrations/README.md`](integrations/README.md) (SSH section: [SSH Remote Linux Hosts](integrations/README.md#5-ssh-remote-linux-hosts-zero-install--optional-title-hook)) and [`docs/context-routing.md`](docs/context-routing.md).
+- **AI Agent setup & troubleshooting contract**: [`docs/agent-setup.md`](docs/agent-setup.md)
+- **Optional multi-window hooks & SSH remote Linux (`[remote]`)**: Single-window terminals, Ghostty splits, and `tmux` panes work with zero hooks. For multiple standalone WSL2 windows in the **same project directory** (use `agent-voice-input integrate`), or to enable zero-install SSH remote context (`[remote] hosts = ["devbox"]`, verified with `agent-voice-input doctor --remote`), see [`integrations/README.md`](integrations/README.md) (SSH section: [SSH Remote Linux Hosts](integrations/README.md#5-ssh-remote-linux-hosts-zero-install--optional-title-hook)) and [`docs/context-routing.md`](docs/context-routing.md).
 
 ---
 
@@ -176,7 +183,7 @@ Configuration priority: `CLI flags > ~/.config/agent-voice-input/config.toml > b
 | **`dashscope`** | `asr`, `refiner` | `✅` *(STT, single-hop & refiner)* | `qwen3-asr-flash` *(or single-hop `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(compat: `ALI_API_KEY`)* |
 | **`doubao`** | `asr` | `✅` *(1.0 & 2.0)* | `bigmodel` | — | `DOUBAO_SPEECH_API_KEY` *(single-header `X-Api-Key`, no `APP_ID` needed; compat: `DOUBAO_ASR_API_KEY` or legacy `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`; `auto` prefers sync `volc.bigasr.auc_turbo` with cached fallback to `volc.seedasr.auc` / `volc.bigasr.auc`)* |
 | **`volcengine`** | `refiner` | `✅` *(`doctor --ping` & refiner)* | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(compat: `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
-| **`openrouter`** | `asr`, `refiner` | `✅` *(STT, single-hop & refiner)* | `qwen/qwen3-asr-1.7b` | `google/gemini-3.5-flash-lite` | `OPENROUTER_API_KEY` |
+| **`openrouter`** | `asr`, `refiner` | `✅` *(STT, single-hop & refiner)* | `qwen/qwen3-asr-1.7b` | `google/gemini-3.8-flash` | `OPENROUTER_API_KEY` |
 | **`gemini`** | `asr`, `refiner` | `✅` *(single-hop & refiner)* | `gemini-3.7-flash` *(single-hop)* | `gemini-3.7-flash` | `GEMINI_API_KEY` |
 | **`openai`** | `asr`, `refiner` | `✅` *(STT, single-hop & refiner)* | `gpt-transcribe` *(or single-hop `gpt-audio-1.5` / `gpt-audio-mini`)* | `gpt-6-luna` | `OPENAI_API_KEY` |
 | **`groq`** | `asr`, `refiner` | `🧪` | `whisper-large-v3-turbo` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
@@ -184,7 +191,7 @@ Configuration priority: `CLI flags > ~/.config/agent-voice-input/config.toml > b
 | **`openai-compatible`** | `asr`, `refiner` | `🧪` | `gpt-4o-mini-transcribe` *(needs `base_url`)* | *(needs explicit `base_url` + `model`)* | `api_key_env` or `OPENAI_API_KEY` *(loopback URLs need no key)* |
 | **`off`** | `refiner` | `✅` | — | *(Stage 2 disabled; raw Stage 1 output)* | None |
 
-- `asr.provider = "auto"` (default): picks the first configured credential in order `dashscope -> doubao -> openrouter -> gemini -> openai -> deepseek -> groq -> siliconflow`.
+- `asr.provider = "auto"` (default): picks the first configured credential in order `dashscope -> doubao -> deepseek -> openai -> gemini -> groq -> openrouter -> siliconflow`.
 - `refiner.provider = "auto"` (default): prefers local `codex` CLI login when present, else picks `deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow`, or degrades cleanly to `"off"`. (`agy` is explicit opt-in only.)
 
 ```toml
@@ -208,7 +215,7 @@ provider = "deepseek"            # Or "openrouter"
 ```toml
 # Recipe 3: Single-hop multimodal audio + 50K cached session context (skips Stage 2)
 [asr]
-provider = "gemini"              # Or "dashscope" + model = "qwen3.8-omni-flash", "openai" + model = "gpt-audio-1.5" / "gpt-audio-mini", or "openrouter" + model = "google/gemini-3.5-flash-lite"
+provider = "gemini"              # Or "dashscope" + model = "qwen3.8-omni-flash", "openai" + model = "gpt-audio-1.5" / "gpt-audio-mini", or "openrouter" + model = "google/gemini-3.8-flash"
 effort = "auto"
 ```
 
@@ -247,7 +254,7 @@ effort = "auto"
 | CLI Flag | Description |
 | :--- | :--- |
 | `--config PATH` | Path to `config.toml` or `config.json` (also supports `AGENT_VOICE_INPUT_CONFIG` and `XDG_CONFIG_HOME`) |
-| `--asr`, `--asr-provider` | Stage 1 provider (`auto`, `dashscope`, `doubao`, `openrouter`, `gemini`, `openai`, `deepseek`, `groq`, `siliconflow`, `openai-compatible`; aliases `volcengine`/`volc` → `doubao`, `bailian` → `dashscope`) |
+| `--asr`, `--asr-provider` | Stage 1 provider (`auto`, `dashscope`, `doubao`, `deepseek`, `openai`, `gemini`, `groq`, `openrouter`, `siliconflow`, `openai-compatible`; aliases `volcengine`/`volc` → `doubao`, `bailian` → `dashscope`) |
 | `--asr-model` | Stage 1 upstream model ID |
 | `--asr-api` | Stage 1 protocol (`auto`, `audio-transcriptions`, `chat-completions`) |
 | `--asr-effort` | Stage 1 thinking budget |

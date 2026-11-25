@@ -1,20 +1,46 @@
-[English](README.md) | [简体中文](README.zh-CN.md)
+**English** | [简体中文](README.zh-CN.md)
 
 # Agent Terminal Title & Session Registry Integrations
 
-`agent-voice-input` can bind to the active foreground coding agent session in **O(1) time** across multiple concurrent terminal tabs/windows, extracting clean recent dialogue and `git status` file hotwords for speech recognition and Stage 2 refinement while strictly ignoring background subagents and non-interactive child processes.
+> [!TIP]
+> **~80% of daily workflows need zero hooks**: macOS Ghostty / `Terminal.app` / `iTerm2`, local or remote `tmux` on any platform (no `~/.tmux.conf` edits), all desktop apps, and WSL2 single-window or distinct-directory windows bind accurately out of the box.
 
-All integrations below are **optional enhancements**:
-- **Inside `tmux`**, active-pane tracking works out of the box on both Linux/WSL2 and macOS without modifying `~/.tmux.conf` (matching the focused attached client's active pane while isolating sibling panes).
-- On **macOS + Ghostty**, `agent-voice-input` already reads the focused split's `tty` and `cwd` to match each split's active `codex`, `claude`, or `agy` session without hooks (including when Ghostty attaches to `tmux`).
-- On **Linux / WSL2**, without hooks it automatically falls back to `/proc` foreground interactive root-session scanning and window-title / directory disambiguation.
-- For the full local, desktop IDE, and SSH remote routing matrix, see [`docs/context-routing.md`](../docs/context-routing.md).
+Optional hooks are mainly useful when you run **multiple standalone non-`tmux` windows in the same project directory**—for example, Windows Terminal on WSL2 without `tmux`, or macOS terminals without a `tty` query API (WezTerm, Kitty, Alacritty, Warp). With hooks enabled, `agent-voice-input` binds to the foreground root session in **O(1) time** while strictly ignoring background subagents and headless child processes.
+
+For the complete local, desktop IDE, and SSH remote routing matrix, see [`docs/context-routing.md`](../docs/context-routing.md).
 
 ---
 
-## 1. Codex CLI (`~/.codex/config.toml`)
+## Recommended: Safe One-Command Setup (`agent-voice-input integrate`)
 
-Merge `terminal_title` from [`codex/config.toml`](codex/config.toml) into the `[tui]` table of `~/.codex/config.toml`:
+Instead of hand-editing JSON/TOML files (or letting an AI agent patch them manually), use the built-in non-interactive command:
+
+```bash
+agent-voice-input integrate --status     # Read-only check: detected CLIs, current hook state, and whether hooks are needed
+agent-voice-input integrate --dry-run    # Preview exact changes without modifying any file
+agent-voice-input integrate              # Safely install hooks for all detected CLIs
+```
+
+Supported flags:
+- `--cli all|claude|codex|agy`: Target a specific CLI (default: `all` detected CLIs).
+- `--uninstall`: Idempotently remove only `agent-voice-input` entries (leaving all other user hooks intact).
+- `--json`: Machine-readable output for AI agents and scripts.
+
+**Built-in safety guarantees**:
+1. **Dotfiles symlink preservation**: If a target config (e.g., `~/.claude/settings.json`) is a symlink managed by Stow, chezmoi, or a dotfiles repo, `integrate` resolves it and atomically writes to the real target without replacing the symlink.
+2. **Clean out-of-tree backups**: Pre-edit snapshots are saved under `~/.cache/agent-voice-input/integrate-backups/` (`0700`/`0600`), never leaving untracked `.bak` files inside dotfiles git repositories.
+3. **Idempotent merge & comment-safe TOML**: Existing user hooks (such as `PreToolUse` / `Stop`) and Codex TOML comments/tables are preserved; Codex edits are validated via `parse_toml()` before atomic replacement.
+4. **Zero extra `.sh` files & uninstall-safe inline commands**: Claude Code and AGY use self-contained inline `sh -c` commands with `PATH` / `$HOME/.local/bin` fallback—if `agent-voice-input` is later uninstalled, hooks fail silently without errors, Claude `stdout` stays empty, and AGY hooks always emit `{}`.
+
+---
+
+## Manual Configuration Examples
+
+If you prefer managing configs by hand (for example, inside a shared dotfiles repo), the sections below show the exact equivalent configuration for each CLI.
+
+### 1. Codex CLI (`~/.codex/config.toml`)
+
+Merge `terminal_title` from [`codex/config.toml`](codex/config.toml) into the `[tui]` table of `~/.codex/config.toml` (or run `agent-voice-input integrate --cli codex`):
 
 ```toml
 [tui]
@@ -25,9 +51,9 @@ Codex appends the root session's `thread-id` UUID to the terminal title, allowin
 
 ---
 
-## 2. Claude Code (`~/.claude/settings.json`)
+### 2. Claude Code (`~/.claude/settings.json`)
 
-Ensure `agent-voice-input` is on your `PATH` (or use its full path; see [`claude/voice-title.sh`](claude/voice-title.sh) for a `~/.local/bin` wrapper), and add `SessionStart` + `UserPromptSubmit` hooks in `~/.claude/settings.json` following [`claude/settings.hooks.json`](claude/settings.hooks.json):
+Add `SessionStart` and `UserPromptSubmit` hooks in `~/.claude/settings.json` (or run `agent-voice-input integrate --cli claude`; see also [`claude/settings.hooks.json`](claude/settings.hooks.json) and [`claude/voice-title.sh`](claude/voice-title.sh)). The recommended inline command checks `PATH` and `$HOME/.local/bin`, runs silently, and never errors if the binary is absent:
 
 ```json
 {
@@ -37,7 +63,7 @@ Ensure `agent-voice-input` is on your `PATH` (or use its full path; see [`claude
         "hooks": [
           {
             "type": "command",
-            "command": "agent-voice-input session-hook --cli claude"
+            "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; [ -x \"$b\" ] && \"$b\" session-hook --cli claude --quiet >/dev/null 2>&1 || true'"
           }
         ]
       }
@@ -47,7 +73,7 @@ Ensure `agent-voice-input` is on your `PATH` (or use its full path; see [`claude
         "hooks": [
           {
             "type": "command",
-            "command": "agent-voice-input session-hook --cli claude"
+            "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; [ -x \"$b\" ] && \"$b\" session-hook --cli claude --quiet >/dev/null 2>&1 || true'"
           }
         ]
       }
@@ -63,9 +89,9 @@ What the hook does:
 
 ---
 
-## 3. Antigravity CLI (`~/.gemini/config/hooks.json`)
+### 3. Antigravity CLI (`~/.gemini/config/hooks.json`)
 
-Following [`gemini/hooks.json`](gemini/hooks.json), add `voice-session-title` to `~/.gemini/config/hooks.json` (legacy `~/.gemini/hooks.json` and `~/.gemini/settings.json` remain recognized by `doctor`):
+Add `voice-session-title` to `~/.gemini/config/hooks.json` (or run `agent-voice-input integrate --cli agy`; see also [`gemini/hooks.json`](gemini/hooks.json); legacy `~/.gemini/hooks.json` and `~/.gemini/settings.json` remain recognized by `doctor`). The recommended inline command guarantees `{}` is always printed even if `agent-voice-input` is uninstalled:
 
 ```json
 {
@@ -73,14 +99,14 @@ Following [`gemini/hooks.json`](gemini/hooks.json), add `voice-session-title` to
     "SessionStart": [
       {
         "type": "command",
-        "command": "agent-voice-input session-hook --cli agy",
+        "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; if [ -x \"$b\" ]; then \"$b\" session-hook --cli agy --quiet >/dev/null 2>&1 || true; fi; printf \"{}\\n\"'",
         "timeout": 5
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "agent-voice-input session-hook --cli agy",
+        "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; if [ -x \"$b\" ]; then \"$b\" session-hook --cli agy --quiet >/dev/null 2>&1 || true; fi; printf \"{}\\n\"'",
         "timeout": 5
       }
     ]
@@ -88,7 +114,7 @@ Following [`gemini/hooks.json`](gemini/hooks.json), add `voice-session-title` to
 }
 ```
 
-The hook checks `presence/<cid>.lock` file locks, the opening JSONL record, and the parent process chain (`/proc` on Linux or `ps` on macOS) to filter out background subagents and headless `agy -p` invocations—recording the normalized `tty` (and `tmux_pane` metadata when inside `tmux`) in `<runtime_dir>/sessions/agy-<cid8>.json`, updating the controlling TTY / pane title (`agy · <short_cwd> [#<cid8>]`) without changing pane focus only for foreground interactive sessions, and returning a clean `{}` JSON response.
+The hook checks `presence/<cid>.lock` file locks, the opening JSONL record, and the parent process chain (`/proc` on Linux or `ps` on macOS) to filter out background subagents and headless `agy -p` invocations—recording the normalized `tty` (and `tmux_pane` metadata when inside `tmux`) in `<runtime_dir>/sessions/agy-<cid8>.json`, updating the controlling TTY / pane title (`agy · <short_cwd> [#<cid8>]`) without changing pane focus only for foreground interactive sessions, and always returning a clean `{}` JSON response.
 
 ---
 

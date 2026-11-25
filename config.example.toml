@@ -59,15 +59,15 @@ beep = false
 
 [asr]
 # Stage 1 speech-to-text provider:
-# "auto" | "dashscope" | "doubao" | "openrouter" | "gemini" | "openai" | "deepseek" | "groq" | "siliconflow" | "openai-compatible"
+# "auto" | "dashscope" | "doubao" | "deepseek" | "openai" | "gemini" | "groq" | "openrouter" | "siliconflow" | "openai-compatible"
 # Cross-stage aliases accepted: "volcengine"/"volc" -> "doubao", "bailian" -> "dashscope"
 # When "auto", selects the first configured credential in priority order:
-#   dashscope -> doubao -> openrouter -> gemini -> openai -> deepseek -> groq -> siliconflow
+#   dashscope -> doubao -> deepseek -> openai -> gemini -> groq -> openrouter -> siliconflow
 provider = "auto"
 # Upstream model ID (kept verbatim; leave empty "" to use the provider's built-in default):
 # - dashscope         -> "qwen3-asr-flash" (dedicated STT; also supports "fun-asr-realtime", "qwen-audio-turbo-latest", or single-hop "qwen3.8-omni-flash")
 # - doubao            -> "bigmodel"
-# - openrouter        -> "qwen/qwen3-asr-1.7b" (dedicated STT) or e.g. "google/gemini-3.5-flash-lite" / "qwen/qwen3.8-omni-flash" / "openai/gpt-audio-mini" (single-hop chat audio)
+# - openrouter        -> "qwen/qwen3-asr-1.7b" (dedicated STT) or e.g. "google/gemini-3.8-flash" / "qwen/qwen3.8-omni-flash" / "openai/gpt-audio-mini" (single-hop chat audio)
 # - gemini            -> "gemini-3.7-flash" (native :generateContent single-hop audio + context refinement; skips Stage 2 by default)
 # - openai            -> "gpt-transcribe" (dedicated STT) or e.g. "gpt-audio-1.5" / "gpt-audio-mini" (single-hop chat audio)
 # - deepseek          -> "deepseek-asr" (official /v1/tools/asr dedicated STT; <=8 MiB / <=120s per chunk; pairs with Stage 2 deepseek-flash)
@@ -115,7 +115,7 @@ hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
 # - deepseek          -> "deepseek-flash" (official https://api.deepseek.com/v1 with thinking disabled by default)
 # - dashscope         -> "qwen3.8-flash"
 # - volcengine        -> "doubao-seed-2-0-mini-260428"
-# - openrouter        -> "google/gemini-3.5-flash-lite"
+# - openrouter        -> "google/gemini-3.8-flash"
 # - gemini            -> "gemini-3.7-flash"
 # - openai            -> "gpt-6-luna"
 # - groq              -> "llama-3.3-70b-versatile"
@@ -192,6 +192,6 @@ timeout_ms = 400
 #
 # Recipe 2 — Single-hop multimodal audio + 50K cached session context (DashScope Qwen-Omni or OpenRouter Gemini; skips Stage 2):
 #   [asr]
-#   provider = "dashscope"                      # Or provider = "openrouter" with model = "google/gemini-3.5-flash-lite"
+#   provider = "dashscope"                      # Or provider = "openrouter" with model = "google/gemini-3.8-flash"
 #   model = "qwen3.8-omni-flash"
 #   effort = "auto"

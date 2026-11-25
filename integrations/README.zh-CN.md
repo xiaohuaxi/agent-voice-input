@@ -1,20 +1,46 @@
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | **简体中文**
 
-# Agent 终端标题与会话注册接入示例
+# Agent 终端标题与会话注册接入指南
 
-`agent-voice-input` 支持在多个并行终端窗口中 **O(1) 精确锁定当前前台 Agent 会话**，抽取干净的最近对话与 `git status` 热词供语音识别和二阶段精修纠错，同时严格排除后台 subagent 或非交互子进程。
+> [!TIP]
+> **约 80% 日常场景零 Hook 即用**：macOS Ghostty / `Terminal.app` / `iTerm2`、任意平台本地或远端 `tmux`（无需改动 `~/.tmux.conf`）、所有桌面 App，以及 WSL2 单窗口或不同目录多窗口均已开箱精准绑定，无需配置任何钩子。
 
-以下接入均为**可选增强**：
-- **在 `tmux` 分屏内**，Linux/WSL2 与 macOS 下无需修改 `~/.tmux.conf` 即可开箱自动锁定当前活跃客户端的焦点窗格（隔离隔壁后台分屏干扰）；
-- 在 **macOS + Ghostty** 下，`agent-voice-input` 已可直接读取当前聚焦分屏的 `tty` 与 `cwd` 自动关联对应分屏内的 `codex`、`claude` 或 `agy` 会话，零钩子也不会串分屏（含 Ghostty 连接 `tmux` 的场景）；
-- 在 **Linux / WSL2** 下，未配置钩子时会自动回退到 `/proc` 前台根会话扫描与窗口标题 / 目录名消歧。
-- 完整的本地终端、桌面 IDE 与 SSH 远端匹配优先级及防串台边界见 [`docs/context-routing.md`](../docs/context-routing.md)。
+以下可选钩子主要服务于**不用 `tmux` 且在同一项目目录多开独立终端窗口**的场景（例如 WSL2 Windows Terminal 同目录多窗，或 macOS 下无 `tty` 查询接口的 WezTerm / Kitty / Alacritty / Warp 多开窗口）。开启后，`agent-voice-input` 可在多窗并发下 **O(1) 精确锁定当前前台根会话**，同时严格排除后台 subagent 与无头子进程。
+
+完整的本地终端、桌面 IDE 与 SSH 远端匹配优先级及防串台边界见 [`docs/context-routing.md`](../docs/context-routing.md)。
 
 ---
 
-## 1. Codex CLI (`~/.codex/config.toml`)
+## 首推方式：官方安全一键接入（`agent-voice-input integrate`）
 
-将 [`codex/config.toml`](codex/config.toml) 中的 `terminal_title` 合并进 `~/.codex/config.toml` 的 `[tui]` 表：
+无需手工拼接 JSON/TOML（也无需让 AI Agent 直接手改配置），使用内置的非交互官方命令即可一步完成：
+
+```bash
+agent-voice-input integrate --status     # 只读检查：已安装的 CLI、当前钩子状态及本平台是否需要钩子
+agent-voice-input integrate --dry-run    # 精确预览将做的改动，不落盘写入任何文件
+agent-voice-input integrate              # 为本机检测到的 CLI 安全写入钩子
+```
+
+常用参数：
+- `--cli all|claude|codex|agy`：仅针对指定 CLI 操作（默认 `all`）。
+- `--uninstall`：幂等摘除 `agent-voice-input` 条目，不动任何其他用户钩子。
+- `--json`：输出结构化 JSON，供 AI Agent 与脚本可靠解析。
+
+**内置安全保障**：
+1. **保护 dotfiles 软链**：若目标配置文件（如 `~/.claude/settings.json`）是指向 dotfiles 仓库的软链（GNU Stow、chezmoi 或自建软链），`integrate` 会自动解析真实路径并原子写回真身，绝不破坏软链。
+2. **仓外安全备份**：首次修改前自动备份原文件至 `~/.cache/agent-voice-input/integrate-backups/`（`0700`/`0600` 权限），绝不在 dotfiles git 仓库里留下未追踪 `.bak` 文件污染 `git status`。
+3. **幂等合并与保注释 TOML**：绝不覆盖用户既有的 `PreToolUse` / `Stop` 等钩子，也保留 Codex TOML 原有注释与结构（修改后经 `parse_toml()` 校验通过再原子替换）。
+4. **免维护独立 `.sh` 文件、卸载零报错**：Claude Code 与 AGY 均使用内置容错内联命令（自动回退 `$HOME/.local/bin/agent-voice-input`），日后即使卸载 `agent-voice-input` 也绝不报错，Claude 标准输出严格为空，AGY 恒定输出 `{}`。
+
+---
+
+## 手动配置示例
+
+若你希望手工管理配置（例如在共享 dotfiles 仓库中统一维护），下方列出与 `integrate` 等价的标准配置片段。
+
+### 1. Codex CLI (`~/.codex/config.toml`)
+
+将 [`codex/config.toml`](codex/config.toml) 中的 `terminal_title` 合并进 `~/.codex/config.toml` 的 `[tui]` 表（或直接执行 `agent-voice-input integrate --cli codex`）：
 
 ```toml
 [tui]
@@ -25,9 +51,9 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
 
 ---
 
-## 2. Claude Code (`~/.claude/settings.json`)
+### 2. Claude Code (`~/.claude/settings.json`)
 
-确保 `agent-voice-input` 已在 `PATH` 中（或替换为绝对路径，亦可参考 [`claude/voice-title.sh`](claude/voice-title.sh)），按 [`claude/settings.hooks.json`](claude/settings.hooks.json) 在 `~/.claude/settings.json` 中添加 `SessionStart` 与 `UserPromptSubmit` 钩子：
+在 `~/.claude/settings.json` 中添加 `SessionStart` 与 `UserPromptSubmit` 钩子（或执行 `agent-voice-input integrate --cli claude`；另见 [`claude/settings.hooks.json`](claude/settings.hooks.json) 与 [`claude/voice-title.sh`](claude/voice-title.sh)）。推荐的内联命令自带 `PATH` 与 `$HOME/.local/bin` 兜底，卸载后静默退避不报错：
 
 ```json
 {
@@ -37,7 +63,7 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
         "hooks": [
           {
             "type": "command",
-            "command": "agent-voice-input session-hook --cli claude"
+            "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; [ -x \"$b\" ] && \"$b\" session-hook --cli claude --quiet >/dev/null 2>&1 || true'"
           }
         ]
       }
@@ -47,7 +73,7 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
         "hooks": [
           {
             "type": "command",
-            "command": "agent-voice-input session-hook --cli claude"
+            "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; [ -x \"$b\" ] && \"$b\" session-hook --cli claude --quiet >/dev/null 2>&1 || true'"
           }
         ]
       }
@@ -63,9 +89,9 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
 
 ---
 
-## 3. Antigravity CLI (`~/.gemini/config/hooks.json`)
+### 3. Antigravity CLI (`~/.gemini/config/hooks.json`)
 
-参考 [`gemini/hooks.json`](gemini/hooks.json)，在 `~/.gemini/config/hooks.json` 中加入 `voice-session-title`（`doctor` 同时兼容旧路径 `~/.gemini/hooks.json` 与 `~/.gemini/settings.json`）：
+在 `~/.gemini/config/hooks.json` 中加入 `voice-session-title`（或执行 `agent-voice-input integrate --cli agy`；另见 [`gemini/hooks.json`](gemini/hooks.json)，`doctor` 同时兼容旧路径 `~/.gemini/hooks.json` 与 `~/.gemini/settings.json`）。推荐的内联命令保证即便卸载工具也恒输出标准 `{}`：
 
 ```json
 {
@@ -73,14 +99,14 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
     "SessionStart": [
       {
         "type": "command",
-        "command": "agent-voice-input session-hook --cli agy",
+        "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; if [ -x \"$b\" ]; then \"$b\" session-hook --cli agy --quiet >/dev/null 2>&1 || true; fi; printf \"{}\\n\"'",
         "timeout": 5
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "agent-voice-input session-hook --cli agy",
+        "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; if [ -x \"$b\" ]; then \"$b\" session-hook --cli agy --quiet >/dev/null 2>&1 || true; fi; printf \"{}\\n\"'",
         "timeout": 5
       }
     ]
@@ -88,7 +114,7 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
 }
 ```
 
-钩子会结合 `presence/<cid>.lock` 文件锁、首行 JSONL 校验以及 `/proc`（Linux）或 `ps` 祖先进程链（macOS）严格拦截后台 subagent 与无头 `agy -p` 进程，将规范化 `tty`（及在 `tmux` 内时的 `tmux_pane` 元数据）记入 `<runtime_dir>/sessions/agy-<cid8>.json`，仅在前台交互式主会话中更新控制终端及窗格标题 `agy · <short_cwd> [#<cid8>]`（不改变分屏焦点）并返回标准空 JSON `{}`。
+钩子会结合 `presence/<cid>.lock` 文件锁、首行 JSONL 校验以及 `/proc`（Linux）或 `ps` 祖先进程链（macOS）严格拦截后台 subagent 与无头 `agy -p` 进程，将规范化 `tty`（及在 `tmux` 内时的 `tmux_pane` 元数据）记入 `<runtime_dir>/sessions/agy-<cid8>.json`，仅在前台交互式主会话中更新控制终端及窗格标题 `agy · <short_cwd> [#<cid8>]`（不改变分屏焦点）并恒返回标准空 JSON `{}`。
 
 ---
 
