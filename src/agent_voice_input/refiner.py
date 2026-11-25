@@ -61,6 +61,7 @@ from .http_transport import (
     classify_transport_error,
     compute_retry_delay,
     make_rate_pacer_key,
+    make_urllib_http_transport,
     sleep_cooperative,
     urllib_http_transport,
 )
@@ -980,7 +981,9 @@ class _HttpTransportRefiner(BaseRefiner):
     ) -> None:
         self.cfg, self.env = cfg, (os.environ if env is None else env)
         self.creds = creds or resolve_credentials(cfg, self.env)
-        self.transport = transport or urllib_http_transport
+        self.transport = transport or (
+            make_urllib_http_transport(self.env) if env is not None else urllib_http_transport
+        )
         self.clock_fn, self.sleep_fn, self.rand_fn = clock_fn, sleep_fn, rand_fn
 
     def _send_http(

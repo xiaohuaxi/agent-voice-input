@@ -1,11 +1,11 @@
-**English** | [简体中文](README.zh-CN.md)
+**English** | [简体中文](https://github.com/xiaohuaxi/agent-voice-input/blob/main/README.zh-CN.md)
 
 # agent-voice-input
 
 [![PyPI version](https://img.shields.io/pypi/v/agent-voice-input.svg)](https://pypi.org/project/agent-voice-input/)
 [![Python 3.10+](https://img.shields.io/pypi/pyversions/agent-voice-input.svg)](https://pypi.org/project/agent-voice-input/)
 [![CI](https://github.com/xiaohuaxi/agent-voice-input/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaohuaxi/agent-voice-input/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/xiaohuaxi/agent-voice-input/blob/main/LICENSE)
 
 **Context-aware voice input for CLI coding agents—grounded in your live session, repo, and SSH hosts.**  
 Built for **Codex**, **Claude Code**, and **Antigravity CLI (`agy`)**, while working out of the box across desktop IDEs and everyday apps.
@@ -55,10 +55,9 @@ agent-voice-input doctor --ping && agent-voice-input start
 - **Simplest 1-key setup**: `init` auto-detects existing environment keys and local `codex` CLI logins and tells you immediately if you are ready out of the box. If you have no Stage 1 key yet, add just **1 key** to `~/.config/agent-voice-input/agent-voice-input.env`:
   - **Mainland China**: `DASHSCOPE_API_KEY` or `DEEPSEEK_API_KEY`
   - **Global / Overseas**: `OPENAI_API_KEY` or `GEMINI_API_KEY`
-- Templates & full agent guide: [`config.example.toml`](config.example.toml), [`config.example.env`](config.example.env), and [`docs/agent-setup.md`](docs/agent-setup.md).
+- Templates & full agent guide: [`config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml), [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env), and [`docs/agent-setup.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/agent-setup.md).
 
-> [!TIP]
-> **Zero hooks required for ~80% of daily workflows**: macOS Ghostty / `Terminal.app` / `iTerm2`, local or remote `tmux` on any platform (no `~/.tmux.conf` edits), all desktop apps, and WSL2 single-window or distinct-directory windows route accurately out of the box. Only if you run multiple standalone non-`tmux` windows in the **same directory** (e.g., Windows Terminal on WSL2) do you ever need one optional command: `agent-voice-input integrate` (see [`integrations/README.md`](integrations/README.md)).
+> **Tip:** **Zero hooks required for ~80% of daily workflows**: macOS Ghostty / `Terminal.app` / `iTerm2`, local or remote `tmux` on any platform (no `~/.tmux.conf` edits), all desktop apps, and WSL2 single-window or distinct-directory windows route accurately out of the box. Only if you run multiple standalone non-`tmux` windows in the **same directory** (e.g., Windows Terminal on WSL2) do you ever need one optional command: `agent-voice-input integrate` (see [`integrations/README.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.md)).
 
 ---
 
@@ -139,7 +138,7 @@ agent-voice-input doctor --ping && agent-voice-input start
 - **Why does macOS record pure silence when I start the daemon over SSH?**  
   macOS binds Microphone TCC permission to the responsible GUI process; daemons launched under `sshd` receive silent all-zero audio frames. Always run `agent-voice-input start` / `restart` inside an authorized local GUI terminal (such as Ghostty or `Terminal.app`).
 - **How do I route the background daemon through a proxy?**  
-  The daemon inherits environment variables at startup: export `HTTPS_PROXY` (and `NO_PROXY=127.0.0.1,localhost` for loopback endpoints) in your shell, then run `agent-voice-input restart`. Because the pure-stdlib HTTP client only speaks `http://` proxies, if your proxy client only sets `ALL_PROXY=socks5://...`, also export its HTTP/HTTPS mixed port (`HTTPS_PROXY=http://127.0.0.1:<port>`) and verify with `agent-voice-input doctor --ping`.
+  Export `HTTPS_PROXY` (and `NO_PROXY=127.0.0.1,localhost` for loopback endpoints) in your shell or set it in `~/.config/agent-voice-input/agent-voice-input.env` (shell environment variables take precedence), then run `agent-voice-input restart`. Because the pure-stdlib HTTP client only speaks `http://` proxies, if your proxy client only sets `ALL_PROXY=socks5://...`, also set its HTTP/HTTPS mixed port (`HTTPS_PROXY=http://127.0.0.1:<port>`) and verify with `agent-voice-input doctor --ping`.
 - **Why does it only paste and never auto-press Enter?**  
   In terminals and SSH sessions, auto-executing a misheard command is dangerous. Paste-only lets you glance before hitting Enter, and if you switch windows mid-processing, output safely falls back to your clipboard instead of pasting into the wrong window.
 - **Should I choose two-stage (STT + Refiner) or single-hop multimodal?**  
@@ -163,8 +162,8 @@ agent-voice-input toggle | cancel                       # Trigger start/stop or 
 agent-voice-input key-test                              # Inspect raw key scancodes / modifier events
 ```
 
-- **AI Agent setup & troubleshooting contract**: [`docs/agent-setup.md`](docs/agent-setup.md)
-- **Optional multi-window hooks & SSH remote Linux (`[remote]`)**: Single-window terminals, Ghostty splits, and `tmux` panes work with zero hooks. For multiple standalone WSL2 windows in the **same project directory** (use `agent-voice-input integrate`), or to enable zero-install SSH remote context (`[remote] hosts = ["devbox"]`, verified with `agent-voice-input doctor --remote`), see [`integrations/README.md`](integrations/README.md) (SSH section: [SSH Remote Linux Hosts](integrations/README.md#5-ssh-remote-linux-hosts-zero-install--optional-title-hook)) and [`docs/context-routing.md`](docs/context-routing.md).
+- **AI Agent setup & troubleshooting contract**: [`docs/agent-setup.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/agent-setup.md)
+- **Optional multi-window hooks & SSH remote Linux (`[remote]`)**: Single-window terminals, Ghostty splits, and `tmux` panes work with zero hooks. For multiple standalone WSL2 windows in the **same project directory** (use `agent-voice-input integrate`), or to enable zero-install SSH remote context (`[remote] hosts = ["devbox"]`, verified with `agent-voice-input doctor --remote`), see [`integrations/README.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.md) (SSH section: [SSH Remote Linux Hosts](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.md#5-ssh-remote-linux-hosts-zero-install--optional-title-hook)) and [`docs/context-routing.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/context-routing.md).
 
 ---
 
@@ -173,7 +172,7 @@ agent-voice-input key-test                              # Inspect raw key scanco
 <details open>
 <summary><b>Built-in Providers, Verification Matrix & Common <code>config.toml</code> Recipes</b></summary>
 
-Configuration priority: `CLI flags > ~/.config/agent-voice-input/config.toml > built-in defaults`. Credentials live in `~/.config/agent-voice-input/agent-voice-input.env` (see [`config.example.env`](config.example.env)).
+Configuration priority: `CLI flags > ~/.config/agent-voice-input/config.toml > built-in defaults`. Credentials live in `~/.config/agent-voice-input/agent-voice-input.env` (see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)).
 
 | `provider` | Stages | Verification | Built-in Default `asr.model` | Built-in Default `refiner.model` | Credential Source / Env |
 | :--- | :--- | :---: | :--- | :--- | :--- |
@@ -283,4 +282,4 @@ Early exploration for this project was inspired by [`Einstellung/voice-asr`](htt
 
 ## License
 
-[Apache-2.0 License](LICENSE)
+[Apache-2.0 License](https://github.com/xiaohuaxi/agent-voice-input/blob/main/LICENSE)

@@ -40,6 +40,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/xiaohuaxi/agent-voice-input"
+Documentation = "https://github.com/xiaohuaxi/agent-voice-input#readme"
 Repository = "https://github.com/xiaohuaxi/agent-voice-input"
 Changelog = "https://github.com/xiaohuaxi/agent-voice-input/blob/main/CHANGELOG.md"
 Issues = "https://github.com/xiaohuaxi/agent-voice-input/issues"

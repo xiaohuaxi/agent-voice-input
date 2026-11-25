@@ -86,6 +86,8 @@ _INIT_ENV_TEMPLATE = """\
 
 # Volcengine Ark (Stage 2 Refiner: doubao-seed-2-0-mini-260428)
 # ARK_API_KEY="..."
+
+# Proxy (optional): HTTPS_PROXY / HTTP_PROXY / NO_PROXY can be exported in your shell or set here (shell env takes precedence; HTTP/HTTPS proxies only, SOCKS5 not supported).
 """
 
 _MACOS_MODIFIER_HOTKEYS = frozenset(
@@ -580,6 +582,17 @@ def _cmd_integrate(
     return 0 if ok else 1
 
 
+def _stage2_only_key_labels(cfg: Config, creds: ProviderCredentials) -> list[str]:
+    """Return configured Stage 2-only credential env names that cannot drive Stage 1 ASR."""
+    labels: list[str] = []
+    if creds.volcengine is not None:
+        labels.append(creds.volcengine.source_env)
+    if cfg.refiner.api_key_env.strip() and creds.refiner_custom is not None:
+        if creds.refiner_custom.source_env not in labels:
+            labels.append(creds.refiner_custom.source_env)
+    return labels
+
+
 def _cmd_init(
     config_path: str | Path | None = None,
     *,
@@ -716,6 +729,17 @@ def _cmd_init(
         ff_cmd = "brew install ffmpeg" if sys.platform == "darwin" else "sudo apt install ffmpeg"
         print(_kv_line("Warning", f"ffmpeg not found (install via '{ff_cmd}')"))
 
+    if sys.platform == "darwin":
+        from .platform_macos import check_macos_clt_ready
+
+        clt_ok, clt_err = check_macos_clt_ready(eff_env)
+        if not clt_ok:
+            clt_msg = (
+                clt_err
+                or "Xcode Command Line Tools not installed; run 'xcode-select --install'"
+            )
+            print(_kv_line("Warning", clt_msg))
+
     creds = resolve_credentials(eff_cfg, eff_env)
     pipe = explain_pipeline_selection(eff_cfg, creds, eff_env)
     asr_ready = bool(pipe["asr"]["ready"])
@@ -740,6 +764,15 @@ def _cmd_init(
             )
         )
     else:
+        if stage2_only := _stage2_only_key_labels(eff_cfg, creds):
+            key_names = ", ".join(stage2_only)
+            print(
+                _kv_line(
+                    "Note",
+                    f"detected Stage 2 refiner-only key ({key_names}), which cannot transcribe "
+                    "Stage 1 speech — still add 1 Stage 1 speech key below.",
+                )
+            )
         if codex_mode == "chatgpt":
             print(
                 _kv_line(
@@ -840,12 +873,12 @@ def _probe_stage_ping(
         HttpRequest,
         _close_quietly,
         _validate_request_url,
-        urllib_http_transport,
+        make_urllib_http_transport,
     )
     from .refiner import CodexRefiner, _build_responses_url
 
     prov = provider.strip().lower()
-    eff_tx = transport or urllib_http_transport
+    eff_tx = transport or make_urllib_http_transport(env)
     if prov == "doubao":
         from .asr_providers import DoubaoAsrProvider
 
@@ -1229,6 +1262,13 @@ def _doctor_check_env_and_ffmpeg(st: _DoctorState) -> None:
         st.emit_fix("brew install ffmpeg" if sys.platform == "darwin" else "sudo apt install ffmpeg")
         st.ok_all = False
 
+    from .http_transport import inspect_proxy_config_warning
+
+    if proxy_warn := inspect_proxy_config_warning(st.env):
+        warn_detail, fix_hint = proxy_warn
+        st.emit(f"[proxy]     WARN {warn_detail}")
+        st.emit_fix(fix_hint)
+
 
 def _doctor_check_macos_host(st: _DoctorState) -> None:
     from .config import ConfigError, validate_hotkey_for_platform
@@ -1351,7 +1391,7 @@ def _doctor_check_wsl_host(st: _DoctorState) -> None:
     except ConfigError as exc:
         st.ok_all = False
         st.emit(f"[hotkey]    FAIL {exc}")
-    w = probe_wsl_host(st.cfg, st.env)
+    w = probe_wsl_host(st.cfg, st.env, announce_slow=(not st.as_json))
     st.fg_title = str(w.get("fg_title") or "")
     st.fg_process = str(w.get("fg_process") or "")
     ps_ok = bool(w.get("powershell_ok"))
@@ -1471,15 +1511,39 @@ def _doctor_check_asr(st: _DoctorState) -> None:
     if cfg.asr.api_key_env.strip():
         configured_keys.append(f"asr_custom={_cred_label(creds.asr_custom)}")
 
-    st.emit(
-        f"[asr]       selected={st.eff_asr} (model={st.eff_asr_model}, api={st.eff_asr_api}, effort={cfg.asr.effort}) -> "
-        f"{'OK' if st.asr_ready else 'MISSING KEY'}"
+    auto_unconfigured = (
+        str(asr_info.get("configured_provider") or "") == "auto"
+        and not st.asr_ready
+        and str(asr_info.get("reason") or "").startswith("auto default fallback")
     )
+    if auto_unconfigured:
+        st.emit(
+            "[asr]       selected=auto (none configured; no Stage 1 ASR key found) -> MISSING KEY"
+        )
+    else:
+        st.emit(
+            f"[asr]       selected={st.eff_asr} (model={st.eff_asr_model}, api={st.eff_asr_api}, effort={cfg.asr.effort}) -> "
+            f"{'OK' if st.asr_ready else 'MISSING KEY'}"
+        )
     st.emit(f"[keys]      {', '.join(configured_keys) if configured_keys else 'none configured'}")
     if not st.asr_ready:
         st.ok_all = False
+        if stage2_only := _stage2_only_key_labels(cfg, creds):
+            key_names = ", ".join(stage2_only)
+            st.emit(
+                f"[asr]       NOTE detected Stage 2 refiner-only key ({key_names}), "
+                "which cannot be used for Stage 1 speech recognition; still add 1 Stage 1 ASR key"
+            )
+        from .config import default_env_file_candidates
+
+        has_cfg_or_env = bool(cfg.config_path) or any(
+            p.is_file()
+            for p in default_env_file_candidates(st.env, config_path=cfg.config_path or None)
+        )
+        init_prefix = "" if has_cfg_or_env else "run 'agent-voice-input init' then "
         st.emit_fix(
-            "run 'agent-voice-input init' then set DASHSCOPE_API_KEY (or DOUBAO_SPEECH_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY) "
+            f"{init_prefix}set DASHSCOPE_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY "
+            "(or DOUBAO_SPEECH_API_KEY / OPENROUTER_API_KEY) "
             "in ~/.config/agent-voice-input/agent-voice-input.env"
         )
 
@@ -2151,6 +2215,7 @@ def _format_start_readiness_row(
     *,
     asr_ready: bool,
     hotkey_ready: bool = True,
+    warming_up: bool = False,
 ) -> tuple[str, str] | None:
     if not asr_ready:
         return (
@@ -2158,7 +2223,12 @@ def _format_start_readiness_row(
             "no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
         )
     if not hotkey_ready:
-        return None
+        if warming_up:
+            return None
+        return (
+            "Hotkey",
+            "unavailable (fix warning above, then run 'agent-voice-input restart')",
+        )
     hotkey = (cfg.hotkey.key or "RControl").strip() or "RControl"
     mode = (cfg.hotkey.trigger_mode or "tap_toggle").strip().lower()
     if mode == "ptt":
@@ -2343,16 +2413,31 @@ def _cmd_start(
             env=child_env,
             start_new_session=True,
         )
-    from .platform_wsl import is_wsl
+    from .platform_wsl import (
+        WSL_COLD_START_PROGRESS_MSG,
+        WSL_SHIM_COLD_TIMEOUT_SEC,
+        _WSL_SLOW_START_NOTICE_SEC,
+        is_wsl,
+    )
 
-    start_wait_sec = 18.0 if (sys.platform != "darwin" and is_wsl(env)) else 10.0
-    deadline = time.monotonic() + start_wait_sec
-    while time.monotonic() < deadline:
+    is_wsl_host = sys.platform != "darwin" and is_wsl(env)
+    start_wait_sec = WSL_SHIM_COLD_TIMEOUT_SEC if is_wsl_host else 10.0
+    start_t0 = time.monotonic()
+    deadline = start_t0 + start_wait_sec
+    wsl_progress_announced = False
+    while (now := time.monotonic()) < deadline:
         if proc.poll() is not None:
             print(f"daemon exited early (rc={proc.returncode}); check {log_path}", file=sys.stderr)
             if diag := read_redacted_log_tail(log_path, start_offset, env, cfg=cfg):
                 print(diag, file=sys.stderr)
             return 1
+        if (
+            is_wsl_host
+            and not wsl_progress_announced
+            and (now - start_t0) >= _WSL_SLOW_START_NOTICE_SEC
+        ):
+            wsl_progress_announced = True
+            print(WSL_COLD_START_PROGRESS_MSG, file=sys.stderr, flush=True)
         try:
             if (st := send_control_command(rt_dir, {"cmd": "status"}, timeout_sec=0.5)).get("ok"):
                 if not warned_shim:
@@ -2365,15 +2450,23 @@ def _cmd_start(
                 for row in _format_pipeline_rows(pipe_info, cfg=cfg, creds=creds):
                     print(row)
                 if cfg is not None and asr_ready is not None:
+                    hotkey_ok = st.get("shim_ok") is True
                     if readiness := _format_start_readiness_row(
                         cfg,
                         asr_ready=asr_ready,
-                        hotkey_ready=st.get("shim_ok") is True,
+                        hotkey_ready=hotkey_ok,
                     ):
                         print(_kv_line(readiness[0], readiness[1]))
+                        if not asr_ready and not hotkey_ok:
+                            print(
+                                _kv_line(
+                                    "Hotkey",
+                                    "unavailable (fix warning above, then run 'agent-voice-input restart')",
+                                )
+                            )
                         if (
                             asr_ready
-                            and st.get("shim_ok") is True
+                            and hotkey_ok
                             and not (rt_dir / "telemetry.jsonl").exists()
                         ):
                             hk = (cfg.hotkey.key or "RControl").strip() or "RControl"
@@ -2409,6 +2502,7 @@ def _cmd_start(
             cfg,
             asr_ready=asr_ready,
             hotkey_ready=False,
+            warming_up=True,
         ):
             print(_kv_line(readiness[0], readiness[1]))
     return 0

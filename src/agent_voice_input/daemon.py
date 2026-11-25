@@ -1699,7 +1699,16 @@ class VoiceInputDaemon:
             if hud_st == "copied":
                 paste_reason = str(summary.get("paste_reason") or "")
                 low_pr = paste_reason.strip().lower()
-                if "accessibility_denied" in low_pr or "send_input_failed" in low_pr:
+                if any(
+                    tok in low_pr
+                    for tok in (
+                        "accessibility_denied",
+                        "automation_denied",
+                        "hotkey_held",
+                        "key_held",
+                        "send_input_failed",
+                    )
+                ):
                     copied_hud_text = format_copied_hud_text(
                         paste_reason,
                         _resolve_effective_ui_language(

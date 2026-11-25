@@ -138,7 +138,7 @@ agent-voice-input doctor --ping && agent-voice-input start
 - **为什么通过 SSH 在 macOS 上启动守护进程录不到声音（全静音）？**  
   macOS 的麦克风 TCC 权限归属责任图形进程，经 `sshd` 拉起的守护进程会被系统静默喂全 0 静音帧。请务必在本机已获麦克风授权的图形终端（如 Ghostty 或 `Terminal.app`）里执行 `agent-voice-input start` 或 `restart`。
 - **后台守护进程怎么走代理？**  
-  守护进程在启动时继承当前 shell 环境变量：请先在终端导出 `HTTPS_PROXY`（以及本机回环排除 `NO_PROXY=127.0.0.1,localhost`），再执行 `agent-voice-input restart`。由于纯标准库 HTTP 客户端仅支持 `http://` 代理，如果代理客户端只设置了 `ALL_PROXY=socks5://...`，请同时设置对应的 HTTP 混合端口（`HTTPS_PROXY=http://127.0.0.1:<port>`），并用 `agent-voice-input doctor --ping` 验证连通。
+  可在终端导出 `HTTPS_PROXY` / `HTTP_PROXY`（以及本机回环排除 `NO_PROXY=127.0.0.1,localhost`），或写入 `~/.config/agent-voice-input/agent-voice-input.env`（系统环境变量优先），然后执行 `agent-voice-input restart`。由于纯标准库 HTTP 客户端仅支持 HTTP/HTTPS 代理、不支持 SOCKS5，如果代理客户端只设置了 `ALL_PROXY=socks5://...`，请同时设置对应的 HTTP 混合端口（`HTTPS_PROXY=http://127.0.0.1:<port>`），并用 `agent-voice-input doctor --ping` 验证连通。
 - **为什么默认只粘贴不自动按回车？**  
   终端与 SSH 下误听一条命令直接回车风险太高，因此默认只粘贴不发送 `Enter`，方便扫一眼再确认；处理期间若切走焦点，也会自动退回剪贴板而不强贴到别的窗口。
 - **两段式（STT + 精修）和一阶段单跳多模态怎么选？**  

@@ -1263,7 +1263,10 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
 
             out_degraded = _run_degraded_start(Config(), env_ready)
             self.assertIn("Daemon    started (pid=42424)", out_degraded)
-            self.assertNotIn("Hotkey    ", out_degraded)
+            self.assertIn(
+                "Hotkey    unavailable (fix warning above, then run 'agent-voice-input restart')",
+                out_degraded,
+            )
 
             # Socket warming-up timeout: MUST NOT print Hotkey line when ASR is ready,
             # while missing Stage 1 ASR key Warning still prints independently.
@@ -1548,6 +1551,18 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
 
         self.assertEqual(format_copied_hud_text("accessibility_denied", "zh"), "✓ 已复制(需开启辅助功能)")
         self.assertEqual(format_copied_hud_text("accessibility_denied (grant ...)", "en"), "✓ Copied (grant Accessibility)")
+        self.assertEqual(
+            format_copied_hud_text("automation_denied (grant Automation permission for Ghostty)", "zh"),
+            "✓ 已复制(需开启自动化权限)",
+        )
+        self.assertEqual(
+            format_copied_hud_text("automation_denied (grant Automation permission for Ghostty)", "en"),
+            "✓ Copied (grant Automation)",
+        )
+        self.assertEqual(format_copied_hud_text("key_held", "zh"), "✓ 已复制(检测到按键按住)")
+        self.assertEqual(format_copied_hud_text("key_held", "en"), "✓ Copied (modifier held)")
+        self.assertEqual(format_copied_hud_text("hotkey_held", "zh"), "✓ 已复制(检测到按键按住)")
+        self.assertEqual(format_copied_hud_text("hotkey_held", "en"), "✓ Copied (modifier held)")
         self.assertEqual(format_copied_hud_text("send_input_failed", "zh"), "✓ 已复制(无法自动粘贴)")
         self.assertEqual(format_copied_hud_text("send_input_failed", "en"), "✓ Copied (manual paste needed)")
         self.assertEqual(format_copied_hud_text("focus_changed", "zh"), "✓ 已复制(窗口已切换)")
@@ -1579,6 +1594,10 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
 
         for reason, lang, exp_text in (
             ("accessibility_denied (grant Accessibility)", "zh", "✓ 已复制(需开启辅助功能)"),
+            ("automation_denied (grant Automation permission for Ghostty)", "zh", "✓ 已复制(需开启自动化权限)"),
+            ("automation_denied", "en", "✓ Copied (grant Automation)"),
+            ("key_held", "zh", "✓ 已复制(检测到按键按住)"),
+            ("hotkey_held", "en", "✓ Copied (modifier held)"),
             ("send_input_failed", "en", "✓ Copied (manual paste needed)"),
             ("focus_changed", "en", None),
         ):
@@ -1634,8 +1653,8 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
         ):
             self.assertIsNone(pw.resolve_powershell_exe({"PATH": ""}))
 
-        # 2. probe_wsl_host timeout=15 + redacted first-line ps_error; WslPlatform._shim_ready_timeout=15.0
-        self.assertEqual(pw.WslPlatform._shim_ready_timeout, 15.0)
+        # 2. probe_wsl_host timeout=180.0 + redacted first-line ps_error; WslPlatform._shim_ready_timeout=180.0
+        self.assertEqual(pw.WslPlatform._shim_ready_timeout, 180.0)
         seen_timeouts: list[object] = []
 
         def _fake_probe_run(cmd, **kw):
@@ -1653,7 +1672,7 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
             mock.patch("agent_voice_input.platform_wsl.subprocess.run", side_effect=_fake_probe_run),
         ):
             pinfo = pw.probe_wsl_host(Config(), env={"OPENAI_API_KEY": "secret_tok_999"})
-        self.assertEqual(seen_timeouts, [15])
+        self.assertEqual(seen_timeouts, [180.0])
         self.assertFalse(pinfo["powershell_ok"])
         self.assertIn("ExecutionPolicy", pinfo["ps_error"])
         self.assertNotIn("secret_tok_999", pinfo["ps_error"])
@@ -2569,6 +2588,509 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                     f"Next: Ready — daemon is running; {expected_verb} ROption to dictate",
                     buf_mode.getvalue(),
                 )
+
+    def test_pypi_readme_links_no_github_alerts_and_docs_url(self) -> None:
+        import re
+
+        readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        # Strip fenced code blocks before inspecting Markdown links and callouts
+        stripped = re.sub(r"```.*?```", "", readme, flags=re.DOTALL)
+        self.assertNotRegex(stripped, r"(?m)^>\s*\[!(?:TIP|NOTE|IMPORTANT|WARNING|CAUTION)\]")
+        rel_links: list[str] = []
+        for m in re.finditer(r"\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)", stripped):
+            target = m.group(1).strip()
+            if not target.startswith(("https://", "http://", "mailto:", "#")):
+                rel_links.append(target)
+        self.assertEqual(rel_links, [], f"Relative links break on PyPI: {rel_links}")
+        self.assertIn(
+            "https://github.com/xiaohuaxi/agent-voice-input/blob/main/README.zh-CN.md",
+            readme,
+        )
+        self.assertIn("> **Tip:**", readme)
+
+        pyp = parse_toml((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(pyp["project"]["version"], "0.16.0")
+        self.assertEqual(
+            pyp["project"]["urls"]["Documentation"],
+            "https://github.com/xiaohuaxi/agent-voice-input#readme",
+        )
+
+    def test_dotenv_proxy_precedence_transport_routing_and_doctor_socks5_warn(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from agent_voice_input.asr_providers import create_asr_provider
+        from agent_voice_input.config import load_env_files
+        from agent_voice_input.http_transport import (
+            HttpTransportError,
+            inspect_proxy_config_warning,
+            make_urllib_http_transport,
+        )
+
+        # 1. Loopback HTTP proxy + origin verifying .env proxy is honored by ASR, Refiner, and doctor --ping
+        proxy_hits: list[str] = []
+
+        class _OriginHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                body = b'{"data":[]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+                body = json.dumps(
+                    {"choices": [{"message": {"content": "proxied ok"}}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        origin_srv = HTTPServer(("127.0.0.1", 0), _OriginHandler)
+        origin_port = origin_srv.server_address[1]
+        origin_thr = threading.Thread(target=origin_srv.serve_forever, daemon=True)
+        origin_thr.start()
+
+        class _ProxyHandler(BaseHTTPRequestHandler):
+            def _forward(self) -> None:
+                import http.client
+                import urllib.parse
+
+                proxy_hits.append(f"{self.command} {self.path}")
+                parsed = urllib.parse.urlsplit(self.path)
+                length = int(self.headers.get("Content-Length", "0"))
+                req_body = self.rfile.read(length) if length else b""
+                conn = http.client.HTTPConnection(parsed.hostname or "127.0.0.1", parsed.port or 80, timeout=5)
+                try:
+                    path_q = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+                    conn.request(self.command, path_q, body=req_body, headers={"Host": parsed.netloc})
+                    resp = conn.getresponse()
+                    data = resp.read()
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                finally:
+                    conn.close()
+
+            def do_GET(self) -> None:
+                self._forward()
+
+            def do_POST(self) -> None:
+                self._forward()
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        proxy_srv = HTTPServer(("127.0.0.1", 0), _ProxyHandler)
+        proxy_port = proxy_srv.server_address[1]
+        proxy_thr = threading.Thread(target=proxy_srv.serve_forever, daemon=True)
+        proxy_thr.start()
+
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                home = Path(td) / "home"
+                rt = Path(td) / "rt"
+                cfg_dir = home / ".config" / "agent-voice-input"
+                cfg_dir.mkdir(parents=True)
+                (cfg_dir / "config.toml").write_text(
+                    f'[asr]\nprovider = "openai-compatible"\nbase_url = "http://127.0.0.1:{origin_port}/v1"\n'
+                    f'[refiner]\nprovider = "openai-compatible"\nbase_url = "http://127.0.0.1:{origin_port}/v1"\nmodel = "m1"\n',
+                    encoding="utf-8",
+                )
+                (cfg_dir / "agent-voice-input.env").write_text(
+                    f'HTTP_PROXY="http://127.0.0.1:{proxy_port}"\n'
+                    'http_proxy="http://127.0.0.1:1"\n',
+                    encoding="utf-8",
+                )
+
+                # Shell/system env MUST win over .env regardless of uppercase/lowercase key differences
+                merged_sys_wins = load_env_files(
+                    {"HOME": str(home), "HTTP_PROXY": f"http://127.0.0.1:{proxy_port}"},
+                    home_dir=home,
+                )
+                self.assertEqual(merged_sys_wins.get("HTTP_PROXY"), f"http://127.0.0.1:{proxy_port}")
+                self.assertNotIn("http_proxy", merged_sys_wins)
+
+                # Higher-priority .env uppercase HTTPS_PROXY MUST NOT be shadowed by lower-priority .env lowercase https_proxy
+                primary_env = cfg_dir / "agent-voice-input.env"
+                legacy_env = cfg_dir / ".env"
+                primary_env.write_text(
+                    f'HTTPS_PROXY="http://127.0.0.1:{proxy_port}"\n',
+                    encoding="utf-8",
+                )
+                legacy_env.write_text('https_proxy="http://127.0.0.1:1"\n', encoding="utf-8")
+                try:
+                    merged_cross_env = load_env_files({"HOME": str(home)}, home_dir=home)
+                finally:
+                    legacy_env.unlink()
+                self.assertEqual(merged_cross_env.get("HTTPS_PROXY"), f"http://127.0.0.1:{proxy_port}")
+                self.assertNotIn("https_proxy", merged_cross_env)
+
+                # Clean .env with valid HTTP_PROXY drives ASR transport, Refiner transport, and doctor --ping
+                (cfg_dir / "agent-voice-input.env").write_text(
+                    f'HTTP_PROXY="http://127.0.0.1:{proxy_port}"\n',
+                    encoding="utf-8",
+                )
+                clean_os_env = {
+                    k: v
+                    for k, v in os.environ.items()
+                    if not (k.lower().endswith("_proxy") or k.lower() == "no_proxy")
+                }
+                with mock.patch.dict(os.environ, clean_os_env, clear=True):
+                    cfg_p, env_p = load_config(
+                        env={"HOME": str(home), "PATH": "", "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)},
+                        home_dir=home,
+                    )
+                    self.assertEqual(env_p.get("HTTP_PROXY"), f"http://127.0.0.1:{proxy_port}")
+
+                    # ASR provider default transport uses .env HTTP_PROXY
+                    asr_prov = create_asr_provider(cfg_p, env=env_p)
+                    r_asr = asr_prov.transport(
+                        HttpRequest(f"http://127.0.0.1:{origin_port}/v1/models", "GET", {}, b"", 5.0)
+                    )
+                    self.assertEqual(r_asr.status, 200)
+
+                    # HTTP Refiner default transport uses .env HTTP_PROXY
+                    ref_prov = create_refiner(cfg_p, env=env_p)
+                    r_ref = ref_prov.refine("hello")
+                    self.assertEqual(r_ref.text, "proxied ok")
+
+                    # doctor --ping uses .env HTTP_PROXY
+                    buf_ping = io.StringIO()
+                    with (
+                        mock.patch.object(cli_mod.sys, "platform", "linux"),
+                        mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                        mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                        mock.patch("sys.stdout", buf_ping),
+                    ):
+                        rc_ping = cli_mod._cmd_doctor(cfg_p, env_p, ping=True)
+                    self.assertEqual(rc_ping, 0, buf_ping.getvalue())
+                    self.assertIn("[ping]      asr(openai-compatible): OK", buf_ping.getvalue())
+                    self.assertGreaterEqual(len(proxy_hits), 3, proxy_hits)
+
+                # 2. SOCKS5-only ALL_PROXY fails closed on transport AND warns cleanly in doctor without leaking creds
+                socks_env = {
+                    "HOME": str(home),
+                    "PATH": "",
+                    "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                    "DEEPSEEK_API_KEY": "sk-ds-proxy-warn-1111",
+                    "ALL_PROXY": "socks5://alice:SuperSecretProxyPw99@127.0.0.1:1080",
+                }
+                warn = inspect_proxy_config_warning(socks_env)
+                self.assertIsNotNone(warn)
+                assert warn is not None
+                self.assertIn("socks5", warn[0].lower())
+                self.assertNotIn("SuperSecretProxyPw99", warn[0])
+                self.assertIn("HTTPS_PROXY=http://127.0.0.1:<port>", warn[1])
+
+                tx_socks = make_urllib_http_transport(socks_env)
+                with self.assertRaises(HttpTransportError) as cm_socks:
+                    tx_socks(HttpRequest("https://api.deepseek.com/v1/models", "GET", {}, b"", 3.0))
+                self.assertNotIn("SuperSecretProxyPw99", str(cm_socks.exception))
+
+                buf_socks = io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                    mock.patch("sys.stdout", buf_socks),
+                ):
+                    self.assertEqual(cli_mod._cmd_doctor(Config(), socks_env), 0)
+                txt_socks = buf_socks.getvalue()
+                self.assertIn("[proxy]     WARN", txt_socks)
+                self.assertIn("HTTPS_PROXY=http://127.0.0.1:<port>", txt_socks)
+                self.assertNotIn("SuperSecretProxyPw99", txt_socks)
+
+                # 3. Dual env (HTTPS_PROXY=http://... + ALL_PROXY=socks5://...) MUST NOT false-warn
+                dual_env = {**socks_env, "HTTPS_PROXY": f"http://127.0.0.1:{proxy_port}"}
+                self.assertIsNone(inspect_proxy_config_warning(dual_env))
+
+                # 4. config.example.env documents proxy support while staying 100% commented
+                example_env_txt = (_REPO_ROOT / "config.example.env").read_text(encoding="utf-8")
+                self.assertIn("HTTPS_PROXY", example_env_txt)
+                self.assertIn("SOCKS5", example_env_txt)
+                self.assertEqual(parse_env_text(example_env_txt), {})
+        finally:
+            proxy_srv.shutdown()
+            proxy_srv.server_close()
+            origin_srv.shutdown()
+            origin_srv.server_close()
+
+    def test_init_doctor_start_first_run_stage2_only_clt_and_degraded_hotkey(self) -> None:
+        parser = cli_mod._build_parser()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            home.mkdir()
+            rt.mkdir()
+
+            # 1. Stage 2-only key (ARK_API_KEY) + no Stage 1 key: init & doctor clearly explain Stage 2 cannot do ASR
+            env_ark = {
+                "HOME": str(home),
+                "PATH": "",
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "ARK_API_KEY": "ark-stage2-only-test-9999",
+            }
+            out_init_ark = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env_ark, clear=True),
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", out_init_ark),
+            ):
+                self.assertEqual(cli_mod.main(["init"]), 0)
+            txt_init_ark = out_init_ark.getvalue()
+            self.assertIn("Stage 2 refiner-only key (ARK_API_KEY)", txt_init_ark)
+            self.assertIn("cannot transcribe", txt_init_ark)
+            self.assertIn("OPENAI_API_KEY", txt_init_ark)
+
+            # doctor after init (config/env exist): no selected=dashscope, no redundant 'run init', includes OPENAI_API_KEY
+            cfg_after, env_after = load_config(env=env_ark, home_dir=home)
+            buf_doc_ark = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_doc_ark),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(cfg_after, env_after), 1)
+            txt_doc_ark = buf_doc_ark.getvalue()
+            self.assertIn("[asr]       selected=auto (none configured; no Stage 1 ASR key found) -> MISSING KEY", txt_doc_ark)
+            self.assertNotIn("selected=dashscope", txt_doc_ark)
+            self.assertIn("NOTE detected Stage 2 refiner-only key (ARK_API_KEY)", txt_doc_ark)
+            self.assertIn("OPENAI_API_KEY", txt_doc_ark)
+            self.assertNotIn("run 'agent-voice-input init' then", txt_doc_ark)
+
+            # doctor before init (no config/env exist) STILL suggests 'agent-voice-input init' + OPENAI_API_KEY
+            empty_home = root / "empty_home"
+            empty_home.mkdir()
+            env_fresh = {"HOME": str(empty_home), "PATH": "", "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
+            buf_doc_fresh = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_doc_fresh),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env_fresh), 1)
+            txt_doc_fresh = buf_doc_fresh.getvalue()
+            self.assertIn("run 'agent-voice-input init' then", txt_doc_fresh)
+            self.assertIn("OPENAI_API_KEY", txt_doc_fresh)
+
+            # 2. macOS init proactively runs zero-modal check_macos_clt_ready() and warns with xcode-select --install
+            mac_home = root / "mac_noclts"
+            mac_home.mkdir()
+            env_mac = {"HOME": str(mac_home), "PATH": ""}
+            out_mac_init = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env_mac, clear=True),
+                mock.patch.object(cli_mod.sys, "platform", "darwin"),
+                mock.patch.object(cli_mod, "_is_macbook_laptop", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/opt/homebrew/bin/ffmpeg"),
+                mock.patch(
+                    "agent_voice_input.platform_macos.check_macos_clt_ready",
+                    return_value=(False, "Xcode Command Line Tools not installed; run 'xcode-select --install'"),
+                ),
+                mock.patch("sys.stdout", out_mac_init),
+            ):
+                self.assertEqual(cli_mod.main(["init"]), 0)
+            self.assertIn("Warning   Xcode Command Line Tools not installed; run 'xcode-select --install'", out_mac_init.getvalue())
+
+            # 3. start with shim_ok=False prints explicit Hotkey unavailable row (both with and without ASR key)
+            class _FakeProc:
+                pid = 71717
+                returncode = None
+
+                def poll(self) -> None:
+                    return None
+
+            for env_case, expect_warn in (
+                ({**env_fresh, "DEEPSEEK_API_KEY": "sk-ds-degraded-1234"}, False),
+                (env_fresh, True),
+            ):
+                calls = [0]
+
+                def _ctrl_degraded(_rt: Path, _req: dict[str, object], timeout_sec: float = 1.0) -> dict[str, object]:
+                    calls[0] += 1
+                    if calls[0] == 1:
+                        raise ConnectionRefusedError("stopped")
+                    return {"ok": True, "pid": 71717, "state": "idle", "shim_ok": False, "shim_error": "no CLT"}
+
+                out_deg, err_deg = io.StringIO(), io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                    mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl_degraded),
+                    mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
+                    mock.patch("sys.stdout", out_deg),
+                    mock.patch("sys.stderr", err_deg),
+                ):
+                    self.assertEqual(cli_mod._cmd_start(parser.parse_args(["start"]), env_case, cfg=Config()), 0)
+                txt_deg = out_deg.getvalue()
+                self.assertIn(
+                    "Hotkey    unavailable (fix warning above, then run 'agent-voice-input restart')",
+                    txt_deg,
+                )
+                if expect_warn:
+                    self.assertIn("Warning   no Stage 1 ASR key configured", txt_deg)
+
+    def test_wsl_cold_start_180s_timeout_and_slow_stderr_notice(self) -> None:
+        from agent_voice_input import platform_wsl as pw
+
+        self.assertEqual(pw.WSL_SHIM_COLD_TIMEOUT_SEC, 180.0)
+        self.assertEqual(pw.WslPlatform._shim_ready_timeout, 180.0)
+
+        # 1. probe_wsl_host(announce_slow=True): fast run prints nothing; slow run prints one stderr progress line
+        ok_probe_json = json.dumps(
+            {
+                "ok": True,
+                "ps_version": "5.1",
+                "wave_in_devs": 1,
+                "wasapi_ok": True,
+                "hwnd": 1,
+                "process": "WindowsTerminal",
+                "title": "bash",
+                "ui_culture": "en-US",
+            }
+        )
+
+        def _fast_run(cmd, **_kw):
+            if cmd[0] == pw.POWERSHELL_EXE:
+                return subprocess.CompletedProcess(cmd, 0, stdout=ok_probe_json + "\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="RDPSource\n", stderr="")
+
+        err_fast = io.StringIO()
+        with (
+            mock.patch("agent_voice_input.platform_wsl.resolve_powershell_exe", return_value=pw.POWERSHELL_EXE),
+            mock.patch("agent_voice_input.platform_wsl.to_windows_path", return_value=r"C:\win_shim.ps1"),
+            mock.patch("agent_voice_input.platform_wsl.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+            mock.patch("agent_voice_input.platform_wsl.subprocess.run", side_effect=_fast_run),
+            mock.patch("sys.stderr", err_fast),
+        ):
+            info_fast = pw.probe_wsl_host(Config(), env={"PATH": ""}, announce_slow=True)
+        self.assertTrue(info_fast["powershell_ok"])
+        self.assertEqual(err_fast.getvalue(), "")
+
+        def _slow_run(cmd, **kw):
+            if cmd and cmd[0] == pw.POWERSHELL_EXE:
+                time.sleep(0.08)
+                return subprocess.CompletedProcess(cmd, 0, stdout=ok_probe_json + "\n", stderr="")
+            if kw.get("text"):
+                return subprocess.CompletedProcess(cmd, 0, stdout="RDPSource\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+
+        err_slow = io.StringIO()
+        with (
+            mock.patch.object(pw, "_WSL_SLOW_START_NOTICE_SEC", 0.02),
+            mock.patch("agent_voice_input.platform_wsl.resolve_powershell_exe", return_value=pw.POWERSHELL_EXE),
+            mock.patch("agent_voice_input.platform_wsl.to_windows_path", return_value=r"C:\win_shim.ps1"),
+            mock.patch("agent_voice_input.platform_wsl.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+            mock.patch("agent_voice_input.platform_wsl.subprocess.run", side_effect=_slow_run),
+            mock.patch("sys.stderr", err_slow),
+        ):
+            info_slow = pw.probe_wsl_host(Config(), env={"PATH": ""}, announce_slow=True)
+        self.assertTrue(info_slow["powershell_ok"])
+        self.assertIn("Initializing Windows helper", err_slow.getvalue())
+        self.assertIn("Ctrl+C", err_slow.getvalue())
+
+        # doctor --json must pass announce_slow=False so stdout JSON & stderr stay clean
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            env_wsl = {
+                "HOME": td,
+                "PATH": "",
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "DEEPSEEK_API_KEY": "sk-ds-wsl-json-1234",
+            }
+            out_js, err_js = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(pw, "_WSL_SLOW_START_NOTICE_SEC", 0.02),
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch("agent_voice_input.platform_wsl.resolve_powershell_exe", return_value=pw.POWERSHELL_EXE),
+                mock.patch("agent_voice_input.platform_wsl.to_windows_path", return_value=r"C:\win_shim.ps1"),
+                mock.patch("agent_voice_input.platform_wsl.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.platform_wsl.subprocess.run", side_effect=_slow_run),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", out_js),
+                mock.patch("sys.stderr", err_js),
+            ):
+                self.assertEqual(cli_mod._cmd_doctor(Config(), env_wsl, as_json=True), 0)
+            self.assertEqual(err_js.getvalue(), "")
+            self.assertTrue(json.loads(out_js.getvalue())["ok"])
+
+            # 2. _cmd_start on WSL waits up to 180s and prints one stderr progress line once >= 2s elapsed
+            parser = cli_mod._build_parser()
+
+            class _FakeProc:
+                pid = 81818
+                returncode = None
+
+                def poll(self) -> None:
+                    return None
+
+            times_cold = iter([0.0, 0.5, 3.0, 95.0, 120.0])
+            ctrl_n = [0]
+
+            def _cold_ctrl(_rt: Path, _req: dict[str, object], timeout_sec: float = 1.0) -> dict[str, object]:
+                ctrl_n[0] += 1
+                if ctrl_n[0] <= 3:
+                    raise ConnectionRefusedError("compiling C# shim")
+                return {"ok": True, "pid": 81818, "state": "idle", "shim_ok": True}
+
+            out_cold, err_cold = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_cold_ctrl),
+                mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
+                mock.patch.object(cli_mod.time, "monotonic", side_effect=lambda: next(times_cold, 190.0)),
+                mock.patch.object(cli_mod.time, "sleep", return_value=None),
+                mock.patch("sys.stdout", out_cold),
+                mock.patch("sys.stderr", err_cold),
+            ):
+                rc_cold = cli_mod._cmd_start(parser.parse_args(["start"]), env_wsl, cfg=Config())
+            self.assertEqual(rc_cold, 0)
+            self.assertIn("started (pid=81818)", out_cold.getvalue())
+            self.assertNotIn("socket warming up", out_cold.getvalue())
+            self.assertEqual(err_cold.getvalue().count("Initializing Windows helper"), 1)
+
+            # Fast warm start (< 2s) stays completely quiet on stderr
+            times_warm = iter([0.0, 0.4, 0.8])
+            warm_n = [0]
+
+            def _warm_ctrl(_rt: Path, _req: dict[str, object], timeout_sec: float = 1.0) -> dict[str, object]:
+                warm_n[0] += 1
+                if warm_n[0] == 1:
+                    raise ConnectionRefusedError("starting")
+                return {"ok": True, "pid": 81818, "state": "idle", "shim_ok": True}
+
+            out_warm, err_warm = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=True),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_warm_ctrl),
+                mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
+                mock.patch.object(cli_mod.time, "monotonic", side_effect=lambda: next(times_warm, 190.0)),
+                mock.patch.object(cli_mod.time, "sleep", return_value=None),
+                mock.patch("sys.stdout", out_warm),
+                mock.patch("sys.stderr", err_warm),
+            ):
+                self.assertEqual(cli_mod._cmd_start(parser.parse_args(["start"]), env_wsl, cfg=Config()), 0)
+            self.assertEqual(err_warm.getvalue(), "")
 
 
 if __name__ == "__main__":

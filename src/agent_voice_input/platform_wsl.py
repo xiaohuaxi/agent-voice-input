@@ -8,6 +8,7 @@ from pathlib import Path
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -43,6 +44,12 @@ _POWERSHELL_EXE_ROOT_MOUNT = "/c/Windows/System32/WindowsPowerShell/v1.0/powersh
 WSLG_PULSE_SOCK = "/mnt/wslg/PulseServer"
 SHIM_SCRIPT = Path(__file__).resolve().with_name("win_shim.ps1")
 WIN_SHIM_DIR = Path(__file__).resolve().with_name("win_shim")
+WSL_SHIM_COLD_TIMEOUT_SEC: float = 180.0
+_WSL_SLOW_START_NOTICE_SEC: float = 2.0
+WSL_COLD_START_PROGRESS_MSG: str = (
+    "[agent-voice-input] Initializing Windows helper "
+    "(first run may compile C# shim and trigger Windows Defender; Ctrl+C to cancel)..."
+)
 
 
 def list_win_shim_sources(
@@ -222,7 +229,12 @@ def _extract_pulse_source_names(output: str) -> set[str]:
     return names
 
 
-def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[str, Any]:
+def probe_wsl_host(
+    cfg: Config,
+    env: Mapping[str, str] | None = None,
+    *,
+    announce_slow: bool = False,
+) -> dict[str, Any]:
     raw_env = os.environ if env is None else env
     eff_env = _pulse_env(raw_env)
     _, eff_pulse_src = resolve_wsl_effective_audio_source(cfg, raw_env)
@@ -244,10 +256,21 @@ def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[st
     except Exception as exc: info["pulse_error"] = str(exc)
     ps_exe = resolve_powershell_exe(raw_env)
     if ps_exe:
+        slow_timer: threading.Timer | None = None
+        if announce_slow:
+            def _emit_slow_notice() -> None:
+                try:
+                    print(WSL_COLD_START_PROGRESS_MSG, file=sys.stderr, flush=True)
+                except Exception:
+                    pass
+
+            slow_timer = threading.Timer(_WSL_SLOW_START_NOTICE_SEC, _emit_slow_notice)
+            slow_timer.daemon = True
+            slow_timer.start()
         try:
             p = subprocess.run(
                 [ps_exe, "-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "probe"],
-                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=WSL_SHIM_COLD_TIMEOUT_SEC, check=False,
             )
             if p.returncode == 0 and p.stdout.strip():
                 d = json.loads(p.stdout.strip().splitlines()[-1])
@@ -265,6 +288,10 @@ def probe_wsl_host(cfg: Config, env: Mapping[str, str] | None = None) -> dict[st
                 info["ps_error"] = redact_secrets(first_err, raw_env, cfg=cfg)[:240]
         except Exception as exc:
             info["ps_error"] = redact_secrets(str(exc), raw_env, cfg=cfg)[:240]
+        finally:
+            if slow_timer is not None:
+                slow_timer.cancel()
+                slow_timer.join(timeout=0.2)
     return info
 
 
@@ -290,7 +317,7 @@ def run_key_test(cfg: Config, seconds: int = 10) -> int:
 
 class WslPlatform(JsonlShimMixin):
     _shim_graceful = False
-    _shim_ready_timeout = 15.0
+    _shim_ready_timeout = WSL_SHIM_COLD_TIMEOUT_SEC
     _shim_label = "win_shim"
 
     def _host_ui_culture(self) -> str | None:

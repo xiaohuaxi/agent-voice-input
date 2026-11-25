@@ -962,6 +962,13 @@ def load_env_files(
 ) -> dict[str, str]:
     """Merge optional .env files behind existing environment variables (never overwrites)."""
     merged: dict[str, str] = dict(os.environ if base_env is None else base_env)
+    # Preserve case-insensitive precedence for proxy variables already defined in process/base env
+    # (e.g. shell HTTPS_PROXY must never be overridden by lowercase https_proxy in .env).
+    base_proxy_keys = {
+        k.lower()
+        for k in merged
+        if k.lower().endswith("_proxy") or k.lower() == "no_proxy"
+    }
     _, home = _resolve_config_roots(base_env, home_dir=home_dir)
     candidates: Sequence[str | Path] = (
         env_paths
@@ -976,9 +983,17 @@ def load_env_files(
             content = path.read_text(encoding="utf-8-sig")
         except OSError:
             continue
+        file_proxy_keys: set[str] = set()
         for k, v in parse_env_text(content).items():
+            k_low = k.lower()
+            is_proxy = k_low.endswith("_proxy") or k_low == "no_proxy"
+            if is_proxy and k_low in base_proxy_keys:
+                continue
             if k not in merged:
                 merged[k] = v
+                if is_proxy:
+                    file_proxy_keys.add(k_low)
+        base_proxy_keys.update(file_proxy_keys)
     return merged
 
 

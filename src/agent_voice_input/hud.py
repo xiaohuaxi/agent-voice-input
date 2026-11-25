@@ -228,6 +228,10 @@ def format_copied_hud_text(reason: str = "", lang: str = "en") -> str:
     zh = (lang or "en").strip().lower() == "zh"
     if "accessibility_denied" in low:
         return "✓ 已复制(需开启辅助功能)" if zh else "✓ Copied (grant Accessibility)"
+    if "automation_denied" in low:
+        return "✓ 已复制(需开启自动化权限)" if zh else "✓ Copied (grant Automation)"
+    if "hotkey_held" in low or "key_held" in low:
+        return "✓ 已复制(检测到按键按住)" if zh else "✓ Copied (modifier held)"
     if "send_input_failed" in low:
         return "✓ 已复制(无法自动粘贴)" if zh else "✓ Copied (manual paste needed)"
     pair = _STATIC_HUD_COPY["copied"]

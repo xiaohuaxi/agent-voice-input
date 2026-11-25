@@ -1560,11 +1560,53 @@ def _proxy_bypass_no_dns(
     return False
 
 
-def _resolve_system_proxy_key(scheme: str, host: str, port: int | None = None) -> str:
-    proxy_url = _select_system_proxy_url(urllib.request.getproxies(), scheme)
+def _get_effective_proxies(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Resolve effective proxy map: explicit ``env`` vars take precedence over OS system proxy settings."""
+    if env is None:
+        return urllib.request.getproxies()
+    env_proxies = _get_proxies_from_env(env)
+    if env_proxies:
+        return env_proxies
+    if urllib.request.getproxies_environment():
+        return {}
+    return urllib.request.getproxies()
+
+
+def inspect_proxy_config_warning(env: Mapping[str, str] | None = None) -> tuple[str, str] | None:
+    """Return ``(warn_detail, fix_hint)`` when effective proxy env uses an unsupported scheme (e.g. SOCKS5)."""
+    proxies = _get_effective_proxies(env)
+    if not proxies:
+        return None
+    fix_hint = (
+        "set HTTPS_PROXY=http://127.0.0.1:<port> (your proxy client's HTTP/mixed port) "
+        "in shell or ~/.config/agent-voice-input/agent-voice-input.env"
+    )
+    https_proxy = _select_system_proxy_url(proxies, "https")
+    if https_proxy:
+        route, err = _resolve_http_proxy_route(https_proxy, target_scheme="https")
+        if route is None:
+            safe_err = _redact_proxy_error_text(err, https_proxy, None)
+            return safe_err, fix_hint
+    explicit_http = (proxies.get("http") or "").strip()
+    if explicit_http:
+        route_http, err_http = _resolve_http_proxy_route(explicit_http, target_scheme="http")
+        if route_http is None:
+            safe_err = _redact_proxy_error_text(err_http, explicit_http, None)
+            return safe_err, fix_hint
+    return None
+
+
+def _resolve_system_proxy_key(
+    scheme: str,
+    host: str,
+    port: int | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    proxy_url = _select_system_proxy_url(_get_effective_proxies(env), scheme)
     if not proxy_url:
         return ""
-    if _proxy_bypass_no_dns(host, port):
+    if _proxy_bypass_no_dns(host, port, env=env):
         return ""
     return _normalize_proxy_fingerprint(proxy_url)
 
@@ -1927,8 +1969,14 @@ def _validate_request_url(
     return parsed, origin
 
 
-def _should_use_system_proxy(scheme: str, host: str, port: int | None = None) -> bool:
-    return bool(_resolve_system_proxy_key(scheme, host, port))
+def _should_use_system_proxy(
+    scheme: str,
+    host: str,
+    port: int | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    return bool(_resolve_system_proxy_key(scheme, host, port, env=env))
 
 
 def _combine_cancel_check(
@@ -2770,7 +2818,9 @@ def reset_rate_limit_pacers() -> None:
     _RATE_PACER.reset()
 
 
-def urllib_http_transport(req: HttpRequest) -> HttpResponse:
+def urllib_http_transport(
+    req: HttpRequest, *, env: Mapping[str, str] | None = None
+) -> HttpResponse:
     """Default pure-stdlib HTTP transport with Keep-Alive pooling, HTTP proxy support, and safe redirects."""
     wall_deadline = (
         req.deadline if req.deadline is not None else (time.monotonic() + float(req.timeout_sec))
@@ -2803,12 +2853,17 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
         _, origin = _validate_request_url(req.url)
         scheme, host, port, _, _ = origin
 
-        if not _should_use_system_proxy(scheme, host, port):
+        use_proxy = (
+            _should_use_system_proxy(scheme, host, port)
+            if env is None
+            else _should_use_system_proxy(scheme, host, port, env=env)
+        )
+        if not use_proxy:
             return _execute_keepalive(
                 req, wall_deadline=wall_deadline, hdrs_init=hdrs_out, proxy_key=""
             )
 
-        cur_proxies = urllib.request.getproxies()
+        cur_proxies = _get_effective_proxies(env)
         raw_proxy_url = _select_system_proxy_url(cur_proxies, scheme)
         proxy_route, proxy_err = _resolve_http_proxy_route(raw_proxy_url, target_scheme=scheme)
         if proxy_route is None:
@@ -2848,3 +2903,11 @@ def urllib_http_transport(req: HttpRequest) -> HttpResponse:
             caller_proxy_auth=caller_proxy_auth,
         )
         raise HttpTransportError(safe_msg, retry_kind=rkind) from None
+
+
+def make_urllib_http_transport(env: Mapping[str, str] | None = None) -> HttpTransport:
+    """Return an ``HttpTransport`` honoring ``env`` (process env + loaded ``.env`` proxy vars)."""
+    if env is None:
+        return urllib_http_transport
+    bound_env = env
+    return lambda req: urllib_http_transport(req, env=bound_env)
