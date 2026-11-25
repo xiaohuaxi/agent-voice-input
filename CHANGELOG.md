@@ -8,7 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Claude Desktop (Code + Cowork) local session binding & macOS nested `AXWebArea` route/title capture**: Added bounded read-only nested `AXWebArea` BFS probing (`maxDepth=12`, per-call remaining `80ms` timeout, skipped on stop/cancel hotkey events) in `mac_shim.swift` for `com.anthropic.claudefordesktop` to extract sanitized `AXTitle` and route `AXURL` (`app://localhost/cowork/local_<uuid>` / `app://localhost/epitaxy/local_<uuid>`), paired with direct route lookup plus stat-cached Code-title fallback across `~/Library/Application Support/Claude` and `Claude-3p`, strict transcript SID verification, Cowork `userSelectedFolders`/`resolvedFolderKinds` local-folder parsing (shielding internal sandbox `outputs` `cwd` and skipping cross-CLI prior blocks), per-message UUID deduplication scoped to Cowork `audit.jsonl` ingestion, and pre-delivery same-window route/SID re-verification while failing closed to `general` + `ai_chat` on cloud Chat, blank pages, or ambiguous routes.
+- **Claude Desktop (Code & Cowork) local session binding on macOS**: Added bounded read-only `AXWebArea` route and title probing for `com.anthropic.claudefordesktop` with dual official (`Claude`) and 3P (`Claude-3p`) metadata discovery, `50K` incremental session caching, local Cowork folder resolution, and pre-paste same-window thread verification, while keeping cloud Chat isolated in `general` + `ai_chat` mode.
+
+### Changed
+- **Extended clipboard-fallback HUD toast duration to 5s**: Extended the clipboard-copied HUD notification duration from `2s` to `5s` across Python, macOS, and Windows so fallback notices when focus shifts or modifier keys are held remain easier to notice.
+- **Single-owner voice-priority clipboard pipeline**: Simplified clipboard delivery across macOS and WSL2 so the native bridge solely owns clipboard writes during paste, prioritizing voice output over restoring the previous clipboard on transient conflicts or timeouts without complex recapture/rollback paths.
+- **Modularized daemon & zero-dependency multi-file native shims**: Split daemon internals into focused modules (`control_ipc.py` and `daemon_pipeline.py`) and decomposed the monolithic native shims into multi-file sources (`mac_shim/*.swift` and `win_shim/*.cs`) with synced packaging metadata and zero added runtime dependencies.
+
+### Fixed
+- **Killable single-slot macOS pasteboard worker & slow Accessibility decoupling**: Isolated macOS clipboard snapshot capture in a killable single-slot worker and decoupled slow Accessibility probes from hot paths, preventing 60s Windows App / RDP clipboard promise hangs from stalling HUD updates, hotkeys, or dictation delivery.
+- **Single-writer bridge stdin, non-blocking HUD dispatch & unified recording ownership**: Consolidated native bridge stdin onto a single-writer channel with lock-free non-blocking HUD dispatch and unified platform recording ownership across macOS and WSL2—fixing WSL stop/cancel write-timeout state recovery and premature slot release, control-socket ordering, and pipe close races.
 
 ## [0.14.0] - 2026-11-24
 
