@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 from agent_voice_input import integrate as mod
-from agent_voice_input.config import parse_toml
+from agent_voice_input.config import _parse_simple_toml, parse_toml
 
 
 def _no_which(_name: str) -> str | None:
@@ -581,7 +581,8 @@ class TestCodexIntegration(unittest.TestCase):
             bad_installs = [
                 "[tui\nbroken",
                 '[tui]\nterminal_title = "not-array"\n',
-                'tui.theme = "dark"\n',  # dotted key conflict caught by parse_toml validation
+                'tui.theme = "dark"\n',  # dotted key without explicit [tui] header -> fail-closed across py3.10-3.14
+                'tui = { theme = "dark" }\n',  # inline table without explicit [tui] header -> fail-closed
                 '[tui]\nterminal_title = [\n  "spinner", # inline comment\n  "project-name",\n]\n',
                 '[tui]\nterminal_title = [["nested"]]\n',
             ]
@@ -590,6 +591,15 @@ class TestCodexIntegration(unittest.TestCase):
                 act = mod.apply_integrations("codex", home_dir=home, cache_dir=cache, which_fn=_no_which)[0]
                 self.assertEqual(act.action, "error", msg=f"expected error for {raw!r}")
                 self.assertEqual(cfg.read_text(encoding="utf-8"), raw)
+
+            # Simulate Python 3.10 fallback parser (_parse_simple_toml) where appending [tui] after
+            # dotted tui.* keys would not be rejected by the parser alone: must still fail closed.
+            with mock.patch.object(mod, "parse_toml", _parse_simple_toml):
+                for raw in ('tui.theme = "dark"\n', 'tui = { theme = "dark" }\n'):
+                    cfg.write_text(raw, encoding="utf-8")
+                    act = mod.apply_integrations("codex", home_dir=home, cache_dir=cache, which_fn=_no_which)[0]
+                    self.assertEqual(act.action, "error", msg=f"expected py310 fallback error for {raw!r}")
+                    self.assertEqual(cfg.read_text(encoding="utf-8"), raw)
 
             # Fail-closed uninstall cases
             bad_uninstalls = [

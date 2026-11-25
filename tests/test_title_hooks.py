@@ -25,6 +25,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from agent_voice_input import session_title as VST  # noqa: E402
 from agent_voice_input.config import parse_toml  # noqa: E402
+from agent_voice_input.integrate import AGY_HOOK_COMMAND, CLAUDE_HOOK_COMMAND  # noqa: E402
 from agent_voice_input.session_ctx import SessionTracker  # noqa: E402
 
 
@@ -132,7 +133,7 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
             self.assertIn(ev, hooks)
             self.assertEqual(
                 hooks[ev][0]["hooks"][0]["command"],
-                "agent-voice-input session-hook --cli claude",
+                CLAUDE_HOOK_COMMAND,
             )
 
         agy_hooks = json.loads(
@@ -144,7 +145,7 @@ class TitleHooksAndLinkageTests(unittest.TestCase):
             self.assertNotIn("matcher", vst_hook[ev][0])
             self.assertEqual(
                 vst_hook[ev][0]["command"],
-                "agent-voice-input session-hook --cli agy",
+                AGY_HOOK_COMMAND,
             )
 
         voice_title_sh = REPO_ROOT / "integrations" / "claude" / "voice-title.sh"

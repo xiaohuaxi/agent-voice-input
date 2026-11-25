@@ -468,6 +468,8 @@ def _patch_codex_toml(raw_text: str, *, uninstall: bool) -> tuple[str | None, bo
 
     if not uninstall:
         if sec is None:
+            if "tui" in parsed:
+                return None, False, f"cannot safely append [tui] because 'tui' is already defined without a [tui] header; {hint}"
             if not raw_text.strip():
                 candidate = f"[tui]{nl}{_CODEX_DEFAULT_LINE}{nl}"
             else:
