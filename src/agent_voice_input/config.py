@@ -500,7 +500,7 @@ class RefinerConfig:
     cold_start_fallback: str = "auto"
     base_url: str = ""
     api_key_env: str = ""
-    max_turns_per_thread: int = 20
+    max_turns_per_thread: int = 0
     timeout_sec: float = 90.0
     max_retries: int = 2
     force_on_single_hop: bool = False
@@ -2562,8 +2562,8 @@ def _validate_refiner_config(cfg: Config, *, env: Mapping[str, str] | None = Non
             resolved_ref = select_refiner_provider(cfg, creds_ref, env)
             if resolved_ref != "off":
                 cfg.refiner.effective_api(resolved_ref)
-    if cfg.refiner.max_turns_per_thread <= 0:
-        raise ConfigError("refiner.max_turns_per_thread must be > 0")
+    if cfg.refiner.max_turns_per_thread < 0:
+        raise ConfigError("refiner.max_turns_per_thread must be >= 0")
     if cfg.refiner.timeout_sec <= 0:
         raise ConfigError("refiner.timeout_sec must be > 0")
     if (

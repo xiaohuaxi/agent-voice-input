@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field, replace
 import hashlib
+import html
 import io
 import json
 import os
@@ -55,9 +56,16 @@ from .config import (
     select_asr_provider,
 )
 from .hotwords import (
+    HotwordEntry,
+    STAGE2_HOTWORDS_MAX_CHARS,
+    STAGE2_HOTWORDS_MAX_ITEMS,
+    STAGE2_VOCABULARY_HINTS_PREAMBLE,
     budget_hotwords_for_provider,
+    budget_openai_keywords,
     dedupe_hotwords_ci,
+    format_stage2_vocabulary_hints,
     load_hotwords_file as _load_hotwords_file_impl,
+    select_stage2_manual_entries,
 )
 from .http_transport import (
     CancelToken,
@@ -127,6 +135,7 @@ from .prompts import (
     SINGLE_HOP_TASK_REMINDER,
     format_target_app_hint,
     strip_target_hint_echo,
+    strip_vocabulary_hints_echo,
 )
 
 class AsrError(RuntimeError):
@@ -257,11 +266,90 @@ def _format_vocabulary_hints(hotwords: Sequence[str]) -> str:
     return f'<vocabulary_hints read_only="true">\n{body}\n</vocabulary_hints>'
 
 
+def _is_vocab_hints_block(block: str) -> bool:
+    return block.lstrip().startswith("<vocabulary_hints")
+
+
+def _extract_vocab_block_stats(blocks: Sequence[str]) -> tuple[set[str], int, int]:
+    """Extract lowercase canonical terms and consumed item/char counts from leading ``<vocabulary_hints>`` blocks."""
+    lows: set[str] = set()
+    used_items = 0
+    used_chars = 0
+    entry_lines = 0
+    for blk in blocks:
+        if not _is_vocab_hints_block(blk):
+            continue
+        for raw_ln in blk.splitlines():
+            ln = raw_ln.strip()
+            if (
+                not ln
+                or ln.lower().startswith("<vocabulary_hints")
+                or ln.lower() == "</vocabulary_hints>"
+                or ln == STAGE2_VOCABULARY_HINTS_PREAMBLE
+            ):
+                continue
+            used_chars += len(ln) + (1 if entry_lines else 0)
+            entry_lines += 1
+            head = ln.split(" (ASR has misheard as:", 1)[0].strip()
+            lows.add(html.unescape(head).lower())
+            used_items += 1
+    return lows, used_items, used_chars
+
+
+def _load_stage2_manual_entries_for_single_hop(
+    hotwords_file: str,
+    *,
+    mode: str,
+    env: Mapping[str, str] | None = None,
+) -> list[HotwordEntry]:
+    if not hotwords_file or not hotwords_file.strip():
+        return []
+    eff_mode = "general" if (mode or "agent").strip().lower() == "general" else "agent"
+    return select_stage2_manual_entries(hotwords_file, mode=eff_mode, env=env)
+
+
+def _format_single_hop_tail_vocabulary(
+    ctx: AsrContext,
+    blocks: Sequence[str],
+    *,
+    hotwords_file: str,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Render single-hop vocabulary sharing the unified 100-item / 1,500-char budget without duplicating leading hints."""
+    manual_entries = _load_stage2_manual_entries_for_single_hop(
+        hotwords_file, mode=ctx.mode, env=env
+    )
+    if any(_is_vocab_hints_block(b) for b in blocks):
+        blk_lows, used_items, used_chars = _extract_vocab_block_stats(blocks)
+        rem_items = max(0, STAGE2_HOTWORDS_MAX_ITEMS - used_items)
+        rem_chars = max(0, STAGE2_HOTWORDS_MAX_CHARS - used_chars - (1 if used_chars > 0 else 0))
+        if rem_items <= 0 or rem_chars <= 0:
+            return ""
+        covered_lows = {e.term.lower() for e in manual_entries} | blk_lows
+        extra_dynamic = [
+            " ".join(w.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").split())
+            for w in dedupe_hotwords_ci(ctx.hotwords)
+            if w.lower() not in covered_lows and w.strip()
+        ]
+        if not extra_dynamic:
+            return ""
+        dyn_budget = budget_hotwords_for_provider(
+            extra_dynamic, "single_hop", max_terms=rem_items, max_chars=rem_chars
+        )
+        if not dyn_budget.kept:
+            return ""
+        return f"Additional context terms (read-only): {', '.join(dyn_budget.kept)}"
+    return format_stage2_vocabulary_hints([*manual_entries, *ctx.hotwords])
+
+
 _LITERAL_EMPTY_QUOTES = frozenset({'""', "''", "“”", "‘’", "``"})
 
 
-def _normalize_single_hop_text(raw: str) -> str:
-    cleaned = strip_target_hint_echo(strip_lenticular_artifacts(raw)).strip()
+def _normalize_single_hop_text(raw: str, *, strip_vocab_echo: bool = True) -> str:
+    cleaned = strip_target_hint_echo(strip_lenticular_artifacts(raw))
+    if strip_vocab_echo:
+        cleaned = strip_vocabulary_hints_echo(cleaned)
+    cleaned = cleaned.strip()
     return "" if cleaned in _LITERAL_EMPTY_QUOTES else cleaned
 
 
@@ -294,7 +382,7 @@ def _compose_context_text(
 
     if include_hotwords and ctx.hotwords:
         hw_prefix = "常用技术术语："
-        hw_cap = max(16, max(64, min(420, max_chars // 2)) - len(hw_prefix))
+        hw_cap = max(16, max(64, min(900 + len(hw_prefix), max_chars // 2)) - len(hw_prefix))
         hw_budget = budget_hotwords_for_provider(ctx.hotwords, "dashscope", max_chars=hw_cap)
         if hw_budget.kept:
             hw_str = hw_prefix + "、".join(hw_budget.kept)
@@ -322,25 +410,34 @@ def _compose_context_text(
     return combined
 
 
-def _compose_single_hop_unprepared_context(ctx: AsrContext, max_chars: int = 16000) -> str:
-    """Compose direct single-hop context using the 480-char single-hop vocabulary budget without duplication."""
-    vocab_blk = _format_vocabulary_hints(ctx.hotwords)
+def _compose_single_hop_unprepared_context(
+    ctx: AsrContext,
+    max_chars: int = 16000,
+    *,
+    manual_entries: Sequence[HotwordEntry] = (),
+) -> str:
+    """Compose direct single-hop context using the unified 100-item / 1,500-char vocabulary hints without duplication."""
+    vocab_blk = format_stage2_vocabulary_hints([*manual_entries, *ctx.hotwords])
     rem = max(0, max_chars - (len(vocab_blk) + 2 if vocab_blk else 0))
     ctx_body = _compose_context_text(ctx, max_chars=rem, include_hotwords=False)
     return "\n\n".join(filter(None, [vocab_blk, ctx_body]))
 
 
-def _compose_stt_prompt_text(ctx: AsrContext, max_chars: int = 2000) -> str:
+def _compose_stt_prompt_text(
+    ctx: AsrContext, max_chars: int = 2000, *, include_hotwords: bool = True
+) -> str:
     """Compose Whisper-compatible STT ``prompt`` with high-priority ``hotwords`` at the END.
 
     Whisper-family ``/audio/transcriptions`` decoders retain only the trailing ~224 tokens
     of ``prompt``; placing ``hotwords`` last prevents background dialog/git text from
-    pushing key vocabulary out of the decoder window.
+    pushing key vocabulary out of the decoder window. When ``include_hotwords=False``
+    (e.g., OpenAI ``gpt-transcribe`` sending native ``keywords[]``), only concise workspace
+    and recent-dialogue context is included.
     """
     if max_chars <= 0:
         return ""
     hw_str = ""
-    if ctx.hotwords:
+    if include_hotwords and ctx.hotwords:
         hw_prefix = "常用技术术语："
         hw_cap = max(16, min(360, max(64, max_chars // 2)) - len(hw_prefix))
         hw_budget = budget_hotwords_for_provider(ctx.hotwords, "whisper", max_chars=hw_cap)
@@ -1007,7 +1104,7 @@ def _resolve_doubao_base_url(raw_base: str) -> str:
 
 
 def _build_doubao_corpus_context(ctx: AsrContext) -> str | None:
-    """Build serialized Doubao corpus.context strictly within 30 words/180 chars + 600 dialog chars."""
+    """Build serialized Doubao corpus.context strictly within 50 words/500 chars + 600 dialog chars."""
     hw_budget = budget_hotwords_for_provider(ctx.hotwords, "doubao")
     hw_objs = [{"word": w} for w in hw_budget.kept]
 
@@ -1697,19 +1794,31 @@ class GeminiAudioProvider(BaseAsrProvider):
         ctx_chunks = 0
         ctx_chars = 0
         hint_blk = format_target_app_hint(ctx.target_hint)
+        sent_vocab_hints = False
         if ctx.single_hop_prepared or ctx.context_blocks or ctx.git_block:
             blocks = list(ctx.context_blocks)
-            ctx_chunks = len(blocks)
-            ctx_chars = sum(len(b) for b in blocks)
+            sess_blocks = [b for b in blocks if not _is_vocab_hints_block(b)]
+            ctx_chunks = len(sess_blocks)
+            ctx_chars = sum(len(b) for b in sess_blocks)
             for blk in blocks:
                 parts.append({"text": blk})
-            tail = "\n\n".join(
-                filter(None, [ctx.git_block, _format_vocabulary_hints(ctx.hotwords), hint_blk])
+            tail_vocab = _format_single_hop_tail_vocabulary(
+                ctx, blocks, hotwords_file=self.cfg.asr.hotwords_file, env=self.env
             )
+            sent_vocab_hints = any(_is_vocab_hints_block(b) for b in blocks) or (
+                "<vocabulary_hints" in tail_vocab.lower()
+            )
+            tail = "\n\n".join(filter(None, [ctx.git_block, tail_vocab, hint_blk]))
             if tail:
                 parts.append({"text": tail})
         else:
-            ctx_body = _compose_single_hop_unprepared_context(ctx, max_chars=16000)
+            manual_entries = _load_stage2_manual_entries_for_single_hop(
+                self.cfg.asr.hotwords_file, mode=ctx.mode, env=self.env
+            )
+            ctx_body = _compose_single_hop_unprepared_context(
+                ctx, max_chars=16000, manual_entries=manual_entries
+            )
+            sent_vocab_hints = "<vocabulary_hints" in ctx_body.lower()
             if ctx_body:
                 parts.append({"text": f"<session_context>\n{ctx_body}\n</session_context>"})
             if hint_blk:
@@ -1825,7 +1934,7 @@ class GeminiAudioProvider(BaseAsrProvider):
         latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
         in_tok, cached_tok, out_tok, rsn_tok = usage_box[0] if not cancelled else _EMPTY_USAGE
         return AsrResult(
-            text="" if cancelled else _normalize_single_hop_text(raw_out),
+            text="" if cancelled else _normalize_single_hop_text(raw_out, strip_vocab_echo=sent_vocab_hints),
             provider=self.provider_name,
             model=model,
             latency_ms=latency_ms,
@@ -1918,6 +2027,14 @@ class _BearerProviderMixin(BaseAsrProvider):
         raise self._fail(_missing_key_hint(self.provider_name, stage="asr"))
 
 
+def _is_openai_gpt_transcribe_model(provider_name: str, model: str) -> bool:
+    """Return True for official OpenAI ``gpt-transcribe*`` models that support native ``keywords[]``."""
+    if (provider_name or "").strip().lower() != "openai":
+        return False
+    slug = (model or "").strip().lower().split("/", 1)[-1].split(":", 1)[0]
+    return slug == "gpt-transcribe" or slug.startswith("gpt-transcribe-")
+
+
 class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
     provider_name = "openai-compatible"
 
@@ -1953,7 +2070,7 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
 
         if self.provider_name == "openrouter":
             # OpenRouter /api/v1/audio/transcriptions accepts JSON input_audio (raw Base64 wav),
-            # ignores Whisper 'prompt', and only supports 'keyterms' on Deepgram/AssemblyAI models.
+            # ignores Whisper 'prompt', and supports 'keyterms' on verified upstream STT models.
             b64_wav = base64.b64encode(wav_bytes).decode("ascii")
             json_payload: dict[str, Any] = {
                 "model": model,
@@ -1968,9 +2085,28 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
                     json_payload["keyterms"] = list(kt_budget.kept)
             headers["Content-Type"] = "application/json"
             body = json.dumps(json_payload, ensure_ascii=False).encode("utf-8")
+        elif _is_openai_gpt_transcribe_model(self.provider_name, model):
+            # Native OpenAI gpt-transcribe accepts repeated multipart keywords[] (<=50 sanitized terms)
+            # separately from concise dialog/git prompt context.
+            fields: list[tuple[str, str]] = [
+                ("model", model),
+                ("response_format", "json"),
+            ]
+            if ctx.hotwords:
+                kw_budget = budget_openai_keywords(ctx.hotwords)
+                for kw in kw_budget.kept:
+                    fields.append(("keywords[]", kw))
+            prompt = _compose_stt_prompt_text(ctx, max_chars=2000, include_hotwords=False)
+            if prompt:
+                fields.append(("prompt", prompt))
+            content_type, body = _encode_multipart_formdata(
+                fields,
+                ("file", "audio.wav", "audio/wav", wav_bytes),
+            )
+            headers["Content-Type"] = content_type
         else:
             prompt = _compose_stt_prompt_text(ctx, max_chars=2000)
-            fields: list[tuple[str, str]] = [
+            fields = [
                 ("model", model),
                 ("response_format", "json"),
             ]
@@ -2353,11 +2489,13 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
         ctx_chunks = 0
         ctx_chars = 0
         hint_blk = format_target_app_hint(ctx.target_hint)
+        sent_vocab_hints = False
         if ctx.single_hop_prepared or ctx.context_blocks or ctx.git_block:
             blocks = list(ctx.context_blocks)
-            ctx_chunks = len(blocks)
-            ctx_chars = sum(len(b) for b in blocks)
-            bps = set(openrouter_cache_breakpoints(self.provider_name, model, len(blocks)))
+            sess_blocks = [b for b in blocks if not _is_vocab_hints_block(b)]
+            ctx_chunks = len(sess_blocks)
+            ctx_chars = sum(len(b) for b in sess_blocks)
+            bps = set(openrouter_cache_breakpoints(self.provider_name, model, context_blocks=blocks))
             ctx_parts: list[dict[str, Any]] = [
                 {
                     "type": "text",
@@ -2366,9 +2504,13 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                 }
                 for idx, blk in enumerate(blocks)
             ]
-            tail = "\n\n".join(
-                filter(None, [ctx.git_block, _format_vocabulary_hints(ctx.hotwords), hint_blk])
+            tail_vocab = _format_single_hop_tail_vocabulary(
+                ctx, blocks, hotwords_file=self.cfg.asr.hotwords_file, env=self.env
             )
+            sent_vocab_hints = any(_is_vocab_hints_block(b) for b in blocks) or (
+                "<vocabulary_hints" in tail_vocab.lower()
+            )
+            tail = "\n\n".join(filter(None, [ctx.git_block, tail_vocab, hint_blk]))
             user_content: list[dict[str, Any]] = [
                 *ctx_parts,
                 *([{"type": "text", "text": tail}] if tail else []),
@@ -2376,7 +2518,13 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                 {"type": "text", "text": CHAT_AUDIO_TASK_REMINDER},
             ]
         else:
-            ctx_body = _compose_single_hop_unprepared_context(ctx, max_chars=16000)
+            manual_entries = _load_stage2_manual_entries_for_single_hop(
+                self.cfg.asr.hotwords_file, mode=ctx.mode, env=self.env
+            )
+            ctx_body = _compose_single_hop_unprepared_context(
+                ctx, max_chars=16000, manual_entries=manual_entries
+            )
+            sent_vocab_hints = "<vocabulary_hints" in ctx_body.lower()
             session_tag = (
                 f"<session_context>\n{ctx_body}\n</session_context>"
                 if ctx_body
@@ -2501,7 +2649,7 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
             cancel_token=cancel_token,
         )
         latency_ms = max(0, int(round((self.clock_fn() - t0) * 1000)))
-        out_text = "" if cancelled else _normalize_single_hop_text(raw_out)
+        out_text = "" if cancelled else _normalize_single_hop_text(raw_out, strip_vocab_echo=sent_vocab_hints)
         in_tok, cached_tok, out_tok, rsn_tok = usage_box[0] if not cancelled else _EMPTY_USAGE
         return AsrResult(
             text=out_text,

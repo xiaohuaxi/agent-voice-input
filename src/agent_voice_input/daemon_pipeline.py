@@ -56,7 +56,12 @@ from .control_ipc import (
     _parse_optional_timeout_sec,
     _resolve_control_origin_window,
 )
-from .hotwords import load_hotwords_file
+from .hotwords import (
+    format_stage2_vocabulary_hints,
+    load_hotwords_file,
+    load_hotwords_table,
+    select_stage2_manual_entries,
+)
 from .hud import is_toast_hud_state, resolve_ui_language
 from .platform_common import (
     ForegroundWindow,
@@ -720,6 +725,7 @@ class _Stage1State:
     workspace_cwd: str = ""
     target_hint: str = ""
     hotwords_scope: str = "global"
+    vocabulary_hints: str = ""
     remote_vetoed: bool = False
     asr_ctx_dialog: str = ""
     sync_ms: int = 0
@@ -1086,16 +1092,20 @@ def _resolve_stage1_context(
     )
     st.hotwords_scope = hw_scope
     has_hw_file = bool(cfg.asr.hotwords_file.strip())
-    manual_hw = (
-        load_hotwords_file(cfg.asr.hotwords_file, env=env, scene=hw_scope)
-        if has_hw_file
-        else []
-    )
+    if has_hw_file:
+        hw_table = load_hotwords_table(cfg.asr.hotwords_file, env=env)
+        manual_hw = hw_table.merged_for_scene(hw_scope)
+        stage2_entries = select_stage2_manual_entries(hw_table, mode=eff_mode)
+        st.vocabulary_hints = format_stage2_vocabulary_hints(stage2_entries)
+    else:
+        manual_hw = []
+        st.vocabulary_hints = ""
     asr_ctx = tracker.build_asr_context(
         st.snap,
         extra_hotwords=[*manual_hw, *extra_hw],
         mode=eff_mode,
         language=_resolve_effective_ui_language(cfg, env=env, platform=platform),
+        target_hint=st.target_hint,
     )
     asr_ctx.hotwords_scope = hw_scope
     asr_ctx.manual_hotwords_loaded = has_hw_file
@@ -1111,6 +1121,7 @@ def _resolve_stage1_context(
             mode=eff_mode,
             workspace_cwd=st.workspace_cwd,
             target_hint=st.target_hint,
+            vocabulary_hints=st.vocabulary_hints,
         )
         if eff_mode != "general" and any(
             b.startswith("<prior_session_reference") for b in asr_ctx.context_blocks
@@ -1422,17 +1433,19 @@ def run_pipeline_once(
                 ref_tracker = _IsolatedSessionTrackerView(eff_tracker, real_skey)
                 if not ref_workspace_cwd and st.snap is not None and st.snap.match.cwd:
                     ref_workspace_cwd = st.snap.match.cwd
-            ref_res = eff_refiner.refine(
-                st.asr_res,
-                session_key=ref_session_key,
-                tracker=ref_tracker,
-                fallback_context=ref_fallback_ctx,
-                is_cancelled=cancel_check,
-                cancel_token=cancel_token,
-                mode=st.eff_mode,
-                workspace_cwd=ref_workspace_cwd,
-                target_hint=st.target_hint,
-            )
+            refine_kw: dict[str, Any] = {
+                "session_key": ref_session_key,
+                "tracker": ref_tracker,
+                "fallback_context": ref_fallback_ctx,
+                "is_cancelled": cancel_check,
+                "cancel_token": cancel_token,
+                "mode": st.eff_mode,
+                "workspace_cwd": ref_workspace_cwd,
+                "target_hint": st.target_hint,
+            }
+            if st.vocabulary_hints:
+                refine_kw["vocabulary_hints"] = st.vocabulary_hints
+            ref_res = eff_refiner.refine(st.asr_res, **refine_kw)
             cand_text = (ref_res.text.strip() if ref_res else "") or st.asr_res.text.strip()
             if (c_rsn := _cancel_reason()) or (
                 ref_res and ref_res.used_fallback in (*_HARD_CANCEL_REASONS, "superseded")

@@ -117,7 +117,12 @@ from ._tmux import (
     probe_tmux_snapshot,
     resolve_tmux_bin,
 )
-from .app_scope import is_remote_ide_window, parse_ide_window_title
+from .app_scope import (
+    BUILTIN_AI_CHAT_HOTWORDS,
+    get_builtin_ai_chat_hotwords,
+    is_remote_ide_window,
+    parse_ide_window_title,
+)
 from .llm_common import AsrContext
 from .config import RemoteConfig, RemoteHostConfig, ensure_secure_dir, get_runtime_dir
 from .remote_ssh import (
@@ -161,6 +166,27 @@ from .workspace_ctx import (
 MAX_META_LINE_BYTES = MAX_LINE_BYTES  # 16 MiB safety cap per metadata/ingest line
 MAX_INGEST_LINE_BYTES = MAX_LINE_BYTES
 _REG_SID_RE = re.compile(r"^[0-9a-f]{8}[0-9a-f-]{0,56}$")
+_STAGE1_GIT_HOTWORDS_LIMIT = 10
+
+
+def _compact_git_hotwords(
+    words: Sequence[str], *, limit: int | None = _STAGE1_GIT_HOTWORDS_LIMIT
+) -> list[str]:
+    """Case-insensitively deduplicate git hotwords and cap to ``limit`` without guessing stem deletions."""
+    out: list[str] = []
+    seen_low: set[str] = set()
+    for raw in words:
+        w = raw.strip()
+        if not w:
+            continue
+        low = w.lower()
+        if low in seen_low:
+            continue
+        seen_low.add(low)
+        out.append(w)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
 
 # ---------------------------------------------------------------------------
 # Window title hint parsing
@@ -4953,7 +4979,8 @@ class SessionTracker:
         if not workspace_cwd or is_wsl_slow_mount_path(workspace_cwd, env=self.env):
             return []
         _, git_hw = self._get_git_info(workspace_cwd)
-        return list(git_hw[:24]) if git_hw else self._fallback_workspace_stems(workspace_cwd)
+        compact_git_hw = _compact_git_hotwords(git_hw)
+        return compact_git_hw if compact_git_hw else self._fallback_workspace_stems(workspace_cwd)
 
     def _canonical_prior_cwd(self, raw_cwd: str, *, is_remote: bool = False) -> str:
         if not raw_cwd:
@@ -5098,7 +5125,10 @@ class SessionTracker:
             prior_checked_sid = ""
             if cached_st is not None and eff_fb != "off":
                 already_checked = (
-                    cached_st.cold_start_prior_checked
+                    (
+                        cached_st.cold_start_prior_checked
+                        and cached_st.cold_start_prior_hotwords_checked
+                    )
                     if eff_fb == "auto"
                     else cached_st.cold_start_prior_hotwords_checked
                 )
@@ -5312,41 +5342,38 @@ class SessionTracker:
             if evicted > 0 or comp_cnt > 0:
                 state.cold_start_prior_retired = True
                 state.cold_start_prior_checked = True
-                state.cold_start_prior_hotwords_checked = True
             elif len(new_turns) >= COLD_START_SWEET_MIN_TURNS:
                 if not state.cold_start_prior_checked:
                     state.cold_start_prior_checked = True
-                    state.cold_start_prior_hotwords_checked = True
                     state.cold_start_prior_retired = True
-            elif eff_fb != "off" and not state.cold_start_prior_retired:
-                if not state.cold_start_prior_hotwords_checked:
-                    if raw_prior_hw:
-                        state.cold_start_prior_hotwords = tuple(_dedupe_hotwords_ci(raw_prior_hw))
-                        if rem_canon_cwd:
-                            state.cold_start_prior_cwd = rem_canon_cwd
-                    elif raw_prior_turns:
-                        state.cold_start_prior_hotwords = tuple(
-                            extract_prior_sessions_hotwords([raw_prior_turns])
+            if eff_fb != "off" and not state.cold_start_prior_hotwords_checked:
+                if raw_prior_hw:
+                    state.cold_start_prior_hotwords = tuple(_dedupe_hotwords_ci(raw_prior_hw))
+                    if rem_canon_cwd:
+                        state.cold_start_prior_cwd = rem_canon_cwd
+                elif raw_prior_turns:
+                    state.cold_start_prior_hotwords = tuple(
+                        extract_prior_sessions_hotwords([raw_prior_turns])
+                    )
+                    if rem_canon_cwd:
+                        state.cold_start_prior_cwd = rem_canon_cwd
+                state.cold_start_prior_hotwords_checked = True
+            if (
+                eff_fb == "auto"
+                and not state.cold_start_prior_checked
+                and not state.cold_start_prior_retired
+            ):
+                if cli != "workspace" and raw_prior_turns:
+                    body_cap = prior_chunk_body_budget(eff_max_chars)
+                    if body_cap > 0:
+                        state.cold_start_prior_chunk = format_prior_turns_body(
+                            raw_prior_turns,
+                            max_chars=body_cap,
+                            max_turns=COLD_START_PRIOR_MAX_TURNS,
                         )
-                        if rem_canon_cwd:
+                        if state.cold_start_prior_chunk and rem_canon_cwd:
                             state.cold_start_prior_cwd = rem_canon_cwd
-                    state.cold_start_prior_hotwords_checked = True
-                if (
-                    eff_fb == "auto"
-                    and not state.cold_start_prior_checked
-                    and not state.cold_start_prior_retired
-                ):
-                    if cli != "workspace" and raw_prior_turns:
-                        body_cap = prior_chunk_body_budget(eff_max_chars)
-                        if body_cap > 0:
-                            state.cold_start_prior_chunk = format_prior_turns_body(
-                                raw_prior_turns,
-                                max_chars=body_cap,
-                                max_turns=COLD_START_PRIOR_MAX_TURNS,
-                            )
-                            if state.cold_start_prior_chunk and rem_canon_cwd:
-                                state.cold_start_prior_cwd = rem_canon_cwd
-                    state.cold_start_prior_checked = True
+                state.cold_start_prior_checked = True
 
             self._update_remote_files_state_locked(
                 host_cfg.name,
@@ -5546,11 +5573,18 @@ class SessionTracker:
                 luna_idx = state.luna_synced_idx
                 gen = state.generation
                 git_status = state.remote_git_status if include_git_info else ""
-                git_hw = list(state.remote_git_hotwords) if include_git_info else []
+                git_hw = _compact_git_hotwords(state.remote_git_hotwords) if include_git_info else []
                 rem_files = list(state.remote_repo_files or state.remote_shallow_files) if include_git_info else []
+                rem_canon_cwd = self._canonical_prior_cwd(state.cwd, is_remote=True)
                 prior_hw = (
                     list(state.cold_start_prior_hotwords)
-                    if (eff_fb != "off" and len(turns_tuple) < COLD_START_SWEET_MIN_TURNS)
+                    if (
+                        eff_fb != "off"
+                        and (
+                            not state.cold_start_prior_cwd
+                            or state.cold_start_prior_cwd == rem_canon_cwd
+                        )
+                    )
                     else []
                 )
                 resolved_match = SessionMatch(
@@ -5569,7 +5603,9 @@ class SessionTracker:
                         self._unpin_state_locked(pk)
         repo_stems = _file_stems_for_hotwords(rem_files, limit=12) if (rem_files and not git_hw) else []
         turn_hw = extract_turn_hotwords(turns_tuple)
-        merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems, *prior_hw]))
+        merged_hw = tuple(
+            _dedupe_hotwords_ci([*turn_hw, *git_hw[:_STAGE1_GIT_HOTWORDS_LIMIT], *repo_stems, *prior_hw])
+        )
         return SessionSnapshot(
             match=resolved_match,
             clean_turns=turns_tuple,
@@ -5655,16 +5691,28 @@ class SessionTracker:
                 state, target_canon_cwd, clear_on_empty=authoritative_cwd
             )
 
+            want_prior_chunk = False
+            want_prior_hotwords = False
             if len(turns_tuple) >= COLD_START_SWEET_MIN_TURNS:
                 if not state.cold_start_prior_checked:
                     state.cold_start_prior_checked = True
-                    state.cold_start_prior_hotwords_checked = True
                     state.cold_start_prior_retired = True
-            elif allow_cold_start_prior and eff_fb != "off" and eff_cwd and not state.cold_start_prior_retired:
-                if eff_fb == "auto" and not state.cold_start_prior_checked:
-                    need_prior_discovery = True
-                elif eff_fb == "hotwords" and not state.cold_start_prior_hotwords_checked:
-                    need_prior_discovery = True
+            elif (
+                allow_cold_start_prior
+                and eff_fb == "auto"
+                and eff_cwd
+                and not state.cold_start_prior_retired
+                and not state.cold_start_prior_checked
+            ):
+                want_prior_chunk = True
+            if (
+                allow_cold_start_prior
+                and eff_fb != "off"
+                and eff_cwd
+                and not state.cold_start_prior_hotwords_checked
+            ):
+                want_prior_hotwords = True
+            need_prior_discovery = want_prior_chunk or want_prior_hotwords
             self._pin_state_locked(state_key)
 
         try:
@@ -5675,13 +5723,13 @@ class SessionTracker:
                 )
                 discovered_hw = (
                     tuple(aggregate_prior_candidates_hotwords(top5_prior))
-                    if top5_prior
+                    if (want_prior_hotwords and top5_prior)
                     else ()
                 )
                 body_cap = prior_chunk_body_budget(self.context_max_chars)
                 best_turns = (
                     (best_prior.get("tail_turns") or best_prior.get("turns") or ())
-                    if best_prior is not None
+                    if (want_prior_chunk and best_prior is not None)
                     else ()
                 )
                 discovered_chunk = (
@@ -5690,7 +5738,7 @@ class SessionTracker:
                         max_chars=body_cap,
                         max_turns=COLD_START_PRIOR_MAX_TURNS,
                     )
-                    if (eff_fb == "auto" and body_cap > 0 and best_turns)
+                    if (want_prior_chunk and eff_fb == "auto" and body_cap > 0 and best_turns)
                     else ""
                 )
                 with self._lock:
@@ -5703,13 +5751,18 @@ class SessionTracker:
                             if cur_st.matched_by in _AUTHORITATIVE_DESKTOP_MATCHED_BY
                             else (not cur_canon or cur_canon == target_canon_cwd)
                         )
-                        if not cur_st.cold_start_prior_retired and cwd_still_matches:
-                            if not cur_st.cold_start_prior_hotwords_checked:
+                        if cwd_still_matches:
+                            if want_prior_hotwords and not cur_st.cold_start_prior_hotwords_checked:
                                 cur_st.cold_start_prior_hotwords = discovered_hw
                                 cur_st.cold_start_prior_hotwords_checked = True
                                 if discovered_hw and target_canon_cwd:
                                     cur_st.cold_start_prior_cwd = target_canon_cwd
-                            if eff_fb == "auto" and not cur_st.cold_start_prior_checked:
+                            if (
+                                want_prior_chunk
+                                and eff_fb == "auto"
+                                and not cur_st.cold_start_prior_retired
+                                and not cur_st.cold_start_prior_checked
+                            ):
                                 cur_st.cold_start_prior_chunk = discovered_chunk
                                 cur_st.cold_start_prior_checked = True
                                 if discovered_chunk and target_canon_cwd:
@@ -5725,7 +5778,6 @@ class SessionTracker:
                         cur_st is not None
                         and allow_cold_start_prior
                         and eff_fb != "off"
-                        and len(turns_tuple) < COLD_START_SWEET_MIN_TURNS
                         and bool(target_canon_cwd)
                         and (
                             not cur_st.cold_start_prior_cwd
@@ -5742,12 +5794,15 @@ class SessionTracker:
             with self._lock:
                 self._unpin_state_locked(state_key)
 
-        git_status, git_hw = (
+        git_status, raw_git_hw = (
             self._get_git_info(eff_cwd) if (include_git_info and eff_cwd) else ("", [])
         )
+        git_hw = _compact_git_hotwords(raw_git_hw)
         repo_stems = self._fallback_workspace_stems(eff_cwd) if (include_git_info and eff_cwd and not git_hw) else []
         turn_hw = extract_turn_hotwords(turns_tuple)
-        merged_hw = tuple(_dedupe_hotwords_ci([*git_hw[:24], *turn_hw, *repo_stems, *prior_hw]))
+        merged_hw = tuple(
+            _dedupe_hotwords_ci([*turn_hw, *git_hw[:_STAGE1_GIT_HOTWORDS_LIMIT], *repo_stems, *prior_hw])
+        )
 
         return SessionSnapshot(
             match=eff_match,
@@ -6055,13 +6110,21 @@ class SessionTracker:
         max_dialog_chars: int = 16000,
         mode: str = "agent",
         language: str = "auto",
+        target_hint: str = "",
     ) -> AsrContext:
         eff_mode = (mode or "agent").strip().lower() or "agent"
-        builtin_tail = () if eff_mode == "general" else get_builtin_agent_hotwords(language)
+        eff_hint = (target_hint or "").strip().lower()
+        if eff_mode == "general":
+            builtin_tail = (
+                get_builtin_ai_chat_hotwords(language) if eff_hint == "ai_chat" else ()
+            )
+        else:
+            builtin_tail = get_builtin_agent_hotwords(language)
         if eff_mode == "general" or snapshot is None:
             return AsrContext(
                 hotwords=_dedupe_hotwords_ci([*extra_hotwords, *builtin_tail]),
                 mode=eff_mode,
+                target_hint=eff_hint,
             )
         merged_hw = _dedupe_hotwords_ci([*extra_hotwords, *snapshot.hotwords, *builtin_tail])
         return AsrContext(
@@ -6069,4 +6132,5 @@ class SessionTracker:
             git_status=snapshot.git_status,
             dialog_text=snapshot.format_dialog(max_chars=max_dialog_chars),
             mode=eff_mode,
+            target_hint=eff_hint,
         )

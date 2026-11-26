@@ -123,6 +123,7 @@ from .prompts import (
     REFINER_TASK_REMINDER,
     format_target_app_hint,
     strip_target_hint_echo,
+    strip_vocabulary_hints_echo,
 )
 from .session_ctx import SessionTracker
 
@@ -244,10 +245,17 @@ def _unpack(asr_input: AsrResult | str) -> tuple[str, bool]:
     )
 
 
-def _clean_out(text: str, fallback: str = "") -> str:
+def _clean_out(text: str, fallback: str = "", *, strip_vocab_echo: bool = True) -> str:
     cleaned = strip_lenticular_artifacts(text).strip()
     if cleaned and "<target_app_hint" not in fallback.lower() and "</target_app_hint>" not in fallback.lower():
         cleaned = strip_target_hint_echo(cleaned).strip()
+    if (
+        strip_vocab_echo
+        and cleaned
+        and "<vocabulary_hints" not in fallback.lower()
+        and "</vocabulary_hints>" not in fallback.lower()
+    ):
+        cleaned = strip_vocabulary_hints_echo(cleaned).strip()
     if cleaned and "<asr_draft_to_clean>" not in fallback and "</asr_draft_to_clean>" not in fallback:
         if cleaned.startswith("<asr_draft_to_clean>"):
             cleaned = cleaned.removeprefix("<asr_draft_to_clean>").strip()
@@ -276,7 +284,7 @@ def _fallback_result(
     used_prior_session: bool = False,
 ) -> RefinerResult:
     return RefinerResult(
-        _clean_out(clean_draft),
+        _clean_out(clean_draft, strip_vocab_echo=False),
         provider_name,
         model,
         _ms(t0, clock_fn),
@@ -421,6 +429,49 @@ def build_refiner_context_chunks(
     return blocks, git_ctx
 
 
+def _is_vocab_hints_block(block: str) -> bool:
+    return block.lstrip().startswith("<vocabulary_hints")
+
+
+def _measure_session_context_blocks(context_blocks: Sequence[str]) -> tuple[int, int]:
+    """Count session/dialogue reference blocks & chars, excluding static ``<vocabulary_hints>``."""
+    sess_blocks = [b for b in context_blocks if not _is_vocab_hints_block(b)]
+    return len(sess_blocks), sum(len(b) for b in sess_blocks)
+
+
+def _build_gemini_contents(
+    context_blocks: Sequence[str], final_block: str
+) -> list[dict[str, Any]]:
+    """Build native Gemini ``contents`` with 3-turn stateless prefix caching layout.
+
+    When at least one stable prefix block exists, placing stable prefix blocks in turn 1
+    (``user``), a minimal ``model`` placeholder ``"Understood."`` in turn 2, and the mutable
+    tail/draft in turn 3 (``user``) enables Gemini's automatic implicit prefix caching.
+    """
+    if not context_blocks:
+        return [{"role": "user", "parts": [{"text": final_block}]}]
+    log_indices = [
+        idx
+        for idx, blk in enumerate(context_blocks)
+        if blk.lstrip().startswith("<session_reference_log")
+    ]
+    if len(log_indices) >= 2:
+        split_idx = log_indices[-1]
+        prefix_blocks = context_blocks[:split_idx]
+        tail_blocks = context_blocks[split_idx:]
+    else:
+        prefix_blocks = context_blocks
+        tail_blocks = ()
+    return [
+        {"role": "user", "parts": [{"text": blk} for blk in prefix_blocks]},
+        {"role": "model", "parts": [{"text": "Understood."}]},
+        {
+            "role": "user",
+            "parts": [*({"text": blk} for blk in tail_blocks), {"text": final_block}],
+        },
+    ]
+
+
 def attach_single_hop_context(
     cfg: Config,
     base_ctx: AsrContext,
@@ -430,15 +481,17 @@ def attach_single_hop_context(
     mode: str = "agent",
     workspace_cwd: str = "",
     target_hint: str = "",
+    vocabulary_hints: str = "",
 ) -> AsrContext:
     eff_mode = (mode or "agent").strip().lower() or "agent"
     eff_hint = (target_hint or base_ctx.target_hint or "").strip().lower()
+    vocab_blk = vocabulary_hints.strip()
     if eff_mode == "general":
         return replace(
             base_ctx,
             git_status="",
             dialog_text="",
-            context_blocks=(),
+            context_blocks=(vocab_blk,) if vocab_blk else (),
             git_block="",
             mode="general",
             single_hop_prepared=True,
@@ -451,6 +504,8 @@ def attach_single_hop_context(
         fallback_context=base_ctx.dialog_text,
         workspace_cwd=workspace_cwd,
     )
+    if vocab_blk:
+        context_blocks = [vocab_blk, *context_blocks]
     return replace(
         base_ctx,
         git_status="",
@@ -473,9 +528,12 @@ def build_refiner_request_blocks(
     mode: str = "agent",
     workspace_cwd: str = "",
     target_hint: str = "",
+    vocabulary_hints: str = "",
 ) -> tuple[list[str], str]:
+    vocab_blk = vocabulary_hints.strip()
     if mode == "general":
-        return [], build_final_refiner_block(clean_draft, git_context="", target_hint=target_hint)
+        blocks = [vocab_blk] if vocab_blk else []
+        return blocks, build_final_refiner_block(clean_draft, git_context="", target_hint=target_hint)
     context_blocks, git_ctx = build_refiner_context_chunks(
         cfg,
         session_key=session_key,
@@ -483,6 +541,8 @@ def build_refiner_request_blocks(
         fallback_context=fallback_context,
         workspace_cwd=workspace_cwd,
     )
+    if vocab_blk:
+        context_blocks = [vocab_blk, *context_blocks]
     return context_blocks, build_final_refiner_block(
         clean_draft, git_context=git_ctx, target_hint=target_hint
     )
@@ -775,6 +835,7 @@ def _run_refiner_retry_loop(
     used_prior_session: bool = False,
     cancel_token: CancelToken | None = None,
     thought_stats_fn: Callable[[], tuple[int, int]] | None = None,
+    has_vocabulary_hints: bool = False,
 ) -> RefinerResult:
     deadline = t0 + tsec
     max_retries = max(0, int(cfg.refiner.max_retries))
@@ -860,7 +921,7 @@ def _run_refiner_retry_loop(
                 thought_stats_fn() if thought_stats_fn is not None else (0, 0)
             )
             return RefinerResult(
-                _clean_out(out_txt, clean_draft),
+                _clean_out(out_txt, clean_draft, strip_vocab_echo=has_vocabulary_hints),
                 provider_name,
                 _cur_model(),
                 _ms(t0, clock_fn),
@@ -954,6 +1015,7 @@ class BaseRefiner:
         mode: str = "agent",
         workspace_cwd: str = "",
         target_hint: str = "",
+        vocabulary_hints: str = "",
     ) -> RefinerResult:
         raise NotImplementedError
 
@@ -1003,6 +1065,7 @@ class _HttpTransportRefiner(BaseRefiner):
         context_chars: int,
         context_chunks: int,
         used_prior_session: bool = False,
+        has_vocabulary_hints: bool = False,
     ) -> RefinerResult:
         body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         tsec = effective_refiner_timeout_sec(self.cfg.refiner.timeout_sec, len(clean_draft))
@@ -1046,6 +1109,7 @@ class _HttpTransportRefiner(BaseRefiner):
             context_chunks=context_chunks,
             used_prior_session=used_prior_session,
             cancel_token=cancel_token,
+            has_vocabulary_hints=has_vocabulary_hints,
         )
 
 
@@ -1064,11 +1128,12 @@ class NoopRefiner(BaseRefiner):
         mode: str = "agent",
         workspace_cwd: str = "",
         target_hint: str = "",
+        vocabulary_hints: str = "",
     ) -> RefinerResult:
         draft, single_hop = _unpack(asr_input)
         if single_hop and isinstance(asr_input, AsrResult):
             return RefinerResult(
-                _clean_out(draft),
+                _clean_out(draft, strip_vocab_echo=False),
                 "off",
                 "",
                 0,
@@ -1081,7 +1146,13 @@ class NoopRefiner(BaseRefiner):
                 context_chunks=asr_input.context_chunks,
                 audio_tokens=asr_input.audio_tokens,
             )
-        return RefinerResult(_clean_out(draft), "off", "", 0, "single_hop_passthrough" if single_hop else "")
+        return RefinerResult(
+            _clean_out(draft, strip_vocab_echo=False),
+            "off",
+            "",
+            0,
+            "single_hop_passthrough" if single_hop else "",
+        )
 
 
 @dataclass(frozen=True)
@@ -1758,6 +1829,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
         mode: str = "agent",
         workspace_cwd: str = "",
         target_hint: str = "",
+        vocabulary_hints: str = "",
     ) -> RefinerResult:
         model = self._select_request_model()
         if self.provider_name == "openai-compatible":
@@ -1793,9 +1865,9 @@ class OpenAIResponsesRefiner(BaseRefiner):
             mode=mode,
             workspace_cwd=workspace_cwd,
             target_hint=target_hint,
+            vocabulary_hints=vocabulary_hints,
         )
-        ctx_chunks = len(context_blocks)
-        ctx_chars = sum(len(b) for b in context_blocks)
+        ctx_chunks, ctx_chars = _measure_session_context_blocks(context_blocks)
         used_prior = any(b.startswith("<prior_session_reference") for b in context_blocks)
         session_uuid = _derive_session_uuid(
             session_key or (f"ws:{workspace_cwd}" if workspace_cwd else ""),
@@ -1899,6 +1971,7 @@ class OpenAIResponsesRefiner(BaseRefiner):
             context_chunks=ctx_chunks,
             used_prior_session=used_prior,
             cancel_token=cancel_token,
+            has_vocabulary_hints=bool(vocabulary_hints.strip()),
         )
 
     def evict_connections(self) -> int:
@@ -2603,6 +2676,7 @@ class GeminiRefiner(_HttpTransportRefiner):
         mode: str = "agent",
         workspace_cwd: str = "",
         target_hint: str = "",
+        vocabulary_hints: str = "",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model("gemini")
         gen_cfg = build_gemini_generation_config(
@@ -2634,12 +2708,13 @@ class GeminiRefiner(_HttpTransportRefiner):
             mode=mode,
             workspace_cwd=workspace_cwd,
             target_hint=target_hint,
+            vocabulary_hints=vocabulary_hints,
         )
-        ctx_chunks, ctx_chars = len(context_blocks), sum(len(b) for b in context_blocks)
+        ctx_chunks, ctx_chars = _measure_session_context_blocks(context_blocks)
         used_prior = any(b.startswith("<prior_session_reference") for b in context_blocks)
         payload = {
             "systemInstruction": {"parts": [{"text": resolve_refiner_prompt(self.cfg, mode=mode)}]},
-            "contents": [{"role": "user", "parts": [*({"text": blk} for blk in context_blocks), {"text": final_block}]}],
+            "contents": _build_gemini_contents(context_blocks, final_block),
             "generationConfig": gen_cfg,
         }
 
@@ -2687,6 +2762,7 @@ class GeminiRefiner(_HttpTransportRefiner):
             context_chars=ctx_chars,
             context_chunks=ctx_chunks,
             used_prior_session=used_prior,
+            has_vocabulary_hints=bool(vocabulary_hints.strip()),
         )
 
 
@@ -2722,6 +2798,7 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
         mode: str = "agent",
         workspace_cwd: str = "",
         target_hint: str = "",
+        vocabulary_hints: str = "",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model(self.provider_name)
         if self.provider_name == "openai-compatible":
@@ -2767,10 +2844,11 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
             mode=mode,
             workspace_cwd=workspace_cwd,
             target_hint=target_hint,
+            vocabulary_hints=vocabulary_hints,
         )
-        ctx_chunks, ctx_chars = len(context_blocks), sum(len(b) for b in context_blocks)
+        ctx_chunks, ctx_chars = _measure_session_context_blocks(context_blocks)
         used_prior = any(b.startswith("<prior_session_reference") for b in context_blocks)
-        bps = set(openrouter_cache_breakpoints(self.provider_name, model, ctx_chunks))
+        bps = set(openrouter_cache_breakpoints(self.provider_name, model, context_blocks=context_blocks))
         if bps:
             user_content: str | list[dict[str, Any]] = [
                 *(
@@ -2846,6 +2924,7 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
             context_chars=ctx_chars,
             context_chunks=ctx_chunks,
             used_prior_session=used_prior,
+            has_vocabulary_hints=bool(vocabulary_hints.strip()),
         )
 
 
@@ -2956,10 +3035,15 @@ def _compute_agy_context_delta(
 ) -> tuple[bool, list[str]]:
     """Return ``(can_resume, delta_blocks)`` for stateful AGY conversation continuation.
 
-    Sealed prefix blocks (including any ``<prior_session_reference>`` and sealed 50K chunks)
-    must match byte-for-byte; only the previously sent trailing ``<session_reference_log>``
-    chunk may grow append-only at a newline boundary (plus any newly opened chunks after it).
+    Sealed prefix blocks (including any leading ``<vocabulary_hints>``,
+    ``<prior_session_reference>``, and sealed 50K chunks) must match byte-for-byte; only
+    the previously sent trailing ``<session_reference_log>`` chunk may grow append-only at
+    a newline boundary (plus any newly opened chunks after it).
     """
+    prev_has_vocab = bool(prev_blocks and _is_vocab_hints_block(prev_blocks[0]))
+    cur_has_vocab = bool(cur_blocks and _is_vocab_hints_block(cur_blocks[0]))
+    if cur_has_vocab and not prev_has_vocab:
+        return False, []
     n_prev = len(prev_blocks)
     if n_prev == 0:
         return True, list(cur_blocks)
@@ -4212,6 +4296,7 @@ class AgyRefiner(BaseRefiner):
         mode: str = "agent",
         workspace_cwd: str = "",
         target_hint: str = "",
+        vocabulary_hints: str = "",
     ) -> RefinerResult:
         requested_model = self.cfg.refiner.effective_model("agy")
         requested_effort = self.cfg.refiner.effective_effort("agy")
@@ -4248,8 +4333,9 @@ class AgyRefiner(BaseRefiner):
             mode=eff_mode,
             workspace_cwd=workspace_cwd,
             target_hint=target_hint,
+            vocabulary_hints=vocabulary_hints,
         )
-        ctx_chunks, ctx_chars = len(context_blocks), sum(len(b) for b in context_blocks)
+        ctx_chunks, ctx_chars = _measure_session_context_blocks(context_blocks)
         used_prior = any(b.startswith("<prior_session_reference") for b in context_blocks)
 
         try:
@@ -4273,7 +4359,7 @@ class AgyRefiner(BaseRefiner):
         prompt_hash = hashlib.sha256(sys_prompt.encode("utf-8")).hexdigest()[:16]
         effort_explicit = self.cfg.refiner.has_explicit_effort("agy")
         effort_key = f"{requested_effort}:{'1' if effort_explicit else '0'}"
-        max_turns = max(1, int(self.cfg.refiner.max_turns_per_thread))
+        max_turns = max(0, int(self.cfg.refiner.max_turns_per_thread))
 
         # Only stateful-resume when an explicit session_key identifies a single session;
         # stateless GUI apps without session_key must never share a conversation thread.
@@ -4361,7 +4447,7 @@ class AgyRefiner(BaseRefiner):
                 if thread_state is not None:
                     can_resume_meta = (
                         bool(thread_state.conversation_id)
-                        and thread_state.turn_count < max_turns
+                        and (max_turns == 0 or thread_state.turn_count < max_turns)
                         and thread_state.model == requested_model
                         and thread_state.effort == effort_key
                         and thread_state.prompt_hash == prompt_hash
@@ -4477,6 +4563,7 @@ class AgyRefiner(BaseRefiner):
                 used_prior_session=used_prior,
                 cancel_token=cancel_token,
                 thought_stats_fn=lambda: (thought_stats_box[0], thought_stats_box[1]),
+                has_vocabulary_hints=bool(vocabulary_hints.strip()),
             )
             succeeded = (
                 not res.used_fallback

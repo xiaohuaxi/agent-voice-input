@@ -1909,6 +1909,15 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
         prior_grown = format_prior_session_reference_chunk("[Speaker]\n上个会话历史\n\n[CLI Agent]\n新增")
         self.assertEqual(_compute_agy_context_delta((prior_blk,), [prior_grown]), (False, []))
 
+        # Adding leading <vocabulary_hints> when prev_blocks had none MUST force fresh session/new
+        from agent_voice_input.hotwords import format_stage2_vocabulary_hints
+
+        vocab_blk = format_stage2_vocabulary_hints(["Ghostty"])
+        self.assertEqual(_compute_agy_context_delta((), [vocab_blk]), (False, []))
+        self.assertEqual(_compute_agy_context_delta((), [vocab_blk, b1]), (False, []))
+        self.assertEqual(_compute_agy_context_delta((b1,), [vocab_blk, b1]), (False, []))
+        self.assertEqual(_compute_agy_context_delta((vocab_blk,), [vocab_blk, b1]), (True, [b1]))
+
         # 2. End-to-end AgyRefiner test with real SessionTracker-like multi-chunk growth, session switch, rollback, and max_turns
         class _DynamicTracker:
             has_bound_session = True
@@ -2067,6 +2076,123 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                 self.assertIn("REASONING_BLOAT", diagnose_record_flags(summ_b, is_first_for_session=True))
             finally:
                 ref.close()
+
+    def test_max_turns_zero_unlimited_and_vocabulary_hints_resume_and_reset(self) -> None:
+        from agent_voice_input.hotwords import HotwordEntry, format_stage2_vocabulary_hints
+
+        class _GrowingTracker:
+            has_bound_session = True
+
+            def __init__(self, turns: list[str]) -> None:
+                self.turns = list(turns)
+
+            def get_refiner_context_with_prior(
+                self, session_key: str, *, max_chars: int = 200000, include_git_status: bool = True, allow_prior: bool = True, **_kw: object
+            ) -> tuple[str, list[str], str]:
+                del session_key, max_chars, include_git_status, allow_prior
+                return "", ["\n\n".join(self.turns)] if self.turns else [], ""
+
+            def get_state(self, session_key: str) -> object:
+                del session_key
+                return object()
+
+        # 1. Default max_turns_per_thread=0 allows >20 consecutive turns on a single stateful thread
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, log_file, env = self._setup_fake_env(td)
+            cfg = Config(refiner=RefinerConfig(provider="agy", include_git_status=False))
+            self.assertEqual(cfg.refiner.max_turns_per_thread, 0)
+            ref = AgyRefiner(cfg, env=env, runtime_dir=rt_dir)
+            try:
+                for idx in range(1, 23):
+                    res = ref.refine(
+                        f"连续口述第 {idx} 句",
+                        session_key="sess-unlimited",
+                        fallback_context="stable session context",
+                    )
+                    self.assertEqual(res.used_fallback, "")
+            finally:
+                ref.close()
+
+            events = [json.loads(ln) for ln in log_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            new_calls = [ev for ev in events if ev.get("event") == "rpc" and ev.get("method") == "session/new"]
+            prompt_calls = [ev for ev in events if ev.get("event") == "rpc" and ev.get("method") == "session/prompt"]
+            self.assertEqual(len(new_calls), 1)
+            self.assertEqual(len(prompt_calls), 22)
+            # Every prompt reuses the single session opened on Turn 1
+            self.assertEqual(len({ev["params"]["sessionId"] for ev in prompt_calls}), 1)
+
+        # 2. Leading static <vocabulary_hints> resumes when unchanged, resets when changed,
+        #    and sends on every stateless general turn with session-only telemetry
+        with tempfile.TemporaryDirectory() as td:
+            rt_dir, log_file, env = self._setup_fake_env(td)
+            cfg = Config(refiner=RefinerConfig(provider="agy", include_git_status=False))
+            ref = AgyRefiner(cfg, env=env, runtime_dir=rt_dir)
+            vocab_v1 = format_stage2_vocabulary_hints([HotwordEntry("KestrelDB", ("凯斯特罗",))])
+            vocab_v2 = format_stage2_vocabulary_hints(
+                [HotwordEntry("KestrelDB", ("凯斯特罗",)), HotwordEntry("Zephyrus")]
+            )
+            tracker = _GrowingTracker(["[User]\n第一条日志"])
+            try:
+                # Turn 1: initial session/new includes vocab_v1 + log_1
+                r1 = ref.refine(
+                    "第一句",
+                    session_key="sess-vocab",
+                    tracker=tracker,  # type: ignore[arg-type]
+                    vocabulary_hints=vocab_v1,
+                )
+                self.assertEqual(r1.used_fallback, "")
+                self.assertEqual(r1.context_chunks, 1)
+
+                # Turn 2: vocab_v1 unchanged + append-only log growth -> resumes without resending vocab_v1
+                tracker.turns.append("[CLI Agent]\n第二条追加日志")
+                r2 = ref.refine(
+                    "第二句",
+                    session_key="sess-vocab",
+                    tracker=tracker,  # type: ignore[arg-type]
+                    vocabulary_hints=vocab_v1,
+                )
+                self.assertEqual(r2.used_fallback, "")
+                self.assertEqual(r2.context_chunks, 1)
+
+                # Turn 3: hotwords.txt changed -> vocab_v2 differs from vocab_v1 -> opens fresh session/new
+                r3 = ref.refine(
+                    "第三句",
+                    session_key="sess-vocab",
+                    tracker=tracker,  # type: ignore[arg-type]
+                    vocabulary_hints=vocab_v2,
+                )
+                self.assertEqual(r3.used_fallback, "")
+
+                # Turn 4: general mode (empty session_key) -> fresh stateless session/new carrying vocab_v2, ctx_chunks=0
+                r4 = ref.refine(
+                    "普通聊天",
+                    mode="general",
+                    vocabulary_hints=vocab_v2,
+                )
+                self.assertEqual(r4.used_fallback, "")
+                self.assertEqual((r4.context_chunks, r4.context_chars), (0, 0))
+            finally:
+                ref.close()
+
+            def _prompt_text(ev: dict[str, object]) -> str:
+                params = ev.get("params") or {}
+                assert isinstance(params, dict)
+                return "".join(p.get("text", "") for p in (params.get("prompt") or []) if isinstance(p, dict))
+
+            events = [json.loads(ln) for ln in log_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            new_calls = [ev for ev in events if ev.get("event") == "rpc" and ev.get("method") == "session/new"]
+            prompt_calls = [ev for ev in events if ev.get("event") == "rpc" and ev.get("method") == "session/prompt"]
+            self.assertEqual(len(new_calls), 3)  # Turn 1, Turn 3 (vocab changed), Turn 4 (stateless general)
+            self.assertEqual(len(prompt_calls), 4)
+            self.assertEqual(prompt_calls[0]["params"]["sessionId"], prompt_calls[1]["params"]["sessionId"])
+            self.assertNotEqual(prompt_calls[1]["params"]["sessionId"], prompt_calls[2]["params"]["sessionId"])
+            self.assertNotEqual(prompt_calls[2]["params"]["sessionId"], prompt_calls[3]["params"]["sessionId"])
+            self.assertIn("KestrelDB (ASR has misheard as: 凯斯特罗)", _prompt_text(prompt_calls[0]))
+            self.assertNotIn('<vocabulary_hints read_only="true">', _prompt_text(prompt_calls[1]))
+            self.assertNotIn("KestrelDB", _prompt_text(prompt_calls[1]))
+            self.assertIn("第二条追加日志", _prompt_text(prompt_calls[1]))
+            self.assertIn("Zephyrus", _prompt_text(prompt_calls[2]))
+            self.assertIn("Zephyrus", _prompt_text(prompt_calls[3]))
 
 
 if __name__ == "__main__":

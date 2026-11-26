@@ -831,8 +831,11 @@ class TestColdStartLayer0Layer1Layer2AndEviction(unittest.TestCase):
             snap1 = tracker.sync_session(match_cur, include_git_info=False)
             self.assertIsNotNone(snap1)
             self.assertEqual(len(snap1.clean_turns), 4)
-            # Layer 1 stops injecting prior hotwords once >= 4 messages
-            self.assertFalse(snap1.prior_hotwords_used)
+            # Same-cwd cross-session prior hotwords stay active past 4 turns, strictly ranked after current turn_hw
+            self.assertTrue(snap1.prior_hotwords_used)
+            self.assertIn("PriorFrozenController", snap1.hotwords)
+            self.assertIn("NewTaskAlpha", snap1.hotwords)
+            self.assertLess(snap1.hotwords.index("NewTaskAlpha"), snap1.hotwords.index("PriorFrozenController"))
 
             blocks1, _ = build_refiner_context_chunks(cfg, session_key=snap1.session_key, tracker=tracker)
             self.assertGreaterEqual(len(blocks1), 2)
@@ -959,27 +962,47 @@ class TestColdStartLayer0Layer1Layer2AndEviction(unittest.TestCase):
             env = {"HOME": str(home), "WSL_DISTRO_NAME": "", "WSL_INTEROP": ""}
             tracker = SessionTracker(home_dir=home, proc_root=None, env=env, prior_cache_ttl_sec=60.0)
 
-            # Warm session: 0 calls to discover_cli_prior_sessions
-            with patch("agent_voice_input.session_ctx.discover_cli_prior_sessions") as m_disc:
+            # Warm session (>= 4 turns) retires Layer 2 <prior_session_reference> on first sync,
+            # while still discovering same-cwd Layer 1 prior hotwords once (shared via 60s cache!).
+            with patch(
+                "agent_voice_input.session_ctx.discover_cli_prior_sessions",
+                wraps=rp_mod.discover_cli_prior_sessions,
+            ) as m_disc_warm:
                 snap_w = tracker.sync_session(
                     SessionMatch(cli="claude", session_id="already-warm", jsonl_path=str(warm_path), cwd=str(repo)),
                     include_git_info=False,
                 )
-                m_disc.assert_not_called()
-            self.assertTrue(tracker.get_state(snap_w.session_key).cold_start_prior_retired)
-
-            # Cold session + workspace hotwords share 60s cache (scanned only once!)
-            with patch(
-                "agent_voice_input.session_ctx.discover_cli_prior_sessions",
-                wraps=rp_mod.discover_cli_prior_sessions,
-            ) as m_disc2:
+                self.assertEqual(m_disc_warm.call_count, 1)
+                self.assertTrue(snap_w.prior_hotwords_used)
+                self.assertIn("WarmPriorController", snap_w.hotwords)
+                self.assertIn("CurrentWarmController", snap_w.hotwords)
+                self.assertLess(
+                    snap_w.hotwords.index("CurrentWarmController"),
+                    snap_w.hotwords.index("WarmPriorController"),
+                )
+                # Cold session + workspace hotwords reuse the 60s cache (still only 1 scan total!)
                 tracker.sync_session(
                     SessionMatch(cli="claude", session_id="cold-cache-1", jsonl_path=str(cold_path), cwd=str(repo)),
                     include_git_info=False,
                 )
                 hw = tracker.get_workspace_prior_hotwords(str(repo))
                 self.assertIn("WarmPriorController", hw)
-                self.assertEqual(m_disc2.call_count, 1)
+                self.assertEqual(m_disc_warm.call_count, 1)
+            st_w = tracker.get_state(snap_w.session_key)
+            self.assertTrue(st_w.cold_start_prior_retired)
+            self.assertEqual(st_w.cold_start_prior_chunk, "")
+
+            # cold_start_fallback="off" still performs 0 calls to discover_cli_prior_sessions
+            tracker_off = SessionTracker(home_dir=home, proc_root=None, env=env, cold_start_fallback="off")
+            with patch("agent_voice_input.session_ctx.discover_cli_prior_sessions") as m_disc_off:
+                snap_off = tracker_off.sync_session(
+                    SessionMatch(cli="claude", session_id="already-warm", jsonl_path=str(warm_path), cwd=str(repo)),
+                    include_git_info=False,
+                )
+                m_disc_off.assert_not_called()
+            self.assertFalse(snap_off.prior_hotwords_used)
+            self.assertNotIn("WarmPriorController", snap_off.hotwords)
+            tracker_off.close()
             tracker.close()
 
     def test_single_hop_sets_prior_session_ctx_fallback_and_openai_compat_refiner_wires_flag(self) -> None:
@@ -1971,6 +1994,141 @@ class TestColdStartAstraReviewFixes(unittest.TestCase):
                 cands = rp_mod.discover_cli_prior_sessions(str(real_ws), home=home, wsl=True)
             self.assertEqual(touched_mnt, [])
             self.assertEqual([c["session_id"] for c in cands], ["wsl-sym-ok"])
+
+    def test_stage1_slot_purification_and_remote_warm_prior_hotwords(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            home = base / "home"
+            repo = home / "repos" / "slotproj"
+            repo.mkdir(parents=True, exist_ok=True)
+            git_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(home),
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "t@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "t@example.com",
+            }
+            subprocess.run(["git", "init", "-q"], cwd=str(repo), env=git_env, check=True)
+            (repo / "base_init.py").write_text("x = 0\n", encoding="utf-8")
+            subprocess.run(["git", "add", "base_init.py"], cwd=str(repo), env=git_env, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=str(repo), env=git_env, check=True)
+
+            # Create 15 dirty files so Stage 1 cap (10) vs Stage 2 full file list (<=30) is verified
+            for idx in range(15):
+                (repo / f"dirty_mod_{idx:02d}.py").write_text(f"v = {idx}\n", encoding="utf-8")
+
+            now = time.time()
+            _write_claude_jsonl(home, str(repo), "prior-slot-1", _make_rich_turns("PriorSlot"), mtime=now - 120)
+            warm_turns = _make_rich_turns("ActiveTopic", pairs=3, pad_chars=500)
+            cur_sid = "33333333-4444-5555-6666-777777777777"
+            cur_path = _write_claude_jsonl(home, str(repo), cur_sid, warm_turns, mtime=now - 5)
+
+            env = {"HOME": str(home), "PATH": git_env["PATH"], "WSL_DISTRO_NAME": "", "WSL_INTEROP": ""}
+            tracker = SessionTracker(home_dir=home, proc_root=None, env=env, git_cache_ttl_sec=0.0)
+            try:
+                # 1) Local warm session: turn_hw BEFORE git_hw[:10] (no bare stem dupes) BEFORE prior_hw
+                snap = tracker.sync_session(
+                    SessionMatch(cli="claude", session_id=cur_sid, jsonl_path=str(cur_path), cwd=str(repo)),
+                    include_git_info=True,
+                )
+                self.assertIsNotNone(snap)
+                self.assertTrue(snap.prior_hotwords_used)
+                self.assertIn("ActiveTopicController", snap.hotwords)
+                self.assertIn("PriorSlotController", snap.hotwords)
+                self.assertIn("dirty_mod_00.py", snap.hotwords)
+                self.assertNotIn("dirty_mod_00", snap.hotwords)
+                self.assertIn("dirty_mod_09.py", snap.hotwords)
+                self.assertNotIn("dirty_mod_10.py", snap.hotwords)
+                self.assertLess(snap.hotwords.index("ActiveTopicController"), snap.hotwords.index("dirty_mod_00.py"))
+                self.assertLess(snap.hotwords.index("dirty_mod_00.py"), snap.hotwords.index("PriorSlotController"))
+
+                # build_workspace_hotwords also compacts duplicates and caps to 10
+                ws_hw = tracker.build_workspace_hotwords(str(repo))
+                self.assertEqual(len(ws_hw), 10)
+                self.assertIn("dirty_mod_00.py", ws_hw)
+                self.assertNotIn("dirty_mod_00", ws_hw)
+                self.assertNotIn("dirty_mod_10.py", ws_hw)
+
+                # Stage 2 preserves full git_status & changed_files (>10) untouched!
+                prior_blk, _, git_ctx = tracker.get_refiner_context_with_prior(snap.session_key, include_git_status=True)
+                self.assertEqual(prior_blk, "")
+                self.assertIn("dirty_mod_14.py", git_ctx)
+
+                # 2) Remote probe on warm session (>= 4 turns): returns prior_hotwords (NOT prior_turns),
+                #    and _read_remote_git_status emits basenames without bare stem duplicates!
+                resp_rem = rp_mod.run_probe(
+                    {
+                        "v": 1,
+                        "token": cur_sid,
+                        "cli": "claude",
+                        "explicit_cli": True,
+                        "cwd_hint": str(repo),
+                        "include_git": True,
+                        "include_repo_files": False,
+                        "cold_start_fallback": "auto",
+                    },
+                    env=env,
+                    home_dir=home,
+                    proc_root=base / "no_proc",
+                )
+                self.assertTrue(resp_rem["ok"])
+                self.assertGreaterEqual(len(resp_rem["turns"]), 6)
+                self.assertNotIn("prior_turns", resp_rem)
+                self.assertIn("PriorSlotController", resp_rem.get("prior_hotwords", []))
+                self.assertNotIn("ActiveTopicController", resp_rem.get("prior_hotwords", []))
+                self.assertIn("dirty_mod_00.py", resp_rem["git_hotwords"])
+                self.assertNotIn("dirty_mod_00", resp_rem["git_hotwords"])
+                self.assertIn("dirty_mod_14.py", resp_rem["git_hotwords"])
+
+                # Remote tracker consumes warm prior_hotwords, keeps them active >= 4 turns,
+                # orders turn_hw > git_hw[:10] > prior_hw, and keeps full Stage 2 git_ctx!
+                hcfg = RemoteHostConfig(name="devbox", ssh_target="devbox")
+                rem_tracker = SessionTracker(
+                    home_dir=home,
+                    proc_root=None,
+                    env=env,
+                    remote_cfg=RemoteConfig(hosts=(hcfg,)),
+                    cold_start_fallback="auto",
+                )
+                try:
+                    with patch.object(rem_tracker.remote_manager, "fetch_with_budget", return_value=resp_rem):
+                        rem_snap = rem_tracker._sync_remote_match(
+                            SessionMatch(
+                                cli="claude",
+                                session_id=cur_sid,
+                                jsonl_path="",
+                                cwd=str(repo),
+                                origin="remote",
+                                host_name="devbox",
+                            ),
+                            window_title=f"claude [#{cur_sid[:8]}]",
+                            include_git_info=True,
+                        )
+                    self.assertIsNotNone(rem_snap)
+                    self.assertTrue(rem_snap.prior_hotwords_used)
+                    self.assertIn("ActiveTopicController", rem_snap.hotwords)
+                    self.assertIn("PriorSlotController", rem_snap.hotwords)
+                    self.assertIn("dirty_mod_00.py", rem_snap.hotwords)
+                    self.assertNotIn("dirty_mod_00", rem_snap.hotwords)
+                    self.assertNotIn("dirty_mod_10.py", rem_snap.hotwords)
+                    self.assertLess(
+                        rem_snap.hotwords.index("ActiveTopicController"),
+                        rem_snap.hotwords.index("dirty_mod_00.py"),
+                    )
+                    self.assertLess(
+                        rem_snap.hotwords.index("dirty_mod_00.py"),
+                        rem_snap.hotwords.index("PriorSlotController"),
+                    )
+                    rem_prior_blk, _, rem_git_ctx = rem_tracker.get_refiner_context_with_prior(
+                        rem_snap.session_key, include_git_status=True
+                    )
+                    self.assertEqual(rem_prior_blk, "")
+                    self.assertIn("dirty_mod_14.py", rem_git_ctx)
+                finally:
+                    rem_tracker.close()
+            finally:
+                tracker.close()
 
 
 if __name__ == "__main__":

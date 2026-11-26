@@ -2993,13 +2993,9 @@ def read_git_status_summary(
             path_part = path_part.split(" -> ", 1)[1].strip()
         path_part = path_part.strip('"')
         base = os.path.basename(path_part.rstrip("/"))
-        if base and base not in seen:
-            seen.add(base)
+        if base and (low := base.lower()) not in seen:
+            seen.add(low)
             hotwords.append(base)
-        stem = os.path.splitext(base)[0]
-        if stem and len(stem) >= 3 and stem not in seen:
-            seen.add(stem)
-            hotwords.append(stem)
 
     return "\n".join(kept_lines), hotwords
 

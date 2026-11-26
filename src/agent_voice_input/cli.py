@@ -2688,10 +2688,12 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
         add_hotwords,
         budget_hotwords_for_provider,
         format_budget_line,
+        format_stage2_budget_line,
         load_hotwords_table,
         remove_hotwords,
         resolve_hotwords_path,
         summarize_hotwords_budgets,
+        summarize_stage2_hotwords_budgets,
     )
 
     action = str(getattr(args, "hotwords_action", "") or "").strip().lower()
@@ -2752,7 +2754,10 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
             ref_scene = scope_filter
             ref_terms = table.merged_for_scene(scope_filter)
 
+        stage2_budgets = summarize_stage2_hotwords_budgets(table)
+
         if as_json:
+            all_entries = table.as_entries_dict()
             payload: dict[str, Any] = {
                 "path": str(hw_path),
                 "exists": table.exists,
@@ -2763,8 +2768,12 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
                     "api": eff_asr_api,
                 },
                 "scopes": {sc: list(table.terms_for_scope(sc)) for sc in display_scopes},
+                "entries": {sc: all_entries[sc] for sc in display_scopes},
                 "mounted": {sc: table.merged_for_scene(sc) for sc in display_scopes},
                 "budgets": budgets,
+                "stage2_budget": {
+                    mode: summary.as_dict() for mode, summary in stage2_budgets.items()
+                },
             }
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 0
@@ -2773,16 +2782,16 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
         print(f"Hotwords file: {hw_path} ({status_lbl})")
         print(f"Active ASR:    {eff_asr}/{eff_asr_model} (api={eff_asr_api})")
         for sc in display_scopes:
-            sc_terms = table.terms_for_scope(sc)
+            sc_entries = table.entries_for_scope(sc)
             mount_note = (
                 f"; mounts {sc}+global={len(table.merged_for_scene(sc))} terms"
                 if sc != "global"
                 else ""
             )
-            print(f"\n[{sc}] ({len(sc_terms)} terms{mount_note})")
-            if sc_terms:
-                for term in sc_terms:
-                    print(f"  {term}")
+            print(f"\n[{sc}] ({len(sc_entries)} terms{mount_note})")
+            if sc_entries:
+                for entry in sc_entries:
+                    print(f"  {entry.format_line()}")
             else:
                 print("  (empty)")
 
@@ -2800,17 +2809,39 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
         for prov in MAINSTREAM_QUOTA_PROVIDERS:
             ref_res = budget_hotwords_for_provider(ref_terms, prov)
             print(f"    {format_budget_line(ref_res, name=prov)}")
+        print("\nStage 2 / Single-hop wide vocabulary budget (includes '<-' aliases):")
+        for mode in ("agent", "general"):
+            print(f"  {format_stage2_budget_line(stage2_budgets[mode])}")
+
+        is_empty = not (table.global_terms or table.chat_terms or table.coding_terms)
+        print()
         if not table.exists:
             print(
-                "\nTip: run 'agent-voice-input hotwords add <term...> [--scope global|chat|coding]' to create it."
+                "Tip: run 'agent-voice-input hotwords add <term> [--alias a1,a2] [--scope global|chat|coding]' to create it."
+            )
+        if is_empty:
+            print(
+                "Agent tip: paste into Claude Code / Codex / AGY -> "
+                '"Read my recent projects & README/specs, draft a clean hotwords list for '
+                '~/.config/agent-voice-input/hotwords.txt, show the diff first, and write after I confirm."'
+            )
+        else:
+            print(
+                "Tip: ask your coding agent to bootstrap, add aliases, or tidy your hotwords (see README -> Hotwords)."
             )
         return 0
 
     raw_terms = list(getattr(args, "terms", ()) or ())
+    raw_aliases = list(getattr(args, "alias", ()) or ())
     scope = str(getattr(args, "scope", "global") or "global").strip().lower()
+    if action == "add" and raw_aliases and len(raw_terms) != 1:
+        raise ConfigError(
+            "--alias can only be used when adding a single canonical hotword term "
+            f"(got {len(raw_terms)} terms)"
+        )
     try:
         if action == "add":
-            edit_res = add_hotwords(hw_path, raw_terms, scope=scope)
+            edit_res = add_hotwords(hw_path, raw_terms, scope=scope, aliases=raw_aliases)
         elif action == "remove":
             edit_res = remove_hotwords(hw_path, raw_terms, scope=scope)
         else:  # pragma: no cover - guarded by argparse required subparser
@@ -2842,9 +2873,12 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
             "scope": edit_res.scope,
             "changed": edit_res.changed,
             "added": list(edit_res.added),
+            "updated": list(edit_res.updated),
+            "aliases_added": list(edit_res.aliases_added),
             "skipped": list(edit_res.skipped),
             "removed": list(edit_res.removed),
             "not_found": list(edit_res.not_found),
+            "warnings": list(edit_res.warnings),
             "active_asr": {
                 "provider": eff_asr,
                 "model": eff_asr_model,
@@ -2859,9 +2893,22 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
     print(f"Hotwords file: {edit_res.path} (scope={edit_res.scope})")
     if action == "add":
         if edit_res.added:
-            print(f"Added ({len(edit_res.added)}):   {', '.join(edit_res.added)}")
+            if edit_res.aliases_added:
+                print(
+                    f"Added ({len(edit_res.added)}):   {', '.join(edit_res.added)} "
+                    f"<- {', '.join(edit_res.aliases_added)}"
+                )
+            else:
+                print(f"Added ({len(edit_res.added)}):   {', '.join(edit_res.added)}")
+        if edit_res.updated:
+            print(
+                f"Updated ({len(edit_res.updated)}): {', '.join(edit_res.updated)} "
+                f"(+aliases: {', '.join(edit_res.aliases_added)})"
+            )
         if edit_res.skipped:
             print(f"Skipped ({len(edit_res.skipped)}): {', '.join(edit_res.skipped)} (already present)")
+        for warn in edit_res.warnings:
+            print(f"Warning: {warn}")
     else:
         if edit_res.removed:
             print(f"Removed ({len(edit_res.removed)}):   {', '.join(edit_res.removed)}")
@@ -3044,13 +3091,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_retry.add_argument("--title", help="Optional window title override for session matching")
     p_hw = sub.add_parser(
         "hotwords",
-        help="Manage layered plain-text ASR hotwords (list, add, remove) and inspect provider quotas",
+        help="Manage layered hotwords & '<-' mishearing aliases (list, add [--alias], remove) and inspect Stage 1/2 budgets",
+        description=(
+            "Manage layered plain-text hotwords (~/.config/agent-voice-input/hotwords.txt) with optional "
+            "'CanonicalTerm <- mishearing1, mishearing2' aliases (add --alias) and inspect Stage 1/2 budgets."
+        ),
     )
     _add_common_flags(p_hw, is_sub=True)
     hw_sub = p_hw.add_subparsers(dest="hotwords_action", required=True)
     p_hw_list = hw_sub.add_parser(
         "list",
-        help="Show hotwords file path, scoped terms, and active/mainstream ASR provider quota usage",
+        help="Show hotwords file path, scoped entries (with '<-' aliases), and Stage 1/2 budget usage",
     )
     _add_common_flags(p_hw_list, is_sub=True)
     p_hw_list.add_argument(
@@ -3067,10 +3118,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_hw_add = hw_sub.add_parser(
         "add",
-        help="Add one or more hotwords to a scope (default: global)",
+        help="Add hotword(s) to a scope (default: global), optionally with '<-' mishearing aliases (--alias)",
     )
     _add_common_flags(p_hw_add, is_sub=True)
-    p_hw_add.add_argument("terms", nargs="+", help="One or more hotwords or phrases to add")
+    p_hw_add.add_argument(
+        "terms",
+        nargs="+",
+        help="One or more canonical hotwords or phrases to add (pass a single term when using --alias)",
+    )
+    p_hw_add.add_argument(
+        "--alias",
+        action="append",
+        default=[],
+        help="Comma-separated ASR mishearing alias(es) for a single canonical term (repeatable, max 5 total; e.g. --alias '哈尼斯,哈尼思')",
+    )
     p_hw_add.add_argument(
         "--scope",
         choices=("global", "chat", "coding"),
@@ -3150,8 +3211,11 @@ def _configure_posix_ascii_stdio(env: Mapping[str, str] | None = None) -> None:
 
 def _recover_parsed_text_args(args: argparse.Namespace) -> None:
     """Recover UTF-8 text business arguments without mutating OS filesystem path arguments."""
-    if getattr(args, "subcmd", None) == "hotwords" and isinstance(getattr(args, "terms", None), list):
-        args.terms = [_recover_utf8_surrogates(str(tok)) for tok in args.terms]
+    if getattr(args, "subcmd", None) == "hotwords":
+        if isinstance(getattr(args, "terms", None), list):
+            args.terms = [_recover_utf8_surrogates(str(tok)) for tok in args.terms]
+        if isinstance(getattr(args, "alias", None), list):
+            args.alias = [_recover_utf8_surrogates(str(tok)) for tok in args.alias]
     for attr in ("window_title", "title"):
         val = getattr(args, attr, None)
         if isinstance(val, str) and val:

@@ -313,10 +313,73 @@ def resolve_windows_paste_chord(process: str) -> str:
 
 AI_CHAT_PATTERNS: tuple[str, ...] = (
     "com.openai.chat", "com.openai.codex", "chatgpt", "com.anthropic.claudefordesktop",
+    "com.anysphere.sand", "grok bot", "grokbot", "ai.x.grok", "com.xai.grok", "grok",
     "ai.perplexity.mac", "perplexity",
+    "com.quora.poe.electron", "com.quora.poe", "poe",
+    "com.deepseek.chat", "deepseek",
+    "com.moonshot.kimi", "kimi",
+    "com.bytedance.doubao.desktop", "com.bytedance.doubao", "doubao", "豆包",
+    "com.tencent.yuanbao", "yuanbao", "元宝",
     "cherry studio", "cherry-studio", "cherrystudio",
     "chatbox", "xyz.chatboxapp.app",
+    "ai.elementlabs.lmstudio", "lm studio",
 )
+
+_BROWSER_PATTERNS: tuple[str, ...] = (
+    # macOS bundle IDs
+    "com.google.chrome", "com.google.chrome.*",
+    "com.apple.safari", "com.apple.safaritechnologypreview",
+    "company.thebrowser.browser", "company.thebrowser.dia",
+    "com.microsoft.edgemac", "com.microsoft.edgemac.*",
+    "org.mozilla.firefox", "org.mozilla.firefoxdeveloperedition", "org.mozilla.nightly",
+    "com.brave.browser", "com.brave.browser.*",
+    "app.zen-browser.zen", "io.github.zen-browser.zen",
+    "com.vivaldi.vivaldi", "com.operasoftware.opera", "org.chromium.chromium", "com.kagi.kagimacos",
+    # Cross-platform process names (stripped of .exe/.app)
+    "chrome", "google chrome", "google chrome canary", "chromium",
+    "safari", "safari technology preview",
+    "arc", "dia",
+    "msedge", "microsoft edge",
+    "firefox", "zen", "zen browser",
+    "brave", "brave browser",
+    "vivaldi", "opera", "orion",
+)
+
+# Sorted longest-first so "Google Chrome Canary" strips before "Google Chrome".
+_BROWSER_TITLE_SUFFIXES: tuple[str, ...] = (
+    "google chrome canary", "google chrome", "safari technology preview",
+    "microsoft edge", "mozilla firefox", "zen browser", "brave browser",
+    "chromium", "firefox", "vivaldi", "safari", "brave", "opera", "orion", "arc", "dia",
+)
+
+_BROWSER_AI_BRANDS: tuple[str, ...] = (
+    "google ai studio", "google gemini", "perplexity", "deepseek",
+    "chatgpt", "claude", "gemini", "doubao", "ai studio",
+    "grok", "kimi", "poe", "豆包",
+)
+
+_BROWSER_BRAND_SEPS: tuple[str, ...] = (" — ", " – ", " - ", " | ", "| ", " · ")
+
+BUILTIN_AI_CHAT_HOTWORDS: tuple[str, ...] = (
+    # Frontier AI assistants & model families
+    "ChatGPT", "Claude", "Grok", "Gemini", "DeepSeek", "Perplexity", "Qwen", "Kimi", "豆包",
+    "GPT", "OpenAI", "Anthropic", "Opus", "Sonnet", "Haiku", "Flash", "Llama",
+    # High-frequency AI/LLM concepts in chat & technical Q&A
+    "LLM", "Agent", "Prompt", "Token", "RAG", "MCP", "API", "JSON", "Markdown",
+    "Fine-tuning", "LoRA", "KV Cache", "Embedding",
+)
+
+_BUILTIN_AI_CHAT_HOTWORDS_NON_CJK: tuple[str, ...] = tuple(
+    w for w in BUILTIN_AI_CHAT_HOTWORDS if all(ord(ch) < 128 for ch in w)
+)
+
+
+def get_builtin_ai_chat_hotwords(language: str = "auto") -> tuple[str, ...]:
+    """Return built-in AI chat hotwords, dropping CJK entries for explicit non-Chinese languages."""
+    raw = (language or "auto").strip().lower()
+    if not raw or raw == "auto" or raw == "zh" or raw.startswith(("zh-", "zh_", "zh.", "zh@")):
+        return BUILTIN_AI_CHAT_HOTWORDS
+    return _BUILTIN_AI_CHAT_HOTWORDS_NON_CJK
 
 IM_CHAT_PATTERNS: tuple[str, ...] = (
     "com.tencent.xinwechat", "com.electron.lark", "com.bytedance.lark",
@@ -427,6 +490,22 @@ def _is_desktop_ai_app_title(title: str, app_names: tuple[str, ...]) -> bool:
     return any(_matches_desktop_app_suffix(t_low, name) for name in app_names)
 
 
+def _is_browser_ai_chat_title(title: str) -> bool:
+    """Strictly match trailing AI brand segments in known browser window titles (regex-free)."""
+    page = _strip_trailing_app_suffix((title or "").strip(), _BROWSER_TITLE_SUFFIXES)
+    if not page:
+        return False
+    low = page.lower()
+    for brand in _BROWSER_AI_BRANDS:
+        if low == brand:
+            return True
+        for sep in _BROWSER_BRAND_SEPS:
+            tail = sep + brand
+            if low.endswith(tail) and low[: -len(tail)].strip():
+                return True
+    return False
+
+
 def classify_target_app_hint(win: WindowLike) -> str:
     """Return ``'ai_chat' | 'im_chat' | ''`` for a ``general_gui`` foreground window (regex-free)."""
     if match_app_patterns(win, AI_CHAT_PATTERNS):
@@ -435,6 +514,8 @@ def classify_target_app_hint(win: WindowLike) -> str:
         app_names = _DESKTOP_AI_COLLIDING_PROCS.get(normalize_app_token(win.process))
         if app_names is not None:
             return "ai_chat" if _is_desktop_ai_app_title(win.title, app_names) else ""
+    if match_app_patterns(win, _BROWSER_PATTERNS) and _is_browser_ai_chat_title(win.title):
+        return "ai_chat"
     return "im_chat" if match_app_patterns(win, IM_CHAT_PATTERNS) else ""
 
 

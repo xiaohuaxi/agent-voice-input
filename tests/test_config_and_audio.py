@@ -1839,6 +1839,31 @@ class AudioProcTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(os.lstat(rt_dir).st_mode), 0o700)
             self.assertTrue(_is_trusted_runtime_dir(rt_dir))
 
+    def test_refiner_max_turns_per_thread_defaults_zero_and_rejects_negative(self) -> None:
+        cfg_default, _ = load_config(env={"HOME": "/tmp/nonexistent-avi-home"}, load_default_env_files=False)
+        self.assertEqual(cfg_default.refiner.max_turns_per_thread, 0)
+
+        cfg_zero, _ = load_config(
+            cli_overrides={"refiner.max_turns_per_thread": 0},
+            env={"HOME": "/tmp/nonexistent-avi-home"},
+            load_default_env_files=False,
+        )
+        self.assertEqual(cfg_zero.refiner.max_turns_per_thread, 0)
+
+        cfg_pos, _ = load_config(
+            cli_overrides={"refiner.max_turns_per_thread": 15},
+            env={"HOME": "/tmp/nonexistent-avi-home"},
+            load_default_env_files=False,
+        )
+        self.assertEqual(cfg_pos.refiner.max_turns_per_thread, 15)
+
+        with self.assertRaisesRegex(ConfigError, "refiner.max_turns_per_thread must be >= 0"):
+            load_config(
+                cli_overrides={"refiner.max_turns_per_thread": -1},
+                env={"HOME": "/tmp/nonexistent-avi-home"},
+                load_default_env_files=False,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

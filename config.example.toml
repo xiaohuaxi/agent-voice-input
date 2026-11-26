@@ -160,7 +160,9 @@ api_key_env = ""
 # Set true to run Stage 2 refinement even when Stage 1 already performed single-hop multimodal refinement
 force_on_single_hop = false
 # Advanced (currently applies to provider = "agy" only): max stateful thread turns before opening a fresh session
-# max_turns_per_thread = 20
+# (default 0 = no fixed turn cap; threads rotate naturally when the 200K rolling session log evicts or vocabulary_hints changes.
+#  If a single session's log stays unchanged across long dictation bursts, set a positive integer such as 50 to bound thread turns)
+# max_turns_per_thread = 0
 
 [remote]
 # Optional zero-install SSH remote Linux session context routing (no remote daemon, no remote pip install, no remote API keys).

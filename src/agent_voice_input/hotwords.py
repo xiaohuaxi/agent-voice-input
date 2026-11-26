@@ -30,11 +30,39 @@ VALID_HOTWORD_SCOPES: tuple[str, ...] = ("global", "chat", "coding")
 VALID_HOTWORD_LIST_SCOPES: tuple[str, ...] = ("all", "global", "chat", "coding")
 VALID_HOTWORD_REMOVE_SCOPES: tuple[str, ...] = ("global", "chat", "coding", "all")
 
+MAX_HOTWORD_ALIASES: int = 5
+STAGE2_HOTWORDS_MAX_ITEMS: int = 100
+STAGE2_HOTWORDS_MAX_CHARS: int = 1500
+SINGLE_HOP_HOTWORDS_MAX_ITEMS: int = STAGE2_HOTWORDS_MAX_ITEMS
+SINGLE_HOP_HOTWORDS_MAX_CHARS: int = STAGE2_HOTWORDS_MAX_CHARS
+STAGE2_VOCABULARY_HINTS_PREAMBLE: str = (
+    "Speaker's personal names/terms. Use ONLY to fix a draft word that sounds like an entry "
+    "AND clearly means it in context; otherwise ignore. Never insert unspoken terms, never "
+    "translate a correctly recognized native word (豆包 stays 豆包), never mention this list."
+)
+
+_ALIAS_SEPARATOR = "<-"
+_ALIAS_SPLIT_RE = re.compile(r"[,，]")
+_OPENAI_KEYWORD_FORBIDDEN_RE = re.compile(r"[<>]")
 _CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _UNICODE_LINE_SEPS = frozenset({"\x85", "\u2028", "\u2029"})
 _INLINE_COMMENT_RE = re.compile(r"\s+#")
 _SECTION_HEADER_RE = re.compile(r"^\[([^\[\]]+)\]$")
-_OPENROUTER_KEYTERMS_PREFIXES: tuple[str, ...] = ("deepgram/", "assemblyai/")
+# Verified OpenRouter /audio/transcriptions models that accept top-level keyterms[]
+# (see docs/benchmarks/asr-hotwords-and-protocols.md).
+# Note: deepgram/nova-3 returns HTTP 400 on OpenRouter top-level keyterms and is intentionally excluded;
+# unverified models (e.g. mistralai/voxtral-mini-3b-2507) are excluded until protocol-verified.
+_OPENROUTER_KEYTERMS_MODELS: frozenset[str] = frozenset(
+    {
+        "microsoft/mai-transcribe-2",
+        "openai/gpt-transcribe",
+        "x-ai/grok-stt-2.0",
+        "mistralai/voxtral-small-transcribe-3-0",
+        "elevenlabs/scribe-v2",
+        "google/gemini-3.5-transcribe",
+        "assemblyai/universal-3-6-pro",
+    }
+)
 
 _HOTWORDS_CACHE_LOCK = threading.Lock()
 _HOTWORDS_CACHE: dict[str, tuple[tuple[int, int, int, int, int], HotwordsTable]] = {}
@@ -43,10 +71,66 @@ _HOTWORDS_CACHE_MAX = 32
 
 
 @dataclass(frozen=True)
+class HotwordEntry:
+    term: str
+    aliases: tuple[str, ...] = ()
+
+    def format_line(self) -> str:
+        if self.aliases:
+            return f"{self.term} {_ALIAS_SEPARATOR} {', '.join(self.aliases)}"
+        return self.term
+
+
+def _merge_entry_sequences(entry_groups: Sequence[Sequence[HotwordEntry]]) -> list[HotwordEntry]:
+    """Merge HotwordEntry sequences in priority order, CI-deduping canonical terms and merging aliases."""
+    order: list[str] = []
+    terms_by_low: dict[str, str] = {}
+    aliases_by_low: dict[str, list[str]] = {}
+    alias_lows_by_low: dict[str, set[str]] = {}
+
+    for group in entry_groups:
+        for entry in group:
+            term = entry.term.strip()
+            if not term:
+                continue
+            low = term.lower()
+            if low not in terms_by_low:
+                order.append(low)
+                terms_by_low[low] = term
+                aliases_by_low[low] = []
+                alias_lows_by_low[low] = set()
+            al_list = aliases_by_low[low]
+            al_seen = alias_lows_by_low[low]
+            for raw_alias in entry.aliases:
+                alias = raw_alias.strip()
+                if len(alias) <= 1:
+                    continue
+                al_low = alias.lower()
+                if al_low == low or al_low in al_seen:
+                    continue
+                if len(al_list) >= MAX_HOTWORD_ALIASES:
+                    break
+                al_seen.add(al_low)
+                al_list.append(alias)
+
+    all_canonical_lows = set(terms_by_low)
+    merged: list[HotwordEntry] = []
+    for low in order:
+        clean_aliases = tuple(
+            a for a in aliases_by_low[low] if a.lower() not in all_canonical_lows
+        )
+        merged.append(HotwordEntry(term=terms_by_low[low], aliases=clean_aliases))
+    return merged
+
+
+@dataclass(frozen=True)
 class HotwordsTable:
     global_terms: tuple[str, ...] = ()
     chat_terms: tuple[str, ...] = ()
     coding_terms: tuple[str, ...] = ()
+    global_entries: tuple[HotwordEntry, ...] = ()
+    chat_entries: tuple[HotwordEntry, ...] = ()
+    coding_entries: tuple[HotwordEntry, ...] = ()
     path: Path | None = None
     exists: bool = False
     encoding_error: str = ""
@@ -59,10 +143,26 @@ class HotwordsTable:
             return self.chat_terms
         return self.coding_terms
 
+    def entries_for_scope(self, scope: str) -> tuple[HotwordEntry, ...]:
+        s = normalize_hotword_scope(scope)
+        if s == "global":
+            entries, terms = self.global_entries, self.global_terms
+        elif s == "chat":
+            entries, terms = self.chat_entries, self.chat_terms
+        else:
+            entries, terms = self.coding_entries, self.coding_terms
+        if entries or not terms:
+            return entries
+        return tuple(HotwordEntry(t) for t in terms)
+
+    def merged_entries_for_scopes(self, scopes: Sequence[str]) -> list[HotwordEntry]:
+        return _merge_entry_sequences([self.entries_for_scope(sc) for sc in scopes])
+
     def merged_for_scene(self, scene: str) -> list[str]:
-        """Return priority-ordered deduplicated manual hotwords for ``scene``.
+        """Return priority-ordered deduplicated canonical manual hotwords for ``scene``.
 
         Active scene terms (``chat`` or ``coding``) precede ``global`` terms, preserving first-seen casing.
+        Never includes mishearing aliases (Stage 1 ASR receives canonical terms only).
         """
         s = (scene or "global").strip().lower()
         if s == "all":
@@ -80,6 +180,15 @@ class HotwordsTable:
             "coding": list(self.coding_terms),
         }
 
+    def as_entries_dict(self) -> dict[str, list[dict[str, Any]]]:
+        return {
+            sc: [
+                {"term": e.term, "aliases": list(e.aliases)}
+                for e in self.entries_for_scope(sc)
+            ]
+            for sc in VALID_HOTWORD_SCOPES
+        }
+
 
 @dataclass(frozen=True)
 class HotwordsEditResult:
@@ -90,6 +199,9 @@ class HotwordsEditResult:
     removed: tuple[str, ...] = ()
     not_found: tuple[str, ...] = ()
     changed: bool = False
+    updated: tuple[str, ...] = ()
+    aliases_added: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -101,6 +213,7 @@ class HotwordsQuotaSpec:
     separator: str = ""
     max_term_chars: int | None = None
     collapse_file_ext: bool = False
+    sanitize_openai_keywords: bool = False
     note: str = ""
 
 
@@ -146,18 +259,61 @@ class HotwordsBudgetResult:
         }
 
 
-# Single source of truth for per-provider ASR hotword quotas.
-# DashScope context_text reserves 7 chars for "常用技术术语：" (420 - 7 = 413);
-# Whisper /audio/transcriptions reserves 7 chars for "常用技术术语：" (360 - 7 = 353).
+@dataclass(frozen=True)
+class Stage2HotwordsBudgetSummary:
+    mode: str
+    scopes: tuple[str, ...]
+    kept_count: int
+    dropped_count: int
+    total_input: int
+    used_chars: int
+    max_items: int
+    max_chars: int
+    dropped: tuple[str, ...] = ()
+
+    @property
+    def truncated(self) -> bool:
+        return self.dropped_count > 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "scopes": list(self.scopes),
+            "kept_count": self.kept_count,
+            "dropped_count": self.dropped_count,
+            "dropped": list(self.dropped),
+            "total_input": self.total_input,
+            "used_chars": self.used_chars,
+            "max_items": self.max_items,
+            "max_chars": self.max_chars,
+            "truncated": self.truncated,
+        }
+
+
+# Single source of truth for per-provider ASR hotword quotas (aligned with
+# docs/benchmarks/asr-hotwords-and-protocols.md protocol measurements):
+# - Doubao file API contract supports up to 5,000 terms; recall is sharpest around 30-50 terms.
+# - DashScope qwen3-asr-flash hard cap is 10,000 text_tokens (~14,500 chars); 80 terms / 900 chars leaves wide headroom.
+# - OpenAI gpt-transcribe supports native keywords[] (50 terms sweet spot; must strip <, >, \r, \n).
+# - Whisper /audio/transcriptions reserves 7 chars for "常用技术术语：" (360 - 7 = 353).
+# - Single-hop multimodal models align with Stage 2 wide vocabulary hints (100 items / 1,500 chars).
 HOTWORDS_QUOTA_SPECS: dict[str, HotwordsQuotaSpec] = {
     "doubao": HotwordsQuotaSpec(
         key="doubao",
         label="doubao",
-        max_terms=30,
-        max_chars=180,
+        max_terms=50,
+        max_chars=500,
         separator="",
         max_term_chars=60,
         collapse_file_ext=True,
+    ),
+    "openai_keywords": HotwordsQuotaSpec(
+        key="openai_keywords",
+        label="openai(keywords)",
+        max_terms=50,
+        max_chars=None,
+        separator="",
+        sanitize_openai_keywords=True,
     ),
     "whisper": HotwordsQuotaSpec(
         key="whisper",
@@ -169,15 +325,15 @@ HOTWORDS_QUOTA_SPECS: dict[str, HotwordsQuotaSpec] = {
     "dashscope": HotwordsQuotaSpec(
         key="dashscope",
         label="dashscope",
-        max_terms=45,
-        max_chars=413,
+        max_terms=80,
+        max_chars=900,
         separator="、",
     ),
     "single_hop": HotwordsQuotaSpec(
         key="single_hop",
         label="single_hop",
-        max_terms=45,
-        max_chars=480,
+        max_terms=SINGLE_HOP_HOTWORDS_MAX_ITEMS,
+        max_chars=SINGLE_HOP_HOTWORDS_MAX_CHARS,
         separator=", ",
     ),
     "openrouter_keyterms": HotwordsQuotaSpec(
@@ -186,6 +342,7 @@ HOTWORDS_QUOTA_SPECS: dict[str, HotwordsQuotaSpec] = {
         max_terms=50,
         max_chars=None,
         separator="",
+        max_term_chars=100,
     ),
     "openrouter_stt_unsupported": HotwordsQuotaSpec(
         key="openrouter_stt_unsupported",
@@ -193,7 +350,11 @@ HOTWORDS_QUOTA_SPECS: dict[str, HotwordsQuotaSpec] = {
         max_terms=0,
         max_chars=0,
         separator="",
-        note="OpenRouter /audio/transcriptions only passes keyterms to deepgram/* and assemblyai/*; use single-hop or Stage 2 refiner",
+        note=(
+            "OpenRouter /audio/transcriptions keyterms is only enabled for verified models "
+            "(mai-transcribe, gpt-transcribe, grok-stt, voxtral, scribe, gemini-transcribe, assemblyai); "
+            "use single-hop or Stage 2 refiner"
+        ),
     ),
     "deepseek_asr_unsupported": HotwordsQuotaSpec(
         key="deepseek_asr_unsupported",
@@ -205,7 +366,7 @@ HOTWORDS_QUOTA_SPECS: dict[str, HotwordsQuotaSpec] = {
     ),
 }
 
-MAINSTREAM_QUOTA_PROVIDERS: tuple[str, ...] = ("doubao", "whisper", "dashscope", "gemini")
+MAINSTREAM_QUOTA_PROVIDERS: tuple[str, ...] = ("doubao", "dashscope", "openai", "whisper", "gemini")
 
 
 def dedupe_hotwords_ci(words: Sequence[str]) -> list[str]:
@@ -228,15 +389,19 @@ def normalize_hotword_scope(scope: str, *, allow_all: bool = False) -> str:
     return s
 
 
+def _has_forbidden_line_chars(raw: str) -> bool:
+    return bool(
+        _CTRL_CHAR_RE.search(raw)
+        or any(ch in _UNICODE_LINE_SEPS for ch in raw)
+        or len(raw.splitlines()) > 1
+    )
+
+
 def validate_hotword_term(raw: str) -> str:
     """Validate and normalize a single hotword term so it safely round-trips in plain-text ``hotwords.txt``."""
     if not isinstance(raw, str):
         raise ValueError(f"hotword must be a string, got {type(raw).__name__}")
-    if (
-        _CTRL_CHAR_RE.search(raw)
-        or any(ch in _UNICODE_LINE_SEPS for ch in raw)
-        or len(raw.splitlines()) > 1
-    ):
+    if _has_forbidden_line_chars(raw):
         raise ValueError(f"hotword contains newline or control characters: {raw!r}")
     term = raw.strip()
     if not term:
@@ -247,7 +412,81 @@ def validate_hotword_term(raw: str) -> str:
         raise ValueError(f"hotword {term!r} cannot start with '#' (comment line prefix)")
     if _INLINE_COMMENT_RE.search(term):
         raise ValueError(f"hotword {term!r} cannot contain whitespace followed by '#' (inline comment syntax)")
+    if _ALIAS_SEPARATOR in term:
+        raise ValueError(
+            f"hotword {term!r} cannot contain alias separator '{_ALIAS_SEPARATOR}' (pass aliases separately)"
+        )
     return term
+
+
+def validate_hotword_alias(raw: str) -> str:
+    """Validate and normalize a single mishearing alias (rejects empty, control chars, separators, and 1-char aliases)."""
+    if not isinstance(raw, str):
+        raise ValueError(f"mishearing alias must be a string, got {type(raw).__name__}")
+    if _has_forbidden_line_chars(raw):
+        raise ValueError(f"mishearing alias contains newline or control characters: {raw!r}")
+    alias = raw.strip()
+    if not alias:
+        raise ValueError("mishearing alias must not be empty")
+    if _ALIAS_SEPARATOR in alias or _ALIAS_SPLIT_RE.search(alias):
+        raise ValueError(f"mishearing alias {alias!r} cannot contain ',' / '，' or '{_ALIAS_SEPARATOR}'")
+    if alias.startswith("#") or _INLINE_COMMENT_RE.search(alias):
+        raise ValueError(f"mishearing alias {alias!r} conflicts with '#' comment syntax")
+    if len(alias) <= 1:
+        raise ValueError(
+            f"mishearing alias {alias!r} is too short (single-character aliases are rejected to prevent false replacements)"
+        )
+    return alias
+
+
+def validate_hotword_aliases(
+    term: str,
+    aliases: Sequence[str],
+    *,
+    existing_canonical_lows: set[str] | frozenset[str] = frozenset(),
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Validate, split (by ',' or '，'), deduplicate, and check guardrails for mishearing aliases.
+
+    Returns ``(clean_aliases, warnings)``. Raises ``ValueError`` on empty aliases, single-char aliases,
+    >5 aliases, self-conflicts, or conflicts with any canonical term in ``existing_canonical_lows``.
+    Emits a non-blocking warning for 2-character aliases.
+    """
+    term_clean = term.strip()
+    term_low = term_clean.lower()
+    clean: list[str] = []
+    seen_low: set[str] = set()
+    warnings: list[str] = []
+
+    for raw_item in aliases:
+        if not isinstance(raw_item, str):
+            raise ValueError(f"mishearing alias must be a string, got {type(raw_item).__name__}")
+        if _has_forbidden_line_chars(raw_item):
+            raise ValueError(f"mishearing alias contains newline or control characters: {raw_item!r}")
+        for piece in _ALIAS_SPLIT_RE.split(raw_item):
+            alias = validate_hotword_alias(piece)
+            al_low = alias.lower()
+            if al_low == term_low:
+                raise ValueError(f"mishearing alias {alias!r} cannot match its own canonical term {term_clean!r}")
+            if al_low in existing_canonical_lows:
+                raise ValueError(f"mishearing alias {alias!r} conflicts with an existing canonical hotword")
+            if al_low in seen_low:
+                continue
+            seen_low.add(al_low)
+            clean.append(alias)
+
+    if len(clean) > MAX_HOTWORD_ALIASES:
+        raise ValueError(
+            f"too many mishearing aliases for {term_clean!r}: {len(clean)} exceeds maximum of {MAX_HOTWORD_ALIASES}"
+        )
+
+    for alias in clean:
+        if len(alias) == 2:
+            warnings.append(
+                f"2-character mishearing alias {alias!r} for {term_clean!r} may risk colliding with common words; "
+                "keep only if you observe repeated ASR mishearings"
+            )
+
+    return tuple(clean), tuple(warnings)
 
 
 def _strip_line_comment(raw_line: str) -> str:
@@ -272,16 +511,47 @@ def _parse_section_header(cleaned_line: str) -> str | None:
     return m.group(1).strip().lower()
 
 
+def _parse_entry_cleaned_line(cleaned: str) -> tuple[str, tuple[str, ...]] | None:
+    """Parse a comment-stripped non-header line into ``(canonical_term, valid_aliases)``.
+
+    Supports both legacy ``Term`` lines and optional ``Term <- alias1, alias2`` (',' or '，').
+    Returns ``None`` if the canonical term on the left side is empty.
+    """
+    if _ALIAS_SEPARATOR not in cleaned:
+        return cleaned, ()
+    left, right = cleaned.split(_ALIAS_SEPARATOR, 1)
+    term = left.strip()
+    if not term:
+        return None
+    term_low = term.lower()
+    aliases: list[str] = []
+    seen_low: set[str] = set()
+    for piece in _ALIAS_SPLIT_RE.split(right):
+        al = piece.strip()
+        if len(al) <= 1 or _ALIAS_SEPARATOR in al:
+            continue
+        al_low = al.lower()
+        if al_low == term_low or al_low in seen_low:
+            continue
+        if len(aliases) >= MAX_HOTWORD_ALIASES:
+            break
+        seen_low.add(al_low)
+        aliases.append(al)
+    return term, tuple(aliases)
+
+
 def parse_hotwords_text(
     text: str,
     *,
     path: Path | None = None,
     exists: bool = True,
 ) -> HotwordsTable:
-    """Parse layered plain-text ``hotwords.txt`` (100% compatible with legacy flat files)."""
+    """Parse layered plain-text ``hotwords.txt`` (100% compatible with legacy flat files and ``<-`` aliases)."""
     clean_text = text.lstrip("\ufeff")
-    buckets: dict[str, list[str]] = {s: [] for s in VALID_HOTWORD_SCOPES}
-    seen_low: dict[str, set[str]] = {s: set() for s in VALID_HOTWORD_SCOPES}
+    order_by_sec: dict[str, list[str]] = {s: [] for s in VALID_HOTWORD_SCOPES}
+    terms_by_sec: dict[str, dict[str, str]] = {s: {} for s in VALID_HOTWORD_SCOPES}
+    aliases_by_sec: dict[str, dict[str, list[str]]] = {s: {} for s in VALID_HOTWORD_SCOPES}
+    alias_lows_by_sec: dict[str, dict[str, set[str]]] = {s: {} for s in VALID_HOTWORD_SCOPES}
     current_section: str | None = "global"
 
     for raw_line in clean_text.splitlines():
@@ -294,15 +564,51 @@ def parse_hotwords_text(
             continue
         if current_section is None:
             continue
-        low = cleaned.lower()
-        if low not in seen_low[current_section]:
-            seen_low[current_section].add(low)
-            buckets[current_section].append(cleaned)
+        parsed = _parse_entry_cleaned_line(cleaned)
+        if parsed is None:
+            continue
+        term, line_aliases = parsed
+        low = term.lower()
+        if low not in terms_by_sec[current_section]:
+            order_by_sec[current_section].append(low)
+            terms_by_sec[current_section][low] = term
+            aliases_by_sec[current_section][low] = []
+            alias_lows_by_sec[current_section][low] = set()
+        al_list = aliases_by_sec[current_section][low]
+        al_seen = alias_lows_by_sec[current_section][low]
+        for al in line_aliases:
+            al_low = al.lower()
+            if al_low not in al_seen and len(al_list) < MAX_HOTWORD_ALIASES:
+                al_seen.add(al_low)
+                al_list.append(al)
+
+    # Guardrail: drop any alias that collides (CI) with any canonical term across all sections.
+    all_canonical_lows: set[str] = set()
+    for sc in VALID_HOTWORD_SCOPES:
+        all_canonical_lows.update(terms_by_sec[sc])
+
+    entries_by_sec: dict[str, tuple[HotwordEntry, ...]] = {}
+    canon_by_sec: dict[str, tuple[str, ...]] = {}
+    for sc in VALID_HOTWORD_SCOPES:
+        sc_entries: list[HotwordEntry] = []
+        sc_terms: list[str] = []
+        for low in order_by_sec[sc]:
+            term = terms_by_sec[sc][low]
+            clean_aliases = tuple(
+                al for al in aliases_by_sec[sc][low] if al.lower() not in all_canonical_lows
+            )
+            sc_entries.append(HotwordEntry(term=term, aliases=clean_aliases))
+            sc_terms.append(term)
+        entries_by_sec[sc] = tuple(sc_entries)
+        canon_by_sec[sc] = tuple(sc_terms)
 
     return HotwordsTable(
-        global_terms=tuple(buckets["global"]),
-        chat_terms=tuple(buckets["chat"]),
-        coding_terms=tuple(buckets["coding"]),
+        global_terms=canon_by_sec["global"],
+        chat_terms=canon_by_sec["chat"],
+        coding_terms=canon_by_sec["coding"],
+        global_entries=entries_by_sec["global"],
+        chat_entries=entries_by_sec["chat"],
+        coding_entries=entries_by_sec["coding"],
         path=path,
         exists=exists,
     )
@@ -636,19 +942,78 @@ def _find_section_insert_index(lines: list[str], target_scope: str) -> int | Non
     return None
 
 
+def _rewrite_raw_line_with_entry(raw_line: str, entry: HotwordEntry) -> str:
+    """Replace the entry portion of ``raw_line`` while preserving leading whitespace, inline comment, and EOL."""
+    body = raw_line.rstrip("\r\n")
+    line_eol = raw_line[len(body) :]
+    leading_len = len(body) - len(body.lstrip(" \t"))
+    leading_ws = body[:leading_len]
+    content = body[leading_len:]
+    m = _INLINE_COMMENT_RE.search(content)
+    comment_suffix = content[m.start() :] if m is not None else ""
+    return f"{leading_ws}{entry.format_line()}{comment_suffix}{line_eol}"
+
+
+def _update_entry_line_in_scope(
+    raw_lines: list[str],
+    target_scope: str,
+    entry: HotwordEntry,
+) -> list[str]:
+    """Update the first matching canonical entry line in ``target_scope`` in place."""
+    target_low = entry.term.lower()
+    cur_sec: str | None = "global"
+    out: list[str] = []
+    updated = False
+    for raw_line in raw_lines:
+        cleaned = _strip_line_comment(raw_line)
+        if not cleaned:
+            out.append(raw_line)
+            continue
+        sec = _parse_section_header(cleaned)
+        if sec is not None:
+            cur_sec = sec if sec in VALID_HOTWORD_SCOPES else None
+            out.append(raw_line)
+            continue
+        if not updated and cur_sec == target_scope:
+            parsed = _parse_entry_cleaned_line(cleaned)
+            if parsed is not None and parsed[0].lower() == target_low:
+                out.append(_rewrite_raw_line_with_entry(raw_line, entry))
+                updated = True
+                continue
+        out.append(raw_line)
+    return out
+
+
 def add_hotwords(
     path: str | Path,
     terms: Sequence[str],
     scope: str = "global",
+    *,
+    aliases: Sequence[str] = (),
 ) -> HotwordsEditResult:
-    """Add one or more hotwords to ``scope`` while preserving comments, BOM, EOL, and other scopes."""
+    """Add one or more hotwords (with optional mishearing ``aliases`` for a single term) to ``scope``.
+
+    Preserves comments, BOM, EOL, and other scopes; uses ``flock`` + ``0600`` atomic replacement.
+    If ``aliases`` is provided and the canonical term already exists in ``scope``, merges deduplicated
+    aliases into the existing line in place (enforcing the 5-alias cap and conflict guardrails).
+    """
     eff_scope = normalize_hotword_scope(scope)
     clean_terms = dedupe_hotwords_ci([validate_hotword_term(t) for t in terms])
+    has_aliases = bool(aliases)
+    if has_aliases and len(clean_terms) != 1:
+        raise ValueError("mishearing aliases can only be specified when adding a single hotword term")
+
     target = Path(path)
     _inspect_writable_target(target)
 
     if not clean_terms:
         return HotwordsEditResult(path=target, scope=eff_scope, changed=False)
+
+    # Fail fast on alias syntax / single-char / >5 / self-conflict before touching disk or lock.
+    pre_aliases: tuple[str, ...] = ()
+    pre_warnings: tuple[str, ...] = ()
+    if has_aliases:
+        pre_aliases, pre_warnings = validate_hotword_aliases(clean_terms[0], aliases)
 
     _ensure_writable_parent(target.parent, create=True)
     with _hotwords_edit_lock(target):
@@ -659,29 +1024,96 @@ def add_hotwords(
             existing_text, has_bom, eol = "", False, "\n"
 
         table = parse_hotwords_text(existing_text, path=target, exists=(st is not None))
-        existing_low = {w.lower() for w in table.terms_for_scope(eff_scope)}
+        all_canonical_lows = {
+            e.term.lower()
+            for sc in VALID_HOTWORD_SCOPES
+            for e in table.entries_for_scope(sc)
+        }
+        all_alias_owners: dict[str, str] = {}
+        for sc in VALID_HOTWORD_SCOPES:
+            for e in table.entries_for_scope(sc):
+                for al in e.aliases:
+                    all_alias_owners.setdefault(al.lower(), e.term)
 
-        added: list[str] = []
-        skipped: list[str] = []
+        # Reject adding a canonical term that collides with an existing mishearing alias.
         for term in clean_terms:
-            if term.lower() in existing_low:
-                skipped.append(term)
-            else:
-                existing_low.add(term.lower())
-                added.append(term)
+            if (owner := all_alias_owners.get(term.lower())) is not None:
+                raise ValueError(
+                    f"hotword {term!r} conflicts with existing mishearing alias of {owner!r}"
+                )
 
-        if not added:
-            return HotwordsEditResult(
-                path=target,
-                scope=eff_scope,
-                added=(),
-                skipped=tuple(skipped),
-                changed=False,
+        existing_entries = {e.term.lower(): e for e in table.entries_for_scope(eff_scope)}
+
+        if has_aliases:
+            term = clean_terms[0]
+            other_canonical_lows = all_canonical_lows - {term.lower()}
+            clean_aliases, warnings = validate_hotword_aliases(
+                term,
+                pre_aliases,
+                existing_canonical_lows=other_canonical_lows,
             )
+            existing_entry = existing_entries.get(term.lower())
+            if existing_entry is not None:
+                existing_al_lows = {a.lower() for a in existing_entry.aliases}
+                new_aliases = tuple(a for a in clean_aliases if a.lower() not in existing_al_lows)
+                if not new_aliases:
+                    return HotwordsEditResult(
+                        path=target,
+                        scope=eff_scope,
+                        skipped=(term,),
+                        changed=False,
+                        warnings=warnings,
+                    )
+                combined_aliases = (*existing_entry.aliases, *new_aliases)
+                if len(combined_aliases) > MAX_HOTWORD_ALIASES:
+                    raise ValueError(
+                        f"too many mishearing aliases for {existing_entry.term!r}: "
+                        f"{len(combined_aliases)} exceeds maximum of {MAX_HOTWORD_ALIASES}"
+                    )
+                merged_entry = HotwordEntry(term=existing_entry.term, aliases=combined_aliases)
+                raw_lines = existing_text.splitlines(keepends=True)
+                new_raw_lines = _update_entry_line_in_scope(raw_lines, eff_scope, merged_entry)
+                payload = (b"\xef\xbb\xbf" if has_bom else b"") + "".join(new_raw_lines).encode("utf-8")
+                _atomic_write_bytes_0600(target, payload)
+                return HotwordsEditResult(
+                    path=target,
+                    scope=eff_scope,
+                    updated=(existing_entry.term,),
+                    aliases_added=new_aliases,
+                    changed=True,
+                    warnings=warnings,
+                )
+
+            new_entry = HotwordEntry(term=term, aliases=clean_aliases)
+            added_lines = [new_entry.format_line()]
+            added = [term]
+            skipped: list[str] = []
+            aliases_added = clean_aliases
+        else:
+            warnings = pre_warnings
+            aliases_added = ()
+            added = []
+            skipped = []
+            existing_low = set(existing_entries)
+            for term in clean_terms:
+                if term.lower() in existing_low:
+                    skipped.append(term)
+                else:
+                    existing_low.add(term.lower())
+                    added.append(term)
+            if not added:
+                return HotwordsEditResult(
+                    path=target,
+                    scope=eff_scope,
+                    added=(),
+                    skipped=tuple(skipped),
+                    changed=False,
+                )
+            added_lines = list(added)
 
         raw_lines = existing_text.splitlines(keepends=True) if existing_text else []
         if not raw_lines:
-            new_raw_lines = [f"[{eff_scope}]{eol}", *(f"{t}{eol}" for t in added)]
+            new_raw_lines = [f"[{eff_scope}]{eol}", *(f"{ln}{eol}" for ln in added_lines)]
         else:
             plain_lines = [ln.rstrip("\r\n") for ln in raw_lines]
             insert_idx = _find_section_insert_index(plain_lines, eff_scope)
@@ -689,7 +1121,7 @@ def add_hotwords(
                 head = list(raw_lines[:insert_idx])
                 if head and not head[-1].endswith(("\n", "\r")):
                     head[-1] = head[-1] + eol
-                new_raw_lines = [*head, *(f"{t}{eol}" for t in added), *raw_lines[insert_idx:]]
+                new_raw_lines = [*head, *(f"{ln}{eol}" for ln in added_lines), *raw_lines[insert_idx:]]
             else:
                 new_raw_lines = list(raw_lines)
                 if new_raw_lines and not new_raw_lines[-1].endswith(("\n", "\r")):
@@ -697,7 +1129,7 @@ def add_hotwords(
                 if new_raw_lines and new_raw_lines[-1].strip():
                     new_raw_lines.append(eol)
                 new_raw_lines.append(f"[{eff_scope}]{eol}")
-                new_raw_lines.extend(f"{t}{eol}" for t in added)
+                new_raw_lines.extend(f"{ln}{eol}" for ln in added_lines)
 
         payload = (b"\xef\xbb\xbf" if has_bom else b"") + "".join(new_raw_lines).encode("utf-8")
         _atomic_write_bytes_0600(target, payload)
@@ -707,7 +1139,20 @@ def add_hotwords(
             added=tuple(added),
             skipped=tuple(skipped),
             changed=True,
+            aliases_added=aliases_added,
+            warnings=warnings,
         )
+
+
+def add_hotword(
+    path: str | Path,
+    term: str,
+    scope: str = "global",
+    *,
+    aliases: Sequence[str] = (),
+) -> HotwordsEditResult:
+    """Add a single hotword (with optional mishearing ``aliases``) to ``scope``."""
+    return add_hotwords(path, [term], scope=scope, aliases=aliases)
 
 
 def remove_hotwords(
@@ -715,7 +1160,7 @@ def remove_hotwords(
     terms: Sequence[str],
     scope: str = "global",
 ) -> HotwordsEditResult:
-    """Remove hotwords from ``scope`` (``global`` | ``chat`` | ``coding`` | ``all``) preserving layout, BOM, and EOL."""
+    """Remove hotwords by canonical term from ``scope`` (``global`` | ``chat`` | ``coding`` | ``all``)."""
     eff_scope = normalize_hotword_scope(scope, allow_all=True)
     clean_terms = dedupe_hotwords_ci([validate_hotword_term(t) for t in terms])
     target = Path(path)
@@ -761,11 +1206,14 @@ def remove_hotwords(
             in_target_scope = (
                 cur_sec in VALID_HOTWORD_SCOPES if eff_scope == "all" else cur_sec == eff_scope
             )
-            low = cleaned.lower()
-            if in_target_scope and low in target_lows:
-                removed_map.setdefault(low, cleaned)
-                changed = True
-                continue
+            parsed = _parse_entry_cleaned_line(cleaned)
+            if in_target_scope and parsed is not None:
+                canon_term = parsed[0]
+                low = canon_term.lower()
+                if low in target_lows:
+                    removed_map.setdefault(low, canon_term)
+                    changed = True
+                    continue
             kept_raw_lines.append(raw_line)
 
         removed = tuple(removed_map[t.lower()] for t in clean_terms if t.lower() in removed_map)
@@ -782,6 +1230,27 @@ def remove_hotwords(
             not_found=not_found,
             changed=changed,
         )
+
+
+def remove_hotword(
+    path: str | Path,
+    term: str,
+    scope: str = "global",
+) -> HotwordsEditResult:
+    """Remove a single hotword (and any attached aliases) by canonical term from ``scope``."""
+    return remove_hotwords(path, [term], scope=scope)
+
+
+def sanitize_openai_keyword(word: str) -> str:
+    """Strip characters rejected by OpenAI ``keywords[]`` (``<``, ``>``, ``\\r``, ``\\n``, control chars)."""
+    if not isinstance(word, str):
+        return ""
+    s = _OPENAI_KEYWORD_FORBIDDEN_RE.sub("", word)
+    s = _CTRL_CHAR_RE.sub(" ", s)
+    for ch in _UNICODE_LINE_SEPS:
+        if ch in s:
+            s = s.replace(ch, " ")
+    return " ".join(s.split())
 
 
 def resolve_hotwords_quota_spec(
@@ -817,10 +1286,19 @@ def resolve_hotwords_quota_spec(
         eff_api = resolve_asr_api("openrouter", eff_model, api or "auto", base_url)
         if eff_api == "chat-completions":
             return HOTWORDS_QUOTA_SPECS["single_hop"]
-        if eff_model.lower().startswith(_OPENROUTER_KEYTERMS_PREFIXES):
+        if eff_model.lower().split(":", 1)[0] in _OPENROUTER_KEYTERMS_MODELS:
             return HOTWORDS_QUOTA_SPECS["openrouter_keyterms"]
         return HOTWORDS_QUOTA_SPECS["openrouter_stt_unsupported"]
-    if prov in ("openai", "groq", "siliconflow", "openai-compatible"):
+    if prov == "openai":
+        eff_model = model.strip() or DEFAULT_ASR_MODELS["openai"]
+        eff_api = resolve_asr_api("openai", eff_model, api or "auto", base_url)
+        if eff_api == "chat-completions":
+            return HOTWORDS_QUOTA_SPECS["single_hop"]
+        low_model = eff_model.lower()
+        if "whisper" in low_model or low_model.startswith("gpt-4o-"):
+            return HOTWORDS_QUOTA_SPECS["whisper"]
+        return HOTWORDS_QUOTA_SPECS["openai_keywords"]
+    if prov in ("groq", "siliconflow", "openai-compatible"):
         eff_model = model.strip() or DEFAULT_ASR_MODELS.get(prov, "")
         eff_api = resolve_asr_api(prov, eff_model, api or "auto", base_url)
         if eff_api == "chat-completions":
@@ -858,6 +1336,11 @@ def budget_hotwords_for_provider(
 
     for raw_w in cleaned_words:
         w = raw_w
+        if spec.sanitize_openai_keywords:
+            w = sanitize_openai_keyword(w)
+            if not w:
+                dropped.append(raw_w)
+                continue
         if spec.collapse_file_ext and "." in w:
             stem, ext = w.rsplit(".", 1)
             if len(stem) >= 3 and ext.isalnum() and stem.lower() in canonical_by_low:
@@ -896,6 +1379,207 @@ def budget_hotwords_for_provider(
         max_chars=eff_max_chars,
         note=spec.note,
     )
+
+
+def budget_openai_keywords(
+    terms: Sequence[str],
+    *,
+    max_terms: int | None = None,
+) -> HotwordsBudgetResult:
+    """Sanitize and budget canonical hotwords for OpenAI ``gpt-transcribe`` native ``keywords[]``."""
+    return budget_hotwords_for_provider(
+        terms,
+        "openai",
+        model="gpt-transcribe",
+        max_terms=max_terms,
+    )
+
+
+def _sanitize_xml_hint_text(text: str) -> str:
+    """Strip control/line-break characters and escape XML special characters for ``<vocabulary_hints>``."""
+    s = _CTRL_CHAR_RE.sub(" ", text)
+    for ch in _UNICODE_LINE_SEPS:
+        if ch in s:
+            s = s.replace(ch, " ")
+    s = " ".join(s.split())
+    if not s:
+        return ""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _coerce_stage2_entries(entries: Sequence[HotwordEntry | str]) -> list[HotwordEntry]:
+    raw_entries: list[HotwordEntry] = []
+    for item in entries:
+        entry = item if isinstance(item, HotwordEntry) else HotwordEntry(term=str(item))
+        if _sanitize_xml_hint_text(entry.term):
+            raw_entries.append(entry)
+    return _merge_entry_sequences([raw_entries])
+
+
+def select_stage2_manual_entries(
+    doc_or_path: HotwordsTable | str | Path | None,
+    *,
+    mode: str = "general",
+    env: Mapping[str, str] | None = None,
+    use_cache: bool = True,
+) -> list[HotwordEntry]:
+    """Select static manual hotword entries for Stage 2 / single-hop ``<vocabulary_hints>``.
+
+    - ``mode == "agent"``: merges ``[coding]`` then ``[global]``.
+    - ``mode == "general"``: merges ``[global]`` then ``[chat]``.
+    """
+    m = (mode or "general").strip().lower()
+    if m == "agent":
+        scopes: tuple[str, ...] = ("coding", "global")
+    elif m == "general":
+        scopes = ("global", "chat")
+    else:
+        raise ValueError(f"invalid stage2 hotwords mode {mode!r} (expected 'agent' or 'general')")
+
+    if doc_or_path is None:
+        return []
+    table = (
+        doc_or_path
+        if isinstance(doc_or_path, HotwordsTable)
+        else load_hotwords_table(doc_or_path, env=env, use_cache=use_cache)
+    )
+    return table.merged_entries_for_scopes(scopes)
+
+
+def format_stage2_entry_line(entry: HotwordEntry | str) -> str:
+    """Format a single Stage 2 vocabulary hint line with XML escaping and descriptive alias text."""
+    if isinstance(entry, HotwordEntry):
+        term = _sanitize_xml_hint_text(entry.term)
+        raw_aliases = entry.aliases
+    else:
+        term = _sanitize_xml_hint_text(str(entry))
+        raw_aliases = ()
+    if not term:
+        return ""
+    term_low = term.lower()
+    clean_aliases: list[str] = []
+    seen_low: set[str] = set()
+    for raw_al in raw_aliases:
+        al = _sanitize_xml_hint_text(raw_al)
+        if len(al) <= 1:
+            continue
+        al_low = al.lower()
+        if al_low == term_low or al_low in seen_low:
+            continue
+        seen_low.add(al_low)
+        clean_aliases.append(al)
+        if len(clean_aliases) >= MAX_HOTWORD_ALIASES:
+            break
+    if clean_aliases:
+        return f"{term} (ASR has misheard as: {', '.join(clean_aliases)})"
+    return term
+
+
+def budget_stage2_hotwords(
+    entries: Sequence[HotwordEntry | str],
+    *,
+    max_items: int = STAGE2_HOTWORDS_MAX_ITEMS,
+    max_chars: int = STAGE2_HOTWORDS_MAX_CHARS,
+) -> tuple[list[HotwordEntry], list[HotwordEntry], int]:
+    """Truncate Stage 2 hotword entries strictly in line order within item and rendered-char budgets.
+
+    Returns ``(kept_entries, dropped_entries, used_chars)``.
+    """
+    eff_max_items = max(0, int(max_items))
+    eff_max_chars = max(0, int(max_chars))
+    normalized = _coerce_stage2_entries(entries)
+
+    kept: list[HotwordEntry] = []
+    dropped: list[HotwordEntry] = []
+    used_chars = 0
+    truncated = False
+
+    for entry in normalized:
+        rendered = format_stage2_entry_line(entry)
+        if truncated or eff_max_items <= 0 or eff_max_chars <= 0 or len(kept) >= eff_max_items:
+            dropped.append(entry)
+            truncated = True
+            continue
+        add_len = len(rendered) + (1 if kept else 0)
+        if used_chars + add_len > eff_max_chars:
+            dropped.append(entry)
+            truncated = True
+            continue
+        kept.append(entry)
+        used_chars += add_len
+
+    return kept, dropped, used_chars
+
+
+def format_stage2_vocabulary_hints(
+    entries: Sequence[HotwordEntry | str],
+    *,
+    max_items: int = STAGE2_HOTWORDS_MAX_ITEMS,
+    max_chars: int = STAGE2_HOTWORDS_MAX_CHARS,
+) -> str:
+    """Render static manual hotwords into a read-only ``<vocabulary_hints>`` block for Stage 2 / single-hop."""
+    kept, _, _ = budget_stage2_hotwords(entries, max_items=max_items, max_chars=max_chars)
+    if not kept:
+        return ""
+    body = "\n".join(format_stage2_entry_line(e) for e in kept)
+    return (
+        '<vocabulary_hints read_only="true">\n'
+        f"{STAGE2_VOCABULARY_HINTS_PREAMBLE}\n"
+        f"{body}\n"
+        "</vocabulary_hints>"
+    )
+
+
+def summarize_stage2_hotwords_budgets(
+    doc_or_path: HotwordsTable | str | Path | None,
+    *,
+    env: Mapping[str, str] | None = None,
+    use_cache: bool = True,
+    max_items: int = STAGE2_HOTWORDS_MAX_ITEMS,
+    max_chars: int = STAGE2_HOTWORDS_MAX_CHARS,
+) -> dict[str, Stage2HotwordsBudgetSummary]:
+    """Summarize Stage 2 manual vocabulary budget usage for both ``agent`` and ``general`` modes."""
+    table: HotwordsTable | None
+    if doc_or_path is None:
+        table = None
+    elif isinstance(doc_or_path, HotwordsTable):
+        table = doc_or_path
+    else:
+        table = load_hotwords_table(doc_or_path, env=env, use_cache=use_cache)
+
+    eff_max_items = max(0, int(max_items))
+    eff_max_chars = max(0, int(max_chars))
+    out: dict[str, Stage2HotwordsBudgetSummary] = {}
+    for mode, scopes in (("agent", ("coding", "global")), ("general", ("global", "chat"))):
+        selected = select_stage2_manual_entries(table, mode=mode)
+        kept, dropped, used_chars = budget_stage2_hotwords(
+            selected,
+            max_items=eff_max_items,
+            max_chars=eff_max_chars,
+        )
+        out[mode] = Stage2HotwordsBudgetSummary(
+            mode=mode,
+            scopes=scopes,
+            kept_count=len(kept),
+            dropped_count=len(dropped),
+            total_input=len(kept) + len(dropped),
+            used_chars=used_chars,
+            max_items=eff_max_items,
+            max_chars=eff_max_chars,
+            dropped=tuple(e.term for e in dropped),
+        )
+    return out
+
+
+def format_stage2_budget_line(summary: Stage2HotwordsBudgetSummary, *, name: str = "") -> str:
+    """Format a compact Stage 2 budget line such as ``stage2 (agent: coding+global): 12/100 items, 240/1500 chars [OK]``."""
+    label = name or f"stage2 ({summary.mode}: {'+'.join(summary.scopes)})"
+    base = f"{label}: {summary.kept_count}/{summary.max_items} items, {summary.used_chars}/{summary.max_chars} chars"
+    if summary.truncated:
+        preview = ", ".join(summary.dropped[:5])
+        more = f", +{summary.dropped_count - 5} more" if summary.dropped_count > 5 else ""
+        return f"{base} [TRUNCATED: {summary.dropped_count} dropped: {preview}{more}]"
+    return f"{base} [OK]"
 
 
 def summarize_hotwords_budgets(

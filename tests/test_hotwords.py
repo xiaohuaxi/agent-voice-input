@@ -19,7 +19,11 @@ SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from agent_voice_input.app_scope import resolve_hotwords_scope
+from agent_voice_input.app_scope import (
+    BUILTIN_AI_CHAT_HOTWORDS,
+    get_builtin_ai_chat_hotwords,
+    resolve_hotwords_scope,
+)
 from agent_voice_input.asr_providers import (
     _build_doubao_corpus_context,
     _coerce_context,
@@ -37,20 +41,39 @@ from agent_voice_input.daemon import run_pipeline_once
 from agent_voice_input.hotwords import (
     DEFAULT_HOTWORDS_FILE,
     HOTWORDS_QUOTA_SPECS,
+    MAX_HOTWORD_ALIASES,
+    SINGLE_HOP_HOTWORDS_MAX_CHARS,
+    SINGLE_HOP_HOTWORDS_MAX_ITEMS,
+    STAGE2_HOTWORDS_MAX_CHARS,
+    STAGE2_HOTWORDS_MAX_ITEMS,
+    STAGE2_VOCABULARY_HINTS_PREAMBLE,
+    HotwordEntry,
     HotwordsTable,
+    add_hotword,
     add_hotwords,
     budget_hotwords_for_provider,
+    budget_openai_keywords,
+    budget_stage2_hotwords,
     clear_hotwords_cache,
     dedupe_hotwords_ci,
     format_budget_line,
+    format_stage2_budget_line,
+    format_stage2_entry_line,
+    format_stage2_vocabulary_hints,
     load_hotwords_file,
     load_hotwords_table,
     normalize_hotword_scope,
     parse_hotwords_text,
+    remove_hotword,
     remove_hotwords,
     resolve_hotwords_path,
     resolve_hotwords_quota_spec,
+    sanitize_openai_keyword,
+    select_stage2_manual_entries,
     summarize_hotwords_budgets,
+    summarize_stage2_hotwords_budgets,
+    validate_hotword_alias,
+    validate_hotword_aliases,
     validate_hotword_term,
 )
 from agent_voice_input.http_transport import HttpRequest, HttpResponse
@@ -642,10 +665,11 @@ class HotwordsSceneAndDaemonHotReloadTests(unittest.TestCase):
             self.assertNotIn("ChatColleagueA", hw_ide)
             self.assertIn(BUILTIN_AGENT_HOTWORDS[0], hw_ide)
 
-            # 3. IM / AI Chat windows -> chat + global ONLY (zero coding words, zero builtin coding words)
-            for chat_win in (
-                ForegroundWindow(12, "WeChat", "工作群", bundle_id="com.tencent.xinwechat"),
-                ForegroundWindow(13, "ChatGPT", "New chat", bundle_id="com.openai.chat"),
+            # 3. IM / AI Chat windows -> chat + global (zero coding words, zero builtin coding words);
+            #    AI chat windows (target_hint="ai_chat") append compact built-in AI tail after manual terms.
+            for chat_win, expect_ai_tail in (
+                (ForegroundWindow(12, "WeChat", "工作群", bundle_id="com.tencent.xinwechat"), False),
+                (ForegroundWindow(13, "ChatGPT", "New chat", bundle_id="com.openai.chat"), True),
             ):
                 asr_chat = _SpyAsrProvider(hotwords_file=str(hw_file), env=env)
                 res_chat = run_pipeline_once(
@@ -661,8 +685,17 @@ class HotwordsSceneAndDaemonHotReloadTests(unittest.TestCase):
                     env=env,
                 )
                 self.assertTrue(res_chat.ok)
-                self.assertEqual(asr_chat.seen_contexts[-1].hotwords, ["ChatColleagueA", "MyBrandGlobal"])
-                self.assertEqual(asr_chat.seen_contexts[-1].hotwords_scope, "chat")
+                ctx_chat = asr_chat.seen_contexts[-1]
+                self.assertEqual(ctx_chat.hotwords_scope, "chat")
+                self.assertEqual(ctx_chat.hotwords[:2], ["ChatColleagueA", "MyBrandGlobal"])
+                self.assertNotIn("CodingManualTerm", ctx_chat.hotwords)
+                self.assertNotIn(BUILTIN_AGENT_HOTWORDS[0], ctx_chat.hotwords)
+                if expect_ai_tail:
+                    self.assertEqual(ctx_chat.target_hint, "ai_chat")
+                    self.assertEqual(ctx_chat.hotwords[2:], list(get_builtin_ai_chat_hotwords("en")))
+                    self.assertTrue(set(ctx_chat.hotwords[2:]).issubset(BUILTIN_AI_CHAT_HOTWORDS))
+                else:
+                    self.assertEqual(ctx_chat.hotwords, ["ChatColleagueA", "MyBrandGlobal"])
 
             # 4. General non-chat window -> global ONLY
             asr_gen = _SpyAsrProvider(hotwords_file=str(hw_file), env=env)
@@ -707,7 +740,7 @@ class HotwordsQuotaBudgeterTests(unittest.TestCase):
         self.assertEqual(resolve_hotwords_quota_spec("doubao").key, "doubao")
         self.assertEqual(resolve_hotwords_quota_spec("volcengine").key, "doubao")
         self.assertEqual(resolve_hotwords_quota_spec("dashscope").key, "dashscope")
-        # Default DashScope STT model uses chat-completions endpoint but is NOT single-hop -> stays 413-char dashscope!
+        # Default DashScope STT model uses chat-completions endpoint but is NOT single-hop -> stays 900-char dashscope!
         self.assertEqual(
             resolve_hotwords_quota_spec("dashscope", model="qwen3-asr-flash", api="chat-completions").key,
             "dashscope",
@@ -722,30 +755,63 @@ class HotwordsQuotaBudgeterTests(unittest.TestCase):
             resolve_hotwords_quota_spec("gemini", api="audio-transcriptions", base_url="https://proxy.example/v1").key,
             "whisper",
         )
-        self.assertEqual(resolve_hotwords_quota_spec("openai").key, "whisper")
+        # OpenAI default gpt-transcribe uses native keywords[] (50 terms); legacy whisper-1 / gpt-4o-* stay whisper
+        self.assertEqual(resolve_hotwords_quota_spec("openai").key, "openai_keywords")
+        self.assertEqual(resolve_hotwords_quota_spec("openai", model="gpt-transcribe").key, "openai_keywords")
+        self.assertEqual(resolve_hotwords_quota_spec("openai", model="whisper-1").key, "whisper")
+        self.assertEqual(resolve_hotwords_quota_spec("openai", model="gpt-4o-transcribe").key, "whisper")
         self.assertEqual(resolve_hotwords_quota_spec("openai", api="chat-completions").key, "single_hop")
         self.assertEqual(resolve_hotwords_quota_spec("groq").key, "whisper")
+        self.assertEqual(resolve_hotwords_quota_spec("groq", api="chat-completions").key, "single_hop")
         self.assertEqual(resolve_hotwords_quota_spec("siliconflow").key, "whisper")
         self.assertEqual(resolve_hotwords_quota_spec("openai-compatible").key, "whisper")
         self.assertEqual(resolve_hotwords_quota_spec("whisper").key, "whisper")
         self.assertEqual(resolve_hotwords_quota_spec("single_hop").key, "single_hop")
-        self.assertEqual(resolve_hotwords_quota_spec("openrouter", model="qwen/qwen3-asr-1.7b").key, "openrouter_stt_unsupported")
-        self.assertEqual(resolve_hotwords_quota_spec("openrouter", model="deepgram/nova-3").key, "openrouter_keyterms")
+
+        # OpenRouter verified keyterms whitelist (exact verified model IDs only; :variant suffix stripped)
+        for kt_model in (
+            "microsoft/mai-transcribe-2",
+            "microsoft/mai-transcribe-2:nitro",
+            "openai/gpt-transcribe",
+            "x-ai/grok-stt-2.0",
+            "mistralai/voxtral-small-transcribe-3-0",
+            "MISTRALAI/VOXTRAL-SMALL-TRANSCRIBE-3-0",
+            "elevenlabs/scribe-v2",
+            "google/gemini-3.5-transcribe",
+            "assemblyai/universal-3-6-pro",
+        ):
+            self.assertEqual(
+                resolve_hotwords_quota_spec("openrouter", model=kt_model).key,
+                "openrouter_keyterms",
+                msg=f"expected openrouter_keyterms for {kt_model}",
+            )
+        for unsup_model in (
+            "deepgram/nova-3",
+            "qwen/qwen3-asr-1.7b",
+            "google/chirp-3",
+            "nvidia/nemotron-3.5-transcribe",
+            "mistralai/voxtral-mini-3b-2507",
+        ):
+            self.assertEqual(
+                resolve_hotwords_quota_spec("openrouter", model=unsup_model).key,
+                "openrouter_stt_unsupported",
+                msg=f"expected openrouter_stt_unsupported for {unsup_model}",
+            )
         self.assertEqual(resolve_hotwords_quota_spec("openrouter", model="google/gemini-3.5-flash-lite").key, "single_hop")
         self.assertEqual(resolve_hotwords_quota_spec("custom-unknown").key, "single_hop")
         self.assertIn("doubao", HOTWORDS_QUOTA_SPECS)
+        self.assertIn("openai_keywords", HOTWORDS_QUOTA_SPECS)
 
-    def test_doubao_whisper_dashscope_single_hop_and_openrouter_quotas(self) -> None:
-        # 1. Doubao: 30 terms / 180 chars / 60 char per term / stem collapse / whole-word skip past oversized
+    def test_doubao_whisper_dashscope_openai_single_hop_and_openrouter_quotas(self) -> None:
+        # 1. Doubao: 50 terms / 500 chars / 60 char per term / stem collapse / whole-word skip past oversized
         db_terms = [
             "ManualTop",
             "refiner.py",
             "refiner",
             "x" * 70,  # >60 chars -> whole-word skipped & marked truncated (never chopped in half!)
-            "y" * 60,
-            "z" * 60,
-            "w" * 60,  # 9 + 7 + 60 + 60 = 136; +60 = 196 > 180 -> skipped, loop continues
-            "TailShort",
+            *(f"{chr(ord('a') + i)}" * 60 for i in range(8)),  # 9 + 7 + 8*60 = 496 chars
+            "z" * 60,  # 496 + 60 = 556 > 500 -> skipped, loop continues
+            "Tail",  # 496 + 4 = 500 <= 500 -> fits!
         ]
         db_res = budget_hotwords_for_provider(db_terms, "doubao")
         self.assertEqual(db_res.kept[0], "ManualTop")
@@ -753,23 +819,21 @@ class HotwordsQuotaBudgeterTests(unittest.TestCase):
         self.assertNotIn("refiner.py", db_res.kept)
         self.assertNotIn("x" * 60, db_res.kept)
         self.assertNotIn("x" * 70, db_res.kept)
-        self.assertIn("y" * 60, db_res.kept)
-        self.assertIn("z" * 60, db_res.kept)
-        self.assertIn("TailShort", db_res.kept)
-        self.assertEqual(db_res.dropped, ("x" * 70, "w" * 60))
+        self.assertIn("Tail", db_res.kept)
+        self.assertEqual(db_res.dropped, ("x" * 70, "z" * 60))
         self.assertTrue(db_res.truncated)
-        self.assertLessEqual(db_res.used_chars, 180)
+        self.assertEqual(db_res.used_chars, 500)
         self.assertIn("doubao:", format_budget_line(db_res))
         self.assertIn("TRUNCATED", format_budget_line(db_res))
 
-        # 2. Doubao > 30 short terms -> truncated at 30 terms, manual head preserved
-        many_short = [f"w{i:02d}" for i in range(40)]
-        db_30 = budget_hotwords_for_provider(many_short, "doubao")
-        self.assertEqual(db_30.kept_count, 30)
-        self.assertEqual(db_30.dropped_count, 10)
-        self.assertEqual(db_30.kept[0], "w00")
-        self.assertEqual(db_30.dropped[0], "w30")
-        self.assertIn("+5 more", format_budget_line(db_30))
+        # 2. Doubao > 50 short terms -> truncated at 50 terms, manual head preserved
+        many_short = [f"w{i:02d}" for i in range(60)]
+        db_50 = budget_hotwords_for_provider(many_short, "doubao")
+        self.assertEqual(db_50.kept_count, 50)
+        self.assertEqual(db_50.dropped_count, 10)
+        self.assertEqual(db_50.kept[0], "w00")
+        self.assertEqual(db_50.dropped[0], "w50")
+        self.assertIn("+5 more", format_budget_line(db_50))
 
         # 3. Whisper: head-first selection up to 35 terms / 353 chars, reversed at prompt tail
         whisper_terms = ["ManualFirst", "ManualSecond", "manualfirst", *[f"dyn_{i:02d}" for i in range(50)]]
@@ -780,11 +844,16 @@ class HotwordsQuotaBudgeterTests(unittest.TestCase):
         prompt = _compose_stt_prompt_text(AsrContext(hotwords=whisper_terms, dialog_text="背景对话" * 100))
         self.assertTrue(prompt.endswith("、ManualSecond、ManualFirst"))
 
-        # Oversized single term is NEVER chopped in half; skipped as dropped/truncated and subsequent short term fits!
-        huge_first = budget_hotwords_for_provider(["A" * 500, "ShortFits"], "dashscope")
+        # 4. DashScope (80 terms / 900 chars): oversized single term is NEVER chopped in half
+        huge_first = budget_hotwords_for_provider(["A" * 950, "ShortFits"], "dashscope")
         self.assertEqual(huge_first.kept, ("ShortFits",))
-        self.assertEqual(huge_first.dropped, ("A" * 500,))
+        self.assertEqual(huge_first.dropped, ("A" * 950,))
         self.assertTrue(huge_first.truncated)
+        ds_many = [f"d{i:02d}" for i in range(90)]
+        ds_80 = budget_hotwords_for_provider(ds_many, "dashscope")
+        self.assertEqual(ds_80.kept_count, 80)
+        self.assertEqual(ds_80.dropped_count, 10)
+
         huge_whisper = budget_hotwords_for_provider(["A" * 500, "B"], "whisper", max_chars=20)
         self.assertEqual(huge_whisper.kept, ("B",))
         self.assertEqual(huge_whisper.dropped, ("A" * 500,))
@@ -793,37 +862,62 @@ class HotwordsQuotaBudgeterTests(unittest.TestCase):
         self.assertEqual(zero_cap.kept, ())
         self.assertEqual(zero_cap.dropped, ("Alpha",))
 
-        # 4. DashScope context_text does NOT chop words mid-term
+        # DashScope context_text does NOT chop words mid-term
         ds_terms = [f"LongTechnicalIdentifier_{i:02d}" for i in range(40)]
         ctx_txt = _compose_context_text(AsrContext(hotwords=ds_terms), max_chars=2500)
         self.assertTrue(ctx_txt.startswith("常用技术术语："))
-        self.assertLessEqual(len(ctx_txt), 420)
+        self.assertLessEqual(len(ctx_txt), 900)
         rendered_terms = ctx_txt[len("常用技术术语：") :].split("、")
         for tok in rendered_terms:
             self.assertIn(tok, ds_terms, f"term was chopped mid-word: {tok!r}")
 
-        # 5. Single-hop vocabulary hints uses unified 45-term / 480-char budgeter
-        vocab_xml = _format_vocabulary_hints(ds_terms)
+        # 5. OpenAI gpt-transcribe keywords[] sanitization & 50-term budget
+        self.assertEqual(sanitize_openai_keyword("<KestrelDB>"), "KestrelDB")
+        self.assertEqual(sanitize_openai_keyword("foo\r\nbar\u2028baz"), "foo bar baz")
+        self.assertEqual(sanitize_openai_keyword("<>"), "")
+        self.assertEqual(sanitize_openai_keyword(123), "")  # type: ignore[arg-type]
+        oai_res = budget_openai_keywords(
+            ["<KestrelDB>", "kestreldb", "<>", "foo\nbar", *[f"kw{i:02d}" for i in range(55)]]
+        )
+        self.assertEqual(oai_res.spec_key, "openai_keywords")
+        self.assertEqual(oai_res.kept[:2], ("KestrelDB", "foo bar"))
+        self.assertEqual(oai_res.kept_count, 50)
+        self.assertIn("<>", oai_res.dropped)
+        self.assertIsNone(oai_res.max_chars)
+        self.assertTrue(oai_res.truncated)
+
+        # 6. Single-hop vocabulary hints uses unified 100-term / 1,500-char budgeter
+        many_sh = [f"LongTechnicalIdentifier_{i:03d}" for i in range(80)]
+        vocab_xml = _format_vocabulary_hints(many_sh)
         self.assertTrue(vocab_xml.startswith('<vocabulary_hints read_only="true">\n'))
         body_line = vocab_xml.splitlines()[1]
-        self.assertLessEqual(len(body_line), 480)
+        self.assertLessEqual(len(body_line), SINGLE_HOP_HOTWORDS_MAX_CHARS)
+        self.assertGreater(len(body_line), 480)
         for tok in body_line.split(", "):
-            self.assertIn(tok, ds_terms)
+            self.assertIn(tok, many_sh)
         self.assertEqual(_format_vocabulary_hints([]), "")
+        self.assertEqual(SINGLE_HOP_HOTWORDS_MAX_ITEMS, STAGE2_HOTWORDS_MAX_ITEMS)
+        self.assertEqual(SINGLE_HOP_HOTWORDS_MAX_CHARS, STAGE2_HOTWORDS_MAX_CHARS)
 
-        # 6. OpenRouter STT unsupported vs keyterms
-        or_unsup = budget_hotwords_for_provider(["Alpha", "Beta"], "openrouter", model="qwen/qwen3-asr-1.7b")
-        self.assertEqual(or_unsup.kept, ())
-        self.assertEqual(or_unsup.dropped, ("Alpha", "Beta"))
-        self.assertIn("0/0 terms", format_budget_line(or_unsup))
+        # 7. OpenRouter STT unsupported (including deepgram/nova-3) vs verified keyterms models
+        for bad_or_model in ("qwen/qwen3-asr-1.7b", "deepgram/nova-3"):
+            or_unsup = budget_hotwords_for_provider(["Alpha", "Beta"], "openrouter", model=bad_or_model)
+            self.assertEqual(or_unsup.kept, ())
+            self.assertEqual(or_unsup.dropped, ("Alpha", "Beta"))
+            self.assertIn("0/0 terms", format_budget_line(or_unsup))
         or_unsup_empty = budget_hotwords_for_provider([], "openrouter", model="qwen/qwen3-asr-1.7b")
         self.assertIn("not passed by this route", format_budget_line(or_unsup_empty))
 
-        or_kt = budget_hotwords_for_provider([f"t{i}" for i in range(60)], "openrouter", model="deepgram/nova-3")
+        or_kt = budget_hotwords_for_provider(
+            ["z" * 101, *[f"t{i}" for i in range(60)]],
+            "openrouter",
+            model="microsoft/mai-transcribe-2",
+        )
         self.assertEqual(or_kt.kept_count, 50)
-        self.assertEqual(or_kt.dropped_count, 10)
+        self.assertIn("z" * 101, or_kt.dropped)
+        self.assertEqual(or_kt.dropped_count, 11)
 
-        # 7. Doubao corpus JSON delegates to unified budgeter
+        # 8. Doubao corpus JSON delegates to unified budgeter
         raw_corpus = _build_doubao_corpus_context(AsrContext(hotwords=["Alpha", "Beta"]))
         assert raw_corpus is not None
         self.assertEqual(json.loads(raw_corpus)["hotwords"], [{"word": "Alpha"}, {"word": "Beta"}])
@@ -990,7 +1084,7 @@ class HotwordsCliTests(unittest.TestCase):
             rc, out, err = self._run_cli(["hotwords", "list", "--config", str(cfg_path)], env)
             self.assertEqual(rc, 0, err)
             self.assertIn("not created yet", out)
-            self.assertIn("doubao (global): 0/30 terms, 0/180 chars", out)
+            self.assertIn("doubao (global): 0/50 terms, 0/500 chars", out)
 
             # 2. add to global and coding
             rc, out, err = self._run_cli(
@@ -999,7 +1093,7 @@ class HotwordsCliTests(unittest.TestCase):
             )
             self.assertEqual(rc, 0, err)
             self.assertIn("Added (2):   MyBrand, C#", out)
-            self.assertIn("doubao: 2/30 terms", out)
+            self.assertIn("doubao: 2/50 terms", out)
 
             rc, out, err = self._run_cli(
                 ["hotwords", "add", "KestrelRouter", "MyBrand", "--scope", "coding", "--config", str(cfg_path)],
@@ -1070,7 +1164,7 @@ class HotwordsCliTests(unittest.TestCase):
             self.assertEqual(rm_json["removed"], ["MyBrand"])
 
             # 5. Overflow truncation warning shown on Doubao
-            many = [f"OverTerm{i:02d}" for i in range(35)]
+            many = [f"OverTerm{i:02d}" for i in range(55)]
             rc, out, err = self._run_cli(
                 ["hotwords", "add", *many, "--scope", "coding", "--config", str(cfg_path)],
                 env,
@@ -1086,7 +1180,7 @@ class HotwordsCliTests(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("section header", err)
 
-            # 7. Default DashScope (qwen3-asr-flash) CLI quota matches 413-char DashScope route (NOT 480-char single-hop)
+            # 7. Default DashScope (qwen3-asr-flash) CLI quota matches 900-char DashScope route (NOT 1500-char single-hop)
             rc, out, err = self._run_cli(
                 ["hotwords", "list", "--asr", "dashscope", "--json", "--config", str(cfg_path)],
                 {**env, "DASHSCOPE_API_KEY": "sk-dummy-dashscope"},
@@ -1094,7 +1188,7 @@ class HotwordsCliTests(unittest.TestCase):
             self.assertEqual(rc, 0, err)
             ds_json = json.loads(out)
             self.assertEqual(ds_json["budgets"]["active"]["reference"]["spec_key"], "dashscope")
-            self.assertEqual(ds_json["budgets"]["active"]["reference"]["max_chars"], 413)
+            self.assertEqual(ds_json["budgets"]["active"]["reference"]["max_chars"], 900)
 
             rc, out, err = self._run_cli(
                 [
@@ -1113,7 +1207,7 @@ class HotwordsCliTests(unittest.TestCase):
             self.assertEqual(rc, 0, err)
             omni_json = json.loads(out)
             self.assertEqual(omni_json["budgets"]["active"]["reference"]["spec_key"], "single_hop")
-            self.assertEqual(omni_json["budgets"]["active"]["reference"]["max_chars"], 480)
+            self.assertEqual(omni_json["budgets"]["active"]["reference"]["max_chars"], 1500)
 
             # 8. Empty hotwords_file in config returns exit code 2
             empty_cfg = tmp / "empty_hw.toml"
@@ -1265,6 +1359,387 @@ class HotwordsCliTests(unittest.TestCase):
                 _run(["hotwords", "list", "--json", "--config", cjk_cfg_path_b]).stdout.decode("utf-8")
             )
             self.assertNotIn("豆包", list_after["scopes"]["global"])
+
+
+class HotwordsAliasesAndStage2Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        clear_hotwords_cache()
+
+    def tearDown(self) -> None:
+        clear_hotwords_cache()
+
+    def test_alias_syntax_parsing_guardrails_and_stage1_isolation(self) -> None:
+        raw = (
+            "\ufeff# Header comment\r\n"
+            "Harness <- 哈尼斯, 哈尼思  # ASR mishearings\r\n"
+            "harness <- 哈尼丝，哈妮丝, 哈, harness, 哈尼斯, 哈尼五, 哈尼六, 哈尼七\r\n"
+            "<- OrphanAliasShouldBeIgnored\r\n"
+            "EmptyRight <-   \r\n"
+            "BadNested <- 正常别名, foo <- bar\r\n"
+            "\r\n"
+            "[chat]\r\n"
+            "豆包 <- 兜包，斗包\r\n"
+            "CrossRef <- 豆包, 跨段别名\r\n"
+            "\r\n"
+            "[coding]\r\n"
+            "Ghostty\r\n"
+            "Harness <- 哈尼高优\r\n"
+        )
+        table = parse_hotwords_text(raw)
+
+        # Stage 1 canonical terms NEVER leak any mishearing aliases
+        self.assertEqual(table.global_terms, ("Harness", "EmptyRight", "BadNested"))
+        self.assertEqual(table.chat_terms, ("豆包", "CrossRef"))
+        self.assertEqual(table.coding_terms, ("Ghostty", "Harness"))
+        self.assertEqual(table.merged_for_scene("coding"), ["Ghostty", "Harness", "EmptyRight", "BadNested"])
+        self.assertEqual(table.merged_for_scene("chat"), ["豆包", "CrossRef", "Harness", "EmptyRight", "BadNested"])
+
+        # Parsed entries enforce <=5 aliases, drop single-char, self, nested '<-', and cross-section canonical collisions
+        g_entries = table.entries_for_scope("global")
+        self.assertEqual(
+            g_entries[0],
+            HotwordEntry("Harness", ("哈尼斯", "哈尼思", "哈尼丝", "哈妮丝", "哈尼五")),
+        )
+        self.assertEqual(len(g_entries[0].aliases), MAX_HOTWORD_ALIASES)
+        self.assertEqual(g_entries[1], HotwordEntry("EmptyRight", ()))
+        self.assertEqual(g_entries[2], HotwordEntry("BadNested", ("正常别名",)))
+
+        c_entries = table.entries_for_scope("chat")
+        self.assertEqual(c_entries[0], HotwordEntry("豆包", ("兜包", "斗包")))
+        # '豆包' in CrossRef's aliases collides with canonical '豆包' -> stripped automatically!
+        self.assertEqual(c_entries[1], HotwordEntry("CrossRef", ("跨段别名",)))
+
+        entries_dict = table.as_entries_dict()
+        self.assertEqual(entries_dict["chat"][0], {"term": "豆包", "aliases": ["兜包", "斗包"]})
+        self.assertEqual(HotwordEntry("Ghostty").format_line(), "Ghostty")
+        self.assertEqual(HotwordEntry("Harness", ("哈尼斯", "哈尼思")).format_line(), "Harness <- 哈尼斯, 哈尼思")
+
+        # Manual HotwordsTable constructed with only *_terms still supports entries_for_scope fallback
+        legacy_table = HotwordsTable(global_terms=("SoloGlobal",), chat_terms=("SoloChat",), coding_terms=("SoloCode",))
+        self.assertEqual(legacy_table.entries_for_scope("global"), (HotwordEntry("SoloGlobal"),))
+        self.assertEqual(legacy_table.entries_for_scope("chat"), (HotwordEntry("SoloChat"),))
+        self.assertEqual(legacy_table.entries_for_scope("coding"), (HotwordEntry("SoloCode"),))
+
+    def test_alias_validation_add_inplace_merge_warnings_and_remove(self) -> None:
+        # Direct validator checks
+        self.assertEqual(validate_hotword_alias("  哈尼斯  "), "哈尼斯")
+        for bad_term in ("Harness <- 哈尼斯",):
+            with self.assertRaises(ValueError):
+                validate_hotword_term(bad_term)
+        for bad_alias in (
+            123,
+            "",
+            "   ",
+            "哈",  # single char rejected
+            "a",  # single char rejected
+            "foo\nbar",
+            "foo\u2028bar",
+            "foo,bar",
+            "foo，bar",
+            "foo <- bar",
+            "#comment",
+            "foo # comment",
+        ):
+            with self.assertRaises(ValueError, msg=f"expected ValueError for alias {bad_alias!r}"):
+                validate_hotword_alias(bad_alias)  # type: ignore[arg-type]
+
+        # validate_hotword_aliases: splitting, dedupe, 2-char warning, >5 & conflict rejections
+        clean, warns = validate_hotword_aliases("Harness", ["哈尼, 哈尼斯，哈尼"])
+        self.assertEqual(clean, ("哈尼", "哈尼斯"))
+        self.assertEqual(len(warns), 1)
+        self.assertIn("哈尼", warns[0])
+
+        for bad_batch in (
+            [123],  # type: ignore[list-item]
+            ["ok\nnewline"],
+            ["哈尼斯, "],
+            [", 哈尼斯"],
+            ["Harness"],  # self-conflict
+            ["harness"],  # self-conflict CI
+            ["ExistingCanon"],  # conflicts with existing_canonical_lows
+            ["a1", "a2", "a3", "a4", "a5", "a6"],  # >5 aliases
+        ):
+            with self.assertRaises(ValueError, msg=f"expected ValueError for batch {bad_batch!r}"):
+                validate_hotword_aliases(
+                    "Harness",
+                    bad_batch,  # type: ignore[arg-type]
+                    existing_canonical_lows={"existingcanon"},
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            hw_path = Path(td) / "hotwords.txt"
+
+            # Aliases rejected when adding 0 or >1 terms
+            with self.assertRaises(ValueError):
+                add_hotwords(hw_path, [], scope="global", aliases=["哈尼斯"])
+            with self.assertRaises(ValueError):
+                add_hotwords(hw_path, ["TermA", "TermB"], scope="global", aliases=["哈尼斯"])
+            self.assertFalse(hw_path.exists())
+
+            # Add fresh entry with aliases (including a 2-char alias warning)
+            r1 = add_hotword(hw_path, "Harness", scope="global", aliases=["哈尼, 哈尼斯"])
+            self.assertTrue(r1.changed)
+            self.assertEqual(r1.added, ("Harness",))
+            self.assertEqual(r1.aliases_added, ("哈尼", "哈尼斯"))
+            self.assertEqual(len(r1.warnings), 1)
+            self.assertEqual(hw_path.read_text(encoding="utf-8"), "[global]\nHarness <- 哈尼, 哈尼斯\n")
+            self.assertEqual(load_hotwords_file(hw_path, scene="global"), ["Harness"])
+
+            # In-place merge into [global] with another entry before it (verifies non-matching lines stay untouched)
+            hw_path.write_bytes(
+                b"\xef\xbb\xbf# Top comment\r\n"
+                b"[global]\r\n"
+                b"FirstUnchanged\r\n"
+                b"  Harness <- " + "哈尼斯".encode("utf-8") + b"  # keep note\r\n"
+                b"\r\n"
+                b"[chat]\r\n"
+                + "豆包".encode("utf-8") + b"\r\n"
+                b"\r\n"
+                b"[coding]\r\n"
+                b"Harness\r\n"
+            )
+
+            # In-place merge into [global] preserves casing, indent, inline comment, BOM, CRLF, and leaves [coding] alone
+            r2 = add_hotwords(hw_path, ["harness"], scope="global", aliases=["哈尼思，哈尼斯"])
+            self.assertTrue(r2.changed)
+            self.assertEqual(r2.added, ())
+            self.assertEqual(r2.updated, ("Harness",))
+            self.assertEqual(r2.aliases_added, ("哈尼思",))
+            self.assertEqual(
+                hw_path.read_bytes(),
+                b"\xef\xbb\xbf# Top comment\r\n"
+                b"[global]\r\n"
+                b"FirstUnchanged\r\n"
+                b"  Harness <- " + "哈尼斯, 哈尼思".encode("utf-8") + b"  # keep note\r\n"
+                b"\r\n"
+                b"[chat]\r\n"
+                + "豆包".encode("utf-8") + b"\r\n"
+                b"\r\n"
+                b"[coding]\r\n"
+                b"Harness\r\n",
+            )
+
+            # Adding already-present alias is a no-op skip (still reports 2-char warning if passed)
+            r_dup = add_hotword(hw_path, "Harness", scope="global", aliases=["哈尼斯"])
+            self.assertFalse(r_dup.changed)
+            self.assertEqual(r_dup.skipped, ("Harness",))
+
+            # In-place merge into [coding] upgrades plain line to alias line without touching [global]
+            r_code = add_hotword(hw_path, "Harness", scope="coding", aliases=["哈尼码"])
+            self.assertTrue(r_code.changed)
+            self.assertEqual(r_code.updated, ("Harness",))
+            self.assertIn(b"[coding]\r\nHarness <- " + "哈尼码".encode("utf-8") + b"\r\n", hw_path.read_bytes())
+
+            # Exceeding 5 aliases on in-place merge is rejected cleanly
+            with self.assertRaises(ValueError):
+                add_hotword(hw_path, "Harness", scope="global", aliases=["别1", "别2", "别3", "别4"])
+
+            # Alias colliding with canonical term in another scope ([chat] 豆包) is rejected
+            with self.assertRaises(ValueError):
+                add_hotword(hw_path, "Harness", scope="global", aliases=["豆包"])
+
+            # Reverse collision: adding a canonical term that already exists as an alias is rejected
+            with self.assertRaises(ValueError):
+                add_hotword(hw_path, "哈尼斯", scope="chat")
+            with self.assertRaises(ValueError):
+                add_hotword(hw_path, "哈尼斯", scope="chat", aliases=["新别名"])
+
+            # remove_hotword removes whole alias line by canonical term (CI) and reports canonical term only
+            rm_miss = remove_hotword(hw_path, "NoSuchEntry", scope="global")
+            self.assertFalse(rm_miss.changed)
+            self.assertEqual(rm_miss.not_found, ("NoSuchEntry",))
+
+            rm = remove_hotword(hw_path, "harness", scope="global")
+            self.assertTrue(rm.changed)
+            self.assertEqual(rm.removed, ("Harness",))
+            self.assertEqual(load_hotwords_table(hw_path, use_cache=False).global_terms, ("FirstUnchanged",))
+            self.assertEqual(load_hotwords_table(hw_path, use_cache=False).coding_terms, ("Harness",))
+
+            # Direct entry-sequence merging handles blank terms and self/duplicate aliases safely
+            raw_tbl = HotwordsTable(
+                global_entries=(
+                    HotwordEntry("   "),
+                    HotwordEntry("Harness", ("哈尼斯", "harness", "哈尼斯")),
+                )
+            )
+            self.assertEqual(
+                raw_tbl.merged_entries_for_scopes(("global",)),
+                [HotwordEntry("Harness", ("哈尼斯",))],
+            )
+
+    def test_bad_encoding_detection_cache_and_strict_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            samples = (
+                ("utf32le.txt", b"\xff\xfe\x00\x00A\x00\x00\x00", "UTF-32 LE"),
+                ("utf32be.txt", b"\x00\x00\xfe\xff\x00\x00\x00A", "UTF-32 BE"),
+                ("utf16le.txt", b"\xff\xfeA\x00", "UTF-16 LE"),
+                ("utf16be.txt", b"\xfe\xff\x00A", "UTF-16 BE"),
+                ("nul.txt", b"Alpha\x00Beta", "NUL byte"),
+                ("gbk.txt", "豆包".encode("gbk"), "invalid UTF-8"),
+            )
+            for fname, payload, expected_hint in samples:
+                p = tmp / fname
+                p.write_bytes(payload)
+                err_buf = io.StringIO()
+                with contextlib.redirect_stderr(err_buf):
+                    tbl = load_hotwords_table(p, use_cache=True)
+                self.assertTrue(tbl.exists)
+                self.assertIn(expected_hint, tbl.encoding_error)
+                self.assertIn("WARN:", err_buf.getvalue())
+
+                # Second cached read does not emit duplicate warning and raises under strict_encoding=True
+                err_buf2 = io.StringIO()
+                with contextlib.redirect_stderr(err_buf2):
+                    tbl2 = load_hotwords_table(p, use_cache=True)
+                self.assertEqual(err_buf2.getvalue(), "")
+                self.assertEqual(tbl2.encoding_error, tbl.encoding_error)
+                with self.assertRaises(ConfigError):
+                    load_hotwords_table(p, use_cache=True, strict_encoding=True)
+                with self.assertRaises(ConfigError):
+                    load_hotwords_table(p, use_cache=False, strict_encoding=True)
+                with self.assertRaises(ConfigError):
+                    add_hotword(p, "SafeTerm", scope="global")
+
+    def test_stage2_selection_budgeting_xml_hints_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            hw_path = Path(td) / "hotwords.txt"
+            hw_path.write_text(
+                "[global]\n"
+                "Harness <- 哈尼斯, 哈尼思\n"
+                "Ghostty\n"
+                "SharedTerm <- 全局别名, 共享别名\n"
+                "\n"
+                "[chat]\n"
+                "豆包 <- 兜包\n"
+                "SharedTerm <- 聊天别名\n"
+                "\n"
+                "[coding]\n"
+                "KestrelDB <- 凯斯特\n"
+                "SharedTerm <- 编码别名1, 编码别名2, 编码别名3, 编码别名4\n",
+                encoding="utf-8",
+            )
+
+            # None / invalid mode checks
+            self.assertEqual(select_stage2_manual_entries(None, mode="general"), [])
+            with self.assertRaises(ValueError):
+                select_stage2_manual_entries(hw_path, mode="bogus")
+
+            # mode="agent": [coding] -> [global], merging deduplicated aliases (capped at 5)
+            agent_entries = select_stage2_manual_entries(hw_path, mode="agent")
+            self.assertEqual(
+                [e.term for e in agent_entries],
+                ["KestrelDB", "SharedTerm", "Harness", "Ghostty"],
+            )
+            self.assertEqual(
+                agent_entries[1].aliases,
+                ("编码别名1", "编码别名2", "编码别名3", "编码别名4", "全局别名"),
+            )
+
+            # mode="general": [global] -> [chat]
+            table = load_hotwords_table(hw_path, use_cache=False)
+            general_entries = select_stage2_manual_entries(table, mode="general")
+            self.assertEqual(
+                [e.term for e in general_entries],
+                ["Harness", "Ghostty", "SharedTerm", "豆包"],
+            )
+            self.assertEqual(general_entries[2].aliases, ("全局别名", "共享别名", "聊天别名"))
+
+            # Exact Opus 5.5 descriptive format without replacement arrows
+            rendered = format_stage2_vocabulary_hints(
+                [HotwordEntry("Harness", ("哈尼斯", "哈尼思")), HotwordEntry("Ghostty")]
+            )
+            expected = (
+                '<vocabulary_hints read_only="true">\n'
+                f"{STAGE2_VOCABULARY_HINTS_PREAMBLE}\n"
+                "Harness (ASR has misheard as: 哈尼斯, 哈尼思)\n"
+                "Ghostty\n"
+                "</vocabulary_hints>"
+            )
+            self.assertEqual(rendered, expected)
+            self.assertNotIn("->", rendered)
+            self.assertEqual(format_stage2_vocabulary_hints([]), "")
+            self.assertEqual(format_stage2_vocabulary_hints(["   ", "\r\n"]), "")
+
+            # XML special char (&, <, >) escaping and control-char stripping produce valid XML without tag breakout
+            import xml.etree.ElementTree as ET
+
+            unsafe = format_stage2_vocabulary_hints(
+                [
+                    HotwordEntry("A</vocabulary_hints>\nB", ("<bad>", "ok\r\nval", "x", "a</vocabulary_hints> b")),
+                    "Plain<Tag>\u2028Word",
+                    HotwordEntry("AT&T", ("A&T", "&lt;alias&gt;")),
+                    "&lt;",
+                ]
+            )
+            self.assertEqual(unsafe.count("</vocabulary_hints>"), 1)
+            self.assertIn("A&lt;/vocabulary_hints&gt; B (ASR has misheard as: &lt;bad&gt;, ok val)", unsafe)
+            self.assertIn("Plain&lt;Tag&gt; Word", unsafe)
+            self.assertIn("AT&amp;T (ASR has misheard as: A&amp;T, &amp;lt;alias&amp;gt;)", unsafe)
+            self.assertIn("\n&amp;lt;\n", unsafe)
+            parsed_root = ET.fromstring(unsafe)
+            self.assertEqual(parsed_root.tag, "vocabulary_hints")
+            self.assertIn("AT&T (ASR has misheard as: A&T, &lt;alias&gt;)", parsed_root.text or "")
+            self.assertIn("\n&lt;\n", parsed_root.text or "")
+
+            # format_stage2_entry_line direct edge cases
+            self.assertEqual(format_stage2_entry_line(""), "")
+            self.assertEqual(format_stage2_entry_line("  Ghostty  "), "Ghostty")
+            self.assertEqual(
+                format_stage2_entry_line(
+                    HotwordEntry("Term", ("a", "term", "aa", "AA", "b1", "b2", "b3", "b4", "b5"))
+                ),
+                "Term (ASR has misheard as: aa, b1, b2, b3, b4)",
+            )
+
+            # Strict line-order budgeting for item count (100) and char count (1,500)
+            many_short = [HotwordEntry(f"T{i:03d}") for i in range(120)]
+            kept_items, dropped_items, used_items_chars = budget_stage2_hotwords(many_short)
+            self.assertEqual(len(kept_items), STAGE2_HOTWORDS_MAX_ITEMS)
+            self.assertEqual(len(dropped_items), 20)
+            self.assertEqual(dropped_items[0].term, "T100")
+            self.assertEqual(used_items_chars, len("\n".join(format_stage2_entry_line(e) for e in kept_items)))
+
+            # Char truncation stops strictly in line order (a short later entry cannot leapfrog a dropped earlier entry)
+            char_entries = [
+                HotwordEntry("FirstTerm", ("别名一", "别名二")),
+                HotwordEntry("VeryLongMiddleTerm_" + ("X" * 40)),
+                HotwordEntry("ShortTail"),
+            ]
+            line0 = format_stage2_entry_line(char_entries[0])
+            kept_c, dropped_c, used_c = budget_stage2_hotwords(char_entries, max_chars=len(line0) + 10)
+            self.assertEqual(kept_c, [char_entries[0]])
+            self.assertEqual(dropped_c, [char_entries[1], char_entries[2]])
+            self.assertEqual(used_c, len(line0))
+            self.assertLessEqual(used_c, len(line0) + 10)
+
+            # Zero budget drops all cleanly
+            kept_z, dropped_z, used_z = budget_stage2_hotwords(char_entries, max_items=0)
+            self.assertEqual(kept_z, [])
+            self.assertEqual(len(dropped_z), 3)
+            self.assertEqual(used_z, 0)
+
+            # Read-only Stage 2 budget summary helper (from Path, Table, None) + compact line formatting
+            sum_path = summarize_stage2_hotwords_budgets(hw_path)
+            self.assertFalse(sum_path["agent"].truncated)
+            self.assertEqual(sum_path["agent"].scopes, ("coding", "global"))
+            self.assertEqual(sum_path["general"].scopes, ("global", "chat"))
+            self.assertEqual(sum_path["agent"].kept_count, 4)
+            self.assertEqual(sum_path["general"].kept_count, 4)
+            self.assertIn("[OK]", format_stage2_budget_line(sum_path["agent"]))
+            self.assertEqual(sum_path["agent"].as_dict()["mode"], "agent")
+
+            sum_none = summarize_stage2_hotwords_budgets(None)
+            self.assertEqual(sum_none["agent"].total_input, 0)
+            self.assertEqual(sum_none["general"].total_input, 0)
+
+            big_table = HotwordsTable(global_terms=tuple(f"Word{i:03d}" for i in range(12)))
+            sum_trunc = summarize_stage2_hotwords_budgets(big_table, max_items=5)
+            self.assertTrue(sum_trunc["agent"].truncated)
+            self.assertEqual(sum_trunc["agent"].dropped_count, 7)
+            line_trunc = format_stage2_budget_line(sum_trunc["agent"])
+            self.assertIn("TRUNCATED", line_trunc)
+            self.assertIn("+2 more", line_trunc)
 
 
 if __name__ == "__main__":

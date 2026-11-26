@@ -559,8 +559,16 @@ class FullPipelineLoopbackE2ETests(unittest.TestCase):
                 for m in s2_req["input"]
                 if m.get("role") == "developer"
             ]
-            self.assertGreaterEqual(len(dev_blocks), 2, f"expected >=2 50K developer context blocks, got {len(dev_blocks)}")
-            self.assertTrue(all("<session_reference_log" in b for b in dev_blocks))
+            self.assertGreaterEqual(
+                len(dev_blocks),
+                3,
+                f"expected leading <vocabulary_hints> + >=2 50K developer context blocks, got {len(dev_blocks)}",
+            )
+            self.assertIn("<vocabulary_hints", dev_blocks[0])
+            self.assertIn("KVCacheScheduler", dev_blocks[0])
+            self.assertIn("OpenTelemetry", dev_blocks[0])
+            self.assertNotIn("ChatOnlyTermNotForCoding", dev_blocks[0])
+            self.assertTrue(all("<session_reference_log" in b for b in dev_blocks[1:]))
             user_block = s2_req["input"][-1]["content"][0]["text"]
             self.assertIn("<workspace_git_status", user_block)
             self.assertIn("kv_cache_scheduler.py", user_block)

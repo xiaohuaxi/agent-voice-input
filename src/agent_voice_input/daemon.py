@@ -1531,17 +1531,19 @@ class VoiceInputDaemon:
                 return
             assert st.asr_res is not None
             if not _will_run_stage2_refiner(self.cfg, self.refiner, st.asr_res):
-                slot.stage2_ref_res = self.refiner.refine(
-                    st.asr_res,
-                    session_key=st.snap.session_key if st.snap else "",
-                    tracker=self.tracker,
-                    fallback_context=st.asr_ctx_dialog,
-                    is_cancelled=cancel_fn,
-                    cancel_token=task.cancel_token,
-                    mode=st.eff_mode,
-                    workspace_cwd=st.workspace_cwd,
-                    target_hint=st.target_hint,
-                )
+                refine_kw: dict[str, Any] = {
+                    "session_key": st.snap.session_key if st.snap else "",
+                    "tracker": self.tracker,
+                    "fallback_context": st.asr_ctx_dialog,
+                    "is_cancelled": cancel_fn,
+                    "cancel_token": task.cancel_token,
+                    "mode": st.eff_mode,
+                    "workspace_cwd": st.workspace_cwd,
+                    "target_hint": st.target_hint,
+                }
+                if st.vocabulary_hints:
+                    refine_kw["vocabulary_hints"] = st.vocabulary_hints
+                slot.stage2_ref_res = self.refiner.refine(st.asr_res, **refine_kw)
                 self._push_completed_stage1_slot(slot)
                 return
         except Exception as exc:
@@ -1607,17 +1609,19 @@ class VoiceInputDaemon:
         cancel_fn = lambda: self._stop_evt.is_set() or task.cancel_token.is_cancelled()
         try:
             assert st.asr_res is not None
-            slot.stage2_ref_res = self.refiner.refine(
-                st.asr_res,
-                session_key=st.snap.session_key if st.snap else "",
-                tracker=self.tracker,
-                fallback_context=st.asr_ctx_dialog,
-                is_cancelled=cancel_fn,
-                cancel_token=task.cancel_token,
-                mode=st.eff_mode,
-                workspace_cwd=st.workspace_cwd,
-                target_hint=st.target_hint,
-            )
+            refine_kw: dict[str, Any] = {
+                "session_key": st.snap.session_key if st.snap else "",
+                "tracker": self.tracker,
+                "fallback_context": st.asr_ctx_dialog,
+                "is_cancelled": cancel_fn,
+                "cancel_token": task.cancel_token,
+                "mode": st.eff_mode,
+                "workspace_cwd": st.workspace_cwd,
+                "target_hint": st.target_hint,
+            }
+            if st.vocabulary_hints:
+                refine_kw["vocabulary_hints"] = st.vocabulary_hints
+            slot.stage2_ref_res = self.refiner.refine(st.asr_res, **refine_kw)
         except Exception as exc:
             if not cancel_fn():
                 slot.exc = exc

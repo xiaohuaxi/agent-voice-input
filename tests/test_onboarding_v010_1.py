@@ -3092,6 +3092,268 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 self.assertEqual(cli_mod._cmd_start(parser.parse_args(["start"]), env_wsl, cfg=Config()), 0)
             self.assertEqual(err_warm.getvalue(), "")
 
+    def test_cli_hotwords_aliases_stage2_budget_and_agent_tips(self) -> None:
+        from agent_voice_input.hotwords import clear_hotwords_cache
+
+        def _run_cli(argv: list[str], env: dict[str, str]) -> tuple[int, str, str]:
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch("sys.stdout", out_buf),
+                mock.patch("sys.stderr", err_buf),
+            ):
+                rc = cli_mod.main(argv)
+            return rc, out_buf.getvalue(), err_buf.getvalue()
+
+        # 1. Help text mentions '<-' aliases & '--alias', and surrogate recovery handles '--alias'
+        parser = cli_mod._build_parser()
+        hw_help = io.StringIO()
+        with mock.patch("sys.stdout", hw_help):
+            with self.assertRaises(SystemExit) as cm_h1:
+                parser.parse_args(["hotwords", "--help"])
+        self.assertEqual(cm_h1.exception.code, 0)
+        self.assertIn("<-", hw_help.getvalue())
+        self.assertIn("--alias", hw_help.getvalue())
+
+        add_help = io.StringIO()
+        with mock.patch("sys.stdout", add_help):
+            with self.assertRaises(SystemExit) as cm_h2:
+                parser.parse_args(["hotwords", "add", "--help"])
+        self.assertEqual(cm_h2.exception.code, 0)
+        self.assertIn("--alias", add_help.getvalue())
+
+        surrogate_alias = "哈尼斯,哈尼思".encode("utf-8").decode("ascii", errors="surrogateescape")
+        surrogate_cfg = "/tmp/" + "中文路径".encode("utf-8").decode("ascii", errors="surrogateescape") + "/config.toml"
+        parsed_sur = parser.parse_args(
+            ["hotwords", "add", "Harness", "--alias", surrogate_alias, "--config", surrogate_cfg]
+        )
+        cli_mod._recover_parsed_text_args(parsed_sur)
+        self.assertEqual(parsed_sur.alias, ["哈尼斯,哈尼思"])
+        self.assertEqual(parsed_sur.config, surrogate_cfg)
+
+        clear_hotwords_cache()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                home = tmp / "home"
+                home.mkdir()
+                hw_path = tmp / "hotwords.txt"
+                cfg_path = tmp / "config.toml"
+                cfg_path.write_text(
+                    f'[asr]\nprovider = "doubao"\nhotwords_file = "{hw_path.as_posix()}"\n',
+                    encoding="utf-8",
+                )
+                env = {
+                    "HOME": str(home),
+                    "DOUBAO_SPEECH_API_KEY": "test-doubao-key",
+                }
+
+                # 2. Empty table list: text shows Stage 2 budget + copyable Agent tip; JSON keeps old fields + stage2_budget/entries
+                rc, out, err = _run_cli(["hotwords", "list", "--config", str(cfg_path)], env)
+                self.assertEqual(rc, 0, err)
+                self.assertIn("Stage 2 / Single-hop wide vocabulary budget", out)
+                self.assertIn("stage2 (agent: coding+global): 0/100 items, 0/1500 chars [OK]", out)
+                self.assertIn("stage2 (general: global+chat): 0/100 items, 0/1500 chars [OK]", out)
+                self.assertIn("Agent tip:", out)
+
+                rc, out, err = _run_cli(["hotwords", "list", "--json", "--config", str(cfg_path)], env)
+                self.assertEqual(rc, 0, err)
+                empty_js = json.loads(out)
+                self.assertFalse(empty_js["exists"])
+                self.assertEqual(empty_js["entries"], {"global": [], "chat": [], "coding": []})
+                self.assertEqual(empty_js["stage2_budget"]["agent"]["max_items"], 100)
+                self.assertEqual(empty_js["stage2_budget"]["agent"]["max_chars"], 1500)
+                self.assertEqual(empty_js["stage2_budget"]["general"]["scopes"], ["global", "chat"])
+                self.assertFalse(empty_js["stage2_budget"]["general"]["truncated"])
+
+                # 3. Fresh add with comma-separated & repeatable --alias
+                rc, out, err = _run_cli(
+                    [
+                        "hotwords",
+                        "add",
+                        "Harness",
+                        "--alias",
+                        "哈尼斯,哈尼思",
+                        "--alias",
+                        "哈尼丝",
+                        "--config",
+                        str(cfg_path),
+                    ],
+                    env,
+                )
+                self.assertEqual(rc, 0, err)
+                self.assertIn("Added (1):   Harness <- 哈尼斯, 哈尼思, 哈尼丝", out)
+                self.assertNotIn("Warning:", out)
+
+                # 4. In-place merge (text + JSON) & duplicate skip
+                rc, out, err = _run_cli(
+                    ["hotwords", "add", "harness", "--alias", "哈尼四", "--config", str(cfg_path)],
+                    env,
+                )
+                self.assertEqual(rc, 0, err)
+                self.assertIn("Updated (1): Harness (+aliases: 哈尼四)", out)
+
+                rc, out, err = _run_cli(
+                    [
+                        "hotwords",
+                        "add",
+                        "harness",
+                        "--alias",
+                        "哈尼五",
+                        "--json",
+                        "--config",
+                        str(cfg_path),
+                    ],
+                    env,
+                )
+                self.assertEqual(rc, 0, err)
+                upd_js = json.loads(out)
+                self.assertTrue(upd_js["changed"])
+                self.assertEqual(upd_js["added"], [])
+                self.assertEqual(upd_js["updated"], ["Harness"])
+                self.assertEqual(upd_js["aliases_added"], ["哈尼五"])
+                self.assertEqual(upd_js["warnings"], [])
+
+                rc, out, err = _run_cli(
+                    [
+                        "hotwords",
+                        "add",
+                        "Harness",
+                        "--alias",
+                        "哈尼斯",
+                        "--json",
+                        "--config",
+                        str(cfg_path),
+                    ],
+                    env,
+                )
+                self.assertEqual(rc, 0, err)
+                dup_js = json.loads(out)
+                self.assertFalse(dup_js["changed"])
+                self.assertEqual(dup_js["skipped"], ["Harness"])
+
+                # 5. 2-character alias emits non-blocking Warning in text & JSON
+                rc, out, err = _run_cli(
+                    [
+                        "hotwords",
+                        "add",
+                        "豆包",
+                        "--scope",
+                        "chat",
+                        "--alias",
+                        "兜包",
+                        "--config",
+                        str(cfg_path),
+                    ],
+                    env,
+                )
+                self.assertEqual(rc, 0, err)
+                self.assertIn("Added (1):   豆包 <- 兜包", out)
+                self.assertIn("Warning:", out)
+                self.assertIn("兜包", out)
+
+                rc, out, err = _run_cli(
+                    [
+                        "hotwords",
+                        "add",
+                        "GrokBot",
+                        "--scope",
+                        "chat",
+                        "--alias",
+                        "格克",
+                        "--json",
+                        "--config",
+                        str(cfg_path),
+                    ],
+                    env,
+                )
+                self.assertEqual(rc, 0, err)
+                warn_js = json.loads(out)
+                self.assertEqual(warn_js["added"], ["GrokBot"])
+                self.assertEqual(warn_js["aliases_added"], ["格克"])
+                self.assertEqual(len(warn_js["warnings"]), 1)
+                self.assertIn("格克", warn_js["warnings"][0])
+
+                # 6. Guardrail rejections return exit code 2
+                for bad_argv, expected_err in (
+                    (
+                        ["hotwords", "add", "TermA", "TermB", "--alias", "误识词", "--config", str(cfg_path)],
+                        "--alias can only be used",
+                    ),
+                    (
+                        ["hotwords", "add", "SingleChar", "--alias", "哈", "--config", str(cfg_path)],
+                        "too short",
+                    ),
+                    (
+                        ["hotwords", "add", "OtherTerm", "--alias", "Harness", "--config", str(cfg_path)],
+                        "conflicts with an existing canonical hotword",
+                    ),
+                    (
+                        ["hotwords", "add", "哈尼斯", "--config", str(cfg_path)],
+                        "conflicts with existing mishearing alias",
+                    ),
+                    (
+                        ["hotwords", "add", "Harness", "--alias", "哈尼六", "--config", str(cfg_path)],
+                        "exceeds maximum of 5",
+                    ),
+                ):
+                    rc, _out, err = _run_cli(bad_argv, env)
+                    self.assertEqual(rc, 2, f"argv={bad_argv!r} stderr={err!r}")
+                    self.assertIn(expected_err, err)
+
+                # 7. Populated list: renders 'Term <- alias1, ...', Stage 2 budget, concise tip, and JSON entries/stage2_budget
+                rc, out, err = _run_cli(["hotwords", "list", "--config", str(cfg_path)], env)
+                self.assertEqual(rc, 0, err)
+                self.assertIn("Harness <- 哈尼斯, 哈尼思, 哈尼丝, 哈尼四, 哈尼五", out)
+                self.assertIn("豆包 <- 兜包", out)
+                self.assertIn("stage2 (agent: coding+global): 1/100 items,", out)
+                self.assertIn("stage2 (general: global+chat): 3/100 items,", out)
+                self.assertNotIn("Agent tip:", out)
+                self.assertIn("README -> Hotwords", out)
+
+                rc, out, err = _run_cli(["hotwords", "list", "--json", "--config", str(cfg_path)], env)
+                self.assertEqual(rc, 0, err)
+                pop_js = json.loads(out)
+                self.assertEqual(pop_js["scopes"]["global"], ["Harness"])
+                self.assertEqual(
+                    pop_js["entries"]["global"],
+                    [{"term": "Harness", "aliases": ["哈尼斯", "哈尼思", "哈尼丝", "哈尼四", "哈尼五"]}],
+                )
+                self.assertEqual(pop_js["stage2_budget"]["agent"]["kept_count"], 1)
+                self.assertEqual(pop_js["stage2_budget"]["general"]["kept_count"], 3)
+                self.assertIn("budgets", pop_js)
+                self.assertIn("mounted", pop_js)
+
+                # Scoped JSON list filters entries alongside scopes while keeping both stage2_budget modes
+                rc, out, err = _run_cli(
+                    ["hotwords", "list", "--scope", "chat", "--json", "--config", str(cfg_path)],
+                    env,
+                )
+                self.assertEqual(rc, 0, err)
+                chat_js = json.loads(out)
+                self.assertEqual(list(chat_js["entries"].keys()), ["chat"])
+                self.assertEqual(set(chat_js["stage2_budget"].keys()), {"agent", "general"})
+
+                # 8. Stage 2 truncation surfaces in both text and JSON when >100 items
+                overflow_terms = [f"Stage2Term{i:03d}" for i in range(105)]
+                rc, _out, err = _run_cli(
+                    ["hotwords", "add", *overflow_terms, "--scope", "coding", "--config", str(cfg_path)],
+                    env,
+                )
+                self.assertEqual(rc, 0, err)
+                rc, out, err = _run_cli(["hotwords", "list", "--config", str(cfg_path)], env)
+                self.assertEqual(rc, 0, err)
+                self.assertIn("stage2 (agent: coding+global): 100/100 items,", out)
+                self.assertIn("[TRUNCATED: 6 dropped:", out)
+
+                rc, out, err = _run_cli(["hotwords", "list", "--json", "--config", str(cfg_path)], env)
+                self.assertEqual(rc, 0, err)
+                trunc_js = json.loads(out)
+                self.assertTrue(trunc_js["stage2_budget"]["agent"]["truncated"])
+                self.assertEqual(trunc_js["stage2_budget"]["agent"]["dropped_count"], 6)
+        finally:
+            clear_hotwords_cache()
+
 
 if __name__ == "__main__":
     unittest.main()

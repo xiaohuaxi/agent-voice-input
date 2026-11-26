@@ -297,8 +297,8 @@ class AsrProvidersTests(unittest.TestCase):
 
         req_json = json.loads(submit_call[4].decode("utf-8"))
         corpus_ctx = json.loads(req_json["request"]["corpus"]["context"])
-        self.assertLessEqual(len(corpus_ctx["hotwords"]), 30)
-        self.assertLessEqual(sum(len(w["word"]) for w in corpus_ctx["hotwords"]), 180)
+        self.assertLessEqual(len(corpus_ctx["hotwords"]), 50)
+        self.assertLessEqual(sum(len(w["word"]) for w in corpus_ctx["hotwords"]), 500)
         self.assertLessEqual(len(corpus_ctx["context_data"][0]["text"]), 600)
         self.assertTrue(corpus_ctx["context_data"][0]["text"].endswith("尾部核心对话内容保留"))
 
@@ -998,8 +998,13 @@ class AsrProvidersTests(unittest.TestCase):
             self.assertNotIn("keyterms", payload)
             self.assertNotIn("reasoning", payload)
 
-        # 2. Known keyterms-capable upstream STT families (deepgram/*, assemblyai/*) receive keyterms
-        for kt_model in ("deepgram/nova-3", "assemblyai/universal-3-6-pro"):
+        # 2. Verified keyterms-capable upstream STT families receive keyterms; deepgram/nova-3 is excluded (HTTP 400 on OpenRouter)
+        for kt_model in (
+            "microsoft/mai-transcribe-2",
+            "openai/gpt-transcribe",
+            "x-ai/grok-stt-2.0",
+            "assemblyai/universal-3-6-pro",
+        ):
             captured.clear()
             cfg_kt = Config()
             cfg_kt.asr.provider = "openrouter"
@@ -1009,6 +1014,16 @@ class AsrProvidersTests(unittest.TestCase):
             payload_kt = json.loads(captured[0].body.decode("utf-8"))
             self.assertEqual(payload_kt["keyterms"], ["openrouter", "qwen3-asr-1.7b"])
             self.assertNotIn("prompt", payload_kt)
+
+        captured.clear()
+        cfg_dg = Config()
+        cfg_dg.asr.provider = "openrouter"
+        cfg_dg.asr.model = "deepgram/nova-3"
+        cfg_dg.asr.hotwords_file = ""
+        transcribe(_sample_wav(), cfg_dg, env=env, context=ctx, transport=or_transport)
+        payload_dg = json.loads(captured[0].body.decode("utf-8"))
+        self.assertNotIn("keyterms", payload_dg)
+        self.assertNotIn("prompt", payload_dg)
 
     def test_chat_audio_asr_provider_anti_hijacking_sandwich_and_effort_matrix(self) -> None:
         captured: list[HttpRequest] = []
@@ -3978,9 +3993,8 @@ class SessionCtxTests(unittest.TestCase):
             "refiner",
             "session_ctx.py",
             "session_ctx",
-            "a" * 58,
-            "b" * 58,
-            "c" * 58,  # 7+11+58+58 = 134; +58 = 192 > 180 -> skipped via continue!
+            *[f"{chr(ord('a') + i)}" * 58 for i in range(8)],  # 7+11+8*58 = 482 <= 500
+            "z" * 58,  # 482 + 58 = 540 > 500 -> skipped via continue!
             "Codex",
             "Luna",
         ]
@@ -3988,13 +4002,13 @@ class SessionCtxTests(unittest.TestCase):
         assert raw_corpus is not None
         parsed_db = json.loads(raw_corpus)
         picked_db = [item["word"] for item in parsed_db["hotwords"]]
-        self.assertLessEqual(len(picked_db), 30)
-        self.assertLessEqual(sum(len(w) for w in picked_db), 180)
+        self.assertLessEqual(len(picked_db), 50)
+        self.assertLessEqual(sum(len(w) for w in picked_db), 500)
         self.assertIn("refiner", picked_db)
         self.assertNotIn("refiner.py", picked_db)
         self.assertIn("session_ctx", picked_db)
         self.assertNotIn("session_ctx.py", picked_db)
-        self.assertNotIn("c" * 58, picked_db)
+        self.assertNotIn("z" * 58, picked_db)
         self.assertIn("Codex", picked_db)
         self.assertIn("Luna", picked_db)
 
@@ -4779,6 +4793,360 @@ class SessionCtxTests(unittest.TestCase):
         self.assertEqual(bad_out.used_fallback, "asr_draft")
         self.assertEqual(bad_out.text, "原始草稿")
         self.assertNotIn(secret, bad_out.warning)
+
+    def test_openai_gpt_transcribe_keywords_and_dashscope_900_budget(self) -> None:
+        from agent_voice_input.asr_providers import _compose_context_text
+
+        oai_reqs: list[HttpRequest] = []
+
+        def oai_tx(req: HttpRequest) -> HttpResponse:
+            oai_reqs.append(req)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"text": "ok"}).encode("utf-8"),
+            )
+
+        oai_env = {"OPENAI_API_KEY": "sk-oai-kw-" + ("x" * 16)}
+        raw_hotwords = [
+            "<KestrelDB>",
+            "kestreldb",
+            "foo\r\nbar",
+            "<>",
+            *[f"Term_{i:02d}" for i in range(60)],
+        ]
+
+        # 1. gpt-transcribe & gpt-transcribe-* send repeated keywords[] (sanitized, <=50),
+        #    with prompt containing only dialog/git context (omitted when no dialog/git)
+        for model_name in ("gpt-transcribe", "gpt-transcribe-2026-01"):
+            oai_reqs.clear()
+            cfg = Config()
+            cfg.asr.provider = "openai"
+            cfg.asr.model = model_name
+            cfg.asr.hotwords_file = ""
+
+            transcribe(
+                _sample_wav(),
+                cfg,
+                env=oai_env,
+                context=AsrContext(hotwords=raw_hotwords),
+                transport=oai_tx,
+            )
+            body_no_ctx = oai_reqs[-1].body.decode("utf-8", errors="ignore")
+            kw_parts = [
+                seg.split("\r\n--", 1)[0]
+                for seg in body_no_ctx.split('name="keywords[]"\r\n\r\n')[1:]
+            ]
+            self.assertEqual(len(kw_parts), 50)
+            self.assertEqual(kw_parts[:2], ["KestrelDB", "foo bar"])
+            self.assertNotIn("<>", kw_parts)
+            self.assertTrue(all("<" not in kw and ">" not in kw and "\n" not in kw for kw in kw_parts))
+            self.assertNotIn('name="prompt"\r\n\r\n', body_no_ctx)
+
+            transcribe(
+                _sample_wav(),
+                cfg,
+                env=oai_env,
+                context=AsrContext(hotwords=raw_hotwords, dialog_text="[User]\n检查 Zephyrus 分支"),
+                transport=oai_tx,
+            )
+            body_with_ctx = oai_reqs[-1].body.decode("utf-8", errors="ignore")
+            self.assertIn('name="keywords[]"\r\n\r\nKestrelDB', body_with_ctx)
+            self.assertIn('name="prompt"\r\n\r\n', body_with_ctx)
+            prompt_val = body_with_ctx.split('name="prompt"\r\n\r\n', 1)[1].split("\r\n--", 1)[0]
+            self.assertIn("检查 Zephyrus 分支", prompt_val)
+            self.assertNotIn("常用技术术语：", prompt_val)
+
+        # 2. Legacy whisper-1 & gpt-4o-transcribe keep prompt-based hotwords without keywords[]
+        for legacy_model in ("whisper-1", "gpt-4o-transcribe"):
+            oai_reqs.clear()
+            cfg_leg = Config()
+            cfg_leg.asr.provider = "openai"
+            cfg_leg.asr.model = legacy_model
+            cfg_leg.asr.hotwords_file = ""
+            transcribe(
+                _sample_wav(),
+                cfg_leg,
+                env=oai_env,
+                context=AsrContext(hotwords=["KestrelDB", "Zephyrus"]),
+                transport=oai_tx,
+            )
+            leg_body = oai_reqs[-1].body.decode("utf-8", errors="ignore")
+            self.assertNotIn('name="keywords[]"', leg_body)
+            self.assertIn('name="prompt"\r\n\r\n', leg_body)
+            self.assertIn("常用技术术语：Zephyrus、KestrelDB", leg_body)
+
+        # 3. DashScope _compose_context_text relaxes hotwords cap to 900 chars (aligned with hotwords.py)
+        ds_terms = [f"DashScopeTerm_{i:02d}" for i in range(60)]
+        ds_txt = _compose_context_text(AsrContext(hotwords=ds_terms), max_chars=2500)
+        self.assertTrue(ds_txt.startswith("常用技术术语："))
+        self.assertGreater(len(ds_txt), 420)
+        self.assertLessEqual(len(ds_txt), 900 + len("常用技术术语："))
+
+    def test_single_hop_vocabulary_hints_dedup_aliases_cache_breakpoints_and_echo_strip(self) -> None:
+        from agent_voice_input.hotwords import (
+            clear_hotwords_cache,
+            format_stage2_vocabulary_hints,
+            select_stage2_manual_entries,
+        )
+        from agent_voice_input.refiner import attach_single_hop_context
+
+        with tempfile.TemporaryDirectory() as td:
+            clear_hotwords_cache()
+            try:
+                hw_file = Path(td) / "hotwords.txt"
+                hw_file.write_text(
+                    "[global]\nKestrelDB <- 凯斯特罗\n[chat]\nChatBrand <- 查特牌\n[coding]\nGhostty <- 高斯提\n",
+                    encoding="utf-8",
+                )
+                cfg = Config()
+                cfg.asr.hotwords_file = str(hw_file)
+                agent_vocab = format_stage2_vocabulary_hints(select_stage2_manual_entries(hw_file, mode="agent"))
+                gen_vocab = format_stage2_vocabulary_hints(select_stage2_manual_entries(hw_file, mode="general"))
+
+                # 1. Prepared ChatAudioAsrProvider (OpenRouter google/gemini-3.8-flash):
+                #    agent [vocab, log0] -> single <vocabulary_hints>, breakpoint on idx 1 (log0),
+                #    dynamic word deduped against manual terms, session-only telemetry, echo stripped
+                or_reqs: list[HttpRequest] = []
+                or_env = {"OPENROUTER_API_KEY": "sk-or-sh-" + ("d" * 16)}
+
+                def or_tx(req: HttpRequest) -> HttpResponse:
+                    or_reqs.append(req)
+                    return HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps(
+                            {
+                                "choices": [
+                                    {
+                                        "message": {
+                                            "content": f"{agent_vocab}\n打开 Ghostty 检查 KestrelDB"
+                                        }
+                                    }
+                                ]
+                            }
+                        ).encode("utf-8"),
+                    )
+
+                cfg_or = Config()
+                cfg_or.asr.provider = "openrouter"
+                cfg_or.asr.model = "google/gemini-3.8-flash"
+                cfg_or.asr.hotwords_file = str(hw_file)
+
+                base_agent_ctx = AsrContext(
+                    hotwords=["Ghostty", "KestrelDB", "DynamicRepoSym"],
+                    dialog_text="[User]\n检查日志",
+                    mode="agent",
+                    manual_hotwords_loaded=True,
+                )
+                prep_agent = attach_single_hop_context(
+                    cfg_or, base_agent_ctx, mode="agent", vocabulary_hints=agent_vocab
+                )
+                or_prov = create_asr_provider(cfg_or, resolve_credentials(cfg_or, or_env), env=or_env, transport=or_tx)
+                res_or = or_prov.transcribe(_sample_wav(), context=prep_agent)
+                self.assertEqual(res_or.text, "打开 Ghostty 检查 KestrelDB")
+                self.assertEqual(res_or.context_chunks, 1)  # excludes leading <vocabulary_hints>
+                or_body_str = or_reqs[-1].body.decode("utf-8")
+                or_parts = json.loads(or_body_str)["messages"][1]["content"]
+                or_user_str = json.dumps(or_parts, ensure_ascii=False)
+                self.assertEqual(or_user_str.count("<vocabulary_hints"), 1)
+                self.assertIn("Ghostty (ASR has misheard as: 高斯提)", or_user_str)
+                self.assertNotIn("cache_control", or_parts[0])
+                self.assertEqual(or_parts[1].get("cache_control"), {"type": "ephemeral"})
+                # Dynamic tail retains DynamicRepoSym without duplicating manual Ghostty/KestrelDB
+                self.assertIn("DynamicRepoSym", or_parts[2]["text"])
+                self.assertNotIn("Ghostty", or_parts[2]["text"])
+                self.assertNotIn("KestrelDB", or_parts[2]["text"])
+
+                # General prepared single-hop: vocab at idx 0, breakpoint at idx 0, zero duplicate tail, ctx_chunks=0
+                base_gen_ctx = AsrContext(
+                    hotwords=["ChatBrand", "KestrelDB"],
+                    mode="general",
+                    manual_hotwords_loaded=True,
+                )
+                prep_gen = attach_single_hop_context(
+                    cfg_or, base_gen_ctx, mode="general", vocabulary_hints=gen_vocab
+                )
+                res_or_gen = or_prov.transcribe(_sample_wav(), context=prep_gen)
+                self.assertEqual((res_or_gen.context_chunks, res_or_gen.context_chars), (0, 0))
+                or_gen_parts = json.loads(or_reqs[-1].body.decode("utf-8"))["messages"][1]["content"]
+                or_gen_user_str = json.dumps(or_gen_parts, ensure_ascii=False)
+                self.assertEqual(or_gen_user_str.count("<vocabulary_hints"), 1)
+                self.assertIn("ChatBrand (ASR has misheard as: 查特牌)", or_gen_user_str)
+                self.assertEqual(or_gen_parts[0].get("cache_control"), {"type": "ephemeral"})
+
+                # 2. GeminiAudioProvider: prepared & unprepared direct calls both render exactly 1 <vocabulary_hints> with aliases
+                gem_reqs: list[HttpRequest] = []
+                gem_env = {"GEMINI_API_KEY": "AIza-gem-sh-" + ("e" * 16)}
+
+                def gem_tx(req: HttpRequest) -> HttpResponse:
+                    gem_reqs.append(req)
+                    return HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"candidates": [{"content": {"parts": [{"text": "Gemini单跳结果"}]}}]}).encode("utf-8"),
+                    )
+
+                cfg_gem = Config()
+                cfg_gem.asr.provider = "gemini"
+                cfg_gem.asr.hotwords_file = str(hw_file)
+                gem_prov = create_asr_provider(cfg_gem, resolve_credentials(cfg_gem, gem_env), env=gem_env, transport=gem_tx)
+
+                res_gem_prep = gem_prov.transcribe(_sample_wav(), context=prep_agent)
+                self.assertEqual(res_gem_prep.context_chunks, 1)
+                gem_prep_user_str = json.dumps(
+                    json.loads(gem_reqs[-1].body.decode("utf-8"))["contents"], ensure_ascii=False
+                )
+                self.assertEqual(gem_prep_user_str.count("<vocabulary_hints"), 1)
+                self.assertIn("Ghostty (ASR has misheard as: 高斯提)", gem_prep_user_str)
+                self.assertIn("DynamicRepoSym", gem_prep_user_str)
+
+                # Unprepared direct call still gets aliases from hotwords_file + deduped dynamic words in 1 block
+                gem_prov.transcribe(
+                    _sample_wav(),
+                    context=AsrContext(hotwords=["Ghostty", "ExtraDirectTerm"], mode="agent"),
+                )
+                gem_unprep_user_str = json.dumps(
+                    json.loads(gem_reqs[-1].body.decode("utf-8"))["contents"], ensure_ascii=False
+                )
+                self.assertEqual(gem_unprep_user_str.count("<vocabulary_hints"), 1)
+                self.assertIn("Ghostty (ASR has misheard as: 高斯提)", gem_unprep_user_str)
+                self.assertIn("ExtraDirectTerm", gem_unprep_user_str)
+
+                # 3. Unified 100-item / 1,500-char budget across BOTH prepared & unprepared single-hop paths:
+                #    100 manual entries + 40 dynamic words MUST stay <= 100 items and <= 1,500 chars (never 140!)
+                from agent_voice_input.asr_providers import (
+                    _extract_vocab_block_stats,
+                    _format_single_hop_tail_vocabulary,
+                    _normalize_single_hop_text,
+                )
+                from agent_voice_input.hotwords import (
+                    STAGE2_HOTWORDS_MAX_CHARS,
+                    STAGE2_HOTWORDS_MAX_ITEMS,
+                )
+
+                hw_100 = Path(td) / "hotwords_100.txt"
+                hw_100.write_text(
+                    "[global]\n" + "\n".join(f"Man{i:03d}" for i in range(100)) + "\n",
+                    encoding="utf-8",
+                )
+                vocab_100 = format_stage2_vocabulary_hints(select_stage2_manual_entries(hw_100, mode="agent"))
+                _, items_100, chars_100 = _extract_vocab_block_stats([vocab_100])
+                self.assertEqual(items_100, STAGE2_HOTWORDS_MAX_ITEMS)
+                self.assertLessEqual(chars_100, STAGE2_HOTWORDS_MAX_CHARS)
+
+                dyn_40 = [f"Dyn{i:03d}" for i in range(40)]
+                ctx_100_40 = AsrContext(hotwords=[*(f"Man{i:03d}" for i in range(100)), *dyn_40], mode="agent")
+                tail_when_full = _format_single_hop_tail_vocabulary(
+                    ctx_100_40, [vocab_100], hotwords_file=str(hw_100), env={}
+                )
+                self.assertEqual(tail_when_full, "")  # 0 extra dynamic terms once 100-item budget is full
+
+                # 80 manual + 40 dynamic -> at most 20 dynamic terms added, total <= 100 items & <= 1,500 chars
+                hw_80 = Path(td) / "hotwords_80.txt"
+                hw_80.write_text(
+                    "[global]\n" + "\n".join(f"Man{i:03d}" for i in range(80)) + "\n",
+                    encoding="utf-8",
+                )
+                vocab_80 = format_stage2_vocabulary_hints(select_stage2_manual_entries(hw_80, mode="agent"))
+                _, items_80, chars_80 = _extract_vocab_block_stats([vocab_80])
+                tail_80 = _format_single_hop_tail_vocabulary(
+                    AsrContext(hotwords=dyn_40, mode="agent"),
+                    [vocab_80],
+                    hotwords_file=str(hw_80),
+                    env={},
+                )
+                self.assertTrue(tail_80.startswith("Additional context terms (read-only): "))
+                tail_body_80 = tail_80.removeprefix("Additional context terms (read-only): ")
+                kept_dyn_80 = [t.strip() for t in tail_body_80.split(", ") if t.strip()]
+                self.assertEqual(len(kept_dyn_80), 20)
+                self.assertLessEqual(items_80 + len(kept_dyn_80), STAGE2_HOTWORDS_MAX_ITEMS)
+                self.assertLessEqual(chars_80 + 1 + len(tail_body_80), STAGE2_HOTWORDS_MAX_CHARS)
+
+                # 4. XML entity round-trip dedup: AT&T rendered as AT&amp;T is unescaped via html.unescape
+                #    so dynamic AT&T is NOT duplicated in single-hop tail
+                hw_amp = Path(td) / "hotwords_amp.txt"
+                hw_amp.write_text("[global]\nAT&T <- 埃梯\n&lt;\n", encoding="utf-8")
+                vocab_amp = format_stage2_vocabulary_hints(select_stage2_manual_entries(hw_amp, mode="agent"))
+                self.assertIn("AT&amp;T", vocab_amp)
+                tail_amp = _format_single_hop_tail_vocabulary(
+                    AsrContext(hotwords=["AT&T", "&lt;", "FreshSym"], mode="agent"),
+                    [vocab_amp],
+                    hotwords_file=str(hw_amp),
+                    env={},
+                )
+                self.assertEqual(tail_amp, "Additional context terms (read-only): FreshSym")
+
+                # 5. Single-hop echo normalization preserves inline mid-sentence examples and skips stripping when no vocab sent
+                inline_ex = "请保留 <vocabulary_hints>Alpha</vocabulary_hints> 作为示例"
+                self.assertEqual(_normalize_single_hop_text(inline_ex, strip_vocab_echo=True), inline_ex)
+                self.assertEqual(
+                    _normalize_single_hop_text("<vocabulary_hints>Alpha</vocabulary_hints>\n正文", strip_vocab_echo=False),
+                    "<vocabulary_hints>Alpha</vocabulary_hints>\n正文",
+                )
+                # No-vocab ChatAudioAsrProvider call keeps echoed <vocabulary_hints> untouched
+                cfg_no_hw = Config()
+                cfg_no_hw.asr.provider = "openrouter"
+                cfg_no_hw.asr.model = "google/gemini-3.8-flash"
+                cfg_no_hw.asr.hotwords_file = str(Path(td) / "missing.txt")
+
+                def or_echo_tx(req: HttpRequest) -> HttpResponse:
+                    del req
+                    return HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"choices": [{"message": {"content": inline_ex}}]}).encode("utf-8"),
+                    )
+
+                prov_no_hw = create_asr_provider(
+                    cfg_no_hw, resolve_credentials(cfg_no_hw, or_env), env=or_env, transport=or_echo_tx
+                )
+                res_inline = prov_no_hw.transcribe(_sample_wav(), context=AsrContext(mode="general"))
+                self.assertEqual(res_inline.text, inline_ex)
+            finally:
+                clear_hotwords_cache()
+
+    def test_extract_vocab_block_stats_line_based_preserves_comma_terms(self) -> None:
+        from agent_voice_input.asr_providers import (
+            _extract_vocab_block_stats,
+            _format_single_hop_tail_vocabulary,
+        )
+        from agent_voice_input.hotwords import HotwordEntry, format_stage2_vocabulary_hints
+
+        vocab = format_stage2_vocabulary_hints(
+            [
+                HotwordEntry("Smith, John"),
+                HotwordEntry("Doe, Jane", ("珍妮",)),
+            ]
+        )
+        lows, used_items, _ = _extract_vocab_block_stats([vocab])
+        self.assertEqual(used_items, 2)
+        self.assertIn("smith, john", lows)
+        self.assertIn("doe, jane", lows)
+        self.assertNotIn("john", lows)
+        self.assertNotIn("smith", lows)
+
+        tail = _format_single_hop_tail_vocabulary(
+            AsrContext(hotwords=["Smith, John", "John", "Jane"], mode="agent"),
+            [vocab],
+            hotwords_file="",
+            env={},
+        )
+        self.assertEqual(tail, "Additional context terms (read-only): John, Jane")
+
+    def test_compact_git_hotwords_dedupes_ci_and_preserves_real_files_with_shared_prefix(self) -> None:
+        from agent_voice_input.session_ctx import _compact_git_hotwords
+
+        self.assertEqual(
+            _compact_git_hotwords(["config.example.toml", "config.example.toml.bak"]),
+            ["config.example.toml", "config.example.toml.bak"],
+        )
+        self.assertEqual(
+            _compact_git_hotwords(
+                ["  ", "Alpha.py", "alpha.py", ".env", "foo.", *[f"f{i}.py" for i in range(12)]]
+            ),
+            ["Alpha.py", ".env", "foo.", *[f"f{i}.py" for i in range(7)]],
+        )
 
 
 if __name__ == "__main__":

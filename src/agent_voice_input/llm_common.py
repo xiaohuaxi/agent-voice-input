@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .config import (
     CREDENTIAL_ENV_ORDER,
@@ -168,23 +168,54 @@ def _extract_gemini_audio_tokens(data: Mapping[str, Any]) -> int | None:
     return total if found else None
 
 
-def openrouter_cache_breakpoints(provider: str, model: str, n_blocks: int) -> tuple[int, ...]:
+def openrouter_cache_breakpoints(
+    provider: str,
+    model: str,
+    n_blocks: int = 0,
+    *,
+    context_blocks: Sequence[str] | None = None,
+) -> tuple[int, ...]:
     """Return 0-based ``context_blocks`` indices that should carry ``cache_control`` on OpenRouter.
 
     For ``google/*`` (where OpenRouter converts only the last ``cache_control`` into a single
-    ``cachedContent``), ``n_blocks >= 2`` targets the last sealed 50K block ``n_blocks - 2`` so
-    appended turns never invalidate the cached prefix, while ``n_blocks == 1`` intentionally
-    targets ``0`` so consecutive utterances reuse the current snapshot before the next reply.
+    ``cachedContent``), history blocks ``m >= 2`` target the last sealed 50K block
+    ``offset + m - 2`` so appended turns never invalidate the cached prefix, while ``m == 1``
+    intentionally targets ``offset`` (the sole history block) so consecutive utterances reuse
+    the current snapshot before the next reply. When a leading ``<vocabulary_hints`` static
+    block is present (``offset = 1``) with zero history blocks (``m == 0``), the breakpoint
+    falls safely on index ``0`` rather than going out of bounds or dropping history caching.
     """
-    if provider.strip().lower() != "openrouter" or n_blocks <= 0:
+    if provider.strip().lower() != "openrouter":
         return ()
-    m = model.strip().lower()
-    sealed = n_blocks - 2 if n_blocks >= 2 else 0
-    if m.startswith("google/"):
-        return (sealed,)
-    if m.startswith("anthropic/"):
-        return tuple(sorted({sealed, n_blocks - 1}))
-    return ()
+    if context_blocks is not None:
+        total = len(context_blocks)
+        offset = (
+            1
+            if (total > 0 and context_blocks[0].lstrip().startswith("<vocabulary_hints"))
+            else 0
+        )
+    else:
+        total = n_blocks
+        offset = 0
+    if total <= 0:
+        return ()
+    history_blocks = total - offset
+    if history_blocks == 0:
+        sealed = offset - 1
+    elif history_blocks == 1:
+        sealed = offset
+    else:
+        sealed = offset + history_blocks - 2
+    model_l = model.strip().lower()
+    if model_l.startswith("google/"):
+        raw_bps: tuple[int, ...] = (sealed,)
+    elif model_l.startswith("anthropic/"):
+        raw_bps = tuple(sorted({sealed, total - 1}))
+    else:
+        return ()
+    if context_blocks is not None:
+        return tuple(idx for idx in raw_bps if context_blocks[idx].strip())
+    return raw_bps
 
 
 _EMPTY_LENTICULAR_RE = re.compile(r"【[ \t]*】")

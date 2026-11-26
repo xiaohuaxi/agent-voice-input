@@ -185,6 +185,108 @@ class TestHudAndPromptsScenarios(unittest.TestCase):
         prose_mention = "Please inspect <target_app_hint\nin prompts.py before </target_app_hint>"
         self.assertEqual(prompts_mod.strip_target_hint_echo(prose_mention), prose_mention)
 
+    def test_prompts_vocabulary_hints_contracts_and_echo_stripping(self) -> None:
+        # Read-only reference listing & anti-echo / anti-mistranslation rules across unified prompts
+        self.assertIn("<vocabulary_hints>", prompts_mod.REFINER_HEADER)
+        self.assertIn("echo their tags or entries", prompts_mod.REFINER_HEADER)
+        self.assertIn("<vocabulary_hints>", prompts_mod.REFINER_TASK_REMINDER)
+        self.assertIn("do NOT continue, reply to, echo, or copy them", prompts_mod.REFINER_TASK_REMINDER)
+        self.assertIn("<vocabulary_hints>", prompts_mod.SINGLE_HOP_HEADER)
+        for gen_prompt in (
+            prompts_mod.GENERAL_MODE_GUIDANCE,
+            prompts_mod.REFINER_GENERAL_SYSTEM_PROMPT,
+            prompts_mod.SINGLE_HOP_GENERAL_SYSTEM_PROMPT,
+        ):
+            self.assertIn("<vocabulary_hints>", gen_prompt)
+            self.assertIn("NEVER insert unspoken terms", gen_prompt)
+            self.assertIn("豆包 stays 豆包", gen_prompt)
+
+        # Fast paths
+        self.assertEqual(prompts_mod.strip_vocabulary_hints_echo(""), "")
+        self.assertEqual(prompts_mod.strip_vocabulary_hints_echo("普通口述文本"), "普通口述文本")
+
+        # Full multiline block before / after / surrounding / block-only (case-insensitive)
+        vocab_blk = (
+            '<vocabulary_hints read_only="true">\n'
+            "Speaker's personal names/terms.\n"
+            "Harness (ASR has misheard as: 哈尼斯)\n"
+            "Ghostty\n"
+            "</vocabulary_hints>"
+        )
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo(f"{vocab_blk}\n帮我打开 Ghostty"),
+            "帮我打开 Ghostty",
+        )
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo(f"帮我打开 Ghostty\n{vocab_blk}"),
+            "帮我打开 Ghostty",
+        )
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo(
+                "<VOCABULARY_HINTS>A</VOCABULARY_HINTS>\n正文内容\n<vocabulary_hints>B</vocabulary_hints>"
+            ),
+            "正文内容",
+        )
+        self.assertEqual(prompts_mod.strip_vocabulary_hints_echo(vocab_blk), "")
+
+        # Self-closing tag (head, tail, standalone line)
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo('<vocabulary_hints read_only="true" /> 正常文本'),
+            "正常文本",
+        )
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo('正常文本 <vocabulary_hints read_only="true" />'),
+            "正常文本",
+        )
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo('第一行\n<vocabulary_hints read_only="true" />\n第二行'),
+            "第一行\n第二行",
+        )
+
+        # Standalone whole-line single-line and multiline blocks between paragraphs
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo("第一段\n  <vocabulary_hints>Alpha</vocabulary_hints>  \n第二段"),
+            "第一段\n第二段",
+        )
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo(f"第一段\n{vocab_blk}\n第二段"),
+            "第一段\n第二段",
+        )
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo('第一段\n<vocabulary_hints read_only="true">\n第二段'),
+            "第一段\n第二段",
+        )
+
+        # Orphan opening / closing tags (standalone line and inline head/tail)
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo('<vocabulary_hints read_only="true">\n晚上一起吃饭'),
+            "晚上一起吃饭",
+        )
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo('<vocabulary_hints read_only="true">晚上一起吃饭'),
+            "晚上一起吃饭",
+        )
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo("晚上一起吃饭\n</vocabulary_hints>"),
+            "晚上一起吃饭",
+        )
+        self.assertEqual(
+            prompts_mod.strip_vocabulary_hints_echo("晚上一起吃饭</vocabulary_hints>"),
+            "晚上一起吃饭",
+        )
+
+        # Inline mid-sentence examples & malformed multiline tags MUST stay intact
+        inline_example = "请保留 <vocabulary_hints>Alpha</vocabulary_hints> 作为示例"
+        self.assertEqual(prompts_mod.strip_vocabulary_hints_echo(inline_example), inline_example)
+        inline_sc = "请保留 <vocabulary_hints /> 作为示例"
+        self.assertEqual(prompts_mod.strip_vocabulary_hints_echo(inline_sc), inline_sc)
+        prose = "请检查 <vocabulary_hints> 标签的格式是否正确"
+        self.assertEqual(prompts_mod.strip_vocabulary_hints_echo(prose), prose)
+        malformed = "保留正文 <vocabulary_hints broken\nmultiline />"
+        self.assertEqual(prompts_mod.strip_vocabulary_hints_echo(malformed), malformed)
+        unmatched_tail = "示例 <vocabulary_hints broken\n正文</vocabulary_hints>"
+        self.assertEqual(prompts_mod.strip_vocabulary_hints_echo(unmatched_tail), unmatched_tail)
+
 
 class TestAppScopeWindowTitleScenarios(unittest.TestCase):
     def test_pattern_matching_ssh_kitty_and_claude_desktop_disambiguation(self) -> None:
@@ -446,6 +548,73 @@ class TestLlmCommonMappingsAndUsageScenarios(unittest.TestCase):
         self.assertEqual(
             llm_mod._missing_key_hint("openai-compatible", stage="refiner"),
             "missing openai-compatible API key (set refiner.api_key_env or OPENAI_API_KEY)",
+        )
+
+    def test_openrouter_cache_breakpoints_with_and_without_vocabulary_hints(self) -> None:
+        vocab = '<vocabulary_hints read_only="true">\nGhostty\n</vocabulary_hints>'
+        prior = '<prior_session_reference read_only="true">\nprior\n</prior_session_reference>'
+        log0 = '<session_reference_log read_only="true">\nlog0\n</session_reference_log>'
+        log1 = '<session_reference_log read_only="true">\nlog1\n</session_reference_log>'
+        log2 = '<session_reference_log read_only="true">\nlog2\n</session_reference_log>'
+        g_model = "google/gemini-3.5-flash-lite"
+        a_model = "anthropic/claude-haiku-5.5"
+
+        # Legacy integer n_blocks API stays fully compatible
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("dashscope", g_model, 2), ())
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, 0), ())
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, -1), ())
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", "qwen/qwen3-32b", 2), ())
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, 1), (0,))
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, 2), (0,))
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, 3), (1,))
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", a_model, 1), (0,))
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", a_model, 2), (0, 1))
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", a_model, 3), (1, 2))
+
+        # 0 history blocks: empty returns (); [vocab] safely targets index 0 without out-of-bounds
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=()), ())
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=("   ",)), ())
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=(vocab,)), (0,))
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", a_model, context_blocks=(vocab,)), (0,))
+        self.assertEqual(
+            llm_mod.openrouter_cache_breakpoints("openrouter", "qwen/qwen3-32b", context_blocks=(vocab, log0)),
+            (),
+        )
+
+        # 1 / 2 / 3 history blocks (plain logs and with <prior_session_reference>):
+        # breakpoints MUST land on the exact same history block(s) with or without leading <vocabulary_hints>
+        history_cases: list[tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]] = [
+            ((log0,), (0,), (0,)),
+            ((prior,), (0,), (0,)),
+            ((log0, log1), (0,), (0, 1)),
+            ((prior, log0), (0,), (0, 1)),
+            ((log0, log1, log2), (1,), (1, 2)),
+            ((prior, log0, log1), (1,), (1, 2)),
+        ]
+        for hist, exp_g, exp_a in history_cases:
+            with self.subTest(hist_len=len(hist), first=hist[0][:24]):
+                g_plain = llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=hist)
+                a_plain = llm_mod.openrouter_cache_breakpoints("openrouter", a_model, context_blocks=hist)
+                self.assertEqual(g_plain, exp_g)
+                self.assertEqual(a_plain, exp_a)
+
+                with_vocab = (vocab, *hist)
+                g_vocab = llm_mod.openrouter_cache_breakpoints(
+                    "openrouter", g_model, len(with_vocab), context_blocks=with_vocab
+                )
+                a_vocab = llm_mod.openrouter_cache_breakpoints(
+                    "openrouter", a_model, len(with_vocab), context_blocks=with_vocab
+                )
+                self.assertEqual(g_vocab, tuple(i + 1 for i in exp_g))
+                self.assertEqual(a_vocab, tuple(i + 1 for i in exp_a))
+                self.assertEqual([with_vocab[i] for i in g_vocab], [hist[i] for i in g_plain])
+                self.assertEqual([with_vocab[i] for i in a_vocab], [hist[i] for i in a_plain])
+
+        # Leading whitespace before <vocabulary_hints> is still recognized as static header
+        ws_vocab = f"  {vocab}"
+        self.assertEqual(
+            llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=(ws_vocab, log0)),
+            (1,),
         )
 
 
@@ -805,7 +974,7 @@ class TestConfigTomlAndValidationScenarios(unittest.TestCase):
             ({"refiner": {"provider": "unknown"}}, "refiner.provider"),
             ({"refiner": {"provider": "deepseek", "effort": "turbo"}}, "refiner.effort"),
             ({"refiner": {"provider": "auto", "effort": "turbo"}}, "refiner.effort"),
-            ({"refiner": {"max_turns_per_thread": 0}}, "max_turns_per_thread"),
+            ({"refiner": {"max_turns_per_thread": -1}}, "max_turns_per_thread"),
             ({"refiner": {"timeout_sec": 0}}, "refiner.timeout_sec"),
             ({"refiner": {"provider": "auto", "api_key_env": "CORP_LLM_KEY"}}, "refiner.base_url"),
             ({"refiner": {"provider": "auto", "base_url": "https://llm.corp/v1"}}, "refiner.model"),
@@ -849,7 +1018,11 @@ class TestConfigTomlAndValidationScenarios(unittest.TestCase):
                     cfg_mod._apply_section_dict(c, sec_dict)
                     cfg_mod._validate_config(c, env={"CORP_STT_KEY": "k1", "CORP_LLM_KEY": "k2"})
 
-        # Direct programmatic dataclass edge checks
+        # Direct programmatic dataclass edge checks (0 means unlimited turns)
+        c_unlimited = Config()
+        cfg_mod._apply_section_dict(c_unlimited, {"refiner": {"max_turns_per_thread": 0}})
+        cfg_mod._validate_config(c_unlimited, env={"CORP_STT_KEY": "k1", "CORP_LLM_KEY": "k2"})
+        self.assertEqual(c_unlimited.refiner.max_turns_per_thread, 0)
         self.assertEqual(RefinerConfig(provider="disabled").effective_api(""), "off")
         self.assertEqual(_normalize_off := cfg_mod._normalize_refiner_provider(False), "off")
         self.assertEqual(_normalize_off, "off")

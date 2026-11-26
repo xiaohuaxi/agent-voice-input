@@ -2886,13 +2886,9 @@ def _read_remote_git_status(real_cwd: str) -> tuple[str, list[str]]:
         if " -> " in part:
             part = part.split(" -> ", 1)[1].strip()
         base = os.path.basename(part.strip('"').rstrip("/"))
-        if base and base not in seen:
-            seen.add(base)
+        if base and (low := base.lower()) not in seen:
+            seen.add(low)
             hw.append(base)
-        stem = os.path.splitext(base)[0]
-        if stem and len(stem) >= 3 and stem not in seen:
-            seen.add(stem)
-            hw.append(stem)
     return "\n".join(kept), hw
 
 
@@ -3154,9 +3150,6 @@ def run_probe(
         if (
             cold_start_mode in ("auto", "hotwords")
             and not prior_already_checked
-            and len(kept_turns) < COLD_START_SWEET_MIN_TURNS
-            and evicted_chunks == 0
-            and compaction_count == 0
             and eff_cwd
             and not _is_broad_or_unsafe_workspace_dir(eff_cwd, home)
         ):
@@ -3175,6 +3168,9 @@ def run_probe(
             if (
                 cold_start_mode == "auto"
                 and cli != "workspace"
+                and len(kept_turns) < COLD_START_SWEET_MIN_TURNS
+                and evicted_chunks == 0
+                and compaction_count == 0
                 and best_prior is not None
                 and max_chars > 0
             ):

@@ -450,7 +450,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertEqual(parsed["refiner"]["model"], "")
         self.assertEqual(parsed["refiner"]["api"], "auto")
         self.assertNotIn("max_turns_per_thread", parsed["refiner"])
-        self.assertIn("# max_turns_per_thread = 20", toml_raw)
+        self.assertIn("# max_turns_per_thread = 0", toml_raw)
         self.assertIn("# timeout_ms = 800", toml_raw)
         self.assertNotIn("max_turns_per_thread", (_REPO_ROOT / "README.md").read_text(encoding="utf-8"))
         self.assertNotIn("max_turns_per_thread", (_REPO_ROOT / "README.zh-CN.md").read_text(encoding="utf-8"))
@@ -5878,7 +5878,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             self.assertNotIn("</workspace_git_status>", user_off)
             self.assertNotIn("feature_alpha.py", user_off)
 
-            # Gemini native wire payload keeps a single "role": "user" turn with multi-part boundaries
+            # Gemini native wire payload uses 3-turn stateless implicit-cache layout when stable prefix blocks exist
             gem_reqs: list[HttpRequest] = []
             gem_env = {"GEMINI_API_KEY": "gem_boundary_" + ("z" * 16)}
             cfg_gem = Config(refiner=RefinerConfig(provider="gemini", include_git_status=True))
@@ -5897,12 +5897,13 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             )
             gem_ref.refine("检查一下 feature alpha", session_key=snap.session_key, tracker=tracker)
             gem_body = json.loads(gem_reqs[-1].body.decode("utf-8"))
-            self.assertEqual(len(gem_body["contents"]), 1)
-            self.assertEqual(gem_body["contents"][0]["role"], "user")
-            gem_parts = gem_body["contents"][0]["parts"]
-            self.assertEqual(len(gem_parts), 3)
-            self.assertIn('<session_reference_log read_only="true">', gem_parts[0]["text"])
-            self.assertIn("<workspace_git_status", gem_parts[-1]["text"])
+            self.assertEqual([c["role"] for c in gem_body["contents"]], ["user", "model", "user"])
+            self.assertEqual(gem_body["contents"][1]["parts"], [{"text": "Understood."}])
+            self.assertEqual(len(gem_body["contents"][0]["parts"]), 1)
+            self.assertIn('<session_reference_log read_only="true">', gem_body["contents"][0]["parts"][0]["text"])
+            self.assertEqual(len(gem_body["contents"][2]["parts"]), 2)
+            self.assertIn('<session_reference_log read_only="true">', gem_body["contents"][2]["parts"][0]["text"])
+            self.assertIn("<workspace_git_status", gem_body["contents"][2]["parts"][1]["text"])
 
             # 3. Stateless Responses wire layout: N developer <session_reference_log> items + 1 trailing user draft+git item,
             #    plus safe concurrent same-session execution!
@@ -10941,8 +10942,9 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 extra_hotwords: object = (),
                 mode: str = "agent",
                 language: str = "auto",
+                target_hint: str = "",
             ) -> AsrContext:
-                del snapshot, extra_hotwords, language
+                del snapshot, extra_hotwords, language, target_hint
                 return AsrContext(hotwords=("demo",), mode=mode)
 
             def get_refiner_context_with_prior(self, *args: object, **kw: object) -> tuple[str, list[str], str]:
@@ -12813,6 +12815,427 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
             finally:
                 daemon.close()
             self.assertEqual(close_calls, ["refiner"])
+
+    def test_stage2_vocabulary_hints_all_channels_gemini_3turn_telemetry_echo_and_hot_reload(self) -> None:
+        from agent_voice_input.hotwords import (
+            HotwordEntry,
+            clear_hotwords_cache,
+            format_stage2_vocabulary_hints,
+        )
+        from agent_voice_input.refiner import (
+            BaseRefiner,
+            GeminiRefiner,
+            OpenAICompatibleRefiner,
+            OpenAIResponsesRefiner,
+            _clean_out,
+        )
+
+        vocab_blk = format_stage2_vocabulary_hints(
+            [HotwordEntry("KestrelDB", ("凯斯特罗",)), HotwordEntry("Ghostty")]
+        )
+        self.assertTrue(vocab_blk.startswith('<vocabulary_hints read_only="true">'))
+        self.assertIn("KestrelDB (ASR has misheard as: 凯斯特罗)", vocab_blk)
+
+        class _MultiChunkTracker:
+            has_bound_session = True
+
+            def __init__(self, chunks: list[str], git_ctx: str = "cwd: /repo\nchanged_files: refiner.py") -> None:
+                self._chunks = chunks
+                self._git_ctx = git_ctx
+
+            def get_refiner_context_with_prior(
+                self, session_key: str, *, max_chars: int = 200000, include_git_status: bool = True, allow_prior: bool = True, **_kw: object
+            ) -> tuple[str, list[str], str]:
+                del session_key, max_chars, allow_prior
+                return "", list(self._chunks), (self._git_ctx if include_git_status else "")
+
+            def get_state(self, session_key: str) -> object:
+                del session_key
+                return object()
+
+        # 1. _clean_out strips echoed <vocabulary_hints> blocks/tags while keeping literal user mentions
+        self.assertEqual(_clean_out(f"{vocab_blk}\n检查 KestrelDB 配置", "检查 凯斯特罗 配置"), "检查 KestrelDB 配置")
+        self.assertEqual(
+            _clean_out("检查 <vocabulary_hints> 标签格式", "检查 <vocabulary_hints> 标签格式"),
+            "检查 <vocabulary_hints> 标签格式",
+        )
+
+        # 2. OpenAIResponsesRefiner: leading developer[0] = <vocabulary_hints> in both agent & general;
+        #    telemetry context_chunks/context_chars exclude static <vocabulary_hints>
+        resp_reqs: list[HttpRequest] = []
+        oai_env = {"OPENAI_API_KEY": "sk-oai-vocab-" + ("a" * 16)}
+
+        def _resp_sse_tx(req: HttpRequest) -> HttpResponse:
+            resp_reqs.append(req)
+            ev = {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": f"{vocab_blk}\n已修正 KestrelDB"}],
+                        }
+                    ],
+                },
+            }
+            return HttpResponse(200, {"content-type": "text/event-stream"}, f"data: {json.dumps(ev)}\n\n".encode("utf-8"))
+
+        cfg_resp = Config(refiner=RefinerConfig(provider="openai", api="responses"))
+        ref_resp = OpenAIResponsesRefiner(
+            cfg_resp, resolve_credentials(cfg_resp, oai_env), provider_name="openai", env=oai_env, transport=_resp_sse_tx
+        )
+        try:
+            r_agent = ref_resp.refine(
+                "检查凯斯特罗",
+                session_key="s-1",
+                tracker=_MultiChunkTracker(["[User]\n查看代码"]),  # type: ignore[arg-type]
+                mode="agent",
+                vocabulary_hints=vocab_blk,
+            )
+            self.assertEqual(r_agent.text, "已修正 KestrelDB")
+            self.assertEqual(r_agent.context_chunks, 1)
+            self.assertGreater(r_agent.context_chars, 0)
+            p_agent = json.loads(resp_reqs[-1].body.decode("utf-8"))
+            self.assertEqual([it["role"] for it in p_agent["input"]], ["developer", "developer", "user"])
+            self.assertEqual(p_agent["input"][0]["content"][0]["text"], vocab_blk)
+            self.assertTrue(p_agent["input"][1]["content"][0]["text"].startswith("<session_reference_log"))
+
+            r_gen = ref_resp.refine("检查凯斯特罗", mode="general", vocabulary_hints=vocab_blk)
+            self.assertEqual(r_gen.text, "已修正 KestrelDB")
+            self.assertEqual((r_gen.context_chunks, r_gen.context_chars), (0, 0))
+            p_gen = json.loads(resp_reqs[-1].body.decode("utf-8"))
+            self.assertEqual([it["role"] for it in p_gen["input"]], ["developer", "user"])
+            self.assertEqual(p_gen["input"][0]["content"][0]["text"], vocab_blk)
+        finally:
+            ref_resp.close()
+
+        # 3. OpenAICompatibleRefiner (OpenRouter google/*): cache breakpoint lands on log0 (idx 1) when [vocab, log0],
+        #    and on vocab (idx 0) when general [vocab], with accurate session-only telemetry counts
+        or_reqs: list[HttpRequest] = []
+        or_env = {"OPENROUTER_API_KEY": "sk-or-vocab-" + ("b" * 16)}
+
+        def _or_tx(req: HttpRequest) -> HttpResponse:
+            or_reqs.append(req)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": "OpenRouter OK"}}]}).encode("utf-8"),
+            )
+
+        cfg_or = Config(refiner=RefinerConfig(provider="openrouter", model="google/gemini-3.8-flash"))
+        ref_or = OpenAICompatibleRefiner(
+            cfg_or, resolve_credentials(cfg_or, or_env), provider_name="openrouter", env=or_env, transport=_or_tx
+        )
+        res_or_agent = ref_or.refine(
+            "看日志",
+            session_key="s-2",
+            tracker=_MultiChunkTracker(["[User]\n单块日志"]),  # type: ignore[arg-type]
+            mode="agent",
+            vocabulary_hints=vocab_blk,
+        )
+        self.assertEqual(res_or_agent.context_chunks, 1)
+        or_parts_agent = json.loads(or_reqs[-1].body.decode("utf-8"))["messages"][1]["content"]
+        self.assertEqual(or_parts_agent[0]["text"], vocab_blk)
+        self.assertNotIn("cache_control", or_parts_agent[0])
+        self.assertEqual(or_parts_agent[1].get("cache_control"), {"type": "ephemeral"})
+
+        res_or_gen = ref_or.refine("普通聊天", mode="general", vocabulary_hints=vocab_blk)
+        self.assertEqual((res_or_gen.context_chunks, res_or_gen.context_chars), (0, 0))
+        or_parts_gen = json.loads(or_reqs[-1].body.decode("utf-8"))["messages"][1]["content"]
+        self.assertEqual(or_parts_gen[0]["text"], vocab_blk)
+        self.assertEqual(or_parts_gen[0].get("cache_control"), {"type": "ephemeral"})
+
+        # 4. Native GeminiRefiner 3-turn stateless implicit caching matrix
+        gem_reqs: list[HttpRequest] = []
+        gem_env = {"GEMINI_API_KEY": "AIza-gem-3turn-" + ("c" * 16)}
+
+        def _gem_tx(req: HttpRequest) -> HttpResponse:
+            gem_reqs.append(req)
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"candidates": [{"content": {"parts": [{"text": "Gemini OK"}]}}]}).encode("utf-8"),
+            )
+
+        cfg_gem = Config(refiner=RefinerConfig(provider="gemini"))
+        ref_gem = GeminiRefiner(cfg_gem, resolve_credentials(cfg_gem, gem_env), env=gem_env, transport=_gem_tx)
+
+        # 4a. Empty context_blocks -> single user turn (no unnecessary placeholder)
+        ref_gem.refine("纯草稿", mode="general")
+        c_empty = json.loads(gem_reqs[-1].body.decode("utf-8"))["contents"]
+        self.assertEqual([c["role"] for c in c_empty], ["user"])
+
+        # 4b. General with <vocabulary_hints> -> 3-turn [user(vocab), model("Understood."), user(draft)], ctx_chunks=0
+        rg_gen = ref_gem.refine("聊天词表", mode="general", vocabulary_hints=vocab_blk)
+        self.assertEqual((rg_gen.context_chunks, rg_gen.context_chars), (0, 0))
+        c_gen = json.loads(gem_reqs[-1].body.decode("utf-8"))["contents"]
+        self.assertEqual([c["role"] for c in c_gen], ["user", "model", "user"])
+        self.assertEqual(c_gen[0]["parts"], [{"text": vocab_blk}])
+        self.assertEqual(c_gen[1]["parts"], [{"text": "Understood."}])
+        self.assertEqual(len(c_gen[2]["parts"]), 1)
+        self.assertIn("<asr_draft_to_clean>", c_gen[2]["parts"][0]["text"])
+
+        # 4c. Vocab + 1 log block -> both stable blocks in turn 1, draft in turn 3
+        rg_one = ref_gem.refine(
+            "单块日志",
+            session_key="s-g1",
+            tracker=_MultiChunkTracker(["[User]\n单块对话"]),  # type: ignore[arg-type]
+            mode="agent",
+            vocabulary_hints=vocab_blk,
+        )
+        self.assertEqual(rg_one.context_chunks, 1)
+        c_one = json.loads(gem_reqs[-1].body.decode("utf-8"))["contents"]
+        self.assertEqual([c["role"] for c in c_one], ["user", "model", "user"])
+        self.assertEqual(len(c_one[0]["parts"]), 2)
+        self.assertEqual(c_one[0]["parts"][0]["text"], vocab_blk)
+        self.assertTrue(c_one[0]["parts"][1]["text"].startswith("<session_reference_log"))
+        self.assertEqual(len(c_one[2]["parts"]), 1)
+
+        # 4d. Vocab + 2 log blocks -> [vocab, log0] in turn 1, [log1, draft] in turn 3
+        rg_two = ref_gem.refine(
+            "双块日志",
+            session_key="s-g2",
+            tracker=_MultiChunkTracker(["[User]\n封口块一", "[User]\n活跃尾块二"]),  # type: ignore[arg-type]
+            mode="agent",
+            vocabulary_hints=vocab_blk,
+        )
+        self.assertEqual(rg_two.context_chunks, 2)
+        c_two = json.loads(gem_reqs[-1].body.decode("utf-8"))["contents"]
+        self.assertEqual([c["role"] for c in c_two], ["user", "model", "user"])
+        self.assertEqual(len(c_two[0]["parts"]), 2)
+        self.assertEqual(c_two[0]["parts"][0]["text"], vocab_blk)
+        self.assertIn("封口块一", c_two[0]["parts"][1]["text"])
+        self.assertEqual(len(c_two[2]["parts"]), 2)
+        self.assertIn("活跃尾块二", c_two[2]["parts"][0]["text"])
+        self.assertIn("<asr_draft_to_clean>", c_two[2]["parts"][1]["text"])
+
+        # 5. End-to-end daemon_pipeline hotwords.txt -> Stage 2 vocabulary_hints mode split + live hot reload
+        with tempfile.TemporaryDirectory() as td:
+            clear_hotwords_cache()
+            try:
+                hw_file = Path(td) / "hotwords.txt"
+                hw_file.write_text(
+                    "[global]\nGlobalName <- 格洛博\n[chat]\nChatFriend <- 查特\n[coding]\nCodingCrate <- 科丁\n",
+                    encoding="utf-8",
+                )
+                seen_vocab: list[tuple[str, str]] = []
+
+                class _CaptureVocabRefiner(BaseRefiner):
+                    provider_name = "capture"
+
+                    def refine(self, asr_input: AsrResult | str, *, mode: str = "agent", vocabulary_hints: str = "", **_kw: object) -> RefinerResult:
+                        seen_vocab.append((mode, vocabulary_hints))
+                        txt = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                        return RefinerResult(text=txt, provider="capture", model="m", latency_ms=1)
+
+                class _StaticAsr(BaseAsrProvider):
+                    provider_name = "static_asr"
+
+                    def __init__(self, text: str) -> None:
+                        self._text = text
+
+                    def transcribe(
+                        self,
+                        wav_bytes: bytes,
+                        context: object = None,
+                        *,
+                        is_cancelled: object = None,
+                        cancel_token: object = None,
+                    ) -> AsrResult:
+                        del wav_bytes, context, is_cancelled, cancel_token
+                        return AsrResult(text=self._text, provider="static_asr", model="m", latency_ms=1)
+
+                cfg_p = Config()
+                cfg_p.asr.hotwords_file = str(hw_file)
+                tracker_p = _isolated_tracker(Path(td))
+                fake_asr = _StaticAsr("测试热加载")
+                cap_ref = _CaptureVocabRefiner()
+
+                run_pipeline_once(
+                    _voiced_wav(),
+                    cfg=cfg_p,
+                    tracker=tracker_p,
+                    asr_provider=fake_asr,
+                    refiner=cap_ref,
+                    mode="agent",
+                    dry_run=True,
+                    env={},
+                )
+                self.assertEqual(seen_vocab[-1][0], "agent")
+                self.assertIn("CodingCrate (ASR has misheard as: 科丁)", seen_vocab[-1][1])
+                self.assertIn("GlobalName (ASR has misheard as: 格洛博)", seen_vocab[-1][1])
+                self.assertNotIn("ChatFriend", seen_vocab[-1][1])
+
+                run_pipeline_once(
+                    _voiced_wav(),
+                    cfg=cfg_p,
+                    tracker=tracker_p,
+                    asr_provider=fake_asr,
+                    refiner=cap_ref,
+                    mode="general",
+                    dry_run=True,
+                    env={},
+                )
+                self.assertEqual(seen_vocab[-1][0], "general")
+                self.assertIn("GlobalName (ASR has misheard as: 格洛博)", seen_vocab[-1][1])
+                self.assertIn("ChatFriend (ASR has misheard as: 查特)", seen_vocab[-1][1])
+                self.assertNotIn("CodingCrate", seen_vocab[-1][1])
+
+                # Edit hotwords.txt on disk without restarting -> reflected on next utterance immediately
+                hw_file.write_text(
+                    "[global]\nHotReloadedTerm <- 热点词\n",
+                    encoding="utf-8",
+                )
+                run_pipeline_once(
+                    _voiced_wav(),
+                    cfg=cfg_p,
+                    tracker=tracker_p,
+                    asr_provider=fake_asr,
+                    refiner=cap_ref,
+                    mode="general",
+                    dry_run=True,
+                    env={},
+                )
+                self.assertIn("HotReloadedTerm (ASR has misheard as: 热点词)", seen_vocab[-1][1])
+                self.assertNotIn("GlobalName", seen_vocab[-1][1])
+            finally:
+                clear_hotwords_cache()
+
+    def test_daemon_stage2_slot_forwards_vocabulary_hints_for_agent_and_general(self) -> None:
+        from agent_voice_input.hotwords import clear_hotwords_cache
+        from agent_voice_input.refiner import BaseRefiner
+
+        with tempfile.TemporaryDirectory() as td:
+            clear_hotwords_cache()
+            try:
+                hw_file = Path(td) / "hotwords.txt"
+                hw_file.write_text(
+                    "[global]\nGlobalName <- 格洛博\n"
+                    "[coding]\nCodingCrate <- 科丁\n"
+                    "[chat]\nChatFriend <- 查特\n",
+                    encoding="utf-8",
+                )
+                seen_calls: list[tuple[str, str, str]] = []
+
+                class _CaptureStage2Refiner(BaseRefiner):
+                    provider_name = "capture_stage2"
+
+                    def refine(
+                        self,
+                        asr_input: AsrResult | str,
+                        *,
+                        mode: str = "agent",
+                        vocabulary_hints: str = "",
+                        **_kw: object,
+                    ) -> RefinerResult:
+                        seen_calls.append((threading.current_thread().name, mode, vocabulary_hints))
+                        txt = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
+                        return RefinerResult(text=f"refined:{txt}", provider="capture_stage2", model="m", latency_ms=1)
+
+                plat = _FakePlatform()
+                cfg = Config(refiner=RefinerConfig(provider="deepseek"))
+                cfg.asr.hotwords_file = str(hw_file)
+                daemon = VoiceInputDaemon(
+                    cfg,
+                    env={},
+                    runtime_dir=Path(td),
+                    platform=plat,
+                    asr_provider=_FakeAsr("热键队列测试"),
+                    refiner=_CaptureStage2Refiner(),
+                    tracker=_isolated_tracker(Path(td)),
+                    paste_settle_sec=0.0,
+                )
+                try:
+                    # 1. Agent mode (terminal foreground) via real hotkey queue -> _run_stage2_slot()
+                    plat.fg = ForegroundWindow(hwnd=101, process="WindowsTerminal", title="codex")
+                    daemon._last_trigger_ts = -1e9
+                    self.assertTrue(daemon.handle_trigger("ptt_start")["ok"])
+                    daemon._last_trigger_ts = -1e9
+                    s1 = daemon.handle_trigger("ptt_stop")
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline and daemon.last_result.get("seq_id") != s1["seq_id"]:
+                        time.sleep(0.02)
+                    self.assertEqual(daemon.last_result.get("seq_id"), s1["seq_id"])
+                    self.assertEqual(len(seen_calls), 1)
+                    self.assertTrue(seen_calls[0][0].startswith("avi-stage2-"), seen_calls[0][0])
+                    self.assertEqual(seen_calls[0][1], "agent")
+                    self.assertIn("CodingCrate (ASR has misheard as: 科丁)", seen_calls[0][2])
+                    self.assertIn("GlobalName (ASR has misheard as: 格洛博)", seen_calls[0][2])
+                    self.assertNotIn("ChatFriend", seen_calls[0][2])
+
+                    # 2. General mode (general GUI foreground) via real hotkey queue -> _run_stage2_slot()
+                    plat.fg = ForegroundWindow(hwnd=202, process="WeChat", title="微信")
+                    daemon._last_trigger_ts = -1e9
+                    self.assertTrue(daemon.handle_trigger("ptt_start")["ok"])
+                    daemon._last_trigger_ts = -1e9
+                    s2 = daemon.handle_trigger("ptt_stop")
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline and daemon.last_result.get("seq_id") != s2["seq_id"]:
+                        time.sleep(0.02)
+                    self.assertEqual(daemon.last_result.get("seq_id"), s2["seq_id"])
+                    self.assertEqual(len(seen_calls), 2)
+                    self.assertTrue(seen_calls[1][0].startswith("avi-stage2-"), seen_calls[1][0])
+                    self.assertEqual(seen_calls[1][1], "general")
+                    self.assertIn("GlobalName (ASR has misheard as: 格洛博)", seen_calls[1][2])
+                    self.assertIn("ChatFriend (ASR has misheard as: 查特)", seen_calls[1][2])
+                    self.assertNotIn("CodingCrate", seen_calls[1][2])
+                finally:
+                    daemon.close()
+            finally:
+                clear_hotwords_cache()
+
+    def test_vocabulary_hints_echo_strip_guard_noop_novocab_literal_draft_and_normal_echo(self) -> None:
+        from agent_voice_input.hotwords import format_stage2_vocabulary_hints
+        from agent_voice_input.refiner import NoopRefiner, OpenAICompatibleRefiner
+
+        inline_example = "请保留 <vocabulary_hints>Alpha</vocabulary_hints> 作为示例"
+        head_echo = '<vocabulary_hints read_only="true">\nGhostty\n</vocabulary_hints>\n打开 Ghostty'
+        vocab_blk = format_stage2_vocabulary_hints(["Ghostty"])
+
+        # 1. NoopRefiner (refiner off) MUST NEVER run strip_vocabulary_hints_echo
+        noop = NoopRefiner()
+        self.assertEqual(noop.refine(inline_example, vocabulary_hints=vocab_blk).text, inline_example)
+        self.assertEqual(noop.refine(head_echo, vocabulary_hints=vocab_blk).text, head_echo)
+
+        # 2. Refiner with NO vocabulary_hints sent -> MUST NOT strip echoed tags
+        cfg = Config(refiner=RefinerConfig(provider="deepseek", model="deepseek-chat"))
+        env = {"DEEPSEEK_API_KEY": "sk-ds-echo-" + ("f" * 16)}
+        canned_reply = [head_echo]
+
+        def _tx(req: HttpRequest) -> HttpResponse:
+            del req
+            return HttpResponse(
+                200,
+                {"content-type": "application/json"},
+                json.dumps({"choices": [{"message": {"content": canned_reply[0]}}]}).encode("utf-8"),
+            )
+
+        ref = OpenAICompatibleRefiner(
+            cfg, resolve_credentials(cfg, env), env=env, transport=_tx, provider_name="deepseek"
+        )
+        res_no_vocab = ref.refine("打开 Ghostty", mode="general", vocabulary_hints="")
+        self.assertEqual(res_no_vocab.text, head_echo)
+
+        # 3. Refiner WITH vocabulary_hints AND original draft literally mentions <vocabulary_hints -> preserve!
+        canned_reply[0] = head_echo
+        res_lit_draft = ref.refine(
+            "保留 <vocabulary_hints>Alpha</vocabulary_hints> 示例",
+            mode="general",
+            vocabulary_hints=vocab_blk,
+        )
+        self.assertEqual(res_lit_draft.text, head_echo)
+
+        # 4. Refiner WITH vocabulary_hints AND clean draft:
+        #    - leading/trailing echo IS stripped
+        #    - inline mid-sentence example IS preserved
+        canned_reply[0] = head_echo
+        res_stripped = ref.refine("打开 高斯提", mode="general", vocabulary_hints=vocab_blk)
+        self.assertEqual(res_stripped.text, "打开 Ghostty")
+
+        canned_reply[0] = inline_example
+        res_inline = ref.refine("请保留示例", mode="general", vocabulary_hints=vocab_blk)
+        self.assertEqual(res_inline.text, inline_example)
 
 
 if __name__ == "__main__":
