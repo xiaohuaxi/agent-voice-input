@@ -19,16 +19,12 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from agent_voice_input.app_scope import (  # noqa: E402
-    BUILTIN_AI_CHAT_HOTWORDS,
     CODING_GUI_PATTERNS,
     REMOTE_CLIENT_PATTERNS,
-    classify_target_app_hint,
     classify_window_category,
-    get_builtin_ai_chat_hotwords,
     is_remote_client_window,
     match_app_patterns,
     normalize_app_token,
-    resolve_hotwords_scope,
     resolve_windows_paste_chord,
 )
 from agent_voice_input.asr_providers import (  # noqa: E402
@@ -80,11 +76,9 @@ class _SpyAsr(BaseAsrProvider):
         self,
         text: str = "测试语音输入",
         *,
-        hotwords_file: str = "",
         env: dict[str, str] | None = None,
     ) -> None:
         self.text = text
-        self.hotwords_file = hotwords_file
         self.env = env
         self.seen_contexts: list[AsrContext] = []
 
@@ -97,7 +91,7 @@ class _SpyAsr(BaseAsrProvider):
         **_kw: object,
     ) -> AsrResult:
         del wav_bytes, is_cancelled
-        eff_ctx = _coerce_context(context, self.hotwords_file, env=self.env)
+        eff_ctx = _coerce_context(context, env=self.env)
         self.seen_contexts.append(eff_ctx)
         return AsrResult(text=self.text, provider="dashscope", model="qwen3-asr-flash", latency_ms=15)
 
@@ -247,7 +241,7 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
         # 2. TOML (stdlib + Python 3.10 _parse_simple_toml) & JSON + cli_overrides precedence
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
-            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
             cfg_file = cfg_dir / "config.toml"
 
@@ -541,7 +535,7 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
             home = tmp / "home"
             rt = tmp / "rt"
             rt.mkdir(parents=True, mode=0o700)
-            hw_file = home / ".config" / "agent-voice-input" / "hotwords.txt"
+            hw_file = home / ".agent-voice-input" / "hotwords" / "personal.txt"
             hw_file.parent.mkdir(parents=True)
             hw_file.write_text("MyCustomBrand\n", encoding="utf-8")
 
@@ -589,13 +583,12 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
             tracker.sync_session = _counting_sync  # type: ignore[method-assign]
 
             cfg = Config()
-            cfg.asr.hotwords_file = str(hw_file)
             cfg.refiner.provider = "dashscope"
             plat = _DummyPlatform()
 
             # 1. Terminal window -> runs sync_session, mode="agent", injects session + built-in AI/CLI hotwords
             env_t = {"HOME": str(home), "DASHSCOPE_API_KEY": "sk-test"}
-            asr_term = _SpyAsr("检查 secret bg cli symbol", hotwords_file=str(hw_file), env=env_t)
+            asr_term = _SpyAsr("检查 secret bg cli symbol", env=env_t)
             ref_term = _SpyRefiner()
             res_term = run_pipeline_once(
                 _voiced_wav(),
@@ -626,7 +619,7 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
                 ForegroundWindow(202, "Code.exe", "main.py - Visual Studio Code"),
                 ForegroundWindow(203, "Antigravity", "workspace", bundle_id="com.google.antigravity"),
             ):
-                asr_ide = _SpyAsr("把 fast API 路由改一下", hotwords_file=str(hw_file), env=env_t)
+                asr_ide = _SpyAsr("把 fast API 路由改一下", env=env_t)
                 ref_ide = _SpyRefiner()
                 res_ide = run_pipeline_once(
                     _voiced_wav(),
@@ -652,14 +645,14 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
                 self.assertNotIn("secret_bg_cli_symbol.py", ide_hw)
 
             # 3. General GUI (Browser / ChatGPT Desktop / WeChat) -> skips sync_session AND uses mode="general"
-            # with zero CLI session leak and zero built-in coding hotwords (ai_chat receives built-in AI chat tail words)
+            # with zero CLI session leak and zero built-in coding/AI hotwords
             sync_calls[0] = 0
-            for gen_win, expect_ai_tail in (
-                (ForegroundWindow(301, "Safari", "Mail", bundle_id="com.apple.Safari"), False),
-                (ForegroundWindow(302, "ChatGPT", "New chat", bundle_id="com.openai.chat"), True),
-                (ForegroundWindow(303, "chrome.exe", "Notion"), False),
+            for gen_win in (
+                ForegroundWindow(301, "Safari", "Mail", bundle_id="com.apple.Safari"),
+                ForegroundWindow(302, "ChatGPT", "New chat", bundle_id="com.openai.chat"),
+                ForegroundWindow(303, "chrome.exe", "Notion"),
             ):
-                asr_gen = _SpyAsr("明天下午三点开会", hotwords_file=str(hw_file), env=env_t)
+                asr_gen = _SpyAsr("明天下午三点开会", env=env_t)
                 ref_gen = _SpyRefiner()
                 res_gen = run_pipeline_once(
                     _voiced_wav(),
@@ -679,14 +672,7 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
                 self.assertEqual(ref_gen.calls[-1]["mode"], "general")
                 self.assertEqual(ref_gen.calls[-1]["session_key"], "")
                 gen_hw = tuple(asr_gen.seen_contexts[-1].hotwords)
-                if expect_ai_tail:
-                    self.assertEqual(gen_hw[0], "MyCustomBrand")
-                    self.assertIn("ChatGPT", gen_hw)
-                    self.assertIn("Claude", gen_hw)
-                    self.assertNotIn("pytest", gen_hw)
-                    self.assertNotIn("secret_bg_cli_symbol.py", gen_hw)
-                else:
-                    self.assertEqual(gen_hw, ("MyCustomBrand",))
+                self.assertEqual(gen_hw, ("MyCustomBrand",))
 
             # 4. retry / file audio_source with explicit GUI foreground window MUST NOT leak background CLI session;
             # headless file diagnostics (empty ForegroundWindow) or explicit --title still sync session!
@@ -697,7 +683,7 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
                     _voiced_wav(),
                     cfg=cfg,
                     tracker=tracker,
-                    asr_provider=_SpyAsr("浏览器恢复录音", hotwords_file=str(hw_file), env=env_t),
+                    asr_provider=_SpyAsr("浏览器恢复录音", env=env_t),
                     refiner=ref_retry_gui,
                     platform=plat,
                     origin_window=ForegroundWindow(301, "Safari", "Mail", bundle_id="com.apple.Safari"),
@@ -714,7 +700,7 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
                 _voiced_wav(),
                 cfg=cfg,
                 tracker=tracker,
-                asr_provider=_SpyAsr("无窗口离线诊断", hotwords_file=str(hw_file), env=env_t),
+                asr_provider=_SpyAsr("无窗口离线诊断", env=env_t),
                 refiner=_SpyRefiner(),
                 platform=None,
                 origin_window=ForegroundWindow(0, "", ""),
@@ -1270,103 +1256,35 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
             self.assertGreaterEqual(len(tmux_calls), 2)
             self.assertEqual(pbcopy_writes, [])
 
-    def test_ai_chat_desktop_clients_browser_brand_suffixes_and_builtin_hotwords(self) -> None:
-        # 1. Standalone AI desktop apps (including GrokBot Mac app com.anysphere.sand / "Grok Bot")
-        for ai_win in (
-            ForegroundWindow(1, "Grok Bot", "Grok Bot", bundle_id="com.anysphere.sand"),
-            ForegroundWindow(2, "Grok Bot", "Chat"),
-            ForegroundWindow(3, "GrokBot.exe", "GrokBot"),
-            ForegroundWindow(4, "Grok", "Ask anything", bundle_id="ai.x.grok"),
-            ForegroundWindow(5, "Perplexity", "Search", bundle_id="ai.perplexity.mac"),
-            ForegroundWindow(6, "Poe", "Assistant", bundle_id="com.quora.poe.electron"),
-            ForegroundWindow(7, "Poe.exe", "Poe"),
-            ForegroundWindow(8, "DeepSeek", "Chat", bundle_id="com.deepseek.chat"),
-            ForegroundWindow(9, "Kimi", "Kimi", bundle_id="com.moonshot.kimi"),
-            ForegroundWindow(10, "豆包", "豆包", bundle_id="com.bytedance.doubao.desktop"),
-            ForegroundWindow(11, "LM Studio", "Local LLM", bundle_id="ai.elementlabs.lmstudio"),
+    def test_general_mode_asr_context_has_no_builtin_ai_chat_tail(self) -> None:
+        import agent_voice_input.app_scope as app_scope_mod
+
+        for removed_attr in (
+            "HotwordsScope",
+            "AI_CHAT_PATTERNS",
+            "IM_CHAT_PATTERNS",
+            "BUILTIN_AI_CHAT_HOTWORDS",
+            "get_builtin_ai_chat_hotwords",
+            "classify_target_app_hint",
+            "resolve_hotwords_scope",
         ):
-            self.assertEqual(classify_target_app_hint(ai_win), "ai_chat", msg=f"missed {ai_win}")
-            self.assertEqual(resolve_hotwords_scope(ai_win, mode="general"), "chat", msg=f"scope {ai_win}")
+            self.assertFalse(hasattr(app_scope_mod, removed_attr), msg=f"still exported: {removed_attr}")
 
-        # 2. Known browsers with explicit trailing AI brand segments -> ai_chat
-        for browser_ai in (
-            ForegroundWindow(20, "Google Chrome", "KV Cache Explained - Claude - Google Chrome", bundle_id="com.google.Chrome"),
-            ForegroundWindow(21, "chrome.exe", "Compare models | Grok - Google Chrome"),
-            ForegroundWindow(22, "Safari", "Claude", bundle_id="com.apple.Safari"),
-            ForegroundWindow(23, "Safari", "Query| Grok", bundle_id="com.apple.Safari"),
-            ForegroundWindow(24, "Arc", "DeepSeek - Arc", bundle_id="company.thebrowser.Browser"),
-            ForegroundWindow(25, "Dia", "Research notes - Perplexity", bundle_id="company.thebrowser.dia"),
-            ForegroundWindow(26, "msedge.exe", "New chat - ChatGPT - Microsoft Edge"),
-            ForegroundWindow(27, "Firefox", "Prompt tuning — Poe — Mozilla Firefox", bundle_id="org.mozilla.firefox"),
-            ForegroundWindow(28, "Brave Browser", "LoRA notes – Google Gemini - Brave Browser", bundle_id="com.brave.Browser"),
-            ForegroundWindow(29, "Zen", "Design Q&A · Kimi - Zen Browser", bundle_id="app.zen-browser.zen"),
-        ):
-            self.assertEqual(classify_target_app_hint(browser_ai), "ai_chat", msg=f"missed {browser_ai}")
-            self.assertEqual(resolve_hotwords_scope(browser_ai, mode="general"), "chat", msg=f"scope {browser_ai}")
-
-        # 3. Strict negative matrix: IDEs, terminals, non-browser apps, and non-brand browser tabs MUST NOT match ai_chat!
-        for non_ai in (
-            ForegroundWindow(40, "Code.exe", "claude.py - Visual Studio Code"),
-            ForegroundWindow(41, "Code.exe", "grok.md - Visual Studio Code"),
-            ForegroundWindow(42, "Code.exe", "Fix - Claude - Visual Studio Code"),
-            ForegroundWindow(43, "Cursor", "perplexity.ts — proj — Cursor", bundle_id="com.todesktop.230313mzl4w4u92"),
-            ForegroundWindow(44, "Antigravity", "grok.py — repo", bundle_id="com.google.antigravity"),
-            ForegroundWindow(45, "Ghostty", "topic - Claude", bundle_id=GHOSTTY_BUNDLE_ID),
-            ForegroundWindow(46, "WindowsTerminal.exe", "query | Grok"),
-            ForegroundWindow(47, "Notion", "Roadmap - Claude"),
-            ForegroundWindow(48, "Notes", "Ideas | Grok", bundle_id="com.apple.Notes"),
-            ForegroundWindow(49, "Google Chrome", "claude.py - GitHub - Google Chrome", bundle_id="com.google.Chrome"),
-            ForegroundWindow(50, "Google Chrome", "grok.md - Google Chrome", bundle_id="com.google.Chrome"),
-            ForegroundWindow(51, "Google Chrome", "my-claude - Google Chrome", bundle_id="com.google.Chrome"),
-            ForegroundWindow(52, "Google Chrome", "awesome-grok - Google Chrome", bundle_id="com.google.Chrome"),
-            ForegroundWindow(53, "Google Chrome", " - Claude - Google Chrome", bundle_id="com.google.Chrome"),
-            ForegroundWindow(54, "Google Chrome", "", bundle_id="com.google.Chrome"),
-            ForegroundWindow(55, "Google Chrome", "Google Chrome", bundle_id="com.google.Chrome"),
-            ForegroundWindow(56, "Safari", "Claude API Docs - Anthropic", bundle_id="com.apple.Safari"),
-        ):
-            self.assertEqual(classify_target_app_hint(non_ai), "", msg=f"false positive on {non_ai}")
-
-        # 4. Built-in ai_chat hotwords sanity, language filter, and low-priority tail placement
-        self.assertGreaterEqual(len(BUILTIN_AI_CHAT_HOTWORDS), 25)
-        self.assertLessEqual(len(BUILTIN_AI_CHAT_HOTWORDS), 30)
-        self.assertEqual(len(BUILTIN_AI_CHAT_HOTWORDS), len({w.lower() for w in BUILTIN_AI_CHAT_HOTWORDS}))
-        self.assertEqual(get_builtin_ai_chat_hotwords("auto"), BUILTIN_AI_CHAT_HOTWORDS)
-        self.assertEqual(get_builtin_ai_chat_hotwords("zh-CN"), BUILTIN_AI_CHAT_HOTWORDS)
-        en_ai_hw = get_builtin_ai_chat_hotwords("en-US")
-        self.assertNotIn("豆包", en_ai_hw)
-        self.assertIn("Grok", en_ai_hw)
-        self.assertIn("KV Cache", en_ai_hw)
-
-        ctx_ai = SessionTracker.build_asr_context(
+        ctx_zh = SessionTracker.build_asr_context(
             None,
             extra_hotwords=["MyCustomBrand"],
             mode="general",
             language="zh-CN",
-            target_hint="ai_chat",
         )
-        self.assertEqual(ctx_ai.hotwords[0], "MyCustomBrand")
-        self.assertIn("Grok", ctx_ai.hotwords)
-        self.assertIn("豆包", ctx_ai.hotwords)
-        self.assertLess(ctx_ai.hotwords.index("MyCustomBrand"), ctx_ai.hotwords.index("ChatGPT"))
+        self.assertEqual(ctx_zh.hotwords, ["MyCustomBrand"])
 
-        ctx_ai_en = SessionTracker.build_asr_context(
+        ctx_en = SessionTracker.build_asr_context(
             None,
             extra_hotwords=["MyCustomBrand"],
             mode="general",
             language="en",
-            target_hint="ai_chat",
         )
-        self.assertEqual(ctx_ai_en.hotwords[0], "MyCustomBrand")
-        self.assertIn("Grok", ctx_ai_en.hotwords)
-        self.assertNotIn("豆包", ctx_ai_en.hotwords)
-
-        ctx_im = SessionTracker.build_asr_context(
-            None,
-            extra_hotwords=["MyCustomBrand"],
-            mode="general",
-            target_hint="im_chat",
-        )
-        self.assertEqual(ctx_im.hotwords, ["MyCustomBrand"])
+        self.assertEqual(ctx_en.hotwords, ["MyCustomBrand"])
 
     def test_no_auto_enter_static_guard(self) -> None:
         forbidden_patterns = (

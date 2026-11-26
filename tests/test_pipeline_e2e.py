@@ -412,19 +412,14 @@ class FullPipelineLoopbackE2ETests(unittest.TestCase):
             sid = "22222222-3333-4444-5555-666666666666"
             _write_large_claude_jsonl(home_dir, sid, real_repo)
 
-            hw_file = cfg_dir / "hotwords.txt"
+            hw_file = home_dir / ".agent-voice-input" / "hotwords" / "personal.txt"
+            hw_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             hw_file.write_text(
                 "\n".join(
                     [
-                        "[global]",
+                        "!KVCacheScheduler",
                         "OpenTelemetry",
-                        "",
-                        "[coding]",
-                        "KVCacheScheduler",
                         "vLLM",
-                        "",
-                        "[chat]",
-                        "ChatOnlyTermNotForCoding",
                         "",
                     ]
                 ),
@@ -459,7 +454,6 @@ class FullPipelineLoopbackE2ETests(unittest.TestCase):
                         'api = "audio-transcriptions"',
                         f'base_url = "{server.base_url}"',
                         'model = "whisper-loopback"',
-                        f'hotwords_file = "{hw_file.as_posix()}"',
                         "max_retries = 0",
                         "",
                         "[refiner]",
@@ -493,7 +487,6 @@ class FullPipelineLoopbackE2ETests(unittest.TestCase):
                     api="audio-transcriptions",
                     base_url=server.base_url,
                     model="whisper-loopback",
-                    hotwords_file=str(hw_file),
                     max_retries=0,
                 ),
                 refiner=RefinerConfig(
@@ -545,7 +538,6 @@ class FullPipelineLoopbackE2ETests(unittest.TestCase):
                 self.assertEqual(wf1.getframerate(), 16000)
             self.assertIn("KVCacheScheduler", s1_req["prompt"])
             self.assertIn("OpenTelemetry", s1_req["prompt"])
-            self.assertNotIn("ChatOnlyTermNotForCoding", s1_req["prompt"])
 
             # Verify Stage 2 SSE request received >=2 50K developer chunks + real git status + draft, no Fast flag
             self.assertEqual(len(server.refiner_requests), 1)
@@ -567,7 +559,6 @@ class FullPipelineLoopbackE2ETests(unittest.TestCase):
             self.assertIn("<vocabulary_hints", dev_blocks[0])
             self.assertIn("KVCacheScheduler", dev_blocks[0])
             self.assertIn("OpenTelemetry", dev_blocks[0])
-            self.assertNotIn("ChatOnlyTermNotForCoding", dev_blocks[0])
             self.assertTrue(all("<session_reference_log" in b for b in dev_blocks[1:]))
             user_block = s2_req["input"][-1]["content"][0]["text"]
             self.assertIn("<workspace_git_status", user_block)

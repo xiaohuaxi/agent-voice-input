@@ -133,7 +133,7 @@ The hook checks `presence/<cid>.lock` file locks, the opening JSONL record, and 
 
 When dictating from a local macOS or Windows+WSL2 machine into a headless remote Linux server over SSH:
 
-1. **Whitelist the host locally** in `~/.config/agent-voice-input/config.toml`:
+1. **Whitelist the host locally** in `~/.agent-voice-input/config.toml`:
    ```toml
    [remote]
    hosts = ["devbox"]

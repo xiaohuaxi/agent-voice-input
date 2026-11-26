@@ -56,16 +56,20 @@ from .config import (
     select_asr_provider,
 )
 from .hotwords import (
+    HOTWORDS_QUOTA_SPECS,
     HotwordEntry,
+    HotwordsTable,
     STAGE2_HOTWORDS_MAX_CHARS,
     STAGE2_HOTWORDS_MAX_ITEMS,
     STAGE2_VOCABULARY_HINTS_PREAMBLE,
     budget_hotwords_for_provider,
-    budget_openai_keywords,
     dedupe_hotwords_ci,
     format_stage2_vocabulary_hints,
-    load_hotwords_file as _load_hotwords_file_impl,
-    select_stage2_manual_entries,
+    load_hotwords_table,
+    order_stage1_entries,
+    order_stage2_entries,
+    project_stage1_hotwords,
+    resolve_personal_hotwords_path,
 )
 from .http_transport import (
     CancelToken,
@@ -133,8 +137,6 @@ from .prompts import (
     SINGLE_HOP_GENERAL_SYSTEM_PROMPT,
     SINGLE_HOP_SYSTEM_PROMPT,
     SINGLE_HOP_TASK_REMINDER,
-    format_target_app_hint,
-    strip_target_hint_echo,
     strip_vocabulary_hints_echo,
 )
 
@@ -163,97 +165,207 @@ class AsrError(RuntimeError):
 
 
 
-def load_hotwords_file(
-    path_str: str,
-    *,
+def _load_personal_hotwords_snapshot(
     env: Mapping[str, str] | None = None,
-    scene: str = "global",
-) -> list[str]:
-    """Load optional user hotwords file for ``scene`` (delegates to ``hotwords.load_hotwords_file``)."""
-    return _load_hotwords_file_impl(path_str, env=env, scene=scene)
+) -> HotwordsTable:
+    """Load the single personal hotwords table snapshot for ``env``."""
+    hw_path = resolve_personal_hotwords_path(env)
+    if hw_path is None:
+        return HotwordsTable(path=None, exists=False)
+    return load_hotwords_table(hw_path, env=env)
 
 
-def _derive_context_hotwords_scope(mode: str, target_hint: str, explicit_scope: str = "") -> str:
-    s = (explicit_scope or "").strip().lower()
-    if s in ("global", "chat", "coding"):
-        return s
-    hint = (target_hint or "").strip().lower()
-    if hint in ("im_chat", "ai_chat"):
-        return "chat"
-    return "global" if (mode or "agent").strip().lower() == "general" else "coding"
+def _clean_hotword_tuple(raw: Any) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    if isinstance(raw, str):
+        s = raw.strip()
+        return (s,) if s else ()
+    return tuple(dedupe_hotwords_ci([str(w).strip() for w in raw if str(w).strip()]))
+
+
+def _has_any_hotwords(ctx: AsrContext) -> bool:
+    return bool(
+        ctx.hotwords
+        or ctx.personal_hotwords
+        or ctx.dynamic_hotwords
+        or ctx.builtin_hotwords
+    )
 
 
 def _coerce_context(
     ctx: AsrContext | Mapping[str, Any] | None,
-    hotwords_file: str = "",
     *,
     env: Mapping[str, str] | None = None,
+    personal_table: HotwordsTable | None = None,
 ) -> AsrContext:
-    has_hw_file = bool(hotwords_file and hotwords_file.strip())
     if ctx is None:
-        file_words = load_hotwords_file(hotwords_file, env=env, scene="global") if has_hw_file else []
+        table = (
+            personal_table
+            if personal_table is not None
+            else _load_personal_hotwords_snapshot(env)
+        )
+        p_terms = tuple(e.term for e in order_stage1_entries(table.entries))
         return AsrContext(
-            hotwords=file_words,
-            hotwords_scope="global",
-            manual_hotwords_loaded=has_hw_file,
+            hotwords=list(p_terms),
+            manual_hotwords_loaded=True,
+            personal_hotwords=p_terms,
+            dynamic_hotwords=(),
+            builtin_hotwords=(),
+            hotwords_bucketed=True,
         )
     if isinstance(ctx, AsrContext):
         eff_mode = (ctx.mode or "agent").strip().lower() or "agent"
-        eff_hint = (ctx.target_hint or "").strip().lower()
-        eff_scope = _derive_context_hotwords_scope(eff_mode, eff_hint, ctx.hotwords_scope)
-        if ctx.manual_hotwords_loaded or not has_hw_file:
-            merged_words = dedupe_hotwords_ci(ctx.hotwords)
-            loaded = bool(ctx.manual_hotwords_loaded)
-        else:
-            file_words = load_hotwords_file(hotwords_file, env=env, scene=eff_scope)
-            merged_words = dedupe_hotwords_ci([*file_words, *ctx.hotwords])
-            loaded = True
-        return AsrContext(
-            hotwords=merged_words,
+        clean_blocks = tuple(str(b) for b in (ctx.context_blocks or ()) if str(b).strip())
+        if ctx.manual_hotwords_loaded:
+            if ctx.hotwords_bucketed:
+                p_hw = tuple(dedupe_hotwords_ci(ctx.personal_hotwords))
+                d_hw = () if eff_mode == "general" else tuple(dedupe_hotwords_ci(ctx.dynamic_hotwords))
+                b_hw = () if eff_mode == "general" else tuple(dedupe_hotwords_ci(ctx.builtin_hotwords))
+                merged_words = (
+                    dedupe_hotwords_ci(ctx.hotwords)
+                    if ctx.hotwords
+                    else dedupe_hotwords_ci([*p_hw, *d_hw, *b_hw])
+                )
+                return replace(
+                    ctx,
+                    hotwords=merged_words,
+                    git_status=ctx.git_status or "",
+                    dialog_text=ctx.dialog_text or "",
+                    context_blocks=clean_blocks,
+                    git_block=ctx.git_block or "",
+                    mode=eff_mode,
+                    single_hop_prepared=bool(ctx.single_hop_prepared),
+                    manual_hotwords_loaded=True,
+                    personal_hotwords=p_hw,
+                    dynamic_hotwords=d_hw,
+                    builtin_hotwords=b_hw,
+                    hotwords_bucketed=True,
+                )
+            return replace(
+                ctx,
+                hotwords=dedupe_hotwords_ci(ctx.hotwords),
+                git_status=ctx.git_status or "",
+                dialog_text=ctx.dialog_text or "",
+                context_blocks=clean_blocks,
+                git_block=ctx.git_block or "",
+                mode=eff_mode,
+                single_hop_prepared=bool(ctx.single_hop_prepared),
+                manual_hotwords_loaded=True,
+            )
+
+        table = (
+            personal_table
+            if personal_table is not None
+            else _load_personal_hotwords_snapshot(env)
+        )
+        file_terms = tuple(e.term for e in order_stage1_entries(table.entries))
+        if ctx.hotwords_bucketed:
+            p_hw = tuple(dedupe_hotwords_ci([*file_terms, *ctx.personal_hotwords]))
+            d_hw = () if eff_mode == "general" else tuple(dedupe_hotwords_ci(ctx.dynamic_hotwords))
+            b_hw = () if eff_mode == "general" else tuple(dedupe_hotwords_ci(ctx.builtin_hotwords))
+            merged_words = dedupe_hotwords_ci([*p_hw, *d_hw, *b_hw])
+            return replace(
+                ctx,
+                hotwords=merged_words,
+                git_status=ctx.git_status or "",
+                dialog_text=ctx.dialog_text or "",
+                context_blocks=clean_blocks,
+                git_block=ctx.git_block or "",
+                mode=eff_mode,
+                single_hop_prepared=bool(ctx.single_hop_prepared),
+                manual_hotwords_loaded=True,
+                personal_hotwords=p_hw,
+                dynamic_hotwords=d_hw,
+                builtin_hotwords=b_hw,
+                hotwords_bucketed=True,
+            )
+
+        raw_words = dedupe_hotwords_ci(ctx.hotwords)
+        if file_terms:
+            if eff_mode == "general":
+                p_hw = tuple(dedupe_hotwords_ci([*file_terms, *raw_words]))
+                d_hw = ()
+            else:
+                p_hw = file_terms
+                d_hw = tuple(raw_words)
+            merged_words = dedupe_hotwords_ci([*p_hw, *d_hw])
+            return replace(
+                ctx,
+                hotwords=merged_words,
+                git_status=ctx.git_status or "",
+                dialog_text=ctx.dialog_text or "",
+                context_blocks=clean_blocks,
+                git_block=ctx.git_block or "",
+                mode=eff_mode,
+                single_hop_prepared=bool(ctx.single_hop_prepared),
+                manual_hotwords_loaded=True,
+                personal_hotwords=p_hw,
+                dynamic_hotwords=d_hw,
+                builtin_hotwords=(),
+                hotwords_bucketed=True,
+            )
+        if raw_words:
+            return replace(
+                ctx,
+                hotwords=raw_words,
+                git_status=ctx.git_status or "",
+                dialog_text=ctx.dialog_text or "",
+                context_blocks=clean_blocks,
+                git_block=ctx.git_block or "",
+                mode=eff_mode,
+                single_hop_prepared=bool(ctx.single_hop_prepared),
+                manual_hotwords_loaded=True,
+                hotwords_bucketed=False,
+            )
+        return replace(
+            ctx,
+            hotwords=[],
             git_status=ctx.git_status or "",
             dialog_text=ctx.dialog_text or "",
-            context_blocks=tuple(str(b) for b in (ctx.context_blocks or ()) if str(b).strip()),
+            context_blocks=clean_blocks,
             git_block=ctx.git_block or "",
             mode=eff_mode,
             single_hop_prepared=bool(ctx.single_hop_prepared),
-            target_hint=eff_hint,
-            hotwords_scope=eff_scope,
-            manual_hotwords_loaded=loaded,
+            manual_hotwords_loaded=True,
+            personal_hotwords=(),
+            dynamic_hotwords=(),
+            builtin_hotwords=(),
+            hotwords_bucketed=True,
         )
     if isinstance(ctx, Mapping):
         raw_hw = ctx.get("hotwords") or []
         hw_list = [str(w).strip() for w in raw_hw if str(w).strip()]
-        eff_mode = str(ctx.get("mode") or "agent").strip().lower() or "agent"
-        eff_hint = str(ctx.get("target_hint") or "").strip().lower()
-        eff_scope = _derive_context_hotwords_scope(
-            eff_mode, eff_hint, str(ctx.get("hotwords_scope") or "")
+        p_in = _clean_hotword_tuple(ctx.get("personal_hotwords"))
+        d_in = _clean_hotword_tuple(ctx.get("dynamic_hotwords"))
+        b_in = _clean_hotword_tuple(ctx.get("builtin_hotwords"))
+        has_bucket_flag = "hotwords_bucketed" in ctx
+        bucketed = (
+            bool(ctx.get("hotwords_bucketed"))
+            if has_bucket_flag
+            else bool(p_in or d_in or b_in)
         )
-        preloaded = bool(ctx.get("manual_hotwords_loaded", False))
-        if preloaded or not has_hw_file:
-            merged_words = dedupe_hotwords_ci(hw_list)
-            loaded = preloaded
-        else:
-            file_words = load_hotwords_file(hotwords_file, env=env, scene=eff_scope)
-            merged_words = dedupe_hotwords_ci([*file_words, *hw_list])
-            loaded = True
         raw_blocks = ctx.get("context_blocks") or ()
         blk_tuple = (
             (str(raw_blocks),)
             if isinstance(raw_blocks, str) and raw_blocks.strip()
             else tuple(str(b) for b in raw_blocks if str(b).strip())
         )
-        return AsrContext(
-            hotwords=merged_words,
+        as_dc = AsrContext(
+            hotwords=hw_list,
             git_status=str(ctx.get("git_status") or ""),
             dialog_text=str(ctx.get("dialog_text") or ""),
             context_blocks=blk_tuple,
             git_block=str(ctx.get("git_block") or ""),
-            mode=eff_mode,
+            mode=str(ctx.get("mode") or "agent").strip().lower() or "agent",
             single_hop_prepared=bool(ctx.get("single_hop_prepared", False)),
-            target_hint=eff_hint,
-            hotwords_scope=eff_scope,
-            manual_hotwords_loaded=loaded,
+            manual_hotwords_loaded=bool(ctx.get("manual_hotwords_loaded", False)),
+            personal_hotwords=p_in,
+            dynamic_hotwords=d_in,
+            builtin_hotwords=b_in,
+            hotwords_bucketed=bucketed,
         )
+        return _coerce_context(as_dc, env=env, personal_table=personal_table)
     raise TypeError(f"unsupported context type: {type(ctx).__name__}")
 
 
@@ -296,57 +408,73 @@ def _extract_vocab_block_stats(blocks: Sequence[str]) -> tuple[set[str], int, in
     return lows, used_items, used_chars
 
 
-def _load_stage2_manual_entries_for_single_hop(
-    hotwords_file: str,
+def _resolve_single_hop_snapshot(
+    raw_context: AsrContext | Mapping[str, Any] | None,
     *,
-    mode: str,
     env: Mapping[str, str] | None = None,
-) -> list[HotwordEntry]:
-    if not hotwords_file or not hotwords_file.strip():
-        return []
-    eff_mode = "general" if (mode or "agent").strip().lower() == "general" else "agent"
-    return select_stage2_manual_entries(hotwords_file, mode=eff_mode, env=env)
+) -> HotwordsTable | None:
+    """Load personal hotwords at most once per single-hop request (skip disk read if already prepared)."""
+    if isinstance(raw_context, AsrContext):
+        loaded = bool(raw_context.manual_hotwords_loaded)
+        prepared = bool(raw_context.single_hop_prepared)
+        blocks: Sequence[str] = raw_context.context_blocks or ()
+    elif isinstance(raw_context, Mapping):
+        loaded = bool(raw_context.get("manual_hotwords_loaded", False))
+        prepared = bool(raw_context.get("single_hop_prepared", False))
+        raw_blocks = raw_context.get("context_blocks") or ()
+        blocks = (raw_blocks,) if isinstance(raw_blocks, str) else tuple(str(b) for b in raw_blocks)
+    else:
+        loaded = False
+        prepared = False
+        blocks = ()
+    if loaded and (prepared or any(_is_vocab_hints_block(b) for b in blocks)):
+        return None
+    return _load_personal_hotwords_snapshot(env)
 
 
 def _format_single_hop_tail_vocabulary(
     ctx: AsrContext,
     blocks: Sequence[str],
     *,
-    hotwords_file: str,
-    env: Mapping[str, str] | None = None,
+    manual_entries: Sequence[HotwordEntry] = (),
 ) -> str:
-    """Render single-hop vocabulary sharing the unified 100-item / 1,500-char budget without duplicating leading hints."""
-    manual_entries = _load_stage2_manual_entries_for_single_hop(
-        hotwords_file, mode=ctx.mode, env=env
+    """Render remaining dynamic context terms outside Block 0 within the 200-item / 3,000-char budget.
+
+    Never mixes ``builtin_hotwords`` or overflows from ``personal_hotwords`` into the tail list.
+    """
+    if (ctx.mode or "agent").strip().lower() == "general":
+        return ""
+    blk_lows, used_items, used_chars = _extract_vocab_block_stats(blocks)
+    rem_items = max(0, STAGE2_HOTWORDS_MAX_ITEMS - used_items)
+    rem_chars = max(0, STAGE2_HOTWORDS_MAX_CHARS - used_chars - (1 if used_chars > 0 else 0))
+    if rem_items <= 0 or rem_chars <= 0:
+        return ""
+    covered_lows = (
+        blk_lows
+        | {e.term.lower() for e in manual_entries}
+        | {w.lower() for w in ctx.personal_hotwords}
     )
-    if any(_is_vocab_hints_block(b) for b in blocks):
-        blk_lows, used_items, used_chars = _extract_vocab_block_stats(blocks)
-        rem_items = max(0, STAGE2_HOTWORDS_MAX_ITEMS - used_items)
-        rem_chars = max(0, STAGE2_HOTWORDS_MAX_CHARS - used_chars - (1 if used_chars > 0 else 0))
-        if rem_items <= 0 or rem_chars <= 0:
-            return ""
-        covered_lows = {e.term.lower() for e in manual_entries} | blk_lows
-        extra_dynamic = [
-            " ".join(w.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").split())
-            for w in dedupe_hotwords_ci(ctx.hotwords)
-            if w.lower() not in covered_lows and w.strip()
-        ]
-        if not extra_dynamic:
-            return ""
-        dyn_budget = budget_hotwords_for_provider(
-            extra_dynamic, "single_hop", max_terms=rem_items, max_chars=rem_chars
-        )
-        if not dyn_budget.kept:
-            return ""
-        return f"Additional context terms (read-only): {', '.join(dyn_budget.kept)}"
-    return format_stage2_vocabulary_hints([*manual_entries, *ctx.hotwords])
+    raw_dyn: Sequence[str] = ctx.dynamic_hotwords if ctx.hotwords_bucketed else ctx.hotwords
+    extra_dynamic = [
+        " ".join(w.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").split())
+        for w in dedupe_hotwords_ci(raw_dyn)
+        if w.strip() and w.lower() not in covered_lows
+    ]
+    if not extra_dynamic:
+        return ""
+    dyn_budget = budget_hotwords_for_provider(
+        extra_dynamic, "single_hop", max_terms=rem_items, max_chars=rem_chars
+    )
+    if not dyn_budget.kept:
+        return ""
+    return f"Additional context terms (read-only): {', '.join(dyn_budget.kept)}"
 
 
 _LITERAL_EMPTY_QUOTES = frozenset({'""', "''", "“”", "‘’", "``"})
 
 
 def _normalize_single_hop_text(raw: str, *, strip_vocab_echo: bool = True) -> str:
-    cleaned = strip_target_hint_echo(strip_lenticular_artifacts(raw))
+    cleaned = strip_lenticular_artifacts(raw)
     if strip_vocab_echo:
         cleaned = strip_vocabulary_hints_echo(cleaned)
     cleaned = cleaned.strip()
@@ -372,7 +500,11 @@ def effective_single_hop_timeout_sec(configured_sec: float, wav_bytes: bytes) ->
 
 
 def _compose_context_text(
-    ctx: AsrContext, max_chars: int, *, include_hotwords: bool = True
+    ctx: AsrContext,
+    max_chars: int,
+    *,
+    include_hotwords: bool = True,
+    max_dialog_chars: int | None = None,
 ) -> str:
     """Compose prioritized context text (hotwords -> git status -> dialog tail) within budget."""
     if max_chars <= 0:
@@ -380,10 +512,11 @@ def _compose_context_text(
     sections: list[str] = []
     used = 0
 
-    if include_hotwords and ctx.hotwords:
+    if include_hotwords and _has_any_hotwords(ctx):
         hw_prefix = "常用技术术语："
-        hw_cap = max(16, max(64, min(900 + len(hw_prefix), max_chars // 2)) - len(hw_prefix))
-        hw_budget = budget_hotwords_for_provider(ctx.hotwords, "dashscope", max_chars=hw_cap)
+        ds_hw_limit = HOTWORDS_QUOTA_SPECS["dashscope"].max_chars or 1800
+        hw_cap = max(16, min(ds_hw_limit, max(64, max_chars // 2) - len(hw_prefix)))
+        hw_budget = project_stage1_hotwords(ctx, "dashscope", max_chars=hw_cap)
         if hw_budget.kept:
             hw_str = hw_prefix + "、".join(hw_budget.kept)
             sections.append(hw_str)
@@ -400,6 +533,8 @@ def _compose_context_text(
     if clean_dialog and used < max_chars - 20:
         prefix = "最近对话参考（仅借用专有名词，勿输出参考中的括号标记）：\n"
         rem = max_chars - used - len(prefix)
+        if max_dialog_chars is not None:
+            rem = min(rem, max(0, int(max_dialog_chars)))
         if rem > 0:
             tail = clean_dialog[-rem:]
             sections.append(prefix + tail)
@@ -410,17 +545,23 @@ def _compose_context_text(
     return combined
 
 
-def _compose_single_hop_unprepared_context(
+def _compose_single_hop_unprepared_parts(
     ctx: AsrContext,
     max_chars: int = 16000,
     *,
     manual_entries: Sequence[HotwordEntry] = (),
-) -> str:
-    """Compose direct single-hop context using the unified 100-item / 1,500-char vocabulary hints without duplication."""
-    vocab_blk = format_stage2_vocabulary_hints([*manual_entries, *ctx.hotwords])
+) -> tuple[str, str, str]:
+    """Return ``(vocab_block_0, session_context_body, tail_dynamic_terms)`` aligned with prepared layout."""
+    vocab_source: Sequence[HotwordEntry | str] = (
+        manual_entries if manual_entries else ctx.personal_hotwords
+    )
+    vocab_blk = format_stage2_vocabulary_hints(vocab_source)
+    tail_vocab = _format_single_hop_tail_vocabulary(
+        ctx, [vocab_blk] if vocab_blk else [], manual_entries=manual_entries
+    )
     rem = max(0, max_chars - (len(vocab_blk) + 2 if vocab_blk else 0))
     ctx_body = _compose_context_text(ctx, max_chars=rem, include_hotwords=False)
-    return "\n\n".join(filter(None, [vocab_blk, ctx_body]))
+    return vocab_blk, ctx_body, tail_vocab
 
 
 def _compose_stt_prompt_text(
@@ -437,10 +578,10 @@ def _compose_stt_prompt_text(
     if max_chars <= 0:
         return ""
     hw_str = ""
-    if include_hotwords and ctx.hotwords:
+    if include_hotwords and _has_any_hotwords(ctx):
         hw_prefix = "常用技术术语："
         hw_cap = max(16, min(360, max(64, max_chars // 2)) - len(hw_prefix))
-        hw_budget = budget_hotwords_for_provider(ctx.hotwords, "whisper", max_chars=hw_cap)
+        hw_budget = project_stage1_hotwords(ctx, "whisper", max_chars=hw_cap)
         if hw_budget.kept:
             # Select head-first (highest-priority manual terms first), then place reversed at prompt tail
             # so #1 highest-priority term sits at the rightmost end of Whisper's ~224-token tail window.
@@ -828,8 +969,8 @@ class DashScopeAsrProvider(BaseAsrProvider):
                 is_single_hop_refined=False,
             )
         cred = self._require_key()
-        ctx = _coerce_context(context, self.cfg.asr.hotwords_file, env=self.env)
-        ctx_text = _compose_context_text(ctx, max_chars=2500)
+        ctx = _coerce_context(context, env=self.env)
+        ctx_text = _compose_context_text(ctx, max_chars=3800, max_dialog_chars=2000)
         b64_wav = base64.b64encode(wav_bytes).decode("ascii")
         data_uri = f"data:audio/wav;base64,{b64_wav}"
 
@@ -1105,7 +1246,7 @@ def _resolve_doubao_base_url(raw_base: str) -> str:
 
 def _build_doubao_corpus_context(ctx: AsrContext) -> str | None:
     """Build serialized Doubao corpus.context strictly within 50 words/500 chars + 600 dialog chars."""
-    hw_budget = budget_hotwords_for_provider(ctx.hotwords, "doubao")
+    hw_budget = project_stage1_hotwords(ctx, "doubao")
     hw_objs = [{"word": w} for w in hw_budget.kept]
 
     dialog_parts: list[str] = []
@@ -1225,7 +1366,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
         pacer_key = make_rate_pacer_key(self.provider_name, base_url, f"{app_id or ''}|{api_key}")
         is_auto_slot, candidates = self._build_candidate_slots(cache_key)
 
-        ctx = _coerce_context(context, self.cfg.asr.hotwords_file, env=self.env)
+        ctx = _coerce_context(context, env=self.env)
         corpus_json = _build_doubao_corpus_context(ctx)
         b64_wav = base64.b64encode(wav_bytes).decode("ascii")
 
@@ -1785,7 +1926,9 @@ class GeminiAudioProvider(BaseAsrProvider):
         url = f"{base}/{model_path}:generateContent"
 
         t0 = self.clock_fn()
-        ctx = _coerce_context(context, self.cfg.asr.hotwords_file, env=self.env)
+        personal_table = _resolve_single_hop_snapshot(context, env=self.env)
+        ctx = _coerce_context(context, env=self.env, personal_table=personal_table)
+        manual_entries = order_stage2_entries(personal_table.entries) if personal_table is not None else []
         audio_bytes, audio_fmt = _prepare_single_hop_audio(wav_bytes)
         b64_audio = base64.b64encode(audio_bytes).decode("ascii")
         mime_type = f"audio/{audio_fmt}"
@@ -1793,36 +1936,42 @@ class GeminiAudioProvider(BaseAsrProvider):
         parts: list[dict[str, Any]] = []
         ctx_chunks = 0
         ctx_chars = 0
-        hint_blk = format_target_app_hint(ctx.target_hint)
         sent_vocab_hints = False
         if ctx.single_hop_prepared or ctx.context_blocks or ctx.git_block:
             blocks = list(ctx.context_blocks)
+            if not any(_is_vocab_hints_block(b) for b in blocks):
+                vocab_source: Sequence[HotwordEntry | str] = (
+                    manual_entries if manual_entries else ctx.personal_hotwords
+                )
+                if vocab_blk := format_stage2_vocabulary_hints(vocab_source):
+                    blocks = [vocab_blk, *blocks]
             sess_blocks = [b for b in blocks if not _is_vocab_hints_block(b)]
             ctx_chunks = len(sess_blocks)
             ctx_chars = sum(len(b) for b in sess_blocks)
             for blk in blocks:
                 parts.append({"text": blk})
             tail_vocab = _format_single_hop_tail_vocabulary(
-                ctx, blocks, hotwords_file=self.cfg.asr.hotwords_file, env=self.env
+                ctx, blocks, manual_entries=manual_entries
             )
-            sent_vocab_hints = any(_is_vocab_hints_block(b) for b in blocks) or (
-                "<vocabulary_hints" in tail_vocab.lower()
-            )
-            tail = "\n\n".join(filter(None, [ctx.git_block, tail_vocab, hint_blk]))
+            sent_vocab_hints = any(_is_vocab_hints_block(b) for b in blocks)
+            tail = "\n\n".join(filter(None, [ctx.git_block, tail_vocab]))
             if tail:
                 parts.append({"text": tail})
         else:
-            manual_entries = _load_stage2_manual_entries_for_single_hop(
-                self.cfg.asr.hotwords_file, mode=ctx.mode, env=self.env
-            )
-            ctx_body = _compose_single_hop_unprepared_context(
+            vocab_blk, ctx_body, tail_vocab = _compose_single_hop_unprepared_parts(
                 ctx, max_chars=16000, manual_entries=manual_entries
             )
-            sent_vocab_hints = "<vocabulary_hints" in ctx_body.lower()
-            if ctx_body:
-                parts.append({"text": f"<session_context>\n{ctx_body}\n</session_context>"})
-            if hint_blk:
-                parts.append({"text": hint_blk})
+            sent_vocab_hints = bool(vocab_blk)
+            if vocab_blk:
+                parts.append({"text": vocab_blk})
+                if ctx_body:
+                    parts.append({"text": f"<session_context>\n{ctx_body}\n</session_context>"})
+                if tail_vocab:
+                    parts.append({"text": tail_vocab})
+            else:
+                unprep_body = "\n\n".join(filter(None, [ctx_body, tail_vocab]))
+                if unprep_body:
+                    parts.append({"text": f"<session_context>\n{unprep_body}\n</session_context>"})
         parts.append(
             {
                 "inlineData": {
@@ -2062,7 +2211,7 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
         api_key = self._resolve_bearer_key(url)
         secrets: tuple[str, ...] = (api_key,) if api_key else ()
         pacer_key = make_rate_pacer_key(self.provider_name, url, api_key or "")
-        ctx = _coerce_context(context, self.cfg.asr.hotwords_file, env=self.env)
+        ctx = _coerce_context(context, env=self.env)
 
         headers: dict[str, str] = {}
         if api_key:
@@ -2077,9 +2226,9 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
                 "input_audio": {"data": b64_wav, "format": "wav"},
                 "response_format": "json",
             }
-            if ctx.hotwords:
-                kt_budget = budget_hotwords_for_provider(
-                    ctx.hotwords, "openrouter", model=model, api="audio-transcriptions"
+            if _has_any_hotwords(ctx):
+                kt_budget = project_stage1_hotwords(
+                    ctx, "openrouter", model=model, api="audio-transcriptions"
                 )
                 if kt_budget.kept:
                     json_payload["keyterms"] = list(kt_budget.kept)
@@ -2092,8 +2241,10 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
                 ("model", model),
                 ("response_format", "json"),
             ]
-            if ctx.hotwords:
-                kw_budget = budget_openai_keywords(ctx.hotwords)
+            if _has_any_hotwords(ctx):
+                kw_budget = project_stage1_hotwords(
+                    ctx, "openai", model=model, api="audio-transcriptions"
+                )
                 for kw in kw_budget.kept:
                     fields.append(("keywords[]", kw))
             prompt = _compose_stt_prompt_text(ctx, max_chars=2000, include_hotwords=False)
@@ -2477,7 +2628,9 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
         pacer_key = make_rate_pacer_key(self.provider_name, url, api_key or "")
 
         t0 = self.clock_fn()
-        ctx = _coerce_context(context, self.cfg.asr.hotwords_file, env=self.env)
+        personal_table = _resolve_single_hop_snapshot(context, env=self.env)
+        ctx = _coerce_context(context, env=self.env, personal_table=personal_table)
+        manual_entries = order_stage2_entries(personal_table.entries) if personal_table is not None else []
         audio_bytes, audio_fmt = _prepare_single_hop_audio(wav_bytes)
         b64_audio = base64.b64encode(audio_bytes).decode("ascii")
         audio_obj = (
@@ -2488,10 +2641,15 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
 
         ctx_chunks = 0
         ctx_chars = 0
-        hint_blk = format_target_app_hint(ctx.target_hint)
         sent_vocab_hints = False
         if ctx.single_hop_prepared or ctx.context_blocks or ctx.git_block:
             blocks = list(ctx.context_blocks)
+            if not any(_is_vocab_hints_block(b) for b in blocks):
+                vocab_source: Sequence[HotwordEntry | str] = (
+                    manual_entries if manual_entries else ctx.personal_hotwords
+                )
+                if vocab_blk := format_stage2_vocabulary_hints(vocab_source):
+                    blocks = [vocab_blk, *blocks]
             sess_blocks = [b for b in blocks if not _is_vocab_hints_block(b)]
             ctx_chunks = len(sess_blocks)
             ctx_chars = sum(len(b) for b in sess_blocks)
@@ -2505,12 +2663,10 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                 for idx, blk in enumerate(blocks)
             ]
             tail_vocab = _format_single_hop_tail_vocabulary(
-                ctx, blocks, hotwords_file=self.cfg.asr.hotwords_file, env=self.env
+                ctx, blocks, manual_entries=manual_entries
             )
-            sent_vocab_hints = any(_is_vocab_hints_block(b) for b in blocks) or (
-                "<vocabulary_hints" in tail_vocab.lower()
-            )
-            tail = "\n\n".join(filter(None, [ctx.git_block, tail_vocab, hint_blk]))
+            sent_vocab_hints = any(_is_vocab_hints_block(b) for b in blocks)
+            tail = "\n\n".join(filter(None, [ctx.git_block, tail_vocab]))
             user_content: list[dict[str, Any]] = [
                 *ctx_parts,
                 *([{"type": "text", "text": tail}] if tail else []),
@@ -2518,22 +2674,30 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                 {"type": "text", "text": CHAT_AUDIO_TASK_REMINDER},
             ]
         else:
-            manual_entries = _load_stage2_manual_entries_for_single_hop(
-                self.cfg.asr.hotwords_file, mode=ctx.mode, env=self.env
-            )
-            ctx_body = _compose_single_hop_unprepared_context(
+            vocab_blk, ctx_body, tail_vocab = _compose_single_hop_unprepared_parts(
                 ctx, max_chars=16000, manual_entries=manual_entries
             )
-            sent_vocab_hints = "<vocabulary_hints" in ctx_body.lower()
-            session_tag = (
-                f"<session_context>\n{ctx_body}\n</session_context>"
-                if ctx_body
-                else "<session_context>\n</session_context>"
-            )
-            # Anti-hijacking sandwich: <session_context> -> <target_app_hint> -> input_audio -> <task_reminder>
+            sent_vocab_hints = bool(vocab_blk)
+            unprep_prefix: list[dict[str, Any]] = []
+            if vocab_blk:
+                unprep_prefix.append({"type": "text", "text": vocab_blk})
+                if ctx_body:
+                    unprep_prefix.append(
+                        {"type": "text", "text": f"<session_context>\n{ctx_body}\n</session_context>"}
+                    )
+                if tail_vocab:
+                    unprep_prefix.append({"type": "text", "text": tail_vocab})
+            else:
+                unprep_body = "\n\n".join(filter(None, [ctx_body, tail_vocab]))
+                session_tag = (
+                    f"<session_context>\n{unprep_body}\n</session_context>"
+                    if unprep_body
+                    else "<session_context>\n</session_context>"
+                )
+                unprep_prefix.append({"type": "text", "text": session_tag})
+            # Anti-hijacking sandwich: <vocabulary_hints> / <session_context> -> input_audio -> <task_reminder>
             user_content = [
-                {"type": "text", "text": session_tag},
-                *([{"type": "text", "text": hint_blk}] if hint_blk else []),
+                *unprep_prefix,
                 {"type": "input_audio", "input_audio": audio_obj},
                 {"type": "text", "text": CHAT_AUDIO_TASK_REMINDER},
             ]

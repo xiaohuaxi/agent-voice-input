@@ -1403,6 +1403,88 @@ class CliTextUxDriftAndIntegrateTipTests(unittest.TestCase):
                 self.assertEqual(cli_mod._cmd_stop({"HOME": str(home), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}), 0)
             self.assertEqual(stop_idle_out.getvalue().strip(), "Daemon    stopped (not running)")
 
+    def test_relative_agent_voice_input_home_clean_exit_2_no_double_traceback(self) -> None:
+        for argv in (["hotwords", "path", "--json"], ["init"]):
+            with self.subTest(argv=argv):
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, {"AGENT_VOICE_INPUT_HOME": "relative/dir"}, clear=False),
+                    mock.patch("sys.stdout", out_buf),
+                    mock.patch("sys.stderr", err_buf),
+                ):
+                    rc = cli_mod.main(argv)
+                self.assertEqual(rc, 2)
+                err_txt = err_buf.getvalue()
+                self.assertTrue(err_txt.startswith("config error: "), err_txt)
+                self.assertNotIn("Traceback", err_txt)
+                self.assertEqual(len(err_txt.strip().splitlines()), 1, err_txt)
+
+    def test_hotwords_path_json_recovers_surrogate_escaped_cjk_and_ascii_stdout(self) -> None:
+        # Simulate Linux strict LC_ALL=C surrogate-escaped UTF-8 path bytes in str
+        cjk_bytes = "/tmp/中文家目录/hotwords/personal.txt".encode("utf-8")
+        surrogate_path_str = cjk_bytes.decode("ascii", errors="surrogateescape")
+        self.assertTrue(any(0xDC80 <= ord(ch) <= 0xDCFF for ch in surrogate_path_str))
+
+        fake_hw_path = Path(surrogate_path_str)
+        with (
+            mock.patch.object(cli_mod.os, "lstat", side_effect=FileNotFoundError),
+            mock.patch.object(cli_mod.os.path, "realpath", side_effect=lambda p: p),
+        ):
+            info = cli_mod._inspect_hotwords_path_info(fake_hw_path)
+        self.assertEqual(info["path"], "/tmp/中文家目录/hotwords/personal.txt")
+        self.assertEqual(info["realpath"], "/tmp/中文家目录/hotwords/personal.txt")
+        self.assertEqual(info["dir"], "/tmp/中文家目录/hotwords")
+        self.assertNotIn("?", info["path"])
+
+        # Under non-UTF-8 stdout (e.g., PYTHONIOENCODING=ascii), _json_dumps_stdout escapes to \uXXXX losslessly
+        class _AsciiOut:
+            encoding = "ascii"
+
+        with mock.patch("sys.stdout", _AsciiOut()):
+            dumped = cli_mod._json_dumps_stdout(info, indent=2)
+        self.assertTrue(dumped.isascii(), dumped)
+        parsed = json.loads(dumped)
+        self.assertEqual(parsed["path"], "/tmp/中文家目录/hotwords/personal.txt")
+        self.assertNotIn("?", parsed["path"])
+
+        # doctor --json reuses recovered path_info["path"] and emits lossless ASCII JSON via _json_dumps_stdout
+        from agent_voice_input.hotwords import HotwordsTable
+
+        surrogate_home = "/tmp/中文家目录".encode("utf-8").decode("ascii", errors="surrogateescape")
+
+        class _AsciiStringIO(io.StringIO):
+            encoding = "ascii"
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Config()
+            doc_env = {"AGENT_VOICE_INPUT_HOME": surrogate_home}
+            creds = resolve_credentials(cfg, doc_env)
+            st = cli_mod._DoctorState(
+                cfg=cfg,
+                env=doc_env,
+                creds=creds,
+                rt_dir=Path(td),
+                as_json=True,
+                all_secrets=(),
+                pipeline=explain_pipeline_selection(cfg, creds, doc_env),
+            )
+            with (
+                mock.patch.object(cli_mod.os, "lstat", side_effect=FileNotFoundError),
+                mock.patch.object(cli_mod.os.path, "realpath", side_effect=lambda p: p),
+                mock.patch("agent_voice_input.hotwords.load_hotwords_table", return_value=HotwordsTable(exists=False)),
+            ):
+                cli_mod._doctor_check_hotwords(st)
+            self.assertEqual(st.hotwords_report["path"], "/tmp/中文家目录/hotwords/personal.txt")
+
+            ascii_buf = _AsciiStringIO()
+            with mock.patch("sys.stdout", ascii_buf):
+                cli_mod._doctor_emit_json_report(st, include_ping=False)
+            raw_doc_json = ascii_buf.getvalue()
+            self.assertTrue(raw_doc_json.isascii(), raw_doc_json)
+            doc_parsed = json.loads(raw_doc_json)
+            self.assertEqual(doc_parsed["hotwords"]["path"], "/tmp/中文家目录/hotwords/personal.txt")
+            self.assertNotIn("?", doc_parsed["hotwords"]["path"])
+
 
 if __name__ == "__main__":
     unittest.main()

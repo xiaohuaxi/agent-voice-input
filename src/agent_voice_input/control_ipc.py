@@ -492,6 +492,43 @@ def send_control_reply(conn: socket.socket, resp: Mapping[str, Any]) -> None:
         pass
 
 
+_SAFE_HOTWORDS_STATUS_KEYS: tuple[str, ...] = (
+    "total",
+    "kept",
+    "dropped_count",
+    "used_chars",
+    "max_items",
+    "max_chars",
+    "warnings_count",
+    "stage2_kept",
+    "stage2_dropped",
+)
+
+
+def _sanitize_hotwords_status_counts(raw: Mapping[str, Any] | None) -> dict[str, int] | None:
+    """Whitelist integer-only hotwords counters for daemon ``status`` (never leaks term text)."""
+    if not isinstance(raw, Mapping):
+        return None
+    out: dict[str, int] = {}
+    for key in _SAFE_HOTWORDS_STATUS_KEYS:
+        val = raw.get(key)
+        if isinstance(val, int) and not isinstance(val, bool):
+            out[key] = val
+    # Normalize fallback aliases (e.g., callers passing summary.as_dict()) onto canonical contract keys
+    for dst_key, src_keys in (
+        ("total", ("total_input",)),
+        ("stage2_kept", ("kept", "kept_count")),
+        ("stage2_dropped", ("dropped_count",)),
+    ):
+        if dst_key not in out:
+            for src_key in src_keys:
+                val = raw.get(src_key)
+                if isinstance(val, int) and not isinstance(val, bool):
+                    out[dst_key] = val
+                    break
+    return out if out else None
+
+
 def build_daemon_status_response(
     *,
     runtime_dir: Path,
@@ -507,6 +544,7 @@ def build_daemon_status_response(
     last_result: Mapping[str, Any],
     remote_hosts: Mapping[str, Any] | None,
     mem_recent_results: Sequence[Mapping[str, Any]],
+    hotwords: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON-serializable response payload for a ``status`` control command."""
     import copy
@@ -532,6 +570,9 @@ def build_daemon_status_response(
         resp["shim_error"] = shim_error
     if remote_hosts:
         resp["remote_hosts"] = dict(remote_hosts)
+    safe_hw = _sanitize_hotwords_status_counts(hotwords)
+    if safe_hw is not None:
+        resp["hotwords"] = safe_hw
     if want_hist:
         disk_items = read_telemetry_history(
             runtime_dir, limit=max(hist_limit, RECENT_RESULTS_MAXLEN)

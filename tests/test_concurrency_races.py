@@ -367,9 +367,8 @@ class _OutOfOrderRefiner(BaseRefiner):
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
         workspace_cwd: str = "",
-        target_hint: str = "",
     ) -> RefinerResult:
-        del session_key, tracker, fallback_context, mode, workspace_cwd, target_hint
+        del session_key, tracker, fallback_context, mode, workspace_cwd
         ev = threading.Event()
         if cancel_token is not None:
             cancel_token.bind_event(ev)

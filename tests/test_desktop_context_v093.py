@@ -21,7 +21,6 @@ if str(_SRC_ROOT) not in sys.path:
 
 from agent_voice_input.app_scope import (  # noqa: E402
     IdeTitleInfo,
-    classify_target_app_hint,
     classify_window_category,
     is_antigravity_ide_window,
     is_claude_desktop_window,
@@ -53,8 +52,6 @@ from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome, WslPl
 from agent_voice_input.prompts import (  # noqa: E402
     REFINER_GENERAL_SYSTEM_PROMPT,
     SINGLE_HOP_GENERAL_SYSTEM_PROMPT,
-    TARGET_APP_HINTS,
-    strip_target_hint_echo,
 )
 from agent_voice_input.refiner import (  # noqa: E402
     GeminiRefiner,
@@ -114,7 +111,7 @@ class _DummyAsr(BaseAsrProvider):
     ,
         **_kw: object,) -> AsrResult:
         del wav_bytes, is_cancelled
-        self.seen_contexts.append(_coerce_context(context, "", env=self.env))
+        self.seen_contexts.append(_coerce_context(context, env=self.env))
         return AsrResult(text=self.text, provider="dashscope", model="qwen3-asr-flash", latency_ms=10)
 
 
@@ -765,9 +762,9 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             _, git_ctx_sub = tracker.get_refiner_context(snap_sub.session_key, workspace_cwd=str(sub_pkg))
             self.assertIn(f"cwd: {os.path.realpath(sub_pkg)}", git_ctx_sub)
 
-    def test_target_app_hint_classification_injection_and_echo_strip(self) -> None:
-        for ai_win in (
-            ForegroundWindow(1, "ChatGPT", "New chat", bundle_id="com.openai.chat"),
+    def test_desktop_agent_window_detection_and_general_mode_isolation(self) -> None:
+        # Codex / ChatGPT Desktop positive matrix (including tight dashes and non-CLI bracket tags)
+        for codex_win in (
             ForegroundWindow(101, "ChatGPT", "New chat", bundle_id="com.openai.codex"),
             ForegroundWindow(102, "Codex", "Codex", bundle_id="com.openai.codex"),
             ForegroundWindow(103, "ChatGPT.exe", "ChatGPT"),
@@ -778,18 +775,25 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             ForegroundWindow(108, "Codex.exe", "Plan—Codex"),
             ForegroundWindow(109, "Codex.exe", "Plan-ChatGPT"),
             ForegroundWindow(110, "Codex.exe", "Run [#42] — ChatGPT"),
-            ForegroundWindow(111, "Claude.exe", "Issue [#42] - Claude"),
             ForegroundWindow(112, "Codex.exe", "Review [codex:notes] - Codex"),
             ForegroundWindow(113, "Codex.exe", "Braille ⠋ demo — ChatGPT"),
-            ForegroundWindow(114, "Claude.exe", "Asterisk ✳ note - Claude"),
             ForegroundWindow(115, "Codex.exe", "Draft [unclosed - Codex"),
+        ):
+            self.assertTrue(is_codex_desktop_window(codex_win), msg=f"missed {codex_win}")
+
+        # Claude Desktop positive matrix
+        for claude_win in (
+            ForegroundWindow(111, "Claude.exe", "Issue [#42] - Claude"),
+            ForegroundWindow(114, "Claude.exe", "Asterisk ✳ note - Claude"),
             ForegroundWindow(2, "Claude", "Claude", bundle_id="com.anthropic.claudefordesktop"),
             ForegroundWindow(3, "Claude.exe", "Claude"),
             ForegroundWindow(4, "Claude.exe", "Architecture question - Claude"),
         ):
-            self.assertEqual(classify_target_app_hint(ai_win), "ai_chat", msg=f"missed {ai_win}")
+            self.assertTrue(is_claude_desktop_window(claude_win), msg=f"missed {claude_win}")
 
-        for cli_claude_win in (
+        # Strict negative matrix: terminals, CLI spinners/tags, bare processes, and non-agent apps
+        for non_desktop_agent in (
+            ForegroundWindow(1, "ChatGPT", "New chat", bundle_id="com.openai.chat"),
             ForegroundWindow(5, "claude.exe", "✳ repo [#abcd1234]"),
             ForegroundWindow(6, "claude.exe", "claude — ~/repos/app"),
             ForegroundWindow(7, "claude.exe", r"C:\Users\demo\.local\bin\claude.exe"),
@@ -813,46 +817,19 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             ForegroundWindow(97, "codex.exe", "mycodex"),
             ForegroundWindow(98, "codex.exe", "⠋ Working"),
             ForegroundWindow(20, "QQMusic.exe", "周杰伦"),
-            ForegroundWindow(21, "TelegramUpdater.exe", "Updating"),
             ForegroundWindow(22, "Safari", "GitHub", bundle_id="com.apple.Safari"),
             ForegroundWindow(23, "Notion.exe", "Roadmap"),
         ):
-            self.assertEqual(classify_target_app_hint(cli_claude_win), "", msg=f"false positive on {cli_claude_win}")
+            self.assertFalse(is_codex_desktop_window(non_desktop_agent), msg=f"codex fp on {non_desktop_agent}")
+            self.assertFalse(is_claude_desktop_window(non_desktop_agent), msg=f"claude fp on {non_desktop_agent}")
 
-        for im_win in (
-            ForegroundWindow(10, "WeChat", "文件传输助手", bundle_id="com.tencent.xinwechat"),
-            ForegroundWindow(11, "Weixin.exe", "群聊"),
-            ForegroundWindow(12, "Feishu.exe", "飞书"),
-            ForegroundWindow(13, "Slack", "general", bundle_id="com.tinyspeck.slackmacgap"),
-            ForegroundWindow(14, "Discord.exe", "#dev"),
-            ForegroundWindow(15, "Telegram.exe", "Saved Messages"),
-            ForegroundWindow(16, "QQ.exe", "测试群"),
-        ):
-            self.assertEqual(classify_target_app_hint(im_win), "im_chat", msg=f"missed {im_win}")
-
-        self.assertEqual(_coerce_context(AsrContext(mode="general", target_hint="ai_chat")).target_hint, "ai_chat")
-        self.assertEqual(_coerce_context({"mode": "general", "target_hint": "IM_CHAT"}).target_hint, "im_chat")
-
+        self.assertEqual(_coerce_context(AsrContext(mode="general")).mode, "general")
+        self.assertEqual(_coerce_context({"mode": "general"}).mode, "general")
+        self.assertEqual(_clean_out("  正常文本  ", fallback="原稿兜底文本"), "正常文本")
         self.assertEqual(
-            strip_target_hint_echo(f"{TARGET_APP_HINTS['ai_chat']}\n帮我解释一下 KV Cache"),
-            "帮我解释一下 KV Cache",
+            _normalize_single_hop_text('<vocabulary_hints read_only="true">Alpha</vocabulary_hints>\n单跳清理结果'),
+            "单跳清理结果",
         )
-        self.assertEqual(strip_target_hint_echo("<target_app_hint>\n晚上一起吃饭吗\n</target_app_hint>"), "晚上一起吃饭吗")
-        self.assertEqual(strip_target_hint_echo("帮我看看这段代码\n</target_app_hint>"), "帮我看看这段代码")
-        self.assertEqual(
-            strip_target_hint_echo("请看下 <target_app_hint> 标签的位置对不对。"),
-            "请看下 <target_app_hint> 标签的位置对不对。",
-        )
-        self.assertEqual(_clean_out(TARGET_APP_HINTS["im_chat"], fallback="原稿兜底文本"), "原稿兜底文本")
-        self.assertEqual(
-            _normalize_single_hop_text(f"{TARGET_APP_HINTS['ai_chat']}\n单跳清理结果"), "单跳清理结果"
-        )
-        t0 = time.perf_counter()
-        ws_heavy = "看下 <target_app_hint> 说明" + (" " * 20000) + "结尾正常文本"
-        malformed_open = "<target_app_hint" + (" " * 20000) + "x"
-        self.assertEqual(strip_target_hint_echo(ws_heavy), ws_heavy)
-        self.assertEqual(strip_target_hint_echo(malformed_open), malformed_open)
-        self.assertLess(time.perf_counter() - t0, 0.05)
 
         cfg = Config()
         env = {"OPENAI_API_KEY": "sk-openai-test", "GEMINI_API_KEY": "gm-test", "OPENROUTER_API_KEY": "or-test"}
@@ -863,19 +840,17 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
         def _resp_transport(req: HttpRequest) -> HttpResponse:
             resp_reqs.append(json.loads(req.body.decode("utf-8")))
             sse = (
-                'data: {"type":"response.output_text.delta","delta":"<target_app_hint category=\\"ai_chat\\">echo</target_app_hint>\\n请问 LoRA 微调怎么做？"}\n\n'
+                'data: {"type":"response.output_text.delta","delta":"请问 LoRA 微调怎么做？"}\n\n'
                 'data: {"type":"response.completed","response":{"usage":{"input_tokens":50,"output_tokens":10}}}\n\n'
             )
             return HttpResponse(200, {"content-type": "text/event-stream"}, sse.encode("utf-8"))
 
         r_resp = OpenAIResponsesRefiner(cfg, creds, provider_name="openai", env=env, transport=_resp_transport)
-        r_resp.refine("请问 lora 微调怎么做", mode="general", target_hint="")
-        out_ai = r_resp.refine("请问 lora 微调怎么做", mode="general", target_hint="ai_chat")
-        self.assertEqual(out_ai.text, "请问 LoRA 微调怎么做？")
-        self.assertEqual(resp_reqs[0]["instructions"], resp_reqs[1]["instructions"])
-        user_txt_ai = resp_reqs[1]["input"][-1]["content"][0]["text"]  # type: ignore[index]
-        self.assertLess(user_txt_ai.index("<target_app_hint "), user_txt_ai.index("<asr_draft_to_clean>"))
-        self.assertLess(user_txt_ai.index("</asr_draft_to_clean>"), user_txt_ai.index("<task_reminder>"))
+        out_gen = r_resp.refine("请问 lora 微调怎么做", mode="general")
+        self.assertEqual(out_gen.text, "请问 LoRA 微调怎么做？")
+        user_txt = resp_reqs[-1]["input"][-1]["content"][0]["text"]  # type: ignore[index]
+        self.assertNotIn("<target_app_hint", user_txt)
+        self.assertLess(user_txt.index("<asr_draft_to_clean>"), user_txt.index("<task_reminder>"))
 
         gem_reqs: list[dict[str, object]] = []
 
@@ -883,16 +858,16 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             gem_reqs.append(json.loads(req.body.decode("utf-8")))
             return _json_resp({"candidates": [{"content": {"parts": [{"text": "明天见"}]}}]})
 
-        GeminiRefiner(cfg, creds, env=env, transport=_gem_transport).refine("明天见", mode="general", target_hint="im_chat")
+        GeminiRefiner(cfg, creds, env=env, transport=_gem_transport).refine("明天见", mode="general")
         self.assertEqual(gem_reqs[-1]["systemInstruction"]["parts"][0]["text"], REFINER_GENERAL_SYSTEM_PROMPT)  # type: ignore[index]
-        self.assertIn('category="im_chat"', gem_reqs[-1]["contents"][0]["parts"][0]["text"])  # type: ignore[index]
+        self.assertNotIn("<target_app_hint", gem_reqs[-1]["contents"][0]["parts"][0]["text"])  # type: ignore[index]
 
         sh_reqs: list[dict[str, object]] = []
 
         def _sh_gem_transport(req: HttpRequest) -> HttpResponse:
             sh_reqs.append(json.loads(req.body.decode("utf-8")))
             return _json_resp(
-                {"candidates": [{"content": {"parts": [{"text": f"{TARGET_APP_HINTS['ai_chat']}\n帮我对比一下 FlashAttention 和 PagedAttention。"}]}}]}
+                {"candidates": [{"content": {"parts": [{"text": "帮我对比一下 FlashAttention 和 PagedAttention。"}]}}]}
             )
 
         cfg_sh = Config()
@@ -910,11 +885,9 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
         self.assertEqual((res_sh.mode, res_sh.final_text), ("general", "帮我对比一下 FlashAttention 和 PagedAttention。"))
         self.assertEqual(sh_reqs[-1]["systemInstruction"]["parts"][0]["text"], SINGLE_HOP_GENERAL_SYSTEM_PROMPT)  # type: ignore[index]
         parts = sh_reqs[-1]["contents"][0]["parts"]  # type: ignore[index]
-        self.assertIn('category="ai_chat"', parts[0]["text"])
-        self.assertIn("inlineData", parts[1])
-        self.assertIn("<task_reminder>", parts[2]["text"])
-        for bw in BUILTIN_AGENT_HOTWORDS[:5]:
-            self.assertNotIn(bw, parts[0]["text"])
+        self.assertIn("inlineData", parts[0])
+        self.assertIn("<task_reminder>", parts[1]["text"])
+        self.assertNotIn("<target_app_hint", json.dumps(parts, ensure_ascii=False))
 
         chat_reqs: list[dict[str, object]] = []
 
@@ -926,13 +899,13 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
         cfg_chat.asr.provider = "openrouter"
         cfg_chat.asr.model = "google/gemini-3.5-flash-lite"
         chat_asr = ChatAudioAsrProvider(cfg_chat, creds, provider_name="openrouter", env=env, transport=_sh_chat_transport)
-        chat_res = chat_asr.transcribe(_voiced_wav(), AsrContext(mode="general", single_hop_prepared=True, target_hint="im_chat"))
+        chat_res = chat_asr.transcribe(_voiced_wav(), AsrContext(mode="general", single_hop_prepared=True))
         self.assertEqual(chat_res.text, "收到，马上到")
         u_items = chat_reqs[-1]["messages"][1]["content"]  # type: ignore[index]
-        self.assertIn('category="im_chat"', u_items[0]["text"])
-        self.assertEqual(u_items[1]["type"], "input_audio")
+        self.assertEqual(u_items[0]["type"], "input_audio")
+        self.assertNotIn("<target_app_hint", json.dumps(u_items, ensure_ascii=False))
 
-    def test_daemon_concurrent_stage2_propagates_workspace_cwd_and_target_hint(self) -> None:
+    def test_daemon_concurrent_stage2_propagates_workspace_cwd_and_general_isolation(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             home, rt = tmp / "home", tmp / "rt"
@@ -978,7 +951,8 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                         time.sleep(0.02)
                 self.assertEqual(len(seen_user_msgs), 2)
                 self.assertIn("LatencyReport2026.md", seen_user_msgs[0])
-                self.assertIn('category="im_chat"', seen_user_msgs[1])
+                self.assertNotIn("LatencyReport2026.md", seen_user_msgs[1])
+                self.assertNotIn("<target_app_hint", seen_user_msgs[1])
             finally:
                 daemon.close()
 
@@ -2287,7 +2261,7 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 assert m_wal is not None
                 self.assertEqual((m_wal.session_id, m_wal.jsonl_path), ("tid-live-wal", os.path.realpath(rp_wal)))
 
-            # 4) End-to-end daemon pipeline: dynamic promotion vs cloud ChatGPT general+ai_chat isolation
+            # 4) End-to-end daemon pipeline: dynamic promotion vs cloud ChatGPT general isolation
             env = {"HOME": str(home), "OPENROUTER_API_KEY": "sk-or-test", "WSL_DISTRO_NAME": "", "WSL_INTEROP": ""}
             cfg = Config()
             cfg.refiner.provider = "openrouter"
@@ -2307,7 +2281,7 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
             )
             asr = _DummyAsr("检查 quartz batcher", env=env)
             try:
-                # 4a) Local Codex Desktop task promotes general_gui -> agent + coding + workspace + 50K chunk cache
+                # 4a) Local Codex Desktop task promotes general_gui -> agent + workspace + 50K chunk cache
                 win_local = ForegroundWindow(801, "ChatGPT", "Refactor QuartzBatcher", bundle_id="com.openai.codex")
                 r1 = run_pipeline_once(
                     _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
@@ -2321,12 +2295,10 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 self.assertEqual(r1.session.match.cwd, os.path.realpath(repo_a))
                 ctx1 = asr.seen_contexts[-1]
                 self.assertEqual(ctx1.mode, "agent")
-                self.assertEqual(ctx1.hotwords_scope, "coding")
-                self.assertEqual(ctx1.target_hint, "")
                 self.assertIn("QuartzBatcher", ctx1.hotwords)
                 self.assertIn("NebulaEngine", ctx1.hotwords)
                 msgs1 = seen_payloads[-1]["messages"]  # type: ignore[index]
-                self.assertNotIn("<target_app_hint>", str(msgs1[-1]["content"]))
+                self.assertNotIn("<target_app_hint", str(msgs1[-1]["content"]))
                 self.assertIn("NebulaEngine.py", str(msgs1[-1]["content"]))
                 offset1 = r1.session.byte_offset
                 self.assertGreater(offset1, 0)
@@ -2377,7 +2349,7 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 prior_blk, _, _ = tracker.get_refiner_context_with_prior(r_cold.session.session_key)
                 self.assertIn("HeliosPriorToken", prior_blk)
 
-                # 4c) Cloud ChatGPT chat stays general + ai_chat + chat hotwords + zero workspace/session!
+                # 4c) Cloud ChatGPT chat stays general with zero workspace/session crosstalk!
                 win_cloud = ForegroundWindow(803, "ChatGPT", "Weekend Travel Plan", bundle_id="com.openai.codex")
                 r_cloud = run_pipeline_once(
                     _voiced_wav(), cfg=cfg, tracker=tracker, asr_provider=asr, refiner=refiner,
@@ -2388,11 +2360,9 @@ class DesktopGuiContextV093Tests(unittest.TestCase):
                 self.assertIsNone(r_cloud.session)
                 ctx_cloud = asr.seen_contexts[-1]
                 self.assertEqual(ctx_cloud.mode, "general")
-                self.assertEqual(ctx_cloud.hotwords_scope, "chat")
-                self.assertEqual(ctx_cloud.target_hint, "ai_chat")
                 self.assertNotIn("NebulaEngine", ctx_cloud.hotwords)
                 self.assertNotIn("OtherTool", ctx_cloud.hotwords)
-                self.assertIn(TARGET_APP_HINTS["ai_chat"], str(seen_payloads[-1]["messages"][-1]["content"]))  # type: ignore[index]
+                self.assertNotIn("<target_app_hint", str(seen_payloads[-1]["messages"][-1]["content"]))  # type: ignore[index]
 
                 # 4d) Explicit mode="general" must NOT promote even for a local Codex Desktop task
                 r_forced_gen = run_pipeline_once(
@@ -3857,7 +3827,6 @@ class TestClaudeDesktopContextBinding(unittest.TestCase):
         ):
             self.assertTrue(is_claude_desktop_window(win), f"expected True for {win}")
             self.assertEqual(classify_window_category(win, is_terminal=is_terminal_window), "general_gui")
-            self.assertEqual(classify_target_app_hint(win), "ai_chat")
 
         # Negative cases (terminals, CLI spinners/tags, browsers, other desktop apps)
         for win in (
@@ -5111,8 +5080,8 @@ class TestClaudeDesktopContextBinding(unittest.TestCase):
                 self.assertTrue(r_code["ok"])
                 self.assertEqual(r_code["mode"], "agent")
                 self.assertEqual(r_code["matched_by"], "claude_desktop_code")
-                self.assertEqual(r_code["hotwords_scope"], "coding")
-                self.assertEqual(r_code["target_app_hint"], "")
+                self.assertNotIn("hotwords_scope", r_code)
+                self.assertNotIn("target_app_hint", r_code)
                 self.assertEqual(r_code["workspace_name"], "voice-engine")
                 self.assertGreater(r_code["ctx_chars"], 0)
 
@@ -5129,11 +5098,10 @@ class TestClaudeDesktopContextBinding(unittest.TestCase):
                 self.assertTrue(r_cowork["ok"])
                 self.assertEqual(r_cowork["mode"], "agent")
                 self.assertEqual(r_cowork["matched_by"], "claude_desktop_cowork")
-                self.assertEqual(r_cowork["target_app_hint"], "")
                 self.assertEqual(r_cowork["workspace_name"], "")
                 self.assertGreater(r_cowork["ctx_chars"], 0)
 
-                # Same-titled cloud Chat (or missing page_url) MUST stay general + ai_chat (opposite routing!)
+                # Same-titled cloud Chat (or missing page_url) MUST stay general (opposite routing!)
                 for chat_url in ("app://localhost/chat/99990000", "app://localhost/new", ""):
                     r_same_title_chat = daemon._execute_probe_route(
                         {
@@ -5145,8 +5113,6 @@ class TestClaudeDesktopContextBinding(unittest.TestCase):
                         }
                     )
                     self.assertEqual(r_same_title_chat["mode"], "general")
-                    self.assertEqual(r_same_title_chat["target_app_hint"], "ai_chat")
-                    self.assertEqual(r_same_title_chat["hotwords_scope"], "chat")
                     self.assertEqual(r_same_title_chat["ctx_chars"], 0)
 
                 # 3) probe_route for Chat fallback and explicit_mode="general"
@@ -5160,8 +5126,8 @@ class TestClaudeDesktopContextBinding(unittest.TestCase):
                     }
                 )
                 self.assertEqual(r_chat["mode"], "general")
-                self.assertEqual(r_chat["target_app_hint"], "ai_chat")
-                self.assertEqual(r_chat["hotwords_scope"], "chat")
+                self.assertNotIn("target_app_hint", r_chat)
+                self.assertNotIn("hotwords_scope", r_chat)
                 self.assertEqual(r_chat["ctx_chars"], 0)
 
                 r_explicit_gen = daemon._execute_probe_route(
@@ -5175,7 +5141,6 @@ class TestClaudeDesktopContextBinding(unittest.TestCase):
                     }
                 )
                 self.assertEqual(r_explicit_gen["mode"], "general")
-                self.assertEqual(r_explicit_gen["target_app_hint"], "ai_chat")
                 self.assertEqual(r_explicit_gen["ctx_chars"], 0)
 
                 # 4a) Pre-delivery same_window_verifier for URL-promoted Claude Desktop (route identity enforced!)

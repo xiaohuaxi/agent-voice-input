@@ -82,13 +82,14 @@ jobs:
 
           # 1. Strict non-UTF-8 POSIX C locale (disabling PEP 538 coercion)
           C_HOME="$EDGE_DIR/c_home"
+          C_AVI_HOME="$EDGE_DIR/中文家目录"
           C_RT="$EDGE_DIR/c_run"
           mkdir -p "$C_HOME" "$C_RT"
           chmod 700 "$C_RT"
           env -i \
             PATH="/usr/bin:/bin" \
             HOME="$C_HOME" \
-            XDG_CONFIG_HOME="$C_HOME/.config" \
+            AGENT_VOICE_INPUT_HOME="$C_AVI_HOME" \
             XDG_CACHE_HOME="$EDGE_DIR/c_cache" \
             XDG_RUNTIME_DIR="$C_RT" \
             LC_ALL="C" \
@@ -97,15 +98,14 @@ jobs:
             PYTHONUTF8="0" \
             PYTHONPATH="$REPO_SRC" \
             "$PY_BIN" - <<'PY'
-          import json, os, pathlib, subprocess, sys
+          import json, os, subprocess, sys
 
           c_home = os.fsencode(os.environ["HOME"])
           cjk_cfg_dir = os.path.join(c_home, "中文配置".encode("utf-8"))
           os.makedirs(cjk_cfg_dir, exist_ok=True)
           cjk_cfg = os.path.join(cjk_cfg_dir, b"config.toml")
-          hw_file = pathlib.Path(os.environ["HOME"]) / "scoped_hotwords.txt"
           with open(cjk_cfg, "wb") as fh:
-              fh.write(f'[asr]\nhotwords_file = "{hw_file.as_posix()}"\n'.encode("utf-8"))
+              fh.write(b'[asr]\nprovider = "auto"\n')
 
           zh_term = "豆包".encode("utf-8")
 
@@ -122,25 +122,35 @@ jobs:
               ("--help",),
               ("--version",),
               ("init",),
-              ("hotwords", "add", "Codex", "--scope", "coding", "--config", cjk_cfg),
-              ("hotwords", "add", zh_term, "--scope", "global", "--config", cjk_cfg),
+              ("hotwords", "add", "Codex", "--pin", "--config", cjk_cfg),
+              ("hotwords", "add", zh_term, "--config", cjk_cfg),
               ("hotwords", "list", "--config", cjk_cfg),
               ("diagnose", "--json", "--config", cjk_cfg),
           ):
               p = run_cli(*sub)
               assert p.returncode == 0, f"{sub!r} failed rc={p.returncode} stderr={p.stderr!r}"
 
+          pj = run_cli("hotwords", "path", "--json", "--config", cjk_cfg)
+          assert pj.returncode == 0, pj.stderr
+          path_data = json.loads(pj.stdout.decode("utf-8"))
+          assert "中文家目录" in path_data["path"] and "?" not in path_data["path"], path_data
+          assert "中文家目录" in path_data["realpath"] and "?" not in path_data["realpath"], path_data
+          assert path_data["path"].endswith("/中文家目录/hotwords/personal.txt"), path_data
+
           lj = run_cli("hotwords", "list", "--json", "--config", cjk_cfg)
           assert lj.returncode == 0, lj.stderr
           data = json.loads(lj.stdout.decode("utf-8"))
-          assert "Codex" in data["scopes"]["coding"], data
-          assert "豆包" in data["scopes"]["global"], data
+          assert "中文家目录" in data["path"] and "?" not in data["path"], data
+          assert "Codex" in data["terms"], data
+          assert "豆包" in data["terms"], data
+          assert any(e["term"] == "Codex" and e["pinned"] is True for e in data["entries"]), data
 
-          rm = run_cli("hotwords", "remove", zh_term, "--scope", "global", "--config", cjk_cfg)
+          rm = run_cli("hotwords", "remove", zh_term, "--config", cjk_cfg)
           assert rm.returncode == 0, rm.stderr
           lj2 = json.loads(run_cli("hotwords", "list", "--json", "--config", cjk_cfg).stdout.decode("utf-8"))
-          assert "豆包" not in lj2["scopes"]["global"], lj2
-          print("Strict LC_ALL=C CLI smoke passed (bytes args + non-ASCII --config path)")
+          assert "豆包" not in lj2["terms"], lj2
+          assert "Codex" in lj2["terms"], lj2
+          print("Strict LC_ALL=C CLI smoke passed (bytes args + non-ASCII AGENT_VOICE_INPUT_HOME & --config path)")
           PY
 
           LC_ALL=C LANG=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0 PYTHONPATH="$REPO_SRC" \
@@ -151,15 +161,16 @@ jobs:
 
           # 2. Minimal PATH=/usr/bin:/bin smoke
           MIN_HOME="$EDGE_DIR/min_home"
+          MIN_AVI_HOME="$EDGE_DIR/min_家目录"
           MIN_RT="$EDGE_DIR/min_run"
           mkdir -p "$MIN_HOME" "$MIN_RT"
           chmod 700 "$MIN_RT"
-          for cmd_args in "--help" "--version" "init" "hotwords list --json" "diagnose --json"; do
+          for cmd_args in "--help" "--version" "init" "hotwords path --json" "hotwords list --json" "diagnose --json"; do
             # shellcheck disable=SC2086
             env -i \
               PATH="/usr/bin:/bin" \
               HOME="$MIN_HOME" \
-              XDG_CONFIG_HOME="$MIN_HOME/.config" \
+              AGENT_VOICE_INPUT_HOME="$MIN_AVI_HOME" \
               XDG_CACHE_HOME="$EDGE_DIR/min_cache" \
               XDG_RUNTIME_DIR="$MIN_RT" \
               PYTHONPATH="$REPO_SRC" \
@@ -194,7 +205,7 @@ jobs:
             "$VENV_PY" -m pip install --no-deps "$SMOKE_DIR/dist"/*.whl
 
             export HOME="$SMOKE_DIR/home"
-            export XDG_CONFIG_HOME="$HOME/.config"
+            export AGENT_VOICE_INPUT_HOME="$SMOKE_DIR/中文家目录"
             export XDG_CACHE_HOME="$SMOKE_DIR/cache"
             export XDG_RUNTIME_DIR="$SMOKE_DIR/run"
             mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
@@ -203,8 +214,9 @@ jobs:
             "$VENV_CLI" --help >/dev/null
             "$VENV_CLI" --version
             "$VENV_CLI" init
-            "$VENV_CLI" hotwords add Codex --scope coding
-            "$VENV_CLI" hotwords list --json | "$VENV_PY" -c 'import json,sys; d=json.load(sys.stdin); assert "Codex" in d["scopes"]["coding"], d'
+            "$VENV_CLI" hotwords path --json | "$VENV_PY" -c 'import json,sys; d=json.load(sys.stdin); assert d["path"].endswith("personal.txt"), d'
+            "$VENV_CLI" hotwords add Codex --pin
+            "$VENV_CLI" hotwords list --json | "$VENV_PY" -c 'import json,sys; d=json.load(sys.stdin); assert "Codex" in d["terms"] and any(e["term"] == "Codex" and e["pinned"] for e in d["entries"]), d'
             "$VENV_CLI" diagnose --json | "$VENV_PY" -c 'import json,sys; d=json.load(sys.stdin); assert d.get("version") and "daemon" in d, d'
           )
 
@@ -215,7 +227,7 @@ jobs:
               cd "$SMOKE_DIR"
               unset PYTHONPATH
               export HOME="$SMOKE_DIR/home"
-              export XDG_CONFIG_HOME="$HOME/.config"
+              export AGENT_VOICE_INPUT_HOME="$SMOKE_DIR/中文家目录"
               export XDG_CACHE_HOME="$SMOKE_DIR/cache"
               export XDG_RUNTIME_DIR="$SMOKE_DIR/run"
               "$VENV_PY" - "$PKG_DIR" <<'PY'

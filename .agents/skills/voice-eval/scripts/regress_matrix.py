@@ -210,6 +210,7 @@ def _build_layer_a_env(
         if val is not None:
             iso_env[key] = val
     iso_env["HOME"] = str(iso_home)
+    iso_env["AGENT_VOICE_INPUT_HOME"] = str(iso_home / ".agent-voice-input")
     iso_env["XDG_CONFIG_HOME"] = str(iso_config)
     iso_env["XDG_CACHE_HOME"] = str(iso_cache)
     iso_env["XDG_RUNTIME_DIR"] = str(rt_dir)
@@ -489,8 +490,8 @@ def _check_asserts(
     metrics: dict[str, Any] = {
         "window_category": resp.get("window_category", ""),
         "mode": resp.get("mode", ""),
-        "target_app_hint": resp.get("target_app_hint", ""),
-        "hotwords_scope": resp.get("hotwords_scope", ""),
+        "hotword_count": int(resp.get("hotword_count") or 0),
+        "personal_hotword_count": int(resp.get("personal_hotword_count") or 0),
         "session_key_masked": resp.get("session_key_masked", ""),
         "matched_by": resp.get("matched_by", ""),
         "remote_vetoed": bool(resp.get("remote_vetoed", False)),
@@ -571,6 +572,17 @@ def run_layer_a_matrix(
             iso_cache=iso_cache,
             rt_dir=rt_dir,
         )
+
+        # Pre-seed isolated flat personal hotwords table (3 terms) for crosstalk assertions
+        iso_app_home = ensure_secure_dir(iso_home / ".agent-voice-input")
+        iso_hw_dir = ensure_secure_dir(iso_app_home / "hotwords")
+        iso_hw_file = iso_hw_dir / "personal.txt"
+        iso_hw_file.write_text(
+            "!Antigravity\nCodex <- 库德克斯\nSessionTracker\n",
+            encoding="utf-8",
+        )
+        os.chmod(iso_hw_file, 0o600)
+        expected_personal_hw = 3
 
         # ---- Build CLI sessions (distinct 8-char prefixes for registry isolation) ----
         rich_pad = "RouterEngine SessionTracker incremental prefix cache chunk verification details. " * 28
@@ -1045,7 +1057,10 @@ def run_layer_a_matrix(
                         ("key==codex_old", r_codex_win.get("session_key_masked") == f"codex:{codex_old_sid[:8]}"),
                         ("ws==alpha-service", r_codex_win.get("workspace_name") == "alpha-service"),
                         ("ctx_chars>1000", int(r_codex_win.get("ctx_chars") or 0) > 1000),
-                        ("no_fallback", r_codex_win.get("ctx_fallback") == ""),
+                        (
+                            "no_prior_session_fallback",
+                            r_codex_win.get("ctx_fallback") in ("", "prior_hotwords"),
+                        ),
                     ],
                 )
             )
@@ -1293,7 +1308,8 @@ def run_layer_a_matrix(
                         [
                             ("ok", r_cd.get("ok") is True),
                             ("mode==agent", r_cd.get("mode") == "agent"),
-                            ("hotwords_scope==coding", r_cd.get("hotwords_scope") == "coding"),
+                            ("personal_hw==3", int(r_cd.get("personal_hotword_count") or 0) == expected_personal_hw),
+                            ("hotword_count>personal", int(r_cd.get("hotword_count") or 0) > expected_personal_hw),
                             ("matched==codex_desktop_db", r_cd.get("matched_by") == "codex_desktop_db"),
                             ("key==codex_desk", r_cd.get("session_key_masked") == f"codex:{codex_desk_tid[:8]}"),
                             ("ws==gamma-codex", r_cd.get("workspace_name") == "gamma-codex"),
@@ -1328,8 +1344,11 @@ def run_layer_a_matrix(
                         [
                             ("ok", r_cc.get("ok") is True),
                             ("mode==general", r_cc.get("mode") == "general"),
-                            ("target_app_hint==ai_chat", r_cc.get("target_app_hint") == "ai_chat"),
-                            ("hotwords_scope==chat", r_cc.get("hotwords_scope") == "chat"),
+                            ("personal_hw==3", int(r_cc.get("personal_hotword_count") or 0) == expected_personal_hw),
+                            (
+                                "hotword_count==personal_hotword_count",
+                                int(r_cc.get("hotword_count") or 0) == int(r_cc.get("personal_hotword_count") or 0),
+                            ),
                             ("key==''", r_cc.get("session_key_masked") == ""),
                             ("ctx_chars==0", int(r_cc.get("ctx_chars") or 0) == 0),
                         ],
@@ -1353,7 +1372,8 @@ def run_layer_a_matrix(
                     [
                         ("ok", r_cl_code.get("ok") is True),
                         ("mode==agent", r_cl_code.get("mode") == "agent"),
-                        ("hotwords_scope==coding", r_cl_code.get("hotwords_scope") == "coding"),
+                        ("personal_hw==3", int(r_cl_code.get("personal_hotword_count") or 0) == expected_personal_hw),
+                        ("hotword_count>personal", int(r_cl_code.get("hotword_count") or 0) > expected_personal_hw),
                         ("matched==claude_desktop_code", r_cl_code.get("matched_by") == "claude_desktop_code"),
                         ("key==claude_code", r_cl_code.get("session_key_masked") == f"claude:{claude_desk_code_sid[:8]}"),
                         ("ws==alpha-service", r_cl_code.get("workspace_name") == "alpha-service"),
@@ -1387,7 +1407,7 @@ def run_layer_a_matrix(
                 )
             )
 
-            # Same title as Cowork ("Quarterly Launch Brief - Claude") on cloud Chat / blank route / no URL MUST stay general+ai_chat
+            # Same title as Cowork ("Quarterly Launch Brief - Claude") on cloud Chat / blank route / no URL MUST stay general with zero session crosstalk
             for tag, chat_page_url in (
                 ("A2_claude_desktop_same_title_chat_route_veto", "app://localhost/chat/99998888"),
                 ("A2_claude_desktop_same_title_no_route_veto", ""),
@@ -1408,45 +1428,42 @@ def run_layer_a_matrix(
                         [
                             ("ok", r_cl_chat_same.get("ok") is True),
                             ("mode==general", r_cl_chat_same.get("mode") == "general"),
-                            ("target_app_hint==ai_chat", r_cl_chat_same.get("target_app_hint") == "ai_chat"),
-                            ("hotwords_scope==chat", r_cl_chat_same.get("hotwords_scope") == "chat"),
+                            ("personal_hw==3", int(r_cl_chat_same.get("personal_hotword_count") or 0) == expected_personal_hw),
+                            (
+                                "hotword_count==personal_hotword_count",
+                                int(r_cl_chat_same.get("hotword_count") or 0) == int(r_cl_chat_same.get("personal_hotword_count") or 0),
+                            ),
                             ("key==''", r_cl_chat_same.get("session_key_masked") == ""),
                             ("ctx_chars==0", int(r_cl_chat_same.get("ctx_chars") or 0) == 0),
                         ],
                     )
                 )
 
-            # 3) Claude desktop / WeChat IM / Browser (general_gui, zero crosstalk)
-            for tag, win_req, exp_hint in (
+            # 3) Claude desktop / WeChat IM / Browser (general_gui, personal hotwords only, zero crosstalk)
+            for tag, win_req in (
                 (
                     "A2_claude_desktop_mac",
                     {"bundle_id": "com.anthropic.claudefordesktop", "process": "Claude", "title": "Claude"},
-                    "ai_chat",
                 ),
                 (
                     "A2_claude_desktop_win",
                     {"process": "Claude.exe", "title": "Design Review - Claude"},
-                    "ai_chat",
                 ),
                 (
                     "A2_wechat_im_mac",
                     {"bundle_id": "com.tencent.xinWeChat", "process": "WeChat", "title": "WeChat"},
-                    "im_chat",
                 ),
                 (
                     "A2_wechat_im_win",
                     {"process": "WeChat.exe", "title": "微信"},
-                    "im_chat",
                 ),
                 (
                     "A2_browser_mac",
                     {"bundle_id": "com.google.Chrome", "process": "Google Chrome", "title": "Docs - Google Chrome"},
-                    "",
                 ),
                 (
                     "A2_browser_win",
                     {"process": "chrome.exe", "title": "Docs - Google Chrome"},
-                    "",
                 ),
             ):
                 r_gen = _probe(win_req)
@@ -1459,7 +1476,11 @@ def run_layer_a_matrix(
                             ("ok", r_gen.get("ok") is True),
                             ("cat==general_gui", r_gen.get("window_category") == "general_gui"),
                             ("mode==general", r_gen.get("mode") == "general"),
-                            (f"hint=={exp_hint!r}", r_gen.get("target_app_hint") == exp_hint),
+                            ("personal_hw==3", int(r_gen.get("personal_hotword_count") or 0) == expected_personal_hw),
+                            (
+                                "hotword_count==personal_hotword_count",
+                                int(r_gen.get("hotword_count") or 0) == int(r_gen.get("personal_hotword_count") or 0),
+                            ),
                             ("key==''", r_gen.get("session_key_masked") == ""),
                             ("ctx_chars==0", int(r_gen.get("ctx_chars") or 0) == 0),
                         ],

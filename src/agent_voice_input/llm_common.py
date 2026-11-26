@@ -47,9 +47,11 @@ class AsrContext:
     git_block: str = ""
     mode: str = "agent"
     single_hop_prepared: bool = False
-    target_hint: str = ""
-    hotwords_scope: str = ""
     manual_hotwords_loaded: bool = False
+    personal_hotwords: tuple[str, ...] = ()
+    dynamic_hotwords: tuple[str, ...] = ()
+    builtin_hotwords: tuple[str, ...] = ()
+    hotwords_bucketed: bool = False
 
 
 _TokenUsageTuple = tuple[int | None, int | None, int | None, int | None]

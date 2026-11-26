@@ -1,7 +1,7 @@
 # agent-voice-input example configuration
-# Default location: ~/.config/agent-voice-input/config.toml (also falls back to ~/.config/voice-input/config.toml)
+# Default location: ~/.agent-voice-input/config.toml (override app home via AGENT_VOICE_INPUT_HOME)
 # Priority: CLI flags > config.toml > built-in defaults
-# Specify a custom config file via --config / AGENT_VOICE_INPUT_CONFIG
+# Specify a custom config file via --config / AGENT_VOICE_INPUT_CONFIG (credentials still load from <app_home>/.env)
 
 [hotkey]
 # Global hotkey:
@@ -53,7 +53,7 @@ macos_device = "default"
 beep = false
 # Tail drain seconds after stopping recording (auto-adapts by platform when unset: 0.65s on WSL2/RDP, 0.20s on macOS)
 # tail_drain_sec = 0.65
-# Optional local MP3 ring archive of valid voiced recordings under ~/.cache/agent-voice-input/recordings/ (16 kHz mono 64 kbps, 0600 mode, off by default)
+# Optional local MP3 ring archive of valid voiced recordings under ~/.agent-voice-input/recordings/ (16 kHz mono 64 kbps, 0600 mode, off by default)
 # save_recordings = false
 # save_recordings_max_count = 300
 # Pre-ASR long-pause & leading/trailing silence compression (pure stdlib; bypassed for <4s clips, <1s total savings, and retry):
@@ -98,10 +98,8 @@ doubao_mode = "auto"
 base_url = ""
 # Optional custom environment variable name holding the Stage 1 API key
 api_key_env = ""
-# Custom layered plain-text hotwords file (hot-reloaded on change, no daemon restart needed).
-# Supports optional [global], [chat] (IM/AI chat), and [coding] (terminal/IDE/Agent) sections; flat files map to [global].
-# Manage via `agent-voice-input hotwords list|add|remove` (manual terms always take top priority over dynamic/built-in words).
-hotwords_file = "~/.config/agent-voice-input/hotwords.txt"
+# Personal hotwords live at ~/.agent-voice-input/hotwords/personal.txt (hot-reloaded on change).
+# Manage via `agent-voice-input hotwords list|add|remove|path`.
 # timeout_sec = 60.0
 # Extra retry attempts within the same provider on rate-limit / transient network errors (0 disables retry)
 # max_retries = 2

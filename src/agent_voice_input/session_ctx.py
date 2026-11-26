@@ -118,8 +118,6 @@ from ._tmux import (
     resolve_tmux_bin,
 )
 from .app_scope import (
-    BUILTIN_AI_CHAT_HOTWORDS,
-    get_builtin_ai_chat_hotwords,
     is_remote_ide_window,
     parse_ide_window_title,
 )
@@ -3132,30 +3130,15 @@ class SessionTracker:
 
     def _candidate_runtime_dirs(self) -> list[Path]:
         dirs: list[Path] = [self.runtime_dir]
-        if not self._explicit_runtime_dir or self.runtime_dir.name == "agent-voice-input":
-            uid = os.getuid()
-            parent = self.runtime_dir.parent
-            fallbacks: list[Path] = [
-                parent / "voice-input",
-                parent / f"voice-input-{uid}",
-            ]
-            if not self._explicit_runtime_dir:
-                xdg = (self.env.get("XDG_RUNTIME_DIR") or "").strip()
-                if xdg:
-                    xp = Path(xdg)
-                    fallbacks.extend(
-                        [xp / "agent-voice-input", xp / "voice-input", xp / f"voice-input-{uid}"]
-                    )
-                cache_base = Path(
-                    (self.env.get("XDG_CACHE_HOME") or "").strip() or (self.home / ".cache")
-                )
-                fallbacks.extend(
-                    [
-                        cache_base / "agent-voice-input",
-                        cache_base / "voice-input",
-                        cache_base / f"voice-input-{uid}",
-                    ]
-                )
+        if not self._explicit_runtime_dir:
+            fallbacks: list[Path] = []
+            xdg = (self.env.get("XDG_RUNTIME_DIR") or "").strip()
+            if xdg:
+                fallbacks.append(Path(xdg) / "agent-voice-input")
+            cache_base = Path(
+                (self.env.get("XDG_CACHE_HOME") or "").strip() or (self.home / ".cache")
+            )
+            fallbacks.append(cache_base / "agent-voice-input")
             for cand in fallbacks:
                 if cand not in dirs:
                     dirs.append(cand)
@@ -6106,31 +6089,44 @@ class SessionTracker:
     def build_asr_context(
         snapshot: SessionSnapshot | None,
         *,
+        personal_hotwords: Sequence[str] = (),
+        workspace_dynamic_hotwords: Sequence[str] = (),
         extra_hotwords: Sequence[str] = (),
         max_dialog_chars: int = 16000,
         mode: str = "agent",
         language: str = "auto",
-        target_hint: str = "",
     ) -> AsrContext:
         eff_mode = (mode or "agent").strip().lower() or "agent"
-        eff_hint = (target_hint or "").strip().lower()
+        personal_bucket = tuple(_dedupe_hotwords_ci([*personal_hotwords, *extra_hotwords]))
         if eff_mode == "general":
-            builtin_tail = (
-                get_builtin_ai_chat_hotwords(language) if eff_hint == "ai_chat" else ()
-            )
-        else:
-            builtin_tail = get_builtin_agent_hotwords(language)
-        if eff_mode == "general" or snapshot is None:
             return AsrContext(
-                hotwords=_dedupe_hotwords_ci([*extra_hotwords, *builtin_tail]),
-                mode=eff_mode,
-                target_hint=eff_hint,
+                hotwords=list(personal_bucket),
+                mode="general",
+                personal_hotwords=personal_bucket,
+                dynamic_hotwords=(),
+                builtin_hotwords=(),
+                hotwords_bucketed=True,
             )
-        merged_hw = _dedupe_hotwords_ci([*extra_hotwords, *snapshot.hotwords, *builtin_tail])
+        builtin_bucket = tuple(_dedupe_hotwords_ci(get_builtin_agent_hotwords(language)))
+        snap_hw = snapshot.hotwords if snapshot is not None else ()
+        dynamic_bucket = tuple(_dedupe_hotwords_ci([*workspace_dynamic_hotwords, *snap_hw]))
+        merged_hw = _dedupe_hotwords_ci([*personal_bucket, *dynamic_bucket, *builtin_bucket])
+        if snapshot is None:
+            return AsrContext(
+                hotwords=merged_hw,
+                mode=eff_mode,
+                personal_hotwords=personal_bucket,
+                dynamic_hotwords=dynamic_bucket,
+                builtin_hotwords=builtin_bucket,
+                hotwords_bucketed=True,
+            )
         return AsrContext(
             hotwords=merged_hw,
             git_status=snapshot.git_status,
             dialog_text=snapshot.format_dialog(max_chars=max_dialog_chars),
             mode=eff_mode,
-            target_hint=eff_hint,
+            personal_hotwords=personal_bucket,
+            dynamic_hotwords=dynamic_bucket,
+            builtin_hotwords=builtin_bucket,
+            hotwords_bucketed=True,
         )

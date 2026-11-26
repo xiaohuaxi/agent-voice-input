@@ -18,7 +18,7 @@ description: 在本机真实长会话或合成样本上实测语音输入精修�
 
 - 红线：调用 `CodexRefiner` 或任何 `codex` 子进程做实测时，严禁通过参数、配置或环境变量开启 Fast 模式。
 - 红线：严禁将任何真实会话内容、语音样本、`telemetry.jsonl` / `daemon.log` 运行流水、宿主机隐私路径或未脱敏凭据写入版本库。
-- 本地输出脱敏与隔离边界：终端报告与仓外文件统一经 `redact_secrets` 过滤密钥，但不同产物的正文与路径留存边界不同。`diagnose_live.py` 不输出任何会话或口述正文（结果记录将 `saved_audio` 转为布尔字段 `has_saved_audio` 隐去失败录音路径，但脱敏后的 `daemon.log` 尾部及异常文本仍可能保留本机路径）；`e2e_system.py` 对宿主机 `recordings/` 真实历史录音回放仅报告音频时长、分段耗时、token/缓存命中数与落字字符长度，不打印真实用户口述原文或隐私路径；`bench_refiner.py` 仅对合成测试句及最多 2 个从会话提取的安全代码标识符展示精修对照（超长异常输出自动截断）；`eval_recordings.py` 终端仅打印聚合指标，但写入仓外私有评测目录（默认 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/eval-runs/`，目录权限 `0700`）的 `0600` 文件 `<tag>.json` 与 `diff_*.md` 保留过滤密钥后的识别初稿、精修正文与历史参考文本供本机复盘，不可当作无口述正文的公开报告外发。`bench_refiner.py`、`e2e_system.py` 与 `regress_matrix.py` Layer A 全程在临时 `0700` `runtime_dir`（及隔离 `HOME` 或 `XDG_CACHE_HOME`）运行并自动清理；`regress_matrix.py` 默认零对话正文输出（仅传 `--show-text` 时在本地终端回显合成测试句结果），`e2e_system.py` 与 `regress_matrix.py` 复用的合成测试 WAV 仅缓存于仓外 `~/.cache/agent-voice-input/eval-wavs/`（权限 `0700`）。
+- 本地输出脱敏与隔离边界：终端报告与仓外文件统一经 `redact_secrets` 过滤密钥，但不同产物的正文与路径留存边界不同。`diagnose_live.py` 不输出任何会话或口述正文（结果记录将 `saved_audio` 转为布尔字段 `has_saved_audio` 隐去失败录音路径，但脱敏后的 `daemon.log` 尾部及异常文本仍可能保留本机路径）；`e2e_system.py` 对宿主机 `recordings/` 真实历史录音回放仅报告音频时长、分段耗时、token/缓存命中数与落字字符长度，不打印真实用户口述原文或隐私路径；`bench_refiner.py` 仅对合成测试句及最多 2 个从会话提取的安全代码标识符展示精修对照（超长异常输出自动截断）；`eval_recordings.py` 终端仅打印聚合指标，但写入仓外私有评测目录（默认 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/eval-runs/`，目录权限 `0700`）的 `0600` 文件 `<tag>.json` 与 `diff_*.md` 保留过滤密钥后的识别初稿、精修正文与历史参考文本供本机复盘，不可当作无口述正文的公开报告外发。`bench_refiner.py`、`e2e_system.py` 与 `regress_matrix.py` Layer A 全程在临时 `0700` `runtime_dir`（及隔离 `HOME` / `AGENT_VOICE_INPUT_HOME` / `XDG_CACHE_HOME`）运行并自动清理；`regress_matrix.py` 默认零对话正文输出（仅传 `--show-text` 时在本地终端回显合成测试句结果），`e2e_system.py` 与 `regress_matrix.py` 复用的合成测试 WAV 仅缓存于仓外 `~/.cache/agent-voice-input/eval-wavs/`（权限 `0700`）。
 
 ## 场景 1：真实长会话精修基准实测（`scripts/bench_refiner.py`）
 
@@ -67,7 +67,7 @@ PYTHONPATH=src python3 .agents/skills/voice-eval/scripts/e2e_system.py --wav /tm
 - `C2_serial_e2e_tmux`：在独立 `tmux -L avi-e2e-*` 服务器与无头 `PlatformBackend` 下拉起真实 `VoiceInputDaemon`，驱动 U1 冷启动及 U2、U3 背靠背连续入队，通过 `tmux capture-pane` 读回真实落字核验不丢句、按序落字，以及默认探针的代码标识符还原、问句保留与口语纠错（预期执行 Stage 2 精修时，校验稳态轮触发 `cached_input_tokens > 0`）。
 - `C3_telemetry_privacy_contract`：校验 `telemetry.jsonl` 为 `0600` 普通文件且成功记录的分段耗时字段齐全，核对磁盘记录与 `status --history` 输出条数一致，且两者均不含任何测试口述、回放原文或明文密钥。
 - `C4_fault_recovery_redaction`：注入单次上游故障，校验当次音频以 `0600` 暂存至隔离 `failed/`、失败记录与异常摘要经 `redact_secrets` 脱敏，且 `diagnose_live.py --json` 报告 `has_saved_audio` 正常闭环。
-- `C5_mp3_archive_and_saved_replay`：在隔离 `XDG_CACHE_HOME` 验证 `audio.save_recordings=true` 真实产出 `0600` `64 kbps` `rec-*.mp3` 且能经 `ffmpeg` 还原为有效 `16kHz WAV`；同时检查宿主机 `resolve_saved_recordings_dir()`，若存在真实 `.mp3`/`.m4a`/`.wav` 历史录音则按 `--saved-limit`（默认最多 2 条，`0` 跳过宿主录音）选取最新录音还原后送入隔离守护进程 + 真 ASR + 真精修 + 隔离 `tmux` 落字验证（仅输出纯数值指标、零原文打印），尚无历史录音时标明 `SKIPPED (0 saved recordings yet)` 并跑通隔离 MP3 往返真链路回放。
+- `C5_mp3_archive_and_saved_replay`：在隔离 `AGENT_VOICE_INPUT_HOME`（`<iso_home>/recordings/`）验证 `audio.save_recordings=true` 真实产出 `0600` `64 kbps` `rec-*.mp3` 且能经 `ffmpeg` 还原为有效 `16kHz WAV`（零污染宿主机目录）；同时检查宿主机 `resolve_saved_recordings_dir()`（默认 `~/.agent-voice-input/recordings/`），若存在真实 `.mp3`/`.m4a`/`.wav` 历史录音则按 `--saved-limit`（默认最多 2 条，`0` 跳过宿主录音）选取最新录音还原后送入隔离守护进程 + 真 ASR + 真精修 + 隔离 `tmux` 落字验证（仅输出纯数值指标、零原文打印），尚无历史录音时标明 `SKIPPED (0 saved recordings yet)` 并跑通隔离 MP3 往返真链路回放。
 - `C6_non_git_and_ssh_isolation`：在隔离临时目录创建不含 `.git` 的普通文件夹（含 `budget_q4_plan.xlsx` / `custom_widget_spec.md`）并绑定隔离会话连续跑通两轮语音精修，验证非 Git 浅层文件名提取、热词还原与增量多轮上下文命中；随后在本地双会话在线场景下，向无头后端分别模拟终端 SSH 窗口标题与专用客户端（`putty.exe`）前台信息，验证触发 Phase 0 远端防串台硬否决（零本地上下文混入）。
 - `C7_native_hud_self_check`：在 macOS 执行 `mac_shim --self-check`、在 WSL2 执行 `win_shim.ps1 -Mode self-check`（纯非 WSL Linux 自动跳过），零屏幕/剪贴板打扰地离屏校验原生 HUD 胶囊像素布局用例（`hud_layout_cases > 0`）与桥接自检状态。
 
@@ -91,7 +91,7 @@ agent-voice-input status --history 10
 
 ## 场景 4：存量真实录音按时间点 A/B 回放评测（`scripts/eval_recordings.py`）
 
-基于 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/` 已归档录音重建录音时刻的历史会话快照做配对对比（`<tag>.json` 按标签名覆盖写入，建议使用带实验标识的唯一 `--tag` 或独立 `--eval-dir`）：
+基于 `~/.agent-voice-input/recordings/`（受 `AGENT_VOICE_INPUT_HOME` 或 `--home-dir` / `--recordings-dir` 覆盖）已归档录音重建录音时刻的历史会话快照做配对对比（`<tag>.json` 按标签名覆盖写入，建议使用带实验标识的唯一 `--tag` 或独立 `--eval-dir`）：
 
 ```bash
 # 1) 用两阶段配置跑基线标签（--limit 按文件修改时间从早到晚取前 N 条通过门控的录音，0 为全量）

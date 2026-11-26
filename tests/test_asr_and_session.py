@@ -88,7 +88,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg = Config()
         cfg.asr.provider = "dashscope"
         cfg.asr.model = "qwen3-asr-flash"
-        cfg.asr.hotwords_file = ""
         env = {"DASHSCOPE_API_KEY": "dummy_ali_secret_token"}
         creds = resolve_credentials(cfg, env)
 
@@ -183,7 +182,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg = Config()
         cfg.asr.provider = "dashscope"
         cfg.asr.model = "qwen-audio-3.1-asr-flash"
-        cfg.asr.hotwords_file = ""
         env = {"ALI_API_KEY": "dummy_ali_native_secret"}
 
         r1 = transcribe(
@@ -257,7 +255,6 @@ class AsrProvidersTests(unittest.TestCase):
 
         cfg = Config()
         cfg.asr.provider = "doubao"
-        cfg.asr.hotwords_file = ""
         env = {
             "APP_ID_DOUBAO_ASR": "fake_appid_value",
             "API_KEY_DOUBAO_ASR": "fake_access_key_value",
@@ -347,7 +344,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg.asr.provider = "doubao"
         cfg.asr.resource_id = "volc.bigasr.auc"
         cfg.asr.timeout_sec = 15.0
-        cfg.asr.hotwords_file = ""
         env = {"DOUBAO_ASR_API_KEY": "deadline_test_key"}
 
         with self.assertRaises(AsrError) as ctx:
@@ -377,7 +373,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_flash.asr.provider = "doubao"
         cfg_flash.asr.resource_id = "volc.bigasr.auc_turbo"
         cfg_flash.asr.timeout_sec = 15.0
-        cfg_flash.asr.hotwords_file = ""
         now_box[0] = 200.0
         with self.assertRaises(AsrError) as late_ctx:
             transcribe(
@@ -394,7 +389,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_auto = Config()
         cfg_auto.asr.provider = "doubao"
         cfg_auto.asr.resource_id = "auto"
-        cfg_auto.asr.hotwords_file = ""
         step = [0]
         now_box[0] = 300.0
 
@@ -458,7 +452,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_sub.asr.provider = "doubao"
         cfg_sub.asr.resource_id = "auto"
         cfg_sub.asr.doubao_mode = "submit"
-        cfg_sub.asr.hotwords_file = ""
         with self.assertRaises(AsrError):
             transcribe(_sample_wav(), cfg_sub, env=env, transport=tx_all_denied, sleep_fn=lambda _: None)
         self.assertEqual(
@@ -495,7 +488,6 @@ class AsrProvidersTests(unittest.TestCase):
 
         cfg_auto = Config()
         cfg_auto.asr.provider = "doubao"
-        cfg_auto.asr.hotwords_file = ""
         res_seed1 = transcribe(_sample_wav(), cfg_auto, env=env, transport=tx_seed_fallback, sleep_fn=lambda _: None)
         self.assertEqual(res_seed1.text, "seed 2.0 fallback ok")
         self.assertEqual(
@@ -533,7 +525,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_flash.asr.provider = "doubao"
         cfg_flash.asr.resource_id = "auto"
         cfg_flash.asr.doubao_mode = "flash"
-        cfg_flash.asr.hotwords_file = ""
         res_fl = transcribe(_sample_wav(), cfg_flash, env=env, transport=tx_flash_only, sleep_fn=lambda _: None)
         self.assertEqual(res_fl.text, "flash mode ok")
         self.assertEqual(seen_flash_only, [("flash", "volc.bigasr.auc_turbo")])
@@ -598,7 +589,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_poll = Config()
         cfg_poll.asr.provider = "doubao"
         cfg_poll.asr.resource_id = "volc.seedasr.auc"
-        cfg_poll.asr.hotwords_file = ""
         res_poll = transcribe(
             _sample_wav(),
             cfg_poll,
@@ -614,7 +604,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg = Config()
         cfg.asr.provider = "doubao"
         cfg.asr.resource_id = "volc.bigasr.auc_turbo"
-        cfg.asr.hotwords_file = ""
 
         # 1. DOUBAO_SPEECH_API_KEY + lingering DOUBAO_ASR_APP_ID / DOUBAO_ASR_API_KEY ->
         #    strictly single-header X-Api-Key only (no X-Api-App-Key / X-Api-Access-Key).
@@ -728,7 +717,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg = Config()
         cfg.asr.provider = "doubao"
         cfg.asr.resource_id = "volc.bigasr.auc_turbo"
-        cfg.asr.hotwords_file = ""
 
         with self.assertRaises(AsrError) as exc_ctx:
             transcribe(_sample_wav(), cfg, env=env, transport=transport_raising_secret)
@@ -749,7 +737,6 @@ class AsrProvidersTests(unittest.TestCase):
 
         cfg_oai = Config()
         cfg_oai.asr.provider = "openai"
-        cfg_oai.asr.hotwords_file = ""
         env_oai = {"OPENAI_API_KEY": secret}
         with self.assertRaises(AsrError) as bound_ctx:
             transcribe(_sample_wav(), cfg_oai, env=env_oai, transport=transport_boundary_secret)
@@ -781,7 +768,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_custom = Config()
         cfg_custom.asr.provider = "dashscope"
         cfg_custom.asr.api_key_env = "MISSING_CUSTOM_ALI_KEY"
-        cfg_custom.asr.hotwords_file = ""
         with self.assertRaises(AsrError) as custom_ctx:
             transcribe(
                 _sample_wav(),
@@ -808,7 +794,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_gem = Config()
         cfg_gem.asr.provider = "gemini"
         cfg_gem.asr.api_key_env = "CUSTOM_GEM_TOML_KEY"
-        cfg_gem.asr.hotwords_file = ""
         gem_secret = "custom_gem_toml_secret_val"
         with self.assertRaises(AsrError) as gem_err_ctx:
             transcribe(
@@ -851,7 +836,6 @@ class AsrProvidersTests(unittest.TestCase):
 
         cfg = Config()
         cfg.asr.provider = "gemini"
-        cfg.asr.hotwords_file = ""
         gem_env = {"GEMINI_API_KEY": "fake_gemini_token_val"}
         gem_res = transcribe(
             _sample_wav(),
@@ -889,7 +873,6 @@ class AsrProvidersTests(unittest.TestCase):
 
         cfg_oai = Config()
         cfg_oai.asr.provider = "openai"
-        cfg_oai.asr.hotwords_file = ""
         oai_env = {"OPENAI_API_KEY": "fake_oai_token_val"}
         oai_res = transcribe(
             _sample_wav(),
@@ -941,7 +924,6 @@ class AsrProvidersTests(unittest.TestCase):
                 cfg = Config()
                 cfg.asr.provider = prov
                 cfg.asr.base_url = base_url
-                cfg.asr.hotwords_file = ""
                 res = transcribe(_sample_wav(), cfg, env=env, context=ctx, transport=stt_transport)
                 self.assertEqual(res.provider, prov)
                 self.assertFalse(res.is_single_hop_refined)
@@ -980,7 +962,6 @@ class AsrProvidersTests(unittest.TestCase):
             cfg = Config()
             cfg.asr.provider = "openrouter"
             cfg.asr.model = model_id
-            cfg.asr.hotwords_file = ""
             res = transcribe(_sample_wav(), cfg, env=env, context=ctx, transport=or_transport)
             self.assertEqual(res.provider, "openrouter")
             self.assertEqual(res.model, model_id or "qwen/qwen3-asr-1.7b")
@@ -1009,7 +990,6 @@ class AsrProvidersTests(unittest.TestCase):
             cfg_kt = Config()
             cfg_kt.asr.provider = "openrouter"
             cfg_kt.asr.model = kt_model
-            cfg_kt.asr.hotwords_file = ""
             transcribe(_sample_wav(), cfg_kt, env=env, context=ctx, transport=or_transport)
             payload_kt = json.loads(captured[0].body.decode("utf-8"))
             self.assertEqual(payload_kt["keyterms"], ["openrouter", "qwen3-asr-1.7b"])
@@ -1019,7 +999,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_dg = Config()
         cfg_dg.asr.provider = "openrouter"
         cfg_dg.asr.model = "deepgram/nova-3"
-        cfg_dg.asr.hotwords_file = ""
         transcribe(_sample_wav(), cfg_dg, env=env, context=ctx, transport=or_transport)
         payload_dg = json.loads(captured[0].body.decode("utf-8"))
         self.assertNotIn("keyterms", payload_dg)
@@ -1062,7 +1041,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg = Config()
         cfg.asr.provider = "openrouter"
         cfg.asr.model = "google/gemini-2.5-flash"
-        cfg.asr.hotwords_file = ""
         prov_obj = create_asr_provider(cfg, resolve_credentials(cfg, env), env=env, transport=chat_transport)
         self.assertIsInstance(prov_obj, ChatAudioAsrProvider)
         res = prov_obj.transcribe(_sample_wav(), context=ctx)
@@ -1103,7 +1081,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_gpt_audio.asr.provider = "openrouter"
         cfg_gpt_audio.asr.model = "openai/gpt-audio-mini"
         cfg_gpt_audio.asr.effort = "auto"
-        cfg_gpt_audio.asr.hotwords_file = ""
         transcribe(_sample_wav(), cfg_gpt_audio, env=env, context=ctx, transport=chat_transport)
         p_gpt_audio = json.loads(captured[0].body.decode("utf-8"))
         self.assertNotIn("reasoning", p_gpt_audio)
@@ -1118,7 +1095,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_exp.asr.provider = "openrouter"
         cfg_exp.asr.model = "qwen/qwen3.8-omni-flash"
         cfg_exp.asr.effort = "medium"
-        cfg_exp.asr.hotwords_file = ""
         transcribe(_sample_wav(), cfg_exp, env=env, context=ctx, transport=chat_transport)
         self.assertEqual(json.loads(captured[0].body.decode("utf-8"))["reasoning"], {"effort": "medium"})
 
@@ -1133,7 +1109,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_oai_max.asr.model = "o4-mini-audio-reasoning"
         cfg_oai_max.asr.api = "chat-completions"
         cfg_oai_max.asr.effort = "max"
-        cfg_oai_max.asr.hotwords_file = ""
         transcribe(_sample_wav(), cfg_oai_max, env=env, context=ctx, transport=chat_transport)
         p_oai_max = json.loads(captured[0].body.decode("utf-8"))
         self.assertEqual(p_oai_max["reasoning_effort"], "xhigh")
@@ -1145,7 +1120,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_oai_def.asr.model = "gpt-5-mini"
         cfg_oai_def.asr.api = "chat-completions"
         cfg_oai_def.asr.effort = "default"
-        cfg_oai_def.asr.hotwords_file = ""
         transcribe(_sample_wav(), cfg_oai_def, env=env, context=ctx, transport=chat_transport)
         p_oai_def = json.loads(captured[0].body.decode("utf-8"))
         self.assertNotIn("reasoning_effort", p_oai_def)
@@ -1170,7 +1144,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_gem_def = Config()
         cfg_gem_def.asr.provider = "gemini"
         cfg_gem_def.asr.effort = "default"
-        cfg_gem_def.asr.hotwords_file = ""
         transcribe(_sample_wav(), cfg_gem_def, env=env, transport=gem_tx)
         self.assertNotIn(
             "thinkingConfig",
@@ -1463,7 +1436,6 @@ class AsrProvidersTests(unittest.TestCase):
         # Default AsrConfig.timeout_sec (60.0s) and explicit overrides forward directly to transport
         cfg_def = Config()
         cfg_def.asr.provider = "openai"
-        cfg_def.asr.hotwords_file = ""
         self.assertEqual(cfg_def.asr.timeout_sec, 60.0)
         prov_def = create_asr_provider(cfg_def, resolve_credentials(cfg_def, env), env=env, transport=fake_tx)
         prov_def.transcribe(chunk_wav)
@@ -1472,7 +1444,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_small = Config()
         cfg_small.asr.provider = "openai"
         cfg_small.asr.timeout_sec = 3.0
-        cfg_small.asr.hotwords_file = ""
         prov_small = create_asr_provider(cfg_small, resolve_credentials(cfg_small, env), env=env, transport=fake_tx)
         prov_small.transcribe(chunk_wav)
         self.assertEqual(seen_timeouts[-1], 3.0)
@@ -1850,7 +1821,6 @@ class AsrProvidersTests(unittest.TestCase):
 
         cfg_oai = Config()
         cfg_oai.asr.provider = "openai"
-        cfg_oai.asr.hotwords_file = ""
         prov_rl = create_asr_provider(
             cfg_oai,
             resolve_credentials(cfg_oai, env),
@@ -1878,7 +1848,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_short = Config()
         cfg_short.asr.provider = "openai"
         cfg_short.asr.timeout_sec = 10.0
-        cfg_short.asr.hotwords_file = ""
         prov_big = create_asr_provider(
             cfg_short,
             resolve_credentials(cfg_short, env),
@@ -1921,11 +1890,9 @@ class AsrProvidersTests(unittest.TestCase):
 
         cfg_db = Config()
         cfg_db.asr.provider = "doubao"
-        cfg_db.asr.hotwords_file = ""
         cfg_db_flash = Config()
         cfg_db_flash.asr.provider = "doubao"
         cfg_db_flash.asr.doubao_mode = "flash"
-        cfg_db_flash.asr.hotwords_file = ""
         prov_db = create_asr_provider(
             cfg_db_flash,
             resolve_credentials(cfg_db_flash, env),
@@ -2076,7 +2043,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_or = Config()
         cfg_or.asr.provider = "openrouter"
         cfg_or.asr.model = "google/gemini-2.5-flash"
-        cfg_or.asr.hotwords_file = ""
         res_or = create_asr_provider(
             cfg_or,
             resolve_credentials(cfg_or, env),
@@ -2122,7 +2088,6 @@ class AsrProvidersTests(unittest.TestCase):
 
         cfg_gem = Config()
         cfg_gem.asr.provider = "gemini"
-        cfg_gem.asr.hotwords_file = ""
         with self.assertRaises(AsrError):
             create_asr_provider(
                 cfg_gem, resolve_credentials(cfg_gem, env), env=env, transport=tx_gem_block, sleep_fn=lambda _s: None
@@ -2142,7 +2107,6 @@ class AsrProvidersTests(unittest.TestCase):
 
         cfg_ali = Config()
         cfg_ali.asr.provider = "dashscope"
-        cfg_ali.asr.hotwords_file = ""
         res_ali_sil = create_asr_provider(
             cfg_ali, resolve_credentials(cfg_ali, env), env=env, transport=tx_ali_sil, sleep_fn=lambda _s: None
         ).transcribe(wav)
@@ -2153,7 +2117,6 @@ class AsrProvidersTests(unittest.TestCase):
         cfg_zero = Config()
         cfg_zero.asr.provider = "openai"
         cfg_zero.asr.max_retries = 0
-        cfg_zero.asr.hotwords_file = ""
         with self.assertRaises(AsrError):
             create_asr_provider(
                 cfg_zero,
@@ -2946,24 +2909,17 @@ class SessionCtxTests(unittest.TestCase):
                 cwd="/tmp/old-shared",
             )
 
-            # Auto-resolved runtime_dir (new_rt doesn't exist yet!) seamlessly finds legacy registries
+            # Auto-resolved runtime_dir ignores removed legacy voice-input* directories and resolves agent-voice-input/sessions
             tracker = SessionTracker(
                 home_dir=home,
                 env={"HOME": str(home), "XDG_RUNTIME_DIR": str(xdg)},
                 runtime_dir=new_rt,
                 proc_root=empty_proc,
             )
-            m_uid = tracker.resolve_session("claude [#aaaa0001]")
-            self.assertIsNotNone(m_uid)
-            assert m_uid is not None
-            self.assertEqual(m_uid.session_id, sid_legacy_uid)
+            self.assertIsNone(tracker.resolve_session("claude [#aaaa0001]"))
+            self.assertIsNone(tracker.resolve_session("claude [#bbbb0002]"))
 
-            m_old = tracker.resolve_session("claude [#bbbb0002]")
-            self.assertIsNotNone(m_old)
-            assert m_old is not None
-            self.assertEqual(m_old.session_id, sid_legacy)
-
-            # Once new_rt registers the same prefix, agent-voice-input/sessions strictly wins over legacy!
+            # Registering in agent-voice-input/sessions resolves cleanly
             write_session_registry_entry(
                 new_rt,
                 cli="claude",
@@ -4036,24 +3992,38 @@ class SessionCtxTests(unittest.TestCase):
             context_blocks=("<session_reference_log>blk0</session_reference_log>", "<session_reference_log>blk1</session_reference_log>"),
             git_block='<workspace_git_status read_only="true">\nM refiner.py\n</workspace_git_status>',
             mode="general",
+            personal_hotwords=("SessionTracker",),
+            hotwords_bucketed=True,
+            manual_hotwords_loaded=True,
         )
-        coerced_dc = _coerce_context(rich_ctx, "")
+        coerced_dc = _coerce_context(rich_ctx, env={})
         self.assertEqual(coerced_dc.context_blocks, rich_ctx.context_blocks)
         self.assertEqual(coerced_dc.git_block, rich_ctx.git_block)
         self.assertEqual(coerced_dc.mode, "general")
+        self.assertEqual(coerced_dc.personal_hotwords, ("SessionTracker",))
+        self.assertTrue(coerced_dc.hotwords_bucketed)
 
         coerced_map = _coerce_context(
             {
                 "hotwords": ["CodexRefiner"],
+                "personal_hotwords": ["CodexRefiner"],
+                "dynamic_hotwords": ["DynSym"],
+                "builtin_hotwords": ["Codex"],
+                "hotwords_bucketed": True,
+                "manual_hotwords_loaded": True,
                 "context_blocks": ["<session_reference_log>m0</session_reference_log>"],
                 "git_block": "<workspace_git_status>G</workspace_git_status>",
                 "mode": "agent",
             },
-            "",
+            env={},
         )
         self.assertEqual(coerced_map.context_blocks, ("<session_reference_log>m0</session_reference_log>",))
         self.assertEqual(coerced_map.git_block, "<workspace_git_status>G</workspace_git_status>")
         self.assertEqual(coerced_map.mode, "agent")
+        self.assertEqual(coerced_map.personal_hotwords, ("CodexRefiner",))
+        self.assertEqual(coerced_map.dynamic_hotwords, ("DynSym",))
+        self.assertEqual(coerced_map.builtin_hotwords, ("Codex",))
+        self.assertTrue(coerced_map.hotwords_bucketed)
 
         # 2. openrouter_cache_breakpoints targets the last SEALED block (history >= 2) for google/* and {sealed, last} for anthropic/*
         self.assertEqual(openrouter_cache_breakpoints("openrouter", "google/gemini-3.5-flash-lite", 1), ())
@@ -4090,7 +4060,6 @@ class SessionCtxTests(unittest.TestCase):
         cfg_ali = Config()
         cfg_ali.asr.provider = "dashscope"
         cfg_ali.asr.model = "qwen3.8-omni-flash"
-        cfg_ali.asr.hotwords_file = ""
         ali_prov = create_asr_provider(cfg_ali, resolve_credentials(cfg_ali, env), env=env, transport=omni_tx)
         self.assertIsInstance(ali_prov, ChatAudioAsrProvider)
         self.assertTrue(ali_prov.single_hop)
@@ -4133,7 +4102,7 @@ class SessionCtxTests(unittest.TestCase):
         ali_parts = ali_body["messages"][1]["content"]
         self.assertEqual(len(ali_parts), 6)  # 3 blocks + tail(git+vocab) + input_audio + task_reminder
         self.assertTrue(all("cache_control" not in p for p in ali_parts))
-        self.assertIn("<vocabulary_hints", ali_parts[3]["text"])
+        self.assertIn("Additional context terms (read-only): SessionTracker, refiner.py", ali_parts[3]["text"])
         self.assertEqual(ali_parts[4]["input_audio"]["format"], "mp3")
         self.assertTrue(ali_parts[4]["input_audio"]["data"].startswith("data:audio/mp3;base64,"))
 
@@ -4152,7 +4121,6 @@ class SessionCtxTests(unittest.TestCase):
         cfg_or = Config()
         cfg_or.asr.provider = "openrouter"
         cfg_or.asr.model = "google/gemini-3.5-flash-lite"
-        cfg_or.asr.hotwords_file = ""
         or_prov = create_asr_provider(cfg_or, resolve_credentials(cfg_or, env), env=env, transport=or_empty_quote_tx)
         with mock.patch("agent_voice_input.asr_providers.encode_wav_to_mp3_bytes", return_value=None):
             res_or = or_prov.transcribe(wav_4s, context=ctx_blocks)
@@ -4221,7 +4189,6 @@ class SessionCtxTests(unittest.TestCase):
         env_gem = {"GEMINI_API_KEY": "AIza-fake-" + ("g" * 16)}
         cfg_gem = Config()
         cfg_gem.asr.provider = "gemini"
-        cfg_gem.asr.hotwords_file = ""
         gem_prov = GeminiAudioProvider(cfg_gem, resolve_credentials(cfg_gem, env_gem), env=env_gem, transport=gem_aud_tx)
         res_gem = gem_prov.transcribe(
             _sample_wav(),
@@ -4244,7 +4211,6 @@ class SessionCtxTests(unittest.TestCase):
         cfg = Config()
         cfg.asr.provider = "openrouter"
         cfg.asr.model = "google/gemini-2.5-flash"
-        cfg.asr.hotwords_file = ""
         cfg.asr.max_retries = 2
 
         for raw_reason, want_norm in (
@@ -4347,7 +4313,6 @@ class SessionCtxTests(unittest.TestCase):
 
         cfg = Config()
         cfg.asr.provider = "deepseek"
-        cfg.asr.hotwords_file = ""
         env = {"DEEPSEEK_API_KEY": secret, "API_KEY_DEEPSEEK": "sk-legacy-unused-1122"}
 
         prov = create_asr_provider(cfg, env=env, transport=ok_tx)
@@ -4398,7 +4363,6 @@ class SessionCtxTests(unittest.TestCase):
             c_url = Config()
             c_url.asr.provider = "deepseek"
             c_url.asr.base_url = raw_base
-            c_url.asr.hotwords_file = ""
             transcribe(wav, c_url, env=env, transport=ok_tx)
             self.assertEqual(captured[0].url, want_url, msg=f"base_url={raw_base!r}")
 
@@ -4593,7 +4557,6 @@ class SessionCtxTests(unittest.TestCase):
             rt.mkdir(mode=0o700)
             cfg_pipe = Config()
             cfg_pipe.asr.provider = "deepseek"
-            cfg_pipe.asr.hotwords_file = ""
             cfg_pipe.refiner.provider = "off"
             pipe_res = run_pipeline_once(
                 wav,
@@ -4663,7 +4626,6 @@ class SessionCtxTests(unittest.TestCase):
         env = {"DEEPSEEK_API_KEY": secret}
         cfg = Config()
         cfg.asr.provider = "deepseek"
-        cfg.asr.hotwords_file = ""
         wav = _sample_wav()
 
         # 1. P2-reqid: strict character whitelist + redaction
@@ -4724,7 +4686,6 @@ class SessionCtxTests(unittest.TestCase):
         cfg_bad = Config()
         cfg_bad.asr.provider = "deepseek"
         cfg_bad.asr.base_url = f"https://[invalid-ipv6/v1?token={secret}"
-        cfg_bad.asr.hotwords_file = ""
         with self.assertRaises(AsrError) as ipv6_ctx:
             transcribe(wav, cfg_bad, env=env, transport=stream_tx)
         self.assertEqual(ipv6_ctx.exception.retry_kind, "never")
@@ -4824,7 +4785,6 @@ class SessionCtxTests(unittest.TestCase):
             cfg = Config()
             cfg.asr.provider = "openai"
             cfg.asr.model = model_name
-            cfg.asr.hotwords_file = ""
 
             transcribe(
                 _sample_wav(),
@@ -4864,7 +4824,6 @@ class SessionCtxTests(unittest.TestCase):
             cfg_leg = Config()
             cfg_leg.asr.provider = "openai"
             cfg_leg.asr.model = legacy_model
-            cfg_leg.asr.hotwords_file = ""
             transcribe(
                 _sample_wav(),
                 cfg_leg,
@@ -4877,39 +4836,138 @@ class SessionCtxTests(unittest.TestCase):
             self.assertIn('name="prompt"\r\n\r\n', leg_body)
             self.assertIn("常用技术术语：Zephyrus、KestrelDB", leg_body)
 
-        # 3. DashScope _compose_context_text relaxes hotwords cap to 900 chars (aligned with hotwords.py)
-        ds_terms = [f"DashScopeTerm_{i:02d}" for i in range(60)]
-        ds_txt = _compose_context_text(AsrContext(hotwords=ds_terms), max_chars=2500)
+        # 3. DashScope _compose_context_text relaxes hotwords cap to 1,800 chars (aligned with HOTWORDS_QUOTA_SPECS["dashscope"])
+        ds_terms = [f"DashScopeTerm_{i:02d}" for i in range(150)]
+        ds_txt = _compose_context_text(AsrContext(hotwords=ds_terms), max_chars=3800)
         self.assertTrue(ds_txt.startswith("常用技术术语："))
-        self.assertGreater(len(ds_txt), 420)
-        self.assertLessEqual(len(ds_txt), 900 + len("常用技术术语："))
+        self.assertGreater(len(ds_txt), 1500)
+        self.assertLessEqual(len(ds_txt), 1800 + len("常用技术术语："))
+
+    def test_dashscope_3800_1800_hotwords_and_dialog_tail_cap_isolation(self) -> None:
+        from agent_voice_input.hotwords import clear_hotwords_cache
+
+        with tempfile.TemporaryDirectory() as td:
+            clear_hotwords_cache()
+            try:
+                app_home = Path(td) / "avi_home"
+                hw_file = app_home / "hotwords" / "personal.txt"
+                hw_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                # 150 personal terms, ~10 chars each + "、" = 11*150 - 1 = 1649 <= 1800 chars
+                terms_150 = [f"Term_{i:03d}X" for i in range(150)]
+                hw_file.write_text("\n".join(terms_150) + "\n", encoding="utf-8")
+
+                reqs: list[HttpRequest] = []
+
+                def ds_tx(req: HttpRequest) -> HttpResponse:
+                    reqs.append(req)
+                    return HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8"),
+                    )
+
+                cfg = Config()
+                cfg.asr.provider = "dashscope"
+                cfg.asr.model = "qwen3-asr-flash"
+                env_ds = {
+                    "AGENT_VOICE_INPUT_HOME": str(app_home),
+                    "DASHSCOPE_API_KEY": "sk-ds-cap-" + ("a" * 16),
+                }
+                prov = create_asr_provider(cfg, resolve_credentials(cfg, env_ds), env=env_ds, transport=ds_tx)
+
+                # Case A: 150 personal terms (<=1800 chars) ALL survive into DashScope system context,
+                # while a 6,000-char dialog tail is bounded within ~2,000 chars and total <= 3,800.
+                long_dialog = "对话历史片段_" * 900  # >6000 chars
+                ctx_full = AsrContext(
+                    hotwords=list(terms_150),
+                    personal_hotwords=tuple(terms_150),
+                    dynamic_hotwords=(),
+                    builtin_hotwords=(),
+                    hotwords_bucketed=True,
+                    manual_hotwords_loaded=True,
+                    mode="general",
+                    dialog_text=long_dialog,
+                )
+                prov.transcribe(_sample_wav(), context=ctx_full)
+                sys_txt_a = json.loads(reqs[-1].body.decode("utf-8"))["messages"][0]["content"][0]["text"]
+                self.assertLessEqual(len(sys_txt_a), 3800)
+                hw_line_a = sys_txt_a.splitlines()[0]
+                self.assertTrue(hw_line_a.startswith("常用技术术语："))
+                sent_terms_a = hw_line_a.removeprefix("常用技术术语：").split("、")
+                self.assertEqual(len(sent_terms_a), 150)
+                self.assertEqual(sent_terms_a[0], "Term_000X")
+                self.assertEqual(sent_terms_a[-1], "Term_149X")
+
+                # Case B: With 0 hotwords and a 6,000-char dialog, dialog tail MUST stay capped at <= 2,000 chars
+                # (raising DashScope total budget to 3800 must NOT inflate dialog tail and risk silence echo).
+                ctx_no_hw = AsrContext(
+                    hotwords=[],
+                    personal_hotwords=(),
+                    dynamic_hotwords=(),
+                    builtin_hotwords=(),
+                    hotwords_bucketed=True,
+                    manual_hotwords_loaded=True,
+                    mode="agent",
+                    dialog_text=long_dialog,
+                )
+                prov.transcribe(_sample_wav(), context=ctx_no_hw)
+                sys_txt_b = json.loads(reqs[-1].body.decode("utf-8"))["messages"][0]["content"][0]["text"]
+                dialog_prefix = "最近对话参考（仅借用专有名词，勿输出参考中的括号标记）：\n"
+                self.assertTrue(sys_txt_b.startswith(dialog_prefix))
+                dialog_tail_b = sys_txt_b.removeprefix(dialog_prefix)
+                self.assertLessEqual(len(dialog_tail_b), 2000)
+                self.assertGreaterEqual(len(dialog_tail_b), 1900)
+
+                # Case C: Mid-list oversized word skipped while trailing short word still fits in 1800-char cap
+                filler = [f"MidCap_{i:02d}_" + ("x" * 16) for i in range(65)]  # 26*65 + 64 = 1754 chars
+                oversized = "VeryLongOverflowWord_" + ("y" * 50)  # 71 chars -> 1754+1+71=1826 > 1800
+                short_tail = "Zed"  # 3 chars -> 1754+1+3=1758 <= 1800 -> fits!
+                ctx_skip = AsrContext(
+                    hotwords=[*filler, oversized, short_tail],
+                    personal_hotwords=tuple([*filler, oversized, short_tail]),
+                    hotwords_bucketed=True,
+                    manual_hotwords_loaded=True,
+                    mode="general",
+                )
+                prov.transcribe(_sample_wav(), context=ctx_skip)
+                sys_txt_c = json.loads(reqs[-1].body.decode("utf-8"))["messages"][0]["content"][0]["text"]
+                self.assertNotIn(oversized, sys_txt_c)
+                self.assertIn(short_tail, sys_txt_c)
+            finally:
+                clear_hotwords_cache()
 
     def test_single_hop_vocabulary_hints_dedup_aliases_cache_breakpoints_and_echo_strip(self) -> None:
         from agent_voice_input.hotwords import (
+            STAGE2_HOTWORDS_MAX_CHARS,
+            STAGE2_HOTWORDS_MAX_ITEMS,
             clear_hotwords_cache,
             format_stage2_vocabulary_hints,
-            select_stage2_manual_entries,
+            load_hotwords_table,
+            order_stage2_entries,
         )
         from agent_voice_input.refiner import attach_single_hop_context
 
         with tempfile.TemporaryDirectory() as td:
             clear_hotwords_cache()
             try:
-                hw_file = Path(td) / "hotwords.txt"
+                app_home = Path(td) / "avi_home"
+                hw_file = app_home / "hotwords" / "personal.txt"
+                hw_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
                 hw_file.write_text(
-                    "[global]\nKestrelDB <- 凯斯特罗\n[chat]\nChatBrand <- 查特牌\n[coding]\nGhostty <- 高斯提\n",
+                    "KestrelDB <- 凯斯特罗\nChatBrand <- 查特牌\nGhostty <- 高斯提\n",
                     encoding="utf-8",
                 )
-                cfg = Config()
-                cfg.asr.hotwords_file = str(hw_file)
-                agent_vocab = format_stage2_vocabulary_hints(select_stage2_manual_entries(hw_file, mode="agent"))
-                gen_vocab = format_stage2_vocabulary_hints(select_stage2_manual_entries(hw_file, mode="general"))
+                table = load_hotwords_table(hw_file)
+                unified_vocab = format_stage2_vocabulary_hints(order_stage2_entries(table.entries))
 
                 # 1. Prepared ChatAudioAsrProvider (OpenRouter google/gemini-3.8-flash):
-                #    agent [vocab, log0] -> single <vocabulary_hints>, breakpoint on idx 1 (log0),
-                #    dynamic word deduped against manual terms, session-only telemetry, echo stripped
+                #    agent [vocab, log0] -> single <vocabulary_hints>, dynamic word deduped against manual terms,
+                #    builtin_hotwords NEVER mixed into tail, echo stripped
                 or_reqs: list[HttpRequest] = []
-                or_env = {"OPENROUTER_API_KEY": "sk-or-sh-" + ("d" * 16)}
+                or_env = {
+                    "AGENT_VOICE_INPUT_HOME": str(app_home),
+                    "OPENROUTER_API_KEY": "sk-or-sh-" + ("d" * 16),
+                }
 
                 def or_tx(req: HttpRequest) -> HttpResponse:
                     or_reqs.append(req)
@@ -4921,7 +4979,7 @@ class SessionCtxTests(unittest.TestCase):
                                 "choices": [
                                     {
                                         "message": {
-                                            "content": f"{agent_vocab}\n打开 Ghostty 检查 KestrelDB"
+                                            "content": f"{unified_vocab}\n打开 Ghostty 检查 KestrelDB"
                                         }
                                     }
                                 ]
@@ -4932,16 +4990,19 @@ class SessionCtxTests(unittest.TestCase):
                 cfg_or = Config()
                 cfg_or.asr.provider = "openrouter"
                 cfg_or.asr.model = "google/gemini-3.8-flash"
-                cfg_or.asr.hotwords_file = str(hw_file)
 
                 base_agent_ctx = AsrContext(
-                    hotwords=["Ghostty", "KestrelDB", "DynamicRepoSym"],
+                    hotwords=["Ghostty", "KestrelDB", "DynamicRepoSym", "BuiltinOnlySym"],
+                    personal_hotwords=("Ghostty", "KestrelDB", "ChatBrand"),
+                    dynamic_hotwords=("Ghostty", "DynamicRepoSym"),
+                    builtin_hotwords=("BuiltinOnlySym",),
+                    hotwords_bucketed=True,
                     dialog_text="[User]\n检查日志",
                     mode="agent",
                     manual_hotwords_loaded=True,
                 )
                 prep_agent = attach_single_hop_context(
-                    cfg_or, base_agent_ctx, mode="agent", vocabulary_hints=agent_vocab
+                    cfg_or, base_agent_ctx, mode="agent", vocabulary_hints=unified_vocab
                 )
                 or_prov = create_asr_provider(cfg_or, resolve_credentials(cfg_or, or_env), env=or_env, transport=or_tx)
                 res_or = or_prov.transcribe(_sample_wav(), context=prep_agent)
@@ -4955,16 +5016,19 @@ class SessionCtxTests(unittest.TestCase):
                 # Single growing history block (<50K) on google/* MUST NOT set explicit cache_control
                 self.assertNotIn("cache_control", or_parts[0])
                 self.assertNotIn("cache_control", or_parts[1])
-                # Dynamic tail retains DynamicRepoSym without duplicating manual Ghostty/KestrelDB
+                # Dynamic tail retains DynamicRepoSym without duplicating manual terms or mixing builtin_hotwords!
                 self.assertIn("DynamicRepoSym", or_parts[2]["text"])
                 self.assertNotIn("Ghostty", or_parts[2]["text"])
                 self.assertNotIn("KestrelDB", or_parts[2]["text"])
+                self.assertNotIn("BuiltinOnlySym", or_parts[2]["text"])
 
                 # Multi-block prepared single-hop ([vocab, sealed_0, tail_1]): explicit breakpoint lands on sealed_0 (idx 1)
                 prep_multi = AsrContext(
                     hotwords=["Ghostty", "KestrelDB"],
+                    personal_hotwords=("Ghostty", "KestrelDB"),
+                    hotwords_bucketed=True,
                     context_blocks=(
-                        agent_vocab,
+                        unified_vocab,
                         '<session_reference_log read_only="true">\nsealed_0\n</session_reference_log>',
                         '<session_reference_log read_only="true">\ntail_1\n</session_reference_log>',
                     ),
@@ -4979,14 +5043,16 @@ class SessionCtxTests(unittest.TestCase):
                 self.assertEqual(or_multi_parts[1].get("cache_control"), {"type": "ephemeral"})
                 self.assertNotIn("cache_control", or_multi_parts[2])
 
-                # General prepared single-hop: vocab at idx 0, no explicit cache_control on google/*, zero duplicate tail, ctx_chunks=0
+                # General prepared single-hop: unified Block 0 at idx 0, no explicit cache_control on google/*, ctx_chunks=0
                 base_gen_ctx = AsrContext(
-                    hotwords=["ChatBrand", "KestrelDB"],
+                    hotwords=["ChatBrand", "KestrelDB", "Ghostty"],
+                    personal_hotwords=("ChatBrand", "KestrelDB", "Ghostty"),
+                    hotwords_bucketed=True,
                     mode="general",
                     manual_hotwords_loaded=True,
                 )
                 prep_gen = attach_single_hop_context(
-                    cfg_or, base_gen_ctx, mode="general", vocabulary_hints=gen_vocab
+                    cfg_or, base_gen_ctx, mode="general", vocabulary_hints=unified_vocab
                 )
                 res_or_gen = or_prov.transcribe(_sample_wav(), context=prep_gen)
                 self.assertEqual((res_or_gen.context_chunks, res_or_gen.context_chars), (0, 0))
@@ -4994,11 +5060,15 @@ class SessionCtxTests(unittest.TestCase):
                 or_gen_user_str = json.dumps(or_gen_parts, ensure_ascii=False)
                 self.assertEqual(or_gen_user_str.count("<vocabulary_hints"), 1)
                 self.assertIn("ChatBrand (ASR has misheard as: 查特牌)", or_gen_user_str)
+                self.assertIn("Ghostty (ASR has misheard as: 高斯提)", or_gen_user_str)
                 self.assertNotIn("cache_control", or_gen_parts[0])
 
-                # 2. GeminiAudioProvider: prepared & unprepared direct calls both render exactly 1 <vocabulary_hints> with aliases
+                # 2. GeminiAudioProvider: prepared & unprepared direct calls share identical Block 0 & single snapshot read
                 gem_reqs: list[HttpRequest] = []
-                gem_env = {"GEMINI_API_KEY": "AIza-gem-sh-" + ("e" * 16)}
+                gem_env = {
+                    "AGENT_VOICE_INPUT_HOME": str(app_home),
+                    "GEMINI_API_KEY": "AIza-gem-sh-" + ("e" * 16),
+                }
 
                 def gem_tx(req: HttpRequest) -> HttpResponse:
                     gem_reqs.append(req)
@@ -5010,91 +5080,106 @@ class SessionCtxTests(unittest.TestCase):
 
                 cfg_gem = Config()
                 cfg_gem.asr.provider = "gemini"
-                cfg_gem.asr.hotwords_file = str(hw_file)
                 gem_prov = create_asr_provider(cfg_gem, resolve_credentials(cfg_gem, gem_env), env=gem_env, transport=gem_tx)
 
                 res_gem_prep = gem_prov.transcribe(_sample_wav(), context=prep_agent)
                 self.assertEqual(res_gem_prep.context_chunks, 1)
-                gem_prep_user_str = json.dumps(
-                    json.loads(gem_reqs[-1].body.decode("utf-8"))["contents"], ensure_ascii=False
-                )
+                gem_prep_parts = json.loads(gem_reqs[-1].body.decode("utf-8"))["contents"][0]["parts"]
+                gem_prep_user_str = json.dumps(gem_prep_parts, ensure_ascii=False)
                 self.assertEqual(gem_prep_user_str.count("<vocabulary_hints"), 1)
                 self.assertIn("Ghostty (ASR has misheard as: 高斯提)", gem_prep_user_str)
                 self.assertIn("DynamicRepoSym", gem_prep_user_str)
+                self.assertNotIn("BuiltinOnlySym", gem_prep_user_str)
 
-                # Unprepared direct call still gets aliases from hotwords_file + deduped dynamic words in 1 block
-                gem_prov.transcribe(
-                    _sample_wav(),
-                    context=AsrContext(hotwords=["Ghostty", "ExtraDirectTerm"], mode="agent"),
-                )
-                gem_unprep_user_str = json.dumps(
-                    json.loads(gem_reqs[-1].body.decode("utf-8"))["contents"], ensure_ascii=False
-                )
+                # Unprepared direct call loads personal hotwords snapshot ONCE, places identical Block 0 at parts[0],
+                # and puts extra dynamic terms in tail without mixing builtin_hotwords.
+                with mock.patch(
+                    "agent_voice_input.asr_providers.load_hotwords_table",
+                    wraps=load_hotwords_table,
+                ) as spy_load:
+                    gem_prov.transcribe(
+                        _sample_wav(),
+                        context=AsrContext(
+                            hotwords=["Ghostty", "ExtraDirectTerm"],
+                            dynamic_hotwords=("Ghostty", "ExtraDirectTerm"),
+                            builtin_hotwords=("BuiltinIgnored",),
+                            hotwords_bucketed=True,
+                            mode="agent",
+                        ),
+                    )
+                    self.assertEqual(spy_load.call_count, 1)
+                gem_unprep_parts = json.loads(gem_reqs[-1].body.decode("utf-8"))["contents"][0]["parts"]
+                self.assertEqual(gem_unprep_parts[0]["text"], gem_prep_parts[0]["text"])
+                gem_unprep_user_str = json.dumps(gem_unprep_parts, ensure_ascii=False)
                 self.assertEqual(gem_unprep_user_str.count("<vocabulary_hints"), 1)
                 self.assertIn("Ghostty (ASR has misheard as: 高斯提)", gem_unprep_user_str)
                 self.assertIn("ExtraDirectTerm", gem_unprep_user_str)
+                self.assertNotIn("BuiltinIgnored", gem_unprep_user_str)
 
-                # 3. Unified 100-item / 1,500-char budget across BOTH prepared & unprepared single-hop paths:
-                #    100 manual entries + 40 dynamic words MUST stay <= 100 items and <= 1,500 chars (never 140!)
+                # 3. Unified 200-item / 3,000-char budget across BOTH prepared & unprepared single-hop paths:
+                #    200 manual entries + 40 dynamic words MUST stay <= 200 items and <= 3,000 chars
                 from agent_voice_input.asr_providers import (
                     _extract_vocab_block_stats,
                     _format_single_hop_tail_vocabulary,
                     _normalize_single_hop_text,
                 )
-                from agent_voice_input.hotwords import (
-                    STAGE2_HOTWORDS_MAX_CHARS,
-                    STAGE2_HOTWORDS_MAX_ITEMS,
-                )
 
-                hw_100 = Path(td) / "hotwords_100.txt"
-                hw_100.write_text(
-                    "[global]\n" + "\n".join(f"Man{i:03d}" for i in range(100)) + "\n",
+                hw_200 = Path(td) / "hotwords_200.txt"
+                hw_200.write_text(
+                    "\n".join(f"Man{i:03d}" for i in range(200)) + "\n",
                     encoding="utf-8",
                 )
-                vocab_100 = format_stage2_vocabulary_hints(select_stage2_manual_entries(hw_100, mode="agent"))
-                _, items_100, chars_100 = _extract_vocab_block_stats([vocab_100])
-                self.assertEqual(items_100, STAGE2_HOTWORDS_MAX_ITEMS)
-                self.assertLessEqual(chars_100, STAGE2_HOTWORDS_MAX_CHARS)
+                entries_200 = order_stage2_entries(load_hotwords_table(hw_200).entries)
+                vocab_200 = format_stage2_vocabulary_hints(entries_200)
+                _, items_200, chars_200 = _extract_vocab_block_stats([vocab_200])
+                self.assertEqual(items_200, STAGE2_HOTWORDS_MAX_ITEMS)
+                self.assertLessEqual(chars_200, STAGE2_HOTWORDS_MAX_CHARS)
 
                 dyn_40 = [f"Dyn{i:03d}" for i in range(40)]
-                ctx_100_40 = AsrContext(hotwords=[*(f"Man{i:03d}" for i in range(100)), *dyn_40], mode="agent")
-                tail_when_full = _format_single_hop_tail_vocabulary(
-                    ctx_100_40, [vocab_100], hotwords_file=str(hw_100), env={}
+                ctx_200_40 = AsrContext(
+                    hotwords=[*(f"Man{i:03d}" for i in range(200)), *dyn_40],
+                    personal_hotwords=tuple(f"Man{i:03d}" for i in range(200)),
+                    dynamic_hotwords=tuple(dyn_40),
+                    hotwords_bucketed=True,
+                    mode="agent",
                 )
-                self.assertEqual(tail_when_full, "")  # 0 extra dynamic terms once 100-item budget is full
+                tail_when_full = _format_single_hop_tail_vocabulary(
+                    ctx_200_40, [vocab_200], manual_entries=entries_200
+                )
+                self.assertEqual(tail_when_full, "")  # 0 extra dynamic terms once 200-item budget is full
 
-                # 80 manual + 40 dynamic -> at most 20 dynamic terms added, total <= 100 items & <= 1,500 chars
-                hw_80 = Path(td) / "hotwords_80.txt"
-                hw_80.write_text(
-                    "[global]\n" + "\n".join(f"Man{i:03d}" for i in range(80)) + "\n",
+                # 180 manual + 40 dynamic -> at most 20 dynamic terms added, total <= 200 items & <= 3,000 chars
+                hw_180 = Path(td) / "hotwords_180.txt"
+                hw_180.write_text(
+                    "\n".join(f"Man{i:03d}" for i in range(180)) + "\n",
                     encoding="utf-8",
                 )
-                vocab_80 = format_stage2_vocabulary_hints(select_stage2_manual_entries(hw_80, mode="agent"))
-                _, items_80, chars_80 = _extract_vocab_block_stats([vocab_80])
-                tail_80 = _format_single_hop_tail_vocabulary(
-                    AsrContext(hotwords=dyn_40, mode="agent"),
-                    [vocab_80],
-                    hotwords_file=str(hw_80),
-                    env={},
+                entries_180 = order_stage2_entries(load_hotwords_table(hw_180).entries)
+                vocab_180 = format_stage2_vocabulary_hints(entries_180)
+                _, items_180, chars_180 = _extract_vocab_block_stats([vocab_180])
+                tail_180 = _format_single_hop_tail_vocabulary(
+                    AsrContext(dynamic_hotwords=tuple(dyn_40), hotwords_bucketed=True, mode="agent"),
+                    [vocab_180],
+                    manual_entries=entries_180,
                 )
-                self.assertTrue(tail_80.startswith("Additional context terms (read-only): "))
-                tail_body_80 = tail_80.removeprefix("Additional context terms (read-only): ")
-                kept_dyn_80 = [t.strip() for t in tail_body_80.split(", ") if t.strip()]
-                self.assertEqual(len(kept_dyn_80), 20)
-                self.assertLessEqual(items_80 + len(kept_dyn_80), STAGE2_HOTWORDS_MAX_ITEMS)
-                self.assertLessEqual(chars_80 + 1 + len(tail_body_80), STAGE2_HOTWORDS_MAX_CHARS)
+                self.assertTrue(tail_180.startswith("Additional context terms (read-only): "))
+                tail_body_180 = tail_180.removeprefix("Additional context terms (read-only): ")
+                kept_dyn_180 = [t.strip() for t in tail_body_180.split(", ") if t.strip()]
+                self.assertEqual(len(kept_dyn_180), 20)
+                self.assertLessEqual(items_180 + len(kept_dyn_180), STAGE2_HOTWORDS_MAX_ITEMS)
+                self.assertLessEqual(chars_180 + 1 + len(tail_body_180), STAGE2_HOTWORDS_MAX_CHARS)
 
                 # 4. XML entity round-trip dedup: AT&T rendered as AT&amp;T is unescaped via html.unescape
                 #    so dynamic AT&T is NOT duplicated in single-hop tail
                 hw_amp = Path(td) / "hotwords_amp.txt"
-                hw_amp.write_text("[global]\nAT&T <- 埃梯\n&lt;\n", encoding="utf-8")
-                vocab_amp = format_stage2_vocabulary_hints(select_stage2_manual_entries(hw_amp, mode="agent"))
+                hw_amp.write_text("AT&T <- 埃梯\n", encoding="utf-8")
+                entries_amp = order_stage2_entries(load_hotwords_table(hw_amp).entries)
+                vocab_amp = format_stage2_vocabulary_hints(entries_amp)
                 self.assertIn("AT&amp;T", vocab_amp)
                 tail_amp = _format_single_hop_tail_vocabulary(
-                    AsrContext(hotwords=["AT&T", "&lt;", "FreshSym"], mode="agent"),
+                    AsrContext(dynamic_hotwords=("AT&T", "FreshSym"), hotwords_bucketed=True, mode="agent"),
                     [vocab_amp],
-                    hotwords_file=str(hw_amp),
-                    env={},
+                    manual_entries=entries_amp,
                 )
                 self.assertEqual(tail_amp, "Additional context terms (read-only): FreshSym")
 
@@ -5109,7 +5194,10 @@ class SessionCtxTests(unittest.TestCase):
                 cfg_no_hw = Config()
                 cfg_no_hw.asr.provider = "openrouter"
                 cfg_no_hw.asr.model = "google/gemini-3.8-flash"
-                cfg_no_hw.asr.hotwords_file = str(Path(td) / "missing.txt")
+                empty_env = {
+                    "AGENT_VOICE_INPUT_HOME": str(Path(td) / "empty_avi_home"),
+                    "OPENROUTER_API_KEY": "sk-or-sh-" + ("d" * 16),
+                }
 
                 def or_echo_tx(req: HttpRequest) -> HttpResponse:
                     del req
@@ -5120,7 +5208,7 @@ class SessionCtxTests(unittest.TestCase):
                     )
 
                 prov_no_hw = create_asr_provider(
-                    cfg_no_hw, resolve_credentials(cfg_no_hw, or_env), env=or_env, transport=or_echo_tx
+                    cfg_no_hw, resolve_credentials(cfg_no_hw, empty_env), env=empty_env, transport=or_echo_tx
                 )
                 res_inline = prov_no_hw.transcribe(_sample_wav(), context=AsrContext(mode="general"))
                 self.assertEqual(res_inline.text, inline_ex)
@@ -5150,8 +5238,6 @@ class SessionCtxTests(unittest.TestCase):
         tail = _format_single_hop_tail_vocabulary(
             AsrContext(hotwords=["Smith, John", "John", "Jane"], mode="agent"),
             [vocab],
-            hotwords_file="",
-            env={},
         )
         self.assertEqual(tail, "Additional context terms (read-only): John, Jane")
 
@@ -5168,6 +5254,107 @@ class SessionCtxTests(unittest.TestCase):
             ),
             ["Alpha.py", ".env", "foo.", *[f"f{i}.py" for i in range(7)]],
         )
+
+    def test_single_hop_skips_disk_reload_when_empty_hotwords_prepared(self) -> None:
+        from agent_voice_input.asr_providers import ChatAudioAsrProvider, GeminiAudioProvider
+
+        with tempfile.TemporaryDirectory() as td:
+            app_home = Path(td) / "avi_home"
+            hw_file = app_home / "hotwords" / "personal.txt"
+            hw_file.parent.mkdir(parents=True, mode=0o700)
+            # Simulate a term written to disk AFTER the pipeline prepared an empty snapshot
+            hw_file.write_text("!LateDiskTerm <- 迟来词\n", encoding="utf-8")
+
+            empty_prepared_ctx = AsrContext(
+                mode="agent",
+                single_hop_prepared=True,
+                manual_hotwords_loaded=True,
+                personal_hotwords=(),
+                dynamic_hotwords=(),
+                builtin_hotwords=(),
+                hotwords_bucketed=True,
+                context_blocks=("<session_context>\nUser: hi\n</session_context>",),
+            )
+            empty_prepared_dict = {
+                "mode": "agent",
+                "single_hop_prepared": True,
+                "manual_hotwords_loaded": True,
+                "personal_hotwords": (),
+                "dynamic_hotwords": (),
+                "builtin_hotwords": (),
+                "hotwords_bucketed": True,
+                "context_blocks": ("<session_context>\nUser: hi\n</session_context>",),
+            }
+
+            # 1. GeminiAudioProvider must NOT reload disk for AsrContext or dict when prepared + loaded
+            gem_env = {"AGENT_VOICE_INPUT_HOME": str(app_home), "GEMINI_API_KEY": "gm-test-key-" + ("a" * 16)}
+            gem_cfg = Config()
+            gem_cfg.asr.provider = "gemini"
+            for label, ctx_in in (("AsrContext", empty_prepared_ctx), ("dict", empty_prepared_dict)):
+                with self.subTest(provider="gemini", context_kind=label):
+                    gem_reqs: list[HttpRequest] = []
+                    gem_prov = GeminiAudioProvider(
+                        gem_cfg,
+                        resolve_credentials(gem_cfg, gem_env),
+                        env=gem_env,
+                        transport=lambda req: (
+                            gem_reqs.append(req),
+                            HttpResponse(
+                                200,
+                                {"content-type": "application/json"},
+                                json.dumps({"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}).encode("utf-8"),
+                            ),
+                        )[1],
+                    )
+                    with mock.patch(
+                        "agent_voice_input.asr_providers.load_hotwords_table",
+                        side_effect=AssertionError("GeminiAudioProvider must not reload personal.txt"),
+                    ):
+                        gem_res = gem_prov.transcribe(_sample_wav(), context=ctx_in)
+                    self.assertEqual(gem_res.text, "ok")
+                    gem_body = gem_reqs[0].body.decode("utf-8")
+                    gem_parts = json.loads(gem_body)["contents"][0]["parts"]
+                    self.assertFalse(
+                        any(str(p.get("text", "")).lstrip().startswith("<vocabulary_hints") for p in gem_parts),
+                        gem_parts,
+                    )
+                    self.assertNotIn("LateDiskTerm", gem_body)
+
+            # 2. ChatAudioAsrProvider must NOT reload disk for AsrContext or dict when prepared + loaded
+            chat_env = {"AGENT_VOICE_INPUT_HOME": str(app_home), "OPENROUTER_API_KEY": "sk-or-test-" + ("b" * 16)}
+            chat_cfg = Config()
+            chat_cfg.asr.provider = "openrouter"
+            chat_cfg.asr.model = "google/gemini-2.5-flash"
+            for label, ctx_in in (("AsrContext", empty_prepared_ctx), ("dict", empty_prepared_dict)):
+                with self.subTest(provider="openrouter", context_kind=label):
+                    chat_reqs: list[HttpRequest] = []
+                    chat_prov = ChatAudioAsrProvider(
+                        chat_cfg,
+                        resolve_credentials(chat_cfg, chat_env),
+                        provider_name="openrouter",
+                        env=chat_env,
+                        transport=lambda req: (
+                            chat_reqs.append(req),
+                            HttpResponse(
+                                200,
+                                {"content-type": "application/json"},
+                                json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8"),
+                            ),
+                        )[1],
+                    )
+                    with mock.patch(
+                        "agent_voice_input.asr_providers.load_hotwords_table",
+                        side_effect=AssertionError("ChatAudioAsrProvider must not reload personal.txt"),
+                    ):
+                        chat_res = chat_prov.transcribe(_sample_wav(), context=ctx_in)
+                    self.assertEqual(chat_res.text, "ok")
+                    chat_body = chat_reqs[0].body.decode("utf-8")
+                    chat_parts = json.loads(chat_body)["messages"][1]["content"]
+                    self.assertFalse(
+                        any(str(p.get("text", "")).lstrip().startswith("<vocabulary_hints") for p in chat_parts),
+                        chat_parts,
+                    )
+                    self.assertNotIn("LateDiskTerm", chat_body)
 
 
 if __name__ == "__main__":

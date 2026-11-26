@@ -5,7 +5,7 @@
 
 ## Hard Safety Rules (Read First)
 
-1. **Never leak secrets**: Never print, echo, log, or commit raw API keys in chat output or git repositories. Write credentials only to `0600` `~/.config/agent-voice-input/agent-voice-input.env`.
+1. **Never leak secrets**: Never print, echo, log, or commit raw API keys in chat output or git repositories. Write credentials only to `0600` `~/.agent-voice-input/.env` (or `$AGENT_VOICE_INPUT_HOME/.env`).
 2. **Never enable Codex Fast mode**: Do not set `service_tier="fast"` or enable Fast mode via any config, flag, or environment variable.
 3. **Never hand-edit third-party CLI hook files**: Do **not** manually patch `~/.claude/settings.json`, `~/.gemini/config/hooks.json`, or `~/.codex/config.toml`. Always use `agent-voice-input integrate`, which preserves dotfiles symlinks, writes out-of-tree backups, and validates schemas.
 4. **macOS SSH daemon rule**: Never run `agent-voice-input start` or `restart` over SSH (`$SSH_CONNECTION` / `$SSH_TTY` set) on macOS. Daemons started under `sshd` lack Microphone TCC attribution and record all-zero silence; instruct the user to run `start` in their local GUI terminal (Ghostty / `Terminal.app`).
@@ -34,7 +34,7 @@ Check `PATH`: `uv tool install` and `pipx install` place binaries in `~/.local/b
 # Install (prefer uv; fall back to pipx, then pip)
 uv tool install agent-voice-input        # fallback: pipx install agent-voice-input
 
-# Create 0600 ~/.config/agent-voice-input/config.toml and agent-voice-input.env
+# Create ~/.agent-voice-input/ (0600 config.toml & .env + default-ignore .gitignore tracking only hotwords/)
 agent-voice-input init
 ```
 
@@ -63,7 +63,7 @@ Read `init`'s stdout summary carefully: it performs a zero-network local check o
    - **Global / Overseas (海外首选 1 把 Key)**: `OPENAI_API_KEY` (two-stage `gpt-transcribe` + `gpt-6-luna`) or `GEMINI_API_KEY` (native single-hop).
    - **Aggregator**: `OPENROUTER_API_KEY` (two-stage or single-hop; default refiner `google/gemini-3.8-flash`).
    - *Gotcha*: `ARK_API_KEY` (`volcengine`) is **Stage 2 only** and cannot drive Stage 1 ASR.
-3. Write the key into `~/.config/agent-voice-input/agent-voice-input.env` and verify permissions remain `0600`.
+3. Write the key into `~/.agent-voice-input/.env` and verify permissions remain `0600`.
 
 ### Proxy Rules
 - The pure-stdlib HTTP client only supports `http://` proxies via `HTTP_PROXY` / `HTTPS_PROXY` (pair with `NO_PROXY=127.0.0.1,localhost`).
@@ -123,5 +123,5 @@ Check `doctor --ping --json` for any `FAIL` items and follow their `Fix:` guidan
 | macOS records silence / empty audio | ① Started over SSH (`sshd` has no Mic TCC): stop and run `start` in a local GUI terminal. ② Missing Microphone permission (麦克风权限): System Settings → Privacy & Security → Microphone → enable your terminal app, then restart the terminal. |
 | macOS paste fails in GUI apps / non-Ghostty terminals | Grant **Accessibility** (辅助功能) to the terminal running the daemon, and **Automation** (自动化) for Ghostty / `Terminal.app`. **Input Monitoring** (输入监控) is **not** required for modifier hotkeys (`RControl` / `ROption` / `Fn`). |
 | `status` or `doctor` reports `code_drift` | The package was upgraded while an older daemon was still running. Run `agent-voice-input restart` (in a local GUI terminal on macOS). |
-| WSL2 missing keys or proxy in daemon | Put API keys in `~/.config/agent-voice-input/agent-voice-input.env` (loaded directly by the daemon regardless of shell rc). For proxy env vars defined in `~/.bashrc`/`~/.zshrc`, run `agent-voice-input restart` from an interactive login shell. |
+| WSL2 missing keys or proxy in daemon | Put API keys in `~/.agent-voice-input/.env` (loaded directly by the daemon regardless of shell rc). For proxy env vars defined in `~/.bashrc`/`~/.zshrc`, run `agent-voice-input restart` from an interactive login shell. |
 | Slow responses, cache misses, or failed clips | Run `agent-voice-input diagnose --json` for latency p50, cache hit rate, and redacted logs; run `agent-voice-input retry --list` to recover stashed failed recordings. |

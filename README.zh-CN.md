@@ -43,7 +43,7 @@
 # 1. 安装前置与 CLI（macOS: `brew install ffmpeg` + `xcode-select --install` | WSL2: `sudo apt install ffmpeg`）
 uv tool install agent-voice-input          # 或 `pipx install agent-voice-input` / `pip install agent-voice-input`
 
-# 2. 初始化 0600 权限配置文件（可选：`--asr` / `--refiner` / `--hotkey`）
+# 2. 初始化 ~/.agent-voice-input/（0600 config.toml 与 .env + 默认全忽略 .gitignore；可选 `--asr` / `--refiner` / `--hotkey`）
 agent-voice-input init
 
 # 3. 探活体检并启动后台守护进程（首次启动会打印快速试录验收提示）
@@ -51,7 +51,8 @@ agent-voice-input doctor --ping && agent-voice-input start
 ```
 
 - **自动适配本机键盘**：`init` 在 MacBook 内置键盘上自动写入 `key = "ROption"`，在台式 Mac（如 Mac mini 外接标准键盘）与 Windows/WSL2 下默认保持 `key = "RControl"`。轻按热键 `<= 0.5s` 开始/结束录音，长按 `0.8s` 即时取消。
-- **最简 1 把 Key 推荐**：`init` 会自动探测环境中已有的 API Key 及本机 `codex` 登录态，若已就绪直接提示开跑；若尚无一阶段语音 Key，只需在 `~/.config/agent-voice-input/agent-voice-input.env` 中填入 **1 把 Key**：
+- **统一应用家目录（`~/.agent-voice-input/`）**：`config.toml`、`.env`、`hotwords/personal.txt` 与可选 `recordings/` 均统一收口于 `~/.agent-voice-input/`（可通过 `AGENT_VOICE_INPUT_HOME` 覆盖根目录）；`init` 排他生成默认全忽略、仅放行 `hotwords/` 的 `.gitignore`（即便 `--force` 也绝不覆盖已有文件）。
+- **最简 1 把 Key 推荐**：`init` 会自动探测环境中已有的 API Key 及本机 `codex` 登录态，若已就绪直接提示开跑；若尚无一阶段语音 Key，只需在 `~/.agent-voice-input/.env` 中填入 **1 把 Key**：
   - **国内首选**：`DASHSCOPE_API_KEY` 或 `DEEPSEEK_API_KEY`
   - **海外首选**：`OPENAI_API_KEY` 或 `GEMINI_API_KEY`
 - 完整配置模板与 Agent 接入契约：[`config.example.toml`](config.example.toml)、[`config.example.env`](config.example.env)、[`docs/agent-setup.md`](docs/agent-setup.md)。
@@ -91,10 +92,10 @@ agent-voice-input doctor --ping && agent-voice-input start
 | **终端** | **本地 & 远端 `tmux`** | `✅` | **macOS** 零剪贴板直投 / **WSL2** 走 `win_shim` 瞬态剪贴板粘贴（不污染原剪贴板）；进程树按焦点窗格隔离；Linux & macOS CI 真实 `tmux` E2E 验证 |
 | **终端** | **其他内置终端与专用 SSH 客户端** | `🧪` | 已内置粘贴键位路由、防串台与识别规则（完整名单见下方折叠区），待真机实测反馈 |
 | **桌面 App** | **Antigravity / AGY 桌面版** | `✅` *(macOS)* / `🧪` *(Windows)* | **Antigravity 2.0 独立桌面版**已在 macOS 真机实测通过（只读 `conversation_summaries.db` + 窗口标题精确/截断前缀匹配、工作区 `git`/文件名与 `brain/` 增量缓存及切会话防串台），同时兼容老版 VS Code Fork *（Windows 桌面版待真机反馈；WSL2 仅扫 WSL 内目录）* |
-| **桌面 App** | **ChatGPT / Codex 统一桌面端** | `✅` *(macOS)* / `🧪` *(Windows)* | 已在 macOS 真机实测通过：统一桌面端（`com.openai.codex`）只读 `~/.codex/sqlite/codex.db` + `~/.codex/sessions/*.jsonl`，本地仓库任务自动升格为 `agent` 模式并挂载项目热词与增量缓存，普通云端 ChatGPT 聊天保持 `general + ai_chat` 零串台，同窗切会话在投递前复核防串台；独立旧版 ChatGPT 桌面端（`com.openai.chat`）保持 `general + ai_chat` 精修落字与锁窗防串台；Windows（`ChatGPT.exe` / `Codex.exe`）当前提供精修落字与锁窗防串台 *（Windows/WSL2 跨系统上下文绑定已列入路线图）* |
-| **桌面 App** | **Claude 桌面版** | `✅` *(macOS)* / `🧪` *(Windows)* | 已在 macOS 真机实测通过（`com.anthropic.claudefordesktop`）：**Code & Cowork** 本地会话上下文绑定（有界只读 `AXWebArea` 路由与标题采集、`Claude`/`Claude-3p` 双目录扫描、`50K` 增量缓存及投递前同窗切会话复核）以及精修落字与剪贴板自动恢复，云端 Chat 保持 `general + ai_chat` 零串台 *（Windows `Claude.exe` 待真机反馈）* |
-| **桌面 App** | **其他桌面 IDE 与主流 IM** | `🧪` | IDE（**VS Code**、**Cursor**、**Windsurf**、**JetBrains**、**Zed** 等）走 `coding_gui` 并挂载宿主工作区 `git`/文件名；**在 IDE 内置终端运行 CLI Agent 时同样按 `coding_gui` 处理**（支持精修落字与工作区文件名参考，但**跳过 CLI `sync_session`**，不读内置终端里的 `codex`/`claude`/`agy` 对话历史，也不区分内置终端分屏）。IM（**微信**、**飞书**、**Slack**、**Discord** 等）走 `im_chat` |
-| **桌面 App** | **其他任意桌面 App** *（浏览器、笔记、邮件等）* | `⚪` | 默认 `hotkey.scope = "all"` 可直接语音精修落字 + 锁窗防串台，无专属上下文或语气适配 |
+| **桌面 App** | **ChatGPT / Codex 统一桌面端** | `✅` *(macOS)* / `🧪` *(Windows)* | 已在 macOS 真机实测通过：统一桌面端（`com.openai.codex`）只读 `~/.codex/sqlite/codex.db` + `~/.codex/sessions/*.jsonl`，本地仓库任务自动升格为 `agent` 模式并挂载项目热词与增量缓存，普通云端 ChatGPT 聊天保持 `general` 模式（仅挂载个人热词，零串台），同窗切会话在投递前复核防串台；Windows（`ChatGPT.exe` / `Codex.exe`）当前提供精修落字与锁窗防串台 *（Windows/WSL2 跨系统上下文绑定已列入路线图）* |
+| **桌面 App** | **Claude 桌面版** | `✅` *(macOS)* / `🧪` *(Windows)* | 已在 macOS 真机实测通过（`com.anthropic.claudefordesktop`）：**Code & Cowork** 本地会话上下文绑定（有界只读 `AXWebArea` 路由与标题采集、`Claude`/`Claude-3p` 双目录扫描、`50K` 增量缓存及投递前同窗切会话复核）以及精修落字与剪贴板自动恢复，云端 Chat 保持 `general` 模式（仅挂载个人热词，零串台）*（Windows `Claude.exe` 待真机反馈）* |
+| **桌面 App** | **其他桌面 IDE** | `🧪` | IDE（**VS Code**、**Cursor**、**Windsurf**、**JetBrains**、**Zed** 等）走 `coding_gui` 并挂载宿主工作区 `git`/文件名；**在 IDE 内置终端运行 CLI Agent 时同样按 `coding_gui` 处理**（支持精修落字与工作区文件名参考，但**跳过 CLI `sync_session`**，不读内置终端里的 `codex`/`claude`/`agy` 对话历史，也不区分内置终端分屏） |
+| **桌面 App** | **其他任意桌面 App** *（浏览器、IM、聊天、笔记、邮件等）* | `⚪` | 默认 `hotkey.scope = "all"` 统一走 `general` 通用润色模式（仅挂个人热词，精修落字 + 锁窗防串台，不再穷举聊天或浏览器窗口标题） |
 
 <details>
 <summary><b>其他内置终端与专用 SSH 客户端完整清单（<code>🧪</code>）</b></summary>
@@ -134,11 +135,11 @@ agent-voice-input doctor --ping && agent-voice-input start
 ## 高频踩坑 FAQ
 
 - **MacBook 没有右 Ctrl 键怎么办？**  
-  `agent-voice-input init` 会自动识别 MacBook 内置键盘并写入 `key = "ROption"`（右 Option），台式 Mac（如 Mac mini）外接标准键盘则保持 `key = "RControl"`。随时可在 `~/.config/agent-voice-input/config.toml` 的 `[hotkey]` 中改为 `"ROption"`、`"Fn"` 或 `"RControl"` 后执行 `agent-voice-input restart`，并用 `agent-voice-input key-test` 确认键码。
+  `agent-voice-input init` 会自动识别 MacBook 内置键盘并写入 `key = "ROption"`（右 Option），台式 Mac（如 Mac mini）外接标准键盘则保持 `key = "RControl"`。随时可在 `~/.agent-voice-input/config.toml` 的 `[hotkey]` 中改为 `"ROption"`、`"Fn"` 或 `"RControl"` 后执行 `agent-voice-input restart`，并用 `agent-voice-input key-test` 确认键码。
 - **为什么通过 SSH 在 macOS 上启动守护进程录不到声音（全静音）？**  
   macOS 的麦克风 TCC 权限归属责任图形进程，经 `sshd` 拉起的守护进程会被系统静默喂全 0 静音帧。请务必在本机已获麦克风授权的图形终端（如 Ghostty 或 `Terminal.app`）里执行 `agent-voice-input start` 或 `restart`。
 - **后台守护进程怎么走代理？**  
-  可在终端导出 `HTTPS_PROXY` / `HTTP_PROXY`（以及本机回环排除 `NO_PROXY=127.0.0.1,localhost`），或写入 `~/.config/agent-voice-input/agent-voice-input.env`（系统环境变量优先），然后执行 `agent-voice-input restart`。由于纯标准库 HTTP 客户端仅支持 HTTP/HTTPS 代理、不支持 SOCKS5，如果代理客户端只设置了 `ALL_PROXY=socks5://...`，请同时设置对应的 HTTP 混合端口（`HTTPS_PROXY=http://127.0.0.1:<port>`），并用 `agent-voice-input doctor --ping` 验证连通。
+  可在终端导出 `HTTPS_PROXY` / `HTTP_PROXY`（以及本机回环排除 `NO_PROXY=127.0.0.1,localhost`），或写入 `~/.agent-voice-input/.env`（系统环境变量优先），然后执行 `agent-voice-input restart`。由于纯标准库 HTTP 客户端仅支持 HTTP/HTTPS 代理、不支持 SOCKS5，如果代理客户端只设置了 `ALL_PROXY=socks5://...`，请同时设置对应的 HTTP 混合端口（`HTTPS_PROXY=http://127.0.0.1:<port>`），并用 `agent-voice-input doctor --ping` 验证连通。
 - **为什么默认只粘贴不自动按回车？**  
   终端与 SSH 下误听一条命令直接回车风险太高，因此默认只粘贴不发送 `Enter`，方便扫一眼再确认；处理期间若切走焦点，也会自动退回剪贴板而不强贴到别的窗口。
 - **两段式（STT + 精修）和一阶段单跳多模态怎么选？**  
@@ -149,14 +150,14 @@ agent-voice-input doctor --ping && agent-voice-input start
 ## 常用命令与可选增强
 
 ```bash
-agent-voice-input init [--asr P] [--refiner P] [--hotkey K] [--force]  # 智能初始化 0600 权限 config.toml 与 agent-voice-input.env
+agent-voice-input init [--asr P] [--refiner P] [--hotkey K] [--force]  # 智能初始化 ~/.agent-voice-input/（0600 config.toml 与 .env + .gitignore）
 agent-voice-input start | restart | stop                # 启停或重启后台守护进程（start 幂等，代码/版本漂移时提示 restart）
-agent-voice-input status                                # 查看运行状态、当前生效管线与漂移信息（支持 --history N）
-agent-voice-input doctor [--ping] [--remote] [--json]   # 全面自检音频、原生桥接、凭据、钩子、SSH 就绪度与端点探活
+agent-voice-input status                                # 查看运行状态、当前生效管线、热词计数与漂移信息（支持 --history N）
+agent-voice-input doctor [--ping] [--remote] [--json]   # 全面自检音频、原生桥接、凭据、热词、钩子、SSH 就绪度与端点探活
 agent-voice-input integrate [--status] [--dry-run] [--cli claude|codex|agy] [--uninstall] [--json]  # 安全一键接入可选 CLI 钩子
 agent-voice-input diagnose [--last N] [--json]          # 本地只读诊断：延迟 p50、缓存命中率、失败录音数与脱敏日志尾部
 agent-voice-input retry [--list] [--print]              # 查看或重跑暂存的失败录音
-agent-voice-input hotwords list|add|remove              # 管理 [global]/[chat]/[coding] 分层热词与空耳映射（--alias、--scope、--json）
+agent-voice-input hotwords list|add|remove|path         # 管理扁平个人热词 personal.txt、! 置顶与 <- 空耳映射（--pin、--alias、--json）
 agent-voice-input once --duration 4 --dry-run           # 单次录音验证流水线（不粘贴上屏；Linux 可用 `--file <wav> --dry-run` 离线转写）
 agent-voice-input toggle | cancel                       # 命令行触发起止录音或取消当前/后台在途任务（--seq N）
 agent-voice-input key-test                              # 测试按键扫描码与修饰键捕获
@@ -169,24 +170,26 @@ agent-voice-input key-test                              # 测试按键扫描码�
 
 ## 热词管理（支持让你的 Agent 帮你打理）
 
-用一份纯文本词表统一管理人名、项目专名与顽固空耳，并可直接交给 **Claude Code**、**Codex** 或 **AGY** 冷启动建库与定期瘦身：
+用一份扁平纯文本词表统一管理人名、项目专名与顽固空耳，并可直接交给 **Claude Code**、**Codex** 或 **AGY** 冷启动建库与定期瘦身：
 
-- **文件路径与 3 段语义**：`~/.config/agent-voice-input/hotwords.txt`（修改后下次口述自动热加载；无分组文件归入 `[global]`；行序即优先级）。支持 `[global]` / `[chat]` / `[coding]` 三段——二阶段精修与单跳在 `agent` 模式下挂载 `[coding] + [global]`，在 `general` 模式下自动同时挂载 **`[global] + [chat]`**，让微信、浏览器、GrokBot 等日常应用都能吃到人名与个人专名。
-- **可选空耳语法（`<-`）**：支持 `规范词 <- 误识1, 误识2` 或执行 `agent-voice-input hotwords add Harness --alias 哈尼斯,哈尼思`。护栏：单条最多 5 个误识、拒单字误识（双字给出提醒）、禁与任何规范词冲突；一阶段 ASR 仅收规范词，二阶段/单跳用空耳精准纠偏。
-- **双阶段配额预算**：一阶段按各 ASR 渠道较窄配额截断（如豆包 50 词 / 500 字、百炼 80 词 / 900 字、OpenAI `keywords[]` 50 词、Whisper 35 词 / 353 字；`deepseek-asr` 由二阶段兜底）；二阶段/单跳提供 **100 条 / 1,500 字** 宽口词表预算，随时运行 `agent-voice-input hotwords list [--json]` 查看用量。
-- **两条 Agent 协作纪律**：**改动 `hotwords.txt` 前必须先展示 diff 经用户确认再落盘；不要凭空瞎猜空耳，等实战真正撞见错听后再补 `<-` 映射**。
+- **扁平单文件与 dotfiles 目录软链**：`~/.agent-voice-input/hotwords/personal.txt`（可通过 `agent-voice-input hotwords path` 查看路径与软链真身；修改后下次口述自动热加载；目录级 `flock` 写锁零 `.lock` 脏文件）。如需跨机同步，推荐**对 `hotwords/` 目录建软链**（如 `ln -sfn ~/.dotfiles/avi-hotwords ~/.agent-voice-input/hotwords`），不要对 `personal.txt` 建单文件软链（读写侧均会拒绝；注：`~/.agent-voice-input/.gitignore` 默认只放行 `hotwords/`，Git 不会跨目录软链追踪目标目录本身，符合预期）。
+- **置顶（`!`）与可选空耳语法（`<-`）**：高频核心词可加 `!` 前缀置顶（如 `!Antigravity` 或 `agent-voice-input hotwords add Antigravity --pin`）；顽固误听可写 `规范词 <- 误识1, 误识2` 或执行 `agent-voice-input hotwords add Harness --alias 哈尼斯,哈尼思`（单条最多 5 个误识、拒单字误识、双字给出提醒、禁与规范词冲突；多个词共享的歧义别名在运行期自动隐藏但保留两侧规范词）。一阶段 ASR 仅收规范词，二阶段/单跳用空耳精准纠偏。
+- **双阶段投影与配额预算**：
+  - **一阶段 ASR**：按权重分层（`! 置顶` > `带空耳` > `普通词`，层内保留文件行序防中文专名被字母序挤出窄窗）。`general` 模式 100% 配额归个人词；`agent` 模式为仓库/会话动态词保底至少 30% 名额并在有空位时自动回流（阿里百炼 **150 词 / 1,800 字**、豆包 **50 词 / 500 字**、OpenAI `keywords[]` **50 词**、OpenRouter `keyterms` **50 词**、Whisper **35 词 / 353 字**；`deepseek-asr` 由二阶段兜底）。
+  - **二阶段 / 单跳块 0（`<vocabulary_hints>`）**：按 `(权重, term.lower(), term)` 确定性排序，改注释、空行或调整同权重行序不影响块 0 字节、稳保 85%–99% 前缀缓存；`agent` 与 `general` 模式统一提供 **200 条 / 3,000 字** 宽口词表预算，随时运行 `agent-voice-input hotwords list [--json]` 查看用量与诊断告警。
+- **两条 Agent 协作纪律**：**改动 `personal.txt` 前必须先展示 diff 经用户确认再落盘；不要凭空瞎猜空耳，等实战真正撞见错听后再补 `<-` 映射**。
 
 可直接复制发给你的 Coding Agent：
 
 ```text
 # 1. 首次冷启动建库（只提炼规范词，不猜空耳）
-读我最近几个项目和 README/规范，帮我提炼一份去噪后的个人与跨项目高频专名草案写入 ~/.config/agent-voice-input/hotwords.txt（按 [global]/[chat]/[coding] 分段），不要凭空猜空耳，先给我看 diff，确认后再落盘。
+读我最近几个项目和 README/规范，帮我提炼一份去噪后的扁平个人与跨项目高频专名草案写入 ~/.agent-voice-input/hotwords/personal.txt（仅对最高频核心词加 ! 置顶），不要凭空猜空耳，先给我看 diff，确认后再落盘。
 
 # 2. 遇错听秒补空耳映射
 刚才语音把 "Harness" 听成了 "哈尼斯"，帮我用 `agent-voice-input hotwords add Harness --alias 哈尼斯` 补一条空耳映射（先给我看变动再执行）。
 
 # 3. 定期体检瘦身与调优排序
-运行 `agent-voice-input hotwords list --json` 检查是否临近一/二阶段预算，把低频过时词裁掉、把跨项目高频词提到 [global] 顶部，先出 diff 给我确认后再改。
+运行 `agent-voice-input hotwords list --json` 检查是否临近一/二阶段预算或存在告警，把低频过时词裁掉、把跨项目高频词加 `!` 置顶，先出 diff 给我确认后再改。
 ```
 
 ---
@@ -196,7 +199,7 @@ agent-voice-input key-test                              # 测试按键扫描码�
 <details open>
 <summary><b>内置渠道与验证状态矩阵及常见 <code>config.toml</code> 配方</b></summary>
 
-配置覆盖优先级：`CLI 参数 > ~/.config/agent-voice-input/config.toml > 内置默认值`。凭据存放于 `~/.config/agent-voice-input/agent-voice-input.env`（见 [`config.example.env`](config.example.env)）。
+配置覆盖优先级：`CLI 参数 > ~/.agent-voice-input/config.toml > 内置默认值`（根目录可通过 `AGENT_VOICE_INPUT_HOME` 覆盖）。凭据存放于 `~/.agent-voice-input/.env`（见 [`config.example.env`](config.example.env)）。
 
 | `provider` | 可用阶段 | 验证状态 | 内置默认 `asr.model` | 内置默认 `refiner.model` | 凭据来源 / 环境变量 |
 | :--- | :--- | :---: | :--- | :--- | :--- |
@@ -267,8 +270,8 @@ effort = "auto"
 - **两阶段 vs 单跳协议（`asr.api`）**：`"auto"` 将专用 STT（`qwen3-asr-flash`、`doubao`、`deepseek-asr`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）路由至一阶段 + 二阶段，将原生 `gemini`、百炼 `qwen*-omni*`、官方 OpenAI `gpt-audio-1.5` / `gpt-audio-mini`（或显式 `asr.api = "chat-completions"`）与 OpenRouter/OpenAI 兼容多模态模型路由至单跳（共享 50K `<session_reference_log>` 前缀块、`>= 3s` 内存压缩 `64 kbps` MP3、上限 `610s`；默认跳过二阶段，除非 `refiner.force_on_single_hop = true`）。DeepSeek 官方 ASR（`POST https://api.deepseek.com/v1/tools/asr`）仅支持 `asr.api = "auto"`（支持 21 种语言自动检测，不支持热词与语言参数）。在 `openrouter` 使用未收录新模型时请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
 - **二阶段协议与思考档位（`refiner.api`、`effort`）**：`refiner.api = "auto"` 将 `codex` 与官方 `openai`（`api.openai.com`）路由至无状态 HTTP `/responses`（`store=false`、`stream=true`），`agy` 路由至本机 `agy acp` stdio JSON-RPC，`gemini` 路由至 `:generateContent`，自定义第三方 `openai` `base_url` 及其他渠道保守默认走 `/chat/completions`（显式配置 `"responses"` / `"chat-completions"` 始终优先）。`effort` 支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`（`codex`/`agy`/`openai` 默认 `"low"`，其余渠道默认 `"auto"` 零思考极速档）。
 - **精修提示词、前缀缓存与冷启动回退（`refiner.prompt`、`include_git_status`、`context_max_chars`、`cold_start_fallback`）**：`prompt` 留空时使用内置自适应 `agent` / `general` 提示词（非空则覆盖两模式）。近期对话（上限 `context_max_chars = 200000`）按 `50K` 封口块前置，末尾拼装 `<workspace_git_status>`（工作树干净时补充核心追踪文件名）与 `<asr_draft_to_clean>`。新开空/极短会话时，`cold_start_fallback = "auto"`（可选 `"hotwords"` / `"off"`）自动从同目录近期历史会话补充热词并前置 1 块冻结的 `<= 25K` `<prior_session_reference>`。
-- **分层纯文本热词表（`asr.hotwords_file` 与 `hotwords` 子命令）**：直接编辑 `~/.config/agent-voice-input/hotwords.txt` 或运行 `agent-voice-input hotwords list|add [--alias]|remove`，下一次口述自动热加载生效。无分组文件归入 `[global]`，`[chat]` 与 `[coding]` 按前台窗口自动挂载，优先级高于动态仓库/会话词与内置热词；可选 `规范词 <- 误识1, 误识2` 映射服务于二阶段/单跳（`100 条 / 1,500 字`），`hotwords list` 同时展示一阶段各渠道（`doubao`/`dashscope`/`openai`/`whisper`/`gemini`）与二阶段预算用量。
-- **同渠道重试与可选本地 MP3 归档（`max_retries`、`audio.save_recordings`）**：两阶段默认 `max_retries = 2`（`0..10`），在阶段 `timeout_sec` 与 9 秒建连/TLS 上限内分别对 `429`/QPS 限流与瞬态网络/5xx 退避重试。开启 `audio.save_recordings = true` 后，后台异步将有效录音压缩为 `0600` 权限 `16 kHz` `64 kbps` MP3 存入 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`（按修改时间环形保留最新 `save_recordings_max_count = 300` 条）。
+- **扁平个人热词表（`hotwords/personal.txt` 与 `hotwords` 子命令）**：直接编辑 `~/.agent-voice-input/hotwords/personal.txt` 或运行 `agent-voice-input hotwords list|add [--pin] [--alias]|remove|path`，下一次口述自动热加载生效（目录级 `flock` 写锁零 `.lock` 脏文件）。一阶段按权重分层并层内保行序，`agent` 模式为动态代码词保底 30% 并空位回流（`general` 模式 100% 归个人词；百炼 `150 词 / 1,800 字`、豆包 `50 / 500`、OpenAI `50`、Whisper `35 / 353`）；二阶段/单跳块 0 按确定性顺序渲染（`200 条 / 3,000 字`）以稳定保住前缀缓存。
+- **同渠道重试与可选本地 MP3 归档（`max_retries`、`audio.save_recordings`）**：两阶段默认 `max_retries = 2`（`0..10`），在阶段 `timeout_sec` 与 9 秒建连/TLS 上限内分别对 `429`/QPS 限流与瞬态网络/5xx 退避重试。开启 `audio.save_recordings = true` 后，后台异步将有效录音压缩为 `0600` 权限 `16 kHz` `64 kbps` MP3 存入 `~/.agent-voice-input/recordings/`（受 `AGENT_VOICE_INPUT_HOME` 覆盖，按修改时间环形保留最新 `save_recordings_max_count = 300` 条）。
 
 </details>
 
@@ -277,7 +280,7 @@ effort = "auto"
 
 | CLI 参数 | 说明 |
 | :--- | :--- |
-| `--config PATH` | 指定 `config.toml` 或 `config.json` 路径（亦支持 `AGENT_VOICE_INPUT_CONFIG` 与 `XDG_CONFIG_HOME`） |
+| `--config PATH` | 指定 `config.toml` 或 `config.json` 路径（亦支持 `AGENT_VOICE_INPUT_CONFIG` 与 `AGENT_VOICE_INPUT_HOME`） |
 | `--asr`, `--asr-provider` | 一阶段渠道（`auto`, `dashscope`, `doubao`, `deepseek`, `openai`, `gemini`, `groq`, `openrouter`, `siliconflow`, `openai-compatible`；别名 `volcengine`/`volc` → `doubao`、`bailian` → `dashscope`） |
 | `--asr-model` | 一阶段上游模型 ID |
 | `--asr-api` | 一阶段协议（`auto`, `audio-transcriptions`, `chat-completions`） |
@@ -287,7 +290,7 @@ effort = "auto"
 | `--refiner-api` | 二阶段协议（`auto`, `chat-completions`, `responses`） |
 | `--refiner-effort`, `--effort` | 二阶段思考档位 |
 
-*（环境变量用于厂商凭据、引导路径 `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR` 及底层运行期诊断项；常规参数统一放 `config.toml`。）*
+*（环境变量用于厂商凭据、引导路径 `AGENT_VOICE_INPUT_HOME` / `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR` 及底层运行期诊断项；常规参数统一放 `config.toml`。）*
 
 </details>
 

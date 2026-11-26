@@ -252,9 +252,12 @@ class MetricsAndReplayTests(unittest.TestCase):
             sid = "395438e5-0000-4000-8000-000000000001"
             brain_logs = home / ".gemini" / "antigravity-cli" / "brain" / sid / ".system_generated" / "logs"
             brain_logs.mkdir(parents=True)
-            cfg_file = home / ".config" / "agent-voice-input" / "config.toml"
+            cfg_file = home / ".agent-voice-input" / "config.toml"
             cfg_file.parent.mkdir(parents=True)
             cfg_file.write_text('[asr]\nprovider = "dashscope"\n[refiner]\nprovider = "codex"\n', encoding="utf-8")
+            hw_dir = home / ".agent-voice-input" / "hotwords"
+            hw_dir.mkdir(parents=True)
+            (hw_dir / "personal.txt").write_text("!Antigravity <- 反重力\n", encoding="utf-8")
 
             t0 = 1794967200.0
             transcript = brain_logs / "transcript_full.jsonl"
@@ -317,8 +320,9 @@ class MetricsAndReplayTests(unittest.TestCase):
                 def prepare_session(self, session_key: str) -> None:
                     pass
 
-                def refine(self, asr_res, *, session_key: str = "", tracker=None, **kwargs) -> RefinerResult:
+                def refine(self, asr_res, *, session_key: str = "", tracker=None, vocabulary_hints: str = "", **kwargs) -> RefinerResult:
                     self.calls += 1
+                    assert "<vocabulary_hints" in vocabulary_hints and "Antigravity" in vocabulary_hints
                     st = tracker.get_state(session_key) if tracker else None
                     turns_n = len(st.clean_turns) if st else 0
                     seen_ctx_Turn_counts.append((session_key, turns_n))
@@ -490,7 +494,7 @@ class MetricsAndReplayTests(unittest.TestCase):
             sid = "395438e5-0000-4000-8000-000000000009"
             brain_logs = home / ".gemini" / "antigravity-cli" / "brain" / sid / ".system_generated" / "logs"
             brain_logs.mkdir(parents=True)
-            cfg_file = home / ".config" / "agent-voice-input" / "config.toml"
+            cfg_file = home / ".agent-voice-input" / "config.toml"
             cfg_file.parent.mkdir(parents=True)
             cfg_file.write_text('[asr]\nprovider = "dashscope"\n[refiner]\nprovider = "off"\n', encoding="utf-8")
 
@@ -685,7 +689,7 @@ class MetricsAndReplayTests(unittest.TestCase):
             home, rec_dir, eval_dir, host_rt = root / "home", root / "rec", root / "eval", root / "rt"
             rec_dir.mkdir(parents=True)
             host_rt.mkdir(parents=True)
-            cfg_file = home / ".config" / "agent-voice-input" / "config.toml"
+            cfg_file = home / ".agent-voice-input" / "config.toml"
             cfg_file.parent.mkdir(parents=True)
             cfg_file.write_text('[asr]\nprovider = "doubao"\n[refiner]\nprovider = "off"\n', encoding="utf-8")
 
@@ -902,6 +906,301 @@ class MetricsAndReplayTests(unittest.TestCase):
             self.assertEqual(doc_off["samples"][0]["recording_sha1"], doc_bal["samples"][0]["recording_sha1"])
             self.assertFalse(doc_bal["samples"][0]["asr_cached"])
             self.assertTrue(doc_bal2["samples"][0]["asr_cached"])
+
+    def test_agent_voice_input_home_env_consistent_without_home_dir_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sys_home = root / "sys_home"
+            wrong_app = sys_home / ".agent-voice-input"
+            wrong_app.mkdir(parents=True)
+            (wrong_app / "config.toml").write_text(
+                '[asr]\nprovider = "openai"\nmodel = "wrong-home-model"\n[refiner]\nprovider = "off"\n',
+                encoding="utf-8",
+            )
+
+            env_app = root / "custom_avi_home"
+            rec_dir = env_app / "recordings"
+            hw_dir = env_app / "hotwords"
+            eval_dir = root / "eval_out"
+            host_rt = root / "host_rt"
+            rec_dir.mkdir(parents=True)
+            hw_dir.mkdir(parents=True)
+            host_rt.mkdir(parents=True)
+            (env_app / "config.toml").write_text(
+                '[asr]\nprovider = "dashscope"\nmodel = "qwen3-asr-flash"\n[refiner]\nprovider = "off"\n',
+                encoding="utf-8",
+            )
+            (hw_dir / "personal.txt").write_text("!EnvHomeTerm\n", encoding="utf-8")
+            (rec_dir / "rec-20261126-101500-envhome.wav").write_bytes(_make_voiced_wav(2.5))
+
+            seen_cfg_models: list[tuple[str, str]] = []
+            seen_hotwords: list[tuple[str, ...]] = []
+
+            class _CaptureAsr:
+                provider_name = "dashscope"
+                single_hop = False
+
+                def __init__(self, cfg) -> None:
+                    seen_cfg_models.append((cfg.asr.provider, cfg.asr.effective_model("dashscope")))
+
+                def transcribe(self, wav_bytes: bytes, context=None, **kw) -> AsrResult:
+                    del wav_bytes, kw
+                    seen_hotwords.append(tuple(getattr(context, "personal_hotwords", ())))
+                    return AsrResult(text="env home ok", provider="dashscope", model="qwen3-asr-flash", latency_ms=40)
+
+            env_patch = {
+                "HOME": str(sys_home),
+                "AGENT_VOICE_INPUT_HOME": str(env_app),
+                "DASHSCOPE_API_KEY": "sk-ali-env-home-key",
+                "OPENAI_API_KEY": "sk-openai-wrong-key",
+            }
+            with (
+                mock.patch.dict(os.environ, env_patch, clear=False),
+                mock.patch.object(EVAL, "create_asr_provider", side_effect=lambda cfg, *a, **kw: _CaptureAsr(cfg)),
+                mock.patch("sys.stdout", io.StringIO()),
+                mock.patch("sys.stderr", io.StringIO()),
+            ):
+                rc = EVAL.main([
+                    "--tag", "env_home_only",
+                    "--eval-dir", str(eval_dir),
+                    "--host-runtime-dir", str(host_rt),
+                    "--no-git-status",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertEqual(seen_cfg_models, [("dashscope", "qwen3-asr-flash")])
+            self.assertEqual(seen_hotwords, [("EnvHomeTerm",)])
+            doc = json.loads((eval_dir / "env_home_only.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc["meta"]["asr_provider"], "dashscope")
+            self.assertEqual(doc["meta"]["asr_model"], "qwen3-asr-flash")
+            self.assertEqual(len(doc["samples"]), 1)
+
+    def test_bench_refiner_wav_respects_no_hotwords_and_hotwords_file(self) -> None:
+        import argparse
+        from agent_voice_input.config import Config, RefinerConfig
+
+        bench_path = REPO_ROOT / ".agents" / "skills" / "voice-eval" / "scripts" / "bench_refiner.py"
+        spec = importlib.util.spec_from_file_location("bench_refiner_mod", bench_path)
+        assert spec is not None and spec.loader is not None
+        bench_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bench_mod)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            host_app = root / "host_avi_home"
+            host_hw = host_app / "hotwords" / "personal.txt"
+            host_hw.parent.mkdir(parents=True)
+            host_hw.write_text("!HostSecretTerm <- 宿主词\n", encoding="utf-8")
+
+            custom_hw = root / "custom_hotwords.txt"
+            custom_hw.write_text("!CustomBenchTerm <- 客制词\n", encoding="utf-8")
+
+            sess_file = root / "11111111-2222-3333-4444-555555555555.jsonl"
+            sess_file.write_text(
+                json.dumps({"type": "user", "message": {"role": "user", "content": "看一下 bench_refiner.py"}}) + "\n",
+                encoding="utf-8",
+            )
+            wav_p = root / "probe.wav"
+            wav_p.write_bytes(_make_voiced_wav(2.0))
+            rt_dir = root / "rt"
+            rt_dir.mkdir()
+
+            snap = SessionTracker(home_dir=root, env={"HOME": str(root)}, runtime_dir=rt_dir, proc_root=rt_dir / "no_proc").sync_session(
+                match=SessionMatch(
+                    cli="claude",
+                    session_id="11111111-2222-3333-4444-555555555555",
+                    jsonl_path=str(sess_file),
+                    cwd="",
+                    matched_by="test",
+                )
+            )
+            assert snap is not None
+
+            captured_asr_hw: list[tuple[str, ...]] = []
+            captured_ref_vocab: list[str] = []
+
+            class _StubAsr:
+                provider_name = "dashscope"
+                single_hop = False
+
+                def transcribe(self, wav_bytes: bytes, context=None, **kw) -> AsrResult:
+                    del wav_bytes, kw
+                    captured_asr_hw.append(tuple(getattr(context, "personal_hotwords", ())))
+                    return AsrResult(text="测试语音", provider="dashscope", model="qwen3-asr-flash", latency_ms=20)
+
+            class _StubRefiner:
+                def refine(self, text, **kw) -> RefinerResult:
+                    del text
+                    captured_ref_vocab.append(str(kw.get("vocabulary_hints") or ""))
+                    return RefinerResult(text="测试语音。", provider="codex", model="gpt-5", latency_ms=10)
+
+                def close(self) -> None:
+                    pass
+
+            base_cfg = Config(refiner=RefinerConfig(provider="codex"))
+            env = {
+                "HOME": str(root),
+                "AGENT_VOICE_INPUT_HOME": str(host_app),
+                "DASHSCOPE_API_KEY": "sk-ali-bench-test",
+            }
+
+            def _run_case(*, no_hotwords: bool, hotwords_file: str, snapshot_text: str) -> None:
+                args = argparse.Namespace(
+                    config="",
+                    model="",
+                    effort="",
+                    max_chars=16000,
+                    no_git_status=True,
+                    api="",
+                    no_hotwords=no_hotwords,
+                    hotwords_file=hotwords_file,
+                )
+                with (
+                    mock.patch("agent_voice_input.daemon_pipeline.create_asr_provider", return_value=_StubAsr()),
+                    mock.patch.object(bench_mod, "create_refiner", return_value=_StubRefiner()),
+                ):
+                    bench_mod._run_wav_benchmark(
+                        wav_path=wav_p,
+                        providers=["codex"],
+                        base_cfg=base_cfg,
+                        env=env,
+                        home=root,
+                        rt_dir=rt_dir,
+                        snap=snap,
+                        args=args,
+                        redact_fn=lambda s: str(s),
+                        hotwords_snapshot_text=snapshot_text,
+                    )
+
+            # 1. --no-hotwords must NOT leak host personal.txt into WAV pipeline
+            _run_case(no_hotwords=True, hotwords_file="", snapshot_text="")
+            self.assertEqual(captured_asr_hw[-1], ())
+            self.assertEqual(captured_ref_vocab[-1], "")
+            self.assertNotIn("HostSecretTerm", captured_ref_vocab[-1])
+
+            # 2. --hotwords-file snapshot must inject selected entries into WAV pipeline, NOT host personal.txt
+            custom_snap = bench_mod._render_hotwords_snapshot(
+                bench_mod.load_hotwords_table(custom_hw, env=env, use_cache=False).entries
+            )
+            _run_case(no_hotwords=False, hotwords_file=str(custom_hw), snapshot_text=custom_snap)
+            self.assertEqual(captured_asr_hw[-1], ("CustomBenchTerm",))
+            self.assertIn("CustomBenchTerm (ASR has misheard as: 客制词)", captured_ref_vocab[-1])
+            self.assertNotIn("HostSecretTerm", captured_ref_vocab[-1])
+
+            # 3. End-to-end main(--wav): leaf symlink hotwords file is rejected in BOTH phases (never followed)
+            cfg_file = host_app / "config.toml"
+            cfg_file.write_text('[asr]\nprovider = "dashscope"\n[refiner]\nprovider = "codex"\n', encoding="utf-8")
+            secret_target = root / "secret_target.txt"
+            secret_target.write_text("!SymlinkSecretTerm <- 秘词\n", encoding="utf-8")
+            leaf_sym = root / "leaf_link_hotwords.txt"
+            leaf_sym.symlink_to(secret_target)
+
+            sym_stage1_vocab: list[str] = []
+            sym_wav_asr_hw: list[tuple[str, ...]] = []
+            sym_wav_ref_vocab: list[str] = []
+
+            class _SymStage1Refiner:
+                def refine(self, text, **kw) -> RefinerResult:
+                    del text
+                    sym_stage1_vocab.append(str(kw.get("vocabulary_hints") or ""))
+                    return RefinerResult(text="ok", provider="codex", model="gpt-5", latency_ms=5)
+
+                def close(self) -> None:
+                    pass
+
+            class _SymWavRefiner:
+                def refine(self, text, **kw) -> RefinerResult:
+                    del text
+                    sym_wav_ref_vocab.append(str(kw.get("vocabulary_hints") or ""))
+                    return RefinerResult(text="ok", provider="codex", model="gpt-5", latency_ms=5)
+
+                def close(self) -> None:
+                    pass
+
+            class _SymWavAsr:
+                provider_name = "dashscope"
+                single_hop = False
+
+                def transcribe(self, wav_bytes: bytes, context=None, **kw) -> AsrResult:
+                    del wav_bytes, kw
+                    sym_wav_asr_hw.append(tuple(getattr(context, "personal_hotwords", ())))
+                    return AsrResult(text="测试", provider="dashscope", model="qwen3-asr-flash", latency_ms=10)
+
+            sym_refs = iter([_SymStage1Refiner(), _SymWavRefiner()])
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(bench_mod, "create_refiner", side_effect=lambda *a, **kw: next(sym_refs)),
+                mock.patch("agent_voice_input.daemon_pipeline.create_asr_provider", return_value=_SymWavAsr()),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                rc_sym = bench_mod.main([
+                    "--config", str(cfg_file),
+                    "--session-file", str(sess_file),
+                    "--no-git-status",
+                    "--rounds", "1",
+                    "--hotwords-file", str(leaf_sym),
+                    "--wav", str(wav_p),
+                ])
+            self.assertEqual(rc_sym, 0)
+            self.assertEqual(sym_stage1_vocab, [""])
+            self.assertEqual(sym_wav_asr_hw, [()])
+            self.assertEqual(sym_wav_ref_vocab, [""])
+
+            # 4. End-to-end main(--wav): mutating hotwords file between Stage 1 and WAV phase causes ZERO drift
+            drift_hw = root / "drift_hotwords.txt"
+            drift_hw.write_text("!FrozenTerm <- 冻结词\n", encoding="utf-8")
+            drift_stage1_vocab: list[str] = []
+            drift_wav_asr_hw: list[tuple[str, ...]] = []
+            drift_wav_ref_vocab: list[str] = []
+
+            class _MutatingStage1Refiner:
+                def refine(self, text, **kw) -> RefinerResult:
+                    del text
+                    drift_stage1_vocab.append(str(kw.get("vocabulary_hints") or ""))
+                    # Mutate source file after Stage 1 load, before _run_wav_benchmark starts
+                    drift_hw.write_text("!MutatedAfterStage1 <- 篡改词\n", encoding="utf-8")
+                    return RefinerResult(text="ok", provider="codex", model="gpt-5", latency_ms=5)
+
+                def close(self) -> None:
+                    pass
+
+            class _DriftWavRefiner:
+                def refine(self, text, **kw) -> RefinerResult:
+                    del text
+                    drift_wav_ref_vocab.append(str(kw.get("vocabulary_hints") or ""))
+                    return RefinerResult(text="ok", provider="codex", model="gpt-5", latency_ms=5)
+
+                def close(self) -> None:
+                    pass
+
+            class _DriftWavAsr:
+                provider_name = "dashscope"
+                single_hop = False
+
+                def transcribe(self, wav_bytes: bytes, context=None, **kw) -> AsrResult:
+                    del wav_bytes, kw
+                    drift_wav_asr_hw.append(tuple(getattr(context, "personal_hotwords", ())))
+                    return AsrResult(text="测试", provider="dashscope", model="qwen3-asr-flash", latency_ms=10)
+
+            drift_refs = iter([_MutatingStage1Refiner(), _DriftWavRefiner()])
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(bench_mod, "create_refiner", side_effect=lambda *a, **kw: next(drift_refs)),
+                mock.patch("agent_voice_input.daemon_pipeline.create_asr_provider", return_value=_DriftWavAsr()),
+                mock.patch("sys.stdout", io.StringIO()),
+            ):
+                rc_drift = bench_mod.main([
+                    "--config", str(cfg_file),
+                    "--session-file", str(sess_file),
+                    "--no-git-status",
+                    "--rounds", "1",
+                    "--hotwords-file", str(drift_hw),
+                    "--wav", str(wav_p),
+                ])
+            self.assertEqual(rc_drift, 0)
+            self.assertIn("FrozenTerm (ASR has misheard as: 冻结词)", drift_stage1_vocab[0])
+            self.assertEqual(drift_wav_asr_hw, [("FrozenTerm",)])
+            self.assertIn("FrozenTerm (ASR has misheard as: 冻结词)", drift_wav_ref_vocab[0])
+            self.assertNotIn("MutatedAfterStage1", drift_wav_ref_vocab[0])
 
 
 if __name__ == "__main__":

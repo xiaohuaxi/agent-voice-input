@@ -190,11 +190,7 @@ def resolve_wsl_effective_audio_source(
 ) -> tuple[str, str]:
     """Return ``(backend, effective_pulse_source)`` matching ``WslPlatform`` runtime capture selection."""
     raw_env = os.environ if env is None else env
-    explicit_pulse = (
-        raw_env.get("AGENT_VOICE_INPUT_PULSE_SOURCE")
-        or raw_env.get("VOICE_INPUT_PULSE_SOURCE")
-        or ""
-    ).strip()
+    explicit_pulse = (raw_env.get("AGENT_VOICE_INPUT_PULSE_SOURCE") or "").strip()
     eff_pulse_src = explicit_pulse or pulse_source.strip() or "RDPSource"
     wsl_src = (cfg.audio.wsl_source or "auto").strip().lower()
     if wsl_src in ("winmm", "wasapi"):
@@ -513,7 +509,7 @@ class WslPlatform(JsonlShimMixin):
     def start_recording(self, runtime_dir: Path, *, loopback: bool = False, seq_id: int | None = None) -> None:
         self._stop_level_streamer()
         self.last_audio_error = ""
-        eff_loopback = bool(loopback or self.env.get("AGENT_VOICE_INPUT_WASAPI_LOOPBACK") == "1" or self.env.get("VOICE_INPUT_WASAPI_LOOPBACK") == "1")
+        eff_loopback = bool(loopback or self.env.get("AGENT_VOICE_INPUT_WASAPI_LOOPBACK") == "1")
         if self._use_winmm:
             with self._winmm_state_lock:
                 if self._closed:

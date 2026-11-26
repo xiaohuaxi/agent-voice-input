@@ -121,8 +121,6 @@ from .prompts import (
     REFINER_GENERAL_SYSTEM_PROMPT,
     REFINER_SYSTEM_PROMPT,
     REFINER_TASK_REMINDER,
-    format_target_app_hint,
-    strip_target_hint_echo,
     strip_vocabulary_hints_echo,
 )
 from .session_ctx import SessionTracker
@@ -247,8 +245,6 @@ def _unpack(asr_input: AsrResult | str) -> tuple[str, bool]:
 
 def _clean_out(text: str, fallback: str = "", *, strip_vocab_echo: bool = True) -> str:
     cleaned = strip_lenticular_artifacts(text).strip()
-    if cleaned and "<target_app_hint" not in fallback.lower() and "</target_app_hint>" not in fallback.lower():
-        cleaned = strip_target_hint_echo(cleaned).strip()
     if (
         strip_vocab_echo
         and cleaned
@@ -374,13 +370,11 @@ def format_workspace_git_block(git_context: str) -> str:
 
 
 def build_final_refiner_block(
-    draft_text: str, *, git_context: str = "", target_hint: str = ""
+    draft_text: str, *, git_context: str = ""
 ) -> str:
     parts: list[str] = []
     if git_blk := format_workspace_git_block(git_context):
         parts.append(git_blk)
-    if hint_blk := format_target_app_hint(target_hint):
-        parts.append(hint_blk)
     parts.append(f"<asr_draft_to_clean>\n{draft_text.strip()}\n</asr_draft_to_clean>")
     parts.append(REFINER_TASK_REMINDER)
     return "\n".join(parts)
@@ -480,11 +474,9 @@ def attach_single_hop_context(
     session_key: str = "",
     mode: str = "agent",
     workspace_cwd: str = "",
-    target_hint: str = "",
     vocabulary_hints: str = "",
 ) -> AsrContext:
     eff_mode = (mode or "agent").strip().lower() or "agent"
-    eff_hint = (target_hint or base_ctx.target_hint or "").strip().lower()
     vocab_blk = vocabulary_hints.strip()
     if eff_mode == "general":
         return replace(
@@ -495,7 +487,8 @@ def attach_single_hop_context(
             git_block="",
             mode="general",
             single_hop_prepared=True,
-            target_hint=eff_hint,
+            dynamic_hotwords=(),
+            builtin_hotwords=(),
         )
     context_blocks, git_ctx = build_refiner_context_chunks(
         cfg,
@@ -514,7 +507,6 @@ def attach_single_hop_context(
         git_block=format_workspace_git_block(git_ctx),
         mode=eff_mode,
         single_hop_prepared=True,
-        target_hint=eff_hint,
     )
 
 
@@ -527,13 +519,12 @@ def build_refiner_request_blocks(
     fallback_context: str = "",
     mode: str = "agent",
     workspace_cwd: str = "",
-    target_hint: str = "",
     vocabulary_hints: str = "",
 ) -> tuple[list[str], str]:
     vocab_blk = vocabulary_hints.strip()
     if mode == "general":
         blocks = [vocab_blk] if vocab_blk else []
-        return blocks, build_final_refiner_block(clean_draft, git_context="", target_hint=target_hint)
+        return blocks, build_final_refiner_block(clean_draft, git_context="")
     context_blocks, git_ctx = build_refiner_context_chunks(
         cfg,
         session_key=session_key,
@@ -544,7 +535,7 @@ def build_refiner_request_blocks(
     if vocab_blk:
         context_blocks = [vocab_blk, *context_blocks]
     return context_blocks, build_final_refiner_block(
-        clean_draft, git_context=git_ctx, target_hint=target_hint
+        clean_draft, git_context=git_ctx
     )
 
 
@@ -1014,7 +1005,6 @@ class BaseRefiner:
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
         workspace_cwd: str = "",
-        target_hint: str = "",
         vocabulary_hints: str = "",
     ) -> RefinerResult:
         raise NotImplementedError
@@ -1127,7 +1117,6 @@ class NoopRefiner(BaseRefiner):
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
         workspace_cwd: str = "",
-        target_hint: str = "",
         vocabulary_hints: str = "",
     ) -> RefinerResult:
         draft, single_hop = _unpack(asr_input)
@@ -1828,7 +1817,6 @@ class OpenAIResponsesRefiner(BaseRefiner):
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
         workspace_cwd: str = "",
-        target_hint: str = "",
         vocabulary_hints: str = "",
     ) -> RefinerResult:
         model = self._select_request_model()
@@ -1864,7 +1852,6 @@ class OpenAIResponsesRefiner(BaseRefiner):
             fallback_context=fallback_context,
             mode=mode,
             workspace_cwd=workspace_cwd,
-            target_hint=target_hint,
             vocabulary_hints=vocabulary_hints,
         )
         ctx_chunks, ctx_chars = _measure_session_context_blocks(context_blocks)
@@ -2675,7 +2662,6 @@ class GeminiRefiner(_HttpTransportRefiner):
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
         workspace_cwd: str = "",
-        target_hint: str = "",
         vocabulary_hints: str = "",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model("gemini")
@@ -2707,7 +2693,6 @@ class GeminiRefiner(_HttpTransportRefiner):
             fallback_context=fallback_context,
             mode=mode,
             workspace_cwd=workspace_cwd,
-            target_hint=target_hint,
             vocabulary_hints=vocabulary_hints,
         )
         ctx_chunks, ctx_chars = _measure_session_context_blocks(context_blocks)
@@ -2797,7 +2782,6 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
         workspace_cwd: str = "",
-        target_hint: str = "",
         vocabulary_hints: str = "",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model(self.provider_name)
@@ -2843,7 +2827,6 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
             fallback_context=fallback_context,
             mode=mode,
             workspace_cwd=workspace_cwd,
-            target_hint=target_hint,
             vocabulary_hints=vocabulary_hints,
         )
         ctx_chunks, ctx_chars = _measure_session_context_blocks(context_blocks)
@@ -4295,7 +4278,6 @@ class AgyRefiner(BaseRefiner):
         cancel_token: CancelToken | None = None,
         mode: str = "agent",
         workspace_cwd: str = "",
-        target_hint: str = "",
         vocabulary_hints: str = "",
     ) -> RefinerResult:
         requested_model = self.cfg.refiner.effective_model("agy")
@@ -4332,7 +4314,6 @@ class AgyRefiner(BaseRefiner):
             fallback_context=fallback_context,
             mode=eff_mode,
             workspace_cwd=workspace_cwd,
-            target_hint=target_hint,
             vocabulary_hints=vocabulary_hints,
         )
         ctx_chunks, ctx_chars = _measure_session_context_blocks(context_blocks)

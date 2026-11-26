@@ -133,7 +133,7 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
 
 当你在本地 macOS 或 Windows+WSL2 上按热键说话、向远端无头 Linux 服务器上的 CLI Agent 输入时：
 
-1. **在本地配置白名单**（`~/.config/agent-voice-input/config.toml`）：
+1. **在本地配置白名单**（`~/.agent-voice-input/config.toml`）：
    ```toml
    [remote]
    hosts = ["devbox"]

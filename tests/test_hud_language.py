@@ -92,7 +92,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
             (cfg_dir / "config.toml").write_text('[ui]\nlanguage = "zh-CN"\n', encoding="utf-8")
 
@@ -135,7 +135,7 @@ class HudLanguageConfigAndResolutionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
 
             # Default without config file is 'bottom'

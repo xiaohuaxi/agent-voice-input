@@ -1284,17 +1284,16 @@ def _load_codex_thread_names(home: Path, *, wsl: bool = False) -> dict[str, str]
 def _candidate_runtime_dirs(home: Path, env: Mapping[str, str]) -> list[Path]:
     uid = os.getuid()
     cands: list[Path] = []
-    for k in ("AGENT_VOICE_INPUT_RUNTIME_DIR", "VOICE_INPUT_RUNTIME_DIR"):
-        v = (env.get(k) or "").strip()
-        if v:
-            cands.append(Path(_expand_remote_path(v, home)))
+    v = (env.get("AGENT_VOICE_INPUT_RUNTIME_DIR") or "").strip()
+    if v:
+        cands.append(Path(_expand_remote_path(v, home)))
     xdg = (env.get("XDG_RUNTIME_DIR") or "").strip()
     if xdg:
         xp = Path(_expand_remote_path(xdg, home))
-        cands.extend([xp / "agent-voice-input", xp / "voice-input"])
+        cands.append(xp / "agent-voice-input")
     cands.append(Path(f"/run/user/{uid}/agent-voice-input"))
     cache_base = Path(_expand_remote_path(env.get("XDG_CACHE_HOME") or "", home) or (home / ".cache"))
-    cands.extend([cache_base / "agent-voice-input", cache_base / "voice-input"])
+    cands.append(cache_base / "agent-voice-input")
     out: list[Path] = []
     for c in cands:
         if c not in out:

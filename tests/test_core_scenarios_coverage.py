@@ -37,7 +37,7 @@ from agent_voice_input import llm_common as llm_mod  # noqa: E402
 from agent_voice_input import prompts as prompts_mod  # noqa: E402
 from agent_voice_input.app_scope import (  # noqa: E402
     IdeTitleInfo,
-    classify_target_app_hint,
+    is_claude_desktop_window,
     is_dedicated_ssh_client_window,
     is_remote_ide_window,
     match_app_patterns,
@@ -147,43 +147,6 @@ class TestHudAndPromptsScenarios(unittest.TestCase):
         mid_pcm = struct.pack("<h", 1200) * 32
         self.assertGreater(hud_mod.pcm16le_rms_level(mid_pcm), 0.1)
         self.assertLess(hud_mod.pcm16le_rms_level(mid_pcm), 0.9)
-
-    def test_prompts_target_hint_echo_stripping_edges(self) -> None:
-        self.assertEqual(prompts_mod.format_target_app_hint("AI_CHAT"), prompts_mod.TARGET_APP_HINTS["ai_chat"])
-        self.assertEqual(prompts_mod.format_target_app_hint("unknown"), "")
-        self.assertEqual(prompts_mod.strip_target_hint_echo(""), "")
-        self.assertEqual(prompts_mod.strip_target_hint_echo("plain text"), "plain text")
-
-        # Modified body inside trailing <target_app_hint ...>...</target_app_hint> and self-closing tag
-        self.assertEqual(
-            prompts_mod.strip_target_hint_echo(
-                '请检查日志 <target_app_hint category="im_chat">paraphrased hint</target_app_hint>'
-            ),
-            "请检查日志",
-        )
-        self.assertEqual(
-            prompts_mod.strip_target_hint_echo('测试自闭合 <target_app_hint category="ai_chat" />'),
-            "测试自闭合",
-        )
-        # Trailing unclosed / malformed tag must NOT truncate preceding text when not matching full block
-        malformed_tail = "保留正文 <target_app_hint broken\nmultiline />"
-        self.assertEqual(prompts_mod.strip_target_hint_echo(malformed_tail), malformed_tail)
-
-        # 5 blocks exhausting the 4-pass loop (L171->178) and falling through to standalone-line cleanup
-        nested = (
-            '<target_app_hint category="a">1</target_app_hint>' * 4
-            + '<target_app_hint category="a" />\n核心内容'
-        )
-        self.assertEqual(prompts_mod.strip_target_hint_echo(nested), "核心内容")
-
-        # Orphan closing tag at end without opening tag in body
-        self.assertEqual(
-            prompts_mod.strip_target_hint_echo("这段话末尾多出了闭合标签</target_app_hint>"),
-            "这段话末尾多出了闭合标签",
-        )
-        # Prose genuinely discussing multiline <target_app_hint ... </target_app_hint> preserves closing tag
-        prose_mention = "Please inspect <target_app_hint\nin prompts.py before </target_app_hint>"
-        self.assertEqual(prompts_mod.strip_target_hint_echo(prose_mention), prose_mention)
 
     def test_prompts_vocabulary_hints_contracts_and_echo_stripping(self) -> None:
         # Read-only reference listing & anti-echo / anti-mistranslation rules across unified prompts
@@ -298,17 +261,14 @@ class TestAppScopeWindowTitleScenarios(unittest.TestCase):
         self.assertTrue(is_dedicated_ssh_client_window(_Win(process="kitty", title="zsh"), is_macos=False))
 
         # Windows Claude Desktop vs Claude Code CLI in console named claude.exe
-        self.assertEqual(
-            classify_target_app_hint(_Win(process="claude.exe", title="Project Plan — Claude")),
-            "ai_chat",
+        self.assertTrue(
+            is_claude_desktop_window(_Win(process="claude.exe", title="Project Plan — Claude")),
         )
-        self.assertEqual(
-            classify_target_app_hint(_Win(process="claude.exe", title="claude · repo [#12345678] - Claude")),
-            "",
+        self.assertFalse(
+            is_claude_desktop_window(_Win(process="claude.exe", title="claude · repo [#12345678] - Claude")),
         )
-        self.assertEqual(
-            classify_target_app_hint(_Win(process="claude.exe", title="⠋ Working - Claude")),
-            "",
+        self.assertFalse(
+            is_claude_desktop_window(_Win(process="claude.exe", title="⠋ Working - Claude")),
         )
 
     def test_ide_window_titles_and_remote_detection_matrix(self) -> None:
@@ -758,18 +718,24 @@ class TestConfigTomlAndValidationScenarios(unittest.TestCase):
             self.assertEqual(expand_user_path("~", home_dir=root), root)
             self.assertEqual(expand_user_path("~/cfg", home_dir=root), root / "cfg")
 
-            # VOICE_INPUT_CONFIG fallback in target paths, env candidates, and load_config
+            # AGENT_VOICE_INPUT_CONFIG in target paths & load_config; VOICE_INPUT_CONFIG is ignored
             vi_cfg = root / "custom" / "voice.json"
             vi_cfg.parent.mkdir(parents=True)
             vi_cfg.write_text(
                 json.dumps({"ui": {"position": "top"}, "refiner": {"provider": "deepseek"}}),
                 encoding="utf-8",
             )
-            env_vi = {"HOME": str(root), "VOICE_INPUT_CONFIG": str(vi_cfg), "XDG_CONFIG_HOME": str(root / ".config")}
+            env_legacy_only = {"HOME": str(root), "VOICE_INPUT_CONFIG": str(vi_cfg)}
+            cdir_def, ctoml_def, cenv_def = resolve_target_config_paths(env=env_legacy_only, home_dir=root)
+            self.assertEqual(
+                (cdir_def, ctoml_def, cenv_def),
+                (root / ".agent-voice-input", root / ".agent-voice-input" / "config.toml", root / ".agent-voice-input" / ".env"),
+            )
+            env_vi = {"HOME": str(root), "AGENT_VOICE_INPUT_CONFIG": str(vi_cfg)}
             cdir, ctoml, cenv = resolve_target_config_paths(env=env_vi, home_dir=root)
-            self.assertEqual((cdir, ctoml, cenv), (vi_cfg.parent, vi_cfg, vi_cfg.parent / "agent-voice-input.env"))
-            self.assertIn(vi_cfg.parent / "agent-voice-input.env", default_env_file_candidates(env_vi))
-            self.assertTrue(len(default_config_file_candidates(env_vi)) >= 4)
+            self.assertEqual((cdir, ctoml, cenv), (vi_cfg.parent, vi_cfg, vi_cfg.parent / ".env"))
+            self.assertEqual(default_env_file_candidates(env_vi), [root / ".agent-voice-input" / ".env"])
+            self.assertEqual(default_config_file_candidates(env_vi), [root / ".agent-voice-input" / "config.toml"])
 
             cfg_loaded, _ = load_config(
                 env=env_vi,
@@ -782,8 +748,9 @@ class TestConfigTomlAndValidationScenarios(unittest.TestCase):
             # Missing explicit config files & malformed JSON roots
             with self.assertRaisesRegex(ConfigError, "AGENT_VOICE_INPUT_CONFIG file does not exist"):
                 load_config(env={"HOME": str(root), "AGENT_VOICE_INPUT_CONFIG": str(root / "missing.toml")})
-            with self.assertRaisesRegex(ConfigError, "VOICE_INPUT_CONFIG file does not exist"):
-                load_config(env={"HOME": str(root), "VOICE_INPUT_CONFIG": str(root / "missing2.toml")})
+            # Legacy VOICE_INPUT_CONFIG is ignored even when pointing at a nonexistent file
+            cfg_ign, _ = load_config(env={"HOME": str(root), "VOICE_INPUT_CONFIG": str(root / "missing2.toml")})
+            self.assertIsNone(cfg_ign.config_path)
 
             bad_json = root / "bad.json"
             bad_json.write_text("{invalid", encoding="utf-8")

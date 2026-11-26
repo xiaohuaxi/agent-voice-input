@@ -90,6 +90,8 @@ _INIT_ENV_TEMPLATE = """\
 # Proxy (optional): HTTPS_PROXY / HTTP_PROXY / NO_PROXY can be exported in your shell or set here (shell env takes precedence; HTTP/HTTPS proxies only, SOCKS5 not supported).
 """
 
+_INIT_GITIGNORE_CONTENT = "/*\n!/.gitignore\n!/hotwords/\n"
+
 _MACOS_MODIFIER_HOTKEYS = frozenset(
     {
         "rcontrol",
@@ -286,6 +288,46 @@ def _write_init_file_0600(cfg_dir: Path, target: Path, content: str, *, force: b
             pass
         raise
     return "overwritten" if st is not None else "created"
+
+
+def _write_init_gitignore_0644(target: Path, content: str) -> str:
+    """Exclusively create 0644 ``.gitignore`` if absent; never overwrite an existing file (even with ``--force``)."""
+    from .config import ConfigError
+
+    st = _lstat_or_none(target)
+    if st is not None:
+        if stat.S_ISDIR(st.st_mode):
+            raise ConfigError(f"cannot overwrite directory: {target}")
+        return "kept"
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o644)
+    except FileExistsError:
+        return "kept"
+    except OSError as exc:
+        raise ConfigError(f"cannot create {target}: {exc}") from None
+
+    closed = False
+    try:
+        os.fchmod(fd, 0o644)
+        fobj = os.fdopen(fd, "w", encoding="utf-8")
+        closed = True
+        with fobj as f:
+            f.write(content)
+            f.flush()
+    except Exception:
+        if not closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return "created"
 
 
 def _lstat_or_none(path: Path) -> os.stat_result | None:
@@ -609,13 +651,15 @@ def _cmd_init(
         VALID_REFINER_PROVIDERS,
         Config,
         ConfigError,
-        default_config_file_candidates,
         detect_codex_local_auth_mode,
+        detect_legacy_config_migration_hint,
+        ensure_app_dir,
         explain_pipeline_selection,
         load_config,
         load_env_files,
         normalize_asr_provider,
         normalize_refiner_provider,
+        resolve_app_home_dir,
         resolve_credentials,
         resolve_target_config_paths,
         validate_hotkey_for_platform,
@@ -653,11 +697,6 @@ def _cmd_init(
         norm_hotkey = "RControl"
 
     cli_cfg_str = str(config_path).strip() if config_path is not None else ""
-    has_explicit_cfg = bool(
-        cli_cfg_str
-        or src_env.get("AGENT_VOICE_INPUT_CONFIG", "").strip()
-        or src_env.get("VOICE_INPUT_CONFIG", "").strip()
-    )
     cfg_dir, toml_path, env_path = resolve_target_config_paths(
         config_path=config_path, env=src_env, home_dir=home_dir
     )
@@ -665,38 +704,42 @@ def _cmd_init(
         raise ConfigError(
             f"init generates TOML config; target path cannot end with .json: {toml_path}"
         )
+    if toml_path.name.lower() in (".env", ".gitignore"):
+        raise ConfigError(
+            f"init target --config path cannot be {toml_path.name!r}: {toml_path}"
+        )
 
-    toml_st = _lstat_or_none(toml_path)
-    env_st = _lstat_or_none(env_path)
-    for p, st in ((toml_path, toml_st), (env_path, env_st)):
-        if st is not None and stat.S_ISDIR(st.st_mode):
-            raise ConfigError(f"cannot overwrite directory: {p}")
+    app_home = resolve_app_home_dir(src_env, home_dir=home_dir)
+    in_app_home = (
+        app_home is not None
+        and os.path.realpath(str(cfg_dir)) == os.path.realpath(str(app_home))
+    )
 
-    shadowed_cfg: Path | None = None
-    if not has_explicit_cfg and not force and toml_st is None:
-        for cand in default_config_file_candidates(src_env, home_dir=home_dir):
-            if cand != toml_path and cand.is_file():
-                shadowed_cfg = cand
-                break
-
-    will_write_toml = (force or toml_st is None) and shadowed_cfg is None
-    will_write_env = force or env_st is None
-    if will_write_toml or will_write_env:
-        _ensure_init_parent_dir(cfg_dir, preserve_existing_mode=has_explicit_cfg)
+    # Check legacy XDG migration hint BEFORE writing <app_home>/config.toml.
+    legacy_hint = detect_legacy_config_migration_hint(src_env, home_dir=home_dir)
 
     toml_content = _render_init_config_toml(
         hotkey=norm_hotkey,
         asr_provider=norm_asr,
         refiner_provider=norm_ref,
     )
-    if shadowed_cfg is not None:
-        print(
-            _kv_line(
-                "Config",
-                f"kept {shadowed_cfg} (pass --force to create {toml_path} which takes precedence)",
-            )
-        )
-    else:
+
+    if in_app_home:
+        assert app_home is not None
+        gitignore_path = cfg_dir / ".gitignore"
+        toml_st = _lstat_or_none(toml_path)
+        env_st = _lstat_or_none(env_path)
+        gi_st = _lstat_or_none(gitignore_path)
+        for p, st in ((toml_path, toml_st), (env_path, env_st), (gitignore_path, gi_st)):
+            if st is not None and stat.S_ISDIR(st.st_mode):
+                raise ConfigError(f"cannot overwrite directory: {p}")
+
+        will_write_any = force or toml_st is None or env_st is None or gi_st is None
+        if will_write_any:
+            ensure_app_dir(app_home, create=True)
+            if cfg_dir != app_home:
+                ensure_app_dir(cfg_dir, create=True)
+
         state_toml = _write_init_file_0600(cfg_dir, toml_path, toml_content, force=force)
         if state_toml == "kept":
             print(_kv_line("Config", f"kept {toml_path} (pass --force to overwrite)"))
@@ -710,11 +753,57 @@ def _cmd_init(
                     )
                 )
 
-    state_env = _write_init_file_0600(cfg_dir, env_path, _INIT_ENV_TEMPLATE, force=force)
-    if state_env == "kept":
-        print(_kv_line("Env", f"kept {env_path} (pass --force to overwrite)"))
+        state_env = _write_init_file_0600(cfg_dir, env_path, _INIT_ENV_TEMPLATE, force=force)
+        if state_env == "kept":
+            print(_kv_line("Env", f"kept {env_path} (pass --force to overwrite)"))
+        else:
+            print(_kv_line("Env", f"{state_env} {env_path} (0600)"))
+
+        state_gi = _write_init_gitignore_0644(gitignore_path, _INIT_GITIGNORE_CONTENT)
+        if state_gi == "kept":
+            print(_kv_line("Gitignore", f"kept {gitignore_path}"))
+        else:
+            print(_kv_line("Gitignore", f"created {gitignore_path} (0644)"))
+        cred_target_label = str(env_path)
     else:
-        print(_kv_line("Env", f"{state_env} {env_path} (0600)"))
+        toml_st = _lstat_or_none(toml_path)
+        if toml_st is not None and stat.S_ISDIR(toml_st.st_mode):
+            raise ConfigError(f"cannot overwrite directory: {toml_path}")
+        if force or toml_st is None:
+            _ensure_init_parent_dir(cfg_dir, preserve_existing_mode=True)
+
+        state_toml = _write_init_file_0600(cfg_dir, toml_path, toml_content, force=force)
+        if state_toml == "kept":
+            print(_kv_line("Config", f"kept {toml_path} (pass --force to overwrite)"))
+        else:
+            print(_kv_line("Config", f"{state_toml} {toml_path} (0600)"))
+            if auto_macbook_hotkey:
+                print(
+                    _kv_line(
+                        "Hotkey",
+                        "ROption (detected MacBook built-in keyboard; pass --hotkey RControl for external keyboard)",
+                    )
+                )
+
+        if app_home is not None:
+            cred_target_label = str(app_home / ".env")
+            print(
+                _kv_line(
+                    "Env",
+                    f"skipped in external --config directory (put credentials in {cred_target_label} or process environment)",
+                )
+            )
+        else:
+            cred_target_label = "your process environment"
+            print(
+                _kv_line(
+                    "Env",
+                    "skipped in external --config directory (provide credentials via process environment variables)",
+                )
+            )
+
+    if legacy_hint:
+        print(_kv_line("Migrate", legacy_hint))
 
     # Zero-network local environment summary
     try:
@@ -754,7 +843,7 @@ def _cmd_init(
         print(
             _kv_line(
                 "Note",
-                f"No need to edit {env_path} unless you want a different provider.",
+                f"No need to edit {cred_target_label} unless you want a different provider.",
             )
         )
         print(
@@ -789,7 +878,7 @@ def _cmd_init(
             )
         pad = " " * _KV_LABEL_WIDTH
         print(
-            f"{_kv_line('Next', f'1. Add 1 Stage 1 speech recognition API key in {env_path}:')}\n"
+            f"{_kv_line('Next', f'1. Add 1 Stage 1 speech recognition API key in {cred_target_label}:')}\n"
             f"{pad}   - Mainland China: DASHSCOPE_API_KEY (Bailian) or DEEPSEEK_API_KEY\n"
             f"{pad}   - Global:         OPENAI_API_KEY or GEMINI_API_KEY\n"
             f"{pad}2. Verify & start: agent-voice-input doctor{cfg_flag} --ping && agent-voice-input start{cfg_flag}"
@@ -1008,7 +1097,7 @@ def _probe_stage_ping(
             out = (
                 "FAIL",
                 ms,
-                f"FAIL (HTTP {resp.status} unauthorized, {ms}ms; check API key in agent-voice-input.env)",
+                f"FAIL (HTTP {resp.status} unauthorized, {ms}ms; check API key in ~/.agent-voice-input/.env)",
             )
         else:
             excerpt = redact_secrets(resp.text().strip(), env, cfg=cfg, extra_secrets=extra_sec)[:140]
@@ -1212,6 +1301,8 @@ class _DoctorState:
     pipeline: dict[str, Any] = dataclasses.field(default_factory=dict)
     ping_results: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
     hooks_report: dict[str, Any] = dataclasses.field(default_factory=dict)
+    hotwords_report: dict[str, Any] = dataclasses.field(default_factory=dict)
+    migration_hint: str = ""
 
     def clean(self, text: str) -> str:
         from .config import redact_secrets
@@ -1230,12 +1321,55 @@ class _DoctorState:
         self.emit(f"            Fix: {safe_fix}")
 
 
+def _inspect_hotwords_path_info(hw_path: Path) -> dict[str, Any]:
+    """Inspect ``personal.txt`` and its ``hotwords/`` parent directory symlink/realpath metadata."""
+    hw_dir = hw_path.parent
+    dir_is_symlink = False
+    dir_symlink_target = ""
+    try:
+        st_dir = os.lstat(hw_dir)
+        dir_is_symlink = stat.S_ISLNK(st_dir.st_mode)
+        if dir_is_symlink:
+            dir_symlink_target = os.readlink(hw_dir)
+    except OSError:
+        pass
+    try:
+        dir_realpath = os.path.realpath(str(hw_dir))
+    except OSError:
+        dir_realpath = str(hw_dir)
+    try:
+        file_realpath = os.path.realpath(str(hw_path))
+    except OSError:
+        file_realpath = str(hw_path)
+    file_exists = False
+    file_is_symlink = False
+    try:
+        st_file = os.lstat(hw_path)
+        file_is_symlink = stat.S_ISLNK(st_file.st_mode)
+        file_exists = stat.S_ISREG(st_file.st_mode)
+    except OSError:
+        pass
+    return {
+        "path": _recover_utf8_surrogates(str(hw_path)),
+        "realpath": _recover_utf8_surrogates(file_realpath),
+        "exists": file_exists,
+        "file_is_symlink": file_is_symlink,
+        "dir": _recover_utf8_surrogates(str(hw_dir)),
+        "dir_is_symlink": dir_is_symlink,
+        "dir_symlink_target": _recover_utf8_surrogates(dir_symlink_target),
+        "dir_realpath": _recover_utf8_surrogates(dir_realpath),
+    }
+
+
 def _doctor_check_env_and_ffmpeg(st: _DoctorState) -> None:
     from .audio_proc import resolve_ffmpeg_bin
-    from .config import default_env_file_candidates
+    from .config import default_env_file_candidates, detect_legacy_config_migration_hint
 
     st.emit(f"[python]    OK ({sys.version.split()[0]}, runtime={st.rt_dir})")
     st.emit(f"[config]    {st.cfg.config_path or 'defaults (no config.toml)'}")
+    if mig_hint := detect_legacy_config_migration_hint(st.env):
+        st.migration_hint = mig_hint
+        st.emit(f"[migrate]   INFO {mig_hint}")
     seen_env_inodes: set[tuple[int, int]] = set()
     for cand_env in default_env_file_candidates(st.env, config_path=st.cfg.config_path or None):
         try:
@@ -1544,8 +1678,124 @@ def _doctor_check_asr(st: _DoctorState) -> None:
         st.emit_fix(
             f"{init_prefix}set DASHSCOPE_API_KEY / DEEPSEEK_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY "
             "(or DOUBAO_SPEECH_API_KEY / OPENROUTER_API_KEY) "
-            "in ~/.config/agent-voice-input/agent-voice-input.env"
+            "in ~/.agent-voice-input/.env"
         )
+
+
+def _doctor_check_hotwords(st: _DoctorState) -> None:
+    from .hotwords import (
+        HOTWORDS_MAX_BYTES,
+        HOTWORDS_MAX_ENTRIES,
+        STAGE2_HOTWORDS_MAX_CHARS,
+        STAGE2_HOTWORDS_MAX_ITEMS,
+        load_hotwords_table,
+        resolve_personal_hotwords_path,
+        summarize_stage2_hotwords_budget,
+    )
+
+    hw_path = resolve_personal_hotwords_path(env=st.env)
+    if hw_path is None:
+        st.hotwords_report = {
+            "path": "",
+            "exists": False,
+            "dir_is_symlink": False,
+            "dir_realpath": "",
+            "counts": {
+                "total": 0,
+                "kept": 0,
+                "dropped_count": 0,
+                "used_chars": 0,
+                "max_items": STAGE2_HOTWORDS_MAX_ITEMS,
+                "max_chars": STAGE2_HOTWORDS_MAX_CHARS,
+                "warnings_count": 0,
+            },
+            "issues": {},
+        }
+        st.emit("[hotwords]  none (HOME and AGENT_VOICE_INPUT_HOME unset)")
+        return
+
+    path_info = _inspect_hotwords_path_info(hw_path)
+    table = load_hotwords_table(hw_path, env=st.env, use_cache=False, strict_encoding=False)
+    s2 = summarize_stage2_hotwords_budget(table)
+    safe_counts = s2.as_safe_counts_dict()
+    file_symlink_rejected = any("symlink" in w.lower() for w in table.file_warnings)
+    # Privacy guardrail: only integer counters, line numbers, and category flags enter doctor JSON/lines
+    # (never emit hotword terms, aliases, or dropped vocabulary text).
+    issues: dict[str, Any] = {
+        "encoding_error": bool(table.encoding_error),
+        "file_warnings_count": len(table.file_warnings),
+        "file_symlink_rejected": file_symlink_rejected,
+        "size_limit_exceeded": bool(table.size_limit_exceeded),
+        "entry_limit_exceeded": bool(table.entry_limit_exceeded),
+        "conflict_lines": list(table.conflict_lines),
+        "legacy_sections_count": len(table.legacy_sections),
+        "ambiguous_aliases_count": len(table.ambiguous_aliases),
+        "alias_warnings_count": len(table.alias_warnings),
+        "invalid_lines_count": len(table.invalid_lines),
+        "stage2_truncated": bool(s2.truncated),
+    }
+    st.hotwords_report = {
+        "path": path_info["path"],
+        "exists": bool(table.exists),
+        "dir_is_symlink": bool(path_info["dir_is_symlink"]),
+        "dir_realpath": path_info["dir_realpath"] if path_info["dir_is_symlink"] else "",
+        "counts": safe_counts,
+        "issues": issues,
+    }
+
+    sym_note = f" (symlink -> {path_info['dir_realpath']})" if path_info["dir_is_symlink"] else ""
+    warn_parts: list[str] = []
+    if table.encoding_error:
+        warn_parts.append("non-UTF-8 encoding")
+    if file_symlink_rejected:
+        warn_parts.append("personal.txt is a symlink (symlink hotwords/ dir instead)")
+    elif table.file_warnings:
+        warn_parts.append(f"{len(table.file_warnings)} file warning(s)")
+    if table.size_limit_exceeded:
+        warn_parts.append(f"exceeded {HOTWORDS_MAX_BYTES // 1024} KiB limit")
+    if table.entry_limit_exceeded:
+        warn_parts.append(
+            f"exceeded {HOTWORDS_MAX_ENTRIES} entries limit ({table.total_valid_entries})"
+        )
+    if table.conflict_lines:
+        ln_csv = ",".join(str(ln) for ln in table.conflict_lines[:5])
+        warn_parts.append(f"{len(table.conflict_lines)} git conflict block(s) at line(s) {ln_csv}")
+    if table.legacy_sections:
+        warn_parts.append(f"{len(table.legacy_sections)} legacy [section] header(s)")
+    if table.ambiguous_aliases:
+        warn_parts.append(f"{len(table.ambiguous_aliases)} ambiguous alias(es)")
+    if table.alias_warnings:
+        warn_parts.append(f"{len(table.alias_warnings)} alias conflict(s)")
+    if table.invalid_lines:
+        warn_parts.append(f"{len(table.invalid_lines)} invalid line(s)")
+    if s2.dropped_count > 0:
+        warn_parts.append(f"stage2 overflow ({s2.dropped_count} dropped)")
+
+    if warn_parts:
+        st.emit(
+            f"[hotwords]  WARN {hw_path}{sym_note} "
+            f"(total={safe_counts['total']}, stage2={safe_counts['kept']}/{safe_counts['max_items']}, "
+            f"dropped={safe_counts['dropped_count']}; {'; '.join(warn_parts)})"
+        )
+        if file_symlink_rejected:
+            st.emit_fix(
+                "replace the personal.txt symlink with a regular file or symlink the hotwords/ directory instead, "
+                "then run 'agent-voice-input hotwords list'"
+            )
+        elif table.encoding_error:
+            st.emit_fix(f"re-save {hw_path} as UTF-8, then run 'agent-voice-input hotwords list'")
+        else:
+            st.emit_fix(
+                "run 'agent-voice-input hotwords list' to inspect and resolve hotwords warnings or overflow"
+            )
+    elif table.exists:
+        st.emit(
+            f"[hotwords]  OK {hw_path}{sym_note} "
+            f"(total={safe_counts['total']}, stage2={safe_counts['kept']}/{safe_counts['max_items']}, "
+            f"{safe_counts['used_chars']}/{safe_counts['max_chars']} chars)"
+        )
+    else:
+        st.emit(f"[hotwords]  OK {hw_path}{sym_note} (not created yet; optional)")
 
 
 def _doctor_check_daemon_and_session(st: _DoctorState) -> None:
@@ -1712,7 +1962,7 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
                 f"[refiner]   FAIL {prov_disp} (model={st.eff_ref_model}, api={eff_ref_api}, "
                 f"effort={eff_ref_effort}{prompt_tag}) -> {auth_note}"
             )
-            st.emit_fix("run 'codex login' or set DEEPSEEK_API_KEY / DASHSCOPE_API_KEY in agent-voice-input.env")
+            st.emit_fix("run 'codex login' or set DEEPSEEK_API_KEY / DASHSCOPE_API_KEY in ~/.agent-voice-input/.env")
             st.ok_all = False
         st.emit(f"[pipeline]  {st.pipeline['summary']}")
         return
@@ -1752,7 +2002,7 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
     else:
         st.ok_all = False
         if cfg.refiner.api_key_env.strip():
-            st.emit_fix(f"set {cfg.refiner.api_key_env.strip()} in agent-voice-input.env")
+            st.emit_fix(f"set {cfg.refiner.api_key_env.strip()} in ~/.agent-voice-input/.env")
         else:
             st.emit_fix(_missing_key_hint(st.resolved_ref_prov, stage="refiner"))
     st.emit(f"[pipeline]  {st.pipeline['summary']}")
@@ -1894,12 +2144,14 @@ def _doctor_emit_json_report(st: _DoctorState, *, include_ping: bool) -> None:
             else None
         ),
         "hooks": st.hooks_report,
+        "hotwords": st.hotwords_report,
+        "migration_hint": st.migration_hint,
         "fixes": st.fixes,
         "lines": st.lines_out,
     }
     if include_ping:
         report["ping"] = st.ping_results
-    print(json.dumps(_redact_json_obj(report), ensure_ascii=False, indent=2))
+    print(_json_dumps_stdout(_redact_json_obj(report), indent=2))
 
 
 def _format_doctor_next_line(st: _DoctorState) -> str:
@@ -1947,6 +2199,7 @@ def _cmd_doctor(
     _doctor_check_env_and_ffmpeg(st)
     _doctor_check_platform(st)
     _doctor_check_asr(st)
+    _doctor_check_hotwords(st)
     _doctor_check_daemon_and_session(st)
     _doctor_check_remote_ssh(st)
     _doctor_check_refiner(st)
@@ -2684,25 +2937,39 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
     from .config import ConfigError, explain_pipeline_selection, resolve_credentials
     from .hotwords import (
         MAINSTREAM_QUOTA_PROVIDERS,
-        VALID_HOTWORD_SCOPES,
         add_hotwords,
         budget_hotwords_for_provider,
         format_budget_line,
         format_stage2_budget_line,
         load_hotwords_table,
+        order_stage2_entries,
+        project_stage1_hotwords,
         remove_hotwords,
-        resolve_hotwords_path,
-        summarize_hotwords_budgets,
-        summarize_stage2_hotwords_budgets,
+        resolve_hotwords_quota_spec,
+        resolve_personal_hotwords_path,
+        summarize_stage2_hotwords_budget,
     )
+    from .llm_common import AsrContext
 
     action = str(getattr(args, "hotwords_action", "") or "").strip().lower()
     as_json = bool(getattr(args, "as_json", False))
-    hw_path = resolve_hotwords_path(cfg.asr.hotwords_file, env=env)
+    hw_path = resolve_personal_hotwords_path(env=env)
     if hw_path is None:
         raise ConfigError(
-            "asr.hotwords_file is empty; set a file path in config.toml before managing hotwords"
+            "cannot resolve personal hotwords path: HOME and AGENT_VOICE_INPUT_HOME are unset"
         )
+
+    if action == "path":
+        path_info = _inspect_hotwords_path_info(hw_path)
+        if as_json:
+            print(_json_dumps_stdout(path_info, indent=2))
+            return 0
+        print(path_info["path"])
+        if path_info["dir_is_symlink"]:
+            print(f"hotwords/ symlink -> {path_info['dir_realpath']}")
+        elif path_info["realpath"] != path_info["path"]:
+            print(f"realpath -> {path_info['realpath']}")
+        return 0
 
     creds = resolve_credentials(cfg, env)
     asr_info = explain_pipeline_selection(cfg, creds, env)["asr"]
@@ -2711,129 +2978,158 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
     eff_asr_api = str(asr_info["api"])
     eff_asr_url = cfg.asr.effective_base_url(eff_asr)
 
-    def _scene_label(sc: str) -> str:
-        return "global" if sc == "global" else f"{sc}+global"
-
     if action == "list":
-        scope_filter = str(getattr(args, "scope", "all") or "all").strip().lower()
+        path_info = _inspect_hotwords_path_info(hw_path)
         table = load_hotwords_table(hw_path, env=env, use_cache=False, strict_encoding=True)
-        if scope_filter == "all":
-            budgets = summarize_hotwords_budgets(
-                table.global_terms,
-                {"chat": table.chat_terms, "coding": table.coding_terms},
-                active_provider=eff_asr,
-                active_model=eff_asr_model,
-                active_api=eff_asr_api,
-                active_base_url=eff_asr_url,
-            )
-            display_scopes: tuple[str, ...] = VALID_HOTWORD_SCOPES
-            ref_scene = str(budgets["reference_scene"])
-            ref_terms = table.merged_for_scene(ref_scene)
-        elif scope_filter == "global":
-            budgets = summarize_hotwords_budgets(
-                table.global_terms,
-                None,
-                active_provider=eff_asr,
-                active_model=eff_asr_model,
-                active_api=eff_asr_api,
-                active_base_url=eff_asr_url,
-            )
-            display_scopes = ("global",)
-            ref_scene = "global"
-            ref_terms = table.merged_for_scene("global")
-        else:
-            budgets = summarize_hotwords_budgets(
-                table.global_terms,
-                table.terms_for_scope(scope_filter),
-                active_provider=eff_asr,
-                active_model=eff_asr_model,
-                active_api=eff_asr_api,
-                active_base_url=eff_asr_url,
-            )
-            display_scopes = (scope_filter,)
-            ref_scene = scope_filter
-            ref_terms = table.merged_for_scene(scope_filter)
+        ordered_entries = order_stage2_entries(table.entries)
+        stage1_terms = table.stage1_terms
+        pinned_count = sum(1 for e in ordered_entries if e.pinned)
+        aliased_count = sum(1 for e in ordered_entries if e.aliases)
 
-        stage2_budgets = summarize_stage2_hotwords_budgets(table)
+        ctx_general = AsrContext(
+            mode="general",
+            personal_hotwords=stage1_terms,
+            hotwords_bucketed=True,
+        )
+        active_general = project_stage1_hotwords(
+            ctx_general,
+            eff_asr,
+            model=eff_asr_model,
+            api=eff_asr_api,
+            base_url=eff_asr_url,
+        )
+        spec = resolve_hotwords_quota_spec(
+            eff_asr,
+            model=eff_asr_model,
+            api=eff_asr_api,
+            base_url=eff_asr_url,
+        )
+        dyn_reserve = 0 if spec.max_terms < 3 else (spec.max_terms * 3 + 9) // 10
+        p_term_cap = max(0, spec.max_terms - dyn_reserve)
+        p_char_cap = int(spec.max_chars * 0.70) if spec.max_chars is not None else None
+        active_agent_sim = budget_hotwords_for_provider(
+            stage1_terms,
+            eff_asr,
+            model=eff_asr_model,
+            api=eff_asr_api,
+            base_url=eff_asr_url,
+            max_terms=p_term_cap,
+            max_chars=p_char_cap,
+        )
+        provider_budgets = {
+            prov: budget_hotwords_for_provider(stage1_terms, prov)
+            for prov in MAINSTREAM_QUOTA_PROVIDERS
+        }
+        stage2_summary = summarize_stage2_hotwords_budget(table)
+        diag_warnings = table.diagnostic_warnings()
 
         if as_json:
-            all_entries = table.as_entries_dict()
             payload: dict[str, Any] = {
-                "path": str(hw_path),
+                "path": path_info["path"],
+                "realpath": path_info["realpath"],
                 "exists": table.exists,
-                "scope": scope_filter,
+                "dir_is_symlink": path_info["dir_is_symlink"],
+                "dir_realpath": path_info["dir_realpath"],
                 "active_asr": {
                     "provider": eff_asr,
                     "model": eff_asr_model,
                     "api": eff_asr_api,
                 },
-                "scopes": {sc: list(table.terms_for_scope(sc)) for sc in display_scopes},
-                "entries": {sc: all_entries[sc] for sc in display_scopes},
-                "mounted": {sc: table.merged_for_scene(sc) for sc in display_scopes},
-                "budgets": budgets,
-                "stage2_budget": {
-                    mode: summary.as_dict() for mode, summary in stage2_budgets.items()
+                "counts": {
+                    "total": len(ordered_entries),
+                    "pinned": pinned_count,
+                    "with_aliases": aliased_count,
+                    "warnings": table.warnings_count,
+                },
+                "terms": [e.term for e in ordered_entries],
+                "stage1_terms": list(stage1_terms),
+                "entries": [
+                    {"term": e.term, "aliases": list(e.aliases), "pinned": e.pinned}
+                    for e in ordered_entries
+                ],
+                "stage1_budgets": {
+                    "active_general": active_general.as_dict(),
+                    "active_agent_70_30": {
+                        **active_agent_sim.as_dict(),
+                        "dynamic_reserve_terms": dyn_reserve,
+                        "personal_term_cap": p_term_cap,
+                        "personal_char_cap": p_char_cap,
+                    },
+                    "providers": {prov: res.as_dict() for prov, res in provider_budgets.items()},
+                },
+                "stage2_budget": stage2_summary.as_dict(),
+                "diagnostics": {
+                    "warnings_count": table.warnings_count,
+                    "warnings": diag_warnings,
+                    "conflict_lines": list(table.conflict_lines),
+                    "legacy_sections": list(table.legacy_sections),
+                    "ambiguous_aliases": [a.as_dict() for a in table.ambiguous_aliases],
+                    "invalid_lines": [i.as_dict() for i in table.invalid_lines],
+                    "alias_warnings": list(table.alias_warnings),
+                    "file_warnings": list(table.file_warnings),
+                    "size_limit_exceeded": table.size_limit_exceeded,
+                    "entry_limit_exceeded": table.entry_limit_exceeded,
+                    "total_valid_entries": table.total_valid_entries,
                 },
             }
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            print(_json_dumps_stdout(payload, indent=2))
             return 0
 
         status_lbl = "exists" if table.exists else "not created yet"
-        print(f"Hotwords file: {hw_path} ({status_lbl})")
+        print(f"Hotwords file: {path_info['path']} ({status_lbl})")
+        if path_info["dir_is_symlink"]:
+            print(f"Hotwords dir:  {path_info['dir']} -> {path_info['dir_realpath']}")
+        elif path_info["realpath"] != path_info["path"]:
+            print(f"Resolved path: {path_info['realpath']}")
         print(f"Active ASR:    {eff_asr}/{eff_asr_model} (api={eff_asr_api})")
-        for sc in display_scopes:
-            sc_entries = table.entries_for_scope(sc)
-            mount_note = (
-                f"; mounts {sc}+global={len(table.merged_for_scene(sc))} terms"
-                if sc != "global"
-                else ""
-            )
-            print(f"\n[{sc}] ({len(sc_entries)} terms{mount_note})")
-            if sc_entries:
-                for entry in sc_entries:
-                    print(f"  {entry.format_line()}")
-            else:
-                print("  (empty)")
+        print(
+            f"\nPersonal hotwords ({len(ordered_entries)} total, "
+            f"{pinned_count} pinned, {aliased_count} with aliases):"
+        )
+        if ordered_entries:
+            for entry in ordered_entries:
+                print(f"  {entry.format_line()}")
+        else:
+            print("  (empty)")
 
-        print("\nProvider quotas (manual hotwords before dynamic session/workspace terms):")
-        for sc in display_scopes:
-            active_res = budget_hotwords_for_provider(
-                table.merged_for_scene(sc),
-                eff_asr,
-                model=eff_asr_model,
-                api=eff_asr_api,
-                base_url=eff_asr_url,
-            )
-            print(f"  [active] {format_budget_line(active_res, name=f'{eff_asr} ({_scene_label(sc)})')}")
-        print(f"  Mainstream reference ({_scene_label(ref_scene)}, {len(ref_terms)} manual terms):")
+        print(f"\nStage 1 ASR quotas (active route: {eff_asr}/{eff_asr_model}, api={eff_asr_api}):")
+        print(f"  [general 100% personal] {format_budget_line(active_general, name=eff_asr)}")
+        print(
+            f"  [agent 70%/30% sim]     {format_budget_line(active_agent_sim, name=eff_asr)} "
+            f"(dynamic reserve={dyn_reserve} terms; unused slots backfill personal)"
+        )
+        print(f"  Mainstream reference ({len(stage1_terms)} personal terms):")
         for prov in MAINSTREAM_QUOTA_PROVIDERS:
-            ref_res = budget_hotwords_for_provider(ref_terms, prov)
-            print(f"    {format_budget_line(ref_res, name=prov)}")
-        print("\nStage 2 / Single-hop wide vocabulary budget (includes '<-' aliases):")
-        for mode in ("agent", "general"):
-            print(f"  {format_stage2_budget_line(stage2_budgets[mode])}")
+            print(f"    {format_budget_line(provider_budgets[prov], name=prov)}")
 
-        is_empty = not (table.global_terms or table.chat_terms or table.coding_terms)
+        print("\nStage 2 / Single-hop wide vocabulary budget (includes '<-' aliases):")
+        print(f"  {format_stage2_budget_line(stage2_summary)}")
+
+        if diag_warnings:
+            print(f"\n[Diagnostics] ({len(diag_warnings)} warning(s)):")
+            for warn_msg in diag_warnings:
+                print(f"  WARN {warn_msg}")
+
         print()
         if not table.exists:
             print(
-                "Tip: run 'agent-voice-input hotwords add <term> [--alias a1,a2] [--scope global|chat|coding]' to create it."
+                "Tip: run 'agent-voice-input hotwords add <term> [--pin] [--alias a1,a2]' to create it."
             )
-        if is_empty:
+        if not ordered_entries:
             print(
                 "Agent tip: paste into Claude Code / Codex / AGY -> "
                 '"Read my recent projects & README/specs, draft a clean hotwords list for '
-                '~/.config/agent-voice-input/hotwords.txt, show the diff first, and write after I confirm."'
+                '~/.agent-voice-input/hotwords/personal.txt, show the diff first, and write after I confirm."'
             )
         else:
             print(
-                "Tip: ask your coding agent to bootstrap, add aliases, or tidy your hotwords (see README -> Hotwords)."
+                "Tip: ask your coding agent to bootstrap, pin (!), add aliases (<-), or tidy your hotwords (see README -> Hotwords)."
             )
         return 0
 
     raw_terms = list(getattr(args, "terms", ()) or ())
     raw_aliases = list(getattr(args, "alias", ()) or ())
-    scope = str(getattr(args, "scope", "global") or "global").strip().lower()
+    pin = bool(getattr(args, "pin", False))
     if action == "add" and raw_aliases and len(raw_terms) != 1:
         raise ConfigError(
             "--alias can only be used when adding a single canonical hotword term "
@@ -2841,39 +3137,33 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
         )
     try:
         if action == "add":
-            edit_res = add_hotwords(hw_path, raw_terms, scope=scope, aliases=raw_aliases)
+            edit_res = add_hotwords(hw_path, raw_terms, aliases=raw_aliases, pin=pin, env=env)
         elif action == "remove":
-            edit_res = remove_hotwords(hw_path, raw_terms, scope=scope)
+            edit_res = remove_hotwords(hw_path, raw_terms, env=env)
         else:  # pragma: no cover - guarded by argparse required subparser
             raise ConfigError(f"unsupported hotwords action: {action!r}")
     except ValueError as exc:
         raise ConfigError(str(exc)) from None
 
     table_after = load_hotwords_table(hw_path, env=env, use_cache=False)
-    eval_scene = (
-        max(
-            ("coding", "chat", "global"),
-            key=lambda s: (len(table_after.merged_for_scene(s)), sum(len(w) for w in table_after.merged_for_scene(s))),
-        )
-        if scope == "all"
-        else scope
-    )
     active_budget = budget_hotwords_for_provider(
-        table_after.merged_for_scene(eval_scene),
+        table_after.stage1_terms,
         eff_asr,
         model=eff_asr_model,
         api=eff_asr_api,
         base_url=eff_asr_url,
     )
+    stage2_after = summarize_stage2_hotwords_budget(table_after)
 
+    display_edit_path = _recover_utf8_surrogates(str(edit_res.path))
     if as_json:
         out_obj: dict[str, Any] = {
             "action": action,
-            "path": str(edit_res.path),
-            "scope": edit_res.scope,
+            "path": display_edit_path,
             "changed": edit_res.changed,
             "added": list(edit_res.added),
             "updated": list(edit_res.updated),
+            "pinned": list(edit_res.pinned),
             "aliases_added": list(edit_res.aliases_added),
             "skipped": list(edit_res.skipped),
             "removed": list(edit_res.removed),
@@ -2883,28 +3173,32 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
                 "provider": eff_asr,
                 "model": eff_asr_model,
                 "api": eff_asr_api,
-                "scene": _scene_label(eval_scene),
                 "budget": active_budget.as_dict(),
             },
+            "stage2_budget": stage2_after.as_dict(),
         }
-        print(json.dumps(out_obj, ensure_ascii=False, indent=2))
+        print(_json_dumps_stdout(out_obj, indent=2))
         return 0
 
-    print(f"Hotwords file: {edit_res.path} (scope={edit_res.scope})")
+    print(f"Hotwords file: {display_edit_path}")
     if action == "add":
         if edit_res.added:
+            pin_tag = " (pinned)" if pin else ""
             if edit_res.aliases_added:
                 print(
                     f"Added ({len(edit_res.added)}):   {', '.join(edit_res.added)} "
-                    f"<- {', '.join(edit_res.aliases_added)}"
+                    f"<- {', '.join(edit_res.aliases_added)}{pin_tag}"
                 )
             else:
-                print(f"Added ({len(edit_res.added)}):   {', '.join(edit_res.added)}")
+                print(f"Added ({len(edit_res.added)}):   {', '.join(edit_res.added)}{pin_tag}")
         if edit_res.updated:
-            print(
-                f"Updated ({len(edit_res.updated)}): {', '.join(edit_res.updated)} "
-                f"(+aliases: {', '.join(edit_res.aliases_added)})"
-            )
+            upd_parts: list[str] = []
+            if edit_res.pinned:
+                upd_parts.append("+pinned")
+            if edit_res.aliases_added:
+                upd_parts.append(f"+aliases: {', '.join(edit_res.aliases_added)}")
+            upd_note = f" ({', '.join(upd_parts)})" if upd_parts else ""
+            print(f"Updated ({len(edit_res.updated)}): {', '.join(edit_res.updated)}{upd_note}")
         if edit_res.skipped:
             print(f"Skipped ({len(edit_res.skipped)}): {', '.join(edit_res.skipped)} (already present)")
         for warn in edit_res.warnings:
@@ -2914,7 +3208,8 @@ def _cmd_hotwords(args: argparse.Namespace, cfg: Config, env: dict[str, str]) ->
             print(f"Removed ({len(edit_res.removed)}):   {', '.join(edit_res.removed)}")
         if edit_res.not_found:
             print(f"Not found ({len(edit_res.not_found)}): {', '.join(edit_res.not_found)}")
-    print(f"Active ASR quota ({_scene_label(eval_scene)}): {format_budget_line(active_budget, name=eff_asr)}")
+    print(f"Active ASR quota (general 100%): {format_budget_line(active_budget, name=eff_asr)}")
+    print(f"Stage 2 budget: {format_stage2_budget_line(stage2_after)}")
     return 0
 
 
@@ -2928,12 +3223,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="subcmd", required=True)
     p_init = sub.add_parser(
         "init",
-        help="Initialize 0600 config.toml and commented agent-voice-input.env",
+        help="Initialize ~/.agent-voice-input/ (0600 config.toml, commented .env, and whitelist .gitignore)",
     )
     p_init.add_argument(
         "--config",
         default=argparse.SUPPRESS,
-        help="Target config.toml path (default: ~/.config/agent-voice-input/config.toml)",
+        help="Target config.toml path (default: ~/.agent-voice-input/config.toml)",
     )
     p_init.add_argument(
         "--asr",
@@ -3091,25 +3386,31 @@ def _build_parser() -> argparse.ArgumentParser:
     p_retry.add_argument("--title", help="Optional window title override for session matching")
     p_hw = sub.add_parser(
         "hotwords",
-        help="Manage layered hotwords & '<-' mishearing aliases (list, add [--alias], remove) and inspect Stage 1/2 budgets",
+        help="Manage personal hotwords & '<-' mishearing aliases (path, list, add [--pin] [--alias], remove) and inspect Stage 1/2 budgets",
         description=(
-            "Manage layered plain-text hotwords (~/.config/agent-voice-input/hotwords.txt) with optional "
-            "'CanonicalTerm <- mishearing1, mishearing2' aliases (add --alias) and inspect Stage 1/2 budgets."
+            "Manage flat personal hotwords (~/.agent-voice-input/hotwords/personal.txt) with optional "
+            "'!' pinning and 'CanonicalTerm <- mishearing1, mishearing2' aliases (add --pin --alias), "
+            "and inspect Stage 1/2 budgets."
         ),
     )
     _add_common_flags(p_hw, is_sub=True)
     hw_sub = p_hw.add_subparsers(dest="hotwords_action", required=True)
+    p_hw_path = hw_sub.add_parser(
+        "path",
+        help="Print personal.txt absolute path and hotwords/ symlink realpath info",
+    )
+    _add_common_flags(p_hw_path, is_sub=True)
+    p_hw_path.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit structured JSON output",
+    )
     p_hw_list = hw_sub.add_parser(
         "list",
-        help="Show hotwords file path, scoped entries (with '<-' aliases), and Stage 1/2 budget usage",
+        help="Show personal hotwords (with '!' pins and '<-' aliases), Stage 1/2 budgets, and diagnostics",
     )
     _add_common_flags(p_hw_list, is_sub=True)
-    p_hw_list.add_argument(
-        "--scope",
-        choices=("all", "global", "chat", "coding"),
-        default="all",
-        help="Filter displayed scope (default: all)",
-    )
     p_hw_list.add_argument(
         "--json",
         action="store_true",
@@ -3118,7 +3419,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_hw_add = hw_sub.add_parser(
         "add",
-        help="Add hotword(s) to a scope (default: global), optionally with '<-' mishearing aliases (--alias)",
+        help="Add or update personal hotword(s), optionally pinned (--pin) or with '<-' mishearing aliases (--alias)",
     )
     _add_common_flags(p_hw_add, is_sub=True)
     p_hw_add.add_argument(
@@ -3127,16 +3428,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="One or more canonical hotwords or phrases to add (pass a single term when using --alias)",
     )
     p_hw_add.add_argument(
+        "--pin",
+        action="store_true",
+        default=False,
+        help="Pin hotword(s) with '!' prefix for top Stage 1/2 priority (upgrades existing entries in place)",
+    )
+    p_hw_add.add_argument(
         "--alias",
         action="append",
         default=[],
         help="Comma-separated ASR mishearing alias(es) for a single canonical term (repeatable, max 5 total; e.g. --alias '哈尼斯,哈尼思')",
-    )
-    p_hw_add.add_argument(
-        "--scope",
-        choices=("global", "chat", "coding"),
-        default="global",
-        help="Target scope section (default: global)",
     )
     p_hw_add.add_argument(
         "--json",
@@ -3146,16 +3447,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_hw_rm = hw_sub.add_parser(
         "remove",
-        help="Remove one or more hotwords from a scope (default: global; use 'all' for all scopes)",
+        help="Remove one or more personal hotwords (removes all duplicate lines matching case-insensitively)",
     )
     _add_common_flags(p_hw_rm, is_sub=True)
     p_hw_rm.add_argument("terms", nargs="+", help="One or more hotwords or phrases to remove")
-    p_hw_rm.add_argument(
-        "--scope",
-        choices=("global", "chat", "coding", "all"),
-        default="global",
-        help="Target scope section to remove from (default: global)",
-    )
     p_hw_rm.add_argument(
         "--json",
         action="store_true",
@@ -3191,6 +3486,28 @@ def _recover_utf8_surrogates(token: str) -> str:
         return token.encode("utf-8", errors="surrogateescape").decode("utf-8")
     except UnicodeDecodeError:
         return token
+
+
+def _json_dumps_stdout(obj: Any, *, indent: int | None = None) -> str:
+    """Serialize JSON for stdout without corrupting non-ASCII text under non-UTF-8 stream encodings."""
+    out_enc = _normalize_enc_name(getattr(sys.stdout, "encoding", ""))
+    use_ascii = bool(out_enc) and out_enc not in ("utf-8", "utf8")
+    return json.dumps(obj, ensure_ascii=use_ascii, indent=indent)
+
+
+def _load_env_for_redaction(
+    env: Mapping[str, str] | None,
+    *,
+    load_env_files_fn: Any,
+    config_error_cls: type[Exception],
+) -> Mapping[str, str]:
+    """Return an env mapping for error redaction without re-raising ConfigError/OSError."""
+    if env is not None:
+        return env
+    try:
+        return load_env_files_fn()
+    except (OSError, config_error_cls):
+        return dict(os.environ)
 
 
 def _configure_posix_ascii_stdio(env: Mapping[str, str] | None = None) -> None:
@@ -3267,11 +3584,11 @@ def main(argv: list[str] | None = None) -> int:
                 hotkey=getattr(args, "hotkey", None),
             )
         except ConfigError as exc:
-            eff_env = load_env_files()
+            eff_env = _load_env_for_redaction(None, load_env_files_fn=load_env_files, config_error_cls=ConfigError)
             print(f"config error: {redact_secrets(str(exc), eff_env)}", file=sys.stderr)
             return 2
         except Exception as exc:
-            eff_env = load_env_files()
+            eff_env = _load_env_for_redaction(None, load_env_files_fn=load_env_files, config_error_cls=ConfigError)
             print(f"error: {redact_secrets(str(exc), eff_env)}", file=sys.stderr)
             return 1
     ov = {
@@ -3418,11 +3735,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     except ConfigError as exc:
-        eff_env = env if env is not None else load_env_files()
+        eff_env = _load_env_for_redaction(env, load_env_files_fn=load_env_files, config_error_cls=ConfigError)
         print(f"config error: {redact_secrets(str(exc), eff_env, cfg=cfg)}", file=sys.stderr)
         return 2
     except Exception as exc:
-        eff_env = env if env is not None else load_env_files()
+        eff_env = _load_env_for_redaction(env, load_env_files_fn=load_env_files, config_error_cls=ConfigError)
         print(f"error: {redact_secrets(str(exc), eff_env, cfg=cfg)}", file=sys.stderr)
         return 1
     return 0

@@ -19,9 +19,10 @@
   - 坚持**纯文本输出 + `<asr_draft_to_clean>` / `<task_reminder>` 三明治指令边界**。
 - **精修提示词治理：现阶段坚持维护一套统一提示词**：
   - 所有精修渠道与模型共用同一套提示词真身，避免多套提示词漂移带来的维护与回归成本；按单模型分叉专属提示词仅作备选预案，启用前须经维护者明确批准。
-- **热词体系聚焦确定性提取，绝不让未确认的单次精修猜测直写持久化 `hotwords.txt`**：
-  - 未经确认的模型猜词一旦误判写入持久化词表，会形成“脏词声学偏置 → 后续识别持续带偏”的自激污染闭环，并挤占豆包 ASR 等窄配额渠道预算（`30 词 / 180 字符`）。
-  - 坚持通过确定性标识符提取、工作区源码/文件名兜底与低优先级内置词表覆盖高频术语。
+- **统一家目录底座与个人热词存储/投影解耦，绝不让未确认的单次精修猜测直写持久化 `hotwords/personal.txt`**：
+  - 配置、凭据、个人热词与录音归档统一收敛于 `~/.agent-voice-input/`（受 `AGENT_VOICE_INPUT_HOME` 覆盖，支持 `hotwords/` 目录软链同步与默认全忽略仅放行 `hotwords/` 的 `.gitignore`）；个人热词采用扁平单文件 `hotwords/personal.txt`（支持 `!` 置顶与 `<-` 误听别名），与运行期双轨投影（Stage 1 权重分层保行序 + 30% 动态词保底、Stage 2 块 0 确定性排序保前缀缓存）解耦。
+  - 未经确认的模型猜词一旦误判写入持久化词表，会形成“脏词声学偏置 → 后续识别持续带偏”的自激污染闭环，并挤占豆包 ASR 等窄配额渠道预算（`50 词 / 500 字符`）。
+  - 坚持通过人工/CLI 确认维护个人词表，并配合确定性标识符提取、工作区源码/文件名兜底与低优先级内置词表覆盖高频术语。
 - **桌面 GUI 适配抓大放小，不碰编辑器私有状态库与无障碍 DOM 抓取**：
   - 仅复用前台窗口进程/Bundle ID、窗口标题、macOS `AXDocument` 文档路径、同构明文会话日志及 AGY/Codex 只读会话索引获取上下文与热词。
   - **明确不做**：不读取 VS Code / Cursor 运行期持锁且表结构易变的内部 SQLite（`state.vscdb`），防锁竞争与版本升级断裂；不对桌面版 AI 聊天、IM 或浏览器遍历无障碍（Accessibility / UIAutomation）组件树抓取聊天正文，杜绝界面卡顿、改版脆弱性与隐私风险。
@@ -37,7 +38,7 @@
 1. **第一级：自动闭环门禁（主力签收基线）**
    - **离线单元测试套件**：`PYTHONPATH=src python3 -W error::ResourceWarning -m unittest discover -s tests -v`（全程离线可重入，覆盖协议解析、并发保序、在途取消、窗口/SSH 路由与剪贴板恢复状态机）。
    - **原生 Shim 离线自检**：macOS `mac_shim --self-check` 与 Windows `win_shim.ps1 -Mode self-check`，在无声卡、无全局钩子权限的 CI 环境中验证原生编译、按键状态机与粘贴键路由。
-   - **隔离全链路自检与时间点回放基准**：通过 `.agents/skills/voice-eval/` 在独立运行目录验证真 ASR、前缀缓存、并发保序落字与 `0600` 隐私脱敏契约；回放评测产物严格限定在仓外缓存目录（`${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/`），严禁入库。
+   - **隔离全链路自检与时间点回放基准**：通过 `.agents/skills/voice-eval/` 在独立运行目录与隔离 `AGENT_VOICE_INPUT_HOME` 下验证真 ASR、前缀缓存、并发保序落字与 `0600` 隐私脱敏契约；本地归档录音位于 `~/.agent-voice-input/recordings/`，回放评测产物严格限定在仓外缓存目录（`${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/eval-runs/`），严禁入库。
 2. **第二级：薄人工真机卡点**
    - 仅当改动触及操作系统硬件链路、窗口焦点权限或跨机终端透传体感时，在自动门禁全绿后执行简短真机确认。
 
@@ -188,12 +189,18 @@
 
 #### 后续演进方向（`演进中`）
 
-1. **本地 CLI 订阅精修渠道**：
+1. **个人词库与本机语料体系演进（基于 `~/.agent-voice-input/` 预留扩展位）**：
+   - **项目级热词（`~/.agent-voice-input/hotwords/projects/<slug>.txt`）**：按“项目 + 个人”生效的可选扩展层，通过文件头 `@match path=` / `@match remote=` 自包含匹配（`path` 优先，支持跨机与跨 SSH）；**安全红线**：绝不自动加载陌生或远端业务仓库内的未授权热词文件（防合法语义 Prompt Injection），团队共享术语表仅支持通过 CLI 显式确认导入。
+   - **本机转录语料日志（`~/.agent-voice-input/transcripts/`）**：按显式隐私开关落盘「ASR 转录草稿 + 精修终稿」本地语料（与 `recordings/` 同级、受 `.gitignore` 默认拦截、绝不进 `telemetry.jsonl` 或同步仓），作为复盘、Agent 分析与离线 Dreaming 的原始素材。
+   - **离线 Dreaming 自动挖掘与屏蔽表（`~/.agent-voice-input/dreaming/` + `hotwords/suppress.txt`）**：严格单写者隔离（不往 `personal.txt` 写频次或时间戳，删除派生区不损人工词库）；通过 `suppress.txt` 避让用户已拒绝词；并专门防范「ASR 误听 → Refiner 按旧错误映射改写 → Dreaming 误当作采纳证据」的自我强化幻觉回环。
+   - **300–1,000+ 条大词库长尾草稿后置召回**：超过 Stage 2 块 0 常驻预算（`200 条 / 3,000 字`）的长尾词，在 Stage 1 ASR 产出草稿后于本机毫秒级检索精确误听，将少量命中临时附在末尾草稿块旁喂给 Stage 2（**不动块 0、不破前缀缓存**）。
+   - **配套 AI-native 热词维护 Skill & 预算持续校准**：提供热词维护 Skill 引导 Coding Agent 按预算与形态契约维护词表，并基于后续真人录音回放持续校准强 ASR 上限与分桶比例。
+2. **本地 CLI 订阅精修渠道**：
    - `refiner.provider = "claude"`（`规划中`）：待本机 Claude Code 环境就绪后实测落地无工具精修渠道（`agy` 已于 `v0.12.0` 正式发布）。
-2. **真录音模型横评与原生 Gemini 单跳定向补测**：依托仓外隔离时间点回放基线，系统开展主流 ASR / 精修组合的真录音横向对比评测与原生 Gemini 单跳路径定向补测。
-3. **桌面版全新空会话首轮上下文关联**：在 Antigravity 2.0 与 ChatGPT/Codex 统一桌面端中，新建空对话在首句生成标题前尚无窗口级目录线索，当前保持宁缺毋滥防跨仓串台；后续视桌面端暴露活跃工作区/会话 ID 机制再评估零猜测首轮绑定。
-4. **桌面端后续扩展**：跟进 WSL2 跨系统读取 Windows 宿主机桌面 App 上下文（macOS Claude 桌面版 Code / Cowork 本地会话绑定已于 `v0.15.0` 正式发布）。
-5. **脱离 WSL 的原生 Windows 独立运行**：覆盖未安装 WSL 的纯 Windows 桌面端用户，原生本地直读 Windows 宿主机 `.codex/`、`.gemini/` 与 Claude 会话目录并复用原生 WASAPI 采集与热键/HUD 桥接；针对同时使用 WSL 终端与 Windows 桌面 App 的混合用户，优先评估「原生 Windows 单守护进程 + 轻量 `wsl.exe` 探针（复用现有 SSH 远端探针模型）」的单热键共存架构，避免双系统热键状态机跳跃冲突。
+3. **真录音模型横评与原生 Gemini 单跳定向补测**：依托仓外隔离时间点回放基线，系统开展主流 ASR / 精修组合的真录音横向对比评测与原生 Gemini 单跳路径定向补测。
+4. **桌面版全新空会话首轮上下文关联**：在 Antigravity 2.0 与 ChatGPT/Codex 统一桌面端中，新建空对话在首句生成标题前尚无窗口级目录线索，当前保持宁缺毋滥防跨仓串台；后续视桌面端暴露活跃工作区/会话 ID 机制再评估零猜测首轮绑定。
+5. **桌面端后续扩展**：跟进 WSL2 跨系统读取 Windows 宿主机桌面 App 上下文（macOS Claude 桌面版 Code / Cowork 本地会话绑定已于 `v0.15.0` 正式发布）。
+6. **脱离 WSL 的原生 Windows 独立运行**：覆盖未安装 WSL 的纯 Windows 桌面端用户，原生本地直读 Windows 宿主机 `.codex/`、`.gemini/` 与 Claude 会话目录并复用原生 WASAPI 采集与热键/HUD 桥接；针对同时使用 WSL 终端与 Windows 桌面 App 的混合用户，优先评估「原生 Windows 单守护进程 + 轻量 `wsl.exe` 探针（复用现有 SSH 远端探针模型）」的单热键共存架构，避免双系统热键状态机跳跃冲突。
 
 #### 近期架构复评与技术债跟踪
 

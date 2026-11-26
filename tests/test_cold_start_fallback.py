@@ -285,7 +285,6 @@ class _CaptureRefiner(BaseRefiner):
         cancel_token=None,
         mode: str = "agent",
         workspace_cwd: str = "",
-        target_hint: str = "",
     ) -> RefinerResult:
         draft = asr_input.text if isinstance(asr_input, AsrResult) else str(asr_input)
         blocks, final_blk = build_refiner_request_blocks(
@@ -296,7 +295,6 @@ class _CaptureRefiner(BaseRefiner):
             fallback_context=fallback_context,
             mode=mode,
             workspace_cwd=workspace_cwd,
-            target_hint=target_hint,
         )
         self.seen_calls.append((blocks, final_blk, session_key, workspace_cwd))
         used_prior = any(b.startswith("<prior_session_reference") for b in blocks)

@@ -64,6 +64,10 @@ from agent_voice_input.config import (  # noqa: E402
     VALID_SILENCE_TRIM,
     _parse_simple_toml,
     classify_asr_model_api,
+    default_config_file_candidates,
+    default_env_file_candidates,
+    detect_legacy_config_migration_hint,
+    ensure_app_dir,
     ensure_secure_dir,
     get_runtime_dir,
     is_dashscope_omni_chat_model,
@@ -72,8 +76,11 @@ from agent_voice_input.config import (  # noqa: E402
     parse_env_text,
     parse_toml,
     redact_secrets,
+    resolve_app_home_dir,
     resolve_asr_api,
     resolve_credentials,
+    resolve_saved_recordings_dir,
+    resolve_target_config_paths,
     select_asr_provider,
 )
 
@@ -199,7 +206,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
     def test_config_precedence_cli_over_file_over_default_and_ignores_ordinary_env_knobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            cfg_dir = home / ".config" / "voice-input"
+            cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
             (cfg_dir / "config.toml").write_text(
                 """
@@ -263,37 +270,45 @@ class ConfigAndCredentialsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            new_dir = home / ".config" / "agent-voice-input"
+            app_dir = home / ".agent-voice-input"
             legacy_dir = home / ".config" / "voice-input"
             legacy_dir.mkdir(parents=True)
 
-            # 1. Legacy fallback when ~/.config/agent-voice-input does not exist yet
-            #    (JSON with UTF-8 BOM to simulate Windows Notepad / PowerShell 5.1 save)
-            (legacy_dir / "config.json").write_bytes(
+            # 1. Legacy ~/.config/voice-input is NOT auto-loaded; explicit --config JSON with UTF-8 BOM still parses!
+            bom_json = home / "explicit_bom.json"
+            bom_json.write_bytes(
                 b"\xef\xbb\xbf"
                 + json.dumps({"audio": {"wsl_source": "winmm", "beep": False}}).encode("utf-8")
             )
+            (legacy_dir / "config.json").write_bytes(bom_json.read_bytes())
             (legacy_dir / "voice-input.env").write_text(
                 'API_KEY_ALI="from_legacy_env"\n'
                 'GEMINI_API_KEY="from_legacy_gemini"\n',
                 encoding="utf-8",
             )
-            legacy_cfg, legacy_meta = load_config(env={"HOME": str(home)}, home_dir=home)
-            self.assertEqual(legacy_cfg.audio.wsl_source, "winmm")
-            self.assertIs(legacy_cfg.audio.beep, False)
-            self.assertTrue(str(legacy_meta).endswith("config.json") or legacy_cfg.config_path.endswith("config.json"))
+            default_cfg, default_env = load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertIsNone(default_cfg.config_path)
+            self.assertNotIn("GEMINI_API_KEY", default_env)
 
-            # 2. New ~/.config/agent-voice-input takes precedence over legacy ~/.config/voice-input,
-            #    while missing keys in new env file still smoothly fall back to legacy env file!
-            new_dir.mkdir(parents=True)
-            (new_dir / "config.toml").write_text(
+            explicit_cfg, _ = load_config(config_path=bom_json, env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(explicit_cfg.audio.wsl_source, "winmm")
+            self.assertIs(explicit_cfg.audio.beep, False)
+            self.assertEqual(explicit_cfg.config_path, str(bom_json))
+
+            # 2. Unified ~/.agent-voice-input/{config.toml, .env} governs defaults; caller env wins over .env
+            app_dir.mkdir(parents=True)
+            (app_dir / "config.toml").write_text(
                 '[audio]\nwsl_source = "wasapi"\nbeep = true\n',
                 encoding="utf-8",
             )
-            (new_dir / "agent-voice-input.env").write_text(
-                'export API_KEY_ALI="from_new_env" # comment\n'
+            (app_dir / ".env").write_text(
+                'export API_KEY_ALI="from_app_env" # comment\n'
                 "DOUBAO_ASR_APP_ID= # empty with comment\n"
-                "DOUBAO_ASR_API_KEY='from_new_single'\n",
+                "DOUBAO_ASR_API_KEY='from_app_single'\n",
+                encoding="utf-8",
+            )
+            (app_dir / "agent-voice-input.env").write_text(
+                'GEMINI_API_KEY="must_be_ignored"\n',
                 encoding="utf-8",
             )
 
@@ -306,8 +321,8 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             merged = load_env_files(caller_env, home_dir=home)
             self.assertEqual(merged["DOUBAO_ASR_API_KEY"], "caller_wins_val")
             self.assertEqual(merged["DOUBAO_ASR_APP_ID"], "")
-            self.assertEqual(merged["API_KEY_ALI"], "from_new_env")
-            self.assertEqual(merged["GEMINI_API_KEY"], "from_legacy_gemini")
+            self.assertEqual(merged["API_KEY_ALI"], "from_app_env")
+            self.assertNotIn("GEMINI_API_KEY", merged)
 
             cfg, _ = load_config(env=caller_env, home_dir=home)
             self.assertEqual(cfg.audio.wsl_source, "wasapi")
@@ -543,7 +558,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
     def test_max_duration_sec_config_and_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
             (cfg_dir / "config.toml").write_text(
                 "[audio]\nmax_duration_sec = 300\n",
@@ -1117,7 +1132,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
     def test_cross_layer_provider_override_resets_inherited_model_and_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
             (cfg_dir / "config.toml").write_text(
                 """
@@ -1322,7 +1337,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         # AND OpenRouter unknown-model api="auto" immediately in load_config (even without env vars set!)
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
 
             # 1) Custom api_key_env inferring openai-compatible without base_url -> ConfigError
@@ -1371,7 +1386,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
 
             # Default when omitted is "balanced"
@@ -1408,6 +1423,324 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 with self.assertRaises(ConfigError) as ctx:
                     load_config(env={"HOME": str(home)}, home_dir=home)
                 self.assertIn("audio.silence_trim", str(ctx.exception))
+
+    def test_app_home_dir_resolution_isolation_and_absolute_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_home = root / "home"
+            custom_home = root / "custom_avi"
+
+            # 1. Explicit home_dir takes precedence over env["AGENT_VOICE_INPUT_HOME"] and os.environ
+            with mock.patch.dict(os.environ, {"AGENT_VOICE_INPUT_HOME": str(custom_home)}, clear=False):
+                self.assertEqual(
+                    resolve_app_home_dir(
+                        {"HOME": str(root / "other"), "AGENT_VOICE_INPUT_HOME": str(custom_home)},
+                        home_dir=fake_home,
+                    ),
+                    fake_home / ".agent-voice-input",
+                )
+                self.assertEqual(
+                    resolve_app_home_dir(None, home_dir=fake_home),
+                    fake_home / ".agent-voice-input",
+                )
+
+            # 2. AGENT_VOICE_INPUT_HOME absolute path & tilde expansion with HOME
+            self.assertEqual(
+                resolve_app_home_dir({"HOME": str(fake_home), "AGENT_VOICE_INPUT_HOME": str(custom_home)}),
+                custom_home,
+            )
+            self.assertEqual(
+                resolve_app_home_dir({"HOME": str(fake_home), "AGENT_VOICE_INPUT_HOME": "~/my_avi"}),
+                fake_home / "my_avi",
+            )
+
+            # 3. Relative or unexpandable AGENT_VOICE_INPUT_HOME raises ConfigError
+            for bad_env in (
+                {"HOME": str(fake_home), "AGENT_VOICE_INPUT_HOME": "relative/avi"},
+                {"HOME": str(fake_home), "AGENT_VOICE_INPUT_HOME": "./avi"},
+                {"AGENT_VOICE_INPUT_HOME": "~/my_avi"},
+                {"HOME": str(fake_home), "AGENT_VOICE_INPUT_HOME": "~otheruser/avi"},
+            ):
+                with self.subTest(bad_env=bad_env):
+                    with self.assertRaises(ConfigError):
+                        resolve_app_home_dir(bad_env)
+
+            # 4. Hermetic env without HOME or AGENT_VOICE_INPUT_HOME returns None (no host leak)
+            self.assertIsNone(resolve_app_home_dir({}))
+            self.assertIsNone(resolve_app_home_dir({"HOME": "~otheruser"}))
+            self.assertEqual(default_config_file_candidates({}), [])
+            self.assertEqual(default_env_file_candidates({}), [])
+            with self.assertRaises(ConfigError):
+                resolve_target_config_paths(env={})
+
+            # 5. Process env (env=None) falls back to Path.home() / ".agent-voice-input" when HOME is unset
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch("agent_voice_input.config.Path.home", return_value=fake_home),
+            ):
+                self.assertEqual(resolve_app_home_dir(None), fake_home / ".agent-voice-input")
+
+    def test_ensure_app_dir_symlinks_recursive_0700_and_error_guards(self) -> None:
+        import stat
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # 1. create=False on nonexistent path returns path without creating it
+            missing = root / "not_yet" / ".agent-voice-input"
+            self.assertEqual(ensure_app_dir(missing, create=False), missing)
+            self.assertFalse(missing.exists())
+
+            # 2. create=True creates every missing intermediate parent and leaf with 0700 (not 0755)
+            old_umask = os.umask(0o022)
+            try:
+                nested = root / "lvl1" / "lvl2" / ".agent-voice-input"
+                self.assertEqual(ensure_app_dir(nested, create=True), nested)
+            finally:
+                os.umask(old_umask)
+            for p in (root / "lvl1", root / "lvl1" / "lvl2", nested):
+                self.assertEqual(stat.S_IMODE(os.lstat(p).st_mode), 0o700)
+
+            # 3. Pre-existing real directory owned by same UID passes WITHOUT altering its 0755 mode
+            existing_755 = root / "existing_755"
+            existing_755.mkdir(mode=0o755)
+            os.chmod(existing_755, 0o755)
+            self.assertEqual(ensure_app_dir(existing_755, create=True), existing_755)
+            self.assertEqual(stat.S_IMODE(os.lstat(existing_755).st_mode), 0o755)
+
+            # 4. Pre-existing directory symlink owned by same UID passes WITHOUT chmodding target
+            sym_target = root / "harness_hotwords"
+            sym_target.mkdir(mode=0o755)
+            os.chmod(sym_target, 0o755)
+            sym_dir = root / "hotwords_link"
+            sym_dir.symlink_to(sym_target)
+            self.assertEqual(ensure_app_dir(sym_dir, create=True), sym_dir)
+            self.assertEqual(stat.S_IMODE(os.stat(sym_target).st_mode), 0o755)
+
+            # 5. Rejects broken symlink, symlink-to-file, regular file, and wrong UID (real/symlink/new)
+            broken = root / "broken_link"
+            broken.symlink_to(root / "does_not_exist")
+            with self.assertRaises(ConfigError):
+                ensure_app_dir(broken, create=True)
+            with self.assertRaises(ConfigError):
+                ensure_app_dir(broken, create=False)
+
+            reg_file = root / "regular.txt"
+            reg_file.write_text("hi", encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                ensure_app_dir(reg_file, create=True)
+            sym_file = root / "file_link"
+            sym_file.symlink_to(reg_file)
+            with self.assertRaises(ConfigError):
+                ensure_app_dir(sym_file, create=True)
+
+            wrong_uid = os.getuid() + 1
+            with self.assertRaises(ConfigError):
+                ensure_app_dir(existing_755, expected_uid=wrong_uid, create=True)
+            with self.assertRaises(ConfigError):
+                ensure_app_dir(sym_dir, expected_uid=wrong_uid, create=True)
+            with self.assertRaises(ConfigError):
+                ensure_app_dir(root / "new_wrong_uid", expected_uid=wrong_uid, create=True)
+
+            # 6. Rejects non-directory or broken-symlink ancestor when creating nested child
+            with self.assertRaises(ConfigError):
+                ensure_app_dir(reg_file / "child", create=True)
+            with self.assertRaises(ConfigError):
+                ensure_app_dir(broken / "child", create=True)
+            # Parent check stops cleanly at filesystem root & wraps OS inspection/creation errors
+            with mock.patch("agent_voice_input.config.os.lstat", side_effect=PermissionError("denied")):
+                with self.assertRaises(ConfigError):
+                    ensure_app_dir(root / "lstat_err", create=True)
+            with mock.patch("agent_voice_input.config.os.mkdir", side_effect=PermissionError("rofs")):
+                with self.assertRaises(ConfigError):
+                    ensure_app_dir(root / "mkdir_err", create=True)
+            # Concurrent FileExistsError falls back cleanly to verifying existing dir
+            race_dir = root / "race_dir"
+            race_dir.mkdir(mode=0o755)
+            os.chmod(race_dir, 0o755)
+            real_lstat = os.lstat
+            seen_first = [False]
+
+            def _lstat_once_missing(p: object) -> os.stat_result:
+                if Path(str(p)) == race_dir and not seen_first[0]:
+                    seen_first[0] = True
+                    raise FileNotFoundError(str(p))
+                return real_lstat(str(p))
+
+            with mock.patch("agent_voice_input.config.os.lstat", side_effect=_lstat_once_missing):
+                self.assertEqual(ensure_app_dir(race_dir, create=True), race_dir)
+            self.assertEqual(stat.S_IMODE(os.lstat(race_dir).st_mode), 0o755)
+
+            # Race where os.lstat fails after FileExistsError or os.open fails after mkdir
+            with (
+                mock.patch("agent_voice_input.config.os.mkdir", side_effect=FileExistsError("exists")),
+                mock.patch("agent_voice_input.config.os.lstat", side_effect=[FileNotFoundError(), PermissionError("boom")]),
+            ):
+                with self.assertRaises(ConfigError):
+                    ensure_app_dir(root / "race_err", create=True)
+            with mock.patch("agent_voice_input.config.os.open", side_effect=OSError("eloop")):
+                with self.assertRaises(ConfigError):
+                    ensure_app_dir(root / "open_err", create=True)
+            with (
+                mock.patch("agent_voice_input.config.os.stat", side_effect=PermissionError("pdenied")),
+            ):
+                with self.assertRaises(ConfigError):
+                    ensure_app_dir(root / "stat_parent_err" / "child", create=True)
+            real_lstat2 = os.lstat
+            missing_parent = root / "lstat_parent_err"
+
+            def _lstat_parent_perm(p: object) -> os.stat_result:
+                if Path(str(p)) == missing_parent:
+                    raise PermissionError("pdenied")
+                return real_lstat2(str(p))
+
+            with mock.patch("agent_voice_input.config.os.lstat", side_effect=_lstat_parent_perm):
+                with self.assertRaises(ConfigError):
+                    ensure_app_dir(missing_parent / "child", create=True)
+            # Direct root parent traversal guard
+            from agent_voice_input.config import _ensure_app_parent_dirs
+            _ensure_app_parent_dirs(Path("/"), os.getuid())
+
+    def test_bootstrap_env_isolation_external_config_env_and_recordings_dir(self) -> None:
+        import stat
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            app_home = home / ".agent-voice-input"
+            app_home.mkdir(parents=True, mode=0o700)
+            hijack_home = root / "hijack_home"
+            hijack_home.mkdir(parents=True, mode=0o700)
+            hijack_cfg = root / "hijack.toml"
+            hijack_cfg.write_text('[hotkey]\nkey = "F12"\n', encoding="utf-8")
+
+            # 1. .env MUST NOT inject AGENT_VOICE_INPUT_HOME or AGENT_VOICE_INPUT_CONFIG
+            (app_home / "config.toml").write_text('[hotkey]\nkey = "F7"\n', encoding="utf-8")
+            (app_home / ".env").write_text(
+                f'AGENT_VOICE_INPUT_HOME="{hijack_home}"\n'
+                f'AGENT_VOICE_INPUT_CONFIG="{hijack_cfg}"\n'
+                'DEEPSEEK_API_KEY="ds_ok_1234"\n',
+                encoding="utf-8",
+            )
+            cfg, merged = load_config(env={"HOME": str(home)})
+            self.assertEqual(cfg.hotkey.key, "F7")
+            self.assertEqual(cfg.config_path, str(app_home / "config.toml"))
+            self.assertNotIn("AGENT_VOICE_INPUT_HOME", merged)
+            self.assertNotIn("AGENT_VOICE_INPUT_CONFIG", merged)
+            self.assertEqual(merged.get("DEEPSEEK_API_KEY"), "ds_ok_1234")
+
+            # 2. External --config NEVER reads sibling .env or agent-voice-input.env; reads only <app_home>/.env
+            ext_dir = root / "external_cfg"
+            ext_dir.mkdir(parents=True)
+            ext_cfg = ext_dir / "custom.toml"
+            ext_cfg.write_text('[hotkey]\nkey = "F6"\n', encoding="utf-8")
+            (ext_dir / ".env").write_text('OPENAI_API_KEY="ext_should_not_load"\n', encoding="utf-8")
+            (ext_dir / "agent-voice-input.env").write_text('GEMINI_API_KEY="ext_legacy_ignored"\n', encoding="utf-8")
+            cfg_ext, merged_ext = load_config(config_path=ext_cfg, env={"HOME": str(home)})
+            self.assertEqual(cfg_ext.hotkey.key, "F6")
+            self.assertNotIn("OPENAI_API_KEY", merged_ext)
+            self.assertNotIn("GEMINI_API_KEY", merged_ext)
+            self.assertEqual(merged_ext.get("DEEPSEEK_API_KEY"), "ds_ok_1234")
+
+            # 3. Legacy VOICE_INPUT_RUNTIME_DIR is ignored by get_runtime_dir
+            rt_legacy = get_runtime_dir({"HOME": str(home), "VOICE_INPUT_RUNTIME_DIR": str(root / "legacy_rt")})
+            self.assertEqual(rt_legacy, home / ".cache" / "agent-voice-input")
+
+            # 4. resolve_saved_recordings_dir under app_home (including symlinked app_home) & hermetic error
+            with self.assertRaises(ConfigError):
+                resolve_saved_recordings_dir({})
+            real_avi = root / "real_avi_target"
+            real_avi.mkdir(mode=0o755)
+            os.chmod(real_avi, 0o755)
+            sym_avi = root / "sym_avi"
+            sym_avi.symlink_to(real_avi)
+            rec_dir = resolve_saved_recordings_dir({"AGENT_VOICE_INPUT_HOME": str(sym_avi)}, create=True)
+            self.assertEqual(rec_dir, sym_avi / "recordings")
+            self.assertEqual(stat.S_IMODE(os.stat(real_avi).st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(os.lstat(rec_dir).st_mode), 0o700)
+
+    def test_detect_legacy_config_migration_hint_read_only_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            home.mkdir()
+            legacy_dir = home / ".config" / "agent-voice-input"
+
+            # Hermetic empty env -> ""
+            self.assertEqual(detect_legacy_config_migration_hint({}), "")
+            # Other-user tilde HOME -> ""
+            self.assertEqual(
+                detect_legacy_config_migration_hint(
+                    {"HOME": "~otheruser", "AGENT_VOICE_INPUT_HOME": str(root / "avi")}
+                ),
+                "",
+            )
+            # No legacy files -> ""
+            self.assertEqual(detect_legacy_config_migration_hint({"HOME": str(home)}), "")
+
+            # Legacy file present & new config.toml absent -> single-line hint
+            legacy_dir.mkdir(parents=True)
+            (legacy_dir / "agent-voice-input.env").write_text("# k\n", encoding="utf-8")
+            (legacy_dir / "hotwords.txt").write_text("Codex\n", encoding="utf-8")
+            hint = detect_legacy_config_migration_hint({"HOME": str(home)})
+            self.assertNotIn("\n", hint)
+            self.assertIn(str(legacy_dir), hint)
+            self.assertIn("agent-voice-input.env", hint)
+            self.assertIn("hotwords.txt", hint)
+            self.assertIn(str(home / ".agent-voice-input"), hint)
+            # Strictly read-only: does not create ~/.agent-voice-input
+            self.assertFalse((home / ".agent-voice-input").exists())
+
+            # Works with explicit home_dir and XDG_CONFIG_HOME
+            xdg_root = root / "xdg_cfg"
+            xdg_leg = xdg_root / "agent-voice-input"
+            xdg_leg.mkdir(parents=True)
+            (xdg_leg / "config.toml").write_text("[hotkey]\n", encoding="utf-8")
+            hint_xdg = detect_legacy_config_migration_hint(
+                {"HOME": str(home), "XDG_CONFIG_HOME": str(xdg_root)},
+            )
+            self.assertIn(str(xdg_leg), hint_xdg)
+            self.assertIn("config.toml", hint_xdg)
+            hint_home_dir = detect_legacy_config_migration_hint(
+                {"XDG_CONFIG_HOME": str(xdg_root)},
+                home_dir=home,
+            )
+            self.assertIn(str(xdg_leg), hint_home_dir)
+            self.assertIn(str(legacy_dir), detect_legacy_config_migration_hint(None, home_dir=home))
+
+            # Same directory via AGENT_VOICE_INPUT_HOME == legacy_dir -> ""
+            self.assertEqual(
+                detect_legacy_config_migration_hint(
+                    {"HOME": str(home), "AGENT_VOICE_INPUT_HOME": str(legacy_dir)}
+                ),
+                "",
+            )
+
+            # Process env fallback (env=None, no HOME/XDG_CONFIG_HOME)
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch("agent_voice_input.config.Path.home", return_value=home),
+            ):
+                self.assertIn(str(legacy_dir), detect_legacy_config_migration_hint(None))
+
+            # Once <app_home>/config.toml exists, hint disappears automatically
+            app_home = home / ".agent-voice-input"
+            app_home.mkdir(parents=True)
+            (app_home / "config.toml").write_text("[hotkey]\n", encoding="utf-8")
+            self.assertEqual(detect_legacy_config_migration_hint({"HOME": str(home)}), "")
+
+            # OSError while probing is_file returns gracefully without crashing
+            with mock.patch("pathlib.Path.is_file", side_effect=OSError("io")):
+                self.assertEqual(detect_legacy_config_migration_hint({"HOME": str(home)}), "")
+            real_is_file = Path.is_file
+
+            def _is_file_only_legacy_err(p: Path) -> bool:
+                if p.parent == legacy_dir:
+                    raise OSError("perm")
+                return real_is_file(p)
+
+            (app_home / "config.toml").unlink()
+            with mock.patch("pathlib.Path.is_file", side_effect=_is_file_only_legacy_err, autospec=True):
+                self.assertEqual(detect_legacy_config_migration_hint({"HOME": str(home)}), "")
 
 
 class AudioProcTests(unittest.TestCase):
@@ -1880,11 +2213,13 @@ class AudioProcTests(unittest.TestCase):
                     str(local_ff),
                 )
 
-            # resolve_saved_recordings_dir(create=True) secures ~/.cache/agent-voice-input (0700) when XDG_RUNTIME_DIR is unset
+            # resolve_saved_recordings_dir(create=True) secures ~/.agent-voice-input (0700) and recordings/ (0700)
             no_xdg_env = {"HOME": str(home)}
             rec_dir = resolve_saved_recordings_dir(no_xdg_env, create=True)
-            rt_dir = get_runtime_dir(no_xdg_env, create=False)
-            self.assertEqual(rec_dir.parent, rt_dir)
+            self.assertEqual(rec_dir, home / ".agent-voice-input" / "recordings")
+            self.assertEqual(stat.S_IMODE(os.lstat(rec_dir.parent).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.lstat(rec_dir).st_mode), 0o700)
+            rt_dir = get_runtime_dir(no_xdg_env, create=True)
             self.assertEqual(stat.S_IMODE(os.lstat(rt_dir).st_mode), 0o700)
             self.assertTrue(_is_trusted_runtime_dir(rt_dir))
 
@@ -2476,6 +2811,27 @@ class AudioProcTests(unittest.TestCase):
                 f"retry failed under min_voiced_sec=3.0: {res_mv3_recover.skipped_reason} {res_mv3_recover.error}",
             )
             self.assertEqual(asr_mv3_recover.seen_wav_lens, [len(mv3_stashed_bytes)])
+
+    def test_legacy_asr_hotwords_file_raises_config_error_with_migration_hint(self) -> None:
+        from agent_voice_input.config import AsrConfig
+
+        self.assertFalse(hasattr(AsrConfig(), "hotwords_file"))
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg_path = tmp / "config.toml"
+            for raw_val in ('"~/.config/agent-voice-input/hotwords.txt"', '""'):
+                cfg_path.write_text(
+                    f"[asr]\nprovider = \"doubao\"\nhotwords_file = {raw_val}\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ConfigError) as cm:
+                    load_config(
+                        config_path=cfg_path,
+                        env={"HOME": str(tmp), "AGENT_VOICE_INPUT_HOME": str(tmp / "avi_home")},
+                    )
+                msg = str(cm.exception)
+                self.assertIn("hotwords_file", msg)
+                self.assertIn("personal.txt", msg)
 
 
 if __name__ == "__main__":

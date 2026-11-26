@@ -329,7 +329,7 @@ def parse_avfoundation_audio_devices(output: str) -> list[str]:
 
 def get_macos_cache_dir(env: Mapping[str, str] | None = None, *, create: bool = False) -> Path:
     src_env = os.environ if env is None else env
-    explicit = (src_env.get("AGENT_VOICE_INPUT_CACHE_DIR") or src_env.get("VOICE_INPUT_CACHE_DIR") or "").strip()
+    explicit = (src_env.get("AGENT_VOICE_INPUT_CACHE_DIR") or "").strip()
     if explicit:
         cdir = expand_user_path(explicit, env=src_env)
     elif xdg_cache := (src_env.get("XDG_CACHE_HOME") or "").strip():

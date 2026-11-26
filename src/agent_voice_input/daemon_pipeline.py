@@ -13,14 +13,12 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ._remote_probe import _is_broad_or_unsafe_workspace_dir
 from .app_scope import (
-    classify_target_app_hint,
     classify_window_category,
     is_antigravity_ide_window,
     is_claude_desktop_window,
     is_codex_desktop_window,
     is_remote_ide_window,
     normalize_app_token,
-    resolve_hotwords_scope,
 )
 from .asr_providers import (
     AsrError,
@@ -58,9 +56,10 @@ from .control_ipc import (
 )
 from .hotwords import (
     format_stage2_vocabulary_hints,
-    load_hotwords_file,
     load_hotwords_table,
-    select_stage2_manual_entries,
+    order_stage1_entries,
+    order_stage2_entries,
+    resolve_personal_hotwords_path,
 )
 from .hud import is_toast_hud_state, resolve_ui_language
 from .platform_common import (
@@ -727,8 +726,6 @@ class _Stage1State:
     eff_mode: str = "agent"
     snap: SessionSnapshot | None = None
     workspace_cwd: str = ""
-    target_hint: str = ""
-    hotwords_scope: str = "global"
     vocabulary_hints: str = ""
     remote_vetoed: bool = False
     asr_ctx_dialog: str = ""
@@ -1057,7 +1054,6 @@ def _resolve_stage1_context(
         if codex_match is not None:
             eff_mode = "agent"
             st.eff_mode = "agent"
-            st.target_hint = ""
             st.workspace_cwd = codex_match.cwd
             st.codex_promoted_sid = codex_match.session_id
             st.snap = tracker.sync_ide_session(
@@ -1066,7 +1062,6 @@ def _resolve_stage1_context(
         elif claude_match is not None:
             eff_mode = "agent"
             st.eff_mode = "agent"
-            st.target_hint = ""
             st.workspace_cwd = claude_match.cwd
             st.claude_promoted_sid = claude_match.session_id
             rk, rsid = _parse_claude_desktop_page_url(getattr(win, "page_url", ""))
@@ -1076,8 +1071,6 @@ def _resolve_stage1_context(
             st.snap = tracker.sync_ide_session(
                 claude_match, cold_start_fallback=cfg.refiner.cold_start_fallback
             )
-        else:
-            st.target_hint = classify_target_app_hint(win)
 
     if (
         eff_mode != "general"
@@ -1088,33 +1081,23 @@ def _resolve_stage1_context(
     ):
         st.ctx_fallback = "prior_hotwords"
 
-    hw_scope = resolve_hotwords_scope(
-        win,
-        target_hint=st.target_hint,
-        mode=eff_mode,
-        has_agent_session=(st.snap is not None),
-    )
-    st.hotwords_scope = hw_scope
-    has_hw_file = bool(cfg.asr.hotwords_file.strip())
-    if has_hw_file:
-        hw_table = load_hotwords_table(cfg.asr.hotwords_file, env=env)
-        manual_hw = hw_table.merged_for_scene(hw_scope)
-        stage2_entries = select_stage2_manual_entries(hw_table, mode=eff_mode)
+    hw_path = resolve_personal_hotwords_path(env)
+    if hw_path is not None:
+        hw_table = load_hotwords_table(hw_path, env=env)
+        personal_hw = tuple(e.term for e in order_stage1_entries(hw_table.entries))
+        stage2_entries = order_stage2_entries(hw_table.entries)
         st.vocabulary_hints = format_stage2_vocabulary_hints(stage2_entries)
     else:
-        manual_hw = []
+        personal_hw = ()
         st.vocabulary_hints = ""
     asr_ctx = tracker.build_asr_context(
         st.snap,
-        extra_hotwords=[*manual_hw, *extra_hw],
+        personal_hotwords=personal_hw,
+        workspace_dynamic_hotwords=extra_hw,
         mode=eff_mode,
         language=_resolve_effective_ui_language(cfg, env=env, platform=platform),
-        target_hint=st.target_hint,
     )
-    asr_ctx.hotwords_scope = hw_scope
-    asr_ctx.manual_hotwords_loaded = has_hw_file
-    if st.target_hint:
-        asr_ctx.target_hint = st.target_hint
+    asr_ctx.manual_hotwords_loaded = True
     st.asr_ctx_dialog = asr_ctx.dialog_text
     if attach_single_hop:
         asr_ctx = attach_single_hop_context(
@@ -1124,7 +1107,6 @@ def _resolve_stage1_context(
             session_key=st.snap.session_key if st.snap else "",
             mode=eff_mode,
             workspace_cwd=st.workspace_cwd,
-            target_hint=st.target_hint,
             vocabulary_hints=st.vocabulary_hints,
         )
         if eff_mode != "general" and any(
@@ -1221,7 +1203,7 @@ def _execute_stage1(
             if (
                 arch_th := spawn_recording_archive(
                     arch_bytes,
-                    resolve_saved_recordings_dir(env),
+                    resolve_saved_recordings_dir(env, create=True),
                     max_count=cfg.audio.save_recordings_max_count,
                 )
             ) is not None:
@@ -1455,7 +1437,6 @@ def run_pipeline_once(
                 "cancel_token": cancel_token,
                 "mode": st.eff_mode,
                 "workspace_cwd": ref_workspace_cwd,
-                "target_hint": st.target_hint,
             }
             if st.vocabulary_hints:
                 refine_kw["vocabulary_hints"] = st.vocabulary_hints
@@ -1646,9 +1627,8 @@ def run_probe_route_request(
         "window_category": st.window_category,
         "mode": st.eff_mode,
         "should_sync": bool(st.should_sync),
-        "target_app_hint": st.target_hint,
-        "hotwords_scope": st.hotwords_scope,
         "hotword_count": len(asr_ctx.hotwords),
+        "personal_hotword_count": len(asr_ctx.personal_hotwords),
         "session_key_masked": _mask_session_key(st.snap),
         "matched_by": _sanitize_matched_by(st.snap),
         "remote_vetoed": bool(st.remote_vetoed),

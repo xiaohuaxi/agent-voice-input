@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import statistics
 import sys
 import tempfile
@@ -38,6 +39,13 @@ from agent_voice_input.config import (  # noqa: E402
     resolve_credentials,
 )
 from agent_voice_input.daemon import run_pipeline_once  # noqa: E402
+from agent_voice_input.hotwords import (  # noqa: E402
+    HotwordEntry,
+    format_stage2_vocabulary_hints,
+    load_hotwords_table,
+    order_stage2_entries,
+    resolve_personal_hotwords_path,
+)
 from agent_voice_input.refiner import (  # noqa: E402
     RefinerResult,
     build_refiner_request_blocks,
@@ -492,6 +500,13 @@ def _clone_Config_for_provider(
     )
 
 
+def _render_hotwords_snapshot(entries: tuple[HotwordEntry, ...]) -> str:
+    """Serialize already-validated hotword entries into an immutable ``personal.txt`` snapshot string."""
+    if not entries:
+        return ""
+    return "".join(f"{e.format_line()}\n" for e in entries)
+
+
 def _run_wav_benchmark(
     *,
     wav_path: Path,
@@ -503,6 +518,7 @@ def _run_wav_benchmark(
     snap: SessionSnapshot,
     args: argparse.Namespace,
     redact_fn: Any,
+    hotwords_snapshot_text: str = "",
 ) -> str:
     lines: list[str] = [
         "## End-to-End WAV Benchmark (`run_pipeline_once`)",
@@ -510,77 +526,100 @@ def _run_wav_benchmark(
         "| Provider | Model | ASR (ms) | Init (ms) | Refine (ms) | Total (ms) | Ctx (chunks/chars) | In Tok | Cached Tok | Hit % | Fallback |",
         "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |",
     ]
-    for prov in providers:
-        p_cfg = _clone_Config_for_provider(
-            base_cfg,
-            prov,
-            model_override=args.model,
-            effort_override=args.effort,
-            max_chars=args.max_chars,
-            include_git=not args.no_git_status,
-            args_api=args.api,
+    iso_app_home = Path(tempfile.mkdtemp(prefix="avi-bench-wav-home-"))
+    try:
+        ensure_secure_dir(iso_app_home)
+        wav_env = dict(env)
+        wav_env["AGENT_VOICE_INPUT_HOME"] = str(iso_app_home)
+        target_cfg_path = (
+            str(Path(args.config).expanduser().resolve())
+            if getattr(args, "config", "")
+            else str(base_cfg.config_path or "")
         )
-        creds = resolve_credentials(p_cfg, env)
-        prov_rt = ensure_secure_dir(rt_dir / f"wav-{prov}")
-        wav_home = home
-        lock_fd = -1
-        try:
-            if snap.match.cli == "agy":
-                # Allow offline/closed agy sessions to pass registry presence validation in isolation
-                wav_home = ensure_secure_dir(prov_rt / "agy-home")
-                pres_dir = ensure_secure_dir(wav_home / ".gemini" / "antigravity-cli" / "presence")
-                lock_file = pres_dir / f"{snap.match.session_id.strip().lower()}.lock"
-                lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            write_session_registry_entry(
-                prov_rt,
-                cli=snap.match.cli,
-                session_id=snap.match.session_id,
-                jsonl_path=snap.match.jsonl_path,
-                cwd=snap.match.cwd,
+        if target_cfg_path:
+            wav_env["AGENT_VOICE_INPUT_CONFIG"] = target_cfg_path
+
+        if not getattr(args, "no_hotwords", False) and hotwords_snapshot_text:
+            iso_hw_dir = ensure_secure_dir(iso_app_home / "hotwords")
+            dst_hw = iso_hw_dir / "personal.txt"
+            fd = os.open(str(dst_hw), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(hotwords_snapshot_text)
+
+        for prov in providers:
+            p_cfg = _clone_Config_for_provider(
+                base_cfg,
+                prov,
+                model_override=args.model,
+                effort_override=args.effort,
+                max_chars=args.max_chars,
+                include_git=not args.no_git_status,
+                args_api=args.api,
             )
-            w_tracker = SessionTracker(
-                home_dir=wav_home,
-                env=env,
-                runtime_dir=prov_rt,
-                proc_root=rt_dir / "no_proc",
-            )
-            ref = create_refiner(p_cfg, creds, env=env, runtime_dir=prov_rt)
+            creds = resolve_credentials(p_cfg, wav_env)
+            prov_rt = ensure_secure_dir(rt_dir / f"wav-{prov}")
+            wav_home = home
+            lock_fd = -1
             try:
-                res = run_pipeline_once(
-                    wav_path,
-                    cfg=p_cfg,
-                    creds=creds,
-                    tracker=w_tracker,
-                    refiner=ref,
-                    origin_window=None,
-                    window_title_override=f"[{snap.match.cli}:#{snap.match.session_id}]",
-                    audio_source="selftest_wav",
-                    dry_run=True,
+                if snap.match.cli == "agy":
+                    # Allow offline/closed agy sessions to pass registry presence validation in isolation
+                    wav_home = ensure_secure_dir(prov_rt / "agy-home")
+                    pres_dir = ensure_secure_dir(wav_home / ".gemini" / "antigravity-cli" / "presence")
+                    lock_file = pres_dir / f"{snap.match.session_id.strip().lower()}.lock"
+                    lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                write_session_registry_entry(
+                    prov_rt,
+                    cli=snap.match.cli,
+                    session_id=snap.match.session_id,
+                    jsonl_path=snap.match.jsonl_path,
+                    cwd=snap.match.cwd,
+                )
+                w_tracker = SessionTracker(
+                    home_dir=wav_home,
+                    env=wav_env,
                     runtime_dir=prov_rt,
-                    env=env,
+                    proc_root=rt_dir / "no_proc",
                 )
-                r = res.refined
-                in_t = r.input_tokens if r else None
-                c_t = r.cached_input_tokens if r else None
-                lines.append(
-                    f"| `{prov}` | `{r.model if r else '-'}` | {res.asr.latency_ms if res.asr else 0} | "
-                    f"{res.refine_init_ms} | {r.latency_ms if r else 0} | {res.total_ms} | "
-                    f"{res.ctx_chunks} / {res.ctx_chars} | {_fmt_opt_int(in_t)} | {_fmt_opt_int(c_t)} | "
-                    f"{_fmt_hit_pct(in_t, c_t)} | `{redact_fn(r.used_fallback or '-') if r else res.skipped_reason}` |"
-                )
+                ref = create_refiner(p_cfg, creds, env=wav_env, runtime_dir=prov_rt)
+                try:
+                    res = run_pipeline_once(
+                        wav_path,
+                        cfg=p_cfg,
+                        creds=creds,
+                        tracker=w_tracker,
+                        refiner=ref,
+                        origin_window=None,
+                        window_title_override=f"[{snap.match.cli}:#{snap.match.session_id}]",
+                        audio_source="selftest_wav",
+                        dry_run=True,
+                        runtime_dir=prov_rt,
+                        env=wav_env,
+                    )
+                    r = res.refined
+                    in_t = r.input_tokens if r else None
+                    c_t = r.cached_input_tokens if r else None
+                    lines.append(
+                        f"| `{prov}` | `{r.model if r else '-'}` | {res.asr.latency_ms if res.asr else 0} | "
+                        f"{res.refine_init_ms} | {r.latency_ms if r else 0} | {res.total_ms} | "
+                        f"{res.ctx_chunks} / {res.ctx_chars} | {_fmt_opt_int(in_t)} | {_fmt_opt_int(c_t)} | "
+                        f"{_fmt_hit_pct(in_t, c_t)} | `{redact_fn(r.used_fallback or '-') if r else res.skipped_reason}` |"
+                    )
+                finally:
+                    ref.close()
             finally:
-                ref.close()
-        finally:
-            if lock_fd >= 0:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                try:
-                    os.close(lock_fd)
-                except OSError:
-                    pass
+                if lock_fd >= 0:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                    try:
+                        os.close(lock_fd)
+                    except OSError:
+                        pass
+    finally:
+        shutil.rmtree(iso_app_home, ignore_errors=True)
     lines.append("")
     return "\n".join(lines)
 
@@ -600,6 +639,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prefer-compacted", action="store_true", help="Prefer sessions with compaction boundaries")
     ap.add_argument("--max-chars", type=int, default=0, help="Override refiner.context_max_chars (0 = use config default)")
     ap.add_argument("--no-git-status", action="store_true", help="Omit workspace git status block during benchmark")
+    ap.add_argument("--hotwords-file", default="", help="Optional personal hotwords file for Block 0 <vocabulary_hints> (default: ~/.agent-voice-input/hotwords/personal.txt)")
+    ap.add_argument("--no-hotwords", action="store_true", help="Disable Block 0 <vocabulary_hints> injection during benchmark")
     ap.add_argument("--prewarm-ms", type=int, default=0, help="Optional prepare_session lead time before R1 (ms)")
     ap.add_argument(
         "--rounds",
@@ -661,12 +702,29 @@ def main(argv: list[str] | None = None) -> int:
             include_git=not args.no_git_status,
             args_api=args.api,
         )
+        vocab_hints = ""
+        vocab_count = 0
+        hotwords_snapshot_text = ""
+        if not args.no_hotwords:
+            hw_path = (
+                expand_user_path(args.hotwords_file, env=env)
+                if args.hotwords_file.strip()
+                else resolve_personal_hotwords_path(env)
+            )
+            if hw_path is not None:
+                hw_table = load_hotwords_table(hw_path, env=env, use_cache=False)
+                vocab_count = len(hw_table.entries)
+                vocab_hints = format_stage2_vocabulary_hints(order_stage2_entries(hw_table.entries))
+                hotwords_snapshot_text = _render_hotwords_snapshot(hw_table.entries)
+        vocab_sha8 = hashlib.sha1(vocab_hints.encode("utf-8")).hexdigest()[:8] if vocab_hints else "-"
+
         probes = _build_probe_suite(snap, probe_cfg, base_tracker)[: max(1, min(6, int(args.rounds)))]
         init_blocks, _ = build_refiner_request_blocks(
             probe_cfg,
             "probe",
             session_key=snap.session_key,
             tracker=base_tracker,
+            vocabulary_hints=vocab_hints,
         )
 
         ts_iso = time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime())
@@ -675,6 +733,7 @@ def main(argv: list[str] | None = None) -> int:
             "",
             f"- Timestamp: `{ts_iso}`",
             f"- Session Sample: `{session_tag}` (turns=`{len(base_turns)}`, generation=`{snap.generation}`, raw_dialog_chars=`{raw_dialog_chars}`, initial_ctx=`{len(init_blocks)} chunks / {sum(len(b) for b in init_blocks)} chars`, max_chars=`{max_chars}`)",
+            f"- Vocabulary Hints (Block 0): `entries={vocab_count}`, `chars={len(vocab_hints)}`, `sha1={vocab_sha8}`",
             f"- Isolated Runtime Dir: `<temp>/avi-bench-*` (auto-cleaned, host runtime untouched)",
             f"- Providers: `{', '.join(providers)}` | Prewarm Lead: `{args.prewarm_ms}ms`",
             "",
@@ -730,6 +789,7 @@ def main(argv: list[str] | None = None) -> int:
                         str(probe["draft"]),
                         session_key=p_snap.session_key,
                         tracker=p_tracker,
+                        vocabulary_hints=vocab_hints,
                     )
                     flags = _evaluate_fidelity(probe, res)
                     if not flags:
@@ -811,7 +871,7 @@ def main(argv: list[str] | None = None) -> int:
             "",
         ]
         # Insert summary right after header metadata
-        report_parts[7:7] = summary_block
+        report_parts[8:8] = summary_block
         report_parts.extend(sample_io_sections)
 
         if args.wav:
@@ -829,6 +889,7 @@ def main(argv: list[str] | None = None) -> int:
                     snap=snap,
                     args=args,
                     redact_fn=redact_fn,
+                    hotwords_snapshot_text=hotwords_snapshot_text,
                 )
             )
 

@@ -99,6 +99,10 @@ from .daemon_pipeline import (
     run_selftest_wav_request,
     validate_selftest_wav_request,
 )
+from .hotwords import (
+    resolve_personal_hotwords_path,
+    summarize_stage2_hotwords_budget,
+)
 from .http_transport import evict_all_keepalive_connections
 from .hud import format_copied_hud_text
 from .platform_common import (
@@ -990,7 +994,6 @@ class VoiceInputDaemon:
                     eff_loopback = bool(
                         loopback
                         or self.env.get("AGENT_VOICE_INPUT_WASAPI_LOOPBACK") == "1"
-                        or self.env.get("VOICE_INPUT_WASAPI_LOOPBACK") == "1"
                     )
                     if loopback:
                         self.platform.start_recording(self.runtime_dir, loopback=True, seq_id=cur_seq)
@@ -1539,7 +1542,6 @@ class VoiceInputDaemon:
                     "cancel_token": task.cancel_token,
                     "mode": st.eff_mode,
                     "workspace_cwd": st.workspace_cwd,
-                    "target_hint": st.target_hint,
                 }
                 if st.vocabulary_hints:
                     refine_kw["vocabulary_hints"] = st.vocabulary_hints
@@ -1617,7 +1619,6 @@ class VoiceInputDaemon:
                 "cancel_token": task.cancel_token,
                 "mode": st.eff_mode,
                 "workspace_cwd": st.workspace_cwd,
-                "target_hint": st.target_hint,
             }
             if st.vocabulary_hints:
                 refine_kw["vocabulary_hints"] = st.vocabulary_hints
@@ -1918,6 +1919,13 @@ class VoiceInputDaemon:
                     else None
                 )
                 mem_snap = [dict(r) for r in self.recent_results] if want_hist else []
+            hw_status: dict[str, int] | None = None
+            try:
+                hw_path = resolve_personal_hotwords_path(self.env)
+                hw_summary = summarize_stage2_hotwords_budget(hw_path, env=self.env, use_cache=True)
+                hw_status = hw_summary.as_safe_counts_dict()
+            except Exception:
+                hw_status = None
             return build_daemon_status_response(
                 runtime_dir=self.runtime_dir,
                 req=req,
@@ -1932,6 +1940,7 @@ class VoiceInputDaemon:
                 last_result=last_res_snap,
                 remote_hosts=remote_hosts,
                 mem_recent_results=mem_snap,
+                hotwords=hw_status,
             )
         if cmd in ("toggle", "rec_start", "rec_stop"):
             win = _window_from_mapping(req) if _has_window_fields(req) else None

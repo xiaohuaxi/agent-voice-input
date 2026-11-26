@@ -55,7 +55,6 @@ from agent_voice_input.diagnose import (  # noqa: E402
 from agent_voice_input.hotwords import (  # noqa: E402
     add_hotwords,
     clear_hotwords_cache,
-    load_hotwords_file,
     load_hotwords_table,
     remove_hotwords,
 )
@@ -973,9 +972,9 @@ class TestA4BadEncodingHotwordsDegradation(unittest.TestCase):
                 t1 = load_hotwords_table(hw_utf16, use_cache=True)
                 t2 = load_hotwords_table(hw_utf16, use_cache=True)
                 t3 = load_hotwords_table(hw_utf16, use_cache=False)
-            self.assertEqual(t1.merged_for_scene("coding"), [])
-            self.assertEqual(t2.merged_for_scene("coding"), [])
-            self.assertEqual(t3.merged_for_scene("coding"), [])
+            self.assertEqual(t1.stage1_terms, ())
+            self.assertEqual(t2.stage1_terms, ())
+            self.assertEqual(t3.stage1_terms, ())
             self.assertTrue(t1.exists)
             self.assertIn("UTF-16 LE", t1.encoding_error)
             self.assertEqual(err1.getvalue().count("WARN:"), 1)
@@ -984,19 +983,19 @@ class TestA4BadEncodingHotwordsDegradation(unittest.TestCase):
             err2 = io.StringIO()
             hw_utf16.write_bytes("[global]\r\nAntigravity2\r\n".encode("utf-16"))
             with redirect_stderr(err2):
-                load_hotwords_file(hw_utf16, scene="coding")
-                load_hotwords_file(hw_utf16, scene="coding")
+                load_hotwords_table(hw_utf16)
+                load_hotwords_table(hw_utf16)
             self.assertEqual(err2.getvalue().count("WARN:"), 1)
 
             # Fixing file to valid UTF-8 restores hotwords immediately
             hw_utf16.write_text("[coding]\nRecoveredTerm\n", encoding="utf-8")
-            self.assertEqual(load_hotwords_file(hw_utf16, scene="coding"), ["RecoveredTerm"])
+            self.assertEqual(load_hotwords_table(hw_utf16).stage1_terms, ("RecoveredTerm",))
 
             # UTF-16 BE & raw invalid UTF-8 bytes
             err3 = io.StringIO()
             with redirect_stderr(err3):
-                self.assertEqual(load_hotwords_file(hw_utf16be, scene="global"), [])
-                self.assertEqual(load_hotwords_file(hw_bad, scene="global"), [])
+                self.assertEqual(load_hotwords_table(hw_utf16be).stage1_terms, ())
+                self.assertEqual(load_hotwords_table(hw_bad).stage1_terms, ())
             self.assertIn("UTF-16 BE", err3.getvalue())
             self.assertIn("invalid UTF-8", err3.getvalue())
 
@@ -1006,17 +1005,21 @@ class TestA4BadEncodingHotwordsDegradation(unittest.TestCase):
                 load_hotwords_table(hw_utf16, use_cache=False, strict_encoding=True)
             self.assertIn("UTF-8", str(ctx_list.exception))
             with self.assertRaises(ConfigError) as ctx_add:
-                add_hotwords(hw_utf16, ["NewTerm"], scope="global")
+                add_hotwords(hw_utf16, ["NewTerm"])
             self.assertIn("UTF-8", str(ctx_add.exception))
             with self.assertRaises(ConfigError) as ctx_rm:
-                remove_hotwords(hw_utf16, ["Antigravity"], scope="global")
+                remove_hotwords(hw_utf16, ["Antigravity"])
             self.assertIn("UTF-8", str(ctx_rm.exception))
             self.assertEqual(hw_utf16.read_bytes(), utf16_bytes, "add/remove must never corrupt non-UTF-8 file")
 
             # 3. CLI `hotwords list|add|remove` report actionable UTF-8 error and return exit code 2
+            app_home = base / "home" / ".agent-voice-input"
+            hw_personal = app_home / "hotwords" / "personal.txt"
+            hw_personal.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            hw_personal.write_bytes(utf16_bytes)
             cfg_path = base / "config.toml"
-            cfg_path.write_text(f'[asr]\nhotwords_file = "{hw_utf16}"\n', encoding="utf-8")
-            cli_env = {"HOME": str(base / "home"), "PATH": ""}
+            cfg_path.write_text('[asr]\nprovider = "auto"\n', encoding="utf-8")
+            cli_env = {"HOME": str(base / "home"), "AGENT_VOICE_INPUT_HOME": str(app_home), "PATH": ""}
             for sub_argv in (
                 ["--config", str(cfg_path), "hotwords", "list"],
                 ["--config", str(cfg_path), "hotwords", "add", "Foo"],
@@ -1027,9 +1030,9 @@ class TestA4BadEncodingHotwordsDegradation(unittest.TestCase):
                     rc = cli_mod.main(sub_argv)
                 self.assertEqual(rc, 2, msg=sub_argv)
                 self.assertIn("UTF-8", err_cli.getvalue())
-            self.assertEqual(hw_utf16.read_bytes(), utf16_bytes)
+            self.assertEqual(hw_personal.read_bytes(), utf16_bytes)
 
-            # 4. Live dictation pipeline does NOT break ASR when hotwords.txt is UTF-16 LE; keeps built-in/workspace hotwords
+            # 4. Live dictation pipeline does NOT break ASR when personal.txt is UTF-16 LE; keeps built-in/workspace hotwords
             clear_hotwords_cache()
             rt = base / "rt"
             rt.mkdir(mode=0o700)
@@ -1037,7 +1040,7 @@ class TestA4BadEncodingHotwordsDegradation(unittest.TestCase):
             proj_dir.mkdir()
             (proj_dir / "README.md").write_text("# KestrelEngine\n", encoding="utf-8")
             cfg = Config(
-                asr=AsrConfig(hotwords_file=str(hw_utf16)),
+                asr=AsrConfig(),
                 refiner=RefinerConfig(provider="off"),
             )
             asr = _SequenceAsr(["第一次正常转写", "第二次正常转写"])
@@ -1055,7 +1058,7 @@ class TestA4BadEncodingHotwordsDegradation(unittest.TestCase):
                         audio_source="winmm",
                         seq_id=seq,
                         runtime_dir=rt,
-                        env={"HOME": str(base / "home"), "PATH": ""},
+                        env=cli_env,
                     )
                     self.assertTrue(res.ok)
             self.assertEqual(len(asr.contexts), 2)
@@ -1077,8 +1080,8 @@ class TestA4BadEncodingHotwordsDegradation(unittest.TestCase):
             with redirect_stderr(err_live):
                 t1 = load_hotwords_table(hw_bomless, use_cache=True)
                 t2 = load_hotwords_table(hw_bomless, use_cache=False)
-            self.assertEqual(t1.merged_for_scene("coding"), [])
-            self.assertEqual(t2.merged_for_scene("coding"), [])
+            self.assertEqual(t1.stage1_terms, ())
+            self.assertEqual(t2.stage1_terms, ())
             self.assertIn("NUL byte", t1.encoding_error)
             self.assertEqual(err_live.getvalue().count("WARN:"), 1)
 
@@ -1087,14 +1090,18 @@ class TestA4BadEncodingHotwordsDegradation(unittest.TestCase):
                 load_hotwords_table(hw_bomless, use_cache=False, strict_encoding=True)
             self.assertIn("UTF-8", str(ctx_strict.exception))
             with self.assertRaises(ConfigError):
-                add_hotwords(hw_bomless, ["SafeTerm"], scope="global")
+                add_hotwords(hw_bomless, ["SafeTerm"])
             with self.assertRaises(ConfigError):
-                remove_hotwords(hw_bomless, ["Codex"], scope="global")
+                remove_hotwords(hw_bomless, ["Codex"])
             self.assertEqual(hw_bomless.read_bytes(), raw_utf16le)
 
+            app_home = base / "home" / ".agent-voice-input"
+            hw_personal = app_home / "hotwords" / "personal.txt"
+            hw_personal.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            hw_personal.write_bytes(raw_utf16le)
             cfg_path = base / "cfg.toml"
-            cfg_path.write_text(f'[asr]\nhotwords_file = "{hw_bomless}"\n', encoding="utf-8")
-            cli_env = {"HOME": str(base / "home"), "PATH": ""}
+            cfg_path.write_text('[asr]\nprovider = "auto"\n', encoding="utf-8")
+            cli_env = {"HOME": str(base / "home"), "AGENT_VOICE_INPUT_HOME": str(app_home), "PATH": ""}
             for argv in (
                 ["--config", str(cfg_path), "hotwords", "list"],
                 ["--config", str(cfg_path), "hotwords", "add", "SafeTerm"],
@@ -1105,7 +1112,7 @@ class TestA4BadEncodingHotwordsDegradation(unittest.TestCase):
                     rc = cli_mod.main(argv)
                 self.assertEqual(rc, 2, msg=argv)
                 self.assertIn("UTF-8", err_cli.getvalue())
-            self.assertEqual(hw_bomless.read_bytes(), raw_utf16le)
+            self.assertEqual(hw_personal.read_bytes(), raw_utf16le)
 
 
 class TestA5UnifiedDeliveryHudAndDiagnoseContract(unittest.TestCase):

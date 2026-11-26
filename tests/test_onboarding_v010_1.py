@@ -472,8 +472,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
     def test_cli_init_permissions_commented_env_xdg_and_symlink_safe_force(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            xdg_dir = root / "xdg_cfg"
-            env = {"HOME": str(root / "home"), "XDG_CONFIG_HOME": str(xdg_dir)}
+            app_home = root / "avi_home"
+            env = {"HOME": str(root / "home"), "AGENT_VOICE_INPUT_HOME": str(app_home)}
 
             out1 = io.StringIO()
             with (
@@ -484,12 +484,15 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 rc1 = cli_mod.main(["init"])
             self.assertEqual(rc1, 0, out1.getvalue())
 
-            cfg_dir = xdg_dir / "agent-voice-input"
+            cfg_dir = app_home
             toml_p = cfg_dir / "config.toml"
-            env_p = cfg_dir / "agent-voice-input.env"
+            env_p = cfg_dir / ".env"
+            gi_p = cfg_dir / ".gitignore"
             self.assertEqual(stat.S_IMODE(cfg_dir.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(toml_p.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(env_p.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(gi_p.stat().st_mode), 0o644)
+            self.assertEqual(gi_p.read_text(encoding="utf-8"), "/*\n!/.gitignore\n!/hotwords/\n")
 
             # Commented .env MUST parse to {} so placeholder strings NEVER hijack auto provider selection!
             env_template_text = env_p.read_text(encoding="utf-8")
@@ -507,21 +510,24 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             parsed_a = parse_toml(toml_p.read_text(encoding="utf-8"))
             parsed_b = _parse_simple_toml(toml_p.read_text(encoding="utf-8"))
             self.assertEqual(parsed_a, parsed_b)
-            loaded_cfg, _ = load_config(env=env, home_dir=root / "home")
+            loaded_cfg, _ = load_config(env=env)
             self.assertEqual(loaded_cfg.config_path, str(toml_p))
             self.assertEqual(loaded_cfg.asr.provider, "auto")
             self.assertEqual(loaded_cfg.refiner.provider, "auto")
 
             # Re-running without --force keeps existing user edits untouched (even if syntax-broken)
             toml_p.write_text("broken = [unterminated\n", encoding="utf-8")
+            gi_p.write_text("# custom user gitignore\n/*\n!/hotwords/\n", encoding="utf-8")
             out2 = io.StringIO()
             with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdout", out2):
                 rc2 = cli_mod.main(["init"])
             self.assertEqual(rc2, 0)
             self.assertIn("Config    kept ", out2.getvalue())
+            self.assertIn("Gitignore kept ", out2.getvalue())
             self.assertEqual(toml_p.read_text(encoding="utf-8"), "broken = [unterminated\n")
 
-            # Symlink protection on --force: replaces symlink entry itself, NEVER overwrites victim target!
+            # Symlink protection on --force: replaces symlink entry itself, NEVER overwrites victim target,
+            # and NEVER overwrites existing .gitignore even under --force!
             victim = root / "victim_secret.txt"
             victim.write_text("DO_NOT_OVERWRITE", encoding="utf-8")
             toml_p.unlink()
@@ -533,24 +539,29 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             self.assertEqual(victim.read_text(encoding="utf-8"), "DO_NOT_OVERWRITE")
             self.assertFalse(toml_p.is_symlink())
             self.assertEqual(stat.S_IMODE(toml_p.stat().st_mode), 0o600)
+            self.assertEqual(gi_p.read_text(encoding="utf-8"), "# custom user gitignore\n/*\n!/hotwords/\n")
 
-            # AGENT_VOICE_INPUT_CONFIG pointing to a not-yet-created path works cleanly with `init`
+            # AGENT_VOICE_INPUT_CONFIG pointing to an external path writes ONLY TOML (never .env or .gitignore)
             custom_toml = root / "custom_dir" / "my_voice.toml"
             env_custom = {"HOME": str(root / "home"), "AGENT_VOICE_INPUT_CONFIG": str(custom_toml)}
-            with mock.patch.dict(os.environ, env_custom, clear=True), mock.patch("sys.stdout", io.StringIO()):
+            out_custom = io.StringIO()
+            with mock.patch.dict(os.environ, env_custom, clear=True), mock.patch("sys.stdout", out_custom):
                 self.assertEqual(cli_mod.main(["init"]), 0)
             self.assertTrue(custom_toml.is_file())
-            self.assertTrue((custom_toml.parent / "agent-voice-input.env").is_file())
+            self.assertEqual(stat.S_IMODE(custom_toml.stat().st_mode), 0o600)
+            self.assertFalse((custom_toml.parent / ".env").exists())
+            self.assertFalse((custom_toml.parent / ".gitignore").exists())
+            self.assertIn(".agent-voice-input/.env", out_custom.getvalue())
 
     def test_doctor_platform_matrix_ping_dedup_and_secret_redaction(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             rt = root / "rt"
             home = root / "home"
-            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True, mode=0o700)
             # Open 0644 .env triggers WARN without failing rc=0
-            env_file = cfg_dir / "agent-voice-input.env"
+            env_file = cfg_dir / ".env"
             secret_ds = "dash_test_aaaa8888"
             env_file.write_text(f'DASHSCOPE_API_KEY="{secret_ds}"\n', encoding="utf-8")
             env_file.chmod(0o644)
@@ -844,8 +855,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             home = root / "home"
             home.mkdir(mode=0o700)
 
-            # P1-1 & P2-1: `init --config <shared_0755>/voice.toml` preserves 0755 dir mode AND
-            # subsequent `load_config(config_path=...)` loads `<shared_0755>/agent-voice-input.env`!
+            # P1-1 & P2-1: `init --config <shared_0755>/voice.toml` preserves 0755 dir mode;
+            # `load_config(config_path=...)` reads credentials solely from `<app_home>/.env` (never external dir)!
             shared_dir = root / "shared_proj"
             shared_dir.mkdir(mode=0o755)
             os.chmod(shared_dir, 0o755)
@@ -856,11 +867,13 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 self.assertEqual(cli_mod.main(["init", "--config", str(custom_cfg_path)]), 0)
             self.assertEqual(stat.S_IMODE(shared_dir.stat().st_mode), 0o755)
             self.assertEqual(stat.S_IMODE(custom_cfg_path.stat().st_mode), 0o600)
-            custom_env_path = shared_dir / "agent-voice-input.env"
-            self.assertEqual(stat.S_IMODE(custom_env_path.stat().st_mode), 0o600)
             self.assertIn("--config", out_init_cfg.getvalue())
 
-            custom_env_path.write_text('DEEPSEEK_API_KEY="ds_custom_aaaa9999"\n', encoding="utf-8")
+            # External sibling .env is ignored; credentials come from <app_home>/.env
+            (shared_dir / ".env").write_text('DEEPSEEK_API_KEY="external_ignored_key"\n', encoding="utf-8")
+            cfg_dir_default = home / ".agent-voice-input"
+            cfg_dir_default.mkdir(parents=True, mode=0o700)
+            (cfg_dir_default / ".env").write_text('DEEPSEEK_API_KEY="ds_custom_aaaa9999"\n', encoding="utf-8")
             loaded_cfg, loaded_env = load_config(config_path=custom_cfg_path, env=env_clean, home_dir=home)
             self.assertEqual(loaded_env.get("DEEPSEEK_API_KEY"), "ds_custom_aaaa9999")
             self.assertEqual(
@@ -872,16 +885,13 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 cli_mod._cmd_init(shared_dir / "bad.json", force=True, env=env_clean, home_dir=home)
 
-            # P1-2b: Default `init` without --force does NOT shadow an active config.json or legacy config
-            cfg_dir_default = home / ".config" / "agent-voice-input"
-            cfg_dir_default.mkdir(parents=True, mode=0o700)
-            active_json = cfg_dir_default / "config.json"
-            active_json.write_text('{"refiner": {"provider": "off"}}\n', encoding="utf-8")
+            # P1-2b: Default `init` without --force keeps existing <app_home>/config.toml untouched
+            active_toml = cfg_dir_default / "config.toml"
+            active_toml.write_text('[refiner]\nprovider = "off"\n', encoding="utf-8")
             out_shadow = io.StringIO()
             with mock.patch("sys.stdout", out_shadow):
                 self.assertEqual(cli_mod._cmd_init(env=env_clean, home_dir=home), 0)
-            self.assertFalse((cfg_dir_default / "config.toml").exists())
-            self.assertIn(str(active_json), out_shadow.getvalue())
+            self.assertIn("kept", out_shadow.getvalue())
             cfg_after_init, _ = load_config(env=env_clean, home_dir=home)
             self.assertEqual(cfg_after_init.refiner.provider, "off")
 
@@ -973,7 +983,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             real_open_env = root / "real_open.env"
             real_open_env.write_text('DASHSCOPE_API_KEY="true"\n', encoding="utf-8")
             real_open_env.chmod(0o644)
-            default_env_link = cfg_dir_default / "agent-voice-input.env"
+            default_env_link = cfg_dir_default / ".env"
             default_env_link.unlink(missing_ok=True)
             default_env_link.symlink_to(real_open_env)
 
@@ -1118,8 +1128,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             ):
                 self.assertIn(key_name, init_txt)
 
-            gen_toml = (home / ".config" / "agent-voice-input" / "config.toml").read_text(encoding="utf-8")
-            gen_env = (home / ".config" / "agent-voice-input" / "agent-voice-input.env").read_text(encoding="utf-8")
+            gen_toml = (home / ".agent-voice-input" / "config.toml").read_text(encoding="utf-8")
+            gen_env = (home / ".agent-voice-input" / ".env").read_text(encoding="utf-8")
             self.assertIn('key = "RControl"', gen_toml)
             self.assertIn("MacBook", gen_toml)
             self.assertIn("ROption", gen_toml)
@@ -2110,7 +2120,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 mock.patch("sys.stdout", out_mb),
             ):
                 self.assertEqual(cli_mod.main(["init"]), 0, out_mb.getvalue())
-            toml_mb = (h_mb / ".config" / "agent-voice-input" / "config.toml").read_text(encoding="utf-8")
+            toml_mb = (h_mb / ".agent-voice-input" / "config.toml").read_text(encoding="utf-8")
             self.assertIn('key = "ROption"', toml_mb)
             self.assertIn("Hotkey    ROption (detected MacBook built-in keyboard", out_mb.getvalue())
             self.assertIn("--hotkey RControl", out_mb.getvalue())
@@ -2128,7 +2138,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                     ["init", "--force", "--asr", "bailian", "--refiner", "off", "--hotkey", "RControl"]
                 )
             self.assertEqual(rc_exp, 0, out_mb_exp.getvalue())
-            toml_mb_exp = (h_mb / ".config" / "agent-voice-input" / "config.toml").read_text(encoding="utf-8")
+            toml_mb_exp = (h_mb / ".agent-voice-input" / "config.toml").read_text(encoding="utf-8")
             self.assertIn('key = "RControl"', toml_mb_exp)
             self.assertIn('provider = "dashscope"', toml_mb_exp)
             self.assertIn('provider = "off"', toml_mb_exp)
@@ -2149,7 +2159,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 self.assertEqual(cli_mod.main(["init"]), 0, out_mini.getvalue())
             self.assertIn(
                 'key = "RControl"',
-                (h_mini / ".config" / "agent-voice-input" / "config.toml").read_text(encoding="utf-8"),
+                (h_mini / ".agent-voice-input" / "config.toml").read_text(encoding="utf-8"),
             )
             self.assertNotIn("MacBook built-in keyboard", out_mini.getvalue())
 
@@ -2699,14 +2709,14 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 home = Path(td) / "home"
                 rt = Path(td) / "rt"
-                cfg_dir = home / ".config" / "agent-voice-input"
+                cfg_dir = home / ".agent-voice-input"
                 cfg_dir.mkdir(parents=True)
                 (cfg_dir / "config.toml").write_text(
                     f'[asr]\nprovider = "openai-compatible"\nbase_url = "http://127.0.0.1:{origin_port}/v1"\n'
                     f'[refiner]\nprovider = "openai-compatible"\nbase_url = "http://127.0.0.1:{origin_port}/v1"\nmodel = "m1"\n',
                     encoding="utf-8",
                 )
-                (cfg_dir / "agent-voice-input.env").write_text(
+                (cfg_dir / ".env").write_text(
                     f'HTTP_PROXY="http://127.0.0.1:{proxy_port}"\n'
                     'http_proxy="http://127.0.0.1:1"\n',
                     encoding="utf-8",
@@ -2721,22 +2731,26 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 self.assertNotIn("http_proxy", merged_sys_wins)
 
                 # Higher-priority .env uppercase HTTPS_PROXY MUST NOT be shadowed by lower-priority .env lowercase https_proxy
-                primary_env = cfg_dir / "agent-voice-input.env"
-                legacy_env = cfg_dir / ".env"
+                primary_env = cfg_dir / ".env"
+                secondary_env = cfg_dir / "secondary.env"
                 primary_env.write_text(
                     f'HTTPS_PROXY="http://127.0.0.1:{proxy_port}"\n',
                     encoding="utf-8",
                 )
-                legacy_env.write_text('https_proxy="http://127.0.0.1:1"\n', encoding="utf-8")
+                secondary_env.write_text('https_proxy="http://127.0.0.1:1"\n', encoding="utf-8")
                 try:
-                    merged_cross_env = load_env_files({"HOME": str(home)}, home_dir=home)
+                    merged_cross_env = load_env_files(
+                        {"HOME": str(home)},
+                        env_paths=[primary_env, secondary_env],
+                        home_dir=home,
+                    )
                 finally:
-                    legacy_env.unlink()
+                    secondary_env.unlink()
                 self.assertEqual(merged_cross_env.get("HTTPS_PROXY"), f"http://127.0.0.1:{proxy_port}")
                 self.assertNotIn("https_proxy", merged_cross_env)
 
                 # Clean .env with valid HTTP_PROXY drives ASR transport, Refiner transport, and doctor --ping
-                (cfg_dir / "agent-voice-input.env").write_text(
+                (cfg_dir / ".env").write_text(
                     f'HTTP_PROXY="http://127.0.0.1:{proxy_port}"\n',
                     encoding="utf-8",
                 )
@@ -3137,34 +3151,43 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 tmp = Path(td)
                 home = tmp / "home"
                 home.mkdir()
-                hw_path = tmp / "hotwords.txt"
+                app_home = tmp / "avi_home"
                 cfg_path = tmp / "config.toml"
                 cfg_path.write_text(
-                    f'[asr]\nprovider = "doubao"\nhotwords_file = "{hw_path.as_posix()}"\n',
+                    '[asr]\nprovider = "doubao"\n',
                     encoding="utf-8",
                 )
                 env = {
                     "HOME": str(home),
+                    "AGENT_VOICE_INPUT_HOME": str(app_home),
                     "DOUBAO_SPEECH_API_KEY": "test-doubao-key",
                 }
 
-                # 2. Empty table list: text shows Stage 2 budget + copyable Agent tip; JSON keeps old fields + stage2_budget/entries
+                # 2. Empty table list: text shows Stage 2 budget + copyable Agent tip; JSON keeps new flat schema
                 rc, out, err = _run_cli(["hotwords", "list", "--config", str(cfg_path)], env)
                 self.assertEqual(rc, 0, err)
                 self.assertIn("Stage 2 / Single-hop wide vocabulary budget", out)
-                self.assertIn("stage2 (agent: coding+global): 0/100 items, 0/1500 chars [OK]", out)
-                self.assertIn("stage2 (general: global+chat): 0/100 items, 0/1500 chars [OK]", out)
+                self.assertIn("stage2: 0/200 items, 0/3000 chars [OK]", out)
                 self.assertIn("Agent tip:", out)
+                self.assertIn("~/.agent-voice-input/hotwords/personal.txt", out)
 
                 rc, out, err = _run_cli(["hotwords", "list", "--json", "--config", str(cfg_path)], env)
                 self.assertEqual(rc, 0, err)
                 empty_js = json.loads(out)
                 self.assertFalse(empty_js["exists"])
-                self.assertEqual(empty_js["entries"], {"global": [], "chat": [], "coding": []})
-                self.assertEqual(empty_js["stage2_budget"]["agent"]["max_items"], 100)
-                self.assertEqual(empty_js["stage2_budget"]["agent"]["max_chars"], 1500)
-                self.assertEqual(empty_js["stage2_budget"]["general"]["scopes"], ["global", "chat"])
-                self.assertFalse(empty_js["stage2_budget"]["general"]["truncated"])
+                self.assertEqual(empty_js["entries"], [])
+                self.assertEqual(empty_js["terms"], [])
+                self.assertEqual(empty_js["counts"]["total"], 0)
+                self.assertEqual(empty_js["stage2_budget"]["max_items"], 200)
+                self.assertEqual(empty_js["stage2_budget"]["max_chars"], 3000)
+                self.assertFalse(empty_js["stage2_budget"]["truncated"])
+                self.assertNotIn("scopes", empty_js)
+
+                # Legacy --scope flag is completely removed
+                with mock.patch("sys.stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm_scope:
+                        parser.parse_args(["hotwords", "list", "--scope", "global"])
+                self.assertEqual(cm_scope.exception.code, 2)
 
                 # 3. Fresh add with comma-separated & repeatable --alias
                 rc, out, err = _run_cli(
@@ -3232,14 +3255,13 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 self.assertFalse(dup_js["changed"])
                 self.assertEqual(dup_js["skipped"], ["Harness"])
 
-                # 5. 2-character alias emits non-blocking Warning in text & JSON
+                # 5. 2-character alias emits non-blocking Warning in text & JSON (with --pin support)
                 rc, out, err = _run_cli(
                     [
                         "hotwords",
                         "add",
                         "豆包",
-                        "--scope",
-                        "chat",
+                        "--pin",
                         "--alias",
                         "兜包",
                         "--config",
@@ -3248,7 +3270,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                     env,
                 )
                 self.assertEqual(rc, 0, err)
-                self.assertIn("Added (1):   豆包 <- 兜包", out)
+                self.assertIn("Added (1):   豆包 <- 兜包 (pinned)", out)
                 self.assertIn("Warning:", out)
                 self.assertIn("兜包", out)
 
@@ -3257,8 +3279,6 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                         "hotwords",
                         "add",
                         "GrokBot",
-                        "--scope",
-                        "chat",
                         "--alias",
                         "格克",
                         "--json",
@@ -3301,56 +3321,344 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                     self.assertEqual(rc, 2, f"argv={bad_argv!r} stderr={err!r}")
                     self.assertIn(expected_err, err)
 
-                # 7. Populated list: renders 'Term <- alias1, ...', Stage 2 budget, concise tip, and JSON entries/stage2_budget
+                # 7. Populated list: renders '!Term <- alias1, ...', Stage 1 100% & 70/30 sim, Stage 2 budget, JSON
                 rc, out, err = _run_cli(["hotwords", "list", "--config", str(cfg_path)], env)
                 self.assertEqual(rc, 0, err)
-                self.assertIn("Harness <- 哈尼斯, 哈尼思, 哈尼丝, 哈尼四, 哈尼五", out)
-                self.assertIn("豆包 <- 兜包", out)
-                self.assertIn("stage2 (agent: coding+global): 1/100 items,", out)
-                self.assertIn("stage2 (general: global+chat): 3/100 items,", out)
+                self.assertIn("!豆包 <- 兜包", out)
+                self.assertIn("Harness <- 哈尼丝, 哈尼五, 哈尼四, 哈尼思, 哈尼斯", out)
+                self.assertIn("3 total, 1 pinned, 3 with aliases", out)
+                self.assertIn("[general 100% personal]", out)
+                self.assertIn("[agent 70%/30% sim]", out)
+                self.assertIn("stage2: 3/200 items,", out)
                 self.assertNotIn("Agent tip:", out)
                 self.assertIn("README -> Hotwords", out)
 
                 rc, out, err = _run_cli(["hotwords", "list", "--json", "--config", str(cfg_path)], env)
                 self.assertEqual(rc, 0, err)
                 pop_js = json.loads(out)
-                self.assertEqual(pop_js["scopes"]["global"], ["Harness"])
+                self.assertEqual(pop_js["terms"], ["豆包", "GrokBot", "Harness"])
+                self.assertEqual(pop_js["counts"], {"total": 3, "pinned": 1, "with_aliases": 3, "warnings": 0})
+                harness_entry = [e for e in pop_js["entries"] if e["term"] == "Harness"][0]
                 self.assertEqual(
-                    pop_js["entries"]["global"],
-                    [{"term": "Harness", "aliases": ["哈尼斯", "哈尼思", "哈尼丝", "哈尼四", "哈尼五"]}],
+                    harness_entry["aliases"],
+                    ["哈尼丝", "哈尼五", "哈尼四", "哈尼思", "哈尼斯"],
                 )
-                self.assertEqual(pop_js["stage2_budget"]["agent"]["kept_count"], 1)
-                self.assertEqual(pop_js["stage2_budget"]["general"]["kept_count"], 3)
-                self.assertIn("budgets", pop_js)
-                self.assertIn("mounted", pop_js)
+                self.assertFalse(harness_entry["pinned"])
+                doubao_entry = [e for e in pop_js["entries"] if e["term"] == "豆包"][0]
+                self.assertTrue(doubao_entry["pinned"])
+                self.assertEqual(pop_js["stage2_budget"]["kept_count"], 3)
+                self.assertIn("active_general", pop_js["stage1_budgets"])
+                self.assertIn("active_agent_70_30", pop_js["stage1_budgets"])
+                self.assertEqual(pop_js["stage1_budgets"]["active_agent_70_30"]["dynamic_reserve_terms"], 15)
 
-                # Scoped JSON list filters entries alongside scopes while keeping both stage2_budget modes
-                rc, out, err = _run_cli(
-                    ["hotwords", "list", "--scope", "chat", "--json", "--config", str(cfg_path)],
-                    env,
-                )
-                self.assertEqual(rc, 0, err)
-                chat_js = json.loads(out)
-                self.assertEqual(list(chat_js["entries"].keys()), ["chat"])
-                self.assertEqual(set(chat_js["stage2_budget"].keys()), {"agent", "general"})
-
-                # 8. Stage 2 truncation surfaces in both text and JSON when >100 items
-                overflow_terms = [f"Stage2Term{i:03d}" for i in range(105)]
+                # 8. Stage 2 truncation surfaces in both text and JSON when >200 items
+                overflow_terms = [f"Stage2Term{i:03d}" for i in range(205)]
                 rc, _out, err = _run_cli(
-                    ["hotwords", "add", *overflow_terms, "--scope", "coding", "--config", str(cfg_path)],
+                    ["hotwords", "add", *overflow_terms, "--config", str(cfg_path)],
                     env,
                 )
                 self.assertEqual(rc, 0, err)
                 rc, out, err = _run_cli(["hotwords", "list", "--config", str(cfg_path)], env)
                 self.assertEqual(rc, 0, err)
-                self.assertIn("stage2 (agent: coding+global): 100/100 items,", out)
-                self.assertIn("[TRUNCATED: 6 dropped:", out)
+                self.assertIn("stage2: 200/200 items,", out)
+                self.assertIn("[TRUNCATED: 8 dropped:", out)
 
                 rc, out, err = _run_cli(["hotwords", "list", "--json", "--config", str(cfg_path)], env)
                 self.assertEqual(rc, 0, err)
                 trunc_js = json.loads(out)
-                self.assertTrue(trunc_js["stage2_budget"]["agent"]["truncated"])
-                self.assertEqual(trunc_js["stage2_budget"]["agent"]["dropped_count"], 6)
+                self.assertTrue(trunc_js["stage2_budget"]["truncated"])
+                self.assertEqual(trunc_js["stage2_budget"]["dropped_count"], 8)
+        finally:
+            clear_hotwords_cache()
+
+    def test_step4_init_symlink_home_external_config_gitignore_and_migration_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            # 1. Whole app_home symlinked (~/.agent-voice-input -> real_avi with 0755): init succeeds without chmodding target!
+            home1 = root / "home1"
+            home1.mkdir()
+            real_avi = root / "real_avi"
+            real_avi.mkdir(mode=0o755)
+            os.chmod(real_avi, 0o755)
+            avi_link = home1 / ".agent-voice-input"
+            avi_link.symlink_to(real_avi)
+
+            # Seed legacy XDG config to verify one-time migration hint before writing config.toml
+            legacy_dir = home1 / ".config" / "agent-voice-input"
+            legacy_dir.mkdir(parents=True)
+            (legacy_dir / "agent-voice-input.env").write_text("# legacy\n", encoding="utf-8")
+
+            env1 = {"HOME": str(home1), "PATH": ""}
+            out1 = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env1, clear=True),
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", out1),
+            ):
+                rc1 = cli_mod.main(["init"])
+            self.assertEqual(rc1, 0, out1.getvalue())
+            self.assertTrue(avi_link.is_symlink())
+            self.assertEqual(stat.S_IMODE(real_avi.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE((real_avi / "config.toml").stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE((real_avi / ".env").stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE((real_avi / ".gitignore").stat().st_mode), 0o644)
+            self.assertEqual((real_avi / ".gitignore").read_text(encoding="utf-8"), "/*\n!/.gitignore\n!/hotwords/\n")
+            self.assertIn("Migrate   legacy config found in", out1.getvalue())
+
+            # Second init: migration hint disappears because <app_home>/config.toml now exists;
+            # passing --config <real_avi>/config.toml matches app_home by realpath!
+            (real_avi / ".gitignore").write_text("# user custom\n", encoding="utf-8")
+            out1b = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env1, clear=True),
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", out1b),
+            ):
+                rc1b = cli_mod.main(["init", "--force", "--config", str(real_avi / "config.toml")])
+            self.assertEqual(rc1b, 0, out1b.getvalue())
+            self.assertNotIn("Migrate", out1b.getvalue())
+            self.assertIn("Gitignore kept ", out1b.getvalue())
+            self.assertEqual((real_avi / ".gitignore").read_text(encoding="utf-8"), "# user custom\n")
+
+            # 2. Reject --config pointing to .env or .gitignore (both inside app_home and external dir)
+            ext_dir = root / "ext_cfg"
+            ext_dir.mkdir()
+            (ext_dir / ".env").write_text("KEEP_ME=1\n", encoding="utf-8")
+            (ext_dir / ".gitignore").write_text("KEEP_GI\n", encoding="utf-8")
+            for bad_target in (
+                avi_link / ".env",
+                avi_link / ".gitignore",
+                ext_dir / ".env",
+                ext_dir / ".gitignore",
+            ):
+                err_bad = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, env1, clear=True),
+                    mock.patch("sys.stderr", err_bad),
+                ):
+                    rc_bad = cli_mod.main(["init", "--force", "--config", str(bad_target)])
+                self.assertEqual(rc_bad, 2, msg=f"target={bad_target} stderr={err_bad.getvalue()}")
+                self.assertIn("config error:", err_bad.getvalue())
+            self.assertEqual((ext_dir / ".env").read_text(encoding="utf-8"), "KEEP_ME=1\n")
+            self.assertEqual((ext_dir / ".gitignore").read_text(encoding="utf-8"), "KEEP_GI\n")
+
+            # 3. External --config writes ONLY TOML, never .gitignore or .env, and points user to <app_home>/.env
+            ext_clean = root / "ext_clean"
+            ext_clean.mkdir(mode=0o755)
+            os.chmod(ext_clean, 0o755)
+            ext_toml = ext_clean / "custom.toml"
+            out_ext = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env1, clear=True),
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", out_ext),
+            ):
+                rc_ext = cli_mod.main(["init", "--config", str(ext_toml)])
+            self.assertEqual(rc_ext, 0, out_ext.getvalue())
+            self.assertTrue(ext_toml.is_file())
+            self.assertEqual(stat.S_IMODE(ext_toml.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(ext_clean.stat().st_mode), 0o755)
+            self.assertFalse((ext_clean / ".env").exists())
+            self.assertFalse((ext_clean / ".gitignore").exists())
+            self.assertIn("skipped in external --config directory", out_ext.getvalue())
+            self.assertIn(str(avi_link / ".env"), out_ext.getvalue())
+
+    def test_step4_hotwords_path_symlink_pin_diagnostics_and_doctor_privacy(self) -> None:
+        from agent_voice_input.hotwords import clear_hotwords_cache
+
+        def _run_cli(argv: list[str], env: dict[str, str]) -> tuple[int, str, str]:
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch("sys.stdout", out_buf),
+                mock.patch("sys.stderr", err_buf),
+            ):
+                rc = cli_mod.main(argv)
+            return rc, out_buf.getvalue(), err_buf.getvalue()
+
+        clear_hotwords_cache()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                home = root / "home"
+                home.mkdir()
+                rt = root / "rt"
+                rt.mkdir(mode=0o700)
+                app_home = home / ".agent-voice-input"
+                app_home.mkdir(mode=0o700)
+
+                # Symlink hotwords/ to external harness directory
+                harness_hw = root / "harness_hotwords"
+                harness_hw.mkdir(mode=0o755)
+                os.chmod(harness_hw, 0o755)
+                (app_home / "hotwords").symlink_to(harness_hw)
+
+                # Legacy XDG file triggers [migrate] in doctor (because config.toml not yet created)
+                legacy_dir = home / ".config" / "agent-voice-input"
+                legacy_dir.mkdir(parents=True)
+                (legacy_dir / "hotwords.txt").write_text("OldTerm\n", encoding="utf-8")
+
+                env = {
+                    "HOME": str(home),
+                    "PATH": "",
+                    "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                    "DASHSCOPE_API_KEY": "sk-dash-step4-test-1234",
+                }
+
+                # 1. `hotwords path` & `--json` surface personal.txt path + hotwords/ symlink realpath
+                rc, out_p, err_p = _run_cli(["hotwords", "path"], env)
+                self.assertEqual(rc, 0, err_p)
+                self.assertIn(str(app_home / "hotwords" / "personal.txt"), out_p)
+                self.assertIn("hotwords/ symlink ->", out_p)
+                self.assertIn(os.path.realpath(str(harness_hw)), out_p)
+
+                rc, out_pj, err_pj = _run_cli(["hotwords", "path", "--json"], env)
+                self.assertEqual(rc, 0, err_pj)
+                pj = json.loads(out_pj)
+                self.assertEqual(pj["path"], str(app_home / "hotwords" / "personal.txt"))
+                self.assertTrue(pj["dir_is_symlink"])
+                self.assertEqual(pj["dir_realpath"], os.path.realpath(str(harness_hw)))
+
+                # 2. `hotwords add` + in-place `--pin` upgrade + `remove` (removes all .lower() dups, keeps comments/CRLF)
+                personal = harness_hw / "personal.txt"
+                personal.write_bytes(b"# my comment\r\nAlpha\r\nalpha\r\nBeta\r\n")
+                rc, out_up, err_up = _run_cli(["hotwords", "add", "beta", "--pin"], env)
+                self.assertEqual(rc, 0, err_up)
+                self.assertIn("Updated (1): Beta (+pinned)", out_up)
+                self.assertIn(b"!Beta\r\n", personal.read_bytes())
+
+                rc, out_rm, err_rm = _run_cli(["hotwords", "remove", "ALPHA", "--json"], env)
+                self.assertEqual(rc, 0, err_rm)
+                rm_js = json.loads(out_rm)
+                self.assertTrue(rm_js["changed"])
+                self.assertEqual(rm_js["removed"], ["Alpha"])
+                raw_after_rm = personal.read_bytes()
+                self.assertIn(b"# my comment\r\n", raw_after_rm)
+                self.assertNotIn(b"Alpha", raw_after_rm)
+                self.assertNotIn(b"alpha", raw_after_rm)
+                self.assertIn(b"!Beta\r\n", raw_after_rm)
+                # Ensure directory-fd flock left zero .lock files in symlinked harness_hw
+                self.assertEqual([p.name for p in harness_hw.iterdir()], ["personal.txt"])
+
+                # 3. Diagnostics in `hotwords list` AND zero-text-leak `doctor --json` + `[migrate]` + `[hotwords]`
+                secret_lines = [
+                    "[coding]",
+                    "UltraSecretVocabXYZ <- 共享秘词",
+                    "AnotherSecretTerm <- 共享秘词",
+                    "Bad<Xml>Line",
+                    "<<<<<<< HEAD",
+                    "ConflictedSecretTerm",
+                    "=======",
+                    "OtherConflictedSecret",
+                    ">>>>>>> main",
+                    *[f"SecTerm{i:03d}" for i in range(205)],
+                ]
+                personal.write_text("\n".join(secret_lines) + "\n", encoding="utf-8")
+
+                rc, out_list, err_list = _run_cli(["hotwords", "list"], env)
+                self.assertEqual(rc, 0, err_list)
+                self.assertIn("Hotwords dir:", out_list)
+                self.assertIn("[Diagnostics]", out_list)
+                self.assertIn("legacy section header", out_list)
+                self.assertIn("ambiguous alias", out_list)
+                self.assertIn("conflict block", out_list)
+                self.assertIn("invalid line", out_list)
+                self.assertIn("TRUNCATED:", out_list)
+
+                rc, out_lj, err_lj = _run_cli(["hotwords", "list", "--json"], env)
+                self.assertEqual(rc, 0, err_lj)
+                lj = json.loads(out_lj)
+                self.assertEqual(lj["diagnostics"]["legacy_sections"], ["[coding]"])
+                self.assertEqual(len(lj["diagnostics"]["ambiguous_aliases"]), 1)
+                self.assertEqual(lj["diagnostics"]["conflict_lines"], [5])
+                self.assertEqual(len(lj["diagnostics"]["invalid_lines"]), 1)
+                self.assertTrue(lj["stage2_budget"]["truncated"])
+
+                # Doctor text & JSON: WARN does not fail rc=0; shows [migrate] + [hotwords]; ZERO secret term text in JSON!
+                cfg, eff_env = load_config(env=env)
+                out_doc_txt = io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                    mock.patch("sys.stdout", out_doc_txt),
+                ):
+                    rc_dt = cli_mod._cmd_doctor(cfg, eff_env, as_json=False)
+                self.assertEqual(rc_dt, 0, out_doc_txt.getvalue())
+                dt = out_doc_txt.getvalue()
+                self.assertIn("[migrate]   INFO legacy config found in", dt)
+                self.assertIn("[hotwords]  WARN ", dt)
+                self.assertIn("symlink ->", dt)
+                self.assertIn("git conflict block(s)", dt)
+                self.assertIn("stage2 overflow", dt)
+
+                out_doc_js = io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                    mock.patch("sys.stdout", out_doc_js),
+                ):
+                    rc_dj = cli_mod._cmd_doctor(cfg, eff_env, as_json=True)
+                self.assertEqual(rc_dj, 0)
+                raw_doc_json = out_doc_js.getvalue()
+                doc_obj = json.loads(raw_doc_json)
+                self.assertTrue(doc_obj["ok"])
+                self.assertIn("legacy config found", doc_obj["migration_hint"])
+                hw_rep = doc_obj["hotwords"]
+                self.assertTrue(hw_rep["exists"])
+                self.assertTrue(hw_rep["dir_is_symlink"])
+                self.assertEqual(
+                    set(hw_rep["counts"].keys()),
+                    {
+                        "total",
+                        "kept",
+                        "dropped_count",
+                        "stage2_kept",
+                        "stage2_dropped",
+                        "used_chars",
+                        "max_items",
+                        "max_chars",
+                        "warnings_count",
+                    },
+                )
+                self.assertEqual(hw_rep["counts"]["kept"], 200)
+                self.assertEqual(hw_rep["counts"]["dropped_count"], 7)
+                self.assertEqual(hw_rep["counts"]["stage2_kept"], 200)
+                self.assertEqual(hw_rep["counts"]["stage2_dropped"], 7)
+                self.assertEqual(hw_rep["issues"]["conflict_lines"], [5])
+                self.assertEqual(hw_rep["issues"]["ambiguous_aliases_count"], 1)
+                self.assertEqual(hw_rep["issues"]["legacy_sections_count"], 1)
+                self.assertEqual(hw_rep["issues"]["invalid_lines_count"], 1)
+                self.assertTrue(hw_rep["issues"]["stage2_truncated"])
+                # Privacy invariant: ZERO hotword terms / aliases / dropped words in entire doctor --json output!
+                for forbidden in (
+                    "UltraSecretVocabXYZ",
+                    "AnotherSecretTerm",
+                    "共享秘词",
+                    "ConflictedSecretTerm",
+                    "SecTerm",
+                    "Bad<Xml>Line",
+                ):
+                    self.assertNotIn(forbidden, raw_doc_json)
+
+                # Healthy clean personal.txt -> [hotwords] OK (no WARN)
+                personal.write_text("!Codex\nGhostty\n", encoding="utf-8")
+                out_doc_ok = io.StringIO()
+                with (
+                    mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                    mock.patch("sys.stdout", out_doc_ok),
+                ):
+                    rc_dok = cli_mod._cmd_doctor(cfg, eff_env, as_json=False)
+                self.assertEqual(rc_dok, 0)
+                self.assertIn("[hotwords]  OK ", out_doc_ok.getvalue())
+                self.assertIn("total=2, stage2=2/200", out_doc_ok.getvalue())
         finally:
             clear_hotwords_cache()
 

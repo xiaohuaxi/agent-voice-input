@@ -1894,14 +1894,14 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
 
             # Top-level cli.main() exception redaction: non-prefix UUID-like secret stored ONLY in .env
             # under a custom api_key_env pointer MUST still be redacted on uncaught Exception & ConfigError!
-            cfg_dir = Path(td) / ".config" / "agent-voice-input"
+            cfg_dir = Path(td) / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
             custom_uuid_secret = "11111111-" + ("2222-" * 3) + ("3" * 12)
             (cfg_dir / "config.toml").write_text(
                 '[asr]\nprovider = "openai-compatible"\nbase_url = "http://127.0.0.1:8000/v1"\napi_key_env = "CUSTOM_PLAIN_CRED"\n',
                 encoding="utf-8",
             )
-            (cfg_dir / "agent-voice-input.env").write_text(
+            (cfg_dir / ".env").write_text(
                 f'CUSTOM_PLAIN_CRED="{custom_uuid_secret}"\n',
                 encoding="utf-8",
             )
@@ -1973,7 +1973,6 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         # DashScope multi-part list content joins all segments and strips trailing '】【' artifact
         cfg = Config()
         cfg.asr.provider = "dashscope"
-        cfg.asr.hotwords_file = ""
         asr_out = transcribe(
             _voiced_wav(),
             cfg,
@@ -2345,7 +2344,6 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         env_ab = {"OPENAI_API_KEY": "sk-oai-" + ("z" * 16)}
         cfg_ab = Config()
         cfg_ab.asr.provider = "openai"
-        cfg_ab.asr.hotwords_file = ""
         prov_ab = create_asr_provider(cfg_ab, resolve_credentials(cfg_ab, env_ab), env=env_ab, transport=tx_sibling_abort)
         two_chunk_wav = pack_pcm16_mono_wav([3500, -3500] * 12000 + [0] * 6400 + [3500, -3500] * 12000)
         t_ab0 = time.monotonic()
@@ -2473,7 +2471,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 daemon.close()
 
         # 4. WslPlatform auto fallback unlatches when secondary also fails instead of locking forever
-        wplat = WslPlatform(Config(), env={"VOICE_INPUT_PULSE_SOURCE": "custom_src"})
+        wplat = WslPlatform(Config(), env={"AGENT_VOICE_INPUT_PULSE_SOURCE": "custom_src"})
         self.assertFalse(wplat._use_winmm)
         self.assertTrue(wplat.switch_to_fallback_audio())
         self.assertTrue(wplat._use_winmm)
@@ -2521,7 +2519,6 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             cfg_sh = Config()
             cfg_sh.asr.provider = "openrouter"
             cfg_sh.asr.model = "google/gemini-2.5-flash"
-            cfg_sh.asr.hotwords_file = ""
             cfg_sh.refiner.provider = "openrouter"
             creds_sh = resolve_credentials(cfg_sh, env)
             res_sh = run_pipeline_once(
@@ -2548,7 +2545,6 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             cfg_ds = Config()
             cfg_ds.asr.provider = "dashscope"
             cfg_ds.asr.model = "qwen3-asr-flash"
-            cfg_ds.asr.hotwords_file = ""
             cfg_ds.refiner.provider = "openrouter"
             creds_ds = resolve_credentials(cfg_ds, env)
             res_ds = run_pipeline_once(
@@ -2573,7 +2569,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         self.assertIs(Config().hotkey.yield_remote_desktop, True)
         with tempfile.TemporaryDirectory() as td_cfg:
             home = Path(td_cfg)
-            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
             (cfg_dir / "config.toml").write_text("[hotkey]\nonly_in_terminals = false\n", encoding="utf-8")
             c_false, _ = load_config(env={"HOME": str(home)}, home_dir=home)
@@ -2598,7 +2594,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 load_config(env={"HOME": str(home)}, home_dir=home)
 
         # 2. Windows terminal whitelist single source of truth
-        wplat = WslPlatform(Config(), env={"VOICE_INPUT_PULSE_SOURCE": "custom_src"})
+        wplat = WslPlatform(Config(), env={"AGENT_VOICE_INPUT_PULSE_SOURCE": "custom_src"})
         for ok_proc in (
             "WindowsTerminal",
             "WindowsTerminal.exe",
@@ -6277,7 +6273,8 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            hw_file = root / "hotwords.txt"
+            hw_file = root / "home" / ".agent-voice-input" / "hotwords" / "personal.txt"
+            hw_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             hw_file.write_text("自定义术语\n", encoding="utf-8")
             env_en = {"HOME": str(root / "home"), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(root / "rt"), "LANG": "en_US.UTF-8"}
             env_zh = {**env_en, "LANG": "zh_CN.UTF-8"}
@@ -6285,7 +6282,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
 
             for lang, cur_env in (("en", env_en), ("auto", env_en), ("auto", env_zh), ("zh", env_en)):
                 cfg = Config(
-                    asr=AsrConfig(hotwords_file=str(hw_file)),
+                    asr=AsrConfig(),
                     ui=UiConfig(language=lang),
                 )
                 res = run_pipeline_once(
@@ -7129,14 +7126,14 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            # Hermetic path resolution under HOME and XDG_CACHE_HOME
+            # Hermetic path resolution under HOME and AGENT_VOICE_INPUT_HOME
             self.assertEqual(
                 resolve_saved_recordings_dir({"HOME": str(tmp)}),
-                tmp / ".cache" / "agent-voice-input" / "recordings",
+                tmp / ".agent-voice-input" / "recordings",
             )
             self.assertEqual(
-                resolve_saved_recordings_dir({"HOME": str(tmp), "XDG_CACHE_HOME": str(tmp / "xdg_c")}),
-                tmp / "xdg_c" / "agent-voice-input" / "recordings",
+                resolve_saved_recordings_dir({"HOME": str(tmp), "AGENT_VOICE_INPUT_HOME": str(tmp / "avi_home")}),
+                tmp / "avi_home" / "recordings",
             )
 
             for bad_toml in (
@@ -7752,7 +7749,6 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             cfg_sh_ali = Config()
             cfg_sh_ali.asr.provider = "dashscope"
             cfg_sh_ali.asr.model = "qwen3.8-omni-flash"
-            cfg_sh_ali.asr.hotwords_file = ""
             sh_prov = create_asr_provider(cfg_sh_ali, resolve_credentials(cfg_sh_ali, env), env=env, transport=sh_tx)
             sh_prov.transcribe(voiced, context=zero_ctx)
             sh_user_txt = json.dumps(json.loads(sh_reqs[0].body.decode("utf-8"))["messages"][1]["content"], ensure_ascii=False)
@@ -9608,10 +9604,9 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 fallback_context: str = "",
                 mode: str = "agent",
                 workspace_cwd: str = "",
-                target_hint: str = "",
                 **kw: object,
             ) -> RefinerResult:
-                del target_hint, kw
+                del kw
                 blocks = (
                     []
                     if mode == "general"
@@ -10227,7 +10222,8 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(r_term["window_category"], "terminal")
                 self.assertEqual(r_term["mode"], "agent")
                 self.assertTrue(r_term["should_sync"])
-                self.assertEqual(r_term["hotwords_scope"], "coding")
+                self.assertNotIn("hotwords_scope", r_term)
+                self.assertNotIn("target_app_hint", r_term)
                 self.assertGreater(r_term["hotword_count"], 0)
                 self.assertEqual(r_term["session_key_masked"], "codex:abcd1234")
                 self.assertTrue(r_term["matched_by"])
@@ -10246,7 +10242,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(r_agy["window_category"], "coding_gui")
                 self.assertEqual(r_agy["mode"], "agent")
                 self.assertFalse(r_agy["should_sync"])
-                self.assertEqual(r_agy["hotwords_scope"], "coding")
                 self.assertEqual(r_agy["session_key_masked"], "agy:75ae924a")
                 self.assertEqual(r_agy["matched_by"], "ide_db_title")
                 self.assertFalse(r_agy["remote_vetoed"])
@@ -10254,7 +10249,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertGreater(r_agy["ctx_chars"], 0)
                 self.assertGreaterEqual(r_agy["ctx_chunks"], 1)
 
-                # c) ChatGPT/Codex desktop local repo dynamic promotion to agent + coding
+                # c) ChatGPT/Codex desktop local repo dynamic promotion to agent
                 r_cdx_local = daemon.handle_control(
                     {"cmd": "probe_route", "process": "ChatGPT.exe", "title": "Refactor QuartzBatcher"}
                 )
@@ -10263,8 +10258,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(r_cdx_local["window_category"], "general_gui")
                 self.assertEqual(r_cdx_local["mode"], "agent")
                 self.assertFalse(r_cdx_local["should_sync"])
-                self.assertEqual(r_cdx_local["target_app_hint"], "")
-                self.assertEqual(r_cdx_local["hotwords_scope"], "coding")
                 self.assertEqual(r_cdx_local["session_key_masked"], "codex:01a207c8")
                 self.assertEqual(r_cdx_local["matched_by"], "codex_desktop_db")
                 self.assertFalse(r_cdx_local["remote_vetoed"])
@@ -10297,8 +10290,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(r_wechat["window_category"], "general_gui")
                 self.assertEqual(r_wechat["mode"], "general")
                 self.assertFalse(r_wechat["should_sync"])
-                self.assertEqual(r_wechat["target_app_hint"], "im_chat")
-                self.assertEqual(r_wechat["hotwords_scope"], "chat")
                 self.assertEqual(r_wechat["session_key_masked"], "")
                 self.assertEqual(r_wechat["matched_by"], "")
                 self.assertFalse(r_wechat["remote_vetoed"])
@@ -10350,7 +10341,8 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 r_live = daemon.handle_control({"cmd": "probe_route", "use_live_window": True})
                 all_resps.append(r_live)
                 self.assertEqual(plat.fg_calls, 1)
-                self.assertEqual(r_live["target_app_hint"], "im_chat")
+                self.assertEqual(r_live["window_category"], "general_gui")
+                self.assertEqual(r_live["mode"], "general")
 
                 # h) Global redlines: zero ASR/Refiner/telemetry/state/UI/path/dialog leakage & tracker isolation
                 self.assertEqual(asr.calls, 0)
@@ -11031,13 +11023,14 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self,
                 snapshot: SessionSnapshot | None,
                 *,
+                personal_hotwords: object = (),
+                workspace_dynamic_hotwords: object = (),
                 extra_hotwords: object = (),
                 mode: str = "agent",
                 language: str = "auto",
-                target_hint: str = "",
             ) -> AsrContext:
-                del snapshot, extra_hotwords, language, target_hint
-                return AsrContext(hotwords=("demo",), mode=mode)
+                del snapshot, personal_hotwords, workspace_dynamic_hotwords, extra_hotwords, language
+                return AsrContext(hotwords=["demo"], mode=mode)
 
             def get_refiner_context_with_prior(self, *args: object, **kw: object) -> tuple[str, list[str], str]:
                 del args, kw
@@ -12502,7 +12495,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         fallback_context=str(kw.get("fallback_context") or ""),
                         mode=mode,
                         workspace_cwd=str(kw.get("workspace_cwd") or ""),
-                        target_hint=str(kw.get("target_hint") or ""),
                     )
                     seen_calls.append(
                         {
@@ -12800,7 +12792,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         fallback_context=str(kw.get("fallback_context") or ""),
                         mode=mode,
                         workspace_cwd=str(kw.get("workspace_cwd") or ""),
-                        target_hint=str(kw.get("target_hint") or ""),
                     )
                     seen_blocks.append(blocks)
                     return RefinerResult(
@@ -13155,8 +13146,15 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         del wav_bytes, context, is_cancelled, cancel_token
                         return AsrResult(text=self._text, provider="static_asr", model="m", latency_ms=1)
 
+                app_home_p = Path(td) / "avi_home_p"
+                hw_file_p = app_home_p / "hotwords" / "personal.txt"
+                hw_file_p.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                hw_file_p.write_text(
+                    "GlobalName <- 格洛博\nCodingCrate <- 科丁\nChatFriend <- 查特\n",
+                    encoding="utf-8",
+                )
+                env_p = {"AGENT_VOICE_INPUT_HOME": str(app_home_p)}
                 cfg_p = Config()
-                cfg_p.asr.hotwords_file = str(hw_file)
                 tracker_p = _isolated_tracker(Path(td))
                 fake_asr = _StaticAsr("测试热加载")
                 cap_ref = _CaptureVocabRefiner()
@@ -13169,12 +13167,13 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     refiner=cap_ref,
                     mode="agent",
                     dry_run=True,
-                    env={},
+                    env=env_p,
                 )
                 self.assertEqual(seen_vocab[-1][0], "agent")
-                self.assertIn("CodingCrate (ASR has misheard as: 科丁)", seen_vocab[-1][1])
-                self.assertIn("GlobalName (ASR has misheard as: 格洛博)", seen_vocab[-1][1])
-                self.assertNotIn("ChatFriend", seen_vocab[-1][1])
+                agent_block = seen_vocab[-1][1]
+                self.assertIn("CodingCrate (ASR has misheard as: 科丁)", agent_block)
+                self.assertIn("GlobalName (ASR has misheard as: 格洛博)", agent_block)
+                self.assertIn("ChatFriend (ASR has misheard as: 查特)", agent_block)
 
                 run_pipeline_once(
                     _voiced_wav(),
@@ -13184,16 +13183,15 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     refiner=cap_ref,
                     mode="general",
                     dry_run=True,
-                    env={},
+                    env=env_p,
                 )
                 self.assertEqual(seen_vocab[-1][0], "general")
-                self.assertIn("GlobalName (ASR has misheard as: 格洛博)", seen_vocab[-1][1])
-                self.assertIn("ChatFriend (ASR has misheard as: 查特)", seen_vocab[-1][1])
-                self.assertNotIn("CodingCrate", seen_vocab[-1][1])
+                # Unified Block 0 is byte-identical across agent and general modes
+                self.assertEqual(seen_vocab[-1][1], agent_block)
 
-                # Edit hotwords.txt on disk without restarting -> reflected on next utterance immediately
-                hw_file.write_text(
-                    "[global]\nHotReloadedTerm <- 热点词\n",
+                # Edit personal.txt on disk without restarting -> reflected on next utterance immediately
+                hw_file_p.write_text(
+                    "HotReloadedTerm <- 热点词\n",
                     encoding="utf-8",
                 )
                 run_pipeline_once(
@@ -13204,7 +13202,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     refiner=cap_ref,
                     mode="general",
                     dry_run=True,
-                    env={},
+                    env=env_p,
                 )
                 self.assertIn("HotReloadedTerm (ASR has misheard as: 热点词)", seen_vocab[-1][1])
                 self.assertNotIn("GlobalName", seen_vocab[-1][1])
@@ -13218,13 +13216,16 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             clear_hotwords_cache()
             try:
-                hw_file = Path(td) / "hotwords.txt"
+                app_home = Path(td) / "avi_home"
+                hw_file = app_home / "hotwords" / "personal.txt"
+                hw_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
                 hw_file.write_text(
-                    "[global]\nGlobalName <- 格洛博\n"
-                    "[coding]\nCodingCrate <- 科丁\n"
-                    "[chat]\nChatFriend <- 查特\n",
+                    "GlobalName <- 格洛博\n"
+                    "CodingCrate <- 科丁\n"
+                    "ChatFriend <- 查特\n",
                     encoding="utf-8",
                 )
+                env_d = {"AGENT_VOICE_INPUT_HOME": str(app_home)}
                 seen_calls: list[tuple[str, str, str]] = []
 
                 class _CaptureStage2Refiner(BaseRefiner):
@@ -13244,10 +13245,9 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
 
                 plat = _FakePlatform()
                 cfg = Config(refiner=RefinerConfig(provider="deepseek"))
-                cfg.asr.hotwords_file = str(hw_file)
                 daemon = VoiceInputDaemon(
                     cfg,
-                    env={},
+                    env=env_d,
                     runtime_dir=Path(td),
                     platform=plat,
                     asr_provider=_FakeAsr("热键队列测试"),
@@ -13271,7 +13271,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     self.assertEqual(seen_calls[0][1], "agent")
                     self.assertIn("CodingCrate (ASR has misheard as: 科丁)", seen_calls[0][2])
                     self.assertIn("GlobalName (ASR has misheard as: 格洛博)", seen_calls[0][2])
-                    self.assertNotIn("ChatFriend", seen_calls[0][2])
+                    self.assertIn("ChatFriend (ASR has misheard as: 查特)", seen_calls[0][2])
 
                     # 2. General mode (general GUI foreground) via real hotkey queue -> _run_stage2_slot()
                     plat.fg = ForegroundWindow(hwnd=202, process="WeChat", title="微信")
@@ -13286,9 +13286,8 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     self.assertEqual(len(seen_calls), 2)
                     self.assertTrue(seen_calls[1][0].startswith("avi-stage2-"), seen_calls[1][0])
                     self.assertEqual(seen_calls[1][1], "general")
-                    self.assertIn("GlobalName (ASR has misheard as: 格洛博)", seen_calls[1][2])
-                    self.assertIn("ChatFriend (ASR has misheard as: 查特)", seen_calls[1][2])
-                    self.assertNotIn("CodingCrate", seen_calls[1][2])
+                    # Unified personal Block 0 is identical across agent & general
+                    self.assertEqual(seen_calls[1][2], seen_calls[0][2])
                 finally:
                     daemon.close()
             finally:
@@ -13345,6 +13344,263 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
         canned_reply[0] = inline_example
         res_inline = ref.refine("请保留示例", mode="general", vocabulary_hints=vocab_blk)
         self.assertEqual(res_inline.text, inline_example)
+
+    def test_daemon_pipeline_to_narrow_provider_preserves_30pct_dynamic_reserve_and_bucket_separation(self) -> None:
+        from agent_voice_input.asr_providers import create_asr_provider
+        from agent_voice_input.config import AsrConfig
+        from agent_voice_input.daemon_pipeline import _Stage1State, _resolve_stage1_context, run_probe_route_request
+        from agent_voice_input.hotwords import clear_hotwords_cache
+        from agent_voice_input.refiner import NoopRefiner
+        from agent_voice_input.session_ctx import SessionSnapshot
+        from agent_voice_input.workspace_ctx import SessionMatch
+
+        with tempfile.TemporaryDirectory() as td:
+            clear_hotwords_cache()
+            try:
+                tmp = Path(td)
+                app_home = tmp / "avi_home"
+                hw_file = app_home / "hotwords" / "personal.txt"
+                hw_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                # 80 short personal terms (6 chars each -> fits comfortably within Doubao's 500-char cap)
+                personal_80 = [f"P{i:03d}x" for i in range(80)]
+                hw_file.write_text("\n".join(personal_80) + "\n", encoding="utf-8")
+
+                dynamic_20 = [f"D{i:03d}y" for i in range(20)]
+
+                class _DynamicStubTracker(SessionTracker):
+                    def __init__(self, snap_to_return: SessionSnapshot | None, ws_hw: list[str]) -> None:
+                        super().__init__(
+                            home_dir=tmp / "home",
+                            runtime_dir=tmp / "rt",
+                            proc_root=tmp / "empty_proc",
+                            env={"HOME": str(tmp / "home"), "AGENT_VOICE_INPUT_HOME": str(app_home)},
+                        )
+                        self._fixed_snap = snap_to_return
+                        self._ws_hw = list(ws_hw)
+
+                    def sync_session(self, **kw: object) -> SessionSnapshot | None:
+                        del kw
+                        return self._fixed_snap
+
+                    def build_workspace_hotwords(self, cwd: str) -> list[str]:
+                        del cwd
+                        return list(self._ws_hw)
+
+                snap_20 = SessionSnapshot(
+                    match=SessionMatch(cli="codex", session_id="s-dyn", jsonl_path=str(tmp / "s.jsonl"), cwd=str(tmp)),
+                    clean_turns=(("user", "讨论动态词"),),
+                    luna_synced_idx=0,
+                    generation=1,
+                    git_status="",
+                    hotwords=tuple(dynamic_20),
+                    byte_offset=10,
+                )
+
+                env_base = {
+                    "HOME": str(tmp / "home"),
+                    "AGENT_VOICE_INPUT_HOME": str(app_home),
+                    "DOUBAO_SPEECH_API_KEY": "db-key-" + ("a" * 16),
+                    "OPENAI_API_KEY": "sk-oai-" + ("b" * 16),
+                }
+
+                # 1. Doubao (50-term narrow window) through run_pipeline_once -> _resolve_stage1_context -> _coerce_context -> project_stage1_hotwords
+                db_reqs: list[HttpRequest] = []
+
+                def db_tx(req: HttpRequest) -> HttpResponse:
+                    db_reqs.append(req)
+                    return HttpResponse(
+                        200,
+                        {"content-type": "application/json", "x-api-status-code": "20000000"},
+                        json.dumps({"result": {"text": "ok"}}).encode("utf-8"),
+                    )
+
+                cfg_db = Config(asr=AsrConfig(provider="doubao", doubao_mode="flash"), refiner=RefinerConfig(provider="off"))
+                db_prov = create_asr_provider(cfg_db, resolve_credentials(cfg_db, env_base), env=env_base, transport=db_tx)
+                tr_snap = _DynamicStubTracker(snap_20, [])
+                res_db = run_pipeline_once(
+                    _voiced_wav(),
+                    cfg=cfg_db,
+                    tracker=tr_snap,
+                    asr_provider=db_prov,
+                    refiner=NoopRefiner(),
+                    origin_window=ForegroundWindow(10, "WindowsTerminal.exe", "codex"),
+                    mode="agent",
+                    dry_run=True,
+                    env=env_base,
+                )
+                self.assertTrue(res_db.ok)
+                db_payload = json.loads(db_reqs[-1].body.decode("utf-8"))
+                db_corpus = json.loads(db_payload["request"]["corpus"]["context"])
+                db_words = [item["word"] for item in db_corpus["hotwords"]]
+                self.assertEqual(len(db_words), 50)
+                db_dyn_kept = [w for w in db_words if w in dynamic_20]
+                db_per_kept = [w for w in db_words if w in personal_80]
+                self.assertGreaterEqual(len(db_dyn_kept), 15, f"Doubao 30% dynamic reserve flattened: {db_words}")
+                self.assertEqual(len(db_per_kept), 35)
+
+                # 2. OpenAI gpt-transcribe keywords[] (50-term narrow window) through run_pipeline_once
+                oai_reqs: list[HttpRequest] = []
+
+                def oai_tx(req: HttpRequest) -> HttpResponse:
+                    oai_reqs.append(req)
+                    return HttpResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        json.dumps({"text": "ok"}).encode("utf-8"),
+                    )
+
+                cfg_oai = Config(asr=AsrConfig(provider="openai", model="gpt-transcribe"), refiner=RefinerConfig(provider="off"))
+                oai_prov = create_asr_provider(cfg_oai, resolve_credentials(cfg_oai, env_base), env=env_base, transport=oai_tx)
+                res_oai = run_pipeline_once(
+                    _voiced_wav(),
+                    cfg=cfg_oai,
+                    tracker=tr_snap,
+                    asr_provider=oai_prov,
+                    refiner=NoopRefiner(),
+                    origin_window=ForegroundWindow(10, "WindowsTerminal.exe", "codex"),
+                    mode="agent",
+                    dry_run=True,
+                    env=env_base,
+                )
+                self.assertTrue(res_oai.ok)
+                oai_body = oai_reqs[-1].body.decode("utf-8", errors="ignore")
+                oai_kws = [
+                    seg.split("\r\n--", 1)[0]
+                    for seg in oai_body.split('name="keywords[]"\r\n\r\n')[1:]
+                ]
+                self.assertEqual(len(oai_kws), 50)
+                oai_dyn_kept = [w for w in oai_kws if w in dynamic_20]
+                self.assertGreaterEqual(len(oai_dyn_kept), 15, f"OpenAI keywords 30% dynamic reserve flattened: {oai_kws}")
+
+                # 3. Sessionless workspace dynamic hotwords MUST land in dynamic_hotwords (NEVER personal_hotwords!)
+                ws_dir = tmp / "my_project"
+                ws_dir.mkdir()
+                ws_only = ["WsDynAlpha", "WsDynBeta"]
+                tr_ws = _DynamicStubTracker(None, ws_only)
+                st_ws = _Stage1State(t_total0=time.monotonic())
+                ws_ctx = _resolve_stage1_context(
+                    st_ws,
+                    cfg=cfg_oai,
+                    env=env_base,
+                    tracker=tr_ws,
+                    platform=None,
+                    origin_window=ForegroundWindow(11, "WindowsTerminal.exe", "bash", cwd=str(ws_dir)),
+                    window_title_override=None,
+                    audio_source="live",
+                    explicit_mode="agent",
+                    cancel_check=None,
+                )
+                self.assertTrue(ws_ctx.hotwords_bucketed)
+                self.assertNotIn("WsDynAlpha", ws_ctx.personal_hotwords)
+                self.assertNotIn("WsDynBeta", ws_ctx.personal_hotwords)
+                self.assertIn("WsDynAlpha", ws_ctx.dynamic_hotwords)
+                self.assertIn("WsDynBeta", ws_ctx.dynamic_hotwords)
+
+                # 4. probe_route exposes personal_hotword_count (equals hotword_count in general mode)
+                probe_gen = run_probe_route_request(
+                    {"process": "Safari", "title": "Mail", "bundle_id": "com.apple.Safari"},
+                    cfg=cfg_oai,
+                    env=env_base,
+                    probe_tracker=tr_ws,
+                    platform=_FakePlatform(),
+                    known_cwds_snap=(),
+                    cancel_fn=lambda: False,
+                )
+                self.assertEqual(probe_gen["mode"], "general")
+                self.assertEqual(probe_gen["personal_hotword_count"], 80)
+                self.assertEqual(probe_gen["hotword_count"], 80)
+            finally:
+                clear_hotwords_cache()
+
+    def test_daemon_status_hotwords_whitelist_never_leaks_terms_or_dropped_text(self) -> None:
+        from agent_voice_input.control_ipc import build_daemon_status_response
+        from agent_voice_input.hotwords import (
+            clear_hotwords_cache,
+            summarize_stage2_hotwords_budget,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            clear_hotwords_cache()
+            try:
+                tmp = Path(td)
+                app_home = tmp / "avi_home"
+                hw_file = app_home / "hotwords" / "personal.txt"
+                hw_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                # 205 terms with unique secret markers + 1 ambiguous alias warning -> triggers dropped & warnings_count
+                lines = [
+                    "SecretAlpha001 <- 共享别名",
+                    "SecretBeta002 <- 共享别名",
+                    *[f"SecretTerm{i:03d}" for i in range(3, 206)],
+                ]
+                hw_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+                env_st = {"HOME": str(tmp / "home"), "AGENT_VOICE_INPUT_HOME": str(app_home)}
+                rt = tmp / "rt"
+                rt.mkdir(mode=0o700)
+                cfg = Config(refiner=RefinerConfig(provider="off"))
+                daemon = VoiceInputDaemon(
+                    cfg,
+                    env=env_st,
+                    runtime_dir=rt,
+                    platform=_FakePlatform(),
+                    asr_provider=_FakeAsr("ok"),
+                    refiner=create_refiner(cfg),
+                    tracker=_isolated_tracker(rt),
+                )
+                try:
+                    st_resp = daemon.handle_control({"cmd": "status"})
+                    self.assertTrue(st_resp["ok"])
+                    hw_info = st_resp.get("hotwords")
+                    self.assertIsInstance(hw_info, dict)
+                    assert isinstance(hw_info, dict)
+                    self.assertEqual(hw_info["total"], 205)
+                    self.assertEqual(hw_info["kept"], 200)
+                    self.assertEqual(hw_info["dropped_count"], 5)
+                    self.assertEqual(hw_info["stage2_kept"], 200)
+                    self.assertEqual(hw_info["stage2_dropped"], 5)
+                    self.assertGreaterEqual(hw_info["warnings_count"], 1)
+                    for k, v in hw_info.items():
+                        self.assertIsInstance(v, int, f"non-int status hotwords value {k}={v!r}")
+                        self.assertNotIsInstance(v, bool)
+                    raw_json = json.dumps(st_resp, ensure_ascii=False)
+                    self.assertNotIn("SecretAlpha001", raw_json)
+                    self.assertNotIn("SecretBeta002", raw_json)
+                    self.assertNotIn("SecretTerm", raw_json)
+                    self.assertNotIn("共享别名", raw_json)
+                    self.assertNotIn('"dropped":', raw_json)
+                finally:
+                    daemon.close()
+
+                # Direct defense-in-depth check: even if someone passes summary.as_dict() (which contains dropped terms),
+                # build_daemon_status_response strictly whitelists integer counters and strips all term strings!
+                dirty_summary = summarize_stage2_hotwords_budget(hw_file, env=env_st).as_dict()
+                self.assertTrue(dirty_summary["dropped"])
+                safe_resp = build_daemon_status_response(
+                    runtime_dir=rt,
+                    req={},
+                    build_id="test",
+                    state="idle",
+                    seq_id=0,
+                    pending_count=0,
+                    active_pipeline={"asr": {"provider": "dashscope"}},
+                    resolved_refiner_provider="off",
+                    shim_ok=True,
+                    shim_error="",
+                    last_result={},
+                    remote_hosts=None,
+                    mem_recent_results=(),
+                    hotwords=dirty_summary,
+                )
+                safe_json = json.dumps(safe_resp, ensure_ascii=False)
+                self.assertNotIn("SecretTerm", safe_json)
+                self.assertNotIn("SecretAlpha", safe_json)
+                self.assertNotIn('"dropped":', safe_json)
+                self.assertEqual(safe_resp["hotwords"]["dropped_count"], 5)
+                self.assertEqual(safe_resp["hotwords"]["total"], 205)
+                self.assertEqual(safe_resp["hotwords"]["stage2_kept"], 200)
+                self.assertEqual(safe_resp["hotwords"]["stage2_dropped"], 5)
+            finally:
+                clear_hotwords_cache()
 
 
 if __name__ == "__main__":

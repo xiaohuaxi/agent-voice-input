@@ -158,8 +158,8 @@ class TestRegressMatrixLayerB(unittest.TestCase):
                             "ok": True,
                             "window_category": "coding_gui",
                             "mode": "agent",
-                            "target_app_hint": "",
-                            "hotwords_scope": "coding",
+                            "hotword_count": 12,
+                            "personal_hotword_count": 3,
                             "session_key_masked": "agy:12345678",
                             "matched_by": "ide_db_title",
                             "remote_vetoed": False,
@@ -181,7 +181,8 @@ class TestRegressMatrixLayerB(unittest.TestCase):
                         "ok": True,
                         "window_category": "general_gui",
                         "mode": "general",
-                        "target_app_hint": "im_chat",
+                        "hotword_count": 3,
+                        "personal_hotword_count": 3,
                         "remote_vetoed": False,
                         "session_key_masked": "",
                         "ctx_chars": 0,
@@ -994,6 +995,7 @@ class TestRegressMatrixIsolationAndCli(unittest.TestCase):
                 "PATH": "/usr/bin:/bin",
                 "LANG": "C.UTF-8",
                 "HOME": "/host/real-home",
+                "AGENT_VOICE_INPUT_HOME": "/host/real-app-home",
                 "XDG_CONFIG_HOME": "/host/real-config",
                 "XDG_CACHE_HOME": "/host/real-cache",
                 "XDG_RUNTIME_DIR": "/host/real-runtime",
@@ -1017,6 +1019,7 @@ class TestRegressMatrixIsolationAndCli(unittest.TestCase):
                 rt_dir=rt_dir,
             )
             self.assertEqual(iso_env["HOME"], str(iso_home))
+            self.assertEqual(iso_env["AGENT_VOICE_INPUT_HOME"], str(iso_home / ".agent-voice-input"))
             self.assertEqual(iso_env["XDG_CONFIG_HOME"], str(iso_config))
             self.assertEqual(iso_env["XDG_CACHE_HOME"], str(iso_cache))
             self.assertEqual(iso_env["XDG_RUNTIME_DIR"], str(rt_dir))

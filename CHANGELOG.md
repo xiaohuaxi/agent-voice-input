@@ -8,7 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Unified `~/.agent-voice-input/` app home & `AGENT_VOICE_INPUT_HOME` root override**: Consolidated user-owned configuration (`config.toml`), credentials (`.env`), personal hotwords (`hotwords/personal.txt`), and opt-in MP3 recordings (`recordings/`) under `~/.agent-voice-input/` with an exclusive default-ignore `.gitignore` (tracking only `hotwords/`), native same-UID directory symlink support for `hotwords/` or the full app home, single-file symlink protection on `hotwords/personal.txt`, and one-shot migration hints in `init`/`doctor` when legacy `~/.config/agent-voice-input/` files exist.
+- **Flat personal hotwords with decoupled Stage 1 / Stage 2 projection & directory-locked editing**: Replaced scoped `[global]`/`[chat]`/`[coding]` hotword sections with a single flat `hotwords/personal.txt` supporting `!` pinning, `<-` mishearing aliases, `hotwords path` / `hotwords add --pin`, directory-fd `flock` mutual exclusion (zero `.lock` files inside symlinked dotfiles repos), two-pass ambiguous-alias hiding, git-conflict-block skipping, privacy-safe count-only health summaries in `status`/`doctor --json`, and dual-track ordering (Stage 1 preserves file order within priority tiers with 30% dynamic-term reserve and overflow refill in `agent` mode; Stage 2 Block 0 sorts deterministically to preserve prefix caching).
 - **Pre-ASR adaptive long-pause & edge-silence trimming (`[audio].silence_trim`)**: Added pure-stdlib silence compression (`"balanced"` default, `"conservative"`, `"off"`) inside `process_wav` before RMS scaling so long thinking pauses and excess leading/trailing silence are compressed with 10 ms integer linear crossfades without altering `gain_db`/`rms_dbfs`/`duration_sec`, while bypassing `< 4 s` clips, `< 1 s` savings, and `retry` replays, preserving raw original audio in `recordings/`, and reporting `silence_trimmed_sec` / `silence_trim_cuts` in telemetry and `diagnose`.
+
+### Changed
+- **Expanded DashScope & Stage 2 hotword budgets**: Raised DashScope `qwen3-asr-flash` Stage 1 hotword budget to `150 terms / 1,800 chars` (with dialogue tail budget kept isolated) and Stage 2 / single-hop `<vocabulary_hints>` Block 0 budget to `200 items / 3,000 chars`, fixing single-entry oversize truncation so shorter subsequent terms remain eligible.
+
+### Removed
+- **Non-agent app enumeration & `<target_app_hint>`**: Removed `ai_chat` / `im_chat` app & browser title enumerations, `BUILTIN_AI_CHAT_HOTWORDS`, `hotwords_scope`, and `<target_app_hint>` prompt injection/echo stripping while retaining full terminal, IDE, desktop Agent (Codex Desktop / Claude Desktop / Antigravity IDE), remote-client, and paste-shortcut routing.
+- **Legacy paths, `[asr].hotwords_file` & `VOICE_INPUT_*` env aliases**: Removed `~/.config/agent-voice-input/` / `~/.config/voice-input/` fallback lookups, `agent-voice-input.env` / `voice-input.env`, `[asr].hotwords_file` (now raises a clear migration error if present in `config.toml`), and the five legacy `VOICE_INPUT_*` environment aliases (`VOICE_INPUT_CONFIG`, `VOICE_INPUT_RUNTIME_DIR`, `VOICE_INPUT_CACHE_DIR`, `VOICE_INPUT_PULSE_SOURCE`, `VOICE_INPUT_WASAPI_LOOPBACK`).
 
 ## [0.16.0] - 2026-11-25
 

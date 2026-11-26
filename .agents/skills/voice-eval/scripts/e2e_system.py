@@ -66,6 +66,7 @@ from agent_voice_input.daemon import (  # noqa: E402
     read_telemetry_history,
     send_control_command,
 )
+from agent_voice_input.hotwords import resolve_personal_hotwords_path  # noqa: E402
 from agent_voice_input.platform_wsl import ForegroundWindow, PasteOutcome  # noqa: E402
 from agent_voice_input.refiner import create_refiner  # noqa: E402
 from agent_voice_input.session_ctx import SessionTracker, write_session_registry_entry  # noqa: E402
@@ -800,11 +801,29 @@ def main(argv: list[str] | None = None) -> int:
     with _install_term_signal_handlers(), tempfile.TemporaryDirectory(prefix="avi-e2e-") as td:
         rt_dir = ensure_secure_dir(Path(td) / "rt")
         iso_cache_dir = ensure_secure_dir(Path(td) / "cache")
+        iso_home = ensure_secure_dir(Path(td) / "app-home")
         e2e_env = dict(tmux_clean_env)
+        e2e_env["AGENT_VOICE_INPUT_HOME"] = str(iso_home)
+        if cfg.config_path:
+            e2e_env["AGENT_VOICE_INPUT_CONFIG"] = str(cfg.config_path)
         e2e_env["AGENT_VOICE_INPUT_RUNTIME_DIR"] = str(rt_dir)
         e2e_env["XDG_CACHE_HOME"] = str(iso_cache_dir)
         prev_pp = e2e_env.get("PYTHONPATH", "")
         e2e_env["PYTHONPATH"] = f"{_SRC_ROOT}{os.pathsep}{prev_pp}" if prev_pp else str(_SRC_ROOT)
+
+        # Mount host personal hotwords read-only (symlink dir or copy personal.txt) into isolated app-home
+        host_hw_path = resolve_personal_hotwords_path(raw_env)
+        if host_hw_path is not None:
+            host_hw_dir = host_hw_path.parent
+            iso_hw_dir = iso_home / "hotwords"
+            if host_hw_dir.is_dir():
+                try:
+                    os.symlink(host_hw_dir.resolve(), iso_hw_dir)
+                except OSError:
+                    ensure_secure_dir(iso_hw_dir)
+                    if host_hw_path.is_file() and not host_hw_path.is_symlink():
+                        shutil.copy2(host_hw_path, iso_hw_dir / "personal.txt")
+                        os.chmod(iso_hw_dir / "personal.txt", 0o600)
 
         # Subcheck 1: CLI `doctor` (offline) + `doctor --ping` (live endpoint connectivity & auth)
         t_doc0 = time.monotonic()

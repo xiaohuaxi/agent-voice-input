@@ -11,11 +11,20 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
 from agent_voice_input import __version__  # noqa: E402
-from agent_voice_input.asr_providers import AsrResult, create_asr_provider, load_hotwords_file  # noqa: E402
+from agent_voice_input.asr_providers import AsrResult, create_asr_provider  # noqa: E402
 from agent_voice_input.audio_proc import _write_temp_0600, list_saved_recordings, process_wav  # noqa: E402
 from agent_voice_input.config import DEFAULT_ASR_BASE_URLS, ensure_secure_dir, expand_user_path, get_runtime_dir, load_config, normalize_asr_provider, normalize_refiner_provider, redact_secrets, resolve_credentials, resolve_saved_recordings_dir, select_asr_provider  # noqa: E402
 from agent_voice_input.control_ipc import read_telemetry_history  # noqa: E402
 from agent_voice_input.daemon_pipeline import _may_run_stage2_refiner, _transcribe_wav_chunks  # noqa: E402
+from agent_voice_input.hotwords import (  # noqa: E402
+    HotwordsTable,
+    format_stage2_vocabulary_hints,
+    load_hotwords_table,
+    order_stage1_entries,
+    order_stage2_entries,
+    resolve_hotwords_quota_spec,
+    resolve_personal_hotwords_path,
+)
 from agent_voice_input.refiner import attach_single_hop_context, create_refiner  # noqa: E402
 from agent_voice_input.session_ctx import SessionMatch, SessionTracker, _clean_agy_record, _clean_claude_record, _collect_claude_storage_matches, _collect_codex_storage_matches, _extract_agy_transcript_cwd, _extract_codex_item_completed, _extract_codex_response_item, _is_agy_transcript_subagent, _resolve_agy_transcript_path  # noqa: E402
 
@@ -233,8 +242,12 @@ def make_asr_cache_key(
     resource_id: str = "",
     doubao_mode: str = "",
     base_url: str = "",
+    personal_hotwords: Sequence[str] = (),
+    mode: str = "",
 ) -> tuple[str, str]:
     raw_ctx = "\n".join(hotwords)
+    if personal_hotwords or mode:
+        raw_ctx = f"{raw_ctx}\0personal={'|'.join(personal_hotwords)}\0mode={mode.strip().lower()}"
     if git_status or dialog_text:
         raw_ctx = f"{raw_ctx}\0{git_status}\0{dialog_text[-2500:]}"
     hw_sha1 = hashlib.sha1(raw_ctx.encode("utf-8")).hexdigest()
@@ -245,7 +258,9 @@ def make_asr_cache_key(
     norm_dmode = (doubao_mode or "auto").strip().lower() or "auto"
     default_url = DEFAULT_ASR_BASE_URLS.get(prov, "").rstrip("/")
     norm_url = (base_url or "").strip().rstrip("/") or default_url
-    slot_canon = f"api={norm_api}\0effort={norm_effort}\0rid={norm_rid}\0dmode={norm_dmode}\0url={norm_url}"
+    q_spec = resolve_hotwords_quota_spec(prov, model=asr_model, api=norm_api, base_url=norm_url)
+    quota_canon = f"{q_spec.key}:{q_spec.max_terms}:{q_spec.max_chars}:v2bucket"
+    slot_canon = f"api={norm_api}\0effort={norm_effort}\0rid={norm_rid}\0dmode={norm_dmode}\0url={norm_url}\0quota={quota_canon}"
     slot_sig = hashlib.sha1(slot_canon.encode("utf-8")).hexdigest()[:12]
     return f"v2:{rec_sha1}:{prov}:{asr_model}:{hw_sha1}:slot={slot_sig}", hw_sha1
 
@@ -459,6 +474,9 @@ def main(argv: list[str] | None = None) -> int:
     base_cfg, raw_env = load_config(config_path=args.config or None, home_dir=args.home_dir or None)
     env = {k: v for k, v in raw_env.items() if not ("FAST" in k.upper() and "CODEX" in k.upper())}
     home = Path(args.home_dir).expanduser().resolve() if args.home_dir else expand_user_path("~", env=env)
+    if args.home_dir:
+        env["HOME"] = str(home)
+        env["AGENT_VOICE_INPUT_HOME"] = str(home / ".agent-voice-input")
     eval_dir = _resolve_eval_dir(env, args.eval_dir)
     secrets = resolve_credentials(base_cfg, env).all_secret_values()
     redact_fn = lambda s: redact_secrets(str(s), env, cfg=base_cfg, extra_secrets=secrets)
@@ -512,7 +530,13 @@ def main(argv: list[str] | None = None) -> int:
         ov["refiner.context_max_chars"] = args.max_chars
     if args.no_git_status:
         ov["refiner.include_git_status"] = False
-    cfg, _ = load_config(config_path=args.config or None, cli_overrides=ov, env=env, home_dir=home, load_default_env_files=False)
+    cfg, _ = load_config(
+        config_path=args.config or None,
+        cli_overrides=ov,
+        env=env,
+        home_dir=home if args.home_dir else None,
+        load_default_env_files=False,
+    )
     creds = resolve_credentials(cfg, env)
     secrets = list(dict.fromkeys([*secrets, *creds.all_secret_values()]))
     redact_fn = lambda s: redact_secrets(str(s), env, cfg=cfg, extra_secrets=secrets)
@@ -589,7 +613,10 @@ def main(argv: list[str] | None = None) -> int:
     session_idx, asr_cache_path = _index_root_sessions(home), eval_dir / "asr_cache.json"
     raw_entries = _load_json_dict(asr_cache_path).get("entries")
     asr_entries: dict[str, Any] = dict(raw_entries) if isinstance(raw_entries, Mapping) else {}
-    file_hotwords = load_hotwords_file(cfg.asr.hotwords_file, env=env)
+    hw_path = resolve_personal_hotwords_path(env, home_dir=home if args.home_dir else None)
+    hw_table = load_hotwords_table(hw_path, env=env, use_cache=False) if hw_path is not None else HotwordsTable()
+    personal_stage1_hotwords = tuple(e.term for e in order_stage1_entries(hw_table.entries))
+    stage2_vocabulary_hints = format_stage2_vocabulary_hints(order_stage2_entries(hw_table.entries))
 
     with tempfile.TemporaryDirectory(prefix="avi-eval-rec-") as td:
         iso_rt, trunc_dir = ensure_secure_dir(Path(td) / "rt"), ensure_secure_dir(Path(td) / "rt" / "trunc")
@@ -626,8 +653,9 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 eff_skey = snap.session_key if snap else ""
                 asr_ctx = tracker.build_asr_context(
-                    snap, extra_hotwords=file_hotwords, mode=rec_mode, language=cfg.ui.language
+                    snap, personal_hotwords=personal_stage1_hotwords, mode=rec_mode, language=cfg.ui.language
                 )
+                asr_ctx.manual_hotwords_loaded = True
                 is_single_hop_asr = bool(getattr(eff_asr, "single_hop", False))
                 if is_single_hop_asr and asr_from_map is None:
                     asr_ctx = attach_single_hop_context(
@@ -636,6 +664,7 @@ def main(argv: list[str] | None = None) -> int:
                         tracker=tracker if snap is not None else None,
                         session_key=eff_skey,
                         mode=rec_mode,
+                        vocabulary_hints=stage2_vocabulary_hints,
                     )
                 if asr_from_map is not None:
                     src_s = asr_from_map.get(rec_sha1)
@@ -686,6 +715,8 @@ def main(argv: list[str] | None = None) -> int:
                         resource_id=cfg.asr.resource_id,
                         doubao_mode=cfg.asr.doubao_mode,
                         base_url=cfg.asr.effective_base_url(asr_prov),
+                        personal_hotwords=asr_ctx.personal_hotwords,
+                        mode=rec_mode,
                     )
                     hit = asr_entries.get(ckey) if (args.use_asr_cache and not args.refresh_asr) else None
                     if isinstance(hit, Mapping) and "text" in hit:
@@ -729,7 +760,15 @@ def main(argv: list[str] | None = None) -> int:
                     t_prep0 = time.monotonic()
                     eff_ref.prepare_session(eff_skey)
                     prep_ms = max(0, int(round((time.monotonic() - t_prep0) * 1000)))
-                ref_res = eff_ref.refine(asr_res, session_key=eff_skey, tracker=tracker, fallback_context=asr_ctx.dialog_text, is_cancelled=None, mode=rec_mode)
+                ref_res = eff_ref.refine(
+                    asr_res,
+                    session_key=eff_skey,
+                    tracker=tracker,
+                    fallback_context=asr_ctx.dialog_text,
+                    is_cancelled=None,
+                    mode=rec_mode,
+                    vocabulary_hints=stage2_vocabulary_hints,
+                )
                 if eff_skey:
                     seen_warm.add(eff_skey)
                 final_txt = ref_res.text.strip() or asr_res.text.strip()

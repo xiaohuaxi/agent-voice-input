@@ -461,7 +461,6 @@ class AsrConfig:
     doubao_mode: str = "auto"
     base_url: str = ""
     api_key_env: str = ""
-    hotwords_file: str = "~/.config/agent-voice-input/hotwords.txt"
     timeout_sec: float = 60.0
     max_retries: int = 2
 
@@ -741,6 +740,142 @@ def ensure_secure_dir(path: str | Path, *, expected_uid: int | None = None) -> P
     return target
 
 
+def _verify_existing_app_dir(target: Path, pre_st: os.stat_result, owner_uid: int) -> Path:
+    if stat.S_ISLNK(pre_st.st_mode):
+        try:
+            st = os.stat(target)
+        except OSError as exc:
+            raise ConfigError(
+                f"unsafe application directory (broken symlink): {target}: {exc}"
+            ) from None
+        if not stat.S_ISDIR(st.st_mode):
+            raise ConfigError(
+                f"unsafe application directory (symlink target is not a directory): {target}"
+            )
+        if st.st_uid != owner_uid:
+            raise ConfigError(
+                f"unsafe application directory owner uid={st.st_uid} (expected {owner_uid}): {target}"
+            )
+        return target
+    if not stat.S_ISDIR(pre_st.st_mode):
+        raise ConfigError(f"unsafe application directory (not a directory): {target}")
+    if pre_st.st_uid != owner_uid:
+        raise ConfigError(
+            f"unsafe application directory owner uid={pre_st.st_uid} (expected {owner_uid}): {target}"
+        )
+    return target
+
+
+def _mkdir_app_dir_0700(target: Path, owner_uid: int) -> Path:
+    try:
+        os.mkdir(target, 0o700)
+    except FileExistsError:
+        try:
+            pre_st = os.lstat(target)
+        except OSError as exc:
+            raise ConfigError(f"cannot inspect application directory {target}: {exc}") from None
+        return _verify_existing_app_dir(target, pre_st, owner_uid)
+    except OSError as exc:
+        raise ConfigError(f"cannot create application directory {target}: {exc}") from None
+
+    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(str(target), open_flags)
+    except OSError as exc:
+        raise ConfigError(
+            f"unsafe application directory (symlink or non-directory): {target}: {exc}"
+        ) from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):  # pragma: no cover - O_DIRECTORY guarantees directory on POSIX
+            raise ConfigError(f"unsafe application directory (not a directory): {target}")
+        if st.st_uid != owner_uid:
+            raise ConfigError(
+                f"unsafe application directory owner uid={st.st_uid} (expected {owner_uid}): {target}"
+            )
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+    return target
+
+
+def _ensure_app_parent_dirs(parent: Path, owner_uid: int) -> None:
+    if parent == parent.parent:
+        return
+    try:
+        st = os.stat(parent)
+    except FileNotFoundError:
+        try:
+            os.lstat(parent)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ConfigError(
+                f"cannot inspect application directory parent {parent}: {exc}"
+            ) from None
+        else:
+            raise ConfigError(f"unsafe application directory parent (broken symlink): {parent}")
+        _ensure_app_parent_dirs(parent.parent, owner_uid)
+        _mkdir_app_dir_0700(parent, owner_uid)
+        return
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect application directory parent {parent}: {exc}") from None
+    if not stat.S_ISDIR(st.st_mode):
+        raise ConfigError(f"unsafe application directory parent (not a directory): {parent}")
+
+
+def ensure_app_dir(
+    path: str | Path,
+    *,
+    expected_uid: int | None = None,
+    create: bool = True,
+) -> Path:
+    """Ensure ``path`` is a safe application directory; allow same-UID directory symlinks without chmodding targets."""
+    target = Path(path)
+    owner_uid = os.getuid() if expected_uid is None else expected_uid
+    try:
+        pre_st = os.lstat(target)
+    except FileNotFoundError:
+        if not create:
+            return target
+        _ensure_app_parent_dirs(target.parent, owner_uid)
+        return _mkdir_app_dir_0700(target, owner_uid)
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect application directory {target}: {exc}") from None
+    return _verify_existing_app_dir(target, pre_st, owner_uid)
+
+
+def resolve_app_home_dir(
+    env: Mapping[str, str] | None = None,
+    *,
+    home_dir: str | Path | None = None,
+) -> Path | None:
+    """Resolve ``~/.agent-voice-input`` (or ``AGENT_VOICE_INPUT_HOME``) without leaking host ``HOME`` into hermetic dicts."""
+    if home_dir is not None:
+        return Path(home_dir) / ".agent-voice-input"
+    explicit = env is not None and env is not os.environ
+    src = os.environ if env is None else env
+    raw_home = (src.get("HOME") or "").strip()
+    if raw_app_home := (src.get("AGENT_VOICE_INPUT_HOME") or "").strip():
+        if explicit and raw_app_home.startswith("~") and (not raw_home or _is_other_user_tilde(raw_app_home)):
+            raise ConfigError(
+                f"AGENT_VOICE_INPUT_HOME must be an absolute path: {raw_app_home!r}"
+            )
+        expanded = expand_user_path(raw_app_home, env=src)
+        if not expanded.is_absolute():
+            raise ConfigError(
+                f"AGENT_VOICE_INPUT_HOME must be an absolute path, got {raw_app_home!r}"
+            )
+        return expanded
+    if raw_home:
+        if explicit and _is_other_user_tilde(raw_home):
+            return None
+        return Path(raw_home) / ".agent-voice-input"
+    if explicit:
+        return None
+    return Path.home() / ".agent-voice-input"
+
+
 def get_runtime_dir(
     env: Mapping[str, str] | None = None,
     *,
@@ -749,11 +884,7 @@ def get_runtime_dir(
 ) -> Path:
     """Return ``${XDG_RUNTIME_DIR}/agent-voice-input`` (or ``~/.cache/agent-voice-input``)."""
     src_env = os.environ if env is None else env
-    explicit_rt = (
-        src_env.get("AGENT_VOICE_INPUT_RUNTIME_DIR")
-        or src_env.get("VOICE_INPUT_RUNTIME_DIR")
-        or ""
-    ).strip()
+    explicit_rt = (src_env.get("AGENT_VOICE_INPUT_RUNTIME_DIR") or "").strip()
     if explicit_rt:
         rt_dir = expand_user_path(explicit_rt, env=src_env)
     else:
@@ -779,17 +910,15 @@ def resolve_saved_recordings_dir(
     uid: int | None = None,
     create: bool = False,
 ) -> Path:
-    """Return ``${XDG_CACHE_HOME}/agent-voice-input/recordings`` (or ``~/.cache/agent-voice-input/recordings``)."""
-    src_env = os.environ if env is None else env
-    cache_home = (src_env.get("XDG_CACHE_HOME") or "").strip()
-    if cache_home:
-        rec_dir = expand_user_path(cache_home, env=src_env) / "agent-voice-input" / "recordings"
-    else:
-        raw_home = (src_env.get("HOME") or "").strip()
-        base_home = expand_user_path(raw_home, env=src_env) if raw_home else Path.home()
-        rec_dir = base_home / ".cache" / "agent-voice-input" / "recordings"
+    """Return ``<app_home>/recordings`` (default ``~/.agent-voice-input/recordings``)."""
+    app_home = resolve_app_home_dir(env)
+    if app_home is None:
+        raise ConfigError(
+            "cannot resolve recordings directory: HOME and AGENT_VOICE_INPUT_HOME are unset"
+        )
+    rec_dir = app_home / "recordings"
     if create:
-        ensure_secure_dir(rec_dir.parent, expected_uid=uid)
+        ensure_app_dir(app_home, expected_uid=uid, create=True)
         ensure_secure_dir(rec_dir, expected_uid=uid)
     return rec_dir
 
@@ -856,25 +985,13 @@ def parse_env_text(text: str) -> dict[str, str]:
     return result
 
 
-def _resolve_config_roots(
-    env: Mapping[str, str] | None = None,
-    *,
-    home_dir: str | Path | None = None,
-) -> tuple[list[Path], Path]:
-    src = os.environ if env is None else env
-    home = (
-        Path(home_dir)
-        if home_dir is not None
-        else Path((src.get("HOME") or "").strip() or Path.home())
-    )
-    roots: list[Path] = []
-    if home_dir is None or (env is not None and env is not os.environ):
-        if xdg := (src.get("XDG_CONFIG_HOME") or "").strip():
-            roots.append(expand_user_path(xdg, env=src, home_dir=home))
-    default_root = home / ".config"
-    if default_root not in roots:
-        roots.append(default_root)
-    return roots, home
+_BOOTSTRAP_ENV_KEYS = frozenset({"AGENT_VOICE_INPUT_HOME", "AGENT_VOICE_INPUT_CONFIG"})
+_LEGACY_MIGRATION_FILES: tuple[str, ...] = (
+    "config.toml",
+    "agent-voice-input.env",
+    ".env",
+    "hotwords.txt",
+)
 
 
 def default_config_file_candidates(
@@ -882,20 +999,9 @@ def default_config_file_candidates(
     *,
     home_dir: str | Path | None = None,
 ) -> list[Path]:
-    """Return ordered default config file lookup candidates across XDG & ``~/.config``."""
-    roots, _ = _resolve_config_roots(env, home_dir=home_dir)
-    out: list[Path] = []
-    for root in roots:
-        for sub_rel in (
-            ("agent-voice-input", "config.toml"),
-            ("agent-voice-input", "config.json"),
-            ("voice-input", "config.toml"),
-            ("voice-input", "config.json"),
-        ):
-            cand = root.joinpath(*sub_rel)
-            if cand not in out:
-                out.append(cand)
-    return out
+    """Return default config file candidate (``[<app_home>/config.toml]`` when resolved)."""
+    app_home = resolve_app_home_dir(env, home_dir=home_dir)
+    return [app_home / "config.toml"] if app_home is not None else []
 
 
 def default_env_file_candidates(
@@ -904,35 +1010,10 @@ def default_env_file_candidates(
     config_path: str | Path | None = None,
     home_dir: str | Path | None = None,
 ) -> list[Path]:
-    """Return ordered default ``.env`` lookup paths honoring ``--config``, ``AGENT_VOICE_INPUT_CONFIG`` & ``XDG_CONFIG_HOME``."""
-    src = os.environ if env is None else env
-    roots, home = _resolve_config_roots(env, home_dir=home_dir)
-    out: list[Path] = []
-    if config_path is not None and str(config_path).strip():
-        cfg_parent = expand_user_path(str(config_path).strip(), env=src, home_dir=home).parent
-        cand_env = cfg_parent / "agent-voice-input.env"
-        if cand_env not in out:
-            out.append(cand_env)
-    elif home_dir is None or (env is not None and env is not os.environ):
-        explicit_cfg = (
-            src.get("AGENT_VOICE_INPUT_CONFIG") or src.get("VOICE_INPUT_CONFIG") or ""
-        ).strip()
-        if explicit_cfg:
-            cfg_parent = expand_user_path(explicit_cfg, env=src, home_dir=home).parent
-            cand_env = cfg_parent / "agent-voice-input.env"
-            if cand_env not in out:
-                out.append(cand_env)
-    for root in roots:
-        for rel in (
-            ("agent-voice-input", "agent-voice-input.env"),
-            ("agent-voice-input", ".env"),
-            ("voice-input", "voice-input.env"),
-            ("voice-input", ".env"),
-        ):
-            p = root.joinpath(*rel)
-            if p not in out:
-                out.append(p)
-    return out
+    """Return the single default ``.env`` path (``[<app_home>/.env]`` when resolved)."""
+    _ = config_path  # External --config never reads a sibling .env; isolate via AGENT_VOICE_INPUT_HOME.
+    app_home = resolve_app_home_dir(env, home_dir=home_dir)
+    return [app_home / ".env"] if app_home is not None else []
 
 
 def resolve_target_config_paths(
@@ -943,20 +1024,85 @@ def resolve_target_config_paths(
 ) -> tuple[Path, Path, Path]:
     """Return ``(config_dir, config_toml_path, env_file_path)`` for ``init`` and diagnostics."""
     src = os.environ if env is None else env
-    roots, home = _resolve_config_roots(env, home_dir=home_dir)
+    home_for_expand = Path(home_dir) if home_dir is not None else None
     explicit = ""
     if config_path is not None and str(config_path).strip():
         explicit = str(config_path).strip()
     elif src.get("AGENT_VOICE_INPUT_CONFIG", "").strip():
         explicit = src["AGENT_VOICE_INPUT_CONFIG"].strip()
-    elif src.get("VOICE_INPUT_CONFIG", "").strip():
-        explicit = src["VOICE_INPUT_CONFIG"].strip()
     if explicit:
-        toml_path = expand_user_path(explicit, env=src, home_dir=home)
+        toml_path = expand_user_path(explicit, env=src, home_dir=home_for_expand)
         cfg_dir = toml_path.parent
-        return cfg_dir, toml_path, cfg_dir / "agent-voice-input.env"
-    cfg_dir = roots[0] / "agent-voice-input"
-    return cfg_dir, cfg_dir / "config.toml", cfg_dir / "agent-voice-input.env"
+        return cfg_dir, toml_path, cfg_dir / ".env"
+    app_home = resolve_app_home_dir(env, home_dir=home_dir)
+    if app_home is None:
+        raise ConfigError(
+            "cannot resolve application home directory: HOME and AGENT_VOICE_INPUT_HOME are unset"
+        )
+    return app_home, app_home / "config.toml", app_home / ".env"
+
+
+def detect_legacy_config_migration_hint(
+    env: Mapping[str, str] | None = None,
+    *,
+    home_dir: str | Path | None = None,
+) -> str:
+    """Return a read-only single-line migration hint when ``<app_home>/config.toml`` is absent but legacy XDG files exist."""
+    app_home = resolve_app_home_dir(env, home_dir=home_dir)
+    if app_home is None:
+        return ""
+    try:
+        if (app_home / "config.toml").is_file():
+            return ""
+    except OSError:
+        return ""
+
+    explicit = env is not None and env is not os.environ
+    src = os.environ if env is None else env
+    raw_home = (src.get("HOME") or "").strip()
+    legacy_dir: Path | None = None
+    if home_dir is not None:
+        base_home = Path(home_dir)
+        xdg = (src.get("XDG_CONFIG_HOME") or "").strip() if explicit else ""
+        legacy_dir = (
+            expand_user_path(xdg, env=src, home_dir=base_home) / "agent-voice-input"
+            if xdg
+            else base_home / ".config" / "agent-voice-input"
+        )
+    else:
+        xdg = (src.get("XDG_CONFIG_HOME") or "").strip()
+        if xdg and not (
+            explicit and xdg.startswith("~") and (not raw_home or _is_other_user_tilde(xdg))
+        ):
+            legacy_dir = expand_user_path(xdg, env=src) / "agent-voice-input"
+        elif raw_home:
+            if not (explicit and _is_other_user_tilde(raw_home)):
+                legacy_dir = Path(raw_home) / ".config" / "agent-voice-input"
+        elif not explicit:
+            legacy_dir = Path.home() / ".config" / "agent-voice-input"
+
+    if legacy_dir is None:
+        return ""
+    try:
+        if os.path.realpath(legacy_dir) == os.path.realpath(app_home):
+            return ""
+    except OSError:  # pragma: no cover - defensive realpath guard
+        return ""
+
+    found: list[str] = []
+    for fname in _LEGACY_MIGRATION_FILES:
+        try:
+            if (legacy_dir / fname).is_file():
+                found.append(fname)
+        except OSError:
+            continue
+    if not found:
+        return ""
+    files_str = ", ".join(found)
+    return (
+        f"legacy config found in {legacy_dir} ({files_str}); "
+        f"migrate into {app_home} (config.toml, .env, hotwords/personal.txt)"
+    )
 
 
 def load_env_files(
@@ -966,7 +1112,7 @@ def load_env_files(
     config_path: str | Path | None = None,
     home_dir: str | Path | None = None,
 ) -> dict[str, str]:
-    """Merge optional .env files behind existing environment variables (never overwrites)."""
+    """Merge optional .env files behind existing environment variables (never overwrites; skips bootstrap path vars)."""
     merged: dict[str, str] = dict(os.environ if base_env is None else base_env)
     # Preserve case-insensitive precedence for proxy variables already defined in process/base env
     # (e.g. shell HTTPS_PROXY must never be overridden by lowercase https_proxy in .env).
@@ -975,14 +1121,14 @@ def load_env_files(
         for k in merged
         if k.lower().endswith("_proxy") or k.lower() == "no_proxy"
     }
-    _, home = _resolve_config_roots(base_env, home_dir=home_dir)
+    home_for_expand = Path(home_dir) if home_dir is not None else None
     candidates: Sequence[str | Path] = (
         env_paths
         if env_paths is not None
         else default_env_file_candidates(base_env, config_path=config_path, home_dir=home_dir)
     )
     for p in candidates:
-        path = expand_user_path(p, env=merged, home_dir=home)
+        path = expand_user_path(p, env=merged, home_dir=home_for_expand)
         if not path.is_file():
             continue
         try:
@@ -991,6 +1137,8 @@ def load_env_files(
             continue
         file_proxy_keys: set[str] = set()
         for k, v in parse_env_text(content).items():
+            if k in _BOOTSTRAP_ENV_KEYS:
+                continue
             k_low = k.lower()
             is_proxy = k_low.endswith("_proxy") or k_low == "no_proxy"
             if is_proxy and k_low in base_proxy_keys:
@@ -1890,7 +2038,11 @@ def _apply_asr_section(cfg: Config, asr: Any) -> None:
         elif k == "api_key_env":
             cfg.asr.api_key_env = _as_str(v, "asr.api_key_env").strip()
         elif k == "hotwords_file":
-            cfg.asr.hotwords_file = _as_str(v, "asr.hotwords_file").strip()
+            raise ConfigError(
+                "asr.hotwords_file has been removed; personal hotwords are now fixed at "
+                "~/.agent-voice-input/hotwords/personal.txt "
+                "(please remove 'hotwords_file' from [asr] in config.toml)"
+            )
         elif k == "timeout_sec":
             cfg.asr.timeout_sec = _as_float(v, "asr.timeout_sec")
         elif k == "max_retries":
@@ -2667,33 +2819,22 @@ def load_config(
         if load_default_env_files
         else dict(os.environ if env is None else env)
     )
-    _, home = _resolve_config_roots(
-        effective_env if env is not None else None,
-        home_dir=home_dir,
-    )
+    home_for_expand = Path(home_dir) if home_dir is not None else None
+    src_bootstrap = os.environ if env is None else env
 
     chosen_path: Path | None = None
     if config_path is not None and str(config_path).strip():
-        chosen_path = expand_user_path(config_path, env=effective_env, home_dir=home)
+        chosen_path = expand_user_path(config_path, env=effective_env, home_dir=home_for_expand)
         if not chosen_path.is_file():
             raise ConfigError(f"config file does not exist: {chosen_path}")
-    elif effective_env.get("AGENT_VOICE_INPUT_CONFIG", "").strip():
+    elif src_bootstrap.get("AGENT_VOICE_INPUT_CONFIG", "").strip():
         chosen_path = expand_user_path(
-            effective_env["AGENT_VOICE_INPUT_CONFIG"], env=effective_env, home_dir=home
+            src_bootstrap["AGENT_VOICE_INPUT_CONFIG"], env=effective_env, home_dir=home_for_expand
         )
         if not chosen_path.is_file():
             raise ConfigError(f"AGENT_VOICE_INPUT_CONFIG file does not exist: {chosen_path}")
-    elif effective_env.get("VOICE_INPUT_CONFIG", "").strip():
-        chosen_path = expand_user_path(
-            effective_env["VOICE_INPUT_CONFIG"], env=effective_env, home_dir=home
-        )
-        if not chosen_path.is_file():
-            raise ConfigError(f"VOICE_INPUT_CONFIG file does not exist: {chosen_path}")
     else:
-        for candidate in default_config_file_candidates(
-            effective_env if env is not None else None,
-            home_dir=home_dir,
-        ):
+        for candidate in default_config_file_candidates(env, home_dir=home_dir):
             if candidate.is_file():
                 chosen_path = candidate
                 break
@@ -2714,7 +2855,9 @@ def load_config(
             cfg.refiner.effort = DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
 
     val_env: Mapping[str, str] | None = (
-        effective_env if (env is not None or home_dir is None) else dict(effective_env, HOME=str(home))
+        effective_env
+        if (env is not None or home_dir is None)
+        else dict(effective_env, HOME=str(home_dir))
     )
     _validate_config(cfg, env=val_env)
     return cfg, effective_env

@@ -6,7 +6,6 @@ import sys
 from typing import Callable, Iterable, Literal, Protocol
 
 WindowCategory = Literal["terminal", "coding_gui", "general_gui"]
-HotwordsScope = Literal["global", "chat", "coding"]
 
 
 class WindowLike(Protocol):
@@ -311,85 +310,6 @@ def resolve_windows_paste_chord(process: str) -> str:
     return "ctrl_v"
 
 
-AI_CHAT_PATTERNS: tuple[str, ...] = (
-    "com.openai.chat", "com.openai.codex", "chatgpt", "com.anthropic.claudefordesktop",
-    "com.anysphere.sand", "grok bot", "grokbot", "ai.x.grok", "com.xai.grok", "grok",
-    "ai.perplexity.mac", "perplexity",
-    "com.quora.poe.electron", "com.quora.poe", "poe",
-    "com.deepseek.chat", "deepseek",
-    "com.moonshot.kimi", "kimi",
-    "com.bytedance.doubao.desktop", "com.bytedance.doubao", "doubao", "豆包",
-    "com.tencent.yuanbao", "yuanbao", "元宝",
-    "cherry studio", "cherry-studio", "cherrystudio",
-    "chatbox", "xyz.chatboxapp.app",
-    "ai.elementlabs.lmstudio", "lm studio",
-)
-
-_BROWSER_PATTERNS: tuple[str, ...] = (
-    # macOS bundle IDs
-    "com.google.chrome", "com.google.chrome.*",
-    "com.apple.safari", "com.apple.safaritechnologypreview",
-    "company.thebrowser.browser", "company.thebrowser.dia",
-    "com.microsoft.edgemac", "com.microsoft.edgemac.*",
-    "org.mozilla.firefox", "org.mozilla.firefoxdeveloperedition", "org.mozilla.nightly",
-    "com.brave.browser", "com.brave.browser.*",
-    "app.zen-browser.zen", "io.github.zen-browser.zen",
-    "com.vivaldi.vivaldi", "com.operasoftware.opera", "org.chromium.chromium", "com.kagi.kagimacos",
-    # Cross-platform process names (stripped of .exe/.app)
-    "chrome", "google chrome", "google chrome canary", "chromium",
-    "safari", "safari technology preview",
-    "arc", "dia",
-    "msedge", "microsoft edge",
-    "firefox", "zen", "zen browser",
-    "brave", "brave browser",
-    "vivaldi", "opera", "orion",
-)
-
-# Sorted longest-first so "Google Chrome Canary" strips before "Google Chrome".
-_BROWSER_TITLE_SUFFIXES: tuple[str, ...] = (
-    "google chrome canary", "google chrome", "safari technology preview",
-    "microsoft edge", "mozilla firefox", "zen browser", "brave browser",
-    "chromium", "firefox", "vivaldi", "safari", "brave", "opera", "orion", "arc", "dia",
-)
-
-_BROWSER_AI_BRANDS: tuple[str, ...] = (
-    "google ai studio", "google gemini", "perplexity", "deepseek",
-    "chatgpt", "claude", "gemini", "doubao", "ai studio",
-    "grok", "kimi", "poe", "豆包",
-)
-
-_BROWSER_BRAND_SEPS: tuple[str, ...] = (" — ", " – ", " - ", " | ", "| ", " · ")
-
-BUILTIN_AI_CHAT_HOTWORDS: tuple[str, ...] = (
-    # Frontier AI assistants & model families
-    "ChatGPT", "Claude", "Grok", "Gemini", "DeepSeek", "Perplexity", "Qwen", "Kimi", "豆包",
-    "GPT", "OpenAI", "Anthropic", "Opus", "Sonnet", "Haiku", "Flash", "Llama",
-    # High-frequency AI/LLM concepts in chat & technical Q&A
-    "LLM", "Agent", "Prompt", "Token", "RAG", "MCP", "API", "JSON", "Markdown",
-    "Fine-tuning", "LoRA", "KV Cache", "Embedding",
-)
-
-_BUILTIN_AI_CHAT_HOTWORDS_NON_CJK: tuple[str, ...] = tuple(
-    w for w in BUILTIN_AI_CHAT_HOTWORDS if all(ord(ch) < 128 for ch in w)
-)
-
-
-def get_builtin_ai_chat_hotwords(language: str = "auto") -> tuple[str, ...]:
-    """Return built-in AI chat hotwords, dropping CJK entries for explicit non-Chinese languages."""
-    raw = (language or "auto").strip().lower()
-    if not raw or raw == "auto" or raw == "zh" or raw.startswith(("zh-", "zh_", "zh.", "zh@")):
-        return BUILTIN_AI_CHAT_HOTWORDS
-    return _BUILTIN_AI_CHAT_HOTWORDS_NON_CJK
-
-IM_CHAT_PATTERNS: tuple[str, ...] = (
-    "com.tencent.xinwechat", "com.electron.lark", "com.bytedance.lark",
-    "com.alibaba.dingtalkmac", "com.tinyspeck.slackmacgap", "com.hnc.discord",
-    "ru.keepcoder.telegram", "com.tdesktop.telegram", "net.whatsapp.whatsapp",
-    "com.microsoft.teams2", "com.microsoft.teams", "com.apple.mobilesms", "com.tencent.qq",
-    "wechat", "weixin", "微信", "feishu", "lark", "飞书", "dingtalk", "钉钉",
-    "slack", "discord", "telegram", "whatsapp", "ms-teams", "teams", "messages", "qq",
-)
-
 _ANTIGRAVITY_IDE_PATTERNS: tuple[str, ...] = ("antigravity", "com.google.antigravity*")
 
 _VSCODE_FAMILY_PATTERNS: tuple[str, ...] = (
@@ -424,7 +344,7 @@ _JETBRAINS_SUFFIXES: tuple[str, ...] = (
 )
 
 
-_DESKTOP_AI_COLLIDING_PROCS: dict[str, tuple[str, ...]] = {
+_DESKTOP_AGENT_COLLIDING_PROCS: dict[str, tuple[str, ...]] = {
     "claude": ("claude code", "claude"),
     "codex": ("codex", "chatgpt"),
 }
@@ -490,73 +410,6 @@ def _is_desktop_ai_app_title(title: str, app_names: tuple[str, ...]) -> bool:
     return any(_matches_desktop_app_suffix(t_low, name) for name in app_names)
 
 
-def _is_browser_ai_chat_title(title: str) -> bool:
-    """Strictly match trailing AI brand segments in known browser window titles (regex-free)."""
-    page = _strip_trailing_app_suffix((title or "").strip(), _BROWSER_TITLE_SUFFIXES)
-    if not page:
-        return False
-    low = page.lower()
-    for brand in _BROWSER_AI_BRANDS:
-        if low == brand:
-            return True
-        for sep in _BROWSER_BRAND_SEPS:
-            tail = sep + brand
-            if low.endswith(tail) and low[: -len(tail)].strip():
-                return True
-    return False
-
-
-def classify_target_app_hint(win: WindowLike) -> str:
-    """Return ``'ai_chat' | 'im_chat' | ''`` for a ``general_gui`` foreground window (regex-free)."""
-    if match_app_patterns(win, AI_CHAT_PATTERNS):
-        return "ai_chat"
-    if not (win.bundle_id or "").strip():
-        app_names = _DESKTOP_AI_COLLIDING_PROCS.get(normalize_app_token(win.process))
-        if app_names is not None:
-            return "ai_chat" if _is_desktop_ai_app_title(win.title, app_names) else ""
-    if match_app_patterns(win, _BROWSER_PATTERNS) and _is_browser_ai_chat_title(win.title):
-        return "ai_chat"
-    return "im_chat" if match_app_patterns(win, IM_CHAT_PATTERNS) else ""
-
-
-def resolve_hotwords_scope(
-    win: WindowLike | None = None,
-    *,
-    window_category: str = "",
-    target_hint: str = "",
-    mode: str = "",
-    has_agent_session: bool = False,
-    is_terminal: Callable[[WindowLike], bool] | None = None,
-) -> HotwordsScope:
-    """Map foreground window classification, target hint, mode, or Agent session to a hotwords scene."""
-    eff_mode = (mode or "").strip().lower()
-    eff_hint = (target_hint or "").strip().lower()
-    if eff_mode == "general":
-        if eff_hint in ("im_chat", "ai_chat"):
-            return "chat"
-        if win is not None and (win.process or win.bundle_id):
-            if classify_target_app_hint(win) in ("im_chat", "ai_chat"):
-                return "chat"
-        return "global"
-    if has_agent_session or eff_mode == "agent":
-        return "coding"
-    if eff_hint in ("im_chat", "ai_chat"):
-        return "chat"
-    eff_cat = (window_category or "").strip().lower()
-    if eff_cat in ("terminal", "coding_gui"):
-        return "coding"
-    if win is not None and (win.process or win.bundle_id):
-        if not eff_cat and is_terminal is not None:
-            eff_cat = classify_window_category(win, is_terminal=is_terminal)
-        if eff_cat in ("terminal", "coding_gui"):
-            return "coding"
-        if not eff_cat and match_app_patterns(win, CODING_GUI_PATTERNS):
-            return "coding"
-        if classify_target_app_hint(win) in ("im_chat", "ai_chat"):
-            return "chat"
-    return "global"
-
-
 def is_antigravity_ide_window(win: WindowLike) -> bool:
     return match_app_patterns(win, _ANTIGRAVITY_IDE_PATTERNS)
 
@@ -583,7 +436,7 @@ def is_codex_desktop_window(win: WindowLike) -> bool:
     if proc == "chatgpt":
         return True
     if proc == "codex":
-        return _is_desktop_ai_app_title(win.title, _DESKTOP_AI_COLLIDING_PROCS["codex"])
+        return _is_desktop_ai_app_title(win.title, _DESKTOP_AGENT_COLLIDING_PROCS["codex"])
     return False
 
 
@@ -595,7 +448,7 @@ def is_claude_desktop_window(win: WindowLike) -> bool:
     if bid:
         return bid == "com.anthropic.claudefordesktop"
     if normalize_app_token(win.process) == "claude":
-        return _is_desktop_ai_app_title(win.title, _DESKTOP_AI_COLLIDING_PROCS["claude"])
+        return _is_desktop_ai_app_title(win.title, _DESKTOP_AGENT_COLLIDING_PROCS["claude"])
     return False
 
 

@@ -44,7 +44,7 @@ Install and configure agent-voice-input following docs/agent-setup.md (https://g
 # 1. Install prerequisites (macOS: `brew install ffmpeg` + `xcode-select --install` | WSL2: `sudo apt install ffmpeg`)
 uv tool install agent-voice-input          # or `pipx install agent-voice-input` / `pip install agent-voice-input`
 
-# 2. Initialize 0600 config.toml & agent-voice-input.env (optional: `--asr`, `--refiner`, `--hotkey`)
+# 2. Initialize ~/.agent-voice-input/ (0600 config.toml & .env + default-ignore .gitignore; optional: `--asr`, `--refiner`, `--hotkey`)
 agent-voice-input init
 
 # 3. Verify connectivity & start daemon (first start prints a quick test-dictation tip)
@@ -52,7 +52,8 @@ agent-voice-input doctor --ping && agent-voice-input start
 ```
 
 - **Keyboard-aware defaults**: `init` automatically sets `key = "ROption"` on MacBook built-in keyboards, and keeps `key = "RControl"` on desktop Macs (e.g., Mac mini with an external full-size keyboard) and Windows/WSL2. Tap hotkey `<= 0.5s` to start/stop; hold `0.8s` to cancel.
-- **Simplest 1-key setup**: `init` auto-detects existing environment keys and local `codex` CLI logins and tells you immediately if you are ready out of the box. If you have no Stage 1 key yet, add just **1 key** to `~/.config/agent-voice-input/agent-voice-input.env`:
+- **Unified app home (`~/.agent-voice-input/`)**: `config.toml`, `.env`, `hotwords/personal.txt`, and opt-in `recordings/` all live under `~/.agent-voice-input/` (override root via `AGENT_VOICE_INPUT_HOME`). `init` creates a default-ignore `.gitignore` tracking only `hotwords/` (never overwritten even with `--force`).
+- **Simplest 1-key setup**: `init` auto-detects existing environment keys and local `codex` CLI logins and tells you immediately if you are ready out of the box. If you have no Stage 1 key yet, add just **1 key** to `~/.agent-voice-input/.env`:
   - **Mainland China**: `DASHSCOPE_API_KEY` or `DEEPSEEK_API_KEY`
   - **Global / Overseas**: `OPENAI_API_KEY` or `GEMINI_API_KEY`
 - Templates & full agent guide: [`config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml), [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env), and [`docs/agent-setup.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/agent-setup.md).
@@ -91,10 +92,10 @@ agent-voice-input doctor --ping && agent-voice-input start
 | **Terminal** | **Local & Remote `tmux`** | `✅` | **macOS**: zero-clipboard direct injection / **WSL2**: `win_shim` transient clipboard + paste (preserves clipboard); process tree isolated by focused pane; Linux & macOS CI real `tmux` E2E |
 | **Terminal** | **Other Built-in Terminals & Dedicated SSH Clients** | `🧪` | Built-in paste-chord routing, anti-crosstalk & client rules (see full list below); seeking real-hardware feedback |
 | **Desktop App** | **Antigravity / AGY Desktop** | `✅` *(macOS)* / `🧪` *(Windows)* | Hardware-verified on macOS for **Antigravity 2.0 standalone desktop** (read-only `conversation_summaries.db` + exact/truncated-prefix title matching, workspace `git`/filenames + `brain/` incremental cache, and thread switching); legacy VS Code Fork also supported *(Windows desktop pending field reports; WSL2 scans WSL paths only)* |
-| **Desktop App** | **ChatGPT / Codex Unified Desktop** | `✅` *(macOS)* / `🧪` *(Windows)* | Hardware-verified on macOS: the unified desktop app (`com.openai.codex`) reads `~/.codex/sqlite/codex.db` + `~/.codex/sessions/*.jsonl` read-only to auto-promote local repo tasks to `agent` mode with project hotwords & incremental cache, keeps cloud ChatGPT chats in `general` + `ai_chat` with zero crosstalk, and re-verifies same-window thread switching before paste; the legacy standalone ChatGPT app (`com.openai.chat`) stays in `general` + `ai_chat` with refined paste & window-locked anti-crosstalk, and Windows (`ChatGPT.exe` / `Codex.exe`) currently provides refined paste & window-locked anti-crosstalk *(Windows/WSL2 cross-OS context binding is on the roadmap)* |
-| **Desktop App** | **Claude Desktop** | `✅` *(macOS)* / `🧪` *(Windows)* | Hardware-verified on macOS (`com.anthropic.claudefordesktop`): **Code & Cowork** local session binding (bounded read-only `AXWebArea` route/title probe, joint `Claude`/`Claude-3p` metadata scan, `50K` incremental cache, and pre-paste same-window thread verification) plus refined paste with clipboard restore, while cloud Chat stays in `general` + `ai_chat` with zero crosstalk *(Windows `Claude.exe` pending field reports)* |
-| **Desktop App** | **Other Desktop IDEs & Mainstream IM** | `🧪` | IDEs (**VS Code**, **Cursor**, **Windsurf**, **JetBrains**, **Zed**, etc.) run as `coding_gui` with workspace `git`/filenames; **running CLI agents inside an IDE's integrated terminal is also treated as `coding_gui`** (skips CLI `sync_session`, does not read `codex`/`claude`/`agy` history inside the integrated terminal, and does not distinguish integrated terminal splits). IM apps (**WeChat**, **Feishu/Lark**, **Slack**, **Discord**, etc.) run as `im_chat` |
-| **Desktop App** | **Any Other Desktop App** *(browsers, notes, email, etc.)* | `⚪` | Works out of the box under default `hotkey.scope = "all"` with refined paste + window-locked anti-crosstalk |
+| **Desktop App** | **ChatGPT / Codex Unified Desktop** | `✅` *(macOS)* / `🧪` *(Windows)* | Hardware-verified on macOS: the unified desktop app (`com.openai.codex`) reads `~/.codex/sqlite/codex.db` + `~/.codex/sessions/*.jsonl` read-only to auto-promote local repo tasks to `agent` mode with project hotwords & incremental cache, keeps cloud ChatGPT chats in `general` mode (personal hotwords only, zero crosstalk), and re-verifies same-window thread switching before paste; Windows (`ChatGPT.exe` / `Codex.exe`) currently provides refined paste & window-locked anti-crosstalk *(Windows/WSL2 cross-OS context binding is on the roadmap)* |
+| **Desktop App** | **Claude Desktop** | `✅` *(macOS)* / `🧪` *(Windows)* | Hardware-verified on macOS (`com.anthropic.claudefordesktop`): **Code & Cowork** local session binding (bounded read-only `AXWebArea` route/title probe, joint `Claude`/`Claude-3p` metadata scan, `50K` incremental cache, and pre-paste same-window thread verification) plus refined paste with clipboard restore, while cloud Chat stays in `general` mode (personal hotwords only, zero crosstalk) *(Windows `Claude.exe` pending field reports)* |
+| **Desktop App** | **Other Desktop IDEs** | `🧪` | IDEs (**VS Code**, **Cursor**, **Windsurf**, **JetBrains**, **Zed**, etc.) run as `coding_gui` with workspace `git`/filenames; **running CLI agents inside an IDE's integrated terminal is also treated as `coding_gui`** (skips CLI `sync_session`, does not read `codex`/`claude`/`agy` history inside the integrated terminal, and does not distinguish integrated terminal splits) |
+| **Desktop App** | **Any Other Desktop App** *(browsers, IM, chat, notes, email, etc.)* | `⚪` | Works out of the box under default `hotkey.scope = "all"` in `general` mode (personal hotwords only, refined paste + window-locked anti-crosstalk; no fragile non-agent app/browser title enumeration) |
 
 <details>
 <summary><b>Full List of Built-in Terminals & Dedicated SSH Clients (<code>🧪</code>)</b></summary>
@@ -134,11 +135,11 @@ agent-voice-input doctor --ping && agent-voice-input start
 ## FAQ & Common Gotchas
 
 - **My MacBook doesn't have a Right Ctrl key—what should I use?**  
-  `agent-voice-input init` automatically detects MacBook built-in keyboards and sets `key = "ROption"` (Right Option), while desktop Macs (e.g., Mac mini) and external full-size keyboards keep `key = "RControl"`. You can also switch anytime under `[hotkey]` in `~/.config/agent-voice-input/config.toml` (`"ROption"`, `"Fn"`, or `"RControl"`), run `agent-voice-input restart`, or inspect raw keycodes with `agent-voice-input key-test`.
+  `agent-voice-input init` automatically detects MacBook built-in keyboards and sets `key = "ROption"` (Right Option), while desktop Macs (e.g., Mac mini) and external full-size keyboards keep `key = "RControl"`. You can also switch anytime under `[hotkey]` in `~/.agent-voice-input/config.toml` (`"ROption"`, `"Fn"`, or `"RControl"`), run `agent-voice-input restart`, or inspect raw keycodes with `agent-voice-input key-test`.
 - **Why does macOS record pure silence when I start the daemon over SSH?**  
   macOS binds Microphone TCC permission to the responsible GUI process; daemons launched under `sshd` receive silent all-zero audio frames. Always run `agent-voice-input start` / `restart` inside an authorized local GUI terminal (such as Ghostty or `Terminal.app`).
 - **How do I route the background daemon through a proxy?**  
-  Export `HTTPS_PROXY` (and `NO_PROXY=127.0.0.1,localhost` for loopback endpoints) in your shell or set it in `~/.config/agent-voice-input/agent-voice-input.env` (shell environment variables take precedence), then run `agent-voice-input restart`. Because the pure-stdlib HTTP client only speaks `http://` proxies, if your proxy client only sets `ALL_PROXY=socks5://...`, also set its HTTP/HTTPS mixed port (`HTTPS_PROXY=http://127.0.0.1:<port>`) and verify with `agent-voice-input doctor --ping`.
+  Export `HTTPS_PROXY` (and `NO_PROXY=127.0.0.1,localhost` for loopback endpoints) in your shell or set it in `~/.agent-voice-input/.env` (shell environment variables take precedence), then run `agent-voice-input restart`. Because the pure-stdlib HTTP client only speaks `http://` proxies, if your proxy client only sets `ALL_PROXY=socks5://...`, also set its HTTP/HTTPS mixed port (`HTTPS_PROXY=http://127.0.0.1:<port>`) and verify with `agent-voice-input doctor --ping`.
 - **Why does it only paste and never auto-press Enter?**  
   In terminals and SSH sessions, auto-executing a misheard command is dangerous. Paste-only lets you glance before hitting Enter, and if you switch windows mid-processing, output safely falls back to your clipboard instead of pasting into the wrong window.
 - **Should I choose two-stage (STT + Refiner) or single-hop multimodal?**  
@@ -149,14 +150,14 @@ agent-voice-input doctor --ping && agent-voice-input start
 ## CLI Commands & Optional Integrations
 
 ```bash
-agent-voice-input init [--asr P] [--refiner P] [--hotkey K] [--force]  # Create 0600 config.toml & agent-voice-input.env with smart defaults
+agent-voice-input init [--asr P] [--refiner P] [--hotkey K] [--force]  # Create ~/.agent-voice-input/ (0600 config.toml & .env + .gitignore)
 agent-voice-input start | restart | stop                # Manage background daemon (start is idempotent and warns on code/version drift)
-agent-voice-input status                                # Inspect daemon health, active pipeline, and drift (--history N)
-agent-voice-input doctor [--ping] [--remote] [--json]   # Check audio, native shim, credentials, hooks, SSH readiness, and endpoint ping
+agent-voice-input status                                # Inspect daemon health, active pipeline, hotwords counts, and drift (--history N)
+agent-voice-input doctor [--ping] [--remote] [--json]   # Check audio, native shim, credentials, hotwords, hooks, SSH readiness, and endpoint ping
 agent-voice-input integrate [--status] [--dry-run] [--cli claude|codex|agy] [--uninstall] [--json]  # Safe optional CLI hook setup
 agent-voice-input diagnose [--last N] [--json]          # Read-only diagnostics: latency p50, cache hits, failed/ count, redacted log tail
 agent-voice-input retry [--list] [--print]              # List or re-run stashed failed recordings
-agent-voice-input hotwords list|add|remove              # Manage [global]/[chat]/[coding] hotwords & aliases (--alias, --scope, --json)
+agent-voice-input hotwords list|add|remove|path         # Manage flat personal.txt hotwords, !pinning & <- aliases (--pin, --alias, --json)
 agent-voice-input once --duration 4 --dry-run           # Record once and print without pasting (or `--file <wav> --dry-run` on Linux)
 agent-voice-input toggle | cancel                       # Trigger start/stop or cancel active/in-flight jobs (--seq N)
 agent-voice-input key-test                              # Inspect raw key scancodes / modifier events
@@ -169,24 +170,26 @@ agent-voice-input key-test                              # Inspect raw key scanco
 
 ## Hotwords & Agent-Assisted Vocabulary
 
-Keep your personal names, project brands, and recurring ASR mishearings in a single plain-text file—and let **Claude Code**, **Codex**, or **AGY** bootstrap or tidy it for you:
+Keep your personal names, project brands, and recurring ASR mishearings in a single flat plain-text file—and let **Claude Code**, **Codex**, or **AGY** bootstrap or tidy it for you:
 
-- **File & 3 scopes**: `~/.config/agent-voice-input/hotwords.txt` (hot-reloads automatically; flat files map to `[global]`; line order = priority). Optional `[global]`, `[chat]`, and `[coding]` sections mount by context—Stage 2 / single-hop uses `[coding] + [global]` in `agent` mode and automatically mounts **`[global] + [chat]`** in `general` mode so WeChat, browsers, GrokBot, and everyday apps all benefit from your personal terms.
-- **Optional mishearing aliases (`<-`)**: Write `CanonicalTerm <- mishearing1, mishearing2` or run `agent-voice-input hotwords add Harness --alias 哈尼斯,哈尼思`. Guardrails: max 5 aliases per entry, single-character aliases rejected (2-character aliases warn), aliases cannot collide with canonical terms. Stage 1 ASR receives canonical terms only; Stage 2 / single-hop uses aliases to fix stubborn mishearings.
-- **Stage 1 & Stage 2 budgets**: Stage 1 respects tighter per-provider quotas (e.g., Doubao 50 terms / 500 chars, DashScope 80 / 900, OpenAI `keywords[]` 50, Whisper 35 / 353; `deepseek-asr` relies on Stage 2). Stage 2 / single-hop carries a wide **100 items / 1,500 chars** vocabulary budget—inspect both anytime via `agent-voice-input hotwords list [--json]`.
-- **Two rules for your Agent**: **always show the diff and wait for your confirmation before editing `hotwords.txt`**, and **never guess mishearing aliases up front—only add `<-` aliases after observing a real ASR mistake**.
+- **Unified flat file & dotfiles symlink**: `~/.agent-voice-input/hotwords/personal.txt` (locate via `agent-voice-input hotwords path`; hot-reloads automatically; directory-fd `flock` leaves zero `.lock` files). To sync across machines via a dotfiles repo, **symlink the `hotwords/` directory** (e.g., `ln -sfn ~/.dotfiles/avi-hotwords ~/.agent-voice-input/hotwords`) rather than `personal.txt` itself (single-file symlinks are rejected on read/write; note that `.gitignore` under `~/.agent-voice-input/` intentionally does not traverse a symlinked `hotwords/` directory).
+- **Pinning (`!`) & mishearing aliases (`<-`)**: Prefix critical terms with `!` (`!Antigravity` or `agent-voice-input hotwords add Antigravity --pin`) to pin them ahead of all other entries. Add mishearing aliases with `CanonicalTerm <- mishearing1, mishearing2` or `agent-voice-input hotwords add Harness --alias 哈尼斯,哈尼思` (max 5 aliases per entry; single-character aliases rejected; 2-character aliases warn; ambiguous aliases shared by multiple terms are hidden automatically while keeping both canonical terms). Stage 1 ASR receives canonical terms only; Stage 2 / single-hop uses aliases to fix stubborn mishearings.
+- **Decoupled Stage 1 & Stage 2 budgets**:
+  - **Stage 1 ASR**: Orders entries by tier (`!pinned` → `aliased` → `plain`, preserving file line order within each tier so CJK names are never pushed out by ASCII order). In `general` mode, 100% of the provider quota goes to personal terms; in `agent` mode, at least 30% of slots are reserved for dynamic repo/session terms with unused space refilled from overflow (e.g., DashScope **150 terms / 1,800 chars**, Doubao **50 / 500**, OpenAI `keywords[]` **50**, OpenRouter `keyterms` **50**, Whisper **35 / 353**; `deepseek-asr` relies on Stage 2).
+  - **Stage 2 / Single-Hop Block 0 (`<vocabulary_hints>`)**: Sorts deterministically by `(tier, term.lower(), term)` to preserve 85%–99% prompt prefix caching across comment/whitespace/line-order edits, carrying a wide **200 items / 3,000 chars** budget in both `agent` and `general` modes. Inspect live budgets & diagnostics anytime via `agent-voice-input hotwords list [--json]`.
+- **Two rules for your Agent**: **always show the diff and wait for your confirmation before editing `personal.txt`**, and **never guess mishearing aliases up front—only add `<-` aliases after observing a real ASR mistake**.
 
 Copy-paste prompts for your coding agent:
 
 ```text
 # 1. Bootstrap from scratch (canonical terms only)
-Read my recent projects, READMEs, and specs to draft a clean list of proper nouns I actually speak aloud for ~/.config/agent-voice-input/hotwords.txt ([global]/[chat]/[coding]). Do not guess mishearing aliases; show me the diff first and write only after I confirm.
+Read my recent projects, READMEs, and specs to draft a clean flat list of proper nouns I actually speak aloud for ~/.agent-voice-input/hotwords/personal.txt (use `!` only for top-priority terms). Do not guess mishearing aliases; show me the diff first and write only after I confirm.
 
 # 2. Fix a real mishearing on the spot
 Voice input just misheard "Harness" as "哈尼斯". Add a mishearing alias with `agent-voice-input hotwords add Harness --alias 哈尼斯` (show me the change first).
 
 # 3. Periodic cleanup & prioritization
-Run `agent-voice-input hotwords list --json`, prune low-frequency or stale entries if we are near Stage 1/2 budgets, move my cross-project favorites to the top of [global], and show me the diff before applying.
+Run `agent-voice-input hotwords list --json`, prune low-frequency or stale entries if we are near Stage 1/2 budgets, pin my highest-frequency cross-project terms with `!`, and show me the diff before applying.
 ```
 
 ---
@@ -196,7 +199,7 @@ Run `agent-voice-input hotwords list --json`, prune low-frequency or stale entri
 <details open>
 <summary><b>Built-in Providers, Verification Matrix & Common <code>config.toml</code> Recipes</b></summary>
 
-Configuration priority: `CLI flags > ~/.config/agent-voice-input/config.toml > built-in defaults`. Credentials live in `~/.config/agent-voice-input/agent-voice-input.env` (see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)).
+Configuration priority: `CLI flags > ~/.agent-voice-input/config.toml > built-in defaults` (root overridable via `AGENT_VOICE_INPUT_HOME`). Credentials live in `~/.agent-voice-input/.env` (see [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env)).
 
 | `provider` | Stages | Verification | Built-in Default `asr.model` | Built-in Default `refiner.model` | Credential Source / Env |
 | :--- | :--- | :---: | :--- | :--- | :--- |
@@ -266,8 +269,8 @@ effort = "auto"
 - **Two-stage vs. single-hop (`asr.api`)**: `"auto"` routes dedicated STT models (`qwen3-asr-flash`, `doubao`, `deepseek-asr`, `whisper-*`, `*-transcribe`, `SenseVoiceSmall`) to Stage 1 + Stage 2, and routes native `gemini`, DashScope `qwen*-omni*`, official OpenAI `gpt-audio-1.5` / `gpt-audio-mini` (or explicit `asr.api = "chat-completions"`), and multimodal chat-audio models on OpenRouter/OpenAI-compatible to single-hop (sharing the 50K sealed `<session_reference_log>` prefix blocks, in-memory `64 kbps` MP3 compression for `>= 3s` clips, and `610s` single-chunk cap; skips Stage 2 unless `refiner.force_on_single_hop = true`). DeepSeek official ASR (`POST https://api.deepseek.com/v1/tools/asr`) supports `asr.api = "auto"` only (21-language auto-detection, no hotword/language params). For uncataloged models on `openrouter`, set `asr.api = "audio-transcriptions"` or `"chat-completions"` explicitly.
 - **Stage 2 protocol & reasoning budget (`refiner.api`, `effort`)**: `refiner.api = "auto"` uses stateless HTTP `/responses` (`store=false`, `stream=true`) for `codex` and official `openai` (`api.openai.com`), local `agy acp` stdio JSON-RPC for `agy`, native `:generateContent` for `gemini`, and `/chat/completions` for custom third-party `openai` `base_url`s and other providers (explicit `"responses"` / `"chat-completions"` always overrides). `effort` accepts `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"` (`refiner.effort` defaults to `"low"` on `codex`/`agy`/`openai`, and `"auto"` zero-thinking fast mode elsewhere).
 - **Prompt caching & cold-start fallback (`refiner.prompt`, `include_git_status`, `context_max_chars`, `cold_start_fallback`)**: Leave `prompt = ""` to use built-in adaptive `agent` / `general` dictation-editor prompts (non-empty `prompt` overrides both). Dialogue up to `context_max_chars = 200000` is evicted in `50K` sealed prefix blocks ahead of `<workspace_git_status>` (falls back to core tracked filenames when clean) and `<asr_draft_to_clean>`. When a new coding session starts empty/short, `cold_start_fallback = "auto"` (or `"hotwords"` / `"off"`) supplements Stage 1 hotwords and prepends one frozen `<= 25K` `<prior_session_reference>` block from recent exact-same-directory sessions.
-- **Layered hotwords (`asr.hotwords_file` & `hotwords` CLI)**: Edit `~/.config/agent-voice-input/hotwords.txt` or use `agent-voice-input hotwords list|add [--alias]|remove`—hot-reloads automatically on the next dictation. Flat files map to `[global]`; `[chat]` and `[coding]` auto-mount ahead of dynamic git/session terms and built-in hotwords, optional `Term <- alias1, alias2` rules feed Stage 2 / single-hop (`100 items / 1,500 chars`), and `hotwords list` inspects both Stage 1 provider quotas (`doubao`, `dashscope`, `openai`, `whisper`, `gemini`) and Stage 2 budgets.
-- **Same-provider retries & optional MP3 archive (`max_retries`, `audio.save_recordings`)**: Both stages default to `max_retries = 2` (`0..10`) under stage `timeout_sec` with a 9s connect/TLS handshake cap, separating `429`/QPS throttling from transient network/5xx errors. Setting `audio.save_recordings = true` asynchronously archives voiced clips as `0600` `16 kHz` `64 kbps` MP3s in `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/` (ring-pruned to `save_recordings_max_count = 300`).
+- **Personal flat hotwords (`hotwords/personal.txt` & `hotwords` CLI)**: Edit `~/.agent-voice-input/hotwords/personal.txt` or use `agent-voice-input hotwords list|add [--pin] [--alias]|remove|path`—hot-reloads automatically on the next dictation with directory-fd locking (zero `.lock` files). Stage 1 applies priority tiers (`!pinned` > `aliased` > `plain`, preserving file order within tiers) with 30% dynamic-term reservation & overflow refill in `agent` mode (100% personal quota in `general` mode; DashScope `150/1,800`, Doubao `50/500`, OpenAI `50`, Whisper `35/353`), while Stage 2 / single-hop renders a deterministically sorted Block 0 (`200 items / 3,000 chars`) to preserve prefix caching.
+- **Same-provider retries & optional MP3 archive (`max_retries`, `audio.save_recordings`)**: Both stages default to `max_retries = 2` (`0..10`) under stage `timeout_sec` with a 9s connect/TLS handshake cap, separating `429`/QPS throttling from transient network/5xx errors. Setting `audio.save_recordings = true` asynchronously archives voiced clips as `0600` `16 kHz` `64 kbps` MP3s in `~/.agent-voice-input/recordings/` (override root via `AGENT_VOICE_INPUT_HOME`; ring-pruned to `save_recordings_max_count = 300`).
 
 </details>
 
@@ -276,7 +279,7 @@ effort = "auto"
 
 | CLI Flag | Description |
 | :--- | :--- |
-| `--config PATH` | Path to `config.toml` or `config.json` (also supports `AGENT_VOICE_INPUT_CONFIG` and `XDG_CONFIG_HOME`) |
+| `--config PATH` | Path to `config.toml` or `config.json` (also supports `AGENT_VOICE_INPUT_CONFIG` and `AGENT_VOICE_INPUT_HOME`) |
 | `--asr`, `--asr-provider` | Stage 1 provider (`auto`, `dashscope`, `doubao`, `deepseek`, `openai`, `gemini`, `groq`, `openrouter`, `siliconflow`, `openai-compatible`; aliases `volcengine`/`volc` → `doubao`, `bailian` → `dashscope`) |
 | `--asr-model` | Stage 1 upstream model ID |
 | `--asr-api` | Stage 1 protocol (`auto`, `audio-transcriptions`, `chat-completions`) |
@@ -286,7 +289,7 @@ effort = "auto"
 | `--refiner-api` | Stage 2 protocol (`auto`, `chat-completions`, `responses`) |
 | `--refiner-effort`, `--effort` | Stage 2 thinking budget |
 
-*(Environment variables are reserved for API credentials, bootstrap paths `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR`, and low-level runtime/diagnostic hooks; ordinary options live in `config.toml`.)*
+*(Environment variables are reserved for API credentials, bootstrap paths `AGENT_VOICE_INPUT_HOME` / `AGENT_VOICE_INPUT_CONFIG` / `AGENT_VOICE_INPUT_RUNTIME_DIR`, and low-level runtime/diagnostic hooks; ordinary options live in `config.toml`.)*
 
 </details>
 

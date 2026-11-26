@@ -646,10 +646,10 @@ class RemoteSshLoopbackE2ETests(unittest.TestCase):
             mtime=t_now,
         )
 
-        cfg_dir = client_home / ".config" / "agent-voice-input"
-        cfg_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
-        hw_file = cfg_dir / "hotwords.txt"
-        hw_file.write_text("[global]\nRemoteGlobalTerm\n\n[coding]\nRemoteDevboxTerm\n", encoding="utf-8")
+        hw_dir = client_home / ".agent-voice-input" / "hotwords"
+        hw_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        hw_file = hw_dir / "personal.txt"
+        hw_file.write_text("RemoteGlobalTerm\nRemoteDevboxTerm\n", encoding="utf-8")
         os.chmod(hw_file, 0o600)
 
         asr_reqs: list[dict[str, Any]] = []
@@ -823,7 +823,6 @@ class RemoteSshLoopbackE2ETests(unittest.TestCase):
                 api="audio-transcriptions",
                 base_url=base_url,
                 model="whisper-remote-e2e",
-                hotwords_file=str(hw_file),
                 max_retries=0,
             ),
             refiner=RefinerConfig(

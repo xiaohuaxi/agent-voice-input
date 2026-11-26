@@ -1579,7 +1579,7 @@ def inspect_proxy_config_warning(env: Mapping[str, str] | None = None) -> tuple[
         return None
     fix_hint = (
         "set HTTPS_PROXY=http://127.0.0.1:<port> (your proxy client's HTTP/mixed port) "
-        "in shell or ~/.config/agent-voice-input/agent-voice-input.env"
+        "in shell or ~/.agent-voice-input/.env"
     )
     https_proxy = _select_system_proxy_url(proxies, "https")
     if https_proxy:
