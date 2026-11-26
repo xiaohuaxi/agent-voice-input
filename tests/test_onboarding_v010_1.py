@@ -2996,15 +2996,24 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
         self.assertTrue(info_fast["powershell_ok"])
         self.assertEqual(err_fast.getvalue(), "")
 
+        notice_emitted = threading.Event()
+
+        class _NoticeStderr(io.StringIO):
+            def write(self, s: str) -> int:
+                written = super().write(s)
+                if s:
+                    notice_emitted.set()
+                return written
+
         def _slow_run(cmd, **kw):
             if cmd and cmd[0] == pw.POWERSHELL_EXE:
-                time.sleep(0.08)
+                notice_emitted.wait(timeout=2.0)
                 return subprocess.CompletedProcess(cmd, 0, stdout=ok_probe_json + "\n", stderr="")
             if kw.get("text"):
                 return subprocess.CompletedProcess(cmd, 0, stdout="RDPSource\n", stderr="")
             return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
 
-        err_slow = io.StringIO()
+        err_slow = _NoticeStderr()
         with (
             mock.patch.object(pw, "_WSL_SLOW_START_NOTICE_SEC", 0.02),
             mock.patch("agent_voice_input.platform_wsl.resolve_powershell_exe", return_value=pw.POWERSHELL_EXE),
@@ -3014,11 +3023,20 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
             mock.patch("sys.stderr", err_slow),
         ):
             info_slow = pw.probe_wsl_host(Config(), env={"PATH": ""}, announce_slow=True)
+        self.assertTrue(notice_emitted.is_set())
         self.assertTrue(info_slow["powershell_ok"])
         self.assertIn("Initializing Windows helper", err_slow.getvalue())
         self.assertIn("Ctrl+C", err_slow.getvalue())
 
         # doctor --json must pass announce_slow=False so stdout JSON & stderr stay clean
+        def _slow_json_run(cmd, **kw):
+            if cmd and cmd[0] == pw.POWERSHELL_EXE:
+                time.sleep(0.05)
+                return subprocess.CompletedProcess(cmd, 0, stdout=ok_probe_json + "\n", stderr="")
+            if kw.get("text"):
+                return subprocess.CompletedProcess(cmd, 0, stdout="RDPSource\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 1, stdout=b"", stderr=b"")
+
         with tempfile.TemporaryDirectory() as td:
             rt = Path(td) / "rt"
             env_wsl = {
@@ -3035,7 +3053,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 mock.patch("agent_voice_input.platform_wsl.resolve_powershell_exe", return_value=pw.POWERSHELL_EXE),
                 mock.patch("agent_voice_input.platform_wsl.to_windows_path", return_value=r"C:\win_shim.ps1"),
                 mock.patch("agent_voice_input.platform_wsl.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
-                mock.patch("agent_voice_input.platform_wsl.subprocess.run", side_effect=_slow_run),
+                mock.patch("agent_voice_input.platform_wsl.subprocess.run", side_effect=_slow_json_run),
                 mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", out_js),
                 mock.patch("sys.stderr", err_js),
