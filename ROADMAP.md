@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前已发布基线**：`v0.16.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
+> **当前已发布基线**：`v0.17.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
 >
 > **工程规范与上下文路由架构**：[AGENTS.md](AGENTS.md) · [docs/context-routing.md](docs/context-routing.md)
 
@@ -53,7 +53,22 @@
 
 ---
 
-### 最新发版里程碑（`已发布 · v0.16.0`）
+### 最新发版里程碑（`已发布 · v0.17.0`）
+
+以下统一家目录与个人热词重构、静音自适应裁剪、多渠道缓存优化及 OOBE 体验打磨已在 `v0.17.0` 完成落地并正式发布：
+
+1. **统一 `~/.agent-voice-input/` 家目录与扁平个人热词解耦**：
+   - 配置（`config.toml`）、凭据（`.env`）、个人热词（`hotwords/personal.txt`）与归档录音（`recordings/`）统一收敛于 `~/.agent-voice-input/`（受 `AGENT_VOICE_INPUT_HOME` 覆盖），原生支持 `hotwords/` 或整目录同 UID 软链与默认全忽略仅放行 `hotwords/` 的 `.gitignore`；
+   - 个人热词采用扁平单文件（支持 `!` 置顶、`<-` 误听别名、目录 fd `flock` 互斥写），与双轨运行期投影解耦（Stage 1 保持优先级行序 + `agent` 模式 30% 动态词保底、DashScope 扩至 `150 词 / 1,800 字`、OpenAI `gpt-transcribe` 原生 `keywords[]`；Stage 2 块 0 `<vocabulary_hints>` 确定性排序保前缀缓存并扩至 `200 条 / 3,000 字`），同时移除非 Agent App 穷举与 `<target_app_hint>`。
+2. **Pre-ASR 长静音自适应压缩（`[audio].silence_trim`）**：
+   - 在 `process_wav` 归一化前纯标准库压缩长思考停顿与首尾冗余静音（默认 `balanced`，10 ms 线性淡入淡出，短句与 `retry` 旁路，`recordings/` 保留原音），并在遥测与 `diagnose` 中汇报裁剪时长与切点数。
+3. **多渠道精修缓存修复、无限 `AgyRefiner` 轮次与 OOBE 打磨**：
+   - 官方 OpenAI 默认走无状态 `/responses`、原生 Gemini 落地 3-turn 缓存布局、OpenRouter `google/*` 跳过 `< 50K` 单块显式断点、解除 `AgyRefiner` 默认单线程轮次上限；
+   - 修复 PyPI 绝对链接、HUD 剪贴板回退提示、`.env` 代理配置生效与 `doctor` SOCKS5 诊断，并将 WSL2 `win_shim` 冷编译超时放宽至 `180s`。
+
+---
+
+### 已归档里程碑（`已发布 · v0.16.0`）
 
 以下一键安全集成命令、开箱与 CLI UX 升级、`AgyRefiner` 预热与增量续接提速及 Stage 3A 平台录音生命周期复评结案已在 `v0.16.0` 完成落地并正式发布：
 
@@ -217,7 +232,7 @@
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
 
-`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.16.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
+`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.17.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
 
 1. **外部用户零门槛开箱**：仅配置任意单一支持语音转写的主流渠道 API Key（可自动搭配本地 CLI 登录态或独立二阶段凭据），即可通过 `init` 与 `doctor --ping` 完成体检并稳定投入日常使用。
 2. **全场景安全投递与零串台**：本地终端、跨机 SSH 远端 Linux、主流桌面 IDE、普通桌面 GUI 应用与远程桌面自动让行均长期稳定运行；跨场景上下文严格隔离，系统剪贴板零意外污染，全链路严守不自动发送回车。

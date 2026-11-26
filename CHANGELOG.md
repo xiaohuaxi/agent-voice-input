@@ -7,13 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-27
+
 ### Added
 - **Unified `~/.agent-voice-input/` app home & `AGENT_VOICE_INPUT_HOME` root override**: Consolidated user-owned configuration (`config.toml`), credentials (`.env`), personal hotwords (`hotwords/personal.txt`), and opt-in MP3 recordings (`recordings/`) under `~/.agent-voice-input/` with an exclusive default-ignore `.gitignore` (tracking only `hotwords/`), native same-UID directory symlink support for `hotwords/` or the full app home, single-file symlink protection on `hotwords/personal.txt`, and one-shot migration hints in `init`/`doctor` when legacy `~/.config/agent-voice-input/` files exist.
 - **Flat personal hotwords with decoupled Stage 1 / Stage 2 projection & directory-locked editing**: Replaced scoped `[global]`/`[chat]`/`[coding]` hotword sections with a single flat `hotwords/personal.txt` supporting `!` pinning, `<-` mishearing aliases, `hotwords path` / `hotwords add --pin`, directory-fd `flock` mutual exclusion (zero `.lock` files inside symlinked dotfiles repos), two-pass ambiguous-alias hiding, git-conflict-block skipping, privacy-safe count-only health summaries in `status`/`doctor --json`, and dual-track ordering (Stage 1 preserves file order within priority tiers with 30% dynamic-term reserve and overflow refill in `agent` mode; Stage 2 Block 0 sorts deterministically to preserve prefix caching).
 - **Pre-ASR adaptive long-pause & edge-silence trimming (`[audio].silence_trim`)**: Added pure-stdlib silence compression (`"balanced"` default, `"conservative"`, `"off"`) inside `process_wav` before RMS scaling so long thinking pauses and excess leading/trailing silence are compressed with 10 ms integer linear crossfades without altering `gain_db`/`rms_dbfs`/`duration_sec`, while bypassing `< 4 s` clips, `< 1 s` savings, and `retry` replays, preserving raw original audio in `recordings/`, and reporting `silence_trimmed_sec` / `silence_trim_cuts` in telemetry and `diagnose`.
+- **Stage 2 `<vocabulary_hints>` alias projection & OpenAI `gpt-transcribe` native `keywords[]`**: Wired Stage 2 / single-hop `<vocabulary_hints>` Block 0 injection with `<-` mishearing aliases, mature-session prior-hotword carry-over, and native multipart `keywords[]` (`<= 50` sanitized terms) on official OpenAI `gpt-transcribe*` ASR.
 
 ### Changed
 - **Expanded DashScope & Stage 2 hotword budgets**: Raised DashScope `qwen3-asr-flash` Stage 1 hotword budget to `150 terms / 1,800 chars` (with dialogue tail budget kept isolated) and Stage 2 / single-hop `<vocabulary_hints>` Block 0 budget to `200 items / 3,000 chars`, fixing single-entry oversize truncation so shorter subsequent terms remain eligible.
+- **Multi-provider Stage 2 caching & `AgyRefiner` unlimited turns**: Defaulted official OpenAI (`api.openai.com`) to stateless `/responses` (`store=false` + `prompt_cache_key`, preserving `/chat/completions` for custom third-party `base_url`), adopted 3-turn stateless prefix caching for native Gemini, and lifted the default `AgyRefiner` per-thread turn cap (`max_turns_per_thread = 0`, unlimited) to preserve warm `agy acp` sessions across extended dictation.
+
+### Fixed
+- **OOBE polish, `.env` proxy routing & 180s WSL cold-start timeout**: Converted README links to absolute URLs for PyPI rendering, clarified HUD clipboard-fallback labels, honored `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` from `.env` across HTTP transports with unsupported-scheme (e.g. SOCKS5) diagnostics in `doctor`, polished `init`/`doctor` onboarding hints, and raised the WSL2 `win_shim` cold-compile startup timeout to `180s` (with early slow-start user notice).
+- **OpenRouter Gemini `< 50K` cache-breakpoint churn**: Skipped emitting explicit `cache_control: ephemeral` on OpenRouter `google/*` models when only the active tail block exists (`history_blocks <= 1`), eliminating per-turn cache rebuild churn and latency spikes while preserving breakpoints on sealed `>= 50K` blocks.
 
 ### Removed
 - **Non-agent app enumeration & `<target_app_hint>`**: Removed `ai_chat` / `im_chat` app & browser title enumerations, `BUILTIN_AI_CHAT_HOTWORDS`, `hotwords_scope`, and `<target_app_hint>` prompt injection/echo stripping while retaining full terminal, IDE, desktop Agent (Codex Desktop / Claude Desktop / Antigravity IDE), remote-client, and paste-shortcut routing.
@@ -230,7 +238,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Initial WSL2 release**: Two-stage context-aware voice input daemon and CLI for coding agents (**Codex**, **Claude Code**, **AGY**) on Windows + WSL2, featuring native `win_shim.ps1` WASAPI capture, global hotkey & HUD bridge, active terminal session discovery, `ffmpeg` loudness normalization with local silence gating, and safe paste without auto-pressing `Enter`.
 
-[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/xiaohuaxi/agent-voice-input/compare/v0.13.0...v0.14.0

@@ -2648,7 +2648,7 @@ class AudioProcTests(unittest.TestCase):
             legacy_rec = {k: v for k, v in sanitized.items() if k not in ("silence_trimmed_sec", "silence_trim_cuts")}
             md = format_live_diagnostics_markdown(
                 {
-                    "version": "0.16.0",
+                    "version": "0.17.0",
                     "diag_elapsed_ms": 5,
                     "requested_last": 2,
                     "daemon": {
