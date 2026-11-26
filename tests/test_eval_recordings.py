@@ -836,6 +836,73 @@ class MetricsAndReplayTests(unittest.TestCase):
                         EVAL.main([*common, "--tag", "db_v1_empty", "--manifest-from", "db_v1", "--limit", "1"])
                 self.assertIn("matched 0/1", str(zero_ctx.exception))
 
+    def test_asr_cache_isolates_silence_trim_modes_while_preserving_recording_sha1(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home, rec_dir, eval_dir, host_rt = root / "home", root / "rec", root / "eval", root / "rt"
+            rec_dir.mkdir(parents=True)
+            host_rt.mkdir(parents=True)
+            cfg_off = root / "cfg_off.toml"
+            cfg_bal = root / "cfg_bal.toml"
+            cfg_off.write_text(
+                '[audio]\nsilence_trim = "off"\n[asr]\nprovider = "dashscope"\n[refiner]\nprovider = "off"\n',
+                encoding="utf-8",
+            )
+            cfg_bal.write_text(
+                '[audio]\nsilence_trim = "balanced"\n[asr]\nprovider = "dashscope"\n[refiner]\nprovider = "off"\n',
+                encoding="utf-8",
+            )
+
+            # Long-pause recording (~9s) whose gate.wav_bytes differs between silence_trim="off" and "balanced"
+            sr = 16000
+            speech = [int(5000 * math.sin(2.0 * math.pi * 220.0 * i / sr)) for i in range(2 * sr)]
+            long_pause_wav = pack_pcm16_mono_wav(speech + [0] * (5 * sr) + speech, sample_rate=sr)
+            rec = rec_dir / "rec-20261126-100000-trim01.wav"
+            rec.write_bytes(long_pause_wav)
+
+            seen_lens: list[int] = []
+
+            class _TrimAwareAsr:
+                provider_name = "dashscope"
+                single_hop = False
+
+                def transcribe(self, wav_bytes: bytes, context=None, **kw) -> AsrResult:
+                    seen_lens.append(len(wav_bytes))
+                    return AsrResult(
+                        text=f"len-{len(wav_bytes)}",
+                        provider="dashscope",
+                        model="qwen3-asr-flash",
+                        latency_ms=80,
+                    )
+
+            base_args = [
+                "--home-dir", str(home),
+                "--recordings-dir", str(rec_dir),
+                "--eval-dir", str(eval_dir),
+                "--host-runtime-dir", str(host_rt),
+                "--no-git-status",
+            ]
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home), "API_KEY_ALI": "sk-fake-ali-key"}, clear=False),
+                mock.patch.object(EVAL, "create_asr_provider", side_effect=lambda *a, **kw: _TrimAwareAsr()),
+                mock.patch("sys.stdout", io.StringIO()),
+                mock.patch("sys.stderr", io.StringIO()),
+            ):
+                rc_off = EVAL.main(["--config", str(cfg_off), *base_args, "--tag", "trim_off"])
+                rc_bal = EVAL.main(["--config", str(cfg_bal), *base_args, "--tag", "trim_bal"])
+                rc_bal2 = EVAL.main(["--config", str(cfg_bal), *base_args, "--tag", "trim_bal_cached"])
+            self.assertEqual((rc_off, rc_bal, rc_bal2), (0, 0, 0))
+            # "off" and "balanced" MUST NOT collide in asr_cache.json, while second "balanced" hits cache
+            self.assertEqual(len(seen_lens), 2)
+            self.assertLess(seen_lens[1], seen_lens[0])
+
+            doc_off = json.loads((eval_dir / "trim_off.json").read_text(encoding="utf-8"))
+            doc_bal = json.loads((eval_dir / "trim_bal.json").read_text(encoding="utf-8"))
+            doc_bal2 = json.loads((eval_dir / "trim_bal_cached.json").read_text(encoding="utf-8"))
+            self.assertEqual(doc_off["samples"][0]["recording_sha1"], doc_bal["samples"][0]["recording_sha1"])
+            self.assertFalse(doc_bal["samples"][0]["asr_cached"])
+            self.assertTrue(doc_bal2["samples"][0]["asr_cached"])
+
 
 if __name__ == "__main__":
     unittest.main()

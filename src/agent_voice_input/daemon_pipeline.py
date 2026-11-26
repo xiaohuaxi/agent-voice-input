@@ -296,6 +296,9 @@ def build_pipeline_summary(
             summary["asr_chunk_secs"] = list(res.asr_chunk_secs)
     if res.asr_missed_chunks > 0:
         summary["asr_missed_chunks"] = res.asr_missed_chunks
+    if res.gate and res.gate.trimmed_sec > 0.0:
+        summary["silence_trimmed_sec"] = round(res.gate.trimmed_sec, 3)
+        summary["silence_trim_cuts"] = res.gate.trim_cuts
     if res.saved_audio:
         summary["saved_audio"] = res.saved_audio
     if dry_run:
@@ -624,6 +627,7 @@ def _transcribe_wav_chunks(
                     eff_audio_cfg,
                     floor_dbfs=norm_floor_dbfs,
                     min_duration_sec=chunk_min_dur,
+                    silence_trim="off",
                 ).passed:
                     missed_chunks += 1
             except Exception:
@@ -1172,7 +1176,17 @@ def _execute_stage1(
         return
 
     t_gate0 = time.monotonic()
-    gate = process_wav(raw_wav, cfg.audio)
+    # Retry replays audio that already passed capture gating (and may be shorter or have fewer voiced
+    # floor-exceeding noise samples after prior trimming); cap duration/voiced gates to built-in defaults
+    # and skip re-trimming so elevated user thresholds do not reject valid failed/ clips.
+    is_retry = audio_source == "retry"
+    gate = process_wav(
+        raw_wav,
+        cfg.audio,
+        min_duration_sec=min(cfg.audio.min_duration_sec, AudioConfig.min_duration_sec) if is_retry else None,
+        min_voiced_sec=min(cfg.audio.min_voiced_sec, AudioConfig.min_voiced_sec) if is_retry else None,
+        silence_trim="off" if is_retry else None,
+    )
     st.gate = gate
     st.gate_ms = _elapsed_ms(t_gate0)
     if not gate.passed:

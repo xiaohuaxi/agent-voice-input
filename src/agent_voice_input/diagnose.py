@@ -135,6 +135,8 @@ _TELEMETRY_NUMERIC_FIELDS: frozenset[str] = frozenset(
         "seq_id",
         "raw_audio_sec",
         "voiced_audio_sec",
+        "silence_trimmed_sec",
+        "silence_trim_cuts",
         "queue_wait_ms",
         "gate_ms",
         "sync_ms",
@@ -685,9 +687,17 @@ def format_live_diagnostics_markdown(payload: Mapping[str, Any]) -> str:
             flags_str = ", ".join(rec.get("diag_flags") or []) or "OK"
             if warn := str(rec.get("refiner_warning") or rec.get("error") or "").strip():
                 flags_str += f" `{warn[:48]}`"
+            raw_sec = float(rec.get("raw_audio_sec") or 0.0)
+            voiced_sec = float(rec.get("voiced_audio_sec") or 0.0)
+            trimmed_sec = float(rec.get("silence_trimmed_sec") or 0.0)
+            audio_col = (
+                f"{voiced_sec:.1f}/{raw_sec:.1f}→{max(0.0, raw_sec - trimmed_sec):.1f}"
+                if trimmed_sec > 0.0
+                else f"{voiced_sec:.1f}/{raw_sec:.1f}"
+            )
             lines.append(
                 f"| {rec.get('seq_id', '-')} | {_fmt_time_short(rec.get('ts'))} | `{rec.get('session_tag')}` | "
-                f"{float(rec.get('voiced_audio_sec') or 0.0):.1f}/{float(rec.get('raw_audio_sec') or 0.0):.1f} | "
+                f"{audio_col} | "
                 f"{int(rec.get('sync_ms') or 0)} | {int(rec.get('asr_ms') or 0)} | "
                 f"{int(rec.get('refine_init_ms') or 0)} | {int(rec.get('refine_ms') or 0)} | "
                 f"{int(rec.get('deliver_ms') or 0)} | {int(rec.get('total_ms') or 0)} | "

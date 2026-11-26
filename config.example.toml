@@ -56,6 +56,11 @@ beep = false
 # Optional local MP3 ring archive of valid voiced recordings under ~/.cache/agent-voice-input/recordings/ (16 kHz mono 64 kbps, 0600 mode, off by default)
 # save_recordings = false
 # save_recordings_max_count = 300
+# Pre-ASR long-pause & leading/trailing silence compression (pure stdlib; bypassed for <4s clips, <1s total savings, and retry):
+# - "balanced" (default): compresses pauses >= 1.2s to ~0.6s (incl. 10ms crossfade) and trims excess leading/trailing silence
+# - "conservative": compresses pauses >= 1.6s to ~0.8s (incl. 10ms crossfade) with wider leading/trailing margins
+# - "off": disable silence trimming
+# silence_trim = "balanced"
 
 [asr]
 # Stage 1 speech-to-text provider:

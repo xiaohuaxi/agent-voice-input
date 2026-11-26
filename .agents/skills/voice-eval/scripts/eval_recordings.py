@@ -673,8 +673,9 @@ def main(argv: list[str] | None = None) -> int:
                     asr_res, _, _ = _transcribe_wav_chunks(gate.wav_bytes, eff_asr=eff_asr, asr_ctx=asr_ctx, floor_dbfs=cfg.audio.floor_dbfs)
                     asr_cached = False
                 else:
+                    wav_sha1 = hashlib.sha1(gate.wav_bytes).hexdigest()
                     ckey, hw_sha1 = make_asr_cache_key(
-                        rec_sha1,
+                        wav_sha1,
                         asr_prov,
                         asr_mod,
                         asr_ctx.hotwords,
@@ -693,7 +694,8 @@ def main(argv: list[str] | None = None) -> int:
                         asr_res, chunks_n, _ = _transcribe_wav_chunks(gate.wav_bytes, eff_asr=eff_asr, asr_ctx=asr_ctx, floor_dbfs=cfg.audio.floor_dbfs)
                         asr_cached = False
                         asr_entries[ckey] = {
-                            "recording_sha1": rec_sha1, "asr_provider": asr_prov, "asr_model": asr_mod,
+                            "recording_sha1": rec_sha1, "audio_sha1": wav_sha1,
+                            "asr_provider": asr_prov, "asr_model": asr_mod,
                             "asr_api": cfg.asr.api, "asr_effort": cfg.asr.effort,
                             "asr_resource_id": cfg.asr.resource_id, "asr_doubao_mode": cfg.asr.doubao_mode,
                             "hotwords_sha1": hw_sha1, "hotword_count": len(asr_ctx.hotwords),

@@ -32,6 +32,7 @@ VALID_HOTKEY_SCOPES = frozenset({"all", "coding", "terminals"})
 VALID_UI_LANGUAGES = frozenset({"auto", "zh", "en"})
 VALID_UI_POSITIONS = frozenset({"bottom", "top"})
 VALID_WSL_SOURCES = frozenset({"auto", "pulse", "winmm", "wasapi"})
+VALID_SILENCE_TRIM = frozenset({"off", "conservative", "balanced"})
 VALID_ASR_PROVIDERS = frozenset(
     {
         "auto",
@@ -442,6 +443,7 @@ class AudioConfig:
     tail_drain_sec: float | None = None
     save_recordings: bool = False
     save_recordings_max_count: int = 300
+    silence_trim: str = "balanced"
 
     def effective_tail_drain_sec(self, *, macos: bool = False) -> float:
         if self.tail_drain_sec is not None:
@@ -1845,6 +1847,8 @@ def _apply_audio_section(cfg: Config, au: Any) -> None:
             cfg.audio.save_recordings = _as_bool(v, "audio.save_recordings")
         elif k == "save_recordings_max_count":
             cfg.audio.save_recordings_max_count = _as_int(v, "audio.save_recordings_max_count")
+        elif k == "silence_trim":
+            cfg.audio.silence_trim = _as_str(v, "audio.silence_trim").strip().lower()
         else:
             raise ConfigError(f"unknown audio option {k!r}")
 
@@ -2388,6 +2392,14 @@ def _validate_audio_config(cfg: Config) -> None:
         raise ConfigError(
             f"audio.wsl_source must be one of {sorted(VALID_WSL_SOURCES)}, "
             f"got {cfg.audio.wsl_source!r}"
+        )
+    if (
+        not isinstance(cfg.audio.silence_trim, str)
+        or cfg.audio.silence_trim not in VALID_SILENCE_TRIM
+    ):
+        raise ConfigError(
+            f"audio.silence_trim must be one of {sorted(VALID_SILENCE_TRIM)}, "
+            f"got {cfg.audio.silence_trim!r}"
         )
     if not cfg.audio.macos_device or not cfg.audio.macos_device.strip():
         raise ConfigError("audio.macos_device must not be empty")

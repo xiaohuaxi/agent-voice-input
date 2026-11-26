@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Pre-ASR adaptive long-pause & edge-silence trimming (`[audio].silence_trim`)**: Added pure-stdlib silence compression (`"balanced"` default, `"conservative"`, `"off"`) inside `process_wav` before RMS scaling so long thinking pauses and excess leading/trailing silence are compressed with 10 ms integer linear crossfades without altering `gain_db`/`rms_dbfs`/`duration_sec`, while bypassing `< 4 s` clips, `< 1 s` savings, and `retry` replays, preserving raw original audio in `recordings/`, and reporting `silence_trimmed_sec` / `silence_trim_cuts` in telemetry and `diagnose`.
+
 ## [0.16.0] - 2026-11-25
 
 ### Added

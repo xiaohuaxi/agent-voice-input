@@ -694,7 +694,7 @@ class VoiceInputDaemon:
             gate = None
             if len(raw_wav) > 44:
                 try:
-                    gate = process_wav(raw_wav, self.cfg.audio)
+                    gate = process_wav(raw_wav, self.cfg.audio, silence_trim="off")
                 except Exception:
                     gate = None
             lost_ts = self.clock_fn()

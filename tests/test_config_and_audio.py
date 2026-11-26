@@ -31,6 +31,9 @@ from agent_voice_input.audio_proc import (  # noqa: E402
     PEAK_LIMIT_INT16,
     SINGLE_HOP_MAX_CHUNK_SEC,
     SINGLE_HOP_MP3_MIN_WAV_BYTES,
+    _TRIM_PRESETS,
+    _plan_silence_trim,
+    _splice_with_crossfade,
     decode_to_16k_mono_pcm,
     encode_wav_to_mp3_bytes,
     inspect_wav_chunks,
@@ -44,6 +47,7 @@ from agent_voice_input.audio_proc import (  # noqa: E402
 )
 from agent_voice_input.config import (  # noqa: E402
     ASR_AUTO_PRIORITY,
+    AudioConfig,
     CREDENTIAL_ENV_ORDER,
     Config,
     ConfigError,
@@ -57,6 +61,7 @@ from agent_voice_input.config import (  # noqa: E402
     VALID_ASR_PROVIDERS,
     VALID_EFFORTS,
     VALID_REFINER_PROVIDERS,
+    VALID_SILENCE_TRIM,
     _parse_simple_toml,
     classify_asr_model_api,
     ensure_secure_dir,
@@ -1360,6 +1365,50 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         for secret in (*env.values(), gsk_tok, or_tok):
             self.assertNotIn(secret, redacted)
 
+    def test_audio_silence_trim_config_parsing_and_validation(self) -> None:
+        self.assertEqual(VALID_SILENCE_TRIM, frozenset({"off", "conservative", "balanced"}))
+        self.assertEqual(AudioConfig().silence_trim, "balanced")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cfg_dir = home / ".config" / "agent-voice-input"
+            cfg_dir.mkdir(parents=True)
+
+            # Default when omitted is "balanced"
+            (cfg_dir / "config.toml").write_text("[audio]\nbeep = false\n", encoding="utf-8")
+            default_cfg, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(default_cfg.audio.silence_trim, "balanced")
+
+            # Valid values + case/whitespace normalization
+            for raw_val, expected in (
+                ("off", "off"),
+                ("conservative", "conservative"),
+                ("balanced", "balanced"),
+                ("  Conservative  ", "conservative"),
+                (" OFF ", "off"),
+                ("BALANCED", "balanced"),
+            ):
+                (cfg_dir / "config.toml").write_text(
+                    f'[audio]\nsilence_trim = "{raw_val}"\n',
+                    encoding="utf-8",
+                )
+                cfg, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+                self.assertEqual(cfg.audio.silence_trim, expected)
+
+            # Invalid strings & non-strings (bool false must NOT be coerced to "off")
+            for bad_toml in (
+                '[audio]\nsilence_trim = "aggressive"\n',
+                '[audio]\nsilence_trim = ""\n',
+                '[audio]\nsilence_trim = "false"\n',
+                "[audio]\nsilence_trim = false\n",
+                "[audio]\nsilence_trim = true\n",
+                "[audio]\nsilence_trim = 0\n",
+            ):
+                (cfg_dir / "config.toml").write_text(bad_toml, encoding="utf-8")
+                with self.assertRaises(ConfigError) as ctx:
+                    load_config(env={"HOME": str(home)}, home_dir=home)
+                self.assertIn("audio.silence_trim", str(ctx.exception))
+
 
 class AudioProcTests(unittest.TestCase):
     def test_rejects_clip_shorter_than_min_duration(self) -> None:
@@ -1863,6 +1912,570 @@ class AudioProcTests(unittest.TestCase):
                 env={"HOME": "/tmp/nonexistent-avi-home"},
                 load_default_env_files=False,
             )
+
+    def _synth_sine(self, sec: float, dbfs: float, *, freq_hz: float = 440.0) -> list[int]:
+        sr = 16000
+        amp = (10.0 ** (dbfs / 20.0)) * math.sqrt(2.0) * 32768.0
+        n = int(round(sec * sr))
+        return [
+            max(-32767, min(32767, int(round(amp * math.sin(2.0 * math.pi * freq_hz * i / sr)))))
+            for i in range(n)
+        ]
+
+    def _synth_noise(self, sec: float, dbfs: float = -75.0, *, seed: int = 42) -> list[int]:
+        import random
+
+        sr = 16000
+        rng = random.Random(seed)
+        # Uniform[-bound, bound] has RMS = bound / sqrt(3)
+        bound = (10.0 ** (dbfs / 20.0)) * 32768.0 * math.sqrt(3.0)
+        n = int(round(sec * sr))
+        return [int(round(rng.uniform(-bound, bound))) for _ in range(n)]
+
+    def test_silence_trim_long_pause_boundaries_and_edge_margins(self) -> None:
+        sr = 16000
+
+        # 1. 20s internal pause between two 4s speech segments (total 28s; speech > 15% so p85 is speech)
+        long_pause_samples = (
+            self._synth_sine(4.0, -20.0)
+            + self._synth_noise(20.0, -75.0, seed=1)
+            + self._synth_sine(4.0, -20.0)
+        )
+        long_pause_wav = pack_pcm16_mono_wav(long_pause_samples)
+
+        bal = process_wav(long_pause_wav, AudioConfig(silence_trim="balanced"))
+        self.assertTrue(bal.passed)
+        self.assertAlmostEqual(bal.duration_sec, 28.0, places=3)
+        self.assertEqual(bal.trim_cuts, 1)
+        # 20.0s pause -> ~0.60s kept minus 0.01s crossfade overlap => ~19.41s trimmed, ~8.59s output
+        self.assertAlmostEqual(bal.trimmed_sec, 19.41, delta=0.05)
+        _, _, _, bal_out = _unpack_wav_samples(bal.wav_bytes)
+        self.assertAlmostEqual(len(bal_out) / float(sr), bal.duration_sec - bal.trimmed_sec, places=3)
+        self.assertAlmostEqual(len(bal_out) / float(sr), 8.59, delta=0.05)
+
+        cons = process_wav(long_pause_wav, AudioConfig(silence_trim="conservative"))
+        self.assertTrue(cons.passed)
+        self.assertEqual(cons.trim_cuts, 1)
+        # 20.0s pause -> ~0.80s kept minus 0.01s crossfade => ~19.21s trimmed, ~8.79s output
+        self.assertAlmostEqual(cons.trimmed_sec, 19.21, delta=0.05)
+        _, _, _, cons_out = _unpack_wav_samples(cons.wav_bytes)
+        self.assertAlmostEqual(len(cons_out) / float(sr), 8.79, delta=0.05)
+
+        # 2. Pause duration boundaries: two 1.1s pauses untouched in balanced; two 1.5s pauses trimmed in balanced but untouched in conservative
+        p11 = (
+            self._synth_sine(1.5, -20.0)
+            + self._synth_noise(1.1, -75.0, seed=2)
+            + self._synth_sine(1.5, -20.0)
+            + self._synth_noise(1.1, -75.0, seed=3)
+            + self._synth_sine(1.5, -20.0)
+        )
+        p11_wav = pack_pcm16_mono_wav(p11)
+        p11_bal = process_wav(p11_wav, AudioConfig(silence_trim="balanced"))
+        p11_off = process_wav(p11_wav, AudioConfig(silence_trim="off"))
+        self.assertEqual(p11_bal.trim_cuts, 0)
+        self.assertEqual(p11_bal.trimmed_sec, 0.0)
+        self.assertEqual(p11_bal.wav_bytes, p11_off.wav_bytes)
+
+        p15 = (
+            self._synth_sine(1.5, -20.0)
+            + self._synth_noise(1.5, -75.0, seed=4)
+            + self._synth_sine(1.5, -20.0)
+            + self._synth_noise(1.5, -75.0, seed=5)
+            + self._synth_sine(1.5, -20.0)
+        )
+        p15_wav = pack_pcm16_mono_wav(p15)
+        p15_cons = process_wav(p15_wav, AudioConfig(silence_trim="conservative"))
+        p15_bal = process_wav(p15_wav, AudioConfig(silence_trim="balanced"))
+        self.assertEqual(p15_cons.trim_cuts, 0)
+        self.assertEqual(p15_cons.trimmed_sec, 0.0)
+        self.assertEqual(p15_bal.trim_cuts, 2)
+        self.assertAlmostEqual(p15_bal.trimmed_sec, 1.82, delta=0.08)
+
+        # 3. Leading & trailing margins per preset + 0.2s hysteresis
+        edges = (
+            self._synth_noise(2.0, -75.0, seed=6)
+            + self._synth_sine(3.0, -20.0)
+            + self._synth_noise(2.0, -75.0, seed=7)
+        )
+        edges_wav = pack_pcm16_mono_wav(edges)
+        e_bal = process_wav(edges_wav, AudioConfig(silence_trim="balanced"))
+        self.assertEqual(e_bal.trim_cuts, 2)
+        # 2.0->0.30 (save 1.70) + 2.0->0.45 (save 1.55) = 3.25s trimmed
+        self.assertAlmostEqual(e_bal.trimmed_sec, 3.25, delta=0.05)
+
+        e_cons = process_wav(edges_wav, AudioConfig(silence_trim="conservative"))
+        self.assertEqual(e_cons.trim_cuts, 2)
+        # 2.0->0.40 (save 1.60) + 2.0->0.55 (save 1.45) = 3.05s trimmed
+        self.assertAlmostEqual(e_cons.trimmed_sec, 3.05, delta=0.05)
+
+        # Hysteresis: leading 0.48s (< 0.30+0.20) & trailing 0.62s (< 0.45+0.20) must not trim
+        small_edges = (
+            self._synth_noise(0.48, -75.0, seed=8)
+            + self._synth_sine(3.2, -20.0)
+            + self._synth_noise(0.62, -75.0, seed=9)
+        )
+        se_bal = process_wav(pack_pcm16_mono_wav(small_edges), AudioConfig(silence_trim="balanced"))
+        self.assertEqual(se_bal.trim_cuts, 0)
+        self.assertEqual(se_bal.trimmed_sec, 0.0)
+
+    def test_silence_trim_impulse_bridging_weak_syllable_and_decay_tail(self) -> None:
+        sr = 16000
+
+        # 1. Faint 40ms click (-48 dBFS <= thresh+8dB) inside a 3.0s pause is bridged in both balanced and conservative
+        click_40 = (
+            self._synth_sine(2.0, -20.0)
+            + self._synth_noise(1.5, -75.0, seed=10)
+            + self._synth_sine(0.04, -48.0, freq_hz=1200.0)
+            + self._synth_noise(1.5, -75.0, seed=11)
+            + self._synth_sine(2.0, -20.0)
+        )
+        c40_wav = pack_pcm16_mono_wav(click_40)
+        c40_bal = process_wav(c40_wav, AudioConfig(silence_trim="balanced"))
+        c40_cons = process_wav(c40_wav, AudioConfig(silence_trim="conservative"))
+        self.assertEqual(c40_bal.trim_cuts, 1)
+        self.assertAlmostEqual(c40_bal.trimmed_sec, 2.45, delta=0.08)
+        self.assertEqual(c40_cons.trim_cuts, 1)
+        self.assertAlmostEqual(c40_cons.trimmed_sec, 2.25, delta=0.08)
+
+        # Faint 60ms click: bridged in balanced (<=3 frames), NOT bridged in conservative (<=2 frames -> two 1.5s < 1.6s gaps)
+        click_60 = (
+            self._synth_sine(2.0, -20.0)
+            + self._synth_noise(1.5, -75.0, seed=12)
+            + self._synth_sine(0.06, -48.0, freq_hz=1200.0)
+            + self._synth_noise(1.5, -75.0, seed=13)
+            + self._synth_sine(2.0, -20.0)
+        )
+        c60_wav = pack_pcm16_mono_wav(click_60)
+        self.assertEqual(process_wav(c60_wav, AudioConfig(silence_trim="balanced")).trim_cuts, 1)
+        self.assertEqual(process_wav(c60_wav, AudioConfig(silence_trim="conservative")).trim_cuts, 0)
+
+        # Loud 40ms short burst (-20 dBFS > thresh+8dB) is protected by peak guard and NOT bridged
+        loud_burst = (
+            self._synth_sine(2.0, -20.0)
+            + self._synth_noise(1.5, -75.0, seed=18)
+            + self._synth_sine(0.04, -20.0, freq_hz=900.0)
+            + self._synth_noise(1.5, -75.0, seed=19)
+            + self._synth_sine(2.0, -20.0)
+        )
+        lb_res = process_wav(pack_pcm16_mono_wav(loud_burst), AudioConfig(silence_trim="balanced"))
+        self.assertEqual(lb_res.trim_cuts, 2)
+        self.assertAlmostEqual(lb_res.trimmed_sec, 1.82, delta=0.08)
+
+        # 2. 150ms weak syllable (-42 dBFS, realistic soft voice) inside a 4s pause MUST be preserved (2 cuts around it)
+        weak_syl = (
+            self._synth_sine(2.0, -20.0)
+            + self._synth_noise(2.0, -75.0, seed=14)
+            + self._synth_sine(0.15, -42.0, freq_hz=660.0)
+            + self._synth_noise(2.0, -75.0, seed=15)
+            + self._synth_sine(2.0, -20.0)
+        )
+        ws_res = process_wav(pack_pcm16_mono_wav(weak_syl), AudioConfig(silence_trim="balanced"))
+        self.assertEqual(ws_res.trim_cuts, 2)
+        _, _, _, ws_out = _unpack_wav_samples(ws_res.wav_bytes)
+        # Expected output: 2.0 + 0.59 + 0.15 + 0.59 + 2.0 = ~5.33s; weak syllable lives around 2.59..2.74s
+        self.assertAlmostEqual(len(ws_out) / float(sr), 5.33, delta=0.08)
+        mid_seg = ws_out[int(2.45 * sr) : int(2.90 * sr)]
+        mid_peak = max(abs(int(x)) for x in mid_seg)
+        # -42 dBFS sine peak ~ 368; -75 dBFS noise peak ~ 10 -> preserved weak syllable clearly stands above noise
+        self.assertGreater(mid_peak, 200)
+
+        # 3. Decaying -60 dBFS tail inside post-speech 0.35s keep zone MUST be preserved (anti-word-clipping guard)
+        tail_samples = (
+            self._synth_sine(3.0, -20.0)
+            + self._synth_sine(0.30, -60.0, freq_hz=330.0)
+            + self._synth_noise(3.0, -75.0, seed=16)
+            + self._synth_sine(2.0, -20.0)
+        )
+        tail_res = process_wav(pack_pcm16_mono_wav(tail_samples), AudioConfig(silence_trim="balanced"))
+        self.assertEqual(tail_res.trim_cuts, 1)
+        _, _, _, tail_out = _unpack_wav_samples(tail_res.wav_bytes)
+        tail_region = tail_out[int(3.02 * sr) : int(3.28 * sr)]
+        tail_rms = math.sqrt(sum(s * s for s in tail_region) / (len(tail_region) * (32768.0 * 32768.0)))
+        tail_dbfs = 20.0 * math.log10(max(tail_rms, 1e-10))
+        self.assertAlmostEqual(tail_dbfs, -60.0 + tail_res.gain_db, delta=1.5)
+
+    def test_silence_trim_preserves_quiet_followup_clause_under_elevated_noise_floor(self) -> None:
+        sr = 16000
+        # Main clauses (-16 dBFS) flanking 2.0s pauses and a quiet modulated -47 dBFS follow-up clause (~1.9s)
+        # with realistic short inter-word gaps, overlaid with -62 dBFS fan/laptop noise floor.
+        quiet_clause = (
+            self._synth_sine(0.55, -47.0, freq_hz=520.0)
+            + [0] * int(0.12 * sr)
+            + self._synth_sine(0.55, -46.0, freq_hz=580.0)
+            + [0] * int(0.13 * sr)
+            + self._synth_sine(0.55, -48.0, freq_hz=500.0)
+        )  # 1.90s
+        clean = (
+            self._synth_sine(2.5, -16.0, freq_hz=440.0)
+            + [0] * int(2.0 * sr)
+            + quiet_clause
+            + [0] * int(2.0 * sr)
+            + self._synth_sine(2.5, -16.0, freq_hz=440.0)
+        )  # total 10.90s
+        noise = self._synth_noise(len(clean) / float(sr), -62.0, seed=404)
+        mixed = [max(-32767, min(32767, a + b)) for a, b in zip(clean, noise)]
+
+        res = process_wav(pack_pcm16_mono_wav(mixed), AudioConfig(silence_trim="balanced"))
+        self.assertTrue(res.passed)
+        self.assertAlmostEqual(res.duration_sec, 10.90, places=2)
+        # Both 2.0s pauses trimmed to ~0.6s (~1.4s saved each -> ~2.82s total), NEVER deleting the 1.9s quiet clause!
+        self.assertEqual(res.trim_cuts, 2)
+        self.assertGreater(res.trimmed_sec, 2.4)
+        self.assertLess(res.trimmed_sec, 3.3)
+        _, _, _, out_arr = _unpack_wav_samples(res.wav_bytes)
+        self.assertAlmostEqual(len(out_arr) / float(sr), 10.90 - res.trimmed_sec, places=3)
+        # Verify the quiet follow-up clause (~3.1s..5.0s in output) retains full -47 dBFS + gain_db energy
+        mid_clause = out_arr[int(3.2 * sr) : int(4.8 * sr)]
+        mid_rms = math.sqrt(sum(s * s for s in mid_clause) / (len(mid_clause) * (32768.0 * 32768.0)))
+        mid_dbfs = 20.0 * math.log10(max(mid_rms, 1e-10))
+        self.assertGreater(mid_dbfs, -52.0 + res.gain_db)
+
+    def test_silence_trim_extreme_low_speech_ratio_thinking_pause(self) -> None:
+        sr = 16000
+        # 3s speech + 45s noise + 3s speech = 51s total (~11.8% speech < 15%, where p85 falls into noise floor)
+        sparse_samples = (
+            self._synth_sine(3.0, -20.0)
+            + self._synth_noise(45.0, -75.0, seed=17)
+            + self._synth_sine(3.0, -20.0)
+        )
+        res = process_wav(pack_pcm16_mono_wav(sparse_samples), AudioConfig(silence_trim="balanced"))
+        self.assertTrue(res.passed)
+        self.assertAlmostEqual(res.duration_sec, 51.0, places=3)
+        self.assertGreaterEqual(res.trim_cuts, 1)
+        self.assertEqual(res.trim_cuts, 1)
+        self.assertGreater(res.trimmed_sec, 40.0)
+        self.assertAlmostEqual(res.trimmed_sec, 44.41, delta=0.08)
+        _, _, _, out_arr = _unpack_wav_samples(res.wav_bytes)
+        self.assertAlmostEqual(len(out_arr) / float(sr), 6.59, delta=0.08)
+
+    def test_silence_trim_bypass_gain_invariance_fixed_noise_idempotency_and_crossfade(self) -> None:
+        sr = 16000
+
+        # 1. Fast bypass: < 4s clip produces bit-for-bit identical bytes to "off"
+        short_clip = self._synth_sine(1.0, -20.0) + self._synth_noise(2.5, -75.0, seed=20)
+        short_wav = pack_pcm16_mono_wav(short_clip)
+        short_off = process_wav(short_wav, AudioConfig(silence_trim="off"))
+        short_bal = process_wav(short_wav, AudioConfig(silence_trim="balanced"))
+        self.assertEqual(short_bal.trimmed_sec, 0.0)
+        self.assertEqual(short_bal.trim_cuts, 0)
+        self.assertEqual(short_bal.wav_bytes, short_off.wav_bytes)
+
+        # Fast bypass: >= 4s clip with < 1.0s savable silence (1.4s pause -> 0.8s savable < 1.0s)
+        small_save = (
+            self._synth_sine(2.0, -20.0)
+            + self._synth_noise(1.4, -75.0, seed=21)
+            + self._synth_sine(2.0, -20.0)
+        )
+        ss_wav = pack_pcm16_mono_wav(small_save)
+        ss_off = process_wav(ss_wav, AudioConfig(silence_trim="off"))
+        ss_bal = process_wav(ss_wav, AudioConfig(silence_trim="balanced"))
+        self.assertEqual(ss_bal.trimmed_sec, 0.0)
+        self.assertEqual(ss_bal.trim_cuts, 0)
+        self.assertEqual(ss_bal.wav_bytes, ss_off.wav_bytes)
+
+        # Direct all-silent guard on _plan_silence_trim
+        self.assertEqual(_plan_silence_trim(array.array("h", [0] * (5 * sr)), _TRIM_PRESETS["balanced"]), [])
+
+        # 2. Gain invariance: off vs balanced produce identical gain_db, rms_dbfs, duration_sec, voiced_sec
+        quiet_long = (
+            self._synth_noise(2.0, -75.0, seed=22)
+            + self._synth_sine(3.0, -34.0)
+            + self._synth_noise(6.0, -75.0, seed=23)
+            + self._synth_sine(3.0, -34.0)
+            + self._synth_noise(2.0, -75.0, seed=24)
+        )
+        ql_wav = pack_pcm16_mono_wav(quiet_long)
+        ql_off = process_wav(ql_wav, AudioConfig(silence_trim="off"))
+        ql_bal = process_wav(ql_wav, AudioConfig(silence_trim="balanced"))
+        ql_override = process_wav(ql_wav, AudioConfig(silence_trim="balanced"), silence_trim="off")
+        self.assertGreater(ql_bal.trimmed_sec, 8.0)
+        self.assertEqual(ql_bal.gain_db, ql_off.gain_db)
+        self.assertEqual(ql_bal.rms_dbfs, ql_off.rms_dbfs)
+        self.assertEqual(ql_bal.duration_sec, ql_off.duration_sec)
+        self.assertEqual(ql_bal.voiced_sec, ql_off.voiced_sec)
+        self.assertEqual(ql_override.wav_bytes, ql_off.wav_bytes)
+        self.assertEqual(ql_override.trimmed_sec, 0.0)
+
+        # 3. Fixed-noise-floor second-pass idempotency: re-planning on its own spliced output returns []
+        raw_arr = array.array("h", quiet_long)
+        for mode in ("balanced", "conservative"):
+            preset = _TRIM_PRESETS[mode]
+            ranges = _plan_silence_trim(raw_arr, preset)
+            self.assertTrue(ranges)
+            spliced = _splice_with_crossfade(raw_arr, ranges)
+            self.assertEqual(_plan_silence_trim(spliced, preset), [])
+
+        # 4. Crossfade continuity: opposite DC steps (+4000 -> -4000) interpolate smoothly with no click
+        step_src = array.array("h", [4000] * 1000 + [0] * 1000 + [-4000] * 1000)
+        spliced_step = _splice_with_crossfade(step_src, [(0, 1000), (2000, 3000)])
+        self.assertEqual(len(spliced_step), 2000 - 160)
+        max_jump = max(
+            abs(int(spliced_step[i + 1]) - int(spliced_step[i]))
+            for i in range(len(spliced_step) - 1)
+        )
+        self.assertLessEqual(max_jump, 60)
+        # Packed WAV output is valid canonical 16kHz mono 16-bit PCM
+        ch, sw, out_sr, out_arr = _unpack_wav_samples(ql_bal.wav_bytes)
+        self.assertEqual((ch, sw, out_sr), (1, 2, 16000))
+        self.assertAlmostEqual(len(out_arr) / float(sr), ql_bal.duration_sec - ql_bal.trimmed_sec, places=3)
+
+    def test_silence_trim_pipeline_seams_retry_archive_telemetry_and_single_hop(self) -> None:
+        from agent_voice_input.asr_providers import AsrContext, AsrResult, BaseAsrProvider
+        from agent_voice_input.audio_proc import list_saved_recordings
+        from agent_voice_input.config import RefinerConfig, resolve_saved_recordings_dir
+        from agent_voice_input.daemon_pipeline import build_pipeline_summary, run_pipeline_once
+        from agent_voice_input.diagnose import (
+            _sanitize_telemetry_record,
+            format_live_diagnostics_markdown,
+        )
+        from agent_voice_input.refiner import NoopRefiner
+
+        class _RecordingAsr(BaseAsrProvider):
+            provider_name = "fake"
+
+            def __init__(self, *, single_hop: bool = False) -> None:
+                self.single_hop = single_hop
+                self.seen_wav_lens: list[int] = []
+
+            def transcribe(
+                self,
+                wav_bytes: bytes,
+                *,
+                context: AsrContext | None = None,
+                is_cancelled: object = None,
+                cancel_token: object = None,
+            ) -> AsrResult:
+                self.seen_wav_lens.append(len(wav_bytes))
+                return AsrResult(
+                    text="测试裁剪接缝",
+                    provider="fake",
+                    model="fake-model",
+                    latency_ms=12,
+                    is_single_hop_refined=self.single_hop,
+                )
+
+        sr = 16000
+        long_samples = (
+            self._synth_sine(2.0, -20.0)
+            + self._synth_noise(5.0, -75.0, seed=30)
+            + self._synth_sine(2.0, -20.0)
+        )
+        raw_wav = pack_pcm16_mono_wav(long_samples)  # 9.0s
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            home.mkdir()
+            rt.mkdir(mode=0o700)
+            env = {"HOME": str(home), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
+
+            # 1. Normal recording trims before ASR, archives RAW original audio to recordings/, and populates telemetry
+            asr_norm = _RecordingAsr(single_hop=False)
+            cfg_arch = Config(
+                audio=AudioConfig(silence_trim="balanced", save_recordings=True, save_recordings_max_count=5),
+                refiner=RefinerConfig(provider="off"),
+            )
+            # Force WAV archive fallback so we can compare exact archived sample count without ffmpeg lossy framing
+            with mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", side_effect=AudioError("no ffmpeg")):
+                res_norm = run_pipeline_once(
+                    raw_wav,
+                    cfg=cfg_arch,
+                    asr_provider=asr_norm,
+                    refiner=NoopRefiner(),
+                    audio_source="avfoundation",
+                    dry_run=True,
+                    runtime_dir=rt,
+                    env=env,
+                )
+            self.assertTrue(res_norm.ok)
+            assert res_norm.gate is not None
+            self.assertAlmostEqual(res_norm.gate.duration_sec, 9.0, places=3)
+            self.assertAlmostEqual(res_norm.gate.trimmed_sec, 4.41, delta=0.06)
+            self.assertEqual(res_norm.gate.trim_cuts, 1)
+            self.assertEqual(len(asr_norm.seen_wav_lens), 1)
+            self.assertLess(asr_norm.seen_wav_lens[0], len(raw_wav) - int(4.0 * sr * 2))
+
+            archived = list_saved_recordings(resolve_saved_recordings_dir(env))
+            self.assertEqual(len(archived), 1)
+            self.assertEqual(archived[0].read_bytes(), raw_wav)
+
+            summary = build_pipeline_summary(1, res_norm, dry_run=True)
+            self.assertEqual(summary["raw_audio_sec"], 9.0)
+            self.assertEqual(summary["silence_trimmed_sec"], round(res_norm.gate.trimmed_sec, 3))
+            self.assertEqual(summary["silence_trim_cuts"], 1)
+
+            sanitized = _sanitize_telemetry_record(summary, lambda s: s)
+            self.assertEqual(sanitized["silence_trimmed_sec"], summary["silence_trimmed_sec"])
+            self.assertEqual(sanitized["silence_trim_cuts"], 1)
+
+            # Diagnose markdown renders sent duration with arrow when trimmed and remains compatible for legacy records
+            legacy_rec = {k: v for k, v in sanitized.items() if k not in ("silence_trimmed_sec", "silence_trim_cuts")}
+            md = format_live_diagnostics_markdown(
+                {
+                    "version": "0.16.0",
+                    "diag_elapsed_ms": 5,
+                    "requested_last": 2,
+                    "daemon": {
+                        "online": False,
+                        "state": "stopped",
+                        "pid": None,
+                        "pending_count": 0,
+                        "shim_ok": None,
+                        "asr_provider": "fake",
+                        "asr_model": "fake-model",
+                        "refiner_provider": "off",
+                        "refiner_model": "",
+                        "refiner_effort": "auto",
+                    },
+                    "pipeline": {},
+                    "summary": {"total": 2, "ok_count": 2, "fallback_count": 0, "failed_or_skipped": 0},
+                    "session_match": {"matched": False},
+                    "storage": {"telemetry_kb": 0.1, "failed_audio_count": 0, "newest_failed_at": ""},
+                    "recent_results": [
+                        {**sanitized, "session_tag": "none", "diag_flags": []},
+                        {**legacy_rec, "seq_id": 2, "session_tag": "none", "diag_flags": []},
+                    ],
+                    "daemon_log_tail": "",
+                }
+            )
+            self.assertIn("→4.6", md)
+
+            # 2. retry bypasses silence trimming and omits silence_trimmed_* telemetry keys
+            asr_retry = _RecordingAsr(single_hop=False)
+            res_retry = run_pipeline_once(
+                raw_wav,
+                cfg=Config(audio=AudioConfig(silence_trim="balanced"), refiner=RefinerConfig(provider="off")),
+                asr_provider=asr_retry,
+                refiner=NoopRefiner(),
+                audio_source="retry",
+                dry_run=True,
+                runtime_dir=rt,
+                env=env,
+            )
+            self.assertTrue(res_retry.ok)
+            assert res_retry.gate is not None
+            self.assertEqual(res_retry.gate.trimmed_sec, 0.0)
+            self.assertEqual(res_retry.gate.trim_cuts, 0)
+            self.assertEqual(asr_retry.seen_wav_lens, [len(raw_wav)])
+            retry_summary = build_pipeline_summary(2, res_retry, dry_run=True)
+            self.assertNotIn("silence_trimmed_sec", retry_summary)
+            self.assertNotIn("silence_trim_cuts", retry_summary)
+
+            # 3. Single-hop provider also receives the trimmed WAV bytes
+            asr_sh = _RecordingAsr(single_hop=True)
+            res_sh = run_pipeline_once(
+                raw_wav,
+                cfg=Config(audio=AudioConfig(silence_trim="balanced"), refiner=RefinerConfig(provider="off")),
+                asr_provider=asr_sh,
+                refiner=NoopRefiner(),
+                audio_source="file",
+                dry_run=True,
+                runtime_dir=rt,
+                env=env,
+            )
+            self.assertTrue(res_sh.ok)
+            self.assertEqual(asr_sh.seen_wav_lens, asr_norm.seen_wav_lens)
+
+            # 4. P1-1 regression: recording passing min_duration_sec=4.0 trims to <4s in failed/, then retry succeeds
+            from agent_voice_input.asr_providers import AsrError
+
+            class _FailOnceAsr(BaseAsrProvider):
+                provider_name = "fake"
+
+                def __init__(self) -> None:
+                    pass
+
+                def transcribe(self, wav_bytes: bytes, **_kw: object) -> AsrResult:
+                    raise AsrError("simulated_asr_outage")
+
+            short_after_trim_raw = pack_pcm16_mono_wav(
+                self._synth_sine(1.2, -20.0)
+                + self._synth_noise(6.4, -75.0, seed=31)
+                + self._synth_sine(1.2, -20.0)
+            )  # 8.8s raw -> ~3.0s after balanced trim (< 4.0s min_duration_sec!)
+            cfg_min4 = Config(
+                audio=AudioConfig(min_duration_sec=4.0, silence_trim="balanced"),
+                refiner=RefinerConfig(provider="off"),
+            )
+            with self.assertRaises(AsrError) as fail_ctx:
+                run_pipeline_once(
+                    short_after_trim_raw,
+                    cfg=cfg_min4,
+                    asr_provider=_FailOnceAsr(),
+                    refiner=NoopRefiner(),
+                    audio_source="avfoundation",
+                    dry_run=True,
+                    runtime_dir=rt,
+                    env=env,
+                )
+            stashed_path = Path(str(getattr(fail_ctx.exception, "_saved_audio_path", "")))
+            self.assertTrue(stashed_path.is_file())
+            stashed_bytes = stashed_path.read_bytes()
+            _, _, _, stashed_arr = _unpack_wav_samples(stashed_bytes)
+            self.assertLess(len(stashed_arr) / float(sr), 4.0)
+
+            asr_recover = _RecordingAsr(single_hop=False)
+            res_recover = run_pipeline_once(
+                stashed_bytes,
+                cfg=cfg_min4,
+                asr_provider=asr_recover,
+                refiner=NoopRefiner(),
+                audio_source="retry",
+                dry_run=True,
+                runtime_dir=rt,
+                env=env,
+            )
+            self.assertTrue(res_recover.ok, f"retry failed: {res_recover.skipped_reason} {res_recover.error}")
+            self.assertEqual(asr_recover.seen_wav_lens, [len(stashed_bytes)])
+
+            # 5. Retry regression for elevated min_voiced_sec=3.0:
+            #    two 0.8s -13 dBFS speech clips + 7.0s -46 dBFS noise (> -50 dBFS floor -> voiced_sec > 3.0 raw),
+            #    trimmed down to voiced_sec < 3.0 in failed/, MUST still recover via retry without 'silence' rejection.
+            voiced_trim_raw = pack_pcm16_mono_wav(
+                self._synth_sine(0.8, -13.0)
+                + self._synth_noise(7.0, -46.0, seed=32)
+                + self._synth_sine(0.8, -13.0)
+            )
+            cfg_mv3 = Config(
+                audio=AudioConfig(floor_dbfs=-50.0, min_voiced_sec=3.0, silence_trim="balanced"),
+                refiner=RefinerConfig(provider="off"),
+            )
+            with self.assertRaises(AsrError) as mv3_ctx:
+                run_pipeline_once(
+                    voiced_trim_raw,
+                    cfg=cfg_mv3,
+                    asr_provider=_FailOnceAsr(),
+                    refiner=NoopRefiner(),
+                    audio_source="avfoundation",
+                    dry_run=True,
+                    runtime_dir=rt,
+                    env=env,
+                )
+            mv3_stashed_path = Path(str(getattr(mv3_ctx.exception, "_saved_audio_path", "")))
+            self.assertTrue(mv3_stashed_path.is_file())
+            mv3_stashed_bytes = mv3_stashed_path.read_bytes()
+            # Confirm the stashed audio indeed fails raw min_voiced_sec=3.0 without retry cap
+            raw_recheck = process_wav(mv3_stashed_bytes, cfg_mv3.audio, silence_trim="off")
+            self.assertFalse(raw_recheck.passed)
+            self.assertEqual(raw_recheck.reason, "silence")
+
+            asr_mv3_recover = _RecordingAsr(single_hop=False)
+            res_mv3_recover = run_pipeline_once(
+                mv3_stashed_bytes,
+                cfg=cfg_mv3,
+                asr_provider=asr_mv3_recover,
+                refiner=NoopRefiner(),
+                audio_source="retry",
+                dry_run=True,
+                runtime_dir=rt,
+                env=env,
+            )
+            self.assertTrue(
+                res_mv3_recover.ok,
+                f"retry failed under min_voiced_sec=3.0: {res_mv3_recover.skipped_reason} {res_mv3_recover.error}",
+            )
+            self.assertEqual(asr_mv3_recover.seen_wav_lens, [len(mv3_stashed_bytes)])
 
 
 if __name__ == "__main__":

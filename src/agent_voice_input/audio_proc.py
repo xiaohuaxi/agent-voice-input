@@ -8,6 +8,7 @@ import array
 from dataclasses import dataclass
 import io
 import math
+import operator
 import os
 from pathlib import Path
 import re
@@ -52,6 +53,167 @@ class AudioGateResult:
     rms_dbfs: float
     gain_db: float
     all_zero: bool = False
+    trimmed_sec: float = 0.0
+    trim_cuts: int = 0
+
+
+_TRIM_MIN_INPUT_SAMPLES = 4 * TARGET_SAMPLE_RATE
+_TRIM_MIN_SAVING_SAMPLES = 1 * TARGET_SAMPLE_RATE
+_TRIM_EDGE_MARGIN_SAMPLES = int(round(0.20 * TARGET_SAMPLE_RATE))
+_TRIM_BRIDGE_SIDE_FRAMES = 15  # 0.30 s @ 50 fps
+_TRIM_CROSSFADE_SAMPLES = int(round(0.010 * TARGET_SAMPLE_RATE))  # 10 ms
+
+
+@dataclass(frozen=True)
+class _TrimPreset:
+    min_pause_samples: int
+    keep_after_samples: int
+    keep_before_samples: int
+    lead_keep_samples: int
+    trail_keep_samples: int
+    max_bridge_frames: int
+
+
+_TRIM_PRESETS: dict[str, _TrimPreset] = {
+    "balanced": _TrimPreset(
+        min_pause_samples=int(round(1.20 * TARGET_SAMPLE_RATE)),
+        keep_after_samples=int(round(0.35 * TARGET_SAMPLE_RATE)),
+        keep_before_samples=int(round(0.25 * TARGET_SAMPLE_RATE)),
+        lead_keep_samples=int(round(0.30 * TARGET_SAMPLE_RATE)),
+        trail_keep_samples=int(round(0.45 * TARGET_SAMPLE_RATE)),
+        max_bridge_frames=3,
+    ),
+    "conservative": _TrimPreset(
+        min_pause_samples=int(round(1.60 * TARGET_SAMPLE_RATE)),
+        keep_after_samples=int(round(0.45 * TARGET_SAMPLE_RATE)),
+        keep_before_samples=int(round(0.35 * TARGET_SAMPLE_RATE)),
+        lead_keep_samples=int(round(0.40 * TARGET_SAMPLE_RATE)),
+        trail_keep_samples=int(round(0.55 * TARGET_SAMPLE_RATE)),
+        max_bridge_frames=2,
+    ),
+}
+
+
+def _plan_silence_trim(
+    samples: Sequence[int],
+    preset: _TrimPreset,
+    *,
+    speech_dbfs: float | None = None,
+) -> list[tuple[int, int]]:
+    """Plan kept sample ranges for conservative long-pause & edge-silence trimming.
+
+    Returns an empty list when trimming should be bypassed (duration < 4 s, no
+    eligible silent spans, or total removable silence < 1.0 s).
+    """
+    total_samples = len(samples)
+    if total_samples < _TRIM_MIN_INPUT_SAMPLES:
+        return []
+
+    fs = _SPLIT_FRAME_SAMPLES
+    inv_full_scale_sq = 1.0 / (32768.0 * 32768.0)
+    mul = operator.mul
+    log10 = math.log10
+    frame_db: list[float] = []
+    for off in range(0, total_samples, fs):
+        blk = samples[off : off + fs]
+        msq = sum(map(mul, blk, blk)) * inv_full_scale_sq / len(blk)
+        frame_db.append(10.0 * log10(msq) if msq > 1e-12 else -120.0)
+
+    n_frames = len(frame_db)
+    sorted_db = sorted(frame_db)
+    noise_db = sorted_db[int(0.08 * (n_frames - 1))]
+    # Prefer voiced rms_dbfs when available so extreme thinking pauses (<15% speech) do not drag p85 into noise floor.
+    speech_db = (
+        speech_dbfs
+        if speech_dbfs is not None
+        else sorted_db[int(0.85 * (n_frames - 1))]
+    )
+    thresh_db = min(speech_db - 26.0, max(noise_db + 9.0, -53.0))
+
+    is_silent = [db <= thresh_db for db in frame_db]
+    runs: list[tuple[bool, int, int]] = []
+    cur_val = is_silent[0]
+    cur_start = 0
+    for i in range(1, n_frames):
+        if is_silent[i] != cur_val:
+            runs.append((cur_val, cur_start, i))
+            cur_val = is_silent[i]
+            cur_start = i
+    runs.append((cur_val, cur_start, n_frames))
+
+    if len(runs) >= 3:
+        for idx in range(1, len(runs) - 1):
+            val, r_start, r_end = runs[idx]
+            if (
+                not val
+                and (r_end - r_start) <= preset.max_bridge_frames
+                and max(frame_db[r_start:r_end]) <= thresh_db + 8.0
+            ):
+                prev_len = runs[idx - 1][2] - runs[idx - 1][1]
+                next_len = runs[idx + 1][2] - runs[idx + 1][1]
+                if prev_len >= _TRIM_BRIDGE_SIDE_FRAMES and next_len >= _TRIM_BRIDGE_SIDE_FRAMES:
+                    for j in range(r_start, r_end):
+                        is_silent[j] = True
+
+    cuts: list[tuple[int, int]] = []
+    run_s = -1
+    for i in range(n_frames + 1):
+        sil = is_silent[i] if i < n_frames else False
+        if sil:
+            if run_s < 0:
+                run_s = i
+        elif run_s >= 0:
+            s_start = run_s * fs
+            s_end = total_samples if i >= n_frames else i * fs
+            seg_len = s_end - s_start
+            if s_start == 0 and s_end == total_samples:
+                return []
+            if s_start == 0:
+                if seg_len > preset.lead_keep_samples + _TRIM_EDGE_MARGIN_SAMPLES:
+                    cuts.append((0, s_end - preset.lead_keep_samples))
+            elif s_end == total_samples:
+                if seg_len > preset.trail_keep_samples + _TRIM_EDGE_MARGIN_SAMPLES:
+                    cuts.append((s_start + preset.trail_keep_samples, total_samples))
+            elif seg_len >= preset.min_pause_samples:
+                cuts.append((s_start + preset.keep_after_samples, s_end - preset.keep_before_samples))
+            run_s = -1
+
+    if not cuts or sum(ce - cs for cs, ce in cuts) < _TRIM_MIN_SAVING_SAMPLES:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for cut_s, cut_e in cuts:
+        if cut_s > cursor:
+            ranges.append((cursor, cut_s))
+        cursor = cut_e
+    if cursor < total_samples:
+        ranges.append((cursor, total_samples))
+    return ranges
+
+
+def _splice_with_crossfade(
+    samples: array.array[int] | Sequence[int],
+    ranges: Sequence[tuple[int, int]],
+    *,
+    fade_samples: int = _TRIM_CROSSFADE_SAMPLES,
+) -> array.array[int]:
+    """Concatenate kept sample ranges with integer linear crossfade at internal splice points."""
+    out = array.array("h")
+    for idx, (r_start, r_end) in enumerate(ranges):
+        if idx == 0 or fade_samples <= 0:
+            out.extend(samples[r_start:r_end])
+            continue
+        fade = min(fade_samples, len(out), r_end - r_start)
+        if fade > 0:
+            out_base = len(out) - fade
+            denom = fade + 1
+            for i in range(fade):
+                lv = out[out_base + i]
+                rv = samples[r_start + i]
+                out[out_base + i] = ((fade - i) * lv + (i + 1) * rv) // denom
+        out.extend(samples[r_start + fade : r_end])
+    return out
 
 
 _FFMPEG_FALLBACK_PATHS: tuple[str, ...] = (
@@ -316,16 +478,18 @@ def process_wav(
     max_gain_db: float | None = None,
     min_duration_sec: float | None = None,
     min_voiced_sec: float | None = None,
+    silence_trim: str | None = None,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
     timeout_sec: float = 30.0,
 ) -> AudioGateResult:
-    """Gate silence/short clips and normalize voiced RMS to ``target_dbfs`` (-20 dBFS)."""
+    """Gate silence/short clips, optionally trim long pauses, and normalize voiced RMS to ``target_dbfs``."""
     cfg = audio_cfg or AudioConfig()
     eff_floor = cfg.floor_dbfs if floor_dbfs is None else floor_dbfs
     eff_target = cfg.target_dbfs if target_dbfs is None else target_dbfs
     eff_max_gain = cfg.max_gain_db if max_gain_db is None else max_gain_db
     eff_min_dur = cfg.min_duration_sec if min_duration_sec is None else min_duration_sec
     eff_min_voiced = cfg.min_voiced_sec if min_voiced_sec is None else min_voiced_sec
+    eff_trim = (cfg.silence_trim if silence_trim is None else silence_trim).strip().lower()
 
     pcm_bytes = decode_to_16k_mono_pcm(
         wav_input, ffmpeg_bin=ffmpeg_bin, timeout_sec=timeout_sec
@@ -409,6 +573,21 @@ def process_wav(
     gain_db = min(eff_target - rms_dbfs, eff_max_gain)
     scale = 10.0 ** (gain_db / 20.0)
 
+    work_samples = samples
+    trimmed_sec = 0.0
+    trim_cuts = 0
+    preset = _TRIM_PRESETS.get(eff_trim)
+    if preset is not None:
+        keep_ranges = _plan_silence_trim(samples, preset, speech_dbfs=rms_dbfs)
+        if keep_ranges:
+            trim_cuts = (
+                (len(keep_ranges) - 1)
+                + (1 if keep_ranges[0][0] > 0 else 0)
+                + (1 if keep_ranges[-1][1] < total_samples else 0)
+            )
+            work_samples = _splice_with_crossfade(samples, keep_ranges)
+            trimmed_sec = max(0.0, (total_samples - len(work_samples)) / float(TARGET_SAMPLE_RATE))
+
     hi = PEAK_LIMIT_INT16
     lo = -PEAK_LIMIT_INT16
     out_samples = array.array(
@@ -417,7 +596,7 @@ def process_wav(
             hi
             if (scaled := int(round(s * scale))) > hi
             else (lo if scaled < lo else scaled)
-            for s in samples
+            for s in work_samples
         ),
     )
 
@@ -431,6 +610,8 @@ def process_wav(
         rms_dbfs=rms_dbfs,
         gain_db=gain_db,
         all_zero=False,
+        trimmed_sec=trimmed_sec,
+        trim_cuts=trim_cuts,
     )
 
 
