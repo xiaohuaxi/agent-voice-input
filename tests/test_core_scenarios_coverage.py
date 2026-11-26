@@ -564,17 +564,18 @@ class TestLlmCommonMappingsAndUsageScenarios(unittest.TestCase):
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, 0), ())
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, -1), ())
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", "qwen/qwen3-32b", 2), ())
-        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, 1), (0,))
+        # google/* skips explicit cache_control when history_blocks <= 1 (no sealed block yet)
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, 1), ())
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, 2), (0,))
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, 3), (1,))
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", a_model, 1), (0,))
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", a_model, 2), (0, 1))
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", a_model, 3), (1, 2))
 
-        # 0 history blocks: empty returns (); [vocab] safely targets index 0 without out-of-bounds
+        # 0 history blocks: empty returns (); [vocab] skips explicit breakpoint on google/*, keeps (0,) on anthropic/*
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=()), ())
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=("   ",)), ())
-        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=(vocab,)), (0,))
+        self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=(vocab,)), ())
         self.assertEqual(llm_mod.openrouter_cache_breakpoints("openrouter", a_model, context_blocks=(vocab,)), (0,))
         self.assertEqual(
             llm_mod.openrouter_cache_breakpoints("openrouter", "qwen/qwen3-32b", context_blocks=(vocab, log0)),
@@ -582,10 +583,11 @@ class TestLlmCommonMappingsAndUsageScenarios(unittest.TestCase):
         )
 
         # 1 / 2 / 3 history blocks (plain logs and with <prior_session_reference>):
-        # breakpoints MUST land on the exact same history block(s) with or without leading <vocabulary_hints>
+        # google/* returns () for single growing block (history_blocks == 1) and targets the last sealed block
+        # for history_blocks >= 2; breakpoints MUST land on the exact same history block(s) with or without <vocabulary_hints>
         history_cases: list[tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]] = [
-            ((log0,), (0,), (0,)),
-            ((prior,), (0,), (0,)),
+            ((log0,), (), (0,)),
+            ((prior,), (), (0,)),
             ((log0, log1), (0,), (0, 1)),
             ((prior, log0), (0,), (0, 1)),
             ((log0, log1, log2), (1,), (1, 2)),
@@ -610,10 +612,15 @@ class TestLlmCommonMappingsAndUsageScenarios(unittest.TestCase):
                 self.assertEqual([with_vocab[i] for i in g_vocab], [hist[i] for i in g_plain])
                 self.assertEqual([with_vocab[i] for i in a_vocab], [hist[i] for i in a_plain])
 
-        # Leading whitespace before <vocabulary_hints> is still recognized as static header
+        # Leading whitespace before <vocabulary_hints> is still recognized as static header:
+        # single history block returns (), while 2+ history blocks shift sealed index to 1
         ws_vocab = f"  {vocab}"
         self.assertEqual(
             llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=(ws_vocab, log0)),
+            (),
+        )
+        self.assertEqual(
+            llm_mod.openrouter_cache_breakpoints("openrouter", g_model, context_blocks=(ws_vocab, log0, log1)),
             (1,),
         )
 

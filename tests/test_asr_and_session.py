@@ -4055,8 +4055,9 @@ class SessionCtxTests(unittest.TestCase):
         self.assertEqual(coerced_map.git_block, "<workspace_git_status>G</workspace_git_status>")
         self.assertEqual(coerced_map.mode, "agent")
 
-        # 2. openrouter_cache_breakpoints targets the last SEALED block for google/* and {sealed, last} for anthropic/*
-        self.assertEqual(openrouter_cache_breakpoints("openrouter", "google/gemini-3.5-flash-lite", 1), (0,))
+        # 2. openrouter_cache_breakpoints targets the last SEALED block (history >= 2) for google/* and {sealed, last} for anthropic/*
+        self.assertEqual(openrouter_cache_breakpoints("openrouter", "google/gemini-3.5-flash-lite", 1), ())
+        self.assertEqual(openrouter_cache_breakpoints("openrouter", "google/gemini-3.5-flash-lite", 2), (0,))
         self.assertEqual(openrouter_cache_breakpoints("openrouter", "google/gemini-3.5-flash-lite", 3), (1,))
         self.assertEqual(openrouter_cache_breakpoints("openrouter", "anthropic/claude-haiku-5.5", 1), (0,))
         self.assertEqual(openrouter_cache_breakpoints("openrouter", "anthropic/claude-haiku-5.5", 3), (1, 2))
@@ -4951,14 +4952,34 @@ class SessionCtxTests(unittest.TestCase):
                 or_user_str = json.dumps(or_parts, ensure_ascii=False)
                 self.assertEqual(or_user_str.count("<vocabulary_hints"), 1)
                 self.assertIn("Ghostty (ASR has misheard as: 高斯提)", or_user_str)
+                # Single growing history block (<50K) on google/* MUST NOT set explicit cache_control
                 self.assertNotIn("cache_control", or_parts[0])
-                self.assertEqual(or_parts[1].get("cache_control"), {"type": "ephemeral"})
+                self.assertNotIn("cache_control", or_parts[1])
                 # Dynamic tail retains DynamicRepoSym without duplicating manual Ghostty/KestrelDB
                 self.assertIn("DynamicRepoSym", or_parts[2]["text"])
                 self.assertNotIn("Ghostty", or_parts[2]["text"])
                 self.assertNotIn("KestrelDB", or_parts[2]["text"])
 
-                # General prepared single-hop: vocab at idx 0, breakpoint at idx 0, zero duplicate tail, ctx_chunks=0
+                # Multi-block prepared single-hop ([vocab, sealed_0, tail_1]): explicit breakpoint lands on sealed_0 (idx 1)
+                prep_multi = AsrContext(
+                    hotwords=["Ghostty", "KestrelDB"],
+                    context_blocks=(
+                        agent_vocab,
+                        '<session_reference_log read_only="true">\nsealed_0\n</session_reference_log>',
+                        '<session_reference_log read_only="true">\ntail_1\n</session_reference_log>',
+                    ),
+                    mode="agent",
+                    single_hop_prepared=True,
+                    manual_hotwords_loaded=True,
+                )
+                res_or_multi = or_prov.transcribe(_sample_wav(), context=prep_multi)
+                self.assertEqual(res_or_multi.context_chunks, 2)
+                or_multi_parts = json.loads(or_reqs[-1].body.decode("utf-8"))["messages"][1]["content"]
+                self.assertNotIn("cache_control", or_multi_parts[0])
+                self.assertEqual(or_multi_parts[1].get("cache_control"), {"type": "ephemeral"})
+                self.assertNotIn("cache_control", or_multi_parts[2])
+
+                # General prepared single-hop: vocab at idx 0, no explicit cache_control on google/*, zero duplicate tail, ctx_chunks=0
                 base_gen_ctx = AsrContext(
                     hotwords=["ChatBrand", "KestrelDB"],
                     mode="general",
@@ -4973,7 +4994,7 @@ class SessionCtxTests(unittest.TestCase):
                 or_gen_user_str = json.dumps(or_gen_parts, ensure_ascii=False)
                 self.assertEqual(or_gen_user_str.count("<vocabulary_hints"), 1)
                 self.assertIn("ChatBrand (ASR has misheard as: 查特牌)", or_gen_user_str)
-                self.assertEqual(or_gen_parts[0].get("cache_control"), {"type": "ephemeral"})
+                self.assertNotIn("cache_control", or_gen_parts[0])
 
                 # 2. GeminiAudioProvider: prepared & unprepared direct calls both render exactly 1 <vocabulary_hints> with aliases
                 gem_reqs: list[HttpRequest] = []

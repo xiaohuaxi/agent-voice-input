@@ -197,13 +197,15 @@
 
 #### 近期架构复评与技术债跟踪
 
-- **精修上下文组织架构统一梳理与多渠道缓存策略沉淀（待专题治理）**：
+- **精修上下文组织架构统一梳理与多渠道缓存策略沉淀（两项确定性缓存缺陷已修复；架构文档与回归门禁待专题治理）**：
   - **历史角色切换教训（`8b315d5` / `b4a8b03` / `f7b11a0`）**：早期 `8b315d5` 确立单 `user` 消息前置 `<session_reference_log>` 的缓存友好布局（`OpenAICompatibleRefiner` 沿用至今）；`b4a8b03` 引入无状态 `/responses` 精修器（`OpenAIResponsesRefiner`，`store=false` + `prompt_cache_key`），将上下文块置于前置 `role="developer"`、尾段草稿置于 `role="user"`；随后 `f7b11a0` 曾评估将 `/responses` 历史块从 `developer` 降权回 `user` 以压低第三方日志的指令权重，但实测证实 `chatgpt.com/backend-api/codex/responses` 在 `store=false` 下**仅同步索引前置 `developer` 块做前缀缓存**（`developer` 约 `91%` 命中 vs `user` `0%` 命中），遂刻意锁定 `role="developer"` 并留注释防误回退。后续调整消息角色前须先核对该历史约束，避免反复踩坑。
-  - **跨渠道实测暴露的上下文与缓存差异（`main@6cf45bb` 多渠道上游实测）**：
-    - `openai` 默认 `chat-completions` 将 `context_blocks` 与草稿拼入单一 `user` 消息且未传 `prompt_cache_key`，长上下文仅 `system` 命中（**2.6%–2.7%**）；切至 `responses` API 或按前置 `developer` 块拆分并传 `prompt_cache_key` 可将静态复跑升至 **99.6%**（General 升至 **90.3%**），但须同步兼顾防上下文指令误导，且官方 `api.openai.com` 在可变尾块增长当轮呈全量 `cache_write`（0% 命中），与 `chatgpt.com` Codex 后端 128-token 前缀匹配（尾增长仍 `96%–98%`）行为显著不同；
-    - `openrouter`（`google/gemini-3.8-flash`）多块会话封口块稳定复用（`64.4%–65.6%`），但 `< 50K` 单块活跃增长会话（`history_blocks == 1`）对持续变化块打显式 `cache_control: ephemeral` 会触发每轮实时重建 Gemini 显式缓存，带来写抖动与高尾延迟尖峰（实测高达 **23.8s**），并在遥测中因“当轮写即读”呈现 **99.0%** 虚假高命中；
-    - 原生 `gemini`（`gemini-3.7-flash`）3-turn 结构使多块续写达 **65.6% → 94.9%**、单块静态复跑达 **82.2%–90.0%**，但 `< 50K` 单块随主会话增长时 Turn 1 变化即归零（**0%**）；另 `agy`/`codex`/`gemini` 在 General 模式下受上游缓存门槛或有意无状态防串话隔离影响恒为 `0%`，宜在诊断指标中与 Agent 模式分列观测。
-  - **后续目标与回归门禁**：建立清晰的跨渠道精修上下文组织模型并沉淀为独立设计文档（统筹 `openai` 默认协议/消息分块、OpenRouter `< 50K` 单块显式断点策略与防指令误导边界）；并将**多渠道真实缓存命中率实测**（覆盖多块增量续写、`< 50K` 单块增长、词表热更恢复与 `agent`/`general` 分列统计）纳入涉及精修消息结构、角色分配、分块边界或缓存断点改动后的必要回归验证，避免仅跑离线单测而漏测线上缓存退化。
+  - **已修复的两项确定性缓存缺陷**：
+    - **`openai` 官方渠道默认切至无状态 `/responses`**：`config.py` 中 `provider="openai"` 且未指定自定义第三方 `base_url`（或指向官方 `api.openai.com`）且未显式覆盖 `api` 时，默认路由至 `OpenAIResponsesRefiner`（无状态 `store=false` + `prompt_cache_key`，解决原默认 `chat-completions` 长上下文仅 `2.6%–2.7%` 命中的缺陷，同时为自定义第三方 `base_url` 保守维持 `chat-completions` 兼容，且显式 `api` 覆盖始终优先）；
+    - **`openrouter`（`google/*`）取消 `< 50K` 单块显式写断点**：`llm_common.py` 中 `openrouter_cache_breakpoints()` 对 `google/*` 改为仅在存在已封口历史块（`history_blocks >= 2`，断点落在 `offset + history_blocks - 2`）时打显式 `cache_control: ephemeral`，`history_blocks <= 1` 时不再对动态增长尾块打显式断点，消除每轮重建 Gemini 显式缓存引发的写抖动、23.8s 延迟尖峰与“当轮写即读”虚假高命中。
+  - **待专题治理的剩余项与回归门禁**：
+    - **跨渠道上下文组织模型统一文档沉淀**：系统梳理各渠道协议/消息分块、`role` 权责与防上下文指令误导边界，并沉淀为独立设计文档；
+    - **`< 50K` 单块策略与渠道差异评估**：针对官方 `api.openai.com` 可变尾块增长当轮呈全量 `cache_write`（0% 命中，区别于 `chatgpt.com` Codex 后端 128-token 前缀匹配）、原生 `gemini`（`gemini-3.7-flash`）`< 50K` 单块增长时 Turn 1 变化即归零，以及 `agy`/`codex`/`gemini` 在 General 模式下恒为 `0%`（宜在诊断指标中与 Agent 模式分列观测）做专题权衡；
+    - **多渠道真实缓存命中率回归门禁**：将覆盖多块增量续写、`< 50K` 单块增长、词表热更恢复与 `agent`/`general` 分列统计的真实上游复测纳入涉及精修消息结构、角色分配、分块边界或缓存断点改动后的必要回归验证，避免仅跑离线单测而漏测线上缓存退化。
 - **平台录音生命周期异步交接复评（已复评结案 · 转为条件触发式前置清理）**：已在 `v0.15.0` 发布后完成专项架构复评，确认 `MacOSPlatform`（`15s` 首帧授权等待、`0.45s` 尾音 `tail_drain`、热插拔自动恢复与 `close()` 收敛）与 `WslPlatform`（跨进程 WASAPI 管道三态写回执与停录/取消代次交接）约 **75%–80%** 属硬件、操作系统与跨进程边界的固有复杂度，当前 Daemon 生产运行路径已达 `0 P0 / 0 P1` 稳定基线；已完成无痛卫生清理（补齐双端状态不变量与锁序注释，并为 `WslPlatform.stop_recording()` 增加 `_expected_gen` 错代保护与 `cancel_recording()` 强杀前 writer 归属复核，闭合仅限平台直调并发的理论 P1）并正式结案。显式单会话状态机重构（macOS `phase`/`stop_intent` + 单一 `_live_recs`、WSL `_WslRecSession`）转为**条件触发式前置清理**，待未来启动「脱离 WSL 的原生 Windows 独立运行」或扩展 macOS 运行期音频采集能力前再分端实施。
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）

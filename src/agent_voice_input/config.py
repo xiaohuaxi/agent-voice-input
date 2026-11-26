@@ -604,6 +604,10 @@ class RefinerConfig:
                     "(uses local 'agy acp' stdio JSON-RPC; keep refiner.api='auto')"
                 )
             return "agy-acp"
+        if prov == "openai":
+            if req_api == "auto":
+                return "responses" if is_openai_official_url(self.base_url) else "chat-completions"
+            return req_api
         if req_api == "auto":
             return "chat-completions"
         return req_api
@@ -2050,6 +2054,17 @@ def is_gemini_native_url(base_url: str) -> bool:
     if _host_matches_domain(b, "googleapis.com"):
         parsed = urllib.parse.urlsplit(b)
         return "/openai" not in (parsed.path or "").lower()
+    return False
+
+
+def is_openai_official_url(base_url: str) -> bool:
+    """Return True when ``base_url`` is empty or targets official ``api.openai.com``."""
+    b = base_url.strip().rstrip("/")
+    if not b:
+        return True
+    if _host_matches_domain(b, "api.openai.com"):
+        parsed = urllib.parse.urlsplit(b)
+        return not (parsed.path or "").rstrip("/").lower().endswith("/chat/completions")
     return False
 
 

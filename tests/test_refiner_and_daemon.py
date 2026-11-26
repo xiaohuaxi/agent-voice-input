@@ -863,24 +863,30 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             ("dashscope", "", "", "low", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.8-flash", {"enable_thinking": True}),
             ("groq", "", "", "low", "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile", {}),
             ("siliconflow", "", "", "low", "https://api.siliconflow.cn/v1/chat/completions", "Qwen/Qwen2.5-7B-Instruct", {}),
-            # Default [refiner] provider="openai" uses gpt-6-luna (reasoning model: sends reasoning_effort, omits temperature)
+            # Explicit api="chat-completions" on openai: reasoning models send reasoning_effort & omit temperature;
+            # non-reasoning override gpt-4o-mini omits reasoning_effort so it never 400s
             ("openai", "", "", "low", "https://api.openai.com/v1/chat/completions", "gpt-6-luna", {"reasoning_effort": "low"}),
-            # Explicit non-reasoning override gpt-4o-mini omits reasoning_effort so it never 400s
             ("openai", "gpt-4o-mini", "", "low", "https://api.openai.com/v1/chat/completions", "gpt-4o-mini", {}),
-            # OpenAI reasoning models omit incompatible custom temperature (both with reasoning_effort and effort="default"/"auto")
             ("openai", "o4-mini", "", "medium", "https://api.openai.com/v1/chat/completions", "o4-mini", {"reasoning_effort": "medium"}),
             ("openai", "gpt-5-mini", "", "default", "https://api.openai.com/v1/chat/completions", "gpt-5-mini", {}),
             ("openai", "gpt-6-luna", "", "auto", "https://api.openai.com/v1/chat/completions", "gpt-6-luna", {}),
+            # Custom third-party base_url on openai stays conservatively on chat-completions under api="auto"
+            ("openai", "gpt-6-luna", "https://relay.example.com/v1", "low", "https://relay.example.com/v1/chat/completions", "gpt-6-luna", {"reasoning_effort": "low"}),
             ("openrouter", "openai/o3-mini", "", "low", "https://openrouter.ai/api/v1/chat/completions", "openai/o3-mini", {"reasoning": {"effort": "low"}}),
             ("openai-compatible", "deepseek-flash", "https://api.deepseek.com/v1", "auto", "https://api.deepseek.com/v1/chat/completions", "deepseek-flash", {"thinking": {"type": "disabled"}}),
             ("openai-compatible", "local-qwen", "http://127.0.0.1:8000/v1", "auto", "http://127.0.0.1:8000/v1/chat/completions", "local-qwen", {}),
         ]
         no_temp_models = {"o4-mini", "gpt-5-mini", "gpt-6-luna", "openai/o3-mini"}
         for prov, m_override, b_url, eff, exp_url, exp_model, exp_extra in matrix:
-            with self.subTest(prov=prov, model=m_override, effort=eff):
+            with self.subTest(prov=prov, model=m_override, base_url=b_url, effort=eff):
                 seen.clear()
                 sub_env = {} if (prov == "openai-compatible" and "127.0.0.1" in b_url) else env
-                c = Config(refiner=RefinerConfig(provider=prov, model=m_override, base_url=b_url, effort=eff))
+                api_override = "chat-completions" if (prov == "openai" and not b_url) else "auto"
+                c = Config(
+                    refiner=RefinerConfig(
+                        provider=prov, model=m_override, api=api_override, base_url=b_url, effort=eff
+                    )
+                )
                 r_inst = create_refiner(c, resolve_credentials(c, sub_env), env=sub_env, transport=ok_transport)
                 res_m = r_inst.refine("测试初稿")
                 self.assertEqual(res_m.provider, prov)
@@ -902,6 +908,39 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
                     self.assertNotIn("thinking", p_json)
                 if "enable_thinking" not in exp_extra:
                     self.assertNotIn("enable_thinking", p_json)
+
+        # 2b. Default official [refiner] provider="openai" (api="auto", empty or api.openai.com base_url)
+        #     routes to stateless OpenAIResponsesRefiner (/v1/responses, store=false, no service_tier)
+        oai_resp_seen: list[HttpRequest] = []
+
+        def oai_resp_tx(req: HttpRequest) -> HttpResponse:
+            oai_resp_seen.append(req)
+            ev = {
+                "type": "response.completed",
+                "response": {
+                    "usage": {"input_tokens": 200, "input_tokens_details": {"cached_tokens": 128}, "output_tokens": 8},
+                    "output": [{"type": "message", "content": [{"type": "output_text", "text": "官方 Responses OK"}]}],
+                },
+            }
+            return HttpResponse(200, {"content-type": "text/event-stream"}, f"data: {json.dumps(ev)}\n\n".encode("utf-8"))
+
+        cfg_oai_default = Config(refiner=RefinerConfig(provider="openai"))
+        r_oai_default = create_refiner(cfg_oai_default, resolve_credentials(cfg_oai_default, env), env=env, transport=oai_resp_tx)
+        self.assertIsInstance(r_oai_default, OpenAIResponsesRefiner)
+        self.assertNotIsInstance(r_oai_default, CodexRefiner)
+        try:
+            res_oai_def = r_oai_default.refine("测试初稿", session_key="s-oai-def", fallback_context="ctx_0")
+            self.assertEqual((res_oai_def.provider, res_oai_def.model, res_oai_def.text), ("openai", "gpt-6-luna", "官方 Responses OK"))
+            self.assertEqual((res_oai_def.input_tokens, res_oai_def.cached_input_tokens), (200, 128))
+            self.assertEqual(oai_resp_seen[0].url, "https://api.openai.com/v1/responses")
+            oai_p = json.loads(oai_resp_seen[0].body.decode("utf-8"))
+            self.assertEqual(oai_p["store"], False)
+            self.assertEqual(oai_p["stream"], True)
+            self.assertEqual(oai_p["reasoning"], {"effort": "low"})
+            self.assertNotIn("service_tier", oai_p)
+            self.assertTrue(oai_p.get("prompt_cache_key"))
+        finally:
+            r_oai_default.close()
 
         # 3. Native Gemini Stage 2 refiner (:generateContent + thinkingConfig + thought filtering + fallback redaction)
         gem_seen: list[HttpRequest] = []
@@ -5388,24 +5427,77 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             self.assertIn(REFINER_TASK_REMINDER, gem_payload["contents"][0]["parts"][0]["text"])
 
     def test_stateless_responses_cookies_idle_reconnect_api_routing_and_codex_30m_refresh(self) -> None:
-        # 1. Config effective_api(), explicit api="responses" routing, gemini incompatibility & legacy max_turns_per_thread
+        # 1. Config effective_api(), official openai default responses vs custom base_url chat-completions,
+        #    explicit api override priority, gemini/codex incompatibility & legacy max_turns_per_thread
         self.assertEqual(RefinerConfig(provider="codex").effective_api(), "responses")
         self.assertEqual(RefinerConfig(provider="gemini").effective_api(), "gemini")
         self.assertEqual(RefinerConfig(provider="off").effective_api(), "off")
-        for compat_prov in ("openai", "openrouter", "dashscope", "volcengine", "groq", "siliconflow"):
+        self.assertEqual(RefinerConfig(provider="openai").effective_api(), "responses")
+        self.assertEqual(RefinerConfig(provider="openai", base_url="https://api.openai.com/v1").effective_api(), "responses")
+        self.assertEqual(RefinerConfig(provider="openai", base_url="https://us.api.openai.com/v1").effective_api(), "responses")
+        self.assertEqual(
+            RefinerConfig(provider="openai", base_url="https://api.openai.com/v1/chat/completions").effective_api(),
+            "chat-completions",
+        )
+        self.assertEqual(
+            RefinerConfig(provider="openai", base_url="https://relay.example.com/v1").effective_api(),
+            "chat-completions",
+        )
+        self.assertEqual(
+            RefinerConfig(provider="openai", base_url="http://127.0.0.1:8080/v1").effective_api(),
+            "chat-completions",
+        )
+        self.assertEqual(RefinerConfig(provider="openai", api="chat-completions").effective_api(), "chat-completions")
+        self.assertEqual(
+            RefinerConfig(provider="openai", api="responses", base_url="https://relay.example.com/v1").effective_api(),
+            "responses",
+        )
+        self.assertEqual(RefinerConfig(provider="auto").effective_api("openai"), "responses")
+        self.assertEqual(
+            RefinerConfig(provider="auto", base_url="https://relay.example.com/v1").effective_api("openai"),
+            "chat-completions",
+        )
+        for compat_prov in ("openrouter", "dashscope", "volcengine", "groq", "siliconflow"):
             self.assertEqual(RefinerConfig(provider=compat_prov).effective_api(), "chat-completions")
             self.assertEqual(RefinerConfig(provider=compat_prov, api="responses").effective_api(), "responses")
 
         with tempfile.TemporaryDirectory() as td_cfg:
+            oai_test_env = {"HOME": td_cfg, "OPENAI_API_KEY": "sk-oai-" + ("6" * 14)}
             p_compat = Path(td_cfg) / "legacy.toml"
             p_compat.write_text('[refiner]\nprovider = "openai"\napi = "responses"\nmax_turns_per_thread = 42\n', encoding="utf-8")
             loaded_c, _ = load_config(config_path=p_compat, env={"HOME": td_cfg}, home_dir=Path(td_cfg))
             self.assertEqual(loaded_c.refiner.effective_api(), "responses")
             self.assertEqual(loaded_c.refiner.max_turns_per_thread, 42)
-            ref_oai_resp = create_refiner(loaded_c, env={"HOME": td_cfg, "OPENAI_API_KEY": "sk-oai-" + ("6" * 14)})
+            ref_oai_resp = create_refiner(loaded_c, env=oai_test_env)
             self.assertIsInstance(ref_oai_resp, OpenAIResponsesRefiner)
             self.assertNotIsInstance(ref_oai_resp, CodexRefiner)
             ref_oai_resp.close()
+
+            # Default provider="openai" (without explicit api) -> OpenAIResponsesRefiner;
+            # custom third-party base_url -> OpenAICompatibleRefiner; explicit api always wins
+            ref_oai_def = create_refiner(Config(refiner=RefinerConfig(provider="openai")), env=oai_test_env)
+            self.assertIsInstance(ref_oai_def, OpenAIResponsesRefiner)
+            self.assertNotIsInstance(ref_oai_def, CodexRefiner)
+            ref_oai_def.close()
+
+            ref_oai_proxy = create_refiner(
+                Config(refiner=RefinerConfig(provider="openai", base_url="https://relay.example.com/v1")),
+                env=oai_test_env,
+            )
+            self.assertIsInstance(ref_oai_proxy, OpenAICompatibleRefiner)
+
+            ref_oai_chat = create_refiner(
+                Config(refiner=RefinerConfig(provider="openai", api="chat-completions")),
+                env=oai_test_env,
+            )
+            self.assertIsInstance(ref_oai_chat, OpenAICompatibleRefiner)
+
+            ref_oai_proxy_resp = create_refiner(
+                Config(refiner=RefinerConfig(provider="openai", api="responses", base_url="https://relay.example.com/v1")),
+                env=oai_test_env,
+            )
+            self.assertIsInstance(ref_oai_proxy_resp, OpenAIResponsesRefiner)
+            ref_oai_proxy_resp.close()
 
             for bad_toml in (
                 '[refiner]\nprovider = "gemini"\napi = "responses"\n',
@@ -12910,8 +13002,9 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
         finally:
             ref_resp.close()
 
-        # 3. OpenAICompatibleRefiner (OpenRouter google/*): cache breakpoint lands on log0 (idx 1) when [vocab, log0],
-        #    and on vocab (idx 0) when general [vocab], with accurate session-only telemetry counts
+        # 3. OpenAICompatibleRefiner (OpenRouter google/*): skips explicit cache_control for single growing
+        #    history block [vocab, log0] and general [vocab], and places cache_control on sealed_0 (idx 1)
+        #    once a sealed block exists [vocab, sealed_0, tail_1], with accurate session-only telemetry counts
         or_reqs: list[HttpRequest] = []
         or_env = {"OPENROUTER_API_KEY": "sk-or-vocab-" + ("b" * 16)}
 
@@ -12935,16 +13028,32 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
             vocabulary_hints=vocab_blk,
         )
         self.assertEqual(res_or_agent.context_chunks, 1)
-        or_parts_agent = json.loads(or_reqs[-1].body.decode("utf-8"))["messages"][1]["content"]
-        self.assertEqual(or_parts_agent[0]["text"], vocab_blk)
-        self.assertNotIn("cache_control", or_parts_agent[0])
-        self.assertEqual(or_parts_agent[1].get("cache_control"), {"type": "ephemeral"})
+        or_content_single = json.loads(or_reqs[-1].body.decode("utf-8"))["messages"][1]["content"]
+        self.assertIsInstance(or_content_single, str)
+        self.assertIn(vocab_blk, or_content_single)
+        self.assertNotIn("cache_control", or_reqs[-1].body.decode("utf-8"))
+
+        res_or_multi = ref_or.refine(
+            "看日志",
+            session_key="s-2-multi",
+            tracker=_MultiChunkTracker(["[User]\n封口块日志", "[User]\n动态尾块日志"]),  # type: ignore[arg-type]
+            mode="agent",
+            vocabulary_hints=vocab_blk,
+        )
+        self.assertEqual(res_or_multi.context_chunks, 2)
+        or_parts_multi = json.loads(or_reqs[-1].body.decode("utf-8"))["messages"][1]["content"]
+        self.assertIsInstance(or_parts_multi, list)
+        self.assertEqual(or_parts_multi[0]["text"], vocab_blk)
+        self.assertNotIn("cache_control", or_parts_multi[0])
+        self.assertEqual(or_parts_multi[1].get("cache_control"), {"type": "ephemeral"})
+        self.assertNotIn("cache_control", or_parts_multi[2])
 
         res_or_gen = ref_or.refine("普通聊天", mode="general", vocabulary_hints=vocab_blk)
         self.assertEqual((res_or_gen.context_chunks, res_or_gen.context_chars), (0, 0))
-        or_parts_gen = json.loads(or_reqs[-1].body.decode("utf-8"))["messages"][1]["content"]
-        self.assertEqual(or_parts_gen[0]["text"], vocab_blk)
-        self.assertEqual(or_parts_gen[0].get("cache_control"), {"type": "ephemeral"})
+        or_content_gen = json.loads(or_reqs[-1].body.decode("utf-8"))["messages"][1]["content"]
+        self.assertIsInstance(or_content_gen, str)
+        self.assertIn(vocab_blk, or_content_gen)
+        self.assertNotIn("cache_control", or_reqs[-1].body.decode("utf-8"))
 
         # 4. Native GeminiRefiner 3-turn stateless implicit caching matrix
         gem_reqs: list[HttpRequest] = []

@@ -177,13 +177,12 @@ def openrouter_cache_breakpoints(
 ) -> tuple[int, ...]:
     """Return 0-based ``context_blocks`` indices that should carry ``cache_control`` on OpenRouter.
 
-    For ``google/*`` (where OpenRouter converts only the last ``cache_control`` into a single
-    ``cachedContent``), history blocks ``m >= 2`` target the last sealed 50K block
-    ``offset + m - 2`` so appended turns never invalidate the cached prefix, while ``m == 1``
-    intentionally targets ``offset`` (the sole history block) so consecutive utterances reuse
-    the current snapshot before the next reply. When a leading ``<vocabulary_hints`` static
-    block is present (``offset = 1``) with zero history blocks (``m == 0``), the breakpoint
-    falls safely on index ``0`` rather than going out of bounds or dropping history caching.
+    For ``google/*`` (where OpenRouter translates the final ``cache_control`` into a synchronous
+    explicit Gemini ``cachedContents`` create call), a breakpoint is placed ONLY once at least
+    one truly sealed immutable history block exists (``history_blocks >= 2``, landing on
+    ``offset + history_blocks - 2``). Deliberately omitting explicit breakpoints when
+    ``history_blocks <= 1`` avoids per-turn explicit cache rebuild churn and 20s+ latency spikes
+    on actively growing single-block (<50K) sessions.
     """
     if provider.strip().lower() != "openrouter":
         return ()
@@ -200,16 +199,21 @@ def openrouter_cache_breakpoints(
     if total <= 0:
         return ()
     history_blocks = total - offset
-    if history_blocks == 0:
-        sealed = offset - 1
-    elif history_blocks == 1:
-        sealed = offset
-    else:
-        sealed = offset + history_blocks - 2
     model_l = model.strip().lower()
     if model_l.startswith("google/"):
-        raw_bps: tuple[int, ...] = (sealed,)
+        # Deliberately skip explicit cache_control when history_blocks <= 1: on google/*
+        # OpenRouter turns it into a synchronous cachedContents create, causing write churn
+        # and latency spikes whenever a single growing tail block changes each turn.
+        if history_blocks < 2:
+            return ()
+        raw_bps: tuple[int, ...] = (offset + history_blocks - 2,)
     elif model_l.startswith("anthropic/"):
+        if history_blocks == 0:
+            sealed = offset - 1
+        elif history_blocks == 1:
+            sealed = offset
+        else:
+            sealed = offset + history_blocks - 2
         raw_bps = tuple(sorted({sealed, total - 1}))
     else:
         return ()
