@@ -156,7 +156,7 @@ agent-voice-input doctor [--ping] [--remote] [--json]   # Check audio, native sh
 agent-voice-input integrate [--status] [--dry-run] [--cli claude|codex|agy] [--uninstall] [--json]  # Safe optional CLI hook setup
 agent-voice-input diagnose [--last N] [--json]          # Read-only diagnostics: latency p50, cache hits, failed/ count, redacted log tail
 agent-voice-input retry [--list] [--print]              # List or re-run stashed failed recordings
-agent-voice-input hotwords list|add|remove              # Manage [global]/[chat]/[coding] hotwords & check provider quotas (--scope, --json)
+agent-voice-input hotwords list|add|remove              # Manage [global]/[chat]/[coding] hotwords & aliases (--alias, --scope, --json)
 agent-voice-input once --duration 4 --dry-run           # Record once and print without pasting (or `--file <wav> --dry-run` on Linux)
 agent-voice-input toggle | cancel                       # Trigger start/stop or cancel active/in-flight jobs (--seq N)
 agent-voice-input key-test                              # Inspect raw key scancodes / modifier events
@@ -164,6 +164,30 @@ agent-voice-input key-test                              # Inspect raw key scanco
 
 - **AI Agent setup & troubleshooting contract**: [`docs/agent-setup.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/agent-setup.md)
 - **Optional multi-window hooks & SSH remote Linux (`[remote]`)**: Single-window terminals, Ghostty splits, and `tmux` panes work with zero hooks. For multiple standalone WSL2 windows in the **same project directory** (use `agent-voice-input integrate`), or to enable zero-install SSH remote context (`[remote] hosts = ["devbox"]`, verified with `agent-voice-input doctor --remote`), see [`integrations/README.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.md) (SSH section: [SSH Remote Linux Hosts](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.md#5-ssh-remote-linux-hosts-zero-install--optional-title-hook)) and [`docs/context-routing.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/context-routing.md).
+
+---
+
+## Hotwords & Agent-Assisted Vocabulary
+
+Keep your personal names, project brands, and recurring ASR mishearings in a single plain-text file—and let **Claude Code**, **Codex**, or **AGY** bootstrap or tidy it for you:
+
+- **File & 3 scopes**: `~/.config/agent-voice-input/hotwords.txt` (hot-reloads automatically; flat files map to `[global]`; line order = priority). Optional `[global]`, `[chat]`, and `[coding]` sections mount by context—Stage 2 / single-hop uses `[coding] + [global]` in `agent` mode and automatically mounts **`[global] + [chat]`** in `general` mode so WeChat, browsers, GrokBot, and everyday apps all benefit from your personal terms.
+- **Optional mishearing aliases (`<-`)**: Write `CanonicalTerm <- mishearing1, mishearing2` or run `agent-voice-input hotwords add Harness --alias 哈尼斯,哈尼思`. Guardrails: max 5 aliases per entry, single-character aliases rejected (2-character aliases warn), aliases cannot collide with canonical terms. Stage 1 ASR receives canonical terms only; Stage 2 / single-hop uses aliases to fix stubborn mishearings.
+- **Stage 1 & Stage 2 budgets**: Stage 1 respects tighter per-provider quotas (e.g., Doubao 50 terms / 500 chars, DashScope 80 / 900, OpenAI `keywords[]` 50, Whisper 35 / 353; `deepseek-asr` relies on Stage 2). Stage 2 / single-hop carries a wide **100 items / 1,500 chars** vocabulary budget—inspect both anytime via `agent-voice-input hotwords list [--json]`.
+- **Two rules for your Agent**: **always show the diff and wait for your confirmation before editing `hotwords.txt`**, and **never guess mishearing aliases up front—only add `<-` aliases after observing a real ASR mistake**.
+
+Copy-paste prompts for your coding agent:
+
+```text
+# 1. Bootstrap from scratch (canonical terms only)
+Read my recent projects, READMEs, and specs to draft a clean list of proper nouns I actually speak aloud for ~/.config/agent-voice-input/hotwords.txt ([global]/[chat]/[coding]). Do not guess mishearing aliases; show me the diff first and write only after I confirm.
+
+# 2. Fix a real mishearing on the spot
+Voice input just misheard "Harness" as "哈尼斯". Add a mishearing alias with `agent-voice-input hotwords add Harness --alias 哈尼斯` (show me the change first).
+
+# 3. Periodic cleanup & prioritization
+Run `agent-voice-input hotwords list --json`, prune low-frequency or stale entries if we are near Stage 1/2 budgets, move my cross-project favorites to the top of [global], and show me the diff before applying.
+```
 
 ---
 
@@ -242,7 +266,7 @@ effort = "auto"
 - **Two-stage vs. single-hop (`asr.api`)**: `"auto"` routes dedicated STT models (`qwen3-asr-flash`, `doubao`, `deepseek-asr`, `whisper-*`, `*-transcribe`, `SenseVoiceSmall`) to Stage 1 + Stage 2, and routes native `gemini`, DashScope `qwen*-omni*`, official OpenAI `gpt-audio-1.5` / `gpt-audio-mini` (or explicit `asr.api = "chat-completions"`), and multimodal chat-audio models on OpenRouter/OpenAI-compatible to single-hop (sharing the 50K sealed `<session_reference_log>` prefix blocks, in-memory `64 kbps` MP3 compression for `>= 3s` clips, and `610s` single-chunk cap; skips Stage 2 unless `refiner.force_on_single_hop = true`). DeepSeek official ASR (`POST https://api.deepseek.com/v1/tools/asr`) supports `asr.api = "auto"` only (21-language auto-detection, no hotword/language params). For uncataloged models on `openrouter`, set `asr.api = "audio-transcriptions"` or `"chat-completions"` explicitly.
 - **Stage 2 protocol & reasoning budget (`refiner.api`, `effort`)**: `refiner.api = "auto"` uses stateless HTTP `/responses` (`store=false`, `stream=true`) for `codex`, local `agy acp` stdio JSON-RPC for `agy`, native `:generateContent` for `gemini`, and `/chat/completions` elsewhere (`openai`/`openrouter`/`openai-compatible` can opt into `"responses"`). `effort` accepts `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"` (`refiner.effort` defaults to `"low"` on `codex`/`agy`/`openai`, and `"auto"` zero-thinking fast mode elsewhere).
 - **Prompt caching & cold-start fallback (`refiner.prompt`, `include_git_status`, `context_max_chars`, `cold_start_fallback`)**: Leave `prompt = ""` to use built-in adaptive `agent` / `general` dictation-editor prompts (non-empty `prompt` overrides both). Dialogue up to `context_max_chars = 200000` is evicted in `50K` sealed prefix blocks ahead of `<workspace_git_status>` (falls back to core tracked filenames when clean) and `<asr_draft_to_clean>`. When a new coding session starts empty/short, `cold_start_fallback = "auto"` (or `"hotwords"` / `"off"`) supplements Stage 1 hotwords and prepends one frozen `<= 25K` `<prior_session_reference>` block from recent exact-same-directory sessions.
-- **Layered hotwords (`asr.hotwords_file` & `hotwords` CLI)**: Edit `~/.config/agent-voice-input/hotwords.txt` or use `agent-voice-input hotwords list|add|remove`—hot-reloads automatically on the next dictation. Flat files map to `[global]`; optional `[chat]` and `[coding]` sections auto-mount ahead of dynamic git/session terms and built-in developer hotwords, with per-provider quota inspection (`doubao`, `whisper`, `dashscope`, `gemini`).
+- **Layered hotwords (`asr.hotwords_file` & `hotwords` CLI)**: Edit `~/.config/agent-voice-input/hotwords.txt` or use `agent-voice-input hotwords list|add [--alias]|remove`—hot-reloads automatically on the next dictation. Flat files map to `[global]`; `[chat]` and `[coding]` auto-mount ahead of dynamic git/session terms and built-in hotwords, optional `Term <- alias1, alias2` rules feed Stage 2 / single-hop (`100 items / 1,500 chars`), and `hotwords list` inspects both Stage 1 provider quotas (`doubao`, `dashscope`, `openai`, `whisper`, `gemini`) and Stage 2 budgets.
 - **Same-provider retries & optional MP3 archive (`max_retries`, `audio.save_recordings`)**: Both stages default to `max_retries = 2` (`0..10`) under stage `timeout_sec` with a 9s connect/TLS handshake cap, separating `429`/QPS throttling from transient network/5xx errors. Setting `audio.save_recordings = true` asynchronously archives voiced clips as `0600` `16 kHz` `64 kbps` MP3s in `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/` (ring-pruned to `save_recordings_max_count = 300`).
 
 </details>

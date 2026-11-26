@@ -156,7 +156,7 @@ agent-voice-input doctor [--ping] [--remote] [--json]   # 全面自检音频、�
 agent-voice-input integrate [--status] [--dry-run] [--cli claude|codex|agy] [--uninstall] [--json]  # 安全一键接入可选 CLI 钩子
 agent-voice-input diagnose [--last N] [--json]          # 本地只读诊断：延迟 p50、缓存命中率、失败录音数与脱敏日志尾部
 agent-voice-input retry [--list] [--print]              # 查看或重跑暂存的失败录音
-agent-voice-input hotwords list|add|remove              # 管理 [global]/[chat]/[coding] 分层热词并查各渠道配额（--scope、--json）
+agent-voice-input hotwords list|add|remove              # 管理 [global]/[chat]/[coding] 分层热词与空耳映射（--alias、--scope、--json）
 agent-voice-input once --duration 4 --dry-run           # 单次录音验证流水线（不粘贴上屏；Linux 可用 `--file <wav> --dry-run` 离线转写）
 agent-voice-input toggle | cancel                       # 命令行触发起止录音或取消当前/后台在途任务（--seq N）
 agent-voice-input key-test                              # 测试按键扫描码与修饰键捕获
@@ -164,6 +164,30 @@ agent-voice-input key-test                              # 测试按键扫描码�
 
 - **AI Agent 一站式安装与排障契约**：[`docs/agent-setup.md`](docs/agent-setup.md)
 - **可选多窗口钩子与 SSH 远端 Linux（`[remote]`）**：单窗口终端、Ghostty 分屏与 `tmux` 分屏零钩子即可用。若常在 WSL2 **同一项目目录**并行开多个独立终端窗口（推荐使用 `agent-voice-input integrate`），或需拉取远端 Linux 服务器上的活跃 Agent 上下文（在 `config.toml` 配置 `[remote] hosts = ["devbox"]` 并运行 `agent-voice-input doctor --remote`），详见 [`integrations/README.zh-CN.md`](integrations/README.zh-CN.md) 与 [`docs/context-routing.md`](docs/context-routing.md)。
+
+---
+
+## 热词管理（支持让你的 Agent 帮你打理）
+
+用一份纯文本词表统一管理人名、项目专名与顽固空耳，并可直接交给 **Claude Code**、**Codex** 或 **AGY** 冷启动建库与定期瘦身：
+
+- **文件路径与 3 段语义**：`~/.config/agent-voice-input/hotwords.txt`（修改后下次口述自动热加载；无分组文件归入 `[global]`；行序即优先级）。支持 `[global]` / `[chat]` / `[coding]` 三段——二阶段精修与单跳在 `agent` 模式下挂载 `[coding] + [global]`，在 `general` 模式下自动同时挂载 **`[global] + [chat]`**，让微信、浏览器、GrokBot 等日常应用都能吃到人名与个人专名。
+- **可选空耳语法（`<-`）**：支持 `规范词 <- 误识1, 误识2` 或执行 `agent-voice-input hotwords add Harness --alias 哈尼斯,哈尼思`。护栏：单条最多 5 个误识、拒单字误识（双字给出提醒）、禁与任何规范词冲突；一阶段 ASR 仅收规范词，二阶段/单跳用空耳精准纠偏。
+- **双阶段配额预算**：一阶段按各 ASR 渠道较窄配额截断（如豆包 50 词 / 500 字、百炼 80 词 / 900 字、OpenAI `keywords[]` 50 词、Whisper 35 词 / 353 字；`deepseek-asr` 由二阶段兜底）；二阶段/单跳提供 **100 条 / 1,500 字** 宽口词表预算，随时运行 `agent-voice-input hotwords list [--json]` 查看用量。
+- **两条 Agent 协作纪律**：**改动 `hotwords.txt` 前必须先展示 diff 经用户确认再落盘；不要凭空瞎猜空耳，等实战真正撞见错听后再补 `<-` 映射**。
+
+可直接复制发给你的 Coding Agent：
+
+```text
+# 1. 首次冷启动建库（只提炼规范词，不猜空耳）
+读我最近几个项目和 README/规范，帮我提炼一份去噪后的个人与跨项目高频专名草案写入 ~/.config/agent-voice-input/hotwords.txt（按 [global]/[chat]/[coding] 分段），不要凭空猜空耳，先给我看 diff，确认后再落盘。
+
+# 2. 遇错听秒补空耳映射
+刚才语音把 "Harness" 听成了 "哈尼斯"，帮我用 `agent-voice-input hotwords add Harness --alias 哈尼斯` 补一条空耳映射（先给我看变动再执行）。
+
+# 3. 定期体检瘦身与调优排序
+运行 `agent-voice-input hotwords list --json` 检查是否临近一/二阶段预算，把低频过时词裁掉、把跨项目高频词提到 [global] 顶部，先出 diff 给我确认后再改。
+```
 
 ---
 
@@ -243,7 +267,7 @@ effort = "auto"
 - **两阶段 vs 单跳协议（`asr.api`）**：`"auto"` 将专用 STT（`qwen3-asr-flash`、`doubao`、`deepseek-asr`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）路由至一阶段 + 二阶段，将原生 `gemini`、百炼 `qwen*-omni*`、官方 OpenAI `gpt-audio-1.5` / `gpt-audio-mini`（或显式 `asr.api = "chat-completions"`）与 OpenRouter/OpenAI 兼容多模态模型路由至单跳（共享 50K `<session_reference_log>` 前缀块、`>= 3s` 内存压缩 `64 kbps` MP3、上限 `610s`；默认跳过二阶段，除非 `refiner.force_on_single_hop = true`）。DeepSeek 官方 ASR（`POST https://api.deepseek.com/v1/tools/asr`）仅支持 `asr.api = "auto"`（支持 21 种语言自动检测，不支持热词与语言参数）。在 `openrouter` 使用未收录新模型时请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
 - **二阶段协议与思考档位（`refiner.api`、`effort`）**：`refiner.api = "auto"` 将 `codex` 路由至无状态 HTTP `/responses`（`store=false`、`stream=true`），`agy` 路由至本机 `agy acp` stdio JSON-RPC，`gemini` 路由至 `:generateContent`，其余走 `/chat/completions`（`openai`/`openrouter`/`openai-compatible` 可显式启用 `"responses"`）。`effort` 支持 `"auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`（`codex`/`agy`/`openai` 默认 `"low"`，其余渠道默认 `"auto"` 零思考极速档）。
 - **精修提示词、前缀缓存与冷启动回退（`refiner.prompt`、`include_git_status`、`context_max_chars`、`cold_start_fallback`）**：`prompt` 留空时使用内置自适应 `agent` / `general` 提示词（非空则覆盖两模式）。近期对话（上限 `context_max_chars = 200000`）按 `50K` 封口块前置，末尾拼装 `<workspace_git_status>`（工作树干净时补充核心追踪文件名）与 `<asr_draft_to_clean>`。新开空/极短会话时，`cold_start_fallback = "auto"`（可选 `"hotwords"` / `"off"`）自动从同目录近期历史会话补充热词并前置 1 块冻结的 `<= 25K` `<prior_session_reference>`。
-- **分层纯文本热词表（`asr.hotwords_file` 与 `hotwords` 子命令）**：直接编辑 `~/.config/agent-voice-input/hotwords.txt` 或运行 `agent-voice-input hotwords list|add|remove`，下一次口述自动热加载生效。无分组文件归入 `[global]`，可选 `[chat]` 与 `[coding]` 按前台窗口自动挂载，优先级高于动态仓库/会话词与内置程序员热词，并内置 `doubao`/`whisper`/`dashscope`/`gemini` 配额预算检查。
+- **分层纯文本热词表（`asr.hotwords_file` 与 `hotwords` 子命令）**：直接编辑 `~/.config/agent-voice-input/hotwords.txt` 或运行 `agent-voice-input hotwords list|add [--alias]|remove`，下一次口述自动热加载生效。无分组文件归入 `[global]`，`[chat]` 与 `[coding]` 按前台窗口自动挂载，优先级高于动态仓库/会话词与内置热词；可选 `规范词 <- 误识1, 误识2` 映射服务于二阶段/单跳（`100 条 / 1,500 字`），`hotwords list` 同时展示一阶段各渠道（`doubao`/`dashscope`/`openai`/`whisper`/`gemini`）与二阶段预算用量。
 - **同渠道重试与可选本地 MP3 归档（`max_retries`、`audio.save_recordings`）**：两阶段默认 `max_retries = 2`（`0..10`），在阶段 `timeout_sec` 与 9 秒建连/TLS 上限内分别对 `429`/QPS 限流与瞬态网络/5xx 退避重试。开启 `audio.save_recordings = true` 后，后台异步将有效录音压缩为 `0600` 权限 `16 kHz` `64 kbps` MP3 存入 `${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/recordings/`（按修改时间环形保留最新 `save_recordings_max_count = 300` 条）。
 
 </details>
