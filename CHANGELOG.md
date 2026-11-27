@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Safer `init --force` & surgical `integrate`**: Protected existing `.env` credentials (and `.gitignore`) from being overwritten by `init --force`; upgraded `integrate` to patch and remove only managed hook entries without disturbing unrelated user hooks and to auto-upgrade `/usr/local/bin/agent-voice-input` wrapper symlinks.
 
 ### Fixed
-- **macOS SSH zero-frame capture & hardened `stop` lifecycle**: Fixed macOS SSH / zero-frame audio capture handling and diagnostics, and hardened `stop` with bounded `SIGKILL` escalation for hung daemons plus `expected_pid` verification on `shutdown` to prevent PID-reuse or generation-swap mis-kills.
+- **macOS SSH zero-frame capture & hardened `stop` lifecycle**: Fixed macOS SSH / zero-frame audio capture handling and diagnostics, and hardened `stop` with bounded `SIGTERM` escalation for hung daemons, unlocked-process exit grace polling, and `expected_pid` verification on `shutdown` to prevent PID-reuse or generation-swap mis-kills.
 - **Transport, audio, socket & cross-platform boundary hardening**: Enforced a 16 MiB HTTP response size cap, preserved the original WAV on `ffmpeg` transcode timeouts instead of dropping audio, added pre-bind Unix control-socket byte-length validation, fixed WSL2 strict ASCII locale path decoding, and converted `pyproject.toml` authors to `[[project.authors]]` for Python 3.10 stdlib TOML fallback compatibility.
 
 ### Removed

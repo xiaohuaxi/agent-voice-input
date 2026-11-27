@@ -66,7 +66,7 @@
 3. **MacBook 免 `init` 默认 `RCommand`、配置契约定稿与全链路加固**：
    - 无 `config.toml`（或未显式指定 `hotkey.key`）时，MacBook 内置键盘运行期自动默认 `RCommand`（台式 Mac 与 Windows/WSL2 保持 `RControl`）；
    - 定稿 `asr.doubao_resource_id`、`refiner.session_max_turns`、`refiner.extra_instructions`（替代 `prompt`）、移除 `effort = "auto"` 并落实全模型上下限夹紧、兼容 `ui.language` BCP 47 标签、移除 `only_in_terminals` / `winmm`；
-   - `init --force` 保护 `.env`、`integrate` 精准钩子操作与自动升级包装软链、修复 macOS SSH 全 0 帧与 `stop` 卡死强杀及 `expected_pid` 防换代误杀、补齐 HTTP 16 MiB 上限 / 转码超时保底 WAV / socket 长度预检 / WSL2 ASCII 路径解码与 `scripts/check_package.py` 三端发版前门禁。
+   - `init --force` 保护 `.env`、`integrate` 精准钩子操作与自动升级包装软链、修复 macOS SSH 全 0 帧与 `stop` 卡死 `SIGTERM` 升级及 `expected_pid` 防换代误杀、补齐 HTTP 16 MiB 上限 / 转码超时保底 WAV / socket 长度预检 / WSL2 ASCII 路径解码与 `scripts/check_package.py` 三端发版前门禁。
 
 ---
 

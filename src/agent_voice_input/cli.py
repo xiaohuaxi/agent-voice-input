@@ -3577,6 +3577,16 @@ def _cmd_stop(
 
     pid_liveness = _probe_pid_liveness(pid)
     still_avi_alive = pid_liveness == "alive" and _is_avi_daemon_pid(pid) is True
+    if lock_confirmed_free and pid > 0 and still_avi_alive:
+        # Daemon releases daemon.lock inside close() just before Python finishes
+        # interpreter teardown; allow a short bounded exit grace window.
+        exit_dl = time.monotonic() + 2.0
+        while time.monotonic() < exit_dl:
+            time.sleep(0.02)
+            pid_liveness = _probe_pid_liveness(pid)
+            still_avi_alive = pid_liveness == "alive" and _is_avi_daemon_pid(pid) is True
+            if not still_avi_alive:
+                break
     if not lock_confirmed_free or still_avi_alive or (not shutdown_sent and pid_liveness == "perm"):
         if lock_owner_changed:
             holder_note = (

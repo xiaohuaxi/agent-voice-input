@@ -1823,10 +1823,17 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             srv_th = threading.Thread(target=daemon.serve_forever, name="test-ctrl-srv", daemon=True)
             srv_th.start()
             try:
-                dl = time.monotonic() + 3.0
-                while time.monotonic() < dl and not daemon.sock_path.exists():
+                dl = time.monotonic() + 5.0
+                ctrl_ready = False
+                while time.monotonic() < dl:
+                    try:
+                        if send_control_command(rt, {"cmd": "status"}, timeout_sec=0.5).get("ok") is True:
+                            ctrl_ready = True
+                            break
+                    except Exception:
+                        pass
                     time.sleep(0.01)
-                self.assertTrue(daemon.sock_path.exists())
+                self.assertTrue(ctrl_ready, "control.sock did not become ready in time")
 
                 start_box: list[dict[str, Any]] = []
                 stop_box: list[dict[str, Any]] = []

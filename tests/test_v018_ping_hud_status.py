@@ -904,6 +904,58 @@ class StatusContractAndJsonCleanupTests(unittest.TestCase):
         self.assertIn("Homepage", proj["urls"])
         self.assertIn("agent-voice-input", proj["scripts"])
 
+    def test_stop_waits_briefly_for_unlocked_daemon_interpreter_teardown(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            rt = Path(td) / "rt"
+            rt.mkdir(mode=0o700)
+            (rt / "daemon.pid").write_text("424242\n", encoding="utf-8")
+            env = {"HOME": td, "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
+
+            # Simulate daemon having already released daemon.lock while Python teardown takes ~60ms:
+            # 2 cleanup probes + initial post-lock check + 2 grace-loop probes return "alive", then "gone".
+            calls = [0]
+            liveness_seq = iter(["alive", "alive", "alive", "alive", "alive", "gone"])
+
+            def _probe(_p: int) -> str:
+                calls[0] += 1
+                return next(liveness_seq, "gone")
+
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            with (
+                mock.patch("agent_voice_input.control_ipc.send_control_command", return_value={"ok": True, "stopping": True}),
+                mock.patch.object(cli_mod, "_probe_pid_liveness", side_effect=_probe),
+                mock.patch.object(cli_mod, "_is_avi_daemon_pid", return_value=True),
+                mock.patch.object(cli_mod.time, "sleep", return_value=None),
+                mock.patch("sys.stdout", out_buf),
+                mock.patch("sys.stderr", err_buf),
+            ):
+                rc = cli_mod._cmd_stop(env)
+            self.assertEqual(rc, 0, err_buf.getvalue())
+            self.assertGreaterEqual(calls[0], 6)
+            self.assertIn("stopped (pid=424242)", out_buf.getvalue())
+
+            # If an unlocked daemon somehow stays alive past the 2s grace window, _cmd_stop still fails cleanly.
+            (rt / "daemon.pid").write_text("424243\n", encoding="utf-8")
+            fake_clock = [100.0]
+
+            def _tick() -> float:
+                fake_clock[0] += 0.6
+                return fake_clock[0]
+
+            err_buf2 = io.StringIO()
+            with (
+                mock.patch("agent_voice_input.control_ipc.send_control_command", return_value={"ok": True, "stopping": True}),
+                mock.patch.object(cli_mod, "_probe_pid_liveness", return_value="alive"),
+                mock.patch.object(cli_mod, "_is_avi_daemon_pid", return_value=True),
+                mock.patch.object(cli_mod.time, "monotonic", side_effect=_tick),
+                mock.patch.object(cli_mod.time, "sleep", return_value=None),
+                mock.patch("sys.stderr", err_buf2),
+            ):
+                rc2 = cli_mod._cmd_stop(env)
+            self.assertEqual(rc2, 1)
+            self.assertIn("could not confirm daemon stop", err_buf2.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
