@@ -30,10 +30,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .config import is_loopback_url as _is_loopback_url, redact_secrets as _redact_secrets
+from .config import (
+    default_env_file_candidates as _default_env_file_candidates,
+    is_loopback_url as _is_loopback_url,
+    redact_secrets as _redact_secrets,
+)
 
 DEFAULT_USER_AGENT = "agent-voice-input/0.1"
 DEFAULT_CONNECT_TIMEOUT_SEC: float = 9.0
+DEFAULT_MAX_RESPONSE_BYTES: int = 16 * 1024 * 1024
+DEFAULT_MAX_SSE_LINE_BYTES: int = 1 * 1024 * 1024
+DEFAULT_MAX_ERROR_RESPONSE_BYTES: int = 64 * 1024
 _STREAM_CHUNK_BYTES = 65536
 
 
@@ -192,6 +199,7 @@ class HttpRequest:
     deadline: float | None = None
     connect_timeout_sec: float = DEFAULT_CONNECT_TIMEOUT_SEC
     cancel_token: CancelToken | None = None
+    max_response_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1577,9 +1585,14 @@ def inspect_proxy_config_warning(env: Mapping[str, str] | None = None) -> tuple[
     proxies = _get_effective_proxies(env)
     if not proxies:
         return None
+    try:
+        env_cands = _default_env_file_candidates(env)
+    except Exception:
+        env_cands = []
+    env_hint = str(env_cands[0]) if env_cands else "~/.agent-voice-input/.env"
     fix_hint = (
         "set HTTPS_PROXY=http://127.0.0.1:<port> (your proxy client's HTTP/mixed port) "
-        "in shell or ~/.agent-voice-input/.env"
+        f"in shell or {env_hint}"
     )
     https_proxy = _select_system_proxy_url(proxies, "https")
     if https_proxy:
@@ -2164,19 +2177,46 @@ def _execute_keepalive(
             )
         )
 
+        is_success = 200 <= status < 300
+        eff_max_bytes = (
+            DEFAULT_MAX_RESPONSE_BYTES
+            if req.max_response_bytes is None
+            else max(0, int(req.max_response_bytes))
+        )
+        eff_err_bytes = min(eff_max_bytes, DEFAULT_MAX_ERROR_RESPONSE_BYTES)
+
         can_reuse = False
         try:
-            body = _read_stream_with_deadline(
-                resp, wall_deadline, max_bytes=(_STREAM_CHUNK_BYTES if is_redirect else None)
-            )
+            if is_redirect:
+                read_limit: int | None = _STREAM_CHUNK_BYTES
+            elif is_success:
+                read_limit = eff_max_bytes + 1
+            else:
+                read_limit = eff_err_bytes + 1
+            body = _read_stream_with_deadline(resp, wall_deadline, max_bytes=read_limit)
+            truncated_error_body = False
+            if not is_redirect:
+                if is_success and len(body) > eff_max_bytes:
+                    can_reuse = False
+                    raise HttpTransportError(
+                        f"HTTP response body exceeded limit of {eff_max_bytes} bytes for {cur_url}",
+                        retry_kind="never",
+                    )
+                if not is_success and len(body) > eff_err_bytes:
+                    body = body[:eff_err_bytes]
+                    truncated_error_body = True
             body_fully_drained = (
-                cur_method == "HEAD"
-                or status in (204, 304)
-                or (bool(getattr(resp, "chunked", False)) and resp.isclosed())
-                or (not getattr(resp, "chunked", False) and getattr(resp, "length", None) == 0)
+                not truncated_error_body
+                and (
+                    cur_method == "HEAD"
+                    or status in (204, 304)
+                    or (bool(getattr(resp, "chunked", False)) and resp.isclosed())
+                    or (not getattr(resp, "chunked", False) and getattr(resp, "length", None) == 0)
+                )
             )
             can_reuse = (
-                status != 407
+                not truncated_error_body
+                and status != 407
                 and _can_reuse_pooled_conn(
                     conn,
                     resp,
@@ -2609,6 +2649,139 @@ def classify_http_failure(
         return "transient", retry_after, False
 
     return "never", None, False
+
+
+_HTTP_CAT_PARAM_ERR_RE = re.compile(
+    r"(?i)\b(?:unsupported|invalid|unknown)\s+(?:parameter|value|argument|field|option|header)\b"
+)
+_HTTP_CAT_MODEL_UNSUPPORTED_RE = re.compile(
+    r"(?i)(?:model_not_found|model_not_supported"
+    r"|\bmodel\b[^:;\n]{0,80}?(?:does\s+not\s+exist|is\s+not\s+found|not\s+found"
+    r"|is\s+not\s+supported|not\s+supported|is\s+unsupported|unsupported"
+    r"|is\s+unavailable|unavailable|(?:do\s+not|don't)\s+have\s+access|no\s+access)"
+    r"|(?:(?:do\s+not|don't)\s+have\s+access|no\s+access)\s+to\s+(?:the\s+)?model\b)"
+)
+
+
+def classify_http_error_category(
+    status: int,
+    *,
+    non_json: bool = False,
+    error_code: str = "",
+    error_type: str = "",
+    error_message: str = "",
+    retry_kind: str = "",
+) -> str:
+    """Map an upstream HTTP/API failure to a bounded, prose-free diagnostic category."""
+    if non_json:
+        if status == 401:
+            return "unauthorized"
+        if status == 402:
+            return "quota_exceeded"
+        if status == 403:
+            return "forbidden"
+        if status == 404:
+            return "not_found"
+        if status == 413:
+            return "payload_too_large"
+        if status == 429:
+            return "rate_limited"
+        if status in (408, 504):
+            return "timeout"
+        if status >= 500:
+            return "server_error"
+        return "non_json"
+
+    code_low = str(error_code or "").strip().lower()
+    type_low = str(error_type or "").strip().lower()
+    msg_low = str(error_message or "").strip().lower()
+    combined = f"{code_low} {type_low} {msg_low}"
+
+    if (
+        status == 401
+        or code_low in ("invalid_api_key", "authentication_error", "unauthenticated", "invalidapikey")
+        or type_low == "authentication_error"
+    ):
+        return "unauthorized"
+    if status == 402 or any(
+        tok in combined
+        for tok in (
+            "insufficient_quota",
+            "quota_exceeded",
+            "arrearage",
+            "allocationquota",
+            "freetieronly",
+            "insufficient_balance",
+            "check your plan and billing",
+            "billing",
+            "credit",
+        )
+    ):
+        return "quota_exceeded"
+    if code_low in ("model_not_found", "model_not_supported") or (
+        status in (200, 400, 404)
+        and not _HTTP_CAT_PARAM_ERR_RE.search(combined)
+        and _HTTP_CAT_MODEL_UNSUPPORTED_RE.search(combined)
+    ):
+        return "model_not_found"
+    if (
+        status == 403
+        or code_low in ("permission_denied", "forbidden")
+        or type_low == "permission_error"
+    ):
+        return "forbidden"
+    if (
+        status == 429
+        or retry_kind == "rate_limit"
+        or any(
+            tok in combined
+            for tok in (
+                "rate_limit",
+                "ratelimit",
+                "throttling",
+                "resource_exhausted",
+                "too_many_requests",
+                "too many requests",
+            )
+        )
+    ):
+        return "rate_limited"
+    if any(
+        tok in combined
+        for tok in ("context_length_exceeded", "maximum context length", "token limit")
+    ):
+        return "context_length_exceeded"
+    if status == 413:
+        return "payload_too_large"
+    if status == 404 or code_low == "not_found" or type_low == "not_found_error":
+        return "not_found"
+    if (
+        status == 400
+        or code_low in ("invalid_request_error", "invalid_argument", "bad_request")
+        or type_low == "invalid_request_error"
+    ):
+        return "bad_request"
+    if (
+        status in (408, 504)
+        or code_low in ("deadline_exceeded", "timeout")
+        or type_low == "timeout"
+    ):
+        return "timeout"
+    if (
+        status >= 500
+        or code_low
+        in ("internal", "unavailable", "server_error", "internal_error", "service_unavailable")
+        or type_low in ("server_error", "internal_error", "service_unavailable")
+        or retry_kind == "transient"
+    ):
+        return "server_error"
+    return "upstream_error"
+
+
+def format_http_error_summary(status: int, category: str, *, prefix: str = "") -> str:
+    """Format a prose-free diagnostic HTTP failure summary ``[prefix ]HTTP <status> (<category>)``."""
+    lead = f"{prefix.strip()} " if prefix and prefix.strip() else ""
+    return f"{lead}HTTP {status} ({category})"
 
 
 def compute_retry_delay(

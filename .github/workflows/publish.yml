@@ -11,8 +11,132 @@ permissions:
 
 jobs:
   test-and-build:
-    name: Run unit tests and build distributions
+    name: Run tests, coverage gate, build & verify distributions
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify release tag, version sync, CHANGELOG & source ASCII
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            python scripts/check_package.py --skip-dist --check-release-tag "$GITHUB_REF_NAME"
+          else
+            python scripts/check_package.py --skip-dist
+          fi
+
+      - name: Install ffmpeg, tmux, and openssh-server for integration tests
+        run: |
+          pkgs=""
+          command -v ffmpeg >/dev/null 2>&1 || pkgs="$pkgs ffmpeg"
+          command -v tmux >/dev/null 2>&1 || pkgs="$pkgs tmux"
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            pkgs="$pkgs openssh-server"
+          fi
+          if [ -n "$pkgs" ]; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y --no-install-recommends $pkgs
+          fi
+
+      - name: Install build, coverage, and twine tooling
+        run: python -m pip install --upgrade pip coverage build twine
+
+      - name: Run full offline unit tests (strict ResourceWarning, no silent skips)
+        env:
+          AGENT_VOICE_INPUT_CI_NO_SKIP: "1"
+        run: PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests -v
+
+      - name: Run tiered statement & pure-branch coverage gate
+        env:
+          AGENT_VOICE_INPUT_CI_NO_SKIP: "1"
+        run: python scripts/check_coverage.py --require-branch -v
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Verify packaged wheel, sdist contents, and PyPI metadata
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            python scripts/check_package.py --check-release-tag "$GITHUB_REF_NAME"
+          else
+            python scripts/check_package.py
+          fi
+          python -m twine check dist/*
+
+      - name: Clean venv wheel install smoke test
+        run: |
+          set -euo pipefail
+          SMOKE_DIR="$(mktemp -d "${RUNNER_TEMP}/avi-publish-wheel-smoke-XXXXXX")"
+          trap 'rm -rf "$SMOKE_DIR"' EXIT
+          python -m venv "$SMOKE_DIR/venv"
+          VENV_PY="$SMOKE_DIR/venv/bin/python"
+          VENV_CLI="$SMOKE_DIR/venv/bin/agent-voice-input"
+          (
+            cd "$SMOKE_DIR"
+            unset PYTHONPATH
+            "$VENV_PY" -m pip install --no-deps "$GITHUB_WORKSPACE"/dist/*.whl
+
+            export HOME="$SMOKE_DIR/home"
+            export AGENT_VOICE_INPUT_HOME="$SMOKE_DIR/avi_home"
+            export XDG_CACHE_HOME="$SMOKE_DIR/cache"
+            export XDG_RUNTIME_DIR="$SMOKE_DIR/run"
+            mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_RUNTIME_DIR"
+            chmod 700 "$XDG_RUNTIME_DIR"
+
+            "$VENV_CLI" --help >/dev/null
+            VER_OUT="$("$VENV_CLI" --version)"
+            echo "Installed CLI version: $VER_OUT"
+            "$VENV_PY" - "$SMOKE_DIR/venv" "$VER_OUT" <<'PY'
+          import importlib, pathlib, sys
+
+          venv_root = pathlib.Path(sys.argv[1]).resolve()
+          ver_out = sys.argv[2]
+
+          for mod_name in (
+              "agent_voice_input",
+              "agent_voice_input.cli",
+              "agent_voice_input.config",
+              "agent_voice_input.daemon",
+              "agent_voice_input.asr_providers",
+              "agent_voice_input.refiner",
+              "agent_voice_input.platform_macos",
+              "agent_voice_input.platform_wsl",
+              "agent_voice_input.remote_ssh",
+          ):
+              mod = importlib.import_module(mod_name)
+              mod_path = pathlib.Path(mod.__file__).resolve()
+              assert venv_root in mod_path.parents, f"{mod_name} not loaded from venv: {mod_path}"
+
+          import agent_voice_input
+          assert agent_voice_input.__version__ in ver_out, f"version {agent_voice_input.__version__!r} not in {ver_out!r}"
+
+          pkg_dir = pathlib.Path(agent_voice_input.__file__).resolve().parent
+          win_ps1 = pkg_dir / "win_shim.ps1"
+          win_cs = sorted((pkg_dir / "win_shim").glob("*.cs"))
+          mac_swift = sorted((pkg_dir / "mac_shim").glob("*.swift"))
+          assert win_ps1.is_file(), f"missing {win_ps1}"
+          assert win_cs, f"missing win_shim/*.cs under {pkg_dir}"
+          assert mac_swift, f"missing mac_shim/*.swift under {pkg_dir}"
+          print(f"Clean wheel smoke passed: {len(win_cs)} C# files, {len(mac_swift)} Swift files")
+          PY
+          )
+
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  macos-shim-check:
+    name: macOS shim compile & self-check (macos-latest)
+    runs-on: macos-latest
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -23,142 +147,90 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install ffmpeg and tmux for integration tests
+      - name: Install tmux and ffmpeg if missing (macOS)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
         run: |
           pkgs=""
-          command -v ffmpeg >/dev/null 2>&1 || pkgs="$pkgs ffmpeg"
           command -v tmux >/dev/null 2>&1 || pkgs="$pkgs tmux"
+          command -v ffmpeg >/dev/null 2>&1 || pkgs="$pkgs ffmpeg"
           if [ -n "$pkgs" ]; then
-            sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
-            sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y --no-install-recommends $pkgs
+            brew install $pkgs
           fi
 
-      - name: Run unit tests
-        run: PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests -v
-
-      - name: Build sdist and wheel
+      - name: Compile mac_shim, run --self-check, and run macOS platform verification
+        env:
+          AGENT_VOICE_INPUT_CI_NO_SKIP: "1"
         run: |
-          python -m pip install --upgrade pip build
-          python -m build
+          set -euo pipefail
+          ISO_DIR="$(mktemp -d "${RUNNER_TEMP}/avi-mac-shim-XXXXXX")"
+          trap 'rm -rf "$ISO_DIR"' EXIT
+          mkdir -p "$ISO_DIR/cache" "$ISO_DIR/run"
+          chmod 700 "$ISO_DIR/run"
+          XDG_CACHE_HOME="$ISO_DIR/cache" XDG_RUNTIME_DIR="$ISO_DIR/run" PYTHONPATH=src python - <<'PY'
+          import os
+          from agent_voice_input.platform_macos import compile_mac_shim, run_mac_shim_self_check
 
-      - name: Verify packaged wheel and sdist contents
-        run: |
-          python - <<'PY'
-          import glob, pathlib, tarfile, zipfile
-
-          pkg_root = pathlib.Path("src/agent_voice_input")
-          pkg_files = sorted(
-              p.name
-              for p in pkg_root.iterdir()
-              if p.is_file() and p.suffix in (".py", ".ps1")
-          )
-          mac_shim_files = sorted(
-              p.relative_to(pkg_root).as_posix()
-              for p in (pkg_root / "mac_shim").glob("*.swift")
-              if p.is_file()
-          )
-          win_shim_files = sorted(
-              p.relative_to(pkg_root).as_posix()
-              for p in (pkg_root / "win_shim").glob("*.cs")
-              if p.is_file()
-          )
-          assert pkg_files, "no package files discovered"
-          assert mac_shim_files, "no mac_shim/*.swift files discovered"
-          assert win_shim_files, "no win_shim/*.cs files discovered"
-          expected_wheel = {
-              "agent_voice_input/__init__.py",
-              "agent_voice_input/cli.py",
-              "agent_voice_input/daemon.py",
-              "agent_voice_input/prompts.py",
-              "agent_voice_input/app_scope.py",
-              "agent_voice_input/http_transport.py",
-              "agent_voice_input/llm_common.py",
-              "agent_voice_input/platform_common.py",
-              "agent_voice_input/workspace_ctx.py",
-              "agent_voice_input/_remote_probe.py",
-              "agent_voice_input/remote_ssh.py",
-              "agent_voice_input/win_shim.ps1",
-              "agent_voice_input/win_shim/NativeBridge.cs",
-              "agent_voice_input/mac_shim/BridgeMain.swift",
-              *(f"agent_voice_input/{name}" for name in pkg_files),
-              *(f"agent_voice_input/{rel}" for rel in mac_shim_files),
-              *(f"agent_voice_input/{rel}" for rel in win_shim_files),
-          }
-
-          whls = glob.glob("dist/*.whl")
-          assert len(whls) == 1, f"expected 1 wheel, got {whls}"
-          with zipfile.ZipFile(whls[0]) as zf:
-              names = set(zf.namelist())
-              assert not any(
-                  "/.agents/" in f"/{n}" or "/.claude/" in f"/{n}" for n in names
-              ), f"unexpected .agents/.claude in wheel: {sorted(names)}"
-              for req in sorted(expected_wheel):
-                  assert req in names, f"missing {req} in wheel"
-              assert any("LICENSE" in n for n in names), f"missing LICENSE in wheel: {sorted(names)}"
-              eps = [n for n in names if n.endswith("entry_points.txt")]
-              assert eps and "agent-voice-input = agent_voice_input.cli:main" in zf.read(eps[0]).decode("utf-8")
-
-          integ_rels = sorted(
-              "/" + p.as_posix() for p in pathlib.Path("integrations").rglob("*") if p.is_file()
-          )
-          doc_rels = sorted(
-              "/" + p.as_posix() for p in pathlib.Path("docs").rglob("*.md") if p.is_file()
-          )
-          expected_sdist_suffixes = {
-              "/LICENSE",
-              "/AGENTS.md",
-              "/CHANGELOG.md",
-              "/ROADMAP.md",
-              "/README.md",
-              "/README.zh-CN.md",
-              "/config.example.toml",
-              "/config.example.env",
-              "/docs/context-routing.md",
-              "/scripts/check_coverage.py",
-              "/integrations/remote/remote-title-hook.sh",
-              "/.github/workflows/ci.yml",
-              "/.github/workflows/publish.yml",
-              "/src/agent_voice_input/prompts.py",
-              "/src/agent_voice_input/app_scope.py",
-              "/src/agent_voice_input/http_transport.py",
-              "/src/agent_voice_input/llm_common.py",
-              "/src/agent_voice_input/platform_common.py",
-              "/src/agent_voice_input/workspace_ctx.py",
-              "/src/agent_voice_input/_remote_probe.py",
-              "/src/agent_voice_input/remote_ssh.py",
-              "/src/agent_voice_input/win_shim.ps1",
-              "/src/agent_voice_input/win_shim/NativeBridge.cs",
-              "/src/agent_voice_input/mac_shim/BridgeMain.swift",
-              *(f"/src/agent_voice_input/{name}" for name in pkg_files),
-              *(f"/src/agent_voice_input/{rel}" for rel in mac_shim_files),
-              *(f"/src/agent_voice_input/{rel}" for rel in win_shim_files),
-              *integ_rels,
-              *doc_rels,
-          }
-
-          sdists = glob.glob("dist/*.tar.gz")
-          assert len(sdists) == 1, f"expected 1 sdist, got {sdists}"
-          with tarfile.open(sdists[0], "r:gz") as tf:
-              snames = set(tf.getnames())
-              rel_snames = {"/" + n.split("/", 1)[1] for n in snames if "/" in n}
-              assert not any(
-                  n == "/.agents" or n.startswith("/.agents/") or n == "/.claude" or n.startswith("/.claude/")
-                  for n in rel_snames
-              ), f"unexpected .agents/.claude in sdist: {sorted(rel_snames)}"
-              for suffix in sorted(expected_sdist_suffixes):
-                  assert suffix in rel_snames, f"missing exact path {suffix} in sdist"
+          iso_env = dict(os.environ)
+          bin_path, err = compile_mac_shim(env=iso_env)
+          assert not err and bin_path is not None and bin_path.is_file(), f"mac_shim compile failed: {err}"
+          ok, payload, sc_err = run_mac_shim_self_check(bin_path, iso_env)
+          assert ok and payload.get("ok") is True, f"mac_shim --self-check failed: {sc_err} {payload}"
+          print(f"mac_shim --self-check passed: {payload}")
           PY
+          PYTHONPATH=src python -W error::ResourceWarning -m unittest tests/test_macos_platform.py -v
 
-      - name: Upload built distributions
-        uses: actions/upload-artifact@v4
+  win-shim-check:
+    name: Windows shim ASCII & self-check (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          name: python-package-distributions
-          path: dist/
-          if-no-files-found: error
+          python-version: "3.12"
+
+      - name: Verify win_shim 7-bit ASCII and run win_shim.ps1 -Mode self-check
+        shell: powershell
+        run: |
+          python scripts/check_package.py --skip-dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $shimPath = (Resolve-Path "src\agent_voice_input\win_shim.ps1").Path
+          $isoAppData = Join-Path $env:RUNNER_TEMP ("avi-publish-win-shim-" + [Guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Force -Path $isoAppData | Out-Null
+          $prevLocalAppData = $env:LOCALAPPDATA
+          try {
+            $env:LOCALAPPDATA = $isoAppData
+            $out1 = & powershell.exe -NoProfile -NonInteractive -Sta -ExecutionPolicy Bypass -File $shimPath -Mode self-check -RealClipboard
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Host "Cold run: $out1"
+            $p1 = ($out1 | Select-Object -Last 1) | ConvertFrom-Json
+            if (-not $p1.ok -or $p1.mode -ne "self-check" -or -not $p1.real_clipboard_ok) {
+              throw "Unexpected cold win_shim self-check output: $out1"
+            }
+            $out2 = & powershell.exe -NoProfile -NonInteractive -Sta -ExecutionPolicy Bypass -File $shimPath -Mode self-check -RealClipboard
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Host "Warm run: $out2"
+            $p2 = ($out2 | Select-Object -Last 1) | ConvertFrom-Json
+            if (-not $p2.ok -or $p2.mode -ne "self-check" -or -not $p2.cache_hit -or -not $p2.real_clipboard_ok) {
+              throw "Unexpected warm win_shim self-check output: $out2"
+            }
+          } finally {
+            $env:LOCALAPPDATA = $prevLocalAppData
+            Remove-Item -Recurse -Force -Path $isoAppData -ErrorAction SilentlyContinue
+          }
 
   publish:
     name: Publish to PyPI via Trusted Publisher OIDC
-    needs: test-and-build
+    needs: [test-and-build, macos-shim-check, win-shim-check]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment:
@@ -191,34 +263,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract release notes and publish GitHub Release
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract release notes from CHANGELOG and publish GitHub Release
         run: |
+          set -euo pipefail
           TAG="$GITHUB_REF_NAME"
-          VERSION="${TAG#v}"
-          NOTES_FILE="/tmp/release_notes.md"
+          NOTES_FILE="${RUNNER_TEMP}/release_notes.md"
           rm -f "$NOTES_FILE"
-          python3 - "$VERSION" "$NOTES_FILE" <<'PY'
-          import pathlib, re, sys
-          ver, out = re.escape(sys.argv[1]), pathlib.Path(sys.argv[2])
-          p = pathlib.Path("CHANGELOG.md")
-          if p.is_file():
-              text = p.read_text(encoding="utf-8")
-              m = re.search(
-                  rf"^## (?:\[v?{ver}\]|v?{ver})(?=[ \t\-—–]|$)[^\n]*\n+(.*?)(?=^## \[|^\[[^\]\n]+\]:\s|\Z)",
-                  text,
-                  re.M | re.S,
-              )
-              if m and m.group(1).strip():
-                  out.write_text(m.group(1).strip() + "\n", encoding="utf-8")
-          PY
+          python scripts/check_package.py --skip-dist --check-release-tag "$TAG" --write-release-notes "$NOTES_FILE"
+          test -s "$NOTES_FILE"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            if [ -s "$NOTES_FILE" ]; then
-              gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
-            fi
+            gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
           else
-            if [ -s "$NOTES_FILE" ]; then
-              gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
-            else
-              gh release create "$TAG" --title "$TAG" --generate-notes
-            fi
+            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
           fi

@@ -3,7 +3,7 @@
 # Agent 终端标题与会话注册接入指南
 
 > [!TIP]
-> **约 80% 日常场景零 Hook 即用**：macOS Ghostty / `Terminal.app` / `iTerm2`、任意平台本地或远端 `tmux`（无需改动 `~/.tmux.conf`）、所有桌面 App，以及 WSL2 单窗口或不同目录多窗口均已开箱精准绑定，无需配置任何钩子。
+> **约 80% 日常场景零 Hook 即用**：macOS Ghostty（`✅`）、`Terminal.app`（`🧪`）与 `iTerm2`（`🧪`，未授自动化权限时静默回退 PTY 扫描，需精准 `tty` 可在系统设置授予自动化权限）、任意平台本地或远端 `tmux`（无需改动 `~/.tmux.conf`）、所有桌面 App，以及 WSL2 单窗口或不同目录多窗口均已开箱精准绑定，无需配置任何钩子。
 
 以下可选钩子主要服务于**不用 `tmux` 且在同一项目目录多开独立终端窗口**的场景（例如 WSL2 Windows Terminal 同目录多窗，或 macOS 下无 `tty` 查询接口的 WezTerm / Kitty / Alacritty / Warp 多开窗口）。开启后，`agent-voice-input` 可在多窗并发下 **O(1) 精确锁定当前前台根会话**，同时严格排除后台 subagent 与无头子进程。
 
@@ -63,7 +63,7 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; [ -x \"$b\" ] && \"$b\" session-hook --cli claude --quiet >/dev/null 2>&1 || true'"
+            "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/usr/local/bin/agent-voice-input\"; [ -x \"$b\" ] && \"$b\" session-hook --cli claude --quiet >/dev/null 2>&1 || true'"
           }
         ]
       }
@@ -73,7 +73,7 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; [ -x \"$b\" ] && \"$b\" session-hook --cli claude --quiet >/dev/null 2>&1 || true'"
+            "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/usr/local/bin/agent-voice-input\"; [ -x \"$b\" ] && \"$b\" session-hook --cli claude --quiet >/dev/null 2>&1 || true'"
           }
         ]
       }
@@ -99,14 +99,14 @@ Codex 会在终端窗口标题末尾输出当前根会话的 `thread-id` UUID，
     "SessionStart": [
       {
         "type": "command",
-        "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; if [ -x \"$b\" ]; then \"$b\" session-hook --cli agy --quiet >/dev/null 2>&1 || true; fi; printf \"{}\\n\"'",
+        "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/usr/local/bin/agent-voice-input\"; if [ -x \"$b\" ]; then \"$b\" session-hook --cli agy --quiet >/dev/null 2>&1 || true; fi; printf \"{}\\n\"'",
         "timeout": 5
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; if [ -x \"$b\" ]; then \"$b\" session-hook --cli agy --quiet >/dev/null 2>&1 || true; fi; printf \"{}\\n\"'",
+        "command": "sh -c 'b=$(command -v agent-voice-input 2>/dev/null || true); [ -x \"$b\" ] || b=\"$HOME/.local/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/opt/homebrew/bin/agent-voice-input\"; [ -x \"$b\" ] || b=\"/usr/local/bin/agent-voice-input\"; if [ -x \"$b\" ]; then \"$b\" session-hook --cli agy --quiet >/dev/null 2>&1 || true; fi; printf \"{}\\n\"'",
         "timeout": 5
       }
     ]

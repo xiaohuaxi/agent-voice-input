@@ -54,6 +54,7 @@ from .config import (
     resolve_credentials,
     resolve_deepseek_endpoint_url,
     select_asr_provider,
+    validate_effort_value,
 )
 from .hotwords import (
     HOTWORDS_QUOTA_SPECS,
@@ -95,9 +96,11 @@ from .http_transport import (
     _sleep_cooperative,
     _unregister_conn_abort,
     _validate_request_url,
+    classify_http_error_category,
     classify_http_failure,
     classify_transport_error,
     compute_retry_delay,
+    format_http_error_summary,
     make_rate_pacer_key,
     make_urllib_http_transport,
     parse_retry_after,
@@ -137,6 +140,7 @@ from .prompts import (
     SINGLE_HOP_GENERAL_SYSTEM_PROMPT,
     SINGLE_HOP_SYSTEM_PROMPT,
     SINGLE_HOP_TASK_REMINDER,
+    append_extra_instructions,
     strip_vocabulary_hints_echo,
 )
 
@@ -368,14 +372,6 @@ def _coerce_context(
         return _coerce_context(as_dc, env=env, personal_table=personal_table)
     raise TypeError(f"unsupported context type: {type(ctx).__name__}")
 
-
-
-def _format_vocabulary_hints(hotwords: Sequence[str]) -> str:
-    budget = budget_hotwords_for_provider(hotwords, "single_hop")
-    if not budget.kept:
-        return ""
-    body = ", ".join(budget.kept)
-    return f'<vocabulary_hints read_only="true">\n{body}\n</vocabulary_hints>'
 
 
 def _is_vocab_hints_block(block: str) -> bool:
@@ -1074,9 +1070,9 @@ class DashScopeAsrProvider(BaseAsrProvider):
         try:
             data = resp.json()
         except ValueError:
-            excerpt = self._safe_excerpt(resp.text(), (secret,))
+            cat = classify_http_error_category(resp.status, non_json=True)
             raise self._fail_http(
-                f"DashScope compatible-mode returned non-JSON (HTTP {resp.status}): {excerpt}",
+                format_http_error_summary(resp.status, cat, prefix="DashScope compatible-mode"),
                 resp,
                 extra_secrets=(secret,),
                 non_json=True,
@@ -1099,11 +1095,17 @@ class DashScopeAsrProvider(BaseAsrProvider):
                 if isinstance(raw_err, Mapping)
                 else str(data.get("code") or "")
             )
+            err_type = str(raw_err.get("type") or "") if isinstance(raw_err, Mapping) else ""
             if err_code == "ASR_RESPONSE_HAVE_NO_WORDS" or "ASR_RESPONSE_HAVE_NO_WORDS" in err_msg:
                 return ""
-            excerpt = self._safe_excerpt(err_msg, (secret,))
+            cat = classify_http_error_category(
+                resp.status,
+                error_code=err_code,
+                error_type=err_type,
+                error_message=err_msg,
+            )
             raise self._fail_http(
-                f"DashScope compatible-mode HTTP {resp.status}: {excerpt}",
+                format_http_error_summary(resp.status, cat, prefix="DashScope compatible-mode"),
                 resp,
                 data,
                 extra_secrets=(secret,),
@@ -1159,9 +1161,9 @@ class DashScopeAsrProvider(BaseAsrProvider):
         try:
             data = resp.json()
         except ValueError:
-            excerpt = self._safe_excerpt(resp.text(), (secret,))
+            cat = classify_http_error_category(resp.status, non_json=True)
             raise self._fail_http(
-                f"DashScope multimodal-generation returned non-JSON (HTTP {resp.status}): {excerpt}",
+                format_http_error_summary(resp.status, cat, prefix="DashScope multimodal-generation"),
                 resp,
                 extra_secrets=(secret,),
                 non_json=True,
@@ -1173,9 +1175,13 @@ class DashScopeAsrProvider(BaseAsrProvider):
             return ""
 
         if resp.status != 200 or (code and not data.get("output")):
-            excerpt = self._safe_excerpt(message or str(data), (secret,))
+            cat = classify_http_error_category(
+                resp.status,
+                error_code=code,
+                error_message=message,
+            )
             raise self._fail_http(
-                f"DashScope multimodal-generation HTTP {resp.status} ({code}): {excerpt}",
+                format_http_error_summary(resp.status, cat, prefix="DashScope multimodal-generation"),
                 resp,
                 data,
                 extra_secrets=(secret,),
@@ -1304,7 +1310,7 @@ class DoubaoAsrProvider(BaseAsrProvider):
         return digest[:24]
 
     def _build_candidate_slots(self, cache_key: str) -> tuple[bool, list[tuple[str, str]]]:
-        rid = (self.cfg.asr.resource_id or "auto").strip()
+        rid = (self.cfg.asr.doubao_resource_id or "auto").strip()
         explicit_mode = (self.cfg.asr.doubao_mode or "auto").strip().lower()
 
         if rid.lower() == "auto" or not rid:
@@ -1659,8 +1665,16 @@ class DoubaoAsrProvider(BaseAsrProvider):
                 is_rl, _ = _is_doubao_rate_limit(resp.status, api_code, api_msg)
                 if not is_rl and self._is_recoverable_slot_error(resp.status, api_code, api_msg):
                     raise _DoubaoSlotUnavailableError(api_code or str(resp.status), api_msg)
+                cat = classify_http_error_category(
+                    resp.status,
+                    non_json=non_json and not api_code,
+                    error_code=api_code,
+                    error_message=api_msg,
+                    retry_kind="rate_limit" if is_rl else "",
+                )
+                code_sfx = f" code={api_code}" if api_code.isdigit() else ""
                 raise self._fail_http(
-                    f"Doubao flash ({rid}) failed HTTP {resp.status} code={api_code}: {api_msg}",
+                    f"{format_http_error_summary(resp.status, cat, prefix=f'Doubao flash ({rid}) failed')}{code_sfx}",
                     resp,
                     data,
                     extra_secrets=secrets,
@@ -1751,8 +1765,16 @@ class DoubaoAsrProvider(BaseAsrProvider):
                     submit_resp.status, sub_code, sub_msg
                 ):
                     raise _DoubaoSlotUnavailableError(sub_code or str(submit_resp.status), sub_msg)
+                cat = classify_http_error_category(
+                    submit_resp.status,
+                    non_json=sub_non_json and not sub_code,
+                    error_code=sub_code,
+                    error_message=sub_msg,
+                    retry_kind="rate_limit" if is_rl else "",
+                )
+                code_sfx = f" code={sub_code}" if sub_code.isdigit() else ""
                 raise self._fail_http(
-                    f"Doubao submit ({rid}) failed HTTP {submit_resp.status} code={sub_code}: {sub_msg}",
+                    f"{format_http_error_summary(submit_resp.status, cat, prefix=f'Doubao submit ({rid}) failed')}{code_sfx}",
                     submit_resp,
                     submit_data,
                     extra_secrets=secrets,
@@ -1845,8 +1867,17 @@ class DoubaoAsrProvider(BaseAsrProvider):
                         )
                     wait_sec = _doubao_poll_wait_sec(poll_elapsed)
                     continue
+                q_rl, _ = _is_doubao_rate_limit(q_resp.status, q_code, q_msg)
+                cat = classify_http_error_category(
+                    q_resp.status,
+                    non_json=q_non_json and not q_code,
+                    error_code=q_code,
+                    error_message=q_msg,
+                    retry_kind="rate_limit" if q_rl else "",
+                )
+                code_sfx = f" code={q_code}" if q_code.isdigit() else ""
                 raise self._fail_http(
-                    f"Doubao query ({rid}) failed HTTP {q_resp.status} code={q_code}: {q_msg}",
+                    f"{format_http_error_summary(q_resp.status, cat, prefix=f'Doubao query ({rid}) failed')}{code_sfx}",
                     q_resp,
                     q_data,
                     extra_secrets=secrets,
@@ -1882,12 +1913,16 @@ SINGLE_HOP_AUDIO_TASK_REMINDER = SINGLE_HOP_TASK_REMINDER
 GEMINI_AUDIO_SYSTEM_PROMPT = SINGLE_HOP_SYSTEM_PROMPT
 
 
-def _resolve_single_hop_system_prompt(mode: str) -> str:
-    return (
+def _resolve_single_hop_system_prompt(
+    mode: str,
+    extra_instructions: Sequence[str] = (),
+) -> str:
+    base = (
         SINGLE_HOP_GENERAL_SYSTEM_PROMPT
         if (mode or "agent").strip().lower() == "general"
         else SINGLE_HOP_SYSTEM_PROMPT
     )
+    return append_extra_instructions(base, extra_instructions)
 
 
 class GeminiAudioProvider(BaseAsrProvider):
@@ -1910,7 +1945,10 @@ class GeminiAudioProvider(BaseAsrProvider):
     ) -> AsrResult:
         eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
         model = self.cfg.asr.effective_model("gemini")
-        gen_cfg = build_gemini_generation_config(model, self.cfg.asr.effort, temperature=0.1)
+        validate_effort_value(self.cfg.asr.effort, "asr.effort", allow_empty=True)
+        gen_cfg = build_gemini_generation_config(
+            model, self.cfg.asr.effective_effort("gemini"), temperature=0.1
+        )
         if not wav_bytes:
             return AsrResult(
                 text="",
@@ -1982,7 +2020,15 @@ class GeminiAudioProvider(BaseAsrProvider):
         )
         parts.append({"text": SINGLE_HOP_AUDIO_TASK_REMINDER})
         payload = {
-            "systemInstruction": {"parts": [{"text": _resolve_single_hop_system_prompt(ctx.mode)}]},
+            "systemInstruction": {
+                "parts": [
+                    {
+                        "text": _resolve_single_hop_system_prompt(
+                            ctx.mode, self.cfg.refiner.extra_instructions
+                        )
+                    }
+                ]
+            },
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": gen_cfg,
         }
@@ -2017,9 +2063,9 @@ class GeminiAudioProvider(BaseAsrProvider):
             try:
                 data = resp.json()
             except ValueError:
-                excerpt = self._safe_excerpt(resp.text(), (cred.value,))
+                cat = classify_http_error_category(resp.status, non_json=True)
                 raise self._fail_http(
-                    f"Gemini generateContent returned non-JSON (HTTP {resp.status}): {excerpt}",
+                    format_http_error_summary(resp.status, cat, prefix="Gemini generateContent"),
                     resp,
                     extra_secrets=(cred.value,),
                     non_json=True,
@@ -2027,14 +2073,16 @@ class GeminiAudioProvider(BaseAsrProvider):
 
             if resp.status != 200 or (data.get("error") and not data.get("candidates")):
                 raw_err = data.get("error")
-                err_msg = (
-                    str(raw_err.get("message") or data)
-                    if isinstance(raw_err, dict)
-                    else str(raw_err or data)
+                err_dict = raw_err if isinstance(raw_err, Mapping) else {}
+                err_code = str(err_dict.get("status") or err_dict.get("code") or "").strip()
+                err_msg = str(err_dict.get("message") or "").strip()
+                cat = classify_http_error_category(
+                    resp.status,
+                    error_code=err_code,
+                    error_message=err_msg,
                 )
-                excerpt = self._safe_excerpt(err_msg, (cred.value,))
                 raise self._fail_http(
-                    f"Gemini generateContent HTTP {resp.status}: {excerpt}",
+                    format_http_error_summary(resp.status, cat, prefix="Gemini generateContent"),
                     resp,
                     data,
                     extra_secrets=(cred.value,),
@@ -2046,9 +2094,9 @@ class GeminiAudioProvider(BaseAsrProvider):
             if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
                 pf = data.get("promptFeedback")
                 if isinstance(pf, dict) and pf.get("blockReason"):
-                    excerpt = self._safe_excerpt(str(pf), (cred.value,))
+                    block_reason = str(pf.get("blockReason") or "blocked").strip()
                     raise self._fail(
-                        f"Gemini generateContent blocked ({pf.get('blockReason')}): {excerpt}",
+                        f"Gemini generateContent blocked ({block_reason})",
                         extra_secrets=(cred.value,),
                         retry_kind="never",
                     )
@@ -2297,9 +2345,22 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
                 except ValueError:
                     err_data = {}
                     non_json = True
-                excerpt = self._safe_excerpt(resp.text(), secrets)
+                raw_err = err_data.get("error") if isinstance(err_data, Mapping) else None
+                err_dict = raw_err if isinstance(raw_err, Mapping) else {}
+                err_code = str(err_dict.get("code") or "").strip()
+                err_type = str(err_dict.get("type") or "").strip()
+                err_msg = str(err_dict.get("message") or "").strip()
+                cat = classify_http_error_category(
+                    resp.status,
+                    non_json=non_json,
+                    error_code=err_code,
+                    error_type=err_type,
+                    error_message=err_msg,
+                )
                 raise self._fail_http(
-                    f"{self.provider_name} audio/transcriptions HTTP {resp.status}: {excerpt}",
+                    format_http_error_summary(
+                        resp.status, cat, prefix=f"{self.provider_name} audio/transcriptions"
+                    ),
                     resp,
                     err_data,
                     extra_secrets=secrets,
@@ -2309,9 +2370,11 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
             try:
                 data = resp.json()
             except ValueError:
-                excerpt = self._safe_excerpt(resp.text(), secrets)
+                cat = classify_http_error_category(resp.status, non_json=True)
                 raise self._fail_http(
-                    f"{self.provider_name} audio/transcriptions returned non-JSON (HTTP {resp.status}): {excerpt}",
+                    format_http_error_summary(
+                        resp.status, cat, prefix=f"{self.provider_name} audio/transcriptions"
+                    ),
                     resp,
                     extra_secrets=secrets,
                     non_json=True,
@@ -2319,14 +2382,20 @@ class AudioTranscriptionsAsrProvider(_BearerProviderMixin):
 
             if data.get("error"):
                 raw_err = data.get("error")
-                err_msg = (
-                    str(raw_err.get("message") or data)
-                    if isinstance(raw_err, dict)
-                    else str(raw_err or data)
+                err_dict = raw_err if isinstance(raw_err, Mapping) else {}
+                err_code = str(err_dict.get("code") or "").strip()
+                err_type = str(err_dict.get("type") or "").strip()
+                err_msg = str(err_dict.get("message") or raw_err or "").strip()
+                cat = classify_http_error_category(
+                    resp.status,
+                    error_code=err_code,
+                    error_type=err_type,
+                    error_message=err_msg,
                 )
-                excerpt = self._safe_excerpt(err_msg, secrets)
                 raise self._fail_http(
-                    f"{self.provider_name} audio/transcriptions error: {excerpt}",
+                    format_http_error_summary(
+                        resp.status, cat, prefix=f"{self.provider_name} audio/transcriptions"
+                    ),
                     resp,
                     data,
                     extra_secrets=secrets,
@@ -2478,19 +2547,24 @@ class DeepSeekAsrProvider(_BearerProviderMixin):
                     err_data = {}
                     non_json = True
                 compat_err = extract_openai_compat_error(err_data) if err_data else None
+                raw_err = compat_err[0] if compat_err is not None else (err_data.get("error") if isinstance(err_data, Mapping) else None)
+                err_dict = raw_err if isinstance(raw_err, Mapping) else {}
+                err_code = str(err_dict.get("code") or err_data.get("code") or "").strip() if isinstance(err_data, Mapping) else ""
+                err_type = str(err_dict.get("type") or "").strip()
                 raw_err_msg = (
                     compat_err[1]
                     if compat_err is not None
-                    else str(err_data.get("message") or resp.text())
+                    else str(err_data.get("message") or "")
                 )
-                excerpt = self._safe_excerpt(raw_err_msg, secrets)
-                status_note = (
-                    f"HTTP {resp.status} (payload too large; limit <= 8 MiB / 120s)"
-                    if resp.status == 413
-                    else f"HTTP {resp.status}"
+                cat = classify_http_error_category(
+                    resp.status,
+                    non_json=non_json,
+                    error_code=err_code,
+                    error_type=err_type,
+                    error_message=raw_err_msg,
                 )
                 raise self._fail_http(
-                    f"deepseek tools/asr {status_note}: {excerpt}",
+                    format_http_error_summary(resp.status, cat, prefix="deepseek tools/asr"),
                     resp,
                     err_data,
                     extra_secrets=secrets,
@@ -2517,28 +2591,18 @@ class DeepSeekAsrProvider(_BearerProviderMixin):
 
             if data.get("error"):
                 raw_err = data.get("error")
-                if isinstance(raw_err, Mapping):
-                    msg = raw_err.get("message")
-                    if isinstance(msg, str) and msg.strip():
-                        err_msg = msg
-                    elif msg is not None and not isinstance(msg, str):
-                        err_msg = f"malformed error.message ({type(msg).__name__})"
-                    else:
-                        err_msg = next(
-                            (
-                                v
-                                for v in (raw_err.get("code"), raw_err.get("type"))
-                                if isinstance(v, str) and v.strip()
-                            ),
-                            "upstream error",
-                        )
-                elif isinstance(raw_err, str) and raw_err.strip():
-                    err_msg = raw_err
-                else:
-                    err_msg = f"malformed error ({type(raw_err).__name__})"
-                excerpt = self._safe_excerpt(err_msg, secrets)
+                err_dict = raw_err if isinstance(raw_err, Mapping) else {}
+                err_code = str(err_dict.get("code") or "").strip()
+                err_type = str(err_dict.get("type") or "").strip()
+                raw_msg = str(err_dict.get("message") or (raw_err if isinstance(raw_err, str) else "")).strip()
+                cat = classify_http_error_category(
+                    resp.status,
+                    error_code=err_code,
+                    error_type=err_type,
+                    error_message=raw_msg,
+                )
                 raise self._fail_http(
-                    f"deepseek tools/asr error: {excerpt}",
+                    format_http_error_summary(resp.status, cat, prefix="deepseek tools/asr"),
                     resp,
                     data,
                     extra_secrets=secrets,
@@ -2705,7 +2769,12 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
         payload: dict[str, Any] = {
             "model": model,
             "messages": [
-                {"role": "system", "content": _resolve_single_hop_system_prompt(ctx.mode)},
+                {
+                    "role": "system",
+                    "content": _resolve_single_hop_system_prompt(
+                        ctx.mode, self.cfg.refiner.extra_instructions
+                    ),
+                },
                 {"role": "user", "content": user_content},
             ],
             "stream": False,
@@ -2718,11 +2787,12 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
             or "omni" in model.lower()
         ):
             payload["modalities"] = ["text"]
+        validate_effort_value(self.cfg.asr.effort, "asr.effort", allow_empty=True)
         apply_chat_effort_params(
             payload,
             provider=self.provider_name,
             model=model,
-            effort=self.cfg.asr.effort,
+            effort=self.cfg.asr.effective_effort(self.provider_name),
             base_url=url,
         )
 
@@ -2755,9 +2825,11 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
             try:
                 data = resp.json()
             except ValueError:
-                excerpt = self._safe_excerpt(resp.text(), secrets)
+                cat = classify_http_error_category(resp.status, non_json=True)
                 raise self._fail_http(
-                    f"{self.provider_name} chat/completions returned non-JSON (HTTP {resp.status}): {excerpt}",
+                    format_http_error_summary(
+                        resp.status, cat, prefix=f"{self.provider_name} chat/completions"
+                    ),
                     resp,
                     extra_secrets=secrets,
                     non_json=True,
@@ -2776,9 +2848,17 @@ class ChatAudioAsrProvider(_BearerProviderMixin):
                     if isinstance(raw_err, Mapping)
                     else str(data.get("code") or "")
                 )
-                excerpt = self._safe_excerpt(err_msg, secrets)
+                err_type = str(raw_err.get("type") or "") if isinstance(raw_err, Mapping) else ""
+                cat = classify_http_error_category(
+                    resp.status,
+                    error_code=err_code,
+                    error_type=err_type,
+                    error_message=err_msg,
+                )
                 raise self._fail_http(
-                    f"{self.provider_name} chat/completions HTTP {resp.status}: {excerpt}",
+                    format_http_error_summary(
+                        resp.status, cat, prefix=f"{self.provider_name} chat/completions"
+                    ),
                     resp,
                     data,
                     extra_secrets=secrets,
@@ -2848,10 +2928,7 @@ def create_asr_provider(
     rand_fn: Callable[[], float] = random.random,
 ) -> BaseAsrProvider:
     eff_env = os.environ if env is None else env
-    if cfg.asr.effort.strip().lower() not in VALID_EFFORTS:
-        raise ConfigError(
-            f"asr.effort must be one of {sorted(VALID_EFFORTS)}, got {cfg.asr.effort!r}"
-        )
+    validate_effort_value(cfg.asr.effort, "asr.effort", allow_empty=True)
     eff_creds = creds if creds is not None else resolve_credentials(cfg, eff_env)
     provider_name = select_asr_provider(cfg, eff_creds)
     if provider_name == "openai-compatible" and not cfg.asr.base_url.strip():

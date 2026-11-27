@@ -59,7 +59,7 @@ body:
     attributes:
       label: "`agent-voice-input --version`"
       description: Output of `agent-voice-input --version` (plus Python version if known).
-      placeholder: "agent-voice-input 1.0.0 (Python 3.12)"
+      placeholder: "e.g. output of 'agent-voice-input --version' (0.x.y, Python 3.12)"
     validations:
       required: true
 

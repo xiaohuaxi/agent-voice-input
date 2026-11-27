@@ -817,7 +817,7 @@ class RemoteSshLoopbackE2ETests(unittest.TestCase):
         remote_cfg = RemoteConfig(timeout_ms=4000, hosts=(host_cfg,))
         cfg = Config(
             hotkey=HotkeyConfig(key="RControl", trigger_mode="tap_toggle", debounce_ms=0),
-            audio=AudioConfig(save_recordings=False),
+            audio=AudioConfig(),
             asr=AsrConfig(
                 provider="openai-compatible",
                 api="audio-transcriptions",
@@ -995,7 +995,13 @@ class RemoteSshLoopbackE2ETests(unittest.TestCase):
         Stage 2 loopback HTTP E2E path even on hosts without ``openssh-server`` installed."""
         git_bin = shutil.which("git")
         if not git_bin:
-            self.skipTest("requires git")
+            msg = "requires git"
+            if (
+                os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+                or os.environ.get("AGENT_VOICE_INPUT_CI_NO_SKIP", "").strip().lower() in {"1", "true", "yes"}
+            ):
+                self.fail(f"CI/AGENT_VOICE_INPUT_CI_NO_SKIP=1: {msg}")
+            self.skipTest(msg)
         base_dir = Path(tempfile.mkdtemp(prefix="avi-rem-e2e-", dir="/tmp"))
         os.chmod(base_dir, 0o700)
         rt_dir = base_dir / "rt"

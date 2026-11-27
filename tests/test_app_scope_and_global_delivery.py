@@ -188,55 +188,28 @@ class _DummyPlatform:
 
 
 class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
-    def test_hotkey_scope_backward_compat_and_ignore_apps_validation(self) -> None:
-        # 1. Defaults & constructor compatibility matrix (including legacy 5th positional arg)
+    def test_hotkey_scope_migration_and_ignore_apps_validation(self) -> None:
+        # 1. Defaults & constructor validation
         dflt = Config()
         self.assertEqual(dflt.hotkey.scope, "all")
-        self.assertIs(dflt.hotkey.only_in_terminals, False)
+        self.assertFalse(hasattr(dflt.hotkey, "only_in_terminals"))
         self.assertIs(dflt.hotkey.yield_remote_desktop, True)
         self.assertEqual(dflt.hotkey.ignore_apps, ())
 
-        hk_pos_true = HotkeyConfig("RControl", "tap_toggle", 1200, 180, True)
-        self.assertEqual(hk_pos_true.scope, "terminals")
-        self.assertIs(hk_pos_true.only_in_terminals, True)
+        hk_coding = HotkeyConfig(scope="CODING", ignore_apps=["msrdc"])
+        self.assertEqual(hk_coding.scope, "coding")
+        self.assertEqual(hk_coding.ignore_apps, ("msrdc",))
 
-        hk_pos_false = HotkeyConfig("RControl", "tap_toggle", 1200, 180, False)
-        self.assertEqual(hk_pos_false.scope, "all")
-        self.assertIs(hk_pos_false.only_in_terminals, False)
+        with self.assertRaises(TypeError):
+            HotkeyConfig(only_in_terminals=True)  # type: ignore[call-arg]
 
-        hk_oit_true = HotkeyConfig(only_in_terminals=True)
-        self.assertEqual(hk_oit_true.scope, "terminals")
-        self.assertIs(hk_oit_true.only_in_terminals, True)
-
-        hk_oit_false = HotkeyConfig(only_in_terminals=False)
-        self.assertEqual(hk_oit_false.scope, "all")
-        self.assertIs(hk_oit_false.only_in_terminals, False)
-
-        # Explicit scope wins over legacy only_in_terminals in constructor
-        hk_both = HotkeyConfig(scope="CODING", only_in_terminals=True, ignore_apps=["msrdc"])
-        self.assertEqual(hk_both.scope, "coding")
-        self.assertIs(hk_both.only_in_terminals, False)
-        self.assertEqual(hk_both.ignore_apps, ("msrdc",))
-
-        with self.assertRaises(ConfigError):
-            HotkeyConfig(only_in_terminals="true")
-
-        # Runtime property setter & dataclasses.replace / asdict round-trip
+        # dataclasses.replace / asdict round-trip
         hk_mut = HotkeyConfig(scope="coding")
         hk_replaced = dataclasses.replace(hk_mut, key="F8")
         self.assertEqual(hk_replaced.key, "F8")
         self.assertEqual(hk_replaced.scope, "coding")
         as_dict = dataclasses.asdict(Config(hotkey=hk_replaced))
         self.assertEqual(as_dict["hotkey"]["scope"], "coding")
-
-        hk_mut.only_in_terminals = True
-        self.assertEqual(hk_mut.scope, "terminals")
-        self.assertIs(hk_mut.only_in_terminals, True)
-        hk_mut.only_in_terminals = False
-        self.assertEqual(hk_mut.scope, "all")
-        self.assertIs(hk_mut.only_in_terminals, False)
-        with self.assertRaises(ConfigError):
-            hk_mut.only_in_terminals = 1  # type: ignore[assignment]
 
         # 2. TOML (stdlib + Python 3.10 _parse_simple_toml) & JSON + cli_overrides precedence
         with tempfile.TemporaryDirectory() as td:
@@ -245,25 +218,16 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
             cfg_dir.mkdir(parents=True)
             cfg_file = cfg_dir / "config.toml"
 
-            # Legacy only_in_terminals = true -> scope = "terminals"
+            # Legacy only_in_terminals raises a clear migration ConfigError
             cfg_file.write_text("[hotkey]\nonly_in_terminals = true\n", encoding="utf-8")
-            c1, _ = load_config(env={"HOME": str(home)}, home_dir=home)
-            self.assertEqual(c1.hotkey.scope, "terminals")
-            self.assertIs(c1.hotkey.only_in_terminals, True)
+            with self.assertRaises(ConfigError) as cm_leg:
+                load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertIn("only_in_terminals", str(cm_leg.exception))
+            self.assertIn("hotkey.scope", str(cm_leg.exception))
 
-            # CLI scope overrides legacy file only_in_terminals = true
-            c1_cli, _ = load_config(
-                env={"HOME": str(home)},
-                home_dir=home,
-                cli_overrides={"hotkey.scope": "coding"},
-            )
-            self.assertEqual(c1_cli.hotkey.scope, "coding")
-            self.assertIs(c1_cli.hotkey.only_in_terminals, False)
-
-            # Same-layer explicit scope + legacy only_in_terminals -> scope wins, types still validated
+            # Explicit scope + yield_remote_desktop + ignore_apps
             toml_same = (
                 '[hotkey]\n'
-                'only_in_terminals = true\n'
                 'scope = "coding"\n'
                 'yield_remote_desktop = false\n'
                 'ignore_apps = [\n  "msrdc.exe",\n  "com.foo.*",\n  "msrdc.exe",\n]\n'
@@ -275,18 +239,25 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
             self.assertIs(c2.hotkey.yield_remote_desktop, False)
             self.assertEqual(c2.hotkey.ignore_apps, ("msrdc.exe", "com.foo.*"))
 
-            # CLI legacy only_in_terminals = True overrides file scope = "coding"
+            # CLI scope override works; legacy CLI override hotkey.only_in_terminals fails with migration error
             c2_cli, _ = load_config(
                 env={"HOME": str(home)},
                 home_dir=home,
-                cli_overrides={"hotkey.only_in_terminals": True},
+                cli_overrides={"hotkey.scope": "terminals"},
             )
             self.assertEqual(c2_cli.hotkey.scope, "terminals")
-            self.assertIs(c2_cli.hotkey.only_in_terminals, True)
 
-            # Invalid legacy type is still caught even when scope is present in the same table
+            with self.assertRaises(ConfigError) as cm_cli_leg:
+                load_config(
+                    env={"HOME": str(home)},
+                    home_dir=home,
+                    cli_overrides={"hotkey.only_in_terminals": True},
+                )
+            self.assertIn("hotkey.scope", str(cm_cli_leg.exception))
+
+            # Legacy key alongside scope is still rejected
             cfg_file.write_text(
-                '[hotkey]\nscope = "all"\nonly_in_terminals = "invalid"\n', encoding="utf-8"
+                '[hotkey]\nscope = "all"\nonly_in_terminals = false\n', encoding="utf-8"
             )
             with self.assertRaises(ConfigError):
                 load_config(env={"HOME": str(home)}, home_dir=home)
@@ -918,7 +889,7 @@ class AppScopeAndGlobalDeliveryTests(unittest.TestCase):
         self.assertGreaterEqual(flush_calls_to[0], 1, "must invoke _flush_shim_events even when waited_for_key=False")
         self.assertFalse(out_to.pasted)
         self.assertTrue(out_to.clipboard)
-        self.assertEqual(out_to.reason, "focus_changed")
+        self.assertEqual(out_to.reason, "hotkey_held")
         paste_rpcs_to = [r for r in rpcs_to if r.get("cmd") == "paste"]
         self.assertEqual(len(paste_rpcs_to), 1)
         self.assertIs(paste_rpcs_to[0].get("force_clipboard_only"), True)

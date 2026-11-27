@@ -44,6 +44,8 @@ from .http_transport import (
     _HttpProxyRoute,
     _KeepAlivePool,
     _RATE_PACER,
+    DEFAULT_MAX_RESPONSE_BYTES,
+    DEFAULT_MAX_SSE_LINE_BYTES,
     _can_reuse_pooled_conn,
     _close_quietly,
     _combine_cancel_check,
@@ -57,9 +59,11 @@ from .http_transport import (
     _select_system_proxy_url,
     _unregister_conn_abort,
     _validate_request_url,
+    classify_http_error_category,
     classify_http_failure,
     classify_transport_error,
     compute_retry_delay,
+    format_http_error_summary,
     make_rate_pacer_key,
     make_urllib_http_transport,
     sleep_cooperative,
@@ -80,6 +84,8 @@ from .llm_common import (
     _openrouter_reasoning_mandatory,
     _opt_int,
     _pick_opt_int,
+    _resolve_openai_reasoning_effort,
+    _resolve_openrouter_reasoning_effort,
     apply_chat_effort_params,
     build_gemini_generation_config,
     extract_chat_message_text,
@@ -112,6 +118,7 @@ from .config import (
     resolve_credentials,
     resolve_deepseek_endpoint_url,
     select_refiner_provider,
+    validate_effort_value,
 )
 from .prompts import (
     CODEX_NO_TOOLS_NOTE,
@@ -121,6 +128,7 @@ from .prompts import (
     REFINER_GENERAL_SYSTEM_PROMPT,
     REFINER_SYSTEM_PROMPT,
     REFINER_TASK_REMINDER,
+    append_extra_instructions,
     strip_vocabulary_hints_echo,
 )
 from .session_ctx import SessionTracker
@@ -222,6 +230,7 @@ class _RefinerAttemptError(RuntimeError):
         is_concurrency_limit: bool = False,
         http_status: int | None = None,
         error_code: str = "",
+        model_unsupported: bool = False,
     ) -> None:
         super().__init__(message)
         self.retry_kind = retry_kind
@@ -229,6 +238,7 @@ class _RefinerAttemptError(RuntimeError):
         self.is_concurrency_limit = is_concurrency_limit
         self.http_status = http_status
         self.error_code = error_code
+        self.model_unsupported = model_unsupported
 
 
 def _ms(t0: float, clock_fn: Callable[[], float] = time.monotonic) -> int:
@@ -326,21 +336,30 @@ _CODEX_PARAM_OR_CTX_ERR_RE = re.compile(
 )
 
 
+def _is_codex_model_unsupported_text(
+    http_status: int | None, error_code: str, raw_msg: str
+) -> bool:
+    if http_status not in (400, 404, None):
+        return False
+    if error_code.strip().lower() in ("model_not_found", "model_not_supported"):
+        return True
+    if _CODEX_PARAM_OR_CTX_ERR_RE.search(raw_msg):
+        return False
+    return bool(_CODEX_MODEL_UNSUPPORTED_RE.search(raw_msg))
+
+
 def _is_codex_model_unsupported_error(err: _RefinerAttemptError) -> bool:
     if err.http_status not in (400, 404, None):
         return False
-    if err.error_code.strip().lower() in ("model_not_found", "model_not_supported"):
+    if err.model_unsupported:
         return True
-    msg = str(err)
-    if _CODEX_PARAM_OR_CTX_ERR_RE.search(msg):
-        return False
-    return bool(_CODEX_MODEL_UNSUPPORTED_RE.search(msg))
+    return _is_codex_model_unsupported_text(err.http_status, err.error_code, str(err))
 
 
 def resolve_refiner_prompt(cfg: Config | None = None, *, mode: str = "agent") -> str:
-    if cfg is not None and cfg.refiner.prompt.strip():
-        return cfg.refiner.prompt.strip()
-    return REFINER_GENERAL_SYSTEM_PROMPT if mode == "general" else REFINER_SYSTEM_PROMPT
+    base = REFINER_GENERAL_SYSTEM_PROMPT if mode == "general" else REFINER_SYSTEM_PROMPT
+    extra = cfg.refiner.extra_instructions if cfg is not None else ()
+    return append_extra_instructions(base, extra)
 
 
 def _compose_codex_instructions(sys_prompt: str) -> str:
@@ -635,6 +654,19 @@ _RESPONSES_PERM_ERROR_TOKENS = (
 _RESPONSES_TRANSIENT_TOKENS = ("server_is_overloaded", "overloaded", "try again")
 
 
+_RESPONSES_INCOMPLETE_REASONS: frozenset[str] = frozenset(
+    {
+        "max_output_tokens",
+        "content_filter",
+        "safety",
+        "pause_turn",
+        "cancelled",
+        "canceled",
+        "length",
+    }
+)
+
+
 def _classify_stream_error_event(
     provider_name: str,
     ev: Mapping[str, Any],
@@ -644,7 +676,8 @@ def _classify_stream_error_event(
     if ev_type == "response.incomplete":
         resp_obj = ev.get("response")
         inc = resp_obj.get("incomplete_details") if isinstance(resp_obj, Mapping) else None
-        reason = str(inc.get("reason") or "unknown").strip().lower() if isinstance(inc, Mapping) else "unknown"
+        raw_reason = str(inc.get("reason") or "").strip().lower() if isinstance(inc, Mapping) else ""
+        reason = raw_reason if raw_reason in _RESPONSES_INCOMPLETE_REASONS else "unknown"
         return _RefinerAttemptError(
             f"Responses stream incomplete ({reason})",
             retry_kind="never" if reason in ("content_filter", "safety") else "transient",
@@ -679,12 +712,21 @@ def _classify_stream_error_event(
             ev_type == "response.failed" and not code and not etype
         ):
             rkind = "transient"
+    cat = classify_http_error_category(
+        200,
+        error_code=code,
+        error_type=etype,
+        error_message=msg,
+        retry_kind=rkind,
+    )
+    model_unsup = _is_codex_model_unsupported_text(None, code, f"{code} {etype} {msg}")
     return _RefinerAttemptError(
-        f"{ev_type}: {msg}",
+        f"{ev_type} ({cat})",
         retry_kind=rkind,
         retry_after_sec=rafter,
         is_concurrency_limit=conc,
         error_code=code,
+        model_unsupported=model_unsup,
     )
 
 
@@ -695,6 +737,9 @@ def _parse_responses_sse_lines(
     resp_headers: Mapping[str, str],
     is_cancelled: Callable[[], bool] | None = None,
     allow_empty_output: bool = False,
+    max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    max_line_bytes: int = DEFAULT_MAX_SSE_LINE_BYTES,
+    supports_limit: bool | None = None,
 ) -> tuple[str, _TokenUsageTuple, bool]:
     """Consume an SSE line iterator to EOF and return ``(text, usage, saw_eof)``."""
     deltas: list[str] = []
@@ -705,6 +750,13 @@ def _parse_responses_sse_lines(
     stream_err: _RefinerAttemptError | None = None
     cur_event_name = ""
     cur_data_lines: list[str] = []
+    eff_max_bytes = max(0, int(max_bytes))
+    eff_max_line = max(0, int(max_line_bytes))
+    if supports_limit is None:
+        use_limit_arg = getattr(line_iter, "__name__", "") == "readline"
+    else:
+        use_limit_arg = bool(supports_limit)
+    total_bytes = 0
 
     def _flush_event() -> None:
         nonlocal cur_event_name, cur_data_lines, usage, saw_completed, saw_refusal, stream_err
@@ -756,11 +808,35 @@ def _parse_responses_sse_lines(
     while True:
         if is_cancelled is not None and is_cancelled():
             return "", _EMPTY_USAGE, False
-        raw_line = line_iter()
+        if use_limit_arg and (eff_max_bytes > 0 or eff_max_line > 0):
+            caps: list[int] = []
+            if eff_max_bytes > 0:
+                caps.append(max(1, eff_max_bytes - total_bytes + 1))
+            if eff_max_line > 0:
+                caps.append(eff_max_line + 1)
+            raw_line = line_iter(min(caps))
+        else:
+            raw_line = line_iter()
         if not raw_line:
             saw_eof = True
             _flush_event()
             break
+        line_nbytes = (
+            len(raw_line)
+            if isinstance(raw_line, (bytes, bytearray, memoryview))
+            else len(str(raw_line).encode("utf-8", errors="replace"))
+        )
+        total_bytes += line_nbytes
+        if eff_max_bytes > 0 and total_bytes > eff_max_bytes:
+            raise _RefinerAttemptError(
+                f"Responses SSE stream exceeded limit of {eff_max_bytes} bytes",
+                retry_kind="never",
+            )
+        if eff_max_line > 0 and line_nbytes > eff_max_line:
+            raise _RefinerAttemptError(
+                f"Responses SSE line exceeded limit of {eff_max_line} bytes",
+                retry_kind="never",
+            )
         line = (
             raw_line.decode("utf-8", errors="replace")
             if isinstance(raw_line, (bytes, bytearray))
@@ -1555,24 +1631,19 @@ class OpenAIResponsesRefiner(BaseRefiner):
         eff = (effort or "").strip().lower()
         if is_codex_subscription:
             if eff in _CONCRETE_RESPONSES_EFFORTS:
-                payload["reasoning"] = {"effort": eff}
+                wire_eff = _resolve_openai_reasoning_effort(model, eff, allow_max=True)
+                if wire_eff is not None:
+                    payload["reasoning"] = {"effort": wire_eff}
         elif self.provider_name == "openrouter":
-            if eff == "default":
-                pass
-            elif _openrouter_reasoning_mandatory(model):
-                payload["reasoning"] = {
-                    "effort": "minimal"
-                    if eff in ("", "auto", "none")
-                    else ("xhigh" if eff == "max" else eff)
-                }
-            elif eff == "auto":
-                if _is_openrouter_thinking_model(model):
-                    payload["reasoning"] = {"effort": "none"}
-            elif eff in _CONCRETE_RESPONSES_EFFORTS:
-                payload["reasoning"] = {"effort": "xhigh" if eff == "max" else eff}
-        elif eff in _CONCRETE_RESPONSES_EFFORTS and _is_openai_reasoning_model(model):
-            wire_eff = "xhigh" if (eff == "max" and self.provider_name in ("openai", "codex")) else eff
-            payload["reasoning"] = {"effort": wire_eff}
+            or_eff = _resolve_openrouter_reasoning_effort(model, eff or "none")
+            if or_eff is not None:
+                payload["reasoning"] = {"effort": or_eff}
+        elif eff in _CONCRETE_RESPONSES_EFFORTS:
+            wire_eff = _resolve_openai_reasoning_effort(
+                model, eff, allow_max=(self.provider_name not in ("openai", "codex"))
+            )
+            if wire_eff is not None:
+                payload["reasoning"] = {"effort": wire_eff}
         return payload
 
     def _execute_streaming_attempt(
@@ -1729,6 +1800,9 @@ class OpenAIResponsesRefiner(BaseRefiner):
                 resp_headers=resp_hdrs,
                 is_cancelled=eff_cancelled,
                 allow_empty_output=allow_empty_output,
+                max_bytes=DEFAULT_MAX_RESPONSE_BYTES,
+                max_line_bytes=DEFAULT_MAX_SSE_LINE_BYTES,
+                supports_limit=True,
             )
             eof_drained = saw_eof and (
                 (bool(getattr(resp, "chunked", False)) and resp.isclosed())
@@ -1780,23 +1854,34 @@ class OpenAIResponsesRefiner(BaseRefiner):
             data, non_json = {}, True
 
         if non_json:
-            err_code, err_msg, classify_data = "", raw_text or f"status {status}", None
+            err_code, err_type, err_msg, classify_data = "", "", raw_text or f"status {status}", None
         else:
             err_dict, err_msg = _extract_responses_http_error(data, raw_text)
             err_code = str(err_dict.get("code") or "").strip()
+            err_type = str(err_dict.get("type") or "").strip()
             classify_data = data if "error" in data else {"error": err_dict}
 
-        excerpt = redact_secrets(err_msg, self.env, cfg=self.cfg, extra_secrets=secrets)[:180]
+        _ = secrets
         rkind, rafter, is_conc = classify_http_failure(
             self.provider_name, status, headers, classify_data, non_json=non_json
         )
+        cat = classify_http_error_category(
+            status,
+            non_json=non_json,
+            error_code=err_code,
+            error_type=err_type,
+            error_message=err_msg,
+            retry_kind=rkind,
+        )
+        model_unsup = _is_codex_model_unsupported_text(status, err_code, f"{err_code} {err_type} {err_msg}")
         raise _RefinerAttemptError(
-            f"HTTP {status}: {excerpt}",
+            format_http_error_summary(status, cat),
             retry_kind=rkind,
             retry_after_sec=rafter,
             is_concurrency_limit=is_conc,
             http_status=status,
             error_code=err_code,
+            model_unsupported=model_unsup,
         )
 
     def _select_request_model(self) -> str:
@@ -1825,9 +1910,8 @@ class OpenAIResponsesRefiner(BaseRefiner):
                 raise ConfigError("refiner.base_url must be explicitly set when refiner.provider is 'openai-compatible'")
             if not model.strip():
                 raise ConfigError("refiner.model must be explicitly set when refiner.provider is 'openai-compatible'")
+        validate_effort_value(self.cfg.refiner.effort, "refiner.effort", allow_empty=True)
         eff = self.cfg.refiner.effective_effort(self.provider_name)
-        if eff not in VALID_EFFORTS:
-            raise ConfigError(f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, got {self.cfg.refiner.effort!r}")
         clean_draft, single_hop = _unpack(asr_input)
         if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
             return NoopRefiner().refine(asr_input, mode=mode)
@@ -2152,21 +2236,28 @@ class CodexRefiner(OpenAIResponsesRefiner):
     def _terminate_proc(proc: subprocess.Popen[bytes] | None) -> None:
         if proc is None:
             return
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            if proc.poll() is not None:
+        pgid = proc.pid
+        for sig, wait_s in ((signal.SIGTERM, 0.15), (signal.SIGKILL, 1.0)):
+            if proc.poll() is not None and not _agy_group_alive(pgid):
                 break
             try:
-                os.killpg(os.getpgid(proc.pid), sig)
-            except OSError:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, PermissionError):
                 try:
-                    proc.kill()
+                    if proc.poll() is None:
+                        proc.send_signal(sig)
                 except OSError:
                     pass
+            dl = time.monotonic() + wait_s
+            while time.monotonic() < dl:
+                if proc.poll() is not None and not _agy_group_alive(pgid):
+                    break
+                time.sleep(0.02)
+        if proc.poll() is None:
             try:
-                proc.wait(timeout=0.35)
-                break
-            except subprocess.TimeoutExpired:
-                continue
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:  # pragma: no cover - unkillable D-state process
+                pass
         for pipe in (proc.stdin, proc.stdout, proc.stderr):
             _close_quietly(pipe)
 
@@ -2220,10 +2311,21 @@ class CodexRefiner(OpenAIResponsesRefiner):
         *,
         timeout_sec: float = CODEX_AUTH_RPC_TIMEOUT_SEC,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> tuple[str, str]:
         """Run one-shot ``codex app-server`` ``initialize`` + ``getAuthStatus(includeToken, refreshToken)``."""
-        if self._closed or (is_cancelled is not None and is_cancelled()):
-            raise RuntimeError("codex refiner closed or cancelled")
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
+
+        def _is_aborted() -> bool:
+            return self._closed or (eff_cancelled is not None and eff_cancelled())
+
+        def _cancel_error(default_msg: str) -> Exception:
+            if cancel_token is not None and cancel_token.is_cancelled() and cancel_token.reason == "timeout":
+                return TimeoutError("codex getAuthStatus timed out")
+            return RuntimeError(default_msg)
+
+        if _is_aborted():
+            raise _cancel_error("codex refiner closed or cancelled")
         cmd = self._build_auth_refresh_cmd()
         proc_env = _clean_env(self.env)
         proc_env.pop("OPENAI_API_KEY", None)
@@ -2251,15 +2353,15 @@ class CodexRefiner(OpenAIResponsesRefiner):
         )
         abort_now = False
         with self._state_lock:
-            if self._closed or (is_cancelled is not None and is_cancelled()):
+            if _is_aborted():
                 abort_now = True
             else:
                 self._refresh_procs.add(proc)
         if abort_now:
             self._terminate_proc(proc)
-            raise RuntimeError("codex refiner closed or cancelled")
+            raise _cancel_error("codex refiner closed or cancelled")
 
-        deadline = time.monotonic() + max(0.2, min(CODEX_AUTH_RPC_TIMEOUT_SEC, float(timeout_sec)))
+        deadline = time.monotonic() + max(0.05, min(CODEX_AUTH_RPC_TIMEOUT_SEC, float(timeout_sec)))
         rx_buf = bytearray()
 
         def _send(payload: Mapping[str, Any]) -> None:
@@ -2270,8 +2372,8 @@ class CodexRefiner(OpenAIResponsesRefiner):
 
         def _wait_id(sel: selectors.BaseSelector, stdout_fd: int, expected_id: int) -> dict[str, Any]:
             while True:
-                if self._closed or (is_cancelled is not None and is_cancelled()):
-                    raise RuntimeError("codex auth check cancelled")
+                if _is_aborted():
+                    raise _cancel_error("codex auth check cancelled")
                 while (nl := rx_buf.find(b"\n")) >= 0:
                     raw_line = bytes(rx_buf[:nl]).strip()
                     del rx_buf[: nl + 1]
@@ -2383,12 +2485,14 @@ class CodexRefiner(OpenAIResponsesRefiner):
         *,
         force_refresh: bool = False,
         is_cancelled: Callable[[], bool] | None = None,
+        cancel_token: CancelToken | None = None,
     ) -> _CachedCodexCredentials:
+        eff_cancelled = _combine_cancel_check(is_cancelled, cancel_token)
         while not self._auth_lock.acquire(timeout=0.05):
-            if self._closed or (is_cancelled is not None and is_cancelled()):
+            if self._closed or (eff_cancelled is not None and eff_cancelled()):
                 raise RuntimeError("codex credential resolution cancelled")
         try:
-            if self._closed or (is_cancelled is not None and is_cancelled()):
+            if self._closed or (eff_cancelled is not None and eff_cancelled()):
                 raise RuntimeError("codex credential resolution cancelled")
             auth_path = self._resolve_auth_json_path()
             prev_creds = self._cached_creds
@@ -2480,9 +2584,10 @@ class CodexRefiner(OpenAIResponsesRefiner):
                 rpc_method, rpc_token = self._call_codex_get_auth_status(
                     timeout_sec=min(CODEX_AUTH_RPC_TIMEOUT_SEC, float(self.cfg.refiner.timeout_sec)),
                     is_cancelled=is_cancelled,
+                    cancel_token=cancel_token,
                 )
             except Exception:
-                if self._closed or (is_cancelled is not None and is_cancelled()):
+                if self._closed or (eff_cancelled is not None and eff_cancelled()):
                     raise
                 if still_usable and cur is not None:
                     self._refresh_cooldown_until = self.clock_fn() + CODEX_REFRESH_FAILURE_COOLDOWN_SEC
@@ -2665,6 +2770,7 @@ class GeminiRefiner(_HttpTransportRefiner):
         vocabulary_hints: str = "",
     ) -> RefinerResult:
         model = self.cfg.refiner.effective_model("gemini")
+        validate_effort_value(self.cfg.refiner.effort, "refiner.effort", allow_empty=True)
         gen_cfg = build_gemini_generation_config(
             model, self.cfg.refiner.effective_effort("gemini"), temperature=0.1
         )
@@ -2709,10 +2815,20 @@ class GeminiRefiner(_HttpTransportRefiner):
             except ValueError:
                 data, non_json = {}, True
             if non_json or resp.status != 200 or (data.get("error") and not data.get("candidates")):
-                excerpt = redact_secrets(resp.text(), self.env, cfg=self.cfg, extra_secrets=secrets)[:180]
+                raw_err = data.get("error") if isinstance(data, Mapping) else None
+                err_dict = raw_err if isinstance(raw_err, Mapping) else {}
+                err_code = str(err_dict.get("status") or err_dict.get("code") or "").strip()
+                err_msg = str(err_dict.get("message") or "").strip()
                 rkind, rafter, is_conc = classify_http_failure("gemini", resp.status, resp.headers, data, non_json=non_json)
+                cat = classify_http_error_category(
+                    resp.status,
+                    non_json=non_json,
+                    error_code=err_code,
+                    error_message=err_msg,
+                    retry_kind=rkind,
+                )
                 raise _RefinerAttemptError(
-                    f"HTTP {resp.status}: {excerpt}",
+                    format_http_error_summary(resp.status, cat),
                     retry_kind=rkind,
                     retry_after_sec=rafter,
                     is_concurrency_limit=is_conc,
@@ -2790,9 +2906,8 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
                 raise ConfigError("refiner.base_url must be explicitly set when refiner.provider is 'openai-compatible'")
             if not model.strip():
                 raise ConfigError("refiner.model must be explicitly set when refiner.provider is 'openai-compatible'")
+        validate_effort_value(self.cfg.refiner.effort, "refiner.effort", allow_empty=True)
         eff = self.cfg.refiner.effective_effort(self.provider_name)
-        if eff not in VALID_EFFORTS:
-            raise ConfigError(f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, got {self.cfg.refiner.effort!r}")
         clean_draft, single_hop = _unpack(asr_input)
         if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
             return NoopRefiner().refine(asr_input, mode=mode)
@@ -2872,13 +2987,24 @@ class OpenAICompatibleRefiner(_HttpTransportRefiner):
                 data, non_json = {}, True
             compat_err = None if non_json else extract_openai_compat_error(data)
             if non_json or resp.status != 200 or compat_err is not None:
-                raw_msg = compat_err[1] if compat_err is not None else resp.text()
-                excerpt = redact_secrets(raw_msg, self.env, cfg=self.cfg, extra_secrets=secrets)[:180]
+                raw_err = compat_err[0] if compat_err is not None else (data.get("error") if isinstance(data, Mapping) else None)
+                err_dict = raw_err if isinstance(raw_err, Mapping) else {}
+                err_code = str(err_dict.get("code") or "").strip()
+                err_type = str(err_dict.get("type") or "").strip()
+                raw_msg = compat_err[1] if compat_err is not None else (str(err_dict.get("message") or "") if err_dict else resp.text())
                 rkind, rafter, is_conc = classify_http_failure(
                     self.provider_name, resp.status, resp.headers, data, non_json=non_json
                 )
+                cat = classify_http_error_category(
+                    resp.status,
+                    non_json=non_json,
+                    error_code=err_code,
+                    error_type=err_type,
+                    error_message=raw_msg,
+                    retry_kind=rkind,
+                )
                 raise _RefinerAttemptError(
-                    f"HTTP {resp.status}: {excerpt}",
+                    format_http_error_summary(resp.status, cat),
                     retry_kind=rkind,
                     retry_after_sec=rafter,
                     is_concurrency_limit=is_conc,
@@ -3152,6 +3278,9 @@ def _agy_match_model(requested_model: str, available_models: Sequence[str]) -> t
     )
 
 
+_AGY_EFFORT_ORDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "extra")
+
+
 def _agy_match_effort(
     target_model: str | None,
     effort: str,
@@ -3161,7 +3290,7 @@ def _agy_match_effort(
     config_options: Sequence[Any],
 ) -> str | None:
     req_e = (effort or "").strip().lower()
-    is_passthrough = req_e in ("", "auto", "default")
+    is_passthrough = req_e in ("", "default")
     explicit_concrete = None if is_passthrough else req_e
     if effort_explicit and explicit_concrete and implied_effort:
         if _agy_canonical_effort_token(explicit_concrete) != _agy_canonical_effort_token(implied_effort):
@@ -3179,7 +3308,7 @@ def _agy_match_effort(
     tl_entry = _agy_config_entry(config_options, "thought_level")
     tl_values = _agy_option_values(tl_entry)
     if not tl_values:
-        if desired is None:
+        if desired is None or desired == "none":
             return None
         if target_model and target_model.lower().endswith(f"-{desired}"):
             return None
@@ -3191,6 +3320,11 @@ def _agy_match_effort(
         )
     if desired is None:
         return None
+    if desired == "none":
+        for lvl in _AGY_EFFORT_ORDER:
+            if lvl in tl_values:
+                return lvl
+        return tl_values[0]
     cand = _agy_canonical_effort_token(desired)
     if cand == "xhigh" and "extra" in tl_values and "xhigh" not in tl_values:
         cand = "extra"
@@ -4152,7 +4286,7 @@ class AgyRefiner(BaseRefiner):
                 cancel_token.unregister_abort(abort_hook_id)
             if worker is not None:
                 if not use_reusable:
-                    worker.stop(fast=emergency_kill or _is_aborted())
+                    worker.stop(fast=(not turn_ok) or emergency_kill or _is_aborted())
                 elif not turn_ok or emergency_kill or _is_aborted():
                     self._discard_worker(worker, fast=True)
 
@@ -4245,7 +4379,12 @@ class AgyRefiner(BaseRefiner):
                     self._prewarm_active = max(0, self._prewarm_active - 1)
                     self._prewarm_threads.discard(threading.current_thread())
 
-    def probe_ping(self, *, timeout_sec: float = 5.0) -> tuple[str, int, str]:
+    def probe_ping(
+        self,
+        *,
+        timeout_sec: float = 5.0,
+        cancel_token: CancelToken | None = None,
+    ) -> tuple[str, int, str]:
         """Lightweight ``agy acp`` ``initialize`` handshake probe (zero model prompt / zero quota)."""
         t0 = self.clock_fn()
         agy_bin = find_agy_bin(self.env)
@@ -4259,9 +4398,20 @@ class AgyRefiner(BaseRefiner):
                 timeout_sec=timeout_sec,
                 prompt_text=None,
                 reuse_worker=False,
+                cancel_token=cancel_token,
             )
             ms = _ms(t0, self.clock_fn)
             return "OK", ms, f"OK ({ms}ms, ACP initialize handshake)"
+        except _AgyRpcError as exc:
+            ms = _ms(t0, self.clock_fn)
+            if exc.source == "hard_timeout" or (
+                exc.source == "cancelled"
+                and cancel_token is not None
+                and cancel_token.reason == "timeout"
+            ):
+                return "FAIL", ms, f"FAIL ({ms}ms: agy ACP handshake timed out after {float(timeout_sec):.1f}s)"
+            safe = redact_secrets(str(exc), self.env, cfg=self.cfg)[:160]
+            return "FAIL", ms, f"FAIL ({ms}ms: {safe})"
         except Exception as exc:
             ms = _ms(t0, self.clock_fn)
             safe = redact_secrets(str(exc), self.env, cfg=self.cfg)[:160]
@@ -4281,11 +4431,8 @@ class AgyRefiner(BaseRefiner):
         vocabulary_hints: str = "",
     ) -> RefinerResult:
         requested_model = self.cfg.refiner.effective_model("agy")
+        validate_effort_value(self.cfg.refiner.effort, "refiner.effort", allow_empty=True)
         requested_effort = self.cfg.refiner.effective_effort("agy")
-        if requested_effort not in VALID_EFFORTS:
-            raise ConfigError(
-                f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, got {self.cfg.refiner.effort!r}"
-            )
         clean_draft, single_hop = _unpack(asr_input)
         if not clean_draft or (single_hop and not self.cfg.refiner.force_on_single_hop):
             return NoopRefiner().refine(asr_input, mode=mode)
@@ -4340,7 +4487,7 @@ class AgyRefiner(BaseRefiner):
         prompt_hash = hashlib.sha256(sys_prompt.encode("utf-8")).hexdigest()[:16]
         effort_explicit = self.cfg.refiner.has_explicit_effort("agy")
         effort_key = f"{requested_effort}:{'1' if effort_explicit else '0'}"
-        max_turns = max(0, int(self.cfg.refiner.max_turns_per_thread))
+        max_turns = max(0, int(self.cfg.refiner.session_max_turns))
 
         # Only stateful-resume when an explicit session_key identifies a single session;
         # stateless GUI apps without session_key must never share a conversation thread.
@@ -4649,10 +4796,8 @@ def create_refiner(
                 "refiner.model must be explicitly set when refiner.provider is 'openai-compatible'"
             )
     eff_api = cfg.refiner.effective_api(prov)
-    if prov != "off" and cfg.refiner.effective_effort(prov) not in VALID_EFFORTS:
-        raise ConfigError(
-            f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, got {cfg.refiner.effort!r}"
-        )
+    if prov != "off":
+        validate_effort_value(cfg.refiner.effort, "refiner.effort", allow_empty=True)
     if eff_api == "off":
         return NoopRefiner()
     common_kw: dict[str, Any] = {

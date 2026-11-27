@@ -402,7 +402,7 @@ class ReadEditSeparationLockAndSymlinkTests(unittest.TestCase):
             app_home.mkdir(parents=True, mode=0o700)
             env = {"HOME": str(home)}
 
-            # Real hotwords directory (e.g. inside ~/.harness) with 0755 permissions
+            # Real hotwords directory (e.g. inside an external dotfiles repo) with 0755 permissions
             real_hw_dir = tmp / "harness_hotwords"
             real_hw_dir.mkdir(mode=0o755)
             mode_before = stat.S_IMODE(real_hw_dir.stat().st_mode)
@@ -1324,16 +1324,16 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
                     "total",
                     "kept",
                     "dropped_count",
-                    "stage2_kept",
-                    "stage2_dropped",
                     "used_chars",
                     "max_items",
                     "max_chars",
                     "warnings_count",
                 },
             )
-            self.assertEqual(safe["stage2_kept"], 4)
-            self.assertEqual(safe["stage2_dropped"], 6)
+            self.assertEqual(safe["kept"], 4)
+            self.assertEqual(safe["dropped_count"], 6)
+            self.assertNotIn("stage2_kept", safe)
+            self.assertNotIn("stage2_dropped", safe)
             self.assertTrue(all(isinstance(v, int) for v in safe.values()))
             self.assertNotIn("SecretPersonalTerm", str(safe))
 

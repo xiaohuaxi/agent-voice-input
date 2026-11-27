@@ -54,7 +54,7 @@ _SECTION_HEADER_RE = re.compile(r"^\[([^\[\]]+)\]$")
 _CONFLICT_MARKER_RE = re.compile(r"^(<{7}|\|{7}|={7}|>{7})(?:\s|$)")
 
 # Verified OpenRouter /audio/transcriptions models that accept top-level keyterms[]
-# (see docs/benchmarks/asr-hotwords-and-protocols.md).
+# (protocol-verified against upstream endpoints).
 # Note: deepgram/nova-3 returns HTTP 400 on OpenRouter top-level keyterms and is intentionally excluded;
 # unverified models (e.g. mistralai/voxtral-mini-3b-2507) are excluded until protocol-verified.
 _OPENROUTER_KEYTERMS_MODELS: frozenset[str] = frozenset(
@@ -291,8 +291,6 @@ class Stage2HotwordsBudgetSummary:
             "total": self.total_input,
             "kept": self.kept_count,
             "dropped_count": self.dropped_count,
-            "stage2_kept": self.kept_count,
-            "stage2_dropped": self.dropped_count,
             "used_chars": self.used_chars,
             "max_items": self.max_items,
             "max_chars": self.max_chars,
@@ -316,7 +314,7 @@ class Stage2HotwordsBudgetSummary:
 
 
 # Single source of truth for per-provider ASR hotword quotas (aligned with
-# docs/benchmarks/asr-hotwords-and-protocols.md protocol measurements):
+# per-provider protocol measurements):
 # - Doubao file API contract supports up to 5,000 terms; recall is sharpest around 30-50 terms.
 # - DashScope qwen3-asr-flash hard cap is 10,000 text_tokens (~14,500 chars); 150 terms / 1,800 chars leaves wide headroom.
 # - OpenAI gpt-transcribe supports native keywords[] (50 terms sweet spot; must strip <, >, \r, \n).

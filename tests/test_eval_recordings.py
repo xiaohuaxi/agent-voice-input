@@ -283,7 +283,7 @@ class MetricsAndReplayTests(unittest.TestCase):
             os.utime(r1, (t0 + 10.0, t0 + 10.0))
             os.utime(r2, (t0 + 40.0, t0 + 40.0))
 
-            (host_rt / "telemetry.jsonl").write_text(
+            (host_rt / "diag.jsonl").write_text(
                 "\n".join(
                     json.dumps(r)
                     for r in [
@@ -460,7 +460,7 @@ class MetricsAndReplayTests(unittest.TestCase):
                 "session_key": "",
                 "refiner_provider": "off",
                 "refiner_fallback": "single_hop_passthrough",
-                "asr_ms": 3400,
+                "asr_ms": 6500,
                 "refine_ms": 0,
             },
             is_first_for_session=True,
@@ -468,7 +468,7 @@ class MetricsAndReplayTests(unittest.TestCase):
         self.assertIn("NO_SESSION_CTX", flags_slow)
         self.assertIn("ASR_SLOW", flags_slow)
         self.assertTrue(all(not f.startswith("FALLBACK") for f in flags_slow))
-        # general mode does NOT warn NO_SESSION_CTX; force_on_single_hop keeps 3300ms ASR threshold via is_single_hop_refined
+        # general mode does NOT warn NO_SESSION_CTX; force_on_single_hop keeps 6000ms single-hop ASR threshold via is_single_hop_refined
         flags_gen_sh = diag_mod._diagnose_record_flags(
             {
                 "ok": True,
@@ -516,7 +516,7 @@ class MetricsAndReplayTests(unittest.TestCase):
             r2.write_bytes(_make_voiced_wav(12.0))
             os.utime(r1, (t0 + 10.0, t0 + 10.0))
             os.utime(r2, (t0 + 40.0, t0 + 40.0))
-            (host_rt / "telemetry.jsonl").write_text(
+            (host_rt / "diag.jsonl").write_text(
                 "\n".join(
                     json.dumps(r)
                     for r in [
@@ -629,7 +629,7 @@ class MetricsAndReplayTests(unittest.TestCase):
                 r3 = rec_dir / "rec-20261118-100050-333333.wav"
                 r3.write_bytes(_make_voiced_wav(4.0))
                 os.utime(r3, (t0 + 50.0, t0 + 50.0))
-                (host_rt / "telemetry.jsonl").write_text(
+                (host_rt / "diag.jsonl").write_text(
                     "\n".join(
                         json.dumps(r)
                         for r in [
@@ -706,7 +706,7 @@ class MetricsAndReplayTests(unittest.TestCase):
             seen_rids: list[str] = []
 
             def _make_fake_asr(cfg_arg, *_a, **_kw):
-                rid = cfg_arg.asr.resource_id
+                rid = cfg_arg.asr.doubao_resource_id
 
                 class _SlotAsr:
                     provider_name = "doubao"
@@ -763,9 +763,9 @@ class MetricsAndReplayTests(unittest.TestCase):
                 # Cache WAS reused for the same slot (no extra ASR calls!)
                 self.assertEqual(len(seen_rids), 4)
 
-                # Alias --asr-provider volcengine when config has asr.provider="doubao" preserves config resource_id/doubao_mode!
+                # Alias --asr-provider volcengine when config has asr.provider="doubao" preserves config doubao_resource_id/doubao_mode!
                 cfg_file.write_text(
-                    '[asr]\nprovider = "doubao"\nresource_id = "volc.seedasr.auc"\ndoubao_mode = "submit"\n'
+                    '[asr]\nprovider = "doubao"\ndoubao_resource_id = "volc.seedasr.auc"\ndoubao_mode = "submit"\n'
                     '[refiner]\nprovider = "off"\n',
                     encoding="utf-8",
                 )
@@ -919,7 +919,7 @@ class MetricsAndReplayTests(unittest.TestCase):
             )
 
             env_app = root / "custom_avi_home"
-            rec_dir = env_app / "recordings"
+            rec_dir = env_app / "audio"
             hw_dir = env_app / "hotwords"
             eval_dir = root / "eval_out"
             host_rt = root / "host_rt"

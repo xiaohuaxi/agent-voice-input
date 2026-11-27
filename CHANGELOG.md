@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-27
+
+### Added
+- **Unified `[archive]` local dictation archive & 1:1 short utterance ID**: Consolidated opt-in local audio archiving (`audio/<id>.mp3`, `archive.save_audio = false`, `archive.audio_max_count = 1000` with `0` unlimited) and new monthly 12-field pure-transcript logs (`transcripts/YYYY-MM.jsonl`, `archive.save_transcripts = false`, secret-redacted and never recording context, hotwords, or credentials) under `[archive]`; linked `audio/`, `transcripts/`, and `diag.jsonl` 1:1 via short utterance IDs (`YYYYMMDD-HHMMSS-<4hex>`) with unified local-timezone ISO-8601 `ts` timestamps and `Archive:` summaries in `start`/`status`/`doctor`.
+- **Synchronous cold-start preflight & model-level `doctor --ping`**: Added fast non-blocking cold-start preflight checks in `start` (emitting concise `WARN` + `Fix:` rows without blocking startup) and upgraded `doctor --ping` to verify configured target models against provider model lists (catching invalid credentials and unenabled/missing models while avoiding false positives on dedicated STT endpoints and paginated responses).
+- **Non-intrusive refiner-fallback HUD toast (`refiner_fallback`)**: Displayed a bilingual warning HUD toast on macOS and Windows whenever Stage 2 refinement fails and falls back to the raw ASR draft, distinguishing auth, quota/rate-limit, model, timeout, and generic failures without interrupting text delivery.
+- **Unified release/package verification gate (`scripts/check_package.py`)**: Added a pure-stdlib verification script enforcing version sync (`pyproject.toml`, `__init__.py`, `CHANGELOG.md`, and release tags), strict 7-bit ASCII on `win_shim.ps1` / `win_shim/*.cs`, and clean sdist/wheel contents; wired it across `ci.yml` and `publish.yml` alongside mandatory `macos-shim-check` and `win-shim-check` gates before PyPI OIDC publishing and GitHub Release creation.
+
+### Changed
+- **Human-readable `status`, `toggle`, and `cancel` output (`--json` opt-in)**: Made `status`, `toggle`, and `cancel` print concise human-readable summaries by default while preserving structured output behind `--json`, reflecting live daemon `--hotkey` overrides in `status` and normalizing `hotwords` status counts to the canonical 7-key schema.
+- **Local diagnostic log renamed to `diag.jsonl` (zero "telemetry" wording)**: Renamed runtime `telemetry.jsonl` to `diag.jsonl` (with read-only legacy fallback on upgrade) and replaced all "telemetry" references across CLI output, documentation, and skills with local diagnostics terminology.
+- **Strict `effort` contract with per-model clamping**: Removed `"auto"` from `[asr].effort` / `[refiner].effort` (empty `""` selects the recommended default, `"default"` defers to provider defaults) and enforced per-model lower/upper bounds across Codex, OpenAI, Gemini, DashScope, DeepSeek, Ark, and OpenRouter.
+- **MacBook zero-`init` `RCommand` default & finalized config schema**: Defaulted MacBook built-in keyboards to `RCommand` at runtime even without running `init` (keeping `RControl` on desktop Macs and Windows/WSL2, with explicit config and `--hotkey` always taking precedence); renamed `[refiner].prompt` to `[refiner].extra_instructions`, `[asr].resource_id` to `[asr].doubao_resource_id`, and `[refiner].max_turns_per_thread` to `[refiner].session_max_turns`; added BCP 47 `ui.language` tag compatibility (e.g. `zh-CN`, `en-US`); streamlined `init` templates and reorganized `config.example.toml`.
+- **Safer `init --force` & surgical `integrate`**: Protected existing `.env` credentials (and `.gitignore`) from being overwritten by `init --force`; upgraded `integrate` to patch and remove only managed hook entries without disturbing unrelated user hooks and to auto-upgrade `/usr/local/bin/agent-voice-input` wrapper symlinks.
+
+### Fixed
+- **macOS SSH zero-frame capture & hardened `stop` lifecycle**: Fixed macOS SSH / zero-frame audio capture handling and diagnostics, and hardened `stop` with bounded `SIGKILL` escalation for hung daemons plus `expected_pid` verification on `shutdown` to prevent PID-reuse or generation-swap mis-kills.
+- **Transport, audio, socket & cross-platform boundary hardening**: Enforced a 16 MiB HTTP response size cap, preserved the original WAV on `ffmpeg` transcode timeouts instead of dropping audio, added pre-bind Unix control-socket byte-length validation, fixed WSL2 strict ASCII locale path decoding, and converted `pyproject.toml` authors to `[[project.authors]]` for Python 3.10 stdlib TOML fallback compatibility.
+
+### Removed
+- **Legacy `[hotkey].only_in_terminals`, `[audio].wsl_source = "winmm"`, and `[audio].save_recordings*`**: Removed deprecated `hotkey.only_in_terminals` (use `hotkey.scope = "terminals"`), `audio.wsl_source = "winmm"` (use `"auto"` / `"wasapi"` / `"pulse"`), and `audio.save_recordings` / `audio.save_recordings_max_count` (moved to `[archive]`), each emitting clear migration errors if still present in `config.toml`.
+
 ## [0.17.0] - 2026-11-27
 
 ### Added

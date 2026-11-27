@@ -38,7 +38,7 @@ from .audio_proc import (
     inspect_wav_chunks,
     process_wav,
     save_failed_audio,
-    spawn_recording_archive,
+    spawn_utterance_archive,
     wait_recording_archives,
 )
 from .config import (
@@ -46,13 +46,16 @@ from .config import (
     Config,
     ProviderCredentials,
     redact_secrets,
+    resolve_archive_audio_dir,
+    resolve_archive_transcripts_dir,
     resolve_credentials,
-    resolve_saved_recordings_dir,
 )
 from .control_ipc import (
     _has_window_fields,
     _parse_optional_timeout_sec,
     _resolve_control_origin_window,
+    format_local_iso_ts,
+    generate_utterance_id,
 )
 from .hotwords import (
     format_stage2_vocabulary_hints,
@@ -185,6 +188,8 @@ class PipelineResult:
     mode: str = "agent"
     ctx_fallback: str = ""
     workspace_cwd: str = ""
+    utterance_id: str = ""
+    record_ts_iso: str = ""
 
 
 def _derive_delivery_status(res: PipelineResult, *, dry_run: bool) -> str:
@@ -211,7 +216,7 @@ def build_pipeline_summary(
     queue_wait_ms: int | None = None,
     redact_fn: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
-    """Build a strictly text-free, secret-redacted numeric summary for status & telemetry.jsonl."""
+    """Build a strictly text-free, secret-redacted numeric summary for status & diag.jsonl."""
     clean_str = redact_fn if redact_fn is not None else (lambda s: redact_secrets(s))
     in_tok = res.refined.input_tokens if res.refined else None
     cached_tok = res.refined.cached_input_tokens if res.refined else None
@@ -219,7 +224,8 @@ def build_pipeline_summary(
     rsn_tok = res.refined.reasoning_tokens if res.refined else None
     eff_q_wait = max(0, int(res.queue_wait_ms if queue_wait_ms is None else queue_wait_ms))
     summary: dict[str, Any] = {
-        "ts": round(time.time(), 6),
+        "id": res.utterance_id or generate_utterance_id(),
+        "ts": res.record_ts_iso or format_local_iso_ts(),
         "seq_id": seq_id,
         "ok": res.ok,
         "skipped_reason": res.skipped_reason,
@@ -741,6 +747,9 @@ class _Stage1State:
     claude_promoted_sid: str = ""
     claude_promoted_route_id: str = ""
     agy_bound_sid: str = ""
+    utterance_id: str = ""
+    record_ts: float = 0.0
+    record_ts_iso: str = ""
 
 
 def _make_desktop_same_window_verifier(
@@ -899,7 +908,150 @@ def _make_pipeline_result(
         mode=st.eff_mode,
         ctx_fallback=eff_ctx_fb,
         workspace_cwd=st.workspace_cwd,
+        utterance_id=st.utterance_id,
+        record_ts_iso=st.record_ts_iso,
     )
+
+
+def _build_transcript_archive_record(
+    res: PipelineResult,
+    *,
+    utterance_id: str,
+    ts_iso: str,
+) -> dict[str, Any]:
+    """Build the canonical 12-field flat transcript record (strictly zero context/hotwords/secrets)."""
+    asr_res = res.asr
+    ref_res = res.refined
+    asr_provider = (asr_res.provider if asr_res else "").strip()
+    asr_model = (asr_res.model if asr_res else "").strip()
+    asr_draft = asr_res.text.strip() if asr_res else ""
+    ref_prov_low = (ref_res.provider if ref_res else "").strip().lower()
+    is_single_hop = bool(
+        asr_res
+        and asr_res.is_single_hop_refined
+        and (
+            ref_res is None
+            or ref_res.used_fallback == "single_hop_passthrough"
+            or ref_prov_low in ("", "off", "none")
+        )
+    )
+    if is_single_hop:
+        refiner_provider: str | None = None
+        refiner_model: str | None = None
+        refiner_fallback = False
+        draft: str | None = None
+    elif ref_res is None or ref_prov_low in ("", "off", "none"):
+        refiner_provider = None
+        refiner_model = None
+        refiner_fallback = False
+        draft = asr_draft
+    else:
+        refiner_provider = ref_res.provider.strip() or None
+        refiner_model = (ref_res.model or "").strip() or None
+        fb_val = (ref_res.used_fallback or "").strip()
+        refiner_fallback = bool(fb_val and fb_val != "single_hop_passthrough")
+        draft = asr_draft
+
+    return {
+        "id": utterance_id,
+        "ts": ts_iso,
+        "mode": "general" if res.mode == "general" else "agent",
+        "duration_sec": round(float(res.gate.duration_sec), 2) if res.gate is not None else 0.0,
+        "asr_provider": asr_provider,
+        "asr_model": asr_model,
+        "refiner_provider": refiner_provider,
+        "refiner_model": refiner_model,
+        "refiner_fallback": refiner_fallback,
+        "draft": draft,
+        "final": res.final_text.strip(),
+        "audio_file": None,
+    }
+
+
+def _maybe_spawn_utterance_archive(
+    *,
+    cfg: Config,
+    env: Mapping[str, str],
+    raw_wav: bytes | str | Path,
+    st: _Stage1State,
+    res: PipelineResult,
+    audio_source: str,
+    archive_sink: Callable[[threading.Thread], None] | None,
+    creds: ProviderCredentials | None = None,
+    stop_evt: threading.Event | None = None,
+) -> threading.Thread | None:
+    """Spawn one ordered background archive task (audio first -> transcript JSONL) after delivery."""
+    if not (cfg.archive.save_audio or cfg.archive.save_transcripts):
+        return None
+    if audio_source in ("retry", "selftest_wav"):
+        return None
+    if not res.ok or not res.final_text.strip() or res.asr is None:
+        return None
+    if res.asr_missed_chunks > 0 or st.asr_missed_chunks > 0:
+        return None
+    try:
+        rec_ts = st.record_ts if st.record_ts > 0.0 else time.time()
+        uid = res.utterance_id or st.utterance_id or generate_utterance_id(rec_ts)
+        ts_iso = res.record_ts_iso or st.record_ts_iso or format_local_iso_ts(rec_ts)
+
+        arch_bytes = b""
+        audio_dir: Path | None = None
+        if cfg.archive.save_audio:
+            try:
+                if isinstance(raw_wav, (bytes, bytearray, memoryview)):
+                    arch_bytes = bytes(raw_wav)
+                else:
+                    arch_bytes = Path(raw_wav).read_bytes()
+                if not arch_bytes and st.gate is not None and st.gate.wav_bytes:
+                    arch_bytes = st.gate.wav_bytes
+                audio_dir = resolve_archive_audio_dir(env, create=True)
+            except Exception:
+                arch_bytes = b""
+                audio_dir = None
+
+        transcripts_dir: Path | None = None
+        rec = _build_transcript_archive_record(res, utterance_id=uid, ts_iso=ts_iso)
+        if cfg.archive.save_transcripts:
+            eff_creds = creds if creds is not None else resolve_credentials(cfg, env)
+            extra_secrets = tuple(eff_creds.all_secret_values())
+            if rec["draft"] is not None:
+                rec["draft"] = redact_secrets(
+                    rec["draft"], env, cfg=cfg, extra_secrets=extra_secrets
+                )
+            rec["final"] = redact_secrets(
+                rec["final"], env, cfg=cfg, extra_secrets=extra_secrets
+            )
+            try:
+                transcripts_dir = resolve_archive_transcripts_dir(env, create=True)
+            except Exception:
+                transcripts_dir = None
+
+        th = spawn_utterance_archive(
+            utterance_id=uid,
+            record_ts=rec_ts,
+            ts_iso=ts_iso,
+            mode=rec["mode"],
+            duration_sec=rec["duration_sec"],
+            asr_provider=rec["asr_provider"],
+            asr_model=rec["asr_model"],
+            refiner_provider=rec["refiner_provider"],
+            refiner_model=rec["refiner_model"],
+            refiner_fallback=rec["refiner_fallback"],
+            draft=rec["draft"],
+            final=rec["final"],
+            raw_wav_bytes=arch_bytes,
+            save_audio=bool(cfg.archive.save_audio and audio_dir is not None and arch_bytes),
+            save_transcripts=bool(cfg.archive.save_transcripts and transcripts_dir is not None),
+            audio_max_count=cfg.archive.audio_max_count,
+            audio_dir=audio_dir,
+            transcripts_dir=transcripts_dir,
+            stop_evt=stop_evt,
+        )
+        if th is not None and archive_sink is not None:
+            archive_sink(th)
+        return th
+    except Exception:
+        return None
 
 
 def _resolve_stage1_context(
@@ -1182,34 +1334,22 @@ def _execute_stage1(
                 and platform
                 and platform.switch_to_fallback_audio()
             )
-            st.skipped_reason = gate.reason
+            if (
+                gate.all_zero
+                and gate.reason == "silence"
+                and audio_source == "avfoundation"
+                and gate.duration_sec > 0.5
+            ):
+                st.skipped_reason = "mic_no_stream"
+            else:
+                st.skipped_reason = gate.reason
         return
 
     if c_rsn := cancel_reason_fn():
         st.skipped_reason = c_rsn
         return
 
-    if (
-        cfg.audio.save_recordings
-        and audio_source not in ("retry", "selftest_wav")
-        and archive_sink is not None
-    ):
-        try:
-            arch_bytes = (
-                bytes(raw_wav)
-                if isinstance(raw_wav, (bytes, bytearray, memoryview))
-                else (Path(raw_wav).read_bytes() or gate.wav_bytes)
-            )
-            if (
-                arch_th := spawn_recording_archive(
-                    arch_bytes,
-                    resolve_saved_recordings_dir(env, create=True),
-                    max_count=cfg.audio.save_recordings_max_count,
-                )
-            ) is not None:
-                archive_sink(arch_th)
-        except Exception:
-            pass
+    _ = archive_sink
 
     asr_ctx = _resolve_stage1_context(
         st,
@@ -1318,10 +1458,14 @@ def run_pipeline_once(
     stashed_once = False
     stashed_path = ""
     cancel_check = _make_cancel_check(seq_id, is_current_seq, is_cancelled, cancel_token)
+    now_ts = time.time()
     st = _Stage1State(
         t_total0=time.monotonic(),
         queue_wait_ms=queue_wait_ms,
         win=origin_window or ForegroundWindow(),
+        utterance_id=generate_utterance_id(now_ts),
+        record_ts=now_ts,
+        record_ts_iso=format_local_iso_ts(now_ts),
     )
 
     def _cancel_reason() -> str:
@@ -1514,7 +1658,7 @@ def run_pipeline_once(
                 if delivery_failed
                 else ""
             )
-            return _make_pipeline_result(
+            res_done = _make_pipeline_result(
                 seq_id,
                 audio_source,
                 st,
@@ -1526,6 +1670,18 @@ def run_pipeline_once(
                 deliver_ms=deliver_ms,
                 saved_audio=saved_p,
             )
+            if not delivery_failed:
+                _maybe_spawn_utterance_archive(
+                    cfg=cfg,
+                    env=eff_env,
+                    raw_wav=raw_wav,
+                    st=st,
+                    res=res_done,
+                    audio_source=audio_source,
+                    archive_sink=eff_sink,
+                    creds=eff_creds,
+                )
+            return res_done
         except Exception as exc:
             if (c_rsn := _cancel_reason()) in _HARD_CANCEL_REASONS:
                 return _cancel_res(c_rsn)
@@ -1547,7 +1703,7 @@ def run_pipeline_once(
         if owns_tracker and (tr_cl := getattr(eff_tracker, "close", None)) is not None:
             tr_cl()
         if local_archive_threads:
-            wait_recording_archives(local_archive_threads, timeout_sec=2.0)
+            wait_recording_archives(local_archive_threads, timeout_sec=None)
 
 
 def make_isolated_probe_tracker(tracker: Any) -> tuple[Any, bool]:
@@ -1732,6 +1888,12 @@ def classify_skipped_commit_hud(
             eff_sr = "mic_disconnected"
         else:
             hud_st, beep_k = "empty", "error"
+    elif skipped_reason == "mic_no_stream":
+        if recorder_lost:
+            hud_st, hud_dur_ms, beep_k = "mic_disconnected", 2200, ""
+            eff_sr = "mic_disconnected"
+        else:
+            hud_st, beep_k = "mic_no_stream", "error"
     elif skipped_reason == "empty_asr":
         if recorder_lost:
             hud_st, hud_dur_ms, beep_k = "mic_disconnected", 2200, ""
@@ -1752,6 +1914,7 @@ def classify_delivered_commit_hud(
     asr_missed_chunks: int,
     recorder_lost: bool,
     saved_audio: str,
+    refiner_fallback: str = "",
 ) -> tuple[bool, str, str, str]:
     """Return ``(delivery_failed, eff_skipped_reason, hud_state, beep_kind)``."""
     delivery_failed = paste_out is not None and not paste_out.pasted and not paste_out.clipboard
@@ -1774,6 +1937,8 @@ def classify_delivered_commit_hud(
             hud_st = "partial_asr_copied" if saved_audio else "partial_asr_copied_unsaved"
         else:
             hud_st = "partial_asr" if saved_audio else "partial_asr_unsaved"
+    elif refiner_fallback == "asr_draft":
+        hud_st = "refiner_fallback"
     elif copied_only:
         hud_st = "copied"
     else:
@@ -1877,6 +2042,7 @@ def finalize_commit_slot_outcome(
     summarize_fn: Callable[[PipelineResult], dict[str, Any]],
     stash_fn: Callable[[], str],
     deliver_fn: Callable[[Any, str, ForegroundWindow, Callable[[ForegroundWindow], bool] | None], PasteOutcome],
+    on_archive_ready: Callable[[PipelineResult], None] | None = None,
 ) -> tuple[dict[str, Any], str, int, str] | None:
     """Finalize one completed commit slot into ``(summary, hud_state, hud_duration_ms, beep_kind)``."""
     hud_st, hud_dur_ms, beep_k = "", 0, ""
@@ -1918,19 +2084,27 @@ def finalize_commit_slot_outcome(
             sum_err["asr_provider"] = getattr(asr_provider, "provider_name", "")
         if not sum_err["refiner_provider"]:
             sum_err["refiner_provider"] = getattr(refiner, "provider_name", "")
-        return sum_err, "error", 0, ("" if task.recorder_lost else "error")
+        hud_st = "error_retry" if saved_p else "error"
+        return sum_err, hud_st, 0, ("" if task.recorder_lost else "error")
 
     if st.skipped_reason:
         if not task.cancel_token.try_commit():
             return _cancelled_outcome()
         sr = st.skipped_reason
         saved_p = stash_fn() if sr == "empty_asr" else ""
+        skip_err = (
+            "macOS AVFoundation captured all-zero audio frames (>0.5s); check Microphone TCC permission "
+            "and run 'agent-voice-input restart' inside a local macOS terminal (outside SSH/SSH-tmux)"
+            if sr == "mic_no_stream" and task.audio_source == "avfoundation"
+            else ""
+        )
         res_skip = _make_pipeline_result(
             task.seq_id,
             task.audio_source,
             st,
             skipped_reason=sr,
             saved_audio=saved_p,
+            error=skip_err,
         )
         sum_skip = summarize_fn(res_skip)
         eff_sr, hud_st, hud_dur_ms, beep_k = classify_skipped_commit_hud(
@@ -1995,7 +2169,11 @@ def finalize_commit_slot_outcome(
         asr_missed_chunks=st.asr_missed_chunks,
         recorder_lost=task.recorder_lost,
         saved_audio=saved_p,
+        refiner_fallback=(ref_res.used_fallback if ref_res is not None else ""),
     )
+    if hud_st == "refiner_fallback":
+        copied_only = bool(paste_out and not paste_out.pasted and paste_out.clipboard)
+        hud_dur_ms = 4500 if copied_only else 4000
     res_ok = _make_pipeline_result(
         task.seq_id,
         task.audio_source,
@@ -2008,6 +2186,11 @@ def finalize_commit_slot_outcome(
         deliver_ms=deliver_ms,
         saved_audio=saved_p,
     )
+    if not delivery_failed and on_archive_ready is not None:
+        try:
+            on_archive_ready(res_ok)
+        except Exception:
+            pass
     return summarize_fn(res_ok), hud_st, hud_dur_ms, beep_k
 
 
@@ -2033,7 +2216,7 @@ def run_selftest_wav_request(
     alloc_seq_fn: Callable[[bool], int],
     deliver_for_selftest_fn: Callable[..., PasteOutcome],
     build_summary_fn: Callable[[int, PipelineResult, bool], dict[str, Any]],
-    record_telemetry_fn: Callable[[dict[str, Any]], None],
+    record_diag_fn: Callable[[dict[str, Any]], None],
 ) -> dict[str, Any]:
     """Execute ``selftest_wav`` with bounded cancellation/deadline wiring."""
     req_cancel = CancelToken()
@@ -2081,8 +2264,8 @@ def run_selftest_wav_request(
                 "pasted": False,
                 "clipboard": False,
             }
-        no_telemetry = req.get("no_telemetry") is True
-        cur_seq = alloc_seq_fn(no_telemetry)
+        no_diag = req.get("no_diag") is True or req.get("no_telemetry") is True
+        cur_seq = alloc_seq_fn(no_diag)
         deliver_hook = (
             (lambda text, **kw: deliver_for_selftest_fn(text, cancel_token=req_cancel, **kw))
             if deliver
@@ -2110,8 +2293,8 @@ def run_selftest_wav_request(
             isolate_refiner_session=True,
         )
         summary = build_summary_fn(cur_seq, res, not deliver)
-        if not no_telemetry and not stop_evt.is_set():
-            record_telemetry_fn(summary)
+        if not no_diag and not stop_evt.is_set():
+            record_diag_fn(summary)
         return format_selftest_wav_response(cur_seq, res, summary)
     finally:
         if deadline_timer is not None:
@@ -2155,21 +2338,25 @@ def plan_commit_hud_calls(
         if hud_st == "copied":
             hud_calls.append(("copied", copied_hud_text, hud_dur_ms, "toast", False, None, 0))
         elif hud_st and is_toast_hud_state(hud_st):
-            hud_calls.append((hud_st, "", hud_dur_ms, None, False, None, 0))
+            hud_calls.append(
+                (hud_st, copied_hud_text if hud_st == "refiner_fallback" else "", hud_dur_ms, None, False, None, 0)
+            )
     elif next_vis_stage:
         if main_hud_state != next_vis_stage:
             hud_calls.append((next_vis_stage, "", 0, None, None, None, 0))
         if hud_st == "copied":
             hud_calls.append(("copied", copied_hud_text, hud_dur_ms, "toast", False, None, 0))
         elif hud_st and is_toast_hud_state(hud_st):
-            hud_calls.append((hud_st, "", hud_dur_ms, None, False, None, 0))
+            hud_calls.append(
+                (hud_st, copied_hud_text if hud_st == "refiner_fallback" else "", hud_dur_ms, None, False, None, 0)
+            )
         play_beep = beep_k
     else:
         if hud_st:
             hud_calls.append(
                 (
                     hud_st,
-                    copied_hud_text if hud_st == "copied" else "",
+                    copied_hud_text if hud_st in ("copied", "refiner_fallback") else "",
                     hud_dur_ms,
                     None,
                     True if is_toast_hud_state(hud_st) else None,

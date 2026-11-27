@@ -1,121 +1,157 @@
 # agent-voice-input example configuration
 # Default location: ~/.agent-voice-input/config.toml (override app home via AGENT_VOICE_INPUT_HOME)
 # Priority: CLI flags > config.toml > built-in defaults
-# Specify a custom config file via --config / AGENT_VOICE_INPUT_CONFIG (credentials still load from <app_home>/.env)
+# Custom path: --config / AGENT_VOICE_INPUT_CONFIG (credentials still load from <app_home>/.env)
+#
+# Layout:
+#   - Common options are active (uncommented) at the top of each section with built-in defaults.
+#   - Advanced tuning options are commented out under each section; uncomment only when needed.
 
+
+# =============================================================================
+# [hotkey] Trigger key, mode, scope & remote-desktop yielding
+# =============================================================================
 [hotkey]
 # Global hotkey:
-# - Windows/WSL2: RControl (default Right Ctrl, 0xA3) | RAlt | RShift | CapsLock | F1..F24 | 0xNN
-# - macOS: RControl (default Right Ctrl, 0x3E / NX_DEVICERCTLKEYMASK) | LControl | ROption/RAlt | RCommand | Fn | F1..F20 | 0xNN
-#   (Note: MacBook built-in keyboards lack a Right Ctrl key — macOS laptop users can set "ROption" or "Fn")
+# - Without config.toml (or when `key` is omitted), runtime automatically defaults to "RCommand" on
+#   MacBook built-in keyboards and "RControl" on desktop Macs & Windows/WSL2; an explicit `key` here
+#   (or CLI `--hotkey`) strictly takes precedence.
+# - Windows/WSL2: RControl (Right Ctrl, 0xA3) | RAlt | RShift | CapsLock | F1..F24 | 0xNN
+# - macOS: RControl (Right Ctrl, 0x3E) | LControl | RCommand | ROption/RAlt | Fn | F1..F20 | 0xNN
+#   (macOS pitfalls: "ROption" conflicts with Doubao IME; "Fn" conflicts with the macOS Globe key unless
+#    System Settings -> Keyboard -> "Press 🌐 key to" is set to "Do Nothing"; "RShift" conflicts with Chinese IME toggle.)
 key = "RControl"
+
 # Trigger mode:
-# - "tap_toggle": isolated short tap (<= tap_max_ms) toggles recording start/stop (or starts a back-to-back recording while refining);
-#                 holding the hotkey alone for hold_cancel_ms triggers layered cancel immediately without waiting for release (chords like RControl+C pass through untouched)
+# - "tap_toggle": isolated short tap (<= tap_max_ms) toggles recording start/stop (or starts a back-to-back clip while refining);
+#                 holding alone for hold_cancel_ms triggers layered cancel immediately (chords like RControl+C pass through untouched)
 # - "ptt": push-to-talk (hold to speak, release to transcribe; pressing another key cancels)
 trigger_mode = "tap_toggle"
-# Maximum isolated tap duration in ms for "tap_toggle" (default 500ms; 500ms..hold_cancel_ms is a silent hesitation deadzone)
-# tap_max_ms = 500
-# Hold-to-cancel threshold in ms for "tap_toggle" (default 800ms, fires immediately while held with a 250ms preview hint; set 0 to disable)
-# hold_cancel_ms = 800
-# debounce_ms = 180
-# Hotkey activation scope for starting new recordings (stopping/canceling an active recording works from any window):
-# - "all" (default): dictate anywhere (terminals bind to active CLI session; IDEs use isolated coding mode; general apps use everyday prose mode)
+
+# Scope for starting new recordings (stopping/canceling an active recording works from any window):
+# - "all" (default): dictate anywhere (terminals bind to active CLI session; IDEs use workspace context; general apps use prose mode)
 # - "coding": start only in terminals and code editors / IDEs
-# - "terminals": start only in allowed terminal emulators (legacy `only_in_terminals = true/false` remains supported)
+# - "terminals": start only in supported terminal emulators
 scope = "all"
-# Yield hotkey silently when a remote desktop / streaming / VM client window is focused so the remote host can handle it
-# (Note: Windows excludes bare "msrdc" by default to protect Win11 WSLg Linux GUI apps; AVD/W365 users not using WSLg can add "msrdc" to ignore_apps)
+
+# Yield hotkey silently when a remote desktop / streaming / VM client window is focused
+# (Windows excludes bare "msrdc" by default to protect Win11 WSLg; non-WSLg AVD/W365 users can add "msrdc" to ignore_apps)
 yield_remote_desktop = true
-# Extra process names or macOS bundle IDs (supports trailing "*" prefix match) where new hotkey recordings should be ignored:
+
+# Extra process names or macOS bundle IDs (supports trailing "*" prefix match) where new triggers are ignored
 ignore_apps = []
 
+# --- Advanced tuning (uncomment to override) ---
+
+# Maximum isolated tap duration in ms for "tap_toggle" (500ms..hold_cancel_ms is a silent hesitation deadzone)
+# tap_max_ms = 500
+
+# Hold-to-cancel threshold in ms for "tap_toggle" (fires while held with a 250ms preview hint; 0 disables)
+# hold_cancel_ms = 800
+
+# Debounce interval in ms between consecutive hotkey edges
+# debounce_ms = 180
+
+
+# =============================================================================
+# [ui] Desktop HUD pill appearance
+# =============================================================================
 [ui]
-# Desktop HUD pill language: "auto" (follows Windows UI language on WSL2 or desktop/POSIX locale on macOS/Linux; falls back to "en") | "zh" | "en"
+# HUD pill language: "auto" (follows OS/POSIX locale; falls back to "en") | "zh" | "en"
+# Also accepts standard BCP 47 language tags such as "zh-CN", "zh-TW", "en-US", "en-GB".
 language = "auto"
-# Desktop HUD pill vertical position: "bottom" (default, above Dock/taskbar) | "top"
+
+# HUD pill vertical position: "bottom" (above Dock/taskbar) | "top"
 position = "bottom"
 
-[audio]
-# Silence gate & RMS loudness normalization (pure stdlib; blocks accidental empty triggers before hitting cloud APIs)
-# floor_dbfs = -50.0
-# target_dbfs = -20.0
-# max_gain_db = 40.0
-# min_duration_sec = 0.3
-# min_voiced_sec = 0.1
-# Maximum single recording duration in seconds (default 600s = 10 minutes; HUD shows countdown in the final 15s and auto-finishes transcription; set 0 to disable)
-# max_duration_sec = 600.0
-# WSL2 capture source: "auto" (defaults to resident win_shim Windows WASAPI 16 kHz capture, avoiding WSLg RDPSource zero-packet deadlocks) | "wasapi" | "winmm" | "pulse"
-wsl_source = "auto"
-# macOS AVFoundation audio input device: "default" (system default mic) | device index e.g. "0" | device name
-macos_device = "default"
-# Start/stop audio cue is disabled by default to avoid 1-2s RDP audio wake-up lag; enable locally if desired
-beep = false
-# Tail drain seconds after stopping recording (auto-adapts by platform when unset: 0.65s on WSL2/RDP, 0.20s on macOS)
-# tail_drain_sec = 0.65
-# Optional local MP3 ring archive of valid voiced recordings under ~/.agent-voice-input/recordings/ (16 kHz mono 64 kbps, 0600 mode, off by default)
-# save_recordings = false
-# save_recordings_max_count = 300
-# Pre-ASR long-pause & leading/trailing silence compression (pure stdlib; bypassed for <4s clips, <1s total savings, and retry):
-# - "balanced" (default): compresses pauses >= 1.2s to ~0.6s (incl. 10ms crossfade) and trims excess leading/trailing silence
-# - "conservative": compresses pauses >= 1.6s to ~0.8s (incl. 10ms crossfade) with wider leading/trailing margins
-# - "off": disable silence trimming
-# silence_trim = "balanced"
 
+# =============================================================================
+# [archive] Opt-in local dictation history (both off by default)
+# =============================================================================
+[archive]
+# Both archives live under ~/.agent-voice-input/ with 0700 dirs & 0600 files (ignored by default .gitignore)
+# and share a 1:1 short utterance ID (`YYYYMMDD-HHMMSS-<4hex>`) with diag.jsonl (which never stores spoken text).
+
+# Append 12-field JSONL records (draft + final text + metadata, never session context/hotwords/secrets)
+# to ~/.agent-voice-input/transcripts/YYYY-MM.jsonl (unlimited)
+save_transcripts = false
+
+# Archive valid voiced clips as 16 kHz mono 64 kbps MP3 to ~/.agent-voice-input/audio/<id>.mp3
+save_audio = false
+
+# Rolling audio archive retention count (0 disables automatic pruning)
+audio_max_count = 1000
+
+
+# =============================================================================
+# [asr] Stage 1 speech-to-text (or single-hop multimodal audio)
+# =============================================================================
 [asr]
-# Stage 1 speech-to-text provider:
+# Stage 1 provider:
 # "auto" | "dashscope" | "doubao" | "deepseek" | "openai" | "gemini" | "groq" | "openrouter" | "siliconflow" | "openai-compatible"
-# Cross-stage aliases accepted: "volcengine"/"volc" -> "doubao", "bailian" -> "dashscope"
-# When "auto", selects the first configured credential in priority order:
+# Aliases accepted: "volcengine"/"volc" -> "doubao", "bailian" -> "dashscope"
+# "auto" picks the first configured credential in order:
 #   dashscope -> doubao -> deepseek -> openai -> gemini -> groq -> openrouter -> siliconflow
 provider = "auto"
-# Upstream model ID (kept verbatim; leave empty "" to use the provider's built-in default):
-# - dashscope         -> "qwen3-asr-flash" (dedicated STT; also supports "fun-asr-realtime", "qwen-audio-turbo-latest", or single-hop "qwen3.8-omni-flash")
+
+# Upstream model ID (leave "" for provider default; explicit values pass through verbatim):
+# - dashscope         -> "qwen3-asr-flash" (STT; also supports single-hop "qwen3.8-omni-flash")
 # - doubao            -> "bigmodel"
-# - openrouter        -> "qwen/qwen3-asr-1.7b" (dedicated STT) or e.g. "google/gemini-3.8-flash" / "qwen/qwen3.8-omni-flash" / "openai/gpt-audio-mini" (single-hop chat audio)
-# - gemini            -> "gemini-3.7-flash" (native :generateContent single-hop audio + context refinement; skips Stage 2 by default)
-# - openai            -> "gpt-transcribe" (dedicated STT) or e.g. "gpt-audio-1.5" / "gpt-audio-mini" (single-hop chat audio)
-# - deepseek          -> "deepseek-asr" (official /v1/tools/asr dedicated STT; <=8 MiB / <=120s per chunk; pairs with Stage 2 deepseek-flash)
+# - deepseek          -> "deepseek-asr" (official /v1/tools/asr; <=8 MiB / <=120s per chunk)
+# - openai            -> "gpt-transcribe" (STT; or single-hop "gpt-audio-1.5" / "gpt-audio-mini")
+# - gemini            -> "gemini-3.7-flash" (native :generateContent single-hop; skips Stage 2 by default)
 # - groq              -> "whisper-large-v3-turbo"
+# - openrouter        -> "qwen/qwen3-asr-1.7b" (STT; or single-hop e.g. "google/gemini-3.8-flash")
 # - siliconflow       -> "FunAudioLLM/SenseVoiceSmall"
-# - openai-compatible -> "gpt-4o-mini-transcribe" (requires explicit base_url, e.g. local faster-whisper-server)
+# - openai-compatible -> "gpt-4o-mini-transcribe" (requires explicit base_url)
 model = ""
-# Wire protocol for DashScope / OpenRouter / OpenAI / OpenAI-compatible channels (doubao / gemini / deepseek use fixed native endpoints; keep "auto"):
-# "auto" | "audio-transcriptions" (dedicated STT -> Stage 2) | "chat-completions" (multimodal single-hop audio + 50K cached session context, e.g. OpenAI gpt-audio-1.5 / gpt-audio-mini; skips Stage 2 by default)
-# Note: in coding-agent mode, single-hop audio models send up to refiner.context_max_chars of recent session dialogue to the selected ASR provider.
-# "auto" classifies known STT vs multimodal audio models automatically; for uncataloged models on "openrouter", set api explicitly.
+
+# Wire protocol ("auto" | "audio-transcriptions" | "chat-completions"):
+# - "auto" classifies known STT vs single-hop multimodal models (keep "auto" for doubao / gemini / deepseek).
+# - For uncataloged models on "openrouter", set api explicitly.
 api = "auto"
-# Stage 1 thinking/reasoning budget:
-# "auto" (suppresses default thinking latency on supported multimodal models) | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-effort = "auto"
-# Doubao Speech ASR auth, resource slot & mode:
-# Auth uses single-header DOUBAO_SPEECH_API_KEY (X-Api-Key, no APP_ID needed; legacy DOUBAO_ASR_APP_ID + DOUBAO_ASR_API_KEY dual-header remains compatible when DOUBAO_SPEECH_API_KEY is unset).
-# "auto" prefers low-latency sync flash ("volc.bigasr.auc_turbo") and falls back on first 403 to 2.0 standard ("volc.seedasr.auc") / 1.0 ("volc.bigasr.auc"), caching the granted slot in memory.
-# Set resource_id explicitly (e.g. "volc.bigasr.auc_turbo" or "volc.seedasr.auc") to skip cold-start slot probing; doubao_mode = "submit" | "flash" restricts "auto" probing to that mode.
-resource_id = "auto"
-doubao_mode = "auto"
-# Required when provider = "openai-compatible"; built-in providers resolve base_url automatically
-base_url = ""
-# Optional custom environment variable name holding the Stage 1 API key
-api_key_env = ""
-# Personal hotwords live at ~/.agent-voice-input/hotwords/personal.txt (hot-reloaded on change).
-# Manage via `agent-voice-input hotwords list|add|remove|path`.
+
+# Stage 1 thinking/reasoning budget (applies to single-hop multimodal audio models; ignored by dedicated STT):
+# - "" (default): tool-recommended low-latency "none"
+# - "default": omit thinking params and defer to upstream provider default
+# - Explicit levels: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+effort = ""
+
+# --- Advanced tuning (uncomment to override) ---
+
+# Doubao Speech ASR resource slot & mode (auth uses DOUBAO_SPEECH_API_KEY, or legacy DOUBAO_ASR_APP_ID + DOUBAO_ASR_API_KEY):
+# "auto" prefers sync flash ("volc.bigasr.auc_turbo") and caches fallback to 2.0 ("volc.seedasr.auc") / 1.0 ("volc.bigasr.auc").
+# doubao_resource_id = "auto"
+# doubao_mode = "auto"
+
+# Custom endpoint URL (required when provider = "openai-compatible"; built-in providers resolve automatically)
+# base_url = ""
+
+# Custom environment variable name holding the Stage 1 API key
+# api_key_env = ""
+
+# Request timeout in seconds & same-provider transient retry attempts (0 disables retry)
 # timeout_sec = 60.0
-# Extra retry attempts within the same provider on rate-limit / transient network errors (0 disables retry)
 # max_retries = 2
 
+# Personal hotwords live in ~/.agent-voice-input/hotwords/personal.txt (hot-reloaded).
+# Manage via `agent-voice-input hotwords list|add|remove|path`.
+
+
+# =============================================================================
+# [refiner] Stage 2 context-aware refinement
+# =============================================================================
 [refiner]
-# Stage 2 context-aware refinement provider:
+# Stage 2 provider:
 # "auto" | "codex" | "agy" | "deepseek" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
-# Cross-stage aliases accepted: "doubao"/"volc"/"ark" -> "volcengine", "bailian" -> "dashscope"
-# When "auto" (default), prefers confirmed local `codex` ChatGPT subscription login (zero extra API billing), otherwise selects the first configured credential in order:
+# Aliases accepted: "doubao"/"volc"/"ark" -> "volcengine", "bailian" -> "dashscope"
+# "auto" prefers confirmed local `codex` ChatGPT subscription login (zero extra API billing), then:
 #   deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow
-# (then falls back to Codex keyring / API-key login if present, or cleanly to "off" if no Stage 2 credentials are set).
-# Note: "agy" is explicit opt-in only (never selected by "auto").
-# Built-in default models (used when model = "" or when provider is overridden via CLI without a new model):
-# - codex             -> "gpt-6-luna" (stateless Keep-Alive HTTP /responses reusing local codex login, with automatic public mini-model fallback when internal models are unavailable; never enables Fast mode)
-# - agy               -> "gemini-3.8-flash" (explicit-only local `agy acp` zero-tool text refiner reusing local Antigravity CLI login; default effort = "low", supports stateful prefix-cache resume)
-# - deepseek          -> "deepseek-flash" (official https://api.deepseek.com/v1 with thinking disabled by default)
+# (falls back cleanly to "off" if no Stage 2 credentials exist; "agy" is explicit opt-in only).
+# Built-in default models:
+# - codex             -> "gpt-6-luna" (stateless HTTP /responses; auto-falls back if unavailable on account; never enables Fast mode)
+# - agy               -> "gemini-3.8-flash" (explicit-only local `agy acp` zero-tool text refiner; default effort = "low")
+# - deepseek          -> "deepseek-flash"
 # - dashscope         -> "qwen3.8-flash"
 # - volcengine        -> "doubao-seed-2-0-mini-260428"
 # - openrouter        -> "google/gemini-3.8-flash"
@@ -123,80 +159,128 @@ api_key_env = ""
 # - openai            -> "gpt-6-luna"
 # - groq              -> "llama-3.3-70b-versatile"
 # - siliconflow       -> "Qwen/Qwen2.5-7B-Instruct"
-# - openai-compatible -> requires explicit base_url and model (e.g. local loopback Ollama/vLLM without API key)
-# - off               -> disable Stage 2 refinement
+# - openai-compatible -> requires explicit base_url and model
 provider = "auto"
-# Leave empty "" to use the selected provider's built-in default model above
-model = ""
-# Stage 2 wire protocol:
-# "auto" ("responses" for codex and official openai api.openai.com, "agy-acp" for agy, "gemini" for gemini, "chat-completions" for custom openai base_url and other providers) | "chat-completions" | "responses"
-api = "auto"
-# Stage 2 thinking/reasoning budget (leave empty "" to use the provider default: "low" for codex/agy/openai, "auto" zero-thinking fast mode for other providers):
-# "auto" | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-effort = ""
-# Custom Stage 2 system prompt (leave empty "" to use the built-in adaptive agent/general voice-dictation editor prompts;
-# setting a non-empty prompt overrides both modes).
-# Supports TOML multiline literal strings '''...''' (no backslash escaping needed) or """...""";
-# in agent mode, requests supply read-only <session_reference_log> context blocks (as developer messages on /responses,
-# or leading user blocks on /chat/completions) followed by optional <workspace_git_status>, <asr_draft_to_clean>, and <task_reminder>:
-# prompt = '''
-# You are a stateless, non-conversational voice-dictation text editor, NOT a chat or coding assistant.
-# Fix ASR homophones/typos using <session_reference_log> and <workspace_git_status>, resolve self-corrections,
-# preserve every substantive point and language(s), and output ONLY the cleaned <asr_draft_to_clean>.
-# '''
-prompt = ""
-# Include workspace git status / modified filenames (or clean-worktree core repo filenames) in the final user block (keeps 50K prefix cache intact)
-include_git_status = true
-# Maximum recent session dialogue characters extracted for Stage 2 context (0 disables dialogue history; ~1/4-window eviction)
-context_max_chars = 200000
-# Cold-start fallback when the active coding session is empty/very short (or a workspace has no active session):
-# - "auto" (default): Stage 1 hotwords from recent same-cwd sessions + frozen <=25K prior same-cwd session block for Stage 2 / single-hop (naturally evicted once the new session fills context_max_chars)
-# - "hotwords": Stage 1 technical hotwords from recent same-cwd sessions only (no prior dialogue prose)
-# - "off": disable cold-start prior-session fallback
-cold_start_fallback = "auto"
-# Required when provider = "openai-compatible" (e.g. "http://127.0.0.1:8000/v1"); built-in providers resolve base_url automatically
-base_url = ""
-api_key_env = ""
-# timeout_sec = 90.0
-# Extra retry attempts within the same provider on rate-limit / transient network errors (0 disables retry)
-# max_retries = 2
-# Set true to run Stage 2 refinement even when Stage 1 already performed single-hop multimodal refinement
-force_on_single_hop = false
-# Advanced (currently applies to provider = "agy" only): max stateful thread turns before opening a fresh session
-# (default 0 = no fixed turn cap; threads rotate naturally when the 200K rolling session log evicts or vocabulary_hints changes.
-#  If a single session's log stays unchanged across long dictation bursts, set a positive integer such as 50 to bound thread turns)
-# max_turns_per_thread = 0
 
+# Leave "" to use the selected provider's built-in default model above
+model = ""
+
+# Wire protocol: "auto" ("responses" for codex & official openai, "agy-acp" for agy, "gemini" for gemini, "chat-completions" elsewhere) | "chat-completions" | "responses"
+api = "auto"
+
+# Stage 2 thinking/reasoning budget:
+# - "" (default): "low" for codex / agy / openai, "none" for all other providers
+# - "default": omit thinking params and defer to upstream provider default
+# - Explicit levels: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+effort = ""
+
+# Optional user preferences appended safely after the built-in system prompt (applies to BOTH two-stage
+# refinement and single-hop multimodal ASR; built-in dictation & safety rules remain intact).
+# Accepts a list of short strings, a single string (""), or multiline '''...''' text (max 20 items, 2,000 chars total).
+# Leave empty [] (or "") to keep the built-in prompt byte-for-byte unchanged.
+# extra_instructions = [
+#   "Output Traditional Chinese",
+#   "Keep English technical terms unspaced from Chinese punctuation",
+# ]
+extra_instructions = []
+
+# --- Advanced tuning (uncomment to override) ---
+
+# Include workspace git status / core repo filenames in the final user block (preserves 50K prefix cache)
+# include_git_status = true
+
+# Max recent session dialogue characters extracted for context (0 disables dialogue history; 50K sealed blocks)
+# context_max_chars = 200000
+
+# Cold-start fallback when active coding session is empty/very short:
+# "auto" (hotwords + <=25K frozen prior same-cwd session block) | "hotwords" | "off"
+# cold_start_fallback = "auto"
+
+# Custom endpoint URL (required when provider = "openai-compatible") & custom API key env var
+# base_url = ""
+# api_key_env = ""
+
+# Request timeout in seconds & same-provider transient retry attempts (0 disables retry)
+# timeout_sec = 90.0
+# max_retries = 2
+
+# Run Stage 2 refinement even when Stage 1 already performed single-hop multimodal refinement
+# force_on_single_hop = false
+
+# Applies to provider = "agy" only: max stateful thread turns before opening a fresh session
+# (0 = no fixed turn cap; threads rotate naturally on 200K eviction or vocabulary_hints change)
+# session_max_turns = 0
+
+
+# =============================================================================
+# [audio] Capture source, audio cue & pre-ASR acoustic processing
+# =============================================================================
+[audio]
+# WSL2 capture source: "auto" (resident win_shim Windows WASAPI 16 kHz) | "wasapi" | "pulse"
+wsl_source = "auto"
+
+# macOS AVFoundation input device: "default" (system default mic) | device index e.g. "0" | device name
+macos_device = "default"
+
+# Start/stop audio cue (disabled by default to avoid 1-2s RDP audio wake-up lag)
+beep = false
+
+# --- Advanced tuning (uncomment to override) ---
+
+# Pre-ASR long-pause & leading/trailing silence compression ("balanced" | "conservative" | "off")
+# silence_trim = "balanced"
+
+# Max single recording duration in seconds (HUD counts down in final 15s and auto-finishes; 0 disables)
+# max_duration_sec = 600.0
+
+# Tail drain seconds after stopping recording (auto-adapts when unset: 0.65s on WSL2/RDP, 0.20s on macOS)
+# tail_drain_sec = 0.65
+
+# Silence gate & RMS loudness normalization thresholds (pure stdlib)
+# floor_dbfs = -50.0
+# target_dbfs = -20.0
+# max_gain_db = 40.0
+# min_duration_sec = 0.3
+# min_voiced_sec = 0.1
+
+
+# =============================================================================
+# [remote] Optional zero-install SSH remote Linux session context routing
+# =============================================================================
 [remote]
-# Optional zero-install SSH remote Linux session context routing (no remote daemon, no remote pip install, no remote API keys).
-# Only hosts explicitly listed here may be queried via `ssh ... -- <target> python3 -` (protects against untrusted OSC 2 terminal titles).
-# Even when `hosts = []`, foreground SSH terminals and Remote-SSH IDEs automatically veto local background session crosstalk.
+# Explicit host allowlist for `ssh ... -- <target> python3 -` (zero remote install, zero remote keys).
+# Even when `hosts = []`, foreground SSH terminals & Remote-SSH IDEs automatically block local crosstalk.
 hosts = []
-# Hard post-stop wait cap in milliseconds (recording-start async prefetch hides SSH handshake latency during speech)
-timeout_ms = 400
-# Optional SSH client binary (on WSL2 when keys/1Password live only on Windows, set `ssh_bin = "ssh.exe"`):
+
+# --- Advanced tuning (uncomment to override) ---
+
+# Hard post-stop wait cap in ms (recording-start async prefetch hides SSH latency during speech)
+# timeout_ms = 400
+
+# Custom SSH binary (on WSL2 when SSH keys / 1Password Agent live on Windows, set `ssh_bin = "ssh.exe"`)
 # ssh_bin = "ssh"
-#
-# Advanced multi-alias form (optional, when remote hostname in prompt/[@tag] differs from ~/.ssh/config Host alias):
+
+# Multi-alias host entry (when remote prompt/[@tag] hostname differs from ~/.ssh/config Host alias):
 # [[remote.hosts]]
 # name = "devbox"
 # ssh_target = "my-cloud-gpu-01"
 # aliases = ["gpu01", "ubuntu-prod"]
 # ssh_bin = "ssh"
-# Optional per-host post-stop wait cap in ms (0..10000; overrides [remote].timeout_ms for this host):
 # timeout_ms = 800
 
-# -----------------------------------------------------------------------------
-# Quick Recipes (replace the [asr] / [refiner] values above as needed)
-# -----------------------------------------------------------------------------
-# Recipe 1 — OpenRouter single key (two-stage dedicated STT + fast refiner, using built-in defaults):
+
+# =============================================================================
+# Quick Recipes (adjust [asr] / [refiner] above as needed)
+# =============================================================================
+# Recipe 1 — OpenRouter single key (two-stage STT + fast refiner using built-in defaults):
 #   [asr]
 #   provider = "openrouter"
+#
 #   [refiner]
 #   provider = "openrouter"
 #
-# Recipe 2 — Single-hop multimodal audio + 50K cached session context (DashScope Qwen-Omni or OpenRouter Gemini; skips Stage 2):
+# Recipe 2 — Single-hop multimodal audio + 50K cached session context (skips Stage 2):
 #   [asr]
-#   provider = "dashscope"                      # Or provider = "openrouter" with model = "google/gemini-3.8-flash"
+#   provider = "dashscope"              # Or provider = "openrouter" with model = "google/gemini-3.8-flash"
 #   model = "qwen3.8-omni-flash"
-#   effort = "auto"
+#   # effort = ""                       # Recommended default ("none") already minimizes thinking latency

@@ -9,7 +9,7 @@ clipboard, global hotkey, and host daemon:
   -> Real Stage 2 stateless Refiner (prewarm + prefix-cache hit verification)
   -> Real VoiceInputDaemon UNIX socket IPC & back-to-back serial utterance queue
   -> Real isolated `tmux -L avi-e2e-*` pane buffer paste & capture-pane readback
-  -> CLI `doctor` & `doctor --ping`, non-Git folder context & shallow files, SSH crosstalk veto, `status --history`, `telemetry.jsonl` (0600, zero prose), `failed/` staging, and `diagnose_live.py --json`.
+  -> CLI `doctor` & `doctor --ping`, non-Git folder context & shallow files, SSH crosstalk veto, `status --history`, `diag.jsonl` (0600, zero prose), `failed/` staging, and `diagnose_live.py --json`.
 """
 from __future__ import annotations
 
@@ -57,13 +57,13 @@ from agent_voice_input.config import (  # noqa: E402
     get_runtime_dir,
     load_config,
     redact_secrets,
+    resolve_archive_audio_dir,
     resolve_credentials,
-    resolve_saved_recordings_dir,
 )
 from agent_voice_input.daemon import (  # noqa: E402
-    TELEMETRY_FILENAME,
+    DIAG_FILENAME,
     VoiceInputDaemon,
-    read_telemetry_history,
+    read_diag_history,
     send_control_command,
 )
 from agent_voice_input.hotwords import resolve_personal_hotwords_path  # noqa: E402
@@ -371,8 +371,8 @@ def _create_isolated_session(
             + ("# e2e context chunk padding for deterministic prefix-cache evaluation\n" * 310),
         ),
         (
-            "VoiceInputDaemon 的串行队列和 telemetry.jsonl 脱敏契约是怎么配合的？",
-            "VoiceInputDaemon 在后台 worker 线程按序消费 _utterance_queue，telemetry.jsonl 以 0600 权限仅记录数值分段耗时与 token 计数，绝不落盘用户口述原文。\n"
+            "VoiceInputDaemon 的串行队列和 diag.jsonl 脱敏契约是怎么配合的？",
+            "VoiceInputDaemon 在后台 worker 线程按序消费 _utterance_queue，diag.jsonl 以 0600 权限仅记录数值分段耗时与 token 计数，绝不落盘用户口述原文。\n"
             + ("# e2e daemon serial pipeline reference log padding line\n" * 310),
         ),
     ]
@@ -769,7 +769,7 @@ def main(argv: list[str] | None = None) -> int:
     private_replay_prose: list[str] = []
     host_daemon_info: dict[str, Any] = {"online": False, "shim_ok": None}
     saved_limit = max(0, int(args.saved_limit))
-    host_rec_dir = resolve_saved_recordings_dir(raw_env, create=False)
+    host_rec_dir = resolve_archive_audio_dir(raw_env, create=False)
     host_saved_all = list_saved_recordings(host_rec_dir) if saved_limit > 0 else []
     host_saved_selected = host_saved_all[:saved_limit]
     host_replay_status = ""
@@ -948,10 +948,10 @@ def main(argv: list[str] | None = None) -> int:
 
             daemon_cfg = dataclasses.replace(
                 cfg,
-                audio=dataclasses.replace(
-                    cfg.audio,
-                    save_recordings=True,
-                    save_recordings_max_count=max(10, int(cfg.audio.save_recordings_max_count)),
+                archive=dataclasses.replace(
+                    cfg.archive,
+                    save_audio=True,
+                    audio_max_count=max(10, int(cfg.archive.audio_max_count)),
                 ),
             )
             daemon = VoiceInputDaemon(
@@ -1170,8 +1170,8 @@ def main(argv: list[str] | None = None) -> int:
 
             # Subcheck 5: Isolated MP3 archive roundtrip + optional real saved recordings replay (strict zero-prose privacy!)
             t_mp30 = time.monotonic()
-            daemon.wait_pending_archives(timeout_sec=2.0)
-            iso_rec_dir = resolve_saved_recordings_dir(e2e_env, create=False)
+            daemon.wait_pending_archives(timeout_sec=4.0)
+            iso_rec_dir = resolve_archive_audio_dir(e2e_env, create=False)
             iso_archived = list_saved_recordings(iso_rec_dir)
             iso_mp3_ok = (
                 len(iso_archived) == 3
@@ -1533,7 +1533,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
 
-            # Subcheck 4 (run before final telemetry audit so telemetry + diagnose_live cover both normal & fault records)
+            # Subcheck 4 (run before final diag audit so diag.jsonl + diagnose_live cover both normal & fault records)
             expected_total_records = expected_ok_records
             if not args.skip_fault_check:
                 t_flt0 = time.monotonic()
@@ -1608,9 +1608,9 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
 
-            # Subcheck 3: CLI `status --history` & `telemetry.jsonl` (0600, complete metrics, zero spoken prose)
+            # Subcheck 3: CLI `status --history` & `diag.jsonl` (0600, complete metrics, zero spoken prose)
             t_tel0 = time.monotonic()
-            tel_path = rt_dir / TELEMETRY_FILENAME
+            tel_path = rt_dir / DIAG_FILENAME
             tel_st = os.lstat(tel_path) if tel_path.exists() else None
             tel_mode_0600 = bool(
                 tel_st is not None
@@ -1618,10 +1618,17 @@ def main(argv: list[str] | None = None) -> int:
                 and (tel_st.st_mode & 0o777) == 0o600
             )
             tel_raw_text = tel_path.read_text(encoding="utf-8") if tel_mode_0600 else ""
-            disk_records = read_telemetry_history(rt_dir, limit=50)
+            disk_records = read_diag_history(rt_dir, limit=50)
 
             st_cli_proc = subprocess.run(
-                [sys.executable, str(_REPO_ROOT / "bin" / "agent-voice-input"), "status", "--history", "50"],
+                [
+                    sys.executable,
+                    str(_REPO_ROOT / "bin" / "agent-voice-input"),
+                    "status",
+                    "--history",
+                    "50",
+                    "--json",
+                ],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
@@ -1647,7 +1654,7 @@ def main(argv: list[str] | None = None) -> int:
                 all(k in r for k in required_latency_keys) for r in ok_recs
             )
 
-            # Verify zero spoken prose & zero secrets in telemetry.jsonl and `status --history`
+            # Verify zero spoken prose & zero secrets in diag.jsonl and `status --history`
             forbidden_prose: list[str] = list(private_replay_prose)
             for item in (*utterance_items, non_git_item):
                 forbidden_prose.extend(item.get("probe_phrases", ()))
@@ -1672,7 +1679,7 @@ def main(argv: list[str] | None = None) -> int:
             tel_ms = max(0, int(round((time.monotonic() - t_tel0) * 1000)))
             checks.append(
                 {
-                    "id": "C3_telemetry_privacy_contract",
+                    "id": "C3_diag_privacy_contract",
                     "ok": tel_ok,
                     "elapsed_ms": tel_ms,
                     "detail": (

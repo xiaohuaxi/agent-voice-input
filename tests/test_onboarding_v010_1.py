@@ -230,9 +230,9 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             self.assertEqual(sent_payload["model"], "deepseek-flash")
             self.assertEqual(sent_payload["thinking"], {"type": "disabled"})
 
-            # DeepSeek reasoner slug skips thinking={"type":"disabled"} on effort="auto", while effort="medium" enables thinking
+            # DeepSeek reasoner slug skips thinking={"type":"disabled"} on effort="none", while effort="medium" enables thinking
             p_reasoner: dict[str, object] = {}
-            apply_chat_effort_params(p_reasoner, provider="deepseek", model="deepseek-reasoner", effort="auto")
+            apply_chat_effort_params(p_reasoner, provider="deepseek", model="deepseek-reasoner", effort="none")
             self.assertNotIn("thinking", p_reasoner)
             p_med: dict[str, object] = {}
             apply_chat_effort_params(p_med, provider="deepseek", model="deepseek-flash", effort="medium")
@@ -308,17 +308,17 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
 
             # 1. Static models_cache.json alignment
             cfg_auto = Config()
-            # Absent cache -> internal default gpt-6-luna preserved
+            # Absent cache -> default gpt-6-luna preserved
             self.assertEqual(resolve_codex_default_model(cfg_auto, env), "gpt-6-luna")
 
-            # Cache containing gpt-6-luna -> internal default preserved
+            # Cache containing gpt-6-luna -> default preserved
             (codex_dir / "models_cache.json").write_text(
                 json.dumps({"models": [{"slug": "gpt-5.4-mini"}, {"slug": "gpt-6-luna"}]}),
                 encoding="utf-8",
             )
             self.assertEqual(resolve_codex_default_model(cfg_auto, env), "gpt-6-luna")
 
-            # Public account cache without gpt-6-luna -> picks first matching CODEX_PUBLIC_FALLBACK_MODELS
+            # Account cache without gpt-6-luna -> picks first matching CODEX_PUBLIC_FALLBACK_MODELS
             (codex_dir / "models_cache.json").write_text(
                 json.dumps({"models": [{"slug": "gpt-5-codex"}, {"slug": "gpt-5-codex-mini"}]}),
                 encoding="utf-8",
@@ -1081,7 +1081,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             )
             settings_json.unlink()
 
-            # 1c. Dangling symlink alone MUST NOT match; symlinked dotfiles config (e.g. ~/.harness / Stow / chezmoi) hits cleanly
+            # 1c. Dangling symlink alone MUST NOT match; symlinked dotfiles config (e.g. ~/.dotfiles / Stow / chezmoi) hits cleanly
             dotfiles_dir = root / "dotfiles"
             dotfiles_dir.mkdir(mode=0o700)
             cfg_hooks_json.symlink_to(dotfiles_dir / "missing_dangling.json")
@@ -1133,6 +1133,15 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
             self.assertIn('key = "RControl"', gen_toml)
             self.assertIn("MacBook", gen_toml)
             self.assertIn("ROption", gen_toml)
+            self.assertIn('# effort = ""', gen_toml)
+            init_loaded_cfg, _ = load_config(
+                config_path=home / ".agent-voice-input" / "config.toml",
+                env=env_base,
+                home_dir=home,
+                load_default_env_files=False,
+            )
+            self.assertEqual(init_loaded_cfg.asr.effort, "")
+            self.assertEqual(init_loaded_cfg.refiner.effort, "")
             self.assertIn("Stage 1: Speech Recognition (REQUIRED", gen_env)
             self.assertIn("Stage 2 Only: Optional Refiner", gen_env)
             self.assertIn("codex login", gen_env)
@@ -1167,6 +1176,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                     mock.patch.object(cli_mod.sys, "platform", "linux"),
                     mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
+                    mock.patch.object(cli_mod, "_run_startup_preflight_ping", return_value=[]),
                     mock.patch("sys.stdout", buf),
                 ):
                     rc = cli_mod._cmd_start(parser.parse_args(["start"]), env_in, cfg=cfg_in)
@@ -1264,6 +1274,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                     mock.patch.object(cli_mod.sys, "platform", "linux"),
                     mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
+                    mock.patch.object(cli_mod, "_run_startup_preflight_ping", return_value=[]),
                     mock.patch("sys.stdout", buf),
                     mock.patch("sys.stderr", err_buf),
                 ):
@@ -1721,7 +1732,7 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
             self.assertIn("WASAPI=FAIL (mic_permission:0x80070005)", out_nomic)
             self.assertIn("ms-settings:privacy-microphone", out_nomic)
 
-            # Explicit wsl_source="winmm" with wasapi_ok=False & winmm_devs=1 MUST still fail (no false green)
+            # Explicit wsl_source="wasapi" with wasapi_ok=False & winmm_devs=1 MUST still fail (no false green)
             buf_winmm_fail = io.StringIO()
             with (
                 mock.patch.object(cli_mod.sys, "platform", "linux"),
@@ -1740,7 +1751,7 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
                 mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("sys.stdout", buf_winmm_fail),
             ):
-                self.assertEqual(cli_mod._cmd_doctor(Config(audio=AudioConfig(wsl_source="winmm")), env_wsl), 1)
+                self.assertEqual(cli_mod._cmd_doctor(Config(audio=AudioConfig(wsl_source="wasapi")), env_wsl), 1)
             self.assertIn("WASAPI=FAIL", buf_winmm_fail.getvalue())
 
             # auto + custom AGENT_VOICE_INPUT_PULSE_SOURCE selects Pulse backend & checks custom source (even when RDPSource=False & wasapi_ok=False)
@@ -1984,6 +1995,7 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
                 mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_wsl_slow_ctrl),
                 mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
+                mock.patch.object(cli_mod, "_run_startup_preflight_ping", return_value=[]),
                 mock.patch.object(cli_mod.time, "monotonic", side_effect=lambda: next(wsl_times, 25.0)),
                 mock.patch.object(cli_mod.time, "sleep", return_value=None),
                 mock.patch("sys.stdout", out_wsl_slow),
@@ -2007,6 +2019,7 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
                     mock.patch("agent_voice_input.platform_macos.compile_mac_shim", return_value=(None, "")),
                     mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
+                    mock.patch.object(cli_mod, "_run_startup_preflight_ping", return_value=[]),
                     mock.patch("sys.stdout", out_s),
                     mock.patch("sys.stderr", err_s),
                 ):
@@ -2019,10 +2032,10 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
         import agent_voice_input as pkg_init
         from agent_voice_input.config import parse_toml
 
-        self.assertEqual(pkg_init.__version__, "0.17.0")
+        self.assertEqual(pkg_init.__version__, "0.18.0")
         self.assertNotIn("Two-stage", pkg_init.__doc__ or "")
         pyp = parse_toml((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(pyp["project"]["version"], "0.17.0")
+        self.assertEqual(pyp["project"]["version"], "0.18.0")
         self.assertIn("Development Status :: 4 - Beta", pyp["project"]["classifiers"])
         self.assertNotIn("Two-stage", pyp["project"]["description"])
         for kw in ("antigravity", "agy", "dictation", "tmux"):
@@ -2107,7 +2120,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
 
-            # 1. MacBook without --hotkey -> auto writes ROption + clear note
+            # 1. MacBook without --hotkey -> auto writes RCommand + clear note
             h_mb = root / "macbook"
             h_mb.mkdir()
             env_mb = {"HOME": str(h_mb), "PATH": ""}
@@ -2121,8 +2134,8 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
             ):
                 self.assertEqual(cli_mod.main(["init"]), 0, out_mb.getvalue())
             toml_mb = (h_mb / ".agent-voice-input" / "config.toml").read_text(encoding="utf-8")
-            self.assertIn('key = "ROption"', toml_mb)
-            self.assertIn("Hotkey    ROption (detected MacBook built-in keyboard", out_mb.getvalue())
+            self.assertIn('key = "RCommand"', toml_mb)
+            self.assertIn("Hotkey    RCommand (detected MacBook built-in keyboard", out_mb.getvalue())
             self.assertIn("--hotkey RControl", out_mb.getvalue())
 
             # 2. MacBook with explicit --hotkey RControl + --asr bailian + --refiner off
@@ -2295,7 +2308,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 self.assertEqual(cli_mod._cmd_doctor(Config(), env), 0)
             txt_mb = buf_mb.getvalue()
             self.assertIn("[hotkey]    WARN", txt_mb)
-            self.assertIn("ROption", txt_mb)
+            self.assertIn("RCommand", txt_mb)
             self.assertIn("Next: run 'agent-voice-input start'", txt_mb)
             self.assertIn("hooks=claude, gemini/agy, codex", txt_mb)
 
@@ -2415,21 +2428,22 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                     mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                     mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
+                    mock.patch.object(cli_mod, "_run_startup_preflight_ping", return_value=[]),
                     mock.patch("sys.stdout", buf),
                 ):
                     rc = cli_mod._cmd_start(parser.parse_args(["start"]), env, cfg=cfg_in)
                 self.assertEqual(rc, 0)
                 return buf.getvalue()
 
-            # 1. First start (no telemetry.jsonl) emits Tip with configured hotkey
+            # 1. First start (no diag.jsonl) emits Tip with configured hotkey
             out_first = _run_start(Config(hotkey=HotkeyConfig(key="ROption")))
             self.assertIn(
                 "Tip       tap ROption to test live, or run 'agent-voice-input once --duration 4 --dry-run'",
                 out_first,
             )
 
-            # 2. Subsequent start (telemetry.jsonl exists) suppresses first-run Tip
-            (rt / "telemetry.jsonl").write_text('{"ok": true}\n', encoding="utf-8")
+            # 2. Subsequent start (diag.jsonl exists) suppresses first-run Tip
+            (rt / "diag.jsonl").write_text('{"ok": true}\n', encoding="utf-8")
             out_second = _run_start(Config(hotkey=HotkeyConfig(key="ROption")))
             self.assertNotIn("once --duration 4 --dry-run", out_second)
 
@@ -2619,7 +2633,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
         self.assertIn("> **Tip:**", readme)
 
         pyp = parse_toml((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(pyp["project"]["version"], "0.17.0")
+        self.assertEqual(pyp["project"]["version"], "0.18.0")
         self.assertEqual(
             pyp["project"]["urls"]["Documentation"],
             "https://github.com/xiaohuaxi/agent-voice-input#readme",
@@ -2947,6 +2961,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                     mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                     mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl_degraded),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
+                    mock.patch.object(cli_mod, "_run_startup_preflight_ping", return_value=[]),
                     mock.patch("sys.stdout", out_deg),
                     mock.patch("sys.stderr", err_deg),
                 ):
@@ -3088,6 +3103,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_cold_ctrl),
                 mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
+                mock.patch.object(cli_mod, "_run_startup_preflight_ping", return_value=[]),
                 mock.patch.object(cli_mod.time, "monotonic", side_effect=lambda: next(times_cold, 190.0)),
                 mock.patch.object(cli_mod.time, "sleep", return_value=None),
                 mock.patch("sys.stdout", out_cold),
@@ -3116,6 +3132,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
                 mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_warm_ctrl),
                 mock.patch.object(cli_mod.subprocess, "Popen", return_value=_FakeProc()),
+                mock.patch.object(cli_mod, "_run_startup_preflight_ping", return_value=[]),
                 mock.patch.object(cli_mod.time, "monotonic", side_effect=lambda: next(times_warm, 190.0)),
                 mock.patch.object(cli_mod.time, "sleep", return_value=None),
                 mock.patch("sys.stdout", out_warm),
@@ -3187,7 +3204,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 self.assertIn("Stage 2 / Single-hop wide vocabulary budget", out)
                 self.assertIn("stage2: 0/200 items, 0/3000 chars [OK]", out)
                 self.assertIn("Agent tip:", out)
-                self.assertIn("~/.agent-voice-input/hotwords/personal.txt", out)
+                self.assertIn(str(app_home / "hotwords" / "personal.txt"), out)
 
                 rc, out, err = _run_cli(["hotwords", "list", "--json", "--config", str(cfg_path)], env)
                 self.assertEqual(rc, 0, err)
@@ -3636,8 +3653,6 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                         "total",
                         "kept",
                         "dropped_count",
-                        "stage2_kept",
-                        "stage2_dropped",
                         "used_chars",
                         "max_items",
                         "max_chars",
@@ -3646,8 +3661,8 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(hw_rep["counts"]["kept"], 200)
                 self.assertEqual(hw_rep["counts"]["dropped_count"], 7)
-                self.assertEqual(hw_rep["counts"]["stage2_kept"], 200)
-                self.assertEqual(hw_rep["counts"]["stage2_dropped"], 7)
+                self.assertNotIn("stage2_kept", hw_rep["counts"])
+                self.assertNotIn("stage2_dropped", hw_rep["counts"])
                 self.assertEqual(hw_rep["issues"]["conflict_lines"], [5])
                 self.assertEqual(hw_rep["issues"]["ambiguous_aliases_count"], 1)
                 self.assertEqual(hw_rep["issues"]["legacy_sections_count"], 1)

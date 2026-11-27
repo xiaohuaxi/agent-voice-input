@@ -274,7 +274,6 @@ class SessionState:
         default_factory=lambda: hashlib.blake2b(digest_size=16), repr=False
     )
     clean_turns: list[tuple[str, str]] = field(default_factory=list)
-    luna_synced_idx: int = 0
     generation: int = 0
     codex_saw_item_completed: bool = False
     codex_item_turns: list[tuple[str, str]] = field(default_factory=list)
@@ -313,7 +312,6 @@ _AUTHORITATIVE_DESKTOP_MATCHED_BY: tuple[str, ...] = (
 class SessionSnapshot:
     match: SessionMatch
     clean_turns: tuple[tuple[str, str], ...]
-    luna_synced_idx: int
     generation: int
     git_status: str
     hotwords: tuple[str, ...]
@@ -4589,7 +4587,6 @@ class SessionTracker:
         state.verified_stat = None
         state.prefix_hasher = hashlib.blake2b(digest_size=16)
         state.clean_turns.clear()
-        state.luna_synced_idx = 0
         state.codex_saw_item_completed = False
         state.codex_item_turns.clear()
         state.codex_resp_turns.clear()
@@ -4613,7 +4610,6 @@ class SessionTracker:
                 state.clean_turns.clear()
                 if cp_summary:
                     state.clean_turns.append(("assistant", cp_summary))
-                state.luna_synced_idx = 0
                 state.generation += 1
                 state.cold_start_prior_retired = True
                 state.cold_start_prior_checked = True
@@ -4636,7 +4632,6 @@ class SessionTracker:
             if not _is_claude_sidechain_or_subagent(obj):
                 if obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
                     state.clean_turns.clear()
-                    state.luna_synced_idx = 0
                     state.generation += 1
                     state.claude_just_compacted = True
                     state.claude_seen_audit_ids.clear()
@@ -4645,7 +4640,6 @@ class SessionTracker:
                     return
                 if obj.get("type") == "user" and bool(obj.get("isCompactSummary")):
                     state.clean_turns.clear()
-                    state.luna_synced_idx = 0
                     if not state.claude_just_compacted:
                         state.generation += 1
                     state.claude_just_compacted = False
@@ -4698,7 +4692,6 @@ class SessionTracker:
                 state.codex_item_turns.clear()
                 state.codex_resp_turns = list(seed_turns)
                 state.clean_turns.clear()
-                state.luna_synced_idx = 0
                 state.generation += 1
                 state.cold_start_prior_retired = True
                 state.cold_start_prior_checked = True
@@ -4883,7 +4876,6 @@ class SessionTracker:
             if state.codex_saw_item_completed:
                 if not prev_saw_item and prev_resp_count > 0:
                     # Switched from fallback response_item stream to item_completed stream
-                    state.luna_synced_idx = 0
                     state.generation += 1
                 state.clean_turns = list(state.codex_item_turns)
             else:
@@ -5308,7 +5300,6 @@ class SessionTracker:
                         or eff_max_chars != state.remote_max_chars
                     ):
                         state.generation += 1
-                    state.luna_synced_idx = 0
                     state.clean_turns = new_turns
                 if rem_cwd:
                     state.cwd = rem_cwd
@@ -5553,7 +5544,6 @@ class SessionTracker:
                 return None
             with self._lock:
                 turns_tuple = tuple(state.clean_turns)
-                luna_idx = state.luna_synced_idx
                 gen = state.generation
                 git_status = state.remote_git_status if include_git_info else ""
                 git_hw = _compact_git_hotwords(state.remote_git_hotwords) if include_git_info else []
@@ -5592,7 +5582,6 @@ class SessionTracker:
         return SessionSnapshot(
             match=resolved_match,
             clean_turns=turns_tuple,
-            luna_synced_idx=luna_idx,
             generation=gen,
             git_status=git_status,
             hotwords=merged_hw,
@@ -5661,7 +5650,6 @@ class SessionTracker:
                     jsonl_mtime=_safe_mtime(state.jsonl_path) or eff_match.jsonl_mtime,
                 )
             turns_tuple = tuple(state.clean_turns)
-            luna_idx = state.luna_synced_idx
             gen = state.generation
             boff = state.byte_offset
             state_cli = state.cli
@@ -5790,7 +5778,6 @@ class SessionTracker:
         return SessionSnapshot(
             match=eff_match,
             clean_turns=turns_tuple,
-            luna_synced_idx=luna_idx,
             generation=gen,
             git_status=git_status,
             hotwords=merged_hw,
@@ -6041,49 +6028,6 @@ class SessionTracker:
             allow_prior=False,
         )
         return dialog_chunks, git_ctx
-
-    def get_luna_delta(
-        self,
-        session_key: str,
-        *,
-        full: bool = False,
-        max_chars: int = DEFAULT_REFINER_CONTEXT_MAX_CHARS,
-    ) -> tuple[str, int, int]:
-        """Return ``(context_delta_text, new_synced_idx, generation)`` for Stage 2 Luna thread."""
-        with self._lock:
-            state = self._states.get(session_key)
-            if state is None:
-                return "", 0, 0
-            self._touch_state_locked(session_key)
-            start_idx = 0 if full else min(state.luna_synced_idx, len(state.clean_turns))
-            delta_turns = state.clean_turns[start_idx:]
-            sections: list[str] = []
-            if state.is_remote:
-                git_status, git_hw = state.remote_git_status, list(state.remote_git_hotwords)
-            else:
-                git_status, git_hw = self._get_git_info(state.cwd)
-            if full and state.cwd:
-                sections.append(f"cwd: {state.cwd}")
-            if git_status:
-                sections.append(f"git_status:\n{git_status}")
-            if git_hw:
-                sections.append("changed_files: " + ", ".join(git_hw[:30]))
-            dialog_str = format_turns_text(delta_turns, max_chars=max_chars)
-            if dialog_str:
-                sections.append(f"dialog_delta:\n{dialog_str}")
-            return "\n\n".join(sections), len(state.clean_turns), state.generation
-
-    def mark_luna_synced(
-        self, session_key: str, synced_idx: int, generation: int | None = None
-    ) -> None:
-        with self._lock:
-            state = self._states.get(session_key)
-            if state is None:
-                return
-            self._touch_state_locked(session_key)
-            if generation is not None and state.generation != generation:
-                return
-            state.luna_synced_idx = max(0, min(synced_idx, len(state.clean_turns)))
 
     @staticmethod
     def build_asr_context(

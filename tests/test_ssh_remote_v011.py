@@ -1101,10 +1101,8 @@ aliases = ["gpu01", "prod-linux"]
                     mock.patch("agent_voice_input.session_ctx.read_workspace_shallow_files", side_effect=AssertionError("local scandir touched!")),
                 ):
                     d_chunks, g_ctx = tracker.get_refiner_context(skey)
-                    luna_txt, _, _ = tracker.get_luna_delta(skey, full=True)
                 self.assertIn("remote_only_engine.rs", g_ctx)
                 self.assertNotIn("LOCAL_ONLY_SECRET", g_ctx)
-                self.assertIn("remote_only_engine.rs", luna_txt)
                 self.assertEqual(len(d_chunks), 1)
             finally:
                 tracker.close()

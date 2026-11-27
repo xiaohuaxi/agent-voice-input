@@ -1,4 +1,4 @@
-"""Local IPC (control.sock), daemon lock/PID management, log rotation, and telemetry I/O."""
+"""Local IPC (control.sock), daemon lock/PID management, log rotation, and local diagnostic log I/O."""
 from __future__ import annotations
 
 import errno
@@ -16,11 +16,18 @@ import time
 from typing import Any, Mapping, Sequence
 
 from . import __version__
-from .config import ensure_secure_dir
+from .config import (
+    UTTERANCE_ID_RE,
+    ensure_secure_dir,
+    format_local_iso_ts,
+    generate_utterance_id,
+    parse_diag_ts,
+)
 from .platform_common import ForegroundWindow
 
-TELEMETRY_FILENAME: str = "telemetry.jsonl"
-TELEMETRY_MAX_BYTES: int = 256 * 1024
+DIAG_FILENAME: str = "diag.jsonl"
+_LEGACY_DIAG_FILENAME: str = "telemetry.jsonl"
+DIAG_MAX_BYTES: int = 256 * 1024
 RECENT_RESULTS_MAXLEN: int = 20
 DAEMON_LOG_FILENAME: str = "daemon.log"
 DAEMON_LOG_BACKUP_FILENAME: str = "daemon.log.1"
@@ -203,17 +210,17 @@ def rotate_daemon_log_if_needed(
         return False
 
 
-def append_telemetry_record(
+def append_diag_record(
     runtime_dir: Path,
     record: Mapping[str, Any],
     *,
-    max_bytes: int = TELEMETRY_MAX_BYTES,
+    max_bytes: int = DIAG_MAX_BYTES,
 ) -> None:
-    """Append one pure-numeric JSON record to ``0600`` ``telemetry.jsonl`` with atomic >256KB tail truncation."""
+    """Append one pure-numeric JSON record to ``0600`` ``diag.jsonl`` with atomic >256KB tail truncation."""
     try:
         rt = ensure_secure_dir(runtime_dir)
-        telemetry_path = rt / TELEMETRY_FILENAME
-        lock_path = rt / ".telemetry.lock"
+        diag_path = rt / DIAG_FILENAME
+        lock_path = rt / ".diag.lock"
         line_bytes = (
             json.dumps(dict(record), ensure_ascii=False, separators=(",", ":")) + "\n"
         ).encode("utf-8")
@@ -224,13 +231,13 @@ def append_telemetry_record(
             fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
             try:
                 try:
-                    st_pre = os.lstat(telemetry_path)
+                    st_pre = os.lstat(diag_path)
                     if not stat.S_ISREG(st_pre.st_mode):
                         return
                 except FileNotFoundError:
                     pass
                 afd = os.open(
-                    str(telemetry_path),
+                    str(diag_path),
                     os.O_CREAT | os.O_WRONLY | os.O_APPEND | nofollow,
                     0o600,
                 )
@@ -238,12 +245,12 @@ def append_telemetry_record(
                 with os.fdopen(afd, "wb") as af:
                     af.write(line_bytes)
                     af.flush()
-                st = os.lstat(telemetry_path)
+                st = os.lstat(diag_path)
                 if not stat.S_ISREG(st.st_mode) or st.st_size <= max_bytes:
                     return
                 keep_target = max(1, max_bytes // 2)
                 seek_pos = max(0, st.st_size - keep_target)
-                with open(telemetry_path, "rb") as rf:
+                with open(diag_path, "rb") as rf:
                     if seek_pos > 0:
                         rf.seek(seek_pos)
                     raw_tail = rf.read()
@@ -255,7 +262,7 @@ def append_telemetry_record(
                         tail = line_bytes if len(line_bytes) <= max_bytes else b""
                 else:
                     tail = raw_tail
-                tmp_path = rt / f".{TELEMETRY_FILENAME}.trim.{os.getpid()}.{time.monotonic_ns()}.tmp"
+                tmp_path = rt / f".{DIAG_FILENAME}.trim.{os.getpid()}.{time.monotonic_ns()}.tmp"
                 tfd = os.open(
                     str(tmp_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY | nofollow, 0o600
                 )
@@ -267,7 +274,7 @@ def append_telemetry_record(
                     with tf_obj as tf:
                         tf.write(tail)
                         tf.flush()
-                    os.replace(tmp_path, telemetry_path)
+                    os.replace(tmp_path, diag_path)
                 except Exception:
                     if not closed_tfd:
                         try:
@@ -284,20 +291,24 @@ def append_telemetry_record(
         pass
 
 
-def read_telemetry_history(
+def read_diag_history(
     runtime_dir: Path,
     limit: int = 10,
     *,
-    max_scan_bytes: int = TELEMETRY_MAX_BYTES + 65536,
+    max_scan_bytes: int = DIAG_MAX_BYTES + 65536,
 ) -> list[dict[str, Any]]:
-    """Read up to ``limit`` most recent JSONL telemetry records from ``runtime_dir / telemetry.jsonl``."""
+    """Read up to ``limit`` most recent JSONL records from ``diag.jsonl`` (with read-only legacy fallback)."""
     eff_limit = max(0, int(limit))
     if eff_limit <= 0:
         return []
-    telemetry_path = runtime_dir / TELEMETRY_FILENAME
+    diag_path = runtime_dir / DIAG_FILENAME
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(str(telemetry_path), os.O_RDONLY | nofollow)
+        try:
+            fd = os.open(str(diag_path), os.O_RDONLY | nofollow)
+        except FileNotFoundError:
+            # One-shot read-only compatibility for runtimes upgraded from pre-v0.18.0.
+            fd = os.open(str(runtime_dir / _LEGACY_DIAG_FILENAME), os.O_RDONLY | nofollow)
         with os.fdopen(fd, "rb") as f:
             st = os.fstat(f.fileno())
             if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
@@ -331,24 +342,33 @@ def merge_recent_results(
     disk_items: Sequence[Mapping[str, Any]],
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    """Merge persisted telemetry records with live in-memory ``recent_results`` without duplicates."""
+    """Merge persisted diagnostic records with live in-memory ``recent_results`` without duplicates."""
     eff_limit = max(0, int(limit))
     if eff_limit <= 0:
         return []
     merged: list[dict[str, Any]] = []
-    seen: set[tuple[Any, Any]] = set()
+    seen: set[tuple[Any, ...]] = set()
+
+    def _dedupe_key(d: Mapping[str, Any]) -> tuple[Any, ...] | None:
+        raw_id = d.get("id")
+        if isinstance(raw_id, str) and raw_id.strip():
+            return ("id", raw_id.strip())
+        if d.get("ts") is not None:
+            return ("ts_seq", d.get("ts"), d.get("seq_id"))
+        return None
+
     for rec in disk_items:
         d = dict(rec)
-        key = (d.get("ts"), d.get("seq_id"))
-        if d.get("ts") is not None:
+        key = _dedupe_key(d)
+        if key is not None:
             seen.add(key)
         merged.append(d)
     for rec in mem_items:
         d = dict(rec)
-        key = (d.get("ts"), d.get("seq_id"))
-        if d.get("ts") is not None and key in seen:
+        key = _dedupe_key(d)
+        if key is not None and key in seen:
             continue
-        if d.get("ts") is not None:
+        if key is not None:
             seen.add(key)
         merged.append(d)
     return merged[-eff_limit:]
@@ -500,8 +520,6 @@ _SAFE_HOTWORDS_STATUS_KEYS: tuple[str, ...] = (
     "max_items",
     "max_chars",
     "warnings_count",
-    "stage2_kept",
-    "stage2_dropped",
 )
 
 
@@ -514,11 +532,11 @@ def _sanitize_hotwords_status_counts(raw: Mapping[str, Any] | None) -> dict[str,
         val = raw.get(key)
         if isinstance(val, int) and not isinstance(val, bool):
             out[key] = val
-    # Normalize fallback aliases (e.g., callers passing summary.as_dict()) onto canonical contract keys
+    # Normalize legacy/alias keys (e.g., callers passing summary.as_dict()) onto canonical contract keys
     for dst_key, src_keys in (
         ("total", ("total_input",)),
-        ("stage2_kept", ("kept", "kept_count")),
-        ("stage2_dropped", ("dropped_count",)),
+        ("kept", ("kept_count", "stage2_kept")),
+        ("dropped_count", ("stage2_dropped",)),
     ):
         if dst_key not in out:
             for src_key in src_keys:
@@ -526,6 +544,43 @@ def _sanitize_hotwords_status_counts(raw: Mapping[str, Any] | None) -> dict[str,
                 if isinstance(val, int) and not isinstance(val, bool):
                     out[dst_key] = val
                     break
+    return out if out else None
+
+
+def _sanitize_archive_status(raw: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Whitelist boolean flags and numeric cap for daemon ``status`` (never leaks transcript text)."""
+    if not isinstance(raw, Mapping):
+        return None
+    st_tr = raw.get("save_transcripts")
+    st_au = raw.get("save_audio")
+    st_max = raw.get("audio_max_count")
+    if (
+        not isinstance(st_tr, bool)
+        or not isinstance(st_au, bool)
+        or isinstance(st_max, bool)
+        or not isinstance(st_max, int)
+        or st_max < 0
+    ):
+        return None
+    return {
+        "save_transcripts": st_tr,
+        "save_audio": st_au,
+        "audio_max_count": st_max,
+    }
+
+
+def _sanitize_hotkey_status(raw: Mapping[str, Any] | str | None) -> dict[str, str] | None:
+    """Whitelist safe hotkey summary fields for daemon ``status``."""
+    if isinstance(raw, str):
+        key = raw.strip()
+        return {"key": key} if key else None
+    if not isinstance(raw, Mapping):
+        return None
+    out: dict[str, str] = {}
+    for field in ("key", "trigger_mode", "scope"):
+        val = raw.get(field)
+        if isinstance(val, str) and val.strip():
+            out[field] = val.strip()
     return out if out else None
 
 
@@ -545,6 +600,8 @@ def build_daemon_status_response(
     remote_hosts: Mapping[str, Any] | None,
     mem_recent_results: Sequence[Mapping[str, Any]],
     hotwords: Mapping[str, Any] | None = None,
+    archive: Mapping[str, Any] | None = None,
+    hotkey: Mapping[str, Any] | str | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON-serializable response payload for a ``status`` control command."""
     import copy
@@ -573,8 +630,14 @@ def build_daemon_status_response(
     safe_hw = _sanitize_hotwords_status_counts(hotwords)
     if safe_hw is not None:
         resp["hotwords"] = safe_hw
+    safe_arch = _sanitize_archive_status(archive)
+    if safe_arch is not None:
+        resp["archive"] = safe_arch
+    safe_hk = _sanitize_hotkey_status(hotkey)
+    if safe_hk is not None:
+        resp["hotkey"] = safe_hk
     if want_hist:
-        disk_items = read_telemetry_history(
+        disk_items = read_diag_history(
             runtime_dir, limit=max(hist_limit, RECENT_RESULTS_MAXLEN)
         )
         merged = merge_recent_results(mem_recent_results, disk_items, limit=hist_limit)

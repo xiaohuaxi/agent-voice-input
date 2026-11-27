@@ -3,6 +3,6 @@
 set -u
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 if command -v agent-voice-input >/dev/null 2>&1; then
-    exec agent-voice-input session-hook --cli claude
+    exec agent-voice-input session-hook --cli claude --quiet >/dev/null 2>&1
 fi
 exit 0

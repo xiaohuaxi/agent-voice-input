@@ -36,7 +36,7 @@ from agent_voice_input.config import (  # noqa: E402
 )
 from agent_voice_input.daemon_pipeline import PipelineResult, build_pipeline_summary  # noqa: E402
 from agent_voice_input.diagnose import (  # noqa: E402
-    _TELEMETRY_NUMERIC_FIELDS,
+    _DIAG_NUMERIC_FIELDS,
     diagnose_record_flags,
 )
 from agent_voice_input.http_transport import CancelToken  # noqa: E402
@@ -637,16 +637,36 @@ class TestAgyConfigAndContracts(unittest.TestCase):
                 "gemini-3.8-flash", "high", effort_explicit=True, implied_effort="low", config_options=cfg_opts
             )
         self.assertEqual(cm_conf.exception.source, "config")
-        # Fixed-effort model without thought_level
+        # Fixed-effort / non-thinking model without thought_level: "none" is ignored safely
         self.assertIsNone(
             _agy_match_effort(
                 "gpt-oss-120b-medium", "medium", effort_explicit=True, implied_effort=None, config_options=[]
+            )
+        )
+        self.assertIsNone(
+            _agy_match_effort(
+                "non-thinking-model", "none", effort_explicit=True, implied_effort=None, config_options=[]
             )
         )
         with self.assertRaises(_AgyRpcError):
             _agy_match_effort(
                 "gpt-oss-120b-medium", "high", effort_explicit=True, implied_effort=None, config_options=[]
             )
+        # "none" selects native "none" when supported, or clamps to lowest supported level
+        cfg_with_none = [{"id": "thought_level", "options": [{"value": "none"}, {"value": "low"}, {"value": "high"}]}]
+        self.assertEqual(
+            _agy_match_effort(
+                "gemini-3.8-flash", "none", effort_explicit=True, implied_effort=None, config_options=cfg_with_none
+            ),
+            "none",
+        )
+        cfg_med_only = [{"id": "thought_level", "options": [{"value": "medium"}, {"value": "high"}]}]
+        self.assertEqual(
+            _agy_match_effort(
+                "gemini-3.8-pro", "none", effort_explicit=True, implied_effort=None, config_options=cfg_med_only
+            ),
+            "medium",
+        )
         # xhigh maps to extra when backend only offers extra
         cfg_extra = [{"id": "thought_level", "options": [{"value": "low"}, {"value": "extra"}]}]
         self.assertEqual(
@@ -690,7 +710,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
     def test_full_acp_lifecycle_resume_delta_eviction_max_turns_and_resume_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             rt_dir, log_file, env = self._setup_fake_env(td)
-            cfg = Config(refiner=RefinerConfig(provider="agy", max_turns_per_thread=2))
+            cfg = Config(refiner=RefinerConfig(provider="agy", session_max_turns=2))
             ref = create_refiner(cfg, env=env, runtime_dir=rt_dir)
             self.assertIsInstance(ref, AgyRefiner)
             # Constructor must not eagerly create workdir or spawn subprocesses
@@ -740,7 +760,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                 self.assertEqual(r2.output_tokens, 45)
                 self.assertEqual(r2.reasoning_tokens, 12)
 
-                # Turn 3: hits max_turns_per_thread=2 -> opens fresh session/new
+                # Turn 3: hits session_max_turns=2 -> opens fresh session/new
                 r3 = ref.refine(
                     "第三句轮转",
                     session_key="sess-A",
@@ -978,22 +998,37 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             finally:
                 ref.close()
 
+        def _wait_prompt_inflight(ref_obj: AgyRefiner, log_file: Path, timeout: float = 5.0) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if ref_obj._active_procs and any(
+                    ev.get("event") == "rpc" and ev.get("method") == "session/prompt"
+                    for ev in _read_jsonl(log_file)
+                ):
+                    return True
+                time.sleep(0.01)
+            return False
+
         # 3. CancelToken aborts hanging agy process group quickly
         with tempfile.TemporaryDirectory() as td:
-            rt_dir, _, env = self._setup_fake_env(td, scenario="slow_hang")
+            rt_dir, log_path, env = self._setup_fake_env(td, scenario="slow_hang")
             ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy", timeout_sec=15.0)), env=env, runtime_dir=rt_dir)
             tok = CancelToken()
+            prompt_started = threading.Event()
+            cancel_ts = [0.0]
 
             def _trigger() -> None:
-                time.sleep(0.15)
+                if _wait_prompt_inflight(ref, log_path, timeout=5.0):
+                    prompt_started.set()
+                cancel_ts[0] = time.monotonic()
                 tok.cancel("user_cancelled")
 
             th = threading.Thread(target=_trigger, daemon=True)
-            t0 = time.monotonic()
             th.start()
             try:
                 res = ref.refine("will cancel", cancel_token=tok)
-                elapsed = time.monotonic() - t0
+                elapsed = time.monotonic() - cancel_ts[0] if cancel_ts[0] > 0.0 else 999.0
+                self.assertTrue(prompt_started.is_set(), "fake agy process did not reach session/prompt within 5s")
                 self.assertEqual(res.used_fallback, "user_cancelled")
                 self.assertLess(elapsed, 3.0)
                 self.assertEqual(len(ref._active_procs), 0)
@@ -1003,7 +1038,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
 
         # 4. close() aborts in-flight call and leaves no active processes
         with tempfile.TemporaryDirectory() as td:
-            rt_dir, _, env = self._setup_fake_env(td, scenario="slow_hang")
+            rt_dir, log_path, env = self._setup_fake_env(td, scenario="slow_hang")
             ref = AgyRefiner(Config(refiner=RefinerConfig(provider="agy", timeout_sec=15.0)), env=env, runtime_dir=rt_dir)
             out_box: list = []
 
@@ -1012,7 +1047,10 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
 
             wt = threading.Thread(target=_worker, daemon=True)
             wt.start()
-            time.sleep(0.15)
+            self.assertTrue(
+                _wait_prompt_inflight(ref, log_path, timeout=5.0),
+                "fake agy process did not reach session/prompt within 5s before close()",
+            )
             ref.close()
             wt.join(timeout=3.0)
             self.assertFalse(wt.is_alive())
@@ -1356,7 +1394,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             rt_dir, log_file, env = self._setup_fake_env(td)
             ref = AgyRefiner(
-                Config(refiner=RefinerConfig(provider="agy", max_turns_per_thread=5)),
+                Config(refiner=RefinerConfig(provider="agy", session_max_turns=5)),
                 env=env,
                 runtime_dir=rt_dir,
                 idle_ttl_sec=30.0,
@@ -1935,7 +1973,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             rt_dir, log_file, env = self._setup_fake_env(td)
             tracker = _DynamicTracker()
             ref = AgyRefiner(
-                Config(refiner=RefinerConfig(provider="agy", max_turns_per_thread=4, include_git_status=False)),
+                Config(refiner=RefinerConfig(provider="agy", session_max_turns=4, include_git_status=False)),
                 env=env,
                 runtime_dir=rt_dir,
                 idle_ttl_sec=60.0,
@@ -1977,7 +2015,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
                 self.assertEqual(ref._threads[("sess-inc", "agent")].conversation_id, cid1)
                 self.assertEqual(ref._threads[("sess-inc", "agent")].turn_count, 4)
 
-                # Turn 5 (sess-inc): hits max_turns_per_thread=4 -> MUST open fresh session/new!
+                # Turn 5 (sess-inc): hits session_max_turns=4 -> MUST open fresh session/new!
                 r5 = ref.refine("口述5满轮", session_key="sess-inc", tracker=tracker)  # type: ignore[arg-type]
                 cid2 = ref._threads[("sess-inc", "agent")].conversation_id
                 self.assertEqual(r5.used_fallback, "")
@@ -2017,8 +2055,8 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             self.assertNotIn("新块内容A", prompts_sent[3])
 
     def test_agent_thought_chunk_observability_and_privacy(self) -> None:
-        self.assertIn("thought_chunks", _TELEMETRY_NUMERIC_FIELDS)
-        self.assertIn("thought_chars", _TELEMETRY_NUMERIC_FIELDS)
+        self.assertIn("thought_chunks", _DIAG_NUMERIC_FIELDS)
+        self.assertIn("thought_chars", _DIAG_NUMERIC_FIELDS)
 
         # 1. Normal zero-thought turn: thought_chunks/chars stay 0 and are omitted from telemetry summary
         with tempfile.TemporaryDirectory() as td:
@@ -2100,7 +2138,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             rt_dir, log_file, env = self._setup_fake_env(td)
             cfg = Config(refiner=RefinerConfig(provider="agy", include_git_status=False))
-            self.assertEqual(cfg.refiner.max_turns_per_thread, 0)
+            self.assertEqual(cfg.refiner.session_max_turns, 0)
             ref = AgyRefiner(cfg, env=env, runtime_dir=rt_dir)
             try:
                 for idx in range(1, 23):
@@ -2122,7 +2160,7 @@ class TestAgyRefinerProtocolAndSafety(unittest.TestCase):
             self.assertEqual(len({ev["params"]["sessionId"] for ev in prompt_calls}), 1)
 
         # 2. Leading static <vocabulary_hints> resumes when unchanged, resets when changed,
-        #    and sends on every stateless general turn with session-only telemetry
+        #    and sends on every stateless general turn with session-only diag counts
         with tempfile.TemporaryDirectory() as td:
             rt_dir, log_file, env = self._setup_fake_env(td)
             cfg = Config(refiner=RefinerConfig(provider="agy", include_git_status=False))

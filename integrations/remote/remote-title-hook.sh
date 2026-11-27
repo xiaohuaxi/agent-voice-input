@@ -1,5 +1,7 @@
 #!/bin/sh
 # Lightweight standalone OSC 2 title hook for headless remote Linux hosts without agent-voice-input installed.
+# Format: "<cli> · <dir> [#<8-hex-session-prefix>]" with optional " [@<short-hostname>]" (override host tag via AGENT_VOICE_INPUT_HOST_TAG).
+# Routing & title contract: docs/context-routing.md
 # Usage:
 #   Claude Code (~/.claude/settings.json):  ~/.local/bin/remote-title-hook.sh claude
 #   Antigravity CLI (~/.gemini/config/hooks.json; legacy ~/.gemini/hooks.json): ~/.local/bin/remote-title-hook.sh agy

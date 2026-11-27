@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-voice-input"
-version = "0.17.0"
+version = "0.18.0"
 description = "Context-aware voice input for CLI coding agents and desktop apps (two-stage STT + refiner or single-hop multimodal)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,6 +26,7 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
+    "Intended Audience :: Developers",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
@@ -37,6 +38,9 @@ classifiers = [
     "Topic :: Software Development :: User Interfaces",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
+
+[[project.authors]]
+name = "xiaohuaxi"
 
 [project.urls]
 Homepage = "https://github.com/xiaohuaxi/agent-voice-input"

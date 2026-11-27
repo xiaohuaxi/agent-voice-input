@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,7 +24,10 @@ if str(_SRC_ROOT) not in sys.path:
 
 
 def _is_ci() -> bool:
-    return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+    return (
+        os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+        or os.environ.get("AGENT_VOICE_INPUT_CI_NO_SKIP", "").strip().lower() in {"1", "true", "yes"}
+    )
 
 from agent_voice_input.audio_proc import (  # noqa: E402
     AudioError,
@@ -47,6 +51,7 @@ from agent_voice_input.audio_proc import (  # noqa: E402
 )
 from agent_voice_input.config import (  # noqa: E402
     ASR_AUTO_PRIORITY,
+    ArchiveConfig,
     AudioConfig,
     CREDENTIAL_ENV_ORDER,
     Config,
@@ -77,9 +82,10 @@ from agent_voice_input.config import (  # noqa: E402
     parse_toml,
     redact_secrets,
     resolve_app_home_dir,
+    resolve_archive_audio_dir,
+    resolve_archive_transcripts_dir,
     resolve_asr_api,
     resolve_credentials,
-    resolve_saved_recordings_dir,
     resolve_target_config_paths,
     select_asr_provider,
 )
@@ -278,7 +284,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             bom_json = home / "explicit_bom.json"
             bom_json.write_bytes(
                 b"\xef\xbb\xbf"
-                + json.dumps({"audio": {"wsl_source": "winmm", "beep": False}}).encode("utf-8")
+                + json.dumps({"audio": {"wsl_source": "wasapi", "beep": False}}).encode("utf-8")
             )
             (legacy_dir / "config.json").write_bytes(bom_json.read_bytes())
             (legacy_dir / "voice-input.env").write_text(
@@ -291,7 +297,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertNotIn("GEMINI_API_KEY", default_env)
 
             explicit_cfg, _ = load_config(config_path=bom_json, env={"HOME": str(home)}, home_dir=home)
-            self.assertEqual(explicit_cfg.audio.wsl_source, "winmm")
+            self.assertEqual(explicit_cfg.audio.wsl_source, "wasapi")
             self.assertIs(explicit_cfg.audio.beep, False)
             self.assertEqual(explicit_cfg.config_path, str(bom_json))
 
@@ -324,7 +330,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(merged["API_KEY_ALI"], "from_app_env")
             self.assertNotIn("GEMINI_API_KEY", merged)
 
-            cfg, _ = load_config(env=caller_env, home_dir=home)
+            cfg, _ = load_config(env=caller_env, home_dir=home, is_macbook=False)
             self.assertEqual(cfg.audio.wsl_source, "wasapi")
             self.assertIs(cfg.audio.beep, True)
             # Ordinary config env vars do not override defaults/config.toml
@@ -488,8 +494,9 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                     home_dir=home,
                     cli_overrides={"audio.floor_dbfs": float("nan")},
                 )
-            # All 9 canonical effort levels are accepted on both stages; bogus values raise ConfigError
-            for valid_eff in ("auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"):
+            # All 8 canonical non-empty effort levels plus "" (recommended default) are accepted on both stages;
+            # removed "auto" emits a clear migration error and bogus values raise ConfigError
+            for valid_eff in ("", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"):
                 ok_cfg, _ = load_config(
                     env={"HOME": str(home)},
                     home_dir=home,
@@ -497,6 +504,39 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 )
                 self.assertEqual(ok_cfg.asr.effort, valid_eff)
                 self.assertEqual(ok_cfg.refiner.effort, valid_eff)
+            for auto_raw in ("auto", " AUTO "):
+                with self.assertRaises(ConfigError) as cm_asr_auto:
+                    load_config(
+                        env={"HOME": str(home)},
+                        home_dir=home,
+                        cli_overrides={"asr.effort": auto_raw},
+                    )
+                self.assertIn("removed", str(cm_asr_auto.exception).lower())
+                self.assertIn("none", str(cm_asr_auto.exception).lower())
+                self.assertIn("default", str(cm_asr_auto.exception).lower())
+                with self.assertRaises(ConfigError) as cm_ref_auto:
+                    load_config(
+                        env={"HOME": str(home)},
+                        home_dir=home,
+                        cli_overrides={"refiner.effort": auto_raw},
+                    )
+                self.assertIn("removed", str(cm_ref_auto.exception).lower())
+                self.assertIn("none", str(cm_ref_auto.exception).lower())
+            # Legacy config.toml with effort="auto" fails clearly during load_config
+            legacy_toml = home / "legacy_auto.toml"
+            legacy_toml.write_text('[asr]\neffort = "auto"\n', encoding="utf-8")
+            with self.assertRaises(ConfigError) as cm_legacy_asr:
+                load_config(config_path=legacy_toml, env={"HOME": str(home)}, home_dir=home)
+            self.assertIn("removed", str(cm_legacy_asr.exception).lower())
+            legacy_ref_toml = home / "legacy_ref_auto.toml"
+            legacy_ref_toml.write_text('[refiner]\nprovider = "deepseek"\neffort = "Auto"\n', encoding="utf-8")
+            with self.assertRaises(ConfigError) as cm_legacy_ref:
+                load_config(config_path=legacy_ref_toml, env={"HOME": str(home)}, home_dir=home)
+            self.assertIn("removed", str(cm_legacy_ref.exception).lower())
+            from agent_voice_input.config import validate_effort_value
+
+            with self.assertRaises(ConfigError):
+                validate_effort_value("", "refiner.effort", allow_empty=False)
             with self.assertRaises(ConfigError):
                 load_config(
                     env={"HOME": str(home)},
@@ -787,9 +827,9 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             "openai-compatible",
         )
 
-        # Explicit Doubao resource_id under provider='auto' MUST route to doubao even if DashScope key exists
+        # Explicit Doubao doubao_resource_id under provider='auto' MUST route to doubao even if DashScope key exists
         cfg_db_rid = Config()
-        cfg_db_rid.asr.resource_id = "volc.seedasr.auc"
+        cfg_db_rid.asr.doubao_resource_id = "volc.seedasr.auc"
         self.assertEqual(
             select_asr_provider(
                 cfg_db_rid,
@@ -989,21 +1029,32 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(VALID_ASR_APIS, frozenset({"auto", "audio-transcriptions", "chat-completions"}))
         self.assertEqual(
             VALID_EFFORTS,
-            frozenset({"auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"}),
+            frozenset({"default", "none", "minimal", "low", "medium", "high", "xhigh", "max"}),
         )
 
-        # Default Config uses canonical v0.10-1 auto-routing values without polluting deferred model/effort
+        # Default Config uses canonical auto-routing values without polluting deferred model/effort
         dcfg = Config()
         self.assertEqual(dcfg.asr.provider, "auto")
         self.assertEqual(dcfg.asr.api, "auto")
-        self.assertEqual(dcfg.asr.effort, "auto")
+        self.assertEqual(dcfg.asr.effort, "")
+        self.assertFalse(dcfg.asr.has_explicit_effort("gemini"))
+        self.assertEqual(dcfg.asr.effective_effort("gemini"), "none")
+        self.assertEqual(dcfg.asr.effective_effort("openrouter"), "none")
+        self.assertEqual(dcfg.asr.effective_effort("dashscope"), "none")
+        self.assertEqual(dcfg.asr.effective_effort("openai"), "none")
         self.assertEqual(dcfg.refiner.provider, "auto")
         self.assertEqual(dcfg.refiner.model, "")
         self.assertEqual(dcfg.refiner.effort, "")
         self.assertEqual(dcfg.refiner.effective_model("codex"), "gpt-6-luna")
         self.assertEqual(dcfg.refiner.effective_effort("codex"), "low")
+        self.assertEqual(dcfg.refiner.effective_effort("openai"), "low")
+        self.assertEqual(dcfg.refiner.effective_effort("agy"), "low")
         self.assertEqual(dcfg.refiner.effective_model("deepseek"), "deepseek-flash")
-        self.assertEqual(dcfg.refiner.effective_effort("deepseek"), "auto")
+        self.assertEqual(dcfg.refiner.effective_effort("deepseek"), "none")
+        self.assertEqual(dcfg.refiner.effective_effort("dashscope"), "none")
+        self.assertEqual(dcfg.refiner.effective_effort("volcengine"), "none")
+        self.assertEqual(dcfg.refiner.effective_effort("gemini"), "none")
+        self.assertEqual(dcfg.refiner.effective_effort("openrouter"), "none")
 
         # Built-in default models, efforts & base_urls strictly match v0.9-1 / v0.10-1 table
         self.assertEqual(DEFAULT_ASR_MODELS["dashscope"], "qwen3-asr-flash")
@@ -1030,8 +1081,9 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(DEFAULT_REFINER_EFFORTS, {"codex": "low", "agy": "low", "openai": "low"})
         self.assertEqual(RefinerConfig(provider="codex").effort, "low")
         self.assertEqual(RefinerConfig(provider="openai").effort, "low")
+        self.assertEqual(RefinerConfig(provider="agy").effort, "low")
         for non_codex in ("deepseek", "openrouter", "dashscope", "volcengine", "gemini", "openai-compatible"):
-            self.assertEqual(RefinerConfig(provider=non_codex).effort, "auto")
+            self.assertEqual(RefinerConfig(provider=non_codex).effort, "none")
 
         self.assertEqual(DEFAULT_ASR_BASE_URLS["openrouter"], "https://openrouter.ai/api/v1")
         self.assertEqual(DEFAULT_ASR_BASE_URLS["deepseek"], "https://api.deepseek.com/v1")
@@ -1175,7 +1227,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg_cli.asr.effective_model(), "whisper-large-v3-turbo")
             self.assertEqual(cfg_cli.refiner.provider, "volcengine")
             self.assertEqual(cfg_cli.refiner.model, "doubao-seed-2-0-mini-260428")
-            self.assertEqual(cfg_cli.refiner.effort, "auto")
+            self.assertEqual(cfg_cli.refiner.effort, "none")
 
             # 2. Same-layer provider + explicit model preserves explicit model
             cfg_both, _ = load_config(
@@ -1218,17 +1270,19 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             self.assertEqual(cfg_sw.asr.api_key_env, "")
             self.assertEqual(cfg_sw.refiner.effective_base_url(), "https://openrouter.ai/api/v1")
             self.assertEqual(cfg_sw.refiner.model, "google/gemini-3.8-flash")
-            self.assertEqual(cfg_sw.refiner.effort, "auto")
+            self.assertEqual(cfg_sw.refiner.effort, "none")
             self.assertEqual(cfg_sw.refiner.api_key_env, "")
 
             # 5. Switching provider resets inherited effort unless same-layer effort is explicitly given;
-            #    config.example.toml loads cleanly with auto -> deferred effort="" (codex -> 'low', dashscope -> 'auto')
+            #    config.example.toml loads cleanly with auto -> deferred effort="" (codex -> 'low', dashscope -> 'none')
             cfg_ex, _ = load_config(
                 config_path=_REPO_ROOT / "config.example.toml",
                 env={"HOME": str(home)},
                 home_dir=home,
                 load_default_env_files=False,
             )
+            self.assertEqual(cfg_ex.asr.effort, "")
+            self.assertEqual(cfg_ex.asr.effective_effort("gemini"), "none")
             self.assertEqual(cfg_ex.refiner.provider, "auto")
             self.assertEqual(cfg_ex.refiner.effort, "")
             self.assertEqual(cfg_ex.refiner.effective_effort("codex"), "low")
@@ -1239,7 +1293,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 cli_overrides={"refiner.provider": "dashscope"},
                 load_default_env_files=False,
             )
-            self.assertEqual(cfg_ex_or.refiner.effort, "auto")
+            self.assertEqual(cfg_ex_or.refiner.effort, "none")
             cfg_ex_keep, _ = load_config(
                 config_path=_REPO_ROOT / "config.example.toml",
                 env={"HOME": str(home)},
@@ -1645,16 +1699,16 @@ class ConfigAndCredentialsTests(unittest.TestCase):
             rt_legacy = get_runtime_dir({"HOME": str(home), "VOICE_INPUT_RUNTIME_DIR": str(root / "legacy_rt")})
             self.assertEqual(rt_legacy, home / ".cache" / "agent-voice-input")
 
-            # 4. resolve_saved_recordings_dir under app_home (including symlinked app_home) & hermetic error
+            # 4. resolve_archive_audio_dir under app_home (including symlinked app_home) & hermetic error
             with self.assertRaises(ConfigError):
-                resolve_saved_recordings_dir({})
+                resolve_archive_audio_dir({})
             real_avi = root / "real_avi_target"
             real_avi.mkdir(mode=0o755)
             os.chmod(real_avi, 0o755)
             sym_avi = root / "sym_avi"
             sym_avi.symlink_to(real_avi)
-            rec_dir = resolve_saved_recordings_dir({"AGENT_VOICE_INPUT_HOME": str(sym_avi)}, create=True)
-            self.assertEqual(rec_dir, sym_avi / "recordings")
+            rec_dir = resolve_archive_audio_dir({"AGENT_VOICE_INPUT_HOME": str(sym_avi)}, create=True)
+            self.assertEqual(rec_dir, sym_avi / "audio")
             self.assertEqual(stat.S_IMODE(os.stat(real_avi).st_mode), 0o755)
             self.assertEqual(stat.S_IMODE(os.lstat(rec_dir).st_mode), 0o700)
 
@@ -1863,7 +1917,14 @@ class AudioProcTests(unittest.TestCase):
         rec_hang = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", hang_src])
         with tempfile.TemporaryDirectory() as td:
             rec_hang.start("pulse", "RDPSource", Path(td), {})
-            time.sleep(0.12)
+            hang_deadline = time.monotonic() + 5.0
+            while len(rec_hang._buf) < 18003 and time.monotonic() < hang_deadline:
+                time.sleep(0.005)
+            self.assertGreaterEqual(
+                len(rec_hang._buf),
+                18003,
+                "blocked recorder child did not flush expected PCM bytes within 5s",
+            )
             t0 = time.monotonic()
             wav_out = rec_hang.stop(drain_sec=0.0)
             elapsed = time.monotonic() - t0
@@ -1938,7 +1999,13 @@ class AudioProcTests(unittest.TestCase):
         rec_err = FfmpegWavRecorder(cmd_factory=lambda _f, _s: [sys.executable, "-c", err_src])
         with tempfile.TemporaryDirectory() as td:
             rec_err.start("pulse", "RDPSource", Path(td), {})
-            time.sleep(0.08)
+            proc = rec_err._proc
+            self.assertIsNotNone(proc)
+            assert proc is not None
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired as exc:
+                self.fail(f"error probe child did not exit within 5s: {exc}")
             wav_empty = rec_err.stop(drain_sec=0.0)
         self.assertEqual(wav_empty, b"")
         self.assertEqual(rec_err.last_returncode, 1)
@@ -2145,7 +2212,7 @@ class AudioProcTests(unittest.TestCase):
             find_codex_bin,
             get_runtime_dir,
             has_codex_local_auth,
-            resolve_saved_recordings_dir,
+            resolve_archive_audio_dir,
         )
         from agent_voice_input.refiner import CodexRefiner
 
@@ -2213,37 +2280,37 @@ class AudioProcTests(unittest.TestCase):
                     str(local_ff),
                 )
 
-            # resolve_saved_recordings_dir(create=True) secures ~/.agent-voice-input (0700) and recordings/ (0700)
+            # resolve_archive_audio_dir(create=True) secures ~/.agent-voice-input (0700) and audio/ (0700)
             no_xdg_env = {"HOME": str(home)}
-            rec_dir = resolve_saved_recordings_dir(no_xdg_env, create=True)
-            self.assertEqual(rec_dir, home / ".agent-voice-input" / "recordings")
+            rec_dir = resolve_archive_audio_dir(no_xdg_env, create=True)
+            self.assertEqual(rec_dir, home / ".agent-voice-input" / "audio")
             self.assertEqual(stat.S_IMODE(os.lstat(rec_dir.parent).st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(os.lstat(rec_dir).st_mode), 0o700)
             rt_dir = get_runtime_dir(no_xdg_env, create=True)
             self.assertEqual(stat.S_IMODE(os.lstat(rt_dir).st_mode), 0o700)
             self.assertTrue(_is_trusted_runtime_dir(rt_dir))
 
-    def test_refiner_max_turns_per_thread_defaults_zero_and_rejects_negative(self) -> None:
+    def test_refiner_session_max_turns_defaults_zero_and_rejects_negative(self) -> None:
         cfg_default, _ = load_config(env={"HOME": "/tmp/nonexistent-avi-home"}, load_default_env_files=False)
-        self.assertEqual(cfg_default.refiner.max_turns_per_thread, 0)
+        self.assertEqual(cfg_default.refiner.session_max_turns, 0)
 
         cfg_zero, _ = load_config(
-            cli_overrides={"refiner.max_turns_per_thread": 0},
+            cli_overrides={"refiner.session_max_turns": 0},
             env={"HOME": "/tmp/nonexistent-avi-home"},
             load_default_env_files=False,
         )
-        self.assertEqual(cfg_zero.refiner.max_turns_per_thread, 0)
+        self.assertEqual(cfg_zero.refiner.session_max_turns, 0)
 
         cfg_pos, _ = load_config(
-            cli_overrides={"refiner.max_turns_per_thread": 15},
+            cli_overrides={"refiner.session_max_turns": 15},
             env={"HOME": "/tmp/nonexistent-avi-home"},
             load_default_env_files=False,
         )
-        self.assertEqual(cfg_pos.refiner.max_turns_per_thread, 15)
+        self.assertEqual(cfg_pos.refiner.session_max_turns, 15)
 
-        with self.assertRaisesRegex(ConfigError, "refiner.max_turns_per_thread must be >= 0"):
+        with self.assertRaisesRegex(ConfigError, "refiner.session_max_turns must be >= 0"):
             load_config(
-                cli_overrides={"refiner.max_turns_per_thread": -1},
+                cli_overrides={"refiner.session_max_turns": -1},
                 env={"HOME": "/tmp/nonexistent-avi-home"},
                 load_default_env_files=False,
             )
@@ -2557,10 +2624,10 @@ class AudioProcTests(unittest.TestCase):
     def test_silence_trim_pipeline_seams_retry_archive_telemetry_and_single_hop(self) -> None:
         from agent_voice_input.asr_providers import AsrContext, AsrResult, BaseAsrProvider
         from agent_voice_input.audio_proc import list_saved_recordings
-        from agent_voice_input.config import RefinerConfig, resolve_saved_recordings_dir
+        from agent_voice_input.config import ArchiveConfig, RefinerConfig, resolve_archive_audio_dir
         from agent_voice_input.daemon_pipeline import build_pipeline_summary, run_pipeline_once
         from agent_voice_input.diagnose import (
-            _sanitize_telemetry_record,
+            _sanitize_diag_record,
             format_live_diagnostics_markdown,
         )
         from agent_voice_input.refiner import NoopRefiner
@@ -2605,10 +2672,11 @@ class AudioProcTests(unittest.TestCase):
             rt.mkdir(mode=0o700)
             env = {"HOME": str(home), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}
 
-            # 1. Normal recording trims before ASR, archives RAW original audio to recordings/, and populates telemetry
+            # 1. Normal recording trims before ASR, archives RAW original audio to audio/, and populates diag record
             asr_norm = _RecordingAsr(single_hop=False)
             cfg_arch = Config(
-                audio=AudioConfig(silence_trim="balanced", save_recordings=True, save_recordings_max_count=5),
+                audio=AudioConfig(silence_trim="balanced"),
+                archive=ArchiveConfig(save_audio=True, audio_max_count=5),
                 refiner=RefinerConfig(provider="off"),
             )
             # Force WAV archive fallback so we can compare exact archived sample count without ffmpeg lossy framing
@@ -2631,7 +2699,7 @@ class AudioProcTests(unittest.TestCase):
             self.assertEqual(len(asr_norm.seen_wav_lens), 1)
             self.assertLess(asr_norm.seen_wav_lens[0], len(raw_wav) - int(4.0 * sr * 2))
 
-            archived = list_saved_recordings(resolve_saved_recordings_dir(env))
+            archived = list_saved_recordings(resolve_archive_audio_dir(env))
             self.assertEqual(len(archived), 1)
             self.assertEqual(archived[0].read_bytes(), raw_wav)
 
@@ -2640,7 +2708,7 @@ class AudioProcTests(unittest.TestCase):
             self.assertEqual(summary["silence_trimmed_sec"], round(res_norm.gate.trimmed_sec, 3))
             self.assertEqual(summary["silence_trim_cuts"], 1)
 
-            sanitized = _sanitize_telemetry_record(summary, lambda s: s)
+            sanitized = _sanitize_diag_record(summary, lambda s: s)
             self.assertEqual(sanitized["silence_trimmed_sec"], summary["silence_trimmed_sec"])
             self.assertEqual(sanitized["silence_trim_cuts"], 1)
 
@@ -2666,7 +2734,7 @@ class AudioProcTests(unittest.TestCase):
                     "pipeline": {},
                     "summary": {"total": 2, "ok_count": 2, "fallback_count": 0, "failed_or_skipped": 0},
                     "session_match": {"matched": False},
-                    "storage": {"telemetry_kb": 0.1, "failed_audio_count": 0, "newest_failed_at": ""},
+                    "storage": {"diag_kb": 0.1, "failed_audio_count": 0, "newest_failed_at": ""},
                     "recent_results": [
                         {**sanitized, "session_tag": "none", "diag_flags": []},
                         {**legacy_rec, "seq_id": 2, "session_tag": "none", "diag_flags": []},

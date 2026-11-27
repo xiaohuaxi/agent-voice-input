@@ -74,6 +74,7 @@ _STATIC_HUD_COPY: dict[str, tuple[str, str]] = {
     "empty": ("○ 未检测到语音", "○ No speech detected"),
     "no_mic": ("✕ 无可用麦克风", "✕ No microphone found"),
     "mic_unavailable": ("! 麦克风暂忙，请再试一次", "! Microphone busy, try again"),
+    "queue_full": ("! 待处理队列已满，请稍候", "! Dictation queue full, please wait"),
     "mic_no_stream": ("! 麦克风无音频流，请检查耳机/设备", "! No mic audio stream, check headset"),
     "mic_permission": ("✕ 麦克风权限未开启", "✕ Microphone access denied"),
     "mic_disconnected": ("✕ 麦克风已断开", "✕ Microphone disconnected"),
@@ -82,10 +83,12 @@ _STATIC_HUD_COPY: dict[str, tuple[str, str]] = {
     "partial_asr_unsaved": ("! 部分语音未识别", "! Partial speech missed"),
     "partial_asr_copied": ("! 已复制，部分未识别可重试", "! Copied; partial missed, can retry"),
     "partial_asr_copied_unsaved": ("! 已复制，部分语音未识别", "! Copied; partial speech missed"),
+    "refiner_fallback": ("⚠ 已贴原文(精修失败)", "⚠ Raw pasted (refiner failed)"),
     "asr_empty_retry": ("! 识别为空，已存录音可重试", "! Empty transcript, audio saved for retry"),
     "asr_empty": ("✕ 识别为空", "✕ Empty transcript"),
     "paste_failed_retry": ("✕ 填入失败，已存录音可重试", "✕ Insert failed, audio saved for retry"),
     "paste_failed": ("✕ 填入失败", "✕ Failed to insert text"),
+    "error_retry": ("✕ 识别失败，已存录音可重试", "✕ Transcription failed, audio saved for retry"),
 }
 
 _CONTROL_HUD_STATES: frozenset[str] = frozenset(
@@ -113,6 +116,7 @@ HUD_STATE_DURATIONS_MS: dict[str, int] = {
     "empty": 2200,
     "no_mic": 2200,
     "mic_unavailable": 2600,
+    "queue_full": 2600,
     "mic_no_stream": 2600,
     "mic_permission": 3200,
     "mic_disconnected": 2200,
@@ -121,10 +125,12 @@ HUD_STATE_DURATIONS_MS: dict[str, int] = {
     "partial_asr_unsaved": 3200,
     "partial_asr_copied": 3200,
     "partial_asr_copied_unsaved": 3200,
+    "refiner_fallback": 4000,
     "asr_empty_retry": 3200,
     "asr_empty": 2600,
     "paste_failed_retry": 3200,
     "paste_failed": 2600,
+    "error_retry": 3200,
     "error": 2600,
 }
 
@@ -238,6 +244,80 @@ def format_copied_hud_text(reason: str = "", lang: str = "en") -> str:
     return pair[0] if zh else pair[1]
 
 
+def format_refiner_fallback_hud_text(
+    warning: str = "",
+    *,
+    copied_only: bool = False,
+    lang: str = "en",
+) -> str:
+    """Format bilingual non-blocking HUD warning copy when Stage 2 refiner falls back to Stage 1 text."""
+    low = (warning or "").strip().lower()
+    zh = (lang or "en").strip().lower() == "zh"
+    if any(
+        tok in low
+        for tok in (
+            "401",
+            "403",
+            "unauthorized",
+            "invalid api key",
+            "invalid_api_key",
+            "authentication",
+            "permission denied",
+            "expired",
+            "forbidden",
+        )
+    ):
+        reason_zh, reason_en = "精修鉴权失败", "refiner auth error"
+    elif any(
+        tok in low
+        for tok in (
+            "402",
+            "429",
+            "quota",
+            "insufficient",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "billing",
+            "balance",
+            "credit",
+        )
+    ):
+        reason_zh, reason_en = "精修额度/限流", "refiner quota/limit"
+    elif any(
+        tok in low
+        for tok in (
+            "404",
+            "not found",
+            "model_not_found",
+            "unsupported model",
+            "does not exist",
+            "no such model",
+        )
+    ):
+        reason_zh, reason_en = "精修模型不可用", "refiner model error"
+    elif any(
+        tok in low
+        for tok in (
+            "timeout",
+            "timed out",
+            "connection",
+            "network",
+            "unreachable",
+            "dns",
+            "reset by peer",
+        )
+    ):
+        reason_zh, reason_en = "精修超时", "refiner timeout"
+    else:
+        reason_zh, reason_en = "精修失败", "refiner failed"
+    if zh:
+        prefix = "⚠ 已复制原文" if copied_only else "⚠ 已贴原文"
+        return f"{prefix}({reason_zh})"
+    prefix = "⚠ Raw copied" if copied_only else "⚠ Raw pasted"
+    return f"{prefix} ({reason_en})"
+
+
 def format_bg_count_badge(bg_count: int) -> str:
     """Return compact background in-flight count badge (e.g. '+1', '+2') or '' when zero."""
     n = int(bg_count)
@@ -315,6 +395,7 @@ __all__ = [
     "format_hotkey_label",
     "format_hud_text",
     "format_recording_duration",
+    "format_refiner_fallback_hud_text",
     "hud_layer_for_state",
     "is_toast_hud_state",
     "is_zh_locale",

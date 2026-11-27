@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前已发布基线**：`v0.17.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
+> **当前已发布基线**：`v0.18.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
 >
 > **工程规范与上下文路由架构**：[AGENTS.md](AGENTS.md) · [docs/context-routing.md](docs/context-routing.md)
 
@@ -38,7 +38,7 @@
 1. **第一级：自动闭环门禁（主力签收基线）**
    - **离线单元测试套件**：`PYTHONPATH=src python3 -W error::ResourceWarning -m unittest discover -s tests -v`（全程离线可重入，覆盖协议解析、并发保序、在途取消、窗口/SSH 路由与剪贴板恢复状态机）。
    - **原生 Shim 离线自检**：macOS `mac_shim --self-check` 与 Windows `win_shim.ps1 -Mode self-check`，在无声卡、无全局钩子权限的 CI 环境中验证原生编译、按键状态机与粘贴键路由。
-   - **隔离全链路自检与时间点回放基准**：通过 `.agents/skills/voice-eval/` 在独立运行目录与隔离 `AGENT_VOICE_INPUT_HOME` 下验证真 ASR、前缀缓存、并发保序落字与 `0600` 隐私脱敏契约；本地归档录音位于 `~/.agent-voice-input/recordings/`，回放评测产物严格限定在仓外缓存目录（`${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/eval-runs/`），严禁入库。
+   - **隔离全链路自检与时间点回放基准**：通过 `.agents/skills/voice-eval/` 在独立运行目录与隔离 `AGENT_VOICE_INPUT_HOME` 下验证真 ASR、前缀缓存、并发保序落字与 `0600` 隐私脱敏契约；本地归档音频位于 `~/.agent-voice-input/audio/`，回放评测产物严格限定在仓外缓存目录（`${XDG_CACHE_HOME:-~/.cache}/agent-voice-input/eval-runs/`），严禁入库。
 2. **第二级：薄人工真机卡点**
    - 仅当改动触及操作系统硬件链路、窗口焦点权限或跨机终端透传体感时，在自动门禁全绿后执行简短真机确认。
 
@@ -53,15 +53,32 @@
 
 ---
 
-### 最新发版里程碑（`已发布 · v0.17.0`）
+### 最新发版里程碑（`已发布 · v0.18.0`）
+
+以下统一本地归档与短 ID 贯通、启动轻量预检与模型级探活、精修回退 HUD 提示、CLI 人类可读默认输出及全链路可靠性与发版门禁加固已在 `v0.18.0` 完成落地并正式发布：
+
+1. **统一 `[archive]` 本地归档与 1:1 短 ID 贯通（`diag.jsonl` 彻底去遥测）**：
+   - 将原音频归档与新建本地转录归档统一收归 `[archive]`（默认全关：`save_transcripts = false`、`save_audio = false`、`audio_max_count = 1000` 且 `0` 不淘汰）；
+   - `transcripts/YYYY-MM.jsonl` 按月追加 12 字段纯转录语料（经凭据脱敏、绝不写入会话上下文、热词或凭据），`audio/<id>.mp3` 存档原音，与重命名后的本地诊断日志 `diag.jsonl` 通过短 ID（`YYYYMMDD-HHMMSS-<4hex>`）1:1 贯通且统一使用本地时区 ISO-8601 时间戳；`status`/`doctor`/`start` 新增 `Archive:` 状态摘要。
+2. **启动轻量预检、`doctor --ping` 模型级核验与精修回退 HUD 提示**：
+   - `start` 冷启动新增非阻塞同步轻量预检，升级 `doctor --ping` 校验目标模型可用性（规避专用 STT 与分页列表误报）；
+   - Stage 2 精修失败回退 ASR 草稿时在 macOS / Windows 弹出双语非打断警告 HUD（区分鉴权、额度、模型、超时与通用异常）；`status`/`toggle`/`cancel` 默认输出人类可读摘要（`--json` 保留机器解析），并反映守护进程实时 `--hotkey` 覆写。
+3. **MacBook 免 `init` 默认 `RCommand`、配置契约定稿与全链路加固**：
+   - 无 `config.toml`（或未显式指定 `hotkey.key`）时，MacBook 内置键盘运行期自动默认 `RCommand`（台式 Mac 与 Windows/WSL2 保持 `RControl`）；
+   - 定稿 `asr.doubao_resource_id`、`refiner.session_max_turns`、`refiner.extra_instructions`（替代 `prompt`）、移除 `effort = "auto"` 并落实全模型上下限夹紧、兼容 `ui.language` BCP 47 标签、移除 `only_in_terminals` / `winmm`；
+   - `init --force` 保护 `.env`、`integrate` 精准钩子操作与自动升级包装软链、修复 macOS SSH 全 0 帧与 `stop` 卡死强杀及 `expected_pid` 防换代误杀、补齐 HTTP 16 MiB 上限 / 转码超时保底 WAV / socket 长度预检 / WSL2 ASCII 路径解码与 `scripts/check_package.py` 三端发版前门禁。
+
+---
+
+### 已归档里程碑（`已发布 · v0.17.0`）
 
 以下统一家目录与个人热词重构、静音自适应裁剪、多渠道缓存优化及 OOBE 体验打磨已在 `v0.17.0` 完成落地并正式发布：
 
 1. **统一 `~/.agent-voice-input/` 家目录与扁平个人热词解耦**：
-   - 配置（`config.toml`）、凭据（`.env`）、个人热词（`hotwords/personal.txt`）与归档录音（`recordings/`）统一收敛于 `~/.agent-voice-input/`（受 `AGENT_VOICE_INPUT_HOME` 覆盖），原生支持 `hotwords/` 或整目录同 UID 软链与默认全忽略仅放行 `hotwords/` 的 `.gitignore`；
+   - 配置（`config.toml`）、凭据（`.env`）、个人热词（`hotwords/personal.txt`）与归档音频（`v0.18.0` 已统一收口至 `audio/` 与 `transcripts/`）统一收敛于 `~/.agent-voice-input/`（受 `AGENT_VOICE_INPUT_HOME` 覆盖），原生支持 `hotwords/` 或整目录同 UID 软链与默认全忽略仅放行 `hotwords/` 的 `.gitignore`；
    - 个人热词采用扁平单文件（支持 `!` 置顶、`<-` 误听别名、目录 fd `flock` 互斥写），与双轨运行期投影解耦（Stage 1 保持优先级行序 + `agent` 模式 30% 动态词保底、DashScope 扩至 `150 词 / 1,800 字`、OpenAI `gpt-transcribe` 原生 `keywords[]`；Stage 2 块 0 `<vocabulary_hints>` 确定性排序保前缀缓存并扩至 `200 条 / 3,000 字`），同时移除非 Agent App 穷举与 `<target_app_hint>`。
 2. **Pre-ASR 长静音自适应压缩（`[audio].silence_trim`）**：
-   - 在 `process_wav` 归一化前纯标准库压缩长思考停顿与首尾冗余静音（默认 `balanced`，10 ms 线性淡入淡出，短句与 `retry` 旁路，`recordings/` 保留原音），并在遥测与 `diagnose` 中汇报裁剪时长与切点数。
+   - 在 `process_wav` 归一化前纯标准库压缩长思考停顿与首尾冗余静音（默认 `balanced`，10 ms 线性淡入淡出，短句与 `retry` 旁路，音频归档保留原音），并在本地诊断日志与 `diagnose` 中汇报裁剪时长与切点数。
 3. **多渠道精修缓存修复、无限 `AgyRefiner` 轮次与 OOBE 打磨**：
    - 官方 OpenAI 默认走无状态 `/responses`、原生 Gemini 落地 3-turn 缓存布局、OpenRouter `google/*` 跳过 `< 50K` 单块显式断点、解除 `AgyRefiner` 默认单线程轮次上限；
    - 修复 PyPI 绝对链接、HUD 剪贴板回退提示、`.env` 代理配置生效与 `doctor` SOCKS5 诊断，并将 WSL2 `win_shim` 冷编译超时放宽至 `180s`。
@@ -102,7 +119,7 @@
 以下 DeepSeek 一等官方 ASR、主流 AI 桌面端（Antigravity 2.0 / ChatGPT & Codex 统一桌面端）深度上下文绑定、性能与桥接防串台加固及双端对称回归验收体系已在 `v0.14.0` 完成落地并正式发布：
 
 1. **DeepSeek 一等官方 ASR 与零推理延迟精修调优**：
-   - 新增内置 `asr.provider = "deepseek"`（`POST https://api.deepseek.com/v1/tools/asr`，默认 `deepseek-asr`，支持 21 语言自动识别并纳入 `asr.provider = "auto"`），仅需一把 `DEEPSEEK_API_KEY` 即可零配置完成两段式口述（`deepseek-asr` + `deepseek-flash`），并统一自定义 `base_url` 与遥测字段契约；
+   - 新增内置 `asr.provider = "deepseek"`（`POST https://api.deepseek.com/v1/tools/asr`，默认 `deepseek-asr`，支持 21 语言自动识别并纳入 `asr.provider = "auto"`），仅需一把 `DEEPSEEK_API_KEY` 即可零配置完成两段式口述（`deepseek-asr` + `deepseek-flash`），并统一自定义 `base_url` 与本地诊断日志字段契约；
    - 在二阶段精修系统提示词、`<task_reminder>` 及 `agy` 隔离规则中显式增加零反复推敲指令，降低精修输出延迟；在本地 `SessionTracker` 与 SSH `_remote_probe.py` 中共用字节级快速预过滤，跳过 Claude Code `2.1.330` 巨型非对话 JSONL 记录。
 2. **Antigravity 2.0 与 ChatGPT / Codex 统一桌面端上下文绑定及同窗防串台**：
    - 支持 Antigravity 2.0 独立桌面版只读 `conversation_summaries.db` 精确/截断前缀标题匹配、工作区 URI 解析（含 WSL `vscode-remote://wsl+...`）、`annotations/*.pbtxt` 前台排序与 `brain/` `50K` 增量缓存，并兼容旧版 VS Code Fork；
@@ -139,7 +156,7 @@
 2. **HTTP/HTTPS 代理 Keep-Alive 连接池复用**：
    - 在 `http_transport.py` 中实现 `CONNECT` HTTP/1.1 隧道复用与单层 TLS 代理连接池，剥离并脱敏调用方 `Proxy-Authorization`，对不安全/畸形代理配置 fail-closed，大幅降低跨境及代理链路单次往返耗时。
 3. **录音/投递可靠性与跨平台细节加固**：
-   - 补齐多块 ASR 静默丢块保护、Windows `rec_stop` 竞态防阻塞、`failed/` 24h TTL 主动清理、`hotwords.txt` 异常编码优雅降级与统一 4 态 HUD/遥测/诊断契约；
+   - 补齐多块 ASR 静默丢块保护、Windows `rec_stop` 竞态防阻塞、`failed/` 24h TTL 主动清理、`hotwords.txt` 异常编码优雅降级与统一 4 态 HUD/本地诊断日志契约；
    - 新增 macOS 多屏聚焦窗口 HUD 锚定、非中文内建热词语言过滤、Eternal Terminal（`et`）远端识别、`DOUBAO_SPEECH_API_KEY` 统一单头凭据、豆包极速优先回退链与异步轮询退避优化及 POSIX `LC_ALL=C` 严格 ASCII locale 兼容；
    - CI 矩阵扩展至 Python 3.10–3.14、三端 clean wheel 冒烟与真实 `sshd`/多进程 daemon 环回 E2E。
 
@@ -206,7 +223,7 @@
 
 1. **个人词库与本机语料体系演进（基于 `~/.agent-voice-input/` 预留扩展位）**：
    - **项目级热词（`~/.agent-voice-input/hotwords/projects/<slug>.txt`）**：按“项目 + 个人”生效的可选扩展层，通过文件头 `@match path=` / `@match remote=` 自包含匹配（`path` 优先，支持跨机与跨 SSH）；**安全红线**：绝不自动加载陌生或远端业务仓库内的未授权热词文件（防合法语义 Prompt Injection），团队共享术语表仅支持通过 CLI 显式确认导入。
-   - **本机转录语料日志（`~/.agent-voice-input/transcripts/`）**：按显式隐私开关落盘「ASR 转录草稿 + 精修终稿」本地语料（与 `recordings/` 同级、受 `.gitignore` 默认拦截、绝不进 `telemetry.jsonl` 或同步仓），作为复盘、Agent 分析与离线 Dreaming 的原始素材。
+   - **本机转录语料日志（`~/.agent-voice-input/transcripts/`，已于 `v0.18.0` 正式发布）**：按显式隐私开关 `[archive]`（`save_transcripts` / `save_audio` / `audio_max_count`）落盘 12 字段「ASR 转录草稿 + 精修终稿」按月 JSONL 语料并与 `audio/<id>.mp3`、`diag.jsonl` 按短 ID 1:1 贯通（受 `.gitignore` 默认拦截、绝不写入上下文/热词/凭据或 `diag.jsonl`），作为复盘、Agent 分析与离线 Dreaming 的原始素材。
    - **离线 Dreaming 自动挖掘与屏蔽表（`~/.agent-voice-input/dreaming/` + `hotwords/suppress.txt`）**：严格单写者隔离（不往 `personal.txt` 写频次或时间戳，删除派生区不损人工词库）；通过 `suppress.txt` 避让用户已拒绝词；并专门防范「ASR 误听 → Refiner 按旧错误映射改写 → Dreaming 误当作采纳证据」的自我强化幻觉回环。
    - **300–1,000+ 条大词库长尾草稿后置召回**：超过 Stage 2 块 0 常驻预算（`200 条 / 3,000 字`）的长尾词，在 Stage 1 ASR 产出草稿后于本机毫秒级检索精确误听，将少量命中临时附在末尾草稿块旁喂给 Stage 2（**不动块 0、不破前缀缓存**）。
    - **配套 AI-native 热词维护 Skill & 预算持续校准**：提供热词维护 Skill 引导 Coding Agent 按预算与形态契约维护词表，并基于后续真人录音回放持续校准强 ASR 上限与分桶比例。
@@ -228,16 +245,17 @@
     - **跨渠道上下文组织模型统一文档沉淀**：系统梳理各渠道协议/消息分块、`role` 权责与防上下文指令误导边界，并沉淀为独立设计文档；
     - **`< 50K` 单块策略与渠道差异评估**：针对官方 `api.openai.com` 可变尾块增长当轮呈全量 `cache_write`（0% 命中，区别于 `chatgpt.com` Codex 后端 128-token 前缀匹配）、原生 `gemini`（`gemini-3.7-flash`）`< 50K` 单块增长时 Turn 1 变化即归零，以及 `agy`/`codex`/`gemini` 在 General 模式下恒为 `0%`（宜在诊断指标中与 Agent 模式分列观测）做专题权衡；
     - **多渠道真实缓存命中率回归门禁**：将覆盖多块增量续写、`< 50K` 单块增长、词表热更恢复与 `agent`/`general` 分列统计的真实上游复测纳入涉及精修消息结构、角色分配、分块边界或缓存断点改动后的必要回归验证，避免仅跑离线单测而漏测线上缓存退化。
+- **Ghostty 直投改走标准输入传参（延后项）**：当前 macOS Ghostty 直投通过 `osascript` `argv` 传递口述文本；后续在真实 Ghostty 环境验证 JXA（`osascript -l JavaScript` 读取 `stdin`）对中文、引号与换行符的保真度后，切换为 `stdin` 传参以消除短暂进程命令行参数暴露面（同时避免使用同样可见的环境变量传参）。
 - **平台录音生命周期异步交接复评（已复评结案 · 转为条件触发式前置清理）**：已在 `v0.15.0` 发布后完成专项架构复评，确认 `MacOSPlatform`（`15s` 首帧授权等待、`0.45s` 尾音 `tail_drain`、热插拔自动恢复与 `close()` 收敛）与 `WslPlatform`（跨进程 WASAPI 管道三态写回执与停录/取消代次交接）约 **75%–80%** 属硬件、操作系统与跨进程边界的固有复杂度，当前 Daemon 生产运行路径已达 `0 P0 / 0 P1` 稳定基线；已完成无痛卫生清理（补齐双端状态不变量与锁序注释，并为 `WslPlatform.stop_recording()` 增加 `_expected_gen` 错代保护与 `cancel_recording()` 强杀前 writer 归属复核，闭合仅限平台直调并发的理论 P1）并正式结案。显式单会话状态机重构（macOS `phase`/`stop_intent` + 单一 `_live_recs`、WSL `_WslRecSession`）转为**条件触发式前置清理**，待未来启动「脱离 WSL 的原生 Windows 独立运行」或扩展 macOS 运行期音频采集能力前再分端实施。
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
 
-`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.17.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
+`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.18.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
 
 1. **外部用户零门槛开箱**：仅配置任意单一支持语音转写的主流渠道 API Key（可自动搭配本地 CLI 登录态或独立二阶段凭据），即可通过 `init` 与 `doctor --ping` 完成体检并稳定投入日常使用。
 2. **全场景安全投递与零串台**：本地终端、跨机 SSH 远端 Linux、主流桌面 IDE、普通桌面 GUI 应用与远程桌面自动让行均长期稳定运行；跨场景上下文严格隔离，系统剪贴板零意外污染，全链路严守不自动发送回车。
 3. **高保真精修与操控韧性**：跨句中途改口消解、中英技术术语还原、长静音稀疏底噪抗幻觉与抗指令劫持稳定达标；长会话前缀缓存高效命中；支持在途即时取消、连发并发保序落字与失败/取消录音无损 `retry`。
-4. **双平台原生桥接与三端 CI 长稳无回归**：`mac_shim.swift` 与 `win_shim.ps1` 自检及打包完整性校验持续通过 Linux / macOS / Windows CI 门禁，单实例锁、异常自愈与 `0600` 隐私脱敏契约经连续日常长稳运行零回归。
+4. **双平台原生桥接与三端 CI 长稳无回归**：`mac_shim/*.swift` 与 `win_shim.ps1` 自检及打包完整性校验持续通过 Linux / macOS / Windows CI 门禁，单实例锁、异常自愈与 `0600` 隐私脱敏契约经连续日常长稳运行零回归。
 
 #### 远期可选扩展赛道（按实际需求演进）
 

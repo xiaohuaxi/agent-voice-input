@@ -45,7 +45,7 @@ from agent_voice_input.config import (  # noqa: E402
 )
 from agent_voice_input.daemon import (  # noqa: E402
     VoiceInputDaemon,
-    append_telemetry_record,
+    append_diag_record,
     compute_package_build_id,
     describe_daemon_drift,
     probe_daemon_status,
@@ -58,7 +58,7 @@ from agent_voice_input.diagnose import (  # noqa: E402
     mask_session_key,
     probe_optional_legacy_codex_sqlite,
     read_redacted_log_tail,
-    summarize_telemetry_records,
+    summarize_diag_records,
 )
 from agent_voice_input.refiner import NoopRefiner  # noqa: E402
 
@@ -277,13 +277,23 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                     mock.patch.dict(os.environ, env, clear=True),
                     mock.patch("sys.stdout", out_unresp),
                 ):
-                    rc_unresp = cli_mod.main(["status"])
+                    rc_unresp = cli_mod.main(["status", "--json"])
                 self.assertEqual(rc_unresp, 1)
                 st_unresp = json.loads(out_unresp.getvalue())
                 self.assertFalse(st_unresp["ok"])
                 self.assertEqual(st_unresp["state"], "unresponsive")
                 self.assertEqual(st_unresp["pid"], os.getpid())
                 self.assertIn("daemon.lock", st_unresp["error"])
+
+                out_unresp_human = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, env, clear=True),
+                    mock.patch("sys.stdout", out_unresp_human),
+                ):
+                    rc_unresp_h = cli_mod.main(["status"])
+                self.assertEqual(rc_unresp_h, 1)
+                self.assertIn("unresponsive", out_unresp_human.getvalue())
+                self.assertIn("Fix:", out_unresp_human.getvalue())
 
                 # `doctor` also reports WARN unresponsive (not stopped!)
                 out_doc_unresp = io.StringIO()
@@ -323,12 +333,25 @@ class StartStatusDriftAndHelpTests(unittest.TestCase):
                 mock.patch("agent_voice_input.control_ipc.send_control_command", return_value=dict(drifted_resp)),
                 mock.patch("sys.stdout", out_st_drift),
             ):
-                rc_st_drift = cli_mod.main(["status"])
+                rc_st_drift = cli_mod.main(["status", "--json"])
             self.assertEqual(rc_st_drift, 0)
             obj_drift = json.loads(out_st_drift.getvalue())
             self.assertTrue(obj_drift["code_drift"])
             self.assertIn("restart", obj_drift["drift_warning"])
             self.assertIn("pipeline", obj_drift)
+
+            out_st_drift_h = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", return_value=dict(drifted_resp)),
+                mock.patch("sys.stdout", out_st_drift_h),
+            ):
+                rc_st_drift_h = cli_mod.main(["status"])
+            self.assertEqual(rc_st_drift_h, 0)
+            txt_drift_h = out_st_drift_h.getvalue()
+            self.assertIn("Daemon    running (pid=7777, state=idle", txt_drift_h)
+            self.assertIn("Notice    ", txt_drift_h)
+            self.assertIn("agent-voice-input restart", txt_drift_h)
 
             out_doc_drift = io.StringIO()
             with (
@@ -687,7 +710,7 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
         ref_db = RefinerConfig(provider="doubao")
         self.assertEqual(ref_db.provider, "volcengine")
         self.assertEqual(ref_db.effective_api("ark"), "chat-completions")
-        self.assertEqual(ref_db.effective_effort("doubao"), "auto")
+        self.assertEqual(ref_db.effective_effort("doubao"), "none")
         self.assertIn("ark.cn-beijing.volces.com", ref_db.effective_base_url("doubao"))
         self.assertEqual(ref_db.effective_model("ark"), ref_db.model)
 
@@ -745,7 +768,7 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
 
         # 1b. doubao_mode="submit" with resource_id="auto" skips /recognize/flash even when both submit slots fail
         seen_sub_only: list[tuple[str, str]] = []
-        cfg_auto_sub = Config(asr=AsrConfig(provider="doubao", resource_id="auto", doubao_mode="submit"))
+        cfg_auto_sub = Config(asr=AsrConfig(provider="doubao", doubao_resource_id="auto", doubao_mode="submit"))
         st_sub_auto, _, msg_sub_auto = DoubaoAsrProvider(
             cfg_auto_sub,
             creds,
@@ -790,7 +813,7 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
         self.assertEqual(st_503, "FAIL")
         self.assertIn("HTTP 503", msg_503)
 
-        cfg_sub = Config(asr=AsrConfig(provider="doubao", resource_id="volc.bigasr.auc", doubao_mode="submit"))
+        cfg_sub = Config(asr=AsrConfig(provider="doubao", doubao_resource_id="volc.bigasr.auc", doubao_mode="submit"))
         st_sub_bad, _, _ = DoubaoAsrProvider(
             cfg_sub,
             creds,
@@ -822,7 +845,7 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
             cfg_path.write_text('[asr]\nprovider = "dashscope"\n[refiner]\nprovider = "deepseek"\n', encoding="utf-8")
 
             # Seed telemetry records covering normal, warm cache hit, cache miss, slow stages, fallback, and skipped/failed
-            append_telemetry_record(
+            append_diag_record(
                 rt,
                 {
                     "ts": 1700001000.0,
@@ -849,7 +872,7 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                     "transcript": "SECRET_SYNTHETIC_FIELD",
                 },
             )
-            append_telemetry_record(
+            append_diag_record(
                 rt,
                 {
                     "ts": 1700001020.0,
@@ -863,11 +886,11 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                     "refiner_fallback": "asr_draft",
                     "refiner_warning": f"upstream failed token={secret_key}",
                     "sync_ms": 5,
-                    "asr_ms": 2000,
+                    "asr_ms": 5000,
                     "refine_init_ms": 0,
-                    "refine_ms": 1700,
+                    "refine_ms": 8500,
                     "deliver_ms": 400,
-                    "total_ms": 4105,
+                    "total_ms": 13905,
                     "ctx_chunks": 2,
                     "ctx_chars": 12000,
                     "input_tokens": 5000,
@@ -875,7 +898,7 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                     "reasoning_tokens": 300,
                 },
             )
-            append_telemetry_record(
+            append_diag_record(
                 rt,
                 {
                     "ts": 1700001040.0,
@@ -943,20 +966,20 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
             self.assertNotIn(secret_key, data["recent_results"][1]["asr_request_id"])
             self.assertNotIn("asr_request_id", data["recent_results"][2])
             self.assertNotIn("free text prose leaked", raw_j)
-            from agent_voice_input.diagnose import _sanitize_telemetry_record
-            san_valid = _sanitize_telemetry_record(
+            from agent_voice_input.diagnose import _sanitize_diag_record
+            san_valid = _sanitize_diag_record(
                 {"asr_request_id": "req_123:abc/def.456-789"}, lambda s: s
             )
             self.assertEqual(san_valid["asr_request_id"], "req_123:abc/def.456-789")
             # Comma-joined multi-chunk asr_request_id: per-segment allowlist + redaction + 256-char cap
-            san_chunks = _sanitize_telemetry_record(
+            san_chunks = _sanitize_diag_record(
                 {"asr_request_id": f"req-1, bad prose here , req-{secret_key} , req-3"},
                 lambda s: s.replace(secret_key, "[REDACTED]"),
             )
             self.assertEqual(san_chunks["asr_request_id"], "req-1,req-[REDACTED],req-3")
             ids_64 = [f"chunk{i}-{'x' * 57}" for i in range(4)]
             self.assertTrue(all(len(x) == 64 for x in ids_64))
-            san_capped = _sanitize_telemetry_record(
+            san_capped = _sanitize_diag_record(
                 {"asr_request_id": ",".join([*ids_64, "short-5"])},
                 lambda s: s,
             )
@@ -974,7 +997,7 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                 "bad prose one, bad prose two",
             ):
                 with self.subTest(bad_asr_request_id=bad_req_id[:24]):
-                    san_bad = _sanitize_telemetry_record({"asr_request_id": bad_req_id}, lambda s: s)
+                    san_bad = _sanitize_diag_record({"asr_request_id": bad_req_id}, lambda s: s)
                     self.assertNotIn("asr_request_id", san_bad)
             self.assertTrue(all(len(ln) <= 241 for ln in data["daemon_log_tail"].splitlines()))
             self.assertEqual(data["summary"]["total"], 3)
@@ -1012,7 +1035,7 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
             self.assertEqual(mask_session_key(""), "none")
             self.assertTrue(mask_session_key("plain-id").startswith("sess#"))
             self.assertEqual(read_redacted_log_tail(rt / "missing.log", 0, env), "")
-            self.assertEqual(summarize_telemetry_records([])["total"], 0)
+            self.assertEqual(summarize_diag_records([])["total"], 0)
 
             md_unresp = format_live_diagnostics_markdown(
                 {
@@ -1027,7 +1050,7 @@ class OfficialDiagnoseSubcommandTests(unittest.TestCase):
                 }
             )
             self.assertIn("UNRESPONSIVE", md_unresp)
-            self.assertIn("No utterance telemetry recorded yet", md_unresp)
+            self.assertIn("No utterance diagnostics recorded yet", md_unresp)
 
             md_drift = format_live_diagnostics_markdown(
                 {
@@ -1275,7 +1298,7 @@ class CliTextUxDriftAndIntegrateTipTests(unittest.TestCase):
             rt = root / "rt"
             home.mkdir()
             rt.mkdir()
-            (rt / "telemetry.jsonl").write_text('{"ok": true}\n', encoding="utf-8")
+            (rt / "diag.jsonl").write_text('{"ok": true}\n', encoding="utf-8")
 
             def _run_start_case(
                 *,
@@ -1307,6 +1330,7 @@ class CliTextUxDriftAndIntegrateTipTests(unittest.TestCase):
                     mock.patch("agent_voice_input.platform_macos.compile_mac_shim", return_value=(None, "")),
                     mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
+                    mock.patch.object(cli_mod, "_run_startup_preflight_ping", return_value=[]),
                     mock.patch("sys.stdout", buf),
                     mock.patch("sys.stderr", io.StringIO()),
                 ):

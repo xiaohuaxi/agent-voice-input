@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import queue
 import random
+import select
 import socket
 import socketserver
 import stat
@@ -49,7 +50,7 @@ from agent_voice_input.config import (  # noqa: E402
     RemoteConfig,
     RemoteHostConfig,
 )
-from agent_voice_input.daemon import VoiceInputDaemon, read_telemetry_history  # noqa: E402
+from agent_voice_input.daemon import VoiceInputDaemon, read_diag_history  # noqa: E402
 from agent_voice_input.http_transport import (  # noqa: E402
     CancelToken,
     HttpRequest,
@@ -520,7 +521,7 @@ class TestConcurrencyRaces(unittest.TestCase):
             cfg = Config(
                 asr=AsrConfig(provider="dashscope"),
                 refiner=RefinerConfig(provider="deepseek", include_git_status=False),
-                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                audio=AudioConfig(beep=False, tail_drain_sec=0.0),
                 hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
             )
             plat = _TorturePlatform(self.speech_wav)
@@ -661,7 +662,7 @@ class TestConcurrencyRaces(unittest.TestCase):
                 self.assertGreaterEqual(len(confirmed_cancelled_pipeline_seqs), 4)
                 self.assertTrue(confirmed_cancelled_all_seqs.isdisjoint(set(delivered_seqs)))
 
-                history = read_telemetry_history(rt, limit=100)
+                history = read_diag_history(rt, limit=100)
                 by_seq = {int(rec["seq_id"]): rec for rec in history if "seq_id" in rec}
                 stashed_files = {str(p): p for p in list_failed_audios(rt)}
                 self.assertLessEqual(len(confirmed_cancelled_pipeline_seqs), 10)
@@ -1355,7 +1356,7 @@ class TestConcurrencyRaces(unittest.TestCase):
             cfg = Config(
                 asr=AsrConfig(provider="dashscope"),
                 refiner=RefinerConfig(provider="off", include_git_status=False),
-                audio=AudioConfig(wsl_source="pulse", beep=True, save_recordings=False, tail_drain_sec=0.0),
+                audio=AudioConfig(wsl_source="pulse", beep=True, tail_drain_sec=0.0),
                 hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
             )
 
@@ -1620,7 +1621,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             cfg = Config(
                 asr=AsrConfig(provider="dashscope"),
                 refiner=RefinerConfig(provider="off", include_git_status=False),
-                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                audio=AudioConfig(beep=False, tail_drain_sec=0.0),
                 hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
             )
             call_order: list[str] = []
@@ -1781,7 +1782,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             cfg = Config(
                 asr=AsrConfig(provider="dashscope"),
                 refiner=RefinerConfig(provider="off", include_git_status=False),
-                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                audio=AudioConfig(beep=False, tail_drain_sec=0.0),
                 hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
             )
             start_entered = threading.Event()
@@ -2044,8 +2045,16 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
 
             # 4c. While a slower RPC (0.35s) occupies the single writer on a full pipe, a queued shorter-deadline
             # RPC (0.05s) still honors its own deadline with write_status='not_sent' and hud_level stays instant!
+            from agent_voice_input import platform_common as _pc_mod
+
             slow_done = threading.Event()
+            slow_writing = threading.Event()
             slow_errs: list[BaseException] = []
+            orig_write_line = _pc_mod._write_line_to_pipe
+
+            def _signaling_write_line(*args: Any, **kwargs: Any) -> Any:
+                slow_writing.set()
+                return orig_write_line(*args, **kwargs)
 
             def _slow_rpc() -> None:
                 try:
@@ -2055,21 +2064,25 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 finally:
                     slow_done.set()
 
-            slow_th = threading.Thread(target=_slow_rpc, daemon=True)
-            slow_th.start()
-            time.sleep(0.02)
-            t_lock0 = time.monotonic()
-            for _ in range(20):
-                bridge.hud_level(0.42)
-            self.assertLess(time.monotonic() - t_lock0, 0.05)
+            with mock.patch.object(_pc_mod, "_write_line_to_pipe", side_effect=_signaling_write_line):
+                slow_th = threading.Thread(target=_slow_rpc, daemon=True)
+                slow_th.start()
+                self.assertTrue(
+                    slow_writing.wait(timeout=2.0),
+                    "single writer did not start writing slow RPC to full pipe within 2s",
+                )
+                t_lock0 = time.monotonic()
+                for _ in range(20):
+                    bridge.hud_level(0.42)
+                self.assertLess(time.monotonic() - t_lock0, 0.05)
 
-            t_lk_rpc = time.monotonic()
-            with self.assertRaises(_ShimWriteTimeout) as ctx_4c:
-                bridge._shim_rpc({"cmd": "ping"}, timeout_sec=0.05, allow_retry=False)
-            self.assertEqual(ctx_4c.exception.write_status, "not_sent")
-            self.assertLess(time.monotonic() - t_lk_rpc, 0.25)
-            self.assertIs(bridge._shim, proc)
-            self.assertTrue(slow_done.wait(timeout=1.0))
+                t_lk_rpc = time.monotonic()
+                with self.assertRaises(_ShimWriteTimeout) as ctx_4c:
+                    bridge._shim_rpc({"cmd": "ping"}, timeout_sec=0.05, allow_retry=False)
+                self.assertEqual(ctx_4c.exception.write_status, "not_sent")
+                self.assertLess(time.monotonic() - t_lk_rpc, 0.25)
+                self.assertIs(bridge._shim, proc)
+                self.assertTrue(slow_done.wait(timeout=1.5))
             self.assertEqual(len(slow_errs), 1)
             self.assertIsInstance(slow_errs[0], _ShimWriteTimeout)
             bridge.close()
@@ -2586,7 +2599,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             cfg = Config(
                 asr=AsrConfig(provider="dashscope"),
                 refiner=RefinerConfig(provider="off", include_git_status=False),
-                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                audio=AudioConfig(beep=False, tail_drain_sec=0.0),
                 hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
             )
             start_entered = threading.Event()
@@ -2715,7 +2728,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             cfg = Config(
                 asr=AsrConfig(provider="dashscope"),
                 refiner=RefinerConfig(provider="off", include_git_status=False),
-                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                audio=AudioConfig(beep=False, tail_drain_sec=0.0),
                 hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
             )
             stop_entered = threading.Event()
@@ -2838,7 +2851,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             cfg = Config(
                 asr=AsrConfig(provider="dashscope"),
                 refiner=RefinerConfig(provider="off", include_git_status=False),
-                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                audio=AudioConfig(beep=False, tail_drain_sec=0.0),
                 hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
             )
             plat = MacOSPlatform(
@@ -3134,7 +3147,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             rt = Path(td) / "rt"
             rt.mkdir(parents=True, exist_ok=True)
             cfg = Config(
-                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                audio=AudioConfig(beep=False, tail_drain_sec=0.0),
                 hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
             )
 
@@ -3354,7 +3367,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             rt = Path(td) / "rt"
             rt.mkdir(parents=True, exist_ok=True)
             cfg = Config(
-                audio=AudioConfig(beep=False, save_recordings=False, tail_drain_sec=0.0),
+                audio=AudioConfig(beep=False, tail_drain_sec=0.0),
                 hotkey=HotkeyConfig(debounce_ms=0, scope="all"),
             )
             probe_entered = threading.Event()
@@ -3649,6 +3662,39 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                     break
             return [json.loads(ln) for ln in b"".join(chunks).decode("utf-8").splitlines() if ln.strip()]
 
+        def _wait_for_cmds(r_fd: int, expected_count: int, timeout: float = 2.0) -> list[dict[str, Any]]:
+            buf = bytearray()
+            cmds: list[dict[str, Any]] = []
+            deadline = time.monotonic() + timeout
+            while len(cmds) < expected_count:
+                rem = deadline - time.monotonic()
+                if rem <= 0.0:
+                    break
+                ready, _, _ = select.select([r_fd], [], [], min(0.05, rem))
+                if not ready:
+                    continue
+                while True:
+                    try:
+                        data = os.read(r_fd, 65536)
+                        if not data:
+                            break
+                        buf.extend(data)
+                    except BlockingIOError:
+                        break
+                while b"\n" in buf:
+                    nl = buf.index(b"\n")
+                    line = bytes(buf[:nl]).decode("utf-8").strip()
+                    del buf[: nl + 1]
+                    if line:
+                        cmds.append(json.loads(line))
+            self.assertGreaterEqual(
+                len(cmds),
+                expected_count,
+                f"timed out waiting for {expected_count} JSONL commands within {timeout}s; got {cmds!r}",
+            )
+            cmds.extend(_read_all_cmds(r_fd))
+            return cmds
+
         with tempfile.TemporaryDirectory() as td:
             rt = Path(td) / "rt"
             rt.mkdir(parents=True, exist_ok=True)
@@ -3701,9 +3747,8 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 with self.assertRaises(queue.Empty):
                     plat.start_recording(rt)
 
-                # Wait briefly for discard flush on writer A, then inspect both pipes.
-                time.sleep(0.05)
-                cmds_a = _read_all_cmds(ra_fd)
+                # Wait deterministically for discard flush on writer A, then inspect both pipes.
+                cmds_a = _wait_for_cmds(ra_fd, 2, timeout=2.0)
                 cmds_b = _read_all_cmds(rb_fd)
                 self.assertEqual([c["cmd"] for c in cmds_a], ["rec_start", "rec_stop"])
                 self.assertIs(cmds_a[1].get("discard"), True)
@@ -3731,8 +3776,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
 
                 plat._shim_rpc = _reply_on_a  # type: ignore[method-assign]
                 plat.stop_recording(drain=False)
-                time.sleep(0.05)
-                cmds_a2 = _read_all_cmds(ra_fd)
+                cmds_a2 = _wait_for_cmds(ra_fd, 1, timeout=2.0)
                 cmds_b2 = _read_all_cmds(rb_fd)
                 self.assertEqual([c["cmd"] for c in cmds_a2], ["rec_release"])
                 self.assertEqual(cmds_a2[0].get("rec_gen"), 9)

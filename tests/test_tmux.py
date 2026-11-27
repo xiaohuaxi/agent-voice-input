@@ -26,7 +26,10 @@ if str(SRC_ROOT) not in sys.path:
 
 
 def _is_ci() -> bool:
-    return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+    return (
+        os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+        or os.environ.get("AGENT_VOICE_INPUT_CI_NO_SKIP", "").strip().lower() in {"1", "true", "yes"}
+    )
 
 from agent_voice_input import session_title as VST  # noqa: E402
 from agent_voice_input._tmux import (  # noqa: E402
@@ -1901,7 +1904,7 @@ class TmuxRealIsolatedIntegrationTests(unittest.TestCase):
                 return AsrResult(text="WSL端tmux全链路验证通过。", provider="dashscope", model="qwen3-asr-flash", latency_ms=5)
 
         wsl_cfg = Config(refiner=RefinerConfig(provider="off"))
-        wsl_cfg.audio.wsl_source = "winmm"
+        wsl_cfg.audio.wsl_source = "wasapi"
         wsl_cfg.audio.tail_drain_sec = 0.0
         wsl_plat = WslPlatform(
             wsl_cfg,

@@ -36,6 +36,7 @@ from .config import (
     Config,
     ensure_secure_dir,
     explain_pipeline_selection,
+    format_archive_status_dict,
     get_runtime_dir,
     redact_secrets,
     resolve_credentials,
@@ -46,9 +47,9 @@ from .control_ipc import (
     CONTROL_REQUEST_READ_TIMEOUT_SEC,
     DAEMON_LOG_FILENAME,
     DEFAULT_DAEMON_LOG_MAX_BYTES,
+    DIAG_FILENAME,
+    DIAG_MAX_BYTES,
     RECENT_RESULTS_MAXLEN,
-    TELEMETRY_FILENAME,
-    TELEMETRY_MAX_BYTES,
     DaemonAlreadyRunningError,
     _has_window_fields,
     _is_control_peer_disconnected,
@@ -57,13 +58,15 @@ from .control_ipc import (
     _recv_control_request_line,
     _window_from_mapping,
     acquire_daemon_lock,
-    append_telemetry_record,
+    append_diag_record,
     build_daemon_status_response,
     compute_package_build_id,
     describe_daemon_drift,
+    format_local_iso_ts,
+    generate_utterance_id,
     merge_recent_results,
     probe_daemon_status,
-    read_telemetry_history,
+    read_diag_history,
     release_daemon_lock,
     rotate_daemon_log_if_needed,
     send_control_command,
@@ -84,6 +87,7 @@ from .daemon_pipeline import (
     _is_single_hop_asr_provider,
     _make_desktop_same_window_verifier,
     _may_run_stage2_refiner,
+    _maybe_spawn_utterance_archive,
     _resolve_effective_ui_language,
     _resolve_pipeline_window_routing,
     _resolve_stage1_context,
@@ -104,7 +108,7 @@ from .hotwords import (
     summarize_stage2_hotwords_budget,
 )
 from .http_transport import evict_all_keepalive_connections
-from .hud import format_copied_hud_text
+from .hud import format_copied_hud_text, format_refiner_fallback_hud_text
 from .platform_common import (
     ForegroundWindow,
     MicrophoneUnavailableError,
@@ -119,6 +123,23 @@ from .session_ctx import SessionSnapshot, SessionTracker, prune_stale_session_re
 _LOG_ROTATE_CHECK_INTERVAL_SEC: float = 60.0
 _FAILED_PRUNE_CHECK_INTERVAL_SEC: float = 3600.0
 _CLOSE_JOIN_TIMEOUT_SEC: float = 3.0
+_UNIX_SOCK_MAX_BYTES_DARWIN: int = 103
+_UNIX_SOCK_MAX_BYTES_LINUX: int = 107
+
+
+def _validate_unix_socket_path_length(
+    sock_path: Path | str, *, platform: str | None = None
+) -> None:
+    """Validate AF_UNIX ``sun_path`` encoded byte length before spawning native shims."""
+    eff_plat = sys.platform if platform is None else platform
+    max_bytes = _UNIX_SOCK_MAX_BYTES_DARWIN if eff_plat == "darwin" else _UNIX_SOCK_MAX_BYTES_LINUX
+    actual_bytes = len(os.fsencode(sock_path))
+    if actual_bytes > max_bytes:
+        raise OSError(
+            f"Unix control socket path is too long ({actual_bytes} bytes > {max_bytes}-byte limit "
+            f"for {eff_plat}): {sock_path}; set a shorter AGENT_VOICE_INPUT_RUNTIME_DIR "
+            "(for example /tmp/avi-rt)"
+        )
 
 
 def create_platform(cfg: Config, *, env: Mapping[str, str] | None = None) -> WslPlatform | MacOSPlatform:
@@ -291,7 +312,7 @@ class VoiceInputDaemon:
     @property
     def sock_path(self) -> Path: return self.runtime_dir / "control.sock"
     @property
-    def telemetry_path(self) -> Path: return self.runtime_dir / TELEMETRY_FILENAME
+    def diag_path(self) -> Path: return self.runtime_dir / DIAG_FILENAME
     @property
     def log_path(self) -> Path: return self.runtime_dir / DAEMON_LOG_FILENAME
 
@@ -332,14 +353,15 @@ class VoiceInputDaemon:
         self._owns_runtime_files = True
 
     def _record_result_locked(self, summary: dict[str, Any]) -> dict[str, Any]:
-        summary.setdefault("ts", round(time.time(), 6))
+        summary.setdefault("id", generate_utterance_id())
+        summary.setdefault("ts", format_local_iso_ts())
         self.last_result = summary
         snap = dict(summary)
         self.recent_results.append(snap)
         return snap
 
-    def _append_telemetry(self, summary: Mapping[str, Any]) -> None:
-        append_telemetry_record(self.runtime_dir, summary)
+    def _append_diag(self, summary: Mapping[str, Any]) -> None:
+        append_diag_record(self.runtime_dir, summary)
         self._maybe_rotate_daemon_log()
         self._maybe_prune_failed_audio()
 
@@ -732,7 +754,7 @@ class VoiceInputDaemon:
                         self._recorder_lost_ts = lost_ts
                         self._recorder_lost_stop_absorbed = False
                     lost_snap = self._record_result_locked(lr_lost)
-                self._append_telemetry(lost_snap)
+                self._append_diag(lost_snap)
                 if not eff_silent:
                     self._emit_capture_error_hud(
                         cur_seq=cur_seq,
@@ -834,11 +856,16 @@ class VoiceInputDaemon:
             if clear_stopping:
                 self._stopping_capture = False
             err_state = self._recompute_state_locked()
-            lr: dict[str, Any] = {"seq_id": cur_seq, "ok": False, "error": err}
+            lr: dict[str, Any] = {
+                "seq_id": cur_seq,
+                "ok": False,
+                "error": err,
+                "delivery_status": "undelivered_unrecoverable",
+            }
             if err_reason:
                 lr["skipped_reason"] = err_reason
             lr_snap = self._record_result_locked(lr)
-        self._append_telemetry(lr_snap)
+        self._append_diag(lr_snap)
         if still_cur and not eff_silent:
             self._emit_capture_error_hud(
                 cur_seq=cur_seq,
@@ -974,7 +1001,7 @@ class VoiceInputDaemon:
 
             if mode == "queue_full":
                 if queue_full_toast:
-                    self._hud("mic_unavailable", clear_main=False)
+                    self._hud("queue_full", clear_main=False)
                 return {"ok": False, "ignored": "queue_full", "state": cur_state, "seq_id": cur_seq}
 
             if mode == "cancel":
@@ -1489,7 +1516,15 @@ class VoiceInputDaemon:
 
     def _run_stage1_for_utterance(self, task: _QueuedUtterance) -> None:
         q_wait_ms = max(0, int(round((self.clock_fn() - task.enqueued_ts) * 1000)))
-        st = _Stage1State(t_total0=time.monotonic(), queue_wait_ms=q_wait_ms, win=task.origin_win)
+        now_ts = time.time()
+        st = _Stage1State(
+            t_total0=time.monotonic(),
+            queue_wait_ms=q_wait_ms,
+            win=task.origin_win,
+            utterance_id=generate_utterance_id(now_ts),
+            record_ts=now_ts,
+            record_ts_iso=format_local_iso_ts(now_ts),
+        )
         slot = _CommitSlot(task=task, st=st)
         cancel_fn = lambda: self._stop_evt.is_set() or task.cancel_token.is_cancelled()
         reason_fn = lambda: (
@@ -1664,6 +1699,17 @@ class VoiceInputDaemon:
             deliver_fn=lambda t, txt, win, ver: self._deliver_for_utterance(
                 t, txt, win, same_window_verifier=ver
             ),
+            on_archive_ready=lambda res_ok: _maybe_spawn_utterance_archive(
+                cfg=self.cfg,
+                env=self.env,
+                raw_wav=task.raw_wav,
+                st=st,
+                res=res_ok,
+                audio_source=task.audio_source,
+                archive_sink=self._register_archive_thread,
+                creds=self.creds,
+                stop_evt=self._stop_evt,
+            ),
         )
 
     def _commit_worker_loop(self) -> None:
@@ -1687,7 +1733,7 @@ class VoiceInputDaemon:
                 return
 
             outcome = self._finalize_commit_slot(slot)
-            if outcome is None or self._stop_evt.is_set():
+            if outcome is None:
                 with self._queue_cv:
                     if self._commit_queue and self._commit_queue[0] is slot:
                         self._commit_queue.popleft()
@@ -1698,8 +1744,17 @@ class VoiceInputDaemon:
                 continue
 
             summary, hud_st, hud_dur_ms, beep_k = outcome
-            summary.setdefault("ts", round(time.time(), 6))
-            self._append_telemetry(summary)
+            summary.setdefault("id", generate_utterance_id())
+            summary.setdefault("ts", format_local_iso_ts())
+            self._append_diag(summary)
+            if self._stop_evt.is_set():
+                with self._queue_cv:
+                    if self._commit_queue and self._commit_queue[0] is slot:
+                        self._commit_queue.popleft()
+                    self._record_result_locked(summary)
+                    self._recompute_state_locked()
+                    self._queue_cv.notify_all()
+                return
             copied_hud_text = ""
             if hud_st == "copied":
                 paste_reason = str(summary.get("paste_reason") or "")
@@ -1720,6 +1775,14 @@ class VoiceInputDaemon:
                             self.cfg, env=self.env, platform=self.platform
                         ),
                     )
+            elif hud_st == "refiner_fallback":
+                copied_hud_text = format_refiner_fallback_hud_text(
+                    str(summary.get("refiner_warning") or ""),
+                    copied_only=bool(not summary.get("pasted") and summary.get("clipboard")),
+                    lang=_resolve_effective_ui_language(
+                        self.cfg, env=self.env, platform=self.platform
+                    ),
+                )
 
             task = slot.task
             play_beep = ""
@@ -1941,6 +2004,12 @@ class VoiceInputDaemon:
                 remote_hosts=remote_hosts,
                 mem_recent_results=mem_snap,
                 hotwords=hw_status,
+                archive=format_archive_status_dict(self.cfg.archive),
+                hotkey={
+                    "key": self.cfg.hotkey.key,
+                    "trigger_mode": self.cfg.hotkey.trigger_mode,
+                    "scope": self.cfg.hotkey.scope,
+                },
             )
         if cmd in ("toggle", "rec_start", "rec_stop"):
             win = _window_from_mapping(req) if _has_window_fields(req) else None
@@ -1967,6 +2036,25 @@ class VoiceInputDaemon:
         if cmd == "probe_route":
             return self._execute_probe_route(req)
         if cmd == "shutdown":
+            raw_expected = req.get("expected_pid")
+            if raw_expected is not None:
+                if (
+                    isinstance(raw_expected, bool)
+                    or not isinstance(raw_expected, int)
+                    or raw_expected <= 0
+                ):
+                    return {
+                        "ok": False,
+                        "error": "invalid expected_pid",
+                        "pid": os.getpid(),
+                    }
+                cur_pid = os.getpid()
+                if raw_expected != cur_pid:
+                    return {
+                        "ok": False,
+                        "error": "pid_mismatch",
+                        "pid": cur_pid,
+                    }
             self._initiate_shutdown()
             return {"ok": True, "stopping": True}
         return {"ok": False, "error": f"unknown cmd: {cmd}"}
@@ -2050,17 +2138,17 @@ class VoiceInputDaemon:
         selftest_tracker, owns_tracker = self._make_probe_tracker()
         acquired_shared = False
 
-        def _alloc_seq(no_telemetry: bool) -> int:
-            if no_telemetry:
+        def _alloc_seq(no_diag: bool) -> int:
+            if no_diag:
                 return 0
             with self._lock:
                 self.seq_id += 1
                 return self.seq_id
 
-        def _record_telemetry(summary: dict[str, Any]) -> None:
+        def _record_diag(summary: dict[str, Any]) -> None:
             with self._lock:
                 st_snap = self._record_result_locked(summary)
-            self._append_telemetry(st_snap)
+            self._append_diag(st_snap)
 
         try:
             if not self._acquire_shared_resources(
@@ -2091,7 +2179,7 @@ class VoiceInputDaemon:
                 build_summary_fn=lambda seq, res, dry: self._build_summary(
                     seq, res, dry_run=dry, audio_error=""
                 ),
-                record_telemetry_fn=_record_telemetry,
+                record_diag_fn=_record_diag,
             )
         finally:
             if acquired_shared:
@@ -2429,6 +2517,7 @@ class VoiceInputDaemon:
         prev_int = signal.signal(signal.SIGINT, lambda *_: sig_stop.set()) if is_main else None
         prev_term = signal.signal(signal.SIGTERM, lambda *_: sig_stop.set()) if is_main else None
         try:
+            _validate_unix_socket_path_length(self.sock_path)
             self.acquire_lock()
             self.sock_path.unlink(missing_ok=True)
             srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -2456,16 +2545,20 @@ class VoiceInputDaemon:
                 except OSError: break
                 self._handle_control_client(conn)
         finally:
-            if is_main and prev_int is not None: signal.signal(signal.SIGINT, prev_int)
-            if is_main and prev_term is not None: signal.signal(signal.SIGTERM, prev_term)
-            self.close()
+            try:
+                self.close()
+            finally:
+                if is_main and prev_int is not None:
+                    signal.signal(signal.SIGINT, prev_int)
+                if is_main and prev_term is not None:
+                    signal.signal(signal.SIGTERM, prev_term)
 
     def _register_archive_thread(self, th: threading.Thread) -> None:
         with self._lock:
             self._archive_threads = {t for t in self._archive_threads if t.is_alive()}
             self._archive_threads.add(th)
 
-    def wait_pending_archives(self, timeout_sec: float = 2.0) -> None:
+    def wait_pending_archives(self, timeout_sec: float = 4.0) -> None:
         with self._lock:
             pending = [t for t in self._archive_threads if t.is_alive()]
         if pending:
@@ -2514,7 +2607,7 @@ class VoiceInputDaemon:
             # Deliberate exception: if an active control worker still holds shared refiner/tracker
             # past the bounded join deadline, defer final close() to that worker's finally block
             # so shutdown stays bounded while preventing both mid-use teardown and resource leaks.
-            self.wait_pending_archives(timeout_sec=2.0)
+            self.wait_pending_archives(timeout_sec=4.5)
             self.platform.close()
         finally:
             # Never unlink daemon.lock: unlinking causes a classic inode race allowing two concurrent daemons.

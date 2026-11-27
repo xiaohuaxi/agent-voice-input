@@ -30,6 +30,7 @@ if str(_SRC_ROOT) not in sys.path:
 
 from agent_voice_input import __version__  # noqa: E402
 from agent_voice_input.config import (  # noqa: E402
+    ArchiveConfig,
     Config,
     RefinerConfig,
     ensure_secure_dir,
@@ -175,9 +176,9 @@ def _build_synthetic_session(rt_dir: Path, tracker: SessionTracker) -> SessionSn
             + ("# synthetic reference log filler block for stage2 prefix cache hit measurement\n" * 340),
         ),
         (
-            "daemon.py 里的 telemetry.jsonl 权限和原子截尾是怎么实现的？",
-            "append_telemetry_record 强制使用 0600 权限并在超过 TELEMETRY_MAX_BYTES (256KB) 时通过同目录临时文件与 os.replace 保留后半段完整 JSON 行。\n"
-            + ("# synthetic daemon telemetry verification padding block\n" * 340),
+            "daemon.py 里的 diag.jsonl 权限和原子截尾是怎么实现的？",
+            "append_diag_record 强制使用 0600 权限并在超过 DIAG_MAX_BYTES (256KB) 时通过同目录临时文件与 os.replace 保留后半段完整 JSON 行。\n"
+            + ("# synthetic daemon diagnostic log verification padding block\n" * 340),
         ),
     ]
     for idx in range(6):
@@ -487,13 +488,14 @@ def _clone_Config_for_provider(
         timeout_sec=base_cfg.refiner.timeout_sec,
         max_retries=base_cfg.refiner.max_retries,
         force_on_single_hop=base_cfg.refiner.force_on_single_hop,
-        prompt=base_cfg.refiner.prompt,
+        extra_instructions=base_cfg.refiner.extra_instructions,
         include_git_status=include_git,
         context_max_chars=max_chars,
     )
     return Config(
         hotkey=base_cfg.hotkey,
-        audio=dataclasses.replace(base_cfg.audio, save_recordings=False),
+        audio=base_cfg.audio,
+        archive=ArchiveConfig(save_transcripts=False, save_audio=False),
         ui=base_cfg.ui,
         asr=base_cfg.asr,
         refiner=ref_cfg,

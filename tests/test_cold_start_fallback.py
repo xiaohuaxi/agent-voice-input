@@ -1,4 +1,4 @@
-"""Offline unit tests for Agent Session cold-start fallback (Layer 0, Layer 1, Layer 2, SSH remote, telemetry)."""
+"""Offline unit tests for Agent Session cold-start fallback (Layer 0, Layer 1, Layer 2, SSH remote, local diag)."""
 from __future__ import annotations
 
 import contextlib
@@ -38,7 +38,7 @@ from agent_voice_input.daemon import (  # noqa: E402
     run_pipeline_once,
 )
 from agent_voice_input.diagnose import (  # noqa: E402
-    _sanitize_telemetry_record,
+    _sanitize_diag_record,
     collect_live_diagnostics,
 )
 from agent_voice_input.http_transport import HttpResponse  # noqa: E402
@@ -1210,8 +1210,8 @@ class TestColdStartSshRemoteAndDiagnose(unittest.TestCase):
             cfg = Config(refiner=RefinerConfig(provider="off"))
             env = {"HOME": td}
 
-            # Verify build_pipeline_summary + _sanitize_telemetry_record allowlist
-            clean_ok = _sanitize_telemetry_record(
+            # Verify build_pipeline_summary + _sanitize_diag_record allowlist
+            clean_ok = _sanitize_diag_record(
                 {"ok": True, "ctx_fallback": "prior_session", "secret_prior_text": "SENSITIVE_PROSE"},
                 lambda s: s,
             )
@@ -1219,14 +1219,14 @@ class TestColdStartSshRemoteAndDiagnose(unittest.TestCase):
             self.assertNotIn("secret_prior_text", clean_ok)
 
             # Non-enum / path / prose stuffed into ctx_fallback MUST be sanitized to ""
-            clean_bad = _sanitize_telemetry_record(
+            clean_bad = _sanitize_diag_record(
                 {"ok": True, "ctx_fallback": "/home/secret/repo/private.jsonl"},
                 lambda s: s,
             )
             self.assertEqual(clean_bad["ctx_fallback"], "")
 
-            # End-to-end telemetry.jsonl -> collect_live_diagnostics
-            tel_path = rt_dir / "telemetry.jsonl"
+            # End-to-end diag.jsonl -> collect_live_diagnostics
+            tel_path = rt_dir / "diag.jsonl"
             rec_line = json.dumps(
                 {
                     "ts": time.time(),

@@ -954,6 +954,9 @@ public static partial class VoiceWinShim {
         } else if (st == "mic_unavailable") {
             txt = zh ? "! \u9EA6\u514B\u98CE\u6682\u5FD9\uFF0C\u8BF7\u518D\u8BD5\u4E00\u6B21" : "! Microphone busy, try again";
             bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 2600; iconKind = "warning";
+        } else if (st == "queue_full") {
+            txt = zh ? "! \u5F85\u5904\u7406\u961F\u5217\u5DF2\u6EE1\uFF0C\u8BF7\u7A0D\u5019" : "! Dictation queue full, please wait";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 2600; iconKind = "warning";
         } else if (st == "mic_no_stream") {
             txt = zh ? "! \u9EA6\u514B\u98CE\u65E0\u97F3\u9891\u6D41\uFF0C\u8BF7\u68C0\u67E5\u8033\u673A/\u8BBE\u5907" : "! No mic audio stream, check headset";
             bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 2600; iconKind = "warning";
@@ -972,6 +975,9 @@ public static partial class VoiceWinShim {
         } else if (st == "partial_asr_copied_unsaved") {
             txt = zh ? "! \u5DF2\u590D\u5236\uFF0C\u90E8\u5206\u8BED\u97F3\u672A\u8BC6\u522B" : "! Copied; partial speech missed";
             bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 3200; iconKind = "warning";
+        } else if (st == "refiner_fallback") {
+            txt = zh ? "\u26A0 \u5DF2\u8D34\u539F\u6587(\u7CBE\u4FEE\u5931\u8D25)" : "\u26A0 Raw pasted (refiner failed)";
+            bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 4000; iconKind = "warning";
         } else if (st == "asr_empty_retry") {
             txt = zh ? "! \u8BC6\u522B\u4E3A\u7A7A\uFF0C\u5DF2\u5B58\u5F55\u97F3\u53EF\u91CD\u8BD5" : "! Empty transcript, audio saved for retry";
             bg = toastBg; ic = toastAmber; mc = toastMain; hc = toastHint; bd = toastAmberBorder; ms = 3200; iconKind = "warning";
@@ -980,6 +986,9 @@ public static partial class VoiceWinShim {
             bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoralBorder; ms = 2600; iconKind = "cross";
         } else if (st == "paste_failed_retry") {
             txt = zh ? "\u2715 \u586B\u5165\u5931\u8D25\uFF0C\u5DF2\u5B58\u5F55\u97F3\u53EF\u91CD\u8BD5" : "\u2715 Insert failed, audio saved for retry";
+            bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoralBorder; ms = 3200; iconKind = "cross";
+        } else if (st == "error_retry") {
+            txt = zh ? "\u2715 \u8BC6\u522B\u5931\u8D25\uFF0C\u5DF2\u5B58\u5F55\u97F3\u53EF\u91CD\u8BD5" : "\u2715 Transcription failed, audio saved for retry";
             bg = toastBg; ic = toastCoral; mc = toastMain; hc = toastHint; bd = toastCoralBorder; ms = 3200; iconKind = "cross";
         } else if (st == "no_mic") {
             txt = zh ? "\u2715 \u65E0\u53EF\u7528\u9EA6\u514B\u98CE" : "\u2715 No microphone found";

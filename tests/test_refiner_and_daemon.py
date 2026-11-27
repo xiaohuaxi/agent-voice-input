@@ -18,7 +18,10 @@ if str(_SRC_ROOT) not in sys.path:
 
 
 def _is_ci() -> bool:
-    return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+    return (
+        os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+        or os.environ.get("AGENT_VOICE_INPUT_CI_NO_SKIP", "").strip().lower() in {"1", "true", "yes"}
+    )
 
 from agent_voice_input.asr_providers import (  # noqa: E402
     AsrContext,
@@ -30,7 +33,7 @@ from agent_voice_input.asr_providers import (  # noqa: E402
     reset_rate_limit_pacers,
 )
 from agent_voice_input.audio_proc import pack_pcm16_mono_wav  # noqa: E402
-from agent_voice_input.config import Config, ConfigError, HotkeyConfig, RefinerConfig, _parse_simple_toml, load_config, load_env_files, parse_toml, resolve_credentials  # noqa: E402
+from agent_voice_input.config import ArchiveConfig, Config, ConfigError, HotkeyConfig, RefinerConfig, _parse_simple_toml, load_config, load_env_files, parse_toml, resolve_credentials  # noqa: E402
 from agent_voice_input.daemon import (  # noqa: E402
     MAX_ASR_CHUNK_CONCURRENCY,
     VoiceInputDaemon,
@@ -445,20 +448,22 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
         self.assertEqual(parsed["asr"]["provider"], "auto")
         self.assertEqual(parsed["asr"]["model"], "")
         self.assertEqual(parsed["asr"]["api"], "auto")
-        self.assertEqual(parsed["asr"]["effort"], "auto")
+        self.assertEqual(parsed["asr"]["effort"], "")
         self.assertEqual(parsed["refiner"]["provider"], "auto")
         self.assertEqual(parsed["refiner"]["model"], "")
         self.assertEqual(parsed["refiner"]["api"], "auto")
-        self.assertNotIn("max_turns_per_thread", parsed["refiner"])
-        self.assertIn("# max_turns_per_thread = 0", toml_raw)
+        self.assertEqual(parsed["refiner"]["effort"], "")
+        self.assertNotIn("session_max_turns", parsed["refiner"])
+        self.assertIn("# session_max_turns = 0", toml_raw)
         self.assertIn("# timeout_ms = 800", toml_raw)
+        self.assertNotIn("max_turns_per_thread", toml_raw)
         self.assertNotIn("max_turns_per_thread", (_REPO_ROOT / "README.md").read_text(encoding="utf-8"))
         self.assertNotIn("max_turns_per_thread", (_REPO_ROOT / "README.zh-CN.md").read_text(encoding="utf-8"))
         cfg, _ = load_config(config_path=toml_path, env={"HOME": "/tmp/nonexistent-home"})
         self.assertEqual(cfg.hotkey.scope, "all")
         self.assertIs(cfg.hotkey.yield_remote_desktop, True)
         self.assertEqual(cfg.hotkey.ignore_apps, ())
-        self.assertIs(cfg.hotkey.only_in_terminals, False)
+        self.assertFalse(hasattr(cfg.hotkey, "only_in_terminals"))
         self.assertEqual(cfg.ui.language, "auto")
         self.assertEqual(cfg.ui.position, "bottom")
         self.assertEqual(cfg.audio.macos_device, "default")
@@ -500,7 +505,7 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
 
         proj = data["project"]
         self.assertEqual(proj["name"], "agent-voice-input")
-        self.assertEqual(proj["version"], "0.17.0")
+        self.assertEqual(proj["version"], "0.18.0")
         self.assertEqual(proj["requires-python"], ">=3.10")
         self.assertEqual(proj["license"], "Apache-2.0")
         self.assertEqual(
@@ -545,10 +550,11 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
             self.assertNotIn("service_tier", joined.lower())
             ref.close()
 
-            # Verify stateless /responses reasoning effort mapping across concrete / auto / default & strict no-Fast
+            # Verify stateless /responses reasoning effort mapping across recommended("") / concrete / default & strict no-Fast
             srv = _LocalResponsesServer()
             try:
                 for eff, expected_wire_eff in (
+                    ("", "low"),
                     ("none", "none"),
                     ("minimal", "minimal"),
                     ("low", "low"),
@@ -556,7 +562,6 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
                     ("high", "high"),
                     ("xhigh", "xhigh"),
                     ("max", "max"),
-                    ("auto", None),
                     ("default", None),
                 ):
                     cfg_eff = Config(
@@ -587,6 +592,28 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
                         self.assertNotIn("reasoning", sent_body)
                     else:
                         self.assertEqual(sent_body["reasoning"], {"effort": expected_wire_eff})
+                # Codex subscription with o3/gpt-5-codex-mini clamps "none"/"minimal" -> "low" and omits on gpt-4o-mini
+                for c_mod, c_eff, exp_rsn in (
+                    ("o3", "none", {"effort": "low"}),
+                    ("gpt-5-codex-mini", "minimal", {"effort": "low"}),
+                    ("gpt-5-mini", "none", {"effort": "minimal"}),
+                    ("gpt-4o-mini", "none", None),
+                ):
+                    cfg_c = Config(
+                        refiner=RefinerConfig(
+                            provider="codex",
+                            model=c_mod,
+                            base_url=srv.base_url,
+                            effort=c_eff,
+                            timeout_sec=3.0,
+                        )
+                    )
+                    r_c = CodexRefiner(cfg_c, env={"HOME": str(tmp)}, runtime_dir=tmp)
+                    try:
+                        r_c.refine("边界模型")
+                    finally:
+                        r_c.close()
+                    self.assertEqual(srv.requests[-1]["body"].get("reasoning"), exp_rsn, (c_mod, c_eff))
             finally:
                 srv.close()
 
@@ -777,7 +804,7 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
                 self.assertEqual(res1.text, "绝不丢失的用户原话")
                 self.assertEqual(res1.provider, "codex")
                 self.assertEqual(res1.used_fallback, "asr_draft")
-                self.assertIn("[REDACTED]", res1.warning)
+                self.assertIn("HTTP 400 (bad_request)", res1.warning)
                 for forbidden in ("MOCK_SECRET_9999", secret_acct, secret_tok):
                     self.assertNotIn(forbidden, res1.warning)
 
@@ -850,16 +877,16 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
 
         # 2. OpenRouter, DashScope, Volcengine, DeepSeek, Groq, SiliconFlow, OpenAI, and keyless loopback openai-compatible
         matrix = [
-            ("openrouter", "", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "minimal"}}),
+            ("openrouter", "", "", "", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "minimal"}}),
             ("openrouter", "", "", "none", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "minimal"}}),
             ("openrouter", "", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "low"}}),
             ("openrouter", "", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {}),
             ("openrouter", "google/gemini-2.5-flash-lite", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "low"}}),
-            ("openrouter", "google/gemini-2.5-flash-lite", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "none"}}),
+            ("openrouter", "google/gemini-2.5-flash-lite", "", "", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "none"}}),
             ("openrouter", "google/gemini-2.5-flash-lite", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {}),
-            ("openrouter", "minimax/minimax-m3.1-flash", "", "auto", "https://openrouter.ai/api/v1/chat/completions", "minimax/minimax-m3.1-flash", {"reasoning": {"effort": "minimal"}}),
+            ("openrouter", "minimax/minimax-m3.1-flash", "", "", "https://openrouter.ai/api/v1/chat/completions", "minimax/minimax-m3.1-flash", {"reasoning": {"effort": "minimal"}}),
             ("openrouter", "anthropic/claude-haiku-5.5", "", "none", "https://openrouter.ai/api/v1/chat/completions", "anthropic/claude-haiku-5.5", {"reasoning": {"effort": "none"}}),
-            ("dashscope", "", "", "auto", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.8-flash", {"enable_thinking": False}),
+            ("dashscope", "", "", "", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.8-flash", {"enable_thinking": False}),
             ("dashscope", "", "", "low", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.8-flash", {"enable_thinking": True}),
             ("groq", "", "", "low", "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile", {}),
             ("siliconflow", "", "", "low", "https://api.siliconflow.cn/v1/chat/completions", "Qwen/Qwen2.5-7B-Instruct", {}),
@@ -867,14 +894,18 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
             # non-reasoning override gpt-4o-mini omits reasoning_effort so it never 400s
             ("openai", "", "", "low", "https://api.openai.com/v1/chat/completions", "gpt-6-luna", {"reasoning_effort": "low"}),
             ("openai", "gpt-4o-mini", "", "low", "https://api.openai.com/v1/chat/completions", "gpt-4o-mini", {}),
+            ("openai", "gpt-4o-mini", "", "none", "https://api.openai.com/v1/chat/completions", "gpt-4o-mini", {}),
             ("openai", "o4-mini", "", "medium", "https://api.openai.com/v1/chat/completions", "o4-mini", {"reasoning_effort": "medium"}),
+            ("openai", "o4-mini", "", "none", "https://api.openai.com/v1/chat/completions", "o4-mini", {"reasoning_effort": "low"}),
             ("openai", "gpt-5-mini", "", "default", "https://api.openai.com/v1/chat/completions", "gpt-5-mini", {}),
-            ("openai", "gpt-6-luna", "", "auto", "https://api.openai.com/v1/chat/completions", "gpt-6-luna", {}),
+            ("openai", "gpt-5-mini", "", "none", "https://api.openai.com/v1/chat/completions", "gpt-5-mini", {"reasoning_effort": "minimal"}),
+            ("openai", "gpt-6-luna", "", "none", "https://api.openai.com/v1/chat/completions", "gpt-6-luna", {"reasoning_effort": "none"}),
             # Custom third-party base_url on openai stays conservatively on chat-completions under api="auto"
             ("openai", "gpt-6-luna", "https://relay.example.com/v1", "low", "https://relay.example.com/v1/chat/completions", "gpt-6-luna", {"reasoning_effort": "low"}),
             ("openrouter", "openai/o3-mini", "", "low", "https://openrouter.ai/api/v1/chat/completions", "openai/o3-mini", {"reasoning": {"effort": "low"}}),
-            ("openai-compatible", "deepseek-flash", "https://api.deepseek.com/v1", "auto", "https://api.deepseek.com/v1/chat/completions", "deepseek-flash", {"thinking": {"type": "disabled"}}),
-            ("openai-compatible", "local-qwen", "http://127.0.0.1:8000/v1", "auto", "http://127.0.0.1:8000/v1/chat/completions", "local-qwen", {}),
+            ("openrouter", "openai/o3-mini", "", "none", "https://openrouter.ai/api/v1/chat/completions", "openai/o3-mini", {"reasoning": {"effort": "low"}}),
+            ("openai-compatible", "deepseek-flash", "https://api.deepseek.com/v1", "", "https://api.deepseek.com/v1/chat/completions", "deepseek-flash", {"thinking": {"type": "disabled"}}),
+            ("openai-compatible", "local-qwen", "http://127.0.0.1:8000/v1", "", "http://127.0.0.1:8000/v1/chat/completions", "local-qwen", {}),
         ]
         no_temp_models = {"o4-mini", "gpt-5-mini", "gpt-6-luna", "openai/o3-mini"}
         for prov, m_override, b_url, eff, exp_url, exp_model, exp_extra in matrix:
@@ -1030,9 +1061,10 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         volc_fb = volc_ref.refine("边界脱敏原稿")
         self.assertEqual(volc_fb.text, "边界脱敏原稿")
         self.assertEqual(volc_fb.used_fallback, "asr_draft")
-        self.assertIn("[REDACTED]", volc_fb.warning)
+        self.assertIn("HTTP 502 (server_error)", volc_fb.warning)
         self.assertNotIn(volc_secret, volc_fb.warning)
         self.assertNotIn("volcprefix", volc_fb.warning)
+        self.assertNotIn("trailing_tail", volc_fb.warning)
 
         gem_body = f"{pad}{gem_secret} trailing_tail"
         self.assertGreater(len(pad) + len(gem_secret), 180)
@@ -1046,9 +1078,10 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
         gem_fb = gem_ref.refine("Gemini 边界脱敏原稿")
         self.assertEqual(gem_fb.text, "Gemini 边界脱敏原稿")
         self.assertEqual(gem_fb.used_fallback, "asr_draft")
-        self.assertIn("[REDACTED]", gem_fb.warning)
+        self.assertIn("HTTP 502 (server_error)", gem_fb.warning)
         self.assertNotIn(gem_secret, gem_fb.warning)
         self.assertNotIn("geminipref", gem_fb.warning)
+        self.assertNotIn("trailing_tail", gem_fb.warning)
 
     def test_long_text_refiner_timeout_adaptive_relaxation(self) -> None:
         # Small unit-test timeout (< 10.0s) and short text (<= 600 chars) keep exact base timeout
@@ -1774,7 +1807,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         with mock.patch("sys.stdout", ver_buf), self.assertRaises(SystemExit) as ver_exit:
             parser.parse_args(["--version"])
         self.assertEqual(ver_exit.exception.code, 0)
-        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.17.0")
+        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.18.0")
 
         # Offline _cmd_doctor verification: displays resolved provider/model/api/effort and NEVER leaks raw secrets
         with tempfile.TemporaryDirectory() as td:
@@ -1804,7 +1837,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 rc = cli_mod._cmd_doctor(cfg, merged_env)
             out = buf.getvalue()
             self.assertEqual(rc, 0, out)
-            self.assertIn("selected=openrouter (model=qwen/qwen3-asr-1.7b, api=audio-transcriptions, effort=auto) -> OK", out)
+            self.assertIn("selected=openrouter (model=qwen/qwen3-asr-1.7b, api=audio-transcriptions, effort=none (recommended)) -> OK", out)
             self.assertIn("openrouter=OK (via OPENROUTER_API_KEY)", out)
             self.assertIn("[refiner]   OK openrouter (model=google/gemini-3.8-flash, api=chat-completions, effort=low)", out)
             self.assertNotIn(secret_or, out)
@@ -2350,7 +2383,8 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         with self.assertRaises(AsrError) as cm_ab:
             _transcribe_wav_chunks(two_chunk_wav, eff_asr=prov_ab, asr_ctx=None, floor_dbfs=-50.0, max_chunk_sec=2.1)
         self.assertLess(time.monotonic() - t_ab0, 0.8)
-        self.assertIn("Invalid API key", str(cm_ab.exception))
+        self.assertIn("HTTP 401 (unauthorized)", str(cm_ab.exception))
+        self.assertNotIn("Invalid API key", str(cm_ab.exception))
         reset_rate_limit_pacers()
 
         # 3. Empty Stage 1 finishing during seq 2 recording keeps main HUD on 'recording' (clear_main=False) & suppresses error beep
@@ -2563,35 +2597,36 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             self.assertEqual(len(ref_calls), 1)
 
     def test_only_in_terminals_config_windows_whitelist_and_daemon_gate_invariants(self) -> None:
-        # 1. Config & env overrides for [hotkey] scope & backward-compatible only_in_terminals
+        # 1. Config & env overrides for [hotkey] scope & legacy only_in_terminals rejection
         self.assertEqual(Config().hotkey.scope, "all")
-        self.assertIs(Config().hotkey.only_in_terminals, False)
+        self.assertFalse(hasattr(Config().hotkey, "only_in_terminals"))
         self.assertIs(Config().hotkey.yield_remote_desktop, True)
         with tempfile.TemporaryDirectory() as td_cfg:
             home = Path(td_cfg)
             cfg_dir = home / ".agent-voice-input"
             cfg_dir.mkdir(parents=True)
-            (cfg_dir / "config.toml").write_text("[hotkey]\nonly_in_terminals = false\n", encoding="utf-8")
-            c_false, _ = load_config(env={"HOME": str(home)}, home_dir=home)
-            self.assertIs(c_false.hotkey.only_in_terminals, False)
+            (cfg_dir / "config.toml").write_text('[hotkey]\nscope = "all"\n', encoding="utf-8")
+            c_all, _ = load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertEqual(c_all.hotkey.scope, "all")
 
             # Ordinary *_ONLY_IN_TERMINALS env vars do not override config.toml; cli_overrides do
             c_env_ignored, _ = load_config(
                 env={"HOME": str(home), "AGENT_VOICE_INPUT_ONLY_IN_TERMINALS": "true"},
                 home_dir=home,
             )
-            self.assertIs(c_env_ignored.hotkey.only_in_terminals, False)
+            self.assertEqual(c_env_ignored.hotkey.scope, "all")
 
-            c_cli_true, _ = load_config(
+            c_cli_term, _ = load_config(
                 env={"HOME": str(home)},
                 home_dir=home,
-                cli_overrides={"hotkey.only_in_terminals": True},
+                cli_overrides={"hotkey.scope": "terminals"},
             )
-            self.assertIs(c_cli_true.hotkey.only_in_terminals, True)
+            self.assertEqual(c_cli_term.hotkey.scope, "terminals")
 
-            (cfg_dir / "config.toml").write_text("[hotkey]\nonly_in_terminals = 123\n", encoding="utf-8")
-            with self.assertRaises(ConfigError):
+            (cfg_dir / "config.toml").write_text("[hotkey]\nonly_in_terminals = false\n", encoding="utf-8")
+            with self.assertRaises(ConfigError) as cm_oit:
                 load_config(env={"HOME": str(home)}, home_dir=home)
+            self.assertIn("hotkey.scope", str(cm_oit.exception))
 
         # 2. Windows terminal whitelist single source of truth
         wplat = WslPlatform(Config(), env={"AGENT_VOICE_INPUT_PULSE_SOURCE": "custom_src"})
@@ -2728,9 +2763,9 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 now[0] += 0.3
                 daemon.handle_trigger("ptt_cancel")
 
-                # only_in_terminals = False maps to scope="all": non-remote apps start recording,
+                # scope="all": non-remote apps start recording,
                 # while remote desktop clients still yield silently until yield_remote_desktop=False
-                daemon.cfg.hotkey.only_in_terminals = False
+                daemon.cfg.hotkey.scope = "all"
                 self.assertEqual(daemon.cfg.hotkey.scope, "all")
                 now[0] += 0.5
                 r_rdp_yield = daemon.handle_trigger("toggle", rdp_win, from_hotkey=True)
@@ -3634,7 +3669,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             from agent_voice_input.config import AudioConfig
             from agent_voice_input.platform_wsl import WslPlatform
 
-            wplat_race = WslPlatform(Config(audio=AudioConfig(wsl_source="winmm")), env={"HOME": td})
+            wplat_race = WslPlatform(Config(audio=AudioConfig(wsl_source="wasapi")), env={"HOME": td})
             early_lost_evt = threading.Event()
             wplat_race.set_recorder_lost_callback(lambda seq_id=None: early_lost_evt.set())
 
@@ -3660,7 +3695,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             wplat_race.cancel_recording()
 
             # Stale queued Windows rec_lost / rec_recovered from rec_gen=1 must NEVER stop a newly started session!
-            wplat_stale = WslPlatform(Config(audio=AudioConfig(wsl_source="winmm")), env={"HOME": td})
+            wplat_stale = WslPlatform(Config(audio=AudioConfig(wsl_source="wasapi")), env={"HOME": td})
             stale_gens: list[int] = []
             wplat_stale._ensure_shim = lambda *, ignore_cooldown=False: True  # type: ignore[method-assign]
             wplat_stale._shim_rpc = lambda payload, timeout_sec=4.0, **kw: (  # type: ignore[method-assign]
@@ -3998,11 +4033,21 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=fake_toggle_ok),
                 mock.patch("sys.stdout", toggle_out),
             ):
-                rc_tog_ok = cli_mod.main(["toggle"])
+                rc_tog_ok = cli_mod.main(["toggle", "--json"])
             self.assertEqual(rc_tog_ok, 0)
             self.assertEqual(len(seen_toggle_timeouts), 1)
             self.assertGreaterEqual(seen_toggle_timeouts[0], 20.0)
-            self.assertIn('"recording"', toggle_out.getvalue())
+            self.assertEqual(json.loads(toggle_out.getvalue())["state"], "recording")
+
+            toggle_human = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=fake_toggle_ok),
+                mock.patch("sys.stdout", toggle_human),
+            ):
+                rc_tog_h = cli_mod.main(["toggle"])
+            self.assertEqual(rc_tog_h, 0)
+            self.assertIn("recording (seq=1)", toggle_human.getvalue())
 
             for timeout_exc in (TimeoutError("timed out"), sock_mod.timeout("socket timed out")):
                 tog_to_err = io.StringIO()
@@ -4032,7 +4077,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=TimeoutError("status timeout")),
                 mock.patch("sys.stdout", st_to_out),
             ):
-                rc_st_to = cli_mod.main(["status"])
+                rc_st_to = cli_mod.main(["status", "--json"])
             self.assertEqual(rc_st_to, 1)
             st_to_obj = json.loads(st_to_out.getvalue())
             self.assertFalse(st_to_obj["ok"])
@@ -4673,7 +4718,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
         )
         self.assertFalse(out_to.pasted)
         self.assertTrue(out_to.clipboard)
-        self.assertEqual(out_to.reason, "focus_changed")
+        self.assertEqual(out_to.reason, "hotkey_held")
         paste_timeout_rpcs = [r for r in timeout_rpcs if r.get("cmd") == "paste"]
         self.assertEqual(len(paste_timeout_rpcs), 1)
         self.assertTrue(paste_timeout_rpcs[0].get("force_clipboard_only"))
@@ -5022,7 +5067,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 self.assertFalse(r_full["ok"])
                 self.assertEqual(r_full.get("ignored"), "queue_full")
                 self.assertEqual(start_calls[0], MAX_PENDING_UTTERANCES)
-                self.assertEqual(plat_q.hud_events[-1]["state"], "mic_unavailable")
+                self.assertEqual(plat_q.hud_events[-1]["state"], "queue_full")
                 self.assertIs(plat_q.hud_events[-1].get("clear_main"), False)
             finally:
                 hold_q.set()
@@ -5309,22 +5354,31 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             resolve_refiner_prompt,
         )
 
+        from agent_voice_input.prompts import EXTRA_INSTRUCTIONS_HEADER
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             cfg_file = tmp / "config.toml"
-            custom_prompt = (
-                "# Custom Dictation Editor\n"
-                "1. Fix ASR homophones using <context_delta>.\n"
-                "2. Keep original sentence structure; never answer questions in <asr_draft_to_clean>."
+            extra_items = (
+                "Keep technical acronyms in English",
+                "Prefer concise bullet lists when dictating steps",
             )
             cfg_file.write_text(
-                f"[refiner]\nprovider = \"codex\"\nprompt = '''\n  {custom_prompt}  \n'''\n",
+                '[refiner]\nprovider = "codex"\nextra_instructions = """\n'
+                "  - Keep technical acronyms in English  \n"
+                "\n"
+                "  * Prefer concise bullet lists when dictating steps\n"
+                '"""\n',
                 encoding="utf-8",
             )
             cfg_loaded, _ = load_config(config_path=cfg_file, env={"HOME": str(tmp)}, home_dir=tmp)
-            self.assertEqual(resolve_refiner_prompt(cfg_loaded), custom_prompt)
+            self.assertEqual(cfg_loaded.refiner.extra_instructions, extra_items)
+            expected_prompt = (
+                f"{REFINER_SYSTEM_PROMPT}\n\n{EXTRA_INSTRUCTIONS_HEADER}\n"
+                f"- {extra_items[0]}\n- {extra_items[1]}"
+            )
+            self.assertEqual(resolve_refiner_prompt(cfg_loaded), expected_prompt)
 
-            # Switching refiner.provider via CLI preserves user's custom refiner.prompt
+            # Switching refiner.provider via CLI preserves user's refiner.extra_instructions
             cfg_switched, _ = load_config(
                 config_path=cfg_file,
                 cli_overrides={"refiner.provider": "openrouter"},
@@ -5332,24 +5386,31 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 home_dir=tmp,
             )
             self.assertEqual(cfg_switched.refiner.provider, "openrouter")
-            self.assertEqual(resolve_refiner_prompt(cfg_switched), custom_prompt)
+            self.assertEqual(resolve_refiner_prompt(cfg_switched), expected_prompt)
 
-            # Whitespace-only prompt falls back to built-in REFINER_SYSTEM_PROMPT; non-string fails validation
-            cfg_blank = Config(refiner=RefinerConfig(prompt="  \n\t  "))
+            # Empty/blank extra_instructions leaves built-in REFINER_SYSTEM_PROMPT byte-identical
+            cfg_blank = Config(refiner=RefinerConfig(extra_instructions="  \n\t  "))
+            self.assertEqual(cfg_blank.refiner.extra_instructions, ())
             self.assertEqual(resolve_refiner_prompt(cfg_blank), REFINER_SYSTEM_PROMPT)
             bad_json = tmp / "bad.json"
-            bad_json.write_text(json.dumps({"refiner": {"prompt": 123}}), encoding="utf-8")
+            bad_json.write_text(json.dumps({"refiner": {"extra_instructions": 123}}), encoding="utf-8")
             with self.assertRaises(ConfigError):
                 load_config(config_path=bad_json, env={"HOME": str(tmp)}, home_dir=tmp)
+            # Legacy refiner.prompt fails with clear migration ConfigError
+            legacy_json = tmp / "legacy.json"
+            legacy_json.write_text(json.dumps({"refiner": {"prompt": "old custom"}}), encoding="utf-8")
+            with self.assertRaises(ConfigError) as cm_leg_p:
+                load_config(config_path=legacy_json, env={"HOME": str(tmp)}, home_dir=tmp)
+            self.assertIn("refiner.extra_instructions", str(cm_leg_p.exception))
 
-            # 1. CodexRefiner stateless /responses sends custom prompt via instructions (with no-tools constraint)
+            # 1. CodexRefiner stateless /responses sends built-in prompt + extra_instructions (with no-tools constraint)
             _write_codex_auth_json(tmp)
             srv_prompt = _LocalResponsesServer()
             cfg_codex = Config(
                 refiner=RefinerConfig(
                     provider="codex",
                     base_url=srv_prompt.base_url,
-                    prompt=custom_prompt,
+                    extra_instructions=extra_items,
                     timeout_sec=4.0,
                 )
             )
@@ -5359,7 +5420,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
                 self.assertEqual(r1.text, "CLEAN#1:你评估一下看")
                 r2 = cref.refine("第二句无状态复用", session_key="sess-p")
                 self.assertEqual(r2.text, "CLEAN#2:第二句无状态复用")
-                cfg_codex.refiner.prompt = "Updated prompt v2"
+                cfg_codex.refiner.extra_instructions = ("Updated instruction v2",)
                 r3 = cref.refine("改提示词后立即生效", session_key="sess-p")
                 self.assertEqual(r3.text, "CLEAN#3:改提示词后立即生效")
             finally:
@@ -5369,19 +5430,20 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             p_b0 = srv_prompt.requests[0]["body"]
             p_b2 = srv_prompt.requests[2]["body"]
             assert isinstance(p_b0, dict) and isinstance(p_b2, dict)
-            self.assertTrue(p_b0["instructions"].startswith(custom_prompt))
+            self.assertTrue(p_b0["instructions"].startswith(expected_prompt))
             self.assertIn("no tools available", p_b0["instructions"].lower())
-            self.assertTrue(p_b2["instructions"].startswith("Updated prompt v2"))
+            self.assertIn("- Updated instruction v2", p_b2["instructions"])
+            self.assertTrue(p_b2["instructions"].startswith(REFINER_SYSTEM_PROMPT))
             self.assertIn(REFINER_TASK_REMINDER, p_b0["input"][-1]["content"][0]["text"])
 
-            # 2. OpenAICompatibleRefiner & GeminiRefiner receive custom prompt + reminder
+            # 2. OpenAICompatibleRefiner & GeminiRefiner receive built-in prompt + extra_instructions + reminder
             oai_seen: list[HttpRequest] = []
             cfg_oai = Config(
                 refiner=RefinerConfig(
                     provider="openai-compatible",
                     base_url="http://127.0.0.1:8000/v1",
                     model="local-qwen",
-                    prompt=custom_prompt,
+                    extra_instructions=extra_items,
                 )
             )
             oai_ref = create_refiner(
@@ -5398,11 +5460,11 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(oai_ref.refine("测试问题？").text, "oai ok")
             oai_payload = json.loads(oai_seen[0].body.decode("utf-8"))
-            self.assertEqual(oai_payload["messages"][0], {"role": "system", "content": custom_prompt})
+            self.assertEqual(oai_payload["messages"][0], {"role": "system", "content": expected_prompt})
             self.assertIn(REFINER_TASK_REMINDER, oai_payload["messages"][1]["content"])
 
             gem_seen: list[HttpRequest] = []
-            cfg_gem = Config(refiner=RefinerConfig(provider="gemini", prompt=custom_prompt))
+            cfg_gem = Config(refiner=RefinerConfig(provider="gemini", extra_instructions=extra_items))
             gem_env = {"GEMINI_API_KEY": "gem_test_" + ("k" * 16)}
             gem_ref = create_refiner(
                 cfg_gem,
@@ -5419,7 +5481,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(gem_ref.refine("测试 Gemini 问题？").text, "gem ok")
             gem_payload = json.loads(gem_seen[0].body.decode("utf-8"))
-            self.assertEqual(gem_payload["systemInstruction"], {"parts": [{"text": custom_prompt}]})
+            self.assertEqual(gem_payload["systemInstruction"], {"parts": [{"text": expected_prompt}]})
             self.assertIn(REFINER_TASK_REMINDER, gem_payload["contents"][0]["parts"][0]["text"])
 
     def test_stateless_responses_cookies_idle_reconnect_api_routing_and_codex_30m_refresh(self) -> None:
@@ -5460,10 +5522,10 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td_cfg:
             oai_test_env = {"HOME": td_cfg, "OPENAI_API_KEY": "sk-oai-" + ("6" * 14)}
             p_compat = Path(td_cfg) / "legacy.toml"
-            p_compat.write_text('[refiner]\nprovider = "openai"\napi = "responses"\nmax_turns_per_thread = 42\n', encoding="utf-8")
+            p_compat.write_text('[refiner]\nprovider = "openai"\napi = "responses"\nsession_max_turns = 42\n', encoding="utf-8")
             loaded_c, _ = load_config(config_path=p_compat, env={"HOME": td_cfg}, home_dir=Path(td_cfg))
             self.assertEqual(loaded_c.refiner.effective_api(), "responses")
-            self.assertEqual(loaded_c.refiner.max_turns_per_thread, 42)
+            self.assertEqual(loaded_c.refiner.session_max_turns, 42)
             ref_oai_resp = create_refiner(loaded_c, env=oai_test_env)
             self.assertIsInstance(ref_oai_resp, OpenAIResponsesRefiner)
             self.assertNotIsInstance(ref_oai_resp, CodexRefiner)
@@ -6041,9 +6103,11 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
         self.assertEqual(resolve_refiner_prompt(None, mode="general"), REFINER_GENERAL_SYSTEM_PROMPT)
         self.assertNotEqual(REFINER_SYSTEM_PROMPT, REFINER_GENERAL_SYSTEM_PROMPT)
         self.assertIn("Mode: general text input", REFINER_GENERAL_SYSTEM_PROMPT)
-        # Explicit user prompt overrides both modes
-        cfg_custom = Config(refiner=RefinerConfig(prompt="CUSTOM_OVERRIDE_PROMPT"))
-        self.assertEqual(resolve_refiner_prompt(cfg_custom, mode="general"), "CUSTOM_OVERRIDE_PROMPT")
+        # User extra_instructions appends safely after the mode-appropriate built-in prompt
+        cfg_custom = Config(refiner=RefinerConfig(extra_instructions=("Keep replies concise",)))
+        gen_with_extra = resolve_refiner_prompt(cfg_custom, mode="general")
+        self.assertTrue(gen_with_extra.startswith(REFINER_GENERAL_SYSTEM_PROMPT))
+        self.assertIn("- Keep replies concise", gen_with_extra)
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -6310,7 +6374,7 @@ class SerialPipelineAndPasteBoundaryTests(unittest.TestCase):
             self.assertIn("豆包", hw_cjk)
 
 
-class ObservabilityAndTelemetryTests(unittest.TestCase):
+class ObservabilityAndDiagLogTests(unittest.TestCase):
     def test_refiner_token_usage_extraction_and_none_vs_zero_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -6450,7 +6514,7 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
 
     def test_daemon_telemetry_jsonl_permissions_256kb_atomic_trim_and_zero_plaintext(self) -> None:
         import stat
-        from agent_voice_input.daemon import TELEMETRY_MAX_BYTES, append_telemetry_record, read_telemetry_history
+        from agent_voice_input.daemon import DIAG_MAX_BYTES, append_diag_record, read_diag_history
         from agent_voice_input.refiner import BaseRefiner
 
         secret_speech = "PRIVATE_USER_SPEECH_UTTERANCE_8821"
@@ -6542,25 +6606,25 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
                 self.assertEqual((lr["ctx_chars"], lr["ctx_chunks"]), (12345, 2))
                 self.assertEqual((lr["input_tokens"], lr["cached_input_tokens"], lr["output_tokens"], lr["reasoning_tokens"]), (8192, 7680, 36, 0))
 
-                tpath = rt / "telemetry.jsonl"
+                tpath = rt / "diag.jsonl"
                 self.assertTrue(tpath.is_file())
                 self.assertEqual(stat.S_IMODE(tpath.stat().st_mode), 0o600)
-                raw_telemetry = tpath.read_text(encoding="utf-8")
+                raw_diag = tpath.read_text(encoding="utf-8")
                 combined_dump = json.dumps(
                     {"last": lr, "recent": list(daemon.recent_results)},
                     ensure_ascii=False,
-                ) + "\n" + raw_telemetry
+                ) + "\n" + raw_diag
                 for forbidden in (secret_speech, secret_refined, secret_dialog, secret_api_key):
                     self.assertNotIn(forbidden, combined_dump)
                 self.assertIn("[REDACTED]", combined_dump)
             finally:
                 daemon.close()
 
-            # Push telemetry.jsonl well past 256 KB and verify atomic 0600 tail truncation on whole lines
+            # Push diag.jsonl well past 256 KB and verify atomic 0600 tail truncation on whole lines
             rt_trim = tmp / "rt_trim"
             rt_trim.mkdir(mode=0o700)
             for seq in range(1, 900):
-                append_telemetry_record(
+                append_diag_record(
                     rt_trim,
                     {
                         "ts": 1700000000.0 + seq * 0.01,
@@ -6582,9 +6646,9 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
                         "pad": "x" * 180,
                     },
                 )
-            trim_file = rt_trim / "telemetry.jsonl"
+            trim_file = rt_trim / "diag.jsonl"
             st_trim = trim_file.stat()
-            self.assertLessEqual(st_trim.st_size, TELEMETRY_MAX_BYTES)
+            self.assertLessEqual(st_trim.st_size, DIAG_MAX_BYTES)
             self.assertGreater(st_trim.st_size, 90 * 1024)
             self.assertEqual(stat.S_IMODE(st_trim.st_mode), 0o600)
             self.assertEqual([p.name for p in rt_trim.iterdir() if ".tmp" in p.name], [])
@@ -6595,14 +6659,14 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
             self.assertEqual(parsed_trimmed[-1]["seq_id"], 899)
             self.assertGreater(parsed_trimmed[0]["seq_id"], 1)
             self.assertEqual(
-                [r["seq_id"] for r in read_telemetry_history(rt_trim, limit=3)],
+                [r["seq_id"] for r in read_diag_history(rt_trim, limit=3)],
                 [897, 898, 899],
             )
 
     def test_cli_status_history_backward_compat_online_merge_and_offline_fallback(self) -> None:
         import io
         from agent_voice_input import cli as cli_mod
-        from agent_voice_input.daemon import append_telemetry_record
+        from agent_voice_input.daemon import append_diag_record
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -6611,9 +6675,9 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
             cfg_file = tmp / "cfg.toml"
             cfg_file.write_text('[refiner]\nprovider = "off"\n', encoding="utf-8")
 
-            # Seed 2 historical records from a previous daemon lifecycle in telemetry.jsonl
+            # Seed 2 historical records from a previous daemon lifecycle in diag.jsonl
             for old_seq in (101, 102):
-                append_telemetry_record(
+                append_diag_record(
                     rt,
                     {"ts": 1700000100.0 + old_seq, "seq_id": old_seq, "ok": True, "total_ms": 500 + old_seq},
                 )
@@ -6649,28 +6713,38 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
                         time.sleep(0.01)
 
                 with unittest.mock.patch.dict(os.environ, env_patch, clear=True):
-                    # 1. Default `status` without --history omits recent_results (strictly backward-compatible)
+                    # 1. Default `status --json` without --history omits recent_results
                     buf_plain = io.StringIO()
                     with unittest.mock.patch("sys.stdout", buf_plain):
-                        rc_plain = cli_mod.main(["--config", str(cfg_file), "status"])
+                        rc_plain = cli_mod.main(["--config", str(cfg_file), "status", "--json"])
                     self.assertEqual(rc_plain, 0)
                     obj_plain = json.loads(buf_plain.getvalue())
                     self.assertTrue(obj_plain["ok"])
                     self.assertEqual(obj_plain["last_result"]["seq_id"], 2)
                     self.assertNotIn("recent_results", obj_plain)
 
-                    # 2. `status --history` (default const=10) merges prior telemetry.jsonl (101, 102) + live (1, 2) without duplicates
+                    # 1b. Default `status` without --json prints human-readable rows
+                    buf_human = io.StringIO()
+                    with unittest.mock.patch("sys.stdout", buf_human):
+                        rc_human = cli_mod.main(["--config", str(cfg_file), "status", "--history", "3"])
+                    self.assertEqual(rc_human, 0)
+                    txt_human = buf_human.getvalue()
+                    self.assertIn("Daemon    running (", txt_human)
+                    self.assertIn("Last      #2 ", txt_human)
+                    self.assertIn("History   3 record(s)", txt_human)
+
+                    # 2. `status --history --json` (default const=10) merges prior diag.jsonl (101, 102) + live (1, 2) without duplicates
                     buf_hist = io.StringIO()
                     with unittest.mock.patch("sys.stdout", buf_hist):
-                        rc_hist = cli_mod.main(["--config", str(cfg_file), "status", "--history"])
+                        rc_hist = cli_mod.main(["--config", str(cfg_file), "status", "--history", "--json"])
                     self.assertEqual(rc_hist, 0)
                     obj_hist = json.loads(buf_hist.getvalue())
                     self.assertEqual([r["seq_id"] for r in obj_hist["recent_results"]], [101, 102, 1, 2])
 
-                    # 3. `status --history 3` caps at last 3
+                    # 3. `status --history 3 --json` caps at last 3
                     buf_h3 = io.StringIO()
                     with unittest.mock.patch("sys.stdout", buf_h3):
-                        rc_h3 = cli_mod.main(["--config", str(cfg_file), "status", "--history", "3"])
+                        rc_h3 = cli_mod.main(["--config", str(cfg_file), "status", "--history", "3", "--json"])
                     self.assertEqual(rc_h3, 0)
                     obj_h3 = json.loads(buf_h3.getvalue())
                     self.assertEqual([r["seq_id"] for r in obj_h3["recent_results"]], [102, 1, 2])
@@ -6678,17 +6752,35 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
                 daemon.close()
                 srv_thread.join(timeout=2.0)
 
-            # 4. Offline daemon fallback: plain `status` stays compact; `status --history 2` reads telemetry.jsonl
+            # 4. Offline daemon fallback: plain `status --json` stays compact; `status --history 2 --json` reads diag.jsonl
             with unittest.mock.patch.dict(os.environ, env_patch, clear=True):
                 buf_off_plain = io.StringIO()
                 with unittest.mock.patch("sys.stdout", buf_off_plain):
-                    rc_off_plain = cli_mod.main(["--config", str(cfg_file), "status"])
+                    rc_off_plain = cli_mod.main(["--config", str(cfg_file), "status", "--json"])
                 self.assertEqual(rc_off_plain, 1)
-                self.assertEqual(json.loads(buf_off_plain.getvalue()), {"ok": False, "state": "stopped"})
+                self.assertEqual(
+                    json.loads(buf_off_plain.getvalue()),
+                    {
+                        "ok": False,
+                        "state": "stopped",
+                        "archive": {
+                            "save_transcripts": False,
+                            "save_audio": False,
+                            "audio_max_count": 1000,
+                        },
+                    },
+                )
+
+                buf_off_human = io.StringIO()
+                with unittest.mock.patch("sys.stdout", buf_off_human):
+                    rc_off_human = cli_mod.main(["--config", str(cfg_file), "status"])
+                self.assertEqual(rc_off_human, 1)
+                self.assertIn("not running (stopped)", buf_off_human.getvalue())
+                self.assertIn("agent-voice-input start", buf_off_human.getvalue())
 
                 buf_off_hist = io.StringIO()
                 with unittest.mock.patch("sys.stdout", buf_off_hist):
-                    rc_off_hist = cli_mod.main(["--config", str(cfg_file), "status", "--history", "2"])
+                    rc_off_hist = cli_mod.main(["--config", str(cfg_file), "status", "--history", "2", "--json"])
                 self.assertEqual(rc_off_hist, 1)
                 obj_off_hist = json.loads(buf_off_hist.getvalue())
                 self.assertFalse(obj_off_hist["ok"])
@@ -6699,7 +6791,7 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
     def test_diagnose_live_works_without_logs_sqlite(self) -> None:
         import importlib.util
         import io
-        from agent_voice_input.daemon import append_telemetry_record
+        from agent_voice_input.daemon import append_diag_record
 
         diag_script = _REPO_ROOT / ".agents" / "skills" / "voice-eval" / "scripts" / "diagnose_live.py"
         if not diag_script.is_file() and not (_REPO_ROOT / ".agents").exists():
@@ -6716,7 +6808,7 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
             rt.mkdir(mode=0o700)
             cfg_file = tmp / "cfg.toml"
             cfg_file.write_text('[refiner]\nprovider = "codex"\n', encoding="utf-8")
-            append_telemetry_record(
+            append_diag_record(
                 rt,
                 {
                     "ts": 1700000500.0,
@@ -6747,7 +6839,7 @@ class ObservabilityAndTelemetryTests(unittest.TestCase):
                 rc = mod.main(["--config", str(cfg_file), "--runtime-dir", str(rt), "--last", "5", "--json"])
             self.assertEqual(rc, 0)
             out_json = json.loads(buf.getvalue())
-            self.assertIsNone(out_json["storage"]["legacy_codex_sqlite"])
+            self.assertNotIn("legacy_codex_sqlite", out_json["storage"])
             self.assertEqual(len(out_json["recent_results"]), 1)
             self.assertNotIn("secret-session-uuid", buf.getvalue())
             self.assertTrue(out_json["recent_results"][0]["session_tag"].startswith("agy#"))
@@ -6870,31 +6962,52 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
                     finally:
                         ref_nr.close()
 
-                # 2. Reasoning OpenAI model maps effort="max" -> "xhigh"
-                srv.requests.clear()
-                cfg_rsn = Config(
-                    refiner=RefinerConfig(
-                        provider="openai",
-                        api="responses",
-                        model="gpt-5-mini",
-                        effort="max",
-                        base_url=f"http://127.0.0.1:{srv.port}/v1",
+                # 2. Reasoning OpenAI model effort mapping on /responses:
+                #    gpt-5/mini/nano max/xhigh -> high & none -> minimal; o1/o3/o4 & non-luna gpt-6 none/minimal -> low;
+                #    gpt-5.4/gpt-6-luna none -> none & max -> xhigh; default -> omitted
+                for oai_m, oai_e, exp_rsn in (
+                    ("gpt-5", "max", {"effort": "high"}),
+                    ("gpt-5-mini", "max", {"effort": "high"}),
+                    ("gpt-5-mini", "xhigh", {"effort": "high"}),
+                    ("gpt-5-nano", "xhigh", {"effort": "high"}),
+                    ("gpt-5-mini", "none", {"effort": "minimal"}),
+                    ("o1", "none", {"effort": "low"}),
+                    ("o3", "none", {"effort": "low"}),
+                    ("o4-mini", "minimal", {"effort": "low"}),
+                    ("gpt-5.4", "none", {"effort": "none"}),
+                    ("gpt-6-luna", "none", {"effort": "none"}),
+                    ("gpt-6-luna", "max", {"effort": "xhigh"}),
+                    ("gpt-6-luna", "default", None),
+                    ("gpt-6-astra", "none", {"effort": "low"}),
+                    ("gpt-6-sol", "none", {"effort": "low"}),
+                    ("gpt-6.2-sol", "none", {"effort": "low"}),
+                ):
+                    srv.requests.clear()
+                    cfg_rsn = Config(
+                        refiner=RefinerConfig(
+                            provider="openai",
+                            api="responses",
+                            model=oai_m,
+                            effort=oai_e,
+                            base_url=f"http://127.0.0.1:{srv.port}/v1",
+                        )
                     )
-                )
-                ref_rsn = create_refiner(cfg_rsn, resolve_credentials(cfg_rsn, env_oai), env=env_oai)
-                try:
-                    ref_rsn.refine("推理模型 max 映射 xhigh")
-                    body_rsn = srv.requests[-1]["body"]
-                    assert isinstance(body_rsn, dict)
-                    self.assertEqual(body_rsn.get("reasoning"), {"effort": "xhigh"})
-                finally:
-                    ref_rsn.close()
+                    ref_rsn = create_refiner(cfg_rsn, resolve_credentials(cfg_rsn, env_oai), env=env_oai)
+                    try:
+                        ref_rsn.refine("推理模型 effort 映射")
+                        body_rsn = srv.requests[-1]["body"]
+                        assert isinstance(body_rsn, dict)
+                        self.assertEqual(body_rsn.get("reasoning"), exp_rsn, (oai_m, oai_e))
+                    finally:
+                        ref_rsn.close()
 
-                # 3. CodexRefiner in api_key mode: omits reasoning on gpt-4o-mini, maps max->xhigh on gpt-6-luna
+                # 3. CodexRefiner in api_key mode: omits reasoning on gpt-4o-mini, clamps o3 none->low, maps max->xhigh on gpt-6-luna
                 home_ak = tmp / "home_ak"
                 _write_codex_auth_json(home_ak, auth_mode="api_key", openai_api_key="sk-ak-codex-777777")
                 for c_model, c_eff, expected_rsn in (
                     ("gpt-4o-mini", "low", None),
+                    ("o3", "none", {"effort": "low"}),
+                    ("gpt-6-luna", "none", {"effort": "none"}),
                     ("gpt-6-luna", "max", {"effort": "xhigh"}),
                 ):
                     srv.requests.clear()
@@ -7093,7 +7206,7 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             resolve_ffmpeg_bin,
             spawn_recording_archive,
         )
-        from agent_voice_input.config import AudioConfig, resolve_saved_recordings_dir
+        from agent_voice_input.config import ArchiveConfig, UTTERANCE_ID_RE, resolve_archive_audio_dir
 
         speech_band_wav = pack_pcm16_mono_wav(
             [int(5000 * math.sin(2.0 * math.pi * 440.0 * i / 16000.0)) for i in range(9600)]
@@ -7119,27 +7232,29 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             has_mp3_encoder = "libmp3lame" in enc_proc.stdout
 
         # 1. Defaults & validation
-        self.assertIs(AudioConfig().save_recordings, False)
-        self.assertEqual(AudioConfig().save_recordings_max_count, 300)
+        self.assertIs(ArchiveConfig().save_audio, False)
+        self.assertIs(ArchiveConfig().save_transcripts, False)
+        self.assertEqual(ArchiveConfig().audio_max_count, 1000)
         for fn in (prune_saved_recordings_dir, archive_recording_audio, spawn_recording_archive):
-            self.assertEqual(inspect.signature(fn).parameters["max_count"].default, 300)
+            self.assertEqual(inspect.signature(fn).parameters["max_count"].default, 1000)
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             # Hermetic path resolution under HOME and AGENT_VOICE_INPUT_HOME
             self.assertEqual(
-                resolve_saved_recordings_dir({"HOME": str(tmp)}),
-                tmp / ".agent-voice-input" / "recordings",
+                resolve_archive_audio_dir({"HOME": str(tmp)}),
+                tmp / ".agent-voice-input" / "audio",
             )
             self.assertEqual(
-                resolve_saved_recordings_dir({"HOME": str(tmp), "AGENT_VOICE_INPUT_HOME": str(tmp / "avi_home")}),
-                tmp / "avi_home" / "recordings",
+                resolve_archive_audio_dir({"HOME": str(tmp), "AGENT_VOICE_INPUT_HOME": str(tmp / "avi_home")}),
+                tmp / "avi_home" / "audio",
             )
 
             for bad_toml in (
-                "[audio]\nsave_recordings_max_count = 0\n",
-                "[audio]\nsave_recordings_max_count = 5001\n",
-                '[audio]\nsave_recordings = "not_a_bool"\n',
+                "[archive]\naudio_max_count = -1\n",
+                '[archive]\nsave_audio = "not_a_bool"\n',
+                "[audio]\nsave_recordings = true\n",
+                "[audio]\nsave_recordings_max_count = 100\n",
             ):
                 bad_f = tmp / "bad_audio.toml"
                 bad_f.write_text(bad_toml, encoding="utf-8")
@@ -7147,13 +7262,13 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
                     load_config(config_path=bad_f, env={"HOME": str(tmp)}, home_dir=tmp)
 
             ok_f = tmp / "ok_audio.toml"
-            ok_f.write_text("[audio]\nsave_recordings = true\nsave_recordings_max_count = 3\n", encoding="utf-8")
+            ok_f.write_text("[archive]\nsave_audio = true\naudio_max_count = 3\n", encoding="utf-8")
             cfg_rec, env_rec = load_config(config_path=ok_f, env={"HOME": str(tmp)}, home_dir=tmp)
-            self.assertIs(cfg_rec.audio.save_recordings, True)
-            self.assertEqual(cfg_rec.audio.save_recordings_max_count, 3)
+            self.assertIs(cfg_rec.archive.save_audio, True)
+            self.assertEqual(cfg_rec.archive.audio_max_count, 3)
 
             # 2. Archive 5 recordings with deterministic timestamps & max_count=3 -> retains newest 3 as 0600
-            rec_dir = resolve_saved_recordings_dir(env_rec)
+            rec_dir = resolve_archive_audio_dir(env_rec)
             created_names: list[str] = []
             for i in range(5):
                 out_p = archive_recording_audio(
@@ -7163,7 +7278,7 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
                     now_ts=1_750_100_000.0 + i * 10.0,
                 )
                 assert out_p is not None
-                self.assertTrue(out_p.name.startswith("rec-"))
+                self.assertRegex(out_p.stem, UTTERANCE_ID_RE)
                 if has_ffmpeg:
                     if has_mp3_encoder:
                         self.assertEqual(out_p.suffix, ".mp3")
@@ -7225,7 +7340,7 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             rt_d.mkdir(mode=0o700)
             env_d = {"HOME": str(home_d), "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt_d)}
             cfg_d = Config(
-                audio=AudioConfig(save_recordings=True, save_recordings_max_count=2),
+                archive=ArchiveConfig(save_audio=True, audio_max_count=2),
                 refiner=RefinerConfig(provider="off"),
             )
             # Silence input must NOT produce an archived recording
@@ -7237,7 +7352,7 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
                 env=env_d,
             )
             self.assertFalse(res_sil.ok)
-            self.assertEqual(list_saved_recordings(resolve_saved_recordings_dir(env_d)), [])
+            self.assertEqual(list_saved_recordings(resolve_archive_audio_dir(env_d)), [])
 
             # retry audio_source must NOT duplicate archive
             run_pipeline_once(
@@ -7248,7 +7363,7 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
                 dry_run=True,
                 env=env_d,
             )
-            self.assertEqual(list_saved_recordings(resolve_saved_recordings_dir(env_d)), [])
+            self.assertEqual(list_saved_recordings(resolve_archive_audio_dir(env_d)), [])
 
             # Live daemon utterances archive asynchronously without blocking & flush cleanly on daemon.stop()
             plat_d = _FakePlatform()
@@ -7272,7 +7387,7 @@ class Step3ReviewFixesAndRecordingArchiveTests(unittest.TestCase):
             finally:
                 daemon_d.stop()
 
-            d_saved = list_saved_recordings(resolve_saved_recordings_dir(env_d))
+            d_saved = list_saved_recordings(resolve_archive_audio_dir(env_d))
             self.assertEqual(len(d_saved), 2)
             if has_ffmpeg:
                 expected_exts = (".mp3",) if has_mp3_encoder else (".mp3", ".m4a")
@@ -8141,7 +8256,7 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                 srv_codex.close()
 
     def test_out_of_order_stage2_strict_seq_delivery_per_utterance_origin_window_and_queue_wait_ms(self) -> None:
-        from agent_voice_input.daemon import read_telemetry_history
+        from agent_voice_input.daemon import read_diag_history
         from agent_voice_input.refiner import BaseRefiner
 
         win_a = ForegroundWindow(hwnd=101, process="WindowsTerminal", title="claude · proj-a [#1111aaaa]")
@@ -8253,7 +8368,7 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                         (r2["seq_id"], "精修B", 202, "ok"),
                     ],
                 )
-                hist = read_telemetry_history(rt, limit=10)
+                hist = read_diag_history(rt, limit=10)
                 self.assertEqual([h["seq_id"] for h in hist], [r1["seq_id"], r2["seq_id"]])
                 for rec in hist:
                     self.assertIn("queue_wait_ms", rec)
@@ -8446,7 +8561,7 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                     unittest.mock.patch.dict(os.environ, {"AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)}, clear=False),
                     unittest.mock.patch("sys.stdout", buf_cli),
                 ):
-                    rc_cli = cli_mod.main(["--config", str(cfg_cli), "cancel", "--seq", str(u_slow["seq_id"])])
+                    rc_cli = cli_mod.main(["--config", str(cfg_cli), "cancel", "--seq", str(u_slow["seq_id"]), "--json"])
                 self.assertEqual(rc_cli, 0, buf_cli.getvalue())
                 cli_json = json.loads(buf_cli.getvalue().strip())
                 self.assertEqual(cli_json["cancelled_ids"], [u_slow["seq_id"]])
@@ -9036,7 +9151,7 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                 tracker=_isolated_tracker(rt),
                 paste_settle_sec=0.0,
             )
-            orig_append = daemon._append_telemetry
+            orig_append = daemon._append_diag
             hooked = [False]
 
             def _racing_append(rec: dict[str, Any]) -> None:
@@ -9049,7 +9164,7 @@ class V092aInflightCancelAndConcurrentStage2Tests(unittest.TestCase):
                     while time.monotonic() < deadline and daemon._visible_inflight_count_locked() > 0:
                         time.sleep(0.01)
 
-            daemon._append_telemetry = _racing_append  # type: ignore[method-assign]
+            daemon._append_diag = _racing_append  # type: ignore[method-assign]
             try:
                 daemon.handle_trigger("toggle")
                 daemon._last_trigger_ts = -1e9
@@ -9665,7 +9780,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 "XDG_RUNTIME_DIR": str(rt),
             }
             cfg = Config(
-                audio=AudioConfig(save_recordings=True),
+                archive=ArchiveConfig(save_audio=True, save_transcripts=True),
                 refiner=RefinerConfig(provider="deepseek"),
             )
             plat = _FakePlatform()
@@ -9683,14 +9798,14 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 wav_file = tmp / "sample.wav"
                 wav_file.write_bytes(_voiced_wav())
 
-                # 1. no_telemetry=True + hostile dry_run=False / no_paste=False attempt
+                # 1. no_diag=True + hostile dry_run=False / no_paste=False attempt
                 resp = daemon.handle_control(
                     {
                         "cmd": "selftest_wav",
                         "wav_path": str(wav_file),
                         "process": "WindowsTerminal.exe",
                         "title": "codex [#abcd1234]",
-                        "no_telemetry": True,
+                        "no_diag": True,
                         "dry_run": False,
                         "no_paste": False,
                     }
@@ -9702,8 +9817,8 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(daemon.seq_id, 0)
                 self.assertEqual(daemon.last_result, {})
                 self.assertEqual(list(daemon.recent_results), [])
-                self.assertFalse(daemon.telemetry_path.exists())
-                # Dry-run redline enforced: zero paste, HUD, beep, failed/, recordings/
+                self.assertFalse(daemon.diag_path.exists())
+                # Dry-run redline enforced: zero paste, HUD, beep, failed/, archive audio/
                 self.assertEqual(plat.deliveries, [])
                 self.assertEqual(plat.huds, [])
                 self.assertEqual(plat.beeps, [])
@@ -9725,7 +9840,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertNotIn(full_sid, routing_json)
                 self.assertNotIn("PRIVATE_SELFTEST_DIALOG_5511", routing_json)
 
-                # 2. Default no_telemetry=False stays backwards compatible
+                # 2. Default no_diag=False stays backwards compatible
                 resp_legacy = daemon.handle_control(
                     {
                         "cmd": "selftest_wav",
@@ -9739,7 +9854,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(daemon.seq_id, 1)
                 self.assertEqual(daemon.last_result.get("seq_id"), 1)
                 self.assertEqual(len(daemon.recent_results), 1)
-                self.assertTrue(daemon.telemetry_path.is_file())
+                self.assertTrue(daemon.diag_path.is_file())
                 self.assertEqual(resp_legacy["routing"]["session_key_masked"], "codex:abcd1234")
             finally:
                 daemon.close()
@@ -9774,7 +9889,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
 
                 # Default use_live_window=False -> empty ForegroundWindow(), never calls get_foreground_window()
                 r_default = daemon.handle_control(
-                    {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True}
+                    {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_diag": True}
                 )
                 self.assertTrue(r_default["ok"])
                 self.assertEqual(plat.fg_calls, 0)
@@ -9785,7 +9900,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     {
                         "cmd": "selftest_wav",
                         "wav_path": str(wav_file),
-                        "no_telemetry": True,
+                        "no_diag": True,
                         "use_live_window": "false",
                     }
                 )
@@ -9797,7 +9912,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     {
                         "cmd": "selftest_wav",
                         "wav_path": str(wav_file),
-                        "no_telemetry": True,
+                        "no_diag": True,
                         "use_live_window": True,
                     }
                 )
@@ -9811,7 +9926,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         "cmd": "selftest_wav",
                         "wav_path": str(wav_file),
                         "process": "WindowsTerminal.exe",
-                        "no_telemetry": True,
+                        "no_diag": True,
                         "use_live_window": True,
                     }
                 )
@@ -9893,7 +10008,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     r1_box.append(
                         send_control_command(
                             rt,
-                            {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                            {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_diag": True},
                             timeout_sec=5.0,
                         )
                     )
@@ -9921,7 +10036,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 t_busy0 = time.monotonic()
                 busy_resp = send_control_command(
                     rt,
-                    {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                    {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_diag": True},
                     timeout_sec=1.0,
                 )
                 self.assertFalse(busy_resp.get("ok"))
@@ -9937,7 +10052,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
 
                 r3 = send_control_command(
                     rt,
-                    {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                    {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_diag": True},
                     timeout_sec=2.0,
                 )
                 self.assertTrue(r3.get("ok"), r3)
@@ -9952,7 +10067,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         r4_box.append(
                             send_control_command(
                                 rt,
-                                {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                                {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_diag": True},
                                 timeout_sec=3.0,
                             )
                         )
@@ -10351,7 +10466,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(daemon.seq_id, 0)
                 self.assertEqual(daemon.last_result, {})
                 self.assertEqual(list(daemon.recent_results), [])
-                self.assertFalse(daemon.telemetry_path.exists())
+                self.assertFalse(daemon.diag_path.exists())
                 self.assertEqual(plat.deliveries, [])
                 self.assertEqual(plat.huds, [])
                 self.assertEqual(plat.beeps, [])
@@ -10443,7 +10558,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
 
                 self.assertEqual(plat.deliveries, [])
                 self.assertEqual(daemon.seq_id, 0)
-                self.assertFalse(daemon.telemetry_path.exists())
+                self.assertFalse(daemon.diag_path.exists())
             finally:
                 daemon.close()
 
@@ -10490,7 +10605,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
 
             plat = _DeliverCapturePlatform()
             cfg = Config(
-                audio=AudioConfig(save_recordings=True),
+                archive=ArchiveConfig(save_audio=True, save_transcripts=True),
                 refiner=RefinerConfig(provider="off"),
             )
             env = {"XDG_CACHE_HOME": str(cache), "XDG_RUNTIME_DIR": str(rt)}
@@ -10504,14 +10619,14 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 tracker=_isolated_tracker(rt),
             )
             try:
-                # 1. Explicit deliver=True + use_live_window=True + no_telemetry=True -> real delivery
+                # 1. Explicit deliver=True + use_live_window=True + no_diag=True -> real delivery
                 r_ok = daemon.handle_control(
                     {
                         "cmd": "selftest_wav",
                         "wav_path": str(wav_file),
                         "use_live_window": True,
                         "deliver": True,
-                        "no_telemetry": True,
+                        "no_diag": True,
                     }
                 )
                 self.assertTrue(r_ok["ok"], r_ok)
@@ -10537,7 +10652,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         "wav_path": str(wav_file),
                         "use_live_window": True,
                         "deliver": True,
-                        "no_telemetry": True,
+                        "no_diag": True,
                     }
                 )
                 self.assertTrue(r_drift["ok"], r_drift)
@@ -10546,7 +10661,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(r_drift["paste_reason"], "focus_changed")
                 self.assertEqual(r_drift["delivery_status"], "copied")
 
-                # 3. Delivery failure during deliver=True never stashes to failed/ or recordings/
+                # 3. Delivery failure during deliver=True never stashes to failed/ or archive audio/
                 plat.paste_outcome = PasteOutcome(False, False, "paste_failed", "WindowsTerminal.exe")
                 r_fail = daemon.handle_control(
                     {
@@ -10554,7 +10669,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         "wav_path": str(wav_file),
                         "use_live_window": True,
                         "deliver": True,
-                        "no_telemetry": True,
+                        "no_diag": True,
                     }
                 )
                 self.assertFalse(r_fail["ok"])
@@ -10566,7 +10681,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(daemon.seq_id, 0)
                 self.assertEqual(daemon.last_result, {})
                 self.assertEqual(list(daemon.recent_results), [])
-                self.assertFalse(daemon.telemetry_path.exists())
+                self.assertFalse(daemon.diag_path.exists())
                 self.assertEqual(plat.huds, [])
                 self.assertEqual(plat.beeps, [])
                 self.assertFalse(get_failed_audio_dir(rt, create=False).exists())
@@ -10655,7 +10770,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                             "wav_path": str(wav_file),
                             "use_live_window": True,
                             "deliver": True,
-                            "no_telemetry": True,
+                            "no_diag": True,
                         }
                     )
                 self.assertTrue(r_drift["ok"], r_drift)
@@ -10677,7 +10792,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         "wav_path": str(wav_file),
                         "use_live_window": True,
                         "deliver": True,
-                        "no_telemetry": True,
+                        "no_diag": True,
                     }
                 )
                 self.assertFalse(r_empty["ok"])
@@ -10790,7 +10905,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                                 "wav_path": str(wav_file),
                                 "use_live_window": True,
                                 "deliver": True,
-                                "no_telemetry": True,
+                                "no_diag": True,
                             }
                         )
                     )
@@ -10977,7 +11092,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     try:
                         send_control_command(
                             rt,
-                            {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                            {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_diag": True},
                             timeout_sec=4.0,
                         )
                     except Exception:
@@ -11065,7 +11180,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 bad_snap = SessionSnapshot(
                     match=bad_match,
                     clean_turns=(),
-                    luna_synced_idx=0,
                     generation=1,
                     git_status="",
                     hotwords=(),
@@ -11102,7 +11216,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                             "wav_path": str(wav_file),
                             "process": "WindowsTerminal.exe",
                             "title": "codex",
-                            "no_telemetry": True,
+                            "no_diag": True,
                         }
                     )
                     self.assertTrue(r_st["ok"], r_st)
@@ -11282,7 +11396,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     try:
                         send_control_command(
                             rt,
-                            {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_telemetry": True},
+                            {"cmd": "selftest_wav", "wav_path": str(wav_file), "no_diag": True},
                             timeout_sec=4.0,
                         )
                     except Exception:
@@ -11516,7 +11630,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         "wav_path": str(wav_file),
                         "use_live_window": True,
                         "deliver": True,
-                        "no_telemetry": True,
+                        "no_diag": True,
                     }
                 )
                 self.assertTrue(r_st["ok"], r_st)
@@ -11603,14 +11717,14 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
 
             daemon._make_probe_tracker = _spy_make_probe  # type: ignore[method-assign]
             try:
-                # 1. selftest_wav(no_telemetry=True) on sandbox session must NOT pollute prod_tracker
+                # 1. selftest_wav(no_diag=True) on sandbox session must NOT pollute prod_tracker
                 r1 = daemon.handle_control(
                     {
                         "cmd": "selftest_wav",
                         "wav_path": str(wav_file),
                         "process": "WindowsTerminal.exe",
                         "title": "codex [#2222bbbb]",
-                        "no_telemetry": True,
+                        "no_diag": True,
                     }
                 )
                 self.assertTrue(r1["ok"], r1)
@@ -11621,14 +11735,14 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(cancel_prefetch_calls, [])
                 self.assertEqual(len(closed_temp_trackers), 1)
 
-                # 2. IDE selftest_wav(no_telemetry=True) still benefits from read-only active_session_cwds snapshot
+                # 2. IDE selftest_wav(no_diag=True) still benefits from read-only active_session_cwds snapshot
                 r2 = daemon.handle_control(
                     {
                         "cmd": "selftest_wav",
                         "wav_path": str(wav_file),
                         "process": "Code.exe",
                         "title": "main.py - prod-ide-proj - Visual Studio Code",
-                        "no_telemetry": True,
+                        "no_diag": True,
                     }
                 )
                 self.assertTrue(r2["ok"], r2)
@@ -11699,7 +11813,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                             "wav_path": str(wav_file),
                             "use_live_window": True,
                             "deliver": True,
-                            "no_telemetry": True,
+                            "no_diag": True,
                         },
                         timeout_sec=0.15,
                     )
@@ -11728,7 +11842,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                                 "wav_path": str(wav_file),
                                 "use_live_window": True,
                                 "deliver": True,
-                                "no_telemetry": True,
+                                "no_diag": True,
                                 "timeout_sec": 10.0,
                             }
                         )
@@ -11775,7 +11889,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                                     "wav_path": str(wav_file),
                                     "use_live_window": True,
                                     "deliver": True,
-                                    "no_telemetry": True,
+                                    "no_diag": True,
                                     "timeout_sec": 10.0,
                                 }
                             )
@@ -11827,7 +11941,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 sleep_fn=lambda _: None,
             )
             try:
-                # 1. Auto-stop absorption survives concurrent selftest_wav(no_telemetry=False)
+                # 1. Auto-stop absorption survives concurrent selftest_wav(no_diag=False)
                 r_start = daemon.handle_trigger("toggle")
                 self.assertTrue(r_start["ok"])
                 rec_seq = r_start["seq_id"]
@@ -11848,7 +11962,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertEqual(r_absorb.get("ignored"), "already_stopped")
                 self.assertFalse(daemon._recording_active)
 
-                # 2. Recorder-lost absorption survives selftest_wav(no_telemetry=False) during/after stop_recording
+                # 2. Recorder-lost absorption survives selftest_wav(no_diag=False) during/after stop_recording
                 now[0] += 2.0
                 r_start2 = daemon.handle_trigger("toggle")
                 self.assertTrue(r_start2["ok"])
@@ -12208,7 +12322,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                             "wav_path": str(wav_file),
                             "use_live_window": True,
                             "deliver": True,
-                            "no_telemetry": True,
+                            "no_diag": True,
                             "timeout_sec": 10.0,
                         }
                     )
@@ -12371,7 +12485,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                             {
                                 "cmd": "selftest_wav",
                                 "wav_path": str(wav_file),
-                                "no_telemetry": True,
+                                "no_diag": True,
                                 "timeout_sec": bad_timeout,
                             },
                             timeout_sec=2.0,
@@ -12384,7 +12498,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     {
                         "cmd": "selftest_wav",
                         "wav_path": str(wav_file),
-                        "no_telemetry": True,
+                        "no_diag": True,
                         "timeout_sec": 10**400,
                     }
                 )
@@ -12398,7 +12512,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         {
                             "cmd": "selftest_wav",
                             "wav_path": str(wav_file),
-                            "no_telemetry": True,
+                            "no_diag": True,
                             "timeout_sec": 5.0,
                         },
                         timeout_sec=2.0,
@@ -12412,7 +12526,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     {
                         "cmd": "selftest_wav",
                         "wav_path": str(wav_file),
-                        "no_telemetry": True,
+                        "no_diag": True,
                         "timeout_sec": 5.0,
                     },
                     timeout_sec=3.0,
@@ -12468,7 +12582,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 snap = SessionSnapshot(
                     match=match,
                     clean_turns=tuple(real_turns),
-                    luna_synced_idx=0,
                     generation=1,
                     git_status="",
                     hotwords=("AgyRefiner", "SessionTracker"),
@@ -12534,7 +12647,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                             "wav_path": str(wav_file),
                             "process": "WindowsTerminal.exe",
                             "title": "codex · demo-proj [#real-liv]",
-                            "no_telemetry": True,
+                            "no_diag": True,
                         }
                     )
                     self.assertTrue(resp.get("ok"), resp)
@@ -12590,7 +12703,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                             "wav_path": str(wav_file),
                             "process": "WindowsTerminal.exe",
                             "title": "codex · demo-proj [#real-liv]",
-                            "no_telemetry": True,
+                            "no_diag": True,
                         }
                     )
                 self.assertTrue(resp_agy.get("ok"), resp_agy)
@@ -12761,7 +12874,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
             snap_nocwd = SessionSnapshot(
                 match=match_nocwd,
                 clean_turns=tuple(st_nocwd.clean_turns),
-                luna_synced_idx=0,
                 generation=1,
                 git_status="",
                 hotwords=("ChunkAlpha",),
@@ -12821,7 +12933,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         "wav_path": str(wav_file),
                         "process": "WindowsTerminal.exe",
                         "title": "agy [#nocwd-mu]",
-                        "no_telemetry": True,
+                        "no_diag": True,
                     }
                 )
                 self.assertTrue(resp_mc.get("ok"), resp_mc)
@@ -12890,7 +13002,7 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                         {
                             "cmd": "selftest_wav",
                             "wav_path": str(wav_file),
-                            "no_telemetry": True,
+                            "no_diag": True,
                         }
                     )
                 with daemon._lock:
@@ -13389,7 +13501,6 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 snap_20 = SessionSnapshot(
                     match=SessionMatch(cli="codex", session_id="s-dyn", jsonl_path=str(tmp / "s.jsonl"), cwd=str(tmp)),
                     clean_turns=(("user", "讨论动态词"),),
-                    luna_synced_idx=0,
                     generation=1,
                     git_status="",
                     hotwords=tuple(dynamic_20),
@@ -13556,8 +13667,8 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                     self.assertEqual(hw_info["total"], 205)
                     self.assertEqual(hw_info["kept"], 200)
                     self.assertEqual(hw_info["dropped_count"], 5)
-                    self.assertEqual(hw_info["stage2_kept"], 200)
-                    self.assertEqual(hw_info["stage2_dropped"], 5)
+                    self.assertNotIn("stage2_kept", hw_info)
+                    self.assertNotIn("stage2_dropped", hw_info)
                     self.assertGreaterEqual(hw_info["warnings_count"], 1)
                     for k, v in hw_info.items():
                         self.assertIsInstance(v, int, f"non-int status hotwords value {k}={v!r}")
@@ -13597,8 +13708,9 @@ class ControlProbeAndSelftestWavTests(unittest.TestCase):
                 self.assertNotIn('"dropped":', safe_json)
                 self.assertEqual(safe_resp["hotwords"]["dropped_count"], 5)
                 self.assertEqual(safe_resp["hotwords"]["total"], 205)
-                self.assertEqual(safe_resp["hotwords"]["stage2_kept"], 200)
-                self.assertEqual(safe_resp["hotwords"]["stage2_dropped"], 5)
+                self.assertEqual(safe_resp["hotwords"]["kept"], 200)
+                self.assertNotIn("stage2_kept", safe_resp["hotwords"])
+                self.assertNotIn("stage2_dropped", safe_resp["hotwords"])
             finally:
                 clear_hotwords_cache()
 

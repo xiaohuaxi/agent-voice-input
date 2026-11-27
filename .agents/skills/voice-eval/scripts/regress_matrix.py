@@ -18,7 +18,7 @@ Three composable verification layers (all redacted, zero conversation prose prin
   Layer B (--live-daemon):
     Read-only / non-destructive verification against the host's running daemon
     control.sock (`status` + drift check, `probe_route` virtual & live-window,
-    `selftest_wav(no_telemetry=True)`, and opt-in `--deliver-live` GUI E2E paste).
+    `selftest_wav(no_diag=True)`, and opt-in `--deliver-live` GUI E2E paste).
   Layer C (--probe-real-clis):
     Strictly read-only compatibility check of locally installed Codex / Claude /
     AGY root transcripts and Antigravity 2.0 / Codex SQLite DBs (mode=ro).
@@ -73,7 +73,7 @@ from agent_voice_input.config import (  # noqa: E402
     resolve_credentials,
 )
 from agent_voice_input.daemon import (  # noqa: E402
-    TELEMETRY_FILENAME,
+    DIAG_FILENAME,
     VoiceInputDaemon,
     describe_daemon_drift,
     send_control_command,
@@ -1626,15 +1626,25 @@ def run_layer_a_matrix(
     return checks
 
 
-def _count_telemetry_lines(rt_dir: Path) -> int:
-    tp = rt_dir / TELEMETRY_FILENAME
+_LEGACY_TELEMETRY_FILENAME: str = "telemetry.jsonl"
+
+
+def _count_jsonl_lines(path: Path) -> int:
     try:
-        if not tp.is_file() or tp.is_symlink():
+        if not path.is_file() or path.is_symlink():
             return 0
-        with open(tp, "rb") as f:
+        with open(path, "rb") as f:
             return sum(1 for ln in f if ln.strip())
     except OSError:
         return 0
+
+
+def _count_diag_lines(rt_dir: Path) -> int:
+    return _count_jsonl_lines(rt_dir / DIAG_FILENAME)
+
+
+def _count_legacy_telemetry_lines(rt_dir: Path) -> int:
+    return _count_jsonl_lines(rt_dir / _LEGACY_TELEMETRY_FILENAME)
 
 
 def _resolve_live_wav(
@@ -1993,10 +2003,12 @@ def run_layer_b_live_daemon(
     assert wav_info is not None
     wav_path, dur_sec, used_tts = wav_info
 
-    tel_before = _count_telemetry_lines(rt_dir)
+    diag_before = _count_diag_lines(rt_dir)
+    legacy_telemetry_before = _count_legacy_telemetry_lines(rt_dir)
     req_st: dict[str, Any] = {
         "cmd": "selftest_wav",
         "wav_path": str(wav_path),
+        "no_diag": True,
         "no_telemetry": True,
     }
     if deliver_live:
@@ -2008,8 +2020,10 @@ def run_layer_b_live_daemon(
     except Exception as exc:
         checks.append(_make_check(check_name, "B", "FAIL", f"selftest_wav IPC failed: {redact_fn(exc)}"))
         return checks
-    tel_after = _count_telemetry_lines(rt_dir)
-    tel_delta = tel_after - tel_before
+    diag_after = _count_diag_lines(rt_dir)
+    legacy_telemetry_after = _count_legacy_telemetry_lines(rt_dir)
+    diag_delta = diag_after - diag_before
+    legacy_telemetry_delta = legacy_telemetry_after - legacy_telemetry_before
 
     summary = res_st.get("summary") if isinstance(res_st.get("summary"), Mapping) else {}
     routing = res_st.get("routing") if isinstance(res_st.get("routing"), Mapping) else {}
@@ -2030,7 +2044,8 @@ def run_layer_b_live_daemon(
         "cached_input_tokens": summary.get("cached_input_tokens"),
         "asr_chars": int(summary.get("asr_chars") or 0),
         "final_chars": final_chars,
-        "telemetry_lines_delta": tel_delta,
+        "diag_lines_delta": diag_delta,
+        "legacy_telemetry_lines_delta": legacy_telemetry_delta,
         "routing": dict(routing),
     }
     if deliver_live:
@@ -2055,11 +2070,11 @@ def run_layer_b_live_daemon(
         b3_metrics["final_text"] = redact_fn(res_st.get("final_text") or "")
 
     ok_res = bool(res_st.get("ok"))
-    no_tel_ok = tel_delta == 0
+    no_diag_ok = diag_delta == 0 and legacy_telemetry_delta == 0
     if deliver_live:
         pasted_ok = bool(res_st.get("pasted"))
         delivered_ok = pasted_ok and final_chars > 0
-        passed = ok_res and no_tel_ok and delivered_ok
+        passed = ok_res and no_diag_ok and delivered_ok
         fail_prefix = ""
         if ok_res and not pasted_ok and bool(res_st.get("clipboard")):
             fail_prefix = (
@@ -2078,15 +2093,16 @@ def run_layer_b_live_daemon(
             f"delivery_status={b3_metrics['delivery_status']} paste_reason={b3_metrics['paste_reason']} "
             f"final_chars={final_chars} asr_ms={b3_metrics['asr_ms']} refine_ms={b3_metrics['refine_ms']} "
             f"rsn_tok={b3_metrics['reasoning_tokens']} mode={routing.get('mode', '')} "
-            f"key={routing.get('session_key_masked', '') or '-'} tel_delta={tel_delta}"
+            f"key={routing.get('session_key_masked', '') or '-'} diag_delta={diag_delta} "
+            f"legacy_telemetry_delta={legacy_telemetry_delta}"
         )
     else:
-        passed = ok_res and no_tel_ok and final_chars > 0
+        passed = ok_res and no_diag_ok and final_chars > 0
         detail = (
             f"ok={ok_res} asr_ms={b3_metrics['asr_ms']} refine_ms={b3_metrics['refine_ms']} "
             f"rsn_tok={b3_metrics['reasoning_tokens']} final_chars={final_chars} "
             f"mode={routing.get('mode', '')} key={routing.get('session_key_masked', '') or '-'} "
-            f"tel_delta={tel_delta}"
+            f"diag_delta={diag_delta} legacy_telemetry_delta={legacy_telemetry_delta}"
         )
     if not ok_res and res_st.get("error"):
         detail += f" err={redact_fn(res_st.get('error'))}"
@@ -2783,7 +2799,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Opt-in Layer B GUI E2E delivery (selftest_wav with use_live_window=True, deliver=True, "
-            "no_telemetry=True; strongly recommended to pair with --expect-app)"
+            "no_diag=True; strongly recommended to pair with --expect-app)"
         ),
     )
     ap.add_argument(

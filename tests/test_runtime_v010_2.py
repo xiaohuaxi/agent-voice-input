@@ -734,27 +734,33 @@ class RuntimeHygieneAndGateV0102Tests(unittest.TestCase):
 
         ci_txt = (_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         pub_txt = (_REPO_ROOT / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
+        pkg_check_txt = (_REPO_ROOT / "scripts" / "check_package.py").read_text(encoding="utf-8")
         self.assertIn("win-shim:", ci_txt)
         self.assertIn("windows-latest", ci_txt)
         self.assertIn("-Mode self-check", ci_txt)
+        self.assertIn("windows-latest", pub_txt)
+        self.assertIn("macos-latest", pub_txt)
+        self.assertIn("-Mode self-check", pub_txt)
         for wf_name, wf_txt in (("ci.yml", ci_txt), ("publish.yml", pub_txt)):
-            self.assertIn("agent_voice_input/mac_shim/BridgeMain.swift", wf_txt, wf_name)
-            self.assertIn("agent_voice_input/win_shim/NativeBridge.cs", wf_txt, wf_name)
-            self.assertIn("agent_voice_input/_remote_probe.py", wf_txt, wf_name)
-            self.assertIn("agent_voice_input/remote_ssh.py", wf_txt, wf_name)
-            for mod_rel in (
-                "agent_voice_input/http_transport.py",
-                "agent_voice_input/llm_common.py",
-                "agent_voice_input/platform_common.py",
-                "agent_voice_input/workspace_ctx.py",
-            ):
-                self.assertIn(mod_rel, wf_txt, wf_name)
-            self.assertIn("/src/agent_voice_input/mac_shim/BridgeMain.swift", wf_txt, wf_name)
-            self.assertIn("/src/agent_voice_input/_remote_probe.py", wf_txt, wf_name)
-            self.assertIn("/src/agent_voice_input/remote_ssh.py", wf_txt, wf_name)
-            self.assertIn("/docs/context-routing.md", wf_txt, wf_name)
-            self.assertIn("/CHANGELOG.md", wf_txt, wf_name)
-            self.assertIn("/ROADMAP.md", wf_txt, wf_name)
+            self.assertIn("scripts/check_package.py", wf_txt, wf_name)
+            self.assertIn("twine check", wf_txt, wf_name)
+        self.assertIn("agent_voice_input/mac_shim/BridgeMain.swift", pkg_check_txt)
+        self.assertIn("agent_voice_input/win_shim/NativeBridge.cs", pkg_check_txt)
+        self.assertIn("agent_voice_input/_remote_probe.py", pkg_check_txt)
+        self.assertIn("agent_voice_input/remote_ssh.py", pkg_check_txt)
+        for mod_rel in (
+            "agent_voice_input/http_transport.py",
+            "agent_voice_input/llm_common.py",
+            "agent_voice_input/platform_common.py",
+            "agent_voice_input/workspace_ctx.py",
+        ):
+            self.assertIn(mod_rel, pkg_check_txt)
+        self.assertIn("/src/agent_voice_input/mac_shim/BridgeMain.swift", pkg_check_txt)
+        self.assertIn("/src/agent_voice_input/_remote_probe.py", pkg_check_txt)
+        self.assertIn("/src/agent_voice_input/remote_ssh.py", pkg_check_txt)
+        self.assertIn("/docs/context-routing.md", pkg_check_txt)
+        self.assertIn("/CHANGELOG.md", pkg_check_txt)
+        self.assertIn("/ROADMAP.md", pkg_check_txt)
 
 
 if __name__ == "__main__":

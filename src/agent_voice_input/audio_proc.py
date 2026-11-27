@@ -6,21 +6,34 @@ from __future__ import annotations
 
 import array
 from dataclasses import dataclass
+import datetime
+import fcntl
 import io
+import json
 import math
 import operator
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
 import time
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 import wave
 
-from .config import AudioConfig, ensure_secure_dir, is_hermetic_env
+from .config import (
+    UTTERANCE_ID_RE,
+    AudioConfig,
+    ensure_app_dir,
+    ensure_secure_dir,
+    format_local_iso_ts,
+    generate_utterance_id,
+    is_hermetic_env,
+    parse_diag_ts,
+)
 
 TARGET_SAMPLE_RATE = 16000
 TARGET_CHANNELS = 1
@@ -989,28 +1002,28 @@ def resolve_failed_audio(
 
 
 SAVED_RECORDING_EXTS: tuple[str, ...] = (".mp3", ".m4a", ".wav")
+_ARCHIVE_AUDIO_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4,}\.(?:mp3|m4a|wav)$", re.IGNORECASE)
+_TRANSCRIPT_WRITE_LOCK = threading.Lock()
 
 
 def _is_saved_recording_entry(entry: Path) -> bool:
     name = entry.name
-    return (
-        name.startswith("rec-")
-        and not name.startswith(".")
-        and name.lower().endswith(SAVED_RECORDING_EXTS)
-    )
+    if name.startswith(".") or not name.lower().endswith(SAVED_RECORDING_EXTS):
+        return False
+    return bool(name.startswith("rec-") or _ARCHIVE_AUDIO_ID_RE.match(name))
 
 
 def prune_saved_recordings_dir(
     recordings_dir: Path,
     *,
-    max_count: int = 300,
+    max_count: int = 1000,
     now_ts: float | None = None,
 ) -> None:
-    """Retain at most ``max_count`` newest ``rec-*`` files ordered by mtime, pruning older entries."""
+    """Retain at most ``max_count`` newest archived audio files (new ``<id>.*`` & legacy ``rec-*``); 0 disables pruning."""
     if not recordings_dir.is_dir() or recordings_dir.is_symlink():
         return
     now = time.time() if now_ts is None else now_ts
-    eff_max = max(1, int(max_count))
+    eff_max = int(max_count)
     alive: list[tuple[int, str, Path]] = []
     try:
         entries = list(recordings_dir.iterdir())
@@ -1030,10 +1043,10 @@ def prune_saved_recordings_dir(
                 except OSError:
                     pass
             continue
-        if _is_saved_recording_entry(entry):
+        if eff_max > 0 and _is_saved_recording_entry(entry):
             alive.append((st.st_mtime_ns, entry.name, entry))
 
-    if len(alive) > eff_max:
+    if eff_max > 0 and len(alive) > eff_max:
         alive.sort(key=lambda item: (item[0], item[1]))
         for _, _, old_path in alive[: len(alive) - eff_max]:
             try:
@@ -1043,7 +1056,7 @@ def prune_saved_recordings_dir(
 
 
 def list_saved_recordings(recordings_dir: Path) -> list[Path]:
-    """Return archived ``rec-*`` files ordered newest-first (read-only; never mutates disk)."""
+    """Return archived audio files (``<id>.*`` and legacy ``rec-*``) ordered newest-first (read-only)."""
     if not recordings_dir.is_dir() or recordings_dir.is_symlink():
         return []
     items: list[tuple[int, str, Path]] = []
@@ -1083,25 +1096,105 @@ def _write_temp_0600(path: Path, data: bytes) -> None:
         raise
 
 
+def _run_ffmpeg_transcode(
+    cmd: list[str],
+    *,
+    timeout_sec: float,
+    stop_evt: threading.Event | None = None,
+    shutdown_grace_sec: float = 1.5,
+) -> tuple[int | None, bool]:
+    """Run ``ffmpeg`` transcode, honoring both ``timeout_sec`` and optional cooperative ``stop_evt``.
+
+    Returns ``(returncode, timed_out_or_aborted)``.
+    """
+    if stop_evt is None:
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_sec,
+                check=False,
+            )
+            return int(proc.returncode), False
+        except (subprocess.TimeoutExpired, OSError):
+            return None, True
+
+    eff_grace = max(0.0, float(shutdown_grace_sec))
+    if stop_evt.is_set() and eff_grace <= 0.0:
+        return None, True
+
+    try:
+        pop = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None, True
+
+    hard_dl = time.monotonic() + max(0.05, float(timeout_sec))
+    shutdown_dl: float | None = None
+    aborted = False
+    try:
+        while pop.poll() is None:
+            now_m = time.monotonic()
+            if stop_evt.is_set() and shutdown_dl is None:
+                shutdown_dl = min(hard_dl, now_m + eff_grace)
+            eff_dl = shutdown_dl if shutdown_dl is not None else hard_dl
+            rem = eff_dl - now_m
+            if rem <= 0.0:
+                aborted = True
+                break
+            try:
+                pop.wait(timeout=min(0.05, rem))
+            except subprocess.TimeoutExpired:
+                pass
+        return (None, True) if aborted else (pop.returncode, False)
+    finally:
+        if pop.poll() is None:
+            try:
+                pop.terminate()
+            except OSError:
+                pass
+            try:
+                pop.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                try:
+                    pop.kill()
+                except OSError:
+                    pass
+                try:
+                    pop.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:  # pragma: no cover - unkillable D-state process
+                    pass
+
+
 def archive_recording_audio(
     raw_wav_bytes: bytes,
     recordings_dir: Path,
     *,
-    max_count: int = 300,
+    max_count: int = 1000,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
     now_ts: float | None = None,
     timeout_sec: float = 15.0,
+    utterance_id: str = "",
+    stop_evt: threading.Event | None = None,
+    shutdown_grace_sec: float = 1.5,
 ) -> Path | None:
-    """Compress voiced WAV to 16 kHz mono 64 kbps MP3 (fallback AAC .m4a / .wav) with 0600 mode & ring pruning."""
+    """Compress voiced WAV to 16 kHz mono 64 kbps MP3 (fallback AAC .m4a / .wav) as ``<id>.<ext>`` (0600)."""
     if not raw_wav_bytes:
         return None
     tmp_in: Path | None = None
     tmp_candidates: list[Path] = []
     try:
+        ensure_app_dir(recordings_dir.parent, create=True)
         rec_dir = ensure_secure_dir(recordings_dir)
         ts = time.time() if now_ts is None else now_ts
-        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(ts))
-        rand_hex = os.urandom(3).hex()
+        clean_id = utterance_id.strip()
+        eff_id = clean_id if (clean_id and UTTERANCE_ID_RE.fullmatch(clean_id)) else generate_utterance_id(ts)
         uniq = f"{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}"
         tmp_in = rec_dir / f".rec-in-{uniq}.wav.tmp"
         _write_temp_0600(tmp_in, raw_wav_bytes)
@@ -1123,7 +1216,7 @@ def archive_recording_audio(
                 tmp_candidates.append(tmp_out)
                 # Pre-create 0600 target before ffmpeg writes into it so encoded bytes are never world-readable
                 _write_temp_0600(tmp_out, b"")
-                proc = subprocess.run(
+                rc, aborted = _run_ffmpeg_transcode(
                     [
                         exe,
                         "-nostdin",
@@ -1141,13 +1234,13 @@ def archive_recording_audio(
                         *fmt_args,
                         str(tmp_out),
                     ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=timeout_sec,
-                    check=False,
+                    timeout_sec=timeout_sec,
+                    stop_evt=stop_evt,
+                    shutdown_grace_sec=shutdown_grace_sec,
                 )
-                if proc.returncode == 0 and tmp_out.is_file() and tmp_out.stat().st_size > 0:
+                if aborted:
+                    break
+                if rc == 0 and tmp_out.is_file() and tmp_out.stat().st_size > 0:
                     chosen_tmp = tmp_out
                     chosen_ext = ext
                     break
@@ -1162,7 +1255,7 @@ def archive_recording_audio(
         os.chmod(chosen_tmp, 0o600)
         if now_ts is not None:
             os.utime(chosen_tmp, (ts, ts))
-        final_path = rec_dir / f"rec-{stamp}-{rand_hex}{chosen_ext}"
+        final_path = rec_dir / f"{eff_id}{chosen_ext}"
         os.replace(chosen_tmp, final_path)
         prune_saved_recordings_dir(rec_dir, max_count=max_count, now_ts=ts)
         return final_path
@@ -1181,13 +1274,211 @@ def archive_recording_audio(
                 pass
 
 
+def _find_last_newline_tail_start(af: io.RawIOBase, end_pos: int, *, chunk_size: int = 65536) -> int:
+    """Return the byte offset immediately after the last ``\\n`` before ``end_pos`` (or ``0``)."""
+    pos = end_pos
+    while pos > 0:
+        read_start = max(0, pos - chunk_size)
+        af.seek(read_start, os.SEEK_SET)
+        chunk = af.read(pos - read_start)
+        if not chunk:
+            break
+        nl_idx = chunk.rfind(b"\n")
+        if nl_idx >= 0:
+            return read_start + nl_idx + 1
+        pos = read_start
+    return 0
+
+
+def _write_all_raw(af: io.RawIOBase, payload: bytes) -> None:
+    view = memoryview(payload)
+    written = 0
+    total = len(payload)
+    while written < total:
+        n = af.write(view[written:])
+        if not n:
+            raise OSError("short write appending transcript record")
+        written += n
+
+
+def append_transcript_record(
+    transcripts_dir: Path,
+    record: Mapping[str, Any],
+    *,
+    now_ts: float | None = None,
+) -> Path | None:
+    """Safely append one UTF-8 JSONL transcript record to ``<transcripts_dir>/YYYY-MM.jsonl`` (0600)."""
+    try:
+        ensure_app_dir(transcripts_dir.parent, create=True)
+        tdir = ensure_secure_dir(transcripts_dir)
+        eff_ts = now_ts if now_ts is not None else parse_diag_ts(record.get("ts"))
+        dt = (
+            datetime.datetime.fromtimestamp(float(eff_ts), tz=datetime.timezone.utc).astimezone()
+            if eff_ts is not None
+            else datetime.datetime.now().astimezone()
+        )
+        month_path = tdir / f"{dt.strftime('%Y-%m')}.jsonl"
+        lock_path = tdir / ".transcripts.lock"
+        line_bytes = (
+            json.dumps(dict(record), ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        with _TRANSCRIPT_WRITE_LOCK:
+            lfd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | nofollow, 0o600)
+            os.fchmod(lfd, 0o600)
+            with os.fdopen(lfd, "r+", encoding="utf-8") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                try:
+                    try:
+                        st_pre = os.lstat(month_path)
+                        if not stat.S_ISREG(st_pre.st_mode):
+                            return None
+                    except FileNotFoundError:
+                        pass
+                    afd = os.open(
+                        str(month_path),
+                        os.O_CREAT | os.O_RDWR | nofollow,
+                        0o600,
+                    )
+                    os.fchmod(afd, 0o600)
+                    with os.fdopen(afd, "r+b", buffering=0) as af:
+                        end_pos = af.seek(0, os.SEEK_END)
+                        safe_pos = end_pos
+                        prefix = b""
+                        if end_pos > 0:
+                            af.seek(end_pos - 1, os.SEEK_SET)
+                            if af.read(1) != b"\n":
+                                tail_start = _find_last_newline_tail_start(af, end_pos)
+                                af.seek(tail_start, os.SEEK_SET)
+                                tail_bytes = af.read(end_pos - tail_start)
+                                tail_valid = False
+                                try:
+                                    parsed = json.loads(tail_bytes.decode("utf-8"))
+                                    tail_valid = isinstance(parsed, dict)
+                                except (UnicodeDecodeError, ValueError):
+                                    tail_valid = False
+                                if tail_valid:
+                                    prefix = b"\n"
+                                    safe_pos = end_pos
+                                    af.seek(safe_pos, os.SEEK_SET)
+                                else:
+                                    safe_pos = tail_start
+                                    os.ftruncate(af.fileno(), safe_pos)
+                                    af.seek(safe_pos, os.SEEK_SET)
+                            else:
+                                af.seek(end_pos, os.SEEK_SET)
+                        try:
+                            _write_all_raw(af, prefix + line_bytes)
+                        except Exception:
+                            try:
+                                os.ftruncate(af.fileno(), safe_pos)
+                            except OSError:
+                                pass
+                            raise
+                    return month_path
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        return None
+
+
+def run_utterance_archive(
+    *,
+    utterance_id: str,
+    record_ts: float,
+    ts_iso: str,
+    mode: str,
+    duration_sec: float,
+    asr_provider: str,
+    asr_model: str,
+    refiner_provider: str | None,
+    refiner_model: str | None,
+    refiner_fallback: bool,
+    draft: str | None,
+    final: str,
+    raw_wav_bytes: bytes | None = None,
+    save_audio: bool = False,
+    save_transcripts: bool = False,
+    audio_max_count: int = 1000,
+    audio_dir: Path | None = None,
+    transcripts_dir: Path | None = None,
+    ffmpeg_bin: str = "/usr/bin/ffmpeg",
+    stop_evt: threading.Event | None = None,
+    shutdown_grace_sec: float = 1.5,
+) -> tuple[Path | None, Path | None]:
+    """Sequentially archive audio (if enabled) and then append the 12-field transcript record (if enabled)."""
+    audio_path: Path | None = None
+    transcript_path: Path | None = None
+    audio_file: str | None = None
+    if save_audio and raw_wav_bytes and audio_dir is not None:
+        try:
+            audio_path = archive_recording_audio(
+                raw_wav_bytes,
+                audio_dir,
+                max_count=audio_max_count,
+                ffmpeg_bin=ffmpeg_bin,
+                now_ts=record_ts,
+                utterance_id=utterance_id,
+                stop_evt=stop_evt,
+                shutdown_grace_sec=shutdown_grace_sec,
+            )
+            if audio_path is not None:
+                audio_file = audio_path.name
+        except Exception:
+            audio_path = None
+            audio_file = None
+    if save_transcripts and transcripts_dir is not None:
+        try:
+            eff_ts_iso = ts_iso or format_local_iso_ts(record_ts)
+            rec = {
+                "id": utterance_id,
+                "ts": eff_ts_iso,
+                "mode": mode,
+                "duration_sec": round(float(duration_sec), 2),
+                "asr_provider": asr_provider,
+                "asr_model": asr_model,
+                "refiner_provider": refiner_provider,
+                "refiner_model": refiner_model,
+                "refiner_fallback": bool(refiner_fallback),
+                "draft": draft,
+                "final": final,
+                "audio_file": audio_file,
+            }
+            transcript_path = append_transcript_record(
+                transcripts_dir,
+                rec,
+                now_ts=record_ts,
+            )
+        except Exception:
+            transcript_path = None
+    return audio_path, transcript_path
+
+
+def spawn_utterance_archive(**kwargs: Any) -> threading.Thread | None:
+    """Spawn a single non-blocking daemon thread to run ordered audio + transcript archiving."""
+    if not (kwargs.get("save_audio") or kwargs.get("save_transcripts")):
+        return None
+    try:
+        th = threading.Thread(
+            target=run_utterance_archive,
+            kwargs=kwargs,
+            name="avi-archive",
+            daemon=True,
+        )
+        th.start()
+        return th
+    except Exception:
+        return None
+
+
 def spawn_recording_archive(
     raw_wav_bytes: bytes,
     recordings_dir: Path,
     *,
-    max_count: int = 300,
+    max_count: int = 1000,
     ffmpeg_bin: str = "/usr/bin/ffmpeg",
     now_ts: float | None = None,
+    utterance_id: str = "",
 ) -> threading.Thread | None:
     """Spawn a non-blocking daemon thread to archive ``raw_wav_bytes``."""
     if not raw_wav_bytes:
@@ -1196,7 +1487,12 @@ def spawn_recording_archive(
         th = threading.Thread(
             target=archive_recording_audio,
             args=(raw_wav_bytes, recordings_dir),
-            kwargs={"max_count": max_count, "ffmpeg_bin": ffmpeg_bin, "now_ts": now_ts},
+            kwargs={
+                "max_count": max_count,
+                "ffmpeg_bin": ffmpeg_bin,
+                "now_ts": now_ts,
+                "utterance_id": utterance_id,
+            },
             name="avi-rec-archive",
             daemon=True,
         )
@@ -1209,12 +1505,18 @@ def spawn_recording_archive(
 def wait_recording_archives(
     threads: Iterable[threading.Thread],
     *,
-    timeout_sec: float = 2.0,
+    timeout_sec: float | None = 4.0,
 ) -> None:
-    """Best-effort wait up to ``timeout_sec`` total for pending background archive threads."""
-    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    """Wait for pending background archive threads (bounded when ``timeout_sec`` is set)."""
+    deadline = (time.monotonic() + max(0.0, float(timeout_sec))) if timeout_sec is not None else None
     for th in list(threads):
         if th is threading.current_thread() or not th.is_alive():
+            continue
+        if deadline is None:
+            try:
+                th.join()
+            except Exception:
+                pass
             continue
         rem = deadline - time.monotonic()
         if rem <= 0:

@@ -13,8 +13,8 @@ if str(_SRC_ROOT) not in sys.path:
 from agent_voice_input import __version__  # noqa: E402
 from agent_voice_input.asr_providers import AsrResult, create_asr_provider  # noqa: E402
 from agent_voice_input.audio_proc import _write_temp_0600, list_saved_recordings, process_wav  # noqa: E402
-from agent_voice_input.config import DEFAULT_ASR_BASE_URLS, ensure_secure_dir, expand_user_path, get_runtime_dir, load_config, normalize_asr_provider, normalize_refiner_provider, redact_secrets, resolve_credentials, resolve_saved_recordings_dir, select_asr_provider  # noqa: E402
-from agent_voice_input.control_ipc import read_telemetry_history  # noqa: E402
+from agent_voice_input.config import DEFAULT_ASR_BASE_URLS, ensure_secure_dir, expand_user_path, get_runtime_dir, load_config, normalize_asr_provider, normalize_refiner_provider, redact_secrets, resolve_archive_audio_dir, resolve_credentials, select_asr_provider  # noqa: E402
+from agent_voice_input.control_ipc import parse_diag_ts, read_diag_history  # noqa: E402
 from agent_voice_input.daemon_pipeline import _may_run_stage2_refiner, _transcribe_wav_chunks  # noqa: E402
 from agent_voice_input.hotwords import (  # noqa: E402
     HotwordsTable,
@@ -30,7 +30,7 @@ from agent_voice_input.session_ctx import SessionMatch, SessionTracker, _clean_a
 
 _REPO_ROOT = _SRC_ROOT.parent
 _TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-_REC_STAMP_RE = re.compile(r"^rec-(\d{8}-\d{6})-")
+_REC_STAMP_RE = re.compile(r"^(?:rec-)?(\d{8}-\d{6})-")
 _LEAKED_MARKERS = ("<asr_draft_to_clean>", "</asr_draft_to_clean>", "<session_reference_log", "<task_reminder>", "[Speaker]", "[CLI Agent]", "```", "】【")
 _TRAILING_FILLER_RE = re.compile(
     r"(?:^|[。！？；.!?\n])[ \t]*(?:嗯+|呃+|啊+|哦+|噢+|唉+)[ \t]*(?:[，,。！？；.!?\n]|$)"
@@ -52,7 +52,7 @@ _CANONICAL_TECH_TERMS = (
     "subagent", "worktree", "rebase", "cherry-pick", "JSONL", "TOML", "YAML", "WSL2", "tmux", "ffmpeg", "RControl",
     "SessionTracker", "CodexRefiner", "VoiceInputDaemon", "refiner.py", "session_ctx.py", "daemon.py",
     "asr_providers.py", "config.toml", "AGENTS.md", "SKILL.md", "TODO.md", "ROADMAP.md",
-    "win_shim.ps1", "mac_shim.swift", "gpt-6-luna", "qwen3-asr-flash", "prompt_cache_key", "telemetry.jsonl",
+    "win_shim.ps1", "mac_shim", "gpt-6-luna", "qwen3-asr-flash", "prompt_cache_key", "diag.jsonl",
 )
 
 
@@ -212,20 +212,34 @@ def _estimate_rec_stop_ts(rec_path: Path, mtime: float) -> float:
             pass
     return mtime
 
-def _match_telemetry(rec_items: Sequence[tuple[Path, float, float]], telemetry: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+def _match_diag_records(rec_items: Sequence[tuple[Path, float, float]], diag_records: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
     used_idx, matched = set(), {}
     for rec_path, mtime, dur_sec in rec_items:
+        stem = rec_path.stem
+        exact_i = next(
+            (
+                idx
+                for idx, rec in enumerate(diag_records)
+                if idx not in used_idx and isinstance(rec.get("id"), str) and rec.get("id") == stem
+            ),
+            -1,
+        )
+        if exact_i >= 0:
+            used_idx.add(exact_i)
+            matched[rec_path.name] = dict(diag_records[exact_i])
+            continue
         best_i, best_score = -1, 1e9
-        for idx, tel in enumerate(telemetry):
-            t_ts, t_dur = tel.get("ts"), tel.get("raw_audio_sec")
-            if idx in used_idx or not isinstance(t_ts, (int, float)) or not isinstance(t_dur, (int, float)):
+        for idx, rec in enumerate(diag_records):
+            t_ts = parse_diag_ts(rec.get("ts"))
+            t_dur = rec.get("raw_audio_sec")
+            if idx in used_idx or t_ts is None or not isinstance(t_dur, (int, float)):
                 continue
-            dur_diff, time_diff = abs(float(t_dur) - dur_sec), abs((float(t_ts) - float(tel.get("total_ms") or 0) / 1000.0) - mtime)
+            dur_diff, time_diff = abs(float(t_dur) - dur_sec), abs((t_ts - float(rec.get("total_ms") or 0) / 1000.0) - mtime)
             if dur_diff <= 0.5 and time_diff <= 15.0 and (dur_diff * 10.0 + time_diff) < best_score:
                 best_score, best_i = dur_diff * 10.0 + time_diff, idx
         if best_i >= 0:
             used_idx.add(best_i)
-            matched[rec_path.name] = dict(telemetry[best_i])
+            matched[rec_path.name] = dict(diag_records[best_i])
     return matched
 
 
@@ -253,7 +267,7 @@ def make_asr_cache_key(
     hw_sha1 = hashlib.sha1(raw_ctx.encode("utf-8")).hexdigest()
     prov = normalize_asr_provider(asr_provider) if asr_provider.strip() else ""
     norm_api = (asr_api or "auto").strip().lower() or "auto"
-    norm_effort = (asr_effort or "auto").strip().lower() or "auto"
+    norm_effort = (asr_effort or "none").strip().lower() or "none"
     norm_rid = (resource_id or "auto").strip().lower() or "auto"
     norm_dmode = (doubao_mode or "auto").strip().lower() or "auto"
     default_url = DEFAULT_ASR_BASE_URLS.get(prov, "").rstrip("/")
@@ -491,20 +505,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     tag = _validate_tag(args.tag)
-    ov: dict[str, Any] = {"audio.save_recordings": False}
+    ov: dict[str, Any] = {"archive.save_audio": False, "archive.save_transcripts": False}
     if args.asr_provider.strip():
         ap_val = normalize_asr_provider(args.asr_provider)
         ov["asr.provider"] = ap_val
         if ap_val != base_cfg.asr.canonical_provider():
             ov.update({
                 "asr.model": "", "asr.api": "auto", "asr.base_url": "", "asr.api_key_env": "",
-                "asr.resource_id": "auto", "asr.doubao_mode": "auto",
+                "asr.doubao_resource_id": "auto", "asr.doubao_mode": "auto",
             })
     for attr, key in (
         ("asr_model", "asr.model"),
         ("asr_api", "asr.api"),
         ("asr_effort", "asr.effort"),
-        ("asr_resource_id", "asr.resource_id"),
+        ("asr_resource_id", "asr.doubao_resource_id"),
         ("asr_doubao_mode", "asr.doubao_mode"),
         ("asr_base_url", "asr.base_url"),
     ):
@@ -541,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     secrets = list(dict.fromkeys([*secrets, *creds.all_secret_values()]))
     redact_fn = lambda s: redact_secrets(str(s), env, cfg=cfg, extra_secrets=secrets)
 
-    rec_dir = expand_user_path(args.recordings_dir, env=env) if args.recordings_dir else resolve_saved_recordings_dir(env)
+    rec_dir = expand_user_path(args.recordings_dir, env=env) if args.recordings_dir else resolve_archive_audio_dir(env)
     raw_recs = sorted(list_saved_recordings(rec_dir), key=lambda p: (p.stat().st_mtime, p.name))
     allowed_sha1: set[str] | None = None
     manifest_tag = ""
@@ -609,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     host_rt = expand_user_path(args.host_runtime_dir, env=env) if args.host_runtime_dir else get_runtime_dir(env, create=False)
-    tel_map = _match_telemetry([(p, mt, g.duration_sec) for p, _, mt, g in prepared], read_telemetry_history(host_rt, limit=1000) if host_rt.is_dir() else [])
+    tel_map = _match_diag_records([(p, mt, g.duration_sec) for p, _, mt, g in prepared], read_diag_history(host_rt, limit=1000) if host_rt.is_dir() else [])
     session_idx, asr_cache_path = _index_root_sessions(home), eval_dir / "asr_cache.json"
     raw_entries = _load_json_dict(asr_cache_path).get("entries")
     asr_entries: dict[str, Any] = dict(raw_entries) if isinstance(raw_entries, Mapping) else {}
@@ -711,8 +725,8 @@ def main(argv: list[str] | None = None) -> int:
                         git_status=asr_ctx.git_status,
                         dialog_text=asr_ctx.dialog_text,
                         asr_api=cfg.asr.api,
-                        asr_effort=cfg.asr.effort,
-                        resource_id=cfg.asr.resource_id,
+                        asr_effort=cfg.asr.effective_effort(asr_prov),
+                        resource_id=cfg.asr.doubao_resource_id,
                         doubao_mode=cfg.asr.doubao_mode,
                         base_url=cfg.asr.effective_base_url(asr_prov),
                         personal_hotwords=asr_ctx.personal_hotwords,
@@ -727,8 +741,8 @@ def main(argv: list[str] | None = None) -> int:
                         asr_entries[ckey] = {
                             "recording_sha1": rec_sha1, "audio_sha1": wav_sha1,
                             "asr_provider": asr_prov, "asr_model": asr_mod,
-                            "asr_api": cfg.asr.api, "asr_effort": cfg.asr.effort,
-                            "asr_resource_id": cfg.asr.resource_id, "asr_doubao_mode": cfg.asr.doubao_mode,
+                            "asr_api": cfg.asr.api, "asr_effort": cfg.asr.effective_effort(asr_prov),
+                            "asr_resource_id": cfg.asr.doubao_resource_id, "asr_doubao_mode": cfg.asr.doubao_mode,
                             "hotwords_sha1": hw_sha1, "hotword_count": len(asr_ctx.hotwords),
                             "text": redact_fn(asr_res.text), "latency_ms": asr_res.latency_ms,
                             "is_single_hop_refined": asr_res.is_single_hop_refined, "chunks": chunks_n,
@@ -790,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
                 rec_out: dict[str, Any] = {
                     "recording_name": p.name, "recording_sha1": rec_sha1, "ok": True, "duration_sec": round(gate.duration_sec, 2),
                     "mode": rec_mode, "session_tag": _mask_session_key(eff_skey), "ctx_chunks": ref_res.context_chunks, "ctx_chars": ref_res.context_chars,
-                    "telemetry_ctx_chars": tel.get("ctx_chars"), "hotword_count": len(asr_ctx.hotwords), "asr_cached": asr_cached,
+                    "diag_ctx_chars": tel.get("ctx_chars"), "hotword_count": len(asr_ctx.hotwords), "asr_cached": asr_cached,
                     "is_single_hop_refined": asr_res.is_single_hop_refined,
                     "e2e_ms": e2e_val, "asr_ms": asr_res.latency_ms, "prep_ms": prep_ms, "refine_init_ms": refine_init_total, "refine_ms": ref_res.latency_ms, "is_warm": is_warm,
                     "input_tokens": in_t, "cached_input_tokens": c_t, "output_tokens": ref_res.output_tokens, "reasoning_tokens": ref_res.reasoning_tokens,
@@ -817,12 +831,12 @@ def main(argv: list[str] | None = None) -> int:
         "asr_provider": asr_prov,
         "asr_model": asr_mod,
         "asr_api": cfg.asr.api,
-        "asr_effort": cfg.asr.effort,
-        "asr_resource_id": cfg.asr.resource_id,
+        "asr_effort": cfg.asr.effective_effort(asr_prov),
+        "asr_resource_id": cfg.asr.doubao_resource_id,
         "asr_doubao_mode": cfg.asr.doubao_mode,
         "refiner_provider": cfg.refiner.provider,
         "refiner_model": cfg.refiner.effective_model(cfg.refiner.provider),
-        "refiner_effort": cfg.refiner.effort,
+        "refiner_effort": cfg.refiner.effective_effort(cfg.refiner.provider),
         "context_max_chars": cfg.refiner.context_max_chars,
     }
     if manifest_tag:

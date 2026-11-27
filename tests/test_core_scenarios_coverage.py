@@ -399,27 +399,91 @@ class TestLlmCommonMappingsAndUsageScenarios(unittest.TestCase):
     def test_effort_mapping_message_extraction_and_key_hints(self) -> None:
         with self.assertRaises(ConfigError):
             llm_mod.build_gemini_generation_config("gemini-3.5-flash", "bogus")
+        with self.assertRaises(ConfigError) as cm_gem_auto:
+            llm_mod.build_gemini_generation_config("gemini-3.5-flash", "auto")
+        self.assertIn("removed", str(cm_gem_auto.exception).lower())
         self.assertEqual(
             llm_mod.build_gemini_generation_config("gemini-2.0-flash", "low"),
             {"temperature": 0.1},
         )
         self.assertEqual(
-            llm_mod.build_gemini_generation_config("gemini-2.5-pro", "auto")["thinkingConfig"],
+            llm_mod.build_gemini_generation_config("gemini-2.5-pro", "")["thinkingConfig"],
+            {"thinkingBudget": 128},
+        )
+        self.assertEqual(
+            llm_mod.build_gemini_generation_config("gemini-2.5-pro", "none")["thinkingConfig"],
             {"thinkingBudget": 128},
         )
         self.assertEqual(
             llm_mod.build_gemini_generation_config("gemini-3-pro", "minimal")["thinkingConfig"],
             {"thinkingLevel": "low"},
         )
+        self.assertEqual(
+            llm_mod.build_gemini_generation_config("gemini-3-flash", "none")["thinkingConfig"],
+            {"thinkingLevel": "minimal"},
+        )
 
         with self.assertRaises(ConfigError):
             llm_mod.apply_chat_effort_params({}, provider="openai", model="gpt-4o-mini", effort="bogus")
+        with self.assertRaises(ConfigError):
+            llm_mod.apply_chat_effort_params({}, provider="openai", model="gpt-6-luna", effort="auto")
 
-        # OpenRouter thinking model branches
-        for or_model in ("anthropic/claude-3.7-sonnet:thinking", "qwen/qwen3-32b", "openai/o3-mini"):
+        # OpenRouter thinking model branches (none disables where supported, clamps mandatory models, skips non-thinking)
+        for or_model, exp_eff in (
+            ("anthropic/claude-3.7-sonnet:thinking", "none"),
+            ("anthropic/claude-haiku-5.5", "none"),
+            ("qwen/qwen3-32b", "none"),
+            ("openai/gpt-6-luna", "none"),
+            ("openai/gpt-5.4-mini", "none"),
+            ("openai/gpt-5-mini", "minimal"),
+            ("openai/o3-mini", "low"),
+            ("openai/o1", "low"),
+            ("openai/o4-mini", "low"),
+            ("google/gemini-3.5-pro", "low"),
+            ("google/gemini-3.8-flash", "minimal"),
+            ("google/gemini-2.5-pro", "minimal"),
+            ("deepseek/deepseek-r1", "minimal"),
+        ):
             p_or: dict[str, object] = {}
-            llm_mod.apply_chat_effort_params(p_or, provider="openrouter", model=or_model, effort="auto")
-            self.assertEqual(p_or["reasoning"], {"effort": "none"})
+            llm_mod.apply_chat_effort_params(p_or, provider="openrouter", model=or_model, effort="none")
+            self.assertEqual(p_or["reasoning"], {"effort": exp_eff}, or_model)
+        p_or_nonthink: dict[str, object] = {}
+        llm_mod.apply_chat_effort_params(
+            p_or_nonthink, provider="openrouter", model="openai/gpt-audio-mini", effort="none"
+        )
+        self.assertNotIn("reasoning", p_or_nonthink)
+        p_or_def: dict[str, object] = {}
+        llm_mod.apply_chat_effort_params(
+            p_or_def, provider="openrouter", model="google/gemini-3.8-flash", effort="default"
+        )
+        self.assertNotIn("reasoning", p_or_def)
+
+        # OpenAI reasoning effort floor & ceiling clamping for o1/o3/o4, gpt-5 (5.0), gpt-5.4/gpt-6, and non-reasoning models
+        for oai_model, oai_eff, exp_wire in (
+            ("o1", "none", "low"),
+            ("o3", "none", "low"),
+            ("o3-mini", "minimal", "low"),
+            ("o4-mini", "none", "low"),
+            ("gpt-5-codex-mini", "none", "low"),
+            ("gpt-5", "max", "high"),
+            ("gpt-5-mini", "none", "minimal"),
+            ("gpt-5-mini", "max", "high"),
+            ("gpt-5-mini", "xhigh", "high"),
+            ("gpt-5-nano", "xhigh", "high"),
+            ("gpt-5.1", "none", "none"),
+            ("gpt-5.2", "none", "none"),
+            ("gpt-5.4", "none", "none"),
+            ("gpt-6-luna", "none", "none"),
+            ("gpt-6-luna", "max", "xhigh"),
+            ("gpt-6-luna", "default", None),
+            ("gpt-6-astra", "none", "low"),
+            ("gpt-6-sol", "none", "low"),
+            ("gpt-6.2-sol", "none", "low"),
+            ("gpt-4o-mini", "none", None),
+        ):
+            p_oai: dict[str, object] = {"temperature": 0.1}
+            llm_mod.apply_chat_effort_params(p_oai, provider="openai", model=oai_model, effort=oai_eff)
+            self.assertEqual(p_oai.get("reasoning_effort"), exp_wire, (oai_model, oai_eff))
 
         # DashScope hybrid vs non-hybrid (thinking / asr) vs omni
         p_ds_text: dict[str, object] = {}
@@ -430,12 +494,18 @@ class TestLlmCommonMappingsAndUsageScenarios(unittest.TestCase):
         llm_mod.apply_chat_effort_params(p_ds_skip, provider="dashscope", model="qwen3-asr-flash", effort="low")
         self.assertEqual(p_ds_skip, {})
 
-        # Volcengine thinking enabled with effort clamping & non-thinking no-op
+        # Volcengine thinking enabled with effort clamping, deepseek-r1 safe skip on none, & non-thinking no-op
         p_volc_hi: dict[str, object] = {"temperature": 0.2}
         llm_mod.apply_chat_effort_params(
             p_volc_hi, provider="volcengine", model="doubao-seed-2-0-mini-260428", effort="max"
         )
         self.assertEqual(p_volc_hi, {"thinking": {"type": "enabled"}, "reasoning_effort": "high"})
+
+        p_volc_r1: dict[str, object] = {"temperature": 0.2}
+        llm_mod.apply_chat_effort_params(
+            p_volc_r1, provider="volcengine", model="deepseek-r1-250528", effort="none"
+        )
+        self.assertEqual(p_volc_r1, {"temperature": 0.2})
 
         p_volc_plain: dict[str, object] = {"temperature": 0.2}
         llm_mod.apply_chat_effort_params(
@@ -449,7 +519,7 @@ class TestLlmCommonMappingsAndUsageScenarios(unittest.TestCase):
             p_ds_compat,
             provider="openai-compatible",
             model="deepseek-reasoner",
-            effort="auto",
+            effort="none",
             base_url="https://api.deepseek.com/v1",
         )
         self.assertEqual(p_ds_compat, {})
@@ -948,7 +1018,7 @@ class TestConfigTomlAndValidationScenarios(unittest.TestCase):
             ({"refiner": {"provider": "unknown"}}, "refiner.provider"),
             ({"refiner": {"provider": "deepseek", "effort": "turbo"}}, "refiner.effort"),
             ({"refiner": {"provider": "auto", "effort": "turbo"}}, "refiner.effort"),
-            ({"refiner": {"max_turns_per_thread": -1}}, "max_turns_per_thread"),
+            ({"refiner": {"session_max_turns": -1}}, "session_max_turns"),
             ({"refiner": {"timeout_sec": 0}}, "refiner.timeout_sec"),
             ({"refiner": {"provider": "auto", "api_key_env": "CORP_LLM_KEY"}}, "refiner.base_url"),
             ({"refiner": {"provider": "auto", "base_url": "https://llm.corp/v1"}}, "refiner.model"),
@@ -994,9 +1064,9 @@ class TestConfigTomlAndValidationScenarios(unittest.TestCase):
 
         # Direct programmatic dataclass edge checks (0 means unlimited turns)
         c_unlimited = Config()
-        cfg_mod._apply_section_dict(c_unlimited, {"refiner": {"max_turns_per_thread": 0}})
+        cfg_mod._apply_section_dict(c_unlimited, {"refiner": {"session_max_turns": 0}})
         cfg_mod._validate_config(c_unlimited, env={"CORP_STT_KEY": "k1", "CORP_LLM_KEY": "k2"})
-        self.assertEqual(c_unlimited.refiner.max_turns_per_thread, 0)
+        self.assertEqual(c_unlimited.refiner.session_max_turns, 0)
         self.assertEqual(RefinerConfig(provider="disabled").effective_api(""), "off")
         self.assertEqual(_normalize_off := cfg_mod._normalize_refiner_provider(False), "off")
         self.assertEqual(_normalize_off, "off")
@@ -1013,9 +1083,9 @@ class TestConfigTomlAndValidationScenarios(unittest.TestCase):
         with self.assertRaises(ConfigError):
             cfg_mod._validate_audio_config(Config(audio=cfg_mod.AudioConfig(max_duration_sec=True)))  # type: ignore[arg-type]
         with self.assertRaises(ConfigError):
-            cfg_mod._validate_audio_config(Config(audio=cfg_mod.AudioConfig(save_recordings="bad")))  # type: ignore[arg-type]
+            cfg_mod._validate_archive_config(Config(archive=cfg_mod.ArchiveConfig(save_audio="bad")))  # type: ignore[arg-type]
         with self.assertRaises(ConfigError):
-            cfg_mod._validate_refiner_config(Config(refiner=RefinerConfig(prompt=123)))  # type: ignore[arg-type]
+            cfg_mod._validate_refiner_config(Config(refiner=RefinerConfig(extra_instructions=123)))  # type: ignore[arg-type]
         with self.assertRaises(ConfigError):
             cfg_mod._validate_refiner_config(Config(refiner=RefinerConfig(include_git_status="bad")))  # type: ignore[arg-type]
         with self.assertRaises(ConfigError):

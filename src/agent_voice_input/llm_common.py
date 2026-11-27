@@ -11,6 +11,7 @@ from .config import (
     ConfigError,
     VALID_EFFORTS,
     _host_matches_domain,
+    validate_effort_value,
 )
 
 _GEMINI_BLOCKED_FINISH_REASONS = frozenset(
@@ -276,7 +277,6 @@ _GEMINI_THINKING_BUDGETS: dict[str, int] = {
 }
 
 _GEMINI_THINKING_LEVELS: dict[str, str] = {
-    "auto": "minimal",
     "none": "minimal",
     "minimal": "minimal",
     "low": "low",
@@ -309,9 +309,7 @@ def build_gemini_generation_config(
     model: str, effort: str, *, temperature: float = 0.1
 ) -> dict[str, Any]:
     """Build Gemini ``generationConfig`` honoring ``effort`` without breaking non-thinking models."""
-    eff = (effort or "auto").strip().lower()
-    if eff not in VALID_EFFORTS:
-        raise ConfigError(f"effort must be one of {sorted(VALID_EFFORTS)}, got {effort!r}")
+    eff = validate_effort_value(effort, "effort", allow_empty=True) or "none"
     gen_cfg: dict[str, Any] = {"temperature": temperature}
     if eff == "default" or not _gemini_supports_thinking_config(model):
         return gen_cfg
@@ -323,7 +321,7 @@ def build_gemini_generation_config(
             lvl = "low"
         gen_cfg["thinkingConfig"] = {"thinkingLevel": lvl}
         return gen_cfg
-    budget = 0 if eff == "auto" else _GEMINI_THINKING_BUDGETS[eff]
+    budget = _GEMINI_THINKING_BUDGETS[eff]
     if budget == 0 and "2.5-pro" in slug:
         budget = 128
     gen_cfg["thinkingConfig"] = {"thinkingBudget": budget}
@@ -340,7 +338,7 @@ def _openrouter_reasoning_mandatory(model: str) -> bool:
 
 
 def _is_openrouter_thinking_model(model: str) -> bool:
-    """Return True only for OpenRouter models known to incur internal thinking overhead by default."""
+    """Return True only for OpenRouter models known to accept/use reasoning parameters."""
     m = model.strip().lower()
     slug = m.split("/", 1)[-1].split(":", 1)[0]
     if "thinking" in m or "reasoning" in m:
@@ -349,7 +347,30 @@ def _is_openrouter_thinking_model(model: str) -> bool:
         return True
     if slug.startswith("qwen3") and "instruct" not in slug and "-asr" not in slug and "_asr" not in slug:
         return True
-    if slug.startswith(("deepseek-v4", "deepseek-r1", "mimo-v2", "o1", "o3", "o4", "gpt-5", "gpt-6")):
+    if slug.startswith(
+        (
+            "deepseek-v3.1",
+            "deepseek-v3.2",
+            "deepseek-v4",
+            "deepseek-r1",
+            "mimo-v2",
+            "o1",
+            "o3",
+            "o4",
+            "gpt-5",
+            "gpt-6",
+            "codex-mini",
+            "claude-3.7",
+            "claude-4",
+            "claude-5",
+            "claude-sonnet-4",
+            "claude-opus-4",
+            "claude-haiku-4.5",
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-haiku-5",
+        )
+    ):
         return True
     return False
 
@@ -369,7 +390,7 @@ def _is_volcengine_thinking_model(model: str) -> bool:
 
 
 def _is_openai_reasoning_model(model: str) -> bool:
-    """Return True for OpenAI models that accept ``reasoning_effort`` on ``/chat/completions``.
+    """Return True for OpenAI models that accept ``reasoning`` / ``reasoning_effort``.
 
     Non-reasoning models such as ``gpt-4o-mini`` and ``gpt-audio-mini`` reject
     ``reasoning_effort`` with HTTP 400 on the official OpenAI API; keeping this strict
@@ -378,6 +399,80 @@ def _is_openai_reasoning_model(model: str) -> bool:
     """
     slug = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
     return slug.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6", "codex-mini")) or "reasoning" in slug
+
+
+_GPT5_DOT_NONE_RE = re.compile(r"^gpt-5\.[1-9]")
+_GPT5_1_RE = re.compile(r"^gpt-5\.1(?:$|-)")
+_GPT5_PRO_RE = re.compile(r"^gpt-5-pro(?:$|-)")
+_GPT6_LUNA_RE = re.compile(r"^gpt-6(?:\.\d+)?-luna(?:$|-)")
+
+
+def _openai_min_reasoning_effort(model: str) -> str:
+    """Return the lowest reasoning effort accepted by an OpenAI reasoning model."""
+    slug = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
+    if _GPT5_PRO_RE.match(slug):
+        return "high"
+    if slug.startswith("gpt-6"):
+        return "none" if _GPT6_LUNA_RE.match(slug) else "low"
+    if _GPT5_DOT_NONE_RE.match(slug) and "codex" not in slug and "-pro" not in slug:
+        return "none"
+    if slug.startswith("gpt-5") and "codex" not in slug and "-pro" not in slug:
+        return "minimal"
+    return "low"
+
+
+def _openai_max_reasoning_effort(model: str) -> str:
+    """Return the highest reasoning effort accepted by an OpenAI reasoning model."""
+    slug = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
+    if (
+        slug.startswith("gpt-5")
+        and (not _GPT5_DOT_NONE_RE.match(slug) or _GPT5_1_RE.match(slug))
+        and "max" not in slug
+    ):
+        return "high"
+    return "max"
+
+
+def _resolve_openai_reasoning_effort(
+    model: str, eff: str, *, allow_max: bool = False
+) -> str | None:
+    """Resolve OpenAI wire reasoning effort, clamping both floor and ceiling per model."""
+    if eff == "default" or not _is_openai_reasoning_model(model):
+        return None
+    slug = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
+    wire = eff if (allow_max and eff == "max") else ("xhigh" if eff == "max" else eff)
+    min_eff = _openai_min_reasoning_effort(model)
+    if min_eff == "high":
+        return "high"
+    if min_eff == "low" and wire in ("none", "minimal"):
+        return "low"
+    if min_eff == "minimal" and wire == "none":
+        return "minimal"
+    if wire == "minimal" and _GPT5_1_RE.match(slug):
+        return "low"
+    max_eff = _openai_max_reasoning_effort(model)
+    if max_eff == "high" and wire in ("xhigh", "max"):
+        return "high"
+    return wire
+
+
+def _resolve_openrouter_reasoning_effort(model: str, eff: str) -> str | None:
+    """Resolve OpenRouter ``reasoning.effort``, avoiding 400s on mandatory-thinking and non-thinking models."""
+    if eff == "default":
+        return None
+    wire = "xhigh" if eff == "max" else eff
+    slug = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
+    if _is_openai_reasoning_model(model):
+        return _resolve_openai_reasoning_effort(model, eff, allow_max=False)
+    if _openrouter_reasoning_mandatory(model):
+        if eff in ("none", "minimal") and slug.startswith(("gemini-3", "gemini-4")) and "pro" in slug:
+            return "low"
+        return "minimal" if eff == "none" else wire
+    if slug.startswith(("gemini-2.5-pro", "deepseek-r1")):
+        return "minimal" if eff == "none" else wire
+    if eff == "none":
+        return "none" if _is_openrouter_thinking_model(model) else None
+    return wire
 
 
 def apply_chat_effort_params(
@@ -394,9 +489,7 @@ def apply_chat_effort_params(
     ``o3*``, ``o4*``, ``gpt-5*``, ``gpt-6*``) or whenever ``reasoning_effort`` is present,
     preventing HTTP 400 rejections on OpenAI's official API and pass-through proxies.
     """
-    eff = (effort or "auto").strip().lower()
-    if eff not in VALID_EFFORTS:
-        raise ConfigError(f"effort must be one of {sorted(VALID_EFFORTS)}, got {effort!r}")
+    eff = validate_effort_value(effort, "effort", allow_empty=True) or "none"
     is_oai_reasoning = _is_openai_reasoning_model(model)
     if is_oai_reasoning or "reasoning_effort" in payload:
         payload.pop("temperature", None)
@@ -406,18 +499,14 @@ def apply_chat_effort_params(
     wire_eff = "xhigh" if eff == "max" else eff
     prov = provider.strip().lower()
     if prov == "openrouter":
-        if _openrouter_reasoning_mandatory(model):
-            payload["reasoning"] = {"effort": "minimal" if eff in ("auto", "none") else wire_eff}
-        elif eff == "auto":
-            if _is_openrouter_thinking_model(model):
-                payload["reasoning"] = {"effort": "none"}
-        else:
-            payload["reasoning"] = {"effort": wire_eff}
+        or_eff = _resolve_openrouter_reasoning_effort(model, eff)
+        if or_eff is not None:
+            payload["reasoning"] = {"effort": or_eff}
         return
 
     if prov == "dashscope":
         if _is_dashscope_hybrid_thinking_model(model):
-            enable_th = eff not in ("auto", "none", "minimal")
+            enable_th = eff not in ("none", "minimal")
             payload["enable_thinking"] = enable_th
             slug_ds = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
             if enable_th and "omni" in slug_ds and not slug_ds.startswith("qwen3-omni"):
@@ -426,21 +515,22 @@ def apply_chat_effort_params(
 
     if prov == "volcengine":
         if _is_volcengine_thinking_model(model):
-            if eff in ("auto", "none", "minimal"):
-                payload["thinking"] = {"type": "disabled"}
+            slug_volc = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
+            if eff in ("none", "minimal"):
+                if not slug_volc.startswith("deepseek-r1"):
+                    payload["thinking"] = {"type": "disabled"}
             else:
                 volc_eff = "high" if wire_eff in ("high", "xhigh") else wire_eff
                 payload["thinking"] = {"type": "enabled"}
-                if volc_eff in ("minimal", "low", "medium", "high"):
-                    payload["reasoning_effort"] = volc_eff
-                    payload.pop("temperature", None)
+                payload["reasoning_effort"] = volc_eff
+                payload.pop("temperature", None)
         return
 
     if prov == "deepseek" or (
         prov == "openai-compatible" and base_url and _host_matches_domain(base_url, "deepseek.com")
     ):
         slug = model.strip().lower().split("/", 1)[-1].split(":", 1)[0]
-        if eff in ("auto", "none", "minimal"):
+        if eff in ("none", "minimal"):
             if "reasoner" not in slug:
                 payload["thinking"] = {"type": "disabled"}
         else:
@@ -448,8 +538,9 @@ def apply_chat_effort_params(
         return
 
     if prov == "openai":
-        if eff not in ("auto", "default", "none") and is_oai_reasoning:
-            payload["reasoning_effort"] = wire_eff
+        oai_eff = _resolve_openai_reasoning_effort(model, eff, allow_max=False)
+        if oai_eff is not None:
+            payload["reasoning_effort"] = oai_eff
             payload.pop("temperature", None)
         return
 

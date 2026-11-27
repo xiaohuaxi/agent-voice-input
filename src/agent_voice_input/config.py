@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
+import datetime
 import json
 import math
 import os
@@ -14,7 +15,9 @@ from pathlib import Path
 import re
 import shutil
 import stat
-from typing import Any, Iterable, Mapping, Sequence
+import subprocess
+import sys
+from typing import Any, Callable, Iterable, Mapping, Sequence
 import urllib.parse
 
 try:
@@ -27,12 +30,61 @@ class ConfigError(ValueError):
     """Raised when configuration syntax or values are invalid."""
 
 
+UTTERANCE_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")
+
+
+def format_local_iso_ts(ts: float | None = None) -> str:
+    """Format an epoch timestamp (or now) as a local-timezone ISO-8601 string (e.g. 2026-11-27T17:45:02+08:00)."""
+    dt = (
+        datetime.datetime.fromtimestamp(float(ts), tz=datetime.timezone.utc).astimezone()
+        if ts is not None
+        else datetime.datetime.now().astimezone()
+    )
+    return dt.isoformat(timespec="seconds")
+
+
+def parse_diag_ts(val: Any) -> float | None:
+    """Parse either an ISO-8601 timestamp string or legacy numeric epoch into a float Unix timestamp."""
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, (int, float)):
+        fval = float(val)
+        return fval if (math.isfinite(fval) and fval > 0.0) else None
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        try:
+            iso = (s[:-1] + "+00:00") if s.endswith(("Z", "z")) else s
+            dt = datetime.datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.astimezone()
+            ts_val = dt.timestamp()
+            return ts_val if (math.isfinite(ts_val) and ts_val > 0.0) else None
+        except ValueError:
+            return None
+    return None
+
+
+def generate_utterance_id(now_ts: float | None = None) -> str:
+    """Generate a compact local-time utterance ID: ``YYYYMMDD-HHMMSS-<4 lowercase hex>``."""
+    dt = (
+        datetime.datetime.fromtimestamp(float(now_ts), tz=datetime.timezone.utc).astimezone()
+        if now_ts is not None
+        else datetime.datetime.now().astimezone()
+    )
+    return f"{dt.strftime('%Y%m%d-%H%M%S')}-{os.urandom(2).hex()}"
+
+
 VALID_TRIGGER_MODES = frozenset({"tap_toggle", "ptt"})
 VALID_HOTKEY_SCOPES = frozenset({"all", "coding", "terminals"})
 VALID_UI_LANGUAGES = frozenset({"auto", "zh", "en"})
 VALID_UI_POSITIONS = frozenset({"bottom", "top"})
-VALID_WSL_SOURCES = frozenset({"auto", "pulse", "winmm", "wasapi"})
+VALID_WSL_SOURCES = frozenset({"auto", "pulse", "wasapi"})
 VALID_SILENCE_TRIM = frozenset({"off", "conservative", "balanced"})
+MAX_EXTRA_INSTRUCTIONS_ITEMS: int = 20
+MAX_EXTRA_INSTRUCTIONS_CHARS: int = 2000
+_EXTRA_INSTR_BULLET_RE = re.compile(r"^(?:[-*•]\s+)+")
 VALID_ASR_PROVIDERS = frozenset(
     {
         "auto",
@@ -85,7 +137,7 @@ CODEX_PUBLIC_FALLBACK_MODELS: tuple[str, ...] = (
 VALID_REFINER_APIS = frozenset({"auto", "chat-completions", "responses"})
 VALID_COLD_START_FALLBACKS = frozenset({"auto", "hotwords", "off"})
 VALID_EFFORTS = frozenset(
-    {"auto", "default", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
+    {"default", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
 )
 VALID_REFINER_EFFORTS = VALID_EFFORTS
 
@@ -135,6 +187,8 @@ DEFAULT_REFINER_MODELS: dict[str, str] = {
     "groq": "llama-3.3-70b-versatile",
     "siliconflow": "Qwen/Qwen2.5-7B-Instruct",
 }
+
+DEFAULT_ASR_EFFORTS: dict[str, str] = {}
 
 DEFAULT_REFINER_EFFORTS: dict[str, str] = {
     "codex": "low",
@@ -351,22 +405,27 @@ class HotkeyConfig:
     scope: str = "all"
     yield_remote_desktop: bool = True
     ignore_apps: tuple[str, ...] = ()
+    _key_explicit: bool = field(default=False, init=False, repr=False, compare=False)
     _hold_cancel_ms_explicit: bool = field(default=False, init=False, repr=False, compare=False)
 
     def __init__(
         self,
-        key: str = "RControl",
+        key: Any = _UNSET,
         trigger_mode: str = "tap_toggle",
         tap_max_ms: int = DEFAULT_TAP_MAX_MS,
         debounce_ms: int = 180,
-        only_in_terminals: Any = _UNSET,
         *,
         hold_cancel_ms: Any = _UNSET,
         scope: Any = _UNSET,
         yield_remote_desktop: bool = True,
         ignore_apps: tuple[str, ...] = (),
     ) -> None:
-        self.key = key
+        if key is _UNSET or key is None:
+            self.key = "RControl"
+            self._key_explicit = False
+        else:
+            self.key = key
+            self._key_explicit = True
         self.trigger_mode = trigger_mode
         self.tap_max_ms = tap_max_ms
         if hold_cancel_ms is _UNSET or hold_cancel_ms is None:
@@ -382,12 +441,6 @@ class HotkeyConfig:
         )
         if scope is not _UNSET and scope is not None:
             self.scope = scope.strip().lower() if isinstance(scope, str) else scope
-        elif only_in_terminals is not _UNSET and only_in_terminals is not None:
-            if not isinstance(only_in_terminals, bool):
-                raise ConfigError(
-                    f"hotkey.only_in_terminals: invalid boolean value {only_in_terminals!r}"
-                )
-            self.scope = "terminals" if only_in_terminals else "all"
         else:
             self.scope = "all"
 
@@ -407,20 +460,10 @@ class HotkeyConfig:
             return 0
         return min(DEFAULT_HOLD_HINT_MS, hc // 2)
 
-    @property
-    def only_in_terminals(self) -> bool:
-        """Deprecated compatibility alias synced with ``scope == 'terminals'``."""
-        return self.scope == "terminals"
-
-    @only_in_terminals.setter
-    def only_in_terminals(self, val: bool) -> None:
-        if not isinstance(val, bool):
-            raise ConfigError(f"hotkey.only_in_terminals: invalid boolean value {val!r}")
-        self.scope = "terminals" if val else "all"
-
 
 @dataclass
 class UiConfig:
+    # Accepts "auto" | "zh" | "en" as well as standard BCP 47 tags like "zh-CN" / "en-US".
     language: str = "auto"
     position: str = "bottom"
 
@@ -441,8 +484,6 @@ class AudioConfig:
     macos_device: str = "default"
     beep: bool = False
     tail_drain_sec: float | None = None
-    save_recordings: bool = False
-    save_recordings_max_count: int = 300
     silence_trim: str = "balanced"
 
     def effective_tail_drain_sec(self, *, macos: bool = False) -> float:
@@ -452,12 +493,51 @@ class AudioConfig:
 
 
 @dataclass
+class ArchiveConfig:
+    save_transcripts: bool = False
+    save_audio: bool = False
+    audio_max_count: int = 1000
+
+
+def format_archive_status_dict(archive: ArchiveConfig | Mapping[str, Any]) -> dict[str, Any]:
+    """Return a JSON-safe, text-free summary dict for ``[archive]`` configuration."""
+    if isinstance(archive, Mapping):
+        save_t = bool(archive.get("save_transcripts", False))
+        save_a = bool(archive.get("save_audio", False))
+        raw_max = archive.get("audio_max_count", 1000)
+        max_cnt = int(raw_max) if isinstance(raw_max, int) and not isinstance(raw_max, bool) else 1000
+    else:
+        save_t = bool(archive.save_transcripts)
+        save_a = bool(archive.save_audio)
+        max_cnt = int(archive.audio_max_count)
+    return {
+        "save_transcripts": save_t,
+        "save_audio": save_a,
+        "audio_max_count": max_cnt,
+    }
+
+
+def format_archive_summary(archive: ArchiveConfig | Mapping[str, Any]) -> str:
+    """Render concise single-line text for ``Archive: <summary>`` status rows."""
+    info = format_archive_status_dict(archive)
+    if not info["save_transcripts"] and not info["save_audio"]:
+        return "off"
+    t_lbl = "on" if info["save_transcripts"] else "off"
+    if info["save_audio"]:
+        cap_lbl = "unlimited" if info["audio_max_count"] == 0 else f"max {info['audio_max_count']}"
+        a_lbl = f"on ({cap_lbl})"
+    else:
+        a_lbl = "off"
+    return f"transcripts={t_lbl}, audio={a_lbl}"
+
+
+@dataclass
 class AsrConfig:
     provider: str = "auto"
     model: str = ""
     api: str = "auto"
-    effort: str = "auto"
-    resource_id: str = "auto"
+    effort: str = ""
+    doubao_resource_id: str = "auto"
     doubao_mode: str = "auto"
     base_url: str = ""
     api_key_env: str = ""
@@ -474,12 +554,23 @@ class AsrConfig:
         low = self.provider.strip().lower()
         return ASR_PROVIDER_ALIASES.get(low, low)
 
+    def has_explicit_effort(self, resolved_provider: str | None = None) -> bool:
+        _ = resolved_provider
+        return bool(self.effort and self.effort.strip())
+
     def effective_model(self, resolved_provider: str | None = None) -> str:
         if self.model and self.model.strip():
             return self.model.strip()
         raw_p = (resolved_provider or self.provider).strip().lower()
         prov = ASR_PROVIDER_ALIASES.get(raw_p, raw_p)
         return DEFAULT_ASR_MODELS.get(prov, DEFAULT_ASR_MODELS["dashscope"])
+
+    def effective_effort(self, resolved_provider: str | None = None) -> str:
+        if self.effort and self.effort.strip():
+            return self.effort.strip().lower()
+        raw_p = (resolved_provider or self.provider).strip().lower()
+        prov = ASR_PROVIDER_ALIASES.get(raw_p, raw_p)
+        return DEFAULT_ASR_EFFORTS.get(prov, "none")
 
     def effective_base_url(self, resolved_provider: str | None = None) -> str:
         if self.base_url and self.base_url.strip():
@@ -489,19 +580,61 @@ class AsrConfig:
         return DEFAULT_ASR_BASE_URLS.get(prov, "")
 
 
+def normalize_extra_instructions(
+    raw: Any, field_name: str = "refiner.extra_instructions"
+) -> tuple[str, ...]:
+    """Normalize ``refiner.extra_instructions`` from a string, multiline string, or string sequence."""
+    if raw is None:
+        return ()
+    candidates: list[str] = []
+    if isinstance(raw, str):
+        candidates.extend(raw.splitlines())
+    elif isinstance(raw, (list, tuple)):
+        for idx, item in enumerate(raw):
+            if not isinstance(item, str):
+                raise ConfigError(
+                    f"{field_name}[{idx}]: expected string, got {type(item).__name__}"
+                )
+            candidates.extend(item.splitlines())
+    else:
+        raise ConfigError(
+            f"{field_name}: expected string or array of strings, got {type(raw).__name__}"
+        )
+    items: list[str] = []
+    for raw_line in candidates:
+        s = raw_line.strip()
+        if not s:
+            continue
+        s = _EXTRA_INSTR_BULLET_RE.sub("", s).strip()
+        if not s or s in ("-", "*", "•"):
+            continue
+        items.append(s)
+    if len(items) > MAX_EXTRA_INSTRUCTIONS_ITEMS:
+        raise ConfigError(
+            f"{field_name}: too many entries ({len(items)} > max {MAX_EXTRA_INSTRUCTIONS_ITEMS})"
+        )
+    total_chars = sum(len(x) for x in items)
+    if total_chars > MAX_EXTRA_INSTRUCTIONS_CHARS:
+        raise ConfigError(
+            f"{field_name}: total length exceeds limit "
+            f"({total_chars} > max {MAX_EXTRA_INSTRUCTIONS_CHARS} chars)"
+        )
+    return tuple(items)
+
+
 @dataclass
 class RefinerConfig:
     provider: str = "auto"
     model: str = ""
     api: str = "auto"
     effort: str = ""
-    prompt: str = ""
+    extra_instructions: tuple[str, ...] = ()
     include_git_status: bool = True
     context_max_chars: int = 200000
     cold_start_fallback: str = "auto"
     base_url: str = ""
     api_key_env: str = ""
-    max_turns_per_thread: int = 0
+    session_max_turns: int = 0
     timeout_sec: float = 90.0
     max_retries: int = 2
     force_on_single_hop: bool = False
@@ -518,11 +651,15 @@ class RefinerConfig:
             self.provider = prov
         self._model_explicit = bool(self.model and self.model.strip())
         self._effort_explicit = bool(self.effort and self.effort.strip())
+        if self.extra_instructions != ():
+            self.extra_instructions = normalize_extra_instructions(
+                self.extra_instructions, "refiner.extra_instructions"
+            )
         if prov not in ("auto", "off"):
             if not self.model or not self.model.strip():
                 self.model = DEFAULT_REFINER_MODELS.get(prov, "")
             if not self.effort or not self.effort.strip():
-                self.effort = DEFAULT_REFINER_EFFORTS.get(prov, "auto")
+                self.effort = DEFAULT_REFINER_EFFORTS.get(prov, "none")
 
     def has_explicit_model(self, resolved_provider: str | None = None) -> bool:
         m = (self.model or "").strip()
@@ -542,7 +679,7 @@ class RefinerConfig:
             return True
         raw_p = (resolved_provider or self.provider).strip().lower()
         prov = REFINER_PROVIDER_ALIASES.get(raw_p, raw_p)
-        return e != DEFAULT_REFINER_EFFORTS.get(prov, "auto")
+        return e != DEFAULT_REFINER_EFFORTS.get(prov, "none")
 
     def effective_model(self, resolved_provider: str | None = None) -> str:
         if self.model and self.model.strip():
@@ -556,7 +693,7 @@ class RefinerConfig:
             return self.effort.strip().lower()
         raw_p = (resolved_provider or self.provider).strip().lower()
         prov = REFINER_PROVIDER_ALIASES.get(raw_p, raw_p)
-        return DEFAULT_REFINER_EFFORTS.get(prov, "auto")
+        return DEFAULT_REFINER_EFFORTS.get(prov, "none")
 
     def effective_base_url(self, resolved_provider: str | None = None) -> str:
         if self.base_url and self.base_url.strip():
@@ -617,6 +754,7 @@ class Config:
     hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
     ui: UiConfig = field(default_factory=UiConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
+    archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     refiner: RefinerConfig = field(default_factory=RefinerConfig)
     remote: RemoteConfig = field(default_factory=RemoteConfig)
@@ -886,41 +1024,114 @@ def get_runtime_dir(
     src_env = os.environ if env is None else env
     explicit_rt = (src_env.get("AGENT_VOICE_INPUT_RUNTIME_DIR") or "").strip()
     if explicit_rt:
+        explicit = env is not None and env is not os.environ
+        raw_home = (src_env.get("HOME") or "").strip()
+        if explicit and explicit_rt.startswith("~") and (not raw_home or _is_other_user_tilde(explicit_rt)):
+            raise ConfigError(
+                f"AGENT_VOICE_INPUT_RUNTIME_DIR must be an absolute path: {explicit_rt!r}"
+            )
         rt_dir = expand_user_path(explicit_rt, env=src_env)
+        if not rt_dir.is_absolute():
+            raise ConfigError(
+                f"AGENT_VOICE_INPUT_RUNTIME_DIR must be an absolute path, got {explicit_rt!r}"
+            )
     else:
         xdg = (src_env.get("XDG_RUNTIME_DIR") or "").strip()
-        if xdg:
-            rt_dir = Path(xdg) / "agent-voice-input"
+        xdg_path = Path(xdg) if xdg else None
+        if xdg_path is not None and xdg_path.is_absolute():
+            rt_dir = xdg_path / "agent-voice-input"
         else:
             cache_home = (src_env.get("XDG_CACHE_HOME") or "").strip()
-            base_cache = (
-                expand_user_path(cache_home, env=src_env)
-                if cache_home
-                else (expand_user_path("~", env=src_env) / ".cache")
-            )
+            cache_path = expand_user_path(cache_home, env=src_env) if cache_home else None
+            if cache_path is not None and cache_path.is_absolute():
+                base_cache = cache_path
+            else:
+                base_cache = expand_user_path("~", env=src_env) / ".cache"
             rt_dir = base_cache / "agent-voice-input"
     if create:
         ensure_secure_dir(rt_dir, expected_uid=uid)
     return rt_dir
 
 
-def resolve_saved_recordings_dir(
+def resolve_archive_audio_dir(
     env: Mapping[str, str] | None = None,
     *,
     uid: int | None = None,
     create: bool = False,
 ) -> Path:
-    """Return ``<app_home>/recordings`` (default ``~/.agent-voice-input/recordings``)."""
+    """Return ``<app_home>/audio`` (default ``~/.agent-voice-input/audio``)."""
     app_home = resolve_app_home_dir(env)
     if app_home is None:
         raise ConfigError(
-            "cannot resolve recordings directory: HOME and AGENT_VOICE_INPUT_HOME are unset"
+            "cannot resolve archive audio directory: HOME and AGENT_VOICE_INPUT_HOME are unset"
         )
-    rec_dir = app_home / "recordings"
+    audio_dir = app_home / "audio"
     if create:
         ensure_app_dir(app_home, expected_uid=uid, create=True)
-        ensure_secure_dir(rec_dir, expected_uid=uid)
-    return rec_dir
+        ensure_secure_dir(audio_dir, expected_uid=uid)
+    return audio_dir
+
+
+def resolve_archive_transcripts_dir(
+    env: Mapping[str, str] | None = None,
+    *,
+    uid: int | None = None,
+    create: bool = False,
+) -> Path:
+    """Return ``<app_home>/transcripts`` (default ``~/.agent-voice-input/transcripts``)."""
+    app_home = resolve_app_home_dir(env)
+    if app_home is None:
+        raise ConfigError(
+            "cannot resolve archive transcripts directory: HOME and AGENT_VOICE_INPUT_HOME are unset"
+        )
+    transcripts_dir = app_home / "transcripts"
+    if create:
+        ensure_app_dir(app_home, expected_uid=uid, create=True)
+        ensure_secure_dir(transcripts_dir, expected_uid=uid)
+    return transcripts_dir
+
+
+def _is_macbook_laptop(
+    *,
+    platform: str | None = None,
+    run_fn: Callable[..., Any] | None = None,
+) -> bool:
+    """Return True only on macOS MacBook laptops (desktop Macs like Mac mini/Studio/iMac/Pro return False)."""
+    eff_platform = sys.platform if platform is None else platform
+    if eff_platform != "darwin":
+        return False
+    runner = subprocess.run if run_fn is None else run_fn
+    try:
+        proc = runner(
+            ["sysctl", "-n", "hw.model"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+        model = (proc.stdout or "").strip().lower()
+        if proc.returncode == 0 and model:
+            if "macbook" in model:
+                return True
+            if any(tok in model for tok in ("macmini", "imac", "macpro", "macstudio")):
+                return False
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc = runner(
+            ["pmset", "-g", "batt"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+        if proc.returncode == 0 and "InternalBattery" in (proc.stdout or ""):
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1133,6 +1344,10 @@ def load_env_files(
             continue
         try:
             content = path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ConfigError(
+                f"cannot decode env file {path} as UTF-8 (byte offset {exc.start}): {exc.reason}"
+            ) from None
         except OSError:
             continue
         file_proxy_keys: set[str] = set()
@@ -1817,6 +2032,29 @@ def normalize_ui_position(raw: Any = "bottom", field_name: str = "ui.position") 
     )
 
 
+def validate_effort_value(raw: Any, field_name: str, *, allow_empty: bool = True) -> str:
+    """Validate and normalize an ``effort`` value, emitting a migration error for removed ``'auto'``."""
+    s = _as_str(raw, field_name).strip().lower()
+    if not s:
+        if allow_empty:
+            return ""
+        raise ConfigError(
+            f"{field_name} must be one of {sorted(VALID_EFFORTS)}, got {raw!r}"
+        )
+    if s == "auto":
+        raise ConfigError(
+            f"{field_name}='auto' has been removed; omit it or set {field_name}='' "
+            "(empty string) to use the tool's recommended default for the provider, "
+            "'none' to disable or minimize thinking, or 'default' to use the upstream provider default"
+        )
+    if s not in VALID_EFFORTS:
+        raise ConfigError(
+            f"{field_name} must be '' (recommended default) or one of {sorted(VALID_EFFORTS)}, "
+            f"got {raw!r}"
+        )
+    return s
+
+
 def normalize_asr_provider(raw: Any) -> str:
     s = _as_str(raw, "asr.provider").strip().lower()
     return ASR_PROVIDER_ALIASES.get(s, s)
@@ -1925,13 +2163,17 @@ def _parse_remote_hosts_value(raw_hosts: Any) -> tuple[RemoteHostConfig, ...]:
 def _apply_hotkey_section(cfg: Config, hk: Any) -> None:
     if not isinstance(hk, Mapping):
         raise ConfigError("[hotkey] must be a table/object")
-    has_explicit_scope = hk.get("scope") is not None
-    oit_val: bool | None = None
     for k, v in hk.items():
+        if k == "only_in_terminals":
+            raise ConfigError(
+                'hotkey.only_in_terminals has been removed; use hotkey.scope = "terminals" '
+                '(or "all" / "coding") instead'
+            )
         if v is None:
             continue
         if k == "key":
             cfg.hotkey.key = _as_str(v, "hotkey.key").strip()
+            cfg.hotkey._key_explicit = True
         elif k == "trigger_mode":
             cfg.hotkey.trigger_mode = _as_str(v, "hotkey.trigger_mode").strip().lower()
         elif k == "tap_max_ms":
@@ -1947,12 +2189,8 @@ def _apply_hotkey_section(cfg: Config, hk: Any) -> None:
             cfg.hotkey.yield_remote_desktop = _as_bool(v, "hotkey.yield_remote_desktop")
         elif k == "ignore_apps":
             cfg.hotkey.ignore_apps = _as_app_patterns(v, "hotkey.ignore_apps")
-        elif k == "only_in_terminals":
-            oit_val = _as_bool(v, "hotkey.only_in_terminals")
         else:
             raise ConfigError(f"unknown hotkey option {k!r}")
-    if oit_val is not None and not has_explicit_scope:
-        cfg.hotkey.scope = "terminals" if oit_val else "all"
 
 
 def _apply_ui_section(cfg: Config, ui: Any) -> None:
@@ -1973,6 +2211,16 @@ def _apply_audio_section(cfg: Config, au: Any) -> None:
     if not isinstance(au, Mapping):
         raise ConfigError("[audio] must be a table/object")
     for k, v in au.items():
+        if k == "save_recordings":
+            raise ConfigError(
+                "audio.save_recordings has moved to [archive]; "
+                "use archive.save_audio = true/false under [archive] in config.toml instead"
+            )
+        if k == "save_recordings_max_count":
+            raise ConfigError(
+                "audio.save_recordings_max_count has moved to [archive]; "
+                "use archive.audio_max_count under [archive] in config.toml instead"
+            )
         if v is None:
             continue
         if k == "floor_dbfs":
@@ -1988,30 +2236,57 @@ def _apply_audio_section(cfg: Config, au: Any) -> None:
         elif k == "max_duration_sec":
             cfg.audio.max_duration_sec = _parse_max_duration_sec(v, "audio.max_duration_sec")
         elif k == "wsl_source":
-            cfg.audio.wsl_source = _as_str(v, "audio.wsl_source").strip().lower()
+            wsl_val = _as_str(v, "audio.wsl_source").strip().lower()
+            if wsl_val == "winmm":
+                raise ConfigError(
+                    "audio.wsl_source = 'winmm' has been removed; "
+                    "use audio.wsl_source = 'wasapi' or 'auto' instead"
+                )
+            cfg.audio.wsl_source = wsl_val
         elif k == "macos_device":
             cfg.audio.macos_device = _as_str(v, "audio.macos_device").strip()
         elif k == "beep":
             cfg.audio.beep = _as_bool(v, "audio.beep")
         elif k == "tail_drain_sec":
             cfg.audio.tail_drain_sec = _as_float(v, "audio.tail_drain_sec")
-        elif k == "save_recordings":
-            cfg.audio.save_recordings = _as_bool(v, "audio.save_recordings")
-        elif k == "save_recordings_max_count":
-            cfg.audio.save_recordings_max_count = _as_int(v, "audio.save_recordings_max_count")
         elif k == "silence_trim":
             cfg.audio.silence_trim = _as_str(v, "audio.silence_trim").strip().lower()
         else:
             raise ConfigError(f"unknown audio option {k!r}")
 
 
-def _apply_asr_section(cfg: Config, asr: Any) -> None:
+def _apply_archive_section(cfg: Config, arch: Any) -> None:
+    if not isinstance(arch, Mapping):
+        raise ConfigError("[archive] must be a table/object")
+    for k, v in arch.items():
+        if v is None:
+            continue
+        if k == "save_transcripts":
+            cfg.archive.save_transcripts = _as_bool(v, "archive.save_transcripts")
+        elif k == "save_audio":
+            cfg.archive.save_audio = _as_bool(v, "archive.save_audio")
+        elif k == "audio_max_count":
+            cfg.archive.audio_max_count = _as_int(v, "archive.audio_max_count")
+        else:
+            raise ConfigError(f"unknown archive option {k!r}")
+
+
+def _apply_asr_section(
+    cfg: Config,
+    asr: Any,
+    *,
+    env: Mapping[str, str] | None = None,
+    home_dir: str | Path | None = None,
+) -> None:
     if not isinstance(asr, Mapping):
         raise ConfigError("[asr] must be a table/object")
     prev_asr_provider = cfg.asr.provider
     has_explicit_asr_provider = asr.get("provider") is not None
     has_explicit_asr_model = asr.get("model") is not None and str(asr.get("model")).strip() != ""
     has_explicit_asr_api = asr.get("api") is not None and str(asr.get("api")).strip() != ""
+    has_explicit_asr_effort = (
+        asr.get("effort") is not None and str(asr.get("effort")).strip() != ""
+    )
     has_explicit_asr_base_url = (
         asr.get("base_url") is not None and str(asr.get("base_url")).strip() != ""
     )
@@ -2019,6 +2294,11 @@ def _apply_asr_section(cfg: Config, asr: Any) -> None:
         asr.get("api_key_env") is not None and str(asr.get("api_key_env")).strip() != ""
     )
     for k, v in asr.items():
+        if k == "resource_id":
+            raise ConfigError(
+                "asr.resource_id has been renamed to asr.doubao_resource_id; "
+                "please update 'resource_id' to 'doubao_resource_id' under [asr] in config.toml"
+            )
         if v is None:
             continue
         if k == "provider":
@@ -2028,9 +2308,9 @@ def _apply_asr_section(cfg: Config, asr: Any) -> None:
         elif k == "api":
             cfg.asr.api = _as_str(v, "asr.api").strip().lower()
         elif k == "effort":
-            cfg.asr.effort = _as_str(v, "asr.effort").strip().lower()
-        elif k == "resource_id":
-            cfg.asr.resource_id = _as_str(v, "asr.resource_id").strip()
+            cfg.asr.effort = validate_effort_value(v, "asr.effort", allow_empty=True)
+        elif k == "doubao_resource_id":
+            cfg.asr.doubao_resource_id = _as_str(v, "asr.doubao_resource_id").strip()
         elif k == "doubao_mode":
             cfg.asr.doubao_mode = _as_str(v, "asr.doubao_mode").strip().lower()
         elif k == "base_url":
@@ -2038,9 +2318,16 @@ def _apply_asr_section(cfg: Config, asr: Any) -> None:
         elif k == "api_key_env":
             cfg.asr.api_key_env = _as_str(v, "asr.api_key_env").strip()
         elif k == "hotwords_file":
+            hw_disp = "~/.agent-voice-input/hotwords/personal.txt"
+            if env is not None or home_dir is not None:
+                try:
+                    app_home = resolve_app_home_dir(env, home_dir=home_dir)
+                except ConfigError:
+                    app_home = None
+                if app_home is not None:
+                    hw_disp = str(app_home / "hotwords" / "personal.txt")
             raise ConfigError(
-                "asr.hotwords_file has been removed; personal hotwords are now fixed at "
-                "~/.agent-voice-input/hotwords/personal.txt "
+                f"asr.hotwords_file has been removed; personal hotwords are now fixed at {hw_disp} "
                 "(please remove 'hotwords_file' from [asr] in config.toml)"
             )
         elif k == "timeout_sec":
@@ -2054,6 +2341,8 @@ def _apply_asr_section(cfg: Config, asr: Any) -> None:
             cfg.asr.model = ""
         if not has_explicit_asr_api:
             cfg.asr.api = "auto"
+        if not has_explicit_asr_effort:
+            cfg.asr.effort = ""
         if not has_explicit_asr_base_url:
             cfg.asr.base_url = ""
         if not has_explicit_asr_key_env:
@@ -2077,6 +2366,16 @@ def _apply_refiner_section(cfg: Config, ref: Any) -> None:
         ref.get("api_key_env") is not None and str(ref.get("api_key_env")).strip() != ""
     )
     for k, v in ref.items():
+        if k == "prompt":
+            raise ConfigError(
+                'refiner.prompt has been removed to protect built-in dictation and tag-safety rules; '
+                'use refiner.extra_instructions = ["..."] instead (applies to both two-stage and single-hop pipelines)'
+            )
+        if k == "max_turns_per_thread":
+            raise ConfigError(
+                "refiner.max_turns_per_thread has been renamed to refiner.session_max_turns; "
+                "please update 'max_turns_per_thread' to 'session_max_turns' under [refiner] in config.toml"
+            )
         if v is None:
             continue
         if k == "provider":
@@ -2087,10 +2386,12 @@ def _apply_refiner_section(cfg: Config, ref: Any) -> None:
         elif k == "api":
             cfg.refiner.api = _as_str(v, "refiner.api").strip().lower()
         elif k == "effort":
-            cfg.refiner.effort = _as_str(v, "refiner.effort").strip().lower()
+            cfg.refiner.effort = validate_effort_value(v, "refiner.effort", allow_empty=True)
             cfg.refiner._effort_explicit = bool(cfg.refiner.effort)
-        elif k == "prompt":
-            cfg.refiner.prompt = _as_str(v, "refiner.prompt")
+        elif k == "extra_instructions":
+            cfg.refiner.extra_instructions = normalize_extra_instructions(
+                v, "refiner.extra_instructions"
+            )
         elif k == "include_git_status":
             cfg.refiner.include_git_status = _as_bool(v, "refiner.include_git_status")
         elif k == "context_max_chars":
@@ -2101,8 +2402,8 @@ def _apply_refiner_section(cfg: Config, ref: Any) -> None:
             cfg.refiner.base_url = _as_str(v, "refiner.base_url").strip()
         elif k == "api_key_env":
             cfg.refiner.api_key_env = _as_str(v, "refiner.api_key_env").strip()
-        elif k == "max_turns_per_thread":
-            cfg.refiner.max_turns_per_thread = _as_int(v, "refiner.max_turns_per_thread")
+        elif k == "session_max_turns":
+            cfg.refiner.session_max_turns = _as_int(v, "refiner.session_max_turns")
         elif k == "timeout_sec":
             cfg.refiner.timeout_sec = _as_float(v, "refiner.timeout_sec")
         elif k == "max_retries":
@@ -2126,7 +2427,7 @@ def _apply_refiner_section(cfg: Config, ref: Any) -> None:
             cfg.refiner.effort = (
                 ""
                 if cfg.refiner.provider in ("auto", "off")
-                else DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
+                else DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "none")
             )
         if not has_explicit_ref_base_url:
             cfg.refiner.base_url = ""
@@ -2154,20 +2455,30 @@ _SECTION_APPLIERS: dict[str, Callable[[Config, Any], None]] = {
     "hotkey": _apply_hotkey_section,
     "ui": _apply_ui_section,
     "audio": _apply_audio_section,
+    "archive": _apply_archive_section,
     "asr": _apply_asr_section,
     "refiner": _apply_refiner_section,
     "remote": _apply_remote_section,
 }
 
 
-def _apply_section_dict(cfg: Config, data: Mapping[str, Any]) -> None:
+def _apply_section_dict(
+    cfg: Config,
+    data: Mapping[str, Any],
+    *,
+    env: Mapping[str, str] | None = None,
+    home_dir: str | Path | None = None,
+) -> None:
     for k in data:
         if k not in _SECTION_APPLIERS:
             raise ConfigError(f"unknown top-level config section {k!r}")
     for sec_name, applier in _SECTION_APPLIERS.items():
         sec_val = data.get(sec_name)
         if sec_val is not None:
-            applier(cfg, sec_val)
+            if sec_name == "asr":
+                _apply_asr_section(cfg, sec_val, env=env, home_dir=home_dir)
+            else:
+                applier(cfg, sec_val)
 
 
 def _expand_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -2555,6 +2866,11 @@ def _validate_ui_config(cfg: Config) -> None:
 
 
 def _validate_audio_config(cfg: Config) -> None:
+    if cfg.audio.wsl_source == "winmm":
+        raise ConfigError(
+            "audio.wsl_source = 'winmm' has been removed; "
+            "use audio.wsl_source = 'wasapi' or 'auto' instead"
+        )
     if cfg.audio.wsl_source not in VALID_WSL_SOURCES:
         raise ConfigError(
             f"audio.wsl_source must be one of {sorted(VALID_WSL_SOURCES)}, "
@@ -2587,18 +2903,23 @@ def _validate_audio_config(cfg: Config) -> None:
         raise ConfigError("audio.max_gain_db must satisfy 0.0 <= max_gain_db <= 120.0")
     if cfg.audio.tail_drain_sec is not None and not (0.0 <= cfg.audio.tail_drain_sec <= 5.0):
         raise ConfigError("audio.tail_drain_sec must satisfy 0.0 <= tail_drain_sec <= 5.0")
-    if not isinstance(cfg.audio.save_recordings, bool):
+
+
+def _validate_archive_config(cfg: Config) -> None:
+    if not isinstance(cfg.archive.save_transcripts, bool):
         raise ConfigError(
-            f"audio.save_recordings: invalid boolean value {cfg.audio.save_recordings!r}"
+            f"archive.save_transcripts: invalid boolean value {cfg.archive.save_transcripts!r}"
+        )
+    if not isinstance(cfg.archive.save_audio, bool):
+        raise ConfigError(
+            f"archive.save_audio: invalid boolean value {cfg.archive.save_audio!r}"
         )
     if (
-        isinstance(cfg.audio.save_recordings_max_count, bool)
-        or not isinstance(cfg.audio.save_recordings_max_count, int)
-        or not (1 <= cfg.audio.save_recordings_max_count <= 5000)
+        isinstance(cfg.archive.audio_max_count, bool)
+        or not isinstance(cfg.archive.audio_max_count, int)
+        or cfg.archive.audio_max_count < 0
     ):
-        raise ConfigError(
-            "audio.save_recordings_max_count must satisfy 1 <= save_recordings_max_count <= 5000"
-        )
+        raise ConfigError("archive.audio_max_count must be an integer >= 0 (0 = unlimited)")
 
 
 def _validate_asr_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> None:
@@ -2610,10 +2931,7 @@ def _validate_asr_config(cfg: Config, *, env: Mapping[str, str] | None = None) -
         raise ConfigError(
             f"asr.api must be one of {sorted(VALID_ASR_APIS)}, got {cfg.asr.api!r}"
         )
-    if cfg.asr.effort not in VALID_EFFORTS:
-        raise ConfigError(
-            f"asr.effort must be one of {sorted(VALID_EFFORTS)}, got {cfg.asr.effort!r}"
-        )
+    cfg.asr.effort = validate_effort_value(cfg.asr.effort, "asr.effort", allow_empty=True)
     if cfg.asr.doubao_mode not in VALID_DOUBAO_MODES:
         raise ConfigError(
             f"asr.doubao_mode must be one of {sorted(VALID_DOUBAO_MODES)}, "
@@ -2680,22 +2998,12 @@ def _validate_refiner_config(cfg: Config, *, env: Mapping[str, str] | None = Non
             f"got {cfg.refiner.provider!r}"
         )
     cfg.refiner.effective_api(cfg.refiner.provider)
-    if cfg.refiner.provider not in ("auto", "off"):
-        if cfg.refiner.effort not in VALID_EFFORTS:
-            raise ConfigError(
-                f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, "
-                f"got {cfg.refiner.effort!r}"
-            )
-    elif cfg.refiner.provider == "auto" and cfg.refiner.effort.strip():
-        if cfg.refiner.effort.strip().lower() not in VALID_EFFORTS:
-            raise ConfigError(
-                f"refiner.effort must be one of {sorted(VALID_EFFORTS)}, "
-                f"got {cfg.refiner.effort!r}"
-            )
-    if not isinstance(cfg.refiner.prompt, str):
-        raise ConfigError(
-            f"refiner.prompt: expected string, got {type(cfg.refiner.prompt).__name__}"
-        )
+    cfg.refiner.effort = validate_effort_value(
+        cfg.refiner.effort, "refiner.effort", allow_empty=True
+    )
+    cfg.refiner.extra_instructions = normalize_extra_instructions(
+        cfg.refiner.extra_instructions, "refiner.extra_instructions"
+    )
     if not isinstance(cfg.refiner.include_git_status, bool):
         raise ConfigError(
             f"refiner.include_git_status: invalid boolean value {cfg.refiner.include_git_status!r}"
@@ -2741,8 +3049,12 @@ def _validate_refiner_config(cfg: Config, *, env: Mapping[str, str] | None = Non
             resolved_ref = select_refiner_provider(cfg, creds_ref, env)
             if resolved_ref != "off":
                 cfg.refiner.effective_api(resolved_ref)
-    if cfg.refiner.max_turns_per_thread < 0:
-        raise ConfigError("refiner.max_turns_per_thread must be >= 0")
+    if (
+        isinstance(cfg.refiner.session_max_turns, bool)
+        or not isinstance(cfg.refiner.session_max_turns, int)
+        or cfg.refiner.session_max_turns < 0
+    ):
+        raise ConfigError("refiner.session_max_turns must be >= 0")
     if cfg.refiner.timeout_sec <= 0:
         raise ConfigError("refiner.timeout_sec must be > 0")
     if (
@@ -2780,6 +3092,7 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
     _validate_hotkey_config(cfg)
     _validate_ui_config(cfg)
     _validate_audio_config(cfg)
+    _validate_archive_config(cfg)
     _validate_asr_config(cfg, env=env)
     _validate_refiner_config(cfg, env=env)
     _validate_remote_config(cfg)
@@ -2788,6 +3101,10 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
 def _load_config_file(path: Path) -> dict[str, Any]:
     try:
         raw_text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"cannot decode config file {path} as UTF-8 (byte offset {exc.start}): {exc.reason}"
+        ) from None
     except OSError as exc:
         raise ConfigError(f"cannot read config file {path}: {exc}") from None
     if path.suffix.lower() == ".json":
@@ -2812,6 +3129,7 @@ def load_config(
     env_paths: Sequence[str | Path] | None = None,
     home_dir: str | Path | None = None,
     load_default_env_files: bool = True,
+    is_macbook: bool | None = None,
 ) -> tuple[Config, dict[str, str]]:
     """Load merged ``(Config, merged_env)`` following CLI > config file > defaults."""
     effective_env = (
@@ -2842,17 +3160,22 @@ def load_config(
     cfg = Config()
     if chosen_path is not None:
         file_data = _load_config_file(chosen_path)
-        _apply_section_dict(cfg, file_data)
+        _apply_section_dict(cfg, file_data, env=env, home_dir=home_dir)
         cfg.config_path = str(chosen_path)
 
     if cli_overrides:
-        _apply_section_dict(cfg, _expand_cli_overrides(cli_overrides))
+        _apply_section_dict(cfg, _expand_cli_overrides(cli_overrides), env=env, home_dir=home_dir)
+
+    if not cfg.hotkey._key_explicit:
+        on_macbook = _is_macbook_laptop() if is_macbook is None else bool(is_macbook)
+        if on_macbook:
+            cfg.hotkey.key = "RCommand"
 
     if cfg.refiner.provider not in ("auto", "off"):
         if not cfg.refiner.model.strip():
             cfg.refiner.model = DEFAULT_REFINER_MODELS.get(cfg.refiner.provider, "")
         if not cfg.refiner.effort.strip():
-            cfg.refiner.effort = DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "auto")
+            cfg.refiner.effort = DEFAULT_REFINER_EFFORTS.get(cfg.refiner.provider, "none")
 
     val_env: Mapping[str, str] | None = (
         effective_env
@@ -3213,7 +3536,7 @@ def select_refiner_provider(
 def _infer_provider_from_explicit_asr_hints(asr_cfg: AsrConfig) -> str | None:
     """Infer target ASR provider when ``provider='auto'`` has explicit base_url, Doubao slot, or api_key_env."""
     url = asr_cfg.base_url.strip()
-    rid = asr_cfg.resource_id.strip().lower()
+    rid = asr_cfg.doubao_resource_id.strip().lower()
     dmode = asr_cfg.doubao_mode.strip().lower()
     key_env = asr_cfg.api_key_env.strip().upper()
 
@@ -3298,7 +3621,7 @@ def _read_codex_models_cache_slugs(env: Mapping[str, str] | None = None) -> list
 
 
 def resolve_codex_default_model(cfg: Config, env: Mapping[str, str] | None = None) -> str:
-    """Resolve effective Codex model, falling back to a public mini model when internal ``gpt-6-luna`` is absent."""
+    """Resolve effective Codex model, falling back to an alternate mini model when the account does not enable ``gpt-6-luna``."""
     if cfg.refiner.has_explicit_model("codex"):
         return cfg.refiner.effective_model("codex")
     default_mod = DEFAULT_REFINER_MODELS["codex"]
@@ -3519,7 +3842,7 @@ def explain_pipeline_selection(
             "model": eff_asr_model,
             "api": eff_asr_api,
             "base_url": sanitize_base_url(eff_asr_url),
-            "effort": cfg.asr.effort,
+            "effort": cfg.asr.effective_effort(eff_asr),
             "ready": asr_ready,
             "single_hop": asr_is_single_hop,
             "reason": asr_reason,

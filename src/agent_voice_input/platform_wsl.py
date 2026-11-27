@@ -116,9 +116,20 @@ def _pulse_env(env: Mapping[str, str]) -> dict[str, str]:
 def to_windows_path(path: str | Path) -> str:
     for wb in ("/usr/bin/wslpath", "/bin/wslpath", "wslpath"):
         if wb == "wslpath" or os.path.isfile(wb):
-            p = subprocess.run([wb, "-w", str(path)], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=False)
-            if p.returncode == 0 and p.stdout.strip():
-                return p.stdout.strip()
+            try:
+                p = subprocess.run(
+                    [wb, "-w", str(path)],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except OSError:
+                continue
+            if p.returncode == 0:
+                raw_out = (p.stdout or b"").rstrip(b"\r\n")
+                if raw_out and raw_out.strip():
+                    return os.fsdecode(raw_out)
     raise RuntimeError(f"wslpath failed for {path}")
 
 
@@ -193,8 +204,8 @@ def resolve_wsl_effective_audio_source(
     explicit_pulse = (raw_env.get("AGENT_VOICE_INPUT_PULSE_SOURCE") or "").strip()
     eff_pulse_src = explicit_pulse or pulse_source.strip() or "RDPSource"
     wsl_src = (cfg.audio.wsl_source or "auto").strip().lower()
-    if wsl_src in ("winmm", "wasapi"):
-        return wsl_src, eff_pulse_src
+    if wsl_src == "wasapi":
+        return "wasapi", eff_pulse_src
     if wsl_src == "pulse":
         return "pulse", eff_pulse_src
     has_custom_pulse = bool(explicit_pulse or pulse_source.strip() not in ("", "RDPSource"))
@@ -327,12 +338,12 @@ class WslPlatform(JsonlShimMixin):
             cfg, raw_env, pulse_source=pulse_source
         )
         self._shim_cmd_factory = shim_cmd_factory
-        if cfg.audio.wsl_source in ("winmm", "wasapi"):
+        if cfg.audio.wsl_source == "wasapi":
             self._primary_winmm = True
         elif cfg.audio.wsl_source == "pulse":
             self._primary_winmm = False
         else:
-            self._primary_winmm = bool(shim_cmd_factory is None and eff_backend in ("wasapi", "winmm"))
+            self._primary_winmm = bool(shim_cmd_factory is None and eff_backend == "wasapi")
         self._use_winmm = self._primary_winmm
         self.last_audio_error = ""
         self._ff_rec, self._rec_mode = FfmpegWavRecorder(), ""
@@ -894,7 +905,7 @@ class WslPlatform(JsonlShimMixin):
         cancelled_fn = lambda: bool(is_cancelled is not None and is_cancelled())
         _confirm_commit = make_once_commit_guard(cancelled_fn, before_commit)
 
-        def _fallback_clipboard_via_shim() -> PasteOutcome:
+        def _fallback_clipboard_via_shim(reason: str = "focus_changed") -> PasteOutcome:
             if not _confirm_commit():
                 return PasteOutcome(False, False, "cancelled", "")
             fb_req: dict[str, Any] = {
@@ -923,7 +934,7 @@ class WslPlatform(JsonlShimMixin):
             return PasteOutcome(
                 False,
                 clip_ok,
-                "focus_changed" if clip_ok else str(res_fb.get("reason") or "clipboard_failed"),
+                reason if clip_ok else str(res_fb.get("reason") or "clipboard_failed"),
                 fg_proc_fb,
                 used_clipboard_paste=False,
             )
@@ -965,7 +976,7 @@ class WslPlatform(JsonlShimMixin):
                     now_flush = time.monotonic()
                     rem_flush = hold_deadline - now_flush
                     if (waited_for_key or hold_timeout_sec > 0.0) and rem_flush <= 0.0:
-                        return _fallback_clipboard_via_shim()
+                        return _fallback_clipboard_via_shim("hotkey_held")
                     flush_wait = min(0.05, max(0.005, rem_flush)) if rem_flush > 0.0 else 0.005
                     flushed = self._flush_shim_events(timeout_sec=flush_wait)
                     if cancelled_fn():
@@ -975,16 +986,16 @@ class WslPlatform(JsonlShimMixin):
                         now_after_flush = time.monotonic()
                         rem = hold_deadline - now_after_flush
                         if rem <= 0.0:
-                            return _fallback_clipboard_via_shim()
+                            return _fallback_clipboard_via_shim("hotkey_held")
                         if (now_after_flush - now_flush) < 0.005:
                             sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
                         continue
                     if (waited_for_key or hold_timeout_sec > 0.0) and (hold_deadline - time.monotonic()) <= 0.0:
-                        return _fallback_clipboard_via_shim()
+                        return _fallback_clipboard_via_shim("hotkey_held")
                     break
                 rem_ks = hold_deadline - time.monotonic()
                 if rem_ks <= 0.0:
-                    return _fallback_clipboard_via_shim()
+                    return _fallback_clipboard_via_shim("hotkey_held")
                 waited_for_key = True
                 sleep_cooperative(min(0.05, rem_ks), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
 

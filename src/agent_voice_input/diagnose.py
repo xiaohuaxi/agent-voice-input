@@ -1,7 +1,7 @@
 """Sub-second read-only live diagnostics for agent-voice-input runtime state.
 
 Summarizes daemon health (online / unresponsive / stopped + code/version drift),
-configured pipeline selection, recent ``telemetry.jsonl`` latency/fallback/cache-hit
+configured pipeline selection, recent ``diag.jsonl`` local diagnostic log latency/fallback/cache-hit
 statistics, active CLI session match metadata (zero prose), staged ``failed/`` WAV count,
 redacted ``daemon.log`` tail, and optional legacy ``codex-home/logs_2.sqlite`` counters.
 """
@@ -30,10 +30,12 @@ from .config import (
     resolve_credentials,
 )
 from .control_ipc import (
-    TELEMETRY_FILENAME,
+    DIAG_FILENAME,
+    _LEGACY_DIAG_FILENAME,
     describe_daemon_drift,
+    parse_diag_ts,
     probe_daemon_status,
-    read_telemetry_history,
+    read_diag_history,
 )
 from .session_ctx import SessionTracker, format_turns_text
 
@@ -57,7 +59,7 @@ _VALID_DELIVERY_STATUS_ENUMS: frozenset[str] = frozenset(
 
 
 def _is_record_delivered_ok(rec: Mapping[str, Any]) -> bool:
-    """Return True iff the telemetry record represents a genuinely delivered/dry-run success."""
+    """Return True iff the local diagnostic record represents a genuinely delivered/dry-run success."""
     if not rec.get("ok", False):
         return False
     ds = str(rec.get("delivery_status") or "").strip().lower()
@@ -73,7 +75,7 @@ def _is_record_delivered_ok(rec: Mapping[str, Any]) -> bool:
 
 
 def diagnose_record_flags(rec: Mapping[str, Any], *, is_first_for_session: bool) -> list[str]:
-    """Return diagnostic warning/anomaly flags for a single telemetry record."""
+    """Return diagnostic warning/anomaly flags for a single local diagnostic record."""
     flags: list[str] = []
     if not _is_record_delivered_ok(rec):
         reason = str(rec.get("skipped_reason") or rec.get("paste_reason") or "error")
@@ -94,12 +96,17 @@ def diagnose_record_flags(rec: Mapping[str, Any], *, is_first_for_session: bool)
         and (is_single_hop_asr or str(rec.get("refiner_provider") or "") not in ("", "off"))
     ):
         flags.append("NO_SESSION_CTX")
-    asr_slow_thr = 3300 if is_single_hop_asr else 1800
-    if int(rec.get("asr_ms") or 0) >= asr_slow_thr:
+    raw_audio_sec = max(0.0, float(rec.get("raw_audio_sec") or 0.0))
+    asr_slow_thr = (
+        max(6000.0, raw_audio_sec * 120.0)
+        if is_single_hop_asr
+        else max(4500.0, raw_audio_sec * 100.0)
+    )
+    if float(rec.get("asr_ms") or 0) >= asr_slow_thr:
         flags.append("ASR_SLOW")
     if int(rec.get("refine_init_ms") or 0) >= 250:
         flags.append("COLD_INIT")
-    if int(rec.get("refine_ms") or 0) >= 1500:
+    if int(rec.get("refine_ms") or 0) >= 8000:
         flags.append("REFINE_SLOW")
     if int(rec.get("deliver_ms") or 0) >= 350:
         flags.append("DELIVER_STALL")
@@ -129,9 +136,8 @@ def diagnose_record_flags(rec: Mapping[str, Any], *, is_first_for_session: bool)
     return flags
 
 
-_TELEMETRY_NUMERIC_FIELDS: frozenset[str] = frozenset(
+_DIAG_NUMERIC_FIELDS: frozenset[str] = frozenset(
     {
-        "ts",
         "seq_id",
         "raw_audio_sec",
         "voiced_audio_sec",
@@ -171,7 +177,7 @@ _TELEMETRY_NUMERIC_FIELDS: frozenset[str] = frozenset(
         "recovery_gap_ms",
     }
 )
-_TELEMETRY_BOOL_FIELDS: frozenset[str] = frozenset(
+_DIAG_BOOL_FIELDS: frozenset[str] = frozenset(
     {
         "ok",
         "switched_fallback",
@@ -182,7 +188,7 @@ _TELEMETRY_BOOL_FIELDS: frozenset[str] = frozenset(
         "capture_interrupted",
     }
 )
-_TELEMETRY_ENUM_FIELDS: frozenset[str] = frozenset(
+_DIAG_ENUM_FIELDS: frozenset[str] = frozenset(
     {
         "skipped_reason",
         "audio_source",
@@ -200,7 +206,7 @@ _TELEMETRY_ENUM_FIELDS: frozenset[str] = frozenset(
 _VALID_CTX_FALLBACK_ENUMS: frozenset[str] = frozenset(
     {"", "prior_hotwords", "prior_session"}
 )
-_TELEMETRY_DIAG_TEXT_FIELDS: frozenset[str] = frozenset(
+_DIAG_TEXT_FIELDS: frozenset[str] = frozenset(
     {
         "asr_request_id",
         "refiner_warning",
@@ -209,6 +215,7 @@ _TELEMETRY_DIAG_TEXT_FIELDS: frozenset[str] = frozenset(
     }
 )
 _ASR_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,128}$")
+_DIAG_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _clean_single_line(text: str, redact_fn: Any, *, max_chars: int = 200) -> str:
@@ -217,18 +224,30 @@ def _clean_single_line(text: str, redact_fn: Any, *, max_chars: int = 200) -> st
     return flat[:max_chars] if len(flat) > max_chars else flat
 
 
-def _sanitize_telemetry_record(rec: Mapping[str, Any], redact_fn: Any) -> dict[str, Any]:
-    """Filter a telemetry record through a strict field allowlist with secret redaction."""
+def _sanitize_diag_record(rec: Mapping[str, Any], redact_fn: Any) -> dict[str, Any]:
+    """Filter a local diagnostic record through a strict field allowlist with secret redaction."""
     clean: dict[str, Any] = {}
-    for k in _TELEMETRY_NUMERIC_FIELDS:
+    if "id" in rec and isinstance(rec["id"], str):
+        raw_id = rec["id"].strip()
+        if raw_id and _DIAG_ID_RE.fullmatch(raw_id):
+            clean["id"] = raw_id
+    if "ts" in rec:
+        ts_val = rec["ts"]
+        if isinstance(ts_val, (int, float)) and not isinstance(ts_val, bool):
+            clean["ts"] = ts_val
+        elif isinstance(ts_val, str):
+            ts_str = _clean_single_line(ts_val, redact_fn, max_chars=64)
+            if ts_str and parse_diag_ts(ts_str) is not None:
+                clean["ts"] = ts_str
+    for k in _DIAG_NUMERIC_FIELDS:
         if k in rec:
             v = rec[k]
             if v is None or (isinstance(v, (int, float)) and not isinstance(v, bool)):
                 clean[k] = v
-    for k in _TELEMETRY_BOOL_FIELDS:
+    for k in _DIAG_BOOL_FIELDS:
         if k in rec and isinstance(rec[k], bool):
             clean[k] = rec[k]
-    for k in _TELEMETRY_ENUM_FIELDS:
+    for k in _DIAG_ENUM_FIELDS:
         if k in rec and isinstance(rec[k], str):
             val = _clean_single_line(rec[k], redact_fn, max_chars=120) if rec[k] else ""
             if k == "ctx_fallback" and val not in _VALID_CTX_FALLBACK_ENUMS:
@@ -236,7 +255,7 @@ def _sanitize_telemetry_record(rec: Mapping[str, Any], redact_fn: Any) -> dict[s
             elif k == "delivery_status" and val not in _VALID_DELIVERY_STATUS_ENUMS:
                 val = ""
             clean[k] = val
-    for k in _TELEMETRY_DIAG_TEXT_FIELDS:
+    for k in _DIAG_TEXT_FIELDS:
         if k in rec and isinstance(rec[k], str) and rec[k].strip():
             if k == "asr_request_id":
                 parts: list[str] = []
@@ -375,18 +394,26 @@ def _percentile(vals: Sequence[float], pct: float) -> float | None:
     return s[f] + (k - f) * (s[c] - s[f])
 
 
-def summarize_telemetry_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Compute latency, fallback, failure, and prefix-cache hit summary over annotated records."""
+def summarize_diag_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Compute latency, fallback, failure, and per-mode prefix-cache hit summary over annotated records."""
     ok_recs = [r for r in records if _is_record_delivered_ok(r)]
     asr_ms = [int(r["asr_ms"]) for r in ok_recs if isinstance(r.get("asr_ms"), (int, float))]
     ref_ms = [int(r["refine_ms"]) for r in ok_recs if isinstance(r.get("refine_ms"), (int, float))]
     tot_ms = [int(r["total_ms"]) for r in ok_recs if isinstance(r.get("total_ms"), (int, float))]
     hit_rates: list[float] = []
+    agent_hit_rates: list[float] = []
+    general_hit_rates: list[float] = []
     for r in ok_recs:
         in_t = r.get("input_tokens")
         c_t = r.get("cached_input_tokens")
         if isinstance(in_t, int) and in_t > 0 and isinstance(c_t, int):
-            hit_rates.append(100.0 * c_t / in_t)
+            pct = 100.0 * c_t / in_t
+            hit_rates.append(pct)
+            mode_str = str(r.get("mode") or "agent").strip().lower()
+            if mode_str == "general":
+                general_hit_rates.append(pct)
+            else:
+                agent_hit_rates.append(pct)
     fallback_count = sum(
         1
         for r in ok_recs
@@ -398,6 +425,7 @@ def summarize_telemetry_records(records: Sequence[Mapping[str, Any]]) -> dict[st
             key = str(fl).split("(", 1)[0]
             flag_counts[key] = flag_counts.get(key, 0) + 1
     r1 = lambda v: round(v, 1) if v is not None else None
+    avg_fn = lambda vals: round(sum(vals) / len(vals), 1) if vals else None
     return {
         "total": len(records),
         "ok_count": len(ok_recs),
@@ -406,7 +434,11 @@ def summarize_telemetry_records(records: Sequence[Mapping[str, Any]]) -> dict[st
         "asr_ms_p50": r1(_percentile(asr_ms, 50)),
         "refine_ms_p50": r1(_percentile(ref_ms, 50)),
         "total_ms_p50": r1(_percentile(tot_ms, 50)),
-        "cache_hit_pct_avg": round(sum(hit_rates) / len(hit_rates), 1) if hit_rates else None,
+        "cache_hit_pct_avg": avg_fn(hit_rates),
+        "agent_cache_hit_pct_avg": avg_fn(agent_hit_rates),
+        "agent_cache_samples": len(agent_hit_rates),
+        "general_cache_hit_pct_avg": avg_fn(general_hit_rates),
+        "general_cache_samples": len(general_hit_rates),
         "flag_counts": flag_counts,
     }
 
@@ -461,7 +493,7 @@ def collect_live_diagnostics(
     status_snapshot = _read_optional_status_snapshot(rt_dir) if (not daemon_online and rt_dir.is_dir()) else {}
 
     if not records and rt_dir.is_dir():
-        records = read_telemetry_history(rt_dir, limit=last_n)
+        records = read_diag_history(rt_dir, limit=last_n)
 
     drift = describe_daemon_drift(status_obj) if daemon_online else None
     pipeline = (
@@ -503,13 +535,17 @@ def collect_live_diagnostics(
         except OSError:
             newest_failed_ts = "-"
 
-    telemetry_path = rt_dir / TELEMETRY_FILENAME
-    telemetry_kb = 0.0
-    if telemetry_path.is_file() and not telemetry_path.is_symlink():
+    diag_path = rt_dir / DIAG_FILENAME
+    if not diag_path.exists():
+        legacy_path = rt_dir / _LEGACY_DIAG_FILENAME
+        if legacy_path.is_file() and not legacy_path.is_symlink():
+            diag_path = legacy_path
+    diag_kb = 0.0
+    if diag_path.is_file() and not diag_path.is_symlink():
         try:
-            telemetry_kb = round(telemetry_path.stat().st_size / 1024.0, 1)
+            diag_kb = round(diag_path.stat().st_size / 1024.0, 1)
         except OSError:
-            telemetry_kb = 0.0
+            diag_kb = 0.0
 
     log_tail = (
         read_redacted_log_tail(rt_dir / "daemon.log", -1, env, cfg=cfg, max_bytes=1536, max_lines=8)
@@ -525,7 +561,7 @@ def collect_live_diagnostics(
         is_first = bool(skey and skey not in seen_skeys)
         if skey:
             seen_skeys.add(skey)
-        clean_rec = _sanitize_telemetry_record(rec, redact_fn)
+        clean_rec = _sanitize_diag_record(rec, redact_fn)
         flags_input = {**clean_rec, "session_key": skey}
         flags = diagnose_record_flags(flags_input, is_first_for_session=is_first)
         clean_rec["has_saved_audio"] = bool(str(rec.get("saved_audio") or "").strip())
@@ -533,7 +569,7 @@ def collect_live_diagnostics(
         clean_rec["diag_flags"] = [redact_fn(fl) for fl in flags]
         annotated_records.append(clean_rec)
 
-    summary_stats = summarize_telemetry_records(annotated_records)
+    summary_stats = summarize_diag_records(annotated_records)
     elapsed_ms = max(0, int(round((time.monotonic() - t0) * 1000)))
     eff_asr = str(status_obj.get("asr_provider") or pipeline["asr"]["provider"])
     eff_ref = str(status_obj.get("refiner_provider") or pipeline["refiner"]["provider"])
@@ -557,6 +593,15 @@ def collect_live_diagnostics(
     if daemon_err := str(status_obj.get("error") or "").strip():
         daemon_info["error"] = redact_fn(daemon_err)
 
+    storage_info: dict[str, Any] = {
+        "runtime_dir_exists": rt_dir.is_dir(),
+        "diag_kb": diag_kb,
+        "failed_audio_count": len(failed_files),
+        "newest_failed_at": newest_failed_ts,
+    }
+    if legacy_sqlite is not None:
+        storage_info["legacy_codex_sqlite"] = legacy_sqlite
+
     payload: dict[str, Any] = {
         "version": __version__,
         "diag_elapsed_ms": elapsed_ms,
@@ -565,13 +610,7 @@ def collect_live_diagnostics(
         "pipeline": dict(pipeline),
         "summary": summary_stats,
         "session_match": sess_meta,
-        "storage": {
-            "runtime_dir_exists": rt_dir.is_dir(),
-            "telemetry_kb": telemetry_kb,
-            "failed_audio_count": len(failed_files),
-            "newest_failed_at": newest_failed_ts,
-            "legacy_codex_sqlite": legacy_sqlite,
-        },
+        "storage": storage_info,
         "recent_results": annotated_records,
         "daemon_log_tail": log_tail,
     }
@@ -579,8 +618,9 @@ def collect_live_diagnostics(
 
 
 def _fmt_time_short(ts_val: Any) -> str:
-    if isinstance(ts_val, (int, float)) and ts_val > 0:
-        return time.strftime("%H:%M:%S", time.localtime(float(ts_val)))
+    parsed = parse_diag_ts(ts_val)
+    if parsed is not None and parsed > 0:
+        return time.strftime("%H:%M:%S", time.localtime(parsed))
     return "-"
 
 
@@ -628,12 +668,27 @@ def format_live_diagnostics_markdown(payload: Mapping[str, Any]) -> str:
 
     if stats.get("total", 0) > 0:
         f_ms = lambda v: f"{v}ms" if v is not None else "-"
-        hit_s = f"{stats['cache_hit_pct_avg']}%" if stats.get("cache_hit_pct_avg") is not None else "-"
+        agent_hit = stats.get("agent_cache_hit_pct_avg")
+        general_hit = stats.get("general_cache_hit_pct_avg")
+        agent_n = int(stats.get("agent_cache_samples") or 0)
+        general_n = int(stats.get("general_cache_samples") or 0)
+        if agent_hit is not None and general_hit is not None:
+            cache_part = (
+                f"avg cache_hit: agent=`{agent_hit}%` (n={agent_n}), "
+                f"general=`{general_hit}%` (n={general_n})"
+            )
+        elif agent_hit is not None:
+            cache_part = f"avg cache_hit(agent)=`{agent_hit}%`"
+        elif general_hit is not None:
+            cache_part = f"avg cache_hit(general)=`{general_hit}%`"
+        else:
+            hit_s = f"{stats['cache_hit_pct_avg']}%" if stats.get("cache_hit_pct_avg") is not None else "-"
+            cache_part = f"avg cache_hit=`{hit_s}`"
         lines.append(
             f"- Recent Stats (`{stats['ok_count']}/{stats['total']}` ok, fallbacks=`{stats['fallback_count']}`, "
             f"failed/skipped=`{stats['failed_or_skipped']}`): "
             f"p50 total=`{f_ms(stats.get('total_ms_p50'))}` (ASR=`{f_ms(stats.get('asr_ms_p50'))}`, "
-            f"Refine=`{f_ms(stats.get('refine_ms_p50'))}`), avg cache_hit=`{hit_s}`"
+            f"Refine=`{f_ms(stats.get('refine_ms_p50'))}`), {cache_part}"
         )
 
     if sess_meta.get("matched"):
@@ -650,7 +705,7 @@ def format_live_diagnostics_markdown(payload: Mapping[str, Any]) -> str:
     newest_failed_ts = str(storage.get("newest_failed_at") or "")
     failed_note = f"`{failed_cnt}` (newest: `{newest_failed_ts}`)" if failed_cnt else "`0`"
     lines.append(
-        f"- Runtime Storage: `telemetry.jsonl`=`{storage.get('telemetry_kb', 0.0)} KB` | `failed/` WAVs={failed_note}"
+        f"- Runtime Storage: `diag.jsonl`=`{storage.get('diag_kb', 0.0)} KB` | `failed/` WAVs={failed_note}"
     )
 
     legacy_sqlite = storage.get("legacy_codex_sqlite")
@@ -667,7 +722,7 @@ def format_live_diagnostics_markdown(payload: Mapping[str, Any]) -> str:
     lines.append(f"## Recent Utterances (last `{len(annotated_records)}` of requested `{last_n}`)")
     lines.append("")
     if not annotated_records:
-        lines.append("_No utterance telemetry recorded yet._")
+        lines.append("_No utterance diagnostics recorded yet._")
     else:
         lines.append(
             "| Seq | Time | Session | Audio(s) | Sync | ASR | Init | Refine | Deliv | Total(ms) | Ctx(ch/chr) | In / Cached (Hit%) | Rsn | Flags |"

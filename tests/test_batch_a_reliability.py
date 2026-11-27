@@ -42,7 +42,7 @@ from agent_voice_input.daemon import (  # noqa: E402
     VoiceInputDaemon,
     _QueuedUtterance,
     _transcribe_wav_chunks,
-    append_telemetry_record,
+    append_diag_record,
     build_pipeline_summary,
     run_pipeline_once,
 )
@@ -50,7 +50,7 @@ from agent_voice_input.diagnose import (  # noqa: E402
     collect_live_diagnostics,
     diagnose_record_flags,
     format_live_diagnostics_markdown,
-    summarize_telemetry_records,
+    summarize_diag_records,
 )
 from agent_voice_input.hotwords import (  # noqa: E402
     add_hotwords,
@@ -587,7 +587,7 @@ class TestA2WslRecStopTimeoutRetry(unittest.TestCase):
     def test_a2_slow_serial_rec_stop_single_wait_does_not_block_next_rec_start_and_releases_on_timeout(self) -> None:
         sample_wav = _voiced_wav(0.5)
         sample_b64 = base64.b64encode(sample_wav).decode("ascii")
-        cfg = Config(audio=AudioConfig(wsl_source="winmm", tail_drain_sec=0.0))
+        cfg = Config(audio=AudioConfig(wsl_source="wasapi", tail_drain_sec=0.0))
 
         with tempfile.TemporaryDirectory() as td:
             rt = Path(td)
@@ -818,7 +818,7 @@ for raw in sys.stdin:
     else:
         emit({"type": "reply", "reply": op, "seq_id": seq, "ok": True})
 """
-        cfg = Config(audio=AudioConfig(wsl_source="winmm", tail_drain_sec=0.0))
+        cfg = Config(audio=AudioConfig(wsl_source="wasapi", tail_drain_sec=0.0))
         with tempfile.TemporaryDirectory() as td:
             rt = Path(td)
             plat = WslPlatform(
@@ -911,7 +911,7 @@ class TestA3FailedAudioTtlAndActivePruning(unittest.TestCase):
 
                 # Advance clock past 1h throttle -> _append_telemetry triggers active pruning
                 fake_now[0] += 3600.0
-                daemon._append_telemetry({"seq_id": 1, "ok": True})
+                daemon._append_diag({"seq_id": 1, "ok": True})
                 self.assertFalse(f_old2.exists())
 
                 # Pruning error never bubbles up to disrupt main flow
@@ -1243,7 +1243,7 @@ class TestA5UnifiedDeliveryHudAndDiagnoseContract(unittest.TestCase):
             self.assertEqual(h4b[-1], "asr_empty")
 
             # Legacy buggy record compatibility + unknown delivery_status sanitization
-            append_telemetry_record(
+            append_diag_record(
                 rt,
                 {
                     "ts": round(time.time(), 6),
@@ -1274,13 +1274,13 @@ class TestA5UnifiedDeliveryHudAndDiagnoseContract(unittest.TestCase):
             self.assertIn("`2/7` ok", md)
             self.assertIn("failed/skipped=`5`", md)
 
-            # Direct unit check on diagnose_record_flags / summarize_telemetry_records
+            # Direct unit check on diagnose_record_flags / summarize_diag_records
             self.assertEqual(
                 diagnose_record_flags({"ok": True, "pasted": False, "clipboard": False, "paste_reason": "paste_failed"}, is_first_for_session=True),
                 ["SKIP(paste_failed)"],
             )
             self.assertEqual(
-                summarize_telemetry_records([{"ok": True, "pasted": False, "clipboard": False, "paste_reason": "clipboard_failed"}])["ok_count"],
+                summarize_diag_records([{"ok": True, "pasted": False, "clipboard": False, "paste_reason": "clipboard_failed"}])["ok_count"],
                 0,
             )
 

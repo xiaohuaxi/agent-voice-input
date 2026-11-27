@@ -22,7 +22,10 @@ if str(_SRC_ROOT) not in sys.path:
 
 
 def _is_ci() -> bool:
-    return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+    return (
+        os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+        or os.environ.get("AGENT_VOICE_INPUT_CI_NO_SKIP", "").strip().lower() in {"1", "true", "yes"}
+    )
 
 from agent_voice_input import cli as cli_mod  # noqa: E402
 from agent_voice_input.asr_providers import AsrContext, AsrResult, BaseAsrProvider  # noqa: E402
@@ -1254,7 +1257,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
 
                 # 5. only_in_terminals = False allows Safari while yielding Windows App unless yield_remote_desktop=False
                 daemon_all = VoiceInputDaemon(
-                    Config(hotkey=HotkeyConfig(only_in_terminals=False), refiner=RefinerConfig(provider="off")),
+                    Config(hotkey=HotkeyConfig(scope="all"), refiner=RefinerConfig(provider="off")),
                     env={"HOME": str(tmp)},
                     runtime_dir=tmp / "rt_all",
                     platform=plat,
@@ -2142,11 +2145,30 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
         self.assertEqual((err_non_gui.reason_code, err_non_gui.hud_state), ("mic_permission", "mic_permission"))
         self.assertIn("agent-voice-input restart", str(err_non_gui))
 
-        # Local GUI session (e.g. Ghostty-started tmux later attached from SSH) with has_graphic_session=True is ALLOWED
+        # SSH/remote session with mic_auth=not_determined MUST warn even when has_graphic_session=True (M3 fix)
+        err_ssh_gui = classify_macos_mic_permission(
+            {"mic_auth": "not_determined", "has_graphic_session": True, "is_remote_session": True},
+            ssh_env,
+        )
+        assert err_ssh_gui is not None
+        self.assertEqual((err_ssh_gui.reason_code, err_ssh_gui.hud_state), ("mic_permission", "mic_permission"))
+        err_remote_only = classify_macos_mic_permission(
+            {"mic_auth": "not_determined", "has_graphic_session": True, "is_remote_session": True},
+            {},
+        )
+        assert err_remote_only is not None
+        self.assertEqual(err_remote_only.reason_code, "mic_permission")
+        err_ssh_env_only = classify_macos_mic_permission(
+            {"mic_auth": "not_determined", "has_graphic_session": True, "is_remote_session": False},
+            ssh_env,
+        )
+        assert err_ssh_env_only is not None
+        self.assertEqual(err_ssh_env_only.reason_code, "mic_permission")
+        # Local non-remote GUI session with not_determined still allows triggering first TCC prompt
         self.assertIsNone(
             classify_macos_mic_permission(
-                {"mic_auth": "not_determined", "has_graphic_session": True, "is_remote_session": True},
-                ssh_env,
+                {"mic_auth": "not_determined", "has_graphic_session": True, "is_remote_session": False},
+                {},
             )
         )
 
@@ -4344,7 +4366,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             )
             self.assertFalse(out_cv_to.pasted)
             self.assertTrue(out_cv_to.clipboard)
-            self.assertEqual(out_cv_to.reason, "focus_changed")
+            self.assertEqual(out_cv_to.reason, "hotkey_held")
             self.assertEqual(cmd_v_count[0], 0)
             self.assertEqual(pbcopy_payloads, ["历史段\n\n长按超时回退"])
 
@@ -4415,7 +4437,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             )
             self.assertFalse(out_none_timeout.pasted)
             self.assertTrue(out_none_timeout.clipboard)
-            self.assertEqual(out_none_timeout.reason, "focus_changed")
+            self.assertEqual(out_none_timeout.reason, "hotkey_held")
             self.assertEqual(cmd_v_count[0], 0)
             self.assertEqual(pbcopy_payloads, ["前段\n\nkey_state持续None超时回退"])
 
@@ -5061,7 +5083,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 )
                 self.assertFalse(out_tap_to.pasted)
                 self.assertTrue(out_tap_to.clipboard)
-                self.assertEqual(out_tap_to.reason, "focus_changed")
+                self.assertEqual(out_tap_to.reason, "hotkey_held")
                 self.assertAlmostEqual(fake_now[0] - 100.0, 5.0, delta=0.15)
                 self.assertEqual(pbcopy_payloads, ["tap兜底文本"])
 
@@ -5095,7 +5117,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 )
                 self.assertFalse(out_ptt_idle.pasted)
                 self.assertTrue(out_ptt_idle.clipboard)
-                self.assertEqual(out_ptt_idle.reason, "focus_changed")
+                self.assertEqual(out_ptt_idle.reason, "hotkey_held")
                 self.assertGreaterEqual(fake_now[0] - 200.0, 17.0)
                 self.assertLess(fake_now[0] - 200.0, 17.3)
                 self.assertEqual(pbcopy_payloads, ["ptt兜底文本"])
@@ -5133,7 +5155,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 )
                 self.assertFalse(out_unavail.pasted)
                 self.assertTrue(out_unavail.clipboard)
-                self.assertEqual(out_unavail.reason, "focus_changed")
+                self.assertEqual(out_unavail.reason, "hotkey_held")
                 self.assertAlmostEqual(fake_now[0] - 400.0, 4.0, delta=0.15)
                 self.assertEqual(pbcopy_payloads, ["无响应兜底文本"])
 
@@ -5394,7 +5416,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 )
                 self.assertFalse(out_exp_wake.pasted)
                 self.assertTrue(out_exp_wake.clipboard)
-                self.assertEqual(out_exp_wake.reason, "focus_changed")
+                self.assertEqual(out_exp_wake.reason, "hotkey_held")
                 self.assertEqual(paste_attempts_5d[0], 0)
                 self.assertEqual(clip_only_5d, ["超期不发粘贴兜底"])
                 self.assertEqual(pbcopy_payloads, [])
@@ -5451,7 +5473,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 )
                 self.assertFalse(out_focus_exp.pasted)
                 self.assertTrue(out_focus_exp.clipboard)
-                self.assertEqual(out_focus_exp.reason, "focus_changed")
+                self.assertEqual(out_focus_exp.reason, "hotkey_held")
                 self.assertEqual(paste_attempts_5e[0], 0)
                 self.assertEqual(fg_calls_5e[0], 2)
                 self.assertEqual(ks_calls_5e, [False, False, True])
@@ -5643,7 +5665,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                     )
                 self.assertFalse(out_alt.pasted)
                 self.assertTrue(out_alt.clipboard)
-                self.assertEqual(out_alt.reason, "focus_changed")
+                self.assertEqual(out_alt.reason, "hotkey_held")
                 self.assertEqual(paste_attempts[0], 0)
                 self.assertAlmostEqual(fake_now[0] - 100.0, 4.0, delta=0.15)
                 self.assertEqual(clip_only_payloads, ["交替失败兜底"])

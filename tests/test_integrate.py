@@ -458,6 +458,110 @@ class TestAgyIntegration(unittest.TestCase):
             self.assertEqual(res3[0].action, "installed")
             self.assertTrue((home / ".gemini" / "config" / "hooks.json").is_file())
 
+    def test_m2_surgical_hooks_conflict_guard_and_usr_local_bin_fallback(self) -> None:
+        self.assertIn('/usr/local/bin/agent-voice-input', mod.CLAUDE_HOOK_COMMAND)
+        self.assertIn('/usr/local/bin/agent-voice-input', mod.AGY_HOOK_COMMAND)
+
+        # Standalone vs chained command detection
+        legacy_claude = next(iter(mod._LEGACY_CLAUDE_HOOK_COMMANDS))
+        legacy_agy = next(iter(mod._LEGACY_AGY_HOOK_COMMANDS))
+        self.assertTrue(mod._is_managed_voice_hook(legacy_claude))
+        self.assertTrue(mod._is_managed_voice_hook(legacy_agy))
+        self.assertTrue(mod._is_managed_voice_hook("agent-voice-input session-hook --cli claude --quiet"))
+        self.assertTrue(mod._is_managed_voice_hook("/usr/local/bin/agent-voice-input session-hook --cli agy >/dev/null 2>&1 || true"))
+        self.assertFalse(mod._is_managed_voice_hook("agent-voice-input session-hook --cli claude && my-notify"))
+        self.assertFalse(mod._is_managed_voice_hook("my-pre; agent-voice-input session-hook --cli claude"))
+        self.assertFalse(mod._is_managed_voice_hook("echo hi | agent-voice-input session-hook --cli claude"))
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            cache = Path(td) / "cache"
+            (home / ".claude").mkdir(parents=True)
+            claude_settings = home / ".claude" / "settings.json"
+            chained_cmd = "agent-voice-input session-hook --cli claude && my-notify"
+            pre_cmd = "my-pre; agent-voice-input session-hook --cli claude"
+            claude_settings.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "SessionStart": [
+                                {"hooks": [{"type": "command", "command": legacy_claude}]},
+                                {"hooks": [{"type": "command", "command": chained_cmd}]},
+                            ],
+                            "UserPromptSubmit": [
+                                {"hooks": [{"type": "command", "command": pre_cmd}]},
+                            ],
+                            "Stop": [
+                                {"hooks": [{"type": "command", "command": "agent-voice-input session-hook --cli claude"}]},
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            un_c = mod.apply_integrations("claude", uninstall=True, home_dir=home, cache_dir=cache, which_fn=_no_which)
+            self.assertEqual(un_c[0].action, "uninstalled")
+            after_c = json.loads(claude_settings.read_text(encoding="utf-8"))
+            # Legacy managed entry in SessionStart removed; chained entries & non-managed Stop event untouched
+            self.assertEqual(len(after_c["hooks"]["SessionStart"]), 1)
+            self.assertEqual(after_c["hooks"]["SessionStart"][0]["hooks"][0]["command"], chained_cmd)
+            self.assertEqual(after_c["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], pre_cmd)
+            self.assertEqual(
+                after_c["hooks"]["Stop"][0]["hooks"][0]["command"],
+                "agent-voice-input session-hook --cli claude",
+            )
+
+            # AGY install: refuses to overwrite conflicting custom voice-session-title namespace
+            cfg_dir = home / ".gemini" / "config"
+            cfg_dir.mkdir(parents=True)
+            agy_hooks = cfg_dir / "hooks.json"
+            conflict_payload = {
+                mod.AGY_NAMESPACE_KEY: {
+                    "PostToolUse": [{"type": "command", "command": "custom-tool.sh"}],
+                    "SessionStart": [{"type": "command", "command": "user-custom-start.sh"}],
+                }
+            }
+            agy_hooks.write_text(json.dumps(conflict_payload), encoding="utf-8")
+            res_conflict = mod.apply_integrations("agy", home_dir=home, cache_dir=cache, which_fn=_no_which)
+            self.assertEqual(res_conflict[0].action, "error")
+            self.assertIn("conflict", res_conflict[0].detail.lower())
+            self.assertEqual(json.loads(agy_hooks.read_text(encoding="utf-8")), conflict_payload)
+
+            # AGY uninstall: removes only managed entries in SessionStart/PreInvocation, preserves custom event & chained command
+            mixed_agy = {
+                mod.AGY_NAMESPACE_KEY: {
+                    "SessionStart": [
+                        {"type": "command", "command": legacy_agy, "timeout": 5},
+                        {"type": "command", "command": "agent-voice-input session-hook --cli agy && my-agy-hook"},
+                    ],
+                    "PreInvocation": [
+                        {"type": "command", "command": mod.AGY_HOOK_COMMAND, "timeout": 5},
+                    ],
+                    "CustomEvent": [
+                        {"type": "command", "command": "keep-custom.sh"},
+                    ],
+                }
+            }
+            agy_hooks.write_text(json.dumps(mixed_agy), encoding="utf-8")
+            un_a = mod.apply_integrations("agy", uninstall=True, home_dir=home, cache_dir=cache, which_fn=_no_which)
+            self.assertEqual(un_a[0].action, "uninstalled")
+            after_a = json.loads(agy_hooks.read_text(encoding="utf-8"))
+            self.assertIn(mod.AGY_NAMESPACE_KEY, after_a)
+            self.assertNotIn("PreInvocation", after_a[mod.AGY_NAMESPACE_KEY])
+            self.assertEqual(
+                after_a[mod.AGY_NAMESPACE_KEY]["SessionStart"],
+                [{"type": "command", "command": "agent-voice-input session-hook --cli agy && my-agy-hook"}],
+            )
+            self.assertEqual(
+                after_a[mod.AGY_NAMESPACE_KEY]["CustomEvent"],
+                [{"type": "command", "command": "keep-custom.sh"}],
+            )
+
+            # voice-title.sh includes --quiet >/dev/null 2>&1
+            repo_root = Path(__file__).resolve().parents[1]
+            vts = (repo_root / "integrations" / "claude" / "voice-title.sh").read_text(encoding="utf-8")
+            self.assertIn("--quiet >/dev/null 2>&1", vts)
+
 
 class TestCodexIntegration(unittest.TestCase):
     def test_codex_create_append_preserve_comments_and_multiline_strings(self) -> None:

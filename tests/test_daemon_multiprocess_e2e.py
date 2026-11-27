@@ -281,7 +281,7 @@ def _run_daemon_child(runtime_dir: Path, sync_dir: Path) -> int:
     }
     cfg = Config(
         hotkey=HotkeyConfig(key="RControl", trigger_mode="tap_toggle", debounce_ms=0),
-        audio=AudioConfig(save_recordings=False),
+        audio=AudioConfig(),
         asr=AsrConfig(provider="dashscope"),
         refiner=RefinerConfig(provider="deepseek"),
     )
@@ -692,6 +692,10 @@ if _SYNC:
 
     _daemon_mod.create_platform = _fake_create_platform
 
+    from agent_voice_input import cli as _cli_mod
+
+    _cli_mod._run_startup_preflight_ping = lambda **_kwargs: []
+
     if sys.platform == "darwin":
         from agent_voice_input import platform_macos as _mac_mod
 
@@ -791,8 +795,8 @@ if _SYNC:
             self.assertIsNone(starts1[0]["env_TMUX_PANE"])
             self.assertEqual(starts1[0]["env_TMUX_HINT"], tmux_start)
 
-            # 2. `status`: live JSON status matches pid1 and configured model
-            p_st1 = _run_cli("status", "--config", str(cfg_file))
+            # 2. `status --json` & plain human-readable `status` match pid1 and configured model
+            p_st1 = _run_cli("status", "--json", "--config", str(cfg_file))
             self.assertEqual(p_st1.returncode, 0, p_st1.stderr)
             st1 = json.loads(p_st1.stdout)
             self.assertTrue(st1["ok"])
@@ -801,19 +805,24 @@ if _SYNC:
             self.assertEqual(st1["pipeline"]["asr"]["model"], "whisper-base-cfg")
             self.assertFalse(st1["code_drift"])
 
+            p_st1_human = _run_cli("status", "--config", str(cfg_file))
+            self.assertEqual(p_st1_human.returncode, 0, p_st1_human.stderr)
+            self.assertIn(f"pid={pid1}", p_st1_human.stdout)
+            self.assertIn("whisper-base-cfg", p_st1_human.stdout)
+
             # 3. `toggle` (start recording) -> `status` (recording) -> `cancel` (abort recording cleanly)
-            p_tog = _run_cli("toggle", "--config", str(cfg_file))
+            p_tog = _run_cli("toggle", "--json", "--config", str(cfg_file))
             self.assertEqual(p_tog.returncode, 0, f"toggle stderr={p_tog.stderr!r}")
             tog_obj = json.loads(p_tog.stdout)
             self.assertTrue(tog_obj["ok"])
             self.assertEqual(tog_obj["state"], "recording")
             self.assertEqual(tog_obj["seq_id"], 1)
 
-            p_st_rec = _run_cli("status", "--config", str(cfg_file))
+            p_st_rec = _run_cli("status", "--json", "--config", str(cfg_file))
             self.assertEqual(p_st_rec.returncode, 0, p_st_rec.stderr)
             self.assertEqual(json.loads(p_st_rec.stdout)["state"], "recording")
 
-            p_can = _run_cli("cancel", "--config", str(cfg_file))
+            p_can = _run_cli("cancel", "--json", "--config", str(cfg_file))
             self.assertEqual(p_can.returncode, 0, f"cancel stderr={p_can.stderr!r}")
             can_obj = json.loads(p_can.stdout)
             self.assertTrue(can_obj["ok"])
@@ -852,7 +861,7 @@ if _SYNC:
             self.assertEqual(starts2[1]["os_TMUX_HINT"], tmux_restart)
             self.assertFalse(_pid_alive(pid1), f"previous daemon pid1={pid1} still alive after restart")
 
-            p_st2 = _run_cli("status", "--config", str(cfg_file))
+            p_st2 = _run_cli("status", "--json", "--config", str(cfg_file))
             self.assertEqual(p_st2.returncode, 0, p_st2.stderr)
             st2 = json.loads(p_st2.stdout)
             self.assertTrue(st2["ok"])

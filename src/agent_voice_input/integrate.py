@@ -16,18 +16,52 @@ from .config import ConfigError, ensure_secure_dir, expand_user_path, parse_toml
 
 CLIS: tuple[str, ...] = ("claude", "codex", "agy")
 CLAUDE_HOOK_EVENTS: tuple[str, ...] = ("SessionStart", "UserPromptSubmit")
+_LEGACY_CLAUDE_HOOK_COMMANDS: frozenset[str] = frozenset(
+    {
+        (
+            'sh -c \'b=$(command -v agent-voice-input 2>/dev/null || true); '
+            '[ -x "$b" ] || b="$HOME/.local/bin/agent-voice-input"; '
+            '[ -x "$b" ] || b="/opt/homebrew/bin/agent-voice-input"; '
+            '[ -x "$b" ] && "$b" session-hook --cli claude --quiet >/dev/null 2>&1 || true\''
+        ),
+    }
+)
 CLAUDE_HOOK_COMMAND = (
     'sh -c \'b=$(command -v agent-voice-input 2>/dev/null || true); '
     '[ -x "$b" ] || b="$HOME/.local/bin/agent-voice-input"; '
     '[ -x "$b" ] || b="/opt/homebrew/bin/agent-voice-input"; '
+    '[ -x "$b" ] || b="/usr/local/bin/agent-voice-input"; '
     '[ -x "$b" ] && "$b" session-hook --cli claude --quiet >/dev/null 2>&1 || true\''
 )
+AGY_HOOK_EVENTS: tuple[str, ...] = ("SessionStart", "PreInvocation")
 AGY_NAMESPACE_KEY = "voice-session-title"
+_LEGACY_AGY_HOOK_COMMANDS: frozenset[str] = frozenset(
+    {
+        (
+            'sh -c \'b=$(command -v agent-voice-input 2>/dev/null || true); '
+            '[ -x "$b" ] || b="$HOME/.local/bin/agent-voice-input"; '
+            '[ -x "$b" ] || b="/opt/homebrew/bin/agent-voice-input"; '
+            'if [ -x "$b" ]; then "$b" session-hook --cli agy --quiet >/dev/null 2>&1 || true; fi; printf "{}\\n"\''
+        ),
+    }
+)
 AGY_HOOK_COMMAND = (
     'sh -c \'b=$(command -v agent-voice-input 2>/dev/null || true); '
     '[ -x "$b" ] || b="$HOME/.local/bin/agent-voice-input"; '
     '[ -x "$b" ] || b="/opt/homebrew/bin/agent-voice-input"; '
+    '[ -x "$b" ] || b="/usr/local/bin/agent-voice-input"; '
     'if [ -x "$b" ]; then "$b" session-hook --cli agy --quiet >/dev/null 2>&1 || true; fi; printf "{}\\n"\''
+)
+_MANAGED_EXACT_COMMANDS: frozenset[str] = frozenset(
+    {CLAUDE_HOOK_COMMAND, AGY_HOOK_COMMAND, *_LEGACY_CLAUDE_HOOK_COMMANDS, *_LEGACY_AGY_HOOK_COMMANDS}
+)
+_STANDALONE_SESSION_HOOK_RE = re.compile(
+    r'^(?:(?:"[^"\n;|&`$()]+"|\'[^\'\n;|&`$()]+\'|[^\s;|&`$()"\']+)/)?'
+    r'(?:"[^"\n;|&`$()]*/agent-voice-input"|\'[^\'\n;|&`$()]*/agent-voice-input\'|agent-voice-input)'
+    r'\s+session-hook'
+    r'(?:\s+(?:--cli(?:=|\s+)(?:auto|claude|agy|gemini)|--quiet))*'
+    r'(?:\s*(?:>/dev/null|2>/dev/null|2>&1))*'
+    r'(?:\s*\|\|\s*true)?$'
 )
 CODEX_THREAD_ID_TOKEN = "thread-id"
 CODEX_DEFAULT_TERMINAL_TITLE: tuple[str, ...] = ("spinner", "project-name", "thread-title", CODEX_THREAD_ID_TOKEN)
@@ -78,11 +112,25 @@ class IntegrationAction:
 
 
 def _is_managed_voice_hook(val: Any) -> bool:
-    return isinstance(val, str) and "agent-voice-input" in val and "session-hook" in val
+    """Match only standalone managed ``agent-voice-input`` hook commands (never chained user commands)."""
+    if not isinstance(val, str):
+        return False
+    cmd = val.strip()
+    if not cmd:
+        return False
+    if cmd in _MANAGED_EXACT_COMMANDS:
+        return True
+    if "\n" in cmd or "\r" in cmd:
+        return False
+    return bool(_STANDALONE_SESSION_HOOK_RE.match(cmd))
 
 
 def _is_any_voice_hook(val: Any) -> bool:
-    return _is_managed_voice_hook(val) or (isinstance(val, str) and "voice-title.sh" in val)
+    if _is_managed_voice_hook(val):
+        return True
+    return isinstance(val, str) and (
+        ("agent-voice-input" in val and "session-hook" in val) or "voice-title.sh" in val
+    )
 
 
 def _event_entries_have_voice_hook(entries: Any) -> bool:
@@ -262,6 +310,52 @@ def _read_json_dict(real_path: Path) -> tuple[dict[str, Any] | None, str]:
     return (parsed, "") if isinstance(parsed, dict) else (None, f"expected JSON object at root of {real_path}")
 
 
+def _upgrade_legacy_hook_entries(
+    entries: list[Any],
+    legacy_cmds: frozenset[str],
+    target_cmd: str,
+) -> bool:
+    """Upgrade exact legacy managed hook commands in-place while preserving sibling fields and custom commands."""
+    upgraded = False
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        cmd = item.get("command")
+        if isinstance(cmd, str) and cmd.strip() in legacy_cmds:
+            item["command"] = target_cmd
+            upgraded = True
+        nested = item.get("hooks")
+        if isinstance(nested, list):
+            for sub in nested:
+                if not isinstance(sub, dict):
+                    continue
+                sub_cmd = sub.get("command")
+                if isinstance(sub_cmd, str) and sub_cmd.strip() in legacy_cmds:
+                    sub["command"] = target_cmd
+                    upgraded = True
+    return upgraded
+
+
+def _upgrade_legacy_hook_map(
+    obj: Any,
+    legacy_cmds: frozenset[str],
+    target_cmd: str,
+) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    upgraded = False
+    for key, val in obj.items():
+        if key in _KNOWN_HOOK_EVENTS and isinstance(val, list):
+            if _upgrade_legacy_hook_entries(val, legacy_cmds, target_cmd):
+                upgraded = True
+        elif isinstance(val, dict):
+            for sk, sv in val.items():
+                if sk in _KNOWN_HOOK_EVENTS and isinstance(sv, list):
+                    if _upgrade_legacy_hook_entries(sv, legacy_cmds, target_cmd):
+                        upgraded = True
+    return upgraded
+
+
 def _claude_merge(data: dict[str, Any]) -> tuple[dict[str, Any] | None, bool, str]:
     out = json.loads(json.dumps(data))
     hooks = out.setdefault("hooks", {})
@@ -275,9 +369,12 @@ def _claude_merge(data: dict[str, Any]) -> tuple[dict[str, Any] | None, bool, st
             changed = True
         elif not isinstance(entries, list):
             return None, False, f"'hooks.{event}' in settings.json must be a JSON array"
-        elif not _event_entries_have_voice_hook(entries):
-            entries.append({"hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}]})
-            changed = True
+        else:
+            if _upgrade_legacy_hook_entries(entries, _LEGACY_CLAUDE_HOOK_COMMANDS, CLAUDE_HOOK_COMMAND):
+                changed = True
+            if not _event_entries_have_voice_hook(entries):
+                entries.append({"hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}]})
+                changed = True
     return out, changed, ""
 
 
@@ -289,7 +386,9 @@ def _claude_uninstall(data: dict[str, Any]) -> tuple[dict[str, Any] | None, bool
     if not isinstance(hooks, dict):
         return None, False, "'hooks' in settings.json must be a JSON object"
     removed = False
-    for event in list(hooks.keys()):
+    for event in CLAUDE_HOOK_EVENTS:
+        if event not in hooks:
+            continue
         entries = hooks[event]
         if not isinstance(entries, list):
             continue
@@ -321,9 +420,85 @@ def _claude_uninstall(data: dict[str, Any]) -> tuple[dict[str, Any] | None, bool
 
 def _agy_namespace_entry() -> dict[str, Any]:
     return {
-        "SessionStart": [{"type": "command", "command": AGY_HOOK_COMMAND, "timeout": 5}],
-        "PreInvocation": [{"type": "command", "command": AGY_HOOK_COMMAND, "timeout": 5}],
+        ev: [{"type": "command", "command": AGY_HOOK_COMMAND, "timeout": 5}]
+        for ev in AGY_HOOK_EVENTS
     }
+
+
+def _agy_merge(data: dict[str, Any]) -> tuple[dict[str, Any] | None, bool, str]:
+    out = json.loads(json.dumps(data))
+    if AGY_NAMESPACE_KEY not in out:
+        if _hook_map_has_voice_hook(out) or _hook_map_has_voice_hook(out.get("hooks")):
+            upgraded = _upgrade_legacy_hook_map(out, _LEGACY_AGY_HOOK_COMMANDS, AGY_HOOK_COMMAND)
+            if _upgrade_legacy_hook_map(out.get("hooks"), _LEGACY_AGY_HOOK_COMMANDS, AGY_HOOK_COMMAND):
+                upgraded = True
+            return out, upgraded, ""
+        out[AGY_NAMESPACE_KEY] = _agy_namespace_entry()
+        return out, True, ""
+    ns = out[AGY_NAMESPACE_KEY]
+    if not isinstance(ns, dict):
+        return None, False, f"'{AGY_NAMESPACE_KEY}' in hooks.json must be a JSON object"
+    if ns and not _hook_map_has_voice_hook(ns):
+        return (
+            None,
+            False,
+            f"conflict: '{AGY_NAMESPACE_KEY}' already exists with non-managed configuration; refusing to overwrite",
+        )
+    changed = False
+    for event in AGY_HOOK_EVENTS:
+        entries = ns.get(event)
+        if entries is None:
+            ns[event] = [{"type": "command", "command": AGY_HOOK_COMMAND, "timeout": 5}]
+            changed = True
+        elif not isinstance(entries, list):
+            return None, False, f"'{AGY_NAMESPACE_KEY}.{event}' in hooks.json must be a JSON array"
+        else:
+            if _upgrade_legacy_hook_entries(entries, _LEGACY_AGY_HOOK_COMMANDS, AGY_HOOK_COMMAND):
+                changed = True
+            if not _event_entries_have_voice_hook(entries):
+                entries.append({"type": "command", "command": AGY_HOOK_COMMAND, "timeout": 5})
+                changed = True
+    return out, changed, ""
+
+
+def _agy_uninstall(data: dict[str, Any]) -> tuple[dict[str, Any] | None, bool, str]:
+    out = json.loads(json.dumps(data))
+    if AGY_NAMESPACE_KEY not in out:
+        return out, False, ""
+    ns = out[AGY_NAMESPACE_KEY]
+    if not isinstance(ns, dict):
+        return None, False, f"'{AGY_NAMESPACE_KEY}' in hooks.json must be a JSON object"
+    removed = False
+    for event in AGY_HOOK_EVENTS:
+        if event not in ns:
+            continue
+        entries = ns[event]
+        if not isinstance(entries, list):
+            continue
+        new_entries: list[Any] = []
+        ev_removed = False
+        for item in entries:
+            if isinstance(item, dict) and _is_managed_voice_hook(item.get("command")):
+                ev_removed = True
+                continue
+            if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                kept = [s for s in item["hooks"] if not (isinstance(s, dict) and _is_managed_voice_hook(s.get("command")))]
+                if len(kept) != len(item["hooks"]):
+                    ev_removed = True
+                    if kept:
+                        item["hooks"] = kept
+                        new_entries.append(item)
+                    continue
+            new_entries.append(item)
+        if ev_removed:
+            removed = True
+            if new_entries:
+                ns[event] = new_entries
+            else:
+                del ns[event]
+    if removed and not ns:
+        del out[AGY_NAMESPACE_KEY]
+    return out, removed, ""
 
 
 def _find_legacy_agy_hook(legacy_files: tuple[Path, ...]) -> Path | None:
@@ -705,21 +880,35 @@ def apply_integrations(
                     actions.append(_act("error", jerr))
                     continue
                 if uninstall:
-                    if AGY_NAMESPACE_KEY not in data:
+                    updated, changed, aerr = _agy_uninstall(data)
+                    if aerr or updated is None:
+                        actions.append(_act("error", aerr))
+                    elif not changed:
                         actions.append(_act("not_configured", legacy_rm))
                     else:
-                        updated = {k: v for k, v in data.items() if k != AGY_NAMESPACE_KEY}
-                        actions.append(_commit(json.dumps(updated, indent=2, ensure_ascii=False) + "\n", f"removed '{AGY_NAMESPACE_KEY}' namespace"))
-                elif _hook_map_has_voice_hook(data) or _hook_map_has_voice_hook(data.get("hooks")):
-                    actions.append(_act("already_configured"))
-                elif legacy_hit is not None:
+                        detail = (
+                            f"removed '{AGY_NAMESPACE_KEY}' namespace"
+                            if AGY_NAMESPACE_KEY not in updated
+                            else f"removed managed hooks from '{AGY_NAMESPACE_KEY}'"
+                        )
+                        actions.append(_commit(json.dumps(updated, indent=2, ensure_ascii=False) + "\n", detail))
+                elif legacy_hit is not None and not (
+                    _hook_map_has_voice_hook(data) or _hook_map_has_voice_hook(data.get("hooks"))
+                ):
                     actions.append(_act("already_configured", f"already configured in legacy {legacy_hit}; not duplicating"))
-                elif AGY_NAMESPACE_KEY in data and not isinstance(data[AGY_NAMESPACE_KEY], dict):
-                    actions.append(_act("error", f"'{AGY_NAMESPACE_KEY}' in {real} must be a JSON object"))
                 else:
-                    updated = dict(data)
-                    updated[AGY_NAMESPACE_KEY] = _agy_namespace_entry()
-                    actions.append(_commit(json.dumps(updated, indent=2, ensure_ascii=False) + "\n", f"added '{AGY_NAMESPACE_KEY}' (SessionStart + PreInvocation)"))
+                    updated, changed, aerr = _agy_merge(data)
+                    if aerr or updated is None:
+                        actions.append(_act("error", aerr))
+                    elif not changed:
+                        actions.append(_act("already_configured"))
+                    else:
+                        actions.append(
+                            _commit(
+                                json.dumps(updated, indent=2, ensure_ascii=False) + "\n",
+                                f"ensured '{AGY_NAMESPACE_KEY}' (SessionStart + PreInvocation)",
+                            )
+                        )
             else:  # codex
                 if not exists and uninstall:
                     actions.append(_act("not_configured"))

@@ -46,7 +46,7 @@ from agent_voice_input.config import (  # noqa: E402
 )
 from agent_voice_input.daemon import (  # noqa: E402
     VoiceInputDaemon,
-    read_telemetry_history,
+    read_diag_history,
 )
 from agent_voice_input.platform_common import ForegroundWindow, PasteOutcome  # noqa: E402
 from agent_voice_input.session_ctx import SessionTracker, encode_claude_project_dir  # noqa: E402
@@ -446,8 +446,9 @@ class FullPipelineLoopbackE2ETests(unittest.TestCase):
                         'trigger_mode = "tap_toggle"',
                         "debounce_ms = 0",
                         "",
-                        "[audio]",
-                        "save_recordings = false",
+                        "[archive]",
+                        "save_audio = false",
+                        "save_transcripts = false",
                         "",
                         "[asr]",
                         'provider = "openai-compatible"',
@@ -481,7 +482,7 @@ class FullPipelineLoopbackE2ETests(unittest.TestCase):
             cfg = Config(
                 config_path=str(cfg_path),
                 hotkey=HotkeyConfig(key="RControl", trigger_mode="tap_toggle", debounce_ms=0),
-                audio=AudioConfig(save_recordings=False),
+                audio=AudioConfig(),
                 asr=AsrConfig(
                     provider="openai-compatible",
                     api="audio-transcriptions",
@@ -611,8 +612,8 @@ class FullPipelineLoopbackE2ETests(unittest.TestCase):
             # Verify Stage 1 & Stage 2 loopback HTTP both executed on retry and telemetry logged recovery
             self.assertEqual(len(server.asr_requests), 3)
             self.assertEqual(len(server.refiner_requests), 3)
-            hist = read_telemetry_history(rt_dir, limit=10)
-            self.assertTrue(hist, "telemetry.jsonl missing records")
+            hist = read_diag_history(rt_dir, limit=10)
+            self.assertTrue(hist, "diag.jsonl missing records")
             last_tel = hist[-1]
             self.assertEqual(last_tel["audio_source"], "retry")
             self.assertTrue(last_tel["ok"])

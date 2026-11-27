@@ -25,7 +25,7 @@ venv/
 .agents/settings.local.json
 .agents/scheduled_tasks.lock
 
-# Local voice recordings & runtime telemetry (never commit)
+# Local voice recordings & local diagnostic logs (never commit)
 *.wav
 *.mp3
 *.m4a
@@ -33,7 +33,9 @@ venv/
 *.opus
 *.flac
 recordings/
-telemetry.jsonl
+audio/
+transcripts/
+diag.jsonl
 
 # Local model benchmark notes (not committed yet)
 docs/benchmarks/

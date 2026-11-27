@@ -579,22 +579,17 @@ def classify_macos_mic_permission(
             "run 'agent-voice-input restart' inside a local macOS terminal (outside any SSH-started tmux server)"
         )
         has_graphic = (st or {}).get("has_graphic_session")
-        if isinstance(has_graphic, bool):
-            if has_graphic is False:
-                return MicrophoneUnavailableError(
-                    non_gui_msg,
-                    reason_code="mic_permission",
-                    hud_state="mic_permission",
-                )
-            return None
+        is_remote = (st or {}).get("is_remote_session")
         eff_env = env if env is not None else {}
-        if any(str(eff_env.get(k) or "").strip() for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
+        has_ssh_env = any(
+            str(eff_env.get(k) or "").strip() for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
+        )
+        if has_graphic is False or is_remote is True or has_ssh_env:
             return MicrophoneUnavailableError(
                 non_gui_msg,
                 reason_code="mic_permission",
                 hud_state="mic_permission",
             )
-        return None
     return None
 
 
@@ -2977,7 +2972,7 @@ class MacOSPlatform(JsonlShimMixin):
                     return _fallback_to_clipboard("focus_changed", fg.process)
                 poll_started = time.monotonic()
                 if waited_for_key and (_effective_deadline(poll_started) - poll_started) <= 0.0:
-                    return _fallback_to_clipboard("focus_changed", fg.process)
+                    return _fallback_to_clipboard("hotkey_held", fg.process)
                 key_state = self._poll_shim_key_state(immediate=False)
                 if cancelled_fn():
                     return PasteOutcome(False, False, "cancelled", fg.process)
@@ -2991,7 +2986,7 @@ class MacOSPlatform(JsonlShimMixin):
                     eff_deadline = _effective_deadline(now_flush)
                     rem_flush = eff_deadline - now_flush
                     if (waited_for_key or hold_timeout_sec > 0.0) and rem_flush <= 0.0:
-                        return _fallback_to_clipboard("focus_changed", fg.process)
+                        return _fallback_to_clipboard("hotkey_held", fg.process)
                     flush_wait = min(0.05, max(0.005, rem_flush)) if rem_flush > 0.0 else 0.005
                     flushed = self._flush_shim_events(timeout_sec=flush_wait)
                     if cancelled_fn():
@@ -3001,13 +2996,13 @@ class MacOSPlatform(JsonlShimMixin):
                         now_after_flush = time.monotonic()
                         rem = _effective_deadline(now_after_flush) - now_after_flush
                         if rem <= 0.0:
-                            return _fallback_to_clipboard("focus_changed", fg.process)
+                            return _fallback_to_clipboard("hotkey_held", fg.process)
                         if (now_after_flush - now_flush) < 0.005:
                             sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
                         continue
                     now_post_flush = time.monotonic()
                     if (waited_for_key or hold_timeout_sec > 0.0) and (_effective_deadline(now_post_flush) - now_post_flush) <= 0.0:
-                        return _fallback_to_clipboard("focus_changed", fg.process)
+                        return _fallback_to_clipboard("hotkey_held", fg.process)
                     if needs_immediate:
                         imm_started = now_post_flush
                         imm_state = self._poll_shim_key_state(immediate=True)
@@ -3019,7 +3014,7 @@ class MacOSPlatform(JsonlShimMixin):
                             unavail_since = None
                             now_after_imm = time.monotonic()
                             if (waited_for_key or hold_timeout_sec > 0.0) and (_effective_deadline(now_after_imm) - now_after_imm) <= 0.0:
-                                return _fallback_to_clipboard("focus_changed", fg.process)
+                                return _fallback_to_clipboard("hotkey_held", fg.process)
                             break
                         now_imm_fail = time.monotonic()
                         if imm_state is None:
@@ -3029,7 +3024,7 @@ class MacOSPlatform(JsonlShimMixin):
                             unavail_since = None
                         rem = _effective_deadline(now_imm_fail) - now_imm_fail
                         if rem <= 0.0:
-                            return _fallback_to_clipboard("focus_changed", fg.process)
+                            return _fallback_to_clipboard("hotkey_held", fg.process)
                         waited_for_key = True
                         sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
                         continue
@@ -3042,7 +3037,7 @@ class MacOSPlatform(JsonlShimMixin):
                     unavail_since = None
                 rem = _effective_deadline(now_poll) - now_poll
                 if rem <= 0.0:
-                    return _fallback_to_clipboard("focus_changed", fg.process)
+                    return _fallback_to_clipboard("hotkey_held", fg.process)
                 waited_for_key = True
                 sleep_cooperative(min(0.05, rem), sleep_fn=time.sleep, is_cancelled=cancelled_fn)
 
@@ -3069,7 +3064,7 @@ class MacOSPlatform(JsonlShimMixin):
         if effective_deadline_fn is not None and (waited_for_key or hold_timeout_sec > 0.0):
             now_pre_commit = time.monotonic()
             if now_pre_commit >= effective_deadline_fn(now_pre_commit):
-                return _fallback_to_clipboard("focus_changed", fg.process)
+                return _fallback_to_clipboard("hotkey_held", fg.process)
 
         if not _confirm_commit():
             return PasteOutcome(False, False, "cancelled", fg.process)

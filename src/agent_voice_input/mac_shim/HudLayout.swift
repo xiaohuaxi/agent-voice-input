@@ -385,6 +385,19 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
             autoHideMs: 2600,
             iconKind: "warning"
         )
+    case "queue_full":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "! 待处理队列已满，请稍候" : "! Dictation queue full, please wait",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 2600,
+            iconKind: "warning"
+        )
     case "mic_no_stream":
         return HudVisualStyle(
             layer: layer,
@@ -463,6 +476,19 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
             autoHideMs: 3200,
             iconKind: "warning"
         )
+    case "refiner_fallback":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "⚠ 已贴原文(精修失败)" : "⚠ Raw pasted (refiner failed)",
+            bg: toastBg,
+            border: amberBorder,
+            borderWidth: 1.0,
+            icon: amberIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 4000,
+            iconKind: "warning"
+        )
     case "asr_empty_retry":
         return HudVisualStyle(
             layer: layer,
@@ -493,6 +519,19 @@ func resolveHudVisualStyle(state: String, explicitLayer: String = "", zh: Bool =
         return HudVisualStyle(
             layer: layer,
             defaultText: zh ? "✕ 填入失败，已存录音可重试" : "✕ Insert failed, audio saved for retry",
+            bg: toastBg,
+            border: coralBorder,
+            borderWidth: 1.0,
+            icon: coralIcon,
+            mainText: toastMainText,
+            hintText: toastHintText,
+            autoHideMs: 3200,
+            iconKind: "cross"
+        )
+    case "error_retry":
+        return HudVisualStyle(
+            layer: layer,
+            defaultText: zh ? "✕ 识别失败，已存录音可重试" : "✕ Transcription failed, audio saved for retry",
             bg: toastBg,
             border: coralBorder,
             borderWidth: 1.0,
