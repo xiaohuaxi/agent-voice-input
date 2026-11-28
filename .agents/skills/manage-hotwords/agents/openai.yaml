@@ -1,0 +1,7 @@
+interface:
+  display_name: "个人热词整理与维护"
+  short_description: "基于归档转录、评测对照与本机 Agent 主会话冷启动或增量迭代 personal.txt 个人热词表"
+  default_prompt: "使用 $manage-hotwords 梳理并优化我的 agent-voice-input 个人热词表（personal.txt），给出分层候选与安全别名清单待我确认。"
+
+policy:
+  allow_implicit_invocation: true
