@@ -117,8 +117,14 @@ if ! command -v ffmpeg >/dev/null 2>&1 && [ ! -x /opt/homebrew/bin/ffmpeg ] && [
   MISSING=1
   if [ "$OS" = "Darwin" ]; then
     printf '\nMissing ffmpeg. Install with:\n  brew install ffmpeg\n'
-  else
+  elif command -v apt-get >/dev/null 2>&1; then
     printf '\nMissing ffmpeg. Install with:\n  sudo apt update && sudo apt install -y ffmpeg\n'
+  elif command -v dnf >/dev/null 2>&1; then
+    printf '\nMissing ffmpeg. Install with:\n  sudo dnf install -y ffmpeg\n'
+  elif command -v pacman >/dev/null 2>&1; then
+    printf '\nMissing ffmpeg. Install with:\n  sudo pacman -S ffmpeg\n'
+  else
+    printf '\nMissing ffmpeg. Please install ffmpeg via your system package manager.\n'
   fi
 fi
 if [ "$OS" = "Darwin" ]; then

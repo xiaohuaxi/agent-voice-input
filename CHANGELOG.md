@@ -7,14 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-11-28
+
 ### Added
 - **Agent routing metadata in monthly transcript archive (`transcripts/YYYY-MM.jsonl`)**: Extended the flat JSONL transcript schema from 12 to 14 backward-compatible fields by adding `"agent"` (`"claude"` / `"codex"` / `"agy"` / `"gemini"` or `null`) and `"agent_session_id"` (matched target session ID or `null`) in `agent` mode (always `null` in `general` mode or when no concrete target session is bound, never recording refiner internal session IDs, context, hotwords, or secrets).
+- **Minimal POSIX `install.sh` & multi-distro CI smoke matrix**: Added an auditable, zero-`sudo`, zero-rc-edit `install.sh` installer (using `uv` with `--dry-run`, `--version`, `--from`, and distro-aware `apt`/`dnf`/`pacman` `ffmpeg` hints) alongside `install-sh-native` (`ubuntu-22.04`, `ubuntu-24.04`, `macos-15`, `macos-26`) and `install-sh-containers` (minimal containers: zero-Python `debian:bookworm-slim` + `fedora:latest`) CI smoke matrices in `.github/workflows/ci.yml`.
+- **Repository `manage-hotwords` agent skill (`.agents/skills/manage-hotwords/`)**: Added a project-local skill with corpus extraction and validation helpers for cold-start hotword curation, incremental maintenance, mishearing-alias troubleshooting, and cleanup of `hotwords/personal.txt`.
 
 ### Changed
 - **Conservative DashScope Stage 1 hotword cap rollback (`150 terms / 1,800 chars`)**: Rolled back DashScope `qwen3-asr-flash` Stage 1 hotword limits from `250 terms / 2,800 chars` to `150 terms / 1,800 chars` (and `_compose_context_text` total budget from `5,800` to `3,800` chars) to avoid sporadic verbatim hotword-recitation hallucinations observed at high term counts while relying on Stage 2 (`200 items / 3,000 chars` with aliases) for tail coverage.
+- **Slimmed bilingual READMEs & tiered `docs/` reference layout**: Streamlined `README.md` and `README.zh-CN.md` around the one-command `install.sh` quickstart while moving detailed provider guides, hotwords, CLI usage, and troubleshooting references into `docs/providers(.zh-CN).md`, `docs/guide(.zh-CN).md`, and `docs/agent-setup.md`.
 
 ### Fixed
-- **Self-consistent `doctor` `[pipeline]` summary for `.env` template placeholders**: Filtered `.env` template placeholder providers out of `doctor` `[pipeline]` `alternatives` (including `codex` when falling back to a placeholder `OPENAI_API_KEY` and legacy dual-header `doubao` with a placeholder `DOUBAO_ASR_APP_ID`) and replaced `auto priority (...)` / stage reasons on placeholder stages with explicit `placeholder key in .env: <VAR>` summaries in both text and `--json` outputs.
+- **Self-consistent `doctor` `[pipeline]` summary for `.env` template placeholders & expired Codex auth**: Filtered `.env` template placeholder providers out of `doctor` `[pipeline]` `alternatives` (including expired `codex` auth falling back to a placeholder `OPENAI_API_KEY` and legacy dual-header `doubao` with a placeholder `DOUBAO_ASR_APP_ID`) and replaced `auto priority (...)` / stage reasons on placeholder stages with explicit `placeholder key in .env: <VAR>` summaries in both text and `--json` outputs.
+- **Excluded gitignored `docs/benchmarks/` from sdist (`MANIFEST.in`)**: Pruned local `docs/benchmarks/` artifacts from source distributions in `MANIFEST.in` and enforced the exclusion in `scripts/check_package.py`.
 
 ## [0.18.1] - 2026-11-28
 

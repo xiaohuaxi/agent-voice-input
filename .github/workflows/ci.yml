@@ -556,3 +556,203 @@ jobs:
         run: |
           python scripts/check_package.py
           python -m twine check dist/*
+
+  install-sh-native:
+    name: install.sh native smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, macos-15, macos-26]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Static check install.sh (POSIX sh, dash, shellcheck)
+        run: |
+          set -euo pipefail
+          sh -n install.sh
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            dash -n install.sh
+            shellcheck -s sh install.sh
+          elif command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -s sh install.sh
+          fi
+
+      - name: Dry-run and isolated minimal-PATH cold-start install via install.sh
+        run: |
+          set -euo pipefail
+          EXPECTED_VER="$(awk -F'"' '/^\[project\]/{in_p=1;next} /^\[/{in_p=0} in_p && /^version[[:space:]]*=/{print $2; exit}' pyproject.toml)"
+          test -n "$EXPECTED_VER"
+          echo "Expected version from pyproject.toml: $EXPECTED_VER"
+
+          ISO_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/avi-install-sh-XXXXXX")"
+          trap 'rm -rf "$ISO_DIR"' EXIT
+
+          # Remove any preinstalled uv in find_uv candidate locations on this ephemeral runner
+          # so this job exercises the real cold-start uv download & install path.
+          unset XDG_BIN_HOME
+          for sys_uv in /usr/bin/uv /bin/uv /usr/sbin/uv /sbin/uv /opt/homebrew/bin/uv /usr/local/bin/uv; do
+            if [ -e "$sys_uv" ] || [ -L "$sys_uv" ]; then
+              echo "Removing preinstalled $sys_uv on ephemeral runner for cold-start test"
+              rm -f "$sys_uv" 2>/dev/null || sudo rm -f "$sys_uv"
+            fi
+          done
+
+          export HOME="$ISO_DIR/home"
+          export XDG_CACHE_HOME="$ISO_DIR/xdg-cache"
+          export XDG_DATA_HOME="$ISO_DIR/xdg-data"
+          export UV_INSTALL_DIR="$ISO_DIR/uv-install"
+          export UV_TOOL_DIR="$ISO_DIR/uv-tools"
+          export UV_TOOL_BIN_DIR="$ISO_DIR/uv-bin"
+          export UV_CACHE_DIR="$ISO_DIR/uv-cache"
+          export UV_PYTHON_INSTALL_DIR="$ISO_DIR/uv-python"
+          mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$UV_INSTALL_DIR" "$UV_TOOL_DIR" "$UV_TOOL_BIN_DIR" "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR"
+
+          MIN_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+          if PATH="$MIN_PATH" command -v uv >/dev/null 2>&1 || [ -x /opt/homebrew/bin/uv ] || [ -x /usr/local/bin/uv ]; then
+            echo "expected zero preinstalled uv before cold-start test" >&2
+            exit 1
+          fi
+
+          PATH="$MIN_PATH" sh install.sh --dry-run >"$ISO_DIR/dry_default.txt"
+          cat "$ISO_DIR/dry_default.txt"
+          grep -Fq "https://astral.sh/uv/install.sh" "$ISO_DIR/dry_default.txt"
+          grep -Fq "tool install --upgrade --python '>=3.10' agent-voice-input" "$ISO_DIR/dry_default.txt"
+
+          PATH="$MIN_PATH" sh install.sh --dry-run --from "$PWD" >"$ISO_DIR/dry_local.txt"
+          cat "$ISO_DIR/dry_local.txt"
+          grep -Fq "tool install --upgrade --python '>=3.10' $PWD" "$ISO_DIR/dry_local.txt"
+
+          PATH="$MIN_PATH" sh install.sh --from "$PWD" >"$ISO_DIR/install.txt"
+          cat "$ISO_DIR/install.txt"
+
+          grep -Fq "uv not found; installing uv" "$ISO_DIR/install.txt"
+          test -x "$UV_INSTALL_DIR/uv"
+          grep -Fq "Installed:" "$ISO_DIR/install.txt"
+          grep -Fq "agent-voice-input $EXPECTED_VER" "$ISO_DIR/install.txt"
+          grep -Fq "export PATH=\"$UV_TOOL_BIN_DIR:\$PATH\"" "$ISO_DIR/install.txt"
+
+          INSTALLED_BIN="$UV_TOOL_BIN_DIR/agent-voice-input"
+          test -x "$INSTALLED_BIN"
+          VER_OUT="$("$INSTALLED_BIN" --version)"
+          echo "Installed CLI --version: $VER_OUT"
+          test "$VER_OUT" = "agent-voice-input $EXPECTED_VER"
+
+  install-sh-containers:
+    name: install.sh bare-distro smoke (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian-bookworm-slim
+            image: debian:bookworm-slim
+            pkg_mgr: apt
+            require_no_python: "1"
+            expected_ffmpeg_hint: "sudo apt update && sudo apt install -y ffmpeg"
+          - distro: fedora-latest
+            image: fedora:latest
+            pkg_mgr: dnf
+            require_no_python: "0"
+            expected_ffmpeg_hint: "sudo dnf install -y ffmpeg"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Cold-start zero-uv / zero-Python install.sh test in ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          EXPECTED_VER="$(awk -F'"' '/^\[project\]/{in_p=1;next} /^\[/{in_p=0} in_p && /^version[[:space:]]*=/{print $2; exit}' pyproject.toml)"
+          test -n "$EXPECTED_VER"
+          echo "Testing ${{ matrix.image }} for expected version $EXPECTED_VER"
+
+          STAGE_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/avi-container-src-XXXXXX")"
+          trap 'rm -rf "$STAGE_DIR"' EXIT
+          git archive HEAD | tar -x -C "$STAGE_DIR"
+          test ! -e "$STAGE_DIR/.git"
+
+          docker run --rm \
+            -v "$STAGE_DIR:/src:ro" \
+            -e EXPECTED_VER="$EXPECTED_VER" \
+            -e PKG_MGR="${{ matrix.pkg_mgr }}" \
+            -e REQUIRE_NO_PYTHON="${{ matrix.require_no_python }}" \
+            -e EXPECTED_FFMPEG_HINT="${{ matrix.expected_ffmpeg_hint }}" \
+            "${{ matrix.image }}" \
+            sh -eu -c '
+              if [ "$PKG_MGR" = "apt" ]; then
+                apt-get -o Acquire::Retries=3 update >/dev/null
+                DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y --no-install-recommends curl ca-certificates tar gzip >/dev/null
+              elif [ "$PKG_MGR" = "dnf" ]; then
+                pkgs="tar gzip ca-certificates"
+                command -v curl >/dev/null 2>&1 || pkgs="$pkgs curl"
+                dnf -y install --setopt=install_weak_deps=False $pkgs >/dev/null
+              else
+                echo "unsupported pkg_mgr: $PKG_MGR" >&2
+                exit 2
+              fi
+
+              if command -v uv >/dev/null 2>&1; then
+                echo "expected zero preinstalled uv" >&2
+                exit 1
+              fi
+              if command -v ffmpeg >/dev/null 2>&1; then
+                echo "expected zero preinstalled ffmpeg" >&2
+                exit 1
+              fi
+              if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+                if [ "$REQUIRE_NO_PYTHON" = "1" ]; then
+                  echo "expected zero preinstalled Python in bare container" >&2
+                  exit 1
+                fi
+                echo "Note: container includes system python; forcing managed Python via UV_PYTHON_PREFERENCE=only-managed"
+                export UV_PYTHON_PREFERENCE=only-managed
+              else
+                echo "Verified zero preinstalled Python, uv, and ffmpeg"
+              fi
+
+              ISO_DIR="$(mktemp -d /tmp/avi-container-install-XXXXXX)"
+              trap '\''rm -rf "$ISO_DIR"'\'' EXIT
+
+              cp -R /src "$ISO_DIR/src"
+              export HOME="$ISO_DIR/home"
+              export XDG_CACHE_HOME="$ISO_DIR/xdg-cache"
+              export XDG_DATA_HOME="$ISO_DIR/xdg-data"
+              export UV_INSTALL_DIR="$ISO_DIR/uv-install"
+              export UV_TOOL_DIR="$ISO_DIR/uv-tools"
+              export UV_TOOL_BIN_DIR="$ISO_DIR/uv-bin"
+              export UV_CACHE_DIR="$ISO_DIR/uv-cache"
+              export UV_PYTHON_INSTALL_DIR="$ISO_DIR/uv-python"
+              mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$UV_INSTALL_DIR" "$UV_TOOL_DIR" "$UV_TOOL_BIN_DIR" "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR"
+
+              sh -n "$ISO_DIR/src/install.sh"
+              if command -v dash >/dev/null 2>&1; then
+                dash -n "$ISO_DIR/src/install.sh"
+              fi
+
+              sh "$ISO_DIR/src/install.sh" --dry-run >"$ISO_DIR/dry.txt"
+              cat "$ISO_DIR/dry.txt"
+              grep -Fq "https://astral.sh/uv/install.sh" "$ISO_DIR/dry.txt"
+              grep -Fq "tool install --upgrade --python '\''>=3.10'\'' agent-voice-input" "$ISO_DIR/dry.txt"
+
+              sh "$ISO_DIR/src/install.sh" --from "$ISO_DIR/src" >"$ISO_DIR/install.txt"
+              cat "$ISO_DIR/install.txt"
+
+              grep -Fq "uv not found; installing uv" "$ISO_DIR/install.txt"
+              test -x "$UV_INSTALL_DIR/uv"
+              grep -Fq "Installed:" "$ISO_DIR/install.txt"
+              grep -Fq "agent-voice-input $EXPECTED_VER" "$ISO_DIR/install.txt"
+              grep -Fq "export PATH=\"$UV_TOOL_BIN_DIR:\$PATH\"" "$ISO_DIR/install.txt"
+              grep -Fq "Missing ffmpeg." "$ISO_DIR/install.txt"
+              grep -Fq "$EXPECTED_FFMPEG_HINT" "$ISO_DIR/install.txt"
+
+              INSTALLED_BIN="$UV_TOOL_BIN_DIR/agent-voice-input"
+              test -x "$INSTALLED_BIN"
+              VER_OUT="$("$INSTALLED_BIN" --version)"
+              echo "Container installed CLI --version: $VER_OUT"
+              test "$VER_OUT" = "agent-voice-input $EXPECTED_VER"
+            '
