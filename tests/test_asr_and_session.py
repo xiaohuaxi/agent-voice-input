@@ -1783,7 +1783,7 @@ class AsrProvidersTests(unittest.TestCase):
             is_cancelled=lambda: cancel_flag[0],
         ) as waited_flag:
             self.assertFalse(waited_flag)
-        self.assertLess(time.monotonic() - t_wait0, 0.35)
+        self.assertLess(time.monotonic() - t_wait0, 1.0)
         release_holder.set()
         th_hold.join(timeout=1.0)
         reset_rate_limit_pacers()

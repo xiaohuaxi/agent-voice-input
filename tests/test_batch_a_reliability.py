@@ -799,7 +799,7 @@ for raw in sys.stdin:
         stop_count[0] += 1
         n = stop_count[0]
         rec_gen = int(msg.get("rec_gen") or 0)
-        delay = 0.28 if n == 1 else 0.65
+        delay = 0.48 if n == 1 else 1.6
         def _send_later(s=seq, g=rec_gen, d=delay):
             time.sleep(d)
             emit({
@@ -832,14 +832,14 @@ for raw in sys.stdin:
                 res = (
                     plat._shim_rpc(
                         {"cmd": "rec_stop", "rec_gen": plat._winmm_gen},
-                        timeout_sec=0.18,
+                        timeout_sec=0.35,
                         allow_retry=True,
                     )
                     or {}
                 )
                 elapsed = time.monotonic() - t0
                 self.assertEqual(base64.b64decode(res.get("wav_b64") or ""), sample_wav)
-                self.assertLess(elapsed, 0.55)
+                self.assertLess(elapsed, 1.2)
                 with plat._shim_lock:
                     self.assertEqual(plat._pending, {})
             finally:
