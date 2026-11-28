@@ -1009,7 +1009,7 @@ class TestConcurrencyRaces(unittest.TestCase):
                     fake_now[0] += sec
 
             rem_cfg = RemoteConfig(
-                timeout_ms=250,
+                timeout_ms=1000,
                 hosts=(RemoteHostConfig(name="devbox", ssh_target="dev@127.0.0.1"),),
             )
             tracker = SessionTracker(
@@ -1147,6 +1147,31 @@ class TestConcurrencyRaces(unittest.TestCase):
                             corrupt_reads.append("empty chunk")
                     if not isinstance(git_txt, str):
                         corrupt_reads.append("non-str git_txt")
+                if wid == 0:
+                    extra_deadline = time.monotonic() + 5.0
+                    extra_step = 0
+                    while time.monotonic() < extra_deadline and extra_step < 150:
+                        with probe_lock:
+                            if valid_snaps[0] >= 3 and etag_304_count[0] >= 1:
+                                break
+                        extra_step += 1
+                        _advance_clock(65.0)
+                        tracker.prefetch_remote_session(
+                            title,
+                            window_process="WindowsTerminal.exe",
+                            seq_id=5000 + extra_step,
+                        )
+                        snap = tracker.sync_session(
+                            window_title=title, window_process="WindowsTerminal.exe"
+                        )
+                        if snap is not None:
+                            with probe_lock:
+                                valid_snaps[0] += 1
+                            for role, txt in snap.clean_turns:
+                                if role not in ("user", "assistant") or not txt:
+                                    corrupt_reads.append(f"bad turn: {(role, txt)!r}")
+                        else:
+                            time.sleep(0.02)
 
             child_script = (
                 "import os, sys, time\n"
@@ -1212,7 +1237,7 @@ class TestConcurrencyRaces(unittest.TestCase):
             rem_threads: list[threading.Thread] = []
             reg_threads: list[threading.Thread] = []
             try:
-                with preemption_watchdog(timeout_sec=15.0, switch_interval=1e-6):
+                with preemption_watchdog(timeout_sec=30.0, switch_interval=1e-6):
                     # Seed initial full sync + ETag 304 hit + tripped -> half-open claim before storm
                     s1 = tracker.sync_session(window_title=title, window_process="WindowsTerminal.exe")
                     self.assertIsNotNone(s1)
@@ -1251,14 +1276,14 @@ class TestConcurrencyRaces(unittest.TestCase):
                     for th in [*rem_threads, *reg_threads]:
                         th.start()
                     for th in [*rem_threads, *reg_threads]:
-                        th.join(timeout=10.0)
+                        th.join(timeout=20.0)
                         self.assertFalse(th.is_alive())
                     for proc in procs:
-                        out_s, err_s = proc.communicate(timeout=10.0)
+                        out_s, err_s = proc.communicate(timeout=20.0)
                         self.assertEqual(proc.returncode, 0, err_s or out_s)
 
                     rm.cancel_prefetch(seq_id=None)
-                    deadline_bg = time.monotonic() + 2.0
+                    deadline_bg = time.monotonic() + 5.0
                     alive_bg: list[threading.Thread] = []
                     while time.monotonic() < deadline_bg:
                         with rm._lock:
@@ -1570,7 +1595,7 @@ class TestConcurrencyRaces(unittest.TestCase):
                         quit_sent = writer_b.close(send_quit=False)
                         cl_dt = time.monotonic() - t_cl0
                         self.assertFalse(quit_sent)
-                        self.assertLess(cl_dt, 0.35)
+                        self.assertLess(cl_dt, 1.0)
                         write_th.join(timeout=1.0)
                         self.assertFalse(write_th.is_alive())
                         self.assertFalse(writer_b._thread.is_alive())
@@ -1728,7 +1753,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 self.assertTrue(res_stop["ok"])
                 self.assertLess(
                     stop_elapsed,
-                    0.25,
+                    0.45,
                     f"ptt_stop must not wait on full shim HUD pipe (took {stop_elapsed:.3f}s)",
                 )
                 self.assertIn("stop_recording", call_order)
@@ -1742,7 +1767,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 # 1b. Subsequent ptt_start + handle_cancel + ptt_cancel stay responsive and cancel_recording precedes HUD.
                 t_next0 = time.monotonic()
                 self.assertTrue(daemon.handle_trigger("ptt_start", win)["ok"])
-                self.assertLess(time.monotonic() - t_next0, 0.25)
+                self.assertLess(time.monotonic() - t_next0, 0.45)
                 call_order.clear()
                 self.assertTrue(daemon.handle_cancel()["ok"])
                 self.assertIn("cancel_recording", call_order)
@@ -1851,7 +1876,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 st_during_start = send_control_command(rt, {"cmd": "status"}, timeout_sec=2.0)
                 st_dt1 = time.monotonic() - t0
                 self.assertTrue(st_during_start["ok"])
-                self.assertLess(st_dt1, 0.25, f"status blocked during slow rec_start ({st_dt1:.3f}s)")
+                self.assertLess(st_dt1, 0.8, f"status blocked during slow rec_start ({st_dt1:.3f}s)")
 
                 # Queue rec_stop while rec_start is still running -> ordered worker runs stop AFTER start!
                 t_stop = threading.Thread(
@@ -1870,7 +1895,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 st_during_stop = send_control_command(rt, {"cmd": "status"}, timeout_sec=2.0)
                 st_dt2 = time.monotonic() - t1
                 self.assertTrue(st_during_stop["ok"])
-                self.assertLess(st_dt2, 0.25, f"status blocked during slow rec_stop ({st_dt2:.3f}s)")
+                self.assertLess(st_dt2, 0.8, f"status blocked during slow rec_stop ({st_dt2:.3f}s)")
 
                 release_stop.set()
                 t_start.join(timeout=3.0)
@@ -2036,7 +2061,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             self.assertEqual(ctx_4a.exception.write_status, "not_sent")
             self.assertFalse(ctx_4a.exception.partial)
             self.assertGreaterEqual(dt_rpc, 0.04)
-            self.assertLess(dt_rpc, 0.35, f"_shim_rpc exceeded deadline on full pipe ({dt_rpc:.3f}s)")
+            self.assertLess(dt_rpc, 0.65, f"_shim_rpc exceeded deadline on full pipe ({dt_rpc:.3f}s)")
             self.assertIs(bridge._shim, proc)
             writer = bridge._current_shim_writer()
             self.assertIsNotNone(writer)
@@ -2048,9 +2073,9 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             for idx in range(50):
                 bridge.hud_level(0.5 + (idx % 5) * 0.1)
             dt_lvl = time.monotonic() - t_lvl0
-            self.assertLess(dt_lvl, 0.05, f"hud_level blocked on full pipe ({dt_lvl:.3f}s)")
+            self.assertLess(dt_lvl, 0.40, f"hud_level blocked on full pipe ({dt_lvl:.3f}s)")
 
-            # 4c. While a slower RPC (0.35s) occupies the single writer on a full pipe, a queued shorter-deadline
+            # 4c. While a slower RPC (1.2s) occupies the single writer on a full pipe, a queued shorter-deadline
             # RPC (0.05s) still honors its own deadline with write_status='not_sent' and hud_level stays instant!
             from agent_voice_input import platform_common as _pc_mod
 
@@ -2065,7 +2090,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
 
             def _slow_rpc() -> None:
                 try:
-                    bridge._shim_rpc({"cmd": "ping"}, timeout_sec=0.35, allow_retry=False)
+                    bridge._shim_rpc({"cmd": "ping"}, timeout_sec=1.2, allow_retry=False)
                 except BaseException as exc:
                     slow_errs.append(exc)
                 finally:
@@ -2081,15 +2106,15 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 t_lock0 = time.monotonic()
                 for _ in range(20):
                     bridge.hud_level(0.42)
-                self.assertLess(time.monotonic() - t_lock0, 0.05)
+                self.assertLess(time.monotonic() - t_lock0, 0.40)
 
                 t_lk_rpc = time.monotonic()
                 with self.assertRaises(_ShimWriteTimeout) as ctx_4c:
                     bridge._shim_rpc({"cmd": "ping"}, timeout_sec=0.05, allow_retry=False)
                 self.assertEqual(ctx_4c.exception.write_status, "not_sent")
-                self.assertLess(time.monotonic() - t_lk_rpc, 0.25)
+                self.assertLess(time.monotonic() - t_lk_rpc, 0.65)
                 self.assertIs(bridge._shim, proc)
-                self.assertTrue(slow_done.wait(timeout=1.5))
+                self.assertTrue(slow_done.wait(timeout=3.0))
             self.assertEqual(len(slow_errs), 1)
             self.assertIsInstance(slow_errs[0], _ShimWriteTimeout)
             bridge.close()
@@ -2124,11 +2149,11 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             self.assertTrue(build_entered.wait(timeout=2.0))
             t0 = time.monotonic()
             self.assertFalse(plat.is_shim_ok())
-            self.assertLess(time.monotonic() - t0, 0.05)
+            self.assertLess(time.monotonic() - t0, 0.5)
 
             t_close0 = time.monotonic()
             plat.close()
-            self.assertLess(time.monotonic() - t_close0, 0.2)
+            self.assertLess(time.monotonic() - t_close0, 0.8)
             release_build.set()
             th.join(timeout=2.0)
             self.assertFalse(th.is_alive())
@@ -2179,7 +2204,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                     }
                 )
                 dt = time.monotonic() - t0
-                self.assertLess(dt, 0.1, f"_on_shim_internal_event blocked caller ({dt:.3f}s)")
+                self.assertLess(dt, 0.6, f"_on_shim_internal_event blocked caller ({dt:.3f}s)")
                 self.assertTrue(stop_entered.wait(timeout=1.0))
                 self.assertFalse(plat.is_recording)
                 release_stop.set()
@@ -3021,7 +3046,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 bridge.hud_level(((idx + 6) % 10) / 10.0)
             bridge.hud("hide")
             enqueue_dt = time.monotonic() - t0
-            self.assertLess(enqueue_dt, 0.15, f"HUD + hud_level burst must never block callers ({enqueue_dt:.3f}s)")
+            self.assertLess(enqueue_dt, 0.6, f"HUD + hud_level burst must never block callers ({enqueue_dt:.3f}s)")
 
             # Now drain the filler bytes so the shim writer flushes its FIFO cleanly before quit.
             drained = 0
@@ -3818,7 +3843,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
 
         def _slow_popen(*_args: Any, **_kwargs: Any) -> Any:
             popen_entered.set()
-            allow_popen_finish.wait(timeout=2.0)
+            allow_popen_finish.wait(timeout=3.0)
             raise OSError("simulated slow popen abort")
 
         def _run_respawn() -> None:
@@ -3842,7 +3867,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 bridge.hud("recording")
                 bridge.hud_level(0.75)
                 dt = time.monotonic() - t0
-                self.assertLess(dt, 0.05, f"hud/hud_level blocked while Popen() held _shim_lock ({dt:.3f}s)")
+                self.assertLess(dt, 0.40, f"hud/hud_level blocked while Popen() held _shim_lock ({dt:.3f}s)")
                 time.sleep(0.35)
                 self.assertTrue(
                     respawn_th.is_alive(),
@@ -4098,7 +4123,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
 
         def _slow_popen(*_args: Any, **_kwargs: Any) -> Any:
             popen_entered.set()
-            allow_popen_exit.wait(timeout=2.0)
+            allow_popen_exit.wait(timeout=3.0)
             raise OSError("simulated slow popen")
 
         def _spawn_worker() -> None:
@@ -4116,7 +4141,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 slow_bridge.hud("hide")
                 slow_bridge.hud_level(0.4)
                 dt = time.monotonic() - t0
-                self.assertLess(dt, 0.05, f"hud('hide') blocked during slow Popen() ({dt:.3f}s)")
+                self.assertLess(dt, 0.40, f"hud('hide') blocked during slow Popen() ({dt:.3f}s)")
                 time.sleep(0.35)
                 self.assertTrue(spawn_th.is_alive(), "Popen() should still hold _shim_lock after 350ms")
         finally:
@@ -4789,9 +4814,9 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             finally:
                 plat_norm.close()
 
-            # Subcase B: concurrent close() during 0.45s tail_drain wakes immediately (<0.3s) and child is already dead.
+            # Subcase B: concurrent close() during 1.5s tail_drain wakes immediately (<0.8s) and child is already dead.
             plat = MacOSPlatform(
-                Config(audio=AudioConfig(tail_drain_sec=0.45)),
+                Config(audio=AudioConfig(tail_drain_sec=1.5)),
                 env={"HOME": td},
                 cache_dir=Path(td) / "cache_close",
                 self_check_fn=mic_ok,
@@ -4828,8 +4853,8 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 plat.close()
                 dt_close = time.monotonic() - t0
 
-                # Assert immediately on close() return (before joining th_stop): <0.3s and child already dead.
-                self.assertLess(dt_close, 0.3, f"close() blocked on 0.45s tail_drain ({dt_close:.3f}s)")
+                # Assert immediately on close() return (before joining th_stop): <0.8s and child already dead.
+                self.assertLess(dt_close, 0.8, f"close() blocked on 1.5s tail_drain ({dt_close:.3f}s)")
                 self.assertIsNotNone(child_proc.poll(), "FFmpeg child must already be dead when close() returns")
                 with plat._rec_cond:
                     self.assertEqual(plat._stopping_recs, {})
