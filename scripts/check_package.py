@@ -58,6 +58,7 @@ CORE_SDIST_SUFFIXES: tuple[str, ...] = (
     "/README.md",
     "/README.zh-CN.md",
     "/SECURITY.md",
+    "/install.sh",
     "/config.example.toml",
     "/config.example.env",
     "/bin/agent-voice-input",

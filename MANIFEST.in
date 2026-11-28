@@ -1,5 +1,5 @@
 include LICENSE README.md README.zh-CN.md config.example.toml config.example.env
-include CHANGELOG.md ROADMAP.md AGENTS.md SECURITY.md
+include CHANGELOG.md ROADMAP.md AGENTS.md SECURITY.md install.sh
 include bin/agent-voice-input
 include src/agent_voice_input/win_shim.ps1
 recursive-include src/agent_voice_input/win_shim *.cs

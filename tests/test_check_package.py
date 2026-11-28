@@ -49,6 +49,7 @@ def _create_minimal_repo(
         "README.md",
         "README.zh-CN.md",
         "SECURITY.md",
+        "install.sh",
         "config.example.toml",
         "config.example.env",
         "bin/agent-voice-input",

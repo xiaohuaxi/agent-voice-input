@@ -2629,7 +2629,14 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
             "https://github.com/xiaohuaxi/agent-voice-input/blob/main/README.zh-CN.md",
             readme,
         )
-        self.assertIn("> **Tip:**", readme)
+        self.assertIn(
+            "https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/guide.md",
+            readme,
+        )
+        self.assertIn(
+            "https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/providers.md",
+            readme,
+        )
 
         pyp = parse_toml((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(pyp["project"]["version"], "0.18.1")
