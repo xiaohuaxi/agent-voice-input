@@ -90,7 +90,10 @@ if [ -z "$UV_BIN" ]; then
     rm -f "$TMP_UV"
     TMP_UV=""
     UV_BIN="$(find_uv || true)"
-    [ -n "$UV_BIN" ] && [ -x "$UV_BIN" ] || { printf 'error: uv binary not found after install\n' >&2; exit 1; }
+    if [ -z "$UV_BIN" ] || [ ! -x "$UV_BIN" ]; then
+      printf 'error: uv binary not found after install\n' >&2
+      exit 1
+    fi
   fi
 fi
 
