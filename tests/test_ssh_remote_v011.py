@@ -2705,6 +2705,22 @@ sys.exit(p.returncode)
                 release_probe.set()
                 mgr.close()
 
+    def test_validate_probe_response_schema_rejects_oversized_session_id_without_truncation(self) -> None:
+        from agent_voice_input.remote_ssh import _validate_probe_response_schema
+
+        valid_uuid = "12345678-1234-5678-1234-567812345678"
+        ok_resp = _validate_probe_response_schema(
+            {"ok": True, "cli": "claude", "session_id": valid_uuid, "turns": []}
+        )
+        self.assertEqual(ok_resp["session_id"], valid_uuid)
+
+        for bad_sid in ("a" * 129, "a" * 200, valid_uuid + "x" * 100, "", "   ", None, 42, "bad\nsid", "bad\x7fsid"):
+            with self.subTest(bad_sid=bad_sid):
+                with self.assertRaisesRegex(ValueError, "invalid remote session_id"):
+                    _validate_probe_response_schema(
+                        {"ok": True, "cli": "claude", "session_id": bad_sid, "turns": []}
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

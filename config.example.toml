@@ -72,7 +72,7 @@ position = "bottom"
 # Both archives live under ~/.agent-voice-input/ with 0700 dirs & 0600 files (ignored by default .gitignore)
 # and share a 1:1 short utterance ID (`YYYYMMDD-HHMMSS-<4hex>`) with diag.jsonl (which never stores spoken text).
 
-# Append 12-field JSONL records (draft + final text + metadata, never session context/hotwords/secrets)
+# Append 14-field JSONL records (draft + final text + metadata, never session context/hotwords/secrets)
 # to ~/.agent-voice-input/transcripts/YYYY-MM.jsonl (unlimited)
 save_transcripts = false
 

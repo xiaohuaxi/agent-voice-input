@@ -41,7 +41,7 @@ def _render_init_config_toml(
         '# effort = ""\n\n'
         "[archive]\n"
         "# Optional local dictation history under ~/.agent-voice-input/ (0700 dirs, 0600 files; both off by default)\n"
-        "# save_transcripts = false    # Monthly 12-field JSONL in transcripts/YYYY-MM.jsonl\n"
+        "# save_transcripts = false    # Monthly 14-field JSONL in transcripts/YYYY-MM.jsonl\n"
         "# save_audio = false          # 16 kHz 64 kbps MP3 in audio/<id>.mp3 (audio_max_count = 1000; 0 = unlimited)\n"
     )
 
@@ -1802,6 +1802,8 @@ class _DoctorState:
     migration_hint: str = ""
     placeholder_hits: list[tuple[str, Path]] = dataclasses.field(default_factory=list)
     placeholder_keys: frozenset[str] = frozenset()
+    asr_placeholder_key: str | None = None
+    ref_placeholder_key: str | None = None
 
     def clean(self, text: str) -> str:
         from .config import redact_secrets
@@ -2279,6 +2281,106 @@ def _stage_placeholder_key(
     return item.source_env if (item is not None and item.source_env in placeholder_keys) else None
 
 
+def _is_alternative_provider_placeholder(
+    stage: str,
+    provider: str,
+    cfg: Config,
+    creds: ProviderCredentials,
+    env: Mapping[str, str],
+    placeholder_keys: frozenset[str],
+) -> bool:
+    """Return True when an alternative provider's effective credentials rely on a .env template placeholder."""
+    if not placeholder_keys:
+        return False
+    if stage == "refiner" and provider == "codex":
+        from .config import detect_codex_local_auth
+
+        codex_mode, codex_src = detect_codex_local_auth(env)
+        return (
+            codex_mode == "api_key"
+            and codex_src == "env"
+            and "OPENAI_API_KEY" in placeholder_keys
+        )
+    return _stage_placeholder_key(stage, provider, cfg, creds, placeholder_keys) is not None
+
+
+def _rebuild_doctor_pipeline_summary(pipeline: dict[str, Any]) -> None:
+    """Rebuild ``pipeline['summary']`` from the current ``asr`` and ``refiner`` sub-dicts."""
+    asr_info = pipeline["asr"]
+    ref_info = pipeline["refiner"]
+
+    eff_asr = str(asr_info.get("provider") or "")
+    eff_asr_model = str(asr_info.get("model") or "")
+    asr_reason = str(asr_info.get("reason") or "")
+    asr_part = f"ASR {eff_asr}/{eff_asr_model} ({asr_reason})"
+
+    raw_ref_prov = str(ref_info.get("configured_provider") or "")
+    resolved_ref = str(ref_info.get("provider") or "")
+    eff_ref_model = str(ref_info.get("model") or "")
+    ref_reason = str(ref_info.get("reason") or "")
+    if raw_ref_prov == "off":
+        ref_part = "Refiner off"
+    elif ref_info.get("bypassed"):
+        ref_part = "Refiner bypassed (single-hop ASR)"
+    elif resolved_ref == "off":
+        ref_part = f"Refiner off ({ref_reason})"
+    else:
+        ref_part = f"Refiner {resolved_ref}/{eff_ref_model} ({ref_reason})"
+
+    asr_alts = [str(p) for p in (asr_info.get("alternatives") or [])]
+    ref_alts = [str(p) for p in (ref_info.get("alternatives") or [])]
+    alt_bits: list[str] = []
+    if asr_alts:
+        alt_bits.append(f"asr=[{', '.join(asr_alts)}]")
+    if ref_alts:
+        alt_bits.append(f"refiner=[{', '.join(ref_alts)}]")
+    alt_tail = f" | alternatives: {', '.join(alt_bits)}" if alt_bits else ""
+    pipeline["summary"] = f"{asr_part} -> {ref_part}{alt_tail}"
+
+
+def _sync_doctor_pipeline_placeholders(st: _DoctorState) -> None:
+    """Reconcile ``st.pipeline`` reasons and alternatives against ``.env`` placeholder keys."""
+    if not st.placeholder_keys:
+        return
+    asr_info = st.pipeline["asr"]
+    ref_info = st.pipeline["refiner"]
+
+    asr_alts = [
+        p
+        for p in (asr_info.get("alternatives") or [])
+        if not _is_alternative_provider_placeholder("asr", str(p), st.cfg, st.creds, st.env, st.placeholder_keys)
+    ]
+    ref_alts = [
+        p
+        for p in (ref_info.get("alternatives") or [])
+        if not _is_alternative_provider_placeholder("refiner", str(p), st.cfg, st.creds, st.env, st.placeholder_keys)
+    ]
+    asr_info["alternatives"] = asr_alts
+    ref_info["alternatives"] = ref_alts
+
+    if st.asr_placeholder_key:
+        asr_info["ready"] = False
+        raw_asr_reason = str(asr_info.get("reason") or "")
+        if raw_asr_reason.startswith("auto priority ("):
+            asr_info["reason"] = f"placeholder key in .env: {st.asr_placeholder_key}"
+        elif "placeholder key" not in raw_asr_reason:
+            asr_info["reason"] = f"{raw_asr_reason}; placeholder key in .env: {st.asr_placeholder_key}"
+
+    if st.ref_placeholder_key:
+        ref_info["ready"] = False
+        raw_ref_reason = str(ref_info.get("reason") or "")
+        if raw_ref_reason.startswith(("auto priority (", "auto fallback to Codex API key")):
+            ref_info["reason"] = f"placeholder key in .env: {st.ref_placeholder_key}"
+        elif "placeholder key" not in raw_ref_reason:
+            ref_info["reason"] = f"{raw_ref_reason}; placeholder key in .env: {st.ref_placeholder_key}"
+
+
+def _emit_doctor_pipeline(st: _DoctorState) -> None:
+    _sync_doctor_pipeline_placeholders(st)
+    _rebuild_doctor_pipeline_summary(st.pipeline)
+    st.emit(f"[pipeline]  {st.pipeline['summary']}")
+
+
 def _doctor_check_asr(st: _DoctorState) -> None:
     cfg, creds = st.cfg, st.creds
     asr_info = st.pipeline["asr"]
@@ -2287,6 +2389,7 @@ def _doctor_check_asr(st: _DoctorState) -> None:
     st.eff_asr_url = cfg.asr.effective_base_url(st.eff_asr)
     st.eff_asr_api = str(asr_info["api"])
     asr_ph_key = _stage_placeholder_key("asr", st.eff_asr, cfg, creds, st.placeholder_keys)
+    st.asr_placeholder_key = asr_ph_key
     st.asr_ready = bool(asr_info["ready"]) and not bool(asr_ph_key)
     if asr_ph_key:
         asr_info["ready"] = False
@@ -2646,21 +2749,21 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
 
     if raw_ref_prov == "off":
         st.emit("[refiner]   off")
-        st.emit(f"[pipeline]  {st.pipeline['summary']}")
+        _emit_doctor_pipeline(st)
         return
     if ref_info["bypassed"]:
         target_lbl = st.resolved_ref_prov if raw_ref_prov != "auto" else "Stage 2"
         st.emit(
             f"[refiner]   bypassed (single-hop ASR passthrough{extra_tag}; set refiner.force_on_single_hop=true to run {target_lbl})"
         )
-        st.emit(f"[pipeline]  {st.pipeline['summary']}")
+        _emit_doctor_pipeline(st)
         return
     if raw_ref_prov == "auto" and st.resolved_ref_prov == "off":
         st.emit(
             "[refiner]   WARN auto -> off (no Stage 2 credentials set; raw Stage 1 ASR draft will be delivered. "
             "Optional fix: set DEEPSEEK_API_KEY / DASHSCOPE_API_KEY or run 'codex login')"
         )
-        st.emit(f"[pipeline]  {st.pipeline['summary']}")
+        _emit_doctor_pipeline(st)
         return
     if st.resolved_ref_prov == "codex":
         eff_ref_api = str(ref_info["api"])
@@ -2673,13 +2776,14 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
             "refiner", "codex", cfg, st.creds, st.placeholder_keys, ref_info=ref_info
         )
         if ref_ph_key:
+            st.ref_placeholder_key = ref_ph_key
             ref_info["ready"] = False
             st.ok_all = False
             st.emit(
                 f"[refiner]   FAIL (PLACEHOLDER KEY) {prov_disp} (model={st.eff_ref_model}, "
                 f"api={eff_ref_api}, effort={eff_ref_effort}{extra_tag})"
             )
-            st.emit(f"[pipeline]  {st.pipeline['summary']}")
+            _emit_doctor_pipeline(st)
             return
         auth_state, auth_note = inspect_codex_auth_status(cfg, st.env)
         if (
@@ -2687,13 +2791,14 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
             and auth_note == "auth=api_key (OPENAI_API_KEY)"
             and "OPENAI_API_KEY" in st.placeholder_keys
         ):
+            st.ref_placeholder_key = "OPENAI_API_KEY"
             ref_info["ready"] = False
             st.ok_all = False
             st.emit(
                 f"[refiner]   FAIL (PLACEHOLDER KEY) {prov_disp} (model={st.eff_ref_model}, "
                 f"api={eff_ref_api}, effort={eff_ref_effort}{extra_tag})"
             )
-            st.emit(f"[pipeline]  {st.pipeline['summary']}")
+            _emit_doctor_pipeline(st)
             return
         if auth_state in ("OK", "WARN"):
             st.ref_ping_needed = True
@@ -2705,6 +2810,8 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
                 f"effort={eff_ref_effort}, {auth_note}{bin_tag}{extra_tag})"
             )
         else:
+            ref_info["ready"] = False
+            ref_info["reason"] = st.clean(auth_note)
             st.emit(
                 f"[refiner]   FAIL {prov_disp} (model={st.eff_ref_model}, api={eff_ref_api}, "
                 f"effort={eff_ref_effort}{extra_tag}) -> {auth_note}"
@@ -2712,7 +2819,7 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
             env_path = _display_env_file_path(st.env, config_path=cfg.config_path or None)
             st.emit_fix(f"run 'codex login' or set DEEPSEEK_API_KEY / DASHSCOPE_API_KEY in {env_path}")
             st.ok_all = False
-        st.emit(f"[pipeline]  {st.pipeline['summary']}")
+        _emit_doctor_pipeline(st)
         return
     if st.resolved_ref_prov == "agy":
         eff_ref_api = str(ref_info["api"])
@@ -2734,7 +2841,7 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
             )
             st.emit_fix("install Antigravity CLI ('agy'), set AGY_BIN, or switch refiner.provider")
             st.ok_all = False
-        st.emit(f"[pipeline]  {st.pipeline['summary']}")
+        _emit_doctor_pipeline(st)
         return
 
     eff_ref_api = str(ref_info["api"])
@@ -2747,6 +2854,7 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
     ref_ph_key = _stage_placeholder_key(
         "refiner", st.resolved_ref_prov, cfg, st.creds, st.placeholder_keys, ref_info=ref_info
     )
+    st.ref_placeholder_key = ref_ph_key
     ref_ready = bool(ref_info["ready"]) and not bool(ref_ph_key)
     if ref_ph_key:
         ref_info["ready"] = False
@@ -2770,7 +2878,7 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
                 st.emit_fix(f"set {cfg.refiner.api_key_env.strip()} in {env_path}")
             else:
                 st.emit_fix(_missing_key_hint(st.resolved_ref_prov, stage="refiner"))
-    st.emit(f"[pipeline]  {st.pipeline['summary']}")
+    _emit_doctor_pipeline(st)
 
 
 def _doctor_run_pings(

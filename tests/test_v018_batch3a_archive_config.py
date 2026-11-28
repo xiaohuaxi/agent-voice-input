@@ -457,7 +457,7 @@ class Batch3AArchiveEngineTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(os.lstat(audio_dir).st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(os.lstat(saved_audio[0]).st_mode), 0o600)
 
-            # Verify transcripts monthly JSONL permissions & exact 12 flat fields
+            # Verify transcripts monthly JSONL permissions & exact 14 flat fields
             tr_files = sorted(tr_dir.glob("*.jsonl"))
             self.assertEqual(len(tr_files), 1)
             self.assertRegex(tr_files[0].name, r"^\d{4}-\d{2}\.jsonl$")
@@ -473,6 +473,8 @@ class Batch3AArchiveEngineTests(unittest.TestCase):
                 "id",
                 "ts",
                 "mode",
+                "agent",
+                "agent_session_id",
                 "duration_sec",
                 "asr_provider",
                 "asr_model",
@@ -485,6 +487,8 @@ class Batch3AArchiveEngineTests(unittest.TestCase):
             ]
             for row in rows:
                 self.assertEqual(list(row.keys()), expected_keys)
+                self.assertIsNone(row["agent"])
+                self.assertIsNone(row["agent_session_id"])
                 self.assertRegex(row["id"], UTTERANCE_ID_RE)
                 self.assertIsNotNone(parse_diag_ts(row["ts"]))
                 self.assertIn("T", row["ts"])
@@ -521,6 +525,476 @@ class Batch3AArchiveEngineTests(unittest.TestCase):
             self.assertIs(rows[3]["refiner_fallback"], False)
             self.assertIsNone(rows[3]["draft"])
             self.assertEqual(rows[3]["final"], "单跳直接精修D")
+
+    def test_transcript_archive_agent_and_session_id_fields(self) -> None:
+        from agent_voice_input.daemon_pipeline import PipelineResult, _build_transcript_archive_record
+        from agent_voice_input.session_ctx import SessionSnapshot
+        from agent_voice_input.workspace_ctx import SessionMatch
+
+        wav = _voiced_wav(0.6)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            home.mkdir()
+            rt.mkdir(mode=0o700)
+            env = {
+                "HOME": str(home),
+                "AGENT_VOICE_INPUT_HOME": str(home / ".agent-voice-input"),
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+            }
+            tr_dir = resolve_archive_transcripts_dir(env)
+            cfg = Config(
+                archive=ArchiveConfig(save_transcripts=True, save_audio=False),
+                refiner=RefinerConfig(provider="agy"),
+            )
+
+            class _MatchedTracker(SessionTracker):
+                def __init__(self, snap: SessionSnapshot | None) -> None:
+                    super().__init__(home_dir=home, runtime_dir=rt, proc_root=root / "no_proc", env=env)
+                    self._fixed_snap = snap
+
+                def sync_session(self, *args: object, **kwargs: object) -> SessionSnapshot | None:
+                    return self._fixed_snap
+
+            # 1. Agent mode with matched CLI session (e.g. claude) records agent + agent_session_id
+            #    and never leaks refiner session id, context text, or hotwords.
+            cli_snap = SessionSnapshot(
+                match=SessionMatch(
+                    cli="claude",
+                    session_id="550e8400-e29b-41d4-a716-446655440000",
+                    jsonl_path="/tmp/claude.jsonl",
+                    cwd=str(root),
+                    matched_by="tty_registry",
+                ),
+                clean_turns=(("user", "SECRET_CONTEXT_SHOULD_NOT_APPEAR"),),
+                generation=1,
+                git_status="M secret.py",
+                hotwords=("SecretHotword",),
+                byte_offset=128,
+            )
+            res_cli = run_pipeline_once(
+                wav,
+                cfg=cfg,
+                tracker=_MatchedTracker(cli_snap),
+                asr_provider=_StubAsr("草稿1", provider="dashscope", model="qwen3-asr-flash"),
+                refiner=_StubRefiner("终稿1", provider="agy", model="gemini-3-flash"),
+                audio_source="avfoundation",
+                dry_run=True,
+                runtime_dir=rt,
+                env=env,
+                mode="agent",
+            )
+            self.assertTrue(res_cli.ok)
+
+            # 2. Agent mode with desktop match (e.g. codex_desktop_db / claude_desktop_code / ide_db_title)
+            desktop_snap = SessionSnapshot(
+                match=SessionMatch(
+                    cli="codex",
+                    session_id="019c8e12-1111-2222-3333-444455556666",
+                    jsonl_path="/tmp/codex.jsonl",
+                    cwd=str(root),
+                    matched_by="codex_desktop_db",
+                ),
+                clean_turns=(),
+                generation=1,
+                git_status="",
+                hotwords=(),
+                byte_offset=0,
+            )
+            res_desk = run_pipeline_once(
+                wav,
+                cfg=cfg,
+                tracker=_MatchedTracker(desktop_snap),
+                asr_provider=_StubAsr("草稿2", provider="dashscope", model="qwen3-asr-flash"),
+                refiner=_StubRefiner("终稿2", provider="agy", model="gemini-3-flash"),
+                audio_source="avfoundation",
+                dry_run=True,
+                runtime_dir=rt,
+                env=env,
+                mode="agent",
+            )
+            self.assertTrue(res_desk.ok)
+
+            # 3. Agent mode cold start (no matched session -> both null)
+            res_cold = run_pipeline_once(
+                wav,
+                cfg=cfg,
+                tracker=_MatchedTracker(None),
+                asr_provider=_StubAsr("草稿3", provider="dashscope", model="qwen3-asr-flash"),
+                refiner=_StubRefiner("终稿3", provider="agy", model="gemini-3-flash"),
+                audio_source="avfoundation",
+                dry_run=True,
+                runtime_dir=rt,
+                env=env,
+                mode="agent",
+            )
+            self.assertTrue(res_cold.ok)
+
+            # 4. General mode -> both agent and agent_session_id MUST be null
+            res_gen = run_pipeline_once(
+                wav,
+                cfg=cfg,
+                tracker=_MatchedTracker(cli_snap),
+                asr_provider=_StubAsr("草稿4", provider="dashscope", model="qwen3-asr-flash"),
+                refiner=_StubRefiner("终稿4", provider="agy", model="gemini-3-flash"),
+                audio_source="avfoundation",
+                dry_run=True,
+                runtime_dir=rt,
+                env=env,
+                mode="general",
+            )
+            self.assertTrue(res_gen.ok)
+
+            tr_files = sorted(tr_dir.glob("*.jsonl"))
+            self.assertEqual(len(tr_files), 1)
+            raw_text = tr_files[0].read_text(encoding="utf-8")
+            self.assertNotIn("SECRET_CONTEXT_SHOULD_NOT_APPEAR", raw_text)
+            self.assertNotIn("SecretHotword", raw_text)
+            self.assertNotIn("avi-refiner", raw_text)
+            rows = [json.loads(ln) for ln in raw_text.splitlines() if ln.strip()]
+            self.assertEqual(len(rows), 4)
+
+            self.assertEqual(rows[0]["mode"], "agent")
+            self.assertEqual(rows[0]["agent"], "claude")
+            self.assertEqual(rows[0]["agent_session_id"], "550e8400-e29b-41d4-a716-446655440000")
+
+            self.assertEqual(rows[1]["mode"], "agent")
+            self.assertEqual(rows[1]["agent"], "codex")
+            self.assertEqual(rows[1]["agent_session_id"], "019c8e12-1111-2222-3333-444455556666")
+
+            self.assertEqual(rows[2]["mode"], "agent")
+            self.assertIsNone(rows[2]["agent"])
+            self.assertIsNone(rows[2]["agent_session_id"])
+
+            self.assertEqual(rows[3]["mode"], "general")
+            self.assertIsNone(rows[3]["agent"])
+            self.assertIsNone(rows[3]["agent_session_id"])
+
+        # Direct unit checks on _build_transcript_archive_record edge cases:
+        asr_ok = AsrResult(text="raw", provider="dashscope", model="qwen3-asr-flash", latency_ms=10)
+        # (a) Agent known, session_id empty (cold start) -> agent set, agent_session_id None
+        snap_no_sid = SessionSnapshot(
+            match=SessionMatch(cli="AGY", session_id="", jsonl_path="", cwd="", matched_by="explicit"),
+            clean_turns=(),
+            generation=1,
+            git_status="",
+            hotwords=(),
+            byte_offset=0,
+        )
+        rec_no_sid = _build_transcript_archive_record(
+            PipelineResult(ok=True, seq_id=1, final_text="ok", asr=asr_ok, session=snap_no_sid, mode="agent"),
+            utterance_id="20261128-100000-abcd",
+            ts_iso="2026-11-28T10:00:00+08:00",
+        )
+        self.assertEqual(rec_no_sid["agent"], "agy")
+        self.assertIsNone(rec_no_sid["agent_session_id"])
+
+        # (b) Synthetic remote_cwd_only / pending- remote placeholder -> both None
+        for bad_match in (
+            SessionMatch(cli="workspace", session_id="cwd-1234567890ab", jsonl_path="", cwd="/srv/repo", matched_by="remote_cwd_only"),
+            SessionMatch(cli="remote", session_id="pending-devbox", jsonl_path="", cwd="", matched_by="remote_whitelist"),
+        ):
+            snap_bad = SessionSnapshot(match=bad_match, clean_turns=(), generation=1, git_status="", hotwords=(), byte_offset=0)
+            rec_bad = _build_transcript_archive_record(
+                PipelineResult(ok=True, seq_id=1, final_text="ok", asr=asr_ok, session=snap_bad, mode="agent"),
+                utterance_id="20261128-100001-abcd",
+                ts_iso="2026-11-28T10:00:01+08:00",
+            )
+            self.assertIsNone(rec_bad["agent"])
+            self.assertIsNone(rec_bad["agent_session_id"])
+
+        # (c) General mode even if session snapshot is attached -> both None
+        rec_gen_forced = _build_transcript_archive_record(
+            PipelineResult(ok=True, seq_id=1, final_text="ok", asr=asr_ok, session=cli_snap, mode="general"),
+            utterance_id="20261128-100002-abcd",
+            ts_iso="2026-11-28T10:00:02+08:00",
+        )
+        self.assertIsNone(rec_gen_forced["agent"])
+        self.assertIsNone(rec_gen_forced["agent_session_id"])
+
+    def test_transcript_archive_rejects_untrusted_ssh_session_id_and_secrets(self) -> None:
+        from agent_voice_input.session_ctx import SessionSnapshot
+        from agent_voice_input.workspace_ctx import SessionMatch
+
+        wav = _voiced_wav(0.6)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            home.mkdir()
+            rt.mkdir(mode=0o700)
+            custom_secret = "custom-env-secret-value-4321"
+            env = {
+                "HOME": str(home),
+                "AGENT_VOICE_INPUT_HOME": str(home / ".agent-voice-input"),
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                "MY_CUSTOM_TOKEN": custom_secret,
+            }
+            tr_dir = resolve_archive_transcripts_dir(env)
+            cfg = Config(
+                archive=ArchiveConfig(save_transcripts=True, save_audio=False),
+                refiner=RefinerConfig(provider="off"),
+            )
+
+            class _RemoteTracker(SessionTracker):
+                def __init__(self, snap: SessionSnapshot) -> None:
+                    super().__init__(home_dir=home, runtime_dir=rt, proc_root=root / "no_proc", env=env)
+                    self._fixed_snap = snap
+
+                def sync_session(self, *args: object, **kwargs: object) -> SessionSnapshot | None:
+                    return self._fixed_snap
+
+            malicious_sids = [
+                "sk-" + ("9" * 24),
+                "gsk_" + ("8" * 24),
+                "ghp_" + ("7" * 36),
+                ("AIza" + ("6" * 35)).lower(),
+                "Bearer_tok_" + ("5" * 16),
+                custom_secret,
+                "bad/session:id?x=1",
+                "x" * 129,
+                "valid..traversal",
+            ]
+            cases: list[tuple[str, str]] = [("codex", sid) for sid in malicious_sids]
+            cases.append(("bad/agent name", "550e8400-e29b-41d4-a716-446655440000"))
+            cases.append(("claude", "550e8400-e29b-41d4-a716-446655440000"))
+
+            for idx, (cli_val, sid_val) in enumerate(cases):
+                snap = SessionSnapshot(
+                    match=SessionMatch(
+                        cli=cli_val,
+                        session_id=sid_val,
+                        jsonl_path="",
+                        cwd="/srv/app",
+                        matched_by="remote_ssh",
+                        origin="remote",
+                        host_name="devbox",
+                    ),
+                    clean_turns=(),
+                    generation=1,
+                    git_status="",
+                    hotwords=(),
+                    byte_offset=0,
+                )
+                res = run_pipeline_once(
+                    wav,
+                    cfg=cfg,
+                    tracker=_RemoteTracker(snap),
+                    asr_provider=_StubAsr(f"草稿{idx}", provider="dashscope", model="qwen3-asr-flash"),
+                    refiner=NoopRefiner(),
+                    audio_source="avfoundation",
+                    dry_run=True,
+                    runtime_dir=rt,
+                    env=env,
+                    mode="agent",
+                )
+                self.assertTrue(res.ok)
+
+            tr_files = sorted(tr_dir.glob("*.jsonl"))
+            self.assertEqual(len(tr_files), 1)
+            raw_text = tr_files[0].read_text(encoding="utf-8")
+            for bad in malicious_sids:
+                self.assertNotIn(bad, raw_text)
+            self.assertNotIn("bad/agent name", raw_text)
+
+            rows = [json.loads(ln) for ln in raw_text.splitlines() if ln.strip()]
+            self.assertEqual(len(rows), len(cases))
+            for i in range(len(malicious_sids)):
+                self.assertEqual(rows[i]["agent"], "codex")
+                self.assertIsNone(rows[i]["agent_session_id"])
+            # Invalid agent drops both agent and agent_session_id
+            self.assertIsNone(rows[-2]["agent"])
+            self.assertIsNone(rows[-2]["agent_session_id"])
+            # Valid remote SSH UUID is preserved
+            self.assertEqual(rows[-1]["agent"], "claude")
+            self.assertEqual(rows[-1]["agent_session_id"], "550e8400-e29b-41d4-a716-446655440000")
+
+    def test_remote_probe_schema_to_transcript_archive_e2e_session_id_enforcement(self) -> None:
+        from agent_voice_input.config import RemoteConfig, RemoteHostConfig
+        from agent_voice_input.daemon_pipeline import PipelineResult, _extract_transcript_agent_fields
+        from agent_voice_input.remote_ssh import _validate_probe_response_schema
+        from agent_voice_input.session_ctx import SessionSnapshot
+        from agent_voice_input.workspace_ctx import SessionMatch
+
+        wav = _voiced_wav(0.6)
+        hex_token_64 = "deadbeef" * 8
+        hex_token_32 = "a1b2c3d4" * 4
+        oversized_sid = "12345678-1234-5678-1234-567812345678" + ("x" * 170)
+        oversized_plain = "a" * 200
+        valid_uuid = "12345678-1234-5678-1234-567812345678"
+
+        # 1. Schema validation rejects oversized (>128) and non-string session_id without [:128] truncation
+        for bad_raw_sid in (oversized_plain, oversized_sid, None, 12345, "abc\x7fdef"):
+            with self.assertRaisesRegex(ValueError, "invalid remote session_id"):
+                _validate_probe_response_schema(
+                    {
+                        "ok": True,
+                        "cli": "claude",
+                        "session_id": bad_raw_sid,
+                        "matched_by": "remote_proc",
+                        "turns": [],
+                    }
+                )
+
+        # 2. End-to-end flow: _validate_probe_response_schema -> SessionTracker._apply_remote_probe_response
+        #    -> run_pipeline_once -> _extract_transcript_agent_fields -> monthly JSONL archive
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            rt = root / "rt"
+            home.mkdir()
+            rt.mkdir(mode=0o700)
+            env = {
+                "HOME": str(home),
+                "AGENT_VOICE_INPUT_HOME": str(home / ".agent-voice-input"),
+                "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+            }
+            tr_dir = resolve_archive_transcripts_dir(env)
+            hcfg = RemoteHostConfig(name="devbox", ssh_target="devbox")
+            cfg = Config(
+                archive=ArchiveConfig(save_transcripts=True, save_audio=False),
+                refiner=RefinerConfig(provider="off"),
+                remote=RemoteConfig(hosts=(hcfg,)),
+            )
+
+            class _ProbeFlowTracker(SessionTracker):
+                def __init__(self, raw_payload: dict[str, object]) -> None:
+                    super().__init__(
+                        home_dir=home,
+                        runtime_dir=rt,
+                        proc_root=root / "no_proc",
+                        env=env,
+                        remote_cfg=cfg.remote,
+                    )
+                    self._raw_payload = raw_payload
+
+                def sync_session(self, *args: object, **kwargs: object) -> SessionSnapshot | None:
+                    try:
+                        validated = _validate_probe_response_schema(dict(self._raw_payload))
+                    except ValueError:
+                        return None
+                    st = self._apply_remote_probe_response(hcfg, validated, req_max_chars=200000)
+                    if st is None:
+                        return None
+                    return SessionSnapshot(
+                        match=SessionMatch(
+                            cli=st.cli,
+                            session_id=st.session_id,
+                            jsonl_path="",
+                            cwd=st.cwd,
+                            matched_by=str(validated.get("matched_by") or "remote"),
+                            origin="remote",
+                            host_name=hcfg.name,
+                        ),
+                        clean_turns=tuple(st.clean_turns),
+                        generation=st.generation,
+                        git_status="",
+                        hotwords=(),
+                        byte_offset=0,
+                    )
+
+            probe_payloads = [
+                # (a) Pure 64-char hex token -> schema parses, archive MUST drop agent_session_id to null
+                {"ok": True, "cli": "claude", "session_id": hex_token_64, "matched_by": "remote_proc", "turns": []},
+                # (b) Pure 32-char hex token -> archive MUST drop agent_session_id to null
+                {"ok": True, "cli": "codex", "session_id": hex_token_32, "matched_by": "remote_registry", "turns": []},
+                # (c) Arbitrary free string from remote -> archive MUST drop agent_session_id to null
+                {"ok": True, "cli": "agy", "session_id": "sess-123", "matched_by": "remote_title_token", "turns": []},
+                # (d) Oversized 200-char session_id -> rejected at schema entry (no truncation) -> null in archive
+                {"ok": True, "cli": "claude", "session_id": oversized_plain, "matched_by": "remote_proc", "turns": []},
+                # (e) Standard UUID -> passes schema and archives cleanly
+                {"ok": True, "cli": "claude", "session_id": valid_uuid, "matched_by": "remote_proc", "turns": []},
+            ]
+
+            for idx, payload in enumerate(probe_payloads):
+                res = run_pipeline_once(
+                    wav,
+                    cfg=cfg,
+                    tracker=_ProbeFlowTracker(payload),
+                    asr_provider=_StubAsr(f"远端回归{idx}", provider="dashscope", model="qwen3-asr-flash"),
+                    refiner=NoopRefiner(),
+                    audio_source="avfoundation",
+                    dry_run=True,
+                    runtime_dir=rt,
+                    env=env,
+                    mode="agent",
+                )
+                self.assertTrue(res.ok)
+
+            tr_files = sorted(tr_dir.glob("*.jsonl"))
+            self.assertEqual(len(tr_files), 1)
+            raw_text = tr_files[0].read_text(encoding="utf-8")
+            self.assertNotIn(hex_token_64, raw_text)
+            self.assertNotIn(hex_token_32, raw_text)
+            self.assertNotIn("sess-123", raw_text)
+            self.assertNotIn("a" * 32, raw_text)
+
+            rows = [json.loads(ln) for ln in raw_text.splitlines() if ln.strip()]
+            self.assertEqual(len(rows), 5)
+            # (a) 64-hex token
+            self.assertEqual(rows[0]["agent"], "claude")
+            self.assertIsNone(rows[0]["agent_session_id"])
+            # (b) 32-hex token
+            self.assertEqual(rows[1]["agent"], "codex")
+            self.assertIsNone(rows[1]["agent_session_id"])
+            # (c) remote free-form string
+            self.assertEqual(rows[2]["agent"], "agy")
+            self.assertIsNone(rows[2]["agent_session_id"])
+            # (d) oversized 200-char sid rejected at schema entry -> no session bound
+            self.assertIsNone(rows[3]["agent"])
+            self.assertIsNone(rows[3]["agent_session_id"])
+            # (e) standard UUID preserved
+            self.assertEqual(rows[4]["agent"], "claude")
+            self.assertEqual(rows[4]["agent_session_id"], valid_uuid)
+
+        # 3. Local trusted sessions still allow legitimate local ID formats (e.g. mock sess-123, Claude local_<uuid>),
+        #    while remote_ matched_by (even without origin/host_name) enforces strict UUID format.
+        local_snap = SessionSnapshot(
+            match=SessionMatch(cli="claude", session_id="sess-123", jsonl_path="/tmp/c.jsonl", matched_by="tty_registry"),
+            clean_turns=(),
+            generation=1,
+            git_status="",
+            hotwords=(),
+            byte_offset=0,
+        )
+        local_cowork_snap = SessionSnapshot(
+            match=SessionMatch(
+                cli="claude",
+                session_id="local_550e8400-e29b-41d4-a716-446655440000",
+                jsonl_path="/tmp/cw.jsonl",
+                matched_by="claude_desktop_cowork",
+            ),
+            clean_turns=(),
+            generation=1,
+            git_status="",
+            hotwords=(),
+            byte_offset=0,
+        )
+        remote_matched_by_only_snap = SessionSnapshot(
+            match=SessionMatch(cli="codex", session_id=hex_token_64, jsonl_path="", matched_by="remote_ssh"),
+            clean_turns=(),
+            generation=1,
+            git_status="",
+            hotwords=(),
+            byte_offset=0,
+        )
+        self.assertEqual(
+            _extract_transcript_agent_fields(PipelineResult(ok=True, seq_id=1, session=local_snap, mode="agent"), "agent"),
+            ("claude", "sess-123"),
+        )
+        self.assertEqual(
+            _extract_transcript_agent_fields(
+                PipelineResult(ok=True, seq_id=2, session=local_cowork_snap, mode="agent"), "agent"
+            ),
+            ("claude", "local_550e8400-e29b-41d4-a716-446655440000"),
+        )
+        self.assertEqual(
+            _extract_transcript_agent_fields(
+                PipelineResult(ok=True, seq_id=3, session=remote_matched_by_only_snap, mode="agent"), "agent"
+            ),
+            ("codex", None),
+        )
 
     def test_audio_failure_still_writes_transcript_with_null_audio_file_and_symlink_refused(self) -> None:
         wav = _voiced_wav(0.5)

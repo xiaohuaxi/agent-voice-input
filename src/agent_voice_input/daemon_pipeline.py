@@ -7,6 +7,7 @@ import hashlib
 import math
 import os
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -102,6 +103,16 @@ DEFAULT_PASTE_SETTLE_SEC: float = 0.15
 
 _SAFE_SESSION_ID_CHARS: frozenset[str] = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+)
+_TRANSCRIPT_AGENT_RE: re.Pattern[str] = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_TRANSCRIPT_SESSION_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_TRANSCRIPT_REMOTE_SESSION_ID_RE: re.Pattern[str] = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_SUSPICIOUS_SESSION_SECRET_RE: re.Pattern[str] = re.compile(
+    r"(?:^|[._-])(?:sk[-_]|pk_|rk_|gsk_|gh[pousr]_|github_pat_|glpat-|xox[bpar]-|"
+    r"aiza|akia|asia|bearer|eyj[a-z0-9_-]{5,}\.|hf_|npm_|pypi-|ya29\.)",
+    re.IGNORECASE,
 )
 _KNOWN_MATCHED_BY: frozenset[str] = frozenset(
     {
@@ -913,13 +924,81 @@ def _make_pipeline_result(
     )
 
 
+def _is_valid_transcript_token(
+    val: str,
+    pattern: re.Pattern[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    cfg: Config | None = None,
+    extra_secrets: Sequence[str] = (),
+) -> bool:
+    if not val or ".." in val or not pattern.fullmatch(val):
+        return False
+    if _SUSPICIOUS_SESSION_SECRET_RE.search(val):
+        return False
+    return redact_secrets(val, env, cfg=cfg, extra_secrets=extra_secrets) == val
+
+
+def _extract_transcript_agent_fields(
+    res: PipelineResult,
+    eff_mode: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    cfg: Config | None = None,
+    extra_secrets: Sequence[str] = (),
+) -> tuple[str | None, str | None]:
+    """Return validated ``(agent, agent_session_id)`` for ``agent`` mode only.
+
+    Rejects synthetic placeholders, malformed identifiers, and secret-like strings
+    (e.g. untrusted cross-boundary SSH remote probe payloads) so sensitive values
+    are never written to monthly transcript archives.
+    """
+    if eff_mode != "agent" or res.session is None:
+        return None, None
+    m = getattr(res.session, "match", None)
+    if m is None:
+        return None, None
+    raw_cli = str(getattr(m, "cli", "") or "").strip().lower()
+    raw_sid = str(getattr(m, "session_id", "") or "").strip()
+    matched_by = str(getattr(m, "matched_by", "") or "").strip().lower()
+    if matched_by == "remote_cwd_only" or raw_cli in ("workspace", "remote"):
+        return None, None
+    if not _is_valid_transcript_token(
+        raw_cli, _TRANSCRIPT_AGENT_RE, env=env, cfg=cfg, extra_secrets=extra_secrets
+    ):
+        return None, None
+    agent: str | None = raw_cli
+    origin = str(getattr(m, "origin", "") or "").strip().lower()
+    host_name = str(getattr(m, "host_name", "") or "").strip()
+    is_remote = (
+        origin == "remote"
+        or bool(host_name)
+        or matched_by == "remote"
+        or matched_by.startswith("remote_")
+    )
+    sid_pattern = _TRANSCRIPT_REMOTE_SESSION_ID_RE if is_remote else _TRANSCRIPT_SESSION_ID_RE
+    agent_sid: str | None = None
+    if (
+        raw_sid
+        and not raw_sid.lower().startswith("pending-")
+        and _is_valid_transcript_token(
+            raw_sid, sid_pattern, env=env, cfg=cfg, extra_secrets=extra_secrets
+        )
+    ):
+        agent_sid = raw_sid
+    return agent, agent_sid
+
+
 def _build_transcript_archive_record(
     res: PipelineResult,
     *,
     utterance_id: str,
     ts_iso: str,
+    env: Mapping[str, str] | None = None,
+    cfg: Config | None = None,
+    extra_secrets: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """Build the canonical 12-field flat transcript record (strictly zero context/hotwords/secrets)."""
+    """Build the canonical 14-field flat transcript record (strictly zero context/hotwords/secrets)."""
     asr_res = res.asr
     ref_res = res.refined
     asr_provider = (asr_res.provider if asr_res else "").strip()
@@ -952,10 +1031,17 @@ def _build_transcript_archive_record(
         refiner_fallback = bool(fb_val and fb_val != "single_hop_passthrough")
         draft = asr_draft
 
+    eff_mode = "general" if res.mode == "general" else "agent"
+    agent, agent_session_id = _extract_transcript_agent_fields(
+        res, eff_mode, env=env, cfg=cfg, extra_secrets=extra_secrets
+    )
+
     return {
         "id": utterance_id,
         "ts": ts_iso,
-        "mode": "general" if res.mode == "general" else "agent",
+        "mode": eff_mode,
+        "agent": agent,
+        "agent_session_id": agent_session_id,
         "duration_sec": round(float(res.gate.duration_sec), 2) if res.gate is not None else 0.0,
         "asr_provider": asr_provider,
         "asr_model": asr_model,
@@ -1010,10 +1096,19 @@ def _maybe_spawn_utterance_archive(
                 audio_dir = None
 
         transcripts_dir: Path | None = None
-        rec = _build_transcript_archive_record(res, utterance_id=uid, ts_iso=ts_iso)
+        extra_secrets: tuple[str, ...] = ()
         if cfg.archive.save_transcripts:
             eff_creds = creds if creds is not None else resolve_credentials(cfg, env)
             extra_secrets = tuple(eff_creds.all_secret_values())
+        rec = _build_transcript_archive_record(
+            res,
+            utterance_id=uid,
+            ts_iso=ts_iso,
+            env=env,
+            cfg=cfg,
+            extra_secrets=extra_secrets,
+        )
+        if cfg.archive.save_transcripts:
             if rec["draft"] is not None:
                 rec["draft"] = redact_secrets(
                     rec["draft"], env, cfg=cfg, extra_secrets=extra_secrets
@@ -1031,6 +1126,8 @@ def _maybe_spawn_utterance_archive(
             record_ts=rec_ts,
             ts_iso=ts_iso,
             mode=rec["mode"],
+            agent=rec["agent"],
+            agent_session_id=rec["agent_session_id"],
             duration_sec=rec["duration_sec"],
             asr_provider=rec["asr_provider"],
             asr_model=rec["asr_model"],

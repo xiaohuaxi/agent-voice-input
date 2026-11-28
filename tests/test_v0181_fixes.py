@@ -432,6 +432,12 @@ class TestOobeFixesV0181(unittest.TestCase):
             self.assertIn("[keys]      FAIL OPENAI_API_KEY", out)
             self.assertNotIn("sk-...", out)
             self.assertNotIn("<your-openai-api-key>", out)
+            pipeline_lines = [ln for ln in out.splitlines() if ln.startswith("[pipeline]")]
+            self.assertEqual(len(pipeline_lines), 1)
+            self.assertIn("placeholder key in .env: DASHSCOPE_API_KEY", pipeline_lines[0])
+            self.assertNotIn("auto priority (DASHSCOPE_API_KEY)", pipeline_lines[0])
+            self.assertNotIn("alternatives:", pipeline_lines[0])
+            self.assertNotIn("openai", pipeline_lines[0])
 
             # 1b. JSON report & --ping MUST agree: ready=false for ASR/refiner and ZERO outbound ping requests
             ping_calls: list[str] = []
@@ -460,6 +466,11 @@ class TestOobeFixesV0181(unittest.TestCase):
             self.assertFalse(doc["asr"]["ready"])
             self.assertFalse(doc["pipeline"]["asr"]["ready"])
             self.assertFalse(doc["pipeline"]["refiner"]["ready"])
+            self.assertEqual(doc["pipeline"]["asr"]["alternatives"], [])
+            self.assertEqual(doc["pipeline"]["refiner"]["alternatives"], [])
+            self.assertNotIn("auto priority", doc["pipeline"]["summary"])
+            self.assertNotIn("alternatives:", doc["pipeline"]["summary"])
+            self.assertIn("placeholder key in .env: DASHSCOPE_API_KEY", doc["pipeline"]["summary"])
             self.assertEqual(doc["ping"], {})
 
             # 2. Process env override with real key clears placeholder FAIL for that key
@@ -735,6 +746,271 @@ class TestOobeFixesV0181(unittest.TestCase):
             self.assertEqual(rc_c2, 1)
             self.assertIn("[refiner]   FAIL (PLACEHOLDER KEY) codex", out_c2)
             self.assertNotIn("[ping]      refiner(codex):", out_c2)
+            pl_c2 = [ln for ln in out_c2.splitlines() if ln.startswith("[pipeline]")][0]
+            self.assertIn("placeholder key in .env: OPENAI_API_KEY", pl_c2)
+            self.assertNotIn("openai", pl_c2)
+
+    def test_doctor_pipeline_summary_filters_placeholder_alternatives_mixed_keys(self) -> None:
+        from agent_voice_input.config import load_config
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            rt = Path(td) / "rt"
+            app_dir = home / ".agent-voice-input"
+            app_dir.mkdir(parents=True, mode=0o700)
+            codex_home = home / ".codex"
+            codex_home.mkdir(parents=True, mode=0o700)
+
+            # 1. Mixed real + placeholder keys:
+            #    DASHSCOPE_API_KEY=placeholder (auto ASR picks it -> FAIL)
+            #    DEEPSEEK_API_KEY=real (valid ASR alt + valid auto Refiner!)
+            #    OPENAI_API_KEY=placeholder + codex auth.json api_key (no file key -> falls back to placeholder env)
+            #    DOUBAO_ASR_API_KEY=real + DOUBAO_ASR_APP_ID=placeholder (legacy dual-header -> unusable alt)
+            (app_dir / ".env").write_text(
+                'DASHSCOPE_API_KEY="sk-..."\n'
+                'DEEPSEEK_API_KEY="sk-real-deepseek-token-5555"\n'
+                'OPENAI_API_KEY="<your-openai-api-key>"\n'
+                'DOUBAO_ASR_API_KEY="real-doubao-token-4444"\n'
+                'DOUBAO_ASR_APP_ID="<your-doubao-app-id>"\n',
+                encoding="utf-8",
+            )
+            (codex_home / "auth.json").write_text(
+                json.dumps({"auth_mode": "api_key"}),
+                encoding="utf-8",
+            )
+            cfg, merged_env = load_config(
+                env={
+                    "HOME": str(home),
+                    "CODEX_HOME": str(codex_home),
+                    "PATH": "",
+                    "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                },
+                home_dir=home,
+            )
+            buf = io.StringIO()
+            buf_json = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf),
+            ):
+                rc = cli_mod._cmd_doctor(cfg, merged_env)
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_json),
+            ):
+                rc_j = cli_mod._cmd_doctor(cfg, merged_env, as_json=True)
+            self.assertEqual((rc, rc_j), (1, 1))
+            out = buf.getvalue()
+            pl = [ln for ln in out.splitlines() if ln.startswith("[pipeline]")][0]
+            self.assertIn("ASR dashscope/qwen3-asr-flash (placeholder key in .env: DASHSCOPE_API_KEY)", pl)
+            self.assertIn("Refiner deepseek/", pl)
+            self.assertIn("auto priority (DEEPSEEK_API_KEY)", pl)
+            self.assertIn("alternatives: asr=[deepseek]", pl)
+            self.assertNotIn("refiner=[", pl)
+            self.assertNotIn("doubao", pl)
+            self.assertNotIn("codex", pl)
+            self.assertNotIn("openai", pl)
+            doc = json.loads(buf_json.getvalue())
+            self.assertEqual(doc["pipeline"]["asr"]["alternatives"], ["deepseek"])
+            self.assertEqual(doc["pipeline"]["refiner"]["alternatives"], [])
+            self.assertEqual(doc["pipeline"]["summary"], pl.split("[pipeline]", 1)[1].strip())
+
+            # 2. Single-hop ASR with placeholder GEMINI_API_KEY (refiner bypassed)
+            (app_dir / "config.toml").write_text(
+                '[asr]\nprovider = "gemini"\n[refiner]\nprovider = "auto"\n',
+                encoding="utf-8",
+            )
+            (app_dir / ".env").write_text(
+                'GEMINI_API_KEY="AIza..."\nOPENAI_API_KEY="sk-..."\n',
+                encoding="utf-8",
+            )
+            cfg_sh, env_sh = load_config(
+                env={
+                    "HOME": str(home),
+                    "CODEX_HOME": str(codex_home),
+                    "PATH": "",
+                    "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                },
+                home_dir=home,
+            )
+            buf_sh = io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_sh),
+            ):
+                rc_sh = cli_mod._cmd_doctor(cfg_sh, env_sh, as_json=True)
+            self.assertEqual(rc_sh, 1)
+            doc_sh = json.loads(buf_sh.getvalue())
+            self.assertIn("placeholder key in .env: GEMINI_API_KEY", doc_sh["pipeline"]["summary"])
+            self.assertIn("Refiner bypassed (single-hop ASR)", doc_sh["pipeline"]["summary"])
+            self.assertEqual(doc_sh["pipeline"]["asr"]["alternatives"], [])
+            self.assertEqual(doc_sh["pipeline"]["refiner"]["alternatives"], [])
+            self.assertNotIn("alternatives:", doc_sh["pipeline"]["summary"])
+
+    def test_doctor_alternative_placeholder_respects_custom_api_key_env_priority(self) -> None:
+        from agent_voice_input.config import load_config
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            rt = Path(td) / "rt"
+            app_dir = home / ".agent-voice-input"
+            app_dir.mkdir(parents=True, mode=0o700)
+
+            # 1. ASR custom api_key_env points to a .env placeholder while default DASHSCOPE_API_KEY is real:
+            #    because asr.api_key_env takes precedence for Stage 1, dashscope MUST NOT appear as an ASR alternative.
+            (app_dir / "config.toml").write_text(
+                '[asr]\nprovider = "deepseek"\napi_key_env = "MY_ASR_KEY"\n'
+                '[refiner]\nprovider = "off"\n',
+                encoding="utf-8",
+            )
+            (app_dir / ".env").write_text(
+                'MY_ASR_KEY="<your-api-key>"\n'
+                'DASHSCOPE_API_KEY="sk-real-dashscope-token-1111"\n'
+                'DEEPSEEK_API_KEY="sk-real-deepseek-token-2222"\n',
+                encoding="utf-8",
+            )
+            cfg_asr, env_asr = load_config(
+                env={"HOME": str(home), "PATH": "", "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)},
+                home_dir=home,
+            )
+            buf_asr_txt, buf_asr_json = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_asr_txt),
+            ):
+                rc_asr_txt = cli_mod._cmd_doctor(cfg_asr, env_asr)
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_asr_json),
+            ):
+                rc_asr_json = cli_mod._cmd_doctor(cfg_asr, env_asr, as_json=True)
+            self.assertEqual((rc_asr_txt, rc_asr_json), (1, 1))
+            pl_asr = [ln for ln in buf_asr_txt.getvalue().splitlines() if ln.startswith("[pipeline]")][0]
+            self.assertNotIn("asr=[", pl_asr)
+            self.assertIn("refiner=[deepseek, dashscope]", pl_asr)
+            doc_asr = json.loads(buf_asr_json.getvalue())
+            self.assertFalse(doc_asr["pipeline"]["asr"]["ready"])
+            self.assertEqual(doc_asr["pipeline"]["asr"]["alternatives"], [])
+            self.assertEqual(doc_asr["pipeline"]["refiner"]["alternatives"], ["deepseek", "dashscope"])
+            self.assertEqual(doc_asr["pipeline"]["summary"], pl_asr.split("[pipeline]", 1)[1].strip())
+
+            # 2. Refiner custom api_key_env points to a .env placeholder while default DASHSCOPE_API_KEY is real:
+            #    dashscope MUST NOT appear as an available refiner alternative in text or JSON.
+            (app_dir / "config.toml").write_text(
+                '[asr]\nprovider = "dashscope"\n'
+                '[refiner]\nprovider = "deepseek"\napi_key_env = "MY_REF_KEY"\n',
+                encoding="utf-8",
+            )
+            (app_dir / ".env").write_text(
+                'DASHSCOPE_API_KEY="sk-real-dashscope-token-1111"\n'
+                'MY_REF_KEY="sk-..."\n',
+                encoding="utf-8",
+            )
+            cfg_ref, env_ref = load_config(
+                env={"HOME": str(home), "PATH": "", "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt)},
+                home_dir=home,
+            )
+            buf_ref_txt, buf_ref_json = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_ref_txt),
+            ):
+                rc_ref_txt = cli_mod._cmd_doctor(cfg_ref, env_ref)
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_ref_json),
+            ):
+                rc_ref_json = cli_mod._cmd_doctor(cfg_ref, env_ref, as_json=True)
+            self.assertEqual((rc_ref_txt, rc_ref_json), (1, 1))
+            pl_ref = [ln for ln in buf_ref_txt.getvalue().splitlines() if ln.startswith("[pipeline]")][0]
+            self.assertNotIn("refiner=[", pl_ref)
+            doc_ref = json.loads(buf_ref_json.getvalue())
+            self.assertTrue(doc_ref["pipeline"]["asr"]["ready"])
+            self.assertFalse(doc_ref["pipeline"]["refiner"]["ready"])
+            self.assertEqual(doc_ref["pipeline"]["refiner"]["alternatives"], [])
+            self.assertEqual(doc_ref["pipeline"]["summary"], pl_ref.split("[pipeline]", 1)[1].strip())
+
+    def test_doctor_codex_expired_auth_syncs_pipeline_ready_and_summary(self) -> None:
+        import base64
+        from agent_voice_input.config import load_config
+
+        def _b64u(obj: dict[str, object]) -> str:
+            raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+            return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+        expired_jwt = f"{_b64u({'alg': 'RS256', 'typ': 'JWT'})}.{_b64u({'exp': 1_600_000_000, 'sub': 'u1'})}.sig"
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            rt = Path(td) / "rt"
+            app_dir = home / ".agent-voice-input"
+            app_dir.mkdir(parents=True, mode=0o700)
+            codex_home = home / ".codex"
+            codex_home.mkdir(parents=True, mode=0o700)
+
+            (app_dir / "config.toml").write_text(
+                '[asr]\nprovider = "dashscope"\n[refiner]\nprovider = "auto"\n',
+                encoding="utf-8",
+            )
+            (app_dir / ".env").write_text(
+                'DASHSCOPE_API_KEY="sk-real-dashscope-token-9999"\n',
+                encoding="utf-8",
+            )
+            (codex_home / "auth.json").write_text(
+                json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": expired_jwt}}),
+                encoding="utf-8",
+            )
+            cfg, merged_env = load_config(
+                env={
+                    "HOME": str(home),
+                    "CODEX_HOME": str(codex_home),
+                    "PATH": "",
+                    "AGENT_VOICE_INPUT_RUNTIME_DIR": str(rt),
+                },
+                home_dir=home,
+            )
+            buf_txt, buf_json = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_txt),
+            ):
+                rc_txt = cli_mod._cmd_doctor(cfg, merged_env)
+            with (
+                mock.patch.object(cli_mod.sys, "platform", "linux"),
+                mock.patch("agent_voice_input.platform_wsl.is_wsl", return_value=False),
+                mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value="/usr/bin/ffmpeg"),
+                mock.patch("sys.stdout", buf_json),
+            ):
+                rc_json = cli_mod._cmd_doctor(cfg, merged_env, as_json=True)
+            self.assertEqual((rc_txt, rc_json), (1, 1))
+            out_txt = buf_txt.getvalue()
+            self.assertIn("[refiner]   FAIL auto -> codex", out_txt)
+            self.assertIn("expired", out_txt)
+            pl = [ln for ln in out_txt.splitlines() if ln.startswith("[pipeline]")][0]
+            self.assertIn("expired", pl)
+            self.assertNotIn("zero extra API billing", pl)
+            doc = json.loads(buf_json.getvalue())
+            self.assertFalse(doc["ok"])
+            self.assertFalse(doc["pipeline"]["refiner"]["ready"])
+            self.assertIn("expired", doc["pipeline"]["refiner"]["reason"])
+            self.assertIn("expired", doc["pipeline"]["summary"])
+            self.assertEqual(doc["pipeline"]["summary"], pl.split("[pipeline]", 1)[1].strip())
 
     def test_config_error_hint_and_offline_status_ordering(self) -> None:
         with tempfile.TemporaryDirectory() as td:

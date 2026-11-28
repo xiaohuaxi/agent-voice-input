@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Agent routing metadata in monthly transcript archive (`transcripts/YYYY-MM.jsonl`)**: Extended the flat JSONL transcript schema from 12 to 14 backward-compatible fields by adding `"agent"` (`"claude"` / `"codex"` / `"agy"` / `"gemini"` or `null`) and `"agent_session_id"` (matched target session ID or `null`) in `agent` mode (always `null` in `general` mode or when no concrete target session is bound, never recording refiner internal session IDs, context, hotwords, or secrets).
+
+### Fixed
+- **Self-consistent `doctor` `[pipeline]` summary for `.env` template placeholders**: Filtered `.env` template placeholder providers out of `doctor` `[pipeline]` `alternatives` (including `codex` when falling back to a placeholder `OPENAI_API_KEY` and legacy dual-header `doubao` with a placeholder `DOUBAO_ASR_APP_ID`) and replaced `auto priority (...)` / stage reasons on placeholder stages with explicit `placeholder key in .env: <VAR>` summaries in both text and `--json` outputs.
+
 ## [0.18.1] - 2026-11-28
 
 ### Added

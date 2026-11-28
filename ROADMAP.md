@@ -239,7 +239,7 @@
 
 1. **个人词库与本机语料体系演进（基于 `~/.agent-voice-input/` 预留扩展位）**：
    - **项目级热词（`~/.agent-voice-input/hotwords/projects/<slug>.txt`）**：按“项目 + 个人”生效的可选扩展层，通过文件头 `@match path=` / `@match remote=` 自包含匹配（`path` 优先，支持跨机与跨 SSH）；**安全红线**：绝不自动加载陌生或远端业务仓库内的未授权热词文件（防合法语义 Prompt Injection），团队共享术语表仅支持通过 CLI 显式确认导入。
-   - **本机转录语料日志（`~/.agent-voice-input/transcripts/`，已于 `v0.18.0` 正式发布）**：按显式隐私开关 `[archive]`（`save_transcripts` / `save_audio` / `audio_max_count`）落盘 12 字段「ASR 转录草稿 + 精修终稿」按月 JSONL 语料并与 `audio/<id>.mp3`、`diag.jsonl` 按短 ID 1:1 贯通（受 `.gitignore` 默认拦截、绝不写入上下文/热词/凭据或 `diag.jsonl`），作为复盘、Agent 分析与离线 Dreaming 的原始素材。
+   - **本机转录语料日志（`~/.agent-voice-input/transcripts/`，已于 `v0.18.0` 正式发布）**：按显式隐私开关 `[archive]`（`save_transcripts` / `save_audio` / `audio_max_count`）落盘 14 字段「ASR 转录草稿 + 精修终稿 + 目标 `agent` / `agent_session_id`」按月 JSONL 语料并与 `audio/<id>.mp3`、`diag.jsonl` 按短 ID 1:1 贯通（受 `.gitignore` 默认拦截、绝不写入上下文/热词/凭据或 `diag.jsonl`），作为复盘、Agent 分析与离线 Dreaming 的原始素材。
    - **离线 Dreaming 自动挖掘与屏蔽表（`~/.agent-voice-input/dreaming/` + `hotwords/suppress.txt`）**：严格单写者隔离（不往 `personal.txt` 写频次或时间戳，删除派生区不损人工词库）；通过 `suppress.txt` 避让用户已拒绝词；并专门防范「ASR 误听 → Refiner 按旧错误映射改写 → Dreaming 误当作采纳证据」的自我强化幻觉回环。
    - **300–1,000+ 条大词库长尾草稿后置召回**：超过 Stage 2 块 0 常驻预算（`200 条 / 3,000 字`）的长尾词，在 Stage 1 ASR 产出草稿后于本机毫秒级检索精确误听，将少量命中临时附在末尾草稿块旁喂给 Stage 2（**不动块 0、不破前缀缓存**）。
    - **配套 AI-native 热词维护 Skill & 预算持续校准**：提供热词维护 Skill 引导 Coding Agent 按预算与形态契约维护词表，并基于后续真人录音回放持续校准强 ASR 上限与分桶比例。

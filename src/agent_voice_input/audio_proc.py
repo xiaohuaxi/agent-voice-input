@@ -1388,6 +1388,8 @@ def run_utterance_archive(
     record_ts: float,
     ts_iso: str,
     mode: str,
+    agent: str | None = None,
+    agent_session_id: str | None = None,
     duration_sec: float,
     asr_provider: str,
     asr_model: str,
@@ -1406,7 +1408,7 @@ def run_utterance_archive(
     stop_evt: threading.Event | None = None,
     shutdown_grace_sec: float = 1.5,
 ) -> tuple[Path | None, Path | None]:
-    """Sequentially archive audio (if enabled) and then append the 12-field transcript record (if enabled)."""
+    """Sequentially archive audio (if enabled) and then append the 14-field transcript record (if enabled)."""
     audio_path: Path | None = None
     transcript_path: Path | None = None
     audio_file: str | None = None
@@ -1434,6 +1436,8 @@ def run_utterance_archive(
                 "id": utterance_id,
                 "ts": eff_ts_iso,
                 "mode": mode,
+                "agent": agent,
+                "agent_session_id": agent_session_id,
                 "duration_sec": round(float(duration_sec), 2),
                 "asr_provider": asr_provider,
                 "asr_model": asr_model,

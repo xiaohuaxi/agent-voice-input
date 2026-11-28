@@ -826,8 +826,11 @@ def _validate_probe_response_schema(data: dict[str, Any]) -> dict[str, Any]:
     cli = str(data.get("cli") or "").strip().lower()
     if cli not in ("codex", "claude", "agy", "workspace"):
         raise ValueError(f"unexpected remote cli {cli!r}")
-    sid = str(data.get("session_id") or "").strip().lower()[:128]
-    if not sid or any(c.isspace() or ord(c) < 0x20 for c in sid):
+    raw_sid = data.get("session_id")
+    if not isinstance(raw_sid, str) or len(raw_sid) > 128:
+        raise ValueError("invalid remote session_id")
+    sid = raw_sid.strip().lower()
+    if not sid or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in sid):
         raise ValueError("invalid remote session_id")
     not_mod = bool(data.get("not_modified") or data.get("unchanged"))
     turns_out: list[tuple[str, str]] = []
