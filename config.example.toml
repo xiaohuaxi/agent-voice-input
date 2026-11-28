@@ -101,7 +101,7 @@ provider = "auto"
 # - openai            -> "gpt-transcribe" (STT; or single-hop "gpt-audio-1.5" / "gpt-audio-mini")
 # - gemini            -> "gemini-3.7-flash" (native :generateContent single-hop; skips Stage 2 by default)
 # - groq              -> "whisper-large-v3-turbo"
-# - openrouter        -> "qwen/qwen3-asr-1.7b" (STT; or single-hop e.g. "google/gemini-3.8-flash")
+# - openrouter        -> "microsoft/mai-transcribe-2" (STT with native keyterms, ~$0.10/hr)
 # - siliconflow       -> "FunAudioLLM/SenseVoiceSmall"
 # - openai-compatible -> "gpt-4o-mini-transcribe" (requires explicit base_url)
 model = ""
@@ -135,6 +135,9 @@ effort = ""
 # max_retries = 2
 
 # Personal hotwords live in ~/.agent-voice-input/hotwords/personal.txt (hot-reloaded).
+# Stage 1 quotas: DashScope 250 terms / 2,800 chars, Doubao 50 terms / 1,000 chars,
+# OpenAI keywords[] 50 terms, OpenRouter keyterms 50 terms, Whisper 35 terms / 353 chars.
+# Stage 2 / single-hop selects up to 200 items / 3,000 chars (!pinned -> aliased -> file order).
 # Manage via `agent-voice-input hotwords list|add|remove|path`.
 
 
@@ -146,7 +149,7 @@ effort = ""
 # "auto" | "codex" | "agy" | "deepseek" | "dashscope" | "volcengine" | "openrouter" | "gemini" | "openai" | "groq" | "siliconflow" | "openai-compatible" | "off"
 # Aliases accepted: "doubao"/"volc"/"ark" -> "volcengine", "bailian" -> "dashscope"
 # "auto" prefers confirmed local `codex` ChatGPT subscription login (zero extra API billing), then:
-#   deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow
+#   openrouter -> deepseek -> dashscope -> gemini -> volcengine -> openai -> groq -> siliconflow
 # (falls back cleanly to "off" if no Stage 2 credentials exist; "agy" is explicit opt-in only).
 # Built-in default models:
 # - codex             -> "gpt-6-luna" (stateless HTTP /responses; auto-falls back if unavailable on account; never enables Fast mode)
@@ -169,7 +172,7 @@ model = ""
 api = "auto"
 
 # Stage 2 thinking/reasoning budget:
-# - "" (default): "low" for codex / agy / openai, "none" for all other providers
+# - "" (default): "low" for codex / agy / openai / openrouter, "none" for all other providers
 # - "default": omit thinking params and defer to upstream provider default
 # - Explicit levels: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 effort = ""
@@ -281,6 +284,6 @@ hosts = []
 #
 # Recipe 2 — Single-hop multimodal audio + 50K cached session context (skips Stage 2):
 #   [asr]
-#   provider = "dashscope"              # Or provider = "openrouter" with model = "google/gemini-3.8-flash"
+#   provider = "dashscope"              # Or provider = "gemini" (built-in default: "gemini-3.7-flash")
 #   model = "qwen3.8-omni-flash"
 #   # effort = ""                       # Recommended default ("none") already minimizes thinking latency

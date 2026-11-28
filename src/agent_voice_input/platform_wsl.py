@@ -277,7 +277,7 @@ def probe_wsl_host(
         try:
             p = subprocess.run(
                 [ps_exe, "-NoProfile", "-NonInteractive", "-Sta", "-ExecutionPolicy", "Bypass", "-File", to_windows_path(SHIM_SCRIPT), "-Mode", "probe"],
-                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=WSL_SHIM_COLD_TIMEOUT_SEC, check=False,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", env=dict(raw_env), timeout=WSL_SHIM_COLD_TIMEOUT_SEC, check=False,
             )
             if p.returncode == 0 and p.stdout.strip():
                 d = json.loads(p.stdout.strip().splitlines()[-1])

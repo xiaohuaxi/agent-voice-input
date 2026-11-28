@@ -1617,11 +1617,11 @@ class TestV100AuditFixes(unittest.TestCase):
                 self.assertIn("stop_recording", call_order)
                 self.assertIn("hud:recognizing", call_order)
                 self.assertLess(
-                    call_order.index("stop_recording"),
                     call_order.index("hud:recognizing"),
-                    f"stop_recording must run before HUD refresh on shim EOF, got {call_order}",
+                    call_order.index("stop_recording"),
+                    f"hud:recognizing must precede stop_recording on shim EOF, got {call_order}",
                 )
-                self.assertEqual(hud_saw_stopped, [True])
+                self.assertEqual(hud_saw_stopped, [False])
             finally:
                 daemon.close()
 

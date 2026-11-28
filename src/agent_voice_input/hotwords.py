@@ -42,6 +42,38 @@ STAGE2_VOCABULARY_HINTS_PREAMBLE: str = (
     "translate a correctly recognized native word (豆包 stays 豆包), never mention this list."
 )
 
+DEFAULT_PERSONAL_HOTWORDS_TERMS: tuple[str, ...] = (
+    "Claude Code",
+    "Codex",
+    "Antigravity",
+    "OpenAI",
+    "ChatGPT",
+    "Gemini",
+    "DeepSeek",
+    "GitHub",
+    "WSL2",
+    "tmux",
+    "Ghostty",
+    "subagent",
+    "worktree",
+    "macOS",
+    "Python",
+    "TypeScript",
+    "Docker",
+    "SSH",
+)
+
+DEFAULT_PERSONAL_HOTWORDS_TEMPLATE: str = (
+    "# agent-voice-input personal hotwords (UTF-8, one term per line)\n"
+    "# Priority: !pinned terms first, then terms with aliases (Term <- mishearing1, mishearing2),\n"
+    "# then remaining terms in top-to-bottom file order.\n"
+    "# Add your own project names, people, and jargon above this block so they take higher priority.\n"
+    "#\n"
+    "# Starter AI / Agent / developer terms (visible & optional — edit or delete freely):\n"
+    + "\n".join(DEFAULT_PERSONAL_HOTWORDS_TERMS)
+    + "\n"
+)
+
 _ALIAS_SEPARATOR = "<-"
 _ALIAS_SPLIT_RE = re.compile(r"[,，]")
 _XML_BRACKET_RE = re.compile(r"[<>]")
@@ -316,7 +348,7 @@ class Stage2HotwordsBudgetSummary:
 # Single source of truth for per-provider ASR hotword quotas (aligned with
 # per-provider protocol measurements):
 # - Doubao file API contract supports up to 5,000 terms; recall is sharpest around 30-50 terms.
-# - DashScope qwen3-asr-flash hard cap is 10,000 text_tokens (~14,500 chars); 150 terms / 1,800 chars leaves wide headroom.
+# - DashScope qwen3-asr-flash hard cap is 10,000 text_tokens (~14,500 chars); 250 terms / 2,800 chars leaves >65% headroom below the 350-term crosstalk knee.
 # - OpenAI gpt-transcribe supports native keywords[] (50 terms sweet spot; must strip <, >, \r, \n).
 # - Whisper /audio/transcriptions reserves 7 chars for "常用技术术语：" (360 - 7 = 353).
 # - Single-hop multimodal models align with Stage 2 wide vocabulary hints (200 items / 3,000 chars).
@@ -325,7 +357,7 @@ HOTWORDS_QUOTA_SPECS: dict[str, HotwordsQuotaSpec] = {
         key="doubao",
         label="doubao",
         max_terms=50,
-        max_chars=500,
+        max_chars=1000,
         separator="",
         max_term_chars=60,
         collapse_file_ext=True,
@@ -348,8 +380,8 @@ HOTWORDS_QUOTA_SPECS: dict[str, HotwordsQuotaSpec] = {
     "dashscope": HotwordsQuotaSpec(
         key="dashscope",
         label="dashscope",
-        max_terms=150,
-        max_chars=1800,
+        max_terms=250,
+        max_chars=2800,
         separator="、",
     ),
     "single_hop": HotwordsQuotaSpec(
@@ -802,11 +834,8 @@ def order_stage1_entries(entries: Sequence[HotwordEntry]) -> list[HotwordEntry]:
 
 
 def order_stage2_entries(entries: Sequence[HotwordEntry]) -> list[HotwordEntry]:
-    """Order entries deterministically for Stage 2 Block 0 so prefix cache stays byte-identical across edits."""
-    return sorted(
-        entries,
-        key=lambda e: (0 if e.pinned else (1 if e.aliases else 2), e.term.lower(), e.term),
-    )
+    """Order entries for Stage 2 Block 0: pinned -> effective-aliased -> plain, preserving file order within each tier."""
+    return order_stage1_entries(entries)
 
 
 def clear_hotwords_cache() -> None:
@@ -2130,7 +2159,7 @@ def format_stage2_budget_line(summary: Stage2HotwordsBudgetSummary, *, name: str
 
 
 def format_budget_line(res: HotwordsBudgetResult, *, name: str = "") -> str:
-    """Format a compact human-readable quota line such as ``doubao: 12/50 terms, 68/500 chars [OK]``."""
+    """Format a compact human-readable quota line such as ``doubao: 12/50 terms, 68/1000 chars [OK]``."""
     label = name or res.provider
     if res.max_terms <= 0:
         tail = f" ({res.note})" if res.note else ""

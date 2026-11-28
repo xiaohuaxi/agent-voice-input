@@ -510,7 +510,7 @@ def _compose_context_text(
 
     if include_hotwords and _has_any_hotwords(ctx):
         hw_prefix = "常用技术术语："
-        ds_hw_limit = HOTWORDS_QUOTA_SPECS["dashscope"].max_chars or 1800
+        ds_hw_limit = HOTWORDS_QUOTA_SPECS["dashscope"].max_chars or 2800
         hw_cap = max(16, min(ds_hw_limit, max(64, max_chars // 2) - len(hw_prefix)))
         hw_budget = project_stage1_hotwords(ctx, "dashscope", max_chars=hw_cap)
         if hw_budget.kept:
@@ -966,7 +966,9 @@ class DashScopeAsrProvider(BaseAsrProvider):
             )
         cred = self._require_key()
         ctx = _coerce_context(context, env=self.env)
-        ctx_text = _compose_context_text(ctx, max_chars=3800, max_dialog_chars=2000)
+        # 5800 // 2 - len("常用技术术语：") == 2893 >= 2800 so DashScope's 2800-char hotword cap passes
+        # intact without prefix clipping while still fitting git status (<=600) + dialog tail (<=2000).
+        ctx_text = _compose_context_text(ctx, max_chars=5800, max_dialog_chars=2000)
         b64_wav = base64.b64encode(wav_bytes).decode("ascii")
         data_uri = f"data:audio/wav;base64,{b64_wav}"
 
@@ -1251,7 +1253,7 @@ def _resolve_doubao_base_url(raw_base: str) -> str:
 
 
 def _build_doubao_corpus_context(ctx: AsrContext) -> str | None:
-    """Build serialized Doubao corpus.context strictly within 50 words/500 chars + 600 dialog chars."""
+    """Build serialized Doubao corpus.context strictly within 50 words/1000 chars + 600 dialog chars."""
     hw_budget = project_stage1_hotwords(ctx, "doubao")
     hw_objs = [{"word": w} for w in hw_budget.kept]
 

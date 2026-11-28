@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-28
+
+### Added
+- **Starter developer hotwords on initial `init`**: Creating `~/.agent-voice-input/hotwords/personal.txt` (`0600`) for the first time during `agent-voice-input init` now seeds 18 common AI, Agent, and developer terms (visible, editable, and removable; covers both `agent` and `general` modes; never overwritten on subsequent `init` or `init --force`).
+- **Python `>= 3.10` version guard in `bin/agent-voice-input`**: Exits immediately with clear remediation instructions (`brew install python` or `uv tool install agent-voice-input`) when invoked on Python `< 3.10` instead of failing with a syntax error.
+- **`.env` template placeholder & onboarding diagnostics**: `doctor` now flags unchanged `.env` template placeholders (e.g., `sk-...`, `<your-...>`) as `FAIL` without scanning process environment variables or leaking values, marks missing Stage 1/2 keys explicitly as `FAIL (MISSING KEY)`, prints a non-failing `[macos-tcc] NOTE` in authorized SSH shells, detects stale `WSL_INTEROP` sessions, and distinguishes WSL2 WASAPI `no_default`/`inactive` (`ms-settings:sound`) from permission denial using resolved absolute `cmd.exe` paths.
+
+### Changed
+- **OpenRouter default ASR switched to `microsoft/mai-transcribe-2`**: Replaced `qwen/qwen3-asr-1.7b` as the built-in default OpenRouter Stage 1 ASR model with `microsoft/mai-transcribe-2` (~`$0.10/hr` base rate with native `keyterms` hotword support).
+- **Expanded DashScope & Doubao Stage 1 hotword quotas**: Raised DashScope `qwen3-asr-flash` Stage 1 hotword limits to `250 terms / 2,800 chars` (and relaxed `_compose_context_text` total budget from `3,800` to `5,800` chars so the full `2,800`-char hotword section passes without prefix clipping while keeping the dialogue tail capped at `2,000` chars), and raised Doubao Stage 1 hotword character budget from `500` to `1,000` chars (`50 terms / 1,000 chars`).
+- **Stage 2 `<vocabulary_hints>` priority-tier selection & rendering**: Replaced A–Z sorting in `order_stage2_entries` with priority-tier order (`!pinned` → effective `<-` aliased → plain entries, preserving top-to-bottom file order within each tier) when selecting and rendering the top `200 items / 3,000 chars`, preventing bottom A-prefixed terms from displacing higher-priority CJK or Z-prefixed entries.
+- **`REFINER_AUTO_PRIORITY` & OpenRouter default `effort`**: Promoted `openrouter` ahead of `deepseek` and `dashscope` (`openrouter -> deepseek -> dashscope -> gemini -> volcengine -> openai -> groq -> siliconflow`, keeping `openai`/`gemini` after `dashscope` to avoid silently consuming pre-existing global shell keys) and set OpenRouter's built-in default refiner `effort` to `"low"`.
+- **Immediate pre-stop HUD transition**: Switched the HUD pill to `"recognizing"` (or the next active background stage) before blocking on `stop_recording()` tail-drain while keeping the stop beep post-capture and preserving clean teardown across failure, cancel, auto-stop, silence, and silent-HUD paths.
+- **Bilingual README & configuration template overhaul**: Updated `README.md`, `README.zh-CN.md`, `config.example.toml`, `config.example.env`, `docs/agent-setup.md`, and `ROADMAP.md` with supported platforms above the fold, side-by-side PyPI (`uv`/`pipx`) vs. zero-dependency git-clone installation (moving bare `pip install` to FAQ with PEP 668 guidance), `.env` uncomment reminders, a clear ASR & Stage 2 refiner model selection guide (removing OpenRouter from single-hop recipes), and synced hotwords documentation.
+
+### Fixed
+- **Onboarding error recovery, `start` warnings & WSL host probe environment**: Added actionable `agent-voice-input init --force` hints (noting `.env` is preserved) on `config.toml` syntax errors, ordered `Config WARN` ahead of `Fix:` in offline `status`, surfaced missing `ffmpeg`/key `init` hints in `start` without hiding the hotkey line, forwarded `env` cleanly into `probe_wsl_host` PowerShell probes, and expanded `MACOS_PERMISSIONS_HINT` to cover `iTerm2` Automation and third-party Accessibility routing.
+
 ## [0.18.0] - 2026-11-27
 
 ### Added

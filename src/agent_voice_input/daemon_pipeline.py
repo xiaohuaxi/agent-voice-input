@@ -2324,7 +2324,7 @@ def plan_commit_hud_calls(
     hud_calls: list[tuple[str, str, int, str | None, bool | None, bool | None, int]] = []
     play_beep = ""
     if silent_hud:
-        if not rec_active and not next_vis_stage and main_hud_visible:
+        if (not rec_active or cur_silent_hud) and not next_vis_stage and main_hud_visible:
             hud_calls.append(("hide", "", 0, None, None, None, 0))
     elif rec_active:
         if (
@@ -2335,11 +2335,30 @@ def plan_commit_hud_calls(
             and vis_inflight != main_hud_bg_count
         ):
             hud_calls.append(("recording", "", 0, None, None, False, vis_inflight))
+        elif stopping_capture and not cur_silent_hud:
+            desired_stop_stage = next_vis_stage or "recognizing"
+            if main_hud_state != desired_stop_stage:
+                hud_calls.append((desired_stop_stage, "", 0, None, None, None, 0))
+        elif cur_silent_hud:
+            if next_vis_stage:
+                if main_hud_state != next_vis_stage:
+                    hud_calls.append((next_vis_stage, "", 0, None, None, None, 0))
+            elif main_hud_visible and hud_st != "copied" and not (hud_st and is_toast_hud_state(hud_st)):
+                hud_calls.append(("hide", "", 0, None, None, None, 0))
+        clear_main_for_toast = bool(cur_silent_hud and not next_vis_stage)
         if hud_st == "copied":
-            hud_calls.append(("copied", copied_hud_text, hud_dur_ms, "toast", False, None, 0))
+            hud_calls.append(("copied", copied_hud_text, hud_dur_ms, "toast", clear_main_for_toast, None, 0))
         elif hud_st and is_toast_hud_state(hud_st):
             hud_calls.append(
-                (hud_st, copied_hud_text if hud_st == "refiner_fallback" else "", hud_dur_ms, None, False, None, 0)
+                (
+                    hud_st,
+                    copied_hud_text if hud_st == "refiner_fallback" else "",
+                    hud_dur_ms,
+                    None,
+                    clear_main_for_toast,
+                    None,
+                    0,
+                )
             )
     elif next_vis_stage:
         if main_hud_state != next_vis_stage:

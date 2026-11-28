@@ -502,7 +502,7 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
             self.assertEqual(sel["refiner"]["base_url"], CODEX_SUBSCRIPTION_BASE_URL)
             self.assertTrue(sel["refiner"]["ready"])
             self.assertIn("zero extra API billing", sel["refiner"]["reason"])
-            self.assertEqual(sel["refiner"]["alternatives"], ["deepseek", "dashscope", "openrouter"])
+            self.assertEqual(sel["refiner"]["alternatives"], ["openrouter", "deepseek", "dashscope"])
             self.assertIn("alternatives:", sel["summary"])
 
             # Codex `auth_mode="api_key"` (paid OpenAI API) MUST NOT preempt auto priority or claim zero billing!
@@ -518,7 +518,7 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
             )
             self.assertEqual(detect_codex_local_auth_mode(env_multi), "api_key")
             sel_apikey_multi = explain_pipeline_selection(cfg_auto, env=env_multi)
-            self.assertEqual(sel_apikey_multi["refiner"]["provider"], "deepseek")
+            self.assertEqual(sel_apikey_multi["refiner"]["provider"], "openrouter")
             self.assertIn("codex", sel_apikey_multi["refiner"]["alternatives"])
 
             # When ONLY Codex auth.json API key is available -> auto falls back to codex with honest OpenAI API URL & billing
@@ -543,7 +543,7 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
             self.assertEqual(detect_codex_local_auth_mode({"HOME": str(home), "PATH": ""}), "none")
 
             # Refresh-token-only auth.json without auth_mode + OPENAI_API_KEY in env falls back to api_key in refiner.py,
-            # so config.py MUST classify it as "api_key" (NOT "chatgpt") and NOT preempt DEEPSEEK_API_KEY!
+            # so config.py MUST classify it as "api_key" (NOT "chatgpt") and NOT preempt OPENROUTER_API_KEY!
             (codex_dir / "auth.json").write_text(
                 json.dumps({"tokens": {"refresh_token": "rt-only-token"}}),
                 encoding="utf-8",
@@ -552,7 +552,7 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
             self.assertEqual(detect_codex_local_auth_mode(env_rt_oai), "api_key")
             self.assertEqual(
                 select_refiner_provider(cfg_auto, resolve_credentials(cfg_auto, env_rt_oai), env_rt_oai),
-                "deepseek",
+                "openrouter",
             )
             # Explicit auth_mode="chatgpt" + refresh_token keeps chatgpt subscription priority even with OPENAI_API_KEY in env
             (codex_dir / "auth.json").write_text(
@@ -574,7 +574,7 @@ class PipelineExplainAliasesAndDoubaoPingTests(unittest.TestCase):
             env_keyring_multi = {**env_multi, "CODEX_BIN": str(fake_cbin)}
             self.assertEqual(detect_codex_local_auth_mode(env_keyring_multi), "keyring")
             sel_kr_multi = explain_pipeline_selection(cfg_auto, env=env_keyring_multi)
-            self.assertEqual(sel_kr_multi["refiner"]["provider"], "deepseek")
+            self.assertEqual(sel_kr_multi["refiner"]["provider"], "openrouter")
             self.assertIn("codex", sel_kr_multi["refiner"]["alternatives"])
 
             env_keyring_only = {"HOME": str(home), "PATH": "", "CODEX_BIN": str(fake_cbin), "DOUBAO_ASR_API_KEY": "db-key-2222"}

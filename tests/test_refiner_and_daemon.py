@@ -505,12 +505,12 @@ class ExamplesAndShimInvariantsTests(unittest.TestCase):
 
         proj = data["project"]
         self.assertEqual(proj["name"], "agent-voice-input")
-        self.assertEqual(proj["version"], "0.18.0")
+        self.assertEqual(proj["version"], "0.18.1")
         self.assertEqual(proj["requires-python"], ">=3.10")
         self.assertEqual(proj["license"], "Apache-2.0")
         self.assertEqual(
             proj["scripts"]["agent-voice-input"],
-            "agent_voice_input.cli:main",
+            "agent_voice_input._entry:main",
         )
         pkg_data = data["tool"]["setuptools"]["package-data"]["agent_voice_input"]
         self.assertIn("win_shim.ps1", pkg_data)
@@ -877,14 +877,16 @@ class RefinerProtocolAndFallbackTests(unittest.TestCase):
 
         # 2. OpenRouter, DashScope, Volcengine, DeepSeek, Groq, SiliconFlow, OpenAI, and keyless loopback openai-compatible
         matrix = [
-            ("openrouter", "", "", "", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "minimal"}}),
+            ("openrouter", "", "", "", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "low"}}),
             ("openrouter", "", "", "none", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "minimal"}}),
             ("openrouter", "", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {"reasoning": {"effort": "low"}}),
             ("openrouter", "", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-3.8-flash", {}),
             ("openrouter", "google/gemini-2.5-flash-lite", "", "low", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "low"}}),
-            ("openrouter", "google/gemini-2.5-flash-lite", "", "", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "none"}}),
+            ("openrouter", "google/gemini-2.5-flash-lite", "", "", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "low"}}),
+            ("openrouter", "google/gemini-2.5-flash-lite", "", "none", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {"reasoning": {"effort": "none"}}),
             ("openrouter", "google/gemini-2.5-flash-lite", "", "default", "https://openrouter.ai/api/v1/chat/completions", "google/gemini-2.5-flash-lite", {}),
-            ("openrouter", "minimax/minimax-m3.1-flash", "", "", "https://openrouter.ai/api/v1/chat/completions", "minimax/minimax-m3.1-flash", {"reasoning": {"effort": "minimal"}}),
+            ("openrouter", "minimax/minimax-m3.1-flash", "", "", "https://openrouter.ai/api/v1/chat/completions", "minimax/minimax-m3.1-flash", {"reasoning": {"effort": "low"}}),
+            ("openrouter", "minimax/minimax-m3.1-flash", "", "none", "https://openrouter.ai/api/v1/chat/completions", "minimax/minimax-m3.1-flash", {"reasoning": {"effort": "minimal"}}),
             ("openrouter", "anthropic/claude-haiku-5.5", "", "none", "https://openrouter.ai/api/v1/chat/completions", "anthropic/claude-haiku-5.5", {"reasoning": {"effort": "none"}}),
             ("dashscope", "", "", "", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.8-flash", {"enable_thinking": False}),
             ("dashscope", "", "", "low", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.8-flash", {"enable_thinking": True}),
@@ -1807,7 +1809,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
         with mock.patch("sys.stdout", ver_buf), self.assertRaises(SystemExit) as ver_exit:
             parser.parse_args(["--version"])
         self.assertEqual(ver_exit.exception.code, 0)
-        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.18.0")
+        self.assertEqual(ver_buf.getvalue().strip(), "agent-voice-input 0.18.1")
 
         # Offline _cmd_doctor verification: displays resolved provider/model/api/effort and NEVER leaks raw secrets
         with tempfile.TemporaryDirectory() as td:
@@ -1837,7 +1839,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 rc = cli_mod._cmd_doctor(cfg, merged_env)
             out = buf.getvalue()
             self.assertEqual(rc, 0, out)
-            self.assertIn("selected=openrouter (model=qwen/qwen3-asr-1.7b, api=audio-transcriptions, effort=none (recommended)) -> OK", out)
+            self.assertIn("selected=openrouter (model=microsoft/mai-transcribe-2, api=audio-transcriptions, effort=none (recommended)) -> OK", out)
             self.assertIn("openrouter=OK (via OPENROUTER_API_KEY)", out)
             self.assertIn("[refiner]   OK openrouter (model=google/gemini-3.8-flash, api=chat-completions, effort=low)", out)
             self.assertNotIn(secret_or, out)
@@ -1923,7 +1925,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
             ):
                 rc_ref_miss = cli_mod._cmd_doctor(cfg_loop_ref_miss, loop_env)
             self.assertEqual(rc_ref_miss, 1, buf_ref_miss.getvalue())
-            self.assertIn("[refiner]   MISSING KEY openai-compatible", buf_ref_miss.getvalue())
+            self.assertIn("[refiner]   FAIL (MISSING KEY) openai-compatible", buf_ref_miss.getvalue())
 
             # Top-level cli.main() exception redaction: non-prefix UUID-like secret stored ONLY in .env
             # under a custom api_key_env pointer MUST still be redacted on uncaught Exception & ConfigError!
@@ -2100,20 +2102,20 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 r_stop = daemon.handle_trigger("toggle")
                 self.assertEqual(r_stop["state"], "recognizing")
                 self.assertTrue(hud_recognizing_evt.wait(timeout=2.0))
-                # stop_recording() runs BEFORE HUD 'recognizing' and beep so slow HUD RPCs never extend capture!
-                self.assertEqual(ops[0], "stop_rec")
-                self.assertLess(ops.index("stop_rec"), ops.index("hud:recognizing"))
+                # HUD 'recognizing' fires immediately before stop_recording() tail-drain, while beep stays after stop_rec!
+                self.assertEqual(ops[0], "hud:recognizing")
+                self.assertLess(ops.index("hud:recognizing"), ops.index("stop_rec"))
                 self.assertLess(ops.index("stop_rec"), ops.index("beep:stop"))
 
                 self.assertTrue(hud_done_evt.wait(timeout=2.0))
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline and daemon.state != "idle":
                     time.sleep(0.02)
-                # Full two-stage HUD batch order: recognizing -> refining -> done, all after stop_rec!
+                # Full two-stage HUD batch order: recognizing (pre-drain) -> refining -> done!
                 hud_seq = [op for op in ops if op.startswith("hud:")]
                 self.assertEqual(hud_seq, ["hud:recognizing", "hud:refining", "hud:done"])
                 self.assertIn("beep:stop", ops)
-                self.assertLess(ops.index("stop_rec"), ops.index("hud:recognizing"))
+                self.assertLess(ops.index("hud:recognizing"), ops.index("stop_rec"))
                 st = daemon.handle_control({"cmd": "status"})
                 lr = st["last_result"]
                 self.assertTrue(lr["ok"])
@@ -2179,7 +2181,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                 t_stop = threading.Thread(target=lambda: out_stop.update(d2.handle_trigger("toggle")))
                 t_stop.start()
                 self.assertTrue(in_drain.wait(timeout=2.0))
-                self.assertEqual(drain_ops, ["stop_rec_enter"])
+                self.assertEqual(drain_ops, ["hud:recognizing", "stop_rec_enter"])
                 self.assertEqual(d2.handle_control({"cmd": "status"})["state"], "recognizing")
 
                 # Arrival at +50ms (<180ms debounce) while drain is still holding _trigger_lock
@@ -3539,7 +3541,7 @@ class DaemonStateMachineAndSocketTests(unittest.TestCase):
                     self.assertEqual(r_stop.get("skipped_reason"), exp_reason)
                     self.assertEqual(daemon.last_result.get("skipped_reason"), exp_reason)
                     self.assertEqual(daemon.state, "idle")
-                    self.assertEqual(events, [f"hud:{exp_state}", "beep:error"])
+                    self.assertEqual(events, ["hud:recognizing", f"hud:{exp_state}", "beep:error"])
                     self.assertEqual(hud_records[-1][0], exp_state)
                     self.assertEqual(hud_records[-1][1], exp_dur)
                     self.assertTrue(hud_records[-1][2].get("clear_main"))

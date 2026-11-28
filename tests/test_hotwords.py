@@ -952,18 +952,20 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
             ],
         )
 
-        # Stage 2: deterministic (tier, term.lower(), term) -> byte-identical across comments/blank lines/reordering
+        # Stage 2: matches Stage 1 priority order (pinned -> effective alias -> plain, preserving file order within tiers)
+        # and stays byte-identical across comments, blank lines, and CRLF edits without reordering entries.
         text_v2 = (
             "\r\n# Different header & comments\r\n"
-            "Alpha  # moved around\r\n"
-            "!ZebraPin\r\n"
-            "AmbigTwo <- 共享词\r\n"
+            "豆包  # inline comment\r\n"
+            "\r\n"
             "飞书\r\n"
-            "中文别名词 <- 别名一\r\n"
-            "豆包\r\n"
-            "AmbigOnly <- 共享词\r\n"
-            "!置顶中文\r\n"
+            "Alpha\r\n"
             "Beta <- 贝塔\r\n"
+            "!置顶中文\r\n"
+            "!ZebraPin\r\n"
+            "中文别名词 <- 别名一\r\n"
+            "AmbigOnly <- 共享词\r\n"
+            "AmbigTwo <- 共享词\r\n"
         )
         t2 = parse_hotwords_text(text_v2)
 
@@ -973,12 +975,12 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
         self.assertEqual(t1.stage2_entries, t2.stage2_entries)
         self.assertEqual(
             [e.term for e in t1.stage2_entries],
-            ["ZebraPin", "置顶中文", "Beta", "中文别名词", "Alpha", "AmbigOnly", "AmbigTwo", "豆包", "飞书"],
+            ["置顶中文", "ZebraPin", "Beta", "中文别名词", "豆包", "飞书", "Alpha", "AmbigOnly", "AmbigTwo"],
         )
 
-    def test_quota_specs_and_dashscope_150_1800_and_single_hop_200_3000(self) -> None:
-        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_terms, 150)
-        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_chars, 1800)
+    def test_quota_specs_and_dashscope_250_2800_and_single_hop_200_3000(self) -> None:
+        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_terms, 250)
+        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_chars, 2800)
         self.assertEqual(STAGE2_HOTWORDS_MAX_ITEMS, 200)
         self.assertEqual(STAGE2_HOTWORDS_MAX_CHARS, 3000)
         self.assertEqual(SINGLE_HOP_HOTWORDS_MAX_ITEMS, 200)
@@ -1009,6 +1011,7 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
         self.assertEqual(resolve_hotwords_quota_spec("deepseek").key, "deepseek_asr_unsupported")
         self.assertEqual(resolve_hotwords_quota_spec("whisper").key, "whisper")
         self.assertEqual(resolve_hotwords_quota_spec("single_hop").key, "single_hop")
+        self.assertEqual(resolve_hotwords_quota_spec("openrouter").key, "openrouter_keyterms")
         self.assertEqual(
             resolve_hotwords_quota_spec("openrouter", model="microsoft/mai-transcribe-2:nitro").key,
             "openrouter_keyterms",
@@ -1023,21 +1026,23 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
         )
         self.assertEqual(resolve_hotwords_quota_spec("custom-unknown").key, "single_hop")
 
-        # DashScope 150 terms / 1800 chars flat budgeter
-        ds_many = [f"d{i:03d}" for i in range(160)]
+        # DashScope 250 terms / 2800 chars flat budgeter
+        ds_many = [f"d{i:03d}" for i in range(260)]
         ds_res = budget_hotwords_for_provider(ds_many, "dashscope")
-        self.assertEqual(ds_res.kept_count, 150)
+        self.assertEqual(ds_res.kept_count, 250)
         self.assertEqual(ds_res.dropped_count, 10)
         self.assertIn("+5 more", format_budget_line(ds_res))
 
-        # Doubao stem collapse, max_term_chars, whole-word skip
+        # Doubao stem collapse, max_term_chars, whole-word skip (50 terms / 1000 chars)
+        self.assertEqual(HOTWORDS_QUOTA_SPECS["doubao"].max_terms, 50)
+        self.assertEqual(HOTWORDS_QUOTA_SPECS["doubao"].max_chars, 1000)
         db_terms = [
             "ManualTop",
             "refiner.py",
             "refiner",
             "x" * 70,
-            *(f"{chr(ord('a') + i)}" * 60 for i in range(8)),
-            "z" * 60,
+            *(f"{chr(ord('a') + i)}" * 60 for i in range(16)),  # 9 + 7 + 16*60 = 976 <= 1000
+            "z" * 60,  # 976 + 60 = 1036 > 1000 -> skipped!
             "Tail",
         ]
         db_res = budget_hotwords_for_provider(db_terms, "doubao")
@@ -1046,7 +1051,7 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
         self.assertNotIn("refiner.py", db_res.kept)
         self.assertIn("Tail", db_res.kept)
         self.assertEqual(db_res.dropped, ("x" * 70, "z" * 60))
-        self.assertEqual(db_res.used_chars, 500)
+        self.assertEqual(db_res.used_chars, 980)
 
         # OpenAI keywords sanitization
         self.assertEqual(sanitize_openai_keyword("<KestrelDB>"), "KestrelDB")
@@ -1094,7 +1099,7 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
         # 2. Agent mode ceil(30%) dynamic reserve:
         #    - Doubao (50): dyn_reserve = 15, personal pass1 <= 35
         #    - Whisper (35): dyn_reserve = 11 (ceil(10.5)), personal pass1 <= 24
-        #    - DashScope (150): dyn_reserve = 45, personal pass1 <= 105
+        #    - DashScope (250): dyn_reserve = 75, personal pass1 <= 175
         ag_doubao = AsrContext(
             mode="agent",
             personal_hotwords=tuple(f"p{i:02d}" for i in range(60)),
@@ -1117,15 +1122,15 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
 
         ag_ds = AsrContext(
             mode="agent",
-            personal_hotwords=tuple(f"p{i:03d}" for i in range(120)),
-            dynamic_hotwords=tuple(f"d{i:03d}" for i in range(60)),
+            personal_hotwords=tuple(f"p{i:03d}" for i in range(200)),
+            dynamic_hotwords=tuple(f"d{i:03d}" for i in range(90)),
             builtin_hotwords=tuple(f"b{i:03d}" for i in range(20)),
             hotwords_bucketed=True,
         )
         r_ds = project_stage1_hotwords(ag_ds, "dashscope")
-        self.assertEqual(r_ds.kept_count, 150)
-        self.assertEqual(r_ds.personal_kept, 105)
-        self.assertEqual(r_ds.dynamic_kept, 45)
+        self.assertEqual(r_ds.kept_count, 250)
+        self.assertEqual(r_ds.personal_kept, 175)
+        self.assertEqual(r_ds.dynamic_kept, 75)
         self.assertEqual(r_ds.builtin_kept, 0)
 
         # 3. Backfill order: personal_overflow -> dynamic_overflow -> builtin

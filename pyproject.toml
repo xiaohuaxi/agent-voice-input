@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-voice-input"
-version = "0.18.0"
+version = "0.18.1"
 description = "Context-aware voice input for CLI coding agents and desktop apps (two-stage STT + refiner or single-hop multimodal)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -50,7 +50,7 @@ Changelog = "https://github.com/xiaohuaxi/agent-voice-input/blob/main/CHANGELOG.
 Issues = "https://github.com/xiaohuaxi/agent-voice-input/issues"
 
 [project.scripts]
-agent-voice-input = "agent_voice_input.cli:main"
+agent-voice-input = "agent_voice_input._entry:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

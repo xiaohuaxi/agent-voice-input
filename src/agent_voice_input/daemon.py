@@ -252,6 +252,7 @@ class VoiceInputDaemon:
         self._recording_trigger_action: str = ""
         self._recording_shim_id: int = 0
         self._stopping_capture: bool = False
+        self._stopping_silent_hud: bool = False
         self._utterance_queue: deque[_QueuedUtterance] = deque()
         self._commit_queue: deque[_CommitSlot] = deque()
         self._active_task: _QueuedUtterance | None = None
@@ -605,17 +606,36 @@ class VoiceInputDaemon:
         with self._hud_lock:
             calls: list[tuple[str, str, int, str | None, bool | None, bool | None, int]] = []
             with self._lock:
-                if (
-                    not self._stop_evt.is_set()
-                    and not self._recording_active
-                    and not self._stopping_capture
-                ):
+                if not self._stop_evt.is_set() and not self._recording_active:
                     self._recompute_state_locked()
                     vis_st = self._derive_bg_stage_locked(visible_only=True)
                     if vis_st == desired_stage and self._main_hud_state != desired_stage:
                         self._update_main_hud_visibility_locked(desired_stage)
                         calls.append((desired_stage, "", 0, None, None, None, 0))
             self._emit_hud_calls_unlocked(calls)
+
+    def _sync_main_hud_after_silent_end(self, *, allow_during_stopping: bool = False) -> str:
+        """Restore active background HUD or hide a stale visible main HUD without emitting toasts or beeps."""
+        with self._hud_lock:
+            calls: list[tuple[str, str, int, str | None, bool | None, bool | None, int]] = []
+            with self._lock:
+                cur_state = self._recompute_state_locked()
+                vis_bg = self._derive_bg_stage_locked(visible_only=True)
+                rec_busy = (
+                    self._recording_active
+                    if allow_during_stopping
+                    else (self._recording_active or self._stopping_capture)
+                )
+                if not self._stop_evt.is_set() and not rec_busy:
+                    if vis_bg:
+                        if self._main_hud_state != vis_bg:
+                            calls.append((vis_bg, "", 0, None, None, None, 0))
+                    elif self._main_hud_visible:
+                        calls.append(("hide", "", 0, None, None, None, 0))
+                    for st_n, _, _, lyr_n, clr_m_n, _, _ in calls:
+                        self._update_main_hud_visibility_locked(st_n, layer=lyr_n, clear_main=clr_m_n)
+            self._emit_hud_calls_unlocked(calls)
+        return cur_state
 
     def _emit_recording_cancel_hud(self, *, show_cancelled_toast: bool) -> str:
         with self._hud_lock:
@@ -700,6 +720,7 @@ class VoiceInputDaemon:
                 rec_cnt, rec_gap = self._rec_recovery_count, self._rec_recovery_gap_ms
                 self._clear_recording_state_locked()
                 self._stopping_capture = True
+                self._stopping_silent_hud = eff_silent
                 win_snap = self._origin_win
                 self._recompute_state_locked()
             self._cancel_max_duration_timer()
@@ -748,6 +769,7 @@ class VoiceInputDaemon:
                         lr_lost["recovery_gap_ms"] = rec_gap
                 with self._lock:
                     self._stopping_capture = False
+                    self._stopping_silent_hud = False
                     self._recompute_state_locked()
                     if not self._recording_active and self._rec_seq_id == cur_seq:
                         self._recorder_lost_seq = cur_seq
@@ -779,6 +801,7 @@ class VoiceInputDaemon:
             )
             with self._queue_cv:
                 self._stopping_capture = False
+                self._stopping_silent_hud = False
                 if self._stop_evt.is_set():
                     self._recompute_state_locked()
                     return
@@ -843,6 +866,7 @@ class VoiceInputDaemon:
         *,
         eff_silent: bool,
         restore_main_if_needed: bool,
+        sync_main_if_silent: bool = False,
         clear_recording: bool = False,
         clear_stopping: bool = False,
     ) -> dict[str, Any]:
@@ -855,6 +879,7 @@ class VoiceInputDaemon:
                     self._clear_recording_state_locked()
             if clear_stopping:
                 self._stopping_capture = False
+                self._stopping_silent_hud = False
             err_state = self._recompute_state_locked()
             lr: dict[str, Any] = {
                 "seq_id": cur_seq,
@@ -873,6 +898,8 @@ class VoiceInputDaemon:
                 duration_ms=err_hud_dur,
                 restore_main_if_needed=restore_main_if_needed,
             )
+        elif still_cur and eff_silent and sync_main_if_silent:
+            self._sync_main_hud_after_silent_end()
         if not eff_silent:
             self.platform.beep("error")
         out_err: dict[str, Any] = {"ok": False, "error": err, "state": err_state, "seq_id": cur_seq}
@@ -943,10 +970,12 @@ class VoiceInputDaemon:
                 resume_state = "idle"
                 stop_hud_stage = "recognizing"
                 cancelled_rec_seq = -1
+                started_silent = False
                 if action == "ptt_cancel":
                     if not self._recording_active:
                         return {"ok": True, "state": self.state, "seq_id": self.seq_id}
-                    eff_silent = bool(silent_hud or self._cur_silent_hud)
+                    started_silent = self._cur_silent_hud
+                    eff_silent = bool(silent_hud or started_silent)
                     cancelled_rec_seq = self._recording_seq_id
                     self._clear_recording_state_locked()
                     self.seq_id += 1
@@ -987,10 +1016,12 @@ class VoiceInputDaemon:
                 elif action in ("toggle", "ptt_stop") and self._recording_active:
                     cur_seq = self._recording_seq_id
                     eff_no_paste = bool(no_paste or self._cur_no_paste)
-                    eff_silent = bool(silent_hud or self._cur_silent_hud)
+                    started_silent = self._cur_silent_hud
+                    eff_silent = bool(silent_hud or started_silent)
                     rec_cnt, rec_gap = self._rec_recovery_count, self._rec_recovery_gap_ms
                     self._clear_recording_state_locked()
                     self._stopping_capture = True
+                    self._stopping_silent_hud = eff_silent
                     if expected_seq_id is None:
                         self._last_trigger_ts = now
                     win_snap = self._origin_win
@@ -1011,6 +1042,8 @@ class VoiceInputDaemon:
                 if not eff_silent:
                     resume_state = self._emit_recording_cancel_hud(show_cancelled_toast=False)
                     self.platform.beep("error")
+                elif not started_silent:
+                    resume_state = self._sync_main_hud_after_silent_end()
                 return {"ok": True, "state": resume_state, "seq_id": cur_seq}
 
             if mode == "start":
@@ -1116,6 +1149,24 @@ class VoiceInputDaemon:
 
             self._cancel_max_duration_timer()
             stop_rec_lost = False
+            if not eff_silent and not self._stop_evt.is_set():
+                with self._hud_lock:
+                    stop_hud_calls: list[
+                        tuple[str, str, int, str | None, bool | None, bool | None, int]
+                    ] = []
+                    with self._lock:
+                        if not self._stop_evt.is_set():
+                            eff_stop_stage = (
+                                self._derive_bg_stage_locked(visible_only=True) or "recognizing"
+                            )
+                            if self._main_hud_state != eff_stop_stage:
+                                self._update_main_hud_visibility_locked(eff_stop_stage)
+                                stop_hud_calls.append(
+                                    (eff_stop_stage, "", 0, None, None, None, 0)
+                                )
+                    self._emit_hud_calls_unlocked(stop_hud_calls)
+            elif not started_silent and not self._stop_evt.is_set():
+                self._sync_main_hud_after_silent_end(allow_during_stopping=True)
             try:
                 raw_wav, src_used = self.platform.stop_recording()
                 snap_audio_err = str(getattr(self.platform, "last_audio_error", "") or "")
@@ -1128,28 +1179,14 @@ class VoiceInputDaemon:
                             self._auto_stop_ts = done_ts
                             self._auto_stop_absorbed = False
                 if not eff_silent and not self._stop_evt.is_set():
-                    with self._hud_lock:
-                        stop_hud_calls: list[
-                            tuple[str, str, int, str | None, bool | None, bool | None, int]
-                        ] = []
-                        with self._lock:
-                            if not self._stop_evt.is_set():
-                                eff_stop_stage = (
-                                    self._derive_bg_stage_locked(visible_only=True) or "recognizing"
-                                )
-                                self._update_main_hud_visibility_locked(eff_stop_stage)
-                                stop_hud_calls.append(
-                                    (eff_stop_stage, "", 0, None, None, None, 0)
-                                )
-                        self._emit_hud_calls_unlocked(stop_hud_calls)
-                    if not self._stop_evt.is_set():
-                        self.platform.beep("stop")
+                    self.platform.beep("stop")
             except Exception as exc:
                 return self._handle_capture_failure(
                     cur_seq,
                     exc,
                     eff_silent=eff_silent,
                     restore_main_if_needed=True,
+                    sync_main_if_silent=not started_silent,
                     clear_stopping=True,
                 )
 
@@ -1168,6 +1205,7 @@ class VoiceInputDaemon:
             )
             with self._queue_cv:
                 self._stopping_capture = False
+                self._stopping_silent_hud = False
                 if self._stop_evt.is_set():
                     stop_out_state = self._recompute_state_locked()
                     return {"ok": False, "ignored": "stopping", "state": stop_out_state, "seq_id": cur_seq}
@@ -1186,6 +1224,7 @@ class VoiceInputDaemon:
         with self._trigger_lock:
             cancel_rec_mode = False
             cancelled_rec_seq = -1
+            started_rec_silent = False
             eff_rec_silent = bool(silent_hud)
             resume_state = "idle"
             candidates: list[_QueuedUtterance] = []
@@ -1222,7 +1261,8 @@ class VoiceInputDaemon:
                 if self._recording_active and (seq_id is None or seq_id == self._recording_seq_id):
                     cancel_rec_mode = True
                     cancelled_rec_seq = self._recording_seq_id
-                    eff_rec_silent = bool(silent_hud or self._cur_silent_hud)
+                    started_rec_silent = self._cur_silent_hud
+                    eff_rec_silent = bool(silent_hud or started_rec_silent)
                     self._clear_recording_state_locked()
                     self.seq_id += 1
                     self._rec_seq_id = self.seq_id
@@ -1251,6 +1291,8 @@ class VoiceInputDaemon:
                 if not eff_rec_silent:
                     resume_state = self._emit_recording_cancel_hud(show_cancelled_toast=True)
                     self.platform.beep("error")
+                elif not started_rec_silent:
+                    resume_state = self._sync_main_hud_after_silent_end()
                 return {
                     "ok": True,
                     "cancelled_recording": cancelled_rec_seq,
@@ -1297,7 +1339,7 @@ class VoiceInputDaemon:
                     cancel_calls: list[tuple[str, str, int, str | None, bool | None, bool | None, int]] = []
                     with self._lock:
                         cur_rec = self._recording_active and not self._stopping_capture
-                        cur_stopping = self._stopping_capture
+                        cur_stopping = self._stopping_capture and not self._stopping_silent_hud
                         cur_vis_bg = self._derive_bg_stage_locked(visible_only=True)
                         cur_vis_cnt = self._visible_inflight_count_locked()
                         self._recompute_state_locked()
@@ -1320,6 +1362,14 @@ class VoiceInputDaemon:
                                     cancel_calls.append(("cancelled", "", 0, None, False, None, 0))
                                 else:
                                     cancel_calls.append(("cancelled", "", 0, None, True, None, 0))
+                            else:
+                                if cur_stopping:
+                                    pass
+                                elif cur_vis_bg:
+                                    if self._main_hud_state != cur_vis_bg:
+                                        cancel_calls.append((cur_vis_bg, "", 0, None, None, None, 0))
+                                elif self._main_hud_visible:
+                                    cancel_calls.append(("hide", "", 0, None, None, None, 0))
                             for st_n, _, _, lyr_n, clr_m_n, _, bg_n in cancel_calls:
                                 self._update_main_hud_visibility_locked(
                                     st_n, layer=lyr_n, clear_main=clr_m_n, bg_count=bg_n
@@ -1803,7 +1853,11 @@ class VoiceInputDaemon:
                             rec_active=rec_active,
                             recording_active=self._recording_active,
                             stopping_capture=self._stopping_capture,
-                            cur_silent_hud=self._cur_silent_hud,
+                            cur_silent_hud=(
+                                self._stopping_silent_hud
+                                if self._stopping_capture
+                                else self._cur_silent_hud
+                            ),
                             main_hud_state=self._main_hud_state,
                             main_hud_visible=self._main_hud_visible,
                             main_hud_bg_count=self._main_hud_bg_count,

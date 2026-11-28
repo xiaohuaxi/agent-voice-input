@@ -129,7 +129,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 }
                 self.assertEqual(
                     REFINER_AUTO_PRIORITY,
-                    ("deepseek", "dashscope", "gemini", "openrouter", "volcengine", "openai", "groq", "siliconflow"),
+                    ("openrouter", "deepseek", "dashscope", "gemini", "volcengine", "openai", "groq", "siliconflow"),
                 )
                 for idx, expected_prov in enumerate(REFINER_AUTO_PRIORITY):
                     env_subset = dict(base_env)
@@ -1174,6 +1174,7 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 buf = io.StringIO()
                 with (
                     mock.patch.object(cli_mod.sys, "platform", "linux"),
+                    mock.patch("agent_voice_input.audio_proc.resolve_ffmpeg_bin", return_value=""),
                     mock.patch("agent_voice_input.control_ipc.send_control_command", side_effect=_ctrl),
                     mock.patch.object(cli_mod.subprocess, "Popen", return_value=_LiveProc()),
                     mock.patch.object(cli_mod, "_run_startup_preflight_ping", return_value=[]),
@@ -1183,17 +1184,16 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 return buf.getvalue()
 
-            # Stage 2-only key (ARK_API_KEY) leaves asr_ready==False -> explicit Warning
+            # Stage 2-only key (ARK_API_KEY) leaves asr_ready==False -> explicit actionable Warning + Hotkey preserved
             out_no_asr = _run_fresh_start(
                 Config(),
                 {**env_base, "ARK_API_KEY": "ark_only_stage2_test_key"},
             )
             self.assertIn("Daemon    started (pid=42424)", out_no_asr)
-            self.assertIn(
-                "Warning   no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
-                out_no_asr,
-            )
-            self.assertNotIn("Hotkey    ", out_no_asr)
+            self.assertIn("Warning   no Stage 1 ASR key configured;", out_no_asr)
+            self.assertIn("agent-voice-input restart", out_no_asr)
+            self.assertIn("Warning   ffmpeg not found", out_no_asr)
+            self.assertIn("Hotkey    tap RControl to start/stop", out_no_asr)
 
             # DeepSeek single key now auto-selects BOTH Stage 1 ASR (deepseek) & Stage 2 Refiner (deepseek)
             ds_ping_urls: list[str] = []
@@ -1323,10 +1323,8 @@ class V0101OnboardingAutoRefinerAndCliTests(unittest.TestCase):
                 {**env_base, "ARK_API_KEY": "ark_only_stage2_test_key"},
             )
             self.assertIn("Daemon    starting (pid=42424, socket warming up)", out_warm_no_asr)
-            self.assertIn(
-                "Warning   no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
-                out_warm_no_asr,
-            )
+            self.assertIn("Warning   no Stage 1 ASR key configured;", out_warm_no_asr)
+            self.assertIn("agent-voice-input restart", out_warm_no_asr)
             self.assertNotIn("Hotkey    ", out_warm_no_asr)
 
 
@@ -2032,10 +2030,10 @@ class V100ContractAndFirstRunPolishTests(unittest.TestCase):
         import agent_voice_input as pkg_init
         from agent_voice_input.config import parse_toml
 
-        self.assertEqual(pkg_init.__version__, "0.18.0")
+        self.assertEqual(pkg_init.__version__, "0.18.1")
         self.assertNotIn("Two-stage", pkg_init.__doc__ or "")
         pyp = parse_toml((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(pyp["project"]["version"], "0.18.0")
+        self.assertEqual(pyp["project"]["version"], "0.18.1")
         self.assertIn("Development Status :: 4 - Beta", pyp["project"]["classifiers"])
         self.assertNotIn("Two-stage", pyp["project"]["description"])
         for kw in ("antigravity", "agy", "dictation", "tmux"):
@@ -2237,7 +2235,8 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
             ):
                 self.assertEqual(cli_mod.main(["init"]), 0)
             txt_wsl = out_wsl.getvalue()
-            self.assertIn("local subscription ready for free", txt_wsl)
+            self.assertIn("local ChatGPT/Codex login detected", txt_wsl)
+            self.assertNotIn("ready for free", txt_wsl)
             for k in ("DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
                 self.assertIn(k, txt_wsl)
             self.assertIn("agent-voice-input integrate", txt_wsl)
@@ -2633,7 +2632,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
         self.assertIn("> **Tip:**", readme)
 
         pyp = parse_toml((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(pyp["project"]["version"], "0.18.0")
+        self.assertEqual(pyp["project"]["version"], "0.18.1")
         self.assertEqual(
             pyp["project"]["urls"]["Documentation"],
             "https://github.com/xiaohuaxi/agent-voice-input#readme",
@@ -2893,7 +2892,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
             ):
                 self.assertEqual(cli_mod._cmd_doctor(cfg_after, env_after), 1)
             txt_doc_ark = buf_doc_ark.getvalue()
-            self.assertIn("[asr]       selected=auto (none configured; no Stage 1 ASR key found) -> MISSING KEY", txt_doc_ark)
+            self.assertIn("[asr]       selected=auto (none configured; no Stage 1 ASR key found) -> FAIL (MISSING KEY)", txt_doc_ark)
             self.assertNotIn("selected=dashscope", txt_doc_ark)
             self.assertIn("NOTE detected Stage 2 refiner-only key (ARK_API_KEY)", txt_doc_ark)
             self.assertIn("OPENAI_API_KEY", txt_doc_ark)
@@ -3371,7 +3370,7 @@ class OobeP0CliIntegrationTests(unittest.TestCase):
                 rc, out, err = _run_cli(["hotwords", "list", "--json", "--config", str(cfg_path)], env)
                 self.assertEqual(rc, 0, err)
                 pop_js = json.loads(out)
-                self.assertEqual(pop_js["terms"], ["豆包", "GrokBot", "Harness"])
+                self.assertEqual(pop_js["terms"], ["豆包", "Harness", "GrokBot"])
                 self.assertEqual(pop_js["counts"], {"total": 3, "pinned": 1, "with_aliases": 3, "warnings": 0})
                 harness_entry = [e for e in pop_js["entries"] if e["term"] == "Harness"][0]
                 self.assertEqual(

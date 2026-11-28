@@ -67,6 +67,7 @@ def _create_minimal_repo(
     (pkg / "win_shim").mkdir(parents=True, exist_ok=True)
     (pkg / "mac_shim").mkdir(parents=True, exist_ok=True)
     for mod in (
+        "_entry.py",
         "cli.py",
         "daemon.py",
         "prompts.py",
@@ -117,7 +118,7 @@ def _build_fake_dists(
         zf.writestr(f"{dist_info}/METADATA", f"Metadata-Version: 2.1\nName: agent-voice-input\nVersion: {w_ver}\n")
         zf.writestr(
             f"{dist_info}/entry_points.txt",
-            "[console_scripts]\nagent-voice-input = agent_voice_input.cli:main\n",
+            "[console_scripts]\nagent-voice-input = agent_voice_input._entry:main\n",
         )
         zf.writestr(f"{dist_info}/licenses/LICENSE", "Apache-2.0\n")
         for arc, data in (extra_wheel_files or {}).items():

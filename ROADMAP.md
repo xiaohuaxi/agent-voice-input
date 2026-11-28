@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前已发布基线**：`v0.18.0`（主干待发版增量归入 [CHANGELOG.md](CHANGELOG.md) 的 `[Unreleased]`；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
+> **当前已发布基线**：`v0.18.1`（主干未发布增量归入 [CHANGELOG.md](CHANGELOG.md)；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
 >
 > **工程规范与上下文路由架构**：[AGENTS.md](AGENTS.md) · [docs/context-routing.md](docs/context-routing.md)
 
@@ -20,8 +20,8 @@
 - **精修提示词治理：现阶段坚持维护一套统一提示词**：
   - 所有精修渠道与模型共用同一套提示词真身，避免多套提示词漂移带来的维护与回归成本；按单模型分叉专属提示词仅作备选预案，启用前须经维护者明确批准。
 - **统一家目录底座与个人热词存储/投影解耦，绝不让未确认的单次精修猜测直写持久化 `hotwords/personal.txt`**：
-  - 配置、凭据、个人热词与录音归档统一收敛于 `~/.agent-voice-input/`（受 `AGENT_VOICE_INPUT_HOME` 覆盖，支持 `hotwords/` 目录软链同步与默认全忽略仅放行 `hotwords/` 的 `.gitignore`）；个人热词采用扁平单文件 `hotwords/personal.txt`（支持 `!` 置顶与 `<-` 误听别名），与运行期双轨投影（Stage 1 权重分层保行序 + 30% 动态词保底、Stage 2 块 0 确定性排序保前缀缓存）解耦。
-  - 未经确认的模型猜词一旦误判写入持久化词表，会形成“脏词声学偏置 → 后续识别持续带偏”的自激污染闭环，并挤占豆包 ASR 等窄配额渠道预算（`50 词 / 500 字符`）。
+  - 配置、凭据、个人热词与录音归档统一收敛于 `~/.agent-voice-input/`（受 `AGENT_VOICE_INPUT_HOME` 覆盖，支持 `hotwords/` 目录软链同步与默认全忽略仅放行 `hotwords/` 的 `.gitignore`）；个人热词采用扁平单文件 `hotwords/personal.txt`（支持 `!` 置顶与 `<-` 误听别名），与运行期双轨投影（Stage 1 权重分层保行序 + 30% 动态词保底、Stage 2 块 0 按 `!` 置顶 → 带别名 → 文件序选取前 `200 条 / 3,000 字`）解耦。
+  - 未经确认的模型猜词一旦误判写入持久化词表，会形成“脏词声学偏置 → 后续识别持续带偏”的自激污染闭环，并挤占豆包 ASR 等窄配额渠道预算（`50 词 / 1,000 字符`）。
   - 坚持通过人工/CLI 确认维护个人词表，并配合确定性标识符提取、工作区源码/文件名兜底与低优先级内置词表覆盖高频术语。
 - **桌面 GUI 适配抓大放小，不碰编辑器私有状态库与无障碍 DOM 抓取**：
   - 仅复用前台窗口进程/Bundle ID、窗口标题、macOS `AXDocument` 文档路径、同构明文会话日志及 AGY/Codex 只读会话索引获取上下文与热词。
@@ -53,7 +53,23 @@
 
 ---
 
-### 最新发版里程碑（`已发布 · v0.18.0`）
+### 已归档里程碑（`已发布 · v0.18.1`）
+
+以下实测驱动的默认模型与热词预算收口、Stage 2 分层保序投影与初始开发者热词、停录先切 HUD 反馈及开箱防呆优化已在 `v0.18.1` 完成落地并正式发布：
+
+1. **实测驱动的 ASR / Refiner 默认值与热词配额收口**：
+   - 将 OpenRouter 默认 Stage 1 ASR 升级为 `microsoft/mai-transcribe-2`（约 `$0.10/小时`，支持原生 `keyterms` 50 词热词）；将 `REFINER_AUTO_PRIORITY` 调整为 `openrouter -> deepseek -> dashscope -> ...`（`openai`/`gemini` 仍保留在 `dashscope` 之后，防静默消耗老用户全局 Shell Key）并为 `openrouter` 默认开启 `effort = "low"`；
+   - 将百炼 `qwen3-asr-flash` Stage 1 热词上限放宽至 `250 词 / 2,800 字`（同步放宽 `_compose_context_text` 总预算至 `5,800` 字保底前缀不截尾且保持对话尾段独立 `2,000` 字上限），豆包 Stage 1 字符上限放宽至 `1,000 字`。
+2. **Stage 2 分层保序热词投影与 `init` 初始开发者热词**：
+   - Stage 2 / 单跳 `<vocabulary_hints>` 改为按优先级分层（`!` 置顶 → 带有效 `<-` 别名 → 普通词，各层内保持原文件从上到下顺序）选取并渲染前 `200 条 / 3,000 字`，消除底部 A 开头英文词挤掉顶部中文与 Z 开头词的问题；
+   - 首次 `init` 新建 `hotwords/personal.txt` 时写入 18 个常见 AI/Agent/开发者初始词（可见可自由删改，`init --force` 绝不覆盖，同时照顾 `agent` 与 `general` 双模式）。
+3. **停录即时 HUD 切换、开箱防呆与双语文档重构**：
+   - 停录前先将 HUD 切至 `"recognizing"`（或下一活跃阶段）消除 `tail_drain` 体感延迟；
+   - `bin/agent-voice-input` 新增 Python `>= 3.10` 守卫，`doctor`/`status`/`start` 补齐 `.env` 模板占位符检测、缺 Key 明确标 `FAIL`、macOS SSH 授权终端提示、WSL2 WASAPI `no_default` 与陈旧 `WSL_INTEROP` 诊断及 `config.toml` 损坏恢复指引；重构双语 README（平铺 PyPI 与零依赖直跑安装、补齐模型选型指南与 PEP 668 说明）。
+
+---
+
+### 已归档里程碑（`已发布 · v0.18.0`）
 
 以下统一本地归档与短 ID 贯通、启动轻量预检与模型级探活、精修回退 HUD 提示、CLI 人类可读默认输出及全链路可靠性与发版门禁加固已在 `v0.18.0` 完成落地并正式发布：
 
@@ -229,10 +245,12 @@
    - **配套 AI-native 热词维护 Skill & 预算持续校准**：提供热词维护 Skill 引导 Coding Agent 按预算与形态契约维护词表，并基于后续真人录音回放持续校准强 ASR 上限与分桶比例。
 2. **本地 CLI 订阅精修渠道**：
    - `refiner.provider = "claude"`（`规划中`）：待本机 Claude Code 环境就绪后实测落地无工具精修渠道（`agy` 已于 `v0.12.0` 正式发布）。
-3. **真录音模型横评与原生 Gemini 单跳定向补测**：依托仓外隔离时间点回放基线，系统开展主流 ASR / 精修组合的真录音横向对比评测与原生 Gemini 单跳路径定向补测。
-4. **桌面版全新空会话首轮上下文关联**：在 Antigravity 2.0 与 ChatGPT/Codex 统一桌面端中，新建空对话在首句生成标题前尚无窗口级目录线索，当前保持宁缺毋滥防跨仓串台；后续视桌面端暴露活跃工作区/会话 ID 机制再评估零猜测首轮绑定。
-5. **桌面端后续扩展**：跟进 WSL2 跨系统读取 Windows 宿主机桌面 App 上下文（macOS Claude 桌面版 Code / Cowork 本地会话绑定已于 `v0.15.0` 正式发布）。
-6. **脱离 WSL 的原生 Windows 独立运行**：覆盖未安装 WSL 的纯 Windows 桌面端用户，原生本地直读 Windows 宿主机 `.codex/`、`.gemini/` 与 Claude 会话目录并复用原生 WASAPI 采集与热键/HUD 桥接；针对同时使用 WSL 终端与 Windows 桌面 App 的混合用户，优先评估「原生 Windows 单守护进程 + 轻量 `wsl.exe` 探针（复用现有 SSH 远端探针模型）」的单热键共存架构，避免双系统热键状态机跳跃冲突。
+3. **起录初始静音提醒（防蓝牙耳机未佩戴 / 系统挂空麦静默录空）**：仅在刚按键开录的前几秒内若持续未检测到有效人声/电平，通过 HUD 状态栏（闪烁或文案）清晰提示未收到声音；绝不干扰用户录音中途停顿浏览后再继续说话（需评估低开销本机实时电平检测方案，确保不影响现有录音与桥接延迟）。
+4. **面向非 Python 技术栈用户的极简安装与开箱演进**：降低非 Python 开发者（如 Node.js 等技术栈）的安装与 README 阅读门槛，评估单命令安装脚本、Homebrew tap 等更低心智负担的分发形态。
+5. **原生 Gemini 单跳定向补测与后续模型持续跟踪**：主力 ASR / 精修组合及百炼热词上限、OpenRouter 默认 ASR 已在 `v0.18.1` 完成真录音实测收口；后续依托仓外隔离时间点回放基线持续补测原生 Gemini 单跳路径及新一代低延迟模型。
+6. **桌面版全新空会话首轮上下文关联**：在 Antigravity 2.0 与 ChatGPT/Codex 统一桌面端中，新建空对话在首句生成标题前尚无窗口级目录线索，当前保持宁缺毋滥防跨仓串台；后续视桌面端暴露活跃工作区/会话 ID 机制再评估零猜测首轮绑定。
+7. **桌面端后续扩展**：跟进 WSL2 跨系统读取 Windows 宿主机桌面 App 上下文（macOS Claude 桌面版 Code / Cowork 本地会话绑定已于 `v0.15.0` 正式发布）。
+8. **脱离 WSL 的原生 Windows 独立运行**：覆盖未安装 WSL 的纯 Windows 桌面端用户，原生本地直读 Windows 宿主机 `.codex/`、`.gemini/` 与 Claude 会话目录并复用原生 WASAPI 采集与热键/HUD 桥接；针对同时使用 WSL 终端与 Windows 桌面 App 的混合用户，优先评估「原生 Windows 单守护进程 + 轻量 `wsl.exe` 探针（复用现有 SSH 远端探针模型）」的单热键共存架构，避免双系统热键状态机跳跃冲突。
 
 #### 近期架构复评与技术债跟踪
 
@@ -243,14 +261,14 @@
     - **`openrouter`（`google/*`）取消 `< 50K` 单块显式写断点**：`llm_common.py` 中 `openrouter_cache_breakpoints()` 对 `google/*` 改为仅在存在已封口历史块（`history_blocks >= 2`，断点落在 `offset + history_blocks - 2`）时打显式 `cache_control: ephemeral`，`history_blocks <= 1` 时不再对动态增长尾块打显式断点，消除每轮重建 Gemini 显式缓存引发的写抖动、23.8s 延迟尖峰与“当轮写即读”虚假高命中。
   - **待专题治理的剩余项与回归门禁**：
     - **跨渠道上下文组织模型统一文档沉淀**：系统梳理各渠道协议/消息分块、`role` 权责与防上下文指令误导边界，并沉淀为独立设计文档；
-    - **`< 50K` 单块策略与渠道差异评估**：针对官方 `api.openai.com` 可变尾块增长当轮呈全量 `cache_write`（0% 命中，区别于 `chatgpt.com` Codex 后端 128-token 前缀匹配）、原生 `gemini`（`gemini-3.7-flash`）`< 50K` 单块增长时 Turn 1 变化即归零，以及 `agy`/`codex`/`gemini` 在 General 模式下恒为 `0%`（宜在诊断指标中与 Agent 模式分列观测）做专题权衡；
+    - **`< 50K` 单块策略与渠道差异评估**：针对官方 `api.openai.com` 可变尾块增长当轮呈全量 `cache_write`（0% 命中，区别于 `chatgpt.com` Codex 后端 128-token 前缀匹配）以及原生 `gemini`（`gemini-3.7-flash`）`< 50K` 单块增长时 Turn 1 变化即归零做专题权衡（`diagnose` 按 `agent`/`general` 分列观测缓存命中率已于 `v0.18.0` 落地）；
     - **多渠道真实缓存命中率回归门禁**：将覆盖多块增量续写、`< 50K` 单块增长、词表热更恢复与 `agent`/`general` 分列统计的真实上游复测纳入涉及精修消息结构、角色分配、分块边界或缓存断点改动后的必要回归验证，避免仅跑离线单测而漏测线上缓存退化。
 - **Ghostty 直投改走标准输入传参（延后项）**：当前 macOS Ghostty 直投通过 `osascript` `argv` 传递口述文本；后续在真实 Ghostty 环境验证 JXA（`osascript -l JavaScript` 读取 `stdin`）对中文、引号与换行符的保真度后，切换为 `stdin` 传参以消除短暂进程命令行参数暴露面（同时避免使用同样可见的环境变量传参）。
 - **平台录音生命周期异步交接复评（已复评结案 · 转为条件触发式前置清理）**：已在 `v0.15.0` 发布后完成专项架构复评，确认 `MacOSPlatform`（`15s` 首帧授权等待、`0.45s` 尾音 `tail_drain`、热插拔自动恢复与 `close()` 收敛）与 `WslPlatform`（跨进程 WASAPI 管道三态写回执与停录/取消代次交接）约 **75%–80%** 属硬件、操作系统与跨进程边界的固有复杂度，当前 Daemon 生产运行路径已达 `0 P0 / 0 P1` 稳定基线；已完成无痛卫生清理（补齐双端状态不变量与锁序注释，并为 `WslPlatform.stop_recording()` 增加 `_expected_gen` 错代保护与 `cancel_recording()` 强杀前 writer 归属复核，闭合仅限平台直调并发的理论 P1）并正式结案。显式单会话状态机重构（macOS `phase`/`stop_intent` + 单一 `_live_recs`、WSL `_WslRecSession`）转为**条件触发式前置清理**，待未来启动「脱离 WSL 的原生 Windows 独立运行」或扩展 macOS 运行期音频采集能力前再分端实施。
 
 #### `v1.0` 正式版日常长稳签收（Production Readiness Gate）
 
-`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.18.0` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
+`v1.0` 不预设硬性时间表，待 `v0.10.0`–`v0.18.1` 已落地核心能力在真实日常高频口述中完成长稳验证、满足以下四项准入标准后正式打标：
 
 1. **外部用户零门槛开箱**：仅配置任意单一支持语音转写的主流渠道 API Key（可自动搭配本地 CLI 登录态或独立二阶段凭据），即可通过 `init` 与 `doctor --ping` 完成体检并稳定投入日常使用。
 2. **全场景安全投递与零串台**：本地终端、跨机 SSH 远端 Linux、主流桌面 IDE、普通桌面 GUI 应用与远程桌面自动让行均长期稳定运行；跨场景上下文严格隔离，系统剪贴板零意外污染，全链路严守不自动发送回车。

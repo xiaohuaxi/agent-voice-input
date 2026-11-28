@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/xiaohuaxi/agent-voice-input/blob/main/LICENSE)
 
 **Context-aware voice input for CLI coding agents—grounded in your live session, repo, and SSH hosts.**  
-Built for **Codex**, **Claude Code**, and **Antigravity CLI (`agy`)**, while working out of the box across desktop IDEs and everyday apps.
+Supports **macOS** and **Windows + WSL2**. Built for **Codex**, **Claude Code**, and **Antigravity CLI (`agy`)**, while working out of the box across desktop IDEs and everyday apps.
 
 ```text
 🎙️ What you say casually to your terminal:
@@ -40,11 +40,26 @@ Install and configure agent-voice-input following docs/agent-setup.md (https://g
 
 ### Path B: Manual Setup in 3 Steps
 
-```bash
-# 1. Install prerequisites (Python >= 3.10; macOS: `brew install ffmpeg` + `xcode-select --install` | WSL2: `sudo apt install ffmpeg`)
-uv tool install agent-voice-input          # or `pipx install agent-voice-input` / `pip install agent-voice-input` (Python >= 3.10)
+**Prerequisites**: Python `>= 3.10`, `ffmpeg` (macOS: `brew install ffmpeg` + `xcode-select --install`; WSL2: `sudo apt install ffmpeg`).
 
-# 2. Initialize ~/.agent-voice-input/ (0600 config.toml & .env + default-ignore .gitignore; optional: `--asr`, `--refiner`, `--hotkey`)
+#### Step 1: Install (Pick Either Option)
+
+**Option 1 — PyPI one-line install** *(installs into `~/.local/bin`; ensure `~/.local/bin` is in your `PATH`)*:
+```bash
+uv tool install agent-voice-input          # or: pipx install agent-voice-input
+```
+
+**Option 2 — Clone repo & run with zero dependencies** *(pure Python `>= 3.10` standard library; no `uv` or `pipx` required)*:
+```bash
+git clone https://github.com/xiaohuaxi/agent-voice-input.git \
+  && mkdir -p ~/.local/bin \
+  && ln -s "$PWD/agent-voice-input/bin/agent-voice-input" ~/.local/bin/agent-voice-input
+```
+
+#### Step 2 & 3: Initialize, Add a Key & Start
+
+```bash
+# 2. Initialize ~/.agent-voice-input/ (0600 config.toml, .env, starter hotwords/personal.txt & default-ignore .gitignore)
 agent-voice-input init
 
 # 3. Verify connectivity & start daemon (first run compiles the native shim: ~5-15s on macOS, ~15-60s+ on WSL2 with Defender)
@@ -53,10 +68,10 @@ agent-voice-input doctor --ping && agent-voice-input start
 
 - **Keyboard-aware defaults (even without `init`)**: Both `init` and zero-`init` runtime automatically default to `key = "RCommand"` on MacBook built-in keyboards, and keep `key = "RControl"` on desktop Macs (e.g., Mac mini with an external full-size keyboard) and Windows/WSL2; an explicit `key` in `config.toml` or CLI `--hotkey` strictly takes precedence. Pitfalls to avoid on macOS: `ROption` conflicts with Doubao IME, `Fn` conflicts with the macOS 🌐 Globe key (to use `Fn`, set System Settings → Keyboard → "Press 🌐 key to" to **Do Nothing**), and `RShift` conflicts with third-party Chinese IME single-tap toggling. Tap hotkey `<= 0.5s` to start/stop; hold `0.8s` to cancel.
 - **macOS permissions belong to the starting terminal**: Grant **Microphone** (required), **Accessibility** (for `Cmd+V` auto-paste outside Ghostty/`tmux` and window-title/session routing in third-party terminals/desktop apps), and **Automation** (for Ghostty / `Terminal.app` / `iTerm2`) to the GUI terminal that runs `agent-voice-input start`; if you restart from a different terminal app, grant permissions to that terminal too.
-- **Unified app home (`~/.agent-voice-input/`)**: `config.toml`, `.env`, `hotwords/personal.txt`, and opt-in archives (`audio/` & `transcripts/`) all live under `~/.agent-voice-input/` (override root via `AGENT_VOICE_INPUT_HOME`). `init` creates a default-ignore `.gitignore` tracking only `hotwords/`, and `init --force` overwrites only `config.toml` while always preserving existing `.env` credentials and `.gitignore`.
-- **Simplest 1-key setup**: `init` auto-detects existing environment keys and local `codex` CLI logins and tells you immediately if you are ready out of the box. If you have no Stage 1 key yet, add just **1 key** to `~/.agent-voice-input/.env`:
+- **Unified app home (`~/.agent-voice-input/`)**: `config.toml`, `.env`, `hotwords/personal.txt`, and opt-in archives (`audio/` & `transcripts/`) all live under `~/.agent-voice-input/` (override root via `AGENT_VOICE_INPUT_HOME`). `init` creates a default-ignore `.gitignore` tracking only `hotwords/`, and `init --force` overwrites only `config.toml` while always preserving existing `.env` credentials, `hotwords/personal.txt`, and `.gitignore`.
+- **Simplest 1-key setup (remember to uncomment `.env` lines!)**: `init` auto-detects existing environment keys and local `codex` CLI logins and tells you immediately if you are ready out of the box. If you need a Stage 1 key, add **1 key** to `~/.agent-voice-input/.env`—**be sure to remove the leading `#` comment character** and replace the placeholder value:
   - **Mainland China**: `DASHSCOPE_API_KEY` or `DEEPSEEK_API_KEY`
-  - **Global / Overseas**: `OPENAI_API_KEY` or `GEMINI_API_KEY`
+  - **Global / Overseas**: `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY`
 - Templates & full agent guide: [`config.example.toml`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.toml), [`config.example.env`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/config.example.env), and [`docs/agent-setup.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/docs/agent-setup.md).
 
 > **Tip:** **Zero hooks required for ~80% of daily workflows**: macOS Ghostty (`✅`), `Terminal.app` (`🧪`), and `iTerm2` (`🧪`, falls back to PTY scan without Automation permission; grant Automation in System Settings for exact `tty`), local or remote `tmux` on any platform (no `~/.tmux.conf` edits), all desktop apps, and WSL2 single-window or distinct-directory windows route accurately out of the box. Only if you run multiple standalone non-`tmux` windows in the **same directory** (e.g., Windows Terminal on WSL2) do you ever need one optional command: `agent-voice-input integrate` (see [`integrations/README.md`](https://github.com/xiaohuaxi/agent-voice-input/blob/main/integrations/README.md)).
@@ -111,15 +126,35 @@ agent-voice-input doctor --ping && agent-voice-input start
 
 ---
 
-## Recommended Provider Combinations by Scenario
+## Model Selection Guide & Recommended Combinations
+
+### Mainstream Stage 1 (ASR) Providers
+
+| Provider | Model | Hotwords / Context | Highlights & Best Fit |
+| :--- | :--- | :--- | :--- |
+| **Alibaba Bailian (`dashscope`)** `✅` | `qwen3-asr-flash` | **250 terms / 2,800 chars** + recent dialogue | Top choice for Chinese & mixed CN/EN dictation; wide hotword capacity and low latency |
+| **OpenRouter (`openrouter`)** `✅` | `microsoft/mai-transcribe-2` | Native `keyterms` (**50 terms**) | ~`$0.10/hr` base rate; rock-solid transcription + native keyterms; great global/aggregator default |
+| **Doubao (`doubao`)** `✅` | `bigmodel` | **50 terms / 1,000 chars** + dialogue | Fast Mainland China alternative; single-header `DOUBAO_SPEECH_API_KEY` (no `APP_ID` required) |
+| **OpenAI (`openai`)** `✅` | `gpt-transcribe` *(default; also `gpt-4o-transcribe`)* | Native `keywords[]` (**50 terms** on `gpt-transcribe`) | Strong English & multilingual STT; pairs natively with `gpt-6-luna` refinement |
+| **DeepSeek (`deepseek`)** `✅` | `deepseek-asr` | None *(rely on Stage 2 refiner)* | Official `/v1/tools/asr` with 21-language auto-detect; ultra-low cost single-key two-stage |
+| **Google Gemini (`gemini`)** `✅` | `gemini-3.7-flash` | Stage 2-grade **200 items / 3,000 chars** + 50K context | Native **single-hop** multimodal audio + context refinement (skips Stage 2) |
+
+### Stage 2 (Refiner) Quality Tiers — Prefer Quality First
+
+- **Tier 1 — Recommended (Best Refinement Quality)**: **`codex`** (`gpt-6-luna`, reuses local Codex CLI login, never enables Fast mode), **`agy`** (`gemini-3.8-flash`, explicit opt-in via local AGY CLI), **`openrouter`** (`google/gemini-3.8-flash`, default `effort = "low"`), **`openai`** (`gpt-6-luna`), and **`gemini`** (`gemini-3.7-flash`). These models handle mid-sentence self-corrections, mixed CN/EN technical terminology, and long-session grounding noticeably better than lightweight domestic models—**prefer them whenever refinement quality matters most**.
+- **Tier 2 — Budget / Single-Key Convenience**: **`deepseek`** (`deepseek-flash`), **`dashscope`** (`qwen3.8-flash`), and **`volcengine`** (`doubao-seed-2-0-mini-260428`). Fast and inexpensive for 1-key Mainland China setups, with slightly weaker complex edit accuracy than Tier 1.
+
+### Recommended Combinations by Scenario
 
 | Scenario | Recommended Stage 1 (ASR) | Recommended Stage 2 (Refiner) | Keys / Setup Needed |
 | :--- | :--- | :--- | :--- |
-| **Reuse Existing Codex / AGY Subscription** *(zero extra Stage 2 API billing)* | `dashscope` `✅`, `doubao` `✅`, `openai` `✅`, `deepseek` `✅`, or `groq` `🧪` | `codex` `✅` *(auto-detected by `auto`; never enables Fast mode)* or `agy` `✅` *(explicit opt-in)* | 1 Stage 1 speech key + local `codex` or `agy` CLI login |
-| **Chinese / Mixed Chinese–English Daily Driver** | `dashscope` (`qwen3-asr-flash` `✅`), `doubao` (`bigmodel` `✅`), or `deepseek` (`deepseek-asr` `✅`) | `codex` `✅` / `agy` `✅` / `deepseek` `✅` / `dashscope` `✅` / `volcengine` `✅` | `DASHSCOPE_API_KEY`, `DOUBAO_SPEECH_API_KEY` *(single-header `X-Api-Key`, no `APP_ID` needed)*, or `DEEPSEEK_API_KEY` + optional Stage 2 key |
-| **English / Global Daily Driver** | `openai` (`gpt-transcribe` `✅`) or `groq` (`whisper-large-v3-turbo` `🧪`) | `codex` `✅` / `agy` `✅` / `openai` `✅` / `gemini` `✅` / `openrouter` `✅` | `OPENAI_API_KEY` or `GROQ_API_KEY` + optional Stage 2 key |
-| **Single-Key Minimal Setup** | `deepseek` `✅` *(cost-effective two-stage: `deepseek-asr` + `deepseek-flash`)*, `dashscope` `✅` *(two-stage or `qwen3.8-omni-flash` single-hop)*, `gemini` `✅` *(native single-hop)*, `openrouter` `✅` *(two-stage or single-hop)*, or `openai` `✅` *(two-stage or `gpt-audio-1.5` / `gpt-audio-mini` single-hop)* | Built-in default for two-stage, or skipped in single-hop | Just 1 key: `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, or `OPENAI_API_KEY` |
+| **Best Quality with Existing Codex / AGY Login** | `dashscope` `✅`, `openrouter` `✅`, `doubao` `✅`, `openai` `✅`, or `deepseek` `✅` | `codex` `✅` *(auto-detected by `auto`; never enables Fast mode)* or `agy` `✅` *(explicit opt-in)* | 1 Stage 1 speech key + local `codex` or `agy` CLI login |
+| **Mainland China Daily Driver (CN / Mixed CN–EN)** | `dashscope` (`qwen3-asr-flash` `✅`, 250-term hotwords) or `doubao` (`bigmodel` `✅`, 50/1,000) | Tier 1: `codex` `✅` / `agy` `✅` / `openrouter` `✅` *(or Tier 2 budget: `deepseek` `✅` / `dashscope` `✅`)* | `DASHSCOPE_API_KEY` or `DOUBAO_SPEECH_API_KEY` + preferred Stage 2 login/key |
+| **Global / Aggregator Single-Key (High Quality)** | `openrouter` (`microsoft/mai-transcribe-2` `✅`, ~$0.10/hr, two-stage) or `openai` (`gpt-transcribe` `✅`) | `openrouter` (`google/gemini-3.8-flash` `✅`) or `openai` (`gpt-6-luna` `✅`) | Just 1 key: `OPENROUTER_API_KEY` or `OPENAI_API_KEY` |
+| **Minimal 1-Key Budget or Single-Hop** | `deepseek` `✅` *(budget two-stage)*, `dashscope` `✅` *(two-stage or `qwen3.8-omni-flash` single-hop)*, or `gemini` `✅` *(native single-hop)* | Built-in default for two-stage, or skipped in single-hop | Just 1 key: `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY`, or `GEMINI_API_KEY` |
 
+> **Note on OpenRouter**: Use OpenRouter in **two-stage** mode (`microsoft/mai-transcribe-2` + `google/gemini-3.8-flash`). Single-hop multimodal chat-audio on OpenRouter is intentionally omitted from recommended recipes because skipping explicit cache writes on `< 50K` sessions makes repeated single-hop audio calls pricier than two-stage.
+>
 > **On local / self-hosted models**: This release focuses on thoroughly tested mainstream cloud APIs and existing CLI logins (`codex` / `agy`). While a generic `openai-compatible` custom `base_url` hook already exists under the hood (`🧪`), fully verified **first-class support for local / private self-hosted models** (compact local ASR + refiner) is planned for **`v1.1+`**.
 
 ---
@@ -137,18 +172,20 @@ agent-voice-input doctor --ping && agent-voice-input start
 
 - **My MacBook doesn't have a Right Ctrl key—what should I use?**  
   Both `agent-voice-input init` and zero-`init` runtime automatically detect MacBook built-in keyboards and default to `key = "RCommand"` (Right Command, recommended first), while desktop Macs (e.g., Mac mini) and external full-size keyboards keep `key = "RControl"`; an explicit `key` in `config.toml` or CLI `--hotkey` always takes precedence. Avoid common conflicts: `ROption` collides with Doubao IME, `Fn` collides with the macOS 🌐 Globe key (to use `Fn`, set System Settings → Keyboard → "Press 🌐 key to" → **Do Nothing**), and `RShift` collides with third-party Chinese IME single-tap toggling. You can change `[hotkey]` in `~/.agent-voice-input/config.toml` anytime, run `agent-voice-input restart`, or inspect keycodes with `agent-voice-input key-test`.
+- **Why isn't bare `pip install agent-voice-input` recommended in Quick Start?**  
+  Homebrew Python on macOS (and modern Debian/Ubuntu distros) enforces **PEP 668 (`externally-managed-environment`)**, causing bare `pip install` outside a virtualenv to fail. Use `uv tool install agent-voice-input` or `pipx install agent-voice-input` for isolated PyPI installs, or clone the repo and symlink `bin/agent-voice-input` directly with zero dependencies.
 - **How do I auto-start, upgrade, or completely uninstall?**
   - **Idempotent terminal auto-start** (add 1 line to `~/.zshrc` or `~/.bashrc`):
     ```bash
     [ -z "$SSH_CONNECTION" ] && command -v agent-voice-input >/dev/null 2>&1 && agent-voice-input start >/dev/null 2>&1
     ```
     > **Warning (macOS):** **Never use `launchd` (`LaunchAgent`) to launch the daemon in the background on macOS.** Background `launchd` agents lose the GUI terminal's Microphone & Automation TCC attribution and silently record all-zero audio; always start from your authorized GUI terminal.
-  - **Upgrade**: `uv tool upgrade agent-voice-input && agent-voice-input restart` (or `pipx upgrade agent-voice-input && agent-voice-input restart`).
+  - **Upgrade**: `uv tool upgrade agent-voice-input && agent-voice-input restart` (or `pipx upgrade agent-voice-input && agent-voice-input restart`; if running from a git clone, `git pull && agent-voice-input restart`).
   - **Uninstall**:
     ```bash
     agent-voice-input stop
     agent-voice-input integrate --uninstall   # optional: remove managed CLI hooks
-    uv tool uninstall agent-voice-input       # or pipx/pip uninstall
+    uv tool uninstall agent-voice-input       # or pipx uninstall / rm ~/.local/bin/agent-voice-input
     # Optional: remove config, runtime & cache files listed below
     ```
   - **Where files live**:
@@ -166,7 +203,7 @@ agent-voice-input doctor --ping && agent-voice-input start
 - **Why does it only paste and never auto-press Enter?**  
   In terminals and SSH sessions, auto-executing a misheard command is dangerous. Paste-only lets you glance before hitting Enter, and if you switch windows mid-processing, output safely falls back to your clipboard instead of pasting into the wrong window.
 - **Should I choose two-stage (STT + Refiner) or single-hop multimodal?**  
-  **Two-stage** gives the widest provider choice (including single-key `deepseek` two-stage), lets you reuse existing Codex/AGY subscriptions with zero extra Stage 2 fee, and handles long technical dictation most reliably. **Single-hop** (`gemini`, DashScope `qwen3.8-omni-flash`, OpenAI `gpt-audio-1.5` / `gpt-audio-mini`, or OpenRouter multimodal chat-audio) is simpler with one request and one key, and sends audio plus session context directly to that single multimodal provider.
+  **Two-stage** gives the widest provider choice (including 1-key `openrouter` and `deepseek` two-stage), lets you reuse existing Codex/AGY logins for top-tier refinement, and handles long technical dictation most reliably. **Single-hop** (`gemini`, DashScope `qwen3.8-omni-flash`, or OpenAI `gpt-audio-1.5` / `gpt-audio-mini`) is simpler with one request and one key, and sends audio plus session context directly to that single multimodal provider.
 
 ---
 
@@ -195,11 +232,13 @@ agent-voice-input key-test                              # Inspect raw key scanco
 
 Keep your personal names, project brands, and recurring ASR mishearings in a single flat plain-text file—and let **Claude Code**, **Codex**, or **AGY** bootstrap or tidy it for you:
 
-- **Unified flat file & dotfiles symlink**: `~/.agent-voice-input/hotwords/personal.txt` (locate via `agent-voice-input hotwords path`; hot-reloads automatically; directory-fd `flock` leaves zero `.lock` files). To sync across machines via a dotfiles repo, **symlink the `hotwords/` directory** (e.g., `ln -sfn ~/.dotfiles/avi-hotwords ~/.agent-voice-input/hotwords`) rather than `personal.txt` itself (single-file symlinks are rejected on read/write; note that `.gitignore` under `~/.agent-voice-input/` intentionally does not traverse a symlinked `hotwords/` directory).
+- **Unified flat file, starter vocabulary & dotfiles symlink**: `~/.agent-voice-input/hotwords/personal.txt` (locate via `agent-voice-input hotwords path`; hot-reloads automatically; directory-fd `flock` leaves zero `.lock` files). On your first `agent-voice-input init`, creating `personal.txt` seeds ~18 common AI, Agent, and developer starter terms (visible, editable, and removable; never overwritten even by `init --force`; active across both `agent` and `general` modes). To sync across machines via a dotfiles repo, **symlink the `hotwords/` directory** rather than `personal.txt` itself (single-file symlinks are rejected on read/write; `.gitignore` under `~/.agent-voice-input/` intentionally does not traverse a symlinked `hotwords/` directory):
+  - *Before your first `init`*: `mkdir -p ~/.agent-voice-input && ln -s ~/.dotfiles/avi-hotwords ~/.agent-voice-input/hotwords` (then `agent-voice-input init` keeps the symlink and preserves any existing `personal.txt` inside it).
+  - *After `init` already created a local `hotwords/` directory*: merge or back up `~/.agent-voice-input/hotwords/personal.txt` into `~/.dotfiles/avi-hotwords/` first, remove the local `~/.agent-voice-input/hotwords` directory, then run `ln -s ~/.dotfiles/avi-hotwords ~/.agent-voice-input/hotwords` (running `ln -sfn` while `hotwords/` is still a real directory creates a nested link inside it instead of replacing it).
 - **Pinning (`!`) & mishearing aliases (`<-`)**: Prefix critical terms with `!` (`!Antigravity` or `agent-voice-input hotwords add Antigravity --pin`) to pin them ahead of all other entries. Add mishearing aliases with `CanonicalTerm <- mishearing1, mishearing2` or `agent-voice-input hotwords add Harness --alias 哈尼斯,哈尼思` (max 5 aliases per entry; single-character aliases rejected; 2-character aliases warn; ambiguous aliases shared by multiple terms are hidden automatically while keeping both canonical terms). Stage 1 ASR receives canonical terms only; Stage 2 / single-hop uses aliases to fix stubborn mishearings.
 - **Decoupled Stage 1 & Stage 2 budgets**:
-  - **Stage 1 ASR**: Orders entries by tier (`!pinned` → `aliased` → `plain`, preserving file line order within each tier so CJK names are never pushed out by ASCII order). In `general` mode, 100% of the provider quota goes to personal terms; in `agent` mode, at least 30% of slots are reserved for dynamic repo/session terms with unused space refilled from overflow (e.g., DashScope **150 terms / 1,800 chars**, Doubao **50 / 500**, OpenAI `keywords[]` **50**, OpenRouter `keyterms` **50**, Whisper **35 / 353**; `deepseek-asr` relies on Stage 2).
-  - **Stage 2 / Single-Hop Block 0 (`<vocabulary_hints>`)**: Sorts deterministically by `(tier, term.lower(), term)` to preserve 85%–99% prompt prefix caching across comment/whitespace/line-order edits, carrying a wide **200 items / 3,000 chars** budget in both `agent` and `general` modes. Inspect live budgets & diagnostics anytime via `agent-voice-input hotwords list [--json]`.
+  - **Stage 1 ASR**: Orders entries by tier (`!pinned` → `aliased` → `plain`, preserving file line order within each tier so CJK names are never pushed out by ASCII order). In `general` mode, 100% of the provider quota goes to personal terms; in `agent` mode, at least 30% of slots are reserved for dynamic repo/session terms with unused space refilled from overflow (e.g., DashScope **250 terms / 2,800 chars**, Doubao **50 / 1,000**, OpenAI `keywords[]` **50**, OpenRouter `keyterms` **50**, Whisper **35 / 353**; `deepseek-asr` relies on Stage 2).
+  - **Stage 2 / Single-Hop Block 0 (`<vocabulary_hints>`)**: Selects and renders up to **200 items / 3,000 chars** in priority-tier order (`!pinned` → effective `<-` aliased → plain entries, preserving file top-to-bottom order within each tier) across both `agent` and `general` modes, so placing high-priority personal/project terms near the top of `personal.txt` keeps them inside the budget without A–Z reordering. Inspect live budgets & diagnostics anytime via `agent-voice-input hotwords list [--json]`.
 - **Two rules for your Agent**: **always show the diff and wait for your confirmation before editing `personal.txt`**, and **never guess mishearing aliases up front—only add `<-` aliases after observing a real ASR mistake**.
 
 Copy-paste prompts for your coding agent:
@@ -232,7 +271,7 @@ Configuration priority: `CLI flags > ~/.agent-voice-input/config.toml > built-in
 | **`dashscope`** | `asr`, `refiner` | `✅` *(STT, single-hop & refiner)* | `qwen3-asr-flash` *(or single-hop `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(compat: `ALI_API_KEY`)* |
 | **`doubao`** | `asr` | `✅` *(1.0 & 2.0)* | `bigmodel` | — | `DOUBAO_SPEECH_API_KEY` *(single-header `X-Api-Key`, no `APP_ID` needed; compat: `DOUBAO_ASR_API_KEY` or legacy `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`; `asr.doubao_resource_id = "auto"` prefers sync `volc.bigasr.auc_turbo` with cached fallback to `volc.seedasr.auc` / `volc.bigasr.auc`)* |
 | **`volcengine`** | `refiner` | `✅` *(`doctor --ping` & refiner)* | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(compat: `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
-| **`openrouter`** | `asr`, `refiner` | `✅` *(STT, single-hop & refiner)* | `qwen/qwen3-asr-1.7b` | `google/gemini-3.8-flash` | `OPENROUTER_API_KEY` |
+| **`openrouter`** | `asr`, `refiner` | `✅` *(STT & refiner)* | `microsoft/mai-transcribe-2` *(~$0.10/hr, native `keyterms`)* | `google/gemini-3.8-flash` *(default `effort = "low"`)* | `OPENROUTER_API_KEY` |
 | **`gemini`** | `asr`, `refiner` | `✅` *(single-hop & refiner)* | `gemini-3.7-flash` *(single-hop)* | `gemini-3.7-flash` | `GEMINI_API_KEY` |
 | **`openai`** | `asr`, `refiner` | `✅` *(STT, single-hop & refiner)* | `gpt-transcribe` *(or single-hop `gpt-audio-1.5` / `gpt-audio-mini`)* | `gpt-6-luna` | `OPENAI_API_KEY` |
 | **`groq`** | `asr`, `refiner` | `🧪` | `whisper-large-v3-turbo` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
@@ -241,30 +280,30 @@ Configuration priority: `CLI flags > ~/.agent-voice-input/config.toml > built-in
 | **`off`** | `refiner` | `✅` | — | *(Stage 2 disabled; raw Stage 1 output)* | None |
 
 - `asr.provider = "auto"` (default): picks the first configured credential in order `dashscope -> doubao -> deepseek -> openai -> gemini -> groq -> openrouter -> siliconflow`.
-- `refiner.provider = "auto"` (default): prefers local `codex` CLI login when present, else picks `deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow`, or degrades cleanly to `"off"`. (`agy` is explicit opt-in only.)
+- `refiner.provider = "auto"` (default): prefers local `codex` CLI login when present, else picks `openrouter -> deepseek -> dashscope -> gemini -> volcengine -> openai -> groq -> siliconflow`, or degrades cleanly to `"off"`. (`agy` is explicit opt-in only.)
 
 ```toml
 # Recipe 1: Reuse local Codex or AGY CLI login for Stage 2 + fast Stage 1 STT
 [asr]
-provider = "dashscope"           # Or "doubao" / "openai" / "deepseek" / "groq"
+provider = "dashscope"           # Or "openrouter" / "doubao" / "openai" / "deepseek"
 
 [refiner]
 provider = "codex"               # Or "agy" for Antigravity CLI login
 ```
 
 ```toml
-# Recipe 2: Single-key two-stage via DeepSeek or OpenRouter (uses built-in defaults)
+# Recipe 2: Single-key two-stage via OpenRouter or DeepSeek (uses built-in defaults)
 [asr]
-provider = "deepseek"            # Or "openrouter" (with just DEEPSEEK_API_KEY, `auto` already picks deepseek for both stages)
+provider = "openrouter"          # microsoft/mai-transcribe-2; or "deepseek" (deepseek-asr)
 
 [refiner]
-provider = "deepseek"            # Or "openrouter"
+provider = "openrouter"          # google/gemini-3.8-flash; or "deepseek" (deepseek-flash)
 ```
 
 ```toml
 # Recipe 3: Single-hop multimodal audio + 50K cached session context (skips Stage 2)
 [asr]
-provider = "gemini"              # Or "dashscope" + model = "qwen3.8-omni-flash", "openai" + model = "gpt-audio-1.5" / "gpt-audio-mini", or "openrouter" + model = "google/gemini-3.8-flash"
+provider = "gemini"              # Or "dashscope" + model = "qwen3.8-omni-flash", or "openai" + model = "gpt-audio-1.5" / "gpt-audio-mini"
 ```
 
 </details>
@@ -289,9 +328,9 @@ provider = "gemini"              # Or "dashscope" + model = "qwen3.8-omni-flash"
 
 - **Provider-first defaults (`model`) & HUD locale (`ui.language`)**: Leave `model = ""` to use each provider's built-in default; overriding `provider` via CLI without `--*-model` resets to the new provider's default. Explicit `model` values are passed upstream verbatim. `ui.language` accepts `"auto"`, `"zh"`, `"en"`, as well as standard BCP 47 tags such as `"zh-CN"` / `"en-US"`.
 - **Two-stage vs. single-hop (`asr.api`, `asr.doubao_resource_id`)**: `"auto"` routes dedicated STT models (`qwen3-asr-flash`, `doubao`, `deepseek-asr`, `whisper-*`, `*-transcribe`, `SenseVoiceSmall`) to Stage 1 + Stage 2, and routes native `gemini`, DashScope `qwen*-omni*`, official OpenAI `gpt-audio-1.5` / `gpt-audio-mini` (or explicit `asr.api = "chat-completions"`), and multimodal chat-audio models on OpenRouter/OpenAI-compatible to single-hop (sharing the 50K sealed `<session_reference_log>` prefix blocks, in-memory `64 kbps` MP3 compression for `>= 3s` clips, and `610s` single-chunk cap; skips Stage 2 unless `refiner.force_on_single_hop = true`). DeepSeek official ASR (`POST https://api.deepseek.com/v1/tools/asr`) supports `asr.api = "auto"` only (21-language auto-detection, no hotword/language params). Doubao slot selection uses `asr.doubao_resource_id = "auto"` (or explicit slot ID) plus `asr.doubao_mode`. For uncataloged models on `openrouter`, set `asr.api = "audio-transcriptions"` or `"chat-completions"` explicitly.
-- **Stage 2 protocol & reasoning budget (`refiner.api`, `effort`, `session_max_turns`)**: `refiner.api = "auto"` uses stateless HTTP `/responses` (`store=false`, `stream=true`) for `codex` and official `openai` (`api.openai.com`), local `agy acp` stdio JSON-RPC for `agy`, native `:generateContent` for `gemini`, and `/chat/completions` for custom third-party `openai` `base_url`s and other providers (explicit `"responses"` / `"chat-completions"` always overrides). `asr.effort` and `refiner.effort` default to `""` (tool-recommended per-provider default: `"low"` for `codex`/`agy`/`openai` refinement, `"none"` for Stage 1 single-hop audio and all other Stage 2 providers) and accept `"default"` (omit thinking parameters and defer to upstream defaults) or `"none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"` (`"none"` disables thinking where supported, clamps to the lowest valid level on mandatory-thinking models, and is ignored on non-thinking models). For `agy`, `refiner.session_max_turns = 0` (default) imposes no fixed turn cap and rotates naturally on 200K eviction or vocabulary changes.
+- **Stage 2 protocol & reasoning budget (`refiner.api`, `effort`, `session_max_turns`)**: `refiner.api = "auto"` uses stateless HTTP `/responses` (`store=false`, `stream=true`) for `codex` and official `openai` (`api.openai.com`), local `agy acp` stdio JSON-RPC for `agy`, native `:generateContent` for `gemini`, and `/chat/completions` for custom third-party `openai` `base_url`s and other providers (explicit `"responses"` / `"chat-completions"` always overrides). `asr.effort` and `refiner.effort` default to `""` (tool-recommended per-provider default: `"low"` for `codex`/`agy`/`openai`/`openrouter` refinement, `"none"` for Stage 1 single-hop audio and all other Stage 2 providers) and accept `"default"` (omit thinking parameters and defer to upstream defaults) or `"none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"` (`"none"` disables thinking where supported, clamps to the lowest valid level on mandatory-thinking models, and is ignored on non-thinking models). For `agy`, `refiner.session_max_turns = 0` (default) imposes no fixed turn cap and rotates naturally on 200K eviction or vocabulary changes.
 - **Extra instructions, prompt caching & cold-start fallback (`refiner.extra_instructions`, `include_git_status`, `context_max_chars`, `cold_start_fallback`)**: Built-in adaptive `agent` / `general` dictation-editor prompts stay active by default; append custom preferences safely via `refiner.extra_instructions` (list of strings, single string, or multiline string; max 20 items / 2,000 chars; applies to both two-stage and single-hop; empty keeps the default prompt byte-identical). Dialogue up to `context_max_chars = 200000` is evicted in `50K` sealed prefix blocks ahead of `<workspace_git_status>` (falls back to core tracked filenames when clean) and `<asr_draft_to_clean>`. When a new coding session starts empty/short, `cold_start_fallback = "auto"` (or `"hotwords"` / `"off"`) supplements Stage 1 hotwords and prepends one frozen `<= 25K` `<prior_session_reference>` block from recent exact-same-directory sessions.
-- **Personal flat hotwords (`hotwords/personal.txt` & `hotwords` CLI)**: Edit `~/.agent-voice-input/hotwords/personal.txt` or use `agent-voice-input hotwords list|add [--pin] [--alias]|remove|path`—hot-reloads automatically on the next dictation with directory-fd locking (zero `.lock` files). Stage 1 applies priority tiers (`!pinned` > `aliased` > `plain`, preserving file order within tiers) with 30% dynamic-term reservation & overflow refill in `agent` mode (100% personal quota in `general` mode; DashScope `150/1,800`, Doubao `50/500`, OpenAI `50`, Whisper `35/353`), while Stage 2 / single-hop renders a deterministically sorted Block 0 (`200 items / 3,000 chars`) to preserve prefix caching.
+- **Personal flat hotwords (`hotwords/personal.txt` & `hotwords` CLI)**: Edit `~/.agent-voice-input/hotwords/personal.txt` (seeded with ~18 editable developer starter terms on first `init`) or use `agent-voice-input hotwords list|add [--pin] [--alias]|remove|path`—hot-reloads automatically on the next dictation with directory-fd locking (zero `.lock` files). Stage 1 applies priority tiers (`!pinned` > `aliased` > `plain`, preserving file order within tiers) with 30% dynamic-term reservation & overflow refill in `agent` mode (100% personal quota in `general` mode; DashScope `250/2,800`, Doubao `50/1,000`, OpenAI `50`, OpenRouter `50`, Whisper `35/353`), while Stage 2 / single-hop selects and renders up to `200 items / 3,000 chars` into Block 0 in the same priority-tier order (`!pinned` > effective `<-` aliased > plain, preserving file order within each tier).
 - **Same-provider retries & opt-in local archive (`max_retries`, `[archive]`)**: Both stages default to `max_retries = 2` (`0..10`) under stage `timeout_sec` with a 9s connect/TLS handshake cap, separating `429`/QPS throttling from transient network/5xx errors. Under `[archive]` (both off by default, `0700` dirs / `0600` files, excluded by `.gitignore`, surfaced as an `Archive:` row in `status`/`doctor`/`start`), `save_transcripts = true` appends 12-field JSONL records (ASR draft, final text, and flat metadata only—never context/hotwords/secrets) to `~/.agent-voice-input/transcripts/YYYY-MM.jsonl`, and `save_audio = true` archives voiced clips as `16 kHz` `64 kbps` MP3s to `~/.agent-voice-input/audio/<id>.mp3` (`audio_max_count = 1000`, `0` = unlimited). Transcripts, audio files, and `diag.jsonl` share the same short utterance ID (`YYYYMMDD-HHMMSS-<4hex>`) for 1:1 correlation.
 
 </details>

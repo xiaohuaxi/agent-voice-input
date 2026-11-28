@@ -29,6 +29,17 @@ except ImportError:  # pragma: no cover - py310 import fallback when stdlib toml
 class ConfigError(ValueError):
     """Raised when configuration syntax or values are invalid."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_kind: str = "",
+        source_path: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.source_kind = source_kind
+        self.source_path = source_path
+
 
 UTTERANCE_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")
 
@@ -153,10 +164,10 @@ ASR_AUTO_PRIORITY: tuple[str, ...] = (
 )
 
 REFINER_AUTO_PRIORITY: tuple[str, ...] = (
+    "openrouter",
     "deepseek",
     "dashscope",
     "gemini",
-    "openrouter",
     "volcengine",
     "openai",
     "groq",
@@ -166,7 +177,7 @@ REFINER_AUTO_PRIORITY: tuple[str, ...] = (
 DEFAULT_ASR_MODELS: dict[str, str] = {
     "dashscope": "qwen3-asr-flash",
     "doubao": "bigmodel",
-    "openrouter": "qwen/qwen3-asr-1.7b",
+    "openrouter": "microsoft/mai-transcribe-2",
     "gemini": "gemini-3.7-flash",
     "openai": "gpt-transcribe",
     "deepseek": "deepseek-asr",
@@ -194,6 +205,7 @@ DEFAULT_REFINER_EFFORTS: dict[str, str] = {
     "codex": "low",
     "agy": "low",
     "openai": "low",
+    "openrouter": "low",
 }
 
 DEFAULT_ASR_BASE_URLS: dict[str, str] = {
@@ -1346,7 +1358,9 @@ def load_env_files(
             content = path.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError as exc:
             raise ConfigError(
-                f"cannot decode env file {path} as UTF-8 (byte offset {exc.start}): {exc.reason}"
+                f"cannot decode env file {path} as UTF-8 (byte offset {exc.start}): {exc.reason}",
+                source_kind="env_encoding",
+                source_path=str(path),
             ) from None
         except OSError:
             continue
@@ -3098,27 +3112,56 @@ def _validate_config(cfg: Config, *, env: Mapping[str, str] | None = None) -> No
     _validate_remote_config(cfg)
 
 
+def _config_file_source_kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return "json"
+    if suffix == ".toml":
+        return "toml"
+    return "other"
+
+
 def _load_config_file(path: Path) -> dict[str, Any]:
+    is_json = path.suffix.lower() == ".json"
+    kind = _config_file_source_kind(path)
     try:
         raw_text = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ConfigError(
-            f"cannot decode config file {path} as UTF-8 (byte offset {exc.start}): {exc.reason}"
+            f"cannot decode config file {path} as UTF-8 (byte offset {exc.start}): {exc.reason}",
+            source_kind=kind,
+            source_path=str(path),
         ) from None
     except OSError as exc:
-        raise ConfigError(f"cannot read config file {path}: {exc}") from None
-    if path.suffix.lower() == ".json":
+        raise ConfigError(
+            f"cannot read config file {path}: {exc}",
+            source_kind=kind,
+            source_path=str(path),
+        ) from None
+    if is_json:
         try:
             parsed = json.loads(raw_text)
         except json.JSONDecodeError as exc:
-            raise ConfigError(f"{path}: invalid JSON at line {exc.lineno}: {exc.msg}") from None
+            raise ConfigError(
+                f"{path}: invalid JSON at line {exc.lineno}: {exc.msg}",
+                source_kind="json",
+                source_path=str(path),
+            ) from None
         if not isinstance(parsed, dict):
-            raise ConfigError(f"{path}: JSON config root must be an object")
+            raise ConfigError(
+                f"{path}: JSON config root must be an object",
+                source_kind="json",
+                source_path=str(path),
+            )
         return parsed
     try:
         return parse_toml(raw_text)
     except ConfigError as exc:
-        raise ConfigError(f"{path}: {exc}") from None
+        raise ConfigError(
+            f"{path}: {exc}",
+            source_kind=kind,
+            source_path=str(path),
+        ) from None
 
 
 def load_config(
@@ -3159,8 +3202,15 @@ def load_config(
 
     cfg = Config()
     if chosen_path is not None:
+        chosen_kind = _config_file_source_kind(chosen_path)
         file_data = _load_config_file(chosen_path)
-        _apply_section_dict(cfg, file_data, env=env, home_dir=home_dir)
+        try:
+            _apply_section_dict(cfg, file_data, env=env, home_dir=home_dir)
+        except ConfigError as exc:
+            if not exc.source_kind:
+                exc.source_kind = chosen_kind
+                exc.source_path = str(chosen_path)
+            raise
         cfg.config_path = str(chosen_path)
 
     if cli_overrides:
@@ -3182,7 +3232,13 @@ def load_config(
         if (env is not None or home_dir is None)
         else dict(effective_env, HOME=str(home_dir))
     )
-    _validate_config(cfg, env=val_env)
+    try:
+        _validate_config(cfg, env=val_env)
+    except ConfigError as exc:
+        if chosen_path is not None and not cli_overrides and not exc.source_kind:
+            exc.source_kind = _config_file_source_kind(chosen_path)
+            exc.source_path = str(chosen_path)
+        raise
     return cfg, effective_env
 
 
@@ -3385,16 +3441,16 @@ def find_agy_bin(env: Mapping[str, str] | None = None) -> str | None:
     )
 
 
-def classify_codex_auth_json(
+def classify_codex_auth_json_with_source(
     data: Mapping[str, Any],
     env: Mapping[str, str] | None = None,
     *,
     allow_empty_auth_env_key: bool = False,
-) -> tuple[str, str, str]:
-    """Classify parsed Codex ``auth.json`` into ``(mode, token_or_key, account_id)``.
+) -> tuple[str, str, str, str]:
+    """Classify parsed Codex ``auth.json`` into ``(mode, token_or_key, account_id, source)``.
 
     ``mode`` is ``'chatgpt'``, ``'chatgpt_refresh'``, ``'api_key'``, or ``'none'``.
-    Shared by ``config.py`` auto-selection and ``refiner.py`` credential parsing.
+    ``source`` is ``'auth_json'``, ``'env'``, or ``''`` when ``mode == 'none'``.
     """
     src = os.environ if env is None else env
     auth_mode = str(data.get("auth_mode") or "").strip().lower()
@@ -3406,28 +3462,52 @@ def classify_codex_auth_json(
     account_id = str(tokens.get("account_id") or "").strip()
 
     if auth_mode in ("api_key", "apikey"):
-        resolved_key = file_api_key or env_api_key
-        return ("api_key", resolved_key, "") if resolved_key else ("none", "", "")
+        if file_api_key:
+            return "api_key", file_api_key, "", "auth_json"
+        if env_api_key:
+            return "api_key", env_api_key, "", "env"
+        return "none", "", "", ""
 
     if access_token:
-        return "chatgpt", access_token, account_id
+        return "chatgpt", access_token, account_id, "auth_json"
 
     if auth_mode not in ("chatgpt", "chatgptauthtokens"):
         if file_api_key:
-            return "api_key", file_api_key, ""
+            return "api_key", file_api_key, "", "auth_json"
         if env_api_key and (refresh_token or allow_empty_auth_env_key):
-            return "api_key", env_api_key, ""
+            return "api_key", env_api_key, "", "env"
 
     if refresh_token:
-        return "chatgpt_refresh", refresh_token, account_id
-    return "none", "", ""
+        return "chatgpt_refresh", refresh_token, account_id, "auth_json"
+    return "none", "", "", ""
 
 
-def detect_codex_local_auth_mode(env: Mapping[str, str] | None = None) -> str:
-    """Zero-subprocess classification of local Codex auth: ``'chatgpt' | 'api_key' | 'keyring' | 'none'``."""
+def classify_codex_auth_json(
+    data: Mapping[str, Any],
+    env: Mapping[str, str] | None = None,
+    *,
+    allow_empty_auth_env_key: bool = False,
+) -> tuple[str, str, str]:
+    """Classify parsed Codex ``auth.json`` into ``(mode, token_or_key, account_id)``.
+
+    ``mode`` is ``'chatgpt'``, ``'chatgpt_refresh'``, ``'api_key'``, or ``'none'``.
+    Shared by ``config.py`` auto-selection and ``refiner.py`` credential parsing.
+    """
+    mode, token_or_key, account_id, _source = classify_codex_auth_json_with_source(
+        data, env, allow_empty_auth_env_key=allow_empty_auth_env_key
+    )
+    return mode, token_or_key, account_id
+
+
+def detect_codex_local_auth(env: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """Zero-subprocess classification of local Codex auth returning ``(mode, source)``.
+
+    ``mode`` is ``'chatgpt' | 'api_key' | 'keyring' | 'none'`` and ``source`` is
+    ``'auth_json' | 'env' | 'keyring' | ''``.
+    """
     codex_home = resolve_codex_home_dir(env)
     if codex_home is None:
-        return "none"
+        return "none", ""
     auth_path = codex_home / "auth.json"
     try:
         st = os.stat(auth_path)
@@ -3439,28 +3519,35 @@ def detect_codex_local_auth_mode(env: Mapping[str, str] | None = None) -> str:
         except (OSError, ValueError):
             data = None
         if isinstance(data, Mapping):
-            mode, _, _ = classify_codex_auth_json(data, env, allow_empty_auth_env_key=False)
+            mode, _, _, src = classify_codex_auth_json_with_source(
+                data, env, allow_empty_auth_env_key=False
+            )
             if mode in ("chatgpt", "chatgpt_refresh"):
-                return "chatgpt"
+                return "chatgpt", src or "auth_json"
             if mode == "api_key":
-                return "api_key"
+                return "api_key", src or "auth_json"
             if str(data.get("auth_mode") or "").strip().lower() in ("api_key", "apikey"):
-                return "none"
+                return "none", ""
 
     cfg_path = codex_home / "config.toml"
     try:
         cst = os.stat(cfg_path)
     except OSError:
-        return "none"
+        return "none", ""
     if not stat.S_ISREG(cst.st_mode) or cst.st_size <= 0 or cst.st_size > 1_048_576:
-        return "none"
+        return "none", ""
     try:
         cfg_txt = cfg_path.read_text(encoding="utf-8-sig")
     except (OSError, ValueError):
-        return "none"
+        return "none", ""
     if _CODEX_KEYRING_STORE_RE.search(cfg_txt) and find_codex_bin(env) is not None:
-        return "keyring"
-    return "none"
+        return "keyring", "keyring"
+    return "none", ""
+
+
+def detect_codex_local_auth_mode(env: Mapping[str, str] | None = None) -> str:
+    """Zero-subprocess classification of local Codex auth: ``'chatgpt' | 'api_key' | 'keyring' | 'none'``."""
+    return detect_codex_local_auth(env)[0]
 
 
 def has_codex_local_auth(env: Mapping[str, str] | None = None) -> bool:
@@ -3678,7 +3765,7 @@ def explain_pipeline_selection(
 ) -> dict[str, Any]:
     """Single source of truth explaining active Stage 1 ASR + Stage 2 Refiner selection and ready alternatives."""
     eff_creds = creds if creds is not None else resolve_credentials(cfg, env)
-    codex_mode = detect_codex_local_auth_mode(env)
+    codex_mode, codex_auth_source = detect_codex_local_auth(env)
     codex_ready = codex_mode != "none"
 
     # --- Stage 1: ASR ---
@@ -3834,6 +3921,8 @@ def explain_pipeline_selection(
     }
     if resolved_ref == "codex" and not ref_bypassed:
         ref_dict["auth_mode"] = codex_mode
+        if codex_auth_source:
+            ref_dict["auth_source"] = codex_auth_source
 
     return {
         "asr": {

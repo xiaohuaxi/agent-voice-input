@@ -70,6 +70,7 @@ TIER_3_MODULES: tuple[str, ...] = (
     "platform_macos",
     "asr_providers",
     "refiner",
+    "_entry",
     "cli",
 )
 

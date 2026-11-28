@@ -52,18 +52,17 @@ Read `init`'s stdout summary carefully: it performs a zero-network local check o
 
 ### Built-in Auto-Routing Reference
 - **`asr.provider = "auto"`** priority: `dashscope -> doubao -> deepseek -> openai -> gemini -> groq -> openrouter -> siliconflow`.
-- **`refiner.provider = "auto"`** priority: local `codex` CLI login first (zero extra Stage 2 API cost; never enables Fast mode), else `deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow`, else `"off"`.
+- **`refiner.provider = "auto"`** priority: local `codex` CLI login first (reuses your Codex plan/quota; never enables Fast mode), else `openrouter -> deepseek -> dashscope -> gemini -> volcengine -> openai -> groq -> siliconflow`, else `"off"`.
 - **`agy` (Antigravity CLI)**: explicit opt-in only (`refiner.provider = "agy"` in `config.toml`); never auto-selected.
-- **OpenRouter default refiner model**: `google/gemini-3.8-flash`.
+- **OpenRouter defaults**: Stage 1 ASR `microsoft/mai-transcribe-2` (~`$0.10/hr`, native `keyterms`) + Stage 2 refiner `google/gemini-3.8-flash` (default `effort = "low"`). Use two-stage on OpenRouter rather than single-hop.
 
 ### Choosing & Writing Keys
 1. **If `init` already reports a valid Stage 1 key** (and optionally local `codex` login for Stage 2): do not ask for another key unless the user requested a specific provider.
-2. **If no Stage 1 key is configured**: ask the user once which single provider they prefer (mentioning if local `codex` login was detected to cover Stage 2 for free):
-   - **Mainland China (国内首选 1 把 Key)**: `DASHSCOPE_API_KEY` (strongest CN/EN two-stage) or `DEEPSEEK_API_KEY` (full two-stage with 1 key). `DOUBAO_SPEECH_API_KEY` is also supported for Stage 1 (single-header `X-Api-Key`, no `APP_ID` needed).
-   - **Global / Overseas (海外首选 1 把 Key)**: `OPENAI_API_KEY` (two-stage `gpt-transcribe` + `gpt-6-luna`) or `GEMINI_API_KEY` (native single-hop).
-   - **Aggregator**: `OPENROUTER_API_KEY` (two-stage or single-hop; default refiner `google/gemini-3.8-flash`).
+2. **If no Stage 1 key is configured**: ask the user once which single provider they prefer (mentioning if local `codex` login was detected for Stage 2):
+   - **Mainland China (国内首选 1 把 Key)**: `DASHSCOPE_API_KEY` (strongest CN/EN two-stage, 250-term hotwords) or `DEEPSEEK_API_KEY` (budget two-stage with 1 key). `DOUBAO_SPEECH_API_KEY` is also supported for Stage 1 (single-header `X-Api-Key`, no `APP_ID` needed).
+   - **Global / Overseas (海外首选 1 把 Key)**: `OPENROUTER_API_KEY` (two-stage `microsoft/mai-transcribe-2` + `google/gemini-3.8-flash`), `OPENAI_API_KEY` (two-stage `gpt-transcribe` + `gpt-6-luna`), or `GEMINI_API_KEY` (native single-hop).
    - *Gotcha*: `ARK_API_KEY` (`volcengine`) is **Stage 2 only** and cannot drive Stage 1 ASR.
-3. Write the key into `~/.agent-voice-input/.env` and verify permissions remain `0600`.
+3. Write the key into `~/.agent-voice-input/.env` (uncommenting the line by removing any leading `#`) and verify permissions remain `0600`.
 
 ### Proxy Rules
 - The pure-stdlib HTTP client only supports `http://` proxies via `HTTP_PROXY` / `HTTPS_PROXY` (pair with `NO_PROXY=127.0.0.1,localhost`).

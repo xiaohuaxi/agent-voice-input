@@ -1719,7 +1719,7 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
             )
             win = ForegroundWindow(hwnd=101, process="WindowsTerminal.exe", title="codex")
             try:
-                # 1a. Normal ptt_stop: stop_recording precedes hud:recognizing and never blocks on full HUD pipe.
+                # 1a. Normal ptt_stop: hud:recognizing fires immediately before stop_recording and never blocks on full HUD pipe.
                 self.assertTrue(daemon.handle_trigger("ptt_start", win)["ok"])
                 call_order.clear()
                 t_stop0 = time.monotonic()
@@ -1734,9 +1734,9 @@ class TestBatch1BConcurrencyFixes(unittest.TestCase):
                 self.assertIn("stop_recording", call_order)
                 self.assertIn("hud:recognizing", call_order)
                 self.assertLess(
-                    call_order.index("stop_recording"),
                     call_order.index("hud:recognizing"),
-                    f"stop_recording must run before HUD update, got {call_order}",
+                    call_order.index("stop_recording"),
+                    f"hud:recognizing must precede stop_recording on normal stop, got {call_order}",
                 )
 
                 # 1b. Subsequent ptt_start + handle_cancel + ptt_cancel stay responsive and cancel_recording precedes HUD.

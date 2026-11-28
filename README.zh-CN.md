@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 **专为 CLI Coding Agent 打造的会话感知语音输入——听得懂你的仓库、对话与远端 SSH。**  
-支持 **Codex**、**Claude Code**、**Antigravity CLI (`agy`)**，同时开箱覆盖桌面 IDE 与日常桌面应用。
+支持 **macOS** 与 **Windows + WSL2**，深度适配 **Codex**、**Claude Code** 与 **Antigravity CLI (`agy`)**，同时开箱覆盖桌面 IDE 与日常桌面应用。
 
 ```text
 🎙️ 你对着终端随口说：
@@ -39,11 +39,26 @@
 
 ### 路径 B：纯手工 3 步上手
 
-```bash
-# 1. 安装前置与 CLI（需 Python >= 3.10；macOS: `brew install ffmpeg` + `xcode-select --install` | WSL2: `sudo apt install ffmpeg`）
-uv tool install agent-voice-input          # 或 `pipx install agent-voice-input` / `pip install agent-voice-input`（需 Python >= 3.10）
+**前置要求**：Python `>= 3.10`、`ffmpeg`（macOS：`brew install ffmpeg` + `xcode-select --install`；WSL2：`sudo apt install ffmpeg`）。
 
-# 2. 初始化 ~/.agent-voice-input/（0600 config.toml 与 .env + 默认全忽略 .gitignore；可选 `--asr` / `--refiner` / `--hotkey`）
+#### 第 1 步：安装（以下两种方式任选其一）
+
+**方式一：PyPI 一键安装** *（命令安装到 `~/.local/bin`，请确保 `~/.local/bin` 已加入 `PATH`）*：
+```bash
+uv tool install agent-voice-input          # 或：pipx install agent-voice-input
+```
+
+**方式二：克隆仓库零依赖直跑** *（纯 Python `>= 3.10` 标准库，无需安装 `uv` 或 `pipx`）*：
+```bash
+git clone https://github.com/xiaohuaxi/agent-voice-input.git \
+  && mkdir -p ~/.local/bin \
+  && ln -s "$PWD/agent-voice-input/bin/agent-voice-input" ~/.local/bin/agent-voice-input
+```
+
+#### 第 2 & 3 步：初始化、填 Key 并启动
+
+```bash
+# 2. 初始化 ~/.agent-voice-input/（0600 config.toml、.env、初始开发者热词 hotwords/personal.txt 与默认全忽略 .gitignore）
 agent-voice-input init
 
 # 3. 探活体检并启动后台守护进程（首次运行需编译原生桥接：macOS 约 5–15 秒，WSL2 C# 编译 + Defender 扫描约 15–60 秒+）
@@ -52,10 +67,10 @@ agent-voice-input doctor --ping && agent-voice-input start
 
 - **自动适配本机键盘（免 `init` 同样生效）与避坑**：无论是否运行过 `init`，MacBook 内置键盘在初始化与运行时均自动默认 `key = "RCommand"`（右 Command），台式 Mac（如 Mac mini 外接标准键盘）与 Windows/WSL2 默认保持 `key = "RControl"`；`config.toml` 中的显式 `key` 或 `--hotkey` 严格优先。避坑提示：`ROption` 易撞豆包输入法，`Fn` 撞 macOS 系统 🌐 键（如要用 `Fn` 需先在 系统设置 → 键盘 将「按下 🌐 键时」设为**不执行任何操作**），`RShift` 撞第三方中文输入法单按切中英文。轻按热键 `<= 0.5s` 开始/结束录音，长按 `0.8s` 即时取消。
 - **macOS 权限归属启动终端速览**：**麦克风**（必选）、**辅助功能**（用于非 Ghostty/`tmux` 的自动粘贴及第三方终端/桌面端窗口标题与会话绑定）、**自动化**（用于 Ghostty / `Terminal.app` / `iTerm2`）均归属于执行 `agent-voice-input start` 的宿主终端；若换了其他终端 `restart`，需为新终端重新授权。
-- **统一应用家目录（`~/.agent-voice-input/`）**：`config.toml`、`.env`、`hotwords/personal.txt` 与可选归档（`audio/`、`transcripts/`）均统一收口于 `~/.agent-voice-input/`（可通过 `AGENT_VOICE_INPUT_HOME` 覆盖根目录）；`init` 排他生成默认全忽略、仅放行 `hotwords/` 的 `.gitignore`，且 `init --force` 仅覆写 `config.toml`，绝不覆盖已有 `.env` 凭据与 `.gitignore`。
-- **最简 1 把 Key 推荐**：`init` 会自动探测环境中已有的 API Key 及本机 `codex` 登录态，若已就绪直接提示开跑；若尚无一阶段语音 Key，只需在 `~/.agent-voice-input/.env` 中填入 **1 把 Key**：
+- **统一应用家目录（`~/.agent-voice-input/`）**：`config.toml`、`.env`、`hotwords/personal.txt` 与可选归档（`audio/`、`transcripts/`）均统一收口于 `~/.agent-voice-input/`（可通过 `AGENT_VOICE_INPUT_HOME` 覆盖根目录）；`init` 排他生成默认全忽略、仅放行 `hotwords/` 的 `.gitignore`，且 `init --force` 仅覆写 `config.toml`，绝不覆盖已有 `.env` 凭据、`hotwords/personal.txt` 与 `.gitignore`。
+- **最简 1 把 Key 推荐（配置 `.env` 务必去掉行首 `#`！）**：`init` 会自动探测环境中已有的 API Key 及本机 `codex` 登录态，若已就绪直接提示开跑；若尚无一阶段语音 Key，只需在 `~/.agent-voice-input/.env` 中填入 **1 把 Key**——**编辑时务必删掉对应行首的 `#` 注释符**并替换占位符：
   - **国内首选**：`DASHSCOPE_API_KEY` 或 `DEEPSEEK_API_KEY`
-  - **海外首选**：`OPENAI_API_KEY` 或 `GEMINI_API_KEY`
+  - **海外首选**：`OPENROUTER_API_KEY`、`OPENAI_API_KEY` 或 `GEMINI_API_KEY`
 - 完整配置模板与 Agent 接入契约：[`config.example.toml`](config.example.toml)、[`config.example.env`](config.example.env)、[`docs/agent-setup.md`](docs/agent-setup.md)（英文）。
 
 > [!TIP]
@@ -111,15 +126,35 @@ agent-voice-input doctor --ping && agent-voice-input start
 
 ---
 
-## 场景化推荐供应商组合
+## 模型选型指南与推荐组合
+
+### 主流一阶段语音识别（ASR）渠道对比
+
+| 渠道 | 模型 | 热词 / 上下文能力 | 核心特点与适用场景 |
+| :--- | :--- | :--- | :--- |
+| **阿里百炼 (`dashscope`)** `✅` | `qwen3-asr-flash` | **250 词 / 2,800 字**热词 + 近期对话 | 中文与中英混排主力；热词容量宽裕、延迟稳 |
+| **OpenRouter (`openrouter`)** `✅` | `microsoft/mai-transcribe-2` | 原生 `keyterms`（**50 词**） | 约 **`$0.10/小时`**；转写稳且原生吃热词，海外与聚合首选 |
+| **豆包语音 (`doubao`)** `✅` | `bigmodel` | **50 词 / 1,000 字**热词 + 对话 | 国内低延迟替代；单头 `DOUBAO_SPEECH_API_KEY` 免填 `APP_ID` |
+| **OpenAI (`openai`)** `✅` | `gpt-transcribe` *（默认，亦支持 `gpt-4o-transcribe`）* | 原生 `keywords[]`（`gpt-transcribe` 支持 **50 词**） | 纯英文与多语种主力；可同源搭配 `gpt-6-luna` 精修 |
+| **DeepSeek (`deepseek`)** `✅` | `deepseek-asr` | 不支持热词 *（依赖二阶段精修）* | 官方 `/v1/tools/asr`，21 语言自动识别；极低成本单 Key 两段式 |
+| **Google Gemini (`gemini`)** `✅` | `gemini-3.7-flash` | 二阶段同级 **200 条 / 3,000 字** + 50K 上下文 | 原生**单跳**多模态音频 + 上下文精修直出（自动跳过二阶段） |
+
+### 主流二阶段精修（Refiner）模型梯队——建议按质量优先选配
+
+- **第一梯队（推荐 · 精修质量首选）**：**`codex`**（复用本机 Codex CLI 登录，默认 `gpt-6-luna`，绝不开 Fast）、**`agy`**（显式配置复用本机 AGY CLI，默认 `gemini-3.8-flash`）、**`openrouter`**（默认 `google/gemini-3.8-flash`，默认 `effort = "low"`）、**`openai`**（默认 `gpt-6-luna`）与 **`gemini`**（默认 `gemini-3.7-flash`）。这一梯队在口语中途改口消解、中英技术术语还原与长上下文理解上明显强于轻量国产精修模型，**追求落字质量时优先选用**。
+- **第二梯队（经济 / 单 Key 省心备选）**：**`deepseek`**（`deepseek-flash`）、**`dashscope`**（`qwen3.8-flash`）与 **`volcengine`**（`doubao-seed-2-0-mini-260428`）。延迟低、单价极省、国内一把 Key 开箱即用，但在复杂口语纠偏与上下文推理上略逊于第一梯队。
+
+### 场景化推荐组合
 
 | 使用场景 | 推荐一阶段（语音识别） | 推荐二阶段（语境精修） | 所需凭据 / 配置 |
 | :--- | :--- | :--- | :--- |
-| **复用现有 Codex / AGY 订阅** *（二阶段免另购 API）* | `dashscope` `✅`、`doubao` `✅`、`openai` `✅`、`deepseek` `✅` 或 `groq` `🧪` | `codex` `✅` *（`auto` 自动复用，绝不开 Fast）* 或 `agy` `✅` *（显式配置启用）* | 1 把语音识别 Key + 本机 `codex` 或 `agy` 登录态 |
-| **国内主力（中文 / 中英混排）** | `dashscope`（阿里百炼 `qwen3-asr-flash` `✅`）、`doubao`（豆包语音 `bigmodel` `✅`）或 `deepseek`（`deepseek-asr` `✅`） | `codex` `✅` / `agy` `✅` / `deepseek` `✅` / `dashscope` `✅` / `volcengine` `✅` | `DASHSCOPE_API_KEY`、`DOUBAO_SPEECH_API_KEY` *（单头 `X-Api-Key`，无需 `APP_ID`）* 或 `DEEPSEEK_API_KEY` + 可选精修 Key |
-| **海外 / 纯英文主力** | `openai`（`gpt-transcribe` `✅`）或 `groq`（`whisper-large-v3-turbo` `🧪`） | `codex` `✅` / `agy` `✅` / `openai` `✅` / `gemini` `✅` / `openrouter` `✅` | `OPENAI_API_KEY` 或 `GROQ_API_KEY` + 可选精修 Key |
-| **一把 Key 省心全包** | `deepseek` `✅`（高性价比两段式：`deepseek-asr` + `deepseek-flash`）、`dashscope` `✅`（国内两段式或 `qwen3.8-omni-flash` 单跳）、`gemini` `✅`（海外原生单跳）、`openrouter` `✅`（两段式/单跳均可）或 `openai` `✅`（两段式或 `gpt-audio-1.5` / `gpt-audio-mini` 单跳） | 两段式用同渠道内置默认，或单跳跳过二阶段 | 仅需 1 把 Key：`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`GEMINI_API_KEY`、`OPENROUTER_API_KEY` 或 `OPENAI_API_KEY` |
+| **复用本机 Codex / AGY 登录** *（高质量首选）* | `dashscope` `✅`、`openrouter` `✅`、`doubao` `✅`、`openai` `✅` 或 `deepseek` `✅` | `codex` `✅` *（`auto` 自动复用，绝不开 Fast）* 或 `agy` `✅` *（显式配置启用）* | 1 把语音识别 Key + 本机 `codex` 或 `agy` 登录态 |
+| **国内主力（中文 / 中英混排）** | `dashscope`（阿里百炼 `qwen3-asr-flash` `✅`，250 词热词）或 `doubao`（豆包 `bigmodel` `✅`，50 词 / 1,000 字） | 第一梯队：`codex` `✅` / `agy` `✅` / `openrouter` `✅` *（或第二梯队省心：`deepseek` `✅` / `dashscope` `✅`）* | `DASHSCOPE_API_KEY` 或 `DOUBAO_SPEECH_API_KEY` + 所选精修登录态或 Key |
+| **海外 / 聚合一把 Key（高质量两段式）** | `openrouter`（`microsoft/mai-transcribe-2` `✅`，约 `$0.10/小时`）或 `openai`（`gpt-transcribe` `✅`） | `openrouter`（`google/gemini-3.8-flash` `✅`）或 `openai`（`gpt-6-luna` `✅`） | 仅需 1 把 Key：`OPENROUTER_API_KEY` 或 `OPENAI_API_KEY` |
+| **极简一把 Key（经济两段式 / 原生单跳）** | `deepseek` `✅`（低价两段式）、`dashscope` `✅`（两段式或 `qwen3.8-omni-flash` 单跳）或 `gemini` `✅`（海外原生单跳） | 两段式用同渠道内置默认，或单跳跳过二阶段 | 仅需 1 把 Key：`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY` 或 `GEMINI_API_KEY` |
 
+> **关于 OpenRouter 选型**：建议在 OpenRouter 使用**两段式**（`microsoft/mai-transcribe-2` + `google/gemini-3.8-flash`）；推荐配方中刻意不列 OpenRouter 单跳，以避免 `< 50K` 会话不写显式缓存时单跳音频重复计费偏贵。
+>
 > **关于本地 / 私有部署模型**：当前版本重点聚焦并充分实测了主流云端 API 与现有 CLI 登录（Codex / AGY）。虽然底层已提供通用的 `openai-compatible` 自定义 `base_url` 接口（`🧪`），但经过完整实测的**本地/企业私有部署模型（自部署小型 ASR + 精修）一等公民支持**规划在后续版本（**`v1.1+`**）推进。
 
 ---
@@ -137,6 +172,8 @@ agent-voice-input doctor --ping && agent-voice-input start
 
 - **MacBook 没有右 Ctrl 键怎么办？**  
   无论是否运行过 `agent-voice-input init`，MacBook 内置键盘在初始化与运行时都会自动识别并默认采用 `key = "RCommand"`（右 Command），台式 Mac（如 Mac mini）外接标准键盘则保持 `key = "RControl"`；`config.toml` 中显式配置的 `key` 或命令行 `--hotkey` 始终优先。避坑提示：`ROption` 易撞豆包输入法，`Fn` 撞 macOS 系统 🌐 键（如要用 `Fn` 需在 系统设置 → 键盘 将「按下 🌐 键时」设为**不执行任何操作**），`RShift` 撞第三方中文输入法单按切中英文。随时可在 `~/.agent-voice-input/config.toml` 的 `[hotkey]` 中切换后执行 `agent-voice-input restart`，并用 `agent-voice-input key-test` 确认键码。
+- **为什么不推荐在主流程里直接裸跑 `pip install agent-voice-input`？**  
+  macOS Homebrew Python（以及较新版本的 Debian/Ubuntu 系统 Python）默认启用了 **PEP 668（`externally-managed-environment`）** 保护，在系统环境下裸跑 `pip install` 会直接报错拦截。建议改用 `uv tool install agent-voice-input` / `pipx install agent-voice-input` 独立安装，或直接克隆仓库软链 `bin/agent-voice-input` 零依赖直跑。
 - **如何随终端自动启动、升级或彻底卸载？**
   - **随终端幂等自启**（在 `~/.zshrc` 或 `~/.bashrc` 加入一行）：
     ```bash
@@ -144,12 +181,12 @@ agent-voice-input doctor --ping && agent-voice-input start
     ```
     > [!WARNING]
     > **macOS 切勿用 `launchd`（LaunchAgent）在后台拉起守护进程！** 经 `launchd` 启动会丢失 GUI 终端的麦克风与自动化 TCC 权限归属，导致录音静默全 0 静音；请务必在本机已授权的图形终端内启动。
-  - **升级**：`uv tool upgrade agent-voice-input && agent-voice-input restart`（或 `pipx upgrade agent-voice-input && agent-voice-input restart`）。
+  - **升级**：`uv tool upgrade agent-voice-input && agent-voice-input restart`（或 `pipx upgrade agent-voice-input && agent-voice-input restart`；克隆仓库直跑用户执行 `git pull && agent-voice-input restart`）。
   - **彻底卸载**：
     ```bash
     agent-voice-input stop
     agent-voice-input integrate --uninstall   # 可选：移除受管 CLI 钩子
-    uv tool uninstall agent-voice-input       # 或 pipx / pip uninstall
+    uv tool uninstall agent-voice-input       # 或 pipx uninstall / rm ~/.local/bin/agent-voice-input
     # 如需彻底清理数据，再按下方位置表删除配置、运行与缓存目录
     ```
   - **文件存放位置**：
@@ -167,7 +204,7 @@ agent-voice-input doctor --ping && agent-voice-input start
 - **为什么默认只粘贴不自动按回车？**  
   终端与 SSH 下误听一条命令直接回车风险太高，因此默认只粘贴不发送 `Enter`，方便扫一眼再确认；处理期间若切走焦点，也会自动退回剪贴板而不强贴到别的窗口。
 - **两段式（STT + 精修）和一阶段单跳多模态怎么选？**  
-  **两段式**组合最灵活（含仅一把 `DEEPSEEK_API_KEY` 的完整两段式）、可免费复用现有 Codex/AGY CLI 订阅，且长句与复杂术语纠偏最稳；**单跳多模态**（如原生 `gemini`、百炼 `qwen3.8-omni-flash`、官方 OpenAI `gpt-audio-1.5` / `gpt-audio-mini` 或 OpenRouter 多模态模型）只需一把 Key 和一次请求，但会把音频与会话上下文一并直接发给该多模态渠道。
+  **两段式**组合最灵活（含仅一把 `OPENROUTER_API_KEY` 或 `DEEPSEEK_API_KEY` 的完整两段式）、可复用现有 Codex/AGY CLI 登录获取第一梯队精修质量，且长句与复杂术语纠偏最稳；**单跳多模态**（如原生 `gemini`、百炼 `qwen3.8-omni-flash` 或官方 OpenAI `gpt-audio-1.5` / `gpt-audio-mini`）只需一把 Key 和一次请求，但会把音频与会话上下文一并直接发给该多模态渠道。
 
 ---
 
@@ -196,11 +233,13 @@ agent-voice-input key-test                              # 测试按键扫描码�
 
 用一份扁平纯文本词表统一管理人名、项目专名与顽固空耳，并可直接交给 **Claude Code**、**Codex** 或 **AGY** 冷启动建库与定期瘦身：
 
-- **扁平单文件与 dotfiles 目录软链**：`~/.agent-voice-input/hotwords/personal.txt`（可通过 `agent-voice-input hotwords path` 查看路径与软链真身；修改后下次口述自动热加载；目录级 `flock` 写锁零 `.lock` 脏文件）。如需跨机同步，推荐**对 `hotwords/` 目录建软链**（如 `ln -sfn ~/.dotfiles/avi-hotwords ~/.agent-voice-input/hotwords`），不要对 `personal.txt` 建单文件软链（读写侧均会拒绝；注：`~/.agent-voice-input/.gitignore` 默认只放行 `hotwords/`，Git 不会跨目录软链追踪目标目录本身，符合预期）。
+- **扁平单文件、初始热词与 dotfiles 目录软链**：`~/.agent-voice-input/hotwords/personal.txt`（可通过 `agent-voice-input hotwords path` 查看路径与软链真身；修改后下次口述自动热加载；目录级 `flock` 写锁零 `.lock` 脏文件）。首次运行 `agent-voice-input init` 新建 `personal.txt` 时，会自动写入约 18 个常见 AI / Agent / 开发者初始词（明文可见、可自由增删，`init --force` 绝不覆盖已有词表，且同时照顾 `agent` 和 `general` 双模式）。如需跨机同步，推荐**对 `hotwords/` 目录建软链**，不要对 `personal.txt` 建单文件软链（读写侧均会拒绝；注：`~/.agent-voice-input/.gitignore` 默认只放行 `hotwords/`，Git 不会跨目录软链追踪目标目录本身，符合预期）：
+  - **首次安装（运行 `init` 之前）**：先执行 `mkdir -p ~/.agent-voice-input && ln -s ~/.dotfiles/avi-hotwords ~/.agent-voice-input/hotwords`，再运行 `agent-voice-input init`（会沿用该目录软链并保留目标目录中已有词表）。
+  - **已运行过 `init`（本地已有 `hotwords/` 目录）**：先将本地 `~/.agent-voice-input/hotwords/personal.txt` 备份或合并到 `~/.dotfiles/avi-hotwords/`，删除本地 `~/.agent-voice-input/hotwords` 目录后再执行 `ln -s ~/.dotfiles/avi-hotwords ~/.agent-voice-input/hotwords`（若本地 `hotwords/` 仍是真实目录就直接 `ln -sfn`，会在其内部生成嵌套软链而非替换该目录）。
 - **置顶（`!`）与可选空耳语法（`<-`）**：高频核心词可加 `!` 前缀置顶（如 `!Antigravity` 或 `agent-voice-input hotwords add Antigravity --pin`）；顽固误听可写 `规范词 <- 误识1, 误识2` 或执行 `agent-voice-input hotwords add Harness --alias 哈尼斯,哈尼思`（单条最多 5 个误识、拒单字误识、双字给出提醒、禁与规范词冲突；多个词共享的歧义别名在运行期自动隐藏但保留两侧规范词）。一阶段 ASR 仅收规范词，二阶段/单跳用空耳精准纠偏。
 - **双阶段投影与配额预算**：
-  - **一阶段 ASR**：按权重分层（`! 置顶` > `带空耳` > `普通词`，层内保留文件行序防中文专名被字母序挤出窄窗）。`general` 模式 100% 配额归个人词；`agent` 模式为仓库/会话动态词保底至少 30% 名额并在有空位时自动回流（阿里百炼 **150 词 / 1,800 字**、豆包 **50 词 / 500 字**、OpenAI `keywords[]` **50 词**、OpenRouter `keyterms` **50 词**、Whisper **35 词 / 353 字**；`deepseek-asr` 由二阶段兜底）。
-  - **二阶段 / 单跳块 0（`<vocabulary_hints>`）**：按 `(权重, term.lower(), term)` 确定性排序，改注释、空行或调整同权重行序不影响块 0 字节、稳保 85%–99% 前缀缓存；`agent` 与 `general` 模式统一提供 **200 条 / 3,000 字** 宽口词表预算，随时运行 `agent-voice-input hotwords list [--json]` 查看用量与诊断告警。
+  - **一阶段 ASR**：按权重分层（`! 置顶` > `带空耳` > `普通词`，层内保留文件行序防中文专名被字母序挤出窄窗）。`general` 模式 100% 配额归个人词；`agent` 模式为仓库/会话动态词保底至少 30% 名额并在有空位时自动回流（阿里百炼 **250 词 / 2,800 字**、豆包 **50 词 / 1,000 字**、OpenAI `keywords[]` **50 词**、OpenRouter `keyterms` **50 词**、Whisper **35 词 / 353 字**；`deepseek-asr` 由二阶段兜底）。
+  - **二阶段 / 单跳块 0（`<vocabulary_hints>`）**：同样按优先级分层（**`!` 置顶 → 带有效 `<-` 别名 → 普通词**，各层内保持原文件从上到下顺序）选取并渲染前 **200 条 / 3,000 字**（在 `agent` 与 `general` 双模式统一生效），把常用个人词与项目专名写在文件靠前位置即可稳稳留在预算内，不再因字母序被底部英文词挤掉。随时运行 `agent-voice-input hotwords list [--json]` 查看用量与诊断告警。
 - **两条 Agent 协作纪律**：**改动 `personal.txt` 前必须先展示 diff 经用户确认再落盘；不要凭空瞎猜空耳，等实战真正撞见错听后再补 `<-` 映射**。
 
 可直接复制发给你的 Coding Agent：
@@ -233,7 +272,7 @@ agent-voice-input key-test                              # 测试按键扫描码�
 | **`dashscope`** | `asr`, `refiner` | `✅` *(转写/单跳/精修均实测)* | `qwen3-asr-flash` *(或单跳 `qwen3.8-omni-flash`)* | `qwen3.8-flash` | `DASHSCOPE_API_KEY` *(兼容 `ALI_API_KEY`)* |
 | **`doubao`** | `asr` | `✅` *(1.0 & 2.0)* | `bigmodel` | — | `DOUBAO_SPEECH_API_KEY` *（单头 `X-Api-Key`，无需 `APP_ID`；兼容旧 `DOUBAO_ASR_API_KEY` 或双头 `DOUBAO_ASR_APP_ID` + `DOUBAO_ASR_API_KEY`；`asr.doubao_resource_id = "auto"` 优先同步 `volc.bigasr.auc_turbo`，未开通时自动回退并缓存 `volc.seedasr.auc` / `volc.bigasr.auc`）* |
 | **`volcengine`** | `refiner` | `✅` *(`doctor --ping` & 精修)* | — | `doubao-seed-2-0-mini-260428` | `ARK_API_KEY` *(兼容 `VOLCENGINE_API_KEY`, `HUOSHAN_API_KEY`)* |
-| **`openrouter`** | `asr`, `refiner` | `✅` *(转写/单跳/精修)* | `qwen/qwen3-asr-1.7b` | `google/gemini-3.8-flash` | `OPENROUTER_API_KEY` |
+| **`openrouter`** | `asr`, `refiner` | `✅` *(转写 & 精修)* | `microsoft/mai-transcribe-2` *(约 `$0.10/小时`，支持原生 `keyterms`)* | `google/gemini-3.8-flash` *(默认 `effort = "low"`)* | `OPENROUTER_API_KEY` |
 | **`gemini`** | `asr`, `refiner` | `✅` *(单跳 & 精修)* | `gemini-3.7-flash` *(单跳)* | `gemini-3.7-flash` | `GEMINI_API_KEY` |
 | **`openai`** | `asr`, `refiner` | `✅` *(转写/单跳/精修)* | `gpt-transcribe` *(或单跳 `gpt-audio-1.5` / `gpt-audio-mini`)* | `gpt-6-luna` | `OPENAI_API_KEY` |
 | **`groq`** | `asr`, `refiner` | `🧪` | `whisper-large-v3-turbo` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
@@ -242,30 +281,30 @@ agent-voice-input key-test                              # 测试按键扫描码�
 | **`off`** | `refiner` | `✅` | — | *(关闭二阶段，直出一阶段原文)* | 无需凭据 |
 
 - `asr.provider = "auto"`（默认）：按 `dashscope -> doubao -> deepseek -> openai -> gemini -> groq -> openrouter -> siliconflow` 顺序选用首个已配置凭据的渠道。
-- `refiner.provider = "auto"`（默认）：优先复用本机已登录的 `codex` CLI，否则按 `deepseek -> dashscope -> gemini -> openrouter -> volcengine -> openai -> groq -> siliconflow` 选用，无凭据时降级为 `"off"`。（`agy` 仅显式配置启用。）
+- `refiner.provider = "auto"`（默认）：优先复用本机已登录的 `codex` CLI，否则按 `openrouter -> deepseek -> dashscope -> gemini -> volcengine -> openai -> groq -> siliconflow` 选用，无凭据时降级为 `"off"`。（`agy` 仅显式配置启用。）
 
 ```toml
-# 配方 1：国内低延迟主力（百炼 / 豆包 / DeepSeek ASR + 复用本机 Codex 或 AGY 订阅精修）
+# 配方 1：国内低延迟主力（百炼 / OpenRouter / 豆包 / DeepSeek ASR + 复用本机 Codex 或 AGY 登录精修）
 [asr]
-provider = "dashscope"           # 亦可改为 "doubao" / "deepseek" / "openai"
+provider = "dashscope"           # 亦可改为 "openrouter" / "doubao" / "deepseek" / "openai"
 
 [refiner]
-provider = "codex"               # 或显式设为 "agy" 复用 Antigravity CLI，无订阅可改为 "deepseek" / "dashscope"
+provider = "codex"               # 或显式设为 "agy" 复用 Antigravity CLI，无订阅可改为 "openrouter" / "deepseek"
 ```
 
 ```toml
-# 配方 2：一把 Key 两段式（DeepSeek 或 OpenRouter，直接用内置默认模型）
+# 配方 2：一把 Key 两段式（OpenRouter 或 DeepSeek，直接用内置默认模型）
 [asr]
-provider = "deepseek"            # 亦可改为 "openrouter"（仅配 DEEPSEEK_API_KEY 时，`auto` 即可零配置直出 DeepSeek 两段式）
+provider = "openrouter"          # 默认 microsoft/mai-transcribe-2；亦可改为 "deepseek"（deepseek-asr）
 
 [refiner]
-provider = "deepseek"            # 亦可改为 "openrouter"
+provider = "openrouter"          # 默认 google/gemini-3.8-flash；亦可改为 "deepseek"（deepseek-flash）
 ```
 
 ```toml
 # 配方 3：多模态单跳音频 + 50K 缓存上下文直出（自动跳过二阶段）
 [asr]
-provider = "dashscope"           # 亦可设为 "gemini"（免填 model）、"openai" + model = "gpt-audio-1.5" / "gpt-audio-mini"，或 "openrouter" + model = "google/gemini-3.8-flash"
+provider = "dashscope"           # 亦可设为 "gemini"（免填 model），或 "openai" + model = "gpt-audio-1.5" / "gpt-audio-mini"
 model = "qwen3.8-omni-flash"
 ```
 
@@ -291,9 +330,9 @@ model = "qwen3.8-omni-flash"
 
 - **按 `provider` 选渠道与界面语言（`model`、`ui.language`）**：`[asr]` 与 `[refiner]` 的 `model` 留空时自动匹配内置默认模型；通过 CLI 切换 `provider` 且未传 `--*-model` 时也会重置为新渠道默认模型。显式指定 `model` 时原样透传上游 ID。`ui.language` 支持 `"auto"`、`"zh"`、`"en"`，同时兼容标准 BCP 47 标签（如 `"zh-CN"` / `"en-US"`）。
 - **两阶段 vs 单跳协议（`asr.api`、`asr.doubao_resource_id`）**：`"auto"` 将专用 STT（`qwen3-asr-flash`、`doubao`、`deepseek-asr`、`whisper-*`、`*-transcribe`、`SenseVoiceSmall`）路由至一阶段 + 二阶段，将原生 `gemini`、百炼 `qwen*-omni*`、官方 OpenAI `gpt-audio-1.5` / `gpt-audio-mini`（或显式 `asr.api = "chat-completions"`）与 OpenRouter/OpenAI 兼容多模态模型路由至单跳（共享 50K `<session_reference_log>` 前缀块、`>= 3s` 内存压缩 `64 kbps` MP3、上限 `610s`；默认跳过二阶段，除非 `refiner.force_on_single_hop = true`）。DeepSeek 官方 ASR（`POST https://api.deepseek.com/v1/tools/asr`）仅支持 `asr.api = "auto"`（支持 21 种语言自动检测，不支持热词与语言参数）。豆包槽位通过 `asr.doubao_resource_id = "auto"`（或显式槽位 ID）与 `asr.doubao_mode` 控制。在 `openrouter` 使用未收录新模型时请显式指定 `asr.api = "audio-transcriptions"` 或 `"chat-completions"`。
-- **二阶段协议、思考档位与会话轮次（`refiner.api`、`effort`、`session_max_turns`）**：`refiner.api = "auto"` 将 `codex` 与官方 `openai`（`api.openai.com`）路由至无状态 HTTP `/responses`（`store=false`、`stream=true`），`agy` 路由至本机 `agy acp` stdio JSON-RPC，`gemini` 路由至 `:generateContent`，自定义第三方 `openai` `base_url` 及其他渠道保守默认走 `/chat/completions`（显式配置 `"responses"` / `"chat-completions"` 始终优先）。`asr.effort` 与 `refiner.effort` 默认留空 `""`（使用工具为当前渠道调优的推荐默认：精修端 `codex`/`agy`/`openai` 为 `"low"`，其余精修渠道及一阶段单跳音频为 `"none"`），支持 `"default"`（不传思考参数，听上游默认）或 `"none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`（`"none"` 尽力关闭思考，强制思考模型自动落到最低合法档位，非思考模型自动忽略）。针对 `agy`，`refiner.session_max_turns = 0`（默认）不设固定轮次上限，随 200K 淘汰或词表变化自然轮换。
+- **二阶段协议、思考档位与会话轮次（`refiner.api`、`effort`、`session_max_turns`）**：`refiner.api = "auto"` 将 `codex` 与官方 `openai`（`api.openai.com`）路由至无状态 HTTP `/responses`（`store=false`、`stream=true`），`agy` 路由至本机 `agy acp` stdio JSON-RPC，`gemini` 路由至 `:generateContent`，自定义第三方 `openai` `base_url` 及其他渠道保守默认走 `/chat/completions`（显式配置 `"responses"` / `"chat-completions"` 始终优先）。`asr.effort` 与 `refiner.effort` 默认留空 `""`（使用工具为当前渠道调优的推荐默认：精修端 `codex`/`agy`/`openai`/`openrouter` 为 `"low"`，其余精修渠道及一阶段单跳音频为 `"none"`），支持 `"default"`（不传思考参数，听上游默认）或 `"none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`（`"none"` 尽力关闭思考，强制思考模型自动落到最低合法档位，非思考模型自动忽略）。针对 `agy`，`refiner.session_max_turns = 0`（默认）不设固定轮次上限，随 200K 淘汰或词表变化自然轮换。
 - **附加偏好指令、前缀缓存与冷启动回退（`refiner.extra_instructions`、`include_git_status`、`context_max_chars`、`cold_start_fallback`）**：默认始终启用内置自适应 `agent` / `general` 精修提示词，可通过 `refiner.extra_instructions` 在内置规则之后安全追加个人偏好（支持字符串数组、单行或多行文本，上限 20 条 / 2,000 字，两段式与单跳统一生效；留空时与默认提示词逐字节一致）。近期对话（上限 `context_max_chars = 200000`）按 `50K` 封口块前置，末尾拼装 `<workspace_git_status>`（工作树干净时补充核心追踪文件名）与 `<asr_draft_to_clean>`。新开空/极短会话时，`cold_start_fallback = "auto"`（可选 `"hotwords"` / `"off"`）自动从同目录近期历史会话补充热词并前置 1 块冻结的 `<= 25K` `<prior_session_reference>`。
-- **扁平个人热词表（`hotwords/personal.txt` 与 `hotwords` 子命令）**：直接编辑 `~/.agent-voice-input/hotwords/personal.txt` 或运行 `agent-voice-input hotwords list|add [--pin] [--alias]|remove|path`，下一次口述自动热加载生效（目录级 `flock` 写锁零 `.lock` 脏文件）。一阶段按权重分层并层内保行序，`agent` 模式为动态代码词保底 30% 并空位回流（`general` 模式 100% 归个人词；百炼 `150 词 / 1,800 字`、豆包 `50 / 500`、OpenAI `50`、Whisper `35 / 353`）；二阶段/单跳块 0 按确定性顺序渲染（`200 条 / 3,000 字`）以稳定保住前缀缓存。
+- **扁平个人热词表（`hotwords/personal.txt` 与 `hotwords` 子命令）**：直接编辑 `~/.agent-voice-input/hotwords/personal.txt`（首次 `init` 新建时预置约 18 个可自由删改的开发者初始词）或运行 `agent-voice-input hotwords list|add [--pin] [--alias]|remove|path`，下一次口述自动热加载生效（目录级 `flock` 写锁零 `.lock` 脏文件）。一阶段按权重分层并层内保行序，`agent` 模式为动态代码词保底 30% 并空位回流（`general` 模式 100% 归个人词；百炼 `250 词 / 2,800 字`、豆包 `50 / 1,000`、OpenAI `50`、OpenRouter `50`、Whisper `35 / 353`）；二阶段/单跳块 0 按同样的优先级分层（`!` 置顶 → 带有效 `<-` 别名 → 普通词，各层内保持原文件顺序）选取并渲染前 `200 条 / 3,000 字`。
 - **同渠道重试与可选本地归档（`max_retries`、`[archive]`）**：两阶段默认 `max_retries = 2`（`0..10`），在阶段 `timeout_sec` 与 9 秒建连/TLS 上限内分别对 `429`/QPS 限流与瞬态网络/5xx 退避重试。`[archive]` 默认全关（`0700` 目录 / `0600` 文件、受 `.gitignore` 默认拦截，并在 `status`/`doctor`/`start` 中以 `Archive:` 摘要展示）：开启 `save_transcripts = true` 后按月追加 12 字段纯转录 JSONL（仅含 ASR 草稿、精修终稿与扁平元数据，绝不写入上下文/热词/凭据）至 `~/.agent-voice-input/transcripts/YYYY-MM.jsonl`；开启 `save_audio = true` 后异步将有效录音压缩为 `16 kHz` `64 kbps` MP3 存入 `~/.agent-voice-input/audio/<id>.mp3`（按 `audio_max_count = 1000` 环形裁剪，`0` 表示不淘汰）。转录记录、音频文件与 `diag.jsonl` 共享同一短 ID（`YYYYMMDD-HHMMSS-<4hex>`）实现 1:1 关联。
 
 </details>

@@ -34,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 CORE_WHEEL_ENTRIES: tuple[str, ...] = (
     "agent_voice_input/__init__.py",
+    "agent_voice_input/_entry.py",
     "agent_voice_input/cli.py",
     "agent_voice_input/daemon.py",
     "agent_voice_input/prompts.py",
@@ -337,7 +338,7 @@ def verify_distributions(
         if not any("LICENSE" in n for n in names):
             raise PackageCheckError(f"missing LICENSE in wheel {whl_path.name}")
         eps = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
-        if not eps or "agent-voice-input = agent_voice_input.cli:main" not in zf.read(eps[0]).decode("utf-8"):
+        if not eps or "agent-voice-input = agent_voice_input._entry:main" not in zf.read(eps[0]).decode("utf-8"):
             raise PackageCheckError(f"missing or invalid console entry_points.txt in wheel {whl_path.name}")
         metas = [n for n in names if n.endswith(".dist-info/METADATA")]
         if not metas:

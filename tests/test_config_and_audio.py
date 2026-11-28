@@ -1054,12 +1054,12 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(dcfg.refiner.effective_effort("dashscope"), "none")
         self.assertEqual(dcfg.refiner.effective_effort("volcengine"), "none")
         self.assertEqual(dcfg.refiner.effective_effort("gemini"), "none")
-        self.assertEqual(dcfg.refiner.effective_effort("openrouter"), "none")
+        self.assertEqual(dcfg.refiner.effective_effort("openrouter"), "low")
 
         # Built-in default models, efforts & base_urls strictly match v0.9-1 / v0.10-1 table
         self.assertEqual(DEFAULT_ASR_MODELS["dashscope"], "qwen3-asr-flash")
         self.assertEqual(DEFAULT_ASR_MODELS["doubao"], "bigmodel")
-        self.assertEqual(DEFAULT_ASR_MODELS["openrouter"], "qwen/qwen3-asr-1.7b")
+        self.assertEqual(DEFAULT_ASR_MODELS["openrouter"], "microsoft/mai-transcribe-2")
         self.assertEqual(DEFAULT_ASR_MODELS["gemini"], "gemini-3.7-flash")
         self.assertEqual(DEFAULT_ASR_MODELS["openai"], "gpt-transcribe")
         self.assertEqual(DEFAULT_ASR_MODELS["deepseek"], "deepseek-asr")
@@ -1078,11 +1078,15 @@ class ConfigAndCredentialsTests(unittest.TestCase):
         self.assertEqual(DEFAULT_REFINER_MODELS["groq"], "llama-3.3-70b-versatile")
         self.assertEqual(DEFAULT_REFINER_MODELS["siliconflow"], "Qwen/Qwen2.5-7B-Instruct")
 
-        self.assertEqual(DEFAULT_REFINER_EFFORTS, {"codex": "low", "agy": "low", "openai": "low"})
+        self.assertEqual(
+            DEFAULT_REFINER_EFFORTS,
+            {"codex": "low", "agy": "low", "openai": "low", "openrouter": "low"},
+        )
         self.assertEqual(RefinerConfig(provider="codex").effort, "low")
         self.assertEqual(RefinerConfig(provider="openai").effort, "low")
         self.assertEqual(RefinerConfig(provider="agy").effort, "low")
-        for non_codex in ("deepseek", "openrouter", "dashscope", "volcengine", "gemini", "openai-compatible"):
+        self.assertEqual(RefinerConfig(provider="openrouter").effort, "low")
+        for non_codex in ("deepseek", "dashscope", "volcengine", "gemini", "openai-compatible"):
             self.assertEqual(RefinerConfig(provider=non_codex).effort, "none")
 
         self.assertEqual(DEFAULT_ASR_BASE_URLS["openrouter"], "https://openrouter.ai/api/v1")
@@ -1266,11 +1270,11 @@ class ConfigAndCredentialsTests(unittest.TestCase):
                 cli_overrides={"asr.provider": "openrouter", "refiner.provider": "openrouter"},
             )
             self.assertEqual(cfg_sw.asr.effective_base_url(), "https://openrouter.ai/api/v1")
-            self.assertEqual(cfg_sw.asr.effective_model(), "qwen/qwen3-asr-1.7b")
+            self.assertEqual(cfg_sw.asr.effective_model(), "microsoft/mai-transcribe-2")
             self.assertEqual(cfg_sw.asr.api_key_env, "")
             self.assertEqual(cfg_sw.refiner.effective_base_url(), "https://openrouter.ai/api/v1")
             self.assertEqual(cfg_sw.refiner.model, "google/gemini-3.8-flash")
-            self.assertEqual(cfg_sw.refiner.effort, "none")
+            self.assertEqual(cfg_sw.refiner.effort, "low")
             self.assertEqual(cfg_sw.refiner.api_key_env, "")
 
             # 5. Switching provider resets inherited effort unless same-layer effort is explicitly given;
@@ -1319,6 +1323,7 @@ class ConfigAndCredentialsTests(unittest.TestCase):
     def test_asr_api_auto_classification_and_native_incompatibility_checks(self) -> None:
         # Dedicated STT models -> audio-transcriptions (including gemini-*-transcribe & voxtral-mini-3b-2507 / -stt)
         for stt_model in (
+            "microsoft/mai-transcribe-2",
             "qwen/qwen3-asr-1.7b",
             "openai/whisper-large-v3-turbo",
             "openai/gpt-transcribe",

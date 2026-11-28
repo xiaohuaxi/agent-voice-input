@@ -217,9 +217,9 @@ _CMD_V_SCRIPT = 'tell application "System Events" to keystroke "v" using command
 
 MACOS_PERMISSIONS_HINT = (
     "Microphone -> terminal/daemon host (ffmpeg capture); "
-    "Automation -> Ghostty (split lookup & direct input) or Terminal.app (active tab TTY lookup); "
+    "Automation -> Ghostty (split lookup & direct input), Terminal.app, or iTerm2 (active tab TTY lookup); "
     "Input Monitoring -> global non-modifier hotkeys / key-test; "
-    "Accessibility -> Cmd+V paste for GUI apps and non-Ghostty terminals outside tmux"
+    "Accessibility -> Cmd+V paste for GUI apps/non-Ghostty terminals outside tmux and window-title/session binding for third-party terminals & desktop apps"
 )
 
 

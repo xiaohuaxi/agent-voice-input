@@ -1,8 +1,8 @@
 """CLI entrypoint for agent-voice-input (init, integrate, daemon, start, restart, stop, status, toggle, cancel, once, retry, hotwords, doctor, diagnose, key-test, session-hook)."""
 from __future__ import annotations
 
-import argparse, dataclasses, errno, fcntl, json, locale, os, shlex, shutil, signal, socket, stat, subprocess, sys, threading, time, urllib.parse
-from collections.abc import Callable, Mapping
+import argparse, dataclasses, errno, fcntl, json, locale, os, re, shlex, shutil, signal, socket, stat, subprocess, sys, threading, time, urllib.parse
+from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,9 +35,9 @@ def _render_init_config_toml(
         '# Thinking budget: "" (recommended low-latency default: "none") | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"\n'
         '# effort = ""\n\n'
         "[refiner]\n"
-        '# "auto" prefers local `codex` login, then configured API keys (deepseek -> dashscope -> gemini -> ...), or falls back to "off"\n'
+        '# "auto" prefers local `codex` login, then configured API keys (openrouter -> deepseek -> dashscope -> gemini -> ...), or falls back to "off"\n'
         f'provider = "{refiner_provider}"\n\n'
-        '# Thinking budget: "" (recommended default: "low" for codex/agy/openai, "none" elsewhere) | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"\n'
+        '# Thinking budget: "" (recommended default: "low" for codex/agy/openai/openrouter, "none" elsewhere) | "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"\n'
         '# effort = ""\n\n'
         "[archive]\n"
         "# Optional local dictation history under ~/.agent-voice-input/ (0700 dirs, 0600 files; both off by default)\n"
@@ -218,8 +218,12 @@ def _format_effort_display(effective: str, explicit: bool) -> str:
     return eff if explicit else f"{eff} (recommended)"
 
 
-def _cred_label(item: Any) -> str:
-    return f"OK (via {item.source_env})" if item is not None else "not set"
+def _cred_label(item: Any, placeholder_keys: Collection[str] = ()) -> str:
+    if item is None:
+        return "not set"
+    if item.source_env in placeholder_keys:
+        return "FAIL (placeholder in .env)"
+    return f"OK (via {item.source_env})"
 
 
 def _check_codex_model(model: str, env: dict[str, str]) -> str:
@@ -712,6 +716,10 @@ def _cmd_init(
         raise ConfigError(
             f"init target --config path cannot be {toml_path.name!r}: {toml_path}"
         )
+    if _is_personal_hotwords_target(toml_path, src_env, home_dir=home_dir):
+        raise ConfigError(
+            f"init target --config path cannot overwrite personal hotwords file: {toml_path}"
+        )
 
     app_home = resolve_app_home_dir(src_env, home_dir=home_dir)
     in_app_home = (
@@ -729,16 +737,29 @@ def _cmd_init(
     )
 
     if in_app_home:
+        from .hotwords import DEFAULT_PERSONAL_HOTWORDS_TEMPLATE
+
         assert app_home is not None
         gitignore_path = cfg_dir / ".gitignore"
+        hotwords_dir = cfg_dir / "hotwords"
+        hotwords_path = hotwords_dir / "personal.txt"
         toml_st = _lstat_or_none(toml_path)
         env_st = _lstat_or_none(env_path)
         gi_st = _lstat_or_none(gitignore_path)
-        for p, st in ((toml_path, toml_st), (env_path, env_st), (gitignore_path, gi_st)):
+        hw_dir_st = _lstat_or_none(hotwords_dir)
+        hw_st = _lstat_or_none(hotwords_path)
+        if hw_dir_st is not None and not stat.S_ISDIR(hw_dir_st.st_mode) and not stat.S_ISLNK(hw_dir_st.st_mode):
+            raise ConfigError(f"unsafe hotwords directory (not a directory): {hotwords_dir}")
+        for p, st in (
+            (toml_path, toml_st),
+            (env_path, env_st),
+            (gitignore_path, gi_st),
+            (hotwords_path, hw_st),
+        ):
             if st is not None and stat.S_ISDIR(st.st_mode):
                 raise ConfigError(f"cannot overwrite directory: {p}")
 
-        will_write_any = force or toml_st is None or env_st is None or gi_st is None
+        will_write_any = force or toml_st is None or env_st is None or gi_st is None or hw_st is None
         if will_write_any:
             ensure_app_dir(app_home, create=True)
             if cfg_dir != app_home:
@@ -774,6 +795,22 @@ def _cmd_init(
             print(_kv_line("Gitignore", f"kept {gitignore_path}"))
         else:
             print(_kv_line("Gitignore", f"created {gitignore_path} (0644)"))
+
+        # Never overwrite an existing personal.txt even under --force to protect user hotwords.
+        if hw_st is None:
+            ensure_app_dir(hotwords_dir, create=True)
+        state_hw = _write_init_file_0600(
+            hotwords_dir, hotwords_path, DEFAULT_PERSONAL_HOTWORDS_TEMPLATE, force=False
+        )
+        if state_hw == "kept":
+            print(_kv_line("Hotwords", f"kept {hotwords_path} (existing personal hotwords preserved)"))
+        else:
+            print(
+                _kv_line(
+                    "Hotwords",
+                    f"{state_hw} {hotwords_path} (0600, starter developer terms — edit or delete freely)",
+                )
+            )
         cred_target_label = str(env_path)
     else:
         toml_st = _lstat_or_none(toml_path)
@@ -898,7 +935,8 @@ def _cmd_init(
             print(
                 _kv_line(
                     "Refiner",
-                    "codex (local subscription ready for free — just add 1 Stage 1 speech key)",
+                    "codex (local ChatGPT/Codex login detected — reuses your Codex plan/quota; "
+                    "add 1 Stage 1 speech key, or switch [refiner].provider if quota is unavailable)",
                 )
             )
         elif codex_mode != "none":
@@ -1762,6 +1800,8 @@ class _DoctorState:
     hooks_report: dict[str, Any] = dataclasses.field(default_factory=dict)
     hotwords_report: dict[str, Any] = dataclasses.field(default_factory=dict)
     migration_hint: str = ""
+    placeholder_hits: list[tuple[str, Path]] = dataclasses.field(default_factory=list)
+    placeholder_keys: frozenset[str] = frozenset()
 
     def clean(self, text: str) -> str:
         from .config import redact_secrets
@@ -1956,6 +1996,20 @@ def _doctor_check_macos_host(st: _DoctorState) -> None:
             "[macos-tcc] INFO Microphone permission not yet requested; "
             "macOS will prompt for authorization on your first recording."
         )
+    elif not is_local_gui and caller_mic == "authorized":
+        has_remote_session = (
+            m.get("caller_has_graphic_session") is False
+            or bool(m.get("caller_is_remote_session"))
+        )
+        ssh_label = (
+            "remote/SSH shell detected"
+            if has_remote_session
+            else "SSH environment variable detected"
+        )
+        st.emit(
+            f"[macos-tcc] NOTE {ssh_label}; microphone capture uses the daemon host's TCC grant "
+            "(if starting a new daemon, run 'agent-voice-input restart' from a local macOS GUI terminal)."
+        )
     if m.get("ax_trusted") is False:
         st.emit(
             '[macos-ax]  WARN Accessibility not granted (Ghostty/tmux direct delivery works; '
@@ -1973,6 +2027,19 @@ def _doctor_check_macos_host(st: _DoctorState) -> None:
         )
     if m.get("pbcopy_ok") is False:
         st.ok_all = False
+
+
+def _resolve_wsl_cmd_exe_path(env: Mapping[str, str]) -> str:
+    from .platform_wsl import resolve_powershell_exe
+
+    ps_exe = resolve_powershell_exe(env)
+    if ps_exe:
+        p = Path(ps_exe)
+        if p.parent.name.lower() == "v1.0" and p.parent.parent.name.lower() == "windowspowershell":
+            cand = p.parent.parent.parent / "cmd.exe"
+            if cand.is_file():
+                return str(cand)
+    return "/mnt/c/Windows/System32/cmd.exe"
 
 
 def _doctor_check_wsl_host(st: _DoctorState) -> None:
@@ -2014,8 +2081,9 @@ def _doctor_check_wsl_host(st: _DoctorState) -> None:
     wasapi_detail = f" ({wasapi_state})" if (not wasapi_ok and wasapi_state) else ""
     wasapi_prefix = f"WASAPI={wasapi_lbl}{wasapi_detail}, " if has_wasapi_key else ""
     pulse_lbl = f"PulseAudio ({eff_pulse_src})" if eff_pulse_src != "RDPSource" else "PulseAudio RDPSource"
+    pulse_status = "OK" if pulse_ok else ("FAIL" if eff_backend == "pulse" else "WARN")
     st.emit(
-        f"[wsl-audio] {wasapi_prefix}{pulse_lbl}={'OK' if pulse_ok else 'WARN'}, winmm waveIn devs={winmm_n}"
+        f"[wsl-audio] {wasapi_prefix}{pulse_lbl}={pulse_status}, winmm waveIn devs={winmm_n}"
     )
     st.emit(
         f"[win-shim]  PowerShell={'OK (' + str(w.get('ps_version')) + ')' if ps_ok else 'FAIL'} fg={w.get('fg_process')!r}{ui_info}"
@@ -2038,10 +2106,41 @@ def _doctor_check_wsl_host(st: _DoctorState) -> None:
                     "[win-shim]  HINT Windows PowerShell ExecutionPolicy/ConstrainedLanguage blocked win_shim.ps1; "
                     "check Windows Group Policy / AppLocker or allow ExecutionPolicy Bypass"
                 )
-        st.emit_fix("check WSL interop or /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+            elif any(
+                tok in low_pe
+                for tok in (
+                    "invalid argument",
+                    "exec format error",
+                    "wsl_interop",
+                )
+            ):
+                st.emit(
+                    "[win-shim]  HINT WSL_INTEROP appears stale (common in SSH or old tmux panes); "
+                    "open a new Windows Terminal WSL tab and retry"
+                )
+        st.emit_fix(
+            "open a new Windows Terminal WSL tab and retry (or check WSL interop / Windows PowerShell)"
+        )
     if not has_wsl_audio:
         st.ok_all = False
-        st.emit_fix("cmd.exe /c start ms-settings:privacy-microphone")
+        if eff_backend == "pulse":
+            st.emit_fix(
+                f"check PulseAudio/WSLg source {eff_pulse_src!r} via 'pactl list short sources' "
+                '(or switch audio.wsl_source = "wasapi" / "auto" in config.toml)'
+            )
+        else:
+            cmd_exe = _resolve_wsl_cmd_exe_path(st.env)
+            low_ws = wasapi_state.lower()
+            if "no_default" in low_ws or "inactive" in low_ws:
+                st.emit_fix(
+                    "unlock Windows and select a default microphone in Windows Settings -> System -> Sound -> Input "
+                    f"(or run '{cmd_exe} /c start ms-settings:sound')"
+                )
+            else:
+                st.emit_fix(
+                    "enable microphone access in Windows Settings -> Privacy & security -> Microphone "
+                    f"(or run '{cmd_exe} /c start ms-settings:privacy-microphone')"
+                )
 
 
 def _doctor_check_platform(st: _DoctorState) -> None:
@@ -2057,6 +2156,129 @@ def _doctor_check_platform(st: _DoctorState) -> None:
         )
 
 
+_DOTENV_TEMPLATE_PLACEHOLDERS: frozenset[str] = frozenset(
+    {"...", "sk-...", "AIza...", "gsk_...", "sk-or-..."}
+)
+_DOTENV_TEMPLATE_ANGLE_RE = re.compile(
+    r"^(?:<your-[a-z0-9_-]+>|your-[a-z0-9_-]+(?:api-key|app-id|access-token))$",
+    re.IGNORECASE,
+)
+
+
+def _is_dotenv_template_placeholder(value: str) -> bool:
+    s = value.strip()
+    if not s:
+        return False
+    return s in _DOTENV_TEMPLATE_PLACEHOLDERS or bool(_DOTENV_TEMPLATE_ANGLE_RE.match(s))
+
+
+def _find_dotenv_placeholder_keys(
+    cfg: Config,
+    env: Mapping[str, str],
+) -> list[tuple[str, Path]]:
+    """Inspect only .env files loaded by this tool for unchanged template placeholders (never scans process env)."""
+    from .config import (
+        CREDENTIAL_ENV_ORDER,
+        default_env_file_candidates,
+        expand_user_path,
+        parse_env_text,
+    )
+
+    known_keys: set[str] = set()
+    for names in CREDENTIAL_ENV_ORDER.values():
+        known_keys.update(names)
+    if k_asr := cfg.asr.api_key_env.strip():
+        known_keys.add(k_asr)
+    if k_ref := cfg.refiner.api_key_env.strip():
+        known_keys.add(k_ref)
+
+    hits: list[tuple[str, Path]] = []
+    seen_keys: set[str] = set()
+    for raw_cand in default_env_file_candidates(env, config_path=cfg.config_path or None):
+        path = expand_user_path(raw_cand, env=env)
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for key, raw_val in parse_env_text(content).items():
+            if key not in known_keys or key in seen_keys:
+                continue
+            if _is_dotenv_template_placeholder(raw_val) and env.get(key) == raw_val:
+                seen_keys.add(key)
+                hits.append((key, path))
+    return hits
+
+
+def _resolve_asr_effective_key(
+    provider: str,
+    cfg: Config,
+    creds: ProviderCredentials,
+) -> Any:
+    """Resolve the active Stage 1 ASR credential item matching provider auth precedence."""
+    if cfg.asr.api_key_env.strip():
+        return creds.asr_custom
+    if provider == "openai-compatible":
+        return creds.openai
+    if provider == "doubao":
+        return creds.doubao_key
+    return creds.for_provider(provider)
+
+
+def _is_doubao_single_header_auth(key_item: Any) -> bool:
+    """Return True when the effective Doubao key uses canonical single-header DOUBAO_SPEECH_API_KEY auth."""
+    return (
+        key_item is not None
+        and key_item.source_env.strip().upper() == "DOUBAO_SPEECH_API_KEY"
+    )
+
+
+def _stage_placeholder_key(
+    stage: str,
+    provider: str,
+    cfg: Config,
+    creds: ProviderCredentials,
+    placeholder_keys: frozenset[str],
+    *,
+    ref_info: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Return the active .env placeholder variable name for ``stage`` if its resolved credential is a placeholder."""
+    if not placeholder_keys:
+        return None
+    if stage == "asr":
+        item = _resolve_asr_effective_key(provider, cfg, creds)
+        if item is not None and item.source_env in placeholder_keys:
+            return item.source_env
+        if (
+            provider == "doubao"
+            and not _is_doubao_single_header_auth(item)
+            and creds.doubao_app_id is not None
+            and creds.doubao_app_id.source_env in placeholder_keys
+        ):
+            return creds.doubao_app_id.source_env
+        return None
+
+    if provider in ("off", "agy") or (ref_info is not None and ref_info.get("bypassed")):
+        return None
+    if provider == "codex":
+        if (
+            ref_info is not None
+            and ref_info.get("auth_mode") == "api_key"
+            and ref_info.get("auth_source") == "env"
+            and "OPENAI_API_KEY" in placeholder_keys
+        ):
+            return "OPENAI_API_KEY"
+        return None
+    if cfg.refiner.api_key_env.strip():
+        item = creds.refiner_custom
+    elif provider == "openai-compatible":
+        item = creds.openai
+    else:
+        item = creds.for_provider(provider)
+    return item.source_env if (item is not None and item.source_env in placeholder_keys) else None
+
+
 def _doctor_check_asr(st: _DoctorState) -> None:
     cfg, creds = st.cfg, st.creds
     asr_info = st.pipeline["asr"]
@@ -2064,33 +2286,41 @@ def _doctor_check_asr(st: _DoctorState) -> None:
     st.eff_asr_model = str(asr_info["model"])
     st.eff_asr_url = cfg.asr.effective_base_url(st.eff_asr)
     st.eff_asr_api = str(asr_info["api"])
-    st.asr_ready = bool(asr_info["ready"])
+    asr_ph_key = _stage_placeholder_key("asr", st.eff_asr, cfg, creds, st.placeholder_keys)
+    st.asr_ready = bool(asr_info["ready"]) and not bool(asr_ph_key)
+    if asr_ph_key:
+        asr_info["ready"] = False
+        st.ok_all = False
     st.asr_is_single_hop = bool(asr_info["single_hop"])
 
+    ph_keys = st.placeholder_keys
     configured_keys: list[str] = []
     for name, item in (
         ("dashscope", creds.dashscope),
         ("deepseek", creds.deepseek),
     ):
         if item is not None:
-            configured_keys.append(f"{name}={_cred_label(item)}")
+            configured_keys.append(f"{name}={_cred_label(item, ph_keys)}")
 
-    doubao_single_key = (
-        creds.doubao_key is not None
-        and creds.doubao_key.source_env.strip().upper() == "DOUBAO_SPEECH_API_KEY"
+    doubao_eff_key = (
+        _resolve_asr_effective_key("doubao", cfg, creds)
+        if st.eff_asr == "doubao"
+        else creds.doubao_key
     )
+    doubao_single_key = _is_doubao_single_header_auth(doubao_eff_key)
     if doubao_single_key:
-        doubao_label = f"doubao={_cred_label(creds.doubao_key)}"
+        doubao_label = f"doubao={_cred_label(doubao_eff_key, ph_keys)}"
         if creds.doubao_app_id is not None:
             doubao_label += f" (legacy app_id via {creds.doubao_app_id.source_env} ignored)"
         configured_keys.append(doubao_label)
-    elif creds.doubao_key is not None or creds.doubao_app_id is not None:
+    elif doubao_eff_key is not None or creds.doubao_app_id is not None:
         if creds.doubao_app_id is not None:
             configured_keys.append(
-                f"doubao={_cred_label(creds.doubao_key)} (app_id={_cred_label(creds.doubao_app_id)})"
+                f"doubao={_cred_label(doubao_eff_key, ph_keys)} "
+                f"(app_id={_cred_label(creds.doubao_app_id, ph_keys)})"
             )
         else:
-            configured_keys.append(f"doubao={_cred_label(creds.doubao_key)}")
+            configured_keys.append(f"doubao={_cred_label(doubao_eff_key, ph_keys)}")
 
     for name, item in (
         ("volcengine", creds.volcengine),
@@ -2101,9 +2331,9 @@ def _doctor_check_asr(st: _DoctorState) -> None:
         ("siliconflow", creds.siliconflow),
     ):
         if item is not None:
-            configured_keys.append(f"{name}={_cred_label(item)}")
+            configured_keys.append(f"{name}={_cred_label(item, ph_keys)}")
     if cfg.asr.api_key_env.strip():
-        configured_keys.append(f"asr_custom={_cred_label(creds.asr_custom)}")
+        configured_keys.append(f"asr_custom={_cred_label(creds.asr_custom, ph_keys)}")
 
     auto_unconfigured = (
         str(asr_info.get("configured_provider") or "") == "auto"
@@ -2112,19 +2342,28 @@ def _doctor_check_asr(st: _DoctorState) -> None:
     )
     if auto_unconfigured:
         st.emit(
-            "[asr]       selected=auto (none configured; no Stage 1 ASR key found) -> MISSING KEY"
+            "[asr]       selected=auto (none configured; no Stage 1 ASR key found) -> FAIL (MISSING KEY)"
         )
     else:
         eff_asr_effort = _format_effort_display(
             str(asr_info.get("effort") or cfg.asr.effective_effort(st.eff_asr)),
             cfg.asr.has_explicit_effort(st.eff_asr),
         )
+        asr_status_label = (
+            "OK"
+            if st.asr_ready
+            else ("FAIL (PLACEHOLDER KEY)" if asr_ph_key else "FAIL (MISSING KEY)")
+        )
         st.emit(
             f"[asr]       selected={st.eff_asr} (model={st.eff_asr_model}, api={st.eff_asr_api}, effort={eff_asr_effort}) -> "
-            f"{'OK' if st.asr_ready else 'MISSING KEY'}"
+            f"{asr_status_label}"
         )
     st.emit(f"[keys]      {', '.join(configured_keys) if configured_keys else 'none configured'}")
-    if not st.asr_ready:
+    for ph_key, ph_path in st.placeholder_hits:
+        st.ok_all = False
+        st.emit(f"[keys]      FAIL {ph_key} in {ph_path} still uses a template placeholder")
+        st.emit_fix(f"replace placeholder {ph_key} in {ph_path} with your real API key")
+    if not st.asr_ready and not asr_ph_key:
         st.ok_all = False
         if stage2_only := _stage2_only_key_labels(cfg, creds):
             key_names = ", ".join(stage2_only)
@@ -2430,7 +2669,32 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
         )
         st.eff_ref_model = str(ref_info["model"])
         prov_disp = "auto -> codex" if raw_ref_prov == "auto" else "codex"
+        ref_ph_key = _stage_placeholder_key(
+            "refiner", "codex", cfg, st.creds, st.placeholder_keys, ref_info=ref_info
+        )
+        if ref_ph_key:
+            ref_info["ready"] = False
+            st.ok_all = False
+            st.emit(
+                f"[refiner]   FAIL (PLACEHOLDER KEY) {prov_disp} (model={st.eff_ref_model}, "
+                f"api={eff_ref_api}, effort={eff_ref_effort}{extra_tag})"
+            )
+            st.emit(f"[pipeline]  {st.pipeline['summary']}")
+            return
         auth_state, auth_note = inspect_codex_auth_status(cfg, st.env)
+        if (
+            auth_state == "OK"
+            and auth_note == "auth=api_key (OPENAI_API_KEY)"
+            and "OPENAI_API_KEY" in st.placeholder_keys
+        ):
+            ref_info["ready"] = False
+            st.ok_all = False
+            st.emit(
+                f"[refiner]   FAIL (PLACEHOLDER KEY) {prov_disp} (model={st.eff_ref_model}, "
+                f"api={eff_ref_api}, effort={eff_ref_effort}{extra_tag})"
+            )
+            st.emit(f"[pipeline]  {st.pipeline['summary']}")
+            return
         if auth_state in ("OK", "WARN"):
             st.ref_ping_needed = True
             cbin = find_codex_bin(st.env)
@@ -2480,20 +2744,32 @@ def _doctor_check_refiner(st: _DoctorState) -> None:
     st.eff_ref_model = str(ref_info["model"])
     st.eff_ref_url = cfg.refiner.effective_base_url(st.resolved_ref_prov)
     prov_disp = f"auto -> {st.resolved_ref_prov}" if raw_ref_prov == "auto" else st.resolved_ref_prov
-    ref_ready = bool(ref_info["ready"])
+    ref_ph_key = _stage_placeholder_key(
+        "refiner", st.resolved_ref_prov, cfg, st.creds, st.placeholder_keys, ref_info=ref_info
+    )
+    ref_ready = bool(ref_info["ready"]) and not bool(ref_ph_key)
+    if ref_ph_key:
+        ref_info["ready"] = False
+        st.ok_all = False
+    ref_status_label = (
+        "OK"
+        if ref_ready
+        else ("FAIL (PLACEHOLDER KEY)" if ref_ph_key else "FAIL (MISSING KEY)")
+    )
     st.emit(
-        f"[refiner]   {'OK' if ref_ready else 'MISSING KEY'} {prov_disp} "
+        f"[refiner]   {ref_status_label} {prov_disp} "
         f"(model={st.eff_ref_model}, api={eff_ref_api}, effort={eff_ref_effort}{extra_tag})"
     )
     if ref_ready:
         st.ref_ping_needed = True
     else:
         st.ok_all = False
-        if cfg.refiner.api_key_env.strip():
-            env_path = _display_env_file_path(st.env, config_path=cfg.config_path or None)
-            st.emit_fix(f"set {cfg.refiner.api_key_env.strip()} in {env_path}")
-        else:
-            st.emit_fix(_missing_key_hint(st.resolved_ref_prov, stage="refiner"))
+        if not ref_ph_key:
+            if cfg.refiner.api_key_env.strip():
+                env_path = _display_env_file_path(st.env, config_path=cfg.config_path or None)
+                st.emit_fix(f"set {cfg.refiner.api_key_env.strip()} in {env_path}")
+            else:
+                st.emit_fix(_missing_key_hint(st.resolved_ref_prov, stage="refiner"))
     st.emit(f"[pipeline]  {st.pipeline['summary']}")
 
 
@@ -2686,6 +2962,8 @@ def _cmd_doctor(
 
     creds = resolve_credentials(cfg, env)
     pipeline = explain_pipeline_selection(cfg, creds, env)
+    placeholder_hits = _find_dotenv_placeholder_keys(cfg, env)
+    placeholder_keys = frozenset(k for k, _ in placeholder_hits)
     st = _DoctorState(
         cfg=cfg,
         env=env,
@@ -2694,6 +2972,8 @@ def _cmd_doctor(
         as_json=as_json,
         all_secrets=tuple(creds.all_secret_values()),
         pipeline=pipeline,
+        placeholder_hits=placeholder_hits,
+        placeholder_keys=placeholder_keys,
     )
     _doctor_check_env_and_ffmpeg(st)
     _doctor_check_platform(st)
@@ -2965,18 +3245,38 @@ def _warn_degraded_shim(st: Mapping[str, Any]) -> None:
         )
 
 
-def _format_start_readiness_row(
+def _format_start_missing_key_warning(cfg: Config, env: Mapping[str, str]) -> str:
+    from .config import default_env_file_candidates
+    from .hotwords import resolve_personal_hotwords_path
+
+    has_cfg_or_env = bool(cfg.config_path) or any(
+        p.is_file()
+        for p in default_env_file_candidates(env, config_path=cfg.config_path or None)
+    )
+    env_path = _display_env_file_path(env, config_path=cfg.config_path or None)
+    if not has_cfg_or_env:
+        hw_path = resolve_personal_hotwords_path(env)
+        hw_note = (
+            " (also creates starter hotwords/personal.txt)"
+            if (hw_path is not None and not hw_path.exists())
+            else ""
+        )
+        return (
+            f"no Stage 1 ASR key configured; run 'agent-voice-input init'{hw_note}, "
+            f"add a key in {env_path}, then run 'agent-voice-input restart'"
+        )
+    return (
+        f"no Stage 1 ASR key configured; add a key in {env_path}, "
+        "then run 'agent-voice-input restart'"
+    )
+
+
+def _format_start_hotkey_row(
     cfg: Config,
     *,
-    asr_ready: bool,
     hotkey_ready: bool = True,
     warming_up: bool = False,
 ) -> tuple[str, str] | None:
-    if not asr_ready:
-        return (
-            "Warning",
-            "no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
-        )
     if not hotkey_ready:
         if warming_up:
             return None
@@ -2996,6 +3296,21 @@ def _format_start_readiness_row(
         sec_str = f"{round(hc_ms / 1000.0, 2):g}s"
         return ("Hotkey", f"tap {hotkey} to start/stop (hold {sec_str} to cancel)")
     return ("Hotkey", f"tap {hotkey} to start/stop")
+
+
+def _format_start_readiness_row(
+    cfg: Config,
+    *,
+    asr_ready: bool,
+    hotkey_ready: bool = True,
+    warming_up: bool = False,
+) -> tuple[str, str] | None:
+    if not asr_ready:
+        return (
+            "Warning",
+            "no Stage 1 ASR key configured; run 'agent-voice-input doctor' before dictating",
+        )
+    return _format_start_hotkey_row(cfg, hotkey_ready=hotkey_ready, warming_up=warming_up)
 
 
 def _cmd_start(
@@ -3103,14 +3418,16 @@ def _cmd_start(
         ff_found = resolve_ffmpeg_bin(env=env)
     except Exception:
         ff_found = ""
+    ff_install = "brew install ffmpeg" if sys.platform == "darwin" else "sudo apt install ffmpeg"
     if not ff_found:
-        ff_install = "brew install ffmpeg" if sys.platform == "darwin" else "sudo apt install ffmpeg"
         print(
             f"[agent-voice-input] WARN: ffmpeg not found (required for audio capture/conversion); install via: {ff_install}",
             file=sys.stderr,
             flush=True,
         )
     warned_shim = False
+    macos_mic_warn = ""
+    macos_ssh_note = ""
     if sys.platform == "darwin" and cfg is not None:
         shim_bin, pre_err = compile_mac_shim(env=env, cfg=cfg, announce=True)
         if shim_bin is None:
@@ -3126,8 +3443,9 @@ def _cmd_start(
                 {**child_env, **{k: env[k] for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY") if k in env}}
             )
             if (ssh_warn := classify_macos_mic_permission({"mic_auth": "not_determined"}, ssh_env)) is not None:
+                macos_mic_warn = redact_secrets(str(ssh_warn), env, cfg=cfg)
                 print(
-                    f"[agent-voice-input] WARN: {redact_secrets(str(ssh_warn), env, cfg=cfg)}",
+                    f"[agent-voice-input] WARN: {macos_mic_warn}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -3142,11 +3460,30 @@ def _cmd_start(
                     isinstance(aud_st, Mapping)
                     and (perm_err := classify_macos_mic_permission(aud_st, perm_env)) is not None
                 ):
+                    macos_mic_warn = redact_secrets(str(perm_err), env, cfg=cfg)
                     print(
-                        f"[agent-voice-input] WARN: {redact_secrets(str(perm_err), env, cfg=cfg)}",
+                        f"[agent-voice-input] WARN: {macos_mic_warn}",
                         file=sys.stderr,
                         flush=True,
                     )
+                elif isinstance(aud_st, Mapping) and str(aud_st.get("mic_auth") or "").strip().lower() == "authorized":
+                    has_ssh_env = any(
+                        str(perm_env.get(k) or "").strip() for k in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
+                    )
+                    has_remote_session = (
+                        aud_st.get("has_graphic_session") is False
+                        or aud_st.get("is_remote_session") is True
+                    )
+                    if has_remote_session or has_ssh_env:
+                        ssh_label = (
+                            "remote/SSH shell detected"
+                            if has_remote_session
+                            else "SSH environment variable detected"
+                        )
+                        macos_ssh_note = (
+                            f"{ssh_label}; if microphone records silence, "
+                            "run 'agent-voice-input restart' from a local macOS GUI terminal"
+                        )
                 if (
                     sc_json.get("ax_trusted") is False
                     and cfg.hotkey.scope != "terminals"
@@ -3229,39 +3566,43 @@ def _cmd_start(
                     print(_kv_line("Archive", format_archive_summary(started_arch)))
                 elif cfg is not None:
                     print(_kv_line("Archive", format_archive_summary(cfg.archive)))
+                if not ff_found:
+                    print(
+                        _kv_line(
+                            "Warning",
+                            f"ffmpeg not found (required for audio capture); install via '{ff_install}' then run 'agent-voice-input restart'",
+                        )
+                    )
+                if macos_mic_warn:
+                    print(_kv_line("Warning", macos_mic_warn))
+                elif macos_ssh_note:
+                    print(_kv_line("Note", macos_ssh_note))
                 if cfg is not None and asr_ready is not None:
                     hotkey_ok = st.get("shim_ok") is True
-                    if readiness := _format_start_readiness_row(
-                        cfg,
-                        asr_ready=asr_ready,
-                        hotkey_ready=hotkey_ok,
+                    if not asr_ready:
+                        print(_kv_line("Warning", _format_start_missing_key_warning(cfg, env)))
+                    if hk_row := _format_start_hotkey_row(cfg, hotkey_ready=hotkey_ok):
+                        print(_kv_line(hk_row[0], hk_row[1]))
+                    if (
+                        asr_ready
+                        and hotkey_ok
+                        and ff_found
+                        and not macos_mic_warn
+                        and not (rt_dir / DIAG_FILENAME).exists()
+                        and not (rt_dir / _LEGACY_DIAG_FILENAME).exists()
                     ):
-                        print(_kv_line(readiness[0], readiness[1]))
-                        if not asr_ready and not hotkey_ok:
-                            print(
-                                _kv_line(
-                                    "Hotkey",
-                                    "unavailable (fix warning above, then run 'agent-voice-input restart')",
-                                )
+                        hk = (cfg.hotkey.key or "RControl").strip() or "RControl"
+                        verb = (
+                            "hold"
+                            if (cfg.hotkey.trigger_mode or "tap_toggle").strip().lower() == "ptt"
+                            else "tap"
+                        )
+                        print(
+                            _kv_line(
+                                "Tip",
+                                f"{verb} {hk} to test live, or run 'agent-voice-input once --duration 4 --dry-run'",
                             )
-                        if (
-                            asr_ready
-                            and hotkey_ok
-                            and not (rt_dir / DIAG_FILENAME).exists()
-                            and not (rt_dir / _LEGACY_DIAG_FILENAME).exists()
-                        ):
-                            hk = (cfg.hotkey.key or "RControl").strip() or "RControl"
-                            verb = (
-                                "hold"
-                                if (cfg.hotkey.trigger_mode or "tap_toggle").strip().lower() == "ptt"
-                                else "tap"
-                            )
-                            print(
-                                _kv_line(
-                                    "Tip",
-                                    f"{verb} {hk} to test live, or run 'agent-voice-input once --duration 4 --dry-run'",
-                                )
-                            )
+                        )
                 for tip_line in _format_integrate_tip_lines(env):
                     print(tip_line)
                 if cfg is not None and creds is not None and pipe_info is not None:
@@ -3293,14 +3634,22 @@ def _cmd_start(
         print(row)
     if cfg is not None:
         print(_kv_line("Archive", format_archive_summary(cfg.archive)))
+    if not ff_found:
+        print(
+            _kv_line(
+                "Warning",
+                f"ffmpeg not found (required for audio capture); install via '{ff_install}' then run 'agent-voice-input restart'",
+            )
+        )
+    if macos_mic_warn:
+        print(_kv_line("Warning", macos_mic_warn))
+    elif macos_ssh_note:
+        print(_kv_line("Note", macos_ssh_note))
     if cfg is not None and asr_ready is not None:
-        if readiness := _format_start_readiness_row(
-            cfg,
-            asr_ready=asr_ready,
-            hotkey_ready=False,
-            warming_up=True,
-        ):
-            print(_kv_line(readiness[0], readiness[1]))
+        if not asr_ready:
+            print(_kv_line("Warning", _format_start_missing_key_warning(cfg, env)))
+        if hk_row := _format_start_hotkey_row(cfg, hotkey_ready=False, warming_up=True):
+            print(_kv_line(hk_row[0], hk_row[1]))
     return 0
 
 
@@ -4284,6 +4633,9 @@ def _format_status_human(
     cfg: Config | None = None,
     creds: ProviderCredentials | None = None,
     show_history: bool = False,
+    cfg_warn: str = "",
+    cfg_flag: str = "",
+    cfg_fix: str = "",
 ) -> list[str]:
     """Render ``status`` response as aligned human-readable rows (never emits spoken prose)."""
     from .config import format_archive_summary
@@ -4391,14 +4743,25 @@ def _format_status_human(
     err = str(resp.get("error") or "").strip()
     if state == "stopped":
         lines.append(_kv_line("Daemon", "not running (stopped)"))
-        lines.append(_kv_line("Fix:", "run 'agent-voice-input start'"))
+        if cfg_warn:
+            lines.append(_kv_line("Config", f"WARN ({cfg_warn})"))
+            fix_msg = cfg_fix or (
+                f"fix the config error above (or run 'agent-voice-input init{cfg_flag} --force' to reset config.toml; .env and hotwords/personal.txt are preserved), then run 'agent-voice-input start'"
+            )
+            lines.append(_kv_line("Fix:", fix_msg))
+        else:
+            lines.append(_kv_line("Fix:", "run 'agent-voice-input start'"))
     elif state == "unresponsive":
         lines.append(_kv_line("Daemon", f"unresponsive (pid={pid or '-'})"))
         if err:
             lines.append(_kv_line("Detail", err))
+        if cfg_warn:
+            lines.append(_kv_line("Config", f"WARN ({cfg_warn})"))
         lines.append(_kv_line("Fix:", "run 'agent-voice-input diagnose' or 'agent-voice-input restart'"))
     else:
         lines.append(_kv_line("Daemon", f"error ({err or 'control socket error'})"))
+        if cfg_warn:
+            lines.append(_kv_line("Config", f"WARN ({cfg_warn})"))
         lines.append(_kv_line("Fix:", "run 'agent-voice-input doctor' or 'agent-voice-input restart'"))
 
     arch_off = resp.get("archive")
@@ -4452,7 +4815,172 @@ def _format_control_action_human(cmd: str, resp: Mapping[str, Any]) -> str:
     return _kv_line("Daemon", f"cancel failed ({err})")
 
 
+def _format_python_version_error() -> str:
+    ver = "{0}.{1}.{2}".format(
+        sys.version_info[0], sys.version_info[1], sys.version_info[2]
+    )
+    return (
+        "agent-voice-input requires Python 3.10+ (found {0} at {1}).\n"
+        "Fix: install Python 3.10+ (macOS: 'brew install python'), "
+        "or install with uv (auto-manages Python): 'uv tool install agent-voice-input'.\n".format(
+            ver, sys.executable
+        )
+    )
+
+
+def _is_personal_hotwords_target(
+    target: Path | None,
+    env: Mapping[str, str] | None = None,
+    *,
+    home_dir: str | Path | None = None,
+) -> bool:
+    """Return True when ``target`` resolves to the user's personal hotwords file."""
+    if target is None:
+        return False
+    from .hotwords import resolve_personal_hotwords_path
+
+    src_env = os.environ if env is None else env
+    candidates: list[Path] = []
+    hw_path = resolve_personal_hotwords_path(env=src_env, home_dir=home_dir)
+    if hw_path is not None:
+        candidates.append(hw_path)
+    if home_dir is not None:
+        candidates.append(Path(home_dir) / ".agent-voice-input" / "hotwords" / "personal.txt")
+    elif raw_home := str(src_env.get("HOME") or "").strip():
+        candidates.append(Path(raw_home) / ".agent-voice-input" / "hotwords" / "personal.txt")
+    try:
+        target_exp = target.expanduser()
+        target_real = os.path.realpath(str(target_exp))
+        target_res = target_exp.resolve(strict=False)
+    except OSError:
+        return False
+    for cand in candidates:
+        try:
+            cand_exp = cand.expanduser()
+            try:
+                if os.path.samefile(str(target_exp), str(cand_exp)):
+                    return True
+            except OSError:
+                pass
+            if (
+                target_real == os.path.realpath(str(cand_exp))
+                or target_res == cand_exp.resolve(strict=False)
+            ):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _format_config_error_recovery_hint(
+    exc: Any,
+    *,
+    config_arg: str = "",
+    env: Mapping[str, str] | None = None,
+    for_offline_status: bool = False,
+) -> str:
+    """Build a targeted recovery hint for ConfigError without suggesting unsafe init --force resets."""
+    from .config import expand_user_path
+
+    raw_err = str(exc)
+    src_kind = str(getattr(exc, "source_kind", "") or "").strip()
+    src_path_str = str(getattr(exc, "source_path", "") or "").strip()
+    src_env = os.environ if env is None else env
+
+    if raw_err.startswith(("AGENT_VOICE_INPUT_HOME ", "AGENT_VOICE_INPUT_RUNTIME_DIR ")):
+        return (
+            "fix the environment path error above, then run 'agent-voice-input start'"
+            if for_offline_status
+            else ""
+        )
+
+    if src_kind == "env_encoding" or raw_err.startswith("cannot decode env file "):
+        env_lbl = src_path_str or ".env"
+        if for_offline_status:
+            return f"re-save {env_lbl} as UTF-8, then run 'agent-voice-input start'"
+        return f"Hint: re-save {env_lbl} as UTF-8 (plain UTF-8 encoding) and retry."
+
+    eff_cfg_str = config_arg.strip() or str(src_env.get("AGENT_VOICE_INPUT_CONFIG") or "").strip()
+    target_path: Path | None = None
+    if src_path_str:
+        target_path = Path(src_path_str)
+    elif eff_cfg_str:
+        target_path = expand_user_path(eff_cfg_str, env=src_env)
+
+    if _is_personal_hotwords_target(target_path, src_env):
+        if for_offline_status:
+            return (
+                "pass a config.toml path (or omit --config) instead of hotwords/personal.txt, "
+                "then run 'agent-voice-input start'"
+            )
+        return (
+            "Hint: hotwords/personal.txt is your personal hotwords file, not a config file; "
+            "pass a config.toml path or omit --config."
+        )
+
+    if src_kind == "json" or (target_path is not None and target_path.suffix.lower() == ".json"):
+        json_lbl = src_path_str or eff_cfg_str or "the JSON config file"
+        if for_offline_status:
+            return f"fix the JSON syntax/values in {json_lbl}, then run 'agent-voice-input start'"
+        return (
+            f"Hint: fix the JSON syntax/values in {json_lbl} and retry "
+            "('init' only generates TOML configs)."
+        )
+
+    if target_path is not None and target_path.name.lower() in (".env", ".gitignore"):
+        if for_offline_status:
+            return (
+                f"pass a config.toml path (or omit --config) instead of {target_path.name}, "
+                "then run 'agent-voice-input start'"
+            )
+        return (
+            f"Hint: {target_path.name} is not a TOML config file; "
+            "pass a config.toml path or omit --config."
+        )
+
+    is_explicit_toml = (
+        src_kind == "toml"
+        and (target_path is None or target_path.suffix.lower() == ".toml")
+    )
+    if is_explicit_toml:
+        cfg_flag = f" --config {shlex.quote(config_arg.strip())}" if config_arg.strip() else ""
+        if for_offline_status:
+            return (
+                f"fix the config error above (or run 'agent-voice-input init{cfg_flag} --force' "
+                "to reset config.toml; .env and hotwords/personal.txt are preserved), "
+                "then run 'agent-voice-input start'"
+            )
+        return (
+            f"Hint: check your config file syntax/values above, or run "
+            f"'agent-voice-input init{cfg_flag} --force' to reset config.toml "
+            "(.env and hotwords/personal.txt are preserved)."
+        )
+
+    if src_kind == "other" or (
+        target_path is not None and target_path.suffix.lower() not in ("", ".toml", ".json")
+    ):
+        other_lbl = src_path_str or eff_cfg_str or "the target file"
+        if for_offline_status:
+            return (
+                f"check your --config path ({other_lbl}) or fix the file directly, "
+                "then run 'agent-voice-input start'"
+            )
+        return (
+            f"Hint: check your --config path ({other_lbl}) or fix the file directly "
+            "(pass a .toml config file or omit --config)."
+        )
+
+    return (
+        "fix the config error above, then run 'agent-voice-input start'"
+        if for_offline_status
+        else ""
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
+    if sys.version_info < (3, 10):
+        sys.stderr.write(_format_python_version_error())
+        return 1
     _configure_posix_ascii_stdio()
     args = _build_parser().parse_args(argv)
     _recover_parsed_text_args(args)
@@ -4542,6 +5070,7 @@ def main(argv: list[str] | None = None) -> int:
                 env = dict(os.environ)
             rt_dir_st = get_runtime_dir(env, create=False)
             cfg_warn = ""
+            cfg_exc: ConfigError | None = None
             try:
                 cfg, env = load_config(
                     config_path=getattr(args, "config", None),
@@ -4550,6 +5079,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except ConfigError as exc:
                 cfg = None
+                cfg_exc = exc
                 cfg_warn = str(exc)
 
             as_json = bool(getattr(args, "as_json", False))
@@ -4587,12 +5117,31 @@ def main(argv: list[str] | None = None) -> int:
             if as_json:
                 print(_json_dumps_stdout(resp, indent=2))
             else:
+                cfg_arg_st = str(getattr(args, "config", "") or "").strip()
+                cfg_flag_st = f" --config {shlex.quote(cfg_arg_st)}" if cfg_arg_st else ""
+                cfg_fix_st = (
+                    redact_secrets(
+                        _format_config_error_recovery_hint(
+                            cfg_exc,
+                            config_arg=cfg_arg_st,
+                            env=env,
+                            for_offline_status=True,
+                        ),
+                        env,
+                    )
+                    if cfg_exc is not None
+                    else ""
+                )
                 for line in _format_status_human(
-                    resp, cfg=cfg, creds=None, show_history=(hist_limit is not None)
+                    resp,
+                    cfg=cfg,
+                    creds=None,
+                    show_history=(hist_limit is not None),
+                    cfg_warn=(redact_secrets(cfg_warn, env) if cfg_warn else ""),
+                    cfg_flag=cfg_flag_st,
+                    cfg_fix=cfg_fix_st,
                 ):
                     print(line)
-                if cfg_warn:
-                    print(_kv_line("Config", f"WARN ({redact_secrets(cfg_warn, env)})"))
             return 1
 
         cfg, env = load_config(
@@ -4701,7 +5250,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except ConfigError as exc:
         eff_env = _load_env_for_redaction(env, load_env_files_fn=load_env_files, config_error_cls=ConfigError)
-        print(f"config error: {redact_secrets(str(exc), eff_env, cfg=cfg)}", file=sys.stderr)
+        raw_err = str(exc)
+        print(f"config error: {redact_secrets(raw_err, eff_env, cfg=cfg)}", file=sys.stderr)
+        if cfg is None and getattr(args, "subcmd", None) != "init":
+            cfg_arg = str(getattr(args, "config", "") or "").strip()
+            hint = _format_config_error_recovery_hint(
+                exc,
+                config_arg=cfg_arg,
+                env=eff_env,
+                for_offline_status=False,
+            )
+            if hint:
+                print(redact_secrets(hint, eff_env, cfg=cfg), file=sys.stderr)
         return 2
     except Exception as exc:
         eff_env = _load_env_for_redaction(env, load_env_files_fn=load_env_files, config_error_cls=ConfigError)
