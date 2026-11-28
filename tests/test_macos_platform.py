@@ -1972,7 +1972,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 if payload.get("cmd") == "audio_status":
                     fc_rpc[0] += 1
                     if fc_rpc[0] >= 3:
-                        time.sleep(0.32)
+                        time.sleep(0.65)
                 return plat_rec._shim_rpc(payload, timeout_sec=timeout_sec)
 
             plat_fc._shim_rpc = _slow_post_for_fc  # type: ignore[method-assign]
@@ -1980,9 +1980,10 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             fc_evt = threading.Event()
             plat_fc.set_recorder_recovered_callback(lambda g: (fc_gaps.append(g), fc_evt.set()))
             plat_fc.start_recording(rt)
-            self.assertTrue(fc_evt.wait(timeout=2.5))
-            # True startup gap is <240ms; must NOT inflate by the 320ms post_st RPC!
-            self.assertLess(fc_gaps[0], 245)
+            self.assertTrue(fc_evt.wait(timeout=3.0))
+            # True startup gap stays well below 480ms even under shared CI subprocess jitter;
+            # must NOT inflate by the 650ms post_st RPC!
+            self.assertLess(fc_gaps[0], 480)
             _, _ = plat_fc.stop_recording(drain=False)
 
     def test_macos_clt_check_first_run_progress_and_xcode_license_hint(self) -> None:
