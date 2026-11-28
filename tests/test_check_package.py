@@ -269,6 +269,52 @@ class CheckPackageTests(unittest.TestCase):
             with self.assertRaises(check_package.PackageCheckError):
                 check_package.verify_distributions(repo, dist, expected_version="0.18.0")
 
+        # Reject gitignored docs/benchmarks/ leaked into sdist (or wheel),
+        # while allowing a clean sdist when docs/benchmarks/ exists locally in repo_root
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            dist = Path(td) / "dist"
+            _create_minimal_repo(repo)
+            _build_fake_dists(
+                repo,
+                dist,
+                extra_sdist_files={"docs/benchmarks/foo.md": b"# local bench\n"},
+            )
+            with self.assertRaises(check_package.PackageCheckError) as ctx:
+                check_package.verify_distributions(repo, dist, expected_version="0.18.0")
+            self.assertIn("docs/benchmarks/foo.md", str(ctx.exception))
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            dist = Path(td) / "dist"
+            _create_minimal_repo(repo)
+            _build_fake_dists(
+                repo,
+                dist,
+                extra_wheel_files={"docs/benchmarks/foo.md": b"# local bench\n"},
+            )
+            with self.assertRaises(check_package.PackageCheckError) as ctx:
+                check_package.verify_distributions(repo, dist, expected_version="0.18.0")
+            self.assertIn("docs/benchmarks/foo.md", str(ctx.exception))
+
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            dist = Path(td) / "dist"
+            _create_minimal_repo(repo)
+            bench_dir = repo / "docs" / "benchmarks"
+            bench_dir.mkdir(parents=True, exist_ok=True)
+            (bench_dir / "local-note.md").write_text("# local only\n", encoding="utf-8")
+            (repo / "docs" / "benchmarks-summary.md").write_text("# public doc\n", encoding="utf-8")
+            _build_fake_dists(
+                repo,
+                dist,
+                omit_sdist_files={"docs/benchmarks/local-note.md"},
+            )
+            summary = check_package.verify_distributions(
+                repo, dist, expected_version="0.18.0"
+            )
+            self.assertEqual(summary["sdist_version"], "0.18.0")
+
         # Reject non-ASCII inside wheel win_shim.ps1
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"

@@ -11,4 +11,5 @@ recursive-include tests *.py
 recursive-include .github/workflows *.yml
 prune .agents
 prune .claude
+prune docs/benchmarks
 global-exclude __pycache__ *.py[cod]

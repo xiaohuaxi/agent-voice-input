@@ -81,10 +81,19 @@ CORE_SDIST_SUFFIXES: tuple[str, ...] = (
 )
 
 _WHEEL_FORBIDDEN_DIRS = frozenset(
-    {".agents", ".claude", ".codex", ".git", "__pycache__", "tests", "scripts"}
+    {
+        ".agents",
+        ".claude",
+        ".codex",
+        ".git",
+        "__pycache__",
+        "tests",
+        "scripts",
+        "docs/benchmarks",
+    }
 )
 _SDIST_FORBIDDEN_DIRS = frozenset(
-    {".agents", ".claude", ".codex", ".git", "__pycache__"}
+    {".agents", ".claude", ".codex", ".git", "__pycache__", "docs/benchmarks"}
 )
 _FORBIDDEN_FILENAMES = frozenset({".DS_Store", ".env"})
 _FORBIDDEN_SUFFIXES = (".pyc", ".pyo", ".wav", ".mp3", ".db", ".sqlite", ".sqlite3")
@@ -248,13 +257,27 @@ def _find_forbidden_entries(
     *,
     forbidden_dirs: frozenset[str],
 ) -> list[str]:
+    single_dirs: set[str] = set()
+    prefix_paths: list[tuple[str, ...]] = []
+    for entry in forbidden_dirs:
+        cleaned = entry.strip("/")
+        if not cleaned:
+            continue
+        if "/" in cleaned:
+            prefix_paths.append(PurePosixPath(cleaned).parts)
+        else:
+            single_dirs.add(cleaned)
+
     bad: list[str] = []
     for raw in sorted(rel_paths):
         norm = raw.lstrip("/")
         if not norm:
             continue
         parts = PurePosixPath(norm).parts
-        if any(part in forbidden_dirs for part in parts):
+        if any(part in single_dirs for part in parts):
+            bad.append(raw)
+            continue
+        if any(parts[: len(prefix)] == prefix for prefix in prefix_paths):
             bad.append(raw)
             continue
         name = parts[-1]
@@ -356,16 +379,24 @@ def verify_distributions(
 
     integ_dir = repo_root / "integrations"
     docs_dir = repo_root / "docs"
-    integ_rels = (
+    raw_integ_rels = (
         sorted("/" + p.relative_to(repo_root).as_posix() for p in integ_dir.rglob("*") if p.is_file())
         if integ_dir.is_dir()
         else []
     )
-    doc_rels = (
+    raw_doc_rels = (
         sorted("/" + p.relative_to(repo_root).as_posix() for p in docs_dir.rglob("*.md") if p.is_file())
         if docs_dir.is_dir()
         else []
     )
+    forbidden_integ = set(
+        _find_forbidden_entries(set(raw_integ_rels), forbidden_dirs=_SDIST_FORBIDDEN_DIRS)
+    )
+    forbidden_docs = set(
+        _find_forbidden_entries(set(raw_doc_rels), forbidden_dirs=_SDIST_FORBIDDEN_DIRS)
+    )
+    integ_rels = [rel for rel in raw_integ_rels if rel not in forbidden_integ]
+    doc_rels = [rel for rel in raw_doc_rels if rel not in forbidden_docs]
     expected_sdist_suffixes = {
         *CORE_SDIST_SUFFIXES,
         *(f"/src/agent_voice_input/{name}" for name in pkg_files),
