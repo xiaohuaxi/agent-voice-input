@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.18.2] - 2026-11-28
+## [0.18.3] - 2026-11-28
+
+> Note: Tag `v0.18.2` was not publicly released and is superseded by `v0.18.3`.
 
 ### Added
 - **Agent routing metadata in monthly transcript archive (`transcripts/YYYY-MM.jsonl`)**: Extended the flat JSONL transcript schema from 12 to 14 backward-compatible fields by adding `"agent"` (`"claude"` / `"codex"` / `"agy"` / `"gemini"` or `null`) and `"agent_session_id"` (matched target session ID or `null`) in `agent` mode (always `null` in `general` mode or when no concrete target session is bound, never recording refiner internal session IDs, context, hotwords, or secrets).
@@ -19,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Slimmed bilingual READMEs & tiered `docs/` reference layout**: Streamlined `README.md` and `README.zh-CN.md` around the one-command `install.sh` quickstart while moving detailed provider guides, hotwords, CLI usage, and troubleshooting references into `docs/providers(.zh-CN).md`, `docs/guide(.zh-CN).md`, and `docs/agent-setup.md`.
 
 ### Fixed
+- **Widened macOS `mac_shim` cold-compile timeout (`60s` → `180s`)**: Raised the first-run `swiftc` compilation timeout in `compile_mac_shim` from `60s` to `180s` (aligned with WSL2 `win_shim`) to prevent cold-compile timeouts on older Macs or freshly upgraded macOS systems.
 - **Self-consistent `doctor` `[pipeline]` summary for `.env` template placeholders & expired Codex auth**: Filtered `.env` template placeholder providers out of `doctor` `[pipeline]` `alternatives` (including expired `codex` auth falling back to a placeholder `OPENAI_API_KEY` and legacy dual-header `doubao` with a placeholder `DOUBAO_ASR_APP_ID`) and replaced `auto priority (...)` / stage reasons on placeholder stages with explicit `placeholder key in .env: <VAR>` summaries in both text and `--json` outputs.
 - **Excluded gitignored `docs/benchmarks/` from sdist (`MANIFEST.in`)**: Pruned local `docs/benchmarks/` artifacts from source distributions in `MANIFEST.in` and enforced the exclusion in `scripts/check_package.py`.
 

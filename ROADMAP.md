@@ -1,6 +1,6 @@
 # 产品演进路线图（ROADMAP）
 
-> **当前已发布基线**：`v0.18.2`（主干未发布增量归入 [CHANGELOG.md](CHANGELOG.md)；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
+> **当前已发布基线**：`v0.18.3`（主干未发布增量归入 [CHANGELOG.md](CHANGELOG.md)；版本号与 PyPI / GitHub Release 实际对外发布严格 1:1 绑定，未发布能力按里程碑组织而不预锁小版本号）
 >
 > **工程规范与上下文路由架构**：[AGENTS.md](AGENTS.md) · [docs/context-routing.md](docs/context-routing.md)
 
@@ -53,12 +53,12 @@
 
 ---
 
-### 已归档里程碑（`已发布 · v0.18.2`）
+### 已归档里程碑（`已发布 · v0.18.3`）
 
-以下 14 字段转录归档扩展、开箱安装与文档分层、百炼热词保守回调、热词维护 Skill 及双平台安装脚本 CI 实测已在 `v0.18.2` 完成落地并正式发布：
+以下 14 字段转录归档扩展、开箱安装与文档分层、百炼热词保守回调、热词维护 Skill、macOS `mac_shim` `180s` 冷编译放宽及双平台安装脚本 CI 实测已在 `v0.18.3` 完成落地并正式发布：
 
 1. **14 字段转录归档与 `doctor` 占位符自洽**：月度纯转录归档新增 `"agent"` 与 `"agent_session_id"`（向后兼容 14 字段，仅在 `agent` 模式绑定具体会话时记录）；修复 `doctor` `[pipeline]` 对 `.env` 模板占位符与过期 Codex 回退场景的摘要自洽。
-2. **极薄 `install.sh`、双语文档分层与多环境 CI 实测**：新增零 `sudo`、零 rc 修改且按发行版适配 `ffmpeg` 提示的 POSIX `install.sh`，并在 CI 新增多版本原生 Runner（`ubuntu-22.04` / `ubuntu-24.04` / `macos-15` / `macos-26`）与精简容器（无系统 Python 的 `debian:bookworm-slim` + `fedora:latest`）实测矩阵；瘦身双语 README 并将选型与使用手册分层至 `docs/`，同时在 `MANIFEST.in` 与发版门禁中排除 `docs/benchmarks/`。
+2. **极薄 `install.sh`、双语文档分层与多环境 CI 实测**：新增零 `sudo`、零 rc 修改且按发行版适配 `ffmpeg` 提示的 POSIX `install.sh`，并在 CI 新增多版本原生 Runner（`ubuntu-22.04` / `ubuntu-24.04` / `macos-15` / `macos-26`）与精简容器（无系统 Python 的 `debian:bookworm-slim` + `fedora:latest`）实测矩阵；瘦身双语 README 并将选型与使用手册分层至 `docs/`，将 macOS `mac_shim` 首次冷编译超时由 `60s` 放宽至 `180s`（对齐 WSL2），同时在 `MANIFEST.in` 与发版门禁中排除 `docs/benchmarks/`。
 3. **百炼 Stage 1 热词回调与 `manage-hotwords` 仓库 Skill**：将百炼 `qwen3-asr-flash` Stage 1 热词上限保守回调至 `150 词 / 1,800 字`（总预算 `3,800` 字）防高词数复述幻觉；新增 `.agents/skills/manage-hotwords/` 项目 Skill 支撑个人热词表梳理、校验与增量维护。
 
 ---

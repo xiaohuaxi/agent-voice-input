@@ -528,9 +528,11 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             (multi_dir / "B.swift").write_text("let b = 2\n", encoding="utf-8")
             (multi_dir / "A.swift").write_text("let a = 1\n", encoding="utf-8")
             seen_dir_cmds: list[list[str]] = []
+            seen_dir_timeouts: list[object] = []
 
             def _spy_dir_swiftc(cmd, **_kw):
                 seen_dir_cmds.append(list(cmd))
+                seen_dir_timeouts.append(_kw.get("timeout"))
                 out = Path(cmd[cmd.index("-o") + 1])
                 out.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
                 return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -541,6 +543,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
                 self.assertEqual(de1, "")
                 assert d1 is not None
                 self.assertEqual(len(seen_dir_cmds), 1)
+                self.assertEqual(seen_dir_timeouts, [180])
                 swift_args = [a for a in seen_dir_cmds[0] if a.endswith(".swift")]
                 self.assertEqual([Path(a).name for a in swift_args], ["A.swift", "B.swift"])
 
@@ -2194,13 +2197,15 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             rt.mkdir()
             env = {"HOME": str(tmp), "AGENT_VOICE_INPUT_SWIFTC": "none"}
 
-            # Verify compile_mac_shim links AVFoundation and Security frameworks
+            # Verify compile_mac_shim links AVFoundation and Security frameworks with 180s cold-compile timeout
             seen_swiftc_argv: list[list[str]] = []
+            seen_swiftc_timeouts: list[object] = []
             fake_swift = tmp / "fw_shim.swift"
             fake_swift.write_text("// fw-check\n", encoding="utf-8")
 
             def _spy_swiftc_run(cmd, **_kw):
                 seen_swiftc_argv.append(list(cmd))
+                seen_swiftc_timeouts.append(_kw.get("timeout"))
                 out = Path(cmd[cmd.index("-o") + 1])
                 out.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
                 return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -2215,6 +2220,7 @@ class MacOSPlatformAndGhosttyTests(unittest.TestCase):
             self.assertIsNotNone(b_fw)
             self.assertEqual(e_fw, "")
             self.assertEqual(len(seen_swiftc_argv), 1)
+            self.assertEqual(seen_swiftc_timeouts, [180])
             self.assertIn("AVFoundation", seen_swiftc_argv[0])
             self.assertIn("Security", seen_swiftc_argv[0])
 

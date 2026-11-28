@@ -57,6 +57,7 @@ from .session_ctx import (
 
 MAC_SHIM_DIR = Path(__file__).resolve().with_name("mac_shim")
 SHIM_SCHEMA_VERSION = 5
+MAC_SHIM_COMPILE_TIMEOUT_SEC: int = 180
 
 
 def list_mac_shim_sources(swift_source: Path = MAC_SHIM_DIR) -> list[Path]:
@@ -470,7 +471,13 @@ def compile_mac_shim(
             )
         try:
             proc = subprocess.run(
-                cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=dict(src_env), timeout=60, check=False
+                cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                env=dict(src_env),
+                timeout=MAC_SHIM_COMPILE_TIMEOUT_SEC,
+                check=False,
             )
         except Exception as exc:
             tmp_path.unlink(missing_ok=True)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-voice-input"
-version = "0.18.2"
+version = "0.18.3"
 description = "Context-aware voice input for CLI coding agents and desktop apps (two-stage STT + refiner or single-hop multimodal)."
 readme = "README.md"
 requires-python = ">=3.10"
