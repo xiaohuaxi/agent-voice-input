@@ -135,7 +135,7 @@ effort = ""
 # max_retries = 2
 
 # Personal hotwords live in ~/.agent-voice-input/hotwords/personal.txt (hot-reloaded).
-# Stage 1 quotas: DashScope 250 terms / 2,800 chars, Doubao 50 terms / 1,000 chars,
+# Stage 1 quotas: DashScope 150 terms / 1,800 chars, Doubao 50 terms / 1,000 chars,
 # OpenAI keywords[] 50 terms, OpenRouter keyterms 50 terms, Whisper 35 terms / 353 chars.
 # Stage 2 / single-hop selects up to 200 items / 3,000 chars (!pinned -> aliased -> file order).
 # Manage via `agent-voice-input hotwords list|add|remove|path`.

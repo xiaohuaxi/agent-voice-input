@@ -226,8 +226,8 @@ class TestRefinerPriorityAndEffortV0181(unittest.TestCase):
         from agent_voice_input.config import DEFAULT_ASR_MODELS
 
         self.assertEqual(DEFAULT_ASR_MODELS["openrouter"], "microsoft/mai-transcribe-2")
-        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_terms, 250)
-        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_chars, 2800)
+        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_terms, 150)
+        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_chars, 1800)
 
         self.assertLess(
             REFINER_AUTO_PRIORITY.index("openrouter"),

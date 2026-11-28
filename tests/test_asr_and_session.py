@@ -4869,14 +4869,14 @@ class SessionCtxTests(unittest.TestCase):
             self.assertIn('name="prompt"\r\n\r\n', leg_body)
             self.assertIn("常用技术术语：Zephyrus、KestrelDB", leg_body)
 
-        # 3. DashScope _compose_context_text relaxes hotwords cap to 2,800 chars (aligned with HOTWORDS_QUOTA_SPECS["dashscope"])
-        ds_terms = [f"DashScopeTerm_{i:03d}" for i in range(250)]
-        ds_txt = _compose_context_text(AsrContext(hotwords=ds_terms), max_chars=5800)
+        # 3. DashScope _compose_context_text caps hotwords at 1,800 chars (aligned with HOTWORDS_QUOTA_SPECS["dashscope"])
+        ds_terms = [f"DashScopeTerm_{i:03d}" for i in range(150)]
+        ds_txt = _compose_context_text(AsrContext(hotwords=ds_terms), max_chars=3800)
         self.assertTrue(ds_txt.startswith("常用技术术语："))
-        self.assertGreater(len(ds_txt), 2500)
-        self.assertLessEqual(len(ds_txt), 2800 + len("常用技术术语："))
+        self.assertGreater(len(ds_txt), 1500)
+        self.assertLessEqual(len(ds_txt), 1800 + len("常用技术术语："))
 
-    def test_dashscope_5800_2800_hotwords_and_dialog_tail_cap_isolation(self) -> None:
+    def test_dashscope_3800_1800_hotwords_and_dialog_tail_cap_isolation(self) -> None:
         from agent_voice_input.hotwords import clear_hotwords_cache
 
         with tempfile.TemporaryDirectory() as td:
@@ -4885,9 +4885,9 @@ class SessionCtxTests(unittest.TestCase):
                 app_home = Path(td) / "avi_home"
                 hw_file = app_home / "hotwords" / "personal.txt"
                 hw_file.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-                # 250 personal terms, 10 chars each + "、" = 11*250 - 1 = 2749 <= 2800 chars
-                terms_250 = [f"Term_{i:04d}X" for i in range(250)]
-                hw_file.write_text("\n".join(terms_250) + "\n", encoding="utf-8")
+                # 150 personal terms, 10 chars each + "、" = 11*150 - 1 = 1649 <= 1800 chars
+                terms_150 = [f"Term_{i:04d}X" for i in range(150)]
+                hw_file.write_text("\n".join(terms_150) + "\n", encoding="utf-8")
 
                 reqs: list[HttpRequest] = []
 
@@ -4908,13 +4908,13 @@ class SessionCtxTests(unittest.TestCase):
                 }
                 prov = create_asr_provider(cfg, resolve_credentials(cfg, env_ds), env=env_ds, transport=ds_tx)
 
-                # Case A: 250 personal terms (<=2800 chars) ALL survive into DashScope system context
+                # Case A: 150 personal terms (<=1800 chars) ALL survive into DashScope system context
                 # without prefix-length clipping, while a 6,000-char dialog tail is bounded within ~2,000 chars
-                # and total <= 5,800.
+                # and total <= 3,800.
                 long_dialog = "对话历史片段_" * 900  # >6000 chars
                 ctx_full = AsrContext(
-                    hotwords=list(terms_250),
-                    personal_hotwords=tuple(terms_250),
+                    hotwords=list(terms_150),
+                    personal_hotwords=tuple(terms_150),
                     dynamic_hotwords=(),
                     builtin_hotwords=(),
                     hotwords_bucketed=True,
@@ -4924,23 +4924,23 @@ class SessionCtxTests(unittest.TestCase):
                 )
                 prov.transcribe(_sample_wav(), context=ctx_full)
                 sys_txt_a = json.loads(reqs[-1].body.decode("utf-8"))["messages"][0]["content"][0]["text"]
-                self.assertLessEqual(len(sys_txt_a), 5800)
+                self.assertLessEqual(len(sys_txt_a), 3800)
                 hw_line_a = sys_txt_a.splitlines()[0]
                 self.assertTrue(hw_line_a.startswith("常用技术术语："))
                 sent_terms_a = hw_line_a.removeprefix("常用技术术语：").split("、")
-                self.assertEqual(len(sent_terms_a), 250)
+                self.assertEqual(len(sent_terms_a), 150)
                 self.assertEqual(sent_terms_a[0], "Term_0000X")
-                self.assertEqual(sent_terms_a[-1], "Term_0249X")
+                self.assertEqual(sent_terms_a[-1], "Term_0149X")
 
-                # Case A2: Exact 2,800-char hotword payload survives intact (5800 // 2 - 7 == 2893 >= 2800)
-                exact_2800_terms = [
-                    f"Exact_{i:03d}_" + ("a" * (30 if i == 0 else 29)) for i in range(70)
-                ]  # 40 + 39*69 + 69 = 2800 chars
-                exact_2800_payload = "、".join(exact_2800_terms)
-                self.assertEqual(len(exact_2800_payload), 2800)
+                # Case A2: Exact 1,800-char hotword payload survives intact (3800 // 2 - 7 == 1893 >= 1800)
+                exact_1800_terms = [
+                    f"Exact_{i:03d}_" + ("a" * (30 if i == 0 else 29)) for i in range(45)
+                ]  # 40 + 39*44 + 44 = 1800 chars
+                exact_1800_payload = "、".join(exact_1800_terms)
+                self.assertEqual(len(exact_1800_payload), 1800)
                 ctx_exact = AsrContext(
-                    hotwords=list(exact_2800_terms),
-                    personal_hotwords=tuple(exact_2800_terms),
+                    hotwords=list(exact_1800_terms),
+                    personal_hotwords=tuple(exact_1800_terms),
                     hotwords_bucketed=True,
                     manual_hotwords_loaded=True,
                     mode="general",
@@ -4948,14 +4948,14 @@ class SessionCtxTests(unittest.TestCase):
                 prov.transcribe(_sample_wav(), context=ctx_exact)
                 sys_txt_exact = json.loads(reqs[-1].body.decode("utf-8"))["messages"][0]["content"][0]["text"]
                 sent_payload_exact = sys_txt_exact.removeprefix("常用技术术语：")
-                self.assertEqual(len(sent_payload_exact), 2800)
-                self.assertEqual(sent_payload_exact, exact_2800_payload)
+                self.assertEqual(len(sent_payload_exact), 1800)
+                self.assertEqual(sent_payload_exact, exact_1800_payload)
                 sent_exact = sent_payload_exact.split("、")
-                self.assertEqual(len(sent_exact), 70)
-                self.assertEqual(sent_exact[-1], exact_2800_terms[-1])
+                self.assertEqual(len(sent_exact), 45)
+                self.assertEqual(sent_exact[-1], exact_1800_terms[-1])
 
                 # Case B: With 0 hotwords and a 6,000-char dialog, dialog tail MUST stay capped at <= 2,000 chars
-                # (raising DashScope total budget to 5800 must NOT inflate dialog tail and risk silence echo).
+                # (DashScope 3800 total budget must NOT inflate dialog tail and risk silence echo).
                 ctx_no_hw = AsrContext(
                     hotwords=[],
                     personal_hotwords=(),
@@ -4974,10 +4974,10 @@ class SessionCtxTests(unittest.TestCase):
                 self.assertLessEqual(len(dialog_tail_b), 2000)
                 self.assertGreaterEqual(len(dialog_tail_b), 1900)
 
-                # Case C: Mid-list oversized word skipped while trailing short word still fits in 2800-char cap
-                filler = [f"MidCap_{i:03d}_" + ("x" * 15) for i in range(102)]  # 26*102 + 101 = 2753 chars
-                oversized = "VeryLongOverflowWord_" + ("y" * 50)  # 71 chars -> 2753+1+71=2825 > 2800
-                short_tail = "Zed"  # 3 chars -> 2753+1+3=2757 <= 2800 -> fits!
+                # Case C: Mid-list oversized word skipped while trailing short word still fits in 1800-char cap
+                filler = [f"MidCap_{i:03d}_" + ("x" * 15) for i in range(65)]  # 26*65 + 64 = 1754 chars
+                oversized = "VeryLongOverflowWord_" + ("y" * 50)  # 71 chars -> 1754+1+71=1826 > 1800
+                short_tail = "Zed"  # 3 chars -> 1754+1+3=1758 <= 1800 -> fits!
                 ctx_skip = AsrContext(
                     hotwords=[*filler, oversized, short_tail],
                     personal_hotwords=tuple([*filler, oversized, short_tail]),

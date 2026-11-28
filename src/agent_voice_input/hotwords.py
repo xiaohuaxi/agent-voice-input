@@ -348,7 +348,10 @@ class Stage2HotwordsBudgetSummary:
 # Single source of truth for per-provider ASR hotword quotas (aligned with
 # per-provider protocol measurements):
 # - Doubao file API contract supports up to 5,000 terms; recall is sharpest around 30-50 terms.
-# - DashScope qwen3-asr-flash hard cap is 10,000 text_tokens (~14,500 chars); 250 terms / 2,800 chars leaves >65% headroom below the 350-term crosstalk knee.
+# - DashScope qwen3-asr-flash hard cap is 10,000 text_tokens (~14,500 chars); conservatively held at
+#   150 terms / 1,800 chars because 250 terms triggered verbatim recitation hallucination in live
+#   audio (Stage 2's 200 items + aliases already cover the tail; revisit after landing post-ASR
+#   recitation circuit-breaker and non-enumerated formatting).
 # - OpenAI gpt-transcribe supports native keywords[] (50 terms sweet spot; must strip <, >, \r, \n).
 # - Whisper /audio/transcriptions reserves 7 chars for "常用技术术语：" (360 - 7 = 353).
 # - Single-hop multimodal models align with Stage 2 wide vocabulary hints (200 items / 3,000 chars).
@@ -380,8 +383,8 @@ HOTWORDS_QUOTA_SPECS: dict[str, HotwordsQuotaSpec] = {
     "dashscope": HotwordsQuotaSpec(
         key="dashscope",
         label="dashscope",
-        max_terms=250,
-        max_chars=2800,
+        max_terms=150,
+        max_chars=1800,
         separator="、",
     ),
     "single_hop": HotwordsQuotaSpec(

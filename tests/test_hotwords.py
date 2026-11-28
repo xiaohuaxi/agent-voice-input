@@ -978,9 +978,9 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
             ["置顶中文", "ZebraPin", "Beta", "中文别名词", "豆包", "飞书", "Alpha", "AmbigOnly", "AmbigTwo"],
         )
 
-    def test_quota_specs_and_dashscope_250_2800_and_single_hop_200_3000(self) -> None:
-        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_terms, 250)
-        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_chars, 2800)
+    def test_quota_specs_and_dashscope_150_1800_and_single_hop_200_3000(self) -> None:
+        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_terms, 150)
+        self.assertEqual(HOTWORDS_QUOTA_SPECS["dashscope"].max_chars, 1800)
         self.assertEqual(STAGE2_HOTWORDS_MAX_ITEMS, 200)
         self.assertEqual(STAGE2_HOTWORDS_MAX_CHARS, 3000)
         self.assertEqual(SINGLE_HOP_HOTWORDS_MAX_ITEMS, 200)
@@ -1026,10 +1026,10 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
         )
         self.assertEqual(resolve_hotwords_quota_spec("custom-unknown").key, "single_hop")
 
-        # DashScope 250 terms / 2800 chars flat budgeter
-        ds_many = [f"d{i:03d}" for i in range(260)]
+        # DashScope 150 terms / 1800 chars flat budgeter
+        ds_many = [f"d{i:03d}" for i in range(160)]
         ds_res = budget_hotwords_for_provider(ds_many, "dashscope")
-        self.assertEqual(ds_res.kept_count, 250)
+        self.assertEqual(ds_res.kept_count, 150)
         self.assertEqual(ds_res.dropped_count, 10)
         self.assertIn("+5 more", format_budget_line(ds_res))
 
@@ -1099,7 +1099,7 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
         # 2. Agent mode ceil(30%) dynamic reserve:
         #    - Doubao (50): dyn_reserve = 15, personal pass1 <= 35
         #    - Whisper (35): dyn_reserve = 11 (ceil(10.5)), personal pass1 <= 24
-        #    - DashScope (250): dyn_reserve = 75, personal pass1 <= 175
+        #    - DashScope (150): dyn_reserve = 45, personal pass1 <= 105
         ag_doubao = AsrContext(
             mode="agent",
             personal_hotwords=tuple(f"p{i:02d}" for i in range(60)),
@@ -1128,9 +1128,9 @@ class DualTrackOrderingAndProjectionTests(unittest.TestCase):
             hotwords_bucketed=True,
         )
         r_ds = project_stage1_hotwords(ag_ds, "dashscope")
-        self.assertEqual(r_ds.kept_count, 250)
-        self.assertEqual(r_ds.personal_kept, 175)
-        self.assertEqual(r_ds.dynamic_kept, 75)
+        self.assertEqual(r_ds.kept_count, 150)
+        self.assertEqual(r_ds.personal_kept, 105)
+        self.assertEqual(r_ds.dynamic_kept, 45)
         self.assertEqual(r_ds.builtin_kept, 0)
 
         # 3. Backfill order: personal_overflow -> dynamic_overflow -> builtin

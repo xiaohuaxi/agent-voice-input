@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Agent routing metadata in monthly transcript archive (`transcripts/YYYY-MM.jsonl`)**: Extended the flat JSONL transcript schema from 12 to 14 backward-compatible fields by adding `"agent"` (`"claude"` / `"codex"` / `"agy"` / `"gemini"` or `null`) and `"agent_session_id"` (matched target session ID or `null`) in `agent` mode (always `null` in `general` mode or when no concrete target session is bound, never recording refiner internal session IDs, context, hotwords, or secrets).
 
+### Changed
+- **Conservative DashScope Stage 1 hotword cap rollback (`150 terms / 1,800 chars`)**: Rolled back DashScope `qwen3-asr-flash` Stage 1 hotword limits from `250 terms / 2,800 chars` to `150 terms / 1,800 chars` (and `_compose_context_text` total budget from `5,800` to `3,800` chars) to avoid sporadic verbatim hotword-recitation hallucinations observed at high term counts while relying on Stage 2 (`200 items / 3,000 chars` with aliases) for tail coverage.
+
 ### Fixed
 - **Self-consistent `doctor` `[pipeline]` summary for `.env` template placeholders**: Filtered `.env` template placeholder providers out of `doctor` `[pipeline]` `alternatives` (including `codex` when falling back to a placeholder `OPENAI_API_KEY` and legacy dual-header `doubao` with a placeholder `DOUBAO_ASR_APP_ID`) and replaced `auto priority (...)` / stage reasons on placeholder stages with explicit `placeholder key in .env: <VAR>` summaries in both text and `--json` outputs.
 
